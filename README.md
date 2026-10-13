@@ -18,3 +18,15 @@ seq $(wc -l $HOME/src/github.com/Niko1221/Strata-EnvVars/000_envvers.md) \
 私の手元では OpenAI Codex で GPT-6 Luna xhigh で、5時間制限 1.6 回くらいで完走しました。xargs の並列数の増減と、5時間制限の消費を見ながら、ペース配分はお好みで。
 
 なお手元パソコンで Radeon R9700 1枚で OpenCode で Strata Qwen3.8 Flash Next IQ2_XXS reasonig_efort=high でやらせたら、1変数に5分から15分くらい要してました。このペースでは何日かかるかわからんぞ...と。いうことで、私は手元で使用枠の余ってた Codex でガッとやらせました。
+
+# つまり何を設定したら prefill や decode が増えるのよ!!
+
+知らん、わからん、頑張って読解してほしい。
+
+# 最新版 Strata ソースコードに追従
+
+どうやっていくか no plan だぜ。
+
+# コマンドライン引数
+
+環境変数もそうだけど、コマンドライン引数も興味がある。
