@@ -1,55 +1,51 @@
 # `STRATA_VERIFY_STEPPED`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
 
 ## 役割
 
-SYCL backend の speculative verify window を、GPU とホストのフラグ通信をカーネル実行中に行わず、複数の SYCL graph segment に分けて実行する opt-in 設定です。各 segment がキュー上で完了した境界でホストが CPU 側の expert pool を処理して必要なフラグを立て、次の segment を進めます。全 expert が VRAM 常駐の経路では、ウィンドウ実行前に必要なホスト側 flag を立てます。これは実行・同期方式を選ぶ設定で、モデルの計算内容そのものを切り替える分岐としては使われていません。
+SYCL verifier の検証窓を、CPU 側の expert 処理を挟む区間に分けて実行します。区間の GPU 処理が完了してからホストが doorbell の内容を読み、CPU expert pool を実行し、次区間が待つ flag を立てます。これにより、実行中の kernel とホストが互いの mapped-memory store を読む必要がない構成になります。実装コメントは Arc A-series / DG2 向けの opt-in と説明しています。
 
-この実装は `sycl/src/core/verify.cpp` にあり、CUDA/HIP 側の実装に同名変数の読み取りはありません。SYCL の verify 実行経路に限られます。
+この名前を読む箇所は `sycl/src/core/verify.cpp` です。CUDA/HIP側でこの名前を読む Strata 所有コードは見つかりませんでした。
 
 ## 値と判定
 
-`env_on()` は `getenv()` が null でないことに加え、空文字ではなく、先頭文字が `0` でないことを条件にします。文字列全体の parse や数値変換はしません。
+共通 helper `env_on()` は `getenv()` の値が存在し、空文字でなく、先頭文字が `0` でない場合に真を返します。文字列全体の比較や数値変換はしません。
 
 | 値 | 判定 |
 |---|---|
-| 未設定 | 無効 |
+| unset | 無効 |
 | 空文字 | 無効 |
-| `0` または `0` で始まる文字列（例: `0abc`） | 無効 |
-| その他（例: `1`, `true`, `false`, `2`, `abc`） | 有効 |
+| `0`、`0anything` | 無効 |
+| `1`、`true`、`false`、`2`、`anything` | 有効（先頭が `0` 以外で空でないため） |
 
-大文字小文字、空白、後続文字の検査はありません。`g_stepped` は翻訳単位のグローバル `const bool` として初期化されるため、プロセス起動時に一度だけ読み取られ、起動後の環境変更は反映されません。
-
-根拠: `sycl/src/core/verify.cpp:92-103`。
+判定結果は翻訳単位の `const bool g_stepped` に初期化時に保存されます。起動後に環境を書き換えても再判定されません。
 
 ## 有効になる条件
 
-- SYCL backend の verify 実装を使用している必要があります。
-- 通常の doorbell 経路では `STRATA_VERIFY_EAGER` が未設定のときに segment graph を capture し、capture 済み segment がある場合に stepped 実行します。`STRATA_VERIFY_EAGER` が設定されていると（値が空でも）この segmented capture/run 経路は選ばれません。
-- すべての expert が VRAM 常駐のときは別経路で、`STRATA_VERIFY_EAGER` の有無によらず stepped 用の flag を launch 前に立てます。ただしテスト用 `g_test_stall` が対象 window に一致すると、この分岐を抑制します。
-- segmented な通常経路で `--remote-expert-opt` が有効だと実行時に `verify: STRATA_VERIFY_STEPPED does not serve --remote-expert-opt` で失敗します。このエラー判定は segmented 経路に置かれ、all-resident の分岐にはありません。
-- `STRATA_VERIFY_SPLIT` は segment の切り方に関係します。既定では split point hook を設定し、`STRATA_VERIFY_SPLIT=0...` で無効にします。`STRATA_VERIFY_PIPE` は split segment に続く CPU 処理を helper thread と並行させるかに関係します（先頭が `0` なら無効）。これらは `STRATA_VERIFY_STEPPED` 自体の有効判定ではありません。
+- 機能の読み取りと実装は `sycl/` の verifier にあります。CUDA/HIPの verifier に同じ名前の読み取りはありません。
+- expert が全て VRAM に常駐していない通常経路では、`STRATA_VERIFY_EAGER` が未設定で、窓サイズ `T` の区間 graph (`seg_[T]`) が作られている場合に segmented run になります。`STRATA_VERIFY_EAGER` が設定されると、通常経路では区間化されず、eager replay の経路になります。
+- expert が全て VRAM に常駐している経路では、eager の設定にかかわらず `g_stepped` が真なら stepped all-resident 経路を使います。ただしテスト用 stall hook が対象窓で作動する場合は除外されます。
+- segmented run は `--remote-expert-opt` をサポートせず、その組み合わせでは `verify: STRATA_VERIFY_STEPPED does not serve --remote-expert-opt` をエラーとして返します。この拒否は通常の segmented run にあるため、all-resident 経路には同じチェックがありません。
+- `STRATA_VERIFY_SPLIT` は区間分割方法を調整します。未設定なら split point 用 hook を有効にし、値の先頭が `0` のとき無効にします。`STRATA_VERIFY_PIPE` は split point で CPU pool と次区間を重ねる helper thread を制御し、先頭が `0` のとき無効、その他（未設定を含む）は有効です。
 
 ## 実行時の詳細
 
-通常の doorbell 経路では、`capture()` が token window を graph segment 群として記録します。各 layer group の doorbell publish 後に serve boundary が挿入され、既定では GPU plan copy と VRAM expert group の後にも split boundary が入ります。実行時は segment を順に投入し、serve boundary で queue drain 後に CPU pool callback を呼び、必要な plan/flag を公開してから後続 segment を進めます。split boundary では plan を公開できた時点で次 segment を投入し、CPU row 計算と重ねます。
+通常の segmented run では、`capture_segments()` が窓を command graph の複数区間として記録します。doorbell publish 後に区間を閉じ、各serve境界を記録します。既定では `STRATA_VERIFY_SPLIT` が有効なので、VRAM expert group の後にも split point が設けられます。`STRATA_VERIFY_NODES` が設定されている場合は、stderr に `strata verify: the %d-token window as %zu graph segments` を出します。
 
-全 expert 常駐経路では segment capture を行わず、必要な PLE rows を用意した後に `h_flag_` を 1 にして graph を実行します。いずれも `g_stepped` が有効なら通常の window 後の layer ごとのホスト待ち処理はスキップされます。
+実行時は各区間を投入し、serve point で queue を待機します。期待した doorbell sequence に届いていなければ `verify (stepped): layer ... did not ring after its queue drained ...` で失敗します。届いていればCPU expert poolを実行し、DMAコピーを待ってflag Bと次のflagを立ててから次の区間へ進みます。`STRATA_VERIFY_PIPE` が有効で次区間が split point なら、poolをhelper threadで実行し、flag Aが立った段階で次区間を先に投入します。実行中のSYCL例外などは `verify (stepped): ...` 等のエラーに変換されます。
 
-この設定は window 用 host memory の選択にも影響します。stepped 有効時は既定で `window_host_uncached()` が false となり、mapped buffer に `sycl::malloc_host` を使い、doorbell payload の plain store を選びます。`STRATA_VERIFY_HOST_UNCACHED` が `env_on()` 判定で有効なら uncached host allocation を維持します。この値も static cache されます。なおこのメモリ選択は `g_stepped` に基づくため、`STRATA_VERIFY_EAGER` などで segmented 実行に入らない場合にも適用されます。
+全expert常駐時は通常の区間serveがありません。必要な PLE 行を用意した後、graph起動前にhost flagを立て、windowのgraphを実行します。この経路では窓内のレイヤごとのCPU serveを行いません。
 
-通常は有効化を知らせる専用ログはありません。`STRATA_VERIFY_NODES` が設定されている場合（空文字を含む）は capture 時に segment 数を stderr に出します。実行失敗時は上記 remote-opt エラーのほか、queue drain 後の ring 不達で `verify (stepped): layer ... did not ring after its queue drained ...`、segment 処理中の例外で `verify (stepped): ...` などを `err` に設定します。
-
-根拠: `sycl/src/core/verify.cpp:218-241, 1287-1297, 1361-1366, 1461-1466, 1687-1727, 1734-1738, 2041-2059, 2063-2149, 2180-2202`。
+このモードでは、window用のhost allocationは通常の `sycl::malloc_host` になります。`STRATA_VERIFY_HOST_UNCACHED` を有効値にした場合はuncached host allocationを維持します。stepped無効時は従来どおりuncached allocationを使います。これはwindowのmapped bufferとdoorbell payload storeの扱いにも関係します。
 
 ## 根拠
 
-- 環境変数の値判定と起動時 cache: `sycl/src/core/verify.cpp:92-103`。
-- host uncached allocation との相互作用: `sycl/src/core/verify.cpp:218-241`。
-- lean path と shared-expert fork の抑止: `sycl/src/core/verify.cpp:803-810, 1287-1297`。
-- segment hook と `STRATA_VERIFY_SPLIT` の判定: `sycl/src/core/verify.cpp:1687-1727`。
-- segmented capture の選択: `sycl/src/core/verify.cpp:1734-1738`。
-- stepped 実行分岐、remote expert-opt エラー、CPU serve と flag 公開: `sycl/src/core/verify.cpp:2041-2149`。
-- all-resident 経路と stepped 後の通常 wait の抑止: `sycl/src/core/verify.cpp:2180-2202`。
-- `docs/DETAILS.md` には `STRATA_VERIFY_STEPPED` の説明を確認できませんでした。性能値は本調査文書には記載していません。
+- `sycl/src/core/verify.cpp:92-103` — `env_on()` の値判定、`g_stepped` の初期化。
+- `sycl/src/core/verify.cpp:218-239` — stepped 時のhost allocation選択と `STRATA_VERIFY_HOST_UNCACHED` の例外。
+- `sycl/src/core/verify.cpp:1679-1719,1726-1734` — windowの区間記録、`STRATA_VERIFY_SPLIT`、EAGERとの関係、任意のsegment数ログ。
+- `sycl/src/core/verify.cpp:2039-2057,2064-2135,2137-2154` — 通常/全expert常駐の経路選択、CPU pool・flag処理、remote expert optのエラー、eager fallback。
+- `sycl/src/core/verify.cpp:2186-2200` — stepped経路で通常のhost per-layer serveを省略する箇所。
+- `sycl/include/strata/core/verify.hpp:358-369` — モードの設計説明、step hook、segment graphのメンバー。
+
+`docs/DETAILS.md` には `STRATA_VERIFY_STEPPED` の説明は見つかりませんでした。速度・正確性の測定値はこの文書では主張しません。

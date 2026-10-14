@@ -1,67 +1,41 @@
 # `STRATA_HIP_ADAPT_KERNEL_COPY`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリ・GPU ドライバーの環境変数（`HSA_ENABLE_SDMA` など）は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（`2026-10-14` 時点）。
 
 ## 役割
 
-HIP ビルド専用の opt-in。適応層（adaptive tier）の expert swap の host→device コピーを、copy-engine（SDMA）の memcpy ではなく、refill stream 上のカーネル（`copy_from_mapped`）で実行する。gfx1030 で MMQ prompt 経路・adaptive swaps・SDMA が同時に効いたときハングする問題（#884）の回避策。prompt read の SDMA はそのまま（SDMA を全体で切る `HSA_ENABLE_SDMA=0` とは違い、swap だけ SDMA 経由にしない）。
-
-読み取りは `src/program/generate.cpp` の `adapt_copy_h2d()` 1 箇所（SYCL ビルドに同一ロジックのミラー `sycl/src/program/generate.cpp:201`）。呼び出しは adaptive swap の device_slot 書き込み（`src/program/generate.cpp:8438,12941`）。
+適応型エキスパートキャッシュの swap/refill で行うホストから GPU へのコピーを、条件が合う場合に通常の非同期 memcpy ではなく GPU カーネルで実行する HIP 向けの切り替えである。ソースコメントでは SDMA（コピーエンジン）を避けるための回避策として説明されている。`strata generate` と `strata serve` の適応型 swap が対象であり、通常のプロンプト読み込みやすべてのホスト・デバイス間コピーを切り替える設定ではない。
 
 ## 値と判定
 
-`std::getenv` の結果の**先頭文字 `e[0]` だけ**を `'1'` と比較する。文字列全体・数値は parse しない。
-
 | 状態 | 判定 |
 |---|---|
-| 未設定（`nullptr`） | 無効（既定） |
-| 空文字 `""` | 無効（`e[0]` は `\0`） |
-| 先頭文字が `1`（`1`, `10`, `1anything`） | 有効 |
-| それ以外（`0`, `true`, `false`, `2` など） | 無効 |
+| 未設定 | 無効 |
+| 空文字 | 無効 |
+| 値の先頭文字が `1`（例: `1`, `10`, `1anything`） | 有効 |
+| それ以外（例: `0`, `true`, ` 1`） | 無効 |
 
-大文字小文字・空白・数値妥当性は検査しない。
-
-根拠: `src/program/generate.cpp:181-182`。
+文字列全体の比較や数値変換は行わず、初回評価時に `getenv` が非 null かつ先頭文字が `'1'` かだけを判定する。判定結果は関数内の `static const bool` に保存されるため、同一プロセスでその後に環境変数を変更しても再評価されない。有効と判定された初回呼び出しでは、stderr に `strata: STRATA_HIP_ADAPT_KERNEL_COPY=1: adaptive swaps copy with a kernel, not SDMA (#884)` を出力する。
 
 ## 有効になる条件
 
-値が有効でも、次の条件が揃わないと通常の `cudaMemcpyAsync`（SDMA）に fallback する。
-
-- ビルドが HIP（`#if defined(STRATA_USE_HIP)`）。CUDA ビルドではこの分岐自体通らない。
-- `bytes % 16 == 0`。
-- `src` と `dst` が 16 バイト境界对齐（`(uintptr_t)src & 15 == 0` かつ `(uintptr_t)dst & 15 == 0`）。
-- source が registered / mapped であること（`cudaHostGetDevicePointer` が成功し非 null を返す）。失敗・null は通常の memcpy へ。
-
-条件不足のとき `copy_from_mapped` は呼ばれず、`cudaMemcpyAsync(..., cudaMemcpyHostToDevice, st)` になる（`src/program/generate.cpp:186-195`）。
+- 実装は `#if defined(STRATA_USE_HIP)` の範囲内にある。通常の CUDA ビルドではこの環境変数を読まず、通常の `cudaMemcpyAsync` 経路を使う。
+- 適応型 swap の各コピーが `adapt_copy_h2d` に到達する必要がある。呼び出し元で `STRATA_DMA_BATCH` のモードが 0 以外の場合、コピーはまとめて `copy_blobs` に送られ、この環境変数によるカーネル経路を通らない。`copy_blobs` の HIP 側実装は通常の `cudaMemcpyAsync` のループである。`--serve` の複数 GPU 経路は `dma_mode` を 0 にする。
+- カーネル経路には、コピーサイズが16バイト単位で、送信元と宛先の両ポインターが16バイト境界に揃っていることが必要である。
+- さらに `cudaHostGetDevicePointer` で送信元のデバイス可視ポインターを得られる必要がある。取得失敗または null の場合はエラーをクリアし、通常の非同期 memcpy にフォールバックする。したがって設定値が有効でも、これらの条件を満たさないコピーにはカーネル方式は適用されない。
 
 ## 実行時の詳細
 
-判定結果は `adapt_copy_h2d()` 内の `static const bool kernel` に保存され、プロセス内で最初に呼ばれたとき一度だけ環境を読む。その後の環境変更は再評価されない。
+`adapt_copy_h2d` は条件を満たす場合、送信元のマップ済みホスト領域をデバイス可視ポインターに変換し、`strata::kernels::copy_from_mapped` を同じ refill stream に投入する。CUDA 実装は `float4` 単位でデータを読み書きするカーネルであり、SYCL 実装も同じく16バイト整列と4要素単位を検査してコピー用カーネルを投入する。カーネル呼び出し後はその起動エラーを返す。条件不成立なら、CUDA/HIP 経路は `cudaMemcpyAsync(..., cudaMemcpyHostToDevice, st)`、SYCL 経路は queue の非同期 `memcpy` に戻る。
 
-有効時、初回判定で stderr に一度だけ:
-
-```
-strata: STRATA_HIP_ADAPT_KERNEL_COPY=1: adaptive swaps copy with a kernel, not SDMA (#884)
-```
-
-（`src/program/generate.cpp:183`）。
-
-有効かつ条件を満たす swap では、`copy_from_mapped`（`float4` 単位の device コピーカーネル、`src/kernels/cuda/elementwise.cu:299-308`）を adaptive stream（refill stream）上に launch する。カーネル launch 後の `cudaGetLastError()` を返す。
-
-## 測定値（資料に記載）
-
-`docs/AMD_HIP.md:209-211` はこれを gfx1030 ハング（#884）の workaround として説明し、「reporter のマシンで未テスト」と明記する。このスイッチ自体の性能向上数値は資料にない。同節の `436 -> 757 tok/s` は別変数 `STRATA_DENSE_MMQ` の測定であり、`STRATA_HIP_ADAPT_KERNEL_COPY` の効果ではない。
-
-## 相互作用
-
-- `STRATA_DENSE_MMQ`（同じ #884 のハング条件に関与。MMQ prompt 経路が有効なときに swap・SDMA と組み合わさるとハング）。
-- `HSA_ENABLE_SDMA` は外部 driver が読む変数で、Strata の実装はこれを解釈しない（Strata 側は prompt read の SDMA をこのスイッチで切らない、という事実だけ）。
+この helper は、通常の適応型 swap/refill の個別コピーで利用される。CUDA/HIP 共通ソースでは `strata generate` と `strata serve` の両方に呼び出しがあり、SYCL 移植ソースにもそれぞれの呼び出しがある。まとめてコピーする分岐では helper を呼ばない。呼び出し後の swap 完了待ちは既存の適応処理が行う。
 
 ## 根拠
 
-- 読み取り・判定: `src/program/generate.cpp:180-185`。
-- 条件と fallback: `src/program/generate.cpp:186-195`。
-- 呼び出し箇所（adaptive swap）: `src/program/generate.cpp:8438,12941`。
-- コピーカーネル: `src/kernels/cuda/elementwise.cu:299-308`。
-- SYCL ミラー: `sycl/src/program/generate.cpp:201-206`。
-- docs 照合: `docs/AMD_HIP.md:209-211`、`docs/DETAILS.md:278`。
+- `src/program/generate.cpp:185-208` — 環境変数の読み取り、先頭文字判定、stderr の文言、整列・マップ確認、カーネルまたは通常コピーへの分岐。
+- `sycl/src/program/generate.cpp:195-225` — SYCL 側の同じ判定と処理。
+- `src/program/generate.cpp:8921-8937, 8957-8961, 13667-13697` — `strata serve` / `strata generate` の個別 swap コピーと、`dma_mode != 0` 時に helper を迂回する分岐。
+- `sycl/src/program/generate.cpp:8032-8091, 12420-12453` — SYCL 側の同じ呼び出し条件。
+- `include/strata/core/dma_batch.hpp:9-15, 65-111` — `STRATA_DMA_BATCH` のモードと、HIP ビルドでは `copy_blobs` が通常コピーのループになること。
+- `src/kernels/cuda/elementwise.cu:229-234, 299-309`、`sycl/src/kernels/cuda/elementwise.dp.cpp:544-560` — マップ済み領域を読むカーネル実装。
+- `docs/AMD_HIP.md:206-211` — #884 の回避策として紹介されている。文書は gfx1030 の hang 事例を述べるが、現行ソースが確認できるのは切り替え処理までであり、特定 GPU での再現性や性能効果をこの調査で検証したものではない。

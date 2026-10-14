@@ -1,42 +1,43 @@
 # `STRATA_VERIFY_COHERENT`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
 
 ## 役割
 
-HIP verifier が mapped host buffer を確保するとき、明示的に coherent と指定した host memory を要求する診断用の切り替えです。コメントは gfx1030 の verifier timeout に関する opt-in A/B 用と説明しています。CUDA の通常経路では環境変数を読みません。
+HIP 版 verifier が使う、GPU と CPU で共有する mapped host memory の割当経路を切り替える診断用 A/B 変数です。`STRATA_USE_HIP` を定義したビルドでのみ値を読み、設定が有効なら `hipHostMalloc` を `hipHostMallocMapped | hipHostMallocCoherent` 付きで直接呼びます。ここで割り当てる verifier の staging 領域には、handshake 用の flags や token/row データが含まれます。通常の CUDA ビルドではこの変数を読みません。根拠: `src/core/verify.cpp:189-199,313-325,627-645`。
 
 ## 値と判定
 
-HIP 実装の `env_on()` は `getenv()` の戻り値について、未設定、空文字、または先頭文字が `0` の場合に false、それ以外を true とします。文字列全体の parse や数値変換はしません。
+文字列全体や数値としての妥当性は検査しません。共通 helper `env_on()` は、値が設定され、空でなく、先頭文字が `0` でなければ有効とします。
 
-| 環境値 | HIP での結果 |
+| 値 | 判定 |
 |---|---|
 | 未設定 | 無効 |
 | 空文字 | 無効 |
-| `0`、`0anything` | 無効 |
-| `1`、`true`、`false`、`2`、`anything` | 有効 |
+| `0` または `0` で始まる文字列（例: `0abc`） | 無効 |
+| その他の空でない文字列（例: `1`, `false`, `-1`, ` 1`） | 有効 |
 
-先頭文字だけを比較するため、大文字小文字、後続文字、数値としての妥当性は判定しません。値は namespace-scope の `const bool g_coherent` 初期化時に一度読み取られます。プロセス起動後に環境を書き換えても再評価されません。
+大文字小文字、後続文字、数値範囲は判定に影響しません。`g_coherent` は HIP ビルド時のグローバル定数として初期化されるため、起動後の環境変更は反映されません。根拠: `src/core/verify.cpp:192-198`。
 
 ## 有効になる条件
 
-- `src/core/verify.cpp` では `STRATA_USE_HIP` が定義されたビルドだけで変数を読み、mapped buffer の確保に適用します。CUDA ビルドではこの変数による分岐はありません。
-- 値が有効でも、verifier が `mapped()` を呼ぶ allocation に限って適用されます。HIP では `hipHostMallocMapped | hipHostMallocCoherent` を指定し、複数 GPU の peer portability が必要な場合は `hipHostMallocPortable` も付けます。未設定または無効なら従来の `cudaHostAllocMapped` 経路を使います。
-- 要求した allocation に失敗すると `mapped()` は false を返します。初期化時の staging/plan buffer なら、それぞれ `verify: mapped staging allocation failed` または `verify: mapped plan allocation failed` で verifier の初期化が失敗します。
-- SYCL 実装（`sycl/src/core/verify.cpp`）にも同名の読み取りがありますが、そこでは `STRATA_USE_HIP` 条件下の宣言と trace ログ表示にだけ使われています。SYCL の `mapped()` は `window_host_uncached()` に応じて `strata::host_malloc_polled()` または `sycl::malloc_host()` を選び、この変数を参照しません。したがって、SYCL の mapped allocation の方式はこの変数では切り替わりません。
+- `STRATA_USE_HIP` が定義されたビルドでのみ `g_coherent` が定義されます。CUDA ビルドでは環境変数の読み取りも割当切替もありません。根拠: `src/core/verify.cpp:196-199,313-323`。
+- 変数が有効なとき `mapped()` は明示的な HIP coherent allocation を行い、失敗時は `false` を返します。その場合、通常の `cudaHostAlloc` 経路には fallback しません。unset または無効値なら通常経路に進みます。根拠: `src/core/verify.cpp:313-325`。
+- SYCL 側の `sycl/src/core/verify.cpp` にも同じ名前の読み取り定義がありますが、そのファイルの `mapped()` は `window_host_uncached()` に応じて `strata::host_malloc_polled()` または `sycl::malloc_host()` を呼び、`g_coherent` を参照しません。このため、SYCL 実装の割当経路はこの値では切り替わりません。根拠: `sycl/src/core/verify.cpp:89-100,229-242`。
 
 ## 実行時の詳細
 
-HIP 実装では `mapped()` が verifier の staging buffers（token/step/position、commit、出力、routing rows、sequence と flags など）、GPU plan、さらに trace 用 buffer の確保に使われます。`STRATA_VERIFY_COHERENT` が有効なら、これらの mapped allocation は明示的 coherent flag 付きで要求されます。この切り替え自体は性能や正確性の測定結果を保証しません。
+HIP 版 verifier の `mapped()` は、値が有効なら `hipHostMalloc(h, bytes, hipHostMallocMapped | hipHostMallocCoherent | portable flag)` を呼びます。portable flag は `peer_portable()` が真の場合だけ追加されます。無効なら `cudaHostAlloc(..., cudaHostAllocMapped | portable flag)` を呼び、どちらの経路も成功後に host 側をゼロ初期化して device pointer を取得します。staging 領域や plan 領域の割り当て失敗は `verify: mapped staging allocation failed` または `verify: mapped plan allocation failed` として返されます。根拠: `src/core/verify.cpp:313-325,627-655`。
 
-`STRATA_VERIFY_TRACE` も有効で trace buffer の確保処理まで到達すると、HIP 経路は stderr に `strata verify trace (#649): on; coherent words explicit, ...` と表示します。変数が無効なら `coherent words default` です。trace が無効な場合、この coherent 状態を示すログは出ません。SYCL で `STRATA_USE_HIP` が定義された場合も trace ログに状態が表示されますが、上記の通り SYCL allocation の選択には影響しません。
+`STRATA_VERIFY_TRACE` も有効で、HIP 版の trace buffer の作成まで進むと、stderr に `coherent words explicit`（本変数が有効）または `coherent words default`（無効）を含む行を出します。本変数だけを設定してもこのログは出ません。根拠: `src/core/verify.cpp:716-731`。
 
 ## 根拠
 
-- `src/core/verify.cpp:169-180`: #649 の HIP opt-in コメント、`env_on()` の判定、HIP 条件付きの読み取り。
-- `src/core/verify.cpp:293-305`: coherent flag 付き HIP allocation と通常 mapped allocation の分岐。
-- `src/core/verify.cpp:605-623,630-632`: mapped staging/plan の使用箇所と allocation failure の扱い。
-- `src/core/verify.cpp:694-709`: trace buffer の mapped allocation と HIP の状態ログ。
-- `sycl/src/core/verify.cpp:89-100,229-242,534-558,620-635`: SYCL 側の読み取り、mapped allocation の方式、trace ログ。`g_coherent` はログ表示にだけ参照されます。
-- `docs/DETAILS.md` には `STRATA_VERIFY_COHERENT` の個別説明を確認できませんでした。性能値や推奨設定は記載していません。
+- 値の読み取りと判定: `src/core/verify.cpp:189-199`。
+- HIP 版での割当経路: `src/core/verify.cpp:313-325`。
+- verifier staging/plan での使用と失敗文字列: `src/core/verify.cpp:627-655`。
+- 条件付き trace ログ: `src/core/verify.cpp:716-731`。
+- SYCL 版の読取定義と、変数に依存しない割当: `sycl/src/core/verify.cpp:89-100,229-242`。
+- HIP 互換ヘッダーでは `cudaHostAlloc` が `hipHostMalloc` に対応付けられます: `include/strata/hip_compat/cuda_runtime.h:65-80`。
+
+この commit の `docs/DETAILS.md` には本変数の説明は見つからず、根拠にできる説明は verifier ソースの #649 コメント（gfx1030 の verify timeout 調査向け A/B）です。性能や timeout への効果を示す測定結果は、この調査では確認できませんでした。

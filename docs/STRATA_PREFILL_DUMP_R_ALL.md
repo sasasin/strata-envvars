@@ -1,44 +1,42 @@
 # `STRATA_PREFILL_DUMP_R_ALL`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。Strata 所有の CUDA 系および SYCL の実装を確認した。外部ライブラリや GPU ドライバーの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-プロンプト処理の最終 residual `m.R` を、各位置について BF16 の生データとしてファイルに追記する診断・データ採取用フックです。コードコメントは draft-layer distillation data 用としています。通常の生成設定を変える分岐ではなく、ファイル出力と GPU/queue の同期を追加します。
-
-読み取り箇所は `src/prefill/prefill.cpp` と `sycl/src/prefill/prefill.cpp` の各1箇所です。両方とも layer-split の後続 stage がない経路（`next_ == nullptr`）で、chunk の layer 処理後に実行されます。先行 stage は residual を次 stage に hand-off して `continue` するため、その stage ではこのファイル出力を行いません。
+プロンプト prefill の各 token 位置について、最終 multi-stream residual `R` を BF16 に丸め、指定ファイルへ追記します。コードコメントでは draft-layer distillation data 用の opt-in フックとされています。通常の生成結果や prefill の計算を切り替える設定ではなく、追加の同期・device-to-host copy・ファイル書き込みを行う調査用出力です。
 
 ## 値と判定
 
 | 環境変数の状態 | 動作 |
 |---|---|
-| 未設定 | 出力しない。 |
-| 設定済み（空文字を含む） | 設定値をファイルパスとして `fopen(path, "ab")` に渡す。開けた場合に出力する。 |
-| `0`、`false` などの文字列 | 特別な無効値として解釈しない。文字列全体をパスとして扱う。 |
+| 未設定 | 出力処理を行わない |
+| 空文字を含む任意の設定値 | 設定値をファイルパスとして `fopen(path, "ab")` に渡す。文字列比較や数値変換はしない |
+| パスを開けない値 | `fopen` が失敗し、出力を黙ってスキップする |
 
-`getenv()` の戻り値が null かどうかだけを調べ、`atoi` 等の変換や真偽文字列の比較はしません。したがって空文字も設定ありとして同期処理まで進みますが、空のパスを `fopen` が開けない場合は書き込みません。相対パスならプロセスの作業ディレクトリからのパスです。既定値、CLI 引数、設定ファイルによる上書きはありません。
+値は `getenv` で各 chunk の出力箇所に到達した時点で読みます。`static` cache はありません。したがって、コード上は後続 chunk で環境値を再取得します。
 
 ## 有効になる条件
 
-- `Prefill::run_impl()` が実行され、その chunk が `next_ == nullptr` の stage に到達すること。
-- chunk の layer 処理後に `ple_land()` が成功して処理が続くこと。途中 return/error した chunk は出力箇所まで到達しません。
-- 当該箇所で環境変数が設定されており、指定パスを `fopen(..., "ab")` で開けること。
+- CUDA 実装（`src/prefill/prefill.cpp`）または SYCL 実装（`sycl/src/prefill/prefill.cpp`）の prefill 経路を通ること。
+- layer-split prefill では `next_ == nullptr` の最終 stage のみがこの書き出し箇所に到達します。中間 stage は後続 stage に hand-off して `continue` するため、この箇所では出力しません。
+- Metal は `Prefill::run()` から `metal_engine::prompt_run()` に分岐して `run_impl()` を呼ばないため、この環境変数の読み取り箇所を通りません。
 
-CUDA 系では `src/prefill/prefill.cpp`、SYCL では `sycl/src/prefill/prefill.cpp` に同じ機能があります。両方とも `D = N * HC` を固定定義し、`N=2560`, `HC=4`, `D=10240` です。外側の chunk ループごとに条件を評価するため、値を static cache しません。コード上は各 chunk のこの箇所で環境変数を読み直します。両環境変数 `STRATA_PREFILL_DUMP_R` と `STRATA_PREFILL_DUMP_R_ALL` が同時に設定されていれば、別々の出力処理が両方行われます。
+通常の prefill 呼び出し、プロンプト chunk 分割、server/CLI のどれかに限定する判定は、この変数の実装箇所にはありません。各 chunk の終端 stage で値が設定されていれば出力します。
 
 ## 実行時の詳細
 
-環境変数が設定されていると、ファイルを開けるかどうかにかかわらず、まず CUDA stream または SYCL queue を同期します。その後ファイルを append mode で開き、chunk 内の全 `T` 行を最大512行ずつ host にコピーして BF16 に変換し、順番に書きます。`std::fwrite` の戻り値は確認せず、`fopen` が失敗しても警告やエラーを出しません。ファイル書き込みの失敗をこの箇所が `err` に設定することもありません。
+`m.R` は `T` 行、各 `D` 個の float を持つ最終 residual バッファです（このソースでは `D = N * HC`）。環境変数が設定されていると、まず CUDA stream または SYCL queue を同期し、`m.R` を最大 512 行ずつ host にコピーします。各 float の IEEE 754 bit pattern `u` に `0x7fff + ((u >> 16) & 1)` を加えた後、上位 16 bit を保存しており、BF16 の round-to-nearest-even への丸めです。
 
-出力はヘッダーなしの連続した 16-bit 値です。各行は `m.R` の `D=10240` 個の float 要素を並び順のまま BF16 に丸めたもので、1行あたり 20,480 bytes です。変換は float の上位16 bitを取り出し、下位部と上位部の最下位bitを使って round-to-nearest-even を行っています。値は `uint16_t` 配列をそのまま書くため、ファイル内の byte order は実行環境の native byte order です。行の位置番号、chunk 長、request 境界、shape はファイルに格納されません。コードコメント上は chunk と request をまたいで追加される形式です。同じパスを使うと既存ファイル末尾に追記し、開始時に切り詰めません。
+出力は token 位置順に並ぶ raw な `uint16_t`（BF16）の連続列です。ファイルにはヘッダー、位置番号、chunk/request 境界は書きません。各 chunk で `fopen(path, "ab")` を使うため、既存ファイルの末尾へ追記し、複数 chunk・複数 request のデータも同じファイルに連結されます。固定寸法のこの実装では各行 10,240 BF16 値（20,480 byte）です。
+
+ファイルを開けない場合の警告・エラー設定はありません。`fwrite` や residual copy の戻り値もこの箇所では検査せず、ログ出力もありません。`STRATA_PREFILL_DUMP_R` は別の出力経路で、64 token ごとに位置番号と F32 residual を別形式で書きます。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:98-104`: `N`, `HC`, `D` の固定値。
-- `src/prefill/prefill.cpp:2139-2143`: `run_impl()` の chunk ループと `T` の算出。
-- `src/prefill/prefill.cpp:4050-4071`: 先行 layer-split stage は residual を hand-off して次 stage に進む。
-- `src/prefill/prefill.cpp:4085-4105`: 環境変数判定、同期、ファイル append、512行単位のコピー、BF16丸め、書き込み。
-- `sycl/src/prefill/prefill.cpp:98-100, 4480-4502`: SYCL 側の対応する定義と出力処理。
-- `src/prefill/prefill.cpp:4230-4242`, `sycl/src/prefill/prefill.cpp:4703-4715`: `run()` から `run_impl()` を呼び、pipeline drain を行う経路。
-
-`docs/DETAILS.md` などの資料でこの変数の追加仕様や出力レイアウトを説明する記述は確認できなかったため、形式と挙動は上記実装から記述した。
+- `src/prefill/prefill.cpp:4180-4214`: CUDA の `STRATA_PREFILL_DUMP_R_ALL` 読み取り、同期、最大 512 行単位の copy、BF16 丸め、追記。
+- `sycl/src/prefill/prefill.cpp:4463-4500`: SYCL の対応実装。形式と追記動作は CUDA と同じ。
+- `src/prefill/prefill.cpp:4169-4179, 4180-4193`: 中間 layer-split stage の hand-off と最終 stage 側の出力箇所。
+- `src/prefill/prefill.cpp:4338-4354`: Metal 経路は `prompt_run()` に分岐し、通常経路の `run_impl()` より前に戻る。
+- `src/prefill/prefill.cpp:118`: `N = 2560`, `HC = 4`, `D = N * HC` の寸法定義。
+- `docs/DETAILS.md` および他の設計資料に、この変数の説明や出力形式・測定値の記載は見つかりませんでした。

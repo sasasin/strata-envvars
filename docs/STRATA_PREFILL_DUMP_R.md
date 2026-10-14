@@ -1,41 +1,43 @@
 # `STRATA_PREFILL_DUMP_R`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-プロンプト prefill の各チャンクが最後の layer stage を終えたとき、最終 residual `R` のうち絶対位置が64の倍数となる行を、指定パスへバイナリ出力します。ソースコメントでは A/B 品質確認用の debug dump とされています。通常の生成設定を切り替える変数ではなく、ファイル書き出しと GPU/queue 同期を追加する診断用フックです。
+プロンプト prefill の各 chunk から、絶対位置が 64 の倍数となる token の最終 residual 行をバイナリファイルへ書き出します。ソースコメント上の目的は、この経路の A/B 品質比較用です。通常の生成結果を変える設定ではありませんが、該当 chunk ごとに device queue/stream の完了を待ってホストへコピーするため、prefill の実行時間や同期タイミングには影響します。
+
+読み取り箇所は CUDA 系 prefill 実装と SYCL prefill 実装に各 1 箇所あります。Metal の `Prefill::run` は Metal 用 `prompt_run` を呼んで戻るため、この `run_impl` 内の読み取りには入りません。
 
 ## 値と判定
 
-| 状態 | 動作 |
+値を真偽値や数値として parse せず、`std::getenv()` が null かどうかだけを判定します。設定値そのものを `fopen` のパスとして渡します。
+
+| 環境変数の状態 | 処理 |
 |---|---|
-| 未設定 | dump 処理を行わない。 |
-| 設定あり（空文字を含む） | 値をそのままファイルパスとして `fopen` に渡す。文字列の parse、真偽値判定、空白除去はない。 |
-| パスを開ける | 出力する。各 `run_impl` 呼び出しの最初のチャンク（`c0 == 0`）は `wb` で新規作成または切り詰め、後続チャンクは `ab` で追記する。 |
-| パスを開けない | `fopen` が失敗し、dump 部分は何も書かずに続行する。専用の警告・エラー処理はない。 |
-
-空文字も「設定あり」として同期処理までは進みますが、通常は空のパスを開けず、書き込みは行われません。
-
-各サンプル行は、まずネイティブ表現の `int64_t` 位置 `pos`、続いて `D` 個のネイティブ表現 `float` residual 値を順に書きます。ファイルにヘッダーや次元情報は付かず、エンディアンや浮動小数点形式の変換もありません。書き込み戻り値は確認されません。
+| 未設定 | ダンプ処理を行わない。 |
+| 設定あり（空文字を含む） | ダンプ処理へ進み、値をファイルパスとして開こうとする。`0`、`false` なども特別扱いせず、その文字列のパスとして使う。 |
+| パスを開けない | 何も書かず、その場でエラーを返さない。明示的な警告ログもない。空文字もこのケースになる。 |
 
 ## 有効になる条件
 
-- CUDA 実装（`src/prefill/prefill.cpp`）または SYCL 実装（`sycl/src/prefill/prefill.cpp`）の prefill 経路で評価されます。
-- 現在の `run_impl` が layer split の最終 stage であることが必要です。後続 stage (`next_ != nullptr`) がある場合は、先に hand-off して `continue` するため、この stage では dump しません。最終 stage 側で同じ処理が実行されます。
-- 対象チャンクの処理後、`m.R` に残っている最終 residual を読みます。絶対位置 `p0 + t` が64の倍数となる行だけが対象です。先頭の対象オフセットは `(64 - p0 % 64) % 64` です。
-- `STRATA_PREFILL_DUMP_R_ALL` は別の変数で、全位置を BF16 で書き出す別処理です。両方を設定した場合は各 dump 処理が独立して実行されます。
+- `Prefill::run_impl` が実行され、chunk の処理が `next_ == nullptr` の末尾 stage まで到達すること。layer split の中間 stage は successor に hand-off して `continue` するため、その stage ではこの環境変数を読まない。単一 stage の prefill は末尾 stage に当たる。
+- CUDA 系では `src/prefill/prefill.cpp`、SYCL では `sycl/src/prefill/prefill.cpp` の該当実装が対象。リポジトリ全体の完全一致検索では、この2箇所以外に `STRATA_PREFILL_DUMP_R` の読み取りは見つからない。
+- 絶対位置 `p0 + t` が 64 の倍数となる行だけを出力する。chunk 内に該当位置がなければ、その chunk からのデータ行はない。ただしファイルを開く処理は行われる。
 
 ## 実行時の詳細
 
-変数はチャンクごとの書き出し箇所で `std::getenv` により読み直され、static cache されません。したがってコード上はチャンクごとにパスを再取得します。各 `run_impl` の最初のチャンクでファイルを切り詰めるため、後続チャンクは同じ実行内で追記されます。次の `run_impl` 呼び出しも `c0 == 0` から始まり、同じパスなら既存ファイルを切り詰めます。
+判定は static cache されず、末尾 stage の各 chunk で `getenv()` を再実行します。CUDA 実装では `cudaStreamSynchronize(m.cs)`、SYCL 実装では `m.cs->wait()` の後、chunk 内の行をホストにコピーします。したがって、環境変数をプロセス起動時に一度だけ読む設定ではありません。
 
-dump が有効な場合、CUDA は `cudaStreamSynchronize(m.cs)`、SYCL は `m.cs->wait()` を実行してから residual を host memory へコピーします。該当行がないチャンクでもこの同期とファイル open/close は行います。ファイル open 失敗や `fwrite` 失敗のログはありません。
+出力はヘッダーなしのレコード列です。各レコードは、まず位置 `p0 + t` の `int64_t` を1個、その後に `D` 個の `float`（各4 byte）を書きます。現在の実装定数は `N=2560`、`HC=4`、`D=N*HC=10240` です。値はホストのネイティブな整数・浮動小数点表現で書かれます。行の間やファイル先頭に追加の区切り・メタデータはありません。
+
+各 `run_impl` 呼び出しの最初の chunk は `c0 == 0` なので `fopen(path, "wb")` でファイルを新規作成または切り詰め、その呼び出し内の後続 chunk は `"ab"` で追加します。よって後続 chunk は同じ prefill 呼び出し中では追記ですが、新しい `run_impl` 呼び出しの最初の chunk では既存内容を消します。`fopen` の失敗や `fwrite` の戻り値は明示的に報告されません。
+
+この変数名の記載と測定値は `docs/DETAILS.md` では見つかりませんでした。動作の説明は現行ソースの分岐に基づきます。
 
 ## 根拠
 
-- CUDA のチャンク loop、`c0` と絶対位置 `p0` の設定: `src/prefill/prefill.cpp:2139-2143`。
-- CUDA での最終 stage 判定、同期、サンプル選択、`int64_t` と `float` の出力、ファイル mode: `src/prefill/prefill.cpp:4065-4083`。
-- SYCL の同等処理: `sycl/src/prefill/prefill.cpp:4452-4478`。
-- `STRATA_PREFILL_DUMP_R_ALL` との別処理: `src/prefill/prefill.cpp:4085-4106`, `sycl/src/prefill/prefill.cpp:4480-4502`。
-- `docs/DETAILS.md` と関連設計資料には、この変数の利用説明や測定値を確認できませんでした。
+- `src/prefill/prefill.cpp:118` — residual 行幅 `D=N*HC` と各定数。
+- `src/prefill/prefill.cpp:2087-2090,2178-2182` — `run_impl` と chunk offset / 絶対位置の設定。
+- `src/prefill/prefill.cpp:4173-4189` — 中間 stage の hand-off、末尾 stage の環境変数判定、同期、位置選択、ファイル形式と open mode。
+- `src/prefill/prefill.cpp:4338-4359` — Metal 用 `prompt_run` への分岐と、それ以外の `run_impl` 呼び出し。
+- `sycl/src/prefill/prefill.cpp:2101-2105,2217-2221,4455-4475` — SYCL 実装の呼び出し、chunk 設定、同等のダンプ処理。

@@ -1,46 +1,49 @@
 # `STRATA_PREFILL_AUTO_MAX`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。対象リポジトリの作業ツリーは調査時点で clean。外部ライブラリの環境変数の動作は対象外。
 
 ## 役割
 
-`--prefill auto` が自動選択する prompt chunk の上限を、既定の 8192 token から 16384 または 32768 token に引き上げます。上限を指定する変数であり、実際にそのサイズが選ばれるかは expert cache から prompt buffer を借りられるか、context 長などで決まります。CUDA/HIP 系と SYCL の `generate` 実装にあります。
+`--prefill auto` が選ぶ prompt 処理 chunk の上限を指定します。既定の上限は 8,192 tokens で、この変数を使うと 16,384 または 32,768 tokens まで auto の候補を広げられます。実際にその大きさが使われるかは別途、context、expert cache の空き、prompt buffer の必要量などで決まります。
+
+環境変数を読む実装は CUDA 系の `src/program/generate.cpp` と SYCL 系の `sycl/src/program/generate.cpp` の `--prefill` 引数解析にあります。設定値は起動時の引数解析時に `Options` へ取り込まれます。リクエストごとの再読み込みや、起動後に環境を書き換えた場合の反映はありません。
 
 ## 値と判定
 
-この変数は `--prefill` の引数を解析する箇所で `getenv()` されます。`--prefill` がなければ読み取られず、数値 chunk を指定した場合も効果はありません。値は `atoll()` で変換し、しきい値で次の3段階に丸めます。文字列全体の妥当性検査やエラー表示はありません。
+両実装とも `std::atoll` で整数変換し、値を次の3段階に丸めます。文字列全体の厳密な検証はしません。
 
-| `--prefill` | 環境変数 | `prefill_auto_max` |
+| `--prefill` の値 | `STRATA_PREFILL_AUTO_MAX` | 設定される上限 |
 |---|---|---:|
-| `auto` | unset | 8192 |
-| `auto` | `atoll()` の結果が 16384 未満 | 8192 |
-| `auto` | `atoll()` の結果が 16384 以上 32768 未満 | 16384 |
-| `auto` | `atoll()` の結果が 32768 以上 | 32768 |
-| `auto:N` | 任意 | `N` を `atoll()` した値を同じしきい値で丸めた値。環境変数より CLI が優先 |
-| 数値など `auto` 以外 | 任意 | 環境変数は不使用 |
+| `auto` | 未設定 | 8,192 |
+| `auto` | `atoll` の結果が 16,384 未満 | 8,192 |
+| `auto` | `atoll` の結果が 16,384 以上 32,768 未満 | 16,384 |
+| `auto` | `atoll` の結果が 32,768 以上 | 32,768 |
+| `auto:N` | 任意 | 環境変数を無視し、`N` を同じ3段階で丸める |
+| 数値など `auto` 以外 | 任意 | 環境変数は chunk 値に影響しない |
 
-したがって `16384junk` は 16384、`32768` 以上の数値に続く文字は無視されます。空文字、数値で始まらない文字列、0、負数は変換結果がしきい値未満となり 8192 です。値そのものの数値範囲検査はありません。
+環境変数が空文字、数値で始まらない文字列、または負値なら `atoll` の結果は 0 以下となり、上限は 8,192 です。`atoll` は数値の後ろの文字列を検査しないため、たとえば `16384tail` は 16,384 として扱われます。値を 8,192 未満に指定しても、auto の上限は 8,192 より小さくなりません。範囲外をエラーにする処理はありません。
 
 ## 有効になる条件
 
-- 自動 chunk の上限になるのは `--prefill auto` または `--prefill auto:N` を指定し、後段でも `prefill_auto` が有効な場合です。
-- `--no-prefill-borrow` が指定された場合、または expert profile が空の場合、自動借用を無効にして chunk を 2048 に戻します。SYCL にも、この後段の同じ無効化があります。
-- 自動選択は設定上限を超えず、context 長も超えない範囲で、借用できる cache slot / buffer と ring の予算を見て chunk を決めます。したがって上限を 32768 にしても、32768 が必ず使われるわけではありません。
-- CUDA/HIP 実装では Windows HIP の bare `--prefill auto` に 6144 の cap がありますが、`STRATA_PREFILL_AUTO_MAX` が設定されていれば bare auto 扱いではなくなり、この特別 cap は付きません。値が空や不正でも「設定あり」と判定されます。
-- Linux HIP gfx12 の bare `--prefill auto` は、変数が未設定なら別の gfx12 条件により 16384 へ上げられる場合があります。変数が設定されているとこの bare-auto 分岐は使われず、値に応じた 8192/16384/32768 の上限になります。`STRATA_GFX12_CHUNK=0` または `STRATA_GFX12_DEFAULTS=0` は、変数未設定の bare-auto gfx12 引き上げを止めます。
+この変数が chunk の選択上限に使われるのは、`--prefill auto` を指定し、`--prefill auto:N` のような CLI 上限を指定していない場合です。`--prefill` 自体を指定しなければ、環境変数を使った上限設定は行われません。
+
+CUDA 系では、環境変数が設定されているかどうかも platform 固有の既定値判定に関わります。
+
+- **Windows HIP**: 変数が未設定の裸の `--prefill auto` は host limit により 6,144 tokens に制限されます。変数を設定すると、値が空や不正で結果的に上限 8,192 になっても「裸の auto」ではない扱いとなり、この 6,144 上限は適用されません。`auto:N` も裸の auto ではありません。ユーザー指定 chunk が 8,192 以上の場合は、警告を出したうえで要求値を維持する経路があります。
+- **Linux HIP の gfx12**: 裸の `--prefill auto` は、GPU 世代と `STRATA_GFX12_CHUNK` / `STRATA_GFX12_DEFAULTS` の条件により 16,384 へ引き上げられることがあります。`STRATA_PREFILL_AUTO_MAX` が設定されていると裸の auto ではなくなるため、この既定値引き上げは行われません。したがってこの変数を空や不正値で設定した場合は 8,192 上限のままです。
+- **その他の CUDA/HIP/SYCL 経路**: 直接の値判定は上表どおりです。最終 chunk は後段の実行条件によってさらに小さくなる場合があります。
 
 ## 実行時の詳細
 
-値は `--prefill` の引数解析時に読み込まれ、`prefill_auto_max` などの option fields に保存されます。後の auto planning はその保存値を上限として、cache lending に適合する chunk を選びます。プロセス実行中に環境を書き換えて再読込する処理はありません。
+auto chunk planner は `prefill_auto_max` を上限として、expert cache から prompt buffer 用領域を借りられる最大 chunk を選びます。通常の scan は 256-token 単位で上限まで候補を調べ、必要 buffer と貸出可能 slot の条件を満たす最大値を採ります。ring byte 機能が無効な旧経路では固定候補リストを使い、8,192 を超える候補は `prefill_auto_max` と context の両方以下の場合だけ候補になります。cache / buffer 条件を満たせなければ上限より小さな chunk になるか、別の小さい buffer 経路に移ります。
 
-CUDA/HIP と SYCL の両方で `auto:N` は環境変数に優先します。CUDA/HIP の Windows HIP cap / gfx12 の条件は前述のとおり bare auto の判定にも使われます。設定値による専用ログや警告はありません。
+したがって、この環境変数は実行 chunk を固定する指定ではなく、auto が選べる上限です。8,192 を超える候補の探索上限は `min(prefill_auto_max, max_context)` で制限されます。一方、planner の `auto_ceiling` は最低 8,192 に保たれるため、`max_context` が 8,192 未満でも通常の 8,192 以下の候補まで一律に小さくする処理ではありません。CUDA の gfx12 や layer split、メモリ条件など他の規則が上限を下げることもあります。
 
 ## 根拠
 
-- `src/program/generate.cpp:1946-1971`: `--prefill` の解析、`atoll()`、上限丸め、Windows HIP bare-auto 判定と cap。
-- `src/program/generate.cpp:2160-2175`: Linux HIP gfx12 の bare auto 上限と、環境変数設定時はこの調整をしない条件。
-- `src/program/generate.cpp:2426-2429`: borrow 不可または expert profile 不在時に auto を無効化し、chunk を 2048 にする処理。
-- `src/program/generate.cpp:6296-6301,6320-6328`: 自動計画上限の context clamp と候補 chunk の上限判定。
-- `sycl/src/program/generate.cpp:1790-1798,2221-2224,5953-5985`: SYCL 側の同じ値変換と、auto の無効化・上限を使った候補選択。
-- `include/strata/platform/host_limits.hpp:19-30`: Windows HIP bare auto の cap と、ユーザー指定 chunk の警告条件。
-- `docs/DETAILS.md:1947`: gfx12 の説明。bare auto だけが対象で、明示 chunk / `auto:N` / `STRATA_PREFILL_AUTO_MAX` はこの調整の対象外と記載されています。
+- `src/program/generate.cpp:534-546,2041-2065`: 既定上限、`--prefill` と環境変数の優先順位、`atoll` と段階的 clamp、Windows HIP の裸 auto 判定。
+- `src/program/generate.cpp:2256-2272`: Linux HIP gfx12 の 16,384 既定値引き上げ条件。裸 auto のみが対象。
+- `src/program/generate.cpp:6612-6661,6677-6690,7391-7401`: context / platform 上限と cache-fit に基づく chunk 候補選択。
+- `sycl/src/program/generate.cpp:1836-1845,6099-6129,6717-6729`: SYCL 側の同じ値変換と planner 上限の利用。
+- `include/strata/platform/host_limits.hpp:19-30`: Windows HIP の裸 auto 6,144 上限と、明示 chunk の警告条件。
+- `docs/DETAILS.md:2030`: gfx12 Linux の裸 auto による 16,384 既定値は、明示 `--prefill N`、`auto:N`、`STRATA_PREFILL_AUTO_MAX` を変更しないとの説明。環境変数固有の性能測定値はこの資料では確認できません。

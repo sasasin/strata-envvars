@@ -1,49 +1,41 @@
 # `HIP_DEVICE_LIB_PATH`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。Strata 所有ソースを対象とし、外部 HIP runtime の内部動作は対象外。
 
 ## 役割
 
-Strata のエンジンが起動する前に、サーバーが親プロセス環境からこの変数を引き継ぐかを検査します。HIP backend のサーバー起動時、値が空でなく、値をパスとして解決した場所が存在しなければ、エンジンへ渡す環境から変数を削除します。存在する場合はそのまま渡します。
-
-Strata の C++/GPU 実装がこの変数を直接読む箇所は見つかりませんでした。コードコメントとトラブルシューティング文書は、削除済み ROCm build を指す `HIP_PATH` / `HIP_DEVICE_LIB_PATH` / `LLVM_PATH` が AMD runtime の起動を妨げるケースに対するサーバー側の修復として説明しています。runtime 内部の変数の意味や挙動はここでは扱いません。
+Strata の HIP サーバーは、engine 子プロセスへ渡す環境を作る際、この変数が指すパスの存在を確認します。値が空でなく、パスが存在しない場合は子プロセス環境から変数を削除して、stderr に通知します。存在するパスの値はそのまま渡します。これはサーバー起動前の環境補正であり、Strata engine 内の計算設定ではありません。
 
 ## 値と判定
 
-| サーバーが作る子プロセス環境の値 | 判定・処理 |
-|---|---|
-| 未設定 | `env.get()` は `None`。処理なし。 |
-| 空文字 | 偽値としてスキップ。空文字のまま子プロセスへ渡す。 |
-| 空で、参照先が存在する値 | `Path(v).exists()` が真なら変更せず渡す。ディレクトリに限る検査ではなく、`exists()` の結果だけを見る。 |
-| 空でなく、参照先が存在しない値 | 子プロセス用辞書からキーを削除し、stderr に `strata serve: AMD: HIP_DEVICE_LIB_PATH=<値> does not exist: not passed to the engine` を出す。 |
+数値や真偽値としては parse しません。`child_env()` が作った環境辞書に対して `env.get("HIP_DEVICE_LIB_PATH")` の真偽を判定し、真の場合に `Path(value).exists()` を調べます。
 
-値を数値・真偽値として parse せず、trim、大文字小文字比較、存在範囲の追加検査もしません。値は Python の `Path(v).exists()` に渡されます。相対パスの存在確認はサーバープロセスの現在の作業ディレクトリを基準に行われます（この検査より後に engine の `cwd` が指定されます）。
+| 子プロセス環境での値 | Strata の処理 |
+|---|---|
+| 未設定 | 何もしない。未設定のまま渡す |
+| 空文字列 | 偽として扱い、存在確認も削除も行わない。空文字列のまま渡す |
+| 空でない値でパスが存在する | 変更せず渡す。ファイルかディレクトリかの追加判定はしない |
+| 空でない値でパスが存在しない | 子プロセス環境から削除し、stderr に `strata serve: AMD: HIP_DEVICE_LIB_PATH=<値> does not exist: not passed to the engine` と出す |
+
+文字列の大小文字、数値としての妥当性、空白の trim、パスの内容は別途検査されません。たとえば `0` も空でないパス文字列として存在確認の対象になります。
 
 ## 有効になる条件
 
-- `child_env(cfg)` が呼ばれ、`cfg["backend"] == "hip"` の場合だけ検査します。CUDA backend などでは、サーバーがこの変数を検査・削除しません。
-- 通常の `--engine strata` 起動では、起動時に `child_env(cfg)` が環境を作ります。設定の `env` 項目に同名キーがあれば、親環境をコピーした後にその設定値で上書きされ、それから存在確認されます。従って修復対象には親環境からの値だけでなく、config 由来の値も含まれます。
-- データ並列 replicas では、各 replica の設定で `child_env(rc)` が呼ばれ、それぞれのエンジン環境で同じ検査をします。
-- サーバーが engine 起動を管理しない直接起動（例: `strata.exe` を手で実行）にはこの修復処理は適用されません。`--engine mock` にも適用されません。
+- `child_env(cfg)` で `cfg["backend"] == "hip"` の場合に限り `hip_env_guard()` が実行されます。CUDA その他の backend ではこの変数を検査しません。
+- `child_env()` は現在の `os.environ` をコピーした後、設定の `cfg["env"]` があればそのキーと値（文字列化）で上書きします。そのため guard は、元のプロセス環境ではなく、設定反映後の値を検査します。
+- `setup.py` の HIP engine / HIP image generator のビルド経路は `HIP_PATH` や `ROCM_PATH` を設定しますが、`HIP_DEVICE_LIB_PATH` を設定する処理は確認できませんでした。
 
 ## 実行時の詳細
 
-`child_env()` は `os.environ` のコピーを作り、HIP backend なら `hip_env_guard()` を呼びます。guard は `HIP_PATH`, `HIP_DEVICE_LIB_PATH`, `LLVM_PATH` を順に検査します。対象キーの値が存在しないパスを指す場合だけ `del env[k]` を行い、変更内容を stderr に一度出力します。親 Python サーバーの `os.environ` 自体は変更しません。エンジンはこの辞書を `subprocess.Popen(..., env=env)` に渡されて起動するため、変更は子プロセス環境に適用されます。
+サーバーは通常の engine 起動時に `child_env(cfg)` を作り、その環境を `StrataEngine` に渡します。`StrataEngine` はその辞書を `subprocess.Popen(..., env=env)` に渡して engine を起動します。replica 起動経路も replica ごとに `child_env()` を呼びます。従って、判定は子プロセス環境を作るたびに行われ、サーバープロセスの環境辞書を書き換える処理ではありません。ログの値は、削除された場合に元の不正な値を含みます。
 
-同じ `child_env()` が通常 engine と replica engine に使われます。vision encoder が構成されている場合は `child_env()` の結果を `vision_env()` に渡し、その環境を encoder の `Popen` に使います。そのため HIP backend では、存在しないパスを指す値は vision encoder の起動環境からも除かれます。
-
-これは起動ごとの環境辞書作成時に行う検査です。設定を一度辞書にした後、親プロセスの環境変数を変更しても既存 engine の環境は変わりません。モデルの unload / reload に伴う engine 再起動については、`StrataEngine` が生成時に保存した `env` を再利用します。
-
-## ログと資料
-
-削除時の stderr 行は `strata serve: AMD: HIP_DEVICE_LIB_PATH=<値> does not exist: not passed to the engine` です。値が空、未設定、または参照先が存在する場合、この変数についてはログを出しません。`docs/TROUBLESHOOTING.md` は Windows で AMD runtime が起動前に `0xC0000005` で終了する事例について、存在しない ROCm path 環境変数をサーバーがログに示して除去すると説明しており、コードの処理と整合します。資料はこの変数単独の原因性や全環境での効果を保証していません。
+コードのコメントと `docs/TROUBLESHOOTING.md` は、存在しない `HIP_DEVICE_LIB_PATH` 等を AMD runtime 起動前に取り除く問題対応を説明しています。この調査では、Strata が値を検査・削除して engine に渡す処理までを確認しました。変数が HIP runtime 内でどう使われるかは外部実装の領域なので記述していません。
 
 ## 根拠
 
-- `serve/server.py:2622-2639` — 親環境コピー、config の `env` 上書き、HIP backend 条件での guard 呼び出し。
-- `serve/server.py:2650-2680` — 説明コメント、真偽値判定、存在確認、辞書からの削除、stderr 表示。
-- `serve/server.py:650-651,697-699` — `StrataEngine` が起動情報（加工済み環境を含む）を保存し、engine を `Popen` で起動する際に渡す。
-- `serve/server.py:6222-6238` — replica ごとの環境構築と engine 起動。
-- `serve/server.py:6375-6393`, `serve/server.py:2089-2095` — 通常起動での環境構築、および vision encoder への環境引き渡し。
-- `docs/TROUBLESHOOTING.md:148-153` — Windows AMD の起動問題に対する利用者向け説明。
-- `serve/test_server.py:1706-1709` は修復動作のテストですが、実装根拠には使っていません。
+- `serve/server.py:2788-2805`: 親環境のコピー、`cfg["env"]` の反映、HIP backend の場合の guard 呼び出し。
+- `serve/server.py:2816-2846`: 非空値の `Path.exists()` 判定、存在しない場合の削除、stderr 通知。
+- `serve/server.py:6547-6552,6700-6702,6750-6754`: replica と通常起動での `child_env()` 利用。
+- `serve/server.py:819-820`: 子 engine の `subprocess.Popen()` に環境辞書を渡す箇所。
+- `setup.py:2989-2995,3155-3159`: HIP build 時に `HIP_PATH` / `ROCM_PATH` は設定するが、この変数は設定しない箇所。
+- `docs/TROUBLESHOOTING.md:148-153`: Windows AMD の起動問題に対する説明。実動作の根拠は上記サーバー実装。

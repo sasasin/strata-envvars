@@ -1,49 +1,56 @@
 # `STRATA_PREFILL_STREAM_ALL`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-SYCL 版の batched prompt prefill で、VRAM cache にない expert の先読み方法を選びます。有効時は各 layer の非 resident expert を expert ID 順に読み込み、GPU 計算より先に複数 layer 分を ring buffer へ流します。無効時は、その layer の routing が選んだ非 resident expert だけを短い staging queue に先読みします。変わるのは prefill 時の expert の I/O と staging で、decode や CUDA/HIP 版の経路からこの変数は読まれません。
+SYCL の prompt prefill で、VRAM cache にない expert を layer ごとに先読みする stream-all walk を選びます。有効時は各 chunk で、cache にない expert を routed かどうかにかかわらず layer / expert ID 順にリングへ流します。無効時は routed-only staging になり、その chunk で必要な expert を stage します。この設定は decode の expert 選択を変えるものではありません。
 
-環境変数を直接読む箇所は `sycl/src/prefill/prefill.cpp` の `ring_slots()` 内の一箇所です。設定値の判定結果は関数内 `static const int` に保存されるため、最初の評価後にプロセス環境を変更しても再評価されません。
+この環境変数を読む実装は `sycl/src/prefill/prefill.cpp` の `ring_slots()` だけです。CUDA 側の同名読み取りはありません。
 
 ## 値と判定
 
-変数の文字列全体ではなく、設定値の先頭文字だけを判定します。未設定だけが自動選択を意味します。
+`std::getenv()` の結果が null かどうかと、設定値の先頭 1 文字だけを見ます。数値変換や文字列全体の比較はしません。
 
-| 値 | `stream_all_env` | 効果 |
+| 値 | `stream_all_env` | 結果 |
 |---|---:|---|
-| 未設定 | `-1` | VRAM cache 外の expert 割合が 10% 未満なら stream-all を選ぶ。10%以上なら routed-only staging。 |
-| 空文字 | `0` | stream-all を無効化し、routed-only staging。 |
-| 先頭文字が `1`（例: `1`, `10`, `1foo`） | `1` | stream-all を要求する。 |
-| その他（例: `0`, `true`, `-1`, ` 1`） | `0` | stream-all を無効化し、routed-only staging。 |
+| unset | -1 | VRAM cache 外の `(layer, expert)` ペアの割合 `g_nonres_share` が `0.10` 未満なら有効。それ以外は無効 |
+| 先頭文字が `1` | 1 | 有効（既定の cache 条件を上書き） |
+| 設定済みで先頭文字が `1` 以外 | 0 | 無効（既定の cache 条件を上書き）。空文字もここに含む |
 
-大文字小文字、数値としての妥当性、後続文字は検査されません。`atoi` のような数値変換はありません。根拠: `sycl/src/prefill/prefill.cpp:219-225`。
+したがって `1`, `10`, `1anything` は有効で、`0`, `true`, 空文字は無効です。大文字小文字、空白、後続文字は解釈されません。
+
+`stream_all_env` は関数内の `static const int` です。プロセス内で最初に `ring_slots()` が呼ばれたときの値を保存し、後から環境を変更しても再評価しません。`ring_slots()` は prompt buffer のサイズ計算や chunk/ring 計画からも呼ばれるため、最初の実際の prefill より前に値が確定することがあります。
 
 ## 有効になる条件
 
-値の判定に加えて、実際に stream-all 経路が選ばれるには、prefill chunk の ring slot 数が `STAGE`（8）より大きく、現在の chunk 長 `T` が `STRATA_PREFILL_STREAM_MIN` 以上で、expert source `m.src` が存在する必要があります。したがって、環境変数を `1` にしても、これらの条件が揃わない chunk は routed-only staging になります (`sycl/src/prefill/prefill.cpp:103,115-121,223-227,2460-2465`)。
+値の判定が有効でも、stream-all walk には次の条件があります。
 
-ring slot 数には別の `STRATA_PREFILL_RING`、自動 chunk 計画の ring budget、pinned share に基づく既定値も関係します。特に `STRATA_PREFILL_RING` が設定され、その `atoi` 結果が 8 なら、`ring_slots()` は stream-all 判定前に 8 を返すため、この変数を `1` にしても routed-only です (`sycl/src/prefill/prefill.cpp:195-227`)。`STRATA_PREFILL_STREAM_MIN` は未設定時 1024 token で、コードは `atoll` を使って読みます。
+- `ring_slots(T)` が `STAGE` (= 8) より大きいリングを返すこと。chunk 長 `T` が `stream_all_min()` 以上であること（既定 1,024 token）。
+- 実行時に expert source (`m.src`) があること。
+- 変数が unset の場合は、`g_nonres_share < 0.10` であること。`generate.cpp` は cache 外のペア数を `host_res` 全体で割って設定するため、これは VRAM cache が全ペアの 90% を超えて保持する条件です。明示値 `1` はこの割合条件を上書きしますが、リングや chunk の条件は上書きしません。
+- `STRATA_PREFILL_RING` が `8` を指定していないこと。実装は `atoi()` の結果が `STAGE` なら stream-all 判定より先に routed-only を返します。たとえば `8`, `8junk` はこの経路で無効化します。`STRATA_PREFILL_RING` のその他の値はリング選択に影響し、stream-all の必要リング数は少なくとも 16、最大 `ring_cap()` に丸められます。
+- SYCL HIP で `STRATA_HIP_WMMA` の先頭文字が `1`、かつ `STRATA_PREFILL_RING` 未設定・ring override なしの場合は特例です。この経路は `ring_slots()` の早期 return で、chunk がしきい値以上なら 96 slot を返します。そのため `STRATA_PREFILL_STREAM_ALL=0` や nonresident share の既定条件を通らず、実行ループでは stream-all になります。
 
-自動選択で使う非 resident share は、prefill chunk があり `srcp` が存在する場合に `generate.cpp` が `(layer, expert)` のうち `host_res` の値が負の組数から計算します。既定で stream-all になるのはこの割合が **10% 未満**のときです。割合がちょうど 10% なら無効です (`sycl/src/program/generate.cpp:5932-5945`; `sycl/src/prefill/prefill.cpp:123-125,224`)。
+`STRATA_PREFILL_STREAM_MIN` は chunk のしきい値を変えます。`std::atoll()` で読み、未設定時は 1,024 です。別のリング設定や既定 ring が 8 以下になる場合、環境変数を `1` にしても walk は行われません。
 
 ## 実行時の詳細
 
-`ring_slots(T)` は stream-all が許可されると、元の ring 候補値を 16 以上かつ backend / expert layout ごとの上限以下に clamp し、`T >= STRATA_PREFILL_STREAM_MIN` の場合にその ring を返します。未満なら 8 slot を返します。stream-all が許可されなければ 8 slot です。`Prefill::init()` はこの値で ring buffer を確保し (`sycl/src/prefill/prefill.cpp:1224-1241`)、prefill 実行時は `m.ring > STAGE && T >= stream_all_min() && m.src != nullptr` を改めて確認して walk を選択します (`sycl/src/prefill/prefill.cpp:2460-2465`)。
+`ring_slots()` は `STRATA_PREFILL_RING` と SYCL HIP の `STRATA_HIP_WMMA` 特例を確認し、通常経路では ring budget / pinned share に基づく slot 数 `r` を決めます。その後、stream-all が不許可なら 8 slot の `STAGE` を返します。許可されていれば `r` を `[16, ring_cap()]` に収めた値を使いますが、`T < stream_all_min()` の chunk では再び 8 slot を返します。`ring_cap()` は fused-ring 対応時 1,024、それ以外は 512 です。HIP 特例は `STRATA_HIP_WMMA` 有効時、`STRATA_PREFILL_RING` と ring override がない場合に早期 return するため、環境変数の明示的な off 指定が効かない経路です。
 
-stream-all walk は現在の layer にある非 resident expert を ID 順に走査します。routing されている expert はコピー後に計算し、routing されていない expert はその ring slot を解放します。比較対象の routed-only 経路は routing 順に必要 expert を staging queue へ先読みします (`sycl/src/prefill/prefill.cpp:4159-4177,4178-4229`)。この環境変数固有の stdout/stderr ログやエラーはありません。
+`Prefill::init()` はこの slot 数で ring buffer を確保します。chunk の実行ループは `m.ring > STAGE && T >= stream_all_min() && m.src != nullptr` を stream-all の条件として扱います。有効な chunk では layer を先行して走査し、VRAM cache にない expert をリングへ入れます。通常の routed-only 経路は layer 内の routing 結果に沿って stage します。つまり環境変数が直接指定するのは walk の許可で、コピー量や適用 chunk は cache、source、ring、chunk 条件に依存します。
 
-## 文書・測定値との照合
+この変数自体についての専用ログは見つかりません。`--prefill auto` では解決した chunk と ring slot 数を stderr に出すコードがありますが、stream-all の有効/無効を直接表示するログではありません（`sycl/src/program/generate.cpp:6806-6813`）。
 
-`docs/INTEL.md:613-625` は、2026-10-03 の変更記録として、stream-all を非 resident expert の割合が 10% 未満なら既定で使い、`=1` / `=0` で強制すると説明しています。40K int8 prompt の比較は routed-only 1,106 tok/s、stream-all 1,160 tok/s などと記載されていますが、これは同資料の測定条件の値であり、他環境での性能を示すものではありません。
+## 文書と測定値
 
-一方、同じ `docs/INTEL.md:318-324` の80K promptの説明には routed-only が port の既定で `STRATA_PREFILL_STREAM_ALL=1` が他方を復元するとあり、上記の2026-10-03節と現行コードの既定動作に一致しません。調査対象 HEAD のコードでは `g_nonres_share < 0.10` の自動条件と `=0` の明示無効化が実装されています。資料中の前段説明は過去の状態として扱い、現在の条件はソースコードに基づいています。
+`docs/INTEL.md` は、stream-all が cache 外の全 expert を先読みする経路であり、unset 時は VRAM が 90% 超のペアを保持する場合に既定で有効、`=1` / `=0` で強制できると説明しています。資料の Coder 測定では、40K int8 prompt が routed-only 1,106 tok/s、stream-all 1,160 tok/s、128K int8 + KV streaming が 897 / 920、128K k8v4 が 1,006 / 1,041、256K int8 + KV streaming が 760 / 780 でした。資料は出力が同じとも記載しています。これらは同資料の測定条件に限られ、他の pack や GPU の性能を示すものではありません。資料はまた、RAM mirror に expert の 1/4 を保持する IQ2_XS で stream-all が 2,184-token prompt を約 560 から 254 tok/s に落とした例を示し、cache 割合を既定条件にする理由を説明しています。
 
 ## 根拠
 
-- `sycl/src/prefill/prefill.cpp:195-227` — ring slot の既定値・上書きと環境変数の判定、非 resident share 条件、chunk threshold。
-- `sycl/src/program/generate.cpp:5932-5945` — 自動判定に渡す non-resident share の算出。
-- `sycl/src/prefill/prefill.cpp:1224-1241,2460-2465,4159-4229` — ring の確保、実行経路の選択、各 walk の処理。
-- `docs/INTEL.md:318-324,613-625` — 過去状態の記述との不一致、および記載された測定値。
+- `sycl/src/prefill/prefill.cpp:121-124`: `STRATA_PREFILL_STREAM_MIN` の既定値・`atoll` 変換・static cache。
+- `sycl/src/prefill/prefill.cpp:125-127, 1843-1845`: pinned share と nonresident share の状態。
+- `sycl/src/prefill/prefill.cpp:197-229`: ring の通常値、環境値の先頭文字判定、unset 時の割合条件、HIP WMMA 早期 return、slot clamp、chunk threshold。
+- `sycl/src/program/generate.cpp:6018-6032`: host-resident 配列から cache 外割合を計算して渡す箇所。
+- `sycl/src/prefill/prefill.cpp:1217-1229, 2458-2463, 2517-2559`: ring buffer 確保、実行時条件、layer / expert の stream-all 計画。
+- `docs/INTEL.md:613-625`: 既定条件、強制値、測定値と出力に関する資料の記述。

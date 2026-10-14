@@ -1,42 +1,41 @@
 # `STRATA_VERIFY_ARENA`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-SYCL 実装で expert arena の読み込みが完了した後、読み込んだ expert データ全体の FNV-1a 64-bit checksum とサイズを stderr に出す診断用フックです。値を検証値と比較したり、読み込み結果を変更したりはしません。実装コメントも用途を tests としています。
+expert arena をロードした後、その読み込み内容の FNV-1a 64-bit checksum を stderr に表示する診断用フックです。値を検証したり読み込みを拒否したりはせず、checksum と arena サイズを出力するだけです。コメント上も checksum を比較するテスト用とされています。
 
 ## 値と判定
+
+値の内容は parse されず、`std::getenv("STRATA_VERIFY_ARENA") != nullptr` だけで判定します。
 
 | 環境変数の状態 | 動作 |
 |---|---|
 | 未設定 | checksum を出さない |
-| 設定済み（空文字を含む） | 値の内容を問わず checksum を出す |
+| 設定済み（空文字を含む） | checksum を出す |
 
-実装は `std::getenv("STRATA_VERIFY_ARENA") != nullptr` のみを判定します。`1` との比較や数値変換はなく、`0`、`false`、空文字も設定されていれば有効です。
+`0`、`false` なども、空文字も、設定されていれば同じ扱いです。数値変換、大小文字比較、値域制限はありません。
 
 ## 有効になる条件
 
-この読み取りは SYCL ツリーの `ArenaExpertSource::open()` にだけあります。SYCL の生成処理が `--stream-experts` でも `--mmap-experts` でもない経路で arena を開く場合に到達します。streaming は `GgufExpertSource` を使い、`--mmap-experts` は別の `FileExpertSource` を使うため、どちらの経路でもこの checksum 出力箇所は通りません。また `STRATA_ARENA_MMAP` が有効で、既存の `experts.bin` が padded arena サイズなら、`ArenaExpertSource::open()` はファイルを map した時点で早期 return するため checksum を出しません。初回 load など mmap の早期 return を通らない経路では判定箇所まで進みます。
+CUDA/HIP では `--mmap-experts` を使わず、`ArenaExpertSource::open()` で arena を読み込む経路で有効です。`--mmap-experts` の経路は `FileExpertSource` を使うため、この環境変数による checksum は出ません。SYCL でも `--mmap-experts` の経路と、`--stream-experts` かつ `--mmap-experts` なしで GGUF から直接 stream する経路では arena を開かないため対象外です。
 
-さらに、arena の予約、expert の読み込み、および読み込み byte 数の確認が成功した後に判定されます。読み込み失敗や `st.bytes != want` の場合は先に `open()` が失敗して戻るため、checksum は出ません。`STRATA_ARENA_MMAP` による既存 arena の早期 map 経路には到達しません。
+対象の arena 読み込みは、pack の `experts.bin` から、または native pack でそのファイルがなく GGUF shard から行われます。レイアウト不一致、入力ファイルのサイズ不一致、arena の確保失敗、読み込み失敗、読み込み byte 数の不一致がある場合は `open()` がそこで失敗するため checksum 出力まで到達しません。CUDA/HIP、SYCL の両実装に同じ設定有無判定があります。
 
 ## 実行時の詳細
 
-`open()` が成功した読み込みのたびに環境変数を読み直します。値を `static` に保存していないため、プロセス内で環境を変更した場合は次回の `open()` に反映されます。子プロセスへの転送や上書き処理はありません。
-
-設定されていれば、読み込み先 `a->data()` の先頭から `want` byte を FNV-1a 64-bit でハッシュし、次の形式を stderr に出します。
+`ArenaExpertSource::open()` は読み込み処理の後に環境変数を参照し、成功した読み込み byte 数が期待値 `want` と一致した場合だけ checksum を計算します。arena の `want` byte 全体を FNV-1a 64-bit（初期値 `1469598103934665603`、乗数 `1099511628211`）で走査します。ログ形式は次のとおりです。
 
 ```text
 strata generate: expert arena checksum %016llx (%.2f GiB)
 ```
 
-サイズ表示は `want / 2^30` GiB です。arena 用に後置される追加 blob の padding は `want` に含まれないため、checksum の対象外です。この出力は checksum の採取のみで、期待値との照合、警告、エラー化はしません。
+checksum は16桁の16進表記、サイズは GiB 単位の小数2桁です。値は読み込みデータの出力後にだけ計算され、arena の内容、pinning、I/O 経路、モデル実行を変えません。判定結果を static cache せず `open()` ごとに環境を読みます。Strata 内の他の箇所からこの名前を読むコードは確認できません。
 
 ## 根拠
 
-- `sycl/src/core/expert_source.cpp:3311-3315,3350-3385` — `ArenaExpertSource::open()` の入口と `STRATA_ARENA_MMAP` 有効時の既存 padded arena の早期 map return。
-- `sycl/src/program/generate.cpp:4186-4203,4204-4219,4237-4257` — streaming、mmap、通常 arena の分岐と `open()` 呼び出し。
-- `sycl/src/core/expert_source.cpp:3504-3512` — 読み込み byte 数の確認後に環境変数を検査し、`want` byte の checksum を stderr に出す箇所。
-- `sycl/src/core/pinned.dp.cpp:287-294` — 使用する FNV-1a 64-bit の実装。
-- `docs/DETAILS.md` — `STRATA_VERIFY_ARENA` の説明は見つからず、コードに対応する測定値や利用者向け記載は確認できませんでした。
+- CUDA/HIP: `src/core/expert_source.cpp:4713-4721`（byte 数確認、環境判定、ログ）、`src/program/generate.cpp:4821-4838,4901-4902`（arena 経路と mmap 経路の選択）。
+- SYCL: `sycl/src/core/expert_source.cpp:3504-3512`（byte 数確認、環境判定、ログ）、`sycl/src/program/generate.cpp:4273-4291,4323-4344`（stream/mmap/arena 経路の選択）。
+- checksum: `include/strata/core/pinned.hpp:171`（初期値）、`src/core/pinned.cu:332-339`（FNV-1a 64-bit の処理）。SYCL 実装も `sycl/src/core/pinned.dp.cpp:287-294` にあります。
+- `docs/DETAILS.md` と README 類に、この環境変数の利用者向け説明は見つかりませんでした。

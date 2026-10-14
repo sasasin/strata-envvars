@@ -1,47 +1,46 @@
 # `STRATA_PREFILL_GROUP_GATHER`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリ自身が読む環境変数の挙動は対象外。
 
 ## 役割
 
-ストリーミング中の prompt prefill で、MMQ 用に expert の重みを group buffer へ集める処理を、expert ごとに行うか、複数 expert 分をまとめて行うかを選びます。既定では group gather を使います。対象経路では、group 内の最後のコピーを待ってから gather し、リング slot の解放 event も group 単位で記録します。無効にすると、コピー待ち・gather・slot 解放を expert ごとに行う経路になります。
+長い prompt の streamed prefill で、native expert の MMQ 用重み取り込み（gather）を expert ごとに行う代わりに、最大16 expert のグループ単位でまとめます。対応経路では、コピー待ちをグループ末尾の一回にまとめ、グループの ring slot を一つの完了 event で再利用可能にします。MMQ 計算に使う group buffer の内容は、個別 gather と同じ配置になるよう実装されています。
+
+CUDA 実装は `src/prefill/prefill.cpp`、SYCL 実装は `sycl/src/prefill/prefill.cpp` にあります。値の判定は関数内の `static const bool` で一度だけ行われ、最初に評価された後のプロセス内環境変更は反映されません。
 
 ## 値と判定
 
-CUDA/HIP と SYCL の prefill 実装は、最初にこの判定へ到達したとき `static const bool` として値を読み、プロセス内に保持します。値は `std::atoi()` で変換し、未設定なら `true`、設定されていれば変換結果が 0 以外のとき `true` です。
+設定値は `std::atoi(v) != 0` で判定します。文字列全体の厳密な数値 parse や `1` との比較ではありません。
 
 | 値 | 判定 |
 |---|---|
-| 未設定 | 有効（既定） |
-| `0`、空文字、数値に変換できない文字列 | 無効 |
-| `1`、負数など、`atoi()` の結果が 0 以外 | 有効 |
+| 未設定 | 有効 |
+| 空文字、数値として先頭を読めない文字列、`0` で始まる数値 | 無効（`atoi` の結果が 0） |
+| `1`、`-1`、その他 `atoi` が 0 以外を返す文字列 | 有効 |
 
-文字列全体の厳密な数値検証はしません。`atoi()` が数値の prefix を読み取るため、たとえば `1abc` は有効、`0abc` と `abc` は無効です。空白や符号も `atoi()` の変換規則に従います。判定後に環境変数を変更しても、同じプロセスでは再評価されません。
+`atoi` は先頭の空白と符号を許し、数値部分の後ろに文字があっても変換できた整数を返します。したがって、たとえば ` 1x` は有効、`0x` は無効、`true` は無効です。大文字小文字の判定はありません。
+
+根拠: `src/prefill/prefill.cpp:3830-3835`、`sycl/src/prefill/prefill.cpp:3895-3900`。
 
 ## 有効になる条件
 
-環境変数の判定が有効でも、各 layer で次の条件をすべて満たす場合に限り group gather が選ばれます。
+環境値が有効でも、実際のグループ gather は次の条件を全て満たす場合に限られます。
 
-- streamed walk (`stream_all`) が有効。実装上はリングが標準 staging 数 `STAGE` より大きく、chunk が `stream_all_min()` 以上で、expert source が存在することが条件です。`STAGE` は 8、`stream_all_min()` は別変数 `STRATA_PREFILL_STREAM_MIN` 等により決まり、他の上書きがない場合の通常値は 1024 tokens です。
-- その layer で MMQ plan が有効 (`use_mmq`)。
-- layer の expert pack が native format (`lay.native`)。
-- `MMQ_GROUP` が backend の `kGatherGroupMax` 以下。現行定義は双方 16 です。
+- prefill が streamed walk を使う。共通判定では `m.ring > STAGE`、`T >= stream_all_min()`、expert source が存在することが必要です（`STAGE` は8）。`stream_all_min()` の既定値は1,024 tokens で、`STRATA_PREFILL_STREAM_MIN` または CPU share 用の内部設定により変わり得ます。
+- その layer で MMQ が選択されている。
+- expert layout が native。
+- `MMQ_GROUP`（16）が `mmq::kGatherGroupMax` 以下。
 
-そのため、通常 staging、MMQ を使わない layer、native でない pack では、この変数の設定は gather 経路を変えません。他の環境変数によって `stream_all` が使われない状態なら、同様に効果はありません。
+この条件外では、この変数の値にかかわらず対象のグループ gather は使いません。通常の gather や別の expert 計算経路に進みます。native group gather 関数はポインタ・offset・size の16-byte alignmentも検査し、条件を満たさない場合は `false` を返します。その場合 CUDA caller はグループ内の expert を一つずつ `gather_native()` します。
+
+根拠: `src/prefill/prefill.cpp:2341,3834-3835,3840-3858`、`include/strata/prefill/moe_mmq.hpp:89-101`、`src/prefill/moe_mmq.cu:409-430`。
 
 ## 実行時の詳細
 
-有効時、streamed walk は `MMQ_GROUP` 個または group の末尾までの expert blob を group buffer に集めます。group に streamed expert があれば、その中で最後のコピー完了 event を compute stream が待ってから gather し、group の最後に当たる ring slot に解放 event を記録して各 slot の解放先をそこへ関連付けます。routing が選ばなかった expert により group が途中で切れる場合は、その時点の group を先に flush します。無効時は各 streamed expert のコピー完了を待ち、その expert の gather 後に個別 slot 解放 event を記録します。
+グループ化が有効な streamed walk では、各 expert の device blob をグループ buffer の対応 slot に対応付け、MMQ group（最大16 expert）が埋まるか、その layer の最後に達した時点で flush します。flush は最後に投入された streamed copy の完了を待ち、可能なら一回の `gather_native_group()` launch で gate/up/down のデータをまとめて配置します。NVFP4 の tail と MMQ 用末尾 zero fill もこの処理に渡します。alignment 不適合時は expert ごとの gather に fallback します。
 
-CUDA/HIP では `gather_native_group()` がアラインメント条件を満たせば複数 blob を一つの kernel launch でコピーします。条件を満たさない場合は group gather 呼び出しが失敗し、同じ group の各 expert に `gather_native()` を呼びます。SYCL 側の `gather_native_group()` は現状 `false` を返す stub なので、grouping による待機と slot 解放のまとめは使われますが、blob gather 自体は expert ごとの `gather_native()` fallback になります。
+通常の streamed MMQ gather では expert ごとにコピー完了待ちと ring slot 解放 event を記録します。グループ経路では最後のコピーを待ってから gather し、グループの slot を最後の slot の完了 event に結び付けて一括で再利用します。router が選ばなかった expert の slot を返すときは、未完了 group を先に flush し、issuer に対してグループ分を過度に保持しない構造です。SYCL 側にも同じ環境判定とグループ化の分岐があります。
 
-この変数に対応する環境変数専用ログは見当たりません。ソースコメントには WDDM で expert ごとの wait/event record が GPU bubble を生み得るとの記述がありますが、`docs/DETAILS.md` にこの変数固有の測定条件や性能値は見つからなかったため、性能効果の数値は記載しません。
+この設定自体による専用ログやエラー文はありません。ソースコメントは WDDM 下で expert ごとの wait/event が各約10 µsの GPU bubble を生み、32K prompt の NVFP4 pack で合計226 msだった例を記載しています。これはコメントに記載された条件の値であり、一般的な性能向上を保証する測定ではありません。`docs/DETAILS.md` にこの環境変数固有の説明や別の測定条件は見つかりませんでした。
 
-## 根拠
-
-- 読み取り、default、真偽判定、適用条件: `src/prefill/prefill.cpp:3746-3753`; SYCL コピー: `sycl/src/prefill/prefill.cpp:3896-3903`。
-- group の待機、gather、slot 解放、および無効時の expert 単位処理: `src/prefill/prefill.cpp:3756-3779,3782-3803,3873-3911`; SYCL: `sycl/src/prefill/prefill.cpp:3906-3938,4017-4043,4159-4224`。
-- `stream_all` 条件: `src/prefill/prefill.cpp:149-153,2302-2303`; `STAGE` 定義: `src/prefill/prefill.cpp:107`。
-- layer ごとの MMQ 判定: `src/prefill/prefill.cpp:2978-2980`。
-- group gather 最大数: `include/strata/prefill/moe_mmq.hpp:71-76`。
-- CUDA/HIP の aligned group copy と失敗条件: `src/prefill/moe_mmq.cu:248-264`; SYCL stub: `sycl/src/prefill/prefill.cpp:68-70`。
+根拠: `src/prefill/prefill.cpp:3823-3866,3870-3900,3977-4015`、`sycl/src/prefill/prefill.cpp:3888-3929,4020-4041,4201-4227`。

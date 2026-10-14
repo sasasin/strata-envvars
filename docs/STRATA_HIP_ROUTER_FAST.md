@@ -1,55 +1,44 @@
 # `STRATA_HIP_ROUTER_FAST`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリ・GPU ドライバーの動作は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-MoE ルーター（`router_top10`）で、gfx906（wave64）ビルドに限り portable カーネルではなく fast kernel（`router_top10_fast_kernel`）を要求する opt-in。fast kernel は serial FP64 sum と block barrier を省いた形だが、ids/weights は portable カーネルと bitwise 一致（`hip_router_fast` が 65,536 行で ties・near-ties・NaN・forced serial を検査）。gfx906 では fast kernel が wave32 形状なので、このカードで測定されるまで既定ではなく「on request」で走る。
-
-読み取りは `src/kernels/cuda/router_top10.cu` の `router_top10()` 1 箇所（SYCL に同一ロジックのミラー `sycl/src/kernels/cuda/router_top10.dp.cpp:692`）。
+gfx906 向け HIP 互換ビルドの MoE router で、既定の portable / wave64 kernel に代えて S6 fast kernel を選ぶ opt-in スイッチです。対象の router は logits から expert の top-k ID と重みを計算します。通常の wave32 HIP ビルドでは、この変数ではなく別の `STRATA_HIP_ROUTER_OLD` が fast kernel の切り替えに使われます。
 
 ## 値と判定
 
-判定は `std::getenv(...) == nullptr`（設定されているかどうか）だけで、値の内容は比較しない。
+| gfx906 HIP 互換ビルドでの値 | 判定と動作 |
+|---|---|
+| 未設定 | `old=true`。fast kernel を選ばず、通常の gfx906 経路へ進む。 |
+| 設定あり | 値の内容を読まず `old=false`。fast kernel の入力条件も満たせば S6 kernel を選ぶ。 |
 
-| 状態 | `old` | fast kernel を要求 |
-|---|---|---|
-| 未設定（`nullptr`） | true | 否（既定の portable / wave64 path） |
-| 空文字 `""` | false | 是 |
-| `1` | false | 是 |
-| `0` | false | 是 |
-| `true`, `false`, `2` など | false | 是 |
-
-名前は `=1` を示唆するが、実装は「変数が設定されていれば」要求扱い。`STRATA_HIP_ROUTER_FAST=0` でも fast kernel を要求する。
-
-根拠: `src/kernels/cuda/router_top10.cu:429`。
+判定は `getenv(...) == nullptr` だけです。したがって `1` に限らず、`0`、空文字、その他どんな文字列でも、設定されていれば同じ扱いです。数値変換や文字列比較はありません。関数内 `static const` の初期化時に一度だけ読み取るため、実行中に環境を書き換えても判定は変わりません。
 
 ## 有効になる条件
 
-要求が効くのは、次のすべてを満たすときだけ。
+このスイッチの分岐は HIP コンパイル時（`__HIPCC__`）かつ `STRATA_HIP_GFX906` ビルド時にあります。CMake では `STRATA_HIP_GFX906` が gfx906 向け HIP 互換レイヤーを有効にし、HIP アーキテクチャを別途指定しなければ `gfx906` に設定します。
 
-- ビルドが HIP（`#if defined(__HIPCC__)`）かつ **gfx906 用 macro**（`STRATA_HIP_GFX906`）。gfx906 以外の HIP ビルドではこの分岐ではなく `#else` の `STRATA_HIP_ROUTER_OLD`（別変数）が効く。
-- 形状条件: `n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32`（`router_top10.cu:433`）。条件外なら fast path を通らず、既定 path（gfx906 では `n_expert <= 64*RW_PER` かつ `STRATA_ROUTER_BLOCK` 未設定なら wave64 one-wavefront kernel、それ以外なら portable `router_top10_kernel`）へ falls through（`router_top10.cu:461-472,474-482`）。
+設定済みであっても fast kernel を起動するのは `n_tokens > 0`、`65 <= n_expert <= 512`、`1 <= k <= 32` の場合だけです。条件外では通常経路へフォールバックします。`n_tokens <= 0`、`n_expert <= 0`、`k <= 0` は通常経路で何もせず戻り、通常経路の上限 `k > 64` または `n_expert > RT_MAX_THREADS * 64` は stderr にエラーを出して終了します。
 
 ## 実行時の詳細
 
-`old` は `static const bool` で、プロセス内で最初に呼ばれたとき一度だけ環境を読む。その後の環境変更は再評価されない。
+`router_top10()` が呼ばれた際、gfx906 HIP 互換ビルドでは環境変数の有無を static cache し、設定されていて上記の入力条件を満たすと `launch_generic(..., mode=1)` で `router_top10_fast_kernel<false>` を起動します。kernel 起動に失敗すると `router_top10 launch: <CUDA/HIP runtime error>` を stderr に出して `exit(1)` します。stream が null の場合は device 同期も行い、失敗時は `router_top10: <runtime error>` を stderr に出して終了します。
 
-要求かつ条件一致のとき `launch_generic(..., mode 1)` を呼ぶ。mode 1 は `router_top10_fast_kernel<false>`（`router_top10.cu:391-394`）。launch 後 `cudaGetLastError()` を確認、`stream == nullptr` なら `cudaDeviceSynchronize()`。失敗は stderr に出して `exit(1)`（`router_top10.cu:435-446`）。
+fast 条件を満たさない場合、gfx906 の `n_expert <= 64 * RW_PER`（`RW_PER` は 8）かつ `STRATA_ROUTER_BLOCK` が未設定なら、既定の one-wavefront / wave64 kernel が選ばれます。それ以外は portable block kernel です。通常の HIP wave32 ビルドでは `STRATA_HIP_ROUTER_FAST` の参照箇所は gfx906 分岐の外にあるため、この変数は効かず、別変数 `STRATA_HIP_ROUTER_OLD` が unset なら fast kernel が選ばれます。
 
-## 測定値（資料に記載）
+router API は MoE 層の通常経路および multi-token routing から呼ばれます（例: `src/core/layer.cpp:376,418`、`src/core/mtp.cpp:1112-1113`）。ただし canonical 512-expert / top-10 の一部経路は native router を使うため、generic `router_top10()` を通らず、この変数の影響を受けません。
 
-`docs/AMD_HIP.md:323-327`（資料中の主張。本調査で計測器動作を独自確認した事実ではない）: fast kernel は portable と bitwise 同一で、call あたり 39 → 9-12 us、decode R9700 62.4 → 70.0 tok/s、9070 XT +4%（ROCm 10.2 nightly）。ユーザーの A/B/A/B（TheRock 7.10、i5-12600K）は +1-4%（12-20% の run-to-run 変動内）。これらは R9700 / 9070 XT の測定。gfx906 の fast path は「このカードで測定されるまで」on request とされ、gfx906 向けの向上数値は資料にない。
+## 文書との照合
 
-## 相互作用
-
-- `STRATA_HIP_ROUTER_OLD`（別変数）: gfx906 以外の HIP ビルドで portable kernel を要求する。gfx906 ビルドでは `STRATA_HIP_ROUTER_FAST` の分岐が優先され、`STRATA_HIP_ROUTER_OLD` は読まれない（`router_top10.cu:426-432`）。
-- `STRATA_ROUTER_BLOCK`: gfx906 の既定 path で wave64 kernel を使う条件に影響（設定すると portable kernel へ）。
+`docs/AMD_HIP.md` は通常の HIP (`gfx1100` / `gfx1201`) では fast router が既定で、`STRATA_HIP_ROUTER_OLD=1` が portable kernel に戻すと説明しています。これは gfx906 互換ビルドの上記 opt-in 分岐とは別の条件です。同資料には gfx906 で `STRATA_HIP_ROUTER_FAST` を使った測定値は見当たらず、gfx906 での性能効果はここでは断定しません。
 
 ## 根拠
 
-- 読み取り・判定: `src/kernels/cuda/router_top10.cu:426-433`。
-- fast kernel 定義と mode 対応: `src/kernels/cuda/router_top10.cu:282-289,385-403`。
-- 既定 path（gfx906）: `src/kernels/cuda/router_top10.cu:461-482`。
-- SYCL ミラー: `sycl/src/kernels/cuda/router_top10.dp.cpp:691-692`。
-- docs 照合: `docs/AMD_HIP.md:323-328`、`src/kernels/cuda/router_top10.cu:279-281`。テスト（`CMakeLists.txt:935` の parity 言及）は実装根拠にしていない。
+- `CMakeLists.txt:64-71,128-144` — gfx906 HIP 互換ビルドの選択、compile definition、既定 HIP architecture。
+- `src/kernels/cuda/router_top10.cu:266-283` — fast kernel の用途と説明。ソースコメントでは portable kernel と同じ ID / weight になるとし、通常 HIP 用の旧経路切り替えも記載。
+- `src/kernels/cuda/router_top10.cu:422-449` — gfx906 における環境変数判定、入力条件、fast kernel 呼び出しとエラー処理。
+- `src/kernels/cuda/router_top10.cu:451-495` — 通常経路の入力検査、gfx906 wave64 kernel と portable kernel の選択、同期・エラー処理。
+- `sycl/src/kernels/cuda/router_top10.dp.cpp:679-712` — 同名の移植版にも同じ HIP / gfx906 条件付き分岐。
+- `src/core/layer.cpp:371-376,393-419`、`src/core/mtp.cpp:1104-1114` — MoE routing から router への呼び出しと native router 経路。
+- `docs/AMD_HIP.md:330-336` — 通常 HIP での fast router の説明と `STRATA_HIP_ROUTER_OLD`。

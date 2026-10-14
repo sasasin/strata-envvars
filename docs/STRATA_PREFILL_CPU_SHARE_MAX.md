@@ -1,49 +1,49 @@
 # `STRATA_PREFILL_CPU_SHARE_MAX`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-CPU prefill share が有効なとき、ルーティング後に CPU と GPU で expert を分担できる prompt chunk の上限を token 数で指定します。値は「常にこの長さの chunk を使う」という指定ではなく、実際の chunk がこの上限未満なら share 用の staged path を選べる、という上限です。chunk 長そのものは別の prompt chunk 設定や planner が決めます。
+CPU prefill share が適用される prompt chunk の上限を token 数で指定します。CPU share が有効な場合、この上限未満の chunk は routed expert を GPU へ一括 stream せず、routing 後に必要な expert を stage する経路を使います。CPU pool が取得でき、他の stage が使っていないときに限り、GPU が stream する代わりに CPU pool が一部の expert を処理します。上限以上の chunk は通常の stream-all 経路です。
 
-この上限は `stream_all_min()` として prefill 実装内で共有され、該当 chunk のリング容量、expert streaming/fused 経路の選択、share 用バッファのサイズ計画にも使われます。上限を大きくすると share 対象になり得る chunk が増えますが、share を有効にする変数ではありません。
+この変数自体が CPU share を有効化するわけではありません。share の値は `STRATA_PREFILL_CPU_SHARE` で決まり、対象関数で `applies` が真のとき、かつ share が有効なときだけ上限が適用されます。
 
 ## 値と判定
 
-値は `std::atoll` で読み、その結果を `max(1024, 値)` にします。未設定時の値は 3072 です。文字列全体の妥当性確認や上限 clamp はありません。
+`cpu_share_max()` は `std::getenv` の文字列を `std::atoll` で変換し、下限を 1024 に制限します。文字列全体の妥当性検査はしません。
 
-| 環境変数の状態 | `cpu_share_max()` の値 |
+| 状態・値 | 上限 |
 |---|---:|
-| 未設定 | 3072。ただし下記の既定 share 条件では実効値 1024 |
-| `0`、負値、数値で始まらない文字列、空文字 | 1024 |
-| 1024 未満の正値 | 1024 |
-| 1024 以上の正値 | 変換された値 |
+| 未設定 | 通常 3072。後述の「既定で share が armed」の特例では 1024 |
+| `1024` 未満の整数、負数、`0` | 1024 |
+| `3072` | 3072 |
+| `4096` など | 指定された整数 |
+| 空文字、数値に変換できない文字列 | `atoll` が 0 を返すため 1024 |
+| 数字の後ろに文字が続く値（例 `2048xyz`） | 数字の prefix を変換し 2048 |
 
-`atoll` は先頭の空白や符号を含む10進整数を読み、数値の後ろの文字列は値の判定に使いません。たとえば `2048junk` は 2048、`junk2048` は 0 として扱われ、後者は 1024 になります。空文字は unset ではなく設定済みとして扱われます。範囲外整数の変換結果はこの実装で検査されません。
+空白や符号などの扱いは `atoll` の変換に従います。上限値に上限 clamp はありません。変換結果が `int64_t` の範囲を超える入力の挙動は、このコードでは別途検査していません。
 
-CPU share がデフォルト有効になる経路では、`STRATA_PREFILL_CPU_SHARE` が未設定で、かつこの変数も未設定なら、実測された既定範囲に合わせて実効値を 1024 にします。`STRATA_PREFILL_CPU_SHARE_MAX` を明示設定すると、この特例は使われず、上表の値が実効値です。したがって `STRATA_PREFILL_CPU_SHARE_MAX=3072` はこの経路でも上限を 3072 にします。
+「既定で share が armed」の経路では、`STRATA_PREFILL_CPU_SHARE` が未設定で `g_share_default` が真、かつこの変数も未設定なら、内部の 3072 ではなく 1024 を返します。これは測定済みの既定動作を 1024 token 未満に限定する処理です。`STRATA_PREFILL_CPU_SHARE=auto` または数値を明示した場合はこの特例に該当せず、上限未設定なら 3072 です。`STRATA_PREFILL_CPU_SHARE_MAX` を明示すると、既定経路でもその値（最低 1024）が使われます。
 
 ## 有効になる条件
 
-- CPU share 自体が有効である必要があります。`STRATA_PREFILL_CPU_SHARE=0` なら share は無効で、この上限は share の効果を生みません。`STRATA_PREFILL_CPU_SHARE=auto` または 0 より大きい数値は share の候補になります。
-- 未設定の CPU share を既定で有効にするのは、CUDA 系ビルドの対象経路で、単一 GPU、batch slot なし、CPU pool あり、GPU cache に未常駐 expert があり、既定 share のメモリ判定を通る場合です。メモリ不足等では既定 share は arm されず、理由を stderr に出します。
-- layer split、batch slot あり、pool なし、GPU cache に全 expert がある場合は既定 share の対象外です。明示的な CPU share 設定は別途評価されます。HIP/HIP GFX906 のビルドでは既定 share を arm しません。
-- 上限値は chunk 長が閾値と等しい場合も share の対象外です。実装は `T < stream_all_min()` を staged/share 側、`T >= stream_all_min()` を全 expert streaming 側として分けます。
+- `Prefill::arm_cpu_share(applies, ...)` で `applies` が真で、`STRATA_PREFILL_CPU_SHARE` の判定結果が 0 でないこと。上限は `applies && cpu_share_on()` の場合だけ `g_stream_min_share` に設定されます。
+- `STRATA_PREFILL_CPU_SHARE` が未設定なら通常は share 無効です。既定で有効化されるのは既定対象経路が `by_default` として arm し、CPU share の適用対象があり、既定 share のメモリ条件を通る場合です。generate の既定対象は単一 GPU、CPU pool 有効、batch slots なし等の経路です。既定有効化は HIP ビルドでは行われません。
+- chunk が上限未満でも、CPU pool がない、pool の同時利用を取得できない、native expert layout でない、multi-GPU peer 経路である、expert source がない、または share 用 pinned buffer の確保に失敗する場合は CPU 処理になりません。buffer 確保失敗時は stderr に `prefill: the CPU share is off for this run: ...` を出し、その実行では GPU が全 expert を処理します。
+- `STRATA_PREFILL_STREAM_MIN` が設定され、`atoll` 値が 0 以上なら、その値が `stream_all_min()` の優先値になります。この場合、`STRATA_PREFILL_CPU_SHARE_MAX` が設定する境界より `STRATA_PREFILL_STREAM_MIN` が優先されます。
 
 ## 実行時の詳細
 
-`Prefill::arm_cpu_share()` が share を適用する経路で `cpu_share_max()` を `g_stream_min_share` に設定します。通常の generate 経路と serve 経路では prompt chunk のバッファ／loan を計画する前に arm され、`Prefill::init()` からも pool の有無に応じて arm 判定が呼ばれます。`cpu_share_max()` の数値と「変数が設定済みか」の判定は関数内の `static` に保存されるため、最初に評価された後のプロセス内環境変更は反映されません。
+環境値から計算した値と「変数が設定されていたか」は、それぞれ `cpu_share_max()` 内の function-local `static` に初回呼び出し時に保存されます。したがって初回呼び出し後にプロセス環境を書き換えても再評価されません。既定経路の 1024 特例は `g_share_default` と `STRATA_PREFILL_CPU_SHARE` の値にも依存します。
 
-chunk が閾値未満なら `ring_slots()` は通常の大きな streaming ring でなく `STAGE`（8 slot）を返し、実行ループでは `stream_all` が false になります。CPU share が有効で CPU pool を確保できれば、ルーティング後に CPU が担当する expert を選び、CPU が読み出す分以外の expert は GPU 側で処理します。chunk が閾値以上なら通常の全 expert streaming 経路になり、この CPU share は使われません。閾値は fused layout や share 用バッファのサイズ計画にも使われるため、chunk の実サイズや必要な VRAM を直接変更する値ではありません。
-
-既定 share をメモリ不足で arm しない場合は、stderr に `strata: the CPU prefill share is not armed by default: ...` と表示されます。CPU share を明示していてメモリ判定が不足する場合は警告を出しつつ明示設定を保持します。share の実行中に pinned buffer の確保に失敗すると、その run では share を停止し、GPU が全 expert を処理する旨を stderr に出します。
+上限は `g_stream_min_share` に入り、prompt の stream-all 判定および ring の sizing 判定で使われます。通常の既定境界も 1024 token です。share が arm されたときは、上限未満の chunk が `stream_all` でなくなり、CPU share が適用可能なら GPU が stream する非 resident expert の一部を CPU pool に回します。chunk が境界以上なら stream-all 側に入り、CPU share による staged-chunk 処理は適用されません。API コメントにも、share が適用される staged chunk はこの上限未満で、buffer sizing より前に上限を設定する必要があるとあります。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:148-152` — `stream_all_min()` の既定値と share 閾値の参照。
-- `src/prefill/prefill.cpp:169-193` — CPU share 設定の有無、`STRATA_PREFILL_CPU_SHARE_MAX` の `atoll`、1024 下限、既定 share 時の1024特例。
-- `src/prefill/prefill.cpp:1919-1930` — share を arm する条件と閾値の反映。
-- `src/prefill/prefill.cpp:277-299, 1020-1038, 1823-1826, 2302-2312` — 閾値によるリング、layout、streaming/share 実行経路の切替と buffer sizing API。
-- `src/program/generate.cpp:6899-6926, 6978-6986, 12556-12561` — 既定 share のメモリ／cache 条件、serve/generate 経路での arm とログ。
-- `include/strata/prefill/prefill.hpp:173-187` — API コメントに記された share の適用範囲と staged chunk の上限。
-- `docs/DETAILS.md:1564-1580` — 既定 share、上限 1024/3072 の説明、記載された測定条件とメモリ不足時の扱い。資料は CUDA の RTX 3060、Tesla P100、RTX 5070 での既定範囲の測定を記載しています。性能値はその条件の資料記載であり、この調査で再測定したものではありません。
+- `src/prefill/prefill.cpp:163-167`: `STRATA_PREFILL_STREAM_MIN` と share 上限から stream-all 境界を決める。
+- `src/prefill/prefill.cpp:184-208`: `STRATA_PREFILL_CPU_SHARE` の値、CPU share 上限の変換、既定 1024 特例。
+- `src/prefill/prefill.cpp:1960-1972`: HIP の既定 arm 除外と、share が有効な場合の上限設定。
+- `src/prefill/prefill.cpp:1103-1105,2337-2351,3137-3148`: init 時の arm、chunk の stream-all 判定、CPU pool と buffer fallback。
+- `src/program/generate.cpp:7202-7229,7281-7289,13154-13159`: 既定 share のメモリ条件、serve/generate の arm 条件。
+- `include/strata/prefill/prefill.hpp:174-188`: API コメント上の適用対象、上限、chunk 境界。
+- `docs/DETAILS.md:1597-1613`: 文書の説明。既定 share の上限を 1024、明示 share の標準上限を 3072 とし、1024 未満を維持する設定例を示す。コードでも既定有効経路では 1024、明示 share 時は未設定なら 3072 となる。

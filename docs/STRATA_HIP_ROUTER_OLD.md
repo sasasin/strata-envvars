@@ -1,52 +1,42 @@
 # `STRATA_HIP_ROUTER_OLD`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリ・GPU ドライバーの動作は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-MoE ルーター（`router_top10`）で、gfx906 以外の HIP ビルドに限り fast kernel ではなく portable kernel（`router_top10_kernel`、serial FP64 sum と block barrier を持つ形）を走らせる opt-in。fast kernel は ids/weights が portable と bitwise 一致で、測定済みカード（R9700 / 9070 XT）では既定で fast が走る。この変数を設定すると portable kernel に戻す。
-
-読み取りは `src/kernels/cuda/router_top10.cu` の `router_top10()` 1 箇所（SYCL に同一ロジックのミラー `sycl/src/kernels/cuda/router_top10.dp.cpp:694`）。
+wave32 AMD HIP backend の MoE router (`router_top10`) で、既定の fast kernel を使わず、従来の portable kernel を選ぶための切り替えです。fast kernel は softmax の指数和の一部を並列化し、選択を wave 0 上で行います。portable kernel は block 内の並列処理と選択ごとの block barrier を使います。ソースコメントと `docs/AMD_HIP.md` は、fast kernel が同じ expert ID と weight を bit 単位で返すこと、および `STRATA_HIP_ROUTER_OLD=1` で portable kernel を実行することを説明しています。
 
 ## 値と判定
 
-判定は `std::getenv(...) != nullptr`（設定されているかどうか）だけで、値の内容は比較しない。
+この変数の値は parse されず、`std::getenv("STRATA_HIP_ROUTER_OLD") != nullptr` だけで判定されます（`src/kernels/cuda/router_top10.cu:430-434`）。
 
-| 状態 | `old` | 走る kernel |
-|---|---|---|
-| 未設定（`nullptr`） | false | fast kernel（形状条件が揃うとき。既定） |
-| 空文字 `""` | true | portable kernel |
-| `1` | true | portable kernel |
-| `0` | true | portable kernel |
-| `true`, `false`, `2` など | true | portable kernel |
+| 状態 | wave32 HIP backend での判定 |
+|---|---|
+| 未設定 | `old == false`。fast kernel を使える入力形状では fast kernel を選ぶ |
+| 空文字を含む何らかの値が設定済み | `old == true`。portable kernel を選ぶ |
 
-docs の「`STRATA_HIP_ROUTER_OLD=1` runs the portable kernel」は、値が `1` であることではなく「設定されていること」で portable に戻る。`STRATA_HIP_ROUTER_OLD=0` でも portable kernel。未設定だけが fast。
-
-根拠: `src/kernels/cuda/router_top10.cu:431`。
+したがって `0` や `false` も設定されていれば portable kernel になります。設定値を数値・真偽値として解釈したり、大文字小文字を比較したりはしません。判定は `router_top10()` 内の関数ローカル `static const bool` に保存されるため、最初の同関数呼び出し時に評価され、その後プロセス内で環境を書き換えても再評価されません。
 
 ## 有効になる条件
 
-- ビルドが HIP（`#if defined(__HIPCC__)`）かつ **gfx906 用 macro が無い**（`#else` 分岐）。gfx906 ビルドでは同じ `old` 変数が `STRATA_HIP_ROUTER_FAST`（別変数）から決まり、`STRATA_HIP_ROUTER_OLD` は読まれない（`router_top10.cu:426-432`）。
-- fast path を通らない条件（`old` が true）なら、形状によらず portable kernel path へ falls through。fast path が選ばれるのは `n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32` のとき（`router_top10.cu:433`）。この外では `old` の値にかかわらず portable path（`router_top10.cu:474-482`）。
+- この分岐は `__HIPCC__` が定義されたビルドにだけ含まれます。Strata の CMake では `STRATA_ENABLE_HIP` が wave32 AMD backend（gfx1100/gfx1201 等）を選び、`src/kernels/cuda/router_top10.cu` を `strata_kernels` に含めます（`CMakeLists.txt:71-72,344-353`）。CUDA build ではこの環境変数を読む分岐はコンパイルされません。
+- `STRATA_HIP_GFX906` の gfx906/wave64 compat build では別分岐になり、この変数は参照されません。同 backend は `STRATA_HIP_ROUTER_FAST` の未設定有無で選択します（`src/kernels/cuda/router_top10.cu:426-432`）。
+- wave32 HIP で変数が未設定でも、fast kernel が使われるのは `n_tokens > 0`, `65 <= n_expert <= 512`, `1 <= k <= 32` の入力に限られます。それ以外は通常の入力検査後に portable `router_top10_kernel` へ進みます（同 `:433-434,451-482`）。
+- MoE 経路が `router_top10()` を呼び出した場合に適用されます。例えば layer の通常 router は、native 512 expert × top-10 router を使わない場合にこの関数へ進みます（`src/core/layer.cpp:371-376`）。native router を選ぶ経路はこの切り替えの対象外です。
 
 ## 実行時の詳細
 
-`old` は `static const bool` で、プロセス内で最初に呼ばれたとき一度だけ環境を読む。その後の環境変更は再評価されない。
+fast kernel が選ばれると `launch_generic(..., mode=1)` が `router_top10_fast_kernel<false>` を起動します。環境変数が存在する場合、または fast kernel の対象形状に合わない場合は、通常の portable kernel 起動へ進みます。fast kernel 起動後の `cudaGetLastError()` が失敗すると `router_top10 launch: ...` を stderr に出し、プロセスを終了します。デフォルト stream (`stream == nullptr`) では同期も行い、失敗時は `router_top10: ...` を stderr に出して終了します。環境変数による portable 選択自体はログを出しません（同 `:385-403,433-449,481-494`）。
 
-portable path は `router_top10_kernel`（`router_top10.cu:481`）。fast path は `launch_generic(..., mode 1)` の `router_top10_fast_kernel<false>`（`router_top10.cu:391-394`）。両者は同じ ids/weights を返す（fast kernel の注釈 `router_top10.cu:279-281`）。launch 失敗は stderr に出して `exit(1)`。
+portable kernel は expert 全体の softmax 用 exponentials を計算し、top-k を選び、選択 weight の和を `2**-14` で下限 clamp して再正規化します。fast kernel も同じ router の出力意味を保つ実装として記述されています（同 `:7-17,87-187,266-383`）。
 
-## 測定値（資料に記載）
-
-`docs/AMD_HIP.md:323-327`（資料中の主張。本調査で計測器動作を独自確認した事実ではない）: fast kernel（portable と bitwise 同一）は call あたり 39 → 9-12 us、decode R9700 62.4 → 70.0 tok/s、9070 XT +4%。`STRATA_HIP_ROUTER_OLD=1` は portable kernel を走らせる、とある。portable path 側の数値は資料に单独記載がなく、fast と結果（ids/weights）は一致する。
-
-## 相互作用
-
-- `STRATA_HIP_ROUTER_FAST`（別変数）: gfx906 ビルドではこちらが `old` を決める。両変数は同じ `old` 変数に割り当てられるが、ビルド macro（`STRATA_HIP_GFX906`）でどちらを読むかが分かれる。
-- `STRATA_ROUTER_BLOCK`: gfx906 の既定 path（wave64 kernel）の選択に影響。
+`docs/AMD_HIP.md` は、対象機材で fast router が portable kernel と同じ IDs/weights を返した検証、および測定時の速度を記載しています。そこでの計測は R9700 / RX 9070 XT と Coder IQ1_M pack 等の条件付きであり、一般的な性能保証ではありません（`docs/AMD_HIP.md:330-336`）。
 
 ## 根拠
 
-- 読み取り・判定: `src/kernels/cuda/router_top10.cu:426-433`（`#else` の `!= nullptr`）。
-- fast / portable kernel 定義と mode 対応: `src/kernels/cuda/router_top10.cu:279-281,385-403,481`。
-- SYCL ミラー: `sycl/src/kernels/cuda/router_top10.dp.cpp:691-694`。
-- docs 照合: `docs/AMD_HIP.md:323-328`。テスト（`CMakeLists.txt:935` の parity 言及）は実装根拠にしていない。
+- 環境変数の有無による選択、fast path の入力範囲、fallback、エラー処理: `src/kernels/cuda/router_top10.cu:422-495`
+- portable kernel の router 計算: `src/kernels/cuda/router_top10.cu:69-187`
+- fast kernel の実装と portable kernel との同一性に関するソース注釈: `src/kernels/cuda/router_top10.cu:266-383`
+- HIP backend の説明と portable kernel への切り替え記述: `docs/AMD_HIP.md:330-336`
+- backend option と router source の build 登録: `CMakeLists.txt:71-72,344-353`
+- 通常 layer router からの呼び出し条件: `src/core/layer.cpp:371-376`

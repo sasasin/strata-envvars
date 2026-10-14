@@ -1,49 +1,42 @@
 # `STRATA_HIP_SWIGLU_FUSED`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリ・GPU ドライバーの動作は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
 
 ## 役割
 
-MoE expert の gate/up（SwiGLU）→ q8_1 量子化を、gfx906 ビルドに限り 2 回 pass（`swiglu_entries_kernel` + `quantize_q8_1_kernel`）ではなく、RDNA の one-pass fused kernel（`swiglu_q8_1_entries_kernel`）で実行する opt-in。fused kernel は出力が bitwise 同一（「bitwise the same」）で、結果を変えず pass 構成を変える。既定は 2-pass（A/B baseline）。
-
-読み取りは `src/kernels/cuda/iq_kernels.cu` の `native_expert_grouped()` 1 箇所（`env_on` 経由、SYCL に同一ロジックのミラー `sycl/src/kernels/cuda/iq_kernels.dp.cpp:5144`）。
+AMD gfx906 互換ビルドの grouped expert カーネルで、SwiGLU の計算と結果の Q8_1 量子化を1つのカーネルにまとめるかを選びます。有効時は gate/up の出力から SwiGLU 値を計算し、Q8_1 ブロックへ直接書き込みます。無効時は SwiGLU と Q8_1 量子化を別々のカーネルで実行します。
 
 ## 値と判定
 
-`env_on(name)` は `v != nullptr && v[0] != '\0' && v[0] != '0'`（`src/kernels/cuda/iq_kernels.cu:1951-1954`）。先頭文字だけを見る。
+`env_on()` は値が存在し、空文字でなく、先頭文字が `0` でない場合に true を返します。文字列全体や数値としての妥当性は調べません。
 
-| 状態 | 判定 |
+| 値 | 判定 |
 |---|---|
-| 未設定（`nullptr`） | 無効（既定） |
-| 空文字 `""` | 無効（`v[0]` は `\0`） |
-| 先頭文字が `0`（`0`, `0anything`） | 無効 |
-| 先頭文字が `0` でも `\0` でもない非空文字列（`1`, `true`, `false`, `2`, `a` など） | 有効 |
+| 未設定 | 無効 |
+| 空文字 | 無効 |
+| `0`、`0abc` | 無効 |
+| `1`、`true`、`2abc`、先頭が空白の値 | 有効 |
 
-`false` は先頭文字 `f` なので有効、`0` は無効。数値 parse・大文字小文字・空白は検査しない。
-
-根拠: `src/kernels/cuda/iq_kernels.cu:3568`（`env_on`）、`1951-1954`（`env_on` 定義）。
+CUDA/HIP 実装と SYCL ポートの `env_on()` は同じ判定です。変数の判定値は関数内の `static const bool` に保存されます。初期化は gate/up と SwiGLU の処理が行われ、この分岐に初めて到達した時点で一度だけ実行されます。その後の環境変更は反映されません。
 
 ## 有効になる条件
 
-- ビルドが gfx906 用 macro（`#if defined(STRATA_HIP_GFX906)`）。それ以外のビルドでは `sw_v1 = v1`（`iq_kernels.cu:3571`）で、この変数は効かない。
-- `v1`（`g_grouped_v1`）が false であること。`sw_v1 = v1 || !sw_fused`（`iq_kernels.cu:3569`）。`v1` が true なら fused path を通らない。`g_grouped_v1` は `env_on("STRATA_GROUPED_V1")`（`iq_kernels.cu:3446`）または `native_grouped_set_v1` で決まる。
-- 判定結果は `static const bool sw_fused` に保存され、プロセス内で最初に呼ばれたとき一度だけ環境を読む。以後の環境変更は反映されない。
+- ビルドで `STRATA_HIP_GFX906` が定義されている必要があります。CMake では `STRATA_HIP_GFX906` オプションが gfx906 向け HIP 互換ビルドを構成し、この macro を定義します。通常の CUDA、wave32 AMD HIP (`STRATA_ENABLE_HIP`)、その他のビルドでは、この変数を読む分岐がコンパイルされません。
+- `native_expert_grouped()` が gate/up と SwiGLU の処理を実行する必要があります。`g_exp_phase == 2` では gate/up 側をスキップするため、この設定は使われません。
+- `STRATA_GROUPED_V1` または `native_grouped_set_v1(true)` によって grouped v1 が選ばれている場合は、環境変数が有効でも2段階の方式が使われます。コードは `sw_v1 = v1 || !sw_fused` と判定します。
 
-## 実際の挙動
+## 実行時の詳細
 
-fused path（`sw_v1` が false）のとき `swiglu_q8_1_entries_kernel` を launch（`iq_kernels.cu:3577-3578`）。2-pass path（`sw_v1` が true）のとき `swiglu_entries_kernel` と `quantize_q8_1_kernel` を launch（`iq_kernels.cu:3574-3575`）。両者は同じ `hq`（q8_1 量子化された hidden）を産む（bitwise 同一）。
+`native_expert_grouped()` の `STRATA_HIP_GFX906` 分岐で環境変数を一度判定し、grouped v1 が無効かつ本変数が有効なら `swiglu_q8_1_entries_kernel` を起動します。このカーネルは実際に呼び出された expert entry 範囲について gate と up から SwiGLU 値を計算し、その値を Q8_1 形式へ格納します。
 
-## 測定値
+それ以外の場合は `swiglu_entries_kernel` で SwiGLU 値を中間バッファへ書き、続けて `quantize_q8_1_kernel` で Q8_1 に変換します。実装コメントは統合版の結果を別々のカーネルと bitwise 同一と説明しています。環境変数専用のログ出力はありません。カーネル起動後は共通の `check("native_expert_grouped/swiglu")` が実行されます。
 
-Strata の docs（`docs/AMD_HIP.md`、`docs/DETAILS.md`）にこのスイッチの性能数値の記載はない。実装注釈（`iq_kernels.cu:3566-3567`）は gfx906 で 2-pass を A/B baseline、fused を「bitwise the same」の one-pass kernel として説明する。向上幅はコードから確認できない。
-
-## 相互作用
-
-- `STRATA_GROUPED_V1`（`env_on`）: 有効（true）なら `sw_v1` が true になり、`STRATA_HIP_SWIGLU_FUSED` の値にかかわらず 2-pass path。fused path は `STRATA_GROUPED_V1` が off のときだけ選ばれる。
+CUDA/HIP 実装と SYCL ポートの両方に同じ環境変数分岐があります。SYCL 側も `STRATA_HIP_GFX906` 条件で分岐し、統合版では1つの `parallel_for`、従来版では2つの `parallel_for` を起動します。`docs/DETAILS.md` にこの環境変数の説明や、この切り替えの測定値は見つかりませんでした。この調査では実機で parity や性能を測定していません。
 
 ## 根拠
 
-- 読み取り・判定: `src/kernels/cuda/iq_kernels.cu:3568`、`env_on` 定義 `1951-1954`。
-- path 分岐と kernel: `src/kernels/cuda/iq_kernels.cu:3565-3578`。
-- `v1` の由来: `src/kernels/cuda/iq_kernels.cu:3446,3492`。
-- SYCL ミラー: `sycl/src/kernels/cuda/iq_kernels.dp.cpp:5143-5144`。
+- `src/kernels/cuda/iq_kernels.cu:2128-2131` — 値の存在、空文字、先頭文字による `env_on()` 判定。
+- `src/kernels/cuda/iq_kernels.cu:3641-3646,3771-3787` — grouped expert 呼び出し、gfx906 条件、`STRATA_GROUPED_V1` との優先関係、統合版と2段階版の起動。
+- `src/kernels/cuda/iq_kernels.cu:1461-1467,1677-1708` — 個別の SwiGLU・量子化処理と、両方をまとめるカーネル。
+- `sycl/src/kernels/cuda/iq_kernels.dp.cpp:3014-3017,5276-5285,5371-5429` — SYCL ポートでの同じ値判定と起動分岐。
+- `CMakeLists.txt:64-70,128-144` — gfx906 互換ビルドの設定と `STRATA_HIP_GFX906` macro の定義。

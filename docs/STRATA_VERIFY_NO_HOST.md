@@ -1,56 +1,56 @@
 # `STRATA_VERIFY_NO_HOST`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。対象は Strata 所有の SYCL 実装と同梱ラッパー・セットアップ。外部ドライバーの動作は含めない。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-SYCL の検証 window で、各 layer の CPU/GPU doorbell handshake（GPU が layer ごとにホストへ計画・応答を求め、ホストが処理するやりとり）を省き、ホスト側は GPU の window 全体が終わるまで待つ経路を選びます。SYCL engine の `strata-sycl.sh` は通常この変数を `1` にして起動します。i915 の Arc A-series 向けセットアップは `0` を設定します。
+SYCL verifier の device-plan 経路で、ホストが各 layer の doorbell / flag handshake に応答しない前提を選びます。設定が有効だと、ホスト側の層ごとの応答ループを省略し、SYCL の verify window 全体をまとめて待つ経路になります。`STRATA_VERIFY_DEVICE_PLAN` による device plan 自体を有効にする変数ではありません。device plan は別途有効である必要があります。
 
-これは単独で device plan を有効にする変数ではありません。`STRATA_VERIFY_DEVICE_PLAN` などで device plan が使われるか、cache の常駐状態、ミラーの有無が実際の処理を左右します。
+主な実装は `sycl/src/core/verify.cpp` の window 記録・完了処理と、`sycl/src/program/generate.cpp` の起動時の安全確認です。CUDA/HIP実装に同名の実動作参照は確認できませんでした。
 
 ## 値と判定
 
-engine の C++ 実装は `getenv()` の値を、空でなく、文字列全体が `"0"` でない場合に有効とします。数値 parse はせず、文字列の完全一致で比較します。
+実装は `getenv()` の値を空文字かどうか確認し、その後文字列全体を `"0"` と比較します。数値変換はしません。
 
-| 値 | engine 内の判定 |
+| 値 | 判定 |
 |---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| `0` | 無効 |
-| `1`、`2`、`false`、`00`、`0abc`、空白を含む文字列など | 有効（空でなく、全体が `0` と一致しないため） |
+| 未設定 | OFF |
+| 空文字 | OFF |
+| 文字列がちょうど `0` | OFF |
+| 上記以外の非空文字列 | ON。例: `1`, `00`, `false`, `0abc`, 前後に空白のある値 |
 
-SYCL wrapper `sycl/serve/strata-sycl.sh` は既定値として `1` を用意し、親環境の `STRATA_*` があればその値で上書きします。値が空文字または厳密に `0` の場合は Docker に渡しません。したがって、wrapper 経由で `0` または空文字を指定したとき、engine では未設定となり無効です。`sycl/setup_intel.py` は i915 driver の設定に `STRATA_VERIFY_NO_HOST=0` を書き、wrapper の既定を打ち消します。
+そのため `00` や `false` は数値的に偽らしく見えてもONです。大文字小文字や数値としての妥当性は検査されません。verify.cpp 内の判定結果は `static const bool` にキャッシュされるため、その判定が初めて実行された後に同一プロセスの環境を書き換えても反映されません。起動処理中の安全確認は `generate.cpp` で別途評価されます。
 
-根拠: `sycl/src/core/verify.cpp:808,2185`; `sycl/src/program/generate.cpp:4874,4975`; `sycl/serve/strata-sycl.sh:25-35`; `sycl/setup_intel.py:193-202`。
+根拠: `sycl/src/core/verify.cpp:800-801,2183-2184`; `sycl/src/program/generate.cpp:4961-4962,5061-5063`。
 
 ## 有効になる条件
 
-- 変数が有効でも、device plan は別の `STRATA_VERIFY_DEVICE_PLAN` が設定され、その `atoi()` 結果が 0 でない場合に限り有効です。ただし、全expertがVRAM cacheに常駐する window では `all_resident_` が優先され、`device_plan_` は false になります。device plan の割り当てに失敗した場合も無効化されます。詳細は `sycl/src/core/verify.cpp:701-729,748-771`。
-- device plan を使う場合も、GPU cache または pinned host mirror から必要なexpertを処理できることが必要です。起動時にVRAMにもmirrorにもないexpertが見つかり、この変数が有効なら engine は `strata generate: REFUSED: ...` をstderrへ出して、その生成を開始せず `return 2` します。ホストmirrorはfirst stageしか覆わないlayer splitでは、後段stageにcache slot不足がある場合も拒否します（`sycl/src/program/generate.cpp:4872-4879,4970-4988`）。
-- 起動時にmissがあり、`--adapt-every` と `--adapt-swaps` が指定されている場合、移動後のexpertをGPUもmirrorも持たずGPUが応答待ちになるのを避けるため、stderrに `strata generate: adaptive swaps off: ...` を出し、`o.adapt_every = 0` とします（`sycl/src/program/generate.cpp:4881-4888`）。
-- 同梱wrapperの既定 `1` はxe driver向けです。i915向けセットアップは `0` を設定します。docs/INTEL.mdもB70 (`xe`) とA750 (`i915`) で値を分けています（`sycl/serve/strata-sycl.sh:22-35`; `sycl/setup_intel.py:193-202`; `docs/INTEL.md:680-703`）。
+- `STRATA_VERIFY_DEVICE_PLAN` 等により device plan が有効であること。`STRATA_VERIFY_NO_HOST` はそれを有効化しません。
+- device-plan が必要とする expert がVRAMにあるか、device planから参照できるホストミラーにあること。初段のVRAM不足分がミラーされず `unmirrored_misses > 0` の場合、起動時に生成を拒否して終了コード2にします。
+- 複数GPUのlayer splitでは、後段のstageのexpert cacheに不足があれば、後段をカバーするホストミラーがないため起動を拒否します。設定を `0` にするとホスト応答経路を許可し、不足expertをホスト側で処理できます。
+- device-plan とこの変数が有効な場合、適応的なexpert swap (`--adapt-every` と `--adapt-swaps` が正) は、移動したexpertをVRAMにもミラーにも置けなくなる危険があるため無効化されます。
+- `record_window()` の `STRATA_VERIFY_LEAN` 経路はさらに、step hook、remote-opt、常時publish、stepped mode がなく、device plan が有効であることを条件にします。この場合、ホストが応答しない doorbell / flag wait、plan copy、PCIe-share group とstaging kernelなど不要なgraph nodeを省略します。
 
 ## 実行時の詳細
 
-検証windowの実行後、通常経路は各layerについてGPUのsequence flagを待ち、CPU expert処理と計画公開を進めます。`no_host` が真ならそのlayer単位ループを実行せず、直後の `cs_->wait()` でGPUのwindow全体が完了するのを待ちます（`sycl/src/core/verify.cpp:2180-2203,2302-2310`）。この分岐の読み取りは関数内の `static const bool` なので、初回評価後は同じプロセス内で環境を変更しても再評価されません。
+通常のverify window完了処理は、device planでresident expertを処理する状況などを除いて、layerごとにGPUのsequence値を待ち、ホスト側のplanを公開します。`STRATA_VERIFY_NO_HOST` が有効ならこの層ごとのループ条件が成立せず、ホスト側は各layerのdoorbellに応答しません。SYCL側のコメントでは、xe driverではgraph実行中のhost-mapped memoryへのkernel書き込みが安定して見えず、per-layer waitが失敗するため、NO_HOST時はwindow全体を待つと説明されています。ホストに処理させるexpertがある構成ではこの前提を満たせません。
 
-同じ名前は `Verifier::record_window()` のstatic判定にも使われ、`STRATA_VERIFY_LEAN` が無効でなく、device plan が有効で、step hook・remote expert経路・always-publish・stepped実行がない場合、不要なdoorbell publish/wait等のgraph nodeを省く条件になります（`sycl/src/core/verify.cpp:803-809`）。この lean 判定もstatic値を含み、初回評価後に環境値を読み直しません。
+起動時に初段のVRAM外expertについて、ミラーされなかった数を調べます。NO_HOSTが有効で不足が残ると、stderrに `strata generate: REFUSED: ...` を出して終了コード2にします。layer splitでも後段stageの不足を調べ、同様に拒否します。不足がなくても `--adapt-every` と `--adapt-swaps` が有効なら、stderrに `strata generate: adaptive swaps off: ...` を出し、`o.adapt_every` を0にします。
 
-`sycl/src/program/generate.cpp` の開始前チェックは各箇所で環境を読み、起動可否とadaptive swapsを決めます。`Verifier` のstatic判定とは異なる読み取りタイミングです。wrapperはengine起動前に親環境と設定をまとめてコンテナへ渡すため、engine起動時点の値がこれらの判定に使われます（`sycl/serve/strata-sycl.sh:10-13,25-42`）。
+`sycl/serve/strata-sycl.sh` は `STRATA_VERIFY_DEVICE_PLAN=1`、`STRATA_VERIFY_NO_HOST=1`、`STRATA_STAGER_THREADS=12` を既定で渡します。スクリプト環境の値はこの既定値を上書きしますが、値が `0` または空文字ならコンテナへ渡しません。その場合、実行ファイル内では未設定としてOFFになります。サーバー設定の `env` ブロックも環境として渡される設計です。`sycl/setup_intel.py` はAlchemist/i915構成で `STRATA_VERIFY_NO_HOST=0` を設定し、layer splitでexpertが収まりそうにない場合も、設定で明示されていなければ `0` を設定します。
 
-## 文書との照合
+## ログと資料
 
-`docs/INTEL.md` は、xeではこの変数を有効にして全window待ちを使い、i915では無効にしてCPUがVRAM外expertを処理する構成を説明しています（`docs/INTEL.md:242-249,680-703,757-760`）。コードにもi915向けに `0` を設定する処理があります。
+拒否時の文言は `sycl/src/program/generate.cpp:4963-4965` および `5069-5074`、適応swap停止の文言は `4971-4974` です。SYCLラッパーの既定値と `0` の扱いは `sycl/serve/strata-sycl.sh:10-13,22-36` にあります。
 
-`docs/DETAILS.md:830` には `STRATA_VERIFY_LEAN` によるgraph node削減で「-2%」という記載がありますが、その一行だけでは測定環境や比較条件を特定できないため、この値を一般的な性能効果としては扱いません。今回確認したコードから性能差は導けません。
+`docs/INTEL.md:246-247` はNO_HOSTを「全window graphを待つ」設定と説明し、expertがすべてresidentの場合に限ると記しています。同資料の `:700-703` は値 `0` または空文字をOFFとして扱い、`strata-sycl.sh` がそれらを転送しない点を説明しています。コード上ではミラーに全missがある構成もdevice planが利用できるため、「全expertがVRAM resident」は一律の必須条件ではなく、各expertがVRAMまたはdevice planが参照可能なmirrorにあることが必要です。外部driverの内部動作や資料中の測定値は本調査の確認事実として扱っていません。
 
 ## 根拠
 
-- 値判定とlean条件: `sycl/src/core/verify.cpp:803-809`
-- device plan と全常駐判定: `sycl/src/core/verify.cpp:701-729,748-771`
-- layerごとのhost処理を飛ばし、window完了を待つ経路: `sycl/src/core/verify.cpp:2180-2203,2302-2310`
-- VRAM/mirror miss の拒否とadaptive swaps無効化: `sycl/src/program/generate.cpp:4872-4888`
-- 後段layer-split missの拒否: `sycl/src/program/generate.cpp:4970-4988`
-- wrapperの既定・値の引き継ぎ: `sycl/serve/strata-sycl.sh:10-13,22-42`
-- i915向け設定: `sycl/setup_intel.py:193-202`
-- docs照合: `docs/INTEL.md:242-249,680-703,757-760`; `docs/DETAILS.md:830`
+- `sycl/src/core/verify.cpp:795-801`: NO_HOST時のlean graph node省略条件。
+- `sycl/src/core/verify.cpp:2178-2201`: SYCL window完了時のNO_HOST判定、層ごとのホスト待ち。
+- `sycl/src/program/generate.cpp:4959-4975`: ミラーされないexpertの起動拒否とadaptive swap停止。
+- `sycl/src/program/generate.cpp:5057-5078`: multi-GPU layer split後段の不足確認・拒否。
+- `sycl/serve/strata-sycl.sh:10-13,22-36`: コンテナへの環境引き継ぎ、既定値および `0` / 空文字の除外。
+- `sycl/setup_intel.py:207-216,308-321`: i915時の明示OFF、layer split時の不足予測に基づくOFF。
+- `docs/INTEL.md:236-249,680-703,769-772`: SYCL利用方法、条件、値の扱いに関する説明。

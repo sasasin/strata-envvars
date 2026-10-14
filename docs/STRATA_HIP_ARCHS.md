@@ -1,40 +1,47 @@
 # `STRATA_HIP_ARCHS`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
 
 ## 役割
 
-Windows 用 HIP ビルドスクリプト `tools/hip/build_windows.bat` が読む、パッケージに含める AMD GPU アーキテクチャの `;` 区切りリストです。指定したアーキテクチャごとに TheRock の `device-<arch>` wheel を選び、同じリストを CMake の `CMAKE_HIP_ARCHITECTURES` とパッケージ作成スクリプトへ渡します。したがって、単独の実行エンジンが起動時に読む設定ではありません。Linux の `./setup.sh --backend hip` や通常の CMake ビルドでは、CMake の `CMAKE_HIP_ARCHITECTURES` が入力であり、この名前の環境変数を直接は読みません。
+`STRATA_HIP_ARCHS` は、Strata の Windows HIP ビルドスクリプトが使う任意のビルド時環境変数である。HIP エンジンをどの AMD GPU アーキテクチャ向けにビルドするかを指定し、対応する ROCm デバイス用パッケージと演算ライブラリを配布 ZIP に含めるためにも使う。実行時の Strata プログラムはこの名前の環境変数を読み取らない。ビルド時に値から作られた `STRATA_HIP_ARCHS` コンパイル定義を使って、実行中の GPU がバイナリに含まれるアーキテクチャかを検査する。
+
+Linux の手動 HIP ビルドでは、文書は `CMAKE_HIP_ARCHITECTURES` を直接指定する方法を案内しており、この環境変数を経由しない（`docs/AMD_HIP.md:131-144`）。
 
 ## 値と判定
 
 | 状況 | 処理 |
 |---|---|
-| `STRATA_HIP_ARCHS` が未定義または空 | Windows バッチが `gfx1100;gfx1101;gfx1102;gfx1200;gfx1201;gfx1030;gfx1031;gfx1151` を設定する。 |
-| 値を設定 | バッチは文字列の値をそのまま使い、セミコロンを空白に置換して `device-<arch>` の wheel 選択に使う。また、値を CMake の `-DCMAKE_HIP_ARCHITECTURES=...` およびパッケージ作成時の `--archs` に渡す。 |
-| CMake が受け取ったアーキテクチャ | 空白をセミコロンに正規化し、各項目の `:` 以降を除いたベース名で許可リストを検査する。重複するベース名は除去される。 |
+| Windows ビルドスクリプト起動時に未設定または空 | `gfx1100;gfx1101;gfx1102;gfx1200;gfx1201;gfx1030;gfx1031;gfx1151` を既定値として設定する。 |
+| 1つ以上のアーキテクチャを指定 | セミコロン区切りの値を、ROCm デバイス用 wheel の選択、`CMAKE_HIP_ARCHITECTURES`、ZIP パッケージ処理へ渡す。 |
+| 空要素だけの値 | CMake 側で空要素を読み飛ばし、アーキテクチャが1つも残らなければ `Strata HIP: CMAKE_HIP_ARCHITECTURES is empty` で構成を失敗させる。 |
+| 未対応アーキテクチャを含む値 | HIP 構成時に `CMAKE_HIP_ARCHITECTURES` の値と対応対象を示す fatal error で失敗する。 |
 
-Windows スクリプト自体はアーキテクチャ名やリスト形式を検証しません。不正な項目や空リストなどは、後続の wheel インストールまたは CMake の設定で失敗し得ます。HIP CMake 設定で認識されるのは、検証済み `gfx1100`, `gfx1201`、コミュニティ報告あり `gfx1101`, `gfx1200`、未検証扱い `gfx1010`, `gfx1011`, `gfx1012`, `gfx1102`, `gfx1103`, `gfx1030`, `gfx1031`, `gfx1034`, `gfx1150`, `gfx1151`, `gfx1152` です。認識済みでも未検証リストの項目には警告が出ます。これ以外は CMake の設定を fatal error で止めます。`gfx1201:xnack-` のような suffix は判定・実行時照合では落とされます。
+Windows スクリプトの既定値は任意設定で上書きできる。CMake はセミコロンに加えて空白もリスト区切りとして扱い、`gfx1201:sramecc-:xnack-` のような要素はコロン以降を落とした `gfx1201` で検証・記録する。同じ基本アーキテクチャの重複は除かれる。検証対象は大文字小文字を含め完全一致であり、認定済み (`gfx1100`, `gfx1201`)、コミュニティ報告で検証 (`gfx1101`, `gfx1200`)、未検証だがビルド可能な一覧に応じて、通常続行、STATUS、WARNING のいずれかになる。どの一覧にもない値は失敗する（`cmake/hip_backend.cmake:13-40`）。
 
 ## 有効になる条件
 
-- `tools/hip/build_windows.bat` を使って Windows HIP エンジンをビルド・パッケージするときに環境変数として有効です。CUDA ビルドや通常の実行時設定には使われません。
-- バッチは `build.ninja` がまだない場合に限って CMake を configure し、そのとき環境変数の値を `CMAKE_HIP_ARCHITECTURES` に渡します。既存のビルドディレクトリではこの値で再 configure しません。一方、ROCm wheel の stamp 判定や最終パッケージ処理はその回の値を読みます。そのため、既存ビルドで値だけを変えて再実行すると、ビルド済み engine の対象 arch とパッケージが選ぶ arch が一致しない可能性があります。
-- CMake 直接利用時は `-DCMAKE_HIP_ARCHITECTURES=...` が対象アーキテクチャの入力です。`STRATA_HIP_ARCHS` は CMake 内でその正規化済み結果から生成され、HIP runtime target のコンパイル定義としてバイナリに埋め込まれます。
-- `STRATA_HIP_GFX906` の互換ビルドは別経路で、この変数を使いません。
+- この環境変数を直接参照するのは `tools/hip/build_windows.bat`。Windows HIP エンジンと ZIP を作る経路で使われる（`tools/hip/build_windows.bat:13-23`）。
+- `STRATA_HIP_ARCHS` は `build.ninja` がまだない場合にだけ `CMAKE_HIP_ARCHITECTURES` として CMake 初回構成へ渡される。既存のビルドディレクトリではスクリプトが再構成を行わないため、後から環境変数だけを変えても、既存ビルドの対象アーキテクチャは更新されない（`tools/hip/build_windows.bat:64-80`）。
+- HIP のアーキテクチャ許可リストにあることは、ハードウェア上での検証済みを意味しない。CMake は検証区分をログまたは警告に出しつつ、許可された未検証アーキテクチャのビルドも続ける（`cmake/hip_backend.cmake:7-15,25-34`）。
+- HIP 以外のバックエンドには、この変数による実行時の GPU 判定は適用されない。
 
 ## 実行時の詳細
 
-HIP 対応ビルドでは、埋め込まれたコンパイル定数を使い、選択した GPU の `gcnArchName` から `:` 以降を除いたアーキテクチャがビルド対象リストに完全一致するか、さらに wave size が 32 かを確認します。リストにない GPU または wave32 でない GPU は実行可能性チェックに失敗します。`strata generate` は使用する GPU を事前確認し、不一致理由を stderr に出して終了コード 1 を返します。`strata-device --list-devices` は `cannot run: ...` を表示します。`strata-device` の通常の起動情報では、実 GPU arch とコンパイル対象リストを表示します。
+Windows バッチは未設定時の既定値を設定し、リスト内の各アーキテクチャに対応する `device-<arch>` wheel を ROCm のインストール指定へ加える。初回構成では同じ値を `-DCMAKE_HIP_ARCHITECTURES=...` として渡す（`tools/hip/build_windows.bat:21,35-46,67-74`）。CMake は許可された基本アーキテクチャを重複なしのリストにし、カンマ区切りの文字列を `STRATA_HIP_ARCHS` コンパイル定義として HIP ターゲットへ設定する（`cmake/hip_backend.cmake:18-43,85-90`）。
 
-これらは実行時に環境変数を再読込する動作ではなく、ビルド時に埋め込まれたリストの使用です。アプリ起動後の `STRATA_HIP_ARCHS` の変更はこのチェックに影響しません。
+ビルド後のパッケージ処理にもバッチが現在の環境変数を `--archs` で渡す。パッケージャーは指定されたアーキテクチャ分の rocBLAS/hipBLASLt カーネルと `.kpack` ファイルを ZIP に含め、同じ一覧を `BUILD.json` に記録する（`tools/hip/build_windows.bat:82-84`; `tools/hip/package_windows.py:119-158`）。したがって既存 `build.ninja` を使って環境変数だけを変更した場合、エンジンがコンパイルされた一覧とパッケージャーが使う一覧が食い違う可能性がある。
+
+HIP 実行ファイルは環境変数を再読込せず、コンパイル定義に埋め込まれたカンマ区切りリストと GPU の `gcnArchName`（コロン以降の機能サフィックスを除去）を完全一致で照合する。対象 GPU がリストになければ「この Strata engine がビルドされたアーキテクチャではない」とする理由を返し、wave サイズが32以外でも HIP カーネルが必要とする wave32 ではない旨を返す（`src/core/device.cu:33-64`）。`strata generate` は実際に使用する GPU を確認し、不一致なら stderr に `strata generate: ...` を出して終了コード1で戻る。`strata-device --list-devices` は該当 GPU に `cannot run: ...` を表示する（`src/program/generate.cpp:2507-2521`; `src/core/device_main.cpp:49-62`）。
+
+同じ HIP 実行時チェックのソース複製が `sycl/src/core/device.dp.cpp:45-88,257-277` にある。そちらもコンパイル定義を使い、実行時の `STRATA_HIP_ARCHS` 環境変数読み取りは行わない。
 
 ## 根拠
 
-- `tools/hip/build_windows.bat:13-23,36-46,64-84` — Windows バッチの既定値、wheel 選択、configure 条件、CMake と package への引き渡し。
-- `cmake/hip_backend.cmake:4-43,85-90,128` — `CMAKE_HIP_ARCHITECTURES` の既定値、正規化・許可判定・重複除去、コンパイル定義と configure 時ログ。
-- `src/core/device.cu:27-63,68-73,215-231,247-299` — コンパイル定数による HIP GPU arch と wave32 の実行時判定、および不一致時のエラー。
-- `src/program/generate.cpp:2448-2462` — generate 起動時の使用 GPU 検査と stderr / 終了コード。
-- `src/core/device_main.cpp:43-75` — `--list-devices` の不一致表示と通常起動時のコンパイル対象表示。
-- `tools/hip/package_windows.py:68-76,119-140` — バッチから渡る arch リストを使った ROCm kernel / kpack の選択。
-- `CMakeLists.txt:125-145` — `STRATA_HIP_GFX906` 互換ビルドが分離された経路であること。
+- `tools/hip/build_windows.bat:13-23,35-46,64-84` — Windows ビルドでの環境変数、既定値、ROCm wheel 選択、CMake とパッケージャーへの引き渡し。
+- `cmake/hip_backend.cmake:4-43,85-90` — CMake の既定値、アーキテクチャ一覧と判定、コンパイル定義。
+- `src/core/device.cu:29-64,70-75,217-233` — 実行ファイルに埋め込まれた一覧と GPU アーキテクチャ・wave32 検査。
+- `sycl/src/core/device.dp.cpp:45-88,257-277` — HIP 実行時チェックのソース複製。
+- `src/program/generate.cpp:2507-2521`; `src/core/device_main.cpp:49-62` — 不一致時の生成エラーとデバイス一覧表示。
+- `tools/hip/package_windows.py:119-158` — 指定アーキテクチャ用ファイルの同梱と `BUILD.json` の記録。
+- `docs/AMD_HIP.md:118-144,451-455` — Windows HIP ビルドでの環境変数利用と、手動ビルドで `CMAKE_HIP_ARCHITECTURES` を使う説明。

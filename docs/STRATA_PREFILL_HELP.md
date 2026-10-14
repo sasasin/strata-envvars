@@ -1,49 +1,48 @@
 # `STRATA_PREFILL_HELP`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-レイヤー分割した複数 GPU のプロンプト処理で、現在のステージが MoE 専門家を読み込んでいる間にアイドル状態になる次のステージの GPU を使い、ストリーム対象の専門家の一部を計算させる機能を有効にする。環境変数を有効にしても、後述の条件を満たすプロンプトだけで動く。未設定時は無効。
+multi-GPU の layer split で、prompt の各 stage が自分の層を処理している間、次の stage（最後の stage では最初の stage）の GPU に、その層の非 resident expert の一部をストリーミングして MMQ で計算させます。prompt stage は処理を順番に実行するため、その間アイドルになる GPU を使います。expert の行は mapped pinned host memory 経由で返します。この動作は opt-in で、helper GPU 側の MMQ grouping により結果は既定経路と bit-identical ではありません（`include/strata/prefill/prefill.hpp:165-172`, `docs/MULTI_GPU.md:85-97`）。
 
 ## 値と判定
 
-| 環境変数の値 | 判定 |
-| --- | --- |
-| 未設定 | 無効 |
-| 空文字、数字で始まらない文字列、`0`、`0abc` | 無効 |
-| `1`、その他 `atoi` が 0 以外に変換する値（例: `-1`, `2`, `1abc`） | 有効 |
+値全体の厳密比較ではなく、`std::atoi()` の結果が 0 でないかで判定します。未設定と空文字は無効です。`atoi` は先頭の空白と符号を許し、数値の後ろに文字が続いても数値部分を変換します。数字として読めない文字列は 0 になります。
 
-実装は `std::getenv` の結果を `std::atoi` に渡し、変換結果が 0 以外なら有効とする。したがって真偽値文字列の `true` は有効にならず、先頭の空白・符号と数字列は変換され、数字列より後ろは判定に使われない。設定値の数値範囲チェックはない。
+| 値の例 | 判定 |
+|---|---|
+| 未設定、空文字、`0`、`00`、`true`、`0abc` | 無効 |
+| `1`、`2`、`-1`、`1abc`、`  +2tail` | 有効 |
 
-値は `Prefill::set_stage_helper` から最初に呼び出された際に関数内の `static` 値として読み取られる。以後同じプロセス内で環境を変更しても反映されないため、設定変更にはプロセスの再起動が必要。CLI 引数でこの環境変数を上書きする処理は見つからなかった。
+値を設定しただけで helper 計算が必ず走るわけではありません。share の既定値は prompt chunk 長 `T` に応じて別途決まり、share が 0 なら helper は使われません（次節参照）。
+
+根拠: CUDA/HIP 実装 `src/prefill/prefill.cpp:1557-1563`、SYCL 実装 `sycl/src/prefill/prefill.cpp:1508-1514`。
 
 ## 有効になる条件
 
-- `strata serve` のレイヤー分割（複数 GPU ステージ）経路で各ステージの `Prefill` に次のステージの `Prefill` を helper として設定する。通常の単一 GPU 経路や `--peer-device` のみの経路では、この helper を設定する呼び出しに入らない。
-- ステージと helper が別の有効 GPU を持ち、対象ステージの MMQ 計画に対象レイヤーが含まれている必要がある。
-- 実際のプロンプト処理では一つのチャンクで読み切る場合に限る。デフォルトでは 1024 トークン以上のチャンク、デフォルトの共有率計算が正の値になる概ね 3276 トークン以下のチャンクが対象となる。チャンク上限や共有率は `STRATA_PREFILL_STREAM_MIN` と `STRATA_PREFILL_HELP_FRAC` によって変わる。
-- 入力元とステージのリング、helper 側の MMQ バッファが利用でき、 fused ring 経路でなく、対象レイヤーが helper 側で計算可能である必要がある。これらを満たさない場合はそのプロンプトで helper を使わず通常の処理を続ける。
-- native expert pack では対象レイヤーに fused カーネルが使える場合、この helper 経路を使わない。`docs/MULTI_GPU.md` は fused prompt kernels (`STRATA_PF_FUSED=1`) と `--peer-device` を対象外として説明している。
+`Prefill::set_stage_helper()` が helper を設定でき、prompt 実行時に `bind_stage_helper()` がすべての条件を満たす必要があります。
 
-デフォルトの共有率は `min(0.45, 0.5 - T / 16384)`（`T` はチャンクのトークン数）で、0.3 未満なら 0 にする。共有率が 0 の場合も helper 計算は行われない。なお、`STRATA_PREFILL_HELP_FRAC` が設定されるとその値を `atof` で読み、0〜1 に clamp した固定共有率を使う。
+- 複数 GPU の layer split であり、helper が null でも同一 stage でもない。両 GPU の device ID が有効で異なり、MMQ plan が存在する。
+- prompt 全体が1 chunkである。先頭 stage では `n <= m.T`、後続 stage ではその chunk 状態を引き継ぐ。
+- 対象 chunk が `stream_all_min()` 以上。既定は1024 tokenで、`STRATA_PREFILL_STREAM_MIN` による変更を受ける。
+- expert source があり、ring が8 slotより大きく、fused ring ではない。
+- stage の全 layer が MMQ 対応である。native expert layout の場合、いずれかの層が fused native kernel に対応すると helper 経路を使わない。
+- helper stage に必要な chunk 用 prompt buffer、MMQ context、ring などがある。
+- 既存の peer prefill（`m.pp`）が設定されていない。したがって `--peer-device` を使う経路では helper は bind されない。
+
+既定 share は `min(0.45, 0.5 - T / 16384)` で、結果が0.3以上のときだけ使い、それ未満は0です。そのため既定では約3.3K tokenを超える chunk は helper の対象外になります。`STRATA_PREFILL_HELP_FRAC` が設定されている場合は `atof` で読み、0〜1に clamp した値をすべての `T` に使います（空文字や数値変換不能値は0となり helper は無効、負値も0、1超は1）。この別変数で share を0にすれば `STRATA_PREFILL_HELP` が有効でも処理されません。
+
+根拠: `src/prefill/prefill.cpp:1564-1579,1582-1588,1622-1639`; SYCL 対応箇所 `sycl/src/prefill/prefill.cpp:1515-1531,1533-1539,1604-1621`; stream 閾値 `src/prefill/prefill.cpp:158-168`; stage/helper の接続と実行 `src/program/generate.cpp:7700-7711`, `src/prefill/prefill.cpp:2122-2139,4172`。
 
 ## 実行時の詳細
 
-サーバー起動時に各ステージへ次ステージの GPU を helper として関連付ける。有効な場合、実装は helper の GPU にストリームとイベントを作る。作成に失敗した場合、`strata serve: <エラー> - stage <番号> reads its prompts alone` を stderr に出し、そのステージは単独で読む。
+各 stage の `set_stage_helper()` が `split_help_env()` を呼び、そこで `STRATA_PREFILL_HELP` を読む結果を function-local `static const bool` に保存します。プロセス内でこの初回判定が済んだ後の環境変更は再評価されません。起動時に環境を設定して使う想定です。CUDA/HIP 系の `src/prefill/prefill.cpp` と SYCL 系の `sycl/src/prefill/prefill.cpp` に同じ判定と同等の gate があります。
 
-一チャンクのプロンプト処理開始時に helper のバッファを結び付ける。共有対象に選ばれた専門家の重みは helper GPU の PCIe 経由でその GPU 自身のプロンプト用バッファへ転送され、helper が MMQ 経路で行を計算して結果を返す。コードでは転送対象を `ps_frac` の累積で選び、活性値と結果行には mapped host memory を通す経路を使う。処理終了時に helper のストリームを同期し、ステージ間の役割を戻す。
+chunk の開始時に helper 条件を満たすと、stage は helper 用の `PeerPrefill` を一時的に active peer として使います。非 resident expert のうち source が pinned であるものから share 相当分を選び、helper GPU に送り、行を戻して本来の MoE 結果に加えます。全層の計算後に helper の copy/compute/output stream を同期して、通常の peer 状態に戻します。helper 用 mapped pinned host buffer は必要な chunk サイズまで確保されます（`src/prefill/prefill.cpp:1662-1684,2341-2427,3294-3306,4046-4053,2126-2139`）。
 
-環境変数が有効でも、条件に合わない場合の多くは追加ログなしで通常処理に戻る。helper 経路の計測が有効な場合、peer GPU のタイミングと `peer-streamed experts` 数が stderr に出る。helper が計算する行は別の MMQ grouping で丸められるため、既定経路と bit-identical ではない。Strata の資料は同じプロンプトに対しては再現可能と記し、この理由で opt-in としている。
+この環境変数専用の有効化ログはありません。タイミング計測が有効なら helper GPU の処理時間や peer-streamed expert 数を `strata prefill timing` として stderr に出すコードがあります（`src/prefill/prefill.cpp:4284-4297`）。
 
-## 根拠
+## 文書記載の測定
 
-- `src/prefill/prefill.cpp:1513-1518` — 変数を `getenv` / `atoi` で読み、非ゼロ判定を static cache。
-- `src/prefill/prefill.cpp:1538-1575` — helper 設定条件、GPU ストリームとイベントの作成。
-- `src/prefill/prefill.cpp:1580-1640` — 一チャンク時の適用条件、MMQ 条件、helper バッファ割当。
-- `src/prefill/prefill.cpp:2077-2094` — 一チャンク時の bind と helper 処理後の同期・復元。
-- `src/prefill/prefill.cpp:2325-2355` — `ps_frac` に基づく専門家の振り分け。
-- `src/prefill/prefill.cpp:148-152` — デフォルトのストリーミング開始トークン数（1024）。
-- `sycl/src/prefill/prefill.cpp:1506-1534` — SYCL 実装にも同じ環境変数の判定と helper 設定がある。
-- `src/program/generate.cpp:7305-7315` — サーバーのレイヤー分割ステージに helper を設定し、設定失敗時に stderr へ通知。
-- `docs/MULTI_GPU.md:85-101` — 機能の説明、適用上限、非 bit-identical の記載、および 2x RTX 3090 / UD-Q4_K_XL / no P2P の測定例。記載された prompt tok/s は 1.1K で 496→723、1.5K で 674→833、2K で 878→1,128、2.5K で 1,017→1,296、3K で 1,260→1,440。これは資料の測定値であり、本調査で再測定した値ではない。
+`docs/MULTI_GPU.md:85-97` は2x RTX 3090、UD-Q4_K_XL、P2Pなしの測定として、1.1K token prompt が496→723 tok/s、1.5Kが674→833、2Kが878→1,128、2.5Kが1,017→1,296、3Kが1,260→1,440と記載しています。同資料では4K/8K prompt と decode は不変とし、約3.3K tokenから既定 share を止める理由を「stage が重なり、share が得にならないため」と説明しています。これらは資料に記載された特定の機材・モデル・経路での測定値であり、他環境の性能を示すものではありません。

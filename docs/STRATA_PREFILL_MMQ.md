@@ -1,43 +1,48 @@
 # `STRATA_PREFILL_MMQ`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの内部動作は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。調査対象リポジトリは `main`（調査開始時点で作業ツリー clean）。
 
 ## 役割
 
-この名前は二つの用途に使われる。CMake の `STRATA_PREFILL_MMQ` オプションは HIP build に GGML MMQ prompt prefill 経路を組み込むビルド設定で、実行時環境変数も同じ名前で、組み込み済みの MMQ 経路を prompt prefill で使うかを切り替える。実行時に有効なら、対応する expert layer は expert weight を MMQ 用に gather し、activation を量子化して gate/up と down の MMQ 積を実行する。無効ならその layer は既存の FP16 dequantize 経路を使う。
+HIP 用にビルドされた prompt prefill の expert 行列積で、GGML MMQ（量子化重みの GPU 行列積）経路を使うかを実行時に選びます。実行時に無効なら、対象 expert の計算は FP16 重み経路へ回ります。環境変数と同名の CMake オプションもあり、こちらは MMQ 実装をバイナリへ組み込むかを決めます。実行時の環境変数だけでは、未ビルドの MMQ を有効にできません。
 
 ## 値と判定
 
-実行時の判定は `std::atoi(env) != 0` であり、文字列全体の厳密な boolean parse ではない。
+実行時は `sycl/src/prefill/prefill.cpp` の `mmq_plan()` が `getenv()` と `std::atoi()` で判定し、初回呼び出し結果を関数内 static の plan に保持します (`:863-889`)。
 
-| 環境変数の状態・値 | 実行時の判定 |
+| 実行時環境変数 | 結果 |
 |---|---|
-| 未設定 | MMQ が build に含まれていれば有効 |
-| `0`、`00`、`-0`、数値に変換できない文字列、空文字 | 無効（`atoi` が 0 を返す） |
-| 先頭の空白や符号の後の整数が 0 以外 | 有効。例: `1`, `-1`, `2abc`, ` 1` |
-| 整数変換後に文字が続く値 | 後続文字は無視。例: `0abc` は無効、`1abc` は有効 |
+| unset | MMQ 実装がビルド済みなら有効。未ビルドなら無効 |
+| `0`、空文字、数字で始まらない文字列 | `atoi` が 0 を返すため無効 |
+| `1`、`-1`、`2abc`、先頭空白の後に非ゼロ整数がある文字列 | `atoi` が非ゼロを返すため有効 |
+| `0abc`、整数変換できない文字列 | `atoi` が 0 を返すため無効 |
 
-未設定時の ON は `mmq::built()` が true の場合に限る。環境変数を設定しただけでは未 build の MMQ 実装を有効にできない。CMake オプションは別の評価段階であり、既定 OFF。ルート `CMakeLists.txt` では `STRATA_PREFILL_MMQ=ON` は `STRATA_ENABLE_HIP=ON` を要求し、`STRATA_NATIVE_EXPERTS=ON` も要求する。CUDA 構成では MMQ の基礎ターゲットが別途組み込まれ、このオプションは HIP のためのビルド選択として宣言されている。
+文字列全体の妥当性検証はなく、数値変換できた先頭部分で決まります。`mmq::built()` が false の場合は、環境変数が unset または非ゼロでも有効になりません。初回の `mmq_plan()` 評価後にプロセス環境を変えても、この plan は再評価されません。
+
+同名のビルド設定は別の判定です。CMake の `STRATA_PREFILL_MMQ` は Boolean option で既定 `OFF`、`ON` にするには HIP が必要で、`STRATA_NATIVE_EXPERTS=ON` も必要です。これらの条件を欠くと CMake configure 時にエラーになります (`CMakeLists.txt:71-89,1263-1265`)。有効な HIP build では `strata_mmq` を作成・リンクして `STRATA_PREFILL_MMQ=1` を compile definition として付与します (`:1535-1579`)。
 
 ## 有効になる条件
 
-- MMQ が組み込まれている必要がある。未組み込み build では stub の `mmq::built()` が false を返し、環境変数に非ゼロ値を設定しても `on` は false。
-- 対象モデルの expert layout に layer があり、各 layer の gate/up と down の format・形状が `mmq::fits()` を満たす場合に、その layer の `use_mmq` が true になる。MMQ が対応しない layer は FP16 経路へ fallback する。native expert format の一部は fused 経路の対象になり得るが、MMQ 自体が無効でも同じ条件で動くとは限らない。
-- CMake の HIP 用オプションは `STRATA_ENABLE_HIP=ON` および `STRATA_NATIVE_EXPERTS=ON` が必要。GGML MMQ のソースが選択した checkout にない場合は configure 時に fatal error となる。
-- SYCL 版 `sycl/src/prefill/prefill.cpp` にも同名の `getenv()` 判定がある。ただしリポジトリの `sycl/CMakeLists.txt` は prefill の SYCL ソースを追加するだけで `STRATA_PREFILL_MMQ` を定義せず、MMQ ソースも build しない。その通常の SYCL build では stub により `mmq::built()` が false であり、環境変数だけでは有効にならない。
+- 実行バイナリに MMQ が組み込まれており (`mmq::built()`)、実行時環境変数の `atoi` 結果が非ゼロであること。
+- MMQ plan はレイヤーごとに重み形式と行列形状を確認し、`mmq::fits()` が false のレイヤーは MMQ 対象にせず fallback 扱いにします (`sycl/src/prefill/prefill.cpp:873-886`)。
+- 環境変数が有効でも、prompt path が選択されない、またはその layer の format/shape が MMQ に適合しない場合、その計算には MMQ は使われません。実際の expert 処理では `mmq_plan().layer[l]` を `use_mmq` として分岐します (`sycl/src/prefill/prefill.cpp:3223-3232,3435-3469,4015-4045`)。
+- この実行時スイッチは dense GGUF projection の MMQ を直接有効化しません。dense path は `STRATA_DENSE_MMQ` を別途読み、`1` で始まる値のみを有効とします (`sycl/src/prefill/gemm.dp.cpp:872-881`)。
 
 ## 実行時の詳細
 
-CUDA/HIP 共通の prefill 実装と SYCL 移植実装は、`mmq_plan()` 内の関数ローカル `static const MmqPlan` 初期化時に値を一度読み、結果を cache する。従ってプロセス起動後に環境変数を書き換えても再判定されない。値は plan の layer ごとの MMQ 選択、MMQ buffer の確保量、fallback 状態を決める。実際の layer 処理では `use_mmq` に従って、入力 activation の量子化、expert weight の MMQ buffer への gather、group ごとの gate/up MMQ・SwiGLU・down MMQ、または FP16 側の処理を選ぶ。
+`mmq_plan()` は `expert_layout()` の各 layer の gate/up と down の型を取り出し、両方の matrix shape が MMQ 対応 (`fits`) ならその layer を MMQ 対象にします。plan に MMQ 対象がある場合、prompt prefill の MoE 処理が layer ごとに MMQ path を選びます。MMQ を使わない layer がある場合や全体を無効にした場合は、FP16 fallback 用 scratch を確保し、その path を使用します (`sycl/src/prefill/prefill.cpp:912-928,1203-1213,3223-3232`)。
 
-MMQ の対応範囲は build 時に含めた GGML MMQ kernel instance と format に依存する。CMake では `STRATA_MMQ_KQUANTS` などの別 build option が追加 format を compile する。これらは実行時 `STRATA_PREFILL_MMQ` の値とは別の条件である。Strata の `docs/DETAILS.md` は prompt prefill 全体の高速化を説明し、RTX 5070 12 GB の 32K prompt などの測定値を記載しているが、その測定は MMQ 環境変数だけを切り替えた比較ではないため、ここでは環境変数単独の効果として引用しない。
+設定読み取りは初回の `mmq_plan()` 呼び出し時であり、値はプロセス内で static cache されます。Strata のコードに、この runtime 変数を子プロセスへ転送・上書きする処理は見つかりませんでした。通常の親プロセス環境からの継承の有無は Strata 固有の実装としては扱いません。
+
+## 文書との照合
+
+`docs/STRIX_HALO.md:54-66` は `-DSTRATA_PREFILL_MMQ=ON` を HIP build 時に指定する手順として記述し、prompt experts 用 MMQ kernel をビルドすると説明しています。`docs/AMD_HIP_PERFORMANCE.md:13-27` は同じ綴りの `STRATA_PREFILL_MMQ=ON` を build 設定、`export STRATA_PREFILL_MMQ=1` を runtime 設定として分け、runtime で MMQ が opt-in と説明しています。これは CMake option と環境変数の二つの役割に対応します。Strata 同梱 `setup.py` の AMD build も `-DSTRATA_PREFILL_MMQ=ON` を CMake に渡します (`setup.py:3001-3007`)。
 
 ## 根拠
 
-- `CMakeLists.txt:71-86,1214-1216` — CMake option の既定値と HIP/native expert の前提。
-- `CMakeLists.txt:1353-1398,1418-1462` — CUDA/HIP の MMQ library の構築と compile definition。HIP 側の必要 GGML source の検査は `1426-1429`。
-- `src/prefill/prefill.cpp:60-78,992-1018` — MMQ 未組み込み時の stub、実行時 parse、static plan、layer format/shape 判定。
-- `src/prefill/prefill.cpp:1277-1286,2978-2987,3372-3397,3782-3828` — buffer 確保、per-layer 経路選択、MMQ 処理と FP16 fallback。
-- `sycl/src/prefill/prefill.cpp:56-74,861-887` — SYCL 実装にもある stub と同じ実行時判定。
-- `sycl/CMakeLists.txt:232-239` — 同梱 SYCL prefill target の構成。
-- `docs/DETAILS.md:317-327` — prompt prefill 全体の処理説明と、複数変更を含む測定への案内。
+- CMake option の既定値と HIP/native-experts 条件: `CMakeLists.txt:71-89,1263-1265`
+- HIP 向け MMQ source の組み込みと compile definition: `CMakeLists.txt:1535-1579`
+- runtime env parse、static plan、layer format/shape 判定: `sycl/src/prefill/prefill.cpp:863-889`
+- FP16 fallback scratch と MMQ plan の利用: `sycl/src/prefill/prefill.cpp:912-928,1203-1213,3223-3232`
+- dense projection は別環境変数で制御: `sycl/src/prefill/gemm.dp.cpp:872-881`
+- Strata の build / runtime 設定の説明: `docs/STRIX_HALO.md:54-66`, `docs/AMD_HIP_PERFORMANCE.md:13-27`

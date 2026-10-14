@@ -1,68 +1,49 @@
 # `STRATA_PREFILL_RING`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
 
 ## 役割
 
-プロンプト処理（prefill）で、VRAM に常駐していない expert の重みを読み込む device staging ring の slot 数を指定します。1 slot は expert blob 1 個分です。大きい ring は先読みコピーを進められますが、その分の device memory を使います。`Prefill::init` が確保する ring と、自動 chunk / cache-loan のサイズ計算が使う ring 数の両方に反映されます。
-
-CUDA/HIP 実装と SYCL 実装の双方に同名の読み取りがあります。設定値は関数呼び出しごとに `getenv` で取得され、環境変数の有無や数値を static cache していません。
+プロンプト prefill で、GPU にまだ常駐していない expert blob をホスト側から先読みして置く device ring の slot 数を指定します。大きい ring は、計算中に次の expert blob をより多く転送できる一方、blob ごとの device buffer を多く確保します。これは `Prefill` の sizing と初期化に使われ、通常の decode ring や外部 driver の設定ではありません。
 
 ## 値と判定
 
-値全体の検証はせず、C の `std::atoi` で先頭の整数部分を読みます。空文字、数字で始まらない文字列は 0 として扱われ、数字の後ろは無視されます。空白や符号などの扱いも `atoi` に従います。
+両実装とも `std::getenv("STRATA_PREFILL_RING")` の結果を `std::atoi` に渡します。値全体の検証はありません。未設定なら自動選択、設定済みなら変換結果を使います。空文字、数字で始まらない文字列は `atoi` により 0 になり、負数も下限処理の対象になります。`atoi` は先頭空白と符号を許し、数字の後ろにある文字列を無視します（例: `32junk` は 32）。
 
-| 設定 | `atoi` の結果 | 結果（stream-all が使える場合） |
-|---|---:|---|
-| unset | — | 下記の優先順位で自動決定 |
-| 空文字、数字で始まらない文字列、`0`、負数など | 0 以下 | 最小 16 slot に丸める |
-| `8` または `8abc` など、結果が `STAGE` (= 8) | 8 | routed-only staging の 8 slot |
-| 1〜15（8 を除く） | 1〜15 | 16 slot に丸める |
-| 16〜上限 | 16〜上限 | 指定数を使用 |
-| 上限超過 | 上限超過 | backend / kernel 条件ごとの上限に丸める |
+| 設定 | ring の扱い |
+|---|---|
+| 未設定 | backend、pinned share、fused 経路などから選ぶ既定値。下記参照 |
+| `8` または `8junk` | 明示的に `STAGE`（8 slot）を返す。大きな chunk でも routed-only staging を選ぶ |
+| その他の整数、空文字、無効文字列 | `atoi` の結果を使用。16 未満は 16、backend の `ring_cap()` 超過は上限に丸める |
+| 上記の ring 値でも chunk が小さい | `STRATA_PREFILL_STREAM_MIN`（既定 1024 token）未満では `STAGE` に戻る。ただし明示値が 8 の場合は先に `STAGE` が返る |
 
-数値変換が 8 になる設定値は、明示的な routed-only staging として特別扱いされます。例えば `8trailing` も 8 slot の staging です。`0` は ring を無効にせず、16 slot になります。大文字小文字の比較はありません。
+CUDA/HIP 実装では、通常の未設定値は pinned share が 90% 以上なら fused ring で 1024、それ以外で 384 slot、pinned share が 90% 未満なら 96 slotです。これは上限処理前の値で、`ring_cap()` は通常 512、非 native の fused 経路では最大 1024 なので、native fused 経路などでは 1024 が 512 に丸められます。HIP で `STRATA_HIP_WMMA` が先頭文字 `1` の場合、かつこの変数が未設定で layer split override もない場合は、閾値以上の chunk で 96 slot、未満で 8 slot を使います。
 
-未設定時の基本優先順位は次の通りです（上位が優先）。
-
-1. HIP で `STRATA_HIP_WMMA` の先頭文字が `1`、かつ `STRATA_PREFILL_RING` が unset、かつ split override がない場合は、chunk が `STRATA_PREFILL_STREAM_MIN`（既定 1024）以上なら 96 slot、それ未満なら 8 slot。
-2. `STRATA_SPLIT_RING` から設定された layer-split override。
-3. `--prefill auto` の byte-budget 計算で設定された ring budget（budget が有効で、chunk が `small_max` を超える場合）。
-4. 通常既定値: streamed expert の pinned-RAM share が 90% 以上なら、fused 条件を満たす Q2_0 pack は 1024、それ以外は 384。share が 90% 未満なら 96。
-
-HIP の WMMA 判定は最初の判定時に static cache されます。ほかの設定値や通常既定値は、ring 数を計算するたびに評価されます。明示値がある場合は、HIP の WMMA 特例より先に通常の値処理へ進み、split override / byte-budget よりも優先します。
+SYCL も通常の既定値・上限式は同じですが、`STRATA_PREFILL_STREAM_ALL` による追加条件があります。未設定時は非常駐 expert の割合が 10% 未満の場合だけ大きい ring を使い、`STRATA_PREFILL_STREAM_ALL` の先頭文字が `1` なら割合にかかわらず許可します。明示値 `8` はこの条件より前に返るため routed-only staging を指定できます。条件を満たさない場合は 8 slot です。
 
 ## 有効になる条件
 
-- chunk が `STRATA_PREFILL_STREAM_MIN` 以上である必要があります。未満では ring 数の計算結果は通常 8 slot になり、expert 全体を先読みする stream-all ring は使いません。`STRATA_PREFILL_RING=8` はこの条件を越える chunk でも 8 slot staging を明示します。
-- SYCL では、別変数 `STRATA_PREFILL_STREAM_ALL` が `1` でない限り、VRAM に常駐しない (layer, expert) pair の割合が 10% 以上なら ring 数は 8 に戻ります。`STRATA_PREFILL_STREAM_ALL=1` ならこの割合による抑制を越えて stream-all を許可します。したがって、SYCL で `STRATA_PREFILL_RING` を大きくしても stream-all 条件が不成立なら大きな ring にはなりません。stream-all 環境値は先頭文字が `1` かで判定されます。
-- CUDA/HIP 側には、この SYCL の nonresident-share / `STRATA_PREFILL_STREAM_ALL` 抑制分岐はありません。
-- ring 上限は `ring_cap()` によります。Q2_0 の fused path では 1024、その他は通常 512 です。native pack では全 layer の format が fused 対応するかなどで fused-ring 条件が決まります。明示値もこの上限を越えません。
-- `STRATA_SPLIT_RING` の値は layer-split 起動時に `Prefill::set_ring_override()` を通じて反映されますが、`STRATA_PREFILL_RING` が設定されていれば本変数の値が優先されます。API のコメントと `ring_slots()` の分岐がこの優先を定めます。
-- `--prefill auto` の chunk / lend 計算では、`STRATA_RING_BYTES` が有効な場合に ring byte budget が考慮されます。ただし明示された `STRATA_PREFILL_RING` は、auto scan が計算した ring より優先し、その ring 分のバッファが収まる chunk に制限します。
+- 変数は CUDA/HIP (`src/prefill/prefill.cpp`) と SYCL (`sycl/src/prefill/prefill.cpp`) の prefill 実装で読み取られます。Metal の `Prefill::init` は別経路で、この ring sizing は通りません。
+- `STRATA_PREFILL_STREAM_MIN` 以上の prompt chunk で、かつ backend 固有の stream-all 条件を通った場合に、8 より大きい ring が先読み ring として使われます。未満では `STAGE` になり、通常の大きな先読み経路になりません。
+- layer split が `Prefill::set_ring_override()` で既定 ring を指定する場合でも、環境変数が設定されていれば環境変数の値が優先されます。環境変数が未設定なら、override が byte-budget ring より先に選ばれます。
+- 変数自体は `static` cache されず、`ring_slots(T)` の呼び出しごとに `getenv` と変換が行われます。自動 chunk の容量見積もりと `Prefill::init` の両方が ring 数を参照するため、プロセス中に環境値を変更すると後続の見積もりと初期化で異なる値になる可能性があります。通常の起動設定では起動前に指定します。
 
 ## 実行時の詳細
 
-`Prefill::init` は `ring_slots(T)` の結果を `m.ring` に取り、その個数分の `MAXBLOB()` byte device staging slot を確保します。所有バッファでは一つの連続 allocation にまとめ、借用領域では slot ごとに割り当てます。必要サイズ計算 `bytes_needed_impl` と `bytes_needed_no_ring` も同じ ring 数を含めるため、設定値はメモリ適合性と自動 chunk / cache loan の見積もりにも影響します。streamed expert の読み込み処理がこれらの slot を再利用します。
+`ring_slots(T)` の戻り値は prefill 初期化時に `m.ring` となり、その数だけ `MAXBLOB()` bytes の expert staging buffer を確保します。`bytes_needed()` / `bytes_needed_owned()` も同じ ring 数を容量見積もりに含めます。CUDA/HIP の先読み経路は ring index を `issued % m.ring` で循環し、転送済み blob を計算側が使い終わるまで slot を再利用しません。したがって指定数は「expert 数」ではなく、同時に保持する whole-blob buffer の数です。
 
-SYCL 実装では stream-all が有効かを `STRATA_PREFILL_STREAM_ALL` と nonresident share から追加判定し、通らなければ `STAGE` を返します。CUDA/HIP の WMMA 既定特例は `STRATA_HIP_WMMA` を先頭文字で判定し、同じく unset の `STRATA_PREFILL_RING` でのみ働きます。
+serve の自動 chunk 選択では、解決後の chunk と slot 数を stderr に `strata serve: prompt chunk auto: ... tokens, a ...-slot ring` と表示します。layer split が override を決めた場合にも、解決 slot 数を stderr に表示します。
 
-serve の layer-split / resident-RAM 経路では、起動時に chunk と ring slot 数を `strata serve: lend sizing: ... (ring R slots at chunk C)` のログに出します。コード上、ring が貸出領域の計算・確保を超えると「do not fit」等の適合失敗につながり得ます。環境値そのものに対する専用の警告ログは確認できません。
+## 資料との照合
 
-## 文書との照合
-
-`docs/AMD_HIP_PERFORMANCE.md` は、gfx1100 の測定構成で `STRATA_PREFILL_RING=96` を使った例を示しています。`docs/AMD_HIP.md` は gfx12 WMMA と組み合わせた 96 slot の構成と、9070 XT の特定条件で既定 384 slot より 96 slot が速かった測定を記載しています。これらは明記された GPU / model / chunk 条件での測定で、一般的な最適値を示すものではありません。
-
-`docs/MULTI_GPU.md` は `STRATA_SPLIT_RING` による split ring override と、`STRATA_PREFILL_RING=384` を明示したときの lend sizing が変わらない例を記しています。ソースでは `STRATA_PREFILL_RING` が split override より優先されるため、この説明と整合します。
+`docs/DETAILS.md` は 0.1.39b 以降、ring をモデル pack の blob bytes に応じて調整し、`--prefill auto` が chunk と ring のメモリを考慮すると説明しています。これは自動 sizing の説明です。`STRATA_PREFILL_RING` を明示すると、ソースの `ring_slots()` がその自動値・override・byte-budget 値より先に指定値を使います。`docs/INTEL.md` では SYCL の `STRATA_PREFILL_RING=8` を routed-only staging に使った例、`docs/AMD_HIP.md` では HIP の値 96 と既定 384 の比較例があります。これらの資料上の測定例は各記載機材・設定に限られ、他環境の性能を示すものではありません。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:277-299`: 環境値の `atoi`、HIP WMMA 特例、override / budget / 既定値、最小値・上限、chunk 閾値。
-- `sycl/src/prefill/prefill.cpp:195-227`: 同じ値決定と SYCL の stream-all / nonresident-share 条件。
-- `src/prefill/prefill.cpp:211-250, 242-275`: split override、fused 判定、ring cap と pinned-share 由来の slot 数。
-- `include/strata/prefill/prefill.hpp:79-90, 106-124`: API の条件、override / budget の意味、INFO 表示向け ring 解決 API。
-- `src/prefill/prefill.cpp:1287-1303, 1836-1895`: 実 ring の設定・allocation、および必要 byte 数への算入。
-- `src/program/generate.cpp:6386-6455`: `--prefill auto` の byte-budget と明示 ring を含む chunk / loan 計算。
-- `src/program/generate.cpp:6702-6717, 7241-7254`: split override の設定順と serve の lend sizing ログ。
-- `sycl/src/program/generate.cpp:5945`: SYCL の nonresident share 設定元。
-- `docs/AMD_HIP_PERFORMANCE.md:13-34`, `docs/AMD_HIP.md:337-349`, `docs/MULTI_GPU.md:158-174`: 測定例および split との説明。
+- `src/prefill/prefill.cpp:214-230,257-290,292-314` — 既定値、cap、値の parse、HIP WMMA 特例、chunk 閾値。
+- `sycl/src/prefill/prefill.cpp:126-172,197-230` — SYCL の既定値、cap、`STRATA_PREFILL_STREAM_ALL` 条件と parse。
+- `include/strata/prefill/prefill.hpp:84-121` — override、byte-budget、自動 chunk と解決 ring の API 契約。
+- `src/prefill/prefill.cpp:1082-1093,1318-1335,1868-1870,1879-1931` — 初期化と容量見積もりでの ring 使用。
+- `src/prefill/prefill.cpp:2338-2342,2436-2445,2479-2504` — 先読みと循環 slot の使用。
+- `src/program/generate.cpp:7000-7010,7470-7474` — layer split override と自動 chunk/ring のログ。
+- `docs/DETAILS.md:1926-1939`, `docs/INTEL.md:320-324`, `docs/AMD_HIP.md:341-342` — 資料上の説明と条件付き測定例。

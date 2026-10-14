@@ -1,49 +1,50 @@
 # `STRATA_VERIFY_SPLIT`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。Strata 所有ソースを対象とし、外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
 
 ## 役割
 
-SYCL verifier の段階実行で、GPU の VRAM expert group を処理した直後にも command graph の境界を設けるかを選びます。有効なら、その境界の次の segment を CPU expert の pool 処理と重ねて投入できるため、layer/group ごとの serve 境界に加えて、VRAM 側と CPU 側の処理を分ける地点ができます。無効にしても serve 境界は残ります。
+SYCL の stepped verifier が decode window を graph segment に分ける位置を追加で設けるかを制御します。ON のとき、各 layer/group の VRAM expert 部分を記録した直後にも segment を閉じます。これにより、その先の CPU expert 計算と GPU の次 segment を重ねるための境界を作ります。
 
-この変数は `sycl/src/core/verify.cpp` のみで読み取られます。CUDA/HIP の verifier に同名変数の読み取りはありません。
+これは検証計算そのものを選ぶ設定ではなく、stepped 実行での graph 分割点を制御する設定です。現在の Strata ソースでこの名前を環境から読む箇所は `sycl/src/core/verify.cpp` の1か所です。
 
 ## 値と判定
 
-値全体や数値としての妥当性は検査せず、環境変数が未設定か、設定値の先頭文字が ASCII `0` かだけを見ます。
+`getenv()` の結果の有無と先頭文字だけで判定します。文字列全体の parse、数値変換、大文字小文字の変換はありません。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 有効 |
-| 空文字 | 有効（先頭文字は終端文字で、`'0'` ではない） |
-| 先頭文字が `0`（例: `0`, `0abc`） | 無効 |
-| それ以外（例: `1`, `true`, `false`, `abc`, 空白始まり） | 有効 |
+| 値 | `split_on` | 説明 |
+|---|---:|---|
+| 未設定 | ON | `e == nullptr` なので `!(e && ...)` は true |
+| 空文字 | ON | 設定済みだが `e[0]` は `\0` であり `'0'` ではない |
+| 先頭が `0` | OFF | `0`, `0anything` など |
+| それ以外 | ON | `1`, `false`, `off`, 空白始まりの値など |
 
-大文字小文字、後続文字、整数変換は関係しません。`static const bool` に保存され、最初の段階 capture 時に評価されます。その後のプロセス内での環境変更は再評価されません。
+値は `capture_segments()` が最初に呼ばれた時に関数内 `static const bool` として評価されます。そのプロセス内ではキャッシュされ、後から環境を書き換えても再評価されません。
+
+根拠: `sycl/src/core/verify.cpp:1704`。
 
 ## 有効になる条件
 
-設定値が有効でも、次の経路でだけ追加境界が設定されます。
+変数が ON でも、次の経路でのみ segment split に使われます。
 
-- SYCL verifier が `g_stepped`（`STRATA_VERIFY_STEPPED`）で段階実行を使う。
-- 実行が通常の doorbell 経路（`!ar_on()`）で、`STRATA_VERIFY_EAGER` が未設定のため segment graph を capture する。
+- `STRATA_VERIFY_STEPPED` による stepped mode が有効であること。コードの `env_on()` は未設定・空文字・先頭が `0` の値を OFF、それ以外を ON とします。
+- all-resident の verifier window ではないこと（`!ar_on()`）。
+- `STRATA_VERIFY_EAGER` が未設定であること。設定されていると graph capture / `capture_segments()` を通らず、window body を eager replay します。
 
-全 expert が VRAM にある `ar_on()` 経路では `capture_segments()` を通らず、この変数は読まれません。eager replay 経路でも segment capture を行わないため適用されません。`STRATA_VERIFY_STEPPED` 自体の判定は共通の `env_on()` によるもので、未設定・空文字・先頭文字 `0` は無効、それ以外は有効です。
+この候補は stepped mode が有効になる条件を変えません。`STRATA_VERIFY_STEPPED` と `STRATA_VERIFY_EAGER` の設定有無を確認した上で評価してください。
 
-段階実行で `--remote-expert-opt` を組み合わせると、実行側が `verify: STRATA_VERIFY_STEPPED does not serve --remote-expert-opt` を返します。このエラーは `STRATA_VERIFY_SPLIT` の値にかかわらず、追加境界を無効にするだけでは回避されません。
+根拠: `sycl/src/core/verify.cpp:92-103,1726-1733`。
 
 ## 実行時の詳細
 
-`capture_segments()` は常に `step_hook_` を設定し、layer/group の doorbell publish 後に serve point を作ります。`STRATA_VERIFY_SPLIT` が有効なら `step_hook2_` も設定し、VRAM expert groups の後（CPU/PCIe share を待つ前）に split point を追加します。実行時、次 segment がこの split point の場合、`STRATA_VERIFY_PIPE` が有効なら pool 処理を helper thread で進め、GPU が flag A を受け取った時点で次 segment を投入します。これにより CPU 側の処理と GPU 側の segment が並行可能になります。`STRATA_VERIFY_PIPE` が無効なら pool 処理後に segment を進めます。
+`capture_segments()` は通常、window graph を layer/group ごとの doorbell serve point で区切ります（`step_hook_`、segment kind `1`）。`STRATA_VERIFY_SPLIT` が ON なら `step_hook2_` も設定し、GPU が VRAM-resident expert group を計算した直後に追加の境界（segment kind `0`）を記録します。split hook は非 all-resident 経路で VRAM group の処理後に呼ばれます。
 
-この変数が直接変更するのは graph の分割点です。record される演算自体は追加・削除されず、コードコメントも各 token の演算は変わらないとしています。実行開始時に `STRATA_VERIFY_NODES` が設定されていると、stderr に `strata verify: the %d-token window as %zu graph segments` の形式で segment 数を出します。segment capture に失敗した場合は capture error として返ります。
+stepped window の実行時、次の segment が split point で終わる場合、serve 処理は CPU pool の処理と GPU segment をパイプラインできます。`STRATA_VERIFY_PIPE` は unset または先頭が `0` 以外なら ON、先頭 `0` なら OFF です。OFF の場合は pool を先に同期実行してから segment を投入するため、この分割だけではその overlap を行いません。`STRATA_VERIFY_SPLIT=0` なら追加の split segment がなくなり、VRAM group 後も後続の wait / PCIe group / CPU 結果処理を含む segment として実行されます。
 
-`docs/DETAILS.md` にはこの変数の説明や性能測定値を確認できませんでした。したがって性能効果や他 GPU での結果はここでは主張しません。
+コード上、追加境界は GPU 計算の順序や入力を変更する分岐ではなく、segment capture と投入タイミングを変えます。ただしこの環境変数単独の数値的な効果・性能値は資料から確認できません。
 
-## 根拠
+根拠: `sycl/src/core/verify.cpp:1687-1709,1440-1458,2088-2119,2138-2143`; `sycl/include/strata/core/verify.hpp:358-369`。
 
-- `sycl/src/core/verify.cpp:92-104`: `env_on()` と `STRATA_VERIFY_STEPPED` の初期化。
-- `sycl/src/core/verify.cpp:1687-1727`: segment capture、追加 hook、環境値判定、segment 数ログ。
-- `sycl/src/core/verify.cpp:1463-1467`: VRAM group 後の split hook 呼び出しと、その後の flag B 待ち。
-- `sycl/src/core/verify.cpp:2038-2045,2057-2065,2090-2124,2139-2147`: stepped run 条件、pool serve、split point での pipelined segment 投入。
-- `sycl/include/strata/core/verify.hpp:358-369`: stepped mode と serve/split hook の説明、segment metadata。
+## 文書との照合
+
+`sycl/src/core/verify.cpp` と verifier header は stepped mode の serve point / split point、および `STRATA_VERIFY_PIPE=0` 時の serial segment 動作を説明しています。`docs/DETAILS.md`、`docs/INTEL.md`、`docs/INTEL_ARC.md` では stepped mode の説明を確認できますが、`STRATA_VERIFY_SPLIT` 自体の値判定や既定値、個別の性能測定は見つかりませんでした。したがって、ここでは実装にある分岐だけを記述し、性能値は記載していません。

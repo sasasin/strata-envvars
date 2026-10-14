@@ -1,49 +1,43 @@
 # `STRATA_PREFILL_STREAM_MIN`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-prompt prefill の chunk がこの token 数以上のとき、GPU cache にない expert を全層分まとめて stream する経路の最小 token 数を指定します。閾値未満では routed-only staging（その chunk の token が実際に選んだ expert を必要時に送る経路）になります。閾値は stream ring の大きさと経路選択にも使われます。
-
-実装は CUDA/HIP 共通の `src/prefill/prefill.cpp` と、別実装の `sycl/src/prefill/prefill.cpp` にあります。両者で未設定時の値は通常 1024 ですが、CUDA/HIP 側は CPU prefill share が有効なときだけ別の fallback を使います。
+プロンプト処理で、非 resident expert を全件ストリーミングする経路へ切り替える token 数の下限を設定します。これより小さい chunk は routed-only の staging 経路を使います。CUDA では、条件がそろえば fused int8 expert 経路に入る chunk の下限と、その経路用バッファの大きさにも使われます。SYCL でも ring の大きさ、全 expert のストリーミング、および fused layout の閾値に使われます。
 
 ## 値と判定
 
-値は真偽値ではなく、`std::atoll()` で整数 token 数へ変換されます。文字列全体の妥当性検証や clamp はありません。空文字または数字で始まらない文字列は 0 として扱われ、数値の後ろに文字があっても数値部分が使われます。符号や先頭空白も `atoll` の変換に従います。負値もそのまま変数に保持されます。
+どちらの backend も `std::atoll()` で読み、整数への完全な文字列検証はしません。数値の前置部分を変換し、変換できない文字列や空文字は `0` になります。符号付き値も変換されます。
 
-| 実装・条件 | 未設定 | 設定時 |
-|---|---:|---|
-| CUDA/HIP: `src/prefill/prefill.cpp` | CPU share が閾値を設定していればその値。そうでなければ 1024 | 変換値が 0 以上ならその値を直接使用。負値なら未設定時と同じ fallback |
-| SYCL: `sycl/src/prefill/prefill.cpp` | 1024 | 変換値をそのまま使用。負値も clamp されない |
+| 値 | CUDA (`src/prefill/prefill.cpp`) | SYCL (`sycl/src/prefill/prefill.cpp`) |
+|---|---|---|
+| unset | 通常は `1024`。CUDA の CPU prefill share が有効なら、share 用の上限値を使う | `1024` |
+| `0` または数値でない文字列 | しきい値 `0` を明示 | しきい値 `0` を明示 |
+| `N`（`N >= 0`） | `N` をしきい値として使用し、CPU share の上書きを抑える | `N` をしきい値として使用 |
+| 負数 | 非負の環境値としては採用せず、unset と同じ fallback（CUDA CPU share、なければ `1024`） | 負数をそのまましきい値として使用 |
 
-CUDA/HIP では `STRATA_PREFILL_STREAM_MIN=` や `=abc` は 0 となり、非負 token 数の chunk は閾値を満たします。`=-1` は閾値を無効化する値ではなく、share がない場合は 1024 に戻ります。SYCL では `=-1` が閾値として残ります。異常な負値を渡したときの全後続計算の意味は保証されていません。
-
-根拠: `src/prefill/prefill.cpp:148-153`; `sycl/src/prefill/prefill.cpp:118-122`。
+`atoll` のため、たとえば `128xyz` は `128`、`xyz` は `0` として扱われます。大文字小文字や空白の特別な処理はありません。両実装とも最初の `stream_all_min()` 呼び出しで環境値を `static` に保存します。以後プロセス内で環境を変更しても、この値は再読込されません。
 
 ## 有効になる条件
 
-- prefill 経路で GPU cache にない expert を読み込む必要があること。全 expert が GPU cache にある場合は送る expert がなく、閾値を満たしてもコピー対象はありません。
-- CUDA/HIP では実際の全 expert stream に `m.ring > STAGE`、`T >= stream_all_min()`、expert source があることが必要です。ring が staging 容量以下なら閾値を満たしても routed-only です。`STRATA_PREFILL_RING`、layer split の ring override、pinned share などが ring 容量を変えます。
-- HIP の `STRATA_HIP_WMMA` 経路では、`STRATA_PREFILL_RING` が未設定で ring override もない場合、閾値以上の chunk に 96-slot ring、未満に staging ring を選びます。その他の ring 選択も閾値と chunk サイズを見ます。
-- SYCL も threshold を ring slot 選択と stream-all 判定に使います。fused experts のみのスイッチではありませんが、`STRATA_PF_FUSED` が有効な SYCL 経路では fused path の適用下限にもなります。
-- `STRATA_PREFILL_EQUAL=1` の chunk 分割は、最後の chunk がこの閾値以上のときに限り均等 chunk へ変更します。閾値未満なら通常の chunk rounding を使います。
-- CUDA/HIP の CPU prefill share が有効で、その値が `STRATA_PREFILL_STREAM_MIN` による非負 override で置き換わっていない場合、`arm_cpu_share()` が `STRATA_PREFILL_CPU_SHARE_MAX` を stream 閾値として設定します。share が有効な短い chunk は GPU cache 外の expert を CPU に渡せるため、全 expert を stream する分岐から外れます。share 自体の適用条件は CUDA/HIP 実装と呼び出し元に依存します。
+- CUDA で全 expert をストリーミングするには、chunk がこの値以上で、`ExpertSource` があり、ring が staging 専用の `STAGE`（8 slots）より大きい必要があります。条件を満たすかは `Prefill` 初期化、ring sizing、chunk 実行時の各所で使われます。適応 CPU share が有効な CUDA 経路では、unset/負数のとき `STRATA_PREFILL_CPU_SHARE_MAX`（通常 3072、既定 share の範囲では 1024）がしきい値になります。非負の `STRATA_PREFILL_STREAM_MIN` はこの fallback を優先します。
+- CUDA の fused layout は、上記に加えて fused ring が有効で、MMQ plan に対象 layer があり、expert source がある場合に限られます。Q2_0 pack の CUDA fused kernel は sm_80 以上で、通常は `STRATA_PF_FUSED=0` で無効化できます。HIP の Q2_0 fused kernel は `STRATA_PF_FUSED` の先頭文字が `1` のときだけ有効です。native pack は fused native kernel 対応 layer など別条件を満たす必要があります。
+- SYCL では `ring_slots()` が大きい ring を返すことも条件です。既定では VRAM cache が expert pair の90%以上を保持する場合に全 expert streaming を許可し、`STRATA_PREFILL_STREAM_ALL=1` で強制できます。`STRATA_PREFILL_STREAM_ALL=0` または pair の90%以上を cache に保持しない場合は `STAGE` に留まり、chunk 閾値だけでは全 expert streaming になりません。fused layout にも expert source、fused ring、MMQ plan の対象 layer が必要です。
 
-根拠: `src/prefill/prefill.cpp:277-299, 2301-2314, 1918-1931`; `src/program/generate.cpp:6978-6986, 12556-12561`; `sycl/src/prefill/prefill.cpp:204-227`; `src/program/generate.cpp:6333-6349`; `sycl/src/program/generate.cpp:5980-5997`。
+負数は CUDA と SYCL で意味が異なります。特に SYCL は負数を有効なしきい値として扱うため、fused layout のバッファ計算にもその値が使われます。ソースには負数入力を正規化する処理がありません。負数利用時の安全性・動作保証はこのコードから確認できません。
 
 ## 実行時の詳細
 
-各実装は `stream_all_min()` の関数ローカル `static` として環境変数からの変換値を一度だけ保存します。したがって、最初にこの値を使った後に同一プロセス内で環境を書き換えても、設定値は再読込されません。CUDA/HIP では CPU share が閾値を設定するグローバル値は `Prefill::arm_cpu_share()` で更新されますが、環境変数の明示値が 0 以上ならそちらが優先されます。
+CUDA の既定しきい値 1024 は「非 resident expert を全件ストリーミングする」chunk の既定境界です。これ未満では routed-only staging を使い、CPU share が利用可能なら GPU がストリームするはずだった一部 expert を CPU に割り当てます。`STRATA_PREFILL_STREAM_MIN` はこの切替を動かすため、同じ prompt chunk でも GPU への expert コピー対象や fused path の可否が変わり得ます。変数自体について専用ログはありません。fused path が実際に選ばれると、stderr に `strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)` が一度出ます。
 
-CUDA/HIP の prompt chunk は、ring 容量が staging 容量を超え、chunk 長が閾値以上で、expert source がある場合に、GPU cache 外の expert を層順に stream-all します。そうでない chunk は routed-only 側に進みます。SYCL の ring 選択・fused buffer sizing・prefill 実行も同じ閾値関数を参照します。公開 accessor `Prefill::stream_all_min_tokens()` は chunk 計画側から閾値を参照するために使われます。
+SYCL でも threshold 未満は `STAGE` slots、threshold 以上は ring-all の slots を使う判定に関与します。ring-all が許可されると全 non-resident expert を layer 順に先読みするため、変数は単なる fused-kernel 選択用ではありません。fused layout の場合、MMQ 用の小 chunk バッファは `stream_all_min() - 1` tokens 分に縮小されます。
 
-この変数専用のログ出力は確認できません。値が不正でも警告やエラーを出すコードは見つからず、変換値が各分岐へ使われます。
+## 根拠
 
-根拠: `src/prefill/prefill.cpp:148-153, 2301-2303, 1823`; `sycl/src/prefill/prefill.cpp:118-122, 119-121, 1849`。
-
-## 文書との照合
-
-`docs/STRIX_HALO.md:116-125` は、`STRATA_PREFILL_STREAM_MIN=128` で 128〜1,023 token の prompt に fused experts を適用する例と、既定値 1,024 を説明しています。これは fused path の適用下限の一側面について実装と整合します。実装全体では変数は fused 専用ではなく、stream-all の閾値、ring 選択、chunk 計画でも使われます。
-
-`docs/DETAILS.md:1572-1578` の CPU share の説明は、share が有効な CUDA 経路で `STRATA_PREFILL_CPU_SHARE_MAX` が短い chunk の扱いを変える点と一致します。CUDA/HIP 実装では `STRATA_PREFILL_STREAM_MIN` の非負値を指定すると、その閾値が share 由来の値より優先されます。
+- `src/prefill/prefill.cpp:157-168` — CUDA 既定値、環境値の `atoll` 変換、負数時の fallback。
+- `src/prefill/prefill.cpp:198-208,1960-1972` — CPU share 上限と、share が適用されるときの CUDA fallback しきい値設定。
+- `src/prefill/prefill.cpp:292-314,1040-1058,2341-2352,2460-2474` — ring 判定、fused layout の閾値、全 expert streaming 経路とその適用条件。
+- `src/prefill/moe_fused.cu:651-672` — CUDA/HIP の fused kernel のビルド・デバイス・環境条件。
+- `sycl/src/prefill/prefill.cpp:117-124,197-229,891-909` — SYCL の既定値、ring-all 条件、fused layout の閾値とバッファ計算。
+- `docs/STRIX_HALO.md:107-125` — 1,024 を既定値として説明し、128 への変更例と fused expert への適用を記載。これは Strata の文書上の説明で、測定結果の再検証ではありません。

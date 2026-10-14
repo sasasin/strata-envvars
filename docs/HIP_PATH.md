@@ -1,43 +1,47 @@
 # `HIP_PATH`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリや HIP runtime 自身がこの変数に与える意味は対象外。
 
 ## 役割
 
-Strata のサーバーは HIP エンジンを起動する直前に `HIP_PATH` を確認し、指定先が存在しない場合はその変数をエンジンの子プロセス環境から取り除きます。AMD の HIP ランタイムが削除済みの ROCm ビルドを参照して起動直後に落ちる事例への対処です。Strata 自身がこの値を使ってデバイスやライブラリを選択する処理は確認できません。
+Strata の AMD/HIP 実行サーバーは、エンジンを起動する前に親プロセスから引き継いだ `HIP_PATH` を検査します。値が空でなく、そのパスが存在しない場合は、エンジンの子プロセスへ渡さないようにします。Strata のトラブルシューティング資料は、削除済み ROCm ディレクトリを指す `HIP_PATH` などが Windows 上の HIP エンジン起動時クラッシュに関係したため、サーバーが修復すると説明しています。
 
-セットアップの HIP エンジン構築時には、選択した ROCm ルートを `HIP_PATH` に設定します。これはユーザー環境から値を読み取る処理ではなく、Strata が子ビルド処理向けに値を書き込む処理です。
+また、Strata の HIP エンジン／HIP 画像エンジンをローカルビルドするとき、`setup.py` は選択した ROCm root を `HIP_PATH` に設定してから CMake を起動します。このビルド経路では、入力された `HIP_PATH` を ROCm root の選択には使いません。
 
 ## 値と判定
 
-| 状況 | サーバーの HIP 起動前処理 |
-|---|---|
-| `HIP_PATH` が未設定 | 何もしない。子プロセスにも設定されない（設定ファイルで値を与えていない場合）。 |
-| 空文字 | `if v` が偽になるため、存在確認も削除もせず空文字のまま子環境に残す。 |
-| 空でない値のパスが存在する | その値を変更せず子環境に渡す。ディレクトリかファイルかは問わず、`Path.exists()` が真なら残る。 |
-| 空でない値のパスが存在しない | 子環境の `HIP_PATH` を削除し、標準エラーに理由を出す。 |
+実行時サーバーの `hip_env_guard()` は `env.get("HIP_PATH")` の値を調べます。環境変数自体の値を parse せず、真偽値と `Path(v).exists()` だけで判定します。
 
-文字列の trim、大小文字変換、パス正規化、ROCm バージョン判定は行いません。相対パスはサーバープロセスの現在の作業ディレクトリ基準で `Path.exists()` に渡されます。設定ファイルの `env` に `HIP_PATH` がある場合は、サーバー起動時環境の値をその値で上書きしてから判定します。
+| 状態 | HIP backend のサーバーがエンジンへ渡す値 |
+|---|---|
+| 未設定 | 未設定のまま（追加しない） |
+| 空文字 | 空文字のまま（`if v` が偽なので存在確認しない） |
+| 空でない値のパスが存在する | 元の文字列をそのまま渡す |
+| 空でない値のパスが存在しない | 子プロセス用環境からキーを削除し、stderr に理由を出す |
+
+ファイルとディレクトリを区別せず、`Path.exists()` の結果を使います。値の前後空白除去、展開、正規化、大小文字比較は行いません。設定ファイルの `env` が `HIP_PATH` を指定した場合は、親環境をコピーした後でその値を上書きし、その上書き後の値が検査対象になります。
 
 ## 有効になる条件
 
-- `child_env(cfg)` が環境辞書を作り、`cfg["backend"] == "hip"` のときだけ `hip_env_guard()` を呼びます。CUDA など別バックエンドでは、不存在パスであってもこのガードによる削除はありません。
-- `HIP_PATH` は `HIP_DEVICE_LIB_PATH` と `LLVM_PATH` と同じ存在確認ループで処理されますが、この文書では `HIP_PATH` の挙動だけを記述しています。
-- サーバーを介さず `strata.exe` 等のエンジンを直接起動する経路にはこのガードは適用されません。`docs/TROUBLESHOOTING.md` も、直接起動時は利用者が古い `HIP_PATH` を修正するよう案内しています。
+- この検査は `child_env()` から `hip_env_guard()` を呼ぶ場合だけ実行されます。`child_env()` は `cfg["backend"] == "hip"` のときに guard を呼びます。CUDA backend などでは値の存在確認も削除も行いません。
+- 検査はサーバーがエンジン用環境を作るたびに行われます。通常の起動と、カードグループごとにエンジンを作る replica 経路の両方が `child_env()` を使います。
+- 存在するパスは、正しい ROCm インストールかどうかを Strata は検証しません。空でないパスが存在する限りそのまま渡します。
+- `HIP_PATH` が未設定、空文字、または存在するパスなら、HIP_PATH に関する警告は出ません。
 
 ## 実行時の詳細
 
-サーバーは起動時に `os.environ` をコピーし、GPU 可視性の設定と構成ファイルの `env` を反映した後、HIP バックエンドならガードを適用します。存在しない値を除去したときは、標準エラーに `strata serve: AMD: HIP_PATH=<値> does not exist: not passed to the engine` と出力します。存在する値や未設定・空文字では、この変数についてログを出しません。
+`child_env()` はまず `os.environ` のコピーを作り、GPU 可視性の設定と設定ファイル内の `env` 値を反映し、設定済みのライブラリディレクトリを環境へ追加します。その後 HIP backend なら `hip_env_guard()` を呼びます。guard は `HIP_PATH` に加えて `HIP_DEVICE_LIB_PATH` と `LLVM_PATH` も同じ規則で検査します。消した変数ごとに `strata serve: AMD: <変数>=<値> does not exist: not passed to the engine` を stderr に出します。
 
-作成した環境辞書は `StrataEngine` に渡され、`subprocess.Popen(..., env=env)` でエンジンを起動します。エンジン再起動時も同じ辞書を使うため、サーバー起動後に親プロセスの `HIP_PATH` を変更しても、既存の環境辞書には反映されません。再度 `child_env()` を作るサーバープロセス起動時に判定し直されます。
+作成した環境辞書は `StrataEngine` に渡され、`popen(..., env=env)` で `[exe, "--serve", ...]` の子プロセス起動に使われます。したがって、サーバー自身の `os.environ` から値を削除する処理ではなく、エンジンに渡す環境だけの変更です。`StrataEngine` の再起動用データにも同じ env 辞書が保存されます。
 
-セットアップでは `rocm_root()` がシステム ROCm（`ROCM_PATH` または `/opt/rocm`）か `.venv` 内に導入した ROCm のルートを返します。`build_engine_hip()` はそのルートを `HIP_PATH` および `ROCM_PATH` に設定し、続く CMake ビルドを実行します。この設定はそのセットアッププロセス内での書き込みです。
+ビルド時は `build_engine_hip()` と HIP backend の `build_image_engine()` が `rocm_root()` の返した root を `os.environ["HIP_PATH"]` に設定します。エンジン側は同時に `HIP_PLATFORM=amd`、`HIP_COMPILER=clang`、`HIP_RUNTIME=rocclr`、`ROCM_PATH=<root>` も設定し、画像エンジン側は `HIP_PLATFORM=amd` と `ROCM_PATH=<root>` を設定します。その後 CMake コマンドを実行します。`rocm_root()` が入力環境から選択に使うのは `ROCM_PATH`（未設定または空なら `/opt/rocm`）であり、`HIP_PATH` は読み取っていません。
 
 ## 根拠
 
-- `serve/server.py:2622-2639` — 親環境の複製、構成 `env` の上書き、HIP バックエンド限定のガード呼び出し。
-- `serve/server.py:2650-2680` — パスの存在確認、子環境からの削除、標準エラーへの出力。
-- `serve/server.py:649-651,697-699,915-922` — `StrataEngine` の起動環境保存、`Popen(env=env)` と再起動時の保存値利用。
-- `serve/server.py:6375-6380` — サーバー起動時の `child_env(cfg)` 呼び出し。
-- `setup.py:2543-2596,2632-2662` — ROCm ルートの選択と `HIP_PATH` / `ROCM_PATH` の設定。
-- `docs/TROUBLESHOOTING.md:148-153` — Windows で削除済み ROCm パスが起動障害につながる説明、および直接起動時の案内。サーバーの存在確認動作は上記ソースを根拠とする。
+- `serve/server.py:2788-2805` — 親環境のコピー、config `env` による上書き、HIP backend の guard 呼び出し。
+- `serve/server.py:2816-2846` — `HIP_PATH` などの値が空でない場合の存在確認、削除と stderr ログ。
+- `serve/server.py:770-773,819-821` — 子プロセス環境を `StrataEngine` に保存し、エンジン起動に渡す箇所。
+- `serve/server.py:6550-6551,6697-6702` — replica と通常の serve 起動の双方が `child_env()` を使う箇所。
+- `setup.py:2877-2887` — `rocm_root()` が `ROCM_PATH` または `/opt/rocm` を入力 root として選ぶ箇所。
+- `setup.py:2989-3007,3155-3159` — HIP エンジンおよび HIP 画像エンジンのビルド環境に `HIP_PATH` を設定する箇所。
+- `docs/TROUBLESHOOTING.md:148-153` — Windows の AMD エンジン起動時に、存在しない ROCm パスを指す変数をサーバーが除去する説明。

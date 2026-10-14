@@ -1,45 +1,48 @@
 # `STRATA_VERIFY_DEBUG`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-verifier の実行経過や内部状態を標準エラーへ出す診断用スイッチです。CUDA/HIP 共通実装では verify window の capture・入力 staging・launch、各 layer の GPU 到達と CPU expert 処理、window 完了のログを追加します。SYCL 実装では同様の進行ログに加え、各 window の時間内訳を表示します。また `STRATA_VERIFY_NO_HOST` が有効な SYCL 経路では、window 後に device 側の状態や layer ごとの残差統計を出すための追加コピーと集計を行います。
-
-通常の verifier の計算値や経路を選ぶ設定ではなく、診断ログおよび SYCL の診断用バッファ・読み戻しを有効にします。
+Verifier の進行状況や、SYCL の verifier window に残った中間値を stderr に出す診断用スイッチです。推論結果を選ぶ条件ではなく、CUDA/HIP では主に capture・staging・layer handshake のログを追加します。SYCL では同じ進行ログに加え、条件付きで layer ごとの residual `R` と mixed activation の統計を記録・表示します。
 
 ## 値と判定
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字を含む、何らかの値を設定 | 有効 |
+値の内容は parse せず、`getenv()` が null かどうかだけを確認します。
 
-値の文字列や数値は parse せず、`std::getenv("STRATA_VERIFY_DEBUG") != nullptr` で設定の有無だけを判定します。したがって `0`、`false`、空文字も有効です。
+| 値 | 判定 | 動作 |
+|---|---|---|
+| 未設定 | null | debug 出力・SYCL の debug buffer 割当てを行わない |
+| 空文字 | non-null | 設定済みとして扱う |
+| `0`、`false`、その他の文字列 | non-null | 設定済みとして扱う |
 
-CUDA/HIP 共通実装と SYCL 実装にある `g_dbg` は翻訳単位の初期化時に一度評価され、その後 `VDBG` が同じ値を使います。SYCL ではこれとは別に verifier 初期化時の debug buffer 確保、各 window 終了時の時間表示と all-resident 状態ダンプで `getenv` を直接再確認します。環境変数をプロセス実行中に変更すると、各処理で有効状態が一致しない場合があります。
+このため `STRATA_VERIFY_DEBUG=0` でも debug は有効です。大文字小文字、数値としての妥当性、先頭文字は関係しません。
 
 ## 有効になる条件
 
-- CUDA/HIP 共通実装では `src/core/verify.cpp` の verifier 経路で有効です。`VDBG` の各ログは値が設定済みの場合に限り stderr へ出ます。
-- SYCL では `sycl/src/core/verify.cpp` の verifier 経路で有効です。通常の `VDBG` ログに加えて window の時間内訳を出します。
-- SYCL の layer ごとの `R` / `mixed` 診断バッファは verifier 初期化時にこの変数が設定されている場合に確保され、window graph が token 0（`Rt(0)`）の値を layer ごとに記録します。詳細な読み戻しと集計ログはさらに `STRATA_VERIFY_NO_HOST` が有効な場合に限られます。
-- SYCL の all-resident 状態ダンプは `no_host` と `STRATA_VERIFY_DEBUG` の両方が有効な window に限られます。`STRATA_VERIFY_NO_HOST` は未設定・空文字・文字列全体が `0` の場合は無効で、それ以外の設定値で有効です。`no_host` が無効ならこの大きな状態ダンプは行いません。
-- layer 到達・CPU expert 処理の進行ログは、host が layer ごとに処理する ring loop を通る場合に限られます。CUDA/HIP の all-resident 経路や SYCL の `no_host` 経路はこの loop を飛ばすため、そのログは出ません。
+- CUDA と HIP の verifier は `src/core/verify.cpp` を使い、`g_dbg` が true のとき `VDBG` のログを出します。Metal ビルドでは `Verifier::run()` が Metal engine に委譲されるため、このファイル内の通常 verifier window の debug 行はその経路では実行されません。
+- SYCL は `sycl/src/core/verify.cpp` に別実装があります。通常の `VDBG` 行は `g_dbg` に従います。
+- SYCL の residual ladder と window 内容の詳細は、`STRATA_VERIFY_NO_HOST` が有効な経路でのみ出ます。`no_host` は同変数の未設定・空文字・`0` を無効、それ以外の非空文字列を有効と判定します。詳細ログの出力自体は各 window の実行後に `STRATA_VERIFY_DEBUG` の存在を再確認します。
+- ソースはこの変数により verifier の計算方法や token 選択を変更していません。SYCL では診断のため device buffer の確保・コピー・統計計算が追加されるため、診断経路には実行時コストとメモリ使用があります。
 
 ## 実行時の詳細
 
-CUDA/HIP 共通実装では、`VDBG` が `fprintf(stderr, "verify dbg: ...")` の形式でログを出し、各行の後に `fflush(stderr)` します。対象は capture 後、staging 後、launch 後、GPU が layer に到達した時、CPU expert pool の処理後、window 完了時です。値を読むだけのため、verify の計算や token 選択を変更する分岐はありません。
+CUDA/HIP と SYCL の `g_dbg` は翻訳単位の静的 bool で、プロセス起動時の環境を一度読みます。起動後に環境を変えても、これら `VDBG` ログの判定には反映されません。ログは `verify dbg: ` を付けて stderr に出し、各 `VDBG` 出力後に flush します。capture 完了、staging、launch、layer の開始・CPU expert 処理後、window 完了などが対象です。
 
-SYCL 実装も同じ進行ログを出します。追加で各 window の `T`、前の window からの間隔、staging 時間、GPU 時間を stderr に出します。SYCL で `no_host` とデバッグ設定が両方有効なら、window 完了後に host sequence、skip 値、layer-0 の weights / expert ids、`d_res` と出力 token の先頭値を出し、いくつかの device 配列について平均絶対値・最大絶対値・非有限値数・先頭4値を集計します。layer ごとには token 0 の `R` と mixed 値を device から読み戻し、平均絶対値と非有限値数を表示します。この経路はデバッグ値を device から host にコピーして集計するため、診断時の追加処理です。
+SYCL では別に、Verifier 初期化時に `STRATA_VERIFY_DEBUG` が存在すると、各 layer の token 0 について `R` と mixed activation を記録する device buffer を確保します（各々 `n_layers * n_embd` 個の float）。`STRATA_VERIFY_NO_HOST` が有効で、かつ window 実行後にも `STRATA_VERIFY_DEBUG` が存在する場合、host sequence / skip、layer 0 の weights・IDs・residual、plan、各中間 tensor の統計、および layer ごとの `R` と mixed activation の平均絶対値・nonfinite 数を stderr に出します。layer 統計は `GDN` / `QSA` の区別も表示します。
+
+SYCL のこの詳細出力は実行後に環境変数を直接再確認する一方、buffer の確保は初期化時です。そのため初期化後に環境を変更した場合、詳細ログが要求されても residual ladder 用 buffer は存在しない場合があります。反対に、初期化時だけ変数が設定されていると、詳細を出さなくても buffer が確保されます。
+
+## ログと資料
+
+ログ例の接頭辞は実装どおり `verify dbg: ` です。SYCL の `STRATA_VERIFY_NO_HOST` 下の詳細出力も `verify dbg:` を使います。これらは診断出力で、通常利用者向け設定の説明や性能保証ではありません。
+
+`docs/INTEL.md` は、SYCL の `STRATA_VERIFY_DEBUG=1` が各 layer 後の `R` を表示する per-layer residual ladder として使われた、と記しています。同資料では streaming ring の調査で layer 5 からの NaN を見つける際に使ったと説明しています。現行ソースでは ladder buffer の記録と表示は `STRATA_VERIFY_NO_HOST` 経路に限られます。
 
 ## 根拠
 
-- `src/core/verify.cpp:69,157` — 環境変数の存在判定と `VDBG` マクロ。
-- `src/core/verify.cpp:2148,2167,2176,2234,2247,2360` — capture / staging / launch / layer 到達・処理 / window 完了の stderr ログ。
-- `sycl/src/core/verify.cpp:70,77` — SYCL 版の存在判定と `VDBG` マクロ。
-- `sycl/src/core/verify.cpp:773-776,1537-1539` — debug buffer の確保と、各 layer の token 0 残差・mixed 値の記録。
-- `sycl/src/core/verify.cpp:2008,2027,2175,2254,2271,2446` — SYCL 版の進行ログ。
-- `sycl/src/core/verify.cpp:2311-2316` — window ごとの時間内訳。
-- `sycl/src/core/verify.cpp:2333-2390` — `no_host` 時の状態読み戻し、統計と layer ごとの残差ログ。
-- `docs/INTEL.md:262-264` — SYCL の不具合調査で `STRATA_VERIFY_DEBUG=1` の per-layer residual ladder を使ったとの説明。表示内容と適用条件の詳細はソース実装を根拠とした。
+- `src/core/verify.cpp:89,177,2235-2241,2252,2271,2295,2361-2374,2494`: CUDA/HIP の存在判定、ログ helper と利用箇所、Metal への委譲。
+- `sycl/src/core/verify.cpp:70,77,765-771`: SYCL の静的 debug 判定、ログ helper、初期化時の buffer 確保。
+- `sycl/src/core/verify.cpp:800-801,2183-2200`: `STRATA_VERIFY_NO_HOST` の parse と host handshake を省く条件。
+- `sycl/src/core/verify.cpp:1524-1533,2309-2314,2331-2387`: layer ごとの値の記録、window timing、`no_host` 条件下の debug 表示。
+- `docs/INTEL.md:264`: SYCL の residual ladder を使った調査例。

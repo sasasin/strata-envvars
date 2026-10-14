@@ -1,52 +1,46 @@
 # `STRATA_VERIFY_DEVICE_PLAN`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-Speculative verification の各層で、GPU がルーティング済み expert の配置計画を作れるようにします。通常は GPU が router の結果と residency table を doorbell 経由でホストへ知らせ、ホスト側の expert pool が plan を作ります。有効にすると、Verifier が `resident_plan` を起動し、対象 group の expert が GPU から直接使える場合は device plan を使ってホストの plan 応答を省きます。CUDA/HIP と SYCL の実装があります。
-
-キャッシュ全体の expert が対象 stage の VRAM に常駐している場合は `all_resident_` の別経路が使われ、この変数による device-plan 分岐は無効です。この変数が有効でも、各 group の expert が必要な device/host mirror に存在しない場合は通常の host doorbell 経路に戻ります。
+推測検証（Verifier）の各グループについて、ルーティング結果から VRAM 常駐 expert の実行 plan を GPU 上で作ります。そのグループの選択 expert がすべて常駐している場合は、CPU が plan を作って doorbell で渡す処理や CPU 側の結果待ちを省きます。常駐していない expert が含まれるグループでは、skip が立たず、従来の host/CPU との受け渡しに進みます。推測検証の起動時に読まれ、通常の decode 経路全体を切り替える設定ではありません。
 
 ## 値と判定
 
-Verifier の初期化時に `std::getenv()` で読み、`std::atoi(v) != 0` を有効条件にします。文字列全体の数値 parse ではなく、`atoi` が変換する先頭の数値部分を使います。
+`Verifier::init()` は `std::getenv()` の値を `std::atoi()` で整数変換し、結果が 0 でなければ有効とします。値全体の検証や範囲制限はありません。
 
 | 値 | 判定 |
 |---|---|
 | 未設定 | 無効 |
-| 空文字、先頭が数値として解釈できない文字列、`0`、`0suffix` | 無効（`atoi` が 0） |
-| `1`、`-1`、`2`、`1suffix`、先頭の空白後の非ゼロ整数 | 有効（`atoi` の結果が非ゼロ） |
+| 空文字、数値に変換できない文字列、`0`、`0tail` | 無効（`atoi` の結果が 0） |
+| `1`、`-1`、`2`、`1tail`、先頭の空白の後に数値がある文字列 | 有効（変換結果が非 0） |
 
-大文字小文字による判定はありません。読み取りは Verifier の `init()` ごとに行われます。また SYCL の expert-source 経路は初回呼び出し時に同じ値を `static const bool` に保存します。実行中に環境を変更すると、読み取り箇所によって反映時期が異なるため、起動前に設定する必要があります。
+数値の後ろの文字は無視されます。`atoi` による変換のため、文字列全体が整数かどうかは検査されません。
 
 ## 有効になる条件
 
-- Verifier が profile で埋めた VRAM expert tier を持つ必要があります。`init()` は `hits.d_res`、`hits.cache_base`、正の `hits.blob` がない場合に失敗します。
-- `all_resident_` が false で、`set_always_publish(true)` が設定されていない場合にだけ `device_plan_` が true になります。全 expert 常駐の判定は、既定では host residency table の `[lb_, le_)` の全層・全 expert を調べます。`STRATA_VERIFY_ALL_RESIDENT=0` ならその検査を無効化します。
-- `device_plan_` に必要な `skip_` バッファや slot offset の device copy を確保できない場合、初期化コードは `device_plan_` を false に戻します（CUDA では `cudaGetLastError()` を消費し、SYCL では allocation/copy の成否を使います）。この fallback 専用ログはありません。
-- `STRATA_ADAPT_OVERLAP` の adaptive overlap gate は、device-plan layers が有効だと `set_adapt_gate()` に拒否されます。`--pipeline-windows` に伴う `set_always_publish(true)` 経路では device plan が無効になります。
-- SYCL の `resident_plan` は VRAM にない expert について host mirror table も確認します。mirror pointer があれば device plan を作れます。CUDA/HIP 側の kernel は residency slot が負の expert があれば group plan を断念して `skip=0` にし、host 経路へ戻します。
+設定値が非 0 でも、Verifier の初期化時に `all_resident_` が true なら `device_plan_` は有効になりません。全 expert が VRAM 常駐の場合は、別の all-resident graph 経路が優先されます。また `set_always_publish(true)` が設定されている場合も無効です。これは pipeline windows で host の residency 表が device 側より先に進む場合に、全 layer を host に publish させるためです。該当条件と判定は `src/core/verify.cpp:794-822` にあります。
+
+all-resident 判定には `hits.h_res`、`hits.d_res`、`hits.cache_base` が必要です。device plan は GPU 上の `hits.d_res` と `hits.cache_base` を `resident_plan()` に渡します。`skip_` の確保・初期化、または利用可能な slot offset の device copy に失敗した場合は、初期化中に `device_plan_` も false に戻ります（`src/core/verify.cpp:801-821,832-841`）。
 
 ## 実行時の詳細
 
-CUDA/HIP と SYCL の Verifier は `init()` 中に設定値を読み、`device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0)` とします。device plan が有効なら `skip_` を確保し、`resident_plan()` に layer の routed expert IDs、device residency table、cache base、slot offsets を渡します。SYCL はさらに対応する layer の mirror table を参照します。kernel は ID を plan にまとめ、GPU 上の expert pointer と出力先を設定します。
+各層・各 group の router が選んだ expert ID を `resident_plan()` に渡し、device 側の residency 表を使って host pool と同じ形式の plan を構築します。全選択 expert が常駐していれば、その group の `skip_` に ring 値が記録されます。後続処理は skip を見て host の plan/結果待ちを抜け、host からの miss rows の代わりにゼロ rows を置きます。選択 expert に miss がある場合は通常の待ちと host rows のコピーを続けます（`src/core/verify.cpp:1512-1537,1624-1674`、`include/strata/kernels/verify_kernels.hpp:73-89`）。
 
-group 全体の plan が作れた場合、Verifier は host から plan を受け取る doorbell wait/copy を `skip_` の値に応じて省きます。CUDA/HIP kernel は VRAM residency が欠けた group で `skip=0` を返し、その group は通常どおり host plan と CPU share を待ちます。SYCL kernel は VRAM または host mirror にない expert があれば同様に fallback します。SYCL の `STRATA_VERIFY_NO_HOST` を同時に有効にすると、Verifier は層ごとの host handoff をせず window 全体の完了を待つ lean 経路を使えますが、その経路は `device_plan_`、`STRATA_VERIFY_LEAN`、他の verifier 条件にも依存します。
+環境変数は `Verifier::init()` のたびに読み直されます。一方、`expert_source.cpp` の mapped rows の zero 処理を選ぶ補助判定は関数内 `static const` で、プロセス内の初回評価結果を保持します。device plan 時は GPU 自身が作った plan の rows を GPU がゼロ化しないため、host 側が GPU rows を含めてゼロ処理する経路を選びます（`src/core/expert_source.cpp:3881-3885`）。
 
-SYCL の `sycl/serve/strata-sycl.sh` はこの変数を既定値 `1` として engine container に渡します。親環境や server config の `env` による同名設定はその既定を上書きします。スクリプトは値が `0` または空文字の変数を container に渡さないため、その場合 engine 側では unset となり、この機能は無効です。通常の engine では未設定が無効です。
+`STRATA_FS_SLOTS` が正数で foresight swap が要求されているとき、値が非 0 なら foresight swap は作られず、stderr に `strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN (the device would plan resident layers without the host)` を出します。`STRATA_FS_SLOTS` が 0 以下なら、この判定・ログには到達しません（`src/core/expert_source.cpp:5150-5159`）。
 
-この値専用の有効・無効ログは見当たりません。Verifier の共通 stderr 行 `strata verify: window up to ...` は出ますが、`all_resident_` の場合だけ `(100% VRAM resident: zero-doorbell graph)` が付きます。SYCL で `STRATA_VERIFY_NO_HOST` と `STRATA_VERIFY_DEBUG` も有効な場合は、window 後に `verify dbg: ... skip[]=` を stderr に出します。
+適応コピー overlap との併用もできません。overlap を有効にしようとした場合、`set_adapt_gate()` が false を返し、生成側は `the device-planned layers (STRATA_VERIFY_DEVICE_PLAN) are on` を理由に overlap を止めます（`include/strata/core/verify.hpp:254-259`、`src/program/generate.cpp:8753-8759`）。
+
+CUDA/HIP の `src/` 実装と SYCL の `sycl/src/` 実装で、環境変数の `atoi` 判定、`all_resident_` / `always_publish_` による抑止、および device plan の構成は同じです（`sycl/src/core/verify.cpp:715-721`、`sycl/src/core/expert_source.cpp:2706-2710`）。
 
 ## 根拠
 
-- `src/core/verify.cpp:759-810`, `sycl/src/core/verify.cpp:701-780`: 全常駐判定、環境値 parse、条件、buffer allocation と失敗時の無効化、初期化ログ。
-- `src/core/verify.cpp:1477-1486`, `sycl/src/core/verify.cpp:1335-1344`: layer の plan 分岐と `resident_plan` 呼び出し。
-- `src/kernels/cuda/verify_kernels.cu:1065-1093`: CUDA/HIP kernel が residency miss で group を fallback させる判定。
-- `sycl/src/kernels/cuda/verify_kernels.dp.cpp:2081-2135`: SYCL kernel の VRAM/host mirror 判定と fallback。
-- `src/core/verify.cpp:1595-1639`, `sycl/src/core/verify.cpp:1453-1493`: skip flag、通常の host plan・CPU share との分岐。
-- `include/strata/core/verify.hpp:249-259`: `set_always_publish()` と adaptive gate が device plan に与える条件。
-- `sycl/src/core/verify.cpp:803-809,2178-2185`: SYCL の lean 条件と `STRATA_VERIFY_NO_HOST` の適用範囲。
-- `sycl/src/core/expert_source.cpp:2706-2710`: SYCL expert-source 側の初回読み取りキャッシュ。
-- `sycl/serve/strata-sycl.sh:22-40`: SYCL server wrapper の既定値、上書き、0/空文字の除外。
-- `docs/INTEL.md:232-249`: SYCL での起動例と、GPU が各層を計画する機能としての説明。性能値は本書では記載していません。
+- 値の読み取りと有効条件: `src/core/verify.cpp:816-822`、SYCL: `sycl/src/core/verify.cpp:715-721`。
+- 常駐判定と初期化 fallback: `src/core/verify.cpp:794-814,832-841`。
+- device plan の生成と実行時の skip/fallback: `src/core/verify.cpp:1512-1537,1624-1674`、kernel API の契約: `include/strata/kernels/verify_kernels.hpp:73-89`。
+- foresight swap との排他: `src/core/expert_source.cpp:5150-5159`。
+- overlap との排他: `include/strata/core/verify.hpp:254-259`、`src/program/generate.cpp:8753-8759`。
+- SYCL の利用例と説明: `docs/INTEL.md:232-249`。この資料は設定例を示しますが、性能測定値は本調査では記載しません。

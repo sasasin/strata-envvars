@@ -1,54 +1,54 @@
 # `STRATA_PREFILL_CPU_SHARE`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。Strata 所有ソースを対象とし、外部ライブラリや GPU ドライバーの環境変数動作は含めない。
 
 ## 役割
 
-プロンプトの prefill で、GPU の VRAM cache にない routed expert の一部を、通常 decode を担当する CPU expert pool に計算させる。CPU pool はプロンプト処理中に遊休しており、CPU は RAM から expert を読み、GPU は残りの expert を PCIe 経由で読みながら処理する。CPU の行は GPU 側の expert 行と同じ combine 入力に加えられるが、CPU 固有の activation format で計算するため、結果が GPU のみの場合と bit-identical になるとは限らない。
+prompt prefill 中、GPU が PCIe 経由で読み込む非 resident expert の一部を、decode 用 CPU pool に計算させる割合を指定する。CPU pool が prompt 処理中に空いていて、expert のデータを CPU から安定して読める場合に使われる。値 `0` は share を無効にし、expert を GPU 側で処理する。`auto` は CPU と GPU の処理時間を測って割合を選ぶ。
 
-対象は CUDA の prefill 実装である。未設定時の既定 ON は、単一 GPU・CPU pool あり・batch slot なし・GPU cache に未常駐 expert があり、かつホストメモリ判定を通る経路に限られる。layer split では各 stage に CPU pool を設定でき、同じ pool を使う stage は一つずつ share を取得する。batch slots がある場合と HIP build では既定 ON にならない。明示設定は既定条件とは別に扱われる。
+環境値は `src/prefill/prefill.cpp` の `cpu_share_explicit()` が `static const double` にキャッシュする。最初の評価後にプロセス内で環境を書き換えても、この値は再読込されない。
 
 ## 値と判定
 
-| 環境変数 | 解釈 |
+環境変数の文字列全体を一般的な真偽値として解釈するものではない。完全一致の小文字 `auto` だけが測定モードになり、それ以外は `std::atof()` で数値変換し、`std::clamp(..., 0.0, 1.0)` で 0〜1 に制限する。
+
+| 値 | 判定 |
 |---|---|
-| 未設定 | 通常は share 比率 `0`。既定 ON の経路で `arm_cpu_share(..., true)` が呼ばれた場合だけ、測定値を使う `auto`（内部値 `-1`）として扱う。 |
-| 正確に `auto` | 大文字小文字を区別する完全一致で、測定型の自動割合。 |
-| その他の文字列 | `std::atof` で double に変換し、`[0.0, 1.0]` に clamp する。たとえば `0.4` は固定割合、`2` は `1.0`、`-1` は `0.0`。空文字や数値に変換できない文字列は `atof` の結果 `0` となる。数値の後ろに変換可能な接頭部があれば、その数値接頭部が使われる。 |
+| 未設定 | 通常は 0。後述の既定有効条件を満たして既定 share が armed された場合は `auto` と同じ測定モード |
+| `auto` | 完全一致の場合のみ測定モード。大文字小文字や前後の空白を含む別表記は一致しない |
+| 数値 | `atof` が読む数値を 0〜1 に clamp した固定割合。例: `0.4` は 0.4、`2` は 1、`-1` は 0 |
+| 空文字、数値に変換できない文字列 | `atof` の結果が 0 になり share 無効 |
+| 数字の後ろに文字が続く文字列 | `atof` が先頭の数値部分を変換する。たとえば `0.4extra` は 0.4 |
 
-`auto` の比較は `strcmp` によるため `AUTO` などは `auto` と同じ扱いにならず、`atof` 経由で `0` になる。値を読む accessor は関数内 `static` にキャッシュされるので、プロセス起動後に環境を変更しても再読込しない。値の parse 自体に明示的なエラー表示はない。
-
-固定割合は、その layer で GPU cache にない routed expert 数の割合を CPU に割り当てる目安で、実際には候補 expert をその routed token 数が少ない順に取り、CPU が安定した blob を得られない場合は GPU 側に残す。`auto` は同じ候補選択に使う割合を実測する。`STRATA_PREFILL_CPU_SHARE=0` は CPU share を無効にする。
+固定割合では、各 layer の非 resident streamed expert 数に割合を掛けて `llround` し、CPU が安定した blob を取得できる候補数を上限として CPU に割り当てる。したがって、割合どおりの個数を常に CPU が処理するとは限らない。根拠: `src/prefill/prefill.cpp:184-197,3256-3287`。
 
 ## 有効になる条件
 
-- share を使うには CPU pool が設定され、chunk が streaming-only の大きさでなく、GPU cache 外の routed expert を source から扱える必要がある。share の処理対象は routing 後に staging される chunk である。
-- share が ON なら chunk の staging 上限は既定で 3072 tokens（`STRATA_PREFILL_CPU_SHARE_MAX`）。未設定の既定 ON 経路では、測定範囲を 1024 tokens に制限する。`STRATA_PREFILL_STREAM_MIN` が 0 以上で設定されると streaming 判定の閾値がそちらで上書きされるため、share の chunk 範囲にも影響する。
-- 未設定時の既定 ON は、CUDA 系の compile guard 内だけで設定される。単一 GPU、pool あり、batch slot なし、未常駐 expert があることに加え、RAM、Windows commit、file-backed expert pages の余裕を満たす必要がある。メモリ判定は share 自身の buffer 量に Linux 等の RAM 余裕 3 GiB、Windows commit 余裕 4 GiB を加えて確認する。
-- 明示値（`0` を除く）はメモリ判定で既定 ON を見送る場合でも設定として保持され、メモリ不足の警告を出す。明示値 `0` は無効化なので、この警告対象ではない。
-- `auto` のとき、最初の適格 layer は比較用に share 有無を交互に実行し、3 比較が揃うまでは探索を続ける。その後は通常、29 layer ごとに反対側を測定し、share ありの方が速いと測定された場合に share する。固定割合ではこの性能判定を行わない。
-- layer split の複数 stage は pool を一つずつ取得し、同じ時刻に複数 stage が CPU share を実行しない。通常の multi-GPU 経路は `generate` 側で pool を割り当てない。
+- 既定 share は、HIP 系 macro (`STRATA_USE_HIP` または `STRATA_HIP_GFX906`) が定義されていないビルドでのみ自動設定される。HIP では unset の既定値は share 無効だが、明示設定値は `cpu_share_explicit()` から引き続き使われる。根拠: `src/prefill/prefill.cpp:1960-1972`。
+- `generate` の既定有効経路は単一 GPU、CPU pool 使用、batch slots なし、GPU expert cache に全 expert が載っていないこと、メモリ判定を通ることが条件。`serve` でも既定有効は単一 GPU・stage なし・batch slots なし・cache に未収容 expert があり、メモリ判定を通る場合に限られる。明示値は既定有効条件と別に扱われる。根拠: `src/program/generate.cpp:7281-7289,13154-13159`。
+- メモリ不足判定は既定動作だけを止める。Strata は利用可能 RAM が share 用 buffer と 3 GiB の合計未満、Windows の利用可能 commit が buffer と 4 GiB の合計未満、または CPU が読む file-page expert を保持する RAM が不足する場合に既定 share を armed しない。環境値が未設定なら理由を stderr に表示する。明示値が `0` 以外ならその値を保持して警告する。`0` は警告せず無効化する。根拠: `include/strata/prefill/share_rules.hpp:21-59`, `src/program/generate.cpp:7202-7229`。
+- default の適用可能性を調べる際、GPU cache に全 expert がある場合は「取る expert がない」として既定有効にしない。`auto` など明示した値ではこの既定判定を強制条件にはしない。根拠: `include/strata/prefill/share_rules.hpp:15-18`, `src/program/generate.cpp:7282-7289`。
+- 実際の chunk では pool を確保でき、全 expert streaming の chunk ではなく、source があり、CPU share buffer が失敗で無効化されておらず、native CPU expert format が使えることが必要。layer split では pool を同時に使える stage は一つに制限される。根拠: `src/prefill/prefill.cpp:2341-2351,3137-3147`。
+- share が有効な場合の chunk 上限は別変数 `STRATA_PREFILL_CPU_SHARE_MAX` が決める（未設定 3072、最小 1024）。`STRATA_PREFILL_STREAM_MIN` が明示されている場合はそちらが優先して全 expert streaming の境界を決める。未設定の share を既定有効にした場合、別変数 `STRATA_PREFILL_CPU_SHARE_MAX` も未設定なら測定範囲に合わせ上限は 1024。根拠: `src/prefill/prefill.cpp:164-167,198-208`。
 
 ## 実行時の詳細
 
-`generate` / `serve` は prefill setup 時に既定 share の可否を判定し、`Prefill::arm_cpu_share` に適用可能性と既定可否を渡す。既定 ON になった場合、stderr に `prefill: the CPU share is ON by default for prompt chunks below 1024 tokens ...` を出す。適格な expert が GPU cache に全てあるときは、serve が既定 share を arm しない理由を stderr に出す。ホストメモリ不足の場合は既定を arm せず理由を表示し、明示値を指定している場合（`0` 以外）は警告を出す。
+`Prefill::arm_cpu_share()` は share を適用できる場合に chunk の streaming 境界を更新する。prompt chunk がその境界以上なら `stream_all` 経路に入り、CPU share は使われない。下回る chunk では、routed ID の集計後に非 resident expert を選び、CPU pool に一部の expert rows を計算させる。GPU 側は残りの expert を処理し、CPU rows を combine 前に GPU にコピーする。CPU が使うのは pinned blob に限らず、arena や mapped expert file pages など安定して参照できるデータを含む。根拠: `src/prefill/prefill.cpp:164-167,2341-2351,3256-3287,3411-3432,4018-4035`。
 
-`auto` は CPU expert あたりの CPU 時間と GPU の streamed expert あたりの時間を running mean として測り、両者の時間が揃う割合を算出する。分担割合は計算時に `[0.05, 0.9]` へ clamp される。別途、share 有無の layer wall time を比較して遅い場合の share を抑える。固定数値の場合はその数値の割合を使い、auto の適否測定をしない。
+`auto` は適格 layer の CPU/GPU 両方の所要時間を計測し、割合を両者の完了時間が釣り合う値に更新する。また share あり／なしの layer を最初に交互に比較し、以降も一定間隔で比較を続け、share 側が遅い場合は通常の layer で CPU に割り当てない。値の割合を選ぶ測定と、share 自体が速いかを判定する測定は別の処理である。根拠: `src/prefill/prefill.cpp:817-834,3149-3167,3411-3429,4018-4028`。
 
-CPU activation buffer または rows buffer の pinned allocation に失敗すると、その run では `m.cpu_dead` を立てて share を止め、GPU が全 expert を処理する旨を stderr に表示する。これはリクエストを allocation failure で失敗させないための fallback である。CPU の expert rows は `Dm` の末尾にコピーされ、通常の combine 処理に渡される。統計には CPU share expert 数と割合が記録される。
+CPU が必要な pinned buffer を確保できなかった場合、その実行中は share を無効にし、GPU が全 expert を処理する。リクエスト自体はこの失敗だけでは失敗させない。別の CPU rows/scale allocation 経路ではエラーを返す分岐もある。根拠: `src/prefill/prefill.cpp:3139-3147,3173-3180,3388-3405`。
 
-環境値の parse と既定状態はプロセス内 static/global 状態であり、リクエストごとに環境を読み直す設計ではない。一方、`auto` の性能測定状態は prefill 実行中に layer ごとに更新される。
+起動時には、既定 share が有効なら `prefill: the CPU share is ON by default ...`、メモリ条件で既定無効なら理由付きの `strata: the CPU prefill share is not armed by default: ...` が stderr に出る。明示値をメモリ警告下で保持する場合は `strata: WARNING STRATA_PREFILL_CPU_SHARE=... is set and kept, but ...` が出る。生成結果について、CPU と GPU は異なる activation format で計算するため最下位 bit が変わり得る。`auto` は timing により layer ごとの配分が変わる場合もある。根拠: `src/prefill/prefill.cpp:1960-1967,3415-3432`, `src/program/generate.cpp:7221-7228`。
 
-## 文書・測定値との照合
+## 文書との照合
 
-`docs/DETAILS.md` の「Short prompts: the CPU shares the experts」節は、0.1.41 の CUDA 単一 GPU・batch slots なしの既定 ON と、0.1.42 のメモリ不足時の既定抑止を説明しており、現行コードの既定条件と一致する。同節には RTX 3060 / Tesla P100 / RTX 5070 での測定条件、入力長、反復回数と prompt time 変化も記載されているが、ここではその文書上の結果として扱い、独立に再測定した値とはしない。コードコメントにも 0.1.41 の既定範囲と測定条件がある。
+`docs/DETAILS.md:1597-1620` は 0.1.41 で一部 CUDA 実行を既定有効にしたこと、0.1.42 でメモリ不足時には既定動作を外すこと、明示値の扱い、結果がわずかに異なり得ることを説明している。同節の冒頭には「set しない限り off」とする以前の記述も残るが、後続の 0.1.41/0.1.42 の記述と現行 `arm_cpu_share()` / 呼び出し条件が示す現在の動作を優先した。資料中の性能値は Strata が記載した特定環境での測定であり、本調査で再測定していない。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:154-182` — share の役割説明、`getenv`、`auto` 完全一致、`atof` と clamp、未設定時の既定切り替え。
-- `src/prefill/prefill.cpp:186-193, 1918-1931` — staged chunk 閾値と既定 ON の設定、CUDA/HIP compile guard。
-- `src/program/generate.cpp:6899-6926, 6978-6986, 7259-7286, 12556-12610` — メモリ verdict、既定可否、batch/pool 条件、serve の stage pool と generate の pool 設定。
-- `include/strata/prefill/share_rules.hpp:15-17, 21-59` — 未常駐 expert の有無とホストメモリ判定、警告理由。
-- `src/prefill/prefill.cpp:2298-2312, 3085-3109, 3116-3163, 3204-3235, 3310-3365, 3914-3929` — chunk / pool gate、auto 測定、候補選択、CPU 計算、結果の combine 入力への配置。
-- `include/strata/prefill/prefill.hpp:173-187` — public API の条件説明、layer split と pool の制約。
-- `docs/DETAILS.md:1564-1587` — 機能説明、既定条件、測定値と結果差の記載。
+- 値の parse、既定値、chunk 上限: `src/prefill/prefill.cpp:164-208`
+- default / explicit の armed 処理: `src/prefill/prefill.cpp:1959-1972`
+- share の実行条件・CPU/GPU への expert 割り当て: `src/prefill/prefill.cpp:2341-2351,3137-3167,3256-3287,3411-3432,4018-4035`
+- 呼び出し側の既定条件とメモリ判定・警告: `src/program/generate.cpp:7202-7229,7281-7289,13154-13159`, `include/strata/prefill/share_rules.hpp:15-59`
+- 設計説明と測定値の出典: `docs/DETAILS.md:1597-1620`
