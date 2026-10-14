@@ -1,42 +1,41 @@
 # `STRATA_PIPELINE_TRACE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。作業ツリーには調査対象外の `bench/results/2026-10-12-community-ai-pro-r9700-qwen3-8-flash-next-iq2-xs/` の未追跡データがある。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 調査、HEAD の commit 日 2026-10-14）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-`--serve` の pipeline windows decode loop が発生させるイベントと、その loop 開始からの経過ミリ秒をファイルに追記します。これは診断トレースで、pipeline の選択や生成処理を変更する値ではありません。
+`--pipeline-windows 2` の pipelined decode loop で発生するイベントと時刻を、指定ファイルへ追記する開発・診断用フックです。CUDA 系の `src/program/generate.cpp` と SYCL 実装の `sycl/src/program/generate.cpp` にあります。通常の decode 経路を選択したり、イベントの処理内容を変えたりする変数ではありません。
 
 ## 値と判定
 
-この変数は `pipe_dbg_env("STRATA_PIPELINE_TRACE")` 経由で読み取られます。同 helper はまず `STRATA_PIPELINE_DEBUG` を判定し、無効なら対象変数を読まず `nullptr` を返します。debug gate の判定は helper 内の `static const bool` に一度だけ保存されます。
+値はファイル名として使われ、数値や真偽値には parse されません。`STRATA_PIPELINE_DEBUG` による共通 gate を通ったあと、pipelined decode loop の最初の実行時に `static const char*` として取得されます。
 
-| `STRATA_PIPELINE_DEBUG` の値 | `STRATA_PIPELINE_TRACE` の扱い |
-|---|---|
-| unset または空文字 | 無効。helper は `nullptr` を返す |
-| 先頭文字が `0` | 無効（例: `0`, `0anything`） |
-| 空でなく先頭文字が `0` 以外 | 有効（例: `1`, `true`, `false`, `2`）。文字列全体や数値としての妥当性は検査しない |
+| `STRATA_PIPELINE_DEBUG` の状態 | `STRATA_PIPELINE_TRACE` の状態 | 結果 |
+|---|---|---|
+| unset、空文字、または先頭文字が `0` | 任意 | trace 変数は読み取り helper から `nullptr` を返され、記録しない |
+| 設定され、先頭文字が NUL でも `0` でもない | unset | 出力先がなく、記録しない |
+| 同上 | 空文字を含む任意の文字列 | その文字列を出力先パスとして使う。空文字では `fopen` が失敗するため出力されない |
 
-gate が有効なとき、`STRATA_PIPELINE_TRACE` が unset ならトレースしません。設定値はパスとして扱い、真偽値や数値には変換しません。空文字は非 null の値ですが、後段で `fopen("", "a")` が失敗するためファイル出力されません。パスの形式や書き込み権限などの検証はありません。
+`STRATA_PIPELINE_DEBUG` は文字列全体でなく先頭文字だけを判定します。空白や大文字小文字は検査せず、たとえば `false` や `2` は gate を有効にし、`0anything` は無効にします。trace のパス自体は変換・正規化されません。根拠: `src/program/generate.cpp:263-269`、`sycl/src/program/generate.cpp:295-300`。
 
 ## 有効になる条件
 
-- pipeline windows decode loop が実行されることが必要です。`--pipeline-windows` の要求がない場合や、要求が実行条件を満たさず無効化された場合は、この loop 内のトレース初期化・記録処理に到達しません。
-- `STRATA_PIPELINE_DEBUG` gate が有効であることが必要です。これが無効なら `STRATA_PIPELINE_TRACE` は無視されます。
-- `src/program/generate.cpp` の CUDA/HIP系実装と `sycl/src/program/generate.cpp` のSYCL実装の双方に同じ機構があります。
+trace の値が有効でも、実際に記録するのは pipelined decode loop が実行された場合だけです。CUDA 系コードでは `pipe && pl_pw >= 2 && pl_snap_ok`、SYCL では `pipe && pl_pw >= 2 && pl_snap2[0] != nullptr` が要求され、さらにその request がキャンセルされておらず、生成上限にも達していない必要があります。適用されない request は通常の経路を使い、trace を追加しません。対応する分岐の前に、`penalty_last_n` による反復ペナルティまたは coupled draft sampling がある request は serial decode に回されます。
+
+この変数と `STRATA_PIPELINE_*` のテスト・調整用変数は、`STRATA_PIPELINE_DEBUG=1` のような gate が有効なときだけ読まれると `docs/MULTI_GPU.md` にも記載されています。ただし実装上は値が厳密に `1` である必要はなく、前節の先頭文字判定です。根拠: `src/program/generate.cpp:11915-11926`、`sycl/src/program/generate.cpp:10639-10650`、`docs/MULTI_GPU.md:319-321`。
 
 ## 実行時の詳細
 
-pipeline loop に入ったとき `pl_trace_path` を static 初期化し、以降の loop invocation でもそのポインタを使います。したがって、プロセス起動後に `STRATA_PIPELINE_DEBUG` を変更しても gate の判定は変わらず、`STRATA_PIPELINE_TRACE` の変更も `pl_trace_path` 初期化後には反映されません。
+loop 開始時の `Clock::now()` から各イベントまでの経過時間をミリ秒で計算し、小数点以下3桁で `時刻 イベント名 seq x0 x1` の1行に整形してメモリ上の文字列に加えます。実装中のイベント名には `F0`、`CD`、`F1`、`U`、`CE`、`L0`、`L1`、`V`、`CL` があります。各イベントは loop 内の異なる進行点で記録されますが、5列の値自体に名前や凡例を付ける処理はありません。
 
-イベント記録時には `%.3f %s %d %d %d\n` の形式で、loop 開始からの経過時間（ミリ秒、小数3桁）、イベント名、sequence 番号、整数引数2つをメモリ上の文字列に追加します。実装には、window の完了・launch（`F0`, `L0`, `L1`）、commit/undo（`CE`, `CD`, `CL`, `U`）、検証結果（`V`）などの記録箇所があります。各イベントが記録されるのはそのコード箇所を通ったときだけです。
+loop の drain 後、イベントが1つ以上あれば出力ファイルを append mode (`"a"`) で開き、`# request p0=<n-1>` の区切り行とイベント行を追記して閉じます。したがって既存ファイルは上書きしません。ファイルを開けない場合のエラー表示や fallback はなく、書き込みの戻り値も確認しません。trace の文字列は request ごとに保持されます。
 
-loop を drain した後、記録がありパスが非 null なら `fopen(path, "a")` で追記モードにし、`# request p0=<n-1>` の行とイベント列を書き込みます。ファイルを開けない場合は何も書かず、戻り値も確認しないため、書き込み失敗はこの処理からログやエラーとして報告されません。request ごとに loop 経過時間の基準を取り直します。
+`STRATA_PIPELINE_DEBUG` の gate は helper 内の `static const bool` で初回評価時に固定されます。trace path も pipelined decode loop で初めて評価された値を static に保持するため、その後プロセス環境を変更しても再読込されません。根拠: `src/program/generate.cpp:266-269,12010-12020,12512-12528`、`sycl/src/program/generate.cpp:297-300,10759-10769,11271-11285`。
 
 ## 根拠
 
-- `src/program/generate.cpp:251-257`, `sycl/src/program/generate.cpp:293-298` — pipeline debug 用 env helper。設定有無と先頭文字による gate 判定、および gate の static cache。
-- `src/program/generate.cpp:10531-10543` — helper の他の利用例。`STRATA_PIPELINE_*` 変数群は helper 経由で参照されます。
-- `src/program/generate.cpp:11261-11270`, `sycl/src/program/generate.cpp:10543-10553` — トレースパスの static cache、経過時間とイベント行の生成。
-- `src/program/generate.cpp:11285`, `11427`, `11479`, `11503`, `11532`, `11599`, `11647`, `11689`, `11719`; `sycl/src/program/generate.cpp:10566`, `10746`, `10790`, `10818`, `10847`, `10910`, `10956`, `10995`, `11020` — イベントの記録箇所。
-- `src/program/generate.cpp:11762-11778`, `sycl/src/program/generate.cpp:11055-11069` — loop の drain 後に request 見出しとトレースを append する処理。
-- `docs/DETAILS.md` を確認したが、`STRATA_PIPELINE_TRACE` の説明や測定値は見つからなかった。
+- 環境変数 gate: `src/program/generate.cpp:263-269`、`sycl/src/program/generate.cpp:295-300`。
+- CUDA 系 loop の起動条件と記録バッファ: `src/program/generate.cpp:11915-11926,12010-12020`。
+- SYCL loop の起動条件と記録バッファ: `sycl/src/program/generate.cpp:10639-10653,10759-10769`。
+- 両 backend の追記処理: `src/program/generate.cpp:12512-12528`、`sycl/src/program/generate.cpp:11271-11285`。
+- debug gate の文書上の説明: `docs/MULTI_GPU.md:319-321`。

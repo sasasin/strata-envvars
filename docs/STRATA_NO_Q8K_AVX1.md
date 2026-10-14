@@ -1,45 +1,44 @@
 # `STRATA_NO_Q8K_AVX1`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの内部動作は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。外部ライブラリの環境変数動作は対象外。
 
 ## 役割
 
-CPU の native expert 経路で、AVX1 専用 Q8_K 活性量子化器を使わず、ggml-cpu の `from_float` 関数へ戻すための抑止用フックです。AVX2 が使えず AVX1 が使える CPU に限って判定されます。AVX2 対応 CPU の Q8_K 量子化器は別の `STRATA_NO_Q8K_AVX2` で制御されます。
+native expert CPU 経路が Q8_K 形式の activation を量子化するとき、AVX2 を利用できない AVX CPU 上で使う AVX1 量子化器を無効にするスイッチです。設定すると、Strata 独自の AVX1 実装を使わず、ggml-cpu の `from_float` 関数へフォールバックします。AVX2 対応 CPU の AVX2 量子化器はこの変数では無効になりません。
 
-native expert は、CPU 上で GGUF 形式の expert を処理するビルド機能です。CMake の `STRATA_NATIVE_EXPERTS` は既定で ON です。対象機能がビルドに含まれない構成では、この環境変数による実用上の効果はありません。
+この経路は `STRATA_NATIVE_EXPERTS` を有効にしてビルドした Strata の native expert 処理に属します。CMake はこの場合に `native_expert.cpp` と AVX1 実装を CPU カーネルライブラリへ追加します。非 native expert ビルドにはこの判定はありません。
 
 ## 値と判定
 
-値の内容は parse せず、`std::getenv(...) == nullptr` かどうかだけを見ます。
-
-| 状態 | AVX1 Q8_K 専用量子化器 |
+| 状態 | AVX1 Q8_K 量子化器 |
 |---|---|
-| 未設定 | CPU 条件を満たせば使用する（既定） |
-| 空文字を含む任意の値を設定 | 使用しない。ggml-cpu の `from_float` にフォールバック |
+| 未設定 | CPU 条件を満たせば有効 |
+| 空文字を含め、何らかの値を設定 | 無効 |
 
-したがって `STRATA_NO_Q8K_AVX1=0` も抑止になります。`1` との文字列比較や真偽値変換はありません。判定結果は `q8k_avx1()` 内の `static const bool` に保持され、最初の呼び出し後に環境を書き換えても再評価されません。根拠: `src/kernels/cpu/native_expert.cpp:95-100`。
+値の内容は parse されません。`getenv(...) == nullptr` かどうかだけを見ているため、`0`、`false`、`1` のいずれも設定されていれば無効化します。
 
 ## 有効になる条件
 
-- `native_expert.cpp` を含む native expert ビルドであること（`CMakeLists.txt:1210,1218,1265-1269`）。
-- 実行 CPU で `cpu_avx2_ok()` が false、かつ `cpu_avx1_ok()` が true であること。
-- 対象の量子化活性型が `GGML_TYPE_Q8_K` であること。
-- `STRATA_NO_Q8K_AVX1` が未設定であること。
+AVX1 量子化器を選ぶには、すべての条件が必要です。
 
-CPU 判定は実行時に行われます。AVX1 判定は AVX と OSXSAVE、OS が YMM 状態を保存することを確認し、AVX2 判定はさらに FMA、F16C、OS の AVX 状態保存および CPUID の AVX2 ビットを確認します（`src/kernels/cpu/expert_layout.cpp:106-160`）。AVX2 のない AVX1 CPU 以外ではこの変数は量子化器の選択を変えません。
+- AVX2 が利用可能でない。
+- `cpu_avx1_ok()` が true（CPU と OS が AVX/YMM state を利用可能）である。
+- `STRATA_NO_Q8K_AVX1` が未設定。
+- 対象 NativeFmt の activation type が `GGML_TYPE_Q8_K`。
+
+AVX2 対応 CPU では AVX2 実装が先に選択候補となり、AVX1 側の CPU 条件は成立しません。この変数は AVX2 実装を抑止しません。また、activation type が Q8_K でない場合も AVX1 量子化器は選ばれません。
 
 ## 実行時の詳細
 
-`native_quant_act()` は gate/up 用活性を、`native_quant_h()` は down 用活性を量子化します。どちらもまず AVX2 Q8_K 量子化器、次にこの環境変数で制御される AVX1 Q8_K 量子化器を確認し、どちらも選ばれなければ `traits(...)->from_float(...)` を呼びます（`src/kernels/cpu/native_expert.cpp:103-112`）。AVX1 量子化器が選ばれるのは対象活性形式が Q8_K のときだけです。
+`native_quant_act()` は gate/up activation を、`native_quant_h()` は down activation を変換します。両関数は AVX2 Q8_K 経路を先に確認し、その経路に該当しなければ AVX1 経路を確認します。AVX1 経路が無効、または activation type が Q8_K でなければ `traits(...)->from_float(...)` にフォールバックします。この環境変数に起因するログ出力やエラー処理はありません。
 
-この経路は prompt prefill の CPU native expert 処理でも使われます。CPU に割り当てた expert が必要とする token の活性に `native_quant_act()` を呼び、その後 CPU expert pool に仕事を渡します（`src/prefill/prefill.cpp:3300-3333`）。API の戻り値、ログ出力、エラー動作をこの環境変数が変える処理は見当たりません。
-
-AVX1 実装は ggml の Q8_K 参照量子化と同じ算術を使うことをコードコメントで説明しており、専用の parity ツールもあります。ただしこれは実装資料上の説明であり、この調査ではテストや測定を実行していません（`src/kernels/cpu/iq_avx1.cpp:448-453`; `src/kernels/cpu/q8k_quant_parity.cpp:1-7,96-120`）。
+AVX1 条件は関数内の `static const bool` に保存されます。`q8k_avx1()` の初回呼び出し時に環境と CPU 条件を評価し、以降のプロセス実行中に環境を変更しても反映されません。この helper は両方の activation 変換関数から呼ばれます。
 
 ## 根拠
 
-- 環境変数の読み取りと CPU/型条件: `src/kernels/cpu/native_expert.cpp:95-112`。
-- AVX1/AVX2 実行時能力判定: `src/kernels/cpu/expert_layout.cpp:106-163`。
-- CPU native expert 機能のビルド条件とソース登録: `CMakeLists.txt:1210-1218,1265-1269`。
-- 呼び出し元の prompt prefill 経路: `src/prefill/prefill.cpp:3300-3333`。
-- `docs/DETAILS.md` には CPU expert pool の説明がありますが、この変数固有の値判定や効果についての説明は確認できませんでした。
+- `CMakeLists.txt:1270-1271,1317-1322,1355-1361`: native expert のビルド条件とソース登録。
+- `src/kernels/cpu/native_expert.cpp:95-121`: AVX2/AVX1 選択条件、環境変数判定、両 activation 変換関数のフォールバック。
+- `src/kernels/cpu/expert_layout.cpp:145-170`: AVX1 CPU 条件が AVX と OS の YMM state を確認。
+- `src/kernels/cpu/iq_avx1.cpp:448-453`: AVX1 Q8_K 実装の説明と関数定義。AVX2 Q8_K quantizer と同じ byte を生成する実装と記載。
+- `src/core/expert_source.cpp:3890-3900`, `src/prefill/prefill.cpp:3415-3432`: decode と prefill で CPU が処理する native expert 用 activation 変換を呼ぶ経路。
+- `docs/DETAILS.md`, `docs/UNSLOTH_Q4.md`, `docs/QUANTS.md`: この変数の個別設定説明は見つかりませんでした。値の判定と挙動は上記ソースを根拠としています。

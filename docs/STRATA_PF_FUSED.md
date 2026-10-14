@@ -1,68 +1,46 @@
 # `STRATA_PF_FUSED`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。外部ライブラリの動作は対象外。
 
 ## 役割
 
-prompt prefill の routed expert 計算で、対応する形式・GPU のときに Strata 独自の int8 fused kernel を選ぶスイッチです。CUDA/HIP の `moe_fused` 経路は Q2_0 pack、`moe_fused_iq` 経路は対応する native IQ pack を扱います。値を有効にしても、通常の decode ではなく、下記の長い chunk の prefill 経路で条件が揃った layer に限って使われます。
-
-このカーネルは MMQ/FP16 の計算と丸めが異なる場合があります。出力の数値が常に同一とは限りません。
+prompt の MoE expert 計算に、Strata の fused int8 カーネルを使うか選びます。Q2_0 pack の経路と native GGUF IQ pack の経路は同じ環境変数を参照しますが、既定値と GPU 条件が異なります。カーネルを選ぶと、router の expert ID の GPU grouping、token 単位の activation quantize、expert blob の batch 処理を行います。該当しない layer や条件では既存の MMQ（または pack によって FP16）経路に進みます。
 
 ## 値と判定
 
-判定は文字列全体や数値としての parse ではなく、主に `getenv()` 結果の有無と先頭文字で行います。`enabled()`、`requested()`、`native_supported()` 内の `static` 値は初回評価後にプロセス内で保持されるため、その後の環境変更は反映されません。
+文字列全体や数値としての parse はせず、各読み取り箇所で先頭文字を比較します。空文字は `getenv()` 上は設定済みですが、`v[0]` は `\0` です。
 
-| 経路 | 未設定 | 空文字 | 設定値の判定 |
-|---|---|---|---|
-| CUDA の Q2_0 fused kernel | 有効要求（既定 ON） | 有効要求 | 先頭文字が `0` なら無効、それ以外は有効要求。`0tail` は無効、`false` や `2` は有効要求 |
-| HIP の Q2_0 fused kernel | 無効 | 無効 | 先頭文字が `1` のときだけ有効要求。`10` は有効、`true` や `0` は無効 |
-| native IQ fused kernel（通常の対応デバイス） | 無効 | 無効 | 先頭文字が `1` のとき要求。その他は無効 |
-| native IQ fused kernel（gfx12 の既定経路） | IQ3_S / IQ3_XXS の対応 layer だけ既定有効 | 未設定と同じ扱い | 空でない値の先頭文字が `1` なら、対応する全形式を要求。`0` で始まる値などそれ以外は無効 |
+| 経路 | unset | 空文字 | 先頭文字 `0` | 先頭文字 `1` | その他の先頭文字 |
+|---|---|---|---|---|---|
+| Q2_0 `enabled()`（CUDA / SYCL） | 有効要求 | 有効要求 | 無効 | 有効要求 | 有効要求 |
+| Q2_0 `enabled()`（HIP） | 無効 | 無効 | 無効 | 有効要求 | 無効 |
+| native pack `native_supported()`（CUDA、HIP gfx11、SYCL） | 無効 | 無効 | 無効 | 有効要求 | 無効 |
+| native pack `native_supported()`（HIP gfx12） | IQ3_S / IQ3_XXS の既定対象 | IQ3_S / IQ3_XXS の既定対象 | 無効 | 明示 opt-in | 無効 |
 
-CUDA の Q2_0 判定では空文字の先頭 `\0` は文字 `'0'` ではないため有効要求です。一方、native IQ 判定では未設定と空文字を同じ既定値として扱います。いずれの経路も末尾文字や数値の妥当性は検査しません。
-
-native IQ には別スイッチ `STRATA_PF_FUSED_NATIVE` もあります。これが先頭文字 `0` で始まる場合、`STRATA_PF_FUSED=1` でも native IQ fused 経路を無効にします。空文字や `false` はこの抑止条件になりません。
-
-根拠: `src/prefill/moe_fused.cu:656-673`, `sycl/src/prefill/moe_fused.dp.cpp:945-962`, `src/prefill/moe_fused_iq.cu:1118-1139`, `sycl/src/prefill/moe_fused_iq.dp.cpp:1361-1367`。
+「有効要求」は、その後の `available()` / `dev_info()`、format 対応、prompt 条件も満たす必要があります。Q2_0 と native pack の各判定は関数内の `static` に保存されるため、その判定を最初に実行した後でプロセス環境を変えても再評価されません。HIP gfx12 の native 判定では unset と空文字を同じ既定扱いにしますが、先頭が `0` の値は明示的な無効です。
 
 ## 有効になる条件
 
-値判定で要求が有効でも、次の実行条件と実装対応が必要です。
+- **Q2_0 pack:** `fused::enabled()` が真で、device の `available()` 判定を通ること。CUDA 実装は compute capability major が 8 未満なら利用不可とし、カーネル属性・occupancy の検査も行います。HIP 実装は gfx11 WMMA kernel の利用可否を検査します。SYCL 実装にも `enabled()` と同様の値判定と device 可用性検査があります。
+- **native pack:** gate/up と down の format の組がカーネルの対応範囲内で、device probe を通ること。基本対応は gate/up の IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS と down の Q2_0 / IQ4_NL です。HIP gfx11 では `STRATA_PF_FUSED_KQ=1` のとき gate/up Q4_K / Q5_K と down Q5_1 / Q8_0 も対応します。`STRATA_PF_FUSED_NATIVE=0` は CUDA / HIP / SYCL の native 実装で native 経路を無効にします。
+- **prompt 経路:** expert source があり、ring が staging 数 8 より大きく、chunk が `stream_all_min()` 以上で全 expert の streaming を行うこと。既定の閾値は 1024 tokens です（`STRATA_PREFILL_STREAM_MIN` で変更可能。CUDA の CPU-share 経路では別の閾値が設定される場合があります）。multi-GPU peer 経路は fused path を使いません。
+- Q2_0 は MMQ plan の該当 layer である必要があります。native pack は MMQ layer または `fused_only` layer で、native format が対応している必要があります。対応しない native layer は MMQ（IQ1_M 等は FP16 path）に残ります。
 
-- prefill の MoE layer であり、その layer が MMQ 対応 (`use_mmq`) または計画上 fused 専用 (`fused_only`) である。
-- 全 expert を決まった順で stage する `stream_all` 経路である。通常は chunk サイズが `STRATA_PREFILL_STREAM_MIN` 以上（既定 1024 token）、リングが通常 staging 用の 8 slot より大きく、source がある場合に成立する。小さい chunk は MMQ または既存の別経路を使う。
-- `--peer-device` による peer 経路ではない。peer-device が有効なら fused 経路を使わず MMQ を使う。
-- デバイスと形式が kernel 対応範囲内である。Q2_0 fused `available()` は対応デバイスであることを追加確認する。CUDA の Q2_0 kernel は sm_80 以上を必要とし、sm_75 以下や sm_80+ の code object を含まない build では利用できない。
-- native IQ は gate/up と down の組み合わせが `gu_covered()` / `d_covered()` に含まれる必要がある。対象外形式や layer は MMQ（または pack によって FP16 経路）に残る。
-
-gfx12 (RDNA4) の HIP build では Q2_0 用 `available()` が false のままですが、native IQ の特別扱いがあります。`STRATA_PF_FUSED` が未設定または空なら、デバイス確認後に IQ3_S / IQ3_XXS の gate/up を既定有効にします。明示的な先頭 `1` は対応する native IQ 形式の opt-in 要求となり、`STRATA_PF_FUSED_NATIVE=0` はそれを止めます。gfx12 以外の HIP では未設定時に既定有効とはならず、native IQ も明示 opt-in が必要です。
-
-根拠: `src/prefill/prefill.cpp:2945-2961`, `sycl/src/prefill/prefill.cpp:3218-3234`, `src/prefill/moe_fused.cu:651-673`, `src/prefill/moe_fused_iq.cu:1123-1139`。ビルド上の CUDA/HIP kernel 組み込み箇所: `CMakeLists.txt:1361-1364,1428-1434`。
+したがって、変数を有効値にしても短い chunk、expert source がない構成、小さい ring、peer-device を使う構成、device / format が未対応の場合には fused kernels は実行されません。
 
 ## 実行時の詳細
 
-`moe_fused::enabled()` は Q2_0 経路の値判定後に `available()` を確認します。native IQ 経路は `native_supported()` でスイッチ、形式対応、デバイス情報を確認します。prefill loop は layer ごとに `fused_l` を決め、実行時には layer input を int8 化し、router の expert IDs を GPU 上で group 化し、stage ring 上の expert blob を使って gate/up、SwiGLU、down の処理を行います。fused path に入った最初の実行では stderr に次の行を一度出します。
+Q2_0 の `enabled()` は CUDA / SYCL では unset を既定有効とし、値の先頭が `0` の場合だけ無効にします。HIP では先頭が `1` の場合だけ有効です。native pack の `requested()` は全体比較ではなく先頭が `1` かを調べます。HIP gfx12 の `native_supported()` には例外があり、`STRATA_PF_FUSED` が unset または空文字なら、対応 device で IQ3_S / IQ3_XXS の gate/up に限り既定で native kernels を許可します。他の native format は明示的な先頭 `1` が必要です。gfx12 は Q2_0 側の fused kernel がないため、Q2_0 pack がこの例外で有効になるわけではありません。SYCL の native 判定は `requested()` を要求し、gfx12 用の自動既定分岐はありません。
 
-```text
-strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)
-```
+実行時に fused path を選んだ layer では、一度だけ stderr に `strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)` を出します。router の ID を GPU 上で grouping し、activation を int8 化してから expert を処理します。したがって host grouping の同期を避ける経路ですが、MMQ と同じ計算ビット列になる保証はありません。資料は native fused path の丸めが MMQ と異なることを明記しています。ログが出ない場合も、環境変数の値だけでなく prompt chunk / streaming / device / format 条件によって経路が選ばれていない可能性があります。
 
-実装には CUDA と SYCL 用の同等の判定・dispatch があり、HIP build は fused source の HIP 分岐を使います。判定 static のため、変数はその判定関数が初めて呼ばれる時点で実質固定されます。子プロセスへの転送や上書きは、このスイッチについての該当処理を確認できませんでした。
-
-根拠: `src/prefill/prefill.cpp:2952-2961,2987-2997`, `sycl/src/prefill/prefill.cpp:3225-3234,3250-3260`, `src/prefill/moe_fused.cu:656-673`。
-
-## 文書との照合
-
-`docs/DETAILS.md` は CUDA RTX 30 世代以降で Q2_0 fused kernel を説明し、`STRATA_PF_FUSED=0` で従来 prompt kernel を選び、`=1` で native IQ pack も opt-in できると記載しています（`docs/DETAILS.md:22-28`）。また gfx12 の native IQ3_S / IQ3_XXS は既定 ON、`=0` で無効と説明しています（`docs/DETAILS.md:1945`）。これは現行 native IQ 判定と一致します。
-
-資料の測定例として、`docs/DETAILS.md:22-28` は同一 PC の Q2_0 prompt で 4K 1,294→1,570、32K 2,170→2,653 tokens/s 等を報告しています。gfx12 の測定は同ファイル 1945 行に R9700 での prompt 4K +15.7%、16K +13..+17%、32K +19..+20% とあります。いずれも各資料記載の条件での値で、他デバイスの結果を保証するものではありません。
-
-一方、`docs/STRIX_HALO.md:108-125` は gfx1151 の native fused kernels を opt-in と説明し、chunk の既定下限 1,024 と K-quant 用 `STRATA_PF_FUSED_KQ` 条件を記載しています。これらはコード上の dispatch 条件と整合します。`docs/AMD_HIP.md:349-361` は現行 gfx12 の扱いと opt-in の数値差も説明しています。古い版または周辺コメントの「HIP は MMQ」の記述だけでは現行挙動を表さず、本調査では分岐を含む実装を根拠にしました。
+`docs/DETAILS.md` は gfx12（RDNA4）で IQ3_S / IQ3_XXS に限り既定有効と記載し、R9700 で測った prompt の向上値を報告しています。これは同資料の記載条件での測定であり、他 GPU や設定での性能を示すものではありません。一般の native pack について同資料は `=1` を opt-in と説明しており、gfx12 の既定は例外です。`docs/AMD_HIP.md:357-369` には gfx12 の opt-in とする説明も残っていますが、この HEAD の分岐と `DETAILS.md:2028` の記述には一致しません。ここでは現行ソースの判定を記載しました。
 
 ## 根拠
 
-- 判定と device availability: `src/prefill/moe_fused.cu:651-673`, `sycl/src/prefill/moe_fused.dp.cpp:940-962`。
-- native IQ の対象形式と gfx12 既定: `src/prefill/moe_fused_iq.cu:1076-1089,1118-1139`; SYCL の通常 opt-in 判定: `sycl/src/prefill/moe_fused_iq.dp.cpp:1361-1367`。
-- dispatch と fused 計算の呼び出し: `src/prefill/prefill.cpp:2952-2961,2987-2997`; SYCL: `sycl/src/prefill/prefill.cpp:3225-3234,3250-3260`。
-- stream-all の token 下限（通常 1024）: `src/prefill/prefill.cpp:141-151`; SYCL: `sycl/src/prefill/prefill.cpp:116-121`。
-- 関連資料: `docs/DETAILS.md:22-28,1945`, `docs/STRIX_HALO.md:100-125`, `docs/AMD_HIP.md:349-361`。
+- `src/prefill/moe_fused.cu:651-673`, `sycl/src/prefill/moe_fused.dp.cpp:940-962`: Q2_0 経路の `built` / `available` / `enabled` / `requested` と環境値判定。
+- `src/prefill/moe_fused_iq.cu:1023-1063,1118-1139`, `sycl/src/prefill/moe_fused_iq.dp.cpp:1174-1212,1361-1367`: device probe、native format 判定、HIP gfx12 の既定条件、SYCL の native opt-in 判定。
+- `src/prefill/moe_fused_iq.cu:1067-1089`, `sycl/src/prefill/moe_fused_iq.dp.cpp:1214-1235`: native kernels の対応 format と `STRATA_PF_FUSED_KQ` による HIP の追加 format。
+- `src/prefill/prefill.cpp:158-168,2341,3030-3039,3065-3075`, `sycl/src/prefill/prefill.cpp:117-123,2462,3223-3232,3248-3258`: stream 閾値、peer / MMQ / format 条件、fused path の起動・ログ。
+- `docs/DETAILS.md:22-28,2028`: Q2_0 の既定、native pack の opt-in 説明、および gfx12 の IQ3_S / IQ3_XXS 既定と R9700 測定の記載。
+- `docs/AMD_HIP.md:357-369`: HIP native kernels と `STRATA_PF_FUSED_NATIVE=0`、測定条件に関する記載。

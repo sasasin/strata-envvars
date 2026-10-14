@@ -1,30 +1,28 @@
 # `STRATA_CPUINFO`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。
 
 ## 役割
 
-Docker 用 entrypoint が、ホスト CPU の AVX2 対応を警告する際に確認するファイルのパスを差し替えます。主用途は entrypoint のテスト用です。通常は `/proc/cpuinfo` を読み、AVX2 が確認できない場合に警告を stderr に出します。この変数は CPU 機能の検出結果やビルド設定を変更せず、警告を出すかどうかだけに影響します。
+コンテナの entrypoint が AVX2 対応状況を確認する CPU 情報ファイルのパスを指定します。主な用途は、実行ホストが AVX2 を報告していないときに警告を出すことです。Strata エンジンの ISA 選択、ビルド、設定ファイルには使われず、警告後も entrypoint は通常どおり続行します。ソース中のコメントはこの値をテスト用としています。
 
 ## 値と判定
 
-`docker-entrypoint.sh` のシェル展開 `${STRATA_CPUINFO:-/proc/cpuinfo}` を使います。
-
-| `STRATA_CPUINFO` | 調査対象のパス |
+| 値 | entrypoint の動作 |
 |---|---|
-| 未設定 | `/proc/cpuinfo` |
-| 空文字 | `/proc/cpuinfo`（`:-` は未設定または空文字で既定値を使う） |
-| 空でない文字列 | その文字列をパスとして使用 |
+| 未設定または空文字 | `/proc/cpuinfo` を調べる（POSIX shell の `${VAR:-default}` による） |
+| 空でない文字列 | その文字列を CPU 情報ファイルのパスとして使う。値の形式、空白、大文字小文字は解析・正規化しない |
+| 指定したファイルが読めない、または `^flags` に一致する行がない | AVX2 の警告を出さない |
+| 最初に `^flags` に一致した行に単語 `avx2` がない | stderr に AVX2 不足の警告を3行出す |
+| 最初に `^flags` に一致した行に単語 `avx2` がある | 警告を出さない |
 
-パスが読み取り可能で、ファイルに行頭が `flags` の行が少なくとも1つある場合だけ、そのうち最初の行を調べます。最初の `flags` 行に小文字の `avx2` が `grep -w` で単語として見つからなければ、AVX2 非対応の警告を出します。ファイル全体や後続の `flags` 行から AVX2 を補って判定することはありません。読み取り不可、または `flags` 行がない場合は警告条件に入りません。
+`grep -q '^flags'` で少なくとも1行あることを確認し、`grep -m1 '^flags'` で最初の一致行だけを取り出して `grep -qw avx2` に渡します。従って複数の `flags` 行がある場合も2行目以降は判定に使いません。`avx2` は文字列全体との比較ではなく grep の単語一致です。
 
 ## 有効になる条件
 
-この変数を参照するのは Strata の `docker-entrypoint.sh` です。Dockerfile はこのスクリプトをコンテナの `ENTRYPOINT` に指定しています。したがって Docker イメージの entrypoint 経由で起動するときに適用されます。通常の `setup.py` による CPU 判定、エンジン内の CPU dispatch、コンパイル時の ISA 選択をこの変数が制御する根拠はありません。
+この変数を読むのは `docker-entrypoint.sh` です。通常のコンテナ起動で使用される Dockerfile はこのスクリプトを `ENTRYPOINT` に指定しています（`Dockerfile:119`）。entrypoint が実行され、指定パスが読み取り可能で、ファイル中に `^flags` 行がある場合にだけ、内容によって警告判定ができます。
 
-## 実行時の詳細
-
-entrypoint の起動直後、モデル設定やサーバー起動処理より前に一度だけファイルを確認します。AVX2 が見つからない場合は、stderr に次の3行を出します。
+警告条件に合致しても終了・起動拒否・再ビルドはしません。出力は stderr に次の文言で行われ、その後のセットアップまたはサーバー起動に進みます。
 
 ```text
 WARNING: this host CPU has no AVX2. The engine in this image is built for CPUs with AVX2, so it may stop
@@ -32,10 +30,16 @@ WARNING: this host CPU has no AVX2. The engine in this image is built for CPUs w
   engine for the CPU it runs on, and see docs/INSTALL.md (Older CPUs, experimental) for the older-CPU build.
 ```
 
-この分岐は警告のみで、スクリプトを終了させません。`STRATA_CPUINFO` は entrypoint の後続コマンドへ明示的に引数として渡されず、リポジトリ内のほかの本番ソースにも参照がありません。`docs/INSTALL.md` は ready-made engine が AVX2 を必要とし、古い CPU 向けには setup が実機で実験的な build を行う旨を説明していますが、`STRATA_CPUINFO` 自体の説明はありません。
+## 実行時の詳細
+
+変数は entrypoint 開始直後、`/opt/strata` への移動の後、他の設定環境変数の既定値を準備する前に一度だけ展開されます。実行中の変更を再読込する処理はありません。値はシェル変数 `cpuinfo` に代入され、`[ -r ... ]` と `grep` に渡されます。環境変数自体は書き換えられず、`cpuinfo` も export されません。
+
+HEAD の tracked source を完全一致で検索したところ、環境変数としての読み取りは `docker-entrypoint.sh:12` のみでした。他の Strata プログラムがこの値を読む実装は確認できません。`setup.py` が `/proc/cpuinfo` を直接読む箇所はありますが、`STRATA_CPUINFO` を参照せず、この環境変数の指定値を利用しません。
 
 ## 根拠
 
-- `docker-entrypoint.sh:9-17` — 変数の既定パス、読み取り可否・`flags` 行・AVX2 判定、警告文と警告のみの処理。
-- `Dockerfile:114-117` — Docker の `ENTRYPOINT` が `docker-entrypoint.sh` であること。
-- `docs/INSTALL.md:139-151` — ready-made engine の AVX2 要件と、旧 CPU 向け setup build の説明。環境変数の挙動を説明する資料ではない。
+- `docker-entrypoint.sh:9-17` — AVX2 不足時の警告の目的、既定ファイル、判定、警告文。警告だけで続行する制御フロー。
+- `Dockerfile:67-71,119` — エンジンは Docker build 時にビルドされること、および entrypoint の指定。
+- `docs/INSTALL.md:145-157` — 配布済みエンジンの AVX2 要件と、旧 CPU 向けの実験的ビルドに関する説明。文書は `STRATA_CPUINFO` 自体の設定方法を説明していません。
+
+この判定は `/proc/cpuinfo` 互換の `flags` 行を想定しています。CPU 情報ファイルの形式が異なる場合、または仮想化環境などで内容がホストの実行能力を正しく表さない場合、警告が出ないか誤った警告になる可能性があります。実装コメントも flags file が VM で誤る可能性を挙げ、警告にとどめる理由としています。

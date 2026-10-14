@@ -1,44 +1,54 @@
 # `STRATA_SPLIT_OWN_PLACE`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。CUDA と SYCL の Strata 所有実装を確認した。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。作業ツリーは `main`、HEAD と `origin/main` は一致し、調査時に未コミット変更はありませんでした。外部ライブラリの環境変数は対象外です。
 
 ## 役割
 
-複数 GPU の `--layer-split auto` が各 stage の配置を探索するとき、プロンプト用バッファを独立して確保する構成の見積もりにも、そのバッファ分の VRAM 予約を含めるかを選ぶ。正確な値 `reserve` を指定すると探索時の stage 空き容量から予約を差し引く。ほかの値では、独立バッファ構成でも探索時にはその予約を差し引かない。
+`STRATA_SPLIT_OWN` の自動判定によって layer split の各 GPU が独自の prompt buffer を持つ場合に、`--layer-split auto` の配置探索でその buffer 用 VRAM を予約量として差し引くかを切り替えます。値が `reserve` なら探索時にも予約を差し引き、未設定または別の値なら探索は予約なしで配置を選びます。探索後の各 GPU の expert cache の容量決定では、独自 buffer 分の予約はどちらの設定でも差し引かれます。
+
+したがって、この変数は独自 buffer を有効にする設定ではなく、独自 buffer が選ばれた場合の自動分割位置に影響する調整用設定です。独自 buffer を使うかどうかは `STRATA_SPLIT_OWN` が決めます。
 
 ## 値と判定
 
-値は `std::string(v) == "reserve"` で文字列全体を比較する。数値変換、空白除去、大文字小文字の変換はしない。
+`std::getenv()` で値を読み、文字列全体を `"reserve"` と比較します。数値変換や前後空白の除去、大文字小文字変換はありません。
 
-| 環境変数の値 | `place_with_reserve` |
-|---|---:|
-| 未設定 | `false` |
-| 空文字 | `false` |
-| `reserve`（完全一致） | `true` |
-| `Reserve`、` reserve`、`reserve `、その他すべて | `false` |
+| 値 | `place_with_reserve` | `split_own_auto=true` のときの探索時の扱い |
+|---|---:|---|
+| 未設定 | false | 独自 prompt buffer の予約を探索容量から差し引かない |
+| 空文字 | false | 同上 |
+| `reserve` | true | `split_pf_mib` を予約量に含める |
+| `RESERVE`、`1`、`true`、` reserve` など | false | 同上 |
 
-値の取得結果は関数内 `static const bool` に保存される。初回評価以降、同一プロセスで環境を書き換えても再評価されない。
+値は関数内の `static const bool` として初回到達時に評価・保存されます。プロセス実行中に環境を変更しても、その後の呼び出しで再評価されません。
+
+根拠: `src/program/generate.cpp:3797-3800`、SYCL 実装 `sycl/src/program/generate.cpp:3546-3549`。
 
 ## 有効になる条件
 
-動作差が生じるには、複数 GPU の layer split で `--layer-split auto` の配置探索を行い、かつプロンプト用バッファを各 stage が独立して持つ状態である必要がある。独立バッファ状態は、この経路では主に `STRATA_SPLIT_OWN` が有効になって `split_own_auto` が立つことで作られる。
+この値が配置に影響するには、次の条件が必要です。
 
-`STRATA_SPLIT_OWN` が有効でない場合、または明示的な `--layer-split K[,K2...]` で自動配置探索をしない場合、この変数による探索容量の差はない。単一 GPU で自動 split が解除された場合も対象外。CUDA 実装と SYCL 実装に同じ判定と容量計算がある。
+- 複数 GPU の layer split である。
+- `--layer-split auto` が使われている。
+- `STRATA_SPLIT_OWN` により独自 prompt buffer が自動選択され、内部フラグ `split_own_auto` が true になっている。
+
+`split_own_auto` は、`--no-prefill-borrow` が指定されておらず、`--split-skip-if-fits` も指定されていない状態で、`STRATA_SPLIT_OWN` が `0` で始まらない値に設定されている場合にだけ検討されます。値が `auto` なら全 split GPU の VRAM 容量を調べ、prompt buffer の推定量が各 GPU の総 VRAM の 12% 以下の場合に独自 buffer を選びます。`1` で始まる値なら明示的に選びます。`STRATA_SPLIT_OWN` の未設定または先頭文字 `0` はこの選択を行いません。独自 buffer が選ばれない場合、`STRATA_SPLIT_OWN_PLACE` の値に関係なく探索時に差し引く `split_pf_mib` は配置に影響しません。
+
+また、`--layer-split` に明示的な境界を渡した場合は配置探索をしないため、この変数の探索時効果はありません。`--split-skip-if-fits` によって単一 GPU 実行へ戻る場合も `split_own_auto` は立ちません。
+
+根拠: `src/program/generate.cpp:2407-2408,2449-2485,3814-3815`。独自 buffer と `STRATA_SPLIT_OWN` の利用者向け説明は `docs/MULTI_GPU.md:76-83` にあります。
 
 ## 実行時の詳細
 
-自動配置の探索では各 stage の `stage_room(..., search=true)` が空き VRAM から予約額を引き、候補配置の容量として使う。`split_own_auto` が真で `STRATA_SPLIT_OWN_PLACE` が `reserve` 以外なら、探索に限ってプロンプトバッファ見積もり `split_pf_mib` を 0 にする。`reserve` なら `split_pf_mib` を含めるため、探索上の各 stage の空き容量がその分小さくなり、自動配置結果に影響し得る。
+独自 prompt buffer の予約量 `split_pf_mib` は、`--prefill` の chunk が正の場合、`160 + (chunk * 680) / 1024 + split_ring_mib` MiB です。独自 buffer が有効な split で chunk が 1024 以上なら、96 個の expert blob 用 split ring のサイズも加算されます。chunk が 1024 未満、または split でない場合、ring 加算は 0 です。`--prefill` が自動の場合の chunk は、独自 buffer 判定時には 2048 として見積もられます。根拠: `src/program/generate.cpp:2458-2460,3731-3741`。
 
-`split_pf_mib` は、プロンプト chunk が正で、バッファを cache から借りない場合に `160 + (prefill_chunk * 680) / 1024` MiB として計算される。複数 GPU で chunk が 1024 以上なら、条件に応じて 96 個の expert blob ring 分も加算される。これは探索用の予約見積もりである。探索後に stage を準備する `stage_room` 呼び出しは `search=false` の既定値を使うため、この環境変数にかかわらず通常の `split_pf_mib` を予約計算に含める。
+`stage_room()` は探索中 (`search=true`) かつ `split_own_auto=true` で、さらに `STRATA_SPLIT_OWN_PLACE` が `reserve` でない場合、探索用容量から差し引く prompt buffer 予約 `pf` を 0 にします。`reserve` の場合は `split_pf_mib` を含めて各 stage の使用可能 VRAM を見積もります。`split_own_auto=false` の場合はこの環境変数による切り替えはなく、通常どおり `split_pf_mib` を使います。いずれも `--vram-reserve-mib`（後続 GPU 用の指定があれば `--vram-reserve-later-mib`）、verify window、pipeline window、drafter/head の予約は別途差し引かれます。
 
-変数を `reserve` にしたこと自体を知らせる専用ログは見当たらない。配置探索や stage 容量のログは出るが、変数名・判定値を直接表示する実装はない。`docs/DETAILS.md` にこの変数の説明は見当たらない。ソースコメントには、9070 XT + R9700 の測定で reserve を探索に含めると境界が K=28 から K=32 に動き、decode が 58.4 から 54.8 tok/s になったとの記載がある。測定手順や反復数はその箇所にないため、この記載を一般的な性能結果とは扱えない。
+探索が終わって cache を実際に確保する際は `search=false` で `stage_room()` が呼ばれるため、`STRATA_SPLIT_OWN_PLACE` の値にかかわらず `split_pf_mib` が差し引かれます。このため、既定の探索は独自 buffer の予約を無視して境界を選び、その後の cache が小さくなる場合があります。`reserve` は探索モデルにも実際の予算を反映させ、選ばれる layer 境界や予測値を変えることがあります。どの境界が選ばれるかは GPU の空き VRAM、各 stage の session サイズ、profile、リンク速度などにも依存します。
 
-## 根拠
+CUDA と SYCL の `generate.cpp` に同じ値比較と `stage_room()` の予約条件があります。実装上、環境変数専用のログはありません。`--layer-split auto` の通常の起動ログには、選ばれた `K`、予測 decode window 時間、profile 上の cache 保持量が出ます。
 
-- `src/program/generate.cpp:3639-3643` — own prompt buffers の探索方針と `reserve` の説明。
-- `src/program/generate.cpp:3675-3690` — 環境値の完全一致判定、予約額を探索時に 0 にする条件、stage 空き容量の計算。
-- `src/program/generate.cpp:2348-2426` — `multi_gpu`、`split_own_auto`、独立 prompt buffers を有効にする条件と `STRATA_SPLIT_OWN` の判定。
-- `src/program/generate.cpp:5310` — 探索後の stage 準備で `stage_room` を `search=false` のまま使う呼び出し。
-- `sycl/src/program/generate.cpp:3496-3536` — SYCL の同じ判定と容量計算。
-- `sycl/src/program/generate.cpp:2084-2170` — SYCL の `split_own_auto` 設定条件。
-- `sycl/src/program/generate.cpp:4896` — 探索後の stage 準備での `stage_room` 呼び出し。
+根拠: `src/program/generate.cpp:3797-3812,3814-3826,4287-4292,5552-5563`、`sycl/src/program/generate.cpp:3546-3567`。
+
+## 文書・測定との照合
+
+`docs/MULTI_GPU.md:76-83` は `STRATA_SPLIT_OWN=1` と `auto` の独自 prompt buffer 選択条件を説明していますが、`STRATA_SPLIT_OWN_PLACE` の説明はありません。ソースコメント (`src/program/generate.cpp:3761-3765`) には、予約込みの探索で境界が `K=28` から `K=32` に変わり、decode が 54.8 tok/s になった比較として、R9700 + RX 9070 XT の測定値が記録されています。ただし、これはソースコメントの記録であり、モデルや測定条件の詳細が揃っていないため、この文書では一般的な性能効果として扱いません。

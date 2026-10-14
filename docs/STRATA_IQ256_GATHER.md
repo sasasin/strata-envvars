@@ -1,46 +1,50 @@
 # `STRATA_IQ256_GATHER`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。
 
 ## 役割
 
-Strata のネイティブ CPU expert 経路で、AVX2 の multi-token IQ カーネルが IQ3_XXS・IQ3_S・IQ2_S のグリッド値を scalar load で組み立てるか、AVX2 gather 命令で読むかを選ぶ。`1` は gather、`0` は scalar decode。未設定または空文字では CPU を判定して選ぶ。どちらも同じグリッド語を同じレーンへ渡す実装として書かれているが、この変数が指定するのは読み出し方式であり、出力の数値同一性を独立に測定したものではない。
+Native expert の AVX2 i-quant 複数 token カーネルで、量子化コードブックの値を scalar load で組み立てるか、AVX2 gather 命令で読むかを選びます。制御対象は Strata の gather variant 選択です。両方の variant は同じビットを計算する、とカーネル実装は説明しています。環境変数自体についての性能測定資料は確認できませんでした。
 
 ## 値と判定
 
-| 環境値 | 内部値 | 選択 |
+`src/kernels/cpu/expert_layout.cpp:210-216` で `std::getenv` した値を一度だけ読みます。
+
+| 値 | 設定値 | 選択 |
 |---|---:|---|
-| 未設定 | `-1` | 呼び出しスレッドのコアで自動判定 |
-| 空文字 | `-1` | 呼び出しスレッドのコアで自動判定 |
-| `atoi(value) == 0` | `0` | 全コアで scalar decode |
-| `atoi(value) != 0` | `1` | 全コアで gather |
+| 未設定 | `-1` | 自動。実行スレッドのコアで gather が速いと判定された場合だけ gather variant |
+| 空文字 | `-1` | 未設定と同じ自動判定 |
+| 空でない値で `std::atoi(value) == 0` | `0` | scalar decode を全コアで選ぶ |
+| 空でない値で `std::atoi(value) != 0` | `1` | gather decode を全コアで選ぶ |
 
-`std::atoi` を使い、文字列全体の厳密な数値 parse はしない。したがって、先頭の空白や符号の後の数値部分を変換し、数値の後ろに文字があってもその部分は無視する（例: `2x` は gather、`0x` は scalar、`x2` は変換結果 0 で scalar）。負の数も変換結果が 0 でなければ gather。大文字小文字を判定する文字列比較はない。無効な数値文字列に対する警告や別の fallback はない。
-
-`iq256_gather_setting()` の値は関数内の `static const` に初回評価時だけ保存される。プロセス起動後に環境値を変えても、その後の選択には反映されない。
+空文字以外は文字列全体の比較ではなく `atoi` です。したがって `1`, `-1`, `2`, `1abc` は gather を選び、`0`, `abc`, `0abc` は scalar decode を選びます。先頭の空白や符号は `atoi` の規則で処理されます。無効な数値文字列専用の警告や fallback ログはありません。
 
 ## 有効になる条件
 
-- Strata のネイティブ expert CPU 経路を使い、AVX2 が利用可能で、AVX2 IQ カーネルへ dispatch されることが必要。実際の gate/up 行は `native_gu_rows()` が CPU 機能、対応形式、`nt >= mt_min` を確認してから呼ぶ。AVX2 がない場合、`STRATA_NO_IQ256` が設定されている場合、または条件に合わない場合は ggml-cpu 等へフォールバックし、この変数による decode 選択は行われない。
-- AVX-512 が利用可能で IQ512 カーネルが対応する IQ3_XXS・IQ3_S・IQ2_S では、通常は AVX-512 経路が先に選ばれるため、この変数はその経路を切り替えない。`STRATA_NO_IQ512` などで AVX-512 経路が無効なら、AVX2 経路に到達する可能性がある。
-- gather 方式を適用するのは形式番号 18 (IQ3_XXS)、21 (IQ3_S)、22 (IQ2_S) のみ。IQ2_XXS、IQ2_XS、IQ4_XS にはこの gather decode の分岐を適用しない。
-- 未設定・空文字時の自動判定は、`cpu_gather_fast()` による CPU 全体の条件と、`cpu_gather_fast_here()` による呼び出しスレッドのコア判定を使う。前者は `STRATA_FORCE_ISA` の上限が通常値で、Intel GenuineIntel、CPUID の AVX-VNNI feature があり、特定の E-core-only model でないことを条件にする。hybrid CPU では CPUID leaf `0x1A` の core type が P-core (`40h`) のスレッドだけ gather を選ぶ。E-core (`20h`) は scalar decode。非 hybrid CPU は core type なしとして CPU 全体の条件を満たせば gather を選ぶ。
-- 明示的な非ゼロ値はこの自動性能判定を上書きし、AVX2 kernel が実行されるすべての対象スレッドで gather を選ぶ。環境値だけでAVX2 kernel自体を有効化することはなく、AVX2 CPU機能 gate は残る。
+- 対象は Native expert の CPU AVX2 i-quant gate/up カーネルで、カーネルが有効な IQ2_XXS、IQ2_XS、IQ3_XXS、IQ3_S、IQ2_S、IQ4_XS が候補です。AVX2 カーネル選択自体には CPU/OS の AVX2 対応と `STRATA_NO_IQ256` が関わり、AVX-512対応 CPU は通常 gate/up で AVX-512 カーネルを優先します（`src/kernels/cpu/native_expert.cpp:143-190`）。
+- gather と scalar の実装差があるのは IQ3_XXS（type 118）、IQ3_S（121）、IQ2_S（122）のコードブック decode です。IQ2_XXS、IQ2_XS、IQ4_XS はこの設定で選ぶ variant が変わっても、gather 用の decode 特殊化を持たず同じ decode を使います（`src/kernels/cpu/iq_avx2.cpp:293-345` および各 `Fmt32` 実装）。
+- `=1` など非ゼロを指定すると自動の CPU 適性判定を上書きし、AVX2 カーネルが呼ばれる場合には全コアで gather を選びます。これは gather の実行速度を保証する指定ではありません。
+- 未設定または空文字の自動判定は、Intel CPU で AVX-VNNI があり、特定の E-core 専用モデルに該当しないことを `cpu_gather_fast()` で調べます。ハイブリッド CPU では呼び出しスレッドが P-core かも調べ、P-core なら gather、E-core なら scalar decode を選びます。非 Intel CPU や判定条件を満たさない CPU は scalar decode です（`src/kernels/cpu/expert_layout.cpp:219-257`）。
+- `STRATA_IQ3S_MT1` による IQ3_S の単一 token AVX2 経路では、この値が `0` のとき gather 条件が成立せず、`STRATA_IQ3S_MT1` の効果も抑止されます。未設定・空文字は `-1` なので、この条件だけでは抑止しません（`src/kernels/cpu/native_expert.cpp:124-140`）。
 
 ## 実行時の詳細
 
-`native_gu_rows()` は IQ の gate/up 行を処理する際、AVX2 を使える条件を満たすと `iq256_gu_rows()` を呼ぶ。そこで `iq256_variant()` が `iq256_gather_setting()` を読み、設定値があれば一律にその選択を使い、未設定なら `cpu_gather_fast_here()` を呼んでスレッドごとに選ぶ。後者は P/E core の判定結果を `thread_local` に保存する。AVX-VNNI が使える場合は整数積和の VNNI 版も選ばれるが、gather/scalar の選択とは別の variant bit である。
+値は `iq256_gather_setting()` が最初に呼ばれた際に関数内の `static const int` へ保存されます。その後プロセス内で環境を変更しても値は再読込されません。自動判定では `cpu_gather_fast_here()` が実行スレッドごとにコア種別を thread-local に一度保存するため、同じプロセスの P-core と E-core で variant が異なる場合があります。明示的な `0` / 非ゼロ指定ではそのコア別差を使いません。
 
-選ばれた variant は、IQ3_XXS・IQ3_S・IQ2_S の decode template をそれぞれ gathered (`118`/`121`/`122`) または通常 (`18`/`21`/`22`) に分岐させる。これは CPU 計算経路の選択であり、この変数を読んだことによる stdout/stderr のログ、警告、エラー、終了処理は実装にない。
+`iq256_variant()` はこの gather bit と、独立して判定する AVX-VNNI bit を組み合わせます。gate/up の AVX2 行計算は選ばれた variant を `iq256_gu_rows_v()` に渡し、`Fmt32<118>`, `<121>`, `<122>` の gather decode を使うか決めます。Native expert pool が gate/up 行処理を呼ぶ経路で適用されます（`src/kernels/cpu/iq_avx2.cpp:456-500`、`src/kernels/cpu/pool.cpp:705-708`）。IQ4_NL down 行は別カーネルであり、この gather 設定の対象ではありません（`src/kernels/cpu/native_expert.cpp:233-255`）。
 
-`STRATA_IQ3S_MT1` との相互作用もある。`STRATA_IQ_MT_MIN` が未設定で、`STRATA_IQ3S_MT1` が設定され、AVX2・非AVX-512等の条件を満たすと、IQ3_S の multi-token kernel を1 token groupにも使う判定が行われる。この判定は `iq256_gather_setting() != 0` と `cpu_gather_fast()` も条件にするため、`STRATA_IQ256_GATHER=0` はこの特別扱いを無効化する。これは `STRATA_IQ256_GATHER` 自体の gather variant 選択とは別の dispatch 条件である。
+通常の Strata 実行経路に、この設定の値を表示するログは見つかりませんでした。AVX2 parity 診断実行ファイルは環境値と選択 variant を表示しますが、診断用表示です（`src/kernels/cpu/iq_avx2_parity.cpp:533-541`）。
+
+`docs/DETAILS.md:97-105` は `STRATA_IQ3S_MT1` と、未設定時の IQ3_S gather 自動選択に言及します。これは上記のコードと整合しますが、`STRATA_IQ256_GATHER` 自体の値判定や全フォーマットへの効果は同資料では説明されていません。
 
 ## 根拠
 
-- `src/kernels/cpu/expert_layout.cpp:202-209` — `getenv`、未設定・空文字の処理、`atoi`、初回値の static cache。
-- `src/kernels/cpu/expert_layout.cpp:211-250` — CPU 全体の自動判定条件と、呼び出しスレッドの core type 判定・thread-local cache。
-- `include/strata/kernels/cpu/expert_layout.hpp:62-72` — API コメント上の設定値と自動判定の説明。
-- `src/kernels/cpu/native_expert.cpp:37-43,115-131,134-179` — 対象形式、`STRATA_IQ3S_MT1` との条件、AVX2/AVX-512のgate/up dispatch。
-- `src/kernels/cpu/iq_avx2.cpp:456-501` — variant の決定と gate/up 行から variant decode への受け渡し。
-- `src/kernels/cpu/iq_avx2_rows.inl:209-235` — gather decode を使う型と、それ以外の型の dispatch。
-- `docs/DETAILS.md:97-105` — 関連する `STRATA_IQ3S_MT1` の説明。Alder Lake以降かつAVX-512なしのIQ3_S経路でAVX2 kernelがgridをgatherすることに触れているが、`STRATA_IQ256_GATHER` の個別比較測定や値の parse 規則は説明していないため、本書ではコードを根拠にした。
+- 値の読み取り、空文字の扱い、`atoi`、static cache: `src/kernels/cpu/expert_layout.cpp:210-216`
+- 自動時の Intel / AVX-VNNI 条件と P-core / E-core 判定: `src/kernels/cpu/expert_layout.cpp:219-257`
+- gather 特殊化の対象と gather 命令: `src/kernels/cpu/iq_avx2.cpp:276-345`
+- variant の選択と AVX2 行計算への適用: `src/kernels/cpu/iq_avx2.cpp:456-500`
+- Native expert における AVX2 kernel の条件と `STRATA_IQ3S_MT1` との相互作用: `src/kernels/cpu/native_expert.cpp:124-190`
+- Native expert pool から gate/up 行処理への呼び出し: `src/kernels/cpu/pool.cpp:705-708`
+- down 行の別経路: `src/kernels/cpu/native_expert.cpp:233-255`
+- 診断時の値・variant 表示: `src/kernels/cpu/iq_avx2_parity.cpp:533-541`
+- 関連する利用者向け説明: `docs/DETAILS.md:97-105`

@@ -1,47 +1,42 @@
 # `STRATA_NO_IQ256`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。対象は Strata 所有ソース。外部ライブラリの環境変数や内部動作は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。外部ライブラリの環境変数の動作は対象外。
 
 ## 役割
 
-native expert を CPU で計算するとき、AVX2 版の i-quant gate/up 行カーネルを選ばないための開発・診断用スイッチです。値の内容は使わず、環境変数が存在するかどうかで判定します。無効化された経路は ggml-cpu の `vec_dot` にフォールバックします。
-
-対象の AVX2 カーネルは `iq256_supported()` が列挙する型（型 ID 16、17、18、21、22、23）です。`native_gu_rows()` が処理する gate/up 行に限られ、`native_down_rows()` の AVX2 経路（IQ4_NL、`STRATA_KQ256` による Q5_1/Q8_0）はこの変数では無効化されません。
+native pack の CPU expert 計算で、i-quant の gate/up 行に使う AVX2 multi-token kernel を無効にします。無効化すると、その経路の代わりに ggml-cpu の `vec_dot` が各 token の行を計算します。CUDA/HIP/SYCL の GPU kernel を切り替える変数ではなく、native pack を処理する CPU 側の経路に作用します。
 
 ## 値と判定
 
-| 状態 | 判定 | 結果 |
-|---|---|---|
-| 未設定 | `getenv()` が `nullptr` | CPU が AVX2 対応なら、他の dispatch 条件に従い AVX2 カーネルを選べる |
-| 設定済み | `getenv()` が非 `nullptr` | AVX2 i-quant gate/up カーネルを選ばない |
+実装は `std::getenv("STRATA_NO_IQ256") != nullptr` で設定有無だけを判定し、値を parse しません。
 
-空文字、`0`、`1`、その他の文字列を区別せず、設定されていれば無効化します。数値変換や空白除去はありません。既定は未設定であり、別の設定ファイルや CLI 引数による優先順位はこのコードにはありません。
+| 環境の状態 | AVX2 i-quant gate/up 経路 |
+|---|---|
+| 未設定 | 他の条件を満たせば利用可能 |
+| 設定済み（`1`、`0`、空文字、その他の文字列を含む） | 無効。対象の行は ggml-cpu の `vec_dot` に fallback |
+
+`native_gu_rows()` 内の判定は関数内 `static const bool` に保存されるため、その判定が初めて実行された後にプロセス環境を変更しても dispatch は変わりません。起動時の診断ログ側は別に `getenv()` を確認します。
 
 ## 有効になる条件
 
-- `STRATA_NATIVE_EXPERTS=ON` でビルドされ、native expert の CPU 実装が含まれること。CMake のこのオプションは既定で `ON` です。
-- native pack の expert を CPU で計算する経路に入ること。通常の canonical pack の AVX-512 expert 経路を切り替える変数ではありません。
-- AVX2 カーネルが候補となるのは AVX2 対応 CPU です。AVX2 がなければ元からそのカーネルを呼ばず、ggml-cpu または別の older-CPU 経路を使います。
-- AVX-512 対応 CPU では gate/up の dispatch は AVX-512 対応型に AVX-512 カーネルを優先します。IQ4_XS のように AVX-512 対応型一覧にない型も `cpu512` 条件により AVX2 側へ進まないため、この変数の AVX2 選択への影響はありません。`STRATA_NO_IQ512` を設定して AVX-512 カーネルを止めた場合も、ハードウェア判定 `cpu512` 自体は変わらないため、この分岐条件は同じです。
-- `STRATA_IQ3S_MT1` が設定され、`STRATA_IQ_MT_MIN` が未設定の場合に限る IQ3_S の単一 token 用 multi-token 閾値引き下げも、この変数が設定されていると成立しません。`STRATA_IQ_MT_MIN` が明示されている場合はそちらの値が使われます。
+変数が未設定でも、AVX2 が使える CPU であることが必要です。さらに AVX-512 対応 CPU ではこの dispatch の条件上 AVX2 経路を選ばず、対象形式の AVX-512 kernel が優先されます。AVX2 kernel が対象とする gate/up 型（`iq256_supported()` が列挙する GGML type 16, 17, 18, 21, 22, 23）であること、multi-token 数 `nt` が `STRATA_IQ_MT_MIN` の閾値以上であることも必要です。同閾値は未設定時 2、設定時は `atoi` の結果で、空文字や数値に変換できない文字列は 0、負数もそのまま使われます。したがって、たとえば 0 以下なら正の `nt` は閾値を満たします。これらの条件を満たさない行は、別に有効な AVX1 kernel か ggml-cpu 経路に進みます。
+
+相互作用として、`STRATA_IQ_MT_MIN` が未設定で `STRATA_IQ3S_MT1` が設定されている場合の IQ3_S 用 one-token 条件も、本変数が未設定であることを要求します。本変数を設定するとその特例も無効になります。
+
+この変数は `native_down_rows()` の選択には使われません。down 行の IQ4_NL multi-token kernel は `STRATA_NO_IQ4NL`、Q5_1/Q8_0 の KQ kernel は `STRATA_KQ256` など、別の条件で選択されます。
 
 ## 実行時の詳細
 
-`native_gu_rows()` 内の `static const bool avx2` が初期化される際に環境変数を読み、結果をプロセス内に保持します。対応形式で、CPU が AVX-512 ではなく、token 数が `native_gu_mt_min()` の閾値以上なら、変数未設定時は `iq256_gu_rows()` を呼びます。設定時はその分岐を通らず、各 gate/up 行と各 token について ggml-cpu の `vec_dot` を呼び、SwiGLU 値を計算します。値が設定されたことで AVX2 非対応 CPU から AVX2 命令を実行することはありません。AVX2 可否の CPU probe も必要条件です。
+native pack は `--native` 経路で expert を CPU 側の native layout として扱います。CPU pool が native expert の gate/up 行を処理するとき `native_gu_rows()` を呼びます。そこで AVX-512 条件、AVX2 条件、AVX1 条件を順に調べ、対象形式かつ token 数が閾値以上なら対応する multi-token kernel に渡します。`STRATA_NO_IQ256` が設定済みの場合は AVX2 条件が偽になり、最後の ggml-cpu `vec_dot` のループで token ごとに dot product を行い、SwiGLU の値を出力します。
 
-同じ値は `native_gu_mt_min()` の IQ3_S 特例の条件にも使われ、そこでは初回の呼び出し時に判定されます。カーネルの選択と閾値のキャッシュはそれぞれの `static` 初期化時点で固定され、その後の環境変更では再評価されません。
-
-`strata generate` は native pack で AVX-512 非対応 CPU の場合、起動時に stderr へ CPU expert 経路を説明する行を出します。AVX2 対応でこの変数が設定されていると、文言は `ggml-cpu vec_dot (STRATA_NO_IQ256 set)` になります。SYCL 側にも同じ形式の起動ログがあります。このログは選択経路の表示で、処理結果の正確性や速度を測定したものではありません。
-
-`docs/DETAILS.md` は `STRATA_IQ3S_MT1` と multi-token 閾値の関係を説明していますが、`STRATA_NO_IQ256` 自体の説明は見つかりませんでした。ここでは実装の dispatch 条件を根拠にしています。
+AVX-512 非対応 CPU で native pack を起動すると stderr に `this CPU has no AVX-512: the expert kernels run on ...` という診断が出ます。AVX2 対応 CPU では、変数未設定時の分岐名は `AVX-2`、設定時は `ggml-cpu vec_dot (STRATA_NO_IQ256 set)` です。AVX2 自体に非対応の CPU では no-AVX2 側のメッセージになり、この変数だけで AVX2 を使えるようにはなりません。
 
 ## 根拠
 
-- `CMakeLists.txt:1205-1210,1265-1269` — native expert の CMake オプション（既定 `ON`）と CPU 実装のビルド対象。
-- `src/kernels/cpu/native_expert.cpp:41-43` — AVX2 IQ gate/up カーネルが対応する型 ID。
-- `src/kernels/cpu/native_expert.cpp:115-131` — `STRATA_IQ_MT_MIN` の既定値と `STRATA_IQ3S_MT1` 特例、および `STRATA_NO_IQ256` による特例抑制。
-- `src/kernels/cpu/native_expert.cpp:134-197` — AVX-512/AVX2 の dispatch、`STRATA_NO_IQ256` の設定有無判定と ggml-cpu への fallback。
-- `src/kernels/cpu/native_expert.cpp:199-233` — down 行処理が別 dispatch であり、この変数を参照しないこと。
-- `src/kernels/cpu/pool.cpp:630-662` — native expert の gate/up と down 行処理の呼び出し。
-- `src/program/generate.cpp:2774-2783`, `sycl/src/program/generate.cpp:2572-2578` — CPU 条件と環境変数に応じた起動ログ。
-- `docs/DETAILS.md:97-105` — 関連する `STRATA_IQ_MT_MIN` / `STRATA_IQ3S_MT1` の説明。
+- `src/kernels/cpu/native_expert.cpp:143-158` — AVX2 条件と値の判定、AVX2 kernel の dispatch。
+- `src/kernels/cpu/native_expert.cpp:179-194,218-229` — CPU 世代、対応形式、multi-token 閾値の条件と ggml-cpu fallback。
+- `src/kernels/cpu/native_expert.cpp:124-140` — `STRATA_IQ_MT_MIN` の既定値と `atoi` 判定、および IQ3_S の追加条件にも本変数の設定有無を使用。
+- `src/kernels/cpu/native_expert.cpp:44-46` — AVX2 kernel が対象とする GGML type。
+- `src/kernels/cpu/pool.cpp:705-718` — CPU pool から gate/up と down の native row 関数を呼び分け。
+- `src/program/generate.cpp:2898-2907` — native pack の AVX-512 非対応 CPU 向け診断と本変数による表示分岐。SYCL 側にも同じ診断がある（`sycl/src/program/generate.cpp:2628-2634`）。
+- `src/program/generate.cpp:2803-2818` — native pack の初期化と native expert 形式チェック。

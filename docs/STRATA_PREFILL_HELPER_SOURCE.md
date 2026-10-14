@@ -1,56 +1,61 @@
 # `STRATA_PREFILL_HELPER_SOURCE`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-`strata serve` の prompt prefill が読む expert blob について、helper GPU の VRAM cache に現在ある blob を、モデルファイルの代わりにその cache から host staging buffer へコピーします。prefill の計算は従来どおり主 GPU で行います。helper にない blob は元の `ExpertSource` に渡されるため、通常の file read、batched read、pinned RAM copy の扱いは維持されます。
-
-これは opt-in で、既定では無効です。有効でも以下の実行条件を満たさなければ source は切り替わりません。コード上の読み取りは `src/program/generate.cpp` の1か所です。
+`--serve` の prompt prefill で、helper GPU の VRAM expert cache にある blob を、モデルファイルから読み直す代わりに host 側の prompt staging buffer へコピーします。helper cache にない blob は従来の `ExpertSource` へ渡されます。通常の `generate` 経路ではこの変数を読まず、serve 経路でも既定は無効です。
 
 ## 値と判定
 
-値全体の比較ではなく、`std::atoi(hv) != 0` で判定します。環境変数が未設定なら条件は偽です。空文字や整数として読めない文字列は `atoi` が0を返すため無効です。先頭の整数部分が0でない値（例: `1`, `2`, `-1`, `1junk`）は値条件を通ります。したがって「文字列が `1` と完全一致すること」は必要ありません。変換結果が `int` の範囲外の場合の扱いは、この呼び出し側では検査していません。
+`src/program/generate.cpp` は環境変数が設定されているかを確認した後、値を `std::atoi()` に渡し、結果が 0 以外かを判定します。文字列全体の厳密な検証や `1` との比較ではありません。
 
-| 環境変数の値 | 値条件 |
+| 値 | 判定 |
 |---|---|
 | 未設定 | 無効 |
-| 空文字 | 無効（`atoi` が0） |
-| `0`、`00`、数値に変換できない文字列 | 無効 |
-| `1`、`2`、`-1`、`1junk` など、`atoi` が0以外を返す値 | 有効候補。実行条件も必要 |
+| 空文字、数字に変換できない文字列（例: `true`） | `atoi` が 0 を返すため無効 |
+| 整数として 0 になる値（例: `0`, `00`, `-0`） | 無効 |
+| 整数として 0 以外になる値（例: `1`, `2`, `-1`） | 有効候補 |
+| 数字の後ろに文字が続く値（例: `1junk`） | 数字の prefix が 0 以外なら有効候補。文字列全体は検証しない |
 
-根拠: `src/program/generate.cpp:6951-6956`。
+`atoi` の通常の変換規則により先頭の空白と符号は許され、最初の数字以外で変換が止まります。数値範囲外の文字列の結果には依存しないでください。判定は serve 起動時の初期化で行われ、リクエストごとの再評価やプロセス起動後の環境変更を反映するコードはありません。
+
+根拠: `src/program/generate.cpp:7244-7259`。
 
 ## 有効になる条件
 
-値条件に加え、source wrapper は次をすべて満たすときだけ作られます。
+値が 0 以外でも、次の条件をすべて満たしたときだけ prompt source を切り替えます。
 
-- `serve` 経路である。
-- `srcp` が有効な expert source を指す。
-- `multi_gpu` が偽で、`stages` が空。つまり layer split 等の複数 GPU stage を使わない。
-- `o.batch <= 0` である（batch slots を使わない）。
-- `drive.d.remote_count` が1以上で、helper GPU が構成されている。
+- コマンドが `--serve` の経路に入っている。
+- `srcp` が有効な expert source を指している。
+- `multi_gpu` が false で、layer split がない。
+- `stages` が空である。
+- `o.batch <= 0` で、batch slots を使わない。
+- helper の `prefill_helpers` が空でない（`drive.d.remote_count` 個の helper を列挙した結果）。
 
-条件が不足した場合、環境変数を設定しても helper source は作られず、起動時の有効ログも出ません。server はこの経路で prompt を serial に処理し、prompt read 中 helper GPU が idle であるという実装コメントが、helper cache を読む前提です。CUDA の `RemoteExperts` を使う経路であり、同名の読み取りは SYCL 実装には見つかりません。
+条件を満たさない場合、変数を有効値にしても source は `srcp` のままです。ソース上、この変数に対応する CLI 引数や別の環境変数による上書きはありません。helper expert cache 自体の設定・容量は別の serve 引数で決まり、この変数だけでは cache を作成しません。
 
 ## 実行時の詳細
 
-環境変数は `serve` の初期化中に読み取られ、`RemotePrefillSource` が作られるかどうかが決まります。その source を `Prefill::init` に渡し、serve の各 prompt read に使います。読み取り箇所は static cache ではありませんが、この分岐自体は serve source の初期化時に一度実行されます。server 実行中に環境変数を書き換えても、既に構築済みの source の有無は変わりません。根拠: `src/program/generate.cpp:6946-6957,7284-7287`。
+有効条件を満たすと `RemotePrefillSource` が作られ、`Prefill::init()` に元の `srcp` の代わりに渡されます。prefill 側は helper cache に現在ある `(layer, expert)` を transient source として扱い、複数 blob の staging では helper ごとにまとめて読み取り、cache hit でない blob は元 source の `copy_blobs()` に渡します。これにより file source の batching などの fallback 処理は維持されます。通常の `generate` は別の `Prefill::init()` 呼出しで `srcp` をそのまま渡しています。
 
-`RemotePrefillSource` は要求ごとに helper の `holds(layer, expert)` を調べます。helper にある blob は stager の `copy_blob(s)` 経路へ誘導され、helper ごとの専用 non-blocking CUDA stream で device-to-host copy を発行して同期します。複数 blob は helper ごとにまとめてコピーします。helper の cache は request 間で変化し得るため、この wrapper は blob を別途 cache せず、各回の現況を照会します。根拠: `include/strata/core/remote_experts.hpp:104-153`, `src/core/remote_experts.cpp:349-379,381-449`。
+helper 側は専用 CUDA read stream で VRAM cache から host buffer へ `cudaMemcpyAsync` し、その stream を同期してから呼出し元へ戻ります。複数の prefill staging thread から読めるよう mutex で同時読取りを直列化します。cache hit はコピー時に調べられ、ラッパー側に別 cache はありません。したがって、リクエスト間に helper cache の内容が変わった場合は次の読み取り時の状態が使われます。
 
-helper に blob がない場合や helper copy が失敗した場合、その blob は元の source から取得します。失敗時は `prefill: a helper cache read failed (%s); the file source fills that blob instead` を stderr に最大1回出します。fallback の source copy 自体が失敗すると、prefill stager は失敗した旨を stderr に出し `abort()` します。正常な request 終了時は `strata serve: prefill helper source: %lld blobs / %.1f MiB taken from a helper's cache in this request` を stderr に出し、その request で helper cache から取った量を示します。wrapper を使わない場合、このログは出ません。根拠: `src/core/remote_experts.cpp:451-455`, `src/prefill/prefill.cpp:517-519`, `src/program/generate.cpp:12539-12545`。
+CUDA 読取りが失敗すると、stderr に `prefill: a helper cache read failed (%s); the file source fills that blob instead` を一度出し、失敗した blob を元 source から補います。読み取り済み hit のコピーが完了していることを確認できない場合は hit 扱いを取り消して fallback します。helper source が作られた場合、各 request の終了時に `strata serve: prefill helper source: %lld blobs / %.1f MiB taken from a helper's cache in this request` を stderr に出します。起動時には有効化した旨の行も出ます。
 
 ## 文書との照合
 
-`docs/SECOND_GPU.md:70-74` は helper GPU が decode を担当し、prompt prefill は CUDA0 で行うと説明しています。今回確認した opt-in は prefill の計算先を変えず、helper VRAM cache から prompt 用 blob を読む source を追加するものなので、この説明と矛盾しません。同文書と `docs/DETAILS.md` には、この変数や helper cache からの prompt read を直接説明する記載は見つかりませんでした。性能値や token 同一性の測定根拠も確認できなかったため、ここでは性能効果を断定しません。
+`docs/SECOND_GPU.md` は helper GPU cache と prompt prefill が CUDA0 で動く構成を説明しています（72-74行）が、この環境変数の個別説明はありません。`docs/DETAILS.md` の関連箇所（600-603行）は helper cache と layer split が VRAM elastic 機能の適用外であることを記載しています。今回確認したソースは cache hit 時に helper cache から prompt staging buffer へ blob をコピーする実装を示しますが、この調査では性能測定や token 結果を検証していません。
 
 ## 根拠
 
-- 環境変数の判定、適用条件、起動ログ: `src/program/generate.cpp:6941-6957`
-- prefill source への設定: `src/program/generate.cpp:7284-7287`
-- wrapper の fallback / helper copy 方針: `include/strata/core/remote_experts.hpp:104-153`
-- helper VRAM から host への copy と fallback: `src/core/remote_experts.cpp:349-449`
-- 失敗時ログ: `src/core/remote_experts.cpp:451-455`, `src/prefill/prefill.cpp:517-519`
-- request ごとの利用量ログ: `src/program/generate.cpp:12539-12545`
-- helper GPU と prompt prefill の説明: `docs/SECOND_GPU.md:70-74`
+- 環境変数の判定、helper 列挙、適用条件、起動ログ: `src/program/generate.cpp:7244-7260`
+- helper source を prompt path に渡す箇所: `src/program/generate.cpp:7608-7612`
+- `generate` 経路では元の `srcp` を渡す箇所: `src/program/generate.cpp:13205-13211`
+- helper cache read stream の作成: `src/core/remote_experts.cpp:195-213`
+- VRAM cache から host へのコピー、同期、read lock: `src/core/remote_experts.cpp:349-379`
+- cache hit の識別、fallback、1回の警告: `src/core/remote_experts.cpp:381-455`
+- source wrapper の fallback semantics と transient/pinned 判定: `include/strata/core/remote_experts.hpp:104-163`
+- prompt stager の複数 blob 読取り呼出し: `src/prefill/prefill.cpp:534`
+- helper cache 関連の serve 構成: `docs/SECOND_GPU.md:72-74`
+- docs の関連機能制約: `docs/DETAILS.md:592-603`

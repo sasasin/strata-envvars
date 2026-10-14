@@ -1,44 +1,43 @@
 # `STRATA_NO_IQ512`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。調査開始時の作業ツリーは `main` で、`bench/results/2026-10-12-community-ai-pro-r9700-qwen3-8-flash-next-iq2-xs/` が未追跡だった。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-CPU native expert の gate/up 行計算で、AVX-512 IQ kernel を選ばないようにするための開発・実行時切替です。変数が設定されていると、AVX-512 対応 CPU でも AVX-512 kernel を選択せず、条件が合えば AVX2 kernel、そうでなければ ggml-cpu の `vec_dot` に進みます。down 行計算はこの変数を参照しません。
+ネイティブ expert の CPU gate/up 行で使う Strata の AVX-512 i-quant カーネルを選択対象から外します。AVX-512 対応 CPU では、対象形式に AVX2 カーネルもあり、`STRATA_NO_IQ256` が未設定なら、複数 token 用の計算は AVX2 カーネルへ切り替わります。AVX2 も無効なら ggml-cpu の `vec_dot` に進みます。
 
-この経路は native expert 対応ビルドで使われます。モデルの native expert を CPU pool で計算し、複数 token の gate/up 行を処理するときに `native_gu_rows()` へ到達します。
+この判定は `native_gu_rows()` にだけあり、native expert の gate/up 行に適用されます。down 行の dispatch と、canonical Q2_0 pack の専用 `q2_rows_any()` 経路はこの変数を参照しません。
 
 ## 値と判定
 
-値の内容は parse されず、`std::getenv("STRATA_NO_IQ512") != nullptr` かどうかだけを判定します。
+値の内容は parse せず、`std::getenv()` が `nullptr` かどうかだけを確認します。
 
-| 環境の状態 | AVX-512 kernel の選択 |
+| 環境変数の状態 | AVX-512 i-quant カーネル |
 |---|---|
-| 未設定 | CPU が AVX-512 対応なら選択候補になる |
-| 空文字を含む何らかの値を設定 | 選択しない |
+| 未設定 | CPU が AVX-512 対応なら選択可能 |
+| 空文字を含む、何らかの値を設定 | 選択対象外 |
 
-したがって `0` も `false` も抑止として扱われます。判定結果は `native_gu_rows()` 内の `static const bool` に初回呼び出し時に保存されます。以降にプロセス環境を変更しても再評価されません。
+`1`、`0`、`false` などの文字列の違いはありません。設定の有無だけが判定されます。AVX-512 非対応 CPU ではもともと同カーネルを選ばないため、この変数を設定しても dispatch は変わりません。
 
 ## 有効になる条件
 
-- CPU native expert 機能を含むビルドであること。CMake の `STRATA_NATIVE_EXPERTS` が有効な場合、AVX-512/AVX2 実装を含む CPU kernel 群が `strata_kernels_cpu` に追加されます。無効ビルドでは native pack の読み込み経路が拒否され、この関数の abort stub は到達しない設計です。
-- CPU が AVX-512 対応であること。非対応 CPU では `cpu_avx512_ok()` が false となり、この変数を設定しても選択は変わりません。
-- `native_gu_rows()` が扱う型であること。`iq512_supported()` は type ID `16, 17, 18, 21, 22` のみを AVX-512 kernel 対象とします。
-- AVX-512 を抑止した後に AVX2 kernel を使うには、CPU が AVX2 対応で、型が `iq256_supported()` の対象であり、token 数が `native_gu_mt_min()` の閾値以上である必要があります。AVX2 kernel 自体も `STRATA_NO_IQ256` の設定で無効化できます。
-- AVX2 に進めない場合、または対象型・token 数が条件を満たさない場合は ggml-cpu の `vec_dot` を token ごとに呼びます。AVX-512 対応 CPU 上では、IQ4_XS のように AVX2 kernel だけが実装されている型は、従来どおりこの経路に留まります。
+- native expert の CPU gate/up 行が `native_gu_rows()` に到達すること。ExpertPool の native レイヤー処理がこの関数を呼びます。
+- CPU が Strata の `cpu_avx512_ok()` 判定を通ること。AVX-512 の実行可否に加えて `STRATA_FORCE_AVX2` やビルドの ISA 上限も影響します。
+- `nt >= native_gu_mt_min()` であること。既定の閾値は2 token です。`STRATA_IQ_MT_MIN` などによって閾値が変わる経路があります。閾値未満ではこの i-quant AVX-512/AVX2 grouped dispatch に入らず、ggml-cpu の dot に進みます。
+- gate/up の型が該当カーネルでサポートされること。AVX-512 と AVX2 の両方が対応する型は `native_expert.cpp` の type ID 16、17、18、21、22 です。
+
+本変数が設定されて AVX-512 経路が無効になったとき、AVX2 経路は別変数 `STRATA_NO_IQ256` が未設定で、型が AVX2 対応である場合に限って使用されます。AVX2 も無効なら、その行は ggml-cpu の `vec_dot` で処理されます。AVX-512 CPU では AVX2 専用型 IQ4_XS は従来どおりこの multi-token AVX2 分岐の条件を満たさず、ggml-cpu に進みます。
 
 ## 実行時の詳細
 
-Prefill の CPU-share 経路は、CPU で処理する expert の入力を量子化し、expert pool に複数 token の job を渡します。pool の native gate/up phase（mode 5）は `native_gu_rows()` を呼び出します。そこで AVX-512 が有効なら対象型を `iq512_gu_rows()` で処理します。`STRATA_NO_IQ512` が設定されている場合はその分岐を飛ばし、次の AVX2 条件を調べてから ggml-cpu の dot へ fallback します。
+`native_gu_rows()` 内の `static const bool avx512` 初回評価時に環境変数を読み、結果をプロセス内で保持します。初回評価後にプロセス環境を書き換えても反映されません。未設定で AVX-512 対応なら AVX-512 実装を優先します。変数を設定すると、その優先経路を外し、AVX2 対応型では有効な AVX2 実装へ進みます。どちらも条件を満たさない場合は行ごと、token ごとに ggml-cpu の `vec_dot` を呼びます。
 
-この変数によるログ出力やエラー処理はありません。環境変数自体は計算値に渡されず、kernel 選択だけを変えます。実行時の精度や速度への影響はこの調査では測定していません。
+この変数専用のログ出力は確認できませんでした。`docs/DETAILS.md` に本変数の個別説明や測定値は見つかりませんでした。実装コメントは AVX-512 を外すと AVX2 カーネルへ進むことを説明していますが、切り替え時の性能や数値結果の同一性を示す測定条件は同資料にありません。
 
 ## 根拠
 
-- `src/kernels/cpu/native_expert.cpp:37-43`: AVX-512/AVX2 kernel の型判定。
-- `src/kernels/cpu/native_expert.cpp:134-149`: gate/up kernel の AVX-512 判定、環境変数読み取り、AVX2 の別条件。
-- `src/kernels/cpu/native_expert.cpp:167-195`: AVX-512 → AVX2 → ggml-cpu `vec_dot` の順の分岐と fallback。
-- `src/kernels/cpu/pool.cpp:629-652,761-773`: native pool phase から `native_gu_rows()` への呼び出し。
-- `src/prefill/prefill.cpp:3278-3324`: prefill CPU-share 経路で CPU expert jobs を準備する処理。
-- `CMakeLists.txt:1210-1218,1265-1270,1304-1305`: native expert 機能と CPU kernel 群のビルド条件。
-- `src/kernels/cpu/expert_layout.cpp:368-376`: native expert 無効ビルド時の stub と到達前提。
+- `src/kernels/cpu/native_expert.cpp:40-46` — AVX-512/AVX2 カーネルが対応する型。
+- `src/kernels/cpu/native_expert.cpp:124-140,143-190` — multi-token 閾値、環境変数の存在判定、AVX-512/AVX2/ggml-cpu の dispatch。
+- `src/kernels/cpu/native_expert.cpp:218-229` — fallback の ggml-cpu `vec_dot` 処理。
+- `src/kernels/cpu/pool.cpp:685-718` — ExpertPool の native gate/up 行から `native_gu_rows()` への呼び出し。Q2_0 gate/up は別の `q2_rows_any()` 分岐。
+- `src/kernels/cpu/expert_layout.cpp:41-45` — CPU の AVX-512 判定が ISA 上限と `STRATA_FORCE_AVX2` を考慮すること。

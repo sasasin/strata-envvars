@@ -1,59 +1,59 @@
 # `STRATA_MTP_STAGE0`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。Strata 所有ソースを対象とし、外部ライブラリの環境変数動作は扱わない。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。
 
 ## 役割
 
-複数 GPU の layer split で pipelined decode を使うとき、MTP drafter を最後の stage の GPU ではなく最初の stage の GPU に配置するかを決めます。既定の配置は最後の stage です。最初の stage に移すと、pipeline 中の drafter の処理を、window の処理が終わって空いている最初の GPU で行う構成になります。drafter の source rows と draft head の rows は別 GPU へコピーされます。
-
-この環境変数は GPU や stage を直接指定するものではなく、配置変更の有効・無効を選びます。配置変更の実体は `mtp_first` を使った drafter のロード先、session、head、K/V state、行バッファーの選択に反映されます（`src/program/generate.cpp:3649-3654,4621-4630,7918-7930`）。
+複数 GPU の layer split で `--pipeline-windows 2` が使われるとき、MTP drafter を最後の stage の GPU ではなく最初の stage の GPU に置くかを指定します。最後の GPU で decode window と draft chain が同じカードを使うのを避け、最初のカードが window を終えて空いている間に draft chain を走らせる配置です。これは MTP の配置を選ぶ変数であり、pipeline 自体を有効にする設定ではありません。
 
 ## 値と判定
 
-変数を読む箇所は一つです。条件を満たす経路に入った時点で `std::atoi()` を呼び、戻り値が 0 でなければ配置変更を有効にします（`src/program/generate.cpp:3649-3654`）。文字列全体の厳密な数値検証はありません。
+`src/program/generate.cpp` は `std::getenv("STRATA_MTP_STAGE0")` が返す文字列に `std::atoi` を適用し、結果が 0 でなければ最初の stage を選びます。文字列全体の妥当性検査はありません。
 
 | 値 | 判定 |
 |---|---|
-| 未設定 | backend の既定値を使う |
-| `0`、空文字、数字で始まらない文字列 | `atoi` の結果が 0 となり、配置変更しない |
-| `1`、`-1`、その他 `atoi` の結果が 0 以外の文字列 | 配置変更する |
+| 未設定 | backend と GPU による既定値を使う |
+| 空文字、数字に変換できない文字列（例 `true`） | `atoi` が 0 を返すため、最後の stage |
+| `0`、`00`、`0anything` | 0 と変換され、最後の stage |
+| `1`、`2`、`-1`、`1suffix` | 先頭の整数部分が 0 でないため、最初の stage |
+| ` 1`、`+1` | `atoi` が 1 と変換するため、最初の stage |
 
-`atoi` は先頭の空白と符号を許容し、数値として読める先頭部分を変換します。したがって ` 1tail` や `+1` も有効、`1tail` も有効、`tail1` は無効です。`-0` は無効です。空文字は未設定と異なり明示値ですが、変換結果は 0 です。設定値の読み取り結果は static cache されず、配置判定の lambda が実行される時に一度読みます。
+数値の後ろに続く文字は無視されます。整数に変換できない入力は 0 扱いです。整数範囲を超える入力について、呼び出し側に個別の範囲検査はありません。
 
-明示値は既定値を上書きしますが、後述する適用条件を省略するものではありません。たとえば `STRATA_MTP_STAGE0=1` でも pipeline が 2 window 未満なら配置変更しません。
+未設定時は CUDA build では OFF、HIP build では現在のデバイスが AMD gfx1200 または gfx1201 の場合に ON、それ以外は OFF です。HIP の既定値判定はデバイス名を取得できない場合も OFF になります。`STRATA_MTP_STAGE0` を設定すると、この既定値を上書きします。
 
 ## 有効になる条件
 
-実際の配置変更には、次の条件が必要です（`src/program/generate.cpp:3500-3506,3649-3654`）。
+値が非 0 でも、次のすべてを満たす場合にだけ最初の stage 配置が選択されます。
 
 - `--mtp` が指定され、`--spec` が 2 以上。
-- MTP drafter 用の subset vocabulary file がある。`--mtp-draft-vocab` 指定時はそのパス、未指定時は MTP ディレクトリー内の `draft_vocab.bin` を確認します。
-- `STRATA_MTP_FULL_HEAD` が先頭文字 `1` でない。先頭文字だけを比較し、該当する場合は `mtp_first_ok` 自体が false になります。
-- `--serve` で、layer split が 2 stage 以上（各 stage が別 GPU）、`--pipeline-windows` の有効値が 2 以上、`--batch` が 0。pipeline の適用チェックで `--peer-device` や helper cache が指定されていないことも必要です。3 stage 以上では `--adapt-async` も併用できません。
-- `STRATA_MTP_STAGE0` の変換結果が非 0、または未設定時の backend 既定値が on。
+- `STRATA_MTP_FULL_HEAD` が未設定、または設定値の先頭文字が `1` 以外。先頭文字が `1` なら `mtp_first_ok` が偽になり、この配置は使われません。
+- draft vocabulary ファイルが存在する。`--mtp-draft-vocab FILE` を指定した場合はそのファイル、指定しない場合は `<mtp>/draft_vocab.bin` が調べられます。ここではファイルの存在だけを確認し、内容の妥当性は後続の MTP load 処理が扱います。
+- `--pipeline-windows` の実効値が 2 以上で、layer split の後段 stage が存在する。
+- `--batch` が 0。
 
-未設定時の backend 既定値は、HIP build で現在の GPU が gfx1200 または gfx1201 の場合に on、それ以外は off です。HIP では `cudaGetDevice` / `cudaGetDeviceProperties` で現在 device を調べ、`gfx_arch_is_gfx12_wmma()` が gfx1200 / gfx1201 を判定します。HIP 以外の build では既定 off です（`src/program/generate.cpp:1630-1648`, `include/strata/kernels/gfx_arch.hpp:30`）。明示値があると既定値は使わないため、上の適用条件を満たせば他の GPU でも選択できます。
+`--pipeline-windows` は `--serve` でのみ使えます。自動設定の場合もありますが、`STRATA_MTP_STAGE0` 自体は pipeline の自動有効化判定ではなく、条件を満たして `mtp_first` を決める段階で読み取られます。たとえば `STRATA_MTP_STAGE0=1` だけでは pipeline は有効になりません。反対に、自動設定の二段 split で pipeline が有効になった後に `=0` を指定すれば、drafter は最後の stage に残ります。
 
-自動 pipeline 設定は別途 backend 条件を持ちます。`--pipeline-windows` を自動選択する HIP 経路では gfx12 以外で pipeline 自体が off になります。明示的に pipeline を要求する場合も `--serve`、stage ごとの GPU、helper cache・peer-device・batch 条件などの適否チェックで無効にされることがあります。この変数は pipeline の有効化そのものを行いません（`src/program/generate.cpp:3507-3525,3527-3545`）。
+SYCL 側の `sycl/src/program/generate.cpp` にはこの名前の読み取りがありません。この設定の実装対象は `src/program/generate.cpp` の CUDA/HIP 経路です。
 
 ## 実行時の詳細
 
-`mtp_first` は stage 構成後、MTP drafter のロードより前に決定されます。設定が有効なら MTP drafter のロード時に現在 GPU を最初の stage にし、最初の stage の session を使います。無効なら drafter を最後の stage の GPU / session に置きます（`src/program/generate.cpp:3644-3654,4621-4630`）。
+判定は generate の初期化中に `mtp_first` として一度行われます。HTTP リクエストごとには再評価されないため、稼働中にプロセス環境を変更しても配置は変わりません。
 
-この選択は後続の GPU memory planning にも渡され、最初または最後の stage の空き容量見積もりで drafter を置く側を考慮します（`src/program/generate.cpp:3823-3827`）。pipeline 準備時には drafter の行バッファーを配置先 GPU 上に確保し、verifier や snapshot で drafter の K/V state を最初／最後どちらの stage に関連付けるかも切り替えます（`src/program/generate.cpp:7918-7930,8242-8249,10998-11007,11072-11093`）。
+最初の stage を選んだ場合、MTP drafter は最初の GPU 上で load されます。draft vocabulary が使われ、主モデルの head が別 GPU にある場合は、主 head の token subset の行を head 側 GPU で gather し、その subset を drafter 側へ一度コピーします。pipeline の row buffer も drafter の GPU に確保されます。MTP の K/V state や snapshot の紐付けも最初の stage 側に切り替わります。`=0` または既定 OFF のときは従来どおり最後の GPU に置かれます。
 
-この変数そのものについて値のログ出力は確認できません。pipeline の自動有効化時には「`--pipeline-windows 2 is on by default ...`」という stderr ログがありますが、配置先を表示するログではありません（`src/program/generate.cpp:3523-3525`）。不適用時にこの変数固有の警告を出す処理も確認できません。
+この変数専用の有効・無効ログは見つかりませんでした。pipeline 自体が自動で有効になった場合は `--pipeline-windows 2 is on by default for a layer split of ... stages` が stderr に出ます。MTP head のロード時には token 数とサイズのログが出ますが、配置モードを示すものではありません。
 
 ## 文書との照合
 
-`docs/MULTI_GPU.md:257-264` は、pipelined decode で drafter を最初の GPU に移す設計、`STRATA_MTP_STAGE0=0` で従来配置を維持すること、および測定値を記載しています。資料の測定は R9700 の複数 GPU 構成での exact-flags A/B、5 組の比較で、2 / 3 / 4 GPU それぞれの decode tok/s と prompt / prose 結果が記されています。これらは文書に報告された特定環境の値であり、今回独自に測定したものではありません。ソースでは未設定時に HIP gfx1200 / gfx1201 のみ既定 on、明示値で切替可能という条件を確認できます。
+`docs/MULTI_GPU.md` は 0.1.44 の gfx12 測定を説明し、draft chain と最後の stage の競合を避ける配置、および `STRATA_MTP_STAGE0=0` による従来配置への切り戻しを記載しています。同文書の exact-flags A/B、5 組では、2 枚構成の code decode は 103→125 tok/s（+21%）、3 枚構成は code +19%、4 枚構成は code +22% でした。prompt の 4K はそれぞれ +8%、+12%、+15%、prose は同率、+2%、+4% と記載されています。これは文書にある R9700 構成の測定値であり、今回の調査で再測定したものではありません。
 
 ## 根拠
 
-- `src/program/generate.cpp:1630-1648` — HIP / CUDA での既定値と GPU architecture 判定。
-- `include/strata/kernels/gfx_arch.hpp:30` — gfx1200 / gfx1201 の判定。
-- `src/program/generate.cpp:3491-3525` — `mtp_first_ok`、subset vocab 条件、自動 pipeline window の条件。
-- `src/program/generate.cpp:3644-3654` — `STRATA_MTP_STAGE0` の値変換と優先順位。
-- `src/program/generate.cpp:3823-3827,4621-4630,7918-7930` — 配置先が memory planning、drafter load/session、行バッファーに与える影響。
-- `src/program/generate.cpp:8242-8249,10998-11007,11072-11093` — pipeline state の stage 選択。
-- `docs/MULTI_GPU.md:257-264` — 配置の説明と、条件付きで報告された測定。
+- `src/program/generate.cpp:1630-1648` — HIP の既定値判定と gfx12 対象（`include/strata/kernels/gfx_arch.hpp:30`）。
+- `src/program/generate.cpp:3498-3505` — MTP、spec、full-head 環境変数、draft vocabulary ファイルによる適用条件。
+- `src/program/generate.cpp:3644-3654` — stage 数、pipeline、batch 条件と `STRATA_MTP_STAGE0` の `atoi` 判定。
+- `src/program/generate.cpp:4621-4629, 5141-5146, 7924-7930` — drafter の device、load、VRAM 見積もり、pipeline row buffer の配置。
+- `src/core/mtp.cpp:690-735` — vocabulary subset の行を head 側から drafter 側 GPU にコピーする処理と失敗時エラー。
+- `src/program/generate.cpp:8242-8249, 10995-11009` — conversation checkpoint / snapshot で MTP K/V state を持つ stage の切り替え。
+- `docs/MULTI_GPU.md:257-264` — 配置の説明と記載測定値。

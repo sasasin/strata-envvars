@@ -1,40 +1,40 @@
 # `STRATA_IQ_GATHER`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-AVX-512 CPU 用の IQ expert gate/up カーネルで、IQ3_XXS と IQ3_S のコードブック値を scalar lookup で組み立てる代わりに AVX-512 gather 命令で読みます。IQ3_XXS は 8-bit の grid index、IQ3_S は `qh` 由来の上位 bit を加えた 9-bit index を使います。実装コメントは gather と scalar lookup が同じ grid 値・結果になるとしています。この変数は処理方式を選び、値の数値や文字列内容で処理を変えません。
+CPU の AVX-512 multi-token i-quant expert kernel で、IQ3_XXS と IQ3_S の codebook grid を読む方法を選びます。未設定なら scalar lookup の値を `_mm512_set_epi32` でまとめ、設定されていれば `_mm512_i32gather_epi32` を使います。どちらも同じ grid table の同じ要素を読む実装です。コード上、変わるのは grid の読み方で、他の形式や計算式はこの変数の対象ではありません。
 
 ## 値と判定
 
-`src/kernels/cpu/iq_avx512.cpp` の名前空間スコープにある `const bool gather` が `std::getenv("STRATA_IQ_GATHER") != nullptr` で初期化されます。文字列比較や数値変換はありません。
-
-| 環境変数の状態 | `gather` | 動作 |
+| 環境変数の状態 | `gather` の値 | grid lookup |
 |---|---:|---|
-| unset | `false` | scalar lookup |
-| 設定あり（空文字を含む） | `true` | AVX-512 gather |
+| 未設定 | `false` | scalar lookup を `_mm512_set_epi32` で組み立てる |
+| 空文字を含む、何らかの値が設定済み | `true` | `_mm512_i32gather_epi32` を使う |
 
-したがって `STRATA_IQ_GATHER=0`、`false`、`1` はいずれも gather を選びます。大文字小文字、空白、文字列全体の妥当性は検査されません。初期化時に一度値が保存されるため、初期化後の環境変更はこの判定に反映されません。
+実装は `std::getenv("STRATA_IQ_GATHER") != nullptr` だけを判定します。数値・文字列の parse や値の比較はありません。そのため `0`、`false`、空文字も有効化し、`1` 以外の値も同じ扱いです。変数は `iq_avx512.cpp` の名前空間スコープの `const bool` として初期化されるため、実行中に環境を変更しても再評価されません。
 
 ## 有効になる条件
 
-変数が設定されていても、実際の gather 命令に到達するには、Strata の native CPU expert 経路が使われ、CPU が AVX-512 kernel を実行でき、gate/up の型が IQ3_XXS（ggml type 18）または IQ3_S（type 21）で、token 数が `STRATA_IQ_MT_MIN` から得た閾値以上である必要があります。`STRATA_IQ_MT_MIN` 未設定時の閾値は 2 です。AVX-512 kernel は CPU 機能判定を通った場合に限って dispatch されます。
+- AVX-512 用の CPU kernel がビルドに含まれていること。CMake は `iq_avx512.cpp` を CPU kernel target に加え、AVX-512 命令を有効にしてコンパイルします。
+- 実行 CPU が `cpu_avx512_ok()` を満たし、`STRATA_NO_IQ512` が設定されていないこと。`STRATA_FORCE_AVX2` で AVX-512 を無効にする場合も、この kernel には入りません。
+- gate/up の native expert dispatch が対象 IQ 形式を選び、token group 数が `STRATA_IQ_MT_MIN` による multi-token 下限以上であること。下限は通常2で、`STRATA_IQ_MT_MIN` が設定されると `atoi` の結果で変わります。
+- 実際に lookup を切り替える形式は IQ3_XXS と IQ3_S（kernel 内の type 18 と 21）です。AVX-512 kernel が扱う IQ2_XXS、IQ2_XS、IQ2_S ではこの変数による gather 分岐はありません。
 
-`STRATA_NO_IQ512` が設定されて AVX-512 kernel が選ばれない場合、AVX2 kernel または ggml-cpu の経路になります。AVX2 kernel の gather 判定に使うのは別変数 `STRATA_IQ256_GATHER` であり、`STRATA_IQ_GATHER` はその経路を制御しません。IQ2_XXS、IQ2_XS、IQ2_S の decode にもこの変数の分岐はありません。
+AVX-512 非対応 CPU で AVX2 kernel に進む場合、その経路の lookup は別の `STRATA_IQ256_GATHER` によって判定されます。`STRATA_IQ_GATHER` は AVX2 経路を切り替えません。AVX-512 対応 CPU で `STRATA_NO_IQ512` により AVX-512 kernel を無効にした場合は、この dispatch では AVX2 に降格せず ggml-cpu の dot product に進みます。
 
 ## 実行時の詳細
 
-Strata の CPU pool が native expert の gate/up 行を計算すると `native_gu_rows()` に入り、対応型・token 数・CPU 機能と `STRATA_NO_IQ512` の状態に応じて `iq512_gu_rows()` を呼びます。IQ3_XXS では `Fmt<18>::decode()`、IQ3_S では `Fmt<21>::decode()` が `gather` を参照し、設定時は `_mm512_i32gather_epi32` で grid を読みます。未設定時は同じ index から scalar で grid を読んで vector を組み立てます。他の IQ format はこの bool を参照しません。
+native expert の gate/up 行処理は、形式と CPU 機能を確認して AVX-512 kernel を呼びます。各 IQ3_XXS/IQ3_S block の decode で `gather` が真なら、読み込んだ byte index（IQ3_S では上位 bit も加えた index）を使って grid を gather します。偽なら同じ index の各 table 要素を個別に参照し、vector に詰めます。その後の sign mask、scale、整数 dot、SwiGLU 計算は同じ処理です。コードコメントは両経路で同じ値を得る設計としています。
 
-この選択について専用のログ、警告、エラー出力は実装にありません。カーネルのコメントは Ryzen 5 7600（Zen 4）で gather が scalar lookup より 3–5% 遅かったとして opt-in にしています。この記述はソースコメントにある測定メモで、条件や測定手順を含む `docs/DETAILS.md` の性能説明は確認できませんでした。結果を他 CPU に一般化できる根拠はありません。
+`docs/DETAILS.md` にこの変数の説明や測定条件は見つかりませんでした。実装コメントには Ryzen 5 7600 で gather が scalar lookup より3–5%遅かったとの記述がありますが、同じ箇所に測定方法などの詳細はなく、他 CPU での性能を示す根拠にはできません。
 
 ## 根拠
 
-- `src/kernels/cpu/iq_avx512.cpp:31-39` — gather と prefetch の環境変数判定、初期値。
-- `src/kernels/cpu/iq_avx512.cpp:108-118,130-147` — IQ3_XXS / IQ3_S の gather と scalar lookup。
-- `src/kernels/cpu/iq_avx512.cpp:245-255` — AVX-512 gate/up 関数が対応する型。
-- `src/kernels/cpu/native_expert.cpp:37-43,134-180` — 対応型、CPU/設定/token 数による native kernel の dispatch。
-- `src/kernels/cpu/pool.cpp:629-652` — CPU pool の gate/up 行から `native_gu_rows()` を呼ぶ箇所。
-- `CMakeLists.txt:1265-1285` — AVX-512 kernel の CPU kernel library への組み込みと ISA compile option。
-- `docs/DETAILS.md` — `STRATA_IQ_GATHER` の直接説明はありません。`bench/results/2026-10-09-community-rtx-5080-w7-2475x-ud-iq4xs-786k/README.md:48-65` には値 `1` を含む実行設定がありますが、同ファイルは `STRATA_IQ_*` をまとめて CPU pool switches として記すだけで、この変数単体の効果は切り分けていません。
+- `src/kernels/cpu/iq_avx512.cpp:31-39`: 環境変数の有無判定、初期化時期、および隣接する prefetch 変数との区別。
+- `src/kernels/cpu/iq_avx512.cpp:108-128,130-153`: IQ3_XXS/IQ3_S の gather と scalar lookup の分岐、他形式には同分岐がないこと。
+- `src/kernels/cpu/native_expert.cpp:40-46,124-140,143-193`: AVX-512 対応形式、multi-token の下限、CPU 機能・無効化環境変数を含む gate/up dispatch。
+- `src/kernels/cpu/expert_layout.cpp:41-65`: AVX-512 実行可否の CPU/OS 機能確認。`src/kernels/cpu/expert_layout.cpp:35-36,41-44` は `STRATA_FORCE_ISA` / `STRATA_FORCE_AVX2` の上限判定。
+- `CMakeLists.txt:1317-1342`: CPU kernel target への登録と AVX-512 compile option。
+- `docs/DETAILS.md:97-112`: `STRATA_IQ_MT_MIN` など関連する IQ multi-token 動作の説明。`STRATA_IQ_GATHER` 自体の説明はなし。

@@ -1,62 +1,44 @@
 # `STRATA_IQ_MT_MIN`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数の意味は対象外。
+調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。
 
 ## 役割
 
-CPU 上で native expert の複数 token 用 IQ カーネルを使い始める最小 token 数を決めます。主な対象は gate/up 行の IQ multi-token kernels で、IQ4_NL の down 行にも同じ閾値があります。既定値 `2` では token が1個のとき ggml-cpu の dot 経路に残り、`1` 以下なら対応する Strata multi-token kernel を1 token から選べます。
-
-この切り替えは CPU 側の演算経路を変えます。IQ の単一 token と複数 token の計算で丸めが異なるため、verify window の draft 数など、同じ expert を共有する token 数が違うと greedy 出力が変わり得ます。`1` にすると対応 kernel の計算を1 token から揃え、draft 数による差を避ける意図です。通常の model/backend 全体の設定ではなく、native expert が CPU で実行される場合の kernel 選択用です。
+ネイティブ形式の CPU expert 計算で、gate/up（および IQ4_NL down）の複数 token カーネルへ切り替える最小 token 数を指定する。既定値 `2` では、token が1個のとき ggml-cpu の dot product、2個以上のとき対応する Strata の multi-token カーネルを使う。この二つの計算経路は丸めが異なることがあり、verify window 内で同じ expert を使う token 数により greedy 出力が変わり得る。`1` にすると対象カーネルを1 tokenから使い、drafting による token 数の違いから生じる差を避ける設定となる（`docs/DETAILS.md` の説明を参照）。
 
 ## 値と判定
 
-値は文字列比較ではなく `std::atoi` で整数へ変換されます。値の全体を検証せず、整数変換の後ろに続く文字列も無視します。unset のときは `2` です。空文字や先頭が数値でない文字列は `atoi` の結果 `0` になり、負数も clamp されません。
+| 環境変数の状態・値 | 判定される最小 token 数 |
+| --- | ---: |
+| 未設定 | `2` |
+| 設定あり（空文字を含む） | `std::atoi` の結果 |
+| 例: `1` / `2` | `1` / `2` |
+| 例: `abc`、空文字 | `0` |
+| 例: `2tail` | `2`（数値として読める先頭部分） |
 
-| 環境値 | 判定結果 | 対応する kernel 選択への影響 |
-|---|---:|---|
-| unset | 既定値 `2` | token 数 `nt >= 2` で multi-token kernel 候補になる |
-| `1`, `1abc` | `1` | `nt >= 1` で候補になる |
-| `0`, 空文字, `abc` | `0` | 正の `nt` すべてで候補になる |
-| `-2` | `-2` | 正の `nt` すべてで候補になる |
-| `3`, `3tail` | `3` | `nt >= 3` で候補になる |
-| 空白または数値で始まる値 | `atoi` の変換規則に従う | 変換された整数と `nt` を比較する |
-
-`atoi` の変換失敗と空文字はどちらも `0` になります。大文字小文字の判定はありません。正の閾値の上限・下限チェックや clamp はありません。
+文字列全体の検証、範囲制限、負値の拒否はない。各経路は `nt >= mt_min` を判定するため、0または負値なら通常の正の `nt` に対して条件を満たす。値は設定有無ではなく `atoi` の整数値として扱う。
 
 ## 有効になる条件
 
-この値は、Strata が native expert 対応 (`STRATA_NATIVE_EXPERTS`) 付きでビルドされ、モデルの native expert を CPU pool が実行するときに関係します。native expert 機能を含めないビルドでは、本番の `native_expert.cpp` は選択経路に入りません。通常の GPU expert kernel、FP16 等の非 native expert 経路にはこの閾値は適用されません。
-
-`native_gu_rows()` では、閾値に加えて token 数、format 対応、CPU ISA の条件を満たす必要があります。
-
-- AVX-512 対応形式なら、AVX-512 が利用可能で `STRATA_NO_IQ512` が unset の場合に AVX-512 kernel が候補です。
-- AVX2 対応形式なら、AVX-512 CPU ではなく、AVX2 が利用可能で `STRATA_NO_IQ256` が unset の場合に AVX2 kernel が候補です。
-- AVX1 用の対応形式では、AVX2 がなく AVX1 が利用可能で `STRATA_NO_IQ128` が unset の場合に AVX1 kernel が候補です。この gate/up 経路にも `nt >= mt_min` が掛かります。
-- いずれの条件も満たさなければ ggml-cpu の `vec_dot` へ fallback します。非対応形式もここへ進みます。
-
-`native_down_rows()` でこの閾値が直接使われるのは IQ4_NL の AVX2 multi-token down kernelです。AVX2 対応、`nt >= mt_min`、かつ `STRATA_NO_IQ4NL` が unset の場合に選ばれます。Q5_1/Q8_0 の down kernel は別の `STRATA_KQ256` 条件と `nt >= 2` で選択され、AVX2 用 Q2_0 down kernel (`q2_native_kernels`) も専用経路を通るため、この変数の閾値では制御されません。AVX1 down kernel の分岐にも `mt_min` 条件はありません。
+- Strata が `STRATA_NATIVE_EXPERTS` を有効にしてビルドされ、ネイティブ expert pack を読み込んで CPU native expert の処理に入ること。CMake の既定は ON。無効ビルドでは native expert 機能自体が利用できず、この変数による切替も起きない。
+- gate/up は `native_gu_rows` が処理する形式のうち、CPU ISA と対応形式に合う専用 multi-token kernel がある場合だけ切り替わる。AVX-512 が使える場合は対象の AVX-512 kernel、AVX-512 がない場合は対応する AVX2 kernel、さらに AVX2 がない場合は対応する AVX1 kernel が個別に選ばれる。`STRATA_NO_IQ512`、`STRATA_NO_IQ256`、`STRATA_NO_IQ128` などの無効化条件、未対応形式、CPU ISA 不足では ggml-cpu の dot product にフォールバックする。
+- `q2_native_kernels` 対象の Q2_0 gate/up/down は pool 側で別の Q2 経路を通るため、この変数の native GU/down 閾値判定の対象ではない。
+- down 側でこの閾値を使うのは IQ4_NL (`d_type == 20`) の AVX2 multi-token kernel。`STRATA_NO_IQ4NL` が設定されている場合、または AVX2 が利用できない場合は ggml-cpu の dot product に進む。Q5_1/Q8_0 の `STRATA_KQ256` 経路など、別条件で選ばれる down kernelの判定はこの閾値を使わない。
+- `STRATA_IQ3S_MT1` は、`STRATA_IQ_MT_MIN` が未設定のときに限り、条件を満たす IQ3_S gate/up を1 tokenから AVX2 multi-token kernelへ切り替える別の opt-in。`STRATA_IQ_MT_MIN` が空文字を含め設定されていれば、この IQ3_S 特例は適用されず、本変数の `atoi` 結果が使われる。
 
 ## 実行時の詳細
 
-本番での読み取り箇所は `src/kernels/cpu/native_expert.cpp` にあります。`native_gu_mt_min()` は `STRATA_IQ_MT_MIN` のポインターと `atoi` 結果を function-local `static` に保持し、gate/up の kernel 選択で使います。`native_down_rows()` は別の function-local `static` で同じ名前を読み、IQ4_NL down kernel に使います。どちらも各関数で最初に評価された結果をプロセス内で再利用します。したがって、読み取り後に環境を変更しても、その選択値は再評価されません。2箇所は初回評価が独立しています。
+gate/up 側は `native_gu_mt_min` の初回呼び出し時に環境変数を読み、関数内 `static` に parse 結果を保持する。さらに `STRATA_IQ3S_MT1` の特例条件も同関数の static 値として初回評価される。down 側は `native_down_rows` 内で別個の static 値として読み取る。そのため実行中に環境を変更しても、各経路が初期化された後は反映されない。二つの経路は初回評価時点が別々である。
 
-`STRATA_IQ_MT_MIN` が unset の場合に限り、`STRATA_IQ3S_MT1` が設定され、AVX2 はあるが AVX-512 はなく、IQ256 gather 条件も満たす CPU では、IQ3_S の gate/up 閾値を `1` にする別の opt-in 分岐があります。`STRATA_IQ_MT_MIN` を明示すると、この IQ3_S 上書き分岐は使われません。これは設定値の内容ではなく、`getenv(...) != nullptr` という設定有無で判定されます。
+native pack の expert pool は gate/up 行の処理から `native_gu_rows` を呼び、通常の native down 行では `native_down_rows` を呼ぶ。閾値を下げるほど、複数 token 時だけでなく1 token時にも対象カーネルを選びやすくなる。閾値が2の既定経路では単独 token と複数 token の丸め差が起き得るため、同一入力での greedy 出力再現性や batch/solo の照合を優先するときに `1` が使われる。測定結果を一般化できる根拠は本調査では確認していない。
 
-この環境変数自体について、本番コードはログや警告を出しません。コード上の効果は CPU native expert の kernel 分岐です。`tools/batch_test.py` は `--mt-min` 引数を engine 用環境辞書へ渡し、既定の引数値は文字列 `1`、空文字ならその変数を辞書に追加しません。ただしこれは同梱比較ツールの挙動であり、engine 本体の既定値は未設定時の `2` です。
-
-診断実行ファイル `native_expert_parity` は、起動時にこの変数が未設定なら自身のプロセス内で `1` を設定してから parity を調べます。設定済みの値は変更しません（`src/kernels/native_expert_parity.cpp:528-544`）。`iq_avx2_parity` は現在値を出力します（`src/kernels/cpu/iq_avx2_parity.cpp:528-545`）。これらは診断実行ファイル固有の挙動で、engine 本体の既定値を変えるものではありません。
-
-## 文書との照合
-
-`docs/DETAILS.md` は、既定の `2` では一 token と複数 token で CPU の IQ expert rows の丸めが異なり得ること、`STRATA_IQ_MT_MIN=1` で対応する multi-token kernel を全 group に使うことを説明しています。同資料の測定記載は Ryzen 7600（AVX-512）の IQ3_S decode で `-1..-3%`、その他の対象モデルは同じとしています。これはその記載条件の測定値であり、他 CPU・モデルや設定での性能はこの調査では確認していません。実装条件は上記の通り format・ISA ごとに制限され、「すべてのCPU演算に一律適用」されるものではありません。
+この変数自身によるログ出力、警告、エラー処理はない。
 
 ## 根拠
 
-- `CMakeLists.txt:1210-1218,1267-1305` — native expert build option と CPU kernel source の登録。
-- `src/kernels/cpu/native_expert.cpp:115-132` — gate/up の閾値、既定値、IQ3_S の unset 時 override。
-- `src/kernels/cpu/native_expert.cpp:134-197` — gate/up の token 閾値、ISA・format 判定、ggml-cpu fallback。
-- `src/kernels/cpu/native_expert.cpp:199-231` — down 行の独立した閾値読み取りと、IQ4_NL、KQ、AVX1、ggml-cpu 各経路。
-- `src/kernels/cpu/pool.cpp:629-663` — CPU pool から native gate/up/down row kernel を呼ぶ箇所と Q2_0 専用分岐。
-- `tools/batch_test.py:81-98` — 比較ツールの `--mt-min` と engine 用環境辞書。
-- `src/kernels/native_expert_parity.cpp:528-544`, `src/kernels/cpu/iq_avx2_parity.cpp:528-545` — parity 診断実行ファイルによる既定値設定と値の表示。
-- `docs/DETAILS.md:97-108` — 目的、設定上の説明、測定値および再現性条件に関する記載。
+- `src/kernels/cpu/native_expert.cpp:124-141` — gate/up の未設定既定値、`atoi`、static 保持、IQ3_S 特例。
+- `src/kernels/cpu/native_expert.cpp:143-193` — gate/up の閾値比較、ISA/形式と無効化環境変数によるカーネル選択および fallback。
+- `src/kernels/cpu/native_expert.cpp:233-255` — down 側の独立した `atoi`/既定値、IQ4_NL と AVX2 条件。
+- `src/kernels/cpu/pool.cpp:684-719` — native expert pool から各処理関数への呼び出し、および Q2_0 経路の分岐。
+- `CMakeLists.txt:107,1317-1361`、`src/kernels/cpu/expert_layout.cpp:376-402` — native expert 機能のビルド条件と無効時の扱い。
+- `docs/DETAILS.md:97-109` — 既定時の丸め差、`STRATA_IQ_MT_MIN=1` の目的、関連条件についてのプロジェクト文書。
