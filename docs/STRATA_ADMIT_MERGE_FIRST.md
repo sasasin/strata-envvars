@@ -1,60 +1,60 @@
 # `STRATA_ADMIT_MERGE_FIRST`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-`strata serve --batch` の新規スロットへの admission（`BGEN` / `BGENI`）で、プロンプト末尾の複数 token と最初の生成 token を、条件がそろう場合に同じ verify window で処理します。通常はプロンプト末尾の token までを prompt window で読み、その後に最後の prompt token から最初の生成 token を出す window を実行します。この変数が有効で適用条件を満たすと、末尾の prompt token を含む最大 `max_t` 個の token を最初の window にまとめます。
+サーバーのバッチ入場（`BGEN` / `BGENI`）で、最後の prompt 部分の末尾と、その入場で生成する最初の token を一つの verify window にまとめる opt-in です。通常は prompt の最後の token までを読み終えた後に、最初の生成 window を別に実行します。まとめると window の処理を一度に行えます。
+
+対象は `src/program/generate.cpp` のサーバー要求処理です。コメントでは、各 row が通常の window と同じ計算を行い、最後の prompt row の次の row が最初の生成位置、その履歴と Philox draw を使うため token と状態を保つ設計とされています。実装ではまとめた window の prompt row を通常の prompt window と同様に commit し、最終 row の出力だけを生成 token として扱います。これはコード上の設計説明であり、本調査では実行比較をしていません。
 
 ## 値と判定
 
-| 環境変数 | 判定 |
+判定結果は関数内の `static const bool` に保存されます。値全体の parse や数値変換はなく、`getenv()` が非 null で、先頭文字が `'0'` でなければ有効です。
+
+| 環境値 | 判定 |
 |---|---|
-| 未設定 | 無効 |
-| 空文字 | 有効 |
-| 先頭文字が `0` | 無効（例: `0`, `0abc`） |
-| それ以外 | 有効（例: `1`, `true`, `false`, `2`） |
+| unset | 無効（既定） |
+| 空文字 | 有効（設定済みで先頭文字は `\0`） |
+| `0`, `0anything` | 無効 |
+| `1`, `true`, `false`, `2`, `anything` | 有効（先頭文字が `0` 以外） |
 
-値全体の parse、数値変換、大文字小文字の判定はありません。判定関数の関数内 `static const bool` に結果を保存するため、プロセス中の最初の呼び出しで読み取られ、その後の環境変更は再評価されません。`STRATA_LOGPOS` は別の環境変数で、値ではなく設定有無がこの最適化の gate になります。
+大文字小文字、空白、残りの文字列は検査しません。読み取りはプロセス起動時ではなく、`admit_merge_first_env()` の初回呼び出し時です。初回評価後にプロセス環境を変更しても反映されません。通常の `GEN` も含む window 対象部分で helper が呼ばれうるため、最初の評価がバッチ入場そのものとは限りません。
 
-根拠: `src/program/generate.cpp:179-190,13368-13374`。
+根拠: `src/program/generate.cpp:186-197,13926`。
 
 ## 有効になる条件
 
-値判定が有効でも、次の条件をすべて満たす windowed prompt の最終 segment に限って適用されます。
+値が有効でも、次をすべて満たす場合に限り merge します。
 
-- `BGEN` / `BGENI` でバッチ slot への admission 中である。
-- その admission の `max_new` が `1` で、`--batch-mtp` と `--pipeline-windows` の経路ではない。
-- 処理対象が prompt の最後の cut (`to == n - 1`) で、turn/root/message checkpoint や pin の境界ではない。
-- 画像入力、KV growth、peer/remote cache・remote option、filesystem swap がない。
-- `STRATA_LOGPOS` が未設定である（空文字でも設定済みとして無効化）。
-- host residency table があり、pending swap がなく、table に負値の slot がない。
-- 全 stage の verifier で `ar_live()` が true である。これは expert が全て VRAM にあり、zero-doorbell graph を使える状態かを host table と照合する gate。
-- 全 stage の `max_t()` の最小値が少なくとも 2 である。
+- 対象要求がバッチ入場である（`admit_slot >= 0`）。
+- 要求の `max_new` が 1 で、batch MTP と pipeline windows を使っていない。
+- 最後の prompt part が verify windows を通る。`windows_ok()` は `--short-read` 相当の `req_short_read` を超える長さの part を拒否し、embedding row がある part も拒否する。要求ごとの `STRATA_PIPELINE_SWITCH` が `short_read=` を設定する場合はその値が使われる。
+- 最後の part の終端が prompt 終端であり、turn/root/message/pin checkpoint 境界と重ならない。
+- 画像入力、KV growth (`kvg.on`)、peer device、remote cache / remote expert、filesystem swap がない。
+- `STRATA_LOGPOS` が unset。
+- `host_res` が空でなく、pending work がなく、resident table に負値の expert entry がない。
+- 全 stage の verifier で `ar_live()` が true である。これは refresh 後に `all_resident_ && !ar_off_` であることを表し、各 stage の全 expert が resident で、all-resident 経路が off でないことを要求する。
+- 最小 stage `max_t` が 2 以上。
 
-条件に合わない場合は `merge_from()` が `-1` を返し、従来どおり最後の prompt token を単独で処理する最初の window に進みます。したがって環境変数を有効にするだけでは、全 prompt や単独 generate の経路でこの処理は有効になりません。
+いずれかを満たさないと `merge_at` は `-1` のままで、従来どおり prompt の読み取りと最初の生成 window を分けます。値が有効でも feature 全体を無条件に有効化するわけではありません。
 
-根拠: `src/program/generate.cpp:13362-13404`; `include/strata/core/verify.hpp:179-181,461`。
+根拠: `src/program/generate.cpp:12917-12923,13888-13908`; `include/strata/core/verify.hpp:179-181,459-462`。
 
 ## 実行時の詳細
 
-`BGEN` / `BGENI` を受け取ると serve loop は `admit_slot` を設定して、通常の `GEN 1` / `GENI 1` 処理へ変換します。prompt を区切る最終 segment が windowed (`windows_ok`) なら、refill 後に `merge_from()` が gate を評価します。成功時は `merge_at = max(a0, n - mt)` となり、prompt のそれ以前の範囲を通常どおり読み、末尾 `[merge_at, n)` は prompt-read loop から残します。
+最後の part が window 対象のとき `merge_from()` が条件を確認し、`merge_at = max(a0, n - mt)` を返します。ここで `mt` は `kVerifyMaxT` と各 stage の `max_t()` の最小値です。prompt 読み取り側は `merge_at` より前までを処理し、`merge_at` 以降の最後の最大 `mt` 個の prompt token を残します。trace が有効な場合、実際に merge したとき stderr に `strata trace: the first window takes the last %lld prompt tokens` を出します。
 
-prompt-read loop は通常、verify window で各 prompt token を commit し、head sampling を無効にして予測を捨てます。続く最初の decode window は `merge_T = n - merge_at` を行数に設定し、prompt の token を入力に使います。実装コメントでは、最後の prompt token と最初の生成 token を同じ window に置き、各 row の計算結果と Philox draw を通常の window と一致させる意図が記されています。ここで `max_new == 1` が gate に含まれるため、この admission で同じ window に複数の生成 token をまとめる設定ではありません。
+最初の decode loop は `merge_T = n - merge_at` を window 長に使い、prompt の末尾 token 群を window に入れます。merged window は prompt row を commit し、最終 row の出力のみを最初の生成 token として出力します。まとめた prompt rows は decode draft の件数に含めません。`STRATA_TRACE` の admission trace による処理時間の計測もありますが、環境変数による性能向上を示す測定値は参照したコード・`docs/BATCHING.md` にありません。
 
-通常の `STRATA_TRACE` が有効なら、成功時に stderr へ `strata trace: the first window takes the last %lld prompt tokens`（`%lld` は実際の token 数）が出ます。prompt window read のエラー処理や `PP` / `REUSED` 出力は通常経路を通ります。
-
-根拠: `src/program/generate.cpp:11305-11347,12517-12528,12531-12566,13362-13424,13479-13490,14204-14243`。
-
-## 文書との照合
-
-`docs/BATCHING.md:110-120` は opt-in switch として、admission が最後の prompt token 群と最初の token を一つの window で読むこと、および全 expert が resident の場合に限ることを記載しています。実装ではさらに上記の admission、最大生成数、checkpoint、backend/resource 状態などの gate が確認できます。測定値や性能向上はこの文書では主張しません。
+根拠: `src/program/generate.cpp:13926-13939,14008-14016,14724-14731,14978-15014`。関連する短い説明: `docs/BATCHING.md:110-121`。
 
 ## 根拠
 
-- `src/program/generate.cpp:179-190`: 値の判定と一度だけの読み取り。
-- `src/program/generate.cpp:11305-11347`: `BGEN` / `BGENI` の admission 識別。
-- `src/program/generate.cpp:13362-13404`: merge の条件、window 上限、prompt 読み取り位置。
-- `src/program/generate.cpp:12517-12566,13479-13490,14204-14243`: prompt windows と最初の merged window の処理。
-- `include/strata/core/verify.hpp:179-181,461`: residency gate。
-- `docs/BATCHING.md:110-120`: 関連する機能説明。
+- 値の読み取りと変換: `src/program/generate.cpp:186-197`。
+- window eligibility: `src/program/generate.cpp:12917-12923`。
+- merge 条件と位置計算: `src/program/generate.cpp:13888-13908`。
+- prompt read / trace: `src/program/generate.cpp:13910-13939`。
+- merged window の生成 loop と出力: `src/program/generate.cpp:14008-14016,14724-14731,14978-15014`。
+- all-resident gate: `include/strata/core/verify.hpp:179-181,459-462`。
+- 設計資料との照合: `docs/BATCHING.md:110-121` は opt-in で「admission reads its last prompt tokens and its first token in one window (all experts resident only)」と記載しており、上記の実装条件と整合します。

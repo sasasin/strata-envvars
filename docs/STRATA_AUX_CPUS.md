@@ -1,50 +1,54 @@
 # `STRATA_AUX_CPUS`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数の動作は対象外。
+調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
 
 ## 役割
 
-`strata generate` の起動時に、CPU pool の worker と host thread 以外の Strata プロセス内スレッドをどの CPU に配置するかを指定します。値の形式は `--aux-cpus` と共通です。Linux では補助 CPU 集合を作り、既存スレッドを移動し、後から作る対象スレッドもその集合へ pin します。これはスレッド配置だけを変更します。
+`strata generate` の補助スレッドをどのCPUに置くかを指定します。対象はCPUプールのworkerでもhost threadでもないエンジンスレッドです。たとえばadaptive tier、prefill helper、ファイル読み込みworker、PLE readerなど、生成コードが `pin_current_thread()` を呼ぶスレッドが含まれます。Linuxではこれらのスレッドを、workerとhostのCPUを避けて選んだCPU集合へ移します。スレッド配置だけを変え、生成結果は変えない設計です。
+
+この名前を環境から読む実装は `src/program/generate.cpp` の起動処理1箇所です。Qwen3.6用の別engineにはこの配置処理は適用されません（`docs/DETAILS.md` の説明も参照）。
 
 ## 値と判定
 
-環境変数の文字列全体を `parse_spec()` に渡します。空白除去、大文字小文字変換、部分一致はしません。
+値は真偽値や数値ではなく、`off`、`auto`、またはCPU番号のリストとして完全一致で判定されます。大文字小文字や前後の空白は正規化されません。
 
-| 値 | 起動時の設定 |
+| 値 | 判定と起動時の動作 |
 |---|---|
-| unset | 空文字相当。起動時 OFF |
-| 空文字 | OFF |
-| `off` | OFF。小文字の完全一致 |
-| `auto` | ON。小文字の完全一致 |
-| CPU リスト（例 `24,26`、`24-27`） | ON。数字、カンマ区切り、昇順の範囲を受け付ける |
-| その他 | 不正値として起動エラー |
+| 環境変数未設定 | CLI指定もなければ空文字扱いとなり、起動時は無効。Linuxでは配置計画自体は作り、serveリクエストから後で有効にできる。 |
+| 空文字 | `off` と同じ。 |
+| `off` | 起動時は無効。 |
+| `auto` | 起動時に有効。Linuxではhostの物理コアのSMT siblingを先に選び、続いてworkerが使っていない物理コアのCPUを選ぶ。 |
+| CPUリスト（例: `24,26`、`24-27`） | 起動時に有効。Linuxでは指定リストからhost CPU、pool workerのCPU、プロセスが使用できないCPUを除いた集合を使う。 |
+| その他 | 不正値。`--aux-cpus takes off, auto or a CPU list such as 24,26 or 24-27 (got '…')` を標準エラーに出し、起動処理は終了コード2で失敗する。 |
 
-CPU リストは空でない要素からなり、各要素は非負の10進数字または `lo-hi` 形式です。負号、逆順範囲、空要素、文字、区切り以外の文字を含むと失敗します。各数字は最大 `100000` まで許され、範囲は両端を含みます。先頭ゼロは数字として受理されます。重複はソート後に除去されます。空白を含む値（例 `auto `）は受理されません。
+リストは10進の非負整数と昇順範囲をカンマでつなぎます。空要素、負数、文字、逆順範囲、空リストは拒否されます。重複は除去され、結果は昇順です。各数値が100000を超える入力も拒否されます。たとえば `1,3-5` は有効ですが、`1, 3`、`3-1`、`1,` は無効です。
 
-不正値の場合、起動処理は stderr に `strata generate: STRATA_AUX_CPUS: --aux-cpus takes off, auto or a CPU list such as 24,26 or 24-27 (got '...')` の形式で出して終了コード 2 を返します。値の妥当性確認と範囲の制限は `include/strata/platform/aux_cpus.hpp:49-80,129-148`、エラー出力は `src/program/generate.cpp:2202-2210` にあります。
+起動時の優先順位は `--aux-cpus` の非空値、次に `STRATA_AUX_CPUS`、最後に空文字（無効）です。CLI値は引数解析時にも検証されます。CLI値が `off` なら環境変数を上書きします。一方、CLIに明示的な空文字を渡した場合は、後続の選択処理が空文字を「未指定」と同様に扱うため、設定されていれば環境変数の値が使われます。
 
 ## 有効になる条件
 
-- **CLI 優先:** `--aux-cpus` に空でない値が渡された場合、その値が環境変数より優先されます。たとえば `--aux-cpus off` は `STRATA_AUX_CPUS=auto` より優先です。引数が空文字なら環境変数を参照します。CLI 値自体も同じ形式で解析されます（`src/program/generate.cpp:1903-1910,2202-2208`）。
-- **Linux:** `auto` はプロセスが使用可能な CPU のうち、host の物理 core の SMT sibling を先に選び、次に pool worker のいない物理 core の CPU を選びます。worker と同じ core の CPU は選びません。core 情報を取得できない CPU も `auto` の集合には入りません。リスト指定は、プロセスが使用可能な CPU に絞り、host CPU と worker CPU を除外します（`include/strata/platform/aux_cpus.hpp:83-126,296-333`）。
-- **空集合:** 条件に合う CPU が残らない場合は配置を開始せず、起動ログに `none spare (...)` と出ます。設定が ON でも実際に移動する CPU がない状態です（同 `:329-341`）。
-- **他 OS:** 共通の値解析は行われますが、Linux 以外の実装は `set_topology()` で `strata aux cpus: not available on this system` を返し、pin・sweep・restore は何もしません（同 `:344-357`）。
+- 実際のスレッド affinity 設定はLinuxのみです。他OSでも値の構文検査は行われますが、配置関数は何もせず、計画は空です。
+- Linuxでは起動時にプロセスが使用可能なCPU集合を記録し、pool workerとhost threadのCPUが分かった後に計画を作ります。`auto` はsysfsでpackage/coreを判別できるCPUだけを使います。
+- `auto` はhostのSMT siblingを優先し、その後workerと同じ物理コアに属さないCPUを選びます。明示リストもhost CPUとworker CPUを除外します。使用可能なCPUが残らない場合は計画が空になり、機能は有効になりません。
+- 起動時に `off` でもLinuxでは計画を保持します。serveの `strata_tune.aux_cpus` に `1` があれば、そのリクエストで `auto` 計画を有効にできます。計画のないOSやCPU構成では要求しても有効化されません。
+- `strata_tune.aux_cpus` はサーバーが真偽値または数値の0/1だけをエンジンへ渡し、エンジン側は `atoi(...) != 0` で判定します。リクエストにこのキーがなければ起動時の有効状態に戻し、`0` は移動済みスレッドの元のaffinityを復元します。リクエストごとにスレッドを再走査します。
+- `STRATA_ADAPT_JOB_CPU` で個別CPUを指定されたadaptive tierのjob threadは、この配置よりそちらの指定が優先されます。`STRATA_AUX_STAGER=0` の場合、prefill copy threadは `pin_current_thread()` を呼ばず、aux CPUへ移りません。
 
 ## 実行時の詳細
 
-環境変数は `generate` の起動初期に、pool worker が作られて CPU に pin される前に一度 `getenv()` で読みます。このとき利用可能 CPU 集合を保存します。読み取った値を後で再評価しないため、プロセス実行中に環境を変更しても反映されません（`src/program/generate.cpp:2202-2211`、`include/strata/platform/aux_cpus.hpp:216-231`）。worker の CPU が確定した後に計画を作り、初期設定が ON で計画が空でなければ有効化します（`src/program/generate.cpp:4744-4770`、同 header `:313-341`）。
+起動処理はpool構築より前に環境変数を読み、初期affinityからプロセスの許可CPU集合を記録します。CLIの値が空なら `getenv("STRATA_AUX_CPUS")` を読みます。変数の値は起動時に一度だけ読み取られ、以降に環境を書き換えても再評価されません。pool構築後、hostとworkerのCPUおよびLinux sysfsのcore topologyから配置先を計算します。
 
-有効時、Strata が作る補助スレッドは `pin_current_thread()` を呼びます。たとえば adaptive job、prefill helper、PLE/file reader が対象です。pool worker と host thread は owned として登録され、移動対象外です（`src/program/generate.cpp:11387,11936,13119`、`src/prefill/prefill.cpp:456-457,2199,2225,2411,4017`、`src/ngram/ple_reader.cpp:367`、`src/platform/direct_file.cpp:188,315`、`src/kernels/cpu/pool.cpp:461-465`、`src/core/session.cpp:560`）。
+起動時に有効で配置先が空でなければ、既に存在する非ownedスレッドを `/proc/self/task` から走査して移し、後から作られる対象スレッドは `pin_current_thread()` で移します。pool workerとhost threadはownedとして除外されます。serveではリクエストの開始ごとに有効状態を設定し、有効化時に再走査、無効化時に移動前のaffinityを復元します。
 
-Linux では `sweep()` が `/proc/self/task` のスレッドを列挙し、owned でないスレッドを補助 CPU 集合へ移します。初期有効化に加え、serve の各リクエスト開始時に有効状態を設定する処理があります。リクエストの `aux_cpus=0` は移動したスレッドを元の affinity に戻し、`aux_cpus=1` は計画があれば再度有効化します。指定がないリクエストは起動時の状態に戻します。サーバーは `strata_tune.aux_cpus` の boolean または数値 `0`/`1` のみをエンジンへ転送します（`src/program/generate.cpp:10028,10056,10951-10959`、`serve/server.py:1000-1011`）。この per-request 指定は起動時の環境変数の再読込ではありません。
-
-開始時には stderr に `strata aux cpus: threads that are neither pool workers nor the host go to CPUs ...` と計画・状態が出ます。リクエストで状態が変わると `strata serve: aux cpus ON/off for this request` が出ます。環境変数は結果の計算内容を変えるものではなく、Strata の資料もスレッド配置のみを変えると説明しています（`src/program/generate.cpp:4765-4770,10951-10959`、`docs/DETAILS.md:1708-1734`）。
+Linuxの起動ログは `strata aux cpus: threads that are neither pool workers nor the host go to CPUs …` です。配置先がない場合は理由を含む `none spare (...)` を表示します。serveで状態が変わると `strata serve: aux cpus ON/off for this request` を標準エラーに出します。非Linuxでは `strata aux cpus: not available on this system` を返します。
 
 ## 根拠
 
-- 値の文法と CPU リスト処理: `include/strata/platform/aux_cpus.hpp:49-80,129-148`
-- 起動時の環境変数読取、CLI 優先、設定エラー: `src/program/generate.cpp:1903-1910,2202-2211`
-- Linux での CPU 候補選択、スレッド配置、ログ: `include/strata/platform/aux_cpus.hpp:83-126,216-285,296-357`
-- pool 作成後の計画設定と初期ログ: `src/program/generate.cpp:4744-4770`
-- リクエスト単位の上書きと Python サーバーからの転送: `src/program/generate.cpp:10028,10056,10951-10959`、`serve/server.py:1000-1011`
-- 設計説明との照合: `docs/DETAILS.md:1708-1734`
+- 候補変数のCLI説明とCLI優先の仕様: `src/program/generate.cpp:525-526,1029-1035,2513-2520`。
+- 起動時のCLI/environment選択、エラーと終了: `src/program/generate.cpp:2874-2883`。
+- 全環境変数読み取り箇所: `src/program/generate.cpp:2878`。ソース全体検索では他の `getenv` 等による `STRATA_AUX_CPUS` 読み取りはありません。
+- 値の構文、空文字、`off`、`auto`、リスト解析: `include/strata/platform/aux_cpus.hpp:50-82,137-149`。
+- 許可CPUの記録、スレッド走査、affinity設定、復元: `include/strata/platform/aux_cpus.hpp:179-213,218-289`。
+- 配置先計画と起動ログ: `include/strata/platform/aux_cpus.hpp:84-127,375-405,407-422`; 呼び出し箇所 `src/program/generate.cpp:5904-5908`。
+- リクエストごとの値の解析と切替: `src/program/generate.cpp:12162-12164,12198,13799-13808`; Pythonサーバーでの転送条件 `serve/server.py:1404-1420` および設定許可キー `serve/server.py:7738-7742`。
+- 補助スレッドの例と例外、別engineの扱いとの照合: `docs/DETAILS.md:2142-2169`。この資料の説明は上記の現行ソースと一致します。
