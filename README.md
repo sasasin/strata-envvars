@@ -62,4 +62,26 @@ echo "i have no idea"
 
 # コマンドライン引数
 
-環境変数もそうだけど、コマンドライン引数も興味がある。
+コマンドラインツールの一覧の最新化。
+
+```bash
+codex exec --skip-git-repo-check --sandbox 'workspace-write' '調査依頼です。Strata ソースコードが更新されたので、`$HOME/src/github.com/sasasin/strata-envvars/docs/cli/000_cli_tools.md` の「更新手順と次回の調査指示」に従って、`$HOME/src/github.com/Niko1221/Strata` を調査し、`000_cli_tools.md` を最新の内容に更新してください。CLI 入口、ビルド生成物、GitHub Release の配布物、ファイル名、インストール先を根拠となるソースから確認し、現行 Release の実体を確認できない項目は推測で埋めず、その制約を記載してください。'
+```
+
+コマンドラインツール毎のオプションの一覧の最新化。
+
+```bash
+codex exec --skip-git-repo-check --sandbox 'workspace-write' 'Strata ソースコードが更新されたので、`$HOME/src/github.com/sasasin/strata-envvars/docs/cli/README.md` の「更新手順と次回の調査指示」に従って、`$HOME/src/github.com/Niko1221/Strata` を調査し、`docs/cli/README.md` を最新の内容に更新してください。全 CLI tool-id とコマンド階層、各 parser のオプションと alias、条件付き engine parser、CMake 生成の対象 CLI を確認してください。全コマンドに `README.md` の概要リンクを置き、各コマンド節では概要リンクを先頭、その後のオプションを ASCII コード順にしてください。オプション文書と概要ページが未作成の場合も、規約どおりの Markdown 予定リンクとして列挙し、現行 Release を確認できない内容は推測で補わないでください。'
+```
+
+削除されたコマンドラインツールやオプションに対応する文書の削除。
+
+```bash
+echo "今後検討"
+```
+
+コマンドラインツール毎のオプションの文書の作成。
+
+```bash
+uv run ./create-cli-docs.py -p 12 -l 100
+```
