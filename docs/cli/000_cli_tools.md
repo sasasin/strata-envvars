@@ -1,44 +1,55 @@
-# Strata のコマンドラインツール一覧
+# Strata の CLI・実行ファイル・配布物
 
-この文書は、Strata リポジトリで管理される CLI、ソースから生成する実行ファイル、GitHub Releases 経由で配布される CLI と推論エンジンの所在・ファイル名・配置先を整理した入口です。個々の CLI の引数を網羅する文書ではありません。
+この文書は、Strata の利用者向け入口、ビルド生成物、GitHub Release の配布物と設置先を整理します。CLI 引数や全ての開発用スクリプトの網羅は対象外です。
 
-> **名称に注意:** 現在の Strata には、Python 製のユーザー向け **Strata Terminal CLI** と、C++/CUDA/HIP 等でビルドする **推論エンジン** があり、どちらも実行ファイル名が `strata` です。Terminal CLI は `strata.py` を Python で起動し、エンジンは `strata` (`strata.exe`) というネイティブ実行ファイルです。Terminal がモデル実行時に GPU/OS に合うエンジンを別途取得・起動します。
+> **`strata` の名前に注意:** Python の Strata Terminal は `strata` コマンドから `strata.py` を実行します。推論エンジンも CMake ターゲット `strata` で、Linux/macOS では `strata`、Windows では `strata.exe` です。デスクトップアプリは Tauri の GUI で、別の配布物です。
 
-## 配布・利用形態の一覧
+## 利用者向け入口と設置先
 
-| ツール / 役割 | Git 管理上の所在 | 生成・配布経路 | 実行ファイル名 | 主な設置場所 |
+| 役割 | ソース上の入口 | 生成・配布経路 | 配布時の名前 | 主な設置・実行場所 |
 | --- | --- | --- | --- | --- |
-| 初回セットアップ（POSIX） | Strata ルート `setup.sh`、`setup.py` | ソース checkout に同梱 | `setup.sh` → `setup.py` | clone した Strata ディレクトリ。仮想環境は通常 `.venv/`、セットアップ後の起動も同ディレクトリから |
-| 初回セットアップ（Windows） | `SETUP.bat` → `START-HERE.bat`、`setup.py` | ソース checkout に同梱 | `SETUP.bat` / `START-HERE.bat` | clone した Strata ディレクトリ。Python 仮想環境は `.venv\Scripts\` |
-| 既存セットアップの更新補助 | Strata ルート `update.sh`、`UPDATE.bat` | ソース checkout に同梱 | `update.sh` / `UPDATE.bat` | clone した Strata ディレクトリ |
-| クイックベンチマーク | Strata ルート `bench.sh`、Windows 用 `BENCH.bat` | ソース checkout に同梱 | `bench.sh` / `BENCH.bat` | clone した Strata ディレクトリ。通常の比較可能なベンチマークは Terminal CLI の `strata bench run` |
-| Strata Terminal CLI（POSIX） | `strata.py`、`strata_cli/`、`bin/strata` | ソース checkout では wrapper が Python ソースを起動。Release アーカイブには Python ランタイムと依存パッケージを同梱 | `strata` (POSIX wrapper。内部で `strata.py` を実行) | checkout: `bin/strata` と `strata.py` があるリポジトリ。Release 導入: 通常 `~/.local/share/strata/terminal/<version>/bin/strata`; `~/.local/bin/strata` シンボリックリンクが PATH 上の入口 |
-| Strata Terminal CLI（Windows） | `strata.py`、`strata_cli/`、`bin/strata.cmd`、`bin/strata.ps1` | ソース checkout 同梱、または Windows Terminal ZIP アーカイブ | `strata.cmd` / `strata.ps1` (入口。実装は Python `strata.py`) | checkout: リポジトリと `.venv`。リリース導入: `%LOCALAPPDATA%\Strata\terminal\<version>\bin`。同 `bin` がユーザー PATH に追加される。`STRATA_NO_PATH=1` では PATH 変更を抑止 |
-| 推論エンジン（CUDA/HIP 等） | CMake ターゲット `strata`、主入口 `src/program/generate.cpp` | `setup.py` のビルド、またはプラットフォーム別 `packaging/build_*.sh` / `.bat` など。Release の署名付き engine component/feed からも取得 | Linux/macOS: `strata`; Windows: `strata.exe` | ソースビルド: ビルドディレクトリ。Terminal 利用: ユーザー component 領域（通常 Linux/macOS `$XDG_DATA_HOME/strata/components` または `~/.local/share/strata/components`、Windows `%LOCALAPPDATA%\Strata\components`）。Terminal の run config は `component:strata-engine` を参照 |
-| GitHub Release の POSIX インストーラー | `packaging/install.sh` | Release に `install.sh` として掲載。利用例: `curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh` | `install.sh` | 取得したスクリプトを実行する場所は任意。一時作業領域を使い、Terminal をユーザー領域に展開。通常 `~/.local/share/strata/terminal/<version>/` と `~/.local/bin/strata`。`STRATA_DATA_DIR`、`STRATA_BIN_DIR` で変更可 |
-| GitHub Release の Windows インストーラー | `packaging/install.ps1` | Release に `install.ps1` として掲載。利用例: `irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 \| iex` | `install.ps1` | スクリプトを実行する場所は任意。通常 `%LOCALAPPDATA%\Strata\terminal\<version>\` に展開し、その `bin` をユーザー PATH に登録。`STRATA_DATA_DIR` でデータ/導入ルート変更、`STRATA_NO_PATH=1` で PATH 登録を抑止 |
+| ソース checkout のセットアップ | `setup.sh` → `setup.py`; Windows は `START-HERE.bat` → `setup.py`。`SETUP.bat` は同 bat を `--setup` 付きで呼ぶ | checkout 同梱。開発・ソース利用向けで、Release 用 GUI installer ではない | `setup.sh`, `START-HERE.bat`, `SETUP.bat` | clone したリポジトリ。通常 `.venv/` または `.venv\\Scripts\\` を使う |
+| checkout 更新・ベンチ補助 | `update.sh`, `UPDATE.bat`, `bench.sh`, `BENCH.bat` | checkout 同梱 | 同名スクリプト | clone したリポジトリ内から実行 |
+| Strata Terminal CLI | `strata.py`, `strata_cli/`, `strata_control/`; wrapper は `bin/strata`, `bin/strata.cmd`, `bin/strata.ps1` | ソース checkout では既存 Python 環境を利用。Release installer は署名付き feed の Control archive を選択し、SHA-256 と feed 署名を検証して展開 | コマンド `strata`; Windows wrapper `strata.cmd` / `strata.ps1`; Release archive は `strata-control-<version>-<platform>.tar.gz` または Windows `.zip` | checkout は repo と `.venv`。POSIX installer は通常 `~/.local/share/strata/terminal/<version>/` と `~/.local/bin/strata` symlink。Windows は通常 `%LOCALAPPDATA%\\Strata\\terminal\\<version>\\`、`terminal\\current\\bin` がユーザー PATH |
+| Strata デスクトップアプリ | Tauri shell `apps/desktop/src-tauri/`; Node App Host/UI は `apps/host/` | Tauri bundle と Release workflow。Windows/Linux は engine を含めず、初回起動時に engine component を取得。macOS DMG は小型 Metal engine を同梱 | 公開中の v0.2.5: `Strata-0.2.5-windows-x64-setup.exe`, `Strata-0.2.5-linux-x86_64.AppImage`, `Strata-0.2.5-macos-arm64.dmg` | Windows installer は current-user install。既定のプログラム先は `%LOCALAPPDATA%\\Programs\\Strata`。Linux AppImage は取得した場所から起動。macOS DMG 内の `Strata.app` を Applications に配置。ユーザーデータと engine component は別のユーザー領域 |
+| 推論エンジン component | CMake target `strata`、入口 `src/program/generate.cpp` | `setup.py` のソースビルド、`packaging/build_*.sh` / `.bat` と `packaging/package_engine.py` による package。Release feed に署名付き engine archive | `strata-engine-<version>-<platform>-<backend>-<variant>.tar.gz`。別 package の DeepSeek engine は `strata-dsv41-...tar.gz` | ソース build directory。アプリ/Terminal 利用時は component store の `engine/`。Windows `%LOCALAPPDATA%\\Strata\\components`、POSIX `$XDG_DATA_HOME/strata/components`（通常 `~/.local/share/strata/components`）。設定は `STRATA_COMPONENTS_DIR` で上書き可 |
+| CMake 診断・開発プログラム | `CMakeLists.txt` の `add_executable` | backend、オプション、テスト設定により build directory に生成。通常の GUI/Terminal 製品コマンドではない | 例: `strata-plan`, `strata-device`, `strata-load`, `strata-concurrent`, `strata-overlap`, `strata-gguf`, `strata-dequant`, `strata-q36`, 条件付き `strata-dsv41` | build directory。Release に含まれるかは各 Release asset を個別に確認する |
 
-上表の Terminal Release アーカイブは `strata-terminal-<version>-<platform>.tar.gz`（Linux/macOS）または `.zip`（Windows）形式で、`install-manifest.txt` が選択するファイルです。インストーラー自身はインストール後も常駐する CLI ではありません。初回モデル起動時に必要なエンジンを Release feed から取得します。
+Terminal の `strata` は wrapper が同梱 Python runtime を優先し、checkout では `.venv` または Python 3.10 以上を使います。wrapper 自体は pip install や download を行いません。Release の `install.sh` / `install.ps1` は常駐 CLI ではなく、manifest を読んで Control archive を導入する installer です。モデルと engine は別途管理され、Terminal の `strata launch` は選択した GPU に合う engine を feed から取得します。
 
-## ソース内の関連実行ファイル
+## 現行 GitHub Release の実物
 
-Strata にはユーザー向け `strata` のほか、CMake で生成される開発・診断用プログラムもあります。例として `strata-plan`、`strata-device`、`strata-load`、`strata-concurrent`、`strata-overlap`、`strata-gguf`、`strata-dequant` があります。さらに backend/option に応じて `strata-dsv41`、`strata-q36` 等の専用プログラムや、多数の `*_parity` / `*_bench` が生成されます。これらは通常の Terminal 製品コマンドと同義ではなく、ビルド条件や CMake target が異なります。出典は `CMakeLists.txt` の `add_executable(...)` 定義です。
+2026-10-26 に GitHub の [`releases/latest`](https://github.com/Niko1221/Strata/releases/latest) と [v0.2.5 の公開 assets 一覧](https://github.com/Niko1221/Strata/releases/expanded_assets/v0.2.5) を確認しました。現行公開 Release は **v0.2.5**、公開日は 2026-10-25、asset は 32 件です。Strata checkout の `apps/desktop/package.json` と `apps/desktop/src-tauri/Cargo.toml` は 0.2.6 ですが、Release の公開実物が 0.2.6 である根拠にはなりません。
 
-リポジトリ内の `.sh` / `.bat` / `.ps1` 全てがエンドユーザー向け CLI ではありません。`packaging/build_*` はビルド手順、`docker/` はコンテナ運用、`tools/`・`sycl/tools/`・`metal/tests/` や `bench/results/` 以下には開発、検証、個別ベンチマーク用スクリプトがあります。この一覧は、汎用的なユーザー入口と配布エントリーポイントを記録し、個人・実験用の全スクリプトを列挙するものではありません。
+確認できた v0.2.5 の主な asset 名:
+
+- GUI installer: `Strata-0.2.5-windows-x64-setup.exe`, `Strata-0.2.5-linux-x86_64.AppImage`, `Strata-0.2.5-macos-arm64.dmg`
+- Terminal/Control: `strata-control-0.1.50-linux-x86_64.tar.gz`, `strata-control-0.1.50-macos-arm64.tar.gz`, `strata-control-0.1.50-windows-x86_64.zip`
+- DeepSeek engine: `strata-dsv41-0.1.50-linux-x86_64-cuda-cuda13.tar.gz`, `strata-dsv41-0.1.50-linux-x86_64-hip-rx9070.tar.gz`, `strata-dsv41-0.1.50-windows-x86_64-cuda-cuda13.tar.gz`
+- Engine: `strata-engine-0.1.50-linux-x86_64-cuda-cuda12.tar.gz`, `strata-engine-0.1.50-linux-x86_64-cuda-cuda13.tar.gz`, `strata-engine-0.1.50-linux-x86_64-hip-halo.tar.gz`, `strata-engine-0.1.50-linux-x86_64-hip-rx6000.tar.gz`, `strata-engine-0.1.50-linux-x86_64-hip-rx7900.tar.gz`, `strata-engine-0.1.50-linux-x86_64-hip-rx9070.tar.gz`, `strata-engine-0.1.50-linux-x86_64-sycl.tar.gz`, `strata-engine-0.1.50-macos-arm64-metal.tar.gz`, `strata-engine-0.1.50-windows-x86_64-cuda-cuda12.tar.gz`, `strata-engine-0.1.50-windows-x86_64-cuda-cuda13.tar.gz`, `strata-engine-0.1.50-windows-x86_64-hip-rdna2.tar.gz`, `strata-engine-0.1.50-windows-x86_64-hip-rdna3.tar.gz`, `strata-engine-0.1.50-windows-x86_64-hip-rx9070.tar.gz`
+- Feed / updater: `install-manifest.txt`, `install.sh`, `install.ps1`, `latest.json`, `SHA256SUMS.txt`, `strata-feed.json`, `strata-feed.json.sig`, `Strata.app.tar.gz`
+
+公開 asset 一覧に Terminal installer が読む Control archives が実在することは確認しました。asset 一覧から `install-manifest.txt` 本文を取得できなかったため、manifest 内の各行・SHA-256・サイズはここでは転記せず、Control archive と OS の対応も manifest 内容としては断定しません。ソースの `feed_tool.py` は Control archive から同 manifest を生成する仕様を定めています。`strata-terminal-<version>-<platform>` 形式は `package_terminal.py` の別の build 出力仕様で、今回の v0.2.5 公開 assets にはその名の archive はありません。
+
+## ビルド生成物と配布対象の区別
+
+- `CMakeLists.txt` は通常エンジンの `strata` を `src/program/generate.cpp` から生成します。条件付きで `strata-q36`、`strata-dsv41` なども定義されます。多数の `*_parity`、`*_bench`、test target は主に診断・検証用であり、ターゲット定義だけで Release 配布を意味しません。
+- `packaging/README.md` の target matrix と `packaging/build_*` が backend ごとの engine package 作成手順を示します。`package_engine.py` が build directory を component package にし、`feed_tool.py` が feed entry と archive 名を生成します。
+- `apps/desktop/src-tauri/tauri.conf.json` は Tauri の bundle target と `host/dist`, `host/server`, Node runtime, Control, harness, engine-bundle の resource mapping を定義します。実際の Release 名は公開 assets で別途確認します。
+- `tools/`, `tests/`, `bench/`, `apps/desktop/scripts/`, `apps/host/scripts/` には検証、開発、個別ベンチ用の多数のスクリプトがあります。全ファイルを利用者向け CLI と数えず、呼び出し元と文書で役割を判断します。
 
 ## 調査で確認した主なソース
 
-- Strata ルート: `setup.sh`, `SETUP.bat`, `START-HERE.bat`, `update.sh`, `UPDATE.bat`, `bench.sh`, `BENCH.bat`, `setup.py`, `strata.py`
-- Terminal launcher: `bin/strata`, `bin/strata.cmd`, `bin/strata.ps1`
-- Release packaging / build: `packaging/install.sh`, `packaging/install.ps1`, `packaging/package_terminal.py`, `packaging/feed_tool.py`, `packaging/README.md`, `packaging/UPDATES.md`
-- 推論エンジン: `CMakeLists.txt` (`add_executable(strata src/program/generate.cpp)`)
-- Terminal の機能・配置の説明: `docs/TERMINAL.md`
-
-調査基準: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-24）。GitHub の latest Release のファイル一覧は今回確認できていないため、Release 実体ではなく Strata checkout 内の packaging ソースで確認できたファイル名・配置仕様を記載しています。Release ファイル名や配置仕様は更新される可能性があるため、再調査時は上記 packaging ソースと Release feed 生成手順を確認してください。
+- checkout 情報: Strata commit `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-25）、working tree clean。確認日: 2026-10-26。
+- CLI / checkout setup: `strata.py`, `strata_cli/cli.py`, `bin/strata`, `bin/strata.cmd`, `bin/strata.ps1`, `setup.sh`, `SETUP.bat`, `START-HERE.bat`, `update.sh`, `UPDATE.bat`, `bench.sh`, `BENCH.bat`, `setup.py`
+- CMake / engine: `CMakeLists.txt`, `src/program/generate.cpp`, `packaging/build_*.sh`, `packaging/build_*.bat`, `packaging/package_engine.py`, `packaging/ENGINE-COMPONENT.md`, `strata_control/engine_component.py`
+- Terminal / feed / install: `packaging/install.sh`, `packaging/install.ps1`, `packaging/package_terminal.py`, `packaging/feed_tool.py`, `packaging/README.md`, `packaging/UPDATES.md`, `docs/INSTALL.md`, `docs/TERMINAL.md`, `docs/TERMINAL_LAUNCH.md`
+- Desktop: `apps/desktop/package.json`, `apps/desktop/src-tauri/Cargo.toml`, `apps/desktop/src-tauri/tauri.conf.json`, `apps/desktop/src-tauri/nsis/installer.nsi`, `apps/desktop/src-tauri/src/main.rs`, `apps/desktop/scripts/`
+- Release 実物: [`releases/latest`](https://github.com/Niko1221/Strata/releases/latest) と [v0.2.5 assets](https://github.com/Niko1221/Strata/releases/expanded_assets/v0.2.5)。公開 assets 名と公開ページ記載を確認。`install-manifest.txt` 本文は取得できなかったため内容未確認。
 
 ## 更新手順と次回の調査指示
 
-Strata のソースコードが更新されたら、`/home/sasasin/src/github.com/Niko1221/Strata` にある更新後の checkout を調べ、この文書の一覧と説明を現状に合わせて更新します。古い一覧への追記だけで済ませず、削除・改名・統合された入口や廃止された配布方法も確認してください。
+Strata checkout が更新されたら、`/home/sasasin/src/github.com/Niko1221/Strata` を調べ、この一覧をソースと公開 Release の双方に合わせて更新します。前回の説明に追記するだけでなく、削除・改名・統合された入口、GUI installer、Terminal installer、component/feed 方式の変更も確認してください。
 
 ### 調査手順
 

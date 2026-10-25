@@ -2,7 +2,7 @@
 
 この索引は Strata のユーザー向け CLI 入口と、そのコマンド階層ごとのオプション文書を列挙します。リンク先の文書は今後作成する予定の項目も含みます。したがって、現時点でリンク先の Markdown が未作成でも、この索引では予定パスとして掲載しています。
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25）。
+調査対象: Strata commit `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 調査、commit 日 2026-10-25）。
 
 文書配置と調査基準は [`001_investigation.md`](001_investigation.md)、CLI 入口と配布形態は [`000_cli_tools.md`](000_cli_tools.md) を参照してください。各コマンドの概要ページは `docs/cli/<tool-id>/<command-path>/README.md`、オプション文書は `docs/cli/<tool-id>/<command-path>/<option-name>.md` に置きます。以下の「コマンド概要」とオプションのリンク先は、今後作成する予定のものも含みます。短縮名・同じ parser action の alias は正規の長い名前の文書にまとめます。
 
@@ -225,6 +225,23 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--output`](strata-terminal/components/update/--output.md)
 - [`--quiet`](strata-terminal/components/update/--quiet.md)
 - [`--wait`](strata-terminal/components/update/--wait.md)
+
+### `strata components install-file` (components/install-file)
+
+ダウンロード済み engine package をローカルから導入する parser です。`strata_cli/update_cmd.py` の `_common()` が追加する共通 option を含みます。
+
+- [コマンド概要](strata-terminal/components/install-file/README.md)
+
+- [`--backend`](strata-terminal/components/install-file/--backend.md)
+- [`--components-dir`](strata-terminal/components/install-file/--components-dir.md)
+- [`--feed`](strata-terminal/components/install-file/--feed.md)
+- [`--force`](strata-terminal/components/install-file/--force.md)
+- [`--help`（alias: `-h`）](strata-terminal/components/install-file/--help.md)
+- [`--json`](strata-terminal/components/install-file/--json.md)
+- [`--model-config`](strata-terminal/components/install-file/--model-config.md)
+- [`--output`](strata-terminal/components/install-file/--output.md)
+- [`--quiet`](strata-terminal/components/install-file/--quiet.md)
+- [`--wait`](strata-terminal/components/install-file/--wait.md)
 
 ### `strata components rollback` (components/rollback)
 
@@ -936,6 +953,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--dsv41-package`](strata-terminal/launch/--dsv41-package.md)
 - [`--family`](strata-terminal/launch/--family.md)
 - [`--feed`](strata-terminal/launch/--feed.md)
+- [`--full-quality`](strata-terminal/launch/--full-quality.md)
 - [`--gpu`](strata-terminal/launch/--gpu.md)
 - [`--gpu-roles`](strata-terminal/launch/--gpu-roles.md)
 - [`--help`（alias: `-h`）](strata-terminal/launch/--help.md)
@@ -960,6 +978,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--save-preset`](strata-terminal/launch/--save-preset.md)
 - [`--set`](strata-terminal/launch/--set.md)
 - [`--show-key`](strata-terminal/launch/--show-key.md)
+- [`--speed`](strata-terminal/launch/--speed.md)
 - [`--status`](strata-terminal/launch/--status.md)
 - [`--stop`](strata-terminal/launch/--stop.md)
 - [`--tune`](strata-terminal/launch/--tune.md)
@@ -1321,7 +1340,7 @@ CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI
 
 - [コマンド概要](strata-engine/qwen36/README.md)
 
-Qwen3.6 family に振り分けられたとき `strata` が使う parser です。同じフラグでも通常 engine parser と意味が違う場合があるため、独立した `qwen36/` scope にしています。CMake では `strata-q36` として単独 executable も生成します。
+Qwen3.6 family に振り分けられたとき `strata` が使う parser です。同じフラグでも通常 engine parser と意味が違う場合があるため、独立した `qwen36/` scope にしています。CMake は `STRATA_HIP_GFX906` でない構成に限り `strata-q36` を生成し、通常の `strata` にもこの family を組み込みます。GFX906 HIP build ではこの parser/executable は対象外です。
 
 - [`--batch`（alias: `--slots`）](strata-engine/qwen36/--batch.md)
 - [`--batch-mtp`](strata-engine/qwen36/--batch-mtp.md)
@@ -1355,7 +1374,7 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 
 - [コマンド概要](strata-engine-dsv41/root/README.md)
 
-`STRATA_BUILD_DSV41=ON` の build で生成される独立 engine CLI です。Release での配布有無はこの source inventory からは断定しません。
+`STRATA_BUILD_DSV41=ON` かつ `STRATA_HIP_GFX906` でない build で生成される独立 engine CLI です。Release での配布有無はこの source inventory からは断定しません。
 
 - [`--cpu-threads`](strata-engine-dsv41/root/--cpu-threads.md)
 - [`--dspark`](strata-engine-dsv41/root/--dspark.md)
@@ -1366,6 +1385,7 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - [`--encode-image`](strata-engine-dsv41/root/--encode-image.md)
 - [`--eos`](strata-engine-dsv41/root/--eos.md)
 - [`--expert-profile`](strata-engine-dsv41/root/--expert-profile.md)
+- [`--experts`](strata-engine-dsv41/root/--experts.md)
 - [`--gpus`](strata-engine-dsv41/root/--gpus.md)
 - [`--help`](strata-engine-dsv41/root/--help.md)
 - [`--ids`](strata-engine-dsv41/root/--ids.md)
@@ -1399,7 +1419,7 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 
 ## CMake 生成の単体 CLI（診断・開発用）
 
-`000_cli_tools.md` の関連実行ファイル欄にある単体 CLI を、製品の推論エンジンとは別 tool-id として掲載します。これらは用途や build target が異なり、通常の Terminal CLI のサブコマンドではありません。`strata-dequant` にはオプション parser がなく、GGUF ファイルの位置引数だけを受け付けます。
+`000_cli_tools.md` の関連実行ファイル欄にある単体 CLI を、製品の推論エンジンとは別 tool-id として掲載します。これらは用途や build target が異なり、通常の Terminal CLI のサブコマンドではありません。`strata-dequant` にはオプション parser がなく、GGUF ファイルの位置引数だけを受け付けます。CMake の `strata-q36ref` も独立 parser を持つ Qwen reference CLI として対象に含めます。これは照合・開発用 executable で、現行 Release への同梱は確認できていません。`*_test`、`*_parity`、`*_bench` や probe は個別検証用途として引き続き対象外です。
 
 
 ### `strata-plan` (`src/plan/plan_main.cpp`)
@@ -1463,6 +1483,25 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - [コマンド概要](strata-dequant/root/README.md)
 
 - オプションなし（位置引数のみ）
+
+### `strata-q36ref` (`src/qwen35/q36ref.cu`)
+
+Qwen3.6 reference path の照合用 executable です。CMake target は GPU backend build 内に定義されます。ソースの usage/parser にある option を索引化し、Release 配布実績は確認できていないため断定しません。
+
+- [コマンド概要](strata-q36ref/root/README.md)
+
+- [`--act`](strata-q36ref/root/--act.md)
+- [`--ctx`](strata-q36ref/root/--ctx.md)
+- [`--dump-full-logits`](strata-q36ref/root/--dump-full-logits.md)
+- [`--dump-layers`](strata-q36ref/root/--dump-layers.md)
+- [`--dump-logits`](strata-q36ref/root/--dump-logits.md)
+- [`--force`](strata-q36ref/root/--force.md)
+- [`--kernels`](strata-q36ref/root/--kernels.md)
+- [`--model`](strata-q36ref/root/--model.md)
+- [`--n`](strata-q36ref/root/--n.md)
+- [`--tokens`](strata-q36ref/root/--tokens.md)
+- [`--tokens-file`](strata-q36ref/root/--tokens-file.md)
+
 ## `source-setup`
 
 `setup.py` は初回 setup、既存環境の更新、モデル設定変更を担います。POSIX/Windows の wrapper はここへ引数を渡します。以下は `setup.py` の CLI parser option inventory です。setup は複数 GPU と helper cache の条件に応じて engine 用 `--remote-expert-opt` を run config に自動追加することがありますが、これは `setup.py` に渡す option ではありません。自動追加を抑止する setup option は `--no-remote-expert-opt` です。
