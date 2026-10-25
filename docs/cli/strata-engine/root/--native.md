@@ -48,7 +48,7 @@ PLE テーブル (`per_layer_token_embd.weight`) は、`--ple-gguf` が未指定
 - `--native` が有効なときは、GGUF のメタデータ・tensor を読み込みます。分割モデルでは全 shard が存在する必要があります。モデル family、GGUF の形状、tensor 構成が実装やビルドに合わなければ処理は続行しません（`src/program/generate.cpp:3232-3256, 3653-3679`; `include/strata/artifact/gguf_split.hpp:38-47`）。
 - `--pack` がネイティブ pack（native expert layout）の場合は、`--native` に加えて `--spec T`（`T >= 2`）、`--keep-canonical` なしが必要です。プロンプトが複数 token なら `--prefill CHUNK` も必要です。これらを満たさないと終了コード 2 になります。これは native pack の条件であり、全ての `--native` 利用に対する共通条件ではありません（`src/program/generate.cpp:3753-3759`）。
 - ネイティブ pack では token embedding を指定した GGUF から mapped host memory に読み込みます。`--embd-gguf` を指定すれば埋め込みの供給元だけを切り替えます（`src/program/generate.cpp:3761-3772, 860-862`）。Metal build では `--native` の shard を model shard として登録し、expert を mmap する設定になります（`src/program/generate.cpp:3422-3424`）。
-- `STRATA_HAVE_QWEN35` build では、parser 本体の前に GGUF family を調べ、Qwen3.6-35B-A3B なら引数一式を専用 engine に転送します。転送先 parser では `--native` と `--model` が同じモデル値を設定します。この場合の専用 parser の詳細は [`strata-engine/qwen36/--native.md`](../qwen36/--native.md) を参照してください（`src/program/generate.cpp:2393-2407`; `src/qwen35/q36_engine.cu:3742-3750`）。
+- `STRATA_HAVE_QWEN35` build では、parser 本体の前に GGUF family を調べ、Qwen3.6-35B-A3B なら引数一式を専用 engine に転送します。転送先 parser では `--native` と `--model` が同じモデル値を設定します。この場合の専用 parser の詳細は [`strata-engine/qwen36/--model.md`](../qwen36/--model.md) を参照してください（`src/program/generate.cpp:2393-2407`; `src/qwen35/q36_engine.cu:3742-3750`）。
 
 ## 出力とエラー
 
