@@ -206,6 +206,8 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 
 ### `strata components update` (components/update)
 
+`--json` と `--quiet` は `strata_cli/update_cmd.py` の parser 定義ではなく、`strata_cli/cli.py` が `update_parsers` を含む one-shot parser 群へ後から追加します。そのため、個別コマンド module 内に宣言が見当たらなくても、このコマンドで有効です。
+
 - [コマンド概要](strata-terminal/components/update/README.md)
 
 - [`--app`](strata-terminal/components/update/--app.md)
@@ -1127,7 +1129,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 
 ## `strata-engine`
 
-CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI の同名 wrapper とは別のプログラムです。一覧は `src/program/generate.cpp` の引数 parser および parser より前に処理される早期終了フラグを基にしています。`--model` は Qwen3.6 専用実装への振り分けで使われます。短縮表記と同一動作の alias は正規名の文書にまとめます。
+CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI の同名 wrapper とは別のプログラムです。一覧は `src/program/generate.cpp` の引数 parser および parser より前に処理される早期終了フラグを基にしています。`--model` は Qwen3.6 専用実装への振り分けで使われます。短縮表記と同一動作の alias は正規名の文書にまとめます。parser が受理していても usage/help に表示されない option があります。たとえば `--no-kv-grow` は parser に実装されているため索引に含めています。
 
 ### `strata` (エンジン引数)
 
@@ -1341,7 +1343,6 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - [`--model`（alias: `--native`）](strata-engine/qwen36/--model.md)
 - [`--mtp`](strata-engine/qwen36/--mtp.md)
 - [`--n`](strata-engine/qwen36/--n.md)
-- [`--native`](strata-engine/qwen36/--native.md)
 - [`--no-graph`](strata-engine/qwen36/--no-graph.md)
 - [`--no-token-graph`](strata-engine/qwen36/--no-token-graph.md)
 - [`--no-warmup`](strata-engine/qwen36/--no-warmup.md)
@@ -1464,7 +1465,7 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - オプションなし（位置引数のみ）
 ## `source-setup`
 
-`setup.py` は初回 setup、既存環境の更新、モデル設定変更を担います。POSIX/Windows の wrapper はここへ引数を渡します。以下は `setup.py --help` の option inventory です。
+`setup.py` は初回 setup、既存環境の更新、モデル設定変更を担います。POSIX/Windows の wrapper はここへ引数を渡します。以下は `setup.py` の CLI parser option inventory です。setup は複数 GPU と helper cache の条件に応じて engine 用 `--remote-expert-opt` を run config に自動追加することがありますが、これは `setup.py` に渡す option ではありません。自動追加を抑止する setup option は `--no-remote-expert-opt` です。
 
 ### `setup.py` / `setup.sh` / `START-HERE.bat` / update wrappers
 
@@ -1504,7 +1505,6 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - [`--parallel`](source-setup/root/--parallel.md)
 - [`--port`](source-setup/root/--port.md)
 - [`--prebuilt`](source-setup/root/--prebuilt.md)
-- [`--remote-expert-opt`](source-setup/root/--remote-expert-opt.md)
 - [`--replicas`](source-setup/root/--replicas.md)
 - [`--resident-budget-gib`](source-setup/root/--resident-budget-gib.md)
 - [`--rollback-engine`](source-setup/root/--rollback-engine.md)
@@ -1559,7 +1559,7 @@ Strata のソースコードが更新されたら、`/home/sasasin/src/github.co
 
 1. **対象 revision と作業状態を記録する。** Strata リポジトリで `git rev-parse HEAD`、`git status --short --branch`、必要に応じて `git log -1 --format='%h %cs %s'` を確認します。未コミット変更があれば調査対象に含め、既存の変更を上書きしないでください。索引に完全な commit SHA と調査日を記録します。
 2. **ツール一覧を照合する。** [`000_cli_tools.md`](000_cli_tools.md) と Strata checkout のルート、`bin/`、`packaging/`、`tools/`、`strata_cli/`、`src/`、各 `CMakeLists.txt` を見直します。CLI のソース、委譲 wrapper、ビルド生成 executable、Release installer と配布対象を区別し、索引に追加・削除すべき tool-id を決めます。
-3. **コマンド階層を列挙する。** Terminal CLI は `strata_cli/cli.py` の root parser と、そこから登録される各 module の parser 定義をたどります。`launch` / `connect`、update、drafting 等、別 module で登録される parser も含めます。安全に実行でき、調査 checkout と同じ revision の CLI がある場合は `--help` を補助に使えますが、parser のソース定義を根拠として照合します。
+3. **コマンド階層を列挙する。** Terminal CLI は `strata_cli/cli.py` の root parser と、そこから登録される各 module の parser 定義をたどります。`launch` / `connect`、update、drafting 等、別 module で登録される parser も含めます。module 内で parser を作った後、`cli.py` 側で共通 option を追加する処理も確認してください。たとえば `--json` / `--quiet` は `update_parsers` を含む one-shot parser 群へ後から追加されます。安全に実行でき、調査 checkout と同じ revision の CLI がある場合は `--help` を補助に使えますが、最終的に登録された parser と実際の処理をソースで照合します。
 4. **各 parser のオプションと alias を列挙する。** `argparse` 等の宣言、手書き C/C++ の `argv` 解析、早期処理される `--version` / `--families` のようなフラグを確認します。推論エンジンは通常の `src/program/generate.cpp` の parser に加え、Qwen3.6 などの条件付き parser、独立 executable、build 条件を確認します。`setup.py` と `tools/strata_bench.py` はそれぞれの parser を調べ、`setup.sh` / `.bat`、update wrapper、quick-benchmark wrapper が引数を委譲するだけなら重複登録しません。
 5. **対象境界を再判定する。** `000_cli_tools.md` に挙がる単体診断 CLI は個別の tool-id として扱います。CMake の `*_test`、`*_parity`、`*_bench`、個別 probe は製品 CLI と混同せず、利用者向け・開発用・テスト用の区分と既存一覧の方針に沿って対象を判断します。Release installer が CLI 引数を持たない場合は、オプションリンクを作らずその事実を記載します。ネットワーク上の Release 実体を確認できない場合は、ソースに基づく予想を実配布物として断定しないでください。
 6. **一意な予定パスとコマンド概要を索引化する。** 各コマンド階層について `docs/cli/<tool-id>/<command-path>/README.md` の「コマンド概要」リンクを一つ置き、その節の先頭にします。root command は `root/` を使い、条件付きで parser や意味が分かれる場合は `001_investigation.md` の規約に沿って scope を分離します。各 option は `docs/cli/<tool-id>/<command-path>/<option-name>.md` にリンクします。同一 parser action の alias は正規名の一文書にまとめ、別の挙動・parser を同じリンクに押し込めません。リンク先ファイルが未作成でも、索引には予定リンクとして残します。
