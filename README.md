@@ -39,19 +39,19 @@ git pull
 環境変数の一覧の最新化。
 
 ```bash
-codex exec --skip-git-repo-check --sandbox 'workspace-write' '調査依頼です。調査対象ソースコードは `$HOME/src/github.com/Niko1221/Strata` です。ソースコードを網羅的に grep して、使用可能な環境変数を一覧化しただけの Markdown ファイルを作成してください。Markdown ファイル名は `$HOME/src/github.com/sasasin/strata-envvars/docs/000_envvers.md` としてください。環境変数名でソートしてください。'
+codex exec --skip-git-repo-check --sandbox 'workspace-write' '調査依頼です。調査対象ソースコードは `$HOME/src/github.com/Niko1221/Strata` です。ソースコードを網羅的に grep して、使用可能な環境変数を一覧化しただけの Markdown ファイルを作成してください。Markdown ファイル名は `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/000_envvers.md` としてください。環境変数名でソートしてください。'
 ```
 
 消えた環境変数の md の削除。
 
 ```bash
-codex exec --skip-git-repo-check --sandbox 'workspace-write' '`$HOME/src/github.com/sasasin/strata-envvars/docs/000_envvers.md` の git diff にもとづいて、削除された環境変数に対応する docs/${環境変数名}.md を削除してください'
+codex exec --skip-git-repo-check --sandbox 'workspace-write' '`$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/000_envvers.md` の git diff にもとづいて、削除された環境変数に対応する docs/envvars/${環境変数名}.md を削除してください'
 ```
 
 増えた環境変数の md の作成。
 
 ```bash
-seq 100 | xargs -P5 -L1 -I{} time codex exec --skip-git-repo-check --sandbox 'workspace-write' '調査依頼です。調査対象ソースコードは `$HOME/src/github.com/Niko1221/Strata` です。 `$HOME/src/github.com/sasasin/strata-envvars/docs/000_envvers.md` から、 `$HOME/src/github.com/sasasin/strata-envvars/docs/` に調査結果ファイルが存在しない環境変数を、任意に1個を選んで、 `$HOME/src/github.com/sasasin/strata-envvars/docs/001_investigation.md` の指示に従って、 `$HOME/src/github.com/sasasin/strata-envvars/docs/` に調査結果ファイルを作成してください。環境変数1個ずつ調べてください。'
+seq 100 | xargs -P5 -L1 -I{} time codex exec --skip-git-repo-check --sandbox 'workspace-write' '調査依頼です。調査対象ソースコードは `$HOME/src/github.com/Niko1221/Strata` です。 `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/000_envvers.md` から、 `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/` に調査結果ファイルが存在しない環境変数を、任意に1個を選んで、 `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/001_investigation.md` の指示に従って、 `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/` に調査結果ファイルを作成してください。環境変数1個ずつ調べてください。'
 ```
 
 変更のあった環境変数の md の更新。
