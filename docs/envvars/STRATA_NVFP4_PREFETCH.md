@@ -1,42 +1,47 @@
 # `STRATA_NVFP4_PREFETCH`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。
+調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-NVFP4 の CPU 行カーネルが、重みブロックを処理するときに発行するソフトウェア prefetch の先読み距離をバイト単位で指定する。対象は Strata 独自の AVX-512 / AVX2 NVFP4 カーネルで、ゲート・アップ行と down 行の両方に使われる。CUDA/HIP の NVFP4 カーネルにはこの変数の読み取りはない。
+CPU の NVFP4 expert 行カーネルで、重みデータに対するソフトウェア prefetch の先読み距離をバイト単位で指定します。AVX-512 と AVX2 の専用カーネルが対象です。通常の Strata 実行では、適切な CPU で NVFP4 専用行カーネルが選択されたときだけ計算中のメモリアクセスに影響します。
 
 ## 値と判定
 
-| 環境変数の状態・値 | カーネル内の値 | 動作 |
-| --- | ---: | --- |
-| 未設定 | `2048` | 各 NVFP4 ブロック処理で、現在の重みブロック先頭から2048バイト先を prefetch する |
-| 空文字 | `0` | prefetch を発行しない |
-| 整数として `0` | `0` | prefetch を発行しない |
-| 正の整数 | `atoi` の変換結果 | そのバイト数先を prefetch する |
-| 負の整数 | 負値 | `> 0` の条件を満たさず、prefetch を発行しない |
-| 数字で始まらない文字列 | `0` | `atoi` の結果が0なので、prefetch を発行しない |
+値は `std::atoi` で整数に変換されます。文字列全体の妥当性検査や範囲制限はありません。
 
-読み取りは `std::atoi` であり、文字列全体の厳密な数値検証はしない。したがって、先頭に整数として読める部分がある文字列はその部分が変換され、例えば `128x` は128として扱われる。未設定と空文字は異なる。コードに clamp や距離の上限確認はない。
+| 環境変数 | 距離 | カーネル内の動作 |
+|---|---:|---|
+| 未設定 | 2048 バイト | 各 NVFP4 block の処理で、現在の block アドレスから 2048 バイト先を `_mm_prefetch(..., _MM_HINT_T0)` に渡す |
+| `0`、空文字、数値として先頭を読めない文字列 | 0 | prefetch 呼び出しを行わない |
+| 正の整数 `n` | `n` バイト | 各 block でそのアドレス距離を prefetch する |
+| 負の整数 | 負値 | `prefetch_ahead > 0` の条件が成立せず、prefetch しない |
+
+変換は `atoi` のため、先頭の空白と符号を受け付け、数値に続く文字列は無視します（例: `"512tail"` は 512）。したがって、空文字や `"abc"` は 0、`"-4"` は負値になります。上限・下限の clamp はありません。
 
 ## 有効になる条件
 
-- 対象は NVFP4 expert の CPU 処理で、実行時 CPU 機能判定を通り、対象次元 `n` が NVFP4 ブロック幅に整合し、ブロック数がカーネルの上限以内である必要がある。AVX-512 が使える場合は通常 AVX-512 経路が先に選ばれ、選べない場合は AVX2 経路が候補になる。
-- `STRATA_NO_NVFP4_512` が設定されていれば AVX-512 経路を選ばず、`STRATA_NO_NVFP4_256` が設定されていれば AVX2 経路を選ばない。設定有無の判定なので、空文字を含め、値が存在すればその経路を無効にする。両経路が使えなければ `ggml-cpu` の dot 経路へ進み、この変数は使われない。
-- 実際の prefetch 命令は、先読み距離が正の場合に限り発行される。AVX-512 と AVX2 のそれぞれの翻訳単位に独立した設定値がある。
+- 実行経路が CPU のネイティブ expert 計算であること。GPU の NVFP4 カーネルには、この環境変数を読む箇所はありません。
+- Gate/up または down の対象型が NVFP4 であること。
+- CPU とビルドが対応する専用カーネルを使えること。AVX-512 対応 CPU では `STRATA_NO_NVFP4_512` が未設定なら AVX-512 カーネルが優先されます。そうでなければ、AVX2 対応 CPU で `STRATA_NO_NVFP4_256` が未設定なら AVX2 カーネルが使われます。
+- 対象の `n` が NVFP4 block サイズの倍数で、最大 block 数以内であること。条件外では ggml-cpu の `vec_dot` に fallback します。
+
+対象環境変数 `STRATA_NVFP4_PREFETCH` 自体は CPU 機能やモデル状態を検査しません。専用カーネルへ到達しない場合、この変数は評価されず、効果もありません。
 
 ## 実行時の詳細
 
-AVX-512 と AVX2 の `prefetch_distance()` は、初回呼び出し時に関数内 `static const int` を初期化する。そのため、環境変数はプロセス起動時ではなく、その翻訳単位の NVFP4 行カーネルが最初に使われた時点で読み取られ、以後の環境変更は同じカーネル内の値に反映されない。各 `row_dot` は NVFP4 重みブロックを走査し、各ブロックで距離が正なら `_mm_prefetch(..., _MM_HINT_T0)` を実行する。これは行カーネルに対するヒントであり、結果の数値計算を変える分岐ではない。
+AVX2/AVX-512 の各 `row_dot` は最初の実行時に関数内 `static` の `prefetch_distance()` を評価し、その翻訳単位内に値を保存します。以後、同じカーネルでプロセス環境を変更しても再評価されません。AVX2 と AVX-512 の実装はそれぞれ独立した関数内 static を持ちます。
 
-同梱診断・ベンチマーク `nvfp4_avx512_parity` にも環境変数の読み取りがある。`--bw` の表示で prefetch 値を出すためのもので、未設定時には `2048` と表示する。明示的な空文字なら表示欄は空になる一方、カーネル側では `atoi("") == 0` として prefetch が無効になる。この診断プログラムは通常の Strata サーバー動作とは別の実行ファイルである。
+各 NVFP4 weight block の計算ループで、距離が正なら現在の block (`x + ib`) のアドレスに距離を加えた位置へ `_MM_HINT_T0` の prefetch を発行します。Gate/up 行と down 行はいずれも同じ `row_dot` を経由します。距離 0 以下では prefetch を呼びません。Strata ソースが指定距離で prefetch 要求を出すことまでを説明しており、その要求が CPU 上でどのように処理されるかは対象外です。
+
+同名の読み取りは `src/kernels/cpu/nvfp4_avx512_parity.cpp` にもあります。この実行ファイルは CMake で parity/ベンチマーク用として定義され、環境変数の値をベンチマーク出力に表示します。ここではカーネル呼び出し時に上記の専用カーネルが値を読むため、表示は未設定なら `2048`、設定済みなら元の文字列です。これは通常アプリの別の設定処理ではありません。
 
 ## 根拠
 
-- `src/kernels/cpu/nvfp4_avx512.cpp:47-55` と `src/kernels/cpu/nvfp4_avx2.cpp:47-55`: 変数の読み取り、`atoi`、未設定時の2048、初回呼び出し時の static cache。
-- `src/kernels/cpu/nvfp4_avx512.cpp:100-110` と `src/kernels/cpu/nvfp4_avx2.cpp:93-103`: 各重みブロックで正の距離だけ prefetch を発行する。
-- `src/kernels/cpu/native_expert.cpp:194-218, 233-278`: NVFP4 のゲート・アップ／down 行処理で AVX-512、AVX2、`ggml-cpu` の順に条件付きで選択する。
-- `src/kernels/cpu/nvfp4_avx512.cpp:152-179` と `src/kernels/cpu/nvfp4_avx2.cpp:161-178`: 次元がブロック幅に整合すること、カーネルが複数 token を分割して処理すること。
-- `src/kernels/cpu/expert_layout.cpp:41-73, 110-143`: AVX-512 / AVX2 の CPU・OS 状態判定。AVX-512 は AVX512F/BW/VL/VNNI 等、AVX2 は FMA/F16C/AVX と OS の AVX 状態保存を確認する。
-- `src/kernels/cpu/nvfp4_avx512_parity.cpp:193-248` と `CMakeLists.txt:1607-1611`: `--bw` のベンチマーク表示と CPU parity 実行ファイルの登録。
-- `docs/NVFP4.md:166-180`: CPU NVFP4 カーネルの概要と測定条件。`STRATA_NVFP4_PREFETCH` 自体の既定値や意味は文書化されていないため、上記は実装から確認した内容である。
+- 値の読み取り、`atoi`、既定値 2048: `src/kernels/cpu/nvfp4_avx2.cpp:47-55`, `src/kernels/cpu/nvfp4_avx512.cpp:47-56`。
+- block ごとの正値判定と prefetch: `src/kernels/cpu/nvfp4_avx2.cpp:93-103`, `src/kernels/cpu/nvfp4_avx512.cpp:100-110`。
+- Gate/up と down の行処理が `row_dot` を呼ぶ箇所: `src/kernels/cpu/nvfp4_avx2.cpp:125-145`, `src/kernels/cpu/nvfp4_avx512.cpp:127-147`。
+- CPU/type/fit 条件と専用カーネルから fallback する経路: `src/kernels/cpu/native_expert.cpp:398-423,455-475`。
+- 専用ソースのビルドと ISA オプション: `CMakeLists.txt:1719-1747`。
+- parity/ベンチマーク実行ファイルとその値表示: `CMakeLists.txt:2139-2143`, `src/kernels/cpu/nvfp4_avx512_parity.cpp:244-247`。
+- `docs/DETAILS.md` にはこの変数の説明は見つからず、値や性能効果を裏付ける資料記載は確認できませんでした。

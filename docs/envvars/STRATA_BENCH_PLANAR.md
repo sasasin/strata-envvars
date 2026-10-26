@@ -1,43 +1,39 @@
 # `STRATA_BENCH_PLANAR`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-SYCL ビルドの `mmvq_bench` が、通常の Q6_K 行列と planar 配置の行列で出力がビット単位に一致するか、さらに planar 配置から選択行を gather した結果が元行列の同じ行と一致するかを追加検証します。通常の `strata` エンジンの推論経路からこの変数を読むコードはありません。用途はベンチマーク／検証用の実行ファイルに限られます。
+SYCL 版 `mmvq_bench` に、Q6_K 行列の planar layout と row gather の追加比較・bitwise 検査を実行させます。Strata エンジンの動作を切り替える環境変数ではなく、このベンチマーク実行ファイルだけが読み取ります。通常の GGUF layout の測定と checksum 出力の後に判定されます。
 
 ## 値と判定
 
-`mmvq_bench` はベースライン測定・checksum 出力の後に `std::getenv` で読み取り、設定値に `std::atoi` を適用した結果が 0 以外かを判定します。
-
-| 値 | planar 追加検証 |
+| 値 | 動作 |
 |---|---|
-| 未設定 | 行わない |
-| 空文字 | 行わない（`atoi("")` は 0） |
-| 先頭の空白や符号の後に 0 以外の数字がある文字列（例: `1`, ` 1`, `+2`, `-1`, `1tail`） | 行う（`atoi` が 0 以外を返す） |
-| `0`、`0tail`、数値に変換できない文字列 | 行わない（`atoi` が 0 を返す） |
+| 未設定 | 追加処理をしない。通常の `mmvq_bench` を実行して終了コード 0。 |
+| 空文字、数値に変換できない文字列、`0`、`0` で始まる数値（例: `0abc`） | `std::atoi()` が 0 を返すため追加処理をしない。 |
+| `1`、`2`、`-1`、`1suffix` など、`std::atoi()` の結果が 0 以外になる文字列 | planar layout と gather の比較を実行する。 |
 
-文字列全体の数値としての妥当性は検査されません。したがって `1tail` は有効、`true` は無効です。範囲チェック、clamp、無効値時の警告や fallback はありません。`atoi` が表現範囲外の値を受けた場合の結果は、このコードでは規定・処理していません。
+値は文字列全体として比較されず、`std::atoi()` で整数に変換した結果が 0 かどうかだけを見ます。したがって、先頭空白や符号の後の数字が変換対象になり、数字以降の文字は無視されます。数字を含まない文字列は 0 です。数値としての境界外入力についてコードは検証していません。
 
 ## 有効になる条件
 
-- SYCL プロジェクトで `mmvq_bench` がビルドされていること。`sycl/CMakeLists.txt` ではこのターゲットは `STRATA_SYCL_PARITY` の有効ブロック内にあり、同オプションの既定値は ON です。トップレベルから SYCL を選ぶ場合は `STRATA_ENABLE_SYCL=ON` が必要で、CUDA/HIP と同時には有効にできません。
-- `mmvq_bench` を実行すること。この環境変数はエンジン本体や他のツールで参照されません。
-- `STRATA_BENCH_PLANAR` が 0 以外に変換されること。
-- planar adoption が成功すること。これは別環境変数 `STRATA_Q6_PLANAR` の判定や行列形状・デバイスメモリなどに依存します。`STRATA_Q6_PLANAR=0` では adoption が無効になり、このベンチは `planar: adopt declined` を出して終了コード 1 になります。ベンチ用行列の `n_in` は 256 の倍数、`n_in` と `n_out` は正数である必要があります。
+- `mmvq_bench` は SYCL サブプロジェクトの実行ファイルです。`sycl/CMakeLists.txt` では `STRATA_SYCL_PARITY` が有効なブロック内で定義され、同オプションの既定値は `ON` です。SYCL ベンチマークをビルドして実行できる環境が必要です。
+- 追加処理は `STRATA_BENCH_PLANAR` の変換結果が 0 以外の場合だけ行います。`STRATA_Q6_PLANAR` も別途参照され、値がちょうど文字列 `0` のときは planar 化を無効にします。この組み合わせでは benchmark 側の `adopt` が元の行列を返し、ベンチマークは `planar: adopt declined` を出して終了コード 1 になります。
+- `n_in` が正で 256 の倍数、`n_out` が正であることも planar 化の条件です。既定の `n_in=2560`, `n_out=2560` は条件を満たします。引数はコマンドラインから与えられ、環境変数ではありません。
+- planar copy の確保や変換、row gather が失敗した場合も、通常の比較完了とは異なる出力または終了コード 1 になります。
 
 ## 実行時の詳細
 
-プログラムはまず既定または CLI 引数から行列サイズ（`n_in`, `n_out`, `ncols`）を取り、ランダムな Q6_K 重みと入力を用意します。通常配置の MMVQ を実行して checksum を出力した後に、この変数を一度読みます。値が有効なら重みのコピーを用意して planar adoption を試し、planar MMVQ の全出力を通常配置の結果と `memcmp` で比較します。その後 20 回ウォームアップし、400 回測定して時間を出力します。さらに `max(1, n_out / 3)` 行を選んで planar gather し、全列について gather 結果を元行列の対応行とビット比較します。
+ベンチマークはまずランダムな Q6_K データと入力を作り、GGUF layout の kernel を測定して checksum を表示します。その後 `STRATA_BENCH_PLANAR` を読みます。有効なら重複行列をデバイスにコピーし、`native_q6_k_planar_adopt()` で planar layout に変換して kernel を実行します。最初の結果を通常 layout の結果と `memcmp()` で比較し、`bitwise EQUAL` または `bitwise DIFFERENT` を出力します。続いて出力行の約 3 分の 1（最低 1 行）を gather し、全列の出力を元の行列の対応行と比較して差分数を表示します。
 
-全出力が一致すれば `bitwise EQUAL`、異なれば `bitwise DIFFERENT` と表示します。gather の不一致数も表示し、どちらかの比較に差があれば終了コード 1、差がなければ 0 です。adoption または gather を行えない場合も診断を出して終了コード 1 になります。変数は `main` 内で一度だけ評価されるので、起動後の環境変更は反映されません。子プロセスへの転送処理はありません。
+planar の結果に差がある場合、または gather 結果に差がある場合は終了コード 1 です。両方一致すれば 0 です。環境変数はベンチマークの `main()` 内で一度読み、static cache はありません。実行中に環境を変更して再評価する処理もありません。
 
 ## 根拠
 
-- `sycl/src/kernels/mmvq_bench.cpp:13-28` — 引数と合成データを用意し、ベースラインを実行。
-- `sycl/src/kernels/mmvq_bench.cpp:51-59` — baseline checksum の後で環境変数を読み、`atoi(...) != 0` で分岐。
-- `sycl/src/kernels/mmvq_bench.cpp:60-97` — planar adoption、全出力と gather 結果の比較、測定、終了コード。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:3062-3067,3075-3115,3118-3152` — SYCL カーネル側の planar 機能条件、adoption/gather の失敗時処理とログ。
-- `sycl/CMakeLists.txt:254-255,362-365,396` — `STRATA_SYCL_PARITY` のブロック内で `mmvq_bench` を作成。
-- `CMakeLists.txt:12-21` — トップレベルの SYCL 選択条件。
-- `docs/INTEL.md:491-500` — 関連する `STRATA_Q6_PLANAR` の設計説明と測定値。これは `STRATA_BENCH_PLANAR` の有効化による速度効果を示す記述ではありません。
+- `sycl/src/kernels/mmvq_bench.cpp:1-2,13-27`: 対象実行ファイル、既定引数、合成入力および Q6_K 行列の準備。
+- `sycl/src/kernels/mmvq_bench.cpp:29-55`: 通常 layout の比較、測定、checksum 出力。
+- `sycl/src/kernels/mmvq_bench.cpp:56-97`: 変数の唯一の読み取り箇所、`atoi` 判定、planar adopt、bitwise 比較、gather 比較、戻り値。
+- `sycl/CMakeLists.txt:278-281,387-390`: `STRATA_SYCL_PARITY` の既定値と `mmvq_bench` の定義位置。
+- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:3062-3068,3072-3114,3117-3151`: `STRATA_Q6_PLANAR` の判定、planar adopt/gather の適格条件と失敗時の挙動。
+- `docs/INTEL.md:393,480-482`: `STRATA_Q6_PLANAR` の概要と Q6_K decode kernel の測定記録。これらは `STRATA_BENCH_PLANAR` 自体の効果測定ではなく、ベンチマーク環境での性能を保証するものではありません。
