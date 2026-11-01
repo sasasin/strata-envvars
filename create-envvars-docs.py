@@ -44,6 +44,7 @@ PROMPT_TEMPLATE = """調査依頼です。Strata の環境変数 1 個につい�
 5. 外部ライブラリや GPU driver が読むだけの名前や、読み取り箇所が見つからない場合は、空の文書や推測の文書を作らず、`{index}` との食い違いとして報告してください。Strata が値を読む・転送する・警告を出す事実だけを書き、外部ライブラリ側の挙動を Strata の挙動として説明しないでください。
 6. 作成先がすでに存在する場合は上書きせず、その旨を報告してください。
 7. 編集対象は指定された文書 1 件だけです。索引 `{index}`、`{investigation}`、他の環境変数文書、Strata のソースコードを変更しないでください。調査のためのソース変更、build、GPU 実行、性能測定、テストは行わないでください。
+{stale_note}
 """
 
 INDEX_ENTRY_RE = re.compile(r"^- `([A-Za-z0-9_]+)`\s*$")
@@ -111,7 +112,71 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="試行記録を消してから実行する",
     )
+    parser.add_argument(
+        "--stale-report",
+        type=Path,
+        default=REPO_ROOT / ".strata-stale.json",
+        help="find-stale.py の報告。削除理由を codex へ渡す (存在しなければ無視)",
+    )
     return parser.parse_args()
+
+
+def strata_head() -> str:
+    result = subprocess.run(
+        ("git", "-C", str(STRATA_ROOT), "rev-parse", "HEAD"),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+def load_stale_notes(report_path: Path, revision: str) -> dict[str, str]:
+    """陳腐化検出の報告を、変数名ごとの追記文にする。"""
+    if not report_path.is_file():
+        return {}
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"陳腐化報告を読み込めません: {exc}", file=sys.stderr)
+        return {}
+    if payload.get("revision") != revision:
+        print(
+            f"陳腐化報告の revision ({payload.get('revision')}) が Strata HEAD ({revision}) と違うので無視します",
+            file=sys.stderr,
+        )
+        return {}
+
+    notes: dict[str, str] = {}
+    for item in payload.get("candidates", []):
+        if item.get("scope") != "envvars":
+            continue
+        name = str(item.get("key", ""))
+        if not name:
+            continue
+        lines = [
+            "",
+            "追加情報: この文書は陳腐化検出で削除されました。旧記述を引き継がず、現行 checkout を読み直して作成してください。",
+            f"- 判定: {item.get('verdict')}",
+            f"- 旧文書の調査対象: {item.get('doc_sha')}（{item.get('doc_date') or '調査日不明'}）、現行基準: {revision}",
+        ]
+        if item.get("sha_suggestion"):
+            lines.append(
+                f"- 旧文書の SHA は Strata に実在しません。索引の {item['sha_suggestion']} の打ち間違いの可能性があります"
+            )
+        commits = item.get("changed_commits") or []
+        if commits:
+            lines.append(f"- 根拠ファイルに触れたコミット（先頭 {min(6, len(commits))} 件）:")
+            lines += [f"    {line}" for line in commits[:6]]
+        for diff_line in (item.get("token_lines") or [])[:4]:
+            lines.append(f"- 変更差分にこの変数名が現れます: {diff_line[:160]}")
+        for path in (item.get("found_now") or [])[:5]:
+            lines.append(f"- 現行 checkout での所在候補: {path}")
+        for symbol in (item.get("symbols_missing") or [])[:6]:
+            lines.append(f"- 旧文書が挙げるが現行 Strata に無い識別子: {symbol}")
+        notes[name] = "\n".join(lines)
+    return notes
 
 
 def read_index() -> list[str]:
@@ -181,7 +246,7 @@ def find_missing(names: list[str]) -> tuple[list[str], list[str]]:
     return missing, skipped
 
 
-def create_doc(envvar: str) -> tuple[str, int, str, str]:
+def create_doc(envvar: str, stale_note: str = "") -> tuple[str, int, str, str]:
     doc_path = DOC_ROOT / f"{envvar}.md"
     prompt = PROMPT_TEMPLATE.format(
         strata_root=STRATA_ROOT,
@@ -190,6 +255,7 @@ def create_doc(envvar: str) -> tuple[str, int, str, str]:
         index=INDEX,
         investigation=DOC_ROOT / "001_investigation.md",
         example_doc=DOC_ROOT / "STRATA_ADAPT_OVERLAP.md",
+        stale_note=stale_note,
     )
     with tempfile.TemporaryDirectory(prefix="create-envvars-docs-") as temp_dir:
         temp_path = Path(temp_dir)
@@ -271,13 +337,18 @@ def main() -> int:
             print(f"  {name} -> docs/envvars/{name}.md")
         return 0
 
+    notes = load_stale_notes(args.stale_report, strata_head())
+    if notes:
+        hit = sum(1 for name in targets if name in notes)
+        print(f"陳腐化報告: {len(notes)} 件 / 今回対象に {hit} 件分付与")
+
     completed = 0
     failed_count = 0
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         futures = {}
         for name in targets:
             print(f"\n=== 開始: {name} ===", flush=True)
-            futures[executor.submit(create_doc, name)] = name
+            futures[executor.submit(create_doc, name, notes.get(name, ""))] = name
         for future in as_completed(futures):
             envvar = futures[future]
             try:

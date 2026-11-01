@@ -1,48 +1,45 @@
 # `STRATA_MTP_PREFILL_SYNC`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 ## 役割
 
-MTP drafter がプロンプト中の draft layer 用 K/V を作るフォールバック処理で、旧来の「最大 `max_t_` 行ごとに入力を準備して graph を実行し、その都度 stream を同期する」経路と、入力レコードをまとめて転送し、複数 group の graph を投入してから同期する E-4 経路を選びます。`1` 相当は旧経路、`0` 相当は E-4 経路です。
-
-この変数を読むのは `MtpDrafter::prefill()` です。通常の単一 GPU では先に `Prefill::draft_kv()` が試され、対応できない場合に drafter 自身の `prefill()` へ進みます。MTP が無効ならこの経路は呼ばれません。CUDA サーバーの layer split では、別設定 `STRATA_SPLIT_MTP_BATCH=1` によって prompt-path のバッチ処理が有効になる場合があります。その場合も、バッチ処理が辞退すれば drafter 側の経路へ進みます。
+MTP drafter がプロンプト中の K/V を自身の `MtpDrafter::prefill` で計算するとき、入力をグループ単位で逐次処理する旧方式を選ぶか、入力レコードをまとめて転送してグループを連続投入する E-4 方式を選ぶかを制御します。MTP が無効な実行や、メイン prefill が draft K/V を batched 経路で作れた場合には、この設定による分岐を通りません（`src/program/generate.cpp:11006-11027`, `src/prefill/prefill.cpp:1916-1937`）。
 
 ## 値と判定
 
-`std::getenv()` で未設定かどうかを調べ、設定値は `std::atoi()` で整数化して 0 かどうかを判定します。文字列全体の妥当性検査はありません。
+`std::getenv` で取得し、設定されていれば `std::atoi(value) != 0` で判定します。文字列全体の検証や範囲制限はありません。
 
-| 入力 | 判定 |
-|---|---|
-| 未設定 | HIP は旧経路。それ以外は E-4 経路 |
-| 空文字 | `atoi("") == 0` のため E-4 経路 |
-| 数値として 0 になる文字列（例 `0`, `abc`） | E-4 経路 |
-| `atoi()` が非 0 を返す文字列（例 `1`, `-1`, `2tail`） | 旧経路 |
+| 値 | 判定 |
+| --- | --- |
+| 未設定 | `STRATA_USE_HIP` が定義されたビルドでは旧方式（true）。それ以外では E-4（false）。 |
+| 空文字 | `atoi("")` は 0 となるため E-4。 |
+| 数値の先頭部分が 0 | 旧方式を無効化。例: `0`, `0xyz`。 |
+| 数値の先頭部分が非ゼロ | 旧方式を有効化。例: `1`, `-1`, `2`, `1xyz`。 |
+| 数字で始まらない文字列 | `atoi` の結果が 0 となるため E-4。先頭空白と符号の後に数字があれば、その数値部分で判定。 |
 
-先頭空白や符号は `atoi()` の規則で解釈されます。数値の後ろにある文字は変換を止める位置以降、判定に影響しません。値の大きさに応じた範囲制限はありません。
+したがって、`=0` は HIP の既定動作も E-4 に切り替え、`=1` は非 HIP の既定動作も旧方式に切り替えます。読み取り結果は関数内の `static` 変数に保存されるため、最初の評価後にプロセス環境を変更しても反映されません（`src/core/mtp.cpp:1425-1435`, `sycl/src/core/mtp.cpp:1380-1387`）。
 
 ## 有効になる条件
 
-- MTP drafter が有効で、プロンプト処理から `MtpDrafter::prefill()` が呼ばれる必要があります。
-- 1 GPU の通常経路では `Prefill::draft_kv()` が先に試されます。たとえば drafter の K/V が hybrid である、ring に対して `STRATA_MTP_BATCH_RING=0` が指定されている、または必要な tensor や embedding の条件を満たさないなどでバッチ処理が辞退すると、drafter 側へ進みます。`STRATA_MTP_BATCH=0` もバッチ処理を辞退させます。これらの辞退条件は `STRATA_MTP_PREFILL_SYNC` 自体の値判定ではありません。
-- CUDA の単一 GPU generate 経路でも、バッチ処理が成功すれば `mtp.prefill()` は呼ばれません。layer split は CUDA と SYCL で呼び出し条件が異なり、CUDA では `STRATA_SPLIT_MTP_BATCH` によるバッチ試行、SYCL の該当箇所では `!multi_gpu` 条件があります。
-- Metal は `MtpDrafter::prefill()` 冒頭で Metal engine に委譲して戻るため、この環境変数の判定箇所には到達しません。
+- MTP drafter が有効で、プロンプトの draft K/V を作る必要があること。
+- `Prefill::draft_kv` がその入力を batched 経路で処理しないこと。たとえば `STRATA_MTP_BATCH=0`、drafter の K/V が通常の paged/ring でない、hybrid K/V、別 GPU、必要な tensor や scratch 条件の不足などで batched 経路は decline し、呼び出し元が `mtp.prefill(...)` に進みます。ring K/V は `STRATA_MTP_BATCH_RING` などの条件にも左右されます（CUDA: `src/prefill/prefill.cpp:1924-1959`; SYCL: `sycl/src/prefill/prefill.cpp:1592-1629`; 呼び出し: `src/program/generate.cpp:11006-11027`, `sycl/src/program/generate.cpp:8055-8063`）。
+- Metal は `MtpDrafter::prefill` 冒頭で `metal_engine::mtp_prefill` に委譲して戻るため、この選択を評価しません（`src/core/mtp.cpp:1465-1470`）。
+- 既定値の切り替えは `STRATA_USE_HIP` のビルド macro によります。実行時の OS 名や GPU 型を調べる分岐はありません（`src/core/mtp.cpp:1427-1434`, `sycl/src/core/mtp.cpp:1380-1387`）。
+
+CLI 引数による直接の上書きは見つかりませんでした。E-9 の batched 経路側には別の `STRATA_MTP_BATCH` / `STRATA_MTP_BATCH_RING` 等の選択条件がありますが、そこで処理が完了すると本変数の判定には進みません。
 
 ## 実行時の詳細
 
-環境変数は `prefill()` 内の関数局所 `static const bool` 初期化子で一度だけ読みます。同一プロセスで最初にこの変数へ到達した後の環境変更は再評価されません。HIP ビルドでは未設定時に `true`、それ以外の同関数のビルドでは `false` です。設定があれば、この既定値を `atoi(value) != 0` で置き換えます。
+E-4（判定 false）では、`n` 件分の token / step / position レコードをまとめて構成・転送し、`max_t_` 件以下のグループごとに device copy と graph を同じ stream に投入します。`sync=true` なら最後に stream を同期し、`sync=false` なら投入後に query して戻ります。旧方式（判定 true）では、`sync` 引数にかかわらず各グループの入力を host 側に用意して graph を実行し、グループごとに stream を同期してから次へ進みます（`src/core/mtp.cpp:1486-1567`; SYCL 実装は `sycl/src/core/mtp.cpp:1388-1538`）。いずれも `first_needed` より前で window が再利用しないセルは飛ばします。
 
-旧経路では `max_t_` 以下の group ごとに入力を host 側 staging buffer に書き、`capture_prefill()` と graph launch を行い、各 group の後で stream を同期します（CUDA: `src/core/mtp.cpp:1458-1477`、SYCL: `sycl/src/core/mtp.cpp:1483` 以降）。E-4 経路では `n` 行分の token / step / position record を一括して device buffer に転送し、各 group に対して record と hidden-state の device copy、graph launch を順に投入します。`sync` 引数が true なら投入後に一度だけ stream / queue を同期します。false なら同期を待たずに戻り、呼び出し側が同じ stream 上で順序を保つ前提です（CUDA: `src/core/mtp.cpp:1400-1456`、SYCL: `sycl/src/core/mtp.cpp:1364-1481`）。
+prompt chunk callback は `use_mtp` が true で E-9 batched 経路が成功しなかった場合に `mtp.prefill` を呼び、失敗時は callback が false を返します（`src/program/generate.cpp:11006-11027`, `17773-17780`; SYCL: `sycl/src/program/generate.cpp:8055-8063`, `12390-12402`）。通常の prompt pass でも MTP 有効時に呼び出され、pipelined window では `sync=false` で呼ばれます（`src/program/generate.cpp:14871,14939`; SYCL: `sycl/src/program/generate.cpp:10532,10594`）。merged window の経路にも呼び出しがあります（`src/program/generate.cpp:17033-17036`）。この変数専用のログや警告はありません。allocation、upload、graph launch、同期が失敗すると `mtp prefill: ...` のエラー文字列を設定して false を返す経路があります（`src/core/mtp.cpp:1488-1495,1512-1514,1523-1540,1545-1563`; SYCL: `sycl/src/core/mtp.cpp:1389-1424,1429-1502`）。
 
-この同期引数は `STRATA_MTP_PREFILL_SYNC` とは独立しています。環境変数が選ぶのは per-group の旧経路か一括転送経路かであり、E-4 経路の末尾で待つかは `sync` 引数によります。
-
-両経路とも、`cell0 + c + T <= first_needed` の group は K/V を今後参照しないとして処理を飛ばします。メモリ確保、転送、graph launch、同期の失敗時は `false` を返し、`err` に `mtp prefill: ...` のエラーを設定します。通常の選択結果を知らせる専用ログはこの判定箇所にはありません。
+コードコメントには、HIP の一部環境で E-4 が停止した観測と旧方式の比較が記されていますが、これはコメントに記録された条件での報告です。現行ソースから他の環境での性能や停止の有無は判断できません（`src/core/mtp.cpp:1480-1485`）。
 
 ## 根拠
 
-- 環境変数の parse、ビルド別既定値、一括経路: `src/core/mtp.cpp:1371-1456`、`sycl/src/core/mtp.cpp:1339-1481`。
-- 旧経路の group ごとの同期: `src/core/mtp.cpp:1458-1480`、`sycl/src/core/mtp.cpp:1483-1510`。
-- CUDA generate の fallback 呼び出し: `src/program/generate.cpp:13214-13225`。CUDA server の prompt path と layer split のバッチ条件: `src/program/generate.cpp:8504-8529`。
-- SYCL generate のバッチ試行と fallback: `sycl/src/program/generate.cpp:7818-7826`、`sycl/src/program/generate.cpp:11891-11902`。
-- バッチ経路の辞退条件: `src/prefill/prefill.cpp:1381-1424`。
-- `docs/DETAILS.md` には `STRATA_MTP_PREFILL_SYNC` または E-4 の説明は見つかりませんでした。`src/core/mtp.cpp:1382-1391` と SYCL 側同範囲には、旧経路に関する測定・障害のメモがありますが、ここではソース内コメントの記録として扱い、独立に再測定した結果とはしていません。
+- 直接の環境読み取りと既定値: `src/core/mtp.cpp:1425-1435`, `sycl/src/core/mtp.cpp:1380-1387`。
+- 二方式の選択、E-4 のまとめ投入と末尾同期、旧方式のグループ同期: `src/core/mtp.cpp:1465-1567`, `sycl/src/core/mtp.cpp:1363-1538`。
+- prompt prefill からの呼び出しと失敗伝播: `src/program/generate.cpp:11006-11027`, `sycl/src/program/generate.cpp:8055-8063`。
+- E-9 batched 経路の decline 条件: `src/prefill/prefill.cpp:1916-1959`, `sycl/src/prefill/prefill.cpp:1592-1629`。

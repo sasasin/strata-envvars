@@ -14,6 +14,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from staleness_lib import sha_distance, similar_sha
+
 
 DEFAULT_REPO = Path(__file__).resolve().parents[4]
 
@@ -362,22 +364,10 @@ def add_suspect_shas(report: dict[str, object], target: str) -> None:
     if not isinstance(counts, dict):
         return
     for sha, count in sorted(counts.items()):
-        if sha != target and similar(sha, target):
+        if sha != target and similar_sha(sha, target, max_diff=2):
             report["problems"].append(
-                f"{sha} は索引の {target} と {distance(sha, target)} 文字差（誤記または別 commit）: {count} 件"
+                f"{sha} は索引の {target} と {sha_distance(sha, target)} 文字差（誤記または別 commit）: {count} 件"
             )
-
-
-def similar(a: str, b: str) -> bool:
-    """SHA 表記の誤記らしきものだけを拾う（1〜2 文字差）。"""
-    return 0 < distance(a, b) <= 2
-
-
-def distance(a: str, b: str) -> int:
-    """同じ長さの 16 進文字列としての異なる文字数。長さが違えば大きい値を返す。"""
-    if len(a) != len(b):
-        return 99
-    return sum(1 for x, y in zip(a, b) if x != y)
 
 
 def print_meta_gaps(report: dict[str, object], limit: int = 15) -> None:
@@ -416,9 +406,9 @@ def report_stale(env_report: dict[str, object], cli_report: dict[str, object], t
             mark = "= 基準" if sha == target else ""
             print(f"  {sha}  {count} 件 {mark}")
         if target:
-            close = [sha for sha in counts if sha != target and similar(sha, target)]
+            close = [sha for sha in counts if sha != target and similar_sha(sha, target, max_diff=2)]
             for sha in sorted(close):
-                print(f"  疑わしい SHA（{target} と {distance(sha, target)} 文字差）: {sha} {counts[sha]} 件")
+                print(f"  疑わしい SHA（{target} と {sha_distance(sha, target)} 文字差）: {sha} {counts[sha]} 件")
 
 
 def main() -> int:

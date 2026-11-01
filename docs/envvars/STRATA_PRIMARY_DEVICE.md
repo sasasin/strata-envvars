@@ -1,50 +1,51 @@
 # `STRATA_PRIMARY_DEVICE`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。
+調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 ## 役割
 
-`strata generate` がモデルと通常の実行セッションを置く可視 GPU の ordinal を指定します。未設定または 0 は従来どおり ordinal 0 を使います。主 GPU の選択は `--expert-cache-device1..3` の補助キャッシュ GPU の割り当てや、peer GPU の相互アクセス判定にも使われます。実装コメントは特に Windows HIP の固定列挙順を理由として挙げています。`HIP_VISIBLE_DEVICES` はデバイスを絞りますが Windows HIP の列挙順を変えないため、より速い GPU が後ろにある場合に本変数で主 GPU を選べます。
+標準の `strata generate` / `strata serve` 経路で、モデル本体のセッションが使う可視 GPU ordinal を選びます。既定は ordinal 0 です。値が正なら、起動後にエンジン本体のスレッドをその GPU に切り替えます。helper expert cache の配置と peer expert tier もこの primary ordinal を参照します。
+
+この設定は `src/program/generate.cpp` でのみ環境から読まれます。Qwen3.5 MoE の専用エンジンへ振り分けられる場合は、その分岐がこの設定の読み取りより先に行われるため、この経路では適用されません。`--version`、`--families`、`--help` など通常の生成処理に入らず終了する経路も読み取りません。
 
 ## 値と判定
 
-起動時に `std::getenv` で値を一度読み、`std::atoi` で整数に変換します。変換後の値が正の場合だけ採用し、それ以外は 0 にします。文字列全体の妥当性確認はありません。
+通常経路では `std::atoi` で整数に変換し、変換結果が正の場合だけ指定値を採用します。未設定、空文字、0、負数、整数の先頭として読めない文字列は ordinal 0 になります。`atoi` のため文字列全体の厳密な検証はなく、先頭の空白や符号を許し、数値の後ろに文字があっても数値部分を使います（例: `2x` は 2）。大文字小文字の規則はありません。整数型の範囲外の入力は有効な指定値として扱えません。
 
-| 環境値 | 結果 |
-|---|---|
-| 未設定 | 0 |
-| 空文字、数値に変換できない文字列 | 0（`atoi` が 0 を返す） |
-| 正の整数 | その整数。例: `2`、`+2` |
-| 正の整数の後ろに文字が続く値 | 数字部分の整数。例: `2abc` は 2 |
-| 0 または負の数 | 0 |
+| 入力例 | 採用される ordinal | 結果 |
+|---|---:|---|
+| unset、空文字、`0`、`-1`、`abc` | 0 | runtime の既定 primary を維持 |
+| `1`、`2`、`  +2tail` | 変換された正整数 | 指定 ordinal を使う。可視 GPU 範囲内である必要がある |
+| GPU 数以上の正整数 | 指定 ordinal | 可視 GPU がないとしてエラー終了 |
 
-`atoi` のため、先頭空白の後の符号付き数字も変換対象です。範囲外の数値に対する `atoi` の結果は C/C++ の仕様上保証されないため、ここでは動作を規定しません。設定有無だけを判定する方式ではなく、空文字は有効な ordinal になりません。
-
-根拠: `src/program/generate.cpp:2740-2749`。
+CLI 引数による同等設定や上書きはありません。`--gpu` は CUDA/HIP の可視デバイス集合を先に設定するため、`STRATA_PRIMARY_DEVICE` はその後の可視 ordinal に対して解釈されます。たとえば `--gpu` でデバイスを絞った場合、指定できる ordinal は絞り込み後の並びに対する番号です。
 
 ## 有効になる条件
 
-- 値の読み取りは `generate.cpp` の生成処理で行われます。別プロセスから呼び出す場合は、そのプロセスの環境に設定されている必要があります。リクエストごとの再読込を示す実装はなく、生成処理の起動時に一度評価されます。
-- 正の ordinal は可視デバイスの範囲内でなければなりません。`cudaGetDeviceCount` が失敗するか ordinal が可視台数以上の場合は stderr に `strata generate: STRATA_PRIMARY_DEVICE=%d: no such visible device (%d visible)` を出して終了コード 2 で戻ります。
-- 範囲内でも `cudaSetDevice` が失敗すると stderr にエラー理由を出し、終了コード 1 で戻ります。成功時は stderr に `strata generate: primary device from STRATA_PRIMARY_DEVICE: CUDA%d` を出します。0 の場合、この切り替え、検査、成功ログは行いません。
-- `--layer-split` が空でない状態では、主 ordinal が 0 以外なら layer split の準備後に stderr へ `strata generate: STRATA_PRIMARY_DEVICE %d is not supported with a layer split yet` を出して終了コード 2 で戻ります。split が auto でもこの時点で有効な指定として残っていれば拒否されます。
-- これは CUDA/HIP 共通の生成コードにあり、ソース上で Windows HIP 専用の環境値判定には限定されていません。ただし Windows HIP 以外での必要性や具体的な列挙順は、環境やランタイムに依存するため本コードだけでは一般化できません。
+- 標準の generate/serve エンジン経路に入ること。Qwen3.5 MoE は `strata::qwen35::run` に先行して分岐するため、この選択処理を通りません。
+- 0 以外を指定する場合、その番号が runtime の列挙する可視 GPU の範囲内であること。HIP ビルドではさらに、primary と実際に使う helper GPU がビルド済みアーキテクチャに対応する必要があります。
+- `--layer-split` との併用は、指定値が 0 以外なら拒否されます。後段 GPU の split-device 番号が primary 0 前提のためです。
+- Windows HIP でカードの runtime ordinal 固定順を変えるものではありません。選択した可視 ordinal にエンジン本体を置きます。`--gpu` / `HIP_VISIBLE_DEVICES` のフィルター後の ordinal が対象です。
+
+helper cache を使う場合、primary が 0 なら既定の CUDA1..3 配置を使い、primary が非 0 なら可視 GPU から primary を除いた ordinal を順番に helper 候補にします。不足分は無効値 `-1` になります。peer tier は `primary_device()` を使って primary と peer の P2P 可否判定・有効化を行います。helper や peer 機能自体を有効にする設定ではなく、それらの GPU 選択・primary 参照に作用する設定です。
 
 ## 実行時の詳細
 
-読み取った ordinal は `strata::core::set_primary_device()` に保存されます。同実装はプロセス内の整数を設定・返却するだけです。ordinal が正なら、GPU コンテキストや割り当てが始まる前に生成スレッド上で `cudaSetDevice(primary_device)` を呼びます。失敗時には上記のエラーで処理を止めます。このため、その後の主セッション用 GPU 作業は指定したデバイスを基準に開始します。セッション生成時も `OnDevice(primary_device)` が使われます。
+通常経路では CLI 引数を解析した後、`STRATA_PRIMARY_DEVICE` を一度読み、`set_primary_device()` に保存します。値の再読込やリクエストごとの評価はありません。のちに primary が 0 以外なら、可視 GPU 数を確認してから `cudaSetDevice()` を呼び、成功時は stderr に `strata generate: primary device from STRATA_PRIMARY_DEVICE: CUDA<N>` を出します。可視範囲外は `no such visible device` を出して終了コード 2、`cudaSetDevice` の失敗はエラー文を出して終了コード 1 です。0 の場合は切替もこのログもありません。
 
-補助 expert cache の配置は、主デバイスが 0 の場合は既定の `{1, 2, 3}` です。主デバイスが 0 以外なら可視 ordinal を昇順に見て主デバイスを除外し、最大 3 台を補助デバイスとして選びます。主デバイスと同じデバイスを補助 cache として開こうとした場合、`RemoteExperts::preflight` はエラーにします。peer expert cache は `primary_device()` と補助デバイス間の双方向 peer access の問い合わせ・有効化に主 ordinal を使います。
+primary の検証・切替はモデルの重みやエンジン arena の割り当てより前ですが、起動時の一部 GPU 照会や backend の初期化はこの選択処理より前に ordinal 0 で実行されます。したがって、この変数が起動時のすべての GPU 照会先を変更するわけではありません。
 
-環境値は `generate.cpp` のこの処理で一度だけ読みます。設定値の変更を実行中に反映する再読込や、子プロセスへの書き換えはこの実装箇所にはありません。`CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` がある場合の ordinal は、ランタイムが列挙する可視デバイスの ordinal です。
+通常経路とは別に、HIP で `STRATA_HIP_GFX906` 以外のビルドは `prime_hw_queues()` でもこの値を読みます。これは CLI 解析と通常の primary 保存より前です。ここでは `atoi` 結果が正ならその ordinal、そうでなければ 0 を queue primer の対象にします。デバイス数取得失敗または範囲外なら queue primer は何もせず戻ります。`STRATA_HIP_QUEUE_PRIME=0` の場合はこの関数が先に戻るため、primary も読みません。これは HIP queue 初期化の対象選択であり、通常経路における範囲エラーの検出・終了処理とは別です。
 
 ## 根拠
 
-- 環境値の読み取り、`atoi`、正数以外を 0 にする処理、グローバルへの設定: `src/program/generate.cpp:2740-2749`、`src/core/device.cu:87-92`。
-- layer split との併用拒否: `src/program/generate.cpp:2811-2819`。
-- 補助 GPU の選択: `src/program/generate.cpp:2837-2849`。
-- 主 GPU の検証、切り替え、ログ: `src/program/generate.cpp:3262-3280`。
-- 主 GPU に置くセッション: `src/program/generate.cpp:4937-4943`。
-- 主 GPU と補助 cache の重複拒否: `src/core/remote_experts.cpp:69-80`。
-- peer GPU 判定・有効化に使う ordinal: `src/core/peer_experts.cpp:138-151`。
-- Windows HIP の選択理由と利用者向け説明: `include/strata/core/device.hpp:51-57`、`docs/SECOND_GPU.md:210-225`。
+- `src/program/generate.cpp:2957-2979` — `--gpu` が最初の CUDA/HIP 呼び出し前に可視デバイス環境を設定する処理。
+- `src/program/generate.cpp:2980-2999` — Qwen3.5 MoE への先行分岐と、HIP の queue primer 呼び出し。
+- `src/program/generate.cpp:2748-2768,2791-2804` — HIP queue primer 側の独立した環境読み取り、整数変換、範囲確認、選択デバイス上での初期化。
+- `src/program/generate.cpp:3566-3575` — 標準経路での `atoi` 判定と primary ordinal の保存。
+- `src/program/generate.cpp:3637-3645` — 非 0 primary と layer split の拒否。
+- `src/program/generate.cpp:3663-3675,3755-3769` — helper ordinal の選択と HIP build architecture の確認。
+- `src/program/generate.cpp:4140-4158` — primary の可視範囲確認、デバイス切替、ログと失敗終了。
+- `src/program/generate.cpp:5933-5939` — main session の初期化を primary ordinal 上で行う箇所。
+- `include/strata/core/device.hpp:51-57`, `src/core/device.cu:87-92` — primary ordinal の意味とプロセス内保存。
+- `src/core/remote_experts.cpp:71-81,136-149`, `src/core/peer_experts.cpp:125-154` — helper の primary 重複拒否と peer tier の primary 参照。

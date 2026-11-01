@@ -1,45 +1,43 @@
 # `STRATA_MOVE_ALWAYS_COPY`
 
-調査対象: Strata `main` の HEAD `b478c6cc8764fe4451886652b2a8a565e751873f`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 ## 役割
 
-モデル格納先を移動する Python 実装の同一ボリューム判定を上書きします。値が文字列 `1` と完全一致すると、実際には同じボリューム上でも `same_drive()` は `False` を返し、モデル移動は rename 経路ではなくコピー経路になります。モジュールの説明ではこの設定は「同じディスク上でコピー経路を試す」ためのものです。読み取りは `strata_control/models_move.py` にあり、モデル移動処理で使われます（`strata_control/models_move.py:1-12,104-111`）。
+`strata models move` とデスクトップアプリが共有するモデルファイル移動処理で、移動元と移動先が同じボリュームでもコピー経路を強制します。主な用途は、同一ボリューム上でコピー処理を試すことです。通常、同じボリュームならファイルを rename（`os.replace`）し、別ボリュームならコピー・検証後に元ファイルを削除します。環境変数を有効にすると、同じボリュームの場合も後者の経路を使います。
 
 ## 値と判定
 
-`os.environ.get("STRATA_MOVE_ALWAYS_COPY") == "1"` で文字列全体を比較します。数値変換、空白除去、大文字小文字変換はありません。
+| 値 | 判定 |
+|---|---|
+| 未設定 | `os.environ.get()` は `None`。環境変数による強制はなく、`os.stat(...).st_dev` で同一ボリュームかを判定する |
+| 空文字 | `"1"` と一致しないため強制しない |
+| 文字列 `1` | 同一ボリューム判定を `False` にする |
+| その他（例: `0`, `true`, `01`, ` 1`） | `"1"` と完全一致しないため強制しない |
 
-| 環境値 | `same_drive()` の結果 | 意味 |
-|---|---:|---|
-| 未設定 | 実際のボリューム判定へ進む | `_near()` で得た既存パス同士の `st_dev` を比較 |
-| 空文字 | 実際のボリューム判定へ進む | コピー強制にはならない |
-| `1` | `False` | コピー経路を強制 |
-| その他（例: `0`, `true`, `01`, `1 `） | 実際のボリューム判定へ進む | コピー強制にはならない |
-
-環境値が `1` 以外の場合、または未設定の場合に `os.stat()` が `OSError` になれば、同関数は `False` を返します。この場合も呼び出し側ではコピー側の扱いになりますが、環境変数による強制とは別の fallback です（`strata_control/models_move.py:96-111`）。
+数値変換や前後空白の除去、大文字小文字の正規化はありません。値が `"1"` でも、移動元と移動先が別ボリュームなら判定結果は元から `False` なので、移動処理上の経路は変わりません。`same_drive()` は呼び出されるたびに環境を参照し、値を static/global cache しません。
 
 ## 有効になる条件
 
-- `strata models move NEW` の計画・実行では、`plan()` が `same_drive()` を呼びます。`--plan` の結果にも、実移動にも反映されます（`strata_cli/cli.py:617-634,648`、`strata_control/models_move.py:137-184,379-401`）。
-- 移動をコピー扱いにすると、計画はファイル合計の `int(total * 1.05)` バイトを必要容量として見積もります。同一ボリューム扱いなら必要容量は 0 です。コピー扱いで空き容量が足りないと、実移動は `MoveError("disk_full", ...)` で始まりません（`strata_control/models_move.py:31,170-180,391-394`）。
-- コピー扱いの移動では通常、各ファイルを `.part` に書き、サイズと SHA-256 を確認して配置し、その後に元ファイルを削除します。同じ inode のハードリンクを検出した場合は `os.link()` を試し、失敗時に検証付きコピーへ fallback します。同一ボリューム扱いの経路は `os.replace()` による移動です（`strata_control/models_move.py:223-258,441-500`）。
-- `strata models move --resume` は通常の `move()` に戻るため、再開時点の環境値で判定し直します（`strata_cli/cli.py:668-705`）。`--leave` による中断移動の後始末でも、元側に戻すファイルごとに `same_drive()` を呼びます。`1` なら復元もコピー経路になります（`strata_control/models_move.py:534-565`）。
-- 既存データフォルダーと移動先が同一パスの場合や、片方が他方の内側の場合など、計画がそれ以前の検査で拒否される経路では同変数を使った移動判定に到達しません（`strata_control/models_move.py:156-170`）。
-
-この判定に CLI オプションや他の環境変数との値の優先順位はありません。移動元・移動先などの CLI 指定は別途パスを選びます。なお、通常の `same_drive()` でも `st_dev` が異なればコピー経路です。環境変数が追加で強制するのは、通常なら同一ボリューム判定になるケースです。
+- `strata models move --plan` では `plan()` が同一ボリューム判定を行い、結果の `same_drive` と必要空き容量に反映します。同一ボリューム扱いなら必要容量は 0 ですが、この変数でコピーを強制すると `int(total * 1.05)` が必要になります。
+- 通常の `strata models move` は `move()` 内で `plan()` を呼んでから、その結果に応じて rename またはコピーを選びます。CLI 引数にこの判定を上書きするものはありません。
+- 中断した移動の `--leave` 処理では、コピー先にしかないファイルを元フォルダーへ戻す際にも `same_drive()` を呼びます。この変数が `1` なら同一ボリュームでも検証付きコピー後にコピー先を削除します。`--status` は移動状態を読むだけで、この判定を使いません。
+- 判定は Python プロセスの環境を読むため、そのプロセスに環境変数が渡っている場合に適用されます。ソース上に OS、backend、build macro、モデル形式による追加条件はありません。
 
 ## 実行時の詳細
 
-読み取りはモジュール import 時ではなく、`same_drive()` が呼ばれた時に `os.environ.get()` で行われます。結果の `static` キャッシュ等はありません。`plan()` と `move()` では `move()` が呼ぶ `plan()` の結果を実際のファイル処理に使います。したがって、計画と後続の実移動でプロセス環境が変更されれば、それぞれの呼び出しで異なる結果になり得ます。`leave()` は対象ファイルの処理中に判定関数を呼ぶため、判定はファイルごとです（`strata_control/models_move.py:104-111,170,388-401,558-562`）。
+`same_drive(a, b)` は最初に `os.environ.get("STRATA_MOVE_ALWAYS_COPY") == "1"` を調べ、一致すれば `False` を返します。それ以外は `_near()` で各パスの存在する親を探し、`os.stat(...).st_dev` を比較します。stat が `OSError` になった場合も `False` を返すため、コピー経路になります（`strata_control/models_move.py:96-111`）。この関数は計画時に呼ばれ、`move()` は計画結果の値をその実行中に使います。環境値を再評価するのは別の `same_drive()` 呼び出し時です（同: `170`, `379-423`）。
 
-この設定自体はログや警告を出しません。CLI の JSON/JSONL の計画結果・最終結果に `same_drive` が含まれ、強制時は `false` になります。JSONL では進捗イベントにも同値が含まれます。空き容量不足などの `MoveError` は JSON では `error`、通常出力では `strata: ...` と stderr に出て終了コード 5 になります。コピー経路の I/O・検証エラーも `MoveError` として CLI に返されます（`strata_control/models_move.py:140-149,423,510-511,241-255`、`strata_cli/cli.py:627-659`）。
+強制されたコピー経路では、移動先に一時 `.part` ファイルを作り、サイズと SHA-256 を照合し、存在すれば元ファイルの `.done` にある固定 SHA-256 とも比較してから `os.replace()` で配置します。その後に元ファイルを削除します。共有 inode のファイルは可能なら hard link を使う特例があります（同: `223-258`, `451-500`）。
+
+`--plan` の結果は通常出力または JSON に現れます。移動実行では JSONL の progress event に `same_drive: false` が含まれます。環境変数専用のログや警告はありません。容量不足は `MoveError("disk_full", ...)`、コピー照合不一致は `MoveError("verify", ...)`、I/O 失敗は `MoveError("io", ...)` となり、CLI は失敗 JSON または stderr の `strata: ...` を出して終了コード 5 を返します。コピー検証で失敗した場合は `.part` を削除し、元ファイルはその経路では削除しません（同: `223-258`, `388-394`, `491-500`; `strata_cli/cli.py:627-660`）。
 
 ## 根拠
 
-- 候補一覧には `STRATA_MOVE_ALWAYS_COPY` が掲載されています（`docs/envvars/000_envvers.md:1107`）。実際の環境読み取りは `strata_control/models_move.py:104-111` の一箇所です。行 105 の説明コメントだけでなく、行 106 の `os.environ.get()` が読み取りを裏付けます。
-- 計画上の空き容量見積もり: `strata_control/models_move.py:170-180`。
-- rename/copy の分岐とコピー後の元ファイル削除: `strata_control/models_move.py:441-500`。
-- 中断移動の復元経路: `strata_control/models_move.py:534-565`。
-- CLI からの計画、実行、再開・後始末、および結果の表示: `strata_cli/cli.py:617-660,668-705`。
-- 関連資料は `docs/release-notes-0.2.2.md:15`。同一ドライブでは rename、別ドライブでは検証付きコピーを行うという記述が実装と一致します。同資料はこの環境変数自体の値判定を説明していないため、値の規則は現行ソースに基づいています。
+- `strata_control/models_move.py:104-111` — 値の完全一致判定、未設定時のボリューム比較、stat 失敗時の fallback。
+- `strata_control/models_move.py:166-180` — 判定結果と必要空き容量の関係。
+- `strata_control/models_move.py:223-258` — コピー、サイズ・SHA-256 検証、`.part` cleanup と失敗分類。
+- `strata_control/models_move.py:379-423,441-511` — 計画結果に基づく移動経路、進捗値、コピー後の元ファイル削除。
+- `strata_control/models_move.py:534-565` — `--leave` での復元経路。
+- `strata_cli/cli.py:617-660,668-705` — CLI の plan / move / resume / leave 呼び出しと観測可能な終了・出力。
+- `strata_control/models_move.py:1-11` — デスクトップアプリと Terminal が共有する移動処理であること。

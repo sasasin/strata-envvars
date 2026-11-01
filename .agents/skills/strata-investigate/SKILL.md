@@ -6,11 +6,12 @@ description: |
   最新化し、増減に合わせて docs/envvars/<NAME>.md と
   docs/cli/<tool-id>/<command-path>/<option>.md を 1 件 1 セッションで作成・削除する。
   create-envvars-docs.py / create-cli-docs.py の並列実行と飽和判定、索引と実ファイルの突合
-  (scripts/check-docs.py) も扱う。
+  (scripts/check-docs.py)、既存文書の陳腐化検出と再作成 (scripts/cli-grammar.py、
+  evidence-index.py、find-stale.py、mark-stale.py) も扱う。
   以下で使用:「Strata が更新された」「環境変数一覧を最新化して」「この環境変数の調査文書を作って」
   「CLI オプションの文書を作って」「未作成の文書をまとめて作る」
   「消えた環境変数・コマンドの md を消して」「docs が追従しているか点検して」
-  「Strata を速くする環境変数を提案して」
+  「既存文書が古くなっていないか調べたい」「Strata を速くする環境変数を提案して」
   以下には使用しない: Strata 本体のコード変更・build・GPU 実行・性能測定・テスト追加
   （調査では行わない）／ Strata 以外のリポジトリの調査 ／ 既にある文書の要約や解説を書くこと。
 ---
@@ -55,6 +56,7 @@ git -C "$HOME/src/github.com/Niko1221/Strata" describe --tags
 | 環境変数 1 個を調べてほしい | D envvars 1 件 | `docs/envvars/001_investigation.md` + `assets/envvar-doc.md` |
 | CLI のオプション 1 個を調べてほしい | E CLI 1 件 | `docs/cli/001_investigation.md` + `assets/cli-option-doc.md`（概要なら `assets/cli-command-readme.md`） |
 | 追従状況・リンク切れ・重複を点検 | F 突合 | `scripts/check-docs.py` |
+| 既存文書の中身が古くなっていないか | H 陳腐化検出 | `references/staleness.md` |
 | 速度改善に効く変数を相談したい | G 提案セッション | `references/prompts.md` の依頼文 |
 
 どのモードでも、コードからの情報抽出は `references/extraction-recipes.md` の検索語・抽出技を使う。
@@ -68,6 +70,33 @@ git -C "$HOME/src/github.com/Niko1221/Strata" describe --tags
 5. 減った項目は B に進み、増えた項目は C に進む。
 
 各索引が従うべき手順の本文は `docs/` 側に既にある（`docs/cli/000_cli_tools.md` と `docs/cli/README.md` の「更新手順と次回の調査指示」節、`docs/envvars/000_envvers.md` 冒頭の生成方法）。索引は**予定リンクを含んだ一覧**であって、この段階で個別文書は作らない。
+
+CLI 索引を更新したときは option inventory も再生成する（`scripts/cli-grammar.py`）。H の陳腐化検出 (S-c) がこれを使う。
+
+## H. 陳腐化検出（索引更新の直後に回す）
+
+```bash
+python3 .agents/skills/strata-investigate/scripts/cli-grammar.py       # option inventory
+python3 .agents/skills/strata-investigate/scripts/evidence-index.py    # 証拠台帳
+python3 .agents/skills/strata-investigate/scripts/find-stale.py --stage3
+python3 .agents/skills/strata-investigate/scripts/mark-stale.py --limit 20          # dry-run
+python3 .agents/skills/strata-investigate/scripts/mark-stale.py --apply --limit 20  # 削除
+python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
+  --exclude-token=--help --limit 200 --apply                                        # 共通 option は後回し
+uv run ./create-envvars-docs.py -p 5 -l 20                                          # 再作成
+uv run ./create-cli-docs.py -p 12 -l 40
+python3 .agents/skills/strata-investigate/scripts/check-docs.py
+```
+
+要点は「文書が引用した行範囲が Strata 側で動いたか」（Stage 1）を見てから、「その差分に環境変数名・
+option 文字列そのものが出るか」（Stage 2）で候補を絞ること。判定の意味と確度、安全弁は
+`references/staleness.md`。削除した項目は索引に残したまま試行記録から消すと、既存の C（一括作成）がそのまま拾う。
+
+2026-11-02 の一巡実測: 全走査（Stage 1/2/3）は約 3 秒。envvars の候補 13 件（`token-in-diff` 12 と
+`unknown-sha` 1）を削除して再作成するのに 4 分 27 秒（5 並列、全件 created）。CLI は 115 件のうち
+`--exclude-token=--help` で 97 件を後回しにし、18 件を 2 分 42 秒で回した。
+`moved` 判定の項目は削除しない（引用座標だけが古い）。**CLI を回すときは毎回
+`--exclude-token=--help` を付ける**（スクリプトに既定除外は無いので、`--help` の 97 件は候補に残ったままが正常）。
 
 ## B. 削除（prune）
 
@@ -102,5 +131,7 @@ python3 .agents/skills/strata-investigate/scripts/check-docs.py --list-missing -
 
 ## 現状スコープ外
 
-- 既存文書の**内容の陳腐化検出**（Strata 側で挙動が変わった変数の洗い出し）は未定義。`check-docs.py --stale` が「どの commit で書かれたか」までしか言えない。
-- 変更検出の設計思路は `references/prune.md` 末尾にメモとして残す（実装しない）。
+- 索引更新より前に陳腐化を先取りする運用（索引 SHA と Strata HEAD がずれた状態での判定）はしない。
+- 差分に出ていない場所の記述が変わったケースは Stage 1/2 では拾えない。そういう項目は `file-only` /
+  `hunk-intact` として残り、`--stage3` の所在追跡と option inventory で補助する。
+- 性能測定のやり直しは依頼があるまで行わない（`references/principles.md`）。

@@ -1,64 +1,63 @@
-# `--experts`
+# `strata-dsv41 --experts`
 
-調査対象: Strata commit `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine-dsv41` |
-| コマンド | `strata-dsv41`（独立した DeepSeek-V4.1 engine executable） |
+| コマンド | `strata-dsv41`（DeepSeek-V4.1 engine の root CLI） |
 | オプション | `--experts` |
 | 別名 | なし |
-| 値 | routed expert 数を表す整数、または小文字の `auto` |
+| 値 | `N`（整数相当）または `auto` |
 
 ## 役割
 
-各 token について router が選ぶ routed expert 数を指定します。モデルが本来選ぶ数より小さくすると、選ばれた expert の routing weight はその選択集合内で正規化されます。`auto` または未指定では、選択 GPU の VRAM と integrated GPU の有無による faster-mode rule が適用されます。
+DeepSeek-V4.1 の通常層で、各 token の routing に使う expert 数を指定します。モデルが本来選ぶ数より小さくすると router の上位 `N` 件を使い、選択された expert の重みは再正規化されます。モデル本来の expert 数まで指定すると全数を使います（`src/dsv41/ds4_model.hpp:49-51`; `src/dsv41/ds4_experts_rule.hpp:1-6`; `src/dsv41/ds4_model.cu:2361-2380`）。
 
 ## 使い方
 
+モデル pack の通常実行に指定する例です（pack の場所や token ID は手元のモデルに合わせます）。
+
 ```sh
-strata-dsv41 --pack /models/maya-ds4 --ids 1,2,3 --n 16 --experts 6
+strata-dsv41 --pack ./model/maya-ds4 --ids 123,456 --experts 5
 ```
 
-`--experts auto` を指定すると、既定の faster-mode rule を明示的に使います。`--pack` と実行モード（例では `--ids`）も必要です（usage: `src/dsv41/ds4_main.cpp:85-93`）。
+engine CLI の usage は `--experts N|auto` としており、`--pack` と実行モード（例では `--ids`）も必要です（`src/dsv41/ds4_main.cpp:101-109,1395-1400`）。
 
 ## 値と既定値
 
-- オプション値は必須です。parser は `auto` だけを特別扱いし、その他の文字列を `std::atoi` で整数化して最低 `1` に丸めます。したがって `0`、負数、整数に変換できない文字列は `1` になり、厳密な数値形式検証はありません（`src/dsv41/ds4_main.cpp:1200-1207,1230-1233`）。
-- 変換後の数がモデルの `num_experts_per_tok` より大きい場合、実行時にモデル本来の数へ上限丸めされます。最小値は `1` です（`src/dsv41/ds4_experts_rule.hpp:17-25`）。
-- 未指定時の内部値は `-1` で、`auto` も `-1` にします。モデルの本来の選択数が1以下ならその値を保ちます。それ以外では、integrated GPU がある場合、または選択 GPU 群の総 VRAM が16 GiB以下の場合は5、それ以外はモデル本来の選択数を使います（`src/dsv41/ds4_model.hpp:45-49`、`src/dsv41/ds4_experts_rule.hpp:14-25`）。モデルごとの本来の数は pack の `num_experts_per_tok` から読み込みます（`src/dsv41/ds4_model.cu:404-410`）。
-- 値を省略すると `--experts needs a value` を stderr に出して終了コード2です。同じオプションを複数回指定すると最後の値が残ります（`src/dsv41/ds4_main.cpp:1200-1207,1230-1233`）。
+- `N` は正の expert 数として扱われ、parser は `std::atoi` の結果を最低 `1` に丸めます。`0`、負数、整数に変換できない文字列は `1` になります。整数の後ろに余分な文字がある場合も `atoi` は先頭の数値部分を使います。厳密な構文検査や parser 段階の上限検査はありません（`src/dsv41/ds4_main.cpp:1338-1341`）。
+- `N` がモデルの値を超える場合、実効値はモデルが元々使う expert 数までに制限されます（`src/dsv41/ds4_experts_rule.hpp:39-46`）。モデルの元の数は pack metadata `num_experts_per_tok` から読みます（`src/dsv41/ds4_model.cu:512-519`）。
+- 未指定時と `auto` は同じ自動選択です。現在の通常ルールでは、使用 GPU の合計 VRAM が 16 GiB 以下、統合 GPU がある、または条件を満たす複数 RDNA4 GPU のいずれかなら 5（モデルの元の数が 5 未満ならその数）、それ以外はモデル本来の数を使います（通常の DeepSeek-V4.1 pack では 6）。`DS4_DEFAULTS=026` / `0.2.6` / `v0.2.6` の場合は複数 RDNA4 条件を無効にし、小容量 VRAM・統合 GPU の条件だけで自動選択します（`src/dsv41/ds4_experts_rule.hpp:22-46`; `src/dsv41/ds4_model.cu:2361-2372`）。
+- 同じオプションを複数回指定した場合、parser は出現ごとに値を代入するため最後の指定が残ります（`src/dsv41/ds4_main.cpp:1307-1341`）。
 
 ## 実行時の動作
 
-モデル load 時、trunk の最初の layer で GPU 群の総 VRAM と integrated GPU の有無を調べ、指定値または自動ルールで選択数を決めます。決定値は全 trunk layer の `k_exp` に適用されます。モデル本来の数より少ない場合、stderr に `experts per word: N (...)` と full-quality 用の数を表示します（`src/dsv41/ds4_model.cu:2038-2064`）。
+parser は未指定を `-1`、`auto` も `-1` として保存します。モデル読み込み時、最初の通常層で GPU の総 VRAM、統合 GPU の有無、複数 RDNA4 GPU の条件を使って自動値または明示値を決め、その値を後続の通常層にも適用します。各層の expert 数はモデル本来の数と選択値の小さい方です（`src/dsv41/ds4_main.cpp:1338-1341`; `src/dsv41/ds4_model.cu:2353-2380`）。
 
-決定された数は router の top-k 数として使われ、token ごとにその数だけ expert ID と weight が出力されます。kernel は選択された expert の重みを合計で割り、`route_scale` を掛けて routing weight を計算します。その後の expert 実行と出力合成も `k_exp` 個を処理します（`src/dsv41/ds4_kernels.cu:501-548`、`src/dsv41/ds4_model.cu:7273-7284,9151-9187`）。
+選択数がモデル本来の数より少ないときは、その上位数の expert を routing に使い、選ばれた expert の routing weights を再正規化します（`src/dsv41/ds4_experts_rule.hpp:1-6`; `src/dsv41/ds4_model.cu:8352-8361,10424-10425`）。このため `--experts` は診断表示だけでなく推論計算を変えます。
 
-環境変数 `DS4_TOPK` が設定され、`atoi` で得られる値が `1..model_k` の範囲なら、その値が `--experts` と自動ルールの結果を上書きします。範囲外や有効な整数に変換されない値は無視されます（`src/dsv41/ds4_experts_rule.hpp:62-69`）。この環境変数はソースコメント上テスト用です。
-
-DSpark の MTP layer は pack の `dspark_num_experts_per_tok` を使い、このオプションによる trunk の `experts_used` を適用しません（`src/dsv41/ds4_model.cu:2040-2045,2063-2069`）。DSpark の有効・無効は別途 `--dspark` などで制御されます。
+`DS4_TOPK` が設定され、`atoi` で得た値が `1` からモデル本来の expert 数までの範囲なら、環境変数が `--experts` と自動ルールの結果を上書きします。これはソースコメントでテスト用とされている override です（`src/dsv41/ds4_experts_rule.hpp:157-164`; [環境変数 `DS4_TOPK`](../../../envvars/DS4_TOPK.md)）。
 
 ## 適用条件と副作用
 
-- この parser は独立 executable `strata-dsv41` のものです。CMake の `STRATA_BUILD_DSV41=ON` で target が定義されます（`CMakeLists.txt:797-811`）。索引もこの独立 CLI を `strata-engine-dsv41/root` に分類しています（`docs/cli/README.md:1373-1388`）。Release での配布有無はこの調査では確認していません。
-- expert 数を減らすと router の選択集合が短くなり、残った expert の weight が再正規化されます。モデル標準の選択数による出力との同一性は保証されません。実測なしに速度向上幅は断定できません。
-- 明示的な数値は最大でもモデル本来の数に丸められ、少なくとも1です。VRAM 条件による自動選択は model load 時に一度決まり、実行中に再評価される処理は確認できません。
-- `--experts` 自体がファイルを書き換える処理は確認できません。モデルの load・推論に伴う他の処理や profile 保存は別の設定・経路です。
+- この option は独立 engine CLI `strata-dsv41` の引数です。CMake では `STRATA_BUILD_DSV41=ON` かつ `STRATA_HIP_GFX906` でない場合に target が生成されます（`CMakeLists.txt:909-918`）。
+- router の expert 数を減らすと出力品質や計算量も変わり得ます。ソースは expert 選択数と routing weights の変化を示しますが、特定環境での速度・品質の改善量はこの調査では測定していません。
+- `DS4_TOPK` による上書きがあっても、stderr の説明文は `--experts` の明示指定有無を基準に選ばれます。そのため括弧内の `as asked` / `faster mode` は実際の最終値の出所を示さない場合があります（`src/dsv41/ds4_model.cu:2372-2378`）。
 
 ## 出力とエラー
 
-- 値の欠落は stderr に `--experts needs a value`、終了コード2です。未知の option は `unknown option ...` と usage を stderr に出し、終了コード2です（`src/dsv41/ds4_main.cpp:1200-1207,1266-1276`）。
-- 自動ルールまたは明示数がモデル本来の数より少ない場合、stderr に選択数と full-quality 用の `--experts N` を表示します。明示値がモデル本来の数と等しいときは full-quality の行を表示します（`src/dsv41/ds4_model.cu:2055-2062`）。
-- option 固有の値 validation error はありません。モデルの load が失敗した場合は `maya-ds4: <理由>` を stderr に出し、終了コード1で終了します（`src/dsv41/ds4_main.cpp:1293-1297`）。
+選択値がモデル本来の数より少ない場合、モデルロード時に stderr へ `ds4: experts per word: N (...)` を出します。全数を使う場合、明示的な `N` が指定されていれば `ds4: experts per word: N (full quality)` を出します。未指定または `auto` で全数となった場合は、この option に関する行を出しません（`src/dsv41/ds4_model.cu:2372-2378`）。
+
+値の範囲外を理由に失敗する validation はありません。値を省略すると parser は stderr に `--experts needs a value` を出して終了コード `2` で終了します。未知の option は stderr に `unknown option ...` と usage を出し、終了コード `2` です（`src/dsv41/ds4_main.cpp:1309-1314,1379-1385`）。値は受理されても pack のロードが失敗した場合は `maya-ds4: <理由>` を stderr に出して終了コード `1` になります（`src/dsv41/ds4_main.cpp:1402-1407`）。
 
 ## 根拠
 
-- 索引の階層・option リンク: `docs/cli/README.md:1373-1388`
-- usage と parser、値変換、unknown option の失敗経路: `src/dsv41/ds4_main.cpp:85-93,1200-1207,1230-1233,1266-1276`
-- 内部既定値、モデル metadata の本来の選択数、自動ルールと clamp: `src/dsv41/ds4_model.hpp:42-49`、`src/dsv41/ds4_model.cu:404-410,2038-2064`、`src/dsv41/ds4_experts_rule.hpp:14-25`
-- `DS4_TOPK` の優先順位と範囲確認: `src/dsv41/ds4_experts_rule.hpp:62-69`
-- router weight の計算と `k_exp` の利用: `src/dsv41/ds4_kernels.cu:501-548`、`src/dsv41/ds4_model.cu:7273-7284,9151-9187`
-- MTP layer への適用条件: `src/dsv41/ds4_model.cu:2040-2045,2063-2069`
-- optional executable の build 条件: `CMakeLists.txt:797-811`
+- `src/dsv41/ds4_main.cpp:101-109` — CLI usage と値の表記。
+- `src/dsv41/ds4_main.cpp:1307-1341,1382-1407` — parser、値変換、missing value / unknown option / load error の経路。
+- `src/dsv41/ds4_model.hpp:49-51` — option の保存先と未指定時の内部値。
+- `src/dsv41/ds4_experts_rule.hpp:22-46,157-164` — `DS4_DEFAULTS` を含む自動選択、上限補正、テスト用 `DS4_TOPK` override。
+- `src/dsv41/ds4_model.cu:512-519,2353-2380,8352-8361,10424-10425` — pack の expert 数、通常層への適用、router 呼び出し。
+- `CMakeLists.txt:909-918` — engine target の build 条件。
 
+調査範囲は上記 commit のソースと既存の環境変数文書です。同一 revision の engine binary による `--help` は実行していません。数値 parse は C/C++ の `atoi` を使うため、空文字や不正形式など個々の文字列の細かな変換結果はソースの変換規則を超えて保証せず、GPU/backend ごとの実測挙動も確認していません。

@@ -1,59 +1,62 @@
 # `--expert-cache-device1`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout は `main...origin/main` で、`git status --short --branch` に未コミット変更はありませんでした。
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（engine の root parser。実装・診断メッセージでは `strata generate` と表記） |
+| コマンド | `strata generate`（ネイティブ推論エンジン） |
 | オプション | `--expert-cache-device1` |
 | 別名 | なし |
-| 値 | 非負の expert slot 数 `N`、または `auto` |
+| 値 | 非負の slot 数 `N` または `auto` |
 
 ## 役割
 
-主 GPU の expert cache に収まらない expert を、最初の helper GPU の VRAM に追加キャッシュします。モデル全体を複数 GPU に分割する `--layer-split` とは異なり、主 GPU は通常どおりモデル本体を実行し、helper は補完的な expert cache として使われます。CUDA0 が主 GPU の標準構成では helper は CUDA1 です（`src/program/generate.cpp:550-562, 3056-3068`）。
+primary GPU（通常 CUDA0）の expert cache に入らない expert blob を、helper GPU の最初の tier に常駐させます。通常の device 配置では CUDA1 が対象です。helper は prompt の計算先ではなく、デコード時に担当 expert の行を計算し、その結果を pinned host memory 経由で返します。GPU 間 P2P はこの helper 経路の要件ではありません。parser の help は CUDA1 に N 件または空き容量分を配置すると説明し、実装では `RemoteExperts` に tier を作って各層の処理へ登録します（`src/program/generate.cpp:1127`, `src/program/generate.cpp:7603-7608`, `src/program/generate.cpp:7722-7728`, `src/core/expert_source.cpp:4752-4765`, `src/core/expert_source.cpp:4800-4805`, `src/core/expert_source.cpp:4820-4825`）。
 
 ## 使い方
 
-```sh
-strata --pack /path/to/model --expert-profile /path/to/profile.bin --expert-cache 4096 --expert-cache-device1 auto
+engine の引数として、モデル pack と profile、primary 側 cache とともに指定します。
+
+```text
+strata generate --pack /path/to/pack --tokens "1,2,3" --expert-profile /path/to/profile.bin --expert-cache auto --expert-cache-device1 auto
 ```
 
-実際のモデル実行には別途必要な engine 引数を指定してください。`--expert-cache-device1` は `N` または `auto` を次の引数として受け取ります。`--expert-cache-device1=auto` の等号形式は parser が認識しません（`src/program/generate.cpp:2416-2421, 2562-2567`）。
+`--expert-profile`、`--expert-cache`、`--tokens` はこの例で helper tier を有効にするための関連引数です。engine の形式は `strata generate --pack DIR --tokens LIST [options]` です（`src/program/generate.cpp:930-936`, `src/program/generate.cpp:7607-7611`）。
 
 ## 値と既定値
 
-- 既定値は `0`（無効）です。値は `std::atoi` で整数化され、`auto` の場合は内部 slot 上限を `INT_MAX` とし、自動サイズ調整フラグを立てます（`src/program/generate.cpp:559-560, 2562-2567`）。
-- `N > 0` は指定数を上限として helper cache を作ります。`auto` は順位付けされた候補から、helper GPU の空き VRAMを調べ、512 MiB の余裕を残して入る数を選びます（`src/core/remote_experts.cpp:153-169, 181-188`）。
-- `0` は無効です。`N < 0` は共通の resource validation で拒否され、stderr に `invalid sampling or resource parameter` を出して終了コード 2 になります（`src/program/generate.cpp:3352-3359`）。
-- 数値文字列の厳密な形式検証はありません。`atoi` の変換結果が使われるため、数値として読めない文字列は 0 になり無効扱いとなり、数値の後ろにある非数値部分は変換対象外です（`src/program/generate.cpp:2562-2567`）。同じフラグを複数回指定すると、parser が読むたび同じ設定値を上書きし、最後の値が残ります（`src/program/generate.cpp:2416-2421, 2562-2567`）。
-- `--expert-cache-device2` を正数で使う場合は device1 も正数でなければならず、device3 も同様に device2 が必要です。欠けた連番は同じ validation error で終了コード 2 になります（`src/program/generate.cpp:3352-3359`）。
+- 省略時は 0 slots（無効）です。options 構造体は device1〜3 の slot 数をゼロ初期化します（`src/program/generate.cpp:676-680`）。
+- `N` は `atoi` で整数に変換され、正数の場合に tier を開きます。`0` は無効、負数は `invalid sampling or resource parameter` で終了コード 2 になります。数値の厳密な字句検証は parser にありません（`src/program/generate.cpp:3149-3154`, `src/program/generate.cpp:3968-3975`）。
+- `auto` は大きな slot 上限と auto sizing フラグに変換されます。起動時に rank 順の expert blob を実際のサイズと当該 GPU の空き VRAMに基づいて選び、少なくとも 512 MiB を残せる範囲で配置します。これは容量の自動決定であり、性能に基づく調整ではありません（`src/program/generate.cpp:3151-3153`, `src/core/remote_experts.cpp:153-169`, `src/core/remote_experts.cpp:182-185`）。
+- 同じ option を複数回指定すると parser のループで後の値が同じ配列要素を上書きします（`src/program/generate.cpp:3003-3008`, `src/program/generate.cpp:3149-3153`）。
 
 ## 実行時の動作
 
-helper cache の利用には、`--expert-profile`、主 GPU の `--expert-cache`（正数）、および CPU expert pool が必要です。profile が空、主 cache が無効、または `--no-pool` の場合は `remote experts need --expert-profile, a CUDA0 expert cache and the expert pool` を stderr に出し、終了コード 2 で停止します（`src/program/generate.cpp:6662-6671`）。
+`--expert-cache-device1` は device1〜3 共通の parser 分岐で末尾の数字を tier index に変換し、数値と auto flag をそれぞれ保存します（`src/program/generate.cpp:3149-3153`）。remote tier の初期化は device1 が正数のときに始まり、`--expert-profile`、正数化された primary `--expert-cache`、CPU expert pool が揃わなければ拒否されます（`src/program/generate.cpp:7607-7612`）。
 
-profile 順を元に主 cache が保持していない expert を選び、helper 側へ読み込みます。`auto` または複数 helper の場合は profile にない expert も補充候補として追加します（`src/program/generate.cpp:6672-6693`）。helper の設定は `--expert-cache-device1` が最初の helper slot 群に対応し、通常は CUDA1 に割り当てられます。`STRATA_PRIMARY_DEVICE` で主デバイスが 0 以外なら、主デバイスを除いた可視 GPU の順番が helper に対応します（`src/program/generate.cpp:3058-3068`）。layer split 併用時は split stage が使わない可視 GPU に割り当てられます（`src/program/generate.cpp:3128-3142`）。
+single-GPU primary の通常配置では `device1` は可視 CUDA device 1 です。`STRATA_PRIMARY_DEVICE` が非ゼロなら primary 以外の可視 device を順に helper に割り当てます。layer split 併用時は stage が使わない可視 GPU が helper に割り当てられます（`src/program/generate.cpp:3566-3574`, `src/program/generate.cpp:3663-3675`, `src/program/generate.cpp:3738-3752`）。helper は primary cache と重複しない expert を選び、GPU 上の cache に blob を埋めて検証します（`src/core/remote_experts.cpp:160-175`, `src/core/remote_experts.cpp:187-205`）。
 
-初期化時に helper GPU の CUDA context と空き VRAM を確認し、cache を確保して選択 expert を埋め、先頭 slot を検証します。起動ログには helper GPU の追加 expert 数と GiB が stderr に表示されます（`src/program/generate.cpp:3533-3547, 5600-5609, 6736-6746`; `src/core/remote_experts.cpp:70-97, 135-204`）。通常の helper cache の結果行は pinned host rows を通って戻ります。`--remote-expert-opt` を併用すると追加の remote expert decode 最適化を接続しますが、この別オプションは `--serve` がないと拒否されます（`src/program/generate.cpp:3365-3367, 6662-6665, 6736-6746`）。
+通常の prompt は primary 側で処理され、helper cache はデコードの expert 行計算に使われます。serve 中に `STRATA_PREFILL_HELPER_SOURCE` を有効にした場合に限り、prompt が helper cache 内の blob を読み出し元として使う経路もあります（`src/program/generate.cpp:9346-9360`）。`--remote-expert-opt` は別 option で、serve 専用です。device1 cache が有効な場合に helper 最適化を接続します（`src/program/generate.cpp:3155`, `src/program/generate.cpp:3981-3983`, `src/program/generate.cpp:7603-7608`）。
 
 ## 適用条件と副作用
 
-- helper GPU が可視で、主 GPU と異なる必要があります。非表示 GPU、主 GPU 自身、CUDA context・VRAM 割当・cache fill の失敗は helper 初期化エラーとなり、stderr に理由を出して終了コード 1 で停止します（`src/core/remote_experts.cpp:70-97, 135-204`; `src/program/generate.cpp:6736-6743`）。
-- `auto` は slot 数を空き VRAM に合わせ、512 MiB を残せない場合はそこで選択を止めます。明示数でも必要量と 512 MiB を合わせて空き VRAMに収まらなければ失敗します（`src/core/remote_experts.cpp:153-184`）。`auto` で一つも未割当 expert が収まらない場合もエラーです（`src/core/remote_experts.cpp:159-174`）。
-- `--peer-device` はこの helper cache と同時に使えません。組み合わせると `--peer-device cannot be combined with --expert-cache-device1..3 ...` を stderr に出し、終了コード 2 になります（`src/program/generate.cpp:3369-3375`）。
-- helper cache は GPU VRAM、CUDA context、stream、device/host staging buffer を確保し、expert weight を GPU に転送します。終了時には `RemoteExperts` が stream を同期し、cache、CUDA allocation、pinned host allocation、stream を解放します（`src/core/remote_experts.cpp:99-133, 181-215`）。
+- device1 が正数で有効なら、device2/3 は前段 tier が有効である必要があります。device2/3 だけを指定すると resource validation で拒否されます（`src/program/generate.cpp:3970-3975`）。
+- `--peer-device` は helper cache と併用できず、`--peer-device` と `--layer-split` の組み合わせも拒否されます（`src/program/generate.cpp:3985-3991`）。
+- helper GPU は可視で、primary GPU と異なり、割り当て対象の expert が残っていなければなりません。auto では 512 MiB を残した上で一件も配置できない場合に失敗します。明示数が空き容量を超えて 512 MiB 未満しか残さない場合も失敗します（`src/core/remote_experts.cpp:141-150`, `src/core/remote_experts.cpp:160-185`）。
+- 初期化時に helper GPU 上へ expert cache、CUDA stream、GPU 作業バッファを確保し、pinned host staging buffer を作ります。結果は pinned host rows 経由で primary に返ります（`src/core/remote_experts.cpp:187-224`, `src/program/generate.cpp:7685-7687`）。
+- 同一 layer に割り当てられた helper expert は CPU pool の担当から除外され、helper が計算します。helper の開始・完了に失敗すると layer の処理を失敗として伝播します（`src/core/expert_source.cpp:4752-4765`, `src/core/expert_source.cpp:4800-4825`）。
 
 ## 出力とエラー
 
-parser に値が続かない場合は `<option> needs a value` を stderr に出し、終了コード 2 です（`src/program/generate.cpp:2418-2421`）。負数や device1〜3 の連番条件違反は共通 validation error で終了コード 2、profile・主 cache・pool の不足も終了コード 2 です。GPU の可視性や割当など初期化段階での失敗は具体的な `CUDA<n> experts: ...` エラーを stderr に出し、engine は終了コード 1 を返します（`src/program/generate.cpp:3352-3359, 6666-6671, 6741-6743`; `src/core/remote_experts.cpp:70-97, 135-204`）。
+初期化成功時は stderr に helper の CUDA ordinal、追加 expert 数、GiB、pinned host rows 経由で結果を返す旨を表示します（`src/program/generate.cpp:7685-7687`）。無効な resource 値、device1 を伴わない device2/3、必要な profile/cache/pool の不足は終了コード 2 です（`src/program/generate.cpp:3970-3975`, `src/program/generate.cpp:7607-7611`）。helper GPU の不可視、空き容量不足、cache 確保・blob 読み込み・検証など初期化失敗はエラーを stderr に出して終了コード 1 になります（`src/core/remote_experts.cpp:141-150`, `src/core/remote_experts.cpp:172-205`, `src/program/generate.cpp:7677-7687`）。option の値が末尾にない場合は `<option> needs a value` を stderr に出し終了コード 2 です（`src/program/generate.cpp:3005-3007`）。
 
 ## 根拠
 
-- parser 表示とオプション説明: `src/program/generate.cpp:999-1011`
-- 設定値の既定値・受理: `src/program/generate.cpp:550-562, 2416-2421, 2562-2567`
-- 数値・連番・peer device の validation: `src/program/generate.cpp:3352-3375`
-- helper GPU の対応付け、profile 候補・helper cache の構築: `src/program/generate.cpp:3056-3068, 6662-6747`
-- GPU 検査、空き VRAM、auto sizing、cache fill と失敗: `src/core/remote_experts.cpp:70-97, 135-204`
-- cache 確保後の staging allocation: `src/core/remote_experts.cpp:181-215`
+- parser の help と値受理: `src/program/generate.cpp:1123-1135`, `src/program/generate.cpp:3145-3157`
+- 値 validation と関連条件: `src/program/generate.cpp:3968-3991`, `src/program/generate.cpp:7607-7612`
+- primary/helper の device 割り当て: `src/program/generate.cpp:3566-3574`, `src/program/generate.cpp:3663-3675`, `src/program/generate.cpp:3738-3752`
+- helper cache の sizing・確保・失敗: `src/core/remote_experts.cpp:141-205`, `src/core/remote_experts.cpp:207-239`
+- expert 行の実行と host 側への結果統合: `src/core/expert_source.cpp:4752-4825`, `src/program/generate.cpp:7722-7728`
+
+範囲: ソース checkout と parser/help 実装を調査しました。GPU の実機がないため、device ごとの driver 挙動、実際の空き VRAM、性能差は確認していません。Release binary の help は実行していません。

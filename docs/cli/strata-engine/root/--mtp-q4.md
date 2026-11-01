@@ -1,68 +1,64 @@
 # `--mtp-q4`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | ネイティブ `strata` 推論エンジン（`generate` 引数 parser） |
+| コマンド | `strata`（ネイティブ推論エンジン、root） |
 | オプション | `--mtp-q4` |
 | 別名 | なし |
-| 値 | `all`、`proj`、`head` のいずれか |
+| 値 | `all`、`proj`、`head` のいずれか。値は必須 |
+| 既定値 | 未指定時は無効（空文字列） |
 
 ## 役割
 
-MTP（multi-token prediction）ドラフターの一部重みを、ロード時に Q4_0 形式へ変換し、ドラフト生成の重み読み出しを小さくするための opt-in 設定です。`proj` はドラフト層の投影重み、`head` はドラフト head、`all` は両方を対象にします。検証側の出力が変わる設定ではなく、MTP が提案した token は引き続き verify window で判定されます（`src/core/mtp.cpp:190-222`, `src/core/mtp.cpp:225-248`, `src/program/generate.cpp:5461-5472`）。
+MTP draft 層の一部の重みを Q4_0 に変換したコピーで実行し、draft 1 ステップあたりに読むデータ量を減らすための opt-in 設定です。draft 層だけに作用し、target 側の検証処理が各 token を決定します。したがって、このオプションが target の重みや検証窓を Q4_0 にするわけではありません（`include/strata/core/mtp.hpp:64-67`）。
 
 ## 使い方
 
-モデル pack と MTP runtime を指定する通常のエンジン呼び出しに追加します。
-
 ```sh
-strata --pack pack/full --tokens "1,2,3" --native --mtp path/to/mtp-runtime --spec 4 --mtp-q4 all
+strata --pack PACK --native MODEL.gguf --mtp MTP_DIR --spec 4 --mtp-q4 all --tokens "1,2,3"
 ```
 
-`--mtp` と `--spec` はこの例で MTP ドラフターをロードするための関連引数です。`--mtp-q4` 自体は値を一つ取ります（`src/program/generate.cpp:741-745`, `src/program/generate.cpp:2684-2690`）。
+`PACK`、`MODEL.gguf`、`MTP_DIR`、token 列は実行環境に合わせて置き換えます。`--mtp` で MTP を指定し、`--spec` を 2 以上にして MTP を使う実行で指定してください。
 
 ## 値と既定値
 
-- `all`: Q8_0 投影重みとドラフト head の対象行を Q4_0 化します。
-- `proj`: Q8_0 投影重みだけを Q4_0 化します。
-- `head`: ドラフト head の対象行だけを Q4_0 化します。
-- 省略時は無効です。Options の `mtp_q4` は空文字列で初期化されます（`src/program/generate.cpp:788-789`）。
-- 値は大文字小文字を区別して上記3つだけを受理します。無効値は stderr に `strata generate: --mtp-q4 takes all, proj or head` を出し、終了コード 2 で終了します。値を省略した場合も parser の共通処理が `--mtp-q4 needs a value` を stderr に出して終了コード 2 にします（`src/program/generate.cpp:2416-2420`, `src/program/generate.cpp:2684-2689`）。
-- 同じオプションを複数回指定した場合、重複拒否処理はなく後の値が上書きします（`src/program/generate.cpp:2416-2420`, `src/program/generate.cpp:2684-2689`）。
+- `all`: Q8_0 の draft projection と、利用可能な draft head の token subset の両方を Q4_0 化します。
+- `proj`: Q8_0 の projection を Q4_0 化します。
+- `head`: draft head の token subset を Q4_0 化します。
+- オプションを省略すると無効です。parser は繰り返し指定を蓄積せず値を代入するため、複数回指定した場合は最後の値が残ります（`src/program/generate.cpp:3271-3276`）。
+- 値がない場合は `--mtp-q4 needs a value` を stderr に出して終了コード 2、上記以外の値は `strata generate: --mtp-q4 takes all, proj or head` を stderr に出して parser が 2 を返します（`src/program/generate.cpp:3005-3007,3271-3276`）。SYCL parser も同じ値を受理し、同様に終了コード 2 で拒否します（`sycl/src/program/generate.cpp:1780-1782,1994-1999`）。
 
 ## 実行時の動作
 
-parser は文字列を `Options::mtp_q4` に保存し、MTP オブジェクトへ渡すとき `all` / `proj` / `head` を投影重み用と head 用の二つのフラグに分けます。設定はロード前に適用されます（`src/program/generate.cpp:788-789`, `src/program/generate.cpp:5460-5463`, `include/strata/core/mtp.hpp:64-67`）。
+`--mtp` がある経路で、`--spec < 2` の場合は MTP 自体を無効化して `o.mtp` を空にします。その後、MTP が残っている場合に `--mtp-q4` の値から projection 用・head 用のフラグを設定し、MTP のロードへ進みます。従って `--mtp-q4` 単独、または `--spec` が 2 未満で MTP が無効になった実行では、この設定による変換は行われません（`src/program/generate.cpp:6281-6298`）。
 
-`proj` が有効なら、MTP runtime の `dense.bin` から Q8_0 で列数が32の倍数の tensor を選び、Q8_0 から float に展開して ggml の Q4_0 quantizer で再量子化し、別の device buffer に置きます。実行中の各投影はその Q4_0 コピーがある場合に選び、なければ元の Q8_0 を使います（選択関数と変換: `src/core/mtp.cpp:178-188`, `src/core/mtp.cpp:190-222`, load 時の呼出し: `src/core/mtp.cpp:295-308`; 投影での使用: `src/core/mtp.cpp:884-906`, `src/core/mtp.cpp:1007-1014`）。従って元の dense 重み buffer に加えて Q4_0 コピー分の device memory も必要です。
+`all` は projection と head の両フラグ、`proj` は projection のみ、`head` は head のみを有効にします。通常版の `src/core/mtp.cpp` と SYCL 版の `sycl/src/core/mtp.cpp` は、`dense.bin` 内の `q8_0` かつ列数が 32 の倍数の tensor を読み、Q8_0 から float へ展開して Q4_0 に量子化した device buffer を作成します。MTP の projection 読み出しは Q4_0 コピーがある名前についてそのコピーを選び、ない場合は Q8_0 原本を使います（`src/core/mtp.cpp:195-230,323`; `src/core/mtp.cpp:197-201,928-933`; SYCL: `sycl/src/core/mtp.cpp:195-221,343`; `include/strata/core/mtp.hpp:64-67`）。このコピーは追加 device memory を使います。
 
-`head` が有効で通常の draft vocabulary subset が使われる場合、main native head から subset 行を取り出し、読み出せる元形式かつ embedding 幅が32の倍数なら行を Q4_0 化して draft head buffer に書き戻します。ドラフト head が使う token 行数は `draft_vocab.bin` による subset の行数です（`src/core/mtp.cpp:692-740`, `src/core/mtp.cpp:225-248`）。`STRATA_MTP_FULL_HEAD=1` の診断経路では subset 行の作成ブロック自体を通らないため、この `head` 変換も行われません（`src/core/mtp.cpp:507-513`, `src/core/mtp.cpp:692-694`）。
+head 側は draft vocabulary の subset をロードして作る経路で、その subset 行を Q4_0 に変換します。subset が見つからず head の全体を使う経路では `make_q4_head` の呼び出しに入らないため、`head` を指定しても head の変換が行われない場合があります（`src/core/mtp.cpp:730-779`; SYCL: `sycl/src/core/mtp.cpp:750-788`）。変換後の draft head は Q4_0 として読み出されます（`src/core/mtp.cpp:253-257,1240-1243`; SYCL: `sycl/src/core/mtp.cpp:253-258,1140-1144`）。
 
-MTP runtime が指定されていない場合、または `--spec` が2未満で MTP runtime が無効化された場合、`--mtp-q4` の値は parser で受理されますが、MTP の load が呼ばれないため変換は行われません（`src/program/generate.cpp:5455-5472`）。`--draft dflash2` など別の drafter 選択もありますが、このフラグの設定先は MTP drafter です。
-
-Metal backend の `MtpDrafter::load` は `metal_engine::mtp_load` に早期委譲します。この経路では CUDA / SYCL 実装の `q4_` / `q4_head_` 変換処理を実行しないため、Metal でこの引数が受理されても Q4_0 化は確認できません（`src/core/mtp.cpp:251-258`）。CUDA と SYCL の実装では同じ値分解と変換処理があります（`sycl/src/program/generate.cpp:1971-1977`, `sycl/src/program/generate.cpp:4180-4197`, `sycl/src/core/mtp.cpp:194-227`, `sycl/src/core/mtp.cpp:230-255`）。
+MTP の prompt 用 batched K/V pass は Q8_0 原本を維持します。Q4_0 コピーを使うのは draft step の重み読み出しです（`include/strata/core/mtp.hpp:64-67`; `src/core/mtp.cpp:928-933`; `sycl/src/core/mtp.cpp:945-948`）。
 
 ## 適用条件と副作用
 
-- `--mtp` が実際にロードされる実行で効果があります。ロード条件として `--spec` は2以上である必要があります。`--native` の main head がドラフト head bind に必要です（`src/program/generate.cpp:5455-5472`, `src/core/mtp.cpp:661-675`）。
-- `STRATA_NATIVE_EXPERTS` なしでビルドされた CUDA / SYCL 実装では、Q4_0 化関数は `mtp: --mtp-q4 needs a build with native experts (ggml)` をエラーとして返します（`src/core/mtp.cpp:218-221`, `sycl/src/core/mtp.cpp:223-226`, `sycl/src/core/mtp.cpp:252-255`）。
-- 投影側の Q4_0 コピーが VRAM に確保できない場合は `mtp: the Q4_0 projections do not fit`、head の型を読み取れないか幅が32の倍数でない場合は `mtp: --mtp-q4 cannot read the head's format`、head の device 間コピー失敗時は読み出し・書き込みエラーになります（`src/core/mtp.cpp:190-248`）。これらは MTP load 失敗となり、CLI はエラーと VRAM free 情報を stderr に出して終了コード 1 を返します（`src/program/generate.cpp:5472`）。
-- 変換時には MTP 重みの読み書きと device memory の確保が発生します。head 変換では head subset を一度 host memory へコピーして変換後に device へ戻します（`src/core/mtp.cpp:225-244`）。ロード成功時の変換状況は stderr の `strata mtp: --mtp-q4: ...` 行で報告されます（`src/core/mtp.cpp:216-216`, `src/core/mtp.cpp:242-243`）。
-- Q4_0 再量子化による出力品質・速度の変化量はソースだけでは定量化できないため、ここでは性能や品質を断定しません。
+- MTP をロードするには `--mtp` と `--spec` が必要で、`--spec` が 2 未満だと MTP は無効になります（`src/program/generate.cpp:6281-6298`; SYCL: `sycl/src/program/generate.cpp:4286-4303`）。
+- `all` と `proj` は `dense.bin` の Q8_0 projection を変換します。ビルドに `STRATA_NATIVE_EXPERTS` / ggml support がない場合は `mtp: --mtp-q4 needs a build with native experts (ggml)` で失敗します（`src/core/mtp.cpp:205-236`; SYCL: `sycl/src/core/mtp.cpp:195-227`）。同じ build 条件は head 変換にも適用されます（`src/core/mtp.cpp:240-263`; SYCL: `sycl/src/core/mtp.cpp:231-263`）。
+- 変換用 device memory の確保に失敗すると `mtp: the Q4_0 projections do not fit`、Q4_0 head subset の変換時には入力形式を読めない場合、head の読み取り・書き込みに失敗した場合にそれぞれ対応する `mtp:` エラーを返します（`src/core/mtp.cpp:227-260`; SYCL: `sycl/src/core/mtp.cpp:217-261`）。
+- SYCL 版で `head` または `all` を使い、head が planar Q6_K の場合、誤った subset を黙って使わないよう `STRATA_Q6_PLANAR=0` を要求してロードを拒否します。エラーは `mtp: --mtp-q4 head needs the packed Q6_K head layout (STRATA_Q6_PLANAR=0)` です（`sycl/src/core/mtp.cpp:231-243`）。関連設定は [STRATA_Q6_PLANAR 文書](../../../envvars/STRATA_Q6_PLANAR.md) を参照してください。
+- 通常版 `src/core/mtp.cpp` と SYCL 版でコード経路・制約が異なります。Metal build は通常版 loader 内で `metal_engine::mtp_load` に委譲しており、この経路から `--mtp-q4` の処理を確認できないため、Metal での効果は本調査では確定していません（`src/core/mtp.cpp:265-273`）。
 
-## 調査範囲
+## 出力とエラー
 
-索引の `strata-engine/root` scope に従い、トップレベル engine の parser と MTP load / bind を確認しました。CUDA `src/` と SYCL `sycl/` の実装は確認しましたが、Metal は委譲先の `metal/src/engine/window.cpp` における MTP load 内部を調査していません。Release 配布物や実機での動作確認は行っていません。
+Q4_0 projection 変換に成功すると stderr に `strata mtp: --mtp-q4: <件数> projections as Q4_0 (<MiB> MiB)`、head subset の変換に成功すると対象 token 数と 1 step あたりの読み込み量を示す行を出力します（`src/core/mtp.cpp:227-230,253-257`; SYCL: `sycl/src/core/mtp.cpp:217-221,253-258`）。MTP load が失敗した場合、呼び出し側は `strata generate: <mtp error>` を stderr に出して終了コード 1 を返します（`src/program/generate.cpp:6298`; SYCL: `sycl/src/program/generate.cpp:4303`）。
 
 ## 根拠
 
-- parser、usage、既定値、値 validation: `src/program/generate.cpp:741-745`, `src/program/generate.cpp:788-789`, `src/program/generate.cpp:2416-2420`, `src/program/generate.cpp:2684-2690`
-- MTP load への設定・失敗処理: `src/program/generate.cpp:5455-5472`
-- 投影重みの変換と選択: `src/core/mtp.cpp:178-222`, `src/core/mtp.cpp:308-308`
-- draft head subset の bind、変換、full-head 条件: `src/core/mtp.cpp:507-513`, `src/core/mtp.cpp:661-740`
-- MTP interface と draft head の挙動: `include/strata/core/mtp.hpp:64-67`
-- SYCL 実装の parser、設定、Q4_0 変換: `sycl/src/program/generate.cpp:1971-1977`, `sycl/src/program/generate.cpp:4180-4197`, `sycl/src/core/mtp.cpp:194-227`, `sycl/src/core/mtp.cpp:230-255`
-- 索引の tool/scope: `docs/cli/README.md:1128-1135`, `docs/cli/README.md:1203-1208`
+- `src/program/generate.cpp:912-914,1071,3271-3276,6281-6298` — option の既定値・help・parser・MTP 設定と load。
+- `include/strata/core/mtp.hpp:64-67` — Q4_0 コピーの目的、draft-only の範囲、prompt K/V pass の例外。
+- `src/core/mtp.cpp:195-263,323,699-790,928-933,1240-1243` — 通常版の projection/head 変換と使用箇所。
+- `sycl/src/program/generate.cpp:731-733,862,1994-1999,4286-4303` — SYCL parser と MTP load。
+- `sycl/src/core/mtp.cpp:195-263,343,750-799,945-948,1140-1144` — SYCL projection/head 変換、planar Q6_K 制約と使用箇所。
+
+調査範囲は上記 revision の parser とソース上の実行経路です。同一 revision の CLI バイナリ help、各 backend の実機挙動、Release 配布物は確認していません。

@@ -34,6 +34,7 @@ seq $(wc -l $HOME/src/github.com/Niko1221/Strata-EnvVars/000_envvers.md) \
 - runbook: `SKILL.md` と `references/`（principles / index-refresh / prune / runner / extraction-recipes / prompts）
 - 文書の雛形: `assets/envvar-doc.md`、`assets/cli-option-doc.md`、`assets/cli-command-readme.md`
 - 点検: `python3 .agents/skills/strata-investigate/scripts/check-docs.py`（`--stale`、`--list-missing`、`--json`、`--strict`）
+- 既存文書の陳腐化検出: `scripts/cli-grammar.py` → `scripts/evidence-index.py` → `scripts/find-stale.py --stage3` → `scripts/mark-stale.py`（削除）→ `create-envvars-docs.py` / `create-cli-docs.py`（再作成）
 
 調査仕様そのものの正は `docs/` 側の文書に置いたままだ。本 README に置いてある `codex exec` のプロンプトは同じ手順の書き写しで、`seq | xargs` 版はリポジトリ名が変わる前のパスを読んでいる。正しいパスに直した版は `.agents/skills/strata-investigate/references/prompts.md` にある。
 

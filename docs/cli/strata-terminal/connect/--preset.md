@@ -1,62 +1,71 @@
-# `strata connect --preset`
+# `--preset`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査時の作業ツリーは `main...origin/main` で、`git status --short --branch` に未コミット変更はありませんでした。
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 調査）。調査時の `git status --short --branch` は `## main...origin/main`。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
 | コマンド | `strata connect` |
-| オプション | `--preset` |
+| オプション | `--preset NAME` |
 | 別名 | なし |
-| 値 | 保存済み launch preset の名前（`NAME`） |
+| 値 | 保存済み launch preset の名前（文字列） |
 
 ## 役割
 
-アプリ向け接続設定を表示・書き込みする際、指定した launch preset に結び付く server の接続先情報を選びます。`strata connect` 自体が server を起動したり、preset を適用して起動し直したりする機能ではありません。
+保存済み launch preset、または同名の実行中 launch から接続先情報を選びます。`strata connect <app>` がアプリ用の設定を表示するときに、URL・API key などの既定値を得るために使います。
 
 ## 使い方
 
 ```sh
-strata connect opencode --preset "Office"
+strata connect opencode --preset Office
 ```
 
-この例は `Office` preset を参照して OpenCode 向けの設定内容を表示します。ファイルを書き込むには別途 `--write` が必要です。
+アプリ ID を省略するとアプリ一覧を表示します。この経路では `--preset` は接続設定の生成に使われません。`--url`、`--key`、`--key-env`、`--model`、`--context` を指定すると、対応する preset / 実行中 launch 由来の値より優先されます。
 
 ## 値と既定値
 
-- `--preset` は `NAME` を1つ取ります。parser では値を文字列として受け取り、名前の存在確認や空文字の検証は行いません。値の省略は argparse の引数エラーになります（`strata_cli/launch/cmd.py:148-165`）。
-- 保存ファイル名を求める際、名前は小文字化され、英小文字・数字・`-`・`_` 以外を `-` に置換し、先頭末尾の `-` / `_` を取り除き、先頭が英字でなければ `l` を付け、48文字に切り詰めます。そのため異なる入力名が同じ slug になることがあります（`strata_cli/launch/settings.py:310-315`、`strata_cli/launch/store.py:35-36`）。
-- 省略時は `launch_info(None)` が最初の稼働中 launch を選びます。稼働中 launch がなければ、URL は `http://127.0.0.1:8080`、model は `strata`、context は `32768` にフォールバックします。key がない場合は harness 内部の非秘密 placeholder `strata-local` が使われます（`strata_cli/launch/cmd.py:605-627,864-869`、`strata_cli/launch/harness.py:22,259-260`）。
+- 値は `NAME` 文字列です。parser は `metavar="NAME"` のみを指定し、名前の形式や空文字列を独自に検証しません。値を省略すると argparse が usage とエラーを表示します（parser 定義: `strata_cli/launch/cmd.py:156-173`）。
+- 指定名は preset ファイル名に使う際、小文字化・許可文字への変換などの slug 化を受けます（`strata_cli/launch/settings.py:355-360`）。
+- preset が存在しなければエラーにはせず、`--preset` からの情報は得られません。preset ファイルが読み取れない、または破損している場合は `PresetError`（`ValueError`）となり、トップレベルのエラー処理で失敗します（`strata_cli/launch/store.py:88-103`、`strata_cli/cli.py:2166-2173`）。
+- URL の最終的な既定値は、該当する実行中 launch の URL、保存 preset の port を使う localhost URL、いずれもなければ `http://127.0.0.1:8080` です。port の既定値は `strata_cli/launch/settings.py:50` にあります。
 
 ## 実行時の動作
 
-`strata connect` にアプリ名がある場合、`run_connect` は `launch_info(a.preset)` から接続情報を取得します。名前を指定すると slug が一致する稼働中 launch を探し、同名の保存 preset も読み込みます。稼働中 launch があれば、その URL と server 設定ファイルの API key が優先されます。保存 preset は URL が得られない場合の port と、稼働中設定から key を得られない場合の API key に使われます（`strata_cli/launch/cmd.py:567-627`）。
+1. `connect` は `launch_info(NAME)` を呼びます。これは稼働中 launch を slug 化した名前で探し、保存 preset も `missing_ok=True` で読みます（`strata_cli/launch/cmd.py:636-658`）。
+2. 同名の実行中 launch があれば、その URL が preset の port より優先されます。実行中 launch がなく preset があれば、preset の `port` を localhost の URL に使います（同 `cmd.py:641-658`）。
+3. 各値の選択順は次のとおりです（同 `cmd.py:945-950`）。
 
-ただし、保存 preset の `model` と `context` は `launch_info` の戻り値に使われていません。model は稼働中設定の `model_name`、または `strata`、context は稼働中設定の `--max-context`、または後段の `32768` になります。したがって、preset に保存された model/context を接続設定へ反映するオプションとしては動作しません（`strata_cli/launch/cmd.py:595-602,621-627,864-869`）。
+   | 接続情報 | 選択順 |
+   | --- | --- |
+   | URL | `--url` → 選ばれた launch/preset の URL → `http://127.0.0.1:8080` |
+   | API key | `--key` → `--key-env NAME` で指定した環境変数の値 → launch の設定または preset の key → 空文字列（後段で harness 用 placeholder に置換） |
+   | model | `--model` → 実行中設定の `model_name` → `strata` |
+   | context | `--context` → 実行中設定の `--max-context` → 32,768 tokens |
 
-同時指定時は `--url` が preset / 稼働中 launch の URL より優先し、`--key`、`--key-env` が preset 由来 key より優先します。`--model` と `--context` も、稼働中 launch 情報より優先します。値の選択式は `--url`、`--key`、`--key-env`、`--model`、`--context` の順で実装されています（`strata_cli/launch/cmd.py:154-160,864-869`）。
+保存 preset のモデル名と context は `launch_info()` の戻り値に含まれず、`connect` の model/context の既定値にはなりません。parser の help は `--preset` を「address, key and model」を得るものと説明しますが（`strata_cli/launch/cmd.py:167`）、現行コードでは preset 由来の model は接続先に渡されず、実行中 config に model がない場合は `strata` になります。これは help と実装の差として確認した点です。
 
-アプリ名を省略した `strata connect --preset NAME` はアプリ一覧を表示して終了し、preset は参照しません。名前が保存されておらず対応する稼働中 launch もない場合、`launch_info` は空情報を返すため、既定の URL/model/context で続行します。人向け出力では稼働中 server が見つからなかった旨も表示します（JSON 出力ではこの注意文は出ません）（`strata_cli/launch/cmd.py:842-869,897-900`）。
+`connect` は preset を読み取るだけで、`last_used` を更新しません。利用履歴を更新する `store.touch_used()` は `strata launch` の実行経路にあります（`strata_cli/launch/cmd.py:858-863`、`strata_cli/launch/store.py:139-144`）。設定ファイルへの書き込みは別オプション `--write` によって行われます。
 
 ## 適用条件と副作用
 
-- `--preset` の情報が利用されるのはアプリ名を指定した `strata connect <app>` の経路です。preset の読み込みは `store.load(..., missing_ok=True)` による読み取りで、`--preset` 単体では保存設定を変更しません（`strata_cli/launch/cmd.py:621-627,842-869`、`strata_cli/launch/store.py:88-103`）。
-- アプリ設定のファイル書き込みは別オプション `--write` が必要です。既存ファイルは backup を作ってから置換し、JSON merge 対象では既存キーを保って新しい値を優先します（`strata_cli/launch/cmd.py:930-947`、`strata_cli/launch/harness.py:275-290`）。
-- `--check` を重ねると、選択された接続情報で server に prompt と tool call を送信します。preset だけではネットワーク接続確認を行いません（`strata_cli/launch/cmd.py:880-896,921-929`）。
-- 接続出力に含まれる API key は通常マスクされます。人向け出力で実値を出すには `--show-key` が必要です。JSON 出力は `--show-key` にかかわらず key をマスクします（`strata_cli/launch/cmd.py:871-876,900-910`、`strata_cli/launch/harness.py:310-311`）。
+- `--preset` の値は `strata connect` にアプリ名（位置引数 `harness`）も指定した場合の接続情報選択に適用されます。アプリ名なしの場合は一覧を出して終了します（`strata_cli/launch/cmd.py:923-937`）。
+- 指定 preset と同名の launch が稼働していれば、その実行 URL と設定内の API key が利用されます。稼働していなくても保存 preset があれば port と key を利用できます。どちらもない場合は通常の既定値へフォールバックします（`strata_cli/launch/cmd.py:636-658, 945-950`）。
+- このオプション単独ではネットワーク接続や設定ファイル書き込みを行いません。アプリ設定への書き込みは `--write`、server への確認リクエストは `--check` の処理です（`strata_cli/launch/cmd.py:961-977, 1003-1028`）。
+- API key は既定でマスクして表示されます。`--show-key` を併用すると実値が表示されるため、端末出力やログの取り扱いに注意してください（同 `cmd.py:951-955, 978-991`）。
 
 ## 出力とエラー
 
-- preset 名が存在しない場合、`missing_ok=True` により preset の読み込み自体は失敗扱いにならず、稼働中 launch が名前一致しなければ既定値にフォールバックします。従って、無効な名前を必ず拒否する validation はありません（`strata_cli/launch/cmd.py:611-627`、`strata_cli/launch/store.py:88-95`）。
-- 保存ファイルが壊れている、読み取れないなど `store.load` が `PresetError`（`ValueError` の派生）を送出すると、通常出力では `strata: ...` を stderr に出し、終了コード 2 になります。`--output json` では同じエラーを JSON に出します（`strata_cli/launch/store.py:23,88-103`、`strata_cli/cli.py:2166-2173,527-532`）。
-- `--output json` の正常時は、app 設定の説明を JSON にして stdout に出します。preset の値を使っても server が実際に応答するかは確認しません。確認には `--check` が必要です（`strata_cli/launch/cmd.py:872-896`）。
+- 指定した preset が見つからないだけなら、`--preset` 自体のエラーにはならず既定の URL、key の placeholder、`strata` model、32K context を使って設定を生成します。key は `run_connect` 内では空文字列となり、`harness.target()` が placeholder に置き換えます（`strata_cli/launch/cmd.py:652-658, 945-950`、`strata_cli/launch/harness.py:272-273`）。
+- preset の JSON が読めない、または構造が壊れている場合は `PresetError` が `ValueError` として CLI 共通処理に渡ります。人間向けでは `strata: ...` のエラーを stderr に出し、既定の終了コード 2 で終了します（`strata_cli/launch/store.py:88-103`、`strata_cli/cli.py:2166-2173`、`strata_cli/cli.py:527-530`）。
+- `--output json` では通常の接続情報を JSON で stdout に出します。key は JSON の設定本文を含めマスクされます。`--show-key` は JSON 経路の表示を解除しません（`strata_cli/launch/cmd.py:951-960`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:148-165` — `connect` parser と `--preset` 定義。
-- `strata_cli/launch/cmd.py:567-627` — 稼働中 launch の検索、preset 読み込み、URL/key/model/context の組み立て。
-- `strata_cli/launch/cmd.py:842-929` — 接続先の優先順位、表示、JSON、`--check` の分岐。
-- `strata_cli/launch/store.py:27-36,88-103` — preset の場所、slug 化、読み込みと missing / damaged の扱い。
-- `strata_cli/launch/settings.py:78-103,310-315` — 保存される launch 設定と preset 名の正規化。
-- `strata_cli/launch/harness.py:22,253-267,275-311` — URL/key/context の既定、app 設定の生成、書き込み、key マスク。
-- `strata_cli/cli.py:2166-2188,2223-2231` — ValueError のエラー変換と未知引数の処理。
+- parser と help: `strata_cli/launch/cmd.py:156-173`
+- preset / 稼働 launch の検索と接続情報生成: `strata_cli/launch/cmd.py:636-658`
+- 接続先の値の優先順位、描画、JSON 出力: `strata_cli/launch/cmd.py:945-977`
+- 人間向け表示、`--check`・`--write` の別動作: `strata_cli/launch/cmd.py:978-1028`
+- preset 読み込み、欠落・破損時の挙動: `strata_cli/launch/store.py:88-103`
+- preset slug 化と既定 port: `strata_cli/launch/settings.py:50, 355-360`
+- harness の key placeholder と context 既定値: `strata_cli/launch/harness.py:272-273`
+- CLI 共通エラー処理: `strata_cli/cli.py:2166-2173, 527-530`

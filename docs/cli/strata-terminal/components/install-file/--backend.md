@@ -1,6 +1,6 @@
-# `--backend`
+# `strata components install-file --backend`
 
-調査対象: Strata commit `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 調査）。
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,55 +8,50 @@
 | コマンド | `strata components install-file` |
 | オプション | `--backend` |
 | 別名 | なし |
-| 値 | バックエンド名を1つ取る。parser に `choices` や型変換の指定はない |
+| 値 | backend 名を表す文字列。現在の既知 family は `metal`、`cuda`、`hip`、`sycl`、`cpu`。parser は選択肢や型変換を指定しない（既知 family: `strata_control/targets.py:23-29`） |
 
 ## 役割
 
-ローカルから導入するエンジン package について、この PC が必要とする backend family を指定します。package の backend と指定値が一致しない場合、適合しない package として拒否されます。省略すると PC の検出結果を使います。
+ローカルの engine package を導入するとき、PC の自動検出結果に代えて、package 適合判定に使う backend family を指定します。package 自体は位置引数 `file` で指定します。
 
 ## 使い方
 
 ```sh
-strata components install-file ./strata-engine.tar.gz --backend cuda
+strata components install-file ./strata-engine.tar.gz --backend hip
 ```
-
-位置引数 `file` は手元にあるエンジン package のパスです。`--backend` は `--feed` のように package の取得先を指定するものではありません。
 
 ## 値と既定値
 
-- 既定値は `None` で、省略時は `updater.detect_hardware()` が得た backend を使います。
-- parser は値を文字列のまま受け取り、許容値を parser 層では制限しません。同じオプションを複数指定した場合は通常の `argparse` の `store` 動作により最後の値になります。
-- package manifest の backend は `metal`、`cuda`、`hip`、`sycl`、`cpu` のいずれかに制限されています。指定値はその backend と大文字小文字を含めて一致する必要があります。未知の値や異なる表記は parser エラーではなく、後段の適合判定で拒否されます。
-- 空文字列を値に渡すと `if a.backend` が偽になるため、明示値として使われず自動検出の値が残ります。
+`--backend` は共通 parser `_common()` が `default=None` で登録し、`choices`、`type`、独自 validator はありません。省略時は `updater.detect_hardware()` の検出結果を使います。値を指定すると `engine_component.split_backend()` が前後の空白を除去し、小文字化します。`hip-<名前>`（`<名前>` が空でない場合）は `("hip", "<名前>")` に分解され、それ以外は名前をそのまま family として扱います。
+
+値が空文字列なら `run()` の `if a.backend` が成立しないため、CLI 指定値としては適用されず、検出結果が使われます。未知の family も parser 段階では拒否されませんが、通常は package の backend と一致せず、適合判定エラーになります。
 
 ## 実行時の動作
 
-`install-file` は `_common()` が共通オプションを登録し、`--backend` 自体の指定は `default=None` です。実行時には最初にハードウェア情報を検出し、値が truthy なら `hardware["backend"]` をその値に、`backend_source` を `requested` に置き換えます。そのハードウェア情報を用いて `install_engine_file()` を呼び出します。
+`strata components install-file` は update command の共通 option 群を登録し、`--backend` を受け付けます。parser は `strata_cli/cli.py` から登録され、実行時に `update_cmd.run()` へ委譲されます（`strata_cli/update_cmd.py:37-47,66-69`; `strata_cli/cli.py:139-140,2135-2137`）。
 
-package の署名・ファイル検証後、manifest から読んだ backend と PC 用に選んだ backend が一致するかを含めて package の適合性を確認します。OS/platform、Control runtime の最低バージョン、検出済み GPU の CUDA architecture / NVIDIA driver、HIP architecture も適合判定の対象です。成功後は staged engine の test start を行い、問題がなければ engine を切り替え、以前の engine を保持します。
+`run()` はまず現在の hardware 情報を検出し、`--backend` が空でない場合は検出した `hardware["backend"]` を指定 family で置き換え、`backend_source` を `requested` にします（`strata_cli/update_cmd.py:194-202`）。`hip-rdna2` のような値では family が `hip`、variant が `rdna2` になります（`strata_control/engine_component.py:439-445`）。
 
-環境変数 `STRATA_ENGINE_BACKEND` は `detect_hardware()` 内で先に評価されます。`--backend` を指定すると backend と source は `requested` に上書きされますが、検出時に得た runtime、driver、GPU architecture 等の情報は再検出されません。したがって指定 backend と実機の組合せをソースが再調査するわけではなく、最終的な test start で起動できない package は失敗し得ます。`STRATA_ENGINE_BACKEND` 自体が無効な値なら、CLI 値による上書きより前の検出段階でエラーになります。
+install-file 経路は feed を読まず、位置引数の archive を展開して署名と全ファイルを検証した後、package と hardware の適合性を検査します（`strata_cli/update_cmd.py:219-228`; `strata_control/updater.py:1162-1206`）。適合判定では OS platform と backend family が比較され、CUDA/HIP では検出できた GPU architecture、CUDA では読み取れた driver version、package が要求する runtime version も確認されます（`strata_control/feed.py:408-431`）。
+
+`hip-<variant>` の suffix は hardware 情報の `variant_wanted` に格納されますが、この install-file 経路が呼ぶ `engine_fit_reasons()` はその値や package の variant 名を照合しません。したがって、このオプションで `hip-rdna2` を指定しても、この経路では `hip` family を指定した効果までで、`rdna2` という variant の一致は検証しません（`strata_cli/update_cmd.py:197-202,223`; `strata_control/updater.py:1204-1206`; `strata_control/feed.py:408-431`）。GPU architecture が読み取れない場合、HIP package の architecture 適合判定は拒否理由を返しません（`strata_control/feed.py:401-405,426-427`）。
 
 ## 適用条件と副作用
 
-- backend family は対象 OS/platform と組み合わせて適合判定されます。対応表は `metal` が macOS arm64、`cuda` / `hip` が Windows x86_64 と Linux x86_64、`sycl` が Linux x86_64、`cpu` が macOS arm64/x86_64、Windows x86_64、Linux x86_64 です。
-- package file の読み取り、staging directory への展開、署名と全ファイルの検証、engine の test start、および成功時の component folder 内の切替・状態履歴更新を伴います。ダウンロードは行わず、指定した元 archive は削除しません。
-- serving 中の engine がある場合、`--wait` なしでは対話端末で待機確認を行い、machine output または非対話時は待たずに busy error になります。待機時間も `--wait` で指定できます。
+- このオプションが作用するのは `strata components install-file` の backend 適合判定です。`--feed` はこの install-file 分岐では参照されず、指定した package の取得元を変えません（`strata_cli/update_cmd.py:219-229`）。
+- 指定した family が package と異なる場合や、検出済み GPU architecture / driver / runtime 条件に合わない場合、package は拒否されます。package 適合後は通常の test-start と engine 切り替え処理に進みます（`strata_control/feed.py:408-431`; `strata_control/updater.py:1204-1219`; `strata_control/updater.py:1068-1079`）。
+- CLI が指定値を使うと hardware family が上書きされるため、package の適合判定は検出された GPU family ではなく指定 family に対して行われます（`strata_cli/update_cmd.py:196-202`）。
 
 ## 出力とエラー
 
-- 成功時は既定の human output に結果を表示し、`--output json` または `jsonl` では JSON を出力します。JSONL の進捗イベントは helper が出力しますが、install-file の通常経路は feed download をしないため download 進捗はありません。
-- package の不在・形式不正、manifest / 署名 / ファイル検証失敗、指定 backend や platform などとの不適合は `UpdateError` として拒否コード 5 になります。空き容量不足・test start 後の切替失敗などはコード 6、engine busy はコード 7 です。`update_cmd.run()` は human mode では `strata: ...` を stderr に、machine mode では `ok: false` の JSON error を stdout に出します。
-- 検証・適合判定に失敗した場合、staging directory は後処理で削除されます。切替後に resolver が新しい engine を選ばない場合は新規配置を `.rejected` に移し、以前の engine を維持します。
+正常終了時は human 出力で導入結果を表示し、`--output json` / `--json` または `--output jsonl` では JSON を出します（`strata_cli/update_cmd.py:185-192,223-228`; `strata_cli/cli.py:508-515`）。package が現在の PC に適合しない場合など `UpdateError` は `strata:` 付きで stderr に出力され、エラーに設定された終了コード（適合拒否は 5）を返します（`strata_control/updater.py:1204-1206`; `strata_cli/update_cmd.py:187-192,257-258`）。
 
 ## 根拠
 
-- parser と共通 option: `strata_cli/update_cmd.py:30-61`。コマンド dispatch: `strata_cli/cli.py:139-140,2135-2137`。
-- hardware 検出結果への適用、install 呼び出し、出力・例外処理: `strata_cli/update_cmd.py:174-216,246-255`。
-- backend 環境変数の検証と検出: `strata_control/updater.py:255-276`、`strata_control/engine_component.py:439-447`。
-- backend の一致、platform/runtime/GPU 条件: `strata_control/feed.py:372-395`。対応 backend/platform: `strata_control/targets.py:20-29`。manifest backend の制約: `strata_control/engine_component.py:267-286`。
-- ローカル package の展開・署名/内容検証・適合確認・元 archive を残す処理: `strata_control/updater.py:1088-1148`。
-- test start、切替、前版保持と rollback 可能な状態の更新: `strata_control/updater.py:994-1077`。
-- 空き容量不足コード: `strata_control/updater.py:454-473`。serving 時の待機・拒否と終了コード: `strata_control/updater.py:306-317`、`strata_cli/update_cmd.py:258-273`。
-
-調査対象は上記 commit の checkout です。CLI `--help`、Release archive、および異なる OS/backend 実機での実行は調査していません。動作の説明は同一 revision の parser と実装ソースに基づきます。
+- `strata_cli/update_cmd.py:37-47,66-69` — 共通 parser option と install-file parser の登録。
+- `strata_cli/update_cmd.py:194-202,219-228,257-258` — 検出結果の上書き、install-file への分岐、出力と UpdateError 処理。
+- `strata_cli/cli.py:139-140,2135-2137,508-515` — parser 登録、update command への委譲、one-shot command の `--json` / `--quiet` 追加。
+- `strata_control/engine_component.py:439-445` — backend 名と HIP variant suffix の分解。
+- `strata_control/targets.py:20-29` — 現行の既知 backend family。
+- `strata_control/updater.py:1162-1222` — ローカル archive の検証、適合判定、導入処理。
+- `strata_control/feed.py:401-431` — hardware と package の適合条件。variant 名自体はこの判定で照合されない。
