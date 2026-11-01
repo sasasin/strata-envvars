@@ -1,54 +1,57 @@
 # `STRATA_CVEC_FUSE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 ## 役割
 
-prompt 処理で、hyper-connection の residual write、制御ベクトル適用、次の half の norm と BF16 画像生成を一つの kernel にまとめるかを選びます。通常の三段階（write、制御ベクトル、norm）を `gr_write_cvec_norm_rs` に置き換える最適化スイッチです。制御ベクトルの読み込みやリクエストごとの有効・無効は、この変数ではなく別の設定が決めます。
-
-CUDA/HIP 実装（`src/prefill/prefill.cpp`）と SYCL 実装（`sycl/src/prefill/prefill.cpp`）に同じ判定と適用条件があります。decode の経路ではなく prompt の prefill 経路で使われます。
+制御ベクトルを適用する prefill の層で、hyper-connection の FFN 書き込み、制御ベクトル適用、次の半層の正規化を一つのカーネルにまとめます。対象は通常の CUDA/HIP prefill と SYCL prefill です。制御ベクトルの有効・無効そのものを切り替える変数ではなく、制御ベクトルがロードされ、その層が適用対象になった場合に融合経路を選ぶためのスイッチです。無効時や融合条件を満たさない場合は通常の書き込みと `cvec_apply` に分かれます（`src/prefill/prefill.cpp:5557-5563,5603-5615`; `sycl/src/prefill/prefill.cpp:4693-4707,4795-4807`）。
 
 ## 値と判定
 
-prefill 実装は `getenv()` の結果を static 変数に一度保存し、文字列全体ではなく先頭文字が `'1'` かだけを調べます。
+CUDA/HIP と SYCL の実装は、`getenv()` が返す文字列の先頭文字だけを `'1'` と比較します。数値 parse や文字列全体の比較はしません。
 
-| 状態 | 判定 |
+| 環境値 | 判定 |
 |---|---|
-| 未設定 | 無効（通常の既定値） |
-| 空文字 | 無効。設定済みだが先頭文字は `\0` |
-| 先頭が `1`（例: `1`, `10`, `1xyz`） | 有効 |
-| その他（例: `0`, `true`, `2`, 空白で始まる値） | 無効 |
+| 未設定 | 無効（ただし後述のアーキテクチャ既定値または setup の設定が適用される場合を除く） |
+| 空文字 | `getenv()` が空文字へのポインターを返す場合は無効。先頭文字が `'1'` ではない |
+| `1` で始まる値 | 有効。例: `1`, `10`, `1anything` |
+| その他 | 無効。例: `0`, `true`, ` 1`, `2` |
 
-数値変換、空白除去、大文字小文字変換はしません。判定は初回の `cvec_fuse()` 呼び出し時に行われ、同一プロセスで環境を変更しても再評価されません。
+判定結果は `cvec_fuse()` 内の関数ローカル `static const bool` に保存されます。最初に関数が呼ばれて判定された後、プロセス内で環境値を変更しても再評価されません（`src/prefill/prefill.cpp:502-505`; `sycl/src/prefill/prefill.cpp:343-346`）。
 
 ## 有効になる条件
 
-スイッチの判定が有効でも、各 layer で次の条件を満たしたときだけ fused kernel が選ばれます。
+フラグが有効でも、次の条件がそろった層でだけ融合経路を使います。
 
-- 該当する hyper-connection half が layer の FFN write 側（`half == 1`）で、ロード済み制御ベクトルがその layer をカバーしている。
-- `STRATA_GR_UNFUSED` が有効でない。
-- 次の layer が存在し（`nl < LE`）、layer 1 の PLE block 前にあたる例外経路ではない。
-- 制御ベクトルの埋め込み次元と hyper-connection 数がモデルと一致し、現在の device に制御ベクトルの表がある。
+- 層の第 2 half（FFN write 側）で、制御ベクトルがロード済みかつその層をカバーしている。
+- `STRATA_GR_UNFUSED` が `1` でない（この変数も先頭文字が `1` かで判定）。
+- 次の層 `nl` が `LE` 未満で、最終層ではない。
+- `nl == 1 && ple_on` の例外経路でない。
+- 制御ベクトルの `n_embd` と `hc` が現在の prefill と一致し、現在デバイスに制御ベクトルの表がある。
 
-制御ベクトルは `--control-vector-scaled` などで別途ロードされます。リクエストでそのベクトルが無効でも fused kernel 自体は選ばれ得ますが、kernel 内の device flag が 0 ならベクトル変換をせず、write と norm を行います。条件を満たさない steered layer では、通常の write/norm と `cvec_apply()` に戻ります。ベクトルがない場合はこの変数だけを設定しても fused cvec 経路は使われません。
+これらは CUDA/HIP と SYCL で同じ条件です（`src/prefill/prefill.cpp:5556-5563`; `sycl/src/prefill/prefill.cpp:4693-4700`）。制御ベクトルは `--control-vector` / `--control-vector-scaled` などからロードされます。ロードがなければ `Cvec::covers()` は false なので、この環境変数だけでは何も融合しません（`src/program/generate.cpp:3289-3304,2064-2069,2124-2127`; `include/strata/kernels/cvec.hpp:25-36,39-57`）。要求レベル（`Cvec::on`）がオフなら融合カーネル内の `steer` も false になり、そのリクエストでは制御ベクトルを適用しません。フラグはこの per-request 状態を上書きしません（`src/prefill/kernels.cu:221-225,251-266`; `sycl/src/prefill/kernels.dp.cpp:281-297`）。
 
-## AMD GPU での既定値と実行時の詳細
+## 既定値と優先順位
 
-HIP build の `generate` は device の architecture を取得できた場合、engine が各スイッチを初めて読む前に `apply_arch_defaults()` を呼びます。この関数は gfx1151、gfx1200、gfx1201 に対して `STRATA_CVEC_FUSE=1` を既定表に含めます。したがって、これらの GPU では候補表の通常既定（unset は off）と異なり、環境変数が未設定なら起動時に `1` が設定されます。gfx1151 では `STRATA_GFX1151_DEFAULTS`、gfx1200/1201 では `STRATA_GFX12_DEFAULTS` の先頭文字が `0` の場合、当該 architecture の既定表は適用されません。
+HIP エンジンはデバイス判定後、engine code が各 switch を初めて読む前にアーキテクチャ既定値を環境へ設定します。既定値の対象は gfx12（RDNA4）の表と gfx1151（Strix Halo）の表で、どちらも `STRATA_CVEC_FUSE=1` を含みます。`setenv(..., overwrite=0)` を使い、変数がすでに存在すれば値を変えません。したがって明示した `0` や空文字も既定値より優先されます（`src/core/arch_defaults.cpp:25-57,59-81,167-180`; `src/program/generate.cpp:3383-3400`）。gfx12 は `STRATA_GFX12_DEFAULTS` の先頭が `0` なら既定表全体を適用しません。gfx1151 も `STRATA_GFX1151_DEFAULTS` の先頭が `0` なら同様です。明示した `STRATA_CVEC_FUSE=1` はそれらの既定表を抑制しても読み取られます（同 `arch_defaults.cpp:38-47,55-57`）。
 
-既に `STRATA_CVEC_FUSE` が設定済みなら、空文字を含めてユーザー設定が保持され、その値が先頭文字判定に使われます。たとえば gfx1151 で `STRATA_CVEC_FUSE=` とすると、既定値の `1` は注入されず無効になります。gfx1151/gfx12 の既定表が何かを設定した場合、stderr に `strata: gfx1151 (Strix Halo): ... exact speed switches on by default ...` または gfx12 の同形式の一覧ログが出ます。これは複数スイッチをまとめたログで、cvec 専用の有効ログはありません。
+gfx1103 と gfx1150 は engine 側のアーキテクチャ既定表には含まれません。HIP でそれぞれの experimental opt-in を使った setup は、作成する実行設定の `env` にこの変数を含む switch 群を書き込みます（`setup.py:3684-3697,10316-10327`）。serve の engine 起動時は設定の `env` を継承環境へ上書き適用するため、設定にこの値があれば、起動元環境より設定値が優先されます（`serve/server.py:3750-3760`）。
 
-この既定表は HIP build に限られます。CUDA build と SYCL build ではこの `#if defined(STRATA_USE_HIP)` の適用箇所を通らず、別の Strata 所有コードが値を設定しない限り unset は無効です。
+`--control-vector-scaled` は制御ベクトルのロードを指定する CLI 引数であり、`STRATA_CVEC_FUSE` の値を直接指定する CLI 引数ではありません（`src/program/generate.cpp:3289-3304`）。この変数の値は prefill 側で初回参照時に static cache されます。
 
-## ソースと文書の照合
+## 実行時の詳細
 
-`docs/DETAILS.md` は control vector / experimental speed projection をロード・有効化する利用者向け手順を説明しています。一方、`STRATA_CVEC_FUSE` はそのベクトル処理を prompt kernel 内にまとめるスイッチです。DETAILS の「既定で off」は実験的な制御ベクトル機能についての説明であり、HIP gfx1151/gfx12 でこの kernel 統合スイッチを既定設定する実装とは対象が異なります。資料にはこのスイッチ単独の測定条件や性能値は確認できないため、ここでは性能効果を数値で述べません。
+適用層で融合条件を満たすと `gr_write_cvec_norm_rs()` を呼び、残差 `R` への hyper-connection write、ベクトル適用、次 half の norm と BF16/FP16 画像生成をまとめて行います。通常経路ではこれを `gr_write`、`cvec_apply`、`gr_norm_rs` に分けます（`include/strata/prefill/kernels.hpp:32-40`; `src/prefill/prefill.cpp:5603-5615`; `src/prefill/kernels.cu:207-268`）。
+
+この変数が無効、または層・モデル状態などの条件が不成立なら fused cvec 経路を選びません。`steered && !cv_fused` の場合は通常の書き込み後に `cvec_apply` を呼ぶため、環境変数がオフでも制御ベクトルの適用自体は続きます（`src/prefill/prefill.cpp:5607-5615`; `sycl/src/prefill/prefill.cpp:4799-4807`）。通常の有効・無効判定について専用の警告や起動ログはありません。
+
+隣接する診断変数 `STRATA_CVEC_FUSE_CHECK` が正数として読み取られている場合、融合経路に入った最初の指定回数について、コピー上で従来経路も実行し、`R`・row scales・`xn16` が `identical` か `DIFFERS` かを stderr に出します。この比較は融合条件を通った場合だけ行われます（CUDA/HIP: `src/prefill/prefill.cpp:5570-5601`; SYCL: `sycl/src/prefill/prefill.cpp:4707-4710,4789-4793`）。
 
 ## 根拠
 
-- 値判定、layer 条件、fallback: `src/prefill/prefill.cpp:345-348,3933-3988`、`sycl/src/prefill/prefill.cpp:280-283,4302-4409`。
-- fused kernel が write、制御ベクトル、次 half の norm を行う処理: `src/prefill/kernels.cu:175-235,1879-1884`、SYCL 相当実装 `sycl/src/prefill/kernels.dp.cpp:255-323,2386-2412`。
-- 制御ベクトルがロード済みか、layer をカバーするか、device 表を持つか: `include/strata/kernels/cvec.hpp:25-57`。ロード処理: `src/program/generate.cpp:1476-1543`。
-- HIP build での architecture 判定と既定値適用時点: `src/program/generate.cpp:2152-2158`、architecture ごとの値と無効化条件: `src/core/arch_defaults.cpp:12-58`、設定済み値を保持する処理とログ: `src/core/arch_defaults.cpp:61-80`。
-- 対象 architecture 名の一致規則: `include/strata/kernels/gfx_arch.hpp:15-19,32-36`。
-- 制御ベクトル機能と利用方法の説明: `docs/DETAILS.md:1752-1783`。
+- 環境値の読み取りと static cache: `src/prefill/prefill.cpp:502-505`, `sycl/src/prefill/prefill.cpp:343-346`。
+- 適用条件・fallback: `src/prefill/prefill.cpp:5556-5563,5603-5615`, `sycl/src/prefill/prefill.cpp:4693-4700,4795-4807`。
+- fused kernel と通常経路に対応する処理: `include/strata/prefill/kernels.hpp:32-40`, `src/prefill/kernels.cu:207-268`, `sycl/src/prefill/kernels.dp.cpp:258-330`。
+- 制御ベクトルの load / table 状態: `src/program/generate.cpp:2064-2069,2124-2127`, `include/strata/kernels/cvec.hpp:25-57`。
+- HIP のアーキテクチャ既定値と明示環境値の優先: `src/core/arch_defaults.cpp:25-57,59-81,167-189`, `src/program/generate.cpp:3383-3400`。
+- gfx1103/gfx1150 setup 設定と serve 起動環境への適用: `setup.py:3684-3697,10316-10327`, `serve/server.py:3750-3760`。

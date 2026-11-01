@@ -137,6 +137,8 @@ def check_envvars(repo: Path, target_sha: str) -> dict[str, object]:
     mismatched_stems = {stem for stem in stems if stem not in seen and stem.lower() in index_lowers}
     spelling_mismatch = []
     for name in names:
+        if (doc_root / f"{name}.md").is_file():
+            continue
         for stem in lowered.get(name.lower(), ()):
             if stem != name:
                 spelling_mismatch.append(f"{name} (索引) -> {stem}.md (実ファイル)")

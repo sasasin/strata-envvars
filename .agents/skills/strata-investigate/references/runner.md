@@ -24,6 +24,15 @@ uv run ./create-cli-docs.py -p 12 -l 100
   `status` は `created` / `no-doc`（Strata が実際には読まない候補。`001_investigation.md` の手順どおり
   「索引との食い違い」として報告され、文書は作られない）/ `error`。
   既定では `status` の有無に関わらず記録済みの変数を避け、`--include-tried` で再調査する。
+- no-doc の中身は二種類ある。判定を間違えやすい方:
+  - Strata がまったく読まない名前（外部 lib・driver 専用、索引の誤拾い）→ 本文は作らない。
+  - **Strata が読むが、読み取り箇所がテスト・parity 専用コードだけ**（GEMV_X、QUANT_CTAB、
+    STRATA_WMMA_PARITY_EXACT など）→ `001_investigation.md` が実装根拠にしないと決めているので本文は作らない。
+    索引には残す。索引は grep 由来の候補一覧で、自分の冒頭で「テスト・開発/e2e スクリプトが読む変数」を
+    内訳に含めると宣言している。
+  - 逆に、セットアップ・ビルド・package スクリプト（`setup.py`、`packaging/**`、vision build の batch など）が
+    読む変数は本文を作る対象。エンジン実行で読まないからと no-doc にするのは誤り（CUDA_PATH で実際に起きた）。
+    再依頼では `001_investigation.md` の「調査対象と結界」の該当文を引用して範囲を示すと直る。
 - 終了時サマリ `残りの未作成 N 件（未調査 M 件 / 試行済み K 件）` の **M が 0 なら飽和**。
   その索引に対しては作れる文書は揃った（残りは Strata が読まない名前）と判断してよい。
 - codex の終了コードが 0 でも本文が増えていなければ `no-doc`。件数が増えない週が続いたら
