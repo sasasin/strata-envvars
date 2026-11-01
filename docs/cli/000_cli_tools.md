@@ -101,6 +101,8 @@ Release の installer スクリプトとソースの対応はハッシュで確�
 
 ## 更新手順と次回の調査指示
 
+> この更新をどの順序で回すか（他の索引との関係、消えた項目の削除、未作成文書の一括作成、突合点検）はスキル `.agents/skills/strata-investigate/SKILL.md` にまとめた。以下は本書単体の手順として残す。
+
 Strata checkout が更新されたら、`/home/sasasin/src/github.com/Niko1221/Strata` を調べ、この一覧をソースと公開 Release の双方に合わせて更新します。前回の説明に追記するだけでなく、削除・改名・統合された入口、GUI installer、Terminal installer、engine package、component/feed 方式、Docker 配布の変更も確認してください。
 
 ### 調査手順

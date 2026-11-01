@@ -1654,6 +1654,8 @@ Release から配布される `install.sh`（POSIX）と `install.ps1`（Windows
 
 ## 更新手順と次回の調査指示
 
+> 索引更新を他の作業（環境変数一覧の更新、本文の一括作成、消えた項目の削除、突合点検）とどの順序で回すかは、スキル `.agents/skills/strata-investigate/SKILL.md` にまとめた。以下は本書単体の手順として残す。
+
 Strata のソースコードが更新されたら、`/home/sasasin/src/github.com/Niko1221/Strata` の更新後 checkout を調査し、この索引を現行のコマンド構造と parser に合わせて更新してください。既存リンクへの追記だけで済ませず、削除・改名・移動されたコマンドやオプション、parser の統合・分岐も見直します。この作業では索引を更新し、リンク先のコマンド概要やオプション文書が未作成でも、規約に合う予定パスを Markdown リンクとして列挙します。
 
 ### 調査手順

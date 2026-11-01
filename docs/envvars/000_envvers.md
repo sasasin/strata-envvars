@@ -26,6 +26,8 @@
 - 同梱ツール・セットアップ・ビルド・パッケージング・Docker・CI のスクリプトが読む変数: 110
 - テスト・開発/e2e スクリプトが読む変数: 202
 
+> 索引そのものの再生成・削除・一括作成の手順はスキル `.agents/skills/strata-investigate/references/index-refresh.md` にある。生成方法の定義は本書の冒頭が正で、索引の形（1 行 1 名の `- \`NAME\`` と ASCII 順）を崩すと `create-envvars-docs.py` と `check-docs.py` が読めなくなる。
+
 ## 環境変数
 
 - `ACQUIRE_SPY_LOG`
