@@ -1,70 +1,66 @@
 # `--batch-groups`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout は `main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 調査）。調査対象 checkout は `main...origin/main` で、`git status --short --branch` に変更表示はなかった。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（エンジン引数、トップレベル） |
-| オプション | `--batch-groups` |
+| コマンド | ネイティブ `strata` エンジン（root） |
+| オプション | `--batch-groups G` |
 | 別名 | なし |
-| 値 | `G`（整数）または CUDA/HIP parser では `auto` |
+| 値 | 正の整数、または `auto`。ただし parser は数値を `atoi` で変換し、正整数かどうかを厳密には検証しない |
 
 ## 役割
 
-`--batch` で作る複数の会話 slot を G グループに分け、層分割（`--layer-split`）した GPU 間でパイプライン実行する数を指定します。グループ数が 1 の場合は slot 全体を一つの window として各 GPU stage を順番に通します。G が 2 以上の場合、stage k があるグループを処理する間に stage k+1 が別グループを処理します（`src/program/generate.cpp:665-669,11739-11748`）。
+`--batch` の slot を複数 group に分け、layer split の GPU stage 間で別 group を重ねて処理する数を指定する。group 数が1以下ならこの pipelined group 経路には入らない。利用には `--batch`、`--serve`、複数 GPU にまたがる layer split が必要になる（`src/program/generate.cpp:780-791, 1034-1041, 6115-6121, 11364`）。
 
 ## 使い方
 
-複数 GPU の層分割で、8 slot を4グループに分ける例です。`--batch-groups 4` が有効になるには `--batch` が4で割り切れる必要があります。
-
 ```sh
-strata --serve --layer-split 12,24,36 --expert-profile /path/to/profile.json \
-  --batch 8 --batch-groups 4
+strata --model model.gguf --serve --batch 8 --layer-split 12,24 --batch-groups 2
 ```
 
-GPU ごとの stage 分割と serving が前提です。実行ファイルは CMake が生成する推論エンジンで、Terminal CLI の `strata serve` とは別の parser です（索引: `docs/cli/README.md:1128-1143`）。
+ここでは8 slotを2 group（各4 slot）に分ける。グループ数を自動選択させる例:
+
+```sh
+strata --model model.gguf --serve --batch 8 --layer-split 12,24 --batch-groups auto
+```
+
+`--batch` の slot 数は実行時に VRAM などで減る場合があるため、最終的な group 数はその後の再評価と補正に従う（`src/program/generate.cpp:6101-6112, 6160-6175`）。
 
 ## 値と既定値
 
-- **CUDA/HIP parser**: 数値は `std::atoi` で整数化され、`auto` は専用フラグとして認識されます。オプション自体の数値範囲 validation はありません。値の省略は parser 共通の `--batch-groups needs a value` を stderr に出して終了コード 2 で終了します（`src/program/generate.cpp:2418-2421,2612-2617`）。
-- **`G=1`**: パイプラインを使わず、全 slot を順次処理する指定です。`G` が 0、負数、または整数として解釈できない文字列も parser では拒否されず、`atoi` の結果が 1 以下なら同様にパイプライン分岐に入りません（`src/program/generate.cpp:2612-2617,11739-11748`）。明示的な検証エラーにはなりません。
-- **`G>1`**: slot 数を G グループに分けます。G が slot 数を割り切らない、または層分割がない場合、batch 有効時には警告を stderr に出して1グループへ戻します。slot 数が VRAM などの都合で縮小された後に割り切れなくなった場合も、最終的に1グループへ戻ります（`src/program/generate.cpp:5380-5385,5427-5436`）。
-- **`auto`（CUDA/HIP）**: 層分割の stage 数を超えず、batch slot 数を割り切る最大のグループ数を選びます。明示指定がなくても、層分割があり `--batch` が2以上なら自動選択が既定です。層分割なし、または batch が1以下の場合は既定1です（`include/strata/program/batch_groups.hpp:41-67`）。
-- **SYCL parser**: `--batch-groups` は `atoi` のみで処理され、`auto` を特別扱いせず暗黙の auto 既定もありません。したがって `auto` は整数0として扱われ、1以下と同じくパイプラインになりません（`sycl/src/program/generate.cpp:1915,4099-4103,9248-9251`）。SYCL 向けのヘルプも単に `G` と表示します（同 `:835`）。
+- 引数 parser は `auto` を特別扱いし、それ以外は `std::atoi` で整数化する。値がない場合は stderr に `--batch-groups needs a value` を出して終了コード2で終了する。`auto` 以外の文字列について数値形式・正数範囲を parser で拒否する処理はない（`src/program/generate.cpp:3005-3007, 3199-3204`; SYCL: `sycl/src/program/generate.cpp:1780-1782, 1935-1938`）。
+- CUDA/HIP 系では、未指定時に `--batch` が2以上で layer split があると `auto` 相当となる。`auto` は slot 数を割り切り、stage 数（CUDA0を含む）を超えない最大の group 数を選ぶ。`--batch-groups 1` は明示的に直列 group を指定する（`include/strata/program/batch_groups.hpp:83-107`; `src/program/generate.cpp:6024-6045, 6131-6154`）。
+- SYCL 系では未指定値は0、明示 `auto` は内部値-1。通常の `auto` は layer split がある場合に上記と同様に最大の割り切れる group 数を選ぶ。一方、未指定時に限り、Arc B-series 2枚の layer split で batch slot が8以上かつ偶数なら既定2 groupとなる。`STRATA_BATCH_GROUPS_AUTO` が設定され、`atoi` の結果が0ならこの特例を抑止する。明示 `--batch-groups 1` も特例を使わない（`sycl/src/program/generate.cpp:630-634, 1935-1938, 4184-4203`）。
+- 不正文字列や0は厳密な validation error にはならず、`atoi` の結果が0となる場合は group 数0のまま保持される。負数も1以下として pipeline 条件を満たさない。これらを意図した使用方法としては記述されていない（`src/program/generate.cpp:3199-3204, 6155-6159, 11364`; SYCL: `sycl/src/program/generate.cpp:1935-1938, 4205-4209, 9473-9476`）。
 
 ## 実行時の動作
 
-CUDA/HIP 版の自動選択は、stage 数を `stages.size()+1` GPU として数え、2からその数および slot 数までを調べ、slot 数を割り切る最大値を使います（`include/strata/program/batch_groups.hpp:41-47`）。ただし、暗黙の既定 auto は次の場合に1へ変更されます。
+指定数が2以上なら、engine は layer split の stage 数と batch slot 数を照合する。layer split がない、または slot 数を group 数で割り切れない場合は stderr に warning を出し、1 group に補正する。slot session の確保後に slot 数が減って割り切れなくなった場合も1 groupに戻す（`src/program/generate.cpp:6155-6159, 6160-6175`; SYCL: `sycl/src/program/generate.cpp:4205-4209, 4210-4272`）。
 
-- `--adapt-async 1` が有効で、明示的な `--batch-groups` がない場合。パイプライン経路では batch の adaptive tier が動作しないためです（`include/strata/program/batch_groups.hpp:59-65`, `src/program/generate.cpp:8066-8092`）。
-- batch MTP が有効で、`STRATA_BATCH_MTP_SERIAL` が空でないかつ先頭文字が `0` ではない場合。明示的な `--batch-groups 1` も serial window を選べます（`src/program/generate.cpp:5299-5321`, `include/strata/program/batch_groups.hpp:59-65`）。
-- 非 HIP ビルド（NVIDIA/CUDA 経路）で、ちょうど2 GPU の層分割、batch MTP 無効、adaptive async 無効の場合、`STRATA_BATCH_GROUPS_NV_SERIAL` が未設定または先頭文字が `0` 以外なら1グループにします。`STRATA_BATCH_GROUPS_NV_SERIAL=0` はこの暗黙の serial 選択を解除します。明示的な `--batch-groups auto` はこの暗黙既定の例外処理を受けず、自動グループ数を要求します（`src/program/generate.cpp:5293-5297`, `include/strata/program/batch_groups.hpp:54-65`）。
+pipeline 経路では各 group が `--batch / group数` slotを持ち、group を stage 間で順に進める。起動時の情報行には `batch_groups=<解決後の数>` が含まれ、実行完了時には group 数・group あたり slot 数・処理行数などを stderr に出す（`src/program/generate.cpp:11364, 12286, 13012-13017, 13470-13475`; SYCL: `sycl/src/program/generate.cpp:8911, 9473-9485, 9578-9581`）。
 
-グループが2以上でパイプラインが有効になるのは、batch slot があり、複数の layer stage がある場合です。各 group は `batch / groups` slot を持ち、各 stage に対して verifier の batch launch を行います（`src/program/generate.cpp:11739-11767`）。起動時には選択グループ数を stderr に記録し、処理終了時には group 数・各 group の slot 数・window 数・行数・処理率を stderr に出します（同 `:5361-5378,11923-11930`）。
+CUDA/HIP 系の暗黙 `auto` は、`--adapt-async 1` のため、または一部の2枚 NVIDIA 構成で `STRATA_BATCH_GROUPS_NV_SERIAL` / `STRATA_DEFAULTS=026` が直列動作を指定するため、1 groupになることがある。`--batch-mtp` は通常の暗黙 pipeline 既定を1 groupにはせず、group pipeline が選ばれる場合は batch MTP draft が無効になることがあり、stderr warning で理由を案内する。明示した数値または `auto` はこれらの暗黙既定より優先される（`include/strata/program/batch_groups.hpp:48-70, 73-80, 92-115`; `src/program/generate.cpp:6037-6045, 6055-6071, 13012-13028`）。
 
 ## 適用条件と副作用
 
-- batch slot は `--serve` と2以上の `--batch` が必要で、層分割では各 stage が別 GPU 上にある必要があります。条件を満たさない `--batch` は警告を出して無効化されます（`src/program/generate.cpp:5340-5347`）。層分割自体も `--serve` を要求し、複数 GPU の分割には `--expert-profile` が必要です（同 `:2998-3027,3069-3072`）。
-- batch slot ごとに各 stage 上の session state を追加確保します。起動時の VRAM 確保が失敗すると、確保できた slot 数に減らし、2 slot 未満しか確保できない場合は batch を無効化します。したがってグループ数は要求どおりでも slot 数が調整され得ます（`src/program/generate.cpp:5386-5440`）。
-- パイプライン経路では slot ごとの MTP draft は実行しません。暗黙の既定でパイプラインが優先される場合は batch MTP が無効化され、明示的に groups>1 を指定した場合は `--batch-mtp` の draft が走らない旨の警告が出ます（`src/program/generate.cpp:5301-5321,11743-11748`）。
-- `--adapt-async 1` はグループ数が2以上の経路と併用できず、batch 有効時には adaptive async が無効化されます（`src/program/generate.cpp:8066-8092`）。
-- pipelined groups は slot ごとの verifier row を作り、stage 間で複数グループを進行させます。slot session が GPU VRAM を消費し、その分 expert cache に使える VRAM が減ります（`src/program/generate.cpp:5272-5275,5417-5440,11739-11805`）。
-- `--batch-groups` は serving の batch 機能に関する指定です。通常の単発 generation や `--batch` が無効化された実行では、group 設定は実効しません（`src/program/generate.cpp:5340-5355,11739-11748`）。
+- batch decode は `--serve`、2 slot以上、各 layer stage がそれぞれ別 GPU にあることを要求する。満たさないと `--batch` 自体が warning 付きで無効化され、group pipeline も実行されない（`src/program/generate.cpp:6115-6129`; SYCL: `sycl/src/program/generate.cpp:4171-4182`）。
+- group pipeline は GPU stage 間に複数 batch group の処理を重ねる。これは実行経路と VRAM 配分に影響する。batch slot ごとに session が確保され、その VRAM は expert cache が使える容量を減らす（`src/program/generate.cpp:6160-6175`; SYCL: `sycl/src/program/generate.cpp:4210-4275`）。
+- `--batch-mtp` は通常の group pipeline と同時には slot draft を行わず、draft 用 VRAM を保持したまま使われない場合がある。直列 batch windows で batch MTP を使う場合は `--batch-groups 1` が案内されている（`src/program/generate.cpp:6055-6071, 13026-13028`）。
+- group pipeline と `--adapt-async 1` は併用時の解決動作が異なる。pipeline の adaptive tier は通常は動かず、`STRATA_PIPE_ADAPT_EVERY` が正の間隔なら group windows の完了を待って適応処理を実行する（`include/strata/program/batch_groups.hpp:13-15, 43-45`; `src/program/generate.cpp:9064-9069, 13223-13243`）。
+- 本文は source checkout の CUDA/HIP 系 `src/program/generate.cpp` と SYCL 系 `sycl/src/program/generate.cpp` を調査した。各 backend の実機動作や性能差は実行・測定していない。
 
 ## 出力とエラー
 
-- 値なしは stderr に必要値を示し、終了コード2です（`src/program/generate.cpp:2418-2421`）。
-- 未知の引数は stderr に `unknown argument` を出し、usage を表示して終了コード2です（`src/program/generate.cpp:2787-2792`）。
-- groups>1 が層分割なし、または batch 数を割り切れない場合は警告を出して1グループへ fallback します。これは終了エラーではありません（`src/program/generate.cpp:5380-5385`）。
-- パイプライン経路でも batch window の上限を超える状態が残る場合、stderr に理由を出して serving loop が false を返します（`src/program/generate.cpp:11748-11755`）。
+数値が `auto` 以外でも parser による書式エラーは確認できない。指定 group 数が layer split を要求する条件を満たさない場合は `strata generate: WARNING: --batch-groups ... needs a layer split and to divide --batch ...; one group` を stderr に出して1に戻す（`src/program/generate.cpp:6155-6159`; SYCL: `sycl/src/program/generate.cpp:4205-4209`）。
+
+`--batch` の条件を満たさない場合は別の warning により batch 自体が無効になる。slot session が各 GPU に2つ以上確保できない場合も batch が無効になる（`src/program/generate.cpp:6115-6121, 6160-6175`; SYCL: `sycl/src/program/generate.cpp:4171-4182, 4263-4275`）。
 
 ## 根拠
 
-- parser と help 表示: `src/program/generate.cpp:665-669,910-916,2418-2421,2612-2617`。
-- auto と暗黙既定の計算: `include/strata/program/batch_groups.hpp:21-67`; 設定値の受け渡しと環境変数: `src/program/generate.cpp:5280-5297`。
-- batch MTP との条件: `src/program/generate.cpp:5299-5321,11743-11748`。
-- batch slot の validation・確保・縮小: `src/program/generate.cpp:5340-5440`。
-- パイプライン処理と出力: `src/program/generate.cpp:11739-11930`。
-- SYCL parser の挙動差: `sycl/src/program/generate.cpp:630,835,1915,4099-4103,9248-9260`。
-- 利用者向け補助資料: `docs/BATCHING.md:88-96,426-433`。この説明表は2 GPU NVIDIA の serial 既定を「PROPOSED」と記していますが、調査対象 revision の parser 側では既定有効の条件が実装されています（`src/program/generate.cpp:5293-5295`, `include/strata/program/batch_groups.hpp:59-65`）。測定値や性能上の推奨は本書では保証しません。
+- CLI help と option parser、内部初期値: `src/program/generate.cpp:780-791, 1034-1041, 3199-3205`; SYCL: `sycl/src/program/generate.cpp:630-635, 840-844, 1935-1939`。
+- group 数の自動解決と暗黙既定: `include/strata/program/batch_groups.hpp:83-115`; `src/program/generate.cpp:6024-6045, 6131-6159`。
+- SYCL Arc B-series の既定と環境変数: `sycl/src/program/generate.cpp:4184-4209`。
+- batch 適用条件、slot 調整、pipeline 実行と出力: `src/program/generate.cpp:6115-6129, 6160-6175, 11364, 12286, 13012-13028, 13470-13475`; SYCL: `sycl/src/program/generate.cpp:4171-4275, 8911, 9473-9485, 9578-9581`。
+- 適応処理との相互作用: `src/program/generate.cpp:9064-9069, 13223-13243`; `include/strata/program/batch_groups.hpp:13-15, 43-45`。

@@ -1,71 +1,56 @@
 # `--vram-experts`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine-dsv41` |
-| コマンド | `strata-dsv41`（DSV4.1 engine のトップレベル引数） |
+| コマンド | `strata-dsv41` の root（サブコマンドなし） |
 | オプション | `--vram-experts` |
 | 別名 | なし |
-| 値 | `F`。`atof` で `double` に変換される VRAM expert 予算の係数 |
+| 値 | `F`。`std::atof` で読む数値。既定値は `1.0` |
 
 ## 役割
 
-GPU ごとに残す VRAM 量を考慮した expert 用予算を調整します。係数は空き VRAM 全体に対する比率ではなく、少なくとも expert 配置の計算では `--reserve-mib` を差し引いた後の予算に掛かります。既定値は `1.0` です。
+GPU の空きメモリから DeepSeek-V4.1 の expert 用に見積もる配置予算に係数を掛け、VRAM に置く expert 数を調整します。残りの expert は CPU lane 側に置かれます。これは「VRAM に置く expert の個数」そのものではなく、メモリ予算に対する倍率です（`src/dsv41/ds4_model.hpp:27-31`、`src/dsv41/ds4_model.cu:4585-4590,4616-4617,4645-4657`）。
 
 ## 使い方
 
 ```sh
-strata-dsv41 --pack /path/to/model/maya-ds4 --ids 1 --vram-experts 0.5
+strata-dsv41 --pack /path/to/model/maya-ds4 --ids 1,2,3 --vram-experts 0.5
 ```
 
-`--pack` には DSV4.1 pack のディレクトリを指定します。実際の推論には利用する pack に適合した token ID などが必要です。
+`--vram-experts` は `--pack`、`--ids` などと同じトップレベル引数です。source の usage も `[--vram-experts F]` と示しています（`src/dsv41/ds4_main.cpp:101-109`）。
 
 ## 値と既定値
 
-- 値は必須です。値を省略すると parser の共通処理が `--vram-experts needs a value` を stderr に出し、終了コード `2` で終了します。
-- `std::atof` の戻り値を `Options::vram_experts` に設定します。ソースには数値形式、有限値、最小値・最大値の検証がありません。したがって、CLI が `0..1` に制限するとはいえません。また、数値でない文字列を明示的に拒否する処理もありません。
-- 省略時は `1.0` です。指定を繰り返した場合は parser が順に代入するため、最後の指定値が残ります。
-- 係数を下げると expert 配置予算を減らし、上げると増やします。0、負数、1 超の値や不正形式の具体的な結果を CLI が保証する validation はありません。実用上の境界や性能上の推奨値は、このソース調査からは確認できません。
+- 省略時は `vram_experts_auto=true`、`vram_experts=1.0` です（`src/dsv41/ds4_model.hpp:30-31`）。
+- 指定すると `std::atof` の結果を保存し、`vram_experts_auto=false` にします。範囲・符号・有限値の検証やエラー処理は parser にありません。非数値文字列は `atof` の規則により通常 `0` になり、数値の後ろに変換できない文字がある場合もその位置までが変換対象です（`src/dsv41/ds4_main.cpp:1307-1315,1321`）。
+- 同じ option を複数回指定した場合は parser のループで値を順次上書きするため、最後に現れた値が残ります（`src/dsv41/ds4_main.cpp:1307-1321`）。値を省くと `--vram-experts needs a value` を stderr に出して終了コード `2` で終了します（同:1309-1314）。
+- 安全な設定範囲はコードで定義されていません。`0` は expert 予算係数をゼロにします。負数や `1` を超える値も parser では拒否されませんが、意図した動作・資源上の安全性は保証されません。
 
 ## 実行時の動作
 
-parser は値を `std::atof` で変換し、`Options::vram_experts` に格納します。`Model::load` はこの Options を保持して pack のロードと GPU 構成を進めます。値は少なくとも次の計算に使われます。
+モデルの配置では各 device の利用可能メモリから `--reserve-mib` 分と、該当経路の作業領域分を差し引いた量にこの係数を掛けて予算を算出します。算出した予算を expert のサイズで配分し、VRAM に置く expert 数を決定します（`src/dsv41/ds4_model.cu:4585-4617,4645-4668`）。一部の事前見積もりでも係数を用い、CPU lane 側 expert の読み込み・先読み量や、expert 配置割合に基づく prompt の attention slab 判定に影響します（同:2261-2275,3001-3023,3267-3281,3344-3354）。
 
-- `--mmap-experts` が `auto` の場合、空き VRAM、`--reserve-mib`、prompt buffer の見積りから算出する expert 向け room に係数を掛け、CPU lane の expert をファイルから読むかを決める判定に使います。
-- expert がファイルから読む構成の場合、expert 配置用 VRAM room と、それに応じた CPU/RAM 側の読み込み先行量を見積もります。
-- 自動 staging ring の大きさを選ぶ際にも、reserve と固定 buffer の見積りを引いた VRAM room に係数を掛けます。
-- 最終的な GPU expert 予算では各 GPU の現在の空き VRAM から `--reserve-mib` を引き、その値に係数を掛けます。tensor-parallel group では最も厳しいメンバーの予算が使われます。DSpark の expert を先に予算へ割り当て、その後 trunk の層ごとに配置数を決めます。
-- 配置できる expert の数を決めた後、profile があれば hit count の多い expert を先に VRAM slot に割り当てます。
-
-指定値は VRAM 割り当てそのものを予約する命令ではなく、これらの予算計算への係数です。係数を大きくして見積り以上の割り当てを試みれば、後続の CUDA allocation が失敗する可能性があります。
+配置されなかった expert は CPU lane 側の処理対象となり、必要に応じてモデルファイルから読み込まれます。expert cache が有効で、一層の VRAM 配置数が全 expert 数より少なく、かつ 2 以上の場合には、配置数から cache swap 用の 1 slot を空けます（`src/dsv41/ds4_model.cu:4695-4704,4726-4756`）。
 
 ## 適用条件と副作用
 
-- 対象は索引上の `strata-engine-dsv41` です。CMake では `STRATA_BUILD_DSV41=ON` のとき `strata-dsv41` target が追加され、この option はその executable の parser にあります。ソースコメントではこの build option は既定で OFF とされています。
-- 実際の VRAM 予算は GPU の実行時空き容量、`--reserve-mib`、選択 GPU、tensor parallel の grouping、prompt buffer、DSpark の状態などに依存します。係数だけから固定の VRAM 容量や slot 数は決まりません。
-- `--no-expert-cache` を併用すると、expert cache の動的差し替え用に VRAM slot を一つ空ける処理が無効になります。ただし `--vram-experts` の配置予算への反映自体は別の処理なので引き続き行われます。
-- GPU に置かれない expert は CPU lane に回り、設定や pack に応じてモデルファイルから読み込まれたり、RAM tier が使われたりします。係数はこの負荷分担・読み込み先行量にも間接的に影響します。
-- 設定ファイルや環境変数との優先順位を定める CLI 側の処理は確認できませんでした。DSV4.1 の `Options` ではこの値は CLI parser から直接セットされます。
+- `strata-dsv41` の parser が引数を受け取る推論経路で適用されます。pack 情報だけを表示する `--pack-info` 経路はモデルを load せず終了するため、expert 配置への効果はありません（`src/dsv41/ds4_main.cpp:1388-1394,1395-1408`）。
+- Metal build では、option を省略した場合（`vram_experts_auto=true`）に限り、環境変数 `DS4_NO_AUTO_VX` が未設定なら `metal_expert_cap()` の上限をさらに適用します。明示的に `--vram-experts` を渡すと自動上限の分岐を通りません。環境変数の詳細は [`DS4_NO_AUTO_VX`](../../../envvars/DS4_NO_AUTO_VX.md) を参照してください（`src/dsv41/ds4_model.cu:4618-4627`）。
+- Metal の cap は物理 RAM、GPU の総メモリ、プロセスの `phys_footprint`、他プロセスの匿名メモリ等から計算されます。cap を適用した場合は stderr に `ds4: expert share: ...` を出します（`src/dsv41/ds4_model.cu:4423-4468,4618-4625`）。
+- Windows の commit 上限が配置を制約すると、GPU に置けなかった expert 量と page file の案内を stderr に警告します（`src/dsv41/ds4_model.cu:4630-4685`）。この予算処理や係数により配置された expert が実際の CUDA allocation に収まらない場合、`cudaMalloc` の失敗として model load が失敗します。main は `maya-ds4: <error>` を stderr に出して終了コード `1` を返します（同:4705-4713、`src/dsv41/ds4_main.cpp:1402-1407`）。
 
 ## 出力とエラー
 
-- 値の欠落は stderr に説明を出して終了コード `2` です。未知のオプションも stderr に `unknown option ...` と usage を出して終了コード `2` です。
-- モデル読み込みが失敗すると `maya-ds4: <理由>` を stderr に出し、終了コード `1` で終了します。GPU expert slot の `cudaMalloc` が失敗した場合は層番号・slot 数・CUDA device ID を含むエラーが読み込み失敗理由になります。
-- 有効値範囲を検証する option 固有のエラー・警告は確認できませんでした。係数によって最終的な割り当てがどうなるかは実行時の GPU 状態に左右されます。
+未知の option は `unknown option ...` と usage を stderr に出して終了コード `2` です。値不足も終了コード `2` です（`src/dsv41/ds4_main.cpp:1309-1314,1379-1385`）。数値として解釈できない値や範囲外の値そのものを理由とする parser エラーは実装されていません。モデル load 失敗時は上記の `maya-ds4:` エラーを出してコード `1` で終了します（同:1402-1407）。
 
 ## 根拠
 
-- Strata `src/dsv41/ds4_main.cpp:85-94,1200-1217` — usage、値の必須処理、`atof` による parser 代入。
-- Strata `src/dsv41/ds4_main.cpp:1266-1295` — help・未知 option の出力と終了コード、`Model::load` のエラー出力。
-- Strata `src/dsv41/ds4_model.hpp:25-40` — Options の既定値 `vram_experts = 1.0`、reserve と expert cache の既定値。
-- Strata `src/dsv41/ds4_model.cu:1853-1891` — Options の受け取り、pack 検査、GPU の選択と空き VRAM の取得。
-- Strata `src/dsv41/ds4_model.cu:1946-1975` — mmap 自動判定用 room と係数、prompt chunk の決定。
-- Strata `src/dsv41/ds4_model.cu:2597-2618,2796-2814` — CPU lane の warm 見積りと staging ring 選択への係数適用。
-- Strata `src/dsv41/ds4_model.cu:3798-3862` — GPU ごとの配置 budget、DSpark/trunk の expert slot 数決定。
-- Strata `src/dsv41/ds4_model.cu:3880-3910` — profile 順の slot 配置と CUDA allocation、その失敗経路。
-- Strata `CMakeLists.txt:797-810` — DSV4.1 target が `STRATA_BUILD_DSV41` で追加される条件。
-- Strata `src/dsv41/ds4_model.hpp:30-33` — `vram_experts` の説明と expert cache の役割。
-
-調査時点で checkout の `git status --short --branch` は `## main...origin/main` で、未コミット変更はありませんでした。既存 build 済み CLI の help は実行していません。数値境界、各 OS/backend での allocation 結果、配布 Release の実体はこの調査では検証していません。
+- `src/dsv41/ds4_main.cpp:101-109,1307-1322` — usage、引数値の取得と変換、auto フラグの切り替え。
+- `src/dsv41/ds4_model.hpp:25-37` — 既定値と関連する expert cache 設定。
+- `src/dsv41/ds4_model.cu:2261-2275,3001-3023,3267-3281,3344-3354` — 係数を使う見積もりと関連計算。
+- `src/dsv41/ds4_model.cu:4585-4713,4726-4756` — 配置予算から VRAM/CPU lane の配置を決め、device allocation を行う処理。
+- `src/dsv41/ds4_model.cu:4423-4468,4618-4627` — Metal の自動 cap と stderr 出力。
+- `docs/cli/README.md:1375-1424` — `strata-dsv41` の root scope と索引上の option リンク。索引は指定 option を現行 parser に掲載しています。

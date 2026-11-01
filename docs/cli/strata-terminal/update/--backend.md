@@ -1,6 +1,6 @@
-# `--backend`
+# `strata update --backend`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,55 +8,52 @@
 | コマンド | `strata update` |
 | オプション | `--backend` |
 | 別名 | なし |
-| 値 | 必須の文字列。parser に `choices` や型変換の指定はない。エンジンファミリー名を渡す |
+| 値 | backend family 名。`hip-rdna2` のように HIP の variant を付けて指定する形式も処理される |
 
 ## 役割
 
-エンジン更新先のファミリーを明示します。省略時は、この PC の GPU などから検出したファミリーを使います。指定値は更新コンテキストの backend として扱われ、feed から適合するエンジンパッケージを選ぶ際に使われます（`strata_cli/update_cmd.py:30-39,163-184`、`strata_control/updater.py:566-580`）。
+エンジン更新時に、GPU 自動検出の代わりに対象 backend family を選びます。HIP の `--backend hip-rdna2` のような指定では、family を `hip`、variant を `rdna2` として扱います。オプションはエンジン package の選択に使われ、Control や desktop app の更新先を選ぶものではありません。
 
 ## 使い方
 
 ```sh
-strata update --backend cuda --check
-```
+# HIP 系エンジンの候補を確認する（feed の読み込みは行うが、package はダウンロードしない）
+strata update --backend hip-rdna2 --check
 
-`--check` は feed を読み、選択内容を表示します。更新を実行する場合は `--check` を外します。`strata components update` にも同じ parser 定義が使われます（`strata_cli/update_cmd.py:42-56`）。
+# 指定した backend のエンジンを含めて通常の更新を行う
+strata update --backend cuda
+```
 
 ## 値と既定値
 
-- 値は1つの文字列です。省略時の parser 値は `None` です（`strata_cli/update_cmd.py:30-34`）。
-- parser 自体には許可値の列挙や validation がありません。非空文字列を指定すると、その値が `hardware["backend"]` にそのまま設定され、`backend_source` は `requested` になります（`strata_cli/update_cmd.py:174-180`）。
-- 実際に feed のエンジンパッケージと照合される名前は `metal`、`cuda`、`hip`、`sycl`、`cpu` です。これは backend/platform 対応表のキーです（`strata_control/targets.py:20-29`）。未知の名前も CLI parser では拒否されませんが、同じ backend 名のパッケージがなければ選択結果は「この PC 向けのパッケージなし」になります（`strata_control/feed.py:372-395,398-416`、`strata_control/updater.py:573-590`）。
-- 省略時は `updater.detect_hardware()` が backend を検出します。`STRATA_ENGINE_BACKEND` があれば環境変数側の処理で値を正規化して検証し、不正ならエラーになります。GPU 検出ではなく環境変数を使った場合の検出元は `environment` です（`strata_control/updater.py:249-270`、`strata_control/engine_component.py:439-482`）。明示した非空の `--backend` はその結果を上書きします。
-- CLI の `--backend` 値は小文字化や空白除去をされません。空文字列を渡した場合は `if a.backend` が偽になるため上書きに使われず、検出値が残ります（`strata_cli/update_cmd.py:176-180`）。
+parser は `--backend` に文字列値を取り、既定値は `None` です。`choices` や型変換による parser 段階の制限はありません。省略時は検出した hardware/backend を使います。値が空文字列の場合も `if a.backend` の条件に入らず、指定なしと同じ扱いです。空白だけの文字列は truthy なので override され、`split_backend` 内で trim 後に空となります。
+
+指定値は trim して小文字化されます。`hip-` で始まり後続文字がある文字列は `hip` と suffix に分割されます。`hip-` の後ろが空の場合や、その他の名前はそのまま backend family として使用されます。`BACKEND_MATRIX` にある family は `metal`、`cuda`、`hip`、`sycl`、`cpu` ですが、`--backend` 自体はこの集合への validation を行いません。未知の family 名は parser では拒否されず、feed 内の engine package と一致しなければ選択候補がなくなります。
 
 ## 実行時の動作
 
-`strata update` は選択した backend を使い、署名済み feed 内から platform、backend、GPU アーキテクチャ、必要 runtime/driver などが合うエンジンを選びます。backend が一致しないパッケージは候補から外れます（`strata_control/feed.py:372-395`）。更新実行時は、取得・検証した engine を試験起動してから切り替えます（`strata_cli/update_cmd.py:43-45`、`strata_control/updater.py:926-960,992-1027`）。
+`run()` はまず `updater.detect_hardware()` で platform、GPU 情報、backend などを調べます。`--backend` が truthy の場合、検出結果の `backend` を指定 family に置き換え、`backend_source` を `requested` にします。分割された variant があれば `variant_wanted` にも設定します。この `requested` 印は GPU make の保護判定に明示指定として渡ります。`--backend` を省略すると、`STRATA_ENGINE_BACKEND` を含む通常の検出結果が使われます。CLI 指定がある場合は、その結果を後から上書きします。
 
-この指定はエンジン選択に作用します。`--no-engine` を併用すると engine 更新工程自体が省略されますが、Control 更新など他工程は独立して動作します（`strata_cli/update_cmd.py:48-56,203-224`、`strata_control/updater.py:1274-1297`）。`--check` でも backend は選択結果に反映されますが、ダウンロードは feed の読み込みに限られ、確認結果を状態ファイルへ記録します（`strata_control/updater.py:624-640`）。
-
-明示値は `backend_source="requested"` と記録されるため、異なる GPU メーカーの engine を更新しないための `make_guard` を通過します（`strata_cli/update_cmd.py:177-180`、`strata_control/updater.py:539-563`）。ただし、これは PC の GPU 情報、CUDA/HIP のアーキテクチャ情報や driver 情報を書き換えません。指定 backend と検出済みハードウェアの組み合わせに合う feed パッケージがなければ選択されません。更新 package が既存 engine と別メーカーの場合の後段拒否も、`backend_source` が `requested` のときは適用されません（`strata_control/updater.py:938-942`）。明示値は実際の GPU に適合する場合に限って使用してください。
+feed の engine package は platform と family が一致し、runtime・CUDA/HIP architecture・NVIDIA driver の適合条件も満たすものに絞られます。同じ family の候補から version などで選びます。HIP の variant 指定が選択に効くのは、HIP architecture (`gfx`) を検出できず、複数 variant が候補に残る場合です。その場合は指定 variant、GPU 名からの推定、既設 variant の順に選択します。architecture を検出できた場合は variant の指定より architecture の適合判定が先に効きます。
 
 ## 適用条件と副作用
 
-- `--backend` は `strata update` と `strata components update` に共通です。`strata components rollback` も共通 option parser を使いますが、rollback の経路では backend は更新 feed の選択には使われず、指定値は rollback 後の engine 解決に渡されます（`strata_cli/update_cmd.py:42-59,174-196`、`strata_control/engine_component.py:859-891`）。
-- `strata update --check` の際も hardware 検出と backend 選択が行われます。通常の更新では feed を取得し、選択された engine/Control 等の更新処理に進みます（`strata_cli/update_cmd.py:174-213`、`strata_control/updater.py:624-632,1274-1285`）。
-- parser に enum validation がないため、タイプミスは使用法エラーにならず、該当 engine がない結果につながります。`--check` では `none-for-this-pc` と理由が表示されます。通常更新でも engine の選択が `none-for-this-pc` ならその工程は更新なしとして扱われ、他の有効な更新工程は続き、例外がなければ終了コードは `0` です（`strata_cli/update_cmd.py:132-152`、`strata_control/updater.py:581-590,926-937,1274-1297`）。
-- `strata update --backend hip-rx9070` のような HIP variant 指定は CLI 側では backend 値そのものとして扱われ、環境変数 `STRATA_ENGINE_BACKEND` にある `hip-<variant>` の解釈処理は通りません。feed の `backend` が `hip-rx9070` であるパッケージを探す形になるため、通常の `hip` backend 指定とは同じではありません（`strata_cli/update_cmd.py:176-180`、`strata_control/updater.py:254-260`、`strata_control/feed.py:380-383`）。
+- `--check` でも指定値は package 選択に適用され、結果に engine 候補と hardware 情報が出ます。check は feed を読み、更新結果を component state の `last_check` に保存しますが、feed 外の package はダウンロードしません。
+- 通常更新では選ばれた engine package の取得・検証・test start・切替に進みます。`--backend` は engine のみを制御し、通常の `strata update` が行う Control 更新や、`--app` を付けた場合の app installer 取得には適用されません。
+- 別 backend family を明示した場合、インストール済み engine と異なる GPU make でも自動選択時の make guard を通過します。この指定は適合性を保証しません。platform、architecture、driver などの適合理由により該当 package が選ばれないことがあります。
+- 未知の family 名や feed にない variant は parser でエラーになりません。候補がなく `--check` ならその状態を表示して終了し、通常更新では engine は「この PC 向け package なし」となり、その経路だけなら変更せず終了します。他の指定がなければ Control など別 component の更新は続きます。未知 family に対する独立した validation error は実装上確認できません。
 
 ## 出力とエラー
 
-無効な backend 名に対する専用 parser エラーはありません。適合パッケージが見つからない場合は、通常出力に engine の選択不可状態と理由を含めます（`strata_control/updater.py:566-590`、`strata_cli/update_cmd.py:132-152,217-224`）。署名済み feed、network、package 検証、試験起動などで更新工程が失敗すると、その工程のエラーを報告し、失敗の終了コードを返します。具体的なコードは失敗原因により異なります（`strata_cli/update_cmd.py:225-234`、`strata_control/updater.py:1274-1297`）。
+人向け出力は `--check` で選択結果・選ばれなかった理由を表示し、通常更新では component ごとの結果を表示します。`--output json` / `jsonl` も同じ hardware 選択を使います。更新処理で `UpdateError`、feed 読み込みで `FeedError`、署名検証で `SignatureError` などが起きると、通常出力では `strata: ...` を stderr に出し、例外に応じた終了 code を返します。`--backend` の任意文字列そのものを検証する専用エラー経路はありません。
 
 ## 根拠
 
-- parser と共有スコープ: `strata_cli/update_cmd.py:30-59`
-- `strata update` 実行時の値反映、`--check` / update 分岐、エラー出力: `strata_cli/update_cmd.py:163-234`
-- backend 検出と `STRATA_ENGINE_BACKEND` の検証: `strata_control/updater.py:249-270`、`strata_control/engine_component.py:439-482`
-- package 適合性・backend による選択: `strata_control/feed.py:372-416`
-- メーカー変更ガードと更新 package の処理: `strata_control/updater.py:539-590,926-942`
-- 選択不可時の更新結果と終了コード: `strata_control/updater.py:624-640,1274-1297`
-- backend/platform 対応表: `strata_control/targets.py:20-29`
-
-調査は指定 revision のソースを対象とし、CLI help の実行、build、テスト、GPU 実行は行っていません。
+- `strata_cli/update_cmd.py:37-46,49-56` — `--backend` parser 定義、既定値、update parser への登録。
+- `strata_cli/cli.py:139-140,2135-2137` — update parser の登録と `update_cmd.run()` への dispatch。
+- `strata_cli/update_cmd.py:194-206` — 検出した hardware への CLI 指定の反映と実行 context の生成。
+- `strata_control/engine_component.py:439-445` — backend 名の正規化と `hip-<variant>` の分割。
+- `strata_control/targets.py:20-29` — backend family と対応 platform の matrix。
+- `strata_control/updater.py:255-275,546-570,573-582` — hardware 検出結果、明示選択時の make guard、feed package 選択への接続。
+- `strata_control/feed.py:408-431,434-461,468-495` — platform/family/architecture/driver の適合判定、候補選択、HIP variant 選択条件。
+- `strata_control/updater.py:631-647,1038-1063,1466-1489` — check の state 保存、通常更新の engine 選択と処理、component 単位の結果・終了 code。

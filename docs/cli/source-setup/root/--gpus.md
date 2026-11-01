@@ -1,69 +1,54 @@
 # `--gpus`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、更新 wrapper からも委譲） |
+| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、更新 wrapper から委譲） |
 | オプション | `--gpus` |
 | 別名 | なし |
-| 値 | GPU 番号をカンマで区切った2個以上（例: `0,1`）、または `all`。値は1引数として渡す |
+| 値 | 複数 GPU の番号をカンマ区切りで指定（例: `0,2`）、または `all` |
 
 ## 役割
 
-1つのモデルを複数 GPU にまたがるレイヤー分割で動かす GPU を選びます。NVIDIA の番号は `nvidia-smi` の番号、AMD の番号は setup が列挙する番号です。オプションは `setup.py` のトップレベル parser にあり、setup 用 wrapper は引数をそのまま渡します（`setup.py:8463-8465`、`setup.sh:6-12,76`、`START-HERE.bat:8-10,48-54`）。
+1つのモデルを複数 GPU に分割して実行する GPU を指定します。モデル設定時は選択をそのモデルの設定に保存し、通常起動時はその起動に使う GPU を指定して設定にも記録します。`--gpu` は1枚用です。`setup.py` の parser は `--gpus` を値を取る文字列引数として定義しています（`setup.py:9113-9115`）。
 
 ## 使い方
 
-初回 setup または既存モデルの設定変更では、たとえば次のように指定します。
-
 ```sh
-./setup.sh --setup --gpus 0,1
+./setup.sh --setup --gpus 0,2
+./setup.sh --gpus all
 ```
 
-Windows では `START-HERE.bat --setup --gpus 0,1` を使います。すでに設定済みのモデルを起動するときは `./setup.sh --gpus 0,1`（Windows: `START-HERE.bat --gpus 0,1`）のように指定でき、そのモデルの選択として保存されます。`--gpus` は `--setup` の有無で parser が分かれていません（parser: `setup.py:8460-8465`、既存モデルの選択: `setup.py:8646-8650`）。
+Windows では `START-HERE.bat --setup --gpus 0,1` のように wrapper へ渡します。wrapper は `setup.py` に委譲します（索引の対象境界: `docs/cli/README.md:13`）。`--setup` を付けた例はモデルの設定時、2つ目は既に設定済みのモデルの起動時です。起動時に `--gpus` を省略した場合は保存済み選択を使い、条件が合えば複数 GPU の利用を一度確認します（`setup.py:9309-9312`）。
 
 ## 値と既定値
 
-- `0,1` のように GPU 番号をカンマ区切りにします。番号は整数として読み取り、2個以上で重複がないことを要求します。要素の前後の空白は `int()` が処理し、空要素は読み飛ばされます。したがって `0,,1` も2番号として解析されます（`setup.py:1660-1674`）。
-- `all` は小文字・大文字を区別せず、前後の空白も除いて判定します。NVIDIA では複数 GPU で共有可能と判定されたカードを選びます。該当カードが2枚未満なら失敗します（`setup.py:1660-1667,1640-1643`）。
-- AMD では、対応 GPU の中から `all` が選びます。対応する専用メモリ GPU が2枚以上ある場合は UMA/APU を除外してそのカードを選び、そうでなければ対応 GPU 全体を選びます。数値指定は `setup.py` が列挙した AMD GPU 番号を使います（`setup.py:3949-3980`）。
-- 指定を省略した場合は、複数 GPU を利用できれば対話選択、それ以外は setup の既定選択に従います。オプション自身の固定の GPU 番号既定値はありません（`setup.py:1774-1790`）。
-- GPU 番号の存在と利用可否も確認されます。未知の番号、非対応 GPU、重複番号、1個だけの番号、数値でも `all` でもない値は拒否されます。`all` の結果が2枚に満たない場合も拒否されます。失敗時のメッセージは `fail()` が標準出力に出し、終了コード1で終了します（`setup.py:1660-1674,1677-1703,825-830`）。
+- 値は `0,2` のような整数番号の列、または前後の空白を除いて大文字小文字を無視した `all` です。引数自体は必須ではなく、未指定時の既定値は `None` です（`setup.py:9113-9115`）。
+- 番号列では空の要素を読み飛ばし、整数化した後、2個以上かつ重複なしを要求します。そのため `0,,2` の空要素は無視されます。`0` だけ、同じ番号の重複、整数でない要素は失敗します（`setup.py:1836-1850`）。空文字列は後段で未指定と同様に扱われます（`setup.py:1933-1937`）。
+- NVIDIA では番号は `nvidia-smi` の番号です。番号が未検出、または選択 GPU が利用不可なら停止します。複数利用時に VRAM が共有要件に足りないカードを番号で明示した場合は、確認を出し、`--yes` があれば同意として続行します。`all` は Strata が同時利用可能と判定したカードだけを選び、該当カードがなければ停止します（`setup.py:1838-1849`、`setup.py:1853-1870`、`setup.py:1950-1956`）。
+- AMD では番号は Strata の AMD/HIP 一覧順です。番号指定時は各 GPU が AMD backend で利用可能か確認します。`all` は利用可能なカードを `amd_rank` 順に選び、専用メモリを持つ GPU が2枚以上ある場合は UMA（システム共有メモリ）のカードを除外します。除外カードを番号で明示すれば選択対象にできます（`setup.py:4217-4248`）。
 
 ## 実行時の動作
 
-初回 setup では、選んだカードを一緒に使う前提でモデルのサイズ選択・メモリ見積もり・engine の対象アーキテクチャを決めます。選択結果は設定の `gpu` 配列として保存され、レイヤー分割の `layer_split` は `--layer-split` がなければ `auto` になります。マルチ GPU 用の engine 設定も行われます（`setup.py:8771-8804,9637-9646`）。
+モデルの setup 経路では NVIDIA の番号列を検証し、指定順で選択結果を構成します。選択が複数なら設定の `gpu` に番号リスト、`layer_split` に `--layer-split` の値または `auto` を保存し、モデル層を複数 GPU に分割します。セットアップ設定はモデルごとの JSON に書き込まれます（`setup.py:1950-1956`、`setup.py:9464-9472`、`setup.py:10338-10347`、`setup.py:10436-10454`）。AMD の指定番号列では最初のカードが main として扱われます（`setup.py:4217-4220`、`setup.py:9420-9444`）。
 
-既存モデルの起動時に `--gpus` を渡すと、選択カードをそのモデルの設定へ書き込み、未指定の layer split は既存値または `auto` にします。NVIDIA では各カードが使える engine か確認し、対応コードが足りなければ setup を再実行するよう案内して起動を止めます。AMD では保存したカードが HIP engine のアーキテクチャに含まれるか確認し、不足時は再 setup を案内します（`setup.py:6775-6792,6814-6820,6827-6837,7190-7216`）。
+既存モデルの起動時にも `--gpus` の番号を解決します。NVIDIA ではカードを確認後、GPU リストと自動 layer split をそのモデルの設定へ保存します。AMD の HIP 経路でもカードリストを設定へ保存し、インストール済み engine に選択カードのアーキテクチャ向けコードがない場合は起動を止めて、その GPU 向けの再 setup を案内します（`setup.py:1933-1947`、`setup.py:7157-7167`、`setup.py:7196-7204`）。
 
-数値を明示した場合、setup は NVIDIA / AMD とも入力順を選択リストに保ちます。`all` の初期候補順は NVIDIA では新しい世代、VRAM、番号順、AMD では UMA でないカード、VRAM、番号順です（`setup.py:1623-1627,1640-1643,3840-3843,3953-3962`）。実際の分割順は起動時にも調整されます。layer split が `auto` で、速度を測定でき、カード間の差が5%を超える場合、server は速いカードを最後（Main stage）へ移します。ただし最後の stage に置く GPU の VRAM が小さくなる場合は元の順を維持します。手動 `--layer-split`、`gpu_order: as_given`、GPU roles がある場合などは自動並べ替えをしません（`serve/server.py:3346-3396`）。
+選択した GPU 数は `--replicas` のグループ分けにも関わります。replica 数が2以上でも、複数選択がない場合や GPU 数を等分できない場合、replica 設定は行われず警告になります（`setup.py:10361-10384`）。複数 GPU 設定では helper cache 条件に応じて engine 用の `--remote-expert-opt` が自動追加されることがあります。setup 側の `--no-remote-expert-opt` で抑止できます（`setup.py:2105-2142`、`setup.py:10341-10347`）。
 
 ## 適用条件と副作用
 
-- 複数 GPU で共有できないカードは `all` から外れるか、明示指定時に拒否・確認の対象になります。NVIDIA はモデルを分割する各カードに `SPLIT_MIN_VRAM_GB` 以上の VRAM が必要で、明示指定したカードが単体では使えても分割時の VRAM 条件だけを満たさない場合はリスク確認になります。`--yes` と明示的な番号指定の組み合わせはそのリスクへの同意として扱われます（`setup.py:1611-1619,1677-1694,5851-5860`）。
-- 初回 setup で AMD の複数 GPU を選ぶ場合、Windows は未対応として停止し、`--gpu N` で単一 GPU を使うよう案内します。複数 AMD GPU の layer split は Linux のみです（`setup.py:8731-8733`）。
-- 低 RAM モードでは、明示的な `--gpus` は複数 GPU の選択を維持します。その場合、GPU に載らない expert は常駐 RAM ではなく OS の file cache 経由で読まれ、長い prompt 中に空き RAM がなくなる可能性を警告します（`setup.py:5751-5765`）。モデルや設定によっては複数 GPU を推奨しない分岐があり、`--gpus` がない場合は単一 GPU に戻す選択が行われます（`setup.py:5786-5848`）。
-- `--gpu-roles` と `--gpu` / `--gpus` は同時指定できず、parser 後の検査でエラーになります。`--layer-split` は `--gpus` で選択した GPU 間の境界指定で、既定は `auto` です（`setup.py:8466-8470,8578-8597,9640-9646`）。
-- `--gpu` と同時に `--gpus` を指定する相互排他検査はありません。通常の GPU 選択関数は `--gpus` を先に処理します（`setup.py:1774-1783`）。
-- setup ではモデルや engine の取得・build・設定ファイル作成があり得ます。既存モデルの start ではモデル設定が更新されます。GPU 使用可否や選択結果は標準出力へ表示されます（`setup.py:808-830,8911-8912,9637-9646`）。
+- `--gpu-roles` と同時には指定できません。両方があると parser 処理でエラーになります。`--gpu` にカンマ区切り値を渡すと、`--gpus` へ移し替えられます。両方に別々の値を渡した場合の明示エラーはなく、setup の GPU 選択では `--gpus` が優先されます（`setup.py:9232-9242`、`setup.py:1950-1959`）。
+- `--backend hip` で AMD GPU を使う Windows の setup では複数 GPU 分割を拒否し、`--gpu N` を案内します。この判定は setup 経路にあります（`setup.py:9395-9398`）。
+- `--gpus all` は全ての検出 GPU を無条件に選ぶ指定ではなく、backend ごとの利用可能性や AMD の UMA 条件を反映します（`setup.py:1838-1843`、`setup.py:4221-4230`）。
+- 選択はモデル単位の設定に保存されるため、setup の実行ではモデル設定ファイルが更新されます。複数 GPU 分割用の `layer_split` も既定で `auto` として記録されます（`setup.py:10341-10347`）。
 
 ## 出力とエラー
 
-不正な指定、利用できない GPU、Windows での複数 AMD GPU 指定などは setup 独自の `[X]` メッセージと案内を標準出力に表示し、終了コード1で停止します（`setup.py:825-830,8731-8733`）。番号の整数変換に失敗する値は `--gpus takes GPU numbers ...`、番号が2個未満または重複なら `--gpus takes two or more different GPUs ...` になります（`setup.py:1668-1674`）。
+`setup.py` の独自検証失敗は理由と修正案を表示して `SystemExit(1)` で終了します（`setup.py:904-910`）。番号列の形式不正、番号不足・重複、GPU 未検出・利用不可では `--gpus` の形式例や利用可能な GPU、代替コマンドを表示します（`setup.py:1844-1849`、`setup.py:1858-1870`、`setup.py:4232-4247`）。AMD の Windows setup で複数 GPU を指定した場合もエラーと単一 GPU の案内を出して停止します（`setup.py:9395-9398`）。
 
-## 根拠
+## 根拠と調査範囲
 
-- parser と help 文: `setup.py:8460-8470`
-- 値の解析、GPU 適合性、NVIDIA の共有候補と順序: `setup.py:1611-1643,1660-1703,1774-1790`
-- AMD GPU の `all` と番号検査: `setup.py:3874-3920,3949-3980`
-- 初回 setup の選択・Windows AMD 制限・設定保存: `setup.py:8731-8804,9637-9646`
-- 起動時の GPU 並べ替えと Main stage: `serve/server.py:3346-3396`
-- 既存モデル start 時の選択・保存・engine 確認: `setup.py:8646-8650,6737-6749,6775-6837,7190-7216`
-- 低 RAM / resident-budget 関連の相互作用: `setup.py:5751-5848`
-- setup wrapper の引数委譲: `setup.sh:6-12,76`、`START-HERE.bat:8-10,48-54`、`UPDATE.bat:5-6,79`
-
-## 調査範囲
-
-対象 checkout は commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`、branch `main`（`origin/main` と一致）で、`git status --short --branch` は `## main...origin/main` でした。ソース parser と使用箇所を確認しました。CLI `--help` は実行していません。OS・GPU 構成ごとの実行結果や、各 model/backend の全ての条件分岐は実機で確認していません。
+根拠は指定 revision の Strata ソース `setup.py` の parser、選択・検証処理、setup 設定保存、起動時処理です。コマンド scope と予定リンクは strata-envvars の索引 `docs/cli/README.md:1528-1557` で確認しました。CLI help や実機 GPU での実行は調査していません。GPU 検出・適合性の個別基準は `gpu_problem` / `amd_problem` 等の helper の判定に依存し、この文書では GPU driver や外部 runtime 自体の動作までは扱いません。
