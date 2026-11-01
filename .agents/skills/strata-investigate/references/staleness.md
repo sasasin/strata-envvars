@@ -112,6 +112,10 @@ python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
   python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
     --exclude-token=--help --exclude-token=--json --exclude-token=--quiet --exclude-token=--version
   ```
+- **`--help` の除外は運用側で毎回付ける**。スクリプトに既定の除外リストは持たせない（暗黙に消えると
+  何を除いたか分からなくなるため）。CLI を回すコマンドには必ず `--exclude-token=--help` を添える。
+  したがって `find-stale.py` の候補数に `--help` が残り続けるのは正常状態で、
+  「候補 0」を目安にするのは envvars 側（共通 option 相当がない）だけ。
 - envvars は `.create-envvars-docs.state.json` から entry を消して「未調査」に戻す
   → `create-envvars-docs.py` が素直に拾う。CLI は索引の予定リンクが残るので `create-cli-docs.py` が拾う。
 - 索引の名前は消さない（Strata が読むことは索引更新で確認済みの前提）。
@@ -142,10 +146,11 @@ codex への依頼文に添えられる。報告の revision が Strata HEAD と
   旧文書になかった変化が拾えていた（`STRATA_HC_Q8`）。旧 SHA 誤記の `STRATA_MOVE_ALWAYS_COPY` も
   現行 SHA の文書に置き換わった。
 - CLI の `token-in-diff` 115 件のうち `--exclude-token=--help` で 97 件を除外し、18 件を一巡させた
-  （削除→ `create-cli-docs.py -p 12 -l 30` で 2 分 42 秒、全件作成。再実行後の候補は `--help` の 97 件のみ）。
-  対象になったのは `--backend` 3、`--preset` 2、`--show-key` 2、`--force`、`--model`、`--batch-groups`、
-  `--expert-cache-device1`、`--kv-grow`、`--mtp-q4`、`--experts`、`--vram-experts`、`--gpu`、`--gpus`、`--vision`。
-  `--help` 97 件は意図して残した（usage 文言変更が主で、意味の変化は S-c / 索引更新で拾える）。
+  （削除→ `create-cli-docs.py -p 12 -l 30` で 2 分 42 秒、全件作成）。対象は `--backend` 3、`--preset` 2、
+  `--show-key` 2、`--force`、`--model`、`--batch-groups`、`--expert-cache-device1`、`--kv-grow`、`--mtp-q4`、
+  `--experts`、`--vram-experts`、`--gpu`、`--gpus`、`--vision`。
+  残った `--help` 97 件はそのまま候補として置く運用にした（スクリプトに既定除外は無い。
+  CLI を回すたびに `--exclude-token=--help` を付ける）。
 - 見付かった実例: `STRATA_ATTN_LANECELL` は既定値テーブル `t.push_back({"STRATA_ATTN_LANECELL", "1"})` が
   `src/core/arch_defaults.cpp` に加わり、`STRATA_HC_Q8` は `getenv` 呼び出しがコメント化されている。
 - 再作成後は `find-stale.py` をもう一度走らせて候補が減っていることを確認する（同じ commit 基準に
