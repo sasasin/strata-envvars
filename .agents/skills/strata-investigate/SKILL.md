@@ -81,6 +81,8 @@ python3 .agents/skills/strata-investigate/scripts/evidence-index.py    # 証拠�
 python3 .agents/skills/strata-investigate/scripts/find-stale.py --stage3
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --limit 20          # dry-run
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --apply --limit 20  # 削除
+python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
+  --exclude-token=--help --limit 200 --apply                                        # 共通 option は後回し
 uv run ./create-envvars-docs.py -p 5 -l 20                                          # 再作成
 uv run ./create-cli-docs.py -p 12 -l 40
 python3 .agents/skills/strata-investigate/scripts/check-docs.py

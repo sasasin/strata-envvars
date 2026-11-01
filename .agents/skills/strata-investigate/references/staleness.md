@@ -98,11 +98,20 @@ Stage 1 の `token-in-diff` がこれ。2026-11-02 実測:
 ```bash
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --limit 20            # dry-run
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --apply --limit 20    # 実行
-python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli --apply --verdict token-in-diff
+python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
+  --exclude-token=--help --limit 200 --apply                                          # 共通 option を後回し
 ```
 
 - 既定の削除対象 verdict は `token-in-diff` / `option-absent-in-grammar` / `symbol-gone`。
   `name-gone` と `cited-file-gone` は索引更新・所在確認が要るので既定外。
+- `--exclude-token=OPTION`（繰り返し可）で主題トークンを除外する。CLI では `--help` が候補の大半を占める
+  （2026-11-02 実測 115 件中 97 件）が、Strata 側の usage 文言変更が主で文書の骨格は変わらない。
+  先に除外して、動作の意味が変わる option（`--backend`、`--preset`、`--show-key` など）から消す。
+  索引の option inventory との突合 (S-c) で `option-absent-in-grammar` 側に出たものは除外不要。
+  ```bash
+  python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
+    --exclude-token=--help --exclude-token=--json --exclude-token=--quiet --exclude-token=--version
+  ```
 - envvars は `.create-envvars-docs.state.json` から entry を消して「未調査」に戻す
   → `create-envvars-docs.py` が素直に拾う。CLI は索引の予定リンクが残るので `create-cli-docs.py` が拾う。
 - 索引の名前は消さない（Strata が読むことは索引更新で確認済みの前提）。
@@ -132,8 +141,11 @@ codex への依頼文に添えられる。報告の revision が Strata HEAD と
   再作成文書には backend 別の判定表や `STRATA_GFX12_DEFAULTS` との相互作用まで書けており、
   旧文書になかった変化が拾えていた（`STRATA_HC_Q8`）。旧 SHA 誤記の `STRATA_MOVE_ALWAYS_COPY` も
   現行 SHA の文書に置き換わった。
-- CLI の `token-in-diff` 115 件は未実施（`--help` / `--json` / `--quiet` のような共通 option が多く、
-  usage 文言変更が主）。実施する場合は共通 option を除外して刻む。
+- CLI の `token-in-diff` 115 件のうち `--exclude-token=--help` で 97 件を除外し、18 件を一巡させた
+  （削除→ `create-cli-docs.py -p 12 -l 30` で 2 分 42 秒、全件作成。再実行後の候補は `--help` の 97 件のみ）。
+  対象になったのは `--backend` 3、`--preset` 2、`--show-key` 2、`--force`、`--model`、`--batch-groups`、
+  `--expert-cache-device1`、`--kv-grow`、`--mtp-q4`、`--experts`、`--vram-experts`、`--gpu`、`--gpus`、`--vision`。
+  `--help` 97 件は意図して残した（usage 文言変更が主で、意味の変化は S-c / 索引更新で拾える）。
 - 見付かった実例: `STRATA_ATTN_LANECELL` は既定値テーブル `t.push_back({"STRATA_ATTN_LANECELL", "1"})` が
   `src/core/arch_defaults.cpp` に加わり、`STRATA_HC_Q8` は `getenv` 呼び出しがコメント化されている。
 - 再作成後は `find-stale.py` をもう一度走らせて候補が減っていることを確認する（同じ commit 基準に

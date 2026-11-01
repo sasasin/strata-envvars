@@ -36,6 +36,14 @@ def parse_args() -> argparse.Namespace:
         choices=["token-in-diff", "option-absent-in-grammar", "symbol-gone", "name-gone", "cited-file-gone", "unknown-sha"],
         help="削除対象の判定 (既定: token-in-diff, option-absent-in-grammar, symbol-gone)",
     )
+    parser.add_argument(
+        "--exclude-token",
+        action="append",
+        default=[],
+        metavar="OPTION",
+        help="この option 文字列の文書を対象外にする (繰り返し指定可)。"
+        " 例: --exclude-token=--help (usage 文言変更が主な群を後回しにする)",
+    )
     parser.add_argument("--limit", type=int, default=40, metavar="N", help="今回削除する上限 (安全弁)")
     parser.add_argument("--scope", choices=["all", "envvars", "cli"], default="all")
     parser.add_argument("--apply", action="store_true", help="実際に削除する (既定は dry-run)")
@@ -58,11 +66,21 @@ def main() -> int:
     tree = StrataTree(strata, revision)
 
     verdicts = set(args.verdict or DEFAULT_VERDICTS)
-    candidates = [
+    excluded = set(args.exclude_token)
+    all_candidates = [
         item
         for item in report.get("candidates", [])
         if item.get("verdict") in verdicts and (args.scope == "all" or item.get("scope") == args.scope)
     ]
+    if excluded:
+        dropped = [item for item in all_candidates if item.get("token") in excluded]
+        print(f"除外 (--exclude-token): {len(dropped)} 件")
+        tally = {}
+        for item in dropped:
+            tally[item.get("token")] = tally.get(item.get("token"), 0) + 1
+        for token, count in sorted(tally.items(), key=lambda kv: -kv[1]):
+            print(f"  {token:22} {count}")
+    candidates = [item for item in all_candidates if item.get("token") not in excluded]
     if len(candidates) > args.limit:
         print(f"候補 {len(candidates)} 件のうち上限 {args.limit} 件だけを処理します")
         candidates = candidates[: args.limit]
