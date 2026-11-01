@@ -1,5 +1,7 @@
 # `--max-tokens`
 
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+
 - 対象: `strata-vision` / `strata-vision-hip` / `strata-vision-sycl` の root scope
 - 調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`
 - 調査日: 2026-11-01

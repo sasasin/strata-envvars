@@ -1,87 +1,45 @@
 # `STRATA_DEBUG`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 ## 役割
 
-Python サーバー（`serve/`）だけの診断ログ用の環境変数。C++/CUDA/HIP エンジン（`src/`、`include/`、`sycl/`）は `STRATA_DEBUG` を読まない。リポジトリ全体を検索した結果、環境から値を読む実装は `serve/server.py` と `serve/mcp.py` にある 3 箇所だけで、いずれも stdout への追加ログを制御する。生成結果・トークン・API レスポンスの内容は変えず、ログ行が増えるだけである。
-
-制御する出力は次の 3 種類。
-
-1. API リクエスト受付時、エンドポイントごとに 1 行の要約（`_debug_req`）。
-2. 生成終了時、モデルが生んだトークン系列の raw デコード（`[strata] raw: ...`）。
-3. MCP サブプロセスの stderr 行をサーバー stdout へ写すエコー（`[mcp <name>] ...`）。
+サーバーの診断情報を標準出力へ追加します。対象は API リクエストの概要、完了した生成の token 列、stdio MCP サーバーから届いた stderr 行です。モデル計算や API の選択を変える設定ではありません。
 
 ## 値と判定
 
-判定は `os.environ.get("STRATA_DEBUG")` の**真偽値（truthiness）**だけで、文字列 parse・`"1"` との比較・数値変換・大文字小文字・空白の検査はない。
+3 つの読み取り箇所はいずれも Python の `os.environ.get("STRATA_DEBUG")` を条件式に使います。文字列を数値や真偽値として parse せず、Python の文字列 truthiness で判定します。
 
-| 状態 | 判定 |
+| 環境値 | 判定 |
 |---|---|
-| 未設定（`None`） | 無効（falsy） |
-| 空文字 `""` | 無効（falsy） |
-| 非空文字列（`1`、`0`、`true`、`false`、`2` など） | 有効（truthy） |
+| 未設定 | 無効（`None` は偽） |
+| 空文字 `""` | 無効 |
+| 空でない任意の文字列 | 有効。`"1"`、`"0"`、`"false"`、空白だけの値も含む |
 
-したがって `STRATA_DEBUG=0` や `STRATA_DEBUG=false` でも**有効**になる。docstring は「Set `STRATA_DEBUG=1` to enable」と書くが、実装は値が非空かどうかだけを見る。既定は未設定＝無効。
-
-根拠: `serve/server.py:4197`（`if not os.environ.get("STRATA_DEBUG"): return`）、`serve/server.py:4090`、`serve/mcp.py:131`。
-
-## 評価時期と適用範囲
-
-キャッシュ（static）はしない。各呼び出し・各行の判定で `os.environ.get` を実行するため、プロセス起動後に環境を書き換えると次のリクエスト／次の stderr 行から反映される。
-
-- `_debug_req` はリクエスト受付直後（生成前）に呼ばれる。呼び出し箇所は openai / responses / anthropic の各ハンドラ（`serve/server.py:5367,5560,5589`）。
-- raw デコードの print は生成ループの終了処理（`serve/server.py:4090-4091`）。
-- MCP エコーは stderr 読取スレッドが 1 行読むたびに判定（`serve/mcp.py:126-132`）。
-
-## 実際の挙動
-
-### 1. リクエスト要約行
-
-`_debug_req`（`serve/server.py:4195-4207`）は有効時のみ、次の形式で 1 行 print する。
-
-```
-[strata] req <api>: msgs=<件数> tools=<件数> max_tokens_raw=<max_tokens!r>/<max_completion_tokens!r> max_new=<解決値> thinking=<bool> stream=<bool> prompt_tokens=<token数> last=<role>:<本文80字preview>
-```
-
-本文 preview は最後の message の content（list なら text 要素を結合）の先頭 80 字で、改行はスペースに置換。無効時は `return` して何も出さない。
-
-### 2. raw モデルテキスト
-
-`raw_ids` は生成中に毎トークン append される（stop token も append 後 break。`serve/server.py:3837,3839,3972,4002`）。この収集自体は `STRATA_DEBUG` の有無に関係なく常に行われる。print は有効かつ `raw_ids` が非空のときだけ（`serve/server.py:4090-4091`）:
-
-```
-[strata] raw: <tokenizer デコード結果の repr>
-```
-
-空生成（`raw_ids` が空）では print しない。
-
-### 3. MCP stderr エコー
-
-`_read_stderr`（`serve/mcp.py:126-132`）は MCP サブプロセスの stderr を 1 行ずつ読み、非空行を `self.stderr`（直近 40 行の deque）へ保存する。加えて有効時はその行を stdout へ print する。
-
-```
-[mcp <name>] <line>
-```
-
-無効時は deque への保存だけ行い、stdout へは出さない。
-
-## 子プロセスへの継承
-
-MCP サブプロセス起動時、`env = dict(os.environ)` に MCP 設定の `env` を上書きして渡す（`serve/mcp.py:94-95,107`）。このコピーには `STRATA_DEBUG` が含まれるため、サブプロセスは現在の環境値を継承する。ただしサブプロセス（外部ツール）がその変数をどう扱うかは Strata の実装ではないので本文書の対象外。Strata 側の動作は「環境をそのまま渡す」ことと「stderr 行をエコーする」ことだけ。
+大文字小文字、前後の空白、数値としての妥当性は検査されません。CLI 引数、設定ファイル、別の環境変数による既定値や優先順位はありません。
 
 ## 有効になる条件
 
-- Python サーバー（`serve/server.py` / `serve/mcp.py`）が動いていること。エンジン単体実行や `setup.py` のインストール経路では読まれない。
-- MCP エコーは MCP サーブリクエストが実際に起動し stderr を出す経路でのみ効く。
-- raw デコードは生成が 1 以上のトークンを生む経路でのみ効く。
+- `serve/server.py` の OpenAI Chat Completions、Responses、Anthropic Messages の各リクエスト経路で、リクエスト準備が成功して `_debug_req()` が呼ばれると概要行を出します。生成 token の診断行は、生成完了時に `raw_ids` が空でない場合に限ります。
+- MCP の stderr 中継は `serve/mcp.py` の stdio transport に限られます。HTTP MCP transport の stderr を読む経路ではありません。
+- OS、GPU backend、build macro、モデル状態による分岐はありません。Python サーバーがこの環境変数を参照します。
 
-診断ログであり、機能トグルや性能・正確性の変更ではない。`docs/DETAILS.md` には記載がない（開発・診断用フック）。
+## 実行時の詳細
+
+設定値は各判定箇所で都度読み取られ、module-level 定数や `static` 値には保存されません。したがって、サーバープロセス内で値が変更された場合は、後続の判定に反映されます。
+
+`_debug_req()` は準備済みの各リクエストについて、API 種別、message/tool 数、要求 token 上限、解決済みの `max_new`、thinking / stream の状態、prompt token 数、最後の message の role と本文 preview を `[strata] req ...` の行として標準出力へ flush します。本文 preview は文字列化後の先頭 80 文字で、改行を空白に置き換えます。content が部品の list の場合は text 部品だけを連結します。
+
+生成処理の完了時には、`raw_ids` がある場合に token 列を decode した `[strata] raw: ...` と、整数 ID 一覧の `[strata] raw ids: ...` を標準出力へ flush します。`raw_ids` には生成中に受け取った token ID が追加されます。例外などで完了時のこの処理に到達しない場合は、これらの行は出ません。
+
+stdio MCP transport は子プロセスの stderr の各非空行を内部の直近ログ用 deque に保存し、`STRATA_DEBUG` が有効なら `[mcp <name>] ...` としてサーバーの標準出力へも flush します。子プロセス起動時には親環境のコピーを渡し、MCP 設定の `env` がその値を上書きできます。ただし中継を有効にする判定は Strata サーバー自身の環境値です。
+
+これらの診断出力には利用者の最後の入力本文、モデル出力、および MCP プロセスが stderr に書いた内容が含まれることがあります。
 
 ## 根拠
 
-- 読み取り 3 箇所: `serve/server.py:4197`、`serve/server.py:4090`、`serve/mcp.py:131`。
-- 呼び出し箇所: `serve/server.py:5367,5560,5589`。
-- `raw_ids` 収集と print: `serve/server.py:3724,3837,3839,3972,4002,4090-4091`。
-- MCP stderr エコーと環境継承: `serve/mcp.py:94-95,107,126-132`。
-- C++/CUDA/HIP 側の読み取りなし: リポジトリ全体の `rg 'STRATA_DEBUG'` で Python 以外に実装箇所が見つからない。テスト（`serve/test_server.py:170,179`）は truthiness 判定と `max_new` 表示を確認する手掛かりだが、本番コードの挙動の根拠にはしていない。
+- `serve/server.py:7880-7882`, `8084-8087`, `8114-8118` — OpenAI Chat Completions、Responses、Anthropic Messages それぞれで準備後に診断 helper を呼び出す。
+- `serve/server.py:6112-6124` — 真偽値判定、出力先・項目、本文 preview の整形。
+- `serve/server.py:5542-5546`, `5686-5694`, `5828-5832`, `5858-5863`, `5944-5953` — request 内の token 収集と、完了時に raw text / ID を出す条件・形式。
+- `serve/mcp.py:82-84`, `96-110`, `128-134` — stdio transport の範囲、子プロセス環境の継承と `env` 上書き、stderr の保存と条件付き中継。
+

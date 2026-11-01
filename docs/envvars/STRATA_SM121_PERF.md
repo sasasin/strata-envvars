@@ -1,6 +1,6 @@
 # `STRATA_SM121_PERF`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae8e9d36928965f53ab`（2026-11-01 時点）。対象は Strata 所有ソースであり、外部ライブラリや GPU driver の環境変数動作は含めない。
+調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。対象は Strata 所有ソースであり、外部ライブラリや GPU driver の環境変数動作は含めない。
 
 ## 役割
 

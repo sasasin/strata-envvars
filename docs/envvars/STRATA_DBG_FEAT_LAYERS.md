@@ -1,4 +1,4 @@
-# STRATA_DBG_FEAT_LAYERS
+# `STRATA_DBG_FEAT_LAYERS`
 
 調査対象: Strata main の HEAD 7695859aa13afb248bdb4d36f9b2e95707db079d（2026-10-12 時点）。対象リポジトリは調査開始時に main で、作業ツリーに変更はなかった。外部ライブラリの環境変数は対象外。
 

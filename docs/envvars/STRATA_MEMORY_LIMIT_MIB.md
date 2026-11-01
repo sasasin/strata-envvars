@@ -1,40 +1,44 @@
 # `STRATA_MEMORY_LIMIT_MIB`
 
-調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。
+調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 ## 役割
 
-Strata generate engine の RAM 判定に、運用者が指定するコンテナ／cgroup 全体の MiB 上限を加えます。主な用途は `--serve` の会話 parking と session save/restore の RAM admission で、利用可能量がこの上限を超えないようにします。可視 cgroup の外側に実際のコンテナ上限がある場合に、その上限を手動で補う用途です。メモリ確保量そのものやプロセス全体の OS 制限を設定する変数ではありません（`include/strata/core/conversation_memory.hpp:10-30,55-63`）。
+Strata の RAM 判定に、運用者が指定するコンテナ／cgroup 全体の MiB 上限を加えます。主な用途は `--serve` の会話 parking と session save/restore の RAM admission です。OS が見せる利用可能 RAM がこの指定上限より大きくても、Strata は指定上限から現在の使用量を引いた残量を RAM 判定に使います。メモリ確保量そのものやプロセス全体の OS 制限を設定するものではありません。Strata 所有コードで環境から直接読む箇所は `src/program/generate.cpp` の起動処理に 1 箇所です（`src/program/generate.cpp:3531-3544`）。
 
 ## 値と判定
 
 | 入力 | 動作 |
 |---|---|
-| 未設定 | 上限なし（0 bytes） |
-| 空文字 | 未設定と同じく上限なし |
-| 非負の十進整数 | MiB として読み、bytes に変換して RAM guard に設定 |
-| 負数、空白付き、数字以外を含む値、範囲外 | stderr に `STRATA_MEMORY_LIMIT_MIB needs a nonnegative integer within range (got "...")` を出して起動を終了（return 2） |
+| `--memory-limit-mib` が指定済み | CLI 値を使い、環境変数を読みません。`0` も指定済みとして環境変数より優先します。 |
+| CLI 未指定、環境変数 unset | 上限なし（0 bytes）。 |
+| CLI 未指定、環境変数が空文字 | unset と同じく上限なし。 |
+| CLI 未指定、環境変数が非負値として parse できる十進整数 | MiB として読み、bytes に変換して RAM guard に設定します（`-0` は 0 として受理）。 |
+| 負数、空白付き、数字以外を含む値、範囲外 | stderr に `STRATA_MEMORY_LIMIT_MIB needs a nonnegative integer within range (got "...")` を出し、`return 2` で起動を終了します。 |
 
-環境変数は `std::from_chars` で `int64_t` 全体を parse し、文字列末尾まで消費したかを検査します。したがって `12x` や ` 12`、`12 ` は無効です。最大値は `INT64_MAX / (1024 * 1024)` MiB で、bytes への左シフトが範囲内に収まるよう制限されています。`0` は上限なしです（`src/program/generate.cpp:2930-2942`）。
+環境変数は `std::from_chars` で `int64_t` に文字列全体を parse し、末尾まで消費したことを確認します。したがって `12x`、` 12`、`12 `、`+12` は受け付けません。`-0` は parse 後の値が 0 なので受理されます。上限は `INT64_MAX / (1024 * 1024)` MiB です。`0` は指定上限なしを意味します。値を読み取るのは起動時の 1 回だけで、その結果を bytes にして `set_memory_limit_bytes()` に保存します（`src/program/generate.cpp:3531-3544`）。
 
-`--memory-limit-mib N` が指定された場合は環境変数より優先されます。CLI 側も非負の整数を全体 parse し、同じ上限を適用します。CLI の `0` も環境変数を無視して上限なしにします（`src/program/generate.cpp:2646-2666,2930-2942`）。
+CLI 引数も非負整数を全体 parse し、同じ上限で検査します。複数回指定された場合は引数ループで後に現れた値が設定され、いずれかが不正なら起動を終了します（`src/program/generate.cpp:3231-3248`）。
 
 ## 有効になる条件
 
-値は `strata generate` の起動時に一度解決され、`set_memory_limit_bytes()` に保存されます。後から環境を変更しても再読み込みされません。以後の `sample_host_memory()` 呼び出しが保存値を RAM 判定に使います（`src/program/generate.cpp:2929-2945`, `src/core/conversation_memory.cpp:255-256,280-291`）。
+環境値の読取・妥当性検査は `generate` 起動処理で行われます。RAM guard の実測は Linux と Windows の経路があり、その他の OS では `sample_host_memory()` が unknown を返します。Linux では `MemAvailable`、可視 cgroup 各階層の上限、明示上限の残量のうち最小を採用します。明示上限の使用量は、読める場合は最上位の可視 cgroup 使用量、そうでなければ `MemTotal - MemAvailable` から求め、clean inactive file cache の credit を差し引きます。明示上限があるのに使用量を測れないと sample は unknown になります（`include/strata/core/conversation_memory.hpp:10-30`; `src/core/conversation_memory.cpp:203-237,258-277`）。Windows は `GlobalMemoryStatusEx` から物理空きと commit 空きの小さい方を RAM sample に渡して、同じ明示上限を組み合わせます（`src/core/conversation_memory.cpp:280-291`）。
 
-この上限は `MemAvailable` と、Strata が読み取れる cgroup の上限・使用量から得る空き容量と併せて判定され、最も小さい値が採用されます。指定上限の空き容量は、cgroup の現在使用量（読めない場合は `MemTotal - MemAvailable`）から clean inactive file cache の credit を差し引いて計算します。上限が設定されているのにその使用量を測れない場合、RAM sample は unknown となり、処理は安全側に拒否されます（`include/strata/core/conversation_memory.hpp:12-30`; `src/core/conversation_memory.cpp:223-237,258-277`）。
+実際の会話 parking と session save/restore は `--serve` の機能です。parking は snapshot の追加 RAM と `--conversation-cache-min-free-mib` の床を満たさない場合に見送られ、古い parked 会話を退避して再判定する場合があります（`src/program/generate.cpp:10663-10695`）。session save は必要 RAM と同じ床を admission 判定し、restore はファイル読込中の必要 RAM を同様に検査します（`src/program/generate.cpp:13715-13743,13784-13804`）。サーバーの会話 cache 自動サイズも、モデル読込後の `available_host_bytes()` を使うためこの上限の影響を受けます（`src/program/generate.cpp:10404-10437`）。
 
-起動時に `--serve` または正の上限がある場合、利用可能 RAM を測れれば stderr に `strata generate: memory guard: limit ... (source: flag|cgroup|meminfo) ...` を出します。`--serve` 中の会話 parking は snapshot の追加 RAM と `--conversation-cache-min-free-mib` の床を満たさなければ parking を見送り、必要なら古い parked 会話を退避します。session save/restore も同じ RAM sample と床を使って拒否できます（`src/program/generate.cpp:2943-2958,9591-9625,12179-12207,12245-12268`）。
+## 実行時の詳細
 
-起動時の RAM sample が取れない場合、stderr に `strata generate: memory guard: the available RAM cannot be read; parking and session save/restore are refused` と出ます。Linux で cgroup 情報が読めず、かつ手動上限がない場合は `MemAvailable` を使う警告を一度出します。手動上限がある場合は使用量を特定できないため sample を返しません（`src/program/generate.cpp:2945-2949`; `src/core/conversation_memory.cpp:267-275`）。Windows は `GlobalMemoryStatusEx` の物理空きと commit 空きの小さい方を RAM sample に渡し、指定上限もその判定に加えます（`src/core/conversation_memory.cpp:280-286`）。
+起動時に `--serve` または正の上限があると、初期 RAM sample を取り、成功時は stderr に `strata generate: memory guard: limit ... (source: flag|cgroup|meminfo) ...` を出します。sample が unknown の場合は `strata generate: memory guard: the available RAM cannot be read; parking and session save/restore are refused` を出します（`src/program/generate.cpp:3544-3560`）。上限を指定した場合でも、他の可視 cgroup 制限または OS が示す空き RAM の方が小さければそちらが判定値になります。
+
+上限 bytes はプロセス内の atomic 状態に保存され、各 `sample_host_memory()` 呼び出しはその上限を使いながら RAM 情報を再取得します。したがって上限の環境変数自体は起動後に再読込されませんが、現在の RAM 使用量は各判定時点で反映されます（`src/core/conversation_memory.cpp:28,255-256,280-298`）。parking の RAM 不足は stderr に `skip parking (physical RAM admission; ...)`、session save/restore の不足は session refusal 経路から通知されます（`src/program/generate.cpp:10686-10690,13729-13743,13787-13804`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:744-746` — 既定状態と変数の意図。
-- `src/program/generate.cpp:2646-2666` — CLI 値の完全 parse、範囲検査、CLI 設定。
-- `src/program/generate.cpp:2929-2958` — CLI 優先、環境値の検証、bytes 化、初期ログ。
-- `include/strata/core/conversation_memory.hpp:10-30,55-63` — RAM guard が組み合わせる容量と保存 API。
-- `src/core/conversation_memory.cpp:223-237,255-291` — operator 上限の適用と Linux/Windows の sample 経路。
-- `src/program/generate.cpp:9591-9625,12179-12207,12245-12268` — parking と session file の RAM admission。
-- `docs/DETAILS.md:628-633` — 概要説明との照合。資料は上限を「コンテナが見えない場合」の手動 cap とし、parking/session file に適用、arena startup sizing や resident budget には適用しないと記載。コード上も `sample_host_memory()` を使う RAM 判定への適用であることを確認した。
+- `src/program/generate.cpp:865-867,1021-1023` — CLI と環境変数の位置づけ、初期値、上限 `0` の意味。
+- `src/program/generate.cpp:3231-3248` — CLI 引数の全体 parse、範囲検査、設定。
+- `src/program/generate.cpp:3531-3560` — CLI 優先、環境値の検証、bytes 化、起動時 sample とログ。
+- `include/strata/core/conversation_memory.hpp:10-30,55-65` — RAM guard が組み合わせる容量、保存 API、利用可能 RAM API。
+- `src/core/conversation_memory.cpp:28,203-237,255-298` — 上限の保存、明示上限の残量計算、Linux/Windows の sample 経路。
+- `src/program/generate.cpp:10404-10437,10663-10695` — `--serve` 会話 cache sizing と parking admission。
+- `src/program/generate.cpp:13715-13743,13784-13804` — session save/restore RAM admission。
+- `docs/DETAILS.md:704-709` — 概要資料との照合。資料は上限をコンテナが見えない場合の補助値とし、parking と session file の RAM 判定に適用、arena startup sizing・resident budget には適用しないと説明しています。

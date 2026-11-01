@@ -1,5 +1,7 @@
 # `--output`
 
+調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |

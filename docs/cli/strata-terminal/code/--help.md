@@ -1,5 +1,7 @@
 # `strata code --help` (`-h`)
 
+調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+
 - 対象: Strata Terminal CLI の `code` コマンド parser
 - 調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`
 - 調査日: 2026-10-25
