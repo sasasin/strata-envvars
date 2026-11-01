@@ -54,7 +54,7 @@ python3 .agents/skills/strata-investigate/scripts/find-stale.py
 | `file-only` | 引用ファイルは動いたが引用行範囲は無傷 | Stage 3 へ |
 | `token-in-diff` | 動いた hunk の +/- 行に環境変数名／option 文字列そのものが出る | **削除候補（高確度）** |
 | `cited-file-gone` | 引用ファイルが現行ツリーに無い | Stage 3 の所在追跡へ |
-| `unknown-sha` | 文書の SHA が Strata に実在しない（誤記） | 削除でなく本文修正 |
+| `unknown-sha` | 文書の SHA が Strata に実在しない（誤記） | 索引 SHA と 3 文字以内なら `sha_suggestion` を添える。本文修正でも、削除→再作成でも解決できる |
 | `no-meta` | 調査対象行が無い | 本文修正 |
 
 名前の突き合わせは境界付き正規表現（`(?<![A-Za-z0-9_-])NAME(?![A-Za-z0-9_-])`）。
@@ -65,7 +65,7 @@ python3 .agents/skills/strata-investigate/scripts/find-stale.py
 
 Stage 1 の `token-in-diff` がこれ。2026-11-02 実測:
 
-- envvars: `same-revision` 742 / `file-only` 684 / `hunk-intact` 182 / **`token-in-diff` 12** / `moved` 6 / `unknown-sha` 1
+- envvars: `same-revision` 742 / `file-only` 684 / `hunk-intact` 182 / **`token-in-diff` 12** / `moved` 6 / `unknown-sha` 1（初回実行、S-a を変数ごと grep していた頃）
 - cli: `file-only` 652 / `hunk-intact` 315 / **`token-in-diff` 115** / `same-revision` 43
 
 索引より古い commit で書かれた 885 文書（envvars）のうち 701 件が hunk と交するが、
@@ -73,12 +73,20 @@ Stage 1 の `token-in-diff` がこれ。2026-11-02 実測:
 
 ## Stage 3 — 補助判定（`--stage3`）
 
-- **envvars S-a 所在追跡**: 現行 HEAD で `"NAME"` を git grep する。
-  - 1 件も無い → `name-gone`（候補。索引更新で消えるはずなので、索引に残っているなら索引側を疑う）
-  - 見付かったが引用ファイルに無い → `moved`（削除しない。引用だけ古い）
+- **envvars S-a 所在移動**: 名前の所在は `build_name_index()` が作る「名前 → 出現ファイル」表で引く
+  （git grep は 3 回だけ: 大文字のクォート名、`$NAME` / `${NAME:-…}`、bat の `%NAME%`）。
+  変数ごとに grep していた実装では 12 分かかっていたのが、約 3 秒になった。
+  - 表に無い → `name-gone`（候補。索引更新で消えるはずなので、索引に残っているなら索引側を疑う）
+  - 見付かったが引用ファイルに無い → `moved`（**削除しない**。引用座標だけが古い）
+    2026-11-02 実測 4 件はすべて実移動だった: `HIPK_CFG` / `HIPK_DBG` / `STRATA_DS4_HIPK` は
+    `src/dsv41/ds4_iq.cu` が `ds4_iq_hip.inc` へ分割、`STRATA_PIN_RESERVE_GIB` は
+    `src/core/pinned.cu` から `src/core/expert_source.cpp` へ移っている。
+  - 引用ファイルに在る → `file-only` のまま（差分は出たが引用箇所は無傷）
+  - `GPUS`・`HOME` のように一般名は、shell 参照まで拾わないと所在移動の誤判定になる
+    （`docker/entrypoint.sh` の `${GPUS:-…}` を読む行が拾えず moved に出ていた例がある）
 - **envvars S-b 引用シンボル**（`--with-symbols --symbol-limit N`）: 文書が挙げる helper・修飾名が
-  現行に存在するか。消滅率が高ければ `symbol-gone`（候補）。費用対効果が小さいので既定は上限 200 件。
-  2026-11-02 実測では 300 件検査して候補は 1 件増。
+  現行に存在するか。シンボルは name index に載らないので、この判定だけ変数あたり git grep が走る。
+  費用対効果が小さいので既定の上限は 200 件。2026-11-02 実測では 300 件検査して候補は 1 件増。
 - **cli S-c option inventory**: `cli-grammar.py` が Strata 全体から `"--xxx"` 文字列を拾い、
   索引の option identity と突合する。索引更新時に必ず再生成する。
   - 索引の option が inventory に無い → `option-absent-in-grammar`（候補）
@@ -114,9 +122,19 @@ codex への依頼文に添えられる。報告の revision が Strata HEAD と
 
 ## 実測メモ（2026-11-02、Strata `c62d5e3a` 基準）
 
-- 全走査（Stage 1/2/3、S-a 込み）で約 70 秒。`--with-symbols` 300 件追加で約 2 分 40 秒。
-- 索引 SHA と同じ commit で書かれた文書（envvars 742 / cli 43）は差分ゼロで intact。
-  envvars の 895 件・cli の 1,083 件は索引より古い commit で書かれており、この手順の主な対象になる。
+- 全走査（Stage 1/2/3、S-a 含む）で約 3 秒。`--with-symbols` 300 件追加で約 3 分。
+- 索引 SHA と同じ commit で書かれた文書（envvars 755 / cli 43）は差分ゼロで intact。
+  envvars の 872 件・cli の 1,083 件は索引より古い commit で書かれており、この手順の主な対象になる。
+- 一巡の実例: envvars の `token-in-diff` 12 件と `unknown-sha` 1 件を `mark-stale.py --apply --limit 20`
+  で削除（数秒）→ `create-envvars-docs.py -p 5 -l 13` で再作成（4 分 27 秒、全件 created）→
+  `find-stale.py --stage3` 再実行で envvars の候補は 0 件（`token-in-diff` 0、`unknown-sha` 0、
+  `moved` 4、`file-only` 686、`hunk-intact` 182、`same-revision` 755）。
+  再作成文書には backend 別の判定表や `STRATA_GFX12_DEFAULTS` との相互作用まで書けており、
+  旧文書になかった変化が拾えていた（`STRATA_HC_Q8`）。旧 SHA 誤記の `STRATA_MOVE_ALWAYS_COPY` も
+  現行 SHA の文書に置き換わった。
+- CLI の `token-in-diff` 115 件は未実施（`--help` / `--json` / `--quiet` のような共通 option が多く、
+  usage 文言変更が主）。実施する場合は共通 option を除外して刻む。
 - 見付かった実例: `STRATA_ATTN_LANECELL` は既定値テーブル `t.push_back({"STRATA_ATTN_LANECELL", "1"})` が
   `src/core/arch_defaults.cpp` に加わり、`STRATA_HC_Q8` は `getenv` 呼び出しがコメント化されている。
-- `STRATA_MOVE_ALWAYS_COPY.md` は strata-envvars のコミット SHA を調査対象に書いていた（`unknown-sha`）。
+- 再作成後は `find-stale.py` をもう一度走らせて候補が減っていることを確認する（同じ commit 基準に
+  揃うので `token-in-diff` は 0 になる）。`check-docs.py --stale` の commit 別分布でも追える。

@@ -90,6 +90,10 @@ python3 .agents/skills/strata-investigate/scripts/check-docs.py
 option 文字列そのものが出るか」（Stage 2）で候補を絞ること。判定の意味と確度、安全弁は
 `references/staleness.md`。削除した項目は索引に残したまま試行記録から消すと、既存の C（一括作成）がそのまま拾う。
 
+2026-11-02 の一巡実測: 全走査（Stage 1/2/3）は約 3 秒。envvars の候補 13 件（`token-in-diff` 12 と
+`unknown-sha` 1）を削除して再作成するのに 4 分 27 秒（5 並列、全件 created）。`moved` 判定の項目は
+削除しない（引用座標だけが古い）。
+
 ## B. 削除（prune）
 
 索引との git diff から消えた名前・オプションを拾い、対応する本文だけを削除し、索引のリンク残骸を確認する。手順の本体は `references/prune.md`。

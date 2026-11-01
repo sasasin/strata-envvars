@@ -32,6 +32,55 @@ OPTION_NAME_RE = re.compile(r"`([^`]+)`")
 THIS_REPO_RE = re.compile(r"^(docs/|\.agents/|README\.md$|create-[a-z-]+\.py$|LICENSE$)")
 
 
+def sha_distance(a: str, b: str) -> int:
+    """同じ長さの commit SHA として、異なる 16 進桁の数。長さが違えば 99。"""
+    if len(a) != len(b) or len(b) != 40:
+        return 99
+    return sum(1 for x, y in zip(a, b) if x != y)
+
+
+def similar_sha(a: str, b: str, max_diff: int = 3) -> bool:
+    """SHA 表記の誤記らしきものだけを拾う。"""
+    return 0 < sha_distance(a, b) <= max_diff
+
+
+QUOTED_RE = re.compile(r'"([A-Z][A-Za-z0-9_]{2,})"')
+SHELL_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+BAT_REF_RE = re.compile(r"%([A-Z_][A-Za-z0-9_]{2,})%")
+GREP_PATTERNS = [
+    r'"[A-Z][A-Za-z0-9_]{2,}"',
+    r"\$\{?[A-Za-z_][A-Za-z0-9_]*",
+    r"%[A-Z_][A-Za-z0-9_]{2,}%",
+]
+GREP_EXCLUDES = [
+    ":(exclude)docs/**",
+    ":(exclude)bench/results/**",
+    ":(exclude)data/**",
+    ":(exclude)ref/**",
+    ":(exclude)third_party/**",
+]
+
+
+def build_name_index(strata: pathlib.Path, revision: str) -> dict[str, set[str]]:
+    """Strata のある revision で「名前 -> 出現ファイル集合」を 1 回の grep 群で作る。
+
+    Stage 3 の所在追跡を、変数ごとの git grep ではなくこの表の参照で済ませるため。
+    """
+    index: dict[str, set[str]] = {}
+    for pattern in GREP_PATTERNS:
+        for raw in git(strata, "grep", "-n", "-E", pattern, revision, "--", *GREP_EXCLUDES).split("\n"):
+            if not raw:
+                continue
+            body = raw[len(revision) + 1 :] if raw.startswith(revision) else raw
+            parts = body.split(":", 2)
+            if len(parts) < 3:
+                continue
+            path, text = parts[0], parts[2]
+            for match in (*QUOTED_RE.finditer(text), *SHELL_REF_RE.finditer(text), *BAT_REF_RE.finditer(text)):
+                index.setdefault(match.group(1), set()).add(path)
+    return index
+
+
 def default_strata_root() -> pathlib.Path:
     return pathlib.Path.home() / "src" / "github.com" / "Niko1221" / "Strata"
 

@@ -161,6 +161,10 @@ def load_stale_notes(report_path: Path, revision: str) -> dict[str, str]:
             f"- 判定: {item.get('verdict')}",
             f"- 旧文書の調査対象: {item.get('doc_sha')}（{item.get('doc_date') or '調査日不明'}）、現行基準: {revision}",
         ]
+        if item.get("sha_suggestion"):
+            lines.append(
+                f"- 旧文書の SHA は Strata に実在しません。索引の {item['sha_suggestion']} の打ち間違いの可能性があります"
+            )
         commits = item.get("changed_commits") or []
         if commits:
             lines.append(f"- 根拠ファイルに触れたコミット（先頭 {min(6, len(commits))} 件）:")

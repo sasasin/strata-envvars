@@ -17,6 +17,9 @@ import re
 from datetime import datetime
 
 from staleness_lib import (
+    build_name_index,
+    sha_distance,
+    similar_sha,
     CLI_DIR,
     CLI_INDEX,
     ENVVAR_DIR,
@@ -117,6 +120,9 @@ def stage1_2(
     for key, doc in docs.items():
         by_sha[str(doc["doc_sha"])].append(key)
 
+    known_shas = {
+        sha for sha in by_sha if sha and git_ok(strata, "cat-file", "-e", f"{sha}^{{commit}}")
+    }
     hunk_cache: dict[str, dict[str, list[tuple[int, int, int, int, list[str]]]]] = {}
     for sha, keys in by_sha.items():
         if sha == revision or not sha or not git_ok(strata, "cat-file", "-e", f"{sha}^{{commit}}"):
@@ -134,6 +140,10 @@ def stage1_2(
             continue
         if sha not in hunk_cache:
             doc["verdict"] = "unknown-sha"
+            near = [ref for ref in (revision, *sorted(known_shas)) if similar_sha(sha, ref)]
+            if near:
+                best = min(near, key=lambda ref: sha_distance(sha, ref))
+                doc["sha_suggestion"] = f"{best}（{sha_distance(sha, best)} 文字差）"
             continue
         per = hunk_cache[sha]
         token = str(doc["token"])
@@ -186,32 +196,26 @@ def stage3_envvars(
     docs: dict[str, dict[str, object]],
     revision: str,
     strata: pathlib.Path,
+    name_index: dict[str, set[str]],
     with_symbols: bool,
     symbol_budget: int,
 ) -> None:
-    """S-a 所在移動 / S-b 引用シンボル / 名前の消失を見る。"""
+    """S-a 所在移動 / S-b 引用シンボル / 名前の消失を見る。
+
+    名前の所在は build_name_index の表で引く（変数ごとの git grep は避ける）。
+    """
     for key, doc in docs.items():
         if doc["verdict"] not in {"file-only", "cited-file-gone"}:
             continue
         token = str(doc["token"])
-        hits = [
-            line.split(":", 1)[1]
-            for line in git(strata, "grep", "-l", "-F", f'"{token}"', revision).split("\n")
-            if line
-        ]
-        doc["found_now"] = hits[:8]
+        hits = sorted(name_index.get(token, set()))
         cited = set(doc_cite_files(doc))
+        doc["found_now"] = hits[:8]
+        doc["found_in"] = len(hits)
         if not hits:
-            hits_any = [
-                line.split(":", 1)[1]
-                for line in git(strata, "grep", "-l", "-F", token, revision).split("\n")
-                if line
-            ]
-            doc["found_now"] = hits_any[:8]
-            doc["verdict"] = "file-only" if hits_any else "name-gone"
-            if doc["verdict"] == "name-gone":
-                continue
-        elif not (cited & set(hits)):
+            doc["verdict"] = "name-gone"
+            continue
+        if not (cited & set(hits)):
             doc["verdict"] = "moved"
             continue
         if with_symbols and symbol_budget > 0:
@@ -307,7 +311,9 @@ def main() -> int:
         add_changed_commits(docs, tree)
         if args.stage3:
             if scope == "envvars":
-                stage3_envvars(docs, revision, strata, args.with_symbols, args.symbol_limit)
+                name_index = build_name_index(strata, revision)
+                print(f"[name index] {len(name_index)} 名")
+                stage3_envvars(docs, revision, strata, name_index, args.with_symbols, args.symbol_limit)
             else:
                 stage3_cli(docs, args.grammar.resolve(), revision)
         print(f"\n[{scope}] 文書 {len(docs)} 件の判定")

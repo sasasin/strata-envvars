@@ -93,7 +93,7 @@ Strata 側で消えたように見えても、読み取り箇所が別ファイ�
    `references/runner.md` の no-doc 節を参考に、調査範囲を引用した追加指示で 1 件ずつ再依頼する。
 6. `python3 .agents/skills/strata-investigate/scripts/check-docs.py` で「必須節の欠落 0 件」を確認してコミットする。
 
-陈旧化した可能性のある文書をまとめて探す場合は、この節の手動運用ではなく `references/staleness.md`（
+陳腐化した可能性のある文書をまとめて探す場合は、この節の手動運用ではなく `references/staleness.md`（
 `find-stale.py` → `mark-stale.py`）を使う。削除→再作成の流れは同じ。
 
 ## 5. 実装済み: 内容の陳腐化検出

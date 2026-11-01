@@ -20,9 +20,11 @@ uv run ./create-cli-docs.py -p 12 -l 100
   - `--dry-run` … 起動せず対象を一覧する（**実行前に必ずこれで目視**）
   - `--include-tried` … 調べても文書ができなかった変数を再調査候補に加える
   - `--reset-state` … 試行記録を消して組み直す（全履歴を失うので通常は使わない）
-  - `--stale-report PATH` … `find-stale.py` の報告（既定 `.strata-stale.json`）。陈旧化で削除した変数の
+  - `--stale-report PATH` … `find-stale.py` の報告（既定 `.strata-stale.json`）。陳腐化で削除した変数の
     調査対象 SHA・触れたコミット・差分の抜書を codex への依頼文に添える。報告の revision が Strata HEAD と
-    違う場合は自動で無視する（`create-cli-docs.py` にも同じオプションがある）
+    違う場合は自動で無視する（`create-cli-docs.py` にも同じオプションがある）。
+    2026-11-02 の一巡では 13 件全てに付与でき、全件が文書化した（`unknown-sha` には「索引 SHA と N 文字差」の
+    候補も添えられる）
 - 試行記録は `.create-envvars-docs.state.json`（`{変数名: {attempts, status, updated_at}}`）。
   `status` は `created` / `no-doc`（Strata が実際には読まない候補。`001_investigation.md` の手順どおり
   「索引との食い違い」として報告され、文書は作られない）/ `error`。
