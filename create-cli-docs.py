@@ -34,6 +34,7 @@ PROMPT_TEMPLATE = """調査依頼です。Strata の CLI 文書を1件作成し�
 5. 文書は日本語で書き、確認した Strata の相対ファイルパスと行番号を根拠として挙げてください。確認できない点は推測せず、調査範囲や制約を明記してください。安全に使える同一 revision の CLI `--help` は補助資料として使えますが、ソースの parser と照合してください。
 6. 作成先がすでに存在する場合は上書きせず、その旨を報告してください。指定された option が現行 parser にない場合、または索引との食い違いがある場合も、別の文書を推測で作らず差異を報告してください。
 7. 編集対象は指定された文書1件だけです。索引や他文書を変更しないでください。調査のためのソース変更、build、GPU 実行、性能測定、テストは行わないでください。
+{stale_note}
 """
 
 INDEX_LINK_RE = re.compile(r"^- \[.*?\]\(([^)]+)\)\s*$")
@@ -82,7 +83,65 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="同時に実行する codex の最大数 (default: 1)",
     )
+    parser.add_argument(
+        "--stale-report",
+        type=Path,
+        default=REPO_ROOT / ".strata-stale.json",
+        help="find-stale.py の報告。削除理由を codex へ渡す (存在しなければ無視)",
+    )
     return parser.parse_args()
+
+
+def strata_head() -> str:
+    result = subprocess.run(
+        ("git", "-C", str(STRATA_ROOT), "rev-parse", "HEAD"),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+def load_stale_notes(report_path: Path, revision: str) -> dict[str, str]:
+    """陳腐化検出の報告を、docs/cli 配下の相対パスごとの追記文にする。"""
+    if not report_path.is_file():
+        return {}
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"陳腐化報告を読み込めません: {exc}", file=sys.stderr)
+        return {}
+    if payload.get("revision") != revision:
+        print(
+            f"陳腐化報告の revision ({payload.get('revision')}) が Strata HEAD ({revision}) と違うので無視します",
+            file=sys.stderr,
+        )
+        return {}
+
+    notes: dict[str, str] = {}
+    for item in payload.get("candidates", []):
+        if item.get("scope") != "cli":
+            continue
+        rel = str(item.get("key", ""))
+        if not rel:
+            continue
+        lines = [
+            "",
+            "追加情報: この文書は陳腐化検出で削除されました。旧記述を引き継がず、現行 checkout の parser を読み直して作成してください。",
+            f"- 判定: {item.get('verdict')}",
+            f"- 旧文書の調査対象: {item.get('doc_sha')}（{item.get('doc_date') or '調査日不明'}）、現行基準: {revision}",
+        ]
+        commits = item.get("changed_commits") or []
+        if commits:
+            lines.append(f"- 根拠ファイルに触れたコミット（先頭 {min(6, len(commits))} 件）:")
+            lines += [f"    {line}" for line in commits[:6]]
+        for diff_line in (item.get("token_lines") or [])[:4]:
+            lines.append(f"- 変更差分にこの option 文字列が現れます: {diff_line[:160]}")
+        if item.get("grammar_hits") is not None:
+            lines.append(f"- 現行 Strata での option 文字列の出現箇所数: {item['grammar_hits']}")
+        notes[rel] = "\n".join(lines)
+    return notes
 
 
 def find_missing_docs() -> list[Path]:
@@ -101,7 +160,7 @@ def find_missing_docs() -> list[Path]:
     return sorted(missing, key=lambda path: str(path))
 
 
-def create_doc(doc_path: Path) -> tuple[Path, int, str, str]:
+def create_doc(doc_path: Path, stale_note: str = "") -> tuple[Path, int, str, str]:
     doc_path.parent.mkdir(parents=True, exist_ok=True)
     prompt = PROMPT_TEMPLATE.format(
         strata_root=STRATA_ROOT,
@@ -109,6 +168,7 @@ def create_doc(doc_path: Path) -> tuple[Path, int, str, str]:
         index=INDEX,
         investigation=DOC_ROOT / "001_investigation.md",
         example_readme=DOC_ROOT / "strata-terminal" / "launch" / "README.md",
+        stale_note=stale_note,
     )
     with tempfile.TemporaryDirectory(prefix="create-cli-docs-") as temp_dir:
         temp_path = Path(temp_dir)
@@ -163,12 +223,16 @@ def main() -> int:
         return 0
 
     print(f"今回の作成対象: {len(doc_paths)} 件", flush=True)
+    notes = load_stale_notes(args.stale_report, strata_head())
+    if notes:
+        hit = sum(1 for path in doc_paths if str(path.relative_to(DOC_ROOT)) in notes)
+        print(f"陳腐化報告: {len(notes)} 件 / 今回対象に {hit} 件分付与", flush=True)
     failed = False
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         futures = {}
         for path in doc_paths:
             print(f"\n=== 開始: {path} ===", flush=True)
-            futures[executor.submit(create_doc, path)] = path
+            futures[executor.submit(create_doc, path, notes.get(str(path.relative_to(DOC_ROOT)), ""))] = path
         for future in as_completed(futures):
             doc_path = futures[future]
             try:

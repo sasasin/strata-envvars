@@ -1,2 +1,6 @@
 __pycache__/
 .create-envvars-docs.state.json
+.strata-evidence.json
+.cli-grammar.json
+.strata-stale.json
+.strata-stale.removed.json

@@ -76,6 +76,9 @@ alias（`|| a == "-h"`）と、`--version` / `-V` / `--families` / `--gpu` の�
 CMake 生成対象は `add_executable` の場所と条件ブロック（`option(...)`、backend guard、`NOT STRATA_HIP_GFX906` など）を
 `CMakeLists.txt`、`sycl/CMakeLists.txt`、`metal/CMakeLists.txt`、`tools/vision/CMakeLists.txt` から読む。
 
+索引更新のたびに、この抽出結果の要として option 文字列 inventory を保存する（`scripts/cli-grammar.py` →
+`.cli-grammar.json`）。`find-stale.py` の S-c（既存 CLI 文書の option が現行 parser から消えたか）がこれを使う。
+
 ## 4. Release と配布物の実体
 
 ```bash

@@ -32,6 +32,11 @@
 - `## \`tool-id\`` → `### \`コマンド\``（command path）→ `- [コマンド概要](<...>/README.md)` を節の先頭に 1 つ → `- [\`--option\`（alias: \`-o\`）](<...>/--option.md)` を**表示される正規名の ASCII 順**。
 - 配置規約と一意性（`tool-id + command-path + option identity`）は `docs/cli/001_investigation.md` が正。ラッパーが委譲だけなら重複登録せず、委譲先が独自 parser を持つ場合は別 scope（例 `source-setup/mac/`、`strata-engine/qwen36/`）。
 - 網羅性は機械照合する: parser 側から抽出した option 集合（`extraction-recipes.md` §3）と索引のリンク集合を突き合わせ、追加・削除・改名・alias 表記の漏れと重複を見る。
+- 索引更新のたびに option inventory も保存する（陳腐化検出 S-c が使う）。
+
+  ```bash
+  python3 .agents/skills/strata-investigate/scripts/cli-grammar.py    # → .cli-grammar.json
+  ```
 - Release installer（`install.sh` / `install.ps1`）は CLI 引数を持たないので option 文書を作らず、その事実を書く。
 
 ## 更新後の自己点検

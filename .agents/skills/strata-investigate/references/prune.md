@@ -93,11 +93,12 @@ Strata 側で消えたように見えても、読み取り箇所が別ファイ�
    `references/runner.md` の no-doc 節を参考に、調査範囲を引用した追加指示で 1 件ずつ再依頼する。
 6. `python3 .agents/skills/strata-investigate/scripts/check-docs.py` で「必須節の欠落 0 件」を確認してコミットする。
 
-## 5. 未実装（スコープ外）: 変更検出
+陈旧化した可能性のある文書をまとめて探す場合は、この節の手動運用ではなく `references/staleness.md`（
+`find-stale.py` → `mark-stale.py`）を使う。削除→再作成の流れは同じ。
 
-「Strata 側で挙動が変わったため既存文書が陳腐化した」検出は未定義。実装するなら次の形が想定される
-（今回は作らない。`check-docs.py --stale` は commit 別の件数を出すだけで、内容の差分は判定しない）。
+## 5. 実装済み: 内容の陳腐化検出
 
-- 各 envvars 文書の `## 根拠` にある `path:line` を逆引き表（変数 → 実装ファイル）にする。
-- Strata 側で `git diff <prev-doc-sha>..HEAD -- <そのファイル>` を取り、差分がその環境変数の読み取り付近に触れていれば再調査候補として並べる。
-- 再調査は 1 変数 1 セッション（`create-envvars-docs.py` と同じ形）で、既存文書を上書き更新する。
+「Strata 側で挙動が変わったため既存文書が陳腐化した」検出は `references/staleness.md` に実装した
+（`scripts/evidence-index.py` / `scripts/find-stale.py` / `scripts/mark-stale.py` / `scripts/cli-grammar.py`）。
+逆引きは envvars 文書の `## 根拠` にある `path:line` を機械抽出した台帳（`.strata-evidence.json`）が担い、
+削除は上記 §4 と同じ流れ（本文を消して試行記録から entry を消す）で再作成に繋がる。
