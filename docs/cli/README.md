@@ -2,18 +2,19 @@
 
 この索引は Strata のユーザー向け CLI 入口と、そのコマンド階層ごとのオプション文書を列挙します。リンク先の文書は今後作成する予定の項目も含みます。したがって、現時点でリンク先の Markdown が未作成でも、この索引では予定パスとして掲載しています。
 
-調査対象: Strata commit `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 調査、commit 日 2026-10-25）。
+調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査、commit 日 2026-10-31）。`git status --short --branch` は working tree clean（branch `main` = `origin/main`）、`git describe --tags` は `v0.2.9` で `git log v0.2.9..HEAD` は 0 件です。
 
 文書配置と調査基準は [`001_investigation.md`](001_investigation.md)、CLI 入口と配布形態は [`000_cli_tools.md`](000_cli_tools.md) を参照してください。各コマンドの概要ページは `docs/cli/<tool-id>/<command-path>/README.md`、オプション文書は `docs/cli/<tool-id>/<command-path>/<option-name>.md` に置きます。以下の「コマンド概要」とオプションのリンク先は、今後作成する予定のものも含みます。短縮名・同じ parser action の alias は正規の長い名前の文書にまとめます。
 
 ## 索引の対象境界
 
-- `strata-terminal`: `strata_cli/cli.py` と登録されたサブコマンド parser、および `strata_cli/launch/cmd.py` の `launch` / `connect`。POSIX/Windows の wrapper は同じ Python CLI を起動するため共通索引です。
-- `strata-engine`: CMake で作られるネイティブ `strata` 推論エンジンの `src/program/generate.cpp` の引数 parser。`--native` から起動する別ファミリー実装への引数転送もエンジンのスコープに含めます。
-- `source-setup`: `setup.sh`、`START-HERE.bat`、`SETUP.bat`、`update.sh`、`UPDATE.bat` が委譲する `setup.py` のオプション。ラッパー独自の引数解釈はなく、同じオプション文書を共有します。
+- `strata-terminal`: `strata_cli/cli.py` の root parser と、そこから登録されるサブコマンド parser。`strata_cli/launch/cmd.py` の `launch` / `connect`、`strata_cli/update_cmd.py`、`strata_cli/tune_commands.py`、`strata_cli/drafting_cmd.py`、`strata_cli/monitor_commands.py` で定義される parser も同じ索引に入れます。POSIX/Windows の wrapper は同じ Python CLI を起動するため共通索引です。
+- `strata-engine`: CMake で作られるネイティブ `strata` 推論エンジンの `src/program/generate.cpp` の引数 parser。`main` 冒頭の family switch で `--native` / `--model` が示す GGUF が `qwen35moe` のとき `src/qwen35` の別ファミリー実装へ移り、そこでの引数 parser は `strata-engine` 内の別 scope `qwen36/` にして索引に含めます。
+- `source-setup`: `setup.sh`、`START-HERE.bat`、`SETUP.bat`、`update.sh`、`UPDATE.bat` が委譲する `setup.py` のオプション。ラッパー独自の引数解釈はなく、同じオプション文書を共有します。Apple Silicon で `STRATA_CONTROL_INSTALL=1` を置かずに `setup.py` を実行すると `metal/setup_mac.py` へ委譲され、そちらは独自の parser を持つため `source-setup` 内の別 scope `mac/` にします。`--backend sycl` で呼ばれる `sycl/setup_intel.py` は独自の option parser を持たず `setup.py` の `main()` を argv を組み替えて再実行するので、`root/` の一覧を共用します。
+- `strata-vision`: `tools/vision/CMakeLists.txt` が作る画像読み取り CLI (`tools/vision/strata_vision.cpp`)。engine package に同梱される独立実行ファイルで、Terminal CLI のサブコマンドではありません。build option で `strata-vision-hip` / `strata-vision-sycl` などの別プログラム名・GPU 版になりますが、parser は同じなので scope は分けず、program 名の違いは `strata-vision/root/` の注記にまとめます。
 - `quick-benchmark`: `bench.sh` / `BENCH.bat` が委譲する `tools/strata_bench.py` のオプション。
 - GitHub Release installers `install.sh` / `install.ps1` は呼び出し時の CLI 引数を解釈せず、設定は環境変数で行うため、この索引に CLI option 文書はありません。環境変数文書側を参照してください。
-- `CMakeLists.txt` 等で生成される `*_test`、`*_parity`、`*_bench`、個別 probe はビルド条件・個別用途の開発/検証プログラムです。製品 CLI のサブコマンドとして一括索引化せず、対象に含める場合は各プログラムの利用者・build target・parser を確認して別の tool-id として追加します。
+- `CMakeLists.txt` 等で生成される `*_test`、`*_parity`、`*_bench`、個別 probe・harness はビルド条件・個別用途の開発/検証プログラムです。製品 CLI のサブコマンドとして一括索引化せず、対象に含める場合は各プログラムの利用者・build target・parser を確認して別の tool-id として追加します。今回の checkout で `4b9e05a2..c62d5e3a` に増えた `add_executable` はすべて `*_test` / `*_parity` / `*_bench` / harness / probe で、索引の対象は増えていません（root の `add_executable` は 250 件）。engine package に同梱される `strata-vision` / `strata-vision-hip` / `strata-vision-sycl` (`tools/vision/CMakeLists.txt`) は利用者 CLI として `strata-vision` tool-id で追加しました。`packaging/monitor_bundle.py`、`packaging/feed_tool.py`、`packaging/package_*.py`、`docker/*.sh` など、配布物を作る helper は利用者向け CLI ではないため対象外です。
 
 ## `strata-terminal`
 
@@ -950,6 +951,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--data-dir`](strata-terminal/launch/--data-dir.md)
 - [`--delete-preset`](strata-terminal/launch/--delete-preset.md)
 - [`--drafting`](strata-terminal/launch/--drafting.md)
+- [`--dspark`](strata-terminal/launch/--dspark.md)
 - [`--dsv41-package`](strata-terminal/launch/--dsv41-package.md)
 - [`--family`](strata-terminal/launch/--family.md)
 - [`--feed`](strata-terminal/launch/--feed.md)
@@ -1148,7 +1150,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 
 ## `strata-engine`
 
-CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI の同名 wrapper とは別のプログラムです。一覧は `src/program/generate.cpp` の引数 parser および parser より前に処理される早期終了フラグを基にしています。`--model` は Qwen3.6 専用実装への振り分けで使われます。短縮表記と同一動作の alias は正規名の文書にまとめます。parser が受理していても usage/help に表示されない option があります。たとえば `--no-kv-grow` は parser に実装されているため索引に含めています。
+CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI の同名 wrapper とは別のプログラムです。一覧は `src/program/generate.cpp` の引数 parser と、parser より前に処理される引数 (`--version` / `-V`、`--families`、`--gpu` の環境変数設定、`--native` / `--model` の family switch) を基にしています。`--model` はその振り分けでしか読まれず、通常の `strata` parser は `--model` を unknown argument として拒否します。短縮表記と同一動作の alias は正規名の文書にまとめます。parser が受理していても usage/help に表示されない option があります。たとえば `--no-kv-grow` は parser (`src/program/generate.cpp:3070`) に実装されているため索引に含めています。
 
 ### `strata` (エンジン引数)
 
@@ -1374,12 +1376,15 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 
 - [コマンド概要](strata-engine-dsv41/root/README.md)
 
-`STRATA_BUILD_DSV41=ON` かつ `STRATA_HIP_GFX906` でない build で生成される独立 engine CLI です。Release での配布有無はこの source inventory からは断定しません。
+`STRATA_BUILD_DSV41=ON` かつ `STRATA_HIP_GFX906` でない build で生成される独立 engine CLI です。macOS の Metal build では同じ入口 `src/dsv41/ds4_main.cpp` から CMake target `strata_ds4` (`metal/CMakeLists.txt:165`) が作られ、`packaging/mac/build_dsv41_engine.sh` がそれを `strata-dsv41` として staging します。Release への同梱はこの source inventory からは断定しません（[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-01 実測では v0.2.9 に `strata-dsv41-0.1.55-*` archive 6 件が確認されています）。`--help` は `-h` も受理し (`src/dsv41/ds4_main.cpp:1379`)、`--version` は build id を表示します (`src/dsv41/ds4_main.cpp:1364`)。
+
+`--sampler-test` は option 一覧に含めません。`src/dsv41/ds4_main.cpp:1287` で argv[1] がちょうどこの値のときにだけ sampler の統計 harness へ引数を渡す分岐で、その harness は `#if defined(STRATA_METAL)` で `strata_ds4` に組み込まれる `src/dsv41/sampler_stat.inc` の個別検証用コードです（CMake の単独 target はありません）。
 
 - [`--cpu-threads`](strata-engine-dsv41/root/--cpu-threads.md)
 - [`--dspark`](strata-engine-dsv41/root/--dspark.md)
 - [`--dspark-block`](strata-engine-dsv41/root/--dspark-block.md)
 - [`--dspark-conf`](strata-engine-dsv41/root/--dspark-conf.md)
+- [`--dspark-depth`](strata-engine-dsv41/root/--dspark-depth.md)
 - [`--dump-image`](strata-engine-dsv41/root/--dump-image.md)
 - [`--dump-logits`](strata-engine-dsv41/root/--dump-logits.md)
 - [`--encode-image`](strata-engine-dsv41/root/--encode-image.md)
@@ -1387,7 +1392,7 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - [`--expert-profile`](strata-engine-dsv41/root/--expert-profile.md)
 - [`--experts`](strata-engine-dsv41/root/--experts.md)
 - [`--gpus`](strata-engine-dsv41/root/--gpus.md)
-- [`--help`](strata-engine-dsv41/root/--help.md)
+- [`--help`（alias: `-h`）](strata-engine-dsv41/root/--help.md)
 - [`--ids`](strata-engine-dsv41/root/--ids.md)
 - [`--images`](strata-engine-dsv41/root/--images.md)
 - [`--layer-split`](strata-engine-dsv41/root/--layer-split.md)
@@ -1398,6 +1403,7 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - [`--pack`](strata-engine-dsv41/root/--pack.md)
 - [`--pack-info`](strata-engine-dsv41/root/--pack-info.md)
 - [`--prefill-chunk`](strata-engine-dsv41/root/--prefill-chunk.md)
+- [`--profile-readonly`](strata-engine-dsv41/root/--profile-readonly.md)
 - [`--profile-run`](strata-engine-dsv41/root/--profile-run.md)
 - [`--reserve-mib`](strata-engine-dsv41/root/--reserve-mib.md)
 - [`--score`](strata-engine-dsv41/root/--score.md)
@@ -1428,7 +1434,7 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 
 - [`--dense`](strata-plan/root/--dense.md)
 - [`--embd`](strata-plan/root/--embd.md)
-- [`--help`](strata-plan/root/--help.md)
+- [`--help`（alias: `-h`）](strata-plan/root/--help.md)
 - [`--max-context`](strata-plan/root/--max-context.md)
 - [`--pool`](strata-plan/root/--pool.md)
 - [`--state`](strata-plan/root/--state.md)
@@ -1449,7 +1455,7 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 
 - [`--chunk-mb`](strata-load/root/--chunk-mb.md)
 - [`--file`](strata-load/root/--file.md)
-- [`--help`](strata-load/root/--help.md)
+- [`--help`（alias: `-h`）](strata-load/root/--help.md)
 - [`--layers`](strata-load/root/--layers.md)
 - [`--no-pin`](strata-load/root/--no-pin.md)
 - [`--stream`](strata-load/root/--stream.md)
@@ -1502,9 +1508,28 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 - [`--tokens`](strata-q36ref/root/--tokens.md)
 - [`--tokens-file`](strata-q36ref/root/--tokens-file.md)
 
+## `strata-vision`
+
+画像の tensor を作るための独立 CLI です。`tools/vision/CMakeLists.txt:96` の `add_executable(strata-vision strata_vision.cpp)` が作り、setup.py は vision encoder を選んだときにこれを build します (`tools/vision/CMakeLists.txt:1-2`)。build option でプログラム名と GPU が変わります: `STRATA_VISION_CUDA=ON` は同じ名前 `strata-vision` のまま GPU 版、`STRATA_VISION_HIP=ON` は `strata-vision-hip`、`STRATA_VISION_SYCL=ON` は `strata-vision-sycl`、既定の `STRATA_VISION_METAL=ON` は Mac の GPU を使います (`tools/vision/CMakeLists.txt:18-20`、`tools/vision/CMakeLists.txt:31`)。いずれも同じ parser で、`--version` の表示だけが variant で変わります (`tools/vision/strata_vision.cpp:102-112`)。engine package に入る実行ファイルで、Terminal CLI のサブコマンドではありません。Release の archive ごとに同梱・未同梱が違い、[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-01 実測では macOS / HIP の archive に `strata-vision`（HIP には `strata-vision-hip` も）が入り、SYCL archive には入りませんでした。位置引数は取らず、`--mmproj` と `--model` の指定が必須です（未指定なら usage を表示して exit 2、`tools/vision/strata_vision.cpp:125-128`）。`--help` option はなく、未知の引数は `unknown argument` で exit 2 です (`tools/vision/strata_vision.cpp:123`)。
+
+### `strata-vision` / `strata-vision-hip` / `strata-vision-sycl`
+
+- [コマンド概要](strata-vision/root/README.md)
+
+- [`--flash-attn`](strata-vision/root/--flash-attn.md)
+- [`--gpu`](strata-vision/root/--gpu.md)
+- [`--max-tokens`](strata-vision/root/--max-tokens.md)
+- [`--min-tokens`](strata-vision/root/--min-tokens.md)
+- [`--mmproj`](strata-vision/root/--mmproj.md)
+- [`--model`](strata-vision/root/--model.md)
+- [`--threads`](strata-vision/root/--threads.md)
+- [`--version`](strata-vision/root/--version.md)
+
 ## `source-setup`
 
-`setup.py` は初回 setup、既存環境の更新、モデル設定変更を担います。POSIX/Windows の wrapper はここへ引数を渡します。以下は `setup.py` の CLI parser option inventory です。setup は複数 GPU と helper cache の条件に応じて engine 用 `--remote-expert-opt` を run config に自動追加することがありますが、これは `setup.py` に渡す option ではありません。自動追加を抑止する setup option は `--no-remote-expert-opt` です。
+`setup.py` は初回 setup、既存環境の更新、モデル設定変更を担います。POSIX/Windows の wrapper はここへ引数を渡します。以下は `setup.py` の CLI parser option inventory です（parser は `setup.py:9070` の一つだけ、現行の option 宣言は 54 個）。setup は複数 GPU と helper cache の条件に応じて engine 用 `--remote-expert-opt` を run config に自動追加することがありますが、これは `setup.py` に渡す option ではありません。自動追加を抑止する setup option は `--no-remote-expert-opt` です。
+
+`--images`、`--image-quant`、`--image-backend`、`--image-native`、`--image-gpu-policy`、`--skip-build` は parser が受理しますが、`help=argparse.SUPPRESS` で `--help` の一覧には表示されません (`setup.py:9097-9106`、`setup.py:9211`。コメントは「in preview, not offered in setup or --help; the options still work」)。索引は parser の受理を基準にしているので、これらも予定リンクとして列挙します。
 
 ### `setup.py` / `setup.sh` / `START-HERE.bat` / update wrappers
 
@@ -1523,12 +1548,18 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 - [`--dsv41-package`](source-setup/root/--dsv41-package.md)
 - [`--experimental-speed-projection`](source-setup/root/--experimental-speed-projection.md)
 - [`--family`](source-setup/root/--family.md)
+- [`--feed`](source-setup/root/--feed.md)
 - [`--gguf-dir`](source-setup/root/--gguf-dir.md)
 - [`--gpu`](source-setup/root/--gpu.md)
 - [`--gpu-roles`](source-setup/root/--gpu-roles.md)
 - [`--gpus`](source-setup/root/--gpus.md)
 - [`--help`（alias: `-h`）](source-setup/root/--help.md)
 - [`--host`](source-setup/root/--host.md)
+- [`--image-backend`](source-setup/root/--image-backend.md)
+- [`--image-gpu-policy`](source-setup/root/--image-gpu-policy.md)
+- [`--image-native`](source-setup/root/--image-native.md)
+- [`--image-quant`](source-setup/root/--image-quant.md)
+- [`--images`](source-setup/root/--images.md)
 - [`--inspect`](source-setup/root/--inspect.md)
 - [`--kv`](source-setup/root/--kv.md)
 - [`--kv-streaming`](source-setup/root/--kv-streaming.md)
@@ -1544,6 +1575,7 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 - [`--parallel`](source-setup/root/--parallel.md)
 - [`--port`](source-setup/root/--port.md)
 - [`--prebuilt`](source-setup/root/--prebuilt.md)
+- [`--replica-profile`](source-setup/root/--replica-profile.md)
 - [`--replicas`](source-setup/root/--replicas.md)
 - [`--resident-budget-gib`](source-setup/root/--resident-budget-gib.md)
 - [`--rollback-engine`](source-setup/root/--rollback-engine.md)
@@ -1551,12 +1583,42 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 - [`--rope-scaling`](source-setup/root/--rope-scaling.md)
 - [`--set-default-data-dir`](source-setup/root/--set-default-data-dir.md)
 - [`--setup`](source-setup/root/--setup.md)
+- [`--skip-build`](source-setup/root/--skip-build.md)
 - [`--source`](source-setup/root/--source.md)
 - [`--update`](source-setup/root/--update.md)
 - [`--vision`](source-setup/root/--vision.md)
 - [`--vision-tokens`](source-setup/root/--vision-tokens.md)
 - [`--vram-reserve-mib`](source-setup/root/--vram-reserve-mib.md)
 - [`--yes`](source-setup/root/--yes.md)
+
+### `metal/setup_mac.py` (mac; setup.py が Apple Silicon で委譲)
+
+- [コマンド概要](source-setup/mac/README.md)
+
+`setup.py` は `main()` の冒頭で `sys.platform == "darwin"` かつ `CONTROL`（環境変数 `STRATA_CONTROL_INSTALL=1`、`setup.py:82`）でないことを調べて、`metal/setup_mac.py` に全 argv を渡して終了します (`setup.py:9068-9069`、`mac_setup` は `setup.py:7703`)。受け側は独自の parser を持つため `mac/` scope に分けます。この parser は `parse_known_args` で、余った引数は `not used on a Mac: ...` と警告して続行します (`metal/setup_mac.py:356-358`)。`--backend sycl` で呼ばれる `sycl/setup_intel.py` には parser がなく、`--backend hip` などを補って `setup.py` の `main()` を再実行するだけです (`sycl/setup_intel.py:553-560` の argv 組み替えと `S.main()` 呼び出し)。
+
+- [`--api-key`](source-setup/mac/--api-key.md)
+- [`--build`](source-setup/mac/--build.md)
+- [`--check`](source-setup/mac/--check.md)
+- [`--context`](source-setup/mac/--context.md)
+- [`--data-dir`](source-setup/mac/--data-dir.md)
+- [`--draft-vocab`](source-setup/mac/--draft-vocab.md)
+- [`--family`](source-setup/mac/--family.md)
+- [`--gguf-dir`](source-setup/mac/--gguf-dir.md)
+- [`--help`（alias: `-h`）](source-setup/mac/--help.md)
+- [`--host`](source-setup/mac/--host.md)
+- [`--model`](source-setup/mac/--model.md)
+- [`--models-dir`](source-setup/mac/--models-dir.md)
+- [`--move-data`](source-setup/mac/--move-data.md)
+- [`--no-browser`](source-setup/mac/--no-browser.md)
+- [`--no-start`](source-setup/mac/--no-start.md)
+- [`--port`](source-setup/mac/--port.md)
+- [`--set-default-data-dir`](source-setup/mac/--set-default-data-dir.md)
+- [`--setup`](source-setup/mac/--setup.md)
+- [`--source`](source-setup/mac/--source.md)
+- [`--update`](source-setup/mac/--update.md)
+- [`--vision`](source-setup/mac/--vision.md)
+- [`--yes`](source-setup/mac/--yes.md)
 
 ## `quick-benchmark`
 
@@ -1588,7 +1650,7 @@ Release から配布される `install.sh`（POSIX）と `install.ps1`（Windows
 
 ## 更新時の確認
 
-この索引を更新するときは、`strata_cli/cli.py` および各登録 parser、`setup.py`、`tools/strata_bench.py`、推論エンジンの argv parser を現行 checkout で再確認してください。コマンド/オプションの追加・削除・alias 変更を反映し、`tool-id + command-path + option identity` ごとのパスを維持します。ラッパーが parser へ委譲するだけなら重複登録せず、CMake 開発用 binary は製品 CLI と区別します。
+この索引を更新するときは、`strata_cli/cli.py` と各 module の登録 parser（`strata_cli/launch/cmd.py`、`strata_cli/update_cmd.py`、`strata_cli/tune_commands.py`、`strata_cli/drafting_cmd.py`、`strata_cli/monitor_commands.py`）、`setup.py`、Apple Silicon で委譲される `metal/setup_mac.py`、`tools/strata_bench.py`、推論エンジン `src/program/generate.cpp` と `src/qwen35/q36_engine.cu`・`src/dsv41/ds4_main.cpp`、`tools/vision/strata_vision.cpp`、CMake 生成の単体 CLI の argv parser を現行 checkout で再確認してください。コマンド/オプションの追加・削除・alias 変更を反映し、`tool-id + command-path + option identity` ごとのパスを維持します。ラッパーが parser へ委譲するだけなら重複登録せず、委譲先が別の parser を持つ場合は別 scope に分けます。CMake 開発用 binary は製品 CLI と区別します。
 
 ## 更新手順と次回の調査指示
 
@@ -1598,11 +1660,11 @@ Strata のソースコードが更新されたら、`/home/sasasin/src/github.co
 
 1. **対象 revision と作業状態を記録する。** Strata リポジトリで `git rev-parse HEAD`、`git status --short --branch`、必要に応じて `git log -1 --format='%h %cs %s'` を確認します。未コミット変更があれば調査対象に含め、既存の変更を上書きしないでください。索引に完全な commit SHA と調査日を記録します。
 2. **ツール一覧を照合する。** [`000_cli_tools.md`](000_cli_tools.md) と Strata checkout のルート、`bin/`、`packaging/`、`tools/`、`strata_cli/`、`src/`、各 `CMakeLists.txt` を見直します。CLI のソース、委譲 wrapper、ビルド生成 executable、Release installer と配布対象を区別し、索引に追加・削除すべき tool-id を決めます。
-3. **コマンド階層を列挙する。** Terminal CLI は `strata_cli/cli.py` の root parser と、そこから登録される各 module の parser 定義をたどります。`launch` / `connect`、update、drafting 等、別 module で登録される parser も含めます。module 内で parser を作った後、`cli.py` 側で共通 option を追加する処理も確認してください。たとえば `--json` / `--quiet` は `update_parsers` を含む one-shot parser 群へ後から追加されます。安全に実行でき、調査 checkout と同じ revision の CLI がある場合は `--help` を補助に使えますが、最終的に登録された parser と実際の処理をソースで照合します。
-4. **各 parser のオプションと alias を列挙する。** `argparse` 等の宣言、手書き C/C++ の `argv` 解析、早期処理される `--version` / `--families` のようなフラグを確認します。推論エンジンは通常の `src/program/generate.cpp` の parser に加え、Qwen3.6 などの条件付き parser、独立 executable、build 条件を確認します。`setup.py` と `tools/strata_bench.py` はそれぞれの parser を調べ、`setup.sh` / `.bat`、update wrapper、quick-benchmark wrapper が引数を委譲するだけなら重複登録しません。
-5. **対象境界を再判定する。** `000_cli_tools.md` に挙がる単体診断 CLI は個別の tool-id として扱います。CMake の `*_test`、`*_parity`、`*_bench`、個別 probe は製品 CLI と混同せず、利用者向け・開発用・テスト用の区分と既存一覧の方針に沿って対象を判断します。Release installer が CLI 引数を持たない場合は、オプションリンクを作らずその事実を記載します。ネットワーク上の Release 実体を確認できない場合は、ソースに基づく予想を実配布物として断定しないでください。
+3. **コマンド階層を列挙する。** Terminal CLI は `strata_cli/cli.py` の root parser と、そこから登録される各 module の parser 定義をたどります。`launch` / `connect`、update、drafting、tune/presets、status/monitor/logs/connection 等、別 module で登録される parser も含めます。module 内で parser を作った後、`cli.py` 側で共通 option を追加する処理も確認してください。たとえば `--json` / `--quiet` は `update_parsers` を含む one-shot parser 群へ後から追加されます (`strata_cli/cli.py:508-514`)。安全に実行でき、調査 checkout と同じ revision の CLI がある場合は `--help` を補助に使えますが、最終的に登録された parser と実際の処理をソースで照合します。`strata_cli.cli.parser()` を呼んで `_actions` と `_SubParsersAction.choices` を再帰 walk すると、後付け option を含む現行 grammar を機械抽出できるので、索引との diff 取りに有効です。
+4. **各 parser のオプションと alias を列挙する。** `argparse` 等の宣言、手書き C/C++ の `argv` 解析、早期処理される `--version` / `-V` / `--families` / `--gpu` のようなフラグを確認します。Python は `ast` で `add_argument` を拾うと option 文字列と行番号を一括で得られ、`help=argparse.SUPPRESS` で `--help` に出ない option も見落としません。C/C++ は `a == "--xxx"` と `std::strcmp(argv[i], "...")` の文字列を集め、`|| a == "-h"` のような alias 表現も拾います（`strata-plan`、`strata-load`、`strata-device`、`strata-dsv41` の `--help` には `-h` alias があります）。推論エンジンは通常の `src/program/generate.cpp` の parser に加え、Qwen3.6 の条件付き parser (`src/qwen35/q36_engine.cu`)、独立 executable (`src/dsv41/ds4_main.cpp`)、build 条件を確認します。`setup.py` と `tools/strata_bench.py` はそれぞれの parser を調べ、`setup.sh` / `.bat`、update wrapper、quick-benchmark wrapper が引数を委譲するだけなら重複登録しませんが、委譲先が独自の parser を持つ場合は別 scope にして列挙します。
+5. **対象境界を再判定する。** `000_cli_tools.md` に挙がる単体診断 CLI は個別の tool-id として扱います。CMake の `*_test`、`*_parity`、`*_bench`、個別 probe・harness は製品 CLI と混同せず、利用者向け・開発用・テスト用の区分と既存一覧の方針に沿って対象を判断します。engine package に同梱される独立実行ファイル（`strata-vision` 系など）は、build target・parser・利用経路を確認して別の tool-id として索引に追加します。同じ名前の引数でもその parser が受理しない場合は項目に含めず、注記で受理範囲を書きます（例: `--model` は `strata` 通常 parser では unknown argument）。parser 内で別 harness へ引数を渡す special arg は、対象外とする理由と所在を注記に書き、option 一覧には混ぜません。Release installer が CLI 引数を持たない場合は、オプションリンクを作らずその事実を記載します。ネットワーク上の Release 実体を確認できない場合は、ソースに基づく予想を実配布物として断定せず、[`000_cli_tools.md`](000_cli_tools.md) で実測した asset 一覧は参照として日付付きで示します。
 6. **一意な予定パスとコマンド概要を索引化する。** 各コマンド階層について `docs/cli/<tool-id>/<command-path>/README.md` の「コマンド概要」リンクを一つ置き、その節の先頭にします。root command は `root/` を使い、条件付きで parser や意味が分かれる場合は `001_investigation.md` の規約に沿って scope を分離します。各 option は `docs/cli/<tool-id>/<command-path>/<option-name>.md` にリンクします。同一 parser action の alias は正規名の一文書にまとめ、別の挙動・parser を同じリンクに押し込めません。リンク先ファイルが未作成でも、索引には予定リンクとして残します。
-7. **節内の順序と網羅性を整える。** コマンド見出しの順番は維持し、各コマンド節では「コマンド概要」を先頭、その後のオプションを表示される正規名の ASCII コード順に並べます。全てのコマンド見出しに概要リンクが一つあること、コマンドごとの parser の全 option が漏れなく列挙されること、同じ tool-id / command path / option identity のリンクが重複しないことを確認します。
+7. **節内の順序と網羅性を整える。** コマンド見出しの順番は維持し、各コマンド節では「コマンド概要」を先頭、その後のオプションを表示される正規名の ASCII コード順に並べます。ASCII 順では接頭辞が短い名前の次文字が並びを決めるため、`--replica-profile` は `--replicas` より前、`--image-*` は `--images` より前、`--set-default-data-dir` は `--setup` より前になります。索引の option 行を正規表現で抽出し、parser 側から機械抽出した集合と突き合わせて、追加・削除・改名・alias 表記の漏れと重複を確認します。全てのコマンド見出しに概要リンクが一つあること、コマンドごとの parser の全 option が漏れなく列挙されること、同じ tool-id / command path / option identity のリンクが重複しないことを確認します。
 8. **根拠と索引の境界を更新する。** 冒頭の commit hash と調査日、ツール説明、対象境界、更新手順を今回実際に調べた checkout に合わせます。オプションの値や効果を個別文書に記載するのは別作業です。この索引更新だけを依頼された場合は、その文書を作成したことにせず、予定リンクとして列挙します。ソース変更、build、GPU 実行、性能測定、テストは依頼がない限り行いません。
 
 ### 次回の依頼文
