@@ -51,8 +51,18 @@ codex exec --skip-git-repo-check --sandbox 'workspace-write' '`$HOME/src/github.
 増えた環境変数の md の作成。
 
 ```bash
-seq 100 | xargs -P5 -L1 -I{} time codex exec --skip-git-repo-check --sandbox 'workspace-write' '調査依頼です。調査対象ソースコードは `$HOME/src/github.com/Niko1221/Strata` です。 `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/000_envvers.md` から、 `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/` に調査結果ファイルが存在しない環境変数を、任意に1個を選んで、 `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/001_investigation.md` の指示に従って、 `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/` に調査結果ファイルを作成してください。環境変数1個ずつ調べてください。'
+uv run ./create-envvars-docs.py -p 5 -l 100
 ```
+
+`create-envvars-docs.py` は `000_envvers.md` の一覧のなかで `docs/envvars/${環境変数名}.md` が存在しない変数を先に確定してから、1 変数 1 セッションで codex を起動する。各 codex に「存在しないものを勝手に選ばせる」 `seq | xargs` 運用と違い、並列に走らせても同じ変数を重複調査せず、無駄なセッション（全件作成済みのときに何も作らない実行）も発生しない。
+
+- `-l`, `--doc-limit N` … 今回作成する件数の上限 (`0` で全件、既定 1)
+- `-p`, `--parallel N` … 同時に動かす codex の数
+- `--dry-run` … 対象を一覧するだけで codex は実行しない
+- `--include-tried` … 調べても文書ができなかった変数を再調査候補に加える
+- `--reset-state` … 試行記録を消して組み直す
+
+Strata が実際に読まない候補（テスト用 helper のログパス、外部ライブラリや driver だけの名前など）は、codex が `001_investigation.md` の手順どおり「索引との食い違い」として報告し、文書を作らない。そういう変数を毎回選び直さないよう、試行結果を `.create-envvars-docs.state.json` に記録して、既定では未調査の変数だけを選ぶ。最後のサマリに出る `残りの未作成 N 件（未調査 M 件 / 試行済み K 件）` の `M` が 0 になったら、その一覧に対しては調査は飽和している。試行記録は `.gitignore` してあるので、履歴をコミットしたければ外す。
 
 変更のあった環境変数の md の更新。
 
