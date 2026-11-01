@@ -1,5 +1,7 @@
 # `strata ops history --json`
 
+調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+
 `strata ops history` の結果を機械可読な JSON で標準出力へ出すフラグです。recipe の履歴を表示するだけで、履歴や recipe は変更しません。
 
 ## 使い方

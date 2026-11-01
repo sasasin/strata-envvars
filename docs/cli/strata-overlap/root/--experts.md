@@ -1,5 +1,7 @@
 # `strata-overlap --experts`
 
+調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+
 - 対象: CMake で生成される診断用 CLI `strata-overlap` のトップレベル option
 - 調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（調査日: 2026-10-25）
 - parser: `src/core/overlap_main.cpp`

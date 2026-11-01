@@ -1,4 +1,4 @@
-# STRATA_METAL_LAZY_FOLD
+# `STRATA_METAL_LAZY_FOLD`
 
 調査対象: Strata main の HEAD 296b59d2f73c8f04a805df29c2fa97655adace78（2026-10-14 時点）。対象は Strata 所有ソース。外部ライブラリや Metal driver の動作は含めない。
 

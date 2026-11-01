@@ -1,5 +1,7 @@
 # `setup.py` の `--cuda`
 
+調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+
 - 対象: `source-setup`（`setup.py`。`setup.sh`、`START-HERE.bat` などの委譲 wrapper も同じ引数を渡す）
 - 調査対象 Strata revision: `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`
 - 調査日: 2026-10-25

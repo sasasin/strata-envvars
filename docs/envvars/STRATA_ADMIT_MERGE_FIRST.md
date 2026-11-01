@@ -1,3 +1,5 @@
+# `STRATA_ADMIT_MERGE_FIRST`
+
 調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
 サーバーのバッチ入場（`BGEN` / `BGENI`）で、最後の prompt 部分の末尾と、その入場で生成する最初の token を一つの verify window にまとめる opt-in です。通常は prompt の最後の token までを読み終えた後に、最初の生成 window を別に実行します。まとめると window の処理を一度に行えます。
 

@@ -1,4 +1,4 @@
-# STRATA_TOPK_OLD
+# `STRATA_TOPK_OLD`
 
 調査対象: Strata main の HEAD a0116b2782a5b82622358c04a06496485d12b2d6（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
 

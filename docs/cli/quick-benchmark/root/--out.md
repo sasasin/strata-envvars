@@ -1,5 +1,7 @@
 # `quick-benchmark` の `--out`
 
+調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+
 - 調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`
 - 調査日: 2026-10-25
 - スコープ: `quick-benchmark`（`bench.sh` / `BENCH.bat` が委譲する `tools/strata_bench.py` の root parser）

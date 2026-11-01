@@ -1,5 +1,7 @@
 # `strata monitor --connection`
 
+調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+
 `--connection NAME` は、`strata connection create` で保存した接続設定を名前で選び、読み取り専用の Terminal Monitor の接続先として使います。接続レコードから URL、reverse-proxy prefix、認証情報を格納した環境変数名を読み込みます。認証情報そのものは接続ファイルに保存されません（`strata_cli/monitor_commands.py:20-25`、`strata_cli/connections.py:97-114, 273-303`）。
 
 ## 使い方
