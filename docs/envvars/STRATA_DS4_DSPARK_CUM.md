@@ -1,46 +1,51 @@
 # `STRATA_DS4_DSPARK_CUM`
 
-調査対象: Strata `main` の HEAD `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
 
 ## 役割
 
-`strata-dsv41` の DSpark speculative decoding で、検証対象に含める drafts の累積信頼度の下限を指定します。draft ごとの信頼度を順に掛けた値がこの下限以上である間だけ、draft を検証対象に残します。後続 draft まで保持される確率が低い長い draft 列をまとめて検証しないための追加条件です。既定値は `0` なので、この累積条件は通常の有限・非負の信頼度積を制限しません。draft ごとの個別下限 `dspark_conf` は別の条件として適用されます。
+DeepSeek V4.1 (`strata-dsv41`) の DSpark speculative decoding で、draft token の confidence の累積積に下限を設けます。各 draft の confidence が `--dspark-conf` 由来の個別下限以上であることに加え、先頭からその draft までの confidence の積がこの値以上である間だけ draft を trunk の検証に回します。累積下限を `0` にすると、この累積条件は通常の confidence が非負である範囲では draft 数を減らさず、個別の confidence 下限だけが残ります。
 
-この変数の読み取りは Strata 同梱の DS4 専用エンジン `src/dsv41/ds4_main.cpp` に1箇所あります。通常の `strata` エンジンで使われる環境変数ではありません。
+この環境変数を読む実装は `src/dsv41/ds4_main.cpp` にあります。DeepSeek V4.1 エンジンは `STRATA_BUILD_DSV41` が有効なときだけ `strata-dsv41` としてビルドされ、この CMake option は既定で OFF です（`CMakeLists.txt:906-920`）。
 
 ## 値と判定
 
-| 環境変数の状態 | `dspark_cum_default()` の結果 |
-|---|---:|
-| 未設定 | `0.0f` |
-| 設定あり（空文字を含む） | `std::atof` で変換した値を `float` にした値 |
+環境変数は `std::getenv` の結果を `std::atof` に渡し、`float` に変換します。設定値の文字列全体の検証、範囲 clamp、無効値のエラー処理はありません。
 
-文字列全体の妥当性検査や値域チェックはありません。`std::atof` の変換規則に従い、数値として読めない先頭（空文字を含む）は `0` になり、数値の後ろにある文字は変換を妨げません。負値、1を超える値、NaN、無限大もコードでは拒否・clamp されません。
+| 環境変数 | 判定結果 |
+|---|---|
+| 未設定 | `0.5`（RDNA4 の gfx1200 / gfx1201）または `0`（それ以外）。ただし `DS4_DEFAULTS` が旧既定値を選ぶ場合は `0`。 |
+| 空文字 | 設定済みとして扱い、`atof("")` から `0`。ハードウェア既定値より優先。 |
+| 数値文字列 | 先頭の数値部分を `atof` で変換。前後の空白や符号を受け付け、数値の後ろに文字があってもその部分で変換を止める。 |
+| 数値に変換できない文字列 | `atof` の結果 `0`。警告や fallback はない。 |
+| 負数 | そのまま使用。累積積は通常非負なので累積条件を実質通過させる。 |
+| 0 より大きい値 | そのまま使用し、累積積が値を下回った draft 以降を検証対象から外す。1 を超える値は通常の confidence 積では通過できず、draft が採用されない。 |
 
-round 中、引数 `cum_min` が `< 0` の場合だけ環境変数由来の既定値に置き換えます。したがって環境変数が負値でも、その負値自体は置き換え後に使われます。要求単位の値も `< 0` ならエンジン既定値を使う sentinel です。`-0.0` は `< 0` ではないため、要求値としては明示値扱いになります。
-
-draft を残すループ条件は `cum *= conf[i]` の後に `cum >= cum_min` を評価します。これは draft の個別信頼度 `conf[i] >= conf_min`、draft 数、残り出力枠の条件とすべて同時に満たす必要があります。通常の信頼度が `[0,1]` の場合、正の下限は後続 draft を絞り、`0` は積が0になった後の draft も許し、1を超える下限は有限の積では draft を残しません。負の下限は積が下限未満になりにくくします。NaN は比較を常に false にし、draft を1個も残さない結果になります。
+`nan` など比較不能な値も拒否されません。累積積との `>=` 比較が成立せず、通常は draft が 1 個も残らず plain step に進みます。極端な値や `atof` の範囲外入力を個別に処理するコードはありません。根拠: `src/dsv41/ds4_main.cpp:176-180,239-243`。
 
 ## 有効になる条件
 
-- DSpark draft の実行が有効で、decode round に draft が試行される必要があります。通常の CLI decode では `--dspark off` で draft が無効です。serve mode では要求の `spec=0`、またはエンジン起動時の DSpark 無効化によって draft 試行が止まります。
-- モデルが `draft_block() > 0` を返し、round の残り出力枠 `room` が1より大きい必要があります。
-- draft ごとの `dspark_conf` 条件も独立して適用されます。累積値が下限を満たさない場合、`m.verify()` は呼ばれず通常の `m.step()` と sampling に進みます。
-- serve mode では各 `GEN` / `GENI` 要求に `dspark_cum=F` または別名 `spec_cum=F` を渡せます。非負の値はその要求の下限になり、負値は環境変数で決めるエンジン既定値を使います。要求値は `std::strtof` で読み、末尾文字や変換エラーの検査はありません。
-- 通常のコマンドライン decode と `spec_eval` は round の既定引数 `cum_min=-1.0f` を使うため、環境変数の値が使われます。serve mode は要求の `r.cum` を渡し、値が負の場合に環境既定値へフォールバックします。
+- `strata-dsv41` をビルドして実行している必要があります。`STRATA_BUILD_DSV41` が OFF のビルドにはこの機能の実行ファイルが含まれません（`CMakeLists.txt:906-920`）。
+- 累積 cut の既定値 `0.5` は、HIP ビルドでエンジンが使うすべての GPU が gfx1200 または gfx1201 の場合だけです。CUDA ビルドや Strix Halo (gfx1151)、その他の AMD GPU では既定値は `0` です。明示設定した `STRATA_DS4_DSPARK_CUM` はこの既定値を上書きします。GPU 判定は `Model::gpus_are_gfx12()` から `rdna4()` に至り、HIP build macro の下で全 device の `gcnArchName` を確認します（`src/dsv41/ds4_model.cu:932-949,10749-10750`）。
+- `DS4_DEFAULTS=026`, `DS4_DEFAULTS=0.2.6`, または `DS4_DEFAULTS=v0.2.6` は、環境変数が未設定の場合の累積 cut を `0` にします。比較は文字列全体で行われ、大文字小文字や余分な文字は一致しません。明示設定された `STRATA_DS4_DSPARK_CUM` が優先されます（`src/dsv41/ds4_experts_rule.hpp:16-28,197-201`）。
+- `round()` が speculative path に入り、`spec` が真、`room > 1`、`m.draft_block() > 0` のときだけ cut が draft 選別に使われます。DSpark が無効、draft block がない、出力余地が 1 以下などで plain step になる経路では、この値は選別に影響しません（`src/dsv41/ds4_main.cpp:218-243,266-272`）。
+- 個別 confidence 下限 (`--dspark-conf` または serve 起動時の同等設定) が先に適用されます。累積 cut は、各 draft の confidence がその下限以上であることに加わる条件です（`src/dsv41/ds4_main.cpp:241-243,1332-1343`）。
 
 ## 実行時の詳細
 
-環境変数の値は `dspark_cum_default()` 内の関数ローカル `static const float` でキャッシュされます。最初に `cum_min < 0` の round がこの関数を呼んだ時点で読み取られ、その後プロセス内で環境を書き換えても再評価されません。非負の要求値だけで処理している間は、この関数がまだ呼ばれないことがあります。
+`dspark_cum_default()` の最初の呼び出しで `std::getenv("STRATA_DS4_DSPARK_CUM")` の返り値ポインターを `static` に保存します。通常の CLI decode では speculative round の最初の draft 生成が成功した後、累積値が未指定 (`cum_min < 0`) の場合にこの関数を呼びます。その後の round では保存した環境値を再利用し、プロセスの環境を後から変えても `getenv` を再実行しません。`std::atof` による変換自体は同関数の呼び出しごとに行われます（`src/dsv41/ds4_main.cpp:176-180,218-243,1525-1532`）。
 
-draft を得た後、`cum` を `1.0f` で初期化し、各 draft の confidence を順に掛けながら keep 数を増やします。最初の不成立でループを止め、keep 数が正ならその範囲だけ `m.verify()` に渡します。keep 数が0なら通常の `m.step()` を実行して次 token を sampling します。環境変数自体によるログ出力はありません。
+`strata-dsv41 --serve` の `GEN` / `GENI` リクエストでは、`dspark_cum=F` と別名 `spec_cum=F` を指定できます。値は `std::strtof` で変換されます。指定が `0` 以上ならそのリクエストの累積下限になり、環境変数より優先されます。指定値が負なら `cum_min < 0` の既定値扱いとなり、環境変数（なければ GPU と `DS4_DEFAULTS` に基づく既定値）に置き換わります。CLI に累積 cut 専用の option はなく、`--dspark-conf` は個別 confidence 下限を指定します（`src/dsv41/ds4_main.cpp:276-288,353-385,388-394,989-994,1332-1343`）。
 
-ソースコメントには、既定はオフ、H100 / owner PC のコード用途では速くならなかったこと、Project Maya の Radeon 8065S では `0.5` で同一 token のまま decode が +6.5% だったとの記載があります。これは実装コメントにある報告であり、この調査で測定条件や性能を再検証したものではありません。`docs/DETAILS.md` と `docs/DEEPSEEK41.md` にはこの変数の追加説明を確認できませんでした。
+選別では `cum` を `1.0` から始め、各 draft の confidence を順に掛けます。draft の個別下限、累積下限、`room - 1`、`--dspark-depth`、draft 数のいずれかに達したところで、それ以降を検証に送りません。1 個以上残れば `m.verify()` を呼び、0 個なら通常の `m.step()` と trunk の sampling に進みます（`src/dsv41/ds4_main.cpp:239-272`）。この環境変数専用のログ、警告、無効値エラーはありません。通常の実行では speculative decoding の統計として `dspark: ... drafts offered, ... accepted` と per-position 集計が stderr に出ます（`src/dsv41/ds4_main.cpp:1546-1553`）。
 
 ## 根拠
 
-- `src/dsv41/ds4_main.cpp:152-162`: 変数の役割、既定値、`std::atof`、関数ローカル static cache。
-- `src/dsv41/ds4_main.cpp:167-203`: round の既定 sentinel、累積 confidence の計算、verify / plain step の分岐。
-- `src/dsv41/ds4_main.cpp:206-217,283-315`: 要求の `cum` 既定値と `dspark_cum` / `spec_cum` の parse。
-- `src/dsv41/ds4_main.cpp:892-908,1192-1230,1296-1301,1397-1403`: serve、CLI、spec_eval から round への適用範囲と DSpark の有効化。
-- `docs/DEEPSEEK41.md:4,67-68,102-103`: `strata-dsv41` が DS4 用の別エンジンとして扱われること。
+- `src/dsv41/ds4_main.cpp:169-180` — cumulative cut の説明、環境値の読み取りと既定値 helper 呼び出し。
+- `src/dsv41/ds4_experts_rule.hpp:16-28,197-201` — `DS4_DEFAULTS` と gfx12 / 旧既定値のルール。
+- `src/dsv41/ds4_main.cpp:218-272` — speculative round の条件、confidence の選別、検証または plain step。
+- `src/dsv41/ds4_main.cpp:276-288,353-385,388-394,989-994` — serve request の値と alias、request ごとの優先順位。
+- `src/dsv41/ds4_model.cu:932-949,10749-10750` — HIP GPU 世代判定と `Model` accessor。
+- `CMakeLists.txt:906-920` — `strata-dsv41` の build option と対象ソース。
+
+`docs/DETAILS.md` にはこの環境変数の挙動や累積 cut の測定説明は見つかりませんでした。性能値は本書では主張しません。
