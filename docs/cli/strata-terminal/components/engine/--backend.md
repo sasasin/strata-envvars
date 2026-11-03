@@ -1,6 +1,6 @@
 # `strata components engine --backend`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。
+調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。Strata checkout は `main` = `origin/main`、作業ツリー clean。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,52 +8,58 @@
 | コマンド | `strata components engine` |
 | オプション | `--backend` |
 | 別名 | なし |
-| 値 | backend family 名を受け取る文字列。ソースで定義された値は `cuda`、`hip`、`sycl`、`metal`、`cpu` |
+| 値 | backend family 名の文字列。parser に `choices` や型変換はなく、既定値は `None` |
 
 ## 役割
 
-ローカルの engine component から、この PC で使う backend family を指定して候補を調べます。コマンドは engine を起動せず、ダウンロードもしません。主な用途は自動検出と異なる family の候補を確認することです。
+ローカル component folder にある engine package のうち、指定した backend を使う場合にこの PC で起動可能なものを照合し、選ばれる engine を表示します。このコマンドは起動可能性の確認だけを行い、ダウンロードやファイル変更はしません（`strata_cli/cli.py:132-138,2015-2042`）。
 
 ## 使い方
 
 ```sh
 strata components engine --backend cuda
+strata components engine --backend hip --components-dir ./strata-components --full --output json
 ```
 
-この例は `cuda` backend の engine をローカル component フォルダーから探します。コマンド名と `--backend` の parser 定義は `strata_cli/cli.py:132-138` にあります。
+`--backend` を省略すると PC の backend を検出します。`--components-dir` は調べる component folder、`--full` は全ファイルの hash 検査、`--output` は `human`（既定）または `json` を選びます（`strata_cli/cli.py:132-138`）。
 
 ## 値と既定値
 
-- 引数は `default=None` の文字列で、parser に `choices` や CLI 側の型変換はありません（`strata_cli/cli.py:134`）。実装上の backend family は `cuda`、`hip`、`sycl`、`metal`、`cpu` です。OS ごとの対応は `strata_control/targets.py:23-29` に定義されています。
-- 省略時は resolver が `detect_backend()` を呼びます。`STRATA_ENGINE_BACKEND` が設定されていれば小文字化した値が優先され、有効値以外は `ComponentProblem` になります。未設定なら macOS は `metal`、それ以外は OS/adapter 情報や既設 GPU 検出ツール等を使って判定し、backend を検出できなければ `cpu` を選びます（`strata_control/engine_component.py:439-482, 868-874`）。
-- CLI の明示値自体は argparse で検証されません。未知値やその OS で利用できない値は resolver に渡され、対応する installed package がなければ usable engine がない結果になります。OS と family のサポート表は `strata_control/targets.py:23-29, 42-51` にあります。
-- 重複指定時の専用処理はありません。argparse の通常の単一値引数として最後に解析された値が使われます。空文字列を明示すると `None` ではない値として resolver に渡されるため、自動検出の代わりにはなりません。
+- parser は値を必須引数として受け取りますが、backend 名の choices、case 正規化、alias 変換は宣言していません（`strata_cli/cli.py:134`）。
+- `None`（未指定）なら `engine_component.resolve()` が `detect_backend()` の結果を使います。検出できなければ CPU backend を選びます（`strata_control/engine_component.py:1021-1027`）。
+- backend matrix にある family は `metal`, `cuda`, `hip`, `sycl`, `cpu` です。matrix 上の対象 platform は `strata_control/targets.py:20-29` に定義されています。`nvidia` / `amd` / `intel` / `arc` の alias 変換は `launch --backend` の設定保存用 helper にあり、この `components engine` 経路では呼ばれません（`strata_control/engine_component.py:474-482`, `strata_cli/cli.py:2021`）。
+- `--backend ''` のような空文字列も parser では拒否されません。空文字列は `None` ではないため検出に切り替わらず、空 family として package に照合され、通常は利用可能な engine が見つからない結果になります（`strata_cli/cli.py:134,2021`; `strata_control/engine_component.py:1021-1027,1043-1045`）。
+- 未知の family も parser では受理されますが、matrix にない package family は照合時に利用不可になります（`strata_control/targets.py:44-48`; `strata_control/engine_component.py:1039-1045`）。
 
 ## 実行時の動作
 
-CLI は `a.backend` を `engine_component.status(..., backend=a.backend, full=a.full)` に渡します（`strata_cli/cli.py:2017-2020`）。status は component folder を走査し、明示 backend がある場合はそれを resolver に渡して package backend と照合します。候補が複数ある場合は usable なもののうち pin が有効なら pin を優先し、そうでなければ version 等で選びます（`strata_control/engine_component.py:969-988, 881-894, 937-944`）。このオプションは候補選択の指定であり、別 backend 用の package を実行可能にするものではありません。
-
-未指定時の `STRATA_ENGINE_BACKEND` は検出値の override になります。一方、CLI に backend を明示した場合はその値が resolver に渡るため、検出値より CLI 指定が選択に使われます（`strata_control/engine_component.py:439-447, 868-874, 983`）。status は表示用 backend 情報を作る過程で検出も呼びますが、CLI 値がある場合は報告上の backend をその値にします（同 `engine_component.py:972-984`）。
-
-通常の status 検証は entrypoint の hash を確認し、`strata components engine --full` を併用した場合に全ファイルを hash します。検証モードの選択は `--full` 側の指定です（`strata_cli/cli.py:137, 2020`; `strata_control/engine_component.py:859-862, 911-918`）。
+1. `--components-dir` があればその path を使い、省略時は `STRATA_COMPONENTS_DIR` または OS ごとの per-user component folder を使います（`strata_cli/cli.py:135-136,2019`; `strata_control/engine_component.py:176-190`）。
+2. `status()` は `<components>/engine` を走査して manifest を読み、platform と backend、runtime、GPU architecture、NVIDIA driver 条件などを照合します。既定の quick check では hash 対象が entrypoint だけで、`--full` を指定すると全 package file を検証します。署名と integrity の検証に失敗した package は選択対象になりません（`strata_control/engine_component.py:933-946,1012-1071`; `strata_cli/cli.py:137,2021`）。
+3. 指定 backend が適用されるのは package family の選別です。OS が matrix で未対応の組み合わせは拒否されます。複数の package が使えるとき、利用可能な pin があればそれを優先し、そうでなければ version、driver 要件、AMD / CUDA architecture の順に比較して一つを選びます（`strata_control/targets.py:20-29`; `strata_control/engine_component.py:1035-1045,1090-1097`）。
+4. `--backend` 自体は設定保存や永続化をしません。`status()` は読み取り用の report を組み立て、cached update notice もローカル state から読みます（`strata_control/engine_component.py:1122-1142,202-211`）。
 
 ## 適用条件と副作用
 
-`--backend` は local component の照合条件として使われます。`STRATA_COMPONENTS_DIR` があればそこを使い、なければユーザー領域の既定 component folder を使います（`strata_cli/cli.py:135-136`; `strata_control/engine_component.py:176-190`）。コマンドは読み取り専用で、engine を起動せず、download やファイル変更を行いません。GPU 検出経路では既設の検出ツールを最大8秒で読み取り専用実行する場合があります（`strata_control/engine_component.py:439-482, 861-867`）。
+- 指定した family がこの PC の実 GPU と一致する必要はありません。指定値は照合 family として使われ、backend が違う、platform 非対応、GPU architecture が合わない、最低 driver/runtime を満たさない package は利用不可になります（`strata_control/engine_component.py:1035-1063`; `strata_control/targets.py:44-50`）。
+- family 名に variant を付ける構文（例 `hip-rdna2`）をこのコマンドは分解しません。分解処理 `split_backend()` は別の更新・launch 経路で使われていますが、`components engine` は `status(..., backend=a.backend)` にそのまま渡します（`strata_control/engine_component.py:465-471`; `strata_cli/cli.py:2021`）。
+- `--full` の有無にかかわらず、backend 検出時には環境変数の選択、保存済み選択、platform 判定、OS の GPU 情報や既存の検出ツールが参照され得ます。検出は read-only とされ、既存の `nvidia-smi` / `rocminfo` / `hipInfo` / `sycl-ls` を最大 8 秒で呼び出す分岐があります（`strata_control/engine_component.py:514-560`）。
+- コマンドは engine を起動せず、ネットワークにも接続せず、何も変更しない旨を human 出力にも明記します（`strata_cli/cli.py:2015-2042`）。
 
 ## 出力とエラー
 
-- 成功時は終了コード `0`。human 出力では component folder、PC/backend、installed package、選択された engine を表示します。JSON 出力は `--output json` で、`schema_version`、`ok`、status report を出します（`strata_cli/cli.py:2023-2040`）。
-- 指定値に合う usable engine がない場合、終了コード `5` です。human 出力では notice を stderr に出し、JSON では `ok: false` を含む report を stdout に出します。どちらも download は行いません（`strata_cli/cli.py:2023-2040`; `strata_control/engine_component.py:919-936, 969-988`）。
-- 自動検出で `STRATA_ENGINE_BACKEND` が不正な場合など、`ComponentProblem` は終了コード `2` として出力されます。human では `strata: ...` を stderr、JSON mode では error object を stdout に出します（`strata_cli/cli.py:2019-2022, 527-532`; `strata_control/engine_component.py:439-447`）。未知の CLI backend 文字列は parser validation error にはなりません。
+- 成功時は human 出力で component folder、検出または指定した backend、installed package、選択 engine を表示します。JSON 出力は `schema_version: 1`、`ok`、report fields を stdout に出します（`strata_cli/cli.py:2024-2041`）。
+- 条件に合う engine がない場合は `usable=false` と理由 notice を report に含め、human では stderr に notice、JSON では `ok:false` の JSON を stdout に出し、終了コード 5 を返します（`strata_cli/cli.py:2024-2037`; `strata_control/engine_component.py:70-88,1122-1142`）。
+- `--backend` を省略した自動検出経路で `ComponentProblem`（例: backend 検出環境変数が不正）が発生すると、CLI は stderr の `strata: ...` または JSON error を出して終了コード 2 を返します。明示値がある場合は `status()` 内の検出例外は記録されますが、package の照合には明示値が使われます（`strata_control/engine_component.py:518-522,1122-1129`; `strata_cli/cli.py:2021-2023,527-532`）。
+- 引数値自体の family validation はありません。未知値は通常 parser error ではなく、利用可能 engine がない照合結果（終了コード 5）になります（`strata_cli/cli.py:134,2021-2024`; `strata_control/engine_component.py:1039-1045`）。
 
 ## 根拠
 
-- parser と option scope: `strata_cli/cli.py:132-138`
-- command dispatch、exit code、表示: `strata_cli/cli.py:2014-2041`
-- backend 環境変数と GPU 検出: `strata_control/engine_component.py:439-482`
-- resolver による値の適用、照合と失敗: `strata_control/engine_component.py:859-936`
-- status の report と missing engine 処理: `strata_control/engine_component.py:969-988`
-- component directory の既定値: `strata_control/engine_component.py:176-190`
-- 対応 backend と OS: `strata_control/targets.py:20-51`
+- Parser・option scope: `strata_cli/cli.py:132-140`
+- Report、終了コード、human / JSON 出力: `strata_cli/cli.py:2015-2042`
+- backend matrix: `strata_control/targets.py:20-29,44-50`
+- component folder の既定値: `strata_control/engine_component.py:176-190`
+- backend family の選択・自動検出: `strata_control/engine_component.py:465-482,514-560,1012-1027`
+- package の適用条件・検証・選択順位: `strata_control/engine_component.py:933-946,1035-1097`
+- status report と欠落時の扱い: `strata_control/engine_component.py:70-88,1122-1142`
 
+調査制約: ソースコードを対象にし、CLI `--help`、Release artifact、実 GPU / backend の実動作は確認していません。backend ごとの外部 driver / tool の挙動は Strata の実装範囲を超えるため記述していません。

@@ -1,65 +1,60 @@
 # `--pcie-frac`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン） |
+| コマンド | `strata`（ネイティブ推論エンジンの root 引数 parser） |
 | オプション | `--pcie-frac` |
 | 別名 | なし |
-| 値 | 数値。parser は `double` に `std::atof` で変換する。通常の指定範囲は 0〜1。 |
+| 値 | 数値を取る。未指定時は pack・GPU・リンク測定などから初期 share を決める |
 
 ## 役割
 
-serve の decode verify window で、GPU cache にない distinct expert のうち、PCIe 経由で GPU が pinned host arena から読む割合を指定します。残りの miss は CPU expert pool が計算します。値は expert 数の比率であり、PCIe 帯域や GPU cache 容量そのものを指定するものではありません（`src/program/generate.cpp:682-685`、`src/core/expert_source.cpp:4828-4830`）。
+各 verify window で、VRAM にない distinct expert miss のうち、GPU が PCIe 経由で読む割合を指定します。残りの miss は CPU pool が計算します。内部では割合を 256 段階の整数にし、router の順で後ろにある miss から PCIe 側へ割り当てます（`src/program/generate.cpp:867-870,12165`, `include/strata/core/expert_source.hpp:612-615`, `src/core/expert_source.cpp:4914-4917,4930-4939,4964-4966`）。
 
 ## 使い方
 
 ```sh
-engine/strata --serve --pack ./packs/model --native ./models/model.gguf --pcie-frac 0.25
+strata --native /path/to/model.gguf --pack /path/to/model.pack \
+  --tokens "1,2,3" --pcie-frac 0.15
 ```
 
-この例は native model を serve し、PCIe へ割り当てる miss の割合を 0.25 にします。モデルや pack の指定は実際の配置に合わせてください。
+`--pcie-frac` は `src/program/generate.cpp` のエンジン引数 parser に属します。`strata` は Terminal CLI の同名 wrapper とは別プログラムです（`docs/cli/README.md` の `strata-engine` 対象境界）。
 
 ## 値と既定値
 
-- `--pcie-frac VALUE` の `VALUE` は `std::atof` で読み取られます。空値や数値として解釈できない文字列について独自の validation はなく、`atof` が返す 0 が設定されます（`src/program/generate.cpp:2420-2429`、`src/program/generate.cpp:2623-2626`）。
-- 値が負数なら parser は拒否せず、後段の `pcie_frac < 0.0` 分岐で「未指定」と同じ自動既定値処理に入ります（`src/program/generate.cpp:3557-3558`）。0 は有効な明示値で、PCIe share を実質 0 にします。
-- 指定値の 0〜1 範囲を parser で検証する処理はありません。serve の通常 dispatch では `pcie_frac * 256` を整数化した後に 0〜256 へ clamp します（`src/program/generate.cpp:9977`、`src/program/generate.cpp:13965`、`src/program/generate.cpp:16177`）。従って有限の値であれば範囲外も起動時にエラーにならず、負値は既定値分岐、1 より大きい値は実行時の最大 share に収まります。非有限値の変換結果はソースから安全な挙動を確認できないため、指定値として扱わないでください。
-- 省略時の基準値は canonical Q2_0 pack が 0.2、native NVFP4 pack が 0.25、その他 native pack が 0.55 です。native pack では起動時に PCIe host-to-device 帯域を probe し、測定値が 20 GB/s 未満なら基準値に帯域比を掛けます。probe 失敗時は基準値を使います（`src/program/generate.cpp:3552-3557`、`src/program/generate.cpp:3587-3598`、`src/program/generate.cpp:2066-2070`）。
-- 値を明示すると `pcie_frac >= 0.0` となり、起動時の share probe/default 決定を通らず、この値が各 stage の share として使われます（`src/program/generate.cpp:2975-2977`、`src/program/generate.cpp:4384-4393`）。
+- parser は次の argv を `std::atof` で `double` に変換します。option 固有の形式検査や範囲エラーはありません（`src/program/generate.cpp:3295-3298,3502`）。値を省略すると `--pcie-frac needs a value` を stderr に出し、status 2 で終了します（同 `:3295-3297`）。
+- 明示値が 0 以上ならその値を使い、実行時の整数化で `round(value * 256)` 相当にして 0〜256 に制限します。したがって有限値の有効 share は 0〜1 に収まり、範囲外の値は実効上 0 または 1 に丸められます（`src/program/generate.cpp:12165,17173-17179,19733-19737`）。
+- 0 未満の値は「明示値なし」と同じ判定になり、モデル既定値と probe の経路に入ります（`src/program/generate.cpp:3901-3903,4567`）。数値でない文字列も `atof` の変換結果を使うため、厳密な入力検証はありません。
+- 明示値がない場合の開始値は、canonical pack が 0.2、NVFP4 native pack が 0.25、その他 native pack が通常 0.55、HIP gfx12 native pack が条件により 0.15 です。`STRATA_DEFAULTS=026`、`STRATA_PCIE_FRAC_DEFAULT=old` などはこの既定値の選択に関係します（`include/strata/core/defaults_026.hpp:32-39`, `src/program/generate.cpp:2421-2435,4567-4587`）。
 
 ## 実行時の動作
 
-dispatch は各 verify window で routed expert を重複排除し、VRAM resident・peer GPU・helper GPU が持つ expert を miss から除外します。残った miss 数に対し、share を 1/256 単位へ丸めて PCIe lane に割り当てる個数を決めます。PCIe 対象は routing 順の後ろ側です（`src/core/expert_source.cpp:4832-4844`、`src/core/expert_source.cpp:4877-4884`、`src/core/expert_source.cpp:4900-4910`）。
+起動時に `--pcie-frac` が 0 以上なら `pcie_given` が立ちます。この場合、既定値決定の PCIe link probe と自動 share 調整は行わず、`STRATA_PCIE_BALANCE=1` による測定ベースの share も選ばれません（`src/program/generate.cpp:3901-3903,4567,4613-4620`）。layer split では同じ明示 share を全 stage に使い、各 GPU ごとの probe を飛ばします（同 `:5532-5541`）。
 
-PCIe lane に選ばれた miss でも、source が pinned host memory を持つ場合だけ GPU fetch へ進みます。pinned でなければ `kd` は miss のままで、後続の CPU 経路が処理します（`src/core/expert_source.cpp:4906-4917`）。`--pcie-mode` は PCIe fetch の DMA / direct / kernel 経路を選ぶ別設定で、この option の share 値を変更しません（`src/program/generate.cpp:2633-2637`、`src/program/generate.cpp:16160-16179`）。
+実際に PCIe lane が使われるのは、対象 layer の source が PCIe read に対応し、miss があり、選ばれた expert blob 全体が pinned である場合です。割当対象でも pinned source が得られなければ PCIe fetch にはせず、CPU miss のままです（`src/core/expert_source.cpp:4964-4971,4996-5009`; pinned 判定: `:4700-4713`, `include/strata/core/expert_source.hpp:233`）。`STRATA_ARENA_MMAP=1` の arena は pinned でないため、ソースコメントは `--pcie-frac 0` で実行するよう案内しています（`src/core/expert_source.cpp:5825-5830`）。
 
-省略時の自動調整は backend・環境条件で異なります。CUDA 等の条件を満たす単一 GPU serve では、probe した share を最初の decode windows の CPU pool 実測に基づいて更新し、その変更を stderr に出します。明示指定時は `pcie_frac_auto` が立たず、この起動後の自動調整を有効にしません（`src/program/generate.cpp:3580-3595`、`src/program/generate.cpp:10031-10054`）。layer split で値を明示した場合は全 stage に共通の値となり、stage ごとの PCIe probe を省略します。省略時は native pack の各 stage が自身の link を probe します（`src/program/generate.cpp:2975-2977`、`src/program/generate.cpp:4384-4393`）。
+serve 経路では、CLI で明示しなかった share に限り、対応条件下で起動時の link probe と CPU pool の測定から PcieAuto が share を調整します。明示値はこの自動調整を無効にします（`src/program/generate.cpp:4585-4610,12142-12165,12218-12245`）。ただし serve の request protocol には request 専用 `pcie_frac=` tuning key があり、値は 0〜1 に clamp されます。request にこの key があれば、その request 中は CLI の share を上書きし、自動調整を pause します（同 `:15118-15129,15169-15170,17173-17179`）。
 
-serve の request line に `pcie_frac=...` が含まれる場合は、request ごとの値が 0〜1 に clamp され、CLI 起動時の share に優先して適用されます。layer split では request override が後段 stage にも適用されます（`src/program/generate.cpp:12317`、`src/program/generate.cpp:12350`、`src/program/generate.cpp:13965-13970`）。
+PCIe 割当数は `floor(nmiss * pcie_num / 256)` を初期値として決まり、ルーティング順の末尾側 miss を GPU に回します。`--pcie-mode` は割当率ではなく、その対象の転送方式を決める別 option です（`src/core/expert_source.cpp:4914-4917,4964-4966`; `src/program/generate.cpp:11265-11269`）。
 
 ## 適用条件と副作用
 
-- 効果があるのは GPU verifier の expert miss を PCIe lane と CPU pool に分ける serve/decode 経路です。resident experts、peer/helper GPU が処理する expert、または miss のない window には PCIe 分担が発生しません（`src/core/expert_source.cpp:4832-4844`、`src/core/expert_source.cpp:4877-4884`）。
-- 明示値はすべての layer split stage に共通です。異なる link 帯域の stage ごとに別値を CLI から設定する機能は、この parser にはありません（`src/program/generate.cpp:2975-2977`）。
-- 明示値があると `STRATA_PCIE_BALANCE=1` による測定ベースの share 決定は無効です（`pcie_balance()` が `!pcie_given` を条件にするため）。一方、`STRATA_PCIE_MIN1` が有効で、1 層に 2 件以上の miss があり PCIe lane が使える場合は、計算 share が 0 に丸まっても最低 1 件を PCIe に割り当てることがあります（`src/program/generate.cpp:3601-3607`、`src/core/expert_source.cpp:4877-4884`）。
-- share を増やすと、より多くの pinned host expert を GPU が PCIe から読み、CPU が計算する miss 数は減ります。これは実行経路を変える設定であり、性能改善の保証はソースからは導けません。
-- 本ソース checkout の `usage()` 文字列には `--pcie-frac` の説明が見当たらず、`--help` だけではこの option を確認できません。一方、parser には定義があります（parser: `src/program/generate.cpp:2625`、help 実装: `src/program/generate.cpp:2423`）。
-- `--native` の model が Qwen35 family と判定されると、通常 parser より前に専用 `src/qwen35` 実装へ全 argv が委譲されます。その family parser における `--pcie-frac` の受理・効果は本書の通常 engine parser の調査範囲外です（`src/program/generate.cpp:2394-2410`）。
-
-## 出力とエラー
-
-- `--pcie-frac` の値がない場合、共通の `next()` が `--pcie-frac needs a value` を stderr に出して exit code 2 で終了します（`src/program/generate.cpp:2420-2429`）。
-- 数値の範囲外や不正な数値文字列について、この option 専用の parser error / warning はありません。未知 option は `unknown argument: ...` と usage を stderr に出し code 2 で終了します（`src/program/generate.cpp:2788-2792`）。
-- 省略時の probe は pinned host buffer と device buffer を確保し、256 MiB copy を測定してから両 buffer を解放します。確保・測定失敗時は probe が失敗値を返し、既定 share に fallback します（`src/program/generate.cpp:2073-2114`、`src/program/generate.cpp:3597-3598`）。明示値ではこの起動時 probe を行いません。
+- 対象は主に GPU verifier の expert miss 経路です。resident expert、peer/helper GPU が保持する expert、PCIe read 非対応の source/layer はこの share の対象外です（`src/core/expert_source.cpp:4921-4928,4935-4939,4986-5008`）。
+- layer split に明示値を使うと全 stage に共通の割合が適用されます。異なる PCIe link ごとに異なる CLI 値を指定する機能はありません（`src/program/generate.cpp:3901-3903,5532-5541`）。
+- CPU pool と GPU lane は native expert の計算丸めが異なることがあり、share を変えると出力 token の値が変わる場合があります。ソースコメントは `--pcie-frac 0.15` と 0.55 の出力差について KL 測定例を記していますが、これは特定機材・prompt の記録であり、性能効果の一般保証ではありません（`src/program/generate.cpp:2421-2428`）。
+- `--pcie-frac` 固有の範囲 validator や値不正時の専用エラーはありません。値なしは status 2、未知の option 名は usage を stderr に出して status 2 です（`src/program/generate.cpp:3295-3297,3683-3688`）。
 
 ## 根拠
 
-- parser と値変換: `src/program/generate.cpp:2420-2429`, `src/program/generate.cpp:2623-2626`
-- default / PCIe probe / 起動後の自動調整: `src/program/generate.cpp:3552-3600`, `src/program/generate.cpp:10031-10054`
-- layer split の stage share: `src/program/generate.cpp:2975-2977`, `src/program/generate.cpp:4384-4393`
-- 実際の miss 分類・PCIe fetch・pinned 条件: `src/core/expert_source.cpp:4828-4830`, `src/core/expert_source.cpp:4877-4917`
-- request 単位 override: `src/program/generate.cpp:12317-12350`, `src/program/generate.cpp:13965-13970`
-- help / family dispatch: `src/program/generate.cpp:2394-2423`
+- 値の初期状態・parser: `src/program/generate.cpp:867-872,3295-3298,3502`
+- 既定 share と環境設定: `include/strata/core/defaults_026.hpp:32-39`, `src/program/generate.cpp:2421-2435,4567-4611`
+- 明示値による probe/balance の抑止と layer split: `src/program/generate.cpp:3901-3903,4613-4620,5532-5541`
+- serve の自動調整と request override: `src/program/generate.cpp:12142-12165,12218-12255,15118-15129,15169-15170,17173-17179`
+- miss の選定、整数化、pinned 判定、PCIe lane dispatch: `include/strata/core/expert_source.hpp:612-619`, `src/core/expert_source.cpp:4914-4917,4964-5009`
+- pinned arena の適用条件: `src/core/expert_source.cpp:4700-4713,5825-5830`
+- 値欠落・未知引数の失敗経路: `src/program/generate.cpp:3295-3297,3683-3688`
+
+調査制約: CLI バイナリの `--help` は実行していません。parser と使用箇所をソースで確認しました。Qwen3.5 系 GGUF は main parser より前に family 専用実装へ振り分けられるため、本書は通常の `src/program/generate.cpp` parser の説明であり、専用 parser 上でのこの option の挙動は確認していません（`src/program/generate.cpp:3270-3283`）。Release artifact、GPU/backend 別の実動作、および実性能は確認していません。

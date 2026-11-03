@@ -1,42 +1,54 @@
 # `HIPK_CFG`
 
-調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。調査対象リポジトリは `main` で、調査時の作業ツリーは clean。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
 
 ## 役割
 
-HIP ビルドで使う DS4 IQ 行列コア用カーネルのうち、レジスタに重みを置く `runr` カーネルのタイル構成を選びます。`HIPK_CFG` はカーネル経路そのものを有効化する設定ではなく、HIPK 経路が選ばれた後、最大 32 行の場合に限って行タイル幅・wave 数・重みタイル数を選びます。
+DeepSeek-V4.1 の HIP i-quant expert 計算で、register-weights matrix-core kernel の tile 構成を選びます。指定値は gate/up と down の各 launch に使う行 tile 幅と列 tile 構成を選び、計算式そのものは切り替えません。HIP build の `ds4_iq.cu` から呼ばれる経路に限られ、CUDA / Metal / CPU の経路では読み取られません。`HIPK_CFG` 自体は matrix-core 経路を有効にしません。デバイス・モデル形式などの適用条件を満たし、別変数 `STRATA_DS4_HIPK` によりその経路が有効なときだけ参照されます。
 
 ## 値と判定
 
-`std::getenv()` で値の有無を確認し、設定されていれば `std::atoi()` で整数へ変換します。環境変数の値全体の妥当性は検査されません。先頭の空白と符号は `atoi` の規則で扱われ、数字の後ろにある文字列は変換に影響しません（例: `2tail` は 2、`  -1x` は -1）。未設定時と空文字・数字で始まらない文字列は 0 として扱われます。`atoi` の整数範囲を超える入力の結果は C/C++ のライブラリ仕様上保証されません。
+読み取りは `std::getenv("HIPK_CFG")` と `std::atoi` です。未設定なら 0、空文字も `atoi` の結果 0 になります。整数として完全に検証せず、`atoi` が読む先頭の数値部分と符号・先行空白に従います（例: `2tail` は 2、数値で始まらない文字列は 0）。`int` の範囲を超える値の変換結果は保証されません。範囲制限やエラー報告はなく、変換後の値が 1〜11 のいずれかに一致した場合だけ明示 tile を選びます。
 
-| 変換後の値 | `a.max_rows <= 32` のときの構成 | `N` が割り切れる必要のある幅 `BN` |
-|---|---|---:|
-| 1 | `runr<T, GU, 32, 4, 1>` | 64 |
-| 2 | `runr<T, GU, 32, 8, 1>` | 128 |
-| 3 | `runr<T, GU, 32, 2, 2>` | 64 |
-| 4 | `runr<T, GU, 32, 8, 2>` | 256 |
-| 5 | `runr<T, GU, 32, 2, 1>` | 32 |
-| その他 | 標準構成: `max_rows <= 32` なら `(32, 4, 2)`、`<= 64` なら `(64, 4, 2)`、それ以外は `(128, 8, 1)` | 128 |
+| 値 | 選択する register-weights tile | 適用条件 |
+|---|---|---|
+| 1 | `BM=32, NW=4, NTW=1`（列幅 64） | `max_rows <= 32` |
+| 2 | `BM=32, NW=8, NTW=1`（列幅 128） | `max_rows <= 32` |
+| 3 | `BM=32, NW=2, NTW=2`（列幅 64） | `max_rows <= 32` |
+| 4 | `BM=32, NW=8, NTW=2`（列幅 256） | `max_rows <= 32` |
+| 5 | `BM=32, NW=2, NTW=1`（列幅 32） | `max_rows <= 32` |
+| 6 | `BM=64, NW=8, NTW=1`（列幅 128） | 常時 |
+| 7 | `BM=32, NW=8, NTW=1`（列幅 128） | 常時 |
+| 8 | `BM=128, NW=8, NTW=2`（列幅 256） | 常時 |
+| 9 | `BM=64, NW=4, NTW=2`（列幅 128） | 常時 |
+| 10 | gate/up: `BM=128, NW=8, NTW=1`（列幅 128）。down: `BM=128, NW=8, NTW=2`（列幅 256） | 常時 |
+| 11 | `BM=64, NW=8, NTW=2`（列幅 256） | 常時 |
+| 未設定、0、その他 | 行数に応じた自動設定 | 常時 |
 
-表中の構成は `BM, NW, NTW` の順です。`NW` は kernel 起動時の wave 数、`NTW` は各 wave が扱う 16 列幅の重みタイル数です。特別値 1〜5 は `a.max_rows <= 32` の場合だけ評価されます。`a.max_rows > 32` では値に関係なく標準構成が使われます。
+1〜5 は `max_rows > 32` ならその指定を採らず、自動設定に進みます。自動設定は `max_rows <= 32` で `BM=32, NW=4, NTW=2`、`<=64` で `BM=64, NW=4, NTW=2`、それより大きければ `BM=128, NW=8, NTW=1` です。
 
 ## 有効になる条件
 
-`HIPK_CFG` が参照されるのは `STRATA_USE_HIP` でコンパイルされたコードで、DS4 IQ の対象型（IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_XS、IQ1_S、IQ1_M、IQ4_NL）の `launch_set` が HIPK 経路を試す場合です。さらに、デバイスが gfx11/gfx12 と判定され、`a.max_rows > 16`、寸法とアラインメントの条件（K が 256 の倍数、N が 64 の倍数、`ldx` が 8 の倍数、`ldo` が偶数、入力ポインターが 16-byte 整列）を満たす必要があります。条件を満たさなければ通常の `set_kernel` 経路へ進み、`HIPK_CFG` は読み取られません。
+- HIP build で DeepSeek-V4.1 i-quant expert の gate/up または down kernel が `launch_set` に到達すること。`HIPK_CFG` の読み取りは `STRATA_USE_HIP` の実装内にあります。
+- 対象の量子化型が IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ1_S / IQ1_M / IQ4_NL のいずれかであること。
+- 現在の GPU が gfx11 または gfx12 系として認識され、`STRATA_DS4_HIPK` の判定で matrix-core 経路が有効であること。通常判定では gfx12 は `STRATA_DS4_HIPK` が未設定または先頭文字が `0` 以外で有効、gfx11 は gfx1151 で未設定なら有効、その他 gfx11 は先頭文字が `1` の場合に有効です。gfx11 で `STRATA_DS4_HIPK` の `atoi` 結果が 2 のときは shared-memory weights kernel 専用のため、この変数を読む register-weights 分岐に入りません。
+- `max_rows > 16`、K が 256 の倍数、出力列数 N が 64 の倍数、`ldx` が 8 の倍数、`ldo` が 2 の倍数で、対象入力ポインターが 16-byte aligned であること。
 
-HIPK 自体の可否は `STRATA_DS4_HIPK` と GPU 世代にも依存します。gfx12 は `STRATA_DS4_HIPK` の先頭文字が `0` でなければ既定で有効、gfx11 は先頭文字が `1` の場合に有効です（未設定時は gfx1151 のみ既定有効）。また `STRATA_DS4_HIPK` を `atoi` で 2 と解釈する場合、gfx12 では重みを shared memory に置く別カーネルを選ぶため、`HIPK_CFG` は使われません。gfx11 ではその 2 は `ok_device()` の先頭文字判定により HIPK 経路を有効にしません。
+明示 tile の列幅が N を割り切らない場合、`runr` は false を返し、呼び出し元は標準 HIP tile kernel に進みます。よって値が 1〜11 でも、常に指定 tile が起動するわけではありません。別変数 `STRATA_DS4_X16` は gate/up の register-weights kernel で F16 入力経路を選ぶ条件に関係しますが、`HIPK_CFG` の tile 選択値は変更しません。
 
 ## 実行時の詳細
 
-選択された特別構成は `runr()` に渡されます。`runr()` は `N % BN != 0` なら `false` を返します。この場合、選択を別の `HIPK_CFG` 構成や標準 `runr` 構成で再試行せず、呼び出し元 `launch_set()` が通常の `set_kernel` を起動します。条件が合えば `set_kernel_r` を起動し、起動エラーの有無を `cudaPeekAtLastError()`（HIP ビルドで使われる互換 API）で返します。
+`HIPK_CFG` は `hipk::launch<T, GU>` の関数テンプレート内の `static const int` として、対応経路が最初に呼ばれたときに読み取られます。テンプレートの各型・gate/up/down の特殊化ごとに初期化され、その特殊化では以後再読込されません。したがって、プロセス実行中に環境値を変えても、既に初期化された特殊化には反映されません。
 
-設定は `launch<T, GU>()` 内の関数ローカル `static const int` に保存されます。したがって各テンプレート特殊化（型 `T` と GU の組み合わせ）で初回到達時に一度読み取られ、その後の環境変更はその特殊化には反映されません。値の選択自体による専用ログはありません。
+値 1〜11 が選ぶ register-weights tile は `set_kernel_r` を dispatch し、その他の値や条件不成立時は行数ベースの自動設定に進みます。`runr` 内では選択した列 tile 幅で N を割り切れるかを確認し、不成立なら `false` を返します。`launch_set` は `hipk::launch` が false のとき標準 HIP kernel を起動します。matrix-core 対象外、モデル型・次元条件不成立、または `STRATA_DS4_HIPK` が経路を無効にする場合も `HIPK_CFG` による選択には至らず、呼び出し元の標準 kernel 経路へ進みます。
+
+`HIPK_CFG` を表示するログや、値の不正を通知するエラーはこの経路にありません。kernel launch の `cudaPeekAtLastError()` が失敗すると `runr` は false を返して呼び出し元の標準 kernel に移ります。`HIPK_CFG` の値自体による終了・警告は確認できません。
 
 ## 根拠
 
-- `src/dsv41/ds4_iq_hip.inc:21-23,297-322`: 対象量子化型、設定読み取り、構成選択、カーネル条件。
-- `src/dsv41/ds4_iq_hip_r.inc:200-209`: `BN` の定義、`N % BN` 判定、選択した register kernel の起動。
-- `src/dsv41/ds4_iq.cu:1177-1194`: HIP ビルドでの呼び出し位置と `false` 時の通常カーネル経路。
-- `src/dsv41/ds4_iq_hip.inc:237-270,305-307`: `STRATA_DS4_HIPK` による世代別の有効条件と shared-memory 構成との分岐。
-- `docs/DETAILS.md` と他の設計資料では `HIPK_CFG` の説明を確認できませんでした。構成の性能差や推奨値はここでは断定しません。
+- `src/dsv41/ds4_iq_hip.inc:10-12` は HIP build 条件と実装 namespace、`src/dsv41/ds4_iq.cu:1184-1201` は include と `STRATA_USE_HIP` 下での dispatch、および false 時の標準 kernel 経路を示します。
+- `src/dsv41/ds4_iq_hip.inc:21-23,297-334` は対応量子化型、共通の適用条件、`STRATA_DS4_HIPK` と `HIPK_CFG` の分岐、値ごとの tile と自動設定を示します。
+- `src/dsv41/ds4_iq_hip.inc:237-270` は gfx 世代ごとの有効条件と device ごとの状態 cache を示します。
+- `src/dsv41/ds4_iq_hip_r.inc:211-231` は選択 tile の列幅検査、kernel launch、launch error 時の戻り値を示します。
+- `src/dsv41/ds4_iq_hip_r.inc:217-231` は `HIPK_DBG` / `STRATA_DS4_X16` を読む register-weights kernel と launch の処理を示します。
+- Strata `docs/DETAILS.md` に `HIPK_CFG` / `STRATA_DS4_HIPK` の記述は見つかりませんでした。上記の説明は現行ソースの分岐に基づきます。

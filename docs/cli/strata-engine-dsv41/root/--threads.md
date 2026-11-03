@@ -1,56 +1,59 @@
-# `--threads`
+# `strata-dsv41 --threads`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine-dsv41` |
-| コマンド | `strata-dsv41`（DeepSeek-V4.1 専用 engine） |
+| コマンド | `strata-dsv41`（DeepSeek-V4.1 engine の独立 CLI） |
 | オプション | `--threads` |
 | 別名 | なし |
-| 値 | `on` または `off`（実装上は `off` との完全一致だけを無効扱い） |
+| 値 | `on` / `off` を想定する文字列。実装は `off` との完全一致だけを判定する |
 
 ## 役割
 
-GPU ごとに host thread を用意し、その GPU に割り当てた層の処理を並列に enqueue するモードを有効にします。GPU 間の層の受け渡しには host-mapped memory を使います。主に decode の window 処理を並列化し、条件によって prompt の chunk 処理にも GPU ごとの host thread を使います。
+GPU ごとに host thread を使って各 GPU の layer 処理を enqueue する threads mode を選びます。推論 engine の並列経路に関わる設定で、`--cpu-threads` が CPU lane の worker 数を調整するのとは別です（`src/dsv41/ds4_model.hpp:33-35,59-67`）。
 
 ## 使い方
 
 ```sh
-strata-dsv41 --pack /path/to/model/maya-ds4 --tp 1 --threads on --ids 1,2,3
+strata-dsv41 --pack ./model/maya-ds4 --serve --threads on
 ```
 
-`--ids` は推論入力の例です。複数 GPU の tensor parallelism を使う場合は `--tp` と組み合わせます。`--threads off` で明示的に無効にできますが、`--tp` により並列経路が選ばれる場合があります。
+`--serve` の代わりに `--ids ...` を使う通常の推論経路でも指定できます。`--pack` と実行モードの引数は engine の usage に示されています（`src/dsv41/ds4_main.cpp:118-123`）。
 
 ## 値と既定値
 
-- `--threads` は値を1つ取ります。ヘルプは `on|off` と案内しています（`src/dsv41/ds4_main.cpp:85-93`）。
-- 既定値は off です。`Options::threads` は `false` で初期化されています（`src/dsv41/ds4_model.hpp:49-57`）。
-- parser は値が文字列 `off` と等しい場合だけ `false`、それ以外を `true` にします。したがって `on` が有効、`off` が無効ですが、未知の値も拒否されず有効扱いです。値の検証や大文字小文字の正規化はありません（`src/dsv41/ds4_main.cpp:1231-1234`）。
-- 値を省略すると `--threads needs a value` を stderr に出して終了コード 2 になります（`src/dsv41/ds4_main.cpp:1200-1207`）。同じオプションを複数回指定した場合、parser が順に代入するため最後の値が残ります（`src/dsv41/ds4_main.cpp:1209-1234`）。
+- 既定値は off (`Options::threads = false`) です（`src/dsv41/ds4_model.hpp:62-63`）。
+- `--threads` の値が文字列 `off` と一致する場合だけ false、それ以外は true になります。したがって `on` は有効ですが、`false`、`0`、空文字列なども拒否されず true として扱われます。`on` / `off` の列挙検証はありません（`src/dsv41/ds4_main.cpp:2511-2518,2550`）。
+- 値を省略して末尾に置くと `<option> needs a value` を標準エラーに出して終了コード 2 で終了します。末尾以外で次の引数がある場合、その引数を値として消費します（`src/dsv41/ds4_main.cpp:2511-2518`）。
+- 複数回指定した場合は parser の走査順に上書きされ、最後の値が残ります（`src/dsv41/ds4_main.cpp:2511-2550`）。
 
 ## 実行時の動作
 
-- モデル初期化時、実効 `tp` が1より大きい場合、または `--threads` が有効な場合に `par` を有効にします。`par` が有効な decode window は `forward_par()` を通り、各 GPU の worker に `run_dev()` を投入してから全 worker を待ちます（`src/dsv41/ds4_model.cu:1912-1924, 8310-8317, 8391-8407`）。モデル既定の `tp` は2ですが、GGUF の分割条件により1まで補正されることがあります。実効 `tp > 1` の場合、`--threads off` だけでは並列経路を無効にしません。`--tp 1 --threads off` なら `par` は無効です（`src/dsv41/ds4_model.hpp:49-57`; `src/dsv41/ds4_model.cu:1892-1917`）。
-- `par` または chunked prompt が有効なら GPU ごとの worker を起動します（`src/dsv41/ds4_model.cu:2770-2775`）。`Options` の説明では worker は各 GPU の層を enqueue し、受け渡しは host-mapped memory とされています（`src/dsv41/ds4_model.hpp:49-57`）。
-- prompt の chunk 経路は `--threads` だけで決まるわけではありません。`par`、`tp > 1`、または chunked prompt の既定条件（`--prefill-chunk` が省略時の負値で `DS4_WINDOWS` が未設定）が `prompt_par` を有効にします。したがって `--tp 1 --threads off` でも、既定では chunked prompt が使われます。`DS4_WINDOWS` が設定されるとその既定条件は無効です（`src/dsv41/ds4_model.cu:1917-1924`; 既定値は `src/dsv41/ds4_model.cu:809-816`）。
-- `--prefill-chunk` は別の制御です。chunk サイズを0にすると chunking を止めて window prompt にしますが、`--threads on` なら `par` 自体は有効なままです（`src/dsv41/ds4_model.cu:1917-1924, 1968-1984`）。
+parser は値を `o.threads` に保存します。モデル初期化では `par = o.threads || tp > 1` とし、threads mode または `tp > 1` なら decode の並列経路を選びます。`--threads on` は GPU ごとの `Worker` host thread を起動する条件となり、window 処理でも各デバイスに担当 worker を作ります（`src/dsv41/ds4_model.cu:2713-2718,3784-3788`; worker の待機・job 実行は `src/dsv41/ds4_model.cu:963-1005`）。window の plan も `par` を並列 / async 経路の判定に使い、実行時は `forward_par` または `forward_serial` に分岐します（`src/dsv41/ds4_model.cu:13228-13235,14572-14579`）。
+
+`--tp` との相互作用があります。既定の `tp` は 2 なので、既定状態では `--threads off` でも `tp > 1` によって `par` は true です。`--tp 1` のときは `--threads on` が `par` を true にします。GGUF では tensor parallel の幅 `tp` が weight block や head の分割条件に合わない場合に小さく補正されるため、実効 `tp` が指定値より小さくなることがあります（`src/dsv41/ds4_model.hpp:59-63`; `src/dsv41/ds4_model.cu:2693-2718`）。
+
+prompt の chunk 経路は decode の `par` と別の条件も持ちます。`tp > 1` / `par` で有効になるほか、`--prefill-chunk` の指定や既定規則でも選ばれます。Metal build では `DS4_NO_CHUNKS` が無い場合に prompt chunk 経路を強制します（`src/dsv41/ds4_model.cu:2719-2727`）。chunk buffer の確保に失敗した場合、chunk サイズを縮め、さらに確保できなければ prompt を 16-token window 処理へ戻します。この fallback は stderr に警告を出します（`src/dsv41/ds4_model.cu:3550-3566`）。
 
 ## 適用条件と副作用
 
-- 処理は選択された GPU 群・層配置に対して行われ、GPU ごとに worker thread を作成します。GPU 間 hand-off 用の host-mapped memory を用います。CPU の expert 計算スレッド数を設定する `--cpu-threads` とは別のオプションです（`src/dsv41/ds4_model.hpp:29-33,49-57`; `src/dsv41/ds4_model.cu:2770-2775,8391-8407`）。
-- `--tp` は group の幅を指定し、GGUF の expert block 分割などの条件によって実効値が下がることがあります。その補正後の `tp` と `--threads` の真偽から decode の並列経路が選択されます（`src/dsv41/ds4_model.cu:1892-1917`）。
-- worker 作成や GPU 処理の詳細な OS ごとの差、および `--threads` による性能差は、このソース確認だけでは一般化できません。ベンチマークや GPU 実行は行っていません。
+このオプションは `strata-dsv41` の引数 parser で受理され、GPU の group / layer 処理を構築するモデル経路で使われます（`src/dsv41/ds4_main.cpp:2550`; `src/dsv41/ds4_model.cu:2693-2718`）。GPU 数、実効 `tp`、build 条件、prompt buffer の確保可否によって並列経路の範囲が異なります。ソース上、`--threads` 自体にファイル変更や別プロセス起動の副作用は確認できません。
+
+`--cpu-threads` は CPU lane の worker 数を指定する別設定です。`--threads` を CPU thread 数の指定として解釈しないでください（`src/dsv41/ds4_model.hpp:33-35,59-67`）。
 
 ## 出力とエラー
 
-- worker ごとの GPU 処理が失敗すると、そのエラー文字列を集約し、並列 forward は失敗を返します。空のエラー文字列なら `a device's thread failed` に置き換えます（`src/dsv41/ds4_model.cu:8393-8407`）。モデル load の失敗は `maya-ds4: <理由>` を stderr に出し、終了コード1になります（`src/dsv41/ds4_main.cpp:1289-1294`）。
-- 未知の CLI オプションは `unknown option ...` と usage を stderr に出し終了コード2です。ただし `--threads` の未知の値は parser でエラーにならず、有効扱いになります（`src/dsv41/ds4_main.cpp:1233,1266-1272`）。
+- 値の省略は stderr にエラーを出し、終了コード 2 です（`src/dsv41/ds4_main.cpp:2511-2518`）。
+- `--threads` の値自体には不正値エラーがありません。未知の option は `unknown option ...` と usage を stderr に出して終了コード 2 ですが、これは parser 全般の経路です（`src/dsv41/ds4_main.cpp:2593-2599`）。
+- chunk buffer を確保できない場合は stderr に fallback の警告を出し、prompt を window 処理にします（`src/dsv41/ds4_model.cu:3550-3562`）。
 
 ## 根拠
 
-- `src/dsv41/ds4_main.cpp:85-93,1200-1207,1231-1234,1266-1272,1289-1294` — usage、値の取得、parser の真偽変換、引数エラー、load 失敗。
-- `src/dsv41/ds4_model.hpp:29-33,49-57` — `cpu_threads` と `threads` の別個の設定、`tp` と `threads` の既定値・説明。
-- `src/dsv41/ds4_model.cu:1892-1924,1968-1984` — `tp` の補正、decode 並列条件、prompt chunk の条件とサイズ。
-- `src/dsv41/ds4_model.cu:2770-2775,8310-8317,8391-8407` — worker 作成、forward の分岐、並列処理と失敗伝播。
-- `docs/cli/README.md:1353-1397` — 対象 CLI の索引 scope と `--threads` 文書リンク。
+- `src/dsv41/ds4_main.cpp:118-123` — engine の引数形式。
+- `src/dsv41/ds4_main.cpp:2511-2518,2548-2550,2593-2599` — 引数値の取得、`--tp` / `--threads` の解析、値省略と未知 option のエラー経路。
+- `src/dsv41/ds4_model.hpp:33-35,59-67` — CPU lane thread 設定との違い、`tp` と `threads` の既定値と役割。
+- `src/dsv41/ds4_model.cu:2693-2727,2777-2789` — 実効 tensor parallel 幅、decode / prompt の並列条件と chunk 設定。
+- `src/dsv41/ds4_model.cu:963-1005,3784-3788,13228-13235,14572-14579` — GPU ごとの host worker と推論経路の選択。
+- `src/dsv41/ds4_model.cu:3550-3566` — chunk buffer 確保失敗時の window fallback と警告。

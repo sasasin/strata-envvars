@@ -1,66 +1,56 @@
-# `--expert-profile`
+# `strata --expert-profile`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数 parser） |
+| コマンド | ネイティブ `strata` 推論エンジン（root） |
 | オプション | `--expert-profile` |
 | 別名 | なし |
-| 値 | profile ファイルのパスを1つ取る |
+| 値 | profile ファイルへのパス `P` |
 
 ## 役割
 
-MoE expert の順位を記録した `profile.bin` を読み込み、GPU expert cache に起動時点で常駐させる expert を順位順に選びます。profile を渡すと「最初に使われた expert から cache に入れる」方式の代わりに、profile の順で cache を事前充填します。オプションの値は `Options::expert_profile` に保存され、profile 読込後は順位表として cache 配置などにも使われます（`src/program/generate.cpp:583-587, 988-989, 2749, 4414-4456, 6441-6487`）。
+MoE expert の優先順位を記録した profile を読み、expert cache の VRAM 常駐候補を指定します。指定すると、初回に使われた expert から枠を埋める方式ではなく、profile の順位に従って起動時に cache を埋めます。profile は cache サイズを指定するものではなく、実際に何件を VRAM に置けるかは利用可能な枠や `--expert-cache` によります（`src/program/generate.cpp:764-768,7998-8001`）。
 
 ## 使い方
 
-通常エンジンの例です。モデルと token 入力は実行するモデルに合わせて指定してください。
-
 ```sh
-strata --native /path/to/model.gguf --tokens 1,2,3 \
-  --expert-profile data/expert-profile.bin --expert-cache auto
+strata --pack PACK_DIR --native MODEL.gguf --tokens 1,2 --expert-profile PROFILE.bin
 ```
 
-`--expert-cache auto` は明示しなくても、profile 指定時に `--expert-cache` の既定値 `0` が自動容量扱い `-1` に切り替わります（`src/program/generate.cpp:4421-4424`）。
+`PACK_DIR`、`MODEL.gguf`、`PROFILE.bin` は実際のパスに置き換えます。`strata` は `--expert-profile` の後に1つの値を要求します（`src/program/generate.cpp:3293-3298,3639`）。
 
 ## 値と既定値
 
-- 値はパス文字列です。parser ではファイル形式やパスの内容を検査せず、そのまま保持します。オプション値を省略すると `--expert-profile needs a value` を stderr に出し、終了コード `2` で終了します（`src/program/generate.cpp:2416-2420, 2749`）。
-- オプション未指定時の値は空文字列で、profile は読み込まれません（`src/program/generate.cpp:583-587, 4414-4417`）。空文字列を値として明示した場合も、空であるため読込はスキップされます。
-- 同じオプションを複数回指定したときの重複拒否はありません。parser は指定ごとに同じ文字列変数へ代入するため、最後に処理された値が残ります（`src/program/generate.cpp:2416-2422, 2749`）。
-- profile が指定され、`--expert-cache` が省略または `0` の場合は自動容量 `-1` になります。正数指定は cache の slot 数を制限します。profile の順位数を超えて cache slot を設定しても、通常の fill は順位表にある expert を超えて埋めません（`src/program/generate.cpp:4421-4424, 6450-6451, 6473-6487`）。native pack で明示 cache 数が profile の順位数を超える場合は、profile 件数が上限になった旨の警告が出ます（`src/program/generate.cpp:6255-6280`）。
+- 値は読み込む profile のパスです。オプションを省略した場合は空文字列のままで、profile は読み込まれません（`src/program/generate.cpp:764-768,5570-5575`）。
+- 値を省略すると `--expert-profile needs a value` を stderr に出して終了コード 2 で終了します（`src/program/generate.cpp:3295-3298`）。空文字列を値にした場合も実質的に未指定と同じです（値を `std::string` に格納し、空かどうかで処理を分けるため。`src/program/generate.cpp:3639,5570`）。
+- 同じオプションを複数回指定したときは、parser が都度同じ文字列を代入するため最後の値が使われます（`src/program/generate.cpp:3293-3298,3639`）。
+- profile は `STRP` magic、version 1、モデルの layer 数と expert 数に一致する header を持つ必要があります。header の ranked pair 数が slots 数を超えないこと、ranked list が途中で切れていないこと、各 pair の layer / expert index がモデルの範囲内であることも検査されます（`src/core/expert_cache.cpp:163-229`）。異なる model artifact 用の profile は拒否されます（同:195-202）。
+- reader は pair の重複や末尾の余分なデータを検査していません（同:204-229）。したがって、それらの形式上の妥当性はこの reader だけでは保証されません。
 
 ## 実行時の動作
 
-通常 parser は値を `Options::expert_profile` に格納します。model の expert レイアウトが分かった後、`read_expert_profile()` がファイルを読み、layer/expert の順位ペアを `profile` にします。読み込み成功時は stderr にパス、順位数、作成時 slot 数を表示します（`src/program/generate.cpp:2749, 4414-4420, 4455-4456`）。
+指定されたパスを `read_expert_profile` で読み、model の `n_layers` / `n_expert` と照合した ranked pair 列を保持します。読み込んだ profile があると、`--expert-cache` が既定値 0 の場合は内部値を -1 に変更し、自動 cache サイズ決定に進めます。明示した正の cache 枠数は profile 順の上限として働き、native pack では profile の pair 数と VRAM の空きも割当数を制限します（`src/program/generate.cpp:5570-5579,7778-7803`）。
 
-Profile はバイナリ形式です。現在の reader は `STRP` magic、version 1、model の layer 数と expert 数の一致、順位数が header の slot 数以下であること、全順位ペアの読み込み完了、各 layer/expert index の範囲内を検査します。reader は `(layer, expert)` 順位ペア列を返し、header の slot 数も返します（`src/core/expert_cache.cpp:74-140`）。同じ順位に重複ペアがあることや、ファイル末尾の余剰データは reader の検査項目に含まれていません。
-
-Profile があり、expert cache のデータソースが利用可能な場合、エンジンは profile 順に expert blob を cache に admit して転送します。cache が満杯なら通常はそこで終了し、profile はヒントではなく起動時の常駐順位として働きます。per-layer admission が有効な場合は、満杯の layer の pair を飛ばして他 layer の順位も処理します。fill 後、少なくとも1件埋まった場合は最初の slot を読み戻して検証します（`src/program/generate.cpp:6441-6451, 6464-6487, 6492-6502`）。
-
-他の処理も順位を参照します。profile があると prefill buffer を expert cache から借りられる条件になり、split 自動配置や「split を省略して1 GPUに収まるか」の見積り、pin-by-need の候補選定などに順位が使われます（`src/program/generate.cpp:4190-4224, 4483-4495, 5837-5888`）。`STRATA_PEER_HOT` が有効な peer GPU 構成では、profile の先頭部分の順位が並べ替えられます（`src/program/generate.cpp:4430-4453`）。
+profile fill は起動時に行われます。cache の slot に順位順で expert blob を読み込んで埋め、slot 不足時は先頭から収まる範囲を使います。per-layer admission が有効な場合は各 layer の満杯を個別に扱います。profile にない expert はこの事前 fill には含まれません（`src/program/generate.cpp:7998-8012,8035-8057`）。通常の single-GPU 経路では開始件数・所要時間・転送速度を stderr に出力し、先頭 slot の読み戻し検証も行います（同:8063-8073,8092-8096）。
 
 ## 適用条件と副作用
 
-- `--layer-split` で複数 GPU に layer を分割すると profile が必須です。未指定なら診断を stderr に出し、終了コード `2` になります（`src/program/generate.cpp:3069-3073`）。
-- `--expert-cache-remote` の CUDA0 helper cache は、profile、CUDA0 expert cache、および expert pool を必要とします。不足時はエラーを出して終了コード `2` になります（`src/program/generate.cpp:6666-6670`）。`--peer-device` も profile と expert cache が必要で、不足時は終了コード `1` です（`src/program/generate.cpp:6750-6756`）。
-- `--cpu-oracle-q8-0` とは併用できず、診断を出して終了コード `2` になります（`src/program/generate.cpp:3407-3409`）。
-- speculative verify の実行にも profile で埋めた VRAM expert tier が必要です。確認処理は residency table、cache base、blob サイズが揃わない場合に失敗します（`src/program/generate.cpp:16121-16125`, `src/core/verify.cpp:721-730`）。
-- Profile 読込は model の GPU 実行準備中に行われるため、形式・内容のエラーは parser 時点ではなく読込時に判明します。開けない、header が短い、magic/version が不一致、別形状の model 用、順位リストが短い、index が範囲外の場合は理由を stderr に出し、終了コード `1` で処理を中断します（`src/program/generate.cpp:4415-4420`, `src/core/expert_cache.cpp:76-138`）。
-- cache fill 中に blob を取得・転送できない場合も pair 番号と理由を stderr に出して終了コード `1` になります（`src/program/generate.cpp:6478-6483`）。GPU VRAM の確保量は `--expert-cache` や空き VRAM 等にも依存します。
-- `--native` または `--model` で Qwen3.6-35B-A3B (`qwen35moe`) が検出されると、通常 parser より先に別の `src/qwen35` 実装へ委譲されます。この文書の parser と適用条件は通常 engine 経路を対象とします（`src/program/generate.cpp:2393-2407`）。
-
-## 出力とエラー
-
-成功時は読み込んだ profile の順位数などを stderr に表示し、cache fill 時には充填 slot 数、時間、読み戻し検証結果を表示します（`src/program/generate.cpp:4455-4456, 6498-6502`）。無効な profile や fill 失敗は上記のとおり stderr に診断を出して処理を中止します。profile 自体をこのオプションで書き換える処理はありません。
+- `--layer-split` で複数 GPU に layer を分割する場合は profile が必須です。未指定なら stderr に理由を出して終了コード 2 になります（`src/program/generate.cpp:3995-3999`）。
+- `--resident-cpu-experts` は `--mmap-experts` と静的な `--expert-profile` の両方を要求します（同:3970-3972）。
+- `--peer-device` 使用時は profile、expert cache、読み込んだ expert source が必要で、満たさないと stderr にエラーを出し終了コード 1 になります（同:8411-8421）。
+- `--cpu-oracle-q8-0` とは併用できず、parser 後の validation で終了コード 2 になります（同:4364-4366）。
+- `--split-skip-if-fits` の自動 layer split 判定でも profile を読みます。profile がない、remote expert cache と併用している、またはこの判定時の profile 読み込みに失敗した場合は、理由を stderr に出して split を維持します（同:5271-5284）。通常の profile 読み込み箇所ではファイルを開けない場合や header / ranked list が不正な場合、読み込みエラーを stderr に出して終了コード 1 になります（同:5570-5575、`src/core/expert_cache.cpp:165-224`）。
+- cache 枠を割り当てた後の blob 読み込み・slot fill に失敗すると、pair 番号と理由を stderr に出し終了コード 1 になります（`src/program/generate.cpp:8047-8055`）。
+- このオプションによるファイル書き込みはありません。profile は起動時に読み込まれ、その順位に基づく VRAM 常駐を設定します。profile の生成・保存は別オプション `--expert-profile-save` の処理です（`src/program/generate.cpp:5570-5575,12258-12264,13100-13102`）。
 
 ## 根拠
 
-- Parser と既定値: `src/program/generate.cpp:583-587, 2416-2422, 2749`
-- help 表示: `src/program/generate.cpp:988-989`
-- profile 読込、cache 既定変更、順位利用: `src/program/generate.cpp:4414-4456, 6441-6502`
-- Profile 形式と validation: `src/core/expert_cache.cpp:74-140`
-- 組合せ制約と family 分岐: `src/program/generate.cpp:2393-2407, 3044-3073, 3407-3409, 6666-6670, 6750-6756, 16121-16125`; `src/core/verify.cpp:721-730`
-- 今回は同一 revision のソースを根拠とし、既存 binary の `--help` は実行していません。Release artifact ごとの挙動は調査していません。
+- parser と値の受け取り: `src/program/generate.cpp:3293-3298,3639`。
+- option state と未指定値: `src/program/generate.cpp:764-768`。
+- profile 読み込み後の cache 枠処理: `src/program/generate.cpp:5570-5611,7778-7803`。
+- 順位順の事前 fill と失敗経路: `src/program/generate.cpp:7998-8057,8092-8096`。
+- profile header / pair validation: `src/core/expert_cache.cpp:163-229`。
+- 複数 GPU・常駐 RAM 等の適用条件: `src/program/generate.cpp:3970-3999,5271-5284,8411-8421`。

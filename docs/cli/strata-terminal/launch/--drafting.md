@@ -1,6 +1,6 @@
 # `--drafting`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,60 +8,58 @@
 | コマンド | `strata launch` |
 | オプション | `--drafting` |
 | 別名 | なし |
-| 値 | `auto`、`mtp`、`dflash2`、`off` |
+| 値 | `auto`、`mtp`、`dflash2`、`off` のいずれか（値を1つ取る） |
 
 ## 役割
 
-生成時に先読みする drafter の選択を指定します。選択は起動設定の `drafting` として保存され、server が engine 起動時に適用します。モデルが DeepSeek で複数ファイル構成の場合は、この選択表示より DSpark が使われます（`strata_cli/launch/runner.py:1851-1855`）。
+起動するモデルの推測デコーダー（drafting）を選びます。Strata は1回の起動で DFlash2、モデル内蔵の MTP draft layer、または drafting なしのいずれか1つを使います。DFlash2 は対応モデル・engine が利用可能な場合の選択肢で、MTP はモデルに含まれる draft layer です。 (`strata_cli/launch/cmd.py:104-107`; `strata_control/drafting.py:1-20`)
 
 ## 使い方
 
 ```sh
-strata launch --model q2_0 --drafting mtp --plan
+strata launch --model iq3_xxs --drafting mtp --no-tui
+strata launch --preset "Office" --drafting off --no-tui
 ```
 
-`--plan` は選択結果を表示し、変更や取得を行いません。実起動時は `--plan` を外します（`strata_cli/launch/cmd.py:138-140`, `strata_cli/launch/cmd.py:733-760`）。
+モデル識別子は例です。実際には `--model` に Terminal のモデル一覧にある名前を指定します。プリセットと併用したときは、この起動での値がプリセット設定に重ねられます。 (`strata_cli/launch/cmd.py:84-85,104-107`; `strata_cli/launch/cmd.py:212-218,249-250`)
 
 ## 値と既定値
 
-- `auto`: `strata_control/drafting.py` の GPU architecture クラス別推奨表から選びます。判定は最初に表に一致したカードの architecture を使い、未知・空の architecture は `other` です（`strata_control/drafting.py:58-79`）。この revision の全推奨行は MTP のため、現状の `auto` は MTP を選びます（同 `:50-56`）。
-- `mtp`: engine 標準の MTP drafter を使います。
-- `dflash2`: DFlash2 drafter を要求します。現 revision では serve 時の適用が無効なため、後述のとおり MTP にフォールバックします。
-- `off`: draft layer を無効にします。
-- 省略時: 新規設定では `LaunchSettings.drafting` は `None` で、`drafting` module の既定 `auto` として扱われます。プリセットを指定した場合は、プリセット値が残ります。コマンドライン指定はプリセット値を上書きします（`strata_cli/launch/settings.py:77-95`, `strata_cli/launch/cmd.py:197-203,234-235`, `strata_control/drafting.py:23-25,136-139`）。
+- `auto`: LaunchSettings の初期値。プリセットを指定しない場合は `None`（Auto）で、`strata_control.drafting` がモデル・backend・engine に応じて MTP または DFlash2 を決めます。プリセットに drafting の選択が保存されていれば、それを引き継ぎます。 (`strata_cli/launch/settings.py:110-129`; `strata_cli/launch/cmd.py:212-218`; `strata_control/drafting.py:34-41,404-406`)
+- `mtp`: モデルの MTP draft layer を使います。
+- `dflash2`: DFlash2 を選びます。対応モデル・engine で pack が未取得なら起動準備時に取得を試みます。
+- `off`: MTP と DFlash2 の両方を使いません。 (`strata_control/drafting.py:784-794`)
 
-parser は前後空白を除き小文字化してから候補と照合します。従って大文字・前後空白を含む表記も同じ値に正規化されます。候補外の値は `argparse.ArgumentTypeError` となり、選択肢を含む usage error で終了します（`strata_cli/launch/cmd.py:37-45,104-107`）。
+値は前後空白を除いて小文字化してから照合されるため、大文字・小文字は区別されません。ほかの文字列は parser の型変換で拒否され、選択肢と近い値があれば候補を添えた argparse エラーになります。 (`strata_cli/launch/cmd.py:37-45,104-107`)
+
+`--drafting` を省略すると、新しい設定では Auto、`--preset` 使用時は保存済み設定が基準です。明示した値は `settings_from_args` がその設定に上書きします。なお DeepSeek-V4.1 では launch config にこの選択を書き込まず、DeepSeek 独自の DSpark 経路を使います。 (`strata_cli/launch/settings.py:127`; `strata_cli/launch/cmd.py:212-218,249-250`; `strata_cli/launch/runner.py:533-549`; `strata_cli/launch/runner.py:2473-2479`)
 
 ## 実行時の動作
 
-値を指定すると `settings_from_args` が設定オブジェクトへ反映します。起動設定生成時は値を run config の `drafting` に保存し、server が各 engine 起動時に `drafting.apply` を呼んで engine 引数を調整します（`strata_cli/launch/cmd.py:234-235`, `strata_cli/launch/runner.py:371-407`, `serve/server.py:3086-3096`）。`--save-preset NAME` を併用すれば選択はプリセットに保存され、既存プリセットを `--preset` で指定しただけならフラグの変更はその起動分のみです（`strata_cli/launch/cmd.py:788-792`）。
-
-`off` は run config の `mtp` を false にし、draft-layer helper で `--mtp` 引数を除去します。`--mtp off` も同じく draft layer を切ります。一方、明示的な `--drafting mtp` / `dflash2` は、保存設定に `mtp: false` があっても server 側で true に戻します（`strata_cli/launch/runner.py:392-407`, `strata_control/drafting.py:215-230`, `serve/server.py:3097-3102`）。
-
-### 現 revision の DFlash2 制約
-
-`strata_control/drafting.py` は `ENGINE_SERVES_DFLASH2 = False` と定義しています。このため `dflash2` を指定しても、対象 family の場合は「この mode では DFlash2 は利用不可」、対象外 family の場合は「Qwen3.8-Flash-Next 専用」という理由を記録し、MTP を使います。`auto` も現在の推奨表では MTP です（`strata_control/drafting.py:50-56,141-155,162-176`）。engine 引数として `--draft dflash2 --draft-model ...` を付ける経路はフラグが有効な場合の実装としてありますが、この revision の serve 選択からは到達しません（同 `:172-176`）。
-
-Runner の不足 drafter 取得も `needs_pack` が true のときだけ行われ、同関数も `ENGINE_SERVES_DFLASH2` を条件に含めます。したがって現 revision でこの option を指定したことによる DFlash2 取得・pack 作成は発生しません（`strata_cli/launch/runner.py:1212-1233,1730-1737`, `strata_control/drafting.py:179-184`）。これは parser の help が記す「DFlash2 は一度 1.2 GB を取得し、不適用時は MTP」という説明のうち、取得部分が現行 serve 条件と一致しないことを示します（parser help: `strata_cli/launch/cmd.py:104-107`; 実装条件: `strata_control/drafting.py:141-146,172-184`）。
+- Auto は通常、DFlash2 対応モデルかつ利用可能な engine なら DFlash2、それ以外は MTP に解決されます。対応 family は `qwen`、`gyro`、`unsloth`。DFlash2 engine 対応 backend は CUDA、HIP、Metal、SYCL です。実際の判定はモデル名/family、backend、engine、MTP の有無などを `decide` に渡して行います。 (`strata_control/drafting.py:34-41,254-258,664-691`; `strata_cli/launch/modelstate.py:84-92`)
+- DFlash2 は複数同時リクエストなどの併用不可条件に当たる場合、または pack / vocabulary が使えない場合に適用できません。適用不能時は MTP があれば MTP、なければ drafting なしへ切り替え、理由を通知します。DFlash2 は1リクエストずつ処理するため、Auto が DFlash2 になる条件で並列数を指定しなければ、Terminal は1リクエストに設定する旨を通知します。利用者が複数リクエスト数を明示した場合はその数を維持し、MTP に切り替わります。 (`strata_control/drafting.py:534-542,664-702`; `strata_cli/launch/runner.py:1567-1579`)
+- DFlash2 pack が必要でデータディレクトリが判明しているとき、起動準備で selector pack のローカル変換（該当engineの場合）を行い、続けて pack を取得します。取得失敗は warning として記録し、MTP が利用可能なら MTP で、そうでなければ drafting なしで起動を続けます。 (`strata_cli/launch/runner.py:1581-1606`)
+- `--drafting off` は launch config の `mtp` を false にし、既存 engine 引数から MTP 指定を取り除きます。`--mtp off` も draft layer を無効にします。明示的な `--drafting mtp` 等は既存の `mtp: false` を上書きして有効化する場合があります。 (`strata_cli/launch/runner.py:558-565`; `strata_control/drafting.py:807-820`)
+- 全カード分割 engine が対象となるとき、Auto はこの engine が実行する MTP を計画・取得対象にします。明示した `dflash2` または `off` は全カード分割 engine の選択条件に合わず、通常の layer split 経路になります。分割に必要な MTP ファイルがない場合、`--split-engine on` では不足を通知して通常の layer split に戻ります。 (`strata_cli/launch/runner.py:1511-1518,1552-1565,1652-1661`; `strata_control/split_engine.py:461-471`)
+- エンジン引数には選択された drafter の設定だけが残るよう変換されます。MTP は DFlash2 の引数を除去し、DFlash2 は MTP 引数を除去して DFlash2 の engine flags を追加します。 (`strata_control/drafting.py:784-831`)
 
 ## 適用条件と副作用
 
-- DFlash2 の対応 family は `qwen` と `gyro`、モデル名 fallback 判定は Qwen3.8-Flash-Next 系に限られます。ただし family が与えられる Terminal 起動では family で判定されます（`strata_control/drafting.py:102-111`）。現 revision では serve 非対応判定が優先され、DFlash2 は起動されません。
-- `--plan` は推奨・選択結果だけを表示し、設定変更や download をしません（`strata_cli/launch/runner.py:1851-1862`, `strata_cli/launch/cmd.py:733-760`）。
-- 実起動では run config が launch 用の JSON ファイルとして書かれます（`strata_cli/launch/runner.py:1235-1244`）。`--save-preset` を使う場合はプリセットの保存も行います（`strata_cli/launch/cmd.py:788-792`）。
-- engine の `/metrics` に記録された実 drafter が要求と異なる場合、Runner は起動後に理由を通知します。通知取得は best effort で、接続に失敗した場合は追加表示しません（`strata_cli/launch/runner.py:1660-1672`; 状態構築: `serve/server.py:1128`, `strata_control/drafting.py:280-290`）。
+DFlash2 は Qwen3.8-Flash-Next 系（`qwen`、`gyro`、`unsloth` family）向けです。指定してもモデルや環境が対応しない場合は parser で拒否されず、通常は MTP へ fallback します。 (`strata_control/drafting.py:254-258,664-691,796-801`)
+
+DFlash2 が未取得の場合、ネットワーク取得とローカル pack 生成が発生することがあります。全カード分割 engine で Auto を使う場合は MTP draft layer の取得が起動準備の対象になり得ます。`--plan` は起動時に必要な MTP / DFlash2 を表示しますが、計画表示メソッド自体は変更・ダウンロードを行わないと記載されています。 (`strata_cli/launch/runner.py:1581-1598,2260-2284,2473-2488`; `strata_cli/launch/runner.py:2473-2475`)
 
 ## 出力とエラー
 
-- 不正な値は parser の usage error になります。値を取らない `--drafting` や後続値の欠落も parser で拒否されます（`strata_cli/launch/cmd.py:104-107`; parser 登録と parse: `strata_cli/cli.py:2223-2231`）。
-- `--drafting dflash2` が現 revision で適用できない場合、server は `[strata] drafting: ...` を標準出力へ出し、engine の `/metrics` にも理由を載せます。起動自体は MTP で続行します（`serve/server.py:3088-3096`, `strata_control/drafting.py:162-176,280-290`）。
-- `--plan` の人間向け表示には選択された drafter と fallback 理由が含まれます。JSON 出力では計画データの `drafting` に入ります（`strata_cli/launch/cmd.py:733-759`, `strata_cli/launch/runner.py:1846-1860`）。
+無効な値は parser の validation error になります。DFlash2 が利用できない理由や取得失敗は warning / notice として表示され、実装上、取得失敗だけを理由に launch を中止せず代替 drafting で続行します。全カード分割 engine を明示的に要求して MTP layer がない場合は、必要な layer と `--drafting mtp` を案内して通常の layer split へ戻します。 (`strata_cli/launch/cmd.py:37-45`; `strata_cli/launch/runner.py:1581-1606,1652-1661`)
 
 ## 根拠
 
-- parser、値検証、help: `strata_cli/launch/cmd.py:37-45,75-107`
-- CLI 値から設定への反映、plan・起動・preset 保存: `strata_cli/launch/cmd.py:197-235,733-760,784-800`
-- 値の既定、推奨表、DFlash2 の判定・fallback: `strata_cli/launch/settings.py:77-95`, `strata_control/drafting.py:23-30,50-79,136-184,215-230`
-- 起動 config と MTP 相互作用: `strata_cli/launch/runner.py:371-407,1212-1244`
-- server の各起動への適用、通知: `serve/server.py:3086-3102`; `strata_cli/launch/runner.py:1660-1672`
-- 実行計画での適用結果: `strata_cli/launch/runner.py:1851-1862`
+- `strata_cli/launch/cmd.py:37-45,104-107,212-218,247-250` — parser 値の検証、選択肢、設定への反映。
+- `strata_cli/launch/settings.py:110-129` — 初期値とプリセット設定フィールド。
+- `strata_cli/launch/runner.py:533-565,936-957` — launch config と setup 引数への反映。
+- `strata_cli/launch/runner.py:1511-1518,1552-1565,1581-1606,1652-1661,2260-2284,2473-2488` — Auto 解決、分割 engine、取得・fallback、計画表示。
+- `strata_control/drafting.py:34-41,254-258,404-406,534-542,664-702,784-831` — 選択肢、対応条件、fallback と engine 引数構成。
+- `strata_control/split_engine.py:461-471` — 全カード分割 engine が受け付ける drafting 条件。
+
+注: CLI の `--help` は実行していません。現行ソースの parser と実装を根拠にしています。backend ごとの実機動作や全モデル・engine 組み合わせは、この調査では実行確認していません。
