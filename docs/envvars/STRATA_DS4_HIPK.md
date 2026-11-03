@@ -1,48 +1,45 @@
 # `STRATA_DS4_HIPK`
 
-調査対象: Strata `main` の HEAD `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。Strata checkout の `git status --short --branch` は `## main...origin/main`。
 
 ## 役割
 
-DeepSeek-V4.1 の DS4 i-quant expert set 計算で、HIP gfx12 向け WMMA カーネルを使用するか、また使用時に重みをどこへ展開するかを制御します。通常は gfx12 で WMMA カーネルが有効です。値の先頭が `0` ならこの経路を無効にし、従来の set kernel へ進みます。`atoi()` の結果が `2` の場合は WMMA の shared-memory 重みカーネルを選び、それ以外では重みをレジスタで扱うカーネルを選びます。
+HIP ビルドの DSV41 IQ expert gate/up・down カーネルで、gfx12 / gfx11 の WMMA カーネルを使うかを選びます。対象は `IQ2_XXS`、`IQ2_XS`、`IQ2_S`、`IQ3_XXS`、`IQ3_S`、`IQ4_XS`、`IQ1_S`、`IQ1_M`、`IQ4_NL` です。ほかの型や条件に合わない入力では、この経路は使われず、呼び出し元が通常の `set_kernel` を起動します（`src/dsv41/ds4_iq_hip.inc:21-23,296-334`、`src/dsv41/ds4_iq.cu:1185-1201`）。
 
 ## 値と判定
 
-| 設定値 | gfx12 WMMA 経路 | WMMA 内の方式 |
-|---|---|---|
-| 未設定 | 有効 | レジスタ方式（`atoi` の既定値 0） |
-| 空文字 | 無効（先頭文字が `\0`） | 到達しない |
-| 先頭文字が `0` | 無効 | 到達しない |
-| `atoi()` が `2` になる値（例: `2`, `2abc`） | 有効 | shared-memory 方式 |
-| その他（例: `1`, `3`, `abc`, `-2`） | 先頭が `0` でなければ有効 | レジスタ方式 |
+デバイス許可判定では値の先頭文字を直接比較し、許可後のカーネル選択では `std::atoi` を使います。そのため、値の意味は GPU 世代ごとに異なります。
 
-判定は一貫した真偽値 parse ではありません。デバイス可否判定は先頭文字だけを見て `0` を除外し、別の判定は `atoi()` で整数の先頭部分を読みます。したがって `02` は先頭判定で無効、`2abc` は shared-memory 方式、`abc` は有効なレジスタ方式になります。空白や大文字小文字の正規化はありません。
+| GPU 世代 | 未設定 | 設定時の許可判定（`ok_device()`） | 許可後のカーネル選択 |
+|---|---|---|---|
+| gfx12 (`gfx12` prefix) | 有効 | 先頭文字が `0` なら無効。それ以外は有効（空文字を含む） | `atoi` 結果が `2` なら共有メモリ重みカーネル。それ以外はレジスタ重みカーネル |
+| gfx11 (`gfx11` prefix) | gfx1151 のみ有効。それ以外は無効 | 先頭文字が `1` の場合だけ有効。空文字を含むそれ以外は無効 | gfx11 では整数値 `2` は不採用。それ以外の値はレジスタ重みカーネル |
+| その他 / device property 取得失敗 | 無効 | 無効 | この経路に入らない |
+
+`ok_device()` は gfx12 では「未設定なら有効、設定値の先頭が `0` なら無効」という判定です。gfx11 では明示値の先頭が `1` のときだけ有効で、未設定時は gfx1151 だけ既定で有効です。設定値 `0` は gfx11 / gfx12 の両方で無効になります（`src/dsv41/ds4_iq_hip.inc:254-270`）。
+
+許可後の `launch()` は、未設定なら `0`、設定時は `std::atoi` の結果を静的変数に保存します。`atoi` は数値として読めない文字列を `0` とし、先頭の整数部分を変換します。従って gfx12 では `2` や `2tail` が共有メモリ重みカーネル、`1`・`10`・`true`・空文字はレジスタ重みカーネルになります。ただし `0` と `0tail` は先の許可判定で経路自体が無効です。gfx11 は先頭が `1` で始まる文字列だけが許可され、整数変換結果が `2` の値は通常この条件と両立しません（`src/dsv41/ds4_iq_hip.inc:260-267,305-334`）。
 
 ## 有効になる条件
 
-- `STRATA_BUILD_DSV41=ON` でビルドされた `strata-dsv41` の DS4 経路であること。CMake ではこのターゲットは既定でビルドされません。
-- HIP ビルドであること（`ds4_iq_hip.inc` は `STRATA_USE_HIP` の場合だけ含まれます）。実行中のデバイス名が `gfx12` で始まる必要があります。
-- IQ 対応形式（IQ2_XXS/XS/S、IQ3_XXS/S、IQ4_XS、IQ1_S/M、IQ4_NL）の gate/up または down set kernel であること。TQ 形式は別経路です。
-- expert 行数 `a.max_rows` が16より大きく、次元・stride・アドレス整列が実装の条件を満たすこと。`K` は256の倍数、`N` は64の倍数、`ldx` は8の倍数、`ldo` は2の倍数で、入力ポインターは16-byte aligned が必要です。さらに選択したタイル幅で `N` が割り切れない場合も専用 launch は失敗扱いとなり、呼び出し元の通常 set kernel に戻ります。
-- 対応する AMD gfx12 の WMMA 組み込み命令を含む HIP 用ターゲットであること。組み込み関数は `__gfx1200__` / `__gfx1201__` でないコンパイル時には積和を行わず、入力 accumulator を返します。
+- HIP ビルドで `STRATA_USE_HIP` が定義され、DSV41 IQ カーネルの `launch_set()` 経由であること。CUDA ビルドでは `hipk::launch()` の呼び出しがコンパイル対象になりません（`src/dsv41/ds4_iq_hip.inc:10-12`、`src/dsv41/ds4_iq.cu:1184-1195`）。
+- デバイス名が gfx12 または gfx11 として認識され、上表の許可判定を通ること。通常の gfx11 では `=1` 等の opt-in が必要で、gfx1151 は未設定時に有効です（`src/dsv41/ds4_iq_hip.inc:254-270`）。
+- 型が上記9種で、`a.max_rows > 16`、K が256の倍数、N が64の倍数、`ldx` が8の倍数、`ldo` が2の倍数、入力ポインターが16-byte aligned であること（`src/dsv41/ds4_iq_hip.inc:21-23,296-304`）。
+- 呼び出し元で trellis 型に分岐せず、寸法の事前条件を満たして IQ set kernel に到達すること。gate/up は `a.tg`、down は `a.td` を dispatch します（`src/dsv41/ds4_iq.cu:1625-1660`）。
 
-値が有効でも以上の条件を満たさなければこの経路は使われません。
+これらのいずれかを満たさない場合、`hipk::launch()` は `false` を返し、`launch_set()` は標準 `set_kernel` を起動します。従って有効な環境変数値だけでは WMMA カーネルの使用は保証されません（`src/dsv41/ds4_iq_hip.inc:297-304`、`src/dsv41/ds4_iq.cu:1186-1201`）。
 
 ## 実行時の詳細
 
-`ok_device()` は GPU ごとの `static std::atomic<int>` に判定を保存します。各 GPU で最初にこの判定を通った後に環境変数を変更しても、その GPU の gfx12 可否は再評価されません。gfx12 で、対応型かつ `max_rows > 16`、shape/alignment 条件を通過した場合に限り、関数テンプレートごとの `static` 値として `atoi(STRATA_DS4_HIPK)` を読みます。この値が `2` なら shared-memory 重みカーネル、そうでなければレジスタ重みカーネルを選びます。設定変更はそれぞれの static 判定後には反映されません。
+`ok_device()` はデバイスごとの `static std::atomic<int> state[16]` に判定を保存し、各 device につき初回判定時に環境変数を読みます。別に、条件を通過した `launch<T, GU>()` ごとの `static const int var` が `atoi` 結果を初回呼び出し時に cache します。プロセス実行中に環境を変更しても、既に cache された device / template instantiation の判定は更新されません。後から初めて呼ばれる template instantiation ではその時点の環境を読み得ます（`src/dsv41/ds4_iq_hip.inc:237-270,296-308`）。
 
-レジスタ方式では別変数 `HIPK_CFG` が読み取られ、値1〜5かつ `max_rows <= 32` のときに対応するタイル構成を選びます。それ以外は行数に応じた既定タイル構成です。これは `STRATA_DS4_HIPK` の説明対象外の相互作用として記載しています。
+gfx12 では整数値 `2` が共有メモリに重みを展開する `set_kernel` を選び、その他の許可値は重みをレジスタに置く `runr` 系の WMMA カーネルを選びます。後者は `HIPK_CFG` によるタイル構成選択を持ちます。gfx11 は共有メモリ重みカーネルを使わず、許可された場合は `runr` 系になります（`src/dsv41/ds4_iq_hip.inc:305-334`）。
 
-環境変数によるログや警告はこの経路にはありません。専用 launch が条件不一致または launch error で `false` を返す場合、`launch_set()` は共通の WMMA（CUDA の場合）または通常の set kernel を選択します。
+この環境変数を読んだこと自体を報告するログや、無効値に対する警告は確認できません。WMMA 経路が選べない場合は通常カーネルに続行します。WMMA kernel launch の直後は `cudaPeekAtLastError()` の結果を返し、失敗なら `launch_set()` は通常カーネル側へ進みます（`src/dsv41/ds4_iq_hip.inc:286-294`、`src/dsv41/ds4_iq.cu:1186-1201`）。
 
 ## 根拠
 
-- `src/dsv41/ds4_iq_hip.inc:18-20,220-270` — 対象形式、デバイス判定、環境値の parse、tile 選択。
-- `src/dsv41/ds4_iq_hip_r.inc:168-176` — レジスタ重み方式の grid 条件と launch。
-- `src/dsv41/ds4_iq.cu:1177-1194,1408-1455` — HIP 専用 include、set kernel dispatch と fallback。
-- `src/dsv41/ds4_iq.cu:1101-1116` — DS4 i-quant dispatch 対象形式。
-- `src/dsv41/ds4_iq_hip.inc:22-27` — WMMA 組み込み関数のコンパイル時 architecture 条件。
-- `CMakeLists.txt:797-811` — `STRATA_BUILD_DSV41` は既定 OFF、ON 時に `strata-dsv41` を構成。
-- `cmake/hip_backend.cmake:94-108` — HIP ターゲットに `STRATA_USE_HIP=1` を定義。
-- `docs/DETAILS.md:2491-2496` — gfx12 向け fused prompt expert の記述はありますが、`STRATA_DS4_HIPK` の値、挙動、測定結果は記載されていません。
+- 環境変数の全ソース参照: `src/dsv41/ds4_iq_hip.inc:260-266,305-306`。その他の一致は同ファイルのコメント、`src/dsv41/ds4_iq.cu:1188` のコメント、および `tests/dsv41/iq_expert_test.cpp:519` のテストコメントです。別の実読み取り箇所はありません。
+- WMMA カーネルの型・入力条件・2系統の選択: `src/dsv41/ds4_iq_hip.inc:21-23,286-334`。
+- HIP 条件と呼び出し元の標準カーネル fallback: `src/dsv41/ds4_iq_hip.inc:10-12,297-304`、`src/dsv41/ds4_iq.cu:1184-1201,1625-1660`。
+- `docs/DETAILS.md` と `docs/AMD_HIP.md` には、この変数固有の動作説明や測定条件を確認できませんでした。性能や精度の効果はここでは主張しません。
