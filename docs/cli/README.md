@@ -21,8 +21,8 @@
 
 - 機械照合: `strata_cli.cli.parser()` を現行 checkout で import して `_actions` と `_SubParsersAction.choices` を再帰 walk し、103 parser の option 集合を索引の href ディレクトリ（`<tool-id>/<command-path>/`）と突き合わせました。C++ 側は `src/program/generate.cpp`・`src/qwen35/q36_engine.cu`・`src/dsv41/ds4_main.cpp`・`tools/vision/strata_vision.cpp`・各 `*_main.cpp` の `"--xxx"` 文字列、Python 側は `setup.py`・`metal/setup_mac.py`・`tools/strata_bench.py` の `add_argument` を AST で拾って照合しました。option 文字列 inventory は `python3 .agents/skills/strata-investigate/scripts/cli-grammar.py` で `.cli-grammar.json`（revision `ffa80d73…`）として保存済みです。
 - 追加 4 節: `strata components engines` / `use` / `remove`（Terminal）と tool-id `strata-split`。
-- 既存節への option 追加 24 件: `strata update` と `strata components update` に `--yes` / `--stop-model` / `--start-again`（`strata_cli/update_cmd.py:67-69` と `:77-79`）、`strata drafting plan` / `fetch` に `--no-split`（`strata_cli/drafting_cmd.py:28-29`）、`strata launch` に `--split-engine` / `--backend`（`strata_cli/launch/cmd.py:108,117`）、エンジン `strata` に `--draft-rule` / `--draft-mtp-spec` / `--draft-mtp-min-p` / `--draft-fallback`（`src/program/generate.cpp:3579-3584`）、`--lookup-max-t` / `--lookup-sizes`（`src/program/generate.cpp:3551-3552`）、`--ram-keep-gib`（`src/program/generate.cpp:3657-3658`）、`strata-dsv41` に `--parallel`（`src/dsv41/ds4_main.cpp:2583-2584`）、`--vision-resident` / `--vision-lazy`（`src/dsv41/ds4_main.cpp:2552-2553`）、`--multi-check`（`src/dsv41/ds4_main.cpp:2590`）、`--sampler-test`（`src/dsv41/ds4_main.cpp:2491`）、`setup.py` に `--prepare-pack`（`setup.py:9658`）と `--drafter`（`setup.py:9693`）。
-- 削除・改名 0 件。索引に載っていた option で現行 parser に無いものは上記照合で 0 件でした（`strata-terminal` 103 節、`strata-engine` 2 節（`root/` と `qwen36/`）、`strata-engine-dsv41` 1 節、`strata-vision` 1 節、`strata-split` 1 節、CMake 単体 CLI 8 節、`source-setup` 2 節（`root/` と `mac/`）、`quick-benchmark` 1 節を突合済み）。
+- 既存節への option 追加 23 件: `strata update` と `strata components update` に `--yes` / `--stop-model` / `--start-again`（`strata_cli/update_cmd.py:67-69` と `:77-79`）、`strata drafting plan` / `fetch` に `--no-split`（`strata_cli/drafting_cmd.py:28-29`）、`strata launch` に `--split-engine` / `--backend`（`strata_cli/launch/cmd.py:108,117`）、エンジン `strata` に `--draft-rule` / `--draft-mtp-spec` / `--draft-mtp-min-p` / `--draft-fallback`（`src/program/generate.cpp:3579-3584`）、`--lookup-max-t` / `--lookup-sizes`（`src/program/generate.cpp:3551-3552`）、`--ram-keep-gib`（`src/program/generate.cpp:3657-3658`）、`strata-dsv41` に `--parallel`（`src/dsv41/ds4_main.cpp:2583-2584`）、`--vision-resident` / `--vision-lazy`（`src/dsv41/ds4_main.cpp:2552-2553`）、`--multi-check`（`src/dsv41/ds4_main.cpp:2590`）、`setup.py` に `--prepare-pack`（`setup.py:9658`）と `--drafter`（`setup.py:9693`）。
+- 削除・改名 0 件。索引に載っていた option で現行 parser に無いものは上記照合で 0 件でした。逆に機械抽出が拾った `--sampler-test` は、`src/dsv41/ds4_main.cpp:2490-2492` の `STRATA_METAL` build 限定 special arg（`src/dsv41/sampler_stat.inc` の統計 harness へ渡す）で、既存注記どおり option 一覧には含めません（一度追加し、削除した）（`strata-terminal` 103 節、`strata-engine` 2 節（`root/` と `qwen36/`）、`strata-engine-dsv41` 1 節、`strata-vision` 1 節、`strata-split` 1 節、CMake 単体 CLI 8 節、`source-setup` 2 節（`root/` と `mac/`）、`quick-benchmark` 1 節を突合済み）。
 - 文書中の source 行番号は現行 checkout に合わせて更新しました（`--no-kv-grow` は `src/program/generate.cpp:3360`、`strata-dsv41` の `--help` / `--version` は `src/dsv41/ds4_main.cpp:2593` / `:2570`、`setup.py` の parser は `setup.py:9568` で option 宣言 56 個、`help=argparse.SUPPRESS` は `setup.py:9595-9603,9716`、Mac 委譲は `setup.py:9566` から `mac_setup`（`setup.py:7944-7948`）経由、`metal/setup_mac.py` の `parse_known_args` は `:362-364`）。
 
 ## `strata-terminal`
@@ -1457,7 +1457,7 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 
 `STRATA_BUILD_DSV41=ON` かつ `STRATA_HIP_GFX906` でない build で生成される独立 engine CLI です。macOS の Metal build では同じ入口 `src/dsv41/ds4_main.cpp` から CMake target `strata_ds4` (`metal/CMakeLists.txt:165`) が作られ、`packaging/mac/build_dsv41_engine.sh` がそれを `strata-dsv41` として staging します。Release への同梱はこの source inventory だけでは断定せず、[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-03 実測で v0.2.10 に `strata-dsv41-0.1.56-*` archive 6 件（linux-x86_64 cuda-cuda13 / hip-rx9070、linux-aarch64 cuda-cuda13、macos-arm64 metal、windows-x86_64 cuda-cuda13 / hip-rdna3）が並ぶことを確認しました。`--help` は `-h` も受理し (`src/dsv41/ds4_main.cpp:2593`)、`--version` は build id を表示します (`src/dsv41/ds4_main.cpp:2570`)。
 
-`--sampler-test` は option 一覧に含めません。`src/dsv41/ds4_main.cpp:1287` で argv[1] がちょうどこの値のときにだけ sampler の統計 harness へ引数を渡す分岐で、その harness は `#if defined(STRATA_METAL)` で `strata_ds4` に組み込まれる `src/dsv41/sampler_stat.inc` の個別検証用コードです（CMake の単独 target はありません）。
+`--sampler-test` は option 一覧に含めません。`src/dsv41/ds4_main.cpp:2490-2492` で argv[1] がちょうどこの値のときにだけ sampler の統計 harness へ引数を渡す分岐で、その harness は `#if defined(STRATA_METAL)` で `strata_ds4` に組み込まれる `src/dsv41/sampler_stat.inc` の個別検証用コードです（CMake の単独 target はありません）。
 
 - [`--cpu-threads`](strata-engine-dsv41/root/--cpu-threads.md)
 - [`--dspark`](strata-engine-dsv41/root/--dspark.md)
@@ -1487,7 +1487,6 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - [`--profile-readonly`](strata-engine-dsv41/root/--profile-readonly.md)
 - [`--profile-run`](strata-engine-dsv41/root/--profile-run.md)
 - [`--reserve-mib`](strata-engine-dsv41/root/--reserve-mib.md)
-- [`--sampler-test`](strata-engine-dsv41/root/--sampler-test.md)
 - [`--score`](strata-engine-dsv41/root/--score.md)
 - [`--score-out`](strata-engine-dsv41/root/--score-out.md)
 - [`--seed`](strata-engine-dsv41/root/--seed.md)
