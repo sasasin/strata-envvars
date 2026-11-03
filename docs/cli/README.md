@@ -2,19 +2,28 @@
 
 この索引は Strata のユーザー向け CLI 入口と、そのコマンド階層ごとのオプション文書を列挙します。リンク先の文書は今後作成する予定の項目も含みます。したがって、現時点でリンク先の Markdown が未作成でも、この索引では予定パスとして掲載しています。
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査、commit 日 2026-10-31）。`git status --short --branch` は working tree clean（branch `main` = `origin/main`）、`git describe --tags` は `v0.2.9` で `git log v0.2.9..HEAD` は 0 件です。
+調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 調査、commit 日 2026-11-02）。`git status --short --branch` は working tree clean（branch `main` = `origin/main`）、`git describe --tags` は `v0.2.10` で、annotated tag `v0.2.10`（tag オブジェクト `db0500a53119a349fa44497099d6e28a83ded34a`）の peel 先がこの commit そのものです（`git log v0.2.10..HEAD` は 0 件）。
 
 文書配置と調査基準は [`001_investigation.md`](001_investigation.md)、CLI 入口と配布形態は [`000_cli_tools.md`](000_cli_tools.md) を参照してください。各コマンドの概要ページは `docs/cli/<tool-id>/<command-path>/README.md`、オプション文書は `docs/cli/<tool-id>/<command-path>/<option-name>.md` に置きます。以下の「コマンド概要」とオプションのリンク先は、今後作成する予定のものも含みます。短縮名・同じ parser action の alias は正規の長い名前の文書にまとめます。
 
 ## 索引の対象境界
 
-- `strata-terminal`: `strata_cli/cli.py` の root parser と、そこから登録されるサブコマンド parser。`strata_cli/launch/cmd.py` の `launch` / `connect`、`strata_cli/update_cmd.py`、`strata_cli/tune_commands.py`、`strata_cli/drafting_cmd.py`、`strata_cli/monitor_commands.py` で定義される parser も同じ索引に入れます。POSIX/Windows の wrapper は同じ Python CLI を起動するため共通索引です。
+- `strata-terminal`: `strata_cli/cli.py` の root parser と、そこから登録されるサブコマンド parser。`strata_cli/launch/cmd.py` の `launch` / `connect`、`strata_cli/update_cmd.py`、`strata_cli/tune_commands.py`、`strata_cli/drafting_cmd.py`、`strata_cli/monitor_commands.py` で定義される parser も同じ索引に入れます。POSIX/Windows の wrapper は同じ Python CLI を起動するため共通索引です。`strata components engines` / `use` / `remove` は `strata_cli/update_cmd.py:82-90` で登録され、`strata_cli/cli.py:140` を経由して `--json` / `--quiet` の後付けも受けます（v0.2.10 で追加されたコマンド）。
 - `strata-engine`: CMake で作られるネイティブ `strata` 推論エンジンの `src/program/generate.cpp` の引数 parser。`main` 冒頭の family switch で `--native` / `--model` が示す GGUF が `qwen35moe` のとき `src/qwen35` の別ファミリー実装へ移り、そこでの引数 parser は `strata-engine` 内の別 scope `qwen36/` にして索引に含めます。
 - `source-setup`: `setup.sh`、`START-HERE.bat`、`SETUP.bat`、`update.sh`、`UPDATE.bat` が委譲する `setup.py` のオプション。ラッパー独自の引数解釈はなく、同じオプション文書を共有します。Apple Silicon で `STRATA_CONTROL_INSTALL=1` を置かずに `setup.py` を実行すると `metal/setup_mac.py` へ委譲され、そちらは独自の parser を持つため `source-setup` 内の別 scope `mac/` にします。`--backend sycl` で呼ばれる `sycl/setup_intel.py` は独自の option parser を持たず `setup.py` の `main()` を argv を組み替えて再実行するので、`root/` の一覧を共用します。
 - `strata-vision`: `tools/vision/CMakeLists.txt` が作る画像読み取り CLI (`tools/vision/strata_vision.cpp`)。engine package に同梱される独立実行ファイルで、Terminal CLI のサブコマンドではありません。build option で `strata-vision-hip` / `strata-vision-sycl` などの別プログラム名・GPU 版になりますが、parser は同じなので scope は分けず、program 名の違いは `strata-vision/root/` の注記にまとめます。
+- `strata-split`: engine package に同梱される全カード分割 engine（`src/split/`、sFNX 由来・MIT、`docs/SPLIT_ENGINE.md`）。CMake target は `strata-split-<N>`（N は 2/3/4 のみ。`src/split/CMakeLists.txt:92-97`）で、配布される実行ファイル名は NVIDIA が `strata-split-N-sm<cc>`、AMD が `strata-split-N-<arch>`（`strata_control/split_engine.py:494-497`）。Terminal が engine component の `strata` と同じフォルダから探して起動するため、製品 engine の独立 CLI として `strata-split` tool-id にします（`strata-vision` と同じ扱い）。同じ folder にある `src/split/tools/` 系の `split_fnx_run`・`split_convert_dump`・`split_moe_tile_test`・`split_*_test` は開発・検証用なので対象外です。
 - `quick-benchmark`: `bench.sh` / `BENCH.bat` が委譲する `tools/strata_bench.py` のオプション。
 - GitHub Release installers `install.sh` / `install.ps1` は呼び出し時の CLI 引数を解釈せず、設定は環境変数で行うため、この索引に CLI option 文書はありません。環境変数文書側を参照してください。
-- `CMakeLists.txt` 等で生成される `*_test`、`*_parity`、`*_bench`、個別 probe・harness はビルド条件・個別用途の開発/検証プログラムです。製品 CLI のサブコマンドとして一括索引化せず、対象に含める場合は各プログラムの利用者・build target・parser を確認して別の tool-id として追加します。今回の checkout で `4b9e05a2..c62d5e3a` に増えた `add_executable` はすべて `*_test` / `*_parity` / `*_bench` / harness / probe で、索引の対象は増えていません（root の `add_executable` は 250 件）。engine package に同梱される `strata-vision` / `strata-vision-hip` / `strata-vision-sycl` (`tools/vision/CMakeLists.txt`) は利用者 CLI として `strata-vision` tool-id で追加しました。`packaging/monitor_bundle.py`、`packaging/feed_tool.py`、`packaging/package_*.py`、`docker/*.sh` など、配布物を作る helper は利用者向け CLI ではないため対象外です。
+- `CMakeLists.txt` 等で生成される `*_test`、`*_parity`、`*_bench`、個別 probe・harness はビルド条件・個別用途の開発/検証プログラムです。製品 CLI のサブコマンドとして一括索引化せず、対象に含める場合は各プログラムの利用者・build target・parser を確認して別の tool-id として追加します。v0.2.9 → v0.2.10（`c62d5e3a..ffa80d73`）で増えた `add_executable`（root 250 → 277 件、`sycl/CMakeLists.txt` 32 → 39 件）はすべて `*_test` / `*_parity` / `*_bench` / harness / probe で、既存 tool-id の対象は増えていません。新規 `src/split/CMakeLists.txt`（5 件）の製品実行ファイル `strata-split-2/3/4` だけ、上のとおり `strata-split` tool-id として追加しました（root の `add_executable` は 277 件）。engine package に同梱される `strata-vision` / `strata-vision-hip` / `strata-vision-sycl` (`tools/vision/CMakeLists.txt`) は利用者 CLI として `strata-vision` tool-id で追加しました。`packaging/monitor_bundle.py`、`packaging/feed_tool.py`、`packaging/package_*.py`、`docker/*.sh` など、配布物を作る helper は利用者向け CLI ではないため対象外です。
+
+### 索引更新 2026-11-03（v0.2.9 索引 `c62d5e3a…` → v0.2.10 `ffa80d73…`）
+
+- 機械照合: `strata_cli.cli.parser()` を現行 checkout で import して `_actions` と `_SubParsersAction.choices` を再帰 walk し、103 parser の option 集合を索引の href ディレクトリ（`<tool-id>/<command-path>/`）と突き合わせました。C++ 側は `src/program/generate.cpp`・`src/qwen35/q36_engine.cu`・`src/dsv41/ds4_main.cpp`・`tools/vision/strata_vision.cpp`・各 `*_main.cpp` の `"--xxx"` 文字列、Python 側は `setup.py`・`metal/setup_mac.py`・`tools/strata_bench.py` の `add_argument` を AST で拾って照合しました。option 文字列 inventory は `python3 .agents/skills/strata-investigate/scripts/cli-grammar.py` で `.cli-grammar.json`（revision `ffa80d73…`）として保存済みです。
+- 追加 4 節: `strata components engines` / `use` / `remove`（Terminal）と tool-id `strata-split`。
+- 既存節への option 追加 24 件: `strata update` と `strata components update` に `--yes` / `--stop-model` / `--start-again`（`strata_cli/update_cmd.py:67-69` と `:77-79`）、`strata drafting plan` / `fetch` に `--no-split`（`strata_cli/drafting_cmd.py:28-29`）、`strata launch` に `--split-engine` / `--backend`（`strata_cli/launch/cmd.py:108,117`）、エンジン `strata` に `--draft-rule` / `--draft-mtp-spec` / `--draft-mtp-min-p` / `--draft-fallback`（`src/program/generate.cpp:3579-3584`）、`--lookup-max-t` / `--lookup-sizes`（`src/program/generate.cpp:3551-3552`）、`--ram-keep-gib`（`src/program/generate.cpp:3657-3658`）、`strata-dsv41` に `--parallel`（`src/dsv41/ds4_main.cpp:2583-2584`）、`--vision-resident` / `--vision-lazy`（`src/dsv41/ds4_main.cpp:2552-2553`）、`--multi-check`（`src/dsv41/ds4_main.cpp:2590`）、`--sampler-test`（`src/dsv41/ds4_main.cpp:2491`）、`setup.py` に `--prepare-pack`（`setup.py:9658`）と `--drafter`（`setup.py:9693`）。
+- 削除・改名 0 件。索引に載っていた option で現行 parser に無いものは上記照合で 0 件でした（`strata-terminal` 103 節、`strata-engine` 2 節（`root/` と `qwen36/`）、`strata-engine-dsv41` 1 節、`strata-vision` 1 節、`strata-split` 1 節、CMake 単体 CLI 8 節、`source-setup` 2 節（`root/` と `mac/`）、`quick-benchmark` 1 節を突合済み）。
+- 文書中の source 行番号は現行 checkout に合わせて更新しました（`--no-kv-grow` は `src/program/generate.cpp:3360`、`strata-dsv41` の `--help` / `--version` は `src/dsv41/ds4_main.cpp:2593` / `:2570`、`setup.py` の parser は `setup.py:9568` で option 宣言 56 個、`help=argparse.SUPPRESS` は `setup.py:9595-9603,9716`、Mac 委譲は `setup.py:9566` から `mac_setup`（`setup.py:7944-7948`）経由、`metal/setup_mac.py` の `parse_known_args` は `:362-364`）。
 
 ## `strata-terminal`
 
@@ -225,7 +234,10 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--no-engine`](strata-terminal/components/update/--no-engine.md)
 - [`--output`](strata-terminal/components/update/--output.md)
 - [`--quiet`](strata-terminal/components/update/--quiet.md)
+- [`--start-again`](strata-terminal/components/update/--start-again.md)
+- [`--stop-model`](strata-terminal/components/update/--stop-model.md)
 - [`--wait`](strata-terminal/components/update/--wait.md)
+- [`--yes`](strata-terminal/components/update/--yes.md)
 
 ### `strata components install-file` (components/install-file)
 
@@ -259,6 +271,59 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--quiet`](strata-terminal/components/rollback/--quiet.md)
 - [`--wait`](strata-terminal/components/rollback/--wait.md)
 
+### `strata components engines` (components/engines)
+
+v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の `components_sp.add_parser("engines", …)`（「この PC に導入済みの engine と、使用中の 1 件を一覧」）。`_common()` の共通 option は `strata_cli/update_cmd.py:47-58`、`--json` / `--quiet` は `strata_cli/cli.py:508-515` の後付けで、位置引数は取りません。
+
+- [コマンド概要](strata-terminal/components/engines/README.md)
+
+- [`--backend`](strata-terminal/components/engines/--backend.md)
+- [`--components-dir`](strata-terminal/components/engines/--components-dir.md)
+- [`--feed`](strata-terminal/components/engines/--feed.md)
+- [`--force`](strata-terminal/components/engines/--force.md)
+- [`--help`（alias: `-h`）](strata-terminal/components/engines/--help.md)
+- [`--json`](strata-terminal/components/engines/--json.md)
+- [`--model-config`](strata-terminal/components/engines/--model-config.md)
+- [`--output`](strata-terminal/components/engines/--output.md)
+- [`--quiet`](strata-terminal/components/engines/--quiet.md)
+- [`--wait`](strata-terminal/components/engines/--wait.md)
+
+### `strata components use` (components/use)
+
+`strata_cli/update_cmd.py:84-87` で登録されます（導入済み engine に切り替え。download はしない、`newest` で更新追従に戻る）。位置引数 `engine` を 1 つ取ります（版番号 `0.1.54`、folder 名、または `newest`。`strata_cli/update_cmd.py:85`）。`--family` は `:86`。`_common()` は `strata_cli/update_cmd.py:47-58`、`--json` / `--quiet` は `strata_cli/cli.py:508-515`。
+
+- [コマンド概要](strata-terminal/components/use/README.md)
+
+- [`--backend`](strata-terminal/components/use/--backend.md)
+- [`--components-dir`](strata-terminal/components/use/--components-dir.md)
+- [`--family`](strata-terminal/components/use/--family.md)
+- [`--feed`](strata-terminal/components/use/--feed.md)
+- [`--force`](strata-terminal/components/use/--force.md)
+- [`--help`（alias: `-h`）](strata-terminal/components/use/--help.md)
+- [`--json`](strata-terminal/components/use/--json.md)
+- [`--model-config`](strata-terminal/components/use/--model-config.md)
+- [`--output`](strata-terminal/components/use/--output.md)
+- [`--quiet`](strata-terminal/components/use/--quiet.md)
+- [`--wait`](strata-terminal/components/use/--wait.md)
+
+### `strata components remove` (components/remove)
+
+`strata_cli/update_cmd.py:88-91` で登録されます（導入済み engine の削除。使用中のものは消せない。モデルと設定は触らない）。位置引数 `engine` を 1 つ取ります（版番号または folder 名。`strata_cli/update_cmd.py:89`）。`--family` は `:90`。`_common()` は `strata_cli/update_cmd.py:47-58`、`--json` / `--quiet` は `strata_cli/cli.py:508-515`。
+
+- [コマンド概要](strata-terminal/components/remove/README.md)
+
+- [`--backend`](strata-terminal/components/remove/--backend.md)
+- [`--components-dir`](strata-terminal/components/remove/--components-dir.md)
+- [`--family`](strata-terminal/components/remove/--family.md)
+- [`--feed`](strata-terminal/components/remove/--feed.md)
+- [`--force`](strata-terminal/components/remove/--force.md)
+- [`--help`（alias: `-h`）](strata-terminal/components/remove/--help.md)
+- [`--json`](strata-terminal/components/remove/--json.md)
+- [`--model-config`](strata-terminal/components/remove/--model-config.md)
+- [`--output`](strata-terminal/components/remove/--output.md)
+- [`--quiet`](strata-terminal/components/remove/--quiet.md)
+- [`--wait`](strata-terminal/components/remove/--wait.md)
+
 ### `strata update` (update)
 
 - [コマンド概要](strata-terminal/update/README.md)
@@ -277,7 +342,10 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--no-engine`](strata-terminal/update/--no-engine.md)
 - [`--output`](strata-terminal/update/--output.md)
 - [`--quiet`](strata-terminal/update/--quiet.md)
+- [`--start-again`](strata-terminal/update/--start-again.md)
+- [`--stop-model`](strata-terminal/update/--stop-model.md)
 - [`--wait`](strata-terminal/update/--wait.md)
+- [`--yes`](strata-terminal/update/--yes.md)
 
 ### `strata models` (models)
 
@@ -352,6 +420,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--family`](strata-terminal/drafting/plan/--family.md)
 - [`--help`（alias: `-h`）](strata-terminal/drafting/plan/--help.md)
 - [`--mode`](strata-terminal/drafting/plan/--mode.md)
+- [`--no-split`](strata-terminal/drafting/plan/--no-split.md)
 - [`--output`](strata-terminal/drafting/plan/--output.md)
 
 ### `strata drafting fetch` (drafting/fetch)
@@ -364,6 +433,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--help`（alias: `-h`）](strata-terminal/drafting/fetch/--help.md)
 - [`--if-needed`](strata-terminal/drafting/fetch/--if-needed.md)
 - [`--mode`](strata-terminal/drafting/fetch/--mode.md)
+- [`--no-split`](strata-terminal/drafting/fetch/--no-split.md)
 - [`--output`](strata-terminal/drafting/fetch/--output.md)
 
 ### `strata engine` (engine)
@@ -947,6 +1017,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--access`](strata-terminal/launch/--access.md)
 - [`--api-key`](strata-terminal/launch/--api-key.md)
 - [`--api-key-env`](strata-terminal/launch/--api-key-env.md)
+- [`--backend`](strata-terminal/launch/--backend.md)
 - [`--context`](strata-terminal/launch/--context.md)
 - [`--data-dir`](strata-terminal/launch/--data-dir.md)
 - [`--delete-preset`](strata-terminal/launch/--delete-preset.md)
@@ -981,6 +1052,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--set`](strata-terminal/launch/--set.md)
 - [`--show-key`](strata-terminal/launch/--show-key.md)
 - [`--speed`](strata-terminal/launch/--speed.md)
+- [`--split-engine`](strata-terminal/launch/--split-engine.md)
 - [`--status`](strata-terminal/launch/--status.md)
 - [`--stop`](strata-terminal/launch/--stop.md)
 - [`--tune`](strata-terminal/launch/--tune.md)
@@ -1150,7 +1222,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 
 ## `strata-engine`
 
-CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI の同名 wrapper とは別のプログラムです。一覧は `src/program/generate.cpp` の引数 parser と、parser より前に処理される引数 (`--version` / `-V`、`--families`、`--gpu` の環境変数設定、`--native` / `--model` の family switch) を基にしています。`--model` はその振り分けでしか読まれず、通常の `strata` parser は `--model` を unknown argument として拒否します。短縮表記と同一動作の alias は正規名の文書にまとめます。parser が受理していても usage/help に表示されない option があります。たとえば `--no-kv-grow` は parser (`src/program/generate.cpp:3070`) に実装されているため索引に含めています。
+CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI の同名 wrapper とは別のプログラムです。一覧は `src/program/generate.cpp` の引数 parser と、parser より前に処理される引数 (`--version` / `-V`、`--families`、`--gpu` の環境変数設定、`--native` / `--model` の family switch) を基にしています。`--model` はその振り分けでしか読まれず、通常の `strata` parser は `--model` を unknown argument として拒否します。短縮表記と同一動作の alias は正規名の文書にまとめます。parser が受理していても usage/help に表示されない option があります。たとえば `--no-kv-grow` は parser (`src/program/generate.cpp:3360`) に実装されているため索引に含めています。
 
 ### `strata` (エンジン引数)
 
@@ -1181,7 +1253,11 @@ CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI
 - [`--draft`](strata-engine/root/--draft.md)
 - [`--draft-cap`](strata-engine/root/--draft-cap.md)
 - [`--draft-conf`](strata-engine/root/--draft-conf.md)
+- [`--draft-fallback`](strata-engine/root/--draft-fallback.md)
 - [`--draft-model`](strata-engine/root/--draft-model.md)
+- [`--draft-mtp-min-p`](strata-engine/root/--draft-mtp-min-p.md)
+- [`--draft-mtp-spec`](strata-engine/root/--draft-mtp-spec.md)
+- [`--draft-rule`](strata-engine/root/--draft-rule.md)
 - [`--dump-final-r`](strata-engine/root/--dump-final-r.md)
 - [`--dump-halves`](strata-engine/root/--dump-halves.md)
 - [`--dump-layers`](strata-engine/root/--dump-layers.md)
@@ -1219,6 +1295,8 @@ CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI
 - [`--logits-stride`](strata-engine/root/--logits-stride.md)
 - [`--lookup-chain`](strata-engine/root/--lookup-chain.md)
 - [`--lookup-chain-min`](strata-engine/root/--lookup-chain-min.md)
+- [`--lookup-max-t`](strata-engine/root/--lookup-max-t.md)
+- [`--lookup-sizes`](strata-engine/root/--lookup-sizes.md)
 - [`--max-context`](strata-engine/root/--max-context.md)
 - [`--max-new`](strata-engine/root/--max-new.md)
 - [`--memory-limit-mib`](strata-engine/root/--memory-limit-mib.md)
@@ -1288,6 +1366,7 @@ CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI
 - [`--prompt-cache-root`](strata-engine/root/--prompt-cache-root.md)
 - [`--prompt-cache-spread`](strata-engine/root/--prompt-cache-spread.md)
 - [`--prompt-cache-tail`](strata-engine/root/--prompt-cache-tail.md)
+- [`--ram-keep-gib`](strata-engine/root/--ram-keep-gib.md)
 - [`--remote-expert-opt`](strata-engine/root/--remote-expert-opt.md)
 - [`--resident-budget-gib`](strata-engine/root/--resident-budget-gib.md)
 - [`--resident-cpu-experts`](strata-engine/root/--resident-cpu-experts.md)
@@ -1376,7 +1455,7 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 
 - [コマンド概要](strata-engine-dsv41/root/README.md)
 
-`STRATA_BUILD_DSV41=ON` かつ `STRATA_HIP_GFX906` でない build で生成される独立 engine CLI です。macOS の Metal build では同じ入口 `src/dsv41/ds4_main.cpp` から CMake target `strata_ds4` (`metal/CMakeLists.txt:165`) が作られ、`packaging/mac/build_dsv41_engine.sh` がそれを `strata-dsv41` として staging します。Release への同梱はこの source inventory からは断定しません（[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-01 実測では v0.2.9 に `strata-dsv41-0.1.55-*` archive 6 件が確認されています）。`--help` は `-h` も受理し (`src/dsv41/ds4_main.cpp:1379`)、`--version` は build id を表示します (`src/dsv41/ds4_main.cpp:1364`)。
+`STRATA_BUILD_DSV41=ON` かつ `STRATA_HIP_GFX906` でない build で生成される独立 engine CLI です。macOS の Metal build では同じ入口 `src/dsv41/ds4_main.cpp` から CMake target `strata_ds4` (`metal/CMakeLists.txt:165`) が作られ、`packaging/mac/build_dsv41_engine.sh` がそれを `strata-dsv41` として staging します。Release への同梱はこの source inventory だけでは断定せず、[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-03 実測で v0.2.10 に `strata-dsv41-0.1.56-*` archive 6 件（linux-x86_64 cuda-cuda13 / hip-rx9070、linux-aarch64 cuda-cuda13、macos-arm64 metal、windows-x86_64 cuda-cuda13 / hip-rdna3）が並ぶことを確認しました。`--help` は `-h` も受理し (`src/dsv41/ds4_main.cpp:2593`)、`--version` は build id を表示します (`src/dsv41/ds4_main.cpp:2570`)。
 
 `--sampler-test` は option 一覧に含めません。`src/dsv41/ds4_main.cpp:1287` で argv[1] がちょうどこの値のときにだけ sampler の統計 harness へ引数を渡す分岐で、その harness は `#if defined(STRATA_METAL)` で `strata_ds4` に組み込まれる `src/dsv41/sampler_stat.inc` の個別検証用コードです（CMake の単独 target はありません）。
 
@@ -1398,14 +1477,17 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - [`--layer-split`](strata-engine-dsv41/root/--layer-split.md)
 - [`--max-context`](strata-engine-dsv41/root/--max-context.md)
 - [`--mmap-experts`](strata-engine-dsv41/root/--mmap-experts.md)
+- [`--multi-check`](strata-engine-dsv41/root/--multi-check.md)
 - [`--n`](strata-engine-dsv41/root/--n.md)
 - [`--no-expert-cache`](strata-engine-dsv41/root/--no-expert-cache.md)
 - [`--pack`](strata-engine-dsv41/root/--pack.md)
 - [`--pack-info`](strata-engine-dsv41/root/--pack-info.md)
+- [`--parallel`](strata-engine-dsv41/root/--parallel.md)
 - [`--prefill-chunk`](strata-engine-dsv41/root/--prefill-chunk.md)
 - [`--profile-readonly`](strata-engine-dsv41/root/--profile-readonly.md)
 - [`--profile-run`](strata-engine-dsv41/root/--profile-run.md)
 - [`--reserve-mib`](strata-engine-dsv41/root/--reserve-mib.md)
+- [`--sampler-test`](strata-engine-dsv41/root/--sampler-test.md)
 - [`--score`](strata-engine-dsv41/root/--score.md)
 - [`--score-out`](strata-engine-dsv41/root/--score-out.md)
 - [`--seed`](strata-engine-dsv41/root/--seed.md)
@@ -1420,8 +1502,35 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - [`--verbose`（alias: `-v`）](strata-engine-dsv41/root/--verbose.md)
 - [`--version`](strata-engine-dsv41/root/--version.md)
 - [`--vision`](strata-engine-dsv41/root/--vision.md)
+- [`--vision-lazy`](strata-engine-dsv41/root/--vision-lazy.md)
+- [`--vision-resident`](strata-engine-dsv41/root/--vision-resident.md)
 - [`--vram-experts`](strata-engine-dsv41/root/--vram-experts.md)
 - [`--window`](strata-engine-dsv41/root/--window.md)
+
+## `strata-split`
+
+v0.2.10 で加わった全カード分割 engine（`src/split/`、sFNX 由来・MIT、設計と手順は `docs/SPLIT_ENGINE.md`）。CMake は `STRATA_BUILD_SPLIT=ON` と `STRATA_SPLIT_CARDS`（2 / 3 / 4 しか通らない。`src/split/CMakeLists.txt:92-97`）で `strata-split-${_n}` を作り、`STRATA_SPLIT_ARCH` の 1 compute capability 専用です（`CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real"`、`src/split/CMakeLists.txt:116`）。ビルドは `packaging/build_split_cuda.sh`（NVIDIA）と `packaging/build_split_hip.sh`（AMD）が担い、engine package には `package_engine.py --include 'strata-split-*'`（option 定義は `packaging/package_engine.py:311`、手順コメントは `packaging/build_split_cuda.sh:3-4`）または `SPLIT_DIR`（`packaging/build_hip_linux.sh:109-110`）で同梱します。Release には独立 asset が無く、0.1.56 の Linux / Windows archive を展開していないので実同梱は未確認です（[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-03 実測）。
+
+起動は Terminal 側が決めます。`strata launch --split-engine auto|on|off`（`strata_cli/launch/cmd.py:108`）の判断で `strata_control/split_engine.py` が engine component フォルダ内の `strata-split-N-sm<cc>` / `strata-split-N-<arch>` を探し、無いときは `this engine package has no strata-split-N` を返して通常の layer split に留まります（`strata_control/split_engine.py:438-497`）。走る引数組み立ては `strata_control/split_engine.py:252-271` で、`FNX_ARENA=0` と `FNX_EXPERT_RAM_GIB=off` を env に置きます。
+
+option inventory は `src/split/tools/sfnx.cpp:72-105` の手書き parser です。`--serve` が無いと `sfnx runs as --serve` で落ち、`--native` / `--mtp` 未指定も必須エラーです（`src/split/tools/sfnx.cpp:100-101`）。`--layer-split` は値を読むだけで、Strata 側の layer split との混同を避けるための受理です（`src/split/tools/sfnx.cpp:90`）。`--rope-scale` は環境変数 `FNX_ROPE_SCALE` と食い違うと例外、合えば `setenv` で engine に渡します（`src/split/tools/sfnx.cpp:91-96`）。`--batch` は `1..MAX_SLOTS` の範囲チェックがあります（`src/split/tools/sfnx.cpp:102`）。`--help` / `-h` option は無く、未知の引数は `unknown argument …` で例外終了です（`src/split/tools/sfnx.cpp:98`）。
+
+### `strata-split-N` (`src/split/tools/sfnx.cpp`)
+
+- [コマンド概要](strata-split/root/README.md)
+
+- [`--batch`](strata-split/root/--batch.md)
+- [`--conversation-cache-mib`](strata-split/root/--conversation-cache-mib.md)
+- [`--draft-vocab`](strata-split/root/--draft-vocab.md)
+- [`--layer-split`](strata-split/root/--layer-split.md)
+- [`--lookup`](strata-split/root/--lookup.md)
+- [`--max-context`](strata-split/root/--max-context.md)
+- [`--mtp`](strata-split/root/--mtp.md)
+- [`--native`](strata-split/root/--native.md)
+- [`--rope-scale`](strata-split/root/--rope-scale.md)
+- [`--serve`](strata-split/root/--serve.md)
+- [`--spec`](strata-split/root/--spec.md)
+- [`--vision`](strata-split/root/--vision.md)
 
 ## CMake 生成の単体 CLI（診断・開発用）
 
@@ -1510,7 +1619,7 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 
 ## `strata-vision`
 
-画像の tensor を作るための独立 CLI です。`tools/vision/CMakeLists.txt:96` の `add_executable(strata-vision strata_vision.cpp)` が作り、setup.py は vision encoder を選んだときにこれを build します (`tools/vision/CMakeLists.txt:1-2`)。build option でプログラム名と GPU が変わります: `STRATA_VISION_CUDA=ON` は同じ名前 `strata-vision` のまま GPU 版、`STRATA_VISION_HIP=ON` は `strata-vision-hip`、`STRATA_VISION_SYCL=ON` は `strata-vision-sycl`、既定の `STRATA_VISION_METAL=ON` は Mac の GPU を使います (`tools/vision/CMakeLists.txt:18-20`、`tools/vision/CMakeLists.txt:31`)。いずれも同じ parser で、`--version` の表示だけが variant で変わります (`tools/vision/strata_vision.cpp:102-112`)。engine package に入る実行ファイルで、Terminal CLI のサブコマンドではありません。Release の archive ごとに同梱・未同梱が違い、[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-01 実測では macOS / HIP の archive に `strata-vision`（HIP には `strata-vision-hip` も）が入り、SYCL archive には入りませんでした。位置引数は取らず、`--mmproj` と `--model` の指定が必須です（未指定なら usage を表示して exit 2、`tools/vision/strata_vision.cpp:125-128`）。`--help` option はなく、未知の引数は `unknown argument` で exit 2 です (`tools/vision/strata_vision.cpp:123`)。
+画像の tensor を作るための独立 CLI です。`tools/vision/CMakeLists.txt:96` の `add_executable(strata-vision strata_vision.cpp)` が作り、setup.py は vision encoder を選んだときにこれを build します (`tools/vision/CMakeLists.txt:1-2`)。build option でプログラム名と GPU が変わります: `STRATA_VISION_CUDA=ON` は同じ名前 `strata-vision` のまま GPU 版、`STRATA_VISION_HIP=ON` は `strata-vision-hip`、`STRATA_VISION_SYCL=ON` は `strata-vision-sycl`、既定の `STRATA_VISION_METAL=ON` は Mac の GPU を使います (`tools/vision/CMakeLists.txt:18-20`、`tools/vision/CMakeLists.txt:31`)。いずれも同じ parser で、`--version` の表示だけが variant で変わります (`tools/vision/strata_vision.cpp:102-112`)。engine package に入る実行ファイルで、Terminal CLI のサブコマンドではありません。Release の archive ごとに同梱・未同梱が違い、[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-03 実測で 0.1.56 の macOS engine archive に `strata` と並び `strata-vision` が入ることを確認しました（2026-11-01 の 0.1.55 実測では macOS / HIP archive に入り、SYCL archive には入りませんでした。0.1.56 の Linux / Windows archive は未展開です）。位置引数は取らず、`--mmproj` と `--model` の指定が必須です（未指定なら usage を表示して exit 2、`tools/vision/strata_vision.cpp:125-128`）。`--help` option はなく、未知の引数は `unknown argument` で exit 2 です (`tools/vision/strata_vision.cpp:123`)。
 
 ### `strata-vision` / `strata-vision-hip` / `strata-vision-sycl`
 
@@ -1527,9 +1636,9 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 
 ## `source-setup`
 
-`setup.py` は初回 setup、既存環境の更新、モデル設定変更を担います。POSIX/Windows の wrapper はここへ引数を渡します。以下は `setup.py` の CLI parser option inventory です（parser は `setup.py:9070` の一つだけ、現行の option 宣言は 54 個）。setup は複数 GPU と helper cache の条件に応じて engine 用 `--remote-expert-opt` を run config に自動追加することがありますが、これは `setup.py` に渡す option ではありません。自動追加を抑止する setup option は `--no-remote-expert-opt` です。
+`setup.py` は初回 setup、既存環境の更新、モデル設定変更を担います。POSIX/Windows の wrapper はここへ引数を渡します。以下は `setup.py` の CLI parser option inventory です（parser は `setup.py:9568` の一つだけ、現行の option 宣言は 56 個）。setup は複数 GPU と helper cache の条件に応じて engine 用 `--remote-expert-opt` を run config に自動追加することがありますが、これは `setup.py` に渡す option ではありません。自動追加を抑止する setup option は `--no-remote-expert-opt` です。
 
-`--images`、`--image-quant`、`--image-backend`、`--image-native`、`--image-gpu-policy`、`--skip-build` は parser が受理しますが、`help=argparse.SUPPRESS` で `--help` の一覧には表示されません (`setup.py:9097-9106`、`setup.py:9211`。コメントは「in preview, not offered in setup or --help; the options still work」)。索引は parser の受理を基準にしているので、これらも予定リンクとして列挙します。
+`--images`、`--image-quant`、`--image-backend`、`--image-native`、`--image-gpu-policy`、`--skip-build` は parser が受理しますが、`help=argparse.SUPPRESS` で `--help` の一覧には表示されません (`setup.py:9595-9603`、`setup.py:9716`。コメントは「in preview, not offered in setup or --help; the options still work」)。索引は parser の受理を基準にしているので、これらも予定リンクとして列挙します。
 
 ### `setup.py` / `setup.sh` / `START-HERE.bat` / update wrappers
 
@@ -1545,6 +1654,7 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 - [`--cuda`](source-setup/root/--cuda.md)
 - [`--data-dir`](source-setup/root/--data-dir.md)
 - [`--draft-vocab`](source-setup/root/--draft-vocab.md)
+- [`--drafter`](source-setup/root/--drafter.md)
 - [`--dsv41-package`](source-setup/root/--dsv41-package.md)
 - [`--experimental-speed-projection`](source-setup/root/--experimental-speed-projection.md)
 - [`--family`](source-setup/root/--family.md)
@@ -1575,6 +1685,7 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 - [`--parallel`](source-setup/root/--parallel.md)
 - [`--port`](source-setup/root/--port.md)
 - [`--prebuilt`](source-setup/root/--prebuilt.md)
+- [`--prepare-pack`](source-setup/root/--prepare-pack.md)
 - [`--replica-profile`](source-setup/root/--replica-profile.md)
 - [`--replicas`](source-setup/root/--replicas.md)
 - [`--resident-budget-gib`](source-setup/root/--resident-budget-gib.md)
@@ -1595,7 +1706,7 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 
 - [コマンド概要](source-setup/mac/README.md)
 
-`setup.py` は `main()` の冒頭で `sys.platform == "darwin"` かつ `CONTROL`（環境変数 `STRATA_CONTROL_INSTALL=1`、`setup.py:82`）でないことを調べて、`metal/setup_mac.py` に全 argv を渡して終了します (`setup.py:9068-9069`、`mac_setup` は `setup.py:7703`)。受け側は独自の parser を持つため `mac/` scope に分けます。この parser は `parse_known_args` で、余った引数は `not used on a Mac: ...` と警告して続行します (`metal/setup_mac.py:356-358`)。`--backend sycl` で呼ばれる `sycl/setup_intel.py` には parser がなく、`--backend hip` などを補って `setup.py` の `main()` を再実行するだけです (`sycl/setup_intel.py:553-560` の argv 組み替えと `S.main()` 呼び出し)。
+`setup.py` は `main()` の冒頭で `sys.platform == "darwin"` かつ `CONTROL`（環境変数 `STRATA_CONTROL_INSTALL=1`、`setup.py:82`）でないことを調べて、`metal/setup_mac.py` に全 argv を渡して終了します (`setup.py:9566`、`mac_setup` は `setup.py:7944-7948`)。受け側は独自の parser を持つため `mac/` scope に分けます。この parser は `parse_known_args` で、余った引数は `not used on a Mac: ...` と警告して続行します (`metal/setup_mac.py:362-364`)。`--backend sycl` で呼ばれる `sycl/setup_intel.py` には parser がなく、`--backend hip` などを補って `setup.py` の `main()` を再実行するだけです (`sycl/setup_intel.py:553-560` の argv 組み替えと `S.main()` 呼び出し)。
 
 - [`--api-key`](source-setup/mac/--api-key.md)
 - [`--build`](source-setup/mac/--build.md)
@@ -1650,7 +1761,7 @@ Release から配布される `install.sh`（POSIX）と `install.ps1`（Windows
 
 ## 更新時の確認
 
-この索引を更新するときは、`strata_cli/cli.py` と各 module の登録 parser（`strata_cli/launch/cmd.py`、`strata_cli/update_cmd.py`、`strata_cli/tune_commands.py`、`strata_cli/drafting_cmd.py`、`strata_cli/monitor_commands.py`）、`setup.py`、Apple Silicon で委譲される `metal/setup_mac.py`、`tools/strata_bench.py`、推論エンジン `src/program/generate.cpp` と `src/qwen35/q36_engine.cu`・`src/dsv41/ds4_main.cpp`、`tools/vision/strata_vision.cpp`、CMake 生成の単体 CLI の argv parser を現行 checkout で再確認してください。コマンド/オプションの追加・削除・alias 変更を反映し、`tool-id + command-path + option identity` ごとのパスを維持します。ラッパーが parser へ委譲するだけなら重複登録せず、委譲先が別の parser を持つ場合は別 scope に分けます。CMake 開発用 binary は製品 CLI と区別します。
+この索引を更新するときは、`strata_cli/cli.py` と各 module の登録 parser（`strata_cli/launch/cmd.py`、`strata_cli/update_cmd.py`、`strata_cli/tune_commands.py`、`strata_cli/drafting_cmd.py`、`strata_cli/monitor_commands.py`）、`setup.py`、Apple Silicon で委譲される `metal/setup_mac.py`、`tools/strata_bench.py`、推論エンジン `src/program/generate.cpp` と `src/qwen35/q36_engine.cu`・`src/dsv41/ds4_main.cpp`、`tools/vision/strata_vision.cpp`、`src/split/tools/sfnx.cpp`、CMake 生成の単体 CLI の argv parser を現行 checkout で再確認してください。`strata components engines` / `use` / `remove` のように `strata_cli/update_cmd.py` 側で増える parser を見落とさないこと、engine package 同梱の実行ファイル（`strata-vision` 系、`strata-split-N`）は tool-id として独立節にすることが 2026-11-03 の更新で必要になった点です。コマンド/オプションの追加・削除・alias 変更を反映し、`tool-id + command-path + option identity` ごとのパスを維持します。ラッパーが parser へ委譲するだけなら重複登録せず、委譲先が別の parser を持つ場合は別 scope に分けます。CMake 開発用 binary は製品 CLI と区別します。
 
 ## 更新手順と次回の調査指示
 
