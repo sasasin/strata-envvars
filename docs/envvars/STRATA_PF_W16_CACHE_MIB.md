@@ -1,50 +1,47 @@
 # `STRATA_PF_W16_CACHE_MIB`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
 
 ## 役割
 
-CUDA の GPU prefill で `Gemm::native()` が量子化された GGUF 重みを FP16 に dequantize した後、その device 上の FP16 重みを予算内で保持します。同じ重み・型・形状を再度処理すると dequantize を省いて FP16 GEMM を実行します。既定値は無効（0 MiB）です。ソースコメントは cached / uncached の FP16 値と積が bit 単位で同じとしています。
+CUDA の prefill 用 `Gemm::native()` が、GGUF の量子化 weight を FP16 に dequantize した結果を GPU メモリに保持する上限を MiB 単位で指定します。同じ weight を後続の GEMM が使うと、再 dequantize せず保持した FP16 weight を使います。既定では無効です。
 
-この環境変数を実行時に読む箇所は `src/prefill/gemm.cu` の一箇所です。候補一覧以外の参照は、ヘッダーと実装のコメント、および `tools/par/variants/stack_s1.txt` の実験プロファイルにあります。これらは追加の読み取り経路ではありません。
+環境変数名の全参照を検索すると、実際に値を読むのは `src/prefill/gemm.cu` の `Gemm::native()` のみです。ヘッダー、サーバー、実験 variant にも名前はありますが、そこはコメントまたは設定文字列です。CUDA 以外ではこのキャッシュ分岐はコンパイル対象になりません。
 
 ## 値と判定
 
-`Gemm::native()` の初回呼び出し時に `std::getenv()` で取得し、`std::atoll()` の結果に `2^20` を掛けてバイト予算にします。値全体の妥当性確認や clamp はありません。
+`std::getenv()` で未設定かどうかを判定し、設定されていれば `std::atoll()` の戻り値に `1 MiB` を掛けます。文字列全体の形式検査や範囲検査はありません。
 
-| 値 | 実装上の結果 |
+| 値 | 判定と動作 |
 |---|---|
-| 未設定 | 0 MiB。キャッシュしない |
-| 空文字 | `atoll("")` が 0 となり、キャッシュしない |
-| 10 進数の整数 | その値 MiB を予算にする。先頭空白・符号は `atoll` の変換規則に従い、数値の後ろにある変換不能な文字列は検査されず、数値部分が使われる（例: `2tail` は 2 MiB） |
-| 数字で始まらない文字列 | 変換結果 0 となり、キャッシュしない |
-| 0 または負数 | 変換後の予算が正ではないため、キャッシュしない |
+| 未設定 | この `Gemm` インスタンスでは予算 0、無効。空き VRAM に応じた自動有効化もありません。 |
+| 空文字、数値に変換できない文字列 | `atoll()` が 0 を返すため無効。エラーや警告は出しません。 |
+| 正の整数 | `atoll()` が読む10進数の前置部分を MiB に換算した値が累積キャッシュ予算になります。例えば `2048` と `2048MiB` はどちらも 2048 MiB、`5.9` は 5 MiB です。先行空白と符号も `atoll()` の変換規則に従います。 |
+| 0 または負数 | 予算が正でないため無効。 |
 
-値の数値変換範囲を超える入力や MiB から byte への乗算 overflow に対する検査はありません。したがって、その場合の結果は有効な設定値として保証されません。
+明示設定時の VRAM 留保は固定 2 GiB です。設定値が予算上限であり、実際に保持できる量はカードの空き VRAM と各 weight の大きさにも制限されます。CLI 引数による同名設定や優先順位はありません。別の環境変数 `STRATA_DEQUANT_SIDE` が side scratch を有効にすると、このキャッシュ経路は使われません。
+
+根拠: `src/prefill/gemm.cu:1411-1423,1425-1433`; `include/strata/prefill/gemm.hpp:96-105`; `src/prefill/gemm.cu:637-643,1468-1483`。
 
 ## 有効になる条件
 
-- `src/prefill/gemm.cu` の HIP 用 `#ifndef STRATA_USE_HIP` 節にあるため、このキャッシュ処理は HIP build では実行されません。CUDA の `Gemm::native()` 経路が対象です。
-- GPU prefill が量子化 GGUF の native projection を実行するときに `Gemm::native()` へ到達します。`native_proj()` は `native_data` がなければ `--native` を使うようエラーを返すため、native GGUF blocks を使わない経路では対象の処理に入りません。
-- 環境値が正でも、`side_scratch_` が設定されているとキャッシュ分岐を通りません。CUDA で `STRATA_DEQUANT_SIDE` の先頭文字が `1` のとき、初期化時に別 scratch が確保できれば side dequant 経路が設定されます。別 scratch が取れない場合は警告を出して side dequant を使わないため、他の条件が合えばキャッシュ分岐に進めます。
-- キャッシュはプロセス全体の共有 pool ではなく `Gemm` インスタンスごとの予算・entry vector です。各 entry は元の device pointer、GGML type、`N`、`K` で照合されます。CLI 引数による予算上書きや、別の予算用環境変数はこの読み取り箇所にはありません。
+- CUDA ビルドであること。`Gemm::native()` のキャッシュ部分は `#ifndef STRATA_USE_HIP` 内にあります。HIP ビルドではこのコードが除外されます。Metal の `Prefill::init()` は Metal engine に委譲して通常の GPU `Gemm` を初期化しません。
+- `Gemm::native()` が呼ばれること。通常は native GGUF weight を使う prefill の dense projection で呼ばれます。`native_proj()` は native weight がない場合はエラーを返し、ある場合に `gm.native()` を呼びます。native PLE key も `Gemm::native()` を呼ぶ経路です。Qwen3.5/3.6 engine でも prompt の行数 `T` が 8 を超えるとこの GEMM を使います。
+- `w16_budget_ > 0` かつ `side_scratch_ == nullptr` であること。
+- weight が予算内に収まり、`cudaMemGetInfo()` が成功し、割り当て後にも 2 GiB より多い空き VRAMが残ること。
+
+`N*K` が scratch に収まり切らない場合でも、キャッシュ割り当てに成功すれば全 weight を dequantize して GEMM に使います。条件を満たさない、または割り当てられない場合は通常の dequantize 経路に進みます。`STRATA_DEQUANT_SIDE` の読み取りは CUDA で先頭文字が `1` の場合に有効となり、prefill 初期化時に side scratch を設定します。この読み取り箇所自体に OS 別の分岐はありません。
+
+根拠: `src/prefill/gemm.cu:1353-1372,1403-1453`; `src/prefill/prefill.cpp:1692-1703,1883-1890,2931-2936,3957-3961`; `src/qwen35/q36_engine.cu:1177,1563-1572`。
 
 ## 実行時の詳細
 
-各 `Gemm` の `w16_budget_` は初期状態 `-1`（未読）です。そのインスタンスで最初にキャッシュ分岐へ来た `native()` 呼び出しが環境値を読み、以後は変数を読み直しません。したがって、その後の環境変更は同じインスタンスに反映されません。値が未設定または 0 以下なら、後続呼び出しもキャッシュを試しません。
+値はプロセス共通の static cache ではなく、各 `Gemm` インスタンスが最初の `native()` 呼び出し時に読み、`w16_budget_` に保持します。そのインスタンスでは以後読み直しません。別の `Gemm` インスタンスはそれぞれ初回呼び出し時に環境を読みます。キャッシュ entry は device weight pointer、量子化 type、`N`、`K` の組で照合されます。
 
-各重みの必要量は `N * K * 2` bytes です。既存 entry があれば FP16 device pointer を使って `f16()` を実行します。entry がなく、使用量と必要量の合計が予算以下の場合に限り、新しい allocation を試します。さらに `cudaMemGetInfo()` が成功し、空き VRAM が必要量に 2 GiB を足した量より大きい場合に `cudaMalloc()` します。成功時は重み全体を `dequant_f16()` で cache allocation に変換して entry を追加し、同じ呼び出しの GEMM にもその pointer を使います。
+新しい weight のサイズは `N*K*2` bytes です。累積使用量と予算の合計が上限内で、空き VRAM `fb` が weight サイズと留保量の合計より大きければ、`cudaMalloc()` 後に全 weight を dequantize して保持します。キャッシュ hit は保持済み weight で `f16()` を実行します。保持した entry は `Gemm` の破棄時に `cudaFree()` されます。
 
-entry がなく予算に収まらない場合は、その重みを cache に追加せず scratch への通常の dequantize と GEMM に進みます。空き VRAM 条件を満たさない、または allocation が失敗した場合は、現在の使用量を予算として残す（まだ entry がなければ 0 にする）ため、それ以後の新規追加を止めます。既存 entry の再利用はこの判定より先に行われます。cached allocation は `Gemm` の destructor で `cudaFree()` されます。
+`cudaMemGetInfo()` または `cudaMalloc()` が失敗したときは、stderr に一度だけ `strata prefill: FP16 weight cache ...` を出し、その時点の既使用量を上限として以降の割り当てを止めます。既使用量が 0 ならキャッシュは無効化されます。新規 weight がユーザー指定予算に収まらない場合は、この割り当て失敗ログを出さずに通常経路へ進みます。通常経路は scratch に weight 全体が収まらなければ行ごとの slice に分け、dequantize と GEMM を行います。明示設定値が無効でも、専用の無効値警告や終了経路はありません。
 
-この環境変数について専用のログ、警告、終了経路はありません。allocation を得られない場合も、この機能固有の失敗にはせず通常の scratch 経路を続けます。通常経路の scratch が `K` の行を一つも格納できない場合などには、別条件として `prefill gemm: scratch too small for K=...` を stderr に出して終了します。
+キャッシュ使用時は full weight を使った `f16()` の GEMM となり、未キャッシュで scratch に収まらない場合の sliced GEMM とは計算形状が異なります。現行ソースのコメントは一部 GPU で bit-exact でない事例を記録していますが、この調査では実機で数値差を再測定していません。
 
-## 根拠
-
-- `src/prefill/gemm.cu:1397-1424` — CUDA 側の環境値の読み取り、予算判定、entry 検索・allocation・dequantize、cache GEMM、通常経路への fallback。
-- `include/strata/prefill/gemm.hpp:96-102` — CUDA opt-in キャッシュの目的、pointer と形状による key、インスタンスごとの状態。
-- `src/prefill/gemm.cu:639-664` — `Gemm` destructor による cache allocation の解放。
-- `src/prefill/gemm.cu:630-637,705-735`; `src/prefill/prefill.cpp:1728-1740` — `STRATA_DEQUANT_SIDE` 判定、side scratch の設定と、設定時にキャッシュ分岐を外れる条件。
-- `src/prefill/prefill.cpp:989-1000,1734-1740,2694-2699` — `Prefill::Impl` の `Gemm` 所有、初期化、native projection から `Gemm::native()` への呼び出し。
-- `src/prefill/prefill.cpp:2694-2698` — native GGUF blocks がない場合は `--native` を要求して projection を失敗させる。
-- `tools/par/variants/stack_s1.txt:2` — 候補名のプロファイル記録例（実装や測定結果の根拠にはしていない）。
+根拠: `include/strata/prefill/gemm.hpp:99-105`; `src/prefill/gemm.cu:646-671,1411-1452,1454-1463`。

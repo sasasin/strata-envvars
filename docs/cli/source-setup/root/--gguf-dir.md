@@ -1,64 +1,71 @@
 # `--gguf-dir`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（`2026-11-03` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`SETUP.bat`、`update.sh`、`UPDATE.bat` からも委譲） |
+| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`SETUP.bat`、更新 wrapper からも委譲） |
 | オプション | `--gguf-dir` |
 | 別名 | なし |
-| 値 | GGUF ファイルを含むディレクトリのパス（文字列、必須） |
+| 値 | GGUF shard が置かれたディレクトリ。parser 上は任意の文字列で、既定値は未指定（`None`）。 |
 
 ## 役割
 
-モデルの GGUF shard を Strata の既定モデル保存先ではなく、指定したディレクトリから利用します。parser は値を文字列として受け取り、ディレクトリの存在や書き込み可否を事前検証しません。パスは `Path(...)` に渡され、相対パスは setup を起動したカレントディレクトリ基準です。`~` の展開処理もこの option の使用箇所にはありません。通常の既定保存先は `--models-dir`（未指定ならデータフォルダー配下）です（`setup.py:8481-8492, 9206-9209`）。
+手元にあるモデル GGUF shard の場所を setup に渡します。通常のモデル setup では、指定した場所から選択モデルの shard を読み、通常のモデル用ダウンロードを省きます。対応する画像 encoder (`mmproj`) や MTP draft layer、engine、Python helper など、GGUF shard 以外の必要物まで一括してローカルから供給する指定ではありません（`setup.py:10397-10421,10478-10515,10519-10524`）。
+
+同じオプションは Intel Arc 向けの `--prepare-pack` 単独モードでも入力ディレクトリとして必要です。このモードはモデル shard の取得や変更を行わず、指定先の pack ディレクトリを作成・更新します（`setup.py:9321-9349,9658-9660,9723-9724`）。
 
 ## 使い方
 
-リポジトリのルートからの例です。モデル・family は手元のファイルに合わせて指定してください。
+通常の setup で、既存の GGUF shard が `/data/my-model` にある例です。
 
 ```sh
-python setup.py --family qwen --model IQ3_XXS --gguf-dir ./my-ggufs --yes --no-start
+./setup.sh --family qwen --model IQ3_XXS --gguf-dir /data/my-model --no-start
 ```
 
-`--family` と `--model` を省略すると通常の対話選択に進みます。`--no-start` は準備後にモデルを起動しない指定であり、`--gguf-dir` 自体が setup 全体を読み取り専用にするわけではありません（`setup.py:8911-8938, 8156-8158`）。
+pack のみを作る例です。`PACK_DIR` は生成物の出力先です。
+
+```sh
+python3 setup.py --prepare-pack /data/strata-pack --gguf-dir /data/my-model --family qwen --model IQ3_XXS
+```
+
+通常モードで `--family` と `--model` を省いた場合は対話で選べます。`--prepare-pack` では `--model` が必要で、`--family` を省略すると `qwen` になります（`setup.py:9325-9333`）。
 
 ## 値と既定値
 
-- 値は1つのディレクトリパスです。option 自体に既定値はなく、省略時は `None` となり Strata 管理下のモデル保存先が使われます（`setup.py:8491-8492, 9206-9209`）。
-- shard 名が標準名でない場合、通常経路は `*-00001-of-*.gguf` に一致する候補を探します。候補が1つならそれを採用し、複数なら選択モデル名を含む候補を優先します。先頭 shard の `-00001-of-0000N.gguf` から総 shard 数を読み、同じ stem の全 shard を組み立てます。適合する候補が一意でない場合はモデルの標準ファイル名を使います（`setup.py:2886-2906`）。
-- 指定ディレクトリの先頭 shard がない場合、そこにある GGUF 名から別 family/model の候補や未対応 quantization を検出できれば、対応する選択肢を案内して停止します。該当する候補がない場合は shard の通常の欠落エラーになります（`setup.py:2935-2957, 3181-3195`）。
+`argparse` では `--gguf-dir` に型・存在確認・必須指定を設定しておらず、値はそのまま `Path` に渡されます。通常モードで未指定なら `<models-dir>/<選択モデルのタグ>` が使われます。指定時はその値が shard のある場所になります（`setup.py:9643-9644,10397-10400`）。
+
+まず選択したモデルの標準 shard 1 名を探します。見つからない場合はディレクトリ直下の `*-00001-of-*.gguf` を列挙し、ファイル名に model 名を含む候補を優先します。候補が一つに定まれば採用し、その `-00001-of-0000N.gguf` から N と shard の stem を読み、同じ stem の全 shard を組み立てます。判定できなければ標準名を使い、後続処理で欠落として失敗します（`setup.py:3222-3242`）。ディレクトリ階層を再帰検索する指定ではありません。
 
 ## 実行時の動作
 
-- 対応する通常の GGUF family では、shard の参照先が指定ディレクトリに切り替わり、モデル shard のダウンロードは行いません。指定した shard は GGUF として読み取られ、全 shard の存在・構造・tensor 範囲が確認されます（`setup.py:9206-9212, 9292-9325, 3181-3203`）。
-- 一部の family は追加ファイルも必要です。画像 encoder（`mmproj`）が必要で、指定場所等に見つからない場合、通常経路では既定のモデル保存先へダウンロードします（`setup.py:9326-9335`）。DeepSeek-V4.1 では GGUF shard を指定場所から読みますが、指定場所などにない共有 Engram・drafter・metadata file は Strata の共有モデル領域へダウンロードされます（`setup.py:7865-7891, 7981-7992, 8073-8079`）。したがって、option は setup が取得する全ファイルを止めるものではありません。
-- Qwen3.6 の独自 engine 経路も指定場所から shard を読み、見つからない場合は停止します（`setup.py:8313-8339`）。
-- NVFP4 など GGUF shard を使わない ready-made pack family では無効です。警告を出して `--gguf-dir` を解除し、pack の通常処理を続けます（`setup.py:8943-8945, 9197-9209`）。
-- 既存ファイルのサイズと SHA-256 を照合します。通常の Unix/Windows 経路では `own=True` として検証し、不一致でも指定した利用者所有ファイルを削除しません（`setup.py:9322-9325, 2978-3010`）。
+通常モードでは指定先から shard 一式を選び、`--gguf-dir` がある場合は不足 shard の通常ダウンロード分を 0 として扱い、モデル shard のダウンロード分岐も通りません（`setup.py:10397-10421,10482-10509`）。指定された GGUF は setup の所有ファイルとして扱われ、setup はそれらを削除しません。
+
+setup は shard を GGUF として読み、tensor directory が示す必要サイズに足りるか検査します。欠落、読めない/不完全な GGUF、短い shard はエラーになります（`setup.py:3574-3601`）。Unsloth など pinned SHA-256 を持つファイルでは、サイズ違いまたは hash 違いでも完全な GGUF と確認できる場合は警告してそのまま使います。完全性を確認できない不一致は失敗します。指定されたファイルを setup が削除して再取得する経路はありません（`setup.py:3324-3371`）。
+
+shard に `.done` 完了印がなく、whole shard と確認できる場合、setup は印を shard の隣に書こうとします。読み取り専用ディレクトリでは Strata 側の `marks/` に保存を試し、それもできない場合は警告して続行します（`setup.py:1098-1118,10410-10415`）。
+
+`--prepare-pack PACK_DIR` と併用した場合は通常の setup を実行せず、`--gguf-dir` から先頭 shard を選んで `tools/iq_pack.py` に渡し、pack と tokenizer を `PACK_DIR` に作ります。`llama.cpp` の `gguf-py` がローカルにない場合は helper の取得が発生します。既に pack の `native_experts.txt` と `tokenizer/vocab.json` が両方あれば変換を省略します（`setup.py:9321-9349,9723-9724`）。この専用経路では通常 setup の全 shard 完全性検査は呼ばれません（`setup.py:9321-9349,3574-3601`）。
 
 ## 適用条件と副作用
 
-- macOS は `setup.py` の通常 parser より前に `metal/setup_mac.py` へ委譲します。macOS parser も `--gguf-dir` を受け付け、指定先を shard の配置先として使いますが、期待する標準 shard 名のみを列挙します（`setup.py:8418-8419`, `metal/setup_mac.py:328-356, 438-452`）。
-- macOS 経路では shard が指定先にない場合も停止せず、そのディレクトリへダウンロードします。また SHA-256 検証を `own=True` で呼ばないため、不一致ファイルは共通検証処理により削除されます（`metal/setup_mac.py:440-452`, `setup.py:2978-3010`）。これは通常の Unix/Windows 経路と異なります。
-- 通常経路でも GGUF の内容検査やセットアップ準備は行います。初回セットアップは tokenizer/pack や起動設定などを別の Strata データ領域に作成し得ます。`--no-start` を併用すると、モデル準備後のサーバー起動だけを省きます（`setup.py:8339-8359, 7660-7665, 8146-8158`）。
-- 不正なパス文字列に対する専用 validation は parser にありません。空文字列を値に渡した場合は Python の真偽判定で未指定と同様に扱われ、既定モデル保存先へ進みます（`setup.py:8491-8492, 9207-9209`）。
+- `--gguf-dir` は GGUF shard を使う family 向けです。ready-made pack の family では警告を出して値を解除し、同オプションを適用しません（`setup.py:10131-10133`）。
+- 選択した shard 1 が Strata 非対応 quantization とファイル名から判定された場合や、候補モデルと一致しない場合は失敗し、対応候補の案内を出すことがあります（`setup.py:3271-3300,10400-10402`）。
+- `--prepare-pack` の family は `FAMILIES` に限られます。省略時は `qwen`、別 family を指定するなら family と model の組み合わせが必要です。`--gguf-dir` と `--model` の不足、不正 family、生成 pack に tokenizer がない場合は停止します（`setup.py:9325-9347`）。
+- 通常 setup は GGUF 以外に engine・Python packages、設定、必要に応じて vision encoder / MTP などを扱います。`--no-start` は setup 後のモデル起動を止める指定で、これらの setup 処理を止めるものではありません（`setup.py:9645-9647,10397-10524`）。
+- `setup.py` を Apple Silicon の macOS で Control mode なしに起動すると、root parser を作る前に `metal/setup_mac.py` へ委譲されます。索引では同じ表記を `source-setup/mac/` の別 scope として扱っています。この文書の値の説明は root scope の `setup.py` parser に対するものです（`setup.py:9560-9568`、[CLI 索引](../../README.md#source-setup)）。
 
 ## 出力とエラー
 
-指定先で shard が見つからない通常経路では、不足ファイル名と配置先を示すエラーを出して setup を終了します（`setup.py:8066-8067, 7644-7646`）。shard が欠落・破損・不完全な GGUF の場合も停止します。一般的な `fail()` は説明と再実行案内を表示して `sys.exit(1)` を呼びます（`setup.py:825-830, 3181-3203`）。
-
-指定先が読み取り専用の場合、通常経路は完了マークを書けない警告を出して続行する経路があります。ファイル本体は読み取って検査します（`setup.py:9220-9225`）。ただし pack 等の後続出力先は別の Strata データ領域です。
+通常の入力・shard 検査で問題が見つかると、`fail()` は理由と可能なら修正ヒントを表示し、終了コード 1 で停止します（`setup.py:965-972,3574-3601,10400-10402`）。たとえば指定先に shard がない、GGUF として読めない、tensor の必要サイズまでデータがない場合が該当します。CLI の argparse 構文・choices のエラーは argparse が処理します（parser 定義 `setup.py:9568-9575,9643-9644`）。
 
 ## 根拠
 
-- `setup.py:8491-8492` — parser 定義、値の型、help。
-- `setup.py:2886-2906, 2935-2957, 3181-3203` — shard 名の解決、候補判定、GGUF shard 検査。
-- `setup.py:9206-9231, 9292-9325` — 通常 family の参照先、download 抑止、検査・hash 照合。
-- `setup.py:8943-8945, 9197-9212` — ready-made pack での無効化。
-- `setup.py:2978-3010` — 利用者所有ファイルと Strata 所有ファイルの hash 不一致時の扱い。
-- `setup.py:7832-7891, 7981-7992, 8061-8079` — DeepSeek-V4.1 の shard と共有ファイル。
-- `metal/setup_mac.py:328-356, 438-452` — macOS parser と異なる欠落・検証経路。
-
-調査範囲は上記 commit の checkout 内ソースです。別 revision の配布済み CLI や各 OS の実行環境での動作は照合していません。
+- `setup.py:9643-9644` — root parser の `--gguf-dir` 宣言。値は任意文字列。
+- `setup.py:3222-3242,10397-10402` — shard の名前・個数の検出と通常 setup での使用。
+- `setup.py:3574-3601,3324-3371` — GGUF 完全性、サイズ、pinned SHA-256 の検査と失敗/警告。
+- `setup.py:1098-1118,10410-10415` — 完了印の書き込みと読み取り専用先での扱い。
+- `setup.py:9321-9349,9658-9660,9723-9724` — `--prepare-pack` 専用経路、helper と pack の動作。
+- `setup.py:10397-10524` — 通常 setup の shard download 分岐と、vision encoder 等の別処理。
+- `setup.py:10131-10133,9560-9568` — ready-made pack での無効化と macOS の parser 委譲。

@@ -1,66 +1,59 @@
 # `--vram-elastic`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン、root） |
+| コマンド | `strata`（ネイティブ推論エンジン） |
 | オプション | `--vram-elastic` |
 | 別名 | なし |
-| 値 | 取らないフラグ。指定で有効化を要求する |
+| 値 | 値を取らないフラグ |
 
 ## 役割
 
-サーバー実行時に GPU 上の expert cache を単一の `cudaMalloc` ではなく複数の CUDA 仮想メモリ segment で確保します。これによりサーバーが要求を処理していない間、後述の `VRAM` 操作で cache の末尾 segment を解放し、必要に応じて再マップできます。dense weights、K/V、その他の GPU メモリ全体を解放する機能ではありません（`src/program/generate.cpp:613-616,11197-11204`、`src/core/expert_cache.cpp:216-218`）。
+serve 用の expert cache を単一の `cudaMalloc` 領域ではなく CUDA 仮想メモリ管理 (VMM) の物理セグメントで構成します。これにより、サーバーが明示的に受け取る `VRAM [reserve_mib]` コマンドに応じて、リクエスト間に cache の末尾を解放し、空き VRAM を他のプログラムへ譲ったり、後でセグメントを再割当てしたりできます。フラグを付けただけでは VRAM は自動調整されません（`src/program/generate.cpp:794-797,1112-1114,13447-13454`）。
 
 ## 使い方
 
 ```sh
-strata --pack ./my-pack --serve --tokens "1,2,3" --vram-elastic
+strata --native MODEL.gguf --serve --expert-cache auto --expert-profile PROFILE --vram-elastic
 ```
 
-エンジンの usage は `strata generate --pack DIR --tokens "1,2,3" [options]` を示し、`--serve` は常駐サーバーモードです。実際の pack と prompt の指定は利用環境に合わせてください（`src/program/generate.cpp:806-812,2633-2638`）。
-
-segment サイズを指定する場合は別 option を併用します。
-
-```sh
-strata --pack ./my-pack --serve --tokens "1,2,3" --vram-elastic --vram-segment-mib 512
-```
+これは既存の native GGUF、expert profile を使う serve 起動の例です。起動後の `VRAM` コマンドはサーバー制御プロトコルの入力であり、このフラグ自体に reserve 値を渡す構文ではありません（`src/program/generate.cpp:1112-1114,13471-13478`）。
 
 ## 値と既定値
 
-`--vram-elastic` は引数 parser で boolean を `true` にするだけで、値は取りません。省略時は `false` で、expert cache は通常の単一 allocation 経路です（`src/program/generate.cpp:615,2604`）。
-
-segment サイズは `--vram-segment-mib` で別途指定し、省略時は 512 MiB です。値は `atoll` で整数化され、厳密な数値形式・上限の parser validation はありません。64 MiB 未満なら feature を無効化して警告します。したがって 0、負数、整数として読めない値もこの判定により無効化されます（`src/program/generate.cpp:616,2605,6284-6297`）。CUDA driver の推奨 allocation granularity に合わせ、実際の segment は必要に応じて切り上げられます（`src/core/expert_cache.cpp:313-321`）。
+- `--vram-elastic` は値なしの boolean option で、未指定時は `false`（無効）です。別名はありません（`src/program/generate.cpp:794-797,3481`）。
+- セグメント幅は別 option `--vram-segment-mib N` で指定し、既定値は 512 MiB です。parser は `atoll` で値を読み、専用の数値 validation は行いません。ただし幅が 64 MiB 未満なら `--vram-elastic` は無効化されます（`src/program/generate.cpp:797,3481-3483,7841-7855`）。
+- `--vram-elastic` の重複指定に特別な処理はなく、同じ真偽値を再設定します。値を続けて指定する option ではありません（`src/program/generate.cpp:3481-3483`）。
 
 ## 実行時の動作
 
-起動時に `--serve` でない、layer split による複数 GPU、remote/helper expert cache の利用、segment が 64 MiB 未満、または HIP build のいずれかに該当すると、stderr に `strata generate: --vram-elastic is off: ...` を出し、この指定を無効にして通常の cache allocation に進みます。これらは当該 option の起動拒否ではありません（`src/program/generate.cpp:6282-6298`）。
+有効条件を満たす場合、`--vram-segment-mib` をバイトへ変換して expert cache に設定し、cache の初期化時に要求容量分の仮想アドレス範囲を予約します。CUDA の推奨割当粒度に合わせてセグメント幅と総容量を切り上げ、起動時には各セグメントを物理確保して範囲へ map します（`src/program/generate.cpp:7841-7855,7913-7922`; `src/core/expert_cache.cpp:397-444`）。
 
-条件を満たす場合は segment サイズを byte 単位にして expert cache に設定し、cache を segment allocation で開きます。要求した reserve に応じて server の `VRAM` 操作が cache の末尾を unmap し、再拡張時には map し直します。縮小で cache から外れた expert は CPU 側の miss として扱われ、拡張時は slot を再充填します。縮小・拡張は自動ではなく操作を受けたときだけ実行されます（`src/program/generate.cpp:6297,11197-11204,11247-11301`、`src/core/expert_cache.cpp:384-414,418-468`）。起動時の INFO 行には `vram_elastic=1` または `0` が出力されます（`src/program/generate.cpp:11078-11096`）。
-
-`--kv-grow` と同時に要求すると、`--kv-grow` の適用条件から `!o.vram_elastic` が外れるため KV の伸長機能は無効になり、stderr に `--kv-grow is off ... no --vram-elastic ...` と出ます（`src/program/generate.cpp:5202-5213`）。
+serve 中に `VRAM` を単独で受け取ると起動時の `--vram-reserve-mib` 値を使い、`VRAM N` では N MiB を空ける目標にします。現在の空き容量が目標未満なら末尾の cache セグメントを unmap/release し、該当 expert を cache 外扱いにします。目標より余裕がある場合はセグメントを再 map し、追い出した expert を slot に再充填します。prompt 用 slot の貸出が残る場合は処理を拒否し、変更後は prompt chunk を残存 cache に合わせます（`src/program/generate.cpp:13447-13470,13471-13552`; `src/core/expert_cache.cpp:484-514,518-545`）。
 
 ## 適用条件と副作用
 
-- 起動時に有効となるのは `--serve`、単一 GPU、helper cache なし、segment 64 MiB 以上、CUDA build の組み合わせです（`src/program/generate.cpp:6284-6297`）。
-- Driver の仮想メモリ管理 API が利用できない、GPU が VMM をサポートしない、granularity の取得や仮想アドレス範囲の確保に失敗する場合は cache open に失敗します（`src/core/expert_cache.cpp:297-325`）。
-- 初期 segment の確保失敗時は解放処理を行って cache open を失敗させます（`src/core/expert_cache.cpp:329-342`）。engine 側はエラーを stderr に出して終了コード 1 を返します（`src/program/generate.cpp:6361-6390`）。HIP build では通常、起動時条件判定で無効化されます。低 RAM resident mode は起動時の無効条件ではありませんが、実行中の `VRAM` 操作は resident low-RAM mode と併用できずエラーになります（`src/program/generate.cpp:11227-11235`）。
-- `VRAM` 操作は batch decode 中や prompt buffer の loan が残る間も拒否されます。GPU 同期に失敗した場合もエラーになります（`src/program/generate.cpp:11236-11242`）。
-- この option は expert cache の領域管理だけを切り替えます。reserve 操作では実際の free VRAM により希望値に届かない場合があり、cache は prompt path が必要とする最低 slot 数を残すことがあります（`src/program/generate.cpp:11245-11260`）。
+- この機能は serve と単一 GPU の組み合わせに限定されます。layer split、helper GPU 上の remote expert cache、`--vram-segment-mib < 64`、HIP build では起動時に stderr へ `--vram-elastic is off: ...` を出して無効化し、通常の cache 確保を続けます（`src/program/generate.cpp:7839-7855`）。
+- GPU/driver が CUDA VMM を提供しない場合、expert cache 初期化時に警告を stderr へ出して segmented mode を off にし、単一ブロックの cache に切り替えます。セグメント確保や map が失敗した場合は cache open が失敗し、通常の起動失敗経路に入ります（`src/core/expert_cache.cpp:386-444,607-635`; `src/program/generate.cpp:7913-7945`）。
+- expert cache 自体が無効（既定の `--expert-cache 0`）なら、この設定の実用上の対象となる cache はありません（`src/program/generate.cpp:731-739,7841-7855`）。
+- `VRAM` 制御は resident low-RAM mode、`--peer-device`、prompt loan 中、batch slot の decode 中には拒否されます。また、縮小で cache にいた expert は cache miss となり、拡張時には slot の再充填が行われます（`src/program/generate.cpp:13481-13493,14772-14778`）。
+- `VRAM` command は数値なしなら起動時 reserve を使い、負数や数値のない引数は `expected: VRAM [reserve_mib]` エラーになります。確認できた範囲では正の値に上限を設ける validation はなく、メモリ状況や prompt 用 cache floor により要求値どおりの空き容量にならない場合があります（`src/program/generate.cpp:13471-13510`）。
 
 ## 出力とエラー
 
-無効条件では stderr に理由付きの `--vram-elastic is off` 警告を出して継続します。VMM 初期化・allocation の失敗は `ExpertCache: ...` の内容を stderr に出し、engine は終了コード 1 を返します（`src/program/generate.cpp:6293-6297,6384-6390`、`src/core/expert_cache.cpp:297-342`）。未知の引数は別経路で usage と `unknown argument` を stderr に出し、終了コード 2 です（`src/program/generate.cpp:2787-2792`）。
+- 制御が成功すると stderr に解放目標、cache slot の変化、実空き容量、prompt chunk を記録し、stdout に `VRAM reserve_mib=...` の状態行を出します（`src/program/generate.cpp:13552-13564`）。
+- 制御拒否や処理失敗は serve protocol の stdout に `ERR ...` として出力されます（`src/program/generate.cpp:14772-14778`）。再 map 不可時は cache の現在サイズを更新して警告注記を付けて応答を続ける経路があり、再充填・同期の失敗は `VRAM: refilling the cache failed` 等のエラーになります（`src/program/generate.cpp:13518-13550`; `src/core/expert_cache.cpp:518-545`）。
+
+## 調査範囲
+
+現行 checkout の parser、起動時の適用条件、expert cache の VMM 確保/縮小/拡張、および serve の `VRAM` 入力処理を確認しました。実 GPU/driver ごとの VMM 対応、実際の空き VRAM 推移、性能差は実機実行や測定を行っていないため確認していません。CLI `--help` の実行および Release binary の照合も行っていません。
 
 ## 根拠
 
-- parser、既定値、関連 help 記述: `src/program/generate.cpp:613-616,907-910,2604-2605`
-- 起動条件と無効化: `src/program/generate.cpp:6282-6298`
-- segmented cache の初期化・driver 要件: `src/core/expert_cache.cpp:297-345,471-508`
-- cache の縮小・拡張と `VRAM` 操作: `src/core/expert_cache.cpp:384-414,418-468`、`src/program/generate.cpp:11197-11242,11245-11314`
-- `--kv-grow` との相互作用: `src/program/generate.cpp:5200-5213`
-- 起動ログと allocation failure: `src/program/generate.cpp:6361-6390,11078-11096`
-
-この文書は指定 checkout のソースを確認した結果です。同一 revision の engine バイナリや Release 配布物での `--help` 照合は行っていません。
+- `src/program/generate.cpp:794-797,1112-1114,3481-3483` — option の既定値、help 記述、parser。
+- `src/program/generate.cpp:7839-7855,7913-7945` — 適用条件、cache への設定、初期化失敗経路。
+- `src/core/expert_cache.cpp:386-444,484-514,518-545,607-640` — CUDA VMM 対応判定、セグメント map/unmap、fallback、確保エラー。
+- `src/program/generate.cpp:13447-13564,14772-14778` — VRAM reserve 制御、slot の縮小/復元、出力とエラー応答。

@@ -1,52 +1,54 @@
 # `STRATA_BATCH_SELF_COMMIT`
 
-調査対象: Strata main の HEAD c62d5e3a15b40ea51c96aae9e8d36928965f53ab（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
 
 ## 役割
 
-複数 slot の batch window が「各 slot につき 1 行」のとき、window の GPU graph 自身に GDN 状態などを進めさせ、window 後の commit graph を省きます。変数は opt-in で、通常の単独 token window の self-commit とは別の batch 用条件です。実行時に batch window がなくても、設定値だけで通常の単独生成経路は変わりません。
+batch verifier の window が各 slot から 1 行ずつを処理するとき、GDN の畳み込み履歴と recurrent state を window 自身で進めます。その window の後に全行を確定する commit graph を起動しません。対象は `--batch` による複数 slot の window で、通常の単独生成を一律に変える設定ではありません。
 
 ## 値と判定
 
-Verifier の env_on() は値全体を parse せず、未設定・空文字・先頭が 0 の値を off、それ以外の非空文字列を on とします。比較は大文字小文字を区別する文字 0 との比較だけです。
+`src/core/verify.cpp` の `env_on()` は環境変数を `getenv()` で読み、値が存在し、空文字でなく、先頭文字が `0` でなければ ON とします。文字列全体の parse はしません。
 
-| 値 | 判定 |
+| 環境値 | 判定 |
 |---|---|
-| 未設定 | off |
-| 空文字 | off（設定済みだが e[0] == '\0'） |
-| 0、0anything | off |
-| 1、true、false、2、anything | on |
+| 未設定 | OFF。ただし後述の Windows gfx1151 batch 既定が設定する場合がある |
+| 空文字 | OFF |
+| `0` または `0` で始まる文字列 | OFF（例: `0`, `0abc`） |
+| その他の非空文字列 | ON（例: `1`, `2`, `true`, `false`, `off`） |
 
-この判定結果は src/core/verify.cpp のグローバル const bool g_batch_self_commit 初期化時に一度読み取られます。プロセス起動後に環境を変更しても Verifier の判定には反映されません。別の直接参照（下記「有効になる条件」）もあり、そこでは空文字を off、それ以外で先頭が 0 でなければ on とします。
-
-根拠: src/core/verify.cpp:299-302,310-315。
+したがって `=false` や `=off` も ON です。数値変換、範囲検査、大文字小文字の正規化はありません。環境値そのものに CLI 引数による上書きはありませんが、`--batch` などが batch verifier を使う条件を決めます。
 
 ## 有効になる条件
 
-Verifier 側では、設定が on であり、batch window の行 ID がすべて異なる場合だけ batch_self_commits(rows, S) が true になります。行 ID の重複があれば false です。この条件は record_window() の batch_rec_ と組み合わせて keep_rows を決め、通常 batch launch の commit graph 省略にも使われます。したがって、各 slot に複数の proposal 行が入る window には適用されません。
+- `--batch` 等で batch verifier が構成され、処理中の window が batch recurrence 経路を使うこと。
+- window の row-slot 対応が重複しないこと（1 slot あたり 1 row）。行が同じ slot の draft/proposal を複数含む場合、この設定による self-commit は使いません。
+- batch window 内の GDN layer では、conv 履歴と GDN state を window graph 内で更新します。QSA indexer tail の snapshot も省きます。条件を満たさない window では通常の commit graph 経路に戻ります。
 
-STRATA_PIPED_MTP の可否判定では、src/program/generate.cpp がこの環境変数を別途直接読みます。値が未設定・空文字・先頭 0 ならこの理由による拒否はせず、空でない先頭 0 以外の値なら STRATA_PIPED_MTP を off にして stderr に次の警告を出します。
-
-> STRATA_PIPED_MTP is off: it does not combine with STRATA_BATCH_SELF_COMMIT (the window would keep its rows itself)
-
-ここでも文字列の全体 parse はありません。Verifier の global 判定とは別の読み取り時点です。
-
-serve/server.py は、Linux 上で 2 slot 以上の CUDA Qwen engine を構成するとき、PARALLEL_STACK_ENV の一項目として "1" を env.setdefault() で設定します。既にサーバー環境または config の env に同名キーがあればその値を維持します。この自動設定は DeepSeek 4.1、SYCL/Metal/Vulkan、HIP、および Linux 以外には適用されません。strata_control/amd_four_card.py の AMD 4-card profile も "1" を提案値として使い、同名の親プロセス環境または config 値があればそれを優先します。これらは Strata 本体の既定値ではなく、各 Python launcher/profile が子 engine 用環境に値を設定する処理です。
-
-根拠: src/core/verify.cpp:322-329,1281-1285,3777-3779,4581-4588; src/program/generate.cpp:6220-6238; serve/server.py:3670-3679,3702-3712; strata_control/amd_four_card.py:27,70-90。
+この設定は `STRATA_PIPED_MTP` と併用できません。`STRATA_PIPED_MTP` が空でなく先頭文字 `0` 以外なら、生成側は `STRATA_BATCH_SELF_COMMIT` が空でなく先頭 `0` 以外かを調べ、ON のとき piped MTP を無効化して stderr に警告します。`STRATA_BATCH_SELF_COMMIT` が未設定・空・`0...` なら、この競合理由では piped MTP を止めません（他の batch/group/window 条件は別途適用されます）。
 
 ## 実行時の詳細
 
-batch window の記録時、keep_rows が true なら GDN convolution の multi-row kernel と GDN recurrence に keep 用の行情報を渡します。GDN groups の経路でも各 group に同じ keep 指示が渡ります（src/core/verify.cpp:1575-1585,1617-1647）。batch window はそのまま slot の row を保持するため、Verifier は対応する commit graph を capture せず、通常 batch launch の直後にも commit graph を launch しません。proposal を判定した後の commit_slot_prefixes() でも、self-commit 条件が true なら batch commit graph の launch と同期を省きます（src/core/verify.cpp:3777-3779,4516-4518,4542-4548,4578-4588）。
+Verifier は `batch_self_commit_on()` の初回呼び出しで値を読み、function-local `static const bool` に cache します。ソース注釈によれば、これは起動直後ではなく初回利用時に読むためです。AMD HIP gfx1151 の Windows batch 既定を `main()` が設定した後に値を確認でき、判定後の環境変更は反映されません。
 
-設定値が on のとき、batch verifier 初期化ログは「one-row windows keep their rows」という suffix を付けます。ただし、この起動ログは設定値を示すもので、個々の window の row ID がすべて異なることまでは示しません。各 batch graph の capture 時には strata verify: captured the batch window over slots ... が出ます。変数専用の失敗・終了経路は見つかりませんでした。関連する graph capture/launch が失敗した場合は既存の verify: ... エラーを返し、生成側が ERR <内容> を出す経路があります。
+Windows の gfx1151（Strix Halo）では、batch slot が 2 以上で `STRATA_GFX1151_DEFAULTS=0` でない場合、arch defaults がこの変数を `1` に設定します。既に環境変数が存在すれば値を変更しません（空文字も「設定済み」として保持されます）。この既定値は HIP build の device 初期化経路で `apply_arch_defaults()` から適用されます。
 
-Strata の docs/BATCHING.md も opt-in switch として「one-row-per-slot window advances the GDN state itself, no commit graph」と記載しています（docs/BATCHING.md:110-123）。同文書には batch parity / 性能測定の説明もありますが、それらの測定結果はこの変数単独の一般的な性能保証としては扱っていません。
+また `serve/server.py` は Linux 上の複数 slot 構成で、DeepSeek・SYCL・Metal・Vulkan と HIP を除く engine に並列 stack 環境を `setdefault` で追加します。このため Linux CUDA Qwen の `--batch`/parallel が 2 以上なら、設定や継承環境が先に値を与えていないと子 engine に `STRATA_BATCH_SELF_COMMIT=1` が渡ります。サーバー設定の `env` に明示した値はそのまま残ります。
 
-根拠: src/core/verify.cpp:3739-3741,3751-3774,1575-1585,1617-1647,4542-4548,4578-4588; src/program/generate.cpp:13419-13424; docs/BATCHING.md:110-123。
+setup の profile も `env` に `1` を補う場合があります。replica profile は opt-in（`STRATA_REPLICA_PROFILE` または run config）で、対応する Qwen3.8 quant、2 枚以上の GPU と VRAM/RAM 条件などを満たしたとき適用されます。4-card AMD profile は R9700 4 枚・Qwen3.8 IQ3_S 等の条件を満たし、profile を無効化していない場合に適用されます。どちらも既存の process 環境に変数があれば profile は env 値を補わず、config の env に値があれば `setdefault` により保持します。
+
+Verifier 初期化時、判定値が ON なら stderr の `strata verify: batch windows ...` に `, one-row windows keep their rows` が付きます。これはスイッチが ON であることの表示で、各 window が実際に一意な row-slot 構成かどうかの表示ではありません。実際の省略判定は window ごとに行い、対象外なら commit graph を通常通り起動します。piped MTP との競合時の警告は `strata generate: WARNING: STRATA_PIPED_MTP is off: it does not combine with STRATA_BATCH_SELF_COMMIT (the window would keep its rows itself)` です。
 
 ## 根拠
 
-- 候補一覧には STRATA_BATCH_SELF_COMMIT が掲載されています（docs/envvars/000_envvers.md:619）。本体の読み取りは共通 helper を経由する src/core/verify.cpp:315 で確認しました。さらに src/program/generate.cpp:6223 が piped MTP との組み合わせ判定で直接読みます。
-- verifier の batch path は src/core/verify.cpp:3744-3774 で batch window を capture し、src/core/verify.cpp:4578-4588 で launch します。single-token path にある別の self_commit は !batch_rec_ 条件付きであり、この変数の batch 条件とは区別されています（src/core/verify.cpp:1230-1233,3629-3632）。
-- docs/BATCHING.md:492-495 は STRATA_BATCH_SELF_COMMIT 有効時に STRATA_PIPED_MTP を使えないことも説明しています。コード側では src/program/generate.cpp:6220-6238 が理由を出して piped MTP を無効化します。
+- `src/core/verify.cpp:308-311,322-330`: `env_on()` の値判定、初回使用時の static cache と理由。
+- `src/core/verify.cpp:338-345,1411-1415`: 一行一 slot の条件と batch window の `keep_rows` 判定。
+- `src/core/verify.cpp:1717-1718,1764-1769,1871-1877`: GDN conv/state 更新と indexer tail snapshot の条件。
+- `src/core/verify.cpp:3972-3978,4014-4016,4816-4822,4924-4927`: 初期化ログ、commit graph capture/launch の省略箇所と通常 commit error path.
+- `src/program/generate.cpp:3702-3719`: HIP device 情報取得後の arch defaults 適用。
+- `src/core/arch_defaults.cpp:193-209,221-229,283-298`: Windows gfx1151・2 batch slots 以上の既定値、既存値を尊重する設定処理とログ。
+- `src/program/generate.cpp:6653-6678`: `STRATA_PIPED_MTP` との競合判定と stderr 警告。
+- `serve/server.py:3974-3983,4009-4019,4054-4071`: Linux server parallel stack の値と適用条件、子 engine 環境の構成。
+- `strata_control/replica_profile.py:37-39,44-49,77-99,102-122` と `setup.py:10863-10877`: opt-in replica profile の条件と値の注入。
+- `strata_control/amd_four_card.py:1-14,27,34-61,64-91` と `setup.py:10878-10885`: 4-card AMD profile の条件と値の注入。
+- `docs/BATCHING.md:110-123,492-495,576-593`: opt-in switch の説明、piped MTP の制約、4x R9700 serving profile での利用例。測定値は同文書の特定構成に限られ、この変数単体の一般的な性能効果を示すものではありません。

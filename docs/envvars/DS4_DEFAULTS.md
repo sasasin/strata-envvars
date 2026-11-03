@@ -1,60 +1,56 @@
 # `DS4_DEFAULTS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `main...origin/main` で変更なし。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
 
 ## 役割
 
-DeepSeek V4.1 エンジンで、Strata 0.2.7 で変更された複数の既定値を 0.2.6 相当に戻すマスター切替です。`src/dsv41/ds4_experts_rule.hpp` の `defaults_026()` が値を読み、各機能の既定値決定関数へ bool を渡します。単一の実行モードを直接切り替える値ではなく、対象となる既定値を個別に選び直します。Qwen 用の別変数 `STRATA_DEFAULTS` とは別です（`src/dsv41/ds4_experts_rule.hpp:16-27`; `docs/release-notes-0.2.7.md:30-35`）。
+DeepSeek V4.1 エンジンで、0.2.7 で変わった複数の既定動作を 0.2.6 相当へ戻す互換スイッチです。モデルや CLI の実行モードを直接選ぶ値ではなく、エンジンが個々の既定値を決める際に参照します。対象には prompt chunk、attention slab、CPU lane のコピー、expert 数、RAM store、dequantizer、head などがあります。Qwen の既定値を切り替える `STRATA_DEFAULTS` とは別です（`src/dsv41/ds4_experts_rule.hpp:16-26`）。
 
 ## 値と判定
 
-値は数値変換せず、文字列全体を `strcmp` で比較します。
+値は数値変換せず、文字列全体を大文字小文字も含め完全一致で比較します。
 
-| 環境値 | `defaults_026()` | 判定 |
-|---|---:|---|
-| 未設定 | false | 新しい既定値側 |
-| `026` | true | 0.2.6 相当の既定値側 |
-| `0.2.6` | true | 同上 |
-| `v0.2.6` | true | 同上 |
-| 空文字、`1`、`true`、`026 `、大文字・小文字違いなど | false | 新しい既定値側 |
+| 値 | 判定 | 結果 |
+|---|---|---|
+| 未設定 | 無効 | 現行の既定値を使う |
+| `026`、`0.2.6`、`v0.2.6` | 有効 | 対象となる既定値を 0.2.6 相当に戻す |
+| 空文字、`0`、`027`、`026 `、`V0.2.6` など | 無効 | 現行の既定値を使う |
 
-認識するのは上表の 3 文字列との完全一致だけです。空白除去、大小文字変換、数値 parse、無効値の警告や別値への fallback はありません。結果は `defaults_026()` 内の `static const bool` に保存され、プロセスで最初に呼ばれた時点の値が以後使われます。したがって、その後の環境値変更は反映されません（`src/dsv41/ds4_experts_rule.hpp:22-27`）。
+無効な文字列への警告やエラーはありません。読み取り結果は `defaults_026()` 内の `static const bool` に保存されるため、最初の呼び出し後にプロセス環境を書き換えても反映されません（`src/dsv41/ds4_experts_rule.hpp:22-27`）。
 
 ## 有効になる条件
 
-変数判定そのものに OS / GPU / build 条件はありません。一方、渡された bool が変える各既定値には機能固有の条件があります。対象は DeepSeek V4.1 エンジンのコードで、特に次のような分岐に作用します。
+DeepSeek V4.1 のコードがビルドされ、そのエンジン経路で該当する既定値が評価される場合にだけ作用します。すべての実行で全項目が一律に変更されるわけではありません。GPU/OS、VRAM と expert の配置、モデル形式、prompt が chunk 化されるか、RAM store や drafter の使用状態など、それぞれの機能条件に従います。
 
-| 既定値 | `DS4_DEFAULTS` が認識値の場合の選択 | 条件・個別指定 |
-|---|---|---|
-| 1 語あたりの expert 数 | 2 枚以上の RDNA4 GPU が半数以上の routed experts を保持することを理由に 5 experts にする既定判定を無効化。小容量 GPU（合計 VRAM 16 GiB 以下）や統合 GPU に対する既定判定は残る | `--experts N` が指定されればその数を使い、モデルの expert 数を上限にする。`DS4_TOPK` はテスト用上書き（`src/dsv41/ds4_experts_rule.hpp:30-46`; 呼び出し `src/dsv41/ds4_model.cu:2361-2380`） |
-| prompt chunk | `multi_tp` 条件を既定 chunk の 1024 行選択から除外する | 適応には chunked prompt が使われる必要がある。`--prefill-chunk N` が明示されるとルール値より優先し、`DS4_CHUNK` が設定されるとさらにその値で置き換える（`src/dsv41/ds4_experts_rule.hpp:64-80`; `src/dsv41/ds4_model.cu:2282-2303`） |
-| staging ring | GPU が保持する expert share が `1/1.3` 以上なら 16 MB、それ未満なら 400 MB | `ring_mb_auto()` が呼ばれる経路の自動値。`DS4_RING_MB` 指定時は別の値を使う（`src/dsv41/ds4_experts_rule.hpp:146-155`; 呼び出し `src/dsv41/ds4_model.cu:3283-3298,3409`） |
-| attention slab | 統合 GPU でも base は 8 MB。`DS4_ATTN_SLAB` 未設定時は base に固定し、自動拡張しない | `STRATA_DS4_A_MB` が非 0 なら base を明示し、`DS4_ATTN_SLAB` の非負値指定も優先する。正値は行数要求、0 は base（`src/dsv41/ds4_experts_rule.hpp:102-130,167-172`; `src/dsv41/ds4_model.cu:3317-3354`） |
-| CPU lane の RAM コピー pin | 未設定なら OFF | `DS4_COPY_PIN` の明示値が優先。pin 実行には RAM copy chunk も必要（`src/dsv41/ds4_experts_rule.hpp:174-180`; `src/dsv41/ds4_model.cu:5140-5158`） |
-| huge-page copy arena | 未設定なら OFF | `DS4_COPY_HUGETLB` の明示値が優先（`src/dsv41/ds4_experts_rule.hpp:182-187`; `src/dsv41/ds4_model.cu:4973-4985`） |
-| matrix-core attention | 未設定なら OFF | `DS4_FAST_ATTN` の明示値が優先する。未設定時の通常既定は HIP の gfx1200 / gfx1201、および Windows HIP の gfx1151 に限られる。CUDA はこの機能の自動選択をしない（`src/dsv41/ds4_experts_rule.hpp:189-195`; `src/dsv41/ds4_kernels.cu:2077-2090`） |
-| drafter の累積 confidence cut | 未設定時 0 | `STRATA_DS4_DSPARK_CUM` が設定されていればその値が優先。未設定時の通常 0.5 既定は gfx1200 / gfx1201 に限られる（`src/dsv41/ds4_experts_rule.hpp:197-200`; `src/dsv41/ds4_main.cpp:169-180`） |
-| RAM store spare slots / put-back | 未設定なら両方 OFF | `DS4_STORE_SPARE` と `DS4_STORE_PUT` の個別指定を優先（`src/dsv41/ds4_experts_rule.hpp:203-208`; 呼び出し `src/dsv41/ds4_model.cu:5550-5557,7113-7121`） |
-| RAM store の prompt 後 preload | `DS4_SETTLE_STORE` 未設定時は ON | 明示値は `env_f()` で float に変換して使用。copy mode では 0.2.6 相当の分岐は RAM copy にある expert を preload 対象から除外しない（`src/dsv41/ds4_experts_rule.hpp:210-213`; `src/dsv41/ds4_model.cu:7179-7194`） |
-| dense dequantizer | 未設定なら旧 row-per-lane kernel | `DS4_DQ_OLD` の非空値があれば `atoi != 0` の結果が優先。未設定で通常時は HIP gfx11 のみ旧 kernel（`src/dsv41/ds4_experts_rule.hpp:215-220`; `src/dsv41/ds4_iq.cu:1398-1422`） |
-| head の列数 / drafter head と gate-up operand | GGUF head は 4 列ずつ。markov head を Q8 にせず F16 で読み、gate/up は F16 activation copy を使わない | `DS4_HEAD_PER` は指定時に列数を上書きする。markov head の変更は drafter head が存在する場合、gate/up は該当計算経路で適用（`src/dsv41/ds4_experts_rule.hpp:222-227`; `src/dsv41/ds4_model.cu:4203-4209,4402-4411,9621-9634`） |
-| RDNA3 dense prefill GEMM | 未設定なら無効 | HIP build の GEMM 経路だけにあり、`STRATA_DENSE_PFGEMM` の明示値が優先する。CUDA build にはこの kernel 選択分岐がない（`src/dsv41/ds4_experts_rule.hpp:228-232`; `src/dsv41/ds4_model.cu:3435-3455`） |
+この値を有効にした場合、主に次の既定値が 0.2.6 相当に戻ります（`src/dsv41/ds4_experts_rule.hpp:16-21,43-50,80-97,133-147,162-170,183-247`）。
 
-`DS4_DEFAULTS` が false でも、それだけで上記機能がすべて ON になるわけではありません。個別の backend / GPU / モデル状態 / RAM store や chunked prompt の有無に応じて各規則が判断します。反対に true でも、呼び出し箇所の条件が成立しない機能は使われません。
+- staging ring は expert share が `1/1.3` 以上なら 16 MB、それ未満なら 400 MB の固定値になります。
+- prompt chunk の現行ルールにある RDNA4 の multi-TP 向け 1024 行分岐は適用されません。明示した `--prefill-chunk N` は優先されます。
+- `DS4_ATTN_SLAB` が未設定なら slab の自動拡張を止め、base を使います。明示値は優先されます。attention base の既定は 8 MB 相当です（`STRATA_DS4_A_MB` が明示されていればそちらが使われます）。
+- `DS4_COPY_PIN` と `DS4_COPY_HUGETLB` が未設定なら無効です。各変数の明示値は優先されます。
+- `DS4_FAST_ATTN` が未設定なら無効です。明示値は優先されます。既定機能は GPU/backend 条件にも依存し、HIP の gfx1200/1201、および Windows HIP の gfx1151 以外へ暗黙に有効化するものではありません。
+- `STRATA_DS4_DSPARK_CUM` が未設定なら drafter の cumulative cut は 0 です（現行既定で gfx1200/1201 のみ使う 0.5 にはなりません）。明示値は優先されます。
+- `--experts` が未指定のとき、RDNA4 1 枚または複数枚に対する現行の faster-mode 既定判定を無効にします。小容量 GPU / 統合 GPU の 5 experts 既定は残ります。`--experts N` は優先されます。
+- `DS4_STORE_SPARE` と `DS4_STORE_PUT` が未設定なら無効です。明示値は優先されます。
+- `DS4_SETTLE_STORE` が未設定なら prompt 後の RAM store preload を有効に戻します。明示値は優先されます。
+- 対象経路の dense dequantizer は旧 row-per-lane kernel、head の処理列数は 4、drafter の Markov head は F16、gate/up operand は F32 相当の既定になります。`DS4_HEAD_PER` は明示値で上書きできます。HIP gfx11 の dequantizer は別条件です（後述）。
+- `STRATA_DENSE_PFGEMM` が未設定なら RDNA3 の WMMA dense GEMM は無効です。明示値は優先されます。
 
 ## 実行時の詳細
 
-ソース全体の完全一致検索では、環境から `DS4_DEFAULTS` を直接読む実装は `defaults_026()` の `std::getenv` 1 箇所です。そこから DeepSeek V4.1 の各規則へ bool が渡されます。`ds4_model.cu` の model 初期化では expert 数、prompt chunk、staging ring、attention slab、copy arena、store 等の選択に使われ、kernel / drafter 側でも dequantizer、attention、head の既定選択に使われます。別の helper や動的な環境変数名経由で `DS4_DEFAULTS` を再読する箇所は見つかりませんでした（`src/dsv41/ds4_experts_rule.hpp:25-27`; 主な呼び出し `src/dsv41/ds4_model.cu:2293,2372,3294,3331,3354,3445,4208,4409,4978,5144-5145,5551,5567,7113,7182,7191,9629`; `src/dsv41/ds4_iq.cu:1402-1406`; `src/dsv41/ds4_kernels.cu:2077-2090`; `src/dsv41/ds4_main.cpp:176-180`）。
+エンジンが `defaults_026()` を最初に呼んだ時点で環境変数を一度読みます。主な呼び出し元はモデルロード時の prompt chunk、expert 数、staging ring、attention slab、コピー arena、store 設定、および head 設定です（`src/dsv41/ds4_model.cu:2788,2877,3943,4070-4093,5861,6027,6677,6693,8657,8727,13291-13298`）。GPU 状態やモデル状態によって呼び出し自体が無い機能もあります。
 
-関連する個別 env は一般に優先されます。たとえば、`copy_pin_default()` / `copy_hugetlb_default()` / `fast_attn_default()` は未設定を表す `env < 0` の場合にだけ `v026` の既定を適用し、明示値があればそれを先に返します。`env_tri()` は未設定を -1、設定値を `atoi(v) != 0` による 0 / 1 にし、空文字は 0 として扱います（`src/dsv41/ds4_model.cu:97-101`; `src/dsv41/ds4_experts_rule.hpp:174-194`）。CLI も `--experts` と `--prefill-chunk` の明示値を各既定規則より先に採ります（`src/dsv41/ds4_experts_rule.hpp:39-46,64-80`; `src/dsv41/ds4_model.cu:2293-2299,2372-2378`）。
+各機能の明示設定との優先順位は機能ごとに異なります。たとえば `--experts` と `--prefill-chunk` はスイッチ由来の既定値より先に選ばれます。一方、環境変数を読む機能ではその明示値が既定値関数の引数として先に判定されます。dequantizer は HIP gfx11 で特別扱いされ、`DS4_DEFAULTS` だけでは旧 kernel を選びません。gfx11 では `DS4_DQ_OLD=1` が必要で、対応する型に限られます（`src/dsv41/ds4_experts_rule.hpp:43-50,80-89,192-210,221-247`; `src/dsv41/ds4_iq.cu:1436-1463,1465-1473`）。
 
-`DS4_DEFAULTS` 自体の専用ログはありません。下流の条件によって stderr に expert 数（`src/dsv41/ds4_model.cu:2374-2378`）、自動 chunk（同 `2295-2297`）、verbose 時の staging ring（同 `3295-3297`）、copy pin の成功・失敗（同 `5146-5158`）などが出ることはありますが、これらは選ばれた処理や条件のログで、変数名や parse エラーを通知するものではありません。ソース上、`DS4_DEFAULTS` 自体が終了やエラーを発生させる分岐はありません。
+この変数そのものを受理・拒否した旨のログは見つかりません。個別機能の既存ログは条件付きで出ます。たとえば attention slab の自動拡張ログは verbose 時のみであり、0.2.6 相当で自動拡張されない場合は出ません（`src/dsv41/ds4_model.cu:4094-4103`）。prompt chunk の選択など、機能ごとの別ログは `DS4_DEFAULTS` の判定結果を直接表示するものではありません。値が未対応でも起動失敗にはならず、単にスイッチが無効になります。
 
-Strata のアプリ設定では「DeepSeek speed-ups」を OFF にした構成として `DS4_DEFAULTS=026` と 6 個の個別変数を同時に設定します。ON ではその 7 項目を除去します。このため、アプリの OFF 動作にはマスター値だけでなく明示的な個別値も含まれます（`apps/host/server/native-settings.mjs:49-53`; `strata_control/speed_switches.py:48-55`）。
+Strata の release notes も、この変数を DeepSeek の既定値を戻すスイッチとして挙げ、個別設定が優先すると記しています（`docs/release-notes-0.2.7.md:28-35`）。測定値はこの文書では引用せず、実行時の性能や数値同一性を独自に検証したものではありません。
 
 ## 根拠
 
-- 読み取り・完全一致値・cache: `src/dsv41/ds4_experts_rule.hpp:22-27`。
-- 変更対象の一覧と明示値優先の設計: `src/dsv41/ds4_experts_rule.hpp:16-21`。個々の現行判定は同ファイルの `39-80,102-130,146-155,167-232`。
-- 呼び出しと下流動作: `src/dsv41/ds4_model.cu:2282-2303,2361-2380,3283-3298,3317-3354,3435-3455,4198-4214,4398-4411,4973-4990,5138-5158,5550-5579,7109-7121,7179-7200,9621-9634`; `src/dsv41/ds4_iq.cu:1398-1435`; `src/dsv41/ds4_kernels.cu:2077-2090`; `src/dsv41/ds4_main.cpp:169-180`。
-- 文書との照合: `docs/release-notes-0.2.7.md:30-35` は切替の概要・0.2.6 相当へ戻す対象・アプリでの設定を説明し、ソースの一覧およびアプリ設定と一致します。測定値は本変数による全機能の効果として一般化せず、本調査文書には記載していません。
+- `src/dsv41/ds4_experts_rule.hpp:16-27` — スイッチの役割、許容文字列、完全一致判定、static cache。
+- `src/dsv41/ds4_experts_rule.hpp:43-50,80-97,133-147,162-170,183-247` — 各既定値と個別設定の優先規則。
+- `src/dsv41/ds4_model.cu:2788,2877,3943,4070-4103,5861,6027,6677,6693,8657,8724-8747,13291-13298` — 実行経路、既定値の利用、関連ログ。
+- `src/dsv41/ds4_iq.cu:1436-1463,1465-1473` — gfx11 の dequantizer 例外と kernel 選択。
+- `src/dsv41/ds4_main.cpp:233-244` — drafter の cumulative cut と明示値。
+- `docs/release-notes-0.2.7.md:28-35` — 0.2.6 相当へ戻す機能としての説明（補助資料）。
