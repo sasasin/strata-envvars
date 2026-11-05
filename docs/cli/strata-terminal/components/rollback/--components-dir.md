@@ -1,6 +1,6 @@
-# `--components-dir`
+# `strata components rollback --components-dir`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,54 +8,56 @@
 | コマンド | `strata components rollback` |
 | オプション | `--components-dir` |
 | 別名 | なし |
-| 値 | コンポーネントフォルダーのパス（文字列） |
+| 値 | コンポーネント格納ルートのパス（文字列） |
 
 ## 役割
 
-rollback 対象となるエンジンと updater の状態ファイルを置くコンポーネントフォルダーを指定します。rollback はそのフォルダー内に保存された「前回の更新で保持したエンジン」を探し、次回起動時にそのエンジンが選ばれるよう pin を記録します。rollback 自体はネットワークから取得しません（`strata_control/updater.py:1033-1035`）。
+rollback が参照する engine component と更新状態のルートディレクトリを指定します。指定した場所の `.updates/state.json` に記録された直前の engine を探し、その engine を選択します。`--components-dir` 自体は rollback 対象の版を選ばず、どの component store を調べるかを決めます。
 
 ## 使い方
 
 ```sh
-strata components rollback --components-dir /srv/strata/components
+strata components rollback --components-dir /srv/strata-components
 ```
+
+rollback 先の store には、前回の更新または切り替えで記録された previous engine が必要です。
 
 ## 値と既定値
 
-- parser は値を1つ受け取ります。型変換、選択肢、存在確認、絶対パス要件などの parser 側 validation はありません（`strata_cli/update_cmd.py:30-39,57-59`）。
-- 値が空でない場合は `Path(a.components_dir)` を使います。省略時、または空文字列の場合は `strata_control.engine_component.components_dir()` にフォールバックします（`strata_cli/update_cmd.py:174`; `strata_control/engine_component.py:176-186`）。
-- 既定の格納先は `STRATA_COMPONENTS_DIR` が設定されていればその値、なければ Windows では `%LOCALAPPDATA%/Strata/components`（未設定時はホーム下の `AppData/Local/Strata/components`）、それ以外では `$XDG_DATA_HOME/strata/components`（未設定時は `~/.local/share/strata/components`）です（`strata_control/engine_component.py:176-186`）。
-- 指定先は updater の状態・ロック・エンジン格納場所に使われます。ディレクトリがなければ、少なくともロック取得時に `<指定先>/.updates` が作成されます（`strata_control/updater.py:129-152`）。
+parser は値を文字列として受け取り、既定値は `None` です。パーサ段階でパスの存在、絶対パスかどうか、ディレクトリかどうかは検証しません。空文字列を渡した場合は Python の条件判定で未指定と同じ既定ルートになります。相対パスは `Path` に変換され、そのまま使われます（呼び出し時の作業ディレクトリ基準です）。同じ option を複数回指定した場合の個別処理はなく、通常の `argparse` の値が `a.components_dir` に渡ります。
 
 ## 実行時の動作
 
-1. 共通 parser で `--components-dir` を受理し、`update_cmd.run` が指定値または既定値を `root` として `Context.components` に設定します（`strata_cli/update_cmd.py:30-39,57-59,163-184`）。
-2. `strata components rollback` の分岐では、実行中エンジンの検出関数を設定し、必要なら待機処理を行った後、`rollback_engine(ctx)` を呼びます。この分岐は update の feed 読み込みや acquire 禁止チェックを通りません（`strata_cli/update_cmd.py:185-196`; feed/acquire を行う通常 update 側は同:197-213）。
-3. rollback は `<root>/.updates/state.json` の engine セクションに保存された `previous` を読み、`<root>/engine/<previous>` の manifest を読み込み、署名と全ファイルを検証します。検証後、現在の engine とハードウェア条件を使って解決し、`previous` が実際に選ばれることを確認します（`strata_control/updater.py:1033-1066`）。
-4. 成功時は state に `pinned`, `previous`, `active` を記録します。現行 engine のバージョンが対象と異なる場合、そのバージョンを `skipped` に追加します。次の成功した更新時に pin は解除されます（`strata_control/updater.py:1033-1035,1055-1078`）。
+- `strata_cli/update_cmd.py` の `_common()` が rollback parser にも `--components-dir` を登録します（`strata_cli/update_cmd.py:47-56,80-82`）。
+- 明示値が truthy なら `Path(a.components_dir)` が component root になります。未指定または空文字なら `default_components_dir()` が使われます（`strata_cli/update_cmd.py:255-270,284-285`）。
+- 既定選択では `STRATA_COMPONENTS_DIR` があればそのルートを採用します。環境変数がなく、コマンドがソース checkout から実行され、checkout 内 `engine-feed` に engine があり、既定の per-user component directory に engine がない場合は checkout 側 `engine-feed` を使います。それ以外は `engine_component.components_dir()` の per-user 既定ルートです（`strata_cli/update_cmd.py:242-270`; `strata_control/engine_component.py:176-186`）。明示した `--components-dir` はこの既定選択を置き換えます。
+- rollback は選ばれた root ごとの `.updates/update.lock` を作成して排他し、同じ root の `.updates/state.json` から `engine.previous` を読みます。該当 engine の manifest と全ファイルを検証し、現在の PC に適合することも確認してから切り替えます（`strata_control/updater.py:136-159,172-211,1355-1377`; `strata_cli/update_cmd.py:286-300`）。
+- `--backend` は共通 parser option で、hardware 判定を指定 backend に置き換え、engine 適合性・選択に使われます。`--wait` は稼働中 engine が停止するまで待つ上限秒数です（既定 `0`、つまり待機しません）。`--feed`、`--force`、`--model-config` は共通 parser に存在しますが、rollback 分岐は feed の取得・更新処理へ進まず、これらの値を rollback 処理へ渡しません（`strata_cli/update_cmd.py:48-56,284-300`; `strata_control/updater.py:1355-1377`）。
+- rollback はネットワークから engine をダウンロードせず、選択した previous folder を起動時に優先される pin として記録します。状態ファイルは原子的置換で保存され、切替履歴も追記されます。engine が変わる場合、保存済み tuning preset は短い再チェック対象としてマークされる場合がありますが、削除はされません（`strata_control/updater.py:200-211,1303-1352,1355-1357`; `strata_cli/update_cmd.py:304-310`）。
 
-同じ `--components-dir` 定義は `strata update` と `strata components update` にも使われますが、この文書の対象は索引どおり `strata components rollback` です（`strata_cli/update_cmd.py:42-59`）。`--backend` はハードウェア検出結果の backend を上書きし、rollback 時の engine 解決に影響します。一方、`--feed`、`--force`、`--model-config` は rollback 分岐の処理では参照されません（`strata_cli/update_cmd.py:174-188`; `strata_control/updater.py:1033-1078`）。
+`STRATA_COMPONENTS_DIR` 自体の仕様は [`環境変数文書`](../../../../envvars/STRATA_COMPONENTS_DIR.md) を参照してください。環境変数との優先順位のこのコマンド固有部分は上記の現行ソースに基づきます。
 
 ## 適用条件と副作用
 
-- `previous` が state にない場合は「戻す先がない」として終了コード 2 になります。指定フォルダーが誤っていると、意図した Strata 環境とは別の場所の state / engine を参照します（`strata_control/updater.py:1036-1042`）。
-- rollback は serving 中の engine がなくなるまで待つか、待機期限・停止要求に達すると拒否します。`--wait` は秒数の浮動小数値で、未指定時は 0 秒です。CLI 側では、human 出力かつ TTY の場合に確認を促すことがあります。それ以外は待機を依頼しないまま busy 判定へ進みます（`strata_cli/update_cmd.py:34-35,182-188,237-252`; `strata_control/updater.py:300-311,1036-1044`）。
-- rollback の分岐より前に backend を含むハードウェア情報を検出します。実装コメントでは `nvidia-smi`、`rocminfo`、sysfs など既存情報を読む probe とされ、必要な場合は既存ツールの読み取り専用実行も行います（`strata_cli/update_cmd.py:174-180`; `strata_control/updater.py:249-270`）。
-- 以前の engine が存在しない、またはすでにその engine が選択中なら変更せず終了コード 2 です。以前の engine の manifest / 署名 / ファイル検証に失敗した場合は終了コード 5 です。検証後にこの PC の条件で以前の engine が選ばれなければ pin を取り消して state を保存し、終了コード 5 で失敗します（`strata_control/updater.py:1040-1066`）。
-- 成功時、engine ファイル自体は移動・削除せず state の pin を更新します。engine の identity が変わる場合に限り tuning の再確認マーカーを記録します。既存 preset は変更・削除しません。以前の recheck marker がある場合は新しい identity への変更に合わせて集約され、元の identity に戻る場合は marker が解消されます（`strata_control/updater.py:1055-1078`; `strata_control/preset_marks.py:72-96`）。
-- ディレクトリ作成・state 保存・ロック作成などのファイル書き込みは指定したコンポーネントフォルダーに対して行われます。recheck marker の保存先はコンポーネントフォルダーとは別の tuning state 配下です（`strata_control/updater.py:129-152,193-204,1057-1078`; `strata_control/preset_marks.py:35-36,55-66`）。
+- 選択したルートに previous engine の状態記録と component が必要です。別の component directory を指定すると、その directory の状態だけを調べ、他の store の previous engine には切り替えません。
+- engine が稼働中の場合、端末対話では待機するか質問し、機械出力または非対話では質問せず、待機指定がなければ busy エラーになります。`--wait SECONDS` を指定すると、その時間まで停止を待ちます（`strata_cli/update_cmd.py:443-459`; `strata_control/updater.py:311-322`）。
+- component root 内の lock、状態ファイルを作成または更新します。rollback 自体は download せず、engine package の削除もしません（`strata_control/updater.py:1355-1377,200-211`）。
 
 ## 出力とエラー
 
-- 成功時は human 出力なら rollback 前後の version を表示し、preset marker の有無と新しい engine を再試行する方法を案内します。`--output json` または `jsonl` では成功 payload を JSON で出力します（`strata_cli/update_cmd.py:185-196`）。
-- `UpdateError` と署名・feed・acquisition エラーは human 出力では `strata: ...` を stderr に出し、machine 出力では error JSON を stdout に出して、それぞれ定義された終了コードを返します（`strata_cli/update_cmd.py:163-172,225-234`）。rollback 固有の主なコードは「previous なし／すでに rollback 済み」が 2、「previous engine が使えない／この PC で選べない」が 5、実行中 engine のため待てない場合が 7 です（`strata_control/updater.py:65-75,1036-1066`）。
+成功時、通常出力は切替元・切替先と tuning preset の扱いを表示します。`--output json` または `--output jsonl` では成功結果を JSON object で出力します（`strata_cli/update_cmd.py:275-311`）。
+
+- previous engine が記録されていない場合、または既にその engine が選択済みの場合は終了コード `2`。
+- previous component が欠落・破損・検証不合格、または現在の PC で使えない場合は終了コード `5`。
+- 指定した待機時間内に稼働 engine が停止しない場合は busy error（終了コード `6`）。
+- component root の更新 lock を別プロセスが保持している場合は終了コード `7`（`strata_control/updater.py:141-159,1361-1377`）。
+- `UpdateError` は通常出力では標準エラーに `strata: ...` と表示され、JSON/JSONL mode では `ok: false` とエラー情報を出します（`strata_cli/update_cmd.py:275-282,347-355`）。
 
 ## 根拠
 
-- parser と共通オプション定義: `strata_cli/update_cmd.py:30-39,42-59`
-- 既定値の選択と rollback 分岐: `strata_cli/update_cmd.py:163-196`
-- rollback 前のハードウェア検出: `strata_control/updater.py:249-270`
-- component folder の環境変数・OS 別既定値: `strata_control/engine_component.py:176-190`
-- rollback の確認、pin、state 更新、副作用: `strata_control/updater.py:1033-1078`
-- 待機と busy 判定: `strata_cli/update_cmd.py:237-252`; `strata_control/updater.py:300-311`
-- tuning preset 再確認 marker: `strata_control/preset_marks.py:35-36,72-96`
+- `strata_cli/update_cmd.py:47-56,80-82` — 共通 parser option と rollback parser への登録。
+- `strata_cli/update_cmd.py:242-270,273-311` — component root の決定、rollback 分岐、成功出力。
+- `strata_control/engine_component.py:176-190` — 環境変数・OS ごとの per-user root と engine directory。
+- `strata_control/updater.py:136-159,172-211` — component root ごとの lock と更新状態ファイル。
+- `strata_control/updater.py:1303-1352,1355-1377` — engine 切替、previous の検証、pin と履歴の更新、失敗条件。
+- `strata_cli/update_cmd.py:443-459`; `strata_control/updater.py:105-129,286-322` — 稼働確認、待機条件、busy error の終了コード。

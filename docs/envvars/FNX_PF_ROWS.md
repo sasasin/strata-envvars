@@ -1,45 +1,42 @@
 # `FNX_PF_ROWS`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
 
 ## 役割
 
-sFNX の prompt prefill で、一つの chunk に処理する prompt row 数の上限を指定します。値は `Engine` の構築時に `pf_c_` に設定され、prefill の chunk 分割、関連バッファーの割り当て、prefill 用ジョブ数の計算に使われます。対象は `src/split` の sFNX engine であり、通常の Strata engine の prefill 設定ではありません。sFNX の CUDA/HIP build と、同じ engine を使う CUDA の `split_fnx_run` がこの設定を読みます（`src/split/CMakeLists.txt:65-80,92-123,153-165`）。
+sFNX の Flash-Next split engine が prompt prefill を処理するときの最大行数（token rows）を、1 chunk あたりで指定します。指定値は engine 構築時に読み取られ、prompt の分割幅 `pf_c_`、関連する prefill buffer のサイズ、QSA の raw-key ring サイズに使われます。環境変数名を読む本番コードは `src/split/src/engine.cu` の engine constructor に 1 箇所あります。通常の Strata engine 全般の設定ではなく、`strata-split-*` / `sfnx` の Flash-Next split 経路の設定です（`src/split/CMakeLists.txt:1-7,108-136`）。
 
 ## 値と判定
 
-環境変数が未設定なら既定値は `4096` です。設定されている場合は共通 helper `env_int` が値全体を 10 進の符号付き整数として読みます。許容範囲は `MAXT` 以上 `8192` 以下、かつ `MAXT` の倍数です。この build の `MAXT` は 16 なので、許容値は 16 から 8192 までの 16 の倍数です。
+`env_int()` は符号付き 10 進整数を文字列全体から `strtoll` で読みます。先頭の `+` / `-` は許可されますが、空文字、空白、末尾の文字、数字でない値、`long long` の範囲外は parse error です。parse を通った値は `16..8192` の範囲かつ 16 の倍数でなければなりません（`MAXT = 16`）。
 
-| 入力 | 結果 |
-| --- | --- |
-| 未設定 | `4096` を使用 |
-| `16`〜`8192` の範囲内で 16 の倍数 | 指定値を使用 |
-| `+16` など、符号付きの整数全体 | 整数として受理後、同じ範囲検査を適用 |
-| 空文字、空白を含む値、小数、末尾に文字がある値、整数でない値、`long long` の範囲外 | `env_int` が `FNX_PF_ROWS: '<値>' is not a whole number` を投げる |
-| 整数として読めるが範囲外、または 16 の倍数でない値 | `FNX_PF_ROWS: a multiple of 16 from 16 to 8192, got <値>` を投げる |
+| build | 未設定時 | 設定時の受理値 | 無効値 |
+|---|---:|---|---|
+| CUDA (`FNX_HIP=0`) | `FNX_PF_PASS` も未設定なら VRAM に応じて 4096 または 8192。`FNX_PF_PASS` が設定されていれば 8192 | 16 の倍数で 16..8192（例 `16`, `4096`, `8192`, `+32`） | 空文字・非整数・範囲外・16 の倍数でない値 |
+| HIP (`FNX_HIP=1`) | 4096 | 16 の倍数で 16..8192 | 空文字・非整数・範囲外・16 の倍数でない値 |
 
-値全体を `strtoll` で検査し、後続文字を許しません。先頭・末尾の空白も受理しません。符号は受け付けますが、負数は範囲検査で拒否されます。無効値に対する fallback や clamp はありません。既定値の設定源は `Engine` 内の `pf_c_ = 4096` のみで、CLI 引数による上書きはこの読み取り経路にはありません（`src/split/src/env.hpp:15-22,33-40`; `src/split/src/model.hpp:43`; `src/split/src/engine.hpp:345-348`; `src/split/src/engine.cu:62-66`）。
+CUDA の自動選択では `FNX_PF_ROWS` と `FNX_PF_PASS` の両方が未設定の場合に、全カード中の最小空き VRAM と K/V pool を使って 8192×4、8192×2、4096×4、4096×2 の順で収まる構成を選びます。どの構成も収まらないときは 4096×2 が選ばれます。どちらかの変数が設定されているとこの自動選択を飛ばし、行数の既定値は CUDA では 8192 です。HIP build ではこの CUDA 用 VRAM 自動選択ブロック自体がコンパイルされず、未設定時は 4096 です（`src/split/src/engine.cu:78-115`）。
 
 ## 有効になる条件
 
-- sFNX split engine を使うプロセスで有効です。sFNX の engine は CMake で CUDA または HIP としてビルドされます。`split_fnx_run` は同じ engine ソースを使う CUDA の実行ファイルです（`src/split/CMakeLists.txt:65-80,92-123,153-165`）。
-- engine 構築時に一度だけ読みます。設定はその `Engine` インスタンスに固定され、プロセス実行中に環境を書き換えても既存 engine の値は変わりません。別の engine を後から構築する場合は、その構築時点の値が読まれます（`src/split/src/engine.cu:31,62-69`）。
-- sFNX サーバーではモデルと MTP を読み込んだ後、engine を構築する時点で判定されます（`src/split/tools/sfnx.cpp:1050-1061`）。
-- 別の環境変数や CLI 値との優先順位分岐はありません。行数の有効範囲を満たさなければ engine 構築自体が失敗します。
+- `STRATA_BUILD_SPLIT=ON` で作る sFNX Flash-Next engine が対象です。split engine は opt-in の別 executable で、CMake は Linux CUDA または Linux HIP の経路を構成します（`src/split/CMakeLists.txt:1-7,108-136`）。
+- engine が `prefill()` を実行する場合に chunk 幅として使われます。`FNX_PREFILL=0` の経路など、prompt を通常の window/decode 処理で読んで `prefill()` を呼ばない場合、chunk 分割への効果はありません。ただし環境値の読み取りと値検証は `Engine` 構築時に行われるため、その経路でも無効値なら構築に失敗します（`src/split/tools/fnx_run.cpp:1003-1019`; `src/split/src/engine.cu:111-114`）。
+- `FNX_PF_PASS` は別設定です。CUDA のみ、両変数が未設定のときに限り `FNX_PF_ROWS` の自動選択と pass 数選択を一緒に行います。`FNX_PF_PASS` が明示されていて `FNX_PF_ROWS` が unset なら、行数の既定値は CUDA 8192 / HIP 4096 です。`FNX_PF_PASS` は行数の値を上書きしません（`src/split/src/engine.cu:82-114`; `src/split/src/prefill.cu:1063-1071`）。
+- CLI 引数から `FNX_PF_ROWS` を上書きする処理は確認できません。`sfnx` は model load 後、server を作る前に `Engine` を構築し（`src/split/tools/sfnx.cpp:1113-1135`）、`fnx_run` も `fnx_run_cmd` 内で `Engine` を構築します（`src/split/tools/fnx_run.cpp:978-988`）。
 
 ## 実行時の詳細
 
-`Engine` の構築時に `FNX_PF_ROWS` を `env_int` で読み、範囲検査後 `pf_c_` に格納します。その値から `pf_jobs_` を計算し、`set_prompt_rows(pf_c_)` に渡します（`src/split/src/engine.cu:62-69`）。prefill は `pf_c_` ごとに token を chunk 化します。最後の chunk は残り token 数に応じて短くなります。複数 chunk の pass 幅は `K * pf_c_` です（`src/split/src/prefill.cu:1004-1028`）。関連する device/host バッファーも `pf_c_` を基準に確保されます（例: `src/split/src/prefill.cu:652-666,995-1002`）。
+`env_int("FNX_PF_ROWS", rows)` は `Engine` constructor ごとに 1 回実行され、`pf_c_` に格納されます。process 起動後に環境値を変えても既存 engine の値は変わりません。新しい `Engine` を作る場合は、その constructor 時点の環境が再度読み取られます。環境値の子 process への転送や上書きはこの設定について見つかりません。
 
-sFNX からの起動では、値が不正だと engine の構築が例外で失敗します。サーバー経路は `ERR <理由>` を出力し、stderr に `sfnx: failed: <理由>` を出して終了コード 1 で終了します（`src/split/tools/sfnx.cpp:1027-1035,1055-1061`）。したがって行数の設定はプロンプト要求ごとではなく、サーバー起動時に作られる engine 全体に適用されます。
+受理された行数は `pf_jobs_` の算出に使われ、`set_prompt_rows()` が QSA ring を `max(2048, 2 * rows)` に設定します。prefill 中は `tokens` を `pf_c_` 行以下の chunks に分割し、各 chunk を順に埋め込み、最大 pass 数 `K` 分ずつ `prefill_pass()` へ渡します。buffer の確保サイズも `pf_c_` に比例します。したがって値は chunk の大きさと関連 buffer のメモリ量を変えます。ユーザー向け CLI の上書きや追加の clamp はありません（`src/split/src/engine.cu:111-117`; `src/split/src/kernels.cu:1306-1311`; `src/split/src/prefill.cu:854-875,1300-1318,1338-1370`）。
+
+無効な整数表記は `env_int()` が `FNX_PF_ROWS: '<値>' is not a whole number` を送出します。整数として parse できても範囲や倍数条件に外れる場合は `FNX_PF_ROWS: a multiple of 16 from 16 to 8192, got <値>` です。`sfnx` の Engine 構築時に発生した例外は `fail()` が protocol の `ERR <例外>` 行と stderr の `sfnx: failed: <例外>` を出し、終了コード 1 で process を終了します（`src/split/src/env.hpp:15-21,33-40`; `src/split/src/engine.cu:111-114`; `src/split/tools/sfnx.cpp:1120-1131,1090-1098`）。CUDA の VRAM 自動選択が標準構成 8192×4 以外を選ぶ場合は、stderr に `fnx: prompt path: ...` が出ます（`src/split/src/engine.cu:97-108`）。
 
 ## 根拠
 
-- 読み取り、範囲検査、engine 内の設定: `src/split/src/engine.cu:31-69`
-- 数値の全体 parse と未設定時 default: `src/split/src/env.hpp:15-22,33-40`; `src/split/src/engine.hpp:345-348`
-- `MAXT=16`: `src/split/src/model.hpp:43`
-- chunk 分割と pass 幅: `src/split/src/prefill.cu:1004-1028`
-- sFNX の CUDA/HIP build と `split_fnx_run`: `src/split/CMakeLists.txt:65-80,92-123,153-165`
-- sFNX の engine 構築と失敗出力: `src/split/tools/sfnx.cpp:1027-1035,1050-1061`
-
-`src/split/src/engine.hpp:345-347` のコメントも既定値 4096 と上限 8192 を記載しています。`docs/DETAILS.md` には `FNX_PF_ROWS` の説明は見当たりません。コメントにある性能値は条件が十分記されていないため、本書では性能効果として断定していません。
+- 値の parse 規則: `src/split/src/env.hpp:15-21,33-40`。
+- 対象 executable と backend build 条件: `src/split/CMakeLists.txt:1-7,108-136`。
+- 既定値、自動選択、検証、設定反映: `src/split/src/engine.cu:78-117`。
+- 1 chunk ずつの prefill 処理と buffer 使用: `src/split/src/prefill.cu:854-875,1300-1318,1338-1370`。
+- QSA ring の行数: `src/split/src/kernels.cu:1306-1311`。
+- engine 構築とエラー表示: `src/split/tools/sfnx.cpp:1113-1135`; `src/split/tools/fnx_run.cpp:978-988`。

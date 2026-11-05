@@ -24,7 +24,7 @@ Control 自身の更新は component store に入り、`components/control/activ
 
 ## 現行 GitHub Release の実物（v0.2.10）
 
-2026-11-03 に GitHub Releases API と asset の実取得で確認しました。[`releases/latest`](https://github.com/Niko1221/Strata/releases/latest) は **v0.2.10**（公開 2026-11-02T23:52:47Z、asset 40 件）。checkout の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f` は annotated tag `v0.2.10`（tag オブジェクト `db0500a53119a349fa44497099d6e28a83ded34a`）の peel 先そのものです。アプリ版は 0.2.10、Control と全 engine package は 0.1.56 です。
+2026-11-06 に GitHub の v0.2.10 release page を確認しました。[`releases/latest`](https://github.com/Niko1221/Strata/releases/latest) は **v0.2.10**（公開 2026-11-02T23:52:47Z、asset 40 件。GitHub page は source archive を含む 42 files と表示）。Strata checkout の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e` は annotated tag `v0.2.10`（tag オブジェクト `db0500a53119a349fa44497099d6e28a83ded34a`）から 3 commit 先です。Release の実物は v0.2.10 のままで、アプリ版は 0.2.10、Control と全 engine package は 0.1.56 です。
 
 asset 40 件の内訳（名前は API の一覧から。v0.2.9 の 40 件と、版数を除く名前一覧は完全に同一）:
 
@@ -71,9 +71,9 @@ Release の installer スクリプトとソースの対応はハッシュで確�
 - Windows 向け code signing 証明書は設定されていないため、`.exe` に Authenticode は付きません（`packaging/README.md`）。asset の `.sig` は Tauri updater の minisign 署名で、Authenticode とは別物です。
 - ソースの `docs/INSTALL.md` は冒頭が「version 0.2.5」のまま、本文の asset 名は 0.2.9（`Strata-0.2.9-windows-x64-setup.exe` ほか）、`docs/DOCKER.md` の flavor 表は `0.2.7-*` を載せています。公開 asset の名前は上記の 0.2.10 / 0.1.56 に従います。
 
-## 直前の調査（v0.2.9）からの変化
+## Release v0.2.10 と checkout HEAD の差、および直前の調査（v0.2.9）からの変化
 
-前回この文書が対象にした v0.2.9（`c62d5e3a15b40ea51c96aae9e8d36928965f53ab`、公開 2026-10-31、asset 40 件、Control / engine 0.1.55）から、配布の形は次のように変わりました。
+前回この文書が対象にした v0.2.9（`c62d5e3a15b40ea51c96aae9e8d36928965f53ab`、公開 2026-10-31、asset 40 件、Control / engine 0.1.55）から、配布の形は次のように変わりました。2026-11-06 の確認では v0.2.10 の公開 asset 一覧に変化はなく、checkout HEAD は v0.2.10 tag から 3 commit 進んでいます。この HEAD は未リリース checkout であり、以下の HEAD ソース変更を Release asset の内容としては扱いません。
 
 - Control / engine の版は 0.1.55 → 0.1.56、アプリは 0.2.9 → 0.2.10。asset 40 件の名前一覧は版数を除いて同一で、platform・backend・variant の組み合わせも同じ（engine 14 + dsv41 6 + control 4 + GUI 3 + `.sig` 4 + feed / installer 8）。feed の `sequence` は 118 → 120。
 - **全カード分割 engine `strata-split-N` が増えた**（`src/split/`、sFNX 由来・MIT）。CMake は `STRATA_BUILD_SPLIT=ON` と `STRATA_SPLIT_CARDS`（2/3/4 のみ可）で `strata-split-${_n}` を作り、`STRATA_SPLIT_ARCH` の 1 アーキテクチャ専用（`src/split/CMakeLists.txt:92-124`）。ビルドは `packaging/build_split_cuda.sh` / `packaging/build_split_hip.sh`（新規）、同梱は `packaging/build_hip_linux.sh` の `SPLIT_DIR`（新規行）。配布は engine package 内の追加ファイルで、独立 asset・feed 節は無い。判定とフォールバックは `strata_control/split_engine.py` と `serve/server.py`。
@@ -83,6 +83,12 @@ Release の installer スクリプトとソースの対応はハッシュで確�
 - macOS の engine package の中身が増えた（38 → 43 entries: `metal/engine-msl/*.metal` 8、`metal/data/draft_vocab.bin`, `metal/data/expert-profile.bin`）。`strata-vision` は前回に続いて同梱。デスクトップアプリの macOS bundle は `engine-bundle/0.1.56-macos-arm64-metal/` を同梱。
 - root `CMakeLists.txt` の `add_executable` は 250 → 277、`sycl/CMakeLists.txt` は 32 → 39。増加分はすべて `*_test` / `*_parity` / `*_bench` / probe・harness 系（`dflash2_ring_test`, `ds4_route_guard_test`, `routed_stream_test`, `window_rule_test`, `gr_v3_screen`, `mmvf_unr_hash` など）で、`src/split/` 側の 5 件（`strata-split-2/3/4`, `split_fnx_run`, `split_convert_dump`, `split_moe_tile_test`, `split_*_test`）は利用者 CLI 索引の対象外とします（engine package が採るファイルと Terminal が起動する実行ファイルのみが対象）。
 - `.github/workflows` の配布 job は変わっていません（差分は `ISSUE_TEMPLATE` の `amd_split_report.yml` 追加と `bug_report.yml` 更新のみ）。
+
+### v0.2.10 tag より後の checkout 変更（HEAD `9f7d977d…`）
+
+- 3 commit の差分で `strata_cli/split_cmd.py` が追加され、Terminal に `strata split-engine apply` parser が加わりました。`strata_cli/cli.py`、`strata_cli/drafting_cmd.py`、`strata_cli/update_cmd.py` にも変更があります。これらは CLI 索引で確認し、個別 option 文書はこの索引更新では作成していません。
+- GUI/App Host では fontconfig の環境変数 (`STRATA_FONT_CONFIG`) と host stream/write 周りの実装が追加・更新されています。これは `docs/envvars/000_envvers.md` に反映しました。
+- エンジンの PCIe share/refinement、chunking、spill に関する更新はソース checkout の変更です。これらが v0.2.10 Release asset に入っているとは断定していません。
 
 ## ビルド生成物と配布対象の区別
 
@@ -97,11 +103,11 @@ Release の installer スクリプトとソースの対応はハッシュで確�
 
 ## 調査で確認した主なソース
 
-- checkout 情報: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-02T23:37:27+01:00）、working tree clean、`git describe --tags` は `v0.2.10`（tag と HEAD は同一コミット。`git pull --ff-only` は "Already up to date"）。確認日: 2026-11-03。
-- CLI / checkout setup: `strata.py`, `strata_cli/cli.py`, `bin/strata`, `bin/strata.cmd`, `bin/strata.ps1`, `setup.sh`, `SETUP.bat`, `START-HERE.bat`, `update.sh`, `UPDATE.bat`, `bench.sh`, `BENCH.bat`, `setup.py`, `chat.py`, `highlight.py`
-- CMake / engine: `CMakeLists.txt`（`add_executable` 277 件の位置と条件）, `sycl/CMakeLists.txt`, `metal/CMakeLists.txt`, `src/split/CMakeLists.txt`, `src/split/env.hpp`, `tools/vision/CMakeLists.txt`, `src/program/generate.cpp`, `packaging/build_cuda_linux.sh`, `packaging/build_cuda_linux_aarch64.sh`, `packaging/build_hip_linux.sh`, `packaging/build_sycl_linux.sh`, `packaging/build_split_cuda.sh`, `packaging/build_split_hip.sh`, `packaging/build_dsv41_cuda.sh`, `packaging/build_dsv41_hip_linux.sh`, `packaging/build_dsv41_windows.bat`, `packaging/build_vision_mac.sh`, `packaging/build_vision_windows.bat`, `packaging/mac/build_dsv41_engine.sh`, `packaging/package_engine.py`, `packaging/ENGINE-COMPONENT.md`, `spark/build_engine.sh`, `strata_control/engine_component.py`, `strata_control/dsv41_engine.py`, `strata_control/split_engine.py`, `serve/server.py`（split_fallback）, `serve/test_split_fallback.py`
+- checkout 情報: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（commit 日 2026-11-05）、working tree clean、`git describe --tags` は `v0.2.10-3-g9f7d977d`（`v0.2.10` tag から 3 commit 先。`git pull --ff-only` は "Already up to date"）。確認日: 2026-11-06。
+- CLI / checkout setup: `strata.py`, `strata_cli/cli.py`, `strata_cli/split_cmd.py`, `bin/strata`, `bin/strata.cmd`, `bin/strata.ps1`, `setup.sh`, `SETUP.bat`, `START-HERE.bat`, `update.sh`, `UPDATE.bat`, `bench.sh`, `BENCH.bat`, `setup.py`, `chat.py`, `highlight.py`
+- CMake / engine: `CMakeLists.txt`（`add_executable` 277 件の位置と条件）, `sycl/CMakeLists.txt`, `metal/CMakeLists.txt`, `src/split/CMakeLists.txt`, `src/split/env.hpp`, `include/strata/core/pcie_share_rule.hpp`, `include/strata/core/nv_chunk.hpp`, `tools/vision/CMakeLists.txt`, `src/program/generate.cpp`, `packaging/build_cuda_linux.sh`, `packaging/build_cuda_linux_aarch64.sh`, `packaging/build_hip_linux.sh`, `packaging/build_sycl_linux.sh`, `packaging/build_split_cuda.sh`, `packaging/build_split_hip.sh`, `packaging/build_dsv41_cuda.sh`, `packaging/build_dsv41_hip_linux.sh`, `packaging/build_dsv41_windows.bat`, `packaging/build_vision_mac.sh`, `packaging/build_vision_windows.bat`, `packaging/mac/build_dsv41_engine.sh`, `packaging/package_engine.py`, `packaging/ENGINE-COMPONENT.md`, `spark/build_engine.sh`, `strata_control/engine_component.py`, `strata_control/dsv41_engine.py`, `strata_control/split_engine.py`, `serve/server.py`（split_fallback）, `serve/test_split_fallback.py`
 - Terminal / feed / install: `packaging/install.sh`, `packaging/install.ps1`, `packaging/package_terminal.py`, `packaging/feed_tool.py`, `packaging/make_local_feed.py`, `packaging/locks/runtime-linux-aarch64-cp312.txt`, `packaging/README.md`, `packaging/UPDATES.md`, `strata_control/feed.py`, `strata_control/paths.py`, `strata_control/components.py`, `strata_control/updater.py`, `strata_control/discovery.py`, `docs/INSTALL.md`, `docs/TERMINAL.md`, `docs/TERMINAL_LAUNCH.md`, `docs/TERMINAL_QUICKSTART.md`, `docs/DGX_SPARK_LINUX.md`, `.gitattributes`（`*.ps1 text eol=crlf`）
-- Desktop: `apps/desktop/package.json`, `apps/host/package.json`（いずれも 0.2.10）, `apps/desktop/src-tauri/Cargo.toml`（0.2.10）, `apps/desktop/src-tauri/tauri.conf.json`, `apps/desktop/src-tauri/nsis/installer.nsi`, `apps/desktop/src-tauri/src/main.rs`（`packaged_resource_dir`）, `apps/desktop/scripts/stage-control.py`, `apps/desktop/scripts/stage-harness.mjs`, `apps/desktop/scripts/fetch-node.sh`, `apps/desktop/scripts/fetch-node.ps1`
+- Desktop: `apps/desktop/package.json`, `apps/host/package.json`（いずれも 0.2.10）, `apps/host/server/index.mjs`, `apps/host/server/stream-beat.mjs`, `apps/desktop/src-tauri/Cargo.toml`（0.2.10）, `apps/desktop/src-tauri/tauri.conf.json`, `apps/desktop/src-tauri/nsis/installer.nsi`, `apps/desktop/src-tauri/src/main.rs`（`packaged_resource_dir`）, `apps/desktop/src-tauri/src/fontguard.rs`, `apps/desktop/scripts/stage-control.py`, `apps/desktop/scripts/stage-harness.mjs`, `apps/desktop/scripts/fetch-node.sh`, `apps/desktop/scripts/fetch-node.ps1`
 - Docker: `docker/Dockerfile`, `Dockerfile`, `docker/build.sh`, `docker/publish.sh`, `docker/fetch-engines.py`, `docker/entrypoint.sh`, `docker/strata-wrapper.sh`, `docker/healthcheck.sh`, `docker/smoke-test.sh`, `docker/compose/*.yml`, `docs/DOCKER.md`, `.github/workflows/docker-images.yml`, ghcr.io の `niko1221/strata` tag 一覧と `latest-cuda13` / `0.2.9-cuda13` の manifest digest（2026-11-03 に取得）
 - Release 実物: [`releases/latest`](https://github.com/Niko1221/Strata/releases/latest) と GitHub Releases API（`/releases/latest`, `/releases/tags/v0.2.9`）で v0.2.10 の asset 40 件・サイズ・`digest` を確認し、v0.2.9 の asset 一覧と比較。`install-manifest.txt`, `latest.json`, `SHA256SUMS.txt`, `strata-feed.json`, `strata-feed-linux-aarch64.json`, `install.sh`, `install.ps1`, `strata-feed.json.sig` の本文を取得。`strata-engine-0.1.56-macos-arm64-metal.tar.gz`, `strata-dsv41-0.1.56-macos-arm64-metal.tar.gz`, `strata-control-0.1.56-macos-arm64.tar.gz`, `Strata.app.tar.gz` をダウンロードして展開し、SHA-256 が API の `digest` と一致することを確認した。
 

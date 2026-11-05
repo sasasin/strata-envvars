@@ -1,49 +1,38 @@
 # `APPIMAGE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
 
 ## 役割
 
-デスクトップ版では、起動に使われた AppImage のパスから利用者向けの再実行コマンドを組み立てます。また、ホストが外部プログラム用の環境を作る際、AppImage 内で動作しているかを判定する手掛かりの一つとして使います。クラッシュ時の診断ログにも値を記録します。
-
-これはデスクトップ／ホスト側の処理です。Strata の C++/CUDA/HIP/SYCL エンジンが `APPIMAGE` を読む箇所は確認できませんでした。
+`APPIMAGE` は推論エンジンの設定ではありません。Linux デスクトップでは、診断ログに現在の値を記録し、ユーザー向けの `--quit` / `--save-logs` 案内で実行ファイル名を組み立てます。AppImage 内のホストでは、システムのファイル選択・通知・ブラウザー等を起動するとき、AppImage 用の環境を外部プログラムへそのまま渡さないための判定にも使われます。
 
 ## 値と判定
 
-| 読み取り箇所 | 未設定 | 設定時の判定・変換 |
+| 読み取り箇所 | 未設定 | 設定時の扱い |
 |---|---|---|
-| デスクトップの `command_name()` | `current_exe()` のファイル名を使用し、得られなければ `strata-desktop` | Rust の `std::env::var` が Unicode 文字列として取得できた場合、パスの `file_name()` を取り、`./<ファイル名>` を返す。値の形式や数値は検証しない。空文字やファイル名のないパス、Unicode でない値ではこの分岐から名前を得られず、実行ファイル名側へ fallback する。 |
-| ホストの `insideAppImage(env)` | `APPDIR` も falsy なら false | JavaScript の `!!(env.APPIMAGE || env.APPDIR)`。空文字は false、空でない文字列は true。値のパス検証はしない。 |
-| ホストの `withoutAppImage(env)` | 既定引数は `process.env` | `APPDIR` は `env.APPDIR || ''` として使用。コピーから `APPIMAGE` と AppImage 関連変数を削除する。`APPDIR` が truthy の場合は、PATH 系リストからそのディレクトリ以下の要素も除く。 |
-| デスクトップの診断ログ | `std::env::var` が値を得られなければ項目を出さない | 環境値をそのまま `APPIMAGE=<値>` として記録する。 |
-
-いずれも `APPIMAGE=1` のような特定値を要求しません。`command_name()` は環境変数を読み取るたびに評価し、結果をキャッシュしません。ホスト側も `process.env` を使う既定経路では `externalEnvironment()` の呼び出しごとに環境を組み立てます。
-
-根拠: `apps/desktop/src-tauri/src/supervisor.rs:65-73`, `apps/desktop/src-tauri/src/desktoplog.rs:186-194`, `apps/host/server/external-env.mjs:43-70`。
+| Linux デスクトップの `command_name()` | `current_exe()` のファイル名を使い、それも得られなければ `strata-desktop` | Unicode 文字列として取得でき、パスにファイル名があれば `./<ファイル名>` を返す。値全体の比較や拡張子検査はしない。空文字や末尾が `/` の値など、ファイル名を取り出せない場合は未設定時と同じ fallback。非 Unicode 値も `std::env::var` が `Err` となり fallback。 |
+| デスクトップ診断ログ | 記録されない | Unicode 文字列として取得できた場合、`APPIMAGE=<値>` の行を記録する。空文字は `APPIMAGE=` として記録される。非 Unicode 値は省かれる。 |
+| ホストの `insideAppImage(env)` | `APPDIR` も falsy なら外部プログラム用の環境を変換しない | JavaScript の真偽値判定で `env.APPIMAGE` が truthy なら AppImage 内と判定する。`APPIMAGE` が空文字なら単独では該当しない。`APPDIR` が truthy なら `APPIMAGE` の有無にかかわらず AppImage 内と判定する。文字列比較・大文字小文字変換・数値変換はしない。 |
 
 ## 有効になる条件
 
-- `command_name()` の値は、ブラウザモード選択時の案内と、ウィンドウプロセスの失敗後に表示するログ収集案内で使われます。`--browser` または `STRATA_UI=browser` はブラウザモードを選ぶ別条件であり、`APPIMAGE` 自体はモード選択に使われません。
-- 外部プログラム用環境の整理は、`APPIMAGE` または `APPDIR` が truthy の場合、または `STRATA_ORIGINAL_ENV` が truthy の場合に適用されます。`APPIMAGE` が空文字で `APPDIR` も空、記録環境もなければ、環境はそのままコピーされます。
-- `STRATA_ORIGINAL_ENV` が truthy で base64 から元環境を復元できる場合は、その復元環境を使います。復元できない場合は現在の環境から AppImage 関連値を除く fallback を使います。どちらの場合も `extra` 引数は最後にマージされ、同名値を上書きできます。
-- `withoutAppImage()` の fallback では `APPIMAGE` を削除します。`APPDIR` が空なら AppImage 内ディレクトリを使った path-list 要素の除去は行いません。
-
-Strata の AppImage 再パッケージ用スクリプトは、AppImage の `AppRun` に `STRATA_ORIGINAL_ENV` を記録するフックを追加します（`apps/desktop/scripts/repack-appimage.sh:52-58`）。これは復元環境を使う経路を用意するもので、ホストが外部プログラムへ渡す具体的な変数は復元された環境の内容に依存します。
+- `command_name()` は Linux 専用の `supervisor` モジュールにあり、`--browser` で開いた案内文と、ウィンドウ異常終了後のログ収集案内に使われます。`--browser` と `STRATA_UI=browser` のどちらが選ばれたかを決める変数ではありません（`apps/desktop/src-tauri/src/main.rs:47-48,871-875`、`apps/desktop/src-tauri/src/supervisor.rs:43-55,75-79,303-313,316-338,385-400`）。
+- `graphics_environment()` は指定された環境変数を列挙し、値が `std::env::var` で取得できるものだけ `APPIMAGE=<値>` として返します。異常終了時のクラッシュレポートと `--save-logs` のログに含まれます。これは診断情報であり、値によるウィンドウ描画設定の切り替えではありません（`apps/desktop/src-tauri/src/desktoplog.rs:186-194,245-259,310-329`）。
+- ホストの外部環境処理では、`APPIMAGE` または `APPDIR` が truthy なら `externalEnvironment()` が記録済みの起動元環境を優先し、記録がなければ AppImage 専用変数を除去したコピーを使います。`APPIMAGE_ONLY` に `APPIMAGE` が含まれるため、後者ではこの変数も削除されます。`APPDIR` がある場合は、同じ fallback 経路でそのディレクトリ内を指す環境値やパス要素も除去します。`extra` は最後に適用されます。起動元環境の記録がない場合、`APPIMAGE` は存在判定に使われた後、外部プログラムの環境から除かれます（`apps/host/server/external-env.mjs:17-26,43-57,60-71`）。
+- この変換は `xdg-open`、ファイル選択ダイアログ、通知、エージェント用ツール等の子プロセスに渡す環境に適用されます。呼び出し例は `apps/host/server/artifacts.mjs:5-6`、`apps/host/server/folder-dialog.mjs:112-126,135-145,153-164`、`apps/host/server/app-ui.mjs:38-59`、`apps/host/server/agent/harness-runtime.mjs:25-36` です。エージェント環境ではその後 `KEEP` に一致する名前だけが残るため、`APPIMAGE` は最終環境に含まれません。
 
 ## 実行時の詳細
 
-`command_name()` は `APPIMAGE` の値からディレクトリ部分を落としたファイル名を `./` 付きで返し、ブラウザ案内やクラッシュ後の `--save-logs` 案内に埋め込みます。この値でプログラムを起動する処理はなく、表示するコマンド文字列だけを変えます。`APPIMAGE` を取得できない場合は現在の実行ファイル名を使います（`apps/desktop/src-tauri/src/supervisor.rs:65-79,303-313,382-393`）。
+Rust 側の `command_name()` は呼び出しごとに `std::env::var("APPIMAGE")` を実行し、結果をキャッシュしません。変数が取得できても `Path::file_name()` が返す名前だけを `./` の後ろに付けて表示し、起動や終了コードには使いません。表示先はブラウザー案内行、またはウィンドウ異常終了後の stderr と shell log です（`apps/desktop/src-tauri/src/supervisor.rs:65-79,303-313`）。
 
-ホスト側の `externalEnvironment()` は、AppImage 起動中または `STRATA_ORIGINAL_ENV` があるときに外部プログラム用の環境を選びます。復元記録がない場合は `APPIMAGE` などの AppImage 専用変数を除去します。この helper はブラウザ起動・通知、ファイル／フォルダーを開く処理、フォルダーダイアログ、および assistant のシェル環境を作る処理で呼ばれます（`apps/host/server/external-env.mjs:17-26,43-70`; `apps/host/server/app-ui.mjs:38-58`; `apps/host/server/artifacts.mjs:5-6`; `apps/host/server/folder-dialog.mjs:105-119,146-157`; `apps/host/server/chat-files.mjs:89-94`; `apps/host/server/open-text-file.mjs:26-29`; `apps/host/server/agent/harness-runtime.mjs:25-36`）。外部プログラムや GPU driver が `APPIMAGE` をどう解釈するかはここでは扱いません。
+Rust の診断ログも呼び出しのたびに環境を列挙します。`--save-logs` では `Graphics session:` の項目として保存され、クラッシュ時はクラッシュレポートの同じ項目に入ります。`--save-logs` が成功すれば保存先を stdout に表示して終了コード 0、書き込みに失敗すれば `[strata] could not save the logs: ...` を stderr に出し、コード 1 を返します。これらの保存結果は `APPIMAGE` の値で分岐しません（`apps/desktop/src-tauri/src/desktoplog.rs:186-194,245-259,281-289,310-329`、`apps/desktop/src-tauri/src/supervisor.rs:316-332`）。
 
-診断ログでは `APPIMAGE` が得られたときに現在値を `Graphics session` 欄へ記録します。これは `--save-logs` で作るログにも含まれ、クラッシュログにも含まれます。値による終了・警告・エラー分岐はありません（`apps/desktop/src-tauri/src/desktoplog.rs:186-194,241-260,310-324`）。
+JavaScript 側の `insideAppImage()` と `externalEnvironment()` は呼び出し時の環境オブジェクトを評価し、値をキャッシュしません。子プロセス起動時に `externalEnvironment()` の返す環境を渡します。記録済み環境がなければ `withoutAppImage()` が `APPIMAGE` を削除します。記録がある場合はデコードされた元環境を使うため、その内容に `APPIMAGE` が含まれていれば保持されます。コード上、この環境選択に伴う `APPIMAGE` 固有の警告や終了経路はありません（`apps/host/server/external-env.mjs:28-40,43-71`）。
 
 ## 根拠
 
-- 候補一覧の `APPIMAGE` は `docs/envvars/000_envvers.md:46`。
-- 再実行コマンドの生成と案内への挿入: `apps/desktop/src-tauri/src/supervisor.rs:65-79,303-313,382-393`。
-- クラッシュ／保存ログへの環境値の記録: `apps/desktop/src-tauri/src/desktoplog.rs:186-194,241-260,310-324`。
-- 外部プログラム用環境の判定・復元・削除規則: `apps/host/server/external-env.mjs:15-26,28-40,43-70`。元環境記録を AppRun に加える処理: `apps/desktop/scripts/repack-appimage.sh:52-58`。
-- helper の利用箇所: `apps/host/server/app-ui.mjs:38-58`, `apps/host/server/artifacts.mjs:5-6`, `apps/host/server/folder-dialog.mjs:105-119,146-157`, `apps/host/server/chat-files.mjs:89-94`, `apps/host/server/open-text-file.mjs:26-29`, `apps/host/server/agent/harness-runtime.mjs:25-36`。
-
-`APPIMAGE` の全参照を `rg` で確認しました。README テンプレート等の置換文字列、コメント、テスト上の値は環境読み取りの根拠に含めていません。ビルド、テスト、GPU 実行は行っていません。
+- `apps/desktop/src-tauri/src/main.rs:47-48,871-875` — Linux のみ `supervisor` を組み込み、入口でオプションを解釈。
+- `apps/desktop/src-tauri/src/supervisor.rs:65-79,303-313` — `APPIMAGE` から案内用コマンド名を作る処理と出力箇所。
+- `apps/desktop/src-tauri/src/desktoplog.rs:186-194,245-259,310-329` — 値の取得・クラッシュレポートと `--save-logs` への記録。
+- `apps/host/server/external-env.mjs:17-26,43-71` — AppImage 判定、専用変数の除去、起動元環境との選択。
+- `apps/host/server/artifacts.mjs:5-6`、`apps/host/server/folder-dialog.mjs:112-126`、`apps/host/server/app-ui.mjs:38-59`、`apps/host/server/agent/harness-runtime.mjs:25-36` — 外部プログラム起動時の利用例。

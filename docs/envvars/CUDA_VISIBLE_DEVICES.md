@@ -1,49 +1,49 @@
 # `CUDA_VISIBLE_DEVICES`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。外部ライブラリと GPU driver が読む動作は対象外。
 
 ## 役割
 
-Strata 自身がこの変数を読む主な箇所は、ネイティブ engine の `--gpu` 起動処理と、serve の GPU 選択・子プロセス環境の処理です。serve は設定の `gpu`（または GPU roles）から選択値を作ってエンジンに渡し、未選択なら親プロセスの環境値を引き継ぎます。`--gpu` を指定したネイティブ engine は最初の CUDA 呼び出しより前に環境値を上書きします。
+Strata の Python 側では、NVIDIA GPU の表示範囲を launch plan のカード一覧に反映し、server や画像生成子プロセスの環境へ GPU 選択を渡します。engine の C++ 起動処理は `--gpu LIST` がある場合に、その値を CUDA 初期化より前にこの変数へ設定します。engine は通常、親環境から継承した値を設定として parse しません。
 
-この変数は Strata 固有の計算設定ではありません。CUDA runtime が列挙するデバイス数の記述にも現れますが、その列挙時の意味は外部 runtime の動作なので、ここでは扱いません（`include/strata/core/device.hpp:41-44`）。
+値の意味を解釈して GPU を隠す外部 runtime / driver の挙動はここでは説明しません。Strata 自身が行う値の解釈は、launch UI のカード表示と server の topology 表示に限られます。
 
 ## 値と判定
 
-| 経路 | 未設定・空文字 | 設定値の処理 |
-|---|---|---|
-| ネイティブ engine の `--gpu LIST` | 未設定または空文字なら上書き警告なし。空文字以外の既存値が CLI 値と異なる場合は警告 | CLI の `LIST` を文字列として `CUDA_VISIBLE_DEVICES` に設定する。Strata は値の数値 parse や範囲検査をしない。HIP build では代わりに `HIP_VISIBLE_DEVICES` を設定する |
-| `serve/server.py` の GPU 選択 | config で GPU を指定しない場合は親環境の値を辞書コピーで継承 | config の GPU 番号をカンマ区切りにして設定する。すべての GPU を Off にした場合は空文字を設定する。続く config の `env` が同じキーを指定すれば、その文字列で上書きする |
-| serve の可視 GPU 対応付け | 値がない、空、または形式不一致なら対応付けなし | `CUDA_DEVICE_ORDER=PCI_BUS_ID` の場合に限り、`0`〜`99999` の1〜16個の整数をカンマ区切りにした文字列を受け付ける。値全体を正規表現で検査し、65535超または重複番号があれば対応付けなし |
-| serve のカード案内ログ | 空要素を除いて分割し、空または連番 `0,1,...` なら案内を出さない | `gpu` 選択時に分割した番号が連番と異なる場合、選択 GPU とエンジン内の `GPU 0 / CUDA0` 等の対応を標準出力へ表示する。この箇所は番号の妥当性を検査しない |
+| Strata の箇所 | 未設定 | 空文字 | 設定値・不正値 |
+|---|---|---|---|
+| `strata_control.gpu_roles.env_visible()` | `None` を返し、環境による絞り込みなしとして扱う | 空リスト `[]`（表示 GPU なし） | カンマ区切りの数値をカード index として解釈。各 token は前後空白を除去し、先頭の `-` をすべて除いた部分が数字かを確認する。非数字 token（UUID、`+1` など）があれば `None`。負数またはカード数以上の番号でリストを打ち切り、それまでの番号を返す。複数の `-` で始まる token は数字チェックを通るものの、後続の `int()` が `ValueError` になる。 |
+| server の `visible_device_order()` | 空リスト `[]` | 空リスト `[]` | CUDA backend（または backend 未指定）かつ `CUDA_DEVICE_ORDER` が厳密に `PCI_BUS_ID` のときだけ読む。値は 1〜5 桁の数字を最大 16 個、カンマで連結した形式に限定。重複、各値が 65535 超、形式外は空リスト `[]` |
+| C++ engine 起動時 | `--gpu` がなければ Strata はこの変数を変更しない | `--gpu ""` なら空文字を設定する。既存値が空なら上書き警告なし | `--gpu` の次の引数を文字列のまま設定し、環境変数としての parse / clamp はこの処理ではしない。既存値が非空かつ引数と異なる場合だけ stderr に警告 |
 
-ネイティブ `--gpu` の警告は `getenv` が null かどうかと、非空値が CLI 引数と異なるかだけで決まります。したがって `"0"` は CLI 値が別なら警告対象ですが、空文字は警告対象になりません。CLI 値そのものはこの処理で検証されず、後続の実行時エラーを Strata が事前に判定するコードは確認できません。
+`env_visible()` の数値解釈は OS の環境値を変更しません。これは launch plan のカード列挙用です。CUDA のカード順と nvidia-smi の番号の対応を特定できない場合、値が非空でも `None` を返します。具体的には、異なる GPU が複数あり、`CUDA_DEVICE_ORDER` が trim 後の大文字化で `PCI_BUS_ID` でない場合です。同一モデル・同一メモリ容量のカード群では `alike=True` としてこの曖昧性チェックを省きます。
+
+根拠: `strata_control/gpu_roles.py:434-476`; `serve/server.py:1023-1034`; `src/program/generate.cpp:3321-3342`。
 
 ## 有効になる条件
 
-- ネイティブ engine は `--gpu LIST` がある場合に限り、CUDA build では `CUDA_VISIBLE_DEVICES` と `CUDA_DEVICE_ORDER=PCI_BUS_ID` を設定します。HIP build では変数名が `HIP_VISIBLE_DEVICES` に切り替わります。環境値だけを engine が読み取って別の Strata 内部設定に変換する処理ではありません（`src/program/generate.cpp:2957-2978`）。
-- serve の engine 起動では `child_env()` が親環境をコピーし、選択 GPU がある場合に可視デバイスを設定します。GPU 番号は `gpu` 設定または保存済み GPU roles から決まり、CUDA の選択時は `CUDA_DEVICE_ORDER=PCI_BUS_ID` も設定されます。config の `env` はこの選択値より後に適用されるため、明示した `env.CUDA_VISIBLE_DEVICES` が最終値になります（`serve/server.py:3081-3095,3517-3528,3747-3763`）。
-- 全カード Off の場合、serve は CUDA と HIP の可視変数を空文字にします。ただし同じ config の `env` が後から上書きできます。CUDA/HIP/SYCL engine で全カード Off を指定すると、起動処理は GPU に触れる前に `SystemExit` で停止します（`serve/server.py:3103-3121,3750-3760`）。
-- NVIDIA GPU の速度情報を取る serve 補助 subprocess は、全カードの情報を得るためコピーした環境から `CUDA_VISIBLE_DEVICES` を削除して起動します。親プロセスや後続 engine の環境は変更しません（`serve/server.py:3407-3435`; 同じ処理は `strata_control/gpu_roles.py:432-454` にあります）。
-- 画像生成の `image_env()` は親環境をコピーし、画像設定に `gpu` があり backend が `cuda` の場合にこの変数を設定して PCI order を指定します。config の `env` が最後に適用されます。画像プロセス起動に渡されます（`serve/images.py:131-150,221-239`）。
-- Vision encoder の個別 GPU 設定 `vision.cuda_device` があれば、serve はコピーした環境の `CUDA_VISIBLE_DEVICES` をその番号に置き換えて vision 子プロセスへ渡します。設定がなければ engine 環境をそのまま使います（`serve/server.py:3931-3946,9202-9224`）。
+- **Launch UI / plan:** `strata launch --plan` のカード役割表示は `visible_cards()` を呼び、NVIDIA では現在の Strata プロセス環境の `CUDA_VISIBLE_DEVICES` を使って、環境が隠すカードを一覧から外します。ユーザーが `--gpu` / `--gpu-roles` で指定したカードは `keep` に含めるため一覧に残します。値を index に変換できず `None` になる場合は、全カードを残します。環境値が未設定の場合も全カードを残します。layer-split のカード候補も、カードを明示していないときは同じ helper で絞ります。
+- **Strata server の engine 子プロセス:** `child_env()` はまず server の `os.environ` をコピーします。全 GPU が Off の場合は CUDA と HIP の両方を空文字にし、HIP backend で選択カードがある場合は HIP 変数を設定します。それ以外で config から GPU が選択されていれば `ordered_gpus(cfg)` をカンマ区切りにして `CUDA_VISIBLE_DEVICES` に設定し、`CUDA_DEVICE_ORDER=PCI_BUS_ID` も設定します。GPU 未指定なら継承値を保ちます。その後 config の `env` を適用するため、そこに `CUDA_VISIBLE_DEVICES` があれば先に選択した値や継承値を上書きします。
+- **画像生成 / vision 子プロセス:** `serve/images.py` は backend が `cuda` で config に `gpu` がある場合、scalar を文字列化し、list / tuple はカンマ区切りにして変数へ設定し、`CUDA_DEVICE_ORDER=PCI_BUS_ID` にします。続く config `env` がその値を上書きできます。server の vision encoder も `vision.cuda_device` が指定されると encoder 用に値を単一 GPU 番号へ差し替えます。HIP backend は CUDA 変数ではなく HIP 変数を設定します。
+- **C++ engine の CLI:** `--gpu LIST` が環境値より優先します。CUDA 初期化より前に `CUDA_DEVICE_ORDER=PCI_BUS_ID` と `CUDA_VISIBLE_DEVICES=LIST` を設定します。HIP build では同じ処理が `HIP_VISIBLE_DEVICES` を対象にします。`--gpu` がない場合、このコードは親環境の値を変更しません。
+- **`strata-vision`:** GPU を使わないモードでは backend 初期化前に CUDA と HIP の両方を `-1` に設定します。`--gpu` を指定した場合、この設定分岐は通りません。
+
+標準 server 起動では、GPU roles がすべて Off で、backend が CUDA / HIP / SYCL など GPU 必須の場合、engine を起動せず `[strata] every graphics card is set to Off, and this engine cannot start without one...` で終了します。CPU / Metal、または macOS では all-Off の説明を出して続行します。
+
+根拠: `strata_cli/launch/cmd.py:475-493`; `strata_control/split_engine.py:366-375`; `serve/server.py:3553-3597,4325-4355`; `serve/images.py:142-161,251-258`; `serve/server.py:4509-4524,10117-10126`; `tools/vision/strata_vision.cpp:130-143`。
 
 ## 実行時の詳細
 
-ネイティブ engine は起動時、CUDA 呼び出しより前に argv の `--gpu` を走査します。最初に見つかった引数について、現在の可視変数が非空で CLI 値と異なるとき、stderr に `warning: --gpu %s overrides %s=%s from the environment` を出し、`CUDA_DEVICE_ORDER` を `PCI_BUS_ID`、可視デバイスを CLI 値に設定して走査を終えます。その後の option parse では `--gpu` の値を消費するだけです。環境値はこの時点で一度調べられます（`src/program/generate.cpp:2957-2978,3011`）。
+engine の起動処理は argv を走査し、最初の `--gpu` とその次の引数を見つけると、ビルドが HIP なら `HIP_VISIBLE_DEVICES`、それ以外なら `CUDA_VISIBLE_DEVICES` を対象にします。従って CUDA build では、既存値が非空で CLI 値と文字列として異なる場合に限り、stderr に `warning: --gpu <値> overrides CUDA_VISIBLE_DEVICES=<既存値> from the environment` を出します。既存値が空、未設定、または CLI 値と一致すると警告しません。Windows は `_putenv_s`、それ以外は上書きフラグ付き `setenv` で更新します。その後の引数 parse ループでも `--gpu` を消費しますが、値の判定はこの環境設定箇所で行わず、`--gpu` に値がなければ `--gpu needs a value` を stderr に出して status 2 で終了します。環境変数自体の設定時点は、ソースコメント上、最初の CUDA 呼び出しより前です。プロセス内での再読み取りや cache は Strata 所有ソースにはありません。
 
-serve の可視デバイス対応付け `visible_device_order()` は、backend が `None` または `cuda` であり、さらに `CUDA_DEVICE_ORDER` が厳密に `PCI_BUS_ID` の場合にだけ CUDA 変数を読みます。値が上記の形式に合わない場合、status 上の GPU ordinal と OS GPU index の対応を空として扱います。HIP backend は `HIP_VISIBLE_DEVICES` を使います（`serve/server.py:933-945`; serve status での呼び出し `serve/server.py:9458`）。
+server の `visible_device_order()` は engine に渡す env dict から値を読み、engine ordinal と OS GPU index の対応が明確な場合だけ topology 表示用の順序を返します。返り値は topology の `device_index` 対応付けに使われ、env や engine の GPU 選択は変更しません。server 起動時の `card_note()` は CUDA backend かつ GPU 選択ありの場合に env dict の値を確認し、選択番号が `0,1,...` と一致しなければ、たとえば単一 GPU なら `[strata] running on GPU N (as nvidia-smi numbers it); the engine's log calls it GPU 0 / CUDA0` を stdout に出します。
 
-`card_note()` は config で GPU を選んだ CUDA 系経路で、環境辞書の値をカンマ分割して案内行を作ります。単一 GPU なら `[strata] running on GPU N ...`、複数 GPU なら stage 順の行を標準出力へ出します。連番なら表示しません（`serve/server.py:3865-3878,9193,9227-9230`）。
+GPU 性能スコアを取得する補助 subprocess では、Strata はコピーした環境から `CUDA_VISIBLE_DEVICES` を削除し、`CUDA_DEVICE_ORDER=PCI_BUS_ID` を設定して NVIDIA driver API の全カード番号を問い合わせます。この処理は起動対象 engine の環境選択ではありません。取得に失敗した場合、server のスコア helper は `None`、GPU roles helper は `{}` を返します。
 
-この変数を理由として Strata が終了する経路は特定できませんでした。serve の全カード Off エラーは GPU roles/config に対するチェックであり、環境値の parse エラーではありません。peer device が列挙数の外にあるときは `src/core/peer_experts.cpp:125-134` が `peer experts: CUDA device ... is not visible (... devices; set CUDA_VISIBLE_DEVICES)` というエラー文字列を返しますが、CUDA の列挙数や変数値の解釈自体は Strata のこの箇所では行っていません。
+根拠: `src/program/generate.cpp:3321-3342,3368-3377`; `serve/server.py:1023-1034,3980-4008,4443-4457,8014-8027,10129-10132`; `strata_control/gpu_roles.py:489-519`。
 
-## 根拠
+## 文書との照合
 
-- 環境変数候補一覧: `docs/envvars/000_envvers.md:92`（調査文書リポジトリ）。
-- ネイティブ engine の CLI 上書きと警告: `src/program/generate.cpp:937-939,2957-2978,3011`。
-- serve の GPU 設定・継承・子環境: `serve/server.py:3081-3121,3517-3528,3747-3790`。
-- serve の厳密な ordinal 対応付けとカード案内: `serve/server.py:933-945,3865-3878`。
-- 画像／vision 子プロセスへの設定: `serve/images.py:131-150,221-239`; `serve/server.py:3931-3946,9202-9224`。
-- 全 GPU 情報取得時の可視値削除: `serve/server.py:3407-3435`; `strata_control/gpu_roles.py:432-454`。
-- peer device エラー文字列: `src/core/peer_experts.cpp:125-134`。
+`docs/MULTI_GPU.md` は `strata launch --gpu` / `--gpu-roles` でカードを選ぶ利用方法を説明しています。今回確認した `docs/DETAILS.md` に `CUDA_VISIBLE_DEVICES` 固有の値 parse や環境優先順位の説明はありません。上記の値規則と優先順位は現行ソースに基づきます。
+
+根拠: `docs/MULTI_GPU.md:16-30`; `src/program/generate.cpp:3321-3342`; `serve/server.py:4325-4338`。
