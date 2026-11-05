@@ -57,4 +57,3 @@ strata split-engine apply --config ./run-config.json --output json
 - `apply_run_config` が返す判定行と警告、通常の拒否時の説明: `strata_control/split_engine.py:631-655`。
 - split 判定が環境・カード・モデル・メモリ等を確認し、通過時に config を変換する処理: `strata_control/split_engine.py:500-565`。
 - 索引上の配置とコマンド scope: `docs/cli/README.md:1237-1244`（索引は本調査対象外として変更していません）。
-
