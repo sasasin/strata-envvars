@@ -1,60 +1,72 @@
 # `--model`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。調査時の `git status --short --branch` は `## main...origin/main` で、未コミット変更はありません。
+調査対象: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | Apple Silicon 用 `metal/setup_mac.py`（通常は `./setup.sh` 経由） |
+| コマンド | `setup.py`（Apple Silicon の通常実行では `metal/setup_mac.py` に委譲） |
 | オプション | `--model` |
 | 別名 | なし |
-| 値 | `MAC_MODELS` にあるモデル名を1つ指定。値は必須。 |
+| 値 | `MAC_MODELS` にあるモデル名。値は必須。 |
 
 ## 役割
 
-Apple Silicon の Metal setup で導入・準備するモデルを選びます。省略した場合は Mac の unified memory に応じて候補を推薦し、対話で選択します。明示したモデルはメモリ適合の推奨を上書きして選ばれますが、適合しない場合も拒否されず、SSD streaming などの注意を表示して続行します（`metal/setup_mac.py:389-403`、`strata_control/mac_fit.py:145-176`）。
+Mac 用 setup が選ぶモデルを明示します。指定モデルはメモリ量に応じた推薦値で置き換えられず、収まらない場合も警告を出して選択を維持します。モデルごとにダウンロード元のファイル、モデル family、pack、起動設定が決まります。
 
 ## 使い方
 
-リポジトリのルートでモデルを指定して setup し、完了後のサーバー起動を省く例です。ダウンロード、engine build、モデル準備、設定ファイル作成は実行されます。
+Strata checkout のルートで実行します。次の例は `IQ3_XXS` を選び、設定と起動スクリプトを作成した後、サーバーを自動起動しません。
 
 ```sh
 ./setup.sh --model IQ3_XXS --no-start
 ```
 
-`setup.py` は macOS で `STRATA_CONTROL_INSTALL=1` が設定されていない場合、受け取った引数をそのまま `metal/setup_mac.py` に渡します（`setup.py:9062-9069`、`setup.py:7703-7707`）。
+Mac では `setup.py` が `STRATA_CONTROL_INSTALL=1` でない場合に引数を `metal/setup_mac.py` へ渡します。したがって、この文書の値規則はその Mac parser に対するものです。`STRATA_CONTROL_INSTALL=1` の Control モードや Windows/Linux の `setup.py` parser は別スコープです。
 
 ## 値と既定値
 
-- `--model` は `choices=list(MAC_MODELS)` で検証される。調査対象 revision の有効値は `Q2_0`、`IQ3_XXS`、`IQ3_S`、`UD-Q4_K_XL`、`UD-Q5_K_XL`、`UD-Q6_K_XL`、`Gyro-S`、`Gyro-M`（`metal/setup_mac.py:329-333`、`strata_control/mac_fit.py:17-34`）。
-- 省略時の parser 既定値は `None`。メモリに基づく推薦モデルが対話候補の初期値となり、`--yes` が指定されている場合はその推薦値が自動選択される（`metal/setup_mac.py:392-401`、`setup.py:930-943`）。通常の候補一覧から `MAC_MODELS` の `missing` 印が付いたモデルは除かれるが、明示値の `choices` は `MAC_MODELS` 全体を使う（`metal/setup_mac.py:332`、`metal/setup_mac.py:395`）。この revision の表には `missing` 印のモデルはない。
-- 値の省略、未知の名前、空文字列は parser の必須値／choices 検証で拒否される。`--model` を複数回指定した場合は argparse の通常の `store` 動作で最後の値が残る（`metal/setup_mac.py:332`）。
+値は必須で、現行 parser の `choices=list(MAC_MODELS)` により次の名前だけを受理します（大文字小文字も一致が必要です）。
+
+- `Q2_0`、`IQ3_XXS`、`IQ3_S`
+- `UD-IQ1_M`、`UD-Q2_0`、`UD-IQ2_XS`、`UD-Q2_K_XL`、`UD-IQ3_XXS`、`UD-Q3_K_XL`、`UD-IQ4_XS-v31`、`UD-Q4_K_XL`、`UD-Q5_K_XL`、`UD-Q6_K_XL`
+- `Gyro-S`、`Gyro-M`
+
+値を省略すると parser 上の `a.model` は `None` です。setup はメモリに基づく推薦モデルを初期値に選択メニューを表示します。`--yes` 併用時はその推薦値が選ばれます。明示したモデルはメモリ適合性を検証して拒否するのではなく、必要な Metal 常駐メモリと実測状況などを警告します。現行 revision では `METAL_Q5_0_DOWN = True` で、旧版で `missing` 扱いだった4モデルも parser の選択肢に含まれます。
+
+値なし、または `MAC_MODELS` にない値は `argparse` の引数エラーになります。重複指定時は通常の `argparse` の単一値引数として最後に指定した値が `a.model` に入ります。
 
 ## 実行時の動作
 
-明示値があれば推薦モデルの代わりにその値を使い、モデル固有の注意を出した後、family、ダウンロード容量、ファイル名、ダウンロード先を決めます（`metal/setup_mac.py:389-422`、`metal/setup_mac.py:66-74`）。その後、選んだモデルの GGUF shard を取得・検証し、必要なモデル pack を準備し、選択モデルを含む起動設定と run script を書きます（`metal/setup_mac.py:450-464`、`metal/setup_mac.py:476-516`、`metal/setup_mac.py:542-570`）。モデル名は `MAC_MODELS` の family/shard 情報に従ってモデルファイル名と処理経路へ反映されます（`strata_control/mac_fit.py:19-34`、`metal/setup_mac.py:66-74`）。
-
-`--family` を併用して値が選択モデルの family と異なる場合、警告を表示してモデル表から求めた family を使用します。つまり `--family` はこの選択結果を強制変更しません（`metal/setup_mac.py:415-419`）。
-
-`--update` と併用すると、選択モデルの既存ファイルと pack を確認して engine の更新経路へ進みます。モデルファイルが存在しない場合もダウンロードせず、「setup で取得する」案内を出して正常終了します（`metal/setup_mac.py:435-448`）。既存の Metal 設定があり、`--model` などの setup を選ぶ引数がないときは通常起動の shortcut に入りますが、`--model` を指定するとその shortcut を避けて選択処理へ進みます（`metal/setup_mac.py:369-372`）。`--check` はモデル選択より前に終了するため、この併用時は `--model` の値は setup 対象の選択には使われません（`metal/setup_mac.py:382-385`）。
+- 既存の設定が見つかり、明示的な setup/update/check/build 指定もない場合、通常は既存モデルをすぐ起動します。しかし `--model` があるとこの早期起動条件を満たさず、setup の選択・準備経路へ進みます。
+- family は選択モデルの `MAC_MODELS` エントリから決まります。`--family` と異なる場合は警告を出してモデル側の family を使います。選択モデルから family の tag を作り、モデルの shard 名と保存先、pack を決めます。
+- 通常経路では不足している shard をダウンロードし、shard 検査と対象 family の hash 検証を行います。Unsloth の複数 shard セットは GPU 用 GGUF に再梱包し、pack が未作成なら `tools/iq_pack.py` で作成します。その後 `strata-<tag>.json` と `run-<tag>.sh` を書き、`--no-start` がなければ起動します。
+- モデルが Metal の常駐予算を超える場合は SSD streaming の警告を出します。streaming の選択はモデル名と Mac のメモリ量から計算され、設定にも反映されます。
+- `--update` 併用時はモデルファイルをダウンロード・準備せず、指定モデルの shard と pack が既にあるか確認して終了します。未導入なら「何もインストールされていない」旨と `./setup.sh --setup` の案内を表示します。
 
 ## 適用条件と副作用
 
-この option は `setup.py` が Apple Silicon 向け Metal setup に委譲したときの parser に属します。`setup.py` の通常 parser が使われる経路とは別 scope です（`setup.py:9068-9069`、索引 `docs/cli/README.md:1594-1610`）。
+この option が使われるのは `setup.py` が macOS 上で `STRATA_CONTROL_INSTALL` なしに Mac setup へ委譲する経路です。Mac setup は Apple Silicon、必要な macOS バージョン、Command Line Tools を確認し、問題があれば setup を停止します。
 
-明示したモデルが Mac の resident memory に収まらない場合、setup は注意を出し、自動的に expert を SSD から streaming する実行設定にします。ファイルが既知の未対応状態として登録された場合は選択を保持して処理しますが、engine 読み込み時に停止すると注意書きがあります（`strata_control/mac_fit.py:140-176`）。モデル選択後の通常経路は、モデルのダウンロード、pack 準備、必要に応じた vision encoder 準備、`strata-<model>.json` と run script の作成を伴います。`--no-start` を加えると設定作成後の server 起動だけを省略します（`metal/setup_mac.py:450-570`）。
+モデルの選択によってネットワークからの大容量モデル取得、vision encoder の取得（別 option `--vision` の設定による）、モデル pack や Unsloth 再梱包ファイルの作成、エンジン build、設定 JSON と起動スクリプトの書き込みが発生し得ます。モデル準備が必要なのに Strata engine が実行中なら、Mac の停止リスクを示して準備を中断します。`--model` 自体はファイルを直接削除しません。
+
+同じ値でも別 parser の選択肢・効果とは異なります。特に `setup.py` の Control モードや非 Mac parser の `--model` は本書の scope ではありません。
 
 ## 出力とエラー
 
-- 有効値以外は argparse が usage と引数エラーを表示して処理を止める。ソースで確認できる拒否条件は `choices` への不一致である（`metal/setup_mac.py:328-333`）。
-- メモリに合わないモデルは拒否せず、streaming になる旨を warning として表示する（`strata_control/mac_fit.py:164-176`）。
-- `--update` でモデルが未導入なら、モデルをダウンロードしない旨と `./setup.sh --setup` の案内を表示し、`0` を返す（`metal/setup_mac.py:435-448`）。
-- setup が `S.fail()` に到達した場合はエラーと再実行案内を表示して終了 status `1` となる。例えば必要なモデル準備中に Strata engine が動作中なら、この経路で停止する（`metal/setup_mac.py:489-492`、`setup.py:904-909`）。ダウンロード、build、ディスク容量など、その他の失敗条件は呼び出し先ごとの処理によるため、ここでは一律の終了コードを記載しない。
+- 無効な値や値の欠落は `argparse` が usage とエラーを stderr に出し、終了コード 2 で終了します。
+- 明示モデルが推奨よりメモリを要する場合や未実測の場合、警告を表示して選択を続けます。Metal engine が動かせないモデルとして `missing` と印された場合も、モデル選択は保持され、ロード時に engine が停止する旨を警告します（現行 revision の parser 候補には `missing` エントリはありません）。
+- Mac の要件を満たさない場合や、準備時に Strata engine が実行中の場合は `S.fail` がエラー表示後に終了コード 1 で停止します。
+- `parse_known_args` のため未知の余剰引数は拒否されず、`not used on a Mac: ...` と警告されます。これは `--model` の値検証とは別です。
 
 ## 根拠
 
-- parser とモデル選択・対話: `metal/setup_mac.py:327-405`
-- Mac モデル名、family、shard 定義と推薦・適合判定: `strata_control/mac_fit.py:17-37`、`strata_control/mac_fit.py:140-176`
-- モデルの shard 名、ダウンロード、pack、設定生成: `metal/setup_mac.py:66-74`、`metal/setup_mac.py:450-570`
-- `setup.py` から Mac parser への委譲: `setup.py:7703-7707`、`setup.py:9062-9069`
-- 索引上の scope と予定リンク: `docs/cli/README.md:1594-1610`
+- `metal/setup_mac.py:333-364` — Mac parser の `--model` 宣言、必須値・`MAC_MODELS` choices、未知引数の警告。
+- `setup.py:9894-9902` — 通常の `setup.py` 起動から Mac parser への委譲条件。
+- `strata_control/mac_fit.py:20-47` — 現行 Mac モデル名、family、shard 数、および Q5_0 kernel 対応フラグ。
+- `metal/setup_mac.py:375-428` — 既存設定時の早期起動条件、推薦・明示値の選択、モデル warning、family の決定と不一致時の扱い。
+- `strata_control/mac_fit.py:209-250` — 常駐予算判定、メモリ推薦、streaming・未実測・未対応モデルの警告。
+- `metal/setup_mac.py:441-454` — `--update` 時の既存ファイル確認と未導入時の案内。
+- `metal/setup_mac.py:456-482,484-524,550-579` — shard download/検証、vision encoder、モデル準備と再梱包、設定・起動スクリプト生成、起動抑止。
+- `metal/setup_mac.py:497-503` — モデル準備中に engine が動作している場合の停止経路と準備 lock。
+- `strata_control/mac_fit.py:162-174`、`setup.py:1072-1077` — Mac 要件判定と `S.fail` の終了動作。

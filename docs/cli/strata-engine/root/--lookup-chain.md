@@ -1,66 +1,65 @@
 # `--lookup-chain`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（推論エンジンのトップレベル引数。`generate.cpp` の usage 表記は `strata generate`） |
+| コマンド | ネイティブ `strata` エンジン（`generate` / `--serve` のデコード設定） |
 | オプション | `--lookup-chain` |
 | 別名 | なし |
-| 値 | 整数 `K`。parser は `0..7` に丸める |
+| 値 | 整数 K。`atoi` で読み取り、0〜7 に丸める。既定値 0（無効） |
 
 ## 役割
 
-MTP が提案したトークン列の続きについて、プロンプトとこれまでに確定した出力内の過去の一致箇所から、最大 `K` 個の追加候補を同じ検証窓へ連結します。候補は通常の verify で検査されるため、候補が受理されるかどうかで生成結果を変える機能ではなく、検証窓の幅を増やし得る投機的ドラフト機能です（`src/program/generate.cpp:780-783`、`include/strata/spec/draft_source.hpp:1-9`）。
+MTP（またはそのデコード窓で使われるドラフト）の提案に続けて、直前の文脈とドラフト列が過去に現れた箇所の続きを prompt lookup で最大 K 個提案し、同じ検証窓に加えます。窓サイズ上限は 8 トークンです。既定では無効です（`src/program/generate.cpp:977-980,1160-1162`）。
 
 ## 使い方
 
 ```sh
-strata --pack pack/full --tokens "1,2,3" --lookup-chain 3
+strata --native model.gguf --mtp model-mtp.gguf --spec 4 --lookup-chain 2
 ```
 
-これはエンジンの token ID 入力形式を使った例です。通常のモデル利用時は、必要なモデル・pack・入力指定とともに `--lookup-chain K` を渡します。エンジンが受け取るトップレベル引数であり、Terminal CLI の同名なし wrapper オプションではありません（`src/program/generate.cpp:806-812`、[`docs/cli/README.md`](../../README.md) の `strata-engine` 節）。
+サーバーモードでは同じエンジン引数に `--serve` を付けます。
+
+```sh
+strata --native model.gguf --mtp model-mtp.gguf --spec 4 --lookup-chain 2 --serve
+```
 
 ## 値と既定値
 
-- 省略時は `0`（無効）です（`src/program/generate.cpp:780-784`）。
-- `atoi` で整数変換し、その後 `0..7` に clamp します。負数は `0`、`7` を超える値は `7` になります（`src/program/generate.cpp:2672-2675`）。
-- 数字として解釈できない文字列は `atoi` の結果 `0` になり、無効値としてはじかれません。値が欠けている場合は parser の共通処理が stderr に `<option> needs a value` を出し、終了コード `2` で終了します（`src/program/generate.cpp:2416-2421`）。
-- 同じオプションを複数回指定すると parser は各値を順に代入するため、最後の指定が残ります（`src/program/generate.cpp:2416-2421,2674`）。
-- 関連する `--lookup-chain-min` は別オプションで、既定 `3`、最小値 `3` です。候補を採用するには一致長がこの値以上である必要があります（`src/program/generate.cpp:784,2675`、`src/spec/draft_source.cpp:20-28`）。
+- 値は必須です。値が欠けると `--lookup-chain needs a value` を stderr に出して終了コード 2 になります（`src/program/generate.cpp:3370-3372`）。
+- 初期値は 0 です。指定値は `std::atoi` で整数化した後、0 未満を 0、7 超を 7 に丸めます。したがって負数は無効化、8 以上は 7 として扱われます。`atoi` のため厳密な整数形式 validation はなく、変換結果をそのまま丸めます（例: 数字で始まらない文字列は 0）。値自体に専用の validation error はありません（`src/program/generate.cpp:977-980,3625`）。
+- 窓の拡張は `--spec >= 2` の場合だけ設定され、`--mtp-max-t` と現在の `--spec` に基づいて上限 8 まで拡張します。実際の提案数は K だけでなく、検証窓の残り容量と lookup の結果でも制限されます（`src/program/generate.cpp:4304-4311,18649-18654`）。
 
 ## 実行時の動作
 
-`K > 0` かつ `--spec >= 2` の場合、初期化時に `--spec` の上限を拡張します。`--mtp-max-t` が未指定（`0`）なら現在の `--spec` を MTP 側の基準幅にし、verify 上限を最大 8 まで広げます。`--suffix-draft` の処理が先に `--spec` を変更している場合は、その時点の値が基準です。`--spec < 2` ではこの幅の拡張処理は行われません（`src/program/generate.cpp:3205-3218`）。
+有効値が 1 以上なら、各リクエストの開始時に prompt の token 列で suffix 履歴と追加 draft source を初期化し、生成結果として確定した token を追加 source に逐次追加します（`src/program/generate.cpp:17778-17785,18954-18956`）。各デコード反復では、初回窓、既に suffix lookup 由来の窓、または現在の窓に空きがない場合は chained lookup を行いません。それ以外では suffix 履歴の末尾（保留中ドラフトを含め最大 64 token）を検索キーとし、過去の一致箇所に続く token を最大 K 個提案します（`src/program/generate.cpp:1310-1312,1339-1346,18647-18654`）。
 
-各リクエスト／生成履歴について prompt と確定済み出力を lookup history に登録し、MTP の未検証ドラフトを末尾に連結した文脈で過去の継続を検索します。候補数は `min(K, verify 窓に残る幅)` までです。候補の根拠となる一致長が `--lookup-chain-min` 未満なら候補は使われません（`src/program/generate.cpp:14175-14183,14878-14920,16459-16467,16567-16584`、`src/program/generate.cpp:1080-1086`、`src/spec/draft_source.cpp:13-33`）。組み込み source は当該リクエストの prompt と確定済み出力です。API 上は追加の draft source も検索可能ですが、この checkout で追加 source の登録箇所は見つかりませんでした（`include/strata/spec/draft_source.hpp:7-9,36-60`、`src/spec/draft_source.cpp:8-10,29-33`）。
+提案は MTP の提案後に続けて窓へ足され、通常の verifier が窓全体を検証します。チェーン部分の受理 token 数は MTP 部分と別に計数されます（`src/program/generate.cpp:18647-18654,18665-18667,18890`）。
 
-候補が見つかっても、通常は `DraftPolicy::chain` が窓サイズごとの実測コストと過去の受理率、MTP ドラフト確率を使い、期待 tokens/ms が改善する範囲だけを検証窓に追加します（`src/program/generate.cpp:14904-14920,16569-16584`、`include/strata/spec/draft_policy.hpp:40-46`）。環境変数 `STRATA_LOOKUP_CHAIN_FIXED` が存在すると、この policy による候補数の絞り込みをスキップします（値が `0` でも「存在」により有効）。
+既定では起動後の実測コストと一致率を使う `DraftPolicy` が追加数を選び、採算が見込めないと判断した提案は使わないことがあります。`STRATA_LOOKUP_CHAIN_FIXED` が環境に存在するとこの policy gate を通さず、見つかった提案を窓へ追加します（`src/program/generate.cpp:17807,18655-18660`; `src/spec/draft_policy.cpp:285-305`）。この環境変数の有無判定は値の内容を見ません。
 
-検証窓へ加えた候補は通常の検証対象となり、受理された候補だけが確定出力になります。提案元は重みを使わず、verify が候補の正否を決める設計です（`include/strata/spec/draft_source.hpp:1-5`）。したがって本オプションによって出力が変わるとはソース上説明されていません。候補が見つからない、最小一致長に届かない、最初の窓である、すでに通常の suffix lookup が選ばれた、または窓に空きがない場合は連結されません（`src/program/generate.cpp:14891-14920,16567-16584`）。
+`--lookup-chain` 有効時は `--lookup-max-t` の未指定時既定値を決める入力にも chain 有効状態が渡されます。また、`--lookup-chain` は `--lookup-max-t` の自動既定選択で従来窓を維持する条件に含まれます（`src/program/generate.cpp:4284-4298`）。`--lookup-chain-min M`（既定 3）は拡張対象とする最短一致長を調整し、3 未満の値は 3 に丸められます（`src/program/generate.cpp:981,3626`）。
 
 ## 適用条件と副作用
 
-- 既定ではオフです。明示的に `K > 0` とした場合だけ lookup history の構築と追加 source の履歴更新を行います（`src/program/generate.cpp:14175-14183,16459-16467`）。
-- 通常の `generate` ループでは MTP が有効で、最初の窓ではなく、suffix lookup に切り替わっておらず、verify 窓に余裕がある場合に連結候補を探索します（`src/program/generate.cpp:16569-16581`）。serve ループも最初の窓・別 suffix 窓・上限幅を条件に探索します（`src/program/generate.cpp:14891-14920`）。
-- lookup は prompt と生成履歴の token を索引化し、過去一致の候補を確認します。`SuffixDrafter` は三つ組索引を持ち、履歴上限の設計値は約 `20 bytes/token`、一つの三つ組について直近4位置を保持します（`include/strata/spec/suffix_drafter.hpp:7-10,19-24`、`src/spec/suffix_drafter.cpp:18-24,51-61`）。この追加メモリ・CPU処理量は `K > 0` のときに生じます。
-- OS、GPU backend、model family による `--lookup-chain` 固有の validation/fallback 分岐は確認できませんでした。配布 Release binary の実動作はこの調査では照合していません。
+- オプションは `src/program/generate.cpp` の共通引数 parser で受け付けられます。ソース上、単発 `generate` と `--serve` の双方に専用のチェーン提案・受理集計処理があります（`src/program/generate.cpp:3258,18649-18660,20439,20604-20617`）。
+- 有効化すると各リクエストの prompt と確定 token をメモリ上の suffix / draft source 履歴に追加します。ファイル書き込みやネットワーク通信をこのオプション自体が行う処理は確認できません（`src/program/generate.cpp:17778-17785,18954-18956`）。
+- 窓は最大 8 token です。追加候補が得られない、最短一致に達しない、窓の空きがない、または policy が採用しない場合は chained draft が追加されません（`src/program/generate.cpp:18649-18660`; `src/spec/draft_source.cpp:13-35`）。
+- `STRATA_SPEC_PROB=1` のときチェーン提案を有効にすると gated proposal の条件を満たさず、この経路では従来の判定へ戻る warning が出ます（`STRATA_SPEC_PROB` が無効ならこの warning 分岐は呼ばれません）（`src/program/generate.cpp:3137-3154,17550-17553`）。
 
 ## 出力とエラー
 
-専用の値 validation error はなく、範囲外値は clamp されます。値欠落は終了コード `2`、未知の引数は `unknown argument: ...` と usage を stderr に出して終了コード `2` です（`src/program/generate.cpp:2416-2421,2787-2792`）。
+serve では各リクエストの `DONE` 行に chain accepted/offered 等の追加カウンタが付き、処理終了時には stderr に `strata serve: lookup chain: ...` の集計が出ます（`src/program/generate.cpp:19269-19285,19588-19590`）。単発 `generate` では終了時の stdout summary に `lookup chain` の窓数と受理数が出ます（`src/program/generate.cpp:20719,20790-20793`）。
 
-通常の `generate` は `K > 0` のとき stdout に `lookup chain` の窓数と「受理数 / 提案数」を出します（`src/program/generate.cpp:16739-16744`）。serve は同様の集計を stderr に出し、サーバープロトコルの `DONE` 行にも追加カウンターを付けます（`src/program/generate.cpp:15365-15378,15650-15655`）。具体的な値は実行履歴に依存します。
+`--lookup-chain` 自体について確認できた parser エラーは値欠落時の終了コード 2 です。指定値の範囲外はエラーではなく丸められます。検証窓実行など後続処理で起きる失敗は通常の `ERR` 出力経路を通り、option 固有のエラーとは区別されます（`src/program/generate.cpp:3370-3372,18853-18860`）。
 
 ## 根拠
 
-- parser の option 初期値・help: `src/program/generate.cpp:780-784,942-944`
-- parser の変換、欠落値、未知引数: `src/program/generate.cpp:2416-2421,2672-2675,2787-2792`
-- verify 上限調整: `src/program/generate.cpp:3205-3218`
-- lookup 候補の追加・policy: `src/program/generate.cpp:14891-14920,16567-16584`; `include/strata/spec/draft_policy.hpp:40-46`
-- source 検索と一致長 validation: `include/strata/spec/draft_source.hpp:1-9,29-60`; `src/spec/draft_source.cpp:13-33`; `src/program/generate.cpp:1080-1086`
-- lookup history の実装: `include/strata/spec/suffix_drafter.hpp:7-10`; `src/spec/suffix_drafter.cpp:18-24,51-95`
-- 実行時カウンター: `src/program/generate.cpp:15365-15378,15650-15655,16739-16744`
-
-調査範囲は上記 commit の checkout 内ソースです。同一 revision の CLI `--help` 実行および Release artifact の照合は行っていません。索引上の予定リンクと現行 parser は一致しています。
+- parser と値の保存: `src/program/generate.cpp:977-980,3625`
+- help と既定の説明: `src/program/generate.cpp:1160-1162`
+- 窓サイズ調整・上限: `src/program/generate.cpp:4304-4311`
+- prompt / 確定 token 履歴、提案条件と policy: `src/program/generate.cpp:1310-1312,1339-1355,17778-17785,17807,18647-18667`; `src/spec/draft_source.cpp:13-35`; `src/spec/draft_policy.cpp:285-305`
+- verifier と chain 計数: `src/program/generate.cpp:18853-18860,18890,19269-19285,19588-19590,20719,20790-20793`
+- `STRATA_SPEC_PROB` との適用制約: `src/program/generate.cpp:3137-3154,17550-17553`

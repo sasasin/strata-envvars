@@ -1,60 +1,60 @@
-# `--serve`
+# `strata --serve`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン） |
+| コマンド | `strata`（ネイティブ推論エンジンの引数。Terminal CLI の `strata serve` とは別） |
 | オプション | `--serve` |
 | 別名 | なし |
-| 値 | 取らないフラグ |
+| 値 | 値を取らないフラグ |
 
 ## 役割
 
-モデルと推論用リソースを起動時に読み込み、プロセスを終了せずに複数の推論要求を順に処理するモードです。この `generate.cpp` の実装では TCP listener を開く処理は確認できず、要求は stdin から受け取り、準備完了・token・完了情報などを stdout に返す行プロトコルです（`src/program/generate.cpp:7497-7517, 11166-11170`）。
+モデル等の起動時リソースを読み込んだ後、プロセスを終了させず、stdin からリクエストを受け付ける常駐モードにします。推論結果と状態通知は stdout に出ます。これはエンジン内の stdin/stdout プロトコルを有効にするフラグであり、このオプションだけで HTTP サーバーの待受を開始する実装ではありません（`src/program/generate.cpp:9543-9564,13776-13777`）。
 
 ## 使い方
 
-pack を使う通常 parser での例です。`/path/to/pack` は利用可能な Strata pack のディレクトリに置き換えます。
-
 ```sh
-strata --pack /path/to/pack --serve --spec 4 --prefill 2048 --expert-cache auto
+strata --pack /path/to/model-pack --serve --spec 4 --prefill auto
 ```
 
-この起動後、クライアントは stdin に `GEN <max_new> <id,id,...>` を一行で送り、stdout の `READY`、`T <id>`、`DONE ...` などを読み取ります。終了時は `QUIT` を送ります。`STOP` は実行中要求の停止要求です（`src/program/generate.cpp:7499-7517, 10956-10965, 12020`）。
+`--pack` は使用するモデル pack、`--spec` は検証ウィンドウ、`--prefill` は prompt 処理 chunk の設定例です。serve 起動時には `--spec` が 2 以上であることと、prefill chunk が正であることが必要です。実際の受理条件は下記「適用条件と副作用」を参照してください（`src/program/generate.cpp:10444-10449`）。
 
 ## 値と既定値
 
-値を取らず、指定すると `Options::serve` を `true` にします。未指定時の値は `false` です（`src/program/generate.cpp:720-721, 2637`）。重複指定を拒否する処理はなく、同じ boolean 値を再設定します。値を後置すると別の引数として解釈され、未知の引数なら usage を stderr に出して終了コード 2 で終了します（`src/program/generate.cpp:2416-2424, 2787-2793`）。
-
-serve では要求ごとの prompt token を stdin から受け取るため、起動時の `--tokens` は必須ではありません。未指定なら内部で token `248045`、`max_new=1`、`stop_eos=true` を初期値として設定します（`src/program/generate.cpp:3168-3178`）。
+- 値を取りません。parser は `--serve` を見つけると `o.serve = true` にします。既定値は `false` で、同じ引数を複数回指定しても true のままです（`src/program/generate.cpp:917-918,3364-3368,3585-3587`）。
+- 引数がない場合、serve モードはリクエストごとに prompt token を受け取るため、起動時の `--tokens` を要求しません。内部では sentinel token、`max_new=1`、`stop_eos=true` を設定します（`src/program/generate.cpp:4240-4250`）。
+- `--serve` 自体に値の validation はありません。値を付けたつもりで `--serve something` とすると `something` は別引数として処理され、未知引数なら usage とともに stderr に出て終了コード 2 になります（`src/program/generate.cpp:3755-3760`）。
 
 ## 実行時の動作
 
-- 通常 parser は `--serve` を `o.serve` に設定します。起動時にモデル・重み・expert cache 等を初期化した後、`READY <context> stop` を stdout に出し、要求待ちに入ります（`src/program/generate.cpp:2637, 11166-11170`）。
-- 通常の要求は `GEN <max_new> <id,id,...>`、画像要求は `GENI` 系の入力を受け付けます。prompt の進捗・再利用量を示す `RESUME` / `PP` / `REUSED`、token ごとの `T <id>`、終了時の `DONE ...`、処理できない要求の `ERR <message>` を stdout に返します。token は verify window 完了後に出力され、decode は greedy です（`src/program/generate.cpp:7499-7517, 12289`）。不正な要求形式は `ERR expected: ...` を返して次の行へ進みます（`src/program/generate.cpp:12289`）。
-- stdin を専用 thread で読みます。`STOP` は停止 flag として扱われ、`QUIT` または stdin の EOF で serve loop を抜けます（`src/program/generate.cpp:10907-10965, 12020, 15685`）。
-- conversation checkpoint は既定で最大 6 個を保持し、会話の prompt の一部を後続要求で再利用できます。これは `--prompt-cache` 等で変更できます（`src/program/generate.cpp:725-729, 891-895`）。モデルや cache の準備・保持と要求処理のため GPU/host RAM を使用します。
-- `--batch` を併用すると複数 slot の要求を同時に扱う別経路が有効になります。`--serve` 単独では batch slot は有効になりません（`src/program/generate.cpp:658-660, 11972-12014`）。
+- `--serve` が有効な場合、起動済みのモデル重み・expert arena・VRAM tier を保持したまま、stdin から行単位でリクエストを読みます。通常の text request は `GEN <max_new> <id,id,...>` 形式で、生成 token ごとに `T <id>`、最後に `DONE ...` を stdout に出します。読み込み進捗は `RESUME`、`PP`、`REUSED` などで通知します（`src/program/generate.cpp:9543-9564,13776-13777,15471-15480,16471-16473,19269-19292`）。
+- stdin reader は別 thread で動き、`STOP` は実行中 request の停止フラグを立て、`QUIT` はリクエストループを終了します。入力が閉じられた場合もループを終えます（`src/program/generate.cpp:13499-13558,15200`）。
+- 画像 request の `GENI` は `--vision` が有効な起動でのみ受け付けます。未指定時に `GENI` が来ると `ERR this engine was started without --vision` を stdout に出して、その request を続行しません（`src/program/generate.cpp:13830-13834,15471-15474,15631-15633`）。
+- `--serve` がない通常実行では一回分の token input が必要で、`--tokens` または token file がなければ stderr に必須エラーと usage を出し、終了コード 2 になります（`src/program/generate.cpp:4246-4250`）。
 
 ## 適用条件と副作用
 
-- 通常 parser の serve 経路では `--spec` が 2 以上、`--prefill` の chunk が正であることが必要です。該当しない場合は `strata serve: needs --spec T and --prefill CHUNK ...` を stderr に出し、終了コード 2 で終了します。expert cache が充填可能であることも前提で、graph-hit 経路を使う構成では `--expert-profile` による profile と fillable hit data が追加で必要です（`src/program/generate.cpp:8354-8359`）。
-- `--serve` を指定すると engine が要求待ちを続け、モデルと関連 cache をプロセス内に保持します。単発 generate と異なり、要求が来るまで stdin 待ちとなります。`--serve` 自体の socket bind やファイル出力は確認できません。profile 保存などは `--expert-profile-save` 等の別オプションを指定した場合の副作用です（`src/program/generate.cpp:7497-7517, 10907-10965, 15685`）。
-- `--model` または `--native` の GGUF が Qwen3.6 family (`qwen35moe`) と識別される build では、option parser より先に `src/qwen35` 実装へ委譲されます。その場合は通常 parser の上記 validation・動作記述ではなく、[Qwen3.6 用 `--serve`](../qwen36/--serve.md) の文書が該当します（`src/program/generate.cpp:2393-2407`）。
+- 起動処理で `--spec < 2`、`--prefill` chunk が 0 以下、または graphed hit path の必要な expert cache/profile が満たされない場合は、`strata serve: needs --spec T and --prefill CHUNK ...` を stderr に出して終了コード 2 になります。`--spec` の初期値は Metal build で 2、それ以外では 0 なので、非 Metal の通常 build では明示指定が必要です（`src/program/generate.cpp:848-852,10444-10449`）。
+- 会話 checkpoint は既定で最大 6 個を保持し、parked conversation cache は最大 4 slot です。serve 中の RAM 使用を抑えたい場合などに `--prompt-cache`、`--conversation-cache-mib`、`--conversation-cache-slots` 等で調整できます。`--prompt-cache 0` または `--conversation-cache-slots 0` と正の cache budget が併存すると、cache 無効化の warning が stderr に出ます（`src/program/generate.cpp:922-928,4005-4007`）。
+- `--batch` は serve 専用で、2 slot 未満や同一 GPU の layer split 等の条件では warning を出し batch を無効化します。`--layer-split` は `--serve` が必要で、条件不成立なら stderr に理由を出し終了コード 2 になります（`src/program/generate.cpp:853-856,4047-4057,4092-4097,6853-6859`）。
+- `--remote-expert-opt` も `--serve` が必須で、単独使用は stderr にエラーを出し終了コード 2 です（`src/program/generate.cpp:4466-4469`）。他にも serve 条件を持つオプションがありますが、それら個別の値・副作用は各オプション文書を参照してください。
+- 起動時に model と GPU/CPU 側の実行資源を準備し、終了まで保持します。会話の再利用 checkpoint や、別オプションによる batch slot、layer split、画像 embedding の読み込みも serve 経路の副作用です（`src/program/generate.cpp:9543-9564,13776-13777,15648-15665`）。OS/backend ごとの全 build を実行しての確認はしていません。
 
 ## 出力とエラー
 
-通常 parser では起動成功時に stdout へ `READY <context> stop` を出します。要求単位の結果・失敗は stdout の `T` / `DONE` / `ERR` などで通知され、診断や起動時 warning は stderr に出ます（`src/program/generate.cpp:7499-7517, 11166-11170, 12289`）。
+- 起動準備完了後、stdout に `READY <max_context> stop` を出します（`src/program/generate.cpp:13774-13777`）。通常 request は token 単位の `T <id>` と完了時の `DONE ...` を出します（`src/program/generate.cpp:18374,18950,19284-19292`）。
+- 不正な request は、たとえば形式不一致なら `ERR expected: GEN ... or GENI ...`、prompt と生成長の合計が context を超える場合は `ERR prompt ... exceeds the context ...` を stdout に出し、その request をスキップします（`src/program/generate.cpp:15471-15474,15726-15729`）。
+- NaN/Infinity を含む logits の window は、その window の token を出力せず `DONE ... nonfinite` として終了し、次の request は token 0 から読み直します（`src/program/generate.cpp:9554-9557,12178-12184`）。
+- `--serve` に固有の数値終了コードは parser にありません。ここに記した起動時 validation は 2、入力不備は常駐中の `ERR` 応答です。GPU 等の実行時障害で終了する全経路の終了コードはこのオプション単体では一律に定まりません。
 
-不足する `--spec` / `--prefill` 等は起動時に拒否され終了コード 2 です。未知の CLI 引数も stderr に `unknown argument: ...` と usage を出し終了コード 2 になります（`src/program/generate.cpp:8354-8359, 2787-2793`）。要求内容が不正な場合は `ERR` を返して loop を継続する経路が確認できます（`src/program/generate.cpp:12289`）。
+## 根拠
 
-## 根拠と調査範囲
-
-- parser と既定値: `src/program/generate.cpp:720-721, 2416-2424, 2637`
-- serve の自動 token 初期化と起動要件: `src/program/generate.cpp:3168-3178, 8354-8359`
-- protocol、入力 thread、準備完了、終了: `src/program/generate.cpp:7497-7517, 10907-10965, 11166-11170, 12020, 15685`
-- family dispatch: `src/program/generate.cpp:2393-2407`
-
-調査は上記 commit の source checkout と `docs/cli/README.md` の索引記載に基づきます。同一 revision の既存バイナリによる `--help` は実行しておらず、build・GPU 実行・テストも行っていません。Release 配布物での挙動はこの調査では確認していません。
+- option の宣言と既定値: `src/program/generate.cpp:917-918`。
+- parser: `src/program/generate.cpp:3364-3368,3585-3587`。
+- serve 時の起動引数補完と tokens 必須条件: `src/program/generate.cpp:4240-4250`。
+- serve mode 固有の起動 validation: `src/program/generate.cpp:10444-10449`。
+- stdin/stdout 常駐経路と protocol: `src/program/generate.cpp:9543-9564,13499-13558,13774-13777,15200,15471-15480,19269-19292`。
+- 索引上の scope: `docs/cli/README.md` の `strata-engine` → `strata`（エンジン引数）節。Qwen3.6 専用 parser は別の `strata-engine/qwen36/` scope で、本書の対象外です。

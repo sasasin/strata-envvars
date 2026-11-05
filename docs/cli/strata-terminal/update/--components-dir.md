@@ -1,6 +1,6 @@
-# `strata update --components-dir`
+# `--components-dir`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,52 +8,49 @@
 | コマンド | `strata update` |
 | オプション | `--components-dir` |
 | 別名 | なし |
-| 値 | コンポーネント格納先のパス |
+| 値 | コンポーネント格納先のパス（文字列） |
 
 ## 役割
 
-更新処理が engine、Control、取得した Desktop installer と updater の状態を扱うルートディレクトリを指定します。`strata update` の共通 parser で定義され、同じ定義・実装は `strata components update` と `strata components rollback` にも使われます。この文書は索引のスコープどおり `strata update` を説明します（`strata_cli/update_cmd.py:30-59`; dispatcher は `strata_cli/cli.py:139-140,2135-2137`）。
-
-## 使い方
+`strata update` が engine と Control の既存データを読み、更新状態・ダウンロード・展開先として使うコンポーネントルートを指定します。engine のディレクトリそのものではなく、Strata がその下に `engine/` や `.updates/` を配置するルートです。
 
 ```sh
-strata update --components-dir /srv/strata/components --check
+strata update --components-dir /path/to/strata-components
 ```
-
-`--check` を付けると、指定した components root にある engine と updater state を基準に更新候補を確認します。実際に更新するときは `--check` を省略します。
 
 ## 値と既定値
 
-- 値は必須で、parser は文字列として受け取ります。`default=None` で、`type` 変換やパス存在・絶対パスの検証は登録されていません（`strata_cli/update_cmd.py:30-40`）。
-- 値を省略すると `strata_control.engine_component.components_dir()` が選ばれます。非空の `STRATA_COMPONENTS_DIR` があればそのパス、なければ Windows は `%LOCALAPPDATA%/Strata/components`（環境変数がなければホーム配下）、それ以外は `$XDG_DATA_HOME/strata/components`（環境変数がなければ `~/.local/share/strata/components`）です（`strata_cli/update_cmd.py:174`; `strata_control/engine_component.py:176-186`）。環境変数の説明は [`STRATA_COMPONENTS_DIR`](../../../STRATA_COMPONENTS_DIR.md) を参照してください。
-- 明示値が空文字列なら `a.components_dir` が偽となり、既定先の解決へ進みます。空白だけの値は空文字列ではないため、そのまま `Path` に渡されます（`strata_cli/update_cmd.py:174`）。
-- 相対パスを拒否したり、この箇所で絶対パスへ変換したりする処理はありません。相対パスはプロセスの作業ディレクトリを基準とする `Path` として使われます（`strata_cli/update_cmd.py:174`）。
+parser は値を `str` のまま受け取り、既定値は `None` です。`choices`、型変換、存在確認、パスの正規化はこの parser にはありません。値が空文字列なら実行時の真偽判定で未指定と同じ扱いになります。相対パスは `Path` に渡され、その後 `resolve()` されずに使われます。`~` の展開など、追加のパス補正も Strata 側では確認できません（`strata_cli/update_cmd.py:47-57,284`）。
+
+省略時は次の順で決まります。
+
+1. `STRATA_COMPONENTS_DIR` が設定されていればそのパス。
+2. 環境変数がなく、ソース checkout 内に engine package を含む `engine-feed/` があり、既定のユーザー用フォルダーに engine package がない場合は、その checkout の `engine-feed/`。
+3. それ以外はユーザー用フォルダー。Windows は `%LOCALAPPDATA%\Strata\components`（`LOCALAPPDATA` がなければ home 以下）、その他は `$XDG_DATA_HOME/strata/components`（`XDG_DATA_HOME` がなければ `~/.local/share/strata/components`）。
+
+明示した `--components-dir` はこれらの既定選択より優先します。環境変数とユーザー用フォルダーの規則は [`STRATA_COMPONENTS_DIR`](../../../envvars/STRATA_COMPONENTS_DIR.md) を参照してください（`strata_cli/update_cmd.py:255-270`、`strata_control/engine_component.py:176-186`）。
 
 ## 実行時の動作
 
-選ばれたパスは `updater.Context.components` に設定され、feed の既定値解決時に保存済み feed を読むほか、更新状態、engine/Control の配置、staging に使われます（`strata_cli/update_cmd.py:87-95,174-184`; `strata_control/updater.py:129-130,165-171,643-659,1145-1157`）。したがって異なる値を指定すると、既定先とは異なるコンポーネントと更新履歴を対象にし得ます。
+`strata update` の parser は `_common()` からこのオプションを登録し、CLI dispatcher は `strata update` を `update_cmd.run()` に渡します（`strata_cli/update_cmd.py:47-64`、`strata_cli/cli.py:2144-2146`）。`run()` は指定値を `Path` にし、未指定なら上記の既定選択を行って `updater.Context.components` に設定します（`strata_cli/update_cmd.py:255-295`）。
 
-選択した root の `.updates/` に `update.lock` と `state.json` が置かれます。`--check` もロックを取得し、feed を確認した後に `last_check` を state に保存します。通常の更新では root 配下で staging を作成し、選択された engine/Control を更新します。`--app` を併用して installer を取得する場合、その検証済みファイルも `.updates/app/` に保存されます（`strata_control/updater.py:129-152,165-205,624-640,643-653,1145-1178,1226-1257,1274-1295`）。
+このルートは engine の検出・既存状態の読取・更新排他ロック・一時ダウンロード・展開・状態保存などに使われます。たとえば更新チェックでも `.updates/update.lock` を作成し、feed の確認結果を `.updates/state.json` に保存します。そのため `--check` を付けてもコンポーネントルートは使用され、更新通知用の状態が書き込まれます（`strata_control/updater.py:136-160,172-208,663-674`）。ダウンロードの部分ファイルは `.updates/partial/`、engine の展開 staging は `.s/` 以下です（`strata_control/updater.py:494-496,690-710`）。
 
 ## 適用条件と副作用
 
-- 指定先の事前検証はありません。存在しない場合でも、後続のロックや状態保存で親ディレクトリを作成します。作成・書き込みできない場合は処理が失敗します（`strata_cli/update_cmd.py:174`; `strata_control/updater.py:133-138,193-205`）。
-- `--check` は feed 取得以外の更新 package は取得しませんが、`.updates/` とロックファイルを作成し、`state.json` に最終確認情報を書きます（`strata_control/updater.py:624-640`）。
-- 通常の update は同じルートの state を読み書きし、engine/Control や、`--app` 指定時の installer を取得・検証・配置します。更新先の誤指定は別のインストール状態を参照・変更する可能性があります（`strata_control/updater.py:1274-1295`）。
-- 同じ root に対する別の updater 実行はファイルロックで排他されます。engine serving 中の扱いは `--wait` 等に依存し、このオプション自体は serving 状態を変えません（`strata_control/updater.py:133-153`; `strata_cli/update_cmd.py:237-252`）。
+- この説明は `strata update` のスコープです。同じ文字列は `strata components update` や他の `strata components` サブコマンドにも別 parser スコープで存在しますが、それらの動作をこの文書の対象には含めません（`strata_cli/update_cmd.py:59-95`、索引 [`docs/cli/README.md`](../../README.md) の各コマンド節）。
+- 通常の更新では、指定したルート内の component state を更新し、feed から取得したファイルの一時保存・展開・engine/Control の配置に使います。パスの書込み権限や空き容量が不足すれば処理は失敗し得ます（`strata_control/updater.py:494-496,665-674,703-745`）。
+- checkout 固有の `engine-feed/` 選択は、明示的な `--components-dir` または `STRATA_COMPONENTS_DIR` がない場合に限られます。環境変数があれば `engine_component.components_dir()` の選択をそのまま返します（`strata_cli/update_cmd.py:255-270`）。
+- 値自体の妥当性検査を行う専用処理は確認できません。実際のファイル操作時に生じた `OSError` は CLI の一般エラー経路に入り、通常は終了コード 6 で報告されます。アクセス権エラーは既知フォルダー修復後に一度再試行される場合があります（`strata_cli/cli.py:2094-2113,2188-2195`）。
 
 ## 出力とエラー
 
-このオプション単独の成功出力はありません。通常出力は更新結果を表示し、`--output json` または `jsonl` では machine 出力になります（`strata_cli/update_cmd.py:62-84,203-224`）。
-
-選択した root のロック競合は `UpdateError`、終了コード 7 です。`UpdateError`、feed/signature エラーなどは human 出力なら `strata: ...` を stderr に、machine 出力なら JSON error を stdout に出します。ディレクトリ作成・書き込み等の `OSError` が出る具体的な箇所と表示は状況によるため、このオプションに固有の単一メッセージや終了コードはありません（`strata_control/updater.py:133-153`; `strata_cli/update_cmd.py:163-172,225-234`）。
+このオプション自体は出力を追加しません。出力形式は `--output` / `--json` など他の設定に従います。更新処理の捕捉済みエラーは human 出力なら stderr の `strata: ...`、JSON 系なら標準出力のエラー object になり、`UpdateError` や feed/signature/acquisition error は各エラーコードを返します（`strata_cli/update_cmd.py:273-282,347-359`）。不正なパス文字列専用のエラー文は定義されていません。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:30-59,163-184` — parser、既定先の選択、Context への設定。
-- `strata_cli/update_cmd.py:87-95` — `--feed` 省略時に選択 root の保存済み feed を参照。
-- `strata_control/engine_component.py:176-186` — `STRATA_COMPONENTS_DIR` と per-user root の解決。
-- `strata_control/updater.py:129-205,624-640` — root 配下のロック・state、`--check` の保存処理。
-- `strata_control/updater.py:643-659,1145-1178,1226-1257,1274-1295` — staging、components の更新、installer 配置と更新処理。
-- `strata_cli/cli.py:139-140,2135-2137` — parser 登録と `strata update` の dispatcher。
-- `docs/cli/README.md:244-262` — `strata update` の階層とこの文書への索引リンク。
+- parser と既定値: `strata_cli/update_cmd.py:47-64`
+- ルート選択、環境変数および checkout fallback、Context への設定: `strata_cli/update_cmd.py:242-295`
+- CLI の dispatch と OS/file error の処理: `strata_cli/cli.py:2144-2146,2188-2195`
+- per-user 既定値と `STRATA_COMPONENTS_DIR`: `strata_control/engine_component.py:176-186`
+- state、lock、check、部分ダウンロード、stage: `strata_control/updater.py:136-160,172-208,494-496,663-674,690-745`

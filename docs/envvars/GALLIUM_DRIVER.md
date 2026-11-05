@@ -1,36 +1,43 @@
 # `GALLIUM_DRIVER`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリ・GPU driver の動作は対象外。
+調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。調査対象 checkout は `main` で、作業ツリーは clean（`## main...origin/main`）。
 
 ## 役割
 
-Strata の Linux desktop shell が、graphics session の診断情報として環境変数の値をクラッシュログと `--save-logs` の出力に記録します。Strata の描画 backend や GPU driver の選択をこの変数で制御する読み取りではありません。
+Strata の Linux デスクトップアプリが、診断用の graphics session 情報としてこの環境変数の現在値を記録します。アプリウィンドウの異常終了時に作成する crash log と、`--save-logs` が作るログ収集ファイルに `GALLIUM_DRIVER=<値>` の行が含まれます。GPU backend や engine の動作を選ぶために Strata が読む設定ではありません。
 
 ## 値と判定
 
-| 環境の状態 | Strata の処理 |
-|---|---|
-| 未設定 | 出力しない |
-| 空文字 | `  GALLIUM_DRIVER=` を出力する |
-| Unicode 文字列 | 値を変換せず `  GALLIUM_DRIVER=<値>` として出力する |
-| Unicode として取得できない値 | `std::env::var` がエラーとなり、その項目を出力しない |
+Strata は値を parse・検証・変換しません。`std::env::var` で Unicode 文字列として取得できれば、値をそのまま `GALLIUM_DRIVER=<値>` の形式にします。
 
-値の構文検証、大小文字変換、既定値、数値変換、無効値時の fallback はありません。CLI 引数や別の Strata 環境変数による値の上書きもありません。`--save-logs` は採取を実行する方法を選びますが、環境変数の値を変更しません。
+| 環境の状態 | 診断出力 |
+|---|---|
+| 未設定 | `GALLIUM_DRIVER` の行を出力しない |
+| 空文字で設定 | `GALLIUM_DRIVER=` の行を出力する |
+| Unicode 文字列で設定 | 値をそのまま出力する。大小文字、数値、空白、値域の検査はない |
+| Unicode でない値 | `std::env::var` がエラーとなるため、その行を出力しない |
+
+有効値・無効値の区別、既定値、fallback、CLI 引数や他の環境変数との優先順位はありません。診断文字列に補間されるだけです。
 
 ## 有効になる条件
 
-この参照は desktop 診断情報の採取に限られます。Linux ではウィンドウプロセスが異常終了したときに shell がクラッシュログを作り、また `--save-logs` の実行時にも graphics session 情報を保存します。通常の起動や描画処理で `GALLIUM_DRIVER` を読み、分岐する箇所はありません。Windows/macOS の起動時ログ経路は別であり、この graphics session 収集経路を呼びません。
+この処理はデスクトップアプリの診断経路に限られます。Linux では、別プロセスのウィンドウが異常終了した場合の crash log に graphics session を記録し、`--save-logs` で保存するログにも記録します。`--save-logs` は Linux supervisor の引数処理です。通常の起動や正常なウィンドウ終了だけでは、この変数を記録する出力経路は呼ばれません。
+
+Strata のソースで `GALLIUM_DRIVER` を設定・上書きしたり、別のプロセスへこの値を明示的に渡したりする箇所は見つかりませんでした。CUDA/HIP/SYCL engine やサーバーの機能をこの値で切り替える Strata 所有コードも見つかりません。
 
 ## 実行時の詳細
 
-`graphics_environment()` は固定名リストを順に走査し、呼び出すたびに `std::env::var()` で現在のプロセス環境を読みます。値を static cache する処理はありません。対象変数の値は、ウィンドウ異常終了時の `desktop-crash-*.log` の `Graphics session:` 節、および `--save-logs` が作る `strata-logs-*.txt` の同節に含まれます。
+`graphics_environment()` は名前の固定リストを順に調べ、`std::env::var(n).ok()` で取得できたものだけを一覧にします。この関数は値を読むたびに実行され、`GALLIUM_DRIVER` 専用の static cache はありません。従って診断生成時点のプロセス環境が対象になります。環境値を読み取ることによる警告・終了・失敗経路はありません。
 
-この変数に関する警告、エラー終了、値による挙動変更はありません。クラッシュログ自体が作れない場合の通知や `--save-logs` のファイル書き込み失敗は一般のログ処理であり、`GALLIUM_DRIVER` の値による失敗経路ではありません。
+ウィンドウプロセスの異常終了では、Linux supervisor が `window_failed()` から crash log を作成し、同じ報告に graphics session を追加します。`--save-logs` は保存ファイルの冒頭にも graphics session を追加します。ログの書き込みに成功した場合の結果や失敗時のメッセージは、ログ収集全体の経路によるもので、この環境変数の値によって変化しません。
 
 ## 根拠
 
-- `apps/desktop/src-tauri/src/desktoplog.rs:186-194` — graphics session の収集関数と固定名リスト。`std::env::var(n).ok()` が未設定・取得エラーを除外し、成功した値をそのまま `name=value` 形式へ整形します。
-- `apps/desktop/src-tauri/src/desktoplog.rs:241-260,281-289` — ウィンドウクラッシュレポートへの記録と、クラッシュログファイルの作成。
-- `apps/desktop/src-tauri/src/desktoplog.rs:310-341` — `--save-logs` 用ファイルへの graphics session 情報の記録。
-- `apps/desktop/src-tauri/src/supervisor.rs:303-313,316-332` — ウィンドウ異常終了時のログ生成、および `--save-logs` による保存経路。
-- `apps/desktop/src-tauri/src/main.rs:865-877` — Linux は supervisor shell 経路、非 Linux は embedded 経路へ進むこと。
+- `apps/desktop/src-tauri/src/desktoplog.rs:186-194` — 固定名リストに `GALLIUM_DRIVER` を含め、`std::env::var` で取得できた値を `  NAME=value` 形式にして返す。
+- `apps/desktop/src-tauri/src/desktoplog.rs:243-259` — crash report の `Graphics session` に一覧を出力する。
+- `apps/desktop/src-tauri/src/desktoplog.rs:281-289` — `write_crash_log()` が crash report を生成してファイルへ保存する。
+- `apps/desktop/src-tauri/src/desktoplog.rs:310-320` — `save_logs()` が収集ファイルに `Graphics session` を含める。
+- `apps/desktop/src-tauri/src/supervisor.rs:303-313,322-332` — Linux のウィンドウ異常終了時と `--save-logs` 時に上記のログ関数を呼ぶ。
+- `apps/desktop/src-tauri/src/main.rs:44-48,869-880` — supervisor は Linux のみでコンパイルされ、Linux では shell と window process の経路を使う。
+
+候補一覧 `docs/envvars/000_envvers.md:614` に名前があります。調査した Strata checkout 全体で完全一致の参照は `desktoplog.rs:191` のみでした。従って候補としては実際に環境を読む名前ですが、その用途はデスクトップ診断ログへの記録に限定されます。

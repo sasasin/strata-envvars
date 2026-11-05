@@ -1,38 +1,38 @@
 # `STRATA_INPUT`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部コマンド自身が行う環境変数の読み取りは対象外。
+調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
 
 ## 役割
 
-Strata Host の「Settings → Your own tools」で設定された command tool を実行するとき、tool 呼び出しの `input` を起動する子プロセスの `STRATA_INPUT` として渡します。Host 自身が既存の `STRATA_INPUT` を環境から読み込んで動作を変える設定ではありません。候補一覧には載っていますが、実装上確認できるのはカスタムコマンドへの値の受け渡しです。
+Strata ホストアプリの「Settings → Tools」で登録した command ツールを実行するとき、ツール呼び出しの `input` をコマンドの子プロセス環境へ渡します。Strata 自身がこの環境変数を読み取って処理するのではなく、コマンド起動時に `STRATA_INPUT` を環境へ設定します。したがって値をどう解釈するかは起動されたコマンド側の処理です。
 
 ## 値と判定
 
-| 入力 | 子プロセスの `STRATA_INPUT` |
+MCP の command ツール入力 schema では `input` は任意の文字列です。未指定なら `runCommand` の引数既定値 `''` が使われ、明示的な `null` も環境設定時に `''` になります。それ以外は JavaScript の `String(...)` で文字列化されます。文字列の trim、数値変換、真偽値判定、長さ制限はこの環境変数を作る箇所にはありません。
+
+| 呼び出し引数 `input` | 子プロセスの `STRATA_INPUT` |
 |---|---|
-| `input` が省略または `null` | 空文字列 `''` |
-| 文字列 | その文字列をそのまま渡す。文字列内容の parse や trim はしない |
-| それ以外の値が runner に渡された場合 | `String(input)` の結果 |
-
-MCP の command tool schema では `input` は任意の文字列で、追加プロパティは許可されません（`apps/host/server/agent/custom-tools-mcp.mjs:24-29`）。呼び出し側から渡された値は `runCommand` に渡り、`String(input ?? '')` に変換されます（同 `:35-40`; `apps/host/server/agent/custom-command-run.mjs:77-88`）。空文字を含め、入力がないときも子環境にはキーを設定します。親 Host の `process.env.STRATA_INPUT` を継承値として使う経路はなく、`{ ...process.env, STRATA_INPUT: ... }` の後勝ちで子環境の値を上書きします（`custom-command-run.mjs:88`）。
-
-この変数値について数値変換、範囲判定、無効値 fallback はありません。設定入力の上限は tool 呼び出しの `input` に関してこの実装では定められていません。Strata は値を環境に設定するだけで、その文字列をどう解釈するかは設定されたコマンド側の処理です。
+| 省略 / `undefined` | 空文字列（引数既定値） |
+| `null` | 空文字列 |
+| 空文字列 | 空文字列 |
+| その他 | `String(input)` の結果 |
 
 ## 有効になる条件
 
-- Settings に有効な `kind: 'command'` のカスタム tool があり、command tool server がその tool を呼び出すこと。設定ファイルには有効な instruction/command tools のみを書き出します（`apps/host/server/agent/tools-settings.mjs:95-114`）。profile は有効な command tool があるときに `strata-commands` MCP server を追加します（`apps/host/server/agent/profile.mjs:298-303`）。
-- 実行にはコマンドを開始できることと、作業ディレクトリが存在することが必要です。作業ディレクトリは呼び出し時の `cwd`、tool 設定の `cwd`、ホームディレクトリの順に選択されます（`apps/host/server/agent/custom-command-run.mjs:50-62,80-89`）。
-- Manual mode では command tool は承認を求め、Plan mode では拒否されます（`apps/host/server/agent/README.md:79`; `apps/host/server/agent/tools-settings.mjs:7-11`）。この条件で実行自体が許可されない場合、子プロセスは起動せず、値も渡されません。別の環境変数、GPU backend、モデル状態による判定はありません。
+- ホストの agent profile に有効な command ツールが含まれ、そのツール呼び出しが `custom-tools-mcp.mjs` に到達する必要があります。有効な command ツールだけがツール JSON に書かれ、command のみのサーバーは command mode で起動されます（`apps/host/server/agent/tools-settings.mjs:99-111`, `apps/host/server/agent/profile.mjs:298-303`）。
+- Manual モードでは command ツール実行前に確認を求めます。Plan モードは接続ツールを拒否するため、この経路ではコマンドは実行されません（`apps/host/server/agent/plugins/strata-gate.mjs:326-348,364-373`）。
+- `STRATA_INPUT` の値を Strata 内で読み取る OS / backend / model / build macro 条件はありません。シェルの選択（Windows の PowerShell / cmd、その他の sh など）は起動コマンドの実行方法を決めますが、値の変換規則は変えません（`apps/host/server/agent/custom-command-run.mjs:41-49,78-87`）。
 
 ## 実行時の詳細
 
-MCP server はリクエストごとに JSON 設定ファイルを読み直し、`tools/call` では該当 tool の command と `input` を runner に渡します（`apps/host/server/agent/custom-tools-mcp.mjs:22,35-40`）。runner はコマンド起動時に現在の Host 環境を複製し、`STRATA_INPUT` を今回の入力値で上書きした環境を `spawn()` に渡します（`apps/host/server/agent/custom-command-run.mjs:80-89`）。そのため tool 呼び出しごとに値が決まり、Host の環境変数として読み取った値を cache する処理はありません。子プロセスの環境を後から変更して再評価する処理もありません。
+MCP サーバーは command ツールの呼び出しから `args.input` を `runCommand` に渡します。`runCommand` はコマンド起動ごとに `spawn` の `env` を作り、ホストプロセスの `process.env` を継承した上で `STRATA_INPUT` を設定値で上書きします。ホスト側に同名変数が既にあっても、そのコマンドの入力（未指定なら空文字列）が優先されます。プロセス起動時に値を固定保存する cache はなく、各コマンド呼び出しで設定します（`apps/host/server/agent/custom-tools-mcp.mjs:35-40`, `apps/host/server/agent/custom-command-run.mjs:78-87`）。
 
-設定されたコマンドが正常終了すれば stdout と stderr をまとめた出力が MCP tool の応答に返ります。非ゼロ終了は tool error になり、出力がなければ終了コードを含む文が返ります。コマンド開始失敗、タイムアウト、無効な作業ディレクトリも `ok: false` と説明テキストになります。タイムアウトの既定は 120 秒、設定上限は 3600 秒です（`custom-command-run.mjs:17-20,80-100`; tool 呼び出しへの接続は `custom-tools-mcp.mjs:39-40`）。`STRATA_INPUT` 値そのものを記録する Host のログはこの経路にありません。
+起動に失敗した場合は MCP tool result が `isError: true` となり、`The command could not start in ...` の文面が返ります。起動後は stdout と stderr をまとめて収集し、終了コード 0 なら成功、それ以外なら失敗として結果を返します。既定 timeout は 120 秒で、超過時はプロセスツリーを終了し `The command was stopped after ... seconds.` を返します。出力は 20,000 文字で切り詰めます。これらはコマンド実行結果の処理であり、`STRATA_INPUT` 自体の値をログ出力する処理ではありません（`apps/host/server/agent/custom-command-run.mjs:18-20,70-72,88-99`; MCP 結果への変換は `apps/host/server/agent/custom-tools-mcp.mjs:39-40`）。
 
 ## 根拠
 
-- `apps/host/server/agent/custom-tools-mcp.mjs:24-29,35-40` — 入力 schema と MCP 呼び出しから runner への引き渡し。
-- `apps/host/server/agent/custom-command-run.mjs:77-100` — 入力の既定値・文字列化、環境の複製と上書き、子コマンド起動および結果・失敗の返却。
-- `apps/host/server/agent/tools-settings.mjs:95-114` と `apps/host/server/agent/profile.mjs:298-303` — 有効な command tool の設定ファイル化と MCP server の追加。
-- `apps/host/server/agent/README.md:79` — Host の command tool と Manual / Plan の説明。
+- `apps/host/server/agent/custom-tools-mcp.mjs:24-28,35-40` — `input` schema と optional 入力の `runCommand` への受け渡し、失敗結果の MCP 返却。
+- `apps/host/server/agent/custom-command-run.mjs:78-87` — 未指定時の既定値、nullish 値の空文字化、`String` 変換、子プロセス環境への上書き設定。
+- `apps/host/server/agent/custom-command-run.mjs:88-99` — stdout/stderr の収集、timeout、出力上限、終了コードによる結果。
+- `apps/host/server/agent/tools-settings.mjs:99-111` と `apps/host/server/agent/profile.mjs:298-303` — 有効な command ツールの公開と専用ツールサーバーの構成。
+- `apps/host/server/agent/plugins/strata-gate.mjs:326-348,364-373` — Manual の確認と Plan の拒否。
