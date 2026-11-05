@@ -1,8 +1,8 @@
 # 環境変数一覧
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（コミット日付 2026-11-02、一覧生成日 2026-11-03）。`git describe --tags` は `v0.2.10` で、annotated tag `v0.2.10`（tag オブジェクト `db0500a53119a349fa44497099d6e28a83ded34a`）の peel 先がこの HEAD そのもの。`git status --short --branch` は working tree clean（`main` = `origin/main`）。
+調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（コミット日付 2026-11-05、一覧生成日 2026-11-06）。`git describe --tags` は `v0.2.10-3-g9f7d977d`。annotated tag `v0.2.10`（tag オブジェクト `db0500a53119a349fa44497099d6e28a83ded34a`）は HEAD の祖先で、tag peel 先は `ffa80d73133ea5c548aefe57889a16e8085a938f`。`git status --short --branch` は working tree clean（`main` = `origin/main`）。
 
-総数: **2127** 件。
+総数: **2139** 件。
 
 生成方法: ソースを grep し、環境変数を実際に読み書きしている箇所から名前を拾った。同じ名前の全参照を集約し、環境変数ではない識別子（文字列定数・ログ文言・量子化形式名・シグナル名・テスト内のダミー）は落とした。
 検索した API / 構文は次のとおり。
@@ -30,7 +30,13 @@
 
 > 索引そのものの再生成・削除・一括作成の手順はスキル `.agents/skills/strata-investigate/references/index-refresh.md` にある。生成方法の定義は本書の冒頭が正で、索引の形（1 行 1 名の `- \`NAME\`` と ASCII 順）を崩すと `create-envvars-docs.py` と `check-docs.py` が読めなくなる。
 
-## 前版との差分（索引の最新化 2026-11-03: v0.2.9 → v0.2.10）
+## 前版との差分（索引の最新化 2026-11-06: v0.2.10 → v0.2.10-3-g9f7d977d）
+
+- 対象は Strata HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-05、`v0.2.10-3-g9f7d977d`）。前版の `ffa80d73133ea5c548aefe57889a16e8085a938f` から 3 commit 進みました。
+- 追加 12 件: `FNX_DRAFT`, `STRATA_BLOCKING_CONSOLE`, `STRATA_FONT_CONFIG`, `STRATA_GFX12_RING`, `STRATA_NV_CHUNK`, `STRATA_NV_KQ_DEFAULT`, `STRATA_PCIE_K_RULE`, `STRATA_PCIE_SHARE_MAX`, `STRATA_PF_OWN_PROBE_OFF`, `STRATA_SPLIT_EARLY_OFF`, `STRATA_STREAM_BEAT_MS`, `STRATA_STREAM_WRITE_TIMEOUT_S`。変更された Strata ソースで新たに読み取り・参照される名前を追加しました。
+- 削除 0 件。前版の 2127 件はすべて維持しています。
+
+### 履歴: 索引の最新化 2026-11-03（v0.2.9 → v0.2.10）
 
 - 前版は `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（v0.2.9、コミット日 2026-10-31、生成 2026-11-01）で 1690 件。v0.2.9 → v0.2.10 のソース差分は 708 コミット・798 ファイル変更（+86,448 / −3,991 行）。
 - 追加 437 件。拾えた群の内訳（同じ名前が複数群に出るので合計は 436 を超える）: `getenv` / `setenv` 系の直接呼び出し 205 件、env helper 経由 93 件、ビルド・パッケージング・Docker・CI・テストのスクリプトが環境から読む設定 84 件、Python / JS の `os.environ` / `process.env` と env dict 経由 47 件、名前の配列・定数経由 10 件。
@@ -40,6 +46,7 @@
 - 索引に入れなかったもの: Dockerfile の `ARG` だけ（`BASE_IMAGE` `CUDA_IMAGE` `RUNTIME_BASE` `CUDA_ARCHITECTURES` `STRATA_VERSION` `ENGINE_LABEL` `STRATA_COMMIT` など）は環境変数ではなくビルド引数。`STRATA_PORTABLE` `STRATA_SPLIT_ARCH` `STRATA_TQ_OVERLAY_OK` `STRATA_USE_HIP` は CMake 変数。量子化形式名（`IQ2_XXS` `IQ4_XS` `MXFP4` など）とファイルヘッダの magic 文字列（`STRATA_HIPBLASLT_TUNING_V1` `STRATA_ROCBLAS_TUNING_V1`）、shell 内蔵変数（`PWD` `RANDOM` `PIPESTATUS` `ERRORLEVEL` `BASH_SOURCE` `BASH_REMATCH`）、ビルドスクリプトが自分で代入するだけの内部変数も除外した。
 - 綴りは Strata が実際に読む形のまま（`Path` `SystemDrive` `ProgramFiles` `VCToolsRedistDir` `IGC_EnableDPEmulation` `NEOReadDebugKeys` `OverrideDefaultFP64Settings`）。ただし `SystemRoot` は索引に載せず大文字形の `SYSTEMROOT` に正規化した（Windows の慣例で同名の大小違いを `docs/envvars/SYSTEMROOT.md` が両方扱っており、本文はすでに `SYSTEMROOT` 名で作られている）。`PATH` と `Path` のように両綴りの本文が別にある名前は前版同様それぞれ載せている。`setup.py:204` の `names = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")` のように大文字形と小文字形を両方読む名前は、索引では大文字形に正規化した。
 - 追加した 436 件は本文が未作成の予定項目。削除項目が無いので `references/prune.md` の後片付けは不要。作成は `references/runner.md`（モード C）で 1 件 1 セッション行う。
+
 
 ## 環境変数
 
@@ -529,6 +536,7 @@
 - `FNX_BDECODE_SEED`
 - `FNX_BENCH_CTX`
 - `FNX_CAPTURE_AFTER`
+- `FNX_DRAFT`
 - `FNX_DRAFT_ADAPT`
 - `FNX_DRAFT_PEN`
 - `FNX_DRAFT_SAMPLE`
@@ -934,6 +942,7 @@
 - `STRATA_BIN`
 - `STRATA_BIND`
 - `STRATA_BIN_DIR`
+- `STRATA_BLOCKING_CONSOLE`
 - `STRATA_BROWSER_HEADLESS`
 - `STRATA_BUILD_COMMIT`
 - `STRATA_CACHE_DIR`
@@ -1159,6 +1168,7 @@
 - `STRATA_FIXTURE_UPSTREAM`
 - `STRATA_FOLLOW`
 - `STRATA_FOLLOW_LOGPOS`
+- `STRATA_FONT_CONFIG`
 - `STRATA_FORCE_AVX2`
 - `STRATA_FORCE_DEMO`
 - `STRATA_FORCE_ISA`
@@ -1204,6 +1214,7 @@
 - `STRATA_GFX1151_EXP8`
 - `STRATA_GFX12_CHUNK`
 - `STRATA_GFX12_DEFAULTS`
+- `STRATA_GFX12_RING`
 - `STRATA_GFX906_ATTN_QUERY_SWIZZLE`
 - `STRATA_GFX906_ATTN_QUERY_SWIZZLE_TRACE`
 - `STRATA_GFX906_ATTN_REDUCE12`
@@ -1556,6 +1567,8 @@
 - `STRATA_NUMA_SPLIT`
 - `STRATA_NVCC`
 - `STRATA_NVFP4_PREFETCH`
+- `STRATA_NV_CHUNK`
+- `STRATA_NV_KQ_DEFAULT`
 - `STRATA_OFFLINE`
 - `STRATA_OLD_GROUPED`
 - `STRATA_OLD_IQ_MMVQ`
@@ -1594,7 +1607,9 @@
 - `STRATA_PCIE_AUTO_SPLIT`
 - `STRATA_PCIE_BALANCE`
 - `STRATA_PCIE_FRAC_DEFAULT`
+- `STRATA_PCIE_K_RULE`
 - `STRATA_PCIE_MIN1`
+- `STRATA_PCIE_SHARE_MAX`
 - `STRATA_PCIE_START`
 - `STRATA_PEER_DIRECT`
 - `STRATA_PEER_HOT`
@@ -1626,6 +1641,7 @@
 - `STRATA_PF_OCC`
 - `STRATA_PF_OCC_W`
 - `STRATA_PF_OWN_CHECK`
+- `STRATA_PF_OWN_PROBE_OFF`
 - `STRATA_PF_PAD`
 - `STRATA_PF_PEER_COMPACT`
 - `STRATA_PF_PEER_F16`
@@ -1925,6 +1941,7 @@
 - `STRATA_SPLIT_ALLOW_UNTESTED`
 - `STRATA_SPLIT_CHUNK16K`
 - `STRATA_SPLIT_COVER_B`
+- `STRATA_SPLIT_EARLY_OFF`
 - `STRATA_SPLIT_ENGINE`
 - `STRATA_SPLIT_HEADROOM`
 - `STRATA_SPLIT_HEADROOM_TOL`
@@ -1960,6 +1977,8 @@
 - `STRATA_STATE_DIR`
 - `STRATA_STATE_HASH`
 - `STRATA_STATE_HASH_GDN`
+- `STRATA_STREAM_BEAT_MS`
+- `STRATA_STREAM_WRITE_TIMEOUT_S`
 - `STRATA_SYCL_A770_FAST`
 - `STRATA_SYCL_BIN`
 - `STRATA_SYCL_GEMM_NO_STAGE`

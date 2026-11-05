@@ -2,13 +2,13 @@
 
 この索引は Strata のユーザー向け CLI 入口と、そのコマンド階層ごとのオプション文書を列挙します。リンク先の文書は今後作成する予定の項目も含みます。したがって、現時点でリンク先の Markdown が未作成でも、この索引では予定パスとして掲載しています。
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 調査、commit 日 2026-11-02）。`git status --short --branch` は working tree clean（branch `main` = `origin/main`）、`git describe --tags` は `v0.2.10` で、annotated tag `v0.2.10`（tag オブジェクト `db0500a53119a349fa44497099d6e28a83ded34a`）の peel 先がこの commit そのものです（`git log v0.2.10..HEAD` は 0 件）。
+調査対象: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 調査、commit 日 2026-11-05）。`git status --short --branch` は working tree clean（branch `main` = `origin/main`）、`git describe --tags` は `v0.2.10-3-g9f7d977d` で、annotated tag `v0.2.10`（tag オブジェクト `db0500a53119a349fa44497099d6e28a83ded34a`）は祖先です（`git log v0.2.10..HEAD` は 3 件）。
 
 文書配置と調査基準は [`001_investigation.md`](001_investigation.md)、CLI 入口と配布形態は [`000_cli_tools.md`](000_cli_tools.md) を参照してください。各コマンドの概要ページは `docs/cli/<tool-id>/<command-path>/README.md`、オプション文書は `docs/cli/<tool-id>/<command-path>/<option-name>.md` に置きます。以下の「コマンド概要」とオプションのリンク先は、今後作成する予定のものも含みます。短縮名・同じ parser action の alias は正規の長い名前の文書にまとめます。
 
 ## 索引の対象境界
 
-- `strata-terminal`: `strata_cli/cli.py` の root parser と、そこから登録されるサブコマンド parser。`strata_cli/launch/cmd.py` の `launch` / `connect`、`strata_cli/update_cmd.py`、`strata_cli/tune_commands.py`、`strata_cli/drafting_cmd.py`、`strata_cli/monitor_commands.py` で定義される parser も同じ索引に入れます。POSIX/Windows の wrapper は同じ Python CLI を起動するため共通索引です。`strata components engines` / `use` / `remove` は `strata_cli/update_cmd.py:82-90` で登録され、`strata_cli/cli.py:140` を経由して `--json` / `--quiet` の後付けも受けます（v0.2.10 で追加されたコマンド）。
+- `strata-terminal`: `strata_cli/cli.py` の root parser と、そこから登録されるサブコマンド parser。`strata_cli/launch/cmd.py` の `launch` / `connect`、`strata_cli/update_cmd.py`、`strata_cli/tune_commands.py`、`strata_cli/drafting_cmd.py`、`strata_cli/monitor_commands.py` で定義される parser も同じ索引に入れます。POSIX/Windows の wrapper は同じ Python CLI を起動するため共通索引です。`strata components engines` / `use` / `remove` は `strata_cli/update_cmd.py` で登録され、`strata_cli/cli.py` が共通の `--json` / `--quiet` を追加します。`strata split-engine apply` は `strata_cli/split_cmd.py` の独立 parser として登録されています。
 - `strata-engine`: CMake で作られるネイティブ `strata` 推論エンジンの `src/program/generate.cpp` の引数 parser。`main` 冒頭の family switch で `--native` / `--model` が示す GGUF が `qwen35moe` のとき `src/qwen35` の別ファミリー実装へ移り、そこでの引数 parser は `strata-engine` 内の別 scope `qwen36/` にして索引に含めます。
 - `source-setup`: `setup.sh`、`START-HERE.bat`、`SETUP.bat`、`update.sh`、`UPDATE.bat` が委譲する `setup.py` のオプション。ラッパー独自の引数解釈はなく、同じオプション文書を共有します。Apple Silicon で `STRATA_CONTROL_INSTALL=1` を置かずに `setup.py` を実行すると `metal/setup_mac.py` へ委譲され、そちらは独自の parser を持つため `source-setup` 内の別 scope `mac/` にします。`--backend sycl` で呼ばれる `sycl/setup_intel.py` は独自の option parser を持たず `setup.py` の `main()` を argv を組み替えて再実行するので、`root/` の一覧を共用します。
 - `strata-vision`: `tools/vision/CMakeLists.txt` が作る画像読み取り CLI (`tools/vision/strata_vision.cpp`)。engine package に同梱される独立実行ファイルで、Terminal CLI のサブコマンドではありません。build option で `strata-vision-hip` / `strata-vision-sycl` などの別プログラム名・GPU 版になりますが、parser は同じなので scope は分けず、program 名の違いは `strata-vision/root/` の注記にまとめます。
@@ -16,6 +16,12 @@
 - `quick-benchmark`: `bench.sh` / `BENCH.bat` が委譲する `tools/strata_bench.py` のオプション。
 - GitHub Release installers `install.sh` / `install.ps1` は呼び出し時の CLI 引数を解釈せず、設定は環境変数で行うため、この索引に CLI option 文書はありません。環境変数文書側を参照してください。
 - `CMakeLists.txt` 等で生成される `*_test`、`*_parity`、`*_bench`、個別 probe・harness はビルド条件・個別用途の開発/検証プログラムです。製品 CLI のサブコマンドとして一括索引化せず、対象に含める場合は各プログラムの利用者・build target・parser を確認して別の tool-id として追加します。v0.2.9 → v0.2.10（`c62d5e3a..ffa80d73`）で増えた `add_executable`（root 250 → 277 件、`sycl/CMakeLists.txt` 32 → 39 件）はすべて `*_test` / `*_parity` / `*_bench` / harness / probe で、既存 tool-id の対象は増えていません。新規 `src/split/CMakeLists.txt`（5 件）の製品実行ファイル `strata-split-2/3/4` だけ、上のとおり `strata-split` tool-id として追加しました（root の `add_executable` は 277 件）。engine package に同梱される `strata-vision` / `strata-vision-hip` / `strata-vision-sycl` (`tools/vision/CMakeLists.txt`) は利用者 CLI として `strata-vision` tool-id で追加しました。`packaging/monitor_bundle.py`、`packaging/feed_tool.py`、`packaging/package_*.py`、`docker/*.sh` など、配布物を作る helper は利用者向け CLI ではないため対象外です。
+
+### 索引更新 2026-11-06（v0.2.10 `ffa80d73…` → HEAD `9f7d977d…`）
+
+- HEAD の `strata_cli.cli.parser()` を import し、parser のコマンド/option と索引リンクを突合しました。`strata split-engine apply` を追加し、`strata drafting plan` と `fetch` の `--engines-unloading` を反映しました。
+- C/C++/Python 等の option inventory を `python3 .agents/skills/strata-investigate/scripts/cli-grammar.py --revision 9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e` で再生成しました。1145 option 文字列、9056 出現箇所、598 ファイルです。
+- GitHub Release は引き続き v0.2.10（2026-11-02 公開）です。checkout HEAD は tag より 3 commit 先のため、Release asset を HEAD の成果物として扱っていません。
 
 ### 索引更新 2026-11-03（v0.2.9 索引 `c62d5e3a…` → v0.2.10 `ffa80d73…`）
 
@@ -417,6 +423,7 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [`--config`](strata-terminal/drafting/plan/--config.md)
 - [`--data-dir`](strata-terminal/drafting/plan/--data-dir.md)
+- [`--engines-unloading`](strata-terminal/drafting/plan/--engines-unloading.md)
 - [`--family`](strata-terminal/drafting/plan/--family.md)
 - [`--help`（alias: `-h`）](strata-terminal/drafting/plan/--help.md)
 - [`--mode`](strata-terminal/drafting/plan/--mode.md)
@@ -429,6 +436,7 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [`--config`](strata-terminal/drafting/fetch/--config.md)
 - [`--data-dir`](strata-terminal/drafting/fetch/--data-dir.md)
+- [`--engines-unloading`](strata-terminal/drafting/fetch/--engines-unloading.md)
 - [`--family`](strata-terminal/drafting/fetch/--family.md)
 - [`--help`（alias: `-h`）](strata-terminal/drafting/fetch/--help.md)
 - [`--if-needed`](strata-terminal/drafting/fetch/--if-needed.md)
@@ -1219,6 +1227,21 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 - [`--json`](strata-terminal/code/sessions/--json.md)
 - [`--output`](strata-terminal/code/sessions/--output.md)
 - [`--quiet`](strata-terminal/code/sessions/--quiet.md)
+
+### `strata split-engine` (split-engine)
+
+- [コマンド概要](strata-terminal/split-engine/README.md)
+
+- [`--help`（alias: `-h`）](strata-terminal/split-engine/--help.md)
+
+### `strata split-engine apply` (split-engine/apply)
+
+- [コマンド概要](strata-terminal/split-engine/apply/README.md)
+
+- [`--config`](strata-terminal/split-engine/apply/--config.md)
+- [`--help`（alias: `-h`）](strata-terminal/split-engine/apply/--help.md)
+- [`--out`](strata-terminal/split-engine/apply/--out.md)
+- [`--output`](strata-terminal/split-engine/apply/--output.md)
 
 ## `strata-engine`
 
