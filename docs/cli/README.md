@@ -2,9 +2,15 @@
 
 この索引は Strata のユーザー向け CLI 入口と、そのコマンド階層ごとのオプション文書を列挙します。リンク先の文書は今後作成する予定の項目も含みます。したがって、現時点でリンク先の Markdown が未作成でも、この索引では予定パスとして掲載しています。
 
-調査対象: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 調査、commit 日 2026-11-05）。`git status --short --branch` は working tree clean（branch `main` = `origin/main`）、`git describe --tags` は `v0.2.10-3-g9f7d977d` で、annotated tag `v0.2.10`（tag オブジェクト `db0500a53119a349fa44497099d6e28a83ded34a`）は祖先です（`git log v0.2.10..HEAD` は 3 件）。
+調査対象: Strata commit `146df3c468739147f520ac3816de806f71232571`（2026-11-07 調査、commit 日 2026-11-07）。`git status --short --branch` は working tree clean（branch `main` = `origin/main`）、`git describe --tags` は `v0.2.12` で、tag は HEAD と同一 commit です。
 
 文書配置と調査基準は [`001_investigation.md`](001_investigation.md)、CLI 入口と配布形態は [`000_cli_tools.md`](000_cli_tools.md) を参照してください。各コマンドの概要ページは `docs/cli/<tool-id>/<command-path>/README.md`、オプション文書は `docs/cli/<tool-id>/<command-path>/<option-name>.md` に置きます。以下の「コマンド概要」とオプションのリンク先は、今後作成する予定のものも含みます。短縮名・同じ parser action の alias は正規の長い名前の文書にまとめます。
+
+### 索引更新 2026-11-07（v0.2.12 `146df3c4…`）
+
+- 現行 `strata_cli` parser と索引のコマンド階層・option を確認しました。利用者向け parser の追加・削除・改名はありません。
+- option inventory を `python3 .agents/skills/strata-investigate/scripts/cli-grammar.py --revision 146df3c468739147f520ac3816de806f71232571` で再生成しました。1164 option 文字列、9266 出現箇所、608 ファイルです。前回 inventory からの増分 19 文字列は `tools/force_check.py`、`packaging/feed_tool.py`、CPU / CUDA / Metal の bench・test 用 parser に属し、この索引の利用者向け CLI scope には入りません。
+- Release API で v0.2.12（2026-11-07 公開）を確認しました。配布物の詳細は [`000_cli_tools.md`](000_cli_tools.md) に記載しています。
 
 ## 索引の対象境界
 

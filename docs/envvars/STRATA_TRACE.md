@@ -1,42 +1,48 @@
 # `STRATA_TRACE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。外部ライブラリの環境変数は対象外。
 
 ## 役割
 
-Strata の engine が起動時の GPU 空きメモリと serve リクエストの進行状況を stderr に記録する診断用スイッチです。CUDA/HIP 系の `src` 実装と SYCL 実装の両方に読み取り箇所があります。値は計算設定として使われず、ログ出力と GPU メモリ情報の取得を有効にします。
+Strata の起動・prompt 読み込み・serve/batch 処理の進行状況や所要時間、GPU 空きメモリなどを stderr に出す診断用スイッチです。通常の計算経路や CLI 設定を選ぶ変数ではありません。ただし CUDA/HIP 系の `mem_mark()` では値の先頭が `2` の場合、各メモリ計測地点で追加の device 同期とエラー状態の出力を行います。
+
+読み取りは `src/program/generate.cpp` と `src/prefill/prefill.cpp`、および SYCL 版の同名ソースにあります。設定を CLI 引数で上書きする処理や、Strata がこの値を子プロセスへ渡す処理は見つかりませんでした。`STRATA_TRACE_ADAPT` は別の環境変数であり、適応層専用ログの切替です。
 
 ## 値と判定
 
-すべての読み取り箇所で、環境変数が未設定かどうかだけを判定します。設定値の数値変換、文字列比較、先頭文字比較はありません。
-
-| 状態 | 判定 |
+| 状態・値 | Strata の判定 |
 |---|---|
-| 未設定 | 無効 |
-| 空文字を含む、何らかの値が設定済み | 有効 |
-| `0`、`false` などの文字列 | 有効 |
+| 未設定 | 対象ログを出さない。`mem_mark()` は何もしない。 |
+| 空文字 | 設定済みとして扱い、通常の trace ログを有効にする。 |
+| 任意の非空文字列（例: `0`, `1`, `true`, `false`, `abc`） | 文字列全体の parse や数値検証はなく、存在するだけで通常の trace ログを有効にする。 |
+| 先頭文字が `2`（例: `2`, `2abc`） | 同様にログを有効にし、CUDA/HIP 系 `mem_mark()` では追加同期と device 状態ログも有効にする。 |
 
-ただし読み取り時期は箇所ごとに異なります。起動時メモリ記録の判定は `mem_mark()` 内の `static const bool` に保存され、最初の呼び出し後はプロセス中に環境を変えても変わりません。serve の詳細トレースは serve ループの初期化時に一度読み、その engine の全リクエストで同じ値を使います。batched prompt の chunk ログは chunk ごとに `getenv()` を呼ぶため、そのループ中も判定し直します。
+SYCL 版も設定の有無だけでメモリ trace を有効にしますが、同版の `mem_mark()` に値 `2` による追加同期分岐はありません。参照: `src/program/generate.cpp:1951-1967`, `sycl/src/program/generate.cpp:1322-1334`。
 
 ## 有効になる条件
 
-各出力がある処理経路に到達する必要があります。起動時の VRAM 記録は `mem_mark()` の呼び出し地点で、モデルや cache などの初期化段階を記録します。詳細なリクエストログは serve 経路で、prompt chunk のログは batched prefill の chunk ループで出ます。これらの条件に当たらない実行経路では、設定しても対応ログは出ません。
+- **起動時のメモリ計測**: `mem_mark()` が呼ばれる起動経路で有効です。CUDA/HIP 系では重み、session、expert cache、profile fill、prompt path 等の確保後に呼び出され、各地点の MiB 空き容量を出力します（`src/program/generate.cpp:5168,5190,6724,7247,7805,8335,8452,9023,9145,11218,11285,11777,20034,20108,20384,20433`）。SYCL 版にも対応する計測地点があります（`sycl/src/program/generate.cpp:4703,5053,5245,5662,5785,7410,7763,13082,13121`）。
+- **prompt 処理**: CUDA/HIP 系では batched prompt の各 chunk で stage と経過時間を記録し、routed stream が有効な場合はコピー数と未使用 ring entry 数を追加出力します（`src/prefill/prefill.cpp:3464-3479,6236-6247`）。SYCL 版も各 prompt chunk を記録します（`sycl/src/prefill/prefill.cpp:2548-2551`）。routed stream の集計ログは `rs_on` かつ issuer thread の join 時だけです。
+- **serve/batch 処理**: CUDA/HIP 系は serve ループで一度環境を確認して trace 関数を作り、要求処理の区間、prompt read、cache slot lend、batch decode、admission の時間などを記録します（`src/program/generate.cpp:13760-13770,15335-15348,17086-17095,17751-17765,17940-17953,19702-19715`）。SYCL 版も serve ループで設定有無を取得し、slot lend、batch decode、read のログを出します（`sycl/src/program/generate.cpp:9032-9039,10952-10959,11040-11052,11145-11152`）。
+- **個別の補助ログ**: HIP の大きな prompt chunk 起動 probe が通った時のログ、file tier の再判定時の RAM 状態、prompt buffer サイズも設定有無で出力されます（`src/program/generate.cpp:1932-1947,10495-10508,20033-20044`）。
+- **checkpoint の詳細計時**: CUDA/HIP 系の serve 実装で checkpoint 処理が通る際、sync/save/eviction の時間を記録します。checkpoint が無効、またはその経路を通らない場合は該当ログはありません（`src/program/generate.cpp:12331-12338,12415-12430,12431-12460,12507-12512`）。
 
-`STRATA_TRACE_ADAPT` は adaptive 層の別診断スイッチであり、`STRATA_TRACE` の値では制御されません。文書と設計資料を検索した範囲では、`docs/` に `STRATA_TRACE` の説明は見つかりませんでした。性能向上や出力の正確性を変えるという根拠はありません。
+この変数は診断出力を追加するもので、ログが出ること自体が機能の実行条件を変えるわけではありません。例外は値先頭 `2` の CUDA/HIP `mem_mark()` 同期です。OS や model 状態による一般的な有効条件はなく、上記のコード経路が実行されるかどうかで各ログの有無が決まります。
 
 ## 実行時の詳細
 
-`mem_mark(where)` は有効時に GPU の空きメモリを取得し、`strata trace: <MiB> MiB free after <where>` の形式で stderr に記録します。CUDA/HIP 系では `cudaMemGetInfo()`、SYCL 系では SYCL device の memory info API を呼びます。ソース中の呼び出し地点は、重み arena・重み・session・expert cache・profile fill・head/prompt path・verifier などの初期化後です。これは状態を記録するもので、空きメモリの量を変更しません。
+`mem_mark()` は `STRATA_TRACE` の `getenv()` 結果を `static` 変数に保持します。設定されていれば `cudaMemGetInfo`（SYCL は device memory info）で空き容量を取得し、`strata trace: <MiB> MiB free after <地点>` を stderr に出します。CUDA/HIP 系で値の先頭文字が `2` なら、さらに `cudaDeviceSynchronize()` と `cudaGetLastError()` を呼び、`strata trace: device ok/ERROR after ... (sync: ..., last error: ...)` を出力します。この同期結果による明示的な終了・fallback 分岐はありませんが、同期自体は追加の診断処理です（`src/program/generate.cpp:1951-1967`）。
 
-serve のトレースは各リクエストの開始時に `strata trace: <event> <a> <b>` を記録し、prompt 開始・完了、位置情報の構築と device idle、window の開始などを追います。値を渡さない event では引数の既定値 `-1 -1` が表示されます。追加で lent/refilled slot 数、prompt chunk と decode の所要時間、読んだ token 数などを記録し、条件が合えば message boundary checkpoint の token 数と tail 数も記録します。CUDA/HIP 系と SYCL 系のこの helper は stderr を flush します。
+その他の読み取りのタイミングは一律ではありません。serve trace は serve ループに入る時点で bool にし、そのループ中の各 log site で使います（`src/program/generate.cpp:13760-13769`）。prompt chunk のログや routed-stream 集計、HIP launch-probe 成功ログ、file-tier 再判定ログ、prompt buffer summary はそれぞれの処理時に `getenv()` を呼びます（`src/prefill/prefill.cpp:3472,6242`; `src/program/generate.cpp:1940,10503,20035`）。checkpoint trace は該当 serve 実行内で bool にします（`src/program/generate.cpp:12331-12338`）。したがって、プロセス開始時に一度だけ全用途の値を読む実装ではありません。通常の OS 環境変数はプロセス外から実行中に書き換えられないため、実用上は起動前に設定します。
 
-batched prefill は各 prompt chunk の先頭で `strata trace: prompt chunk <c0> of <n>` を stderr に出して flush します。これらの診断ログは結果の生成・request 処理分岐を切り替えません。
+無効値による parse error、警告、終了経路はありません。追加出力先は stderr で、trace を設定しない場合も通常の進捗表示や処理エラー出力は別途行われます。serve loop の trace 行に steady-clock の時刻を付ける仕様は Strata docs に記載されています（`docs/DETAILS.md:1614`）。同資料は routed-stream の chunk ごとのコピー/破棄件数（`docs/DETAILS.md:1141-1144`）、`docs/BATCHING.md:126` は admission の段階別時間を説明しており、いずれも上記実装と一致します。
 
 ## 根拠
 
-- `src/program/generate.cpp:1305-1312` — `mem_mark()` の設定有無判定、CUDA memory info、出力形式。起動中の呼び出し箇所は同ファイルの `3010-3026`, `4271`, `4502`, `4776`, `5118`, `5198`, `5573`, `5695`, `7318`, `7601`, `12792`, `12810`。
-- `sycl/src/program/generate.cpp:1251-1263` — SYCL `mem_mark()` の判定、memory info、出力。
-- `src/program/generate.cpp:8911-8916` — serve リクエスト用の判定と trace helper。
-- `src/program/generate.cpp:10496`, `10715`, `10763-10764`, `10815-10819`, `10971`, `10917-10919`, `11055-11056`, `11089-11090`, `11097`, `11897` — request/prompt/window、slot、chunk、checkpoint のログ呼び出し。
-- `sycl/src/program/generate.cpp:8359-8365`, `9812`, `10023-10024`, `10126`, `10220-10222`, `10260`, `10314-10316`, `10348-10350`, `10356`, `11179` — SYCL 側の対応箇所。
-- `src/prefill/prefill.cpp:2133-2136` および `sycl/src/prefill/prefill.cpp:2219-2223` — batched prompt の chunk ごとの読み取り、出力、flush。
+- 値の読み取り、cache、追加 device 同期: `src/program/generate.cpp:1951-1967`; SYCL: `sycl/src/program/generate.cpp:1322-1334`。
+- prompt chunk と routed stream: `src/prefill/prefill.cpp:3464-3479,6236-6247`; SYCL: `sycl/src/prefill/prefill.cpp:2548-2551`。
+- serve trace bool と timestamped trace helper: `src/program/generate.cpp:13760-13770`。
+- admission / checkpoint / read / lend trace: `src/program/generate.cpp:12331-12338,12415-12430,12431-12460,12507-12512,15335-15348,17086-17095,17751-17765,17940-17953,19702-19715`。
+- 起動 probe / file tier / prompt buffers: `src/program/generate.cpp:1932-1947,10495-10508,20033-20044`。
+- SYCL serve trace: `sycl/src/program/generate.cpp:9032-9039,10952-10959,11040-11052,11145-11152`。
+- Strata の記述との照合: `docs/DETAILS.md:1141-1144,1614`; `docs/BATCHING.md:126`。
