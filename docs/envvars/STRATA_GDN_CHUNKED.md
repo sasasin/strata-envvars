@@ -1,60 +1,67 @@
 # `STRATA_GDN_CHUNKED`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。外部ライブラリ・GPU driver の環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。
 
 ## 役割
 
-Gated DeltaNet (GDN) の prompt recurrence を、token ごとの逐次 kernel から複数 token の chunk をまとめる経路へ切り替える opt-in 変数です。CUDA では FP32 の chunked recurrence、HIP では gfx11/gfx12 の WMMA recurrence を選びます。どちらも通常の GDN recurrence を置き換える計算経路で、CUDA と HIP で値の精度・適用条件・chunk 長が異なります。
+プロンプト中の GDN（gated DeltaNet）再帰計算を chunked scan に切り替える指定です。CUDA と HIP では別実装で、切替値、最小入力長、GPU 条件が異なります。chunked 経路は通常の逐次再帰と演算順序・丸めが異なるため、出力値も変わり得ます。
 
-Strata 所有コードにある実際の環境読み取りは `src/prefill/kernels.cu` の CUDA/HIP recurrence dispatcher と、HIP gfx12 の convolution/recurrence 融合 helper の計 4 箇所です（`src/prefill/kernels.cu:1247,2163-2167,2883-2889,2982-2986`）。`serve/server.py` は特定の構成で子 engine に値を設定しますが、値の自動設定は明示値を上書きしません（`serve/server.py:3728-3745,3747-3764`）。
+CUDA では 32 token 単位の FP32 chunked recurrence を選び、通常経路が使える環境でも opt-in で優先します。HIP では gfx11/gfx12 の matrix core を使う 16 token WMMA recurrence を選びます。gfx12 では未設定時に長い prompt chunk だけを自動選択する経路もあります。根拠: `src/prefill/kernels.cu:919-934,1803-1839,2131-2168,2969-2985,3070-3150`。
 
 ## 値と判定
 
-カーネル側は `std::atoi()` で数値変換し、CUDA/HIP dispatcher では変換結果が 0 かどうかを見ます。文字列全体の数値検証はなく、先頭の空白・符号と数値部分を読み、数値以降の文字は判定に使いません。したがって未設定または空文字、`true`、数値として読めない文字列は 0 になり、`1`, `-1`, `1tail` などは非 0 です。CUDA の追加 SM 条件では変換値が 2 以上かを別に判定します。値の範囲検証や clamp はありません（`src/prefill/kernels.cu:1247,2163-2167,2887,2985`）。
+値は整数として `atoi()` で読みます（HIP gfx12 の自動閾値は別変数 `STRATA_GDN_CHUNKED_MIN` を `atoll()` で読みます）。数値文字列全体の検証はありません。`atoi()` が読める先頭の整数部分で判定されるため、たとえば `1x` は 1、`2x` は 2、整数に変換できない文字列は 0 相当です。空文字は CUDA では 0 相当で無効、HIP では未設定相当（-1）です。値の大文字小文字は関係しません。
 
-| 値（`atoi` の結果） | CUDA recurrence | HIP gfx11/gfx12 recurrence | HIP gfx12 融合 |
-|---|---|---|---|
-| 未設定、空文字、0、非数値文字列 | 無効 | 無効 | 無効 |
-| 非 0（例: `1`, `-1`） | 有効候補 | 有効候補 | 有効候補 |
-| 2 以上 | 有効候補。128 SM 条件を省略 | 有効候補。CUDA の SM 条件はない | 有効候補 |
+| ビルド・値 | 判定と動作 |
+|---|---|
+| CUDA、unset | 無効。従来の CUDA recurrence を使う。 |
+| CUDA、`atoi(value) == 0` | 無効。`0`、空文字、数値で始まらない文字列など。 |
+| CUDA、`atoi(value) != 0` | chunked 経路を候補にする。負数も有効扱い。prompt chunk が 128 token 未満なら使わない。 |
+| CUDA、`atoi(value) >= 2` | 上記に加え、128 SM 以上という条件を免除する。2 未満の非ゼロ値はこの条件を免除しない。 |
+| HIP gfx11、unset / 空文字 | 未設定扱い（-1）となり、chunked 経路は無効。 |
+| HIP gfx11、`atoi(value) == 0` | 無効。 |
+| HIP gfx11、`atoi(value) != 0` | WMMA 経路を候補にする。gfx11 対応 arch、64 token 以上、出力 stride が 8 の倍数などを満たすと使用する。2 に CUDA のような特別な意味はない。 |
+| HIP gfx12、unset / 空文字 | `STRATA_GFX12_DEFAULTS` が無効でなければ、`STRATA_GDN_CHUNKED_MIN` 以上の長さで自動選択する。 |
+| HIP gfx12、`atoi(value) == 0` | 明示的に無効。自動選択もしない。 |
+| HIP gfx12、`atoi(value) != 0` | 64 token 以上から明示的に有効候補。長さ自動閾値は適用しない。 |
 
-これは経路を試す条件であり、その値だけで kernel が必ず起動することを意味しません。CUDA では別の `STRATA_GDN_TC` 経路が先に選ばれる場合もあります。HIP gfx12 では融合経路の可否と通常 recurrence の可否を別々に評価します（`src/prefill/kernels.cu:1247-1251,2163-2181,2982-3044`）。
+CUDA の 128 token 最小値と `=2` の SM 条件緩和は `src/prefill/kernels.cu:1231-1252,934,3076-3137`、HIP の値解釈と 64 token・arch 条件は `src/prefill/kernels.cu:1832-1839,2133-2151,2173-2194,2975-2985` にあります。`STRATA_GDN_CHUNKED_MIN` の既定値は 30,000 で、空または未設定なら既定値、整数として変換できない文字列は 0 相当になります。負値にも clamp はありません。`STRATA_GFX12_DEFAULTS` は先頭文字が `0` のときだけ gfx12 自動選択を止め、それ以外（空文字を含む）は許可します。根拠: `src/prefill/kernels.cu:1836-1839`。
 
 ## 有効になる条件
 
 ### CUDA
 
-- HIP ではないビルドの通常 recurrence dispatcher が対象です。値が非 0 で、`T >= 128` のとき chunked FP32 recurrence を試します（`src/prefill/kernels.cu:934-935,2982-2986,3039-3043`）。
-- device の compute capability major が 8 以上、chunk scan に必要な opt-in shared memory があり、scratch を確保できる必要があります。通常は scan 用の 128 block を一度に置ける 128 SM も必要です。`atoi(value) >= 2` のときだけこの SM 数条件を飛ばします。compute capability と shared memory 条件は `=2` でも残ります（`src/prefill/kernels.cu:1231-1253`）。
-- 条件を満たさない、prompt が短い、または scratch が取れない場合はこの経路を採らず、後続の通常 kernel に進みます。通常 dispatch では `STRATA_GDN_TC` が有効でその経路が成功すれば TC が優先され、chunked は選ばれません（`src/prefill/kernels.cu:3026-3055`）。
-- CUDA の chunk は 32 token 単位です。数値演算の実装は chunk prep と scan の FP32 kernel で、通常 recurrence とは演算順序が異なります（`src/prefill/kernels.cu:927-944,1231-1277`）。
+- GDN recurrence の通常 dispatch（`src/prefill/kernels.cu:3070-3150`）で、`STRATA_GDN_CHUNKED` が非ゼロとして parse されること。通常の自動選択では、先に有効な `STRATA_GDN_TC` 経路が選ばれると chunked recurrence は呼ばれません。
+- 入力長 `T >= 128`。
+- GPU compute capability 8 以上、chunk scan に必要な shared memory があり、scratch allocation が成功すること。
+- 既定では scan の 128 block が一度に載る SM 数（実装の `HK * (S / GDV)`）を満たすこと。`STRATA_GDN_CHUNKED` の `atoi()` 結果が 2 以上なら SM 数条件だけを省略します。architecture と shared memory の条件は残ります。
+- 条件に合わない場合、通常の自動 dispatch は key-head、pipelined columns、または columns recurrence に fallback します。`STRATA_GDN_PIPELINE` は fallback kernel の選択に関係します。
 
 ### HIP
 
-- `STRATA_GDN_CHUNKED` が非 0 で、recurrence の `variant` が 0 または 1、`STRATA_GDN_REC_HEADS` が未設定であるとき WMMA 経路を試します。`STRATA_GDN_REC_HEADS` は設定有無で serial 経路を選び、値が空でも設定されていれば WMMA を止めます（`src/prefill/kernels.cu:2882-2891`）。
-- WMMA 経路は gfx11 WMMA または gfx12 WMMA device に限られ、`T >= 64`、出力 stride `ld16` が 8 の倍数である必要があります。その他の device、短い入力、stride 不適合なら `false` を返し、後続の recurrence kernel に進みます。gfx11 の WMMA intrinsic は対応する gfx11 device pass で定義されます（`src/prefill/kernels.cu:1814-1828,2121-2155`）。
-- HIP の chunk は 16 token です。WMMA の行列積は FP16 operand、FP32 accumulation で実行されます。通常の FP32 recurrence と丸め結果が異なり得ます（`src/prefill/kernels.cu:1803-1813,1817-1822`）。
-- gfx12 では prefill 側が先に畳み込み込み経路を試します。この融合は `STRATA_GDN_CHUNKED` が非 0、`T >= 64`、gfx12、stride 条件適合で、かつ `STRATA_GDN_FUSE` が未設定または `atoi` 結果非 0 のときに限られます。`STRATA_GDN_FUSE=0`（または `atoi` 結果 0）は融合を止めますが、その後の通常 recurrence で WMMA chunked を選ぶ条件は別なので、chunked recurrence 自体を止める設定ではありません。融合不可の場合は通常の `gdn_conv()` と recurrence 呼出しに進みます（`src/prefill/prefill.cpp:3817-3831`, `src/prefill/kernels.cu:2157-2181,3090-3099`）。
+- `gdn_recurrence_impl()` の variant 0 または 1 で、`STRATA_GDN_REC_HEADS` が設定されていないこと。state-only recurrence も同じ dispatch を通ります。根拠: `src/prefill/kernels.cu:2971-2985,3194-3199`。
+- WMMA 対応の gfx11 または gfx12 device。gfx11 の対象は gfx1100/1101/1102/1103/1150/1151、gfx12 は gfx12 WMMA 判定を満たす device です。実行中に device が変わる layer-split worker では、arch 判定は thread ごとの現在 device に応じて更新されます。根拠: `src/prefill/kernels.cu:1814-1816,2136-2151`。
+- `T >= 64`、`ld16` が 8 の倍数。gfx12 ではさらに `T >= 64` を満たし、未設定時は `STRATA_GDN_CHUNKED_MIN` と `STRATA_GFX12_DEFAULTS` の gate も満たすこと。
+- HIP gfx12 では `STRATA_GDN_FUSE` が未設定または非ゼロなら、chunked path が選ばれたとき conv と recurrence をまとめる経路も使えます。`STRATA_GDN_FUSE=0` では融合を止め、conv と recurrence を別々に呼びます。融合が使われない場合や GPU / 長さ / stride が条件外の場合、呼び出し元は従来の `gdn_conv()` と `gdn_recurrence()` に戻ります。根拠: `src/prefill/kernels.cu:2170-2210`, `src/prefill/prefill.cpp:4240-4254`。
 
-### server.py による子 engine への設定
-
-`child_env()` はまず親プロセス環境をコピーし、config の `env` を上書き適用した後 `gdn_stack_env()` を呼びます。Linux 上の `qwen4exp`、HIP backend で、表示対象の全 AMD device が `gfx12` であることを検出できた場合、`setdefault` で `STRATA_GDN_CHUNKED=1` を追加します。ユーザー環境または config の `env` に同名キーがあればその値を保持します。対象構成外、device arch が不明、あるいは gfx12 以外を含む場合、この helper は値を自動追加しません（`serve/server.py:3728-3745,3747-3764`）。これは server の子プロセス環境設定であり、engine 側で gfx11 も対象となる HIP 経路を gfx12 専用に制限するものではありません。
+サーバーの `serve/server.py` は Linux 上の `qwen4exp` HIP 設定で、可視 GPU がすべて gfx12 の場合、子プロセス環境に `STRATA_GDN_CHUNKED=1` を `setdefault` します。従って明示値や config の `env` が優先し、サーバー経由では未設定時の gfx12 長さ自動選択ではなく、64 token 以上の明示 opt-in として動きます。gfx11、CUDA、SYCL、Metal、Vulkan にはこの変数を自動設定しません。`child_env()` は親環境を複製して config の env を反映し、その後この helper を呼びます。根拠: `serve/server.py:4312-4341,4344-4361`。
 
 ## 実行時の詳細
 
-CUDA dispatcher の `chunked`、HIP dispatcher の `chunked`、HIP gfx12 融合 helper の `on` は、それぞれ関数内 `static const` に初回評価結果を保持します。`gdn_rec_chunked()` 内の `=2` 用 SM bypass も別の `static const` です。そのため各読み取り箇所で最初に評価された後、プロセス内で環境を変更してもその値は再評価されません。HIP の fused helper と通常 recurrence dispatcher は別々に初期化されるため、それぞれが最初に呼ばれた時点の判定を保持します（`src/prefill/kernels.cu:1247,2163-2167,2883-2889,2982-2986`）。
+CUDA は recurrence dispatch の初回評価時に `STRATA_GDN_CHUNKED` を static bool に保存します。chunked 経路に実際に入った場合、SM 数 bypass の値も別の static bool に保存されます。従って最初の評価後にプロセス環境を変更しても、このプロセスでは再評価されません。chunked recurrence は device ごとの scratch を初回利用時に確保し、以後保持します。根拠: `src/prefill/kernels.cu:1212-1224,1244-1249,3076-3078`。
 
-CUDA の chunked 経路が eligibility check や scratch allocation に失敗した場合、その呼出しは kernel を起動せず通常 dispatch に戻ります。`gdn_chunk_why()` の理由文字列は probe がある場合の診断情報用です。HIP で gfx11/gfx12 判定や入力長条件が合わない場合も WMMA helper が false を返し、呼出し元が通常経路を続けます。通常利用時に「環境変数を設定したが不適格だった」という専用警告は確認できません（`src/prefill/kernels.cu:1231-1253,1370-1393,2121-2155,2887-2891,3039-3055`）。
+HIP は `gdn_chunked_env()` の parse 結果を static に保持します。recurrence dispatch の chunked 判定も static で、gfx12 の長さ閾値と `STRATA_GFX12_DEFAULTS` も初回評価後に保持します。HIP の WMMA 経路は 16 token chunk で計算し、gfx11 では FP16 operand と FP32 accumulation を使います。gfx12 は同じ WMMA family の専用 kernel を呼びます。通常の CUDA recurrence は 32 token chunk scan を使い、scan の準備・計算 kernel を起動します。根拠: `src/prefill/kernels.cu:1832-1839,2131-2168,2195-2209,3076-3078`。
 
-kernel launch 後の `check()` が CUDA/HIP runtime error を検出すると、stderr に `prefill <処理名>: <runtime error>` を出して exit status 1 で終了します。これは fallback 可能な事前 eligibility 不成立とは異なる経路です（`src/prefill/kernels.cu:102-105,2887-2890,2157-2197,3071`）。
+CUDA で適格条件を満たさなければ通常 dispatch が fallback するため、利用者向けの「chunked を使えなかった」ログはありません。gfx12 HIP の未設定かつ既定が許可される場合、Strata は起動時に `strata: RDNA4 (gfx12): prompt chunks of 30,000+ tokens use the chunked GDN scan (STRATA_GDN_CHUNKED=0 turns it off)` を stderr に出します。これは `apply_arch_defaults()` の診断で、実際にその長さの prompt が実行された証明ではありません。適用箇所は engine 起動時の `src/program/generate.cpp:3790-3807` です。選択後に kernel launch error があれば `prefill gdn_recurrence (chunked, WMMA): ...` または `prefill gdn_conv_recurrence_fused: ...` 形式を stderr に出し、`exit(1)` します。通常 CUDA の chunked dispatch は条件不足なら fallback し、失敗理由を利用者ログには出しません。根拠: `src/prefill/kernels.cu:102-105,2981-2983,3152-3164,2209`。
+
+## 文書との照合
+
+`docs/DETAILS.md:1079` は CUDA の 128 SM 条件と `=2` の例外、HIP gfx11 対応、chunk 長と丸めの違いを説明しています。`docs/AMD_HIP.md:307-319` は gfx11 を opt-in とし、64 token 条件、出力 stride と `STRATA_GDN_REC_HEADS` による fallback を記載しています。対象 commit のコードには gfx12 の追加経路があり、未設定なら gfx12 で `STRATA_GFX12_DEFAULTS` と `STRATA_GDN_CHUNKED_MIN` に従った長さ gate が有効です（`src/prefill/kernels.cu:1823-1839,2150-2151`; 起動ログは `src/core/arch_defaults.cpp:270-273`）。また gfx12 サーバー設定は値 `1` を子プロセスに追加するため、エンジン単体の未設定時の gate とは異なります（`serve/server.py:4325-4341`）。
 
 ## 根拠
 
-- `src/prefill/kernels.cu:1231-1253,1272-1277` — CUDA chunked kernel の device 条件、`=2` の SM 数 bypass、scratch、launch。
-- `src/prefill/kernels.cu:927-944,2982-2986,3026-3055` — CUDA の chunk 長、env 判定、TC 優先と fallback。
-- `src/prefill/kernels.cu:1814-1828,2121-2155,2882-2891` — HIP gfx11/gfx12 WMMA 対象、64 token 下限、stride と recurrence dispatch。
-- `src/prefill/kernels.cu:2157-2197` — gfx12 融合条件、`STRATA_GDN_FUSE` の関係、kernel launch check。
-- `src/prefill/prefill.cpp:3817-3831` — GDN prefill 呼出し順と融合失敗後の通常 convolution/recurrence。
-- `src/prefill/kernels.cu:102-105,3071` — runtime error の stderr と終了処理。
-- `serve/server.py:3728-3745,3747-3764` — server が gfx12 HIP 条件で子 engine 環境へ既定値を加え、親環境/config の値を保持する処理。
-- 現行 `docs/DETAILS.md:1029,1436` は CUDA と gfx11 の記述に留まり、現行ソースで確認できる gfx12 WMMA 経路と server 側の gfx12 設定は列挙していません。実装条件の根拠には上記ソースを用いました。
+- 値 parse、gfx11/gfx12 の閾値・自動選択: `src/prefill/kernels.cu:1814-1839,2131-2168`。
+- gfx12 融合と fallback の呼び出し: `src/prefill/kernels.cu:2170-2210`, `src/prefill/prefill.cpp:4240-4254`。
+- CUDA parse、GPU eligibility、fallback: `src/prefill/kernels.cu:1212-1252,3070-3164`。
+- gfx12 起動ログと arch defaults 呼び出し: `src/core/arch_defaults.cpp:231-273`, `src/program/generate.cpp:3790-3807`。
+- server の子環境設定: `serve/server.py:4312-4361`。
