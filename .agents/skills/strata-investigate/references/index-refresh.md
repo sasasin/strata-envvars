@@ -5,7 +5,7 @@
 
 | 索引 | 更新手順の本文（正） | skill 側の補足 |
 | --- | --- | --- |
-| `docs/envvars/000_envvers.md` | `extraction-recipes.md` §6（生成範囲。索引ファイル側には書かない） | 下記 §1 |
+| `docs/envvars/000_envvers.md` | `extraction-recipes.md` §5（生成範囲。索引ファイル側には書かない） | 下記 §1 |
 | `docs/cli/000_cli_tools.md` | 下記 §2（索引ファイル側には手順を書かない） | `extraction-recipes.md` §2・§3 |
 | `docs/cli/README.md` | 下記 §3（索引ファイル側には手順を書かない） | `extraction-recipes.md` §3 |
 
@@ -29,7 +29,7 @@
   ```
 
   `調査対象:` 行は `scripts/check-docs.py --stale` が基準 SHA として読む。一覧は 1 行 1 名の `- \`NAME\``（ASCII 順、重複なし）。この形を崩すと `create-envvars-docs.py` と `scripts/check-docs.py` が読めなくなる。
-- 検索対象 API・除外条件・見る場所は `extraction-recipes.md` §6 が正。再生成時はその範囲で grep する。
+- 検索対象 API・除外条件・見る場所は `extraction-recipes.md` §5 が正。再生成時はその範囲で grep する。
 - 前版との差分・件数は `git diff` / `git log` で見る（索引には書き残さない）。減った名前は `prune.md` §1、増えた名前は `runner.md` へ渡す。差分の説明が要るならコミットメッセージに書く。
 - 環境変数名の大小が異なる同名（Windows の `PATH` と `Path` など）は索引では 1 名に正規化されることがある。ファイル名は Strata が実際に読む綴りを使うので、`check-docs.py` が「索引名と綴りの違うファイル」を出す場合はどちらの綴りがソース上の実綴りか確認して寄せる。
 
@@ -39,6 +39,7 @@
 - 中身は次に限る: 見出し、`調査対象:` 行（HEAD の完全な commit SHA と日付）、`## tool-id` 表（tool-id / 入口 / parser の所在 / scope）、`## 対象外`（入口と一行の理由）。
 - 書かないもの: 設置先・配布経路・Release asset の名前・サイズ・digest、feed の中身、Docker の flavor、`add_executable` の件数、前回からの変化、調べたソース一覧、更新手順・依頼文。
 - 更新時は Strata ルート・`bin/`・`packaging/`・`tools/`・`strata_cli/`・`src/`・各 `CMakeLists.txt` を見て、tool-id の追加・削除・改名と parser の所在を確かめる（`extraction-recipes.md` §2・§3）。名前だけで分類せず、呼び出し先と parser を読む。
+- tool-id は現行 checkout に parser があるものだけ。ソースから parser が消えた CLI は、過去の Release に配布物が残っていても一覧から外す（Release は調べない）。
 - `*_test` / `*_parity` / `*_bench`、probe・harness、配布物を作る helper、CLI 引数を持たない installer は対象外に置く。対象外から tool-id に昇格させる場合は利用者・build target・parser を確認する。
 
 ## 3. CLI 索引（`docs/cli/README.md`）

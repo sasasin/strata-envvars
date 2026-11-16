@@ -40,7 +40,7 @@
 
 ## 根拠
 
-parser 登録箇所、実行処理、配布 wrapper などの `path:line`。Release への同梱実績を書く場合は取得日で示す。
+parser 登録箇所、実行処理、配布 wrapper などの `path:line`（checkout のソースだけ。Release の配布物は根拠にしない）。
 
 <!--
 書式と詳しさの基準は docs/cli/001_investigation.md の「コマンド概要の内容」（特定の文書を手本にしない）。

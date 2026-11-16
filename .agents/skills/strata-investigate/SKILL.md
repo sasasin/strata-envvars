@@ -18,7 +18,7 @@ description: |
 
 # Strata 調査文書の更新 runbook
 
-Strata ソースコードを一次情報にして、このリポジトリの `docs/` を現行 release に追従させる手順。
+Strata ソースコード（作業開始時点の checkout）だけを一次情報にして、このリポジトリの `docs/` を最新のソースに追従させる手順。GitHub Release の配布物は調査対象にも根拠にもしない。
 **詳細な調査仕様は `docs/` 側の文書が正**であり、本書は「どの順序で・何を読み・何を叩くか」だけを定める。
 
 ## 前提の絶対パス
@@ -69,7 +69,7 @@ git -C "$HOME/src/github.com/Niko1221/Strata" describe --tags
 4. 更新後に F（突合）を走らせ、増減件数を確認する。
 5. 減った項目は B に進み、増えた項目は C に進む。
 
-各索引の更新手順と、索引に書いてよい中身は `references/index-refresh.md` が正（環境変数一覧の生成範囲は `references/extraction-recipes.md` §6）。索引 3 ファイルには調査対象行と一覧だけを置き、手順・依頼文・差分・履歴・Release の実測値は書かない。索引は**予定リンクを含んだ一覧**であって、この段階で個別文書は作らない。
+各索引の更新手順と、索引に書いてよい中身は `references/index-refresh.md` が正（環境変数一覧の生成範囲は `references/extraction-recipes.md` §5）。索引 3 ファイルには調査対象行と一覧だけを置き、手順・依頼文・差分・履歴・Release の実測値は書かない。索引は**予定リンクを含んだ一覧**であって、この段階で個別文書は作らない。
 
 CLI 索引を更新したときは option inventory も再生成する（`scripts/cli-grammar.py`）。H の陳腐化検出 (S-c) がこれを使う。
 

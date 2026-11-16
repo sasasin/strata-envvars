@@ -29,14 +29,13 @@ CMake / Docker / CI 側は `$ENV{NAME}`、`ENV NAME=`、`environment:` のキー
 
 ## 2. 変更範囲だけを拾う（索引更新）
 
-前回索引に書いた commit SHA を `<prev>` として、入口・配布物だけを眺める。
+前回索引に書いた commit SHA を `<prev>` として、入口と packaging まわりだけを眺める。
 
 ```bash
 git -C "$STRATA" diff --name-status <prev>..HEAD -- packaging/ bin/ docker/ spark/ apps/desktop/ docs/ .
 git -C "$STRATA" ls-files | grep -E '\.(sh|bash|bat|cmd|ps1|py|js|mjs|c|cc|cpp)$'
 ```
 
-`git describe --tags` と `git log <tag>..HEAD` で tag と HEAD が同一コミットかを見る（Release とソースの対応の根拠）。
 
 ## 3. CLI grammar を機械抽出する（索引の網羅性照合）
 
@@ -79,27 +78,12 @@ CMake 生成対象は `add_executable` の場所と条件ブロック（`option(
 索引更新のたびに、この抽出結果の要として option 文字列 inventory を保存する（`scripts/cli-grammar.py` →
 `.cli-grammar.json`）。`find-stale.py` の S-c（既存 CLI 文書の option が現行 parser から消えたか）がこれを使う。
 
-## 4. Release と配布物の実体
-
-```bash
-curl -fsSL https://api.github.com/repos/Niko1221/Strata/releases/latest
-curl -fsSL 'https://api.github.com/repos/Niko1221/Strata/releases?per_page=15'
-```
-
-- asset の `digest` と `name`・サイズを一覧化し、`install-manifest.txt` / `latest.json` / `SHA256SUMS.txt` /
-  `strata-feed.json` / `strata-feed-linux-aarch64.json` / `install.sh` / `install.ps1` は本文を取れる。
-- 小さな asset（macOS の engine package、`strata-dsv41-*-metal.tar.gz`、macOS の Control archive、
-  `Strata.app.tar.gz`）は展開して中身とハッシュを確認すると、archive 内の実行ファイル名や
-  `engine-bundle/` のフォルダ名まで実証できる。大きな Windows/Linux archive は未取得のまま制約として書く。
-- Docker: `https://ghcr.io/v2/niko1221/strata/tags/list`（anonymous token 付き）で tag 実体を確認する。
-- ネットワークで確認できなかった項目は、ソース上の生成規則を実配布物として断定しない。
-
-## 5. 索引 ↔ 実ファイルの突合
+## 4. 索引 ↔ 実ファイルの突合
 
 自前で見積もらず `scripts/check-docs.py` を使う。件数サマリ、未作成一覧（`--list-missing`）、
 孤児・綴り不一致・並び順違反・概要リンク欠落・SHA/調査日欠落、commit 別分布（`--stale`）を出す。
 
-## 6. 環境変数一覧（`docs/envvars/000_envvers.md`）の生成範囲
+## 5. 環境変数一覧（`docs/envvars/000_envvers.md`）の生成範囲
 
 索引の再生成はこの節が正。索引ファイル自身には生成方法・内訳・差分・履歴を書かない（`index-refresh.md` §1）。
 
