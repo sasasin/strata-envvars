@@ -65,8 +65,8 @@ codex exec --skip-git-repo-check --sandbox 'workspace-write' \
 調査対象ソースコード: `$HOME/src/github.com/Niko1221/Strata`
 対象環境変数: `STRATA_XXXX`
 作成対象文書: `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/STRATA_XXXX.md`
-`docs/envvars/001_investigation.md` の調査範囲・手法・文書フォーマット・品質基準に従ってください。
-書式と詳しさの基準文書は `docs/envvars/STRATA_ADAPT_OVERLAP.md` です。
+`docs/envvars/001_investigation.md` の調査範囲・手法・文書フォーマット・詳しさの基準・品質基準に従ってください。
+他の環境変数文書を書式の手本にしないでください。
 Strata が実際には読まない名前なら、空の文書を作らず索引との食い違いとして報告してください。
 索引・001_investigation.md・他の文書・Strata ソースは変更しないでください。'
 ```
@@ -75,7 +75,7 @@ Strata が実際には読まない名前なら、空の文書を作らず索引�
 
 通常は `uv run ./create-cli-docs.py -l 1`。索引に決めた予定パス 1 件を指定して投げる場合は
 `create-cli-docs.py` の `PROMPT_TEMPLATE` と同じ手順（配置規約は `docs/cli/001_investigation.md`、
-コマンド概要の基準は `docs/cli/strata-terminal/launch/README.md`）に従う。
+コマンド概要の書式と詳しさは同書の「コマンド概要の内容」。特定の文書を手本にしない）に従う。
 
 ## 速度改善に効く設定を相談する（G モード）
 

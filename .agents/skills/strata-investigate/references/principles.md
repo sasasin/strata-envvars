@@ -41,5 +41,5 @@
 ## 言語と文体
 
 - 文書は日本語。コード・ファイル名・識別子・ログ文言は原文のまま。
-- 見出し構成と詳しさは基準文書に合わせる（envvars: `docs/envvars/STRATA_ADAPT_OVERLAP.md`、CLI 概要: `docs/cli/strata-terminal/launch/README.md`）。該当しない節は無理に作らず、必要な節は追加してよい。
+- 見出し構成と詳しさは基準に合わせる（envvars: `docs/envvars/001_investigation.md` の「文書フォーマット」「詳しさの基準」。特定の文書を手本にしない。CLI 概要: `docs/cli/001_investigation.md` の「コマンド概要の内容」）。該当しない節は無理に作らず、必要な節は追加してよい。
 - 主張の近くに `path/to/file.cpp:123-145` の形でソース位置を置く。

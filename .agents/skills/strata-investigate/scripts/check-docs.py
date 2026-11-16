@@ -22,7 +22,7 @@ DEFAULT_REPO = Path(__file__).resolve().parents[4]
 
 ENVVAR_DIR = "docs/envvars"
 ENVVAR_INDEX = "000_envvers.md"
-ENVVAR_EXCLUDE = {"001_investigation.md", "STRATA_ADAPT_OVERLAP.md"}
+ENVVAR_EXCLUDE = {"001_investigation.md"}
 ENVVAR_ENTRY_RE = re.compile(r"^- `([A-Za-z0-9_]+)`\s*$")
 ENVVAR_REQUIRED_SECTIONS = ["## 役割", "## 値と判定", "## 有効になる条件", "## 実行時の詳細"]
 ENVVAR_EVIDENCE_HEADING_RE = re.compile(r"^## .*(根拠|参照|出典)", re.MULTILINE)

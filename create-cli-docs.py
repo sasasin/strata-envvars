@@ -31,7 +31,7 @@ PROMPT_TEMPLATE = """調査依頼です。Strata の CLI 文書を1件作成し�
 1. Strata リポジトリで `git rev-parse HEAD` と `git status --short --branch` を確認してください。調査対象の完全な commit SHA と調査日を文書に記録し、未コミット変更を上書きしないでください。
 2. `{index}` で作成対象のリンク、コマンド階層、option の scope を確認してください。
 3. `{investigation}` の配置規約と調査基準に従ってください。
-4. 作成対象がオプション文書なら、parser 定義から実際の使用箇所まで調べ、値、既定値、validation、効果、相互作用、適用条件、副作用、出力・失敗経路をソースで裏付けてください。対象がコマンド概要 `README.md` なら `{example_readme}` を参考にし、そのコマンドの役割、代表的な利用方法、実行モード、主要な動作・副作用、注意点、関連文書へのリンクをまとめてください。
+4. 作成対象がオプション文書なら、parser 定義から実際の使用箇所まで調べ、値、既定値、validation、効果、相互作用、適用条件、副作用、出力・失敗経路をソースで裏付けてください。対象がコマンド概要 `README.md` なら `{investigation}` の「コマンド概要の内容」の見出し構成と詳しさの基準に従い、そのコマンドの役割、代表的な利用方法、実行モード、主要な動作・副作用、注意点、関連文書へのリンクをまとめてください。他の CLI 文書を書式の手本にしないでください。
 5. 文書は日本語で書き、確認した Strata の相対ファイルパスと行番号を根拠として挙げてください。確認できない点は推測せず、調査範囲や制約を明記してください。安全に使える同一 revision の CLI `--help` は補助資料として使えますが、ソースの parser と照合してください。
 6. 作成先がすでに存在する場合は上書きせず、その旨を報告してください。指定された option が現行 parser にない場合、または索引との食い違いがある場合も、別の文書を推測で作らず差異を報告してください。
 7. 編集対象は指定された文書1件だけです。索引や他文書を変更しないでください。調査のためのソース変更、build、GPU 実行、性能測定、テストは行わないでください。
@@ -172,7 +172,6 @@ def create_doc(doc_path: Path, stale_note: str = "") -> tuple[Path, int, str, st
         doc_path=doc_path,
         index=INDEX,
         investigation=DOC_ROOT / "001_investigation.md",
-        example_readme=DOC_ROOT / "strata-terminal" / "launch" / "README.md",
         stale_note=stale_note,
     )
     with tempfile.TemporaryDirectory(prefix="create-cli-docs-") as temp_dir:

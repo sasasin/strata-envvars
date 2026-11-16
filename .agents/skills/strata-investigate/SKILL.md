@@ -113,7 +113,7 @@ uv run ./create-cli-docs.py -p 12 -l 100         # CLI
 
 ## D / E. 1 件の調査
 
-対象を 1 つ指定して実行する。D は `docs/envvars/001_investigation.md`、E は `docs/cli/001_investigation.md` の調査範囲・品質基準・配置規約にそのまま従う。文体と詳しさの基準は、D が `docs/envvars/STRATA_ADAPT_OVERLAP.md`、E のコマンド概要が `docs/cli/strata-terminal/launch/README.md`。雛形は `assets/` に置いたが、雛形より基準文書の方が詳しい。
+対象を 1 つ指定して実行する。D は `docs/envvars/001_investigation.md`、E は `docs/cli/001_investigation.md` の調査範囲・品質基準・配置規約にそのまま従う。文体と詳しさの基準は、D が `docs/envvars/001_investigation.md` の「文書フォーマット」「詳しさの基準」（特定の文書を手本にしない）、E のコマンド概要が `docs/cli/001_investigation.md` の「コマンド概要の内容」（同じく特定の文書を手本にしない）。雛形は `assets/` に置いた。
 
 codex に投げる場合の依頼文は `references/prompts.md` にある。
 
