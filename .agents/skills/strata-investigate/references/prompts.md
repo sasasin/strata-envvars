@@ -11,8 +11,10 @@ codex exec --skip-git-repo-check --sandbox 'workspace-write' '
 調査依頼です。調査対象ソースコードは `$HOME/src/github.com/Niko1221/Strata` です。
 ソースコードを網羅的に grep して、使用可能な環境変数を一覧化しただけの Markdown ファイルを作成してください。
 Markdown ファイル名は `$HOME/src/github.com/sasasin/strata-envvars/docs/envvars/000_envvers.md` としてください。
-環境変数名でソートしてください。冒頭の生成方法・検索した API・除外条件の記述形式は既存ファイルを維持し、
-1 行 1 名の一覧形式（`- ` 始まりのバッククォート付き）を崩さないでください。'
+検索する API・除外条件・見る場所は `$HOME/src/github.com/sasasin/strata-envvars/.agents/skills/strata-investigate/references/extraction-recipes.md` の §6 に従ってください。
+ファイルの形は同 `references/index-refresh.md` §1 のとおり、見出し・調査対象行（HEAD の完全な commit SHA と日付）・
+環境変数名の ASCII 順の一覧（1 行 1 名、`- ` 始まりのバッククォート付き）だけにしてください。
+生成方法・総数・内訳・前版との差分・履歴などの説明は書かないでください。'
 ```
 
 ## 消えた環境変数の本文削除

@@ -5,7 +5,7 @@
 
 | 索引 | 更新手順の本文（正） | skill 側の補足 |
 | --- | --- | --- |
-| `docs/envvars/000_envvers.md` | 冒頭の「生成方法」節（検索した API / 構文の一覧） | 下記 §1 と `extraction-recipes.md` |
+| `docs/envvars/000_envvers.md` | `extraction-recipes.md` §6（生成範囲。索引ファイル側には書かない） | 下記 §1 |
 | `docs/cli/000_cli_tools.md` | 「更新手順と次回の調査指示」節（8 手順）＋「次回の依頼文」 | 下記 §2 |
 | `docs/cli/README.md` | 「更新手順と次回の調査指示」節（8 手順）＋「次回の依頼文」 | 下記 §3 |
 
@@ -13,10 +13,21 @@
 
 ## 1. 環境変数一覧（`docs/envvars/000_envvers.md`）
 
-- 索引の形は 1 行 1 名の `- \`NAME\``（ASCII 順、重複なし）。冒頭に Strata の commit SHA・コミット日・一覧生成日・総数・生成方法・内訳を書く。この形式を崩すと `create-envvars-docs.py` と `scripts/check-docs.py` が読めなくなる。
-- 検索対象 API と除外条件の完全な一覧は索引自身の冒頭に書いてある（C/C++/CUDA/HIP/SYCL/Metal/Rust、Python、JS/TS、shell/batch/PowerShell、CMake/Docker/Compose/GitHub Actions）。再生成時も同じ範囲で grep し、`bench/results/`、`docs/`、`data/`、`ref/`、`third_party/` を落とす。
-- 既定値テーブル（`{"STRATA_X", "1"}`）や `setenv("X=" + v)` 経由の名前も拾う。コメント・docs・ビルド `#define`・コマンドライン引数名・CMake 変数・テスト内のダミー文字列は落とす。
-- 前版との差分は `git diff` で見る。減った名前は `prune.md` §1、増えた名前は `runner.md` へ渡す。
+- 索引は**一覧だけ**のファイルにする。中身は次の 3 つに限り、これ以外（生成方法・検索 API・除外条件・総数・内訳・前版との差分・履歴・運用メモ）は書かない。
+
+  ```markdown
+  # 環境変数一覧
+
+  調査対象: Strata `main` の HEAD `<完全な commit SHA>`（`YYYY-MM-DD` 時点）。
+
+  ## 環境変数
+
+  - `NAME`
+  ```
+
+  `調査対象:` 行は `scripts/check-docs.py --stale` が基準 SHA として読む。一覧は 1 行 1 名の `- \`NAME\``（ASCII 順、重複なし）。この形を崩すと `create-envvars-docs.py` と `scripts/check-docs.py` が読めなくなる。
+- 検索対象 API・除外条件・見る場所は `extraction-recipes.md` §6 が正。再生成時はその範囲で grep する。
+- 前版との差分・件数は `git diff` / `git log` で見る（索引には書き残さない）。減った名前は `prune.md` §1、増えた名前は `runner.md` へ渡す。差分の説明が要るならコミットメッセージに書く。
 - 環境変数名の大小が異なる同名（Windows の `PATH` と `Path` など）は索引では 1 名に正規化されることがある。ファイル名は Strata が実際に読む綴りを使うので、`check-docs.py` が「索引名と綴りの違うファイル」を出す場合はどちらの綴りがソース上の実綴りか確認して寄せる。
 
 ## 2. CLI 入口・配布物（`docs/cli/000_cli_tools.md`）

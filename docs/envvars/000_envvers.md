@@ -1,52 +1,6 @@
 # 環境変数一覧
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（コミット日付 2026-11-07、一覧生成日 2026-11-07）。`git describe --tags` は `v0.2.12`（tag は HEAD と同一 commit）。`git status --short --branch` は working tree clean（`main` = `origin/main`）。
-
-総数: **2182** 件。
-
-生成方法: ソースを grep し、環境変数を実際に読み書きしている箇所から名前を拾った。同じ名前の全参照を集約し、環境変数ではない識別子（文字列定数・ログ文言・量子化形式名・シグナル名・テスト内のダミー）は落とした。
-検索した API / 構文は次のとおり。
-
-- C/C++/CUDA/HIP/SYCL/Metal/Rust: `std::getenv` / `getenv` / `_wgetenv` / `setenv` / `putenv` / `_putenv_s` / `unsetenv` / `std::env::var` / `std::env::var_os`
-- Python: `os.environ[...]` / `os.environ.get` / `os.environ.setdefault` / `os.environ.pop` / `os.getenv` / 名前を引数に取る env helper（呼び出し側で自動解決）
-- JavaScript / TypeScript / Rust(アプリ): `process.env.NAME` / `process.env["NAME"]` / `Deno.env.get`
-- shell / batch / PowerShell: スクリプト内で代入されずに環境から読む `$NAME` / `${NAME:-既定}` / `${NAME:?必須}` / `%NAME%` / `$env:NAME`。bat の `if defined NAME` と `if "%NAME%"==""` も読み取りとして数えた
-- CMake / Docker / Compose / GitHub Actions: `$ENV{...}` / `ENV 変数=` / `environment:` のキーと `${VAR}` 参照 / `${{ env.VAR }}` / workflow の `env:` キー
-- NSIS インストーラ: `SetEnvironmentVariableW` で環境に書き込む名前
-
-既定値テーブル（`{"STRATA_X", "1"}`）や `push_back({"STRATA_X", "2"})`、子プロセスへの `setenv("X=" + v)`、Python / JS の env dict の key、`for (const char* k : {"FNX_PF_SKIP", ...})` のように getenv へ渡す名前の配列、`ENV_CHECKOUT = "STRATA_HANDOVER_IN_CHECKOUT"` のような定数名経由で決まる名前も拾った。
-環境変数を読み取る helper（`getenv` に identifier を渡す関数・ラムダをソースから割り出した 31 個: `ds4_dbg` / `a_env` / `env_int` / `env_on` / `env_tri` / `env_f` / `env_num` / `env_flag` / `env_count` / `envi` / `envd` / `bm_default_on` / `kva_env_flag` / `kva_env_i64` / `lanes_env` / `sm75_switch` / `pipe_dbg_env` / `il_env_on` / `one_gpu_or` / `env_int_or` / `strata_metal::resource` など）の呼び出し引数も検索対象。
-コメント・ドキュメント・ビルド用 `#define`・CMake 変数・コマンドライン引数名・量子化形式名・テスト内のダミー文字列は除外した。
-`bench/results/`（ベンチマーク記録内のスクリプト）、`docs/`、`data/`、`ref/`、`third_party/` は対象外。
-見た場所: `src/` `include/` `sycl/` `metal/` `serve/` `strata_cli/` `strata_control/` `tools/` `apps/` `integrations/` `tests/` `bench/` `packaging/` `docker/` `spark/` `bin/` `cmake/` `.github/` と、直下の `setup.py` `setup.sh` `update.sh` `CMakeLists.txt` `Dockerfile` `START-HERE.bat` `SETUP.bat` `UPDATE.bat` `BENCH.bat`。
-検索した拡張子: `.c .cc .cpp .cxx .h .hpp .hxx .cu .cuh .metal .rs .mm .m .inc .cppm .tpp .nsi .py .js .mjs .cjs .ts .tsx .jsx .sh .bash .zsh .bat .cmd .ps1 .psm1 .yml .yaml .cmake .txt`。`.mm` と `.inc` は `metal/src/mtl_rt.mm`・`metal/src/engine/dflash2.inc`・`src/dsv41/ds4_iq_hip*.inc` が `getenv` を読むので前版に無いものを追加した。
-一覧に名前の重複はない。
-
-一覧は環境変数名のソート順（ASCII 順）。内訳は次のとおり（一覧自体では区別しない。名前が現れる全ファイルから、テスト・検証コードだけが出る名前は test、ビルド・パッケージング・Docker・CI・同梱ツール側のスクリプトだけが出る名前は tooling、実装コードが読む名前は implementation として数えた）。
-
-- エンジン / サーバー / CLI / デスクトップアプリの実装が読む変数: 1770
-- 同梱ツール・セットアップ・ビルド・パッケージング・Docker・CI のスクリプトが読む変数: 147
-- テスト・開発/e2e スクリプト・parity / bench / probe が読む変数: 210
-
-> 索引そのものの再生成・削除・一括作成の手順はスキル `.agents/skills/strata-investigate/references/index-refresh.md` にある。生成方法の定義は本書の冒頭が正で、索引の形（1 行 1 名の `- \`NAME\`` と ASCII 順）を崩すと `create-envvars-docs.py` と `check-docs.py` が読めなくなる。
-
-## 前版との差分（索引の最新化 2026-11-07: v0.2.10-3-g9f7d977d → v0.2.12）
-
-- 対象は Strata HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07、tag `v0.2.12`）。追加 **43** 件、削除 0 件です。追加名はすべて変更されたソースの環境変数読み取り API または既定値テーブルで確認しました。
-- 追加: `STRATA_ADAPT_FETCH`, `STRATA_ADAPT_FETCH_MARGIN`, `STRATA_ADAPT_FETCH_MIN`, `STRATA_ADAPT_FETCH_VERIFY`, `STRATA_DF2_GATE`, `STRATA_DF2_ROW_MS`, `STRATA_FILE_TIER_HONEST`, `STRATA_FILE_TIER_IDLE`, `STRATA_FORCE_FAULT`, `STRATA_GDN_CHUNKED_MIN`, `STRATA_HC_Q8_ALL_STAGES`, `STRATA_IQ4XS512_MIN`, `STRATA_IQ4_W4A8`, `STRATA_IQ512_FUSED_MAX`, `STRATA_IQ512_FUSED_TYPES`, `STRATA_MANIFEST`, `STRATA_METAL_HCLD`, `STRATA_METAL_PROMPT_HOSTPIPE`, `STRATA_METAL_STEPPROF`, `STRATA_METAL_STEPPROF_AT`, `STRATA_METAL_STEPPROF_OUT`, `STRATA_METAL_STEPPROF_REPS`, `STRATA_METAL_WPF_MIB`, `STRATA_NO_IQ4XS512`, `STRATA_NO_Q50_512`, `STRATA_NO_VBMI`, `STRATA_PF_ALLOC_TRACE`, `STRATA_PF_DM16`, `STRATA_PF_FUSED_Q50`, `STRATA_PF_PEER_CPU`, `STRATA_PROMPT_DN`, `STRATA_PROMPT_GU`, `STRATA_PROMPT_KPROF`, `STRATA_PROMPT_MERGEH`, `STRATA_PROMPT_V6`, `STRATA_Q50_512_MIN`, `STRATA_ROUTE_DUMP`, `STRATA_SELECT_TWO_PASS`, `STRATA_SELECT_TWO_PASS_CHECK`, `STRATA_SELECT_TWO_PASS_MIN`, `STRATA_UNDECLARED_TOOL_CALLS`, `STRATA_VNNI_TIER`, `STRATA_W4A8_CFG`。
-- 前版の 2139 件は維持し、現在の総数は **2182** 件です。
-
-### 履歴: 索引の最新化 2026-11-03（v0.2.9 → v0.2.10）
-
-- 前版は `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（v0.2.9、コミット日 2026-10-31、生成 2026-11-01）で 1690 件。v0.2.9 → v0.2.10 のソース差分は 708 コミット・798 ファイル変更（+86,448 / −3,991 行）。
-- 追加 437 件。拾えた群の内訳（同じ名前が複数群に出るので合計は 436 を超える）: `getenv` / `setenv` 系の直接呼び出し 205 件、env helper 経由 93 件、ビルド・パッケージング・Docker・CI・テストのスクリプトが環境から読む設定 84 件、Python / JS の `os.environ` / `process.env` と env dict 経由 47 件、名前の配列・定数経由 10 件。
-  主な増分: `src/split/`（`FNX_*` の prefill / batch / peer 設定と `FNX_PF_SKIP` 系の一括読み取り）、`src/dsv41/` と `metal/` の DFlash2・streaming（`STRATA_DF2_*`、`DS4_STREAM_*`、`DS4_WARM_*`）、`src/program/generate.cpp` の batching / spill / lookup（`STRATA_BATCH_DF2*`、`STRATA_MTP_*`、`STRATA_LOOKUP_MAX_T`）、Metal の SYCL parity kernel 既定（`STRATA_*_SLM` / `_ROW_REUSE` / `bm_default_on` 系）、mac の署名・package スクリプトと terminal の e2e スクリプト。
-- 削除 0 件。前版の 1690 件はすべて現行 checkout で読み取りまたは設定の箇所を `rg -w` で確認できた（Strata 側で消えた名前は無い）。
-- 前版の抽出漏れを今回埋めた: `docker/entrypoint.sh` が `eval "v=\${$legacy:-}"` で読む旧名（`HOST` `LOW_RAM` `REINSTALL` `RESIDENT_BUDGET_GIB` `KV_STREAMING` `LAYER_SPLIT` `CONFIG`）と `KV`、`sycl/tools/build.sh` の `AOT` / `I8_ESIMD`、Dockerfile の `ENV DEBIAN_FRONTEND`。これらは v0.2.9 の時点で既に読まれていた。
-- 索引に入れなかったもの: Dockerfile の `ARG` だけ（`BASE_IMAGE` `CUDA_IMAGE` `RUNTIME_BASE` `CUDA_ARCHITECTURES` `STRATA_VERSION` `ENGINE_LABEL` `STRATA_COMMIT` など）は環境変数ではなくビルド引数。`STRATA_PORTABLE` `STRATA_SPLIT_ARCH` `STRATA_TQ_OVERLAY_OK` `STRATA_USE_HIP` は CMake 変数。量子化形式名（`IQ2_XXS` `IQ4_XS` `MXFP4` など）とファイルヘッダの magic 文字列（`STRATA_HIPBLASLT_TUNING_V1` `STRATA_ROCBLAS_TUNING_V1`）、shell 内蔵変数（`PWD` `RANDOM` `PIPESTATUS` `ERRORLEVEL` `BASH_SOURCE` `BASH_REMATCH`）、ビルドスクリプトが自分で代入するだけの内部変数も除外した。
-- 綴りは Strata が実際に読む形のまま（`Path` `SystemDrive` `ProgramFiles` `VCToolsRedistDir` `IGC_EnableDPEmulation` `NEOReadDebugKeys` `OverrideDefaultFP64Settings`）。ただし `SystemRoot` は索引に載せず大文字形の `SYSTEMROOT` に正規化した（Windows の慣例で同名の大小違いを `docs/envvars/SYSTEMROOT.md` が両方扱っており、本文はすでに `SYSTEMROOT` 名で作られている）。`PATH` と `Path` のように両綴りの本文が別にある名前は前版同様それぞれ載せている。`setup.py:204` の `names = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")` のように大文字形と小文字形を両方読む名前は、索引では大文字形に正規化した。
-- 追加した 436 件は本文が未作成の予定項目。削除項目が無いので `references/prune.md` の後片付けは不要。作成は `references/runner.md`（モード C）で 1 件 1 セッション行う。
-
+調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（`2026-11-07` 時点）。
 
 ## 環境変数
 

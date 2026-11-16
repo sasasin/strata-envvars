@@ -98,3 +98,41 @@ curl -fsSL 'https://api.github.com/repos/Niko1221/Strata/releases?per_page=15'
 
 自前で見積もらず `scripts/check-docs.py` を使う。件数サマリ、未作成一覧（`--list-missing`）、
 孤児・綴り不一致・並び順違反・概要リンク欠落・SHA/調査日欠落、commit 別分布（`--stale`）を出す。
+
+## 6. 環境変数一覧（`docs/envvars/000_envvers.md`）の生成範囲
+
+索引の再生成はこの節が正。索引ファイル自身には生成方法・内訳・差分・履歴を書かない（`index-refresh.md` §1）。
+
+ソースを grep し、環境変数を実際に読み書きしている箇所から名前を拾う。同じ名前の全参照を集約し、
+環境変数ではない識別子（文字列定数・ログ文言・量子化形式名・シグナル名・テスト内のダミー）は落とす。
+
+検索する API / 構文:
+
+- C/C++/CUDA/HIP/SYCL/Metal/Rust: `std::getenv` / `getenv` / `_wgetenv` / `setenv` / `putenv` / `_putenv_s` / `unsetenv` / `std::env::var` / `std::env::var_os`
+- Python: `os.environ[...]` / `os.environ.get` / `os.environ.setdefault` / `os.environ.pop` / `os.getenv` / 名前を引数に取る env helper（呼び出し側で解決）
+- JavaScript / TypeScript: `process.env.NAME` / `process.env["NAME"]` / `Deno.env.get`
+- shell / batch / PowerShell: スクリプト内で代入されずに環境から読む `$NAME` / `${NAME:-既定}` / `${NAME:?必須}` / `%NAME%` / `$env:NAME`。bat の `if defined NAME` と `if "%NAME%"==""` も読み取りとして数える。`eval "v=\${$legacy:-}"` のような間接参照も追う
+- CMake / Docker / Compose / GitHub Actions: `$ENV{...}` / `ENV 変数=` / `environment:` のキーと `${VAR}` 参照 / `${{ env.VAR }}` / workflow の `env:` キー
+- NSIS インストーラ: `SetEnvironmentVariableW` で環境に書き込む名前
+
+名前が間接的に決まるものも拾う: 既定値テーブル（`{"STRATA_X", "1"}`）、`push_back({"STRATA_X", "2"})`、
+子プロセスへの `setenv("X=" + v)`、Python / JS の env dict の key、getenv へ渡す名前の配列
+（`for (const char* k : {"FNX_PF_SKIP", ...})`）、定数名経由（`ENV_CHECKOUT = "STRATA_HANDOVER_IN_CHECKOUT"`）。
+`getenv` に identifier を渡す helper（`env_on` / `env_int` / `env_flag` / `pipe_dbg_env` / `bm_default_on` /
+`strata_metal::resource` など）はソースから毎回割り出し、その呼び出し引数も検索対象にする。
+
+除外するもの: コメント・ドキュメント・ビルド用 `#define`・CMake 変数（`STRATA_PORTABLE` など）・Dockerfile の `ARG` だけの名前・
+コマンドライン引数名・量子化形式名・ファイルヘッダの magic 文字列・shell 内蔵変数（`PWD` `RANDOM` `PIPESTATUS`
+`ERRORLEVEL` `BASH_SOURCE` `BASH_REMATCH`）・スクリプトが自分で代入するだけの内部変数・テスト内のダミー文字列。
+
+対象外のディレクトリ: `bench/results/`、`docs/`、`data/`、`ref/`、`third_party/`。
+見る場所: `src/` `include/` `sycl/` `metal/` `serve/` `strata_cli/` `strata_control/` `tools/` `apps/` `integrations/`
+`tests/` `bench/` `packaging/` `docker/` `spark/` `bin/` `cmake/` `.github/` と、直下の `setup.py` `setup.sh`
+`update.sh` `CMakeLists.txt` `Dockerfile` `START-HERE.bat` `SETUP.bat` `UPDATE.bat` `BENCH.bat`（新しい入口が増えていれば足す）。
+検索する拡張子: `.c .cc .cpp .cxx .h .hpp .hxx .cu .cuh .metal .rs .mm .m .inc .cppm .tpp .nsi .py .js .mjs .cjs .ts .tsx .jsx .sh .bash .zsh .bat .cmd .ps1 .psm1 .yml .yaml .cmake .txt`。
+
+綴りは Strata が実際に読む形のまま載せる（`Path` `SystemDrive` `VCToolsRedistDir` など）。例外として
+`SystemRoot` は `SYSTEMROOT` に正規化し、大文字形と小文字形を両方読む proxy 系（`HTTPS_PROXY` / `https_proxy` など）は大文字形に寄せる。
+`PATH` と `Path` のように両綴りの本文が別にある名前はそれぞれ載せる。
+
+テスト・開発/e2e・parity・bench・probe スクリプトだけが読む名前も索引には載せる（索引は候補一覧。本文を作るかは `runner.md` の no-doc 判定で決める）。

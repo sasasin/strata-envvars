@@ -69,7 +69,7 @@ git -C "$HOME/src/github.com/Niko1221/Strata" describe --tags
 4. 更新後に F（突合）を走らせ、増減件数を確認する。
 5. 減った項目は B に進み、増えた項目は C に進む。
 
-各索引が従うべき手順の本文は `docs/` 側に既にある（`docs/cli/000_cli_tools.md` と `docs/cli/README.md` の「更新手順と次回の調査指示」節、`docs/envvars/000_envvers.md` 冒頭の生成方法）。索引は**予定リンクを含んだ一覧**であって、この段階で個別文書は作らない。
+各索引が従うべき手順の本文は `docs/` 側に既にある（`docs/cli/000_cli_tools.md` と `docs/cli/README.md` の「更新手順と次回の調査指示」節）。環境変数一覧の生成範囲は `references/extraction-recipes.md` §6 が正で、`docs/envvars/000_envvers.md` には調査対象行と一覧だけを置く（`references/index-refresh.md` §1）。索引は**予定リンクを含んだ一覧**であって、この段階で個別文書は作らない。
 
 CLI 索引を更新したときは option inventory も再生成する（`scripts/cli-grammar.py`）。H の陳腐化検出 (S-c) がこれを使う。
 

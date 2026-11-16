@@ -33,8 +33,8 @@ uv run ./create-cli-docs.py -p 12 -l 100
   - Strata がまったく読まない名前（外部 lib・driver 専用、索引の誤拾い）→ 本文は作らない。
   - **Strata が読むが、読み取り箇所がテスト・parity 専用コードだけ**（GEMV_X、QUANT_CTAB、
     STRATA_WMMA_PARITY_EXACT など）→ `001_investigation.md` が実装根拠にしないと決めているので本文は作らない。
-    索引には残す。索引は grep 由来の候補一覧で、自分の冒頭で「テスト・開発/e2e スクリプトが読む変数」を
-    内訳に含めると宣言している。
+    索引には残す。索引は grep 由来の候補一覧で、テスト・開発/e2e スクリプトだけが読む名前も載せる決まり
+    （`extraction-recipes.md` §6）。
   - 逆に、セットアップ・ビルド・package スクリプト（`setup.py`、`packaging/**`、vision build の batch など）が
     読む変数は本文を作る対象。エンジン実行で読まないからと no-doc にするのは誤り（CUDA_PATH で実際に起きた）。
     再依頼では `001_investigation.md` の「調査対象と結界」の該当文を引用して範囲を示すと直る。
