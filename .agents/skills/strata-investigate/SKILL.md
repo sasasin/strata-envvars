@@ -2,7 +2,7 @@
 name: strata-investigate
 description: |
   strata-envvars リポジトリの調査・更新運用。Strata のリリースや checkout 更新後に、環境変数一覧
-  (docs/envvars/000_envvers.md) と CLI 入口・索引 (docs/cli/000_cli_tools.md、docs/cli/README.md) を
+  (docs/envvars/000_envvers.md) と CLI ツール一覧・索引 (docs/cli/000_cli_tools.md、docs/cli/README.md) を
   最新化し、増減に合わせて docs/envvars/<NAME>.md と
   docs/cli/<tool-id>/<command-path>/<option>.md を 1 件 1 セッションで作成・削除する。
   create-envvars-docs.py / create-cli-docs.py の並列実行と飽和判定、索引と実ファイルの突合
@@ -64,12 +64,12 @@ git -C "$HOME/src/github.com/Niko1221/Strata" describe --tags
 ## A. 索引の最新化（リリース追従の入口）
 
 1. `docs/envvars/000_envvers.md`（環境変数一覧）を再生成する。
-2. `docs/cli/000_cli_tools.md`（CLI 入口・ビルド生成物・Release 配布物）を更新する。
+2. `docs/cli/000_cli_tools.md`（CLI ツール一覧。tool-id と parser の所在）を更新する。
 3. `docs/cli/README.md`（CLI 索引）を更新する。
 4. 更新後に F（突合）を走らせ、増減件数を確認する。
 5. 減った項目は B に進み、増えた項目は C に進む。
 
-各索引が従うべき手順の本文は `docs/` 側に既にある（`docs/cli/000_cli_tools.md` と `docs/cli/README.md` の「更新手順と次回の調査指示」節）。環境変数一覧の生成範囲は `references/extraction-recipes.md` §6 が正で、`docs/envvars/000_envvers.md` には調査対象行と一覧だけを置く（`references/index-refresh.md` §1）。索引は**予定リンクを含んだ一覧**であって、この段階で個別文書は作らない。
+各索引の更新手順と、索引に書いてよい中身は `references/index-refresh.md` が正（環境変数一覧の生成範囲は `references/extraction-recipes.md` §6）。索引 3 ファイルには調査対象行と一覧だけを置き、手順・依頼文・差分・履歴・Release の実測値は書かない。索引は**予定リンクを含んだ一覧**であって、この段階で個別文書は作らない。
 
 CLI 索引を更新したときは option inventory も再生成する（`scripts/cli-grammar.py`）。H の陳腐化検出 (S-c) がこれを使う。
 

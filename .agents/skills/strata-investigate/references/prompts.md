@@ -1,7 +1,7 @@
 # codex / pi に投げる依頼文
 
 `README.md` に置いてあったプロンプト集の最新版。パスは実体（`docs/envvars/…`、`docs/cli/…`）に直してある。
-索引の中身に関する指示は `docs/` 側の「更新手順と次回の調査指示」節を参照する形に統一した。
+索引の中身に関する指示は `references/index-refresh.md` を参照する形に統一した（索引ファイル側に手順は置かない）。
 ファイル名は `000_envvers.md`（綴りは envvars ではない）が実在名なので、そのまま使う。
 
 ## 環境変数一覧の再生成
@@ -29,28 +29,27 @@ codex exec --skip-git-repo-check --sandbox 'workspace-write' '
 まだ読み取り箇所がある場合は削除せず、索引の落ち度として報告してください。'
 ```
 
-## CLI 入口・配布物一覧の更新
+## CLI ツール一覧の更新
 
 ```bash
 codex exec --skip-git-repo-check --sandbox 'workspace-write' '
-調査依頼です。Strata ソースコードが更新されたので、
-`$HOME/src/github.com/sasasin/strata-envvars/docs/cli/000_cli_tools.md` の「更新手順と次回の調査指示」に従って、
-`$HOME/src/github.com/Niko1221/Strata` を調査し、`000_cli_tools.md` を最新の内容に更新してください。
-CLI 入口、ビルド生成物、GitHub Release の配布物、ファイル名、インストール先を根拠となるソースから確認し、
-現行 Release の実体を確認できない項目は推測で埋めず、その制約を記載してください。'
+調査依頼です。Strata ソースコードが更新されたので、`$HOME/src/github.com/Niko1221/Strata` を調査し、
+`$HOME/src/github.com/sasasin/strata-envvars/docs/cli/000_cli_tools.md` を最新の tool-id 一覧に更新してください。
+手順と書いてよい中身は `$HOME/src/github.com/sasasin/strata-envvars/.agents/skills/strata-investigate/references/index-refresh.md` §2 に従ってください。
+tool-id 表と対象外の一覧だけを書き、設置先・Release の実測・前回からの変化・更新手順などの説明は書かないでください。'
 ```
 
 ## CLI 索引の更新
 
 ```bash
 codex exec --skip-git-repo-check --sandbox 'workspace-write' '
-Strata ソースコードが更新されたので、
-`$HOME/src/github.com/sasasin/strata-envvars/docs/cli/README.md` の「更新手順と次回の調査指示」に従って、
-`$HOME/src/github.com/Niko1221/Strata` を調査し、`docs/cli/README.md` を最新の内容に更新してください。
-全 CLI tool-id とコマンド階層、各 parser のオプションと alias、条件付き engine parser、CMake 生成の対象 CLI を確認してください。
+Strata ソースコードが更新されたので、`$HOME/src/github.com/Niko1221/Strata` を調査し、
+`$HOME/src/github.com/sasasin/strata-envvars/docs/cli/README.md` を最新の索引に更新してください。
+手順と書いてよい中身は `$HOME/src/github.com/sasasin/strata-envvars/.agents/skills/strata-investigate/references/index-refresh.md` §3 に従ってください。
+対象 tool-id は `docs/cli/000_cli_tools.md` の一覧です。各 parser のオプションと alias、条件付き engine parser を確認してください。
 全コマンドに `README.md` の概要リンクを置き、各コマンド節では概要リンクを先頭、その後のオプションを ASCII コード順にしてください。
-オプション文書と概要ページが未作成の場合も、規約どおりの Markdown 予定リンクとして列挙し、
-現行 Release を確認できない内容は推測で補わないでください。'
+オプション文書と概要ページが未作成の場合も、規約どおりの Markdown 予定リンクとして列挙してください。
+索引には見出し・調査対象行・リンクだけを書き、前置き・対象境界・履歴・注記・更新手順などの説明は書かないでください。'
 ```
 
 ## 環境変数 1 件
