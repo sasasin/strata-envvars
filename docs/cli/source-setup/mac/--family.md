@@ -1,61 +1,69 @@
 # `--family`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | macOS Apple Silicon 向け source setup (`metal/setup_mac.py`) |
+| コマンド | macOS 用 `metal/setup_mac.py`（`setup.py` から委譲） |
 | オプション | `--family` |
 | 別名 | なし |
-| 値 | `qwen`、`unsloth`、`gyro` のいずれか。省略可能 |
+| 値 | `qwen`、`unsloth`、`gyro`、または読み込まれた署名 feed に登録された family ID |
 
 ## 役割
 
-選択した `--model` のモデル family と指定値が合っているかを確認し、食い違う場合に警告します。family の選択・モデル一覧の絞り込みには使われません。モデルの family は Mac 用モデル表から決まり、オプション指定が合わない場合もモデル表の値が実行に使われます。
+`--family` はモデル family 名を受け取ります。ただし、macOS セットアップで実際に使う family は選択した `--model` の `MAC_MODELS` エントリーから決まります。指定値とモデル側の family が違う場合は警告を出し、モデル側の family を使います。そのため、family を指定してもモデルの絞り込みや強制にはなりません。
 
 ## 使い方
 
-ソース checkout のルートで、たとえば次のように実行します。
-
 ```sh
-./setup.sh --setup --family gyro --model Gyro-S --no-start
+# Unsloth family のモデルを選び、設定後にサーバーは起動しない
+./setup.sh --family unsloth --model UD-IQ4_XS --no-start
 ```
 
-`setup.py` は macOS で Control mode 以外なら全 argv を `metal/setup_mac.py` に渡します。`setup.sh` などの入口から実行した場合も、この Mac 専用 parser が処理します。根拠: `setup.py:7703-7707`、`setup.py:9068-9069`。
+`--family` は `--model` と組み合わせて指定できます。family だけを指定した場合のモデル選択は「実行時の動作」を参照してください。
 
 ## 値と既定値
 
-- 値は `qwen`、`unsloth`、`gyro` に限定されます。省略時の値は `None` です。parser は不正な値を受理せず、`argparse` の引数エラーとして終了します。根拠: `metal/setup_mac.py:327-331`。
-- モデルを省略すると Mac 用モデル一覧から対話的に選びます。`--family` による一覧の絞り込みはありません。モデル一覧は `MAC_MODELS` に基づきます。根拠: `metal/setup_mac.py:392-401`、`strata_control/mac_fit.py:19-34`。
-- `--family` の重複指定時の独自処理はありません。通常の `argparse` の store 動作により最後に指定した値が引数値になります。
+- 省略時は `None` です。短縮別名はありません。
+- parser の choices は組み込みの `qwen`、`unsloth`、`gyro` と、セットアップ前に読み込まれた feed の family ID です。feed の family は `strata_control.mac_fit.FEED_FAMILIES` に加えられ、`MAC_MODELS` にモデルが登録されます。
+- feed の family を指定した場合、feed が取得できなければ前回検証済みのキャッシュが利用されることがあります。どちらも利用できず family ID が choices にない場合、parser は値を受理しません。
 
 ## 実行時の動作
 
-選択したモデル名から `MAC_MODELS[model].get("family", "qwen")` で family を決定します。`--family` があり、その値がモデルの family と異なるときは `--family <指定値>: <model> is a <family> file; using <family>` の警告を出し、モデル側の family を採用します。たとえば `--family qwen --model Gyro-S` は `gyro` として処理されます。根拠: `metal/setup_mac.py:415-419`、モデル別 family の定義は `strata_control/mac_fit.py:19-34`。
+1. `setup.py` は macOS で通常の PC 用 parser を通さず、引数を `metal/setup_mac.py` にそのまま渡します。
+2. `setup_mac.py` は parser を作る前に `--family` を確認します。組み込み 3 family 以外の値なら、署名 feed のモデル一覧を読み込んで feed family を登録しようとします。
+3. parser は `--family` を choices で検証します。モデルは別引数 `--model` で指定し、`--model` がなければ `--family` による絞り込みをせず、利用可能なモデル一覧から対話選択します。
+4. 既存の設定があり、`--setup`、`--model`、`--check`、`--no-start`、`--update`、`--build` のいずれもない場合は、既存モデルをそのまま起動する早期経路に入ります。この条件には `--family` が含まれないため、`--family` 単独では既存モデルの起動先を切り替えません。
+5. セットアップ経路では、選ばれたモデルの `MAC_MODELS[model].family`（未設定なら `qwen`）を実際の family として採用します。`--family` と違えば `--family <指定値>: <model> is a <family> file; using <family>` と警告して続行します。この family がダウンロード元、モデルタグ、準備処理、設定ファイル名に使われます。
 
-採用された family はダウンロード元・ファイル名・タグ等を定める `setup.py` の `FAMILIES` エントリに使われ、モデル shard の選択にも反映されます。Gyro は単一ファイル、Unsloth はモデルごとの複数 shard、通常の Qwen は標準の Qwen shard 名を使います。pack 処理では family の `pack_args` も渡されます。根拠: `setup.py:572-640`、`metal/setup_mac.py:66-74`、`metal/setup_mac.py:418-420`、`metal/setup_mac.py:509-515`。
-
-既存の Mac 設定が見つかり、`--setup`、`--model`、`--check`、`--no-start`、`--update`、`--build` のいずれも指定されていない場合、設定済みモデルをすぐ起動します。この早期分岐の判定には `a.family` が含まれないため、`--family` 単独では設定選択や再セットアップを起こさず、値は実質使われません。根拠: `metal/setup_mac.py:369-371`。
+feed family の読み込みは、未登録 family を指定しただけでも parser 検証より先に試みられます。feed の取得が有効で署名付き一覧を取得できた場合、その一覧はオフライン利用用キャッシュに記録されます。取得失敗時は既存の検証済みキャッシュにフォールバックし、一覧がない場合は feed 由来の選択肢は追加されません。
 
 ## 適用条件と副作用
 
-この文書は `setup.py` が Apple Silicon の通常 setup を `metal/setup_mac.py` に委譲する `source-setup/mac/` scope の説明です。`setup.py` の一般 parser は macOS 委譲より後に作られるため、同じ `--family` でも受理値と挙動は異なり得ます。根拠: `setup.py:9068-9072`、索引 [`docs/cli/README.md`](../../README.md) の `metal/setup_mac.py` scope 説明。
-
-新規セットアップ経路では `--family` 自体はダウンロードや設定ファイルを書き換えませんが、モデル表を通じて実際に処理する family が決まり、その後のダウンロード、pack、設定・起動スクリプト生成に影響します。これらの処理はモデル選択後に実行されます。根拠: `metal/setup_mac.py:415-420`、`metal/setup_mac.py:428-435`、`metal/setup_mac.py:559-570`。
+- この文書の parser は Apple Silicon / macOS の Metal セットアップ用です。`setup.py` は `sys.platform == "darwin"` かつ Control モードでない場合に `metal/setup_mac.py` を呼び出します。
+- family のみを指定して既存設定がない場合、モデル一覧から選択します。指定 family に応じた絞り込みや、その family のモデルを自動選択する処理は確認できません。
+- feed family の照会は、対象値が組み込み family 以外の場合に parser 構築前に起きます。feed を取得できる条件ではネットワークアクセスがあり、取得した署名付きモデル一覧は更新 feed 用ディレクトリの `feed-models.json` に保存されます。保存できない場合は警告ログにとどまり、処理を続けます。
+- モデルのダウンロード、ビルド、モデル準備などの副作用は、`--family` 自体ではなく、後続のセットアップ経路と選択モデルによって発生します。
 
 ## 出力とエラー
 
-- 有効な値でもモデル family と食い違うときは警告し、モデルに対応する family で続行します。family の不一致だけを理由に失敗しません。根拠: `metal/setup_mac.py:415-418`。
-- 選択肢にない値は parser が拒否します。`parse_known_args` により未知の引数は `not used on a Mac: ...` と警告して続行しますが、これは `--family` に無効値を指定した場合とは異なります。根拠: `metal/setup_mac.py:356-358`。
-- family が一致していても、その後の Mac 検査、ダウンロード、build 等が失敗すれば setup は別の理由で停止し得ます。このオプション単独の終了コードは定義されていません。
+- 指定値と選択モデルの family が異なる場合、`S.warn` による警告を表示し、モデル側の family で続行します。
+- family が parser choices に含まれない場合は choices 検証で拒否されます。未登録の値では、その検証より前に feed 読み込みが試行される場合があります。
+- このオプション専用の Strata エラー出力や終了コードは確認できません。feed の取得・キャッシュ読込エラーは `feed_models.load` 内で処理され、最終的に利用できるキャッシュがなければ feed family を追加せずに戻ります。
 
 ## 根拠
 
-- parser と unknown argument 処理: `metal/setup_mac.py:327-358`
-- 既存設定からの早期起動: `metal/setup_mac.py:369-371`
-- モデル選択と family の決定・不一致警告: `metal/setup_mac.py:392-420`
-- family ごとの Mac モデル定義: `strata_control/mac_fit.py:19-34`
-- family 別ファイル選択・pack 呼び出し: `metal/setup_mac.py:66-74`、`metal/setup_mac.py:509-515`
-- family の配布元・タグ等の定義: `setup.py:572-640`
-- Mac setup への委譲: `setup.py:7703-7707`、`setup.py:9068-9069`
+- `setup.py:8309-8313` — macOS で使用するセットアップ実装への引数委譲。
+- `setup.py:9330-9331` — macOS かつ Control モードでない場合に Metal セットアップへ入る条件。
+- `metal/setup_mac.py:360-368` — 組み込み外の `--family` を parser 作成前に検出して feed モデル一覧を読む条件。
+- `metal/setup_mac.py:371-378` — `--family` の parser 定義、既定値、choices、および別引数 `--model`。
+- `metal/setup_mac.py:402-404` — parser が既知引数を解析し、残りの引数を警告する処理。
+- `metal/setup_mac.py:415-417` — 既存設定をそのまま起動する早期経路。条件に `a.family` が含まれない。
+- `metal/setup_mac.py:433-447` — `--model` 未指定時は全モデル一覧から選び、family 値で絞らない処理。
+- `metal/setup_mac.py:461-465` — モデル定義から実 family を決め、指定値との不一致を警告してモデル側を採用する処理。
+- `metal/setup_mac.py:496-512` — 実 family とモデルを使うダウンロード・shard 検証・family pin 検証。
+- `strata_control/mac_fit.py:176-185` — 組み込み Mac family と feed family リスト。
+- `strata_control/feed_models.py:110-137` — feed 取得、検証済みキャッシュへのフォールバック、取得一覧の記録。
+- `strata_control/feed_models.py:337-347` — feed モデルを `MAC_MODELS` と `FEED_FAMILIES` に登録する処理。
+- `setup.py:8568-8583` — Mac セットアップから呼ばれる feed モデル読み込みと登録。

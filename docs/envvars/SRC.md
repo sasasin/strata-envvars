@@ -1,41 +1,41 @@
 # `SRC`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-`SRC` は、Linux 向けの Strata engine / 補助 engine のビルド用シェルスクリプトが、ソース checkout の場所を指定するために読む環境変数です。対象は `packaging/build_hip_linux.sh`、`packaging/build_dsv41_hip_linux.sh`、`packaging/build_dsv41_cuda.sh`、`packaging/build_split_cuda.sh`、`packaging/build_split_hip.sh` です。通常の Strata engine 実行時の設定ではありません。
-
-これらのスクリプトは、値を CMake のソースディレクトリに渡すか、そのディレクトリへ移動してビルドを開始します。`build_hip_linux.sh` は同じ checkout 内の `tools/vision` もビルドします。ソースパスが変わるため、tarball checkout で `COMMIT` を指定している一部の経路では、その checkout の `BUILD_ID` へ build ID を書き込みます（下記「有効になる条件」参照）。
+`SRC` は Strata 本体の実行時設定ではなく、Linux 向け packaging 用 shell script がビルド対象の Strata checkout のルートを指定するために読む。`packaging/build_split_cuda.sh`、`packaging/build_split_hip.sh`、`packaging/build_hip_linux.sh` の3本で参照される。どのスクリプトでも、選ばれたパスを CMake のソースディレクトリに渡す。HIP の2本はその後も `SRC` を `cd`、相対ファイルの参照や出力先に使う（`packaging/build_split_cuda.sh:13,23`、`packaging/build_split_hip.sh:18,31`、`packaging/build_hip_linux.sh:23,50,58-59,63`）。
 
 ## 値と判定
 
-5 スクリプトとも Bash の `SRC=${SRC:-$(cd "$(dirname "$0")/.." && pwd)}` をスクリプト開始時に評価します（`packaging/build_hip_linux.sh:22-24`、`packaging/build_dsv41_hip_linux.sh:14-17`、`packaging/build_dsv41_cuda.sh:13-17`、`packaging/build_split_cuda.sh:12-16`、`packaging/build_split_hip.sh:17-22`）。
+各スクリプトは Bash の `${SRC:-既定値}` を使う。この形式では未設定または空文字のとき既定値となり、非空文字列はそのまま採用される。パスとしての検証、正規化、空白除去は `SRC` の代入時には行われない（`packaging/build_split_cuda.sh:13`、`packaging/build_split_hip.sh:18`、`packaging/build_hip_linux.sh:23`）。
 
-| 入力 | 採用値・結果 |
-|---|---|
-| unset | 実行中スクリプトの `packaging/` の親ディレクトリを `pwd` で求めたパス |
-| 空文字 | unset と同じ既定パス（`:-` は未設定と空文字の両方で右辺を使う） |
-| 非空文字列 | 渡された文字列をパスとしてそのまま使う |
+| 条件（script） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| Linux CUDA split / HIP split / HIP package | `$(cd "$(dirname "$0")/.." && pwd)` | 非空の checkout パス。例: `/work/Strata` | 空文字は設定値として使われず既定値に戻る。存在しないパスや Strata 以外のパスも代入段階では拒否されないが、後続コマンドが失敗し得る |
 
-文字列を数値や真偽値に変換せず、空白除去・存在確認・絶対パス化も共通処理としては行いません。相対パスはスクリプトを起動した作業ディレクトリ基準です。値はスクリプト内で一度シェル展開され、実行中に環境値を変えても再評価されません。CLI の `SRC` 引数はありません。ほかの build 変数（`B`、`CUDA`、`GG`、`HP`、`LLAMA` 等）は各スクリプトで別途要求・設定されます。
+値の大文字小文字や数値としての妥当性は判定しない。`SRC` に空白を含むパスは代入後は引用されて利用されるが、値自体を検査する処理はない。`SRC` に関する CLI 引数や別環境変数との優先順位はなく、3本のスクリプトでは `SRC` が非空なら環境値、未設定または空ならスクリプト位置から計算した既定値を使う（同上）。
 
 ## 有効になる条件
 
-- 適用先は前記 5 つの Linux packaging build script を実行したときだけです。CUDA 系では `cmake -S "$SRC"` に渡されます（`packaging/build_dsv41_cuda.sh:27-32`、`packaging/build_split_cuda.sh:21-25`）。HIP split も同様です（`packaging/build_split_hip.sh:29-34`）。HIP engine / DSV41 は `cd "$SRC"` した後、CMake のソースとして `.` を使います（`packaging/build_hip_linux.sh:58-63`、`packaging/build_dsv41_hip_linux.sh:43-48`）。
-- 変数自身に backend や GPU 判定はありません。どのビルドを行うかは実行したスクリプトで決まり、各スクリプトが CUDA または HIP の CMake オプションを指定します。通常の engine 起動、CLI、サーバーの設定には読み取り箇所がありません。
-- `packaging/build_dsv41_cuda.sh` は `$SRC/.git` も `$SRC/BUILD_ID` もない場合、非空の `COMMIT` を要求します。なければ stderr に `build_dsv41_cuda.sh: $SRC has no .git and no BUILD_ID: set COMMIT=<hex> so the engine can print its commit` と出して終了コード 2 です（同ファイル 23-25 行）。`COMMIT` がある場合は先頭 9 文字を `$SRC/BUILD_ID` に書きます。
-- `packaging/build_hip_linux.sh` と `packaging/build_dsv41_hip_linux.sh` は、`COMMIT` が既定値 `unknown` でなく、かつ `$SRC/.git` と `$SRC/BUILD_ID` が両方ない場合に、先頭 9 文字を `$SRC/BUILD_ID` に書きます（`packaging/build_hip_linux.sh:31,49-51`、`packaging/build_dsv41_hip_linux.sh:23,36-37`）。これらのスクリプトは `cd "$SRC" || exit 1` を使い、移動に失敗すると終了します（`packaging/build_hip_linux.sh:58-59`、`packaging/build_dsv41_hip_linux.sh:43-44`）。
-- ほかのパス検査や CMake 設定の成否は各 build script / CMake の処理に委ねられます。`SRC` 専用の clamp、fallback、優先順位上書きはありません。
+- `SRC` が使われるのは、上記の Linux packaging script を起動した場合に限られる。Strata engine の通常実行や Windows packaging の外部設定として読む箇所は見つからなかった。
+- `build_split_cuda.sh` はさらに `B` と `CUDA`、`build_split_hip.sh` は `B` と `HP`、`build_hip_linux.sh` は `VARIANT` と `HP` を要求する。これらがない場合、それぞれの script の必須変数展開が処理を止める（`packaging/build_split_cuda.sh:14-15`、`packaging/build_split_hip.sh:19-20`、`packaging/build_hip_linux.sh:22,26`）。
+- パスが不正または必要なソースツリーを含まない場合の専用 `SRC` エラー処理はない。後続の `cmake`、`cd`、`. "$SRC/packaging/shape_build.sh"` などの失敗として現れる（`packaging/build_split_cuda.sh:23`、`packaging/build_split_hip.sh:31`、`packaging/build_hip_linux.sh:58-65`）。
+- `packaging/build_vision_windows.bat` と `tools/hip/build_windows.bat` は `SRC` を環境から読むのではなく、それぞれ `%~dp0` からローカル変数として設定する（`packaging/build_vision_windows.bat:20,25`、`tools/hip/build_windows.bat:25-32`）。
 
 ## 実行時の詳細
 
-環境からの読み取りは各シェルスクリプトの冒頭で一度行われる build-time の選択です。値は CMake の `-S` に渡されるか、`cd` の対象となります。エンジン起動時の設定として `SRC` を明示的に転送する処理はありません（起動元から受け継いだ環境変数が build 子プロセスに継承される場合はあります）。`build_hip_linux.sh` では選択した checkout から engine を構成し、`VISION_ONLY` が空の場合には `strata`（必要なら DSV41）も構成します（`packaging/build_hip_linux.sh:60-80`）。`SRC` が不正な場合、明示的なディレクトリ移動のある HIP engine / DSV41 スクリプトは終了コード 1 で止まり、他のスクリプトは CMake がソースパスを処理する段階で失敗し得ます。
+値は各 shell script の冒頭で一度展開され、代入後の `SRC` は CMake の `-S` 引数や shell のパス引数として使われる（`packaging/build_split_cuda.sh:13,23`、`packaging/build_split_hip.sh:18,31`、`packaging/build_hip_linux.sh:23,50,58-59,63`）。
 
-同じ名前は `tests/dsv41/build_dq_test.sh:7-17` にもありますが、これはテスト専用ビルド補助です。候補一覧に現れるその他の `SRC` は、スクリプトが環境値を参照して代入するケースではなく、Windows batch が checkout パスを設定し直す箇所や、Python のローカル変数・CLI の `SRC=DEST` 表記等でした（例: `packaging/build_vision_windows.bat:25`、`tools/hip/build_windows.bat:26`）。それらを環境変数の読み取りとは扱っていません。
+CUDA split script は `SRC` を CMake のソースパスにのみ使用する。HIP split script も CMake の `-S` に渡す。HIP package script はさらに `SRC/.git` と `SRC/BUILD_ID` を調べ、条件を満たす場合は `BUILD_ID` を書き、`SRC` に移動して `packaging/shape_build.sh` を読み込む。この処理は `SRC` の指す checkout にファイルを書き込む場合がある（`packaging/build_hip_linux.sh:48-50,58-59`）。
+
+## ログと測定値
+
+`SRC` の値自体を表示する専用ログや警告は確認できなかった。ビルド失敗時は各後続コマンドのエラー経路となる。`build_split_cuda.sh` と `build_split_hip.sh` は生成バイナリが見つからない場合にそれぞれ `build_split_cuda.sh: no strata-split-$n`、`build_split_hip.sh: no strata-split-$n` を stderr に出して終了するが、これらは `SRC` の検証ログではない（`packaging/build_split_cuda.sh:29-31`、`packaging/build_split_hip.sh:38-40`）。性能測定値は該当しない。
 
 ## 根拠
 
-- 既定値と未設定・空文字時の分岐: `packaging/build_hip_linux.sh:22-24`、`packaging/build_dsv41_hip_linux.sh:14-17`、`packaging/build_dsv41_cuda.sh:13-17`、`packaging/build_split_cuda.sh:12-16`、`packaging/build_split_hip.sh:17-22`。
-- ソースパスの CMake / 作業ディレクトリへの適用: `packaging/build_dsv41_cuda.sh:27-32`、`packaging/build_split_cuda.sh:21-25`、`packaging/build_split_hip.sh:29-34`、`packaging/build_hip_linux.sh:58-63,79-86`、`packaging/build_dsv41_hip_linux.sh:43-48`。
-- tarball の build ID 処理と失敗経路: `packaging/build_dsv41_cuda.sh:23-25`、`packaging/build_hip_linux.sh:49-51,58-59`、`packaging/build_dsv41_hip_linux.sh:36-37,43-44`。
+- `packaging/build_split_cuda.sh:6,13-16,23` — 使用例、既定値、CMake への引き渡し。
+- `packaging/build_split_hip.sh:10,18-23,31` — 使用例、既定値、CMake への引き渡し。
+- `packaging/build_hip_linux.sh:9,23-26,48-50,58-65` — 使用例、既定値、checkout 内の参照・書き込みと CMake 呼び出し。
+- `packaging/build_vision_windows.bat:20-25`、`tools/hip/build_windows.bat:25-32` — `SRC` を環境から読まず、スクリプト位置をもとに設定。

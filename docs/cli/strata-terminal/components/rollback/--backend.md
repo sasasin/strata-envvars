@@ -1,6 +1,6 @@
 # `strata components rollback --backend`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,57 +8,56 @@
 | コマンド | `strata components rollback` |
 | オプション | `--backend` |
 | 別名 | なし |
-| 値 | エンジンの backend 名。parser では文字列をそのまま受け取り、選択肢を限定しません。 |
+| 値 | エンジン backend 名を表す文字列。parser は選択肢を制限しない |
 
 ## 役割
 
-PC の GPU backend 自動検出を上書きし、その backend を対象に「直近の切替または更新で保持された前の engine」へ戻せるか確認します。rollback 対象の engine は保存状態の `previous` から決まり、`--backend` で任意の engine package を指定するわけではありません。
+ロールバック時に対象とする GPU/backend を指定する。ロールバック先のバージョン自体は components store の状態に記録された `previous` から取得されるため、このオプションはロールバック先を名前で選ぶものではない。指定 backend に対して、現在使用中のエンジンを判定し、保存済みの前バージョンがこの PC で起動可能かを検査する。
 
 ## 使い方
 
 ```sh
-strata components rollback --backend hip
+# AMD backend として記録された前バージョンへ戻す
+strata components rollback --backend amd
 ```
 
-指定を省略する場合:
-
-```sh
-strata components rollback
-```
+実行には rollback 対象の前バージョンが components store に保存されている必要がある。標準では backend を自動検出する。
 
 ## 値と既定値
 
-- 値は必須の文字列です。`argparse` の `type`、`choices`、独自の CLI validation は設定されていません。既定値は `None` です（`strata_cli/update_cmd.py:47-56,80-82`）。
-- 実行時には前後の空白を除き小文字化します。`hip-<variant>` 形式は `hip` backend と variant に分解されます。それ以外は backend 名としてそのまま渡されます（`strata_control/engine_component.py:465-471`）。
-- 空白だけの値は parser では受理されますが、分解後の backend は空文字列になります。rollback resolver では `None` の場合だけ自動検出へ進むため、この値は自動検出に戻らず engine 選択に失敗します（`strata_cli/update_cmd.py:247-252`、`strata_control/engine_component.py:1012-1027,1043-1045`）。
-- `nvidia` / `amd` / `intel` などの別名変換はこの経路では行われません。`clean_backend_name()` は launch 用の別処理であり、rollback の `run()` からは呼ばれません（`strata_control/engine_component.py:474-482`、`strata_cli/update_cmd.py:244-252`）。
-- 未指定なら `updater.detect_hardware()` が検出した値を使います。同関数は `STRATA_ENGINE_BACKEND` も検出入力として扱います（`strata_control/updater.py:261-281`）。
+- `--backend` は値を1つ取る。parser は `default=None` で、`choices` や独自の型変換を指定していない（`strata_cli/update_cmd.py:47-56,80-81`）。値を省略すると argparse が使用法エラーにする。
+- 明示値は前後の空白を除去して小文字化される。`nvidia` は `cuda`、`amd` は `hip`、`intel` と `arc` は `sycl` に対応する。`hip-<variant>` は backend `hip` と variant に分けられる（`strata_control/engine_component.py:476-488`）。
+- 空文字列を明示した場合は `a.backend` が偽として扱われ、未指定と同じ自動検出経路に入る（`strata_cli/update_cmd.py:310-315`）。
+- parser は任意の文字列を受け付けるため、未知名は parser 段階では拒否されない。後続の engine 解決時に適合する engine が見つからなければ失敗する（`strata_cli/update_cmd.py:279-296`、`strata_control/engine_component.py:1081-1114`）。
+- 未指定時は `updater.detect_hardware()` を使い、通常の backend 検出に加えて `STRATA_ENGINE_BACKEND` の指定も反映する。`--backend` を指定した場合はその値から hardware 情報を作る（`strata_cli/update_cmd.py:279-296,310-315`、`strata_control/updater.py:316-336`）。
 
 ## 実行時の動作
 
-`run()` はまず自動検出した hardware 情報を作り、`--backend` が空文字列でなければその値で `hardware["backend"]` を上書きします。`hip-<variant>` の場合は分解結果を `variant_wanted` にも記録します（`strata_cli/update_cmd.py:233-255`）。
+`--backend` が指定されると、`requested_hardware()` が値を backend と variant に分け、認識済み backend family ならその family を `STRATA_ENGINE_BACKEND` として hardware 検出に渡す。未知 family は検出した hardware 情報の backend 欄をその値に置き換える（`strata_cli/update_cmd.py:279-296`）。
 
-rollback は `updater.rollback_engine()` に進み、状態ファイルの `engine.previous` が指す folder の manifest と署名・全ファイルを検証します。続いて、現在選択される engine と rollback 先を切り替える際に `hardware["backend"]` を `engine_component.resolve()` に渡して、指定 backend で使用可能かを確認します（`strata_control/updater.py:1355-1377,1303-1329`、`strata_control/engine_component.py:1012-1045,1064-1097`）。したがって指定 backend に対応する保持済み engine がない場合や、platform・runtime・GPU architecture・driver 条件を満たさない場合は切替できません。実機の platform や GPU architecture 情報は backend 上書きだけでは置き換わりません（`strata_control/updater.py:261-281`）。
+rollback 処理は state の `engine.previous` を対象フォルダーとして読み込み、稼働中の server/engine がないか確認してから、manifest と全ファイルを検証する。その後、指定 backend の hardware 情報で「現在の engine」を解決し、rollback 先へ切り替える。切り替えは engine をダウンロード・削除せず、次回起動でその engine が選ばれるよう pin と active/previous の状態を更新する（`strata_control/updater.py:1450-1472,1398-1447`）。
 
-この rollback 経路では分解した `variant_wanted` は参照されず、resolver に渡るのは backend family です。したがって `--backend hip-rdna2` は `hip` family として適合性を確認し、`rdna2` variant の package を明示選択する指定にはなりません（`strata_cli/update_cmd.py:247-260`、`strata_control/updater.py:1355-1377`）。
+`hip-<variant>` の variant は hardware 情報に保持されるが、rollback の対象 folder は state の `previous` で決まり、rollback 処理は feed package 選択を行わない（`strata_cli/update_cmd.py:287-296,318-322`、`strata_control/updater.py:1450-1472`）。
 
 ## 適用条件と副作用
 
-- rollback は feed からのダウンロードを行いません。成功すると engine の `pinned`、`previous`、`active` 等の状態を更新し、成功履歴を保存します。engine package 自体を削除しません（`strata_control/updater.py:1303-1352,1355-1377`）。
-- backend 指定文字列自体を設定ファイルに保存する処理はありません。ただし成功した切替では対象 package の pin が状態に保存されます。backend 指定が検証にだけ使われる一時値でも、結果としての engine pin は後続の起動に影響します（`strata_control/updater.py:1313-1328,1345-1350`）。
-- 切替前に稼働中 engine があれば、`--wait` が指定されている場合は停止まで待機し、指定がなく対話端末なら待機確認を行います。非対話または machine output の場合は確認せず、稼働状態なら Busy として拒否されます（`strata_cli/update_cmd.py:403-418,257-260`、`strata_control/updater.py:311-322,1364-1365`）。
-- engine の変更に伴い、必要な場合は保存済み tuning preset を短い再確認対象としてマークします（`strata_control/updater.py:1345-1352`、`strata_cli/update_cmd.py:264-270`）。
+- rollback は components folder の update lock を取得して実行する。同じ folder に対する別の update 操作が lock を保持中なら busy エラーになる（`strata_control/updater.py:195-215,1453-1455`）。
+- `--wait` を指定した場合、稼働中の engine が停止するまでその秒数の範囲で待つ。未指定または `0` の場合、対話端末では待つか確認し、非対話または machine output では待たずに busy として扱う（`strata_cli/update_cmd.py:473-488`）。rollback の実処理でも `wait_until_idle()` が稼働状態を再確認する（`strata_control/updater.py:366-378,1459-1461`）。
+- 成功時は `<components-dir>/.updates/state.json` を更新し、前後の engine、pin、rollback 履歴を記録する。engine が変わった場合、保存済み tuning preset は削除せず短い再確認の対象として印を付ける（`strata_control/updater.py:227-233,1398-1447`、出力は `strata_cli/update_cmd.py:325-331`）。
+- `--components-dir` を省略した場合は既定の components folder を使う。backend はその folder 内の engine 解決に適用される（`strata_cli/update_cmd.py:261-277,310-315`）。
 
 ## 出力とエラー
 
-- 成功時は標準出力に切替元・切替先を表示し、preset の状態と次の操作を案内します。比較上 rollback 先が新しい版なら「rolled-forward」として表示されます。`--output json` / `--json` では JSON 結果を出力します（`strata_cli/update_cmd.py:257-270`、`strata_cli/cli.py:508-515,2249-2254`）。
-- `previous` がない、または既にその engine を使っている場合は終了コード 2。対象 package が壊れている・署名検証に失敗する場合、指定 backend で使用できない場合は終了コード 5 です（`strata_control/updater.py:1361-1376,1327-1336`）。
-- 稼働中 engine の終了待ちが必要なのに待機できない場合は Busy による終了コード 7 です。失敗は human 出力では標準エラーに `strata:` 付きで出力し、JSON 系出力ではエラー JSON になります（`strata_control/updater.py:72-83`、`strata_cli/update_cmd.py:237-242,307-311`）。
+- 成功時は human 出力で変更前後の version と preset の扱いを表示する。`--output json` または `--json` では JSON を stdout に出す（`strata_cli/update_cmd.py:318-331`、`strata_cli/cli.py:2266-2269`）。
+- 前バージョンが記録されていない場合、すでにその前バージョンが使用中の場合は終了コード `2`。前バージョンの manifest / 完全性検証に失敗した場合、または rollback 先が現在の PC で起動可能な engine として解決できない場合は終了コード `5`（`strata_control/updater.py:1456-1471,1422-1431`）。
+- 稼働中の engine が待機時間内に停止しない場合や同じ components folder がロック中の場合は busy エラー（終了コード `7`）（`strata_control/updater.py:366-378,195-215`）。
+- 捕捉された `UpdateError` は human 出力では stderr、JSON 出力では `error.code` と `error.message` を含む JSON として出され、同じ終了コードで終了する（`strata_cli/update_cmd.py:303-308,368-372`）。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:47-56,80-82` — 共通 parser の `--backend` 宣言と rollback parser への登録。
-- `strata_cli/update_cmd.py:233-271` — hardware backend の上書き、rollback の呼び出し、結果出力。
-- `strata_control/engine_component.py:465-482,1012-1045,1064-1097` — backend/variant 分解、resolver の適合性判定と engine 選択。
-- `strata_control/updater.py:261-281,1303-1352,1355-1377` — 検出値、pin/履歴更新、rollback 対象の検証と切替。
-- `strata_cli/update_cmd.py:403-418`、`strata_control/updater.py:311-322` — 稼働中 engine の待機・拒否。
+- `strata_cli/update_cmd.py:47-56,80-81` — 共通 parser の `--backend` 宣言と rollback parser への登録。
+- `strata_cli/update_cmd.py:279-296,310-322` — 値の変換、hardware 検出への反映、rollback 分岐。
+- `strata_control/engine_component.py:476-488` — backend alias と `hip-<variant>` の変換規則。
+- `strata_control/updater.py:316-336,594-599,1081-1114` — backend を使った hardware 情報生成と installed engine 解決。
+- `strata_control/updater.py:1398-1472` — engine の pin・状態更新、前バージョンの検証と rollback。
+- `strata_cli/update_cmd.py:303-308,318-331,368-372,473-488`、`strata_control/updater.py:195-215,366-378` — 出力、失敗コード、稼働中 engine の待機。

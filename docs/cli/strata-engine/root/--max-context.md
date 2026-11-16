@@ -1,61 +1,64 @@
 # `--max-context`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | ネイティブ `strata` エンジンのトップレベル生成コマンド |
+| コマンド | `strata`（推論エンジン、root 引数） |
 | オプション | `--max-context` |
 | 別名 | なし |
-| 値 | 整数 `N`。KV/状態の最大セル数（context capacity） |
+| 値 | 整数 `N`（token/cell 数） |
 
 ## 役割
 
-生成セッションが保持できるコンテキストの上限を指定します。prompt と生成分を収容する必要があり、この容量に応じてセッション状態（主に KV）のサイズと、生成が続けられる位置が決まります。モデルが学習した context 長や RoPE scaling の指定そのものではありません（parser と既定値: `src/program/generate.cpp:418-423, 866-875`）。
+エンジンが確保し、prompt と生成に利用できる context/KV/state の最大 cell 数を指定する。大きくすると長い prompt や生成を収容できる一方、session 状態の確保量に影響する。モデルの学習済み context 長を変更する指定ではなく、RoPE の拡張設定は別途扱われる。
 
 ## 使い方
 
 ```sh
-strata --pack /path/to/model-pack --tokens 1,2,3 --max-new 128 --max-context 8192
+strata --pack /path/to/pack --tokens '1,2,3' --max-context 8192 --max-new 256
 ```
 
-`--tokens` にはモデルの語彙範囲にある token ID を指定します。`--pack` は利用するモデル pack のパスです。例の値は構文例であり、モデル・GPU に対する推奨値ではありません。
+この例では通常 engine の token ID 入力に対して context 上限を 8192 cell、生成上限を 256 token として起動する。実際の起動にはモデル/pack など実行環境に合った入力が必要。
 
 ## 値と既定値
 
-- 省略時は `4096` です（`src/program/generate.cpp:418-423`）。
-- 値は `std::atoll` で `int64_t` に読み取られます。値を省略すると `--max-context needs a value` を stderr に出して終了コード `2` で終了します（`src/program/generate.cpp:2416-2421, 2444-2446`）。数値文字列の厳密な全体検査はこの parser にはありません。数値として読み取れず `0` になった値は後段の正数検査で拒否されます。
-- 有効な範囲は `1` 以上 `2147483639` 以下です。上限を超えると `strata generate: --max-context must be below 2^31`、0 以下は `strata generate: positive --max-new and --max-context must fit the prompt and generation` を stderr に出し、終了コード `2` で終了します（`src/program/generate.cpp:3302-3310`）。
-- 同じオプションを複数回指定した場合、parser は出現ごとに同じフィールドへ代入するため、後の値が残ります（`src/program/generate.cpp:2416-2421, 2444-2446`）。
+- 値は必須。parser は `--max-context` の直後の引数を `std::atoll` で `int64_t` に変換する。引数が欠けると stderr に `--max-context needs a value` を出して終了コード 2 で終了する。
+- 既定値は `4096`。短い数値で始まる不正な文字列を厳密に拒否する処理は parser にない。`atoll` の変換結果が 0 となる値や、負数は後続の正数検査で拒否される。
+- 有効条件は `max_context > 0`、`max_context <= 2147483639`（`2^31 - 1 - 8`）、かつ `max_new <= max_context` と prompt token 数が `max_context - max_new` 以下であること。`--max-new` の既定値は 16。
+- `--serve` では各リクエストについて `prompt token 数 + max_new + 8 <= max_context` を検査する。このため、起動時の prompt なし検査を通っても、実際のリクエストは context 不足で拒否されることがある。
 
 ## 実行時の動作
 
-- 起動時に `--max-new` が正で、`--max-new <= --max-context`、かつ prompt token 数が `--max-context - --max-new` 以下であることを検査します。満たさない場合は上記の正数・収容エラーで終了コード `2` になります（`src/program/generate.cpp:3307-3310`）。後段にも prompt と生成上限を合わせた収容検査があり、失敗時は `--max-context N cannot hold P prompt + M new tokens` を stderr に出して `2` を返します（`src/program/generate.cpp:3970-3973`）。
-- `session_bytes` はこの値を使ってセッション arena の必要量を算出し、QSA state と関連 buffer のサイズにも渡します。通常経路ではそのサイズを `cudaMalloc` し、`session_init` に同じ容量を渡します。割当失敗は `session state allocation failed`、初期化失敗は `session_init failed` を stderr に出して終了コード `1` です（`src/core/session.cpp:56-75, 77-109`; `src/program/generate.cpp:5215-5221`）。layer split 時も各 GPU の担当層ごとに同容量を元に状態を確保します（`src/program/generate.cpp:5251-5253`）。
-- この容量は VRAM の空き計算にも使われます。expert cache 用の容量が確保できない診断では、セッションが `N` token 分に必要とする MiB とともに、より小さい `--max-context` が対処候補として stderr に表示されます（`src/program/generate.cpp:6182-6202`）。実際に必要なメモリ量はモデル形状、KV 形式、layer 分割などに依存します。
-- 生成中は容量端で通常の生成を止め、`strata generate: ran out of context at position ...` を stderr に出して終了コード `2` を返す経路があります（`src/program/generate.cpp:15873-15879`）。連続バッチでは prompt + `max_new` に加えて 8 token の余裕を要求し、満たさない request は `ERR ... exceeds the context ...` を stdout に返してその request を処理しません（`src/program/generate.cpp:12485-12489`）。
-- `--kv-grow` を有効にしたときも最大容量そのものは変わりません。コメント上、KV は到達したセルに応じて物理メモリを増やしますが、指定した全セルは引き続き収容可能です（`src/program/generate.cpp:7853-7859, 7885-7891`）。
+- parser が設定した値は session の GPU buffer サイズ計算と初期化に渡される。QSA state の `max_cells` や KV page 数、画像位置テーブルの大きさにも反映されるため、必要なデバイス/ホストメモリはモデル、KV 設定などと合わせて変わる。
+- 生成時は context の位置上限として使われ、上限に達すると生成は継続できない。serve では起動時に `READY <max_context>` を stdout に出し、リクエストごとに上限を検査する。
+- `--rope-scaling`、`--rope-scale`、RoPE 関連の値とは独立した指定。通常 engine は解決済み RoPE 設定と学習済み context を比較して stderr に表示するが、`--max-context` 単独で RoPE scaling を有効化しない。
+- `--max-new` と合わせて prompt と生成を収容する必要がある。context 値は session config にも保存対象設定として記録される。
 
 ## 適用条件と副作用
 
-- `--native-flash-attn-short` との併用では `--max-context <= 256` が必須です。超える場合は stderr に要件を出し、終了コード `2` で終了します（`src/program/generate.cpp:3378-3380`）。
-- `--rope-scaling` が有効な場合、起動時の診断に指定容量とモデルの学習済み context 長が出ます。容量が学習済み長以下なら extension は不要という注記も出ますが、scaling の設定は角度全体に適用されます。`--max-context` が scaling の方式やモデル側の学習済み長を自動変更する処理は確認できません（`src/program/generate.cpp:3732-3743`）。
-- Vision 経路では位置テーブルも `max_context + 64` cells 分作られ、確保・転送に失敗すると `cannot allocate the image position table` を stderr に出して終了コード `1` です（`src/program/generate.cpp:3942-3955`）。
-- session の構成には KV 形式なども関係します。たとえば session 設定 fingerprint に `max_context` と KV 設定が記録されるため、session 再利用の同一性にも容量が含まれます（`src/program/generate.cpp:9432-9447`）。
+- この文書は `src/program/generate.cpp` の通常 engine parser を対象とする。`strata` は `--native` / `--model` が指す GGUF の family を先に判定し、Qwen3.5 MoE では別実装へ委譲する。別 parser のオプション仕様はこの root scope に含めない。
+- session state を CUDA device memory に確保し、失敗すれば推論を開始できない。`--max-context` が大きい場合の必要メモリ量や実行性能の具体値は、モデル、KV 形式、backend、GPU などに依存し、ここでは一律に確定できない。
+- vision が有効な場合、画像位置テーブルは `max_context + 64` cell 分をホスト側に用意し、device に転送する。
 
 ## 出力とエラー
 
-- 値の範囲や prompt/generation 容量の不整合は stderr、終了コード `2` です（`src/program/generate.cpp:3302-3310, 3970-3973`）。
-- context を使い切った通常の生成は stderr、終了コード `2` です。serve 互換の起動経路では準備完了時に stdout へ `READY N stop` を出し、context 上限もクライアントに通知します（`src/program/generate.cpp:11166-11169, 15873-15879`）。
-- GPU の session allocation/initialization や Vision 位置テーブル確保の失敗は stderr、終了コード `1` です（`src/program/generate.cpp:3947-3955, 5215-5221`）。
+- 不正な範囲、`--max-new` との不整合、起動時 prompt が収まらない場合は stderr に `strata generate:` のエラーを出し、終了コード 2 で終了する。
+- serve のリクエストが `prompt + max_new + 8` の条件を満たさない場合は stdout に `ERR prompt ... exceeds the context ...` を出して、そのリクエストを拒否し次の処理へ進む。
+- session buffer の確保失敗は stderr に `session state allocation failed` を出し、終了コード 1。session 初期化失敗も終了コード 1。
+- 生成中に position が context 上限に達した場合は stderr に `ran out of context at position ...` を出して終了コード 2。
 
 ## 根拠
 
-- parser と既定値: `src/program/generate.cpp:418-423, 2416-2421, 2444-2446, 866-875`
-- 値検査と prompt の収容条件: `src/program/generate.cpp:3302-3310, 3970-3973`
-- 容量に基づく session 計算・初期化: `src/core/session.cpp:56-75, 77-109`; `src/program/generate.cpp:5215-5221, 5251-5253`
-- context 終端とバッチ request: `src/program/generate.cpp:12485-12489, 15873-15879`
-- 他 option・副作用との関係: `src/program/generate.cpp:3378-3380, 3732-3743, 3942-3955, 7853-7891, 9432-9447`
-
-索引の対象は `strata-engine/root` です。同名オプションは別 parser スコープにもありますが、この文書では索引が指定する `src/program/generate.cpp` のトップレベル生成 parser のみを扱います（`docs/cli/README.md:1199, 1339, 1373`）。同一 revision の既存 CLI help は実行しておらず、help に書かれた説明は補助資料として照合していません。
+- `src/program/generate.cpp:736-741` — `Options::max_context` の型と既定値。
+- `src/program/generate.cpp:1225-1227` — help にある値の説明と既定値。
+- `src/program/generate.cpp:3667-3672, 3695-3697` — 引数欠落時の処理と `atoll` による parser 登録。
+- `src/program/generate.cpp:3645-3657` — Qwen3.5 MoE を family 判定後に別 parser へ委譲する経路。
+- `src/program/generate.cpp:4870-4877, 5781-5785` — context の上限、正数、`--max-new`・prompt との起動時 validation とエラー終了。
+- `src/program/generate.cpp:5757-5765` — vision 位置テーブルの `max_context + 64` サイズと device allocation。
+- `src/program/generate.cpp:6094-6107, 6757-6781, 7300-7312` — session/KV 容量見積もり、QSA state の最大 cell 数、session buffer の確保・初期化。
+- `src/program/generate.cpp:13085-13096` — `max_context` を session config に含める処理。
+- `src/program/generate.cpp:15201-15202, 17291-17296` — serve の READY 出力と prompt/request 上限エラー。
+- `src/program/generate.cpp:21780-21785` — 生成位置が context 上限に達した場合の失敗経路。
+- `docs/cli/README.md:1000-1074` — `strata-engine` root 引数の索引と、この文書の予定リンク。

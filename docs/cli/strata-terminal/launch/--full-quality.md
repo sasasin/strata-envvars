@@ -1,6 +1,6 @@
 # `--full-quality`
 
-調査対象: Strata commit `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,47 +8,38 @@
 | コマンド | `strata launch` |
 | オプション | `--full-quality` |
 | 別名 | なし |
-| 値 | 取らない真偽フラグ。指定すると有効 |
+| 値 | 値を取らないフラグ。指定時は真、未指定時は偽。 |
 
 ## 役割
 
-DeepSeek-V4.1-Flash の起動で、1語あたり6 expertを使う full quality を選びます。`--speed full` と同じ設定です。parser は `strata_cli/launch/cmd.py:108-111` で `store_true` として定義しています。
+旧 DeepSeek 用スクリプトとの互換性のため parser が受け付ける隠しフラグです。現行 Strata は DeepSeek を提供しないため、このフラグを指定するとモデルの品質設定には使われず、起動前に拒否されます。
 
 ## 使い方
 
 ```sh
-strata launch --model ist-das-2.00bpw --family deepseek41 --full-quality --no-tui
+strata launch --model qwen-model --full-quality
 ```
 
-モデル名は利用可能な DeepSeek モデルに置き換えてください。既存 preset と組み合わせる場合は `strata launch --preset "NAME" --full-quality` のように指定できます。
+この例は互換フラグの拒否経路を示します。現行モデルの品質を変更するコマンド例ではありません。
 
 ## 値と既定値
 
-値は不要です。省略時はこのフラグから speed 設定を変更しません。preset を読み込んだ場合も、`--full-quality` を指定しなければ preset の設定が残ります。フラグを繰り返しても真偽値は有効のままです。文字列値を取る parser 定義ではなく、別名もありません（`strata_cli/launch/cmd.py:75-85,108-112,201-207`）。
+値は不要です。`argparse` の `store_true` で定義され、未指定時は `False` です。追加の値を渡す形式、範囲検証、複数回指定の特別な処理はありません（`strata_cli/launch/cmd.py:110`）。
 
 ## 実行時の動作
 
-起動引数はまず preset（指定時）または新規 `LaunchSettings` に読み込まれ、その上に CLI の設定が反映されます。`--full-quality` がある場合は `s.speed = "full"` を設定します。`--speed faster` も同時に指定したときは `--full-quality` が優先し、警告を追加します。したがって、引数の記述順にかかわらず full が採用されます（`strata_cli/launch/cmd.py:201-207,240-245`）。
+`strata launch` の parser は `--full-quality` を受け付けますが、help 表示からは隠しています（`strata_cli/launch/cmd.py:73-80,110`）。引数設定の構築時に `full_quality` が真なら、他の旧 DeepSeek 専用フラグと同じ経路で `ValueError` を送出し、`strata_control.retired.NOT_OFFERED` の文言を返します。エラー文は「Strata no longer offers DeepSeek models. Run `strata launch` to choose one of the Qwen models.」です（`strata_cli/launch/cmd.py:206-220`、`strata_control/retired.py:42-43`）。
 
-DeepSeek の対象モデルでは `Runner` が選択した engine の版を確認し、対応する場合に設定内の既存 `--experts` 引数を取り除いて `--experts 6` に置き換えます。対応 engine は 0.1.50 以降です（`strata_cli/launch/runner.py:422-425,475-489,2034-2039`）。起動計画と起動後の要約には speed の説明が表示され、計画には実行相当の CLI 表記も含まれます（`strata_cli/launch/runner.py:2011-2022,2041-2050`; `strata_cli/launch/cmd.py:772-783,842-849`; `strata_cli/launch/settings.py:291-318`）。
+したがって、指定しない場合はこのフラグによる変更はありません。指定した場合は品質設定に反映されず、起動処理は続行しません。`--model` 等との組み合わせで拒否を回避できる条件はありません。
 
 ## 適用条件と副作用
 
-- `--full-quality` は `strata launch` の parser に属します。`strata connect` のオプションではありません（`strata_cli/launch/cmd.py:75-82,108-112`）。
-- DeepSeek-V4.1-Flash 以外のモデルでは、speed 設定は「DeepSeek 用で、このモデルでは使わない」という警告とともに `None` に戻されます。通常のモデルにはこの選択肢がないため、expert 数は変わりません（`strata_cli/launch/cmd.py:325-353`）。
-- DeepSeek でも engine が 0.1.50 未満、未検出、または版を取得できない場合は `--experts` を渡さず、engine 側の既定動作に任せます。ソース上、この条件自体は起動失敗にせず、speed の明示値も engine に反映しません（`strata_cli/launch/runner.py:415-425,2024-2039`）。
-- このフラグ単独では preset の保存を指定しません。`--save-preset` などを併用した場合の保存や、通常起動で必要となるモデル準備・server 起動は `strata launch` の動作です。`--plan` を併用した場合は計画表示後に終了し、「Nothing was changed.」と表示します（`strata_cli/launch/cmd.py:755-784,808-824`）。
-
-## 出力とエラー
-
-`--full-quality --speed faster` の組み合わせでは、平文実行時は警告として表示され、JSON 出力では launch 結果または計画の warnings に含まれます。full quality 自体について追加の値検証はありません（`strata_cli/launch/cmd.py:240-245,744-759,785-788,825-829`）。
-
-本フラグに値を付ける構文は parser 定義にありません。parser が不正引数としてどう表示するか・終了コードを返すかは Python `argparse` の共通処理であり、このフラグ固有のエラー経路は確認されませんでした。
+旧コマンドライン呼び出しを認識して案内するための互換入力です。通常の `--help` には表示されず、DeepSeek を実行する機能や品質モードはありません（`strata_cli/launch/cmd.py:109-110,217-220`）。拒否は launch 設定の検証時に起き、`run_launch` はこの `ValueError` を終了コード `2` の失敗として扱います（`strata_cli/launch/cmd.py:798,963-964`）。この拒否経路からモデル起動・ダウンロードへ進む処理は確認できません。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:75-82,108-112` — コマンド階層、フラグ定義と help。
-- `strata_cli/launch/cmd.py:201-207,240-245` — preset 読み込み後の設定反映、`--speed faster` との優先順位。
-- `strata_cli/launch/cmd.py:325-353` — モデル適用条件と DeepSeek 以外での警告・解除。
-- `strata_cli/launch/runner.py:422-425,475-489,1390-1397,2034-2039` — engine 対応版の判定、設定済み `--experts` の置換と実行時の適用。
-- `strata_cli/launch/cmd.py:755-784,808-829` — 計画表示と通常起動の分岐。
+- `strata_cli/launch/cmd.py:73-80,110` — `launch` parser の登録位置、`store_true`、help 非表示。
+- `strata_cli/launch/cmd.py:206-220` — `full_quality` が真の場合の拒否条件と `ValueError`。
+- `strata_control/retired.py:42-43` — 現行の拒否メッセージ。
+- `strata_cli/launch/cmd.py:798,961-964` — launch 設定生成からエラー捕捉、終了コード `2` への変換。
+- `docs/cli/README.md:809-824` — `strata launch` のコマンド階層と索引リンク。

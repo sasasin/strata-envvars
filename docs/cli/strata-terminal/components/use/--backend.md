@@ -1,61 +1,64 @@
-# `--backend`
+# `strata components use --backend`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
-| コマンド | `strata components use` |
+| コマンド | `strata components use <engine>` |
 | オプション | `--backend` |
 | 別名 | なし |
-| 値 | backend 名を取る。parser の `choices` 検査はない |
+| 値 | バックエンド名を取る文字列。parser に型・候補制限はなく、省略時はハードウェア検出を使う |
 
 ## 役割
 
-導入済み engine の切替先を調べるとき、GPU backend の自動検出結果を指定値で上書きします。指定した backend に適合しない engine は使用可能な候補として扱われず、`newest` は指定 backend で使用可能な候補から選ばれます。engine のダウンロードや削除は行いません。
+インストール済みエンジンを選ぶときのバックエンド／ハードウェア条件を指定します。通常は PC の GPU を検出し、明示するとその指定を使って候補の適合性を判定します。検出中の backend と異なるメーカー用エンジンを選んだ場合、かつその GPU が PC に存在すると確認できた場合は、そのメーカーの選択も次回以降の起動用に保存します。`--backend` でそのメーカーを明示して対象 engine と同じ backend にした場合はこの保存経路を通りません。このコマンドはローカルにあるエンジンを切り替えるもので、ダウンロードはしません。
 
 ## 使い方
 
 ```sh
-strata components use newest --backend cuda
+# AMD 用としてインストール済みの 0.1.54 を選ぶ
+strata components use 0.1.54 --backend amd
+
+# CUDA 用の特定フォルダーを選ぶ
+strata components use 0.1.54-linux-x86_64-cuda --backend nvidia
 ```
 
-上の例は `cuda` backend の適合判定で最新の導入済み engine を選びます。特定 engine を選ぶときは `newest` の代わりに版番号または folder 名を指定できます。両 engine family に同じ版番号がある場合は `--family qwen` または `--family deepseek` で絞れます。
+候補のバージョンやフォルダー名は `strata components engines` で確認できます。同じバージョンが複数候補に一致するときは、曖昧さを避けるためフォルダー名を指定します。
 
 ## 値と既定値
 
-- 省略時は `None` です。`strata components use` の実行時には `updater.detect_hardware()` が環境変数 `STRATA_ENGINE_BACKEND`、保存された backend 選択、OS と GPU 検出などから判定した値を使います（`strata_cli/update_cmd.py:244-252`、`strata_control/updater.py:261-281`、`strata_control/engine_component.py:514-540`）。
-- 値を指定すると、前後の空白を除去して小文字化した値で検出結果を上書きします。既知の backend family は `metal`、`cuda`、`hip`、`sycl`、`cpu` です（`strata_control/engine_component.py:465-471`、`strata_control/targets.py:20-29`）。
-- `hip-rdna2` のように `hip-` で始まる未知の名前は `hip` と variant 部分に分割されます。ただし `components use` の一覧・適合判定は backend family を参照し、`variant_wanted` を使って候補を絞り込みません。そのため、このコマンドで variant まで指定しても、同じ `hip` family 内の variant 選択を保証しません（`strata_cli/update_cmd.py:247-251`、`strata_control/engine_library.py:91-110,136-161`）。
-- `nvidia` / `amd` / `intel` などの別名変換はこの経路では行われません。`split_backend()` は `hip-...` 以外をそのまま返すため、backend family の正規名（例: `cuda`、`hip`、`sycl`）を指定してください（`strata_control/engine_component.py:465-482`）。
-- parser に `choices` や専用 validation はありません。未知の値でも parser は受理しますが、一覧の適合判定では backend が一致せず候補が不適合になります（`strata_cli/update_cmd.py:47-56`、`strata_control/engine_library.py:59-80,91-110,136-161`）。
+`strata_cli/update_cmd.py` の共通 parser は `--backend` を `default=None` の文字列引数として登録し、`choices` や `type` を設定していません（`strata_cli/update_cmd.py:47-56,84-87`）。省略時は `updater.detect_hardware()` が使われ、環境変数 `STRATA_ENGINE_BACKEND`、保存済み選択、OS・GPU 検出の順で判断します（`strata_cli/update_cmd.py:310-317`、`strata_control/engine_component.py:528-548`）。
+
+既知の別名は `nvidia` → `cuda`、`amd` → `hip`、`intel` / `arc` → `sycl` です。`hip-rdna2` のような `hip-<variant>` も受け付け、バックエンド `hip` と variant に分けます（`strata_control/engine_component.py:476-488`）。`metal`、`cuda`、`hip`、`sycl`、`cpu` はコンポーネントで扱うバックエンドです（`strata_control/targets.py:22-31`）。
+
+parser は値を検証しません。未知の文字列は parser では拒否されず、後段の候補適合性判定で扱われます。コマンドで使われる適合性判定は OS、バックエンド、Strata runtime、GPU arch、NVIDIA driver とファイル検証を参照します（`strata_control/engine_library.py:65-88`）。
 
 ## 実行時の動作
 
-`--backend` は `strata_cli/update_cmd.py` の `_common()` が定義し、`use` parser にも追加されます。CLI から `update_cmd.run()` に渡された後、検出済み hardware の `backend` を指定値で上書きし、`backend_source` を `requested` にします（`strata_cli/update_cmd.py:47-56,84-87,233-255`、`strata_cli/cli.py:2136-2138`）。
+明示された値は `requested_hardware()` で正規化され、対象バックエンドを環境変数に一時設定したのと同じ形でハードウェア情報を検出します。認識できるバックエンドならその指定が優先され、未知の名前はハードウェア情報の `backend` 欄にそのまま設定されます（`strata_cli/update_cmd.py:279-296,310-317`）。
 
-その hardware 情報を使って導入済み engine を列挙します。Qwen 側では OS、backend、runtime、GPU arch、driver、ファイル検証などを適合判定に使い、DeepSeek 側では OS と backend を確認します。`newest` は適合する候補のうちの最新を指します（`strata_control/engine_library.py:59-80,91-123,136-162,198-211`）。版番号や folder 名を直接指定した場合も、選ばれた entry が不適合なら切替を中止します（`strata_cli/update_cmd.py:378-383`）。
+そのハードウェア情報を使ってインストール済みエンジン一覧を適合性判定し、位置引数のバージョンまたはフォルダー名から対象を特定します（`strata_control/engine_library.py:98-134,184-197`）。`--backend` は一覧の候補を直接選んだり、同一バージョンの曖昧さを解消したりはしません。`--family` が指定されていれば、その値でファミリーを絞って候補を探します（`strata_cli/update_cmd.py:84-87`）。
 
-切替が成功すると、engine が次回以降の起動で使われるよう更新状態を保存します。Qwen engine は pin と履歴・previous 情報を更新し、選んだ engine が自動選択される最新 engine なら pin を外して更新追従に戻します（`strata_control/updater.py:1303-1352`）。DeepSeek engine は選択状態を更新し、保存済み run config の参照先も切り替えます（`strata_control/engine_library.py:265-289`）。engine family の選択は `--family` が別途担います（`strata_cli/update_cmd.py:84-87`）。
+対象が現在の hardware context と異なる backend でも、その backend が実機にある別メーカーなら、Strata のユーザー設定 `engine_backend` に保存してから切り替えます。実装条件は `target.backend != ctx.hardware.backend` かつ `target.backend` が検出済み `makes` に含まれることです。`--backend amd` のように明示指定して context と対象の backend が同じならこの保存分岐には入りません。保存後の切り替えに失敗した場合は以前の選択に戻します（`strata_control/engine_library.py:277-293`、`strata_control/engine_component.py:488-525`）。エンジン選択自体は component state の pin と履歴を更新し、最新エンジンを選ぶ場合は pin を外して更新追従に戻します（`strata_control/updater.py:1398-1447`）。エンジンの同一性が変わると保存済み tuning preset が再確認対象としてマークされる場合がありますが、削除はされません（`strata_control/updater.py:1442-1447`）。
 
 ## 適用条件と副作用
 
-- `--backend` は自動検出を上書きする明示指定です。backend と OS の組み合わせ、engine の runtime 条件、GPU arch や driver 条件、engine ファイルの状態によっては候補が使用不可と判定されます（`strata_cli/update_cmd.py:247-252`、`strata_control/engine_library.py:59-80`、`strata_control/targets.py:20-53`）。
-- backend を変えても engine package は変換されません。指定 backend に適合する導入済み候補がない場合は切替できません。
-- 切替は実行中の model が停止するまで待つか、待機が許可されていない場合は拒否されます。実行中 model が使用中の engine はそのままです（`strata_cli/update_cmd.py:378-383,403-418`、`strata_control/engine_library.py:216-239`）。
-- 成功時は設定・engine 選択状態・履歴が更新され、engine が変わった場合は保存済み tuning preset が短い再確認の対象としてマークされることがあります。preset は削除されません（`strata_control/updater.py:1313-1352`、`strata_cli/update_cmd.py:386-393`）。
+- 対象エンジンが別 OS、未対応バックエンド、非対応 GPU arch、古い runtime / driver、または欠損・改変ファイルに該当すると適合しません（`strata_control/engine_library.py:65-88`）。適合しない場合は切り替えずエラーになります（`strata_cli/update_cmd.py:439-444`）。
+- エンジンを使用中のモデルがある場合は切り替えを拒否または待機します。`--wait` がなければ対話端末では待機確認を出し、非対話では busy エラーになります（`strata_control/engine_library.py:202-228`、`strata_cli/update_cmd.py:473-488`）。
+- 切り替えでローカル component state の engine pin、previous / skipped 情報、履歴が更新されます（`strata_control/updater.py:1404-1445`）。別メーカーのエンジンを選んだ場合はさらにユーザー設定の `engine_backend` が更新されます（`strata_control/engine_library.py:281-292`）。ダウンロードやエンジンファイル削除はこの `use` 経路では行いません（`strata_control/engine_library.py:211-228`）。
+- `hip-<variant>` の variant はハードウェア情報に記録されますが、この `use` の適合性・候補特定では参照されません。候補適合性判定はバックエンド family などを確認し（`strata_control/updater.py:327-336`、`strata_control/engine_library.py:65-88`）、候補名の照合は folder / version / `newest` で行います（`strata_control/engine_library.py:184-197`）。
 
 ## 出力とエラー
 
-- 成功時は通常、人向け出力で使用中になった engine と更新追従状態を表示します。すでに使用中なら「変更なし」と表示します。`--output json` / `jsonl` または one-shot alias の `--json` では構造化出力になります（`strata_cli/update_cmd.py:358-394`、`strata_cli/cli.py:508-515`）。
-- 指定 backend に適合しない engine を指定すると、理由を含むエラーで終了コード `5` になります。指定名に一致する導入済み engine がない場合、または指定が曖昧な場合は `2` です（`strata_cli/update_cmd.py:378-383`、`strata_control/engine_library.py:198-211`）。
-- 実行中 engine があり切替できない場合は `7` の busy error になります。通常出力では `strata: ...` を stderr に出し、JSON 系出力では error object を出します（`strata_control/engine_library.py:216-236`、`strata_cli/update_cmd.py:237-242,307-311`）。
+正常終了時は、人向け出力で切り替え先と状態を表示します。`--output json` または `jsonl` の場合は成功結果を JSON として出力します（`strata_cli/update_cmd.py:439-464`）。対象が見つからない、曖昧、または無効な場合は終了コード 2、対象がこの PC で実行できない場合や検証に失敗した場合は通常終了コード 5、実行中モデルで切り替えが阻止された場合は終了コード 7 です（`strata_control/engine_library.py:184-207,238-254`、`strata_cli/update_cmd.py:439-444,368-372`）。人向けエラーは `strata:` を付けて stderr に出し、機械向け出力では `ok: false` とエラー情報を JSON に出します（`strata_cli/update_cmd.py:303-308`）。
 
 ## 根拠
 
-- parser と option scope: `strata_cli/update_cmd.py:47-56,84-87`、共通 one-shot option: `strata_cli/cli.py:508-515`
-- 値の上書きと hardware 検出: `strata_cli/update_cmd.py:244-255`、`strata_control/updater.py:261-281`、`strata_control/engine_component.py:465-482,514-540`
-- engine 候補の適合判定・`newest` 解決: `strata_control/engine_library.py:59-80,91-123,136-162,198-211`
-- 切替・状態更新と出力: `strata_cli/update_cmd.py:358-394`、`strata_control/engine_library.py:216-289`、`strata_control/updater.py:1303-1352`
-
-この文書はソースコードの静的確認に基づきます。`--help` の実行、build、GPU 実行、テストは行っていません。
+- `strata_cli/cli.py:113-139` — `components` parser と update command parser の登録。
+- `strata_cli/update_cmd.py:47-56,84-87` — `--backend` の定義、`use` の位置引数・共通引数への組み込み。
+- `strata_cli/update_cmd.py:279-296,310-317,419-464` — 指定値から hardware context を作り、対象を適合判定して切り替える実行経路。
+- `strata_control/engine_component.py:476-488,528-548` — backend alias / variant の正規化と、省略時検出の優先順位。
+- `strata_control/engine_library.py:65-88,184-228,277-312` — 適合条件、候補特定、使用中チェック、別 GPU backend の保存、engine 切り替え。
+- `strata_control/updater.py:1398-1447` — pin、履歴、tuning preset 状態の更新。
+- `strata_control/targets.py:22-31` — 対応 OS と backend family の組み合わせ。

@@ -1,6 +1,6 @@
-# `--gpu-roles`
+# `strata launch --gpu-roles`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,53 +8,60 @@
 | コマンド | `strata launch` |
 | オプション | `--gpu-roles` |
 | 別名 | なし |
-| 値 | GPU 番号と `main` / `helper` / `off` の組を並べたリスト |
+| 値 | `LIST`。カード番号と `main` / `helper` / `off` の組を列挙する |
 
 ## 役割
 
-この起動で使う各 GPU の役割を指定します。Main はモデル分割の最後の段を実行し、Helper はモデルの一部を保持し、Off は Strata がそのカードを使わない指定です。Main はエンジンへ渡す GPU 順の最後になります。
+起動時に使うグラフィックスカードごとの役割を指定する。`Main` は回答の最終段階を担当し、`Helper` はモデルの一部を保持する。`Off` のカードは使わない。明示した指定にないカードも `Off` として扱われる。これはカード番号だけを選ぶ `--gpu` の代わりに使うオプションである（`strata_cli/launch/cmd.py:111-117`、`strata_control/gpu_roles.py:1-9,247-252`）。
 
 ## 使い方
 
+2 枚のカードが番号 `0` と `1` で検出される環境で、番号 `1` を Main、番号 `0` を Helper にして計画だけ表示する例:
+
 ```sh
-strata launch --model q2_0 --gpu-roles 1=main,0=helper --no-tui
+strata launch --plan --model iq3_xxs --gpu-roles 1=main,0=helper
 ```
 
-指定した GPU 番号は、この Strata build が利用できる GPU の番号です。番号は `nvidia-smi` と同じ番号体系です。値には `番号=役割` のほか `番号:役割` も使え、項目はカンマまたはセミコロンで区切れます。空白と役割の大文字・小文字は正規化されます。例: `1:MAIN; 0:helper`。
+`--plan` は実行内容を表示して終了し、変更を行わない（`strata_cli/launch/cmd.py:14-28,146`）。実際に起動する場合は `--plan` を外す。
 
 ## 値と既定値
 
-- 値は必須で、少なくとも1カードを記述します。GPU 番号は数字、役割は `main`、`helper`、`off` のいずれかです。
-- 同じ GPU の重複指定と Main の複数指定はエラーです。Main を書かない値は受理され、後段で有効なカードのうち1枚が Main に補完されます。
-- 1件も解釈できない空値、不正な区切り、負数などの非数字番号、未知の役割はエラーです。末尾や連続区切りの空項目は読み飛ばされます。
-- `--gpu-roles` を省略した場合、このオプションによる役割指定はありません。preset の既存選択や通常のカード選択が使われます。
+- 各指定は `カード番号=役割` 形式で、`,` または `;` で区切れる。`1:main` のように `:` を区切りにする形式も受理される。大文字小文字は区別せず、前後の空白は除去される（`strata_control/gpu_roles.py:218-230`）。
+- 役割は `main`、`helper`、`off` のいずれか。カード番号は 0 以上の数字でなければならない。同じカードを複数回指定できず、`main` は最大 1 枚まで（同: `229-238`）。
+- 空要素は無視されるため、区切り文字の連続や末尾の区切りは、それ自体ではエラーにならない。空文字列 `""` は `settings_from_args` の truthy 判定で処理を素通りし、未指定と同じ扱いになる。一方、空白のみや区切り文字のみの非空文字列は parse され、「no cards named」エラーになる（`strata_cli/launch/cmd.py:256-262`、`strata_control/gpu_roles.py:221-238`）。形式不正、未知の役割、重複カード、複数の Main もエラーになる。
+- Main を指定しなくても値は受理される。少なくとも 1 枚が Main または Helper なら、実行時にカード性能・メモリ等に基づいて最適な有効カードが Main に補われる。単独で有効なカードがあればそれが Main になる（同: `138-150,247-252`）。
+- 引数を省略した場合の `LaunchSettings.gpu_roles` は `None` で、明示的なカード役割指定はありません（`strata_cli/launch/settings.py:81-92`）。この場合は既存設定または推奨値など別の選択経路が使われます（`strata_cli/launch/runner.py:398-429`）。
+- 同じ `--gpu-roles` を複数回書いた場合、CLI parser は通常の単一値引数として登録しているため、後の値が前の値を置き換える（`strata_cli/launch/cmd.py:116-117`）。
 
 ## 実行時の動作
 
-`--gpu` と同時に指定すると拒否されます。preset を読み込んでいる場合、明示した `--gpu-roles` はその起動の役割を置き換えます。`--gpu` を指定した場合は preset の役割が消えます。`--save-preset` も付ければ、その起動設定を preset として保存できます。
+parser は値を文字列として受け取り、`settings_from_args` が `strata_control.gpu_roles.parse_roles` で文法を検証して `LaunchSettings.gpu_roles` にカード番号を文字列キーとする辞書として格納する。`--gpu` も同時に指定すると `ValueError` になる（`strata_cli/launch/cmd.py:251-262`）。この段階の文法検証では、番号が実機に存在するかは検査しない。
 
-CLI は値を役割辞書に変換し、現在の build で認識するカード一覧に対して、指定していないカードを Off として補います。複数カードが on で Main が未指定なら、共通の正規化処理がカード情報から Main を選びます。モデル準備時、runner は役割を setup 呼び出しの `--gpu-roles` 引数として渡します。モデル準備後の launch 設定ファイルには役割と旧形式互換の GPU 順が書き込まれます。
+その後、launch は指定番号がこのビルドで使えるカードに存在するか確認する。存在しない番号があればカード一覧を添えた error notice を作り、計画表示・起動のどちらも終了コード `2` で拒否する。指定されたカードがすべて `off` の場合は拒否ではなく警告 notice になる（同: `441-449,836-843`）。カード一覧はエンジンの vendor に合うカードを基準にするため、別 vendor のカード番号は有効な選択肢にならない。
 
-サーバーは保存された役割から Helper を先、Main を最後にした GPU リストを作り、Off のカードを除外します。役割指定が有効な場合、通常の速度順による再並べ替えは行いません。エンジンのログにはカード役割が表示されます。
+起動時には、検出されたカードすべてについて、指定がないカードを `off` として役割辞書を補完し、`normalize` で有効カードがある場合の Main を整える。役割辞書から Helper 群を先、Main を最後にしたカード順を作り、実行設定に `gpu_roles` と旧形式との互換用 `gpu` / `gpu_order` 等の mirror を書き込む。複数カードなら必要に応じて layer split も設定される（`strata_cli/launch/runner.py:350-365,398-410`、`strata_control/gpu_roles.py:138-150,195-214`）。launch 用設定ファイルは `launch_dir()` 内に書き込まれる（`strata_cli/launch/runner.py:1692-1714`）。
+
+`--preset` と併用した場合は、保存済み設定に対してこのフラグの値を上書きして今回の起動に使う。再利用できる launch preset として保存するのは `--save-preset` を指定した場合である（`strata_cli/launch/cmd.py:206-211,251-262,914-918`）。
 
 ## 適用条件と副作用
 
-- build の利用可能 vendor を判定できる場合、指定されたカード番号が使えるカード一覧にないとエラーになります。異なる GPU vendor のカードを混ぜて指定することもできません。
-- 全カードを Off にする値は CLI parser では受理されます。CUDA / HIP / SYCL engine は GPU なしでは起動できず、サーバーは理由を1行表示して停止します。CPU 実行可能な engine（`cpu` / `metal` backend、または macOS）では CPU のみの性能低下メッセージを出して続行します。
-- 通常の `strata launch` はモデルや engine の準備、launch 設定の書き込み、サーバー起動を行います。`--plan` を付けた場合は計画を表示して終了し、変更を行わない経路です。
-- hardware 情報を使った役割変換で例外が発生した場合、カード選択 helper は launch を止めず `None` を返します。その場合に最終的に使われる設定は、既存設定など後続の通常処理に依存します。
+- カード番号は 0 始まりの検出番号である。画面上の `GPU 1` は番号 `0` を指す（`strata_control/gpu_roles.py:64-66`）。
+- 値に書かなかったカードは Off になるため、たとえば `1=main` はカード `1` だけを有効にする指定となる（同: `247-252`）。
+- すべて Off の場合も parser は受理し、launch は「カードなし」の警告を出す。すべてのカードを無効にしたとき実際に起動できるかはエンジン/backend に依存し、このオプションの parser だけから一律の起動可否は確定できない（`strata_cli/launch/cmd.py:441-449`）。
+- 実際の起動ではモデル取得や起動設定の作成・書き込みなど、`strata launch` 自体の処理が行われる。`--plan` では変更しない（`strata_cli/launch/cmd.py:25,146,851-877`）。
 
 ## 出力とエラー
 
-- 値の形式エラー、および `--gpu` との併用エラーは `ValueError` となり、通常出力では標準エラーに `strata: ...` を表示して終了コード `2` になります。`--output json` ではエラー情報を JSON で出力します。
-- 未知のカード番号は launch 設定の確認時にエラーとして返され、起動処理の前に終了コード `2` になります。
-- 全カード Off の場合、CUDA / HIP / SYCL の拒否はサーバー側の `SystemExit` 経路です。確認したソースではこの経路のプロセス終了コードまでは特定できません。
+- 不正な文法や `--gpu` との併用は `ValueError` となり、通常出力では `strata: ...` を stderr に表示して終了コード `2`。`--output json` の場合は標準出力に `ok: false` とエラー情報の JSON を返す（`strata_cli/launch/cmd.py:251-262,716-721,961-964`）。
+- 実機にないカード番号も、利用可能カードの番号を示す error notice として終了コード `2` になる。全カード Off はこの時点では警告であり、同じ理由だけでは拒否されない（同: `441-449,836-843`）。
+- `--plan` で有効な値を指定すると、カード役割を含む計画を表示して `Nothing was changed.` と出力し、終了コード `0` で終わる（同: `851-877`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:108-110` — parser 定義とヘルプ文。`strata_cli/launch/cmd.py:236-247` — `--gpu` との排他、値の解析、preset 設定への反映。
-- `strata_control/gpu_roles.py:21-27,138-152` — 役割名、正規化、Main の補完規則。`strata_control/gpu_roles.py:195-215` — engine 順と設定への互換ミラー。`strata_control/gpu_roles.py:218-244` — 値の構文・重複・Main 数の検査。
-- `strata_cli/launch/cmd.py:376-404,720-725` — build が使えるカード番号の確認とエラー時の終了。`strata_cli/launch/cmd.py:636-641,832-837` — エラー出力形式と終了コード。
-- `strata_cli/launch/runner.py:341-368,738-759,777-794,1235-1243` — 役割からカード設定を作る処理、setup への引き渡し、保存済み選択の引継ぎ、launch 設定の書き込み。
-- `strata_control/gpu_roles.py:1-9,203-215` — Main / Helper / Off の意味と Main を最後にする規則。`serve/server.py:2913-2920,2941-2957,3346-3358` — サーバー側の GPU リスト化、全 Off の分岐、役割指定時の順序保持。
-- `docs/MULTI_GPU.md:44-67,69-89` — 利用者向けの役割説明と設定例。実装根拠ではなく補助資料として参照。
+- `strata_cli/launch/cmd.py:111-117` — `--gpu` と `--gpu-roles` の parser 登録・説明。
+- `strata_cli/launch/cmd.py:251-262` — `--gpu` との排他、値の parse、設定への反映。
+- `strata_control/gpu_roles.py:218-252` — 値の文法、validation、未指定カードと Main の補完。
+- `strata_cli/launch/cmd.py:441-449,836-843` — 実機カードとの照合、警告・拒否。
+- `strata_cli/launch/runner.py:350-365,398-410,1692-1714` — 実行設定にカード役割を適用し、launch 設定を書き込む処理。
+- `strata_control/gpu_roles.py:138-150,195-214` — Main の正規化、Helper/Main の順序、互換設定への変換。
+- `strata_cli/launch/cmd.py:716-721,851-877,961-964` — エラー出力、計画表示、終了コード。

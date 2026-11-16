@@ -1,47 +1,40 @@
 # `BUILD_DIR`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-`BUILD_DIR` は Strata の通常のモデル実行時設定ではなく、同梱された SYCL/HIP ビルドスクリプトで CMake のビルドディレクトリを指定する環境変数です。SYCL、Linux HIP の DeepSeek-V4.1 用ビルド、Windows HIP の DeepSeek-V4.1 用ビルド、および Windows HIP エンジンのビルドで参照されます。生成済みエンジンが実行時にこの変数を読む箇所は、調査した Strata ソース内では確認できません。
+`BUILD_DIR` は Strata 本体の実行時設定ではなく、SYCL ビルドスクリプトと Windows HIP ビルド・パッケージ用バッチでビルドディレクトリを指定する環境変数である。SYCL では `sycl/tools/build.sh` の `cmake -B`、`cmake --build`、ログ出力先に使い、Windows HIP では CMake の configure/build とパッケージャーの `--build` 引数に使う。候補一覧に載る名前だが、アプリケーション起動時に読む実装は見つからなかった。SYCL の利用例は `docs/INTEL.md:68-79` と `docs/INTEL_ARC.md:77-80` にある。
 
 ## 値と判定
 
-値は数値や真偽値として parse されず、パス文字列として使われます。存在確認や正規化などの独自検証もありません。
+| 条件（build など） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| SYCL (`sycl/tools/build.sh`) | `$repo/build-sycl`。`repo` は `REPO` が未設定または空なら `git rev-parse --show-toplevel` の結果 | 空でない値をそのままディレクトリ名として使う。例: `/work/Strata/build-sycl-aot` | `BUILD_DIR` 自体の値検証はない。パスが不正、または必要な作成・アクセスができなければ後続の CMake 等が失敗する |
+| Windows HIP (`tools/hip/build_windows.bat`) | `%SRC%\build-hip-win` | `if not defined` に該当しない値を使う | 値の形式検証はない。空または未定義は既定値に置き換わる |
 
-| スクリプト | 未設定または空文字 | 非空の値 |
-|---|---|---|
-| `sycl/tools/build.sh` | `REPO` の値（未設定なら `git rev-parse --show-toplevel` の結果）に `/build-sycl` を付けたパス | そのまま `b` に代入し、CMake の `-B`、build、ログ出力先に使う |
-| `tools/dsv41/build_hip_linux.sh` | スクリプトが求めたリポジトリルートに `/build-dsv41-hip` を付けたパス | そのまま `B` に代入し、CMake の `-B` と build に使う |
-| `tools/dsv41/win/build_hip_win.bat` | `%SRC%\build-dsv41-hip` | そのまま `BUILD_DIR` に設定し、CMake の `-B` と build に使う |
-| `tools/hip/build_windows.bat` | `%SRC%\build-hip-win` | そのまま `BUILD_DIR` に設定し、CMake の `-B`、build、パッケージ入力に使う |
-
-Bash の `${BUILD_DIR:-default}` は未設定と空文字の両方で既定値を選びます。Windows バッチの `if not defined BUILD_DIR` も未定義または空のとき既定値を設定します。空白だけの値は空ではない値として扱われ、空白・不正なパスの拒否や代替はありません。値の範囲や境界値はありません。
-
-SYCL スクリプトは変数を引用符なしで CMake・build・ログの各コマンドに展開するため、空白を含むパスはシェルで分割され得ます。他の3スクリプトでは該当するパス展開を引用符で囲んでいます。
+SYCL 側は Bash の `${BUILD_DIR:-...}` を使うため、未設定と空文字の両方が既定値になる。文字列としての比較、数値変換、範囲制限、空白除去はしない。Windows 側は `if not defined BUILD_DIR` で判定し、空・未定義なら既定値を設定する。どちらもパスが存在するかの一般的な検証は変数判定時には行わず、後述の `build.ninja` 確認やビルド処理に委ねる。SYCL のパス展開は引用符で囲まれていないため、空白や glob 文字を含む値はシェルの語分割・展開の影響を受ける。`sycl/tools/build.sh:38-44`、`tools/hip/build_windows.bat:25-32,70-85`。
 
 ## 有効になる条件
 
-- SYCL 用スクリプトを実行した場合に使われます。既定値の親パスは `REPO` が指定されていればその値、なければ Git が返す作業ツリーのトップです。CLI 引数は build target を指定しますが、`BUILD_DIR` を上書きしません（`sycl/tools/build.sh:37-43`）。
-- Linux の DeepSeek-V4.1 HIP スクリプトでは、OS・backend の条件は Linux/HIP のスクリプト実行自体で決まり、`BUILD_DIR` は出力先を選びます。CLI 引数は build target を選択し、出力先の優先順位には入りません（`tools/dsv41/build_hip_linux.sh:9-14,19-27`）。
-- Windows の DeepSeek-V4.1 HIP スクリプトと Windows HIP エンジンビルドでは、同じ環境変数名に対してそれぞれ異なる既定パスを設定します。CLI 引数は前者の build target、後者の `tests` モードを選び、どちらも `BUILD_DIR` の設定値は変更しません（`tools/dsv41/win/build_hip_win.bat:15-18,34-43`; `tools/hip/build_windows.bat:30-34,72-85`）。
-- 選択したディレクトリに既に `build.ninja` があると、これらのスクリプトは CMake の初回 configure を省略して既存ビルドの設定を使います。変数自体は設定を更新しません（`sycl/tools/build.sh:39-42`; `tools/dsv41/build_hip_linux.sh:19-27`; `tools/dsv41/win/build_hip_win.bat:34-43`; `tools/hip/build_windows.bat:72-85`）。
+- SYCL ビルド経路で `sycl/tools/build.sh` が呼び出されること。リポジトリ資料は Docker の `strata-sycl-dev` 内での実行例を示し、`BUILD_DIR` を `docker run -e` で渡している（`docs/INTEL.md:55-70,73-79`）。この変数自体に GPU 世代やモデル状態の条件はない。
+- Windows HIP 経路では `tools/hip/build_windows.bat` が実行されること。Windows バッチ内の `SRC` を既定パスの基点にする（`tools/hip/build_windows.bat:25-32`）。
+- 指定ディレクトリに `build.ninja` があると configure をスキップし、既存 CMake cache を使う。従って `BUILD_DIR` は既存ビルドの選択先にもなり、同ディレクトリに以前の構成があれば、それがそのまま使われる（`sycl/tools/build.sh:40-43`、Windows は `tools/hip/build_windows.bat:73-80`）。
+- `REPO` は SYCL スクリプトのソース位置・既定ビルド先を決める別環境変数である。`BUILD_DIR` が明示されればそのディレクトリが使われる。CLI の build-directory 引数による上書きはスクリプトにない。SYCL の CLI 引数は任意の CMake target (`--target`) に渡されるだけ（`sycl/tools/build.sh:38-44`）。
+- Windows HIP では第 1 CLI 引数 `tests` がビルド target を変えるが、ビルドディレクトリは変えない（`tools/hip/build_windows.bat:33-34,82-85`）。
 
 ## 実行時の詳細
 
-各スクリプトの開始時に環境変数をローカルの `b` または `B` に取り込むか、Windows バッチ内で既定値を設定します。そのパスは CMake の `-B` で configure 対象に選ばれ、`cmake --build` の対象にもなります。Windows HIP エンジンのスクリプトでは、その配下の llama.cpp checkout を既定探索先にし、最後に `package_windows.py --build` へ渡します（`tools/hip/build_windows.bat:89-95,113-115`）。プロセス起動後に環境変数を変更して再評価する仕組みはありません。
+SYCL スクリプトは起動時に `BUILD_DIR` を `b` に展開する。指定先に `build.ninja` がなければ `cmake -S $repo/sycl -B $b ...` を実行し、存在すれば configure を省略する。続いて `cmake --build $b` を実行し、標準出力・標準エラーを `$b/build.log` に tee する。スクリプト内に環境変数値を後から再読込する処理や cache はない。環境の変更を反映するには新たなスクリプト実行が必要だが、指定先に既存 cache があれば CMake 構成は引き継がれる。configure 時は `AOT`、`SPIN_MAX`、`I8_ESIMD`、`IQ_DECODE_FAST` など別の設定も渡る。既存 build では `I8_ESIMD` だけを明示的に再設定する処理がある（`sycl/tools/build.sh:38-45`）。
 
-未設定・空文字が既定値になる以外に優先順位の分岐はありません。build target や `tests` の CLI 選択、`REPO`、他の環境変数はビルド内容や既定値の親を決めますが、非空の `BUILD_DIR` を上書きしません。
+Windows HIP バッチは起動後、値が未定義なら既定値を設定し、`%BUILD_DIR%\build.ninja` がなければその場所を `cmake -B` に渡す。その後同じ場所で `cmake --build` し、最後に `tools/hip/package_windows.py --build` に渡す。ビルドディレクトリを選ぶ別の cache はバッチ内にない。既存 `build.ninja` があると初回 configure の CMake 引数（例: HIP arch や compiler）を再適用せず、その既存 build を使う（`tools/hip/build_windows.bat:31,70-85,118-120`）。
 
-不正なパスに対する `BUILD_DIR` 固有の警告やエラー処理はありません。失敗は後続コマンドに現れます。SYCL スクリプトは `build.log` に build 出力を記録し、`BUILD EXIT <status>` と `errors: <count>` を出力します（`sycl/tools/build.sh:43-50`）。Linux HIP の DeepSeek-V4.1 ビルドは `set -e` で失敗したコマンド時に終了し、成功時は `built in <path>` を出力します（`tools/dsv41/build_hip_linux.sh:9,19-28`）。Windows の DeepSeek-V4.1 HIP スクリプトは `BUILD-EXIT <status>` を表示します（`tools/dsv41/win/build_hip_win.bat:43-45`）。Windows HIP エンジンビルドは configure・build・package の失敗時に終了コード 1 で抜け、完了時に zip の出力先を表示します（`tools/hip/build_windows.bat:72-85,113-117`）。
+## ログと測定値
+
+測定値は該当しない。SYCL はビルド後に `BUILD EXIT <終了コード>` と `errors: <error: 行数>` を出力し、`cmake --build` の終了コードで終了する。ビルドログは選択したディレクトリの `build.log` に保存される（`sycl/tools/build.sh:44-52`）。Windows HIP は configure/build の失敗時に終了コード 1 で中断し、成功時には `%DIST_DIR%\strata-windows-x64-hip.zip` の出力先を表示する（`tools/hip/build_windows.bat:73-85,118-122`）。これらは `BUILD_DIR` の値に応じた特別な警告ではなく、指定されたパス上でのビルド結果である。
 
 ## 根拠
 
-- SYCL の既定値、configure/build への適用、ログ: `sycl/tools/build.sh:37-50`。既存ビルドは cache を維持する旨も同ファイル `:41-42` にあります。
-- Linux HIP / DeepSeek-V4.1: `tools/dsv41/build_hip_linux.sh:9-28`。
-- Windows HIP / DeepSeek-V4.1: `tools/dsv41/win/build_hip_win.bat:11-18,34-45`。
-- Windows HIP エンジンと package への引き渡し: `tools/hip/build_windows.bat:24-34,69-85,89-95,113-117`。
-- SYCL 利用例は `docs/INTEL.md:68-83` および `docs/INTEL_ARC.md:67-74` にあります。これはスクリプトの使い方の説明であり、判定規則は上記実装に基づきます。
-
-候補一覧の同名表記には、環境変数ではない用法も含まれます。`packaging/build_dsv41_windows.bat` の `BUILD_DIR` は第1位置引数を示す文書上の名前で、実装は `%~1` を `BD` に読みます（`packaging/build_dsv41_windows.bat:5-11,20`）。また `CMakeLists.txt` の `STRATA_ORACLE_BUILD_DIR` は別名の CMake cache 設定です（`CMakeLists.txt:655-674`）。これらを環境変数 `BUILD_DIR` の読み取り箇所には数えていません。
+- `sycl/tools/build.sh:38-52` — SYCL の既定値、configure 判定、build とログの出力先、終了結果。
+- `tools/hip/build_windows.bat:25-34,70-85,118-122` — Windows HIP の既定値、configure/build とパッケージャーへの受け渡し。
+- `docs/INTEL.md:55-83`、`docs/INTEL_ARC.md:71-83` — Docker 実行時の設定例と説明。

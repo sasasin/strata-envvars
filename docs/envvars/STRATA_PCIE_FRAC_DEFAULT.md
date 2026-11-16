@@ -1,54 +1,56 @@
 # `STRATA_PCIE_FRAC_DEFAULT`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-expert cache miss の PCIe share (`pcie_frac`) に使う起動時の既定動作を選びます。値が文字列として厳密に `old` の場合、canonical Q2_0 pack で新しい自動調整用プローブを使わず、serve 中の `PcieAuto` による share の更新も止めます。これは `--pcie-frac` の代替ではなく、明示的な `--pcie-frac` が優先します。
+PCIe 経由で GPU が処理する expert miss の割合 (`pcie_frac`) を直接指定する変数ではない。実装が認識する値は `old` と `auto` で、HIP gfx12 の初期 share を旧値へ戻す、または CPU pool の速度から share を更新する機能を有効にする。`old` は PCIe miss 処理そのものを無効にせず、明示的な `--pcie-frac` も上書きしない。CUDA/HIP は `src/program/generate.cpp`、SYCL は `sycl/src/program/generate.cpp` で読み取る。
 
-share は miss のうち GPU 側で PCIe 経由に扱う部分を決めます。実装は `pcie_frac * 256` を丸めて 0〜256 に制限した `pcie_num` として verifier に渡し、verifier はその share の expert rows を GPU 側で処理します。CPU pool 側に残る miss の計算・転送と分担する設定です。
+値はどちらの実装でも文字列全体を `strcmp` で大文字小文字を区別して比較する。空文字、空白付き文字列、`1`、`true` などは `old` / `auto` に一致しない。`std::getenv` の結果を trim や数値変換する処理はない。CUDA/HIP の `old` 判定は `src/program/generate.cpp:5190-5194`、HIP の `auto` 判定は `src/program/generate.cpp:2778-2784`、SYCL の `auto` 判定は `sycl/src/program/generate.cpp:2789-2793`。
 
 ## 値と判定
 
-`std::getenv()` の結果を `std::strcmp(pfd, "old") == 0` で比較します。数値変換や真偽値 parse はありません。
+| 実装・条件 | unset | 有効になる値 | 無効・通常扱いの値 |
+|---|---|---|---|
+| CUDA、`--pcie-frac` 未指定 | `old` ではない。native pack は通常の初期 share と probe を使い、対応する経路では PcieAuto が動く | 完全一致の `old` は PcieAuto を止める。CUDA では gfx12 専用の初期 share 変更はない | `auto`、空文字、`0`、`1`、`true`、`OLD`、` old ` は `old` として扱わない。`auto` 固有の判定もない |
+| HIP、`--pcie-frac` 未指定、単一 GPU | gfx1200/gfx1201 の native pack は通常 0.15 から開始し、CPU pool による refinement も既定で許可。他の HIP GPU は native pack 0.55 から開始し refinement しない | `old`: gfx12 の初期 share を 0.55 に戻し、refinement を止める。`auto`: gfx12 以外でも refinement を許可 | `auto` 以外は gfx12 外の refinement を有効にしない。`old` 以外の文字列は初期 share を旧値に戻さない |
+| SYCL、native pack かつ PCIe probe 成功、`--pcie-frac` 未指定 | probe で得た値を使い、PcieAuto は無効 | 完全一致の `auto` で PcieAuto を許可（layer split 中は無効） | `old`、空文字、`1`、`AUTO` などは PcieAuto を有効にしない。SYCL にはこの変数による gfx12 の 0.15 初期 share 分岐がない |
 
-| 環境変数の状態 | `pf_old` |
-|---|---:|
-| unset | false |
-| 空文字 | false |
-| 完全一致で `old` | true |
-| `OLD`, `old `, `older`, `1` など、それ以外の文字列 | false |
+HIP gfx12 の 0.15 は `pcie_share_gfx12_default()` が HIP build かつ GPU architecture が gfx12 WMMA 対応の場合に true となり、`pcie_start_frac()` が native pack、`old` でない、`STRATA_DEFAULTS` が 026 でない場合に選ぶ値である。`STRATA_DEFAULTS=026` は `STRATA_DEFAULTS` 自身の読み取り時に一度判定され、`026`、`0.2.6`、`v0.2.6` の完全一致だけが該当する。NVFP4 pack は 0.25、canonical Q2_0 pack は 0.2 が別の初期値で、gfx12 判定による変更を受けない（`src/program/generate.cpp:2736-2744,2765-2771,5190-5194`; `include/strata/core/defaults_026.hpp:21-39`）。
 
-大文字小文字、空白、接尾辞を含めて完全一致だけが有効です。変数は既定 share を設定する箇所で読み取られ、値を static cache しません。通常の起動ではこの設定箇所は一度通ります。
+どの実装でも `--pcie-frac` を指定し、その値が内部 sentinel の `-1` 以上なら環境変数による初期値処理に入りません。CLI 値は `std::atof` で読み取られます（CUDA/HIP: `src/program/generate.cpp:3873,4484-4486`; SYCL: `sycl/src/program/generate.cpp:1998,2199,2769-2770`）。
 
 ## 有効になる条件
 
-- `--pcie-frac` が省略されたか、parse 結果が 0 未満の場合にだけ環境変数が参照されます。0 以上の `--pcie-frac` では既定 share の処理全体を通らず、環境変数は読まれません。CLI の値は `std::atof()` で変換され、`pcie_num` 作成時に 0〜256 の範囲へ制限されます。
-- canonical pack（`native_pack == false`）の CUDA では、`old` は PCIe probe と serve 中の自動調整を抑え、開始 share 0.2 を使います。Linux CUDA で unset または `old` 以外なら probe を試します。probe 成功時も canonical pack の開始値は 0.2 で、対応する serve 経路では `PcieAuto` が CPU pool の実測に応じて後から share を調整します。probe 失敗時は 0.2 のままです。
-- Windows CUDA の canonical pack は `STRATA_PCIE_AUTO_CANON` も条件になります。同変数の先頭文字が `1` で、かつ `STRATA_PCIE_FRAC_DEFAULT` が `old` でない場合に限って probe します。`STRATA_PCIE_FRAC_DEFAULT=old` はこの opt-in より優先します。
-- HIP の canonical pack は probe/autotune の対象外で、開始値 0.2 を使います。`STRATA_PCIE_FRAC_DEFAULT` を `old` 以外にしてもこの canonical pack の probe は有効になりません。
-- native pack は backend にかかわらず `native_pack` の条件で PCIe probe を試します。成功すれば開始 share は base 0.55 を probe 帯域に応じて縮小し、失敗すれば 0.55 です。この native-pack の起動時 share は `STRATA_PCIE_FRAC_DEFAULT=old` でも変わりませんが、`old` は後述する `PcieAuto` による serve 中の更新を抑えます。
-- probe 後の `PcieAuto` は serve の非 resident expert cache 経路でのみ候補になります。batch 指定、peer GPU、全 expert が VRAM resident の場合は実行されません。layer split では CUDA は通常無効で、HIP は `STRATA_PCIE_AUTO_SPLIT` が `atoi` で非ゼロとなる場合に限り対象になり得ます。HIP の自動調整は `decode_defaults_arch_ok()` が true の gfx12 WMMA 世代（gfx1200/gfx1201）に限られます。いずれも `old` なら初期更新設定が無効になります。
+- **`old`** は CUDA/HIP の PCIe share 初期化ブロック内でのみ評価される。`--pcie-frac` が指定済みならそのブロック自体に入らず、変数はその起動の share に作用しない（`src/program/generate.cpp:5187-5194`）。
+- **HIP の初期 share** を 0.15 にするのは gfx1200/gfx1201 と native pack の組み合わせだけ。`STRATA_DEFAULTS=026` または `old` なら 0.55。gfx12 以外の HIP GPU、CUDA、SYCL にはこの 0.15 の既定分岐はない（`src/program/generate.cpp:2736-2744,2765-2771`; `include/strata/core/defaults_026.hpp:32-39`）。
+- **CUDA の PcieAuto** は probe 成功後の share 初期化で設定される。native pack では通常の GPU 構成で候補になる。canonical pack は CUDA で probe される経路に限られ、Windows ではさらに `STRATA_PCIE_AUTO_CANON=1` が必要。`old` はこの自動更新を止める（`src/program/generate.cpp:5196-5217`）。
+- **HIP の PcieAuto** は probe 成功した native pack で、gfx12 なら既定で候補になる。gfx12 以外は `STRATA_PCIE_FRAC_DEFAULT=auto` が必要。layer split では `STRATA_PCIE_AUTO_SPLIT` 等から決まる `pcie_auto_split_ok()` が true の場合だけ候補になり、HIP の split は opt-in（`src/program/generate.cpp:2720-2731,2778-2784,5218-5227`）。
+- PcieAuto が作られても、expert がすべて VRAM resident、batch 使用中、peer GPU 使用中（CUDA/HIP）なら実際の更新処理は開始しない。SYCL では all-resident、batch、または複数 stage で更新しない（`src/program/generate.cpp:13815-13818,13867-13875`; `sycl/src/program/generate.cpp:8398-8411`）。miss が少なく測定条件に届かない場合も値は変わらない。
+- **SYCL の `auto`** は native pack の probe 成功時にだけ読まれる。layer split では `pcie_frac_auto` が false。さらに xe driver で `--stream-experts` がない場合、未指定 CLI share は後続処理で 0 に上書きされる（`sycl/src/program/generate.cpp:2770-2797,2789-2793,2804-2814`）。
 
 ## 実行時の詳細
 
-既定 share の設定は `o.pcie_frac < 0.0` のとき `generate.cpp` で行われます。CUDA/Linux の canonical pack では probe に成功しても起動 share を 0.2 に保ち、probe 値を記録します。serve 側で `PcieAuto` が有効な場合、最初は 48 decode windows、その後は 96 windows ごとに miss 数と実行時間を集計します。十分な miss があり、pool 速度を算出できると、link 帯域と CPU pool 速度から share を 0.05 刻みで再計算します。変更があれば stderr に `strata serve: PCIe share: ...` と出し、次の処理に使う `pcie_num` を更新します。最大3回の更新です。
+読み取りは起動時、`--pcie-frac` の未指定を確認した後の初期化中に行われる。`old` 判定はその起動のローカル変数で、HIP の `auto` 判定は同じ初期化経路の helper から取得する。SYCL の `auto` も probe 成功時に一度取得する。これらの値をリクエストごとに再読する処理はなく、実行中に環境を変更しても初期化済みの判定は更新されない（`src/program/generate.cpp:2780-2784,5187-5194,5222-5227`; `sycl/src/program/generate.cpp:2789-2793`）。
 
-したがって `old` の効果は「常に固定値 0.2」ではありません。これは主に canonical pack の CUDA で旧来の起動ルールを選ぶ値です。native pack は起動 probe による帯域補正を引き続き行い、CLI で明示 share があればそれを優先します。
+PcieAuto が有効な場合、初期 share は probe 帯域で調整された後、decode window ごとに CPU pool の miss 処理時間と PCIe link 帯域から更新される。CUDA/HIP 実装は最初の 48 window、その後 96 window ごとに評価し、miss が 300 件未満なら測定を延期、最大 3 回更新する。2000 window まで測定に足る miss がない場合は自動更新を止める。CPU miss 時間が 1 µs 以下、expert byte 数または link 帯域が正でない場合も新しい share は返さない。新しい値が現行値から 0.025 未満の差なら変更・更新ログを出さない。share の計算は `link / (link + k * CPU rate)` を 0.05 刻みに丸め、最低 0.10、上限は `STRATA_PCIE_SHARE_MAX` 等から得る ceiling に制限する。`STRATA_PCIE_K_RULE` も係数 `k` の規則に関係する（`src/program/generate.cpp:2968-3022,13867-13904`）。
 
-## 文書との照合
+SYCL の PcieAuto も 48 window、その後 96 window ごとに最大 3 回更新し、300 miss 未満では測定を延期する。係数は 1.85、share は 0.10..0.60 に制限される。更新時は `drive.d.pcie_num` も新しい割合から再設定される（`sycl/src/program/generate.cpp:1697-1734,8403-8425,12522-12526`）。
 
-`docs/DETAILS.md` は `STRATA_PCIE_FRAC_DEFAULT=old` を 0.1.41 ルールの維持手段として説明し、canonical Q2_0 pack の新しい既定と比較した測定を記載しています（`docs/DETAILS.md:1652-1666`）。この文書では測定値を再検証していません。コード上では pack/backend により `old` の作用範囲が異なり、native pack の起動 probe は止めず `PcieAuto` の更新だけを止める点を補足しています。
+最終的な `pcie_frac` は verifier/drive に渡す PCIe miss 数 (`pcie_num`) に変換され、CPU pool が処理する miss と GPU が PCIe から読む miss の配分を変える。環境変数自体はモデルの出力や share の数値を直接指定しない（`src/program/generate.cpp:13814,13892-13904`; `sycl/src/program/generate.cpp:8397-8398,8422-8425`）。
+
+Strata の設定スイッチ側では「Faster answers on Radeon RX 9000 / AI PRO R9700」は既定 ON で、OFF を run config に反映する値が `STRATA_PCIE_FRAC_DEFAULT=old`。これは環境変数の読み取りを実装する箇所ではなく、エンジンに渡す設定値の由来である（`strata_control/speed_switches.py:47-50`）。
+
+## ログと測定値
+
+- probe 成功時は `strata generate: PCIe probe: ...` の行に帯域と初期 `pcie_frac` を出す。probe 失敗時は `strata generate: PCIe probe failed -> pcie_frac default ...` を出す（CUDA/HIP: `src/program/generate.cpp:5208-5230`; SYCL: `sycl/src/program/generate.cpp:2773-2796`）。
+- share が更新された場合、CUDA/HIP は `strata serve: PCIe share: the CPU pool takes ... -> pcie_frac ...`、layer split の stage 更新は `strata serve: PCIe share: stage ...` を stderr に出す。SYCL は `strata serve: PCIe share: ... -> pcie_frac ...` を stderr に出す（`src/program/generate.cpp:13879-13904`; `sycl/src/program/generate.cpp:8412-8425`）。
+- SYCL の xe driver かつ `--stream-experts` なしで明示的に正の `--pcie-frac` を指定すると、実装は pageable host memory に関する `WARNING` 行を出す。これは `STRATA_PCIE_FRAC_DEFAULT` の警告ではなく、後続の share 条件の警告である（`sycl/src/program/generate.cpp:2804-2814`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:575-577`: PCIe share と自動調整状態の初期値。
-- `src/program/generate.cpp:1563-1579`: HIP layer-split opt-in と gfx12 判定。
-- `src/program/generate.cpp:1651-1699`: 帯域による share 計算と `PcieAuto` の更新間隔・範囲。
-- `src/program/generate.cpp:1996`: `--pcie-frac` の parse。
-- `src/program/generate.cpp:2255-2257`: 明示 share 判定。
-- `src/program/generate.cpp:2731-2772`: 環境変数の完全一致判定、pack/backend 別 probe、開始 share と自動調整フラグ。
-- `src/program/generate.cpp:8200-8201,8241-8249`: share の verifier 値への変換と自動調整の適用条件。
-- `src/program/generate.cpp:11981-12004`: serve 中の調整、ログ、share の更新。
-- `src/core/verify.cpp:1610-1640`: PCIe share と CPU 側 miss rows の実行・転送経路。
-- `docs/DETAILS.md:1652-1666`: 文書上の既定説明と測定条件。
+- `src/program/generate.cpp:2720-2731,2736-2784,5187-5230` — CUDA/HIP の GPU・値判定、share 初期化、probe、自動更新の有効化。
+- `src/program/generate.cpp:2968-3022,13867-13904` — PcieAuto の測定条件、share 更新、ログ。
+- `sycl/src/program/generate.cpp:1688-1735,2769-2814,8397-8425,12522-12526` — SYCL の probe、`auto` 判定、xe 条件、更新。
+- `include/strata/core/defaults_026.hpp:21-39` — `STRATA_DEFAULTS` の判定と PCIe 初期 share。
+- `strata_control/speed_switches.py:47-50` — Radeon 9000 向け設定スイッチが書き込む `old` 値。

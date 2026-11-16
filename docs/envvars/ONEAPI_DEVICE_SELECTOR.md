@@ -1,44 +1,46 @@
 # `ONEAPI_DEVICE_SELECTOR`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。Strata リポジトリの作業ツリーは `main...origin/main` で未コミット変更なし。外部ライブラリ・GPU driver の解釈は対象外。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-Strata の SYCL 用セットアップと起動経路が、この名前の値を実行環境に設定・引き継ぎます。複数の Intel GPU が見つかったセットアップでは、ユーザー設定がなければ選択した GPU または layer split 対象に対応する値を設定します。Strata のエンジンソースには、この変数を読み取って parse したり、その値に応じて分岐したりする箇所は見つかりませんでした。値の解釈とデバイス選択結果は、Strata の挙動としては説明できません。
+Strata 本体の C++/Python は、この名前を `getenv` や `os.environ` で読み取って値を解釈しない。Strata がこの値に関与するのは Intel SYCL セットアップと起動経路である。Intel GPU が複数あるとき、`sycl/setup_intel.py` は選択 GPU に応じた値を設定ファイルの `env` に既定値として書き、既存の同キー設定があれば保持する。サーバーは設定ファイルの `env` を engine 子プロセスの環境へ反映し、SYCL 起動ラッパーは `ONEAPI_*` を Docker コンテナへ渡す。したがって Strata 側の動作は値の生成・設定・転送であり、セレクターの書式やデバイス選択結果を Strata が検証・決定する処理ではない（`sycl/setup_intel.py:479-498`, `serve/server.py:4428-4441`, `sycl/serve/strata-sycl.sh:13-16,33-43`）。
 
 ## 値と判定
 
-Strata エンジン側に値の parse、検証、範囲判定はありません。セットアップの `setdefault` は、その処理時点の `cfg["env"]` にキーが既にあれば、空文字を含めその値を保ちます。サーバーは設定の値を文字列化して子プロセス環境へ設定し、設定にキーがなければサーバー自身から継承した値が残ります。SYCL 起動ラッパーは値が空文字または文字列 `0` のとき Docker に明示転送せず、それ以外の値をそのまま `-e` で渡します。したがって、ラッパー経由では空文字と `0` は転送されません。これらの文字列が外部ランタイムで何を意味するかは本調査の対象外です。
+Strata による文字列の parse、大小文字変換、数値変換、値域検証はない。既存設定値はセットアップが上書きせず、サーバーが文字列化して子環境へ設定する。SYCL ラッパーは値が `0` または空文字なら Docker に渡さず、それ以外はそのまま渡す。この `0` は文字列との完全一致であり、`00` や `0anything` はこのフィルターでは除外されない（`setup_intel.py:494-498`, `server.py:4440-4441`, `strata-sycl.sh:39-43`）。
 
-| 経路 | Strata の処理 |
-|---|---|
-| セットアップで複数 GPU を検出し、設定にキーがない | 単一 GPU 選択なら `level_zero:<選択 index>`、layer split なら `level_zero:*` を設定 |
-| セットアップで複数 GPU を検出し、`setdefault` 時点の設定にキーがある | 既存値を保持。空文字も保持 |
-| 設定にキーがなく、ホスト環境に値がある | サーバーの子環境へホスト値を継承し、SYCL ラッパーが空文字・`0` 以外をコンテナへ転送 |
-| ラッパーに空文字または `0` が渡る | コンテナ起動時の明示的な環境引数から除外 |
-| SYCL 開発用 Docker イメージの既定 | Dockerfile は `ONEAPI_DEVICE_SELECTOR=level_zero:0` を設定 |
+| 条件 | 未設定 | Strata が設定・転送する値 | Strata の値判定 |
+|---|---|---|---|
+| Intel SYCL セットアップ、検出カードが 2 枚以上、設定 `gpu` が単一 index | `cfg["env"]` に同キーがなければ `level_zero:<index>` を追加 | 既存 `cfg["env"]["ONEAPI_DEVICE_SELECTOR"]` があればその値を保持。生成値では `index` は選択 index（範囲外なら 0） | セレクターを parse しない |
+| 同じく `gpu` が list の split 設定 | 同キーがなければ `level_zero:*` を追加 | 既存設定があれば保持 | セレクターを parse しない |
+| 1 枚の Intel GPU、または通常の非 SYCL 実行 | このセットアップ箇所からは設定しない | server の親環境またはプロファイル `env` に値があれば、SYCL ラッパー経由では空文字と正確な `0` 以外を転送 | Strata は意味を判定しない |
+
+セットアップ時に「ユーザーが設定した値」として保持されるのは設定ファイル `cfg["env"]` の値であり、セットアッププロセスの環境変数を読み取って保持する処理ではない（`sycl/setup_intel.py:479-498`）。
 
 ## 有効になる条件
 
-- セットアップによる既定値の追加は、Intel Arc/SYCL セットアップが複数カードを検出した場合だけです。単一カードの場合、この箇所では既定値を追加しません。
-- layer split かどうかは生成された設定の `gpu` がリストかで判定します。複数カードでも設定に同名キーがあれば、その値を保持します。
-- 実行時に SYCL ラッパーが動く経路では、サーバーが設定の `env` を子環境に反映し、ラッパーは `ONEAPI_*` 名の環境変数を Docker に転送対象として列挙します。
-- `ONEAPI_DEVICE_SELECTOR` を CLI 引数として読む Strata の実装は見つかりませんでした。値によって Strata が失敗・警告・終了する条件も確認できませんでした。
+- セットアップによる既定値の生成は、Linux の Intel SYCL セットアップで `len(intel) > 1` の場合だけ行われる。Windows では SYCL セットアップ自体が拒否され、単一カードではこの箇所は既定値を追加しない（`setup.py:8323-8325`, `sycl/setup_intel.py:494-498`）。
+- 単一 GPU 用の既定値は選択された `cfg["gpu"]` index、split 用は `level_zero:*`。設定の選択 GPU はコマンドラインや config から `cfg["gpu"]` に反映された後で使われる（`sycl/setup_intel.py:481-491,494-498`）。
+- 実行時の設定ファイル `env` は親プロセス環境に重ねられるため、同じキーが両方にあれば設定ファイル値が優先される（`serve/server.py:4431-4441`）。
+- `strata-sycl.sh` が使われる SYCL 実行では `ONEAPI_*` をコンテナへ渡す。ただし値が空文字または正確な `0` の場合はラッパーが渡さない（`sycl/serve/strata-sycl.sh:33-43`）。
+- CUDA/HIP/CPU 実行に対して、この変数を解釈する Strata 本体の分岐は確認できない。
 
 ## 実行時の詳細
 
-Intel セットアップの `write_run_script` は、複数カード構成でのみ selector を設定へ追加してから通常の run script を作ります（`sycl/setup_intel.py:479-498,530-533`）。通常のサーバー起動時、`child_env()` はホスト環境を複製し、設定 `env` の各キー・値で上書きします（`serve/server.py:3747-3760`）。この環境がエンジン起動に使われます（`serve/server.py:9193`）。
+Intel セットアップの `write_run_script` は設定 JSON を読み、複数カード時に必要なら `env` の既定値を追加して同じ JSON を書き戻す。その後の通常 server 起動スクリプト自体は設定値を export せず、`serve/server.py` が `child_env` で親環境を複製し、config の `env` を上書き適用する。engine 実行ファイルとして `strata-sycl.sh` を使う構成では、ラッパーが環境中の `ONEAPI_*` を列挙して `docker run -e` に渡す（`sycl/setup_intel.py:479-498,530-533`, `setup.py:8253-8266`, `serve/server.py:4428-4441,10175-10183`, `sycl/serve/strata-sycl.sh:33-52`）。
 
-SYCL ラッパーは環境変数名の接頭辞が `ONEAPI_` のものをコンテナへ転送し、値が空または `0` なら明示的な転送から外します（`sycl/serve/strata-sycl.sh:13-16,28-38`）。転送されない場合、イメージ内に値が残るかどうかはイメージ側の設定に依存します。このリポジトリの開発用イメージは `level_zero:0` を既定にしています（`sycl/tools/Dockerfile:8`）。Strata が selector をキャッシュして読み直す実装はなく、セットアップ時の設定生成と、サーバーがエンジン環境を作る時点で扱われます。
+セットアップ時の値生成は run script 作成時に行われる。実行中に Strata がこの変数を再読込または cache する箇所はない。サーバーの子プロセス環境は engine 起動時に構築される。ラッパーを通る値の `0` / 空文字フィルターもコンテナ起動時に適用される。
 
-セットアップやサーバーは selector の値をログに出しません。`tools/arc/b.py` は測定用ツールとして既定値 `level_zero:*` を設定し、`--gpus` と `--env` で上書きしてエンジンの子環境へ渡します（`tools/arc/b.py:32-46`）。これは同梱ツールの起動設定であり、エンジンによる読み取りを示すものではありません。
+## ログと測定値
+
+この変数自体について Strata の警告・成功ログ・エラー文言はない。Strata 所有の `tools/vision/own/vit_sycl.cpp:254-268` は GPU を列挙し選ぶコードと、セレクターが一覧を filter するとのコメントを含むが、当該ファイルにこの環境変数を読むコードはない。ggml-SYCL 内部には `getenv("ONEAPI_DEVICE_SELECTOR")` があるが、これは `third_party/strata-llama/...` の依存コードであり、本書ではその内部動作を Strata の挙動として説明しない（`third_party/strata-llama/ggml/src/ggml-sycl/dpct/helper.hpp:915`, `ggml-sycl.cpp:184`）。
 
 ## 根拠
 
-- `sycl/setup_intel.py:494-498`: 複数カードでだけ selector の候補を作り、その時点で設定済みの値を `setdefault` で保持。
-- `serve/server.py:3747-3760,9193`: ホスト環境を複製し、config `env` を上書きしてエンジン起動環境に使う。
-- `sycl/serve/strata-sycl.sh:13-16,28-38`: `ONEAPI_*` を Docker 転送対象とし、空文字・`0` を転送しない。
-- `sycl/tools/Dockerfile:8`: 同梱 SYCL 開発イメージの既定環境値。
-- `tools/arc/b.py:32-46`: Arc 用ベンチマークツールが値を構成して子プロセスに渡す例。
-
-候補一覧には名前があります（`docs/envvars/000_envvers.md:473`）。ソース全体の完全一致検索では、エンジンの読み取り箇所は見つからず、実行時の明示的な設定・転送箇所は上記のセットアップ、サーバー、ラッパーに限られます。`docs/INTEL_ARC.md:124-125` も二枚構成時の selector とラッパー転送を説明していますが、その値の意味・デバイス選択動作の根拠にはしていません。
+- `sycl/setup_intel.py:479-498,530-545` — config の読み込み、複数カード時の既定 selector、config 保存と SYCL 起動。
+- `serve/server.py:4428-4441,10175-10183` — config `env` を engine 子環境へ重ねる処理と engine 起動経路。
+- `setup.py:8253-8266` — run script は server を起動する。
+- `sycl/serve/strata-sycl.sh:13-16,33-52` — `ONEAPI_*` のコンテナ転送と空文字・`0` の除外。
+- `tools/vision/own/vit_sycl.cpp:254-268` — Strata 所有 SYCL vision reader の GPU 列挙（対象変数の読み取りはない）。
+- `third_party/strata-llama/ggml/src/ggml-sycl/dpct/helper.hpp:915`, `third_party/strata-llama/ggml/src/ggml-sycl/ggml-sycl.cpp:184` — 候補名の依存コード内参照。依存コードの動作は対象外。

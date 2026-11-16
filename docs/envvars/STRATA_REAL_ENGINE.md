@@ -1,64 +1,50 @@
 # `STRATA_REAL_ENGINE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-Strata 同梱 Desktop host（`apps/host/server` の Node.js 実装）で、モデル一覧・ロード処理・監視表示を実モデル向けにするか、デザイン確認用の simulated mode にするかを選びます。ホストプロセス自身が読む設定であり、環境変数を llama.cpp や GPU driver に渡す処理ではありません。
+App Host のモデルカタログとモデルライブラリを実モードにし、推論側で実エンジンが必須かどうかを決め、デモ用の監視値の一部を抑制する。通常のソース実行では unset がデザイン反復用のシミュレーションモードであり、`'1'` で実モードになる。パッケージ版の Desktop はホスト子プロセスにこの値を `'1'` で明示設定する（`apps/host/server/catalog.mjs:24-34`、`apps/host/server/models.mjs:12-21`、`apps/desktop/src-tauri/src/main.rs:467-485`）。
 
-ただし「real」は単一の engine 実装を意味しません。モデルをロードするときは Strata が supervisor 経由で llama.cpp を起動します。一方、チャット推論はまず Strata API worker を探し、次に supervisor 管理 engine、既知の OpenAI 互換 server を試します。いずれも見つからないときの simulated 応答可否もこの変数が関係します。
+「実モード」はモデルの選択・インストール・ロード経路を切り替えるが、モデルや推論サーバーを自動で用意する意味ではない。実モードで、モデルがまだディスク上になく既存のダウンロード処理もない状態でモデル一覧の install 処理に入ると HTTP 409 で拒否する。ロードにはモデルがディスク上に存在する必要があり、ロード時は `supervisor.restart` を呼ぶ（`apps/host/server/models.mjs:146-160,207-243`）。推論は既存の Strata worker、起動済み supervisor engine、または検出した OpenAI 互換サーバーへ接続し、実エンジン必須なのにどれも利用できなければシミュレーションせずエラーにする（`apps/host/server/inference.mjs:84-155,198-234`）。
 
 ## 値と判定
 
-主要な比較は文字列全体に対する厳密な `=== '1'` です。数値変換、trim、大小文字の変換はありません。
+Strata の各箇所は数値変換をせず、文字列 `'1'` との完全一致で判定する。大文字小文字、前後空白、数値としての解釈は関係しない。空文字・`'0'`・`'true'`・`'1anything'`・`' 1'` はすべて `'1'` と一致せず、実モード判定は false になる。多くの箇所で unset も同様に false 扱いだが、推論側では `STRATA_PACKAGED` の値も合わせて判定する（`apps/host/server/models.mjs:20`、`apps/host/server/catalog.mjs:24`、`apps/host/server/inference.mjs:38-42`）。
 
-| 値 | モデル・カタログ・monitor の判定 | 推論の `requiresRealEngine()` 判定 |
-|---|---|---|
-| 未設定、空文字、`0`、`true`、`1x`、` 1` など | simulated 側 | `STRATA_PACKAGED === '1'` でなければ demo 可 |
-| 正確に `1` | real 側 | `STRATA_FORCE_DEMO === '1'` かつ packaged でなければ demo 可。それ以外は real backend 必須 |
+| 条件 | unset | `'1'` | その他の設定値（例） |
+|---|---|---|---|
+| カタログ・モデルライブラリ | デザイン用モデル一覧／シミュレーション | `REAL_VARIANTS` と実モデル経路 | unset と同じ。空文字も無効 |
+| 推論の実エンジン必須判定 | `STRATA_PACKAGED !== '1'` なら false | true。ただし後述の `STRATA_FORCE_DEMO` 優先条件あり | `STRATA_PACKAGED === '1'` なら true、そうでなければ false |
+| 監視表示・restart 判定 | デモ値を使う側／restart を拒否 | 一部デモ値を抑制し restart を許可 | unset と同じ |
 
-`STRATA_FORCE_DEMO=1` は推論判定だけに作用し、`STRATA_PACKAGED=1` のときは無視されます。モデルカタログと monitor の分岐はこの2変数を参照せず `STRATA_REAL_ENGINE` だけを見るため、開発環境で `STRATA_REAL_ENGINE=1` と `STRATA_FORCE_DEMO=1` を同時設定すると、モデル・monitor は real 扱いのまま推論だけ demo になり得ます。packaged host は Tauri が両方 `STRATA_PACKAGED=1` と `STRATA_REAL_ENGINE=1` に設定します。
+実モード判定の主要実装は `apps/host/server/catalog.mjs:24`、`apps/host/server/models.mjs:20`、`apps/host/server/inference.mjs:38-42`、`apps/host/server/monitor.mjs:89-103,172-194`、`apps/host/server/engine.mjs:195-197` にある。
 
 ## 有効になる条件
 
-- Node.js の Desktop host が対象です。候補名の読み取りは `apps/host/server` にあり、C++/CUDA/HIP/SYCL 本体での読み取りは見つかりませんでした。
-- `STRATA_REAL_ENGINE=1` でも、real 推論 backend が自動的に起動するわけではありません。既存の Strata worker、supervisor 管理 engine、または認識された互換 server が接続できなければ失敗経路になります。
-- `STRATA_REAL_ENGINE` が `1` 以外で、推論側も `STRATA_PACKAGED=1` でなく `STRATA_FORCE_DEMO=1` でもない場合は、接続先がない時に demo engine が選ばれます。
-- `STRATA_PACKAGED=1` は推論の demo fallback を禁止しますが、`models.REAL` や monitor の値判定そのものは上書きしません。Tauri の通常起動と self-test は両方の変数を `1` に設定します。
-- OS、CUDA/HIP/SYCL backend、build macro、CLI 引数による値の上書きは、この変数の読み取り箇所では確認できません。`apps/desktop/scripts` と `apps/host/scripts` にある E2E / preview 起動スクリプトは子 host に `1` または `0` を明示設定しますが、製品 host の別の値 parser ではありません。
+- OS / backend / build macro による Strata 側の値判定差はない。判定は App Host の Node.js コードで行われる。Desktop の通常起動と自己テスト起動はそれぞれ `STRATA_PACKAGED=1` と `STRATA_REAL_ENGINE=1` をホスト子プロセスに設定する（`apps/desktop/src-tauri/src/main.rs:467-485,738-749`）。
+- 推論側では `STRATA_FORCE_DEMO === '1'` かつ `STRATA_PACKAGED !== '1'` のとき、先に実エンジン必須判定を false にする。この組合せでは `STRATA_REAL_ENGINE=1` であっても推論 fallback は demo になり得る。`STRATA_PACKAGED=1` の場合は `STRATA_FORCE_DEMO` による上書きはなく、最後に `STRATA_PACKAGED` が true を返す（`apps/host/server/inference.mjs:38-42,131-155`）。
+- `STRATA_PACKAGED=1` 単独でも推論側は実エンジン必須になる。ただしカタログと `models.REAL` は `STRATA_REAL_ENGINE` だけで決まり、`STRATA_PACKAGED` では切り替わらない（`apps/host/server/catalog.mjs:24`、`apps/host/server/models.mjs:20`、`apps/host/server/inference.mjs:38-42`）。
+- `STRATA_REAL_ENGINE=1` でも推論の実応答には接続先の worker / engine / 対応サーバーが必要である。Strata worker は `STRATA_SERVER_URL` または既定の `http://127.0.0.1:8095/v1` を調べ、その他の候補も探索する。どれも使えない場合は「No Strata engine answered ... Simulated output is disabled in this build.」をエラーにし、チャット要求を失敗させる（`apps/host/server/inference.mjs:19-26,44-49,84-155,198-234`）。
+- 実モードのモデルロードは対象モデルがディスク上にある場合だけ進み、`supervisor.restart` の失敗はモデル状態を `error` にして `loaded` をクリアしたうえで呼び出し元へ再送出する（`apps/host/server/models.mjs:207-243`）。
+- モデル restart API は実モードでないと `Restart is unavailable with the example engine. Save settings for the next load.` を throw する（`apps/host/server/engine.mjs:195-197`）。
+- このフラグによる GPU / OS 制限の追加判定は確認できない。監視処理は別途、GPU telemetry reader や system sampler の結果を利用する（`apps/host/server/monitor.mjs:130-139,88-105`）。
 
 ## 実行時の詳細
 
-### モデル一覧とロード
+- `catalog.mjs` はモジュール評価時に built-in variant 一覧を選び、`models.mjs` は同じくモジュール評価時に `REAL` を定数へ保存する。通常のホスト起動後に `process.env` を変更しても、このカタログ選択と `REAL` は更新されない。ライブラリ初期化は `REAL` に応じてデモ状態の補正を行い、実モード時はファイル有無を基準にインストール状態を整える（`apps/host/server/catalog.mjs:24-34`、`apps/host/server/models.mjs:20,54-89`）。
+- 推論側の `requiresRealEngine()` は呼び出しごとに環境を参照する。起動時に `detectBackend({ force: true })` が一度実行され、チャットの `streamChat` も backend を検出する。検出結果は一部の経路で最大 20 秒再利用されるため、プロセス内で環境を後から変更した場合は、モジュール定数と検出 cache が同時には更新されない（`apps/host/server/index.mjs:260-268`、`apps/host/server/inference.mjs:38-42,84-155,198-200`）。
+- 監視モジュールは `process.env` を tick・snapshot・監視値更新時に直接読み直す。unset / `'1'` 以外では GPU 読み取り値の代わりに `source: 'demo'` の GPU 値、一部の RAM / VRAM 使用量、温度、prompt/output throughput 等のデモ値を作る。`'1'` ではこれらの一部を `none` または実測・engine 由来の値にし、drive 温度読み取りも Monitor 表示中などの時間条件が揃った場合だけ呼ぶ。ただし GPU load / GPU 温度ターゲットなど、監視内のすべての数値がこの変数だけで切り替わるわけではない（`apps/host/server/monitor.mjs:88-105,130-205,301-352`）。
+- `autostartModel` には `'1'` の場合に `loaded ?? current` を返す判定がある。ただし調査対象 commit のホストコードでこの関数を呼ぶ箇所は見つからなかったため、ホスト起動時の自動ロードが実際に行われるとは記載しない（`apps/host/server/autostart.mjs:12-19`）。
+- ソース上の直接参照には、上記のほか index の起動時案内文と engine restart 判定がある。`models.REAL` は index 内の複数モデル/API経路にも渡され、実モードと simulated mode の分岐に使われる（`apps/host/server/index.mjs:127,170,250-257,661-734,1477-1548`）。
 
-`models.mjs` の `REAL` と `catalog.mjs` の組み込みカタログ選択は、モジュール読み込み時に一度評価されます。`1` なら real catalog、モデル状態とロードは実ファイル・engine 状態を使い、モデル load は `supervisor.restart()` を呼びます。`1` 以外ならデザイン用バリアントを一覧にし、install/load/unload の一部を simulated state として扱います。環境を同一プロセス内で後から変更しても、これらの定数や既に作成された catalog は再評価されません。
+## ログと測定値
 
-起動時に `1` の場合だけ、保存状態の `loaded` または `current` を `startupModelId` とし、700 ms 後にその variant が存在しディスク上にあることを確認して自動 load を試みます。成功・失敗はそれぞれ `autostart · loading ...` と `autostart failed: <message>` の stdout/stderr ログに現れます。値が `1` でない場合、この自動 load は行われません。
-
-real mode のモデル一覧から実行できないスターター catalog の新規ダウンロード要求は、ネットワーク要求前に status 409 のエラーになります（ログ文言: `The app downloads models from the Models screen of the native engine, not from this list.`）。実ファイルがあり load を選ぶと supervisor の engine 起動に進みます。engine 再起動 API は環境値が厳密に `1` でなければ `Restart is unavailable with the example engine. Save settings for the next load.` で拒否します。
-
-### 推論と観測結果
-
-推論判定は `requiresRealEngine()` の呼び出し時に環境を直接読みます。`STRATA_FORCE_DEMO=1`（かつ packaged でない場合）が先に demo を許し、それ以外では `STRATA_REAL_ENGINE=1` または `STRATA_PACKAGED=1` が real engine 必須にします。host は Strata worker を先に probe し、次に supervisor engine、既知の互換 server を試します。real 必須なのにどれも見つからない場合、backend は `unavailable` となり、`streamChat()` は `No Strata engine answered at ... and no supervised engine is running. Start Strata (or load a model) and retry. Simulated output is disabled in this build.` を含む例外を投げます。リクエスト経路は serving entry を error で完了し、`type: 'error'` frame を送り、エラー本文を返します。
-
-real 必須でない場合は demo backend が選ばれ、固定の demo 応答と `demo: true` の frame を出します。起動時の console 表示は `models.REAL` の値を使い、非 real 判定なら `inference · simulated (design iteration) — set STRATA_REAL_ENGINE=1 for a real engine` と表示します。real 判定では検出 backend に応じた表示となり、接続がなければ `No Strata engine` などになります。
-
-### monitor
-
-monitor は 1 秒ごとの tick や snapshot 生成などで環境値を都度参照します。値が `1` 以外なら GPU/CPU/RAM、temperature、throughput、expert cache、prompt/output throughput に demo source またはシミュレート値を使います。値が `1` ならこれらの demo 値を抑え、throughput は engine metrics がなければ `none`、thermal は `none`、memory はモデル状態に応じて `estimated` または `none` とします。温度読取 API の呼び出しも `1` かつ monitor が watch 対象期間内という条件付きです。`STRATA_FORCE_DEMO` は monitor 判定に影響しません。
-
-### 読み取り時期と cache
-
-モデル定数・カタログは Node.js の ES module 初期化時に固定されます。`startupModelId` も host boot 時に決定します。推論の `requiresRealEngine()` は backend 検出の都度評価しますが、`detectBackend()` は検出結果を最大20秒再利用する経路があり、その間は環境値を変更しても cached backend が返ることがあります。monitor の直接参照は tick/snapshot 等の実行ごとに評価されます。ソースには外部プロセスから起動中 Node プロセスの環境を更新する仕組みはありません。
+- Host 起動時、モデルライブラリが simulated 扱いなら stdout に `inference    ·  simulated (design iteration) — set STRATA_REAL_ENGINE=1 for a real engine` を表示する。実モードでは検出 backend 名など `inferenceLine` の結果を表示する（`apps/host/server/index.mjs:262-268`）。
+- 実エンジン必須時に backend が見つからないと、`detectBackend` は上記の説明文字列を含む `unavailable` 状態を返し、`streamChat` がその文言で例外にする。チャット処理は error frame と serving error に反映する（`apps/host/server/inference.mjs:131-142,228-234`、`apps/host/server/index.mjs:679-714`）。
+- 実モードでモデルが未取得かつ既存ダウンロードがない状態で install が呼ばれると、HTTP 409 と `The app downloads models from the Models screen of the native engine, not from this list.` を返す。この一覧側の install はモデル取得を実行しない（`apps/host/server/models.mjs:140-159`）。
+- 性能値や実行比較の定量的測定は、この変数のソース実装および参照した説明資料では確認できなかった。
 
 ## 根拠
 
-- `apps/host/server/models.mjs:12-20,37-50,54-90,93-130,146-159,207-243,332-335` — `REAL` の厳密比較、simulated/real のモデル状態・install/load 分岐。
-- `apps/host/server/catalog.mjs:10-33` — `REAL` によるカタログ選択。
-- `apps/host/server/index.mjs:254-276,278-284` — 起動時モデル選択、自動 load、起動ログ。
-- `apps/host/server/inference.mjs:38-42,84-156,199-235,480-524` — packaged / force-demo を含む実推論判定、backend 探索、unavailable と demo 経路。
-- `apps/host/server/index.mjs:675-759` — 推論 request 呼び出し、serving error 終了と error frame。
-- `apps/host/server/engine.mjs:195-220` — restart の環境値 guard と no-model warning / restart ログ。
-- `apps/host/server/monitor.mjs:83-100,125-133,142-200,296-312,323-347` — demo telemetry 判定と定期・snapshot 時の読み取り。
-- `apps/desktop/src-tauri/src/main.rs:463-477,734-744` — 製品 host と self-test の起動環境で `STRATA_PACKAGED=1`、`STRATA_REAL_ENGINE=1` を設定。
-- 候補一覧: `docs/envvars/000_envvers.md:1404`。設計資料 `apps/host/docs/native-engine-handover.md:46` はこの変数を旧 GGUF/llama adapter の real/simulated 切替として記述しています。これは host の本番実装で確認できるカタログ・load・推論・monitor の条件と整合しますが、native adapter 自体の動作をこの変数の効果とはしていません。
+主な読み取り箇所は `apps/host/server/catalog.mjs:24`、`apps/host/server/models.mjs:20`、`apps/host/server/inference.mjs:38-42`、`apps/host/server/monitor.mjs:89,135,172,184,187,192,312,334,351`、`apps/host/server/engine.mjs:196`。Desktop による値設定は `apps/desktop/src-tauri/src/main.rs:477,744`。

@@ -1,45 +1,42 @@
 # `LLAMA`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-Linux AMD/HIP 向けのパッケージ作成スクリプトが参照する、llama.cpp checkout のディレクトリです。Strata の実行時設定ではなく、ビルド時に CMake の `STRATA_GGML_DIR` または `LLAMA_DIR` へ渡す入力です。`packaging/build_hip_linux.sh` はエンジンと CPU/GPU vision reader を構成し、`packaging/build_dsv41_hip_linux.sh` は DeepSeek-V4.1 エンジンを構成します（`packaging/build_hip_linux.sh:5-18,25,60-86`; `packaging/build_dsv41_hip_linux.sh:2-13,17,46-48`）。
+`LLAMA` は Linux AMD/HIP のパッケージ用ビルドスクリプト `packaging/build_hip_linux.sh` が読む、llama.cpp checkout のパス指定です。空でなければ、エンジン用 ggml の選択値 `STRATA_GGML_DIR` と、画像 reader 用 CMake の `LLAMA_DIR` に変換して渡します。空または未設定なら、初回構成時は Strata に同梱されたソースを使います。これは Strata 実行ファイルが読む環境変数ではなく、このスクリプトを実行するときのビルド設定です（`packaging/build_hip_linux.sh:21-25,60-80`）。
 
 ## 値と判定
 
-両スクリプトは Bash の `${LLAMA:?...}` を使います。値を数値や真偽値として parse せず、ディレクトリのパスとして後続の CMake 引数に展開します。
+スクリプトは Bash の `${LLAMA:-}` で値を取り込み、その後 `[ -z "$LLAMA" ]` で空かどうかだけを判定します。`:-` により未設定と空文字はどちらも空になります。空でなければ値をパス文字列としてそのまま CMake に渡し、`LLAMA` 自体について数値・真偽値・存在確認・空白除去・パス正規化はしません（`packaging/build_hip_linux.sh:21-25,71-80`）。
 
-| 状態 | 判定と結果 |
-|---|---|
-| 未設定 | 必須パラメーター展開が失敗し、Bash が指定された案内文字列を含む診断を出してスクリプトを終了します。 |
-| 空文字 | 未設定と同じく展開が失敗します。 |
-| 空でない値 | パスとしてそのまま保持し、引用した CMake 引数に渡します。スクリプト内でパスの存在、checkout の commit、指定 commit との一致は検証しません。 |
+| 条件 | 未設定 | 非空で有効になる値 | 空またはこのスクリプトで別扱いにならない値 |
+|---|---|---|---|
+| `packaging/build_hip_linux.sh` を Bash で実行 | 空と同じ。初回 CMake 構成では同梱ツリーを使う | `../llama.cpp` のような checkout パス。`0` や空白だけの値も非空なので override として転送される | `LLAMA=''` は未設定と同様。`true` / `false` も真偽値として解釈されず、それぞれ文字列のパスとして転送される |
 
-既定値や別環境変数からの fallback はありません。`build_hip_linux.sh` では `VISION_ONLY` が設定されてエンジン構成を飛ばす場合も、`LLAMA` の必須チェックは先に実行され、vision reader の構成に使われます（`packaging/build_hip_linux.sh:22-25,60-64,78-86`）。
+`LLAMA` が非空でも、値が有効な checkout を指すかはこのシェルスクリプトでは検証しません。CMake の構成・ビルドがそのパスを扱い、失敗時は通常のビルド失敗経路に入ります（`packaging/build_hip_linux.sh:63-85`; `cmake/strata_ggml.cmake:8-13`; `tools/vision/CMakeLists.txt:18,122`）。
 
 ## 有効になる条件
 
-- `LLAMA` の読み取りは Linux HIP パッケージ用の `packaging/build_hip_linux.sh` と `packaging/build_dsv41_hip_linux.sh` を実行したときに限られます。OS/backend は各スクリプトの対象に由来し、Strata の通常実行やサーバー起動で読む環境変数ではありません（`packaging/build_hip_linux.sh:1-4`; `packaging/build_dsv41_hip_linux.sh:1-4,14-18`）。
-- `build_hip_linux.sh` は通常のエンジン構成で `-DSTRATA_GGML_DIR="$LLAMA"` を渡し、vision reader の CPU/HIP 両構成で `-DLLAMA_DIR="$LLAMA"` を渡します。`VISION_ONLY` が空でない場合は通常エンジン構成を省略しますが、CPU/HIP reader は引き続き構成します（`packaging/build_hip_linux.sh:60-64,78-86`）。
-- 同スクリプト内で DSV41 を追加構成するときも `STRATA_GGML_DIR` に渡されます。その経路は `DSV41=1` のときです（`packaging/build_hip_linux.sh:42,68-75`）。
-- `build_dsv41_hip_linux.sh` は DSV41 エンジンを HIP で構成し、`STRATA_NATIVE_EXPERTS=ON` と `STRATA_GGML_DIR` を渡します（`packaging/build_dsv41_hip_linux.sh:46-50`）。
-
-CMake は `STRATA_GGML_DIR` が空でなければその下の `ggml` を追加し、空なら pin された llama.cpp commit を FetchContent します。標準 CMake の既定は `STRATA_NATIVE_EXPERTS=ON` です（`CMakeLists.txt:176,2045-2050,2057,2104-2116`）。vision 側は `LLAMA_DIR` を既定でリポジトリ内の `third_party/llama.cpp` にしますが、これらのパッケージスクリプトは `-DLLAMA_DIR="$LLAMA"` を明示してその既定を置き換えます（`tools/vision/CMakeLists.txt:17,94`; `packaging/build_hip_linux.sh:79,85`）。
-
-スクリプトのコメントは pinned commit の checkout を指定するよう案内していますが、スクリプト自身はその commit を照合しません。実際のパスが必要な構成であること、対象ライブラリ側のビルド結果などは CMake/後続ビルドに委ねられます（`packaging/build_hip_linux.sh:10,25,62`; `packaging/build_dsv41_hip_linux.sh:8,17,47`）。
+- この環境変数を読むのは `packaging/build_hip_linux.sh` です。他の実行経路がこの名前の環境値を参照する箇所はありません。`LLAMA` という名前の他の参照は、Windows スクリプト内で `STRATA_GGML_DIR` から作るローカル変数か、CMake 関数引数です（例: `tools/hip/build_windows.bat:94-99`, `cmake/strata_ggml_tq_overlay.cmake:20-23`）。
+- エンジン構成は `VISION_ONLY` が空のときだけ行われます。このとき非空の `LLAMA` は `-DSTRATA_GGML_DIR=...` として `cmake -S .` に渡されます。`STRATA_CMAKE_EXTRA` はその引数より後ろに追加されるため、同じ変数を含む CMake 引数を指定すればエンジン側の指定を後から変えられます（`packaging/build_hip_linux.sh:60-68`）。CMake は非空の `STRATA_GGML_DIR` を ggml の root とし、空なら `third_party/strata-ggml` を選びます（`cmake/strata_ggml.cmake:6-13`）。
+- `VISION_ONLY` の有無にかかわらず、このスクリプトは CPU reader と HIP reader の構成・ビルドへ進みます。非空の `LLAMA` は両方へ `-DLLAMA_DIR=...` として渡され、空なら `tools/vision/CMakeLists.txt` の同梱 `third_party/strata-llama` の既定値が使われます（`packaging/build_hip_linux.sh:60-85`; `tools/vision/CMakeLists.txt:18-20,122`）。
+- `OUT` の下に既存の CMake build directory/cache がある場合、スクリプトが空値のときに `-DSTRATA_GGML_DIR` / `-DLLAMA_DIR` を渡さないため、以前の構成で保存された値が残り得ます。したがって空または未設定でも、再利用 build directory では同梱ツリーが選ばれるとは限りません。明示的な非空値はそれぞれの `-D` として構成コマンドに渡されます（`packaging/build_hip_linux.sh:24-25,63-65,71-81`; `cmake/strata_ggml.cmake:8-13`; `tools/vision/CMakeLists.txt:18`）。
+- この設定は Linux HIP パッケージビルド経路に限られます。モデル状態、生成時 CLI、サーバーモード、GPU の実行時選択を `LLAMA` が変える読み取り箇所はありません。
 
 ## 実行時の詳細
 
-各スクリプトの冒頭で一度シェル変数 `LLAMA` に展開します。以後は実行中の環境変更を読み直す処理はなく、実行中に環境変数を書き換えても、この値の展開結果は変わりません。値は CMake の `-D` 引数に埋め込まれ、エンジン側では `STRATA_GGML_DIR/ggml`、vision 側では `LLAMA_DIR` のソースディレクトリとして使われます（`packaging/build_hip_linux.sh:25,62,79,85`; `packaging/build_dsv41_hip_linux.sh:17,47`; `CMakeLists.txt:2050,2104-2105`; `tools/vision/CMakeLists.txt:17,94`）。
+環境変数の読み取りはスクリプト起動時、`set -u` の直後のシェル展開で一度行われ、以後はシェル変数 `LLAMA` が使われます。起動後の環境変更を再読込する処理はありません。プロセス起動後の Strata 実行ファイルへの引き継ぎもなく、値は CMake configure のコマンドライン引数に変換されます（`packaging/build_hip_linux.sh:21-25,63-80`）。
 
-未設定または空文字なら CMake 起動前にシェルが失敗します。指定パスが構成に使えず CMake が非ゼロで終わる場合、通常エンジン構成は `cfg.log`、DSV41 構成は `cfg-dsv41.log` に出力を保存し、`chk` が `build.status` に失敗段階と終了コードを記録して終了します。vision 構成のログは `cfg-vision.log` / `cfg-vision-hip.log` に保存され、後続のビルド失敗は同じ `chk` に記録されます（`packaging/build_hip_linux.sh:47-48,61-66,79-89`; `packaging/build_dsv41_hip_linux.sh:33-35,46-51`）。
+エンジン用 CMake 構成は `OUT/b`、画像 reader は `OUT/bv` と `OUT/bh` に構成されます。`VISION_ONLY` が非空の場合はエンジン構成・ビルドを飛ばしますが reader の構成には `LLAMA` が使われます（`packaging/build_hip_linux.sh:29,60-85`）。
 
-`LLAMA` という綴りの他の参照には、CMake 関数引数、テスト用 CMake 変数、リポジトリ内のパス定数、Windows バッチ内で `STRATA_GGML_DIR` から作られるローカル変数があります。それらは `LLAMA` という名前の環境変数を独立に読む箇所ではありません。この調査では実環境読み取りを上記2スクリプトの必須パラメーター展開に確認しました。
+## ログと測定値
+
+`LLAMA` 専用のログや値の警告はありません。構成ログは `$OUT/cfg.log`、`$OUT/cfg-vision.log`、`$OUT/cfg-vision-hip.log` にリダイレクトされます。各 configure/build の終了コードが非ゼロなら `chk` が `$OUT/build.status` に `ABORT ... failed (rc=...)` を記録してスクリプトを終了します。HIP reader が生成されなかった場合は `ABORT no strata-vision-hip` を記録し、HIP reader の build log の末尾も status に追記します（`packaging/build_hip_linux.sh:44-47,63-85`）。
 
 ## 根拠
 
-- `packaging/build_hip_linux.sh:5-18,22-25,42,47-48,60-89` — ビルド用途、必須値、エンジン/vision/DSV41 への受け渡し、失敗記録。
-- `packaging/build_dsv41_hip_linux.sh:8-18,33-35,43-51` — DSV41 用の必須値、受け渡し、失敗記録。
-- `CMakeLists.txt:176,2045-2050,2057,2104-2116` — `STRATA_GGML_DIR` の既定、ローカル ggml と pinned FetchContent の分岐。
-- `tools/vision/CMakeLists.txt:17,94` — `LLAMA_DIR` の既定と llama.cpp ソースの追加。
+- `packaging/build_hip_linux.sh:21-25` — シェルでの取り込み、未設定・空文字の扱い、エンジン用 `STRATA_GGML_DIR` 引数。
+- `packaging/build_hip_linux.sh:60-85` — `VISION_ONLY` 分岐、CMake 引数の組み立て、engine / CPU reader / HIP reader の構成と失敗処理。
+- `cmake/strata_ggml.cmake:6-13` — `STRATA_GGML_DIR` の cache 変数と同梱 ggml への fallback。
+- `tools/vision/CMakeLists.txt:18-20,122` — `LLAMA_DIR` の同梱既定値と llama.cpp tree の追加。

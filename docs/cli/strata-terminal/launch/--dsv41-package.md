@@ -1,56 +1,55 @@
 # `--dsv41-package`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（2026-11-17 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
 | コマンド | `strata launch` |
-| オプション | `--dsv41-package FILE` |
+| オプション | `--dsv41-package` |
 | 別名 | なし |
-| 値 | DeepSeek-V4.1 用 engine package のファイルパス |
+| 値 | `FILE`（文字列。既定値なし） |
 
 ## 役割
 
-DeepSeek-V4.1 の専用 engine package を手元にダウンロード済みの場合、そのファイルを Strata に検査・導入させます。通常の feed からの取得の代わりに使う指定です。モデルファイルの指定ではありません（`strata_cli/launch/cmd.py:87-88`、`setup.py:7764-7779`）。
+この引数は旧 DeepSeek-V4.1 用の引数との互換性のため parser に残っています。値を package として検査・導入する機能はなく、通常は `strata launch` の設定作成前に DeepSeek の提供終了メッセージを返します。`--help` の表示対象にも含まれません（`strata_cli/launch/cmd.py:85`）。
 
 ## 使い方
 
+旧呼び出し形式を実行すると、値の内容にかかわらず（空文字列の場合を除く）DeepSeek は提供されていない旨を返します。
+
 ```sh
-strata launch --model MODEL --family deepseek41 --dsv41-package /absolute/path/strata-dsv41-package.tar.gz --no-tui
+strata launch --dsv41-package /path/to/old-package.tar.gz
 ```
 
-`MODEL` はカタログにある DeepSeek-V4.1 のモデル名に置き換えてください。`--dsv41-package` だけでは起動対象の選択になりません。対話端末では通常の案内画面に進みますが、このフラグ単独では選択内容として扱われません。非対話環境では `--model` または DeepSeek の preset など、起動対象も指定してください（`strata_cli/launch/cmd.py:197-213,680-710`）。
+これは package の導入例ではありません。現行 Strata でこの引数を使って DeepSeek engine を導入することはできません。
 
 ## 値と既定値
 
-- `FILE` は必須の1値です。launch parser は拡張子、存在、内容を事前検証せず、`Path(...).expanduser()` で `~` だけ展開して設定に保存します。既定値はありません（`strata_cli/launch/cmd.py:87-88,197-205`）。
-- setup の package installer は `.tar.gz`、`.tar.xz`、`.zip`、または展開済みディレクトリを処理できます。ただし launch の help は `.tar.gz` / `.zip` と説明しており、`.tar.xz` と展開済みディレクトリは setup 実装で確認できる追加対応です（`strata_control/dsv41_engine.py:38-39,51-75`）。
-- `strata launch` は引数を setup に渡す際の作業ディレクトリを Strata の source checkout にします。相対パスを使うと呼び出し元ディレクトリではなく、その setup subprocess の作業ディレクトリを基準に解決されます。確実に指定するには絶対パスを使ってください（`strata_cli/launch/runner.py:948-959`）。
+値は parser 上必須の位置引数 `FILE` ですが、型変換、パス検査、ファイル存在確認は parser では行われません。省略時の値は `None` です。通常の非空値では `settings_from_args()` が属性の truthiness を確認し、DeepSeek 非提供メッセージの `ValueError` を発生させます。繰り返し指定した場合は argparse の通常の `store` 動作で最後の値が残ります（`strata_cli/launch/cmd.py:85,206-219`）。
+
+`--dsv41-package=` のように空文字を明示すると parser は空文字を値として受け取り得ますが、判定は truthiness によるため廃止フラグとして検出されません。その場合、この引数は実質無視され、通常の launch 処理が続きます（同 `:218-219`）。
 
 ## 実行時の動作
 
-launch は値を `LaunchSettings.dsv41_package` に保持し、選択された family が `deepseek41` の場合だけ `setup.py --dsv41-package FILE` に転送します。他の family では転送されず、package は使われません（`strata_cli/launch/settings.py:77-86`、`strata_cli/launch/runner.py:727-755`）。
+parser が値を `a.dsv41_package` に格納し、`run_launch()` から呼ばれる `settings_from_args()` が `dsv41_package` を含む廃止済みフラグのいずれかに truthy な値があれば `retired.NOT_OFFERED` を送出します。ここで値は他の処理へ渡されず、ファイルを開いたり package をインストールしたりする経路もありません（`strata_cli/launch/cmd.py:85,217-222,798`）。
 
-DeepSeek の setup は専用 engine がまだ見つからない場合にこの package を導入します。受け入れ前に engine の manifest、実行ファイル名、ホスト platform、信頼済み鍵による署名、および manifest に記録された全ファイルの hash を検査します。成功すると engine を Strata の install folder 内の `engine-dsv41/<version>-<platform>-<backend>[-<variant>]/` に配置し、Unix 系では実行権限を設定します（`setup.py:7741-7743,7770-7779,8037-8053`、`strata_control/dsv41_engine.py:51-111`）。
-
-指定 package がすでに導入済みの engine を強制置換する機能ではありません。launch は、既存モデル設定・必要なファイル・engine が揃っていれば setup を省略します。また setup 自体も engine が見つかった場合は指定 package をインストールしません。指定 package があると、通常の自動 upgrade も抑止されます（`strata_cli/launch/runner.py:925-938,1896-1903`、`setup.py:8041-8050`）。`--plan` は計画を表示して終了するため、package の導入には進みません（`strata_cli/launch/cmd.py:733-760`）。
+エラー文は「Strata no longer offers DeepSeek models. Run `strata launch` to choose one of the Qwen models.」です（`strata_control/retired.py:42-43`）。この例外は `run_launch()` 内で捕捉され、通常出力では `strata: ` を付けて stderr に出力し、終了コード 2 を返します。`--output json` が指定されている場合は stdout に `ok: false` とエラー内容を含む JSON を出力し、同じくコード 2 です（`strata_cli/launch/cmd.py:716-721,963-964`）。
 
 ## 適用条件と副作用
 
-- launch からの転送条件は `family == "deepseek41"` です。対象が DeepSeek でない場合は値を保持しても利用されません（`strata_cli/launch/runner.py:752-753`）。
-- macOS では `setup_args()` が setup に渡す引数を許可リストで絞り、このオプションは許可リストに含まれません。そのため launch parser は受理しますが、この経路では package が setup に渡りません（`strata_cli/launch/runner.py:752-775`）。
-- install 時は install folder 内の `engine-dsv41.manual` 一時作業領域を作り、終了時に削除します。検証に通った package を配置する際、同じ version 名の既存 directory は削除して置き換え、さらに `engine-dsv41` 内の他の directory も削除します。別バージョンの手動保持や同時併置はされません（`setup.py:7741-7743`、`strata_control/dsv41_engine.py:62-64,100-116`）。
-- package の取得元ファイルは installer が削除・移動する処理を確認できません。検査・展開・copy の対象はありますが、元ファイルは残ります（`strata_control/dsv41_engine.py:58-75,100-116`）。
-- 不正な package の導入が失敗すると setup は `[X]` のエラーを出して終了し、launch は setup の出力をもとに model install error を返します（`setup.py:7775-7779,825-830`、`strata_cli/launch/runner.py:997-1012`）。launch の通常エラーは stderr、`--output json` 指定時は JSON 出力になります（`strata_cli/launch/cmd.py:630-641`）。
+- 値が空でなければ、モデル名・選択中 family・preset の内容にかかわらず廃止メッセージで launch が止まります。DeepSeek のモデル名や family を別途検出した場合も同じメッセージになります（`strata_cli/launch/cmd.py:217-222`）。
+- `--plan` を併用しても廃止判定は行われます。通常のモデル準備やサーバー起動へは到達しません（同 `:798,851-852`）。
+- `--backend` も併用すると、その backend の値が妥当な場合、廃止判定より先に backend 選択を環境変数へ設定します。`--plan` なしでは選択を保存し、`--plan` ありでは保存しません。その後 `--dsv41-package` の判定で失敗します。したがって通常の launch は中止されても backend の保存状態は変更される場合があります。不正な backend 値なら、先にその値のエラーになります（`strata_cli/launch/cmd.py:771-798`）。
+- `--preset` が指定されていれば廃止判定より前に preset を読み込みますが、非空の廃止引数で失敗した場合、preset の更新や launch 設定の保存・起動には進みません（同 `:206-219,798`）。
+- `--help` にはこの引数が掲載されません。parser 定義自体は維持されているため、保存済みショートカットや古いスクリプトから渡された呼び出しは受理したうえで説明メッセージを返します（`strata_cli/launch/cmd.py:85`、互換目的の記述 `tests/terminal/test_retired_entry_points.py:200-216`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:75-89,197-205` — launch parser と path の取り込み。
-- `strata_cli/launch/cmd.py:630-641,680-700,733-760` — 起動対象の判定、失敗出力、計画表示。
-- `strata_cli/launch/runner.py:727-775,925-959,997-1012,1896-1903` — setup への引数転送、macOS の引数選別、setup 起動・失敗処理、upgrade 条件。
-- `strata_cli/launch/settings.py:77-86` — LaunchSettings の値。
-- `setup.py:7764-7779,8037-8058,8488-8491` — setup 側 parser・取得経路・対象 family の engine setup。
-- `strata_control/dsv41_engine.py:38-39,51-116` — package 形式、検証、配置、削除範囲、失敗時の出力。
+- `strata_cli/launch/cmd.py:73-86` — `strata launch` parser と `FILE` 引数の定義。help 表示から抑制。
+- `strata_cli/launch/cmd.py:206-222` — 引数値による廃止判定と、モデル/family/preset に対する同じ判定。
+- `strata_control/retired.py:42-43` — DeepSeek を要求した場合の利用者向けメッセージ。
+- `strata_cli/launch/cmd.py:710-721,771-798,851-852,961-964` — backend 処理の順序、launch 設定処理への到達、失敗時の出力形式と終了コード。
+- `tests/terminal/test_retired_entry_points.py:200-216` — 旧フラグを受理して拒否メッセージを返すこと、および help に表示しないことのテスト記述。動作説明の根拠は上記の実装ソース。
 
-調査は上記 commit の checkout 内ソースに限定しました。同一 revision の CLI help と Release 配布物は実行・取得しておらず、配布実績や配布ファイル名は確認していません。
+調査時の Strata checkout は `main` と `origin/main` が一致し、`git status --short --branch` に未コミット変更はありませんでした。旧 parser を確認した範囲では、現行 Strata が実際に導入する別の DeepSeek package 経路はありません。

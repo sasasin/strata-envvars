@@ -1,6 +1,6 @@
-# `strata components use --family`
+# `--family`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,52 +8,66 @@
 | コマンド | `strata components use` |
 | オプション | `--family` |
 | 別名 | なし |
-| 値 | `qwen` または `deepseek`。値は必須 |
+| 値 | エンジン系列名。`qwen` または `shape:<shape>`。省略時は全系列を検索 |
 
 ## 役割
 
-導入済み engine のうち、どの engine 系統から対象を選ぶか指定します。同じ版番号が複数系統に存在する場合の候補絞り込みに使います。モデルの family を選ぶオプションではありません。コマンドは engine を切り替え、ダウンロードはしません（`strata_cli/update_cmd.py:84-87`）。
+指定した版・フォルダー名が複数のエンジン系列に存在するとき、切り替え対象の系列を指定します。これはモデル family を選ぶ指定ではありません。モデル形状別エンジンには `shape:<shape>` を使います。選択したエンジンは、以後の該当エンジンのモデル起動に使われます。
 
 ## 使い方
 
 ```sh
-strata components use 0.1.54 --family deepseek
+# Qwen 系列から、インストール済みエンジンを選ぶ
+strata components use <version-or-folder> --family qwen
+
+# 形状別エンジンを選ぶ（例の q4_lite は shape 名）
+strata components use <version-or-folder> --family shape:q4_lite
+
+# --family を省略して全系列から検索する。版が一意でない場合は失敗する
+strata components use <version-or-folder>
 ```
 
-版番号の代わりに、インストール済み engine の folder 名、または `newest` を指定できます（`strata_cli/update_cmd.py:84-87`）。
+`<version-or-folder>` は実際にインストール済みの版またはフォルダー名に置き換えます。`newest`（ソース上は `latest` も同義）を指定すると、選んだ系列の更新追従対象エンジンを選びます。
 
 ## 値と既定値
 
-- `argparse` の `choices` は `qwen` と `deepseek`、既定値は `None` です。オプション省略時は両系統を候補に含めます（`strata_cli/update_cmd.py:84-87`、`strata_control/engine_library.py:198-205`）。
-- 値は必須です。未指定、または `qwen` / `deepseek` 以外の値は parser が拒否し、usage とエラーを表示して終了コード 2 になります。繰り返し指定時は `argparse` の通常の単一値引数として最後の値が残ります（宣言: `strata_cli/update_cmd.py:86`）。
-- `newest` に加え `latest` も内部で同じ意味として扱われますが、parser の help は `newest` のみを位置引数の例として示します（`strata_control/engine_library.py:198-205`）。
+- `--family` は値を1つ取ります。既定値は `None` で、この場合は全系列が検索対象です。
+- `qwen` は共通の Strata エンジン系列です。モデル形状別エンジンは `shape:<shape>` で指定します。`<shape>` は英小文字で始まり、英小文字・数字・`_` を含む所定形式に合う必要があります（例: `shape:q4_lite`）。その形状のエンジンが未インストールなら選択できません。
+- parser は `choices` で値を検証します。無効値は処理本体に入る前に argparse の引数エラーになります。コード上、`deepseek` など廃止 family 名も choices 判定では受理されますが、現行のエンジン一覧には含まれないため選択先として使えません。
+- 同名のオプションが `strata components remove` にもありますが、ここでは `use` の動作だけを説明します。
 
 ## 実行時の動作
 
-`strata components use` の parser は `_common()` ではなくこの `--family` を直接登録します。コマンド処理では `list_engines()` が作る候補一覧に `a.family` を渡し、その値に一致する family の候補だけから指定された版番号・folder 名・`newest` を検索します（`strata_cli/update_cmd.py:84-87,358-363,378-379`、`strata_control/engine_library.py:180-195,198-205`）。family を省略して複数候補が一致すれば曖昧エラーとなり、folder 名を使うよう案内されます（`strata_control/engine_library.py:209-210`）。
+CLI は `--family` を `find_entry` に渡し、その family のインストール済み一覧に限定して位置引数の版またはフォルダー名を解決します。`newest` と `latest` は一覧内で更新追従対象と判定されたエンジンを指します。family を省略した場合も同じ解決を全系列に対して行います。
 
-候補一覧は engine を読み取り、Qwen 系では OS、backend、runtime、GPU architecture、driver、署名・ファイル整合性などからこの PC で実行可能かを判定します。DeepSeek 系では OS と指定 backend を使って適合性を判定します（`strata_control/engine_library.py:59-81,91-123,136-162`）。`--family` 自体はこの適合性判定を変更せず、候補を絞ります。選択された候補が実行不可なら切替前に終了コード 5 のエラーとなります（`strata_cli/update_cmd.py:378-383`）。
+選択したエンジンがすでに適用済みなら変更せず「すでに使用中」と報告します。それ以外は該当系列の更新状態を変更し、次回以降にその系列のモデルを起動すると選択したエンジンが解決されます。最新版を選ぶと固定指定を解除して更新追従状態に戻します。エンジンのダウンロードや削除は行いません。
 
-切替時には共有 engine 更新 lock を取り、実行中モデルがあれば停止を待つか、待ち時間を超えて Busy エラーになります（`strata_control/engine_library.py:225-239`）。Qwen engine は署名と全ファイルを再検証してから pin / active 状態などを更新します。最新 engine を選んだ場合は pin を外して更新追従に戻し、それ以外は pin します（`strata_control/engine_library.py:246-262`、`strata_control/updater.py:1303-1352`）。DeepSeek engine は test start の可否を確認し、最新でない場合は pin を設定し、関連する保存済み設定を選択先へ向け直し、履歴を保存します。最新を選んだ場合は pin を解除します（`strata_control/engine_library.py:265-289`）。
+`--backend` を併用すると、適合性判定の対象 backend を指定できます。複数メーカーの GPU があり、選択エンジンが別メーカー向けの場合、処理はそのメーカーを次回以降の選択として設定ファイルに保存します。`--components-dir` は検索・切替対象のコンポーネント領域を変え、`--wait` は稼働中モデルが停止するまで待つ時間を指定します。
 
 ## 適用条件と副作用
 
-このオプションは `strata components use` の候補検索にのみ作用します。同じ `--family` 内でも同一版番号に複数の folder が一致すれば、引き続き曖昧となり folder 名を指定する必要があります（`strata_control/engine_library.py:204-210`）。
-
-切替は将来起動する engine に適用され、すでに動作中のモデルを差し替えません。Qwen 系では共有更新 state の pin / active / previous / skipped / 履歴が更新され、engine が変わったときは保存 tuning preset が短い再確認対象としてマークされる場合があります。DeepSeek 系では family 側の pin、設定参照先、履歴が更新されます。engine のダウンロードや削除は行いません（`strata_control/engine_library.py:225-239,246-289`、`strata_control/updater.py:1303-1352`）。
+- 選択先は一覧にあるインストール済みエンジンでなければなりません。対象 PC で実行できない engine は切り替えを拒否します。適合性には OS、GPU/backend、必要な driver/runtime・architecture、およびコンポーネントファイルの状態が関係します。
+- エンジン切替時には署名と全ファイルを再検証します。検証に失敗した場合は切替を拒否します。
+- 切替前に更新ロックを取得し、モデル稼働中なら停止を待つか拒否します。`--wait` が省略または 0 のとき、対話端末では待機確認が出る場合があります。非対話実行や待機しない選択では、稼働中モデルがあれば変更せず終了します。稼働中モデル自体が使うエンジンは切り替わりません。
+- 成功時はエンジンの選択状態と履歴をローカル状態ファイルに保存します。shape engine は形状ごとの状態領域に保存され、Qwen 系列は更新状態を通じて固定先または最新版追従を記録します。複数 GPU メーカー環境で別メーカーを選んだ場合は、メーカー選択もユーザー設定ファイルに保存します。
+- 通常の切替はモデル設定やエンジンファイルを削除しません。ネットワーク取得も行いません。
 
 ## 出力とエラー
 
-- 成功時は人間向け出力で「既に使用中」または切替先・preset の扱い・更新追従状態を表示します。`--output json` / `jsonl` では機械向け JSON を出力します（`strata_cli/update_cmd.py:358-394`）。
-- 指定 family に該当する engine がない場合や、指定が曖昧な場合はエラーになります。人間向けでは `strata: ...` を stderr に出し、エラーコードを終了コードとして返します。該当 engine がない・曖昧はコード 2、実行不能または検証失敗はコード 5、稼働中モデルにより切替できない場合はコード 7 です（`strata_control/engine_library.py:198-210,216-239,248-260,265-279`、`strata_cli/update_cmd.py:237-242,378-383`）。
-- 同一 revision の CLI help も確認し、parser 定義と `qwen` / `deepseek` の選択肢が一致することを照合しました。help は `latest` alias の説明を含みません。実行したのは help 表示のみで、engine 切替は行っていません。
+- 成功時の人向け出力は標準出力に切替結果を表示します。すでに選択済みの場合は変更なしと表示します。
+- 対象エンジンが見つからない、family と版の組み合わせに一致しない、版が複数系列に一致して曖昧、または引数値が不正な場合は終了コード `2` です。曖昧な版指定にはフォルダー名を使うよう案内します。
+- 対象 engine がこの PC に適合しない、または署名・ファイル検証に失敗した場合は終了コード `5` です。
+- モデルが稼働中で切替できない場合は終了コード `7` です。人向けエラーは標準エラーに出力されます。`--output json` / `jsonl` を使う場合は機械可読形式で結果を出力します。
 
 ## 根拠
 
-- parser と位置引数: `strata_cli/update_cmd.py:82-95`
-- コマンド処理、候補選択、適合性エラー: `strata_cli/update_cmd.py:358-400`
-- 候補の family 絞り込み、`newest` / `latest`、未一致・曖昧時: `strata_control/engine_library.py:180-210`
-- 切替 lock と Qwen / DeepSeek の分岐、検証: `strata_control/engine_library.py:216-289`
-- 適合性判定と一覧生成: `strata_control/engine_library.py:59-81,91-123,136-162`
-- Qwen engine の pin、state、preset mark 更新: `strata_control/updater.py:1303-1352`
-- 共通 option 登録と `--json` / `--quiet`: `strata_cli/cli.py:508-515`
+- `strata_cli/update_cmd.py:84-87` — `use` の位置引数と `--family` の parser 定義、choices、既定値。`:98-110` — `qwen`、形状別 family、廃止 DeepSeek 名の choices 判定。
+- `strata_control/engine_library.py:28-38` — `shape:<shape>` の解析。`strata_control/shape_engine.py:29-33` — shape 名の形式。
+- `strata_cli/update_cmd.py:333-334, 419-445` — dispatch、family を用いた一覧検索、適合性判定と切替呼び出し。`:447-463` — 成功・変更なし時の出力。
+- `strata_control/engine_library.py:184-197` — family による絞り込み、`newest` / `latest`、未一致・曖昧一致のエラー。`:211-228` — 更新ロック、稼働中の待機、系列別切替。
+- `strata_control/engine_library.py:231-274` — shape engine の再検証、状態・履歴保存、最新版追従。`:277-312` — Qwen engine の再検証、メーカー選択との相互作用、切替。
+- `strata_control/engine_component.py:499-525` — 他メーカーの backend 選択を設定ファイルに保存する処理。
+- `strata_cli/update_cmd.py:441-445, 368-380, 473-488` — 実行時の拒否と終了コード、稼働中モデルの待機条件。
+- `packaging/UPDATES.md:148-159` — 利用者向けコマンド概要との照合。選択状態やオプションの詳細はソースを根拠に記載。
+
+調査範囲は上記 revision の Terminal CLI と `strata_control` の実装です。実機にインストールされたエンジン構成ごとの検索結果は確認していません。

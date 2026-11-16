@@ -1,6 +1,6 @@
 # `strata launch --backend`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 調査）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,65 +8,52 @@
 | コマンド | `strata launch` |
 | オプション | `--backend` |
 | 別名 | なし |
-| 値 | backend 名。GPU メーカー名または内部名（下記「値と既定値」参照） |
+| 値 | GPU メーカー名。実装上 `nvidia`、`amd`、`intel` と `auto` を案内。前後空白と大文字小文字は正規化される。 |
 
 ## 役割
 
-複数メーカーの GPU がある PC などで、`strata launch` が使う GPU エンジンのメーカーを選びます。これは GPU 番号を選ぶ `--gpu` とは別の指定です。選んだメーカーは、次回以降の起動や engine の更新時にも使う設定として保存されます（`strata_cli/launch/cmd.py:117-119,847-876`、`strata_cli/launch/catalog.py:319-331`）。
+`--backend` は Strata が使用するエンジンの GPU 系統を選びます。複数メーカーの GPU がある PC で選択を固定したい場合に使います。`auto` は保存済みの選択を解除し、PC の検出結果に戻します。parser は値を列挙制約で制限せず、実行処理で検証します。
 
 ## 使い方
 
 ```sh
-strata launch --backend intel --model q2_0
-```
+# Intel GPU を選び、通常起動の選択として保存する
+strata launch --backend intel --model q2_0 --no-tui
 
-保存済みのメーカー指定を消し、この PC の自動選択に戻す例:
+# 選択を保存せず、計画上だけ AMD を指定する
+strata launch --backend amd --plan --model q2_0
 
-```sh
-strata launch --backend auto --model q2_0
+# 保存済み選択を解除して自動選択に戻す
+strata launch --backend auto --model q2_0 --no-tui
 ```
 
 ## 値と既定値
 
-parser は `--backend` の値を必須の文字列として受け取ります。`choices` や型変換は parser に指定されておらず、実行時に前後の空白を除き小文字化して検証します。受理される値は次の通りです（`strata_cli/launch/cmd.py:117-119,847-859`、`strata_control/engine_component.py:474-482`）。
+値は文字列として受け取り、実行時に `strip().lower()` で正規化します。`auto`、`default`、`none` は自動選択として扱います。その他は `clean_backend_name()` に渡され、別名 `nvidia`→`cuda`、`amd`→`hip`、`intel`→`sycl` に変換されます。受理されるのは最終的に `cuda`、`hip`、`sycl` に対応する入力です（`strata_control/engine_component.py:488-496`）。未指定時の選択はこのオプションでは上書きされず、環境変数・保存済み選択・プラットフォームや GPU 検出の順で決まります（同 `:528-549`）。
 
-- メーカー名: `nvidia` → `cuda`、`amd` → `hip`、`intel` / `arc` → `sycl`
-- 内部名: `cuda`、`hip`、`sycl`
-- 自動選択に戻す語: `auto`、`default`、`none`（小文字化されるので大文字も同じ扱い）
-
-値を省略した場合の指定値はありません。help の「default: auto」は選択の既定動作を示す説明であり、オプション省略時に保存済み選択や `STRATA_ENGINE_BACKEND` を消す処理はありません。未指定なら既存の環境変数、保存済み選択、その後に PC の検出結果が使われます（`strata_control/engine_component.py:485-496,514-560`）。
-
-同じオプションを複数回書いた場合は argparse の通常の `store` 動作で最後の値が残ります（`strata_cli/launch/cmd.py:117`）。空文字列は `run_launch` の backend 処理を通らず、指定なしと同様です（`strata_cli/launch/cmd.py:847-848`）。
+空文字列は `getattr(a, "backend", None)` の真偽値判定を通らず、明示指定処理が行われません。重複指定時の argparse は単一値引数のため、最後の指定値が Namespace に残る通常の挙動です。
 
 ## 実行時の動作
 
-`auto`、`default`、`none` のいずれかを指定すると、通常起動では保存設定から `engine_backend` を削除し、現在のプロセス環境から `STRATA_ENGINE_BACKEND` も取り除きます。その後は自動判定に進みます（`strata_cli/launch/cmd.py:851-855`、`strata_control/engine_component.py:499-511`）。
+parser は `--backend` を `metavar="nvidia|amd|intel|auto"` の文字列引数として登録し、default は指定していません（`strata_cli/launch/cmd.py:113-115`）。起動処理は値を小文字化し、`auto` / `default` / `none` の場合、通常実行では保存済みメーカー選択を削除して、現在のプロセスの `STRATA_ENGINE_BACKEND` も環境から除きます。`--plan` の場合は保存設定を変更せず、プロセス環境からの除去だけを行います（同 `:771-780`）。
 
-メーカー名または内部名を指定すると、対応する内部名を `STRATA_ENGINE_BACKEND` に設定し、このプロセスとそこから起動する処理に適用します。通常起動では同じ選択を Strata の設定ファイルに保存します。保存処理は他の設定キーを維持し、`engine_backend` だけを更新します（`strata_cli/launch/cmd.py:857-867`、`strata_control/engine_component.py:499-511`）。設定ファイルはアプリ用 `STRATA_SETTINGS_FILE` があればそれを使い、そうでなければ Windows では `%APPDATA%/Strata/settings.json`、その他では `$XDG_CONFIG_HOME/strata/settings.json`（未設定時 `~/.config/strata/settings.json`）です（`strata_control/discovery.py:123-131`）。
-
-保存済み選択または環境変数による選択は、インストール済み engine の backend より優先して GPU メーカーを決めます。自動選択へ戻す場合は `--backend auto` などを明示します（`strata_cli/launch/catalog.py:319-331`）。保存済みのメーカーが現在の PC に存在しない場合、保存値は無視され、その PC の検出結果で選び直します（`strata_control/engine_component.py:485-496`）。
-
-`--plan` と併用すると、特定の backend はこのプロセス内の環境変数にだけ設定され、設定ファイルには保存されません。`--backend auto` と `--plan` の併用でも、環境変数は現在のプロセスから外しますが、保存済みの選択は削除しません。plan の最後は「何も変更していない」と出力されます（`strata_cli/launch/cmd.py:851-867,924-953`）。
-
-この処理は `run_launch` の管理系分岐（プリセット一覧・削除、停止、状態表示、API key 表示）の後にあります。さらに backend の保存・環境変更はモデルなどの設定解決や、非対話時に選択を要求するエラー判定より前です。そのため、たとえば `--backend amd` を指定してモデルを指定せず非対話実行し、後で終了コード 2 のエラーになった場合でも、backend 選択が先に保存されることがあります（`strata_cli/launch/cmd.py:799-845,847-891`）。
+その他の値はメーカー別名をエンジン系統名に変換します。変換できない値ならコード 2 で失敗します。正常な値は `STRATA_ENGINE_BACKEND` に設定され、この起動とそこから開始する処理に適用されます。通常実行では設定ファイルにも保存され、次回起動や更新・アプリでも選択に使われます。`--plan` では保存されません（同 `:781-791`）。保存関数は設定 JSON の `engine_backend` キーだけを更新・削除し、親ディレクトリを作成して JSON を書き戻します（`strata_control/engine_component.py:513-525`）。保存された選択は、そのメーカーの GPU が現在の PC にない場合は無視されます（同 `:499-510`）。
 
 ## 適用条件と副作用
 
-特定 backend 名として認識するのは `cuda` / `hip` / `sycl` 系です。指定が認識されても、その PC や OS に対応 GPU・engine があることまではこの parser の検証で保証されません。後続の hardware/backend 判定と engine 選択に渡され、選択したメーカーに合う GPU がなければ他メーカーの GPU は対象から外れます（`strata_control/engine_component.py:478-482,514-560`、`strata_control/gpu_fit.py:254-269`）。
+メーカー選択が利用可能な GPU に一致しない場合の後続エンジン選択・起動結果は、検出・コンポーネント処理に依存します。`--backend` 自体に GPU の有無を事前検証する処理は見当たりません。通常実行の明示値はユーザー設定ファイルを書き換えます。`auto` 等は通常実行時に保存選択を削除します。`--plan` ではこれらの永続的な設定変更を行いません。
 
-通常起動ではユーザー設定ファイルを書き換えます。`--plan` はこの永続化を行いません。`--backend` 自体は `LaunchSettings` や保存 preset の設定項目としてコピーされるものではなく、Strata 全体で参照する環境変数・設定値を切り替えます（`strata_cli/launch/cmd.py:212-218,847-876`）。
+ソースでは `auto` 時の案内文を「NVIDIA、AMD、Intel の順」としています（`strata_cli/launch/cmd.py:775-780`）。ただし macOS 等のプラットフォーム選択や環境変数による上書きもあるため、この順序だけで全環境の最終 backend が決まるとは限りません（`strata_control/engine_component.py:528-549`）。
 
 ## 出力とエラー
 
-未対応の値では `strata: '<値>' is not a make of graphics card Strata knows. Use nvidia, amd, intel or auto.` を stderr に出し、終了コード 2 を返します。`--output json` では同じエラーを JSON の `error` として出力します（`strata_cli/launch/cmd.py:790-797,857-859`）。値そのものがない場合は `argparse` が引数不足として拒否します（parser 定義 `strata_cli/launch/cmd.py:117`、トップレベル parse `strata_cli/cli.py:2239-2248`）。
-
-通常起動の選択・解除では、その選択が今後も使われる旨の notice が追加されます。`--plan` の特定 backend 指定では「この plan のみで記憶しない」旨が notice に入り、plan の出力に警告として表示されます（`strata_cli/launch/cmd.py:855-876,924-953`）。
+無効な値は `'<入力>' is not a make of graphics card Strata knows. Use nvidia, amd, intel or auto.` として失敗し、終了コード 2 を返します。通常出力では `strata:` を付けて stderr に出し、`--output json` では `ok: false` とエラー情報を JSON で stdout に出します（`strata_cli/launch/cmd.py:716-721, 781-783`）。値が受理されると選択結果に関する警告通知が追加されます（同 `:785-800`）。
 
 ## 根拠
 
-- parser と help: `strata_cli/launch/cmd.py:75-82,117-119`
-- backend 値の正規化・設定保存・検出優先順位: `strata_control/engine_component.py:474-511,514-560`
-- 起動処理での検証、環境変数設定、`--plan` 分岐: `strata_cli/launch/cmd.py:847-876,924-953`
-- 保存設定ファイルの場所: `strata_control/discovery.py:123-131`
-- backend と GPU メーカーの選択: `strata_cli/launch/catalog.py:319-331`、`strata_control/gpu_fit.py:254-269`
-- 索引上の配置・scope: `docs/cli/README.md:11,1018-1023`（`strata-terminal` の `launch` option として掲載）
+- `strata_cli/launch/cmd.py:73-80` — `launch` parser の説明とコマンド概要。
+- `strata_cli/launch/cmd.py:113-115` — `--backend` の parser 定義、案内値、既定動作の説明。
+- `strata_cli/launch/cmd.py:716-721, 771-800` — エラー出力、値の分岐、環境変数設定、保存、通知。
+- `strata_control/engine_component.py:488-496` — メーカー名から engine backend 名への変換。
+- `strata_control/engine_component.py:499-525` — 保存値の適用条件と設定ファイル更新。
+- `strata_control/engine_component.py:528-549` — 環境変数・保存選択・プラットフォーム・検出による backend 決定。

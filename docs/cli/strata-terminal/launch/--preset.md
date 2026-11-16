@@ -1,6 +1,6 @@
 # `--preset`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,50 +12,62 @@
 
 ## 役割
 
-保存済みの起動設定を読み込み、その設定でモデルの serving を開始します。モデル、context、接続方法などを毎回指定せず再利用できます。preset と同時に他の起動オプションを渡すと、その実行に限り読み込んだ設定を上書きできます（例: `strata launch --preset Office --set prefill=65536 --no-tui`）。`--preset` は `strata connect --preset` にもありますが、そちらは別 parser・別用途です。
+保存済みの launch 設定を読み込み、モデル、context、接続方式などを使って起動する。ほかの `strata launch` 設定オプションを同時に指定すると、指定した項目は今回の起動用に preset の値を上書きする。`--save-preset` も指定した場合は、起動設定をその名前で保存する。
 
 ## 使い方
 
 ```sh
-strata launch --preset "IQ3_XXS 128K"
-strata launch --preset Office --set prefill=65536 --no-tui
-strata launch --plan --preset Office
+# 既存の preset を読み込み、変更内容を確認する（起動・設定変更はしない）
+strata launch --preset "Office" --plan
+
+# 既存の preset で起動し、画面を使わず接続先を表示して戻る
+strata launch --preset "Office" --no-tui
+
+# 今回だけ context を上書きして起動する。元の preset は保存し直さない
+strata launch --preset "Office" --context 128k --no-tui
+
+# 上書きを含む今回の設定を別名で保存してから起動する
+strata launch --preset "Office" --context 128k --save-preset "Office 128K" --no-tui
 ```
 
-名前に空白があるときは引用符で囲みます。対話端末で起動条件を指定した場合は通常 monitor が開き、`--no-tui` を付けると画面を出さず、起動結果のアドレスを表示して戻ります。`--plan` は実行計画を表示して終了します。
+例の `Office` は既存の preset 名に置き換える。
 
 ## 値と既定値
 
-- 値を1個取ります。parser に `type`、`choices`、既定値、名前の形式検証はなく、省略時の値は `None` です。短縮別名もありません。
-- 渡された名前は小文字化され、英小文字・数字・`-`・`_` 以外の連続部分を `-` に置き換えた slug から JSON ファイル名を作ります。したがって大文字小文字や記号の違いが同じファイルを指す場合があります。名前は最大48文字に切られます。
-- ファイルがない場合は「その名前の保存済み preset はない」として失敗します。読み込み不能または JSON 不正なら再保存を案内し、JSON が object でなければ破損として失敗します。空文字を含む名前の個別検証は parser にありません。
-- 同じオプションの複数回指定時の専用処理はありません（通常の `argparse` 引数として解析されます）。
+- `--preset` は `NAME` を1つ取る。parser に型変換や列挙値の制約はない。オプションを重複して指定した場合の個別検証はなく、`argparse` の同名引数の通常の結果として最後の値が namespace に入る（parser 登録: `strata_cli/launch/cmd.py:82`）。
+- 未指定時は空の `LaunchSettings` から設定を組み立てる。`--preset` 自体に既定名はない（`strata_cli/launch/cmd.py:206-212`）。
+- 名前は小文字化し、ファイル名に使えない文字列を `-` に置き換え、連続する `-` をまとめ、先頭・末尾の `-` と `_` を除いてから、先頭が英字でなければ `l` を付け、48文字で切り詰める。この slug に `.json` を付けたファイルが読み込み先になる。表示上の名前と slug が異なっても、この規則で同じ保存先を参照し得る（`strata_cli/launch/settings.py:327-332`、`strata_cli/launch/store.py:35-36`）。
+- 保存先は `STRATA_LAUNCH_PRESET_DIR` が設定されていればそのディレクトリ、そうでなければ profiles ディレクトリの隣の `launch-presets/`（`strata_cli/launch/store.py:27-32`）。
 
 ## 実行時の動作
 
-preset の JSON を `LaunchSettings` に読み込み、引数で明示された値をその上に反映します。たとえば `--model`、`--context`、`--access`、`--port`、API key、`--set` は preset の対応設定を更新します。`--no-api-key` だけを指定した場合は保存済み API key も外します。`--save-preset NAME` を併用すると設定名がその名前に変わり、runner が例外なく戻った後にその名前で保存（同名 preset は置換）します。これらの更新は、`--save-preset` を使わない限り元の preset ファイルに保存されません。
+1. `settings_from_args` が指定名の JSON を読み、`LaunchSettings` に復元する。保存設定があればその値が起点となり、同時指定した `--model`、`--context`、`--access` などの値で対応する項目を上書きする。preset 未指定なら初期設定から始める（`strata_cli/launch/cmd.py:206-212, 223-296`）。
+2. `--preset` は選択済み設定があることを示すため、通常は最初の選択画面を開くのではなく、その設定で起動経路へ進む。対話端末では設定を起動前に表示する TUI monitor が開き、`--no-tui` では画面を使わず実行して接続先を表示する。`--plan` を付けると計画だけを出して終了する（`strata_cli/launch/cmd.py:803-825, 851-877, 897-903`）。
+3. 実起動では選択に応じた launch profile（`launch-<slug>`）の設定を書き、engine とモデルの準備、tuning、server 起動へ進む。既に同じ選択で serving 中なら再利用し、異なる設定で同じ launch または port が使用中の場合は、`--restart` なしの非対話実行では拒否する（`strata_cli/launch/runner.py:638-639, 2030-2058, 2543-2582`）。
+4. `--save-preset` がなければ preset の選択値自体は保存し直さないが、起動が正常終了した場合は `last_used` を更新して preset ファイルを書き戻す。`--save-preset` を指定すると、指定した保存名で preset を作成または置換し、`last_used` も更新する（`strata_cli/launch/cmd.py:914-918`、`strata_cli/launch/store.py:75-85, 139-144`）。
 
-起動前の `--plan` は同じ preset を読み込んで計画を作りますが、serve や preset の最終使用時刻更新には進みません。通常の起動では runner が例外なく戻った後（serving しなかった結果を含む）に `last_used` が更新されます。preset はモデルファイルや tuning 結果そのものを複製するのではなく、起動設定を保存するものです。tuning 結果は共有 store の参照として扱われます。
+`--no-api-key` は保存 preset にあった API key も今回の設定から取り除く。反対に `--api-key` または `--api-key-env` と `--no-api-key` を併記した場合は、key を保持して警告する（`strata_cli/launch/cmd.py:271-284`）。
 
 ## 適用条件と副作用
 
-- `--preset` があると「起動対象が指定された」と判定され、引数なしの対話セットアップ画面を開く経路には入りません。preset を読む後、model catalog の利用可否、設定 validation、engine・モデルの準備を経て起動します。
-- 保存先は既定で profiles ディレクトリの隣にある `launch-presets/` です。`STRATA_LAUNCH_PRESET_DIR` が設定されていれば、そのディレクトリが使われます。preset は API key を含む場合があるため、Strata は保存ファイルを private 扱いで書き込みます。
-- `--preset` に他の設定変更を添えても起動時だけの変更です。恒久化するには `--save-preset` を指定します。`--plan` は何も変更しない経路として実装されています。
-- `strata launch --stop --preset NAME` では、起動設定を実行する代わりに、その名前を profile slug にして該当 launch を停止する対象に指定します。
+- 指定名に対応する保存ファイルが必要。preset は端末の setup screens と共有され、保存項目に API key を含み得る。通常の書き込みは一時ファイル経由で置換され、POSIX では mode `0600` を試み、Windows では現在ユーザーだけに制限する処理を試みる（`strata_cli/launch/store.py:1-7, 39-60`）。
+- 実起動時には選択に応じて server 用 profile と設定ファイルが更新され、engine 起動・モデル準備・tuning・port 使用が起き得る。`--plan` は `runner.plan()` の後に「変更なし」として終了し、実行処理には進まない（`strata_cli/launch/cmd.py:851-877`、`strata_cli/launch/runner.py:2543-2582`）。
+- 他の launch flags は今回の設定に反映されるが、`--save-preset` を付けない限り、それらを preset の設定として保存しない。ただし前述の `last_used` は実起動の正常終了時に更新される（`strata_cli/launch/cmd.py:285-296, 914-918`）。
+- `--preset` は `strata connect` にも同じ表記の別オプションがある。そちらは接続先情報の参照用で、この文書の対象ではない（`strata_cli/launch/cmd.py:157-168`）。索引でもコマンド階層ごとに別リンクである（`docs/cli/README.md` の `strata launch` 節および `strata connect` 節）。
 
 ## 出力とエラー
 
-- preset が見つからない、読み取れない、JSON が壊れている場合は `PresetError` を捕捉し、通常出力では `strata: ...` を stderr に出して終了コード 2 を返します。`--output json` では `ok: false` とエラー内容を JSON で stdout に出します。
-- 適用した設定が不正、または起動処理で失敗した場合も、設定エラーは終了コード 2、`LaunchError` はそのエラーに付属するコードで報告されます。モデル・server の起動時は進捗や警告が表示されます。
-- `--plan` は計画と警告を表示して終了コード 0 を返します。通常の起動で server が serving 状態になれば接続 URL が表示され、保存 preset 由来の API key があればマスクした値と確認方法が案内されます。
+- 保存 preset が見つからない場合は `There is no saved preset called ...` と候補一覧または類似名を添えて失敗する。JSON が読めない場合、または最上位が object でない場合も `PresetError` として失敗する（`strata_cli/launch/store.py:88-103, 106-112`）。
+- `run_launch` は `PresetError` と設定値の `ValueError` を失敗として扱う。human 出力では `strata: ...` を stderr に出し、終了コード 2。`--output json` の場合は `ok: false` とエラー内容を含む JSON を stdout に出す（`strata_cli/launch/cmd.py:710-721, 961-964`）。
+- engine/server の起動失敗は `LaunchError` として文面・終了コード付きで返る。事前に launch 設定ファイルが書かれていて `--save-preset` を指定した場合、失敗時にもその preset を保存しようとする（`strata_cli/launch/cmd.py:901-913`）。
 
 ## 根拠
 
-- parser と利用者向け例: `strata_cli/launch/cmd.py:16-29`, `strata_cli/launch/cmd.py:75-85`
-- preset の読込・引数による上書き: `strata_cli/launch/cmd.py:205-211`, `strata_cli/launch/cmd.py:214-300`
-- 起動経路・plan・使用時刻更新: `strata_cli/launch/cmd.py:753-784`, `strata_cli/launch/cmd.py:797-830`, `strata_cli/launch/cmd.py:854-863`
-- エラー処理と出力: `strata_cli/launch/cmd.py:686-697`, `strata_cli/launch/cmd.py:913-918`, `strata_cli/launch/cmd.py:871-910`
-- 保存場所・ファイル形式・読み込み失敗・private 書込み: `strata_cli/launch/store.py:1-7`, `strata_cli/launch/store.py:27-60`, `strata_cli/launch/store.py:88-103`
-- slug の生成規則: `strata_cli/launch/settings.py:355-360`
-- preset が保持する項目と `from_dict`: `strata_cli/launch/settings.py:97-149`
+- `strata_cli/launch/cmd.py:73-83` — `strata launch` parser と `--preset NAME` の宣言。
+- `strata_cli/launch/cmd.py:157-174` — `strata connect --preset` が別 parser scope であること。
+- `strata_cli/launch/cmd.py:206-296` — preset 読込、他の引数との合成、API key / 保存名処理。
+- `strata_cli/launch/cmd.py:803-825, 851-877, 897-918, 961-966` — 実行モード、計画終了、保存、失敗処理。
+- `strata_cli/launch/store.py:27-36, 39-60, 75-103, 132-144` — 保存場所、private write、置換、読込、削除、最終使用時刻の更新。
+- `strata_cli/launch/settings.py:327-332` — preset 名からファイル・profile に使う slug への変換。
+- `strata_cli/launch/runner.py:638-639, 2030-2058, 2543-2582` — `launch-<slug>` profile、稼働中 server の扱い、実起動処理。
+- 索引照合: `docs/cli/README.md` の `strata launch` 節にこの文書へのリンクがあり、`strata connect` 節には別の `--preset` 文書へのリンクがある。

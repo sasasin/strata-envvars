@@ -1,59 +1,67 @@
 # `setup.py --model`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat` 等からも呼び出される） |
+| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat` などの引数転送先） |
 | オプション | `--model` |
 | 別名 | なし |
-| 値 | parser が列挙する model ID。`--family` に応じて通常・preview・multi-file family の選択肢から選ぶ |
+| 値 | モデルサイズ名。組み込みモデル表と preview family の選択肢（および利用可能な署名 feed のモデル）から選ぶ |
 
 ## 役割
 
-setup で使うモデルサイズ／variant を指定します。省略すると通常の setup 経路では既存の導入サイズや推奨値を初期値として選択画面に進みます。指定するとその model ID が選択済みとして扱われ、モデルの適合性判定、取得・準備、生成する設定名などに使われます（`setup.py:10140-10171,10238-10240`）。
+`--model` はセットアップで使うモデルのサイズを指定する。通常のセットアップでは、選択した family にそのサイズがあるかを確認し、そのモデルに対応するファイル、メモリ見積もり、準備処理、実行設定へ値を引き継ぐ。family を明示しない場合は family 選択が別に行われるため、モデル名だけで family が選ばれるわけではない。インストール済み環境では、通常起動ではなく明示的な再セットアップ経路に入り、`--calibrate` と併用した場合は既存設定の絞り込みに使われる。
 
 ## 使い方
 
 ```sh
-./setup.sh --family qwen --model IQ3_XXS --yes --no-start
-```
+# Linux / macOS の通常セットアップで family とサイズを指定
+./setup.sh --family qwen --model IQ3_S
 
-通常の Linux setup で Qwen family の `IQ3_XXS` を選択し、推奨を自動回答して、最後にモデルを起動せずに終了する例です。Windows は `START-HERE.bat` に同じ option を渡せます。`setup.sh` は `"$@"`、`START-HERE.bat` は `%*` を `setup.py` に渡します（`setup.sh:12`、`START-HERE.bat:48,53`。索引 [`README.md`](../../README.md) の `source-setup` scope）。
+# モデルをインストールして起動せずに終了
+./setup.sh --family qwen --model IQ3_S --no-start
+
+# すでにインストールされた同名モデル設定を調整
+./setup.sh --calibrate --model IQ3_S
+```
 
 ## 値と既定値
 
-`--model` は値を1つ取ります。parser は `MODELS`、`PREVIEW_FAMILIES`、`MULTI_FILE_FAMILIES` の model ID を集めて重複を除いたものを `choices` にします。parser 上の既定値は未指定（`None`）です（`setup.py:9573-9575`）。
-
-値は `model_alias()` を通してから選択肢と照合されます。DeepSeek の旧表記 `ISTA-DAS-<数値...>` は `IST-DAS-...` に正規化され、`ISTA-DAS-Coder` / `IST-DAS-Coder` は登録済み Coder ID に正規化されます（`setup.py:195-199`）。それ以外の未知値は argparse の choices エラーになります。
+- 値を1つ取る。`argparse` の `choices` により、セットアップ時に構成されたモデル選択肢以外は parser が拒否する。`type=model_alias` は現行ソースでは値をそのまま返し、別名変換を行わない（`setup.py:196-199, 9349-9350`）。
+- 選択肢は `MODELS` と preview family の各 `models` から構成される。`--model` が組み込み表にない場合、`--family` を省略した経路では parser 構築前に署名 feed の一覧を読み込み、選択表に反映する（`setup.py:431-460, 752-775, 9332-9344, 8568-8583, 9345-9350`）。family を明示した場合に未知モデルの feed 読み込みへ進む条件は確認できず、parser の choices 検証で拒否される。従って固定の全候補一覧はここでは列挙しない。
+- 省略時はモデル選択画面の推奨サイズが使われる通常セットアップ経路がある。Apple Silicon のアプリ経路では推奨サイズが使われる。Intel Arc のアプリ経路では `--model` が必須。`--prepare-pack` 経路でも必須（`setup.py:8354-8359, 8994-9005, 9135-9145, 9934-9935`）。
+- 空文字、値の欠落、選択肢外の値は受理されない。family と組み合わせたとき、family にないサイズも後段で拒否される（`setup.py:9349-9350, 9505-9507, 8726-8728, 9910-9918`）。重複指定時の扱いは個別に確認していない。
 
 ## 実行時の動作
 
-- 通常の setup では `--model` があると、選択した `--family` の model 名一覧にその値があるか検証します。family に属さない値は候補を示して停止し、別 family で使える場合はその組み合わせも案内します（`setup.py:10140-10148`）。`--family` を省略した通常 family 経路では family を選択した後に同じ検査をします（`setup.py:10101-10119,10140-10148`）。
-- 有効な model は選択画面を経ずに選ばれ、`MODELS[model]` を使った適合性・RAM/GPU 判定へ進みます（`setup.py:10149-10173`）。選択値は family tag と連結され、モデルファイルや pack、設定ファイルの対象を決めます（`setup.py:10238-10240,10532-10535`）。ファイルが揃っていない通常経路では後続処理が取得・検査・pack 準備を行います（`setup.py:10510-10515,10532-10567`）。
-- `--model` はモデルを指定する明示的な setup 要求でもあります。既存導入があっても単純起動経路に入らず（`setup.py:9771-9777`）、通常 setup を選択します（`setup.py:9785-9789`）。`--calibrate` と併用すると導入ではなく、指定 model が既に入っているかを探して calibration 対象にします。該当する導入がなければ停止します（`setup.py:9821-9831`）。
-- `--prepare-pack` と併用すると専用の pack 作成経路に入り、`--model` は `--gguf-dir` 内で対象 GGUF shard を探すために使われます。この経路では `--model` と `--gguf-dir` が必須で、`--family` 省略時は `qwen` です。モデル本体のダウンロードや engine 導入は行いません（`setup.py:9321-9349,9723-9724`）。
+- `--model` は実行モード判定に含まれる。通常起動と異なり、インストール済みモデルがあってもセットアップ側へ進む（`setup.py:9557-9578`）。通常セットアップでは family 内の有効サイズとの整合を確認し、未指定なら選択画面を使う箇所で、指定値がそのまま選択値になる（`setup.py:9910-9935`）。
+- 指定した family にモデルがない場合はエラーにし、対応する候補を案内する。別 family で有効なサイズならその family とサイズの組み合わせも案内する（`setup.py:9910-9918`）。
+- `--model` が組み込み表にない状態で `--family` を省略すると、feed 読み込みを試みてから parser の choices を作る。feed が取得できない場合は署名を再検証したキャッシュ一覧を使う。family を明示した場合はこの未知モデル向け読込条件に入らない（`setup.py:9332-9350, 8568-8583`; `strata_control/feed_models.py:87-98, 110-137`）。
+- RAM や GPU との適合性にリスクがあるサイズを明示した場合、`--yes` を併用すると明示選択が同意として扱われ、通常の確認を通過する条件がある。`--yes` 単独では同じ同意にならない。低 RAM 時には遅延・起動失敗の可能性を警告する経路がある（`setup.py:6641-6650, 6653-6669, 9951-9965`）。
+- `--calibrate` との併用では、モデル名がインストール済み設定の選別条件になる。該当設定がなければ失敗する。`--no-start` も指定しない限り、調整後に対象設定でモデルを起動する（`setup.py:7226-7237, 9610-9634`）。
+- Apple Silicon の非 Control 経路では `setup.py` 自身の parser に入らず `metal/setup_mac.py` へ引数を転送する。同ファイルにも独立した `--model` parser と候補検査があるが、そのスコープは索引上の `source-setup/mac/` であり、本書の root parser とは別扱い（`setup.py:9330-9331, 8309-8313`; `metal/setup_mac.py:366-378, 441`）。Intel Arc の source checkout 経路も `sycl_setup` へ引数を転送するため、通常の CUDA/HIP 経路とは処理が異なる（`setup.py:9516-9519, 8316-8330`）。
 
 ## 適用条件と副作用
 
-値の候補が正しくても、指定した family にその model がなければ setup は停止します。`--yes` と合わせた場合、メモリ不足や未検証 backend などの risk 確認で、明示的に指定した `--model` が続行の意思表示として扱われる箇所があります（`setup.py:6354-6363,10184-10201,10231-10232`）。`--yes` 単独は同じ同意として扱われません。モデル適合性や不足メモリの判定そのものを無効化する option ではなく、警告・確認または停止条件はモデルと環境によって異なります。
-
-通常の Apple Silicon で `setup.py` を実行すると、root parser に入る前に `metal/setup_mac.py` へ委譲されます（`setup.py:9560-9567`）。Mac 側 parser の `--model` は別 scope の [`source-setup/mac/--model.md`](../mac/--model.md) を参照してください。Strata Control の install mode はこの委譲を通らず、root parser を使います（`setup.py:82-83,9566-9568,9727-9730`）。
+- `--model` 単独では family を選ばない。モデル選択後に family が異なる場合は拒否されるため、曖昧さを避ける例では `--family` も指定する（`setup.py:9857-9888, 9910-9918`）。
+- 通常セットアップで選択モデルが変われば、そのモデル用ファイルのダウンロードやローカル準備処理、設定書き込みへ進み得る。`--no-start` はインストール後の起動を止めるが、ダウンロード等のセットアップ作業は止めない（`setup.py:8914-8916, 8953-8958, 10292-10322`）。
+- `--check` / `--calibrate` / `--prepare-pack` / Mac / Intel Arc は通常のモデル導入経路と異なる。`--check` はモデル選択に応じた適合確認、`--prepare-pack` は既存 GGUF の pack 作成、preview family はファイルの取得までで設定や起動はしない（`setup.py:9505-9519, 8920-8962, 8994-9018`）。
 
 ## 出力とエラー
 
-未知の model ID は argparse の option/choices エラーになります。parser を通った後の family 不一致や必要ファイルの不備は `fail()` がメッセージと修正案を表示し、終了コード 1 で停止します（`setup.py:965-970,10142-10148`）。メモリ不足などの一部条件は警告後に確認し、拒否すると同じ `fail()` 経路になります（`setup.py:6354-6363`）。
+- parser の引数不足・choices 不一致は `argparse` のエラー経路となる。モデルが preview family 専用なのに family が合わない場合は `ap.error` で説明される（`setup.py:9345-9350, 9505-9507`）。
+- family 内にサイズがない、専用経路で `--model` が必要なのに未指定、または `--calibrate` の対象が未インストールの場合は `fail()` がメッセージとヒントを表示して終了コード 1 で停止する（`setup.py:823-828, 8357-8359, 8726-8728, 9003-9005, 9615-9619, 9912-9918`）。廃止された DeepSeek 名は parser より前に案内を表示し、終了コード 2 を返す（`setup.py:9332-9338`）。
+- RAM/GPU リスクは警告と確認を出し、拒否時は上記 `fail()` 経路となる。明示的な `--model` と `--yes` の組み合わせは、該当するリスク確認への同意として扱われる（`setup.py:6641-6650, 9951-9965`）。
 
 ## 根拠
 
-- parser と choices: `setup.py:9560-9575`
-- alias 正規化: `setup.py:195-199`
-- family/model の照合と選択: `setup.py:10101-10119,10140-10173`; own-path family: `setup.py:8187-8207`; multi-file family: `setup.py:8934-8951`
-- setup 要求判定・既存導入・calibration: `setup.py:9771-9789,9821-9831`
-- risk の同意条件: `setup.py:6354-6382,10184-10201,10231-10232`
-- 選択後のファイル確認・pack と設定対象: `setup.py:10510-10567`
-- `--prepare-pack` との相互作用: `setup.py:9321-9349,9718-9724`
-- Mac 委譲条件: `setup.py:82-83,9560-9567,9727-9730`
-
-調査対象 checkout は `git status --short --branch` で `main` と `origin/main` が一致し、未コミット変更なしでした。Release 実行物や各 platform の実行は調査していません。値の全候補は parser の定義データから動的に構成されるため、本書では網羅表を複製していません。
+- `setup.py:9332-9350` — 事前の feed モデル確認、parser の `--model` 宣言、候補リスト。
+- `setup.py:9505-9519` — family/preview の検査と、pack・inspect・Mac・SYCL 経路への分岐。
+- `setup.py:9557-9587, 9857-9935` — 起動と再セットアップの判定、family 選択、指定モデルのサイズ選択。
+- `setup.py:6641-6669, 9951-9965` — 明示選択と `--yes` のリスク確認上の相互作用。
+- `setup.py:7226-7237, 9610-9634` — `--calibrate` が対象設定を絞り込む動作と失敗時の処理。
+- `setup.py:8354-8370, 8994-9018` — Intel Arc / pack 作成経路での必須条件および既存モデルファイルの検査。
+- `setup.py:823-828` — `fail()` の出力と終了コード。
+- `metal/setup_mac.py:366-378, 441` — Apple Silicon 用の独立 parser と候補制限。

@@ -1,49 +1,44 @@
 # `STRATA_DATA_DIR`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-Strata Terminal のインストーラーでは Terminal 本体の配置ルートを指定します。Linux/macOS の `packaging/install.sh` と Windows の `packaging/install.ps1` がこの値を読み、`terminal/<version>` と `terminal/current` をその下に作ります（`packaging/install.sh:24-27,98-100,125-129`、`packaging/install.ps1:45-46,65-68,122-129`）。
-
-実行時には、`strata launch` のインストール探索がこのルートの `install` サブフォルダーも候補に加えます。そこに保存済みモデル設定があれば、現在の Terminal フォルダーより先に使います（`strata_control/discovery.py:160-191`）。また、ランチャーの計画表示では、CLI で選んだモデルデータフォルダー、またはこの環境変数の値と現在のインストール場所を比べ、外にある既存インストールを使う場合に警告文を追加します（`strata_cli/launch/runner.py:39-55,2038-2055`）。
+この変数は、Strata Terminal のインストーラが Terminal 本体を置くデータルートを指定する。また、Python のインストール探索では、その直下の `install/` を既存モデル設定の探索候補に加える。モデルファイルの保存先を直接決める変数ではない。`strata launch --data-dir` はモデル用データフォルダーの指定であり、インストール先とは別に扱われる（`packaging/install.sh:24-27,110-141`、`packaging/install.ps1:87-89,113-115`、`strata_control/discovery.py:170-192`、`strata_cli/launch/runner.py:41-57`）。
 
 ## 値と判定
 
-値はパス文字列として扱われ、環境変数自体の形式検査や存在確認はありません。空白の trim や変数値の正規化も行われません。各読み取り箇所の扱いは次のとおりです。
+| 読み取り箇所・条件 | 未設定 | 空文字 | 設定値の処理・無効値 |
+|---|---|---|---|
+| `packaging/install.sh`（Linux/macOS） | `${XDG_DATA_HOME:-$HOME/.local/share}/strata` | `:-` により未設定と同じ既定値 | 非空文字列をパスとして使い、`terminal/<version>` 以下へ展開する。値を parse・正規化・検証する処理はない。変数展開は引用されており、値の `~` はシェルによるホーム展開を受けない（`packaging/install.sh:24-27,110-112`）。 |
+| `packaging/install.ps1`（Windows） | `%LOCALAPPDATA%\Strata`。`LOCALAPPDATA` も未設定・空なら `Die` で終了 | PowerShell の偽値として未設定と同じ扱い | 非空値を `$data` に代入する。形式や存在確認の事前検証はなく、後続のディレクトリ作成・展開で失敗すればインストーラのエラー経路に入る（`packaging/install.ps1:87-90,113-115,144`）。 |
+| Python のインストール探索 | `install/` 候補を追加しない | `if data_root` が偽となり候補を追加しない | `environ.get` で文字列を取得し、`Path(...).expanduser() / "install"` を候補化する。値の形式検査はなく、候補内に認識対象の run config がある場合だけ探索結果に残る（`strata_control/discovery.py:161-193`）。 |
 
-| 読み取り箇所 | 未設定・空文字 | 非空値 |
-|---|---|---|
-| Linux/macOS インストーラー | どちらも既定値 `${XDG_DATA_HOME:-$HOME/.local/share}/strata` を使用 | その文字列を Terminal の配置ルートに使用 |
-| Windows インストーラー | どちらも `%LOCALAPPDATA%\Strata`。ただし `LOCALAPPDATA` も空ならエラー終了 | `LOCALAPPDATA` が空でもその値を配置ルートに使用 |
-| インストール探索 (`discovery.places`) | `install` 候補を追加しない | `~` を展開した値の下の `install` を候補に追加 |
-| ランチャーの計画警告 | CLI の `data_dir` がなければ選択値なしとして警告判定をしない | CLI の `data_dir` が truthy ならそちらを使い、それ以外は環境変数を使う |
-| `tools/dgx_smoke.py` | `~/Strata-data` | argparse の `--data-dir` 既定値として使用。明示した `--data-dir` が優先 |
-
-インストール探索では `STRATA_INSTALL_DIR`（または呼び出し元から渡された明示的な `explicit` 引数）が存在すると、その場所だけを返して `STRATA_DATA_DIR` の候補追加を行いません。`STRATA_INSTALL_DIR` は `None` かどうかで判定されるため、空文字でも設定されていれば `Path("")` を明示場所として扱います（`strata_control/discovery.py:160-172`）。
-
-ランチャーの `--data-dir` はモデルファイルの保存先で、値は `strata_cli/launch/cmd.py:226-231` でフォルダー検査を受けて設定に反映されます。これはインストーラーの Terminal 配置先や `discovery.places` の探索条件を切り替える引数ではありません。計画警告の比較値を選ぶときにだけ、truthy な CLI `data_dir` が `STRATA_DATA_DIR` より優先されます（`strata_cli/launch/runner.py:39-55`）。
+Python の探索では、値そのものの比較や大文字小文字・数値の判定はしない。空白だけの値や不正なパス文字列も文字列として候補化されるが、そこに有効な run config が見つからなければ候補から落ちる。Linux/macOS インストーラでは空文字を既定値に置き換える一方、Python 探索では空文字を候補なしとする。
 
 ## 有効になる条件
 
-- `packaging/install.sh` は Linux/macOS 用インストーラー、`packaging/install.ps1` は Windows 用インストーラーです。GPU backend や build macro の条件はありません（`packaging/install.sh:1-3,24-27`、`packaging/install.ps1:1-3,45-46`）。
-- 実行時のインストール探索で `STRATA_DATA_DIR` が候補になるのは、`STRATA_INSTALL_DIR` / 明示 `explicit` が未指定のときだけです。候補に保存済み設定がなければ結果から落ち、後続候補（Terminal 自身、記憶済み場所、アプリの場所など）が使われます（`strata_control/discovery.py:164-191`）。候補は順番に評価され、最初に設定ファイルが見つかった場所が `find_install()` の結果になります（同 `:195-203`）。
-- 計画警告は、選択値と探索場所があり、先頭の場所が `source == "explicit"` でなく、その場所が選択値の内側にない場合に生成されます。`--plan` の preflight から呼ばれ、通常の起動を強制停止する処理ではありません。警告は「data folder only says where model files are kept」と明記します（`strata_cli/launch/runner.py:45-55,2038-2055`）。
+- インストール先の上書きに使われるのは `install.sh` / `install.ps1` の実行時である。インストール場所はそれぞれ `DATA_DIR/terminal/<version>`、`$data/terminal/<version>` となる。設定済みの `STRATA_DATA_DIR` が空なら両インストーラとも既定値を使う（`packaging/install.sh:24-27,110-112`、`packaging/install.ps1:87-89,113-115`）。
+- Python の `discovery.places` では、明示引数または `STRATA_INSTALL_DIR` が `raw is not None` で選ばれると、その場所だけを返すため、`STRATA_DATA_DIR` の候補は調べない。そうでなければ `STRATA_DATA_DIR/install` は `here`、ユーザー設定に記録された場所、アプリの場所より前に候補へ追加される（`strata_control/discovery.py:161-179`）。ただし `STRATA_DATA_DIR/install` に `strata-*.json` 形式の run config がなければ探索結果には含まれない（同 `:142-150,180-193`）。
+- `find_install` は候補の先頭を採用し、どの候補にも run config がなければアプリのインストール場所へ fallback する。この場合、変数を設定しただけでは `STRATA_DATA_DIR/install` が使われるとは限らない（`strata_control/discovery.py:196-204`）。
+- `strata launch` の `--data-dir` はモデルデータ用設定である。インストール探索候補を上書きする指定ではない。計画時の説明では `--data-dir` があればそれを使い、なければ `STRATA_DATA_DIR` を参照する（`strata_cli/launch/runner.py:41-57,2393-2397`）。
 
 ## 実行時の詳細
 
-インストーラーは起動時に値を変数へ一度読み込み、その後のダウンロード展開先と `current` リンク／ジャンクションの作成先に使います。Linux/macOS では `${STRATA_DATA_DIR:-...}` により未設定と空文字が同じ既定値になります。値が空白だけなら既定値にはならず、その文字列が使われます（`packaging/install.sh:24-27,98-100,125-129`）。Windows も PowerShell の真偽判定により未設定と空文字は同じ扱いです。両方が空の場合は `strata installer: Windows did not say where your user folder is...` を標準エラーに出して停止します。非空値があれば `%LOCALAPPDATA%` は不要です（`packaging/install.ps1:45-46`）。
+シェル版インストーラは起動時に `DATA_DIR` を一度設定し、その後の展開・リンク作成に使う（`packaging/install.sh:24-27,110-141`）。PowerShell 版も処理中に `$data` を一度決め、展開先と `current` の設定先に使う（`packaging/install.ps1:87-90,113-115,174-189`）。
 
-インストール探索の Python 関数は呼ばれるたびに渡された `environ`（省略時は `os.environ`）を参照し、モジュール内の値キャッシュはありません。非空の `STRATA_DATA_DIR` から `install` 候補を作り、`config_files()` がそのフォルダー内で `strata-*.json`（shared-settings を除く）を見つけた場合だけ候補に残します（`strata_control/discovery.py:141-149,160-191`）。この候補が先にあると、保存済み設定を持つ Terminal 配下のインストールが、呼び出し元の `here` より優先され得ます。
+Python 側は `places()` の呼び出しごとに `environ.get("STRATA_DATA_DIR")` を評価し、値を `Path.expanduser()` に通す。関数内 static cache はない。通常の呼び出しでは `environ` の既定値はその時点の `os.environ` である（`strata_control/discovery.py:161-172`）。`strata models list` などの共有探索経路は `discovery.places` を呼ぶ（`strata_cli/launch/catalog.py:173-177,249-253`、`strata_control/models.py:80-86`）。
 
-ランチャーの `install_isolation_words()` は候補探索結果を受けて計画警告を組み立てます。CLI の選択値を優先し、なければ `os.environ` を参照します。選択値または候補がない場合、先頭候補が明示インストールの場合、あるいはその候補が選択値の内側なら警告を返しません。外側なら「Strata is using the earlier install ... not a clean one ...」という文面を返し、`preflight_words()` が計画の警告一覧に追加します。例外はこの警告処理内で握りつぶされるため、そこでの失敗は警告なしになります（`strata_cli/launch/runner.py:39-55,2038-2055`）。
+`strata launch --plan` の preflight は、選ばれたインストールが指定データフォルダーの外にあり、明示的なインストール場所ではない場合、次の警告を `warnings` に加える。これは説明だけで、インストールを切り替えたりファイルを移動したりしない: `Strata is using the earlier install in ... (... saved model setting(s) and its engine settings), not a clean one in ...: the data folder only says where model files are kept. To test from scratch, use a new user account or remove the earlier install first.`（`strata_cli/launch/runner.py:41-57,2380-2397,2419-2420`）。
 
-同梱開発ツール `tools/dgx_smoke.py` では、環境変数を argparse の `--data-dir` 既定値として読みます。コマンドラインで `--data-dir` を指定すると argparse がその値を使います。環境変数が空文字の場合は `or` により `~/Strata-data` にフォールバックします（`tools/dgx_smoke.py:74-85`）。
+## ログと測定値
+
+Python の条件に合う場合、上記の `strata launch --plan` 警告が観測できる。インストーラでは、この変数専用の受理値ログはない。Windows で `STRATA_DATA_DIR` と `LOCALAPPDATA` の両方が空の場合は stderr に `strata installer: Windows did not say where your user folder is. Set $env:STRATA_DATA_DIR to a folder you own, for example $env:STRATA_DATA_DIR='C:\Strata', and run this again.` を出して停止する（`packaging/install.ps1:24,87`）。パス作成・展開の失敗時は既存のインストーラ失敗処理へ進む（`packaging/install.sh:112-114`、`packaging/install.ps1:144`）。性能測定値は該当しない。
 
 ## 根拠
 
-- インストーラーの既定値と配置: `packaging/install.sh:20-27,98-100,125-134`、`packaging/install.ps1:18-19,45-46,65-69,122-137`。
-- インストール探索・優先順位: `strata_control/discovery.py:160-203`。設定ファイル候補の条件: 同 `:141-149`。
-- ランチャーの CLI データフォルダー検査と反映: `strata_cli/launch/cmd.py:90-93,226-231`。環境変数との警告比較・表示: `strata_cli/launch/runner.py:39-55,2038-2055`。
-- 同梱 DGX smoke ツールの既定値: `tools/dgx_smoke.py:74-85`。
-
+- `packaging/install.sh:24-27,110-141` — Unix 系インストーラの既定値、保存先。
+- `packaging/install.ps1:87-90,113-115,144,174-189` — Windows での値判定、保存先と失敗経路。
+- `strata_control/discovery.py:161-204` — 探索候補、優先順、run config の条件、fallback。
+- `strata_cli/launch/catalog.py:173-177,249-253`、`strata_control/models.py:80-86` — 共有探索関数の呼び出し。
+- `strata_cli/launch/runner.py:41-57,2380-2420` — `--data-dir` との選択、計画時警告。

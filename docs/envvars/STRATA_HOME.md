@@ -1,43 +1,46 @@
 # `STRATA_HOME`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-host サーバーの per-user データ用ルートディレクトリを指定します。ここに `data/state.json` などの状態データを置き、書き込み可能な候補として選ばれれば `models/` も作ります。engine インストーラーなど、host 内の複数機能がこのルートを基準にパスを作ります。
+host/server は `STRATA_HOME` をアプリ用データルートの最優先候補として読み、選ばれたディレクトリの下に `models` と `data` を作成します。状態 JSON は `data/state.json`、同梱エンジンのインストール先は `<HOME>/engine` です。`HOME` は別途 `homedir()/.strata`、`process.cwd()/.strata` へフォールバックします。host の `store.mjs` が一度解決して export する値であり、host の `index.mjs` はその `DATA_DIR` を chat store や他の状態ストアへ渡します。`apps/host/server/store.mjs:14-32`, `apps/host/server/index.mjs:123-127`, `apps/host/server/engine-install.mjs:13-18`
 
-Windows の `strata` CLI では別の用途として、ユーザー所有ファイルの権限修復で「ユーザーデータのルート」の一つに数えます。
+同梱 Python の `strata repair-access` 経路では、設定値がユーザーのデータルートとしてアクセス権修復の対象一覧に加わります。この Python 側の用途は host の保存先選択とは別です。`strata_control/private_files.py:418-433, 509-527`; 呼び出し元は `strata_cli/cli.py:2117-2126, 2129-2137`。
 
 ## 値と判定
 
-| 状態 | host サーバー (`apps/host/server/store.mjs`) | Windows CLI の権限修復 (`strata_control/private_files.py`) |
-|---|---|---|
-| 未設定 | `~/.strata`、次に `<cwd>/.strata` を候補にする | この変数由来のルートは追加しない |
-| 空文字 | falsy として候補から除外。未設定と同じ | falsy として無視 |
-| 空でない値 | 文字列をそのまま先頭候補として使う。相対パスも拒否・絶対化されず、プロセスの cwd 基準で扱われる | `Path(value)` をルート候補に加える。`user_roots()` では `resolve()` で正規化し、`known_roots()` では存在確認に使う |
+| 条件 | 未設定 | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| host/server のデータルート | `homedir()/.strata` を試す | 空でないパス文字列（例: `/var/lib/strata`）。そのパスに `models` と `data` を再帰作成できれば採用 | 未設定・空文字は候補から除外。`0` や `false` も特別な真偽値として解釈せず、文字どおりのディレクトリ名として試す。作成に失敗した候補は不採用 |
+| 同梱 Python の修復対象ルート | `STRATA_HOME` 由来のルートを追加しない | 空でない文字列を `Path` にし、`user_roots()` では `resolve()` できたルートを追加。`known_roots()` では存在するルートだけを追加 | 未設定・空文字は追加しない。`0` や `false` もパスとして扱う。`known_roots()` は存在しないパスを除外 |
 
-文字列の trim、展開、値形式の検証はありません。例えば空白だけの値も非空文字列として扱われます。host は候補ごとに `models/` と `data/` を再帰作成し、両方の作成に成功した最初の候補を採用します。失敗は捕捉して次候補へ進み、全候補で失敗した場合は `No writable data directory found — set STRATA_HOME to a writable path` を投げます。
+host 側は文字列の trim、絶対パス検査、正規化、値の内容検証を行いません。相対パスは Node の現在の作業ディレクトリ基準でファイルシステム操作されます。候補列は `STRATA_HOME`、`homedir()/.strata`、`process.cwd()/.strata` の順で、各候補について `models`、次に `data` を `mkdirSync(..., { recursive: true })` します。例外は候補ごとに握りつぶして次へ進み、最初に両方を作れた候補を返します。Python の `user_roots()` は値が truthy なら追加して `resolve()` の `OSError` を除外し、`known_roots()` は存在確認後に小文字化した文字列で重複を除きます。`apps/host/server/store.mjs:14-27`; `strata_control/private_files.py:418-433, 509-527`
 
 ## 有効になる条件
 
-- host サーバーの `store.mjs` がロードされるときに評価されます。ES module の初期化で `HOME` が決まるため、ロード後に `process.env.STRATA_HOME` を変更しても選択済みの `HOME` や `DATA_DIR` は移りません。
-- `STRATA_HOME` のディレクトリ作成に成功したときだけ採用されます。失敗時は `homedir()/.strata`、続いて `process.cwd()/.strata` に fallback します。環境変数が設定されていても、その場所が使えなければ fallback します。
-- `STRATA_MODELS_DIR` が設定されていれば、モデル用ディレクトリの選択はそちらを優先する別設定です。`STRATA_HOME` は引き続き `data/` など host のデータ基点です。モデル用の環境変数がない場合でも、モデル保存先の希望場所はプラットフォーム別の Documents で、そこを使えない場合などに `STRATA_HOME/models` が fallback になります。
-- Windows CLI の修復処理では、`STRATA_HOME` は `APPDATA` などと並ぶ候補の一つです。`known_roots()` は存在するルートのみを返します。権限修復そのものは Windows でのみ動きます。
+- host/server では Node host が `store.mjs` を import して `resolveHome()` を実行する経路で適用されます。指定パスに `models` と `data` の両方を作成できることが採用条件です。先行候補が失敗すると後続候補に移るため、設定した `STRATA_HOME` が使われない場合があります。候補をすべて使えない場合は例外になります。`apps/host/server/store.mjs:14-30`
+- `STRATA_MODELS_DIR` はモデル置き場の別設定です。`defaultModelDirectory()` はそれを優先候補にし、`pickModelsDirectory()` は保存済み `state.modelsDir` があればそれを優先します。`STRATA_HOME` を設定しても、新規モデルの置き場が常に `<STRATA_HOME>/models` になるわけではありません。preferred の作成・アクセス確認に失敗した場合は `<HOME>/models` にフォールバックし、notice を生成します。`apps/host/server/model-directory-default.mjs:8-20`; `apps/host/server/store.mjs:60-87`
+- Python 側の `repair_access()` と `repair_known_roots()` は Windows 以外では修復を行いません。`repair_known_roots()` は Windows で既知ルートを走査します。CLI の `repair-access` はこの処理を明示実行し、通常の CLI 処理でも PermissionError の再試行経路から呼ばれます。`strata_control/private_files.py:445-476, 530-540`; `strata_cli/cli.py:2098-2114, 2117-2137`
+- `STRATA_HOME` が設定されているだけでは修復は始まりません。`repair-access` の実行、または CLI の対象処理で PermissionError が起きることが必要です。ファイル共有違反の場合は既知ルート修復ではなく 1.5 秒待って再試行します。`strata_cli/cli.py:2102-2114`
 
 ## 実行時の詳細
 
-host は採用したルートから `DATA_DIR = HOME/data`、状態ファイル `data/state.json` を作ります。状態ファイルがない、または読み込み・JSON parse に失敗した場合は初期状態を使います。保存時は同じ状態ファイルへ書き、書き込みエラーは `[strata] could not persist state:` として stderr に出します。
+host は `store.mjs` のモジュール評価時に `HOME` を計算し、その時点で `models` と `data` のディレクトリを作成します。続いて `DATA_DIR`、`STATE_FILE`、モデル置き場が定まり、JSON state を読み込みます。host 起動後に `process.env.STRATA_HOME` を変更しても、既に export 済みの `HOME` や `DATA_DIR` は再解決されません。`state.json` がない、読み込みや JSON parse に失敗する場合は既定 state を使います。更新時は `data/state.json` へ保存し、`save()` の書き込み失敗は `[strata] could not persist state:` を stderr に出します。`apps/host/server/store.mjs:14-60, 146-157`
 
-他の host 処理もこのルートを使います。engine installer は `HOME/engine` をインストール先にし、Cloudflare connector は `HOME/engine/cloudflare`、artifacts の preview は `HOME/previews` を使います。API でユーザー指定パスの先頭 `~` を展開するときも `store.HOME` に置き換えます。ディスク空き・合計容量の helper は既定で `HOME` を調べますが、呼び出し元は別パスを渡せます。
+Python の `user_roots()` / `known_roots()` は呼び出しごとに `os.environ` を参照します。前者は Windows の `repair_access()` が指定ファイルの所有ルート判定を行う際に使用し、後者は `repair_known_roots()` が走査するルートを作る際に使用します。`known_roots()` は存在する `STRATA_HOME` 自体を走査ルートに加えます。ディレクトリ走査は上限 `limit=20000` 件で止まり、`models` など `_SKIP_DIRS` のサブディレクトリは再帰しません。`strata_control/private_files.py:418-442, 445-453, 505-527, 530-568`
 
-Windows CLI 側では `user_roots()` が `STRATA_HOME` を含む既知のユーザーデータ環境変数を列挙し、`is_users_own()` が対象パスがそのルート内かを判定します。`repair_known_roots()` はそのルート群を走査し、権限エラーがある項目を修復しようとします。CLI は起動時のアクセスエラー再試行や `repair-access` コマンドからこの関数を呼びます。未設定時に `~/.strata` を走査するのは Python CLI 側の `known_roots()` が独自に追加する既定ルートであり、Node host の fallback 選択とは別実装です。
+## ログと測定値
+
+host の候補がすべて失敗すると `Error('No writable data directory found — set STRATA_HOME to a writable path')` を投げます。host の起動経路でこの例外を捕捉して別候補を追加するコードは `store.mjs` にありません。モデル用 preferred path が使えず `<HOME>/models` に戻る場合は `[strata] ${MODELS_DIR_NOTICE}` を `console.warn` します。state 保存に失敗すると `[strata] could not persist state:` を `console.error` します。`apps/host/server/store.mjs:18-27, 83-87, 146-152`
+
+Windows CLI の明示的な `repair-access` は human 出力で `checked … entries, repaired …, could not repair …` を表示し、失敗数が 0 より大きい場合はアクセス拒否時の案内も表示して終了コード 5 を返します。JSON 出力時は `ok` とレポートを出力します。PermissionError の自動再試行経路はこのサマリを出力せず、再実行後も失敗した場合にエラーコード 5 のエラーを返します。`strata_cli/cli.py:2102-2114, 2117-2126`
 
 ## 根拠
 
-- 候補順、空値の除外、ディレクトリ作成、fallback、全失敗時の例外: `apps/host/server/store.mjs:14-30`。
-- `data/state.json` と読み書きの fallback / ログ: `apps/host/server/store.mjs:31-32,50-60,131-147`。
-- モデル用ディレクトリとの関係: `apps/host/server/store.mjs:61-87`、`apps/host/server/model-directory-default.mjs:7-20`。
-- engine / connector / preview / `~` 展開: `apps/host/server/engine-install.mjs:13-18`、`apps/host/server/index.mjs:918,1041-1044,1735-1738`。
-- ルート列挙と対象判定、Windows 修復: `strata_control/private_files.py:415-439,506-570`。CLI からの呼び出し: `strata_cli/cli.py:2075-2091,2094-2103,2106-2114`。
-- `apps/host/docs/README-historical.md:96-102` は過去の `~/.strata` と fallback の説明です。現行動作は上記コードを根拠にしました。`docs/DETAILS.md` にはこの環境変数の実装説明や測定値は見当たらず、性能・正確性の主張は記載していません。
+- host の値の候補順・作成・失敗: `apps/host/server/store.mjs:14-32`
+- state とモデル置き場の初期化・保存: `apps/host/server/store.mjs:50-87, 131-157`
+- host のデータルート利用: `apps/host/server/index.mjs:123-127, 284-291`; エンジン置き場: `apps/host/server/engine-install.mjs:13-18`
+- 別モデル置き場の優先設定: `apps/host/server/model-directory-default.mjs:8-20`; `apps/host/server/store.mjs:67-87`
+- Python 側の環境値参照と Windows 修復範囲: `strata_control/private_files.py:418-453, 509-540`
+- CLI からの自動・明示呼び出しと出力: `strata_cli/cli.py:2098-2137`

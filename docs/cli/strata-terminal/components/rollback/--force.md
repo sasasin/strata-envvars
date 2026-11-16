@@ -1,6 +1,6 @@
-# `--force`
+# `strata components rollback --force`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,50 +8,49 @@
 | コマンド | `strata components rollback` |
 | オプション | `--force` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。指定時は真、未指定時は偽 |
+| 値 | 値を取らない真偽フラグ。省略時は `false`、指定時は `true`。 |
 
 ## 役割
 
-このコマンドでは `--force` を指定しても rollback の結果は変わりません。共通 parser から受理されますが、rollback 実装は force 値を参照しません。`--force` が実際に使われるのは `strata update` / `strata components update` の経路で、テスト起動に失敗した、または rollback 元として skip された engine version の再試行を許可します。
+`--force` は共通 parser で受理されるフラグです。parser の説明は、テスト起動に失敗した版または rollback された版を再試行することです。ただし `strata components rollback` の実行経路ではこの値を参照しません。このコマンドに付けても rollback の対象選択や検証を変えず、再試行の強制にもなりません。再試行の制御は `strata update --force` の更新経路で行われます。
 
 ## 使い方
 
 ```sh
+# 以前の切り替えで記録されたエンジンへ戻す。--force はこの経路の動作を変えない。
 strata components rollback --force
 ```
 
-rollback 自体に `--force` は不要であり、上記は通常の rollback と同じ動作です。通常は次のように使います。
-
-```sh
-strata components rollback
-```
+このコマンド自体はエンジンの選択状態を切り替えます。`--force` はその変更を強制したり、確認を省略したりする指定ではありません。
 
 ## 値と既定値
 
-値を取らない `argparse` の `store_true` フラグです。未指定時の値は `False`、指定時は `True` になります。同じフラグを複数回指定しても値は `True` のままです。値を続けて渡す形式ではないため、`--force yes` のような入力は余分な引数として parser に拒否されます。rollback parser は共通オプション群 `_common()` を登録しており、その中に `--force` が含まれます。
+`argparse` の `store_true` フラグで、既定値は `false` です。引数値は定義されておらず、別名もありません。rollback 用 parser は `_common()` を通じてこのフラグを登録します。重複して指定しても値は真のままで、rollback の結果は変わりません（`strata_cli/update_cmd.py:47-57,80-82`）。
 
 ## 実行時の動作
 
-CLI は `--force` の値を `updater.Context.force` に渡します。しかし rollback 分岐では `updater.rollback_engine(ctx)` を呼び出し、この関数は `ctx.force` を参照しません。rollback は保存済みの前バージョンを検証し、engine の pin / previous / active 状態や履歴を更新しますが、`--force` はそれらの処理を上書き・強制しません。
+CLI は受け取った値を `updater.Context.force` に渡してから rollback 分岐へ進みますが、その分岐は `updater.rollback_engine(ctx)` を呼び、`force` を読みません（`strata_cli/update_cmd.py:310-321`、`strata_control/updater.py:1450-1472`）。rollback は保存状態の `engine.previous` を取得し、そのパッケージの manifest と完全性を検証してから切り替えます。対象が存在しない場合や検証に通らない場合も、`--force` による迂回はありません（`strata_control/updater.py:1453-1472`）。
 
-一方、通常の update 経路では `update_engine()` が `ctx.force` を使い、状態が `failed-before` または `skipped` の engine を再試行対象に含めます。`_choose_engine()` も、rollback 済みの version は `--force` で再インストールするよう案内します。従って再試行したい場合は rollback コマンドでなく `strata update --force` を使います。
+`--force` が効果を持つのは更新側です。新しい版が過去に失敗した、またはスキップ扱いになった場合の選択を許可し、通常の「再試行しない」判定を変えます（`strata_control/updater.py:698-705,1193-1204,1680-1688`）。
 
 ## 適用条件と副作用
 
-`--force` の有無にかかわらず rollback は、保存された previous engine がなければ失敗します。対象 engine の manifest 読み込みと完全検証を行い、現在稼働中の engine があれば `--wait` の待機規則を適用します。成功時は前バージョンを pin して次回起動で選ばれる状態にし、engine 状態と履歴を保存します。必要に応じて保存済み tuning preset に再確認マークを付けます。更新ダウンロードは行いません。
+このフラグに固有の副作用はありません。rollback が成功すると、以前のエンジンを起動対象として pin し、active / previous / skipped 状態と履歴を更新します。必要な場合は、そのエンジンで測定された保存済み tuning preset に再確認マークを付けますが、preset 自体は削除しません。パッケージはローカルで検証・切り替えられ、rollback 処理はダウンロードしません（`strata_control/updater.py:1398-1447,1450-1472`、`strata_control/preset_marks.py:72-96`）。
+
+エンジンが稼働中の場合、`--wait` がなければ対話端末では待機するか質問し、非対話・機械出力では待たずに失敗します。`--wait` を指定すると、その秒数まで待ちます（`strata_cli/update_cmd.py:473-487`、`strata_control/updater.py:366-377`）。
 
 ## 出力とエラー
 
-成功時は既定の human 出力で切替元・先と tuning preset の扱いを表示します。`--force` の指定有無で表示は変わりません。JSON / JSONL 系の共通出力オプションでは成功データを JSON で出力します。
+成功時は通常出力で切り替え元・先、preset の再確認状態、次の操作案内を表示します。`--output json` または `--output jsonl` では成功結果を JSON オブジェクト1行で出力します（`strata_cli/update_cmd.py:318-331`）。
 
-前バージョンがない場合、または既にその engine に rollback 済みの場合は usage error（終了コード 2）です。前バージョンが検証できない場合、または現在の PC に適合しない場合は refusal（終了コード 5）です。失敗は JSON 系出力なら `ok: false` と error object、human 出力なら標準エラーの `strata: ...` として返されます。rollback 後に新しい方を再試行する案内は `strata update --force` です。
+previous が記録されていない、または既に previous のエンジンを使用中の場合は終了コード `2`、以前のパッケージが利用不能・検証失敗の場合は `5`、稼働中のエンジンを待機時間内に停止できない場合は `7` です。人向け出力ではエラーを stderr に `strata: ...` と表示し、JSON / JSONL 指定時は `ok: false` とエラー情報を JSON で出します（`strata_control/updater.py:72-83,1453-1472`、`strata_cli/update_cmd.py:301-308,368-380`）。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:30-40` は `--force` を値なし `store_true` として共通 parser に追加します。`strata_cli/update_cmd.py:57-59` で rollback parser に `_common()` を適用しています。
-- `strata_cli/update_cmd.py:174-195` は force を Context に渡した後 rollback を呼び出し、成功時の出力を行います。`strata_cli/update_cmd.py:167-172,225-234` は通常の失敗表示・終了コード処理です。
-- `strata_control/updater.py:1033-1078` は rollback の検証・状態変更・履歴記録を行いますが、`ctx.force` は参照しません。
-- `strata_control/updater.py:606-613,926-937` は update 側の force による failed / skipped version の再試行条件を示します。
-- `strata_cli/cli.py:2135-2137` は `components rollback` を update command handler に振り分けます。
-
-確認範囲は上記 checkout のソースです。実行可能な同一 revision の CLI help や Release artifact は調査に使用していません。
+- `strata_cli/update_cmd.py:47-57,80-82` — 共通 parser での `--force` 登録、rollback parser への適用。
+- `strata_cli/update_cmd.py:310-321` — 値を context に渡した後、rollback 関数へ分岐する処理。
+- `strata_control/updater.py:698-705,1193-1204,1680-1688` — `--force` が更新時の失敗済み・スキップ済み版の再試行判定に使われる箇所。
+- `strata_control/updater.py:1398-1447,1450-1472` — rollback の対象取得、検証、切り替え、状態更新と失敗条件。`rollback_engine()` 内で `ctx.force` は参照されない。
+- `strata_control/updater.py:366-377`、`strata_cli/update_cmd.py:473-487` — 稼働中のエンジンの確認と待機。
+- `strata_control/preset_marks.py:72-96` — エンジン identity 変更時の preset 再確認マーク。
+- `strata_cli/update_cmd.py:301-308,318-331,368-380` — 成功・失敗の出力と終了コードの返却。

@@ -1,40 +1,45 @@
 # `HP`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-`HP` は Linux AMD/HIP 向けのビルド・パッケージ作成スクリプトが使う、ROCm devel SDK のルートパスです。通常の Strata 実行ファイルが読む実行時設定ではありません。`packaging/build_hip_linux.sh`、`packaging/build_dsv41_hip_linux.sh`、`packaging/build_split_hip.sh` が値を必須入力として受け取り、HIP コンパイラや ROCm の検索先を組み立てます（各スクリプトの変数入力と利用: `packaging/build_hip_linux.sh:11,26-28,53-57`、`packaging/build_dsv41_hip_linux.sh:8,18-20,39-42`、`packaging/build_split_hip.sh:10,20-28,32-34`）。
+`HP` は実行時の `strata` が読む設定ではなく、Linux AMD/HIP のビルド用シェルスクリプトが ROCm devel root として読む入力である。`packaging/build_hip_linux.sh` はこれを HIP コンパイラ、CMake の ROCm root/prefix、device bitcode、ライブラリ探索、tuning 表の入力に使う。`packaging/build_split_hip.sh` も同様に HIP コンパイラ・CMake 設定・bitcode のパスを組み立てる。両スクリプトは `HP` を必須にする（前者 26 行、52–56 行、96 行、111 行、後者 20 行、27–35 行）。
+
+したがって効果があるのはこれらのビルドスクリプトを実行するときだけで、ビルド済み engine の実行時動作を直接変えない。スクリプトは `ROCM_PATH` / `HIP_PATH` なども設定して CMake 等へ渡すが、それらを利用する外部ツールや driver の挙動はここでは扱わない。
 
 ## 値と判定
 
-| スクリプト | 未設定 | 空文字 | 設定値 |
+| 読み取り箇所 | unset | 有効になる値 | 無効になる値 |
 |---|---|---|---|
-| Linux HIP エンジン／reader パッケージ | `${HP:?HP=<ROCm devel root>}` でエラー終了 | 同じくエラー終了 | 値をパスのルートとして使用 |
-| DeepSeek-V4.1 HIP パッケージ | 同上 | 同上 | 同上 |
-| split HIP エンジンのビルド | 同上 | 同上 | 同上 |
+| `packaging/build_hip_linux.sh` | `${HP:?HP=<ROCm devel root>}` がエラーとなりスクリプトが終了 | 空でない任意の文字列を root パスとして使用 | 明示的な空文字は unset と同じくエラー |
+| `packaging/build_split_hip.sh` | `${HP:?HP=<ROCm devel root>}` がエラーとなりスクリプトが終了 | 空でない任意の文字列を root パスとして使用 | 明示的な空文字は unset と同じくエラー |
 
-これらのスクリプトは `set -u`（split は `set -eu`）で動き、`${HP:?…}` は未設定または null（空文字）のとき展開エラーにします。非空値について形式・存在・ディレクトリ妥当性の事前検証や変換、数値境界判定はありません。値を `$HP/…` のパスに連結し、CMake の HIP コンパイラ・ROCm root・prefix/flags に渡します（`packaging/build_hip_linux.sh:22,26,53-57`、`packaging/build_dsv41_hip_linux.sh:14,18,39-42,46-48`、`packaging/build_split_hip.sh:17,20,26-34`）。
-
-`CORE` と `LIBW` はそれぞれ別に設定されていなければ `HP` が既定値です。明示された `CORE` / `LIBW` はそれらの検索先・データ配置に使われますが、`HP` は引き続きコンパイラ、ROCm root、HIP flags、devel ライブラリ検索などに使われます（`packaging/build_hip_linux.sh:26-28,56-57,98-103`、`packaging/build_dsv41_hip_linux.sh:18-20,41-42,66-68`、`packaging/build_split_hip.sh:20-21,26-34`）。
+これは Bash の `${parameter:?word}` 展開であり、`1`/`0` の真偽値判定や数値変換ではない。`true`、`0`、空白以外の任意の非空文字列も値として受け入れられ、ROCm root としてパス結合に使われる。パスの存在や内容をこの時点で検証する分岐はない。値が不正なパスなら後続の CMake、ビルド、ライブラリ収集または tuning 表作成で失敗し得る（`build_hip_linux.sh:26, 52–56, 63–68, 96–99, 111–112`; `build_split_hip.sh:20, 27–35, 38–55`）。
 
 ## 有効になる条件
 
-この変数を読むのは上記の Linux HIP packaging/build スクリプトを実行した場合です。ビルド済みの Strata CLI、Python サーバー、通常のモデル実行に対する条件や効果はありません。`build_hip_linux.sh` はエンジンと HIP image reader を作り、設定によって DSV41 も作成します。別の `build_dsv41_hip_linux.sh` は DSV41 パッケージを作り、`build_split_hip.sh` は split HIP バイナリをビルドします（`packaging/build_hip_linux.sh:2-3,60-90`、`packaging/build_dsv41_hip_linux.sh:2-4,43-52`、`packaging/build_split_hip.sh:2-8,29-38`）。
-
-各スクリプトは `HP` から `ROCM_PATH` と `HIP_PATH` を export し、split ビルドではさらに `$HP/bin` を `PATH` の先頭に加えます。CMake にも HIP compiler/root と ROCm flags を明示して渡します（`packaging/build_hip_linux.sh:53-57`、`packaging/build_dsv41_hip_linux.sh:39-42`、`packaging/build_split_hip.sh:26-34`）。これはビルド工程へのパス設定です。これらのスクリプトから、同名 `HP` を生成後の Strata プロセスに対する実行時設定として渡す処理は確認できません。
+- Linux の HIP build 用 `packaging/build_hip_linux.sh` または `packaging/build_split_hip.sh` を起動すること。前者は `VARIANT` の必須値確認が `HP` より先にあり、後者は `B` の確認が先にあるため、先行条件が欠ける場合は `HP` の判定まで進まない（`build_hip_linux.sh:21–27`; `build_split_hip.sh:17–21`）。
+- `build_hip_linux.sh` は `VISION_ONLY` が空または未設定でも engine を構成・build するが、指定されている場合も `HP` 必須判定後に GPU vision reader build に使う。`VISION_ONLY` は engine/package の工程を省略するだけで `HP` 要件は解除しない（`build_hip_linux.sh:26, 60–86`）。
+- `build_split_hip.sh` は `B`、`HP` を必須とし、`LIBW` が未設定または空なら `HP` をライブラリ root に使う。`build_hip_linux.sh` では `CORE` と `LIBW` が同様に `HP` を既定値とする。これらを非空に設定すると個別に上書きできるが、`HP` 自体は引き続き必要（`build_split_hip.sh:19–21`; `build_hip_linux.sh:26–28`）。
+- `build_hip_linux.sh` の `VARIANT` / `ARCHS`、`build_split_hip.sh` の `ARCHS` などが対象アーキテクチャを選ぶ。`HP` は選択には使わず、選ばれた build に必要な ROCm 関連パスを提供する（`build_hip_linux.sh:33–43, 52–56`; `build_split_hip.sh:24–35`）。
 
 ## 実行時の詳細
 
-`HP` は各シェルスクリプトの初期化時に一度変数へ代入されます。要求値がなければ、後続処理に入る前の必須展開でスクリプトが終了します。パス自体が間違っている場合の独自診断はなく、CMake や後続の収集・stage 処理の成否に現れます。エンジンと DSV41 のスクリプトは CMake configure/build の出力を `$OUT` 配下のログへリダイレクトし、`chk` が失敗コードを `build.status` に記録して `ABORT … failed (rc=…)` を追記して終了します（`packaging/build_hip_linux.sh:45-48,61-66`、`packaging/build_dsv41_hip_linux.sh:33-35,46-51`）。`build_split_hip.sh` は configure/build の出力をリダイレクトせず、失敗時に終了します（`packaging/build_split_hip.sh:29-38`）。
+両スクリプトは起動時のシェル展開で `HP` を変数に取り込み、その後のコマンド引数や export 値へ展開する。プロセス内で環境を書き換えて読み直すコードや cache はなく、スクリプト実行中に親プロセス側の環境値を変更して反映させる経路もない（`build_hip_linux.sh:21–28, 52–56`; `build_split_hip.sh:17–29, 33–35`）。
 
-値の再読み込み、static cache、リクエスト単位の評価はありません。ビルド時に環境から得た値を CMake 引数や `stage_tuning.py --rocm` に使います。エンジンパッケージのスクリプトはライブラリを `$HP/lib` 等から検索し、チューニング表の stage にも `HP` を渡します（`packaging/build_hip_linux.sh:98-103,116-117`、`packaging/build_dsv41_hip_linux.sh:66-75`）。
+`build_hip_linux.sh` は `ROCM_PATH`、`HIP_PATH`、`PATH` 等を export し、HIP コンパイラの場所、CMake prefix、bitcode directory を構成する。`HP` の下の `lib/rocm_sysdeps` が存在する場合は prefix と後続のライブラリ探索に追加する。`build_split_hip.sh` も同じ sysdeps directory の有無で prefix を分け、bitcode は `$HP/lib/llvm/amdgcn/bitcode` が存在しなければ `$HP/amdgcn/bitcode` を選ぶ（`build_hip_linux.sh:52–56`; `build_split_hip.sh:27–34`）。
+
+## ログと測定値
+
+`HP` が未設定または空の場合、Bash の必須パラメータ展開エラーが stderr に出てスクリプトが終了する。文言の後半は展開式に書かれた `HP=<ROCm devel root>` である（`build_hip_linux.sh:26`; `build_split_hip.sh:20`）。`build_hip_linux.sh` は後続 build の出力を `$OUT/cfg.log` 等へリダイレクトし、各段階の終了コードを `$OUT/build.status` に記録する。tuning table 作成の失敗では `ABORT tuning tables` を同ファイルに記録して終了する（`build_hip_linux.sh:44–47, 63–68, 111–112`）。`build_split_hip.sh` は build 後の検査失敗時に `build_split_hip.sh: ...` 形式の診断を stderr に出す（`build_split_hip.sh:38–55`）。
+
+`docs/DETAILS.md` に `HP` の説明や測定値はない。`packaging/README.md` と `packaging/ENGINE-COMPONENT.md` は Linux HIP package の build script と構成を記載しており、上記のソース上の用途と矛盾する記述は見当たらない（`packaging/README.md:32`; `packaging/ENGINE-COMPONENT.md:112`）。
 
 ## 根拠
 
-- `packaging/build_hip_linux.sh:11,22-28,53-57,98-117`: Linux HIP エンジンパッケージの入力、既定、HIP 設定、ライブラリ収集、チューニング表処理。
-- `packaging/build_dsv41_hip_linux.sh:8,14-20,39-48,66-75`: DSV41 パッケージでの同じ入力と利用。
-- `packaging/build_split_hip.sh:10,17-34`: split HIP ビルドの入力、必須判定、HIP 環境と CMake 設定。
-- 候補索引 `docs/envvars/000_envvers.md:671` に `HP` は載っています。候補名の完全一致参照を調べたところ、環境入力として使う Strata 所有コードはこの 3 つの packaging スクリプトでした。C++/Python の Strata 実行時 `getenv` / `os.environ` による読み取りは見つかりませんでした。
-- ほかに `tests/dsv41/build_dq_test.sh:47-64` にシェル変数 `HP` がありますが、これは `HIP_ROOT` から作るテスト用のローカル変数で、環境変数 `HP` の読み取りではありません。ベンチマーク結果内にも同名のローカル配列名がありますが、環境変数としての参照ではありません。
-- `packaging/README.md:32` は Linux HIP engine package のビルド入口として `packaging/build_hip_linux.sh` を示しています。測定値はこの変数の役割を説明する根拠にしていません。
+- `packaging/build_hip_linux.sh:21–28` — 先行する `VARIANT` 確認、`HP` 必須判定、`CORE` / `LIBW` の既定値。
+- `packaging/build_hip_linux.sh:52–56` — HIP 関連環境値の export と CMake root / compiler / bitcode 設定。
+- `packaging/build_hip_linux.sh:60–86, 96–112` — `VISION_ONLY` の分岐、ライブラリ探索と tuning 表の生成。
+- `packaging/build_split_hip.sh:17–35` — `B` / `HP` 必須判定、`LIBW` 既定値、HIP build 用パス設定。
+- `packaging/build_split_hip.sh:38–55` — build 後の検査と失敗時の診断。

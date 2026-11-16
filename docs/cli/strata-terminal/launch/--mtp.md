@@ -1,6 +1,6 @@
-# `--mtp`
+# `strata launch --mtp`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,56 +8,58 @@
 | コマンド | `strata launch` |
 | オプション | `--mtp` |
 | 別名 | なし |
-| 値 | `on` または `off`（値を取る） |
+| 値 | `on` または `off` |
 
 ## 役割
 
-モデル起動時に draft layer（MTP）を使うかを指定します。`off` はドラフト層を使わない設定で、`on` はインストール済み設定が無効でも有効にします。parser の説明では、`off` はグラフィックスメモリーと RAM の使用量を減らす代わりに応答を遅くし、小さい GPU や RAM が少ない PC で使う選択肢とされています（`strata_cli/launch/cmd.py:101-103`）。これは Terminal CLI 側の設定です。ネイティブ engine の `--mtp <path|depth>` と同じ値形式ではありません。
+モデルの MTP draft layer を使うかどうかを、この launch の設定として指定する。`off` は起動構成に無効状態を記録して MTP 用 engine 引数を除き、MTP を使わずに起動する。`on` は保存済みの無効状態を上書きして有効にする。MTP は通常の draft に使うモデル内の補助レイヤーであり、`--drafting` が DFlash2 を選ぶ場合の DFlash2 drafter とは別の設定である（`strata_cli/launch/cmd.py:98-104`、`strata_cli/launch/settings.py:96-99`、`strata_control/draft_layer.py:1-18`）。
 
 ## 使い方
 
 ```sh
-strata launch --model q2_0 --mtp off --no-tui
-strata launch --plan --model q2_0 --mtp off
-```
+# 変更を加えず、MTP を使わない場合の計画を表示する
+strata launch --plan --model iq3_xxs --mtp off
 
-1つ目はモデルを起動する指定、2つ目は変更せず起動計画を表示する指定です（`strata_cli/launch/cmd.py:75-82,101-103,138`）。
+# モデルを MTP なしで起動する
+strata launch --model iq3_xxs --mtp off --no-tui
+
+# 保存済み preset の MTP を有効にして起動する
+strata launch --preset "IQ3_XXS 128K" --mtp on
+```
 
 ## 値と既定値
 
-- `on` / `off` の2値を受け付けます。値は前後の空白を除いて小文字化してから検査されるため、大文字・小文字は区別されません（`strata_cli/launch/cmd.py:37-45,101-103`; `strata_cli/launch/settings.py:28`）。
-- 省略時は `LaunchSettings.mtp` が `None` です。設定モデル上はインストール済み設定に従い、通常は draft layer を有効にする扱いです。parser の help も既定値を `on` と説明します（`strata_cli/launch/settings.py:77-95`; `strata_cli/launch/cmd.py:101-103`）。
-- 値を省略すると argparse の必須値検査で拒否されます。`on` / `off` 以外の値も `_choice` の型変換で拒否され、選べる値を示すエラーになります（`strata_cli/launch/cmd.py:37-45,101-103`）。
+- 値は `on` / `off` の二択。parser の変換関数は前後の空白を除き小文字化してから候補と照合するため、たとえば `ON` も `on` として受理される（`strata_cli/launch/cmd.py:35-43,98-100`、候補定義は `strata_cli/launch/settings.py:28`）。
+- 省略時の parser 値は `None`。したがって、preset があればその値を引き継ぎ、そうでなければ既存のモデル設定に従う。新規セットアップでは既定で MTP が有効になる（`strata_cli/launch/cmd.py:206-211,245-246`、`strata_cli/launch/settings.py:98`、`setup.py:9471-9474`）。
+- `--mtp` の値を省略した場合や `yes` など候補外の値を指定した場合は argparse が拒否する。誤った値では候補一覧と近い値の提案を含む usage error になり、終了コードは 2（`strata_cli/launch/cmd.py:35-43,98-100`、`strata_cli/cli.py:2256-2265`）。
+- 同一コマンドで複数回指定した場合の個別検証はありません。argparse の通常の単一値引数として処理され、後に指定した値が残ります（登録は `strata_cli/launch/cmd.py:98-100`）。
 
 ## 実行時の動作
 
-`settings_from_args()` は指定値を launch 設定へ格納し、`--preset NAME` と併用した場合は preset の値に上書きします（`strata_cli/launch/cmd.py:197-203,225-235`）。
-
-`off` の場合、launch 用 run config に `"mtp": false` を設定し、`draft_layer.apply()` が engine 引数から MTP 専用の `--mtp`、`--spec-min-p`、`--batch-mtp` を除きます。したがって既存 config に draft layer の引数があっても、launch 時には無効化されます（`strata_cli/launch/runner.py:371-407`; `strata_control/draft_layer.py:25-26,29-56`）。また `modelstate.mtp_choice()` が `off` を返すため、必要ファイルの計画・setup 引数にも反映されます（`strata_cli/launch/modelstate.py:84-88,105-112`; `strata_cli/launch/runner.py:727-745,853-862,1702-1720`）。
-
-`on` の場合、run config の `"mtp"` を true にし、既存の無効設定を上書きします（`strata_cli/launch/runner.py:392-400`; `strata_cli/launch/settings.py:94`）。新規 setup では `qwen`、`swift`、`coder`、`unsloth`、`gyro` の helper family に限り、`--mtp on` を setup 引数に渡します。`off` も同じ family で `--mtp off` として渡され、不要な draft layer の取得を避ける用途があります（`strata_cli/launch/modelstate.py:79-82`; `strata_cli/launch/runner.py:727-745`）。
-
-`--drafting off` を同時に指定すると、`drafting` の選択から MTP 無効が判定され、`--mtp on` より優先して draft layer を無効化します（`strata_cli/launch/modelstate.py:84-88`; `strata_cli/launch/runner.py:392-399`）。`--drafting` はどの drafter を使うかを選ぶ別オプションです。
+- CLI 値は preset の設定に重ねて `LaunchSettings.mtp` に入る（`strata_cli/launch/cmd.py:206-211,245-246`）。
+- `off` の場合、launch 用 config に `"mtp": false` を設定し、MTP が選ばれている場合の engine 引数から `--mtp`、`--spec-min-p`、`--batch-mtp` とその値を取り除く。server は各 engine 起動時にも `"mtp": false` を適用し、engine 引数に MTP 用フラグが残っていれば除去する（`strata_cli/launch/runner.py:495-512`、`strata_control/draft_layer.py:25-56`、`serve/server.py:3934-3940`）。
+- `on` の場合、launch 用 config に `"mtp": true` を書き、保存済みの `false` を引き継がない（`strata_cli/launch/runner.py:497-502`）。ただし `--drafting off` が同時に指定されると `drafting off` 側も MTP を無効化する（`strata_cli/launch/runner.py:495-502`）。
+- `--drafting dflash2` との併用では、MTP layer と DFlash2 drafter は別々に扱われる。launch のセットアップ引数では DFlash2 が選択されたとき `--drafter dflash2` を渡し、`--mtp off` なら MTP layer を fetch しない。engine 起動時も DFlash2 用の選択引数がある場合は、MTP layer の引数除去条件から除外される（`strata_cli/launch/runner.py:944-952`、`serve/server.py:3934-3940`）。選択の詳細は [`--drafting`](--drafting.md) を参照。
+- 初回モデル設定などで helper files が必要な launch では、`--mtp off` により MTP のダウンロード計画からも MTP が除外される。指定がなく、別の drafter が選ばれていない場合は、必要なモデル family で MTP が計画に含まれる（`strata_cli/launch/modelstate.py:121-126,143-160`、`strata_cli/launch/runner.py:2261-2283`）。セットアップに渡す値は `qwen`、`swift`、`coder`、`unsloth`、`gyro` family に限られ、それ以外の family には渡されない（`strata_cli/launch/modelstate.py:80-83`、`strata_cli/launch/runner.py:944-950`）。
+- launch はモデル設定を準備した後、今回の起動用 config を作って保存し、その設定で server を起動する。オフライン等で必要な MTP を fetch できない場合、通常の MTP 選択では launch は停止せず、MTP なしで続行する経路がある（`strata_cli/launch/runner.py:2432-2455,2543-2581`）。
 
 ## 適用条件と副作用
 
-- オプション単独では、非対話・TTY なしの通常起動に必要なモデルや preset の選択には数えられません。`have_choices` の判定に `a.mtp` が含まれず、TTY の対話起動でも選択済み設定を渡す分岐ではなく空の案内画面を開きます。モデル・preset などと併用してください。`--plan` はこの判定を経ず、指定値を含む計画を表示します（`strata_cli/launch/cmd.py:685-710,735-760`）。
-- setup で draft layer が不足していれば、`on` は取得対象になり得ます。`off` は取得計画から除外されます。計画上のファイル有無確認と setup 引数の生成は `strata_cli/launch/modelstate.py:105-173`、`strata_cli/launch/runner.py:727-745,1702-1720` にあります。実際の download は通常の launch/setup 処理に伴います。
-- `--mtp off` は MTP draft layer を無効にします。launch parser の説明では GPU memory と RAM の節約、応答の低速化が記されています（`strata_cli/launch/cmd.py:101-103`）。MTP 無効時にも残る生成機能など、engine 側の詳細はこの Terminal CLI オプション文書の調査範囲外です。
-- このオプションは `--drafting` と独立して保存・適用されます。DFlash2 を含む drafter の選択規則全体は `strata_control/drafting.py` 側の処理であり、ここでは詳細な互換性を断定しません。
+- `off` は MTP の重み・draft head を使わず、利用可能 VRAM と RAM を減らす代わりに、MTP を使う場合より生成が遅くなると CLI の説明にある。数値での効果はこの文書では再測定していない（`strata_cli/launch/cmd.py:98-100`、`strata_control/draft_layer.py:8-18`）。
+- 明示した `on` / `off` は launch の設定に反映される。`off` はセットアップが書き戻す `--mtp` 引数より優先され、次回以降の engine 起動でも反映される。セットアップが再実行されるモデルでは、`--mtp off` / `--mtp on` も `setup.py` に渡され、モデルの run config に `mtp` の真偽値が記録される（`strata_cli/launch/runner.py:497-512,944-950`、`setup.py:9471-9474`、`strata_control/setup_config.py:528-538`、`serve/server.py:3934-3940`）。
+- MTP が既に有効なモデルに対する `--plan` は、実行計画を表示して変更しない。一方、通常の launch はモデル設定の確認・取得、起動用設定の保存、engine/server 起動を行う（`strata_cli/launch/cmd.py:14-26`、`strata_cli/launch/runner.py:2543-2581`）。
 
 ## 出力とエラー
 
-値の欠落または不正値は parser の型・必須値検査でエラーになります。設定後の通常起動は、モデルや engine の準備、設定保存、起動を行い、launch runner の失敗は `LaunchError` 経由でメッセージと終了コードを返します（`strata_cli/launch/cmd.py:101-103,784-787`; `strata_cli/launch/runner.py:2011-2048`）。`--plan` は計画内容を表示し「Nothing was changed.」として終了します（`strata_cli/launch/cmd.py:735-760`）。
+- 有効化・無効化時のセットアップ出力は、`the draft layer (MTP) is on` または `the draft layer (MTP) is off for this model` とする。off で engine 引数を除いた場合は、取り除いたフラグ名も出力に含む（`strata_control/setup_config.py:528-538`）。
+- server 起動時に既存 run config の `mtp` が `false` で MTP 引数も残っていれば、`"mtp": false - starting without the draft layer (...)` を標準出力へ出す（`serve/server.py:3934-3940`）。
+- 無効値は parser の usage error となり、終了コード 2（`strata_cli/launch/cmd.py:35-43,98-100`、`strata_cli/cli.py:2256-2265`）。MTP の取得失敗時は、オフラインの場合を含めて launch が続行する fallback が実装されている。全ての失敗条件や外部取得処理の詳細はこのオプションの parser だけからは確定できない（`strata_cli/launch/runner.py:2432-2455`）。
 
 ## 根拠
 
-- parser、選択肢検証、help の説明: `strata_cli/launch/cmd.py:37-45,75-107`。
-- preset との合成と値の格納: `strata_cli/launch/cmd.py:197-235`。
-- 既定値と設定値の意味: `strata_cli/launch/settings.py:77-95`。
-- draft layer の enable/disable と engine 引数への適用: `strata_cli/launch/runner.py:371-407`; `strata_control/draft_layer.py:25-56`。
-- setup へ渡す値、適用 family: `strata_cli/launch/modelstate.py:79-88`; `strata_cli/launch/runner.py:727-745`。
-- 不足ファイルの判定、計画への反映: `strata_cli/launch/modelstate.py:105-173`; `strata_cli/launch/runner.py:853-862,1702-1720`。
-- `--mtp` 単独時の対話・非対話分岐と計画表示: `strata_cli/launch/cmd.py:685-710,735-760`。
-
-調査範囲は指定 commit の Terminal CLI parser、launch 設定、draft layer 制御と setup 計画です。Release 配布物の実行、各 engine backend 上での性能・実機動作は確認していません。
+- `strata_cli/launch/cmd.py:35-43,73-80,98-100` — `strata launch` parser の option scope、値の正規化・validation、既定値未指定。
+- `strata_cli/launch/settings.py:28,81-99,124-137` および `strata_cli/launch/cmd.py:206-211,245-246` — 値候補、設定表現、preset への上書き。
+- `strata_cli/launch/runner.py:470-513,928-987` — launch config への適用、セットアップへの引数転送と family 条件。
+- `strata_cli/launch/modelstate.py:80-83,121-160` および `strata_cli/launch/runner.py:2261-2283` — helper family と download plan 上の扱い。
+- `strata_control/draft_layer.py:1-56`、`strata_control/setup_config.py:528-538`、`setup.py:9471-9478`、`serve/server.py:3882-3940` — MTP flag 除去、setup config への保存、server 起動時の適用。
+- `strata_cli/launch/runner.py:2432-2455,2543-2581` — 不足 drafter の fallback と launch 実行順。

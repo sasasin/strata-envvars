@@ -1,45 +1,41 @@
 # `STRATA_NATIVE_REPO`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-Strata のデスクトップ UI をソース checkout から動かすとき、UI の native engine control が最初に参照する Strata リポジトリのパスを指定します。プロセス起動時に `createNativeControl()` が値を既定パスとして取り込みます。ユーザーが Settings → Engine でリポジトリを選ぶと、その選択は設定ファイルに保存され、以後は環境変数の初期値より優先されます。
-
-この名前を環境から直接読む本番コードは `apps/host/server/native-control.mjs` の `process.env.STRATA_NATIVE_REPO` です。ほかの直接参照はプレビュー・テスト用スクリプトによる子プロセス環境の設定と、手渡し用文書です（下記「根拠」）。
+Host UI のソース checkout モードで、ネイティブ Strata リポジトリの初期候補パスを指定する。Host UI はこのパスを使って `setup.py`、`tools/strata_mcp.py`、`serve/server.py` を持つ checkout を選び、MCP 接続と `serve/server.py` の起動に使う。推論エンジン自体の挙動を切り替える変数ではない。`apps/host/server/native-control.mjs:48, 118, 124-127, 564`。
 
 ## 値と判定
 
-値はパス文字列として使われ、boolean や数値への変換はありません。既定引数の `process.env.STRATA_NATIVE_REPO ?? resolve(ROOT, '../../Strata')` は nullish coalescing なので、未設定なら `apps/host` から `../../Strata` を解決した sibling checkout が既定になります。空文字は未設定扱いにならず、空のパスとして後続処理に渡ります。空白の trim や環境変数値自体の形式検証もありません。
+`createNativeControl` の引数既定値で `process.env.STRATA_NATIVE_REPO ?? resolve(ROOT, '../../Strata')` として読み取る。`??` のため未設定（`undefined`）のときだけ Host UI 内で計算した既定パスを使い、空文字も指定値として残る。文字列の真偽値判定、trim、大小文字変換、数値変換はしない。`repo()` は `realpathSync(preferences.repo)` で実在パスへ解決し、3 ファイルの存在を確認する。`apps/host/server/native-control.mjs:27, 48-51, 118`。
 
-| 状態 | 初期設定に使われる値 |
-|---|---|
-| `native-host.json` が存在しない、または JSON を読めない | 環境変数の値。未設定なら既定 sibling path |
-| 有効な `native-host.json` があり `repo` がある | 保存済みの `repo`。環境変数より優先 |
-| 環境変数が空文字で、保存済み設定がない | 空文字。未設定時の既定 path へは戻らない |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| ソース checkout モード | `resolve(ROOT, '../../Strata')` を初期候補にする | 実在し、`setup.py`・`tools/strata_mcp.py`・`serve/server.py` を含むディレクトリのパス | 空文字、存在しないパス、または必須ファイルのいずれかがないパス。空白だけの値も trim されず、その名前のパスとして解決される |
+| packaged mode（Control がある場合） | 同左の環境変数候補は使われない | 該当なし | 環境変数値は `repo()` の選択に使われない |
 
-`readJson()` は有効な JSON をオブジェクトごと返すため、既存ファイルに `repo` キーがない場合も環境変数とのマージは行われず、`preferences.repo` は `undefined` になります。CLI 引数による優先順位はありません。UI の Engine 設定 API から別の repository が選ばれると、そのパスが `preferences.repo` を置き換えて保存されます。
+パスの形式・実在性は Node.js の `realpathSync` に委ねられ、相対パスも禁止されていないため、プロセスの作業ディレクトリから解決される。無効なパスを選んだときは `repo()` が `Choose the Strata repository folder containing setup.py and tools/strata_mcp.py.` を投げる。空文字や不存在パスでは `realpathSync` 自体のエラーになり得る。`apps/host/server/native-control.mjs:118`。
 
 ## 有効になる条件
 
-- ソース checkout の host 経路で使われます。`repo()` は `control` が渡された packaged mode では `installRoot()` を返すため、環境変数の値はリポジトリ選択に使われません。
-- 指定先が実在し、`setup.py`、`tools/strata_mcp.py`、`serve/server.py` を含む必要があります。
-- 有効な既存の `native-host.json` の `repo` があればそちらが優先されます。Engine 設定画面で repository を変更すると、以後の起動でも保存値が優先されます。
+- `apps/host/server/index.mjs:129-130` が `findControl()` の結果を Host に渡し、`native-control.mjs:69` が `packaged=!!control` とする。`control` がないソース checkout モードでこの環境変数による候補パスが有効になる。packaged mode では `repo()` は `installRoot()` を返すため、`STRATA_NATIVE_REPO` は参照パスを変えない。`apps/host/server/native-control.mjs:69, 113, 118`。
+- `directory/native-host.json` がすでに存在して `repo` が保存されていると、その値が環境変数より優先される。環境変数はファイルを読むときの fallback 初期値に限られる。`apps/host/server/native-control.mjs:48-51`。
+- UI のインストール選択（`configure({repository})`）は `preferences.repo` を更新して検証後に `native-host.json` へ保存するため、その後は保存値が使われる。実行中モデルまたは実行中ジョブがある間は変更を拒否する。CLI 引数による上書き経路はこの変数の読取・利用コードにはない。`apps/host/server/native-control.mjs:168`。
 
 ## 実行時の詳細
 
-環境変数は host プロセス内で `createNativeControl()` の既定引数を評価するときに読み取られ、その値を使って設定ファイルが読まれます。サーバー初期化時に一度だけ初期値として取り込まれるため、起動後に親プロセスの環境を変えても反映されません。設定画面からの変更は `realpathSync()` で解決したパスに差し替え、native host の設定ファイルへ保存して refresh します。
+環境変数は `createNativeControl` の既定引数が評価されるときに読み取られ、`preferences` が初期化される。保存ファイルがあればその `repo` 値を使う。プロセス中に環境変数だけを書き換えても `preferences` は再読込されない。UI からの `configure` は選択値を検証・保存し、ネイティブ接続を切って状態を更新する。`apps/host/server/native-control.mjs:48-51, 118, 168`。
 
-リポジトリを使うとき `repo()` は `realpathSync(preferences.repo)` を実行し、3つの必須ファイルの存在を確認します。解決・検証に失敗するとエラーになります。状態 refresh の経路では例外の `message` が native 状態の `error` に格納され、`available:false` とともに返されます。Engine 設定 API からの変更時は検証に失敗すると旧 preferences に戻し、エラーを呼び出し元へ返します。
+ソース checkout では `repo()` の結果が `tools/strata_mcp.py` の起動パスと作業ディレクトリになり、モデル起動時の `serve/server.py` のパスと作業ディレクトリにもなる。子プロセスには `process.env` の複製を渡す（Python の文字コード設定を上書きし、MCP 側ではさらに Host の `STRATA_API_KEY` を削除する）が、`STRATA_NATIVE_REPO` を子プロセス側で参照するコードは見つからなかった。`apps/host/server/native-control.mjs:123-127, 564`; `apps/host/server/control-runtime.mjs:82-85`。
 
-ソース checkout の host は `process.env` を spread した環境で `tools/strata_mcp.py` と `serve/server.py` を起動するため、この変数も変更・除去されず子プロセス環境へ継承されます。autotune 起動にも同様に `process.env` を渡します。リポジトリ全体の名前検索では、これらの子プロセス側に `STRATA_NATIVE_REPO` を直接読む Strata の参照は見つかりませんでした。したがって、ここで確認できる挙動は host が初期 repository を選び、値を子プロセス環境へ引き継ぐところまでです。
+## ログと測定値
+
+この変数に関する専用ログや測定値はない。初期状態の更新処理では `repo()` の失敗が捕捉され、`snapshot.error` にエラーメッセージが入り、`available:false` となる。UI からの不正なリポジトリ選択は `configure` の呼び出しをエラーで終了し、旧 `preferences` に戻す。`apps/host/server/native-control.mjs:118, 166, 168`。
 
 ## 根拠
 
-- `apps/host/server/native-control.mjs:29-40`: `ROOT`、環境変数を使う既定値、設定ファイル読み込みと初期 snapshot。
-- `apps/host/server/native-control.mjs:97-106`: packaged/source の分岐、ソース repository の実在・必須ファイル確認、MCP 子プロセス起動時の環境。
-- `apps/host/server/native-control.mjs:144-146`: refresh 時のエラー状態化、Engine 設定変更時の path 検証・rollback・保存。
-- `apps/host/server/native-control.mjs:55,387`: autotune と source server の起動時に渡す環境。
-- `apps/host/server/control-runtime.mjs:82-85`: source server 環境は `process.env` のコピーであり、削除するのは `STRATA_API_KEY`。`STRATA_NATIVE_REPO` は除去されない。
-- `apps/host/server/index.mjs:164,997-998`: host 作成時に `createNativeControl()` を呼び、`/api/native` の PATCH で Engine 設定を受け付ける。
-- ほかの文字列参照: `apps/host/scripts/language-shots.mjs:26`、`apps/host/scripts/preview-ui.mjs:13`、`apps/host/tests/api-reasoning-effort.test.mjs:81`、`apps/host/tests/gh-app-features.test.mjs:205` は UI preview/test の子プロセス環境に値を注入する箇所。`apps/host/docs/native-engine-handover.md:40` は説明文であり、読み取りコードではありません。
+- `apps/host/server/native-control.mjs:48-51, 69, 113, 118-127, 166-168, 564`: 環境変数の読取、既定値、保存値との関係、モード分岐、パス検証、読取失敗と子プロセス起動。
+- `apps/host/server/index.mjs:128-130`: Control の有無を Host に渡す。
+- `apps/host/server/control-runtime.mjs:77-85`: ソース checkout のサーバー子プロセス環境。
+- `apps/host/docs/README.md:27-30`: Host UI のソース checkout 用パス指定としての説明。コード上の必須ファイル検査は `native-control.mjs:118` による。

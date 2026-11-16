@@ -1,40 +1,45 @@
 # `STRATA_HC_Q8_INJECT`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-`STRATA_HC_Q8=1` で有効になる hyper-connection の Q8_0 verify read に、GGUF 内で F32 として保存された `_inject.weight` 行の Q8_0 コピーも渡します。未設定または無効なら、inject 行は既存の BF16 重みを使います。この変数単独では Q8 read を有効にしません。
+`STRATA_HC_Q8` が有効な native dense の重みロードで、GGUF 内の F32 hyper-connection injection 行列にも Q8_0 のコピーを作るかを選ぶ。対象行列は `blk.<layer>.hc_attn_inject.weight` と `blk.<layer>.hc_ffn_inject.weight`。既定ではこの F32 行列に Q8_0 コピーを作らず、injection の読み取りは BF16 行を使う。値を有効にするとロード時に F32 から Q8_0 へ量子化して device memory にコピーし、verify の fused GR 読み取りへ `q8_inject` として渡す。通常の down/up 投影の Q8_0 化を有効にするスイッチではなく、それには親スイッチ `STRATA_HC_Q8` が必要である（`src/core/native_dense.cpp:91-102,503-536`; `src/core/verify.cpp:1602-1613`; `src/kernels/cuda/fused_gr.cu:2023-2036`）。
 
 ## 値と判定
 
-| 値 | 判定 |
-|---|---|
-| unset、空文字、先頭文字が `1` 以外 | OFF |
-| 先頭文字が `1` | ON（例: `1`, `10`, `1anything`） |
+CUDA/HIP 実装では `hc_q8_inject_env()` の関数内 `static` 初期化、SYCL 実装ではロードループ内の関数内 `static` 初期化で `getenv` の値を取得し、値の先頭 1 文字が `'1'` かだけを調べる。文字列全体の数値変換・妥当性検査はしない。したがって空文字・未設定は無効で、`1`、`10`、`1anything` は有効、`0`、`true`、`True`、` 1`、`01` は無効となる（`src/core/native_dense.cpp:92-95`; `sycl/src/core/native_dense.cpp:393-399`）。
 
-文字列全体や数値としての妥当性は検査せず、先頭文字だけを大文字小文字区別ありで比較します。値を読む箇所は関数内 static の bool なので、`NativeDense::load()` の該当ループが初めて実行された時点で一度だけ評価され、その後のプロセス内の環境変更は反映されません。なおこの読み取りは `STRATA_HC_Q8` が有効で、GGUF shard を走査する分岐に入った場合にだけ行われます（`src/core/native_dense.cpp:323-328`）。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP native dense | false | 先頭文字が `1`（例: `1`, `1foo`） | 空文字、`0`, `true`, ` 1`, `01` など |
+| SYCL native dense | false | 先頭文字が `1`（例: `1`, `1foo`） | 空文字、`0`, `true`, ` 1`, `01` など |
 
 ## 有効になる条件
 
-- `NativeDense::load()` が実行されること。エンジンでは `--native-dense-gguf` を指定する経路でロードされます（`src/program/generate.cpp:1878,3028-3031`）。
-- `STRATA_HC_Q8` が先頭文字 `1` で有効になっていること。こちらが無効なら inject 変数の判定・処理まで到達しません（`src/core/native_dense.cpp:40-43,323-328`）。
-- shard に `hc_q8_name()` が認める F32・2次元テンソルがあること。F32 からの変換対象は `blk.*.hc_attn_inject.weight` と `blk.*.hc_ffn_inject.weight` に該当する名前です。`output_hc_down/up.weight` は関数が名前として許可しますが、`_inject.weight` ではないためこの変数による F32 変換対象ではありません（`src/core/native_dense.cpp:45-51,328-330`）。
-- 対応する weight table entry があり、まだ `hc_q8` コピーが登録されていないこと。行幅 `ne0` は32の倍数で、GGUF shape は weight table の次元と一致する必要があります。違えば load は `native dense (STRATA_HC_Q8): incompatible matrix <name>` で失敗します（`src/core/native_dense.cpp:330-345`）。
-
-既に GGUF に Q8_0（tensor type 8）で格納された hyper-connection projection は、この変数が OFF でも `STRATA_HC_Q8` の処理対象です。この変数が追加する対象は F32 の inject tensor です。
+- `STRATA_HC_Q8` が有効であること。無効なら CUDA/HIP は `hc_q8_env()` の分岐に入らず、SYCL は `hc_q8_requested()` が false となり、この変数による処理は行われない。親スイッチの条件は backend ごとに異なる。CUDA/HIP 共通の判定は先頭文字 `1` で ON、空でない値（ただし完全一致の `auto` を除く）で OFF。HIP では unset / 空 / `auto` が gfx1151・gfx12 で既定 ON（gfx12 は `STRATA_GFX12_DEFAULTS=0` で抑止）。非 HIP の CUDA では unset / 空 / `auto` 自体は OFF だが、通常 generate 経路は Q8_0 hyper-connection を含む GGUF の場合に unset を `1` に設定する（明示設定は保持）。SYCL は値の先頭文字が `1` の場合だけ ON（`src/core/native_dense.cpp:47-85,646-653`; `src/program/generate.cpp:4844-4848`; `sycl/src/core/native_dense.cpp:33-36,393-399`）。
+- native dense のロード対象 GGUF に、名前が `hc_q8_name()` の対象で、型が F32 (`tensor.type == 0`)、名前末尾が `_inject.weight`、2 次元の tensor があること。その他の型・名前・次元の行列はこの変数では追加コピーされない（`src/core/native_dense.cpp:96-102,503-508`; `sycl/src/core/native_dense.cpp:38-44,393-399`）。
+- CUDA/HIP では stage-local のフィルターが既定で有効で、別 stage またはロード範囲外の層はコピーを飛ばす。`STRATA_HC_Q8_ALL_STAGES=1` はこの stage-local 判定を無効にする（`src/core/native_dense.cpp:86-89,509-515`）。SYCL 側の該当ロードにはこのフィルターがない。
+- BF16 pack 側で行う Q8_0 変換ループは down/up projection のみを対象とし、injection 行列を対象にしない。そのため、この変数が扱うのは F32 injection tensor が GGUF のロード対象にある場合であり、BF16 pack の injection 行を Q8_0 化する条件ではない（`src/core/native_dense.cpp:539-571`）。
+- ソース上、この判定に CLI 引数やサーバーモード固有の分岐はない。native dense `load` を通る経路で共通に評価される。
 
 ## 実行時の詳細
 
-有効時は各32要素ブロックについて最大絶対値を127で割った scale を作り、scale を half にして、各値を scale で割って `lround` した int8 にします。34 byte/ブロックの Q8_0 データを CUDA device memory に割り当ててコピーし、該当 weight の `hc_q8` として登録します。割り当て・転送に失敗すると load は `native dense (STRATA_HC_Q8) upload <name>` のエラーで失敗します（`src/core/native_dense.cpp:53-87,336-347`）。
+CUDA/HIP では `hc_q8_inject_env()` の初回呼び出し時に環境を読み、結果を `static const bool` に保存する。呼び出し元は容量見積もり `weight_bytes_for()` と実ロードの両方にあるため、親スイッチが有効なら容量見積もり時にこの値が初期化され得る。SYCL では親スイッチが有効で GGUF tensor 走査に入ったとき、最初のループで値を static cache する。いずれも同一プロセス内での後からの環境変更は反映されない（`src/core/native_dense.cpp:92-95,220-244,503-508`; `sycl/src/core/native_dense.cpp:393-399`）。
 
-Verifier は hyper-connection の fused read 引数にこのポインタを渡します（`src/core/verify.cpp:1053-1072`）。down/up の Q8 コピーが両方そろっていれば CUDA 側は Q8 read kernel を起動し、inject の Q8 コピーがある場合はその行も Q8_0 から読みます。ポインタがない場合は pack の BF16 inject 重みを使います（`src/kernels/cuda/fused_gr.cu:1377-1383,1855-1863`）。つまり有効化により注入 projection の重み表現が変わり、演算結果に影響し得ます。
+有効時、F32 injection tensor の各要素を `q8_0_of()` で Q8_0 に量子化し、`ne0 / 32 * 34 * ne1` bytes の device buffer にコピーして `WeightRef::hc_q8` に設定する。shape が canonical table と一致しない、または行幅が 32 の倍数でない場合は `native dense (STRATA_HC_Q8): incompatible matrix <name>` を `err` に設定してロードを失敗させる。device allocation / upload が失敗した場合もロードは失敗し、エラー文字列は CUDA/HIP では `native dense (STRATA_HC_Q8) upload <name>`、SYCL では同じ形式になる（`src/core/native_dense.cpp:520-536`; `sycl/src/core/native_dense.cpp:403-429`）。
 
-ソースには有効時の Q8_0 hyper-connection 重み総量を stderr に出す処理がありますが、ログは `STRATA_HC_Q8=1` の表示であり、inject 変換だけの件数・容量は別途出しません（`src/core/native_dense.cpp:377-381`）。`docs/STRIX_HALO.md` は `STRATA_HC_Q8` を既定で有効にしない、丸めが変わる実験設定に列挙していますが、`STRATA_HC_Q8_INJECT` 単独の測定値や品質評価は記載していません（`docs/STRIX_HALO.md:100-115`）。
+CUDA/HIP verify 経路は `WeightRef::hc_q8` を `FusedGrArgs::q8_inject` に渡す。CUDA fused GR kernel はその pointer が null でなければ injection 行を Q8_0 側から読み、null なら injection 行の BF16 側を使う（`src/core/verify.cpp:1602-1613`; `src/kernels/cuda/fused_gr.cu:2023-2036`）。この変更は injection 行列の読み取り表現に関するもので、Strata のソース資料にはこの変数単独の速度・出力差の測定値は見当たらない。SYCL もロードした `hc_q8` を verify 引数へ設定するが、この調査では SYCL kernel 内の消費箇所を特定できなかったため、その先の SYCL 側計算への効果は断定しない（`sycl/src/core/verify.cpp:1141`）。
+
+## ログと測定値
+
+この変数専用のログは確認できなかった。親スイッチが有効な場合、ロード成功時には `strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read` が stderr に出るが、F32 injection コピーだけの有無や個数は表示しない（`src/core/native_dense.cpp:626-628`; `sycl/src/core/native_dense.cpp:480-482`）。CUDA/HIP では `STRATA_MANIFEST` 有効時に injection コピーが manifest の `dense_hc_q8_copy` と型 `F32->Q8_0` で記録される（`src/core/native_dense.cpp:536`）。
 
 ## 根拠
 
-- 環境変数判定と型・名前フィルター: `src/core/native_dense.cpp:323-334`
-- F32 からの Q8_0 変換、device copy、登録: `src/core/native_dense.cpp:53-87,336-347`
-- verify 引数への伝達と CUDA read 経路: `src/core/verify.cpp:1053-1072`, `src/kernels/cuda/fused_gr.cu:1377-1383,1855-1863`
-- 関連設定の資料上の位置づけ: `docs/STRIX_HALO.md:100-115`
+- `src/core/native_dense.cpp:91-102` — 値判定の static cache と対象 tensor 名。
+- `src/core/native_dense.cpp:220-244,503-536` — 容量見積もり、F32 injection 行の選別、変換・転送、エラーと manifest 記録。
+- `src/core/native_dense.cpp:509-515,539-571,626-628,646-653`; `src/program/generate.cpp:4844-4848` — stage filter、BF16 pack の対象範囲、成功時ログ、CUDA の親スイッチ既定設定。
+- `sycl/src/core/native_dense.cpp:393-429,480-482` — SYCL の値判定、変換・転送、エラーと成功時ログ。
+- `src/core/verify.cpp:1602-1613`; `src/kernels/cuda/fused_gr.cu:2023-2036` — CUDA verify から fused GR kernel へ渡す経路と Q8_0 / BF16 選択。
+- `sycl/src/core/verify.cpp:1141` — SYCL verify 引数への `hc_q8` pointer 設定。

@@ -1,34 +1,47 @@
 # `PIP_NO_INDEX`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-Strata サーバーは、strict offline モードで起動したとき、エンジンなどの子プロセスへ渡す環境に `PIP_NO_INDEX=1` を設定します。Strata 自身は親プロセスの `PIP_NO_INDEX` を読み取って分岐せず、値の意味を解釈もしません。これは Strata が子プロセス環境へ設定・転送する変数です。
+Strata 自身がこの変数を読み取って動作を分岐する箇所は確認できない。`serve --offline` が有効なとき、Strata はエンジン子プロセスへ `PIP_NO_INDEX=1` を設定して渡す。通常モードでは Strata はこの変数を設定せず、親プロセスまたは設定ファイル由来の値を環境に残す。Strata が pip の動作やネットワーク要求を直接制御するものではない。`serve/server.py` の `child_env` と `strata_control/offline.py` の `OFFLINE_ENV` が実装箇所である（`serve/server.py:4428-4454`、`strata_control/offline.py:42-59`）。
 
 ## 値と判定
 
-Strata による入力値の parse はありません。未設定、空文字、その他の値を Strata が判定する箇所は見つかりませんでした。`strata_control/offline.py` の `OFFLINE_ENV` 辞書に値が文字列 `"1"` として固定されています（`strata_control/offline.py:44-61`）。
+Strata は `PIP_NO_INDEX` の入力値を parse しない。`--offline` が有効なら既存値やプロファイルの `env` 値を `"1"` で上書きし、無効なら `child_env` はこのキーを特別扱いせず、`os.environ` からコピーした値（または `cfg["env"]` で上書きされた値）をそのまま渡す（`serve/server.py:4431-4448`）。
 
-サーバーの `child_env()` は親環境をコピーし、設定ファイルの `env` を反映した後、`offline=True` の場合にこの辞書を最後に適用します。そのため、親環境やプロファイルに別の `PIP_NO_INDEX` 値があっても、通常の offline 経路では子プロセス向けの値は `"1"` になります（`serve/server.py:3747-3771`）。
+| 条件 | 親環境・設定の値 | Strata が子へ渡す値 |
+|---|---|---|
+| `serve --offline` あり | 未設定、空文字、`0`、任意の文字列 | 常に `1` |
+| `serve --offline` なし | 親環境で未設定、設定 `env` にも指定なし | 未設定 |
+| `serve --offline` なし | 親環境に値あり | その値を維持。ただし設定 `env` に同名キーがあればその文字列値で上書き |
 
-`offline=False` の `serve.server.child_env()` はこのキーを削除も上書きもしません。従って親環境からコピーされた値、または設定ファイルの `env` による値が子環境に残ります。別の `strata_control.offline.child_environment()` helper は offline でない場合に `OFFLINE_ENV` のキーを削除する実装ですが、調査対象内に本番コードからの呼び出しはありません。サーバー本体は `serve.server.child_env()` を使います（`strata_control/offline.py:122-136`、`serve/server.py:9191-9194`）。
+この変数自体に Strata 側の無効値・境界値規則はない。`0`、`true`、空文字なども Strata による判定には使われず、offline モード時は `1` に置き換えられる（`serve/server.py:4440-4448`）。
 
 ## 有効になる条件
 
-- `serve/server.py` の `--offline` CLI フラグが指定されることが条件です。`PIP_NO_INDEX` 自体を CLI 引数や別の環境変数から選ぶ機能はありません（`serve/server.py:9000-9001,9175-9194`）。
-- offline モードでは設定済み MCP サーバー、`before_load` コマンド、またはプロファイルが許可するリモート画像ソースがあると、サーバーは起動前に拒否します（`serve/server.py:9172-9184`; 判定対象は `strata_control/offline.py:139-166`）。
-- 単一エンジン、replica、split serve のいずれの起動経路でも、子エンジンの環境作成に `offline` 状態が渡されます（`serve/server.py:8704-8711,8768-8777,9273-9279`）。OS、GPU backend、モデル状態による `PIP_NO_INDEX` 固有の分岐はありません。
-- offline policy module の import が失敗する例外経路では、`child_env()` は `STRATA_OFFLINE`、`HF_HUB_OFFLINE`、`TRANSFORMERS_OFFLINE` のみ設定し、`PIP_NO_INDEX` は設定しません（`serve/server.py:3768-3777`）。
+- `serve` の `--offline` が有効であること。オプションは `store_true` で、Strata は `a.offline` をエンジン環境の構築へ渡す（`serve/server.py:9985-9986`, `10180-10183`, `10258-10263`）。
+- 製品エンジン経路（`--engine strata`）であること。mock engine の分岐では Strata エンジン子プロセスを起動しないため、この経路で `PIP_NO_INDEX` を渡す処理はない（`serve/server.py:10175-10183`, `10270-10275`）。
+- 対象は Strata が起動するエンジン子プロセスの環境。通常起動に加え、分割エンジンの fallback、replica、split の各起動経路も `child_env(..., offline=offline)` から環境を作る（`serve/server.py:9546-9550`, `9555-9578`, `9625-9645`）。
+- vision encoder を起動する構成でも同じ環境辞書が渡る（`serve/server.py:10208-10209`, `3195-3205`, `3341-3348`）。
+- offline ポリシーモジュールの import に失敗した場合、`child_env` は `STRATA_OFFLINE`、`HF_HUB_OFFLINE`、`TRANSFORMERS_OFFLINE` のみを追加設定する fallback に入り、`PIP_NO_INDEX=1` への上書きは行わない。先に組み立てた親環境または設定値は残る（`serve/server.py:4431-4454`）。通常の配布構成でこの import 失敗が起こるかは、このコードからは確認できない。
+- `--offline` は MCP サーバーや `before_load` コマンドを使うプロファイルを拒否する。さらに offline ポリシーが strict offline と両立しない profile 要件を検出した場合、引数エラーで停止する（`serve/server.py:10162-10173`）。
 
 ## 実行時の詳細
 
-`--offline` は `argparse` がサーバー起動時に読み、設定値は `child_env()` の呼び出しごとに子環境へ反映されます。`PIP_NO_INDEX` の親環境値を読む処理や、その値を cache する処理はありません。`--offline` の有効時には、エンジンの初回起動、replica、split serve の各子起動へ生成した環境が渡されます（`serve/server.py:3747-3771,8704-8711,8768-8777,9191-9194,9273-9279`）。
+Strata サーバーは `child_env` で親プロセス環境をコピーし、プロファイルの `env` を文字列化して反映した後、offline の場合は offline 環境一式を最後に適用する。この順序により、offline 時の `PIP_NO_INDEX=1` は親環境やプロファイルで指定した同名値より優先される（`serve/server.py:4431-4448`）。
 
-`--offline` による起動前拒否は argparse のエラー経路で、メッセージに理由を含めます（`serve/server.py:9173-9184`）。`PIP_NO_INDEX` の値を個別にログ出力、警告、終了コードへ結び付ける処理は見つかりませんでした。offline 時の子環境への設定は、`docs/work/IMPLEMENTATION_STATUS.md:849-858` にも記載されており、実装の方針と一致します。
+作成された環境辞書は `StrataEngine` に渡され、エンジン起動時に `popen(..., env=env)` で子プロセスへ渡る。エンジンの再起動用情報にも同じ環境が保持される（`serve/server.py:1101-1103`, `1161-1165`）。vision encoder を起動する場合も、同じ環境（必要な GPU 可視性だけを調整した辞書）が `popen` に渡る（`serve/server.py:4608-4623`, `10208-10209`, `3341-3348`）。この変数について Strata が実行中に再読込する処理や static cache はない。サーバー起動時の環境辞書作成時に値が決まり、後から親プロセス環境を変えても既存の子プロセス環境は変わらない。
+
+## ログと測定値
+
+`PIP_NO_INDEX` の設定値や設定有無を示す専用ログ、警告、終了経路は確認できない。`--offline` の profile 不適合は `argparse` の引数エラーとなるが、これは `PIP_NO_INDEX` の値判定ではなく、offline 機能全体の事前条件である（`serve/server.py:10162-10173`）。関連する測定値はない。
 
 ## 根拠
 
-- 候補名のコード全体検索で、実装上の設定箇所は `strata_control/offline.py:52`、サーバーからの適用箇所は `serve/server.py:3768-3771` でした。`strata_control/offline.py:122-136` に別の子環境 helper がありますが、本番コードの呼び出しはありません。
-- `tests/tuning/test_offline.py:72-80` は helper が offline 時に `PIP_NO_INDEX` を `"1"` にすることを確認し、`packaging/smoke_terminal.py:78-81` はテスト用環境に同値を設定しています。これらはテスト・診断コードであり、独立した実行時の読み取り箇所ではありません。
-- `packaging/acceptance_matrix.py:397` と `docs/work/ACCEPTANCE-EVIDENCE.md:103` にも strict offline の子環境変数として名前が記載されています。いずれも説明資料であり、動作の根拠は上記の実装箇所です。
+- `strata_control/offline.py:42-59` — 子プロセス用 offline 環境に `PIP_NO_INDEX: "1"` を定義。
+- `serve/server.py:4428-4454` — 子環境の生成、プロファイル値の反映、offline ポリシーの上書きと import fallback。
+- `serve/server.py:9985-9986`, `10162-10183`, `10258-10263` — CLI フラグ、profile の事前判定、engine 起動への適用。
+- `serve/server.py:1101-1103`, `1161-1165` — 環境を engine 起動・再起動情報に保持し、子プロセスへ渡す箇所。
+- `serve/server.py:9546-9550`, `9555-9578`, `9625-9645` — fallback、replica、split engine の環境適用箇所。
+- `packaging/smoke_terminal.py:78-80` — 別用途として terminal archive smoke-test の環境に同名キーを固定値で加える箇所。製品の環境読み取りではない。

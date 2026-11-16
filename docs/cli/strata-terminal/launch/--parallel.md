@@ -1,6 +1,6 @@
-# `--parallel`
+# `strata launch --parallel`
 
-調査対象: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,55 +12,43 @@
 
 ## 役割
 
-同時に処理するリクエスト数を指定します。複数の会話を並行して応答させる用途に使います。モデルによって、この値は DeepSeek-V4.1-Flash の会話数、または他モデルの engine slot 数として設定されます。値を省略した場合もモデルごとの通常設定はありますが、DeepSeek-V4.1-Flash は明示指定がなければ逐次応答です（`strata_cli/launch/cmd.py:100,427-429`、`strata_cli/launch/runner.py:1833-1845`）。
+同時に応答を処理するリクエスト数を指定する。値はモデル設定と起動プロファイルに反映され、通常のエンジンでは最大 `N` 件を batch slot で同時に decode し、超えた分は順番待ちにする。全カード split engine が使われる場合は `N` が split の lane 数として扱われる（`strata_cli/launch/cmd.py:97`、`serve/server.py:3983-4010`、`strata_cli/launch/runner.py:1737-1757`）。
 
 ## 使い方
 
-モデルと値を指定して、変更を加えず設定内容を見る例です。
-
 ```sh
-strata launch --model iq3_xxs --parallel 4 --plan
+# 保存済みプリセットの起動時に同時リクエスト数を4にする
+strata launch --preset Office --parallel 4
 ```
 
-`--plan` の表示では、通常モデルは指定値、DeepSeek-V4.1-Flash は予定される会話数と説明が表示されます。計画表示は「Nothing was changed」として終了します（`strata_cli/launch/cmd.py:330-345,930-960`）。
+`--preset` による既存設定を読み込んだ後、コマンドラインで指定した値がその設定を上書きする（`strata_cli/launch/cmd.py:206-212,243-244`）。
 
 ## 値と既定値
 
-- `N` は整数で、1〜8 が有効です。整数に変換できない値は「requests の数ではない」、範囲外は「engine が扱えない」として parser が拒否します（`strata_cli/launch/cmd.py:65-72,100`）。
-- このオプションの既定値は未指定です。設定モデルでは未指定を `None` として扱い、通常モデルの launch は GPU の VRAM に応じた値を profile に設定します。判定表は 32 GiB 以上で4、24 GiB 以上で3、20 GiB 以上で2、それ未満で1です（境界は表の値から0.5 GiBを差し引いた位置）。GPU が利用可能でない場合など、判定できないときは自動値を設定しません（`strata_cli/launch/settings.py:65-75,125`、`strata_cli/launch/runner.py:1840-1847`）。
-- DeepSeek-V4.1-Flash は `--parallel` 未指定なら逐次処理です。値1も同じく逐次処理となり、2〜8で複数会話を要求します（`strata_cli/launch/cmd.py:427-429`、`strata_control/dsv41_parallel.py:39-44,82-83`）。
-- `--preset NAME` と併用した場合、コマンドラインの指定が preset の設定に重なり、その起動に使われます。`--save-preset` を付けない限り、既存 preset の設定値はその指定で書き換えず、使用時刻のみ更新します（`strata_cli/launch/cmd.py:212-218,245-246,1000-1003`）。
+- `N` は整数で、1〜8を受け付ける。整数に変換できない値、範囲外の値は parser が拒否する。別名はない（`strata_cli/launch/cmd.py:63-70,97`）。
+- 省略時の初期値は `None`（カードに合わせる）だが、指定済みプリセットの値は引き継がれる（`strata_cli/launch/settings.py:81-96`、`strata_cli/launch/cmd.py:206-212`）。新規設定で自動選択するときは VRAM に応じて、約20 GB未満で1、20 GBから2、24 GBから3、32 GBから4を選ぶ。境界判定には各段階で0.5 GBの許容幅がある（`strata_cli/launch/settings.py:36-46`、`strata_cli/launch/runner.py:1797-1805,1837-1840`）。利用可能な GPU がない、またはカード情報を取得できない場合、自動値は設定されず、起動プロファイルへ `parallel` override を追加しない。
+- 明示値がカードの自動目安を超えても CLI は拒否せず警告し、起動を続ける。警告は「カードが通常保持できる数」を超える場合に出て、メモリ上の余裕が減り各応答が遅くなり得ると案内する（`strata_cli/launch/settings.py:199-212`）。
 
 ## 実行時の動作
 
-launch は選ばれた設定から run config を作ります。指定値は通常 serving profile の `parallel` override に入ります。サーバーは DeepSeek-V4.1-Flash なら engine 引数 `--parallel N` に、その他の engine なら `--batch N` に変換します。engine args に既に `--batch` / `--slots` がある場合は通常の変換を行いません。全カード split engine の run config では `parallel` を lane 数として既存の `--batch` 値へ反映し、最大8に抑えます（`strata_cli/launch/runner.py:1791-1814`、`serve/server.py:3845-3897`）。
+`strata launch` は `--parallel` を設定に取り込み、起動用 JSON を作成する。通常は `launch-<name>` の共有 profile に `parallel=N` を設定し、その起動で使う host・port とともに override を置き換える（`strata_cli/launch/runner.py:1692-1715,1797-1818`）。通常のエンジンでは Strata server が設定値を `--batch N` に変換し、エンジンへ渡す。`N=1` なら追加の batch 引数を渡さず1件ずつ処理する。エンジンが要求数を扱えない場合、Strata は要求値を渡し、エンジン側の警告・調整に委ねる（`serve/server.py:3983-4010`）。
 
-DeepSeek-V4.1-Flash では、engine は各会話用の attention memory を GPU 上に持ち、複数会話の token をまとめて decode します。追加会話ぶんの VRAM を experts が使える領域から使うため、同時実行中の個々の応答は遅くなることがあります。plan と通常の launch 出力にはこの動作の説明が含まれます（`strata_control/dsv41_parallel.py:1-10,61-74`、`strata_cli/launch/runner.py:2476-2487`、`strata_cli/launch/cmd.py:943-965`）。
-
-通常モデルでは、VRAM から見積もった同時数を超える明示値に警告を出しますが、launch を拒否しません。DeepSeek でも測定条件外の OS・GPU 等には警告を出しますが、これも拒否ではありません。engine は搭載メモリに応じて実際の同時数を減らすことがあります。DeepSeek engine が古く `--parallel` を受け付けないと確認できた場合、launch 側は値を落として逐次処理にし、engine 更新を案内します。engine の capability を確認できない場合は値を落とさず続行します（`strata_cli/launch/settings.py:230-243`、`strata_control/dsv41_parallel.py:77-118`、`strata_cli/launch/runner.py:1757-1770`、`strata_control/dsv41_flags.py:27-49`）。
-
-`--drafting auto` は複数リクエストが並行すると MTP を使い、`--drafting dflash2` は指定した parallel 数で動作します（`strata_cli/launch/cmd.py:104-107`）。ただし、DFlash2 が利用できるモデル等の条件は drafting の選択に依存します。値を省略し DFlash2 の単一リクエスト動作を選ぶ場合、launch が自動設定する parallel override を抑制します（`strata_cli/launch/runner.py:1592-1600,1794-1799`）。
+相互作用として、`--drafting auto` は複数リクエスト同時処理時に MTP を選ぶ動作が parser の説明に記され、runner も parallel 数を drafter 判定へ渡す（`strata_cli/launch/cmd.py:101-104`、`strata_cli/launch/runner.py:1599-1606`）。全カード split engine では `parallel` が lane 数になり、engine 設定内にすでに `--batch` / `--slots` がある構成では profile override を重ねない（`strata_cli/launch/runner.py:1737-1752,1797-1835`）。
 
 ## 適用条件と副作用
 
-- 4枚の Radeon AI PRO R9700 と該当する Qwen3.8-Flash-Next 構成では、ユーザー指定がない場合に専用 profile が parallel 数を補うことがあります。明示した `--parallel` はその自動値を置き換えます（`strata_cli/launch/runner.py:1772-1787`、`strata_control/amd_four_card.py:64-90`）。
-- `--parallel` は launch 用 run config と serving profile の設定に影響します。`--save-preset` を指定した場合はその設定を preset として保存します。preset から起動した場合、保存せずに指定した値はその起動だけの変更です（`strata_cli/launch/runner.py:1689-1694,1791-1814`、`strata_cli/launch/cmd.py:999-1003`）。
-- DeepSeek の古い engine 判定では、対象 engine に `--help` を渡して usage を確認します。調査時点の checkout に含まれるコードと、利用者のインストール済み engine の版は別です（`strata_control/dsv41_flags.py:27-49`）。
+値は launch の設定と共有 profile に書き込まれ、起動時の同時処理数に影響する。実際に使われる slot 数はモデル、カード、engine/backend によって要求値と異なる場合がある。Strata server は要求数が engine の通常上限を超え、分割実行などの条件にも該当しない場合、標準出力へ上限を使う旨を表示する（`serve/server.py:3970-3974,4004-4010`）。調査では動的な実機 slot 数を確認していない。
 
 ## 出力とエラー
 
-- 非整数または1〜8の範囲外は parser error になります（`strata_cli/launch/cmd.py:65-72`）。
-- 通常モデルで GPU の見積もりより大きい値は警告され、起動可能なまま続行します。DeepSeek の測定条件外も警告に留まります（`strata_cli/launch/settings.py:230-243`、`strata_control/dsv41_parallel.py:77-118`）。
-- DeepSeek engine が `--parallel` 非対応と判明したときは、値を使わず逐次処理にする警告を表示します（`strata_cli/launch/runner.py:1757-1770`）。
-- plan は値を含む設定と警告を表示して終了し、設定変更や起動は行いません（`strata_cli/launch/cmd.py:930-960`）。
+- 非整数には「数値を使うか省略」、1〜8の範囲外には「1〜8を使う」という parser エラーが設定される（`strata_cli/launch/cmd.py:63-70`）。この時点で launch の処理には進まない。
+- 指定値がカードの目安を超えると警告を出すが、起動自体は許可する（`strata_cli/launch/settings.py:199-212`）。engine が要求値を調整する場合は server/engine の出力に委ねられる（`serve/server.py:3983-4010`）。
 
 ## 根拠
 
-- Parser と整数・範囲 validation: `strata_cli/launch/cmd.py:65-72,100`。
-- preset と CLI 設定の重ね合わせ: `strata_cli/launch/cmd.py:212-218,239-246`。
-- モデル別の説明・警告: `strata_cli/launch/cmd.py:427-451,461-472`。
-- VRAM 別 default と警告: `strata_cli/launch/settings.py:65-75,230-243`。
-- Run config / profile への反映と旧 DeepSeek engine 判定: `strata_cli/launch/runner.py:1681-1694,1757-1814,1833-1847`。
-- engine 引数への変換と既存 slot 引数の扱い: `serve/server.py:3834-3897`。
-- DeepSeek の同時実行・測定条件・環境別警告: `strata_control/dsv41_parallel.py:17-35,61-118`。
-- DeepSeek engine の capability 確認: `strata_control/dsv41_flags.py:27-49`。
+- `strata_cli/launch/cmd.py:63-70,73-80,97` — 値の変換・範囲 validation、コマンド parser 定義。
+- `strata_cli/launch/settings.py:36-46,81-96,199-212` — 自動値、設定値、VRAM に対する警告。
+- `strata_cli/launch/cmd.py:206-212,243-244` — プリセットへの CLI 値の適用。
+- `strata_cli/launch/runner.py:1692-1715,1737-1757,1797-1842` — 起動設定の保存、split engine の lane 処理、profile override と自動値。
+- `serve/server.py:3970-4010` — `parallel` 設定から engine 引数への変換と上限時の出力。
+- `docs/TERMINAL_LAUNCH.md:96` — 利用者向け説明との照合。値域と既定値の説明は parser と一致する。

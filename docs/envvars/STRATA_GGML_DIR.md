@@ -1,40 +1,50 @@
 # `STRATA_GGML_DIR`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-この名前は Strata のエンジンが実行時に読む設定ではありません。Strata の一部ビルド用シェル／バッチスクリプトが環境変数から llama.cpp の checkout のパスを取り、CMake の `-DSTRATA_GGML_DIR=...` に転送します。CMake 側で定義されているのは環境変数ではなく `PATH` 型の cache 変数です。CMake を直接実行するときは環境に設定するだけでは足りず、`-DSTRATA_GGML_DIR=<checkout>` を指定する必要があります。
+これはエンジン実行時の設定ではなく、Strata のセットアップ／ビルド用プロセスが読む環境変数である。値が有効なら、同梱の `third_party/strata-ggml` の代わりに、指定した llama.cpp checkout 内の `ggml` をエンジンのビルド元にする。ビルドされた後の `strata` がこの環境変数を読んで挙動を変える箇所は見つからなかった。セットアップでは同じ checkout を画像 reader のビルドにも渡す（`setup.py:3805-3819, 6364, 6379-6385`）。
 
-指定した tree は、ビルド対象の ggml ソースとして使われます。主 CMake では `STRATA_NATIVE_EXPERTS` が有効なとき、空なら commit `3cf03257f219afbe7334045ff7c6a06ac68c627d` の llama.cpp を FetchContent し、非空なら `<path>/ggml` を `add_subdirectory` します。CUDA の MMQ trellis instance の有無など、一部ソース選択にも指定 tree のファイルが使われます。SYCL でも `STRATA_NATIVE_EXPERTS` が有効なら同じ cache path を使います。Metal 専用 CMake はエンジンをビルドする場合に checkout を必須とします（`CMakeLists.txt:1898-1901,1908-1910,1955-1967,2099-2124,2135-2145`; `sycl/CMakeLists.txt:178-199`; `metal/CMakeLists.txt:71-89`）。
+設定の核は CMake cache variable `STRATA_GGML_DIR` であり、CMake 自身が同名のプロセス環境変数を自動で読むわけではない。セットアップや packaging script が環境値を読み、`-DSTRATA_GGML_DIR=<path>` に変換している（`setup.py:3805-3814`, `cmake/strata_ggml.cmake:7-13`）。直接 CMake を使う場合は `-DSTRATA_GGML_DIR=...` が必要。
 
 ## 値と判定
 
-値は真偽値や数値に変換されず、パス文字列として転送されます。空文字・未設定の扱いはラッパーごとに異なります。
-
-| 読み取り経路 | 未設定／空文字 | 非空文字列 | 追加の扱い |
+| 読み取り経路 | unset / 空文字 | 設定時に使われる値 | 無効値・結果 |
 |---|---|---|---|
-| `spark/build_engine.sh` | どちらも `$repo/third_party/llama.cpp` を使用 | 指定したパスを使う | `${VAR:-default}` のため空も既定値。`<path>/ggml/CMakeLists.txt` がなければ setup.py の `get_llama_cpp()` を呼び、それでも同じパスに見つからない場合は stderr に `build_engine.sh: no llama.cpp tree at ...` を出して終了コード 2（`spark/build_engine.sh:25,44-47`）。 |
-| `packaging/mac/build_dsv41_engine.sh` | どちらも `$HOME/strata-mac/llamacpp` を使用 | 指定したパスを使う | `${VAR:-default}` のため空も既定値（`packaging/mac/build_dsv41_engine.sh:37,42-45`）。 |
-| `tools/dsv41/build_hip_linux.sh` | 未設定・空なら CMake に渡さない | `-DSTRATA_GGML_DIR=<値>` として渡す | 空判定は `[ -n ... ]`。パスの存在確認はこのスクリプトではしない（`tools/dsv41/build_hip_linux.sh:9,16,19-25`）。 |
-| `tools/dsv41/win/build_hip_win.bat`, `tools/hip/build_windows.bat` | 未定義なら CMake への `-D` 指定を省略 | `-D` に渡す。vision 用 llama path にも利用 | Windows の `\` を `/` に置換。HIP ビルド用 `build.ninja` がすでにあると CMake の再構成を省略する（`tools/dsv41/win/build_hip_win.bat:32-41`; `tools/hip/build_windows.bat:69-80,87-105`）。 |
-| `packaging/build_vision_windows.bat` | 未定義なら `%SRC%\third_party\llama.cpp` を設定 | 指定したパスを使う | 空は未定義と同様。`\` を `/` に置換し、`tools/mtmd` がなければメッセージを出して終了コード 1。CMake へは `STRATA_GGML_DIR` でなく vision 用 `LLAMA_DIR` として渡す（`packaging/build_vision_windows.bat:16,37-40`）。 |
-| `packaging/build_dsv41_windows.bat` | 未定義または空なら `set STRATA_GGML_DIR to the llama.cpp checkout` を表示して終了コード 2 | CMake の `-DSTRATA_GGML_DIR` に渡す | 事前のディレクトリ検証はこのスクリプトにない（`packaging/build_dsv41_windows.bat:5,11-20`）。 |
+| `setup.py` のセットアップ | helper は `os.environ.get` の結果が空なら `None` を返し、同梱 ggml を使う | 値を `Path` にし、その直下に `ggml/CMakeLists.txt` が存在すればその checkout を返す | 空でないがそのファイルがない値も `None` になり、同梱 ggml へ黙って fallback（`setup.py:3805-3814`）。文字列の列挙値・大小文字・数値変換はない |
+| Linux/macOS shell packaging（CUDA・SYCL・Metal・Spark） | `${STRATA_GGML_DIR:-}` を使うため未設定と空文字は同じ。SYCL はその場合 `LLAMA_CPP` に fallback | 空でない文字列を `-DSTRATA_GGML_DIR=...` として CMake に渡す。SYCL は `STRATA_GGML_DIR` が空でない場合 `LLAMA_CPP` より優先（`packaging/build_cuda_linux.sh:36, 41-43`; `packaging/build_sycl_linux.sh:46-50`; `packaging/mac/build_engine.sh:49-50, 64`; `spark/build_engine.sh:26-27`） | checkout の存在確認はこれらの shell では行わず、CMake の `add_subdirectory` に渡す。パスとして解決できない場合は configure が失敗する。shell での unquoted 展開のため、空白を含むパスの扱いは保証されない |
+| Windows packaging / HIP build batch | `if defined` が偽なら override 引数を加えない | パスを CMake に渡す。Windows batch は `\` を `/` に置換（`packaging/build_cuda_windows.py:75-76, 173`; `tools/hip/build_windows.bat:71-80`） | Windows の画像 reader build では `tools/mtmd` がないと `llama.cpp with tools/mtmd not found in ... - check STRATA_GGML_DIR` を出して終了する（`packaging/build_vision_windows.bat:38-41`; `tools/hip/build_windows.bat:95-99`）。CUDA Python packaging の engine path には同様の事前検査はない |
+| CMake に直接渡す cache variable | `cmake/strata_ggml.cmake` は空を default にし、同梱 tree を選ぶ | 空でなければその値を ggml root として選ぶ | 文字列の parse・正規化・checkout の版検査はここではしない。ggml subdirectory が使えなければ configure の `add_subdirectory` が失敗（`cmake/strata_ggml.cmake:7-13, 56`）。Metal は事前に確認し、`ggml sources not found in '...' (third_party/strata-ggml, or the -DSTRATA_GGML_DIR checkout)` で fatal error（`metal/CMakeLists.txt:80-84`） |
 
-これらのスクリプトはパスの trim、存在しないパスの共通 fallback、または共通の優先順位を定義していません。空値の扱いを全経路に一般化できません。Windows 系ではパス区切りだけを置換します。
+値に `true` / `false` や数字としての意味はない。setup helper は存在確認を行うが、shell wrapper と CMake の直接指定では同じ事前検証をしない。CLI option が環境変数を上書きする仕組みは確認できなかった。なお `STRATA_CMAKE_EXTRA` を受け取る packaging wrapper では、その文字列も CMake 引数として追加されるが、同名定義が重複した場合の選択はこの環境変数自体の parse 規則ではない（例: `packaging/build_cuda_linux.sh:38-43`）。
 
 ## 有効になる条件
 
-- **主 CUDA/HIP ビルド**: CMake が `STRATA_NATIVE_EXPERTS` 有効の分岐に入った場合、指定した tree の `ggml` をビルドに加えます。未指定なら pinned commit の取得に進みます。値が不正、または `<path>/ggml` がない場合、CMake の configure で `add_subdirectory` が失敗します（`CMakeLists.txt:1908-1910,1955-1967`）。
-- **CUDA の追加 MMQ ソース**: 指定 tree に `ggml/src/ggml-cuda/template-instances/mmq-instance-tqk6.cu` があるか、さらに `mmq-instance-tqp5.cu` があるかで trellis 型の選択が変わります。`STRATA_MMQ_TQ_OVERLAY` 経路では指定 tree または FetchContent tree が overlay の入力になります。これらは CUDA 分岐の configure 時判定です（`CMakeLists.txt:2099-2124,2135-2145`）。
-- **SYCL**: `STRATA_NATIVE_EXPERTS` 有効時に指定 tree を使います。未指定時は CMake が pinned commit を FetchContent します（`sycl/CMakeLists.txt:178-199`）。
-- **Metal**: `STRATA_METAL_ENGINE=OFF` ならその時点で CMake が return し、ggml path を検証しません。有効時は `<path>/ggml/CMakeLists.txt` が存在しないと `STRATA_GGML_DIR='<値>' is not a llama.cpp checkout` の fatal error になります（`metal/CMakeLists.txt:73-89`）。
-- **ビルド用ラッパーに限る**: 上表の各 OS／スクリプトを使う場合のみ環境変数の値を取り込みます。直接の CMake 呼び出し、通常の Strata CLI、サーバー、モデル読み込み処理がこの環境変数を読む実装は見つかりませんでした。
+- Strata のセットアップがソースからエンジンまたは reader を configure するときに有効。既に適合する prebuilt engine を選んでソース build を行わない経路では、この値はその binary を差し替えない（`setup.py:8493-8510`; source build の `llama_override()` 呼出しは `setup.py:6364, 6379-6385`）。
+- CMake の root engine、SYCL、Metal の各 configure が `strata_ggml_resolve()` を呼ぶと、選択された root の `ggml` を subdirectory として構成する（`CMakeLists.txt:17`; `sycl/CMakeLists.txt:201-205`; `metal/CMakeLists.txt:78-84`; `cmake/strata_ggml.cmake:7-13, 56`）。バックエンドの有効化自体は別の build option で決まる。
+- CUDA build では override のファイル構成も条件になる。`ggml-cuda/template-instances/mmq-instance-tqk6.cu` があれば trellis MMQ 型を追加し、さらに `mmq-instance-tqp5.cu` があれば pair-trellis 型を追加する（`cmake/strata_ggml.cmake:59-71`）。それがない場合、CUDA/HIP で overlay option が有効なら、Strata は configure 時に overlay を試みる。上流 ggml の必要ファイルや編集 anchor が合わないと overlay を無効にし、trellis prompt は FP16 経路に残る（`cmake/strata_ggml.cmake:72-100`; `cmake/strata_ggml_tq_overlay.cmake:15-28, 163-167`）。
+- CUDA の `STRATA_MMQ_TAB` は vendored tree では ON にできる一方、override tree では `mmq.cuh` の特定 scheduler 区間の SHA256 が既知値に一致した場合のみ ON となる。不一致時は `STRATA_MMQ_TAB off: mmq.cuh differs from the mirrored scheduler (...)` を configure status に出す（`cmake/backends/cuda.cmake:171-203`）。
+- Windows の packaging reader scripts は画像 reader build 時に override tree 内 `tools/mtmd` を要求する。reader を build しない設定ではそのチェック経路を通らない（`packaging/build_vision_windows.bat:38-41`; `tools/hip/build_windows.bat:92-103`）。
 
 ## 実行時の詳細
 
-値の読み取りは各ビルドスクリプトの実行中に行われ、設定した場合は configure 時に CMake cache へ渡されます。生成バイナリにこの環境変数の値を埋め込んで、エンジン実行時に再評価する処理はありません。ビルドディレクトリの再利用条件にも注意が必要です。`spark/build_engine.sh` は選択したパスを毎回 CMake に渡しますが、HIP の Linux/Windows helper は `build.ninja` があると初回 configure を省略します。Mac の DSV41 helper は実行ファイルがないときだけ configure します。したがってこれらの既存ビルドでは、環境値を変えただけで既存 CMake cache の設定が更新されるとは限りません（`spark/build_engine.sh:58-63`; `tools/dsv41/build_hip_linux.sh:19-25`; `tools/dsv41/win/build_hip_win.bat:32-43`; `tools/hip/build_windows.bat:69-80`; `packaging/mac/build_dsv41_engine.sh:41-47`）。
+環境値を読むのはビルド側である。`setup.py:3808-3809` の `llama_override()` は呼び出しごとに `os.environ.get("STRATA_GGML_DIR")` を行い、static cache は持たない。helper は setup の main build、local engine 再構築、vision build、macOS setup から呼ばれる（`setup.py:3822-3831, 5932-5963, 6364, 6379-6385, 8495`; `metal/setup_mac.py:476`）。プロセス環境を変更してから次の helper 呼出しがあれば新しい値が評価されるが、既に開始済みの CMake configure へ後から変更を反映する処理はない。
 
-Strata の実行時ログ、警告、終了、timeout をこの変数が引き起こす経路はありません。観測される失敗はビルド側です。Windows の vision helper は `tools/mtmd` の不足を表示して終了し、Metal CMake は不正な checkout で fatal error、主 CMake は選択された `<path>/ggml` を configure に追加できないと configure が失敗します。Spark helper は上記の独自エラーを出します。外部 llama.cpp/ggml のビルド内部の挙動はここでは扱いません。
+有効な override は setup で `-DSTRATA_GGML_DIR=<path>` としてエンジン configure に渡され、vision configure では `-DLLAMA_DIR=<path>` になる（`setup.py:3812-3819, 6364, 6379-6385`; `metal/setup_mac.py:139-145, 184-189`）。CMake は非空 cache value を ggml root に採用し、`${root}/ggml` を追加する。unset / 空のときは `${repo_root}/third_party/strata-ggml` が選ばれる（`cmake/strata_ggml.cmake:7-13, 56`）。この選択はビルド時だけであり、ビルド後の生成処理、モデル状態、サーバー request ごとの動作への適用はない。
 
-候補名の全参照を `rg` で確認しました。`CMakeLists.txt`、`sycl/CMakeLists.txt`、`metal/CMakeLists.txt` と setup.py / Metal setup の `-D` 引き渡しは CMake cache 変数の利用であり、環境から値を読む処理ではありません。setup.py と Metal setup は内部で得た `llama` path を渡しています（`setup.py:4821-4827,5944-5949`; `metal/setup_mac.py:126-142`）。`packaging/build_sycl_linux.sh` は別名の `LLAMA_CPP` を受け取り、`packaging/build_hip_linux.sh` は `LLAMA` を受け取ります。これらを `STRATA_GGML_DIR` の読み取りとは数えていません（`packaging/build_sycl_linux.sh:39-45`; `packaging/build_hip_linux.sh:21-25,58-62`）。
+## ログと測定値
+
+- Metal CMake で override tree に `ggml/CMakeLists.txt` がなければ configure を fatal error にする（`metal/CMakeLists.txt:80-84`）。
+- Windows の画像 reader build は `tools/mtmd` がない override path を検出すると、上記のエラー文を出して終了する（`packaging/build_vision_windows.bat:38-41`; `tools/hip/build_windows.bat:95-99`）。
+- trellis MMQ overlay の不一致時は不足ファイルまたは anchor/signature の理由を含む `trellis MMQ overlay: ...: off` / `trellis MMQ overlay off: ...` status を出し、overlay を無効にする（`cmake/strata_ggml_tq_overlay.cmake:25-28, 163-167`）。
+- `docs/DETAILS.md` にこの build override の性能測定値は見つからなかったため、性能値は記載しない。
+
+## 根拠
+
+- `setup.py:3805-3819` — 環境値の取得、checkout 存在条件、CMake/vision への引数化。
+- `setup.py:5932-5965, 6358-6385, 8493-8510` — 再ビルドと prebuilt 選択の経路。
+- `packaging/build_cuda_linux.sh:35-59`, `packaging/build_sycl_linux.sh:42-50`, `packaging/mac/build_engine.sh:49-74`, `spark/build_engine.sh:26-27, 62-69` — POSIX packaging の環境値転送。
+- `packaging/build_cuda_windows.py:68-77, 164-176`, `packaging/build_vision_windows.bat:38-64`, `tools/hip/build_windows.bat:71-80, 92-114` — Windows 経路の転送と reader path check。
+- `cmake/strata_ggml.cmake:7-13, 56-100`, `cmake/backends/cuda.cmake:171-203`, `cmake/strata_ggml_tq_overlay.cmake:20-28, 163-167` — ggml root の選択と CUDA 専用 build 条件。
+- `metal/CMakeLists.txt:74-84`, `sycl/CMakeLists.txt:201-205` — 他 backend の configure 経路と Metal の欠落エラー。

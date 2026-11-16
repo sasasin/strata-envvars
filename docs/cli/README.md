@@ -1,6 +1,6 @@
 # CLI コマンド・オプション索引
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（`2026-11-07` 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## `strata-terminal`
 
@@ -14,10 +14,12 @@
 - [コマンド概要](strata-terminal/serve/README.md)
 - [`--batch-groups`](strata-terminal/serve/--batch-groups.md)
 - [`--batch-telemetry`（alias: `--no-batch-telemetry`）](strata-terminal/serve/--batch-telemetry.md)
+- [`--config`](strata-terminal/serve/--config.md)
 - [`--engine`](strata-terminal/serve/--engine.md)
 - [`--host`](strata-terminal/serve/--host.md)
 - [`--json`](strata-terminal/serve/--json.md)
 - [`--max-queue`](strata-terminal/serve/--max-queue.md)
+- [`--no-batch-telemetry`](strata-terminal/serve/--no-batch-telemetry.md)
 - [`--offline`](strata-terminal/serve/--offline.md)
 - [`--output`](strata-terminal/serve/--output.md)
 - [`--parallel`](strata-terminal/serve/--parallel.md)
@@ -320,6 +322,7 @@
 - [`--engines-unloading`](strata-terminal/drafting/plan/--engines-unloading.md)
 - [`--family`](strata-terminal/drafting/plan/--family.md)
 - [`--mode`](strata-terminal/drafting/plan/--mode.md)
+- [`--model`](strata-terminal/drafting/plan/--model.md)
 - [`--no-split`](strata-terminal/drafting/plan/--no-split.md)
 - [`--output`](strata-terminal/drafting/plan/--output.md)
 
@@ -332,8 +335,10 @@
 - [`--family`](strata-terminal/drafting/fetch/--family.md)
 - [`--if-needed`](strata-terminal/drafting/fetch/--if-needed.md)
 - [`--mode`](strata-terminal/drafting/fetch/--mode.md)
+- [`--model`](strata-terminal/drafting/fetch/--model.md)
 - [`--no-split`](strata-terminal/drafting/fetch/--no-split.md)
 - [`--output`](strata-terminal/drafting/fetch/--output.md)
+- [`--throttle`](strata-terminal/drafting/fetch/--throttle.md)
 
 ### `strata engine` (engine)
 
@@ -1216,55 +1221,6 @@
 - [`--tokens`](strata-engine/qwen36/--tokens.md)
 - [`--vision`](strata-engine/qwen36/--vision.md)
 
-### `strata-dsv41` (optional DeepSeek-V4.1 engine executable)
-
-- [コマンド概要](strata-engine-dsv41/root/README.md)
-- [`--cpu-threads`](strata-engine-dsv41/root/--cpu-threads.md)
-- [`--dspark`](strata-engine-dsv41/root/--dspark.md)
-- [`--dspark-block`](strata-engine-dsv41/root/--dspark-block.md)
-- [`--dspark-conf`](strata-engine-dsv41/root/--dspark-conf.md)
-- [`--dspark-depth`](strata-engine-dsv41/root/--dspark-depth.md)
-- [`--dump-image`](strata-engine-dsv41/root/--dump-image.md)
-- [`--dump-logits`](strata-engine-dsv41/root/--dump-logits.md)
-- [`--encode-image`](strata-engine-dsv41/root/--encode-image.md)
-- [`--eos`](strata-engine-dsv41/root/--eos.md)
-- [`--expert-profile`](strata-engine-dsv41/root/--expert-profile.md)
-- [`--experts`](strata-engine-dsv41/root/--experts.md)
-- [`--gpus`](strata-engine-dsv41/root/--gpus.md)
-- [`--ids`](strata-engine-dsv41/root/--ids.md)
-- [`--images`](strata-engine-dsv41/root/--images.md)
-- [`--layer-split`](strata-engine-dsv41/root/--layer-split.md)
-- [`--max-context`](strata-engine-dsv41/root/--max-context.md)
-- [`--mmap-experts`](strata-engine-dsv41/root/--mmap-experts.md)
-- [`--multi-check`](strata-engine-dsv41/root/--multi-check.md)
-- [`--n`](strata-engine-dsv41/root/--n.md)
-- [`--no-expert-cache`](strata-engine-dsv41/root/--no-expert-cache.md)
-- [`--pack`](strata-engine-dsv41/root/--pack.md)
-- [`--pack-info`](strata-engine-dsv41/root/--pack-info.md)
-- [`--parallel`](strata-engine-dsv41/root/--parallel.md)
-- [`--prefill-chunk`](strata-engine-dsv41/root/--prefill-chunk.md)
-- [`--profile-readonly`](strata-engine-dsv41/root/--profile-readonly.md)
-- [`--profile-run`](strata-engine-dsv41/root/--profile-run.md)
-- [`--reserve-mib`](strata-engine-dsv41/root/--reserve-mib.md)
-- [`--score`](strata-engine-dsv41/root/--score.md)
-- [`--score-out`](strata-engine-dsv41/root/--score-out.md)
-- [`--seed`](strata-engine-dsv41/root/--seed.md)
-- [`--serve`](strata-engine-dsv41/root/--serve.md)
-- [`--size`](strata-engine-dsv41/root/--size.md)
-- [`--spec-eval`](strata-engine-dsv41/root/--spec-eval.md)
-- [`--ssd-cache`](strata-engine-dsv41/root/--ssd-cache.md)
-- [`--ssd-policy`](strata-engine-dsv41/root/--ssd-policy.md)
-- [`--temperature`](strata-engine-dsv41/root/--temperature.md)
-- [`--threads`](strata-engine-dsv41/root/--threads.md)
-- [`--tp`](strata-engine-dsv41/root/--tp.md)
-- [`--verbose`（alias: `-v`）](strata-engine-dsv41/root/--verbose.md)
-- [`--version`](strata-engine-dsv41/root/--version.md)
-- [`--vision`](strata-engine-dsv41/root/--vision.md)
-- [`--vision-lazy`](strata-engine-dsv41/root/--vision-lazy.md)
-- [`--vision-resident`](strata-engine-dsv41/root/--vision-resident.md)
-- [`--vram-experts`](strata-engine-dsv41/root/--vram-experts.md)
-- [`--window`](strata-engine-dsv41/root/--window.md)
-
 ## `strata-split`
 
 ### `strata-split-N` (`src/split/tools/sfnx.cpp`)
@@ -1296,37 +1252,6 @@
 - [`--vram`](strata-plan/root/--vram.md)
 - [`--workspace`](strata-plan/root/--workspace.md)
 
-### `strata-device` (`src/core/device_main.cpp`)
-
-- [コマンド概要](strata-device/root/README.md)
-- [`--list-devices`](strata-device/root/--list-devices.md)
-- [`--selftest`](strata-device/root/--selftest.md)
-
-### `strata-load` (`src/core/load_main.cpp`)
-
-- [コマンド概要](strata-load/root/README.md)
-- [`--chunk-mb`](strata-load/root/--chunk-mb.md)
-- [`--file`](strata-load/root/--file.md)
-- [`--layers`](strata-load/root/--layers.md)
-- [`--no-pin`](strata-load/root/--no-pin.md)
-- [`--stream`](strata-load/root/--stream.md)
-- [`--threads`](strata-load/root/--threads.md)
-
-### `strata-concurrent` (`src/core/concurrent_main.cpp`)
-
-- [コマンド概要](strata-concurrent/root/README.md)
-- [`--cpu-threads`](strata-concurrent/root/--cpu-threads.md)
-- [`--experts`](strata-concurrent/root/--experts.md)
-- [`--file`](strata-concurrent/root/--file.md)
-- [`--gpu-roles`](strata-concurrent/root/--gpu-roles.md)
-
-### `strata-overlap` (`src/core/overlap_main.cpp`)
-
-- [コマンド概要](strata-overlap/root/README.md)
-- [`--experts`](strata-overlap/root/--experts.md)
-- [`--file`](strata-overlap/root/--file.md)
-- [`--tpr`](strata-overlap/root/--tpr.md)
-
 ### `strata-gguf` (`src/artifact/gguf_reader.cpp`)
 
 - [コマンド概要](strata-gguf/root/README.md)
@@ -1336,21 +1261,6 @@
 
 - [コマンド概要](strata-dequant/root/README.md)
 - オプションなし（位置引数のみ）
-
-### `strata-q36ref` (`src/qwen35/q36ref.cu`)
-
-- [コマンド概要](strata-q36ref/root/README.md)
-- [`--act`](strata-q36ref/root/--act.md)
-- [`--ctx`](strata-q36ref/root/--ctx.md)
-- [`--dump-full-logits`](strata-q36ref/root/--dump-full-logits.md)
-- [`--dump-layers`](strata-q36ref/root/--dump-layers.md)
-- [`--dump-logits`](strata-q36ref/root/--dump-logits.md)
-- [`--force`](strata-q36ref/root/--force.md)
-- [`--kernels`](strata-q36ref/root/--kernels.md)
-- [`--model`](strata-q36ref/root/--model.md)
-- [`--n`](strata-q36ref/root/--n.md)
-- [`--tokens`](strata-q36ref/root/--tokens.md)
-- [`--tokens-file`](strata-q36ref/root/--tokens-file.md)
 
 ## `strata-vision`
 

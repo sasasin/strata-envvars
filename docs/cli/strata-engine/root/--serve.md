@@ -1,60 +1,51 @@
-# `strata --serve`
+# `--serve`
 
-調査対象: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数。Terminal CLI の `strata serve` とは別） |
+| コマンド | `strata`（推論エンジン、root） |
 | オプション | `--serve` |
 | 別名 | なし |
 | 値 | 値を取らないフラグ |
 
 ## 役割
 
-モデル等の起動時リソースを読み込んだ後、プロセスを終了させず、stdin からリクエストを受け付ける常駐モードにします。推論結果と状態通知は stdout に出ます。これはエンジン内の stdin/stdout プロトコルを有効にするフラグであり、このオプションだけで HTTP サーバーの待受を開始する実装ではありません（`src/program/generate.cpp:9543-9564,13776-13777`）。
+モデルをロードして一回の生成で終了する通常経路から、エンジンを常駐させて標準入力から複数のリクエストを受けるサーバーモードへ切り替える。常駐中はリクエスト間でモデル等を保持し、GEN/GENI などの行単位プロトコルを処理する。
 
 ## 使い方
 
 ```sh
-strata --pack /path/to/model-pack --serve --spec 4 --prefill auto
+strata <モデル等の通常の起動引数> --serve
 ```
 
-`--pack` は使用するモデル pack、`--spec` は検証ウィンドウ、`--prefill` は prompt 処理 chunk の設定例です。serve 起動時には `--spec` が 2 以上であることと、prefill chunk が正であることが必要です。実際の受理条件は下記「適用条件と副作用」を参照してください（`src/program/generate.cpp:10444-10449`）。
+エンジンの実行ファイル名はビルド・配布環境に依存する。上は必須の通常引数を省略記法で示した例であり、そのまま実行できる完全なコマンドではない。
 
 ## 値と既定値
 
-- 値を取りません。parser は `--serve` を見つけると `o.serve = true` にします。既定値は `false` で、同じ引数を複数回指定しても true のままです（`src/program/generate.cpp:917-918,3364-3368,3585-3587`）。
-- 引数がない場合、serve モードはリクエストごとに prompt token を受け取るため、起動時の `--tokens` を要求しません。内部では sentinel token、`max_new=1`、`stop_eos=true` を設定します（`src/program/generate.cpp:4240-4250`）。
-- `--serve` 自体に値の validation はありません。値を付けたつもりで `--serve something` とすると `something` は別引数として処理され、未知引数なら usage とともに stderr に出て終了コード 2 になります（`src/program/generate.cpp:3755-3760`）。
+値を取らず、指定すると内部フラグ `serve` を `true` にする。省略時は `false` で通常の生成経路になる。同一引数を複数回指定した場合の専用処理はなく、各指定が同じ真値を設定する。parser では引数値の validation を行わない。
 
 ## 実行時の動作
 
-- `--serve` が有効な場合、起動済みのモデル重み・expert arena・VRAM tier を保持したまま、stdin から行単位でリクエストを読みます。通常の text request は `GEN <max_new> <id,id,...>` 形式で、生成 token ごとに `T <id>`、最後に `DONE ...` を stdout に出します。読み込み進捗は `RESUME`、`PP`、`REUSED` などで通知します（`src/program/generate.cpp:9543-9564,13776-13777,15471-15480,16471-16473,19269-19292`）。
-- stdin reader は別 thread で動き、`STOP` は実行中 request の停止フラグを立て、`QUIT` はリクエストループを終了します。入力が閉じられた場合もループを終えます（`src/program/generate.cpp:13499-13558,15200`）。
-- 画像 request の `GENI` は `--vision` が有効な起動でのみ受け付けます。未指定時に `GENI` が来ると `ERR this engine was started without --vision` を stdout に出して、その request を続行しません（`src/program/generate.cpp:13830-13834,15471-15474,15631-15633`）。
-- `--serve` がない通常実行では一回分の token input が必要で、`--tokens` または token file がなければ stderr に必須エラーと usage を出し、終了コード 2 になります（`src/program/generate.cpp:4246-4250`）。
+`--serve` で入力がない場合、通常の `--tokens` 必須条件を通るため、リクエストが prompt を供給する常駐モードでは `--tokens` を省略できる。エンジンは内部で初期 token・生成数を設定し、EOS 停止も有効にする。サーバーループでは標準入力から行単位の要求を読み、生成 token や状態行を標準出力へ返す。生成はリクエスト単位で処理され、ソースコメントの説明では greedy とされている。
+
+このモードは `--spec` が 2 以上、`--prefill` chunk が正数であることを要求する。条件を満たさない場合は `strata serve: needs --spec T and --prefill CHUNK ...` を stderr に出して終了コード 2 で終了する。その他の serve 専用機能や追加条件は他のオプション文書を参照。
 
 ## 適用条件と副作用
 
-- 起動処理で `--spec < 2`、`--prefill` chunk が 0 以下、または graphed hit path の必要な expert cache/profile が満たされない場合は、`strata serve: needs --spec T and --prefill CHUNK ...` を stderr に出して終了コード 2 になります。`--spec` の初期値は Metal build で 2、それ以外では 0 なので、非 Metal の通常 build では明示指定が必要です（`src/program/generate.cpp:848-852,10444-10449`）。
-- 会話 checkpoint は既定で最大 6 個を保持し、parked conversation cache は最大 4 slot です。serve 中の RAM 使用を抑えたい場合などに `--prompt-cache`、`--conversation-cache-mib`、`--conversation-cache-slots` 等で調整できます。`--prompt-cache 0` または `--conversation-cache-slots 0` と正の cache budget が併存すると、cache 無効化の warning が stderr に出ます（`src/program/generate.cpp:922-928,4005-4007`）。
-- `--batch` は serve 専用で、2 slot 未満や同一 GPU の layer split 等の条件では warning を出し batch を無効化します。`--layer-split` は `--serve` が必要で、条件不成立なら stderr に理由を出し終了コード 2 になります（`src/program/generate.cpp:853-856,4047-4057,4092-4097,6853-6859`）。
-- `--remote-expert-opt` も `--serve` が必須で、単独使用は stderr にエラーを出し終了コード 2 です（`src/program/generate.cpp:4466-4469`）。他にも serve 条件を持つオプションがありますが、それら個別の値・副作用は各オプション文書を参照してください。
-- 起動時に model と GPU/CPU 側の実行資源を準備し、終了まで保持します。会話の再利用 checkpoint や、別オプションによる batch slot、layer split、画像 embedding の読み込みも serve 経路の副作用です（`src/program/generate.cpp:9543-9564,13776-13777,15648-15665`）。OS/backend ごとの全 build を実行しての確認はしていません。
+モデルと GPU/ホスト資源をロードしたままプロセスを常駐させ、標準入出力をプロトコル通信に使う。`--serve` 自体が TCP ポートを開く処理は確認できず、ネットワーク受付はこのフラグだけからは導けない。サーバーループ上の要求形式と応答形式は `src/program/generate.cpp` の実装コメントに記載されている。
 
 ## 出力とエラー
 
-- 起動準備完了後、stdout に `READY <max_context> stop` を出します（`src/program/generate.cpp:13774-13777`）。通常 request は token 単位の `T <id>` と完了時の `DONE ...` を出します（`src/program/generate.cpp:18374,18950,19284-19292`）。
-- 不正な request は、たとえば形式不一致なら `ERR expected: GEN ... or GENI ...`、prompt と生成長の合計が context を超える場合は `ERR prompt ... exceeds the context ...` を stdout に出し、その request をスキップします（`src/program/generate.cpp:15471-15474,15726-15729`）。
-- NaN/Infinity を含む logits の window は、その window の token を出力せず `DONE ... nonfinite` として終了し、次の request は token 0 から読み直します（`src/program/generate.cpp:9554-9557,12178-12184`）。
-- `--serve` に固有の数値終了コードは parser にありません。ここに記した起動時 validation は 2、入力不備は常駐中の `ERR` 応答です。GPU 等の実行時障害で終了する全経路の終了コードはこのオプション単体では一律に定まりません。
+サーバー処理では `GEN <max_new> <id,id,...>` のような入力、生成 token ごとの `T <id>`、完了時の `DONE ...`、エラー時の `ERR <message>` などを標準入出力で扱う。`QUIT` はプロセス終了、`STOP` は実行中要求を次の処理点で停止する指示として説明されている。上記は該当する実装コメントで確認できた範囲であり、すべての応答フィールドや全エラー条件を列挙したものではない。
 
 ## 根拠
 
-- option の宣言と既定値: `src/program/generate.cpp:917-918`。
-- parser: `src/program/generate.cpp:3364-3368,3585-3587`。
-- serve 時の起動引数補完と tokens 必須条件: `src/program/generate.cpp:4240-4250`。
-- serve mode 固有の起動 validation: `src/program/generate.cpp:10444-10449`。
-- stdin/stdout 常駐経路と protocol: `src/program/generate.cpp:9543-9564,13499-13558,13774-13777,15200,15471-15480,19269-19292`。
-- 索引上の scope: `docs/cli/README.md` の `strata-engine` → `strata`（エンジン引数）節。Qwen3.6 専用 parser は別の `strata-engine/qwen36/` scope で、本書の対象外です。
+- `src/program/generate.cpp:1056-1057` — `serve` フラグの既定値は `false`。
+- `src/program/generate.cpp:3885` — parser は `--serve` を値なしで受理し、`o.serve = true` にする。
+- `src/program/generate.cpp:4700-4708` — serve 時に入力 token がなければ要求用の初期状態を設定し、serve 以外で token がない場合はエラー・usage を出して終了コード 2。
+- `src/program/generate.cpp:9919-9925` — sampling の通常時出力を serve 経路では抑制。
+- `src/program/generate.cpp:10365-10389` — 常駐エンジンのプロトコルと標準入出力行の説明。
+- `src/program/generate.cpp:11438-11445` — serve 時の `--spec` / `--prefill` 前提条件と失敗時の終了コード。
+- 索引 `docs/cli/README.md:1000-1005,1152` — `strata-engine` の root スコープと `--serve` 文書の登録。

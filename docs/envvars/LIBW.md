@@ -1,42 +1,42 @@
 # `LIBW`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-`LIBW` は Linux AMD (HIP) の配布ビルド用 shell script が、ROCm の library root を指定するために読む環境変数です。`packaging/build_hip_linux.sh` と `packaging/build_dsv41_hip_linux.sh` では CMake に渡す prefix と package 化時の library / kernel data の場所に使い、`packaging/build_split_hip.sh` では split engine 用 CMake の prefix に使います。通常の `strata` / `strata-dsv41` の実行時に読む設定ではありません。
+`LIBW` は Linux/HIP 用 packaging スクリプトが ROCm libraries root を指定する build-time 入力である。未設定または空文字なら `HP`（ROCm devel root）を代わりに使う。指定した root は CMake の prefix 探索パスと、HIP package の共有ライブラリ・rocBLAS/hipBLASLt データ収集元に使われる。エンジンの通常実行時に読み取るコードは見つからず、生成されるバイナリの実行時設定ではない（`packaging/build_hip_linux.sh:11,26-28,55,93-98`、`packaging/build_split_hip.sh:10,19-21,33`）。
 
 ## 値と判定
 
-| 状態 | 3 スクリプト共通の扱い |
-|---|---|
-| 未設定 | `${LIBW:-$HP}` により `HP` を使う |
-| 空文字 | 未設定と同じく `HP` を使う（Bash の `:-` 展開） |
-| 非空の値 | 文字列をそのまま `LIBW` に代入し、パスの存在・形式・内容をこの段階では検証しない |
+両スクリプトとも Bash の `${LIBW:-$HP}` を一度評価してシェル変数 `LIBW` に代入する。`:-` は未設定と空文字の両方で fallback する。文字列を boolean や数値として parse せず、空白除去・パス正規化・存在確認もしない。非空ならその文字列を root として使うため、`0`、`false`、`0anything` もパス文字列として有効扱いになる。大文字小文字は Bash の変数名どおり区別される。
 
-数値変換、正規化、範囲判定、CLI 引数による上書きはありません。`HP` は各スクリプトで必須入力です。`LIBW` が空または未設定の場合の fallback 先であるため、`HP` が未設定なら `set -u` と必須値展開によりスクリプトは `LIBW` の後続処理へ進みません（`packaging/build_hip_linux.sh:22-28`; `packaging/build_split_hip.sh:17-22`; `packaging/build_dsv41_hip_linux.sh:14-20`）。
+| 条件 | unset | 空文字 | 非空の値 |
+|---|---|---|---|
+| `packaging/build_hip_linux.sh` | `$HP` を使う | `$HP` を使う | 指定文字列を使う |
+| `packaging/build_split_hip.sh` | `$HP` を使う | `$HP` を使う | 指定文字列を使う |
+
+`HP` は両スクリプトで必須であり、未設定なら `${HP:?…}` で処理が止まる。`LIBW` による別の値域検査や無効値 fallback はない（`packaging/build_hip_linux.sh:21,26-28`、`packaging/build_split_hip.sh:17,20-21`）。
 
 ## 有効になる条件
 
-- Linux HIP の `packaging/build_hip_linux.sh` を実行すると、常に CMake 用 `HIPDEFS` に `$HP;$LIBW$SYSDEPS` を組み立てます。`VISION_ONLY` が非空なら engine build と library collection はスキップしますが、CPU/GPU vision reader の configure にも同じ `HIPDEFS` を渡すため、`LIBW` は引き続き CMake 引数に含まれます。通常の collection は `VISION_ONLY` が空のときだけです（同:53-63,78-91,97-104）。
-- このスクリプト内で `DSV41=1` と判定されて DSV41 engine を追加 build する場合も同じ CMake prefix と collector の検索先を使います。別の `packaging/build_dsv41_hip_linux.sh` を直接実行する経路では、DSV41 専用 configure と package collection に使われます（`packaging/build_hip_linux.sh:68-76,97-104`; `packaging/build_dsv41_hip_linux.sh:39-50,61-69`）。
-- `packaging/build_split_hip.sh` では split engine の CMake configure に使われます。こちらの script は `set -eu` で実行され、CMake 失敗時は後続の build / 検査へ進みません（同:17-34）。
-
-`SYSDEPS` は `$HP/lib/rocm_sysdeps` が存在するときだけ設定され、prefix 文字列に追加されます。`LIBW` の値が他変数や CLI によって後から選び直される処理はありません。どの CMake module が prefix をどう解釈するかは本変数の Strata 側の処理ではありません。
+- `packaging/build_hip_linux.sh` または `packaging/build_split_hip.sh` を実行する場合にだけ参照される。どちらも Linux/HIP 用 build script で、通常の Strata CLI・server 起動では使われない（`packaging/build_hip_linux.sh:1-5,22-28`、`packaging/build_split_hip.sh:1-3,17-21`）。
+- `HP` が必須である。`LIBW` が未設定または空なら `HP` が libraries root として兼用される。
+- `build_hip_linux.sh` では `LIBW` が CMake の prefix path に入るため、エンジンと HIP vision reader の configure に渡される。`VISION_ONLY` が非空ならエンジン build と後段の package/data collection を飛ばすが、HIP vision reader の configure には引き続き prefix path が渡る（`packaging/build_hip_linux.sh:55,60-70,79-85`）。
+- `build_hip_linux.sh` の通常 packaging 経路では、`$LIBW/lib` が `collect_libs.py` の共有ライブラリ検索先に含まれ、`$LIBW/lib/rocblas/library` と `$LIBW/lib/hipblaslt/library` がデータ収集元になる。`build_split_hip.sh` は CMake prefix path にだけ含める（`packaging/build_hip_linux.sh:93-100`、`packaging/build_split_hip.sh:31-35`）。
+- `LIBW` の root が存在しない、または期待するサブディレクトリを欠く場合の明示的な検査はない。共有ライブラリは他の検索 root から見つかることがあり、データ収集は該当ファイルがなければコピー対象がなくても処理を続ける（`packaging/build_hip_linux.sh:93-99`、`packaging/collect_libs.py:154-180,224-238`）。
 
 ## 実行時の詳細
 
-各 script の起動時に shell parameter expansion で一度読み、以後は shell 変数として使います。実行中に親の環境値を変更して再読込する箇所はありません。Strata の engine 実行ファイルに値を埋め込んだり、起動時に engine へ渡したりする処理は、`LIBW` の参照全体からは確認できません。
+両スクリプトの冒頭で一度 shell parameter expansion され、後続処理は代入済みの値を使う。プロセス実行中に環境側の `LIBW` を変更して再評価する処理や cache はない。
 
-`build_hip_linux.sh` と `build_dsv41_hip_linux.sh` は `LIBW` を含む prefix を CMake に渡し、package collection では `$LIBW/lib` を先頭の `--search` directory として渡します。`build_hip_linux.sh` と `build_dsv41_hip_linux.sh` はさらに `$LIBW/lib/rocblas/library` と `$LIBW/lib/hipblaslt/library` を `--data` 引数として渡します。`build_split_hip.sh` は prefix 以外に `LIBW` を使いません（`packaging/build_hip_linux.sh:28,54-57,98-103`; `packaging/build_split_hip.sh:20-34`; `packaging/build_dsv41_hip_linux.sh:20,40-42,66-68`）。
+`build_hip_linux.sh` では `-DCMAKE_PREFIX_PATH=$HP;$LIBW$SYSDEPS` の一部として CMake configure に渡し、package stage では `$LIBW/lib` を `collect_libs.py --search` に渡す。また rocBLAS/hipBLASLt の data source を `$LIBW/lib/...` として渡す。`build_split_hip.sh` は同様に CMake prefix path を設定する（`packaging/build_hip_linux.sh:52-56,63-65,93-99`、`packaging/build_split_hip.sh:27-35`）。
 
-Strata の shell script は `LIBW` 固有の警告を出しません。`build_hip_linux.sh` / `build_dsv41_hip_linux.sh` では CMake configure と library collection の出力をそれぞれ `cfg*.log` / `collect.log` に送り、コマンドが非 0 なら `build.status` に `ABORT ... failed (rc=...)` を記録して終了します。`build_split_hip.sh` は CMake または後続コマンドの失敗で `set -e` により停止します。無効な path が各外部コマンドでどう扱われるかは、Strata のこの変数処理からは断定できません（`packaging/build_hip_linux.sh:45-48,61-65,101-104`; `packaging/build_dsv41_hip_linux.sh:33-35,46-51,66-69`; `packaging/build_split_hip.sh:17,30-39`）。
+変数は Strata の build artifact の作成元を切り替える入力であり、スクリプトはその値を環境変数として runtime engine に設定する処理をしていない。`build_hip_linux.sh` の configure/build/収集が失敗すると `chk` が build.status に失敗と `ABORT` を記録して終了コード 1 で終了する。CMake ログは `$OUT/cfg.log` 等、collect のログは `$OUT/collect.log` に出る（`packaging/build_hip_linux.sh:44-47,63-68,95-100`）。`build_split_hip.sh` は `set -eu` で、CMake または ninja 等の失敗時にその場で非 0 終了する。`LIBW` 専用の警告文はない（`packaging/build_split_hip.sh:17,31-40`）。
 
 ## 根拠
 
-- `packaging/build_hip_linux.sh:5-18,22-28` — HIP engine package script の入力説明と `LIBW` の fallback。
-- `packaging/build_hip_linux.sh:53-63,78-91,97-104` — CMake prefix の組み立て・reader への適用・`VISION_ONLY` 条件・package collection。
-- `packaging/build_split_hip.sh:10,17-22,26-34` — split HIP script の入力説明、fallback、CMake への引き渡し。
-- `packaging/build_dsv41_hip_linux.sh:8-20,39-50,61-69` — DSV41 HIP script の入力説明、fallback、configure と collection。
-
-候補名 `LIBW` の Strata 内全参照を確認しました。読み取りは上記 3 shell script に限られ、C++ / HIP engine の実行時読み取りは見つかりませんでした。
+- `packaging/build_hip_linux.sh:5-17,21-29` — 対象スクリプトと入力の説明、必須 `HP`、`LIBW` の fallback。
+- `packaging/build_hip_linux.sh:52-68,71-85` — CMake 設定への適用、`VISION_ONLY` 条件、失敗記録。
+- `packaging/build_hip_linux.sh:87-100` — stage/package の条件、`LIBW` 配下の data と共有ライブラリ検索。
+- `packaging/build_split_hip.sh:10,17-35` — `LIBW` の説明、fallback と CMake prefix path への適用。
+- `packaging/collect_libs.py:154-180,224-238` — 検索 root の利用と、指定 data directory 配下にあるファイルのコピー処理。

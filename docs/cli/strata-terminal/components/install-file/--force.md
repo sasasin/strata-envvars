@@ -1,6 +1,6 @@
-# `--force`
+# `strata components install-file --force`
 
-調査対象: Strata commit `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 調査）。調査対象 checkout は `main...origin/main` で、`git status --short --branch` に未コミット変更は表示されませんでした。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,54 +8,54 @@
 | コマンド | `strata components install-file` |
 | オプション | `--force` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。省略時 `False`、指定時 `True` |
+| 値 | 値を取らないフラグ。省略時は `False`。 |
 
 ## 役割
 
-指定したローカル engine package が現在インストール済みの engine より古い場合でも、インストール処理へ進めます。通常は古い package を `current` として扱い、ファイルを変更しません。
-
-このサブコマンドでの `--force` は、更新 feed が記録した「test start に失敗した version」や手動 rollback で飛ばした version の再試行抑止を解除するものではありません。そうした抑止は feed を使う更新経路の判定で、ローカルファイル経路では version の新旧だけを確認します（根拠: `strata_control/updater.py:609-620`, `strata_control/updater.py:1088-1092`, `strata_control/updater.py:1138-1145`）。
+指定したローカルのエンジンパッケージが、現在インストールされているエンジンより古い場合でもインストール処理を続けます。通常は新しい版から古い版へ切り替える操作を拒否するため、意図して旧版へ戻す場合に使います。`--force` を付けてもパッケージの署名・全ファイルの検証、PC との適合確認、新エンジンのテスト起動は省略されません。
 
 ## 使い方
 
 ```sh
-strata components install-file ./strata-engine.tar.gz --force
+# 手元のパッケージが現在のエンジンより古い場合も、検証とテスト起動を通して切り替える
+strata components install-file --force /path/to/engine-package.tar.gz
 ```
 
-位置引数 `file` には手元にダウンロードした engine package を指定します。parser の説明は `.tar.gz` または `.zip` を示しますが、実装は `.tgz` と `.tar.xz` も形式名として受け付けます（`strata_cli/update_cmd.py:59-61`, `strata_control/updater.py:1080-1085`）。
+このコマンドは実際にエンジンをインストールして次回起動時の使用対象を切り替える操作です。ファイル名の拡張子は `.tar.gz`、`.tgz`、`.tar.xz`、`.zip` をソースが受理します。位置引数 `file` は必須です。
 
 ## 値と既定値
 
-`argparse` の `action="store_true"` で宣言されるため値は不要です。既定値は偽で、フラグを付けると真になります（`strata_cli/update_cmd.py:30-39`, `strata_cli/update_cmd.py:59-62`）。
+`--force` は `argparse` の `store_true` フラグで、値を取りません。指定しない場合は偽です。同じフラグを複数回指定しても真のままで、値の範囲検証はありません（`strata_cli/update_cmd.py:47-56,92-95`）。
+
+ローカルパッケージの版がインストール済みエンジンより古いとき、フラグなしでは状態 `current` と「何も変更しなかった」旨を返して処理を終えます。フラグが真ならこの拒否分岐を通過し、テスト起動と切り替えへ進みます。インストール済みエンジンがない場合や、パッケージの版が同じか新しい場合、この版比較による拒否はもともと発生しないため、`--force` による追加の効果はありません（`strata_control/updater.py:1385-1392`）。
 
 ## 実行時の動作
 
-CLI はこの値を `updater.Context.force` に渡し、`install_engine_file()` を呼びます（`strata_cli/update_cmd.py:193-195`, `strata_cli/update_cmd.py:208-216`）。インストール済み engine の version がローカル package より新しいとき、`--force` なしでは `status="current"` を返して処理を終えます。`--force` があればこの比較による早期終了をせず、通常の install 経路へ進みます（`strata_control/updater.py:1138-1145`）。
+CLI は `--force` を `Context.force` に渡し、`install_engine_file` がインストール済みエンジンの版とパッケージの版を比較します（`strata_cli/update_cmd.py:310-317,335-340`、`strata_control/updater.py:1385-1392`）。許可された場合、ステージ領域に展開したパッケージをテスト起動し、成功後に切り替えます。以前のエンジンは保持され、切り替え履歴やエンジン状態も更新されます（`strata_control/updater.py:1242-1245,1249-1273,1304-1321`）。
 
-`--force` を付けても、package の展開、manifest の読み込み、信頼済み鍵による署名確認、全ファイルの整合性確認、現在の PC との適合性確認は行われます。その後も stage 上の engine を test start し、成功してから切り替えます。従ってこのフラグはこれらの検証や test start を省略しません（`strata_control/updater.py:1102-1132`, `strata_control/updater.py:994-1006`）。
+このコマンドは渡されたローカルファイルを使い、フィードからのパッケージ取得はしません。アーカイブは処理後も選択元に残ります（`strata_control/updater.py:1335-1338,1392`）。`--force` は `.updates` 等の状態や署名・ハッシュ検証を無効化するものではなく、旧版拒否の条件だけに作用します（`strata_control/updater.py:1357-1379,1385-1392`）。
+
+共通 parser のヘルプ文字列は「テスト起動に失敗した版、または rollback 済みの版を再試行」と説明しますが、`install-file` の処理では `force` が参照されるのは上記の新旧版比較だけです。フィード更新側の再試行条件（`strata_control/updater.py:1193-1204`）はこのコマンドの処理経路では使われません（`strata_cli/update_cmd.py:53,335-340`、`strata_control/updater.py:1335-1392`）。
 
 ## 適用条件と副作用
 
-- 作用する条件は、インストール済み engine があり、その version が指定ファイルの version より新しい場合です。同じ version または新しい package について、この比較を理由にした拒否はありません（`strata_control/updater.py:1138-1145`）。
-- install は components directory の update lock を取得して行われます。稼働中 engine があれば `_maybe_wait()` の確認後に idle を待ち、待ち時間内に停止しなければ `Busy` で失敗します。`--force` は稼働中 engine の置換を許可しません（`strata_cli/update_cmd.py:208-212`, `strata_cli/update_cmd.py:258-273`, `strata_control/updater.py:306-317`, `strata_control/updater.py:71-81`）。
-- 成功時は新しい engine を active にし、以前の engine を rollback 用に保持し、更新履歴と state を保存します。必要な tuning preset は再確認対象としてマークされます。指定した archive 自体は削除されません（`strata_control/updater.py:1023-1077`, `strata_control/updater.py:1088-1092`, `strata_control/updater.py:1142-1148`）。
-- 検証や test start に失敗した場合は切替を完了せず、stage directory を片付けます。test start 失敗は busy に起因しない限り失敗理由を state に記録します（`strata_control/updater.py:1001-1022`, `strata_control/updater.py:1076-1077`, `strata_control/updater.py:1146-1148`）。
+- ローカルの指定ファイルが存在し、認識されるアーカイブ形式である必要があります。展開後、マニフェスト、信頼鍵による署名、全ファイルのサイズ・SHA-256、実行ファイルの実行可能性を確認し、対象 PC の platform/backend/driver 等に適合しなければ拒否します（`strata_control/updater.py:1327-1342,1350-1379`、`strata_control/engine_component.py:385-411,439-465`）。
+- インストールにはコンポーネント領域の空き容量と、エンジンが使用中でないことも関係します。`--wait` があれば待機し、対話端末では稼働中エンジンを待つか確認します。機械出力・非対話では待つ確認をせず、稼働状況により拒否されます。`--force` は待機・稼働中チェックを回避しません（`strata_cli/update_cmd.py:310-317,335-340,473-488`、`strata_control/updater.py:72-83,1249-1273`）。
+- 成功時はエンジン状態・履歴が更新され、次の起動で新しいエンジンが使われます。旧版の導入も通常のテスト起動に通す必要があり、テスト失敗時は現在のエンジンを維持し、失敗理由を記録します（`strata_control/updater.py:1250-1270,1304-1321`）。
 
 ## 出力とエラー
 
-成功時、既定の human 出力は結果の note または engine 更新結果を表示します。`--output json` は結果を JSON で出力し、`--output jsonl` は処理 phase 等の event と最終結果を JSON Lines で出力します（`strata_cli/update_cmd.py:65-87`, `strata_cli/update_cmd.py:208-216`）。
+成功時、人間向け出力では結果の要約を表示します。`--output json` または `--output jsonl` では成功結果を JSON で出力します（`strata_cli/update_cmd.py:301-307,339-344`）。失敗時、人間向けでは `strata: ...` を標準エラーへ出し、JSON 系出力では `ok: false` とエラー情報を標準出力へ出します（同 `:303-308,368-378`）。
 
-`UpdateError` は human 出力では `strata: ...` を stderr に出し、JSON/JSONL 指定時は error object を出します。package 不在、形式不正、署名・整合性・PC 適合性の拒否は終了コード 5、稼働中 engine 等による busy は 7 です。test start の失敗は終了コード 6 です（`strata_cli/update_cmd.py:174-183`, `strata_cli/update_cmd.py:246-255`, `strata_control/updater.py:60-81`, `strata_control/updater.py:85-128`, `strata_control/updater.py:1080-1085`, `strata_control/updater.py:1092-1132`）。
+たとえばファイル不在、形式不正、署名・ファイル検証失敗、PC 不適合は終了コード 5、テスト起動または切替検証の失敗は 6、稼働中エンジンによる拒否は 7 です。これらの検証や終了条件を `--force` が緩和することはありません（`strata_control/updater.py:61-83,1303-1303,1340-1369,1377-1379`）。
 
 ## 根拠
 
-- parser と共通 option 宣言: `strata_cli/update_cmd.py:30-39`, `strata_cli/update_cmd.py:57-62`
-- 引数から context への伝搬、install-file の dispatch と出力: `strata_cli/update_cmd.py:174-195`, `strata_cli/update_cmd.py:208-216`
-- install-file における force の実際の判定: `strata_control/updater.py:1088-1145`
-- 検証と検証失敗の扱い: `strata_control/updater.py:1102-1132`
-- test start、切替、state 保存、stage cleanup: `strata_control/updater.py:994-1077`
-- test start 失敗の説明と終了コード: `strata_control/updater.py:85-128`
-- engine 稼働中の待機と busy 経路: `strata_control/updater.py:71-81`, `strata_control/updater.py:306-317`, `strata_cli/update_cmd.py:258-273`
-- feed 更新側の失敗済み・rollback 済み version 判定との違い: `strata_control/updater.py:609-620`, `strata_control/updater.py:964-975`
-
-調査範囲は指定 revision の Terminal CLI parser と、それが呼び出す updater 実装です。実際の archive を用いたインストールや各 OS/backend での動作確認は行っていません。
+- `strata_cli/update_cmd.py:47-56` — 共通オプション parser。`--force` の `store_true`、既定値、共通ヘルプ。
+- `strata_cli/update_cmd.py:92-95` — `install-file` が位置引数と共通オプションを登録する箇所。
+- `strata_cli/update_cmd.py:303-317,335-344,368-378` — `Context.force` への受け渡し、ローカルパッケージ処理の呼び出し、成功・失敗出力。
+- `strata_cli/update_cmd.py:473-488` — 稼働中エンジンと `--wait`・対話確認の関係。
+- `strata_control/updater.py:1327-1395` — 対応アーカイブ形式、展開・署名/全ファイル検証、PC 適合確認、旧版拒否条件、force によるその条件の解除、元ファイル保持。
+- `strata_control/updater.py:1242-1324` — テスト起動、切り替え、失敗時の記録、旧エンジン保持、成功後の状態更新。
+- `strata_control/engine_component.py:385-411,439-465` — 署名検証とファイルの完全性検証。
+- `strata_control/updater.py:1193-1204` — フィード更新における別の `force` 再試行条件。`install-file` の経路とは区別。

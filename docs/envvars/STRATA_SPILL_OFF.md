@@ -1,47 +1,63 @@
 # `STRATA_SPILL_OFF`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-GPU メモリが足りないときに `generate` が自動で選ぶ、prompt 用バッファの小型化・独立確保と、出力 head を後から pinned host memory に移す処理を抑止します。名前に `OFF` とありますが、値を boolean や数値として解釈するのではなく、環境変数が存在するかだけを見ます。設定すると、値が `1` でなくても、空文字でも、これらの自動退避経路の条件が成立しません。
+`src/program/generate.cpp` の `generate` 起動準備で、VRAM 不足時に Strata が自動で行う一連の spill walk（GPU 上の配置やキャッシュを小さくする処理）の一部を止める。実装は `std::getenv("STRATA_SPILL_OFF") == nullptr`、つまり値ではなく環境変数の設定有無で判定する。設定すると自動 fallback を行わないため、同じメモリ不足が残り、既存の失敗経路に進むことがある。これは GPU spill の自動調整を制御するもので、明示指定の `--trim-stage-weights` / `STRATA_STAGE_TRIM` などを一律に無効化するスイッチではない（`src/program/generate.cpp:5461-5475`, `5701-5731`）。
 
-この変数は GPU メモリ退避全般のマスター設定ではありません。たとえば MTP draft layer をロード前に外す処理（`src/program/generate.cpp:6721-6740`）にはこの変数の判定がなく、native head の初回 GPU allocation 失敗時に host memory を試す処理（`src/core/native_head.cpp:61-84`）も `STRATA_SPILL_OFF` を参照しません。
+対象になる主な自動調整は次のとおり。
+
+- `--layer-split auto` で空きの足りない GPU を split から外す処理（`src/program/generate.cpp:4519-4539`）。
+- layer split の重み trim と、auto split の早期 trim（`src/program/generate.cpp:5477-5485`, `5698-5729`）。
+- split の配置を開始できない場合に KV window を小さくして再探索する処理（`src/program/generate.cpp:7080-7100`）。
+- キャッシュが小さい場合に prompt buffer の借用で残す cache slot 数を減らす処理（`src/program/generate.cpp:8622-8640`, `9335-9350`）。
+- 単一 GPU の自動 cache が小さい場合に prompt path 用の独立 buffer と小さい chunk を選ぶ処理、および cache に空きがない場合に output head を pinned host memory に移す処理（`src/program/generate.cpp:8668-8696`, `8698-8725`）。
+- layer split の head 保持 GPU で cache の余地が足りない場合に output head を pinned host memory に移す処理（`src/program/generate.cpp:9222-9237`）。
+- multi-GPU split で MTP / DFlash2 drafter を外す spill walk（`src/program/generate.cpp:7646-7678`）。ただし、単一 GPU の MTP drafter 判定は別条件で残る（後述）。
+
+いずれも `generate.cpp` 内で GPU の空き容量やモデル配置を調べる初期化中の分岐であり、推論 token の選択を直接変更する処理ではない。spill 判定は Metal build と integrated GPU では許可されず、CUDA/HIP 互換 API から discrete GPU と判定された場合に限られる（`src/program/generate.cpp:306-319`, `include/strata/core/spill_gate.hpp:8-14`）。
 
 ## 値と判定
 
-| 設定状態 | 判定 | 結果 |
-|---|---|---|
-| 未設定 | `std::getenv(...) == nullptr` | 下記条件がそろえば自動調整・退避を許す |
-| 空文字 | 非 null | 3 つの自動経路を抑止 |
-| `0`、`1`、その他の文字列 | 非 null | 3 つの自動経路を抑止 |
+| ビルド / 実行条件 | unset | 設定時に有効になる値（spill を止める） | 無効になる値（spill を止める） |
+|---|---|---|---|
+| 全条件 | `getenv` が `nullptr`。他の条件を満たせば spill walk の各分岐を評価する | 値の内容を問わず、環境変数が存在すれば該当分岐を止める。例: 空文字、`0`、`1`、`false`、空白 | 該当なし。文字列 parse や値の妥当性検査はない |
 
-数値変換、文字列比較、範囲検査、無効値時の fallback はありません。各判定は `generate` の自動 cache sizing 部分で直接 `getenv` し、環境変数の値を static cache しません。GPU が discrete かを調べる `spill_discrete_gpu()` の結果は別途 `static const bool` に保存されます（`src/program/generate.cpp:271-283,7604-7605,7651-7652,7680-7681`）。
+したがって `STRATA_SPILL_OFF=0` も spill を止める。大文字小文字、数値境界、負値の規則はなく、文字列を比較・変換しない（`src/program/generate.cpp:4521`, `5483`, `5703`, `7083`, `7654`, `8627`, `8674`, `8703`, `9225`, `9339`）。
 
 ## 有効になる条件
 
-環境変数が未設定でも、次の各経路の条件を満たす場合だけ処理されます。明示的な `STRATA_SPILL_OFF` の値は、各条件式の該当経路を止めます。
-
-| 経路 | `STRATA_SPILL_OFF` 以外の主な条件 | 設定時の扱い |
-|---|---|---|
-| prompt の slot loan を縮めて cache を保つ | `--prefill` の chunk が正、prefill が cache を借りる、prefill auto、cache が必要 slot 数未満、reserve 未指定、単一 GPU で layer split なし、discrete GPU。可能な場合は keep 数を 128 から 16 にし、再計算した cache slot 数を使う | loan 縮小を行わず通常の条件判定を続ける（`src/program/generate.cpp:7600-7618`） |
-| prompt path 自前の小さい buffer と小さい cache に切り替える | auto cache、prefill が借用可能かつ auto、reserve 未指定、cache が必要 slot 数未満、単一 GPU で layer split なし、expert profile がある、discrete GPU。1024/512/256-token chunk を試し、少なくとも 1 cache slot が取れると選ぶ | 切り替えず、cache が足りない状態なら後続の不足処理へ進む（`src/program/generate.cpp:7646-7674`） |
-| native output head を後から pinned host memory に移す | cache が 0、native head がロード済みでまだ host 上でない、reserve 未指定、単一 GPU で layer split なし、`STRATA_HEAD_HOST_OFF` も未設定、discrete GPU | `to_host()` を試さず、cache が 0 の不足処理へ進む（`src/program/generate.cpp:7676-7704`） |
-
-`spill_discrete_gpu()` は Metal build では常に false です。それ以外では CUDA 互換 API から現在 device の属性を取り、取得失敗時は false、integrated GPU では false、discrete GPU では true になります。そのためこの自動調整は Metal と integrated GPU（APU 等）では実行されません（`src/program/generate.cpp:271-283`; 判定関数: `include/strata/core/spill_gate.hpp:8-14`）。SYCL 実装の `sycl/src/program/generate.cpp` にはこの環境変数名の参照がありません。
+- 変数が **unset** で、かつ個々の spill walk の条件が揃うと、自動調整候補が実行される。設定済み（空文字を含む）なら、明示指定や他条件による処理を除き、その候補は飛ばされる。
+- ほとんどの spill walk は `spill_discrete_gpu()` が true の場合だけ動く。Metal build では常に false、非 Metal では GPU device property を一度調べ、integrated GPU なら false、discrete GPU なら `strata::spill_allowed(false, ...)` が true となる（`src/program/generate.cpp:306-319`, `include/strata/core/spill_gate.hpp:8-14`）。GPU 情報取得に失敗した場合も false。
+- 利用モードや設定が個々の分岐を制限する。たとえば GPU を減らす処理と早期 trim は `--layer-split auto` が必要（`src/program/generate.cpp:4521`, `5483-5485`）。KV window の再探索は split auto の初回探索が配置を見つけられない場合だけ（`src/program/generate.cpp:7080-7095`）。
+- trim walk は `trim_user_asked` が false で、`STRATA_STAGE_TRIM=0` でも `STRATA_SPLIT_EARLY_OFF` でもないことが条件。明示的な `--trim-stage-weights` / `STRATA_STAGE_TRIM` による trim は `STRATA_SPILL_OFF` の getenv 判定を通らず、別ルールで適用される（`src/program/generate.cpp:5461-5475`, `5483-5485`, `5703-5704`）。
+- 単一 GPU の cache / prompt buffer / head 調整は、cache が不足していること、自動 cache などの条件、未指定の reserve など各分岐の条件が必要。output head の host 移動はさらに `STRATA_HEAD_HOST_OFF` が unset であることが必要（`src/program/generate.cpp:8622-8627`, `8668-8675`, `8702-8704`）。split 側の host 移動には `STRATA_HEAD_HOST_OFF` unset、reserve 未指定、cache の余地不足が必要（`src/program/generate.cpp:9222-9226`）。
+- split の MTP / DFlash2 退避は `split_walk_drafter` にこの変数の unset 判定を一度格納しており、変数設定時は multi-GPU split での該当処理を止める。一方、単一 GPU の MTP 退避は `(!multi_gpu && stages.empty())` の別枝で評価され、`STRATA_SPILL_OFF` を見ない。従って設定しても、discrete GPU・MTP・`STRATA_MTP_KEEP` unset などの条件が揃えば単一 GPU の drafter は従来どおり外され得る。DFlash2 はビルド macro `STRATA_HAVE_DFLASH2` の下で別途判定される（`src/program/generate.cpp:7609-7616`, `7646-7678`）。
+- CLI の明示設定は個別分岐に従う。例として `--vram-reserve-mib` 指定時には単一 GPU の cache buffer 変更や host head fallback が止まり、明示 cache/chunk 指定も prompt spill 条件に関わる（`src/program/generate.cpp:8626-8627`, `8672-8675`, `8702-8704`）。
 
 ## 実行時の詳細
 
-1. cache slot 数の初期計算後、cache が必要数より少ない場合に prompt loan 縮小を検討します。成功すれば stderr に `short of GPU memory: the cache ... the loan keeps ...` を出し、必要 slot 数と cache 数を再計算します（`src/program/generate.cpp:7600-7618`）。
-2. 続いて必要 slot 数を満たさない場合、プロファイルに基づき prompt path 独自の buffer を確保できる組合せを探します。見つかれば stderr に `the prompt path keeps its own ... more is read from RAM and the SSD, expect it to be slower` と出し、cache、reserve、prefill chunk を更新します。変数が設定済みならこの fallback は行いません（`src/program/generate.cpp:7646-7674`）。
-3. さらに cache が 0 なら、条件付きで native head を pinned host memory に移して cache を再計算します。成功時は stderr に `the output head ... moves to pinned host memory ... decode is slower`、失敗時は `the output head stays in VRAM (...)` と出します。`STRATA_SPILL_OFF` が設定されている場合、この試行自体が省かれます（`src/program/generate.cpp:7676-7704`）。
-4. 上記の調整後も cache が 0 の場合は stderr に `no VRAM is left for the expert cache` と、必要 slot 数・不足量・対処案を出します（`src/program/generate.cpp:7705-7725`）。この変数専用の警告や終了処理はありません。自動退避を抑止した結果として起動不能になるかは、後続の初期化経路によります。
+候補名の全参照は `src/program/generate.cpp` にあり、同ファイルの直接 `getenv` 判定 10 箇所と、コメント中の説明を確認した。値を helper に動的に渡す経路はない。helper `spill_discrete_gpu()` 自体は GPU 種別を判定するだけで、この環境変数は読まない（`src/program/generate.cpp:306-319`）。設定値は parse されず、各 spill 判定地点で `getenv` が呼ばれるため、対象機能のための共通 static cache はない。ただし split drafter 判定は `split_walk_drafter` というローカル bool にその地点で一度格納される（`src/program/generate.cpp:7654-7655`）。
 
-CLI との関係では、3 経路とも `--vram-reserve-mib` が明示されると対象外です。2 番目は `--expert-cache auto` に相当する `auto_cache`、prefill auto と profile を要求します。1 番目は prefill auto と cache 借用を要求しますが `auto_cache` 自体は条件式にありません。layer split / 複数 GPU では各経路が対象外です（`src/program/generate.cpp:7604-7605,7651-7652,7680-7681`）。
+設定時は、たとえば split auto が使える GPU を減らさず、split 配置探索の失敗後も KV window を縮めずに既存の経路へ進む。auto split の探索が最後まで空の場合、stderr に `strata generate: layer split auto: no placement can start the prompt path on the figures here; choosing by decode speed alone` を出して制約なしの再探索を行い、それでも配置がないと `strata generate: --layer-split auto: no valid split for %d GPUs (this model has %lld layers)` を出して return 2 する（`src/program/generate.cpp:7101-7113`）。
+
+単一 GPU で自動 cache が 0 のままなら既存の不足診断に進み、stderr に `strata generate: no VRAM is left for the expert cache: it needs at least ...` を出す（`src/program/generate.cpp:8727-8747`）。この変数自体の専用警告や確認ログはない。環境変数を実行中に変更する経路や子プロセスへの転送は、Strata 所有ソースで確認できなかった。
+
+## ログと測定値
+
+`STRATA_SPILL_OFF` を設定したこと自体を示すログはない。変数を unset にして spill が実行された場合は、条件に応じて「short of GPU memory」等の各処理ログが出る。たとえば GPU を split から除く場合は `src/program/generate.cpp:4532-4537`、cache に余地がなく host head fallback を試みる場合は `src/program/generate.cpp:8721-8725` に文字列がある。設定によって spill を飛ばした場合は、その分岐固有の理由ログは出ない。
+
+`docs/MULTI_GPU.md:224-235` は spill walk の説明と過去の測定例を掲載し、`STRATA_SPILL_OFF=1` で全段階を止めると記す。ただしコードは値を見ず存在だけで判定し、単一 GPU の MTP drafter spill は設定時にも残るため、「every step off」という説明はコード上の全 spill 経路には当てはまらない。測定例は過去の条件付き記録であり、ここでは現行動作の測定値として扱わない。
 
 ## 根拠
 
-- 候補名のコード全体検索で見つかった実行コードの読み取りは `src/program/generate.cpp:7605,7652,7681` の 3 箇所です。コメントにも `src/program/generate.cpp:7650` に記載がありますが、実際の判定根拠は各行の `std::getenv` 条件です。
-- discrete GPU gate と backend / device 判定: `src/program/generate.cpp:271-283`, `include/strata/core/spill_gate.hpp:8-14`。
-- MTP layer の自動除外にこの変数を使わないこと: `src/program/generate.cpp:6721-6740`。
-- native head 初回 upload 時の host fallback と、その別設定: `src/core/native_head.cpp:61-84`。
+- `src/program/generate.cpp:306-319` — discrete GPU / Metal / integrated GPU の spill gate。
+- `src/program/generate.cpp:4519-4539` — layer split auto の GPU 除外。
+- `src/program/generate.cpp:5461-5485`, `5698-5731` — trim の既定値、spill walk trim と明示 trim の区別。
+- `src/program/generate.cpp:7080-7113` — KV window 再探索と split 配置失敗時のログ・終了。
+- `src/program/generate.cpp:7646-7678` — single / multi GPU の drafter spill 判定。
+- `src/program/generate.cpp:8622-8640`, `8668-8725`, `8727-8747` — cache / prompt buffer / head fallback と不足時ログ。
+- `src/program/generate.cpp:9222-9237`, `9335-9350` — split head fallback と cache loan 調整。
+- `include/strata/core/spill_gate.hpp:8-14` — Metal / integrated GPU を spill 対象外にする gate。
+- `docs/MULTI_GPU.md:224-235` — spill walk の説明とコードとの差異を確認。

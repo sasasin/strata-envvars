@@ -1,53 +1,49 @@
 # `STRATA_REPLICA_SHARED_ARENA`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありません。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-Strata の `serve/server.py` が複数 replica engine を起動するとき、各 engine の expert arena を共有する backing object を使うか決めます。共有できれば expert の RAM copy を replica ごとに持たずに済むよう、サーバーが作った arena のパスを各 engine の `--shared-expert-arena` 引数に追加します。環境変数だけでは replica 起動は有効にならず、`--replicas N` または config の `replicas` で少なくとも二つの replica が選ばれている必要があります（`serve/server.py:9038-9041,9261-9275`）。
-
-これは server 側の Python が読む環境変数です。Strata engine にこの環境変数の値を渡して解釈させる実装ではありません。engine へ渡るのは、条件が通った場合の `--shared-expert-arena <path>` 引数です（`serve/server.py:8700-8710`）。
+Strata の serving server が複数レプリカを起動するとき、各エンジンに共有 expert arena のパスを `--shared-expert-arena` として渡すかを選びます。共有が成立すると、最初のエンジンが arena に expert を読み込み、他のエンジンは同じ arena を使うため、expert 用の RAM コピーをレプリカごとに作らずに済みます。これは `serve/replicas.py` の `shared_arena_plan` が行う server 側の判断で、エンジン側の独立した環境変数ではありません（`serve/replicas.py:161-224`、`serve/server.py:9555-9577`、`src/core/expert_source.cpp:6269-6303`）。
 
 ## 値と判定
 
-設定の `replica_shared_arena` が `None` または存在しない場合だけ、server は `environ.get("STRATA_REPLICA_SHARED_ARENA", "")` の文字列を `strip()` し、`lower()` した結果を完全一致で判定します（`serve/replicas.py:167-172`）。
+`shared_arena_plan` はまず `cfg.get("replica_shared_arena")` を確認し、その値が `None` の場合だけ、渡された `environ`（通常は `os.environ`）から変数を読みます。環境変数は値を文字列化し、前後の空白を `strip()` で取り除き、小文字化してから `1`、`true`、`on`、`yes` のいずれかと完全一致するかを判定します。数値変換はせず、空文字や部分一致は有効になりません（`serve/replicas.py:167-172`）。
 
-| 環境変数値（前後空白除去・小文字化後） | 要求値 |
-|---|---|
-| `1`, `true`, `on`, `yes` | 有効要求 |
-| 未設定、空文字、その他すべて（例: `0`, `false`, `2`, `y`, `enabled`） | 無効要求 |
+| 条件 | 未設定 | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `cfg["replica_shared_arena"]` が `None`（通常の環境変数判定） | 無効 | `1`, `true`, `on`, `yes`。大文字小文字は区別せず、前後空白は無視 | 空文字、`0`, `false`, `off`, `no`, `0anything`, `trueish`。いずれも許可語との完全一致ではない |
+| `cfg["replica_shared_arena"]` が `None` 以外 | 環境変数を読まず、設定値の真偽値で判定 | 真と評価される設定値 | 偽と評価される設定値 |
 
-部分一致や数値変換ではありません。大文字小文字は区別せず、前後の空白は無視します（例: ` TRUE ` は有効）。空文字は無効です。
-
-設定 `replica_shared_arena` に `None` 以外の値がある場合、環境変数は参照されず、設定値そのものの Python truthiness が使われます。従って config の `false` は環境変数が `1` でも共有を止め、config の `true` は環境変数が `0` でも共有を要求します。文字列 `"false"` も truthy なので共有要求になります（`serve/replicas.py:169-172`）。
-
-なお `STRATA_REPLICA_PROFILE` による自動 profile は、条件成立時に `cfg.setdefault("replica_shared_arena", True)` を行います。その場合はこの env var の値を読む分岐に入らず、明示 config 値がなければ `true` が優先されます（`strata_control/replica_profile.py:101-120`）。
+設定ファイルの `replica_shared_arena` が明示されると環境変数より優先します。レプリカプロファイルが適用されると、共有可能な OS では `cfg.setdefault("replica_shared_arena", True)` を設定するため、そこでは環境変数 `=0` も上書きできません（`strata_control/replica_profile.py:102-118`）。設定値の型検証はこの判定箇所にないため、文字列 `"false"` も Python では真として扱われます（`serve/replicas.py:169-172`）。
 
 ## 有効になる条件
 
-有効要求のうえで `n_replicas >= 2` のときだけ arena の選択を続けます。それ以外は黙って `(None, "")` を返し、この機能に関するログも出しません（`serve/replicas.py:172-173`）。通常の起動経路では `n_replicas` は `gpu_groups(cfg)` が返した replica group 数で、config の `replicas` または `--replicas N` から決まります（`serve/server.py:9038-9041,9261-9275`）。
-
-- Windows では named section 用の `win:Local\\strata-replicas-<server pid>` を返します（`serve/replicas.py:174-178`）。
-- Linux では `arch == "deepseek41"`、または全体・replica 個別の `args` に `--mmap-experts`、`--resident-experts`、`--shared-expert-arena`、`--resident-budget-gib` のいずれかがあれば共有を使わず、各 replica が個別 arena を使う旨を返します（`serve/replicas.py:181-187`）。
-- Linux で memfd を使える場合、既定では memfd を試します。ただし config 値の文字列表現が大文字小文字を無視して `devshm` の場合は memfd を使わず `/dev/shm` 経路にします（`serve/replicas.py:188-190`）。利用可能 RAM が 8 GiB 未満なら各 replica 個別コピーに fallback するログを返します。memfd 作成が `OSError` で失敗した場合も `/dev/shm` 経路へ進みます（`serve/replicas.py:191-200`）。
-- `/dev/shm` 経路では、指定ディレクトリ（通常 `/dev/shm`）が存在し書き込み可能で、空きが 8 GiB 以上である必要があります。不成立なら個別コピーへ fallback するメモを返します。成立時は stale arena を掃除して uid と server pid を含む `.bin` パスを選びます（`serve/replicas.py:215-224`）。
-- Linux / Windows 以外は共有対象外で、個別コピーにするメモを返します（`serve/replicas.py:179-180`）。
-
-`--replicas` は replica を起動する CLI ですが、共有 arena を直接 on/off する CLI option はこの処理にありません。Linux の config args にある上記の非互換 engine option は共有を無効にします（`serve/server.py:9038-9041`; `serve/replicas.py:181-187`）。
+- server がレプリカ起動経路 `start_replicas` に入り、2 個以上のレプリカを計画する必要があります。1 個のとき、または判定値が偽なら共有 arena を作らず、ログ行も出しません（`serve/server.py:9555-9569`、`serve/replicas.py:169-173`）。
+- Linux では `--mmap-experts`、`--resident-experts`、`--shared-expert-arena`、`--resident-budget-gib` が共通引数またはいずれかのレプリカ引数に含まれる場合、共有可能な private expert arena がないものとして共有を使いません（`serve/replicas.py:181-187`）。
+- Windows では named section のパスを計画します。Linux でも `os.memfd_create` が利用できない、または作成に失敗した場合は `/dev/shm` のファイル方式を試します。Linux 以外の OS（Windows を除く）では不適用の理由をログに出し、各レプリカを個別の expert コピーで起動します（`serve/replicas.py:174-224`）。
+- Linux の memfd 方式は空き RAM が 8 GiB 未満なら共有なしで戻り、`/dev/shm` 方式には進みません。memfd が利用できない場合に限って `/dev/shm` ファイル方式を試し、こちらもディレクトリが存在して書き込み可能で、空きが 8 GiB 以上である必要があります。条件を満たさなければ共有なしで続行します（`serve/replicas.py:99-100, 190-224`）。
+- `cfg["env"]` にこの名前を設定しても共有計画には反映されません。計画関数は `cfg["env"]` でなく server プロセスの `os.environ` を見ます。`cfg["env"]` は後でエンジン子プロセスの環境に加えられます（`serve/replicas.py:167-171`、`serve/server.py:4428-4441`）。
 
 ## 実行時の詳細
 
-値は `start_replicas()` が replica 起動を組み立てるとき、`shared_arena_plan(cfg, n)` を一度呼ぶ中で評価されます。関数に `static` 等の cache はなく、各 server 起動（fallback による再起動も含む）で評価し直します。起動後に親プロセスの environment を変えても、すでに選んだ arena や起動済み child engines には反映されません（`serve/server.py:8700-8702,8715-8723,8743-8746`）。
+レプリカ起動時に `shared_arena_plan` が一度呼ばれ、server が選んだパスを各レプリカの引数末尾に `--shared-expert-arena` として追加します。環境値自体を保持する static cache はなく、計画時に `os.environ` を読みます。一方、server の通常起動では計画結果をその起動処理中に使うため、起動後に環境を変えても既に起動したエンジン群には反映されません（`serve/server.py:9567-9577`）。
 
-arena path が得られると、server は各 replica の engine args に `--shared-expert-arena <path>` を追加して `StrataEngine` を起動します。env var 自体は `child_env()` が親環境からコピーするため子プロセスにも継承されますが、Strata の該当箇所では子 engine 向けにこの値を使わず、共有有無は server が決めた CLI 引数で伝えます（`serve/server.py:8704-8710,3747-3760`）。arena の選択メモが空でなければ `[strata] <メモ>` を stdout に出します（`serve/server.py:8701-8702`）。
+Linux の memfd は server が作成して `/proc/<server pid>/fd/<n>` で渡します。memfd が利用可能で空き RAM が 8 GiB 未満なら計画を終了し、共有なしで続行します。memfd 自体が利用できないか作成に失敗した場合は `/dev/shm` ファイル方式を試します。Windows では server プロセス ID を含む named section 名を渡します（`serve/replicas.py:174-224`）。エンジンの arena 初期化に成功すると、共有状態ヘッダーを使い、1 エンジンが expert を読み、他は読み込み完了を待って読み込みを省きます。読み込み担当 PID が終了した場合は別のエンジンが読み直し、担当が生存したまま 45 分を超えて待つ場合は待機側も自身で読み込みを進めます（`src/core/expert_source.cpp:6269-6303`）。
 
-共有 arena で replica 起動に失敗した場合、失敗 replica の一部だけが落ちていれば、server は再試行するログを出して同じ arena で再起動します。失敗が残れば arena を解放し、共有を `false` にした config で全 replica を再起動します。共有なしの再試行も失敗する場合は `[strata] replica <番号> did not start: <例外>` で `SystemExit` になります（`serve/server.py:8724-8747`）。起動成功後は server 終了時に arena を解放する `atexit` handler を登録します（`serve/server.py:8748-8753`）。
+もし arena 付きで一部エンジンだけ起動に失敗すれば、server は失敗したレプリカを同じ arena で再試行します。それでも失敗する場合は arena を除去し、全レプリカを個別コピーで起動し直します。arena なしでも失敗すれば `SystemExit` で起動を終えます（`serve/server.py:9592-9615`）。成功した場合は server 終了時に arena を閉じる／ファイルを削除するため `atexit` に登録します（`serve/server.py:9616-9621`）。
+
+## ログと測定値
+
+共有パスが計画されると `[strata] one shared expert arena ...` の行を server が stdout に出します。メモリ不足、対象外 OS、使えない `/dev/shm` など共有を計画できない場合は理由付きの `[strata] shared expert arena: ...` 行を出します。Windows と Linux memfd のいずれでも、定量的な起動性能値はこの環境変数の実装箇所にはありません（`serve/server.py:9567-9569`、`serve/replicas.py:174-224`）。
+
+engine 側では共有 arena 初期化の失敗理由が arena のエラー情報になります。server が arena 付きの再起動にも失敗すると `[strata] replica <番号> did not start with the shared expert arena (...); starting every replica with its own copy of the experts instead` を表示します。エンジンの読み込み担当が途中で終了した場合は stderr に `strata generate: shared expert arena: engine ... died while reading it; reading it again`、待機側には `strata generate: shared expert arena: engine ... is reading the experts; waiting for it instead of reading them again` が出ます（`serve/server.py:9592-9615`、`src/core/expert_source.cpp:6287-6303`）。
 
 ## 根拠
 
-- 全参照の確認: 実装上の読み取りは `serve/replicas.py:171` の一箇所。候補名はモジュール説明・docstring、`serve/server.py` の `STRATA_REPLICA_START` 分岐、setup variant/recon 用文字列にも現れますが、これらは対象 env var の値を読む処理ではありません。テスト `serve/test_replicas.py:323-351` は unset / `0` / `1` と platform・model/args 条件を fixture で確認しています（調査ではテストを実行していません）。
-- 候補一覧には `docs/envvars/000_envvers.md:1411` に掲載されています。実際の環境値読み取りは Strata 同梱 server の Python 実装で確認できました。
-- 値取得・arena 条件: `serve/replicas.py:161-224`。
-- profile が config default を補う箇所: `strata_control/replica_profile.py:101-120`。profile の適用入口: `setup.py:10348-10362`。
-- replica 数決定・arena 引数の転送・ログ・失敗時 fallback: `serve/server.py:8688-8753,9038-9041,9261-9279`。
-- 子 engine 環境の構築: `serve/server.py:3747-3760`。
+- `serve/replicas.py:161-224` — 環境値の変換、設定優先、OS・引数・空き領域による計画分岐。
+- `serve/server.py:9555-9621` — 計画結果のログ、エンジン引数への追加、再試行・共有なしへの fallback、後片付け。
+- `strata_control/replica_profile.py:102-118` — レプリカプロファイルが共有設定を既定で真にする条件。
+- `serve/server.py:4428-4441` — 子エンジン環境の生成と設定 `env` の適用。
+- `src/core/expert_source.cpp:6269-6303` — エンジン間の読み込み担当選定、待機、担当交代。
+- `src/core/pinned.cu:297-434` — Linux 共有ファイルの作成・ヘッダーと pack hash の検証・RAM 確保・`MAP_SHARED`。

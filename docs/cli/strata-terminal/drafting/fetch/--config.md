@@ -1,6 +1,6 @@
 # `--config`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `c77572806996349b49995e4f98d41b5294d36a21`（2026-11-17 時点）。調査開始時の checkout は `main...origin/main` で、未コミット変更はありませんでした。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,51 +8,57 @@
 | コマンド | `strata drafting fetch` |
 | オプション | `--config` |
 | 別名 | なし |
-| 値 | `FILE`。run config のファイルパス。必須指定ではない |
+| 値 | `FILE`。モデルの run config JSON ファイルのパス |
 
 ## 役割
 
-run config を読み、モデルのデータフォルダーと drafting の選択を参照します。`fetch --if-needed` では、選択したモデルに DFlash2 pack が必要かを判定する入力にもなります。通常の `fetch`（`--if-needed` なし）では、config のモデル名や drafting 設定によってダウンロード自体を制限せず、config からデータフォルダーを選ぶ用途です。
+指定したモデルの run config を読み、DFlash2 drafter の取得判断に必要なモデル名、drafting の選択、エンジン引数などを渡します。config の `args` からデータフォルダーを推定できる場合は取得先にも使います。`--data-dir` を併記した場合は、明示したフォルダーが取得先になります。parser 上は任意指定です。
 
 ## 使い方
 
 ```sh
-strata drafting fetch --config strata-qwen.json --if-needed
+strata drafting fetch --config ./model.json
 ```
 
-`--config` は `strata drafting plan` にも登録されています。同じデータフォルダーとモデル情報を使った取得計画を確認できます。
+既に drafter が選択されていて、ファイルが未配置の場合だけ取得する例:
+
+```sh
+strata drafting fetch --config ./model.json --if-needed
+```
 
 ## 値と既定値
 
-- parser は `--config FILE` を値一つを取る文字列引数として登録します。指定省略時は `None` です。ファイル存在、JSON の object 形式、run config の schema は parser では検証しません（`strata_cli/drafting_cmd.py:22-29`）。
-- 指定時は UTF-8-SIG として読み、`json.loads` で解析します。ファイルを読めない場合または JSON 構文が不正な場合は例外を捕捉し、空の設定 `{}` として続行します（`strata_cli/drafting_cmd.py:40-46`）。したがって、この場合に `--config` のデータフォルダーや drafting/model 情報は使われません。JSON として有効でも object 以外の値は明示的に拒否されず、後続の `.get()` で失敗し得ます（同 `:44-54`）。
-- 同じ `--config` を複数回指定した場合の専用処理はありません。`argparse` の通常の単一値引数として最後の値が Namespace に入ります（登録箇所 `strata_cli/drafting_cmd.py:24`）。
+- `FILE` は必須の単一値です。parser は `--config` に文字列を受け取りますが、ファイルの存在や JSON 形式を parser 段階では検証しません（`strata_cli/drafting_cmd.py:24-29`）。
+- オプション自体は省略できます。省略時、fetch でモデル名・family も指定されていなければ、DFlash2 対応のインストール済みモデルを検索します。該当モデルが1件ならその run config を自動選択し、複数なら選択を促すエラーになります。明示的な `--config` がある場合、この自動選択は行いません（`strata_cli/drafting_cmd.py:80-98, 103-109`）。
+- 指定ファイルを UTF-8 with BOM 許容で読み、JSON として解析します。読み込み時の `OSError` または JSON の `ValueError` は捕捉され、空 config として扱われます。従ってこの場合も CLI の設定読込エラーにはならず、データフォルダー推定などは既定経路へ進みます（`strata_cli/drafting_cmd.py:105-116`）。
 
 ## 実行時の動作
 
-`--data-dir` があればそちらが優先されます。なければ config の `args` から `--pack` または `--mtp` のパスを探し、そのパスの親からモデルの data folder を推定します。config から推定できなければ `Catalog().data_dir()` を使います（`strata_cli/drafting_cmd.py:47-54`、`strata_control/drafting.py:203-212`、`strata_cli/launch/catalog.py:494-501`）。
+config の `args` に `--pack <path>` があればそのパスの2階層上、なければ `--mtp <path>` の2階層上をデータフォルダーとして推定します。`--mtp` の値の basename が数字の場合はその候補を使いません。どちらからも推定できなければ `Catalog().data_dir()` の既定フォルダーを使います（`strata_control/drafting.py:1500-1509`、`strata_cli/drafting_cmd.py:110-116`）。明示的な `--data-dir` がある場合はこちらが優先されます（`strata_cli/drafting_cmd.py:110-116`）。既定フォルダー経路で `Catalog` を初期化すると、インストールルートの作成を試みます（`strata_cli/launch/catalog.py:249-259`）。
 
-`--mode` を明示した場合は config の `drafting` より優先されます。省略時は config の `drafting` を読み、値もなければ drafting 側の既定 `auto` として扱われます。`--family` を指定した場合は family がモデル適合判定に使われ、config の `model_name` より優先されます（`strata_cli/drafting_cmd.py:54`、`strata_control/drafting.py:23-24, 107-112, 136-138`）。
-
-- `strata drafting plan` は config 等から判定を作りますが、ファイルを取得しません。config または `--mode` を使ってモデルについて問い合わせ、必要でない場合は結果の `gb` を `0.0` にします（`strata_cli/drafting_cmd.py:63-73`）。
-- `strata drafting fetch --if-needed` は `needs_pack` が false なら取得せず成功終了します。true のときだけ `ensure` を呼びます（`strata_cli/drafting_cmd.py:60-79`）。この revision では `ENGINE_SERVES_DFLASH2 = False` であり、`needs_pack` の条件にこの値との AND があるため、`--if-needed` を付けた呼び出しは config の内容にかかわらず取得をスキップします（`strata_control/drafting.py:141-146, 179-183`）。
-- `--if-needed` を付けない `fetch` は `needed` の値によらず `ensure` を実行します。すでに 1 MiB を超える pack があればそれを保持して返し、なければ取得処理へ進みます（`strata_cli/drafting_cmd.py:60-62, 74-88`、`strata_control/drafting.py:114-122`、`strata_control/drafting_fetch.py:54-64`）。この場合 `--config` は保存先選択に関係しますが、config の drafting/model 値は取得可否に使われません。
+同じ config から `model_name`、`drafting`、`args`、`parallel` 等も参照され、モデルと現在の hardware/backend に応じた drafter 選択、既存 MTP layer の状態、engine 引数との整合を判断します。明示した `--mode` があれば config の `drafting` より優先されます。config で `mtp` が `false` かつ選択が `auto` の場合は `off` として扱われます（`strata_cli/drafting_cmd.py:117-134`）。`--if-needed` がある場合だけ、必要判定が偽なら取得をスキップします。付けない通常の fetch は必要判定が偽でも `ensure_for()` を呼ぶため、config の選択が drafter を必要としない場合にも取得を試みる経路があります（`strata_cli/drafting_cmd.py:159-190, 199-201`）。
 
 ## 適用条件と副作用
 
-通常の `fetch` は明示実行された場合にネットワーク取得を行い、data folder 配下の `dflash2/src/` に一時・取得ファイルを作成します。固定された Hugging Face revision のファイルをサイズ・SHA-256 検証付きで取得し、pack を一時ファイル経由で作成した後、元の取得ファイルを削除します。生成物は `<data-dir>/dflash2/qwen3.8-flash-next-dflash2.q8.pack` です（`strata_control/drafting.py:88-100`、`strata_control/drafting_fetch.py:54-59, 63-101`）。
-
-`--if-needed` を付けたときだけ config の mode/model 情報は取得条件に影響します。判定では `auto` は GPU class の提案に置換され、family があれば `qwen` / `gyro` かを確認し、なければ config の model name が Qwen3.8-Flash-Next の形式に適合するかを調べます。ただし現 revision では engine serving 対応フラグが false のため、これらの値が適合していても取得条件を満たしません（`strata_control/drafting.py:102-112, 141-146, 179-183`）。
+- `--config` は plan/fetch の両方に共通して登録されていますが、この文書は fetch のスコープです（`strata_cli/drafting_cmd.py:21-29`）。
+- config の `args` からデータフォルダーを推定できるかは、その引数リストに `--pack` または `--mtp` と値が含まれるかによります。相対パスの解決や他の config キーの妥当性検証をこの処理が行うことは確認できません（`strata_control/drafting.py:1500-1509`）。
+- `--if-needed` を付けない fetch は、必要判定にかかわらず `ensure_for()` を呼びます。config のモデル・選択と hardware 条件は取得する pack の選定に使われます。明示的な `--config` はモデル固有の選択のために使われますが、config の読込に失敗すると空 config として扱われるため、意図したモデルや取得先を使わない可能性があります（`strata_cli/drafting_cmd.py:101-134, 159-165, 186-215`）。
 
 ## 出力とエラー
 
-`--output` の選択肢は `human`（既定）、`json`、`jsonl` です（`strata_cli/drafting_cmd.py:29`）。`--if-needed` により取得を省略すると、人間向けには `Nothing to download.`、JSON/JSONL では `skipped: true` の結果を出して終了コード 0 です（同 `:74-79`）。実際に取得する場合、JSONL は進捗イベントを出し、成功時は pack path を結果として出します（同 `:81-99`）。
-
-取得・pack の `DraftingError` と取得禁止の `AcquisitionRefused` は、機械向けには JSON error、人間向けには stderr の `strata:` エラーとして表示され、終了コード 5 です（`strata_cli/drafting_cmd.py:87-94`）。ファイルの欠落・破損した JSON 構文は上記のとおり空 config にフォールバックします。JSON 配列や文字列のように `.get()` を持たない有効 JSON の場合の CLI 表示・終了コードは専用処理で定義されておらず、この調査では確定できません。
+- 複数のインストール済みモデルが見つかる bare fetch の曖昧さエラーは終了コード 2 です。ただし `--config` を明示した呼び出しはこの自動検索・曖昧さ判定の対象外です（`strata_cli/drafting_cmd.py:83-98, 153-158`）。
+- fetch の取得失敗または取得禁止は終了コード 5 です。通常出力では `strata: ...` を stderr に、`--output json` / `jsonl` ではエラー JSON を stdout に出します（`strata_cli/drafting_cmd.py:210-215`）。
+- ファイルシステム由来の未捕捉 `OSError` は共通 CLI handler が終了コード 6 として処理します（`strata_cli/cli.py:2189-2196`）。構文上の引数不足・余分な引数は argparse の usage/error 経路です（`strata_cli/cli.py:2256-2265`）。
 
 ## 根拠
 
-- parser と config 読み込み・値の優先順位・取得分岐・出力: `strata_cli/drafting_cmd.py:17-99`
-- data folder の推定と DFlash2 の必要判定、現 revision の serving 対応状態: `strata_control/drafting.py:102-122, 136-183, 203-212`
-- 実際の pinned download、pack 作成、取得ファイル削除: `strata_control/drafting_fetch.py:29-39, 54-101`
-- CLI のサブコマンド登録と dispatch: `strata_cli/cli.py:172-173, 2144-2146`
+- 索引上の scope と予定リンク: `docs/cli/README.md:329-341`。
+- parser 定義と option の共通 scope: `strata_cli/drafting_cmd.py:19-38`。
+- bare fetch 時の config 自動選択と config ファイル読み込み・失敗時の扱い: `strata_cli/drafting_cmd.py:80-116`。
+- config の読み取り内容と `--data-dir` 優先、mode 等の決定: `strata_cli/drafting_cmd.py:117-134`。
+- fetch の必要判定、スキップ、取得呼び出し、失敗時の終了コードと出力: `strata_cli/drafting_cmd.py:150-220`。
+- config 引数からのデータフォルダー推定: `strata_control/drafting.py:1500-1509`。
+- 既定フォルダー経路で使う Catalog の初期化とルート作成: `strata_cli/launch/catalog.py:249-259, 537-544`。
+- 共通 CLI の `OSError` エラー処理: `strata_cli/cli.py:2189-2196`。
+
+調査範囲は上記 commit の Strata 所有ソースです。CLI の help は実行していません。`--config` の不正な JSON や読み取りエラーは明示的な失敗ではなく空 config にフォールバックする実装を確認しましたが、JSON として読めても object ではない値を渡した場合の動作はこの調査では確認していません。

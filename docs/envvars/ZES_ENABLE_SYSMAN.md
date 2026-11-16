@@ -1,43 +1,45 @@
 # `ZES_ENABLE_SYSMAN`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `main...origin/main` で、変更表示はありませんでした。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
-Strata の engine 本体がこの名前を読んで分岐するコードは見つかりませんでした。Strata が行うこととして確認できたのは、SYCL 用 Docker 起動スクリプトから `ZES_*` 名の変数をコンテナへ渡すこと、Arc 用ベンチマークスクリプトでこの値を `1` に設定して engine 子プロセスを起動すること、そして汎用の起動設定から任意の環境変数として engine へ渡せることです。名前の受け手である外部 runtime / driver が値をどう解釈するかは、この調査の対象外です。
+Strata のエンジンコードに、この名前を直接読んで値を判定する箇所は確認できない。Strata が行うのは、サーバー設定またはプロセス環境から子プロセスへ値を渡す処理である。特に Intel SYCL 用ランチャー `sycl/serve/strata-sycl.sh` はホスト環境の `ZES_*` 変数を Docker コンテナへ転送する。したがって、この変数による下流の機能や GPU driver の挙動は Strata のソースだけからは説明しない。`serve/server.py` は設定 `env` を子エンジン環境に反映し、SYCL ランチャーは `ZES_*` を転送対象に含める（`serve/server.py:4428-4441`、`sycl/serve/strata-sycl.sh:33-42`）。
 
 ## 値と判定
 
-engine 本体に `ZES_ENABLE_SYSMAN` 専用の値判定はありません。値を扱う Strata 側の経路ごとの規則は次のとおりです。
+Strata エンジンは値を parse しない。通常のサーバー経路では設定 `env` の値を文字列化して子環境に設定する。Intel の Docker ランチャーではホスト環境の値を読み、空文字列と文字列 `0` を Docker に渡さず、それ以外をそのまま渡す。数値・真偽値としての検証、大文字小文字変換、空白除去はない（`serve/server.py:4440-4441`、`sycl/serve/strata-sycl.sh:33-42`）。
 
-| 経路 | 設定値の扱い |
-|---|---|
-| `tools/arc/b.py` | 子プロセス用環境に既定値 `1` を設定する。`--env KEY=VALUE` で同じキーを指定すると後から上書きできる。`--env ZES_ENABLE_SYSMAN` のように `=` がない指定は空文字で上書きされる。|
-| `sycl/serve/strata-sycl.sh` | スクリプト起動時の環境から `ZES_*` を収集する。値が文字列 `0` または空文字なら Docker の `-e` 引数に含めず、それ以外の値はそのまま渡す。数値化や大文字小文字変換はしない。|
-| `strata launch --set ZES_ENABLE_SYSMAN=VALUE` | 汎用環境設定として値を保存し、engine 用環境に設定する。値 `off`、`unset`、`none`（大文字小文字を区別しない）は環境設定から削除する指示になる。その他の値は文字列のまま渡す。|
+| 条件 | unset | 転送される値 | 転送されない値 |
+|---|---|---|---|
+| サーバーの一般的な子プロセス環境 | 親環境にも設定 `env` にもなければ未設定 | 設定 `env` の値は文字列化して反映。値の内容は判定しない | 特別な無効値判定なし。`strata launch --set` で `off`、`unset`、`none` を指定すると設定キーを削除し、親環境からの継承に戻る |
+| Intel SYCL の `strata-sycl.sh` 経由 | ホストで未設定ならランチャーから Docker に渡さない。標準の SYCL 開発イメージでは Dockerfile の `ENV` によりコンテナ内の既定値 `1` が設定される | 空でも `0` でもない値。例: `1`、`true`、`false`、`0anything` は値を変えず渡す | 空文字列と厳密に `0` のみ。比較は shell case pattern であり、空白や大文字小文字の正規化はしない |
 
-SYCL ラッパーの `0` / 空文字の除外は「変数をコンテナへ渡さない」という処理です。コンテナイメージには Dockerfile の `ENV ... ZES_ENABLE_SYSMAN=1` があります。そのため、このラッパー経由では `0` / 空文字がイメージ既定値を上書きしません。これはコンテナ環境の構成についての記述であり、engine や driver がその値をどう使うかを示すものではありません。
+SYCL 開発イメージのコンテナ既定値 `1` は `sycl/tools/Dockerfile:8` に記述されている。ランチャーでホスト値 `0` または空文字列を除外しても、標準イメージの場合はそのイメージ既定値が残る。これは Strata の値変換ではなく、ランチャーの転送条件と Docker イメージ設定の組み合わせである（`sycl/serve/strata-sycl.sh:40-42`、`sycl/tools/Dockerfile:8`）。
 
 ## 有効になる条件
 
-- `sycl/serve/strata-sycl.sh` が engine の実行ファイルとして使われると、ホスト側サーバー環境にある `ZES_*` がラッパーの収集対象になります。サーバーの `cfg["env"]` 設定は `child_env()` で継承環境に上書きされて engine 用環境へ渡されます。
-- ラッパーは `ZES_*` を含む変数名の集合を対象とするため、`ZES_ENABLE_SYSMAN` は対象です。`0` と空文字は転送されず、それ以外は値を保持して Docker に渡されます。
-- `tools/arc/b.py` はバックエンドや値を判定せず、engine 子プロセスの環境に `ZES_ENABLE_SYSMAN=1` を追加します。任意の `--env` 指定はその後に適用されます。
-- `strata launch --set` の設定は、任意の大文字を含む環境変数名として受理され、起動時の config `env` に反映されます。`child_env()` は親プロセスの環境を先にコピーし、その後 config の各項目で上書きします。config からこのキーを除いた場合は、親環境に同名変数があれば継承値が残ります。
+- 一般のサーバー経路では、設定ファイルの `env` にこの名前が指定されるか、サーバープロセス環境に設定されていれば、子エンジン環境に届く。設定値は親環境の値より後に反映される（`serve/server.py:4431-4441`）。
+- Intel 用コンテナ経路では `sycl/serve/strata-sycl.sh` が起動され、ホスト環境に `ZES_ENABLE_SYSMAN` が空でも `0` でもない値で存在する必要がある。ランチャーは `STRATA_SYCL_*` を除外しつつ、`ZES_*` を Docker の `-e` 引数にする（`sycl/serve/strata-sycl.sh:33-42`、`sycl/serve/strata-sycl.sh:46-52`）。
+- `strata launch --set ZES_ENABLE_SYSMAN=VALUE` のような任意の大文字を含む環境変数名も設定構文として受理され、設定 `env` に反映される。`off`、`unset`、`none` はこの CLI 経路で設定解除として扱われる（`strata_cli/launch/settings.py:228-252`、`strata_cli/launch/settings.py:259-284`、`strata_cli/launch/runner.py:503-510`）。
+- GPU backend、GPU 世代、モデル状態による Strata 側の値判定はない。Strata エンジンがこの名前を直接読む箇所は見つからず、転送後に何が有効になるかは本調査範囲では確認できない。
 
 ## 実行時の詳細
 
-SYCL server は `child_env()` の結果を engine プロセスの環境として `StrataEngine` に渡します。`strata-sycl.sh` はその環境から `ZES_*` を含む変数を集め、値が `0` / 空文字でない場合に Docker の `-e KEY=VALUE` としてコンテナへ渡します。Dockerfile 側にはイメージ既定値 `ZES_ENABLE_SYSMAN=1` が記載されています。
+サーバーの `child_env` はサーバープロセス環境を基に子エンジン用環境を作り、設定 `env` の各項目を `str(k)`、`str(v)` として上書きする。その環境をエンジン起動時に子プロセスへ渡す。値の変更をリクエストごとに読む処理や、Strata エンジン内の cache は確認できない（`serve/server.py:4428-4441`、`serve/server.py:1161-1165`）。
 
-汎用 launcher では、`--set` の環境設定は `cfg["env"]` に入り、server 起動時の `child_env()` がその値を子 engine の環境へ反映します。これらの箇所に `ZES_ENABLE_SYSMAN` 固有の警告、ログ、終了条件はありません。engine/driver 内部での読み取り後の挙動や観測結果は Strata 所有コードからは確認できません。
+Intel コンテナ経路では、`strata-sycl.sh` の起動時に環境変数名を列挙し、`STRATA_*`、`ONEAPI_*`、`UR_*`、`IGC_*`、`SYCL_*`、`ZES_*` などの値をコンテナ起動引数に追加する。`ZES_ENABLE_SYSMAN` は `ZES_*` に該当する。Strata 側の処理はこの転送までで、エンジン起動後に値を再読込したり変更したりしない（`sycl/serve/strata-sycl.sh:33-52`）。
+
+## ログと測定値
+
+Strata 所有コードに、この変数の値に応じたログ、警告、終了・失敗分岐は見つからない。`000_envvers.md` の候補名に加え、SYCL 用 Dockerfile の既定値、Intel Arc 文書の設定例、研究 harness の環境設定、CLI の環境変数名パターン例に名前が現れるが、これらは Strata エンジンでの値判定を示すものではない。外部依存の `third_party/strata-llama/.../helper.hpp` にある警告文は依存コードの記述であり、Strata 自身のログとして扱わない。
 
 ## 根拠
 
-- 候補名の参照箇所: `docs/INTEL_ARC.md:143`（使用例）、`sycl/tools/Dockerfile:8`（イメージ環境の既定値）、`tools/arc/b.py:32-39`（既定値と `--env` 上書き）、`strata_cli/launch/settings.py:253-269`（任意環境変数名としての認識）。
-- CLI 設定値の変換: `strata_cli/launch/cmd.py:120-121,284-285`、`strata_cli/launch/settings.py:257-277,286-310`。環境設定の削除・文字列設定: `strata_control/tune_knobs.py:519-525`。
-- config 環境の engine への反映: `strata_cli/launch/runner.py:557-562`、`serve/server.py:3747-3760,8704-8710`。
-- SYCL ラッパーでの収集・フィルター・コンテナ転送: `sycl/serve/strata-sycl.sh:13-16,28-38,42-47`。
-
-## 候補一覧との照合
-
-`docs/envvars/000_envvers.md` には候補として掲載されています。Strata engine 自身による読み取りは確認できませんが、上記の Strata 所有コードによる設定と転送は確認できたため、この文書ではその範囲のみを説明しました。driver/runtime 側の意味や機能は記載していません。
+- `serve/server.py:4428-4441` — サーバーの子環境作成と設定 `env` の反映。
+- `serve/server.py:1161-1165` — 作成した環境でエンジンを起動。
+- `sycl/serve/strata-sycl.sh:33-42` — `ZES_*` を含む環境変数の選別と空文字列・`0` の除外。
+- `sycl/serve/strata-sycl.sh:46-52` — 選別した環境を Docker 起動に渡す。
+- `sycl/tools/Dockerfile:8` — 開発イメージの `ZES_ENABLE_SYSMAN=1` 既定値。
+- `strata_cli/launch/settings.py:228-252`、`strata_cli/launch/settings.py:259-284`、`strata_cli/launch/runner.py:503-510` — 任意の環境変数名を受ける `--set` と設定への反映。
+- `strata_cli/launch/cmd.py:121-122` — `--set KEY=VALUE` の CLI 定義。
