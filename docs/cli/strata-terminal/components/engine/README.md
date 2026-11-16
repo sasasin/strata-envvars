@@ -45,7 +45,7 @@ strata components engine --components-dir /path/to/components
 - [`--components-dir`](--components-dir.md) — component root の指定。省略時は環境変数またはユーザー領域を使います。
 - [`--full`](--full.md) — manifest にある全ファイルの SHA-256 を検証。
 - [`--output`](--output.md) — `human` または `json` の出力形式。
-- [`--help`](--help.md)（alias: `-h`）— このコマンドのヘルプ。
+- `--help`（alias: `-h`）— このコマンドのヘルプ。
 
 オプション文書の索引は [`docs/cli/README.md`](../../../README.md) を参照してください。
 

@@ -99,23 +99,23 @@ Stage 1 の `token-in-diff` がこれ。2026-11-02 実測:
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --limit 20            # dry-run
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --apply --limit 20    # 実行
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
-  --exclude-token=--help --limit 200 --apply                                          # 共通 option を後回し
+  --exclude-token=--json --exclude-token=--quiet --limit 200 --apply                  # 共通 option を後回し
 ```
 
 - 既定の削除対象 verdict は `token-in-diff` / `option-absent-in-grammar` / `symbol-gone`。
   `name-gone` と `cited-file-gone` は索引更新・所在確認が要るので既定外。
-- `--exclude-token=OPTION`（繰り返し可）で主題トークンを除外する。CLI では `--help` が候補の大半を占める
-  （2026-11-02 実測 115 件中 97 件）が、Strata 側の usage 文言変更が主で文書の骨格は変わらない。
-  先に除外して、動作の意味が変わる option（`--backend`、`--preset`、`--show-key` など）から消す。
+- `--exclude-token=OPTION`（繰り返し可）で主題トークンを除外する。共通 option（`--json`、`--quiet`、
+  `--version` など）を先に除外して、動作の意味が変わる option（`--backend`、`--preset`、`--show-key` など）から消す。
+  かつては `--help` が CLI 候補の大半を占めた（2026-11-02 実測 115 件中 97 件）。usage 文言の変更に
+  引っかかるだけで文書の骨格は変わらなかったため、2026-11-17 に `--help` の文書自体を廃止した
+  （索引に載せず作らない。`index-refresh.md` §3）。
   索引の option inventory との突合 (S-c) で `option-absent-in-grammar` 側に出たものは除外不要。
   ```bash
   python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
-    --exclude-token=--help --exclude-token=--json --exclude-token=--quiet --exclude-token=--version
+    --exclude-token=--json --exclude-token=--quiet --exclude-token=--version
   ```
-- **`--help` の除外は運用側で毎回付ける**。スクリプトに既定の除外リストは持たせない（暗黙に消えると
-  何を除いたか分からなくなるため）。CLI を回すコマンドには必ず `--exclude-token=--help` を添える。
-  したがって `find-stale.py` の候補数に `--help` が残り続けるのは正常状態で、
-  「候補 0」を目安にするのは envvars 側（共通 option 相当がない）だけ。
+- 除外は運用側で明示する。スクリプトに既定の除外リストは持たせない（暗黙に消えると
+  何を除いたか分からなくなるため）。`--help` は文書が存在しないので除外指定は要らない。
 - envvars は `.create-envvars-docs.state.json` から entry を消して「未調査」に戻す
   → `create-envvars-docs.py` が素直に拾う。CLI は索引の予定リンクが残るので `create-cli-docs.py` が拾う。
 - 索引の名前は消さない（Strata が読むことは索引更新で確認済みの前提）。
@@ -149,8 +149,8 @@ codex への依頼文に添えられる。報告の revision が Strata HEAD と
   （削除→ `create-cli-docs.py -p 12 -l 30` で 2 分 42 秒、全件作成）。対象は `--backend` 3、`--preset` 2、
   `--show-key` 2、`--force`、`--model`、`--batch-groups`、`--expert-cache-device1`、`--kv-grow`、`--mtp-q4`、
   `--experts`、`--vram-experts`、`--gpu`、`--gpus`、`--vision`。
-  残った `--help` 97 件はそのまま候補として置く運用にした（スクリプトに既定除外は無い。
-  CLI を回すたびに `--exclude-token=--help` を付ける）。
+  残った `--help` 97 件はそのまま候補として置く運用にしたが、2026-11-17 に `--help` の文書と索引行を
+  すべて削除した（文書を作らない方針に変更）。
 - 見付かった実例: `STRATA_ATTN_LANECELL` は既定値テーブル `t.push_back({"STRATA_ATTN_LANECELL", "1"})` が
   `src/core/arch_defaults.cpp` に加わり、`STRATA_HC_Q8` は `getenv` 呼び出しがコメント化されている。
 - 再作成後は `find-stale.py` をもう一度走らせて候補が減っていることを確認する（同じ commit 基準に

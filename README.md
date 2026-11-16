@@ -92,7 +92,7 @@ codex exec --skip-git-repo-check --sandbox 'workspace-write' '調査依頼です
 コマンドラインツール毎のオプションの一覧の最新化。
 
 ```bash
-codex exec --skip-git-repo-check --sandbox 'workspace-write' 'Strata ソースコードが更新されたので、`$HOME/src/github.com/Niko1221/Strata` を調査し、`$HOME/src/github.com/sasasin/strata-envvars/docs/cli/README.md` を最新の索引に更新してください。手順と書いてよい中身は `$HOME/src/github.com/sasasin/strata-envvars/.agents/skills/strata-investigate/references/index-refresh.md` §3 に従ってください。対象 tool-id は `docs/cli/000_cli_tools.md` の一覧です。各 parser のオプションと alias、条件付き engine parser を確認してください。全コマンドに `README.md` の概要リンクを置き、各コマンド節では概要リンクを先頭、その後のオプションを ASCII コード順にしてください。オプション文書と概要ページが未作成の場合も、規約どおりの Markdown 予定リンクとして列挙してください。索引には見出し・調査対象行・リンクだけを書き、前置き・対象境界・履歴・注記・更新手順などの説明は書かないでください。'
+codex exec --skip-git-repo-check --sandbox 'workspace-write' 'Strata ソースコードが更新されたので、`$HOME/src/github.com/Niko1221/Strata` を調査し、`$HOME/src/github.com/sasasin/strata-envvars/docs/cli/README.md` を最新の索引に更新してください。手順と書いてよい中身は `$HOME/src/github.com/sasasin/strata-envvars/.agents/skills/strata-investigate/references/index-refresh.md` §3 に従ってください。対象 tool-id は `docs/cli/000_cli_tools.md` の一覧です。各 parser のオプションと alias、条件付き engine parser を確認してください。全コマンドに `README.md` の概要リンクを置き、各コマンド節では概要リンクを先頭、その後のオプションを ASCII コード順にしてください。オプション文書と概要ページが未作成の場合も、規約どおりの Markdown 予定リンクとして列挙してください。索引には見出し・調査対象行・リンクだけを書き、前置き・対象境界・履歴・注記・更新手順などの説明は書かないでください。`--help`（alias `-h`）は索引に載せないでください。'
 ```
 
 削除されたコマンドラインツールやオプションに対応する文書の削除。

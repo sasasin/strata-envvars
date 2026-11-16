@@ -81,8 +81,6 @@ python3 .agents/skills/strata-investigate/scripts/evidence-index.py    # 証拠�
 python3 .agents/skills/strata-investigate/scripts/find-stale.py --stage3
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --limit 20          # dry-run
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --apply --limit 20  # 削除
-python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
-  --exclude-token=--help --limit 200 --apply                                        # 共通 option は後回し
 uv run ./create-envvars-docs.py -p 5 -l 20                                          # 再作成
 uv run ./create-cli-docs.py -p 12 -l 40
 python3 .agents/skills/strata-investigate/scripts/check-docs.py
@@ -94,9 +92,9 @@ option 文字列そのものが出るか」（Stage 2）で候補を絞ること
 
 2026-11-02 の一巡実測: 全走査（Stage 1/2/3）は約 3 秒。envvars の候補 13 件（`token-in-diff` 12 と
 `unknown-sha` 1）を削除して再作成するのに 4 分 27 秒（5 並列、全件 created）。CLI は 115 件のうち
-`--exclude-token=--help` で 97 件を後回しにし、18 件を 2 分 42 秒で回した。
-`moved` 判定の項目は削除しない（引用座標だけが古い）。**CLI を回すときは毎回
-`--exclude-token=--help` を付ける**（スクリプトに既定除外は無いので、`--help` の 97 件は候補に残ったままが正常）。
+`--help` の 97 件を後回しにし、18 件を 2 分 42 秒で回した。この結果を受けて 2026-11-17 に
+`--help` の文書自体を廃止した（索引に載せず作らない。`references/index-refresh.md` §3）ので、
+現在は CLI の候補に `--help` は出ない。`moved` 判定の項目は削除しない（引用座標だけが古い）。
 
 ## B. 削除（prune）
 
@@ -111,7 +109,7 @@ uv run ./create-envvars-docs.py -p 5 -l 100      # envvars
 uv run ./create-cli-docs.py -p 12 -l 100         # CLI
 ```
 
-1 変数（1 オプション）= 1 codex セッション。飽和判定・state ファイル・並列数の目安は `references/runner.md`。
+1 変数（1 オプション）= 1 codex セッション。CLI の `--help` は索引に載せないので作成されない。飽和判定・state ファイル・並列数の目安は `references/runner.md`。
 
 ## D / E. 1 件の調査
 

@@ -52,7 +52,7 @@ strata ops list --profile four-gpu
 ## 関連文書
 
 - [CLI 索引](../../../README.md) — `strata ops` の全コマンドと各 option 文書
-- [`--help`](--help.md) — `strata ops init --help`
+- `--help` — `strata ops init --help`
 - [`--json`](--json.md) — 共通 JSON 出力 option
 - [`--output`](--output.md) — human / JSON 出力形式
 - [`--profile`](--profile.md) — 操作対象 profile

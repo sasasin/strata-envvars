@@ -20,23 +20,25 @@ docs/cli/<tool-id>/<command-path>/<option-name>.md
 
 - **`tool-id`** はツールの役割を識別する、固定の小文字 kebab-case 名とする。実行ファイル名だけでは識別しない。たとえば Terminal CLI とネイティブ推論エンジンはいずれも `strata` という名前になり得るため、`strata-terminal` と `strata-engine` のように分ける。
 - **`command-path`** はサブコマンドの階層をディレクトリで表す。サブコマンドがないトップレベルの呼び出しには `root/` を使う。例: `launch/`、`bench/run/`。
-- **`option-name`** は通常、オプションの正規の長い表記をそのまま使う。例: `--model.md`、`--help.md`。同じスコープ・同じ動作の短縮別名は一つの文書にまとめる。短い表記しかない場合は `-x.md` のようにする。
+- **`option-name`** は通常、オプションの正規の長い表記をそのまま使う。例: `--model.md`、`--version.md`。同じスコープ・同じ動作の短縮別名は一つの文書にまとめる。短い表記しかない場合は `-x.md` のようにする。
 - `/` などファイル名に使えない文字を含むオプションは UTF-8 のパーセントエンコード表記を使う。エンコードは衝突しない一貫した規則で行い、文書内に元のオプション表記を必ず記載する。
 
 例:
 
 ```text
 docs/cli/README.md
-docs/cli/strata-terminal/root/--help.md
+docs/cli/strata-terminal/root/README.md
 docs/cli/strata-terminal/root/--version.md
-docs/cli/strata-terminal/launch/--help.md
+docs/cli/strata-terminal/launch/README.md
 docs/cli/strata-terminal/launch/--model.md
-docs/cli/strata-terminal/bench/run/--help.md
-docs/cli/strata-engine/root/--help.md
+docs/cli/strata-terminal/bench/run/README.md
+docs/cli/strata-engine/root/--version.md
 docs/cli/strata-engine/root/--model.md
 ```
 
-この規約では `strata --help` と `strata launch --help` は別文書となり、Terminal CLI とエンジンで同名オプションがあっても衝突しない。`root/` の `--help` はトップレベルのヘルプ、各コマンド下の `--help` はそのコマンド固有のヘルプを指す。
+この規約では `strata-terminal/root/--version.md` と `strata-engine/root/--version.md` は別文書となり、Terminal CLI とエンジンで同名オプションがあっても衝突しない。
+
+`--help`（alias `-h`）は文書を作らず、索引にも載せない。parser が自動で足す help は全コマンド共通で、usage 文言の変化に追随するだけになり、文書として情報が増えないため。コマンド概要で触れる場合はリンクなしの `` `--help` `` と書く。
 
 ### ツール ID と委譲ラッパー
 
@@ -126,7 +128,7 @@ OS/backend/build/モデル状態などの条件、無視・拒否・fallback 条
 
 ## 品質基準
 
-- オプションの一意性は **tool ID + command path + option identity** で判断する。`--help.md` などファイル名単独で同一性を判断しない。
+- オプションの一意性は **tool ID + command path + option identity** で判断する。`--version.md` などファイル名単独で同一性を判断しない。
 - 同じ正規オプションが異なるコマンドで異なる意味・値・既定値を持つなら必ず分ける。別名をまとめるのは、受理されるスコープと挙動が等しいと確認できた場合に限る。
 - source checkout、ビルド生成バイナリ、Release archive、インストール済み wrapper の差を明示する。異なる backend や platform の差をひとつの値規則に押し込めない。
 - 説明は parser の宣言だけでなく最終的な利用箇所まで追う。オプションが受理されても、条件により値が使われない、別値に補正される、後続処理に転送される場合は記述する。

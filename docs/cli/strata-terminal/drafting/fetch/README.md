@@ -55,7 +55,7 @@ strata drafting plan --data-dir /path/to/model-data
 - [`strata drafting plan` 概要](../plan/README.md)
 - [`strata launch` 概要](../../launch/README.md)
 - [CLI 索引の `strata drafting fetch` 節](../../../README.md#strata-drafting-fetch-draftingfetch)
-- 個別オプション: [`--config`](--config.md)、[`--data-dir`](--data-dir.md)、[`--family`](--family.md)、[`--help` / `-h`](--help.md)、[`--if-needed`](--if-needed.md)、[`--mode`](--mode.md)、[`--output`](--output.md)
+- 個別オプション: [`--config`](--config.md)、[`--data-dir`](--data-dir.md)、[`--family`](--family.md)、`--help` / `-h`、[`--if-needed`](--if-needed.md)、[`--mode`](--mode.md)、[`--output`](--output.md)
 
 ## 根拠
 

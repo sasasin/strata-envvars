@@ -47,6 +47,7 @@
 - 書かないもの: 前置きの説明、対象境界（`000_cli_tools.md` に置く）、`### 索引更新 <日付>` のような履歴、inventory の件数、コマンド節の注記・根拠の行番号（コマンド概要 `README.md` に置く）、更新手順・依頼文。
 - `調査対象:` 行は `check-docs.py`・`staleness_lib.py`・`cli-grammar.py`（`--revision` 既定）が基準 SHA として読む。見出しとリンク行の形は `create-cli-docs.py` と `check-docs.py` が読む。
 - 各コマンド節は `- [コマンド概要](<tool-id>/<command-path>/README.md)` を先頭に 1 つ、その後 `- [\`--option\`（alias: \`-o\`）](<...>/--option.md)` を**表示される正規名の ASCII 順**（`--replica-profile` は `--replicas` より前）。
+- `--help`（alias `-h`）は索引に載せない（オプション文書を作らない）。parser が自動で足す help は全コマンド共通で、usage 文言の変化に追随するだけになり、文書として情報が増えないため。他の option の網羅性照合では `--help` / `-h` を突合対象から外す。索引行・`--help.md` / `-h.md` のファイル・本文からのリンクが再び現れたら `scripts/check-docs.py` が「--help / -h の混入」として報告する。
 - 配置規約と一意性（`tool-id + command-path + option identity`）は `docs/cli/001_investigation.md` が正。ラッパーが委譲だけなら重複登録せず、委譲先が独自 parser を持つ場合は別 scope（例 `source-setup/mac/`、`strata-engine/qwen36/`）。
 - 更新時は `strata_cli/cli.py` の root parser と各 module の登録 parser、`cli.py` が後から足す共通 option（`--json` / `--quiet` など）、C/C++ の手書き `argv` 解析と parser 前に処理される引数、`help=argparse.SUPPRESS` の option をたどる。
 - 網羅性は機械照合する: parser 側から抽出した option 集合（`extraction-recipes.md` §3）と索引のリンク集合を突き合わせ、追加・削除・改名・alias 表記の漏れと重複を見る。

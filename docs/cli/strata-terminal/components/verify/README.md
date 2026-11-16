@@ -53,7 +53,7 @@ report が成功なら終了コード 0、error issue がある場合は 5 で�
 ## 関連文書
 
 - [Terminal CLI 索引](../../../README.md) — このコマンドと option 文書一覧。
-- [`--profile`](--profile.md)、[`--live`](--live.md)、[`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)、[`--help` / `-h`](--help.md)
+- [`--profile`](--profile.md)、[`--live`](--live.md)、[`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)、`--help` / `-h`
 - Strata `docs/TERMINAL_QUICKSTART.md:64-71` — component check の利用例。
 - Strata `docs/TERMINAL.md:158` — inventory の範囲と制約。
 

@@ -7,7 +7,6 @@
 ### `strata` (トップレベル)
 
 - [コマンド概要](strata-terminal/root/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/root/--help.md)
 - [`--version`](strata-terminal/root/--version.md)
 
 ### `strata serve` (serve)
@@ -16,7 +15,6 @@
 - [`--batch-groups`](strata-terminal/serve/--batch-groups.md)
 - [`--batch-telemetry`（alias: `--no-batch-telemetry`）](strata-terminal/serve/--batch-telemetry.md)
 - [`--engine`](strata-terminal/serve/--engine.md)
-- [`--help`（alias: `-h`）](strata-terminal/serve/--help.md)
 - [`--host`](strata-terminal/serve/--host.md)
 - [`--json`](strata-terminal/serve/--json.md)
 - [`--max-queue`](strata-terminal/serve/--max-queue.md)
@@ -34,13 +32,11 @@
 ### `strata profile` (profile)
 
 - [コマンド概要](strata-terminal/profile/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/--help.md)
 
 ### `strata profile create` (profile/create)
 
 - [コマンド概要](strata-terminal/profile/create/README.md)
 - [`--from-config`](strata-terminal/profile/create/--from-config.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/create/--help.md)
 - [`--json`](strata-terminal/profile/create/--json.md)
 - [`--output`](strata-terminal/profile/create/--output.md)
 - [`--quiet`](strata-terminal/profile/create/--quiet.md)
@@ -48,7 +44,6 @@
 ### `strata profile list` (profile/list)
 
 - [コマンド概要](strata-terminal/profile/list/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/list/--help.md)
 - [`--json`](strata-terminal/profile/list/--json.md)
 - [`--output`](strata-terminal/profile/list/--output.md)
 - [`--quiet`](strata-terminal/profile/list/--quiet.md)
@@ -57,7 +52,6 @@
 
 - [コマンド概要](strata-terminal/profile/show/README.md)
 - [`--effective`](strata-terminal/profile/show/--effective.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/show/--help.md)
 - [`--json`](strata-terminal/profile/show/--json.md)
 - [`--output`](strata-terminal/profile/show/--output.md)
 - [`--quiet`](strata-terminal/profile/show/--quiet.md)
@@ -65,7 +59,6 @@
 ### `strata profile validate` (profile/validate)
 
 - [コマンド概要](strata-terminal/profile/validate/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/validate/--help.md)
 - [`--json`](strata-terminal/profile/validate/--json.md)
 - [`--output`](strata-terminal/profile/validate/--output.md)
 - [`--quiet`](strata-terminal/profile/validate/--quiet.md)
@@ -73,7 +66,6 @@
 ### `strata profile set` (profile/set)
 
 - [コマンド概要](strata-terminal/profile/set/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/set/--help.md)
 - [`--json`](strata-terminal/profile/set/--json.md)
 - [`--output`](strata-terminal/profile/set/--output.md)
 - [`--plan`](strata-terminal/profile/set/--plan.md)
@@ -83,7 +75,6 @@
 
 - [コマンド概要](strata-terminal/profile/use-config/README.md)
 - [`--from-config`](strata-terminal/profile/use-config/--from-config.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/use-config/--help.md)
 - [`--if-revision`](strata-terminal/profile/use-config/--if-revision.md)
 - [`--json`](strata-terminal/profile/use-config/--json.md)
 - [`--output`](strata-terminal/profile/use-config/--output.md)
@@ -93,7 +84,6 @@
 ### `strata profile edit` (profile/edit)
 
 - [コマンド概要](strata-terminal/profile/edit/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/edit/--help.md)
 - [`--json`](strata-terminal/profile/edit/--json.md)
 - [`--output`](strata-terminal/profile/edit/--output.md)
 - [`--quiet`](strata-terminal/profile/edit/--quiet.md)
@@ -101,7 +91,6 @@
 ### `strata profile history` (profile/history)
 
 - [コマンド概要](strata-terminal/profile/history/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/history/--help.md)
 - [`--json`](strata-terminal/profile/history/--json.md)
 - [`--output`](strata-terminal/profile/history/--output.md)
 - [`--quiet`](strata-terminal/profile/history/--quiet.md)
@@ -109,7 +98,6 @@
 ### `strata profile rollback` (profile/rollback)
 
 - [コマンド概要](strata-terminal/profile/rollback/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/rollback/--help.md)
 - [`--json`](strata-terminal/profile/rollback/--json.md)
 - [`--output`](strata-terminal/profile/rollback/--output.md)
 - [`--quiet`](strata-terminal/profile/rollback/--quiet.md)
@@ -118,14 +106,12 @@
 ### `strata repair-access` (repair-access)
 
 - [コマンド概要](strata-terminal/repair-access/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/repair-access/--help.md)
 - [`--output`](strata-terminal/repair-access/--output.md)
 
 ### `strata doctor` (doctor)
 
 - [コマンド概要](strata-terminal/doctor/README.md)
 - [`--components`](strata-terminal/doctor/--components.md)
-- [`--help`（alias: `-h`）](strata-terminal/doctor/--help.md)
 - [`--json`](strata-terminal/doctor/--json.md)
 - [`--live`](strata-terminal/doctor/--live.md)
 - [`--output`](strata-terminal/doctor/--output.md)
@@ -135,12 +121,10 @@
 ### `strata components` (components)
 
 - [コマンド概要](strata-terminal/components/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/--help.md)
 
 ### `strata components verify` (components/verify)
 
 - [コマンド概要](strata-terminal/components/verify/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/verify/--help.md)
 - [`--json`](strata-terminal/components/verify/--json.md)
 - [`--live`](strata-terminal/components/verify/--live.md)
 - [`--output`](strata-terminal/components/verify/--output.md)
@@ -151,14 +135,12 @@
 
 - [コマンド概要](strata-terminal/components/plan/README.md)
 - [`--backend`](strata-terminal/components/plan/--backend.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/plan/--help.md)
 - [`--output`](strata-terminal/components/plan/--output.md)
 - [`--target`](strata-terminal/components/plan/--target.md)
 
 ### `strata components backends` (components/backends)
 
 - [コマンド概要](strata-terminal/components/backends/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/backends/--help.md)
 - [`--output`](strata-terminal/components/backends/--output.md)
 
 ### `strata components engine` (components/engine)
@@ -167,7 +149,6 @@
 - [`--backend`](strata-terminal/components/engine/--backend.md)
 - [`--components-dir`](strata-terminal/components/engine/--components-dir.md)
 - [`--full`](strata-terminal/components/engine/--full.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/engine/--help.md)
 - [`--output`](strata-terminal/components/engine/--output.md)
 
 ### `strata components update` (components/update)
@@ -180,7 +161,6 @@
 - [`--components-dir`](strata-terminal/components/update/--components-dir.md)
 - [`--feed`](strata-terminal/components/update/--feed.md)
 - [`--force`](strata-terminal/components/update/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/update/--help.md)
 - [`--json`](strata-terminal/components/update/--json.md)
 - [`--model-config`](strata-terminal/components/update/--model-config.md)
 - [`--no-control`](strata-terminal/components/update/--no-control.md)
@@ -199,7 +179,6 @@
 - [`--components-dir`](strata-terminal/components/install-file/--components-dir.md)
 - [`--feed`](strata-terminal/components/install-file/--feed.md)
 - [`--force`](strata-terminal/components/install-file/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/install-file/--help.md)
 - [`--json`](strata-terminal/components/install-file/--json.md)
 - [`--model-config`](strata-terminal/components/install-file/--model-config.md)
 - [`--output`](strata-terminal/components/install-file/--output.md)
@@ -213,7 +192,6 @@
 - [`--components-dir`](strata-terminal/components/rollback/--components-dir.md)
 - [`--feed`](strata-terminal/components/rollback/--feed.md)
 - [`--force`](strata-terminal/components/rollback/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/rollback/--help.md)
 - [`--json`](strata-terminal/components/rollback/--json.md)
 - [`--model-config`](strata-terminal/components/rollback/--model-config.md)
 - [`--output`](strata-terminal/components/rollback/--output.md)
@@ -227,7 +205,6 @@
 - [`--components-dir`](strata-terminal/components/engines/--components-dir.md)
 - [`--feed`](strata-terminal/components/engines/--feed.md)
 - [`--force`](strata-terminal/components/engines/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/engines/--help.md)
 - [`--json`](strata-terminal/components/engines/--json.md)
 - [`--model-config`](strata-terminal/components/engines/--model-config.md)
 - [`--output`](strata-terminal/components/engines/--output.md)
@@ -242,7 +219,6 @@
 - [`--family`](strata-terminal/components/use/--family.md)
 - [`--feed`](strata-terminal/components/use/--feed.md)
 - [`--force`](strata-terminal/components/use/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/use/--help.md)
 - [`--json`](strata-terminal/components/use/--json.md)
 - [`--model-config`](strata-terminal/components/use/--model-config.md)
 - [`--output`](strata-terminal/components/use/--output.md)
@@ -257,7 +233,6 @@
 - [`--family`](strata-terminal/components/remove/--family.md)
 - [`--feed`](strata-terminal/components/remove/--feed.md)
 - [`--force`](strata-terminal/components/remove/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/remove/--help.md)
 - [`--json`](strata-terminal/components/remove/--json.md)
 - [`--model-config`](strata-terminal/components/remove/--model-config.md)
 - [`--output`](strata-terminal/components/remove/--output.md)
@@ -274,7 +249,6 @@
 - [`--components-dir`](strata-terminal/update/--components-dir.md)
 - [`--feed`](strata-terminal/update/--feed.md)
 - [`--force`](strata-terminal/update/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/update/--help.md)
 - [`--json`](strata-terminal/update/--json.md)
 - [`--model-config`](strata-terminal/update/--model-config.md)
 - [`--no-control`](strata-terminal/update/--no-control.md)
@@ -289,14 +263,12 @@
 ### `strata models` (models)
 
 - [コマンド概要](strata-terminal/models/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/models/--help.md)
 
 ### `strata models list` (models/list)
 
 - [コマンド概要](strata-terminal/models/list/README.md)
 - [`--connection`](strata-terminal/models/list/--connection.md)
 - [`--credential-env`](strata-terminal/models/list/--credential-env.md)
-- [`--help`（alias: `-h`）](strata-terminal/models/list/--help.md)
 - [`--install-dir`](strata-terminal/models/list/--install-dir.md)
 - [`--installed`](strata-terminal/models/list/--installed.md)
 - [`--json`](strata-terminal/models/list/--json.md)
@@ -309,7 +281,6 @@
 ### `strata models inspect` (models/inspect)
 
 - [コマンド概要](strata-terminal/models/inspect/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/models/inspect/--help.md)
 - [`--install-dir`](strata-terminal/models/inspect/--install-dir.md)
 - [`--json`](strata-terminal/models/inspect/--json.md)
 - [`--output`](strata-terminal/models/inspect/--output.md)
@@ -318,7 +289,6 @@
 ### `strata models import` (models/import)
 
 - [コマンド概要](strata-terminal/models/import/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/models/import/--help.md)
 - [`--json`](strata-terminal/models/import/--json.md)
 - [`--output`](strata-terminal/models/import/--output.md)
 - [`--plan`](strata-terminal/models/import/--plan.md)
@@ -329,7 +299,6 @@
 - [コマンド概要](strata-terminal/models/move/README.md)
 - [`--cancel-file`](strata-terminal/models/move/--cancel-file.md)
 - [`--from`](strata-terminal/models/move/--from.md)
-- [`--help`（alias: `-h`）](strata-terminal/models/move/--help.md)
 - [`--install-dir`](strata-terminal/models/move/--install-dir.md)
 - [`--json`](strata-terminal/models/move/--json.md)
 - [`--leave`](strata-terminal/models/move/--leave.md)
@@ -342,7 +311,6 @@
 ### `strata drafting` (drafting)
 
 - [コマンド概要](strata-terminal/drafting/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/drafting/--help.md)
 
 ### `strata drafting plan` (drafting/plan)
 
@@ -351,7 +319,6 @@
 - [`--data-dir`](strata-terminal/drafting/plan/--data-dir.md)
 - [`--engines-unloading`](strata-terminal/drafting/plan/--engines-unloading.md)
 - [`--family`](strata-terminal/drafting/plan/--family.md)
-- [`--help`（alias: `-h`）](strata-terminal/drafting/plan/--help.md)
 - [`--mode`](strata-terminal/drafting/plan/--mode.md)
 - [`--no-split`](strata-terminal/drafting/plan/--no-split.md)
 - [`--output`](strata-terminal/drafting/plan/--output.md)
@@ -363,7 +330,6 @@
 - [`--data-dir`](strata-terminal/drafting/fetch/--data-dir.md)
 - [`--engines-unloading`](strata-terminal/drafting/fetch/--engines-unloading.md)
 - [`--family`](strata-terminal/drafting/fetch/--family.md)
-- [`--help`（alias: `-h`）](strata-terminal/drafting/fetch/--help.md)
 - [`--if-needed`](strata-terminal/drafting/fetch/--if-needed.md)
 - [`--mode`](strata-terminal/drafting/fetch/--mode.md)
 - [`--no-split`](strata-terminal/drafting/fetch/--no-split.md)
@@ -372,14 +338,12 @@
 ### `strata engine` (engine)
 
 - [コマンド概要](strata-terminal/engine/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/engine/--help.md)
 
 ### `strata engine calibrate` (engine/calibrate)
 
 - [コマンド概要](strata-terminal/engine/calibrate/README.md)
 - [`--apply-result`](strata-terminal/engine/calibrate/--apply-result.md)
 - [`--exclusive`](strata-terminal/engine/calibrate/--exclusive.md)
-- [`--help`（alias: `-h`）](strata-terminal/engine/calibrate/--help.md)
 - [`--json`](strata-terminal/engine/calibrate/--json.md)
 - [`--measure`](strata-terminal/engine/calibrate/--measure.md)
 - [`--out`](strata-terminal/engine/calibrate/--out.md)
@@ -394,19 +358,16 @@
 ### `strata install` (install)
 
 - [コマンド概要](strata-terminal/install/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/install/--help.md)
 - [`--update`](strata-terminal/install/--update.md)
 
 ### `strata runtime` (runtime)
 
 - [コマンド概要](strata-terminal/runtime/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/runtime/--help.md)
 
 ### `strata runtime start` (runtime/start)
 
 - [コマンド概要](strata-terminal/runtime/start/README.md)
 - [`--die-with-pid`](strata-terminal/runtime/start/--die-with-pid.md)
-- [`--help`（alias: `-h`）](strata-terminal/runtime/start/--help.md)
 - [`--json`](strata-terminal/runtime/start/--json.md)
 - [`--output`](strata-terminal/runtime/start/--output.md)
 - [`--plan`](strata-terminal/runtime/start/--plan.md)
@@ -418,7 +379,6 @@
 ### `strata runtime status` (runtime/status)
 
 - [コマンド概要](strata-terminal/runtime/status/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/runtime/status/--help.md)
 - [`--json`](strata-terminal/runtime/status/--json.md)
 - [`--output`](strata-terminal/runtime/status/--output.md)
 - [`--profile`](strata-terminal/runtime/status/--profile.md)
@@ -427,7 +387,6 @@
 ### `strata runtime verify` (runtime/verify)
 
 - [コマンド概要](strata-terminal/runtime/verify/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/runtime/verify/--help.md)
 - [`--if-instance-id`](strata-terminal/runtime/verify/--if-instance-id.md)
 - [`--if-owner-id`](strata-terminal/runtime/verify/--if-owner-id.md)
 - [`--json`](strata-terminal/runtime/verify/--json.md)
@@ -441,7 +400,6 @@
 ### `strata runtime stop` (runtime/stop)
 
 - [コマンド概要](strata-terminal/runtime/stop/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/runtime/stop/--help.md)
 - [`--if-instance-id`](strata-terminal/runtime/stop/--if-instance-id.md)
 - [`--if-owner-id`](strata-terminal/runtime/stop/--if-owner-id.md)
 - [`--json`](strata-terminal/runtime/stop/--json.md)
@@ -454,7 +412,6 @@
 ### `strata runtime cleanup` (runtime/cleanup)
 
 - [コマンド概要](strata-terminal/runtime/cleanup/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/runtime/cleanup/--help.md)
 - [`--json`](strata-terminal/runtime/cleanup/--json.md)
 - [`--output`](strata-terminal/runtime/cleanup/--output.md)
 - [`--profile`](strata-terminal/runtime/cleanup/--profile.md)
@@ -465,7 +422,6 @@
 - [コマンド概要](strata-terminal/runtime/restart/README.md)
 - [`--allow-source-migration`](strata-terminal/runtime/restart/--allow-source-migration.md)
 - [`--allow-source-switch`](strata-terminal/runtime/restart/--allow-source-switch.md)
-- [`--help`（alias: `-h`）](strata-terminal/runtime/restart/--help.md)
 - [`--if-instance-id`](strata-terminal/runtime/restart/--if-instance-id.md)
 - [`--if-owner-id`](strata-terminal/runtime/restart/--if-owner-id.md)
 - [`--if-profile-revision`](strata-terminal/runtime/restart/--if-profile-revision.md)
@@ -481,12 +437,10 @@
 ### `strata ops` (ops)
 
 - [コマンド概要](strata-terminal/ops/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/--help.md)
 
 ### `strata ops init` (ops/init)
 
 - [コマンド概要](strata-terminal/ops/init/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/init/--help.md)
 - [`--json`](strata-terminal/ops/init/--json.md)
 - [`--output`](strata-terminal/ops/init/--output.md)
 - [`--profile`](strata-terminal/ops/init/--profile.md)
@@ -495,7 +449,6 @@
 ### `strata ops list` (ops/list)
 
 - [コマンド概要](strata-terminal/ops/list/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/list/--help.md)
 - [`--json`](strata-terminal/ops/list/--json.md)
 - [`--output`](strata-terminal/ops/list/--output.md)
 - [`--profile`](strata-terminal/ops/list/--profile.md)
@@ -504,7 +457,6 @@
 ### `strata ops create` (ops/create)
 
 - [コマンド概要](strata-terminal/ops/create/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/create/--help.md)
 - [`--json`](strata-terminal/ops/create/--json.md)
 - [`--kind`](strata-terminal/ops/create/--kind.md)
 - [`--output`](strata-terminal/ops/create/--output.md)
@@ -514,7 +466,6 @@
 ### `strata ops show` (ops/show)
 
 - [コマンド概要](strata-terminal/ops/show/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/show/--help.md)
 - [`--json`](strata-terminal/ops/show/--json.md)
 - [`--output`](strata-terminal/ops/show/--output.md)
 - [`--profile`](strata-terminal/ops/show/--profile.md)
@@ -523,7 +474,6 @@
 ### `strata ops edit` (ops/edit)
 
 - [コマンド概要](strata-terminal/ops/edit/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/edit/--help.md)
 - [`--json`](strata-terminal/ops/edit/--json.md)
 - [`--output`](strata-terminal/ops/edit/--output.md)
 - [`--profile`](strata-terminal/ops/edit/--profile.md)
@@ -532,7 +482,6 @@
 ### `strata ops set` (ops/set)
 
 - [コマンド概要](strata-terminal/ops/set/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/set/--help.md)
 - [`--json`](strata-terminal/ops/set/--json.md)
 - [`--output`](strata-terminal/ops/set/--output.md)
 - [`--plan`](strata-terminal/ops/set/--plan.md)
@@ -542,7 +491,6 @@
 ### `strata ops history` (ops/history)
 
 - [コマンド概要](strata-terminal/ops/history/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/history/--help.md)
 - [`--json`](strata-terminal/ops/history/--json.md)
 - [`--output`](strata-terminal/ops/history/--output.md)
 - [`--profile`](strata-terminal/ops/history/--profile.md)
@@ -551,7 +499,6 @@
 ### `strata ops rollback` (ops/rollback)
 
 - [コマンド概要](strata-terminal/ops/rollback/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/rollback/--help.md)
 - [`--json`](strata-terminal/ops/rollback/--json.md)
 - [`--output`](strata-terminal/ops/rollback/--output.md)
 - [`--profile`](strata-terminal/ops/rollback/--profile.md)
@@ -561,7 +508,6 @@
 ### `strata ops plan` (ops/plan)
 
 - [コマンド概要](strata-terminal/ops/plan/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/plan/--help.md)
 - [`--json`](strata-terminal/ops/plan/--json.md)
 - [`--output`](strata-terminal/ops/plan/--output.md)
 - [`--profile`](strata-terminal/ops/plan/--profile.md)
@@ -571,7 +517,6 @@
 
 - [コマンド概要](strata-terminal/ops/run/README.md)
 - [`--exclusive`](strata-terminal/ops/run/--exclusive.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/run/--help.md)
 - [`--if-instance-id`](strata-terminal/ops/run/--if-instance-id.md)
 - [`--if-owner-id`](strata-terminal/ops/run/--if-owner-id.md)
 - [`--if-profile-revision`](strata-terminal/ops/run/--if-profile-revision.md)
@@ -585,7 +530,6 @@
 ### `strata ops runs` (ops/runs)
 
 - [コマンド概要](strata-terminal/ops/runs/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/runs/--help.md)
 - [`--json`](strata-terminal/ops/runs/--json.md)
 - [`--limit`](strata-terminal/ops/runs/--limit.md)
 - [`--output`](strata-terminal/ops/runs/--output.md)
@@ -595,7 +539,6 @@
 ### `strata ops result` (ops/result)
 
 - [コマンド概要](strata-terminal/ops/result/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/result/--help.md)
 - [`--json`](strata-terminal/ops/result/--json.md)
 - [`--output`](strata-terminal/ops/result/--output.md)
 - [`--profile`](strata-terminal/ops/result/--profile.md)
@@ -604,7 +547,6 @@
 ### `strata bench` (bench)
 
 - [コマンド概要](strata-terminal/bench/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/bench/--help.md)
 
 ### `strata bench run` (bench/run)
 
@@ -615,7 +557,6 @@
 - [`--condition`](strata-terminal/bench/run/--condition.md)
 - [`--credential-env`](strata-terminal/bench/run/--credential-env.md)
 - [`--custom-pack`](strata-terminal/bench/run/--custom-pack.md)
-- [`--help`（alias: `-h`）](strata-terminal/bench/run/--help.md)
 - [`--json`](strata-terminal/bench/run/--json.md)
 - [`--load-timeout`](strata-terminal/bench/run/--load-timeout.md)
 - [`--model-revision`](strata-terminal/bench/run/--model-revision.md)
@@ -641,7 +582,6 @@
 ### `strata bench cancel` (bench/cancel)
 
 - [コマンド概要](strata-terminal/bench/cancel/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/bench/cancel/--help.md)
 - [`--output`](strata-terminal/bench/cancel/--output.md)
 - [`--path`](strata-terminal/bench/cancel/--path.md)
 - [`--profile`](strata-terminal/bench/cancel/--profile.md)
@@ -649,7 +589,6 @@
 ### `strata bench report` (bench/report)
 
 - [コマンド概要](strata-terminal/bench/report/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/bench/report/--help.md)
 - [`--json`](strata-terminal/bench/report/--json.md)
 - [`--out`](strata-terminal/bench/report/--out.md)
 - [`--output`](strata-terminal/bench/report/--output.md)
@@ -658,7 +597,6 @@
 ### `strata bench compare` (bench/compare)
 
 - [コマンド概要](strata-terminal/bench/compare/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/bench/compare/--help.md)
 - [`--json`](strata-terminal/bench/compare/--json.md)
 - [`--out`](strata-terminal/bench/compare/--out.md)
 - [`--output`](strata-terminal/bench/compare/--output.md)
@@ -667,13 +605,11 @@
 ### `strata timeskip` (timeskip)
 
 - [コマンド概要](strata-terminal/timeskip/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/timeskip/--help.md)
 
 ### `strata timeskip run` (timeskip/run)
 
 - [コマンド概要](strata-terminal/timeskip/run/README.md)
 - [`--attempts`](strata-terminal/timeskip/run/--attempts.md)
-- [`--help`（alias: `-h`）](strata-terminal/timeskip/run/--help.md)
 - [`--output`](strata-terminal/timeskip/run/--output.md)
 - [`--prompt`](strata-terminal/timeskip/run/--prompt.md)
 - [`--revise-command`](strata-terminal/timeskip/run/--revise-command.md)
@@ -683,14 +619,12 @@
 ### `strata timeskip status` (timeskip/status)
 
 - [コマンド概要](strata-terminal/timeskip/status/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/timeskip/status/--help.md)
 - [`--output`](strata-terminal/timeskip/status/--output.md)
 - [`--state-dir`](strata-terminal/timeskip/status/--state-dir.md)
 
 ### `strata timeskip list` (timeskip/list)
 
 - [コマンド概要](strata-terminal/timeskip/list/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/timeskip/list/--help.md)
 - [`--output`](strata-terminal/timeskip/list/--output.md)
 - [`--state-dir`](strata-terminal/timeskip/list/--state-dir.md)
 
@@ -699,7 +633,6 @@
 - [コマンド概要](strata-terminal/timeskip/apply/README.md)
 - [`--attempt`](strata-terminal/timeskip/apply/--attempt.md)
 - [`--dry-run`](strata-terminal/timeskip/apply/--dry-run.md)
-- [`--help`（alias: `-h`）](strata-terminal/timeskip/apply/--help.md)
 - [`--output`](strata-terminal/timeskip/apply/--output.md)
 - [`--restore`](strata-terminal/timeskip/apply/--restore.md)
 - [`--state-dir`](strata-terminal/timeskip/apply/--state-dir.md)
@@ -708,14 +641,12 @@
 ### `strata tune` (tune)
 
 - [コマンド概要](strata-terminal/tune/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/--help.md)
 
 ### `strata tune plan` (tune/plan)
 
 - [コマンド概要](strata-terminal/tune/plan/README.md)
 - [`--backend`](strata-terminal/tune/plan/--backend.md)
 - [`--engine`](strata-terminal/tune/plan/--engine.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/plan/--help.md)
 - [`--hold`](strata-terminal/tune/plan/--hold.md)
 - [`--model`](strata-terminal/tune/plan/--model.md)
 - [`--objective`](strata-terminal/tune/plan/--objective.md)
@@ -736,7 +667,6 @@
 - [`--context`](strata-terminal/tune/run/--context.md)
 - [`--engine`](strata-terminal/tune/run/--engine.md)
 - [`--full-digests`](strata-terminal/tune/run/--full-digests.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/run/--help.md)
 - [`--hold`](strata-terminal/tune/run/--hold.md)
 - [`--max-new`](strata-terminal/tune/run/--max-new.md)
 - [`--mode`](strata-terminal/tune/run/--mode.md)
@@ -756,7 +686,6 @@
 - [コマンド概要](strata-terminal/tune/apply/README.md)
 - [`--config`](strata-terminal/tune/apply/--config.md)
 - [`--context`](strata-terminal/tune/apply/--context.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/apply/--help.md)
 - [`--model-path`](strata-terminal/tune/apply/--model-path.md)
 - [`--output`](strata-terminal/tune/apply/--output.md)
 - [`--state-dir`](strata-terminal/tune/apply/--state-dir.md)
@@ -764,21 +693,18 @@
 ### `strata tune rollback` (tune/rollback)
 
 - [コマンド概要](strata-terminal/tune/rollback/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/rollback/--help.md)
 - [`--output`](strata-terminal/tune/rollback/--output.md)
 - [`--state-dir`](strata-terminal/tune/rollback/--state-dir.md)
 
 ### `strata tune status` (tune/status)
 
 - [コマンド概要](strata-terminal/tune/status/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/status/--help.md)
 - [`--output`](strata-terminal/tune/status/--output.md)
 - [`--state-dir`](strata-terminal/tune/status/--state-dir.md)
 
 ### `strata tune list` (tune/list)
 
 - [コマンド概要](strata-terminal/tune/list/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/list/--help.md)
 - [`--output`](strata-terminal/tune/list/--output.md)
 - [`--state-dir`](strata-terminal/tune/list/--state-dir.md)
 
@@ -790,7 +716,6 @@
 - [`--boot-timeout`](strata-terminal/tune/auto/--boot-timeout.md)
 - [`--goal`](strata-terminal/tune/auto/--goal.md)
 - [`--gpu-lock`](strata-terminal/tune/auto/--gpu-lock.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/auto/--help.md)
 - [`--leave-ram`](strata-terminal/tune/auto/--leave-ram.md)
 - [`--mode`](strata-terminal/tune/auto/--mode.md)
 - [`--name`](strata-terminal/tune/auto/--name.md)
@@ -806,75 +731,63 @@
 ### `strata presets` (presets)
 
 - [コマンド概要](strata-terminal/presets/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/--help.md)
 
 ### `strata presets list` (presets/list)
 
 - [コマンド概要](strata-terminal/presets/list/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/list/--help.md)
 - [`--model`](strata-terminal/presets/list/--model.md)
 - [`--output`](strata-terminal/presets/list/--output.md)
 
 ### `strata presets status` (presets/status)
 
 - [コマンド概要](strata-terminal/presets/status/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/status/--help.md)
 - [`--output`](strata-terminal/presets/status/--output.md)
 
 ### `strata presets show` (presets/show)
 
 - [コマンド概要](strata-terminal/presets/show/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/show/--help.md)
 - [`--output`](strata-terminal/presets/show/--output.md)
 
 ### `strata presets apply` (presets/apply)
 
 - [コマンド概要](strata-terminal/presets/apply/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/apply/--help.md)
 - [`--output`](strata-terminal/presets/apply/--output.md)
 
 ### `strata presets rename` (presets/rename)
 
 - [コマンド概要](strata-terminal/presets/rename/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/rename/--help.md)
 - [`--output`](strata-terminal/presets/rename/--output.md)
 
 ### `strata presets delete` (presets/delete)
 
 - [コマンド概要](strata-terminal/presets/delete/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/delete/--help.md)
 - [`--output`](strata-terminal/presets/delete/--output.md)
 
 ### `strata presets undo` (presets/undo)
 
 - [コマンド概要](strata-terminal/presets/undo/README.md)
 - [`--config`](strata-terminal/presets/undo/--config.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/undo/--help.md)
 - [`--output`](strata-terminal/presets/undo/--output.md)
 
 ### `strata presets export` (presets/export)
 
 - [コマンド概要](strata-terminal/presets/export/README.md)
 - [`--file`](strata-terminal/presets/export/--file.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/export/--help.md)
 - [`--output`](strata-terminal/presets/export/--output.md)
 
 ### `strata presets import` (presets/import)
 
 - [コマンド概要](strata-terminal/presets/import/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/import/--help.md)
 - [`--output`](strata-terminal/presets/import/--output.md)
 
 ### `strata presets effective` (presets/effective)
 
 - [コマンド概要](strata-terminal/presets/effective/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/effective/--help.md)
 - [`--output`](strata-terminal/presets/effective/--output.md)
 
 ### `strata presets off` (presets/off)
 
 - [コマンド概要](strata-terminal/presets/off/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/off/--help.md)
 - [`--output`](strata-terminal/presets/off/--output.md)
 
 ### `strata presets recheck` (presets/recheck)
@@ -882,7 +795,6 @@
 - [コマンド概要](strata-terminal/presets/recheck/README.md)
 - [`--boot-timeout`](strata-terminal/presets/recheck/--boot-timeout.md)
 - [`--gpu-lock`](strata-terminal/presets/recheck/--gpu-lock.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/recheck/--help.md)
 - [`--no-quiet-check`](strata-terminal/presets/recheck/--no-quiet-check.md)
 - [`--output`](strata-terminal/presets/recheck/--output.md)
 - [`--serve-dir`](strata-terminal/presets/recheck/--serve-dir.md)
@@ -907,7 +819,6 @@
 - [`--full-quality`](strata-terminal/launch/--full-quality.md)
 - [`--gpu`](strata-terminal/launch/--gpu.md)
 - [`--gpu-roles`](strata-terminal/launch/--gpu-roles.md)
-- [`--help`（alias: `-h`）](strata-terminal/launch/--help.md)
 - [`--kv`](strata-terminal/launch/--kv.md)
 - [`--list-presets`](strata-terminal/launch/--list-presets.md)
 - [`--model`](strata-terminal/launch/--model.md)
@@ -943,7 +854,6 @@
 - [コマンド概要](strata-terminal/connect/README.md)
 - [`--check`](strata-terminal/connect/--check.md)
 - [`--context`](strata-terminal/connect/--context.md)
-- [`--help`（alias: `-h`）](strata-terminal/connect/--help.md)
 - [`--key`](strata-terminal/connect/--key.md)
 - [`--key-env`](strata-terminal/connect/--key-env.md)
 - [`--model`](strata-terminal/connect/--model.md)
@@ -959,7 +869,6 @@
 - [コマンド概要](strata-terminal/status/README.md)
 - [`--connection`](strata-terminal/status/--connection.md)
 - [`--credential-env`](strata-terminal/status/--credential-env.md)
-- [`--help`（alias: `-h`）](strata-terminal/status/--help.md)
 - [`--json`](strata-terminal/status/--json.md)
 - [`--output`](strata-terminal/status/--output.md)
 - [`--quiet`](strata-terminal/status/--quiet.md)
@@ -973,7 +882,6 @@
 - [`--connection`](strata-terminal/monitor/--connection.md)
 - [`--credential-env`](strata-terminal/monitor/--credential-env.md)
 - [`--glyphs`](strata-terminal/monitor/--glyphs.md)
-- [`--help`（alias: `-h`）](strata-terminal/monitor/--help.md)
 - [`--interval`](strata-terminal/monitor/--interval.md)
 - [`--json`](strata-terminal/monitor/--json.md)
 - [`--once`](strata-terminal/monitor/--once.md)
@@ -990,7 +898,6 @@
 - [`--connection`](strata-terminal/logs/--connection.md)
 - [`--credential-env`](strata-terminal/logs/--credential-env.md)
 - [`--follow`](strata-terminal/logs/--follow.md)
-- [`--help`（alias: `-h`）](strata-terminal/logs/--help.md)
 - [`--interval`](strata-terminal/logs/--interval.md)
 - [`--json`](strata-terminal/logs/--json.md)
 - [`--output`](strata-terminal/logs/--output.md)
@@ -1002,13 +909,11 @@
 ### `strata connection` (connection)
 
 - [コマンド概要](strata-terminal/connection/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/connection/--help.md)
 
 ### `strata connection create` (connection/create)
 
 - [コマンド概要](strata-terminal/connection/create/README.md)
 - [`--credential-env`](strata-terminal/connection/create/--credential-env.md)
-- [`--help`（alias: `-h`）](strata-terminal/connection/create/--help.md)
 - [`--json`](strata-terminal/connection/create/--json.md)
 - [`--output`](strata-terminal/connection/create/--output.md)
 - [`--prefix`](strata-terminal/connection/create/--prefix.md)
@@ -1018,7 +923,6 @@
 ### `strata connection show` (connection/show)
 
 - [コマンド概要](strata-terminal/connection/show/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/connection/show/--help.md)
 - [`--json`](strata-terminal/connection/show/--json.md)
 - [`--output`](strata-terminal/connection/show/--output.md)
 - [`--quiet`](strata-terminal/connection/show/--quiet.md)
@@ -1026,7 +930,6 @@
 ### `strata connection list` (connection/list)
 
 - [コマンド概要](strata-terminal/connection/list/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/connection/list/--help.md)
 - [`--json`](strata-terminal/connection/list/--json.md)
 - [`--output`](strata-terminal/connection/list/--output.md)
 - [`--quiet`](strata-terminal/connection/list/--quiet.md)
@@ -1034,7 +937,6 @@
 ### `strata connection set` (connection/set)
 
 - [コマンド概要](strata-terminal/connection/set/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/connection/set/--help.md)
 - [`--if-revision`](strata-terminal/connection/set/--if-revision.md)
 - [`--json`](strata-terminal/connection/set/--json.md)
 - [`--output`](strata-terminal/connection/set/--output.md)
@@ -1044,7 +946,6 @@
 ### `strata config` (config)
 
 - [コマンド概要](strata-terminal/config/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/config/--help.md)
 
 ### `strata config show` (config/show)
 
@@ -1052,7 +953,6 @@
 - [`--connection`](strata-terminal/config/show/--connection.md)
 - [`--credential-env`](strata-terminal/config/show/--credential-env.md)
 - [`--effective`](strata-terminal/config/show/--effective.md)
-- [`--help`（alias: `-h`）](strata-terminal/config/show/--help.md)
 - [`--json`](strata-terminal/config/show/--json.md)
 - [`--output`](strata-terminal/config/show/--output.md)
 - [`--quiet`](strata-terminal/config/show/--quiet.md)
@@ -1062,7 +962,6 @@
 ### `strata code` (code)
 
 - [コマンド概要](strata-terminal/code/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/code/--help.md)
 - [`--quiet`](strata-terminal/code/--quiet.md)
 - [`--resume`](strata-terminal/code/--resume.md)
 - [`--workspace`](strata-terminal/code/--workspace.md)
@@ -1070,7 +969,6 @@
 ### `strata code run` (code/run)
 
 - [コマンド概要](strata-terminal/code/run/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/code/run/--help.md)
 - [`--output`](strata-terminal/code/run/--output.md)
 - [`--policy`](strata-terminal/code/run/--policy.md)
 - [`--prompt-file`](strata-terminal/code/run/--prompt-file.md)
@@ -1079,7 +977,6 @@
 ### `strata code sessions` (code/sessions)
 
 - [コマンド概要](strata-terminal/code/sessions/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/code/sessions/--help.md)
 - [`--json`](strata-terminal/code/sessions/--json.md)
 - [`--output`](strata-terminal/code/sessions/--output.md)
 - [`--quiet`](strata-terminal/code/sessions/--quiet.md)
@@ -1087,13 +984,11 @@
 ### `strata split-engine` (split-engine)
 
 - [コマンド概要](strata-terminal/split-engine/README.md)
-- [`--help`（alias: `-h`）](strata-terminal/split-engine/--help.md)
 
 ### `strata split-engine apply` (split-engine/apply)
 
 - [コマンド概要](strata-terminal/split-engine/apply/README.md)
 - [`--config`](strata-terminal/split-engine/apply/--config.md)
-- [`--help`（alias: `-h`）](strata-terminal/split-engine/apply/--help.md)
 - [`--out`](strata-terminal/split-engine/apply/--out.md)
 - [`--output`](strata-terminal/split-engine/apply/--output.md)
 
@@ -1159,7 +1054,6 @@
 - [`--gr-native-mmvf`](strata-engine/root/--gr-native-mmvf.md)
 - [`--graph-only`](strata-engine/root/--graph-only.md)
 - [`--greedy`](strata-engine/root/--greedy.md)
-- [`--help`（alias: `-h`）](strata-engine/root/--help.md)
 - [`--host-core`](strata-engine/root/--host-core.md)
 - [`--keep-canonical`](strata-engine/root/--keep-canonical.md)
 - [`--kv`](strata-engine/root/--kv.md)
@@ -1337,7 +1231,6 @@
 - [`--expert-profile`](strata-engine-dsv41/root/--expert-profile.md)
 - [`--experts`](strata-engine-dsv41/root/--experts.md)
 - [`--gpus`](strata-engine-dsv41/root/--gpus.md)
-- [`--help`（alias: `-h`）](strata-engine-dsv41/root/--help.md)
 - [`--ids`](strata-engine-dsv41/root/--ids.md)
 - [`--images`](strata-engine-dsv41/root/--images.md)
 - [`--layer-split`](strata-engine-dsv41/root/--layer-split.md)
@@ -1397,7 +1290,6 @@
 - [コマンド概要](strata-plan/root/README.md)
 - [`--dense`](strata-plan/root/--dense.md)
 - [`--embd`](strata-plan/root/--embd.md)
-- [`--help`（alias: `-h`）](strata-plan/root/--help.md)
 - [`--max-context`](strata-plan/root/--max-context.md)
 - [`--pool`](strata-plan/root/--pool.md)
 - [`--state`](strata-plan/root/--state.md)
@@ -1407,7 +1299,6 @@
 ### `strata-device` (`src/core/device_main.cpp`)
 
 - [コマンド概要](strata-device/root/README.md)
-- [`--help`（alias: `-h`）](strata-device/root/--help.md)
 - [`--list-devices`](strata-device/root/--list-devices.md)
 - [`--selftest`](strata-device/root/--selftest.md)
 
@@ -1416,7 +1307,6 @@
 - [コマンド概要](strata-load/root/README.md)
 - [`--chunk-mb`](strata-load/root/--chunk-mb.md)
 - [`--file`](strata-load/root/--file.md)
-- [`--help`（alias: `-h`）](strata-load/root/--help.md)
 - [`--layers`](strata-load/root/--layers.md)
 - [`--no-pin`](strata-load/root/--no-pin.md)
 - [`--stream`](strata-load/root/--stream.md)
@@ -1500,7 +1390,6 @@
 - [`--gpu`](source-setup/root/--gpu.md)
 - [`--gpu-roles`](source-setup/root/--gpu-roles.md)
 - [`--gpus`](source-setup/root/--gpus.md)
-- [`--help`（alias: `-h`）](source-setup/root/--help.md)
 - [`--host`](source-setup/root/--host.md)
 - [`--image-backend`](source-setup/root/--image-backend.md)
 - [`--image-gpu-policy`](source-setup/root/--image-gpu-policy.md)
@@ -1550,7 +1439,6 @@
 - [`--draft-vocab`](source-setup/mac/--draft-vocab.md)
 - [`--family`](source-setup/mac/--family.md)
 - [`--gguf-dir`](source-setup/mac/--gguf-dir.md)
-- [`--help`（alias: `-h`）](source-setup/mac/--help.md)
 - [`--host`](source-setup/mac/--host.md)
 - [`--model`](source-setup/mac/--model.md)
 - [`--models-dir`](source-setup/mac/--models-dir.md)
@@ -1576,7 +1464,6 @@
 - [`--compare-only`](quick-benchmark/root/--compare-only.md)
 - [`--config`](quick-benchmark/root/--config.md)
 - [`--gpu`](quick-benchmark/root/--gpu.md)
-- [`--help`（alias: `-h`）](quick-benchmark/root/--help.md)
 - [`--long`](quick-benchmark/root/--long.md)
 - [`--out`](quick-benchmark/root/--out.md)
 - [`--port`](quick-benchmark/root/--port.md)

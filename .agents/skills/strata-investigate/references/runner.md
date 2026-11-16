@@ -50,6 +50,7 @@ uv run ./create-cli-docs.py -p 12 -l 100
 - `-l`, `--doc-limit N` / `-p`, `--parallel N` のみ。試行記録は持たない（索引にリンクがあれば再現する）。
 - 対象が `<command-path>/README.md` ならコマンド概要、`--option.md` / `-x.md` ならオプション文書になる。
   概要の基準文書は `docs/cli/strata-terminal/launch/README.md`（スクリプトが参照）。
+- `--help` は索引に載せない決まりなので作成対象にならない（`index-refresh.md` §3）。索引に `--help.md` へのリンクが紛れ込んでいたら、作成せず索引側を直す。
 
 ## codex 実行の形（両スクリプト共通）
 

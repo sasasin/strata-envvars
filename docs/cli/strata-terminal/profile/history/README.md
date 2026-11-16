@@ -43,7 +43,7 @@ strata profile history local --json
 
 - [`strata profile` 概要](../README.md)
 - [`strata profile rollback`](../rollback/README.md)
-- [`--help`](--help.md)、[`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)
+- `--help`、[`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)
 - [CLI 索引](../../../README.md)
 
 ## 根拠

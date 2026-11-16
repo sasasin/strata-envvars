@@ -51,7 +51,7 @@ strata models inspect qwen_iq3_xxs --install-dir /absolute/path/to/strata/instal
 
 - [CLI 索引](../../../README.md) — コマンド階層とこのコマンドで受理されるオプション。
 - [`strata models inspect` の利用者向け説明](../../../../TERMINAL.md) — ローカルモデル設定の探索と結果の解釈。
-- [`--help`](--help.md)、[`--install-dir`](--install-dir.md)、[`--json`](--json.md)、[`--output`](--output.md)、[`--quiet`](--quiet.md) — 個別オプション。
+- `--help`、[`--install-dir`](--install-dir.md)、[`--json`](--json.md)、[`--output`](--output.md)、[`--quiet`](--quiet.md) — 個別オプション。
 - [`strata models list`](../list/README.md)、[`strata models import`](../import/README.md) — 関連するモデル確認コマンド。
 
 ## 根拠

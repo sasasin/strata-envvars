@@ -49,7 +49,7 @@ strata profile history local
 | `history NAME` | 現在と保存済み revision を表示する | [`history`](history/README.md) |
 | `rollback NAME --to REVISION` | 過去 revision の内容を現在値として復元する | [`rollback`](rollback/README.md) |
 
-各サブコマンドの `--help` は [`strata profile --help`](--help.md) および各サブコマンド文書から参照できます。
+各サブコマンドのヘルプは `strata profile <サブコマンド> --help` で表示できます。
 
 ## profile の保存と適用
 

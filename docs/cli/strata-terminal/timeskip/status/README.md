@@ -25,7 +25,7 @@ strata timeskip status RUN_ID --state-dir ./timeskip-state
 strata timeskip status RUN_ID --output json
 ```
 
-`RUN_ID` は必須の位置引数です。サブコマンドは `strata timeskip` の下に登録されており、`strata timeskip` だけでは実行できません（`strata_cli/cli.py:348-350,371-374`）。このページのオプション scope は `status` に限られます。個別の値と動作は [`--state-dir`](--state-dir.md)、[`--output`](--output.md)、[`--help`（`-h` alias）](--help.md) を参照してください。
+`RUN_ID` は必須の位置引数です。サブコマンドは `strata timeskip` の下に登録されており、`strata timeskip` だけでは実行できません（`strata_cli/cli.py:348-350,371-374`）。このページのオプション scope は `status` に限られます。個別の値と動作は [`--state-dir`](--state-dir.md)、[`--output`](--output.md)、`--help`（`-h` alias） を参照してください。
 
 ## 表示と実行時の動作
 

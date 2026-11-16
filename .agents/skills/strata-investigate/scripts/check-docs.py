@@ -2,7 +2,8 @@
 """索引と実ファイルの突合で、docs/envvars と docs/cli の追従状況を確認する。
 
 envvars 側: 未作成・孤児・索引と綴りの違うファイル名・索引の重複と並び順・本文の必須節・commit SHA と調査日。
-cli 側: 予定リンク（未作成）・孤児・索引に無い tool-id・コマンド節の概要リンク・option の並び順・commit SHA と調査日。
+cli 側: 予定リンク（未作成）・孤児・索引に無い tool-id・コマンド節の概要リンク・option の並び順・commit SHA と調査日・
+文書化しない `--help` / `-h` の再混入（索引行・文書ファイル・本文からのリンク）。
 """
 
 from __future__ import annotations
@@ -33,6 +34,9 @@ CLI_INDEX_LINK_RE = re.compile(r"^- \[(.*?)\]\(([^)]+)\)\s*$")
 SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
 DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 OPTION_NAME_RE = re.compile(r"`([^`]+)`")
+# `--help` / `-h` は文書化しない（references/index-refresh.md §3）。
+HELP_DOC_NAMES = {"--help.md", "-h.md"}
+MD_LINK_TARGET_RE = re.compile(r"\]\(([^)#\s]+)\)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -278,6 +282,21 @@ def check_cli(repo: Path, target_sha: str) -> dict[str, object]:
     real_tools = {path.name for path in doc_root.iterdir() if path.is_dir()}
     unknown_tools = sorted(real_tools - indexed_tools)
 
+    help_entries: list[str] = []
+    for path in sorted(linked):
+        if Path(path).name in HELP_DOC_NAMES:
+            help_entries.append(f"索引行: {path}")
+    for path in sorted(doc_root.rglob("*.md")):
+        rel = str(path.relative_to(doc_root))
+        if path.name in HELP_DOC_NAMES:
+            help_entries.append(f"文書ファイル: {rel}")
+            continue
+        if rel == CLI_INDEX:
+            continue
+        for match in MD_LINK_TARGET_RE.finditer(path.read_text(encoding="utf-8")):
+            if Path(match.group(1)).name in HELP_DOC_NAMES:
+                help_entries.append(f"本文からのリンク: {rel} → {match.group(1)}")
+
     section_problems: list[str] = []
     order_problems: list[str] = []
     for title, texts, paths in cli_sections(index_text):
@@ -333,6 +352,7 @@ def check_cli(repo: Path, target_sha: str) -> dict[str, object]:
             "unknown_tools": unknown_tools,
             "section_problems": section_problems,
             "order_problems": order_problems,
+            "help_entries": help_entries,
             "no_meta": no_meta,
             "no_sha": no_sha,
             "no_date": no_date,
@@ -348,6 +368,10 @@ def check_cli(repo: Path, target_sha: str) -> dict[str, object]:
         report["problems"].append(f"コマンド節の問題 {len(section_problems)} 件")
     if order_problems:
         report["problems"].append(f"option の並び順違反 {len(order_problems)} 件")
+    if help_entries:
+        report["problems"].append(
+            f"文書化しない --help / -h が {len(help_entries)} 件混入（references/index-refresh.md §3）"
+        )
     if no_meta or no_sha or no_date:
         report["problems"].append(
             f"cli: 調査対象行 {len(no_meta)} 件 / SHA {len(no_sha)} 件 / 調査日 {len(no_date)} 件の欠落"
@@ -460,7 +484,8 @@ def main() -> int:
                 f"コマンド節の問題 {len(cli_report['section_problems'])} 件 / 並び順違反 {len(cli_report['order_problems'])} 件 / "
                 f"調査対象行の欠落 {len(cli_report['no_meta']) + len(cli_report['no_sha']) + len(cli_report['no_date'])} 件"
             )
-            for label in ("missing", "orphans", "section_problems", "order_problems"):
+            print(f"  --help / -h の混入 {len(cli_report['help_entries'])} 件")
+            for label in ("missing", "orphans", "section_problems", "order_problems", "help_entries"):
                 items = cli_report[label]
                 if items:
                     print(f"  {label}:")

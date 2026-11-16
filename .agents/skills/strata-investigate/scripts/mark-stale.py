@@ -41,8 +41,8 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         metavar="OPTION",
-        help="この option 文字列の文書を対象外にする (繰り返し指定可)。既定の除外リストは持たないので、"
-        " CLI を回すときは --exclude-token=--help を毎回付ける (usage 文言変更が主な群)。",
+        help="この option 文字列の文書を対象外にする (繰り返し指定可)。既定の除外リストは持たない"
+        " (例: 共通 option の --json / --quiet を後回しにする)。",
     )
     parser.add_argument("--limit", type=int, default=40, metavar="N", help="今回削除する上限 (安全弁)")
     parser.add_argument("--scope", choices=["all", "envvars", "cli"], default="all")

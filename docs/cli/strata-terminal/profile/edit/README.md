@@ -8,7 +8,7 @@
 | コマンド | `strata profile edit` |
 | 主な実装 | `strata_cli/cli.py`、`strata_control/profiles.py` |
 | 位置引数 | `NAME`（既存 profile 名） |
-| 出力関連 option | [`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)、[`--help`](--help.md) |
+| 出力関連 option | [`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)、`--help` |
 
 ## 役割
 

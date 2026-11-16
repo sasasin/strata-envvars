@@ -45,7 +45,7 @@ CLI は `STRATA_INSTALL_DIR` が設定されていればそのディレクトリ
 ## 関連文書
 
 - [`--update`](--update.md) — `strata install` の更新モード。
-- [`--help`（alias: `-h`）](--help.md) — install parser のヘルプ。
+- `--help`（alias: `-h`） — install parser のヘルプ。
 - [CLI 文書索引](../../README.md) — コマンド階層とオプション文書。
 - Strata `docs/TERMINAL_LAUNCH.md` — Terminal の導入方法と `strata launch` の説明（調査対象 repo 内の資料）。
 
