@@ -54,7 +54,7 @@ strata runtime verify --profile four-gpu --if-owner-id OWNER_ID --if-instance-id
 
 ## 関連文書
 
-- [`--profile`](--profile.md)、[`--wait`](--wait.md)、[`--load`](--load.md)、[`--plan`](--plan.md)、[`--if-owner-id`](--if-owner-id.md)、[`--if-instance-id`](--if-instance-id.md)、[`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)、[`--help`](--help.md) — このコマンドのオプション文書。
+- [`--profile`](--profile.md)、[`--wait`](--wait.md)、[`--load`](--load.md)、[`--plan`](--plan.md)、[`--if-owner-id`](--if-owner-id.md)、[`--if-instance-id`](--if-instance-id.md)、[`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)、`--help` — このコマンドのオプション文書。
 - [CLI 索引](../../../README.md) — Terminal CLI のコマンド・オプション一覧。
 - Strata `docs/TERMINAL.md` — managed runtime、verify probe、限界の説明。
 - Strata `docs/MANAGEMENT_PROTOCOL.md` — runtime verify の plan と journal の management bridge 契約。

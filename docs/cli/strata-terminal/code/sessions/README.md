@@ -44,7 +44,7 @@ CLI 全体では未知の引数は argparse の usage error となります。`-
 
 - [`strata code` の概要](../README.md)
 - [`strata code run` の概要](../run/README.md)
-- [`--help`（alias: `-h`）](--help.md)
+- `--help`（alias: `-h`）
 - [`--json`](--json.md)
 - [`--output`](--output.md)
 - [`--quiet`](--quiet.md)

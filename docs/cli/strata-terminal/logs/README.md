@@ -54,7 +54,7 @@ one-shot の保持イベントは最大 32 件です。follow 中に取得間隔
 
 ## 関連するオプション文書
 
-このコマンドの全オプションは [`docs/cli/README.md`](../../README.md) の `strata-terminal` 節に一覧します。接続先・credential・timeout は [`--url`](--url.md)、[`--connection`](--connection.md)、[`--credential-env`](--credential-env.md)、[`--timeout`](--timeout.md)、出力動作は [`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)、追跡動作は [`--follow`](--follow.md)、[`--interval`](--interval.md)、取得元は [`--source`](--source.md) を参照してください。コマンド固有のヘルプは [`--help`](--help.md)（短縮形 `-h`）です。
+このコマンドの全オプションは [`docs/cli/README.md`](../../README.md) の `strata-terminal` 節に一覧します。接続先・credential・timeout は [`--url`](--url.md)、[`--connection`](--connection.md)、[`--credential-env`](--credential-env.md)、[`--timeout`](--timeout.md)、出力動作は [`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)、追跡動作は [`--follow`](--follow.md)、[`--interval`](--interval.md)、取得元は [`--source`](--source.md) を参照してください。コマンド固有のヘルプは `--help`（短縮形 `-h`）です。
 
 ## 根拠
 

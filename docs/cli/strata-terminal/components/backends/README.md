@@ -23,7 +23,7 @@ strata components backends
 strata components backends --output json
 ```
 
-`--output` はこのサブコマンド固有で、値は `human` / `json`、省略時は `human` です（`strata_cli/cli.py:129-131`）。個別の出力形式は [`--output`](--output.md)、ヘルプは [`--help`](--help.md) を参照してください。
+`--output` はこのサブコマンド固有で、値は `human` / `json`、省略時は `human` です（`strata_cli/cli.py:129-131`）。個別の出力形式は [`--output`](--output.md)、ヘルプは `--help` で表示できます。
 
 ## 表示内容と対応範囲
 

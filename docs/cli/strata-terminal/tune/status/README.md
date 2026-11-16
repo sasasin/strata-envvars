@@ -45,7 +45,7 @@ strata tune status JOB_ID --state-dir ./tuning-state --output json
 - [`strata tune run`](../run/README.md)
 - [`strata tune apply`](../apply/README.md)
 - [`strata tune list`](../list/README.md)
-- [`--output`](--output.md)・[`--state-dir`](--state-dir.md)・[`--help`](--help.md)
+- [`--output`](--output.md)・[`--state-dir`](--state-dir.md)・`--help`
 - [CLI 索引](../../../README.md)
 
 ## 根拠

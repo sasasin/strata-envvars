@@ -60,7 +60,6 @@ AMD の `auto` はさらに制限され、現行ルールでは `gfx1201` の 4 
 - CMake target は `strata-split-2`、`strata-split-3`、`strata-split-4` です。NVIDIA package 内では compute capability 付きの名前、AMD package 内では architecture 付きの名前で配置される場合があります。実際に使うファイルは Terminal が engine component folder から解決します（`src/split/CMakeLists.txt:92-97,116`、`strata_control/split_engine.py:493-497`）。
 - CMake では Linux CUDA または Linux HIP 以外の構成では split engine を生成せず、必要な ggml CUDA headers がない場合も対象を skip します（`src/split/CMakeLists.txt:20-30`）。
 - parser の必須条件は `--serve`、`--native`、`--mtp` です。未知の引数はエラーとなり、引数不足・不正値など parse 段階の失敗は stderr に `sfnx: ...` を出して status 2 で終了します。モデル読み込み後の致命的失敗は標準出力に `ERR ...`、stderr に診断を出し status 1 で終了します（`src/split/tools/sfnx.cpp:77-103,1030-1048,1051-1062`）。
-- `strata-split` 独立の Release asset や全 platform の package 実体は、この文書では確認していません。engine package に同梱されているかは使用する配布物によります。索引側の Release 確認範囲は [`000_cli_tools.md`](../../000_cli_tools.md) を参照してください。
 
 ## 関連文書
 

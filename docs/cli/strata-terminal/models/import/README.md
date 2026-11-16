@@ -23,7 +23,7 @@ strata models import /absolute/path/to/model-folder --plan
 strata models import /absolute/path/to/model-00001-of-00002.gguf --plan --output json
 ```
 
-`PATH` は絶対パスで指定します。ファイルを選ぶ場合は `.gguf` のモデルファイルを指定し、分割モデルではどの shard でも選べます。ディレクトリはモデルファイルを含む場所のほか、モデルを含む下位フォルダーを探す上位ディレクトリも指定できます。CLI parser では `--plan` が必須で、`--output` は `human`（既定）または `json` です。[`--plan`](--plan.md)、[`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)、[`--help`](--help.md) は個別文書を参照してください。
+`PATH` は絶対パスで指定します。ファイルを選ぶ場合は `.gguf` のモデルファイルを指定し、分割モデルではどの shard でも選べます。ディレクトリはモデルファイルを含む場所のほか、モデルを含む下位フォルダーを探す上位ディレクトリも指定できます。CLI parser では `--plan` が必須で、`--output` は `human`（既定）または `json` です。[`--plan`](--plan.md)、[`--output`](--output.md)、[`--json`](--json.md)、[`--quiet`](--quiet.md)、`--help` は個別文書を参照してください。
 
 ## 実行モードと主な動作
 

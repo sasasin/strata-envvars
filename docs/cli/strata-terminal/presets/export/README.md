@@ -46,7 +46,7 @@ preset が見つからない場合、または名前・ID prefix が複数の pr
 - [`strata presets` の概要](../README.md)
 - [`strata presets import`](../import/README.md)
 - [`strata tune auto`](../../tune/auto/README.md)
-- [`--file`](--file.md)、[`--output`](--output.md)、[`--help` / `-h`](--help.md)
+- [`--file`](--file.md)、[`--output`](--output.md)、`--help` / `-h`
 - [CLI 文書索引](../../../README.md)
 
 ## 根拠

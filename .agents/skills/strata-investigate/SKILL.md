@@ -2,7 +2,7 @@
 name: strata-investigate
 description: |
   strata-envvars リポジトリの調査・更新運用。Strata のリリースや checkout 更新後に、環境変数一覧
-  (docs/envvars/000_envvers.md) と CLI 入口・索引 (docs/cli/000_cli_tools.md、docs/cli/README.md) を
+  (docs/envvars/000_envvers.md) と CLI ツール一覧・索引 (docs/cli/000_cli_tools.md、docs/cli/README.md) を
   最新化し、増減に合わせて docs/envvars/<NAME>.md と
   docs/cli/<tool-id>/<command-path>/<option>.md を 1 件 1 セッションで作成・削除する。
   create-envvars-docs.py / create-cli-docs.py の並列実行と飽和判定、索引と実ファイルの突合
@@ -18,7 +18,7 @@ description: |
 
 # Strata 調査文書の更新 runbook
 
-Strata ソースコードを一次情報にして、このリポジトリの `docs/` を現行 release に追従させる手順。
+Strata ソースコード（作業開始時点の checkout）だけを一次情報にして、このリポジトリの `docs/` を最新のソースに追従させる手順。GitHub Release の配布物は調査対象にも根拠にもしない。
 **詳細な調査仕様は `docs/` 側の文書が正**であり、本書は「どの順序で・何を読み・何を叩くか」だけを定める。
 
 ## 前提の絶対パス
@@ -64,12 +64,12 @@ git -C "$HOME/src/github.com/Niko1221/Strata" describe --tags
 ## A. 索引の最新化（リリース追従の入口）
 
 1. `docs/envvars/000_envvers.md`（環境変数一覧）を再生成する。
-2. `docs/cli/000_cli_tools.md`（CLI 入口・ビルド生成物・Release 配布物）を更新する。
+2. `docs/cli/000_cli_tools.md`（CLI ツール一覧。tool-id と parser の所在）を更新する。
 3. `docs/cli/README.md`（CLI 索引）を更新する。
 4. 更新後に F（突合）を走らせ、増減件数を確認する。
 5. 減った項目は B に進み、増えた項目は C に進む。
 
-各索引が従うべき手順の本文は `docs/` 側に既にある（`docs/cli/000_cli_tools.md` と `docs/cli/README.md` の「更新手順と次回の調査指示」節、`docs/envvars/000_envvers.md` 冒頭の生成方法）。索引は**予定リンクを含んだ一覧**であって、この段階で個別文書は作らない。
+各索引の更新手順と、索引に書いてよい中身は `references/index-refresh.md` が正（環境変数一覧の生成範囲は `references/extraction-recipes.md` §5）。索引 3 ファイルには調査対象行と一覧だけを置き、手順・依頼文・差分・履歴・Release の実測値は書かない。索引は**予定リンクを含んだ一覧**であって、この段階で個別文書は作らない。
 
 CLI 索引を更新したときは option inventory も再生成する（`scripts/cli-grammar.py`）。H の陳腐化検出 (S-c) がこれを使う。
 
@@ -81,8 +81,6 @@ python3 .agents/skills/strata-investigate/scripts/evidence-index.py    # 証拠�
 python3 .agents/skills/strata-investigate/scripts/find-stale.py --stage3
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --limit 20          # dry-run
 python3 .agents/skills/strata-investigate/scripts/mark-stale.py --apply --limit 20  # 削除
-python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
-  --exclude-token=--help --limit 200 --apply                                        # 共通 option は後回し
 uv run ./create-envvars-docs.py -p 5 -l 20                                          # 再作成
 uv run ./create-cli-docs.py -p 12 -l 40
 python3 .agents/skills/strata-investigate/scripts/check-docs.py
@@ -94,9 +92,9 @@ option 文字列そのものが出るか」（Stage 2）で候補を絞ること
 
 2026-11-02 の一巡実測: 全走査（Stage 1/2/3）は約 3 秒。envvars の候補 13 件（`token-in-diff` 12 と
 `unknown-sha` 1）を削除して再作成するのに 4 分 27 秒（5 並列、全件 created）。CLI は 115 件のうち
-`--exclude-token=--help` で 97 件を後回しにし、18 件を 2 分 42 秒で回した。
-`moved` 判定の項目は削除しない（引用座標だけが古い）。**CLI を回すときは毎回
-`--exclude-token=--help` を付ける**（スクリプトに既定除外は無いので、`--help` の 97 件は候補に残ったままが正常）。
+`--help` の 97 件を後回しにし、18 件を 2 分 42 秒で回した。この結果を受けて 2026-11-17 に
+`--help` の文書自体を廃止した（索引に載せず作らない。`references/index-refresh.md` §3）ので、
+現在は CLI の候補に `--help` は出ない。`moved` 判定の項目は削除しない（引用座標だけが古い）。
 
 ## B. 削除（prune）
 
@@ -111,11 +109,11 @@ uv run ./create-envvars-docs.py -p 5 -l 100      # envvars
 uv run ./create-cli-docs.py -p 12 -l 100         # CLI
 ```
 
-1 変数（1 オプション）= 1 codex セッション。飽和判定・state ファイル・並列数の目安は `references/runner.md`。
+1 変数（1 オプション）= 1 codex セッション。CLI の `--help` は索引に載せないので作成されない。飽和判定・state ファイル・並列数の目安は `references/runner.md`。
 
 ## D / E. 1 件の調査
 
-対象を 1 つ指定して実行する。D は `docs/envvars/001_investigation.md`、E は `docs/cli/001_investigation.md` の調査範囲・品質基準・配置規約にそのまま従う。文体と詳しさの基準は、D が `docs/envvars/STRATA_ADAPT_OVERLAP.md`、E のコマンド概要が `docs/cli/strata-terminal/launch/README.md`。雛形は `assets/` に置いたが、雛形より基準文書の方が詳しい。
+対象を 1 つ指定して実行する。D は `docs/envvars/001_investigation.md`、E は `docs/cli/001_investigation.md` の調査範囲・品質基準・配置規約にそのまま従う。文体と詳しさの基準は、D が `docs/envvars/001_investigation.md` の「文書フォーマット」「詳しさの基準」（特定の文書を手本にしない）、E のコマンド概要が `docs/cli/001_investigation.md` の「コマンド概要の内容」（同じく特定の文書を手本にしない）。雛形は `assets/` に置いた。
 
 codex に投げる場合の依頼文は `references/prompts.md` にある。
 

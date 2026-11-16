@@ -56,7 +56,7 @@ ID は4文字以上の一意な prefix を指定できます。名前は大文�
 - [preset の適用](../apply/README.md)
 - [preset の undo](../undo/README.md)
 - [`--output`](--output.md)
-- [`--help` / `-h`](--help.md)
+- `--help` / `-h`
 - [CLI 文書索引](../../../README.md)
 
 ## 根拠

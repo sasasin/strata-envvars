@@ -47,7 +47,7 @@ strata connection show work --output json
 
 - [CLI 索引](../../../README.md) — `strata-terminal` のコマンドとオプション文書。
 - [`strata connection`](../README.md) — 接続記録の共通仕様と保存先。
-- [`--help`（alias: `-h`）](--help.md)、[`--json`](--json.md) — このコマンドで使えるオプションの説明。
+- `--help`（alias: `-h`）、[`--json`](--json.md) — このコマンドで使えるオプションの説明。
 
 ## 根拠
 

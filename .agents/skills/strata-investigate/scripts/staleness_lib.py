@@ -15,7 +15,7 @@ from typing import Iterable
 
 ENVVAR_DIR = "docs/envvars"
 ENVVAR_INDEX = "000_envvers.md"
-ENVVAR_EXCLUDE = {"001_investigation.md", "STRATA_ADAPT_OVERLAP.md"}
+ENVVAR_EXCLUDE = {"001_investigation.md"}
 CLI_DIR = "docs/cli"
 CLI_INDEX = "README.md"
 CLI_SKIP = {"README.md", "000_cli_tools.md", "001_investigation.md"}

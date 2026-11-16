@@ -51,7 +51,7 @@ strata-device --help
 ## 関連文書
 
 - オプション個別文書と CLI 索引: [`docs/cli/README.md`](../../README.md) の `strata-device` 節。
-- [`--help`](--help.md)、[`--list-devices`](--list-devices.md)、[`--selftest`](--selftest.md) の各リンク先は索引上の個別文書です。
+- [`--list-devices`](--list-devices.md)、[`--selftest`](--selftest.md) の各リンク先は索引上の個別文書です（`--help` は文書化しない）。
 - AMD HIP backend とデバイス列挙の利用例: Strata [`docs/AMD_HIP.md`](../../../../../../Niko1221/Strata/docs/AMD_HIP.md)（checkout の利用者向け説明）。
 
 ## 根拠

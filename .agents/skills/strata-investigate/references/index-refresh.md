@@ -5,39 +5,58 @@
 
 | 索引 | 更新手順の本文（正） | skill 側の補足 |
 | --- | --- | --- |
-| `docs/envvars/000_envvers.md` | 冒頭の「生成方法」節（検索した API / 構文の一覧） | 下記 §1 と `extraction-recipes.md` |
-| `docs/cli/000_cli_tools.md` | 「更新手順と次回の調査指示」節（8 手順）＋「次回の依頼文」 | 下記 §2 |
-| `docs/cli/README.md` | 「更新手順と次回の調査指示」節（8 手順）＋「次回の依頼文」 | 下記 §3 |
+| `docs/envvars/000_envvers.md` | `extraction-recipes.md` §5（生成範囲。索引ファイル側には書かない） | 下記 §1 |
+| `docs/cli/000_cli_tools.md` | 下記 §2（索引ファイル側には手順を書かない） | `extraction-recipes.md` §2・§3 |
+| `docs/cli/README.md` | 下記 §3（索引ファイル側には手順を書かない） | `extraction-recipes.md` §3 |
 
-更新順序は §1 → §2 → §3。§2 の配布物・入口の一覧が §3 の tool-id 集合を決める。
+3 ファイルとも**一覧だけ**を置く。生成方法・手順・依頼文・前回からの変化・履歴・Release の実測値は索引に書かない。
+差分は `git diff` / `git log` で見て、説明が要るならコミットメッセージに書く。
+
+更新順序は §1 → §2 → §3。§2 の tool-id 一覧が §3 の tool-id 集合を決める。
 
 ## 1. 環境変数一覧（`docs/envvars/000_envvers.md`）
 
-- 索引の形は 1 行 1 名の `- \`NAME\``（ASCII 順、重複なし）。冒頭に Strata の commit SHA・コミット日・一覧生成日・総数・生成方法・内訳を書く。この形式を崩すと `create-envvars-docs.py` と `scripts/check-docs.py` が読めなくなる。
-- 検索対象 API と除外条件の完全な一覧は索引自身の冒頭に書いてある（C/C++/CUDA/HIP/SYCL/Metal/Rust、Python、JS/TS、shell/batch/PowerShell、CMake/Docker/Compose/GitHub Actions）。再生成時も同じ範囲で grep し、`bench/results/`、`docs/`、`data/`、`ref/`、`third_party/` を落とす。
-- 既定値テーブル（`{"STRATA_X", "1"}`）や `setenv("X=" + v)` 経由の名前も拾う。コメント・docs・ビルド `#define`・コマンドライン引数名・CMake 変数・テスト内のダミー文字列は落とす。
-- 前版との差分は `git diff` で見る。減った名前は `prune.md` §1、増えた名前は `runner.md` へ渡す。
+- 索引は**一覧だけ**のファイルにする。中身は次の 3 つに限り、これ以外（生成方法・検索 API・除外条件・総数・内訳・前版との差分・履歴・運用メモ）は書かない。
+
+  ```markdown
+  # 環境変数一覧
+
+  調査対象: Strata `main` の HEAD `<完全な commit SHA>`（`YYYY-MM-DD` 時点）。
+
+  ## 環境変数
+
+  - `NAME`
+  ```
+
+  `調査対象:` 行は `scripts/check-docs.py --stale` が基準 SHA として読む。一覧は 1 行 1 名の `- \`NAME\``（ASCII 順、重複なし）。この形を崩すと `create-envvars-docs.py` と `scripts/check-docs.py` が読めなくなる。
+- 検索対象 API・除外条件・見る場所は `extraction-recipes.md` §5 が正。再生成時はその範囲で grep する。
+- 前版との差分・件数は `git diff` / `git log` で見る（索引には書き残さない）。減った名前は `prune.md` §1、増えた名前は `runner.md` へ渡す。差分の説明が要るならコミットメッセージに書く。
 - 環境変数名の大小が異なる同名（Windows の `PATH` と `Path` など）は索引では 1 名に正規化されることがある。ファイル名は Strata が実際に読む綴りを使うので、`check-docs.py` が「索引名と綴りの違うファイル」を出す場合はどちらの綴りがソース上の実綴りか確認して寄せる。
 
-## 2. CLI 入口・配布物（`docs/cli/000_cli_tools.md`）
+## 2. CLI ツール一覧（`docs/cli/000_cli_tools.md`）
 
-- 「利用者向け入口と設置先」表の 5 列（役割 / ソース上の入口 / 生成・配布経路 / 配布時の名前 / 主な設置・実行場所）を維持し、推測で埋めない列は「実体を確認できていない項目（推測しない）」節に回す。
-- 「現行 GitHub Release の実物」節は Releases API の実測で更新する（tag、公開日、asset 名・サイズ・digest、`install-manifest.txt`、`latest.json`、`SHA256SUMS.txt`、feed JSON）。小さな asset は展開して中身とハッシュを確認する。`*.ps1` は `.gitattributes` で CRLF 化されるため、asset の SHA-256 は git オブジェクト（LF）側と比べる。
-- 「直前の調査からの変化」節を追記し、「調査で確認した主なソース」と末尾の commit hash・調査日を更新する。
-- CLI 引数の網羅はこのファイルではやらない（§3 と個別文書の仕事）。
+- `docs/cli/<tool-id>/` を切る単位の一覧。envvars の `000_envvers.md` に相当し、`docs/cli/001_investigation.md` が tool-id の起点として読む。
+- 中身は次に限る: 見出し、`調査対象:` 行（HEAD の完全な commit SHA と日付）、`## tool-id` 表（tool-id / 入口 / parser の所在 / scope）、`## 対象外`（入口と一行の理由）。
+- 書かないもの: 設置先・配布経路・Release asset の名前・サイズ・digest、feed の中身、Docker の flavor、`add_executable` の件数、前回からの変化、調べたソース一覧、更新手順・依頼文。
+- 更新時は Strata ルート・`bin/`・`packaging/`・`tools/`・`strata_cli/`・`src/`・各 `CMakeLists.txt` を見て、tool-id の追加・削除・改名と parser の所在を確かめる（`extraction-recipes.md` §2・§3）。名前だけで分類せず、呼び出し先と parser を読む。
+- tool-id は現行 checkout に parser があるものだけ。ソースから parser が消えた CLI は、過去の Release に配布物が残っていても一覧から外す（Release は調べない）。
+- `*_test` / `*_parity` / `*_bench`、probe・harness、配布物を作る helper、CLI 引数を持たない installer は対象外に置く。対象外から tool-id に昇格させる場合は利用者・build target・parser を確認する。
 
 ## 3. CLI 索引（`docs/cli/README.md`）
 
-- 冒頭に調査対象 commit SHA と調査日、`## 索引の対象境界` に各 tool-id の parser 所在を書く。
-- `## \`tool-id\`` → `### \`コマンド\``（command path）→ `- [コマンド概要](<...>/README.md)` を節の先頭に 1 つ → `- [\`--option\`（alias: \`-o\`）](<...>/--option.md)` を**表示される正規名の ASCII 順**。
+- 中身は次に限る: 見出し、`調査対象:` 行、`## \`tool-id\``（グループ見出しも可）→ `### \`コマンド\`` → リンク行。リンクの無いコマンドは `- オプションなし（位置引数のみ）` のような 1 行だけ置いてよい。
+- 書かないもの: 前置きの説明、対象境界（`000_cli_tools.md` に置く）、`### 索引更新 <日付>` のような履歴、inventory の件数、コマンド節の注記・根拠の行番号（コマンド概要 `README.md` に置く）、更新手順・依頼文。
+- `調査対象:` 行は `check-docs.py`・`staleness_lib.py`・`cli-grammar.py`（`--revision` 既定）が基準 SHA として読む。見出しとリンク行の形は `create-cli-docs.py` と `check-docs.py` が読む。
+- 各コマンド節は `- [コマンド概要](<tool-id>/<command-path>/README.md)` を先頭に 1 つ、その後 `- [\`--option\`（alias: \`-o\`）](<...>/--option.md)` を**表示される正規名の ASCII 順**（`--replica-profile` は `--replicas` より前）。
+- `--help`（alias `-h`）は索引に載せない（オプション文書を作らない）。parser が自動で足す help は全コマンド共通で、usage 文言の変化に追随するだけになり、文書として情報が増えないため。他の option の網羅性照合では `--help` / `-h` を突合対象から外す。索引行・`--help.md` / `-h.md` のファイル・本文からのリンクが再び現れたら `scripts/check-docs.py` が「--help / -h の混入」として報告する。
 - 配置規約と一意性（`tool-id + command-path + option identity`）は `docs/cli/001_investigation.md` が正。ラッパーが委譲だけなら重複登録せず、委譲先が独自 parser を持つ場合は別 scope（例 `source-setup/mac/`、`strata-engine/qwen36/`）。
+- 更新時は `strata_cli/cli.py` の root parser と各 module の登録 parser、`cli.py` が後から足す共通 option（`--json` / `--quiet` など）、C/C++ の手書き `argv` 解析と parser 前に処理される引数、`help=argparse.SUPPRESS` の option をたどる。
 - 網羅性は機械照合する: parser 側から抽出した option 集合（`extraction-recipes.md` §3）と索引のリンク集合を突き合わせ、追加・削除・改名・alias 表記の漏れと重複を見る。
 - 索引更新のたびに option inventory も保存する（陳腐化検出 S-c が使う）。
 
   ```bash
   python3 .agents/skills/strata-investigate/scripts/cli-grammar.py    # → .cli-grammar.json
   ```
-- Release installer（`install.sh` / `install.ps1`）は CLI 引数を持たないので option 文書を作らず、その事実を書く。
 
 ## 更新後の自己点検
 

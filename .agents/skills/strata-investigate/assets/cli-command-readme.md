@@ -40,9 +40,9 @@
 
 ## 根拠
 
-parser 登録箇所、実行処理、配布 wrapper などの `path:line`。Release への同梱実績を書く場合は取得日で示す。
+parser 登録箇所、実行処理、配布 wrapper などの `path:line`（checkout のソースだけ。Release の配布物は根拠にしない）。
 
 <!--
-基準文書: docs/cli/strata-terminal/launch/README.md（详しさはこの文書に合わせる）。
+書式と詳しさの基準は docs/cli/001_investigation.md の「コマンド概要の内容」（特定の文書を手本にしない）。
 コマンド概要は docs/cli/<tool-id>/<command-path>/README.md に置き、索引の各節の先頭リンクにする。
 -->

@@ -38,7 +38,7 @@ PROMPT_TEMPLATE = """調査依頼です。Strata の環境変数 1 個につい�
 次の手順で作業してください。
 
 1. Strata リポジトリで `git rev-parse HEAD` と `git status --short --branch` を確認してください。調査対象の完全な commit SHA と調査日を文書に記録し、未コミット変更を上書きしないでください。
-2. `{investigation}` の調査範囲・手法・文書フォーマット・品質基準に従ってください。書式と詳しさの基準文書は `{example_doc}` です。
+2. `{investigation}` の調査範囲・手法・文書フォーマット・詳しさの基準・品質基準に従ってください。他の環境変数文書を書式の手本にしないでください。
 3. `{index}` は grep で得た候補一覧であり、その名前が実際に環境変数であることを保証しません。候補名の全参照を `rg` で洗い出し、実際に環境から値を読んでいる箇所を特定してください。helper 経由や動的な名前の渡し先も追跡し、最初に見つかった箇所だけで判断しないでください。
 4. 値の判定（未設定・空文字・変換方法・境界・無効値）、既定値と CLI 引数や他の環境変数との優先順位、読み取りの時期と cache の有無、有効になる条件（OS / backend / build macro / サーバーモード / CLI / モデル状態 / 他変数）、実際の挙動、観測できるログ・終了・失敗経路を、Strata の相対ファイルパスと行番号で裏付けてください。
 5. 外部ライブラリや GPU driver が読むだけの名前や、読み取り箇所が見つからない場合は、空の文書や推測の文書を作らず、`{index}` との食い違いとして報告してください。Strata が値を読む・転送する・警告を出す事実だけを書き、外部ライブラリ側の挙動を Strata の挙動として説明しないでください。
@@ -254,7 +254,6 @@ def create_doc(envvar: str, stale_note: str = "") -> tuple[str, int, str, str]:
         doc_path=doc_path,
         index=INDEX,
         investigation=DOC_ROOT / "001_investigation.md",
-        example_doc=DOC_ROOT / "STRATA_ADAPT_OVERLAP.md",
         stale_note=stale_note,
     )
     with tempfile.TemporaryDirectory(prefix="create-envvars-docs-") as temp_dir:

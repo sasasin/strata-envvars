@@ -1,61 +1,20 @@
-# Strata CLI オプション文書 索引
+# CLI コマンド・オプション索引
 
-この索引は Strata のユーザー向け CLI 入口と、そのコマンド階層ごとのオプション文書を列挙します。リンク先の文書は今後作成する予定の項目も含みます。したがって、現時点でリンク先の Markdown が未作成でも、この索引では予定パスとして掲載しています。
-
-調査対象: Strata commit `146df3c468739147f520ac3816de806f71232571`（2026-11-07 調査、commit 日 2026-11-07）。`git status --short --branch` は working tree clean（branch `main` = `origin/main`）、`git describe --tags` は `v0.2.12` で、tag は HEAD と同一 commit です。
-
-文書配置と調査基準は [`001_investigation.md`](001_investigation.md)、CLI 入口と配布形態は [`000_cli_tools.md`](000_cli_tools.md) を参照してください。各コマンドの概要ページは `docs/cli/<tool-id>/<command-path>/README.md`、オプション文書は `docs/cli/<tool-id>/<command-path>/<option-name>.md` に置きます。以下の「コマンド概要」とオプションのリンク先は、今後作成する予定のものも含みます。短縮名・同じ parser action の alias は正規の長い名前の文書にまとめます。
-
-### 索引更新 2026-11-07（v0.2.12 `146df3c4…`）
-
-- 現行 `strata_cli` parser と索引のコマンド階層・option を確認しました。利用者向け parser の追加・削除・改名はありません。
-- option inventory を `python3 .agents/skills/strata-investigate/scripts/cli-grammar.py --revision 146df3c468739147f520ac3816de806f71232571` で再生成しました。1164 option 文字列、9266 出現箇所、608 ファイルです。前回 inventory からの増分 19 文字列は `tools/force_check.py`、`packaging/feed_tool.py`、CPU / CUDA / Metal の bench・test 用 parser に属し、この索引の利用者向け CLI scope には入りません。
-- Release API で v0.2.12（2026-11-07 公開）を確認しました。配布物の詳細は [`000_cli_tools.md`](000_cli_tools.md) に記載しています。
-
-## 索引の対象境界
-
-- `strata-terminal`: `strata_cli/cli.py` の root parser と、そこから登録されるサブコマンド parser。`strata_cli/launch/cmd.py` の `launch` / `connect`、`strata_cli/update_cmd.py`、`strata_cli/tune_commands.py`、`strata_cli/drafting_cmd.py`、`strata_cli/monitor_commands.py` で定義される parser も同じ索引に入れます。POSIX/Windows の wrapper は同じ Python CLI を起動するため共通索引です。`strata components engines` / `use` / `remove` は `strata_cli/update_cmd.py` で登録され、`strata_cli/cli.py` が共通の `--json` / `--quiet` を追加します。`strata split-engine apply` は `strata_cli/split_cmd.py` の独立 parser として登録されています。
-- `strata-engine`: CMake で作られるネイティブ `strata` 推論エンジンの `src/program/generate.cpp` の引数 parser。`main` 冒頭の family switch で `--native` / `--model` が示す GGUF が `qwen35moe` のとき `src/qwen35` の別ファミリー実装へ移り、そこでの引数 parser は `strata-engine` 内の別 scope `qwen36/` にして索引に含めます。
-- `source-setup`: `setup.sh`、`START-HERE.bat`、`SETUP.bat`、`update.sh`、`UPDATE.bat` が委譲する `setup.py` のオプション。ラッパー独自の引数解釈はなく、同じオプション文書を共有します。Apple Silicon で `STRATA_CONTROL_INSTALL=1` を置かずに `setup.py` を実行すると `metal/setup_mac.py` へ委譲され、そちらは独自の parser を持つため `source-setup` 内の別 scope `mac/` にします。`--backend sycl` で呼ばれる `sycl/setup_intel.py` は独自の option parser を持たず `setup.py` の `main()` を argv を組み替えて再実行するので、`root/` の一覧を共用します。
-- `strata-vision`: `tools/vision/CMakeLists.txt` が作る画像読み取り CLI (`tools/vision/strata_vision.cpp`)。engine package に同梱される独立実行ファイルで、Terminal CLI のサブコマンドではありません。build option で `strata-vision-hip` / `strata-vision-sycl` などの別プログラム名・GPU 版になりますが、parser は同じなので scope は分けず、program 名の違いは `strata-vision/root/` の注記にまとめます。
-- `strata-split`: engine package に同梱される全カード分割 engine（`src/split/`、sFNX 由来・MIT、`docs/SPLIT_ENGINE.md`）。CMake target は `strata-split-<N>`（N は 2/3/4 のみ。`src/split/CMakeLists.txt:92-97`）で、配布される実行ファイル名は NVIDIA が `strata-split-N-sm<cc>`、AMD が `strata-split-N-<arch>`（`strata_control/split_engine.py:494-497`）。Terminal が engine component の `strata` と同じフォルダから探して起動するため、製品 engine の独立 CLI として `strata-split` tool-id にします（`strata-vision` と同じ扱い）。同じ folder にある `src/split/tools/` 系の `split_fnx_run`・`split_convert_dump`・`split_moe_tile_test`・`split_*_test` は開発・検証用なので対象外です。
-- `quick-benchmark`: `bench.sh` / `BENCH.bat` が委譲する `tools/strata_bench.py` のオプション。
-- GitHub Release installers `install.sh` / `install.ps1` は呼び出し時の CLI 引数を解釈せず、設定は環境変数で行うため、この索引に CLI option 文書はありません。環境変数文書側を参照してください。
-- `CMakeLists.txt` 等で生成される `*_test`、`*_parity`、`*_bench`、個別 probe・harness はビルド条件・個別用途の開発/検証プログラムです。製品 CLI のサブコマンドとして一括索引化せず、対象に含める場合は各プログラムの利用者・build target・parser を確認して別の tool-id として追加します。v0.2.9 → v0.2.10（`c62d5e3a..ffa80d73`）で増えた `add_executable`（root 250 → 277 件、`sycl/CMakeLists.txt` 32 → 39 件）はすべて `*_test` / `*_parity` / `*_bench` / harness / probe で、既存 tool-id の対象は増えていません。新規 `src/split/CMakeLists.txt`（5 件）の製品実行ファイル `strata-split-2/3/4` だけ、上のとおり `strata-split` tool-id として追加しました（root の `add_executable` は 277 件）。engine package に同梱される `strata-vision` / `strata-vision-hip` / `strata-vision-sycl` (`tools/vision/CMakeLists.txt`) は利用者 CLI として `strata-vision` tool-id で追加しました。`packaging/monitor_bundle.py`、`packaging/feed_tool.py`、`packaging/package_*.py`、`docker/*.sh` など、配布物を作る helper は利用者向け CLI ではないため対象外です。
-
-### 索引更新 2026-11-06（v0.2.10 `ffa80d73…` → HEAD `9f7d977d…`）
-
-- HEAD の `strata_cli.cli.parser()` を import し、parser のコマンド/option と索引リンクを突合しました。`strata split-engine apply` を追加し、`strata drafting plan` と `fetch` の `--engines-unloading` を反映しました。
-- C/C++/Python 等の option inventory を `python3 .agents/skills/strata-investigate/scripts/cli-grammar.py --revision 9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e` で再生成しました。1145 option 文字列、9056 出現箇所、598 ファイルです。
-- GitHub Release は引き続き v0.2.10（2026-11-02 公開）です。checkout HEAD は tag より 3 commit 先のため、Release asset を HEAD の成果物として扱っていません。
-
-### 索引更新 2026-11-03（v0.2.9 索引 `c62d5e3a…` → v0.2.10 `ffa80d73…`）
-
-- 機械照合: `strata_cli.cli.parser()` を現行 checkout で import して `_actions` と `_SubParsersAction.choices` を再帰 walk し、103 parser の option 集合を索引の href ディレクトリ（`<tool-id>/<command-path>/`）と突き合わせました。C++ 側は `src/program/generate.cpp`・`src/qwen35/q36_engine.cu`・`src/dsv41/ds4_main.cpp`・`tools/vision/strata_vision.cpp`・各 `*_main.cpp` の `"--xxx"` 文字列、Python 側は `setup.py`・`metal/setup_mac.py`・`tools/strata_bench.py` の `add_argument` を AST で拾って照合しました。option 文字列 inventory は `python3 .agents/skills/strata-investigate/scripts/cli-grammar.py` で `.cli-grammar.json`（revision `ffa80d73…`）として保存済みです。
-- 追加 4 節: `strata components engines` / `use` / `remove`（Terminal）と tool-id `strata-split`。
-- 既存節への option 追加 23 件: `strata update` と `strata components update` に `--yes` / `--stop-model` / `--start-again`（`strata_cli/update_cmd.py:67-69` と `:77-79`）、`strata drafting plan` / `fetch` に `--no-split`（`strata_cli/drafting_cmd.py:28-29`）、`strata launch` に `--split-engine` / `--backend`（`strata_cli/launch/cmd.py:108,117`）、エンジン `strata` に `--draft-rule` / `--draft-mtp-spec` / `--draft-mtp-min-p` / `--draft-fallback`（`src/program/generate.cpp:3579-3584`）、`--lookup-max-t` / `--lookup-sizes`（`src/program/generate.cpp:3551-3552`）、`--ram-keep-gib`（`src/program/generate.cpp:3657-3658`）、`strata-dsv41` に `--parallel`（`src/dsv41/ds4_main.cpp:2583-2584`）、`--vision-resident` / `--vision-lazy`（`src/dsv41/ds4_main.cpp:2552-2553`）、`--multi-check`（`src/dsv41/ds4_main.cpp:2590`）、`setup.py` に `--prepare-pack`（`setup.py:9658`）と `--drafter`（`setup.py:9693`）。
-- 削除・改名 0 件。索引に載っていた option で現行 parser に無いものは上記照合で 0 件でした。逆に機械抽出が拾った `--sampler-test` は、`src/dsv41/ds4_main.cpp:2490-2492` の `STRATA_METAL` build 限定 special arg（`src/dsv41/sampler_stat.inc` の統計 harness へ渡す）で、既存注記どおり option 一覧には含めません（一度追加し、削除した）（`strata-terminal` 103 節、`strata-engine` 2 節（`root/` と `qwen36/`）、`strata-engine-dsv41` 1 節、`strata-vision` 1 節、`strata-split` 1 節、CMake 単体 CLI 8 節、`source-setup` 2 節（`root/` と `mac/`）、`quick-benchmark` 1 節を突合済み）。
-- 文書中の source 行番号は現行 checkout に合わせて更新しました（`--no-kv-grow` は `src/program/generate.cpp:3360`、`strata-dsv41` の `--help` / `--version` は `src/dsv41/ds4_main.cpp:2593` / `:2570`、`setup.py` の parser は `setup.py:9568` で option 宣言 56 個、`help=argparse.SUPPRESS` は `setup.py:9595-9603,9716`、Mac 委譲は `setup.py:9566` から `mac_setup`（`setup.py:7944-7948`）経由、`metal/setup_mac.py` の `parse_known_args` は `:362-364`）。
+調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（`2026-11-07` 時点）。
 
 ## `strata-terminal`
-
-Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --help` と `--version`、その配下のコマンドごとに parser スコープを分けています。各オプション名は個別文書への予定リンクです。
 
 ### `strata` (トップレベル)
 
 - [コマンド概要](strata-terminal/root/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/root/--help.md)
 - [`--version`](strata-terminal/root/--version.md)
 
 ### `strata serve` (serve)
 
 - [コマンド概要](strata-terminal/serve/README.md)
-
 - [`--batch-groups`](strata-terminal/serve/--batch-groups.md)
 - [`--batch-telemetry`（alias: `--no-batch-telemetry`）](strata-terminal/serve/--batch-telemetry.md)
 - [`--engine`](strata-terminal/serve/--engine.md)
-- [`--help`（alias: `-h`）](strata-terminal/serve/--help.md)
 - [`--host`](strata-terminal/serve/--host.md)
 - [`--json`](strata-terminal/serve/--json.md)
 - [`--max-queue`](strata-terminal/serve/--max-queue.md)
@@ -74,14 +33,10 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 
 - [コマンド概要](strata-terminal/profile/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/profile/--help.md)
-
 ### `strata profile create` (profile/create)
 
 - [コマンド概要](strata-terminal/profile/create/README.md)
-
 - [`--from-config`](strata-terminal/profile/create/--from-config.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/create/--help.md)
 - [`--json`](strata-terminal/profile/create/--json.md)
 - [`--output`](strata-terminal/profile/create/--output.md)
 - [`--quiet`](strata-terminal/profile/create/--quiet.md)
@@ -89,8 +44,6 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata profile list` (profile/list)
 
 - [コマンド概要](strata-terminal/profile/list/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/profile/list/--help.md)
 - [`--json`](strata-terminal/profile/list/--json.md)
 - [`--output`](strata-terminal/profile/list/--output.md)
 - [`--quiet`](strata-terminal/profile/list/--quiet.md)
@@ -98,9 +51,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata profile show` (profile/show)
 
 - [コマンド概要](strata-terminal/profile/show/README.md)
-
 - [`--effective`](strata-terminal/profile/show/--effective.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/show/--help.md)
 - [`--json`](strata-terminal/profile/show/--json.md)
 - [`--output`](strata-terminal/profile/show/--output.md)
 - [`--quiet`](strata-terminal/profile/show/--quiet.md)
@@ -108,8 +59,6 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata profile validate` (profile/validate)
 
 - [コマンド概要](strata-terminal/profile/validate/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/profile/validate/--help.md)
 - [`--json`](strata-terminal/profile/validate/--json.md)
 - [`--output`](strata-terminal/profile/validate/--output.md)
 - [`--quiet`](strata-terminal/profile/validate/--quiet.md)
@@ -117,8 +66,6 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata profile set` (profile/set)
 
 - [コマンド概要](strata-terminal/profile/set/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/profile/set/--help.md)
 - [`--json`](strata-terminal/profile/set/--json.md)
 - [`--output`](strata-terminal/profile/set/--output.md)
 - [`--plan`](strata-terminal/profile/set/--plan.md)
@@ -127,9 +74,7 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata profile use-config` (profile/use-config)
 
 - [コマンド概要](strata-terminal/profile/use-config/README.md)
-
 - [`--from-config`](strata-terminal/profile/use-config/--from-config.md)
-- [`--help`（alias: `-h`）](strata-terminal/profile/use-config/--help.md)
 - [`--if-revision`](strata-terminal/profile/use-config/--if-revision.md)
 - [`--json`](strata-terminal/profile/use-config/--json.md)
 - [`--output`](strata-terminal/profile/use-config/--output.md)
@@ -139,8 +84,6 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata profile edit` (profile/edit)
 
 - [コマンド概要](strata-terminal/profile/edit/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/profile/edit/--help.md)
 - [`--json`](strata-terminal/profile/edit/--json.md)
 - [`--output`](strata-terminal/profile/edit/--output.md)
 - [`--quiet`](strata-terminal/profile/edit/--quiet.md)
@@ -148,8 +91,6 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata profile history` (profile/history)
 
 - [コマンド概要](strata-terminal/profile/history/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/profile/history/--help.md)
 - [`--json`](strata-terminal/profile/history/--json.md)
 - [`--output`](strata-terminal/profile/history/--output.md)
 - [`--quiet`](strata-terminal/profile/history/--quiet.md)
@@ -157,8 +98,6 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata profile rollback` (profile/rollback)
 
 - [コマンド概要](strata-terminal/profile/rollback/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/profile/rollback/--help.md)
 - [`--json`](strata-terminal/profile/rollback/--json.md)
 - [`--output`](strata-terminal/profile/rollback/--output.md)
 - [`--quiet`](strata-terminal/profile/rollback/--quiet.md)
@@ -167,16 +106,12 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata repair-access` (repair-access)
 
 - [コマンド概要](strata-terminal/repair-access/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/repair-access/--help.md)
 - [`--output`](strata-terminal/repair-access/--output.md)
 
 ### `strata doctor` (doctor)
 
 - [コマンド概要](strata-terminal/doctor/README.md)
-
 - [`--components`](strata-terminal/doctor/--components.md)
-- [`--help`（alias: `-h`）](strata-terminal/doctor/--help.md)
 - [`--json`](strata-terminal/doctor/--json.md)
 - [`--live`](strata-terminal/doctor/--live.md)
 - [`--output`](strata-terminal/doctor/--output.md)
@@ -187,13 +122,9 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 
 - [コマンド概要](strata-terminal/components/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/components/--help.md)
-
 ### `strata components verify` (components/verify)
 
 - [コマンド概要](strata-terminal/components/verify/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/components/verify/--help.md)
 - [`--json`](strata-terminal/components/verify/--json.md)
 - [`--live`](strata-terminal/components/verify/--live.md)
 - [`--output`](strata-terminal/components/verify/--output.md)
@@ -203,35 +134,26 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata components plan` (components/plan)
 
 - [コマンド概要](strata-terminal/components/plan/README.md)
-
 - [`--backend`](strata-terminal/components/plan/--backend.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/plan/--help.md)
 - [`--output`](strata-terminal/components/plan/--output.md)
 - [`--target`](strata-terminal/components/plan/--target.md)
 
 ### `strata components backends` (components/backends)
 
 - [コマンド概要](strata-terminal/components/backends/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/components/backends/--help.md)
 - [`--output`](strata-terminal/components/backends/--output.md)
 
 ### `strata components engine` (components/engine)
 
 - [コマンド概要](strata-terminal/components/engine/README.md)
-
 - [`--backend`](strata-terminal/components/engine/--backend.md)
 - [`--components-dir`](strata-terminal/components/engine/--components-dir.md)
 - [`--full`](strata-terminal/components/engine/--full.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/engine/--help.md)
 - [`--output`](strata-terminal/components/engine/--output.md)
 
 ### `strata components update` (components/update)
 
-`--json` と `--quiet` は `strata_cli/update_cmd.py` の parser 定義ではなく、`strata_cli/cli.py` が `update_parsers` を含む one-shot parser 群へ後から追加します。そのため、個別コマンド module 内に宣言が見当たらなくても、このコマンドで有効です。
-
 - [コマンド概要](strata-terminal/components/update/README.md)
-
 - [`--app`](strata-terminal/components/update/--app.md)
 - [`--app-version`](strata-terminal/components/update/--app-version.md)
 - [`--backend`](strata-terminal/components/update/--backend.md)
@@ -239,7 +161,6 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 - [`--components-dir`](strata-terminal/components/update/--components-dir.md)
 - [`--feed`](strata-terminal/components/update/--feed.md)
 - [`--force`](strata-terminal/components/update/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/update/--help.md)
 - [`--json`](strata-terminal/components/update/--json.md)
 - [`--model-config`](strata-terminal/components/update/--model-config.md)
 - [`--no-control`](strata-terminal/components/update/--no-control.md)
@@ -253,15 +174,11 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 
 ### `strata components install-file` (components/install-file)
 
-ダウンロード済み engine package をローカルから導入する parser です。`strata_cli/update_cmd.py` の `_common()` が追加する共通 option を含みます。
-
 - [コマンド概要](strata-terminal/components/install-file/README.md)
-
 - [`--backend`](strata-terminal/components/install-file/--backend.md)
 - [`--components-dir`](strata-terminal/components/install-file/--components-dir.md)
 - [`--feed`](strata-terminal/components/install-file/--feed.md)
 - [`--force`](strata-terminal/components/install-file/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/install-file/--help.md)
 - [`--json`](strata-terminal/components/install-file/--json.md)
 - [`--model-config`](strata-terminal/components/install-file/--model-config.md)
 - [`--output`](strata-terminal/components/install-file/--output.md)
@@ -271,12 +188,10 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 ### `strata components rollback` (components/rollback)
 
 - [コマンド概要](strata-terminal/components/rollback/README.md)
-
 - [`--backend`](strata-terminal/components/rollback/--backend.md)
 - [`--components-dir`](strata-terminal/components/rollback/--components-dir.md)
 - [`--feed`](strata-terminal/components/rollback/--feed.md)
 - [`--force`](strata-terminal/components/rollback/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/rollback/--help.md)
 - [`--json`](strata-terminal/components/rollback/--json.md)
 - [`--model-config`](strata-terminal/components/rollback/--model-config.md)
 - [`--output`](strata-terminal/components/rollback/--output.md)
@@ -285,15 +200,11 @@ Python 製 Terminal CLI (`strata.py`、`strata_cli/`)。最上位の `strata --h
 
 ### `strata components engines` (components/engines)
 
-v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の `components_sp.add_parser("engines", …)`（「この PC に導入済みの engine と、使用中の 1 件を一覧」）。`_common()` の共通 option は `strata_cli/update_cmd.py:47-58`、`--json` / `--quiet` は `strata_cli/cli.py:508-515` の後付けで、位置引数は取りません。
-
 - [コマンド概要](strata-terminal/components/engines/README.md)
-
 - [`--backend`](strata-terminal/components/engines/--backend.md)
 - [`--components-dir`](strata-terminal/components/engines/--components-dir.md)
 - [`--feed`](strata-terminal/components/engines/--feed.md)
 - [`--force`](strata-terminal/components/engines/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/engines/--help.md)
 - [`--json`](strata-terminal/components/engines/--json.md)
 - [`--model-config`](strata-terminal/components/engines/--model-config.md)
 - [`--output`](strata-terminal/components/engines/--output.md)
@@ -302,16 +213,12 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 ### `strata components use` (components/use)
 
-`strata_cli/update_cmd.py:84-87` で登録されます（導入済み engine に切り替え。download はしない、`newest` で更新追従に戻る）。位置引数 `engine` を 1 つ取ります（版番号 `0.1.54`、folder 名、または `newest`。`strata_cli/update_cmd.py:85`）。`--family` は `:86`。`_common()` は `strata_cli/update_cmd.py:47-58`、`--json` / `--quiet` は `strata_cli/cli.py:508-515`。
-
 - [コマンド概要](strata-terminal/components/use/README.md)
-
 - [`--backend`](strata-terminal/components/use/--backend.md)
 - [`--components-dir`](strata-terminal/components/use/--components-dir.md)
 - [`--family`](strata-terminal/components/use/--family.md)
 - [`--feed`](strata-terminal/components/use/--feed.md)
 - [`--force`](strata-terminal/components/use/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/use/--help.md)
 - [`--json`](strata-terminal/components/use/--json.md)
 - [`--model-config`](strata-terminal/components/use/--model-config.md)
 - [`--output`](strata-terminal/components/use/--output.md)
@@ -320,16 +227,12 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 ### `strata components remove` (components/remove)
 
-`strata_cli/update_cmd.py:88-91` で登録されます（導入済み engine の削除。使用中のものは消せない。モデルと設定は触らない）。位置引数 `engine` を 1 つ取ります（版番号または folder 名。`strata_cli/update_cmd.py:89`）。`--family` は `:90`。`_common()` は `strata_cli/update_cmd.py:47-58`、`--json` / `--quiet` は `strata_cli/cli.py:508-515`。
-
 - [コマンド概要](strata-terminal/components/remove/README.md)
-
 - [`--backend`](strata-terminal/components/remove/--backend.md)
 - [`--components-dir`](strata-terminal/components/remove/--components-dir.md)
 - [`--family`](strata-terminal/components/remove/--family.md)
 - [`--feed`](strata-terminal/components/remove/--feed.md)
 - [`--force`](strata-terminal/components/remove/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/components/remove/--help.md)
 - [`--json`](strata-terminal/components/remove/--json.md)
 - [`--model-config`](strata-terminal/components/remove/--model-config.md)
 - [`--output`](strata-terminal/components/remove/--output.md)
@@ -339,7 +242,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata update` (update)
 
 - [コマンド概要](strata-terminal/update/README.md)
-
 - [`--app`](strata-terminal/update/--app.md)
 - [`--app-version`](strata-terminal/update/--app-version.md)
 - [`--backend`](strata-terminal/update/--backend.md)
@@ -347,7 +249,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 - [`--components-dir`](strata-terminal/update/--components-dir.md)
 - [`--feed`](strata-terminal/update/--feed.md)
 - [`--force`](strata-terminal/update/--force.md)
-- [`--help`（alias: `-h`）](strata-terminal/update/--help.md)
 - [`--json`](strata-terminal/update/--json.md)
 - [`--model-config`](strata-terminal/update/--model-config.md)
 - [`--no-control`](strata-terminal/update/--no-control.md)
@@ -363,15 +264,11 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/models/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/models/--help.md)
-
 ### `strata models list` (models/list)
 
 - [コマンド概要](strata-terminal/models/list/README.md)
-
 - [`--connection`](strata-terminal/models/list/--connection.md)
 - [`--credential-env`](strata-terminal/models/list/--credential-env.md)
-- [`--help`（alias: `-h`）](strata-terminal/models/list/--help.md)
 - [`--install-dir`](strata-terminal/models/list/--install-dir.md)
 - [`--installed`](strata-terminal/models/list/--installed.md)
 - [`--json`](strata-terminal/models/list/--json.md)
@@ -384,8 +281,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata models inspect` (models/inspect)
 
 - [コマンド概要](strata-terminal/models/inspect/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/models/inspect/--help.md)
 - [`--install-dir`](strata-terminal/models/inspect/--install-dir.md)
 - [`--json`](strata-terminal/models/inspect/--json.md)
 - [`--output`](strata-terminal/models/inspect/--output.md)
@@ -394,8 +289,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata models import` (models/import)
 
 - [コマンド概要](strata-terminal/models/import/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/models/import/--help.md)
 - [`--json`](strata-terminal/models/import/--json.md)
 - [`--output`](strata-terminal/models/import/--output.md)
 - [`--plan`](strata-terminal/models/import/--plan.md)
@@ -404,10 +297,8 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata models move` (models/move)
 
 - [コマンド概要](strata-terminal/models/move/README.md)
-
 - [`--cancel-file`](strata-terminal/models/move/--cancel-file.md)
 - [`--from`](strata-terminal/models/move/--from.md)
-- [`--help`（alias: `-h`）](strata-terminal/models/move/--help.md)
 - [`--install-dir`](strata-terminal/models/move/--install-dir.md)
 - [`--json`](strata-terminal/models/move/--json.md)
 - [`--leave`](strata-terminal/models/move/--leave.md)
@@ -421,17 +312,13 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/drafting/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/drafting/--help.md)
-
 ### `strata drafting plan` (drafting/plan)
 
 - [コマンド概要](strata-terminal/drafting/plan/README.md)
-
 - [`--config`](strata-terminal/drafting/plan/--config.md)
 - [`--data-dir`](strata-terminal/drafting/plan/--data-dir.md)
 - [`--engines-unloading`](strata-terminal/drafting/plan/--engines-unloading.md)
 - [`--family`](strata-terminal/drafting/plan/--family.md)
-- [`--help`（alias: `-h`）](strata-terminal/drafting/plan/--help.md)
 - [`--mode`](strata-terminal/drafting/plan/--mode.md)
 - [`--no-split`](strata-terminal/drafting/plan/--no-split.md)
 - [`--output`](strata-terminal/drafting/plan/--output.md)
@@ -439,12 +326,10 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata drafting fetch` (drafting/fetch)
 
 - [コマンド概要](strata-terminal/drafting/fetch/README.md)
-
 - [`--config`](strata-terminal/drafting/fetch/--config.md)
 - [`--data-dir`](strata-terminal/drafting/fetch/--data-dir.md)
 - [`--engines-unloading`](strata-terminal/drafting/fetch/--engines-unloading.md)
 - [`--family`](strata-terminal/drafting/fetch/--family.md)
-- [`--help`（alias: `-h`）](strata-terminal/drafting/fetch/--help.md)
 - [`--if-needed`](strata-terminal/drafting/fetch/--if-needed.md)
 - [`--mode`](strata-terminal/drafting/fetch/--mode.md)
 - [`--no-split`](strata-terminal/drafting/fetch/--no-split.md)
@@ -454,15 +339,11 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/engine/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/engine/--help.md)
-
 ### `strata engine calibrate` (engine/calibrate)
 
 - [コマンド概要](strata-terminal/engine/calibrate/README.md)
-
 - [`--apply-result`](strata-terminal/engine/calibrate/--apply-result.md)
 - [`--exclusive`](strata-terminal/engine/calibrate/--exclusive.md)
-- [`--help`（alias: `-h`）](strata-terminal/engine/calibrate/--help.md)
 - [`--json`](strata-terminal/engine/calibrate/--json.md)
 - [`--measure`](strata-terminal/engine/calibrate/--measure.md)
 - [`--out`](strata-terminal/engine/calibrate/--out.md)
@@ -477,22 +358,16 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata install` (install)
 
 - [コマンド概要](strata-terminal/install/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/install/--help.md)
 - [`--update`](strata-terminal/install/--update.md)
 
 ### `strata runtime` (runtime)
 
 - [コマンド概要](strata-terminal/runtime/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/runtime/--help.md)
-
 ### `strata runtime start` (runtime/start)
 
 - [コマンド概要](strata-terminal/runtime/start/README.md)
-
 - [`--die-with-pid`](strata-terminal/runtime/start/--die-with-pid.md)
-- [`--help`（alias: `-h`）](strata-terminal/runtime/start/--help.md)
 - [`--json`](strata-terminal/runtime/start/--json.md)
 - [`--output`](strata-terminal/runtime/start/--output.md)
 - [`--plan`](strata-terminal/runtime/start/--plan.md)
@@ -504,8 +379,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata runtime status` (runtime/status)
 
 - [コマンド概要](strata-terminal/runtime/status/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/runtime/status/--help.md)
 - [`--json`](strata-terminal/runtime/status/--json.md)
 - [`--output`](strata-terminal/runtime/status/--output.md)
 - [`--profile`](strata-terminal/runtime/status/--profile.md)
@@ -514,8 +387,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata runtime verify` (runtime/verify)
 
 - [コマンド概要](strata-terminal/runtime/verify/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/runtime/verify/--help.md)
 - [`--if-instance-id`](strata-terminal/runtime/verify/--if-instance-id.md)
 - [`--if-owner-id`](strata-terminal/runtime/verify/--if-owner-id.md)
 - [`--json`](strata-terminal/runtime/verify/--json.md)
@@ -529,8 +400,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata runtime stop` (runtime/stop)
 
 - [コマンド概要](strata-terminal/runtime/stop/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/runtime/stop/--help.md)
 - [`--if-instance-id`](strata-terminal/runtime/stop/--if-instance-id.md)
 - [`--if-owner-id`](strata-terminal/runtime/stop/--if-owner-id.md)
 - [`--json`](strata-terminal/runtime/stop/--json.md)
@@ -543,8 +412,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata runtime cleanup` (runtime/cleanup)
 
 - [コマンド概要](strata-terminal/runtime/cleanup/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/runtime/cleanup/--help.md)
 - [`--json`](strata-terminal/runtime/cleanup/--json.md)
 - [`--output`](strata-terminal/runtime/cleanup/--output.md)
 - [`--profile`](strata-terminal/runtime/cleanup/--profile.md)
@@ -553,10 +420,8 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata runtime restart` (runtime/restart)
 
 - [コマンド概要](strata-terminal/runtime/restart/README.md)
-
 - [`--allow-source-migration`](strata-terminal/runtime/restart/--allow-source-migration.md)
 - [`--allow-source-switch`](strata-terminal/runtime/restart/--allow-source-switch.md)
-- [`--help`（alias: `-h`）](strata-terminal/runtime/restart/--help.md)
 - [`--if-instance-id`](strata-terminal/runtime/restart/--if-instance-id.md)
 - [`--if-owner-id`](strata-terminal/runtime/restart/--if-owner-id.md)
 - [`--if-profile-revision`](strata-terminal/runtime/restart/--if-profile-revision.md)
@@ -573,13 +438,9 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/ops/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/ops/--help.md)
-
 ### `strata ops init` (ops/init)
 
 - [コマンド概要](strata-terminal/ops/init/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/init/--help.md)
 - [`--json`](strata-terminal/ops/init/--json.md)
 - [`--output`](strata-terminal/ops/init/--output.md)
 - [`--profile`](strata-terminal/ops/init/--profile.md)
@@ -588,8 +449,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops list` (ops/list)
 
 - [コマンド概要](strata-terminal/ops/list/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/list/--help.md)
 - [`--json`](strata-terminal/ops/list/--json.md)
 - [`--output`](strata-terminal/ops/list/--output.md)
 - [`--profile`](strata-terminal/ops/list/--profile.md)
@@ -598,8 +457,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops create` (ops/create)
 
 - [コマンド概要](strata-terminal/ops/create/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/create/--help.md)
 - [`--json`](strata-terminal/ops/create/--json.md)
 - [`--kind`](strata-terminal/ops/create/--kind.md)
 - [`--output`](strata-terminal/ops/create/--output.md)
@@ -609,8 +466,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops show` (ops/show)
 
 - [コマンド概要](strata-terminal/ops/show/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/show/--help.md)
 - [`--json`](strata-terminal/ops/show/--json.md)
 - [`--output`](strata-terminal/ops/show/--output.md)
 - [`--profile`](strata-terminal/ops/show/--profile.md)
@@ -619,8 +474,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops edit` (ops/edit)
 
 - [コマンド概要](strata-terminal/ops/edit/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/edit/--help.md)
 - [`--json`](strata-terminal/ops/edit/--json.md)
 - [`--output`](strata-terminal/ops/edit/--output.md)
 - [`--profile`](strata-terminal/ops/edit/--profile.md)
@@ -629,8 +482,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops set` (ops/set)
 
 - [コマンド概要](strata-terminal/ops/set/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/set/--help.md)
 - [`--json`](strata-terminal/ops/set/--json.md)
 - [`--output`](strata-terminal/ops/set/--output.md)
 - [`--plan`](strata-terminal/ops/set/--plan.md)
@@ -640,8 +491,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops history` (ops/history)
 
 - [コマンド概要](strata-terminal/ops/history/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/history/--help.md)
 - [`--json`](strata-terminal/ops/history/--json.md)
 - [`--output`](strata-terminal/ops/history/--output.md)
 - [`--profile`](strata-terminal/ops/history/--profile.md)
@@ -650,8 +499,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops rollback` (ops/rollback)
 
 - [コマンド概要](strata-terminal/ops/rollback/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/rollback/--help.md)
 - [`--json`](strata-terminal/ops/rollback/--json.md)
 - [`--output`](strata-terminal/ops/rollback/--output.md)
 - [`--profile`](strata-terminal/ops/rollback/--profile.md)
@@ -661,8 +508,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops plan` (ops/plan)
 
 - [コマンド概要](strata-terminal/ops/plan/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/plan/--help.md)
 - [`--json`](strata-terminal/ops/plan/--json.md)
 - [`--output`](strata-terminal/ops/plan/--output.md)
 - [`--profile`](strata-terminal/ops/plan/--profile.md)
@@ -671,9 +516,7 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops run` (ops/run)
 
 - [コマンド概要](strata-terminal/ops/run/README.md)
-
 - [`--exclusive`](strata-terminal/ops/run/--exclusive.md)
-- [`--help`（alias: `-h`）](strata-terminal/ops/run/--help.md)
 - [`--if-instance-id`](strata-terminal/ops/run/--if-instance-id.md)
 - [`--if-owner-id`](strata-terminal/ops/run/--if-owner-id.md)
 - [`--if-profile-revision`](strata-terminal/ops/run/--if-profile-revision.md)
@@ -687,8 +530,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops runs` (ops/runs)
 
 - [コマンド概要](strata-terminal/ops/runs/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/runs/--help.md)
 - [`--json`](strata-terminal/ops/runs/--json.md)
 - [`--limit`](strata-terminal/ops/runs/--limit.md)
 - [`--output`](strata-terminal/ops/runs/--output.md)
@@ -698,8 +539,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata ops result` (ops/result)
 
 - [コマンド概要](strata-terminal/ops/result/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/ops/result/--help.md)
 - [`--json`](strata-terminal/ops/result/--json.md)
 - [`--output`](strata-terminal/ops/result/--output.md)
 - [`--profile`](strata-terminal/ops/result/--profile.md)
@@ -709,19 +548,15 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/bench/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/bench/--help.md)
-
 ### `strata bench run` (bench/run)
 
 - [コマンド概要](strata-terminal/bench/run/README.md)
-
 - [`--background`](strata-terminal/bench/run/--background.md)
 - [`--build-options`](strata-terminal/bench/run/--build-options.md)
 - [`--concurrency`](strata-terminal/bench/run/--concurrency.md)
 - [`--condition`](strata-terminal/bench/run/--condition.md)
 - [`--credential-env`](strata-terminal/bench/run/--credential-env.md)
 - [`--custom-pack`](strata-terminal/bench/run/--custom-pack.md)
-- [`--help`（alias: `-h`）](strata-terminal/bench/run/--help.md)
 - [`--json`](strata-terminal/bench/run/--json.md)
 - [`--load-timeout`](strata-terminal/bench/run/--load-timeout.md)
 - [`--model-revision`](strata-terminal/bench/run/--model-revision.md)
@@ -747,8 +582,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata bench cancel` (bench/cancel)
 
 - [コマンド概要](strata-terminal/bench/cancel/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/bench/cancel/--help.md)
 - [`--output`](strata-terminal/bench/cancel/--output.md)
 - [`--path`](strata-terminal/bench/cancel/--path.md)
 - [`--profile`](strata-terminal/bench/cancel/--profile.md)
@@ -756,8 +589,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata bench report` (bench/report)
 
 - [コマンド概要](strata-terminal/bench/report/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/bench/report/--help.md)
 - [`--json`](strata-terminal/bench/report/--json.md)
 - [`--out`](strata-terminal/bench/report/--out.md)
 - [`--output`](strata-terminal/bench/report/--output.md)
@@ -766,8 +597,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata bench compare` (bench/compare)
 
 - [コマンド概要](strata-terminal/bench/compare/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/bench/compare/--help.md)
 - [`--json`](strata-terminal/bench/compare/--json.md)
 - [`--out`](strata-terminal/bench/compare/--out.md)
 - [`--output`](strata-terminal/bench/compare/--output.md)
@@ -777,14 +606,10 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/timeskip/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/timeskip/--help.md)
-
 ### `strata timeskip run` (timeskip/run)
 
 - [コマンド概要](strata-terminal/timeskip/run/README.md)
-
 - [`--attempts`](strata-terminal/timeskip/run/--attempts.md)
-- [`--help`（alias: `-h`）](strata-terminal/timeskip/run/--help.md)
 - [`--output`](strata-terminal/timeskip/run/--output.md)
 - [`--prompt`](strata-terminal/timeskip/run/--prompt.md)
 - [`--revise-command`](strata-terminal/timeskip/run/--revise-command.md)
@@ -794,26 +619,20 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata timeskip status` (timeskip/status)
 
 - [コマンド概要](strata-terminal/timeskip/status/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/timeskip/status/--help.md)
 - [`--output`](strata-terminal/timeskip/status/--output.md)
 - [`--state-dir`](strata-terminal/timeskip/status/--state-dir.md)
 
 ### `strata timeskip list` (timeskip/list)
 
 - [コマンド概要](strata-terminal/timeskip/list/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/timeskip/list/--help.md)
 - [`--output`](strata-terminal/timeskip/list/--output.md)
 - [`--state-dir`](strata-terminal/timeskip/list/--state-dir.md)
 
 ### `strata timeskip apply` (timeskip/apply)
 
 - [コマンド概要](strata-terminal/timeskip/apply/README.md)
-
 - [`--attempt`](strata-terminal/timeskip/apply/--attempt.md)
 - [`--dry-run`](strata-terminal/timeskip/apply/--dry-run.md)
-- [`--help`（alias: `-h`）](strata-terminal/timeskip/apply/--help.md)
 - [`--output`](strata-terminal/timeskip/apply/--output.md)
 - [`--restore`](strata-terminal/timeskip/apply/--restore.md)
 - [`--state-dir`](strata-terminal/timeskip/apply/--state-dir.md)
@@ -823,15 +642,11 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/tune/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/tune/--help.md)
-
 ### `strata tune plan` (tune/plan)
 
 - [コマンド概要](strata-terminal/tune/plan/README.md)
-
 - [`--backend`](strata-terminal/tune/plan/--backend.md)
 - [`--engine`](strata-terminal/tune/plan/--engine.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/plan/--help.md)
 - [`--hold`](strata-terminal/tune/plan/--hold.md)
 - [`--model`](strata-terminal/tune/plan/--model.md)
 - [`--objective`](strata-terminal/tune/plan/--objective.md)
@@ -843,7 +658,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata tune run` (tune/run)
 
 - [コマンド概要](strata-terminal/tune/run/README.md)
-
 - [`--api-expect`](strata-terminal/tune/run/--api-expect.md)
 - [`--api-port`](strata-terminal/tune/run/--api-port.md)
 - [`--api-prompt`](strata-terminal/tune/run/--api-prompt.md)
@@ -853,7 +667,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 - [`--context`](strata-terminal/tune/run/--context.md)
 - [`--engine`](strata-terminal/tune/run/--engine.md)
 - [`--full-digests`](strata-terminal/tune/run/--full-digests.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/run/--help.md)
 - [`--hold`](strata-terminal/tune/run/--hold.md)
 - [`--max-new`](strata-terminal/tune/run/--max-new.md)
 - [`--mode`](strata-terminal/tune/run/--mode.md)
@@ -871,10 +684,8 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata tune apply` (tune/apply)
 
 - [コマンド概要](strata-terminal/tune/apply/README.md)
-
 - [`--config`](strata-terminal/tune/apply/--config.md)
 - [`--context`](strata-terminal/tune/apply/--context.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/apply/--help.md)
 - [`--model-path`](strata-terminal/tune/apply/--model-path.md)
 - [`--output`](strata-terminal/tune/apply/--output.md)
 - [`--state-dir`](strata-terminal/tune/apply/--state-dir.md)
@@ -882,37 +693,29 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata tune rollback` (tune/rollback)
 
 - [コマンド概要](strata-terminal/tune/rollback/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/tune/rollback/--help.md)
 - [`--output`](strata-terminal/tune/rollback/--output.md)
 - [`--state-dir`](strata-terminal/tune/rollback/--state-dir.md)
 
 ### `strata tune status` (tune/status)
 
 - [コマンド概要](strata-terminal/tune/status/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/tune/status/--help.md)
 - [`--output`](strata-terminal/tune/status/--output.md)
 - [`--state-dir`](strata-terminal/tune/status/--state-dir.md)
 
 ### `strata tune list` (tune/list)
 
 - [コマンド概要](strata-terminal/tune/list/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/tune/list/--help.md)
 - [`--output`](strata-terminal/tune/list/--output.md)
 - [`--state-dir`](strata-terminal/tune/list/--state-dir.md)
 
 ### `strata tune auto` (tune/auto)
 
 - [コマンド概要](strata-terminal/tune/auto/README.md)
-
 - [`--allow-not-repeatable`](strata-terminal/tune/auto/--allow-not-repeatable.md)
 - [`--allow-small-differences`](strata-terminal/tune/auto/--allow-small-differences.md)
 - [`--boot-timeout`](strata-terminal/tune/auto/--boot-timeout.md)
 - [`--goal`](strata-terminal/tune/auto/--goal.md)
 - [`--gpu-lock`](strata-terminal/tune/auto/--gpu-lock.md)
-- [`--help`（alias: `-h`）](strata-terminal/tune/auto/--help.md)
 - [`--leave-ram`](strata-terminal/tune/auto/--leave-ram.md)
 - [`--mode`](strata-terminal/tune/auto/--mode.md)
 - [`--name`](strata-terminal/tune/auto/--name.md)
@@ -929,95 +732,69 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/presets/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/presets/--help.md)
-
 ### `strata presets list` (presets/list)
 
 - [コマンド概要](strata-terminal/presets/list/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/presets/list/--help.md)
 - [`--model`](strata-terminal/presets/list/--model.md)
 - [`--output`](strata-terminal/presets/list/--output.md)
 
 ### `strata presets status` (presets/status)
 
 - [コマンド概要](strata-terminal/presets/status/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/presets/status/--help.md)
 - [`--output`](strata-terminal/presets/status/--output.md)
 
 ### `strata presets show` (presets/show)
 
 - [コマンド概要](strata-terminal/presets/show/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/presets/show/--help.md)
 - [`--output`](strata-terminal/presets/show/--output.md)
 
 ### `strata presets apply` (presets/apply)
 
 - [コマンド概要](strata-terminal/presets/apply/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/presets/apply/--help.md)
 - [`--output`](strata-terminal/presets/apply/--output.md)
 
 ### `strata presets rename` (presets/rename)
 
 - [コマンド概要](strata-terminal/presets/rename/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/presets/rename/--help.md)
 - [`--output`](strata-terminal/presets/rename/--output.md)
 
 ### `strata presets delete` (presets/delete)
 
 - [コマンド概要](strata-terminal/presets/delete/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/presets/delete/--help.md)
 - [`--output`](strata-terminal/presets/delete/--output.md)
 
 ### `strata presets undo` (presets/undo)
 
 - [コマンド概要](strata-terminal/presets/undo/README.md)
-
 - [`--config`](strata-terminal/presets/undo/--config.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/undo/--help.md)
 - [`--output`](strata-terminal/presets/undo/--output.md)
 
 ### `strata presets export` (presets/export)
 
 - [コマンド概要](strata-terminal/presets/export/README.md)
-
 - [`--file`](strata-terminal/presets/export/--file.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/export/--help.md)
 - [`--output`](strata-terminal/presets/export/--output.md)
 
 ### `strata presets import` (presets/import)
 
 - [コマンド概要](strata-terminal/presets/import/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/presets/import/--help.md)
 - [`--output`](strata-terminal/presets/import/--output.md)
 
 ### `strata presets effective` (presets/effective)
 
 - [コマンド概要](strata-terminal/presets/effective/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/presets/effective/--help.md)
 - [`--output`](strata-terminal/presets/effective/--output.md)
 
 ### `strata presets off` (presets/off)
 
 - [コマンド概要](strata-terminal/presets/off/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/presets/off/--help.md)
 - [`--output`](strata-terminal/presets/off/--output.md)
 
 ### `strata presets recheck` (presets/recheck)
 
 - [コマンド概要](strata-terminal/presets/recheck/README.md)
-
 - [`--boot-timeout`](strata-terminal/presets/recheck/--boot-timeout.md)
 - [`--gpu-lock`](strata-terminal/presets/recheck/--gpu-lock.md)
-- [`--help`（alias: `-h`）](strata-terminal/presets/recheck/--help.md)
 - [`--no-quiet-check`](strata-terminal/presets/recheck/--no-quiet-check.md)
 - [`--output`](strata-terminal/presets/recheck/--output.md)
 - [`--serve-dir`](strata-terminal/presets/recheck/--serve-dir.md)
@@ -1027,7 +804,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata launch` (launch)
 
 - [コマンド概要](strata-terminal/launch/README.md)
-
 - [`--access`](strata-terminal/launch/--access.md)
 - [`--api-key`](strata-terminal/launch/--api-key.md)
 - [`--api-key-env`](strata-terminal/launch/--api-key-env.md)
@@ -1043,7 +819,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 - [`--full-quality`](strata-terminal/launch/--full-quality.md)
 - [`--gpu`](strata-terminal/launch/--gpu.md)
 - [`--gpu-roles`](strata-terminal/launch/--gpu-roles.md)
-- [`--help`（alias: `-h`）](strata-terminal/launch/--help.md)
 - [`--kv`](strata-terminal/launch/--kv.md)
 - [`--list-presets`](strata-terminal/launch/--list-presets.md)
 - [`--model`](strata-terminal/launch/--model.md)
@@ -1077,10 +852,8 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata connect` (connect)
 
 - [コマンド概要](strata-terminal/connect/README.md)
-
 - [`--check`](strata-terminal/connect/--check.md)
 - [`--context`](strata-terminal/connect/--context.md)
-- [`--help`（alias: `-h`）](strata-terminal/connect/--help.md)
 - [`--key`](strata-terminal/connect/--key.md)
 - [`--key-env`](strata-terminal/connect/--key-env.md)
 - [`--model`](strata-terminal/connect/--model.md)
@@ -1094,10 +867,8 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata status` (status)
 
 - [コマンド概要](strata-terminal/status/README.md)
-
 - [`--connection`](strata-terminal/status/--connection.md)
 - [`--credential-env`](strata-terminal/status/--credential-env.md)
-- [`--help`（alias: `-h`）](strata-terminal/status/--help.md)
 - [`--json`](strata-terminal/status/--json.md)
 - [`--output`](strata-terminal/status/--output.md)
 - [`--quiet`](strata-terminal/status/--quiet.md)
@@ -1107,12 +878,10 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata monitor` (monitor)
 
 - [コマンド概要](strata-terminal/monitor/README.md)
-
 - [`--color`](strata-terminal/monitor/--color.md)
 - [`--connection`](strata-terminal/monitor/--connection.md)
 - [`--credential-env`](strata-terminal/monitor/--credential-env.md)
 - [`--glyphs`](strata-terminal/monitor/--glyphs.md)
-- [`--help`（alias: `-h`）](strata-terminal/monitor/--help.md)
 - [`--interval`](strata-terminal/monitor/--interval.md)
 - [`--json`](strata-terminal/monitor/--json.md)
 - [`--once`](strata-terminal/monitor/--once.md)
@@ -1126,11 +895,9 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata logs` (logs)
 
 - [コマンド概要](strata-terminal/logs/README.md)
-
 - [`--connection`](strata-terminal/logs/--connection.md)
 - [`--credential-env`](strata-terminal/logs/--credential-env.md)
 - [`--follow`](strata-terminal/logs/--follow.md)
-- [`--help`（alias: `-h`）](strata-terminal/logs/--help.md)
 - [`--interval`](strata-terminal/logs/--interval.md)
 - [`--json`](strata-terminal/logs/--json.md)
 - [`--output`](strata-terminal/logs/--output.md)
@@ -1143,14 +910,10 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/connection/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/connection/--help.md)
-
 ### `strata connection create` (connection/create)
 
 - [コマンド概要](strata-terminal/connection/create/README.md)
-
 - [`--credential-env`](strata-terminal/connection/create/--credential-env.md)
-- [`--help`（alias: `-h`）](strata-terminal/connection/create/--help.md)
 - [`--json`](strata-terminal/connection/create/--json.md)
 - [`--output`](strata-terminal/connection/create/--output.md)
 - [`--prefix`](strata-terminal/connection/create/--prefix.md)
@@ -1160,8 +923,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata connection show` (connection/show)
 
 - [コマンド概要](strata-terminal/connection/show/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/connection/show/--help.md)
 - [`--json`](strata-terminal/connection/show/--json.md)
 - [`--output`](strata-terminal/connection/show/--output.md)
 - [`--quiet`](strata-terminal/connection/show/--quiet.md)
@@ -1169,8 +930,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata connection list` (connection/list)
 
 - [コマンド概要](strata-terminal/connection/list/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/connection/list/--help.md)
 - [`--json`](strata-terminal/connection/list/--json.md)
 - [`--output`](strata-terminal/connection/list/--output.md)
 - [`--quiet`](strata-terminal/connection/list/--quiet.md)
@@ -1178,8 +937,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata connection set` (connection/set)
 
 - [コマンド概要](strata-terminal/connection/set/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/connection/set/--help.md)
 - [`--if-revision`](strata-terminal/connection/set/--if-revision.md)
 - [`--json`](strata-terminal/connection/set/--json.md)
 - [`--output`](strata-terminal/connection/set/--output.md)
@@ -1190,16 +947,12 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/config/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/config/--help.md)
-
 ### `strata config show` (config/show)
 
 - [コマンド概要](strata-terminal/config/show/README.md)
-
 - [`--connection`](strata-terminal/config/show/--connection.md)
 - [`--credential-env`](strata-terminal/config/show/--credential-env.md)
 - [`--effective`](strata-terminal/config/show/--effective.md)
-- [`--help`（alias: `-h`）](strata-terminal/config/show/--help.md)
 - [`--json`](strata-terminal/config/show/--json.md)
 - [`--output`](strata-terminal/config/show/--output.md)
 - [`--quiet`](strata-terminal/config/show/--quiet.md)
@@ -1209,8 +962,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata code` (code)
 
 - [コマンド概要](strata-terminal/code/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/code/--help.md)
 - [`--quiet`](strata-terminal/code/--quiet.md)
 - [`--resume`](strata-terminal/code/--resume.md)
 - [`--workspace`](strata-terminal/code/--workspace.md)
@@ -1218,8 +969,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata code run` (code/run)
 
 - [コマンド概要](strata-terminal/code/run/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/code/run/--help.md)
 - [`--output`](strata-terminal/code/run/--output.md)
 - [`--policy`](strata-terminal/code/run/--policy.md)
 - [`--prompt-file`](strata-terminal/code/run/--prompt-file.md)
@@ -1228,8 +977,6 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 ### `strata code sessions` (code/sessions)
 
 - [コマンド概要](strata-terminal/code/sessions/README.md)
-
-- [`--help`（alias: `-h`）](strata-terminal/code/sessions/--help.md)
 - [`--json`](strata-terminal/code/sessions/--json.md)
 - [`--output`](strata-terminal/code/sessions/--output.md)
 - [`--quiet`](strata-terminal/code/sessions/--quiet.md)
@@ -1238,25 +985,18 @@ v0.2.10 で追加されたコマンドです。`strata_cli/update_cmd.py:82` の
 
 - [コマンド概要](strata-terminal/split-engine/README.md)
 
-- [`--help`（alias: `-h`）](strata-terminal/split-engine/--help.md)
-
 ### `strata split-engine apply` (split-engine/apply)
 
 - [コマンド概要](strata-terminal/split-engine/apply/README.md)
-
 - [`--config`](strata-terminal/split-engine/apply/--config.md)
-- [`--help`（alias: `-h`）](strata-terminal/split-engine/apply/--help.md)
 - [`--out`](strata-terminal/split-engine/apply/--out.md)
 - [`--output`](strata-terminal/split-engine/apply/--output.md)
 
 ## `strata-engine`
 
-CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI の同名 wrapper とは別のプログラムです。一覧は `src/program/generate.cpp` の引数 parser と、parser より前に処理される引数 (`--version` / `-V`、`--families`、`--gpu` の環境変数設定、`--native` / `--model` の family switch) を基にしています。`--model` はその振り分けでしか読まれず、通常の `strata` parser は `--model` を unknown argument として拒否します。短縮表記と同一動作の alias は正規名の文書にまとめます。parser が受理していても usage/help に表示されない option があります。たとえば `--no-kv-grow` は parser (`src/program/generate.cpp:3360`) に実装されているため索引に含めています。
-
 ### `strata` (エンジン引数)
 
 - [コマンド概要](strata-engine/root/README.md)
-
 - [`--adapt-async`](strata-engine/root/--adapt-async.md)
 - [`--adapt-decay`](strata-engine/root/--adapt-decay.md)
 - [`--adapt-every`](strata-engine/root/--adapt-every.md)
@@ -1314,7 +1054,6 @@ CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI
 - [`--gr-native-mmvf`](strata-engine/root/--gr-native-mmvf.md)
 - [`--graph-only`](strata-engine/root/--graph-only.md)
 - [`--greedy`](strata-engine/root/--greedy.md)
-- [`--help`（alias: `-h`）](strata-engine/root/--help.md)
 - [`--host-core`](strata-engine/root/--host-core.md)
 - [`--keep-canonical`](strata-engine/root/--keep-canonical.md)
 - [`--kv`](strata-engine/root/--kv.md)
@@ -1449,9 +1188,6 @@ CMake で生成する推論エンジン (`strata` / `strata.exe`)。Terminal CLI
 ### `strata` / `strata-q36` (Qwen3.6 専用 parser; model 選択時または別 executable)
 
 - [コマンド概要](strata-engine/qwen36/README.md)
-
-Qwen3.6 family に振り分けられたとき `strata` が使う parser です。同じフラグでも通常 engine parser と意味が違う場合があるため、独立した `qwen36/` scope にしています。CMake は `STRATA_HIP_GFX906` でない構成に限り `strata-q36` を生成し、通常の `strata` にもこの family を組み込みます。GFX906 HIP build ではこの parser/executable は対象外です。
-
 - [`--batch`（alias: `--slots`）](strata-engine/qwen36/--batch.md)
 - [`--batch-mtp`](strata-engine/qwen36/--batch-mtp.md)
 - [`--bench-pp`](strata-engine/qwen36/--bench-pp.md)
@@ -1483,11 +1219,6 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 ### `strata-dsv41` (optional DeepSeek-V4.1 engine executable)
 
 - [コマンド概要](strata-engine-dsv41/root/README.md)
-
-`STRATA_BUILD_DSV41=ON` かつ `STRATA_HIP_GFX906` でない build で生成される独立 engine CLI です。macOS の Metal build では同じ入口 `src/dsv41/ds4_main.cpp` から CMake target `strata_ds4` (`metal/CMakeLists.txt:165`) が作られ、`packaging/mac/build_dsv41_engine.sh` がそれを `strata-dsv41` として staging します。Release への同梱はこの source inventory だけでは断定せず、[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-03 実測で v0.2.10 に `strata-dsv41-0.1.56-*` archive 6 件（linux-x86_64 cuda-cuda13 / hip-rx9070、linux-aarch64 cuda-cuda13、macos-arm64 metal、windows-x86_64 cuda-cuda13 / hip-rdna3）が並ぶことを確認しました。`--help` は `-h` も受理し (`src/dsv41/ds4_main.cpp:2593`)、`--version` は build id を表示します (`src/dsv41/ds4_main.cpp:2570`)。
-
-`--sampler-test` は option 一覧に含めません。`src/dsv41/ds4_main.cpp:2490-2492` で argv[1] がちょうどこの値のときにだけ sampler の統計 harness へ引数を渡す分岐で、その harness は `#if defined(STRATA_METAL)` で `strata_ds4` に組み込まれる `src/dsv41/sampler_stat.inc` の個別検証用コードです（CMake の単独 target はありません）。
-
 - [`--cpu-threads`](strata-engine-dsv41/root/--cpu-threads.md)
 - [`--dspark`](strata-engine-dsv41/root/--dspark.md)
 - [`--dspark-block`](strata-engine-dsv41/root/--dspark-block.md)
@@ -1500,7 +1231,6 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 - [`--expert-profile`](strata-engine-dsv41/root/--expert-profile.md)
 - [`--experts`](strata-engine-dsv41/root/--experts.md)
 - [`--gpus`](strata-engine-dsv41/root/--gpus.md)
-- [`--help`（alias: `-h`）](strata-engine-dsv41/root/--help.md)
 - [`--ids`](strata-engine-dsv41/root/--ids.md)
 - [`--images`](strata-engine-dsv41/root/--images.md)
 - [`--layer-split`](strata-engine-dsv41/root/--layer-split.md)
@@ -1537,16 +1267,9 @@ Qwen3.6 family に振り分けられたとき `strata` が使う parser です�
 
 ## `strata-split`
 
-v0.2.10 で加わった全カード分割 engine（`src/split/`、sFNX 由来・MIT、設計と手順は `docs/SPLIT_ENGINE.md`）。CMake は `STRATA_BUILD_SPLIT=ON` と `STRATA_SPLIT_CARDS`（2 / 3 / 4 しか通らない。`src/split/CMakeLists.txt:92-97`）で `strata-split-${_n}` を作り、`STRATA_SPLIT_ARCH` の 1 compute capability 専用です（`CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real"`、`src/split/CMakeLists.txt:116`）。ビルドは `packaging/build_split_cuda.sh`（NVIDIA）と `packaging/build_split_hip.sh`（AMD）が担い、engine package には `package_engine.py --include 'strata-split-*'`（option 定義は `packaging/package_engine.py:311`、手順コメントは `packaging/build_split_cuda.sh:3-4`）または `SPLIT_DIR`（`packaging/build_hip_linux.sh:109-110`）で同梱します。Release には独立 asset が無く、0.1.56 の Linux / Windows archive を展開していないので実同梱は未確認です（[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-03 実測）。
-
-起動は Terminal 側が決めます。`strata launch --split-engine auto|on|off`（`strata_cli/launch/cmd.py:108`）の判断で `strata_control/split_engine.py` が engine component フォルダ内の `strata-split-N-sm<cc>` / `strata-split-N-<arch>` を探し、無いときは `this engine package has no strata-split-N` を返して通常の layer split に留まります（`strata_control/split_engine.py:438-497`）。走る引数組み立ては `strata_control/split_engine.py:252-271` で、`FNX_ARENA=0` と `FNX_EXPERT_RAM_GIB=off` を env に置きます。
-
-option inventory は `src/split/tools/sfnx.cpp:72-105` の手書き parser です。`--serve` が無いと `sfnx runs as --serve` で落ち、`--native` / `--mtp` 未指定も必須エラーです（`src/split/tools/sfnx.cpp:100-101`）。`--layer-split` は値を読むだけで、Strata 側の layer split との混同を避けるための受理です（`src/split/tools/sfnx.cpp:90`）。`--rope-scale` は環境変数 `FNX_ROPE_SCALE` と食い違うと例外、合えば `setenv` で engine に渡します（`src/split/tools/sfnx.cpp:91-96`）。`--batch` は `1..MAX_SLOTS` の範囲チェックがあります（`src/split/tools/sfnx.cpp:102`）。`--help` / `-h` option は無く、未知の引数は `unknown argument …` で例外終了です（`src/split/tools/sfnx.cpp:98`）。
-
 ### `strata-split-N` (`src/split/tools/sfnx.cpp`)
 
 - [コマンド概要](strata-split/root/README.md)
-
 - [`--batch`](strata-split/root/--batch.md)
 - [`--conversation-cache-mib`](strata-split/root/--conversation-cache-mib.md)
 - [`--draft-vocab`](strata-split/root/--draft-vocab.md)
@@ -1562,16 +1285,11 @@ option inventory は `src/split/tools/sfnx.cpp:72-105` の手書き parser で�
 
 ## CMake 生成の単体 CLI（診断・開発用）
 
-`000_cli_tools.md` の関連実行ファイル欄にある単体 CLI を、製品の推論エンジンとは別 tool-id として掲載します。これらは用途や build target が異なり、通常の Terminal CLI のサブコマンドではありません。`strata-dequant` にはオプション parser がなく、GGUF ファイルの位置引数だけを受け付けます。CMake の `strata-q36ref` も独立 parser を持つ Qwen reference CLI として対象に含めます。これは照合・開発用 executable で、現行 Release への同梱は確認できていません。`*_test`、`*_parity`、`*_bench` や probe は個別検証用途として引き続き対象外です。
-
-
 ### `strata-plan` (`src/plan/plan_main.cpp`)
 
 - [コマンド概要](strata-plan/root/README.md)
-
 - [`--dense`](strata-plan/root/--dense.md)
 - [`--embd`](strata-plan/root/--embd.md)
-- [`--help`（alias: `-h`）](strata-plan/root/--help.md)
 - [`--max-context`](strata-plan/root/--max-context.md)
 - [`--pool`](strata-plan/root/--pool.md)
 - [`--state`](strata-plan/root/--state.md)
@@ -1581,18 +1299,14 @@ option inventory は `src/split/tools/sfnx.cpp:72-105` の手書き parser で�
 ### `strata-device` (`src/core/device_main.cpp`)
 
 - [コマンド概要](strata-device/root/README.md)
-
-- [`--help`（alias: `-h`）](strata-device/root/--help.md)
 - [`--list-devices`](strata-device/root/--list-devices.md)
 - [`--selftest`](strata-device/root/--selftest.md)
 
 ### `strata-load` (`src/core/load_main.cpp`)
 
 - [コマンド概要](strata-load/root/README.md)
-
 - [`--chunk-mb`](strata-load/root/--chunk-mb.md)
 - [`--file`](strata-load/root/--file.md)
-- [`--help`（alias: `-h`）](strata-load/root/--help.md)
 - [`--layers`](strata-load/root/--layers.md)
 - [`--no-pin`](strata-load/root/--no-pin.md)
 - [`--stream`](strata-load/root/--stream.md)
@@ -1601,7 +1315,6 @@ option inventory は `src/split/tools/sfnx.cpp:72-105` の手書き parser で�
 ### `strata-concurrent` (`src/core/concurrent_main.cpp`)
 
 - [コマンド概要](strata-concurrent/root/README.md)
-
 - [`--cpu-threads`](strata-concurrent/root/--cpu-threads.md)
 - [`--experts`](strata-concurrent/root/--experts.md)
 - [`--file`](strata-concurrent/root/--file.md)
@@ -1610,7 +1323,6 @@ option inventory は `src/split/tools/sfnx.cpp:72-105` の手書き parser で�
 ### `strata-overlap` (`src/core/overlap_main.cpp`)
 
 - [コマンド概要](strata-overlap/root/README.md)
-
 - [`--experts`](strata-overlap/root/--experts.md)
 - [`--file`](strata-overlap/root/--file.md)
 - [`--tpr`](strata-overlap/root/--tpr.md)
@@ -1618,21 +1330,16 @@ option inventory は `src/split/tools/sfnx.cpp:72-105` の手書き parser で�
 ### `strata-gguf` (`src/artifact/gguf_reader.cpp`)
 
 - [コマンド概要](strata-gguf/root/README.md)
-
 - [`--check`](strata-gguf/root/--check.md)
 
 ### `strata-dequant` (`src/artifact/dequant.cpp`)
 
 - [コマンド概要](strata-dequant/root/README.md)
-
 - オプションなし（位置引数のみ）
 
 ### `strata-q36ref` (`src/qwen35/q36ref.cu`)
 
-Qwen3.6 reference path の照合用 executable です。CMake target は GPU backend build 内に定義されます。ソースの usage/parser にある option を索引化し、Release 配布実績は確認できていないため断定しません。
-
 - [コマンド概要](strata-q36ref/root/README.md)
-
 - [`--act`](strata-q36ref/root/--act.md)
 - [`--ctx`](strata-q36ref/root/--ctx.md)
 - [`--dump-full-logits`](strata-q36ref/root/--dump-full-logits.md)
@@ -1647,12 +1354,9 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 
 ## `strata-vision`
 
-画像の tensor を作るための独立 CLI です。`tools/vision/CMakeLists.txt:96` の `add_executable(strata-vision strata_vision.cpp)` が作り、setup.py は vision encoder を選んだときにこれを build します (`tools/vision/CMakeLists.txt:1-2`)。build option でプログラム名と GPU が変わります: `STRATA_VISION_CUDA=ON` は同じ名前 `strata-vision` のまま GPU 版、`STRATA_VISION_HIP=ON` は `strata-vision-hip`、`STRATA_VISION_SYCL=ON` は `strata-vision-sycl`、既定の `STRATA_VISION_METAL=ON` は Mac の GPU を使います (`tools/vision/CMakeLists.txt:18-20`、`tools/vision/CMakeLists.txt:31`)。いずれも同じ parser で、`--version` の表示だけが variant で変わります (`tools/vision/strata_vision.cpp:102-112`)。engine package に入る実行ファイルで、Terminal CLI のサブコマンドではありません。Release の archive ごとに同梱・未同梱が違い、[`000_cli_tools.md`](000_cli_tools.md) の 2026-11-03 実測で 0.1.56 の macOS engine archive に `strata` と並び `strata-vision` が入ることを確認しました（2026-11-01 の 0.1.55 実測では macOS / HIP archive に入り、SYCL archive には入りませんでした。0.1.56 の Linux / Windows archive は未展開です）。位置引数は取らず、`--mmproj` と `--model` の指定が必須です（未指定なら usage を表示して exit 2、`tools/vision/strata_vision.cpp:125-128`）。`--help` option はなく、未知の引数は `unknown argument` で exit 2 です (`tools/vision/strata_vision.cpp:123`)。
-
 ### `strata-vision` / `strata-vision-hip` / `strata-vision-sycl`
 
 - [コマンド概要](strata-vision/root/README.md)
-
 - [`--flash-attn`](strata-vision/root/--flash-attn.md)
 - [`--gpu`](strata-vision/root/--gpu.md)
 - [`--max-tokens`](strata-vision/root/--max-tokens.md)
@@ -1664,14 +1368,9 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 
 ## `source-setup`
 
-`setup.py` は初回 setup、既存環境の更新、モデル設定変更を担います。POSIX/Windows の wrapper はここへ引数を渡します。以下は `setup.py` の CLI parser option inventory です（parser は `setup.py:9568` の一つだけ、現行の option 宣言は 56 個）。setup は複数 GPU と helper cache の条件に応じて engine 用 `--remote-expert-opt` を run config に自動追加することがありますが、これは `setup.py` に渡す option ではありません。自動追加を抑止する setup option は `--no-remote-expert-opt` です。
-
-`--images`、`--image-quant`、`--image-backend`、`--image-native`、`--image-gpu-policy`、`--skip-build` は parser が受理しますが、`help=argparse.SUPPRESS` で `--help` の一覧には表示されません (`setup.py:9595-9603`、`setup.py:9716`。コメントは「in preview, not offered in setup or --help; the options still work」)。索引は parser の受理を基準にしているので、これらも予定リンクとして列挙します。
-
 ### `setup.py` / `setup.sh` / `START-HERE.bat` / update wrappers
 
 - [コマンド概要](source-setup/root/README.md)
-
 - [`--api-key`](source-setup/root/--api-key.md)
 - [`--backend`](source-setup/root/--backend.md)
 - [`--browser`](source-setup/root/--browser.md)
@@ -1691,7 +1390,6 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 - [`--gpu`](source-setup/root/--gpu.md)
 - [`--gpu-roles`](source-setup/root/--gpu-roles.md)
 - [`--gpus`](source-setup/root/--gpus.md)
-- [`--help`（alias: `-h`）](source-setup/root/--help.md)
 - [`--host`](source-setup/root/--host.md)
 - [`--image-backend`](source-setup/root/--image-backend.md)
 - [`--image-gpu-policy`](source-setup/root/--image-gpu-policy.md)
@@ -1733,9 +1431,6 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 ### `metal/setup_mac.py` (mac; setup.py が Apple Silicon で委譲)
 
 - [コマンド概要](source-setup/mac/README.md)
-
-`setup.py` は `main()` の冒頭で `sys.platform == "darwin"` かつ `CONTROL`（環境変数 `STRATA_CONTROL_INSTALL=1`、`setup.py:82`）でないことを調べて、`metal/setup_mac.py` に全 argv を渡して終了します (`setup.py:9566`、`mac_setup` は `setup.py:7944-7948`)。受け側は独自の parser を持つため `mac/` scope に分けます。この parser は `parse_known_args` で、余った引数は `not used on a Mac: ...` と警告して続行します (`metal/setup_mac.py:362-364`)。`--backend sycl` で呼ばれる `sycl/setup_intel.py` には parser がなく、`--backend hip` などを補って `setup.py` の `main()` を再実行するだけです (`sycl/setup_intel.py:553-560` の argv 組み替えと `S.main()` 呼び出し)。
-
 - [`--api-key`](source-setup/mac/--api-key.md)
 - [`--build`](source-setup/mac/--build.md)
 - [`--check`](source-setup/mac/--check.md)
@@ -1744,7 +1439,6 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 - [`--draft-vocab`](source-setup/mac/--draft-vocab.md)
 - [`--family`](source-setup/mac/--family.md)
 - [`--gguf-dir`](source-setup/mac/--gguf-dir.md)
-- [`--help`（alias: `-h`）](source-setup/mac/--help.md)
 - [`--host`](source-setup/mac/--host.md)
 - [`--model`](source-setup/mac/--model.md)
 - [`--models-dir`](source-setup/mac/--models-dir.md)
@@ -1761,19 +1455,15 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 
 ## `quick-benchmark`
 
-`bench.sh` / `BENCH.bat` が起動するローカル quick benchmark (`tools/strata_bench.py`)。標準比較ベンチマークの `strata bench run` は上記 Terminal CLI 索引にあります。
-
 ### `bench.sh` / `BENCH.bat`
 
 - [コマンド概要](quick-benchmark/root/README.md)
-
 - [`--api-key`](quick-benchmark/root/--api-key.md)
 - [`--clients`](quick-benchmark/root/--clients.md)
 - [`--compare`](quick-benchmark/root/--compare.md)
 - [`--compare-only`](quick-benchmark/root/--compare-only.md)
 - [`--config`](quick-benchmark/root/--config.md)
 - [`--gpu`](quick-benchmark/root/--gpu.md)
-- [`--help`（alias: `-h`）](quick-benchmark/root/--help.md)
 - [`--long`](quick-benchmark/root/--long.md)
 - [`--out`](quick-benchmark/root/--out.md)
 - [`--port`](quick-benchmark/root/--port.md)
@@ -1782,35 +1472,4 @@ Qwen3.6 reference path の照合用 executable です。CMake target は GPU bac
 - [`--runs`](quick-benchmark/root/--runs.md)
 - [`--think`](quick-benchmark/root/--think.md)
 - [`--url`](quick-benchmark/root/--url.md)
-
-## Release installer
-
-Release から配布される `install.sh`（POSIX）と `install.ps1`（Windows）は CLI 引数を定義していません。インストール先などを環境変数で上書きする仕様は対応する `docs/<ENVVAR>.md` に記録し、ここではオプション文書を作成しません。
-
-## 更新時の確認
-
-この索引を更新するときは、`strata_cli/cli.py` と各 module の登録 parser（`strata_cli/launch/cmd.py`、`strata_cli/update_cmd.py`、`strata_cli/tune_commands.py`、`strata_cli/drafting_cmd.py`、`strata_cli/monitor_commands.py`）、`setup.py`、Apple Silicon で委譲される `metal/setup_mac.py`、`tools/strata_bench.py`、推論エンジン `src/program/generate.cpp` と `src/qwen35/q36_engine.cu`・`src/dsv41/ds4_main.cpp`、`tools/vision/strata_vision.cpp`、`src/split/tools/sfnx.cpp`、CMake 生成の単体 CLI の argv parser を現行 checkout で再確認してください。`strata components engines` / `use` / `remove` のように `strata_cli/update_cmd.py` 側で増える parser を見落とさないこと、engine package 同梱の実行ファイル（`strata-vision` 系、`strata-split-N`）は tool-id として独立節にすることが 2026-11-03 の更新で必要になった点です。コマンド/オプションの追加・削除・alias 変更を反映し、`tool-id + command-path + option identity` ごとのパスを維持します。ラッパーが parser へ委譲するだけなら重複登録せず、委譲先が別の parser を持つ場合は別 scope に分けます。CMake 開発用 binary は製品 CLI と区別します。
-
-## 更新手順と次回の調査指示
-
-> 索引更新を他の作業（環境変数一覧の更新、本文の一括作成、消えた項目の削除、突合点検）とどの順序で回すかは、スキル `.agents/skills/strata-investigate/SKILL.md` にまとめた。以下は本書単体の手順として残す。
-
-Strata のソースコードが更新されたら、`/home/sasasin/src/github.com/Niko1221/Strata` の更新後 checkout を調査し、この索引を現行のコマンド構造と parser に合わせて更新してください。既存リンクへの追記だけで済ませず、削除・改名・移動されたコマンドやオプション、parser の統合・分岐も見直します。この作業では索引を更新し、リンク先のコマンド概要やオプション文書が未作成でも、規約に合う予定パスを Markdown リンクとして列挙します。
-
-### 調査手順
-
-1. **対象 revision と作業状態を記録する。** Strata リポジトリで `git rev-parse HEAD`、`git status --short --branch`、必要に応じて `git log -1 --format='%h %cs %s'` を確認します。未コミット変更があれば調査対象に含め、既存の変更を上書きしないでください。索引に完全な commit SHA と調査日を記録します。
-2. **ツール一覧を照合する。** [`000_cli_tools.md`](000_cli_tools.md) と Strata checkout のルート、`bin/`、`packaging/`、`tools/`、`strata_cli/`、`src/`、各 `CMakeLists.txt` を見直します。CLI のソース、委譲 wrapper、ビルド生成 executable、Release installer と配布対象を区別し、索引に追加・削除すべき tool-id を決めます。
-3. **コマンド階層を列挙する。** Terminal CLI は `strata_cli/cli.py` の root parser と、そこから登録される各 module の parser 定義をたどります。`launch` / `connect`、update、drafting、tune/presets、status/monitor/logs/connection 等、別 module で登録される parser も含めます。module 内で parser を作った後、`cli.py` 側で共通 option を追加する処理も確認してください。たとえば `--json` / `--quiet` は `update_parsers` を含む one-shot parser 群へ後から追加されます (`strata_cli/cli.py:508-514`)。安全に実行でき、調査 checkout と同じ revision の CLI がある場合は `--help` を補助に使えますが、最終的に登録された parser と実際の処理をソースで照合します。`strata_cli.cli.parser()` を呼んで `_actions` と `_SubParsersAction.choices` を再帰 walk すると、後付け option を含む現行 grammar を機械抽出できるので、索引との diff 取りに有効です。
-4. **各 parser のオプションと alias を列挙する。** `argparse` 等の宣言、手書き C/C++ の `argv` 解析、早期処理される `--version` / `-V` / `--families` / `--gpu` のようなフラグを確認します。Python は `ast` で `add_argument` を拾うと option 文字列と行番号を一括で得られ、`help=argparse.SUPPRESS` で `--help` に出ない option も見落としません。C/C++ は `a == "--xxx"` と `std::strcmp(argv[i], "...")` の文字列を集め、`|| a == "-h"` のような alias 表現も拾います（`strata-plan`、`strata-load`、`strata-device`、`strata-dsv41` の `--help` には `-h` alias があります）。推論エンジンは通常の `src/program/generate.cpp` の parser に加え、Qwen3.6 の条件付き parser (`src/qwen35/q36_engine.cu`)、独立 executable (`src/dsv41/ds4_main.cpp`)、build 条件を確認します。`setup.py` と `tools/strata_bench.py` はそれぞれの parser を調べ、`setup.sh` / `.bat`、update wrapper、quick-benchmark wrapper が引数を委譲するだけなら重複登録しませんが、委譲先が独自の parser を持つ場合は別 scope にして列挙します。同一 revision の option 文字列集合は `python3 .agents/skills/strata-investigate/scripts/cli-grammar.py` で `.cli-grammar.json` として保存し、既存文書の陳腐化検出（option が現行 parser から消えたか）に使う。
-5. **対象境界を再判定する。** `000_cli_tools.md` に挙がる単体診断 CLI は個別の tool-id として扱います。CMake の `*_test`、`*_parity`、`*_bench`、個別 probe・harness は製品 CLI と混同せず、利用者向け・開発用・テスト用の区分と既存一覧の方針に沿って対象を判断します。engine package に同梱される独立実行ファイル（`strata-vision` 系など）は、build target・parser・利用経路を確認して別の tool-id として索引に追加します。同じ名前の引数でもその parser が受理しない場合は項目に含めず、注記で受理範囲を書きます（例: `--model` は `strata` 通常 parser では unknown argument）。parser 内で別 harness へ引数を渡す special arg は、対象外とする理由と所在を注記に書き、option 一覧には混ぜません。Release installer が CLI 引数を持たない場合は、オプションリンクを作らずその事実を記載します。ネットワーク上の Release 実体を確認できない場合は、ソースに基づく予想を実配布物として断定せず、[`000_cli_tools.md`](000_cli_tools.md) で実測した asset 一覧は参照として日付付きで示します。
-6. **一意な予定パスとコマンド概要を索引化する。** 各コマンド階層について `docs/cli/<tool-id>/<command-path>/README.md` の「コマンド概要」リンクを一つ置き、その節の先頭にします。root command は `root/` を使い、条件付きで parser や意味が分かれる場合は `001_investigation.md` の規約に沿って scope を分離します。各 option は `docs/cli/<tool-id>/<command-path>/<option-name>.md` にリンクします。同一 parser action の alias は正規名の一文書にまとめ、別の挙動・parser を同じリンクに押し込めません。リンク先ファイルが未作成でも、索引には予定リンクとして残します。
-7. **節内の順序と網羅性を整える。** コマンド見出しの順番は維持し、各コマンド節では「コマンド概要」を先頭、その後のオプションを表示される正規名の ASCII コード順に並べます。ASCII 順では接頭辞が短い名前の次文字が並びを決めるため、`--replica-profile` は `--replicas` より前、`--image-*` は `--images` より前、`--set-default-data-dir` は `--setup` より前になります。索引の option 行を正規表現で抽出し、parser 側から機械抽出した集合と突き合わせて、追加・削除・改名・alias 表記の漏れと重複を確認します。全てのコマンド見出しに概要リンクが一つあること、コマンドごとの parser の全 option が漏れなく列挙されること、同じ tool-id / command path / option identity のリンクが重複しないことを確認します。
-8. **根拠と索引の境界を更新する。** 冒頭の commit hash と調査日、ツール説明、対象境界、更新手順を今回実際に調べた checkout に合わせます。オプションの値や効果を個別文書に記載するのは別作業です。この索引更新だけを依頼された場合は、その文書を作成したことにせず、予定リンクとして列挙します。ソース変更、build、GPU 実行、性能測定、テストは依頼がない限り行いません。
-
-### 次回の依頼文
-
-次回以降は、次のように依頼してください（この節「更新手順と次回の調査指示」を指します）。
-
-> Strata ソースコードが更新されたので、`/home/sasasin/src/github.com/sasasin/strata-envvars/docs/cli/README.md` の「更新手順と次回の調査指示」に従って、`/home/sasasin/src/github.com/Niko1221/Strata` を調査し、`docs/cli/README.md` を最新の内容に更新してください。全 CLI tool-id とコマンド階層、各 parser のオプションと alias、条件付き engine parser、CMake 生成の対象 CLI を確認してください。全コマンドに `README.md` の概要リンクを置き、各コマンド節では概要リンクを先頭、その後のオプションを ASCII コード順にしてください。オプション文書と概要ページが未作成の場合も、規約どおりの Markdown 予定リンクとして列挙し、現行 Release を確認できない内容は推測で補わないでください。
 

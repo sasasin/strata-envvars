@@ -34,7 +34,7 @@ strata presets list --model qwen --output json
 ## 関連文書
 
 - [`strata presets` の概要](../README.md)
-- [`--help`](--help.md)
+- `--help`
 - [`--model`](--model.md)
 - [`--output`](--output.md)
 - [`strata launch` の概要](../../launch/README.md)（起動設定プリセットの管理）

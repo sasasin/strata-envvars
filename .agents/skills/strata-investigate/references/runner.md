@@ -33,8 +33,8 @@ uv run ./create-cli-docs.py -p 12 -l 100
   - Strata がまったく読まない名前（外部 lib・driver 専用、索引の誤拾い）→ 本文は作らない。
   - **Strata が読むが、読み取り箇所がテスト・parity 専用コードだけ**（GEMV_X、QUANT_CTAB、
     STRATA_WMMA_PARITY_EXACT など）→ `001_investigation.md` が実装根拠にしないと決めているので本文は作らない。
-    索引には残す。索引は grep 由来の候補一覧で、自分の冒頭で「テスト・開発/e2e スクリプトが読む変数」を
-    内訳に含めると宣言している。
+    索引には残す。索引は grep 由来の候補一覧で、テスト・開発/e2e スクリプトだけが読む名前も載せる決まり
+    （`extraction-recipes.md` §5）。
   - 逆に、セットアップ・ビルド・package スクリプト（`setup.py`、`packaging/**`、vision build の batch など）が
     読む変数は本文を作る対象。エンジン実行で読まないからと no-doc にするのは誤り（CUDA_PATH で実際に起きた）。
     再依頼では `001_investigation.md` の「調査対象と結界」の該当文を引用して範囲を示すと直る。
@@ -49,7 +49,8 @@ uv run ./create-cli-docs.py -p 12 -l 100
   索引に予定リンクとして載った瞬間に作成対象になる。`--dry-run` は無いので、`-l` で件数を刻む。
 - `-l`, `--doc-limit N` / `-p`, `--parallel N` のみ。試行記録は持たない（索引にリンクがあれば再現する）。
 - 対象が `<command-path>/README.md` ならコマンド概要、`--option.md` / `-x.md` ならオプション文書になる。
-  概要の基準文書は `docs/cli/strata-terminal/launch/README.md`（スクリプトが参照）。
+  概要の書式と詳しさは `docs/cli/001_investigation.md` の「コマンド概要の内容」（特定の文書を手本にしない）。
+- `--help` は索引に載せない決まりなので作成対象にならない（`index-refresh.md` §3）。索引に `--help.md` へのリンクが紛れ込んでいたら、作成せず索引側を直す。
 
 ## codex 実行の形（両スクリプト共通）
 

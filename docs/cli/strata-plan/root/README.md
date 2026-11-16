@@ -59,7 +59,7 @@ strata-plan --help
 ## 関連文書
 
 - [CLI 索引の `strata-plan` 節](../../README.md#strata-plan-srcplanplan_maincpp)
-- [`--dense`](--dense.md)、[`--embd`](--embd.md)、[`--help`](--help.md)、[`--max-context`](--max-context.md)、[`--pool`](--pool.md)、[`--state`](--state.md)、[`--vram`](--vram.md)、[`--workspace`](--workspace.md)
+- [`--dense`](--dense.md)、[`--embd`](--embd.md)、`--help`、[`--max-context`](--max-context.md)、[`--pool`](--pool.md)、[`--state`](--state.md)、[`--vram`](--vram.md)、[`--workspace`](--workspace.md)
 
 ## 根拠
 

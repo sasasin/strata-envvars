@@ -51,7 +51,7 @@ GPU/backend の利用可能性はビルドと実行環境に依存します。�
 ## 関連文書
 
 - [Strata CLI 索引](../../README.md) — `strata-engine` のオプション文書一覧
-- [`--help`](--help.md)、[`--version`](--version.md)
+- `--help`、[`--version`](--version.md)
 - [`--pack`](--pack.md)、[`--tokens`](--tokens.md)、[`--native`](--native.md)、[`--serve`](--serve.md)
 - [Strata CLI の配置・配布一覧](../../000_cli_tools.md)
 
