@@ -182,6 +182,10 @@ def create_doc(doc_path: Path, stale_note: str = "") -> tuple[Path, int, str, st
         command = [
             "codex",
             "exec",
+            "--model",
+            "gpt-6-luna",
+            "--config",
+            "model_reasoning_effort=high",
             "--skip-git-repo-check",
             "--sandbox",
             "workspace-write",
