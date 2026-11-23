@@ -7,9 +7,11 @@ HEAD ツリーに合わせて正規化する。evidence-index.py / find-stale.py
 from __future__ import annotations
 
 import collections
+import os
 import pathlib
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Iterable
 
@@ -70,15 +72,34 @@ GREP_EXCLUDES = [
     ":(exclude)third_party/**",
 ]
 
+# hunk の差分行から切り出す語: 識別子と option 文字列（境界付き）。
+# 語全体で一致させるので、STRATA_PF_FUSED の語に STRATA_PF_FUSED_SM75 は入らない
+# （find-stale.py の旧実装が文書ごとに走らせていた境界正規表現 search と同義で、
+# 行あたり 1 回の finditer + 集合 membership に置き換えるためのもの）。
+WORD_RE = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z_][A-Za-z0-9_]*|-{1,2}[A-Za-z][A-Za-z0-9-]*)")
 
-def build_name_index(strata: pathlib.Path, revision: str) -> dict[str, set[str]]:
-    """Strata のある revision で「名前 -> 出現ファイル集合」を 1 回の grep 群で作る。
+
+def default_parallel() -> int:
+    """git diff / git log の並列数。コア数から決めるが、メモリと git の CPU 使用を抑えるため 8 まで。"""
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except OSError:
+        cores = os.cpu_count() or 1
+    return max(1, min(8, cores))
+
+
+def build_name_index(strata: pathlib.Path, revision: str, parallel: int | None = None) -> dict[str, set[str]]:
+    """Strata のある revision で「名前 -> 出現ファイル集合」を grep 群で作る。
 
     Stage 3 の所在追跡を、変数ごとの git grep ではなくこの表の参照で済ませるため。
+    パターンごとの git grep は独立なので並列に走らせる。
     """
+    workers = parallel or default_parallel()
+    with ThreadPoolExecutor(max_workers=min(workers, len(GREP_PATTERNS))) as ex:
+        outputs = list(ex.map(lambda p: git(strata, "grep", "-n", "-E", p, revision, "--", *GREP_EXCLUDES), GREP_PATTERNS))
     index: dict[str, set[str]] = {}
-    for pattern in GREP_PATTERNS:
-        for raw in git(strata, "grep", "-n", "-E", pattern, revision, "--", *GREP_EXCLUDES).split("\n"):
+    for out in outputs:
+        for raw in out.split("\n"):
             if not raw:
                 continue
             body = raw[len(revision) + 1 :] if raw.startswith(revision) else raw
@@ -178,34 +199,42 @@ class StrataTree:
         )
         return [line for line in out.split("\n") if line]
 
-    def hunk_data(self, since: str) -> dict[str, list[tuple[int, int, int, int, list[str]]]]:
-        """`since..HEAD` の hunk を行範囲と差分テキストで集める（1 回の diff、全ツリー）。
+    def hunk_data(
+        self, since: str, known_tokens: set[str]
+    ) -> dict[str, list[tuple[int, int, int, int, dict[str, list[str]] | None]]]:
+        """`since..HEAD` の hunk を行範囲と「トークン -> 抜粋行」の写像で集める（1 回の diff、全ツリー）。
 
         pathspec は使わない。引用ファイル（新パス）だけに絞ると、大きなレイアウト移動
         （例: Strata 0.2.16 の src/ → engine/src/）では old パスが diff に入らず
         rename 検出が壊れて「全文追加」の巨大 hunk になり、token-in-diff が量産される
         （2026-11-23 実測: 候補 2731 件のうち 1136 件が移動由来の誤検知）。
         全ツリーの diff にすれば -M が効き、純粋な移動 (R100) は hunk を出さない。
+
+        差分行は全部は保持しない。hunk ごとに WORD_RE で語を 1 回切り出し、
+        known_tokens に在るものだけを {トークン: 抜粋行 最大 6 本} にまとめる。
+        文書側の照合は「交差した hunk の写像に自分のトークンが在るか」の O(1) で、
+        報告に添える行もそのトークン自身の行になる（旧実装は 文書×座標×hunk×行 で
+        re.search を 2.5 億回走らせ、それが find-stale.py の所要時間の 6 割だった）。
         """
-        per: dict[str, list[tuple[int, int, int, int, list[str]]]] = collections.defaultdict(list)
+        per: dict[str, list[tuple[int, int, int, int, dict[str, list[str]] | None]]] = collections.defaultdict(list)
         cur_path: str | None = None
         pending: tuple[int, int, int, int] | None = None
-        lines: list[str] = []
+        toks: dict[str, list[str]] | None = None
         out = git(self.strata, "diff", "-M", "-U0", "--no-color", f"{since}..{self.revision}")
         for line in out.split("\n"):
             if line.startswith("+++ b/"):
                 if cur_path and pending:
-                    per[cur_path].append((*pending, lines))
+                    per[cur_path].append((*pending, toks))
                 cur_path = line[6:].strip()
                 pending = None
-                lines = []
+                toks = None
             elif line.startswith("@@") and cur_path:
                 if pending:
-                    per[cur_path].append((*pending, lines))
+                    per[cur_path].append((*pending, toks))
                 match = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
                 if not match:
                     pending = None
-                    lines = []
+                    toks = None
                     continue
                 old_start = int(match.group(1))
                 old_count = int(match.group(2) or 1)
@@ -217,12 +246,19 @@ class StrataTree:
                     new_start,
                     new_start + max(new_count, 1) - 1,
                 )
-                lines = []
+                toks = None
             elif line[:1] in "+-" and not line.startswith(("+++", "---")):
-                if pending:
-                    lines.append(line)
+                if pending is not None:
+                    for m in WORD_RE.finditer(line):
+                        word = m.group(1)
+                        if word in known_tokens:
+                            if toks is None:
+                                toks = {}
+                            lst = toks.setdefault(word, [])
+                            if len(lst) < 6:
+                                lst.append(line)
         if cur_path and pending:
-            per[cur_path].append((*pending, lines))
+            per[cur_path].append((*pending, toks))
         return per
 
 

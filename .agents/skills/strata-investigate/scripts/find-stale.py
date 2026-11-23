@@ -14,10 +14,13 @@ import collections
 import json
 import pathlib
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from staleness_lib import (
     build_name_index,
+    default_parallel,
     sha_distance,
     similar_sha,
     CLI_DIR,
@@ -75,6 +78,13 @@ def parse_args() -> argparse.Namespace:
         help="--with-symbols で 引用シンボル現存を見る文書数の上限 (git grep が増える)",
     )
     parser.add_argument("--report", type=pathlib.Path, default=REPO_ROOT / ".strata-stale.json")
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=0,
+        metavar="N",
+        help="git diff / git log / git grep を並列化するワーカー数 (既定: min(8, CPU コア数))",
+    )
     parser.add_argument("--list", action="store_true", help="候補を一覧する")
     parser.add_argument("--limit", type=int, default=30, metavar="N")
     return parser.parse_args()
@@ -111,25 +121,17 @@ def doc_symbols(path: pathlib.Path, limit: int = 12) -> list[str]:
 def stage1_2(
     docs: dict[str, dict[str, object]],
     revision: str,
-    tree: StrataTree,
-    strata: pathlib.Path,
+    hunk_cache: dict[str, dict[str, list[tuple[int, int, int, int, dict[str, list[str]] | None]]]],
+    known_shas: set[str],
     grammar_files: dict[str, set[str]] | None = None,
 ) -> dict[str, dict[str, object]]:
-    """Stage 1 / Stage 2 の判定を doc に書き込む。"""
-    by_sha: dict[str, list[str]] = collections.defaultdict(list)
-    for key, doc in docs.items():
-        by_sha[str(doc["doc_sha"])].append(key)
+    """Stage 1 / Stage 2 の判定を doc に書き込む。
 
-    known_shas = {
-        sha for sha in by_sha if sha and git_ok(strata, "cat-file", "-e", f"{sha}^{{commit}}")
-    }
-    hunk_cache: dict[str, dict[str, list[tuple[int, int, int, int, list[str]]]]] = {}
-    for sha in by_sha:
-        if sha == revision or not sha or not git_ok(strata, "cat-file", "-e", f"{sha}^{{commit}}"):
-            continue
-        # pathspec なしの全ツリー diff（rename 検出を壊さないため。staleness_lib.hunk_data 参照）
-        hunk_cache[sha] = tree.hunk_data(sha)
-
+    hunk_cache は main で doc_sha ごとに 1 回作り、envvars/cli で共有する
+    （同じ sha の全ツリー diff を二度引かないため）。トークン照合は hunk_data が
+    事前抽出した「hunk 内の既知トークン集合」で行う（行ごとの境界正規表現 search は
+    文書×座標×hunk×行 で 2.5 億回走り、所要時間の 6 割を占めていた）。
+    """
     for key, doc in docs.items():
         sha = str(doc["doc_sha"])
         if not sha:
@@ -149,13 +151,12 @@ def stage1_2(
         token = str(doc["token"])
         touched: list[str] = []
         token_lines: list[str] = []
-        token_re = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(token) + r"(?![A-Za-z0-9_-])") if token else None
         for path, start, end in doc["coords"]:  # type: ignore[misc]
-            for old_a, old_b, new_a, new_b, lines in per.get(path, ()):
+            for old_a, old_b, new_a, new_b, toks in per.get(path, ()):
                 if not (end < new_a or start > new_b):
                     touched.append(path)
-                    if token_re:
-                        token_lines += [line for line in lines if token_re.search(line)]
+                    if toks:
+                        token_lines += toks.get(token, ())
                     break
         unresolved = [cited for cited, (state, _) in doc["cites"].items() if state in {"absent"}]  # type: ignore[attr-defined]
         # option 文字列を宣言するファイルの差分でなければ、別名・usage 文言の揺れとみなす
@@ -183,13 +184,22 @@ def stage1_2(
 def add_changed_commits(
     docs: dict[str, dict[str, object]],
     tree: StrataTree,
+    parallel: int,
 ) -> None:
-    """削除候補に、触れたコミット一覧を添える (--stale-report で codex に渡す)。"""
-    for doc in docs.values():
-        if doc["verdict"] not in CANDIDATE_VERDICTS:
-            continue
-        files = [path for path, _, _ in doc["coords"]]
+    """削除候補に、触れたコミット一覧を添える (--stale-report で codex に渡す)。
+
+    候補ごとに git log を 1 本引く I/O 待ちなので ThreadPoolExecutor で重ねる。
+    """
+    items = [doc for doc in docs.values() if doc["verdict"] in CANDIDATE_VERDICTS]
+    if not items:
+        return
+
+    def one(doc: dict[str, object]) -> None:
+        files = [path for path, _, _ in doc["coords"]]  # type: ignore[misc]
         doc["changed_commits"] = tree.commits_touching(str(doc["doc_sha"]), sorted(set(files))[:10])[:12]
+
+    with ThreadPoolExecutor(max_workers=parallel) as ex:
+        list(ex.map(one, items))
 
 
 def stage3_envvars(
@@ -199,11 +209,15 @@ def stage3_envvars(
     name_index: dict[str, set[str]],
     with_symbols: bool,
     symbol_budget: int,
+    parallel: int,
 ) -> None:
     """S-a 所在移動 / S-b 引用シンボル / 名前の消失を見る。
 
     名前の所在は build_name_index の表で引く（変数ごとの git grep は避ける）。
+    S-b のシンボル現存チェックだけは git grep が必要なので、対象文書を先に集めて
+    並列に走らせる（budget は docs の先頭順で同じように消費される）。
     """
+    pending_symbols: list[dict[str, object]] = []
     for key, doc in docs.items():
         if doc["verdict"] not in {"file-only", "cited-file-gone"}:
             continue
@@ -220,12 +234,22 @@ def stage3_envvars(
             continue
         if with_symbols and symbol_budget > 0:
             symbol_budget -= 1
-            symbols = doc_symbols(pathlib.Path(str(doc["file"])))
-            gone = [
-                name
-                for name in symbols
-                if not git(strata, "grep", "-l", "-F", name, revision).strip()
-            ]
+            pending_symbols.append(doc)
+
+    if not pending_symbols:
+        return
+
+    def check(doc: dict[str, object]) -> tuple[dict[str, object], list[str], list[str]]:
+        symbols = doc_symbols(pathlib.Path(str(doc["file"])))
+        gone = [
+            name
+            for name in symbols
+            if not git(strata, "grep", "-l", "-F", name, revision).strip()
+        ]
+        return doc, symbols, gone
+
+    with ThreadPoolExecutor(max_workers=parallel) as ex:
+        for doc, symbols, gone in ex.map(check, pending_symbols):
             if symbols and len(gone) >= max(2, (len(symbols) + 1) // 2):
                 doc["symbols_missing"] = gone[:12]
                 doc["verdict"] = "symbol-gone"
@@ -301,19 +325,48 @@ def main() -> int:
                 for name, where in gp.get("options", {}).items()
             }
 
-    all_candidates: list[dict[str, object]] = []
+    parallel = args.parallel or default_parallel()
+
+    # scope をまたいで doc_sha 単位的全ツリー diff を 1 回ずつ引く（envvars と cli で
+    # 同じ sha を二度引かない）。トークンは hunk 内で語集合に落とすので、全文書の
+    # 主題トークンを先に集めておく。
+    scopes_docs: dict[str, dict[str, dict[str, object]]] = {}
     for scope in ("envvars", "cli"):
         docs_raw = payload.get(scope)
-        if not isinstance(docs_raw, dict):
-            continue
-        docs = {key: dict(value) for key, value in docs_raw.items()}
-        stage1_2(docs, revision, tree, strata, grammar_files if scope == "cli" else None)
-        add_changed_commits(docs, tree)
+        if isinstance(docs_raw, dict):
+            scopes_docs[scope] = {key: dict(value) for key, value in docs_raw.items()}
+
+    known_tokens: set[str] = set()
+    all_shas: set[str] = set()
+    for docs in scopes_docs.values():
+        for doc in docs.values():
+            token = str(doc["token"])
+            if token:
+                known_tokens.add(token)
+            sha = str(doc["doc_sha"])
+            if sha:
+                all_shas.add(sha)
+    known_shas = {sha for sha in all_shas if git_ok(strata, "cat-file", "-e", f"{sha}^{{commit}}")}
+    sha_list = sorted(known_shas - {revision})
+
+    hunk_cache: dict[str, dict[str, list[tuple[int, int, int, int, dict[str, list[str]] | None]]]] = {}
+    if sha_list:
+        print(f"[diff] doc_sha {len(sha_list)} 個の全ツリー diff を {parallel} 並列で引く ...", flush=True)
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=parallel) as ex:
+            results = list(ex.map(lambda s: tree.hunk_data(s, known_tokens), sha_list))
+        hunk_cache = dict(zip(sha_list, results))
+        print(f"[diff] {time.time() - t0:.1f}s", flush=True)
+
+    all_candidates: list[dict[str, object]] = []
+    for scope, docs in scopes_docs.items():
+        stage1_2(docs, revision, hunk_cache, known_shas, grammar_files if scope == "cli" else None)
+        add_changed_commits(docs, tree, parallel)
         if args.stage3:
             if scope == "envvars":
-                name_index = build_name_index(strata, revision)
+                name_index = build_name_index(strata, revision, parallel)
                 print(f"[name index] {len(name_index)} 名")
-                stage3_envvars(docs, revision, strata, name_index, args.with_symbols, args.symbol_limit)
+                stage3_envvars(docs, revision, strata, name_index, args.with_symbols, args.symbol_limit, parallel)
             else:
                 stage3_cli(docs, args.grammar.resolve(), revision)
         print(f"\n[{scope}] 文書 {len(docs)} 件の判定")

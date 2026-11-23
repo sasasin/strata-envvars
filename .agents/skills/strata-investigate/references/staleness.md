@@ -53,6 +53,17 @@ diff に入らず rename 検出が壊れて「全文追加」の巨大 hunk に�
 量産された（2026-11-23 実測: 候補 2731 件のうち 1136 件が移動由来の誤検知）。`-M` を効かせれば
 純粋な移動 (R100) は hunk を出さず、内容が動いた箇所だけが候補になる。
 
+**hunk ごとに「既知トークン -> 抜粋行」の写像を 1 回作る**（`WORD_RE` で語を切り出して
+`known_tokens` と突き合わせる）。文書側の照合は写像参照の O(1)。旧実装は
+文書×座標×hunk×行で境界正規表現の `re.search` を 2.5 億回走らせ、これが所要時間の 6 割だった。
+語全体で一致させるので `STRATA_PF_FUSED` の語に `STRATA_PF_FUSED_SM75` は入らず、
+旧実装の境界正規表現と同義になる。
+
+**並列化**: doc_sha 単位の全ツリー diff、候補ごとの `git log`（changed_commits）、
+name index の git grep、`--with-symbols` の git grep は `--parallel N`（既定 `min(8, CPU コア数)`）
+で `concurrent.futures.ThreadPoolExecutor` による並列。envvars と cli で同じ doc_sha の diff を
+共有する（旧実装は scope ごとに再構築し、12 sha × 2 回引いていた）。
+
 | 判定 | 意味 | 処置 |
 | --- | --- | --- |
 | `same-revision` | 索引と同じ commit 時点で書かれた | 対象外 |
@@ -138,6 +149,13 @@ uv run ./create-cli-docs.py -p 12 -l 40
 
 `--stale-report` で「旧文書の SHA、触れたコミット、差分行、現在の所在候補、消えた識別子」が
 codex への依頼文に添えられる。報告の revision が Strata HEAD と違う場合は自動的に無視される。
+
+## 実測メモ（2026-11-23、Strata `73d4f4196` 基準、索引 SHA から 1378 コミット乖離）
+
+- 全走査（Stage 1/2/3、name index 含む）: 旧実装 4 分 37 秒 → 新実装 **1 分 13 秒**（8 並列、24 コア）。
+  内訳は全ツリー diff 12 sha × 約 2 秒（並列で 71 秒）+ 判定ループ約 10 秒 + commits_touching 約 5 秒。
+- 判定結果は書き換え前後で候補 1316 件・verdict 分布・touched_files が完全一致（回帰テスト済み）。
+- 2026-11-02 実測の「全走査 約 3 秒」は pathspec 版（移動で壊れる前の小差分）での値。
 
 ## 実測メモ（2026-11-02、Strata `c62d5e3a` 基準）
 
