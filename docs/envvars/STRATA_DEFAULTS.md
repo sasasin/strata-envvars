@@ -1,51 +1,50 @@
 # `STRATA_DEFAULTS`
 
-調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。調査開始時の状態は `## main...origin/main`（未コミット変更なし）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-`STRATA_DEFAULTS` は、Qwen エンジンのコードで `0.2.6` 相当へ戻す対象として明示された複数の**既定値**を選ぶマスタースイッチです。`026`、`0.2.6`、`v0.2.6` のいずれかを指定すると `qwen_defaults_026()` が true になり、接続先の各ルールが旧版相当の既定値を返します。これは機能群を一律に無効化する設定ではなく、環境変数を参照する機能の既定判断にだけ渡されます。対象外の設定は変えず、個別の機能環境変数や明示的な CLI 引数がある場合はそちらを優先するルールがあります（`include/strata/core/defaults_026.hpp:1-13, 21-30`）。
-
-現 HEAD でこの判定に接続されている処理には、GPU アーキテクチャ別設定表（AMD gfx12 および NVIDIA）、gfx12 の追加既定、NVIDIA の prompt chunk 上限、prefill の層単位読み込み、PLE の RAM 常駐判断、PCIe share の既定、分割起動時の後段 cache 予約、batch group の選択、CUDA の GR / prompt-attention / MMVQ カーネル選択が含まれます（`src/core/arch_defaults.cpp:16, 115`; `src/core/nv_defaults.cpp:22, 127`; `src/program/generate.cpp:2729, 2974-2978, 4256, 5194, 5936, 6531, 7383, 8581, 8636, 8679, 8707, 9217, 11706`; `src/prefill/prefill.cpp:8994`; `src/kernels/cuda/fused_gr.cu:496, 2682`; `src/kernels/cuda/qsa_prompt_attn.cu:2563`; `src/kernels/cuda/native_mmvq.cu:3805, 3904`; `src/kernels/cuda/dequant_bf16.cu:301`; `src/kernels/cuda/iq_kernels.cu:6199`; `src/kernels/mmvq_il_parity.cpp:406`; `include/strata/core/gfx12_extra.hpp:51, 67`; `include/strata/core/bw_dense_defaults.hpp:16, 19`）。実際に適用される機能は GPU、backend、モデル・pack、分割や batch の状態、および各機能固有の条件にも依存します。
-
-`setup.py` にも読み取りがありますが、これは `--prefill auto` の推奨文を出すか決める診断用の判定です。エンジン設定を変更しません（`setup.py:8034-8052, 8055-8070`）。`strata_control/speed_switches.py` は Qwen 用・terminal-only の「Qwen: 0.2.6 behaviour」スイッチから `STRATA_DEFAULTS=026` を設定します（`strata_control/speed_switches.py:61-63`）。
+Qwen エンジンで 0.2.7 以降に追加された一部の既定動作を、0.2.6 相当へ戻すマスタースイッチ。すべての Strata 設定や全 GPU の動作を一律に戻すものではない。対象になる既定値は各機能の個別判定に渡され、GPU 世代、backend、モデル・実行条件が合う機能だけに作用する。例えば CUDA の世代別既定テーブル、HIP の gfx 世代別テーブル、裸の `--prefill auto` の上限、PLE テーブルの常駐方針、NVIDIA の複数 GPU バッチ群、後段 GPU のメモリ予約などが判定に使う（`engine/include/strata/core/defaults_026.hpp:1-13`, `engine/src/core/nv_defaults.cpp:29-38`, `engine/src/core/arch_defaults.cpp:16-30`, `engine/src/program/generate.cpp:4490-4525,6275-6287,6879-6884,7741-7749`）。
 
 ## 値と判定
 
-C++ の `is_026_token()` は `std::strcmp` で文字列全体を次の3値と比較します。数値変換、trim、大文字小文字の正規化、前方一致はありません。したがって空白付き、大小文字違い、後続文字付きの値も一致しません（`include/strata/core/defaults_026.hpp:21-24`）。
-
-| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| 読み取り経路 | unset | 有効になる値 | 設定されていても無効な値 |
 |---|---|---|---|
-| エンジンの共通 C++ 判定 | false（現行の各既定ルールを使う） | `026`、`0.2.6`、`v0.2.6` | 空文字、`0`、`027`、`026 `、`V0.2.6`、`026anything` |
-| `setup.py` の推奨表示判定 | `str(None)` が許可値と一致せず、旧版相当とは判定しない | 上記3文字列 | 上記以外。config 側の `env` にキーがあればその値を使い、キーがなければ setup プロセスの環境を参照する |
+| エンジン共通 `qwen_defaults_026()` | 無効（通常の現行既定値） | 完全一致の `026`、`0.2.6`、`v0.2.6` | 空文字、`0`、`027`、`026 `、` 026`、`TRUE` など、上記以外すべて |
+| CUDA QSA の `sm70_default_on()` 内の独立判定 | 無効 | 完全一致の `026` のみ | `0.2.6`、`v0.2.6` を含む上記以外 |
+| Terminal の `bare_auto_is_32768()`（設定提案用） | 現プロセスの環境変数に同じ完全一致判定 | `026`、`0.2.6`、`v0.2.6` | それ以外 |
 
-C++ 判定が true でも、接続先機能の個別条件を満たさなければ効果はありません。たとえば NVIDIA chunk 上限は NVIDIA の bare `--prefill auto` 経路だけで参照され、gfx12 設定は対象 arch/backend の表に限られます（`include/strata/core/nv_chunk.hpp:21-33`; `include/strata/core/arch_defaults.hpp:22-38`）。
+エンジン共通判定は `std::getenv` の結果を `strcmp` で文字列全体比較するため、数値変換・前後空白の除去・大文字小文字の正規化はありません。明示的な空文字は「設定あり」でも無効値です。QSA の CUDA 経路だけは `026` しか認識せず、共通判定と値規則が異なります（`engine/include/strata/core/defaults_026.hpp:21-29`, `engine/src/kernels/cuda/qsa_select.cu:2155-2161`）。
 
 ## 有効になる条件
 
-- C++ エンジンでは、プロセス内で `qwen_defaults_026()` が最初に呼ばれた時点で環境値が上記3値のいずれかであることが必要です。その結果は関数内 `static const bool` に保存され、同一プロセスで後から環境を書き換えても更新されません（`include/strata/core/defaults_026.hpp:26-30`）。
-- 適用は `qwen_defaults_026()` を明示的に使う各コード経路に限られます。関連する GPU/backend/モデル/実行モード条件を満たさない場合、その機能の既定判断自体が行われないか、別の既定経路が使われます。例として bare auto chunk ceiling は `nv_chunk_ceiling()` に渡され、カード世代・単一 GPU / layer-split 条件や `STRATA_NV_CHUNK` とともに判定されます（`src/program/generate.cpp:4253-4256`; `include/strata/core/nv_chunk.hpp:23-36`; `setup.py:8034-8052`）。
-- 各機能が読む個別環境変数が明示されていると、その値がマスタースイッチより優先されるルールがあります。共通ヘッダーは `STRATA_GR_V3`、`STRATA_PLE_AUTO_RAM` 等を例示し、CLI の `--pcie-frac` / `--ple-io` も優先すると記しています。個別の優先規則は機能ごとに異なり、すべての環境変数を一括上書きする意味ではありません（`include/strata/core/defaults_026.hpp:10-13`; `src/program/generate.cpp:5194, 5936`; `include/strata/core/sm120_series.hpp:63, 104, 149`）。
-- `setup.py` の推奨判定は GPU arch が数字列で、compute capability が 8.0 以上または 7.0、かつ `--gpus` と `--layer-split` が引数にない場合にだけ 32768-token の bare-auto 推奨候補になります。そこで `STRATA_DEFAULTS` が許可値なら候補を false にして tip を抑制します。これは設定の強制やエンジンへの値の転送ではありません（`setup.py:8034-8052, 8068-8070`）。
+- 共通判定が有効でも、各呼び出し箇所に到達し、対象 backend・GPU・モデル・モードの条件を満たす機能だけが変わります。例として NVIDIA の裸の `--prefill auto` は CUDA build、対象計算能力 8.0 以上または 7.0、可視 GPU 条件などを満たす必要があり、明示的な `--prefill N` / `auto:N` はこの既定値調整の対象外です。適用時は `STRATA_NV_CHUNK` よりマスタースイッチが先に上限を 8192 相当へ戻します（`engine/src/program/generate.cpp:4490-4525`, `engine/include/strata/core/nv_chunk.hpp:21-43`）。
+- HIP の AMD 既定テーブルは gfx12 / gfx1151 等のアーキテクチャ分岐を通る場合に限られます。gfx12 では `STRATA_GFX12_DEFAULTS` が先に `0` で無効化するとテーブルは空になり、そうでなければ `STRATA_DEFAULTS` 有効時も従来の prompt 側エントリは残し、新しい decode 側エントリを加えません（`engine/src/core/arch_defaults.cpp:28-64`）。
+- PLE の自動常駐方針は直接読み取りモードで、かつ `--ple-io` が明示されていない場合にだけ判定されます。`STRATA_PLE_AUTO_RAM` が設定されていれば `atoi(value) != 0` が優先し、`1` で明示的に再有効化、`0` で無効化できます。未設定ならこのスイッチが有効なとき常駐方針を止めます（ただし RAM 容量等の適合判定も別途必要です）（`engine/src/program/generate.cpp:6275-6295`, `engine/include/strata/core/ple_residency.hpp:32-37`）。
+- NVIDIA の世代別既定値では、ユーザーが個別の環境変数を設定している場合、その設定が優先されます。自動設定は未設定変数にだけ書き込みます。CUDA/HIP の世代や個別フラグが対象外なら該当機能への影響はありません（`engine/src/core/nv_defaults.cpp:222-253`; sm_121 等の適用条件は `engine/include/strata/core/sm120_series.hpp:75-81`）。
+- `--pcie-frac` など明示 CLI 引数や個別機能変数がある機能では、明示設定がマスター判定に優先するものがあります。一方、全 CLI 引数がこの変数を上書きするわけではありません（`engine/include/strata/core/defaults_026.hpp:10-13,32-38`; PLE の CLI 条件は上記）。
+- Terminal の Advanced 設定にある「Qwen: 0.2.6 behaviour」は Terminal 専用の切替項目で、オン時に `STRATA_DEFAULTS=026` を設定します。Terminal 共通で自動的に付与される値ではありません（`terminal/strata_control/speed_switches.py:71-75`）。
 
 ## 実行時の詳細
 
-エンジン側は `std::getenv("STRATA_DEFAULTS")` を `qwen_defaults_026()` の初回評価時に一度だけ読み、厳密な一致結果を cache します。エンジン起動後の変更はそのプロセスでは反映されません。コマンドラインに `STRATA_DEFAULTS` 専用引数はなく、各機能の明示フラグや個別環境値は接続先の解決関数が扱います（`include/strata/core/defaults_026.hpp:21-30`; `include/strata/core/defaults_026.hpp:10-13`）。
+`qwen_defaults_026()` は関数内 `static const bool` に `std::getenv` の判定結果を保存します。最初に呼ばれた時点の値がプロセス内で再利用され、以降の環境変更では更新されません（`engine/include/strata/core/defaults_026.hpp:26-30`）。これは実行時の再設定 API ではなく、子プロセスへの転送処理もこの関数にはありません。
 
-この値が true の場合に旧版相当へ切り替わる具体例は、bare NVIDIA prefill auto の ceiling を 32768 から旧来の 8192 相当へ戻す処理、gfx12 および NVIDIA アーキテクチャ既定表の選択、layer-major prefill の既定解決、PLE 自動 RAM 許可の解決、PCIe share の開始値、split/cache の late allocation 量、batch group の既定解決です（`include/strata/core/nv_chunk.hpp:23-29`; `src/core/arch_defaults.cpp:16, 115`; `src/core/nv_defaults.cpp:22, 127`; `src/prefill/prefill.cpp:8994`; `src/program/generate.cpp:5194, 5936, 6531, 7383, 8581, 8636, 8679, 8707, 9217`; `include/strata/program/batch_groups.hpp:73-80`）。CUDA の fused GR、prompt attention、MMVQ / BF16 dequant、gfx12 decode 既定も同じ bool を使って既定経路を選びます（`src/kernels/cuda/fused_gr.cu:496, 2682`; `src/kernels/cuda/qsa_prompt_attn.cu:2563`; `src/kernels/cuda/native_mmvq.cu:3805, 3904`; `src/kernels/cuda/dequant_bf16.cu:301`; `src/kernels/mmvq_il_parity.cpp:406`; `include/strata/core/gfx12_extra.hpp:40-67`）。
+有効時は複数の独立した機能判定が現行既定を抑制または旧値へ戻します。ソース上で確認できる例は、CUDA bare-auto prefill の 32768 上限を抑えること、gfx12 の decode 既定群を追加しないこと、PLE 自動常駐を既定では行わないこと、2 枚の NVIDIA カードで batch groups を serial 側にすること、後段 GPU の予約メモリや Windows WDDM の遅延割当を外すことです（`engine/include/strata/core/nv_chunk.hpp:21-38`, `engine/src/core/arch_defaults.cpp:28-62`, `engine/include/strata/core/ple_residency.hpp:32-37`, `engine/src/program/generate.cpp:7741-7749,6879-6884,9151-9154`）。効果はそれぞれの機能が実行されるときに限られ、生成結果や全設定が必ず 0.2.6 と同一になるというコード上の保証ではありません。
 
-`setup.py` 側では呼び出しごとに config の `env` mapping を複製して確認し、`STRATA_DEFAULTS` がなければ現在の Python プロセス環境を参照します。許可値なら「`--prefill auto` から `--prefill auto:32768` への tip」を出さないだけです（`setup.py:8034-8052, 8068-8070`）。
+CUDA QSA は別の `static` 判定を持ちます。`scores_thread_on()` の環境変数 `STRATA_SCORES_THREAD` が未設定のときにデバイスごとの既定判定へ進み、Volta では `sm70_default_on()` が呼ばれます。そこでは `STRATA_DEFAULTS` を独自に一度読み、文字列 `026` だけを除外条件として使用します。そのため `0.2.6` / `v0.2.6` は共通ヘルパーでは有効でも、この QSA の Volta 既定には反映されない実装差があります。`STRATA_SCORES_THREAD` が明示されると同関数は先にその `atoi` 判定を返します（`engine/src/kernels/cuda/qsa_select.cu:2155-2176`）。
+
+Terminal の `bare_auto_is_32768()` はエンジン設定ではなく、設定内容に対するベンチマーク提案の判定です。引数 `env` に `STRATA_DEFAULTS` キーがあればその値を使い、キーがなければプロセス環境を参照し、前記3文字列の場合に 32768 の提案条件から外れます。単独 GPU の arch 条件を満たし、`--gpus` / `--layer-split` がない場合だけの提案ロジックで、エンジン引数や設定値を変更しません（`terminal/setup.py:8884-8902,8905-8908`）。
 
 ## ログと測定値
 
-`STRATA_DEFAULTS` 自体の値が無効な場合に警告・エラーを出す処理は確認できません。直接読み取り helper は boolean を返すだけです（`include/strata/core/defaults_026.hpp:21-30`）。また、値に応じた専用ログ文言は確認できません。切り替わるのは接続先の機能処理であり、そこでの挙動・出力は個別機能の条件に従います。
+変数自体の値を報告する専用ログは確認できません。機能側のログは通常どおり出ることがあります。例えば NVIDIA bare-auto の上限を引き上げたときは `strata generate: NVIDIA: --prefill auto may take chunks up to ...`、引き上げない特定条件では `strata generate: NVIDIA (... GiB): --prefill auto stays at 8192 ...` が stderr に出ます（`engine/src/program/generate.cpp:4514-4525`）。CUDA の世代別既定値を自動設定した場合は `apply_nv_defaults()` が設定されたスイッチ名を stderr に出しますが、マスター変数の判定結果そのものを出力する行ではありません（`engine/src/core/nv_defaults.cpp:222-253`）。
 
-`setup.py` の推奨文は、条件を満たしていて `STRATA_DEFAULTS` が旧版相当でない場合にのみ `tip: with ... --prefill auto:32768 ...` を表示し得ます。旧版相当ならこの tip を抑制します（`setup.py:8068-8070`）。
+`docs/release-notes-0.2.7.md:28-35` は、このスイッチを Qwen の 0.2.7 既定を戻す用途として挙げ、個別変数・CLI フラグが引き続き優先する旨を記載しています。現行ソースではこの説明と整合する複数の判定を確認しましたが、同資料の一覧は全呼び出し箇所の網羅リストではありません。`docs/SETTINGS.md:365` は NVIDIA / AMD 向け設定として索引化しています。測定値はこの変数単独の効果としては記載しません。
 
 ## 根拠
 
-- 値の完全一致、初回読み取りと cache: `include/strata/core/defaults_026.hpp:21-30`
-- 対象既定の説明と個別設定・CLI 優先の原則: `include/strata/core/defaults_026.hpp:1-13`
-- エンジン側の全 helper 呼び出し箇所: `src/core/arch_defaults.cpp:16, 115`; `src/core/nv_defaults.cpp:22, 127`; `src/program/generate.cpp:2729, 2974-2978, 4256, 5194, 5936, 6531, 7383, 8581, 8636, 8679, 8707, 9217, 11706`; `src/prefill/prefill.cpp:8994`; `src/kernels/cuda/fused_gr.cu:496, 2682`; `src/kernels/cuda/qsa_prompt_attn.cu:2563`; `src/kernels/cuda/native_mmvq.cu:3805, 3904`; `src/kernels/cuda/dequant_bf16.cu:301`; `src/kernels/cuda/iq_kernels.cu:6199`; `src/kernels/mmvq_il_parity.cpp:406`; `include/strata/core/gfx12_extra.hpp:51, 67`; `include/strata/core/bw_dense_defaults.hpp:16, 19`
-- bare-auto の診断用判定: `setup.py:8034-8052, 8055-8070`
-- terminal-only の Qwen スイッチ登録: `strata_control/speed_switches.py:61-63`
+- 共通の値判定とキャッシュ: `engine/include/strata/core/defaults_026.hpp:21-30`
+- 独立して環境を読む CUDA QSA 判定: `engine/src/kernels/cuda/qsa_select.cu:2152-2176`
+- 代表的な backend / 機能別の適用箇所: `engine/src/core/nv_defaults.cpp:29-38,222-253`; `engine/src/core/arch_defaults.cpp:16-64`; `engine/include/strata/core/ple_residency.hpp:32-37`; `engine/include/strata/core/nv_chunk.hpp:21-43`; `engine/src/program/generate.cpp:4490-4525,6275-6295,6879-6884,7741-7749,9151-9154`
+- Terminal の設定 UI と提案判定: `terminal/strata_control/speed_switches.py:71-75`; `terminal/setup.py:8884-8902`
+- 設計資料との照合: `docs/SETTINGS.md:365`; `docs/release-notes-0.2.7.md:28-35`

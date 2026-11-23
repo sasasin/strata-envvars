@@ -1,41 +1,44 @@
 # `LLAMA_CPP`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-`LLAMA_CPP` は `packaging/build_sycl_linux.sh` 専用のビルド時環境変数です。値が空でない場合、SYCL エンジンの CMake configure にローカル llama.cpp checkout の場所を渡し、FetchContent のネットワーク取得を無効にします。Strata の実行ファイル、CLI、サーバーが起動後に読む環境変数ではありません。
+`LLAMA_CPP` は `tools/packaging/build_sycl_linux.sh` が読む、ggml のソース checkout を指定する旧名のビルド用 override です。値は `-DSTRATA_GGML_DIR=<値>` として SYCL エンジンの CMake configure に渡されます。通常の実行時環境変数ではなく、エンジンやサーバーの実行時動作を制御する読み取り箇所はありません（`tools/packaging/build_sycl_linux.sh:42-50`）。
+
+現在は同じスクリプト内で `STRATA_GGML_DIR` が優先され、`LLAMA_CPP` はその値が unset または空のときだけ使われる互換用 alias です。他のビルドスクリプト（例: CUDA Linux）は `LLAMA_CPP` を参照せず、`STRATA_GGML_DIR` だけを CMake に渡します（`tools/packaging/build_cuda_linux.sh:37-45`）。
 
 ## 値と判定
 
-| 値 | スクリプトの扱い |
-|---|---|
-| 未設定 | 空文字と同じ。`LLAMA_CPP` 用の CMake 引数を追加しない。 |
-| 空文字 | 未設定と同じ。 |
-| 空でない文字列 | その文字列を `FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP` の値として CMake に渡し、`FETCHCONTENT_FULLY_DISCONNECTED=ON` も渡す。 |
+シェルの `${VAR:-word}` 展開を使い、値を文字列としてパスに連結します。trim、引用符除去、検証、数値変換はありません。空白だけの値も空ではない値として扱われます。ただし組み立てた `ggml` 引数は引用符なしで CMake に渡されるため、空白を含む値はシェルの word splitting を受け、単一のパス引数としては渡りません（`tools/packaging/build_sycl_linux.sh:42-50`）。変数の参照は `setvars.sh` と `shape_setup` の後、CMake configure の直前です。
 
-値の存在判定は shell の `[ -n "${LLAMA_CPP:-}" ]` であり、空白除去、パス検証、正規化、commit 検査はありません。空白だけの値も指定ありとして扱われます。値は `ggml` 文字列へ埋め込まれ、後で未引用の `$ggml` として CMake コマンドに展開されます。そのため、空白を含むパスは単語分割され、glob 文字 `*` などもファイル名展開の対象になります。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `STRATA_GGML_DIR` が unset または空 | `LLAMA_CPP` も unset/空なら override 指定なし | `LLAMA_CPP=/src/llama.cpp` は CMake 引数 `-DSTRATA_GGML_DIR=/src/llama.cpp` になる | `LLAMA_CPP` の空文字は引数を作らない。`0`、`false`、`true` は特別扱いされず、いずれもパス文字列として渡る |
+| `STRATA_GGML_DIR` が非空 | `LLAMA_CPP` は参照結果として選ばれない | `STRATA_GGML_DIR=/src/ggml` が CMake に渡る | `LLAMA_CPP` の値は優先順位が低いため採用されない |
+
+このスクリプトで `LLAMA_CPP` が意味を持つのは `STRATA_GGML_DIR` が unset または空の場合だけです。空文字、`0`、`false` を boolean として解釈する処理はありません（`tools/packaging/build_sycl_linux.sh:42-50`）。
 
 ## 有効になる条件
 
-- Linux の SYCL エンジンパッケージを作る `packaging/build_sycl_linux.sh` を実行したときだけ評価されます。このスクリプトは oneAPI `setvars.sh` を読み込んで `icpx` を使い、`cmake -S sycl` を実行します。
-- `LLAMA_CPP` が空でない場合、この指定が同スクリプト内の `third_party/llama.cpp/ggml` 自動検出より優先します。
-- `LLAMA_CPP` が未設定または空で、リポジトリ内に `third_party/llama.cpp/ggml` ディレクトリがあれば、代わりに `-DSTRATA_GGML_DIR=<repo>/third_party/llama.cpp` を渡します。
-- どちらも該当しない場合、スクリプトは llama.cpp source 指定を渡しません。SYCL CMake は `STRATA_NATIVE_EXPERTS` が有効な既定経路で pinned commit `3cf03257f219afbe7334045ff7c6a06ac68c627d` を FetchContent で取得しようとします。
-
-この変数は `packaging/build_sycl_linux.sh` に限られ、他の Strata のビルドスクリプトが同名の環境変数を読む箇所はありません。`LLAMA_CPP_COMMIT` は `setup.py` の固定文字列定数などとして別に現れますが、`LLAMA_CPP` の読み取りや同変数の値ではありません。
+- `tools/packaging/build_sycl_linux.sh` を Linux x86_64 の Intel oneAPI SYCL ビルド環境で実行する必要があります。同スクリプトは `icpx` 等を確認し、失敗時はエラーを stderr に出して終了します（`tools/packaging/build_sycl_linux.sh:8-18,30-38`）。
+- 値があれば CMake cache 変数 `STRATA_GGML_DIR` に転送されます。CMake はこれを vendor 済み `engine/third_party/strata-ggml` に代わる checkout として選択します（`engine/cmake/strata_ggml.cmake:6-16`）。
+- ただしこのパッケージスクリプトは `STRATA_SYCL_PARITY=OFF` を指定し、SYCL CMake の `STRATA_OWN_CPU_QUANT` は既定で `ON` です。この組み合わせでは ggml の `add_subdirectory` を行わず、「no ggml in this build」と記された分岐になります。そのためスクリプトの既定構成では、`LLAMA_CPP` が CMake に渡っても外部 checkout の ggml はビルドに取り込まれません（`tools/packaging/build_sycl_linux.sh:49-50`; `engine/sycl/CMakeLists.txt:204-219,220-227`）。
+- `STRATA_CMAKE_EXTRA` 等で `STRATA_SYCL_PARITY` または `STRATA_OWN_CPU_QUANT` を変更して ggml を追加する構成では、選択した checkout の `${root}/ggml` が追加対象です。ディレクトリが存在しない場合の CMake の `add_subdirectory` 失敗はこの条件下で起こり得ます（`engine/sycl/CMakeLists.txt:219-227`; `engine/cmake/backends/sycl.cmake:5-15`）。
 
 ## 実行時の詳細
 
-スクリプトの configure 時に一度だけ shell が環境値を展開します。エンジン実行時への引き継ぎや、CLI 引数による上書きはありません。CMake には `FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP=<値>` と `FETCHCONTENT_FULLY_DISCONNECTED=ON` が渡ります。SYCL CMake は `STRATA_GGML_DIR` が空なら `FetchContent_Declare(strata_llamacpp ...)` で pinned repository を宣言し、FetchContent の populated source の `ggml` サブディレクトリを追加します。このため、指定パスはその FetchContent source として使われ、ネットワーク取得は許可されません。ローカルソースが不正・不足なら configure の CMake エラーで停止し、`set -e` により後続の build/package 手順へ進みません。
+この値を読むのはビルドスクリプトが実行されたときの一度だけです。実行中の環境変更を再読する処理や、生成されたエンジン／子プロセスへ `LLAMA_CPP` を転送する処理はありません。スクリプトは選択した値を CMake の configure 引数へ変換し、その後 `cmake --build` で `strata` target をビルドします（`tools/packaging/build_sycl_linux.sh:42-51`）。
 
-スクリプトの `BUILD` で既定と異なる CMake build directory を指定できます。同じ build directory を再利用する場合、以前 CMake に `-D` で渡した FetchContent 変数が CMake cache に残る可能性があります。シェル側で `LLAMA_CPP` が未設定でも、それだけでは既存 cache を消去しません。
+値が unset/空なら CMake 引数を省略し、CMake 側は vendored `third_party/strata-ggml` を root として選びます（`engine/cmake/strata_ggml.cmake:11-16`）。非空なら CMake cache に値が設定されますが、前節の既定 SYCL package 条件では ggml を追加しないため、そこから実行ファイルの挙動が変わることはコード上確認できません。
 
-スクリプト自身は `LLAMA_CPP` の選択値を表示する専用ログや独自の警告を出しません。CMake configure が失敗した場合は CMake のエラーが出てスクリプトが中断し、configure が通れば `cmake --build` に進みます。CMake build cache に値が記録されるのは configure/build directory 内の話で、実行時環境変数としては保存されません。
+## ログと測定値
+
+`LLAMA_CPP` の値を表示する専用ログや警告はありません。SYCL configure/build 自体のエラーは CMake の出力と終了状態に現れます。スクリプトは後続で `env -i <package>/strata --version` を実行し、失敗時に `build_sycl_linux.sh: env -i ... --version does not run` を stderr に出して終了しますが、これは `LLAMA_CPP` の個別検証ではありません（`tools/packaging/build_sycl_linux.sh:49-51,76-80`）。関連する Strata の測定値は確認できません。
 
 ## 根拠
 
-- `packaging/build_sycl_linux.sh:2-16,39-46` — Linux SYCL package build であること、空でない値を FetchContent source override と disconnected mode に変換すること、ローカル `third_party/llama.cpp` への fallback、CMake 実行。
-- `packaging/build_sycl_linux.sh:17,25-26,44-46` — `set -eu`、`BUILD` による build directory 指定、configure/build の失敗時に後続へ進まない制御。
-- `sycl/CMakeLists.txt:171-202` — native experts の条件、`STRATA_GGML_DIR` が指定された場合の ggml source 使用、未指定時の pinned llama.cpp FetchContent と `ggml` の追加。
-- `setup.py:222-223` — `LLAMA_CPP_COMMIT` は固定値から作る別の定数であり、ここでは `LLAMA_CPP` を環境から読まない。
+- `tools/packaging/build_sycl_linux.sh:42-50` — alias の優先順位、空値の処理、CMake への転送。
+- `tools/packaging/build_cuda_linux.sh:37-45` — CUDA Linux スクリプトでは `STRATA_GGML_DIR` のみ参照。
+- `engine/cmake/strata_ggml.cmake:6-16` — CMake の外部 checkout / vendored tree 選択。
+- `engine/sycl/CMakeLists.txt:204-227`、`engine/cmake/backends/sycl.cmake:5-15` — SYCL build 条件と ggml を追加する経路。

@@ -1,6 +1,6 @@
-# `--plan`
+# `strata launch --plan`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,54 +8,57 @@
 | コマンド | `strata launch` |
 | オプション | `--plan` |
 | 別名 | なし |
-| 値 | 取らないフラグ。指定すると真になる。 |
+| 値 | 値を取らないフラグ。既定値は `false`。 |
 
 ## 役割
 
-`strata launch` が選んだ設定で何を行うかを計算して表示し、起動せずに終了します。通常の起動に進む前に、モデル、設定、ダウンロード見込み、警告などを確認するための表示モードです。parser は `action="store_true"` で定義し、help 文でも「何が起きるかを表示して終了、変更なし」としています（`strata_cli/launch/cmd.py:27,152`）。
+起動設定を組み立て、選んだモデル・設定・ダウンロード見込み・警告などを表示して終了します。通常起動の TUI、モデルやエンジンの取得、チューニング、サーバー起動には進みません。計画のためにローカルの設定・モデル状態・ハードウェア情報を読み、条件によっては署名付き更新フィードにも問い合わせます。
 
 ## 使い方
 
 ```sh
+# 推奨設定で q2_0 の起動計画を人向けに表示
 strata launch --plan --model q2_0
-```
 
-保存済み preset の設定を基に確認する場合は、起動先を `--preset` で指定できます。モデルを指定しない場合は、後述のとおりコンピューターに合わせた候補選択も行われます。コマンド例は `strata_cli/launch/cmd.py:27` にあります。
+# JSON で計画を取得（JSON 出力は --plan と併用）
+strata launch --plan --model q2_0 --output json
+
+# 保存済みプリセットを基に、今回の変更を含めた計画を表示
+strata launch --plan --preset "Office" --context 64k
+```
 
 ## 値と既定値
 
-- `--plan` 自体に値はありません。省略時は通常の対話式または起動処理に進みます（`strata_cli/launch/cmd.py:152,880-901,924-954`）。
-- 同時に `--output json` を指定すると JSON 形式で計画を返します。`--output` の既定値は `human` です（`strata_cli/launch/cmd.py:154,790,927-928`）。
-- preset を指定したときは、その設定を読み込んで CLI の指定を重ねます（`strata_cli/launch/cmd.py:212-231`）。モデル未指定かつ preset にもモデルがない場合、ハードウェアに基づく推奨モデルを選びます。推奨が得られないとエラーになります（`strata_cli/launch/cmd.py:372-384`）。
+`--plan` は `argparse` の `store_true` で、引数値を取りません。省略時は通常の起動経路になり、指定すると計画表示後に終了します。`--output` は別オプションで `human`（既定）または `json` を選びます。人向け表示では計画内容と `Nothing was changed.` を出し、JSON では `schema_version`、`ok`、`plan` を含むオブジェクトを標準出力へ出します（`terminal/strata_cli/launch/cmd.py:141-154,897-925`）。
+
+`--plan` 自体に値の範囲や独自 validation はありません。モデル、ポート、コンテキストなど他の指定値はそれぞれの parser と設定処理で検証されます。例としてポートは 1〜65535 に制限され、`--gpu` と `--gpu-roles` の併用は拒否されます（`terminal/strata_cli/launch/cmd.py:46-60,262-273`）。
 
 ## 実行時の動作
 
-`run_launch()` は `--plan` があると対話画面を無効にし、設定と既定値を適用した後に `runner.plan()` を呼びます。人向け表示にはモデル、context、画像・並列設定、ダウンロード見込み、drafting、speed、必要なら DeepSeek の配置情報、tuning/access/port、警告、再現用フラグを出します。成功時は終了コード `0` で終了し、通常起動の `runner.run()` には進みません（`strata_cli/launch/cmd.py:874-880,906-954,980-982`）。
+1. 指定したプリセットを読み込み、コマンドライン指定を重ねて `LaunchSettings` を作ります。モデル名の解決や `--api-key-env` の読み取りもこの段階で行います（`terminal/strata_cli/launch/cmd.py:215-313`）。
+2. `--plan` のときは TUI を選ばず、未指定の設定にコンピューターに応じた既定値を適用します。モデルも指定されず、TUI にも入らない場合は推奨モデルの選択を試みます（`terminal/strata_cli/launch/cmd.py:344-415,849-875`）。
+3. 指定された `--model-path` の存在・内容を確認し、runner が計画情報をまとめます。計画には設定（API key を含めない形式）、警告、起動手順、モデル情報、ダウンロード見込み、drafting の説明が含まれます（`terminal/strata_cli/launch/cmd.py:876-900`, `terminal/strata_cli/launch/runner.py:1885-1918,2968-2990`）。
+4. 計画を表示して終了コード 0 で戻ります。通常実行の `runner.run()`、preset 保存・最終使用時刻更新、ブラウザー起動の経路には進みません（`terminal/strata_cli/launch/cmd.py:897-925,949-1008`）。
 
-計画データには設定と警告、モデル情報、想定ステップ、ダウンロード対象・容量、drafting と speed の説明が含まれます。DeepSeek の複数ファイルモデルでは配置情報を加え、`--parallel` が明示されて 1 より大きい場合に限り並列数の説明も加えます（`strata_cli/launch/runner.py:2398-2430`）。JSON 形式は `schema_version: 1`, `ok: true`, `plan` の形です。設定シリアライズでは API key の実値を出さず、設定済みなら `"set"` とします（`strata_cli/launch/runner.py:2413-2423`; `strata_cli/launch/settings.py:149-153`; `strata_cli/launch/cmd.py:927-928`）。
-
-`download_plan()` はローカルのモデル・コンポーネント状態を調べ、不足するモデルファイル、draft layer、画像 reader、drafter などを見積もります。DeepSeek では共有ファイルも計算対象です。見積もり中に例外が起きた場合は「容量を計算できなかった」という結果を返して他の計画表示を続けます（`strata_cli/launch/runner.py:2249-2307,2317-2355,2408-2412`）。
+`--output json` を付けると計画のオブジェクトを JSON として出力します。エラー時も JSON 形式を選んでいれば `ok: false` とエラーコード・メッセージを出し、エラーコードを終了コードとして返します。たとえばモデルファイルの問題は `LaunchError` として返され、設定 validation の `ValueError` はコード 2 になります（`terminal/strata_cli/launch/cmd.py:753-764,879-881,1009-1014`）。
 
 ## 適用条件と副作用
 
-- 計画分岐ではモデルや engine のダウンロード、サーバー起動、設定書き込み、preset 保存には進みません。`--save-preset` を併記しても計画分岐で `store.save()` に到達しません（`strata_cli/launch/cmd.py:924-954,980-997`）。
-- `--data-dir` と `--move-data` を併記しても既存モデルの移動は行いません。計画モードでは移動選択関数が false を返す条件に当たります（`strata_cli/launch/cmd.py:635-650`）。
-- `--backend` を指定した場合、値はこのプロセスの環境変数に反映されますが、`--plan` 中は次回以降のための保存処理を呼びません。`auto` / `default` / `none` は保存済み選択を消さずに、現在のプロセス環境から backend 指定を外します（`strata_cli/launch/cmd.py:847-867`）。
-- LAN などローカル以外への共有で key が必要な場合、通常起動と同様に既存 key を読み取るか新しい key をメモリー上で生成することがあります。計画表示は key の有無だけを示し、計画分岐では preset に保存しません（`strata_cli/launch/cmd.py:917-925,945-946`; `strata_cli/launch/settings.py:149-153`; `strata_cli/launch/cmd.py:437-446`）。
-- 計画生成はハードウェア情報、モデル一覧、インストール状態、指定されたモデルファイルや保存済み preset を読み取ります。したがってローカル環境の検出結果に依存し、実際の起動可否や容量は実行時点で変わり得ます（`strata_cli/launch/cmd.py:868-874,909-925`; `strata_cli/launch/runner.py:1459-1480,2379-2423`）。
-- `--plan` 単独で起動専用のモデル選択肢がない場合も計画分岐には進みます。選択可能な推奨があればそれを使い、見つからなければエラーになります（`strata_cli/launch/cmd.py:888-903,924-954,377-384`）。
+- `--plan` は対話可能な端末でも計画だけを表示します。明示した `--move-data` は選択値として受け取られますが、このモードではデータ移動を実行しません。移動判定は計画時に既定で移動しない扱いです（`terminal/strata_cli/launch/cmd.py:600-608,897-925`）。
+- `--backend` の明示値は現在の Python プロセスの環境変数に反映されますが、`--plan` では backend の選択を保存しません（`terminal/strata_cli/launch/cmd.py:817-837`）。
+- 外部共有用の API key が必要で既存キーがない場合、既定値処理でキーを生成することがあります。ただし plan 経路は書き込み後に出す通知を保留し、runner はキーなし形式の設定を返すため、計画出力にキーを含めず保存もしません（`terminal/strata_cli/launch/cmd.py:402-411,884-886,917`, `terminal/strata_cli/launch/runner.py:2988-2990`）。
+- 計画表示は通常、ローカル状態の読み取りです。ただし DFlash2 の tuned drafter のサイズを判定する必要がある場合、署名付き feed を一度取得して照会します。この照会は何も書き込まず、オフライン・接続失敗・署名検証失敗などで回答できない場合は「不明」として計画を続けます（`terminal/strata_cli/launch/cmd.py:897-899`, `terminal/strata_cli/launch/runner.py:2812-2821`, `terminal/strata_control/drafting_fetch.py:260-271`）。
+- ダウンロード量を計算できない場合も、runner は計画全体を中断せず、計算不能の説明を含めます（`terminal/strata_cli/launch/runner.py:2976-2984`）。計画は実行時のハードウェア状態や feed 応答を反映するため、その後の起動結果を保証するものではありません。
 
 ## 出力とエラー
 
-- 人向け出力は計画の各項目と最後の `Nothing was changed.` です。`--output json` では成功計画を JSON にします（`strata_cli/launch/cmd.py:927-954`）。
-- 不正なモデル指定、引数間の矛盾、無効な `--model-path` などは失敗します。JSON モードでは `{schema_version, ok: false, error: {code, message}}`、通常モードでは標準エラーに `strata: ...` を出します。`argparse` の値変換エラーも parser の通常の usage/error 経路です（`strata_cli/launch/cmd.py:48-52,65-72,792-797,909-916,1048-1053`）。
-- モデル一覧など必要なカタログを利用できない場合は終了コード `5`、設定・入力エラーは通常終了コード `2` です。計画中に自分のモデルファイルの検査で `LaunchError` になった場合は、その例外のコードを返します（`strata_cli/launch/cmd.py:868-874,902-916`; `strata_cli/launch/runner.py:1459-1474`）。
+成功時は標準出力に人向け計画、または JSON 計画を出し、コード 0 で終了します。対象モデルの一覧が利用できない場合はコード 5、指定モデルファイルの問題は原因に応じたコードで失敗します。設定エラーは通常コード 2 です。人向けエラーは `strata: ...` として標準エラーへ、`--output json` のエラーは JSON オブジェクトとして標準出力へ出ます（`terminal/strata_cli/launch/cmd.py:759-764,838-844,879-881,1009-1014`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:27,75-82,152,154` — コマンド例、コマンド説明、`--plan` と出力形式の parser 定義。
-- `strata_cli/launch/cmd.py:786-797,847-880,906-954` — backend の扱い、対話抑止、設定後の計画分岐、表示と終了。
-- `strata_cli/launch/cmd.py:212-309,372-452` — preset と引数の合成、モデル選択・既定値・警告。
-- `strata_cli/launch/cmd.py:635-650,980-997` — データ移動判定と、計画分岐後の通常起動・preset 保存。
-- `strata_cli/launch/runner.py:1459-1480,2249-2355,2379-2430` — 指定ファイル検査、ダウンロード見積もり、警告・計画情報の生成。
-- `strata_cli/launch/settings.py:149-153,208-226` — API key のマスクとアクセス設定の検査。
+- `terminal/strata_cli/launch/cmd.py:141-154` — launch parser 上の `--plan` 定義、値を取らないこと、`--output` の選択肢と既定値。
+- `terminal/strata_cli/launch/cmd.py:215-313,344-415` — プリセットと引数からの設定構築、入力処理、マシンに応じた既定値。
+- `terminal/strata_cli/launch/cmd.py:817-837,849-925` — backend の一時的な反映、TUI を避ける条件、plan の計算・出力・終了。
+- `terminal/strata_cli/launch/cmd.py:949-1014` — 通常起動との差、失敗の標準出力・標準エラー・終了コード。
+- `terminal/strata_cli/launch/runner.py:1885-1918,2968-2990` — モデルファイル確認と plan の項目構成。
+- `terminal/strata_cli/launch/runner.py:2812-2821`、`terminal/strata_control/drafting_fetch.py:260-271` — tuned drafter の feed 照会と、書き込みを伴わない応答取得。

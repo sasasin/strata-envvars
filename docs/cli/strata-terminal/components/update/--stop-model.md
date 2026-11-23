@@ -1,6 +1,6 @@
-# `--stop-model`
+# `strata components update --stop-model`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,55 +8,52 @@
 | コマンド | `strata components update` |
 | オプション | `--stop-model` |
 | 別名 | なし |
-| 値 | 値を取らない真偽値。指定すると `True`、省略時は `False` |
+| 値 | 値を取らないフラグ。指定すると真になる |
 
 ## 役割
 
-更新対象 engine を使ってモデルが稼働中の場合に、更新処理がそのモデルを停止してよいことを明示します。特に、対話入力を受け取れないスクリプトで停止を許可するための指定です。稼働中モデルがない場合、この指定によるモデル停止はありません（`strata_cli/update_cmd.py:77-79,347-350`、`strata_control/engine_update.py:308-324`）。
+更新対象があるとき、稼働中の Strata 管理モデルを更新のために停止してよいという明示的な許可を与える。特に、確認を行えないスクリプトや JSON 出力で使う。`strata update` にも同じフラグがあり、両コマンドは同じ更新処理を使う。
 
 ## 使い方
 
 ```sh
-strata components update --stop-model
+# 更新時に稼働モデルの停止を許可し、更新後に同じ設定で再起動する
+strata components update --stop-model --start-again
 ```
 
-この例は更新処理がモデル停止を許可された状態で実行します。停止したモデルを更新後も自動で起動するには `--start-again` も指定します。
+このコマンドは更新を実行し、フィードの読み取りやダウンロード、コンポーネントのインストールを行い得る。`--stop-model` 単独ではスクリプトのモデル再起動を許可しない。更新後も起動する場合は `--start-again` を付ける。
 
 ## 値と既定値
 
-- `argparse` の `store_true` option で、引数値は不要です。省略時は `False` です（`strata_cli/update_cmd.py:76-79`）。
-- 値の範囲、空値、複数指定に対する独自 validation はありません。`--stop-model=true` のような値付き構文はこの parser の定義ではありません。
-- `--yes` とは別の同意です。`--yes` は質問を省略しますが、モデル停止への同意を与えません。モデルが稼働中で `--stop-model` がない非対話実行は、変更前に exit code `7` で拒否されます（`strata_cli/update_cmd.py:67-69,333-350`、`strata_control/engine_update.py:317-324`）。
+値を取りません。省略時は停止許可が無効です。引数 parser は `action="store_true"` で定義し、別名や値の validation はありません。重複指定による追加の効果もありません（`terminal/strata_cli/update_cmd.py:77-79`）。
 
 ## 実行時の動作
 
-1. `strata components update` parser がこの flag を受け取り、共通 dispatch から `update_cmd.run()` に渡します（`strata_cli/update_cmd.py:70-79`、`strata_cli/cli.py:139-140,512-515,2136-2138`）。
-2. `run()` は `--check` の場合を除き、更新を `engine_update.update_with_models()` と `ModelGate` に委譲します。`ModelGate` の `allow_stop` にこの flag の値が渡ります（`strata_cli/update_cmd.py:290-301,347-350`）。
-3. 更新予定があり稼働中モデルが見つかると、`--stop-model` がない対話端末では停止前に確認します。指定がある場合はこの停止確認を行わず、対象モデルを停止可能として同意済みに記録します。更新はモデルが稼働したままダウンロードを進め、その後停止してから staging / test start に進みます（`strata_control/engine_update.py:308-332,334-363`、`strata_control/updater.py:327-331,1703-1710`）。
-4. モデル停止では `runtime.stop()` を呼び、関連 tunnel の停止も試みます。tunnel 停止で例外が起きても無視します（`strata_control/engine_update.py:217-224`）。
-5. 停止後は既定で再起動しません。`--start-again` を併用すると、保存済み profile の設定でモデルを起動します。再起動指定は更新失敗時にも適用され、その場合は旧 engine のままで起動を試みます（`strata_cli/update_cmd.py:69,347-350`、`strata_control/engine_update.py:376-406,412-432`）。
+`strata components update` と `strata update` の parser はそれぞれ `--stop-model` を登録し、どちらも同じ `update_cmd.run` に送ります（`terminal/strata_cli/update_cmd.py:59-79`、`terminal/strata_cli/cli.py:160-161,2210-2212`）。`run` は実更新のとき `ModelGate` を作り、このフラグを `allow_stop` に渡します（`terminal/strata_cli/update_cmd.py:366-368,414-417`）。
+
+更新可能な変更があり、モデルが稼働中の場合、更新処理はダウンロード前に停止同意を確認します。`--stop-model` があると、その確認を省いて許可済みモデルを記録します（`terminal/strata_control/updater.py:2060-2074`、`terminal/strata_control/engine_update.py:300-325`）。実際の停止はダウンロード後、コンポーネントのステージングやテスト起動の直前です。停止に成功したモデルは更新後に `--start-again` または対話時の確認に従って再起動されます（`terminal/strata_control/updater.py:395-401`、`terminal/strata_control/engine_update.py:327-356,369-399`）。
+
+相互作用:
+
+- `--yes` は質問をすべて省く指定ですが、単独ではモデル停止を許可しません。非対話時に稼働モデルがあれば、`--stop-model` がないと何も変更せず終了コード 7 になります（`terminal/strata_cli/update_cmd.py:67,77`、`terminal/strata_control/engine_update.py:310-317`）。
+- `--start-again` は停止済みモデルを更新後に再起動します。指定しない場合、対話端末では再起動を質問し、質問できない実行ではモデルを停止状態のままにして手動起動方法を表示・報告します（`terminal/strata_control/engine_update.py:369-399`）。
+- `--check` はフィードを確認して返る経路で、モデル停止ゲートを呼びません（`terminal/strata_cli/update_cmd.py:357-363`）。更新対象がない場合もモデルゲートは呼ばれないため、このフラグの効果はありません（`terminal/strata_control/updater.py:2063-2065`）。
 
 ## 適用条件と副作用
 
-- モデルが稼働している場合にだけ停止許可として意味を持ちます。`--check` は `update_with_models()` に進まず feed を確認して終了するため、モデル停止 gate は通りません（`strata_cli/update_cmd.py:290-301`）。
-- Strata がこのプロセスから起動していない service、`strata serve`、または別プログラムが保持する server は `can_stop` 不可と分類され、この flag を指定しても停止されません。変更前に exit code `7` で拒否されます（`strata_control/engine_update.py:189-199,308-324`）。
-- 更新ダウンロード中に新たに起動した未同意モデルは停止対象に追加されず、更新を進める前に拒否されます。対話時に追加確認できるケースもありますが、`--stop-model` 指定時は `allow_stop` が有効なため追加モデルも自動停止の許可対象にはならず、エラーになります（`strata_control/engine_update.py:334-352`）。
-- flag だけを指定し `--start-again` を指定しなければ、モデルは停止状態のままです。人向け出力では再開方法が表示されます（`strata_control/engine_update.py:376-405`）。
-- 停止後に再起動を試みて失敗したとき、更新成功なら exit code `8` になります。更新自体の失敗は通常の更新エラーを維持します（例: 更新失敗 `6`）。停止中の更新拒否や停止失敗は `7` です（`strata_control/engine_update.py:34-35,357-363,424-432`、`strata_cli/update_cmd.py:307-319`）。
-- `--output json` / `jsonl` など機械出力モードでは対話質問は行われません。`--stop-model` は停止同意として渡り、機械出力に model phase event が含まれます（`strata_cli/update_cmd.py:98-107,333-350`、`strata_control/engine_update.py:316-317,354-363`）。
+停止対象は Strata が管理する稼働モデルです。`--stop-model` があっても、Strata が起動していない `strata serve` や他プログラムが保持する server は自動停止されず、終了コード 7 で更新を拒否します（`terminal/strata_control/engine_update.py:182-202,301-307`）。
+
+モデルは新しいエンジンをダウンロードしている間は稼働を続け、その後に停止されます。停止に失敗した場合は更新を進めず、停止処理が何も変更していない保証もありません。停止後、GPU の解放を最大 120 秒待ちます。解放されない場合も終了コード 7 で後続の更新を拒みます（`terminal/strata_control/engine_update.py:290-295,327-367`）。停止処理はモデル runtime を停止し、該当する場合は Cloudflare tunnel も閉じます（`terminal/strata_control/engine_update.py:210-218`）。
 
 ## 出力とエラー
 
-- 稼働モデルがあるのに停止同意がない非対話実行では、モデル名、変更していない旨、再実行時に `--stop-model` を付ける案内を含むエラーになり、通常 human 出力では `strata: ...` を標準エラーへ出して code `7` を返します。機械出力時は同じ失敗を JSON の `error` として標準出力に出します（`strata_control/engine_update.py:317-324`、`strata_cli/update_cmd.py:237-242,307-311`）。
-- この flag 自体に成功メッセージはありません。停止・再起動の状態は human 出力または JSON/JSONL の model event と結果に反映されます（`strata_control/engine_update.py:316,354-363,397-405`、`strata_cli/update_cmd.py:98-115,302-306`）。
+稼働モデルがあり、停止許可がない非対話実行、停止不能な server、停止失敗、停止後の GPU 解放待ちタイムアウトでは終了コード 7 になります。更新が成功しても、再起動が必要なモデルの再起動に失敗した場合は終了コード 8 になります。更新自体が失敗した場合は更新処理の終了コードが返り、停止済みモデルの再起動処理も試みられます（`terminal/strata_control/engine_update.py:33-34,301-367,369-425`）。
+
+人が対話確認できない経路では、モデルの確認・進捗は通常文の代わりにイベントとして出力されます。`--output json` / `jsonl` の失敗は JSON エラーとして出力されます（`terminal/strata_cli/update_cmd.py:303-312,400-417`）。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:67-79` — `strata update` と `strata components update` の parser 宣言。両方の command scope で flag を定義。
-- `strata_cli/cli.py:139-140,512-515,2136-2138` — parser 登録、共通 `--json` / `--quiet` 追加、実行関数への dispatch。
-- `strata_cli/update_cmd.py:290-301,333-350` — `--check` 分岐、gate への値の引き渡し、対話可否と `allow_stop` の生成。
-- `strata_control/engine_update.py:189-209,217-224,292-363,376-432` — 稼働モデルの分類、停止処理、同意・release・再起動と終了コード。
-- `strata_control/updater.py:327-331,1703-1710` — engine 停止前の gate 呼び出し。
-- `docs/INSTALL.md:122-128` — 利用者向け説明との照合。
-
-調査範囲は上記 commit の checkout にある Terminal CLI と `strata_control` 実装です。ソースを変更せず、build、GPU 実行、性能測定、テスト、Release artifact の実行・取得は行っていません。
+- `terminal/strata_cli/update_cmd.py:59-79` — 両コマンドの parser 定義と `--stop-model` の型。
+- `terminal/strata_cli/update_cmd.py:303-321,357-373,400-417` — 実更新経路、停止ゲートへの値の転送、対話・機械出力時の扱い。
+- `terminal/strata_control/updater.py:395-401,2060-2074` — 停止同意を確認する時点と、同意後に停止を実行する時点。
+- `terminal/strata_control/engine_update.py:182-202,210-218,285-367,369-425` — 稼働モデルの識別、停止と副作用、失敗・再起動の扱い。

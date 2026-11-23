@@ -1,52 +1,53 @@
 # `STRATA_MTP_Q8_SM60`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-MTP drafter が使う Q8_0 重みの一部を、Pascal 向け Q8_0 GEMV の登録形式へ変換する opt-in です。対象は `dense.bin` の drafter projection 9 個と、所有する draft head の語彙 subset です。projection は別領域へパックし、draft head は可能なら既存領域内でパックします。これにより MTP の Q8_0 行列を `native_mmvq` 経由で Pascal GEMV に渡せるようにします（`src/core/mtp.cpp:77-85,349-371,782-787`; `src/kernels/cuda/native_mmvq.cu:2824-2854,2890-2920`）。
+CUDA/HIP 共通の MTP drafter が持つ Q8_0 重みの一部を、CUDA の Pascal 向け Q8_0 GEMV が読む packed layout に登録する opt-in です。対象は drafter の 9 個の必須 dense projection と、draft vocabulary subset がある場合の draft head です。通常の GGUF Q8_0 layout で読む経路から、packed layout の `native_mmvq` 経路へ切り替わります。MTP の提案値はカーネルの加算順序の違いで丸めが異なり得ると実装コメントにありますが、target の返信は提案値に依存しないと同コメントは説明しています。`engine/src/core/mtp.cpp:106-115,486-509,996-1004`。
 
-この変数単独では Pascal 経路を有効にしません。基盤側の `STRATA_Q8_SM60` も文字列全体が `"1"` である必要があります（後述）。
+この変数だけでは pack は有効になりません。packer は別の `STRATA_Q8_SM60` も有効と判定した場合にだけ働きます。`STRATA_Q8_SM60` は値が厳密に `1` のとき有効で、CUDA kernel は HIP build では無効です。したがってこの MTP 変数単独、または HIP build では MTP 重みは通常の layout のままです。`engine/src/kernels/cuda/native_mmvq.cu:2623-2637,3044-3051,3111-3117`。
 
 ## 値と判定
 
-MTP 側は `std::getenv()` の結果について、未設定でなく先頭文字が `'1'` かだけを確認します。文字列全体の parse、数値変換、大文字小文字変換はしません（`src/core/mtp.cpp:80-85`）。
+`MtpDrafter::mtp_q8_sm60()` が `std::getenv` の結果を関数内 `static const bool` に一度だけ保存し、値が存在して先頭文字が `'1'` なら true とします。文字列全体は比較せず、数値変換もありません。unset、空文字、`0`、`true`、` 1` は false、`1`、`10`、`1anything` は true です。最初の呼び出し後に環境を書き換えてもこの判定は変わりません。`engine/src/core/mtp.cpp:109-115`。
 
-| 値 | MTP 側の判定 |
-|---|---|
-| 未設定 | OFF |
-| 空文字 | OFF |
-| `1` | ON |
-| `10`, `1anything` | ON（先頭文字だけで判定） |
-| `0`, `true`, `false`, ` 1` など | OFF |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| MTP 側のフラグ判定 | false | `1`, `10`, `1anything` | 空文字, `0`, `true`, ` 1` |
+| packed layout の実際の作成 | MTP 側フラグが false なら作成しない | 上記に加えて `STRATA_Q8_SM60=1` の CUDA build が必要 | `STRATA_Q8_SM60` unset / 空 / `01` / `1 `、または HIP build では作成しない |
 
-有効な値でも、Q8_0 以外の重みやパック条件を満たさない形状は対象になりません。パック処理が失敗した場合は、その重みについて GGUF の元レイアウトを維持する fallback があります（`src/core/mtp.cpp:356-371,782-787`; `src/kernels/cuda/native_mmvq.cu:2824-2847,2890-2919`）。
+packer 側の `q8_sm60_on()` は `STRATA_Q8_SM60` を文字列全体 `"1"` と比較します。HIP build では常に false です。MTP フラグが true でもこの gate が false なら `pack` は false を返し、通常 layout を維持します。`engine/src/kernels/cuda/native_mmvq.cu:2625-2637,3044-3051,3111-3117`。
 
 ## 有効になる条件
 
-- MTP drafter がロードされる必要があります。CLI では `--mtp` が指定され、`--spec` が 2 以上でなければ MTP は無効化されます。`--mtp` のロードが失敗すれば `strata generate` はエラーを stderr に出して終了コード 1 を返します（`src/program/generate.cpp:6281-6298`）。
-- 実際の Q8_0 Pascal パッキングは CUDA 実装です。HIP 側の `q8_sm60_on()` と pack 関数は常に false を返し、Metal の `MtpDrafter::load()` は Metal drafter のロードへ早期 return するため、この MTP 判定を使う処理に進みません（`src/core/mtp.cpp:265-273`; `src/kernels/cuda/native_mmvq.cu:2466-2478,2824-2829,2890-2895`）。
-- `STRATA_Q8_SM60` がちょうど `"1"` であることも必要です。値が未設定、空、`10`、`1anything` などは基盤側で OFF です。したがって `STRATA_MTP_Q8_SM60` の prefix 判定とは異なります（`src/kernels/cuda/native_mmvq.cu:2464-2477`）。
-- projection は `shared == nullptr` かつ `dense4_ == nullptr` の場合に限りパックを試みます。9 個の必須 projection のうち、存在し `q8_0` 型で、native pack helper の対象形状・割り当て条件を満たすものだけが登録されます。`--mtp-q4` によって `dense4_` ができた場合、projection の Q8_0 パック分岐は通りません（`src/core/mtp.cpp:349-371`; `src/kernels/cuda/native_mmvq.cu:2802-2805,2824-2840`）。
-- draft head は `dhead_type_ == GGML_Q8_0`、この drafter が head を所有していること、行バイト数が `n_embd / 32 * 34` と一致すること、および native pack 条件を満たすことが必要です。共有 drafter では `owns_draft_head_` が false なので、slot drafter ごとに head を再パックしません（`src/core/mtp.cpp:282-293,782-787`; `src/kernels/cuda/native_mmvq.cu:2802-2805,2890-2900`）。
-- `src/core/mtp.cpp` の環境変数 helper 自体は GPU 世代を調べません。SM60 対応コードを含む CUDA build と対応する実行環境が必要ですが、この環境変数の読み取り箇所だけから build のアーキテクチャ設定や実 GPU の可否を追加で保証することはできません。
+- MTP layer を実際にロードすること。`--mtp` が空なら loader に達せず、`--spec` が 2 未満なら `--mtp` は無視されます。`engine/src/program/generate.cpp:8172-8193`。
+- backend が CUDA kernel を含む build で、`STRATA_Q8_SM60=1` も設定されていること。HIP build では packer が常に false を返します。コードは GPU 世代を実行時に検査せず、Pascal / GP100 向けとするコメントに基づく opt-in です。`engine/src/kernels/cuda/native_mmvq.cu:2623-2637,3044-3051`。
+- projection は `MtpDrafter::load()` が共有 weights を受け取らず (`shared == nullptr`)、`--mtp-q4 proj` または `all` で作る `dense4_` がないときだけ pack を試します。必須 9 tensor のうち `q8_0` で packer の形状条件 `n_in >= 128`、32 の倍数、`n_out > 0` を満たす行列が対象です。batch slot drafter は solo drafter の重みを共有するため、その slot の load では再 pack しません。`engine/src/core/mtp.cpp:345-378,486-509`; `engine/src/kernels/cuda/native_mmvq.cu:2991-2995`。
+- draft head は vocabulary subset がロードされ、`STRATA_MTP_FULL_HEAD` が設定されておらず、head が Q8_0 (`type == 8`)、`--mtp-q4 head/all` が適用されていない場合に限り候補です。さらに MTP フラグ、row byte 条件、packer 成功が必要です。subset がなく full head を使う場合、この MTP 変数による draft-head pack はありません。`engine/src/core/mtp.cpp:939-1004`。
+- `STRATA_Q8_SM60` は main output head の pack も制御しますが、それはこの変数の効果とは別です。NativeHead 側は Q8_0 head に対して独立に packer を呼びます。`engine/src/core/native_head.cpp:262-265`。
+- `generate.cpp` の DFlash2 head 共有見積もりは `STRATA_MTP_Q8_SM60` の値ではなく設定有無を見ます。空文字や無効な値でも存在すれば `df2_expect_share` が false となり、head byte 見積もり上の共有を見込みません。これは MTP pack 判定とは別の相互作用です。`engine/src/program/generate.cpp:8337-8353`。
 
 ## 実行時の詳細
 
-`mtp_q8_sm60()` は関数内 `static const bool` に判定結果を保存します。最初の評価後にプロセス環境を書き換えても再判定されません。通常は MTP の `load()` 内で projection パッキング条件を調べる際に最初に呼ばれます。head の分岐も同じ cache を使います（`src/core/mtp.cpp:80-85,356-357,782-785`）。
+solo MTP load の `bind()` で、必須 projection の確認後に pack を試し、成功数と追加 VRAM byte 数を集計します。packer は Q8_0 の packed eligibility（SM60 有効時は `n_in >= 128`、`n_in % 32 == 0`、`n_out > 0`）を検査してから、別の packed buffer を作って registry に登録します。成功した projection が 1 個以上あれば `strata mtp: %d of %zu projections on the Pascal Q8_0 GEMV (STRATA_MTP_Q8_SM60=1, %.1f MiB more VRAM)` を stderr に出します。失敗または対象なしならこの MTP 集計行は出ません。pack 自体の失敗時には VRAM 不足や packing failure の警告が出て、GGUF layout を保ちます。`engine/src/core/mtp.cpp:486-509`; `engine/src/kernels/cuda/native_mmvq.cu:2991-2995,3044-3075`。
 
-projection 側では `fc_embedding.weight`, `fc_hidden.weight`, `self_attn.{q,k,v,o}_proj.weight`, `mlp.shared_expert.{gate,up,down}_proj.weight` の 9 tensors を順に調べます。pack helper が成功した数と追加 VRAM を `vram_` に加算し、成功数が 1 以上なら stderr に `strata mtp: N of 9 projections on the Pascal Q8_0 GEMV ...` を出します。成功数 0 の場合、この MTP 集計ログは出ません（`src/core/mtp.cpp:349-371`）。
+draft head subset は同じ bind 中に別途処理されます。形状・alignment に応じて同じ大きさの allocation 内へ in-place pack するか、通常 packer の別 buffer に fallback します。成功時は `dhead_plain_` を false にし、stderr に `strata mtp: the draft head on the Pascal Q8_0 GEMV (STRATA_MTP_Q8_SM60=1)` を出します。失敗時は通常 layout のままです。`engine/src/core/mtp.cpp:996-1004`; `engine/src/kernels/cuda/native_mmvq.cu:3111-3141`。
 
-draft head は同じ環境条件のもとで in-place pack を試み、成功時に `strata mtp: the draft head on the Pascal Q8_0 GEMV (STRATA_MTP_Q8_SM60=1)` を stderr に出します。helper はメモリ条件や 16-byte alignment によって別領域 pack に切り替えることがあり、VRAM 不足、読み書き失敗時には `strata q8 sm60: ...` の stderr ログを出して失敗を返します。元 layout を維持または復元できない旨を含むログもあります（`src/core/mtp.cpp:782-787`; `src/kernels/cuda/native_mmvq.cu:2833-2847,2890-2919`）。
+判定値は最初の `mtp_q8_sm60()` 呼び出し時に static cache されます。projection pack は `load()` 中、draft-head subset pack は `bind()` 中に実行され、その後の `record_rest()` が Q/O projection と shared-expert projection を `native_mmvq` へ渡し、draft-head row も `native_mmvq` から読みます。registry に packed 重みとして登録済みで、kernel 条件を満たす場合は packed path が使われ、decline した形状は通常の経路に fallback します。`engine/src/core/mtp.cpp:109-115,486-509,996-1004,1309-1354`; `engine/src/kernels/cuda/native_mmvq.cu:2767-2801,3699-3704`。
 
-MTP の projection は `record_rest()` などから `native_mmvq()` に渡されます。登録に成功した重みは、native MMVQ の Pascal 分岐で Q8 SM60 kernel に渡されます。Pascal kernel がその呼び出しを受けられないとき、実装は条件に応じて exact packed kernel または通常 GGUF layout の経路を残します（`src/core/mtp.cpp:1041-1085`; `src/kernels/cuda/native_mmvq.cu:2587-2614`）。draft head の subset も `native_mmvq()` で読む経路に限られ、コメント上、prompt path はこの packed subset を読まず GGUF layout を使います（`src/core/mtp.cpp:782-785,1242`）。
+## ログと測定値
+
+この変数に関して MTP 側が出す成功ログは、projection pack が 1 個以上成功したときの集計行と、draft head subset pack 成功時の行です（上記参照）。packer は作成失敗時に `strata q8 sm60: no VRAM for the packed %s (%.0f MiB); it keeps the GGUF layout`、`strata q8 sm60: packing the %s failed; it keeps the GGUF layout` などを stderr に出します。`STRATA_Q8_SM60=1` が kernel 側で初めて評価された際には `strata q8 sm60: Q8_0 decode GEMVs on the Pascal kernel (STRATA_Q8_SM60=1)` も出ます。`engine/src/kernels/cuda/native_mmvq.cu:2629-2634,3055-3068`。
+
+設定一覧は `STRATA_MTP_Q8_SM60` を「NVIDIA and AMD」と記載していますが、当該 MTP packing 関数が呼ぶ packer は `__HIPCC__` build で false を返すため、この機能の実装条件とは一致しません。release notes は GP100 向け opt-in と記載します。Strata の資料には本変数の性能測定値はありません。`docs/SETTINGS.md:180`; `docs/release-notes-0.2.7.md:53`; `engine/src/kernels/cuda/native_mmvq.cu:3044-3051,3111-3117`。
 
 ## 根拠
 
-- 環境変数の読み取り、prefix 判定、static cache: `src/core/mtp.cpp:77-85`。
-- drafter projection の対象と pack / 成功ログ: `src/core/mtp.cpp:349-371`。
-- draft head の対象、所有条件、成功ログ: `src/core/mtp.cpp:782-787`。
-- MTP 起動条件、load 失敗時の stderr と終了: `src/program/generate.cpp:6281-6298`。
-- 基盤変数 `STRATA_Q8_SM60` の完全一致判定、HIP の no-op、ログ: `src/kernels/cuda/native_mmvq.cu:2464-2478`。
-- Q8 pack 対象形状、割り当て・pack 失敗 fallback: `src/kernels/cuda/native_mmvq.cu:2794-2805,2824-2854,2890-2920`。
-- 登録重みの native MMVQ 分岐: `src/kernels/cuda/native_mmvq.cu:2587-2614`。
+- `engine/src/core/mtp.cpp:106-115` — MTP フラグの読取・先頭文字判定・static cache。
+- `engine/src/core/mtp.cpp:345-378,486-509` — load 経路、共有重み・Q4 優先、projection pack とログ。
+- `engine/src/core/mtp.cpp:908-1004,1309-1354` — subset head 条件・pack と packed projection の利用箇所。
+- `engine/src/kernels/cuda/native_mmvq.cu:2623-2637,2991-2995,3044-3075,3111-3141,3699-3704` — backend gate、形状、pack / fallback / GEMV。
+- `engine/src/core/native_head.cpp:262-265` — main head の別個の `STRATA_Q8_SM60` 処理。
+- `engine/src/program/generate.cpp:8172-8193,8337-8353` — MTP 起動条件と DFlash2 共有見積もり。
+- `docs/SETTINGS.md:180`; `docs/release-notes-0.2.7.md:53` — 文書記載との照合。

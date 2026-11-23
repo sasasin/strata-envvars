@@ -1,65 +1,56 @@
-# `--no-browser`
+# `setup.sh --no-browser`（macOS / Metal）
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `metal/setup_mac.py`（`setup.py` から Apple Silicon の macOS で委譲） |
+| コマンド | `./setup.sh`（macOS Apple Silicon では `engine/metal/setup_mac.py` に委譲） |
 | オプション | `--no-browser` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。未指定時の parser 値は `None` |
+| 値 | 値を取らないフラグ |
 
 ## 役割
 
-Metal engine を起動するときに、サーバーが準備できた後のブラウザー自動起動を抑止します。対象は `metal/setup_mac.py` の parser です。macOS で `STRATA_CONTROL_INSTALL=1` が設定されていない `setup.py` は、独自 parser を動かす前に全引数をこのスクリプトへ渡します（`setup.py:82,7703-7707,9068-9069`、`metal/setup_mac.py:327-358`）。
+モデルのセットアップや起動時に、準備完了後のチャットページ自動表示を止めます。API を使うハーネスやアプリから利用する場合などに使えます。macOS の通常経路では `setup.py` が Apple Silicon の処理を `engine/metal/setup_mac.py` に渡し、その parser がこのフラグを受け取ります（`terminal/setup.py:11218-11220`、`engine/metal/setup_mac.py:372-385`）。
 
 ## 使い方
 
-Apple Silicon Mac の Strata checkout ルートで `setup.py` / wrapper 経由で使う例です。
-
 ```sh
+# macOS の Metal セットアップを行い、ブラウザーを開かずにモデルを起動
 ./setup.sh --no-browser
+
+# セットアップ内容を保存するが、この実行ではモデルを起動しない
+./setup.sh --no-browser --no-start
 ```
-
-既存モデル設定の起動時は現在の起動だけに適用されます。セットアップを実行して設定へ保存する例:
-
-```sh
-./setup.sh --setup --no-browser
-```
-
-`setup.sh` は Python 環境を確認・用意してから `setup.py` を実行し、Darwin の通常経路は `metal/setup_mac.py` に委譲します。直接呼び出す場合は `python3 metal/setup_mac.py --no-browser` です（`setup.sh:7-13,39-50`、`setup.py:9068-9069`）。
 
 ## 値と既定値
 
-値は不要で、型変換・値域 validation はありません。parser は `dest="browser"`、`action="store_false"`、`default=None` として登録され、指定時は `a.browser` が `False` になります（`metal/setup_mac.py:327-356`）。`--no-browser yes` のように続けて値を付ける構文ではありません。ただし Mac parser は `parse_known_args()` を使うため、`yes` は未知引数として警告され、通常は処理が続きます（`metal/setup_mac.py:356-358`）。
+`--no-browser` は `argparse` の `store_false`、保存先 `browser`、既定値 `None` のフラグです。値は指定しません。未指定時は `None` のままなので、ブラウザーを明示的に止めず、通常の起動ではチャットページを開く経路になります。値の範囲検証はありません（`engine/metal/setup_mac.py:375-385`）。
 
 ## 実行時の動作
 
-- 既存の Mac 設定があり、`--setup`、`--model`、`--check`、`--no-start`、`--update`、`--build` のいずれも指定されていないと、選択済み設定をそのまま起動します。この経路では `--no-browser` を `start()` の引数として渡し、設定ファイルは書き換えません。次回起動にも抑止を残すには設定を作り直す必要があります（`metal/setup_mac.py:369-371`）。
-- セットアップでモデル設定を生成する経路では、指定時に `cfg["open_browser"] = False` を設定ファイルへ保存し、生成する `run-<model>.sh` にもブラウザーを開く `--open` 引数が付かない形で反映します（`metal/setup_mac.py:542-570`、`setup.py:7647-7650`）。`--no-start` と併用すると設定と起動スクリプトは保存されますが、その場では server を起動しません（`metal/setup_mac.py:557-570`）。
-- 起動時は `start()` が `serve/server.py --engine strata --config ...` を子プロセスとして呼びます。`--no-browser` 指定または config の `open_browser: false` の場合に `--open` を付けず、それ以外なら付けます。設定ファイルの値も `False` なら、フラグ未指定であってもブラウザーは開きません（`metal/setup_mac.py:302-323`）。
-- このオプションはブラウザー起動だけを制御します。設定生成、モデル取得や engine 準備、server 起動を省略するものではありません。server は準備完了時に API URL とチャット画面 URL を表示し、その後 `--open` と config 値の条件を満たす場合だけブラウザーを開きます（`metal/setup_mac.py:542-570`、`serve/server.py:9490-9494,9511-9516`）。
+新しいセットアップ経路では、指定すると `a.browser` が `False` になり、生成する `strata-<model>.json` に `"open_browser": false` を保存します。続けて生成する `run-<model>.sh` にはサーバーの `--open` を付けません。`--no-start` を併用した場合も設定と起動スクリプトは書かれ、当該実行でサーバーを開始する段階だけが省略されます（`engine/metal/setup_mac.py:608-621`、`terminal/setup.py:9149-9162`）。
+
+既にインストール済みの Metal 設定を通常起動する場合も、フラグを渡すと `start()` に `False` が渡り、サーバー起動引数に `--open` が追加されません。フラグなしで通常起動する場合は `True` が渡ります（`engine/metal/setup_mac.py:416-418`、`engine/metal/setup_mac.py:311-332`）。サーバー側は `--open` が指定され、かつ設定の `open_browser` が `false` でない場合にだけブラウザー起動処理を行います（`terminal/serve/server.py:9207-9212`）。
+
+この文書の scope である macOS 委譲先 parser には `--browser` の登録がありません。未知の引数は `parse_known_args()` で受け取り、「not used on a Mac」と警告されるため、`--browser` で `--no-browser` を取り消すことはできません（`engine/metal/setup_mac.py:375-405`）。`terminal/setup.py` 自体には `--browser` がありますが、通常の macOS 経路はその parser より前に委譲されます（`terminal/setup.py:11218-11220`、`terminal/setup.py:11287-11291`）。
 
 ## 適用条件と副作用
 
-この scope は Apple Silicon 用の Metal セットアップ経路です。Control mode（`STRATA_CONTROL_INSTALL=1`）では `setup.py` が Mac standalone parser に委譲しないため、この文書の parser は使われません（`setup.py:82,9068-9069`）。
-
-フラグ単独に設定ファイルの副作用はありません。設定を生成する経路で明示した場合はモデル別 JSON と起動スクリプトを書き込みます。通常の既存設定起動では設定を書き換えず、当該起動の server 引数だけを変えます（`metal/setup_mac.py:369-371,557-570`）。
+- 適用対象は `terminal/setup.py` が macOS かつ Control モードでなく、Hy4 または Inkling の専用経路でもない場合の Metal セットアップです。通常の Intel / AMD / Linux / Windows 経路の同名フラグとは別 scope です（`terminal/setup.py:11216-11220`）。
+- 新しい設定では `open_browser: false` が設定ファイルへ記録され、後続の `./setup.sh` 起動でもブラウザーを開かない設定として残ります。生成される `run-<model>.sh` も `--open` なしになります（`engine/metal/setup_mac.py:608-612`、`terminal/setup.py:9149-9162`）。
+- このフラグ自体はブラウザーを閉じたり、サーバーの起動・待受を止めたりしません。サーバーは通常どおり起動し、指定ポートで API とページを提供します（起動コマンド生成: `engine/metal/setup_mac.py:324-332`）。
+- `--no-start` を併用するとサーバー起動を行わず終了しますが、設定と起動スクリプトの書き込みはその前に行われます（`engine/metal/setup_mac.py:610-621`）。
 
 ## 出力とエラー
 
-`--no-browser` 固有の validation、警告、失敗処理はありません。余分な未知引数があれば `not used on a Mac: ...` の警告を出して続行します（`metal/setup_mac.py:356-358`）。設定参照先の実行ファイルや GGUF が見つからない場合、またはモデル repack が実行中の場合は、`start()` が通常の setup エラーを出し server を起動しません。これらはこのオプション固有の失敗ではありません（`metal/setup_mac.py:302-323`）。ブラウザーを開かない場合も起動案内は表示され、server 子プロセスの終了コードが返されます（`metal/setup_mac.py:319-323`）。
+このフラグ固有の成功メッセージやエラー経路はありません。未知の引数は警告に出力され、セットアップ処理は続行します（`engine/metal/setup_mac.py:403-405`）。起動時には設定が参照する実行ファイルや GGUF が欠けている場合、またはモデル再パックが実行中の場合に `S.fail()` でサーバーを開始せず失敗します。開始できた場合は `serve/server.py` の終了コードが `start()` から呼び出し元へ返されます（`engine/metal/setup_mac.py:311-332`）。
 
 ## 根拠
 
-- parser 宣言、未知引数の扱い: `metal/setup_mac.py:327-358`
-- 既存設定の通常起動分岐: `metal/setup_mac.py:369-371`
-- server 起動引数とファイル・repack 検査: `metal/setup_mac.py:302-323`
-- 新規設定への保存、run script 作成、`--no-start` 分岐: `metal/setup_mac.py:542-570`
-- run script の `--open` 付与条件: `setup.py:7647-7650`
-- macOS の委譲条件と子プロセス起動: `setup.py:82,7703-7707,9068-9069`
-- server の準備完了時の URL 表示とブラウザー起動条件: `serve/server.py:9490-9494,9511-9516`
-- 索引上の所属とリンク: `docs/cli/README.md:1594-1619`
-
-調査は上記 commit の parser・分岐・起動処理を対象にしました。CLI help の実行、Release artifact、および実機のブラウザー起動結果は確認していません。
+- `terminal/setup.py:11216-11220` — macOS で Metal setup へ委譲する条件と引数転送。
+- `engine/metal/setup_mac.py:375-405` — macOS parser のフラグ定義、既定値、未知引数の警告。
+- `engine/metal/setup_mac.py:416-418`、`608-621` — 既存設定起動、新規設定への保存、起動スクリプト生成、`--no-start` と起動呼び出し。
+- `engine/metal/setup_mac.py:311-332`、`terminal/setup.py:9149-9162` — 設定を使ったサーバー起動と `--open` の有無。
+- `terminal/serve/server.py:9207-9212` — サーバー側のブラウザー起動条件。

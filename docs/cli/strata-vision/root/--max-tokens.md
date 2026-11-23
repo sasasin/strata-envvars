@@ -1,54 +1,61 @@
-# `--max-tokens`
+# `strata-vision --max-tokens`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
-- 対象: `strata-vision` / `strata-vision-hip` / `strata-vision-sycl` の root scope
-- 調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`
-- 調査日: 2026-11-01
-- 対象 checkout の状態: `main...origin/main`、working tree clean
+| 項目 | 内容 |
+| --- | --- |
+| ツール ID | `strata-vision` |
+| コマンド | `strata-vision`、`strata-vision-hip`、`strata-vision-sycl` |
+| オプション | `--max-tokens` |
+| 別名 | なし |
+| 値 | 整数。正の値は画像あたりの目標上限トークン数として使われる。 |
+
+## 役割
+
+画像を vision encoder に渡す前処理で、画像サイズを制限するための値です。値は mmproj の画像 geometry に基づく画像リサイズ上限へ換算されます。前処理後のトークン数が指定上限の 1/8 の許容幅も超える場合は、その画像をエンコードせず `ERR` として拒否します。これは `strata-vision` の常駐プロセス起動時に指定し、各画像の `ENC` 処理に適用します（`terminal/tools/vision/strata_vision.cpp:7-8, 87-89`、`terminal/tools/vision/own/own_reader.cpp:123-140`）。
 
 ## 使い方
 
 ```sh
-strata-vision --mmproj ./mmproj.gguf --model ./model.gguf --max-tokens 1024
+# mmproj を読み込む常駐 reader を起動し、各画像のトークン上限を 1024 にする
+strata-vision --mmproj ./vision-mmproj.gguf --max-tokens 1024
 ```
 
-`--max-tokens` は画像 encoder が画像から作る image token 数の上限値として指定します。`strata-vision` は `--mmproj` と `--model` を必須とし、標準入力から `ENC <画像パス> <出力パス>` を受け付ける常駐プロセスです。オプションを指定するだけで画像を処理する形式ではありません（`tools/vision/strata_vision.cpp:7-15, 125-128, 283-291`）。
+起動後のプロセスは標準入力で `ENC <画像パス> <出力パス>` と `QUIT` を受け付けます。GPU ビルドでは同じ parser を持つ `strata-vision-hip` / `strata-vision-sycl`（または Metal 対応 `strata-vision`）にも同じ指定を使います（`terminal/tools/vision/strata_vision.cpp:10-13, 36-56`、`terminal/tools/vision/CMakeLists.txt:77-98`）。
 
 ## 値と既定値
 
-値は `N` の位置に整数文字列を1つ取ります。parser は `std::atoi` で変換し、明示的な範囲・書式検証を行いません。したがって数値に変換できない値は `0` となり、値が `0` 以下の場合と同じく context へ上限を設定しません。オプションを省略した場合も内部値は `0` で、上限は設定されません。値を省略すると `--max-tokens needs a value` を stderr に出して終了コード `2` で終了します（`tools/vision/strata_vision.cpp:90, 93-97, 115`）。
-
-同じオプションを複数回指定した場合、parser は値を順に代入し、最後に読んだ値が残ります（`tools/vision/strata_vision.cpp:93-97, 115`）。
+- `--max-tokens` の次の引数を `std::atoi` で整数に変換します。引数がない場合は `--max-tokens needs a value` を標準エラーに出し、終了コード 2 で終了します。値の範囲や変換結果の妥当性を parser で検査する処理はありません（`terminal/tools/vision/strata_vision.cpp:61-65, 87-89`）。
+- オプションを省略した場合の内部値は `0` です。0 以下の場合、リサイズ上限には `geo.max_tokens` が使われます。この revision のソースでは `VitGeometry` の初期値 4096 が使われ、GGUF から token 上限を読み替える処理は確認できません（`terminal/tools/vision/own/own_reader.h:14-19`、`terminal/tools/vision/own/vit_geometry.h:43-44`、`terminal/tools/vision/own/vit_geometry.cpp:37-57`、`terminal/tools/vision/own/image_prep.cpp:205-209`）。
+- 正の値は画像上限として適用されます。負数や、数値に変換できず `atoi` が 0 を返す入力は、明示的なエラーにならず既定 geometry の上限と同様に扱われます。重複指定を拒む処理はなく、引数走査中に同じフィールドへ代入するため最後の指定が残ります（`terminal/tools/vision/strata_vision.cpp:61-65, 87-89`）。
 
 ## 実行時の動作
 
-値が正数の場合、`mtmd_context_params.image_max_tokens` に設定され、vision encoder の context 初期化に渡されます。`--min-tokens` も正数なら別途 `image_min_tokens` に設定されますが、Strata 側に両値の組み合わせを検証する処理はありません（`tools/vision/strata_vision.cpp:214-231`）。
+画像準備時、正の `--max-tokens` は `patch × patch × merge × merge` を乗じたピクセル上限に換算されます。画像の縦横比を保ちながら encoder の alignment 単位に丸め、上限より大きい画像は縮小します。値が 0 以下なら mmproj 由来の `geo.max_tokens` を代わりに使います（`terminal/tools/vision/own/image_prep.cpp:205-209, 42-59`）。
 
-この設定だけで全モデルに対して厳密な上限が保証されるわけではありません。GPU 利用時は起動時の warm-up で生成された token 数が `max_tokens + floor(max_tokens / 8)` を超えると stderr に警告します。実際の `ENC` 処理でも同じ閾値を超えた画像は拒否され、出力先を開かず、標準出力へ `ERR ... (vision.max_tokens)` を返して次の入力を処理します。閾値以下の端数超過は拒否されない場合があります（`tools/vision/strata_vision.cpp:249-279, 316-334`）。
+`--min-tokens` を同時に正の値で指定した場合は同じ前処理関数に渡されます。リサイズはまず最大ピクセル上限を確認し、画像がその上限を超えず、かつ最小ピクセル数を下回る場合に限って拡大するため、最大上限側の条件が先に評価されます（`terminal/tools/vision/strata_vision.cpp:87-89`、`terminal/tools/vision/own/image_prep.cpp:42-59, 205-209`）。
+
+前処理後、算出した画像トークン数が `max_tokens + max_tokens / 8` を超えると画像を拒否します。つまり 1/8 の余裕を許容し、それを超えた場合は出力ファイルを書かず、`ERR ... over the limit ... (vision.max_tokens)` を標準出力へ返して次の入力を処理します（`terminal/tools/vision/own/own_reader.cpp:133-140`）。
+
+GPU 経路では起動時の warm-up にも同じ min/max 値を使います。初期 GPU バッファの token 数は正の指定値または geometry の上限と 4096 の小さい方です。4096 を超える上限を指定しても、ソースコメント上は大きな画像時にバッファを拡張する経路があり、その画像の処理が遅くなる可能性が記されています（`terminal/tools/vision/own/own_reader.cpp:65-76, 102-117`）。
 
 ## 適用条件と副作用
 
-上限値は、正数を指定した場合に限り mtmd context に渡されます。ソースには「このモデルでは上限が適用されない」ケースが明記されており、GPU warm-up で超過が判明すると警告し、画像ごとの処理では許容幅を超えた画像を拒否します。CPU 利用時にも画像ごとの拒否判定はありますが、起動時 warm-up 自体が行われないため、その警告はありません（`tools/vision/strata_vision.cpp:225-231, 249-279, 316-319`）。
-
-超過判定を通過した画像は、指定された出力ファイルを `wb` で開いて書き込みます。同名ファイルがあれば切り詰められます。上限超過時はそのファイルを開かないため、このオプションによる拒否経路では既存ファイルは変更されません（`tools/vision/strata_vision.cpp:316-328`）。
-
-この parser は各 build variant で共通です。HIP / SYCL variant など、実行ファイル名や GPU backend の差は `--max-tokens` の解釈を変えません（`tools/vision/CMakeLists.txt:18-31, 96-115`）。
+- option は `strata-vision`、`strata-vision-hip`、`strata-vision-sycl` で共通の `terminal/tools/vision/strata_vision.cpp` parser を通ります。どの backend でも画像のリサイズと上限チェックに使われます。GPU が有効な場合は warm-up と GPU バッファ確保の大きさにも影響します（`terminal/tools/vision/CMakeLists.txt:77-98`、`terminal/tools/vision/own/own_reader.cpp:65-76, 102-117`）。
+- positive な上限は前処理画像の大きさに影響し、上限を大きくするとより多くの画像トークンを処理できる余地が生じますが、特定の性能・メモリ量はソースだけから一律には確定できません。
+- 出力ファイルへの書き込みは画像が上限チェックを通過し、encoder が成功した後に行われます。指定先が既存ファイルの場合は `fopen(..., "wb")` により上書きされます（`terminal/tools/vision/own/own_reader.cpp:142-153`）。
 
 ## 出力とエラー
 
-- 値を省略: stderr に `--max-tokens needs a value`、終了コード `2`（`tools/vision/strata_vision.cpp:95-97`）。
-- 数値が `0` 以下、または数値に変換できない値: 起動時 parser は拒否せず、上限設定と画像ごとの上限判定を行いません（`tools/vision/strata_vision.cpp:115, 229, 317`）。
-- GPU warm-up が許容閾値を超過: stderr に `WARNING ... the limit is not applied for this model` を出して起動を続けます（`tools/vision/strata_vision.cpp:273-279`）。
-- 画像が許容閾値を超過: stdout に `ERR ... (vision.max_tokens)` を出し、常駐プロセスは終了せず次の入力へ進みます（`tools/vision/strata_vision.cpp:316-335`）。
+- オプション値が欠落すると標準エラーにエラーを出し、終了コード 2 です（`terminal/tools/vision/strata_vision.cpp:63-65`）。
+- 数値の範囲外を理由にした起動時エラーはありません。値が正ならリサイズ条件に反映され、0 以下なら geometry 既定値へフォールバックします（`terminal/tools/vision/strata_vision.cpp:87-89`、`terminal/tools/vision/own/image_prep.cpp:205-209`）。
+- 画像の前処理が失敗した場合、または上限を 1/8 超過した場合は標準出力に `ERR ...` を返して常駐プロセスは次の入力へ進みます。上限超過時の分岐は出力ファイルを開く処理より前にあります（`terminal/tools/vision/own/own_reader.cpp:131-140, 142-153`）。
 
-## 根拠と調査範囲
+## 根拠
 
-- parser、変換、既定値: `tools/vision/strata_vision.cpp:90-97, 113-128`
-- context 設定と初期化: `tools/vision/strata_vision.cpp:214-235`
-- warm-up 警告: `tools/vision/strata_vision.cpp:249-283`
-- 画像ごとの拒否と出力ファイル処理: `tools/vision/strata_vision.cpp:286-335`
-- 実行ファイルと variant: `tools/vision/CMakeLists.txt:18-31, 94-115`
-- 配置と scope: `docs/cli/README.md` の `strata-vision` 節。調査基準: `docs/cli/001_investigation.md`。
-
-同一 revision の `--help` は実装されていません。ソース内の usage 表示は必須引数の案内のみで、`--max-tokens` を含む一覧表示はありません（`tools/vision/strata_vision.cpp:123-128`）。mtmd ライブラリ内部で各モデルに対して token 上限を適用する詳細はこの Strata 側ソースからは確認できないため、モデルごとの厳密な上限動作は断定していません。
+- `terminal/tools/vision/strata_vision.cpp:7-13, 61-95` — 共通 CLI 構文、parser、整数変換、欠落値・usage の扱い。
+- `terminal/tools/vision/own/own_reader.h:14-19` — 内部 option の初期値と上限の意味。
+- `terminal/tools/vision/own/vit_geometry.h:43-49` — geometry の token 既定値と alignment。
+- `terminal/tools/vision/own/image_prep.cpp:42-59, 205-225` — 最大・最小ピクセルへの換算と画像サイズ調整。
+- `terminal/tools/vision/own/own_reader.cpp:65-76, 102-117, 123-155` — GPU 初期化、warm-up、画像ごとの上限拒否、出力ファイル生成。
+- `terminal/tools/vision/CMakeLists.txt:77-98` — CPU/GPU variant が同じ parser 実装を使うこと。

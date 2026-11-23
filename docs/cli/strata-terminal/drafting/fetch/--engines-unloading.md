@@ -1,6 +1,6 @@
-# `strata drafting fetch --engines-unloading`
+# `--engines-unloading`
 
-調査対象: Strata commit `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,55 +8,52 @@
 | コマンド | `strata drafting fetch` |
 | オプション | `--engines-unloading` |
 | 別名 | なし |
-| 値 | 値なし。`store_true` フラグ |
+| 値 | 値を取らない boolean flag。指定すると `True`、省略すると `False`。 |
 
 ## 役割
 
-モデル実行設定から all-cards split engine の起動可否を早期判定するとき、現在 GPU 上で Strata の engine が保持しているメモリを、次の起動までに返却されるものとして扱います。アプリが既存 engine を停止する前に drafter の取得要否を問い合わせる用途を想定したフラグです。このフラグ自体は engine を停止・unload しません（`strata_cli/drafting_cmd.py:42-56`）。
+新しいモデルの開始前に既存の Strata engine が停止して VRAM を返す予定であることを split engine の事前判定へ伝えます。これにより、停止前の GPU 空き容量ではなくカード容量を使って split engine が開始可能かを見積もります。fetch コマンド自身が engine を停止する機能ではありません。特に `--if-needed` と併用すると、split engine が使われる見込みなら DFlash2 drafter の取得を省略する判定になります。
 
 ## 使い方
 
 ```sh
-strata drafting fetch --config /path/to/run-config.json --engines-unloading --if-needed
+# アプリと同様に、既存 engine の停止後に split engine が使われる見込みなら取得を省く
+strata drafting fetch --config ./run-config.json --engines-unloading --if-needed
 ```
 
-`--if-needed` を付けると、選択された実行経路で drafter の取得が不要な場合は取得を省略します。フラグは `strata drafting plan` と `fetch` の共通 parser で定義されています（`strata_cli/drafting_cmd.py:19-35`）。
+このオプションは通常の `--help` 出力には表示されません（parser で `argparse.SUPPRESS` が指定されています）。ただし現行 parser は受け付け、索引上の scope は `strata drafting fetch` です。
 
 ## 値と既定値
 
-- 値は取りません。指定すると `args.engines_unloading` が真になり、省略時は `store_true` の既定値で偽です（`strata_cli/drafting_cmd.py:31-32`）。
-- 値の範囲や追加 validation はありません。値を後置する形式ではなく、同じフラグを複数回指定しても真のままです。help 表示からは `argparse.SUPPRESS` により隠されています（`strata_cli/drafting_cmd.py:31-32`）。
+値・引数は不要です。`argparse` の `store_true` で登録され、未指定時は偽です。別名、値の範囲、空値の解釈はありません。値を続けて渡した場合、その値はこの flag の値にはならず、コマンドの他の引数として parser による処理を受けます。
 
 ## 実行時の動作
 
-`fetch` は引数を `_inputs()` に渡し、設定の drafting mode が `auto` または `mtp` で、かつ `--no-split` が指定されていないときに split 可否を問い合わせます。このときフラグの真偽が `_split_expected(..., unloading=...)` に渡ります（`strata_cli/drafting_cmd.py:61-85`）。
+`fetch` と `plan` は共通 parser でこの flag を登録します。`fetch` では設定ファイルと引数から入力を組み立てる際、実効 mode が `auto` または `mtp` で、かつ `--no-split` がない場合に split engine の事前判定を行います。`--engines-unloading` があると実 GPU probe の各カードについて `free_mib` を `None` に置き換えます。split engine の判定は `free_mib=None` を「空き容量不明」としてカード全容量で計算するため、稼働中 engine が保持している VRAM は見積もり上 busy とされません。
 
-`unloading=True` の場合、split-engine のカード情報を取得した後、各カードの `free_mib` を `None` に置き換えます。split 可否判定の空きメモリ計算は `free_mib=None` ならカード全容量、既知の空き容量があればその値から 700 MiB の reserve を引くため、このフラグは「Strata engine が保持中の VRAM が返却された後」の見積もりに切り替えます（`strata_cli/drafting_cmd.py:42-56`、`strata_control/split_engine.py:99-104`）。カード情報取得や split 判定で例外が起きても `_split_expected()` は `False` を返し、早期問い合わせを理由にコマンドを失敗させません（`strata_cli/drafting_cmd.py:57-58`、`strata_control/split_engine.py:437-473`）。
+事前判定が split engine を選ぶと、入力の mode を `mtp` に切り替えます。続く `needs_pack` / `needs_tuned` の判定は drafter の選択を見ており、`fetch --if-needed` はそれらが不要なら取得を行わず成功扱いで終了します。split engine はモデル内蔵の MTP draft layer を使うため、この経路で DFlash2 pack を求めません。`--if-needed` がない明示的な fetch では、この flag は `ensure_for` の取得処理に引き渡されず、split 判定結果による skip も行いません。
 
-split が予測されると `_inputs()` は選択 mode を `mtp` として扱い、DFlash2 pack が必要かどうかを再計算します（`strata_cli/drafting_cmd.py:80-85`、`strata_control/drafting.py:721-731`）。`--if-needed` があると `needed` が偽の場合に「Nothing to download.」または JSON の `skipped: true` を出して正常終了します（`strata_cli/drafting_cmd.py:90-118`）。
+`--no-split` がある場合は split 判定自体をせず、この flag は fetch の取得要否に影響しません。mode が `off` または `dflash2` の場合も split 判定の条件外です。設定の `mtp` が false で実効 mode が `auto` のときは先に mode が `off` へ変わるため、同様に split 判定されません。split の事前判定内で例外が起きた場合も `False`（split を見込まない）として扱われます。
 
-このオプションだけでは `fetch` を条件付きにはしません。`--if-needed` がない経路では、上記の判定後も `drafting_fetch.ensure()` が呼ばれ、DFlash2 pack の取得・準備を試みます（`strata_cli/drafting_cmd.py:113-138`）。
+この flag は状態を主張する入力であり、engine の停止確認はしません。従って、解放予定の Strata engine が残ったまま使うと、その占有分を含めずカード全容量で判定します。ほかの GPU 利用プロセスが使っている VRAM もこの見積もりから除外されます。
 
 ## 適用条件と副作用
 
-- 効果があるのは `drafting.normalize(mode)` が `auto` または `mtp` で、`--no-split` が無効の場合です。`--mode dflash2`、`--mode off` などではこの split 判定分岐に入りません（`strata_cli/drafting_cmd.py:77-82`）。
-- `--config` の `gpu`、`args`、`drafting`、`split_engine`、`replicas` 等が予測に使われます。`--config` が読めない場合は `_inputs()` が空設定として続行し、split 判定自体も例外時は偽として扱います（`strata_cli/drafting_cmd.py:61-80`、`strata_control/split_engine.py:447-473`）。
-- これはメモリ見積もりの変更であり、実際に GPU メモリを解放したり、engine/GPU を操作したりはしません。システム RAM 等、カードの `free_mib` 以外の split 判定条件は引き続き判定されます（`strata_cli/drafting_cmd.py:51-56`、`strata_control/split_engine.py:437-473`）。
-- `fetch` の通常取得経路ではネットワークアクセス、pack 生成、関連ファイル操作が発生し得ますが、それらは `--engines-unloading` による副作用ではなく `fetch` 本体の動作です（`strata_cli/drafting_cmd.py:126-138`、`strata_control/drafting_fetch.py:144-200`）。
+split engine の事前判定は対応する Linux / Windows 系のシステムで GPU probe を行い、カード数・種類、モデルや engine 引数、RAM などの条件も判定します。`--engines-unloading` はその判定に使うカードのメモリ情報だけを置き換えます。GPU の probe 自体は行われますが、この flag によるファイル変更、ネットワークアクセス、engine の停止はありません。後続の fetch が実際に必要と判断された場合のダウンロード・pack 作成は通常の fetch 処理です。
+
+判定の情報が不足したり例外が発生したりすると split 不採用として継続します。その場合 `--if-needed` は DFlash2 が必要と判断されれば取得へ進むことがあります。逆にこの flag が full VRAM 前提で split を採用し、`--if-needed` が DFlash2 を省略しても、実際の start が別条件で split を使えない場合の fallback では通常の drafter が必要になる可能性があります。
 
 ## 出力とエラー
 
-このフラグ固有の警告やエラー出力は確認できません。フラグにより split 判定が真になり、`--if-needed` による skip が成立すれば、human 出力は `Nothing to download.`、JSON/JSONL 出力は `{"schema_version":1,"ok":true,"event":"result","pack":null,"skipped":true}` です（`strata_cli/drafting_cmd.py:113-118`）。
-
-通常の fetch が続いた場合、DFlash2 の取得・準備エラーは human 出力では stderr に `strata: ...`、機械可読出力では `ok: false` の JSON となり、終了コード 5 です。成功時は pack の場所を表示して 0 で終了します（`strata_cli/drafting_cmd.py:126-138`）。
+`--if-needed` で DFlash2 が不要と判定された場合、human 出力は `Nothing to download.`、JSONL 出力は `skipped: true` の result event となり、終了コード 0 です。必要と判断された場合は通常の取得処理へ進みます。取得時に `DraftingError` または acquisition 拒否が起きると、machine 出力では `drafting_failed`、human 出力では stderr に `strata: ...` を出し、終了コード 5 です。split 判定の内部例外だけではこの flag 起因のエラーにはならず、split 不採用として処理が続きます。
 
 ## 根拠
 
-- Parser と共通 option 定義: `strata_cli/drafting_cmd.py:19-35`
-- フラグから split 判定への引き渡しと VRAM 情報の変更: `strata_cli/drafting_cmd.py:42-58,61-85`
-- `--if-needed` の分岐、取得処理、出力と終了コード: `strata_cli/drafting_cmd.py:88-138`
-- 空きメモリの扱いと split 早期判定: `strata_control/split_engine.py:99-104,437-473`
-- drafter の要否判定: `strata_control/drafting.py:721-731`
-- fetch が実行する取得・pack 処理: `strata_control/drafting_fetch.py:144-200`
-
-調査範囲は上記 checkout の Python CLI と split-engine 判定コードです。別 OS や GPU 構成での実機挙動、アプリ側がこのフラグを組み立てる詳細は、この文書では検証していません。
+- `terminal/strata_cli/drafting_cmd.py:22-38` — `plan` と `fetch` の共通 parser、`store_true` 登録、help 非表示。
+- `terminal/strata_cli/drafting_cmd.py:45-61` — split 判定への入力、VRAM 情報の置換、例外時に `False` とする経路。
+- `terminal/strata_cli/drafting_cmd.py:101-136` — 実効 mode、`--no-split` 条件、判定後に mode を `mtp` とする処理。
+- `terminal/strata_cli/drafting_cmd.py:240-246, 267-272, 281-305` — 必要性判定、`--if-needed` の skip、実取得と出力・失敗経路。
+- `terminal/strata_control/split_engine.py:96-103, 477-513` — 空き VRAM が不明なカードを全容量として数える規則、事前判定が扱う条件と例外処理。
+- `terminal/strata_control/drafting.py:1611-1622` — DFlash2 pack / tuned pack の必要性判定。
+- `app/host/server/control-runtime.mjs:401-406` — ホストアプリが fetch にこの flag と `--if-needed` を渡す経路。
+- `docs/cli/README.md:349-361` — `strata drafting fetch` のコマンド階層と option scope の索引。

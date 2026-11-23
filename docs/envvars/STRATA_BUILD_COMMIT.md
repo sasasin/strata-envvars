@@ -1,51 +1,45 @@
 # `STRATA_BUILD_COMMIT`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありません。Strata が直接読む箇所を対象とし、外部ライブラリの動作は対象外です。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-端末配布アーカイブを作成するとき、そのアーカイブの元になった Strata の完全な commit SHA を供給します。`packaging/package_terminal.py` は `STRATA_BUILD_COMMIT` を `STRATA_COMMIT` より後順位の候補として読み、値が40桁の16進 SHA として有効なら小文字化してアーカイブ内の `COMMIT` ファイルに書きます。この値は通常の Strata engine の実行時設定ではありません。
+Terminal 配布アーカイブを作るとき、そのソースの commit SHA をビルド環境から渡すための packaging 用入力です。engine の実行時動作や推論設定は変えません。`tools/packaging/package_terminal.py` は最終的に選んだ SHA をアーカイブ内の `COMMIT` ファイルに書き、Strata の benchmark がソース revision を記録できるようにします（`tools/packaging/package_terminal.py:422-438, 465-471, 514-516`）。
 
-主な供給経路は Docker build です。両 Dockerfile は build argument `STRATA_COMMIT` を環境変数 `STRATA_BUILD_COMMIT` に設定してからパッケージ作成スクリプトを実行します。`docker/build.sh` はホスト側の `STRATA_BUILD_COMMIT` または git HEAD を選び、Docker build argument `STRATA_COMMIT` として渡します。
+Docker 経路では `tools/docker/build.sh` がこの変数を読み、Dockerfile の `STRATA_COMMIT` build arg に渡します。Dockerfile はその build arg を `STRATA_BUILD_COMMIT` として Terminal の packaging コマンドへ渡します（`tools/docker/build.sh:61-63, 130-134`; `tools/docker/Dockerfile:34-37`; `tools/docker/Dockerfile.src:109-116`）。
 
 ## 値と判定
 
-Python の `build_commit()` は候補ごとに truthiness を確認し、`.strip()` 後の文字列全体が `[0-9a-fA-F]{40}` に一致するか検査します。一致した値は前後空白を除去して小文字化します。数値変換や SHA の存在確認はしません。
+| 読み取り経路 | unset / 空文字 | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| `package_terminal.py` を直接実行 | `os.environ.get` は `None` または `""`。どちらも候補として採用せず、次の候補へ進む | 前後の空白を除いた **40 桁**の ASCII 16 進文字列。大文字・小文字を受け付け、採用時は小文字に正規化する（例: `a`×40、`A`×40、前後に空白を付けたもの） | 空白だけ、空文字、39 桁または 41 桁、`0`、`true`、`0anything`、16 進文字以外を含む文字列。値全体を正規表現で検査し、部分一致では採用しない |
+| `tools/docker/build.sh` を経由 | シェルの `${STRATA_BUILD_COMMIT:-...}` により unset と空文字はいずれも `git -C "$repo" rev-parse HEAD` の結果へ置き換える | 置換後に小文字 `0-9a-f` だけからなる文字列。ここでは長さを検査しない。通常は git が返す 40 桁 SHA | 大文字、空白、その他の文字を含む値は `commit` を空にする。長さだけが不正な小文字 hex はこの段階では残るが、後段の packaging 検証には通らない |
 
-| `STRATA_BUILD_COMMIT` の状態 | `build_commit()` の処理 |
-|---|---|
-| 未設定、空文字 | 候補として採用せず、後続の Git fallback へ進む |
-| 前後空白付きの40桁16進文字列 | 空白を除去し小文字化して採用 |
-| 40桁の大文字・小文字混在16進文字列 | 小文字化して採用 |
-| 40桁でない、16進以外を含む、または空白だけ | 無効として次の fallback へ進む |
-
-優先順位は `--commit` CLI 引数、`STRATA_COMMIT`、`STRATA_BUILD_COMMIT`、ソースツリーでの `git rev-parse HEAD` です。上位候補が有効なら下位候補は見ません。たとえば有効な `STRATA_COMMIT` は `STRATA_BUILD_COMMIT` より優先され、無効な `STRATA_COMMIT` は `STRATA_BUILD_COMMIT` の判定へ進みます。すべての候補が無効で Git も有効な40桁SHAを返さない場合、通常の配布ビルドは停止します。`--skip-deps` のレイアウト確認では停止せず、警告を出して `COMMIT` ファイルなしのアーカイブを作ります。
+直接実行時、候補の優先順位は CLI `--commit`、`STRATA_COMMIT`、`STRATA_BUILD_COMMIT`、ソースツリーの `git rev-parse HEAD` です。各候補は空でなく、trim 後に 40 桁 hex の場合だけ採用されます。したがって、上位候補が unset・空・無効なら次へ進み、CLI 引数または `STRATA_COMMIT` が有効なら `STRATA_BUILD_COMMIT` は使われません（`tools/packaging/package_terminal.py:422-433, 449-451`）。
 
 ## 有効になる条件
 
-- `packaging/package_terminal.py` が実行され、`--commit` と `STRATA_COMMIT` が有効な SHA を与えず、この環境変数が有効な40桁 SHA を与える場合に候補として採用されます。
-- Docker 経由では Dockerfile の `ARG STRATA_COMMIT` が `ENV STRATA_BUILD_COMMIT=${STRATA_COMMIT}` に渡されます。トップレベル `Dockerfile` と `docker/Dockerfile` の両方にこの宣言があります。
-- `docker/build.sh` 経由では、ホストの `STRATA_BUILD_COMMIT` が空でなければそれを使い、空または未設定ならリポジトリの HEAD を使います。その後、値に小文字 `0-9a-f` 以外が含まれる場合は空にして build argument に渡します。この shell 側の確認は40桁長を検査しません。最終的な40桁検査は Python 側で行われます。
-- ビルド用コンテキストに `.git` がなく、CLI 引数や `STRATA_COMMIT` / `STRATA_BUILD_COMMIT` の有効値もない場合は Git fallback も使えず、通常ビルドは失敗します。Strata の Docker 文書はソースビルドで `.git` をコピーしないこと、および `STRATA_COMMIT` build argument の指定を説明しています。
-
-OS、CUDA/HIP/SYCL backend、GPU、モデル状態、サーバーモードには依存しません。Strata の engine コードがこの名前を環境変数として読む箇所は見つかりません。
+- Terminal アーカイブの packaging を実行する経路で使われます。engine の C++/CUDA/HIP/SYCL 実行時設定として読む箇所はありません。
+- 直接 packaging では `--commit` または `STRATA_COMMIT` が有効な値なら、そちらがこの変数より優先されます。両方が無効または未設定のときに限り、本変数が候補になります（`tools/packaging/package_terminal.py:422-433, 465`）。
+- Docker 用 `tools/docker/build.sh` は本変数を先に読み、値を `STRATA_COMMIT` build arg として渡します。Dockerfile 内では `ARG STRATA_COMMIT` から `ENV STRATA_BUILD_COMMIT=${STRATA_COMMIT}` を設定します。このため packaging の実行時には同じ commit 値が `STRATA_COMMIT` 候補としても存在し、同値の本変数より先に選ばれます（`tools/docker/build.sh:61-63, 130-134`; `tools/docker/Dockerfile:34-37`; `tools/docker/Dockerfile.src:110-116`）。
+- `tools/docker/build.sh` 経由で本変数が unset または空なら、checkout の HEAD を代用します。git の参照に失敗した場合や、その後の有効な commit 値が得られない場合、Terminal packaging は git fallback も試します（`tools/docker/build.sh:61-63`; `tools/packaging/package_terminal.py:426-433`）。
+- Docker build の値が最終的に 40 桁 hex として採用できない場合、通常の配布アーカイブ作成（`--skip-deps` なし）は停止します。`--skip-deps` の場合は警告を出して処理を続けますが、`COMMIT` ファイルは作られません（`tools/packaging/package_terminal.py:465-471, 514-516`）。
 
 ## 実行時の詳細
 
-`build_commit()` は `package_terminal.py` の main 処理から呼ばれ、プロセス環境をその呼び出し時に参照します。値は `static` cache されませんが、この処理はパッケージ作成時の一回の呼び出しです。読み取った SHA はアーカイブのルートに `COMMIT` として保存され、後のベンチマーク記録で配布物の commit を示す情報になります。生成後の Strata 実行時に `STRATA_BUILD_COMMIT` を再読する処理ではありません。
+`tools/docker/build.sh` は context 作成時にシェル変数 `commit` を一度設定します。ここで本変数が非空ならその値を使い、unset/空なら git HEAD を読みます。小文字 hex 以外を含む場合は値を空にしてから Docker build arg を組み立てます。build arg は後続の `docker build` に渡され、Terminal stage で `package_terminal.py` が実行されます（`tools/docker/build.sh:55-63, 130-134`; `tools/docker/Dockerfile:33-40`）。
 
-有効値が得られない場合、`--skip-deps` なしでは `SystemExit` により次の文言で停止します。この文言は `STRATA_BUILD_COMMIT` を明示していませんが、候補判定後にも SHA が得られなかった場合の経路です。
+直接 packaging の場合は `main()` が `build_commit(args.commit)` を呼び、その呼び出しで `os.environ.get("STRATA_BUILD_COMMIT")` を評価します。関数内 static cache やリクエストごとの再評価はありません。通常のコード経路ではこの選択は一度の packaging 実行時に行われます（`tools/packaging/package_terminal.py:422-438, 441-465`）。
 
-> the commit of these sources is unknown (no .git here, no --commit, no STRATA_COMMIT): the archive would carry no COMMIT file, and every `strata bench run` on it would be nonconforming
+有効な値が得られると、staging directory に `COMMIT` を一行で作成し、その directory が配布アーカイブへ収録されます（`tools/packaging/package_terminal.py:514-516, 547-548`）。この環境変数自体を読む Strata のサーバー／CLI 実行経路は見つかりませんでした。
 
-`--skip-deps` を指定した場合は同じ説明を `warning: ` 付きで標準出力に出し、`COMMIT` を書かずに続行します。成功時の SHA 自体について専用ログはなく、アーカイブの `COMMIT` ファイルに現れます。
+## ログと測定値
+
+有効値を採用したときの commit 専用ログはありません。採用できる値がなく `commit is None` になると、実装は `the commit of these sources is unknown (no .git here, no --commit, no STRATA_COMMIT): the archive would carry no COMMIT file, and every `strata bench run` on it would be nonconforming` を作ります。`--skip-deps` なしではこの文言で `SystemExit` し、指定時は `warning: ` を先頭に付けて stdout へ出します（`tools/packaging/package_terminal.py:465-471`）。
 
 ## 根拠
 
-- `packaging/package_terminal.py:320-331`: 候補順、環境変数の読み取り、空白除去、40桁16進文字列の判定、小文字化、Git fallback。
-- `packaging/package_terminal.py:347-349,357-368`: `--commit` の定義、優先順位を含む `build_commit()` 呼び出し、未知 commit 時の停止または `--skip-deps` 警告。
-- `packaging/package_terminal.py:411-415`: 有効な commit をアーカイブ staging root の `COMMIT` に書く処理。
-- `Dockerfile:71-76`、`docker/Dockerfile:34-37`: Docker build argument から環境変数への設定とパッケージャー起動。
-- `docker/build.sh:59-61,105-109`: ホスト環境変数または git HEAD の選択、値の文字種検査、Docker build argument の受け渡し。
-- `docs/DOCKER.md:303-307`: `.git` が build に含まれず、`STRATA_COMMIT` argument を渡すソースビルドの説明。
-- `docs/BENCHMARK_PROTOCOL.md:326-329`: リリースアーカイブ内の `COMMIT` ファイルを commit 情報として扱う説明。
+- `tools/docker/build.sh:61-63, 130-134` — 環境変数のシェル展開、文字種検査、Docker build arg への受け渡し。
+- `tools/packaging/package_terminal.py:422-438, 449-451, 465-471, 514-516` — 値の検証と優先順位、fallback、失敗時の扱い、`COMMIT` ファイル作成。
+- `tools/docker/Dockerfile:33-40` — Docker build arg から環境変数を設定し、Terminal packaging を実行。
+- `tools/docker/Dockerfile.src:109-116` — ソースビルド経路での build arg と環境変数の設定。

@@ -1,45 +1,49 @@
 # `STRATA_LOGITS_DUMP`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-通常の verify window で計算した head logits を指定パスへバイナリ形式で保存します。実装コメントでは sampler が見た window の logits を診断用に保存する tap とされています。KVA 専用ではなく、KVA の有効・無効を切り替える環境変数でもありません（`src/core/verify.cpp:3410-3415`、`docs/KVA.md:123`）。
-
-`STRATA_LOGITS_DUMP` は `src/core/verify.cpp` の `std::getenv("STRATA_LOGITS_DUMP")` で直接読み取られます。全リポジトリの名前検索で確認できたコード参照はこの読み取りとその直前のコメントだけです。helper 経由や動的な名前の読み取りはありません。候補一覧の名前は、この実装で実際に環境から読まれています。
+verify の最終段が正常に完了したウィンドウについて、`head_logits_` の全 `T × n_vocab` FP32 値を、指定パスのバイナリファイルへ追記していく診断用 tap です。通常のトークン出力先を変更する処理ではなく、この環境変数を読むコード自体はサンプリング結果 `out` を書き出しません。CUDA/HIP 実装では、条件を満たす head bitplane 経路もこの tap が有効と判定された場合に選ばなくなります（条件は「有効になる条件」参照）。CUDA/HIP と SYCL の verify 実装に読み取りがあります。Metal 経路は `Verifier::run` 内で別経路として先に return するため、この読み取り箇所を通りません。`engine/src/core/verify.cpp:3792-3818,3025-3027,4242-4273`、`engine/sycl/src/core/verify.cpp:2962-2975`。
 
 ## 値と判定
 
-| 環境値 | Strata の処理 |
-|---|---|
-| 未設定 | dump 部分を実行しない。 |
-| 設定あり（空文字を含む） | 値をパスとして `std::fopen(path, "wb")` に渡す。文字列比較、数値変換、空白除去、範囲検査はしない。 |
+値の内容は parse されず、`getenv` が null かどうかだけで判定します。未設定は無効、空文字を含む設定済みの値は有効です。設定値はファイルパスとして `fopen(path, "wb")` に渡されます。`1`、`true`、空白を含む値も真偽値として解釈せず、その文字列をパスとして使います。空文字や開けないパスでは `fopen` が失敗し、記録は行われません。大文字小文字・数値形式・範囲の検査はありません。`engine/src/core/verify.cpp:4250-4253`、`engine/sycl/src/core/verify.cpp:2962-2965`。
 
-空文字も `getenv` が null でないため有効側の分岐に入りますが、空文字パスでの `fopen` が成功するかは OS のファイル API に委ねられ、Strata は失敗を通知しません。`fopen` 成功時は `"wb"` で開くため、そのパスに既存ファイルがあれば最初に切り詰めます。
+| 条件 | unset | 有効になる値 | 無効になる値・結果 |
+|---|---|---|---|
+| CUDA/HIP または SYCL の verify 最終段 | dump 分岐を通らない | `dump.bin`、`1`、`true` など、空でない任意の文字列（文字列をパスにする） | `""` は設定済みだが空パスで open に失敗し、記録なし。存在しない親ディレクトリなど open 失敗時も記録なし |
+| Metal の `Verifier::run` | 環境変数をこの dump 実装では読まない | 該当なし | 該当なし |
 
-CLI 引数による上書きや別環境変数との優先順位はありません。CLI の `--dump-logits` は `src/program/generate.cpp` にある別の出力機能で、この環境変数の値を設定・変更しません（`src/program/generate.cpp:546,1005,3047,8007-8014`）。
+他の CLI 引数や環境変数によるパスの上書き・fallback はありません。既存ファイルは最初の open 時に `wb` で切り詰められます。`engine/src/core/verify.cpp:3806,4250-4252`、`engine/sycl/src/core/verify.cpp:2962-2964`。
 
 ## 有効になる条件
 
-- `Verifier::run()` が実行され、関数末尾近くの dump 部分まで正常に到達すること。window の CUDA stream 同期、sampling、出力 token の取り出しより後に処理されます（`src/core/verify.cpp:3333-3358,3395-3415`）。
-- layer split の先行 stage は `le_ < g.n_layers` の分岐で次 stage に渡して戻るため、その stage では dump しません。最終 stage の run が到達すればそこで対象になります（`src/core/verify.cpp:3355-3358`）。
-- `STRATA_GPU_METAL` ビルドでは `Verifier::run()` が Metal の `window_run()` を呼んで早期 return するため、この dump コードを通りません（`src/core/verify.cpp:3056-3061`）。
-- `run_slot_rows()` による slot batch と `pl_finish()` による pipelined finish には同じ書き込み処理がありません（`src/core/verify.cpp:4387-4405,5024-5048`）。環境変数を設定しただけで全推論経路の logits が記録されるわけではありません。
-
-ソース上、この分岐に OS、GPU 世代、KVA 状態、CLI フラグによる追加 gate はありません。非 Metal の通常 `run()` 経路で、設定値がありファイルを開けた場合に動作します。
+- CUDA/HIP または SYCL の verify 実装が使われること。Metal の `run` は `window_run` の後に戻り、dump の読み取り箇所を通りません。`engine/src/core/verify.cpp:3792-3818,4185-4191`。
+- ウィンドウが `Verifier::run` の head 側まで成功して到達すること。CUDA/HIP では layer split の先行段は `le_ < g.n_layers` の分岐で戻り、SYCL でも `le_ < g.n_layers` で次段へ渡して戻るため、その段自身は記録しません。最終段で dump します。`engine/src/core/verify.cpp:4185-4191,4242-4250`、`engine/sycl/src/core/verify.cpp:2942-2963`。
+- `getenv` 時点で値が設定されていること、および出力ファイルを開けること。open 失敗時の代替パスや明示的な警告はありません。`engine/src/core/verify.cpp:4250-4253`、`engine/sycl/src/core/verify.cpp:2962-2966`。
+- CUDA/HIP では head bitplane 経路を避ける効果は、head がロード済みで bitplane を持ち、`T <= 16` かつ `(head_->type() == 8 || T >= 4)` の場合に限られます。値の有無は関数内 `static` に保存されます。SYCL の同じ用途の bitplane 判定はこの名前では行われず、dump 分岐だけです。`engine/src/core/verify.cpp:3025-3027`。
 
 ## 実行時の詳細
 
-各対象 window の処理時に `getenv` を評価します。環境値があると、最初に条件へ入った時点で `static std::FILE*` が `fopen(path, "wb")` を一度だけ実行し、その結果（失敗時の null も含む）を後続呼び出しでも使います。最初の open 後に環境値を書き換えても別パスへ切り替わらず、open 失敗後も再試行しません。外側の `getenv` 判定自体は呼び出しごとに行われるので、最初の対象 window まで unset で、その後 set された場合は、その時点のパスで初回 open します（`src/core/verify.cpp:3415-3418`）。
+各 verify ウィンドウの通常処理後、トークン出力 `out` へのコピーと `note_nonfinite` の後に環境変数を読みます。CUDA/HIP ではその前に sampling が必要な場合の処理と `cudaStreamSynchronize` があり、そこで失敗すると `false` を返すため dump まで到達しません。SYCL でも sampling 同期の失敗時は先に `false` を返します。したがって、プロンプト処理・生成の全呼び出しではなく、この verify 経路を通り、head 段まで正常に完了したウィンドウが対象です。`engine/src/core/verify.cpp:4192-4233,4242-4254`、`engine/sycl/src/core/verify.cpp:2946-2967`。
 
-記録は次の順序のバイナリです。ヘッダーは4個の native `int32`（magic `0x53474F4C`、window の `T`、`n_vocab`、record 番号）、続いて native `int64` の `pos0`、最後に `T * n_vocab` 個の native `float` logits を row-major で書きます。row 0 は `pos0` の位置です。各 window で device logits を host vector へコピーし、成功した場合にヘッダーとデータを書いて `fflush` します。record 番号は成功した device-to-host copy の後で増えます（`src/core/verify.cpp:3419-3427`）。
+dump 分岐に初めて入ったとき、関数内 `static FILE*` が現在の値を使って `wb` で一度だけファイルを開き、ハンドルを保持します。以後のウィンドウも同じファイルへ書きます。分岐の `getenv` 自体は毎ウィンドウ再評価されるため、初回 open 前に設定すれば実行中の設定変更で有効化できます。一方、最初の open 後に値を unset するとその間の記録はスキップされ、別のパスに変更して再設定しても保持中のハンドルを使います。`engine/src/core/verify.cpp:4250-4263`、`engine/sycl/src/core/verify.cpp:2962-2974`。
 
-`fopen` が失敗した場合は何も書かず、警告も出しません。device-to-host copy が失敗すると、最初の一度だけ stderr に `strata verify: STRATA_LOGITS_DUMP copy failed: <CUDA error string>` を出し、CUDA の last error を取得して dump をスキップします。どちらの失敗も、この dump 部分から `run()` を失敗扱いにはしません。`fwrite` と `fflush` の戻り値も検査されません（`src/core/verify.cpp:3416-3434`）。
+各記録は 24-byte 相当のヘッダー（`int32 magic=0x53474F4C`、`int32 T`、`int32 n_vocab`、`int32 record`、`int64 position`）の後に `T × n_vocab` 個の float を書きます。`position` はウィンドウ開始位置 `pos0`、各行は順にその位置からの logits です。record 番号は静的カウンターで、CUDA/HIP では device-to-host copy が成功した記録だけ増えます。行は `head_logits_` から取得します。CUDA/HIP は `ensure_full_logits(T, true)` を呼んで split head の logits を materialize し、ホストへ copy します。SYCL は queue の memcpy と wait でホストへコピーします。いずれも各記録後に `fflush` します。`engine/src/core/verify.cpp:4254-4263,5851-5861`、`engine/sycl/src/core/verify.cpp:2966-2974`。
+
+CUDA/HIP では copy 失敗時に最初の一度だけ stderr に `strata verify: STRATA_LOGITS_DUMP copy failed: %s` を出し、CUDA error state を取得します。ファイル open 失敗、`fwrite` / `fflush` の戻り値は検査せず、専用エラーや終了にはつなげません。SYCL の queue copy / wait は例外を投げると verify の外側 catch に進み、`record_verify_sycl_exception("window run", ...)` でエラーを記録して `false` を返します。`engine/src/core/verify.cpp:4250-4272`、`engine/sycl/src/core/verify.cpp:2962-2974,3000-3003`。
+
+CUDA/HIP では別の関数内 `static const bool logits_dump` が head 処理の最初の到達時点で設定有無を一度だけ cache し、その値で条件付き bitplane head 経路を抑止します。空文字も設定ありです。この cache と dump 側の毎回の `getenv` は別の評価です。たとえば cache 初期化後に環境変数を変更すると、dump の on/off は次のウィンドウから反映され得ますが、bitplane 判定は変わりません。SYCL にはこの cache 判定がありません。`engine/src/core/verify.cpp:3025-3027,4250`。
+
+## ログと測定値
+
+CUDA/HIP device-to-host copy の失敗ログは上記のとおりで、同一プロセス中一度だけです。SYCL は専用の `STRATA_LOGITS_DUMP` 失敗文言を出しません。KVA 資料は本変数を「各 verify window の sampler logits を path に書く debug tap」と説明していますが、設定一覧の値型は `on / off` と記載されています。コードでは on/off 値ではなくパスとして扱うため、資料の型表記は実装と一致しません。ログ出力形式と実装は `engine/src/core/verify.cpp:4245-4273`、`engine/sycl/src/core/verify.cpp:2959-2975`。資料の記述は `docs/KVA.md:123`、型表記は `docs/SETTINGS.md:153`。
 
 ## 根拠
 
-- 全参照検索: `docs/KVA.md:123,145-148` と `src/core/verify.cpp:3410-3432`。実際の読み取りは `src/core/verify.cpp:3415`。
-- 値の確認、static file handle、バイナリ構造、copy・書き込み・エラー処理: `src/core/verify.cpp:3415-3434`。
-- 対象となる通常 verify window と最終 stage の分岐: `src/core/verify.cpp:3333-3358,3395-3415`。
-- Metal と batch/pipelined 経路: `src/core/verify.cpp:3056-3061,4387-4405,5024-5048`。
-- `docs/KVA.md` は KVA 条件下の likelihood 比較でこの変数を logits 保存に使うと述べていますが、測定値は同文書の記載です。本調査では測定を再実行していません（`docs/KVA.md:145-148`）。
+- `engine/src/core/verify.cpp:3025-3027` — 設定有無の cache と head bitplane 経路の条件。
+- `engine/src/core/verify.cpp:4185-4191,4192-4233,4242-4273` — 先行 stage の return、sampling / 同期、record 書き込み、エラー処理。
+- `engine/src/core/verify.cpp:5851-5861` — split logits の materialize。
+- `engine/sycl/src/core/verify.cpp:2942-2975,3000-3003` — SYCL の先行 stage return、dump と例外経路。
+- `docs/SETTINGS.md:153`、`docs/KVA.md:123` — 設定一覧・説明との照合（実装動作の根拠ではない）。

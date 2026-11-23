@@ -1,6 +1,6 @@
-# `strata update --backend`
+# `--backend`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点、`main` / `origin/main` と一致、未コミット変更なし）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,52 +8,67 @@
 | コマンド | `strata update` |
 | オプション | `--backend` |
 | 別名 | なし |
-| 値 | backend family 名。`hip-rdna2` のように HIP の variant を付けて指定する形式も処理される |
+| 値 | 文字列を 1 つ取る（エンジン family 名、GPU メーカー名、または `hip-<variant>`） |
 
 ## 役割
 
-エンジン更新時に、GPU 自動検出の代わりに対象 backend family を選びます。HIP の `--backend hip-rdna2` のような指定では、family を `hip`、variant を `rdna2` として扱います。オプションはエンジン package の選択に使われ、Control や desktop app の更新先を選ぶものではありません。
+この PC の GPU 検出結果の代わりに、更新で入れるエンジンの family を指定する。検出と違う family を選びたい PC（NVIDIA と AMD の両方がある、Intel カードを使う、variant まで決めたい）で、取得・テスト起動・切り替えの対象を固定するために使う。
 
 ## 使い方
 
-```sh
-# HIP 系エンジンの候補を確認する（feed の読み込みは行うが、package はダウンロードしない）
-strata update --backend hip-rdna2 --check
+```bash
+# 変更せずに、AMD(hip) 向けにどのパッケージが選ばれるかだけを見る
+strata update --check --backend amd
 
-# 指定した backend のエンジンを含めて通常の更新を行う
-strata update --backend cuda
+# Intel(sycl) のエンジンを取得して切り替える
+strata update --backend intel
+
+# AMD の rdna2 ビルドを名指しする
+strata update --backend hip-rdna2
 ```
 
 ## 値と既定値
 
-parser は `--backend` に文字列値を取り、既定値は `None` です。`choices` や型変換による parser 段階の制限はありません。省略時は検出した hardware/backend を使います。値が空文字列の場合も `if a.backend` の条件に入らず、指定なしと同じ扱いです。空白だけの文字列は truthy なので override され、`split_backend` 内で trim 後に空となります。
-
-指定値は trim して小文字化されます。`hip-` で始まり後続文字がある文字列は `hip` と suffix に分割されます。`hip-` の後ろが空の場合や、その他の名前はそのまま backend family として使用されます。`BACKEND_MATRIX` にある family は `metal`、`cuda`、`hip`、`sycl`、`cpu` ですが、`--backend` 自体はこの集合への validation を行いません。未知の family 名は parser では拒否されず、feed 内の engine package と一致しなければ選択候補がなくなります。
+- 未指定（`--backend` を渡さない、または空文字）なら検出経路に戻る（`terminal/strata_cli/update_cmd.py:316`）。
+- 小文字化と前後空白の除去だけを行う（`terminal/strata_control/engine_component.py:491`）。`argparse` に `choices` は無く、値の検証はパーサでは行わない（`terminal/strata_cli/update_cmd.py:50`）。
+- 受理される名前（`terminal/strata_control/engine_component.py:490`、`terminal/strata_control/targets.py:25`）:
+  - family 名: `cuda` / `hip` / `sycl` / `metal` / `cpu`
+  - GPU メーカー名の別名: `nvidia`→`cuda`、`amd`→`hip`、`intel`/`arc`→`sycl`（`terminal/strata_control/engine_component.py:502`）
+  - `hip-<variant>`（例 `hip-rdna2`）: family は `hip`、variant は後半（`terminal/strata_control/engine_component.py:495`）
+- 上記以外の語もエラーにならず、その語がそのまま family として扱われる（`terminal/strata_cli/update_cmd.py:294`）。結果は後述のとおり「この PC 向けは無い」になる。
+- 既定値は `None`。この指定は保存されないので、次回の `strata update` は再び検出（または `strata launch --backend` が保存した選択、`terminal/strata_control/engine_component.py:551`）に従う。
 
 ## 実行時の動作
 
-`run()` はまず `updater.detect_hardware()` で platform、GPU 情報、backend などを調べます。`--backend` が truthy の場合、検出結果の `backend` を指定 family に置き換え、`backend_source` を `requested` にします。分割された variant があれば `variant_wanted` にも設定します。この `requested` 印は GPU make の保護判定に明示指定として渡ります。`--backend` を省略すると、`STRATA_ENGINE_BACKEND` を含む通常の検出結果が使われます。CLI 指定がある場合は、その結果を後から上書きします。
-
-feed の engine package は platform と family が一致し、runtime・CUDA/HIP architecture・NVIDIA driver の適合条件も満たすものに絞られます。同じ family の候補から version などで選びます。HIP の variant 指定が選択に効くのは、HIP architecture (`gfx`) を検出できず、複数 variant が候補に残る場合です。その場合は指定 variant、GPU 名からの推定、既設 variant の順に選択します。architecture を検出できた場合は variant の指定より architecture の適合判定が先に効きます。
+1. `run()` が `--backend` の有無で分岐し（`terminal/strata_cli/update_cmd.py:316`）、指定時は `requested_hardware()`（同 `:283`）を呼ぶ。
+2. family が `BACKEND_MATRIX` にある語なら、`STRATA_ENGINE_BACKEND` に family を入れた環境で `updater.detect_hardware()` を呼び、**その family のカードの情報**（hip なら gfx 名、cuda ならドライバと arch）を読み直す（同 `:292`）。未知の語なら通常の検出結果の `backend` だけをその語で上書きする（同 `:294`）。`hip-<variant>` の variant は `variant_wanted` に入る（同 `:297`）。
+3. `backend_source` は常に `"requested"` になり（同 `:299`）、「別メーカーのエンジンへ乗り換えない」ガード（`terminal/strata_control/updater.py:654`、同 `:1501`）を本人の決定として通す。
+4. パッケージ選択は `select_engine()`。プラットフォーム一致の後、`pkg.backend` が指定 family と一致することを要求する（`terminal/strata_control/feed.py:739`）。variant 指定時は一致する variant があれば絞り込み、無ければ絞り込まない（同 `:773`）。gfx 不明で複数の hip variant が適合した場合は、指定 variant、GPU 名、導入済み variant の順に決め、決められなければ理由を付けて hip を除外する（同 `:796`）。
+5. `installed_before` も同じ family で解決され（`terminal/strata_control/updater.py:610`）、切り替え後もその family で選ばれるエンジンかを確認する（同 `:1587`）。
+6. Control と app は `hardware["platform"]` しか使わないため影響を受けない（`terminal/strata_control/updater.py:1921`、同 `:2004`）。モデル形状ごとのエンジンは同じ `ctx.hardware` を共有するため影響を受ける（`terminal/strata_control/shape_engine.py:301`）。`--no-engine` を併用するとエンジンとモデル形状の手順自体が省かれ、`--backend` は何も変えない（`terminal/strata_control/updater.py:2097`）。
 
 ## 適用条件と副作用
 
-- `--check` でも指定値は package 選択に適用され、結果に engine 候補と hardware 情報が出ます。check は feed を読み、更新結果を component state の `last_check` に保存しますが、feed 外の package はダウンロードしません。
-- 通常更新では選ばれた engine package の取得・検証・test start・切替に進みます。`--backend` は engine のみを制御し、通常の `strata update` が行う Control 更新や、`--app` を付けた場合の app installer 取得には適用されません。
-- 別 backend family を明示した場合、インストール済み engine と異なる GPU make でも自動選択時の make guard を通過します。この指定は適合性を保証しません。platform、architecture、driver などの適合理由により該当 package が選ばれないことがあります。
-- 未知の family 名や feed にない variant は parser でエラーになりません。候補がなく `--check` ならその状態を表示して終了し、通常更新では engine は「この PC 向け package なし」となり、その経路だけなら変更せず終了します。他の指定がなければ Control など別 component の更新は続きます。未知 family に対する独立した validation error は実装上確認できません。
+- 取得するのは指定 family のパッケージで、既存の別 family のエンジンは削除されず残る（`terminal/strata_control/updater.py:1615`）。
+- テスト起動は取得したパッケージ自身の backend を使う（`terminal/strata_control/updater.py:1372`）。`--backend` がテスト起動の引数として転送されるわけではない。
+- 対応する OS/arch は family ごとに固定（`terminal/strata_control/targets.py:25`。`sycl` は Linux x86_64 のみ、`metal` は macOS arm64 のみ）。合わない組み合わせは取得を試みず「この PC 向けは無い」になる。
+- 指定 family のカードが実機に無い場合（例 NVIDIA のみの PC で `--backend hip`）は gfx が読めず variant を決められないことがある。その場合は理由付きで `none-for-this-pc` になる（`terminal/strata_control/feed.py:808`）。メーカーガードで拒否されることはない。
+- `strata components update` も同じパーサ定義を共有する（`terminal/strata_cli/update_cmd.py:70`）。本稿は `strata update` の文脈のみを扱う。
 
 ## 出力とエラー
 
-人向け出力は `--check` で選択結果・選ばれなかった理由を表示し、通常更新では component ごとの結果を表示します。`--output json` / `jsonl` も同じ hardware 選択を使います。更新処理で `UpdateError`、feed 読み込みで `FeedError`、署名検証で `SignatureError` などが起きると、通常出力では `strata: ...` を stderr に出し、例外に応じた終了 code を返します。`--backend` の任意文字列そのものを検証する専用エラー経路はありません。
+- パッケージが無い／未知の語のとき、`strata update` はエンジンについて `none-for-this-pc` の注記を出して**そのまま続行し、終了コード 0** になる（`terminal/strata_control/updater.py:1489`）。Control などの他ステップは実行される。
+- `--check` では `Engine` 行の下に選ばれたパッケージと除外理由の一覧が出る（`terminal/strata_cli/update_cmd.py:229`）。`--output json` / `jsonl` では hardware（`backend` など）が含まれる（`terminal/strata_control/updater.py:775`）。
+- 未知の語でも usage エラー（終了コード 2）にはならない。`strata launch --backend` が未知の語を終了コード 2 で拒否するのとは挙動が異なる（`terminal/strata_cli/launch/cmd.py:831`）。
+- 署名・ハッシュ・ダウングレード拒否など既存の失敗経路（終了コード 5・6）は `--backend` で変わらない（`terminal/strata_cli/update_cmd.py:379`）。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:37-46,49-56` — `--backend` parser 定義、既定値、update parser への登録。
-- `strata_cli/cli.py:139-140,2135-2137` — update parser の登録と `update_cmd.run()` への dispatch。
-- `strata_cli/update_cmd.py:194-206` — 検出した hardware への CLI 指定の反映と実行 context の生成。
-- `strata_control/engine_component.py:439-445` — backend 名の正規化と `hip-<variant>` の分割。
-- `strata_control/targets.py:20-29` — backend family と対応 platform の matrix。
-- `strata_control/updater.py:255-275,546-570,573-582` — hardware 検出結果、明示選択時の make guard、feed package 選択への接続。
-- `strata_control/feed.py:408-431,434-461,468-495` — platform/family/architecture/driver の適合判定、候補選択、HIP variant 選択条件。
-- `strata_control/updater.py:631-647,1038-1063,1466-1489` — check の state 保存、通常更新の engine 選択と処理、component 単位の結果・終了 code。
+- `terminal/strata_cli/update_cmd.py:50` — `--backend` の parser 定義（`default=None`、検証なし）。
+- `terminal/strata_cli/update_cmd.py:283`–`:300` — 指定 family のハードウェア読み直し、variant、`backend_source="requested"`。
+- `terminal/strata_cli/update_cmd.py:316` — 指定時と検出時の分岐。
+- `terminal/strata_control/engine_component.py:490`–`:502` — 名前の正規化と別名、`hip-<variant>` の分解。
+- `terminal/strata_control/feed.py:739`、`:773`、`:796` — backend 一致、variant 絞り込み、variant を決められない場合。
+- `terminal/strata_control/updater.py:654`、`:1501` — メーカーガードが `requested` を通す箇所。
+- `terminal/strata_control/updater.py:1489`、`:1587`、`:1615` — パッケージ無しの継続、切り替え後の確認、旧エンジン保持。
+- 補助資料: 同一 revision の `python3 strata.py update --help`（`--backend BACKEND  choose an engine family instead of detecting this PC's GPU`）は parser 定義と一致。ユーザー向け `docs/` に `strata update --backend` の記載は無い（`docs/INTEL_ARC.md:25` は `strata launch --backend` の保存選択が `strata update` にも効くと述べるのみ）。

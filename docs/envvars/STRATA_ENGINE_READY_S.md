@@ -1,40 +1,48 @@
 # `STRATA_ENGINE_READY_S`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-`strata --serve` の Python サーバーが engine 子プロセスを起動した後、標準出力から `READY` 行を待つ秒数を指定します。既定は 900 秒です。engine のモデル読込などが長引いても、設定時間内に `READY` が届けば起動を継続します。これは server 側の待機上限であり、engine の読込処理自体の設定ではありません。
+Strata の Python サーバーがエンジン子プロセスから `READY` 行を受け取るまでの待ち時間を制限する。既定は 900 秒で、0 以下を指定すると待ち時間の上限をなくす。上限に達するとサーバーは子プロセスを kill し、起動失敗として扱う。エンジンの計算設定や READY 行の生成方法を変える変数ではない。参照はサーバーの `terminal/serve/server.py` にあり、エンジン側のソースにはこの名前の読み取り箇所がない（全参照検索結果はサーバーコードと記録資料）。`terminal/serve/server.py:827-840, 841-864, 867-879`
 
 ## 値と判定
 
-モジュール読み込み時に Python の `float()` で環境変数を変換します。未設定時は `900.0`、空文字または数値に変換できない文字列は `ValueError` を捕捉して `900.0` に戻ります。変換後の値が `0` 以下なら timeout を `None` にし、時間制限なしで待ちます。正の数値はその秒数を使います。整数・小数・指数表記など `float()` が受理する書式が対象で、整数への丸めや上限 clamp はありません。`NaN` や無限大のような非有限値には明示的な検査がありません。
+`terminal/serve/server_parts/base.py` の `_timeout_env` が `os.environ.get(name, default)` を `float` に変換する。`ValueError` の場合は既定値に戻し、変換値が `<= 0` なら `None`（上限なし）にする。文字列全体を浮動小数点数として変換するため、`1anything` や `true` は無効で既定値に戻る。Python の `float` が受け付ける前後空白は許容される。空文字は `ValueError` となる。有限値かどうかの追加検査はない。`base.py:260-265`; `server.py:456`
 
-| 環境変数値 | server の timeout |
-|---|---:|
+| 環境変数の値 | サーバー側の結果 |
+|---|---|
 | 未設定 | 900 秒 |
-| 空文字・不正な数値 | 900 秒へ fallback |
-| `0`、負数 | 無期限（READY を待つ） |
-| 正の数値（例: `30`, `0.5`） | 指定秒数 |
+| 空文字、`true`、`0anything` など数値変換できない文字列 | 900 秒に fallback |
+| `1`、`900`、` 1 ` | それぞれ指定秒数の上限 |
+| `0`、`-1` | `None` となり無期限待ち |
+| `nan`、`inf` | `float` 変換と `<= 0` 判定を通過する。有限値検査はないため、これらの期限値での実行時挙動はコードから安全に特定できない |
+
+起動時に `engine_ready_s` がサーバー設定 JSON に存在し、値が `None` でなければ、設定値が環境変数から得た値を置き換える。この設定値は bool 以外の int/float で、0 より大きい場合だけ受理される。0、負数、文字列、bool は設定エラーとなり、`[strata] config ...` を付けてサーバーを終了する。設定値には有限性チェックもない。`server.py:3456-3465, 8935-8939`
 
 ## 有効になる条件
 
-この値は `serve/server.py` が import される実行経路で評価され、engine を起動して `READY` を待つ際に使われます。CLI の独立した timeout 引数による上書きはありません。サーバー設定 JSON の `engine_ready_s` が数値として存在すると環境変数由来の値を上書きします。ただし設定値は bool ではない int/float かつ `> 0` でなければならず、違反時は設定エラーで起動を止めます。したがって config の `engine_ready_s: 0` は環境変数と異なり無期限指定にならず無効です。
-
-適用先は server が管理する engine 子プロセスの起動待ちです。OS や GPU backend 別の分岐はこの判定にはありません。
+- `terminal/serve/server.py` の Strata 実エンジン起動経路で使われる。`--engine strata` は `--config` を必要とし、初期化後に `apply_ready_timeout(cfg)` を呼ぶ。`server.py:8641-8644, 8870-8873, 8935-8961`
+- `--engine mock` には Strata エンジンの READY 待ちがなく、この変数による制御はない。Strata エンジンの起動ロジックは `StrataEngine` で行われる。`server.py:827-840`
+- 設定 JSON に `engine_ready_s` があれば、正の数値である限りその値が環境変数より優先される。専用の CLI timeout 引数は見当たらない。`server.py:3456-3465, 8641-8644`
+- OS、CUDA/HIP/SYCL backend、GPU 世代、モデル状態による別の値判定はない。どの設定でも READY 行を受信した時点で待機を終える。`server.py:841-864`
 
 ## 実行時の詳細
 
-`serve/server.py` のモジュール初期化で `_timeout_env("STRATA_ENGINE_READY_S", 900.0)` が一度呼ばれます。値を module global `ENGINE_READY_S` に保持するため、server 起動後の `os.environ` 変更は反映されません。server 設定に `engine_ready_s` がある場合、engine 起動前に `apply_ready_timeout()` が global を更新します（この関数は同一プロセス内の後続起動にも影響します）。
+環境変数は `server.py` のモジュール読み込み時に一度 `ENGINE_READY_S` として評価される。サーバー起動時には設定の `engine_ready_s` を適用し、その後のエンジン開始ごとに `time.monotonic()` から deadline を計算する。READY 待ちでは別スレッドが標準出力行をキューへ渡し、期限が来る前に `READY` で始まる行を受信すると `max_context` と対応能力を設定して成功する。`server_parts/base.py:260-265`; `server.py:456, 839-864, 8935-8939`
 
-engine 起動後、別スレッドが標準出力行を queue に渡し、起動処理は `ENGINE_READY_S` から deadline を作って `READY` を待ちます。タイムアウトすると engine を kill し、`EngineDied` に `the engine did not report READY within N s` を含めます。engine が先に終了した場合は `the engine exited before it was ready` の失敗経路です。通常の要求経路ではこの失敗を通じてロード待ちの要求を 503 にします。timeout 後に自動再試行する分岐はなく、再試行分岐は timeout ではない一時的な起動失敗に限られます。
+期限は起動ごとに計算されるが、環境変数自体を起動ごと・リクエストごとに再読込する処理はない。プロセス起動後に環境を書き換えても反映されない。設定値もサーバー起動時に適用され、そのサーバープロセスが後で再起動するエンジンに同じ値を使う。`server.py:841-849, 8935-8961`
+
+## ログと測定値
+
+timeout すると `timed_out` となり、まだ READY を報告していない子プロセスに `kill()` を試みる。失敗理由は `the engine did not report READY within {秒} s` で、`EngineDied` として起動時の失敗経路へ渡される。timeout でない早期終了は別理由 `the engine exited before it was ready` となる。timeout 時は終了コード由来の `start_exit_note` を付けないが、ログがあれば `start_log_tail` の内容を失敗理由に連結する。`server.py:841-849, 865-879, 923-933`
+
+この環境変数について、条件付き性能測定値は該当しない。索引に関連する bench 記録は設定値 `0` を記録しているだけで、挙動や性能の根拠にはしていない。
 
 ## 根拠
 
-- `serve/server.py:307-320`: READY 行待ち timeout の説明と `_timeout_env()` の変換、fallback、0 以下を無期限にする判定。
-- `serve/server.py:362-364`: import 時の環境変数読み取りと既定値 900 秒。
-- `serve/server.py:1085-1110`: engine 起動後の deadline 設定、READY 待ちと受信処理。
-- `serve/server.py:1111-1153`: timeout 時の kill、失敗理由、engine 終了時のエラー経路。
-- `serve/server.py:3211-3220,9252-9256`: config の `engine_ready_s` による上書き、型・正数チェック、設定エラー。
-- `serve/server.py:1145-1147`: READY 起動失敗を `EngineDied` として扱う説明。
-- `docs/DEEPSEEK41.md:94`: 大きなモデル向けに config の `engine_ready_s` を 3600 秒にする記載。環境変数自体の性能測定値は確認できません。
+- `terminal/serve/server_parts/base.py:260-265` — 環境値の取得、float 変換、無効文字列の fallback、0 以下を無期限にする処理。
+- `terminal/serve/server.py:433-456` — READY timeout 群の説明と既定値 900 秒。
+- `terminal/serve/server.py:827-864` — エンジン子プロセス起動、期限作成、READY 行待ち。
+- `terminal/serve/server.py:865-933` — timeout 時の kill、再試行条件、失敗理由と `EngineDied`。
+- `terminal/serve/server.py:3456-3465, 8935-8939` — JSON 設定による上書きと値検証。

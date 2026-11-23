@@ -1,74 +1,69 @@
 # `--replica-profile`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（POSIX: `./setup.sh`、Windows: `START-HERE.bat`） |
+| コマンド | `setup.py`（source setup、トップレベル） |
 | オプション | `--replica-profile` |
 | 別名 | なし |
-| 値 | 値を取らない真偽フラグ。省略時 `False` |
+| 値 | 値を取らないフラグ。指定すると `True`。既定値は `False`。 |
 
 ## 役割
 
-複数 GPU のセットアップで、対応する Qwen3.8 モデルと十分な RAM がある場合に、GPU ごとに独立 engine を置く serving profile を opt-in します。通常の一つの layer split の代わりに複数 replica を設定し、RAM 上の expert arena を共有できる環境では共有を有効にします。これは setup の選択を行うフラグで、単独でサーバーを直接起動するオプションではありません（`setup.py:9195-9203, 10338-10360`; `strata_control/replica_profile.py:1-20, 101-130`）。
+複数 GPU で新しいモデル設定を作るとき、対応する Qwen3.8-Flash-Next の量子化モデルなら、1つの layer-split engine の代わりに GPU ごとの独立 engine（replicas）を使う設定を opt-in で提案・保存する。適用時は RAM から起動可能な engine 数を選び、共有 expert arena、いくつかの実行環境変数、VRAM 予約量、条件に応じた `parallel` 数も設定する。フラグの宣言は `terminal/setup.py:11372-11376`、複数 GPU の設定構築と適用呼び出しは `terminal/strata_control/setup_config.py:476-500` にある。
 
 ## 使い方
 
-Linux で2枚の GPU を指定して再セットアップし、セットアップ後の自動起動を避ける例です。Windows では `START-HERE.bat --setup --replica-profile --gpus 0,1 --no-start` として同じ parser に渡せます。
+`terminal/` ディレクトリで実行する例。モデルの選択など、他の setup 入力は通常どおり行う。
 
 ```sh
-./setup.sh --setup --replica-profile --gpus 0,1 --no-start
+# GPU 0 と 1 で setup し、対応モデルなら replica profile を使う
+python setup.py --gpus 0,1 --replica-profile
 ```
 
-`--gpus` は対象 GPU の選択、`--no-start` はセットアップ後のモデル起動を省く指定です。profile が適用された場合、生成された run config を次回以降も使います。
+`--gpus` は複数カードを選ぶ引数で、`--replica-profile` は追加値を取りません（`terminal/setup.py:11271-11280`、`11372-11376`）。
 
 ## 値と既定値
 
-- 引数値・alias はありません。`argparse` の `store_true` で、未指定は `False`、指定すると `True` です（`setup.py:9199-9203`）。
-- フラグ自体に数値・文字列の validation はありません。適用可否は後段の条件で判定されます。
-- 既定状態では opt-in されません。setup は `STRATA_REPLICA_PROFILE` 環境変数でも profile 判定を試みます（`setup.py:10349-10357`; `strata_control/replica_profile.py:43-49`）。この環境変数は CLI 引数ではありません。
+- `argparse` の `store_true`、`default=False`。引数値の型変換や CLI 値の範囲 validation はない（`terminal/setup.py:11372-11376`）。
+- このフラグを付けると設定生成時に `cfg["replica_profile"] = True` が設定される。フラグを付けないことだけで、既存 config 内の明示的な `false` を新たに書き込むわけではない（`terminal/strata_control/setup_config.py:487-495`）。
+- `STRATA_REPLICA_PROFILE` 環境変数でも適用を要求できる。プロファイル関数は値を trim し小文字化して `1` / `on` / `yes` / `true` を有効値とする。それ以外の値は無効（`terminal/strata_control/setup_config.py:487-495`、`terminal/strata_control/replica_profile.py:40-49`）。
 
 ## 実行時の動作
 
-setup は複数 GPU の選択がある場合に限り、`--replicas` が未指定で、`--layer-split` が未指定または `auto`、かつこのフラグまたは `STRATA_REPLICA_PROFILE` が有効なとき profile helper を呼びます。明示フラグがあれば `cfg["replica_profile"] = True` も記録します（`setup.py:10338-10357`）。
+`setup_config.config_for` は、選択 GPU が複数枚で、`--replicas` が未指定、`--layer-split` が未指定または `auto`、かつ CLI フラグまたは `STRATA_REPLICA_PROFILE` がある場合に profile を試す（`terminal/strata_control/setup_config.py:476-500`）。profile 側はさらに、設定内の replicas や `--peer-device` がなく、明示的 layer-split がなく、GPU が2枚以上で、モデル名または引数から Qwen3.8 と `iq3_s` / `iq3_xxs` / `q2_0` を識別でき、選択した各 GPU が24 GB以上であることを確認する（`terminal/strata_control/replica_profile.py:52-60`、`77-99`）。
 
-この root parser は macOS の通常 setup では使われません。`setup.py` は parser 作成前に `metal/setup_mac.py` へ委譲し、そちらは未知の引数を `not used on a Mac` と警告して続行します。従って Apple Silicon の Metal setup でこのフラグは適用されません（`setup.py:9068-9070`; `metal/setup_mac.py:356-358`）。
+条件を満たすと、RAM の見積りから engine 数 `k` を算出する。共有 arena が可能な platform では `RAM - 12 GB headroom - 量子化別 arena` を 8 GB 単位で数え、そうでない場合は各 engine の arena コピーも含めて算出し、2枚以上かつ選択カード数以下に制限する。選ばれた GPU それぞれを1 engine とする `replicas`、選択 GPU リスト、共有可能な場合の `replica_shared_arena: true` を config に加える（`terminal/strata_control/replica_profile.py:30-36`、`63-75`、`102-118`）。RAM 条件により一部の選択 GPU が使われないことがある（`terminal/strata_control/replica_profile.py:109-133`）。
 
-profile helper は次の条件を全て満たす場合に適用します（`strata_control/replica_profile.py:76-98`）。
+profile は `STRATA_QSA_SLOTS`、`STRATA_BATCH_SELF_COMMIT`、`STRATA_SLOT_COPY_DIRECT`、`STRATA_CKPT_POOL`、`STRATA_CKPT_POOL_READY`、`STRATA_SLOT_CKPT_MOVE`、`STRATA_SLOT_COPY_BATCHSYNC` を config の `env` に既定値として設定する。プロセス環境に同名変数があれば追加せず、config 側に値があれば `setdefault` により保持する。また `--vram-reserve-mib` が args にない場合は `2500` を追加する（`terminal/strata_control/replica_profile.py:37-39`、`116-127`）。
 
-- 2枚以上の GPU が選択されている。
-- config が既に replica、`deepseek41`、`--peer-device` を指定していない。
-- 自動 layer split を使い、engine 引数に `--layer-split` がない。
-- model 名または engine 引数から Qwen3.8-Flash-Next と識別でき、quant が `IQ3_S`、`IQ3_XXS`、`Q2_0` のいずれか。
-- 各 GPU の VRAM が24 GB以上。
-- RAM 見積りで少なくとも2 engine 分を確保できる。
-
-quant ごとの expert arena 見積りは IQ3_S 50.3 GB、IQ3_XXS 42.9 GB、Q2_0 34.0 GB、engine ごとの追加 RAM は8 GB、OS・server・file cache 用 headroom は12 GBです。Linux / Windows では arena を一度だけ共有する計算を使い、他 OS では replica ごとに expert copy を持つ計算を使います。作成数は RAM と GPU 数の小さい方で、選択 GPU の先頭から使います（`strata_control/replica_profile.py:30-38, 62-73, 87-97, 107-127`）。
-
-適用時は `cfg["replicas"]` を GPU ごとに1枚ずつの group に設定し、Linux / Windows では `replica_shared_arena: true` を追加します。profile 用の `STRATA_*` engine 環境変数は、同名変数を現在のプロセス環境が設定していなければ既存 config 値を保ちつつ default として加えます（`strata_control/replica_profile.py:36-38, 111-121`）。
-
-`--parallel` を明示した場合は profile 自体は適用されますが、自動値を設定しません。未指定かつ既存 config に `parallel` がなく、engine 引数に `--batch` / `--slots` がない場合は、2 replica なら8、その他は4を設定します（`setup.py:9192-9198, 10355-10357`; `strata_control/replica_profile.py:128-130`）。profile が適用されない場合、通常の4-card AMD profile を試す後続経路が残ります（`setup.py:10361-10370`）。
+`--parallel` が指定されず、config に `parallel` がなく、args に `--batch` / `--slots` がない場合、2 engines なら各 engine の `parallel` を8、それ以外は4にする。明示した `--parallel` または既存の parallel/slots 設定をこの既定値で置き換えない（`terminal/strata_control/setup_config.py:493-495`、`terminal/strata_control/replica_profile.py:134-136`）。`--replicas` または手動の layer split がある場合は profile 呼び出し条件から外れ、ユーザー指定を優先する（`terminal/strata_control/setup_config.py:487-488`）。
 
 ## 適用条件と副作用
 
-- 明示的な `--replicas` または `--layer-split` の選択が優先され、この profile を適用しません。module 側でも既存の replica、peer device、別 model family、手動 layer split を拒否します（`setup.py:10349-10357`; `strata_control/replica_profile.py:80-89`）。
-- RAM が2 engine 分に足りない、対応外の quant / model、1 GPU、24 GB 未満の GPU がある場合は適用されず、理由を表示して layer split を維持します。RAM 不足時の必要量は共有可能 OS で `12 + arena + 2*8 GB`、共有できない OS で `12 + 2*(arena + 8) GB` の見積りです（`strata_control/replica_profile.py:85-98`）。
-- RAM に応じて選択 GPU が一部除外されることがあります。適用時は複数 engine 用の config、shared arena 指定、profile の engine 環境設定が作られ、config の書き込み後は通常の setup 経路で server を起動します（`strata_control/replica_profile.py:107-130`; `setup.py:10453-10454, 10483-10490`）。
-- helper 内で予期しない例外が起きても setup は中止せず、`(the replica profile was not applied: ...)` と表示して継続します（`setup.py:10351-10362`）。helper 自体は渡されたカード情報・RAM・config の変換だけを行い、直接 I/O はしません（`strata_control/replica_profile.py:22, 101-130`）。
+- 対応モデル・GPU VRAM・RAM が条件に合わない場合は profile を適用せず、理由を setup の案内行として返す。2 engine 分の RAM がない場合も layer split のままとする（`terminal/strata_control/replica_profile.py:77-99`）。
+- profile の適用中に例外が起きても setup 全体を失敗させず、`(the replica profile was not applied: ...)` を案内して続行する（`terminal/strata_control/setup_config.py:489-500`）。
+- 成功時の設定は run config に保存される。setup は同じモデルの既存 config を更新し、変更がある場合は `.bak` を作ってから書き込む（`terminal/setup.py:12300-12306`、`7631-7663`）。
+- これは setup 時の設定生成に作用するオプション。対象モデル以外や単一 GPU では profile の判定条件を満たさず適用されない。
 
 ## 出力とエラー
 
-helper が適用されると、engine 数・throughput の説明と共有 arena の説明を setup の通常メッセージとして出します。RAM により GPU が除外された場合は台数と RAM も表示します。profile 不適用の判定理由は通常メッセージとして表示し、helper の例外は括弧付きの案内として表示します。いずれもこの profile 判定単独では parser error や非0終了にせず、setup の後続処理へ進みます（`setup.py:10358-10362`; `strata_control/replica_profile.py:122-127`）。
+profile の判定理由または成功時の説明行は `setup_config.config_for` が `ok` / `say` を使って表示する。profile 内の例外は捕捉され案内文になります。parser 自体にこのオプション専用の validation error 経路はありません（`terminal/strata_control/setup_config.py:493-500`、`terminal/strata_control/replica_profile.py:104-136`）。
+
+## 関連オプション
+
+- [`--replicas`](--replicas.md)
+- [`--parallel`](--parallel.md)
+- [`--layer-split`](--layer-split.md)
 
 ## 根拠
 
-- `setup.py:9192-9203` — root parser の `--parallel`、`--replicas`、`--replica-profile` 定義。
-- `setup.py:10338-10370` — 複数 GPU 条件、helper 呼び出し、config 更新、例外処理と後続 profile。
-- `setup.py:10453-10454, 10483-10490` — config / 起動 script の書き込みと setup 後の起動経路。
-- `setup.py:9068-9070`; `metal/setup_mac.py:356-358` — Apple Silicon の委譲先 parser と未知引数の扱い。
-- `strata_control/replica_profile.py:30-49, 62-98, 101-130` — quant、RAM 計算、適用条件、config 変換と通知内容。
-- `setup.sh:6-13, 76`; `START-HERE.bat:8-10, 44-55` — POSIX / Windows wrapper が引数を `setup.py` に渡すこと。
-
-この文書は指定 revision のソースを調査したものです。CLI `--help` は実行していません。異なる OS / backend での実動作や Release 配布物は確認していません。
+- `terminal/setup.py:11372-11376` — parser 登録、フラグ形式、既定値。
+- `terminal/setup.py:11271-11280` — GPU 選択引数の形式と layer-split の指定範囲。
+- `terminal/strata_control/setup_config.py:476-500` — 複数 GPU 条件、profile 呼び出し、`--replicas` / layer-split との適用条件、例外時の継続。
+- `terminal/strata_control/replica_profile.py:30-49` — 見積り定数、環境変数の有効値、opt-in 判定。
+- `terminal/strata_control/replica_profile.py:52-99` — 対象モデル・GPU・RAM の条件と engine 数算出。
+- `terminal/strata_control/replica_profile.py:102-136` — config 変更、env 設定、VRAM 予約、parallel の既定値。
+- `terminal/setup.py:12300-12306`、`7631-7663` — 設定生成後の run config 保存と既存設定の backup。

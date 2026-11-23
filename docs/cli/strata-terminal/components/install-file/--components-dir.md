@@ -1,6 +1,6 @@
 # `--components-dir`
 
-調査対象: Strata commit `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,53 +8,57 @@
 | コマンド | `strata components install-file` |
 | オプション | `--components-dir` |
 | 別名 | なし |
-| 値 | コンポーネント保存先ディレクトリのパス（文字列） |
+| 値 | ディレクトリパスを表す文字列 |
 
 ## 役割
 
-エンジン package のインストール先となる Strata コンポーネントのルートディレクトリを指定します。指定しない場合は、`STRATA_COMPONENTS_DIR` またはプラットフォーム別のユーザー領域が使われます。
+エンジン package の導入先となる Strata components root を指定します。インストール済み engine だけでなく、更新状態や staging など updater が使うデータもこの root に置かれます。省略した場合は通常のユーザー別 root（または `STRATA_COMPONENTS_DIR`）を使います。オフラインで取得済みの package を別の components root に導入したい場合に使います。
 
 ## 使い方
 
 ```sh
-strata components install-file ./strata-engine.tar.gz --components-dir /srv/strata/components
+# カレントディレクトリ配下の Strata データ領域へ、取得済み package を導入する
+strata components install-file ./engine-package.tar.gz --components-dir ./strata-components
 ```
 
-`install-file` は位置引数 `file` でローカル package を受け取ります。`--components-dir` はそのファイルの場所ではなく、インストール先のルートを指定します。
+`file` は必須位置引数です。`--components-dir` は `install-file` の共通オプションで、位置引数の前後どちらにも置けます（parser 定義: `terminal/strata_cli/update_cmd.py:92-94`）。
 
 ## 値と既定値
 
-parser は値を文字列として受け取り、`default=None` です。パスの存在・絶対パス性・書き込み権限を parser 段階では検証しません。相対パスも parser では拒否されず、後続の `Path` 操作でプロセスの作業ディレクトリを基準に扱われます。明示値が空文字列の場合も `if a.components_dir` の判定を通らないため、未指定と同じ既定ルートになります。
+値は parser では単なる文字列として受け取り、専用の形式・存在確認・書き込み可否検証は行いません（`terminal/strata_cli/update_cmd.py:47-56`）。`run()` は値が空でなければ `Path(a.components_dir)` を root にし、空文字または未指定なら既定 root を選びます（`terminal/strata_cli/update_cmd.py:314`）。相対パスは絶対化されず `Path` として利用されるため、呼び出し時の作業ディレクトリからの相対パスです。
 
-明示値を省略すると `engine_component.components_dir()` が使われます。環境変数 `STRATA_COMPONENTS_DIR` が空でない場合はその値が優先されます。そうでなければ Windows は `%LOCALAPPDATA%\Strata\components`（`LOCALAPPDATA` がなければホーム以下）、その他の OS は `$XDG_DATA_HOME/strata/components`（未設定なら `~/.local/share/strata/components`）です。
+未指定時、`STRATA_COMPONENTS_DIR` があればその値を使用します。なければ Windows は `%LOCALAPPDATA%/Strata/components`（`LOCALAPPDATA` がなければユーザー home 配下）、その他の OS は `$XDG_DATA_HOME/strata/components`（未設定なら `~/.local/share/strata/components`）です。ソース checkout に同梱 engine store があり、ユーザー別 root に engine が見つからない場合には checkout 側 store が選ばれる分岐もあります（`terminal/strata_cli/update_cmd.py:252-280`; `terminal/strata_control/engine_component.py:179-190`）。
+
+明示した `--components-dir` は `run()` が直接 root として使うため、環境変数や通常の既定値より優先します（`terminal/strata_cli/update_cmd.py:314`）。
 
 ## 実行時の動作
 
-`run()` は明示値を `Path` に変換して updater context の `components` に設定し、その context を `install_engine_file()` に渡します。この値の下に `.updates` の状態・排他 lock・一時 staging を置き、成功時は `engine/<version-platform-backend>/` 以下へ package を配置します。従って既存の別のコンポーネント領域を指定すると、そちらのエンジンや update state が対象になります。
+`install-file` の処理は `ctx.components` に選択した root を設定し、その root に対する updater lock を取得します。空き容量を確認した後、package を `<root>/.s/<識別子>/engine/` に展開し、manifest の署名と全ファイルの hash を検証し、この PC に適合する engine か確認します。その後 test-start に成功した場合に限って root 配下の `engine/` へ移し、状態を記録して次回起動から使う engine を切り替えます。古い engine はこの処理では削除しません（`terminal/strata_cli/update_cmd.py:314,341-350`; `terminal/strata_control/updater.py:1638-1695,1538-1627`）。
 
-インストール処理は package ファイルを展開し、署名と manifest 記載の全ファイルを検査し、この PC に適合するか確認してから test-start と切り替えを行います。前の engine は rollback 用に保持されます。入力 package 自体は削除されません。`--components-dir` は install-file 分岐で保存先 root として使われ、feed の選択には使われません。
+このコマンド経路は feed を読まず、package archive をネットワークから取得しません。入力ファイルは呼び出し元が指定した場所に残します。検証用 staging と `.updates/` 配下の lock・state などは指定 root に作成されます（`terminal/strata_control/updater.py:1638-1649,1695`; `terminal/strata_control/updater.py:196-214,227-232`）。
 
-同じ parser に共通 option として `--wait`、`--force`、`--model-config`、`--feed`、`--backend`、`--output` も登録されます。このコマンドでは `--feed` は install-file 分岐で参照されません。`--force` は既存 engine より古い package を拒否する比較を通過させます。`--backend` は hardware 判定値を上書きし、package 適合性判定に影響します。`--wait` は engine 使用中に待つ時間に関係し、`--model-config` は test-start に使う run config です。さらに CLI 共通処理が `--json` と `--quiet` をこの one-shot parser に追加します。
+`--backend` を併用すると、その backend を基にした hardware 情報で package の適合性を判定します。`--force` は、既に導入済みの engine より archive の version が古い場合の「何もしない」判定を通過させます（`terminal/strata_cli/update_cmd.py:314-320`; `terminal/strata_control/updater.py:1675-1695`）。engine が稼働中の場合は `--wait SECONDS` の値が待機動作に関係します。対話端末では未指定時に待つか確認し、機械出力または非対話時には待機せず busy として拒否されます（`terminal/strata_cli/update_cmd.py:500-515`; `terminal/strata_cli/update_cmd.py:341-345`）。
 
 ## 適用条件と副作用
 
-保存先には `.updates/update.lock` を作成して同じコンポーネント領域への同時更新を防ぎます。領域が存在しなければ必要なディレクトリを作成します。インストールに失敗した場合も途中 staging は通常削除されます。package は展開・検証・test-start されるため、この操作は読み取り専用ではありません。
-
-この option のパス検証は明示実装されていません。ディレクトリを作成できない、容量が足りない、lock を取れない場合などはインストールが失敗します。package は `.tar.gz`、`.tgz`、`.tar.xz`、`.zip` の拡張子を認識しますが、parser の位置引数ヘルプは `.tar.gz` または `.zip` とだけ説明しています。
+- root が存在しなければ、空き容量確認時に親を含めて作成します。書き込み権限がない、または容量不足の場合は導入できません（`terminal/strata_control/updater.py:550-569`）。
+- 同じ root で別 updater が実行中なら lock 取得に失敗し、終了コード `7` の更新拒否になります（`terminal/strata_control/updater.py:196-214`）。
+- 稼働中 engine があり処理を継続できない場合も busy として終了コード `7` になります。既存の Strata launch が GPU を使用中の場合、エラーは先に model を停止するよう案内します（`terminal/strata_cli/update_cmd.py:500-515`; `terminal/strata_control/updater.py:72-83`）。
+- archive の拡張子が `.tar.gz`、`.tgz`、`.tar.xz`、`.zip` のいずれでもない場合、ファイルでない場合、読み取り・展開に失敗する場合、署名やファイル hash が不正な場合、または PC に適合しない場合は拒否されます。拒否・test-start 失敗時には staging は削除され、通常、稼働中の engine は切り替わりません（`terminal/strata_control/updater.py:1630-1635,1642-1673,1695-1698,1538-1627`）。
+- 実行開始時、クラッシュ等で残った `<root>/.s/` staging と旧形式の `<root>/.updates/staging/` は掃除対象です。導入成功時は engine の切り替え・状態更新が行われ、以前の engine は保持されます（`terminal/strata_control/updater.py:792-802,1600-1627`）。
 
 ## 出力とエラー
 
-成功時は既定の human 出力で進捗・結果を stdout に表示します。`--output json` / `--json` では結果を JSON で出力し、`--output jsonl` はイベント出力モードですが、install-file の最終結果自体は JSON を出力します。失敗は既定で `strata: ...` を stderr に出し、機械可読出力時は JSON の error object を stdout に出します。
+成功時、通常出力では導入結果の note または engine 状態を表示し、`--output json` / `jsonl` では成功結果を JSON として標準出力に出します（`terminal/strata_cli/update_cmd.py:345-350`）。確認した `UpdateError` は、通常出力では `strata: ...` を標準エラーに出し、機械出力では error object を標準出力へ出して、そのエラーの終了コードを返します（`terminal/strata_cli/update_cmd.py:303-312,374-380`）。
 
-ソースで確認できる代表的な失敗は、指定ファイルがない・非対応形式・読めない package・署名またはファイル整合性エラー・この PC に適合しない package で終了コード 5、同じ領域の updater lock 競合で 7、test-start が失敗して旧 engine が維持される場合に 6 です。古い package は `--force` なしでは「現在の engine の方が新しい」として変更せず成功扱いになります。
+実装で明示されている例では、ファイル不在・形式不正・package の安全性または適合性拒否は終了コード `5`、空き容量不足や install 後の engine 解決失敗は `6`、稼働中 engine または同一 root の lock 競合は `7` です（`terminal/strata_control/updater.py:1635,1643-1645,1671-1682,1690-1691`; `terminal/strata_control/updater.py:565-566,1595-1599,208-214`; `terminal/strata_cli/update_cmd.py:307-312,374-380`）。
 
 ## 根拠
 
-- parser と共通 option: `strata_cli/update_cmd.py:30-39, 57-62`
-- `--json` / `--quiet` の追加: `strata_cli/cli.py:508-516`
-- option の値を root にする処理と install-file の呼び出し・出力: `strata_cli/update_cmd.py:174-217`
-- option 未指定時の環境変数・OS 別既定パス: `strata_control/engine_component.py:176-190`
-- `.updates` lock の作成と競合時の終了コード: `strata_control/updater.py:135-168`
-- package 展開、検査、適合性判定、古い版の扱い、install finish: `strata_control/updater.py:1080-1148`
-- test-start 後の切り替え、旧版保持、失敗時の復帰: `strata_control/updater.py:994-1077`
-- コマンド dispatch: `strata_cli/cli.py:2135-2137`
+- `terminal/strata_cli/update_cmd.py:47-56` — 共通 parser の定義。値は文字列で、default は `None`。
+- `terminal/strata_cli/update_cmd.py:92-94` — `install-file` に位置引数 `file` と共通 options を登録。
+- `terminal/strata_cli/update_cmd.py:303-320,341-350` — 選択 root から context を作り、install-file 処理と出力へ進む。
+- `terminal/strata_cli/update_cmd.py:252-280`; `terminal/strata_control/engine_component.py:179-190` — 未指定時の root 選択とユーザー別既定パス。
+- `terminal/strata_control/updater.py:1630-1698,1538-1627` — archive 形式、検証、staging、install・switch・cleanup。
+- `terminal/strata_control/updater.py:196-232,550-569` — root 単位の lock、状態ファイル、root 作成と容量判定。
+- 配置と scope は索引 `docs/cli/README.md:177-188` の `strata components install-file` 節と一致します。

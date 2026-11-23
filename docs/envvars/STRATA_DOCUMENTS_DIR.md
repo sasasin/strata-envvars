@@ -1,52 +1,51 @@
 # `STRATA_DOCUMENTS_DIR`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。外部ライブラリの環境変数動作は対象外です。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata が使う Documents フォルダーを指定します。Strata 内で二つの用途があります。
-
-- デスクトップアプリの Node ホストでは、新しいモデルライブラリの既定先を `<Documents>/Strata/Models` に決めます。
-- Terminal の Python 側では、既存データを探すときに `<Documents>/Strata` を候補に加えます。ただし、その下にモデル等のデータが見つかった場合だけ採用します。
-
-同じ値でも、Node ホストは単一の既定場所として扱い、Python は他の Documents 候補と合わせた探索候補として扱います。読み取り箇所は `apps/host/server/model-directory-default.mjs:8-19` と `strata_control/discovery.py:64-87` です。
+この変数は Strata が Documents フォルダーとして扱う場所を指定します。デスクトップ host では新規モデルフォルダーの既定値と、Linux のチャット用 workspace の既定場所の基準になります。Terminal では既存データを探す `Documents/Strata` 候補を追加します。どちらも値をパスとして扱いますが、相対パスや空文字の処理、候補が採用される条件は異なります。[`app/host/server/model-directory-default.mjs:14-25,34-42`](../../../../Niko1221/Strata/app/host/server/model-directory-default.mjs)、[`terminal/strata_control/discovery.py:65-88,263-295`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py)
 
 ## 値と判定
 
-| 読み取り箇所 | 未設定・空文字 | 空でない値 | 不正・相対値 |
-|---|---|---|---|
-| Node ホスト | Windows は Windows の既知 Documents フォルダーを取得し、失敗時はホームの `Documents`。Linux は `XDG_DOCUMENTS_DIR`、なければ `user-dirs.dirs` を試し、最終的にホームの `Documents`。その他の OS（macOS を含む）はホームの `Documents`。 | `STRATA_MODELS_DIR` が truthy ならそちらが先に使われる。そうでなければこの値を Documents として使い、`Strata/Models` を足す。 | 絶対パスでなければ OS 別 Documents 値を使わず、ホームの `Documents` に戻る。文字列の trim、`~` 展開、環境変数展開はしない。 |
-| Python の discovery | この候補を追加しない。OS 別の他の候補は引き続き追加する。 | `Path(value)` を Documents 候補リストの先頭に追加する。 | trim、絶対パス確認、`~` や `$HOME` 展開はしない。相対値も相対 `Path` 候補として保持する。 |
+| 読み取り経路 | 未設定・空文字 | 設定値の扱いと例 |
+|---|---|---|
+| デスクトップ host の `documentsFolder()` | `undefined` と `""` は未指定扱い。Windows は Windows の既知 Documents フォルダーを試し、Linux は XDG の設定を試す。最終 fallback は `<home>/Documents`。 | 値を trim・展開・正規化せずに受け取る。絶対パスならそのまま使う（例 `/mnt/docs`）。相対パス（例 `docs`）や空白だけの値は絶対パスでないため `<home>/Documents` に fallback。Linux の XDG Documents 値や設定ファイルの値は別途 `$HOME` 展開と絶対パス検査を行うが、この変数には行わない。 |
+| Terminal の `documents_dirs()` | `None` と `""` は候補に追加されない。 | truthy な値を `Path(explicit)` として最初の候補に追加する。trim、`expanduser()`、絶対パス検査、正規化はしない（例 `~/docs` は文字どおり `~/docs/Strata` 候補）。ただし候補フォルダーにモデル等がなければ採用されない。 |
 
-Node 側で「空」は falsy 判定です。空白だけの値は空扱いではなく非空ですが、相対パスなので後でホームの `Documents` にフォールバックします。絶対パスでも、存在確認は既定値を作る関数内では行いません。後段で作成・アクセス確認します。
+デスクトップ host は Windows / Linux / macOS で後続 fallback が異なります。Terminal は Windows で `USERPROFILE`（空なら home）の `Documents` と設定済み OneDrive 各種の `Documents` も候補にし、非 Windows では `XDG_DOCUMENTS_DIR` と `<home>/Documents` も候補にします。重複候補は除去されます。[`app/host/server/model-directory-default.mjs:15-25`](../../../../Niko1221/Strata/app/host/server/model-directory-default.mjs)、[`terminal/strata_control/discovery.py:67-88`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py)
 
-Linux の Node 側では `STRATA_DOCUMENTS_DIR` が空の場合に限り、`XDG_DOCUMENTS_DIR`、次に `$XDG_CONFIG_HOME` または `~/.config` 内の `user-dirs.dirs` にある `XDG_DOCUMENTS_DIR="..."` を参照します。読み取った値は `$HOME` / `${HOME}` を置換し、残りの `$` がなく絶対パスなら採用します。Windows の既知フォルダー取得に失敗した例外は無視して通常の既定値へ進みます（`apps/host/server/model-directory-default.mjs:8-19`）。
-
-Python 側の Documents 候補は重複を除いて保持します。Windows では `USERPROFILE/Documents` と設定されている OneDrive の各 `Documents` も候補に加わります。その他の OS では `XDG_DOCUMENTS_DIR` とホームの `Documents` が続きます（`strata_control/discovery.py:64-87`）。
+この変数自体の数値変換、大小文字比較、許容値域はありません。ホストは絶対パスだけを使い、Terminal は候補を作った後に `Documents/Strata` 内の `Models` / `models` / `packs` のいずれかに中身があるかを調べます。[`terminal/strata_control/discovery.py:288-297`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py)
 
 ## 有効になる条件
 
-- **デスクトップアプリ / Node ホスト:** `defaultModelDirectory()` が `store.mjs` の読み込み時に一度呼ばれます。保存済みの `state.modelsDir` があればそれが優先されます。保存値がなくても、`STRATA_MODELS_DIR` が未設定または空でなく、既存の `STRATA_HOME/models` 以下に重みファイルがある場合は既存ライブラリを維持します。どちらにも当たらない新規ライブラリで、この変数由来の既定場所が使われます（`apps/host/server/store.mjs:60-87`）。
-- **Terminal / Python discovery:** `data_dir_choices()` がこの変数を候補にしますが、`STRATA_SETTINGS_FILE` が truthy のアプリ内モードでは Documents 候補群そのものを探索しません。アプリ内モード判定は同変数の値の設定有無ではなく、`STRATA_SETTINGS_FILE` の truthy 判定です（`strata_control/discovery.py:59-61,262-274`）。
-- Python の候補が既定データ先に採用されるのは、その `Documents/Strata` 下に `Models`、`models`、`packs` のいずれかがあり、さらにそのサブフォルダーが空でない場合です。自分の設定ファイルの `data_dir` があれば先に使われ、アプリの data folder が存在する場合も Documents より先です。どの候補も合わなければ呼び出し元の既定先になります（`strata_control/discovery.py:262-296`）。
-- ホスト側の `STRATA_MODELS_DIR` はより直接的なモデルフォルダー指定です。Node helper は truthy な値を `path.resolve()` したパスにし、ホストのモデル既定値として扱います。保存済みフォルダーはさらに優先されます（`apps/host/server/model-directory-default.mjs:9-11`, `apps/host/server/store.mjs:60-87`）。
-- Python の通常の `strata launch` では `--data-dir` が実際の起動先を指定できます。`STRATA_DOCUMENTS_DIR` は主に既存データの自動発見用で、`data_dir()` は設定済みデータ場所やアプリの場所を先に選びます（`strata_cli/launch/catalog.py:546-553`, `strata_cli/launch/cmd.py:90-92`, `strata_control/discovery.py:277-289`）。
+- **デスクトップ host のモデルフォルダー**: 本変数の Documents 値に `Strata/Models` を足した場所が既定です。`STRATA_MODELS_DIR` が truthy なら、その `path.resolve()` 値がこの既定場所を置き換えます。ただし保存済み `state.modelsDir` はどちらの環境変数由来の場所よりも優先されます。[`app/host/server/model-directory-default.mjs:7-25`](../../../../Niko1221/Strata/app/host/server/model-directory-default.mjs)、[`app/host/server/store.mjs:69-85`](../../../../Niko1221/Strata/app/host/server/store.mjs)
+- 保存済み `state.modelsDir` がある場合はそれが優先されます。保存先がなくても、`STRATA_MODELS_DIR` が未指定で `STRATA_HOME/models` 配下に既存 GGUF 重みがあれば既存フォルダーを維持します。それ以外で Documents 由来の既定フォルダーを作成・検査します。[`app/host/server/store.mjs:52-63,69-89`](../../../../Niko1221/Strata/app/host/server/store.mjs)
+- Documents 由来の既定フォルダーを作成または読み書き実行可能にできない場合、モデル用の fallback は `STRATA_HOME/models` です。この失敗で host 起動を止めません。[`app/host/server/store.mjs:69-88`](../../../../Niko1221/Strata/app/host/server/store.mjs)
+- **デスクトップ host の workspace**: `STRATA_WORKSPACE` が truthy ならその `resolve()` 値が優先されます。未指定の場合、Linux では本変数が workspace 基準にも使われ、`Strata/Workspace` を作成します。ただし既存 workspace が `<home>/Documents/Strata/Workspace` にあり、指定先にはまだ workspace がない場合は旧場所を保ちます。Windows と macOS では `workspaceBases()` が `<home>/Documents` を使うため、本変数は workspace 場所に影響しません。作成に失敗すると次の候補を試し、全候補で失敗した場合は home を使います。[`app/host/server/index.mjs:111-123`](../../../../Niko1221/Strata/app/host/server/index.mjs)、[`app/host/server/model-directory-default.mjs:34-42`](../../../../Niko1221/Strata/app/host/server/model-directory-default.mjs)
+- **Terminal のモデルデータ候補**: `STRATA_SETTINGS_FILE` が設定された app mode では Documents 候補自体を加えません。通常の Terminal では自分の設定とデスクトップ app の設定が Documents 候補より先です。両設定の場所が異なるときは更新時刻が新しい側を優先し、古い側の設定ファイルを同期します（ただし app 側の場所が存在しない場合は Terminal 側を維持）。[`terminal/strata_control/discovery.py:60-62,242-275`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py)
+- Terminal は `Documents/Strata` の `Models` / `models` / `packs` のいずれかに中身がある候補だけを採用します。該当しなければ `Catalog` の install 隣接既定値に進みます。個別モデルの run config や起動設定の `--data-dir` がある場合は、各呼び出し側がモデル実体または明示 data dir を優先します。[`terminal/strata_control/discovery.py:278-297`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py)、[`terminal/strata_cli/launch/catalog.py:753-774`](../../../../Niko1221/Strata/terminal/strata_cli/launch/catalog.py)、[`terminal/strata_cli/launch/runner.py:1445-1465,1590-1597,1828-1840`](../../../../Niko1221/Strata/terminal/strata_cli/launch/runner.py)
 
 ## 実行時の詳細
 
-Node ホストではモジュール初期化時に既定値が計算され、その結果から `MODELS_DIR` を選びます。選ばれたフォルダーはホスト起動ログの `models dir   ·  ...` に出ます。Documents 由来の既定先を作成またはアクセス確認できなければ `STRATA_HOME/models` に切り替わり、stderr に `[strata] Strata could not use ... for models (...), so models go to .... You can pick another folder in Settings.` の警告を出します（`apps/host/server/store.mjs:60-87`, `apps/host/server/index.mjs:280-286`）。この初期化後にプロセスの環境を変更しても、`DEFAULT_MODELS_DIRECTORY` と初期の `MODELS_DIR` は再評価されません。Settings API からモデルフォルダーを変えた場合は、検証して状態ファイルへ保存した後、プロセス内の `MODELS_DIR` を更新します（`apps/host/server/store.mjs:131-139`, `apps/host/server/index.mjs:1425-1440`）。
+デスクトップ host の `store.mjs` はモジュール初期化中に `DEFAULT_MODELS_DIRECTORY` を一度計算し、同じ初期化で state を読み `MODELS_DIR` を選びます。`index.mjs` も起動時に `WORKSPACE` を決めます。そのためプロセス起動後に環境変数を変えても、これらの値は再評価されません。モデル保存先を後から変更する経路は環境変数ではなく Settings の `changeModelsDirectory()` で、state に保存してから `MODELS_DIR` を更新します。[`app/host/server/store.mjs:52-63,85-89,133-141`](../../../../Niko1221/Strata/app/host/server/store.mjs)、[`app/host/server/index.mjs:114-124`](../../../../Niko1221/Strata/app/host/server/index.mjs)
 
-Python の `documents_dirs()` は呼ばれた時点の `os.environ`（または明示的に渡された mapping）を読みます。永続キャッシュはありません。`data_dir()` は設定場所・アプリの場所の後に Documents 候補を順に見て、`Documents/Strata` に既存モデルデータがある最初の場所を返します。Terminal の共通カタログからこの関数が呼ばれ、起動時のデータフォルダー選択などに使われます。`strata models move` では `--from` がなければ同じ探索結果を移動元候補にします（`strata_cli/launch/catalog.py:546-553`, `strata_cli/cli.py:617-626`）。候補フォルダーが存在しない、空、または読めない場合はモデルデータ候補として採用せず、後続候補または呼び出し元の既定先に進みます（`strata_control/discovery.py:277-296`）。
+Terminal の `documents_dirs()` は呼ばれるたびに渡された `environ`（省略時は `os.environ`）を参照し、結果を cache しません。`Catalog.data_dir_choice()` から `discovery.data_dir()` が呼ばれ、設定済みデータ場所、既存 app data、モデル等を含む Documents 候補、最後に install 隣接 default の順で選びます。通常 Terminal では設定同期のためファイル書き込みが起きる場合がありますが、Documents 候補の発見そのものは読み取りです。app mode は同期と Documents 候補を使いません。[`terminal/strata_control/discovery.py:65-88,242-290`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py)、[`terminal/strata_cli/launch/catalog.py:753-760`](../../../../Niko1221/Strata/terminal/strata_cli/launch/catalog.py)
 
-ホストの supervisor は子プロセスの環境を作る際に `process.env` 全体を含めます。そのため、設定されていれば名前自体は継承されますが、今回確認した engine 起動経路には `STRATA_DOCUMENTS_DIR` を読み取る Strata の実装は見つかりませんでした。ホストで選ばれたモデルディレクトリー自体は別途処理に渡されます（`apps/host/server/supervisor.mjs:243-244`）。
+## ログと測定値
+
+デスクトップ host が既定モデルフォルダーを作成・検査できない場合、stderr に `[strata] ` を先頭につけ、次の文面を `console.warn` で出します（`${preferred}` と `${legacy}` は選択されたパス、`${error.code ?? error.message}` はエラー値です）。
+
+```text
+Strata could not use ${preferred} for models (${error}), so models go to ${legacy}. You can pick another folder in Settings.
+```
+
+この警告はモデル保存先選択の失敗時に限られます。Terminal の Documents 候補が採用されない場合に、この変数専用の警告・終了・例外を出すコードは確認できません。測定値はありません。[`app/host/server/store.mjs:77-89`](../../../../Niko1221/Strata/app/host/server/store.mjs)、[`terminal/strata_control/discovery.py:278-297`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py)
 
 ## 根拠
 
-- Node の直接参照と OS 別フォールバック: `apps/host/server/model-directory-default.mjs:7-19`
-- 保存先・既存ライブラリ・書き込み失敗時 fallback と警告: `apps/host/server/store.mjs:60-87`
-- 起動時に表示するモデル場所: `apps/host/server/index.mjs:280-286`
-- 実行中に Settings から変更する処理: `apps/host/server/index.mjs:1425-1440`, `apps/host/server/store.mjs:112-139`
-- Python の直接参照と OS 別 Documents 候補: `strata_control/discovery.py:59-87`
-- Documents 候補の適用条件と既定先への fallback: `strata_control/discovery.py:262-296`
-- Terminal の共通カタログからの利用: `strata_cli/launch/catalog.py:546-553`
-- `000_envvers.md` には候補名として掲載されています（該当行 708）。上記二つの本番ソース読み取りを確認しました。調査では build・GPU 実行・性能測定・テストを行っていません。
+- `app/host/server/model-directory-default.mjs:7-25,34-42` — デスクトップ host のモデル Documents パスと workspace 候補。
+- `app/host/server/store.mjs:52-63,69-89,133-141` — state 読み込み、既定モデル場所の優先順位、失敗時 fallback と警告、保存先変更。
+- `app/host/server/index.mjs:111-124` — workspace の起動時決定と `STRATA_WORKSPACE` 優先。
+- `terminal/strata_control/discovery.py:60-88,242-297` — Terminal の app mode、Documents 候補、設定同期、候補採用条件。
+- `terminal/strata_cli/launch/catalog.py:753-774`、`terminal/strata_cli/launch/runner.py:1445-1465,1590-1597,1828-1840` — Terminal からの呼び出し、保存済みモデル場所・`--data-dir` の優先。

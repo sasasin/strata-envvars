@@ -1,43 +1,40 @@
 # `STRATA_KEEP_EMPTY_TURNS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（2026-11-23 時点）。
 
 ## 役割
 
-Python サーバーがチャットテンプレート用のメッセージ列を描画する際、本文が空の assistant メッセージをプロンプトに残すかを指定します。未指定または `1` 以外では、空の assistant 履歴メッセージを取り除きます。`STRATA_KEEP_EMPTY_TURNS=1` なら、取り除かずに従来どおり描画します。
+`terminal/serve/frontend.py` の `ChatTemplate.render()` が、モデルへ渡すメッセージ履歴から空の assistant メッセージを取り除くかを切り替える。`STRATA_KEEP_EMPTY_TURNS` が文字列 `"1"` のとき、この除去を行わず、従来どおりそれらもテンプレートへ渡す。値はモデルの出力や選択を直接指定するものではなく、テンプレートへ渡す履歴を変える（`terminal/serve/frontend.py:71-87`）。
 
 ## 値と判定
 
-値は `os.environ.get(...) == "1"` で比較されます。数値変換や空白除去、大文字小文字変換はありません。
+Python の `os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1"` で毎回文字列全体を比較する。数値変換、空白除去、大文字小文字変換はしない。未設定 (`None`)、空文字、`"0"`、`"true"`、`"01"`、`"1anything"` など `"1"` 以外はすべて除去側の動作になる。`"1"` のみ除去を抑止する（`terminal/serve/frontend.py:75-78`）。
 
-| 環境変数の値 | 空の assistant 履歴メッセージ |
-|---|---|
-| 未設定 | 除去 |
-| 空文字 | 除去 |
-| 文字列がちょうど `1` | 保持 |
-| その他すべて（例: `0`, `true`, `01`, `1 `） | 除去 |
+| 条件 | unset | 有効になる値 | 無効になる値 |
+| --- | --- | --- | --- |
+| `ChatTemplate.render()` | 空の assistant 履歴を除去 | `1` | 空文字、`0`、`true`、`01`、`1anything` など `1` 以外 |
 
-ただしメッセージ列の最後の要素は、値に関係なく保持されます。CLI 引数、設定ファイル、別の環境変数による上書きはこの処理にはありません。
+ここで「空」と判定されるのは、メッセージが辞書で role が `assistant`、テキスト部分を連結した内容の `.strip()` が空、画像を含まず、`tool_calls` が truthy でない場合。テキスト部分は文字列ならそのまま、リストなら `type` が `text`、`input_text` または未指定の辞書要素の `text` を連結する。画像の有無は `image_url`、`input_image`、`image` の各 type を調べる（`terminal/serve/frontend.py:168-175`, `235-236`）。メッセージ列の最後の要素は、空であっても常に残る。`"1"` はそれ以外の位置にある対象メッセージも残す（`terminal/serve/frontend.py:75-78`）。
 
 ## 有効になる条件
 
-この変数を読むのは `serve/frontend.py` の `ChatTemplate.render()` です。したがって Python サーバーがこのテンプレート描画処理を通るときに有効です。エンジンの CUDA/HIP/SYCL backend やモデル世代に依存する分岐はありません。サーバーの mock engine でも同じ描画コードを使います。
-
-除去対象は、最後の要素ではなく、辞書で `role` が `assistant` で、`content` のテキスト部分を連結して前後の空白を除くと空であり、画像部分も `tool_calls` もないメッセージです。テキストが空でも画像または tool call があれば残ります。空でない assistant メッセージや他の role のメッセージも、この条件では除去されません。
+- Strata の Python サーバーが `ChatTemplate` を用いてプロンプトを描画する経路で参照される。サーバーはテンプレートを `ChatTemplate` として構築し（`terminal/serve/server.py:8974-8979`）、`Service.render_prompt()` から `self.template.render()` を呼び出す（`terminal/serve/server.py:5173-5190`）。
+- CUDA/HIP/SYCL、OS、モデル種類、build macro、CLI 引数、別の環境変数による追加条件や優先順位は、この判定にはない。該当する empty assistant メッセージが履歴になければ、値によるメッセージ除去の差は生じない（`terminal/serve/frontend.py:75-87`）。
+- `"1"` 以外の場合でも、最後のメッセージ、空でないテキストを持つ assistant メッセージ、画像を含む assistant メッセージ、truthy な `tool_calls` を持つ assistant メッセージは、この条件では除去されない（`terminal/serve/frontend.py:75-78`）。
 
 ## 実行時の詳細
 
-`ChatTemplate.render()` はテンプレートへ渡す直前にメッセージ列をフィルターします。サーバーの `Service.encode_prompt()` はテンプレート描画を呼び、その後 tokenizer で prompt を token 化します。通常の生成要求に加え、トークン数を数える経路も `encode_prompt()` を呼ぶため、この変数によるフィルターの対象です。
+`ChatTemplate.render()` が呼ばれるたびに `os.environ.get()` を評価し、該当する途中の空 assistant メッセージを除いた新しいリストをテンプレートに渡す。読み取った値を保持するキャッシュはないため、プロセス実行中に環境値が変更されれば次の描画呼び出しから判定に反映される（`terminal/serve/frontend.py:71-87`）。サーバーでは描画結果が `encode_prompt()` に渡され、トークン化される（`terminal/serve/server.py:5196-5209`）。
 
-環境変数は `ChatTemplate` の初期化時には保存されず、各 `render()` 呼び出しで `os.environ.get()` により読み直されます。プロセス内で環境値を変更すれば、後続の描画に反映されます。プロンプトや token 化結果は保持するメッセージが変わることで変わり得ます。
+他の環境変数・CLI 引数・設定ファイルとの上書き関係は実装されていない。`ChatTemplate` の能力検出も `render()` を呼ぶが、その空 assistant の probe メッセージには `tool_calls` があるため、本変数の除去条件には該当しない（`terminal/serve/frontend.py:89-115`）。
 
-この変数の判定に伴う専用ログ、警告、終了・失敗経路はありません。描画後の通常のテンプレート処理はそのまま行われます。
+## ログと測定値
+
+この分岐に伴うログ、警告、終了・失敗経路は実装されていない。プロンプト履歴の内容が変わり得るが、この環境変数についての性能測定値は確認できない。
 
 ## 根拠
 
-- `serve/frontend.py:57-66` — `ChatTemplate.render()` のフィルター、完全一致判定、テンプレートへの引き渡し。
-- `serve/frontend.py:121-127,181-182` — 空判定に使うテキスト抽出と画像判定。
-- `serve/server.py:5098-5114,5116-5130` — サーバーでのテンプレート描画と token 化。
-- `serve/server.py:8093-8100` — Anthropic トークン数カウントから `encode_prompt()` を呼ぶ経路。
-- `docs/TROUBLESHOOTING.md:248-250` — 空の assistant 履歴が会話履歴から消える場合と、サーバー環境で `=1` を指定する案内。内容は実装と一致します。
-- `docs/DETAILS.md:1044` — 本変数をトラブルシューティング文書へ案内する記載。
+- `terminal/serve/frontend.py:71-87` — 値の読み取り、履歴フィルター、テンプレート描画。
+- `terminal/serve/frontend.py:89-115` — 起動時の能力検出と描画 probe。
+- `terminal/serve/frontend.py:168-175`, `235-236` — テキスト・画像の判定。
+- `terminal/serve/server.py:5173-5209`, `8974-8979` — サーバーの描画・トークン化経路と `ChatTemplate` の構築。

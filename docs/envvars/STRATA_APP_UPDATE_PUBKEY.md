@@ -1,43 +1,44 @@
 # `STRATA_APP_UPDATE_PUBKEY`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査範囲はこの commit の Strata 所有ソースです。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Terminal のアプリ更新経路が、ダウンロードした Desktop アプリのインストーラー署名を検証するときに使う minisign 公開鍵です。通常のフィード署名・engine component 署名用の鍵とは別です。変数は `strata update --app`（または `strata components update --app`）でアプリ更新処理が実行される場合にだけ参照されます。
+Terminal のアプリ更新で、ダウンロードした Desktop アプリのインストーラー署名を検証する minisign 公開鍵を上書きする。変数を設定しただけでは更新は実行されず、通常の `strata update` は対象外である。`strata update --app` または `strata components update --app` がアプリ更新ステップを実行するときに使われる（`terminal/strata_cli/update_cmd.py:59-79, 367-368`、`terminal/strata_control/updater.py:1996-2007, 2087-2100`）。
 
 ## 値と判定
 
-| 環境値 | `app_public_key()` の結果 |
-|---|---|
-| 未設定 | `strata_control/update_keys.json` の `app_minisign_public` を読む |
-| 空文字 | Python の偽値判定により、未設定と同じく同梱キーへ fallback |
-| 空でない文字列 | 内容の検証をせず、その文字列を同梱キーより優先して返す |
+`app_public_key()` は `ctx.environ.get("STRATA_APP_UPDATE_PUBKEY")` の戻り値を文字列比較や数値変換なしで判定する。Python の truthiness により、未設定と空文字 `""` は同じく明示値なしとなり、同梱 `update_keys.json` の `app_minisign_public` に fallback する。空白だけの文字列を含む非空値は明示鍵としてそのまま返され、同梱鍵へ fallback しない（`terminal/strata_control/updater.py:1967-1977`）。
 
-数値変換、大小文字判定、長さ制限、CLI による鍵指定はありません。空白だけの値も空文字ではないため優先され、後段の公開鍵 parser で失敗します。公開鍵 parser は外側の空白を除き、minisign 公開鍵ファイル形式またはその base64 形式を受け付けます。不正な形式、鍵 ID の不一致、署名不一致などは検証エラーになります（`strata_control/signing.py:277-291,294-324`）。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| Terminal のアプリ更新 | 同梱 `update_keys.json` の `app_minisign_public` が非空文字列ならそれを使用。ファイル読み込み／JSON 構文解析に失敗、または JSON object 内の値が非文字列／空文字なら鍵なし | minisign の公開鍵テキスト（`.pub` の base64 表現またはファイルテキスト）が有効な形式。選択時点では形式検査しないため、`"true"`、`"0"` など任意の非空文字列も明示値として選ばれる | 空文字は明示値として採用されず unset と同じ fallback。空白だけを含む文字列は truthy なので明示値に採用されるが、署名検証時に公開鍵として拒否される |
+
+アプリ更新の実処理では鍵が得られなければダウンロード前に `UpdateError`（終了コード 5）になる。非空だが不正な鍵は選択時には拒否されず、インストーラーをダウンロードした後に `minisign_verify()` で検査される。公開鍵の base64・鍵行・Ed25519 形式・署名との鍵 ID 照合・署名本体の検証に失敗すると `SignatureError` となり、ダウンロード済みファイルを削除して終了コード 5 の更新失敗として返す（`terminal/strata_control/updater.py:2004-2019`、`terminal/strata_control/signing.py:277-324`）。同梱ファイルが有効な JSON でも object ではない場合、この関数は `.get()` の例外を捕捉しないため、鍵なし扱いにはならず通常の `UpdateError` 経路も通らない（`terminal/strata_control/updater.py:1972-1977`）。
 
 ## 有効になる条件
 
-- CLI の `--app` が指定され、更新処理の app step が有効である必要があります。`--no-engine` や `--no-control` は app step を止めません（`strata_cli/update_cmd.py:49-63,245`; `strata_control/updater.py:1466-1478`）。
-- フィードにアプリがあり、この PC 向けの配布物があり、状態が `available` またはインストール済み app version が不明である場合に鍵を取得して検証へ進みます。インストール済み版が提示版以上なら app step は `current` となり、鍵は参照されません（`strata_control/updater.py:1402-1415,1422-1428`）。
-- 通常の CLI では `Context.environ` は作成時点の `os.environ` のコピーです（`strata_control/updater.py:321-341`）。その環境辞書を `app_public_key` に渡します。値は app step の実行時に読み、関数内やプロセス共通の static cache はありません。
-- `--app-version` / `STRATA_APP_VERSION` はアプリ更新の要否判定に影響し、更新対象になればこの鍵の読み取りに到達します（`strata_cli/update_cmd.py:53-54,204-206`; `strata_control/updater.py:1402-1415`）。公開鍵そのものの優先順位には関与しません。
-- 直接参照検索では、この名前の実装読み取りは `strata_control/updater.py` の一箇所です。Desktop 側の Tauri updater 設定には別途コンパイル時の `pubkey` が記述されていますが、この環境変数を読む参照は見つかりません（`apps/desktop/src-tauri/tauri.conf.json:65-70`）。ここでは Terminal 側が行う処理のみを記載します。
+- `--app` を指定してアプリ更新ステップを要求する必要がある。両 CLI 形式とも既定では `--app` は false（`terminal/strata_cli/update_cmd.py:59-79`、`terminal/strata_cli/update_cmd.py:367-368`）。
+- フィードにアプリ項目があり、現在のプラットフォーム用のエントリーが必要。さらに `update_app()` は判定状態が `available` または `unknown-installed` のときだけ鍵を取得する。`--check` はフィード上の状態を表示するだけで、この変数を使ったインストーラー検証を行わない（`terminal/strata_control/updater.py:1980-1993, 1996-2007`、`terminal/strata_cli/update_cmd.py:357-368`）。
+- インストーラー検証に必要な鍵はこの変数が優先される。空または未設定時は同梱鍵に fallback する。フィード／コンポーネント用の `STRATA_UPDATE_TRUSTED_KEYS` は別の鍵経路であり、このアプリ鍵を置き換えない（`terminal/strata_control/updater.py:1967-1977`、`terminal/strata_control/signing.py:8-15, 275-299`）。
+- 既知のインストール済みアプリ版がフィード版以上なら状態は `current` となり、アプリ更新ステップは鍵を読まずに終了する。版が不明なら `unknown-installed` として鍵検証付きダウンロードの対象になり得る。比較に使う版は `--app-version` が truthy ならその値、そうでなければ `STRATA_APP_VERSION`（さらに無ければ不明）であり、この変数とは独立している（`terminal/strata_cli/update_cmd.py:63-64, 319-321`、`terminal/strata_control/updater.py:1989-2007`）。
 
 ## 実行時の詳細
 
-`app_public_key(ctx.environ)` は同梱鍵を `utf-8-sig` で読み、JSON の `app_minisign_public` が空でない文字列なら fallback 値として返します。ファイル読み込みまたは JSON decode が `OSError` / `ValueError` で失敗した場合や、値が空・文字列でない場合は `None` です（`strata_control/updater.py:1389-1399`）。明示値は同梱鍵に対する追加鍵ではなく置き換えです。
+CLI は `Context` を作る時点で `dict(os.environ)` を `environ` に保存する。アプリ更新時に `app_public_key(ctx.environ)` が呼ばれるため、値はその更新処理で読む環境スナップショットに基づく。プロセス起動後に OS 環境を変更しても、この `Context` の値は更新されない。関数内 static cache はなく、同一 `Context` 上で関数を再度呼べばその時点の `ctx.environ` を再参照する（`terminal/strata_control/updater.py:406-425, 1967-1977, 2004-2007`、`terminal/strata_cli/update_cmd.py:314-321`）。
 
-更新対象なのに鍵が得られないと、ダウンロード前に exit code 5 の `UpdateError` となり、メッセージは `this build has no app update key (update_keys.json app_minisign_public); the app installer cannot be verified, so it was not downloaded` です。鍵が得られた場合、Terminal はフィードに記載された配布物を取得し、その署名を鍵で検証します。署名検証エラーなら一時アーカイブを削除し、`the app installer failed its signature check: ...; it was deleted` として app の結果を `failed`、終了コードを 5 にします。成功時はファイルを `.updates/app` に移し、`downloaded` と検証済みパスを返します。Terminal はインストーラーを起動せず、実行は利用者に委ねます（`strata_control/updater.py:1418-1449`）。
+鍵選択後、Terminal はフィードの該当プラットフォーム用 URL からインストーラーを取得し、SHA-256 はフィード値で確認したうえで、選択した minisign 公開鍵で署名を検証する。成功時はインストーラーを `<components>/.updates/app` に保存し、結果を `downloaded` として報告する。これは Terminal が検証済みインストーラーを取得する経路であり、Desktop アプリ自身の Tauri updater の実行設定をこの変数で変更する処理ではない（`terminal/strata_control/updater.py:1996-2027`、`terminal/strata_control/signing.py:294-329`）。
 
-`run_update` は app step の `UpdateError` を結果に記録して処理を続け、失敗時は最終 `exit_code` に反映します（`strata_control/updater.py:1478-1489`）。通常表示では `NOT downloaded: ...`、JSON/JSONL では失敗結果と `ok: false` が観測できます（`strata_cli/update_cmd.py:145-149,247-256`）。不正な明示鍵は「鍵なし」fallback にはならず、minisign parser / verifier のエラー経路に入ります。
+## ログと測定値
+
+鍵が無い場合のエラー文は `this build has no app update key (update_keys.json app_minisign_public); the app installer cannot be verified, so it was not downloaded`。署名検証失敗時は `the app installer failed its signature check: ...; it was deleted` となる。これらは `run_update()` が app コンポーネントの結果 `status: failed`、エラー文、`exit_code: 5` として記録する。人間向け表示では `App     NOT downloaded: ...`、JSON/JSONL では失敗結果として出力される。測定値は該当しない（`terminal/strata_control/updater.py:2006-2019, 2087-2117`、`terminal/strata_cli/update_cmd.py:175-210, 369-373`）。
 
 ## 根拠
 
-- 直接読み取り、空値判定、同梱 fallback: `strata_control/updater.py:1389-1399`
-- CLI と app step の有効化: `strata_cli/update_cmd.py:49-63,183-206,229-256`; `strata_control/updater.py:1466-1489`
-- app の更新判定、公開鍵利用、検証、失敗時削除、保存: `strata_control/updater.py:1402-1449`
-- minisign 公開鍵の形式判定と署名検証: `strata_control/signing.py:277-291,294-330`
-- 同梱 app 鍵: `strata_control/update_keys.json:10`
-- Desktop の Tauri 設定鍵: `apps/desktop/src-tauri/tauri.conf.json:65-70`
-- 概要資料も Terminal が `strata update --app` 時に同じ署名を確認すると説明しています: `docs/SAFETY.md:117-119`
+- `terminal/strata_control/updater.py:1967-1977` — 環境値と同梱鍵の選択、fallback。
+- `terminal/strata_control/updater.py:1980-1993` — フィード項目、プラットフォーム、版による更新状態。
+- `terminal/strata_control/updater.py:1996-2027` — 鍵の利用、ダウンロード、署名検証、保存。
+- `terminal/strata_control/updater.py:2087-2117` — app ステップの opt-in と失敗結果。
+- `terminal/strata_cli/update_cmd.py:59-79, 314-321, 357-373` — CLI オプション、環境スナップショット、app-version の優先、`--check` と更新処理。
+- `terminal/strata_cli/update_cmd.py:175-210` — 人間向けのアプリ結果表示。
+- `terminal/strata_control/signing.py:275-329` — minisign 公開鍵と署名の形式・検証。

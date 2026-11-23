@@ -1,54 +1,50 @@
 # `STRATA_BATCH_CONCURRENT_READ`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-batch serving 中の prompt 読み取りを専用スレッドで進め、その間、既存 slot の batch window を実行します。これにより、新しい request の prompt 読み取りの間も、decode 中の slot が進みます。対象は Strata engine の batch prompt 経路です。候補名の直接参照は `src/program/generate.cpp` の読み取り 1 箇所のほか、説明コメントと `tools/par/recon3.py` の実験設定例にあります。後者は環境変数を設定する側であり、読み取り実装ではありません。
+`--batch` で処理中のスロットがあるとき、適用条件を満たす prompt の読み込みを専用スレッドで行い、その間もこのスレッドで batch window を進めます。無効時や条件を満たさない場合は通常の `run(q, r)` に戻ります。読み取り箇所は `engine/src/program/generate.cpp` の `conc1` 初期化で、実際の分岐は同ファイルの `run_conc` です（`20787-20805`）。
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換し、変換結果が 0 以外なら opt-in になります。文字列全体の検証やエラー報告はありません。
+最初に `run_conc` の初期化箇所へ到達したとき、`std::getenv` の結果を `std::atoi(v) != 0` で判定し、関数内 `static` の `conc1` に保存します（`engine/src/program/generate.cpp:20792-20795`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効（既定） |
-| 空文字 | `atoi("") == 0` のため無効 |
-| 数値として 0 になる文字列 | 無効。例: `0`, `0abc`, 数字より前に空白だけがある文字列 |
-| 数値として 0 以外になる文字列 | 有効。例: `1`, `-1`, `2`, `1abc`, ` 1` |
+| 条件 | unset | 有効になる値の例 | 無効になる値の例 |
+|---|---|---|---|
+| すべての実行条件 | `false` | `1`、`2`、`-1`、`1tail`（整数として読める先頭部分が非ゼロ） | 空文字、`0`、`0tail`、`true`、整数部分を読めない文字列 |
 
-したがって、真偽値の `true` や先頭文字だけが `1` かどうかでは判定されません。`atoi` が読み取れる先頭の整数部分を使い、整数部分の後の文字は判定を変えません。範囲外の数値文字列について、Strata は別途検査や fallback を実装していません。
-
-読み取り結果は `read_part` 内の `static const bool` に保存され、最初に初期化された後は同一プロセス内で再評価されません。起動後に環境を書き換えても反映されません。CLI による同名設定や、別環境変数による優先上書きはありません。
+`atoi` のため、文字列全体の厳密な数値検証・大文字小文字の判定・範囲制限はありません。先頭の空白と符号は整数変換に従い、変換された値がゼロなら無効、非ゼロなら有効です。表現可能範囲を超えた数値の結果は、このコードで定義・検査されていません。CLI 引数による値の上書きや、無効値時の別の既定値への fallback はありません。
 
 ## 有効になる条件
 
-変数が有効でも、次の条件を満たすときだけ専用スレッド経路を使います。
+環境変数の判定が有効であることに加えて、prompt 読み込み時に次をすべて満たす必要があります（`engine/src/program/generate.cpp:20796-20799`）。満たさない場合は同じ箇所から通常の `run(q, r)` に進みます。
 
-- `--batch` または同義の `--slots` に正の slot 数が指定されている。
-- `--no-prefill-borrow` が指定されている。
-- batch slot が実際に decode 中である（`batch_on()`）。
-- piped 経路ではなく、layer split ではない（`piped == false` かつ `stages.empty()`）。実装コメントはこの opt-in を one GPU の経路として説明している。コード上の直接条件は `stages.empty()` で、別個の `multi_gpu` 判定はありません。
-- request に画像が含まれず、elastic K/V（`kvg.on`）も使われていない。
-- batch prompt 分割 helper が正の piece size を返す。この設定の対象となる通常の単一 GPU batch 経路では prompt は chunk ごとに処理される。layer split では batch read helper が複数 chunk の piece を返す場合があるが、この変数の guard が layer split を除外する。
+- `--batch`（または同義の `--slots`）が正数であること。引数は `o.batch` に設定されます（`engine/src/program/generate.cpp:4036-4037`）。
+- batch slot が少なくとも一つ active であること。`batch_on()` は `BSlot::active` を走査します（`engine/src/program/generate.cpp:16696`, `16750`）。
+- `--no-prefill-borrow` が指定され、`o.no_prefill_borrow` が true であること（`engine/src/program/generate.cpp:4030`）。
+- `piped` が false で、`stages` が空であること。layer split の stage がある経路は対象外です。`piped` は batch groups と複数 stage の条件で決まります（`engine/src/program/generate.cpp:17423-17426`）。
+- その request に画像がなく（`req_imgs.empty()`）、elastic K/V が有効でない（`!kvg.on`）こと。
+- その prompt part の長さが `piece_now()` によって正の piece に分割されること。piece が正でなければ `run(a0, b0)` へ進みます（`engine/src/program/generate.cpp:21237-21242`）。
 
-条件のどれかが欠けると `run_conc` は通常の `run(q, r)` にそのまま渡します。環境変数自体を明示設定したが条件を満たさない場合に、この変数専用の警告やエラーを出すコードはありません。この設定の読み取りや guard に OS ごとの分岐、backend ごとの分岐、この設定専用の build macro 判定はありません。処理は `src/program/generate.cpp` の GPU engine の batch serving 実装にあります。
+実装コメントはこの機能を「one GPU」と説明しています（`engine/src/program/generate.cpp:20787`）。コード上の明示的な判定は `stages.empty()` であり、`multi_gpu` を直接検査する条件はこの分岐にはありません。OS や GPU 世代、特定の build macro による追加判定もこの箇所にはありません。
 
 ## 実行時の詳細
 
-専用スレッドで `run(q, r)` を呼び、main thread は読み取り完了まで、batch が続いていれば `batch_step()` を回します。読み取りスレッドはメイン session に prompt を読み、slot の window は各 slot の session を使います。`--no-prefill-borrow` が必要なのは、prompt が slot の expert cache を借りないためです。piece の終わりに slot 停止などの入力行を処理し、読了後に reader を `join()` します。
+`conc1` は初回到達時に一度だけ評価されるため、後から環境値を変更しても同じプロセス内では反映されません（`engine/src/program/generate.cpp:20792-20795`）。他の環境変数はこの分岐の有効条件に使われていません。CLI は環境変数の値を上書きしませんが、`--batch` と `--no-prefill-borrow` は機能を使うための別条件です（`engine/src/program/generate.cpp:4030`, `4036-4037`, `20797-20799`）。
 
-成功時、stderr に `strata batch: read N tokens on a thread of its own in X ms; the slots ran W windows meanwhile` が出ます。これはこの経路が使われた場合のログで、未設定時や条件不成立時には出ません。
+条件を満たすと `run_conc` は `in_prompt_read` と `conc_read` を立て、prefill の share を block してから reader thread を起動し、そのスレッドで `run(q, r)` を実行します。呼び出し側のスレッドは reader の完了まで `batch_on()` 中に `batch_step()` を進め、`BSTOP` 入力も処理します。reader を join した後、prompt の読み込み token 数・所要時間と、その間に進んだ window 数を stderr に出します（`engine/src/program/generate.cpp:20800-20846`）。この環境変数が変えるのは読み込みと slot window の進め方であり、CLI 引数や prompt token の内容はこの分岐では書き換えません。
 
-読み取りスレッド内で例外が起きると `read_ok=false` とし、例外文を `the prompt read failed: ...`（未知の例外なら `the prompt read failed`）に設定します。batch window が失敗した場合は `a batch window failed` で batch を fatal 扱いにします。いずれも通常の prompt read エラー処理へ戻り、stderr に `strata serve: <理由>`、stdout に `ERR <理由>` を出して engine の request 処理を失敗させます。CUDA fault が検出される場合は同じエラー経路から process を即時終了する処理があります。
+batch window が失敗すると `batch_fatal` を立て、`a batch window failed` をエラーとして返します。reader 内で例外が発生した場合は `the prompt read failed: <例外内容>`（または `the prompt read failed`）を記録します。失敗は呼び出し元で `strata serve: <エラー>` を stderr、`ERR <エラー>` を stdout に出し、通常は終了コード 1 で request 処理を終えます（`engine/src/program/generate.cpp:20806-20814`, `20847-20852`, `21487-21498`）。条件不成立時や変数が無効のときに、この機能専用の理由ログはありません。
+
+## ログと測定値
+
+有効経路を通った場合の stderr 行は `strata batch: read %lld tokens on a thread of its own in %.0f ms; the slots ran %lld windows meanwhile` です（`engine/src/program/generate.cpp:20844-20846`）。調査対象 commit のコードと関連文書 `docs/BATCHING.md:328-357` を照合しました。同文書は pipelined groups の別の読み込み方式を説明しており、この環境変数固有の測定値は確認できないため、性能値は記載しません。
 
 ## 根拠
 
-- `src/program/generate.cpp:15255-15263` — 変数の読み取り、`atoi` による判定、static cache。
-- `src/program/generate.cpp:15264-15317` — 適用条件、reader thread、slot window の並行実行、成功ログ、失敗時の値。
-- `src/program/generate.cpp:15701-15707` — prompt を piece に分けて `run_conc` に渡す呼び出し。
-- `src/program/generate.cpp:15912-15932,15954-15965` — prompt read の呼び出し元と失敗時の stderr/stdout、CUDA fault 時の終了。
-- `src/program/generate.cpp:3190-3197` — `--no-prefill-borrow` と `--batch` / `--slots` の CLI 設定。
-- `include/strata/program/batch_read.hpp:22-28` — batch/piped/layer split/slot 状態ごとの prompt piece size。
-- `docs/BATCHING.md:3-8` — `--batch` が複数 conversation を同時に decode する機能であること。
-- `tools/par/recon3.py:22-23,41-42` — 実験設定での環境変数の設定例。実行時の読み取り箇所ではない。
+- `engine/src/program/generate.cpp:20787-20852` — 値の読み取り、適用条件、reader thread と batch window の並行処理、結果ログ。
+- `engine/src/program/generate.cpp:16696`, `16750` — batch slot と active 判定。
+- `engine/src/program/generate.cpp:4030`, `4036-4037`, `17423-17426`, `21237-21242` — 関連 CLI 引数、piped 判定、piece 呼び出し。
+- `engine/src/program/generate.cpp:21487-21498` — prompt 読み込み失敗時のログと終了経路。
+- `docs/BATCHING.md:328-357` — 関連する batch 読み込み文書との照合。

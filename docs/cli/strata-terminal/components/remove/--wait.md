@@ -1,6 +1,6 @@
 # `strata components remove --wait`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,45 +8,45 @@
 | コマンド | `strata components remove` |
 | オプション | `--wait` |
 | 別名 | なし |
-| 値 | 秒数を表す浮動小数点数（`SECONDS`）。parser に範囲検証はない |
+| 値 | 秒数を表す浮動小数点数。parser に追加の範囲検証はない |
 
 ## 役割
 
-この option は `_common()` により `remove` parser にも登録されています。ただし現行実装では、remove の削除処理は `--wait` の値を参照せず、実行中の engine が止まるまで待つ動作も行いません。engine 使用中なら削除は拒否されます。
+このコマンドでは `--wait` は parser に登録され、ヘルプ文も「エンジンが serving 中なら停止まで待つ」と説明します。しかし `remove` の処理はこの値を待機処理へ渡さず、削除処理も参照しません。そのため、このコマンドで `--wait` を指定しても待機時間は変わりません。削除対象が現在使用中なら、待たずに拒否されます。
 
 ## 使い方
 
 ```sh
+# 構文例。実行すると指定したインストール済みエンジンを削除する。
 strata components remove 0.1.54 --wait 30
 ```
 
-`30` は parser で受理されますが、`remove` では効果がありません。待機が必要な場合は、engine を利用中のモデル／プログラムを停止してから再実行してください。
+`0.1.54` は構文例です。実際に実行する場合は `strata components engines` で対象を確認してください。`--wait` は削除の待機を有効にしません。
 
 ## 値と既定値
 
-`--wait` は `type=float`、既定値 `None`、値の metavar は `SECONDS` です。数値に変換できない値は argparse の引数エラーになります。明示した秒数に対する範囲や非負条件の検証は parser にありません。共通 parser から作られる `Context.wait` は `a.wait or 0.0` で初期化されますが、remove の処理ではその値を使いません。
+`--wait` は `type=float`、既定値 `None`、値の metavar は `SECONDS` です。CLI は値を `a.wait or 0.0` として共通の更新 context に格納します。`remove` 専用の正数・有限値などの範囲検証はありません。数値に変換できない値は argparse の引数エラーになります。
 
 ## 実行時の動作
 
-`strata_cli/update_cmd.py` の `_common()` が `--wait` を定義し、`remove` parser にも同じ共通 option 群を追加します（`strata_cli/update_cmd.py:47-56,88-91`）。実行時は `run()` が `Context.wait` に値を渡し、`components_command` が `remove` の場合に `_engines_command()` を呼びます（`strata_cli/update_cmd.py:244-256,272-273`）。
+`update_cmd._common()` が `--wait` を `remove` parser に登録します。実行時には `run()` が値を context に格納し、`_engines_command()` に分岐しますが、`remove` の分岐では `lib.delete_engine()` を直接呼びます。`rollback`、`use` などが呼ぶ `_maybe_wait()` は `remove` 分岐では呼ばれません。また `delete_engine()` 内にも `ctx.wait` や `wait_until_idle()` の参照はありません。したがって省略・指定のどちらでも待機動作はありません。共通 parser のヘルプ文はこの `remove` の実際の動作と一致しません。
 
-`_engines_command()` は `use` 分岐でのみ `_maybe_wait()` を呼び、その後の remove 分岐では直ちに `lib.delete_engine()` を実行します（`strata_cli/update_cmd.py:378-400`）。従って `--wait 0`、正の値、負の値のいずれも削除の待機時間・結果を変えません。`--json` / `--quiet` は one-shot parser 群に後付けされる出力 option であり、待機処理を追加しません（`strata_cli/cli.py:508-515`）。
+削除 helper はインストール済み一覧から対象を特定し、現在選択中のエンジン、または実行中プログラムが使用しているエンジンを拒否します。削除可能な場合は対象ディレクトリを `.deleting-<乱数>` に rename してから削除し、Qwen 系または shape 専用エンジンの state に必要な履歴等を保存します。モデルや設定ファイル自体は削除対象ではありません。
 
 ## 適用条件と副作用
 
-削除処理は component folder の update lock を取り、対象 engine が導入済みか、使用中または実行中プログラムが使っていないかを確認します（`strata_control/engine_library.py:301-309`）。使用中の engine、または実行中プログラムが使う engine は削除できず、終了コード 2 のエラーになります。`--wait` による自動待機や再試行はありません。
-
-削除できる場合、対象 folder を `.deleting-<識別子>` に rename してから削除し、Qwen engine では関連する previous / pinned 状態と履歴も更新します。モデルと設定、および別 family の engine は削除対象ではありません。ファイルが使用中などで rename に失敗すると終了コード 6 で失敗します。rename 後に個別ファイルの削除が失敗しても、その folder は残る場合があり、次回の削除処理で `.deleting-*` を掃除します（`strata_control/engine_library.py:310-334,341-348`）。
+`--wait` による適用条件や副作用はありません。削除成功時にはエンジンのファイルが削除されます。現在選択中のエンジンや稼働中プログラムが使うエンジンは削除できません。ディレクトリ rename が失敗した場合は削除を中断し、何も変更しなかった旨をエラーに含めます。ファイルが使用中で rename 後の削除に残った場合、`.deleting-*` は次回の削除時にも掃除されます。
 
 ## 出力とエラー
 
-成功時は通常出力で削除した engine の版と解放サイズを表示します。JSON 出力では成功結果を含む JSON を出します（`strata_cli/update_cmd.py:395-400`）。使用中／未導入など `UpdateError` は通常出力なら stderr に `strata: ...` と表示し、機械可読出力なら `ok: false` の JSON を stdout に出します。終了コードは例外に設定された値です（`strata_cli/update_cmd.py:237-242,307-311`; `strata_control/engine_library.py:305-316`）。
+成功時は通常出力に削除したエンジンの版と解放容量を表示し、`--output json` または `jsonl` では成功結果を JSON で出力します。対象が見つからない、対象を削除できない場合は `UpdateError`（終了コード 2）、rename 時の OS エラーは終了コード 6 になります。通常モードでは `strata: ...` を stderr に出し、JSON 系出力ではエラーコードとメッセージを含む JSON を出します。
 
 ## 根拠
 
-- parser 定義と remove の登録: `strata_cli/update_cmd.py:47-56,88-91`
-- 値の Context への格納とコマンド振り分け: `strata_cli/update_cmd.py:244-256,272-273`
-- remove が待機 helper を通らず削除へ進む箇所: `strata_cli/update_cmd.py:378-400`
-- 共通 `--json` / `--quiet` の追加: `strata_cli/cli.py:508-515`
-- 削除可否、rename と状態更新: `strata_control/engine_library.py:167-176,294-334`
-- 削除後の残留 directory 掃除: `strata_control/engine_library.py:341-348`
+- `terminal/strata_cli/update_cmd.py:47-56` — 共通 parser が `--wait` を浮動小数点数、既定値 `None` で登録し、serving 中の待機と説明。
+- `terminal/strata_cli/update_cmd.py:88-91` — `remove` parser に位置引数 `engine` と共通オプションを登録。
+- `terminal/strata_cli/update_cmd.py:314-321` — `a.wait or 0.0` を共通 context に格納。
+- `terminal/strata_cli/update_cmd.py:337-338,445-497` — `remove` を `_engines_command()` に渡し、削除分岐から直接 `delete_engine()` を呼ぶ。`_maybe_wait()` は `use` 分岐にのみ呼ばれる。
+- `terminal/strata_control/engine_library.py:139-149` — 現在使用中または実行中プログラムが使う対象を削除不可にする判定。
+- `terminal/strata_control/engine_library.py:317-366` — 対象確認、ディレクトリ rename と削除、state 履歴保存、失敗時の例外。
+- `terminal/strata_cli/update_cmd.py:307-312,374-378` — エラーの出力形式と終了コードの返却。

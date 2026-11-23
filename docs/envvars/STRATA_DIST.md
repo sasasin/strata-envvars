@@ -1,45 +1,49 @@
 # `STRATA_DIST`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata の Node App Host が、ビルド済み Web UI のファイルを探すディレクトリを指定します。`apps/host/server/index.mjs` が `process.env.STRATA_DIST` を読み、その値を絶対パス `DIST` にして HTTP の静的ファイル配信に使用します。API 専用の設定ではなく、`/api/` と `/v1/` 以外の要求の UI/静的ファイル応答に関係します。GPU backend やモデル状態による条件はありません。
+Node の App Host が配信するビルド済み Web UI のディレクトリを指定する。`app/host/server/index.mjs` はこの値から `DIST` を決め、`/api/` と `/v1/` 以外のリクエストを `staticFile` に渡す。通常はホスト自身の `dist/` を使い、変数または `--dist` で別の場所を指定できる。API や推論処理の設定ではない（`app/host/server/index.mjs:95-110,1023-1038`）。
+
+デスクトップアプリでは Tauri が `host/dist` のパスを `STRATA_DIST` として Node ホストの子プロセスに設定する。Windows/macOS の通常起動と Linux supervisor の起動は共通の `host_command` を通る。パッケージのセルフテストでも同じパスを設定する（`app/desktop/src-tauri/src/main.rs:503-526,554-560`、`app/desktop/src-tauri/src/main.rs:797-807`、`app/desktop/src-tauri/src/supervisor.rs:503-527`）。
 
 ## 値と判定
 
-`apps/host/server/index.mjs` は起動引数から `--dist` の位置を探し、次の順で `DIST` を一度設定します（同ファイル 88–100 行）。
+値は真偽値や数値として解析せず、JavaScript の truthiness 判定の後に `path.resolve` へ渡す。Node の `process.env` の文字列全体がパスとして使われ、前後空白の除去、大文字小文字変換、パス存在の起動時検証はない。相対パスは Node プロセスの現在ディレクトリを基準に絶対化される（`app/host/server/index.mjs:104-108`）。
 
-| `STRATA_DIST` | `--dist` | 採用値 |
+| 条件 | `STRATA_DIST` | 採用される `DIST` |
 |---|---|---|
-| 空でない文字列 | 有無を問わない | `resolve(STRATA_DIST)`。CLI と既定値より優先 |
-| 未設定または空文字 | あり、後続引数あり | `resolve(--dist の次の引数)` |
-| 未設定または空文字 | あり、後続引数なし | `resolve(ROOT/dist)` |
-| 未設定または空文字 | なし | `join(ROOT, 'dist')` |
+| Node App Host 全般 | 未設定 | `--dist` の次の引数があればそのパス。なければホストの `dist/` |
+| Node App Host 全般 | 空文字 | 未設定と同じ。`--dist` の次の引数があればそちら、なければホストの `dist/` |
+| Node App Host 全般 | 空でない任意の文字列 | その文字列を `resolve` したパス。`--dist` より優先 |
+| デスクトップアプリ／セルフテスト | Tauri が子プロセス環境に設定 | Tauri が解決した `host/dist` が `--dist` の有無にかかわらず優先 |
 
-環境変数は数値や真偽値として parse されず、内容をそのままパスとして渡します。Node.js の条件式で空文字は falsy なので未設定と同じく扱われます。それ以外は空白だけの文字列も非空値として優先されます。相対パスは Node.js の `resolve()` によりホストプロセスの現在ディレクトリ基準で絶対化されます。大文字小文字変換、trim、存在確認による別候補への切替は設定時には行いません。
-
-`--dist` は完全な引数一致で最初の位置だけを使います。直後の引数が `--other` のような別オプションでもパス値として受け取られます。`--dist` があり次引数が欠けているときは `ROOT/dist` が使われます。
-
-根拠: `apps/host/server/index.mjs:86-100`。
+`0`、`false`、`true`、空白だけの文字列も空でなければパスとして採用される（`app/host/server/index.mjs:98-108`）。値の指定順は `STRATA_DIST`、`--dist <path>`、既定の `ROOT/dist`。`--dist` があり次の引数がない場合は `ROOT/dist` に戻る（同:96-108）。
 
 ## 有効になる条件
 
-App Host の Node プロセスで有効です。環境変数は Chromium の引数リストにホスト用の `--dist` を混在させにくいデスクトップキャリア向けに導入されたとコメントされています。通常の開発・serve 起動では、`STRATA_DIST` が空または未設定なら CLI `--dist`、さらに指定がなければ `apps/host/dist` 相当の既定位置が使われます（`apps/host/server/index.mjs:90-99`）。
-
-デスクトップシェルの `host_command` は `host/dist` を確認し、子 Node プロセスに `STRATA_DIST` として渡します（`apps/desktop/src-tauri/src/main.rs:444-468`）。`start_host` は Linux 以外の desktop 起動経路でこのコマンドを起動します（同ファイル 495-515 行）。同ファイルの self-test 用ホスト起動も同じディレクトリを設定します（同ファイル 734-745 行）。この環境変数を設定する起動スクリプトとして、desktop の UI/E2E スクリプトにも参照があります（例: `apps/desktop/scripts/first-run-ui.mjs:48-53`, `apps/desktop/scripts/ui-flows.mjs:151-154`, `apps/desktop/scripts/vision-e2e.mjs:33-36`）。これらはテスト用の起動設定であり、別の本番読取実装ではありません。
+- Node App Host のみが値を読み、Web UI の静的配信経路で使う。GPU backend、OS 固有のエンジン実装、モデル状態、ビルド macro による値判定の違いはない（`app/host/server/index.mjs:95-108,1023-1038`）。
+- デスクトップ起動では Tauri が値を `host_dir/dist` に固定して子プロセスへ渡すため、呼び出し元が持つ同名の値でその子プロセスのパスを変更する経路ではない。ホストと UI のエントリが見つからない、または `dist` がない場合は Tauri が起動コマンドを作れずエラーを返す（`app/desktop/src-tauri/src/main.rs:503-520,522-527`）。
+- 単独起動では有効なパス文字列でも、その先にビルド済み UI がなければ UI は配信されない。`DIST` の存在確認は静的リクエストごとに行われる（`app/host/server/index.mjs:2511-2537`）。
 
 ## 実行時の詳細
 
-値は `index.mjs` のモジュール評価時に `const DIST` として決まり、リクエストのたびに環境変数を読み直しません。プロセス起動後の環境変更はこの値に反映されません。ルーターは `/api/` を API handler、`/v1/` を OpenAI 互換 handler に渡し、それ以外を `staticFile()` に渡します（`apps/host/server/index.mjs:969-984`）。
+`DIST` は `server/index.mjs` のモジュール評価時に一度計算される定数で、プロセス稼働中に環境変数を変えても再評価されない。一方、ディレクトリやファイルの存在確認は静的リクエストごとに行うため、同じプロセスでもファイル配置の変化はその後のリクエストで反映される（`app/host/server/index.mjs:95-108,2511-2537`）。
 
-`staticFile()` はまず `DIST` の存在を確認します。ディレクトリが見つからない場合は HTTP 200 で「Strata host is running」と「No built web app found at …」を含む案内 HTML を返します。したがって、存在しないパスは UI 配信を止めますが、この分岐自体はエラー終了や警告ログにはせず、サーバーの API 経路は別に処理されます。ディレクトリが存在する場合は要求パスに対応するファイルを配信し、拡張子のないパスは `index.html` に fallback します。要求ファイルがない場合は拡張子ありで HTTP 404 `Asset not found`、`index.html` もない場合は HTTP 404 `Not found` です（同ファイル 2210-2252 行）。この変数専用の起動時ログや値の検証エラーは見当たりません。リクエスト処理で例外が発生すれば共通 catch が `[strata]` と例外を stderr に出して HTTP 500 を返します（同ファイル 985-987 行）。
+`/api/` は API handler、`/v1/` は OpenAI 互換 handler に振り分けられ、それ以外が `staticFile` に渡る。`DIST` 自体がない場合、ホストは HTTP 200 で「Strata host is running」「No built web app found at …」を含む案内 HTML を返す。ディレクトリが存在していて要求ファイルがない場合、拡張子付きパスには 404 `Asset not found`、拡張子なしパスは `index.html` にフォールバックし、それもなければ 404 `Not found`。ファイルがあれば MIME type と内容を返し、`index.html` は `no-store`、その他は `public, max-age=3600` とする（`app/host/server/index.mjs:1023-1038,2511-2552`）。
+
+デスクトップでは、Tauri は `host/dist` が存在しないと「the built UI is missing at …; run …」を起動エラーとして返す。セルフテスト経路は同じパスを設定してホストを起動し、45 秒以内の health check と `/` の UI 配信を別々に記録する（`app/desktop/src-tauri/src/main.rs:513-518,797-832`）。
+
+## ログと測定値
+
+この変数の読み取り自体に専用ログはない。単独ホストで `DIST` がない場合の応答 HTML に、実際に選ばれた絶対パスを含む `No built web app found at …` が表示される。Tauri 側の `dist` 欠落は起動エラー文字列にパスを含む（`app/host/server/index.mjs:2512-2525`、`app/desktop/src-tauri/src/main.rs:513-518`）。測定値は該当なし。
 
 ## 根拠
 
-- 読み取り、空値判定、CLI と既定値の優先順位、絶対パス化: `apps/host/server/index.mjs:86-100`。
-- API / `/v1/` と静的配信の振り分け、例外ログ: `apps/host/server/index.mjs:969-987`。
-- UI ディレクトリ不在時の応答、ファイル fallback と 404: `apps/host/server/index.mjs:2210-2252`。
-- desktop 子プロセスへの値設定と UI ディレクトリ事前確認: `apps/desktop/src-tauri/src/main.rs:444-481`。
-- desktop 起動時の `host_command` 使用（Linux 以外）: `apps/desktop/src-tauri/src/main.rs:495-515`。
-- self-test 子プロセスへの設定: `apps/desktop/src-tauri/src/main.rs:734-745`。
+- `app/host/server/index.mjs:95-110` — Node ホストの引数と環境変数の優先順位、パス解決。
+- `app/host/server/index.mjs:1023-1038` — API、OpenAI 互換 API、静的ファイルの振り分け。
+- `app/host/server/index.mjs:2511-2552` — `DIST` の存在、ファイル選択、応答内容。
+- `app/desktop/src-tauri/src/main.rs:503-527` — デスクトップ用ホストコマンドの配置検査と環境設定。
+- `app/desktop/src-tauri/src/main.rs:797-832` — セルフテスト用ホストの設定と UI 確認。
+- `app/desktop/src-tauri/src/supervisor.rs:503-527` — Linux supervisor が共通ホストコマンドを起動する経路。

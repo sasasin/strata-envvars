@@ -1,66 +1,61 @@
-# `--conversation-cache-mib`
+# `strata-split-N --conversation-cache-mib`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-split` |
-| コマンド | `strata-split-N`（N はビルド対象のカード数。サブコマンドなし） |
+| コマンド | `strata-split-N`（N = 2 / 3 / 4） |
 | オプション | `--conversation-cache-mib` |
 | 別名 | なし |
-| 値 | MiB 単位の整数。parser は `std::stol` で `long` に変換する |
+| 値 | MiB 単位の整数。ホストメモリ上に保持する会話スナップショットとチェックポイントの予算 |
 
 ## 役割
 
-会話キャッシュに使うホストメモリの予算を MiB で指定します。会話状態を GPU 上の K/V pool からホストメモリへ退避し、次の会話ターンで再利用する処理と、会話途中の checkpoint の保持にこの予算が使われます。ここでの値は `strata-split-N` の設定であり、同名の通常 `strata` エンジン用オプションとは別スコープです（`src/split/tools/sfnx.cpp:65-70,72-104`）。
+`strata-split-N` のサーバーモードで、会話キャッシュが保持できるチェックポイントと退避済み会話のホストメモリ予算を指定する。予算内で別会話の状態を保持し、同じ会話の続きが来たときに状態を復元できる。これは同時実行スロット数を指定するものではない。
 
 ## 使い方
 
 ```sh
-strata-split-2 --serve --native model.gguf --mtp draft-layer --conversation-cache-mib 4096
+# strata-split-2 をサーバーモードで起動し、キャッシュ予算を 4096 MiB にする
+strata-split-2 --serve --native MODEL.gguf --mtp RT_DIR --draft-vocab VOCAB.bin --conversation-cache-mib 4096
 ```
-
-`--serve`、`--native`、`--mtp` はこの実行ファイルの起動に必要です。カード数に対応する `strata-split-N` はビルド時に選ばれます（`src/split/tools/sfnx.cpp:4-5,100-102`、`src/split/CMakeLists.txt:92-97`）。
 
 ## 値と既定値
 
-- 省略時は `0` です。0 バイト予算となり、会話の park/cache を行いません（`src/split/tools/sfnx.cpp:65-70,435-440`、`src/split/src/session.cpp:154-162,308-312`）。
-- 指定値は `std::stol` で `long` に変換され、その値を `size_t` に変換してから `1 MiB = 2^20` バイトを掛けるシフトで byte 予算にします（`src/split/tools/sfnx.cpp:72-89,435-438`）。
-- `std::stol` には変換位置の検査が渡されていないため、数値の後ろに変換されない文字が続いても数値部分が受理されます。数値部分がない値や `long` の範囲外は変換例外になります（`src/split/tools/sfnx.cpp:76-79,88`）。
-- オプション値の非負範囲や上限を検査する処理はありません。負数は拒否されず `size_t` へ変換されてからシフトされます。したがって負数を有効な予算として使うことはできず、意図した上限にならない可能性があります（`src/split/tools/sfnx.cpp:88,435-438`）。
-- 同じオプションを複数回指定した場合は、引数走査中に `cache_mib` を上書きするため最後の値が残ります（`src/split/tools/sfnx.cpp:74-89`）。
+- 値は `std::stol` で `long` に変換される。省略時は `0`、すなわち予算なしである（`engine/src/split/tools/sfnx.cpp:65-70, 91`）。
+- この引数専用の範囲検査、非負検査、MiB から byte への変換時の上限検査はない。変換時に `std::stol` が例外を出す形式・範囲外の値は起動引数エラーになる。変換後の値は `size_t` にキャストされてから 20 bit 左シフトされるため、負数は有効な「負の予算」として扱われず、意図しない大きな予算になり得る。負数を指定しないこと（`engine/src/split/tools/sfnx.cpp:91, 448-450`）。
+- `std::stol` の戻り値だけを使い、変換済み文字列の末尾確認はしていない。そのため整数の後ろに数値でない文字がある場合も、先頭の数値部分が変換される（同 `:91`）。
+- 同じオプションを複数回指定した場合は、引数を順に処理して同じフィールドへ代入するため最後の値が残る（同 `:76-92`）。
 
 ## 実行時の動作
 
-起動時に作られる `ConvCache` の共有予算を、この値から byte 単位で設定します。複数 slot の `Session` は同じ cache を共有します。会話状態を保持する際、予算を超えると最も古く使われた parked conversation を順に追い出し、それでも超える場合は live conversation の checkpoint を古い順に削除します（`src/split/tools/sfnx.cpp:435-455`、`src/split/src/session.cpp:350-361`）。
+起動時に `Args::cache_mib` を MiB から byte へ変換し、全セッションで共有する `fnx::ConvCache::budget` に設定する。サーバーは各セッションに同じキャッシュを渡す（`engine/src/split/tools/sfnx.cpp:448-468`）。予算の対象はホストメモリ上の退避済み会話状態とチェックポイントであり、現在実行中の会話の状態や GPU の K/V pool の容量を直接設定する値ではない（`engine/src/split/src/session.hpp:77-90, 109-115`）。
 
-会話状態の park は、cache 予算が 0 より大きく、会話履歴が 1024 token 以上のときに行われます。K/V pool の空きが不足した場合、または arena が expert に貸し出されている間に slot が長時間 idle になった場合、idle conversation の状態をホストメモリへ退避して lane の pool pages を返します。退避や復元、追い出しは stderr に `conversation cache:` または `sfnx:` の診断行を出します（`src/split/src/session.cpp:15-20,308-330`、`src/split/tools/sfnx.cpp:394-432`）。
+要求処理では予算が 0 より大きく、要求の `ckpt` ヒントが有効なときにチェックポイントを作成する。予算が 0、または要求側が `ckpt=0` の場合、新しい状態の保存・退避を抑止する（`engine/src/split/src/session.cpp:155-163, 192-194, 228-252`）。一方、キャッシュ上限を超えると、退避済み会話を最終使用時刻が古い順に破棄し、それでも超過する場合は現在の会話に属するチェックポイントを古いものから削る（同 `:351-362`）。保存予算が不足する会話の退避は行われず、予算値そのものに応じてメモリを起動時に一括確保する実装ではない（同 `:309-323`）。
 
-Strata の split-engine 起動設定は `split_config()` の既定 `cache_mib=4096` を引数として明示的に渡します。そのため通常の split-engine 経由では、エンジン単体 parser の既定 `0` ではなく 4096 MiB が使われます（`strata_control/split_engine.py:73-80,250-263`）。
+`--batch` で複数スロットを使う場合もキャッシュは共有される。起動時に stdout の `INFO` 行へ `conversation_cache_mib=<値>` が含まれ、`--batch` が 1 より大きい場合はスロット数も同じ行に出る（`engine/src/split/tools/sfnx.cpp:448-468, 1155-1157`）。
 
 ## 適用条件と副作用
 
-このオプションは `strata-split-N` にだけ適用されます。Terminal の launch が split-engine を選び、その構成を生成するときに値が渡されます。split-engine の適用可否や通常 engine への fallback は別の判定経路です（`strata_cli/launch/runner.py:1630-1637,1662-1682`、`strata_control/split_engine.py:250-264,480-510`）。
-
-予算はホストメモリ上で保持する会話状態と checkpoint の上限です。会話状態を退避する処理では engine state を保存し、元の lane を reset して K/V pool pages を返します。上限に達したときの追い出しは会話の再利用可能性を減らします（`src/split/src/session.hpp:77-91,109-115`、`src/split/src/session.cpp:308-338,350-361`）。ソース上、この値分のメモリを起動時に事前確保する処理は確認できません。
+- 対象は索引上の `strata-split` ツール、すなわち `strata-split-N` の root parser である。`--serve` が必須で、モデルとドラフト関連引数も別途必要になる（`engine/src/split/tools/sfnx.cpp:4-5, 73-117`）。
+- `strata-split` は opt-in のビルド対象で、CMake 設定では既定で無効、Linux の CUDA または HIP 向けとされる。実行可能性は当該 checkout のビルド条件に依存する（`engine/src/split/CMakeLists.txt:1-7`）。
+- キャッシュの保持と復元はホストメモリのスナップショット保存を伴う。`0` では予算に基づく新規チェックポイント作成や会話退避を止める。`--batch` はスロット数、キャッシュ予算とは別の設定である。
 
 ## 出力とエラー
 
-- オプション値が欠けると `--conversation-cache-mib needs a value`、変換できない値や `long` 範囲外の値では標準ライブラリの変換例外になります。引数解析時の例外は stderr に `sfnx: <理由>` と出して終了コード `2` になります（`src/split/tools/sfnx.cpp:76-79,88,1040-1048`）。
-- 起動成功後、標準出力の `INFO` 行に `conversation_cache_mib=<指定値>` が出ます（`src/split/tools/sfnx.cpp:1081-1083`）。
-- モデルや engine のロード後など、引数解析後の例外は `ERR <理由>` を標準出力、`sfnx: failed: <理由>` を標準エラーに出し、終了コード `1` で終了します。これは引数変換以外も含む一般的な失敗経路です（`src/split/tools/sfnx.cpp:1027-1035,1050-1065,1086-1092`）。
-
-## 調査範囲
-
-同一 revision の parser、cache 予算の設定、cache 保持・eviction、launch から split 設定を作る箇所を確認しました。安全に起動できる同一 revision の実行バイナリは確認していないため、`--help` 出力との照合は行っていません。負数や数値サフィックスの挙動は parser の変換コードから記述しており、実バイナリでの動作確認はしていません。
+- 値が欠けると `--conversation-cache-mib needs a value` が stderr に出て、引数解析で終了コード `2` になる。`std::stol` が例外を出す入力も同じ引数解析の catch に入り、`sfnx: <例外内容>` を stderr に出して `2` を返す（`engine/src/split/tools/sfnx.cpp:76-81, 1107-1115`）。
+- 値自体の負数・MiB 上限を拒否する専用エラー経路は確認できない。モデル読み込み後の処理で例外が発生した場合は別経路となり、`ERR <理由>` を stdout、`sfnx: failed: <理由>` を stderr に出して終了コード `1` で終了する（同 `:1094-1103, 1117-1136`）。
+- 正常な初期化後は stdout の `INFO` 行に設定値が出る（同 `:1155-1157`）。
 
 ## 根拠
 
-- `src/split/tools/sfnx.cpp:65-104` — parser の既定値、値変換、必須引数と batch validation。
-- `src/split/tools/sfnx.cpp:435-455,1040-1048,1081-1083` — byte 予算の設定、parse 失敗、起動時 INFO。
-- `src/split/tools/sfnx.cpp:394-432` — pool 不足・idle 時の会話 park。
-- `src/split/src/session.hpp:77-100,109-115` — cache の共有単位と会話状態の説明。
-- `src/split/src/session.cpp:154-162,308-330,350-361` — cache 有効条件、park、eviction と checkpoint 削除。
-- `strata_control/split_engine.py:73-80,250-264` — split-engine 構成が既定 4096 MiB を引数へ渡す処理。
-- `strata_cli/launch/runner.py:1630-1637,1662-1682` — launch から split-engine を適用する経路。
-- `src/split/CMakeLists.txt:92-97` — `strata-split-N` の製品 target。
+- `engine/src/split/tools/sfnx.cpp:65-70, 73-117` — 引数フィールド、parser、既定値、`--serve` 必須条件、引数エラー処理。
+- `engine/src/split/tools/sfnx.cpp:448-468` — MiB から byte への変換、共有キャッシュ、全スロットへの適用。
+- `engine/src/split/tools/sfnx.cpp:1094-1115, 1155-1157` — 実行時失敗経路、引数解析失敗時の終了、起動時 `INFO` 出力。
+- `engine/src/split/src/session.hpp:77-90, 109-115` — キャッシュ構造と予算の対象。
+- `engine/src/split/src/session.cpp:155-163, 192-194, 228-252` — 要求ごとのキャッシュ有効条件、会話再利用とチェックポイント作成。
+- `engine/src/split/src/session.cpp:309-362` — 会話退避、予算超過時の LRU 破棄とチェックポイント削減。
+- `engine/src/split/CMakeLists.txt:1-7` — split engine のビルド条件。
+
+値の異常入力について、実際の CLI を用いた確認は行っていない。記述は parser と利用箇所の静的な追跡に基づく。

@@ -1,42 +1,46 @@
 # `STRATA_CRASH_BT`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Linux 版 `strata` 実行ファイルで、指定された致命的シグナルを受けたときに backtrace を出力する診断用設定です。値が有効だと `SIGFPE`、`SIGSEGV`、`SIGBUS`、`SIGABRT` のハンドラを登録します。通常実行時のログや計算処理は変えません。`strata` の実行ファイルは `src/program/generate.cpp` から作られます（`CMakeLists.txt:868-871`）。
+Linux 向けの Strata engine program で、fatal signal 時に native call stack を出力する調査用フック。`engine/src/program/generate.cpp` の translation unit 初期化時に環境を読み、設定に応じて `SIGFPE`、`SIGSEGV`、`SIGBUS`、`SIGABRT` の handler を登録する。モデル処理や生成設定を変えるものではなく、CLI 引数による上書き経路もこの実装にはない。Linux 以外ではこの実装全体がコンパイル対象外である（`engine/src/program/generate.cpp:362-388`）。
 
 ## 値と判定
 
-`src/program/generate.cpp:268-274` の初期化処理は環境変数を文字列として読みます。整数変換や CLI 引数との優先順位はありません。
+`std::getenv` の結果を文字列全体として parse せず、未設定・空文字・先頭文字を直接判定する。設定値によっては値そのものを出力ファイル名として使う（`engine/src/program/generate.cpp:365,380-385`）。
 
-| 環境値 | 判定と出力先 |
-|---|---|
-| 未設定 | 無効。ハンドラを登録しない |
-| 空文字 | 無効。ハンドラを登録しない |
-| 先頭文字が `0` | 無効。`0`, `0anything` など |
-| 値が厳密に `1` | 有効。致命的シグナル時の出力先は標準エラー（fd 2） |
-| 先頭文字が `1` で、値が厳密な `1` ではない | 有効。値全体を出力ファイルのパスとして保存する。例: `1/tmp/crash.log` は `/tmp/crash.log` ではなく `1/tmp/crash.log` というパス |
-| 上記以外 | 無効。例: `true`, `2`, ` 1` |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| Linux | 無効 | 空でない値で先頭文字が `0` 以外。`1` だけの値は stderr に出力し、それ以外は値を出力先パスとして扱う。例: `1`、`true`、`/tmp/strata-crash.txt` | 空文字、または先頭文字が `0`。例: `0`、`0anything` |
+| Linux 以外 | このコードによる読み取りなし | 該当なし | このコードによる効果なし |
 
-出力先パスは 512 バイトのバッファに `snprintf` で格納されるため、終端 NUL を含めて最大 511 バイトが残ります。空白除去、大文字小文字変換、数値 parse はありません（`src/program/generate.cpp:253,268-272`）。
+値全体の数値・真偽値検証、大文字小文字変換、空白除去はない。したがって `true` は真偽値としてではなくファイルパスとして扱われ、`false` も無効値ではなく同名のパスとして扱われる。` 1` は先頭が空白なのでパス、`1 ` や `10` も値全体が `1` ではないためパスとなる。一方 `01` は先頭が `0` のため無効。パスは `g_crash_path` の 512 byte 配列へ `snprintf` でコピーされ、長い値は配列に収まる範囲に切り詰められる（同 `:365,381-384`）。
 
 ## 有効になる条件
 
-- `#if defined(__linux__)` のコードに限られ、Linux 以外のビルドではこの環境変数を読む処理もハンドラ登録もありません（`src/program/generate.cpp:250-276`）。
-- GPU backend、CLI オプション、モデル状態、他の環境変数による追加条件は、この実装にはありません。
-- 値は `generate.cpp` の名前空間スコープ初期化で一度読みます。初期化後にプロセス環境を書き換えても再評価されません（`src/program/generate.cpp:268-274`）。
+- Linux 上で `engine/src/program/generate.cpp` を含む Strata engine program を実行すること。非 Linux では signal handler の定義も読み取りも `__linux__` 条件内にない（`engine/src/program/generate.cpp:362-388`）。
+- プロセス初期化時に値が空でなく、先頭文字が `0` でないこと。変数はグローバル初期化 lambda で一度読み取られ、その後の環境変更は反映されない（同 `:380-386`）。
+- 対象の四 signal のいずれかが発生し、Strata の登録 handler が呼ばれること（同 `:366-384`）。CLI 引数、モデル状態、GPU backend による有効化条件はこの処理にない。
+- `STRATA_CRASH_BT` が `1` 以外の有効文字列なら、その値を出力先パスとして開けること。開けなかった場合も handler は有効なままで、出力先を stderr に戻す（同 `:371-376`）。
 
 ## 実行時の詳細
 
-有効時に登録されるハンドラは、最大 48 フレームを `backtrace` で取得し、`strata: fatal signal, call stack:\n` とシンボル情報を出力します。値が厳密な `1` なら標準エラーへ直接出します。それ以外の有効値では、その値をパスとして `O_WRONLY | O_CREAT | O_APPEND` で開きます。ファイルを開けた場合はそのファイルへ追記し、開けなかった場合は標準エラーへ出力します（`src/program/generate.cpp:254-264`）。
+グローバル初期化 lambda が起動時に一度 `STRATA_CRASH_BT` を読み取る。unset・空文字・先頭 `0` なら登録せず終了する。それ以外は、値が厳密に `1` でなければ値を `g_crash_path` に保存し、四つの signal に同じ handler を登録する（`engine/src/program/generate.cpp:365,380-386`）。
 
-出力処理後は該当シグナルのハンドラを既定値に戻し、同じシグナルを再送出します。そのため、バックトレース出力の後に元の致命的シグナルによるプロセス終了が続きます。対象は上記 4 シグナルであり、その他の終了原因を処理するものではありません（`src/program/generate.cpp:265-266,272`）。通常時にこの設定を知らせるログはありません。
+handler は最大 48 frame 分を `backtrace` で取得し、`strata: fatal signal, call stack:\n` と `backtrace_symbols_fd` による frame 表示を書き出す。厳密な値 `1` のとき、および指定パスを `open(O_WRONLY | O_CREAT | O_APPEND, 0644)` で開けないときは fd 2（stderr）を使う。パスを開けた場合は追記出力する。出力後は当該 signal の処理を `SIG_DFL` に戻し、同じ signal を `raise` して終了経路を元の signal に委ねる（同 `:366-378`）。
 
-候補名の全参照を確認すると、値を実際に読む箇所は `src/program/generate.cpp:269` のみです。`tools/par/variants/*.txt` と `tools/par/co_bt.sh`、`tools/par/host_seq.sh` には実験実行用の代入がありますが、これらは値の利用方法を定義する実装ではありません。
+## ログと測定値
+
+有効値で対象 signal が発生すると、選択された出力先に次のヘッダーと最大 48 frame の symbolized address 表示が書かれる。ファイル指定時に open が失敗した場合は stderr に出る。未設定・空文字・先頭 `0` の場合、この handler による出力はない（`engine/src/program/generate.cpp:366-376,380-385`）。
+
+```text
+strata: fatal signal, call stack:
+```
+
+出力後は同じ signal を再送するため、通常の復帰や継続処理には進まない（同 `:377-378`）。この変数に関する測定値は Strata の資料で確認できなかった。
 
 ## 根拠
 
-- Linux 専用のハンドラ、読み取り、値判定、シグナル登録: `src/program/generate.cpp:250-276`
-- `strata` 実行ファイルへの組み込み: `CMakeLists.txt:868-871`
-- 候補名の実際の読み取り箇所は 1 箇所のみ。他の一致は `tools/par/variants/` の実験設定および `tools/par/*.sh` の環境値設定。
+- Linux 限定の実装、handler の出力・signal 再送、環境値の判定と handler 登録: `engine/src/program/generate.cpp:362-388`
+- Linux 用の `execinfo`、`fcntl`、signal、`unistd` の include: `engine/src/program/generate.cpp:154-159`

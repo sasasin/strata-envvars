@@ -1,44 +1,44 @@
 # `OPENAI_API_KEY`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata の推論 engine が OpenAI の API キーとして自動取得する環境変数ではありません。Strata CLI は、環境変数名を CLI 引数で指定した場合に限り値を読みます。また `strata connect hermes` は、接続先 Strata サーバーのキーを Hermes Agent 起動用の `OPENAI_API_KEY` として表示します。
+Strata の推論エンジンやサーバーが `OPENAI_API_KEY` という固定名を直接参照する実装は確認できない。一方、CLI は `--key-env OPENAI_API_KEY` または `--api-key-env OPENAI_API_KEY` のように環境変数名を引数で指定すると、その値を実行時に読み取る。また `strata connect hermes` は、接続先用のキーを Hermes 向けの環境設定 `OPENAI_API_KEY=<key>` として生成し、端末表示または JSON に出力する。ここで扱うのは Strata CLI のキー取得と設定出力であり、Hermes やサーバー側がキーをどう使うかではない。`terminal/strata_cli/launch/cmd.py:137-138,163-174,1074-1080`、`terminal/strata_cli/launch/harness.py:286-309,343-348`
 
 ## 値と判定
 
-| 読み取り経路 | 未設定・空文字 | 設定時の扱い |
-|---|---|---|
-| `strata launch --api-key-env OPENAI_API_KEY` | 未設定または空文字ならエラー。空白だけの文字列は取得時には通るが、後続の API キー検証で無効 | 値を launch 設定の API キーにする。カンマ区切りはサーバー側で複数キーとして解釈し、各キー前後の空白を除く |
-| `strata connect <app> --key-env OPENAI_API_KEY` | 未設定・空文字なら実行中 launch のキーへ進み、なければ `strata-local` | `--key` が空でなければそれを優先し、そうでなければこの環境値を使う |
-| Hermes 用の環境表示 | 選択したサーバーキーがなければ `strata-local` | `strata connect hermes` の出力に `OPENAI_API_KEY=<接続先キー>` を含める |
+値は文字列のまま扱われ、`OPENAI_API_KEY` 固有の形式検査、数値変換、長さ制限はない。固定名が環境から検索されるのではなく、CLI 引数の環境変数名が `OPENAI_API_KEY` のときにだけ参照対象となる。
 
-数値変換や `1` 判定はありません。launch 経路では `--api-key-env` の値が明示的な `--api-key` より後に適用されるため、両方を指定すると環境変数側が上書きします。さらに `--no-api-key` も指定するとキー指定は保持され、stderr に警告が出ます。
+| 読み取り経路 | unset | 空文字 | その他の値 |
+|---|---|---|---|
+| `strata launch --api-key-env OPENAI_API_KEY` | `os.environ.get()` が `None`。空文字と同様にエラー | エラー | 文字列を API キーとして採用。空白だけの値も truthy なので受け付ける |
+| `strata connect <app> --key-env OPENAI_API_KEY` | 環境値を使わず次の候補へ進む | 同左 | 文字列をキー候補にする。空白だけの値は truthy なので採用 |
+
+launch 経路は `if not val` で未設定と空文字を同じ扱いにし、`The environment variable OPENAI_API_KEY is empty or not set.` を出して終了コード 2 で失敗する。空白文字列はこの判定を通る。connect 経路は `or` による選択なので、未設定・空文字のときだけ後順位のキーへ進み、無効値としてのエラーや形式検査はない。`terminal/strata_cli/launch/cmd.py:288-300,703-725,1074-1079,1009-1012`
 
 ## 有効になる条件
 
-- `strata launch` は `--api-key-env OPENAI_API_KEY` を明示した場合にこの名前を検索し、値を launch の `api_key` 設定に入れます。サーバー起動時には別環境変数 `STRATA_API_KEY` がこの設定値より優先されます。
-- `strata connect` は `--key-env OPENAI_API_KEY` を指定した場合に検索します。`--key`、環境値、実行中 launch のキー、`strata-local` の順で選びます。これはクライアント設定を作る CLI の処理です。
-- Hermes 用の表示は harness 定義にあります。`--write` が書くのは設定ファイルで、環境行を環境や shell profile に設定しません。
+- 環境値を launch のサーバーキーにするには `strata launch --api-key-env OPENAI_API_KEY` を指定する必要がある。環境値が空または未設定だと起動処理は終了コード 2 で失敗する。`--api-key` と併用した場合、`--api-key-env` の値が `s.api_key` に後から代入されるため優先する。`--no-api-key` も併用すると、キー指定がある旨の警告を出し、キーを保持する。`terminal/strata_cli/launch/cmd.py:137-140,288-300`
+- connect の出力に環境値を使うには `strata connect hermes --key-env OPENAI_API_KEY` のように `--key-env` を指定する。`--key` が非空ならそれが優先し、次に `--key-env` の非空値、次に起動中サーバーまたは指定 preset のキー、それらがなければ空文字が候補となる。`terminal/strata_cli/launch/cmd.py:169-174,703-725,1074-1079`
+- Hermes 用の `OPENAI_API_KEY` 行を出すのは `hermes` / `hermes-agent` を選んだ場合である。`strata connect` の別アプリ設定がこの名前を生成するわけではない。値候補が空なら `target()` が `strata-local` に置き換えるため、Hermes の環境設定にもそのプレースホルダーが出る。`terminal/strata_cli/launch/harness.py:21,307-309,318-323,339-347`
+- OS、GPU backend、build macro、サーバーモードによる `OPENAI_API_KEY` 固有の分岐はない。読み取りは CLI 引数に指定した名前を使うため、固定名を直接探す挙動はない。`terminal/strata_cli/launch/cmd.py:288-294,1074-1079`
 
 ## 実行時の詳細
 
-Python の `os.environ.get()` で CLI 処理中に読みます。`--api-key-env` の未設定・空文字は `ValueError` となり、CLI は `strata: The environment variable OPENAI_API_KEY is empty or not set.` を stderr に出し、通常のエラーコード 2 で終了します。空白だけの値は取得時に受け入れられますが、サーバー側の `api_key_of()` が空白を除去した結果が空なら無効です。launch 時の検証に失敗すると `ProfileError("the inference API key is invalid", 5)` になります。値にカンマがあれば複数の許可キーとして扱われます。
+両 CLI 経路ともコマンド実行時に環境を一度参照し、その後の変更を監視・再読込する cache はない。launch 側では環境値を `s.api_key` に設定する。connect 側では得たキーを `Target` に渡し、Hermes の `Harness.env` がその文字列を `OPENAI_API_KEY` の値にする。`render()` はファイル内容と環境マップを返すだけで、`--write` が書き込む対象は `out["files"]` の設定ファイルのみであり、環境変数をプロセス環境やファイルへ設定する処理ではない。`terminal/strata_cli/launch/cmd.py:288-300,1074-1080,1019-1050,1156-1161`、`terminal/strata_cli/launch/harness.py:205-208,307-309,339-348`
 
-`strata connect` では `--key-env` の値が空なら launch キーへフォールバックし、それもなければ `Target` が `strata-local` を使います。人向け出力では通常キーをマスクし、`--show-key` で実値を表示します。Hermes 用の `env` 辞書は同じ `Target.key` から作られます。
+通常出力では環境設定行は `Environment:` 以下に表示され、キーは既定で `mask()` により一部置換される。キーが設定されていて出力中に含まれる場合は `The key is hidden here; add --show-key to print it.` と案内する。JSON 出力では `env` の値も `mask()` を通して返す。組み込みモニターの Connect 画面でも環境行を表示・コピーできるが、画面表示は既定でマスクされ、コピー操作は `KEY=value` の行を組み立てる。`terminal/strata_cli/launch/cmd.py:1081-1086,1120-1136`、`terminal/strata_cli/launch/harness.py:432-433`、`terminal/strata_cli/launch/monitor_ext.py:240-255,410-430`
 
-読み取りは CLI コマンドごとで、static cache はありません。環境変数名は CLI 引数から渡されるため、利用者が `OPENAI_API_KEY` と指定した場合に読み取り対象になります。
+## ログと測定値
+
+測定値は該当しない。キー取得の失敗は launch のエラー文 `The environment variable {NAME} is empty or not set.`（ここでは `NAME` が `OPENAI_API_KEY`）として報告され、終了コード 2 になる。connect は `--key-env` の値が空でもそれ自体では警告せず、後順位のキーまたは `strata-local` を使う。生成したキー行は前節のとおり既定でマスクされる。`terminal/strata_cli/launch/cmd.py:288-294,1009-1012,1074-1079,1131-1136`、`terminal/strata_cli/launch/harness.py:21,339-347,432-433`
 
 ## 根拠
 
-- 候補一覧: `docs/envvars/000_envvers.md:474`。
-- launch の引数、値設定、空値拒否、優先順位、`--no-api-key` 警告: `strata_cli/launch/cmd.py:130-133,270-283`。
-- CLI のエラー表示・終了コード: `strata_cli/cli.py:2166-2173,528-532`。
-- launch 設定への反映: `strata_cli/launch/runner.py:524-536`。
-- 実行時の `STRATA_API_KEY` 優先と API キー検証: `strata_cli/cli.py:782-795`。
-- 空値、空白除去、カンマ区切りの扱い: `serve/server.py:8358-8399`。
-- connect の引数とキー優先順位: `strata_cli/launch/cmd.py:161-172,945-950`。
-- `Target` のプレースホルダー: `strata_cli/launch/harness.py:22,28-44,272-273`。
-- Hermes harness の環境値と render: `strata_cli/launch/harness.py:240-242,276-281`。
-- 人向け出力のマスク、`--show-key`、`--write`: `strata_cli/launch/cmd.py:951-957,978-992,1011-1028`。
+- `terminal/strata_cli/launch/cmd.py:137-140,163-178` — launch/connect の CLI 引数。
+- `terminal/strata_cli/launch/cmd.py:288-300,1009-1012` — launch 側の動的環境変数読み取り、判定、エラー終了。
+- `terminal/strata_cli/launch/cmd.py:703-725,1074-1080` — 起動情報と connect のキー選択順。
+- `terminal/strata_cli/launch/cmd.py:1081-1086,1120-1136` — JSON・端末出力とキーのマスク。
+- `terminal/strata_cli/launch/harness.py:21,286-315,318-348,432-433` — Hermes の環境マップ、キーの fallback と表示用マスク。
+- `terminal/strata_cli/launch/monitor_ext.py:240-255,410-430` — モニターの設定表示とコピー。

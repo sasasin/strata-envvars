@@ -1,44 +1,47 @@
 # `STRATA_HIP_ARCHS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-HIP 用のビルドスクリプトが対象 GPU アーキテクチャ一覧を受け取り、CMake の `CMAKE_HIP_ARCHITECTURES` に渡すための環境変数です。Strata エンジンの実行時設定ではありません。HIP エンジンは configure 時に検証・正規化した一覧を `STRATA_HIP_ARCHS` コンパイル定義として埋め込み、起動時の GPU アーキテクチャ確認に使います。
+これは Strata エンジンの実行時設定ではなく、Windows HIP ビルドスクリプトが読むビルド時の環境変数である。`terminal/tools/hip/build_windows.bat` が未設定なら対象 GPU アーキテクチャ一覧を設定し、その値から TheRock の device wheel 一覧を作り、CMake の `CMAKE_HIP_ARCHITECTURES` と配布スクリプトの `--archs` に渡す（`terminal/tools/hip/build_windows.bat:13-28,43-51,76-84,123-125`）。ビルド済みエンジンでは、この値そのものは環境から読まれない。
 
-環境から値を読むのは `tools/hip/build_windows.bat`、`tools/dsv41/win/build_hip_win.bat`、`tools/dsv41/build_hip_linux.sh` です。エンジンの C++/HIP ソースに `getenv` による読み取りはありません。`cmake/hip_backend.cmake` に同名の CMake 変数もありますが、こちらは環境変数を読むコードではなく、検証済みアーキテクチャ名から作られるビルド時の値です。
+CMake は `CMAKE_HIP_ARCHITECTURES` を検証・正規化し、コンパイル定義 `STRATA_HIP_ARCHS` としてアーキテクチャ一覧を実行ファイルへ埋め込む（`engine/cmake/hip_backend.cmake:4-5,18-43,106-109`）。この埋め込み値は HIP デバイスの起動前チェックに使われ、環境変数の実行時変更では変わらない（`engine/src/core/device.cu:41-64,70-75`）。
 
 ## 値と判定
 
-値は GPU アーキテクチャ名のリストとして扱われ、数値や真偽値には変換されません。
+| 条件 | unset / 空文字 | 値の扱い | 無効値・境界 |
+|---|---|---|---|
+| Windows の `terminal/tools/hip/build_windows.bat` | `if not defined` により既定値 `gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1200;gfx1201;gfx1030;gfx1031` を設定。空文字も未定義扱い | セミコロン区切りの一覧を `for` で区切り、wheel 名を組み立てたうえで、同じ文字列を `-DCMAKE_HIP_ARCHITECTURES=...` と `package_windows.py --archs` に渡す。バッチ自身は真偽値や数値として parse しない（`terminal/tools/hip/build_windows.bat:28,43-44,80,123-125`） | バッチ自身に一覧の検証はない。未知・空要素・不正な arch 名は後段の CMake 構成または wheel / package 処理で問題になり得る。値が空なら上記既定値が使われる（`terminal/tools/hip/build_windows.bat:28,43-44,80`） |
+| HIP backend の CMake 構成 | `CMAKE_HIP_ARCHITECTURES` が未定義または空なら `gfx1100` | 空白をセミコロンに直し、各 arch の `:` 以降を除いて検証・重複排除する（`engine/cmake/hip_backend.cmake:4-5,18-37`） | リストが空なら `Strata HIP: CMAKE_HIP_ARCHITECTURES is empty` で configure を失敗させる。検証リスト外なら `message(FATAL_ERROR ...)` で失敗する。無効文字列を黙って fallback する処理はない（同 `:20-40`） |
 
-| 読み取り経路 | 未設定・空文字 | 設定値の使い方 |
-|---|---|---|
-| Windows `tools/hip/build_windows.bat` | `if not defined` により既定の `gfx1100;gfx1101;gfx1102;gfx1200;gfx1201;gfx1030;gfx1031;gfx1151` を設定 | セミコロン区切りで ROCm device パッケージ一覧を作り、`CMAKE_HIP_ARCHITECTURES` と zip の `--archs` に渡す |
-| Windows `tools/dsv41/win/build_hip_win.bat` | `gfx1151` を設定 | `CMAKE_HIP_ARCHITECTURES` に渡す |
-| Linux `tools/dsv41/build_hip_linux.sh` | `${STRATA_HIP_ARCHS:-gfx1151}` により `gfx1151` を使う（未設定または空文字） | `CMAKE_HIP_ARCHITECTURES` に渡す |
+CMake が受け付けるベース名は、同ファイルの `_strata_hip_validated`、`_strata_hip_community`、`_strata_hip_unvalidated` の一覧に限られる（`engine/cmake/hip_backend.cmake:13-15,24-34`）。分類済み arch は受理され、community 一覧では `Strata HIP: <arch> was validated by community reports (docs/AMD_HIP.md)` の status、unvalidated 一覧では `Strata HIP: <arch> builds, but it is not validated on a real card yet; please report results` の warning が出る。どちらもビルドを止めない。これらのメッセージは CMake の構成時の出力である（同 `:25-33`）。
 
-値のアーキテクチャ名としての検証は `cmake/hip_backend.cmake` が行います。空要素は飛ばし、空白をセミコロンに置き換えてリスト化し、各要素の `:` 以降を除いてから判定します。検証済み一覧は `gfx1100`, `gfx1201`、コミュニティ報告で検証された一覧は `gfx1101`, `gfx1200` です。`gfx1010`, `gfx1011`, `gfx1012`, `gfx1102`, `gfx1103`, `gfx1030`, `gfx1031`, `gfx1032`, `gfx1034`, `gfx1150`, `gfx1151`, `gfx1152` はビルド可能だが実機検証なしとして警告されます。これら以外は configure を `FATAL_ERROR` で停止します。重複は除去されます。要素が残らない場合も `Strata HIP: CMAKE_HIP_ARCHITECTURES is empty` で configure が失敗します。
+バッチの「既定一覧」と CMake の「直接 configure 時の既定値」は異なる。前者は Windows ビルド用 wrapper によるもので、後者は `CMAKE_HIP_ARCHITECTURES` 未指定時の `gfx1100` である。CMake にも `STRATA_HIP_ARCHS` という変数がありますが、`hip_backend.cmake` が検証済み `CMAKE_HIP_ARCHITECTURES` から生成する値であり、同名の環境変数を CMake が直接読んでいるわけではない（`engine/cmake/hip_backend.cmake:4-5,35-43`）。
 
 ## 有効になる条件
 
-- `tools/hip/build_windows.bat` は Windows の HIP エンジンをビルド・パッケージするときに使います。`STRATA_NO_VISION=1` は画像 reader のビルドを止めますが、エンジン側のアーキテクチャ指定には影響しません。`STRATA_VISION_HIP_ARCHS` が未設定なら、この変数の値を HIP 画像 reader のビルドにも渡します。
-- `tools/dsv41/build_hip_linux.sh` と `tools/dsv41/win/build_hip_win.bat` は DSV41 の HIP ビルド経路でのみ使います。
-- ビルドスクリプトは `build.ninja` が既にあると configure を省略します。その場合、環境変数を変更しても既存ビルドディレクトリの `CMAKE_HIP_ARCHITECTURES` はこの実行では更新されません。Windows の一般 HIP バッチはその一方で、現在の値を ROCm パッケージ選択と最終 zip の `--archs` に使います。
-- `cmake/hip_backend.cmake` を使う標準 HIP backend は `STRATA_ENABLE_HIP` が有効な場合に読み込まれます。ビルド時に埋め込まれた一覧は HIP エンジンの GPU 検査に使われます。`STRATA_HIP_GFX906` の互換 backend は別経路で、この環境変数を参照しません。
-- スクリプトが渡す `-DCMAKE_HIP_ARCHITECTURES=...` と通常の CMake configure で直接指定する `CMAKE_HIP_ARCHITECTURES` が実際のビルド対象を決めます。標準 HIP backend でそれが未定義または空なら `gfx1100` が既定です。したがって、スクリプトを介さない直接 CMake ビルドでは `STRATA_HIP_ARCHS` 環境変数単独では選択されません。
+- この環境変数を直接読むのは Windows 用 `terminal/tools/hip/build_windows.bat` の経路である。Linux のビルド設定は環境変数名ではなく CMake の `CMAKE_HIP_ARCHITECTURES` を使う。
+- Windows バッチでは `build.ninja` がまだない場合に限って CMake configure を実行し、そこで環境変数を `CMAKE_HIP_ARCHITECTURES` に渡す。既存の build tree では configure をスキップするため、値を変えても既存の CMake キャッシュ上のアーキテクチャは更新されない。一方、後続の配布処理にはその時点の環境値が再び `--archs` として渡る（`terminal/tools/hip/build_windows.bat:76-85,123-125`）。
+- ROCm wheel の追加インストール判定は、環境値から生成した `EXTRAS` とバージョンを stamp と比較して行う。差があれば通常は pip install と `rocm-sdk init` を実行するが、`STRATA_ROCM_KEEP=1` のときは差があっても更新しない（同 `:43-53`）。
+- `STRATA_NO_VISION=1` なら vision reader のビルドと配布引数が省略される。実行される場合、`STRATA_VISION_HIP_ARCHS` が未設定ならこの変数の値が vision HIP build に渡る（同 `:101-120`）。
+- CMake の arch 検証を通ることが必要。未知の arch は configure を失敗させる。対応 arch の分類・status/warning は `engine/cmake/hip_backend.cmake:13-40` を参照。
+- 生成エンジンでは HIP backend が有効で、実際に使う GPU がコンパイル済み arch の一つであり、かつ `warpSize == 32` である必要がある（`engine/src/core/device.cu:53-64,224-236`; 呼び出し元 `engine/src/program/generate.cpp:4969-4982`）。
 
 ## 実行時の詳細
 
-標準 HIP backend では CMake が対象一覧を正規化し、セミコロン区切りをカンマ区切りへ変換して `strata_hip_runtime` の compile definition に埋め込みます。HIP の device 検査はコンパイル済み一覧と検出した GPU の `gcnArchName`（コロン以降を除去）を照合します。一覧にない GPU では、対象 GPU がコンパイル対象外であること、HIP 用に再ビルドする方法、または `HIP_VISIBLE_DEVICES` で別 GPU を選ぶ案内を含むエラー文字列を返します。GPU が一台もない場合は `no HIP device is present; this engine was compiled for ...` のエラーになります。
+バッチはプロセス起動時に環境値を展開する。スクリプト内の変数へ値を設定した後、wheel の extras、CMake configure、配布スクリプト呼び出しに使う。実行中に環境値を再読込する処理や、エンジン側で値を cache する処理はない（`terminal/tools/hip/build_windows.bat:26-28,43-53,76-84,123-125`）。ただし configure は build directory に `build.ninja` がない場合だけなので、既存 build tree で arch を変更した場合、ビルド済み engine と package に渡す arch リストが食い違う可能性がある（同 `:76-85,123-125`）。
 
-ビルド時には CMake の status/warning/error が観測できます。標準 HIP backend が有効な場合、configure 成功時に `Strata: HIP enabled, arch ...` を表示し、未検証アーキテクチャには warning を出します。不許可のアーキテクチャや空リストは configure を停止します。実行時一覧はバイナリに埋め込まれるため、起動後に環境変数を変更しても変化しません。
+CMake は検証後の一覧をセミコロンからコンマ区切りへ変えてコンパイル定義に埋め込む（`engine/cmake/hip_backend.cmake:41-43,106-109`）。実行時の `arch_problem` はデバイス名と GPU の base arch（`gcnArchName` の `:` 以降を切り落としたもの）を埋め込み一覧と完全一致で照合する。未対応 arch または wave サイズ不一致なら理由文字列を返す（`engine/src/core/device.cu:33-64`）。
+
+`strata generate` は primary GPU と、multi-GPU / remote expert cache で使う GPU を検査し、問題があれば stderr に `strata generate: <理由>` を出して終了コード `1` を返す（`engine/src/program/generate.cpp:4969-4982`）。デバイス一覧経路では `strata-device` が `cannot run: <理由>` を表示する（`engine/src/core/device_main.cpp:52-65`）。HIP device が一台もない場合は `device_info` が `no HIP device is present; this engine was compiled for <埋め込み一覧>` の `CudaError` を投げる（`engine/src/core/device.cu:256-264`）。
+
+パッケージスクリプトは `--archs` を `;`、`,`、空白で分割し、arch 名の集合を使って ROCm の rocBLAS / hipBLASLt kernels と `.kpack` を選び、`BUILD.json` の `archs` に記録する。不足 `.kpack` があれば `missing <path>: install the rocm-sdk-device-<arch> wheel and run rocm-sdk init` で終了する（`terminal/tools/hip/package_windows.py:82-94,147-178,189-201`）。
 
 ## 根拠
 
-- `tools/hip/build_windows.bat:13-26,41-49,69-79,87-115` — Windows の既定値、ROCm device package 選択、CMake への転送、画像 reader への既定転送、zip への転送。
-- `tools/dsv41/win/build_hip_win.bat:7-16,32-43` — Windows DSV41 ビルドの既定値と CMake 転送。
-- `tools/dsv41/build_hip_linux.sh:5-16,19-27` — Linux DSV41 ビルドの既定値・空文字扱いと CMake 転送。
-- `CMakeLists.txt:86-93,148-153,190-206` — 標準 HIP backend と gfx906 互換 backend の区別、および標準 backend の include 条件。
-- `cmake/hip_backend.cmake:4-5,13-43,94-105,137` — CMake 側の既定値、アーキテクチャ検証・重複除去、コンパイル定義、configure status。
-- `src/core/device.cu:29-64,70-75,256-264`、`sycl/src/core/device.dp.cpp:46-81,87-92,303-312` — コンパイル済み一覧による HIP GPU の照合、返される診断、GPU 不在時の例外。これらは `STRATA_HIP_ARCHS` 環境変数を実行時に読む処理ではありません。
+- `terminal/tools/hip/build_windows.bat:13-28,43-53,76-85,101-125` — Windows wrapper での読み取り、既定値、wheel・CMake・vision・package への転送。
+- `engine/cmake/hip_backend.cmake:4-5,13-43,106-109,148` — `CMAKE_HIP_ARCHITECTURES` の既定・検証、コンパイル定義と configure 時ログ。
+- `engine/src/core/device.cu:29-64,70-75,224-240,256-264` — compile-time の arch 表と実行時照合、デバイスなし経路。
+- `engine/src/program/generate.cpp:4969-4982`、`engine/src/core/device_main.cpp:52-65` — generate 終了とデバイス一覧表示。
+- `terminal/tools/hip/package_windows.py:82-94,147-178,189-217` — package 引数の parse、arch ごとの収録物、manifest と出力。

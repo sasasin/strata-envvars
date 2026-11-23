@@ -1,52 +1,42 @@
 # `XDG_DOCUMENTS_DIR`
 
-調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-この変数は、Strata Terminal の既存データフォルダー探索と、Linux デスクトップ host の新規モデルライブラリー既定位置の候補に使われる。Terminal 側では `STRATA_DOCUMENTS_DIR` の次に Documents フォルダー候補へ追加し、その中の `Strata/` に既存モデルデータがある場合に選ぶ。host 側では新規モデルフォルダーを `<Documents>/Strata/Models` として組み立てる。どちらも変数だけで既存の保存先を移動しない。`strata_control.discovery.documents_dirs` と host の `defaultModelDirectory` が読み取り元である（`strata_control/discovery.py:65-88,263-295`; `apps/host/server/model-directory-default.mjs:8-19`）。
+Linux のデスクトップ host は、この変数を Documents ディレクトリとして使い、新規インストール時の既定モデル保存先を `<XDG_DOCUMENTS_DIR>/Strata/Models` にする。Terminal 側は `Documents/Strata` に既存モデルがあるかを探す候補の一つとして使う。どちらもモデル保存場所全体を単独で決める設定ではなく、既存設定やモデル状態によって選択されない場合がある。[`app/host/server/model-directory-default.mjs:14-24`](../../../../Niko1221/Strata/app/host/server/model-directory-default.mjs:14) [`terminal/strata_control/discovery.py:65-88`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py:65)
 
 ## 値と判定
 
-| 経路 | unset / 空文字 | 有効になる値（例） | 無効・別扱いの値（例） |
-|---|---|---|---|
-| Terminal (`strata_control.discovery`) | `environ.get()` が偽になるため候補に加えず、`~/Documents` を候補にする | 非空文字列をそのまま `Path` にする。例: `/mnt/archive/Documents` | 文字列としての検証・絶対パス確認・`$HOME` 展開はしない。`relative/docs` も候補になる。Windows 判定時はこの変数を読まず、`USERPROFILE/Documents` と OneDrive 候補を使う。 |
-| Linux デスクトップ host (`defaultModelDirectory`) | 未設定または空文字なら `user-dirs.dirs` を読む | 絶対 POSIX パス。`$HOME` または `${HOME}` は home に置換後に使える。例: `/mnt/archive/Documents`, `${HOME}/Dokumente` | 相対パス、`~`、置換後にも `$` を含む値は採用せず `home/Documents` に fallback。例: `relative/docs`, `~/Docs`, `$(command)`。 |
+| 経路 | unset / 空文字 | 値の処理と例 |
+|---|---|---|
+| desktop host（Linux のみ） | unset または空文字なら `$XDG_CONFIG_HOME/user-dirs.dirs`（未設定なら `~/.config/user-dirs.dirs`）から `XDG_DOCUMENTS_DIR="…"` の行を探す。そこで値を得られない場合は `~/Documents`。 | 環境変数を優先。`${HOME}` と、`/` または文字列末尾に続く `$HOME` を home に置換する。置換後に `$` が残らず絶対パスなら採用。相対値、`$HOMEfoo` など未展開の `$` を含む値は不採用となり `~/Documents` に戻る。空白や大小文字を正規化せず、trim もしない。[^1] |
+| Terminal の discovery（Windows 以外） | unset または空文字なら XDG 候補を追加しない。`~/Documents` は別候補として常に追加される。 | 非空値をそのまま `Path(xdg)` に渡す。`$HOME` 展開や絶対パス検査は行わない。例えば相対値も候補化される。重複する候補は除去される。[^2] |
 
-Terminal 側は環境マップの値の truthiness だけを判定し、パースしない。空文字は未設定と同じ扱いで、非空ならそのまま候補へ追加する。候補が実際に選ばれるには、その候補の `Strata/` に `Models`、`models` または `packs` のいずれかの非空ディレクトリーが必要である（`strata_control/discovery.py:70-88,288-297`）。
-
-host 側は Linux でのみ環境変数を直接見る。`STRATA_MODELS_DIR` が truthy ならそれを解決して即時返却し、この変数を参照しない。そうでなければ truthy な `STRATA_DOCUMENTS_DIR` を先に使い、未設定または空なら `XDG_DOCUMENTS_DIR` を調べる。XDG 値が空なら `XDG_CONFIG_HOME`、または `~/.config` の `user-dirs.dirs` から、`XDG_DOCUMENTS_DIR="..."` に一致する最初の非空・二重引用符内の値を読む。ファイル読取例外は無視する。直接値が相対パスなどで無効でも、設定ファイルを再試行せず `home/Documents` へ fallback する（`apps/host/server/model-directory-default.mjs:9-19`）。
-
-設定ファイル由来・環境変数由来のどちらも、host は `${HOME}` と、末尾または `/` の直前にある `$HOME` を置換する。その後に `$` が残らず、パスが絶対パスである場合だけ採用する。文字列全体のシェル評価や `~` 展開はしない。最終的に選んだ Documents パスへ `Strata/Models` を連結する（`apps/host/server/model-directory-default.mjs:14-19`）。
+[^1]: desktop host は `STRATA_DOCUMENTS_DIR` が非空なら先に採用し、Windows では Windows の known Documents folder を使うため、この XDG 判定に入らない。`STRATA_MODELS_DIR` が非空なら Documents 解決自体を通らず、その path をモデル先にする。[`app/host/server/model-directory-default.mjs:8-24`](../../../../Niko1221/Strata/app/host/server/model-directory-default.mjs:8)
+[^2]: Terminal でも `STRATA_DOCUMENTS_DIR` が非空ならその候補が先に追加される。Windows 分岐では XDG 候補を使わず、`USERPROFILE/Documents` と設定済み OneDrive の Documents を候補にする。[`terminal/strata_control/discovery.py:67-83`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py:67)
 
 ## 有効になる条件
 
-- Terminal の `documents_dirs` では非 Windows 経路に限り、`XDG_DOCUMENTS_DIR` の候補を追加する。Windows 経路はこの変数を参照しない（`strata_control/discovery.py:37-38,73-83`）。
-- Terminal はアプリ自身のプロセス（`STRATA_SETTINGS_FILE` が truthy）では Documents 候補を追加しない。コマンドライン側でも、自分の保存設定とアプリ側データフォルダーが Documents 候補より先に調べられる。CLI の `--data-dir` で指定された場所は launch state に入り、実行時に discovery の既定候補より先に使われる（`strata_control/discovery.py:60-62,263-290`; `strata_cli/launch/cmd.py:81-90`; `strata_cli/launch/runner.py:953-959`）。
-- Linux host が既定パスを計算するときは `STRATA_MODELS_DIR` が最優先で、次に非空 `STRATA_DOCUMENTS_DIR`、その次に `XDG_DOCUMENTS_DIR` が使われる。ただし、host の保存済み `state.modelsDir` は計算した既定パスより優先する。保存済み値がなければ、`STRATA_MODELS_DIR` による固定指定がない場合に限り `STRATA_HOME/models` 以下の既存 GGUF ライブラリーを維持する（`apps/host/server/model-directory-default.mjs:10-19`; `apps/host/server/store.mjs:60-83`）。
-- Terminal の Documents 候補は、`Strata/Models`・`Strata/models`・`Strata/packs` のどれかが存在し、かつ中に項目がある場合だけ採用される。候補がなければ `Catalog` の default が使われる（`strata_control/discovery.py:278-297`; `strata_cli/launch/catalog.py:537-544`）。
-- host 側で既定の Documents フォルダーを作成できない、または読み書き実行権を確認できない場合、`STRATA_HOME/models` に fallback する。host が別に `STRATA_MODELS_DIR`・保存済みフォルダー・既存 GGUF を採用した場合、この XDG 値は選択結果に現れない（`apps/host/server/store.mjs:67-86`）。
+- desktop host では `process.platform === 'linux'` のときだけ環境変数を読む。既定モデル先を計算する際に `STRATA_MODELS_DIR` が未設定で、`STRATA_DOCUMENTS_DIR` も空である必要がある。[`app/host/server/model-directory-default.mjs:8-24`](../../../../Niko1221/Strata/app/host/server/model-directory-default.mjs:8)
+- その値がモデル保存先に反映されるのは、保存済み `state.modelsDir` がなく、`STRATA_MODELS_DIR` による固定もなく、`STRATA_HOME/models` に保持すべき既存モデルがない場合。保存設定または既存モデルがあればそちらが優先される。[`app/host/server/store.mjs:62-85`](../../../../Niko1221/Strata/app/host/server/store.mjs:62)
+- Linux host が選んだ Documents の下に作成・アクセスできなければ `STRATA_HOME/models` に fallback し、通知を警告する。[`app/host/server/store.mjs:77-89`](../../../../Niko1221/Strata/app/host/server/store.mjs:77)
+- Terminal ではデスクトップアプリ内モード（`STRATA_SETTINGS_FILE` が真）でなければ Documents 候補を調べる。候補 `Documents/Strata` に `Models`、`models` または `packs` の中身があるときだけデータディレクトリとして選ぶ。設定ファイル由来の候補が優先され、どれも該当しなければ呼び出し元の既定値を使う。[`terminal/strata_control/discovery.py:60-62`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py:60) [`terminal/strata_control/discovery.py:263-296`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py:263)
 
 ## 実行時の詳細
 
-Terminal 側は `documents_dirs()` が呼ばれるたびに渡された環境マップ（省略時は現在の `os.environ`）を読み、結果を cache しない。`data_dir()` は設定の同期後に候補を順に調べ、Documents 候補については `Strata/` 以下を走査してモデルデータの有無を判定する。既存モデルの run config に実データ位置が書かれている場合は、`Catalog.data_dir_for()` がその位置を優先する（`strata_control/discovery.py:65-88,242-297`; `strata_cli/launch/catalog.py:537-558`）。
+desktop host は `model-directory-default.mjs` の関数呼び出し時に `process.env` を評価し、`store.mjs` のモジュール初期化時に `DEFAULT_MODELS_DIRECTORY` とモデル先を決める。その結果は `MODELS_DIR` として起動中保持されるため、プロセス実行中の環境変数変更を再読込するコードではない。[`app/host/server/store.mjs:62-89`](../../../../Niko1221/Strata/app/host/server/store.mjs:62)
 
-デスクトップ host 側は `store.mjs` のモジュール初期化中に `defaultModelDirectory()` を一度呼び、`DEFAULT_MODELS_DIRECTORY` に保存する。したがって起動後の環境変更は既定パスに反映されない。Linux の XDG 値が未設定・空のときは同じ初期化中に `user-dirs.dirs` を同期読み込みする。既定パス作成時に失敗した場合は host が notice を設定し、起動自体は `STRATA_HOME/models` を使って続行する（`apps/host/server/store.mjs:60-87`; `apps/host/server/model-directory-default.mjs:8-19`）。
-
-`strata_control/discovery.py` は XDG 設定ファイルを読み込まず、環境変数値だけを候補として使う。一方、Linux host は直接値が空の場合に限り `XDG_CONFIG_HOME/user-dirs.dirs`（未設定時は `~/.config/user-dirs.dirs`）を読む。このため、環境変数が空でも XDG 設定ファイルの Documents 設定が有効になるのは host 経路であり、Terminal 経路では `~/Documents` が候補になる（`strata_control/discovery.py:65-88`; `apps/host/server/model-directory-default.mjs:13-19`）。
+Terminal の `documents_dirs()` は `data_dir_choices()` / `data_dir()` の呼び出しごとに渡された `environ`（省略時は `os.environ`）を参照する。選択済みの data directory は後段の `Catalog.data_dir()` 経由で CLI のモデル管理などに使われる。[`terminal/strata_control/discovery.py:65-88`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py:65) [`terminal/strata_control/discovery.py:263-290`](../../../../Niko1221/Strata/terminal/strata_control/discovery.py:263) [`terminal/strata_cli/launch/catalog.py:753-760`](../../../../Niko1221/Strata/terminal/strata_cli/launch/catalog.py:753)
 
 ## ログと測定値
 
-Terminal の Documents 候補探索自体には、この変数に関するログ出力・終了・失敗処理はない。ディレクトリー列挙時の `OSError` は `_holds_models()` が `False` として扱い、後続候補または既定値へ進む（`strata_control/discovery.py:288-297`）。
-
-host が既定 Documents フォルダーを作成・検査できなければ、stderr に `[strata] ` と `Strata could not use <preferred> for models (<error code または message>), so models go to <legacy>. You can pick another folder in Settings.` を出す。作成失敗以外に、XDG 値の無効さだけを示す警告はない。測定値は該当なし（`apps/host/server/store.mjs:75-86`）。
+desktop host は起動時に選択済みモデル先を `models dir   ·  <path>` と出力する。既定 Documents 先を作成またはアクセスできない場合は stderr に `[strata] Strata could not use <preferred> for models (<error>), so models go to <legacy>. You can pick another folder in Settings.` と警告する。XDG 値が無効で `~/Documents` に戻っただけの場合、専用の警告はない。[`app/host/server/index.mjs:310-316`](../../../../Niko1221/Strata/app/host/server/index.mjs:310) [`app/host/server/store.mjs:77-89`](../../../../Niko1221/Strata/app/host/server/store.mjs:77)
 
 ## 根拠
 
-- `strata_control/discovery.py:65-88` — Documents 候補の生成、OS 分岐、`STRATA_DOCUMENTS_DIR` と XDG の順序。
-- `strata_control/discovery.py:263-297` — Terminal の設定候補との優先、アプリモードでの除外、Documents データの存在判定。
-- `strata_cli/launch/catalog.py:537-558` — CLI catalog から discovery を呼び、モデル単位の保存先を優先する経路。
-- `strata_cli/launch/cmd.py:81-90`; `strata_cli/launch/runner.py:953-959` — `--data-dir` を launch state の明示指定として使う経路。
-- `apps/host/server/model-directory-default.mjs:8-19` — host の環境値・設定ファイル・絶対パス判定・fallback。
-- `apps/host/server/store.mjs:60-87` — 初期化時の既定値保持、保存済み／既存ライブラリーの優先と失敗 notice。
-- `docs/TERMINAL_LAUNCH.md:195`; `docs/INSTALL.md:140` — データフォルダー探索とデスクトップ初期保存先の概要。詳細な値判定は上記実装に基づく。
+- `app/host/server/model-directory-default.mjs:8-25` — desktop host の優先順位、Linux XDG 判定、設定ファイル fallback、HOME 展開と絶対パス判定。
+- `app/host/server/store.mjs:62-89` — 読み取り時期、保存済み値・既存モデルとの優先関係、作成失敗時の fallback と警告。
+- `app/host/server/index.mjs:310-316` — 起動時の選択済みモデルディレクトリ出力。
+- `terminal/strata_control/discovery.py:65-88,263-296` — Terminal 側の候補生成と実際の選択条件。
+- `terminal/strata_cli/launch/catalog.py:753-760` — Terminal の catalog から discovery を呼ぶ経路。

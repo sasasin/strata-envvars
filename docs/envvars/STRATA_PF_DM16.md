@@ -1,47 +1,49 @@
 # `STRATA_PF_DM16`
 
-調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-HIP の prompt fused native expert 経路で、対応する F16 down kernel が expert ごとの down 出力行を FP32 ではなく FP16 で一時バッファ `Dm` に書き、MoE combine も FP16 入力用 kernel に切り替えるスイッチです。書込み・読込みバイト数は半分になりますが、値はFP16へ丸められ、絶対値が65504を超える値は飽和します。decode側や通常のMMQ/FP16 expert経路を切り替えるものではありません。`src/prefill/prefill.cpp:931-935,5540-5554,7091-7099`、`src/prefill/moe_f16_common.cuh:248-255`。
+prompt の fused native MoE 経路で、対象となる F16 down カーネルの expert 出力行を FP32 ではなく FP16 で書き、後段を `moe_combine16` に切り替える要求スイッチです。FP16 の down 行は各値を半精度へ変換し、有限範囲を `[-65504, 65504]` に飽和させます。設定だけでは fused 経路や F16 カーネルを選択せず、カーネル選択条件が満たされない層では通常の FP32 行と `moe_combine` のままです（`engine/src/prefill/prefill.cpp:980-984, 5698-5704, 5830-5844, 7622-7630`; `engine/src/prefill/moe_fused_iq.cu:3781-3788`; `engine/src/prefill/moe_f16_common.cuh:229-253`）。
+
+主な利用経路は AMD gfx11 の prompt fused native expert カーネルです。Strata の gfx11 既定値テーブルは `STRATA_PF_DM16=1` を加える場合があります（後述）。decode、非 native fused expert 経路、同梱ツールからこの値を読む実装は見つかりませんでした。
 
 ## 値と判定
 
-`pf_dm16()` は最初に呼ばれたとき `std::getenv` の結果を関数内 `static const bool` に保存し、値が未設定でなく先頭文字 `e[0]` が ASCII の `'1'` なら有効にします。文字列全体や数値としての妥当性は検査せず、大文字小文字・空白の正規化もしません。したがって `1`、`10`、`1anything` は有効、`0`、`true`、` 1`、空文字は無効です。未設定も無効です。`src/prefill/prefill.cpp:932-935`。
+`prefill.cpp` の `pf_dm16()` は `std::getenv` の戻り値が非 null で、かつ先頭文字 `e[0]` が文字 `'1'` の場合だけ true とします。文字列全体・数値としての妥当性・大文字小文字・後続文字は検査しません。従って空文字は false、`1` と `1anything` は true、`10` も true、`0`・`0anything`・`true`・` 1` は false です。unset は false です（`engine/src/prefill/prefill.cpp:981-984`）。
 
-| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
 |---|---|---|---|
-| 通常の実行時判定 | 無効（ただし下記の起動時既定値が設定された場合を除く） | 先頭文字が `1` の文字列（`1`, `10`, `1x`） | 空文字、`0`, `true`, ` 1`, `x1` |
-| Windows の統合 gfx1151 で統合GPU prompt set が適用される場合 | 起動時に `1` がセットされる | `0` を含め先頭文字が `1` の値 | 明示的に設定された空文字や `0` など。設定済み値は既定値で置換されない |
+| `pf_dm16()` の判定 | false（ただし gfx11 起動時の既定設定が先に値を設定する場合あり） | 先頭文字が `1` の値: `1`, `10`, `1anything` | 空文字、`0`, `0anything`, `true`, ` 1` |
 
-値に範囲や数値変換はありません。`STRATA_PF_DM16=10` も `1` と同じ真偽判定です。`pf_dm16()` を一度呼んだ後に環境を変更しても、そのプロセス内のこの判定には反映されません。`src/prefill/prefill.cpp:932-935`。
+関数内 `static const bool` に初回評価結果を保存します。したがって `pf_dm16()` の初回呼び出し後にプロセス環境を変更しても、この判定には反映されません。値を読む際に CLI 引数や設定ファイルとの比較はなく、コード中で確認できる既定値設定との関係は「unset のときだけ Strata が設定し、利用者が設定した値はそのまま残す」です（`engine/src/prefill/prefill.cpp:981-984`; `engine/src/core/arch_defaults.cpp:218-223, 302-309, 334-343`）。
 
 ## 有効になる条件
 
-- 変数が有効であることに加え、prompt が `fused_l` のレイヤーを `fused_nat` として `fused::experts_native` に渡す必要があります。fused path 自体が選ばれないレイヤーには適用されません。`src/prefill/prefill.cpp:5436-5445,5540-5554`。
-- この native F16 実装は HIP ビルドかつ gfx1100/1101/1102/1150/1151 向けにコンパイルされたカーネルです。gfx12 は native expert のWMMA配置が異なるためこのF16経路を使わず、CUDAビルドにもこのHIP実装はありません。`src/prefill/moe_f16_common.cuh:38-45`、`src/prefill/moe_fused_iq.cu:3171-3178`。
-- down kernel が F16 対応である必要があります。通常は `STRATA_PF_F16=1` で選ばれるF16経路（K-quant down、または `Q2_0` / `IQ4_NL` / `Q8_0` / `Q5_0`）が対象です。gfx1151 の `Q8_0` down は `STRATA_PF_Q8D_F16=0` で無効化されていない既定F16経路でも対象になります。対応しない形式ではFP32 down rowsを使い、`dm_f16_used()` はfalseになります。`src/prefill/moe_fused_iq.cu:2558,2591-2606,3171-3178,3220-3225`。
-- prefill caller はこの要求を `rows_cpu == 0`、`peer_now == false`、および `m.shared` と `m.bo` のアドレスがともに16-byte整列している場合に限って fused 層へ渡します。この条件を満たさないときはスイッチが真でもFP16 rows要求を出しません。`src/prefill/prefill.cpp:5540-5544`。
-- Windows の統合 gfx1151 で `apply_arch_defaults` の統合GPU prompt set が適用される場合、未設定なら `STRATA_PF_DM16=1` が起動時に補われます。この既定セットは `STRATA_IGPU_DEFAULTS=0`、`STRATA_IGPU_PROMPT_SET=0` で抑止でき、ユーザーが空文字を含む何らかの値を設定していればその値が優先されます。Linux gfx1151、gfx1103/1150、離散GPUにはこの変数の同じ既定値はありません。`src/core/arch_defaults.cpp:123-136,169-177,187-213,358-373`。
+- 実行が prompt の MoE 処理を通り、その層で `fused_nat` が true であること。コード上これは MMQ 計画の対象、`stream_all`、peer 計算なし、native レイアウト、対応する重み形式（または対応条件を満たす folded layer）などを要します。通常の fused/非 native 経路ではこの値を渡さず、FP32 down 行を使います（`engine/src/prefill/prefill.cpp:5692-5704, 5830-5847`）。
+- `moe_fused_iq.cu` が対象ビルドに含まれ、その native 経路に到達すること。該当実装は HIP/CUDA コンパイル分岐を持ち、機能のコメントとカーネル選択条件は gfx11 の F16 expert カーネルを示します。ビルドされない fused 実装の stub は要求を受けても何もしません（`engine/src/prefill/prefill.cpp:180-203`; `engine/src/prefill/moe_fused_iq.cu:3781-3835`）。
+- down が F16 カーネルを使うこと。HIP では `STRATA_PF_F16` が `1` または `2` であると F16 が要求されます。さらに down の形式が F16 対応であるか、F16 要求が false の場合でも `f16_q8d`（Q8_0 down の既定 F16 経路）が選ばれる必要があります。非対応形式・gfx12 (`d.w12`)・他の down カーネルでは DM16 になりません（`engine/src/prefill/moe_f16_common.cuh:55-62`; `engine/src/prefill/moe_fused_iq.cu:3781-3788, 3830-3836`）。
+- prompt 呼び出し側が追加条件を満たすこと: `rows_cpu == 0`、`peer_now == false`、`m.shared` と `m.bo` の両ポインターが 16-byte aligned であること。どれかを満たさない場合は `want_dm_f16(false)` が渡ります（`engine/src/prefill/prefill.cpp:5830-5844`）。
+- fused native 関数内で要求後にも形式別判定を通ること。実装は `d16` を算出して直近カーネルが FP16 を書いたか `dm_f16_used()` で返し、呼び出し元がそれを受けた場合だけ `moe_combine16` を選びます。別経路や別形式なら FP32 用 combine です（`engine/src/prefill/moe_fused_iq.cu:3786-3788`; `engine/src/prefill/prefill.cpp:5840-5844, 7622-7630`）。
+
+起動時に既定で有効化する条件もあります。RDNA3 discrete `gfx1100/1101/1102` では WMMA 既定値テーブルが `STRATA_PF_DM16=1` を含み、`STRATA_DEFAULTS=026`、`STRATA_GFX11_DEFAULTS` が先頭文字 `0`、または `STRATA_GFX11_WMMA_DEFAULTS` が先頭文字 `0` のときはこのテーブル自体が無効です。Windows `gfx1151` の別テーブルにも `STRATA_PF_DM16=1` が含まれます。いずれも既に環境変数が設定されていれば（空文字や `0` も含む）Strata は上書きしません。これらの設定は機能の成立を保証するものではなく、上記の prompt・native・F16 条件は別途必要です（`engine/include/strata/core/gfx11_extra.hpp:27-37, 87-114`; `engine/src/core/arch_defaults.cpp:190-209, 302-343`）。
 
 ## 実行時の詳細
 
-HIP native expert 呼出しごとにスレッドローカルの `g_dm16_want` をcallerが設定します。native expert関数は各呼出しの冒頭で `g_dm16_used` をfalseに戻し、F16 down形式と希望フラグが揃うとD16 kernelを選んでFP16 rowsを書きます。通常のF16 down epilogueは値を `[-65504, 65504]` に制限してhalfへ変換します。`src/prefill/moe_fused_iq.cu:3049-3054,3114-3118,3176-3185,3220-3225`、`src/prefill/moe_f16_common.cuh:248-255`。
+prompt 層の fused native 処理で、呼び出し側が `pf_dm16()` を評価して `want_dm_f16(...)` に渡します。この読み取りは `static` にキャッシュされます。要求値は `moe_fused_iq.cu` の `thread_local` 状態に保存され、`experts_native()` は各呼び出しの冒頭で前回の `dm_f16_used` を false に戻します。F16 down 対応時だけ `d16` を true にして、down kernel の FP16 出力テンプレート経路を選びます。FP16 出力の各値は上記範囲に飽和後 half に変換されます。呼び出し元はその呼び出しの `dm_f16_used()` を受け取り、CPU 行がないとき `moe_combine16` に分岐します。この combine は down 行を half から float に戻して重み付き加算し、shared 経路と合成します（`engine/src/prefill/prefill.cpp:5831-5844, 7622-7630`; `engine/src/prefill/moe_fused_iq.cu:3596-3601, 3686-3701, 3786-3795`; `engine/src/prefill/moe_f16_common.cuh:229-253`; `engine/src/prefill/kernels.cu:2442-2469`）。
 
-fused呼出し後、callerは `dm_f16_used()` を読みます。peer側のsumがない場合、`dm16_used` が真かつCPUが担当したrowsがないと `moe_combine16` を実行し、それ以外は通常のFP32 `moe_combine` へ進みます。`moe_combine16` は読み込んだhalfをfloatに戻して、通常combineと同じFMA順でroute weightを掛けて足し、shared expert項を加えます。出力経路は変わりますが、中間down値がFP16に丸められるため数値はFP32 rowsの場合と一致するとは限りません。`src/prefill/prefill.cpp:5553-5554,7086-7099`、`src/prefill/kernels.cu:2384-2410,3435-3440`。
-
-値は `pf_dm16()` の最初の呼出し時に一度だけキャッシュされます。HIP native kernel側の要求フラグと使用結果はホストスレッドごとの `thread_local` 状態です。子プロセスへの設定・引継ぎをこの変数について行うコードは確認できません。`src/prefill/prefill.cpp:932-935`、`src/prefill/moe_fused_iq.cu:3049-3054`。
+DM16 固有の CLI 引数、リクエストごとの再読み取り、子プロセスへの転送は見つかりませんでした。`pf_dm16()` の読み取り箇所は一つです。ソース全体で他の候補名参照も確認し、`gfx11_extra.hpp` と `arch_defaults.cpp` は値を読み取る箇所ではなく unset 時の値設定、テストや設定レジストリは実行時読み取りではないことを区別しました。
 
 ## ログと測定値
 
-DM16だけを有効化・無効化したことを示す専用ログや、失敗時のDM16専用エラー経路はありません。既定値が適用されたWindows統合GPU起動では、統合GPU prompt set のログに設定済みスイッチ名が列挙され、その中に `PF_DM16` が含まれます。kernel起動エラーは `ck` による通常のCUDA/HIPエラーチェックへ進みます。`src/core/arch_defaults.cpp:358-373`、`src/prefill/moe_fused_iq.cu:3135-3142,3240-3243`。
+この変数だけに対する有効・無効ログ、警告、エラーはありません。gfx11 既定値を適用した起動では一般の既定スイッチ一覧ログに `PF_DM16` が含まれます。ユーザーが `STRATA_PF_DM16` を設定済みの場合は既定値一覧に追加されず、同変数はログされません（`engine/src/core/arch_defaults.cpp:334-344`）。
 
-ソースコメントのRound 0215測定では、Windows gfx1151の8K interleaved pairsで、IQ3_Sは1.022倍（4組中4組）、UD-IQ4_XSは1.026倍（3組中3組）、UD-Q4_K_XLは1.012倍（4組中3組）と記載されています。同コメントはfirst-token KLを8Kで `1e-4`、agent transcriptで `0.02-0.04` と記しますが、計測条件の詳細はこのソース範囲にありません。これらはコードコメントに記載された値であり、本調査で再測定したものではありません。`src/core/arch_defaults.cpp:204-207`。
+コードコメントには down 行の書き込み・読み込みバイト数が半分になるとの説明がありますが、この調査では実測条件を示す資料を確認できなかったため、性能測定値は記載しません（`engine/src/prefill/prefill.cpp:980`; `engine/src/prefill/kernels.cu:2442-2443`）。
 
 ## 根拠
 
-- 読取・値判定・キャッシュ: `src/prefill/prefill.cpp:931-935`
-- HIP gfx11 F16 down-format選択とDM16要求: `src/prefill/moe_fused_iq.cu:3171-3185,3220-3225`
-- 既定値の設定と条件: `src/core/arch_defaults.cpp:123-136,169-177,187-213,358-373`
-- FP16書込みとcombine切替: `src/prefill/moe_f16_common.cuh:248-255`, `src/prefill/prefill.cpp:7091-7099`, `src/prefill/kernels.cu:2384-2410`
+- `engine/src/prefill/prefill.cpp:980-984` — 環境値の読み取りと static cache。
+- `engine/src/prefill/prefill.cpp:5692-5705, 5830-5844, 7622-7630` — native prompt 経路、呼び出し条件、FP16 combine の選択。
+- `engine/src/prefill/moe_fused_iq.cu:3596-3601, 3686-3701, 3781-3836` — thread-local 要求、実際の down 出力形式の判定とカーネル選択。
+- `engine/src/prefill/moe_f16_common.cuh:229-253`; `engine/src/prefill/kernels.cu:2442-2469, 3502-3508` — FP16 down 出力の飽和・変換と combine。
+- `engine/include/strata/core/gfx11_extra.hpp:27-37, 87-114`; `engine/src/core/arch_defaults.cpp:218-223, 302-343` — gfx11 既定値、利用者設定優先、既定スイッチログ。

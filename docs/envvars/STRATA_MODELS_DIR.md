@@ -1,45 +1,60 @@
 # `STRATA_MODELS_DIR`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata ホストが使うモデル保存先の既定候補を明示する環境変数です。保存済みフォルダーがない場合、ホストは値を候補として作成・検査します。モデル一覧・ファイル探索・空き容量表示や native engine の準備先は、最終的に選ばれた `MODELS_DIR` を使います（`apps/host/server/model-directory-default.mjs:8-19`、`apps/host/server/store.mjs:61-87`、`apps/host/server/models.mjs:32-51,129`、`apps/host/server/native-control.mjs:162-164`）。
-
-これは `apps/host/server` の設定です。通常の C++ 推論 engine がこの名前を読む実装は確認できません。検索結果にある `apps/desktop/scripts/*` や `apps/host/tests/*` の多くは、テスト対象プロセスへ値を渡す側です。
+App Host が新しいモデルライブラリに使う既定パスを指定する。値が空でなく、保存済みの `state.modelsDir` がない場合、ホストは値を実行 OS のパス規則で絶対パス化してモデルディレクトリ候補にする。モデルファイルの配置・検出、モデル用ディスク容量の表示、およびネイティブエンジンのダウンロード準備にこのディレクトリが使われる。モデルそのものの読み込みを起動時に行わせる設定ではない（`app/host/server/model-directory-default.mjs:8-11`; `app/host/server/store.mjs:62-89,306-308`; `app/host/server/models.mjs:32-44,129`; `app/host/server/index.mjs:141,184,306-315`; `app/host/server/native-control.mjs:273`).
 
 ## 値と判定
 
-| 環境値 | 判定と結果 |
-|---|---|
-| 未設定 | `defaultModelDirectory()` は OS ごとの Documents 配下を既定候補にします。ホストは後述の保存済み設定・既存ライブラリも考慮します。 |
-| 空文字 | JavaScript の falsy 判定で未設定と同じです。明示的な空パスとしては扱いません。 |
-| 空でない文字列 | `path.resolve()` で絶対パスに変換し、モデルディレクトリの既定候補にします。相対値はホストの現在の作業ディレクトリ基準です。値の trim、形式検証、存在確認はこの変換時には行いません。 |
-| 候補を作成・利用できない | 起動時の `mkdirSync` / 読み書き実行権限確認が失敗すると、`STRATA_HOME/models` に fallback し、警告を記録します。 |
+| 条件（実行環境） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| App Host の初期化時 | `Documents/Strata/Models` を既定候補にする（OS ごとの Documents 解決は下記） | 空でない文字列。`path.resolve` に渡し、相対値はホストの現在作業ディレクトリ基準で絶対化する | 空文字 `''` は falsy のため未設定と同じ。`0`、`false`、`true` は文字列として真なのでパスとして扱われ、論理値としては解釈されない |
+| `state.modelsDir` が保存済み | 環境変数の有無にかかわらず保存済みディレクトリ | 保存済みパスが優先される | 該当なし |
 
-`defaultModelDirectory()` には数値変換や値域制限はありません。パスとして不正な値でファイル操作が失敗した場合は fallback 対象になります（`apps/host/server/model-directory-default.mjs:8-10`、`apps/host/server/store.mjs:67-81`）。
+環境変数は `process.env.STRATA_MODELS_DIR` の真偽値だけで判定し、数値変換、真偽文字列の比較、空白除去、値全体の別形式検証はしない。したがって `''` は採用されない一方、`'0'`、`'false'`、空白だけの値は候補になる。値があると `defaultModelDirectory()` は `path.resolve(value)` を返す。区切り文字、ドライブ文字、相対パスの意味は実行 OS の `node:path` に従う（`app/host/server/model-directory-default.mjs:8-11`）。
+
+保存済みパスがない場合も、環境変数が常に選択結果を決めるわけではない。`pickModelsDirectory()` はまず保存済み `state.modelsDir` を返し、次に環境変数が空でない場合を除いて `STRATA_HOME/models` 以下に既存の GGUF 重みがあればそれを保持する。どちらにも該当しなければ環境変数由来の候補を作成して読み書き・実行可能性を確認し、成功すればその realpath を使う。作成・確認に失敗すると `STRATA_HOME/models` に fallback する（`app/host/server/store.mjs:62-85`）。
+
+環境変数由来の候補が作れない場合や使えない場合の fallback は、`STRATA_HOME/models` と警告である。警告文は `Strata could not use <候補> for models (<エラーコードまたはメッセージ>), so models go to <fallback>. You can pick another folder in Settings.`。`MODELS_DIR_NOTICE` が空でない場合、起動時に `[strata] ` を付けて `console.warn` に出す（`app/host/server/store.mjs:77-89`）。
+
+候補パス自体の既定値は OS によって異なる。Windows は Documents の Known Folder を取得し、取得に失敗した場合は `<home>/Documents`。Linux は `STRATA_DOCUMENTS_DIR`、`XDG_DOCUMENTS_DIR` または `user-dirs.dirs` の値を解決し、有効な絶対パスが得られなければ `<home>/Documents`。macOS 等のその他の OS は `<home>/Documents`。いずれも末尾に `Strata/Models` を付ける（環境変数が空でないときはこの既定値解決を使わない。`app/host/server/model-directory-default.mjs:8-25`）。
+
+他の優先順位・相互作用:
+
+- `state.modelsDir`（ホストの `STRATA_HOME/data/state.json` 由来）が `STRATA_MODELS_DIR` より優先される。ホストの CLI 引数でこの環境変数を上書きする処理は確認できない（`app/host/server/store.mjs:30-32,52-63,69-70,85`）。
+- `STRATA_MODELS_DIR` が非空なら、保存済みパスがないときに限り、`STRATA_HOME/models` 内の既存重みを優先する分岐を抑止する（`app/host/server/store.mjs:74-85`）。
+- ネイティブエンジン準備時、選択済みディレクトリが既定 Documents パスと一致する場合、ホストは `data_dir` を一段上のディレクトリに変換してモデルの `models` 配下が同じ場所になるよう調整する。環境変数が非空ならこの既定パス用変換を行わない。ただし `STRATA_HOME/models` を保持している経路の互換リンク処理が先にある（`app/host/server/store.mjs:91-111`; `app/host/server/native-control.mjs:273`）。
+- デスクトップ更新確認では、Rust 側が `STRATA_MODELS_DIR` を含むカスタムプロファイル変数群について、未設定または空でないものを検出する。値のパスは読み取らず、非空の場合に更新 verdict の `customProfileEnv` に名前を含め、ホストは「そのランチャーで再起動するように」という警告を表示する。これはモデル保存先の選択とは別の診断経路である（`app/desktop/src-tauri/src/updater.rs:28-36,73-79,181-197`; `app/host/server/updates.mjs:109-123`）。
 
 ## 有効になる条件
 
-- `apps/host/server` のホストプロセスで有効です。backend や GPU の種類による分岐はありません。ホスト起動時に `store.mjs` が `defaultModelDirectory()` を呼びます（`apps/host/server/store.mjs:7,60-61`）。
-- `STRATA_MODELS_DIR` が空でない場合、その絶対化したパスが Documents 等から作る既定候補より優先されます。ただし、保存状態の `state.modelsDir` がある場合は `pickModelsDirectory()` がそれを最初に返すため、保存済みフォルダーが環境変数より優先されます（`apps/host/server/store.mjs:50-58,67-68,83`）。
-- 保存済みフォルダーがない場合、環境変数が未設定なら `STRATA_HOME/models` 内に GGUF ファイルがあるとその既存ライブラリを保持します。環境変数が空でない場合はこの既存ライブラリ優先判定を飛ばし、環境変数の候補を使います（`apps/host/server/store.mjs:72-75,83`）。
-- 空でない環境変数の候補を作成・利用できなければ `STRATA_HOME/models` に fallback します。したがって有効な値でも、保存済み状態がある場合や候補へのアクセスに失敗した場合には、そのパスが実際の保存先にならないことがあります（`apps/host/server/store.mjs:67-81,83`）。
-- 既定候補の生成には `STRATA_DOCUMENTS_DIR`、Windows の既知 Documents フォルダー、Linux の `XDG_DOCUMENTS_DIR`（または `user-dirs.dirs`）、最後の `home/Documents` が関係します。これらは `STRATA_MODELS_DIR` が空または未設定の場合に限る経路です（`apps/host/server/model-directory-default.mjs:11-19`）。
-- CLI 引数による `STRATA_MODELS_DIR` の上書き・優先順位はありません。ホストの Settings でモデルフォルダーを変更すると、選んだパスを状態ファイルに保存し、同じプロセス内の `MODELS_DIR` も更新します。次回起動時はその保存値が環境変数より優先されます（`apps/host/server/store.mjs:131-139`）。
+- 対象は `app/host/server/store.mjs` を読み込む App Host プロセス。値はホスト起動時のモジュール初期化でモデル既定値と `MODELS_DIR` に反映される。
+- 保存済み `state.modelsDir` があると、その値が環境変数より優先される。
+- 新しい既定候補が使われるには、ディレクトリ作成と `R_OK | W_OK | X_OK` の確認が成功する必要がある。失敗時は `STRATA_HOME/models` に fallback し、理由を警告する。
+- 既存の `STRATA_HOME/models` に GGUF 重みがあり、環境変数が空または未設定なら、その既存ライブラリを優先する。
+- ネイティブ準備時のパス変換は入力ディレクトリが既存であること、`MODELS_DIR_NOTICE` が空であることなどにも依存する。保存済みディレクトリや既存モデル個別の run data folder が選ばれる場合は、既定値用変換の対象にならない（`app/host/server/store.mjs:91-111`; `app/host/server/native-control.mjs:273`）。
+- CUDA/HIP/SYCL 等の backend や GPU の有無は、この環境変数によるホスト側パス選択の条件ではない。モデル起動時にロードするかどうかも別の制御であり、ホスト起動時には記憶済みモデルをロードしない（`app/host/server/index.mjs:306-308`）。
 
 ## 実行時の詳細
 
-`store.mjs` のモジュール初期化時に状態ファイルを読み、環境変数から既定候補を作って `MODELS_PICK` と `MODELS_DIR` を初期化します。選択結果はプロセス内の `MODELS_DIR` として保持されるため、起動後にプロセス環境を書き換えても再評価されません。Settings からの変更だけは `MODELS_DIR` を更新します（`apps/host/server/store.mjs:50-61,83-87,131-139`）。
+ホストの `store.mjs` 初期化時に状態ファイルを読み、次に `defaultModelDirectory()` を呼んで環境変数から既定候補を決め、`pickModelsDirectory()` の結果を `MODELS_DIR` に保持する。ディレクトリ決定はプロセス起動ごとに行われ、実行中に `process.env.STRATA_MODELS_DIR` を変更しても `DEFAULT_MODELS_DIRECTORY` や `MODELS_DIR` は再計算されない。環境変数を再読する `nativeDataDirectory()` の分岐だけは呼び出し時点の `process.env` を参照する（`app/host/server/store.mjs:62-89,92-111`）。
 
-`STRATA_MODELS_DIR` の候補を採用する前に `pickModelsDirectory()` は再帰作成し、読み書き実行権限を確認して実パスを採用します。失敗時は `STRATA_HOME/models` を使い、stderr に `[strata] Strata could not use <候補> for models (<エラーコードまたはメッセージ>), so models go to <fallback>. You can pick another folder in Settings.` の形式で警告します（`apps/host/server/store.mjs:75-86`）。起動時には標準出力にも `models dir   ·  <選択パス>` を出し、host の状態応答にも `modelsDir` と `modelsDirNotice` を含めます（`apps/host/server/index.mjs:280-301`）。
+選択された `MODELS_DIR` は、モデルファイル探索とダウンロード先のパス生成、インストール状態判定、ライブラリの空き容量表示に使われる。`/api/hardware` のディスク情報にも含まれる。ホスト起動時に `models dir   ·  <パス>` を標準出力へ表示する（`app/host/server/models.mjs:32-44,46-51,129`; `app/host/server/hardware.mjs:75-80`; `app/host/server/index.mjs:310-315`）。
 
-選ばれたパスはモデルファイルの探索・配置と容量情報に使われ、native engine の準備時には `modelsDirectory()` として渡されます（`apps/host/server/models.mjs:32-51,129`、`apps/host/server/hardware.mjs:75-80`、`apps/host/server/index.mjs:164`）。native 準備先の調整では、環境変数が空でないときは Documents 既定位置向けの `models` / `Models` 整合処理を行わず、入力されたディレクトリをそのまま返します（`apps/host/server/store.mjs:90-109`）。
+ネイティブエンジン準備では、既存モデル固有のデータフォルダーや UI の保存済みダウンロード先がなければ `MODELS_DIR` が入力候補となり、`nativeDataDirectory()` による `data_dir` 調整後に準備引数へ渡される。したがって値はモデル配置先を選ぶが、環境変数だけで既存モデルの実行設定や記憶済み保存先を移動するわけではない（`app/host/server/index.mjs:184`; `app/host/server/native-control.mjs:273`）。
+
+## ログと測定値
+
+測定値の記載はない。観測できる出力は、選択したパスの起動時標準出力 `models dir   ·  <パス>` と、既定候補を利用できず fallback した場合の `[strata] Strata could not use ...` 警告。更新確認で値が非空なら、設定画面の更新結果に `This session uses custom profile paths (STRATA_MODELS_DIR). Reopen Strata through that launcher after updating to keep the same profile.` を含める。モデルディレクトリ変更 API は候補ディレクトリが無効な場合 HTTP 400 と `validateModelsDirectory()` のエラー文を返すが、この検証は環境変数自体の parse ではない（`app/host/server/store.mjs:82-89,114-130`; `app/host/server/index.mjs:315,1566-1571`; `app/desktop/src-tauri/src/updater.rs:193-196`; `app/host/server/updates.mjs:113-123`）。
 
 ## 根拠
 
-- 値から既定候補への変換と、Documents 系の fallback: `apps/host/server/model-directory-default.mjs:7-19`
-- 状態読み込み・既存ライブラリ判定・候補の検査、fallback と警告: `apps/host/server/store.mjs:50-87`
-- native engine 準備先の扱い: `apps/host/server/store.mjs:90-109`、呼び出しへの接続 `apps/host/server/native-control.mjs:162-164`
-- 起動時のログと応答への公開: `apps/host/server/index.mjs:280-301`
-- 選択先を使うモデル探索と容量表示: `apps/host/server/models.mjs:32-51,129`、`apps/host/server/hardware.mjs:75-80`
+- `app/host/server/model-directory-default.mjs:8-25` — 環境変数の truthy 判定、絶対パス化、OS 別 Documents 既定候補。
+- `app/host/server/store.mjs:52-89` — 状態読み込み、既定候補と保存済みパスの優先順位、既存重み保持、fallback と警告。
+- `app/host/server/store.mjs:91-111,114-141` — ネイティブ用ディレクトリ調整と、UI/API からの保存先変更。
+- `app/host/server/models.mjs:32-44,46-51,129` — モデルパス、ディスク検出・利用量。
+- `app/host/server/index.mjs:306-315,141,184,1545-1549,1566-1589` — 起動時ロードなし、ログ、依存サービスへの供給、API。
+- `app/host/server/hardware.mjs:75-80`; `app/host/server/native-control.mjs:273` — ハードウェア情報とネイティブ準備への利用。
+- `app/desktop/src-tauri/src/updater.rs:28-36,73-79,181-197`; `app/host/server/updates.mjs:109-123` — 空でない設定の検出と更新警告。

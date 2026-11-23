@@ -1,51 +1,46 @@
 # `STRATA_ENGINE_NICE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata の Python サーバーが engine 子プロセスを起動するとき、その子プロセスに `os.nice()` で加える nice 値を指定します。対象は `StrataEngine` 経由で起動する engine です。サーバー通常起動のほか、replica と split serving も同じ `StrataEngine` を使います。engine の CLI 引数や engine 自身の環境設定を変更する変数ではありません。
+Strata サーバーが engine 子プロセスを起動する際、Linux でその子プロセスに適用する nice 増分を選ぶ。正の値なら engine のプロセス優先度を下げる。明示値は GPU/backend や engine の CLI 引数を変えず、`os.nice(nice)` を `preexec_fn` から呼ぶことで起動時のプロセス nice を設定する。サーバーは適用値が 0 より大きいときだけ標準出力に案内を出す（`terminal/serve/server.py:817-829`）。
 
-Linux で変数が未指定または空白だけの場合、KFD topology から検出した GPU のいずれかが内蔵 Radeon の対象 architecture なら nice increment 5、それ以外なら 0 です。対象 architecture は `gfx1035`, `gfx1036`, `gfx1037`, `gfx1103`, `gfx1150`, `gfx1151`, `gfx1152`, `gfx90c` です。
+未設定時の Linux 既定値は、KFD topology から得た GPU arch のいずれかが `HIP_IGPU_ARCHS` に含まれると `5`、それ以外は `0`。対象 arch 一覧は `terminal/serve/server_parts/engines.py:1017`。この判定は engine の backend 設定ではなくホストの topology を調べるため、GPU を使わない経路や別 backend の engine でも条件が一致すれば値を返す（`terminal/serve/server.py:3736-3737`）。
 
 ## 値と判定
 
-| 状況 | `engine_nice()` の結果 |
-|---|---:|
-| `sys.platform` が `linux` で始まらない | `0`。環境変数も GPU topology も調べない |
-| Linux、未設定または空文字・空白のみ | 対象 architecture の GPU が一つ以上あれば `5`、それ以外は `0` |
-| Linux、整数として変換できる値 | `0`〜`19` に clamp した値 |
-| Linux、空白を除去しても整数にできない値（例: `x`, `3.0`） | `0`。GPU による既定値へは戻らない |
+判定は Linux の engine 起動ごとに行う。OS が Linux でなければ環境変数を参照せず `0` を返す。Linux では `env` 引数（通常は `child_env` が作った子プロセス環境。`terminal/serve/server.py:3870-3891`）から取得し、値を文字列化して前後の空白を除いた後 Python の `int()` で変換する。変換できた値は `0..19` に clamp される。大文字小文字の概念はなく、`true` / `false` は数値として変換できない。`0anything` のような末尾文字付きも変換エラーとなる。空文字または空白だけは unset と同じ自動判定に進むが、その他の無効値は `0` を返して自動判定を抑止する（`terminal/serve/server.py:3723-3737`）。
 
-値は `str(asked).strip()` の後 Python の `int()` で変換されます。符号付き整数も受け付け、負値は 0、19 より大きい値は 19 になります。空白だけは変数未指定と同じ自動判定です。値が `0` なら内蔵 GPU の自動既定値を明示的に無効化します。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効・特別扱いとなる値 |
+|---|---|---|---|
+| Linux | KFD topology に `HIP_IGPU_ARCHS` の arch があれば `5`、なければ `0` | `int()` で読める整数。結果を `0..19` に clamp（例: `9` → `9`、`20` → `19`、`-1` → `0`） | 空文字・空白のみは unset と同じ。`x`、`true`、`0anything` は変換エラーで `0`。符号付き整数や前後空白は `int()` が受理し、変換後 clamp |
+| Linux 以外 | `0` | なし（環境変数を読む前に返る） | すべて実質無視 |
 
-helper の引数 `env` が空でない辞書ならそこから値を読みます。`env` が `None` または空辞書なら `os.environ` を参照する実装です。通常の engine 起動では helper に渡した環境辞書がそのまま子プロセスにも渡されます。CLI 引数にこの nice 値を指定する経路はありません。
+値の既定判定は `/sys/class/kfd/kfd/topology/nodes` を読む `hip_gpu_archs()` に依存する。ディレクトリがない、node 情報を取得できない、または有効 node がない場合は arch 判定用データが `None` となり、既定値は `0`（`terminal/serve/server.py:3736-3757`）。
 
 ## 有効になる条件
 
-- `StrataEngine.__init__()` が `lazy=False` で engine を実際に起動する経路で評価されます。`lazy=True` では初期化早期に戻るため、その時点では環境変数を読みません。
-- 自動値の判定は Linux のみです。Linux 以外では明示値も含め常に 0 です。
-- Linux の自動値は、`/sys/class/kfd/kfd/topology/nodes` の GPU node `properties` から読み取る `gfx_target_version` と `simd_count` による architecture 検出に依存します。読み取り不能、値不正、対象 GPU なしの場合、architecture を得られず自動値は 0 です。
-- 明示値が有効な整数なら、GPU topology に関係なくその値（0〜19）になります。明示値が無効なら 0 となり、自動判定を使いません。
-- OS/backend/build macro/モデル状態による追加分岐はこの helper にはありません。これはサーバー側の子プロセス起動処理であり、engine の CLI 単独起動にはこの Python 処理は介在しません。
+- Strata の Python サーバーが `StrataEngine` を起動する経路で適用される。通常起動、分割 engine、replica engine、役割別 engine は `StrataEngine(..., env=...)` を使う（`terminal/serve/server.py:8277-8280`, `8303-8308`, `8331-8336`, `8399-8404`）。
+- Linux であること。`platform.startswith("linux")` で判定し、Windows / macOS では `0`（`terminal/serve/server.py:3728-3729`）。
+- 明示値がある場合、その clamp 後の値が `0` より大きいときだけ `os.nice()` が呼ばれる。明示 `0`、負値、無効値は変更を行わない（`terminal/serve/server.py:3731-3735`, `817-820`）。
+- unset / 空白のみの場合、`hip_gpu_archs()` が返す arch のうち一つでも `HIP_IGPU_ARCHS` に入っていることが自動既定値 `5` の条件。該当 arch 一覧は gfx1035 / gfx1036 / gfx1037 / gfx1103 / gfx1150 / gfx1151 / gfx1152 / gfx90c（`terminal/serve/server.py:3736-3737`, `terminal/serve/server_parts/engines.py:1017`）。topology を読めない場合は機能は有効にならない。
+- サーバーから engine へ渡す環境は親プロセス環境のコピーを起点にし、設定の `env` 項目で同名キーを後から上書きする。そのため設定 `env` に `STRATA_ENGINE_NICE` があれば親の値より優先する（`terminal/serve/server.py:3870-3873`, `3890-3891`）。CLI 引数による上書き処理はこの判定箇所にはない。
 
 ## 実行時の詳細
 
-`StrataEngine` はログの開始記録後、engine 起動ごとに `engine_nice(env)` を呼びます。値が 0 なら `preexec_fn` に nice 処理を設定せず、優先度ログも出しません。非 0 なら既存の CPU affinity 設定がある場合は先に適用し、その後、子プロセス内で `os.nice(nice)` を実行します。サーバープロセス自身の nice 値は変更しません。engine は `[exe, "--serve", *args]` として起動され、指定された `env` を引き継ぎます。
+`StrataEngine.__init__` は spawn 情報に `env` を保持し、各起動時に `engine_nice(env)` を呼ぶ。engine の再起動も保存した spawn 情報から `__init__` を呼び直すため、保存済み環境を使って再判定する（`terminal/serve/server.py:755-761`, `817`, `terminal/serve/server.py:1201-1212`）。関数内 static cache はなく、`engine_nice` は呼び出しごとに環境値を読み、unset / 空白の場合はその時点で `hip_gpu_archs()` を呼ぶ。既に作成された子プロセスの nice は後から環境を変更しても変化しない。
 
-非 0 のとき、サーバーの stdout に次の行を出します（実際の値に置換）。このログは明示値か自動値かを区別しません。
+返り値が正なら、サーバーは既存の CPU affinity 設定があればそれを先に実行し、その後 `os.nice(nice)` を子プロセス起動前処理で呼ぶ。環境変数自体は `Popen` の `env` として子へ渡される（`terminal/serve/server.py:814-829`）。この変数を読むのはサーバー側であり、engine の C++ 実装に同名変数を読む参照はない。
 
-```text
-[strata] engine priority: nice +N (this PC has built-in Radeon graphics that usually draw the desktop; STRATA_ENGINE_NICE=0 turns it off)
-```
+## ログと測定値
 
-読み取りは engine 起動のたびに行われ、helper 内に cache はありません。環境辞書を使う起動では、その辞書の値が評価と子プロセスへの引き渡しの双方に使われます。起動後に値を変えても、すでに動いている engine の nice 値は再設定されません。再起動では再評価されます。子プロセス生成時の OS エラーは `StrataEngine` から再送出されます。生成後に engine が `READY` を返さず timeout または早期終了した場合は `EngineDied` になる起動失敗処理がありますが、コードから `STRATA_ENGINE_NICE` 固有の engine 終了経路は確認できません。
+適用値が正のとき、サーバーは stdout に `[strata] engine priority: nice +N (this PC has built-in Radeon graphics that usually draw the desktop; STRATA_ENGINE_NICE=0 turns it off)` を出力して flush する。値が `0` のときはこの行を出さない（`terminal/serve/server.py:817-822`）。nice 設定専用の警告・fallback ログ・性能測定値は確認できない。engine 起動時の `Popen` が `OSError` で失敗する経路では、サーバーは loading event とログ handle を処理して例外を再送出する（`terminal/serve/server.py:826-834`）。nice 設定失敗に固有のメッセージはこの箇所にない。
 
 ## 根拠
 
-- 候補名の本番読み取りと判定: `serve/server.py:3458-3472`。Linux 判定、環境取得、空文字処理、`int()` 変換、clamp、無効値時の 0、および topology による既定値を実装しています。
-- 内蔵 GPU architecture の取得と対象一覧: `serve/server.py:3475-3491,3571`。KFD topology の `properties` を読み、architecture を組み立てます。
-- 読み取り時期、nice 適用、ログ、子プロセス起動と環境引き渡し: `serve/server.py:1043-1045,1064-1079`。
-- 通常サーバー、replica、split serving からの `StrataEngine` 起動: `serve/server.py:8688-8711,8757-8777,9273-9279`。
-- 起動エラーの再送出と、engine が `READY` を返さない場合の失敗処理: `serve/server.py:1080-1084,1085-1153`。
-- 設計説明との照合: `docs/STRIX_HALO.md:246-247` は Linux の内蔵 Radeon 搭載機で nice +5、`STRATA_ENGINE_NICE=0` による無効化と別値指定を説明しています。値の変換詳細は同資料にはなく、上記コードを根拠としました。
+- `terminal/serve/server.py:3723-3737` — OS 分岐、環境値の取得・変換・clamp、自動 arch 判定。
+- `terminal/serve/server.py:3740-3757` — Linux KFD topology からの GPU arch 取得と読み取り失敗時の扱い。
+- `terminal/serve/server_parts/engines.py:1017` — 自動判定に使う `HIP_IGPU_ARCHS` 一覧。
+- `terminal/serve/server.py:3870-3891` — 子環境の作成と設定 `env` による上書き。
+- `terminal/serve/server.py:755-761`, `817-834`, `1201-1212` — 起動・再起動時の判定、`os.nice` 適用、失敗処理。

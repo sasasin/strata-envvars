@@ -1,62 +1,60 @@
-# `--host`
+# `source-setup`（mac）`--host`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `metal/setup_mac.py`（Apple Silicon 用。`setup.py` から委譲） |
+| コマンド | `metal/setup_mac.py`（`setup.py` から委譲） |
 | オプション | `--host` |
 | 別名 | なし |
-| 値 | 接続待受アドレスを表す文字列。parser に型・選択肢の制限はない |
+| 値 | 値を取る文字列。parser に選択肢・形式・範囲の指定はない |
 
 ## 役割
 
-生成する Metal サーバー設定の `host` を指定し、起動時にサーバーが待ち受けるアドレスを変えます。既定の loopback では同じ Mac からの接続に限られます。ネットワーク上の他の端末から接続させる場合は、たとえば `0.0.0.0`（IPv4 全 interface）を指定します。外部端末に公開する設定では API key の利用を推奨します。
+Apple Silicon の Mac でモデルをセットアップするとき、生成するモデル設定にサーバーの bind address を保存する。サーバーは保存値を使って待受けるため、loopback に限定するか、他のインターフェースでも接続を受けるかを決められる。
 
 ## 使い方
 
-Apple Silicon Mac で、セットアップ設定を作成・更新するときに指定します。
-
 ```sh
-./setup.sh --setup --host 127.0.0.1
+# Mac 上でセットアップし、サーバーをこの PC だけで待ち受ける
+./setup.sh --host 127.0.0.1
+
+# セットアップし、全 IPv4 インターフェースで待ち受ける
+./setup.sh --host 0.0.0.0 --api-key 'replace-with-a-long-secret'
 ```
 
-`setup.py` は macOS で `STRATA_CONTROL_INSTALL=1` が設定されていない場合、引数を `metal/setup_mac.py` に渡します（`setup.py:82, 9068-9069`、`setup.py:7703-7707`）。
+`setup.py` は Mac 経路で引数を `engine/metal/setup_mac.py` にそのまま渡す。`setup_mac.py` の parser は `--host` を値付き引数として登録し、セットアップ後に設定へ保存する（`terminal/setup.py:9206-9210`、`engine/metal/setup_mac.py:375-403`、`engine/metal/setup_mac.py:602-611`）。
 
 ## 値と既定値
 
-- `argparse` の値を一つ取ります。`type`、`choices`、明示的な validation は指定されていません（`metal/setup_mac.py:327-336`）。空文字列は parser で受理されますが、後段の `if a.host:` が偽になるため設定値として書き込まれません（同:551-552）。
-- 新しい設定では `--host` を省略したとき `host` キーを追加せず、サーバー側の既定値 `127.0.0.1` が使われます（`metal/setup_mac.py:239-243, 551-552`; `serve/server.py:9127`）。
-- 同じオプションを複数回指定した場合の個別処理はありません。値は `argparse` の通常の単一値引数として扱われます。
+- `--host` は `argparse` の文字列値で、choices や独自 validation はない。省略時はセットアップが `host` キーを書かず、サーバー側で設定値もなければ `127.0.0.1` になる（`engine/metal/setup_mac.py:382`、`terminal/serve/server.py:8808`）。
+- 設定へ値をコピーする条件は `if a.host` のため、空文字列は保存されない（`engine/metal/setup_mac.py:602-603`）。
+- ヘルプ文言では `127.0.0.1` をこの Mac のみ、`0.0.0.0` を全 IPv4、`::` を全 IPv6 インターフェースとして示す。setup parser 自体はこれら以外の文字列も拒否しない（`terminal/setup.py:11283-11284` と対照）。
+- 同じ `--host` を複数回指定した場合は通常の `argparse` の単一値引数として最後に解析された値が残る。Mac parser で追加の重複指定処理はない（`engine/metal/setup_mac.py:382`）。
 
 ## 実行時の動作
 
-`--host` に空でない値を渡すと、セットアップが生成する設定 JSON の `host` にその値を保存します。サーバー起動時に `serve/server.py` は明示引数、設定 JSON の値、`127.0.0.1` の順でアドレスを選びます。Mac セットアップの起動ラッパーは設定 JSON を渡し、`--host` を別途渡さないため、このオプションの保存値が適用されます（`metal/setup_mac.py:551-552, 559-570, 302-323`; `serve/server.py:9127`）。
+モデルのセットアップ経路では、真偽値として空でない `a.host` を生成する `strata-<model>.json` の `host` キーに入れ、その設定を書き出してからサーバーを起動する（`engine/metal/setup_mac.py:593-611`、`engine/metal/setup_mac.py:619-621`）。設定ファイルは一時ファイルに書いてから置換されるため、再セットアップで同じモデル設定を更新するときは設定全体が置き換わる（`terminal/setup.py:7447-7453`）。
 
-注意点として、Metal 設定がすでにあり、`--setup`、`--model`、`--check`、`--no-start`、`--update`、`--build` のいずれも指定しない通常の再起動経路では、`--host` は再設定されません。この分岐は既存設定をそのまま `start()` に渡して終了します（`metal/setup_mac.py:369-371`）。既存設定に反映するには再設定経路を使います。
-
-設定ファイルは `strata-<model>.json` です。`write_config()` は一時ファイルを書いてから既存ファイルに置き換えるため、再設定時は同名の設定ファイルが更新されます（`metal/setup_mac.py:559-560`; `setup.py:6490-6495`）。
+既に Metal 設定があり、実行が通常起動条件に該当すると、`main()` は既存設定で `start()` へ戻り、モデル設定を作り直す処理を通らない。その場合 `--host` は設定変更に使われない。`--setup`、`--model` などでセットアップ処理へ進むときに設定へ反映される（`engine/metal/setup_mac.py:416-418`）。サーバー起動時は CLI の `--host`、設定 JSON の `host`、`127.0.0.1` の順に選択し、Mac 起動ラッパーは設定 JSON を渡す（`engine/metal/setup_mac.py:311-332`、`terminal/serve/server.py:8808`）。
 
 ## 適用条件と副作用
 
-- 対象は `setup.py` が委譲する macOS の Metal セットアップ経路です。`STRATA_CONTROL_INSTALL=1` の Control 経路はこの委譲条件の対象外です（`setup.py:82, 9068-9069`）。
-- セットアップ parser は host 値の形式や到達範囲を検査しません。実際に待受ソケットを作る段階で OS の bind が失敗すると、server parser の usage error となり起動を中断します（`serve/server.py:9144-9147`）。
-- 指定値はサーバーのネットワーク待受範囲を変えます。loopback 以外で起動した場合、サーバーは他端末向け URL を表示し、API key が設定されていなければ警告を表示します。API key はこの経路では必須ではありません（`serve/server.py:9143-9147, 9486-9505`）。API key の指定方法は [`--api-key`](--api-key.md) を参照してください。
-- `--port` と組み合わせると、そのポートで指定 host に bind します。設定方法は [`--port`](--port.md) を参照してください。
+- `0.0.0.0` や `::` など loopback 以外の address は他端末から到達可能な待受けを意図する。API key は Mac parser では強制されないが、共有ネットワークでの利用時に指定する例を推奨する。サーバーは loopback 以外で待ち受け、API key がなければ警告を表示する（`terminal/serve/server.py:9191-9201`）。
+- 値が実際に bind 可能かはサーバー起動時に OS の socket bind で確認される。起動前の preflight が `OSError` になると `listen_problem()` の説明を usage error として出す（`terminal/serve/server.py:8824-8828`）。
+- 誤ったホスト文字列の具体的な受理範囲や各 macOS の bind 挙動はこの parser では定義されないため、ここでは列挙しない。
 
 ## 出力とエラー
 
-セットアップ完了時の API URL 表示は host 指定にかかわらず `127.0.0.1` を示す固定文字列です（`metal/setup_mac.py:564-570`）。実際の起動後は `serve/server.py` が待受アドレスとポートを `ready:` 行に表示し、loopback 以外では他端末向け URL も出します（`serve/server.py:9490-9505`）。
+セットアップ後のサーバーは待受 URL を標準出力へ表示する。loopback 以外の場合、他端末向け URL も表示し、API key がなければ警告を出す（`terminal/serve/server.py:9182-9201`）。bind 失敗は上記 preflight のエラー経路を通る（`terminal/serve/server.py:8824-8828`）。
 
-無効なアドレスや使用中のアドレス・ポートなど bind 時の `OSError` は `ap.error()` に渡され、usage とエラーで起動が止まります（`serve/server.py:9144-9147`）。`argparse` のエラー終了コードや OS ごとのアドレス解釈は、この checkout 上で実行確認していません。
+## 根拠
 
-## 根拠と調査範囲
-
-- parser と設定への代入: `metal/setup_mac.py:327-336, 551-552`
-- 既存設定での再起動分岐、設定生成と起動: `metal/setup_mac.py:302-323, 369-371, 542-570`
-- 設定ファイルの置換: `setup.py:6490-6495`
-- `setup.py` から Mac parser への委譲: `setup.py:82, 7703-7707, 9068-9069`
-- 待受値の既定、bind、起動後表示: `serve/server.py:9127, 9143-9147, 9486-9505`
-
-同一 revision のソースを調査しました。CLI help の実行、ビルド、サーバー起動は行っていません。アドレスごとの OS 固有の bind 挙動や、実ネットワークからの到達性は未検証です。
+- `terminal/setup.py:9206-9210` — Mac（Apple Silicon）で `engine/metal/setup_mac.py` を呼び出す委譲経路。
+- `engine/metal/setup_mac.py:375-403` — Mac parser と `--host` 登録、未知引数の警告。
+- `engine/metal/setup_mac.py:416-418` — 既存モデルの通常起動経路。
+- `engine/metal/setup_mac.py:593-621` — host をモデル設定に追加し、設定を保存して起動する経路。
+- `terminal/setup.py:7447-7453` — 設定 JSON の一時ファイル経由の置換。
+- `terminal/serve/server.py:8808-8828` — host の優先順位、API key 検証後の bind preflight と失敗処理。
+- `terminal/serve/server.py:9182-9201` — bind 実行、待受 URL とリモート接続時の表示・警告。

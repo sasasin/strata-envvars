@@ -1,47 +1,48 @@
 # `STRATA_CKPT_GATHER`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査時の作業ツリーは `## main...origin/main` で、未コミット変更はありません。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-CUDA の conversation checkpoint 保存時に、PLE 履歴と各 QSA layer の indexer tail・dead row・block position を一つの device staging buffer に集め、まとめて host へコピーします。checkpoint の GDN state 本体はこの gather の対象外で、別のコピー経路です。変わるのは小さい running-state vector 群のコピー方法で、保存される vector の内容は同じです。
+CUDA の会話チェックポイント保存で、小さな実行状態ベクトルを一時バッファへ集約し、ホストへまとめてコピーする経路を選びます。対象は `ple`、各所有 QSA レイヤーの indexer tail・dead row・block position です。未設定時などはそれぞれを個別にコピーします。保存データの内容はどちらの経路でも同じです。`conversation_checkpoint_save` は生成中のチェックポイントと会話スナップショット保存から呼ばれます（`engine/src/core/conversation_state.cpp:222-227,391-407,411-415,563-568,703-714`、`engine/src/program/generate.cpp:2561-2566,14587-14608`）。
 
 ## 値と判定
 
-環境変数の文字列を数値や真偽値として parse せず、最初の文字だけを検査します。
+関数内 static 初期化で `std::getenv` の値を読み、ポインターが非 null で、先頭バイトが文字 `'1'` の場合だけ有効にします。文字列全体の比較や数値変換はしません（`engine/src/core/conversation_state.cpp:230-236`）。
 
-| ビルド条件 | unset | 設定値 |
-|---|---|---|
-| HIP、`STRATA_HIP_GFX906`、または Metal macro が定義済み | 無効 | 値にかかわらず無効。関数は環境変数を読みません |
-| 上記以外（CUDA 実装） | 無効 | 先頭文字が `1` なら有効。それ以外は無効 |
+| ビルド条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `STRATA_USE_HIP`、`STRATA_HIP_GFX906`、`STRATA_GPU_METAL` のいずれも定義されない場合 | 無効 | `1`、`10`、`1anything` など先頭が `1` | 空文字、`0`、`true`、` 1`、`-1` など先頭が `1` 以外 |
+| 上記いずれかが定義される場合 | 無効 | なし（値を読み取らず常に無効） | すべて |
 
-したがって CUDA では `1`、`10`、`1anything` が有効です。空文字、`0`、`true`、` 1` は無効です。大文字小文字や後続文字は見ません。既定値は OFF で、CLI 引数や別の環境変数による上書きはこの判定にはありません。
+空白の trim、大文字小文字の変換、数字としての妥当性検査はありません。`ckpt_gather_on()` の最初の呼び出し時に一度だけ値を読み、結果を関数内 `static` に保持します。その後の環境変更は同プロセスでは反映されません（`engine/src/core/conversation_state.cpp:230-236`）。
 
 ## 有効になる条件
 
-- 対象ビルドが上表の CUDA 側であること。
-- `conversation_checkpoint_save` または内部の snapshot save が呼ばれ、保存対象 vector の合計サイズが 0 でないこと。
-- gather buffer の割り当てが成功すること。割り当てに失敗すると個別コピー経路へ戻ります。
-
-layer split 経路でも各 stage の session state を個別に `checkpoint_save` するため、その stage ごとに同じ判定と gather が適用され得ます。実装には layer split を排除する条件はありません。一方、`docs/DETAILS.md` の測定表は「layer split across cards」では未テストとしています。これは測定範囲の注記であり、実装がその経路を無効化するという意味ではありません。
+- HIP、HIP gfx906、Metal のビルドでは無効です。これらの macro がない CUDA 実装経路で有効になり得ます（`engine/src/core/conversation_state.cpp:230-236`）。
+- 会話チェックポイントの保存処理が実行される必要があります。復元処理ではこのスイッチを参照しません（`engine/src/core/conversation_state.cpp:391-407,417-455`）。
+- `STRATA_CKPT_ASYNC` は必須ではありません。これは別の大きな GDN 状態のコピー経路を制御し、小ベクトルの gather 分岐はその後に独立して評価されます（`engine/src/core/conversation_state.cpp:319-388,390-404`）。
+- 層分割時は各 stage の所有状態を保存します。gather 用の一組のバッファは mutex で保護され、同じバッファを使う保存呼び出しを直列化します（`engine/src/core/conversation_state.cpp:222-229,239-255`）。
+- gather 用のデバイスバッファまたは pinned host バッファを確保できない場合、gather は無効扱いとなり、個別コピーへ fallback します（`engine/src/core/conversation_state.cpp:244-258,392-403`）。
 
 ## 実行時の詳細
 
-`ckpt_gather_on()` の結果は関数内の `static const bool` に保存され、プロセス内で最初に呼んだ時に一度だけ評価されます。以降の環境変更は反映されません。無効なら、PLE と各 layer の三つの vector をそれぞれコピーします。
+保存ごとに、存在する `ple` と所有レイヤーの tail・dead row・block position のサイズを合計します。合計が 0 ならコピーなしで成功します。必要なバッファは初回に確保し、その後は容量と device が合う限り再利用します。必要容量が増えた場合や device が変わった場合は既存バッファを解放して確保し直します（`engine/src/core/conversation_state.cpp:239-258`）。
 
-有効なら `ckpt_gather_small()` が mutex を保持し、現在の device に対応する staging buffer と pinned host buffer を確保・再利用します。必要サイズが増えた場合または device が変わった場合は既存 buffer を解放して作り直します。各 vector を順に device buffer へ queued copy し、最後に一度 host へコピーして、各 checkpoint vector に `memcpy` します。合計サイズが 0 の場合は何もコピーせず成功扱いです。
+有効時は各状態を同じ device バッファへ順に device-to-device コピーし、そのバッファを一度 host へコピーして、元のチェックポイント配列へ `memcpy` します。無効時、または確保失敗時は各配列を個別にコピーします（`engine/src/core/conversation_state.cpp:259-274,390-404`）。コピー失敗時はこの fallback に切り替えず保存失敗になります。通常の保存ラッパーは `strata serve: checkpoint save: <理由>` を stderr に出します（`engine/src/core/conversation_state.cpp:41-47,259-274,392-407`、`engine/src/program/generate.cpp:2561-2566`）。
 
-device staging または pinned host buffer の確保ができない場合は `0` を返し、呼び出し元が通常の個別コピーを実行します。gather 中のコピー失敗は `-1` となり、個別コピーには戻らず checkpoint 保存失敗になります。コピー helper は `conversation snapshot running-state copy: <CUDA error>` などを error に設定し、serve の checkpoint 保存 wrapper が stderr に `strata serve: checkpoint save: ...` を出します。保存失敗がコピー資源不足として回復可能なら checkpoint を skip して要求を続け、GPU 側の sticky error など回復不能な場合は要求失敗経路へ進みます。
+読み取りは engine プロセス内の `ckpt_gather_on()` に限られ、候補名の全参照にも子プロセスへの転送処理はありません。CLI 引数や別の環境変数による値の上書きも、このスイッチの判定にはありません（`engine/src/core/conversation_state.cpp:230-236,391-404`）。
 
-この変数自体が有効・無効や fallback のログを出すことはありません。`STRATA_PARK_TRACE` が有効な場合、checkpoint snapshot 内の小コピー所要時間を `strata parktrace: save small copies ... ms` として stderr に出します。`STRATA_CKPT_ASYNC` は GDN state 本体の非同期コピーを別に制御します。GDN state の非同期化は gather の必須条件ではありません。
+## ログと測定値
+
+このスイッチ専用の有効・無効ログはありません。gather バッファの確保失敗もログを出さず個別コピーへ進みます。コピー失敗は `strata serve: checkpoint save: <理由>` として出力され、層分割の一部チェックポイントでは、GPU が継続可能な場合に `strata serve: checkpoint at %lld skipped: stage %zu's state could not be copied out (see above); the request goes on without it` が出ます（`engine/src/core/conversation_state.cpp:253-258,391-404`、`engine/src/program/generate.cpp:2561-2566,14776-14784`）。
+
+`docs/DETAILS.md:1774` は小コピーを 37 個から 1 回にまとめると記し、層分割での測定はしていないとしています。これは資料上の記述であり、独立した速度測定値は示されていません。現在の実装には層分割時に共有バッファを mutex で保護する処理があります（`engine/src/core/conversation_state.cpp:222-229,244-274`）。
 
 ## 根拠
 
-- `src/core/conversation_state.cpp:216-230` — gather 対象の説明、backend macro guard、環境変数の先頭文字判定。
-- `src/core/conversation_state.cpp:232-269` — 合計サイズ判定、mutex、buffer の割り当て、vector の gather と host への一括コピー。
-- `src/core/conversation_state.cpp:284-303,305-363` — checkpoint save の初期化と GDN 本体の別コピー経路。
-- `src/core/conversation_state.cpp:364-382` — gather 呼び出し、割り当て失敗時の個別コピー fallback、および save の戻り値。
-- `src/core/conversation_copy.hpp:138-153` — queued copy と通常 copy の完了待ち、およびコピー helper。
-- `src/program/generate.cpp:1915-1920,1923-1929,11065-11073` — serve 側の stderr と checkpoint skip / 失敗処理。
-- `src/program/generate.cpp:10850-10890,10925-10932` — layer split の各 stage で checkpoint save を行う経路。
-- `docs/DETAILS.md:1504-1516` — opt-in スイッチとしての説明、測定者・環境に関する注記、layer split 未測定の記載。
+- `engine/src/core/conversation_state.cpp:222-236` — スイッチの対象、backend macro 条件、値判定、static cache。
+- `engine/src/core/conversation_state.cpp:239-274,390-407` — バッファの確保・再利用、gather と個別コピーの経路、失敗時の扱い。
+- `engine/src/core/conversation_state.cpp:411-415,563-568,703-714`、`engine/src/program/generate.cpp:14587-14608` — 保存処理の呼び出し元。
+- `engine/src/program/generate.cpp:2561-2566,14776-14784` — 保存失敗時のログと一部チェックポイントの扱い。
+- `docs/DETAILS.md:1762-1775` — 資料上の適用範囲と測定記述。

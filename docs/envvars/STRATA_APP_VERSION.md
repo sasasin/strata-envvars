@@ -1,47 +1,50 @@
 # `STRATA_APP_VERSION`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。Strata の Host、Desktop shell、Control/CLI を調査。外部 updater の内部動作は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata Desktop の Host にアプリ自身のインストール済みバージョンを知らせます。Host はこれをセットアップ状態・更新確認に使い、Control の CLI にも引き継ぎます。単体の `strata update` CLI では、`--app-version` が指定されていない場合のインストール済みアプリ版として使われ、アプリ更新の要否を比較します。
+Strata デスクトップアプリの版を App Host と更新処理へ伝える。App Host の `/api/setup` が返すアプリ版の表示値に使われ、更新確認ではインストール済みアプリ版として Control の `--app-version` 引数または CLI 更新コンテキストへ渡される。アプリのバージョンを変更したり、単独で更新を実行したりする設定ではない（`app/desktop/src-tauri/src/supervisor.rs:515-527`、`app/desktop/src-tauri/src/updater.rs:457-463`、`app/host/server/index.mjs:149-150,320-331,1513-1514`、`app/host/server/control-runtime.mjs:269-299`、`terminal/strata_cli/update_cmd.py:303-321`）。
 
-Desktop shell は Host 子プロセス起動時に `STRATA_APP_VERSION` を設定します。Linux の supervisor 経由では Cargo の `CARGO_PKG_VERSION` を設定し、Windows/macOS の Host 起動経路では Tauri の package version を設定します。通常の Desktop 起動では、利用者の同名環境変数よりこの値が優先されます（`apps/desktop/src-tauri/src/supervisor.rs:361`, `apps/desktop/src-tauri/src/main.rs:495-504`, `apps/desktop/src-tauri/src/updater.rs:243-249`）。
+デスクトップシェルは Linux の supervisor で `env!("CARGO_PKG_VERSION")`、Windows/macOS の App Host 起動では `app.package_info().version` を子プロセス環境へ設定する。デスクトップ外の checkout 起動では App Host が同じ `app/desktop/src-tauri/Cargo.toml` を読む fallback を持つ（`app/desktop/src-tauri/src/supervisor.rs:515-527`、`app/desktop/src-tauri/src/main.rs:554-568`、`app/desktop/src-tauri/src/updater.rs:457-463`、`app/host/server/app-version.mjs:1-18`）。
 
 ## 値と判定
 
-Host の `appVersionFrom()` は値を文字列化して前後空白を除き、次の形式に全体一致する場合だけ採用します: `数字.数字.数字` に、任意で `-` または `+` と英数字・`.`・`+`・`-` の1文字以上を続けた形式です。大文字小文字は問わず、先頭の `v`、空白を含む値、末尾の余分な文字は不一致です（`apps/host/server/app-version.mjs:8-18`）。
+App Host 表示用の `appVersionFrom` は `String(env.STRATA_APP_VERSION ?? '').trim()` で読み、正規表現 `^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$` 全体に一致する場合だけ値を採用する。一致しない場合は `app/desktop/src-tauri/Cargo.toml` の `version` 行を同じ形式で検証し、それも読めない・不適合なら `dev` を返す（`app/host/server/app-version.mjs:8-18`）。
 
-| `STRATA_APP_VERSION` | Host の表示・通常更新確認用 `appVersion()` |
-|---|---|
-| 有効形式 | trim 後の値を使用 |
-| 未設定、空文字、空白だけ、不正形式 | `apps/desktop/src-tauri/Cargo.toml` の `version` を読み、同じ形式ならそれを使用 |
-| Cargo.toml が読めない、またはその `version` が形式不一致 | `dev` |
+| 経路 | 未設定・空文字 | 受け付ける例 | 表示用に無効となる例 |
+|---|---|---|---|
+| App Host の表示 (`appVersionFrom`) | 空文字として扱い、Cargo.toml の版へ fallback。読み取り失敗または不適合なら `dev` | `1.2.3`、`0.2.0-beta`、`1.2.3+build.7`。前後空白は trim 後に判定 | `1.2`、`latest`、`1.2.3x` |
+| App Host の Control 更新確認 | `/api/updates/check` では `process.env.STRATA_APP_VERSION || null`。未設定・空文字は `null` として渡す | truthy の環境値を検証・trim せず `--app-version` に渡す | host 側では値検証なし。Control が版として扱えない値は更新確認エラーになり得る |
+| `strata update` / `strata components update` | `--app-version` が falsy なら `os.environ.get("STRATA_APP_VERSION")`。環境変数も未設定なら `None`、空文字なら空文字 | CLI 引数が truthy なら環境変数より優先。どちらも文字列のまま更新 Context に入る | host/CLI の入力段階では形式検査なし。Control のアプリ版比較時に不適合ならエラー |
 
-このフォールバックは Host の `appVersionFrom()` に限られます。パッケージ版 Host の Control 更新確認経路では `process.env.STRATA_APP_VERSION || null` が渡されるため、空文字は未設定扱いになり、Host の Cargo.toml fallback は使われません（`apps/host/server/index.mjs:129-130,1372-1373`）。
-
-CLI の `strata update` は `--app-version` の非空文字列を環境変数より優先します。CLI 引数が未指定または空文字なら `os.environ.get("STRATA_APP_VERSION")` を使い、環境変数もなければ `None` です。ここでは値を trim したり、Host と同じ形式検証をしたりしません（`strata_cli/update_cmd.py:49-62,183-206`）。
+表示用正規表現は数値部分を 3 セグメント要求するが、先頭ゼロや suffix 内の `+` / `-` の並びを追加制約しない。対して更新比較側の `app_version_key` は `-` で区切った prerelease だけを許し、基底版を `version_key` で検証するため、`+build` を含む値は表示で受理されても更新比較で拒否される。更新側で未設定値はアプリ版 `unknown-installed` となる。feed にアプリがない、または現在の platform 向け installer がない場合はそれぞれ `not-in-feed`、`none-for-this-pc` となり、値比較はされない（`terminal/strata_control/feed.py:69-82`、`terminal/strata_control/updater.py:1980-1993`）。
 
 ## 有効になる条件
 
-- Desktop Host では、`/api/setup` が `setupState().app.version` を返す時点で `appVersionFrom()` を呼びます。パッケージ版では Desktop shell が設定した値が有効です。source checkout など shell の設定がない場合は Cargo.toml、さらに `dev` の順で決まります（`apps/host/server/index.mjs:129-130,290-301`）。
-- パッケージ版の `GET /api/updates/check` で Control が使える場合、環境変数値を `checkComponentUpdates()` から Control の `strata update --check` に渡します。Control の子プロセス環境は親環境をコピーするので、この変数も継承されます（`apps/host/server/index.mjs:1372`, `apps/host/server/updates.mjs:52-60`, `apps/host/server/control-runtime.mjs:89-103,124-130,183-186`）。
-- Control がない source checkout の更新確認では `setupState().app.version` を使い、`appVersionToShow()` でアプリ版が `dev` または利用可能でない場合に Control の版を選びます。これは `/api/updates/check` の別経路です（`apps/host/server/index.mjs:1372-1373`, `apps/host/server/app-version.mjs:21-25`）。
-- 単体 CLI では `strata update` / `strata components update` の `--app-version` と `STRATA_APP_VERSION` が `updater.Context.app_version` に入ります。フィードに対象 platform のアプリ項目がある場合、値なしなら installed version は不明 (`unknown-installed`)、値があればフィード版と比較して `available` または `current` になります（`strata_cli/update_cmd.py:49-63,183-206`, `strata_control/updater.py:1402-1415`）。
+- デスクトップ版では App Host 起動時にシェルが版を設定する。Linux は Cargo の compile-time `CARGO_PKG_VERSION`、Windows/macOS は Tauri の package info を使う（`app/desktop/src-tauri/src/supervisor.rs:515-527`、`app/desktop/src-tauri/src/main.rs:554-568`、`app/desktop/src-tauri/src/updater.rs:457-463`）。
+- `/api/setup` の表示値は `appVersionFrom` の検証・fallback 結果。ソース checkout では Cargo.toml が読める場合にその版を表示し、環境値が不適合でも更新 API に渡す値まで置き換えるわけではない（`app/host/server/index.mjs:149-150,320-331,1513-1514`、`app/host/server/app-version.mjs:10-18`）。
+- `/api/updates/check` の Control 経路は `control?.updateCheck` がある場合に限り、環境値を Control の `--app-version` として渡す。Control がなければ別の `checkUpdates` 経路を使い、`setupState().app.version` と native state の版を `appVersionToShow` で選ぶ（`app/host/server/index.mjs:1513-1514`、`app/host/server/control-runtime.mjs:269-285`）。
+- CLI の `--app-version` が指定されると環境変数より優先する。ただし `getattr(..., None) or os.environ.get(...)` のため、空文字の引数は環境変数へ fallback する。値はアプリ更新が feed に含まれ、対応 platform の項目があるときに版比較に影響する（`terminal/strata_cli/update_cmd.py:59-75,314-321`、`terminal/strata_control/updater.py:1980-1993`）。
+- App Host の更新確認値と表示 fallback は別々に計算される。無効な非空値は表示では Cargo.toml 版または `dev` に fallback しても、Control 更新確認にはそのまま送られる（`app/host/server/index.mjs:149-150,1513-1514`）。
 
 ## 実行時の詳細
 
-Host の `appVersion()` はキャッシュされません。`setupState()` が呼ばれるたびに環境値を判定し、無効・未設定の場合は Cargo.toml の読み込みを試みます。通常、プロセス起動後の環境変更も次の呼び出しで反映されます（`apps/host/server/index.mjs:129-130,290-301`, `apps/host/server/app-version.mjs:10-18`）。ただし Desktop shell が起動時に渡した子プロセス環境は、親プロセスの環境をその場で再読込する仕組みではありません。
+`appVersionFrom` は `/api/setup` の状態を作るたびに呼ばれ、Node の環境オブジェクトをその時点で参照する。関数内 cache はなく、プロセス起動後に環境値が変更された場合も次の呼び出しで読み直す（`app/host/server/index.mjs:149-150,320-331`）。デスクトップシェルの値は App Host 子プロセス起動時に設定される（`app/desktop/src-tauri/src/supervisor.rs:523-527`、`app/desktop/src-tauri/src/updater.rs:459-463`）。
 
-パッケージ版の更新確認は Host が Control の `update --check` を実行する際に `--app-version` を付けます。単体 CLI では app-version は `Context` 作成時に読み取られ、その値がフィード内のアプリ版比較に使われます。比較時の `app_version_key()` は `-` より前を通常のバージョンとして検査し、末尾の prerelease 部分は同じ数値版より低く扱います。不正値は `FeedError` になり、CLI は stderr に `strata: ...`（人間向け出力）または JSON エラーを出して終了コードを返します。フィードにアプリ項目がない場合はこの比較に入りません（`strata_control/feed.py:62-75`, `strata_control/updater.py:1402-1415`, `strata_cli/update_cmd.py:187-206,235-260`）。
+更新確認では API handler が環境値を `|| null` で取り出し、`checkComponentUpdates` から `control.updateCheck({ appVersion })` へ渡す。Control runner は feed と版を含む引数列を作り、版が truthy のとき `--app-version <値>` を追加する。更新確認はアプリ版で feed を比較し、feed の offered 版がインストール済み版より大きければ `available`、そうでなければ `current` と報告する。アプリ版が未知なら `unknown-installed` とし、`--app` による CLI ダウンロード対象になり得る（`app/host/server/updates.mjs:55-64`、`app/host/server/control-runtime.mjs:269-285`、`terminal/strata_cli/update_cmd.py:351-363`、`terminal/strata_control/updater.py:1980-2004`）。
 
-パッケージ版 Host の `native-control.mjs` は起動時の環境値を未検証のまま更新ログに表示し、アプリ更新 job に `appUpdateFrom` として保存します。次回起動時、保存版と現在版が異なれば更新完了とし、同じなら更新失敗として表示します。値がないと `unknown` ログとなり、版の一致・不一致によるこの判定は行われません（`apps/host/server/native-control.mjs:43-49,433-449`）。
+native-control は `process.env.STRATA_APP_VERSION || null` を使い、アプリ更新ジョブ開始時の `appUpdateFrom` として保存する。次回起動時に同じ値と比較し、値が変わっていればジョブを完了扱い、同じなら installer が旧版で再起動したエラー扱いにする。ここでは `appVersionFrom` の形式検査・Cargo.toml fallback を使わず、生の環境値を比較する（`app/host/server/native-control.mjs:128-136,829`）。
+
+## ログと測定値
+
+この変数自体を読み取ったことを示す専用ログはない。CLI の `--check` は更新レポートを通常出力または JSON で返す。比較時に不正な版として `FeedError` になった場合、CLI は `strata: <エラー>` を stderr に出し、例外の exit code で終了する。App Host の Control 更新確認は例外を捕捉し、`Couldn't check for updates. Try again in a moment.` を含む error 状態を返す（`terminal/strata_cli/update_cmd.py:307-312,357-363,379-382`、`terminal/strata_control/feed.py:69-82`、`app/host/server/updates.mjs:55-64`）。
 
 ## 根拠
 
-- Desktop shell から Host への設定: `apps/desktop/src-tauri/src/supervisor.rs:353-365`, `apps/desktop/src-tauri/src/main.rs:495-505`, `apps/desktop/src-tauri/src/updater.rs:243-249`。
-- Host の形式判定・fallback と setup state: `apps/host/server/app-version.mjs:8-18`, `apps/host/server/index.mjs:129-130,290-301`。
-- パッケージ版と checkout の更新確認分岐: `apps/host/server/index.mjs:1368-1373`, `apps/host/server/updates.mjs:52-60`, `apps/host/server/app-version.mjs:21-25`。
-- Control への環境継承と `--app-version` 生成: `apps/host/server/control-runtime.mjs:89-103,124-130,171-195`。
-- CLI の優先順位と app version の比較・無効値エラー: `strata_cli/update_cmd.py:49-63,183-206,235-260`, `strata_control/updater.py:1402-1415`, `strata_control/feed.py:62-75`。
-- Host の更新 job ログ・再起動後の状態判定: `apps/host/server/native-control.mjs:43-49,433-449`。
+- デスクトップから子プロセスへの設定: `app/desktop/src-tauri/src/supervisor.rs:515-527`、`app/desktop/src-tauri/src/main.rs:554-568`、`app/desktop/src-tauri/src/updater.rs:457-463`
+- App Host の読み取り、検証、fallback、表示: `app/host/server/app-version.mjs:8-18`、`app/host/server/index.mjs:149-150,320-331`
+- App Host の更新確認と Control への引き渡し: `app/host/server/index.mjs:1513-1514`、`app/host/server/updates.mjs:55-64`、`app/host/server/control-runtime.mjs:269-285`
+- CLI の引数・環境変数優先順位と Context 設定: `terminal/strata_cli/update_cmd.py:59-75,303-321`
+- 更新側のアプリ版比較・無効値判定: `terminal/strata_control/feed.py:69-82`、`terminal/strata_control/updater.py:1980-2004`
+- App Host のアプリ更新完了判定: `app/host/server/native-control.mjs:128-136,829`

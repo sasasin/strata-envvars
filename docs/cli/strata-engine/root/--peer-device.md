@@ -1,59 +1,64 @@
-# `strata --peer-device`
+# `--peer-device`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。調査時の `git status --short --branch` は `## main...origin/main`（clean）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの root） |
+| コマンド | `strata`（root / 通常の engine parser） |
 | オプション | `--peer-device` |
 | 別名 | なし |
-| 値 | 整数の GPU device index。1 以上で peer GPU を有効化する |
+| 値 | 整数。`1` 以上で第2 expert-cache tier を有効化 |
 
 ## 役割
 
-2 枚目の GPU を adaptive expert-cache tier として使います。主 GPU に載らなかった、expert profile で順位付けされた expert を peer 側 VRAM に追加配置し、推論時に peer でも expert row を計算します。dense weights、KV cache、主 GPU の cache は peer に移しません（`include/strata/core/peer_experts.hpp:3-15`）。
+主 GPU の adaptive expert cache にない expert を、指定した別 GPU の cache に追加するための起動時オプションです。profile のランキングに従い、主 GPU が保持しない expert を第2 GPU の空き VRAM に収まる範囲で配置します。serve 中の adaptive 更新にも参加し、prefill では設定された行数をその GPU に計算させる経路があります。Qwen3.6 family は別 parser・別スコープで、索引上も `strata-engine/qwen36/--peer-device.md` に分かれています。
 
 ## 使い方
 
 ```sh
-strata --native /path/to/model.gguf \
-  --expert-profile /path/to/profile.bin --expert-cache 4096 --peer-device 1
+# expert profile と主 GPU の cache を使い、device ordinal 1 に peer tier を置く
+strata --native model.gguf --expert-profile profile.bin --expert-cache 4096 --peer-device 1
 ```
 
-`--peer-device` は値を必須とし、使用には `--expert-profile` と正数の `--expert-cache` も必要です（`src/program/generate.cpp:1222-1224,8413-8416`）。
+この例の `model.gguf` と `profile.bin` は利用者のファイルに置き換えてください。`--expert-profile` と正の `--expert-cache` はこのオプションを有効にするときに必要です。
 
 ## 値と既定値
 
-- 既定値は `-1`（無効）です。実装は値が `>= 1` の場合だけ peer tier を開きます。したがって `0` と負数は peer を有効化しません（`src/program/generate.cpp:751-760,8413`）。
-- 値は `std::atoi` で整数化されます。厳密な数値形式や正の範囲を parser で検証する処理はありません。数値に変換できない文字列は `atoi` の結果 0 となり、peer は起動しません（`src/program/generate.cpp:3633`）。値を省略すると `--peer-device needs a value` を stderr に出して終了コード 2 で終了します（`src/program/generate.cpp:3295-3297`）。
-- 同じ option を複数回指定したときは parser が順に代入するため、最後に指定した値が使われます（`src/program/generate.cpp:3293-3297,3633`）。
-- 有効値は実行時に見える device のうち 1 以上かつ device 数未満でなければなりません（`src/core/peer_experts.cpp:129-135`）。
-- `0` は peer tier を有効化しませんが、既定値 `-1` と異なり、KVA の適用条件では「peer device 指定あり」と判定され、明示的に有効化した KVA を無効にします（`src/program/generate.cpp:6712-6717`）。
+- parser は値を `std::atoi` で整数化します。省略時の内部値は `-1` で無効です。`0` と負数も有効化条件 `peer_device >= 1` を満たさないため、tier は開かれません。
+- 値の形式や範囲を parser で個別検証していません。数値に変換できない文字列は `atoi` の結果が `0` となり、tier は無効になります。オプションを重ねて指定した場合は、引数走査で後から代入された値が残ります。
+- 値を省略すると parser の `next()` が stderr に `--peer-device needs a value` を出し、終了コード `2` で終了します。
+- `1` 以上でも指定 GPU が実行時の device 数の範囲外、または主 GPU と同じ ordinal なら、peer cache の初期化に失敗します。
 
 ## 実行時の動作
 
-値が 1 以上なら、エンジンは起動前に peer 用 mapped host buffer を portable 扱いに設定し（`src/program/generate.cpp:3849`）、expert cache の初期化後に peer tier を開きます。初期 cache には profile 順のうち主 cache にない expert を、peer GPU の空き VRAMから予約分を引いた予算内で格納します。開いた後は、peer GPU に格納した expert の推論も実行します（`src/program/generate.cpp:8411-8427`; `src/core/peer_experts.cpp:192-212,245-315`）。
+正の値を指定すると、engine は起動時に mapped host buffer を portable 扱いに設定し、prefill の prompt path に peer device があることを伝えます。通常の expert cache のランキングから主 GPU が保持していない expert を選び、peer GPU の空き VRAMから予約量を引いた範囲で cache を作成します。空き容量に収まる前に選択が止まり、`--peer-slots` が正ならその上限も適用されます。serve の adaptive 更新では peer cache も別に候補を入れ替えます。prefill では `--peer-prefill-rows` が 0 でなければ peer path を構成し、負値の既定設定では chunk × top-k の半分を行数として渡します。
 
-peer の初期化が成功すると、stderr に peer GPU 番号、格納 expert 数と容量、初期化時間、および主 cache と合算した GPU 上の expert 数を出力します（`src/program/generate.cpp:8424-8427`）。
-
-profile の上位部分は `STRATA_PEER_HOT`（既定 `0.45`）と `STRATA_PEER_HOT_AT`（既定 `8700`）でも配分され、指定割合の順位を peer 側に回してから両 cache を埋めます。値が `0 < f < 1` かつ対象順位が正のときに適用されます（`src/program/generate.cpp:5579-5607`）。推論中の適応処理では、主 cache と peer cache のどちらにもない高頻度 expert を peer cache に補充し、使用頻度の低い peer slot と入れ替えます（`src/program/generate.cpp:12639-12649`; `src/core/peer_experts.cpp:336-379`）。
+peer cache 初期化時は、両 GPU が相互 P2P access 可能かを調べます。可能な場合も topology と小さな双方向コピーを確認し、安全性またはコピー内容を確認できなければ P2P を使わず pinned host staging に切り替える実装です。P2P が利用できないこと自体はこの経路では失敗条件ではありません。
 
 ## 適用条件と副作用
 
-- `--expert-profile` が空、profile source が利用できない、または `--expert-cache <= 0` の場合、`strata generate: --peer-device needs --expert-profile and the expert cache` を stderr に出し、終了コード 1 で終了します（`src/program/generate.cpp:8413-8416`）。
-- `--layer-split`、または `--expert-cache-device1..3` の remote expert cache と併用できません。該当時は競合する option 名を含むエラーを stderr に出し、終了コード 2 で終了します（`src/program/generate.cpp:4326-4332`）。
-- `--adapt-async 1` と同時に指定した場合、peer 自体を拒否せず、非同期適応を無効化して blocking adaptive tier に切り替え、その理由を stderr に出します（`src/program/generate.cpp:9743-9746,9768-9784`）。
-- 指定 device が見えない場合は `peer experts: CUDA device N is not visible ...` を返し、呼び出し側が stderr に出して終了コード 1 で終了します（`src/core/peer_experts.cpp:129-135`; `src/program/generate.cpp:8418-8422`）。peer 用に空きがない場合や主 cache にない expert が残っていない場合も初期化に失敗します（`src/core/peer_experts.cpp:192-210`）。
-- peer tier は初期化時に VRAM を使って cache と作業領域を確保します。また、`--session-save` / `--session-load` による session file 処理は peer 有効時に拒否され、その要求について `session files do not support --peer-device` と応答します（`src/core/peer_experts.cpp:174-186`; `src/program/generate.cpp:14888-14895`）。
-- prompt path でも peer が計算に参加しますが、P2P が使えない／利用を有効化できない場合は host 経由になります。peer access が有効でも往復コピーの検証に失敗した場合は警告を stderr に出し、host route に切り替えます（`src/core/peer_experts.cpp:141-164`; `src/program/generate.cpp:10747-10754`）。
-- SYCL build の peer 実装は stub で、`PeerExperts::open` は「not ported to SYCL yet」として失敗します。有効な device 番号でも peer tier 初期化時に拒否され、呼び出し側は stderr に出して終了コード 1 で終了します（`sycl/src/core/peer_experts.cpp:19-23`; `src/program/generate.cpp:8418-8422`）。
+- `--expert-profile` が読み込まれており、主 GPU の `--expert-cache` が正であることが必要です。条件を満たさない場合は stderr に `--peer-device needs --expert-profile and the expert cache` を出し、終了コード `1` で終了します。
+- `--layer-split` および `--expert-cache-device1..3`（remote/helper expert cache）とは併用できません。該当時は理由を stderr に出し、終了コード `2` で終了します。
+- peer GPU 上に cache・実行用 device memory を確保し、input/result/plan staging 用の portable mapped pinned host memory も確保します。peer GPU の空きが予約量を差し引いた後に残らない場合や、残りのランキング対象がない場合は初期化エラーになります。
+- peer 指定時は prefill の fused path を使わず MMQ 用の buffer 配置を保つ分岐があります。
+- SYCL parser もこの引数を受け取りますが、同 backend の `PeerExperts::open()` は「second-GPU expert tier is not ported to SYCL yet」として拒否します。したがって SYCL build では正の値を指定しても tier は利用できず、peer 初期化で終了コード `1` になります。
+
+## 出力とエラー
+
+peer cache の初期化成功時は、peer GPU 番号、搭載 expert 数・容量と、主 GPU cache と合わせた総数を stderr に表示します。GPU ordinal 不正、device 操作・memory allocation の失敗、cache を置く余地がない場合は初期化エラーを stderr に出し、呼び出し元は終了コード `1` で終了します。P2P の topology/copy 検査で直接転送を採用しない場合は stderr に理由を表示して host staging を使います。
 
 ## 根拠
 
-- parser と値変換: `src/program/generate.cpp:3293-3298,3630-3637`
-- 既定値とヘルプ記載: `src/program/generate.cpp:751-760,1222-1229`
-- 競合検査: `src/program/generate.cpp:4326-4332`
-- 必須条件、初期化、起動ログ: `src/program/generate.cpp:8411-8427`
-- device 検査、P2P 判定、cache 予算・格納: `src/core/peer_experts.cpp:129-164,192-242`
-- prompt path への接続と SYCL 制約: `src/program/generate.cpp:10747-10754`; `sycl/src/core/peer_experts.cpp:19-23`
+- `engine/src/program/generate.cpp:913-918` — 内部値と既定値（`peer_device = -1`）。
+- `engine/src/program/generate.cpp:1424-1429` — root parser の help 説明と同時使用上の注意。
+- `engine/src/program/generate.cpp:3837-3842,4200` — 引数値の取得、欠落時の終了、`atoi` 変換。
+- `engine/src/program/generate.cpp:4721-4723` — 正の値を portable mapping と prefill peer flag に反映。
+- `engine/src/program/generate.cpp:5256-5263` — layer split / helper cache との併用拒否と終了コード `2`。
+- `engine/src/program/generate.cpp:10133-10149` — profile/cache 必須条件、peer cache 起動、成功表示、失敗時の終了コード `1`。
+- `engine/src/program/generate.cpp:920-922,13064-13075,15410-15418` — prefill 行数の既定値、peer path の構成と serve 中の adaptive 更新。
+- `engine/src/core/peer_experts.cpp:192-201` — device ordinal の範囲・主 GPU との重複検査。
+- `engine/src/core/peer_experts.cpp:208-235` — P2P の確認と host staging への切替。
+- `engine/src/core/peer_experts.cpp:246-258,264-285` — staging/device memory 確保、VRAM 予約と slot 上限、容量不足エラー。
+- `engine/src/prefill/prefill.cpp:780-781,5688-5692` — peer 指定時に fused prefill 経路を避ける分岐。
+- `engine/sycl/src/program/generate.cpp:2169,5736-5752`、`engine/sycl/src/core/peer_experts.cpp:19-23` — SYCL parser の受理と peer 初期化時の未対応エラー。

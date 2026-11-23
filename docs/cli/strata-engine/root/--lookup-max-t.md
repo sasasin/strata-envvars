@@ -1,61 +1,63 @@
 # `--lookup-max-t`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。調査開始時の Strata 作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数） |
+| コマンド | `strata`（エンジン引数、`root/`） |
 | オプション | `--lookup-max-t` |
 | 別名 | なし |
-| 値 | 整数 `N`。必須。負数は0に補正され、正数は prompt-lookup window の幅として使われる |
+| 値 | 整数 `N`。prompt-lookup の窓サイズ上限（トークン数）。 |
 
 ## 役割
 
-prompt lookup（過去の文脈にある一致箇所から候補 token を提案する処理）が使う verify window の最大幅を指定します。MTP drafter の幅は別に維持し、lookup 候補だけをより長い window で検証できるようにします。通常の8 token幅を超える窓は最大16 tokenまでで、build が16行窓を持つ場合もこの lookup 用上限は `kVerifyLongT` で制限されます（`src/program/generate.cpp:4140-4158,4170-4172`、`include/strata/kernels/verify_kernels.hpp:25-31`）。
+prompt lookup（文脈内の過去の反復に続いたトークンを候補にする suffix drafter）が、MTP の通常窓より長い検証窓を使えるようにする上限です。serve 中は窓サイズごとの CUDA graph を準備し、適応ポリシーが候補と実測コストに応じて使う窓を選びます。`--lookup-max-t` は MTP 自体の窓を長くする指定ではありません。
 
 ## 使い方
 
 ```sh
-strata --pack ./model.gguf --serve --mtp ./draft.gguf --spec 6 --suffix-draft 3 --lookup-max-t 12
-```
+# モデルと serve モードを指定し、prompt-lookup 窓の上限を指定する
+strata --native model.gguf --serve --lookup-max-t 12
 
-`--suffix-draft` を有効にして serve する例です。`--lookup-max-t` の自動既定値もこの種の実行条件を見ますが、明示値を指定するとその自動判定を通らず、指定値が設定されます（`src/program/generate.cpp:3549-3552,4143-4158`）。
+# 長い prompt-lookup 窓の拡張を無効にする
+strata --native model.gguf --serve --lookup-max-t 0
+```
 
 ## 値と既定値
 
-- 値は必須です。`Options` の初期値は `-1`（未指定）で、明示値は `std::atoi()` で読み、`std::max(0, ...)` により負数を0にします。整数として読めない文字列も `atoi` の結果が0となります。厳密な数値形式 validation はありません。引数を複数回指定した場合は、後の値が前の値を置き換えます（`src/program/generate.cpp:972-977,3551`）。
-- 未指定時は `default_lookup_max_t()` が条件を判定します。既定値12になるのは、ビルドの verify 窓が narrow（`kVerifyMaxT == kVerifyNarrowT`）、Metal ではない、serve、単一GPU、layer split なし、`--batch` が1以下、DFlash2 なし、`--lookup-chain` なし、suffix draft 有効、`--spec >= 2`、かつ `STRATA_LOOKUP_MAX_T` が先頭 `0` ではない場合です。どれか一つでも外れると0です（`src/program/generate.cpp:4143-4154`、`include/strata/core/lookup_default.hpp:9-27`）。
-- `STRATA_LOOKUP_MAX_T` は未指定時の自動値を抑止する用途です。値の先頭文字が `0` なら自動値を0にし、それ以外の値は自動で有効化するものではありません。CLI で `--lookup-max-t` を明示すると環境変数判定は行われません（`src/program/generate.cpp:4143-4155`）。詳細は [`STRATA_LOOKUP_MAX_T`](../../../envvars/STRATA_LOOKUP_MAX_T.md) を参照してください。
-- `N=0` は lookup の長い窓を無効にします。上限の明示 validation は parser にありませんが、実際に利用できるのは `kVerifyLongT` までです。narrow build では `kVerifyMaxT` が8のため `kVerifyLongT` は16です。wide build では `kVerifyLongT` はその build の `kVerifyMaxT` です（`include/strata/kernels/verify_kernels.hpp:25-31`）。
-- 値を省略すると parser の `next()` が `--lookup-max-t needs a value` を stderr に出して終了コード2で終了します（`src/program/generate.cpp:3293-3298,3551`）。
+- parser は次の引数を `atoi` で整数化し、`max(0, 値)` を保存します。負数は `0` になり、数値として読めない文字列も `atoi` の結果 `0` になります。値を省略すると `stderr` に `--lookup-max-t needs a value` を出して終了コード `2` で終了します。複数回指定した場合は走査中に後の値が前の値を置き換えます。 (`engine/src/program/generate.cpp:3837-3842, 4116-4119`)
+- `0` はこのオプションによる長い窓への拡張を無効にします。suffix draft 自体の有効・無効は別設定 `--suffix-draft` で決まり、`--lookup-max-t 0` がそれを無効にするわけではありません。正の値を指定した場合、help は `N <= 16` と案内します。parser 自体には `16` を超える値を直接拒否する処理はありませんが、実行時の `--spec` 上限と利用可能な窓サイズにより、窓はビルドの `kVerifyLongT` 以下（通常 16）に制限されます。 (`engine/src/program/generate.cpp:1341-1346, 4116-4119, 5051-5070`; `engine/include/strata/kernels/verify_kernels.hpp:23-31`)
+- 省略時は、`STRATA_LOOKUP_MAX_T` が `0` で始まる場合を除き、8 行窓の build、非 Metal、serve、単一 GPU、layer split なし、`--batch` が 1、DFlash2 でない、lookup chain なし、suffix draft 有効、`--spec >= 2` の条件が全て成立すると `12` です。それ以外は `0` です。 (`engine/src/program/generate.cpp:5035-5049`; `engine/include/strata/core/lookup_default.hpp:9-28`)
+- 環境変数による既定値判定はオプション未指定時だけ行われます。明示的に `--lookup-max-t 12` を指定すれば、`STRATA_LOOKUP_MAX_T=0` でもその値が優先されます。 (`engine/src/program/generate.cpp:4118, 5038-5049`)
 
 ## 実行時の動作
 
-値が正で suffix draft が有効かつ `--spec >= 2` の場合、初期化時に必要なら `--spec` を `N` 以下・`kVerifyLongT` 以下まで広げ、MTP 上限を元の `--spec` に保ちます。したがって MTP が提案する幅を `N` にする指定ではありません（`src/program/generate.cpp:4133-4159`）。suffix draft が無効の場合、この拡張処理は働かず、lookup サイズ候補の設定だけでは suffix lookup を起動しません（`src/program/generate.cpp:4156-4159,20031-20040`）。
-
-正の値では、draft policy の許可サイズに MTP 側のサイズと lookup 側のサイズを設定します。`--lookup-sizes` が未指定なら MTP 上限より1つ・2つ大きい幅と `--spec` が追加候補です。明示されている場合はカンマ区切りを `atoi` で読み、2以上 `--spec` 以下の値だけを追加します。`--lookup-sizes` 自体に不正形式のエラーはなく、不適合な値は候補から外れます（`src/program/generate.cpp:1300-1321`）。
-
-serve では起動時に stderr へ上限・MTP 幅・許可 window サイズを表示します。各サイズは個別の window graph として準備されます。VRAM 不足で graph を作れないサイズは policy から恒久的に除外され、小さい候補へ進みます。VRAM 以外の graph 準備エラーは fallback せず、呼び出し側のエラー経路へ進みます。prompt の分割処理と decode の lookup 候補の双方で、選択サイズに対してこの準備確認を行います（`src/program/generate.cpp:13417-13437,16237-16243,18233-18252`）。
+- `N > 0` かつ suffix draft が有効で `--spec >= 2` の場合、MTP 上限が未指定なら現在の `--spec` を MTP 上限に設定し、検証窓の `--spec` を `N` と `kVerifyLongT` の小さい方まで拡張します。以後、`--spec` はこの上限を超えると `strata generate: --spec ...` を `stderr` に出して終了コード `1` になります。suffix draft が無効などこの条件に当たらない場合は、この拡張処理は行われません。 (`engine/src/program/generate.cpp:5051-5070`)
+- `--lookup-max-t` が有効なとき、lookup 窓に使えるサイズは MTP のサイズに加え、既定では MTP 上限より大きい候補（MTP+1、MTP+2、`--spec` 以下のサイズ）です。`--lookup-sizes` を指定すると、その追加候補は指定リストのうち `2..--spec` に入る値に絞られます。サイズ指定は `lookup_size_mask` でポリシーに渡されます。 (`engine/src/program/generate.cpp:1505-1526, 16323`; `engine/src/program/generate.cpp:1172-1173`)
+- serve 起動時に有効な窓サイズを `stderr` に表示します。各候補サイズの graph は事前に準備され、VRAM 不足ならそのサイズを候補から外し、次に小さい適合サイズを試します。VRAM 不足以外の準備失敗はエラー経路になります。窓サイズごとの graph が追加で VRAM を使うため、上限や候補数を増やすと必要 VRAM も増えます。 (`engine/src/program/generate.cpp:16406-16423`; help の目安: `engine/src/program/generate.cpp:1344-1346`)
+- 長い窓は単一会話の prompt/decode に適用されます。batch 窓・pipelined 窓は通常窓上限のままです。layer split では長い窓がサポートされず、複数 stage 時に `stderr` へ上限を知らせた後、`spec` を narrow 窓上限へ戻します。CUDA/HIP の通常窓上限は build により 8 または 16、Metal/SYCL 等は別の build 条件を持ちます。 (`engine/include/strata/kernels/verify_kernels.hpp:23-31`; `engine/src/program/generate.cpp:13178-13183`)
+- この機能は候補の検証窓を切り替えるもので、draft policy のコメントでは出力自体は変えないとされています。ただし、ソースだけでは全モデル・全 backend での出力同一性を独立に保証できる範囲までは確認していません。 (`engine/include/strata/spec/draft_policy.hpp:13-19`)
 
 ## 適用条件と副作用
 
-- 自動値12の対象は上記条件をすべて満たす serve 実行に限られます。明示値は自動判定を迂回しますが、実際の幅は backend/build、draft 使用条件、layer split のバッファ制約に従います（`src/program/generate.cpp:4143-4158,10857-10863`）。
-- layer split では verify hand-off の幅に合わせて `--spec` を narrow 幅へ下げるログを stderr に出し、lookup policy の許可サイズも narrow 幅までに制限します（`src/program/generate.cpp:10857-10863,13417-13422`）。batch は自動値12の条件から除外されています（`src/program/generate.cpp:4146-4150`）。pipeline window の設定は MTP drafter の load 幅にも影響します（`src/program/generate.cpp:6759-6763`）。
-- 追加される window サイズごとに graph を準備するため、VRAM を消費します。ソースコメントは各 graph を約20–35 MiB と記していますが、実使用量はモデル・build 等に依存し、ここでは測定していません（`src/program/generate.cpp:972-976,13423-13435`）。
-- 値は起動時の設定処理で決まり、要求ごとに再読込する処理は確認できません。このオプション固有のファイル書き込みやネットワーク処理も確認できません。
+- 自動で `12` になる条件は上記のとおり限定的です。Metal は既定値判定で明示的に除外され、複数 GPU、layer split、batch、DFlash2、lookup chain、suffix draft 無効、`--spec < 2` なども既定値 `0` になります。明示値と自動既定値は区別してください。 (`engine/include/strata/core/lookup_default.hpp:23-28`)
+- 既定の追加候補サイズは MTP より大きいものだけですが、各候補の graph は個別に準備されます。VRAM 不足の候補は実行中に以後の選択対象から外れます。 (`engine/src/program/generate.cpp:1508-1525, 16409-16423`)
+- lookup 上限が narrow 窓を超える場合、serve は penalty history 用バッファを `kVerifyLongT` 分に確保し、GPU にも同サイズを確保します。長い lookup 窓を有効にすることでホスト・GPU メモリ使用量が増える条件があります。 (`engine/src/program/generate.cpp:13134-13145`)
 
 ## 出力とエラー
 
-- serve で値が正なら、設定された上限とサイズ一覧を stderr に出します。graph の VRAM 不足時はサイズを除外した旨と残り候補を stderr に出し、より小さいサイズを試します（`src/program/generate.cpp:13420-13437`）。
-- graph 準備時に VRAM 以外のエラーが起きた場合、prompt 経路は失敗を返し、decode 経路は `ERR ...` を stdout に出してその処理を終了します（`src/program/generate.cpp:13426-13437,16240-16243,18237-18252`）。
-- 未知の引数は stderr に `unknown argument` と usage を出し、終了コード2です（`src/program/generate.cpp:3683-3688`）。このオプションには専用の値範囲拒否処理はありません。
+- 引数値の欠落は parser が `stderr` にエラーを出し、終了コード `2` で終了します。 (`engine/src/program/generate.cpp:3837-3842`)
+- `--spec` が実行可能上限を超えた場合は `stderr` に許容範囲を表示し、終了コード `1` で終了します。 (`engine/src/program/generate.cpp:5063-5070`)
+- lookup graph の準備時に VRAM 不足なら `stderr` にそのサイズを候補から外した旨を表示して縮小したサイズを試します。別種の graph 準備失敗は decode 側で `ERR ...` を出して終了コード `1`、prompt 側ではエラー文字列を返す経路を確認しました。 (`engine/src/program/generate.cpp:16412-16423, 20328-20330, 22631-22635, 22643-22647, 22655-22659`)
 
-## 根拠と調査範囲
+## 根拠
 
-- parser、初期値、値変換: `src/program/generate.cpp:972-977,3293-3298,3551`。
-- 自動既定値と条件: `src/program/generate.cpp:4140-4158`、`include/strata/core/lookup_default.hpp:9-27`。
-- 候補サイズと幅上限: `src/program/generate.cpp:1300-1321,4168-4175`、`include/strata/kernels/verify_kernels.hpp:25-31`。
-- serve での graph 準備・VRAM fallback・prompt/decode への適用: `src/program/generate.cpp:13417-13437,16237-16243,18233-18252`。
-- 索引上の scope は `strata-engine` の `strata` エンジン root 引数です（`docs/cli/README.md:1223-1231,1296-1300`）。
-- 同一 revision のソース parser と使用箇所を確認しました。ビルド済み CLI の help 実行、Release artifact の確認、build、GPU 実行、性能測定、テストは行っていません。`src/program/generate.cpp` の parser が共通で受理する点を確認しましたが、全 backend/build での実行結果は検証していません。
+- `engine/src/program/generate.cpp:1166-1173` — option の保存値と関連する MTP/lookup sizes の設定。
+- `engine/src/program/generate.cpp:1341-1346, 3837-3842, 4116-4119` — help 表示、値の取得、parser 変換。
+- `engine/src/program/generate.cpp:5035-5070`、`engine/include/strata/core/lookup_default.hpp:9-28` — 未指定時の環境変数・build・実行条件による既定値、`spec` 拡張と上限検査。
+- `engine/src/program/generate.cpp:1505-1526, 16323, 16406-16423`、`engine/include/strata/spec/draft_policy.hpp:13-19` — 候補サイズ、適応ポリシー、graph 準備と VRAM 不足時の縮小。
+- `engine/include/strata/kernels/window_limits.hpp:20-25`、`engine/include/strata/kernels/verify_kernels.hpp:23-31` — build ごとの窓上限と長い単一会話窓の制約。
+- `engine/src/program/generate.cpp:13134-13145, 13178-13183, 20325-20340, 22631-22680`、`engine/src/core/verify.cpp:3505-3520` — バッファ確保、layer split の扱い、prompt/decode の実使用と長窓の commit 制約。
+
+調査範囲は上記 commit の Strata 所有ソースです。既存バイナリの `--help` 実行、build、GPU 実行、性能測定、テストは行っていません。help の `<= 16` 表示と parser の直接検証範囲を照合し、値そのものに対する上限検査は確認できず、実効上限は `--spec` と build 窓サイズの制約として記載しました。

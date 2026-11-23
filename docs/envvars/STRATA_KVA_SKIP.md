@@ -1,40 +1,47 @@
 # `STRATA_KVA_SKIP`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-KVA（近似 prompt read）が適用される late layer で、既定の state-only 処理に代えて attention 半分を通常どおり計算し、MoE 半分を省略するモードを選びます。値が有効でも、KVA 自体が有効で、その chunk と layer が近似対象になった場合だけ効果があります。KVA は既定で無効です（`include/strata/prefill/kva.hpp:72-90,149-156`）。
+KVA が近似する prompt chunk の late layer で、通常の state-only 処理から「attention half（GDN または QSA とその出力）を実行し、MoE half と expert transfer を省略する」処理へ切り替える。値を `moe` にしても KVA 自体は有効にならず、KVA が有効で当該 chunk・layer が近似対象になった場合にだけ差が出る。設定の読み取りは `strata::prefill::kva_config_from_env()`、処理の切り替えは `Prefill::run_impl()` にある（`engine/include/strata/prefill/kva.hpp:69-90,149-188`、`engine/src/prefill/prefill.cpp:4997-5007,5074-5082`）。
 
 ## 値と判定
 
-| 値 | 判定 | 結果 |
-|---|---|---|
-| 未設定 | 既定 | `StateOnly` |
-| 空文字 | 既定 | `StateOnly` |
-| 完全一致の `moe` | 有効 | `Moe` |
-| その他すべて（`state`、`bogus`、`MOE`、空白付きなど） | 無効値として既定に戻る | `StateOnly` |
+`std::getenv("STRATA_KVA_SKIP")` の結果が null でなく、値全体が大文字小文字を区別して文字列 `moe` と等しい場合だけ `Skip::Moe` にする。数値変換や trim は行わない。環境変数が未設定、空文字、または `moe` 以外なら既定の `Skip::StateOnly` が残る。したがって `MOE`、`1`、`true`、`state`、`bogus`、`moe ` はいずれも state-only となる（`engine/include/strata/prefill/kva.hpp:69-75,88-90,182-182`）。
 
-`std::string(sk) == "moe"` による大文字小文字を区別する文字列全体の比較です。trim、数値変換、無効値の警告やエラーはありません。CLI 引数による上書きもありません。値の既定は `KvaConfig::skip = StateOnly` で、環境読み取りはその値を完全一致時だけ `Moe` に変えます（`include/strata/prefill/kva.hpp:69-90,182-188`）。同ファイルのテストも未設定、`moe`、`state`、`bogus` の結果を確認するケースを記述しています（`src/prefill/kva_test.cpp:129-138`。テストは今回実行していません）。
+| 条件（build など） | unset | 有効になる値 | state-only のままになる値 |
+|---|---|---|---|
+| KVA の設定値判定 | `StateOnly` | 完全一致の `moe` | 空文字、`MOE`、`1`、`true`、`state`、`bogus`、`moe ` |
+
+設定は `kva_config()` の関数内 `static const` に初回アクセス時の値を保存する。プロセス実行中に環境を変更しても、この設定済み config には反映されない（`engine/include/strata/prefill/kva.hpp:149-195`）。
 
 ## 有効になる条件
 
-- KVA の主スイッチ `STRATA_KVA` が空でない値で設定され、先頭文字が `0` でないこと。未設定・空文字・先頭文字が `0` の値では KVA が動かず、この変数も効果を持ちません（`include/strata/prefill/kva.hpp:149-156`）。
-- ビルドに KVA prefill path があること。`STRATA_GPU_METAL` ビルドでは `kKvaBackend` が false となり、KVA は無効です（`include/strata/prefill/kva.hpp:43-49,149-156`）。
-- SYCL engine は別の prompt path を使い KVA を持たない、と Strata の KVA 説明文書は記載しています（`docs/KVA.md:99-104`）。
-- その prompt read が KVA の適用条件を満たし、chunk が近似 prefix 内にあり、layer が split 以降であること。KVA は cold read、全 trunk の読み取り等の条件を検査し、chunk ごとに近似区間を決めます。`STRATA_KVA_ONLY` が `gdn` または `qsa` なら、選ばれた種類の layer にだけこの skip が及びます（`include/strata/prefill/kva.hpp:104-134`; `src/prefill/prefill.cpp:2947-2966,3115-3123,3621-3627`）。
-- layer の MoE expert 転送計画も、同じ近似 chunk・split・`STRATA_KVA_ONLY` 条件に基づいてその layer を除外します（`src/prefill/prefill.cpp:3382-3394`）。
+- `STRATA_KVA` も有効であること。KVA は `STRATA_KVA` が空でなく、先頭文字が `0` でない場合に on となる。`STRATA_KVA_SKIP` は KVA の on/off を切り替えない（`engine/include/strata/prefill/kva.hpp:77-78,152-156`）。
+- state-only late-layer path を持つ build であること。`STRATA_GPU_METAL` build では `kKvaBackend` が false になり、KVA は無効化される。CUDA/HIP 側では true（`engine/include/strata/prefill/kva.hpp:43-49,152-156`）。
+- KVA の全体適用条件を満たすこと。capture 中でなく、engine が block されず、prompt の開始位置が 0、全 trunk を読む（layer split なし）、画像なし、DFlash2 prompt taps なし、prompt 長が `STRATA_KVA_MIN_PROMPT` 以上かつ有効 suffix より 64 token を超えて長いこと。既定値は min prompt 4096、suffix 2048（`engine/include/strata/prefill/kva.hpp:85-87,95-96,104-133`）。
+- 通常はモデル形状が 48 layers / 512 experts であること。異なる形状では KVA は辞退し、`STRATA_KVA_ANY_MODEL` が有効な場合のみ警告付きで許可される（`engine/src/prefill/prefill.cpp:4233-4244`）。
+- multi-GPU layer split、`--batch` の batch slots、または `--peer-device` が使われると、generate 起動時に KVA がプロセス全体で block される。KVA が使われない限り、この変数による差もない（`engine/src/program/generate.cpp:8093-8114`）。
+- 実際の切り替えは `kva_approx` な chunk かつ `l >= kva_split` の layer に限られる。`STRATA_KVA_ONLY` が `gdn` または `qsa` の場合は該当 layer 種別だけが対象。split は既定 36 で、1 から layer 数の範囲へ clamp される（`engine/src/prefill/prefill.cpp:4244-4246,4405-4412,4997-5005`; `engine/include/strata/prefill/kva.hpp:85,183-187`）。
+- CLI に `STRATA_KVA_SKIP` 相当の引数・優先設定はなく、この値を読む箇所は環境からの読み取り一箇所。KVA を使わない通常の prefill はこの skip 分岐に入らない（`engine/include/strata/prefill/kva.hpp:182`; `engine/src/prefill/prefill.cpp:4997-5005`）。
 
 ## 実行時の詳細
 
-本番経路では `kva_config()` が `static const KvaConfig` を初回に一度生成して環境値を保持します。generate 初期化時にもこの設定を参照し、prefill 各回も同じ cache を読むため、起動後に環境を書き換えても反映されません。`kva_config_from_env()` 自体は環境から都度作る helper ですが、製品経路は cache された `kva_config()` を使います（`include/strata/prefill/kva.hpp:149-195`; `src/program/generate.cpp:6263-6279`; `src/prefill/prefill.cpp:2947-2954`）。
+KVA の適用判断後、各 chunk は末尾が exact suffix の開始位置より前にあるとき `kva_approx` になる。近似対象 layer では `kva_moe_only` が true となり、layer loop の half 0（attention）は通常どおり実行する。続く half 1 に入る直前に分岐し、その MoE 処理を飛ばして次の layer に進む。また、その layer の expert transfer を queue しない経路も `kva_moe_only` を使う（`engine/src/prefill/prefill.cpp:4405-4412,4680-4684,4997-5007,5074-5082`）。
 
-近似対象 layer では `STRATA_KVA_SKIP=moe` のとき attention half（GDN または QSA）を実行します。その出力は residual に書き込まれます。続く `half == 1` で MoE half を実行せず、その layer の expert 転送も計画から除きます。既定の state-only と異なり、attention の出力計算・residual への反映が残ります（`src/prefill/prefill.cpp:3621-3627,3382-3394,3696-3705`; attention 処理 `src/prefill/prefill.cpp:3792-3842,3843-3961,4103`）。
+`STRATA_KVA_SKIP=moe` は attention 出力を residual に反映する一方、近似対象位置の MoE 出力を計算しない。exact suffix や KVA が辞退した prompt は通常の計算経路であり、この変数は影響しない。CLI との優先順位で skip 値を上書きする処理はない。環境値は config の初回参照で一度だけ読み取られる（`engine/include/strata/prefill/kva.hpp:149-195`）。
 
-有効時にこの変数専用の警告や失敗経路はありません。KVA が適用された read の stderr 行では mode が `moe-skip` と表示されます（`src/prefill/prefill.cpp:5820-5831`）。KVA を要求していても条件不成立なら、通常の `KVA configured but NOT applied: ...` 行などで KVA が適用されなかった理由が出ますが、この変数の不正値を理由とするログはありません（`src/prefill/prefill.cpp:5844-5856`; 起動時の batch slots、layer split、peer device の通知 `src/program/generate.cpp:6269-6277`）。
+## ログと測定値
+
+KVA が実行された場合、prefill の診断行は `mode moe-skip` と表示する。KVA が有効でも適用されなかった場合は、明示的に KVA を on にしている経路などで辞退理由を stderr に出す。shape が未計測の場合の理由行、および起動時の backend / batch / split / peer-device 理由行はソースに定義されているが、これらは `STRATA_KVA_SKIP` 固有のログではない（`engine/src/prefill/prefill.cpp:8008-8044`; `engine/src/program/generate.cpp:8102-8113`）。
+
+`docs/KVA.md:116` は `moe` で attention half を実行し、MoE half と expert transfer を省略すると説明しており、ソースの分岐と一致する。同文書にある速度・残差品質の評価は測定主張であり、本調査では再測定していない。`docs/DETAILS.md` にこの変数の記述は見つからなかった。
 
 ## 根拠
 
-候補一覧 `000_envvers.md` には名前がありますが、Strata 所有コードでの実際の読み取りは `include/strata/prefill/kva.hpp:182` の1箇所です。ほかに見つかった名前の参照はコメント、KVA 説明文書、テストです。動的な環境名 helper への引き渡しはなく、読み取った `Skip` 値は前述の prefill 分岐へ渡されます。
-
-`docs/KVA.md:116` も `moe` を opt-in とし、attention 半分を実行して MoE 半分と expert transfers を省くモード、ログ名 `mode moe-skip` と説明しています。同文書の「既定 state-only より遅く、exact residual に近い」という記述は定性的な説明で、この変数についての独立した測定値や測定条件は確認できなかったため、ここでは性能値を記載していません。
+- 読み取り、既定値、完全一致判定、static cache: `engine/include/strata/prefill/kva.hpp:69-90,149-195`
+- backend guard と KVA の適用条件: `engine/include/strata/prefill/kva.hpp:43-49,98-134`
+- chunk / layer の適用、attention half 後の MoE skip: `engine/src/prefill/prefill.cpp:4233-4246,4405-4412,4997-5007,5074-5082`
+- expert transfer の抑止と prefill log: `engine/src/prefill/prefill.cpp:4680-4684,8008-8044`
+- engine 全体の block 条件と理由ログ: `engine/src/program/generate.cpp:8093-8114`

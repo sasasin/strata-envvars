@@ -1,39 +1,43 @@
 # `STRATA_GRP_KEEP_GOING`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-`gr_parity` の fused GR / QFUSE 二グループ検証で、比較失敗が起きた後も反復を続けるための診断用フラグです。通常の Strata 推論・サーバー設定ではなく、CUDA カーネル検証プログラム専用です。`gr_parity` は CMake のテスト実行ファイルとして登録されています（`src/kernels/gr_parity.cpp:278-282,464-473`、`CMakeLists.txt:1384-1387`）。
+CUDA/HIP 用の standalone 検証プログラム `gr_parity` で、2 グループに分けた QFUSE parity 検査が不一致を見つけた後も、残りの token 数・反復回数の検査を続けるかを切り替えます。通常の生成 engine、server、model 設定を変える環境変数ではありません。候補名の全参照を確認したところ、実際の環境読み取りは `engine/src/kernels/gr_parity.cpp` の `fused_multi_lds_parity()` にある一箇所だけです（同 `:607`）。同ファイルの `:605` は説明コメント、`terminal/data/settings-register.json:12121-12131` は設定レジストリのメタデータで、いずれも追加の読み取り箇所ではありません。CMake は CUDA または HIP の GPU engine 内に `gr_parity` target を定義し、同名の CTest を登録します（`engine/cmake/strata_gpu_engine.cmake:8,1005-1008`）。
 
 ## 値と判定
 
-値の内容は parse されず、`std::getenv()` が null かどうかだけを見ます。空文字を含め、環境変数が存在すれば有効です。
+`std::getenv("STRATA_GRP_KEEP_GOING") != nullptr` の真偽だけを使います。環境変数が未設定なら `false`、設定されていれば中身にかかわらず `true` です。文字列比較・数値変換・trim・大小文字の正規化・範囲検査はありません（`engine/src/kernels/gr_parity.cpp:607`）。
 
-| 環境の状態 | `keep_going` | 動作 |
-|---|---:|---|
-| 未設定 | `false` | 二グループ比較で失敗を記録した後、次の反復条件で検証を止める |
-| 任意の値（`1`, `0`, `false` など） | `true` | 失敗を記録しながら反復を続ける |
-| 空文字 | `true` | 変数が設定済みなので反復を続ける |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `gr_parity` の2グループ検査に到達 | 継続しない（最初の失敗後、後続の反復と token 数を止める） | 空文字、`0`、`false`、`1`、` 1`、任意の非空文字列。いずれも継続する | なし。設定値に「無効」と判定される文字列はない |
 
-したがって `=0` や `=false` も無効化ではありません。明示的に止めるには変数を unset にします。判定結果は `fused_multi_lds_parity()` の呼び出し時に通常のローカル `const bool` として一度取得されます。関数は `main()` から一度呼ばれるため、プロセス実行中の値変更を再読込する経路はありません（`src/kernels/gr_parity.cpp:473,949`）。
+この変数に数値的な境界値はありません。`STRATA_GRP_REPS` はこの検査の反復数を別に決めますが、本変数との優先順位・上書き関係はありません（同 `:606-607`）。
 
 ## 有効になる条件
 
-- `gr_parity` を実行し、fused multi 反復検証まで到達すること。CMake は `gr_parity --selftest` をテストとして登録しています（`CMakeLists.txt:1384-1387`）。このプログラムは CUDA runtime を include し、デバイス上の比較を行います（`src/kernels/gr_parity.cpp:22-26,278-282`）。
-- `STRATA_GR_V3` が無効であること。`main()` は同変数が未設定なら `0` を設定し、`fused_multi_lds_parity()` は `atoi(v) != 0` を static cache します。V3 が有効なら `if (!v3)` の二グループ検証ブロックごと実行されず、この変数は読み取られません（`src/kernels/gr_parity.cpp:340-342,470-473,611-617`）。
-- CLI 引数にこのフラグを上書きする指定はありません。受け付ける引数は `--selftest` のみで、その他は usage を stderr に出し終了コード 2 で終了します（`src/kernels/gr_parity.cpp:618-622`）。
-
-`STRATA_GRP_REPS` は別の環境変数で、二グループ検証の反復数を指定します。`STRATA_GRP_KEEP_GOING` 自体はその回数や比較内容を変更しません（`src/kernels/gr_parity.cpp:471-474,509`）。
+- CUDA または HIP の GPU engine を構成して `gr_parity` をビルド・実行していること。target 定義は `STRATA_BUILD_TESTS` の条件内ではなく、`strata_gpu_engine()` が GPU backend 有効時にだけ target 群を定義します（`engine/CMakeLists.txt:631`; `engine/cmake/strata_gpu_engine.cmake:6-8,1005-1008`）。
+- 実行が `fused_multi_lds_parity()` の `if (!v3)` 節に到達すること。`v3` は `STRATA_GR_V3` を `atoi` で判定した関数内 `static` 値です。`main()` は `STRATA_GR_V3` が未設定の場合だけ `"0"` を設定します。従って `STRATA_GR_V3` の変換結果が非ゼロなら本変数は読まれず、未設定、空文字、`atoi` が 0 を返す値などでは対象節に入ります（`engine/src/kernels/gr_parity.cpp:340-342,745-750,604-607`）。
+- `--selftest` はこの検査を有効化する条件ではありません。引数なしでも検査に進み、`--selftest` は全検査が成功した場合の `gr_parity OK` 表示だけを制御します。これら以外の引数は stderr に `usage: gr_parity [--selftest]` を出して終了コード 2 で戻るため、本変数は読みません（同 `:752-756,1089-1093`）。
+- この検査は固定形状・合成入力で動き、モデル状態や server モードには依存しません（同 `:598-620,758-785`）。
 
 ## 実行時の詳細
 
-この判定は、`T=2..8` の二グループ分割を行い、各 `T` について直接実行・graph replay の結果を参照量子化結果と比較するテストに適用されます。比較差、書き越し、カウンタ残留などは `g2bad` に加算され、該当内容が stdout に表示されます。フラグ unset 時は `g2bad` が非ゼロになると反復ループの条件を満たさなくなり、設定時は反復を続けて追加の失敗を数えます（`src/kernels/gr_parity.cpp:487-509,532-589`）。
+`fused_multi_lds_parity()` の先行する検査を終え、`STRATA_GR_V3` が false の場合に、2 グループ検査へ入る時点で一度だけ `getenv` します。値を関数内 `const bool` に保持し、外側の `T=2..8` と内側の反復ループの継続条件に使います。したがって読み取り前にプロセス環境を変更すればその時点の値が参照されますが、読み取り後に変更してもこの呼び出し中の判定は変わりません。static cache ではなく、リクエスト単位の読み取りでもありません（同 `:604-607,621-643`）。
 
-継続フラグは失敗を成功扱いにしません。最後に失敗数と `FAIL` を stdout に出し、`bad` が非ゼロならプロセスは終了コード 1 を返します。CUDA API エラーは `check()` がエラー文字列を stderr に出して即時に終了コード 1 とする別経路です（`src/kernels/gr_parity.cpp:39-44,587-606,955-959`）。
+未設定時は、`g2bad` が増えた反復内の処理を終えると、ループ条件 `(!g2bad || keep_going)` が偽になり、次の反復と後続の `T` を実施しません。設定時は `g2bad` が増えても `T=2..8` の各サイズと `STRATA_GRP_REPS` 回数まで続け、検出した失敗を累積します。`STRATA_GRP_REPS` 未設定時の反復数は 200、設定時は `max(1, atoi(value))` です（同 `:606,621-643`）。この検査は group-relative / window-indexed の出力比較、counter 残留、書き込み範囲などを確認します（同 `:653-714`）。
+
+この変数は検査結果を成功扱いにしたり、比較方法・GPU kernel・生成結果を変えたりしません。`g2bad` は関数の `bad` に加算され、`main()` は最終失敗数を表示し、失敗があれば終了コード 1 を返します（同 `:721-740,1089-1093`）。
+
+## ログと測定値
+
+この環境変数自体を示す有効化ログ・警告・エラーはありません。検査終了時の標準出力は、書式文字列 `  fused GR read + q8_1 (STRATA_QFUSE), a window of two groups, T 2..8, %ld runs (%d random inputs each T), group-relative and window-indexed, direct and graph: %s\n` に従い、最後の `%s` は `FAIL` または `pass` です。不一致時には、たとえば `QFUSE two groups: T=%d rep %d: counter %zu left at %u\n` や `QFUSE two groups (window-indexed): T=%d rep %d: token %d (group %d) differs\n` も出力します（同 `:669-692,721-723`）。総失敗数は `gr_read/gr_write: N failures` として表示され、`N` が 0 以外なら終了コード 1 です（同 `:1090-1093`）。この変数の効果に関する測定値は、確認したソースおよび `docs/DETAILS.md` にありません。
 
 ## 根拠
 
-- 唯一の環境読み取りと反復条件: `src/kernels/gr_parity.cpp:470-509`。
-- 失敗の記録・出力と終了コード: `src/kernels/gr_parity.cpp:532-589,955-959`。
-- 実行ファイルと CTest 登録: `CMakeLists.txt:1384-1387`。
+- `engine/src/kernels/gr_parity.cpp:598-607` — 対象の2グループ検査、`STRATA_GR_V3` 条件、`STRATA_GRP_REPS` と本変数の読み取り。
+- `engine/src/kernels/gr_parity.cpp:621-643,653-714` — 失敗後の継続条件、反復、比較と失敗カウント。
+- `engine/src/kernels/gr_parity.cpp:721-740,745-756,1089-1093` — 要約出力、CLI 引数、終了コード。
+- `engine/cmake/strata_gpu_engine.cmake:6-8,1005-1008`; `engine/CMakeLists.txt:631` — GPU backend の target と CTest 登録。

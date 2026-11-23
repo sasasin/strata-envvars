@@ -1,6 +1,6 @@
-# `--wait`
+# `strata components install-file --wait`
 
-調査対象: Strata commit `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 調査）。調査対象 checkout は `## main...origin/main` で、`git status --short --branch` に未コミット変更の表示はありません。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,50 +12,46 @@
 
 ## 役割
 
-engine が稼働中の場合に、停止するまで指定秒数の範囲で待つようにします。時間内に停止しなければ、engine の切り替えは行わず失敗します。このオプションは engine を停止させるものではありません。
+エンジンのパッケージファイルをインストールするとき、エンジンが稼働中なら、停止するまで最大何秒待つかを指定する。稼働中のエンジンがなければ待たない。
 
 ## 使い方
 
 ```sh
-strata components install-file ./strata-engine-package.tar.gz --wait 300
+# 稼働中のエンジンが停止するまで最大300秒待ってから切り替える
+strata components install-file ./engine.tar.gz --wait 300
 ```
-
-`file` はローカルの engine package（`.tar.gz` または `.zip`）を指定します。`--wait` は `_common()` で追加されるため、同じ parser の `--feed`、`--components-dir`、`--backend` などとともに受理されます。
 
 ## 値と既定値
 
-- `argparse` の `type=float`、`default=None` で定義されています。指定を省略すると実行コンテキスト上の待ち時間は `0.0` 秒です。
-- 明示値に最小値・最大値や有限値の検証はありません。数値に変換できない文字列は `argparse` が拒否し、通常の usage エラー（終了コード 2）になります。
-- 待機処理では `wait <= 0` の場合、稼働中 engine があれば即座に `Busy` になります（ただし端末での対話確認で待機を選ぶと、コンテキスト値は6時間に変更されます）。正の値では、その秒数を期限として最大約3秒間隔で稼働状態を再確認します。
+- 値は必須で、`argparse` の `type=float` で解析される。別名はない（`terminal/strata_cli/update_cmd.py:51-52`）。
+- parser 上の既定値は `None`。実行時には `a.wait or 0.0` として context に渡されるため、未指定と `0` はどちらも `0.0` になる（`terminal/strata_cli/update_cmd.py:319-321`）。
+- `wait_until_idle` は待ち時間が `0` 以下なら、稼働中のエンジンを検出した時点で `Busy` を送出する。負数を含む値について専用の範囲検証やエラーメッセージはない（`terminal/strata_control/updater.py:381-391`）。
+- 有限値であることの検証もない。`inf` や `nan` のような浮動小数点値を渡した場合の扱いを制限するコードは確認できず、待ち時間の上限として使えない可能性があるため、これらを指定しないこと（parser と期限判定: `terminal/strata_cli/update_cmd.py:51-52`、`terminal/strata_control/updater.py:384-391`）。
 
 ## 実行時の動作
 
-1. `install-file` は共通 parser option を受け取り、`run()` が `--wait` の値を `Context.wait` に渡します。`None` や `0` は `0.0` として扱われます。
-2. `run()` は install-file 経路で、まず `_maybe_wait()` を呼びます。正の `--wait` が指定されている場合、対話確認を省いて後続処理へ進みます。値を省略するか `0` を指定した場合、engine が稼働中かつ端末入力が対話可能なら「待つか」を尋ねます。`y` / `yes` の場合は6時間を上限として待ちます。非対話実行では確認せず、稼働中なら待機判定で失敗します。負数は truthy として対話確認を省きますが、待機判定では即時失敗になります。
-3. 実際の `wait_until_idle()` は、一時 engine の test-start が成功した後、engine の保存先を切り替える直前に呼ばれます。したがって、`--wait` はファイルの展開・署名と内容の検証や test-start 自体を待機後まで遅らせる指定ではありません。
-4. 待機中は3秒ごとに稼働状態を確認します。engine が停止すれば切り替えへ進みます。待機は `strata_control` の管理対象インスタンスまたは共有 activity lease による稼働検知を使います。
+`install-file` は共通オプション登録関数 `_common` を使うため、このコマンドの parser に `--wait` が追加される（`terminal/strata_cli/update_cmd.py:47-56,92-94`）。処理では値を `updater.Context.wait` に渡し、稼働状況の確認関数を `ctx.serving` に設定する（`terminal/strata_cli/update_cmd.py:319-321,341-345`）。
+
+待機は単純にコマンド開始時に行うのではない。パッケージを展開・検証し、ステージング先からテスト起動した後、稼働状況を再確認して切り替える直前に `idle_gate` が `wait_until_idle` を呼ぶ（`terminal/strata_control/updater.py:1638-1698,1538-1569,395-401`）。稼働が続いていて指定秒数が経過すると `Busy`（終了コード `7`）となり、その回のエンジンは切り替えられない（`terminal/strata_control/updater.py:381-391,72-83`）。待機中は最大3秒間隔で再確認し、待機イベントを出す（`terminal/strata_control/updater.py:381-391`）。
 
 ## 適用条件と副作用
 
-- 待機チェックは「稼働中 engine がある場合」に限って時間を消費します。稼働していなければ直ちに通過します。
-- 待機対象の停止操作は行いません。engine が指定時間内に停止しない場合、`Busy` で切り替えを拒否します。
-- package の展開・検証は components 配下の一時 staging 領域を使い、署名と各ファイルを検査します。test-start は別の一時 runtime/profile を使い、保存済みモデルがあれば起動・1トークン確認後に停止します。選択した package ファイルは残されます。
-- 実装上、待機判定は test-start 後です。稼働中 engine がある状況での test-start が成功しない場合は、その失敗経路が先に返るため、`--wait` を指定していても待機処理まで到達しないことがあります。
+- `--wait` に正の値を明示すると、コマンド冒頭の `_maybe_wait` は対話確認を行わず、後段の切り替え前チェックでその秒数だけ待つ（`terminal/strata_cli/update_cmd.py:341-345,500-503`）。
+- 値を省略するか `0` を指定し、エンジンが稼働中の場合、対話端末では「停止を待つか」を尋ねる。`y` / `yes` の回答は6時間の待機に設定され、それ以外は待機を設定しない（`terminal/strata_cli/update_cmd.py:500-515`）。非対話または機械出力モードでは質問せず、切り替え前の待機がないため、稼働が続いていれば `Busy` で失敗する（同上、`terminal/strata_control/updater.py:381-391`）。
+- Strata 自身の `launch-` プロファイルが稼働中の場合は `_maybe_wait` の確認質問を省略する。テスト起動自体が先に `Busy` で失敗することもあり、その場合も `--wait` の待機処理には進まない。`Busy` は「モデルを先に停止して再実行する」案内を返す（`terminal/strata_cli/update_cmd.py:504-515`、`terminal/strata_control/updater.py:72-83,1546-1556`）。
+- `--wait` は稼働中プロセスを停止しない。パッケージファイル自体はその場に残され、処理失敗時にはステージング領域が削除される（`terminal/strata_control/updater.py:1638-1648,1695-1698`）。
 
 ## 出力とエラー
 
-- 人間向け出力では待機中に `An engine is serving; waiting for it to stop before updating.` を表示します。
-- `--output jsonl` では待機イベントを JSON Lines で出力します。`--output json` ではイベント出力を抑制します。
-- 時間切れ時は失敗メッセージを出し、終了コード 7 を返します。JSON / JSONL の機械向けモードではエラーオブジェクトを出力し、人間向けでは `strata: ...` を標準エラーへ出します。
-- file 不在、archive 形式・署名・内容の不正などは別の検証エラー経路です。待機時間切れと混同しないでください。
+- 人間向け出力では、待機中に `An engine is serving; waiting for it to stop before updating.` が標準出力へ表示される。`jsonl` では `waiting` イベントが出力され、`json` では進行イベントは出力されない（`terminal/strata_cli/update_cmd.py:117-139`）。
+- 待機時間内にアイドルにならなければ終了コード `7`。人間向けでは `strata: ...` を標準エラーへ、`json` / `jsonl` では `ok: false` とエラーコードを含む JSON を出力する（`terminal/strata_control/updater.py:72-83`、`terminal/strata_cli/update_cmd.py:303-312,374-378`）。
+- 数値として解析できない値は parser の `float` 変換で拒否される。Strata 固有の追加検証はない（`terminal/strata_cli/update_cmd.py:51-52`）。
 
 ## 根拠
 
-- parser と install-file のスコープ: `strata_cli/update_cmd.py:30-39, 57-62`。索引も `install-file` に `--wait` を掲載しています: `docs/cli/README.md:229-244`。
-- CLI から Context への値の受け渡しと install-file 経路: `strata_cli/update_cmd.py:174-195, 208-217`。
-- 対話確認、非対話時の扱い、待機時の6時間上限: `strata_cli/update_cmd.py:258-273`。
-- 稼働 engine の検知と待機間隔・期限判定: `strata_control/updater.py:281-317, 322-340`。
-- install-file の一時展開、署名・全ファイル検証、対象 engine 判定、test-start 呼び出し: `strata_control/updater.py:1088-1145`。
-- test-start 後、保存先の切り替え前の待機判定: `strata_control/updater.py:994-1025`。
-- `Busy` の終了コードとメッセージ: `strata_control/updater.py:71-82`。失敗の JSON / 標準エラー出力: `strata_cli/update_cmd.py:174-183, 246-255`。
-- 待機イベントの human / JSONL / JSON 出力: `strata_cli/update_cmd.py:65-87`。
+- `terminal/strata_cli/update_cmd.py:47-56,92-94` — `install-file` parser への共通オプション登録、`--wait` の型・既定値。
+- `terminal/strata_cli/update_cmd.py:303-321,341-350` — 秒数の context への伝達と install-file 実行経路。
+- `terminal/strata_cli/update_cmd.py:500-515` — 未指定・ゼロ時の対話確認、および `launch-` プロファイルの扱い。
+- `terminal/strata_control/updater.py:381-401,406-417` — 待機期限・再確認間隔・待機値の単位。
+- `terminal/strata_control/updater.py:1538-1569,1638-1698` — テスト起動後、切り替え前に待機する位置と失敗時のステージング領域の後始末。
+- `terminal/strata_control/updater.py:61-83`、`terminal/strata_cli/update_cmd.py:303-312,374-378` — Busy の終了コードとエラー出力。

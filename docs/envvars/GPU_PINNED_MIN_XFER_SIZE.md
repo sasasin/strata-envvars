@@ -1,40 +1,42 @@
 # `GPU_PINNED_MIN_XFER_SIZE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata はこの名前の環境変数を自分の処理設定として読み取りません。Linux の HIP 系ビルドで `STRATA_ARENA_MMAP` が有効なとき、プロセス起動時に既定値 `1000000` を環境へ追加します。既に同名の環境変数があればその値を上書きしません。変数名は Strata のソースでこの設定箇所にのみ現れ、実行時の効果は外部コンポーネント側のため、ここでは説明しません。
+Strata はこの変数の数値を読み取って処理を変えるのではなく、HIP エンジンの起動初期に既存値の有無を確認し、条件を満たしていて未設定なら `1000000` をプロセス環境へ設定する。対象は AMD/HIP のファイルバック arena 経路、または Linux の特定の統合 gfx11 GPU 構成である。設定値そのものの意味や GPU コピーの挙動は ROCm/HIP 側の領域であり、Strata ソースからは確定できない。`engine/src/program/generate.cpp:3736-3757`。
 
 ## 値と判定
 
-| 状態 | Strata の処理 |
-| --- | --- |
-| `STRATA_ARENA_MMAP` が未設定 | `GPU_PINNED_MIN_XFER_SIZE` を設定しない |
-| `STRATA_ARENA_MMAP` が空文字、または先頭文字が `1` 以外 | 設定しない |
-| `STRATA_ARENA_MMAP` の先頭文字が `1` | `setenv("GPU_PINNED_MIN_XFER_SIZE", "1000000", 0)` を呼ぶ |
-| `GPU_PINNED_MIN_XFER_SIZE` が既に設定済み | `setenv` の overwrite 引数が `0` のため、既存値を維持する。空文字も設定済みとして扱われる |
-| `GPU_PINNED_MIN_XFER_SIZE` が未設定 | 値 `1000000` を設定する |
+| 条件 | `GPU_PINNED_MIN_XFER_SIZE` が未設定 | 設定済みの場合 |
+|---|---|---|
+| `STRATA_ARENA_MMAP` の分岐がコンパイルされ、値の先頭文字が `1` | Strata は `setenv(..., "1000000", 0)` を呼ぶ。既存値があれば上書きしない。 | 値を読み取らず、上書きしない。 |
+| Linux の `STRATA_USE_HIP` ビルドで KFD topology が対象クラス | `STRATA_KFD_QUIET` と `STRATA_KFD_QUIET_XFER` が有効なら `1000000` を設定する。 | 値の内容を検証せず、そのままにする。空文字も設定済みとして扱う。 |
+| 上記以外 | Strata は設定しない。 | 値の内容を検証せず、そのままにする。 |
 
-`STRATA_ARENA_MMAP` は文字列全体を parse せず、先頭文字だけを `'1'` と比較します。したがって `1`, `10`, `1anything` は条件を満たし、`true`, `01`, 空文字は満たしません。対象変数自体について、Strata は既存値を数値変換・検証せず、境界値や無効値の判定もしません。設定 API の戻り値も確認していません。根拠: `src/program/generate.cpp:2940-2941`, `sycl/src/program/generate.cpp:1761-1762`。
+`STRATA_ARENA_MMAP` は `getenv` で値が存在し、かつ先頭文字が `1` の場合に分岐するため、`1abc` も条件を満たす。`STRATA_KFD_QUIET` と `STRATA_KFD_QUIET_XFER` は共通 helper が先頭文字 `0` のときだけ無効とし、未設定・空文字・それ以外の値は有効扱いにする。対象変数自身は数値変換も空白除去もされず、`getenv(...) != nullptr` の有無だけで自動設定を抑止する。`engine/src/program/generate.cpp:3742-3754`、`engine/include/strata/core/kfd_quiet.hpp:47-68,251-257`。
 
 ## 有効になる条件
 
-- `STRATA_USE_HIP` または `STRATA_HIP_GFX906` のいずれかが定義されたビルドであること。
-- `_WIN32` が定義されていないこと。
-- `STRATA_ARENA_MMAP` の値があり、先頭文字が `1` であること。
-
-この条件は CLI の `--mmap-experts` ではなく `STRATA_ARENA_MMAP` で判定されます。対象変数の設定箇所は `main()` の引数解析より前にあり、`--version` / `-V` はその手前で終了するため、その呼び出しでは設定箇所に到達しません。`STRATA_ARENA_MMAP` 自体はファイルバックの expert arena に関係する別設定です（`src/core/expert_source.cpp:5816-5825`; SYCL 側 `sycl/src/core/expert_source.cpp:3350-3359`）。
+- `STRATA_ARENA_MMAP` 経由の設定は `(STRATA_USE_HIP または STRATA_HIP_GFX906) かつ Windows 以外` のビルドで実行され、`STRATA_ARENA_MMAP` の先頭文字が `1` の場合に行われる。ここでは GPU 世代や `STRATA_KFD_QUIET` の値を条件にしない。`engine/src/program/generate.cpp:3736-3744`。SYCL 側の `engine/sycl/src/program/generate.cpp:1858-1866` にも同じ mmap 分岐がある。
+- KFD quiet の XFER 設定は `STRATA_USE_HIP` かつ Linux のビルドに限られる。`/sys/class/kfd/kfd/topology/nodes` を読み、GPU node が少なくとも 1 つあり、GPU node がすべて gfx1103・gfx1150・gfx1151 のいずれかなら対象クラスとする。他の GPU node が混在する場合や topology を読めず GPU node が得られない場合は対象外。`engine/src/program/generate.cpp:3745-3753`、`engine/include/strata/core/kfd_quiet.hpp:198-212,228-249`。
+- KFD quiet 経由では `STRATA_KFD_QUIET` または `STRATA_KFD_QUIET_XFER` の先頭文字が `0` なら設定しない。いずれか未設定、空文字、先頭文字が `0` 以外ならスイッチ判定上は有効。`engine/include/strata/core/kfd_quiet.hpp:47-68,254-257`。
+- `GPU_PINNED_MIN_XFER_SIZE` 自身に CLI 引数や設定ファイルの値を読む処理は見つからない。`--mmap-experts` は引数として別途解析されるが、この変数の直接の読み取り・設定箇所ではない。`engine/src/program/generate.cpp:4213,3742-3754`。
 
 ## 実行時の詳細
 
-通常の起動では引数解析前に一度だけ `STRATA_ARENA_MMAP` を読み、条件成立時に対象変数の既定値を設定します。対象変数の値を Strata が後から読み直す処理、CLI 引数や別設定との優先順位判定、ログ・警告・終了分岐は確認できませんでした。設定呼び出しの失敗も明示的には処理されません。
+両方の自動設定経路は engine の `main` で、通常の引数処理や GPU 初期化より前に評価される。`--version` 等の早期終了引数はこのブロックより前に処理される。起動時に一度だけ対象変数の有無を調べ、後段で再読込・キャッシュ更新する Strata コードは確認できない。`engine/src/program/generate.cpp:3696-3744,3745-3764`。
 
-候補一覧と関連ドキュメントには同名の記載がありますが、役割は異なります。`docs/AMD_HIP.md:372-377` は ROCm 7.2.4 の RX 6800 でサーバー JSON の `env` に `1048576` を指定した報告例を載せ、`docs/TROUBLESHOOTING.md:344-347` も同報告に触れています。これらは利用者が設定する回避策の記録です。Strata のコードが設定する値は `1000000` であり、Strata はこの値を解釈しないため、文書中の値の違いから外部側の意味や効果は推定しません。
+ファイルバック arena 経路は、値が設定済みであるかに関わらず `setenv` を呼ぶが、上書きフラグ `0` により呼び出し元の値を保つ。KFD quiet 経路は topology とスイッチを判定してから対象変数を読み、未設定時だけ同じ値を設定する。mmap 経路が先に値を設定した場合、後続の KFD quiet 経路はその存在を見て追加設定しない。いずれも `setenv` の戻り値を検査せず、失敗時の Strata 独自エラー処理はない。`engine/src/program/generate.cpp:3742-3757`、`engine/include/strata/core/kfd_quiet.hpp:251-257`。
+
+## ログと測定値
+
+KFD quiet 経由で Strata が自動設定し、かつ `STRATA_TRACE` が設定済み（空文字を含む）なら、stderr に `strata trace: kfd quiet: GPU_PINNED_MIN_XFER_SIZE=1000000 (pageable copies staged by the runtime)` を出す。既存値を保持する場合、mmap 経由だけで設定する場合、または KFD quiet 条件が無効の場合に、この箇所から対象変数のログは出ない。警告・終了・失敗を対象変数のために行う分岐は見つからない。`engine/src/program/generate.cpp:3751-3757`。
 
 ## 根拠
 
-- HIP 系・非 Windows の条件、`STRATA_ARENA_MMAP` の先頭文字判定と既定値設定: `src/program/generate.cpp:2934-2942`, `sycl/src/program/generate.cpp:1755-1763`。
-- `--version` / `-V` が設定箇所より先に return すること: `src/program/generate.cpp:2918-2932`, `sycl/src/program/generate.cpp:1746-1753`。
-- `STRATA_ARENA_MMAP` の関連する file-backed arena 実装: `src/core/expert_source.cpp:5816-5848`, `sycl/src/core/expert_source.cpp:3350-3381`。
-- 手動設定例: `docs/AMD_HIP.md:365-379`, `docs/TROUBLESHOOTING.md:341-347`。
+- `engine/src/program/generate.cpp:3736-3744` — HIP 系、Windows 以外での `STRATA_ARENA_MMAP` 判定と非上書き設定。
+- `engine/src/program/generate.cpp:3745-3757` — Linux HIP の topology 判定、設定値の選択、環境設定、trace ログ。
+- `engine/include/strata/core/kfd_quiet.hpp:47-68,198-212,228-257` — quiet switch の値判定、対象 GPU node の規則、topology 読み取り、対象変数の未設定判定。
+- `engine/sycl/src/program/generate.cpp:1858-1866` — SYCL ソース内の mmap 経由の設定。
+- `engine/src/program/generate.cpp:4213` — `--mmap-experts` の引数解析箇所。

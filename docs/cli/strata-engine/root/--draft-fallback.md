@@ -1,68 +1,62 @@
-# `--draft-fallback`
+# `strata --draft-fallback`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` エンジン引数（`root/`） |
+| コマンド | `strata`（root parser。通常実行と `--serve` の両方） |
 | オプション | `--draft-fallback` |
 | 別名 | なし |
-| 値 | CUDA/HIP/Metal 系は `mtp` または `none`。SYCL build は `none` のみ |
+| 値 | `mtp` または `none` |
 
 ## 役割
 
-`--draft dflash2` 使用時に、DFlash2 drafter が起動できない場合の MTP drafter fallback を選びます。`mtp` は MTP 層を DFlash2 とともにロードして fallback として残し、`none` は MTP 層をロードせず DFlash2 だけで実行します。指定を省略したときの `--draft dflash2` は `none` と同じ扱いです（`src/program/generate.cpp:987-993,1157-1161,5319-5355`）。
+`--draft dflash2` を選んだとき、DFlash2 が起動できない場合に MTP drafter を使える状態にするかを指定します。`mtp` は MTP layer もロードしてfallbackとして残し、`none` は MTP layer をロードせず DFlash2 だけで実行します。省略時も `none` と同じ扱いです。MTP layer を保持する設定は実行開始時に決まり、各生成ラウンドごとに切り替わる設定ではありません（`engine/src/program/generate.cpp:1182-1188,6466-6477`）。
 
 ## 使い方
 
 ```sh
-strata --pack target.gguf --mtp /models/mtp --draft dflash2 --draft-model drafter.pack --draft-fallback mtp --spec 6
-```
+# DFlash2 が起動できない場合に MTP へ切り替える。MTP ディレクトリには draft_vocab.bin が必要。
+strata --pack TARGET.pack --native MODEL.gguf --mtp MTP_DIR --draft dflash2 --draft-model DFLASH2.pack --draft-fallback mtp --spec 4 --tokens 1,2
 
-MTP の語彙ファイルだけを使い、MTP 層をロードしない例:
-
-```sh
-strata --pack target.gguf --mtp /models/mtp --draft dflash2 --draft-model drafter.pack --draft-fallback none --spec 6
+# MTP layer をロードせず、DFlash2 の起動失敗をエラーにする。語彙ファイルは別途指定できる。
+strata --pack TARGET.pack --native MODEL.gguf --draft dflash2 --draft-model DFLASH2.pack --draft-fallback none --mtp-draft-vocab VOCAB.bin --spec 4 --tokens 1,2
 ```
 
 ## 値と既定値
 
-- CUDA/HIP/Metal 系 parser は `mtp` と `none` だけを受理します。それ以外は標準エラーに `strata generate: --draft-fallback takes mtp or none` を出して終了コード `2` で終了します（`src/program/generate.cpp:3583-3588`）。
-- 値を省略すると `next()` が `--draft-fallback needs a value` を標準エラーに出して終了コード `2` で終了します（`src/program/generate.cpp:3293-3298`）。
-- `Options` の初期値は空文字列ですが、`--draft dflash2` かつ `--draft auto` でない場合、値が `mtp` でなければ `none` 扱いになります。したがって実効上の既定値は `none` です（`src/program/generate.cpp:990-993,5330-5332`）。
-- 同じ引数を複数回指定すると、引数列を順に読む parser が同じ field を更新するため、最後の値が残ります（`src/program/generate.cpp:3293-3298,3583-3588`）。
-- SYCL の別 parser は既定値を `none` とし、明示値も `none` だけを受理します。`mtp` を指定すると標準エラーに「only none is supported on this build」と出し、終了コード `2` で終了します（`sycl/src/program/generate.cpp:751-755,2032-2037`）。
+- `mtp`: MTP layer をロードし、DFlash2 が利用できない場合は MTP で生成します。通常は `--mtp DIR` が必要です。`--mtp-draft-vocab FILE` は DFlash2 の draft vocabulary の場所を指定しますが、MTP layer 自体をロードする指定の代わりにはなりません（`engine/src/program/generate.cpp:6470-6471,8193-8203`）。
+- `none`: DFlash2 専用にします。MTP layer のロードは省略されますが、DFlash2 用 draft vocabulary は必要です。`--mtp DIR` がある場合は既定の `<DIR>/draft_vocab.bin` の解決元として使われ、`--mtp-draft-vocab FILE` で個別指定もできます（`engine/src/program/generate.cpp:6470-6502`）。
+- 省略時は内部値が空文字列のままで、`--draft dflash2` の通常経路では `mtp` 以外を `none` として扱います（`engine/src/program/generate.cpp:1188,6477`）。
+- 値の大文字小文字や別表記は受理されません。値がない場合は `--draft-fallback needs a value`、`mtp` / `none` 以外は `strata generate: --draft-fallback takes mtp or none` を stderr に出して終了コード 2 で終了します（`engine/src/program/generate.cpp:3839-3842,4150-4155`）。
+- 有効値を複数回指定した場合、parser は後の値で同じフィールドを置き換えます。重複指定専用のエラー処理はありません（`engine/src/program/generate.cpp:3837-3842,4150-4155`）。
 
 ## 実行時の動作
 
-`--draft-fallback none` では、DFlash2 の語彙を解決した後に `--mtp` を空にし、MTP 層をロードしない状態にします。語彙の指定には `--mtp DIR`（`DIR/draft_vocab.bin`）または `--mtp-draft-vocab FILE` を使えます。`none` でも `--mtp DIR` を指定した場合、そのディレクトリは語彙の場所として参照されますが、MTP 層はロードされません（`src/program/generate.cpp:5319-5325,5330-5355,6742-6764`）。
+このオプションは `--draft dflash2` と組み合わせた場合に作用します。`mtp` を選ぶと `o.mtp` を保持し、MTP layer をロードしたうえで DFlash2 を起動します。DFlash2 が初期化できなければ MTP に切り替えます（`engine/src/program/generate.cpp:8193-8203,8243-8255,24407-24426,13519-13527`）。したがってfallback用の MTP layer と draft vocabulary のメモリも必要です。
 
-この solo モードには `--draft-model PACK`、`--spec` 2 以上、および `--mtp DIR` か `--mtp-draft-vocab FILE` が必要です。不足時は標準エラーに必要条件を表示して終了コード `2` で戻ります。DFlash2 がロード・bind・prepare できない場合も MTP fallback がないため、開始または実行を終了コード `1` で中止します（`src/program/generate.cpp:5330-5333,6765-6772,6802-6815,19703-19722`）。
+`none` または省略時は、MTP layer のロードを避けるために `o.mtp` をクリアし、`df2_solo` を立てます。MTP layer のロード箇所は `o.mtp` が空なら通りません（`engine/src/program/generate.cpp:6477-6502,8172-8194`）。そのため MTP layer の追加ロードを行いませんが、DFlash2 が使えない場合に MTP へ切り替わることもありません。
 
-`--draft-fallback mtp` では `--mtp DIR` の MTP 層をロードしたままにし、DFlash2 の初期化に失敗した場合は標準エラーに理由を出して MTP に切り替えます。DFlash2 側にだけ指定された広い `--spec` を使っていた場合、`--draft-mtp-spec` が明示されていれば fallback 後の窓幅をその値に縮めます（`src/program/generate.cpp:6742-6764,6806-6818`）。
-
-`--draft auto` は両方の drafter を保持するモードなので、`--draft-fallback none` との組み合わせは矛盾として標準エラーに理由を表示し、終了コード `2` で戻ります。`--draft auto` では両方をロードする動作が優先されます（`src/program/generate.cpp:990-993,1159-1164,5326-5329`）。
+`--draft mtp` では `--draft-fallback` の値による分岐がなく、MTP drafterを選ぶ動作は変わりません。`--draft auto` は両 drafter を保持するモードで、`--draft-fallback none` を明示すると「`--draft-fallback none is for --draft dflash2`」を stderr に出し、終了コード 2 で終了します。`auto` と `mtp` の組み合わせでは `auto` 自体が両方を保持するため、fallback 指定による別の切替はありません（`engine/src/program/generate.cpp:4140-4144,6473-6475,6477`）。
 
 ## 適用条件と副作用
 
-- このオプションの fallback 選択が実際に参照されるのは `--draft dflash2` の経路です。DFlash2 の実行には `--draft-model` などの前提があり、solo と fallback ありで不足時の結果が異なります（`src/program/generate.cpp:5330-5333,6765-6772`）。
-- `none` は MTP 層の GPU メモリ負荷をなくしますが、DFlash2 を代替する drafter もなくなります。起動時に DFlash2 の準備に失敗すると処理は継続しません（`src/program/generate.cpp:990-992,6802-6815,19720-19722`）。
-- `mtp` は MTP 層もロードするため、その層が使用するメモリが必要です。ソースの usage は約 0.9 GiB と記していますが、実量はモデル・環境に依存し得る値として扱ってください（`src/program/generate.cpp:1159-1161`）。
-- MTP の layer split による pipeline windows は、DFlash2 を solo で使う場合には有効になりません。条件判定で自動的に off とされ、その理由を標準エラーに出します（`src/program/generate.cpp:5398-5407,5417-5419`）。
-- `src/program/generate.cpp` の共通 parser は CUDA/HIP/Metal 系のビルドで使われ、Metal 用の語彙 fallback も条件付きで実装されています（`src/program/generate.cpp:5335-5343`、`metal/CMakeLists.txt:117`）。SYCL は独立 parser・実装です。実機・特定 Release artifact での動作確認はしていません。
+- DFlash2 の通常経路では `--draft-model PACK`、`--spec` 2以上、および draft vocabulary が必要です。`none` の場合、`--mtp DIR` または `--mtp-draft-vocab FILE` のどちらかが語彙の解決元として必要ですが、MTP layer をロードする必要はありません（`engine/src/program/generate.cpp:6477-6502`）。
+- `mtp` を選び `--mtp` を省略すると、DFlash2 起動処理は「it needs --mtp (the fallback)」として停止します。通常実行では fallback MTP もロードされず、DFlash2 も使われない経路があります。fallback を意図する場合は MTP directory を指定してください（`engine/src/program/generate.cpp:8193-8203`）。
+- DFlash2 のセットアップ失敗時は、`mtp` なら MTP が続行し、`none` なら通常の生成経路・serve 起動経路とも開始をエラーにします（通常実行: `engine/src/program/generate.cpp:8239-8255,24407-24430`、serve: `engine/src/program/generate.cpp:13519-13527`）。DFlash2 が正常に起動した場合は、`none` でも `mtp` でも主 drafter は DFlash2 です。
+- 例外として、layer split のGPUメモリ事前判定で DFlash2 が収まらないと判断されたとき、`none` でも `df2_solo` と draft 指定を解除して drafter なしで続行する経路があります。この判定は layer split、離散GPU、`STRATA_SPILL_OFF` 未設定などの条件下です（`engine/src/program/generate.cpp:8148-8169`）。
+- DFlash2 がロードされない場合も `none` を選べば常にエラーになるわけではありません。上記の事前判定経路のほか、DFlash2 実装が使えないビルド条件について、すべての分岐をこの調査範囲から確認できませんでした。
 
 ## 出力とエラー
 
-値不正・値欠落・solo の必須条件不足・`auto` との矛盾は標準エラーに診断を出し、終了コード `2` になります（`src/program/generate.cpp:3295-3297,3583-3588,5326-5333`）。solo で DFlash2 の初期化に失敗、または使用不可の場合は MTP へ切り替えず標準エラーに失敗理由を出して終了コード `1` になります。fallback が `mtp` の場合は診断後に MTP を使って処理を続けます（`src/program/generate.cpp:6802-6815,11160-11168,19703-19722`）。
+引数値の誤りと `--draft auto --draft-fallback none` は終了コード 2 です。`none` で DFlash2 のロード・bind・prepare が失敗した場合、stderr に失敗理由を含むメッセージを出し、通常生成では終了コード 1、serve では開始を中止して終了コード 1 を返します。`mtp` で DFlash2 が起動しない場合は stderr に理由と MTP へ切り替える旨を出して続行します（`engine/src/program/generate.cpp:6473-6480,8240-8255,13519-13527,24412-24430`）。
 
 ## 根拠
 
-- parser、既定値、値検査: `src/program/generate.cpp:987-993,1157-1161,3293-3298,3583-3588`
-- solo 条件、語彙解決、MTP 層の抑止: `src/program/generate.cpp:5319-5355,6742-6764`
-- DFlash2 の失敗時の fallback / 終了経路: `src/program/generate.cpp:6765-6818,11160-11168,19703-19722`
-- pipeline windows との相互作用: `src/program/generate.cpp:5398-5407,5417-5419`
-- SYCL の受理値制限: `sycl/src/program/generate.cpp:751-755,2032-2037`
-- Metal build の DFlash2 compile definition: `metal/CMakeLists.txt:117`
-
-調査範囲は上記 checkout のソースです。CUDA/HIP/Metal/SYCL の実機実行、各 Release artifact の照合、および性能測定は行っていません。
+- `engine/src/program/generate.cpp:1182-1188` — 値の役割、未指定時の意味、per-run 設定であること。
+- `engine/src/program/generate.cpp:3837-3842,4150-4155` — 引数取得、受理値、欠落値と不正値の終了処理。
+- `engine/src/program/generate.cpp:6470-6502` — `auto` との相互作用、語彙パス解決、MTP layer を外す処理。
+- `engine/src/program/generate.cpp:8172-8203,8239-8255` — MTP のロードと通常生成時の DFlash2 起動・fallback。
+- `engine/src/program/generate.cpp:8148-8169,24407-24430` — layer split のメモリ不足経路と通常生成時の失敗処理。
+- `engine/src/program/generate.cpp:13505-13534` — serve の DFlash2 設定・fallback・起動中止処理。

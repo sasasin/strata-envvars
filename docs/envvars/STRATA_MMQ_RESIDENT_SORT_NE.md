@@ -1,52 +1,42 @@
 # `STRATA_MMQ_RESIDENT_SORT_NE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-MMQ を使う prompt prefill の MoE 層で、常駐 expert の処理順を、その層で各 expert に割り当てられた routed row 数の昇順に並べ替える opt-in です。CUDA系実装では `STRATA_MMQ_GROUP_SORT` が選ぶ「16 expert の完全な group だけ」の並べ替えより優先され、最後の不完全 group も含めて active expert 全体を並べ替えます。SYCL にも同じ resident-sort helper を使う経路があります。
-
-並べ替えは expert ID・routing weight・各 expert 内の row 順を変更せず、MMQ に渡す `order` と、それに整合する `off`、`slot`、`src` を作り直します。環境変数だけで MMQ が有効になるわけではありません。
+MMQ を使う prompt prefill の expert 行テーブルを、expert ID 順ではなく、ルーティングされた行数が少ない expert から並べ直します。これにより MMQ の expert group の構成順が変わります。並べ替え時に `off`、`slot`、`src` を再構築するため、expert ごとの行対応と expert 内の元の行順は維持されます。CUDA/HIP 共通 prefill 実装では部分 group も含めた全 `order` が対象で、SYCL 実装も同じ helper を呼びます (`engine/src/prefill/mmq_resident_sort.hpp:91-123`, `engine/src/prefill/prefill.cpp:6142-6168`, `engine/sycl/src/prefill/prefill.cpp:4134-4141`)。
 
 ## 値と判定
 
-値は `std::getenv` で取得し、`std::strcmp(value, "1") == 0` で文字列全体を比較します（`src/prefill/mmq_resident_sort.hpp:13-19`）。数値変換、前後空白の除去、大文字小文字変換はありません。
+共通 helper は `std::getenv` の結果が null でなく、文字列全体が `"1"` と一致するときだけ有効にします。数値変換や trim はありません。したがって unset、空文字、`0`、`true`、`01`、`1anything`、前後に空白のある `1` は無効で、大文字小文字による別扱いもありません (`engine/src/prefill/mmq_resident_sort.hpp:21-28`)。
 
-| 環境値 | 要求フラグ |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| `1` | 有効 |
-| `0`、`true`、`01`、`1x`、その他の文字列 | 無効 |
-
-要求フラグは `mmq_resident_sort_requested()` 内の `static const bool` に保存されます。初回評価後にプロセス環境を変更しても再読込されません。CLI 引数による上書きはこの helper にはありません。
+| 条件（build / 実行経路） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP 共通 prefill または SYCL prefill の helper が呼ばれる場合 | OFF | 文字列全体が `1` | 空文字、`0`、`true`、`01`、`1anything`、` 1` |
 
 ## 有効になる条件
 
-要求フラグが有効でも、層ごとに次の条件を満たさなければ並べ替えません。
-
-- その層が MMQ を使う (`use_mmq`)。
-- cache と層の resident 情報があり、expert 数が正である。
-- resident 情報上、層の**全 expert**が常駐している（`layer_resident[e] >= 0`）。一部だけ常駐する層では無効。
-- CUDA系の prompt prefill では peer 分割/peer 処理がない（`on_peer.empty()`）。
-- stream-all 経路では、その層に stream 対象がない。実装は `!stream_all || seq_start[l] == seq_start[l + 1]` を helper に渡す。
-
-CUDA系ではさらに、`STRATA_MMQ_GROUP_SORT` が有効でも resident-sort の要求が優先されます。resident-sort が要求されると `sort_full` は偽になり、resident-sort が適格なら `order` 全体を対象にします。不適格なら `STRATA_MMQ_GROUP_SORT` の group-sort に切り替わるのではなく、その層の並べ替え自体が行われません (`src/prefill/prefill.cpp:1404-1415,4552-4566`)。SYCL 側には `STRATA_MMQ_GROUP_SORT` による代替分岐がなく、resident-sort の適格性だけを確認します (`sycl/src/prefill/prefill.cpp:3700-3707`)。
-
-MMQ 自体が利用可能であることも必要です。CUDA系の MMQ plan は `mmq::built()`、`STRATA_PREFILL_MMQ`、層の形式・shape 適合性から層ごとに作られます。`STRATA_PREFILL_MMQ=0` は MMQ plan を無効にし、未設定なら build が MMQ を含む場合に有効候補になります (`src/prefill/prefill.cpp:77-91,1348-1380`)。SYCL でも呼び出し側の `use_mmq` が偽なら適格性判定を通りません。
+- 対象 layer が MMQ expert 経路を使う必要があります。共通実装の `use_mmq` が false のとき helper は対象外と判定します (`engine/src/prefill/mmq_resident_sort.hpp:63-80`)。通常の MMQ 計画はビルドに MMQ があり、`STRATA_PREFILL_MMQ` が unset または `atoi` で 0 以外の場合に限って MMQ を有効にし、layer ごとに両 product の tile 対応も確認します (`engine/src/prefill/prefill.cpp:2026-2037,2048-2077`)。
+- layer の全 expert が GPU cache に resident である必要があります。cache と `layer_resident` が存在し、`layer_stream_empty` が true で、全 expert の resident slot が非負の場合だけ有効です。非 resident expert が一つでもあれば並べ替えません (`engine/src/prefill/mmq_resident_sort.hpp:63-80`)。
+- CUDA/HIP 共通 prefill 経路では peer expert が割り当てられた layer は要求を false として渡すため並べ替えません (`engine/src/prefill/prefill.cpp:6151-6157`)。SYCL 経路も `on_peer` が空であることを要求します (`engine/sycl/src/prefill/prefill.cpp:4138-4141`)。
+- streamed walk (`stream_all`) では layer の stream 範囲が空であることも必要です。非 streamed walk では caller が `layer_stream_empty` を true として渡しますが、resident cache と全 expert resident 条件は引き続き適用されます (`engine/src/prefill/prefill.cpp:6154-6157`; `engine/sycl/src/prefill/prefill.cpp:4138-4141`)。
+- `STRATA_MMQ_TIER_SORT=1` も有効な CUDA/HIP 共通経路では、並べ替え helper に readiness tier 情報も渡され、tier 順（VRAM resident、pinned RAM、その他）の後に行数順となります。全 expert resident 条件が満たされると全員同じ tier なので行数順です (`engine/src/prefill/prefill.cpp:6151-6168`; comparator: `engine/src/prefill/mmq_resident_sort.hpp:97-105`)。
+- CUDA/HIP 共通実装では、この変数が有効だと `STRATA_MMQ_GROUP_SORT` のみを使う枝を抑止します。resident sort は全 expert 順を扱うので、group sort の全 group 条件に依存しません (`engine/src/prefill/prefill.cpp:2163-2176`)。
 
 ## 実行時の詳細
 
-CUDA系では各 prompt prefill 層で routed ID の出現数 `m.cnt` を数え、resident/stream/peer/CPU の分類と expert の `order` を作った後に判定します。適格なら `mmq_resident_sort_rows` が `order` の対象範囲を `count` 昇順（同数なら expert ID 昇順）に安定 sort し、`off` を再構成してから routing table の `slot` と `src` を再構築します。`sort_all` の経路では `sort_full` の span 制限がないため、partial group も対象です (`src/prefill/prefill.cpp:4537-4566`, `src/prefill/mmq_resident_sort.hpp:51-79`)。この後 `slot` と `src` は GPU に転送されます (`src/prefill/prefill.cpp:4567-4575`)。
+値は `mmq_resident_sort_requested()` 内の関数ローカル `static const bool` で初回評価時に一度だけ読み取られ、そのプロセス内で cache されます。したがって初回評価後に環境を変更しても反映されません。CUDA/HIP 共通実装では MMQ plan 構築中に group-sort の排他条件で参照される場合があり、実際の sort 判定では prefill の expert 行テーブル構築中に参照されます。SYCL では prefill の行テーブル構築中に参照されます (`engine/src/prefill/mmq_resident_sort.hpp:25-28`; `engine/src/prefill/prefill.cpp:2026-2037,2163-2167,6128-6168`; `engine/sycl/src/prefill/prefill.cpp:4127-4141`)。
 
-SYCL も routing 情報と order の作成後、同じ helper で適格性を判定し、適格なら `slot/src/off/order` を再構築してから routing table を転送します (`sycl/src/prefill/prefill.cpp:3693-3732`)。helper は host 側の sort と配列再構成を行います。device 計算式や精度を変える処理はこの helper にはありません (`src/prefill/mmq_resident_sort.hpp:1,56-79`)。
+並べ替え対象はルーティングされた expert の `order` です。比較は行数昇順、同数なら expert ID 昇順です。その順に `off` の expert 開始位置を更新し、元の route 配列から `slot` と `src` を作り直します。各 expert 内の行順は token/rank traversal のままです。CUDA/HIP 共通経路ではこの並びが後続の MMQ group walk に使われます (`engine/src/prefill/mmq_resident_sort.hpp:82-123`; caller: `engine/src/prefill/prefill.cpp:6121-6179`)。この変数専用の fallback エラーや終了経路はなく、条件を満たさない layer は既存の順序で進みます。
 
-この変数専用の有効・無効ログや警告、無効値エラーは見つかりません。並べ替えが不適格でも、その理由をこの変数名で出力する分岐はありません。CUDA系の MMQ plan には `STRATA_MMQ_GROUP_SORT` が有効で resident-sort が要求されていない場合に group-sort の層数を stderr に出すログがありますが、resident-sort の動作を示すログではありません (`src/prefill/prefill.cpp:1404-1415`)。
+## ログと測定値
+
+この変数を有効・無効にしたことを示す専用 stdout/stderr ログは確認できません。CUDA/HIP 実装の近接ログは `STRATA_MMQ_GROUP_SORT` と `STRATA_MMQ_TIER_SORT` の別設定に対するものです (`engine/src/prefill/prefill.cpp:2174-2185`)。Strata の `docs/DETAILS.md` に本変数固有の説明または測定値は見つかりませんでした。
 
 ## 根拠
 
-- 文字列判定と static cache: `src/prefill/mmq_resident_sort.hpp:13-19`。
-- 適格条件: `src/prefill/mmq_resident_sort.hpp:38-49`。
-- stable sort と routing table の再構築: `src/prefill/mmq_resident_sort.hpp:51-79`。
-- CUDA系 MMQ plan の作成と group-sort との優先関係: `src/prefill/prefill.cpp:1348-1418,4552-4575`。
-- SYCL 側の呼び出しと転送: `sycl/src/prefill/prefill.cpp:3693-3732`。
+- 値の厳密比較と static cache: `engine/src/prefill/mmq_resident_sort.hpp:21-28`
+- sort の適用条件: `engine/src/prefill/mmq_resident_sort.hpp:63-80`
+- sort 比較、行テーブルの再構築: `engine/src/prefill/mmq_resident_sort.hpp:82-123`
+- CUDA/HIP 共通経路、他の sort 設定との優先関係: `engine/src/prefill/prefill.cpp:2163-2185,6128-6179`
+- SYCL 経路: `engine/sycl/src/prefill/prefill.cpp:4127-4141`

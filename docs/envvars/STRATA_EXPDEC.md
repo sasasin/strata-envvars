@@ -1,46 +1,47 @@
 # `STRATA_EXPDEC`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-GPU の `native_expert_grouped` が実行する routed expert の gate/up 計算について、対応する量子化形式・形状なら EXPDEC カーネルを選びます。このカーネルはグループの q8_1 activation を shared memory に置き、複数行をまとめて計算します。対象外の形式・形状では通常カーネルに戻ります。down 計算は別設定 `STRATA_EXPDEC_DOWN` が必要です。
-
-実行時の選択箇所は `src/kernels/cuda/iq_kernels.cu` です。同ファイルは CUDA/HIP の GPU カーネルターゲットに含まれます（`CMakeLists.txt:412,456-502`）。一方、説明資料 `docs/EXPERTDEC.md:3` は「CUDA only」と記しています。現行のソース上では同じ GPU カーネル経路に判定と HIP 用アーキテクチャ既定値もあるため、同資料の backend 範囲の説明とは一致しません。ここではコードで確認できる選択条件を記し、性能測定値は一般化しません。
+CUDA/HIP の `native_expert_grouped` における resident expert の gate/up 計算で、既定 kernel ではなく EXPDEC kernel を選べるようにするフラグです。EXPDEC kernel は routed group の q8_1 activation を shared memory に置いて処理します。down projection も `STRATA_EXPDEC_DOWN` 等の条件がそろえば対象になります。EXPDEC が無効、または layout が対象外なら呼び出し元は既定 kernel に進みます（`engine/src/kernels/cuda/iq_kernels.cu:4452-4466,4486-4493,7306,7402-7409`）。
 
 ## 値と判定
 
-`STRATA_EXPDEC` は `env_on("STRATA_EXPDEC")` で判定します。環境変数の文字列全体は parse せず、未設定でないこと、空文字でないこと、先頭文字が `0` でないことを見ます。
+`env_on` は `std::getenv` の結果が null でなく、先頭文字が NUL でも `'0'` でもないとき true を返します。文字列全体や数値としては parse しません（`engine/src/kernels/cuda/iq_kernels.cu:3689-3692,4360-4362`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 判定時点の既定値に従う。通常は OFF。HIP gfx1200/gfx1201 のアーキテクチャ既定値が適用済みなら ON |
-| 空文字 | OFF。設定済みなので、アーキテクチャ既定値による補完も抑止する |
-| `0` または `0` 始まりの文字列 | OFF（例: `0`, `0abc`） |
-| その他の非空文字列 | ON（例: `1`, `2`, `true`, `false`, ` 0`） |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 通常の評価 | `0`（既定 kernel） | 先頭文字が `'0'` 以外の非空文字列。例: `1`, `true`, ` 0`, `0anything` 以外の文字列 | 空文字、`0`, `0anything`, `00`。大文字小文字・後続文字・数値妥当性は判定しない |
+| HIP の gfx12 / discrete RDNA3 起動時既定値 | 既定適用が有効なら `1` が設定される | 明示値が上記判定で true | 明示値が上記判定で false。明示設定は自動既定値に置き換わらない |
 
-数値変換、範囲検査、大文字小文字の正規化はありません。値が有効判定でも、後述の適用条件を満たさない呼び出しは通常カーネルを使います。
-
-根拠: `src/kernels/cuda/iq_kernels.cu:3395-3398,4060-4062`。
+この変数自体を読むコードに CLI 引数との直接の優先順位はありません。HIP のアーキテクチャ既定値は `getenv(...) != nullptr` なら設定を追加しないため、ユーザー環境の値（空文字や `0` を含む）が優先されます（`engine/src/core/arch_defaults.cpp:307-310,320-324`）。
 
 ## 有効になる条件
 
-- `STRATA_EXPDEC` が ON で、旧 grouped kernels を選ぶ `STRATA_OLD_IQ_MMVQ` が ON でないこと。後者も同じ `env_on()` 判定です。
-- 対象計算が `native_expert_grouped` の gate/up または down 経路に到達すること。EXPDEC は通常の grouped dispatch から呼ばれます。nibble layout の分岐では先に nibble kernel を選び、EXPDEC 判定には進みません。
-- gate/up は量子化 type `16, 17, 18, 21, 22`、`n_embd == 32 * ED_XB`、`n_ff > 0` かつ `n_ff` が64の倍数のとき対応します。資料では主な形状を `n_embd 2560` と記載しています。
-- down は `STRATA_EXPDEC_DOWN` が非ゼロで、type `42`（IQ4_NL）または `STRATA_EXPDEC_D20` も非ゼロの type `20`（Q2_0）であり、`n_ff == 32 * ED_HB`、`n_embd > 0` かつ128の倍数のとき対応します。既定では `STRATA_EXPDEC_DOWN=0` なので gate/up のみです。
-- HIP では `src/program/generate.cpp` が GPU アーキテクチャを調べ、`apply_arch_defaults()` を engine が環境スイッチを初回評価する前に呼びます。`gfx1200` / `gfx1201` では `STRATA_GFX12_DEFAULTS` が `0` 始まりでなく、`STRATA_DEFAULTS=026` の旧表を使わない場合、表に `STRATA_EXPDEC=1` が含まれます。利用者が変数を何らかの値（空文字を含む）で設定済みなら、その値を保ちます。gfx1151 表にはこの変数がありません。CUDA 側の NVIDIA 既定表には同変数がありません。
-
-根拠: `src/kernels/cuda/iq_kernels.cu:4151-4192,4077-4084`; `src/kernels/cuda/iq_kernels.cu:6323-6338,6404-6415,6484-6490`; `src/core/arch_defaults.cpp:27-53,55-57,167-180`; `src/program/generate.cpp:3383-3400,3445-3459`; `src/core/nv_defaults.cpp:23-80,82-92`。
+- `STRATA_EXPDEC` が有効判定になり、旧 IQ kernel を選ぶ `STRATA_OLD_IQ_MMVQ` が有効でないこと。旧 kernel が有効なら gate/up と down の EXPDEC 選択を早期に止めます（`engine/src/kernels/cuda/iq_kernels.cu:3693-3695,4453-4458,4486-4490`）。
+- gate/up は `gu_type` が 16, 17, 18, 21, 22 のいずれかで、`had_block == 0`、`tail_off == 0`、`n_embd == 32 * ED_XB`、`n_ff > 0` かつ 64 の倍数であること。条件外では既定 kernel に戻ります（`engine/src/kernels/cuda/iq_kernels.cu:4378-4381,4456-4466`）。
+- down はさらに `STRATA_EXPDEC_DOWN` が非ゼロであることが必要です。`d_type == 42` (Q2_0)、または `d_type == 20` かつ `STRATA_EXPDEC_D20` が非ゼロであり、`had_block == 0`、`tail_off == 0`、`n_ff == 32 * ED_HB`、`n_embd > 0` かつ 128 の倍数である必要があります（`engine/src/kernels/cuda/iq_kernels.cu:4366,4371,4382-4384,4486-4493`）。
+- HIP の起動時既定値として `STRATA_EXPDEC=1` を補うのは、`gfx12` と discrete RDNA3 (`gfx1100/1101/1102`) のアーキテクチャ表です。`STRATA_GFX12_DEFAULTS=0` または `STRATA_GFX11_DEFAULTS=0` はそれぞれの表を止め、`STRATA_DEFAULTS=026` も旧既定値に戻します。既定値適用自体は HIP build の起動経路で実行されます（`engine/src/program/generate.cpp:4282-4285,4315`; `engine/src/core/arch_defaults.cpp:30-42,50-55,307-310,312-324`; `engine/include/strata/core/gfx11_extra.hpp:27-30,39-45,55-64`; `engine/include/strata/core/defaults_026.hpp:26-30`）。
+- down projection の既定有効化は現行コードでは確認できません。`g_expdec_down` の環境読み取り fallback は `0` で、アーキテクチャ表にも `STRATA_EXPDEC_DOWN` はありません（`engine/src/kernels/cuda/iq_kernels.cu:4370-4371`; `engine/src/core/arch_defaults.cpp:43-62`; `engine/include/strata/core/gfx11_extra.hpp:46-75`）。一方、`docs/EXPERTDEC.md:3-5,34-38` は gfx12 の Q2_0 down が既定で有効と説明しており、コードと文書に食い違いがあります。
 
 ## 実行時の詳細
 
-`g_expdec` は初期値 `-1` で、`expdec_mode()` の最初の呼び出し時に環境値から決まり、以後プロセス内で保持されます。初回評価後に環境を書き換えても再読込されません。コード内 API `native_expert_set_expdec(int)` が呼ばれると環境判定結果を上書きできます。通常 engine の HIP アーキテクチャ既定値はこの初回評価より前に環境へ設定されます。CLI 引数による直接上書きは見つかりません。
+`g_expdec` は初期値 `-1` で、`expdec_mode()` の初回呼び出し時に `STRATA_EXPDEC` を読み、その結果を保存します。コードコメントでは、アーキテクチャ既定値設定の後に初回評価する意図が示されています。したがって初回評価後にプロセス環境だけを変更しても反映されませんが、engine API `native_expert_set_expdec(int)` は cache を `0` / `1` に上書きでき、負値なら次の評価で環境を再読します（`engine/src/kernels/cuda/iq_kernels.cu:4360-4362,7055-7056`; 起動順: `engine/src/program/generate.cpp:4282-4285,4315`）。
 
-EXPDEC が有効でも対応形式・形状でなければ `expdec_note()` がその role/type の初回に stderr へ `strata expdec: CUDA%d ... not covered: the default kernel runs` を出して通常カーネルを実行します。対応する場合も同関数が初回の role/type ごとに、選択した kernel、パラメーター、grid、graph capture の有無を stderr に記録します。down が設定不足などで無効なときは `expdec_down()` が false を返し、呼び出し元が通常 down kernel を使います。確認した経路には、この変数だけを理由とする警告や終了処理はありません。
+EXPDEC の gate/up と down はそれぞれ適合条件を確認し、適合すれば専用 kernel を launch して `true` を返し、呼び出し元の既定 kernel を抑止します。適合しない場合は `false` を返し、呼び出し元が通常 kernel を実行します（`engine/src/kernels/cuda/iq_kernels.cu:4452-4466,4486-4493,7306,7402-7409`）。プロセス起動後の環境変更や子プロセスへの `STRATA_EXPDEC` の転送を行う処理は、この変数の参照経路では確認できません。
 
-根拠: `src/kernels/cuda/iq_kernels.cu:4060-4062,4120-4148,4151-4192,6216-6217`; HIP 既定値の適用順は `src/program/generate.cpp:3383-3400`。
+## ログと測定値
 
-## 資料との照合
+EXPDEC を有効にして対象 layout に到達すると、role と format ごとに初回だけ stderr に実行 kernel、行数、grid 等を出します。適合しない layout では `strata expdec: CUDA%d %s type %d (n_embd %lld, n_ff %lld) not covered: the default kernel runs` を出します。適合する場合は gate/up または down の `strata expdec: ...` 行を出し、stream capture 中なら末尾に `, captured into a graph` が付きます。`STRATA_EXPDEC` が無効、または `STRATA_OLD_IQ_MMVQ` で早期 return する場合はこの記録関数まで到達しません（`engine/src/kernels/cuda/iq_kernels.cu:4421-4449,4453-4458,4486-4490`）。
 
-`docs/EXPERTDEC.md:3,8-17,31-42` は opt-in、gate/up と down の分離、旧 kernels による無効化、初回ログについて説明しています。実装の値判定では `=1` だけでなく先頭が `0` でない任意の非空値が ON です。また、現行ソースは gfx12 HIP の既定値に `STRATA_EXPDEC=1` を含めるため、「未設定は常に OFF」「CUDA only」という資料の記述は、少なくともこのソース上の既定値・backend 範囲と一致しません。`docs/DETAILS.md:1052-1057,1430` にある性能値は特定構成の測定であり、ここでは一般的な効果として扱いません。
+`docs/EXPERTDEC.md:76-108` は、RTX 2080 Ti / RTX 3060 の `expdec_bench` gate/up 比較、RTX 2080 Ti の 131k decode における gate/up 比較、および同機での end-to-end 測定を記載しています。これらは資料中の測定値であり、この調査では再測定していません。
+
+## 根拠
+
+- 読み取り・値判定・cache: `engine/src/kernels/cuda/iq_kernels.cu:3689-3692,4360-4362`
+- 適用条件・kernel 選択・fallback: `engine/src/kernels/cuda/iq_kernels.cu:4378-4384,4452-4493,7306,7402-7409`
+- HIP の既定値と明示値の優先: `engine/src/program/generate.cpp:4282-4285,4315`; `engine/src/core/arch_defaults.cpp:28-55,302-324`; `engine/include/strata/core/gfx11_extra.hpp:27-30,39-45,55-64`
+- API による cache 上書き: `engine/src/kernels/cuda/iq_kernels.cu:7055-7056`
+- ログ: `engine/src/kernels/cuda/iq_kernels.cu:4421-4449`
+- 測定資料と down 既定値の記述: `docs/EXPERTDEC.md:3-5,34-42,76-108`

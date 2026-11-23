@@ -1,41 +1,46 @@
 # `STRATA_EXECV`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。Strata がこの変数を読む箇所は `setup.py` のサーバー起動処理です。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata のセットアッププログラムがサーバーを起動するとき、セットアップ側のプロセスをサーバーに置き換えるかを選びます。非 Windows で値が truthy の場合は `os.execve` を使い、通常の `subprocess.call` による子プロセス起動を行いません。ソースコメントは、Docker image では `STRATA_EXECV=1` を設定し、サーバーを PID 1 にして停止シグナルを受けられるようにする意図を説明しています。確認できた読み取り箇所は `setup.py` のみで、サーバーや engine の動作設定として読む箇所はありません。
+`terminal/setup.py` の `_start()` がサーバーを起動するとき、Windows 以外でこの環境変数が空でない値なら、setup プロセスをサーバーへ置き換える。未設定または空文字なら、setup は子プロセスとしてサーバーを起動し、終了を待つ。値は真偽文字列として解釈されず、プロセス構成だけを切り替える。サーバーの引数・モデル設定をこの変数自体が変更する処理はない（`terminal/setup.py:8517-8518, 8614-8620`）。
 
 ## 値と判定
 
-| OS / 値 | 起動方法 |
-|---|---|
-| Windows（値を問わない） | `subprocess.call` でサーバーを子プロセスとして起動 |
-| 非 Windows、未設定 | `subprocess.call` で起動 |
-| 非 Windows、空文字 | `subprocess.call` で起動 |
-| 非 Windows、空でない文字列 | `os.execve` で現在のプロセスをサーバーに置換 |
+`os.environ.get("STRATA_EXECV")` の戻り値を Python の条件式で直接判定する。文字列の parse、strip、大小文字変換、数値検査はない。環境変数が未設定なら `None`、空文字なら偽、それ以外の文字列は真になる。したがって `1`、`0`、`false`、空白だけの値、その他の任意の非空文字列は、いずれも同じ分岐に入る（`terminal/setup.py:8614`）。
 
-`os.environ.get("STRATA_EXECV")` の真偽値だけを見ており、文字列の parse や数値変換はありません。そのため `1` だけでなく `0`、`false`、空白を含む任意の非空文字列も有効です。明示的な空文字は未設定と同じ分岐です。範囲、大小文字、無効値時の fallback はありません。
+| 条件 | 未設定 | 設定時に分岐が有効になる値 | 分岐しない値 |
+|---|---|---|---|
+| `os.name != "nt"` | 有効にならない | 任意の非空文字列（例: `1`, `0`, `false`, ` `） | 空文字 |
+| Windows（`WIN`） | 有効にならない | なし。値を読む条件式の左辺で除外される | すべて |
+
+`WIN` は `os.name == "nt"` で定義される（`terminal/setup.py:111`）。CLI 引数や設定ファイルによるこの判定の上書きはありません。
 
 ## 有効になる条件
 
-この判定は `setup.py` の `start()` がサーバー起動まで進んだときにだけ実行されます。たとえば `--no-start` の経路は `start()` を呼ばず、変数は評価されません。値が truthy でも Windows では条件の `not WIN` が成立せず、プロセス置換しません。コード上、CUDA / HIP などの backend による追加制限はありません。
-
-CLI 引数や設定ファイルがこの変数を上書きする処理はありません。CLI や設定から組み立てた `cmd` はどちらの分岐でも同じです。`STRATA_EXECV` を設定した起動元では、分岐に使った値もサーバーの環境へ引き継がれます。
+- `_start()` がサーバー起動箇所まで到達すること。設定ファイルの参照先やモデルファイルが見つからない場合は、それ以前に `fail()` で開始処理を止める（`terminal/setup.py:8486-8492`）。
+- OS が Windows 以外で、値が空文字ではないこと。Windows では設定値に関係なく子プロセス起動経路になる（`terminal/setup.py:111, 8614-8620`）。
+- server 起動用のコマンドは設定ファイルとポートから組み立てられる。CLI の別オプションや backend に応じた設定処理を通った後に環境変数を判定するが、それらが値の truthiness 規則を変える箇所はない（`terminal/setup.py:8517-8518, 8519-8585, 8614-8620`）。
+- 同名の CLI オプション、設定ファイル項目、Strata ソース内での値の書き換えは見つからない。実行中に環境を変更する処理もないため、判定は `_start()` の起動分岐に到達した時点の環境を使う（`terminal/setup.py:8614-8620`）。
 
 ## 実行時の詳細
 
-`start()` は設定ファイルやモデルファイルを確認し、GPU/backend に応じた引数を組み立て、起動内容を表示した後にこの環境変数を読みます。したがってサーバー起動直前の評価であり、読み取り結果を保持する static cache はありません。通常のセットアップ CLI では、`main()` からモデル選択後に `start()` が呼ばれます。
+`start()` は `acquisition.forbidden()` の中で `_start()` を呼ぶ。サーバーコマンドは現在の Python 実行ファイル、`serve/server.py`、`--engine strata`、設定ファイル、ポートから組み立てられる（`terminal/setup.py:8474-8479, 8517-8518`）。
 
-非 Windows で値が空でなければ、実行ファイル `cmd[0]`（`sys.executable`）と引数 `cmd` で `os.execve` を呼び、環境には現在の `os.environ` を引き継いで `acquisition.ENV` を `"1"` に設定します。成功時には呼び出し元の Python プロセスが置換されるため、後続の `subprocess.call` には進みません。未設定・空文字、または Windows では同じコマンドを `subprocess.call` で起動し、その戻り値を `start()` の戻り値にします。こちらも環境に `acquisition.ENV="1"` を設定します。
+起動直前に環境変数を毎回読みます。関数外のキャッシュはありません。Windows 以外で値が非空なら `os.execve(cmd[0], cmd, {**os.environ, acquisition.ENV: "1"})` を実行し、setup プロセスをそのコマンドへ置き換えるため、setup は子プロセスの終了を待つ経路を通りません。環境は既存の全項目を引き継ぎ、`acquisition.ENV` だけは `"1"` に設定して渡します。ここでは対象の `STRATA_EXECV` 自体も環境に残ります（`terminal/setup.py:8614-8618`）。
 
-この変数について専用の警告やログ出力はありません。`execve` が失敗した場合、`OSError` を捕捉する分岐はなく、`main()` の例外処理にも該当ハンドラーがないため、通常の未処理例外経路になります。子プロセス起動側では `subprocess.call` の終了コードが返ります。
+値が未設定・空、または Windows なら `subprocess.call()` で同じコマンドを起動し、同じく既存環境を引き継いで `acquisition.ENV` を `"1"` に上書きし、サーバーの終了コードを返します（`terminal/setup.py:8614-8620`）。この変数に対応する CLI 優先順位や fallback はありません。
+
+## ログと測定値
+
+この分岐専用のログや警告はありません。分岐より前に通常の起動案内を出しますが、その文言はこの変数の値で変わりません（`terminal/setup.py:8595-8618`）。子プロセス経路では `subprocess.call()` の戻り値が呼び出し元へ返ります。exec 経路で `os.execve()` が失敗した場合にこの箇所で例外を捕捉する処理や子プロセス起動への fallback はなく、例外は呼び出し元へ伝播します（`terminal/setup.py:8614-8620`）。この変数について Strata の測定値は記載されていません。
 
 ## 根拠
 
-- `setup.py:7110-7115` — `start()` は acquisition 禁止コンテキスト内で `_start()` を呼ぶ。
-- `setup.py:7118-7128,7151-7153` — 設定・ファイル確認とサーバーコマンドの組み立て。
-- `setup.py:7253-7262` — 表示後の `STRATA_EXECV` 判定、非 Windows の `execve`、通常の `subprocess.call` と子環境。
-- `setup.py:9336-9353,10489-10494` — 通常の既存モデル起動から `start()` への経路とトップレベル例外処理。
-- `tools/test_setup_component_start.py:29-49` — テストでは `STRATA_EXECV` を空文字にして `subprocess.call` 経路を模擬する（本番挙動の根拠ではなく、テスト設定の確認）。
-- `docs/envvars/000_envvers.md:764` — 候補一覧に名前がある。候補一覧自体は動作根拠ではない。
+- `terminal/setup.py:111` — Windows 判定 `WIN` の定義。
+- `terminal/setup.py:8474-8479` — 起動関数と `_start()` の呼び出し。
+- `terminal/setup.py:8486-8492` — 起動前の設定読み込みと参照ファイル検査。
+- `terminal/setup.py:8517-8518` — サーバー起動コマンドの構成。
+- `terminal/setup.py:8595-8612` — 分岐前に出す通常の起動案内。
+- `terminal/setup.py:8614-8620` — 環境変数の判定、exec/子プロセスの選択、環境の引き継ぎ。

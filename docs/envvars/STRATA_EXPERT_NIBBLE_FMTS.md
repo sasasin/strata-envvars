@@ -1,47 +1,60 @@
 # `STRATA_EXPERT_NIBBLE_FMTS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-`STRATA_EXPERT_NIBBLE=1` で要求する 4-bit expert slot 機能について、変換対象にする gate/up の GGUF 形式 ID の集合を指定します。対象コードで変換可能なのは ggml type ID `22`（IQ2_S）、`18`（IQ3_XXS）、`21`（IQ3_S）だけです。未指定または空文字なら既定の順序 `[22, 18, 21]` を使います。この変数だけでは機能を有効にしません。
+`STRATA_EXPERT_NIBBLE=1` で有効にする 4-bit expert slot 機能において、変換対象とする gate/up の GGUF 形式コードを指定する。既定値は `22,18,21`（IQ2_S、IQ3_XXS、IQ3_S）。形式の選択だけでは変換は有効にならず、主スイッチ、ビルド、GPU、モデル形状、起動オプションなどの条件も必要になる。対象形式でも条件に合わないレイヤーは変換されず、down rows は常に GGUF のまま。設定を読む実装は `strata::core::nibble::config()`、選択は `plan_layer()`、起動時の適用は `generate.cpp` にある（`engine/include/strata/core/expert_nibble.hpp:213-218,238-269,315-340`; `engine/src/program/generate.cpp:5440-5480`）。
 
-直接の環境読み取りは `include/strata/core/expert_nibble.hpp:250` の一箇所です。同ファイル `:216` の環境変数名は既定値のコメント、`src/program/generate.cpp:4172-4173` は対象形式がない場合の理由文字列、`docs/OLDER_GPUS.md:229` は設定例です。実際の読み取りはヘッダーの `config()` を通じ、generate 起動時に行われます。
+この変数だけを設定しても nibble 機能は有効にならない。`STRATA_EXPERT_NIBBLE` が未設定または `0` の場合、FMTS の値が不正でも nibble 起動判定に入らず、通常の GGUF slot のまま起動する（`engine/include/strata/core/expert_nibble.hpp:242-246`; `engine/src/program/generate.cpp:5446-5461`）。
 
 ## 値と判定
 
-値はカンマ区切りの 10 進整数リストとして `strtoll(..., 10)` で一つずつ読みます。`include/strata/core/expert_nibble.hpp:221-235,250-260` の実装に基づく判定は次のとおりです。
+初回の `config()` 呼び出しで `getenv` し、値が未設定または空文字なら既定の3形式を維持する。空でない値は `detail::parse_list()` が10進 `strtoll` とカンマ区切りで解析する。各 parsed 値は `int` に cast され、その値が `fmt_built()` の 22、18、21 のいずれかか確認される。`strtoll` の `errno` や `int` への範囲を別途検査していない（`engine/include/strata/core/expert_nibble.hpp:94-101,216,221-235,249-261`）。
 
-| 値 | 結果 |
-|---|---|
-| 未設定、または空文字 | 既定リスト `[22, 18, 21]` のまま |
-| 例 `22,18`、`+22, 18`、`22,` | 整数として読み取った ID のリストに置き換える。空白は各数値の前なら `strtoll` が読み飛ばす。末尾カンマは受理される |
-| 数字に続く余分な文字、空要素（例 `x`、`22x`、`,22`、`22,,18`）、カンマ以外の区切り | リスト parse エラー |
-| 認識対象外の整数 ID | `STRATA_EXPERT_NIBBLE_FMTS: type <ID> is not converted ...` エラー |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| FMTS のリスト解析 | `fmts` は既定の `22,18,21` | `22`、`18,21`、`22,18,21`。符号付き十進数も解析され、重複は許される。`22,` も末尾カンマ後に解析が終了するため受理される | `0`、`17` など対応外コードは型エラー。`,22`、`22,,18`、`22x` はリスト解析エラー |
+| 明示的な空文字 | 既定の `22,18,21` を維持 | 該当なし | 空文字自体はエラーではない |
 
-文字列全体の正規化や空白 trim はありません。末尾の空白は `strtoll` の次に残り、カンマでも終端でもない文字として parse エラーになります。負数も整数として parse された後、対応する 3 ID のどれでもないため無効です。ID の重複は除去されず、選択上は同じ形式を複数回指定しても対象が増えません。空文字以外で正常に parse できると既定リストを消去して指定リストに置き換えます。`strtoll` の `errno` や `int` への narrowing の範囲検査はありません。
+`strtoll` は数値の前の空白を読み飛ばすため、たとえば ` 22` は解析される一方、数値の後の空白は区切り文字ではないため `22 ` は不正となる。`22abc` や `22,18x` のように数値の後ろにカンマ以外が残る場合も失敗する。全体の文字列比較や `true` / `false` 判定はしない。数値 token のオーバーフロー時の `errno` は確認せず、さらに `int` cast 後の値を検証するため、通常の3つのコード以外の巨大値の結果は移植可能な入力仕様として保証されていない（`engine/include/strata/core/expert_nibble.hpp:223-234,255-260`）。
 
-parse エラーと未知 ID エラーは `Config.error` に保持されます（先に別の expert nibble 設定エラーがあれば最初のエラーを保持）。機能要求がない場合はこの FMTS エラーだけで `nib_asked` が真にならないため、形式リストは適用されず、FMTS エラー警告も出ません。`STRATA_EXPERT_NIBBLE=1` と併用した場合は起動前チェックでエラーとなり、警告のうえこの起動では 4-bit slot を使わず GGUF slot のまま続行します（後述）。
+不正なリストまたは対応外型は `Config.error` に記録される。エラーが既に設定済みなら FMTS 側で上書きされない。`STRATA_EXPERT_NIBBLE=1` と併用した場合、エラーは起動前チェックで理由として使われ、nibble はその起動では無効になる（`engine/include/strata/core/expert_nibble.hpp:242-261`; `engine/src/program/generate.cpp:3403-3408,5446-5461`）。
 
 ## 有効になる条件
 
-- `STRATA_EXPERT_NIBBLE=1` が必要です。同スイッチは文字列全体が `1` のときだけ ON、`0` または未設定・空文字は OFF、その他の非空文字列は不正です（`include/strata/core/expert_nibble.hpp:242-246`）。FMTS には CLI の上書きはありません。
-- 実装が組み込まれるのは CUDA、`STRATA_EXPERIMENTAL_SM60` 定義あり、HIP/Metal ではない build です（同 `:33-38`）。有効要求時は native experts が必要で、可視 CUDA device があり、全 device が compute capability 6.0 であることも起動前に確認します（`src/program/generate.cpp:2685-2706`）。
-- 指定した形式の層でも、gate/up 形状が `2560 x 640` などの対象条件に一致し、skip 対象でなく、native pack に含まれる場合だけ変換されます。指定した全形式に対象層がなければ警告して通常 slot に戻ります（`include/strata/core/expert_nibble.hpp:315-340,343-356`; `src/program/generate.cpp:4167-4179`）。
-- peer/remote expert cache、`--kv-grow`、`--vram-elastic`、`--expert-profile` 不在、`--expert-cache 0` などは起動前チェックで機能を拒否します。また prompt MMQ が変換 slot と両立しない場合も拒否理由になります（`src/program/generate.cpp:2682-2717`; `src/prefill/prefill.cpp:2642-2664`）。拒否はプロセス全体の起動失敗ではなく、この機能を無効にして GGUF slot で続ける警告経路です。
+- `STRATA_EXPERT_NIBBLE=1` が必要。主スイッチは文字列全体が `1` の場合だけ on。未設定、空文字、`0` は off で、他の非空値は不正値として記録される（`engine/include/strata/core/expert_nibble.hpp:242-246`）。
+- `STRATA_EXPERT_NIBBLE_BUILT` と `STRATA_NATIVE_EXPERTS` が必要。4-bit kernel は CUDA build で `STRATA_EXPERIMENTAL_SM60` が定義され、HIP/Metal ではない場合に限り組み込まれる。build 条件を満たさなければ起動前チェックが理由を返し、警告付きで通常 slot に戻る（`engine/include/strata/core/expert_nibble.hpp:33-38`; `engine/src/program/generate.cpp:3403-3409`）。
+- 全ての可視 CUDA device が compute capability 6.0 でなければならない（`engine/src/program/generate.cpp:3410-3424`）。
+- `--peer-device`、`--expert-cache-device1..3`、`--kv-grow`、`--vram-elastic` は利用できず、`--expert-profile` が空、または `--expert-cache 0` でも起動前チェックで無効になる（`engine/src/program/generate.cpp:3425-3435`）。
+- 競合する設定がないこと。`STRATA_MMQ_DIRECT` は非ゼロ、`STRATA_PREFILL_MMQ=0`、`STRATA_PF_FUSED` が `1` で始まる値、`STRATA_FS_SLOTS` は正数、`STRATA_EXPERT_V2` が `1` で始まる値、`STRATA_KV_GROW` が `0` で始まらない非空値、`STRATA_EXP_MODE` が `atoi` で 0 または 8 以外になる値は理由として返される。各判定の詳細は `env_conflicts()` の実装どおり（`engine/include/strata/core/expert_nibble.hpp:277-299`）。
+- 選ばれる各レイヤーは native pack 上にあり、`n_embd=2560`、`n_ff=640`、gate/up の row byte 数・offset・tail が所定値で、down rows が16-byte境界に合うこと。対象コードは `fmts` に含まれ、`STRATA_EXPERT_NIBBLE_SKIP` に列挙されていない必要がある（`engine/include/strata/core/expert_nibble.hpp:315-340`）。
+- 選択後に対象 layer が一つもなければ、「no layer ... among STRATA_EXPERT_NIBBLE_FMTS and outside STRATA_EXPERT_NIBBLE_SKIP」の理由でその起動の機能が無効になる。prompt 側は全ての変換 layer で MMQ が必要で、direct MMQ、FP16 fallback、WMMA-only、対応 fused kernel、GGUF 配列形状との不一致も拒否条件（`engine/src/program/generate.cpp:5451-5461`; `engine/src/prefill/prefill.cpp:3915-3937`）。
+
+既定形式を変える CLI 引数や設定ファイルの優先順位は見つからない。実際の対象 layer はモデルの native pack と expert profile に従い、FMTS は候補形式を絞る（`engine/include/strata/core/expert_nibble.hpp:327-339`; `engine/src/program/generate.cpp:3432-3435`）。
 
 ## 実行時の詳細
 
-`config()` は関数内 `static const Config` として初回評価結果を cache します。generate は slot 推定・GPU allocation より前の `src/program/generate.cpp:4165-4175` で設定を参照し、値はそのプロセスで再読込されません。CLI option や別環境変数が FMTS のリストを上書きする処理はありません。
+`config()` は関数内 `static const Config` として初回だけ構築され、FMTS を含む3つの設定をその時点の環境から読む。`generate.cpp` はモデル割当て・slot 見積りより前に config を使って拒否理由を確認し、問題がなければ layer table を設定する。その後の slot サイズ計算、expert cache fill、decode / prompt 経路はこの表を参照する。プロセス中に環境値を変更しても config には反映されない（`engine/include/strata/core/expert_nibble.hpp:238-269,345-389`; `engine/src/program/generate.cpp:5440-5464`）。
 
-有効条件を通ると、各 layer の GGUF gate/up type が指定リストに含まれるかを調べ、対象 layer の VRAM slot を 4-bit layout として計画します。リストは gate/up 形式に適用され、down 部分は変換対象ではありません。変換を有効にした起動では adaptive tier の swap を無効化し、成功時に stderr へ変換 layer 数・形式別内訳・追加 VRAM 見積りを出します（`include/strata/core/expert_nibble.hpp:315-340`; `src/program/generate.cpp:4182-4199`）。形式リストに一致する layer がない場合の警告は `src/program/generate.cpp:4171-4179` にあります。
+FMTS に含まれる形式と形状条件に合うレイヤーでは slot の gate/up が変換コード・scale・fp16 `d` に置き換わり、down rows は GGUF bytes のままコピーされる。slot の大きさは変換データ量に基づいて見積もられる。起動時 fill は変換した項目を round-trip 検証し、再構築した GGUF blocks も元 blob と比較する。無効な値・競合・非対応 build 等の起動前拒否は処理を終了させず、「この起動では off」と警告して通常の GGUF slot で続行する。一方、fill の CUDA エラーや変換値が round-trip しない場合は fill が失敗する（`engine/include/strata/core/expert_nibble.hpp:50-60,315-340`; `engine/src/program/generate.cpp:3225-3314,5448-5480`）。
 
-`docs/OLDER_GPUS.md:205-236` も GP100 向け `STRATA_EXPERT_NIBBLE=1` の条件と `STRATA_EXPERT_NIBBLE_FMTS=22,18,21` の形式選択例を記載しており、実装と整合します。同資料は個別の parser 境界値までは規定していません。
+有効時は adaptive tier の swap を無効化する。全 expert の VRAM residency や prompt chunk など後で判明する条件は別途確認され、失敗時の扱いもその起動処理に従う（`engine/src/program/generate.cpp:5462-5480`; `docs/OLDER_GPUS.md:220-231`）。
+
+## ログと測定値
+
+起動前に拒否された場合の形式は `strata generate: WARNING: STRATA_EXPERT_NIBBLE is off for this start: <理由>; the expert slots stay GGUF blocks`。理由には FMTS の parse エラー `STRATA_EXPERT_NIBBLE_FMTS=<値>: expected ggml types, e.g. 22,18,21`、または `STRATA_EXPERT_NIBBLE_FMTS: type <数値> is not converted (22 IQ2_S, 18 IQ3_XXS, 21 IQ3_S)` が使われる（`engine/include/strata/core/expert_nibble.hpp:250-260`; `engine/src/program/generate.cpp:5457-5461`）。有効なら layer 数と形式別内訳、追加 VRAM 量を `strata generate: STRATA_EXPERT_NIBBLE: ...` として stderr に出す（`engine/src/program/generate.cpp:5465-5480`）。
+
+変換 fill でバッファ確保・CUDA 操作・round-trip 検証に失敗すると stderr に `strata generate: STRATA_EXPERT_NIBBLE: ...`、`strata generate: the profile fill failed at pair ...`、または layer-split 時の `strata generate: STRATA_EXPERT_NIBBLE: CUDA<n>: ...` を出して `return 1` する（`engine/src/program/generate.cpp:9700-9735,9882-9907`）。
+
+`docs/OLDER_GPUS.md` は例として `22,18,21` を挙げ、対象が GP100 向けの opt-in 機能であると説明している。現行ソースの既定値と一致する。この資料にある性能測定値は機能全体の測定であり、FMTS の値ごとの比較ではない（`docs/OLDER_GPUS.md:200-242`）。
+
+`docs/SETTINGS.md` の表はこの変数の対応先を「NVIDIA and AMD」と記すが、現行のコンパイル条件は CUDA の `STRATA_EXPERIMENTAL_SM60` を必要とし、HIP build では nibble kernel を組み込まない。実装上の利用条件はソースに従う（`docs/SETTINGS.md:68-70`; `engine/include/strata/core/expert_nibble.hpp:33-38`）。
 
 ## 根拠
 
-- 読み取り、既定値、parser、形式 ID 検証、layer 計画: `include/strata/core/expert_nibble.hpp:96-104,213-269,315-356`。
-- build 条件: `include/strata/core/expert_nibble.hpp:33-38`。
-- generate 起動時の要求判定、拒否、fallback 警告、成功ログ: `src/program/generate.cpp:2682-2719,4159-4200`。
-- prompt 経路の適合チェック: `src/prefill/prefill.cpp:2642-2665`。
-- 文書との照合: `docs/OLDER_GPUS.md:205-236`。
+- `engine/include/strata/core/expert_nibble.hpp:213-269` — Config、リスト解析、環境値の読み取りと既定値・エラー。
+- `engine/include/strata/core/expert_nibble.hpp:277-340` — 競合判定、形式とレイヤー適格条件。
+- `engine/src/program/generate.cpp:3400-3437,5440-5480` — 起動前チェック、警告、適用と有効時ログ。
+- `engine/src/prefill/prefill.cpp:3915-3937` — prompt MMQ の追加条件。
+- `docs/OLDER_GPUS.md:200-242` — 機能説明と測定資料。

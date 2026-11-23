@@ -1,51 +1,53 @@
 # `STRATA_EXPERIMENTAL_GFX1150`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata の `setup.py` が、AMD の gfx1150（Radeon 890M / 880M、Strix Point）をサポート対象の GPU として扱うための opt-in です。設定すると、gfx1150 を AMD 対応アーキテクチャ一覧へ追加し、UMA iGPU としてメモリ量を扱います。HIP backend で gfx1150 の GPU を選んだ場合は、setup がそのモデルの実行設定に gfx1150 用の speed switch 群も書き込みます。
+`terminal/setup.py` が、AMD Radeon 890M / 880M（gfx1150）をセットアップで使える AMD GPU アーキテクチャとして扱うかを制御します。変数はエンジンが読む実行時設定ではありません。セットアップ時に `AMD_ARCHS` へ gfx1150 を追加し、その後の対応 GPU 判定、HIP 用 ROCm の選択、および選択 GPU 用エンジンのビルド経路へ影響します（`terminal/setup.py:4415-4422`, `4950-4956`, `5572-5617`）。
 
-これはエンジン実行時に読む変数ではなく、setup の Python プロセスが読む変数です。生成する run config の `env` にこの変数自体を追加する箇所はなく、代わりに対応判定や別の設定値へ反映されます。
+既定値は有効です。変数名やコメントに「experimental」「opt-in」とありますが、実装は未設定時に gfx1150 を有効にし、明示的な文字列 `0` だけで無効にします（`terminal/setup.py:4415-4417`）。
 
 ## 値と判定
 
-`setup.py` のモジュール初期化時に `os.environ.get(...) == "1"` で文字列全体を比較します。空文字、未設定、`true`、`01`、`1 `、その他すべての値は無効です。数値変換や trim、大文字小文字変換はありません。
+`os.environ.get("STRATA_EXPERIMENTAL_GFX1150", "1") != "0"` の文字列完全一致で判定し、結果をモジュール読み込み時に `GFX1150_OPT_IN` へ保存します。数値変換や真偽値パーサーは使いません（`terminal/setup.py:4415-4417`）。
 
-| 値 | 判定と結果 |
-|---|---|
-| 未設定 | opt-in 無効。gfx1150 は `AMD_ARCHS` に含まれず、setup の AMD backend では非対応扱い。 |
-| `1` | opt-in 有効。gfx1150 を `AMD_ARCHS` に追加し、UMA として扱う分岐を許可する。 |
-| 空文字・`0`・その他 | opt-in 無効。 |
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| `terminal/setup.py` の読み込み時 | 既定文字列 `"1"` なので有効 | 空文字、`1`、`true`、`false`、`00`、`0 ` など、値が文字列 `"0"` と一致しないもの | `0` のみ |
 
-この値を読むのは `setup.py` の import 時です。同じプロセスの途中で環境を書き換えても再評価されません。setup の CLI 引数による上書きはありません。起動時に有効だった場合の結果は、GPU 対応判定や保存される実行設定に反映されます。
-
-根拠: `setup.py:3669-3676`。
+大文字小文字や空白を正規化しません。したがって `false` や ` 0` は無効化値ではなく有効側です。範囲・数値妥当性・境界値の検証もありません。CLI 引数がこの値を上書きする経路はなく、`--backend` は AMD 経路を選ぶ指定ですが gfx1150 の対応判定自体はこの環境値で決まります（`terminal/setup.py:4415-4422`, `11380-11383`, `11560-11575`）。
 
 ## 有効になる条件
 
-- setup が AMD GPU を列挙し、gfx1150 を選ぶ経路で有効です。Linux の KFD 列挙では GPU の arch が `gfx1150` として得られ、Windows では AMD/HIP GPU の列挙結果を使います。いずれも対応判定は `AMD_ARCHS` に基づきます（`setup.py:3783-3787, 4191-4197, 4200-4214`）。
-- `--backend hip` を選ぶか、利用可能な NVIDIA GPU がなく AMD 対応 GPU があるため HIP が自動選択される必要があります。gfx1150 だけがあるとき、変数 unset のままでは `amd_problem()` が非対応理由を返し、AMD 使用可能 GPU の一覧に入りません（`setup.py:9361-9374, 9395-9401, 4191-4197`）。
-- 変数を `1` にしても HIP エンジンの gfx1150 対応コードが自動で用意されるわけではありません。setup のコメントは Windows に gfx1150 用の ready-made engine がないとし、`STRATA_HIP_ARCHS=gfx1150 tools\hip\build_windows.bat` でビルドして `--prebuilt dist\` を指定する手順を案内しています（`setup.py:3669-3674, 4043-4052`）。
-- gfx1150 GPU が実際に選ばれ、backend が HIP の場合に限り、gfx1151 向けに測定されたものを元にした `GFX1150_SWITCHES` が実行設定の `env` に追加されます。gfx1150 以外の GPU、CUDA backend、または opt-in 無効時にはこの追加は行われません（`setup.py:3693-3697, 10303-10327`）。
+- gfx1150 GPU が検出され、セットアップが AMD GPU 判定を行う必要があります。無効時もデバイス自体の検出・アーキテクチャ名判定は行いますが、gfx1150 は `AMD_ARCHS` に含まれないため `amd_problem()` が未対応として返します（`terminal/setup.py:4533-4537`, `4950-4956`）。
+- 有効時、gfx1150 は `AMD_ARCHS` に入ります。Linux では AMD backend を選ぶ必要があり、`--backend hip` で明示するか、利用可能な NVIDIA GPU がなく利用可能な AMD GPU があるときに自動選択されます。利用可能な NVIDIA GPU がある場合、backend の自動選択は NVIDIA と AMD の選択肢を出します（`terminal/setup.py:11560-11592`）。
+- Linux の HIP エンジン構築では選択アーキテクチャが `build_engine_hip()` に渡り、gfx1150 を含む `CMAKE_HIP_ARCHITECTURES` を指定します。十分なシステム ROCm が使えない場合、gfx1150 用 TheRock wheel index を使う経路もあります（`terminal/setup.py:4389-4399`, `4466-4467`, `5473-5516`, `5572-5617`）。この環境変数自体は ROCm のバージョンや index を選びません。周辺では `ROCM_PATH` がシステム ROCm の場所、`STRATA_ROCM_INDEX` が wheel index、`STRATA_ROCM_VERSION` が wheel の版を指定します（`terminal/setup.py:4409-4411`, `4466-4467`, `5478-5495`, `5503-5509`）。
+- Windows でも対応アーキテクチャ判定への追加は同じですが、セットアップの AMD engine 経路は ready-made HIP engine を取得し、その build metadata に gfx1150 が含まれるかを別途確認します。利用できるエンジンがなければセットアップは停止します。この変数だけでは Windows のエンジンを用意しません（`terminal/setup.py:5366-5383`, `5417-5435`, `9522-9528`）。
+- 有効時は gfx1150 の APU として UMA 判定やセットアップの説明文を適用します。無効時は Strix Halo 用の特例を除き、gfx1150 をこの APU 経路に通しません（`terminal/setup.py:4574-4586`, `4596-4603`, `4819-4827`）。
+- ビルド macro、サーバーモード、モデル状態による追加判定はありません。起動済みモデルの実行時にこの変数を読むエンジン側の箇所も見つかりません。
 
 ## 実行時の詳細
 
-opt-in が有効だと `AMD_ARCHS` に `gfx1150` が加わります。この一覧は GPU の受け入れ判定 `amd_problem()`、複数 GPU の選択、および既存のローカル HIP engine の更新時にビルド対象 arch を絞る処理で使われます（`setup.py:3675-3676, 4191-4197, 4217-4221, 5550-5559`）。
+この環境変数名の全参照では、実際の値読み取りは `terminal/setup.py:4417` の一箇所です。その他の参照はコメント上の記載です。値は Python が `terminal/setup.py` を読み込む時点で一度評価され、`GFX1150_OPT_IN` と `AMD_ARCHS` に保持されます。そのプロセスで後から環境値を書き換えても、すでに作られた対応アーキテクチャ一覧は再計算されません（`terminal/setup.py:4415-4422`）。
 
-また `is_uma_apu()` が gfx1150 を UMA APU と認識し、`amd_apply_uma()` は VRAM を BIOS carve-out として扱い、共有メモリを OS の RAM として扱います。GPU 情報・モデル選択に使う容量が変わり、選択後は Strix Point の説明文を setup の出力に表示します（`setup.py:3824-3847, 4043-4057, 4060-4068, 9445-9452`）。
+無効時に gfx1150 を HIP backend で使おうとすると、GPU 一覧では `not supported - Strata's AMD backend runs on ... only, this is gfx1150 (an integrated Radeon, not Strix Halo)` として扱われ、利用可能な AMD GPU がなければ `no AMD GPU Strata can use` で失敗します（`terminal/setup.py:4950-4956`, `11597-11618`）。有効時も、GPU 選択、OS、HIP/ROCm の利用可否や Windows の ready-made engine の対応状況によっては、gfx1150 での導入・ビルドに至らないことがあります。
 
-選んだ GPU が gfx1150 で HIP backend の場合、setup は `GFX1150_SWITCHES`（gfx1103 用 switch 群のコピー）を生成した run config の `env` に加えます。これらは setup 管理キー `SETUP_ENV` に含まれるため、再 setup 時に setup 側で更新されます。対象の GPU/config 条件が合わない場合にこれらの追加はありません（`setup.py:3684-3697, 6498-6509, 10323-10327`）。
+この変数を Strata が run config の `env` に書き込む処理は確認できません。setup が生成する設定には gfx1150 用 speed switches が別途ありますが、この変数自体とは別物です（`terminal/setup.py:4439-4443`, `7460-7463`）。
 
-直接のログ・失敗経路としては、未対応 GPU の一覧表示に `not supported - Strata's AMD backend runs on ... only, this is gfx1150` が出ます（`setup.py:4191-4197, 9398-9401`）。opt-in 後は GPU 名、容量、arch を表示し、UMA の注意・説明を表示します。値が無効だからという専用の警告や終了処理はありません。ready-made engine や ROCm wheel の取得・ビルドが成功するかは別の setup 処理に依存します。
+## ログと測定値
+
+この変数を読み取ったことや値を有効化したことだけを示す専用ログはありません。無効時の未対応理由と AMD GPU 不在時の失敗は上記のとおりです（`terminal/setup.py:4950-4956`, `11597-11618`）。有効時は通常の GPU 検出・選択ログに反映されます。
+
+Strata 内の `docs/AMD_HIP.md` は gfx1150 を「setup で未対応」と記しています（`docs/AMD_HIP.md:42-43`）。また同文書は gfx1150 について「Setup does not install for it」としています（`docs/AMD_HIP.md:565`）。これは今回調査した commit の `terminal/setup.py` の実装、すなわち未設定を有効扱いして gfx1150 を `AMD_ARCHS` に含める挙動と整合しません。文書側の更新時期や未反映理由はソースから確認できません。ベンチマーク資料の数値はこの環境変数の効果としては扱いません。
 
 ## 根拠
 
-- 変数の読取、完全一致判定、arch allowlist への追加: `setup.py:3669-3676`。
-- gfx1150 の ROCm index 定義: `setup.py:3643-3652`。index はこの変数で読み取られるのではなく、gfx1150 を含む GPU/arch 経路で利用されます。
-- UMA 判定、容量計算、非対応判定: `setup.py:3824-3847, 4191-4197`。
-- gfx1150 の setup 表示: `setup.py:4043-4057, 4060-4068, 9445-9452`。
-- run config の speed switch 追加と setup 管理 env: `setup.py:3684-3697, 6498-6509, 10303-10327`。
-- `docs/AMD_HIP.md:42-43` は Strix Point を「setup ではサポートされていない」と説明し、`docs/AMD_HIP.md:537` は setup が gfx1150 用 engine をインストールしないと記載しています。前者は調査対象 commit の `setup.py` にある opt-in 対応と食い違います。後者の ready-made engine がないという説明は、setup のコメント（`setup.py:3671-3674, 4049-4052`）とも一致します。gfx1150 のコミュニティ測定値は `docs/AMD_HIP.md:537, 775` に記載がありますが、本調査では再測定していません。
-
-候補名の全参照を検索した結果、完全一致は `setup.py` の5箇所（コメント/URL記述を含む）で、環境からの実読取は `setup.py:3674` の1箇所でした。外部ライブラリや driver が読む同名変数の挙動は確認・記述対象に含めていません。
+- 値の読み取り、既定値、gfx1150 の対応一覧への追加: `terminal/setup.py:4415-4422`
+- gfx1150 の ROCm index と system/wheel 選択: `terminal/setup.py:4389-4399`, `4409-4411`, `4466-4467`, `5473-5516`
+- GPU 対応判定と未対応理由: `terminal/setup.py:4950-4956`
+- Linux の backend 選択と未対応時の失敗: `terminal/setup.py:11560-11618`
+- Linux HIP engine の build 対象アーキテクチャ: `terminal/setup.py:5572-5617`
+- Windows ready-made engine の条件: `terminal/setup.py:5366-5383`, `5417-5435`, `9522-9528`
+- UMA 判定とセットアップ案内: `terminal/setup.py:4574-4586`, `4596-4603`, `4819-4827`
+- Strata docs との不整合: `docs/AMD_HIP.md:42-43`, `565`

@@ -1,43 +1,47 @@
 # `STRATA_METAL_BATCH_ROWS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Metal エンジンの batch decode で、複数 slot の行を一つの window としてまとめて実行する経路を選びます。既定では複数行対応の `run_rows()` を使います。`STRATA_METAL_BATCH_ROWS=0` にすると、各行を slot ごとに 1 token 実行し、その都度 commit する経路に切り替わります（`metal/src/engine/window.cpp:1781-1797`）。
+Metal エンジンのバッチ行を、1 回の複数行 window として処理するか、各行を 1 token ずつ順番に処理するかを選びます。未設定時および値が文字列 `0` と完全一致しないときは、複数行経路を選びます。値が `0` のときは逐次経路を選びます。ただし複数行経路には、バッチ用状態バッファが確保されていることも必要です。読み取りと分岐は Metal の `Window::run_slots` にあります（`engine/metal/src/engine/window.cpp:2255-2271`）。
 
-この環境変数を読むのは Metal エンジンの `Window::run_slots()` です。Metal CMake プロジェクトで `STRATA_METAL_ENGINE` が有効なときに `metal/src/engine/*.cpp` がエンジンへ組み込まれます（`metal/CMakeLists.txt:73-77,110-130`）。CUDA、HIP、SYCL の同名変数読み取りは確認できません。
+これは `--batch` スロットの Metal 処理に関する切替です。Metal 以外の backend の処理にはこの読み取り箇所はありません。Metal では生成処理が CLI の `o.batch` を `set_batch_slots` に渡します（`engine/src/program/generate.cpp:5310-5313`）。
 
 ## 値と判定
 
-文字列全体を `"0"` と比較します。数値変換はありません。
+`std::getenv` で設定有無を確認し、設定されていれば値全体を `std::string` にして `"0"` と完全一致するか比較します。数値変換や trim、大文字小文字変換はありません。空文字は設定済みですが `"0"` ではないため、複数行経路を選びます（`engine/metal/src/engine/window.cpp:2257-2258`）。
 
-| 値 | `one_window` | 結果（`bigs_ok_` も真の場合） |
-|---|---:|---|
-| 未設定 | true | `run_rows(rows, S, ...)` で batch 行をまとめて実行 |
-| 空文字 | true | 同上 |
-| 完全一致の `0` | false | 各行について `run(1, ...)` の後に `commit(1, ...)` |
-| その他すべて（`00`, `0 `, `false`, `1` など） | true | `run_rows(rows, S, ...)` で batch 行をまとめて実行 |
+| 条件（build など） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| Metal の `Window::run_slots` でバッチ用状態バッファが使える場合 | 複数行経路 | `0`（逐次経路を選択） | 空文字、`1`、`true`、`false`、`00`、`0anything`、` 0`（いずれも複数行経路） |
+| Metal の `Window::run_slots` でバッチ用状態バッファが使えない場合 | 逐次経路 | `0`（逐次経路を選択） | 空文字、`1`、`true`、`false`、`00`、`0anything`、` 0`（いずれも複数行経路を要求する値だが、バッファ条件を満たさないため逐次経路） |
 
-値は `Window::run_slots()` 内の関数ローカル `static const bool` に保存されます。最初にこの関数が呼ばれた時点で一度だけ評価され、その後プロセス内で環境を書き換えても再評価されません。batch 経路を通らない実行では読み取りません（`metal/src/engine/window.cpp:1781-1784`）。
+ここで「有効」は設定によって逐次経路を選ぶ意味です。`0` 以外の文字列を bool や整数として解釈する仕様ではありません。`one_window` は関数内 `static const` なので、スロットが存在して `run_slots` の判定箇所まで実行が進んだ最初の時点で値を読み、その判定をプロセス内で保持します。スロットが空の場合はその前に戻るため読み取りません。その後の環境変更は反映されません（同上）。
 
 ## 有効になる条件
 
-- Metal エンジンで batch slots が初期化され、`Verifier::run_slot_rows()` から Metal の `window_run_slots()` が呼ばれることが必要です。Metal の `Verifier::init_slots()` は slot を初期化し、batch run は `run_slot_rows()` から window に渡します（`src/core/verify.cpp:3696-3719,4394-4404`）。通常の生成側は `--batch` の値を `set_batch_slots()` に渡します（`src/program/generate.cpp:4039-4042`）。
-- まとめて実行する分岐には `bigs_ok_` も必要です。これは window 初期化時に `g_slot_cap > 0` で始まり、`g_slot_cap` は `set_batch_slots(n)` により `n > 0` なら最大 8 に制限されます。slot 数が cap を超えると `slots_init()` が `bigs_ok_` を false にします。この場合、環境変数が未設定または `"0"` 以外でも逐次経路になります（`metal/src/engine/window.cpp:91-93,608-621,1751-1763,2921`）。
-- `run_rows()` は `S` が 1 以上、`MAXT` 以下、かつ `max_t_` 以下であることを要求します。Metal window の `MAXT` は 8 です（`metal/src/engine/window.cpp:93,1359-1361`）。
+- `STRATA_GPU_METAL` を定義した生成コードで、Metal エンジンのバッチスロット処理を通る必要があります。生成側は `o.batch` を `set_batch_slots` に設定します（`engine/src/program/generate.cpp:5310-5313`）。
+- `set_batch_slots` は正の値を最大 8 に制限し、非正値ならスロット容量を 0 にします。window 初期化時には実際のスロット数と容量を比べ、容量を超えるスロットがあると `bigs_ok_` を false にして逐次処理にします（`engine/metal/src/engine/window.cpp:819-831,2215-2227,3591`）。
+- `STRATA_METAL_BATCH_ROWS=0` は `one_window` を false にします。その他の値は複数行経路を選びますが、`bigs_ok_` が false なら値にかかわらず逐次経路です（`engine/metal/src/engine/window.cpp:2255-2268`）。
+- `--batch` が指定されずスロットが作られない場合、`run_slots` は `metal window: no batch slots` で失敗します。環境変数はこの前提を作りません（同 `:2255-2256`）。
 
 ## 実行時の詳細
 
-まとめて実行する経路は `rows[]` の各 slot を `rows_set_` に対応付け、`run(S, ...)` を一度呼びます。`finish_rows()` が各 slot の履歴 parity と PLE 状態を更新します（`metal/src/engine/window.cpp:1359-1381,1384-1405`）。一つの window に同じ slot が複数回現れる場合や存在しない slot が指定された場合は `run_rows()` が失敗し、それぞれ `metal window: two rows of one batch window are the same slot`、`metal window: a batch row names a slot that does not exist` を `err` に設定します（`metal/src/engine/window.cpp:1364-1368`）。
+複数行経路では set 0 を active にし、`run_rows(rows, S, ...)` にまとめて渡します。`run_rows` は行数が 1 以上かつ `MAXT` と `max_t_` 以下であることを検査し、slot の範囲外や同じ window 内で重複する slot をエラーにします。モデルで M-RoPE が有効なのに slot 用テーブルがなければ、この経路は `metal window: batch rows without the slots' M-RoPE tables` で失敗します（`engine/metal/src/engine/window.cpp:1644-1667,2258-2260`）。`MAXT` は 8 です（同 `:127`）。
 
-逐次経路は各行の slot を activate し、`run(1, ...)` と `commit(1, ...)` を順に行います。同じ slot が複数行にあってもこの分岐では重複チェックを行いません。slot 番号が不正なら `metal window: a batch row names a slot that does not exist` を返し、`run()` または `commit()` の失敗もそのまま伝播します（`metal/src/engine/window.cpp:1788-1797`）。
+逐次経路では各行について slot を active にし、`run(1, ...)` と `commit(1, ...)` を実行してから次の行へ進みます。失敗時はループを止め、最後に set 0 を active に戻します（`engine/metal/src/engine/window.cpp:2262-2271`）。Verifier は Metal では各行が slot の状態で実行・commit されるとし、この関数へ処理を渡します（`engine/src/core/verify.cpp:5370-5379`）。
 
-環境変数の値だけを理由に出すログや警告はありません。batch slot 初期化時には `strata metal: %zu batch slots...`（`metal/src/engine/window.cpp:1768-1769`）、Verifier 初期化時には `strata verify: batch windows of up to %d sequences, run slot by slot in the Metal window`（`src/core/verify.cpp:3718`）が stderr に出ます。後者は環境変数で実際に選択された経路を報告するものではありません。上記の失敗は呼び出し元へ `false` と `err` を返します。
+設定は `run_slots` 内の static 初期化で一度だけ評価されます（スロットが空なら初期化行に到達しません）。CLI の `--batch` はスロット数とバッファ条件を決めますが、`STRATA_METAL_BATCH_ROWS` の値を上書きする読み取りや優先順位分岐はありません（`engine/src/program/generate.cpp:5310-5313`; `engine/metal/src/engine/window.cpp:819-831,2255-2258,3591`）。
+
+## ログと測定値
+
+この変数の値を示す専用ログや警告はありません。スロット初期化時には stderr に `strata metal: %zu batch slots, each with its own running state and K/V (%.2f GB each, %.2f GB in all)` が出ますが、経路選択の表示ではありません（`engine/metal/src/engine/window.cpp:2242-2244`）。各経路の実行エラーは `err` に設定され、上位の verifier が失敗として返します。文書 `docs/DETAILS.md` に本変数の説明や測定値は見当たりません。
 
 ## 根拠
 
-- 候補名の全参照を Strata リポジトリ全体で `rg -n --hidden --glob '!.git/**' 'STRATA_METAL_BATCH_ROWS'` で確認し、実行時読み取りは `metal/src/engine/window.cpp:1783` の 1 箇所でした。動的な helper 経由の参照はありません。
-- 値判定、読み取り時期、分岐、行・slot の検査: `metal/src/engine/window.cpp:1359-1381,1751-1763,1781-1797`。
-- batch slot の有効条件と verifier からの呼び出し: `src/program/generate.cpp:4039-4042`, `src/core/verify.cpp:3696-3719,4394-4404`。
-- Metal エンジンの build 条件とソース組み込み: `metal/CMakeLists.txt:73-77,110-130`。
+- 候補名の全参照は `engine/metal/src/engine/window.cpp:2257` のみです。`terminal/data/settings-register.json:20421` にも名前がありますが、これは登録データであり環境値の読み取りではありません。
+- 読み取りと経路分岐: `engine/metal/src/engine/window.cpp:2255-2271`
+- バッチバッファ、slot 数による逐次 fallback: `engine/metal/src/engine/window.cpp:819-831,2215-2244,3591`
+- Metal 生成コードから CLI 値を渡す箇所: `engine/src/program/generate.cpp:5310-5313`
+- Metal verifier からの呼び出し: `engine/src/core/verify.cpp:5370-5379`

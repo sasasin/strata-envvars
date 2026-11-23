@@ -1,40 +1,50 @@
 # `STRATA_FEED`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-POSIX 用 `packaging/install.sh` と Windows 用 `packaging/install.ps1` が、Strata Terminal のリリースファイルを取得するフィードフォルダーを選びます。既定は GitHub Releases の `latest/download` フォルダーです。これはインストーラーの設定であり、Strata の通常起動時やサーバーの設定として `STRATA_FEED` を読むコードは見つかりませんでした。`strata update` が使う別変数は `STRATA_UPDATE_FEED` です（`strata_cli/update_cmd.py:23-26,97-107`）。
+`STRATA_FEED` は、Strata Terminal の POSIX シェル版および Windows PowerShell 版インストーラが、Terminal のリリースファイルを取得するベース URL を指定する。未設定または空文字なら GitHub Releases の `latest/download` を使う。指定値は `install-manifest.txt` と、manifest が指定するアーカイブの取得先になり、展開後の Terminal に署名付き feed を確認させる `strata update --check --no-engine --feed <値>` にも渡される（`tools/packaging/install.sh:24-25,132-146,163-174`、`tools/packaging/install.ps1:29-30,119-137,184-195`）。
+
+これはインストーラが読む変数であり、通常起動中の Strata が `STRATA_FEED` を直接読む実装は見つからなかった。インストーラの署名確認時は明示的な `--feed` が使われるため、`strata update` の `STRATA_UPDATE_FEED` や記憶済み feed よりもインストーラが選んだ feed が優先される（`terminal/strata_cli/update_cmd.py:142-151`）。
 
 ## 値と判定
 
-| 実装 | 未設定・空文字 | 設定値 | 正規化・判定 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
 |---|---|---|---|
-| POSIX `install.sh` | 既定 URL にする | その文字列をフィードとして使う | 末尾の `/` を最大 1 文字取り除く。URL 形式や文字列全体は検証しない。正規化後に空ならエラー。 |
-| Windows `install.ps1` | 既定 URL にする | PowerShell で truthy な値を使う（空文字は既定。`0` など空でない文字列は値として使う） | 末尾の `/` をすべて取り除く。URL 形式や文字列全体は検証しない。正規化後に空ならエラー。 |
+| POSIX `install.sh` | `https://github.com/Niko1221/Strata/releases/latest/download` を使用 | 空でない任意の文字列。例: `https://example.org/strata` | 空文字は無効値エラーにならず既定 URL を選ぶ。非空値でも形式の事前検証はなく、URLや取得内容が不正なら後続の取得・manifest・チェックで失敗する |
+| Windows `install.ps1` | `https://github.com/Niko1221/Strata/releases/latest/download` を使用 | PowerShell の条件式で真となる文字列。例: `https://example.org/strata` | 空文字は既定 URL を選ぶ。空白だけの値は空文字ではないので採用され、URLとしての妥当性は事前検証されない |
 
-POSIX 側の `${STRATA_FEED:-既定値}` は未設定と空文字の両方で既定値を選びます。値が `/` なら一文字除去後に空となり、インストールを始める前に stderr へ `this installer does not know where the Strata release folder is...` を出して終了コード 1 になります。`//` は一文字だけ除去され `/` が残るため、空値エラーにはならずその値で取得を試みます。Windows 側は未設定・空文字で既定値を選び、`/` や `///` は `TrimEnd('/')` 後に空となって同様の案内を出して停止します。空白だけの値などは空とは判定されず、URL として取得を試みます。
+POSIX 版は `${STRATA_FEED:-<既定値>}` を用いるので、未設定と空文字のどちらも既定値になる。続けて末尾の `/` を 1 個だけ取り除く。したがって `https://host/feed///` は `https://host/feed//` となる。PowerShell 版は `if ($env:STRATA_FEED)` で未設定または空文字を除外し、採用した値から末尾の `/` をすべて取り除く（`tools/packaging/install.sh:24-25`、`tools/packaging/install.ps1:29-30`）。
 
-根拠: `packaging/install.sh:24-32`、`packaging/install.ps1:29-34`。
+値全体への真偽値・数値・大小文字変換はなく、`true`、`0`、空白などを特別扱いしない（ただし空文字は上記のとおり既定値）。URL構文も読み取り時点では検証されない。POSIX 版の後続チェック `[ -n "$FEED" ]` は既定値が非空なので通常の unset/empty 入力では通り、PowerShell 版の `if (-not $feed)` も既定 URL 選択後の空値確認となる（`tools/packaging/install.sh:32`、`tools/packaging/install.ps1:100-102`）。
 
 ## 有効になる条件
 
-- `install.sh` は Linux x86_64、Linux aarch64、macOS Apple silicon の対応プラットフォームを選んだ後にフィードへアクセスします。Windows は `install.ps1` を使います（`packaging/install.sh:53-61`、`packaging/install.ps1:34-37`）。
-- 両スクリプトとも、まず `<feed>/install-manifest.txt` を取得し、対象プラットフォームの行に記載されたアーカイブを同じフィードから取得します。従って値は任意の「フォルダー URL」として連結され、マニフェストやアーカイブが存在しない場合はインストールできません（`packaging/install.sh:86-95`、`packaging/install.ps1:50-62`）。
-- インストール後の署名確認でも、選択した値を `strata update --check --no-engine --feed <feed>` に渡します。この明示的な `--feed` が `STRATA_UPDATE_FEED` より優先されます。CLI の解決順は `--feed`、`STRATA_UPDATE_FEED`、記憶済み feed、既定 feed です（`packaging/install.sh:117-121`、`packaging/install.ps1:109-118`、`strata_cli/update_cmd.py:97-107`）。
-- `STRATA_FEED` の値に応じた別の OS/backend/build macro 条件はありません。プラットフォーム選択はインストーラー自身の OS/CPU 判定に従います。
+- POSIX では `tools/packaging/install.sh`、Windows では `tools/packaging/install.ps1` を実行すること。変数の読み取りはこの2つのインストーラにある。
+- インストーラが対応 OS / CPU を受け付けること。POSIX 版は Linux x86_64、Linux aarch64、macOS arm64 を分岐で扱い、PowerShell 版は Windows x64 を扱う（`tools/packaging/install.sh:59-67`、`tools/packaging/install.ps1:103-106`）。
+- 指定先が必要な `install-manifest.txt` とそこに記載された Terminal アーカイブを返すこと。manifest に現在の platform の行がなければインストールを止める（`tools/packaging/install.sh:137-146`、`tools/packaging/install.ps1:119-137`）。
+- アーカイブの SHA-256 が manifest の値と一致し、展開後に Strata の起動ファイルが見つかること。これらは feed の値を有効にする条件ではなく、インストールを続行するための後続条件である（`tools/packaging/install.sh:145-160`、`tools/packaging/install.ps1:136-138,172-177`）。
+- 展開後の署名確認は同じ feed に対して明示的な `--feed` を渡す。`update_cmd._feed_source` は `a.feed` が真ならそれを返し、その後に `STRATA_UPDATE_FEED` を見る（`tools/packaging/install.sh:168-170`、`tools/packaging/install.ps1:184-188`、`terminal/strata_cli/update_cmd.py:142-151`）。
 
 ## 実行時の詳細
 
-値はインストーラースクリプトの実行時に一度だけ読み、既定値の選択と末尾スラッシュ処理を行います。プロセス起動後の環境変更を再読する処理やキャッシュはありません。選択値は stdout に `Release folder: ...` と表示され、マニフェスト、アーカイブ、署名確認用の feed として使われます（`packaging/install.sh:24-27,81-86,93,117-118`、`packaging/install.ps1:29-30,41-50,59,109-112`）。
+各インストーラスクリプトの開始時に feed の値をローカル変数へ一度取り込み、その実行中は `$FEED` / `$feed` を使う。実行中にプロセス環境を変更して読み直す処理はない（`tools/packaging/install.sh:24-27`、`tools/packaging/install.ps1:29-32`）。
 
-取得できないマニフェストでは POSIX 版は stderr に `could not read <feed>/install-manifest.txt...` を出して終了し、Windows 版も取得例外を捕捉して同趣旨のエラーを出します。アーカイブ取得失敗や署名確認失敗もそれぞれ停止経路があり、署名確認に失敗すると未確定の展開先を削除します（`packaging/install.sh:86-96,117-122`、`packaging/install.ps1:50-62,109-119`）。
+POSIX 版は `FEED/install-manifest.txt` を取得し、platform に一致する manifest 行の相対パスを使って `FEED/<相対パス>` からアーカイブを取得する。展開後は同じ FEED を `--feed` 引数で新しい Terminal に渡して `update --check --no-engine` を実行し、取得したリリースの署名付き feed を確認する（`tools/packaging/install.sh:132-146,163-174`）。PowerShell 版も同じ順序で manifest、アーカイブを取得し、`--feed $feed` を指定して署名確認する（`tools/packaging/install.ps1:119-137,184-195`）。
 
-`STRATA_FEED` はインストーラー内で直接読み取られます。`packaging/UPDATES.md:186-191` もインストーラー用の値として区別し、`strata update` の `--feed` / `STRATA_UPDATE_FEED` とは別の指定として説明しています。候補一覧にある名前と実装の間に食い違いは見つかりませんでした。
+この feed は初回インストールに使う取得先である。インストール後の通常の `strata update` の既定値を環境変数として設定する処理は確認できない。署名確認コマンドの `--feed` は `STRATA_UPDATE_FEED` より優先されるが、以降の CLI 実行では `--feed`、`STRATA_UPDATE_FEED`、記憶済みの HTTPS feed、既定 feed の順に選択される（`terminal/strata_cli/update_cmd.py:142-151,154-158`）。
+
+## ログと測定値
+
+インストーラは選択した値を `Release folder: <値>` と表示する（`tools/packaging/install.sh:130`、`tools/packaging/install.ps1:110-112`）。取得失敗時は POSIX 版で `... did not answer ...`、platform 行がない場合は `this release has no Terminal for <platform>.`、チェックサム不一致時は `the download does not match the release's checksum ...` を stderr に出して終了する（`tools/packaging/install.sh:137,139,146`）。PowerShell 版も取得失敗、platform 行欠落、チェックサム不一致で停止し、署名確認が失敗すると新たに展開した内容を削除して、失敗した `strata` の出力と `the release folder's signed feed could not be verified ...` を表示する（`tools/packaging/install.ps1:120-125,132-137,190-193`）。
+
+成功した署名確認は `Signature ok.`（POSIX）または `Signature ok.`（PowerShell）と表示される（`tools/packaging/install.sh:168-174`、`tools/packaging/install.ps1:184-195`）。性能測定値は該当しない。
 
 ## 根拠
 
-- `packaging/install.sh:17-25,29-32,81-96,112-123` — 既定値、入力判定、フィードの表示・取得、署名確認と失敗処理。
-- `packaging/install.ps1:16-19,24-34,41-62,104-120` — Windows 側の既定値、入力判定、取得、署名確認と失敗処理。
-- `strata_cli/update_cmd.py:23-26,37-38,97-107` — 別名の `STRATA_UPDATE_FEED` と `--feed` を含む CLI の優先順位。
-- `packaging/UPDATES.md:186-191` — フィード URL とインストーラー用 `STRATA_FEED` の説明。
+- `tools/packaging/install.sh:24-32` — POSIX 版の既定値、末尾 slash 処理、空値確認。
+- `tools/packaging/install.sh:132-174` — feed からの manifest / アーカイブ取得、検査、署名確認と失敗処理。
+- `tools/packaging/install.ps1:29-32,100-102` — PowerShell 版の既定値、末尾 slash 処理、空値確認。
+- `tools/packaging/install.ps1:119-137,179-195` — feed からの取得、チェックサム確認、署名確認と失敗処理。
+- `terminal/strata_cli/update_cmd.py:142-151` — `--feed`、`STRATA_UPDATE_FEED`、記憶済み feed、既定 feed の選択順。

@@ -1,52 +1,48 @@
 # `STRATA_EXPERIMENTAL_GFX1103`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-この変数は Strata engine の実行時設定ではなく、`setup.py` の AMD GPU セットアップに対する gfx1103（Radeon 780M / 760M / 740M、Ryzen 7040 / 8040）の opt-in です。セットアップが gfx1103 を対応 AMD arch として扱い、Linux の gfx1103 HIP 構成には専用の環境設定を run config に書きます。コードコメントはこのサポートを experimental / unsupported と位置づけています（`setup.py:3665-3668`）。
-
-候補名の全参照を検索した結果、値を実際に読むのは `setup.py:3668` のみです。C++/CUDA/HIP/SYCL engine や `serve` に、この名前を読んで処理を分岐するコードはありません。通常の engine 実行時にこの変数自体を設定しても、engine の挙動を切り替える処理は確認できません。
+Strata Terminal のセットアップで AMD gfx1103（Radeon 780M / 760M / 740M、Phoenix / Hawk Point）を AMD HIP の対応 GPU として扱うかを制御する。名前に「EXPERIMENTAL」とあるが、この checkout では未設定時も有効で、値がちょうど `"0"` のときだけ無効になる。エンジン実行時に読む環境変数ではなく、`terminal/setup.py` の対応アーキテクチャ判定と、`terminal/strata_control/setup_config.py` の run config 作成に使われる。`setup.py` は有効時に Linux の gfx1103 用 config へ setup 管理の環境設定も書き込む。エンジンや GPU driver がこの変数自体を読む実装は確認できない。`terminal/setup.py:4412-4422`、`terminal/strata_control/setup_config.py:452-458`
 
 ## 値と判定
 
-`os.environ.get("STRATA_EXPERIMENTAL_GFX1103") == "1"` で文字列全体を比較します。数値変換、trim、大文字小文字変換はありません。
+値は `os.environ.get("STRATA_EXPERIMENTAL_GFX1103", "1") != "0"` で文字列比較される。数値・真偽値への変換や trim、大文字小文字の正規化はない。`"0"` との完全一致だけが無効である。`setup.py` のモジュール読込時に定数へ保存され、同じプロセス内で後から環境を変えても再評価されない。`terminal/setup.py:4414`
 
-| 環境の値 | opt-in |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| `1` | 有効 |
-| `0`、`true`、`01`、`1 `、` 1` など、文字列全体が `1` でない値 | 無効 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 全 platform / setup の共通判定 | 既定文字列 `"1"` を使うため有効 | 空文字、`1`、`true` / `TRUE`、`false`、`00`、`0anything`、` 0` | 完全一致の `0` |
 
-判定値 `GFX1103_OPT_IN` は `setup.py` の import 時に一度設定されます。setup プロセスの起動後に環境を書き換えても再評価されず、次の setup 起動で読み直されます（`setup.py:3668`）。この変数に対応する CLI 引数や、CLI が値を上書きする分岐はありません。
+空文字も「設定ありで無効」にはならず、有効扱いである。CLI 引数による値の上書き、数値境界、fallback はない。`--backend hip` は HIP 経路を選ぶ引数だが、このフラグを個別に上書きしない。`terminal/setup.py:4414, 11595-11629`
 
 ## 有効になる条件
 
-- **セットアップでの GPU 対応判定:** `GFX1103_OPT_IN` が真なら `AMD_ARCHS` に `gfx1103` を加えます。GPU 列挙で検出した arch がこの一覧にあるかを `amd_problem()` が確認するため、opt-in なしでは gfx1103 は未対応とされ、opt-in 時には他のチェックを通れば使用可能になります（`setup.py:3675-3676, 4142-4187, 4191-4197`）。
-- **AMD APU としてのメモリ扱い:** gfx1103 を UMA APU と判定し、BIOS carve-out と shared memory を使って setup の GPU memory 情報を作ります。これは対応 arch に加える opt-in と同じ判定値に依存します（`setup.py:3824-3847`）。
-- **HIP backend:** gfx1103 向けの table 探索と追加設定は HIP の config 生成経路にあります。HIP を選ばない構成ではこの設定生成分岐に入りません（`setup.py:10305-10323`）。
-- **OS:** `STRATA_NO_ARENA_THP=1` と17個の gfx1103 speed switch を config の `env` に加える分岐は `not WIN` の場合だけです。Windows では opt-in 判定自体は arch 対応・UMA 判定に使われますが、この2種類の設定は生成されません（`setup.py:10316-10322`）。`docs/RADEON_780M.md:1-5` は gfx1103 の手順を Linux 向けとし、ready-made Windows engine はないと説明しています。
-- **既存設定との関係:** 再セットアップ時、gfx1103 switch 群と `STRATA_NO_ARENA_THP` は setup 管理値として古い config から引き継がれません。今回の条件で新しい config に設定された値が使われ、opt-in を外した場合に古い setup 値が残り続けない処理です（`setup.py:6502-6509, 6525-6530`）。
+- `GFX1103_OPT_IN` が真なら `AMD_ARCHS` に `gfx1103` が追加され、`amd_problem()` が gfx1103 を「未対応」として弾かなくなる。実際の GPU 選択には AMD GPU の検出と、AMD HIP 経路（例: `--backend hip`）が別途必要。`--gpu` / `--gpus` は検出済みの対応 GPU を選ぶもので、gfx1103 を無効設定から再び対応化するものではない。`terminal/setup.py:4421-4422, 4950-4955, 11617-11629`
+- GPU の arch は Linux では KFD の情報などから、Windows では HIP runtime または Windows の display adapter 情報から判定される。gfx1103 と一致する判定は完全な arch 名または `gfx1103:` で始まる arch 名であり、別の gfx 世代への前方一致ではない。無効時も検出名自体は `AMD_IGPU_PCI` / Windows 名対応表に残るが、`AMD_ARCHS` 外として利用不可になる。`terminal/setup.py:4533-4537, 4542-4546, 4950-4955, 5030-5035`
+- Linux で選択した GPU が gfx1103 の場合、有効設定のときだけ config 生成時に `STRATA_NO_ARENA_THP=1` と `GFX1103_SWITCHES` が `env` に書かれる。Windows ではこの追加処理に `not WIN` の条件があるため、gfx1103 を許可してもこれらの値は setup が追加しない。ここで記すのは Strata が config に書く事実であり、各設定値のエンジン内効果ではない。`terminal/strata_control/setup_config.py:452-458`
+- config 再作成時、`STRATA_NO_ARENA_THP` と `GFX1103_SWITCHES` のキーは `SETUP_ENV` に含まれ、setup 管理項目として古い値が引き継がれない。有効時に新しい config が生成する値があればそれが使われ、無効時はこの分岐からは再生成されない。`terminal/setup.py:7460-7463, 7480-7495`
+- この変数による判定に特定の model / server mode / build macro 条件はない。AMD GPU を選んだ後、既存 engine / build toolchain など別の条件が失敗すれば利用はできない。Windows で有効にしても、gfx1103 用 ready-made engine をこの変数が提供するわけではない。`terminal/setup.py:4950-4955, 5010-5017, 11617-11645`
 
 ## 実行時の詳細
 
-Linux で HIP backend の config を作る場合、選択 GPU が gfx1103 で opt-in が有効なら、setup は `STRATA_NO_ARENA_THP=1` と `GFX1103_SWITCHES` の17項目を `cfg["env"]` に記録します。switch 群は `STRATA_GDN_HEAD=1`, `STRATA_GDN_PP=2`, `STRATA_GDN_CONVL2=1`, `STRATA_GDN_NOY=1`, `STRATA_CVEC_FUSE=1`, `STRATA_PF_PAD=1`, `STRATA_Q8_PACKED=1`, `STRATA_Q6_PACKED=1`, `STRATA_MMVF_ROWS=1`, `STRATA_ATTN_LANECELL=1`, `STRATA_EXPERT_V2=1`, `STRATA_TSUM=1`, `STRATA_LFUSE=1`, `STRATA_GDN_SPLIT=1`, `STRATA_QFUSE=1`, `STRATA_PLE_BATCH=1`, `STRATA_SH_STREAM=1` です（`setup.py:3684-3692, 10316-10322`）。setup は生成した config を保存します（`setup.py:6648-6676, 10436-10453`）。
+`setup.py` のモジュール初期化時に環境値を読み、`GFX1103_OPT_IN` として保持する。`AMD_ARCHS` の構築、UMA APU 判定 `is_uma_apu()`、および `strata_control.setup_config` が参照する同定数に使われるため、実行中に環境変数だけを変更しても現在のプロセスには反映されない。別のセットアッププロセスを起動し直すと、そのプロセスが起動時の環境から再判定する。`terminal/setup.py:4414, 4421-4422, 4574-4580`、`terminal/strata_control/setup_config.py:158-161`
 
-保存済み calibration が適用される場合、calibration の `env` は `STRATA_SH_STREAM` を再設定できるため、この17項目のうち同名の値は calibration 値が優先します。他の env 項目は `apply_env()` の `ENV_KEYS` に含まれないため、この処理では変更されません（`tools/calibrate.py:514-522`, `setup.py:10437-10444`）。
+有効時に gfx1103 が選択されると、setup は gfx1103 を使える GPU として扱い、Linux では run config の `env` に `STRATA_NO_ARENA_THP=1` と次の 17 キーを書き込む。無効時には gfx1103 は対応 GPU リストから外れ、gfx1103 の Linux 専用 env 設定分岐にも入らない。`terminal/strata_control/setup_config.py:433-458`、キー定義は `terminal/setup.py:4430-4437`。
 
-同じ HIP 経路では選択 GPU の arch と hipBLASLt version に合う table が見つかれば `STRATA_HIPBLASLT_TUNING` も config に設定します。gfx1103 用 table が見つからない場合、setup の `hipblaslt_table()` は warning を出し、table なしを返します。table は opt-in の文字列を別途読むものではなく、HIP config 経路と arch/version によって選択されます（`setup.py:4760-4781, 10313-10315`）。ROCm の wheel を使う場合、gfx1103 は `gfx110X-all` index を選び、専用 pin は `7.10.0a20251121` です。ただし `STRATA_ROCM_INDEX` と `STRATA_ROCM_VERSION` が別途設定されれば index / version 選択に使われます（`setup.py:3652-3663, 3716-3717, 4707-4727`）。これらは gfx1103 opt-in 判定そのものを変更しません。
+この変数自身を子 engine や server に転送するコードは確認できない。setup が run config に書くのは上記の別名の env 設定であり、この変数は起動後の model request ごとには評価されない。`terminal/strata_control/setup_config.py:452-458`、`terminal/setup.py:4414`
 
-server は config の `env` を engine 子プロセス環境へ反映します。同名の親プロセス環境値より config 値が後から設定されます（`serve/server.py:3747-3764`）。したがって Strata が runtime に適用するのは setup が書いた各設定値です。`STRATA_EXPERIMENTAL_GFX1103` 自体は config に書かれず、engine のコードも読まないため、起動後のログや処理にこの opt-in 名固有の分岐・警告・終了経路はありません。
+## ログと測定値
 
-setup の GPU 表示では、対応外なら `amd_problem()` の `not supported ... this is gfx1103 (an integrated Radeon, not Strix Halo)` が理由として表示され、対応扱いなら `can be used` と表示されます（`setup.py:4191-4197, 9400-9407`）。値が `1` 以外だったことだけを示す専用 warning/error は見つかりません。`--check` を含む setup は GPU の検出結果をこの判定で表示します（`setup.py:9360-9364, 9400-9407`）。
+gfx1103 を無効にして AMD GPU 経路へ進み、その gfx1103 GPU しか利用可能な GPU がない場合、GPU 一覧では `amd_problem()` の返す `not supported - Strata's AMD backend runs on ... only, this is gfx1103 (an integrated Radeon, not Strix Halo)` が表示され、セットアップは `no AMD GPU Strata can use` で停止する。`fail()` は `[X]` を付けて表示し exit code 1 で終了する。別の対応 AMD GPU があればセットアップ全体は続行できる。`terminal/setup.py:4950-4955, 1049-1056, 11597-11618`
+
+有効時に gfx1103 が選択されたことを示す専用の警告・ログ文言はこの分岐にはない。Strata の測定値はこの文書では扱わない。セットアップの値判定と、それによる対応 GPU / config の変更を説明するための測定条件は該当しない。
 
 ## 根拠
 
-- 候補一覧: `docs/envvars/000_envvers.md:775`。
-- 値の唯一の実読み取り、arch list と ROCm family pin: `setup.py:3652-3676`。
-- Linux KFD GPU 列挙、arch 判定、UMA 判定とメモリ分類: `setup.py:3824-3847, 4142-4197`。
-- gfx1103 switch 群と setup config 生成、HIP 条件・Windows 除外: `setup.py:3684-3692, 6498-6509, 10303-10323`。
-- hipBLASLt table の選択と未発見時の warning: `setup.py:4760-4781, 10313-10315`。
-- 保存済み config の `env` を子プロセスへ反映: `setup.py:6648-6676`, `serve/server.py:3747-3764`。
-- 関連説明（設計資料）: `docs/RADEON_780M.md:1-5, 66-80`; 測定条件や性能値はこの調査で再測定していません。
+- `terminal/setup.py:4412-4422` — 値の既定値・比較、gfx1103 の AMD 対応リストへの追加。
+- `terminal/setup.py:4533-4537, 4542-4546, 4574-4580` — GPU arch 判定と UMA APU 条件。
+- `terminal/setup.py:4950-4955, 11617-11629` — 非対応時の判定と GPU 選択。
+- `terminal/strata_control/setup_config.py:158-161, 433-458` — setup 定数の取り込みと Linux gfx1103 用 config 生成。
+- `terminal/setup.py:7460-7463, 7480-7495` — setup が管理する env キーと再実行時の引継ぎ規則。
+- `terminal/setup.py:1049-1056` — セットアップのエラー表示と終了コード。

@@ -1,6 +1,6 @@
 # `strata components remove --feed`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,45 +8,49 @@
 | コマンド | `strata components remove` |
 | オプション | `--feed` |
 | 別名 | なし |
-| 値 | 1 個の文字列。parser の help では署名付き update feed の URL またはフォルダーと説明されていますが、このコマンドでは値を使用しません。 |
+| 値 | 文字列を1つ取る。URL・フォルダー名などの形式検証はない。 |
 
 ## 役割
 
-`--feed` は共通 parser によって `strata components remove` でも受理されます。ただし remove はローカルに導入済みの engine package を削除するコマンドであり、この実行経路では feed の参照もダウンロードも行いません。したがって、ここで指定する値は削除対象や削除動作に影響しません（`strata_cli/update_cmd.py:47-58,88-91,272-273,358-400`）。
+`--feed` は `remove` の parser で受理されるが、このコマンドの削除処理では値を使用しない。指定しても更新 feed の選択・読み込み・検証は行われず、削除対象や結果にも影響しない。`remove` はインストール済みエンジンをローカルで削除するコマンドである（parser 共通引数: `terminal/strata_cli/update_cmd.py:47-56,88-91`、削除分岐: `terminal/strata_cli/update_cmd.py:337-338,445-466,492-497`）。
 
 ## 使い方
 
-構文上は次のように値を指定できますが、remove では値は利用されません。
-
 ```sh
+# 指定したインストール済みエンジンを削除する。--feed の値は処理に使われない
 strata components remove 0.1.54 --feed https://example.invalid/strata-feed.json
 ```
 
-`engine` には導入済み engine の版またはフォルダー名を指定します。削除に使う feed を切り替える効果はありません（`strata_cli/update_cmd.py:88-91`）。
+`remove` は位置引数 `engine`（バージョンまたはフォルダー名）を必要とする。`--feed` 自体は任意で、指定しない場合も削除処理は同じである（`terminal/strata_cli/update_cmd.py:88-91`）。
 
 ## 値と既定値
 
-parser は `_common()` から `--feed` を登録し、`default=None` としています。型変換や URL・フォルダーの検証はこの宣言では設定されていません。値を省略すると通常の `argparse` により引数エラーになります。空文字列を含め、構文上受理された値も remove の処理では参照されません（`strata_cli/update_cmd.py:47-48,88-91`）。
+- `--feed` は共通 parser で `default=None` の文字列引数として登録され、`type`、`choices`、必須指定は設定されていない。そのため、このコマンドの parser は引数の値を feed URL やフォルダーとして検証しない（`terminal/strata_cli/update_cmd.py:47-49,88-91`）。
+- 省略時の値は `None`。空文字列を渡した場合も parser 上は値として受理される。
+- 共通定義の help 文には feed の指定先と既定候補（`STRATA_UPDATE_FEED`、前回使用値、プロジェクトの feed）が記されるが、これは `remove` の実行時には適用されない（`terminal/strata_cli/update_cmd.py:48` と `terminal/strata_cli/update_cmd.py:337-338,351-354`）。
 
 ## 実行時の動作
 
-`strata_cli/cli.py` は `components remove` を `update_cmd.run()` に委譲します。`run()` は共通 context を作成した後、`components_command` が `remove` の場合に `_engines_command()` を呼びます。そこでは導入済み engine 一覧から位置引数 `engine` と `--family` に一致する項目を選び、`delete_engine()` を実行します。この経路は `_feed_source()` を呼び出さず、`a.feed` も読みません（`strata_cli/cli.py:2136-2138`; `strata_cli/update_cmd.py:123-132,244-256,272-273,358-360,378,395-400`）。
+`strata components remove` は `update_cmd.run()` に入り、コンポーネント保存先とハードウェア情報から context を作った後、`engines`・`use`・`remove` 用の分岐に進む。この分岐は `_feed_source()`、署名鍵の読み込み、取得許可判定より前に実行される。そのため `--feed` の値も `STRATA_UPDATE_FEED` も削除処理では参照されず、ネットワークアクセスや feed の署名検証は発生しない（`terminal/strata_cli/update_cmd.py:303-321,337-354`）。
 
-`_feed_source()` が `--feed` を参照するのは更新処理向けの feed source を選ぶ場合です。`remove` はその後の更新分岐にも進みません（`strata_cli/update_cmd.py:123-132,284-301`）。
+削除対象は `engine` と任意の `--family` からインストール済み一覧で特定される。対象が一意に決まると `delete_engine()` が対象フォルダーを一時名へ rename して削除する。`--feed` の値はこの選択にも削除処理にも渡されない（`terminal/strata_cli/update_cmd.py:445-466,492-497`、`terminal/strata_control/engine_library.py:317-344`）。
 
 ## 適用条件と副作用
 
-remove で `--feed` を指定しても、ネットワークアクセス、署名確認、feed の読み込みは発生しません。ローカル engine の削除自体は指定値にかかわらず実行され得ます。削除処理は engine が使用中の場合に拒否し、対象ディレクトリを一時名へ rename してから削除します。Qwen engine の場合は関連する更新 state/history も更新します（`strata_control/engine_library.py:294-334`）。
+- `--feed` の有無や値による適用条件はない。値が無効な URL でも拒否されず、削除の成否はローカルの対象エンジン状態で決まる（`terminal/strata_cli/update_cmd.py:337-338,445-466`）。
+- `--feed` によるネットワーク・ファイル副作用はない。ただし、コマンド自体は対象エンジンのフォルダーを削除し、Qwen エンジンの場合は保存状態の `previous` / `pinned` / 該当する失敗記録を整理して履歴を保存する（`terminal/strata_control/engine_library.py:337-364`）。
+- 使用中のエンジン、または実行中のプログラムが使用しているエンジンは削除できない。モデルと設定、他 family のエンジンは削除対象外（`terminal/strata_control/engine_library.py:317-319,328-335`）。
 
 ## 出力とエラー
 
-成功時、通常出力では削除した engine の版、解放容量、およびモデルと設定には触れなかった旨を表示します。`--output json` または `jsonl` の場合は成功結果を JSON として出力します。対象 engine が見つからない場合や削除不可の場合は `UpdateError` 経由で失敗します（`strata_cli/update_cmd.py:237-242,395-400`; `strata_control/engine_library.py:198-211,294-316`）。
+`--feed` の値による独自の出力・エラーはない。削除成功時は人間向け出力に削除バージョンと解放サイズが表示され、`--output json` / `jsonl` では削除結果が JSON で出力される（`terminal/strata_cli/update_cmd.py:492-497`）。
 
-`--feed` 固有の出力・失敗経路は確認できません。remove ではその値を使用しないためです。
+対象が未インストール、曖昧、使用中などの場合、`UpdateError` が人間向けでは stderr、機械向けでは JSON エラーとして出力される。対象不一致・削除禁止は終了コード 2、フォルダー rename に失敗した場合は終了コード 6 で、後者は「何も変更していない」と報告する（`terminal/strata_control/engine_library.py:184-196,331-342`、`terminal/strata_cli/update_cmd.py:307-312,374-378`）。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:47-58,88-91` — 共通 parser における `--feed` の宣言と remove への適用。
-- `strata_cli/cli.py:2136-2138` — `components remove` の実装への委譲。
-- `strata_cli/update_cmd.py:123-139,244-256,272-273,284-301,358-400` — feed 解決経路と remove の分岐・出力。
-- `strata_control/engine_library.py:198-211,294-334` — engine の照合、削除条件、副作用。
+- `terminal/strata_cli/update_cmd.py:47-56,88-91` — `--feed` の共通 parser 登録、既定値、`remove` parser への登録。
+- `terminal/strata_cli/update_cmd.py:303-321,337-354` — `remove` が feed 解決・取得経路より先にローカル処理へ分岐する根拠。
+- `terminal/strata_cli/update_cmd.py:445-466,492-497` — engine/family による対象選択と `delete_engine()` 呼び出し、成功時出力。
+- `terminal/strata_control/engine_library.py:317-364` — 削除拒否条件、rename と削除、状態履歴の更新、rename 失敗経路。
+- `docs/cli/README.md:243-255` — `strata components remove` の階層と `--feed` の索引リンク。索引に記載された option が parser にも存在することを確認した。

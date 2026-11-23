@@ -1,46 +1,47 @@
 # `STRATA_FS_DEPTH`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Foresight swap space の VRAM slot を再利用するまでに必要な、完了済み decode window 数を指定します。slot を参照した window がまだ読み終えていない間に、その slot の内容を別 expert で上書きしないための猶予です。Foresight swap space 自体は `STRATA_FS_SLOTS` で opt-in する CUDA の serve 経路です。`STRATA_FS_DEPTH` 単独では機能を有効にしません。
+Foresight swap space の VRAM スロットを再利用するまでに待つ、完了済み verify window の数を決めます。値を大きくすると、直近の window が読み得るスロットをより長く保持します。ルーターの選択、コピー対象、またはモデルの出力を直接変える設定ではありません。スロットがまだ読み込み中・未着の場合はそのスロットを使わず、通常の miss 処理へ進みます（`engine/src/core/expert_source.cpp:7248-7259`、`engine/src/core/expert_source.cpp:5583-5606`）。
+
+実装は `strata::core::foresight_swap_from_env()` で、`--serve` の生成経路が Foresight swap を作成し、verify/route 側に接続します（`engine/src/core/expert_source.cpp:7294-7321`、`engine/src/program/generate.cpp:14794-14815`）。
 
 ## 値と判定
 
-`foresight_swap_from_env()` 内の共通 `env_int` lambda が `std::getenv(name)` で読み、設定値は `std::atoi` に渡します。変換後の値が下限より小さい場合は下限へ引き上げます（`src/core/expert_source.cpp:6547-6552`）。
+`STRATA_FS_SLOTS` が正数で、デバイス側 plan/hits の検証モードで無効化されない場合に限り、この変数を読みます。読み取りは `getenv` の結果を `atoi` に渡し、未設定なら 4、変換値が 2 未満なら 2 に丸めます。上限の clamp はありません。`atoi` は整数の先頭部分を読むため、空文字や数字で始まらない値は 0 となり 2 に丸められます。数値の後ろの文字や先頭空白は変換を妨げず、符号も整数変換に含まれます。大文字小文字の概念はありません（`engine/src/core/expert_source.cpp:7306-7311`）。
 
-| 環境変数の状態・値 | `f->depth` |
-| --- | ---:|
-| 未設定 | 4（既定値） |
-| 空文字、数値に変換できない文字列 | 2（`atoi` が 0 を返し、下限で clamp） |
-| `atoi` の結果が 2 未満（負値、0、1 を含む） | 2 |
-| `atoi` の結果が 2 以上 | その整数値 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---:|---|---|
+| Foresight swap の初期化に進む場合 | 4 | 整数変換結果が 2 以上。例: `2`, `4`, `7`, `4tail` | 整数変換結果が 2 未満なら 2 として有効。例: `0`, `1`, `-3`, 空文字, `true` はいずれも 2 |
+| `STRATA_FS_SLOTS` が未設定または `atoi` 結果 `<= 0` | 読まれない | 該当なし | Foresight swap 自体が作成されない |
+| `STRATA_VERIFY_DEVICE_PLAN` または `STRATA_VERIFY_DEVICE_HITS` が設定され、`atoi` 結果が非 0 | 読まれない | 該当なし | Foresight swap 自体が無効化される |
 
-全体の厳密な数値 parse や上限 clamp はありません。`atoi` のため先頭の空白と符号は変換対象になり、数値の後ろに文字があっても数値部分が使われます（例: `5x` は 5、`x5` は変換結果 0 となり 2）。整数としての範囲外入力に対する明示的な検査もありません。
+CLI 引数や設定ファイルからこの値を上書きする処理は、この読み取り経路にはありません。`--pipeline-windows` は同時に進む window 数に関する別設定で、`STRATA_FS_DEPTH` の値を置き換えません（`engine/include/strata/core/foresight_swap.hpp:10-14`）。
 
 ## 有効になる条件
 
-- `STRATA_FS_SLOTS` が設定され、`atoi` の結果が 1 以上であること。未設定・空文字・非数値・0・負値では swap pool を作らず、その時点で `STRATA_FS_DEPTH` も読みません（`src/core/expert_source.cpp:6537-6542`）。
-- `STRATA_VERIFY_DEVICE_PLAN` が未設定または `atoi` の結果 0 であること。非 0 なら pool の作成を拒否し、stderr に `strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN (the device would plan resident layers without the host)` と出します（同:6542-6545）。
-- Foresight swap の初期化が成功すること。slot の CUDA allocation または event 作成に失敗すると初期化失敗となり、caller は pool を破棄します（同:6302-6356, 6554-6557）。
-- 実際にコピー要求が通るには、source と expert のデータがあり、source がその expert を pinned と判定する必要があります。条件を満たさない miss/prediction は slot コピーを要求せず、通常の経路のままです（同:6472-6488）。
-
-CLI 引数や他の環境変数から depth を上書きする処理は見つかりません。`STRATA_FS_AHEAD` や `STRATA_LOOKAHEAD` は予測経路の有無に関係しますが、depth の parse 値は変更しません（`src/program/generate.cpp:7734-7742`）。
+- `STRATA_FS_SLOTS` が設定され、`atoi` 結果が 1 以上であること。実際に確保する slot 数は最大 64 に制限されます（`engine/src/core/expert_source.cpp:7296-7298,7313`）。
+- `STRATA_VERIFY_DEVICE_PLAN` と `STRATA_VERIFY_DEVICE_HITS` の両方が未設定または整数変換結果 0 であること。どちらかが非 0 なら swap space を無効にして理由を stderr に出します（`engine/src/core/expert_source.cpp:7299-7305`）。
+- 初期化が成功すること。割り当て・CUDA event 作成の失敗時は swap space を無効にします（`engine/src/core/expert_source.cpp:7082-7108,7312-7316`）。
+- コピーを発行するには、対象 expert が pin 済みで、その blob を取得でき、空きまたは再利用可能な slot があり、カードごとのコピー予算内である必要があります。これらを満たさない miss は slot にコピーされません（`engine/src/core/expert_source.cpp:7239-7261`）。
+- 読み込み済み slot を GPU 側で使うのは、対象 expert が cache におらず、peer GPU や helper が処理せず、swap slot のコピーが完了している場合です。未着なら `take()` は false となり、通常の miss 処理へ進みます（`engine/src/core/expert_source.cpp:5583-5606,7161-7195`）。
 
 ## 実行時の詳細
 
-serve の生成処理が Foresight swap pool を作るときに環境から読み、pool の `depth` フィールドへ保持します。`static` cache ではなく、その pool の初期化ごとの読み取りです。pool 作成呼び出しは `src/program/generate.cpp:11108-11121` にあります。成功時の stderr 初期化ログは `reuse after %d windows` として採用値を出します（`src/core/expert_source.cpp:6559-6562`）。
+serve の生成経路で `foresight_swap_from_env()` が呼ばれた時に値を読み、`ForesightSwap::depth` に保存します。関数の呼び出し後に環境を変更しても、このオブジェクトの値は再読込されません。ソース上、設定値のキャッシュ用 static はなく、呼び出しごとに環境を読みます（`engine/src/core/expert_source.cpp:7294-7311`）。
 
-各 decode window の完了時に `completed` カウンターを1増やします（`src/program/generate.cpp:16581-16587, 17056-17059`）。slot を再利用候補にする際、実装は `sl.last_ref + depth > now` なら候補から除外します。`now` は完了済み window 数、`last_ref` は slot を最後に plan へ渡した時点の完了数です。従って depth を大きくすると slot の再利用を遅らせ、小さくすると下限2の範囲で早めます。候補 slot がない場合は `busy` カウンターを増やして要求を見送り、depth を満たすまで待機するのではありません（`src/core/expert_source.cpp:6435-6438, 6472-6504`）。コピー未完了 slot は `take()` で未着として扱われ、expert はその時点で swap slot からは提供されません（同:6404-6415）。
+成功した slot 参照時に、その slot は現在の完了済み window 数 `completed` を `last_ref` に記録します。再利用候補になるのは `last_ref + depth <= completed` となった後です。serve の2つの window 完了経路が `completed` を加算します。したがって `2` は最後の参照から少なくとも2 window が完了するまで待ち、既定の `4` は少なくとも4 window 待ちます（`engine/src/core/expert_source.cpp:7192-7195,7248-7259`、`engine/src/program/generate.cpp:22303-22305,23017-23020`）。
 
-実行終了時に `foresight swap: ... no free slot ...` を含む集計行が stderr に出ます（`src/core/expert_source.cpp:6524-6534`; 出力箇所 `src/program/generate.cpp:17177`）。コピーの失敗時は `strata serve: foresight swap: a copy failed - swap space off` が stderr に出て、それ以降の要求コピーを止めます（`src/core/expert_source.cpp:6393-6400, 6472-6474`）。初期化の割当失敗時は理由と `swap space off` が stderr に出ます（同:6325-6332, 6554-6557）。
+`STRATA_FS_DEPTH` 自体に対する警告やエラー出力はありません。初期化成功時は stderr に `reuse after %d windows` を含む設定ログが出るため、clamp 後に使われる値を確認できます。`STRATA_FS_SLOTS` が無効ならこのログも出ません。device plan/hits による無効化では `strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN/HITS (the device would plan resident layers without the host)` と出ます。初期化失敗時は `strata serve: foresight swap: %s - swap space off`、コピー失敗時は `strata serve: foresight swap: a copy failed - swap space off` が stderr に出ます（`engine/src/core/expert_source.cpp:7301-7304,7313-7320,7151-7155`）。
+
+この変数固有の測定値は、調査対象コードと確認した Strata 資料にはありません。`docs/DETAILS.md:1244,1695` は `STRATA_FS_SLOTS` の記述・測定で、`STRATA_FS_DEPTH` の比較結果ではありません。
 
 ## 根拠
 
-- 読み取り、既定値、最小値 clamp、起動条件、初期化ログ: `src/core/expert_source.cpp:6537-6562`
-- slot の再利用判定と候補不足時の動作: `src/core/expert_source.cpp:6435-6438, 6472-6504`
-- Foresight swap の serve 側生成と接続: `src/program/generate.cpp:11108-11129`
-- 完了 window カウンター: `src/program/generate.cpp:16581-16587, 17056-17059`
-- Foresight swap の opt-in 説明と `STRATA_FS_DEPTH` の既定値に関するコメント: `include/strata/core/foresight_swap.hpp:2-14, 49-53`
-- `STRATA_FS_SLOTS` の適用範囲と過去測定: `docs/DETAILS.md:1030, 1437`。これは `STRATA_FS_SLOTS` の資料であり、`STRATA_FS_DEPTH` 単独の性能測定値は記載されていません。
+- `engine/src/core/expert_source.cpp:7294-7321` — 環境値の読み取り、既定値 4、下限 2、初期化と設定ログ。
+- `engine/src/core/expert_source.cpp:7248-7259` — `depth` による slot 再利用条件。
+- `engine/src/program/generate.cpp:14794-14815,22303-22305,23017-23020` — serve 経路での生成・接続と完了 window 数の加算。
+- `engine/src/core/expert_source.cpp:5583-5606,7161-7195` — landed slot の利用と未着時の通常 miss 経路。
+- `engine/include/strata/core/foresight_swap.hpp:10-14` — slot 参照後の安全な再利用に関する実装コメント。

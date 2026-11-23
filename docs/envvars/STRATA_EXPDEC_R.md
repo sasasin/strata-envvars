@@ -1,52 +1,50 @@
 # `STRATA_EXPDEC_R`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-EXPDEC の gate/up カーネルで、lane がまとめて計算する出力行数 `R` を選びます。既定値は 1 で、値が整数としてちょうど 2 の場合だけ 2 が使われます。EXPDEC 自体を有効にするスイッチではありません。
+CUDA/HIP の IQ expert kernel にある EXPDEC gate/up カーネルで、lane あたりに処理する行数 `R` を選ぶ。`R=1` または `R=2` により `expdec_gu_kernel` のテンプレート実体と、1 block が扱う行数の計算が変わる。down projection 用の `STRATA_EXPDEC_DR` とは別の設定である。EXPDEC が選ばれないとき、この値は通常の gate/up kernel の選択に影響しない（`engine/src/kernels/cuda/iq_kernels.cu:4363-4376, 4400-4419, 4453-4466`）。
 
 ## 値と判定
 
-`env_int_or()` は環境変数が未設定または空文字なら既定値を返し、それ以外は `std::atoi()` の結果を使います。その後 `expdec_r()` が結果を検査し、整数値が 2 なら 2、それ以外はすべて 1 に正規化します。
+`env_int_or` は `std::getenv` で設定有無を調べ、未設定または空文字なら既定値を返し、それ以外は `std::atoi` の結果を使う。既定値は `1`。その後 `expdec_r()` が変換結果を検査し、厳密に `2` のときだけ `2`、それ以外はすべて `1` に正規化する（`engine/src/kernels/cuda/iq_kernels.cu:4356-4359, 4363, 4375`）。
 
-| 環境値 | `atoi` の結果 | gate/up の R |
-|---|---:|---:|
-| 未設定、空文字 | 既定値 1 | 1 |
-| `2`, `02`, `+2`, `2junk`, `2.5` | 2 | 2 |
-| `1`, `0`, `-2`, `true`, `junk`, `0x2` | 変換結果（例では 1 / 0 / -2 / 0） | 1 |
+| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA または HIP（この `.cu` がビルドされる場合） | `1` | `atoi` の結果が `2` になる値。例: `2`, `02`, `+2`, `2tail`, `2.5` | 結果が `2` 以外なら `1`。例: 空文字は既定値 `1`、`0`, `1`, `3`, `-2`, `true`, `false`, `0anything`, `n/a` |
 
-文字列全体の妥当性は検査しません。`atoi` が先頭の空白と符号を許容し、数値以降を読み飛ばすため、たとえば `  +2tail` も 2 になります。`true` のような変換不能文字列は 0 になり、既定値へ戻るのではなく `R=1` になります。整数の表現範囲を超える入力の結果は、この実装から保証できません。
+`atoi` は数値全体の妥当性を検査しないため、先頭の空白・符号と数値の後ろの文字列を許し、数値部分が無い文字列は `0` になる。大文字小文字は値の判定に関係しない。`2tail` のような入力も整数として拒否されず `R=2` になる（同 `iq_kernels.cu:4356-4359, 4375`）。
 
 ## 有効になる条件
 
-- この設定値を読む実装は `src/kernels/cuda/iq_kernels.cu` にあります。同 `.cu` は CUDA/HIP の kernel target に含まれますが、backend により前段の layout 分岐が異なります。EXPDEC の説明資料は CUDA 専用機能としています。HIP での実機動作はこの調査では確認していません。
-- EXPDEC の gate/up 経路が有効である必要があります。環境変数 `STRATA_EXPDEC` または呼び出し側の `native_expert_set_expdec()` により EXPDEC が有効で、かつ `STRATA_OLD_IQ_MMVQ` が有効でない場合にのみ候補になります。
-- gate/up の量子化 type が `16`, `17`, `18`, `21`, `22` のいずれかで、`n_embd == 32 * ED_XB`、`n_ff` が 64 の倍数かつ正である必要があります。対象外なら既定カーネルへ進みます。
-- `STRATA_EXPERT_V2` の専用経路（条件を満たす場合）および `STRATA_EXPERT_V2K` の専用経路では `native_expert_grouped()` が先に return するため、EXPDEC gate/up の判定に到達しません。
-- AMD layout を選ぶ `STRATA_EXP_MODE` の分岐でも、対応 layout を選んだ場合は EXPDEC の gate/up 判定を通らないことがあります。モード 0 などで通常 layout 側へ進む場合は、以降の条件を満たせば判定されます。
-- gfx12（RDNA4）では、`STRATA_DEFAULTS=026` でなく `STRATA_GFX12_DEFAULTS` が `0` で始まらない場合、Strata は `STRATA_EXPDEC=1` を architecture default として追加します。ただし利用者が `STRATA_EXPDEC` を何らかの値で設定済みならその値が優先されます。この既定設定は `STRATA_EXPDEC_R` の値自体を変更しません。
-- C++ API の `native_expert_set_expdec_params()` が呼ばれ、`gu_rows_per_lane > 0` を渡すと、その値が環境から読み込んだ値を上書きします。Strata の通常エンジン内でのこの setter 呼び出しは確認できず、同梱 `expdec_bench` からは呼び出されます。
+- この実装ファイルを含む CUDA/HIP GPU engine が必要。CMake は共通 GPU engine を CUDA または HIP が有効な場合に構成し、`iq_kernels.cu` を `strata_kernels` に含める（`engine/cmake/strata_gpu_engine.cmake:6-8, 96-100`）。
+- EXPDEC 自体が有効で、旧 IQ kernel が選択されていないこと。`expdec_gu` は `STRATA_EXPDEC` の有効判定が偽、または `g_old_kernels` が真なら既定経路へ戻る。`STRATA_OLD_IQ_MMVQ` は空でなく先頭文字が `'0'` 以外なら `g_old_kernels` を有効にする（`engine/src/kernels/cuda/iq_kernels.cu:3689-3695, 4360-4363, 4453-4458`）。`STRATA_EXPDEC` は値を直接見ると unset/空文字/先頭文字 `'0'` なら無効だが、別の起動時設定が gfx12 または discrete RDNA3（gfx1100/1101/1102）で `1` を既定値として設定する経路がある（`engine/src/core/arch_defaults.cpp:28-55`, `engine/include/strata/core/gfx11_extra.hpp:39-64`）。
+- gate/up layout が対応する型（type `16`, `17`, `18`, `21`, `22`）、block/tail 条件を満たし、`n_embd == 32 * ED_XB`（`ED_XB=80`、すなわち 2560）、`n_ff` が 64 の倍数かつ正であること。合わなければ default kernel が使われる（`engine/src/kernels/cuda/iq_kernels.cu:2661, 4378-4380, 4455-4466`）。
+- `nib_layout(L)` が真なら EXPDEC を呼ばず nibble gate/up kernel を使う。nibble kernel を含まない build では nibble slot の grouped 呼び出しは `4-bit gate/up slots are not built into this engine` を stderr に出して終了する（`engine/src/kernels/cuda/iq_kernels.cu:7113-7117, 7300-7307`）。
+- `STRATA_EXP_LAYOUTS` build で `fused_gu` が選択される場合（たとえば `em0 == 8` と対応形式・形状条件を満たす場合）は、先行 fused kernel が gate/up を処理し、後段の EXPDEC 呼び出しは `!fused_gu` guard により実行されない。`em0` は `STRATA_EXP_MODE` などの状態から決まるため、この経路では `STRATA_EXPDEC_R` は使われない（`engine/src/kernels/cuda/iq_kernels.cu:7196-7204, 7205-7239, 7265-7307`）。
+- `STRATA_EXPERT_V2` が空でなく先頭文字 `'1'` で、`gu_type=21`, `d_type=20`, `n_embd=2560`, `n_ff=640` などの条件を満たす場合は、`native_expert_grouped` の先行 S26 分岐が gate/up と down を処理して return するため、この呼び出しでは `STRATA_EXPDEC_R` の EXPDEC 分岐に到達しない（`engine/src/kernels/cuda/iq_kernels.cu:7121-7132`）。
+- grouped 呼び出しの `cap_groups` または `cap_entries` が 0 以下なら、kernel dispatch 前に return する（`engine/src/kernels/cuda/iq_kernels.cu:7085-7090`）。
+- 内部の `g_exp_phase == 2` の実行では gate/up launch block が飛ばされるため、この呼び出しでも `R` は使われない（`engine/src/kernels/cuda/iq_kernels.cu:7265-7269, 7316-7318`）。
+- 通常の engine CLI に `STRATA_EXPDEC_R` を上書きする引数は見つからなかった。C++ API `native_expert_set_expdec_params` に正の `gu_rows_per_lane` が渡された場合は環境変数由来の値を上書きし、`2` 以外の正数は `expdec_r()` で `1` に正規化される。調査対象内の呼び出しは EXPDEC benchmark と parity harness にある（`engine/src/kernels/cuda/iq_kernels.cu:7057-7065`; 呼び出し元: `engine/src/kernels/expdec_bench.cpp:115-117`, `engine/src/kernels/iq_multi_parity.cpp:263-275`）。benchmark の `dec:r` 選択肢自体は `1` または `2` のみを受け付ける（`engine/src/kernels/expdec_bench.cpp:95-101`）。
 
 ## 実行時の詳細
 
-`g_expdec_r` は `iq_kernels.cu` のグローバル変数初期化で `env_int_or("STRATA_EXPDEC_R", 1)` を呼びます。したがって値は同翻訳単位の初期化時に読み取られ、以後の環境変更では再読込されません。正の値を渡す API setter による上書きは別途可能です。読み取り自体は `STRATA_EXPDEC` の有効／無効にかかわらず初期化時に行われますが、値がカーネル選択に使われるのは前節の条件を満たす EXPDEC gate/up 経路です。
+`g_expdec_r` は翻訳単位のグローバル初期化時に環境から一度読み込まれる。したがって、プロセス起動後に環境を書き換えても自動では反映されない。読み込んだ値は gate/up の EXPDEC dispatch 時に `expdec_r()` で `1`/`2` に正規化され、テンプレート引数 `R` として `expdec_gu_kernel` に渡る。`R` は `expdec_rows_per_block` の rows-per-pass（`16 * R`）にも使われるため、`STRATA_EXPDEC_RB` が自動値の `0` の場合の block 行数計算にも関係する（`engine/src/kernels/cuda/iq_kernels.cu:4363, 4375, 4388-4406, 4411-4419`）。
 
-EXPDEC 経路では `R=2` または `R=1` のテンプレートカーネルを選び、`R` に応じて行ごとの処理と rows-per-block の計算が変わります。EXPDEC が有効な状態で該当形式に初めて遭遇すると stderr に `strata expdec: CUDA... gate/up type ...: expdec_gu_kernel R <値> ...` が出ます。形式・形状が未対応なら `... not covered: the default kernel runs` と出て通常カーネルを使います。ゲート／アップ形状の `n_ff` が 32 で割り切れない場合は、それより前に `native_expert_grouped: n_ff ...` を出して `exit(1)` しますが、これはこの環境値の検査やエラーではありません。
+`native_expert_set_expdec_params` は `gu_rows_per_lane > 0` のときグローバル値を更新するため、環境読み込み後の API 呼び出しによる上書きは可能。ベンチマークや parity harness は複数設定を切り替えるためこの API を呼ぶ。一方、通常の server/engine 呼び出し箇所からこの setter を呼ぶ経路は確認できなかった。EXPDEC の選択は graph capture 前に行うよう API コメントに記載され、capture 済み graph は capture 時の kernel を保持する（`engine/src/kernels/cuda/iq_kernels.cu:7057-7065`; `engine/include/strata/kernels/iq_kernels.hpp:164-175`）。
 
-`docs/EXPERTDEC.md` は EXPDEC を CUDA 専用と説明します。一方、コードは HIP build にも含まれる共有 `.cu` 実装で、AMD layout 分岐が EXPDEC に到達せず通常 layout に続く場合は同じ判定を呼びます。gfx12 の architecture default にも `STRATA_EXPDEC=1` が含まれます。よって資料の「CUDA 専用」という説明と、この commit の共有実装・gfx12 default の関係には差があります。実機での backend 動作確認はこの調査では行っていません。
+## ログと測定値
 
-`STRATA_EXPDEC_R` 自体に無効値のエラー、警告、終了経路はありません。別の down projection 用値 `STRATA_EXPDEC_DR` はこの値とは独立です。
+`STRATA_EXPDEC` が有効で旧 kernel が無効な場合、対応 layout の最初の呼び出しでは stderr に `strata expdec: CUDA%d gate/up type %d: expdec_gu_kernel R %d MINB %d, %d rows per block, grid %d x %lld (cap %lld groups)%s` の形式で出力され、`R` に正規化後の値が表示される。未対応 layout では `strata expdec: CUDA%d gate/up type %d (n_embd %lld, n_ff %lld) not covered: the default kernel runs` と出力する。role/type/taken ごとに一度だけで、モードが無効または旧 kernel が有効ならこの診断箇所には到達しない（`engine/src/kernels/cuda/iq_kernels.cu:4421-4442, 4453-4458`）。
+
+`docs/EXPERTDEC.md:25` は gate/up の `R` を 1 または 2、既定 1 と説明している。同文書のベンチ表は主に既定 `R=1` 構成との比較であり、ここでは `R=2` の一般的な速度差を断定しない。文書に記載された bitwise 一致は資料上の主張であり、本調査では benchmark や GPU 実行を行っていない。
 
 ## 根拠
 
-- 候補一覧への掲載: `docs/envvars/000_envvers.md:773`。これは候補名の一覧であり、実装根拠ではありません。
-- 値の読み取り、既定値、整数化、正規化: `src/kernels/cuda/iq_kernels.cu:4055-4059,4063-4064,4074-4075`。
-- EXPDEC の gate/up 条件、形式・形状、旧 kernel による無効化、カーネル選択: `src/kernels/cuda/iq_kernels.cu:4077-4080,4110-4118,4151-4165`。
-- `STRATA_OLD_IQ_MMVQ` の読み取り: `src/kernels/cuda/iq_kernels.cu:3395-3401`。
-- V2/V2K 専用分岐と EXPDEC 呼び出し箇所: `src/kernels/cuda/iq_kernels.cu:6267-6279,6284-6321,6410-6415`。
-- AMD layout 分岐と共有 `.cu` の HIP 向け注記: `src/kernels/cuda/iq_kernels.cu:5536-5550,6328-6403`。kernel target への収録: `CMakeLists.txt:502`。gfx12 で `STRATA_EXPDEC=1` を追加する default と利用者値の優先: `src/core/arch_defaults.cpp:25-53,167-189`; default 適用時期: `src/program/generate.cpp:3400`。
-- API setter による上書きと実行時パラメータ公開: `src/kernels/cuda/iq_kernels.cu:6216-6238`。同梱 bench の setter 呼び出し: `src/kernels/expdec_bench.cpp:106`。
-- grouped expert 呼び出し: `src/core/verify.cpp:2221-2236`。形状エラーと終了: `src/kernels/cuda/iq_kernels.cu:6246-6252`。
-- ログの文言と一形式あたりの初回出力: `src/kernels/cuda/iq_kernels.cu:4120-4141`。
-- 機能が CUDA 専用であること、既定 R=1: `docs/EXPERTDEC.md:1-4,23-24`。ヘッダー上の環境ノブ説明: `include/strata/kernels/iq_kernels.hpp:113-123`。
+- 読み取りと変換: `engine/src/kernels/cuda/iq_kernels.cu:4356-4359, 4363, 4375`
+- gate/up の layout 条件と fallback: `engine/src/kernels/cuda/iq_kernels.cu:4378-4380, 4453-4466`
+- `R` による行数・kernel 選択: `engine/src/kernels/cuda/iq_kernels.cu:4388-4419`
+- 実行時 setter と値の取得: `engine/src/kernels/cuda/iq_kernels.cu:7055-7077`
+- stderr 診断: `engine/src/kernels/cuda/iq_kernels.cu:4421-4449`
+- EXPDEC 資料: `docs/EXPERTDEC.md:1-6, 18-46`

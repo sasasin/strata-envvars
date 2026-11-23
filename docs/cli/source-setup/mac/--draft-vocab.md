@@ -1,65 +1,69 @@
 # `--draft-vocab`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | macOS の `setup.py` → `metal/setup_mac.py` |
+| コマンド | macOS の `./setup.sh`（`metal/setup_mac.py`） |
 | オプション | `--draft-vocab` |
 | 別名 | なし |
-| 値 | `cjk`、`en`、`cyrillic`、`fr` のいずれか |
+| 値 | `cjk`、`en`、`cyrillic`、`fr`、`latin`、`arabic` |
 
 ## 役割
 
-Apple Silicon の Metal setup で、MTP（投機的デコード）の draft head が使うトークン subset を選びます。選択値に対応する配布済み subset を MTP runtime ディレクトリへ置き、生成する実行設定にも選択値を保存します。setup の選択肢であり、エンジン CLI に渡すオプションではありません。
+MTP draft layer が候補 token として使う語彙 subset を選びます。指定した名前に対応する Strata 同梱の `data/draft_vocab_*.bin` を MTP ディレクトリの `draft_vocab.bin` に反映し、明示指定した名前をモデル設定に記録します。任意のファイルパスを渡すオプションではありません。
 
 ## 使い方
 
-Strata のソースディレクトリで、モデルの setup とともに指定します。
+既存の Mac セットアップを更新して英語・コード向け subset を選ぶ例です。
 
 ```sh
 ./setup.sh --setup --draft-vocab en
 ```
 
-macOS では `setup.py` が `metal/setup_mac.py` に引数を転送します。既存設定がある状態で `--draft-vocab` だけを付けると通常起動経路に入り、値は適用されません。明示的に再 setup するには `--setup` を付けてください。
+通常起動では、既存設定のモデルをそのまま起動します。既存モデルにこの指定を反映させるには `--setup`（またはモデル選択を伴うセットアップ経路）を使います。
 
 ## 値と既定値
 
-- `cjk`: 中国語・日本語・韓国語を含む標準 subset。
-- `en`: 英語とコード向け subset。
-- `cyrillic`: 英語・コードに加えてキリル文字を含む subset。
-- `fr`: 英語・コードとフランス語向け subset。
+| 値 | 同梱ファイル |
+| --- | --- |
+| `cjk` | `draft_vocab.bin` |
+| `en` | `draft_vocab_en.bin` |
+| `cyrillic` | `draft_vocab_cyrillic.bin` |
+| `fr` | `draft_vocab_fr.bin` |
+| `latin` | `draft_vocab_latin.bin` |
+| `arabic` | `draft_vocab_arabic.bin` |
 
-parser は `choices=list(S.DRAFT_VOCABS)` で値を検証します。別名や短縮形はありません。既定値は parser 上 `None` です。setup の MTP runtime 更新時には未指定を `cjk` として扱いますが、設定 JSON の `draft_vocab` キーは明示指定時だけ書かれます。したがって、Mac で後から再 setup する際にこのオプションを省略すると、保存済みの選択を読み戻さず `cjk` を使用します。
+parser は `choices=list(S.DRAFT_VOCABS)` で値を制限し、既定値は設定していません。したがって不明な値は argparse が引数エラーとして拒否します。省略時、Mac のセットアップで MTP 語彙を更新する処理は `cjk` を使います。明示指定がない場合、設定 JSON に `draft_vocab` は追加されません。
 
 ## 実行時の動作
 
-setup が既存設定から通常起動へ進まず、モデル準備を行う場合、MTP が使用されていれば `data/draft_vocab*.bin` の対応ファイルを `rt/draft_vocab.bin` に反映します。標準の `cjk` は `data/draft_vocab.bin`、他の値は `data/draft_vocab_en.bin`、`data/draft_vocab_cyrillic.bin`、`data/draft_vocab_fr.bin` に対応します。setup は `rt` ディレクトリを作成してから更新を呼び出します。
+セットアップ時に MTP を使う構成なら、`engine/metal/setup_mac.py` は MTP の `rt` ディレクトリを作り、指定値または `cjk` で `S.refresh_draft_vocab` を呼びます。セットアップ後の起動時も、モデル設定の `draft_vocab`（なければ `cjk`）で同じ更新関数を呼びます。MTP を使わない構成ではセットアップ中の語彙コピーは行われません。
 
-更新 helper は対象ファイルが存在しないか runtime ディレクトリがない場合は何もせず戻ります。既存の `rt/draft_vocab.bin` が Strata 配布 subset（旧 subset を含む）なら選択値と異なる場合に置き換え、同じ subset ならコピーしません。配布物の hash と一致しない手作り subset は保持します。更新後、生成する `strata-*.json` の `draft_vocab` に明示値を記録します。
+更新関数は対応する同梱ファイルがあり、宛先ディレクトリが存在するときだけ処理します。宛先 `draft_vocab.bin` がない場合はコピーし、既存ファイルが同梱済み subset（または旧版の既知 subset）なら選択値に合わせて置き換えます。既存ファイルが独自作成のものと判定された場合は保持します。同じ subset が既にある場合もコピーしません。
 
-既存 Metal config が見つかり、`--setup`、`--model`、`--check`、`--no-start`、`--update`、`--build` のいずれも指定されていないと、setup は既存 config を使って起動し、setup の選択処理を通りません。この早期分岐の条件に `--draft-vocab` は含まれないため、単独指定では既存の subset や config は変更されません。また、Mac のモデル条件により MTP を使わない場合は subset の更新処理自体が実行されません。
+明示値は `strata-<model>.json` の `draft_vocab` に保存されます。既存モデルの通常起動経路は、`--setup`、`--model` などのセットアップ条件がなければ引数処理後すぐ `start()` に進むため、その実行で渡した `--draft-vocab` を新しい設定として保存しません。設定に保存済みの値がある場合は起動時の更新に使われます。
 
 ## 適用条件と副作用
 
-- 対象は `setup.py` から `metal/setup_mac.py` に委譲される macOS の通常 setup（Apple Silicon / Metal）です。`STRATA_CONTROL_INSTALL=1` の Control mode はこの委譲を避けます。
-- setup は選択した配布 subset を runtime ファイルへコピーし、実行設定 JSON を書き換えます。コピー先が手作り subset と判定される場合は上書きしません。
-- Mac setup の parser は `parse_known_args` を使います。認識しない余剰引数は `not used on a Mac: ...` と警告して続行します。このオプションの不正な値は既知引数の `choices` 検証で拒否されます。
-- setup 終了時は、`--no-start` がなければモデルサーバーを起動します。これはこのオプション固有の動作ではありません。
+- 対象は索引上の macOS 用 parser `metal/setup_mac.py` です。`terminal/setup.py` は Mac の場合にこのスクリプトへ引数を委譲します。
+- このオプションが選択するのは同梱 subset の名前です。subset の内容やサイズ自体を編集・生成するものではありません。
+- MTP 用語彙ファイルをコピーまたは置換する場合があります。独自作成と判定された既存ファイルは保持されます。
+- セットアップで明示した値はモデル設定 JSON に永続化され、後の起動時に参照されます。
 
 ## 出力とエラー
 
-配布 subset の置換時には `draft layer: ...` の状態メッセージを出します。配布元ファイルがない場合は helper が何もせず戻るため、この更新処理から専用エラーは出ません。選択肢外の値は argparse の validation で拒否され、setup 本体へ進みません。
+選択肢以外の値は argparse の引数エラーになります。指定語彙の同梱ファイルが見つからない場合、または MTP の宛先ディレクトリがない場合、`refresh_draft_vocab` はコピーせずに戻ります。ソースではこの未配置ケース専用の警告やエラー出力は確認できませんでした。
 
 ## 根拠
 
-- `setup.py:82`, `setup.py:7703-7707`, `setup.py:9062-9069`: Control mode 判定、Mac setup への委譲。
-- `setup.sh:6-12`: 呼び出し元からの引数を `setup.py` へ転送。
-- `metal/setup_mac.py:302-323`: 既存 config の起動処理。MTP があれば保存済み subset（未設定時 `cjk`）で runtime を更新。
-- `metal/setup_mac.py:327-358`: parser、`--draft-vocab` の choices、未知引数の警告。
-- `metal/setup_mac.py:369-371`: 既存 config がある場合の通常起動への早期分岐条件。
-- `metal/setup_mac.py:518-540`: MTP 使用時の runtime ディレクトリ作成と subset 更新。
-- `metal/setup_mac.py:551-560`: 明示値を config に記録し、設定ファイルを書き出す処理。
-- `setup.py:7265-7270`: subset 名と配布ファイルの対応。
-- `setup.py:7534-7553`: コピー条件、配布済み subset の置換、手作り subset の保持、出力。
+- `docs/cli/README.md:1719-1740` — `source-setup` の mac 用コマンド階層と `--draft-vocab` の索引リンク。
+- `engine/metal/setup_mac.py:372-405` — Mac parser の定義、許容値、`parse_known_args`、未知の残余引数の警告。
+- `engine/metal/setup_mac.py:416-418` — 既存設定がある通常起動時に `start()` へ早期 return する条件。
+- `engine/metal/setup_mac.py:567-589` — MTP 利用条件、選択値または `cjk` による語彙更新。
+- `engine/metal/setup_mac.py:593-612` — 明示値をモデル設定 JSON に格納して書き出す処理。
+- `engine/metal/setup_mac.py:311-332` — 起動時に設定値（未設定なら `cjk`）で語彙更新を行う処理。
+- `terminal/setup.py:8627-8638` — subset 名と同梱ファイルの対応、既存設定から値を読む補助関数。
+- `terminal/setup.py:9026-9048` — コピー条件、既知の同梱 subset の置換、独自 subset の保持。
+- `terminal/setup.py:9206-9210` — Terminal setup から Mac 用 `metal/setup_mac.py` への委譲。

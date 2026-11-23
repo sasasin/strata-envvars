@@ -1,46 +1,46 @@
 # `STRATA_DROP_CACHE_ON_EXIT`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-サーバーが engine を終了させた後、起動時に指定されたモデル関連ファイルについて `os.posix_fadvise(..., POSIX_FADV_DONTNEED)` で page cache の破棄を要求する opt-in です。アドバイス呼び出しが例外なく戻ったファイル数を `[strata] STRATA_DROP_CACHE_ON_EXIT: released the page cache of N model files` と標準出力に出します。このログは実際に cache が破棄されたことを検証していません。これはサーバー側の処理であり、engine の環境変数として読み込まれたり、通常の終了時に常に実行されたりするものではありません。
+Strata のサーバープロセスが engine を強制終了する特定の終了経路で、モデルファイルに対して `posix_fadvise(..., POSIX_FADV_DONTNEED)` を要求します。対象はモデルファイルのページキャッシュであり、ファイルの内容を書き換えたり削除したりする処理ではありません。通常の engine 終了時に毎回実行する設定ではありません。読み取りと処理は Python サーバーの `serve.cache_drop` にあり、engine 内部の設定ではありません（`terminal/serve/cache_drop.py:14-16,36-69`）。
 
 ## 値と判定
 
-値は `serve/cache_drop.py` の `enabled()` が呼ばれる時点で `os.environ` から取得されます。文字列の前後空白を除き、小文字化した結果を完全一致で判定します。
+Python サーバーが `os.environ` から値を取得し、前後の空白を `strip()` で除き、`lower()` で小文字化した文字列全体を `"1"`、`"true"`、`"yes"`、`"on"` のいずれかと比較します。数値変換はしません。変数が未設定なら空文字列が使われ、明示的な空文字や空白だけの値も無効です。大文字小文字は区別せず、前後の空白は無視します。その他の文字列は無効です（`terminal/serve/cache_drop.py:14-16`）。
 
-| 値 | 判定（Windows 以外） |
-|---|---|
-| 未設定 | 無効 |
-| 空文字、空白のみ | 無効 |
-| `1`, `true`, `yes`, `on`（大文字小文字不問、前後空白可） | 有効 |
-| その他（例: `0`, `false`, `2`, `onward`） | 無効 |
+| 条件 | 未設定 | 有効になる値の例 | 無効になる値の例 |
+| --- | --- | --- | --- |
+| `os.name != "nt"` | 無効 | `1`, `TRUE`, ` yes `, `on` | 空文字、空白のみ、`0`, `0anything`, `2`, `true0`, `false`, `y` |
+| `os.name == "nt"` | 無効 | なし | すべての値（設定値を比較する前に無効） |
 
-Windows (`os.name == "nt"`) では値にかかわらず無効です。数値変換は行いません。CLI 引数や設定ファイルによる上書きは、この判定にはありません。関数は production 経路では引数 `env` を省略して `os.environ` を使い、値を static cache せず呼び出しごとに判定します。
+CLI 引数や設定ファイルによる上書きはありません。`enabled()` を呼ぶたびにサーバープロセスの環境を参照し、値を static 変数などへ保存しません。したがって、判定時点の `os.environ` の値が使われます（`terminal/serve/cache_drop.py:14-16,57-60`）。
 
 ## 有効になる条件
 
-- `serve/server.py` の終了処理中に、engine の `close()` が KeyboardInterrupt（コード上のコメントでは二度目の Ctrl+C）を受ける。
-- その時点で `engine.proc` が truthy である。server は engine process を `kill()` した後に helper を呼びます。
-- `enabled()` が有効と判定する。Windows では有効化されません。
-- `drop_after_exit()` の確認時に engine がまだ実行中でない。`proc` があり `proc.poll() is None` なら処理せず 0 を返します。kill 後に wait はしないため、poll が終了前を返す競合では cache 処理をせず、成功ログも出ません。
-
-通常に `close()` が完了する終了経路では helper の呼び出しがありません。Linux の engine 側には、resident-memory 安全性チェック失敗時、`/proc/meminfo` の `Cached + Buffers` が 1 GiB 以上ならこの変数を案内する文言がありますが、engine はこの環境変数を読み取らず、その文言はキャッシュ解放処理を実行しません。
+- `strata serve` のサーバー終了処理で、engine の `close()` などを実行中に二度目の Ctrl+C が入り、その `KeyboardInterrupt` を捕捉した経路であること。最初の Ctrl+C は drain と終了処理を開始しますが、通常の `close()` が完了する場合、この変数による処理は呼ばれません（`terminal/serve/server.py:9234-9237,9258-9271`）。
+- その捕捉箇所で `engine.proc` が存在し、サーバーが engine に `kill()` を要求していること。`drop_after_exit()` は有効値かつ engine のプロセスが終了済みの場合にだけ続行し、まだ実行中なら待機・再試行をせず `0` を返します（`terminal/serve/server.py:9264-9270`; `terminal/serve/cache_drop.py:57-63`）。
+- Windows (`os.name == "nt"`) では無効です。POSIX 系 OS でも `os.posix_fadvise` がなければ対象ファイルへの助言は行わず、処理件数 `0` になります（`terminal/serve/cache_drop.py:14-16,36-40`）。
+- CUDA/HIP/SYCL、GPU 世代、モデル形式による値判定の分岐はありません。対象ファイルのパスは engine の起動引数 `--native`、`--pack`、`--mmproj`、`--model` から選びます（`terminal/serve/cache_drop.py:64-68`）。
 
 ## 実行時の詳細
 
-終了処理の close ループで `engine.close()` が KeyboardInterrupt を受けると、server は engine を kill し、`serve.cache_drop.drop_after_exit(engine)` を呼びます。helper は `engine.spawn` の引数列から `--native`, `--pack`, `--mmproj`, `--model` の直後の値をファイル／ディレクトリ候補として集めます。候補がなければ `engine.model_path` を使います。対象が通常ファイルならそのファイル、ディレクトリなら配下を再帰走査した通常ファイルを処理します。存在しないパス、アクセス時の `OSError`、開けないファイルは飛ばします。
+二度目の Ctrl+C を終了処理中に受けると、サーバーは engine に `kill()` を要求してから `drop_after_exit(engine)` を呼びます。変数が有効で engine が終了済みなら、起動時の引数から `--native`、`--pack`、`--mmproj`、`--model` の値をパスとして集めます。いずれも得られない場合は `engine.model_path` を使います。指定パスが通常ファイルならそのファイル、ディレクトリなら再帰的に列挙した通常ファイルが対象です。存在しないパスや列挙時の `OSError` は飛ばします（`terminal/serve/cache_drop.py:19-33,57-68`）。
 
-各ファイルを読み取り専用で開き、利用可能な `os.posix_fadvise` に offset 0、length 0、`POSIX_FADV_DONTNEED`（属性がなければ値 4）を渡します。この API がなければ 0 を返します。アドバイス呼び出しの `OSError` は無視され、呼び出し成功数をログに出します。処理の例外は server 側で捕捉され、`[strata] could not release the model files' cache: ...` と出力されます。server の終了処理を止めないよう例外は再送出されません。
+各ファイルを読み取り専用で開き、ファイル全体（offset と length を `0`）に `POSIX_FADV_DONTNEED` を要求します。ファイルを開けない場合や助言 API が `OSError` を返す場合、そのファイルは成功件数に含めません。これはカーネルへの助言であり、実際にキャッシュから解放された量を Strata が確認する処理はありません（`terminal/serve/cache_drop.py:36-54`）。
+
+この名前は `engine/src/core/expert_source.cpp:216` にもありますが、これは Linux の resident-memory 安全確認が失敗し、ファイルキャッシュとバッファの合計が 1 GiB 以上の場合にエラーへ付加される案内文の一部です。同箇所はこの環境変数を読まず、サーバー側の処理を起動しません（`engine/src/core/expert_source.cpp:208-217,4201-4216`）。
+
+## ログと測定値
+
+有効値で、engine が終了済みとして処理を進めた場合は、助言に成功したファイル数にかかわらず stdout に `[strata] STRATA_DROP_CACHE_ON_EXIT: released the page cache of {n} model files` を出します。設定が無効、Windows、または engine がまだ動いている場合はこのログを出しません。終了処理で helper が例外を送出した場合、サーバーは `[strata] could not release the model files' cache: {e}` を出して終了を続けます（`terminal/serve/cache_drop.py:57-69`; `terminal/serve/server.py:9264-9271`）。この変数による性能測定値はありません。
 
 ## 根拠
 
-- `serve/cache_drop.py:14-16` — OS 条件、未設定時の空文字 fallback、strip/lower 後の許可値との完全一致。
-- `serve/cache_drop.py:19-33,36-54` — モデルファイル列挙、posix_fadvise 呼び出し、ファイルごとの失敗処理。
-- `serve/cache_drop.py:57-70` — engine 生存確認、spawn 引数からのパス抽出、fallback、ログ。
-- `serve/server.py:9560-9574` — 終了時の close ループ、割り込み時の kill と helper 呼び出し、例外ログ。
-- `serve/server.py:1017-1023` — `StrataEngine.spawn` の引数保持と `model_path` の設定。
-- `serve/server.py:2628-2650` — engine の通常終了、terminate/kill 待ちを行う `close()`。この通常完了経路から cache helper は呼ばれません。
-- `src/core/expert_source.cpp:195-205,3655-3678` — Linux のメモリ不足メッセージに出る案内文。ここでは変数を読む処理や cache 解放はありません。
-- `setup.py:253` — リリース履歴の記載のみ。実行時判定の根拠にはしていません。
+- `terminal/serve/cache_drop.py:14-16` — OS 条件、環境値の正規化と許可値。
+- `terminal/serve/cache_drop.py:19-54` — モデルファイル列挙、ファイル単位の助言と件数。
+- `terminal/serve/cache_drop.py:57-69` — engine 終了確認、対象パス選択、ログ。
+- `terminal/serve/server.py:9234-9237,9258-9271` — Ctrl+C を受けたサーバーの終了処理と呼び出し条件。
+- `terminal/serve/server.py:2879-2921` — 通常の engine `close()` が終了を待ち、終了後に process 参照を片付ける処理。
+- `engine/src/core/expert_source.cpp:208-217,4201-4216` — Linux のメモリ安全確認エラーに付く案内文。環境変数の読み取り箇所ではない。

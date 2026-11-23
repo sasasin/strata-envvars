@@ -1,6 +1,6 @@
 # `--show-key`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 調査）。調査対象 checkout は `main`（`origin/main` と同期）で、`git status --short --branch` に未コミット変更はありませんでした。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,49 +8,41 @@
 | コマンド | `strata connect` |
 | オプション | `--show-key` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。既定値は `false` |
+| 値 | 値を取らないフラグ（指定すると有効） |
 
 ## 役割
 
-`strata connect <app>` が人間向け出力に表示するアプリ設定・環境値の API key を、通常のマスク表示から実値に切り替えます。API key を端末やログに露出させるため、必要な場合だけ指定してください。
+指定したアプリ向け接続設定を表示するとき、通常は伏せられる API キーを人間向け出力にそのまま表示します。`strata connect` は、起動中の `strata launch`、指定したプリセット、または引数から接続先情報を組み立て、アプリ用の設定内容と環境変数を表示します。キーの選択は `--key`、`--key-env`、`--preset` などで行い、このフラグは表示方法だけを切り替えます（`terminal/strata_cli/launch/cmd.py:163-182, 1074-1085`）。
 
 ## 使い方
 
 ```sh
+# OpenCode向け設定を表示し、APIキーも表示する
 strata connect opencode --show-key
 ```
 
-この例は OpenCode 用の設定を表示します。`--show-key` を付けない人間向け出力では、設定中の key は `key[:10]` に `••••••••` を続けた形でマスクされます。
-
 ## 値と既定値
 
-値を取らない `store_true` フラグで、指定時は真、未指定時は偽です。回数による追加効果や値の validation はありません（parser は `strata_cli/launch/cmd.py:156-172`）。
+- `argparse` の `store_true` フラグで、値・別名・追加の値検証はありません。省略時は無効です（`terminal/strata_cli/launch/cmd.py:181`）。
+- コマンドはキーを `--key`、指定環境変数の値、選択された起動情報のキー、空文字列の順で選びます。したがって、環境変数が未設定または空なら起動情報のキーへ進みます。キーがない場合、設定生成では `strata-local` というプレースホルダーが使われます（`terminal/strata_cli/launch/cmd.py:1074-1080`, `terminal/strata_cli/launch/harness.py:21, 339-347`）。
+- harness（例: `opencode`）を指定しない呼び出しはアプリ一覧を返して早期終了するため、その場合 `--show-key` はキーを表示しません（`terminal/strata_cli/launch/cmd.py:1055-1065`）。
 
 ## 実行時の動作
 
-`connect` は key を `--key`、`--key-env` が指定する環境変数、選択した実行中 launch / `--preset` の順に採用し、どれも得られなければ空文字にします（`strata_cli/launch/cmd.py:945-950`）。Harness 設定生成時には空 key がプレースホルダー `strata-local` に置き換わります（`strata_cli/launch/harness.py:22,272-280`）。
-
-`--show-key` は人間向け出力時、生成したファイル本文と環境変数をマスクせず表示します。未指定時は `harness.mask()` で key をマスクします（`strata_cli/launch/cmd.py:951-952,978-991`; `strata_cli/launch/harness.py:323-324`）。このオプションは設定ファイルを読み出したり変更したりせず、表示方法だけを切り替えます。
-
-`--output json` と併用した場合、JSON のファイル本文等は常に `harness.mask()` に通されるため、`--show-key` を指定しても key はマスクされたままです（`strata_cli/launch/cmd.py:953-960`）。トップレベルの `--json` も CLI 本体が `output=json` に変換します（`strata_cli/cli.py:2248-2252`）。また、app 名を省略した場合は app 一覧を返す早期分岐となり、key を表示する処理には進みません（`strata_cli/launch/cmd.py:925-937`）。
+- 人間向け出力（既定の `--output human`）では、フラグなしの場合、生成したファイル内容と環境変数に含まれる実キーをマスクし、キーが含まれているときは `--show-key` を追加する案内を出します。マスクはキー文字列全体を「先頭10文字＋8個の伏字」に置換します（`terminal/strata_cli/launch/cmd.py:1123-1136`, `terminal/strata_cli/launch/harness.py:432-433`）。フラグを付けると、ファイル内容と環境変数の値に実キーを含めて表示します（`terminal/strata_cli/launch/cmd.py:1081, 1123-1133`）。
+- `--output json` では、`--show-key` の有無にかかわらず、JSON内の生成設定文字列を実キーでマスクします。したがって、このフラグはJSON出力の秘匿状態を解除しません（`terminal/strata_cli/launch/cmd.py:1082-1086`）。
+- `--write` と併用した場合、フラグの有無にかかわらず生成設定の内容が書き込まれます。人間向け出力では書き込み処理より前に設定内容を表示するため、`--show-key --write` はファイルへの保存に加えて標準出力にも実キーを出します。実行前確認、既存ファイルのバックアップ、`--dry-run` 等の書き込み規則は `--show-key` では変わりません（`terminal/strata_cli/launch/cmd.py:1123-1127, 1156-1167, 1019-1050`; `terminal/strata_cli/launch/harness.py:343-347, 355-399`）。
 
 ## 適用条件と副作用
 
-`--show-key` は `harness` 名を指定した `strata connect` に適用されます。`--write` と併用してもファイル書き込み自体の内容はこのフラグで切り替わりません。書き込みではマスク前の生成結果を使うため、key は設定ファイルに書かれます。既存ファイルはバックアップされ、JSON merge 対象では既存キーを保持しつつ新しい値で更新します（`strata_cli/launch/cmd.py:1011-1028`; `strata_cli/launch/harness.py:276-280,288-311`）。
-
-このフラグ自体はファイル・ネットワーク・プロセスに副作用を起こしません。`--check` と併用する場合は、別途 server へ prompt と tool call を送信しますが、これは `--check` の動作です（`strata_cli/launch/cmd.py:961-977,1002-1010`）。
-
-## 出力とエラー
-
-人間向け出力では key を含む設定値が stdout に現れるため、端末記録やリダイレクト先にも残り得ます。`--output json` ではフラグの有無にかかわらずマスク済み設定を出力します。`--show-key` 固有の validation error や終了コード変更はありません。app 名が登録済み harness に一致しない場合は stderr にエラーを出して終了コード 2 になります（`strata_cli/launch/cmd.py:938-944`）。
+- 対象アプリ名が解決できた場合の人間向け接続設定表示に作用します。キーを実表示すると、端末の画面・標準出力の保存先などから秘密情報が見える状態になります。安全な保管先か確認してから実行してください。
+- `--check` を併用すると、設定表示の後にサーバーへプロンプトとツール呼び出しを送ります。人間向け経路では接続チェックが失敗しても、それより前に表示された実キーは取り消されません（`terminal/strata_cli/launch/cmd.py:1123-1155`）。
+- harness 名が無効なら候補付きエラーを標準エラーへ出し、終了コード `2` で終了します。未知オプションも parser 後の検査で標準エラーに案内を出して終了コード `2` になります（`terminal/strata_cli/launch/cmd.py:1067-1073`, `terminal/strata_cli/cli.py:2327-2334`）。
 
 ## 根拠
 
-- parser とフラグ定義: `strata_cli/launch/cmd.py:156-173`
-- 適用する key の選択と human/JSON 出力: `strata_cli/launch/cmd.py:923-960,978-991`
-- JSON 出力の mask および key 表示以外の `--check` / `--write` 経路: `strata_cli/launch/cmd.py:961-977,1002-1028`
-- harness 用 key、render、mask、ファイル書き込み: `strata_cli/launch/harness.py:22,272-324`
-- root parser 登録と `connect` の dispatch: `strata_cli/cli.py:488-490,2153-2155`
-- 索引のコマンド階層と予定リンク: `docs/cli/README.md:991-1006`
-
-同一 revision の CLI `--help` は補助実行していません。parser と処理経路をソースで確認しました。
+- `terminal/strata_cli/launch/cmd.py:163-183` — `connect` parser と `--show-key` の宣言。
+- `terminal/strata_cli/launch/cmd.py:1052-1085` — harness 解決、キー・接続情報の選択、出力形式別のマスキング。
+- `terminal/strata_cli/launch/cmd.py:1120-1168` — 人間向けのキー表示、チェック、書き込みの順序と失敗時の終了コード。
+- `terminal/strata_cli/launch/harness.py:21, 339-347, 355-399, 432-433` — キープレースホルダー、設定生成、ファイル書き込みとマスク処理。
+- `terminal/strata_cli/cli.py:2327-2334` — parser が認識しないオプションのエラー経路。

@@ -1,41 +1,39 @@
 # `CMAKE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。Strata リポジトリの調査開始時の状態は `## main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata 本体や実行時機能を制御する変数ではありません。Strata 同梱の build script 2 本が、起動時に CMake 実行ファイルのパス／コマンド名を選ぶために読みます。
-
-- `spark/build_engine.sh` は DGX Spark 向け CUDA engine の configure と build に使うコマンドを選びます。
-- `packaging/mac/build_dsv41_engine.sh` は macOS 向け DeepSeek-V4.1 Metal engine の configure に使うコマンドを選びます。
+`CMAKE` は Strata の実行エンジンではなく、同梱のビルド・パッケージ用シェルスクリプトが起動する CMake 実行ファイルを指定する。DGX Spark 向け `engine/spark/build_engine.sh` では configure、ビルドツリー内のターゲット判定、ビルドに使い、Apple Silicon 向け `tools/packaging/mac/build_engine.sh` では Metal エンジンの configure に使う。したがって通常の Strata 実行や生成内容を直接制御する環境変数ではない（`engine/spark/build_engine.sh:25,51-65`; `tools/packaging/mac/build_engine.sh:42,60-66`）。
 
 ## 値と判定
 
-どちらも POSIX shell の `${CMAKE:-既定値}` を使います。この形式では `CMAKE` が未設定、または空文字なら既定値になり、空でない値ならその文字列が使われます。数値や真偽値への変換、文字列検証、範囲制限はありません。選ばれた文字列は引用符付きでコマンド位置に展開されるため、空白を含むパスも一つのコマンド名として扱われます。
+両スクリプトとも POSIX/Bash の `${CMAKE:-既定値}` 展開を使う。未設定または空文字なら既定値、空でない値ならその値を採用する。文字列の検証、真偽値・数値変換、空白除去、実行ファイル探索（明示値について）は行わない。採用した値全体を引用符付きでコマンド位置に置くため、値は実行ファイル名またはパスとして扱われ、追加引数を含む文字列にはならない（`engine/spark/build_engine.sh:25`; `tools/packaging/mac/build_engine.sh:42,64`）。
 
-| 読み取り箇所 | 未設定または空文字 | 非空の値 |
-|---|---|---|
-| `spark/build_engine.sh` | `cmake` | 指定されたコマンド名／パス |
-| `packaging/mac/build_dsv41_engine.sh` | `command -v cmake` の結果。見つからなければ `$HOME/strata-mac/tools/bin/cmake` | 指定されたコマンド名／パス |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| Spark スクリプト | `cmake` | `cmake`、`/opt/cmake/bin/cmake` | 書式上の無効値判定はない。存在しないパスや実行できないファイルは起動時に失敗する |
+| Mac パッケージスクリプト | `command -v cmake` が成功すればその出力、失敗すれば `$HOME/strata-mac/tools/bin/cmake` | `cmake`、`/opt/cmake/bin/cmake` | 書式上の無効値判定はない。存在しないパスや実行できないファイルは起動時に失敗する |
 
-CLI オプションによる `CMAKE` の上書きはありません。両スクリプトにある `--build` 等の引数は別の build/output directory 等を選びます。
+いずれも `CMAKE=''` は unset と同じ既定値になります。`0`、`1`、`true`、`false`、`0anything` も、文字列としてそのまま実行ファイル名と解釈されます。大文字小文字の正規化や値の部分比較はありません（同上）。
 
 ## 有効になる条件
 
-この値を読むのは上記スクリプトを実行した場合だけです。Strata engine の通常起動、CUDA/HIP/SYCL backend の実行、サーバーモードでは参照されません。
-
-Spark script は起動時に値を `cmake` shell 変数へ代入し、その後同じ値で configure と build を呼びます。プラットフォーム検査や CUDA toolkit 検査などが先に失敗した場合、CMake 呼び出しには到達しません。macOS script は値を `CMAKE` shell 変数に代入し、`strata_ds4` 実行ファイルが存在しない場合の configure に使います。既に実行ファイルがある場合はこのコマンドで configure しませんが、後続の Ninja build は実行します。
+- Spark 用は `Linux-aarch64` または `Linux-arm64` であり、CUDA Toolkit の検出結果が許可された 13.x 経路に進む必要がある。その他の OS/CPU は `build_engine.sh:31` で終了し、CUDA バージョン不一致等は `build_engine.sh:44` で終了する。これらを通過した後に configure と build を実行する（`engine/spark/build_engine.sh:29-46,51-65`）。
+- Mac 用は `--version` が指定されている必要があり、`--stages`（既定値 `engine vision pkg`）に `engine` が含まれる場合にだけ `CMAKE` を起動する。`--stages` から `engine` を外せば CMAKE は設定されても実行されない（`tools/packaging/mac/build_engine.sh:29-42,60-68`）。
+- CLI に CMake 実行ファイルを指定する引数はない。両スクリプトで非空の `CMAKE` が各スクリプトの既定値より優先される。Mac スクリプトでは `NINJA` は別に解決され、configure 後のビルド自体は `$NINJA` を起動する（`tools/packaging/mac/build_engine.sh:42-44,64-66`）。
+- Spark スクリプトは `CMAKE` を `engine_targets` に引数として渡し、その helper も同じ実行ファイルで `strata_kq` ターゲットの dry-run 判定を行う（`engine/spark/build_engine.sh:62-65`; `tools/packaging/engine_targets.sh:3-4,10-19`）。
 
 ## 実行時の詳細
 
-Spark では `"$cmake"` を使って `cmake -G Ninja ...` configure を行い、続けて `cmake --build ...` を実行します。configure/build が失敗すると `set -e` により script は失敗終了します（`spark/build_engine.sh:16,59-68`）。
+値は各スクリプトの開始処理でシェル変数へ一度展開される（Spark は `engine/spark/build_engine.sh:25`、Mac は引数処理後の `tools/packaging/mac/build_engine.sh:42`）。関数内 cache や後続の再読み込みはないため、スクリプト実行中にプロセス環境を変更しても再評価されない。CMake への引数は Spark では `-G Ninja -S engine -B "$build"` とビルド設定、Mac では `-S engine/metal -B "$BUILD" -G Ninja` 等である。Spark は同じ値で configure 後にターゲット検査と `--build` を行い、Mac は configure 後に `NINJA` でビルドする（`engine/spark/build_engine.sh:51-65`; `tools/packaging/mac/build_engine.sh:64-66`）。
 
-macOS では `"$CMAKE"` を使って Metal 用 CMake configure を行います。configure が失敗した場合は `|| exit 1` で終了します（`packaging/mac/build_dsv41_engine.sh:19,41-47`）。両方とも選択値を再評価する cache はなく、代入はスクリプト実行ごとに一度です。設定された `CMAKE` の値そのものについて Strata 独自のログや警告はありません。実行ファイルが見つからない等の失敗は shell のコマンド実行失敗となり、Spark では `set -e`、macOS では configure 行の `exit 1` により後続処理へ進みません。
+## ログと測定値
+
+`CMAKE` 固有の値確認ログや警告はない。実行ファイルが起動できない、または CMake が非ゼロで終了した場合、Spark 側は `set -eu` によりその場で終了する。Mac 側では configure の標準出力・標準エラーを `$WORK/metal-cfg.log` に記録し、失敗時に末尾 30 行を表示して終了コード 1 で終わる。Spark の `engine_targets` 判定で既知の `strata_kq` 不在以外の probe エラーが起きると、probe 出力と `engine_targets.sh: cannot tell whether the build tree ... has the strata_kq target` を標準エラーに出して失敗する（`engine/spark/build_engine.sh:17,51-65`; `tools/packaging/mac/build_engine.sh:64-66`; `tools/packaging/engine_targets.sh:11-19`）。CMAKE の変更による性能測定値は該当しない。
 
 ## 根拠
 
-- `spark/build_engine.sh:16-24,27-43,59-74` — strict shell 設定、`CMAKE` の既定値、プラットフォーム／toolkit 条件、CMake を用いた configure/build。
-- `packaging/mac/build_dsv41_engine.sh:19-20,34-47` — `CMAKE` の既定値選択と、実行ファイルがない場合だけ行う configure。
-- 呼び出し経路の記載: `docs/DGX_SPARK_LINUX.md:37,59` は Spark setup/build で `spark/build_engine.sh` を使うことを説明し、`docs/DEEPSEEK_MAC.md:88` は macOS engine packaging script を案内しています。
-
-候補一覧 `docs/envvars/000_envvers.md` に名前がありますが、確認できた参照はこの2つの shell build script に限られます。engine/runtime の環境変数ではありません。
+- `engine/spark/build_engine.sh:17-25,29-46,48-65`
+- `tools/packaging/mac/build_engine.sh:23-44,56-68`
+- `tools/packaging/engine_targets.sh:1-19`

@@ -1,39 +1,42 @@
 # `STRATA_DESKTOP_TEST_PANIC`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata Desktop の起動時失敗処理（panic hook、ログ、クラッシュ記録、エラーダイアログ）を、正常に起動する環境でも意図的な panic で確認するためのテスト用スイッチです。値に応じた通常機能の設定ではなく、設定されているとアプリ起動を中断します。候補一覧の名前どおり、Strata が実際に環境から読み取る変数です。
+Windows/macOS の Strata Desktop で、Tauri の setup 中に意図的な panic を起こす診断用フック。setup エラー時に panic hook が失敗を記録する仕組みを、正常に起動する環境で確認する用途として置かれている。アプリ本体やエンジンの計算設定を変えるものではない。チェックは `run_embedded()` の Tauri `.setup()` callback 内にあるため、通常の Windows/macOS デスクトップ起動経路でのみ評価される（`app/desktop/src-tauri/src/main.rs:947-949,977-981`）。
 
 ## 値と判定
 
-`std::env::var_os(...).is_some()` で設定の有無だけを判定し、値の文字列化・parse・比較はしません（`apps/desktop/src-tauri/src/main.rs:897-901`）。
+`std::env::var_os(...).is_some()` により、値の文字列や Unicode 変換をせず、変数が存在するかだけを見る。未設定なら何もしない。空文字を含む設定済みの値はすべて同じ扱いで panic し、`1`、`0`、`false`、任意文字列でも区別されない（`app/desktop/src-tauri/src/main.rs:979-980`）。
 
-| 状態 | 判定と結果 |
-|---|---|
-| 未設定 | 条件は false。意図的な panic は起きず、通常の setup 処理へ進む |
-| 設定あり | 条件は true。空文字や `0` を含め、値の内容によらず意図的に panic する |
-
-値は Tauri の setup callback が実行される時点で読み取られます。static cache はなく、環境変数を読むのはこの箇所だけです。起動後に値を変えても、既に発生した判定には影響しません。CLI 引数や他の環境変数による値の上書き・優先順位はありません。
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| Windows/macOS の通常の Desktop 起動で `.setup()` に到達 | panic しない | 空文字を含む、存在するすべての値 | なし（値内容を検査しない） |
+| Linux Desktop | この名前の読み取りコードがなく、効果なし | 該当なし | 該当なし |
+| `--self-test[=path]` を指定した起動 | self-test に進む | このチェックには到達しない | 該当なし |
 
 ## 有効になる条件
 
-- `run_embedded()` が呼ばれる非 Linux の Desktop 起動経路で有効です。同関数は `#[cfg(not(target_os = "linux"))]` で定義され、`main()` の同じ条件の分岐から呼ばれます（`apps/desktop/src-tauri/src/main.rs:875-881`）。実際の対象は Windows/macOS の通常の組み込みアプリ起動です。
-- Linux では `main()` が Linux supervisor / window-process 経路へ進み、非 Linux 専用の `run_embedded()` およびこの判定は使われません（`apps/desktop/src-tauri/src/main.rs:865-876`）。
-- `--self-test` または `--self-test=<path>` が指定されると、`main()` は `run_self_test()` の後にプロセスを終了するため、`run_embedded()` の setup に到達せず、この変数による panic は起きません（`apps/desktop/src-tauri/src/main.rs:607-623,860-863`）。
-- ビルド設定用の専用 macro や feature gate はこの判定にありません。値が設定されていても、上記の実行経路を通らない場合は作用しません。
+- ビルド対象が Linux 以外であること。`run_embedded()` とその setup callback は `#[cfg(not(target_os = "linux"))]` 側にあり、Linux は supervisor/window-process 経路へ進む（`app/desktop/src-tauri/src/main.rs:929-944,947-949`）。
+- `--self-test[=path]` でないこと。self-test は `run_embedded()` より前に処理され、結果コードで終了する（`app/desktop/src-tauri/src/main.rs:924-926,943-944`）。
+- Tauri setup callback まで起動が進むこと。変数が設定されていると callback 内で panic するため、`start_host()` と `open_window()` は呼ばれない（`app/desktop/src-tauri/src/main.rs:977-995`）。
+- debug/release の値判定に分岐はない。release profile は `panic = "abort"`（`app/desktop/src-tauri/Cargo.toml:37-42`）。
+- `STRATA_NO_DIALOG` が存在する場合（空文字を含む）は `desktoplog` の起動時設定でダイアログが無効になる。panic 自体は抑止されず、失敗記録の経路は実行される（`app/desktop/src-tauri/src/desktoplog.rs:363-370,484-488`）。
 
 ## 実行時の詳細
 
-通常の非 Linux 起動では `main()` が先に `desktoplog::init_startup(...)` を呼び、run log を開いて panic hook を登録します。その後 `run_embedded()` が Tauri アプリを構築し、setup callback の先頭で環境変数を確認します。設定ありなら `panic!("STRATA_DESKTOP_TEST_PANIC is set: the app panics on purpose")` が実行され、App Host の起動処理より前に失敗します。従ってこの経路では、環境変数を子プロセスへ渡す処理はなく、App Host も起動されません（`apps/desktop/src-tauri/src/main.rs:849-851,879-905`）。
+main は Windows/macOS で `run_embedded()` に入る前に `desktoplog::init_startup(...)` を呼び、run log と panic hook を初期化する。`--self-test` の場合はその前に別経路へ進む（`app/desktop/src-tauri/src/main.rs:909-926,943-949`; `app/desktop/src-tauri/src/desktoplog.rs:363-371`）。環境変数は `.setup()` callback が走った時点でその都度読み取られ、値を保持する cache はない。設定済みなら文字列 `STRATA_DESKTOP_TEST_PANIC is set: the app panics on purpose` で panic し、callback 内の後続の host 起動・window 作成には進まない（`app/desktop/src-tauri/src/main.rs:977-995`）。
 
-panic hook は panic の本文と発生位置を `the app stopped unexpectedly: ...` の形式にして `report_failure()` へ渡します。そこでは run log に `START FAILED: ...` を記録し、起動失敗ファイルの作成を試みます。通常起動ではダイアログも表示します（`apps/desktop/src-tauri/src/desktoplog.rs:363-371,472-488,499-513`）。macOS では `show_error()` が stderr に `[strata] ...` を出し、Windows ではエラーダイアログを表示します（同 `desktoplog.rs:452-470`）。release profile は `panic = "abort"` であり、hook の処理後に panic によってプロセスが中断されます（`apps/desktop/src-tauri/Cargo.toml:27-31`）。終了コードはこの変数の分岐では明示的に設定されていません。
+panic hook は元の hook を呼んでから panic payload と場所・thread 名を取り出し、`report_failure` に渡す。run log に `START FAILED: the app stopped unexpectedly: ...` を記録し、起動失敗ファイルを書き、保存先をログにも記録する。ダイアログが有効なら `Strata could not start.` で始まるエラー表示を行う（`app/desktop/src-tauri/src/desktoplog.rs:472-488,497-513`）。release build は `panic = "abort"` であり、hook の処理後に abort する（`app/desktop/src-tauri/Cargo.toml:37-42`）。debug build の panic 後の最終的な終了方法は、この環境変数の読み取り箇所だけからは特定しない。
+
+## ログと測定値
+
+測定値は該当しない。panic hook が run log に書く失敗行の形式は `START FAILED: the app stopped unexpectedly: {message} (at {file}:{line}, thread {thread})`。設定値による通常ログや値の表示はなく、panic 時には crash file の保存先を `The crash file is {path}` と記録する（`app/desktop/src-tauri/src/desktoplog.rs:478-488,503-513`）。Strata の `docs/DETAILS.md` を含む文書群には、この変数の追加動作を説明する該当記述は見つからなかった。
 
 ## 根拠
 
-- 候補一覧: `docs/envvars/000_envvers.md:691`。
-- 唯一の完全一致参照と値判定、panic 本文: `apps/desktop/src-tauri/src/main.rs:897-901`。
-- 起動時の分岐、self-test の先行終了、OS 条件: `apps/desktop/src-tauri/src/main.rs:849-876`、`apps/desktop/src-tauri/src/main.rs:607-623`。
-- run log・panic hook・失敗記録: `apps/desktop/src-tauri/src/desktoplog.rs:363-371,472-488,499-513`。
-- release の panic 設定: `apps/desktop/src-tauri/Cargo.toml:27-31`。
+- `app/desktop/src-tauri/src/main.rs:901-945` — main の起動順、self-test と Linux の分岐。
+- `app/desktop/src-tauri/src/main.rs:947-995` — 非 Linux の埋め込み起動、設定有無判定、panic の位置とその後に続く処理。
+- `app/desktop/src-tauri/src/desktoplog.rs:363-371,472-513` — 起動ログ・panic hook・失敗記録・ダイアログ。
+- `app/desktop/src-tauri/Cargo.toml:37-42` — release の panic 設定。

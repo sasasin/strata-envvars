@@ -1,51 +1,61 @@
 # `STRATA_HIP_PROMPT_F16`
 
-調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（2026-11-17 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-HIP の prefill で、BF16 重みを使う 16-bit GEMM の入出力を FP16 にするかを選ぶ。対象 stage の活性値イメージを BF16 から FP16 にし、GEMM の結果も FP16 で書いて同じ出力行内で FP32 に widen する。通常経路と bit-identical ではなく、decode の GEMM 設定を変えるスイッチではない。HIP 以外では有効にならない。`src/prefill/gemm.cu` の `prompt_f16()` が選択し、`src/prefill/prefill.cpp` の stage 初期化がその値を `Gemm` と活性値 writer に渡す（`src/prefill/gemm.cu:605-635`, `src/prefill/prefill.cpp:2613-2618`, `src/prefill/kernels.cu:84-90,2843-2853`）。
+HIP の prompt prefill における 16-bit GEMM の I/O を FP16 に切り替える。対象 stage の活性値画像を BF16 ではなく FP16 で書き、対応する 16-bit GEMM を FP16 入力・FP16 出力で実行する。出力は結果バッファ内で FP32 に widen される。従って prompt 計算の丸め結果は既定経路と bit-identical ではない。設定は `engine/src/prefill/gemm.cu` の `prompt_f16()` が決め、`Prefill::init` が GEMM と活性値カーネルへ反映する（`engine/src/prefill/gemm.cu:681-713`、`engine/src/prefill/prefill.cpp:2724-2731`、`engine/src/prefill/gemm.cu:1169-1180,1318-1320,1460-1474`）。
+
+これは prompt 側の選択で、decode 全般を切り替える設定ではない。GEMM がこの経路を使うのは HIP コンパイル時であり、`beta == 0` の `f16` GEMM、およびこのモード用に FP16 化した BF16 GEMM。FP16 出力は FP32 に widen される。活性値の FP16 化も行うため、単に計算ライブラリを選ぶだけの設定ではない（`engine/src/prefill/gemm.cu:1169-1180,1303-1320,1460-1474`、`engine/src/prefill/kernels.cu:88-95,2901-2911`）。
 
 ## 値と判定
 
-| 条件 | unset | 有効になる値 | 無効になる値 |
-|---|---|---|---|
-| 通常の HIP 実装 (`src/prefill/gemm.cu`) | gfx1103 の統合 Radeon 780M、Linux のみ on。それ以外 off | 最初の文字が `1`。例: `1`, `10`, `1anything` | 設定済みで最初の文字が `1` 以外。例: 空文字、`0`, `true`, ` 1`, `2`, `0anything` |
-| `sycl/src/prefill/gemm.dp.cpp` の HIP compile path | off | 最初の文字が `1`。例: `1`, `10`, `1anything` | unset または最初の文字が `1` 以外 |
-| CUDA / Metal など HIP 以外 | off（この変数を読む有効経路なし） | なし | すべて |
+HIP 実装は `std::getenv` で文字列を得て、値が設定されていれば全体を parse せず先頭文字だけを `'1'` と比較する。未設定時だけ GPU の既定ルールを使う。空文字は設定済みで先頭文字が `'1'` ではないため off。大文字小文字、空白、数値としての妥当性は検証しない。先頭が `'1'` なら残りの文字にかかわらず on（例: `1`, `10`, `1anything`）、それ以外は off（例: `0`, `0anything`, `true`, `True`, ` 1`, 空文字）。範囲や境界値の数値変換はない（`engine/src/prefill/gemm.cu:691-699`、判定 helper: `engine/include/strata/core/arch_defaults.hpp:85-90`）。
 
-両 HIP 実装とも `getenv` の戻り値を確認し、値全体を parse せず `e[0] == '1'` で判定する。したがって空文字は「設定あり・off」、空白や大文字小文字を含む `true` は off、後続文字は無視される。数値範囲・符号の検査や無効値警告はない。通常の HIP 実装は `prompt_f16_resolve()` に渡し、unset の場合だけ device arch・統合 GPU 判定・Windows 判定で既定値を決める（`src/prefill/gemm.cu:615-623`, `include/strata/core/arch_defaults.hpp:79-85`）。SYCL ツリー側は unset で false とする（`sycl/src/prefill/gemm.dp.cpp:359-380`）。
+| HIP 実装での条件 | unset | 有効になる値の例 | 無効になる値の例 |
+| --- | --- | --- | --- |
+| 統合 GPU と判定された gfx1103、Linux | on | `1`, `1x` | 空文字、`0`, `true` |
+| discrete gfx1030 / gfx1031 / gfx1032（Linux または Windows） | on | `1`, `1x` | 空文字、`0`, `true` |
+| それ以外（gfx11/gfx12、統合 gfx103x を含む） | off | `1`, `1x` | 空文字、`0`, `true` |
+
+明示値はデバイス既定値に優先する。従って `=0` は既定 on のデバイスでも off にし、先頭が `1` の値は既定 off のデバイスでも on にする。統合 GPU の gfx1103 既定 on は Linux のみだが、discrete gfx1030/31/32 の既定 on は両 OS である。機種判定は `hipGetDeviceProperties` の architecture 名と integrated フラグに基づく（`engine/src/prefill/gemm.cu:693-705`、`engine/include/strata/core/arch_defaults.hpp:85-90`）。
+
+SYCL コピー `engine/sycl/src/prefill/gemm.dp.cpp:360-384` にも同名の `getenv` があるが、判定全体が `#if defined(__HIPCC__)` 内にある。SYCL は独立プロジェクトとして `icpx` で構成されるため（`engine/sycl/CMakeLists.txt:1-10,21,303-308`）、通常の SYCL ビルドではこの関数は `false` を返し、変数を読み取らない。HIP の値規則を SYCL の動作として扱わない。
 
 ## 有効になる条件
 
-- HIP compiler 経路であること。通常の `src/prefill/gemm.cu` と `src/prefill/kernels.cu` は `__HIPCC__` 条件でこの処理を行い、CUDA では FP16 活性値 writer は no-op、`prompt_f16()` は false を返す（`src/prefill/gemm.cu:605-635`, `src/prefill/kernels.cu:84-90,2843-2853`）。
-- 明示値が unset の場合、通常 HIP 実装では device 情報が Radeon 780M の gfx1103、統合 GPU、Linux と判定されること。この条件以外のカードや Windows は既定 off。HIP device / properties の取得に失敗した場合も false 側になる（`src/prefill/gemm.cu:610-623`, `include/strata/core/arch_defaults.hpp:82-85`）。
-- 値が `1` で始まる場合は通常 HIP 実装ではカードや OS を問わず on。SYCL ツリーの HIP compile path も `__HIPCC__` のときだけ判定し、カード情報による既定 on は持たない（`src/prefill/gemm.cu:605-623`, `sycl/src/prefill/gemm.dp.cpp:359-380`）。
-- Prompt stage の初期化で決まる。通常 HIP 実装は stage の device を current にしてから値を確認する（`src/prefill/prefill.cpp:2613-2618`）。同じ値は必要バッファ量の計算でも参照される（`src/prefill/prefill.cpp:3563-3576`）。
-- `STRATA_PREFILL_BF16X2` の BF16 low-part GEMM は `f16_io` が on のとき無効扱いになる。`STRATA_XN_F16` は `!f16_io` のときだけ `xn_f16` に影響するため、この FP16 経路を上書きしない（`src/prefill/prefill.cpp:842-849,2616-2624`）。
+- HIP コンパイルであること。`prompt_f16()` は `__HIPCC__` がないビルドでは `false` を返す。CUDA の活性値画像も常に BF16 で、この変数を読み取らない（`engine/src/prefill/gemm.cu:681-713`、`engine/src/prefill/kernels.cu:88-95,2901-2911`）。
+- prefill stage の初期化が対象デバイス上で行われること。stage ごとに `prompt_f16()` の結果を `Gemm::set_f16_io` と `set_act_f16` に設定する（`engine/src/prefill/prefill.cpp:2724-2731`）。
+- GEMM ごとに専用の早期 return 経路が成立した場合、その GEMM は `f16_io_` 分岐まで進まない。HIP の `STRATA_PF_GEMM` が有効で閾値以上かつ専用 GEMM が成功した場合、または `STRATA_WMMA_GEMM` が有効で `T >= 16` かつ beta 条件を満たして専用 GEMM が成功した場合は先に return する（`engine/src/prefill/gemm.cu:1307-1320`）。
+- `f16` GEMM の FP16 in-place 分岐は `beta == 0` の場合だけ。`beta != 0` では通常分岐へ進む（`engine/src/prefill/gemm.cu:1303-1320`）。FP16 prompt mode の BF16 GEMM は beta が 0 でない場合にエラー終了する（`engine/src/prefill/gemm.cu:1169-1174`）。
+- 無効なデバイス番号、または `hipGetDevice` 失敗時は off を返し、HIP の last error を取得して消費する。デバイス属性取得に失敗すると architecture 名を空、integrated を false として既定値判定するが、明示的な環境値はその判定に優先する（`engine/src/prefill/gemm.cu:684-699`）。
 
 ## 実行時の詳細
 
-通常 HIP 実装は `prompt_f16()` 内に device ごとの `static std::atomic<int8_t>` cache を持つ。最初の問い合わせで環境変数と device 情報から決めた on/off を格納し、以降その device では cache を返すため、プロセス実行中に環境値を変えても再評価されない。device index が 0–63 外、または `hipGetDevice` が失敗した場合は off を返す。`hipGetDeviceProperties` の失敗も arch 名と統合属性を空/false にして既定判定を off にする（`src/prefill/gemm.cu:605-635`）。SYCL ツリーの HIP compile path も同様に device ごとに cache する（`sycl/src/prefill/gemm.dp.cpp:359-384`）。
+`prompt_f16()` は現在デバイス番号を取得し、64 要素の static cache をデバイス番号単位で確認する。未 cache のデバイスで `getenv` と GPU 属性取得を行い、on/off を保存する。したがって同じプロセス内で環境を後から変更しても、そのデバイスでは判定済みの値が使われ続ける。複数 GPU の layer split では各 stage が動作するデバイスごとに判定・cache する（`engine/src/prefill/gemm.cu:681-709`、`engine/src/prefill/prefill.cpp:2724-2729`）。
 
-stage 初期化は `prompt_f16()` の結果を `m.f16_io` と `Gemm::set_f16_io()` に保存し、`set_act_f16()` で HIP device symbol `g_act_f16` を設定する。設定に失敗すると `prefill: setting the FP16 activation image failed: ...` を stderr に出して終了コード 1 で終了する（`src/prefill/prefill.cpp:2613-2618`, `src/prefill/kernels.cu:84-90,2843-2853`）。
+有効時は prefill の活性値カーネルが FP16 画像を書き、GEMM の BF16 重みを FP16 に変換してから FP16 in/out の GEMM を実行する。出力先の FP32 行へ FP16 結果を widen する。`STRATA_DBG_NAN` が設定されていると widen 後の非有限出力を数え、各 GEMM で stream を同期し、件数が非ゼロならログを出してカウンタをリセットする（`engine/src/prefill/kernels.cu:88-95`、`engine/src/prefill/gemm.cu:1169-1180,1460-1482`）。
 
-on のとき活性値 writer の `act16()` は FP32 値を飽和付き FP16 に変換し、16-bit GEMM は `f16_io_` かつ `beta == 0` の呼び出しで FP16 入出力 GEMM に分岐する。BF16 重みは scratch に FP16 変換してから実行し、出力は FP16 で書いた後 widen する。通常の FP16 GEMM では rocBLAS の形状別 solution が使えればそれを使い、そうでなければ HIP GEMM に fallback する（`src/prefill/kernels.cu:84-90`, `src/prefill/gemm.cu:1081-1093,1209-1218,1351-1363`）。この経路の FP16 丸めにより prompt の中間値・結果は既定経路と bit-identical ではない（`src/prefill/gemm.cu:612-615,624-626`）。
-
-FP16 経路で BF16 の low-part 累積 GEMM（`beta != 0`）に入ると `prefill gemm: an accumulating BF16 GEMM on the FP16 prompt path` を stderr に出して `exit(1)` する。FP16 GEMM scratch が不足する場合は `prefill gemm: scratch too small for K=...` を出して `exit(1)` する（`src/prefill/gemm.cu:1081-1087`）。
+無効値を受けた場合の警告や CLI による上書きはない。環境値は GPU 既定値より優先する。FP16 activation symbol の設定に失敗すると `prefill: setting the FP16 activation image failed: %s` を stderr に出して `exit(1)`。FP16 prompt 経路で累積 BF16 GEMM が呼ばれた場合や scratch が不足する場合も、それぞれエラーを stderr に出して `exit(1)` する（`engine/src/prefill/kernels.cu:2901-2910`、`engine/src/prefill/gemm.cu:1169-1175`）。
 
 ## ログと測定値
 
-- 明示値が有効で on の場合、通常 HIP 実装は device ごとに `strata prefill: HIP device <n> <arch> - STRATA_HIP_PROMPT_F16=1: the prompt's 16-bit GEMMs run FP16 in and out (rocBLAS is tuned only for that on gfx103x; not bit-identical to the default)` を stderr に出す。`STRATA_HIP_PROMPT_F16` が unset で gfx103x の場合は、約 2 倍速いという tip を stderr に出す。既定値のまま on になる gfx1103 は後者の gfx103x tip の対象ではない（`src/prefill/gemm.cu:624-630`）。
-- Strata の `docs/AMD_HIP.md:506-513` は gfx1030 の rocBLAS が FP16-in/FP16-out GEMM 向けに tuned kernels を持つと記し、gfx1030/103x の経路選択の説明をしている。同資料は Radeon 780M (gfx1103), Q2_0 の prompt で 300 / 1,000 / 2,048 / 8,192 tokens に対して x1.11 / x1.15 / x1.19 / x1.25 を記載し、Radeon AI PRO R9700 (gfx1201) の dense GEMM は x0.70–x0.72 と記載する。これらは資料中の測定結果であり、今回再測定していない。
-- `STRATA_DBG_NAN` が設定されている場合、FP16 GEMM 後に非有限値があれば `strata prefill: STRATA_DBG_NAN: ... non-finite FP16 GEMM outputs (...; FP16 ends at 65504)` を stderr に出す。ただしこれは別の診断変数であり、この変数自体はその検査を有効にしない（`src/prefill/gemm.cu:1364-1373`）。
+HIP で明示値により on になった場合は、デバイスごとの初回判定時に次を stderr に出す（`engine/src/prefill/gemm.cu:700-702`）。
+
+```text
+strata prefill: HIP device <番号> <arch> - STRATA_HIP_PROMPT_F16=1: the prompt's 16-bit GEMMs run FP16 in and out (rocBLAS is tuned only for that on gfx103x; not bit-identical to the default)
+```
+
+未設定で gfx103x の既定 on になった場合は、別の既定値ログを出す。明示値により on でない場合、または他の既定 on デバイスではこの2種類のログは出ない（同 `engine/src/prefill/gemm.cu:700-705`）。SYCL コピーには異なる案内ログがあるが、通常の `icpx` SYCL ビルドは前述の HIP 条件に入らない（`engine/sycl/src/prefill/gemm.dp.cpp:360-384`）。
+
+Strata の `docs/AMD_HIP.md:516` は、RX 6700 XT（gfx1031）、ROCm 10.1、IQ2_XS、2K prompt 16 件・64 forced tokens の測定として、FP32 積を真値にした KL 0.00549（旧経路 0.00621）および prompt 11–14% 高速と記載する。同資料は Radeon 780M の Q2_0 における複数 prompt 長の結果や gfx1201 で遅くなる例も記載する。これらは資料記載の測定であり、今回実行して再測定した値ではない。
 
 ## 根拠
 
-- `src/prefill/gemm.cu:605-635` — HIP 条件、device ごとの cache、環境値・device 既定値の判定、ログ。
-- `include/strata/core/arch_defaults.hpp:79-85` — unset 時の gfx1103 統合 Radeon 780M/Linux 既定値と override 判定。
-- `src/prefill/prefill.cpp:2613-2624,3563-3576` — stage 初期化、環境の値の反映、関連する BF16 buffer 判定。
-- `src/prefill/kernels.cu:84-90,2843-2853` — FP16 活性値変換と device symbol 設定、設定失敗時の終了。
-- `src/prefill/gemm.cu:1081-1093,1209-1218,1351-1373` — GEMM の FP16 分岐、fallback、失敗と診断経路。
-- `sycl/src/prefill/gemm.dp.cpp:359-384` — SYCL ツリーの HIP compile path における明示 opt-in と cache。
-- `docs/AMD_HIP.md:506-513` — Strata 資料に記載された HIP 経路の測定値。
+- `engine/src/prefill/gemm.cu:681-713` — HIP 側の読み取り、デバイス既定解決、ログ、cache、非 HIP の戻り値。
+- `engine/include/strata/core/arch_defaults.hpp:79-90` — 未設定時の機種ルールと明示値の判定。
+- `engine/src/prefill/prefill.cpp:2724-2735` — prefill stage での適用。
+- `engine/src/prefill/gemm.cu:1169-1180,1303-1320,1460-1482` — GEMM の経路、出力、失敗と診断ログ。
+- `engine/src/prefill/kernels.cu:88-95,2901-2911` — 活性値形式と symbol 設定時の失敗。
+- `engine/sycl/src/prefill/gemm.dp.cpp:360-384`、`engine/sycl/CMakeLists.txt:1-10,21,303-308` — SYCL 側の条件付きコピーとビルド構成。
+- `docs/AMD_HIP.md:516` — 資料に記載された測定値。

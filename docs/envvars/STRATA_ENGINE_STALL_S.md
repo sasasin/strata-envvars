@@ -1,51 +1,64 @@
 # `STRATA_ENGINE_STALL_S`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。Strata 所有コードのみを対象とする。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（2026-11-23 時点）。
 
 ## 役割
 
-Strata Python サーバーが、応答行を出さず CPU・ディスク I/O もほぼ止まったエンジンを終了するまでの時間を秒で指定します。既定値は 90 秒です。エンジンが無言でも CPU/I/O が動いている場合は終了せず、一度だけ警告します。また並列リクエストが空き slot を待つ時間がこの値に達すると、待ち状況を一度ログに出します。この後者は待機を終了させる timeout ではありません。
+`terminal/serve/server.py` の HTTP サーバーが、応答行を出さない engine を「処理が遅い」のか「停止・凍結した」のか判定する時間窓を秒単位で設定する。既定は90秒。指定時間中に CPU とディスク I/O の動きがほぼなく、GPU も稼働中でないと判定した場合は engine プロセスを終了し、該当リクエストを失敗させる。engine が無音でも処理中なら終了せず、一度だけ警告する。また、batch の空き slot を待つリクエストがこの時間を超えたとき、待ち状況を一度ログに出す。この slot 待ち側は通知だけで、engine やリクエストを終了しない。 (`terminal/serve/server.py:436-442`, `terminal/serve/server.py:2145-2159`, `terminal/serve/server.py:2725-2764`)
 
-読み取りと処理は `serve/server.py` にあります。同名の C++/CUDA/HIP/SYCL 読み取り箇所はなく、エンジン本体の挙動を直接設定する変数ではありません。
+これは `terminal/serve/server.py` が読むサーバー側の変数であり、engine バイナリ自身の環境変数読み取りではない。`python -m serve.server --engine strata` などのサーバー経路に適用され、`--engine mock` は `StrataEngine` の request watchdog を通らない。CUDA/HIP/SYCL 等の engine backend 自体による値判定はない。 (`terminal/serve/server.py:1-4`, `terminal/serve/server.py:714-724`, `terminal/serve/server.py:8968-8973`)
 
 ## 値と判定
 
-`_timeout_env()` が `os.environ.get(name, default)` を `float()` に渡し、`ValueError` の場合だけ既定値へ戻します。変換後の値が `<= 0` なら `None`（無効）になります。
+`server.py` の import 時に `_timeout_env("STRATA_ENGINE_STALL_S", 90.0)` を呼ぶ。helper は環境値を Python の `float` に変換し、`ValueError` なら既定値へ戻す。変換後の値が `0` 以下なら `None`（無効）を返す。空文字も変換エラーなので無効化ではなく90秒に戻る。 (`terminal/serve/server.py:442`, `terminal/serve/server_parts/base.py:260-265`)
 
-| 環境値 | サーバー内の値 | 結果 |
-|---|---:|---|
-| 未設定 | `90.0` | 既定の監視を有効化 |
-| 空文字 | `90.0` | `float("")` が `ValueError` となり既定値へ fallback |
-| 不正な数値文字列 | `90.0` | `ValueError` となり既定値へ fallback |
-| 正の数値 | その数値 | その秒数を閾値にする。小数・指数表記も `float()` の規則で受理 |
-| `0` または負の数値 | `None` | frozen-engine 判定と slot 待ちログの両方を無効化 |
-| `nan` | NaN | `float()` は受理するが、`> 0` 判定が偽となるため両方の処理は実質無効 |
-| 正の `inf` / `infinity` | 正の無限大 | 監視は有効扱いだが有限時間では閾値に達しない |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| サーバー起動時の共通判定 | `90.0` 秒 | float に変換できる正の有限値。例: `1`, `90`, `1.5`, `1e2` | `0`, `-1`, `-inf` は監視を無効化。空文字、`0anything` などの不正文字列は無効化ではなく既定の90秒へ fallback |
 
-文字列全体を Python の `float()` で変換します。空白を含む有効な数値文字列など、受理される表記も Python の変換規則に従います。値域の上限・clamp はありません。
-
-根拠: `serve/server.py:315-320,328-329,2035,2364`。
+Python の `float` 変換なので、数値文字列全体を変換し、前後空白を含む数値は受理する一方、数値の後ろに文字が続く値は受理しない。大文字小文字の比較や整数限定の検査はない。`nan` は `v <= 0` を満たさず helper から返るが、その後の `stall_s > 0` 判定を満たさないため監視は実質無効。`inf` は正値として返るが、経過時間が `inf` に達しないため判定閾値として機能しない。 (`terminal/serve/server_parts/base.py:260-265`, `terminal/serve/server.py:2147`, `terminal/serve/server.py:2574-2595`)
 
 ## 有効になる条件
 
-- `serve.server` が読み込まれたプロセスに適用されます。値は import 時に `ENGINE_STALL_S` として一度読み取られ、その後の環境変数変更では更新されません。CLI 引数や設定ファイルからこの変数を読む処理は見つかりません。別設定 `engine_silence_s` は別個の無応答 timeout です。
-- frozen-engine の終了判定は、Strata エンジンへのリクエストで出力行が途絶え、監視が有効で、プロセス活動を取得できたときに進みます。サンプル間で CPU 使用時間の増加が 0.5 秒以下、かつ read+write bytes の増加が 1 MiB 以下で、GPU 稼働 telemetry が 10% 未満（または telemetry が無い）なら「frozen」と判定します。GPU 稼働中なら終了せず、活動量の基準を更新して一度だけ警告します。
-- CPU/I/O サンプルは `psutil` が利用可能で、対象プロセスの値を取得できる場合に限り使えます。取得できない場合は frozen 判定で終了しません。セットアップは `psutil` を Python パッケージとして含みますが、手動実行環境での導入を保証するものではありません。
-- slot 待ちのログは、並列 engine の要求が空き slot を得られず待っている場合に閾値を超えると出ます。これは `psutil` に依存せず、リクエストを中断もしません。
-- OS/backend 固有の値分岐はありません。GPU 稼働確認用 telemetry は GPU の利用状況を読むもので、取得例外時は GPU 非稼働として扱います。
-
-根拠: `serve/server.py:353-359,995,2033-2048,2477-2512,4883-4886`、`setup.py:256`、`requirements.txt:14`。
+- `terminal/serve.server` を起動するサーバーモードであること。CLI の `--engine mock` は `MockEngine` となり、engine の出力を待つ `StrataEngine` の watchdog は使わない。 (`terminal/serve/server.py:1-4`, `terminal/serve/server.py:714-724`, `terminal/serve/server.py:8968-8973`)
+- リクエスト中の凍結判定は、engine から新しい行が来ず、正の stall 閾値を超えて無音が続く場合に行う。CPU 利用量が窓内で0.5秒以下、読み書き量が1 MiB以下で、GPU 使用率が10%未満（または GPU 使用状況を取得できず busy 扱いでない）なら凍結として終了する。 (`terminal/serve/server.py:2570-2611`, `terminal/serve/server.py:2714-2749`, `terminal/serve/server_parts/base.py:294-302`)
+- `psutil` が利用できず CPU/I/O の測定値を得られない場合、`_activity()` は `None` を返し、凍結による終了判定はしない。GPU の稼働中判定は telemetry のスナップショットから行い、いずれかの GPU 使用率が10%以上なら engine を凍結扱いにしない。 (`terminal/serve/server.py:2714-2723`, `terminal/serve/server.py:2734-2749`, `terminal/serve/server.py:4925-4942`)
+- 同じ変数は batch の空き slot 待ちにも使われる。ここでは slot が空かない状態が閾値を超えると待ち状況を一度出力するが、これ自体は engine の凍結判定ではない。 (`terminal/serve/server.py:2145-2159`)
+- 別設定の `engine_silence_s` は、リクエスト中に engine が無音でいられる上限を定める。こちらは CPU/I/O/GPU の活動判定とは別に働き、より早く上限に達すればその経路で engine が終了し得る。`STRATA_ENGINE_STALL_S` はこの設定や CLI 引数を上書きしない。 (`terminal/serve/server.py:2570-2584`, `terminal/serve/server.py:8935-8963`)
 
 ## 実行時の詳細
 
-リクエスト中はエンジン stdout の行を最大 0.5 秒ずつ待ちます。行が来ない間、キャンセルされていなければ `_stall_check()` を呼びます。直近の出力後に CPU 時間と I/O bytes の基準値を取り、設定秒数経過後に現在値と比較します。CPU/I/O が動いているときは `[strata] the engine has said nothing for ... but is still working; it is not ended ...` を一度だけ出し、その後も設定秒数ごとに再確認します。無活動と判定すると `_silent()` がエンジンプロセスを kill し、`EngineSilent` を発生させます。
+環境変数は `server.py` のモジュール初期化時に一度読み取られ、`ENGINE_STALL_S` に保持される。リクエスト開始時にその値をローカル変数 `stall_s` へ取り、無音を検査するループで使用するため、サーバープロセス稼働中に環境を書き換えても値は再読込されない。設定値は engine の子プロセスに渡して engine 側で使うものではない。 (`terminal/serve/server.py:442`, `terminal/serve/server.py:827-829`, `terminal/serve/server.py:2570-2575`)
 
-終了されたリクエストは通常の生成 API では 503（ストリーム中ならストリーム内のエラー）になり、エラー文に次の要求で再起動する旨が含まれます。次の要求でエンジンが停止済みと認識されれば、サーバーは再起動を試みます。slot 操作の経路は 500 と「次の要求がエンジンを再起動する」旨を返します。並列 slot 待ちでは閾値到達時に busy slot / 使用中 / 解放中の一覧を含む `[strata] parallel: a request has waited ... for a free slot ... (issue #1603)` を一度出します。
+無音中、最初のチェックで CPU 秒と読み書き byte 数の基準値を取り、その後 stall 窓ごとに再計測する。各窓で CPU 増分が `0.5` 秒以下かつ I/O 増分が `1 MiB` 以下なら「凍結候補」とし、telemetry が GPU 使用中と示していないことも確認する。凍結条件を満たせば `EngineSilent` を発生させ、`_silent()` がプロセスを kill して終了済みと記録する。次のリクエストでは engine が再起動される。活動が観測された場合は警告を一度出し、その後も窓ごとに再判定する。CPU/I/O の測定値を得られない場合は凍結判定をせず、終了もしない。 (`terminal/serve/server.py:2576-2611`, `terminal/serve/server.py:2714-2764`, `terminal/serve/server_parts/base.py:294-302`)
 
-環境値は Python サーバーが読みます。`child_env()` は親環境をコピーするため、値は通常エンジン子プロセスの環境にも継承されます（構成の `env` が同名キーを上書きする場合を除く）が、調査対象 commit の Strata エンジンソースにこの名前を読む箇所はありません。子プロセスでの効果は確認できません。
+無音が続く間でも engine が活動していれば、この変数による終了はしない。ただし `engine_silence_s` の上限は別に適用される。engine が出力行を返すと無音計測の基準時刻と stall 状態がリセットされる。 (`terminal/serve/server.py:2570-2613`, `terminal/serve/server.py:2742-2749`)
 
-根拠: `serve/server.py:3747-3760,2358-2401,2477-2527,5747-5750,7523-7529,7576-7577,7903-7907,8015-8017,8136-8138`。
+## ログと測定値
 
-## 文書との照合
+活動中の engine が無音のまま閾値を超えた場合、サーバー標準出力に次の警告を一度出す（閾値を過ぎた無音秒数を埋め込む）。
 
-`docs/DETAILS.md:1272` は既定 90 秒、正数による変更、`0` による無効化、`psutil` が必要なことを説明しており、サーバー実装と一致します。この文書では実装で確認できた負数・空文字・無効文字列・非有限値の判定、および slot 待ちログへの別用途も補足しました。性能測定値は記載していません。
+```text
+[strata] the engine has said nothing for {age:.0f} s but is still working; it is not ended (the limit is engine_silence_s). If it is stuck, "engine_silence_s" can be set lower.
+```
+
+凍結と判定した場合、`EngineSilent` の理由に次の文言を含め、engine を終了する。
+
+```text
+the engine said nothing for {age:.0f} s and used no CPU or disk in that time (frozen; STRATA_ENGINE_STALL_S sets this, 0 = off); the server ended the engine
+```
+
+`age` は経過秒を整数に丸めて表示する。通常の JSON API 経路では回答開始前の `EngineDied` として HTTP 503 とエラー理由を返す。設定値の fallback や無効化について専用ログはない。測定値の記載はない。 (`terminal/serve/server.py:2740-2764`, `terminal/serve/server.py:7530-7533`)
+
+## 根拠
+
+- 読み取り箇所と既定値: `terminal/serve/server.py:436-442`
+- 共通の値変換、fallback、0以下の無効化: `terminal/serve/server_parts/base.py:260-265`
+- 空き slot 待ちでの通知: `terminal/serve/server.py:2145-2159`
+- リクエスト内の監視開始・無音ループ: `terminal/serve/server.py:2567-2613`
+- CPU/I/O 取得と無音凍結判定: `terminal/serve/server.py:2714-2749`; 閾値: `terminal/serve/server_parts/base.py:294-302`
+- GPU 活動判定: `terminal/serve/server.py:4925-4942`
+- engine 終了処理: `terminal/serve/server.py:2751-2764`
+- HTTP 503 への変換: `terminal/serve/server.py:7530-7533`
+- サーバー起動時に telemetry を初期化: `terminal/serve/server.py:8263-8268`
+- 説明資料との照合: `docs/DETAILS.md:1524-1525`。既定90秒、値での変更、0による無効化、psutil が必要という説明は実装と一致する。

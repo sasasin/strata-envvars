@@ -1,51 +1,42 @@
 # `STRATA_FS_BUDGET`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Foresight swap space が、1 枚のカードにつき 1 回の完了 verify window の間に発行できる expert copy 要求数の上限です。slot 数やコピー対象そのものを指定する変数ではありません。Foresight swap space の作成には別途 `STRATA_FS_SLOTS` が正数である必要があります。
+Foresight swap space が、各カードにつき完了済み window ごとに新たに発行できる expert blob の非同期コピー数を制限する。既定値は32コピーで、値が小さいとその上限に達した後のコピー要求が記録されて見送られる。環境変数は swap space の作成時に読み取られ、そのインスタンスの `budget` に格納される。`STRATA_FS_SLOTS` が有効な CUDA/HIP の serve 経路で使われる設定であり、通常の経路やスロットを作らない経路では効果がない（`engine/src/core/expert_source.cpp:7294-7321`、`engine/src/program/generate.cpp:14795-14807`）。
 
 ## 値と判定
 
-値は環境変数が設定されていれば `std::atoi` で整数に変換し、結果が 1 未満なら 1 にします。未設定時の既定値は 32 です。値全体の厳密な検証はありません。
+値は swap space 作成関数内の helper が `std::getenv` で取得し、設定があれば `std::atoi`、未設定なら既定値32を採用したうえで1未満を1に丸める。文字列全体の妥当性検査やエラー報告はなく、`atoi` が変換する先頭の整数部分が使われる。従って空文字や整数に変換できない文字列は0相当となり1に丸められる。数値の後ろの文字は無視される。符号と先行空白も `atoi` の変換に従う。`atoi` の `int` 範囲を超える値の結果はこのコードで定義されない（`engine/src/core/expert_source.cpp:7306-7311`）。
 
-| 設定 | `budget` に使う値 |
-|---|---:|
-| 未設定 | 32 |
-| 空文字、数字で始まらない文字列、`0`、負数 | 1（`atoi` の結果が 1 未満のため） |
-| 正の整数として変換できる値 | 変換結果 |
-| 先頭に空白・符号がある数値、数値の後ろに文字が続く値 | `atoi` が読み取った整数を使い、その後 1 未満なら 1 |
+| 条件 | 未設定 | 有効になる値（例） | 無効な値・変換後の扱い（例） |
+|---|---|---|---|
+| Foresight swap space を作成する経路 | 32 | `1` → 1、`32` → 32、`32junk` → 32、`+4` → 4 | 空文字、`abc`、`false`、`0`、`0anything`、`-7` → 1。`1.9` → 1。 |
 
-たとえば `" 3x"` は 3、`"-2"` は 1 になります。正値への上限 clamp はありません。`atoi` で `int` の範囲を超える文字列を変換した場合の結果は C/C++ の仕様上保証されないため、その値はここでは規定できません。
-
-CLI 引数、設定ファイル、他の環境変数でこの数値を上書きする経路は確認できません。`STRATA_FS_SLOTS` は機能を作るかどうかを決める独立条件であり、budget 値の優先順位には入りません。
+ここで「有効」はコピー予算に格納される値を指す。`0` や負値でも機能全体を無効にはせず、最小予算1になる。設定値に上限の clamp はない（ただし `atoi` の結果型は `int`）。
 
 ## 有効になる条件
 
-- `foresight_swap_from_env()` が呼ばれ、`STRATA_FS_SLOTS` の `atoi` 結果が正数であること。0 以下なら swap pool を作らず、この変数も読みません。
-- その後 `STRATA_VERIFY_DEVICE_PLAN` が設定され `atoi` 結果が 0 以外の場合、swap pool は拒否されます。このとき `STRATA_FS_BUDGET` はすでに読み取られていますが、作られた pool には適用されません。
-- swap pool の初期化が成功すること。CUDA device memory、stream または event の確保に失敗した場合は pool が無効になり、budget による copy 制限は発生しません。
-- `STRATA_FS_BUDGET` が有効でも、copy 要求があること、該当 expert の blob が pinned source にあること、空き slot があることが必要です。cache hit、peer/remote 経路などで Foresight swap の要求処理に入らない場合、この上限は影響しません。
-
-実装は CUDA runtime API を使う `src/core/expert_source.cpp` の Foresight swap にあり、`src/program/generate.cpp` の generate/serve 経路から pool が接続されます。対象ソース内で `STRATA_FS_BUDGET` の別読み取りはなく、SYCL 側の参照も確認できませんでした。
+- `STRATA_FS_SLOTS` を `std::atoi` した値が正であること。未設定・0以下なら `foresight_swap_from_env` は直ちに `nullptr` を返し、`STRATA_FS_BUDGET` を読み取らない。スロット数そのものは64に上限 clamp される（`engine/src/core/expert_source.cpp:7294-7298,7313`）。
+- `STRATA_VERIFY_DEVICE_PLAN` と `STRATA_VERIFY_DEVICE_HITS` のどちらも、設定値を `atoi` した結果が非0でないこと。いずれかが非0なら stderr に `strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN/HITS (the device would plan resident layers without the host)` と出して `nullptr` を返し、予算値の読取りより前に機能を止める（`engine/src/core/expert_source.cpp:7299-7308`）。
+- serve の対象実行経路で Foresight swap space の生成処理が呼ばれること。作成時に CUDA device memory / stream / event の初期化に失敗した場合は「`cannot allocate ...`」または「`cannot create the copy events`」を理由に `strata serve: foresight swap: <理由> - swap space off` を出し、機能を無効にする（`engine/src/core/expert_source.cpp:7082-7113,7312-7316`）。
 
 ## 実行時の詳細
 
-pool 初期化時に値を読み、`ForesightSwap::budget` に保存します。`static` cache はありません。各カードについて、`completed` window 番号が変わると発行済み数 `card_used` を 0 に戻します。新しい window で copy 要求が `budget` 件に達すると、それ以上の要求は `over_budget` に数えてその要求の copy を発行せず、通常の expert 処理経路に戻ります。`completed` は generate/serve の window 完了時に増加します。予測 look-ahead による要求も同じ `request_locked()` を通るため同じカード別上限を共有します。
+`generate.cpp` は serve の処理で `foresight_swap_from_env` を呼び、生成されたインスタンスを dispatch に設定する。利用可能な場合は router look-ahead と expert source にも接続される（`engine/src/program/generate.cpp:14795-14807`）。呼び出し側は予算値を引数や設定ファイルから渡しておらず、優先順位を上書きする CLI 設定はこの経路にない。対象変数の読取りはこのインスタンスの作成時だけで、関数内 static cache はなく、既存インスタンスの実行中にプロセス環境を変更しても格納済みの `budget` には反映されない。
 
-pool の作成に成功すると stderr に `up to %d copies per card and window` として実効 budget を含む初期化行が出ます。処理末尾の report は `... %llu over budget` を出力し、上限により見送られた要求数を示します。初期化失敗時は具体的な理由に `- swap space off` を付けた stderr 行が出ます。コピー API の失敗時は `strata serve: foresight swap: a copy failed - swap space off` が出ます。これらは pool 全体の経路に関するログで、budget の無効値専用の警告や終了経路はありません。
+通常の expert 選択でキャッシュにない expert を Foresight slot から取得できなければ、swap に miss を通知した後、既存の fetch / staging 処理へ進む。予測コピーも同じ swap の要求処理を使う（`engine/src/core/expert_source.cpp:5593-5606,3791-3792,7218-7221`）。要求処理はカードごとに完了済み window の番号を見て使用数をリセットし、`card_used >= budget` なら `over_budget` を増やしてコピー要求をそこで終了する。予算内で pinned arena にコピー元があり、再利用可能な slot があればコピーをキューへ積み、別 filler thread がホストからデバイスへコピーする（`engine/src/core/expert_source.cpp:7230-7278,7134-7158`）。
 
-起動後に環境値を変えた場合、すでに作られた pool の budget は変わりません。後続で `foresight_swap_from_env()` が改めて呼ばれれば、その時点の環境値が読み直されます。
+予算上限に達した要求はコピーを追加しないだけで、miss の処理は既存の経路へ進む。予算が route / expert 選択を書き換える処理はここにはなく、値はコピー機会の上限として使われる（`engine/src/core/expert_source.cpp:5593-5606,7240-7245`）。生成処理の報告時には、コピー数と `over budget` 件数を含む統計を stderr に出す（`engine/src/core/expert_source.cpp:7281-7291`、`engine/src/program/generate.cpp:23286`）。
+
+## ログと測定値
+
+swap space 作成に成功すると stderr に `strata serve: foresight swap: <slots> slots per layer on <cards> card(s), up to <budget> copies per card and window, admit after <n> miss(es), reuse after <n> windows` が出る。この `<budget>` は clamp 後の値。生成処理の報告では `foresight swap: ... <n> over budget` が含まれる（`engine/src/core/expert_source.cpp:7318-7321,7281-7291`）。コピー失敗時は `strata serve: foresight swap: a copy failed - swap space off` が出る（`engine/src/core/expert_source.cpp:7151-7155`）。対象変数の値ごとの性能測定値は、確認した Strata の資料にない。
 
 ## 根拠
 
-- 候補一覧での記載: `docs/envvars/000_envvers.md` の `STRATA_FS_BUDGET`。
-- 読み取り順、`atoi`、既定値 32、最低値 1、device-plan による拒否、初期化とログ: `src/core/expert_source.cpp:6537-6562`。
-- カード別 window カウンターと budget 判定、超過要求の計上、copy 要求の enqueue: `src/core/expert_source.cpp:6472-6521`。
-- 完了 window 数の更新: `src/program/generate.cpp:16581-16587,17056-17059`。
-- pool の接続: `src/program/generate.cpp:11109-11121`。
-- 遅着 slot の通常経路への fallback および pinned source 条件: `src/core/expert_source.cpp:6404-6418,6483-6488`。
-- pool 初期化失敗・copy failure のログ: `src/core/expert_source.cpp:6325-6349,6392-6399`。
-- report 文字列と stderr 出力: `src/core/expert_source.cpp:6524-6534`; `src/program/generate.cpp:17177`。
-- 関連機能の説明: `include/strata/core/foresight_swap.hpp:2-21`。`docs/DETAILS.md:1030,1437` は Foresight swap slots の概要・測定を記載しますが、`STRATA_FS_BUDGET` 固有の値や性能測定は記載していません。
+- `engine/src/core/expert_source.cpp:7294-7321` — スロット有効条件、検証フラグ、予算の変換・既定値・下限、作成ログ。
+- `engine/src/core/expert_source.cpp:7230-7278` — window ごとのカード別予算適用とコピー要求。
+- `engine/src/core/expert_source.cpp:5593-5606,3791-3792` — miss と look-ahead からの利用。
+- `engine/src/program/generate.cpp:14795-14807,23286` — serve 経路の接続と報告。

@@ -1,48 +1,49 @@
 # `STRATA_GDN_TC_NP`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。
 
 ## 役割
 
-CUDA の GDN（DeltaNet recurrence）prefill で、通常の tensor-core scan が失敗した後に試す split scan の pass 数を選びます。Strata の通常の CUDA 自動 dispatch が対象で、`STRATA_GDN_TC` が有効、かつ入力 token 数が 128 以上であることに加え、最初の非 split tensor-core scan が失敗した場合にだけ値が参照されます。既定は 3 pass です。これは実験用の fallback 選択であり、通常の成功経路や明示的に probe で強制された経路は変えません。
+CUDA の prompt GDN recurrence が tensor-core 経路を選び、通常の tensor-core scan の起動に失敗した後、split scan を再試行するときの積の分割数（NP）を選ぶ実験用設定です。`engine/src/prefill/kernels.cu` の `gdn_recurrence_impl()` が値を読み、`gdn_rec_tc(..., split=true, np=...)` に渡します（`engine/src/prefill/kernels.cu:3227-3236`）。
+
+これは tensor-core 経路そのものを有効化するスイッチではありません。通常経路の最初の試行が成功すれば値は読まれず、split retry にも進みません。split kernel 内では NP=3 が各積を3段で計算し、NP=2 は出力だけの積を1段、状態更新に使う積を3段で計算し、NP=1 は全積を1段で計算します（`engine/src/prefill/gdn_tc.cuh:151-170`）。演算方法が変わるため結果の丸めも変わり得ますが、Strata のコードは NP=1/2 の出力・状態が NP=3 と同一になる保証をしていません。
 
 ## 値と判定
 
-値は `std::getenv` で読み、`std::atoi` で整数変換した後、結果が `1` または `2` のときだけ採用します。それ以外は `3` にします。文字列全体の妥当性検証はしません。
+コードは `std::getenv` の結果を `std::atoi` で変換し、変換結果がちょうど `1` または `2` の場合だけ採用します。それ以外は `3` です。文字列全体の妥当性検査はなく、`atoi` が先頭から整数として読める部分を使います。空白や数値の後ろの文字も別途検査しません（`engine/src/prefill/kernels.cu:3233-3235`）。
 
-| 環境値 | 採用される pass 数 |
-|---|---:|
-| 未設定 | 3 |
-| 空文字 | 3（`atoi("")` は 0） |
-| 先頭から整数変換した結果が 1 | 1 |
-| 先頭から整数変換した結果が 2 | 2 |
-| その他（0、3、負値、整数に変換できない文字列など） | 3 |
+| 条件 | unset | 有効になる値 | 無効値の例と結果 |
+|---|---:|---|---|
+| CUDA の split tensor-core retry が必要になった場合 | `3` | `1`, `2` | 空文字、`0`, `3`, `-1`, `true`, `x` は `3`。`1tail` は `1`、` 2tail` は `2` として扱われる |
 
-`atoi` のため、たとえば `1abc` や `1.5` は変換結果が 1 となり 1 pass、`2anything` は 2 pass になります。先頭の空白や符号も `atoi` の変換規則に従います。数値変換可能範囲を超える文字列の結果は、この実装では保証されません。
+この値は Linux CUDA の engine 既定値設定対象ではありません。`apply_gdn_defaults_cuda()` が設定するのは `STRATA_GDN_TC=1` と `STRATA_GDN_CONVL2=2` で、既存値は保持されます（`engine/src/core/arch_defaults.cpp:263-275`, `engine/src/program/generate.cpp:4405-4410`）。同じ helper による `STRATA_GDN_TC_NP` の既定値設定や上書きはありません。
 
 ## 有効になる条件
 
-- CUDA の `src/prefill/kernels.cu` にある通常の自動 dispatch が使われること。tensor-core の自動経路は `#if !defined(__HIPCC__)` 内です。HIP の recurrence 分岐ではこの変数を読みません。
-- `STRATA_GDN_TC` が設定され、`atoi` の結果が 0 以外であること。
-- recurrence の token 数 `T` が 128 以上であること。
-- `GdnProbe` が別経路を強制していないこと（probe はテスト用）。
-- 通常の非 split tensor-core scan が失敗し、その後の split scan fallback に到達すること。
-
-通常 scan が成功すればこの変数は読み取られず、split scan の pass 数には影響しません。通常 scan が失敗して split scan も失敗した場合は、利用可能なら `STRATA_GDN_CHUNKED` の経路を試し、そこも選ばれなければ `STRATA_GDN_PIPELINE` による key-head / pipelined columns / columns の既定 recurrence に進みます。`T < 128` では tensor-core 自動経路自体を試しません。CLI 引数による上書きはこの実装にありません。
+- CUDA build の `gdn_recurrence_impl()` を通ること。tensor-core dispatch は `#if !defined(__HIPCC__)` 内にあり、HIP ではこの読み取り・分岐を通りません（`engine/src/prefill/kernels.cu:3182-3190,3262-3267`）。
+- 通常の自動 dispatch で `STRATA_GDN_TC` が `atoi` で非ゼロとなり、系列長 `T` が最低 `128` であること。Linux CUDA の `generate` 経路では未設定の `STRATA_GDN_TC` に `1` が補われます（`engine/src/prefill/kernels.cu:992,3186-3189,3227-3229`; `engine/src/core/arch_defaults.cpp:263-275`; `engine/src/program/generate.cpp:4405-4410`）。
+- その通常の `gdn_rec_tc(... split=false ...)` 試行が失敗し、split retry に進むこと。成功時は `STRATA_GDN_TC_NP` を評価しません（`engine/src/prefill/kernels.cu:3227-3236`）。split retry も失敗すると、条件が合えば `STRATA_GDN_CHUNKED` の経路を試し、最後は key-head / pipelined / columns recurrence へ進みます（`engine/src/prefill/kernels.cu:3239-3255`）。
+- `GdnProbe` が特定経路を強制していないこと。probe 強制時の tensor-core NP は force 値から `3`、`2`、`1` と決まり、この環境変数を使う自動 retry 分岐には入りません（`engine/src/prefill/kernels.cu:3190-3194,3203-3209`）。
+- GPU が tensor-core 実装の実行条件を満たすこと。`gdn_rec_tc()` は compute capability 8 以上、必要な SM 数、経路に応じた shared memory、scratch 確保などを確認し、満たさない場合はエラーを返します（`engine/src/prefill/kernels.cu:1365-1384`）。この場合 split retry の可否も同関数で判定され、最終的に通常 recurrence に fallback し得ます。
 
 ## 実行時の詳細
 
-`gdn_recurrence_impl()` の自動 CUDA dispatch は `STRATA_GDN_TC` と `T >= 128` を確認して、まず `gdn_rec_tc(..., split=false)` を呼びます。これが成功すればその経路を選択し終了します。失敗したときだけ関数内 static local の `tc_np` が初期化され、環境値を一度読みます。したがって評価はプロセス起動時とは限らず、最初の該当 fallback 時です。その初期化後に環境値を変えても同一プロセスでは再評価されません。該当 fallback に一度も到達しなければ読み取りも起きません。
+値は `gdn_recurrence_impl()` 内の関数ローカル `static const int tc_np` です。起動時に必ず読むのではなく、自動 tensor-core 経路が `T >= 128` で通常試行に失敗し、最初に split retry へ到達したときに一度だけ評価・保存されます。その後の環境変更は同一プロセス内のこの値に反映されません。条件に到達しない実行では読み取り自体がありません（`engine/src/prefill/kernels.cu:3227-3235`）。
 
-採用値は `gdn_rec_tc(..., split=true, np=tc_np, ...)` に渡されます。split scan は値に応じて `gdn_tc_scan_kernel` の `NPV=1`、`NPV=2` または既定の 3 pass 版を起動します。split scan が成功すれば `kGdnTcSplit` を選び、通常の後段 norm を融合できる条件では融合し、そうでなければ別の norm kernel を実行します。実装コメントは 1/2 pass を「experiment, not a default」としていますが、性能や出力への影響をこの調査で新たに測定していません。
+値は split retry の `gdn_rec_tc` に渡され、split scan kernel の NP テンプレート選択に使われます。NP=3 で2 tile の条件がそろう場合は2 tile の専用 kernel、それ以外は NP に応じた scan kernel が選択されます。出力 norm の融合が使える場合も NP=1/2/3 の scan specialization を選びます（`engine/src/prefill/kernels.cu:1405-1424`）。`STRATA_GDN_TC_FUSE` と `STRATA_GDN_TC_TILES` は `GdnTcNorm` の受け渡しや tile 選択に関係しますが、`STRATA_GDN_TC_NP` の値自体はこれらで変更されません（`engine/src/prefill/kernels.cu:3198-3202,1340-1355`）。
 
-通常 scan はデバイス属性が取得できない、compute capability が 8 未満、SM 数が不足、必要な shared memory が不足、または scratch allocation が失敗した場合などにエラーを返し得ます。split scan も失敗し、chunked path も使えない場合は通常 recurrence に戻ります。自動 dispatch の probe がある場合、失敗理由や選択 path は probe の記録欄に入り得ますが、Strata の通常利用者向けログとしてこの環境変数の値や選択結果を出力する箇所は見つかりませんでした。GPU kernel launch error は共通 `check()` が `prefill <処理名>: <CUDA error>` を stderr に出し、終了コード 1 で終了します。
+この設定に対応する CLI 引数、別環境変数からの値上書き、子プロセスへの個別転送は確認できません。Linux CUDA の engine 既定値 helper は NP 変数を触りません。呼び出しは prompt prefill 内の `gdn_recurrence()` から行われます（`engine/src/prefill/prefill.cpp:5209,9342`）。
+
+## ログと測定値
+
+この変数の値を表示するログ、無効値の警告、split retry の失敗理由を通常実行で出す処理はありません。失敗理由は test 用 `GdnProbe` がある場合にだけ記録されます。自動 dispatch では最終経路を選んで `check("gdn_recurrence")` を呼び、共通の kernel launch error を検査します。NP 専用の検証や終了処理はありません（`engine/src/prefill/kernels.cu:3229-3261,3271`; `engine/src/prefill/kernels.cu:1427-1431`）。
+
+`docs/DETAILS.md` に `STRATA_GDN_TC_NP` の説明またはこの設定固有の測定値は見つかりませんでした。そこに記載された `STRATA_GDN_TC` の測定値を本変数の効果として転用していません。
 
 ## 根拠
 
-- `src/prefill/kernels.cu:2878-2883,2982-2999` — recurrence dispatch、HIP 分岐と非 HIP の CUDA dispatch、tensor-core の opt-in 判定。
-- `src/prefill/kernels.cu:935` — tensor-core 自動経路の最小 `T=128`。
-- `src/prefill/kernels.cu:3027-3057` — 通常 scan の試行、失敗後に限る `STRATA_GDN_TC_NP` の読み取り、split scan、失敗時の後続 fallback。
-- `src/prefill/kernels.cu:1308-1368` — tensor-core scan のデバイス条件と `np` に応じた split kernel 選択。
-- `src/prefill/kernels.cu:103-104,3068-3071` — CUDA error の stderr 出力と終了。
-- `src/prefill/prefill.cpp:3824-3831,6953-6957` — prefill GDN recurrence の呼び出し箇所。
+- `engine/src/prefill/kernels.cu:3182-3199,3227-3269` — CUDA 条件、dispatch、値の読み取り、split retry と fallback。
+- `engine/src/prefill/kernels.cu:992,1340-1355,1365-1425` — minimum T、tile selection、GPU eligibility と NP kernel selection。
+- `engine/src/prefill/gdn_tc.cuh:151-170` — NP=1/2/3 が各積に適用する pass 数。
+- `engine/src/core/arch_defaults.cpp:263-275`, `engine/src/program/generate.cpp:4405-4410` — Linux CUDA 既定値と環境上書き規則。
+- `engine/src/prefill/prefill.cpp:5209,9342` — prefill からの呼び出し。

@@ -1,44 +1,44 @@
 # `STRATA_METAL_ENGINE_KERNELS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。Strata 所有ソースを対象とし、外部ライブラリの挙動は含めない。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Metal engine が実行時にコンパイルする独自 MSL カーネル `ple.metal`、`mtp.metal`、`mtp_chain.metal` の置き場所を指定します。環境変数の値はファイル名ではなくディレクトリとして使われ、各カーネル名が末尾に連結されます。実際に参照するのは Metal backend の `Window` 実装です。
+Metal engine が実行時にコンパイルする engine 固有 MSL ソース（`ple.metal`、`mtp.metal`、`mtp_chain.metal`、`dflash2.metal`）のディレクトリを指定する。通常は実行ファイル横のパッケージ資材、またはビルド時に埋め込まれた `engine/metal/src/engine/msl` を使い、この変数が設定されるとその探索より優先して指定パスを使う。コアの `metal/kernels/*.metal` の場所を指定する変数ではない（`engine/metal/src/engine/window.cpp:67, 797, 2516, 2604`、`engine/metal/src/engine/dflash2.inc:31`、`engine/metal/src/engine/msl_libs.h:25-38`、`engine/metal/src/mtl_rt.mm:148-150, 190-192`）。
 
 ## 値と判定
 
-値の parse、数値変換、真偽判定、空白除去、範囲検査はありません。`resource()` は環境変数が設定されていれば、その文字列をそのままディレクトリとして返します。
+`strata_metal::resource()` は `env != nullptr` のとき `std::getenv(env)` を呼び、返り値が null でなければその文字列をそのまま返す。文字列の解析、空文字判定、存在確認、正規化はしない（`engine/metal/src/resource_path.h:44-54`）。
 
-| 状態 | 使用するディレクトリ |
-|---|---|
-| 未設定 | 実行ファイルの隣の `metal/engine-msl` が存在すればそのパス。存在しなければビルド時に定義された `STRATA_METAL_ENGINE_KERNELS_DEFAULT`（通常はソースツリーの `metal/src/engine/msl`） |
-| 空文字を設定 | 空文字をそのまま採用し、呼び出し元が `/ple.metal` 等を組み立てる。未設定時の検索へは戻らない |
-| その他の文字列 | 文字列をそのまま採用。絶対パスはそのまま使われ、相対パスは `STRATA_METAL_KERNELS` が決める通常カーネルディレクトリの下として扱われる。存在確認や補正はしない |
+| 条件 | unset | 設定時に使われる値 | パスが使えない場合 |
+|---|---|---|---|
+| Metal engine build | 実行ファイル横の `metal/engine-msl` が存在すればそれ、なければ CMake の `STRATA_METAL_ENGINE_KERNELS_DEFAULT`（ソースツリーの `engine/metal/src/engine/msl`） | 空でない値は内容を問わず採用。`/opt/strata/msl` のような絶対パスが直接使われる | 指定値へのフォールバックはせず、MSL ファイル読み込みで失敗する |
 
-末尾 `/` の重複や不正なパス文字列も Strata 側では検証しません。`Context::compile()` は、完成したファイルパスが `/` で始まる場合はそのまま読み、それ以外は `STRATA_METAL_KERNELS` が決める通常カーネルディレクトリを前置します。したがって空文字時に組み立てられる `/ple.metal` 等は絶対パスとして読まれます。
+空文字も「設定あり」として採用され、engine MSL のファイル名は `/ple.metal` などになる。`0`、`1`、`true`、`false`、`0anything` も真偽値ではなく各文字列をディレクトリ名として扱う。相対パスは絶対パスと同様には直接開かれず、`Context::compile()` がコア kernel ディレクトリ `kernel_dir` の下に連結するため、たとえば `custom` は `kernel_dir/custom/ple.metal` として解決される。先頭・末尾の空白や大文字小文字にも特別扱いはない（`engine/metal/src/resource_path.h:44-53`、`engine/metal/src/mtl_rt.mm:190-192`）。
 
 ## 有効になる条件
 
-- Metal 用 `strata` のビルドでのみ関係します。`metal/CMakeLists.txt` では `STRATA_METAL_ENGINE` が既定で `ON` であり、`OFF` の場合は Metal engine の定義より前に CMake 設定を return します。
-- Metal engine の `Window::init()` は幾何条件を通過してモデルを開いた後、`ple.metal` のコンパイルを行います。このため、このパスは通常の window 初期化時に使われます。
-- `mtp.metal` は MTP draft model のロード時に使われます。`mtp_chain.metal` はさらに、`STRATA_METAL_MTP_CHAIN` が未設定または文字列全体が `0` 以外で、埋め込み tensor の型が実装の許可リストに含まれる場合にだけコンパイルされます。この別変数は chain 機能の条件であり、カーネルディレクトリの指定値を上書きしません。
-- CLI 引数や設定ファイルによるこのパスの上書きは、確認した呼び出し経路にはありません。
+- `engine/metal/CMakeLists.txt` は macOS 以外では Metal build を拒否し、`METAL_CPP_DIR` に Metal C++ headers がなければ device runtime と engine を組み立てず、engine 自体も `STRATA_METAL_ENGINE` が有効なときに組み立てられる（`engine/metal/CMakeLists.txt:18-20, 82-87, 103-108`）。この環境変数を読むのは `engine_msl_dir()` を含む Metal engine 経路である。
+- `Window::init()` は decode window の初期化時に PLE library をコンパイルするため、Metal engine の window を初期化する経路では MTP/DFlash2 を使わなくても engine MSL ディレクトリが参照される（`engine/metal/src/engine/window.cpp:714-737, 791-798`）。
+- MTP model を読み込む経路では `mtp.metal` が追加で使われる。`mtp_chain.metal` は MTP 読み込み後、`STRATA_METAL_MTP_CHAIN=0` でなく、かつ token embedding の型が許可リストにある場合に使われる（`engine/metal/src/engine/window.cpp:2516-2517, 2595-2605`）。
+- DFlash2 の tapped layer を有効にする経路では `dflash2.metal` が使われる（`engine/metal/src/engine/dflash2.inc:19-38, 995-1009`）。
+- CLI 引数や別環境変数によるパス上書きはこの選択処理にはない。`STRATA_METAL_KERNELS` は別の core kernel directory 用であり、engine MSL path には合成されない（`engine/metal/src/engine/window.cpp:67`、`engine/metal/src/resource_path.h:44-54`、`engine/metal/src/mtl_rt.mm:148-150`）。
 
 ## 実行時の詳細
 
-共通 helper `strata_metal::resource(env, sub, compiled)` は、`env` が非 null の場合に `std::getenv(env)` を毎回呼び、設定値があれば即座に返します。未設定なら実行ファイルのパスから隣接リソースを調べ、最後にコンパイル時パスへ進みます。`STRATA_METAL_ENGINE_KERNELS` の値自体を static 変数等へ保存する処理はありません。各 `resource()` 呼び出し時に環境を読みますが、各カーネルパスはそれぞれのコンパイル呼び出しの時点で確定します。
+`engine_msl_dir()` はキャッシュせず、呼ばれるたびに `resource()` が環境を読み直す。最初は window 初期化の PLE compile で評価され、MTP と DFlash2 は各機能の初期化時にも同じ helper を通る。したがって、後続の呼び出し前にプロセス環境が変更されていれば後続 library のパスに反映されるが、すでに読み込んだファイルやコンパイル済み library は切り替わらない（`engine/metal/src/engine/window.cpp:67, 791-798, 2516-2517, 2604-2605`、`engine/metal/src/engine/dflash2.inc:31-32`）。Strata ソース内にこの名前への `setenv` / `putenv` / `unsetenv` はない。
 
-`ple.metal` は `Window::init()` で `lple_` 用にコンパイルされます。MTP ロード時には `mtp.metal` を `lmtp_` 用にコンパイルし、条件が整えば `mtp_chain.metal` もコンパイルします。各 `.metal` ファイルを開くのは `Context::compile()` 内の `read_file()` です。読み取りに失敗すると stderr に `mtl: cannot read <path>` を出し、プロセスを終了コード 2 で終了します。ファイルは読めても Metal のソースコンパイルに失敗した場合は `mtl: compile failed (<device>, macOS <version>; <file>):` とコンパイラのエラーを stderr に出して終了コード 3 になります。環境変数の値そのものに関する警告や fallback はありません。
+選ばれたディレクトリを `lib_ple` / `lib_mtp` / `lib_mtp_chain` / `lib_dflash2` が各 `.metal` ファイル名に連結する。`Context::compile()` は `/` 始まりのファイル名をそのまま開き、それ以外は core kernel directory を前置する。`read_file()` が開けないと stderr に `mtl: cannot read <path>` を出して終了コード 2 で終了する。ファイルが読めても Metal source compile 自体が失敗した場合は `mtl: compile failed (<device>, macOS <version>; <file>):` とコンパイラの説明を stderr に出し、終了コード 3 で終了する（`engine/metal/src/engine/msl_libs.h:33-38`、`engine/metal/src/mtl_rt.mm:26-35, 170-192`）。
+
+## ログと測定値
+
+変数の読み取りや有効化を知らせる専用ログはない。誤った場所で MSL ファイルを開けない場合の `mtl: cannot read <path>`、または Metal source compile 失敗時の `mtl: compile failed (...)` が観測可能な結果となる（`engine/metal/src/mtl_rt.mm:26-35, 170-179`）。この変数についての測定値は、調査対象ソースおよび `docs/DETAILS.md` では確認できなかった。
 
 ## 根拠
 
-- `metal/src/resource_path.h:43-54` — 環境値、実行ファイル隣接ディレクトリ、コンパイル時パスの選択順と未設定時の存在確認。
-- `metal/CMakeLists.txt:73-80,121-130` — Metal engine の build option と実行ファイルへの組み込み。
-- `metal/CMakeLists.txt:123-126` — `STRATA_METAL_ENGINE_KERNELS_DEFAULT` のコンパイル時定義。
-- `metal/src/engine/window.cpp:524-542,581-587` — Window 初期化条件と `ple.metal` のパス解決・コンパイル。
-- `metal/src/engine/window.cpp:1949-1966` — MTP モデルロード時の `mtp.metal` のパス解決・コンパイル。
-- `metal/src/engine/window.cpp:2038-2046` — tensor 型と `STRATA_METAL_MTP_CHAIN` による chain の条件、および `mtp_chain.metal` のコンパイル。
-- `metal/src/mtl_rt.mm:32-40,331-361` — 絶対パスと kernel directory の合成、ファイル読み込み失敗時の終了コード 2、Metal compile 失敗時のログと終了コード 3。
-
-候補一覧 `docs/envvars/000_envvers.md:1032` に名前があります。完全一致検索では、上記3つの呼び出しと CMake の既定値定義が確認できました。環境値を直接読む共通 helper は `metal/src/resource_path.h` です。
+- `engine/metal/src/resource_path.h:44-54` — 環境値の有無判定、実行ファイル横の資材確認、ビルド時既定値への順序。
+- `engine/metal/src/engine/window.cpp:67, 714-737, 791-798, 2516-2517, 2595-2605` — helper、window 初期化、MTP と MTP chain の利用箇所。
+- `engine/metal/src/engine/dflash2.inc:19-38, 995-1009` — DFlash2 kernel のコンパイルと有効化経路。
+- `engine/metal/src/engine/msl_libs.h:33-38` — engine directory から参照する MSL ファイル。
+- `engine/metal/src/mtl_rt.mm:26-35, 148-150, 170-192` — ファイル解決、読み取り失敗、compile 失敗のログと終了経路。
+- `engine/metal/CMakeLists.txt:18-20, 82-87, 103-108, 168-174` — macOS / headers / engine build 条件と既定パス。

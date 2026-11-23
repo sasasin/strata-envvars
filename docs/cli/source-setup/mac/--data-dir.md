@@ -1,67 +1,62 @@
 # `--data-dir`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.sh` → `setup.py` → macOS Apple Silicon では `metal/setup_mac.py` |
-| オプション | `--data-dir DIR` |
+| コマンド | `metal/setup_mac.py`（`setup.py` から Apple Silicon の Mac 向け処理として委譲） |
+| オプション | `--data-dir` |
 | 別名 | なし |
-| 値 | データ用フォルダーのパス（文字列、必須） |
+| 値 | データフォルダーのパス（文字列）。指定先は絶対パスで、書き込み可能なフォルダーである必要がある |
 
 ## 役割
 
-モデル関連データを置く Strata data folder を指定します。Mac 用 setup では、このフォルダー直下を基点として `models/`（GGUF の既定保存先）、`packs/`、`mtp/`、Metal 用の再パック済みモデルが扱われます。GGUF だけ別の場所に置く場合は `--models-dir` または既存 GGUF を使う `--gguf-dir` が別にあります。parser は `metal/setup_mac.py:339-343`、各保存先の組み立ては同 `:365-367,451-454,476-505,518-539` です。
+モデルファイル、準備済み pack、MTP データなどを置くデータフォルダーを指定する。Mac 用 setup はこの場所を新規ダウンロードと生成物の配置先に使い、既存の Strata フォルダーなどにあるデータは同じ場所として扱える場合に限り、別途確認または `--move-data` の指定に従って移動する。GGUF ファイルを別の場所に置く用途は `--models-dir` または `--gguf-dir` の担当であり、`--data-dir` はそれらの代替ではない。
 
 ## 使い方
 
-Strata ソース checkout のディレクトリで、例のパスを使ってモデルをセットアップし、完了後に自動起動しない例です。
-
 ```sh
-./setup.sh --setup --data-dir ~/Strata-data --no-start
-```
+# 新しい場所をデータ先に指定して Mac 用セットアップを実施（既存データは自動では移動しない）
+./setup.sh --setup --yes --no-start --data-dir /Volumes/Work/Strata-data
 
-`setup.sh` は引数を `setup.py` に渡し、通常の macOS では `setup.py` が独自 parser の `metal/setup_mac.py` に全引数を渡します（`setup.sh:76`、`setup.py:9068-9069,7703-7707`）。Mac parser は `--data-dir` を文字列引数として受け付けます（`metal/setup_mac.py:328-356`）。
+# 既存モデルデータも新しい場所へ移す。移動できないデータは元の場所に残る場合がある
+./setup.sh --setup --yes --no-start --data-dir /Volumes/Work/Strata-data --move-data
+```
 
 ## 値と既定値
 
-- `DIR` は `argparse` の string 値で、parser 上に `choices`、`type`、既定値、専用 alias はありません。繰り返し指定した場合の parser 値は最後の指定です（`metal/setup_mac.py:339`）。
-- 指定時は共通処理が `expanduser()` と `resolve()` を行ってから検査するため、`~` と相対パスも絶対パスに変換されます。省略時は設定済み `data_dir`、未設定なら `home().parent / "Strata-data"` が使われます（`setup.py:6387-6391`）。非 Control の Mac setup では `home()` は Strata checkout のルートです（`setup.py:82-88`）。
-- 空文字を値に渡した場合は共通処理で未指定と同じ扱いになります。空でないパスは、システム用ディレクトリでないこと、ファイルではなくディレクトリであること、既存先または作成に必要な親ディレクトリへ書き込めることを共通 validator が調べます。存在しないパスは、最も近い既存親で書き込み可能性を試します（`setup.py:6389-6393`; `strata_control/folders.py:63-100`）。
+Mac parser は `--data-dir` を値付き引数として受理し、個別の型変換・選択肢制限は設けていない（`engine/metal/setup_mac.py:386-388`）。共有処理は指定値を `expanduser()` と `resolve()` で解決し、空値または未指定なら設定に記録されたデータフォルダーを使う。記録がなければ Strata フォルダーの隣にある `Strata-data` が既定先となる（`terminal/setup.py:7339-7348`）。
+
+指定先は絶対パスであること、システムフォルダーではないこと、既存ならディレクトリーかつ書き込み可能であること、未作成なら親ディレクトリーまで存在し書き込み可能であることを検査する。相対パス、ファイル、使用不能な場所などは拒否される。検査後、指定先の作成を試みる。作成に失敗すると警告を出し、データ先を Strata の実行フォルダーに切り替える（`terminal/strata_control/folders.py:77-110`、`terminal/setup.py:7344-7356`）。
 
 ## 実行時の動作
 
-Mac 用 `main()` はモデル選択などに進む前に `S.data_folder_for(a)` を呼び、data folder と、別の場所に残っている既存モデルデータの一覧を得ます（`metal/setup_mac.py:364-367`）。指定した新しいフォルダーへ、既存モデルが自動的に移動するわけではありません。
+Mac parser が得た値は `S.data_folder_for(a)` から共通の `data_folder()` に渡される（`engine/metal/setup_mac.py:412-414`、`terminal/setup.py:7429-7432`）。移動確認時に `--yes` がない場合、同一ドライブ上に既存データが見つかると「そのまま残す」か「移動する」かを尋ねる。`--yes` がある場合の既定は既存データを残して新しいダウンロードだけを指定先へ置くこと。`--move-data` はこの確認を省いて移動を選ぶ。既存データが一つもなければ、新しい場所が記憶先になる（`terminal/setup.py:7373-7409`）。
 
-- 既存データが同じドライブにあり、移動を選ばない場合は、既存データを元の場所に残し、新規ダウンロードは指定先に置きます。Mac parser の `--yes` は既定 false なので、対話可能なら選択を尋ねます。`--yes` を付けると既存データを残す側になり、`--move-data` を付けると移動側になります（`metal/setup_mac.py:340,344`; `setup.py:6381-6386,6410-6434,6472-6475`）。
-- `--set-default-data-dir` は、データを移動せず指定先を記憶する指定です。既存データが残る分岐でも指定先を設定に保存します（`metal/setup_mac.py:341`; `setup.py:6430-6432`）。それ以外も、data folder 処理の最後に選択先と Strata install path の一覧を設定へ保存します（`setup.py:6466-6469`）。既存設定は `setup.py:6251-6265` の共通設定読み書き処理で扱われます。
-- 移動が選ばれた場合、同じドライブ上の `models/`、`packs/`、`mtp/` を既存の宛先を保ちながら移し、参照先ファイルが移動して元に残らない場合は設定ファイルのパスも更新します。移動できなかったデータは元の場所に残り、警告されます。別ドライブにあるデータは大容量コピーを避けるため元の場所で使われます（`setup.py:6301-6327,6441-6465`）。
-- `--data-dir` はモデル保存先だけでなく、ディスク空き容量の表示・検査に使う場所にも影響します（`metal/setup_mac.py:380-382,420-422`）。ただし `--models-dir` を指定すると GGUF 保存先だけはそちらになり、data folder 側の pack や MTP などの用途は引き続き残ります（同 `:367,451-454,466-478,518-539`）。
-- 既存の設定があり、`--setup`、`--model`、`--check`、`--no-start`、`--update`、`--build` のいずれも指定しない場合、data folder 処理の後に既存設定でサーバーを起動します。この早期起動条件には `--data-dir` 自体は含まれません（`metal/setup_mac.py:364-371`）。
+別のデータ先を指定して既存データを残す場合、`--set-default-data-dir` も同時指定されていなければ設定上の記憶先は変更されない。`--set-default-data-dir` を加えると、移動せずに指定先を記憶する（`terminal/setup.py:7338-7342`、`terminal/setup.py:7398-7404`）。データを移動する場合は `models` 配下をファイル単位でマージし、`packs` と `mtp` は移動先に同名の項目がないときに移動する。設定ファイル内のパスも、ファイルが移動先にあり元の場所にはない場合に更新する。移動先の同名ファイルは保持され、移動できなかったファイルも元に残り得る（`terminal/setup.py:7405-7422`、`terminal/setup.py:7265-7307`）。
+
+Mac setup は戻り値のデータ先と、移動後もデータが残る場所を探索対象にする。モデル GGUF は通常 `<data-dir>/models/<モデル>` にダウンロードされ、pack、Metal 用生成物、MTP もデータ先の下に置かれる。`--models-dir` を指定すると GGUF の配置だけが別になります（`engine/metal/setup_mac.py:412-414`、`engine/metal/setup_mac.py:486-500`、`engine/metal/setup_mac.py:517-567`）。
 
 ## 適用条件と副作用
 
-`setup.py` が `sys.platform == "darwin"` かつ `STRATA_CONTROL_INSTALL` が `1` でない場合に限り Mac parser へ委譲します。Control install mode はこの委譲条件の対象外です（`setup.py:82,9068-9069`）。
-
-指定先が無効と判定された場合は `S.fail()` が停止し、既定の案内ではダウンロードも設定変更もしない旨を表示します（`setup.py:6391-6393,904-909`; 検証条件は `strata_control/folders.py:63-100`）。検査後のディレクトリ作成で `OSError` が起きた場合は警告して `home()` にフォールバックします（`setup.py:6398-6402`）。
-
-有効な指定先はディレクトリ作成、設定ファイル更新、選択内容に応じたモデルデータ移動を伴うことがあります。`--data-dir` 単独で既存ファイルを移動する指定ではありませんが、`--move-data` との組み合わせでは移動が発生します（`setup.py:6398-6402,6410-6469`）。
+- この文書のスコープは `source-setup/mac`。トップレベル `setup.py` は macOS で通常の Metal setup を起動すると `engine/metal/setup_mac.py` に引数を渡す（`terminal/setup.py:9207-9211`、`terminal/setup.py:11218-11219`）。
+- パス検証後に指定フォルダーを作成し、条件に応じて既存の `models`、`packs`、`mtp` を移動し、設定ファイルとアプリ設定のデータ先を変更する。`--data-dir` だけでは既存ファイルを移動しない。
+- `--move-data` と `--set-default-data-dir` は `--data-dir` と組み合わせる補助オプション。`--move-data` が有効なら同じドライブの既存データを移動する。別ドライブのデータは移動せず、既存場所を探索対象に残す（`terminal/setup.py:7391-7424`）。
+- `--models-dir` は GGUF の保存先を別途変更し、`--gguf-dir` は既存 GGUF の利用先を指定する。`--data-dir` と併用可能で、それぞれデータ一式の保存先、GGUF の保存先／入力先として別々に使われる（`engine/metal/setup_mac.py:414`、`engine/metal/setup_mac.py:486-500`）。
 
 ## 出力とエラー
 
-- 無効な指定先は理由と対処案を表示して終了コード 1 で停止します（`setup.py:6391-6393,904-909`）。
-- 指定先の作成時に失敗すると警告を出し、`home()` を使って続行します（`setup.py:6398-6402`）。設定保存の失敗も警告されます（`setup.py:6258-6265`）。
-- 同じドライブの既存データについて移動選択が必要なときは、保持または移動を尋ねます。`--yes` の場合は確認を行わず保持側になります（`setup.py:6418-6429`; Mac parser の既定は `metal/setup_mac.py:344`）。
+指定パスが無効な場合、共通 `fail()` が理由と案内を表示し、setup を終了コード `1` で停止する。指定パスの検証失敗については「何もダウンロード・変更しておらず、データ先として保存していない」と案内される（`terminal/strata_control/folders.py:83-108`、`terminal/setup.py:7344-7347`、`terminal/setup.py:1049-1057`）。
+
+データ先フォルダーを作成できない場合は警告を出して実行フォルダーへフォールバックする。設定ファイルの保存に失敗した場合も警告を出すが、`save_settings()` 自体はその場で終了しない（`terminal/setup.py:7352-7356`、`terminal/setup.py:7215-7223`）。セットアップ全体の後続失敗や終了コードは別のエラー経路に依存するため、このオプション固有の結果としては特定できない。
 
 ## 根拠
 
-- Mac 側 parser と引数処理: `metal/setup_mac.py:327-367`。
-- setup.py から Mac 実装への委譲: `setup.py:7703-7707,9062-9069`、shell wrapper: `setup.sh:76`。
-- data folder の既定値、検証、選択、移動、設定保存: `setup.py:6251-6265,6301-6327,6378-6475`。
-- パス validator: `strata_control/folders.py:63-100`。
-- Mac 側の `models/`、pack、Metal/MTP の利用: `metal/setup_mac.py:365-367,451-505,518-539`。
-
-## 調査範囲
-
-対象 revision は上記 SHA で、確認時の `git status --short --branch` は `## main...origin/main`（working tree clean）でした。Mac 実機での動作、実際のファイルシステム条件による失敗挙動、CLI `--help` の出力は実行していません。説明はこの revision の parser と共通実装の静的確認に基づきます。
+- `engine/metal/setup_mac.py:386-388` — Mac parser 定義と `--move-data`、`--set-default-data-dir` の関係。
+- `terminal/setup.py:7338-7424` — 既定先、検証後の処理、移動・記憶条件、残存フォルダーの扱い。
+- `terminal/setup.py:7429-7432` — Mac parser の引数から共通データフォルダー処理への引き渡し。
+- `terminal/strata_control/folders.py:77-120` — パスの有効条件と拒否理由。
+- `terminal/setup.py:7265-7307`、`terminal/setup.py:7208-7223` — ファイル移動、設定内パス更新、設定保存。
+- `engine/metal/setup_mac.py:412-414`、`engine/metal/setup_mac.py:486-567` — Mac setup におけるデータ先の探索、GGUF・pack・生成物の利用。
+- `terminal/setup.py:9207-9211`、`terminal/setup.py:11218-11219` — `setup.py` から Mac 用 setup への委譲。

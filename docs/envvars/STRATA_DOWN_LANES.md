@@ -1,49 +1,43 @@
 # `STRATA_DOWN_LANES`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-SYCL の grouped expert down kernel で、1 行の計算を担当する lane 数を選びます。対象ファイル内の `native_down_kernel` は 256 work-item の work-group を `256 / lanes` 行に分けるため、この値は行あたりの並列度と work-group 内の行数を決めます。Strata はこの値をモデルや他の backend 全般には適用せず、SYCL の `native_expert_grouped` が lane kernel を起動する経路で使います。
+SYCL エンジンの grouped native expert down-projection kernels で、1 行の計算を分担する lane 数を指定する。選択値は `launch_down_lanes` のテンプレート引数となり、選択した down kernel の行あたりの lane 分割に使われる。CUDA/HIP 側の同名設定は確認できず、この読み取りは `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp` 内にある（`iq_kernels.dp.cpp:4478-4487,5991-5999`）。
 
 ## 値と判定
 
-環境変数の文字列を `std::atoi` で整数に変換し、結果が `4`, `8`, `16`, `32` のときだけ採用します。それ以外は compile-time の `kExpertLanes` に戻ります。`atoi` のため文字列全体の厳密な検証はなく、先頭の空白や符号を許し、数値の後ろにある非数値部分を無視します（例: `" 16tail"` は `16`）。`""`, `"0"`, 負数、数値で始まらない文字列は有効値になりません。
+`lanes_env` は `std::getenv` で値を取得し、設定されていれば `std::atoi` で整数変換する。変換結果が `4`, `8`, `16`, `32` のいずれかの場合だけ採用し、それ以外は `kExpertLanes` に戻す。未設定の場合も `kExpertLanes`。このソースでは `STRATA_EXPERT_LANES` が別途定義されていなければ 8 である（`iq_kernels.dp.cpp:1173-1180,4481-4485`）。
 
-| 環境値 | 判定結果 |
-|---|---|
-| 未設定 | `kExpertLanes` |
-| 空文字 | `atoi` が `0` を返すため `kExpertLanes` |
-| `4`, `8`, `16`, `32`（または `atoi` が同じ値を返す文字列） | その値 |
-| その他の値 | `kExpertLanes` |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| SYCL engine | ビルド時の `STRATA_EXPERT_LANES`（既定 8） | `atoi` の結果が 4 / 8 / 16 / 32。例: `4`, `8`, `16`, `32`, `8tail`, `  +8` | それ以外はビルド既定値。例: 空文字、`0`, `0anything`, `3`, `-4`, `true`, `  ` |
 
-`kExpertLanes` は `STRATA_EXPERT_LANES` の compile-time 値で、マクロ未定義時は `8` です。ビルド時にマクロを上書きしている場合は、その値が fallback になります。dispatch の switch は `4`, `16`, `32` を個別に選び、それ以外を 8-lane kernel に割り当てます。
+文字列全体の妥当性検査や大文字小文字の判定はない。`atoi` が読む数値 prefix だけで判定するため、`8tail` は 8 として採用され、非数値文字列や空文字は 0 となって既定値に戻る。値は clamp されず、許可された 4 値以外はすべて既定値になる。`atoi` の変換範囲を超える文字列については、このコードから定義された fallback を保証できない。
 
 ## 有効になる条件
 
-- SYCL build の grouped native expert 経路であること。通常の CUDA/HIP 実装や別 backend がこの読み取り箇所を共有している証拠はありません。
-- モデルの expert layout が native 経路として選ばれ、`native_expert_grouped` に到達すること。SYCL の生成処理は各 layer の形式を `native_expert_supported` で事前確認します。
-- down kernel が起動し、かつその format / runtime 分岐が `launch_down_lanes` を使うこと。`kSplit<TD>` の format で `STRATA_EXPERT_SPLIT` が有効、かつ `STRATA_OLD_IQ_MMVQ` が無効なら multi-entry down kernel に進み、この変数は読まれません。split 形式でも旧 kernel が有効なら lane kernel が使われます。
-
-`STRATA_DOWN_LANES` 自体に OS、CLI、モデル状態による値の上書きはありません。kernel 経路がこの値を使わない場合には、設定値が有効でも動作への効果はありません。
+- `engine/sycl` の SYCL build に含まれる kernel 経路が対象。`engine/sycl/CMakeLists.txt:40-45` は `iq_kernels.dp.cpp` を `strata_kernels` のソースとして登録する。CUDA/HIP engine でこの変数を読む箇所は見つからなかった。
+- grouped native expert の down projection が呼ばれ、型別 dispatch が `launch_down<TD>` を選ぶ必要がある。通常の `native_expert_grouped` は down の形式を `L.d_type` で dispatch する（`iq_kernels.dp.cpp:7767-7770,7948-7982`）。SYCL verify-window と remote-expert の native layout 経路からこの関数が呼ばれる（`engine/sycl/src/core/verify.cpp:1726-1749`; `engine/sycl/src/core/remote_experts.cpp:431-442`）。
+- `STRATA_OLD_IQ_MMVQ` が有効な場合、または `STRATA_EXPERT_SPLIT` が無効な場合、split 形式を含む down kernel は lane kernel 経由となる。split ではない形式も lane kernel 経由である。split 形式で `STRATA_EXPERT_SPLIT` が有効かつ旧 kernel が無効の場合は `launch_down_multi` に進むため、この変数による lane 分割は使われない（`iq_kernels.dp.cpp:3927-3938,6115-6120`; `kSplit` の形式別指定は `iq_kernels.dp.cpp:1246-1253` 以降）。
+- down type 42 では、`STRATA_OLD_IQ_MMVQ` と `STRATA_EXPERT_SPLIT` が無効で、選ばれた値が 8、かつ `q2_word_expand_enabled` が true の場合、`launch_down_q2_word_expand` に分岐して lane dispatch を通らない。`STRATA_SYCL_Q2_WORD_EXPAND` の先頭文字が `0` ならこの fast path 判定は false となる。Battlemage 以外の device でも false（`iq_kernels.dp.cpp:3942-3951,6101-6106`）。
+- down type 20 では `STRATA_IQ4NL_DOWN_SLM` が有効で、旧 kernel が無効、かつ `L.n_embd == 2560` / `L.n_ff == 640` の場合に SLM kernel へ分岐し、lane dispatch を通らない（`iq_kernels.dp.cpp:6108-6113`）。
+- 該当 fast path が選ばれなければ、値は 4 / 8 / 16 / 32 の down lane kernel に対応する template specialization を選ぶ（`iq_kernels.dp.cpp:5991-5999,6115-6120`）。
 
 ## 実行時の詳細
 
-`down_lanes()` は `static const int` に結果を保存し、`launch_down_lanes()` から選択時に初期化します。したがって、最初の該当 dispatch で環境を読み、その後の dispatch では同じプロセス内の cache 値を使います。プロセス起動後に環境を書き換えても、初回評価後の値は変わりません。プロセス起動時に別のコードが先にこの関数を呼ぶわけではなく、`native_expert_grouped` の down 処理から lane kernel に進んだ時点が読み取り契機です。
+値は `down_lanes()` 内の関数ローカル `static const int` に初回評価時に保存される。実行中にプロセス環境を変更しても、このプロセスでは再評価されない。実際に `launch_down_lanes` または type 42 の lane 数判定へ到達するまでは評価されない（`iq_kernels.dp.cpp:4481-4487,5991-5999,6101-6106`）。
 
-採用値に応じて `down_port_km<TD, LN>` が `LN=4/8/16/32` の kernel を起動します。down kernel は各 work-item の lane ID を `LN` で分け、`256 / LN` 個の行を処理します。環境値の parse や選択について専用ログ、警告、エラー出力はありません。無効値は既定値へ fallback し、値自体を理由に終了・失敗する経路もありません。kernel 起動後の SYCL エラー処理は `native_expert_grouped/down` の共通 `check()` 経路です。
-
-この変数は down の lane kernel 選択だけを変えます。Strata のコードから性能差や数値結果の同一性を一般化できる測定根拠は確認できません。
+値は down projection の kernel 選択だけに使われる。gate/up projection には別の `STRATA_GU_LANES` 読み取りがある。`STRATA_DOWN_LANES` を gate/up の lane 値としても使う処理は確認できなかった（`iq_kernels.dp.cpp:4486-4487,5991-5999`）。設定の読み取り失敗や無効値に対する警告・終了処理はなく、既定値へ静かに fallback する。
 
 ## 根拠
 
-- 候補一覧への掲載: `docs/envvars/000_envvers.md:712`。
-- SYCL grouped expert 用の compile-time 既定値: `sycl/src/kernels/cuda/iq_kernels.dp.cpp:887-894`。
-- `atoi`、許容値検査、`down_lanes()` の static cache: `sycl/src/kernels/cuda/iq_kernels.dp.cpp:4487-4496`。
-- lane 数に応じた kernel の dispatch と fallback 先: `sycl/src/kernels/cuda/iq_kernels.dp.cpp:4560-4569`。
-- down kernel の launch path。split format の場合に multi-entry kernel を選ぶ条件: `sycl/src/kernels/cuda/iq_kernels.dp.cpp:4622-4634`。
-- grouped native expert の down format dispatch と終了後の `check`: `sycl/src/kernels/cuda/iq_kernels.dp.cpp:5761-5795`。
-- down kernel 内で `LN` が行数と lane ID の分割に使われる箇所: `sycl/src/kernels/cuda/iq_kernels.dp.cpp:2330-2345`。
-- split kernel と runtime selector の定義: `sycl/src/kernels/cuda/iq_kernels.dp.cpp:959-964,1018,1050,1087,1126,1171,1219,1244,1272,1309-1311,3200-3210`。
-- SYCL 生成処理が native expert 対応形式を事前確認する箇所: `sycl/src/program/generate.cpp:2664-2676`。
-- grouped expert を native layout で起動する server-side expert 経路: `sycl/src/core/remote_experts.cpp:431-442`。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:1173-1180` — compile-time 既定 lane 数（未定義時 8）。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4481-4487` — `getenv`、`atoi`、有効値集合、既定値、static cache。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:5991-5999,6101-6120` — down lane specialization の選択と lane dispatch を迂回する条件。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:7767-7775,7948-7982` — grouped expert down 経路の入り口・down 型 dispatch。
+- `engine/sycl/src/core/verify.cpp:1726-1749`; `engine/sycl/src/core/remote_experts.cpp:431-442` — SYCL verify と remote-expert native layout 呼び出し。
+- `engine/sycl/CMakeLists.txt:40-45` — 対象 kernel source の SYCL build 登録。
+
+`docs/DETAILS.md` と Strata の Markdown docs には、この変数の動作や測定値の記述は見つからなかった。性能・数値出力への影響は測定していない。

@@ -1,61 +1,60 @@
-# `--batch-telemetry`
+# `strata serve --batch-telemetry`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
 | コマンド | `strata serve` |
 | オプション | `--batch-telemetry` |
-| 別名 | `--no-batch-telemetry`（無効化。`argparse.BooleanOptionalAction` が生成） |
-| 値 | 値を取らない真偽値スイッチ |
+| 別名 | `--no-batch-telemetry`（無効化する否定形） |
+| 値 | 値を取らない boolean フラグ |
 
 ## 役割
 
-対応するネイティブ Strata engine に、batch decode window の低頻度サンプルを有効化します。サンプルは monitor 用の `BSTAT`（処理 verifier row 数と稼働 request slot 数）です。`--batch-groups` を使う pipelined path では、stage の host 側 in-flight 時間を表す `PSTAT` も有効になります。これらは GPU 使用率や生成 token 数を表す値ではありません（`src/program/generate.cpp:11364-11375,11739-11742,11852,11914-11920`; `include/strata/core/batch_telemetry.hpp:12-20,49-63`）。
+通常は無効なエンジンの decode batch window 計測を有効にし、処理した verifier row 数と稼働中 request slot 数を `/v1/telemetry` に含めます。対応するエンジンは計測値を標準出力の内部 protocol 行でサーバーへ送り、サーバーが request の token 出力から分離して保持します。これは GPU 使用率ではなく、batch window の仕事量を観測するための値です（`terminal/strata_cli/cli.py:78-79`、`engine/src/program/generate.cpp:16721-16740`、`terminal/serve/server.py:1041-1045`、`terminal/serve/server.py:7130-7141`）。
 
 ## 使い方
 
 ```sh
-strata serve --profile /path/to/run-config.json --batch-telemetry
-strata serve --profile /path/to/run-config.json --no-batch-telemetry
+# run config の推論サーバーを foreground で起動し、対応エンジンの batch 計測を有効にする
+strata serve --config ./run-config.json --batch-telemetry
+
+# 起動せず、解決された起動計画を確認する
+strata serve --config ./run-config.json --batch-telemetry --plan
 ```
 
-`--profile` はこのコマンドでは run config のパスを受け取ります。オプションは `strata serve` に属し、値は付けません（`strata_cli/cli.py:45-58`）。
+`--config` は `--profile` の alias です。`--plan` は起動計画を出力して終了するため、サーバーや推論エンジンは起動しません（`terminal/strata_cli/cli.py:67-69`、`terminal/strata_cli/cli.py:974-981`）。
 
 ## 値と既定値
 
-- `--batch-telemetry` が true、`--no-batch-telemetry` が false です。どちらも値引数を受け付けません。値を後ろに付けると余分な引数として拒否されます（`strata_cli/cli.py:57-58,2223-2231`）。
-- parser 上の既定値は `None`（未指定）です。最終値の優先順位は、コマンド指定、保存 profile の override、run config の `batch_telemetry`、`STRATA_BATCH_TELEMETRY`、既定の false です。環境変数は未設定なら無視され、設定済みなら文字列が厳密に `1` のときだけ true、それ以外は false として解決されます（`strata_cli/cli.py:745-769`）。
-- run config の `batch_telemetry` は JSON 真偽値でなければなりません。文字列や数値などは `batch_telemetry must be true or false` で拒否されます（`serve/server.py:8241-8254`）。保存 profile の値も bool に限られ、`profile set` では小文字 `true` / `false` を指定します（`strata_control/profiles.py:88-95,98-117`）。
-- CLI で指定しなかった場合でも、優先順位の結果が run config 以外（profile または環境変数）なら、Terminal CLI は解決済み真偽値を server の `--batch-telemetry` / `--no-batch-telemetry` に明示して渡します。run config 値と組み込み既定値の場合は server 側で解決します（`strata_cli/cli.py:798-805`）。
+- 値を伴わないフラグです。`argparse.BooleanOptionalAction` により `--batch-telemetry` が有効、`--no-batch-telemetry` が無効を指定し、CLI parser 上の既定値は `None`（未指定）です（`terminal/strata_cli/cli.py:78-79`）。サーバー側にも同じ option 定義があります（`terminal/serve/server.py:8671-8672`）。
+- 未指定時は保存 profile、run config、環境変数の順に設定を探し、いずれもなければ無効です。CLI 指定が最優先です（`terminal/strata_cli/cli.py:783-803`）。
+- `STRATA_BATCH_TELEMETRY` が存在し、他の設定がない場合、Terminal CLI は値が厳密に `1` のとき有効、それ以外は無効として扱います（`terminal/strata_cli/cli.py:799-802`）。環境変数の説明は [`STRATA_BATCH_TELEMETRY`](../../../envvars/STRATA_BATCH_TELEMETRY.md) を参照してください。
+- run config の `batch_telemetry` は JSON boolean である必要があります。別の型ならサーバー parser が `batch_telemetry must be true or false` で起動を拒否します（`terminal/serve/server.py:8767-8768`）。保存 profile でも値は `true` / `false` のみ受理されます（`terminal/strata_control/profiles.py:88-95`、`terminal/strata_control/profiles.py:113-116`）。
 
 ## 実行時の動作
 
-通常の単一 engine 起動では、server が親環境と run config の `env` をもとに子環境を作り、CLI 指定があれば config より優先して適用します。true は子環境の `STRATA_BATCH_TELEMETRY=1` にし、false はその変数を削除します。未指定時は config 値を使い、config も未指定なら継承環境を保ちます（`serve/server.py:914-920,3499-3512,8350-8351,8414-8418`）。
+Terminal CLI は、優先順位で決めた値の由来がコマンド指定・保存 profile・環境変数の場合、その boolean を `--batch-telemetry` または `--no-batch-telemetry` としてサーバーへ渡します。run config 由来と既定値の場合はサーバー引数へ重ねず、run config または継承環境を使います（`terminal/strata_cli/cli.py:837-844`）。サーバーは単一エンジン経路で子プロセス用環境を組み立て、明示値または config 値が true なら `STRATA_BATCH_TELEMETRY=1` を設定し、false ならその変数を取り除きます。どちらも指定がなければ継承値を維持します（`terminal/serve/server.py:705-712`、`terminal/serve/server.py:8873-8878`）。split fallback に切り替える場合もこの環境設定が適用されます（`terminal/serve/server.py:8272-8308`）。
 
-ネイティブ engine は batch 生成ループ開始時に `STRATA_BATCH_TELEMETRY` を一度読み、値全体が `1` のときだけ測定を有効にします（`src/program/generate.cpp:11364-11375`）。有効な batch window を集計し、おおむね1秒ごと、または全 slot が idle になった時点で最後の部分サンプルを出します。処理 row 数には pipeline padding や batch MTP の row が含まれる場合があり、単一 request の solo path には batch sample がありません（`include/strata/core/batch_telemetry.hpp:12-47`; `src/program/generate.cpp:11691,11852`）。
-
-`PSTAT` は複数 stage の pipelined path だけで計測し、launch から完了 poll までの host 経過時間を含みます。GPU kernel occupancy と解釈できません（`src/program/generate.cpp:11739-11742,11801,11887-11920`; `include/strata/core/batch_telemetry.hpp:49-63,65-98`）。server は `BSTAT` / `PSTAT` 行を検証して telemetry sample として保持し、request の token stream には渡しません（`serve/server.py:923-935,1204-1213`）。
+エンジンの `generate.cpp` は環境変数が厳密に `1` の場合だけ sampler を有効にします。batch window 完了時の集計はおおむね 1 秒ごとに出力され、全 slot が idle になった時は最終の部分集計を出します。計測対象 row には pipeline の padding row と MTP row も含まれます。server は `BSTAT` 行を token stream に流さず、最後に受け取った sample を `/v1/telemetry` の work 情報へ追加します（`engine/include/strata/core/batch_telemetry.hpp:12-20,27-40`、`engine/src/program/generate.cpp:16733-16740`、`terminal/serve/server.py:1041-1045`、`terminal/serve/server.py:7130-7141`）。この設定は pipeline stage sampler も有効化します（`engine/src/program/generate.cpp:17423-17427,18243-18250`）。
 
 ## 適用条件と副作用
 
-- `--engine strata` のネイティブ engine が batch decode を行う場合にサンプルが得られます。`--engine mock` でも parser はこの option を受理しますが、MockEngine の生成分岐はこの telemetry 設定を使わず、ネイティブ `BSTAT` / `PSTAT` は出しません（`strata_cli/cli.py:48-50,57-58`; `serve/server.py:8343-8351,8425-8430`）。
-- option は sampling を有効にして engine 標準出力へ制御行を追加します。Python server がその行を消費するため、request 本文には混ざりません。既定の false では sampler が無効で `BSTAT` は出力されません（`src/program/generate.cpp:11368-11375`; `include/strata/core/batch_telemetry.hpp:19-29`; `serve/server.py:1204-1213`）。
-- **replica 起動には明示値が子 engine へ伝わらない経路があります。** server は通常起動用 `env` に option を反映しますが、replica 分岐は各子 engine 用に `child_env(rc, ...)` を作り直し、その後 `configure_batch_telemetry_env()` を呼びません。このため replica mode で CLI の `--batch-telemetry` / `--no-batch-telemetry` や run config の `batch_telemetry` だけに依存した場合、その値が各子へ反映されないことがあります。各 replica は親環境と replica config の `env` をもとに環境を作ります（`serve/server.py:8350-8351,8414-8418,7966-7983`; `serve/replicas.py:91-105`; `serve/server.py:3499-3512`）。
-- CUDA/HIP/SYCL の実機でのビルド・計測結果はこのソース調査では確認していません。Telemetry 値の運用上の説明は [`STRATA_BATCH_TELEMETRY`](../../../STRATA_BATCH_TELEMETRY.md) も参照してください。
+- `engine/src/program/generate.cpp` でこの環境変数を読むことを確認しました。別の実行ファイルを指定した場合、その実装が同じ環境変数と protocol に対応するかはこの調査では確認できません。
+- replica および split の通常起動経路は、それぞれ replica / role ごとに `child_env(...)` を作ってエンジンを開始し、単一エンジン経路にある `configure_batch_telemetry_env(...)` を呼びません（`terminal/serve/server.py:8956-8961`、`terminal/serve/server.py:8313-8336`、`terminal/serve/server.py:8383-8403`）。そのため、この CLI option による環境変数の明示設定がこれらの子エンジンへ渡ることはソース上で確認できません。環境変数が起動元から継承される場合の値は別途 `child_env` の処理に従います（`terminal/serve/server.py:3870-3874`）。
+- 対応エンジンは内部 protocol 用の `BSTAT`（および pipeline 用の `PSTAT`）を標準出力へ追加します。サーバーはこれらを request token として扱わず sample にします。ファイル変更や外部ネットワーク接続をこの option が行う処理は確認できません（`engine/src/program/generate.cpp:16733-16740,18243-18250`、`terminal/serve/server.py:1041-1049`）。
+- 計測が無効、未対応、またはまだ sample が届いていない場合、batch sample は telemetry 応答に現れません。server は `/v1/telemetry` で `svc.metrics()` を返します（`terminal/serve/server.py:7034-7039`、`terminal/serve/server.py:7130-7141`）。
 
 ## 出力とエラー
 
-- 無効な run config の型は server parser の `ap.error()` によって拒否されます。CLI から余分な値引数を付けた場合も argparse の unrecognized-arguments エラーになります（`serve/server.py:8253-8254`; `strata_cli/cli.py:2223-2231`）。
-- ネイティブ engine は `BSTAT <windows> <processed_rows> <active_rows> <elapsed_ms>` の形式で出力します。server は長さ80文字以下、正数・上限・row/active 関係を満たす行だけ受理し、不正な行は無視します（`src/program/generate.cpp:11368-11375`; `serve/server.py:923-935,1204-1208`）。
-- `PSTAT` の集計値は stage の launch / 完了 poll の時刻差です。sampler は stage 数2〜16の範囲で有効になります（`include/strata/core/batch_telemetry.hpp:54-63`）。
+- 有効時、対応エンジンは `BSTAT <window数> <processed rows> <active rows> <elapsed ms>` を標準出力へ出します。server がこの制御行を消費するため、クライアントの生成 token には入りません（`engine/src/program/generate.cpp:16733-16740`、`terminal/serve/server.py:1041-1045`）。
+- option 自体に値の validation はありません。無効な run config 値は前述の parser error で拒否されます。CLI の parser は未知の引数を `ap.error(...)` に渡すため、値を後置しても値付き option として受理される定義ではありません（`terminal/strata_cli/cli.py:2325-2334`）。
 
 ## 根拠
 
-- `strata_cli/cli.py:45-58` — `strata serve` parser と option 定義、BooleanOptionalAction。
-- `strata_cli/cli.py:745-779,798-805` — 値の優先順位、既定値、server 引数への反映。
-- `serve/server.py:914-920,923-935,1204-1213,3499-3512,8241-8254,8343-8351,8414-8430` — 環境設定、protocol 処理、validation、単一・replica・mock 起動経路。
-- `serve/replicas.py:91-105` — replica ごとの config / 環境差分。
-- `src/program/generate.cpp:11364-11375,11691,11739-11742,11801,11852,11887-11920` — native sampler の有効化・BSTAT/PSTAT 出力と batch 経路。
-- `include/strata/core/batch_telemetry.hpp:12-47,49-108` — batch window および stage host span の集計条件。
+- `terminal/strata_cli/cli.py:62-88` — Terminal CLI の `serve` parser、両方向 option と既定値。
+- `terminal/strata_cli/cli.py:783-818,837-844` — profile / run config / environment / default の解決とサーバー引数への反映。
+- `terminal/serve/server.py:705-712,8671-8673,8767-8768,8873-8878,8956-8961` — サーバー parser、config 検証、engine 環境の設定と経路分岐。
+- `engine/include/strata/core/batch_telemetry.hpp:12-40`、`engine/src/program/generate.cpp:16721-16740,17423-17427,18243-18250` — 計測値、出力条件、batch / pipeline sampler。
+- `terminal/serve/server.py:1041-1049,7034-7039,7130-7141` — 制御行の消費と telemetry 応答への反映。

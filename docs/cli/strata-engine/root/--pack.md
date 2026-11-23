@@ -1,57 +1,56 @@
-# `strata generate --pack`
+# `--pack`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（エンジンの root 引数 parser） |
+| コマンド | `strata generate` |
 | オプション | `--pack` |
 | 別名 | なし |
-| 値 | pack ディレクトリのパス（文字列） |
+| 値 | パックのディレクトリを表す文字列（`DIR`）。parser に型・形式・範囲の検査はない |
 
 ## 役割
 
-推論エンジンがモデルの重みと expert を読む pack ディレクトリを指定します。引数を省略すると `pack/full` を使います。エンジンの usage は `--pack DIR` と表示し、必須のトークン入力と併用する形式を示しています（`src/program/generate.cpp:1011-1017`）。
+推論エンジンが重みパックと expert layout を読むディレクトリを指定する。`strata generate` はパック内の `native_experts.txt` を調べて expert の形式を決め、`index.txt` とそこに記された重みファイルを読み込む。`native_experts.txt` がないパックは標準形式として扱われる。`--serve` で会話キャッシュの SSD spill を有効にした場合は、パックの場所からデータディレクトリを推定する用途にも使われる。
 
 ## 使い方
 
 ```sh
-strata generate --pack /path/to/pack --tokens "1,2,3"
+# パックと事前トークン化した入力を指定して生成する
+strata generate --pack /data/packs/model-a --tokens "1,2,3"
 ```
-
-`--tokens` は `strata generate` の usage が示す必須の入力例です。CLI の parser は `--pack` の値を pack path として保存します（`src/program/generate.cpp:1013-1017,3294-3303`）。
 
 ## 値と既定値
 
-- 値はディレクトリのパス文字列です。型・存在確認・値域検証は parser では行わず、指定値を `Options::pack` に代入します（`src/program/generate.cpp:594-598,3294-3303`）。
-- 省略時は `pack/full` です（`src/program/generate.cpp:596,1015`）。
-- 値を省略すると `next()` が標準エラーに `--pack needs a value` を出して終了コード 2 で終了します（`src/program/generate.cpp:3294-3297`）。重ねて指定した場合は parser が値を都度代入するため、最後に指定した値が残ります（`src/program/generate.cpp:3294-3303`）。
-- 空文字列や存在しないパスを parser 自体は拒否しません。後続のファイル読み込みで失敗します。
+- 省略時は `pack/full`。相対パスの場合、ソースは与えられた文字列に `/native_experts.txt` や `/index.txt` を連結して開くため、実行時の作業ディレクトリを基準に解決される（`engine/src/program/generate.cpp:755`、`engine/src/kernels/cpu/expert_layout.cpp:505`、`engine/src/core/weights.cpp:95-97`）。
+- `--pack` の値は次の argv 要素をそのまま文字列として代入する。空文字列や重複指定を parser 自身は拒否せず、複数指定時は後の値が残る。パックの存在・構造は後段の読み込み処理で確認される（`engine/src/program/generate.cpp:3837-3846`）。
+- 値がない場合は `--pack needs a value` を stderr に出して終了コード 2 で終了する（`engine/src/program/generate.cpp:3839-3841`）。
 
 ## 実行時の動作
 
-- 起動時に `<pack>/native_experts.txt` を調べます。ファイルがなければ標準の expert layout として扱い、存在すれば native layout を読み込みます。native layout の解析に失敗すると、その理由を `strata generate:` 付きで標準エラーに出して終了コード 1 です（`src/kernels/cpu/expert_layout.cpp:435-451`、`src/program/generate.cpp:4426-4433`）。
-- 通常の重みは `<pack>/index.txt` からサイズと tensor 情報を得て GPU arena を確保し、各重みファイルをロードします。index が開けない場合は `cannot open <pack>/index.txt`、重みファイルが開けない場合はそのファイル名を含むエラーとなり、エンジンは終了コード 1 を返します（`src/core/weights.cpp:93-110,176-184`、`src/program/generate.cpp:4866-4872,4916-4922`）。ロード成功時は読込量と pack path を標準エラーに記録します（`src/program/generate.cpp:4924-4932`）。
-- `native_experts.txt` がある native pack では、engine は `--native SHARD1`、`--spec T`（`T >= 2`）、および prefill 条件を要求します。不足時は要件を標準エラーに出して終了コード 2 です（`src/program/generate.cpp:4766-4777`）。
-- `--mmap-experts` 併用時は `<pack>/experts.bin` を memory map します。native pack に `experts.bin` がない場合は native layout が示す model GGUF shard から expert を読みます。source を開けない場合は、通常はエラーを表示して終了コード 1、RAM 不足後の fallback 経路では arena 読み込みへ戻ります（`src/program/generate.cpp:7091-7117`）。
+1. 起動時に `native_experts.txt` を読み、存在しなければ標準形式の expert layout を設定する。存在する場合は native expert layout として解析する。native パックでは、さらに `--native SHARD1`、`--spec T`（`T >= 2`）などが必要で、条件を満たさなければ終了コード 2 で拒否される（`engine/src/kernels/cpu/expert_layout.cpp:501-516`、`engine/src/program/generate.cpp:5355-5363,5753-5760`）。
+2. `index.txt` の pool サイズを使って重み領域を確保し、`WeightTable` が index とそこに記された重みファイルを読み込む。ファイルが存在しない、index のヘッダーや行が不正、読み込みに失敗する場合はエラーを stderr に出して終了コード 1 となる（`engine/src/program/generate.cpp:5965-5969,6016-6029`、`engine/src/core/weights.cpp:93-122,176-223,308-313`）。
+3. `--serve` と会話キャッシュ SSD spill の組み合わせでは、明示的な spill ディレクトリがなければ、`--pack` の親ディレクトリ名が `packs` の場合にその親をデータディレクトリとみなし、`conversation-spill` を作成する。条件を満たさない場合は SSD tier を有効にせず、その理由を stderr に出す（`engine/src/program/generate.cpp:13965-13987,14001-14012`）。
 
 ## 適用条件と副作用
 
-- `--pack` は pack ディレクトリ内の index、重み、expert layout を読み込む場所を変えます。パスの作成・書き換えはこの option の処理では行いません（`src/core/weights.cpp:93-110,176-184`、`src/kernels/cpu/expert_layout.cpp:435-451`）。
-- pack に `native_experts.txt` がなく CPU が必要な expert kernel 機能を持たない場合、エンジンは標準 Q2_0 pack と判定し、AVX-512 要件を説明してから CPU feature の拒否処理を呼びます。native pack で AVX-512 がない場合は利用する CPU kernel を標準エラーに案内します（`src/program/generate.cpp:4621-4645`）。
-- native pack の読み込み経路は `--native` 等の条件に依存します。異なる pack 形式に対する適合性は parser では検査せず、各 pack metadata と後続 loader が検証します（`src/program/generate.cpp:4426-4433,4766-4777`）。
+- このオプションは `strata-engine` の `strata generate` parser のもの。Terminal CLI の同名オプションとは別スコープである。索引では `strata-engine` のトップレベル `root` に掲載されている（`docs/cli/README.md` の `strata-engine` 節、`engine/src/program/generate.cpp:1206-1212,3844-3846`）。
+- `native_experts.txt` があるパックは、native expert 対応なしでビルドされたエンジンでは拒否される。layout のバージョンや行形式、量子化形式に問題がある場合も読み込みに失敗する（`engine/src/kernels/cpu/expert_layout.cpp:512-534,545-557`）。
+- パックの重み読み込みは GPU 重み領域を確保し、重みデータを読み込む。`--pack` 自体が通常のパックファイルを書き換える処理は確認できない（`engine/src/program/generate.cpp:5970-6008,6016-6030`）。一方、前述の serve spill 条件では `conversation-spill` ディレクトリを作成し、SSD tier の session ファイルを扱う（`engine/src/program/generate.cpp:13965-14012`）。
+- 位置引数相当の値の検証は parser では行わず、実ファイルの読み込み時に失敗する。`--tokens` も通常の `generate` では必要だが、これは `--pack` とは別の必須条件である（`engine/src/program/generate.cpp:4991-5002`）。
 
 ## 出力とエラー
 
-option 自身には成功時の独立した出力はありません。pack の読み込み後、重みの読込量と使用 path が標準エラーに表示されます。pack metadata やファイルが欠けている・壊れている場合は loader の診断を標準エラーに出し、読み込み失敗は通常終了コード 1、native pack の必須 option 不足は終了コード 2 になります（`src/program/generate.cpp:4426-4433,4766-4777,4866-4872,4916-4932`）。
+- パックの `native_experts.txt` を解析できない場合、エラー文を stderr に出し、呼び出し元で終了コード 1 となる（`engine/src/program/generate.cpp:5358-5362`）。
+- 重み index やそのデータファイルを開けない場合、`WeightTable` のエラー文を stderr に出して終了コード 1 となる。index に有効な pool ヘッダーがない場合や行の形式が不正な場合も同様に失敗する（`engine/src/core/weights.cpp:93-122,176-223,308-313`、`engine/src/program/generate.cpp:5965-5969,6016-6019`）。
+- `--pack` に値が続かない場合は parser が終了コード 2 で終了する。未知のオプションも stderr に表示して usage を出し、コード 2 で終了する（`engine/src/program/generate.cpp:3839-3841,4263-4268`）。
 
 ## 根拠
 
-- parser の既定値・値の取り込み・不足時の扱い: `src/program/generate.cpp:594-598,1011-1017,3294-3303`
-- native / canonical pack の識別と layout の読み込み: `src/kernels/cpu/expert_layout.cpp:435-451`、`src/program/generate.cpp:4426-4433,4621-4645`
-- native pack の追加条件: `src/program/generate.cpp:4766-4777`
-- index と重みファイルの読み込み・エラー: `src/core/weights.cpp:93-110,176-184`、`src/program/generate.cpp:4866-4872,4916-4932`
-- mmap expert source と GGUF fallback: `src/program/generate.cpp:7091-7117`
-
-調査範囲は上記 commit の checkout にある parser と loader のコードです。同 revision の既存 engine binary/help および Release archive は確認していません。
+- `engine/src/program/generate.cpp:754-755` — `Options::pack` の型と既定値。
+- `engine/src/program/generate.cpp:1206-1212,3837-3846` — usage 表示と parser 登録。
+- `engine/src/kernels/cpu/expert_layout.cpp:501-516` — パックの native expert layout 判定と native build 条件。
+- `engine/src/program/generate.cpp:5355-5363,5753-5760` — layout 読み込みと native パックの適用条件。
+- `engine/src/core/weights.cpp:93-122,176-223,308-313` および `engine/src/program/generate.cpp:5965-6030` — index の検査、重み読み込み、失敗経路。
+- `engine/src/program/generate.cpp:13965-14012` — serve の conversation spill が `--pack` の位置を使う条件とディレクトリ作成。

@@ -1,46 +1,47 @@
 # `STRATA_FS_ADMIT`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Foresight swap が、通常の expert miss を受けて VRAM の swap slot へコピーを予約するまでに要求する miss 回数を指定します。Foresight swap が有効なとき、既定値 `1` は従来どおり最初の miss でコピーを要求し、`2` 以上は同じ `(layer, expert)` の miss が所定の window 範囲で指定回数に達するまでコピーを保留します。既に発生した miss の処理を変える設定ではなく、将来の swap slot 用コピーの受付を絞る設定です。
+`STRATA_FS_SLOTS` で有効にした Foresight swap において、GPU swap slot にコピーする対象を、通常の expert cache ミスから何回観測した後に採用するかを指定する。既定値 1 ではミスのたびにコピー候補として進み、2 以上では同じ `(layer, expert)` の最近のミス回数がしきい値に達するまで通常ミスからのコピー要求を抑える。これはコピー候補を選ぶ条件であり、GPU slot が空いていることやコピーが完了して実際に利用できることを保証しない。読み取りと設定は `engine/src/core/expert_source.cpp:7294-7311`、miss 回数によるゲートは同 `:7218-7238`。
 
 ## 値と判定
 
-値は `foresight_swap_from_env()` 内の `env_int` helper で `std::getenv()` から取得し、`std::atoi()` で整数化した後、下限 `1` に clamp します。上限 clamp はありません。
+読み取りは `foresight_swap_from_env` の生成時に行う。`STRATA_FS_SLOTS` を `std::getenv` と `std::atoi` で先に読み、値が 1 以上の場合にだけ設定用 lambda が `STRATA_FS_ADMIT` を読む。lambda は未設定なら既定値 1、設定時は `std::atoi` の結果を使い、1 未満を 1 に clamp する。文字列全体の妥当性検査はなく、`atoi` の数値接頭辞変換に従う（例: `2tail` は 2、空文字・`true`・`0`・`-3` は 0 以下となり 1）。先頭空白や符号は `atoi` の変換規則に従い、大文字小文字は数値判定に関係しない。根拠: `engine/src/core/expert_source.cpp:7294-7311`。
 
-| 環境値 | 実装上の結果 |
-| --- | --- |
-| 未設定 | 既定値 `1`。通常 miss の最初の発生でコピー要求の判定を通る |
-| 空文字 | `atoi("")` は `0` となり、下限 clamp により `1` |
-| `0`、負値 | `1` に clamp |
-| 正の整数 `N` | 閾値 `N`。通常 miss は閾値に達するまでコピー要求を保留。`N > 255` は miss counter の上限に届かないため、通常 miss からは閾値を満たせない |
-| 整数として読めない文字列 | `atoi` の結果 `0` となるため `1` |
-| 数字で始まり後続に数字以外がある文字列 | `atoi` が読む数値部分を使い、その後に下限 clamp |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効・特別扱いとなる値 |
+|---|---|---|---|
+| `STRATA_FS_SLOTS` が `atoi` で 1 以上 | 1 | `1` は各通常ミスをしきい値通過、`2`〜`255` は同じ expert の miss 回数がその数に達したとき通過 | 空文字、`0`、`-1`、`true` は 1 に clamp。`2tail` は 2 として扱う。`256` 以上は整数しきい値として保持されるが、回数カウンターは 255 で飽和するため通常ミスからは到達しない |
+| `STRATA_FS_SLOTS` が未設定または `atoi` で 1 未満 | この変数を読まず Foresight swap 自体を作らない | 該当なし | `STRATA_FS_ADMIT` の値は適用されない |
 
-変換エラーを個別に報告する処理はありません。環境変数の値を `1` と文字列比較する処理でもありません。根拠: `src/core/expert_source.cpp:6537-6552`。
+通常ミスの回数カウンターは layer と expert ごとに保持され、最後の miss から完了 window 数が 4 を超えた場合にリセットされる。カウンターの上限は 255。look-ahead 由来の予測コピーはこの回数条件を適用しない。根拠: `engine/src/core/foresight_swap.hpp:49-54`、`engine/src/core/expert_source.cpp:7231-7238`。
 
 ## 有効になる条件
 
-- この設定を読むのは CUDA の serve 経路で `ForesightSwap` を構成するときです。生成処理は `foresight_swap_from_env()` を呼び、戻った swap pool を dispatch と expert source に接続します（`src/program/generate.cpp:11108-11121`）。
-- 先に `STRATA_FS_SLOTS` を `atoi` で読み、値が `1` 未満なら pool を作らず return します。この場合 `STRATA_FS_ADMIT` は読み取られず、効果もありません（`src/core/expert_source.cpp:6537-6541`）。
-- `STRATA_VERIFY_DEVICE_PLAN` が設定され、その `atoi` 結果が非ゼロの場合も、pool 作成前に return します。この場合は stderr に `strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN (the device would plan resident layers without the host)` を出し、`STRATA_FS_ADMIT` は読み取りません（`src/core/expert_source.cpp:6542-6545`）。
-- pool が有効でも、通常の miss 受付閾値を適用するのは `note_miss()` 経由のコピー要求です。router look-ahead からの `predict()` 要求は閾値判定を迂回します（`src/core/expert_source.cpp:6461-6469,6472-6482`）。look-ahead が pool に接続されるのは look-ahead が存在するときです（`src/program/generate.cpp:11118-11120`）。
+- `STRATA_FS_SLOTS` が設定され、`std::atoi` の結果が 1 以上であること。0 以下や未設定では swap pool を作らず、この変数も読まない。生成経路での有効化と pool への接続は `engine/src/program/generate.cpp:14794-14807`。
+- `STRATA_VERIFY_DEVICE_PLAN` または `STRATA_VERIFY_DEVICE_HITS` が設定され、`std::atoi` の結果が非 0 の場合、Foresight swap は無効化される。`STRATA_FS_ADMIT` は pool 作成前に読まれない。警告は `engine/src/core/expert_source.cpp:7299-7305`。
+- pool の初期化に成功すること。初期化時の CUDA device memory または copy event の作成失敗では pool を破棄し、swap を無効にする（`engine/src/core/expert_source.cpp:7059-7113`、作成元の失敗ログは同 `:7313-7316`）。この値の読み取り・判定箇所に OS や build macro による分岐はない。pool 初期化は CUDA runtime API を呼ぶ。
+- しきい値は `note_miss` から来る通常ミスにだけ適用される。expert が pinned source にあり、blob が取得でき、カードごとの window budget に空きがあり、再利用可能な slot があることもコピー成立に必要。これらの条件を満たさない候補はコピーされない（`engine/src/core/expert_source.cpp:7234-7269`）。
+- Router look-ahead の予測要求は `STRATA_FS_AHEAD` が未設定または非 0 で look-ahead が起動している場合に swap pool に届く。予測要求は `STRATA_FS_ADMIT` の miss しきい値を迂回する。look-ahead の起動条件は `engine/src/program/generate.cpp:10210-10225`、予測要求は `engine/src/core/expert_source.cpp:7223-7227` と `:7234-7238`。
 
 ## 実行時の詳細
 
-`STRATA_FS_ADMIT` は pool 構成時に読み取り、`ForesightSwap::admit` に保存します。pool 稼働中に環境を変更しても再読み取りはありません。各 `(layer, expert)` の miss counter は pool 初期化時に 0 で作られます。通常 miss では、完了済み verify window 数 `now` が前回記録時から 4 を超えて進んでいれば counter を 0 に戻し、その後 miss counter を最大 255 まで増やします。counter が `admit` 未満ならその miss でのコピー要求を終え、閾値に達した場合は通常の予算・pinned source・空き slot などの条件確認へ進みます（`src/core/expert_source.cpp:6302-6311,6472-6513`）。したがって値が 1 より大きくても、予算超過、pinned arena に source がない、blob がない、再利用可能な slot がない場合にはコピーされません（同 `6483-6504`）。
+`foresight_swap_from_env` が pool を作る際に一度読み、`ForesightSwap::admit` に保存する。pool 作成後に環境を変更しても、その pool のしきい値は読み直されない。別の pool 作成時にはその時点の環境を読み取る。CLI 引数による `STRATA_FS_ADMIT` の上書きはこの読み取り経路にはない（`engine/src/core/expert_source.cpp:7294-7311`）。
 
-dispatch は resident cache、peer GPU、helper にない expert について foresight slot を調べます。slot が利用できなければ `note_miss()` を呼んだ後、既存の miss 経路で PCIe staging 条件を確認し、それ以外は元の miss 処理を続けます。`STRATA_FS_ADMIT` はその miss を即座に処理するかどうかを変更せず、Foresight swap 用のコピー予約だけを制限します（`src/core/expert_source.cpp:4977-5005`）。閾値を通過したコピー要求は fill thread の queue に入り、host blob から CUDA device slot への非同期コピーが行われます。コピーに失敗すると stderr に `strata serve: foresight swap: a copy failed - swap space off` を出し、pool は以後の要求を受け付けません（同 `6377-6401,6472-6521`）。
+通常ミスでは `(layer, expert)` ごとのカウンターを更新し、最後の miss から完了 window 数が 4 を超えていれば回数をゼロに戻す。`admit > 1` の場合、カウンターが `admit` 未満ならその場で戻り、しきい値到達後に限って slot 探索と copy queue 登録へ進む。生成 loop は処理 window の完了ごとに pool の `completed` を増やす（`engine/src/core/expert_source.cpp:7231-7238, 7240-7278`、`engine/src/program/generate.cpp:22304, 23019`）。
 
-pool 作成に成功すると stderr に slot 数、card 数、budget、`admit after %d miss(es)`、再利用までの window 数が出ます。この `%d` が clamp 後の実値です。`docs/DETAILS.md` は `STRATA_FS_SLOTS` を CUDA 向けの opt-in として記載し、測定した組み合わせで効果が確認できず off としていますが、`STRATA_FS_ADMIT` の個別測定や推奨値は記載していません（`docs/DETAILS.md:1030,1432-1437`）。
+threshold を通過した候補でも、GPU slot への非同期コピーがまだ完了していれば、その時点では pool から利用できない。expert dispatch は pool の `take` が成功した場合にだけ GPU group として扱い、成功しない場合は通常の miss 経路を続ける（`engine/src/core/expert_source.cpp:5583-5606`）。
+
+## ログと測定値
+
+初期化成功時は stderr に、実際に採用されたしきい値を含む `strata serve: foresight swap: %d slots per layer on %zu card(s), up to %d copies per card and window, admit after %d miss(es), reuse after %d windows` を出す（`engine/src/core/expert_source.cpp:7318-7320`）。値が低すぎる／高すぎる場合や、miss がしきい値未満で抑制された場合に個別の警告を出す処理は確認できない。測定値はこの変数の実装箇所に記載されていない。
 
 ## 根拠
 
-- 候補名の全参照: `src/core/expert_source.cpp:6550` の実読み取りと、`include/strata/core/foresight_swap.hpp:20,53` の説明コメント。実装側の読み取りは一箇所です。
-- helper、既定値、下限 clamp、pool 起動ログ: `src/core/expert_source.cpp:6537-6562`。
-- miss counter の初期化と時間窓判定: `src/core/expert_source.cpp:6302-6311,6472-6482`。
-- copy request が満たす追加条件と queue 登録: `src/core/expert_source.cpp:6483-6521`。
-- dispatch miss と look-ahead の呼び出し: `src/core/expert_source.cpp:4977-5005,3311-3315`。
-- CUDA serve 経路での pool 作成・接続: `src/program/generate.cpp:11108-11129`。
+- 読み取り条件、`atoi`、既定値、下限 clamp、成功ログ: `engine/src/core/expert_source.cpp:7294-7320`
+- pool の miss counter と admission gate: `engine/include/strata/core/foresight_swap.hpp:49-54`、`engine/src/core/expert_source.cpp:7218-7238`
+- pool の有効化と dispatch への接続: `engine/src/program/generate.cpp:14794-14807`
+- 通常ミス時の pool 利用: `engine/src/core/expert_source.cpp:5583-5606`
+- Router look-ahead の起動と予測要求: `engine/src/program/generate.cpp:10210-10225`、`engine/src/core/expert_source.cpp:7223-7238, 3791-3793`
+- pool 初期化と失敗経路: `engine/src/core/expert_source.cpp:7059-7113, 7313-7316`

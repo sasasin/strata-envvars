@@ -1,47 +1,55 @@
 # `STRATA_GRAPH_PRIO`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-CUDA verify window graph の kernel node に、capture 元 stream の優先度を保持させる opt-in です。設定すると、Strata が作成する window 用 `cs_` / `side2_` stream を中間優先度、`side_` stream を高優先度、共有 expert 用 `sh_cs_` stream を低優先度で作成し、graph の instantiate に `cudaGraphInstantiateFlagUseNodePriority` を指定します。外部から渡された `cs_` stream はこの箇所では作成・優先度設定されません。`side_` と `sh_cs_` の処理自体をこの変数が有効化するわけではなく、各処理は既存の分岐条件が満たされたときだけ graph に入ります（`src/core/verify.cpp:1055-1069,1072-1093,1112-1116,1159-1167,1520-1544,1828-1836,2048-2051,2171-2174,2718-2725`）。
+CUDA の verify window graph に、capture 時の stream priority を kernel node priority として適用し、priority を指定して graph を instantiate する opt-in 変数です。未設定または整数変換結果が 0 の場合はこの設定を使わず、従来どおり node priority を指定しません。対象は `Verifier` の window graph であり、commit graph にはこの変数による設定を渡しません（`engine/src/core/verify.cpp:240-248, 3388-3409, 3425-3426`）。
+
+CUDA の priority 範囲が複数値を持つ場合、side mixer 用 stream は最高、`cs_` と `side2_` は中間、shared expert 用 `sh_cs_` は最低の priority で作成します。capture 後、stream から node priority が取得できなければ記録した fork/tail をたどって属性を設定し、`cudaGraphInstantiateFlagUseNodePriority` を指定します。これは計算内容や graph の依存関係を書き換える設定ではありません（`engine/src/core/verify.cpp:1295-1309, 1404-1412, 1508-1511, 1897-1903, 2318-2326, 2756-2759, 5155-5210, 3388-3393`）。
 
 ## 値と判定
 
-値は `std::atoi()` で変換し、結果が 0 以外なら ON とします。文字列全体の妥当性検査はありません。
+CUDA 対象 build では `std::getenv` の結果を `std::atoi(v) != 0` で判定します。文字列全体の数値検証や範囲検査はありません。`atoi` は先頭の空白と符号を許し、整数として読める先頭部分を変換します。したがって、空文字・整数部分がない文字列・`0anything` は 0、`1`・`-1`・`1anything` は非 0 です。`true` や `false` は 0 になります。変換範囲外の文字列についてコード上の検査・fallback はありません（`engine/src/core/verify.cpp:242-248`）。
 
-| 環境変数の値 | 判定 |
-|---|---|
-| 未設定 | OFF |
-| 空文字 | `atoi("")` が 0 となるため OFF |
-| 数値変換結果が 0 | OFF。例: `0`, `0abc`, 数字で始まらない文字列 |
-| 数値変換結果が 0 以外 | ON。例: `1`, `-1`, `2`, `1abc` |
+| build 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `STRATA_USE_HIP`、`STRATA_HIP_GFX906`、`STRATA_GPU_METAL` のいずれも未定義 | 無効 | `1`, `-1`, `1junk` | 空文字、`0`, `0anything`, `true`, `abc` |
+| 上記いずれかが定義済み | 常に無効 | なし | すべての値 |
 
-先頭の空白や符号を含む文字列も `atoi` の変換規則に従います。境界外の整数文字列については、このコードが個別の検証や fallback を実装していません（`src/core/verify.cpp:220-226`）。
+設定値は `graph_prio_on()` の関数内 `static` に初回呼び出し時に保存され、そのプロセス内では再読込されません。起動後に環境を変更しても反映されません（`engine/src/core/verify.cpp:242-248`）。CLI 引数や設定ファイルからこの値を上書きする読み取り箇所は、対象 commit の全参照検索では見つかりません。
 
 ## 有効になる条件
 
-- `STRATA_USE_HIP`、`STRATA_HIP_GFX906`、`STRATA_GPU_METAL` のいずれかを定義した build では、helper が常に `false` を返すため、この環境変数では有効になりません（`src/core/verify.cpp:220-227`）。
-- それ以外の build でも、device の stream priority range の取得に成功し、`gp_lo != gp_hi` の場合にだけ優先度付き stream を作成します。range が `0..0` など幅を持たない場合、graph priority の要求が ON でも stream は通常の優先度で作られます。range 取得失敗時は CUDA error を読み捨てます（`src/core/verify.cpp:1060-1069,1086-1093`）。
-- `side_` と `side2_` の stream は `g_side_mixer() > 0` の場合だけ作成されます。GDN gate / QSA indexer の `side_` branch は `sidem` 条件、gate projection / QSA query の `side2_` branch は `side_proj` 条件に依存します（`src/core/verify.cpp:1159-1167,1234-1237,1538-1561,1828-1844`）。
-- 共有 expert 用 `sh_cs_` は初期化されますが、共有 expert の並行 branch は `sh_stream_on()`、profile 状態、stream/event の利用可否などで決まる `sh_fork` が真の場合にだけ使われます（`src/core/verify.cpp:1112-1116,2048-2051,2160-2174`）。
-- `STRATA_PIPED_CONCURRENT` が非ゼロで、かつ `STRATA_PIPED_CONCURRENT_PRIO` が未設定または `atoi` の結果が非ゼロなら、共通の stream 作成 helper は device の最高優先度で stream を作成して先に戻ります。この場合、helper を使う `copy_`、Strata 作成の `cs_`、`sh_cs_` では `STRATA_GRAPH_PRIO` が指定する個別の優先度よりこちらが優先されます。`STRATA_PIPED_CONCURRENT_PRIO=0` ならこの優先経路は使われません。`side_` / `side2_` は別の作成経路です（`src/core/verify.cpp:1072-1093,1112-1116,1159-1164`）。
-- 優先度付き stream の作成に失敗すると、そのエラーを読み捨てて通常優先度の stream 作成へ進みます（`src/core/verify.cpp:1086-1093`）。
+- HIP、`STRATA_HIP_GFX906`、Metal build では helper が常に `false` を返し、priority query・node 属性設定・instantiate flag 設定も CUDA 専用の条件付きコード内です（`engine/src/core/verify.cpp:242-248, 1300-1306, 3388-3394`）。
+- CUDA では `cudaDeviceGetStreamPriorityRange` が成功し、返された `gp_lo` と `gp_hi` が異なる場合に限り `gprio` が有効になります。失敗または同値なら stream priorities は 0 のままで、設定は適用されません（`engine/src/core/verify.cpp:1300-1309`）。
+- `STRATA_SIDE_MIXER` が有効でない場合、side mixer の `side_` / `side2_` stream は作成されません。`STRATA_SIDE_MIXER` が未設定のときの有効化は CUDA compute capability 12.0 の既定に依存します。batch window では mixer branch に `STRATA_BATCH_SIDE_MIXER` も必要です（`engine/src/core/verify.cpp:272-292, 370-372, 1404-1412, 1503-1515`）。
+- `STRATA_PIPED_CONCURRENT` が非 0 で、`STRATA_PIPED_CONCURRENT_PRIO` が未設定または非 0 の場合、`make_stream` は先に最高 priority の stream 作成を試みます。成功した stream では `STRATA_GRAPH_PRIO` 用の指定 priority よりこの経路が優先されます。失敗時には `gprio` の priority 作成を試み、さらに失敗すれば通常の non-blocking stream に fallback します（`engine/src/core/verify.cpp:1312-1334`）。
+- `Verifier::set_stream` で外部 stream が設定されている場合、`cs_` はその stream を共有し、`make_stream(&cs_, gp_mid)` を通りません。その stream の priority はこの変数では設定されません（`engine/include/strata/core/verify.hpp:346, 560; engine/src/core/verify.cpp:1352-1355`）。
+- priority 付き stream の作成に失敗しても `make_stream` は失敗を返さず通常 stream へ fallback します。copy stream 等の最終 fallback 作成が失敗すると `verify: copy stream create failed`、`cs_` / `sh_cs_` の作成が失敗すると `verify: stream create failed` で初期化が失敗します（`engine/src/core/verify.cpp:1326-1356`）。
 
 ## 実行時の詳細
 
-`graph_prio_on()` の結果は関数内の `static const bool` に保存されます。最初の呼び出し時に環境を読み、その後プロセス内で環境変数を変更しても再評価しません。最初の呼び出しは verifier 初期化中の priority range 判定にあります（`src/core/verify.cpp:220-226,780,1060-1063`）。
+`Verifier` の初期化時に `graph_prio_on()` を呼び、priority range を調べて stream を準備します。`side_` は GDN gate / QSA indexer の branch が使う最高 priority、`side2_` と `cs_` は中間、shared expert 用 `sh_cs_` は最低 priority です。外部 stream、`STRATA_PIPED_CONCURRENT` による先行成功、または stream 作成 fallback がある場合、実 stream の priority がこの割当てと異なることがあります（`engine/src/core/verify.cpp:1300-1355, 1897-1903, 2318-2326, 2747-2759`）。
 
-window capture 中、優先度付き branch の fork と tail の graph node を記録します。graph を instantiate する前に kernel node の priority を調べ、capture 元 stream の priority が graph に記録されていなければ、記録した fork/tail の依存関係をたどって kernel node の priority attribute を設定します。その後 `cudaGraphInstantiateFlagUseNodePriority` を渡して graph を instantiate します（`src/core/verify.cpp:1238-1242,1543-1544,1835-1836,2052-2054,2132-2136,2171-2174,2718-2725,4168-4201,4203-4261`）。
+各 window graph の capture 開始時に priority の fork/tail 記録を消去し、対象 branch の fork と priority stream の tail を記録します。graph 完成後に `apply_node_priorities` が node priority を調べ、capture から非 0 の priority が得られない場合は記録した tail から fork まで依存 node をたどって kernel node に属性を設定します。その後、window graph だけを `cudaGraphInstantiateFlagUseNodePriority` 付きで instantiate します（`engine/src/core/verify.cpp:3270-3278, 3388-3409, 5120-5210`）。
 
-優先度 range が使え、優先度付き stream が成立すると stderr に `strata verify: STRATA_GRAPH_PRIO: stream priorities ...` が出ます。window graph の capture ごとに kernel node の priority histogram と capture / repair の結果も stderr に記録します。capture note や node attribute の取得・設定に失敗した場合は一部の CUDA error を読み捨て、priority repair を続行できない場合があります。graph instantiate 自体が失敗すれば通常の `verify: instantiate: ...` エラー経路で capture が失敗します（`src/core/verify.cpp:1062-1069,4171-4200,4206-4258,2725-2727,4264-4304`）。
+priority range query が失敗または全 priority が同値のときは適用を諦め、設定有効を示す priority stream ログも出ません。query 失敗時の CUDA error は `cudaGetLastError()` で消費されます。capture query や node 属性の個々の失敗も同様に error を消費して続行する処理であり、専用の失敗ログはありません（`engine/src/core/verify.cpp:1302-1309, 5123-5152, 5161-5204`）。
 
-`docs/DETAILS.md` は CUDA の opt-in decode switch として掲載し、CMP 170HX（sm_80）、Qwen3.8-Flash-Next IQ3_S native pack、`--spec 3`、約 3,000 語の prompt 後の decode という報告者の条件下で `STRATA_QIL=1` 時に decode +1.8% と記載しています。同資料は回答が bit-exact と報告しています。この数値は当該報告条件の値で、他の GPU や設定での性能を示すものではありません（`docs/DETAILS.md:1524-1530`）。
+## ログと測定値
+
+priority range query が成功し複数の値が得られたとき、stderr に次の形式で stream priority を出します（`gp_hi`, `gp_mid`, `gp_lo` の実値が入ります）。
+
+```text
+strata verify: STRATA_GRAPH_PRIO: stream priorities side %d, cs / side2 %d, shared expert %d
+```
+
+各 window graph では stderr に kernel node priority の histogram、priority range、capture からの取得有無、fork/tail 記録数、fallback で属性設定した node 数も記録します。`STRATA_GRAPH_PRIO` によるエラー専用メッセージはありません。対象 commit の `docs/DETAILS.md:1788` には `STRATA_QIL=1` とした decode の測定記載がありますが、測定条件がこの調査の品質基準を満たす形で揃っていないため、一般的な性能値としては記載しません。
 
 ## 根拠
 
-- 読み取り、compile-time guard、cache: `src/core/verify.cpp:220-227`
-- 優先度 range、stream 優先度、初期化時のログ: `src/core/verify.cpp:1055-1093,1112-1116`
-- priority branch の作成条件と利用箇所: `src/core/verify.cpp:1159-1167,1234-1242,1538-1544,1828-1844,2048-2054,2160-2174`
-- capture priority の記録、node の補正、graph instantiate flag: `include/strata/core/verify.hpp:473-482`; `src/core/verify.cpp:2718-2727,4168-4261`
-- Strata の測定資料: `docs/DETAILS.md:1524-1530`
+- 判定・compile guard・cache: `engine/src/core/verify.cpp:240-248`
+- priority range、stream 作成、ログ、fallback: `engine/src/core/verify.cpp:1295-1355`
+- verify window の capture と instantiate: `engine/src/core/verify.cpp:3270-3289, 3388-3409`
+- branch / tail の記録と node 属性設定: `engine/src/core/verify.cpp:1508-1512, 1897-1903, 2318-2326, 5120-5210`
+- 外部 stream setter: `engine/include/strata/core/verify.hpp:346, 560`

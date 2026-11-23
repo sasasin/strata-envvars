@@ -1,38 +1,44 @@
 # `STRATA_DOCKER_BUILD_OPTS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ツールの環境変数の解釈は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata 同梱の Docker image build script `docker/build.sh` が、ホスト環境から受け取った値を `docker build` の追加引数として渡します。Strata の CLI、サーバー、エンジンの実行時設定ではありません。直接 `docker/build.sh` を実行する場合と、同スクリプトを呼び出す `docker/publish.sh` の各 flavor build で使われます（`docker/build.sh:20,105-109`、`docker/publish.sh:27,74-75`）。
+`tools/docker/build.sh` が `docker build` を実行するとき、環境変数の内容を追加のコマンドライン引数として挿入する。スクリプト自身はオプションを解析・検証せず、値を真偽値や設定値として使わない。たとえば `--network host` のような Docker build オプションを渡す用途としてコメントに例示されている（`tools/docker/build.sh:20,130-134`）。
+
+`tools/docker/publish.sh` はこの名前をコメントに記すだけで、値は読まない。ビルド可能な flavor ごとに `build.sh` を子プロセスとして呼ぶため、環境から export されていれば、その子プロセスで同じ値が利用される（`tools/docker/publish.sh:27,63-82`）。
 
 ## 値と判定
 
-スクリプトは値を個別に parse・検証しません。`${STRATA_DOCKER_BUILD_OPTS:-}` を引用符なしで展開するため、unset と空文字は同じく追加引数なしになります。非空値はシェルの field splitting と pathname expansion を受け、結果の各語が `docker build` の引数として挿入されます。たとえば `--network host` は通常2引数になります。値全体を一つの引数として渡す仕組みではなく、引用符を値に含めてもその引用符はシェル構文として再解釈されません。glob 文字がある場合は、スクリプト実行時のカレントディレクトリに合うパスへ展開されることがあります（`docker/build.sh:105-109`）。
+build script における式は `${STRATA_DOCKER_BUILD_OPTS:-}` で、unset と空文字のどちらも空に置き換わる。非空の値は引用符なしで展開されるため、シェルの単語分割と pathname expansion を受け、できた各語が `docker build` の引数になる。シェルは展開後の値に含まれる引用符を引用構文として再解釈しない。値全体の parse、型・空白・大文字小文字・数値の検証、Strata 独自の上限・境界処理はない（`tools/docker/build.sh:22,130-134`）。
 
-| 環境値 | Strata スクリプトの処理 |
-|---|---|
-| unset / 空文字 | `${...:-}` が空になり、追加引数なし |
-| 空白を含む値 | shell の field splitting によって複数語に分かれ得る |
-| glob 文字を含む値 | pathname expansion の対象になり得る |
-| その他の値 | Strata 側で値域・形式を検証せず、展開後の語をそのまま渡す |
+| 条件 | unset | 値の扱い（例） | Strata 側で無効と判定する値 |
+|---|---|---|---|
+| `build.sh` が `docker build` に進む場合 | オプション引数を追加しない | 空文字も追加なし。`--network host` は2引数、`--network=host` は1引数として渡る。`0`、`1`、`true`、`false` も真偽値扱いせず、各々その文字列の引数として渡す | なし。Strata は引数として渡すだけで、Docker CLI に受理されるかは判定しない |
+
+値に空白があれば通常は単語分割され、glob パターンがあれば現在の作業ディレクトリ（この箇所では `repo`）に対して展開され得る。分割や glob 展開を避けたい場合のエスケープ方法を Strata は提供していない。Docker が引数をどう解釈するか、無効な Docker オプションが何を意味するかは本書の対象外。
 
 ## 有効になる条件
 
-- `docker/build.sh` が `--flavor` と `--engine` などの必須引数を通過し、build context を準備した後に、`--ctx-only` による早期終了をせず `docker build` に到達することが必要です。`--ctx-only` の場合は context を作成した時点で終了し、この環境変数は展開されません（`docker/build.sh:28-46,53-57,99-109`）。
-- `docker/publish.sh` は flavor ごとに `build.sh` を起動します。環境変数を置き換えたり専用引数へ変換したりせず、子スクリプトへ通常のプロセス環境として引き継ぎます。`--push` の有無は build 引数の受け渡しに影響しません（`docker/publish.sh:24-27,32-46,74-88`）。
-- `docker/build.sh --no-cache` はこの変数とは別に `--no-cache` を追加します。両方を使った場合、`--no-cache`、環境値から展開した語、スクリプトが指定する `--build-arg` 群、tag、context の順で `docker build` に渡ります（`docker/build.sh:26,38,105-109`）。
-- `docker/build.sh` は Linux x86_64 と Docker を前提とする説明を持ちますが（`docker/build.sh:2-3`; `docs/DOCKER.md:287-300,346-349`）、この変数自体を読むコードに OS、CUDA/HIP/SYCL flavor、Docker build macro による条件分岐はありません。
+- `tools/docker/build.sh` が引数検証と build context の準備を通過し、`--ctx-only` で早期終了していないこと。`--ctx-only` では Docker build 呼び出し自体がない（`tools/docker/build.sh:42-48,55-59,124-134`）。
+- 値を使うには環境変数としてプロセスに渡されている必要がある。`publish.sh` 経由では、export された環境値が `build.sh` に継承される。`publish.sh` 自身は読取り・変換・設定をしない（`tools/docker/publish.sh:27,82`）。
+- スクリプト内に OS、CUDA/HIP/SYCL flavor、ビルド macro、モデル状態、または別環境変数によるこの値の分岐はない。Docker が利用でき、build 呼び出しまで進む経路でのみ引数として渡される（`tools/docker/build.sh:130-134`）。
+- CLI の `--no-cache` は別途 `$nocache` として渡され、コマンド上ではこの環境変数の引数より前に置かれる。Strata は両者の競合解決をしておらず、重複オプションの優先順位は Docker CLI 側の扱いとなる（`tools/docker/build.sh:40,130-134`）。
+- `publish.sh --push` はイメージの push を制御する別の CLI 条件であり、この値の読み取りには影響しない（`tools/docker/publish.sh:41,82,89-96`）。
 
 ## 実行時の詳細
 
-`docker/build.sh` は `#!/bin/sh` のスクリプトで、`set -eu` を設定しています。引数検証、context の用意、`--ctx-only` 判定の後、`docker build` の起動時に環境値を一度展開します。値のキャッシュや後続の Strata プロセスへの転送はありません。`docker/publish.sh` 経由では各 flavor の `build.sh` 起動時にその子プロセスが値を展開します（`docker/build.sh:1,22,53-57,99-109`; `docker/publish.sh:63-75`）。
+値は `build.sh` の `docker build` コマンド行を実行する時点でシェル展開される。関数内 static 値やプロセス内 cache はなく、同じスクリプト中での繰り返し読取りもない。build script はこの値を書き換えず、値の内容を別の環境変数や build arg に変換もしない（`tools/docker/build.sh:130-134`）。
 
-この環境変数専用の Strata ログや警告はありません。展開後の語が `docker build` の引数列に加わり、Docker CLI の出力を通じて結果が観測されます。`docker build` が非ゼロで終了すれば `set -e` により `build.sh` はそこで終了し、後続の `docker image inspect` と成功メッセージには進みません（`docker/build.sh:22,105-111`）。どの追加引数が受理されるか、受理された Docker オプションが build に及ぼす意味は Docker CLI 側の仕様であり、この文書では Strata の挙動として扱いません。
+直接 `build.sh` を呼ぶ場合も `publish.sh` から呼ぶ場合も、実際の Docker 呼び出しより前に引数検証、context の組み立て、設定概要の表示を行う。`publish.sh` は package のある flavor について順次 `build.sh` を起動し、環境変数を明示的な引数にはせず、プロセス環境を継承させる（`tools/docker/build.sh:24-59,65-68,124-134`; `tools/docker/publish.sh:64-82`）。実行中に親環境の値を変えても、既に起動済みの子プロセスへ反映される処理はない。
+
+## ログと測定値
+
+対象変数専用のログ、値の表示、警告はない。build script は Docker 呼び出し前に context・flavor・base・engine・tag を表示し、Docker build 後に `docker image inspect` の結果を表示してから `Not pushed anywhere. Size on disk: ... bytes.` を出力する（`tools/docker/build.sh:126-136`）。`set -e` のため `docker build` が非ゼロ終了すると inspect とサイズ表示へ進まず、inspect が非ゼロ終了した場合もサイズ表示へ進まない。いずれも script は失敗終了する。自動作成 context は終了 trap で削除されるが、指定された `--ctx` の context はこの cleanup の対象外（`tools/docker/build.sh:22,55-59,130-136`）。失敗時のエラー内容や終了の詳細は Docker コマンド側の出力・終了値であり、Strata はこの変数について独自の診断を追加しない。
 
 ## 根拠
 
-- `docker/build.sh:20` — この環境変数を Docker build 追加オプションとして説明。
-- `docker/build.sh:22,28-46,53-57,99-111` — shell 設定、CLI 検証と context-only 経路、環境値を含む `docker build` 呼び出し、および失敗時・成功時の後続処理。
-- `docker/publish.sh:27,63-75` — publish script から flavor ごとに `build.sh` を起動する経路。
-- `docs/DOCKER.md:287-300,312-343,346-349` — Docker image の build と publish の用途、対応する実行環境の説明。
+- `tools/docker/build.sh:20,130-134` — 変数の説明コメントと唯一の実読取り・引数展開。
+- `tools/docker/build.sh:22,40-48,55-59,124-136` — shell の失敗設定、CLI 条件、早期終了、ログと build 後の処理。
+- `tools/docker/publish.sh:27,63-82` — コメントのみの参照と `build.sh` 子プロセス呼出し。
+- `docs/DOCKER.md:372-385,418-435` — Docker build / publish の利用経路の説明との照合。環境変数の値の意味を裏付ける用途には使っていない。

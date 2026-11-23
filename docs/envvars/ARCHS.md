@@ -1,45 +1,50 @@
 # `ARCHS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-`ARCHS` は Linux 向けの CUDA/HIP エンジンや DGX Spark 用 CUDA エンジンをビルドするとき、ビルド対象 GPU アーキテクチャの一覧を渡す環境変数です。実行時の `strata` が読む環境変数ではありません。読み取り箇所は `packaging/build_cuda_linux.sh:18-19`、`packaging/build_hip_linux.sh:33-38`、`spark/build_engine.sh:18` です。
+`ARCHS` は Strata のエンジンや同梱 reader、split engine をビルド・パッケージする一部の Strata 所有スクリプトで、対象 GPU architecture の一覧を指定する環境変数である。通常の `strata` 実行時コードに `ARCHS` を読む箇所はなく、実行中の GPU 選択やモデル動作を変更しない。ビルドスクリプトは値を CMake に渡し、生成物の architecture 一覧やパッケージ metadata にも使う（`tools/packaging/build_cuda_linux.sh:22-23,35-45,70-79`、`tools/packaging/build_hip_linux.sh:33-43,57-65,78-90`、`engine/spark/build_engine.sh:19,48-54,80-87`）。
 
 ## 値と判定
 
-| 読み取り箇所 | 未設定または空文字 | 非空値の扱い |
+| 読み取り経路 | 未設定・空文字 | 設定値の扱いと無効値 |
 |---|---|---|
-| Linux x86_64 CUDA | `VARIANT=cuda12` は `60;61;70;75;80;86;89`、`cuda13` は `75;86;89;120` | `;` または `,` を区切りとして扱い、各値に `-real` を付けた CMake の CUDA arch リストを作ります。最後の値は `-virtual` 用にも使います。数値としての事前検証はありません。 |
-| Linux HIP | `rx9070`: `gfx1200;gfx1201`、`rx7900`: `gfx1100;gfx1101;gfx1102`、`rx6000`: `gfx1030;gfx1031`、`halo`: `gfx1151`、`igpu`: `gfx1103;gfx1150` | `;` を空白またはカンマに置換した値を、それぞれビルド用の archs とデータ選択用の archs に使います。値自体の妥当性をこのスクリプトで検証しません。 |
-| DGX Spark (Linux aarch64 CUDA) | `121` | CUDA x86_64 スクリプトと同じく `;` / `,` 区切りの値を処理し、各値を real arch、最後の値を virtual arch として CMake に渡します。 |
+| Linux CUDA release builder (`cuda12` / `cuda13`) | それぞれ `60;61;70;75;80;86;120;89` / `75;86;89;120` | `${ARCHS:-...}` なので未設定または空文字は既定値。非空文字列を数値検証せず受け取り、`;` と `,` を空白に置き換えた各要素を `-real` にし、最後の要素を `-virtual` に付けて CMake に渡す。空白や不正な arch の独自検査はない（`tools/packaging/build_cuda_linux.sh:17-24,35,43-45`）。 |
+| Windows CUDA package builder | `os.environ.get("ARCHS")` が空文字または未設定なら variant 既定値（`cuda13`: `75,86,89,120`; `cuda12`: `60,61,70,75,80,86,120,89`） | 非空値を `;`、`,`、空白の連続で分割し、空要素を除いて各要素を Python `int()` で変換する。符号付き整数も変換可能で、正数・範囲・重複の検証はない。数値でない要素は `ARCHS=%r is not a list of numbers like 75;86;89;120` で終了し、区切りだけの値も同じエラーになる。空白だけの値は非空なので parse に進みエラー（`tools/packaging/build_cuda_windows.py:37-42,52-65,155-160`）。 |
+| Linux HIP package builder | `rx9070`: `gfx1200;gfx1201`、`rx7900`: `gfx1100;gfx1101;gfx1102`、`rx6000`: `gfx1030;gfx1031;gfx1032`、`halo`: `gfx1151`、`igpu`: `gfx1103;gfx1150`。 | `${ARCHS:-...}` なので空値は variant 既定値。未知の variant では `${ARCHS:?...}` により未設定・空値が `ARCHS=gfx...` の shell parameter error になる。非空値は検証せず、`;` を空白（kernel data 用には `,`）へ置換し、エンジン、HIP reader、metadata に渡す（`tools/packaging/build_hip_linux.sh:33-43,63-65,78-90`）。 |
+| Linux HIP split engine builder | 未設定・空文字なら `gfx1201;gfx1200;gfx11-generic` | 非空値を検証せず CMake に渡す。検査ループでは `;` だけを空白に置換して各要素を実行ファイル内で検索するため、欠けた code object があれば `build_split_hip.sh:51-55` のエラーで終了する（`tools/packaging/build_split_hip.sh:26,31-35,51-55`）。 |
+| DGX Spark CUDA builder | 未設定・空文字なら `121` | 非空値を検証せず、`,` と `;` を空白に置換して各要素を `-real`、最後の要素を `-virtual` として CMake に渡す（`engine/spark/build_engine.sh:17-19,48-54`）。 |
 
-いずれも `${ARCHS:-default}` 形式なので、未設定と空文字は同じく既定値になります。HIP の既知 variant 以外では `${ARCHS:?...}` を使い、未設定または空文字だと Bash が `ARCHS=gfx...` を要求するエラーを出して停止します（`packaging/build_hip_linux.sh:32-38`）。空白だけの値など非空だが不正な値はこの判定を通過し、明示的な値域チェックはありません。
-
-CUDA スクリプトの `real` / `last` 抽出は `tr ';,' '  '` と `awk '{print $NF}'` によります。HIP スクリプトはセミコロンだけを置換し、カンマ区切りの値は別途正規化しません。したがって、区切りの解釈はスクリプトごとに異なります（`packaging/build_cuda_linux.sh:31-36,60-64`、`packaging/build_hip_linux.sh:42-43`、`spark/build_engine.sh:56-62`）。
+文字列比較による大文字小文字判定や全リスト共通の数値・範囲検証はない。Windows CUDA のみ区切りを `;` / `,` / 空白として扱い、整数変換する。Linux shell scripts は経路ごとに区切りの置換方法が異なるため、同じ入力が同じように解釈されるとは限らない。
 
 ## 有効になる条件
 
-- `packaging/build_cuda_linux.sh` は Linux x86_64 の CUDA 12/13 ビルドレシピです。`VARIANT` が `cuda12` または `cuda13` である必要があり、CUDA toolkit の版も variant に対応していなければスクリプトは stderr に `build_cuda_linux.sh: ... needs the matching CUDA toolkit` と出して終了コード 2 で止まります。この判定は `ARCHS` の値によらず先に行われます（`packaging/build_cuda_linux.sh:15-29`）。
-- `packaging/build_hip_linux.sh` は Linux HIP ビルドです。既知の `VARIANT` では `ARCHS` が既定値を上書きし、未知の名前では明示した `ARCHS` が必須です。エンジンのビルドを省略する `VISION_ONLY` 経路でも archs は GPU vision reader のビルドに使われます（`packaging/build_hip_linux.sh:32-39,59-90`）。
-- `spark/build_engine.sh` は Linux aarch64 / DGX Spark 専用で、別 OS や CPU アーキテクチャでは `build_engine.sh: this builds on arm64 Linux (the DGX Spark)` を stderr に出して終了コード 2 で止まります（`spark/build_engine.sh:27-30`）。CUDA toolkit の版の判定も別途あります（同:36-43）。
-- `packaging/build_vision_windows.bat` も `ARCHS` という名前を使いますが、variant に応じてスクリプト内で値を設定し、任意の環境入力としては読みません。上書き入力は `VISION_ARCHS` です（`packaging/build_vision_windows.bat:26-33`）。この経路を `ARCHS` 環境変数の読み取りとして数えていません。
+- `tools/packaging/build_cuda_linux.sh` は Linux CUDA release build で `VARIANT=cuda12` または `cuda13` を選んだときに読む。対応する CUDA toolkit が `nvcc` から見つからない、または variant と toolkit の major version が合わない場合は `ARCHS` 処理後に builder 自身の診断を stderr に出して終了する（`tools/packaging/build_cuda_linux.sh:17-33`）。
+- `tools/packaging/build_cuda_windows.py` は Windows 上で variant 引数が `cuda12` / `cuda13` のときに読む。非 Windows では `this builds the Windows engine; on Linux use tools/packaging/build_cuda_linux.sh` で終了する。variant は CLI 引数で選び、`ARCHS` がその variant の既定リストを上書きする（`tools/packaging/build_cuda_windows.py:151-160`）。
+- `tools/packaging/build_hip_linux.sh` は `VARIANT` で選んだ HIP package builder に限る。既知 variant ではカスタム `ARCHS` を受け、未知 variant では `ARCHS` が必須である（`tools/packaging/build_hip_linux.sh:22,33-40`）。
+- `tools/packaging/build_split_hip.sh` は Linux AMD split engine build 専用である。architecture list が生成物に含まれない場合、明示的なチェックで build を失敗させる（`tools/packaging/build_split_hip.sh:2-16,51-55`）。
+- `engine/spark/build_engine.sh` は Linux arm64 (`aarch64` / `arm64`) 上の DGX Spark build 専用で、他の OS / CPU では `this builds on arm64 Linux (the DGX Spark)` を stderr に出して終了する（`engine/spark/build_engine.sh:29-32`）。
+- Windows CUDA builder は選んだ archs を `VISION_ARCHS` として reader の batch builder に渡す。batch builder は自身の `ARCHS` を variant の既定値で初期化した後、`VISION_ARCHS` が定義されていれば置き換えるため、reader build ではこの内部転送値が使われる（`tools/packaging/build_cuda_windows.py:189-190`、`tools/packaging/build_vision_windows.bat:26-33,48-61`）。
+- これらはビルド・パッケージ経路の設定である。Strata engine の runtime、サーバーモード、CLI 推論経路から `ARCHS` を読む箇所は確認できない。`000_envvers.md` の候補名は、ここでは実際に値を読む Strata 同梱の build scripts に対応している。
 
 ## 実行時の詳細
 
-これらはビルド用 shell script が開始時に変数展開し、同じ実行の中でビルド・パッケージ処理へ値を渡します。Strata の実行プロセスでの読み取りやプロセス内 cache はありません。
+各スクリプトの開始時または `main()` 実行時にプロセス環境から読み、その後ローカル変数へ保持して CMake configure、reader build、または package metadata に渡す。関数内 cache やリクエストごとの再読込はないため、実行中に環境を変更しても既に読み込んだ値は変わらない（Linux CUDA: `tools/packaging/build_cuda_linux.sh:17-23`、HIP: `tools/packaging/build_hip_linux.sh:22,33-43`、split HIP: `tools/packaging/build_split_hip.sh:17-26`、Spark: `engine/spark/build_engine.sh:17-20`、Windows CUDA: `tools/packaging/build_cuda_windows.py:151-160`）。
 
-- CUDA x86_64 ではアーキテクチャ一覧から `-DCMAKE_CUDA_ARCHITECTURES="<各値>-real;<最後>-virtual"` を組み立て、エンジンと vision reader の両方に渡します。さらに `BUILD.json` の `archs` / `vision_archs` に記録し、`package_engine.py` の `--arch` 引数にも渡します（`packaging/build_cuda_linux.sh:31-45,53-64`）。`cuda12` で必要な `sm_60`, `sm_61`, `sm_70` が package 引数に存在しない場合、packager は `refusing to package the cuda12 engine without ...` を出して停止します（`packaging/package_engine.py:176-182`）。
-- HIP では `ARCHS` を `CMAKE_HIP_ARCHITECTURES`、GPU vision reader の `STRATA_VISION_HIP_ARCHS`、`BUILD.json` の `archs` / `vision_archs`、kernel data 選択、package の `--arch` 引数に渡します（`packaging/build_hip_linux.sh:42-43,59-69,83-85,92-100,117-120`）。設定・ビルド・package の各コマンドが失敗した場合、スクリプトは `build.status` に `ABORT ... failed` 等を記録する経路があります（同:45-47,63-74,86-89,112-120）。
-- Spark では CUDA x86_64 のスクリプトと同様に実・virtual arch を作り、engine と任意の vision reader の CMake 設定に渡します。生成する `BUILD.json` の `archs` に元の文字列を記録します（`spark/build_engine.sh:56-74,84-91`）。
+値が各 build に到達する形は異なる。Linux CUDA と Spark では各 arch に machine code (`-real`) を指定し、リスト末尾の arch に PTX (`-virtual`) も指定する。Linux HIP では engine と HIP vision reader の CMake architecture、および package の arch / kernel data metadata に渡す。Windows CUDA は `int` の tuple から同じく全 arch の `-real` と最後の `-virtual` を構成し、package の `--arch` 引数と BUILD.json に記録する（`tools/packaging/build_cuda_linux.sh:35-36,43-45,72-80`、`tools/packaging/build_hip_linux.sh:42-43,63-65,78-90`、`tools/packaging/build_cuda_windows.py:52-55,68-78,174-195`、`engine/spark/build_engine.sh:48-54,80-87`）。
 
-各スクリプトはアーキテクチャ名の独自 parse・正規化をほぼ行わず、CMake / packager に値を渡します。そこで値が拒否された場合、`set -e` 等により該当コマンドのエラーで停止しますが、すべての不正値に対する共通の Strata 固有エラーメッセージはありません。HIP の package 化には追加の tuning table 整合性チェックがあり、不足時は `refusing to package the AMD engine:` と理由を出して終了します（`packaging/build_hip_linux.sh:112-120`、`packaging/package_engine.py:183-187`）。
+Linux CUDA の不正値は事前検査されず、CMake configure や後続 package 処理が失敗すれば `set -e` によりそこで止まる。HIP builder は configure/build のログを `$OUT/cfg*.log` / `$OUT/build*.log` に記録し、`chk` が失敗段階と return code を `$OUT/build.status` に記録して終了する。Windows CUDA は parse エラーを `SystemExit` として出す。ここで個別に列挙した以外の CMake、compiler、packager のエラー文言や終了条件はそれぞれの下流処理による（`tools/packaging/build_cuda_linux.sh:16,43-45`、`tools/packaging/build_hip_linux.sh:44-47,63-84`、`tools/packaging/build_cuda_windows.py:48-50,59-65`）。
+
+## ログと測定値
+
+Windows CUDA builder の数値リスト parse エラーは `build_cuda_windows.py:64` の文言を `build_cuda_windows.py:49` の `build_cuda_windows.py: ` prefix 付きで終了理由として出す。Linux HIP は `$OUT/build.status` に開始時の variant と architecture list、および失敗段階・return code を記録する（`tools/packaging/build_hip_linux.sh:44-47,57,66,76,81,84`）。Linux CUDA と Spark は `ARCHS` 固有の形式検査・警告を実装していない。性能測定値は該当しない。
 
 ## 根拠
 
-- `packaging/build_cuda_linux.sh:14-36,39-65` — Linux CUDA の既定値、区切り処理、toolkit 条件、CMake / package への転送。
-- `packaging/build_hip_linux.sh:21-43,59-120` — Linux HIP の既定値、必須条件、エンジン・reader・metadata・package への転送。
-- `spark/build_engine.sh:16-18,27-43,56-62,70-91` — DGX Spark 用の既定値、platform/toolkit 条件、CMake と metadata への転送。
-- `packaging/build_vision_windows.bat:26-33,51-64` — 同名のローカル変数と、実際に上書きする `VISION_ARCHS`。
-- `packaging/package_engine.py:168-187` — package 側の arch 必須条件、CUDA 12 条件、HIP tuning 検査。
-- `packaging/README.md:31-33` — レシピが対象とする各 Linux backend / platform の説明。これはビルド実績の記述であり、`ARCHS` の追加の実行時効果を示すものではありません。
+- `tools/packaging/build_cuda_linux.sh:17-45,70-80` — CUDA Linux での既定値、変換、CMake と package への受け渡し。
+- `tools/packaging/build_cuda_windows.py:37-42,52-65,151-160,174-195` — variant 既定値、Windows の parse と検査、engine / reader / package への受け渡し。
+- `tools/packaging/build_vision_windows.bat:26-33,48-61` — Windows reader builder の variant 既定値と `VISION_ARCHS` による上書き。
+- `tools/packaging/build_hip_linux.sh:21-43,57-90` — HIP Linux の variant ごとの既定値、変換、build / metadata / ログ。
+- `tools/packaging/build_split_hip.sh:17-35,51-55` — split HIP の既定値、CMake への受け渡し、生成物の architecture 確認。
+- `engine/spark/build_engine.sh:17-19,29-54,67-87` — Spark build の platform gate、既定値、CMake / metadata への受け渡し。

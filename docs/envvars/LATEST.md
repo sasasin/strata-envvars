@@ -1,40 +1,42 @@
 # `LATEST`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-`LATEST` は Strata engine の実行時設定ではありません。手動実行する GitHub Actions の `Docker images` workflow が、Docker イメージの `latest-<flavor>` タグも更新するかどうかをシェル引数に変換するため、その workflow の一 step にだけ設定する環境変数です。workflow_dispatch の boolean 入力 `latest` が既定で `true` です（`.github/workflows/docker-images.yml:12-37`）。
-
-workflow は `inputs.latest` が false のとき `LATEST=--no-latest`、true のとき空文字を step の環境に設定し、実行行でその値を `docker/publish.sh` へ展開します（`.github/workflows/docker-images.yml:97-104`）。そのため、これは workflow 内で値が作られる一時的な中継であり、利用者が Strata プロセスへ設定する環境変数ではありません。
+`LATEST` は Strata の Docker images 手動実行 workflow 内で使う step-level 環境変数で、利用者が選んだ `latest` boolean を `tools/docker/publish.sh` の `--no-latest` 引数へ変換する中継値である。`latest` を有効にすると、各 flavor の `latest-<flavor>` タグを作成し、push が有効ならそのタグも registry へ送る。無効にすると、そのタグ操作を省く。通常のアプリ実行や engine の動作を制御する環境変数ではない（`.github/workflows/docker-images.yml:12-38,97-104`、`tools/docker/publish.sh:32-43,82-94`）。
 
 ## 値と判定
 
-`LATEST` 自体を parse するコードはありません。値は workflow の式が生成する次の二通りです。
+workflow_dispatch の入力 `latest` は boolean 型で必須、既定値は `true`。workflow の式 `${{ !inputs.latest && '--no-latest' || '' }}` が `LATEST` に設定する。したがって `inputs.latest: true` なら空文字、`false` なら文字列 `--no-latest` になる。publish step はこれを unquoted の `$LATEST` として展開するため、空文字なら引数なし、`--no-latest` ならその一引数が script に渡る（`.github/workflows/docker-images.yml:29-33,97-104`）。
 
-| workflow 入力 `latest` | step 環境の `LATEST` | publish.sh に渡る結果 |
-|---|---|---|
-| `true`（既定） | 空文字 | 引数なし。`publish.sh` の `latest=1` が維持される |
-| `false` | `--no-latest` | `--no-latest` オプションにより `latest` が空文字になる |
+| workflow 入力 | `LATEST` の値 | script の判定 | 結果 |
+|---|---|---|---|
+| `latest: true`（既定） | 空文字 | `--no-latest` が渡らず、`latest=1` のまま | latest タグを作成する |
+| `latest: false` | `--no-latest` | `latest=""` に設定 | latest タグを作成しない |
 
-この workflow 以外から任意の値を与えた場合の解釈規則は定義されていません。`docker/publish.sh` は環境変数 `LATEST` を直接参照せず、コマンドライン引数 `--no-latest` だけを認識します（`.github/workflows/docker-images.yml:102-104`, `docker/publish.sh:32-46`）。
+この値は workflow が boolean 入力から生成するため、任意文字列、数値、大小文字、空白を使った有効・無効判定は実装されていない。手動実行の入力値そのものが未指定なら、必須入力の定義に加えて既定値 `true` が指定されている（`.github/workflows/docker-images.yml:29-33`）。
 
 ## 有効になる条件
 
-- `Docker images` workflow の `workflow_dispatch` を実行した場合に限り、この `LATEST` step 環境値が設定されます。workflow は自動起動しないと説明されています（`.github/workflows/docker-images.yml:3-4,12-13`）。
-- `latest` 入力は `push` 入力から独立しています。既定値は `true` です（`.github/workflows/docker-images.yml:24-33`）。
-- `publish.sh` は、`--no-latest` がなければ各 flavor の version タグから `latest-<flavor>` タグを作成します。`--push` があるときだけその追加タグも registry に push し、`--push` がないとローカル build のみです（`docker/publish.sh:24-26,32-43,74-88`）。
-- 起動時の引数解析で `--no-latest` を受け取ったとき、後続の tag 作成と push の条件が無効になります。未対応の引数は stderr に `publish.sh: unknown option ...` を出して終了コード 2 になります（`docker/publish.sh:33-46,76-85`）。
+- この変数を設定する経路は `.github/workflows/docker-images.yml` の `workflow_dispatch` に限られる。通常の Strata CLI・server・GPU backend の設定ではない（`.github/workflows/docker-images.yml:12-38,97-104`）。
+- workflow が対象 flavor の package を見つけて image を build する必要がある。package のない flavor は script が skip し、全 flavor が build されなければ `publish.sh:100` で終了コード 3 になる（`tools/docker/publish.sh:63-73,100`）。
+- `latest: true` のとき、`publish.sh` は `--push` の有無に関係なく `docker tag` でローカルの latest タグを作る。registry への `docker push` は別の boolean 入力 `push` が true のときだけ行われる。`push: false` では latest タグはローカルで作られるが、公開されない（`.github/workflows/docker-images.yml:24-28,97-104`、`tools/docker/publish.sh:82-96`）。
+- `latest: false` は `push` の値にかかわらず latest の tag/push を抑止する。version 付きタグの build、および `push: true` 時の version 付きタグの push は引き続き行われる（`tools/docker/publish.sh:74-94`）。
 
 ## 実行時の詳細
 
-workflow の式は `latest: true` なら空の引数、`latest: false` なら `--no-latest` をシェル展開でコマンドへ追加します。`publish.sh` は初期値 `latest=1` の後、引数 `--no-latest` を見た場合に `latest=""` とします。flavor ごとの build 後、`latest` が非空なら `docker tag "$img" "$image:latest-$flavor"` を実行します。さらに `push` が有効な場合、version タグを push し、`latest` が非空の場合に限って latest タグも push します。push 無効時の出力は `built ... (not pushed; add --push)` です（`.github/workflows/docker-images.yml:97-104`, `docker/publish.sh:32-46,74-88`）。
+GitHub Actions が `inputs.latest` を `LATEST` 環境変数に設定し、step の shell が `$LATEST` を展開して script の argv に渡す。script は起動時の引数解析で `--no-latest` を受け取った場合だけ内部 shell 変数 `latest` を空にし、それ以降はその値を使う。script 内で `getenv` 相当の再読み取りや cache はないため、実行中に環境変数を書き換えても反映する処理はない（`.github/workflows/docker-images.yml:97-104`、`tools/docker/publish.sh:32-43`）。
 
-`LATEST` の値は workflow が step 起動時に作り、同じ step の command line に渡されます。engine や Strata のサーバーに渡す処理、起動後の再読み込み、cache はありません。
+`latest` が有効なら各 flavor の build 後に `docker tag "$img" "$image:latest-$flavor"` を実行する。`push` 有効時は version 付き tag を push し、続けて latest tag も push し、出力に `and <image>:latest-<flavor>` を含める。`--no-latest` の場合はこの tag/push/出力追加と latest image の削除を省く。`set -eu` のもとで Docker コマンドが失敗すれば script は後続処理へ進まず終了する（`tools/docker/publish.sh:28,82-100`）。
+
+## ログと測定値
+
+`push: true` かつ latest 有効時は `pushed <image>:<version>-<flavor> and <image>:latest-<flavor>` を出力する。latest 無効時は `and ...` の部分を出さない。`push: false` の場合は `built <image>:<version>-<flavor> (not pushed; add --push)` を出力する。workflow 内の `LATEST` 専用ログや測定値はない（`tools/docker/publish.sh:89-97`）。
 
 ## 根拠
 
-- workflow の入力、既定値、`LATEST` への変換と引数展開: `.github/workflows/docker-images.yml:12-37,97-104`
-- Docker publish script の `latest` 既定値と `--no-latest` の解析: `docker/publish.sh:24-46`
-- version/latest タグの作成、push 条件と観測できる出力: `docker/publish.sh:74-88`
-- 候補名の全参照: `.github/workflows/docker-images.yml:102,104` が workflow の中継用途、`apps/host/src/lib/live-status.ts:6` と `apps/host/server/agent/status.mjs:4` はコメント中の普通名詞、`tools/test_setup_engine_hash.py:33,58-60,135-139,178-179` は release URL を表すテスト定数・テストです。後者のテスト定数は Strata の環境変数読み取りではありません。
+- `.github/workflows/docker-images.yml:12-38` — 手動起動 workflow と `latest` boolean 入力（必須、既定 true）。
+- `.github/workflows/docker-images.yml:97-104` — `inputs.latest` から `LATEST` を設定し、shell 展開で publish script に渡す。
+- `tools/docker/publish.sh:32-43` — `latest=1` の既定値と `--no-latest` の引数処理。
+- `tools/docker/publish.sh:82-96` — latest tag/push と出力の分岐。

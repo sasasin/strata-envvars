@@ -1,6 +1,6 @@
 # `strata drafting plan --no-split`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,53 +8,46 @@
 | コマンド | `strata drafting plan` |
 | オプション | `--no-split` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ（`store_true`） |
+| 値 | 値を取らないフラグ。指定すると真になる |
 
 ## 役割
 
-プランの推定で all-cards split engine が起動する想定を除外します。通常、設定が Auto の場合は split engine の起動予測が真なら、プランは split engine が使う MTP を選び、DFlash2 drafter の取得要否を示しません。このフラグを付けるとその予測分岐を飛ばし、通常の Auto 判定でプランを作ります（`strata_cli/drafting_cmd.py:39-51,69-78`）。
-
-このフラグは `strata drafting plan` の推定にだけ作用し、`strata launch` が split engine を起動するかどうかを切り替える設定ではありません。split engine の起動設定は別の launch 経路にあります（`strata_cli/launch/cmd.py:108,251-252`）。
+通常の計画では、条件が合えば「全カード split engine が起動する」と見込み、ドラフト方式を MTP に切り替えて計画する。このフラグはその見込みを無効にし、全カード split engine が起動しない前提で計画する。計画だけを変える指定であり、実際の engine 起動を直接制御するオプションではない。
 
 ## 使い方
 
 ```sh
-strata drafting plan --config ./run.json --no-split
+# run config を使い、全カード split engine を見込まずドラフト計画を表示する
+strata drafting plan --config ./model.run.json --no-split
 ```
-
-`--config` を省略して `--mode` を指定する使い方もできます。`plan` と `fetch` は同じ parser 定義を共有しますが、この文書の対象は `plan` です（`strata_cli/drafting_cmd.py:21-32`）。
 
 ## 値と既定値
 
-- 値は不要です。指定すると `a.no_split` が真になり、省略時は偽です（`strata_cli/drafting_cmd.py:28-29`）。
-- `--no-split=true` のような値付き指定はこの parser の形式ではありません。追加値や未知引数は CLI の引数解析で拒否されます（`strata_cli/cli.py:2239-2248`）。
-- フラグを複数回指定しても `store_true` のままです。別の数値範囲や値 validation はありません。
+値や別名はない。parser は `store_true` として登録しているため、省略時は偽、指定時は真になる。同じフラグを繰り返しても真のままで、値を伴う形式は定義されていない。`--mode` が省略された場合のドラフト選択は run config の `drafting` 値を使い、それもなければ `auto` として正規化される。`--mode` が明示される場合は `auto`、`mtp`、`dflash2`、`off` のいずれかを選べる（`terminal/strata_cli/drafting_cmd.py:24-31`、`terminal/strata_control/drafting.py:37-38,882-884`）。
 
 ## 実行時の動作
 
-1. `--mode` が指定されていればそれを使い、なければ設定ファイルの `drafting` を使います。設定が `"mtp": false` で、選択 mode が Auto なら、フラグの有無にかかわらず mode は `off` にされます（`strata_cli/drafting_cmd.py:54-78`）。
-2. それ以外で Auto の場合、フラグなしなら `_split_expected` が設定の GPU、user args、replicas、native model、context を使って split engine の起動可能性を問い合わせます。フラグありならこの問い合わせを行わず、split 用の `mtp` への置き換えも行いません（`strata_cli/drafting_cmd.py:39-51,69-78`）。split 予測関数は調査中に確定できない条件がある場合も `False` を返す設計です（`strata_control/split_engine.py:398-431`）。
-3. 続いて `drafting.needs_pack` と `drafting.needs_mtp`、`drafting.decide` が、モデル・family・backend・GPU arch・data directory・pack の有無などから必要な drafter を判定します。Auto は対象モデルかつ対応 backend なら DFlash2、それ以外は MTP になります。DFlash2 の pack がない場合、plan は取得要否を報告しますが、`plan` 自体はダウンロードを実行しません（`strata_control/drafting.py:653-691,712-722`; `strata_cli/drafting_cmd.py:81-102`）。
-4. 結果には `split` が含まれます。`--no-split` の場合は split 予測による真値への設定がないため false です。人向け出力は plan の説明または判定行、`--output json` / `jsonl` は `schema_version: 1`、`ok: true` と判定データを JSON で出力します（`strata_cli/drafting_cmd.py:88-102`）。
+parser は同じ `--no-split` を `strata drafting plan` と `strata drafting fetch` の両方に登録している。この文書の対象は索引に従って `plan` のみである（`terminal/strata_cli/drafting_cmd.py:19-38`）。
+
+`plan` は config などからモデル、drafting mode、実行引数を読み、明示された `--mode` があればそちらを使う。config の `mtp` が `false` で mode が `auto` のときは先に `off` へ変える。それ以外で正規化後の mode が `auto` または `mtp` なら、通常は全カード split engine の見込みを調べるが、`--no-split` がある場合はその判定を呼ばず、mode を split 用の `mtp` に上書きする分岐にも入りません（`terminal/strata_cli/drafting_cmd.py:101-125`）。
+
+このため、フラグは全カード split engine を理由とする MTP 選択を抑えます。DFlash2 を強制するものではなく、モデル・backend・実行条件・ドラフトファイルの有無に基づく通常の選択処理が続きます（`terminal/strata_control/drafting.py:1548-1587`）。既定の「auto」選択などが別の理由で MTP を選ぶ場合、その選択までは無効にしません。`dflash2` または `off` の mode では split 見込み分岐自体が適用されないため、このフラグによる mode 変更はありません。
+
+全カード split engine の判定は `split_engine.expected` が行い、split engine の mode、カード・メモリ、モデル、engine 実行ファイル等を条件にします。判定中の例外は「split しない」として扱われます（`terminal/strata_cli/drafting_cmd.py:45-61`、`terminal/strata_control/split_engine.py:477-513`）。ここで抑止されるのは全カード split engine の計画であり、通常の layer split まで無効にする指定ではありません。
 
 ## 適用条件と副作用
 
-- split 回避は mode が正規化後の `auto` のときだけ影響します。明示した `mtp` / `dflash2` / `off` の判定はこのフラグで変わりません（`strata_cli/drafting_cmd.py:70-75`; `strata_control/drafting.py:404-406,653-661`）。
-- `_split_expected` 内の split engine モジュール読み込みや予測で例外が起きると、例外を外へ出さず「split 予測なし」として続行します（`strata_cli/drafting_cmd.py:39-51`）。
-- `plan` は help/parser の説明でも「何を取得するかを示し、変更しない」コマンドとして定義されています。処理は pack の存在確認、ハードウェア検出、計画・判定の出力で、取得・pack 作成には進みません（`strata_cli/drafting_cmd.py:21-22,81-102`; `strata_control/drafting_fetch.py:32-43`）。
-- `--config` のファイルが読めない、または JSON として解釈できない場合、例外は握りつぶされ空設定として続行します。この場合、ファイルの設定に基づく split 予測や mode 選択は行われません（`strata_cli/drafting_cmd.py:54-60`）。
+`strata drafting plan` はダウンロード予定を説明するコマンドで、ファイルや engine 設定を変更しません（`terminal/strata_cli/drafting_cmd.py:22-23,247-266`）。human 出力は計画テキストを表示し、`--output json` または `jsonl` では結果を JSON として出力します。指定した model/config で DFlash2 を取得する必要がなければ、表示用の必要量を `0` にし、準備状態によっては `Nothing to download.` とします（`terminal/strata_cli/drafting_cmd.py:251-265`）。
 
-## 出力とエラー
+デスクトップアプリは全カード split 用の MTP 層を取得できなかった場合、`drafting plan` を `--no-split` 付きで再照会し、続く DFlash2 drafter の判定・取得にも同じ指定を渡します（`app/host/server/native-control.mjs:610-616`）。このアプリ経路でも、本フラグ自体がダウンロードを行うわけではありません。
 
-正常な plan は終了コード `0` です。`--no-split` に固有のエラー経路は確認できませんでした（`strata_cli/drafting_cmd.py:88-102`）。値を付けるなど parser が受理しない引数は CLI の引数エラーとなり、未知引数経路では `ap.error` が呼ばれます（`strata_cli/cli.py:2241-2248`）。
+無効な追加値や未知の引数に対する専用エラー処理はこのオプション用には実装されていません。parser は値なしフラグとして定義されています（`terminal/strata_cli/drafting_cmd.py:30-31`）。
 
 ## 根拠
 
-- 索引の配置・scope: `docs/cli/README.md:414-424`（`strata drafting plan` の予定リンクと `--no-split`）。
-- parser 宣言・共有範囲: `strata_cli/drafting_cmd.py:18-32`。
-- split 判定の除外、mode の選択、plan 出力: `strata_cli/drafting_cmd.py:39-102`。
-- Auto の drafter 判定と pack 要否: `strata_control/drafting.py:653-691,712-722`。
-- split engine 起動予測と失敗時の扱い: `strata_control/split_engine.py:398-431`。
-- 調査対象 revision: `git rev-parse HEAD` は `ffa80d73133ea5c548aefe57889a16e8085a938f`、`git status --short --branch` は `## main...origin/main`（変更表示なし）。
-
-実機の GPU/backend ごとに split 起動予測がどうなるかは実行環境に依存します。この調査では CLI を実行せず、ハードウェア別の実測・予測結果は確認していません。
+- `terminal/strata_cli/drafting_cmd.py:19-38` — `drafting plan` / `fetch` の parser、flag の型、scope。
+- `terminal/strata_cli/drafting_cmd.py:101-125` — config と mode の解決、および `--no-split` による split 見込み分岐の抑止。
+- `terminal/strata_cli/drafting_cmd.py:247-266` — plan の結果組み立てと出力。
+- `terminal/strata_control/split_engine.py:477-513` — 全カード split engine の予測条件と例外時の扱い。
+- `terminal/strata_control/drafting.py:37-38,882-884,1548-1587` — mode の候補・既定値、ドラフト方式の通常判定。
+- `app/host/server/native-control.mjs:610-616` — MTP 層を取得できない場合にアプリが再計画・取得へ渡す指定。

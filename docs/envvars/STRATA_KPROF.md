@@ -1,41 +1,51 @@
 # `STRATA_KPROF`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。作業開始時の Strata checkout は `main` で、`git status --short --branch` は `## main...origin/main`（未コミット変更なし）だった。
 
 ## 役割
 
-SYCL port の Strata kernel profiler を有効にします。有効時、`strata::kprof::kp(...)` 経由で投入された kernel の event を保持し、phase/window/chunk の区切りまたはプロセス終了時に event の開始・終了時刻を集計して stderr に出します。同時に `dpct::device` が作る queue に profiling property を付けます。全ての Strata backend 共通の設定ではなく、実装箇所は `sycl/` 以下です（`sycl/include/strata/kprof.hpp:1-14,223-257`; `sycl/include/dpct/device.hpp:679-701`）。
+SYCL engine で、Strata が作成する SYCL queue に profiling property を付け、`strata::kprof::kp()` を通る kernel launch の `sycl::event` を記録して、prompt/decode の phase ごとに GPU 時刻を集計する診断用スイッチ。通常の計算カーネルや選択ロジックを別実装に切り替える設定ではないが、記録時に event を保持し、集計時に待機・読み出しを行う。主な実装は `engine/sycl/include/dpct/device.hpp` の `create_queue_impl()` と `engine/sycl/include/strata/kprof.hpp` の `enabled()` / `QP` / `flush_locked()`。
+
+この読み取りは `engine/sycl/` 内だけにある。トップレベル CMake では SYCL engine は実験的な別 backend で、`STRATA_ENABLE_SYCL` の既定値は `OFF`（`engine/CMakeLists.txt:23-32`）。CUDA/HIP engine でこの変数を読む Strata 所有箇所は見つからなかった。
 
 ## 値と判定
 
-2箇所の判定はいずれも `getenv()` が null でないこと、および値の先頭文字が `'0'` でないことです。文字列全体や真偽値として parse しません。
+queue 作成側と `kprof::enabled()` 側が、それぞれ `std::getenv("STRATA_KPROF")` を行い、値が非 null かつ `v[0] != '0'` なら有効とする（`engine/sycl/include/dpct/device.hpp:690-696`, `engine/sycl/include/strata/kprof.hpp:31-34`）。文字列全体の比較や数値変換はしない。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 有効（値は存在し、先頭文字 `\0` は `'0'` ではない） |
-| `0`、`0anything` | 無効 |
-| `1`、`true`、`false`、`2`、その他先頭が `0` 以外の値 | 有効 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| SYCL queue 作成 / `kprof::enabled()` | 無効 | 先頭文字が `0` 以外の値。例: `1`, `true`, `false`, ` 1`, `-1` | 空文字、`0`, `0anything`, `00`（いずれも先頭文字が `0` または空文字） |
 
-空白、大文字小文字、数値としての妥当性は確認しません。queue 作成側と profiler 側では、それぞれ最初の判定結果を `static const bool` に保持します。従って、それぞれの初回評価後にプロセス内で環境値を変更してもその箇所の判定には反映されません（`sycl/include/dpct/device.hpp:685-687`; `sycl/include/strata/kprof.hpp:31-34`）。
+大文字小文字、空白、後続文字の妥当性は検査しない。したがって `false` も有効で、`0anything` は無効。queue 作成側の `kprof_on` と `enabled()` は別々の関数内 static 値であり、それぞれ初回評価時に読み取った結果を保持する。既定値はどちらも無効（同上）。
 
 ## 有効になる条件
 
-- **SYCL backend**: 直接の読み取り・利用は `sycl/include/` と `sycl/src/` にあります。CUDA/HIP の実行経路にこの Strata 側 profiler が有効になる根拠は確認できません。
-- **queue 作成**: `dpct::device::create_queue_impl()` が呼ばれた時点で有効判定が真なら、作成 queue に `enable_profiling()` を加えます。偽なら、その translation unit が `DPCT_PROFILING_ENABLED` を定義している場合に限って同 property を付けます。したがって、この変数はマクロによる queue 設定を有効値で上書きし、queue 作成後に設定しても既存 queue の設定は変えません（`sycl/include/dpct/device.hpp:679-701`）。
-- **kernel event 記録**: profiler header を使う箇所でも、記録対象は `kp()` の `parallel_for` / `submit` / `single_task` wrapper を通る投入です。`record()` は queue が `executing` 状態でない場合（graph recording 中）には event を保存しません（`sycl/include/strata/kprof.hpp:81-86,223-257`）。SYCL decode は graph replay だと event を記録できないため、decode kernel の per-kernel 計測には別環境変数 `STRATA_VERIFY_EAGER` を設定した eager 経路が必要とコメントに明記されています。prompt は eager launch 経路です（`sycl/include/strata/kprof.hpp:3-8`; `sycl/src/core/verify.cpp:1833-1837,2522`）。
-- **CLI・モデル状態**: CLI 引数やモデル状態で `STRATA_KPROF` の判定を変える処理は確認できません。サーバーモード固有の分岐もこの profiler 実装にはありません。
+- SYCL engine の実行経路を使う必要がある。トップレベル構成では `STRATA_ENABLE_SYCL=ON` で CUDA/HIP を同時に有効化できず、SYCL は既定で無効（`engine/CMakeLists.txt:23-32`）。
+- 計測対象は `strata::kprof::kp()` で包まれた `parallel_for` / `submit` / `single_task` の launch。event の記録は queue の状態が `executing` のときだけで、graph recording 中は `record()` が戻る（`engine/sycl/include/strata/kprof.hpp:81-86,230-254`）。
+- decode window は通常 graph 経路で記録されるため、`STRATA_VERIFY_EAGER` が設定され、window body が queue 上で直接実行される経路が per-kernel event 記録の条件。`capture()` はこの変数が設定されていると graph recording を省く（`engine/sycl/src/core/verify.cpp:2098-2107`）。`STRATA_VERIFY_EAGER` 自体は値の内容でなく設定有無で判定される。
+- prompt は `Prefill::run_impl()` の prompt phase と `window_end("prompt")` を通る（`engine/sycl/src/prefill/prefill.cpp:2692-2698,5729-5731`）。decode は verifier の phase と成功経路末尾の `window_end("decode")` を通る（`engine/sycl/src/core/verify.cpp:2384-2389,2906-2919`）。他の実行経路や未完了の処理は、これらの flush 地点に到達しないことがある。
+- `DPCT_PROFILING_ENABLED` がない translation unit では、変数が無効でも queue 作成コードが profiling property を付ける場合がある。ただし `kprof::enabled()` が偽なら、この環境変数による per-kernel event 記録・phase flush は有効にならない（`engine/sycl/include/dpct/device.hpp:691-704`, `engine/sycl/include/strata/kprof.hpp:31-34,230-254`）。
+- この環境変数を上書きする CLI 引数や設定ファイルの読み取りは確認できなかった。
 
 ## 実行時の詳細
 
-`STRATA_KPROF` の読み取りは起動時の一箇所に集約されているわけではありません。queue 側は最初の `create_queue_impl()` で、profiler 側は最初の `enabled()` 呼び出しで各々キャッシュします。profiler が有効なら、wrapper が返した event を記録し、graph recording 中の event は除外します。decode の `Verifier::run()` は `phase("decode")` で phase を切り替え、成功した verify window の終わりに `window_end("decode")` を呼びます。prompt の prefill path も終端で `window_end("prompt")` を呼び、蓄積 event を flush します（`sycl/include/strata/kprof.hpp:31-34,81-86,197-213`; `sycl/src/core/verify.cpp:2107-2120,2515-2526`; `sycl/src/prefill/prefill.cpp:5006-5010`）。
+queue 初期化では `init_queues()` が in-order queue と out-of-order queue を `create_queue_impl()` 経由で作成する。`STRATA_KPROF` が有効なら、同関数が translation unit の `DPCT_PROFILING_ENABLED` にかかわらず queue に `enable_profiling()` property を加える（`engine/sycl/include/dpct/device.hpp:676-704`）。
 
-flush 時は event を待ち、kernel ごとの開始・終了時刻、queue span、合計を phase ごとに集計します。既定では途中の周期出力はなく、プロセス終了時に残りを flush して、データがあれば集計表を stderr に出します。出力行は `kprof <phase>: ...`、続く行は launch site と時間等です。`STRATA_KPROF_EVERY` が正数に変換される場合はその回数ごとの flush でも stderr に出し、`STRATA_KPROF_TOP` は各 phase 表に出す site 数を制御します（既定値45）。これら2変数は別の環境変数で、本書の対象ではありません（`sycl/include/strata/kprof.hpp:118-139,142-188,215-220`）。
+`kprof::enabled()` が真のとき、`QP` の launch wrapper は通常どおり queue に処理を投入し、返った event と起動元の file/function/line を `record()` に渡す。queue が graph recording 状態なら記録は行わない（`engine/sycl/include/strata/kprof.hpp:81-86,230-257`）。収集対象は `kp()` を通る launch に限られ、全ての SYCL / 外部ライブラリ処理を計測するものではない。
 
-event の wait / profiling timestamp 取得で例外が発生した場合、その event の例外は `catch (...)` で握りつぶされ、その event の集計は加算されません。Strata 独自の警告やエラー出力はこの経路にはありません。SYCL runtime/driver が出すメッセージや挙動はここでは扱いません（`sycl/include/strata/kprof.hpp:147-177`）。
+`phase("prompt")` / `phase("decode")` は phase 切替時に前の記録を flush する。正常な prompt/decode の終端では `window_end()` がそれぞれの名前で flush する。flush は event を wait し、kernel の start/end timestamp を読み、呼び出し場所ごとに集計して記録をクリアする。取得時の例外は空の `catch (...)` で無視される（`engine/sycl/include/strata/kprof.hpp:142-213`）。プロセス終了時の `State` destructor も残った記録を flush してレポートを出す（同 `:215-221`）。
+
+読み取り結果は初回評価後 static cache され、実行中に環境値を変更しても queue 作成判断や `enabled()` の結果は更新されない。CLI、リクエストごとの再読込、子プロセスへの転送は実装されていない（`engine/sycl/include/dpct/device.hpp:691`, `engine/sycl/include/strata/kprof.hpp:31-34`）。
+
+## ログと測定値
+
+`STRATA_KPROF_EVERY` が正の整数として `std::atoll` で読まれた場合、その phase の flush 回数が指定値の倍数になるたびに、集計表を stderr に出力して flush する。未設定時は `0` で定期出力しない。空文字や整数として変換できない先頭文字は `atoll` により `0` となり、負値も `> 0` を満たさない。数値の後ろの文字列は `atoll` が読む範囲で切り捨てられる（`engine/sycl/include/strata/kprof.hpp:183-187`）。
+
+プロセス終了時は集計が存在すれば同じレポート形式を stderr に出力する。行の形式は `kprof %s: %lld flushes, %lld kernels; kernel sum %.3f ms/flush, queue span %.3f ms/flush, gap %.3f ms/flush`、続く site 行は `%-58s %8.3f ms/flush %5.1f%%  n=%.1f/flush  avg %.1f us`（`engine/sycl/include/strata/kprof.hpp:118-139,215-221`）。site 表示の行数は `STRATA_KPROF_TOP` で指定し、未設定は 45、設定時は `std::atoi` の結果を使う。測定結果や比較値を記載した Strata 資料は確認できなかった。
 
 ## 根拠
 
-- 候補一覧上の記載: `000_envvers.md:963`。
-- 候補名の全参照を検索し、値を読む本番実装として確認した箇所: `sycl/include/dpct/device.hpp:685-687`、`sycl/include/strata/kprof.hpp:31-34`。他の候補名参照は helper のコメント、呼び出し箇所、関連変数 `STRATA_KPROF_EVERY` / `STRATA_KPROF_TOP` で、`STRATA_KPROF` の追加読み取りではありません。
-- `docs/DETAILS.md` に `STRATA_KPROF` の説明は見つかりませんでした。挙動の根拠は上記の実装です。
+- 環境変数の全直接読み取り: `engine/sycl/include/dpct/device.hpp:691`, `engine/sycl/include/strata/kprof.hpp:32`。その他の `STRATA_KPROF` 参照はコメントのみ。
+- queue 作成と profiling property: `engine/sycl/include/dpct/device.hpp:676-704`。
+- event 記録・phase 集計・出力: `engine/sycl/include/strata/kprof.hpp:31-34,81-86,118-139,142-221,230-257`。
+- SYCL build 条件と decode/prompt の経路: `engine/CMakeLists.txt:23-32`, `engine/sycl/src/core/verify.cpp:2098-2107,2384-2389,2906-2919`, `engine/sycl/src/prefill/prefill.cpp:2692-2698,5729-5731`。

@@ -1,51 +1,49 @@
 # `STRATA_GROUPED_V1`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査対象リポジトリは調査開始時点で `main...origin/main`、未コミット変更なし。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-CUDA/HIP および SYCL の native grouped expert GPU kernel で、旧 grouped 実行方式を選びます。通常方式では、呼び出し側が `grid_groups` で指定した少数 group だけを並列 grid に出し、SwiGLU と q8_1 量子化を一つの kernel にまとめます。この変数を有効にすると、group grid を `cap_groups` 全体にし、SwiGLU と q8_1 量子化を別々の kernel にします。旧方式と通常方式の結果は同一になるよう実装されており、header は bitwise 同一と説明しています。
+CUDA/HIP と SYCL の native grouped expert カーネルで、グループ方向の起動グリッドと関連する融合経路を選ぶ A/B 用スイッチです。値を有効にすると旧 grouped 経路（V1）を選び、処理対象グループ数 `cap_groups` 分の block row を起動します。未設定時などは、呼び出し側から渡される `grid_groups` が有効ならその値を使います。入力や出力の選択条件を変更する設定ではありません。ヘッダーの説明では V1 と既定経路は bitwise 同じ結果で、A/B timing 用とされています（`engine/include/strata/kernels/iq_kernels.hpp:140-143`）。
 
-主な利用経路は `native_expert_grouped()` です。verify window の PCIe expert 呼び出しなど、実際にある group が `cap_groups` より少ない呼び出しで grid の形を変えます。対象外の CPU expert 経路ではこの変数を読みません。
+環境からの読み取りは CUDA/HIP 実装と SYCL 実装に各 1 箇所あり、いずれも `env_on` を通じて `g_grouped_v1` の初期値を設定します（`engine/src/kernels/cuda/iq_kernels.cu:3689-3692,6831-6833`; `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:3927-3930,7761-7765`）。
 
 ## 値と判定
 
-CUDA/HIP 実装と SYCL 実装の `env_on()` は `std::getenv()` の結果について、未設定でなく、先頭文字が NUL でも `'0'` でもない場合に true を返します。数値変換や文字列全体の比較はしません。
+`env_on(name)` は `std::getenv(name)` の結果が null でなく、先頭文字が NUL でも `'0'` でもない場合に true を返します。文字列全体の parse、数値変換、trim、大文字小文字変換はしません（`engine/src/kernels/cuda/iq_kernels.cu:3689-3692`; `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:3927-3930`）。
 
-| 環境値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| `0`、`0anything` | 無効（先頭が `'0'`） |
-| `1`、`true`、`false`、`2x`、先頭が空白の文字列 | 有効（非空で先頭が `'0'` 以外） |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP または SYCL の grouped kernel 実装 | false | `1`, `2`, `true`, `false`, ` 0`（先頭文字が空白） | 空文字, `0`, `0anything`, `0.5` |
 
-値の fallback、範囲制限、警告ログはありません。CLI 引数や別の環境変数による本番時の優先順位もありません。parity 用の `native_grouped_set_v1(bool)` は内部状態を書き換えますが、呼び出しは parity プログラムに限られます。
+したがって `false` という文字列も true 扱いです。先頭文字だけを見るため、後続文字や数値としての妥当性は判定されません。境界値の数値範囲はありません。空文字は「設定済み」でも false です。
 
 ## 有効になる条件
 
-- CUDA/HIP では `src/kernels/cuda/iq_kernels.cu`、SYCL では対応する `sycl/src/kernels/cuda/iq_kernels.dp.cpp` の grouped expert GPU 実装が使われること。CPU の `native_expert_grouped` 相当処理や Metal 経路でこの名前は参照されません。
-- `native_expert_grouped()` が呼ばれ、通常の gate/up および down kernel 経路へ進むこと。CUDA の `STRATA_EXPERT_V2` / `STRATA_EXPERT_V2K` 専用経路は関数冒頭で別 kernel を起動して return するため、そこで `g_grouped_v1` による grid・SwiGLU 分岐の効果はありません。
-- `grid_groups` が `1..cap_groups-1` なら、有効時は `gy=cap_groups`、無効時は `gy=grid_groups` です。`grid_groups<=0` または `grid_groups>cap_groups` なら両方とも `cap_groups` です。
-
-`STRATA_EXP_LAYOUTS` の特殊 layout、4-bit nibble kernel、EXPDEC などの選択は引き続き別条件で行われます。そこでも `gy` を使う通常の launch は grid の変更対象ですが、特殊実装が明示的に `cap_groups` を使う部分はこの変数でさらに変わりません。CUDA の fused gate/up layout は独立した分岐なので、この変数が gate/up kernel 自体を常に旧版へ戻すわけではありません。
-
-HIP gfx906 では `STRATA_HIP_SWIGLU_FUSED` も相互作用します。fused SwiGLU が選ばれていれば、この変数が有効な場合は `sw_v1` が true となり別々の SwiGLU・量子化 kernel に戻します。fused SwiGLU が選ばれていない場合は、無効時も同じ別 kernel 経路です。
+- 対象コードを含む CUDA/HIP または SYCL engine が実行され、`native_expert_grouped` まで到達すること。サーバー専用の設定ではなく、このカーネル実装側で読みます（`engine/src/kernels/cuda/iq_kernels.cu:7085-7089`; `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:7767-7775`）。
+- 有効値の場合、V1 の group grid は `cap_groups` です。無効値の場合は `grid_groups <= 0` または `grid_groups > cap_groups` なら `cap_groups`、それ以外なら `grid_groups` になります（`engine/src/kernels/cuda/iq_kernels.cu:7184-7185`; `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:7791-7795`）。
+- CUDA/HIP では `!g_grouped_v1` が条件に含まれる NVFP4 grouped decode 経路（`cap_entries > 10`、format/type、block/tail、phase、GPU 対応条件を満たすもの）を、有効値で迂回します（`engine/src/kernels/cuda/iq_kernels.cu:7092-7102`）。また V1 は `gu_swiglu_on()` を使う GU+SwiGLU の経路を抑止します（`engine/src/kernels/cuda/iq_kernels.cu:7241-7255`）。
+- SYCL では V1 が `STRATA_EXP_MODE=8` 等で選択可能な fused GU 経路を抑止します（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:7797-7801`）。また、特定 layout/device 条件に限定された追加 GU 経路も `!v1` を条件とするため、有効値では選ばれません（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:7849-7872`）。
+- SYCL の `native_expert_grouped_staged` は `g_grouped_v1` が true なら staging 条件を満たさない扱いとして、通常の `native_expert_grouped` に fallback します（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:8427-8443`）。
+- 両 backend で V1 は SwiGLU と q8_1 量子化を別 kernel にする側を選びます。gfx906 では `STRATA_HIP_SWIGLU_FUSED` が有効でも `v1` が true なら別経路です（`engine/src/kernels/cuda/iq_kernels.cu:7317-7337`; `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:7884-7946`）。APR の `had_block > 0` も別 kernel 経路を必要とします（同上）。
+- V1 でないときも、上記の融合経路が選ばれるにはそれぞれの format、layout、GPU、phase、他スイッチ条件を満たす必要があります。条件不足なら通常の grouped 実装へ進みます。
 
 ## 実行時の詳細
 
-値は kernel ソース内の namespace-scope `g_grouped_v1` 初期化時に一度読み取られます。プロセス起動後に環境値を変更しても再評価されません。CLI やサーバーのリクエストごとに読む処理ではありません。
+`g_grouped_v1` は CUDA/HIP と SYCL の各翻訳単位にある namespace-scope 変数で、ライブラリの静的初期化時に環境を一度読みます。`native_expert_grouped` の各呼び出しでは保存済み bool を使い、環境を再読しません。そのためプロセス起動後に環境を変更しても、この値には反映されません（`engine/src/kernels/cuda/iq_kernels.cu:6831-6832,7184`; `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:7761-7765,7791`）。
 
-通常経路では `gy` を gate/up grid と down grid の group 次元に渡します。無効時に `grid_groups` が小さければ少数 group を起動し、各 block row が残りの group を stride して扱います。有効時は `gy` を `cap_groups` に固定し、group ごとに block row を配置します。続く SwiGLU/量子化は、旧方式では `swiglu_entries_kernel` と `quantize_q8_1_kernel` の二段、新方式では `swiglu_q8_1_entries_kernel` の一段です。CUDA の `L.had_block > 0` の場合は必要な Hadamard 変換のため、環境値にかかわらず float 中間値を作る別段経路になります。
+CLI 引数、設定ファイル、別の環境変数からこの値を上書きする読み取り経路は見つかりませんでした。宣言済みの `native_grouped_set_v1(bool)` は保存値を書き換えられますが、対象 commit 内でその関数を呼ぶ箇所は宣言・定義以外に見つかりませんでした（`engine/include/strata/kernels/iq_kernels.hpp:140-143`; `engine/src/kernels/cuda/iq_kernels.cu:6891`; `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:7765`）。ヘッダーは graph capture 前の設定を想定し、capture 済み graph は自身の起動構成を保持すると記しています（同ヘッダー:140-143）。
 
-有効・無効を示す専用ログはありません。CUDA の kernel launch 後にエラーがあれば `check()` が `stderr` に `<kernel名>: <CUDA error string>` を出し `exit(1)` します。SYCL 側の `check()` は移植コード上、CUDA error code の置き換え値を確認するだけで、変数固有のログはありません。
+`native_expert_grouped` は GU 計算後に SwiGLU/q8_1 化を行い、その後 down projection を起動します。V1 は GU と down の group grid に `cap_groups` を用い、通常経路の選択にも関わります。CUDA/HIP と SYCL のソースコメントは group grid による結果は変わらないと説明していますが、この調査では build や parity 実行をしていないため、実行結果を独立検証したものではありません（`engine/src/kernels/cuda/iq_kernels.cu:7184-7195,7327-7343`; `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:7791-7795,7893-7950`; `engine/include/strata/kernels/iq_kernels.hpp:140-143`）。
+
+## ログと測定値
+
+この環境変数を読み取ったことや V1 が選ばれたことを示す専用ログはありません。後続 kernel は `check("native_expert_grouped/gu")`、`check("native_expert_grouped/swiglu")`、down の check に渡されますが、チェックの表示内容はここでは変数固有のものではありません（`engine/src/kernels/cuda/iq_kernels.cu:7316-7337,7343-7354`; `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:7883-7982`）。
+
+`docs/DETAILS.md` に本変数の記述は見つかりませんでした。ソースヘッダーは A/B timing 用と説明しますが、本変数による性能測定値は同資料から確認できないため記載しません（`engine/include/strata/kernels/iq_kernels.hpp:140-143`）。
 
 ## 根拠
 
-- `src/kernels/cuda/iq_kernels.cu:3395-3398`、`sycl/src/kernels/cuda/iq_kernels.dp.cpp:3200-3203`: 未設定・空文字・先頭 `'0'` の判定。それぞれ `6211`、`5604` で起動時に状態を初期化。
-- `src/kernels/cuda/iq_kernels.cu:6246-6258,6267-6324`: early return する V2/V2K 経路、通常経路の `v1` と `gy`。
-- `src/kernels/cuda/iq_kernels.cu:6353-6368,6423-6442,6444-6447`: fused gate/up との独立、fused SwiGLU の条件、SwiGLU/量子化 kernel の分岐と group grid。
-- `sycl/src/kernels/cuda/iq_kernels.dp.cpp:5609-5636,5696-5708,5742-5759,5761-5764`: SYCL の grouped kernel、`gy`、SwiGLU/量子化の分岐。
-- `include/strata/kernels/iq_kernels.hpp:79-92`: `grid_groups` の意味、旧方式が block row を group ごとに置くこと、結果同一との注記、setter の宣言。
-- `src/core/verify.cpp:2217-2221,2234-2236`: verify window で group 数 `gy` を決め、native kernel に渡す呼び出し。
-- `src/kernels/cuda/iq_kernels.cu:38-40`: CUDA の launch error のログと終了処理。parity 用 setter の呼び出しは `src/kernels/native_grouped_parity.cpp:194-200,277-289`、`src/kernels/iq_nibble_parity.cpp:668-696`、`sycl/src/kernels/native_grouped_parity.cpp:260-276` にあり、製品経路での setter 呼び出しはありません。
-- `CMakeLists.txt:80-95` と `sycl/CMakeLists.txt:1-5`: CUDA/HIP と SYCL が別の backend 実装であること。
+- `engine/src/kernels/cuda/iq_kernels.cu:3689-3692,6831-6833,7085-7102,7184-7195,7241-7255,7317-7354` — CUDA/HIP の値判定、グリッド、特化経路、SwiGLU/q8_1 化。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:3927-3930,7761-7801,7849-7872,7883-7982,8427-8462` — SYCL の値判定、グリッド、融合・特化経路、staged 経路の fallback。
+- `engine/include/strata/kernels/iq_kernels.hpp:140-143` — V1 の説明、同一結果との説明、graph capture に関する注記。

@@ -1,6 +1,6 @@
-# `--show-key`
+# `strata launch --show-key`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,62 +8,59 @@
 | コマンド | `strata launch` |
 | オプション | `--show-key` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ（`store_true`、既定値は false） |
+| 値 | 取らないフラグ（`store_true`、既定値 `false`） |
 
 ## 役割
 
-launch または setup.py が保存したモデル設定から API key を読み出し、標準出力へそのまま表示します。稼働中の launch や preset に保存されたキーを確認する用途にも使えます。設定やサーバーを変更せず、通常の launch 起動処理より前に表示して終了します。
+実行中の `strata launch`、指定した保存済み preset、または setup.py が用意したモデル設定から API key を探し、見つかった鍵をそのまま表示します。鍵の確認だけを行い、launch の開始・停止や設定ファイルの書き換えはこの分岐では行いません。`strata connect` にも同名フラグがありますが、そちらはアプリ向け設定表示で鍵をマスクするかどうかを制御する別スコープです（索引の `connect` 節、および `terminal/strata_cli/launch/cmd.py:181`）。
 
 ## 使い方
 
 ```sh
+# 実行中の launch の鍵、または該当する setup.py 設定の鍵を表示
 strata launch --show-key
-strata launch --show-key --preset "Office"
+
+# 名前を指定した実行中 launch または保存済み preset の鍵を表示
+strata launch --show-key --preset office
+
+# setup.py が設定したモデルの鍵を選ぶ（複数候補がある場合）
 strata launch --show-key --model iq3_xxs
 ```
 
-1つ目は指定のない稼働 launch を優先し、該当キーがなければ setup.py のモデル設定を検索します。2つ目は `Office` の稼働 launch または保存済み preset を指定します。3つ目の `--model` は setup.py のモデル設定を検索するときに候補を絞ります。出力は実際の秘密鍵なので、端末やコマンド出力を閲覧できる利用者に注意してください。
+鍵そのものが stdout に出るため、端末履歴・ログ・パイプの保存先に残さないよう出力先を選んでください。
 
 ## 値と既定値
 
-値は不要です。parser は `action="store_true"` で定義され、既定値は false です（`strata_cli/launch/cmd.py:153-154`）。同じフラグを複数回指定しても真偽値のままで、値の検証や鍵の形式検証はこのオプションについて行いません。
-
-`--preset NAME` と併用すると、その名前に対応する稼働 launch の設定キーを先に確認し、設定キーがなければ保存 preset のキーを使います。`--preset` を省略した場合は稼働 launch の情報を先に調べます。そこにキーがなくても preset は自動選択されず、setup.py のモデル設定へ進みます（`strata_cli/launch/cmd.py:636-658, 728-745`）。
+`--show-key` は `action="store_true"` で、値も別名もありません。省略時は `false` となり、通常の launch 処理へ進みます。複数回指定しても真偽値のままです。`--preset NAME` と `--model NAME` は値を取る別オプションで、前者は parser 上で保存済み preset の起動指定、後者はモデル指定として定義されています（`terminal/strata_cli/launch/cmd.py:82-83,160-161`）。
 
 ## 実行時の動作
 
-`run_launch()` は `--list-presets`、`--delete-preset`、`--stop`、`--status` の処理後、通常の launch 設定・起動へ進む前に `--show-key` を処理します。したがってこの分岐ではモデルの起動、チューニング、server 起動を行いません（`strata_cli/launch/cmd.py:699-728`）。
+`run_launch` は通常の launch 設定処理に進む前に `a.show_key` を確認します（`terminal/strata_cli/launch/cmd.py:798-816`）。まず `launch_info(a.preset)` を呼び、`--preset` があればその名前に一致する実行中 launch を探し、なければ同名の保存 preset を読みます。preset を指定しない場合は検出された実行中 launch の先頭を選びます。選んだ launch の設定ファイルに有効な `api_key` がある場合はそれを使い、なければ preset に保存された鍵を使います（`terminal/strata_cli/launch/cmd.py:663-689,703-725`）。
 
-キー検索の順序は次のとおりです。
+その経路で鍵が得られない場合に限り、`--preset` が指定されていなければ setup.py が用意したモデル設定を検索します。`--model NAME` があればモデル ID の大文字小文字を区別しない完全一致または末尾一致で絞ります。候補の設定 JSON から `api_key` を読み、空文字と大文字小文字を区別しない `none` は鍵として扱いません（`terminal/strata_cli/launch/cmd.py:728-750,803-815`）。
 
-1. `launch_info(--preset)` が稼働 launch と preset を検索します。名前を指定した場合は同名の稼働 launch の設定ファイルにある `api_key` を読み、値がなければ保存 preset の `api_key` を使います。名前なしの場合は検出された稼働 launch の先頭を使います。設定の `api_key` が空、または文字列 `none` の場合は preset 側のキーにフォールバックします（`strata_cli/launch/cmd.py:636-658`）。
-2. そこでキーが見つからず、かつ `--preset` が指定されていない場合は、`strata_control.models.list_installed()` で見つけた setup.py のモデル設定ファイルを読みます。設定の `api_key` を前後空白除去して取得し、空文字と `none` は候補から除外します（`strata_cli/launch/cmd.py:661-683, 733-745`）。
-3. `--model NAME` を指定したときは、モデル ID が NAME と大文字小文字を無視して一致するか、NAME で終わる候補に絞ります。これは setup.py 設定の検索にだけ使われます（`strata_cli/launch/cmd.py:661-675, 733-745`）。
-
-候補が1件なら鍵を表示します。複数ならモデル ID の一覧を伴うエラーになり、`--model NAME` を指定するよう案内します（`strata_cli/launch/cmd.py:735-745`）。setup.py 設定の探索・読込 helper は設定を読み取り、モデル ID、設定ファイルのパス、鍵を返します（`strata_cli/launch/cmd.py:661-683`）。
-
-同じ `--show-key` 文字列は `strata launch connect` にも別 parser action として存在しますが、別コマンドのスコープです。索引も [`strata connect --show-key`](../connect/--show-key.md) を別文書として扱います（`strata_cli/launch/cmd.py:156-173`）。
+`--output` の形式は成功時の鍵表示には適用されず、成功鍵は `_say` によって stdout に一行で出ます。setup.py 設定から鍵を得た場合、人間向け出力ではモデル名と設定ファイルの出所が stderr に追加されます。`--output json` でも成功時の鍵は平文のまま stdout に出ます（`terminal/strata_cli/launch/cmd.py:495-498,798-810`）。
 
 ## 適用条件と副作用
 
-- `--preset` で選んだ稼働 launch または保存 preset に API key がある場合は、それを出力します。`--preset` を指定した場合、そこにキーがなくても setup.py のモデル設定検索には進みません（`strata_cli/launch/cmd.py:652-658, 728-745`）。
-- `--preset` がなく稼働 launch にキーがない場合、setup.py のモデル設定にあるキーが検索対象です。複数の設定にキーがあり `--model` で一つに絞れない場合は失敗します（`strata_cli/launch/cmd.py:661-683, 733-745`）。
-- 成功時は API key 全体を stdout に1行で出力します。setup.py 設定からの成功では human 出力の場合に限り、モデル ID と設定ファイルのパスを stderr に補足表示します（`strata_cli/launch/cmd.py:728-740, 447-449`）。
-- この分岐はファイルの読込とモデル設定の列挙を行います。ソース上、このオプション自体によるファイル書込、鍵の生成・ローテーション、ネットワーク通信、server 起動は確認できません（`strata_cli/launch/cmd.py:728-745`）。
+- `--preset NAME` を付けると、その preset 名に対応する実行中 launch または保存 preset を対象とします。指定した preset から鍵が取れない場合、setup.py 設定へのフォールバックは行いません。
+- `--preset` なしで実行中 launch に鍵がない場合は、setup.py 設定の鍵を検索します。`--model` はこの検索の絞り込みに使われます。
+- setup.py 設定に鍵があるモデルが複数見つかった場合、`--model NAME` で一つを指定する必要があります。候補の列挙に失敗した場合や設定ファイルが読めない場合、その候補は検索結果に含まれません（`terminal/strata_cli/launch/cmd.py:728-750,811-815`）。
+- このオプション自体はファイルに書き込みませんが、鍵を stdout に平文で露出します。実行中 launch の状態・設定や preset、setup.py のモデル設定は読み取り対象です。
 
 ## 出力とエラー
 
-- キーが見つかった場合、キー文字列を stdout に出力し終了コード `0` を返します（`strata_cli/launch/cmd.py:728-740`）。
-- キーがない場合は `There is no API key for that launch.` を表示し終了コード `5` を返します。preset 無指定時は preset または setup.py 設定を指定する案内が続きます（`strata_cli/launch/cmd.py:745`）。
-- `--model` に一致する setup.py 設定がなく、キーも見つからない場合はその旨を出して終了コード `5` を返します（`strata_cli/launch/cmd.py:743-744`）。複数モデルにキーがある場合も候補名と `--model` の案内を出して終了コード `5` です（`strata_cli/launch/cmd.py:741-742`）。
-- 失敗時は human 出力では `strata: ...` を stderr に出します。`--output json` の失敗は `ok: false` とエラー情報を含む JSON を stdout に出力します（`strata_cli/launch/cmd.py:690-697`）。一方、成功経路は `--output json` でも鍵を `_say()` でそのまま stdout に出すため、JSON 形式ではありません。setup.py 設定から成功した場合の補足 stderr は JSON 出力時には抑止されます（`strata_cli/launch/cmd.py:728-740, 447-449`）。
+- 鍵があれば鍵を stdout に一行出して終了コード `0` を返します。setup.py 設定由来の場合、人間向け出力では出所の説明を stderr に出します。
+- 鍵がない場合は終了コード `5` です。preset 指定時は `There is no API key for that launch.`、preset なしでモデル指定があるときは該当モデルと鍵がない旨（実装の文面は `and no launch is running` を含みます）、複数候補時は候補名と `--model NAME` を使うよう案内するメッセージになります。
+- `--output json` の失敗は `ok: false` とエラーコード・メッセージを含む JSON を stdout に出します。成功時は前述のとおり平文の鍵を出します（`terminal/strata_cli/launch/cmd.py:757-764,798-815`）。
+- preset が破損して読み込めない場合は `PresetError` を通じて終了コード `2` のエラーになります（`terminal/strata_cli/launch/store.py:89-104`; `terminal/strata_cli/launch/cmd.py:1009-1010`）。
 
 ## 根拠
 
-- parser 定義と別コマンドの同名 option: `strata_cli/launch/cmd.py:148-173`
-- 稼働 launch / preset のキー選択: `strata_cli/launch/cmd.py:598-658`
-- setup.py 設定の候補抽出とモデル名フィルター: `strata_cli/launch/cmd.py:661-683`
-- オプションの分岐、出力、失敗条件: `strata_cli/launch/cmd.py:686-697, 728-745`
-- `--output json` 時の成功キー出力と stderr 補足: `strata_cli/launch/cmd.py:447-449, 735-740`
+- `terminal/strata_cli/launch/cmd.py:80-83,155-161` — `launch` の `--preset` / `--model` と `--show-key` の parser 定義。`--show-key` は管理オプション群にあり、値を取らない。
+- `terminal/strata_cli/launch/cmd.py:663-689,703-725` — 起動中 launch の状態確認と preset を含む鍵・設定情報の選択。
+- `terminal/strata_cli/launch/cmd.py:728-750,798-816` — setup.py 設定へのフォールバック、モデル絞り込み、成功表示および鍵不在時の分岐。
+- `terminal/strata_cli/launch/cmd.py:495-498,757-764,1009-1010` — stdout / stderr と JSON エラー出力、終了コード。
+- `terminal/strata_cli/launch/store.py:89-104` — preset の読込、未存在・破損時の扱い。
 
-調査範囲は上記 commit の Terminal CLI ソースです。実環境にある preset、稼働 launch、setup.py 設定の内容は調査していません。また、CLI の help は実行しておらず、parser 定義と処理コードを根拠にしています。
+調査時点の Strata checkout は `git status --short --branch` で `## main...origin/main` と表示され、作業ツリーに未コミット変更はありませんでした。CLI の `--help` は実行していません。

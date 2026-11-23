@@ -1,47 +1,49 @@
 # `STRATA_PF_P1A_L2`
 
-調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-HIP ビルドの gfx1151 向け native fused prompt expert 経路で、P1A の F16 行列コアカーネルに渡せる gate/up と down の量子化形式ペアを広げるフラグです。既定では追加分を有効にせず、既定の Q4_K gate/up + Q5_1 down ペアはこの変数を設定しなくても対象です。値が有効でも、P1A 本体、FP16 down 行、モデル形式などの条件がそろわなければ通常の native expert カーネルが続きます（`src/prefill/moe_fused_iq.cu:3076-3082,3093-3096,3131-3143`、`src/prefill/moe_p1a.cu:508-510`）。
+HIP の native MoE prefill で、`STRATA_PF_P1A=1` が選ぶ P1A カーネルの対象量子化ペアを広げるスイッチ。P1A の基本対象は gate/up `Q4_K` と down `Q5_1` で、この変数が有効なら `Q4_K` / `Q5_K` gate/up と `Q5_1` / `Q8_0` down の組み合わせを `p1a::takes()` が受け入れる。したがって、この変数だけでは P1A を有効にしない。`p1a_wanted()` が `STRATA_PF_P1A` と GPU 条件を満たし、対象 layer が実際の prefill 条件も満たす必要がある（`engine/src/prefill/moe_fused_iq.cu:3612-3628,3665-3668,3703-3715`; `engine/src/prefill/moe_p1a.cu:507-512`）。
 
 ## 値と判定
 
-HIP では `p1a_l2()` の初回評価時に `std::getenv` し、値が存在し、先頭が `'1'` かつ次の文字が終端（`'\0'`）である場合だけ有効です。数値変換や空白除去、大文字小文字変換はありません。空文字、`0`、`true`、`10`、`1anything`、` 1` は無効です。非 HIP ビルドはこの環境変数を読み取らず常に無効を返します（`src/prefill/moe_fused_iq.cu:3076-3082`）。
+HIP ビルドの `p1a_l2()` は `std::getenv()` の結果が null でなく、かつ文字列全体がちょうど `"1"` の場合だけ true とする。整数変換はしない。明示的な空文字は設定済みでも false。大文字小文字・空白・後続文字を含めて文字列完全一致なので、`1 `、`1anything`、`true`、`0`、`false`、`-1` は false になる。非 HIP ビルドでは関数が常に false を返す（`engine/src/prefill/moe_fused_iq.cu:3623-3629`）。
 
-| ビルド・条件 | unset | 有効になる値 | 無効になる値 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
 |---|---|---|---|
-| HIP | 追加ペアは無効。Q4_K + Q5_1 は引き続き候補 | 文字列が厳密に `1` | 空文字、`0`、`true`、`10`、`1anything`、空白を含む値 |
-| HIP 以外 | 関数が `false` を返す | なし | すべて |
+| HIP ビルド、P1A 判定時 | `p1a_l2()` は false。起動時の対象 GPU 既定値が適用されていれば、その前に `"1"` が設定される | `1`（文字列全体がちょうど `1`） | 空文字、`0`、`true`、`1 `、`1anything` |
+| 非 HIP ビルド | `p1a_l2()` は false | なし | すべて（値を参照する HIP 専用処理がコンパイル対象外） |
 
-コード上のペア判定は `STRATA_PF_P1A_L2=1` のとき、Q4_K または Q5_K の gate/up と、Q5_1 または Q8_0 の down の組み合わせを許可します。したがって判定式上は Q4_K/Q5_1、Q4_K/Q8_0、Q5_K/Q5_1、Q5_K/Q8_0 が対象です。コメントは L2 が追加するペアを Q5_K/Q8_0 とだけ説明しており、判定式とは範囲が異なります。実際にどのペアが選ばれるかは読み込んだ native pack の形式にも依存します（`src/prefill/moe_p1a.cu:57,508-510`、説明コメント `src/prefill/moe_p1a.hpp:16`、`src/prefill/moe_fused_iq.cu:3056-3059`）。
+既定値の注入は既存値の有無で決まり、値の真偽では決まらない。既に `STRATA_PF_P1A_L2` が存在すれば `set_default()` は上書きしないため、空文字や `0` も既定値を抑止する（`engine/src/core/arch_defaults.cpp:218-223,334-344`）。
 
 ## 有効になる条件
 
-- `__HIPCC__` でコンパイルされた経路であること。CUDA など非 HIP ビルドでは無効です（`src/prefill/moe_fused_iq.cu:3076-3082`）。
-- P1A 本体の `STRATA_PF_P1A` が厳密に `1` で、検出デバイスが gfx1151 であること。P1A 本体が無効なら、ペア判定より前に対象外です（`src/prefill/moe_fused_iq.cu:3065-3074,3093-3096`）。Windows の統合 gfx1151 では起動時の arch defaults が `STRATA_PF_P1A=1` を既定設定します。設定済みの値は上書きしません。`STRATA_PF_P1A_L2` 自体はこの既定値一覧にありません（`src/core/arch_defaults.cpp:187-213,218-223,358-363`）。
-- 対象層が native expert layout で、`fused_nat` が選ばれること。これは MMQ 計画または fused-only 対象、全体ストリーム経路、peer 不使用、native layout、対応形式を要します。通常の fused native 判定は折り畳み入力・出力の層を除外します（`src/prefill/prefill.cpp:5426-5437`）。
-- 同じ呼び出しで `STRATA_PF_DM16` による FP16 down 出力が許可されること。`STRATA_PF_DM16` は先頭文字が `1` なら有効ですが、CPU 分担がなく、peer 行がなく、共有バッファと出力ポインタが 16-byte 整列している必要もあります（`src/prefill/prefill.cpp:931-935,5540-5543`）。
-- P1A に渡す FP16 入力があること。gate/up の入力を折り畳む層では `p1a_input` に null が渡されます。また down の回転が有効な呼び出しも P1A の条件から外れます（`src/prefill/prefill.cpp:5490-5493`、`src/prefill/moe_fused_iq.cu:3084-3090,3134-3136`）。
-- `tiles <= 65535` かつ FP16 H 行を格納する容量があること。モデル内に対象ペアがない場合はバッファを追加せず、対象層があっても容量条件を満たさない呼び出しでは P1A を起動しません（`src/prefill/prefill.cpp:2237-2267`、`src/prefill/moe_fused_iq.cu:3133-3136`）。
+- **HIP 実行経路であること。** 起動時の `apply_arch_defaults()` 呼び出しは `STRATA_USE_HIP` の下にあり、P1A の読み取りも `__HIPCC__` の分岐内にある。CUDA-only ビルドではこのスイッチは P1A カーネルを選ばない（`engine/src/program/generate.cpp:4282-4286,4315`; `engine/src/prefill/moe_fused_iq.cu:3612-3629`）。
+- **P1A の親スイッチと GPU 条件を満たすこと。** `STRATA_PF_P1A` も完全一致の `"1"` で、`dev_info().g11_wmma` が true の場合に限り `p1a_wanted()` が true になる。`g11_wmma` は `gfx1100` / `gfx1101` / `gfx1102` / `gfx1103` / `gfx1150` / `gfx1151` のデバイスで true になり得る。P1A_L2 単独での opt-in はできない（`engine/src/prefill/moe_fused_iq.cu:2858-2868,3612-3628`; `engine/include/strata/kernels/gfx_arch.hpp:28-32`）。
+- **native MoE prefill で対象 layer があること。** `p1a::takes()` が受け入れるのは gate/up `Q4_K` または `Q5_K` と down `Q5_1` または `Q8_0` の直積。`STRATA_PF_P1A_L2` が false のときは `Q4_K` + `Q5_1` だけが対象（`engine/src/prefill/moe_p1a.cu:509-512`）。
+- **その呼び出しに FP16 入力と FP16 down 出力が使えること。** prefill が native fused path で FP16 入力行を渡し、`g_dm16_want` が true、down rotation が無効、device が `g11_wmma`、layer の tile 数が 65,535 以下、FP16 の H 行が確保済みバイト数に収まる場合に P1A の gate/up と down を起動する。それらを満たさない呼び出しはこの枝を通らず既存経路へ進む（`engine/src/prefill/prefill.cpp:5774-5776,5830-5845`; `engine/src/prefill/moe_fused_iq.cu:3703-3715`）。
+- **起動時の自動設定があるのは対象 GPU の限定経路。** AMD HIP の discrete `gfx1100` / `gfx1101` / `gfx1102` では `gfx11_discrete_wmma_env()` が `"1"` を既定値候補にする。Windows の integrated `gfx1151` でも integrated prompt set が有効なら同じ値が候補に入る。`STRATA_DEFAULTS=026`、`STRATA_GFX11_DEFAULTS` の先頭が `0`、または（discrete RDNA3 では）`STRATA_GFX11_WMMA_DEFAULTS` の先頭が `0` なら discrete 向け matrix-core 既定値群は作られない。Windows `gfx1151` の integrated 経路は `STRATA_IGPU_DEFAULTS` が先頭 `0` なら無効、`STRATA_IGPU_PROMPT_SET` の先頭 `1` / `0` が有効 / 無効を明示し、未指定なら有効になる。その他の対応 GPU では手動設定でのみこの変数が供給される（`engine/include/strata/core/gfx11_extra.hpp:27-36,87-109`; `engine/src/core/arch_defaults.cpp:120-138,172-180,193-213,302-344,406-420`; `engine/include/strata/core/defaults_026.hpp:21-29`）。
 
 ## 実行時の詳細
 
-`p1a_l2()` は関数内 `static const bool` に結果を保存します。通常は P1A が有効な状態で native pack のバッファを計画するとき、`p1a_pack()` → `p1a_takes_pair()` から初回評価されます。そこで読み取られた後にプロセス環境を変更しても反映されません。P1A 本体の `p1a_wanted()` も別の関数内 static として初回値を保持します（`src/prefill/moe_fused_iq.cu:3065-3082,3093-3096`、`src/prefill/prefill.cpp:2237-2243,2260-2267`）。
+`generate.cpp` は HIP ビルドで device 0 のプロパティ取得に成功すると、起動時に `apply_arch_defaults()` を呼ぶ。対象の既定値テーブルを走査し、環境に既に同名があればその値を保持し、なければ Windows では `_putenv_s`、それ以外では `setenv(..., 0)` で `"1"` を設定する。discrete gfx11 の既定値は integrated GPU と判定された場合には適用しない。Windows integrated gfx1151 の既定値は別の integrated prompt set 経路で入る（`engine/src/program/generate.cpp:4282-4315`; `engine/src/core/arch_defaults.cpp:218-223,302-344,406-420`）。
 
-専用の engine CLI 引数はありません。Strata Terminal の汎用 `strata launch --set STRATA_PF_P1A_L2=1` は設定を受け付け、CLI の指定は保存済みの同名 extra を上書きします。その後、runner は env 形式の extra を起動設定の `env` に適用し、同名キーを置き換えます。`--set ...=off` / `unset` / `none` はキーを削除します。engine 内では最後に渡された環境値を上記の厳密な判定で読みます（`strata_cli/launch/cmd.py:121-122,285-286`、`strata_cli/launch/settings.py:247-252`、`strata_control/tune_knobs.py:259-284,522-529`、`strata_cli/launch/runner.py:507-510`）。
-
-条件を満たす呼び出しでは `moe_p1a.cu` の F16 gate/up と down を起動し、H と down 行を FP16 として書きます。続いて `dm16_used` が立ち、CPU 行がない場合は `moe_combine16` がその down 行を読みます。launch 条件を満たさない場合は `experts_native` の残りの既存経路に進みます（`src/prefill/moe_fused_iq.cu:3133-3143`、`src/prefill/moe_p1a.cu:513-525`、`src/prefill/prefill.cpp:5540-5554,7091-7099`）。
+P1A_L2 の値を読む実装は `p1a_l2()` の関数内 `static const bool` で、最初に呼ばれた時点のプロセス環境から一度だけ決まる。それ以降の環境変更はそのキャッシュに反映されない。呼び出し側は `p1a_wanted()` が true のときに layer の対象ペアを確認し、実行時には入力・down 出力・容量などの条件を満たした呼び出しだけ `moe_p1a.cu` の P1A gate/up と down を実行する（`engine/src/prefill/moe_fused_iq.cu:3623-3629,3665-3668,3703-3715`; `engine/src/prefill/moe_p1a.cu:509-512`）。
 
 ## ログと測定値
 
-この変数専用の警告・有効ログはありません。P1A が少なくとも 1 層で実際に使われると、最初の対象チャンクの最終層で stderr に `strata: prompt experts P1A (STRATA_PF_P1A=1): ...` が出て、使われた形式ペアと層数、既存カーネルに残った層数などを表示します。P1A を使った層が 0 の場合、この行は出ません。L2 の値自体はログに表示されません（`src/prefill/prefill.cpp:2195-2230,5567-5571`）。この L2 追加分について、調査対象ソースに条件付き測定値は見つかりませんでした。
+discrete gfx11 の起動時に Strata がこの値を新規設定し、同時に他の matrix-core 既定値も一つ以上設定した場合、stderr の既定値一覧に `P1A_L2` が含まれる。ユーザーがこの変数を事前に設定していた場合、その名前は一覧に追加されない。P1A の使用状況は最初の fused prefill chunk の最終 layer で一度報告される。少なくとも一つの layer で使われた場合の stderr 書式は `strata: prompt experts P1A (STRATA_PF_P1A=1): gate/up + down on the P1A kernels in %d of %zu layers (%s); today's kernels in %d (%s); %d not on the fused path in this chunk`。この時点で P1A を使った layer がない場合は報告行を出さない（`engine/src/core/arch_defaults.cpp:334-344`; `engine/src/prefill/prefill.cpp:2273-2308,5857-5861`）。
+
+ソースコメントには Windows gfx1151 でのモデル別測定記述があるが、P1A_L2 単体の効果を切り分けた測定ではないため、ここではこの変数単独の速度・品質測定値としては扱わない（`engine/src/core/arch_defaults.cpp:202-210`）。
 
 ## 根拠
 
-- 読み取り、厳密な値判定、HIP 以外の扱い、ペア判定呼び出し: `src/prefill/moe_fused_iq.cu:3076-3096`
-- 実際の対応型ペアとカーネル起動条件: `src/prefill/moe_p1a.cu:57,508-525`; `src/prefill/moe_fused_iq.cu:3131-3143`
-- native fused prompt 条件、FP16 入出力、フォールバック後の combine: `src/prefill/prefill.cpp:5426-5443,5490-5493,5540-5554,7091-7099`
-- 対象 pack の事前判定と H 容量: `src/prefill/prefill.cpp:2232-2267`
-- 関連資料: `docs/SETTINGS.md:187` は AMD 向け on/off 設定として掲載。個別の効果説明はありません。`data/settings-register.json:26099-26127` は HIP、既定 off、P1A と gfx1151 で追加ペアを使う設定として登録しています。
+- `engine/src/prefill/moe_fused_iq.cu:3623-3629` — 値の取得、完全一致判定、HIP 以外での false。
+- `engine/src/prefill/moe_fused_iq.cu:3665-3668,3703-3715` — P1A 親スイッチとの関係、ペア判定と実カーネル分岐。
+- `engine/src/prefill/moe_p1a.cu:509-512` — P1A_L2 有効時に受け入れる量子化ペア。
+- `engine/include/strata/core/gfx11_extra.hpp:27-36,87-109` — discrete RDNA3 の既定値とその無効化条件。
+- `engine/src/core/arch_defaults.cpp:218-223,302-344,406-420` — 既存環境値の保持、既定値注入、stderr 通知、integrated GPU の適用経路。
+- `engine/src/program/generate.cpp:4282-4315` — HIP ビルドの起動時における arch defaults 適用。
+- `engine/src/prefill/prefill.cpp:2280-2308,5774-5776,5830-5861` — P1A 使用ログと prefill 側の入力・呼び出し条件。
+- `engine/include/strata/kernels/gfx_arch.hpp:28-32`; `engine/src/prefill/moe_fused_iq.cu:2858-2868` — gfx11 WMMA 世代判定。

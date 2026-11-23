@@ -1,50 +1,43 @@
 # `STRATA_METAL_GDN_SCAN`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Metal backend の GDN prompt scan で使う kernel 名を明示指定します。認識される値を設定すると、チップ名と prompt chunk 長による既定選択を上書きします。値を設定していないときは既定選択に従います。
-
-この選択関数を呼ぶのは、Metal の大きな prompt 向け prompt-chain 経路と、prompt GEMM 経路です。通常の decode window や、prompt の 8-row window fallback はこの関数を通りません。
+Metal エンジンの prompt GDN scan に使う kernel 名を固定し、機種・prompt 長に応じた自動選択を上書きする診断・比較用の変数です。選択肢は `gdn_scanr_4`、`gdn_scanr_4_8`、`gdn_scanr_4_4`、`gdn_scanr_4_2` です。selector は `engine/metal/src/engine/window.cpp` の `gdn_scan_name` にあり、選んだ名前は prompt 用の GDN scan dispatch の pipeline 名として使われます。通常の decode window が呼ぶ `gdn_step` はこの selector を通らないため、この変数は decode の GDN kernel 選択を変更しません（`engine/metal/src/engine/window.cpp:72-89,1173-1176,3255-3257`、`engine/metal/src/engine/prompt_chain.inc:357-360`）。
 
 ## 値と判定
 
-`std::getenv` の値を `std::string` にし、文字列全体を大文字小文字を区別して比較します。数値変換や trim はありません。空文字は unset と同じく自動選択になります。次の4文字列だけが強制指定として認識されます。
+`gdn_scan_name` 内の関数ローカル `static const std::string` 初期化で `std::getenv` を一度呼び、環境値全体を `std::string` の完全一致で比較します。未設定は空文字列に置き換えられ、明示的な空文字も同じく無効です。大文字小文字を区別し、空白除去・数値変換・部分一致はしません。許可名以外はエラーにせず「強制指定なし」として自動選択へ進みます（`engine/metal/src/engine/window.cpp:79-89`）。
 
-| 環境変数の状態・値 | 選択 |
-|---|---|
-| 未設定、空文字 | 自動選択 |
-| `gdn_scanr_4` | `gdn_scanr_4` |
-| `gdn_scanr_4_8` | `gdn_scanr_4_8` |
-| `gdn_scanr_4_4` | `gdn_scanr_4_4` |
-| `gdn_scanr_4_2` | `gdn_scanr_4_2` |
-| 上記以外（大文字、前後の空白、接尾辞を含む） | 無効値として無視し、自動選択 |
+| 条件 | unset / 空文字 | 有効になる値 | 無効になる値の例 |
+|---|---|---|---|
+| Metal prompt GDN scan | 機種・chunk 長による自動選択 | `gdn_scanr_4`、`gdn_scanr_4_8`、`gdn_scanr_4_4`、`gdn_scanr_4_2` | `0`、`1`、`true`、`false`、`gdn_scanr_4_8 `、`GDN_SCANR_4`、任意の別文字列。いずれも自動選択へ戻る |
 
-無効値に対する専用の警告・エラー処理はありません。値は boolean や数値として解釈されません。
+自動選択は、device 名が正確に `Apple M4` なら `gdn_scanr_4_8`、正確に `Apple M5 Max` かつ scan の `T >= 4096` なら `gdn_scanr_4_4`、それ以外は `gdn_scanr_4` です。`gdn_scanr_4_2` は有効な強制値ですが、自動選択では選ばれません（`engine/metal/src/engine/window.cpp:85-89`）。
 
 ## 有効になる条件
 
-- Metal backend を組み込んだ Strata の実行経路であること。Metal engine の構築には `metal/CMakeLists.txt` の Metal runtime と engine の有効化、および `METAL_CPP_DIR` が必要です。
-- Metal engine が prompt 処理を行い、選択関数を使う prompt-chain (`pc_chunk`) または prompt GEMM (`prompt_chunk`) 経路に入ること。大きな prompt の通常経路、streaming の prompt GEMM 経路などが該当します。
-- GDN scan を行うモデル層であること。両経路では layer `l` が `l % 4 != 3` の場合に GDN scan dispatch を追加します。
-
-既定選択は、device 名が厳密に `Apple M4` なら `gdn_scanr_4_8`、厳密に `Apple M5 Max` かつ当該 chunk の行数 `T >= 4096` なら `gdn_scanr_4_4`、それ以外は `gdn_scanr_4` です。認識済みの環境変数値は、このチップ名・chunk 長の規則より優先されます。`STRATA_METAL_PROMPT=window` により8-row window prompt を選ぶ場合や、既定の prompt 経路条件に満たない短い prompt では、この変数による選択は使われません。
+- `STRATA_GPU_METAL` を定義して組み立てる Metal エンジン経路に限られます。Metal 以外の backend にはこの Strata 読み取り箇所がありません（`engine/src/prefill/prefill.cpp:9633-9641`、`engine/metal/src/engine/window.cpp:70-81`）。
+- prompt が GDN scan を含む行列演算経路に入る必要があります。非 streaming では `STRATA_METAL_PROMPT=window` でなく、入力 token 数が `STRATA_METAL_PROMPT_MIN`（既定 32）以上の場合に `Window::prompt` を呼びます。streaming では `STRATA_METAL_PROMPT=window` でなく、`STRATA_METAL_PROMPT_GEMM` が文字列 `0` でなく、token 数が `STRATA_METAL_PROMPT_GEMM_MIN`（既定 64）以上の場合に prompt chunk 経路を使います。これらの条件を満たさない場合は 8 行 window の経路になり、この selector は使われません（`engine/metal/src/engine/window.cpp:3743-3776`）。
+- prompt 経路でも、走査対象の layer が GDN layer である必要があります。prompt chain は `l % G_QI != G_QI - 1` の分岐で GDN 前処理・scan・後処理を dispatch します（`engine/metal/src/engine/window.cpp:3235-3260`、`engine/metal/src/engine/prompt_chain.inc:322-371`）。
+- 対象変数を有効値にしても prompt 経路そのものは有効化されません。モデルや request に GDN scan がなければ選択機会もありません。CLI 引数による直接上書きはこの selector にはありません。prompt 経路の選択に関係する上記の環境変数は別途そのゲートとして評価されます。
 
 ## 実行時の詳細
 
-選択関数内の関数ローカル `static const std::string` が、最初の呼び出し時に一度だけ環境変数を読み取ります。その後同じプロセスで環境を変更しても、強制値の判定は更新されません。prompt ごとに device 名と chunk 行数から既定値を選びますが、キャッシュ済みの有効な強制値があれば常にそれを返します。
+環境値は最初の `gdn_scan_name` 呼び出しで読み込まれ、関数ローカル `static` に保持されます。以後の呼び出しでは環境を再読しないため、同一プロセス内での環境変更は反映されません。一方、fallback の機種名と `T` 判定は関数を呼ぶたびに評価されます（`engine/metal/src/engine/window.cpp:79-89`）。
 
-返された名前は、`gdn_prompt.metal` から作る Metal pipeline の関数名として渡され、prompt の GDN scan dispatch に使われます。prompt-chain と prompt GEMM の両方で同じ選択関数を呼びます。`STRATA_METAL_GDN_SCAN` に関するログ出力、終了コード変更、値の子プロセスへの転送は実装にありません。kernel/pipeline の実行時エラーについて、この環境変数固有の処理は確認できません。
+選択名は pipeline 関数名として prompt GDN scan の dispatch に渡されます。通常の window prompt と streaming prompt chunk の両方が同じ selector を呼びます。kernel source は `gdn_scanr_4`、`gdn_scanr_4_8`、`gdn_scanr_4_4`、`gdn_scanr_4_2` を `gdn_scan_r<4, TB>` の別 `TB` として export しています（`engine/metal/src/engine/window.cpp:3255-3257`、`engine/metal/src/engine/prompt_chain.inc:357-360`、`engine/metal/kernels/gdn_prompt.metal:329-334`）。
 
-`000_envvers.md` の候補名は実装で実際に読み取られていました。`docs/DETAILS.md` にはこの変数の説明は見当たりませんでした。
+## ログと測定値
+
+この変数の読み取り、無効値の fallback、選択した kernel 名について専用のログはありません。prompt 全体の既存 trace/profile は `STRATA_METAL_TRACE` または `STRATA_METAL_PROFILE` が設定されたときに集計時間を stderr に出しますが、選択名は表示しません（`engine/metal/src/engine/prompt_chain.inc:608-611`）。有効名に対応する Metal function が pipeline 作成時に見つからない場合は、共通処理が `mtl: no function %s %s` を stderr に出して exit code 3 で終了します。pipeline 生成失敗時は `mtl: pipeline %s: %s` を出して同じく終了します（`engine/metal/src/mtl_rt.mm:229-265`）。
+
+`window.cpp` の実装コメントは Apple M4 で `gdn_scanr_4_8` が scan 1.16x / GDN prompt stage 1.11x（T 512..32K）、Apple M5 Max で `gdn_scanr_4_4` が T 4096 以上で 1.04x（4K）/ 1.10x（16K）と記載しています。ただしコメントには OS、モデル・量子化、他の設定、測定回数などの条件がなく、この文書では条件付きの再現可能な測定結果として扱いません（`engine/metal/src/engine/window.cpp:72-78`）。
 
 ## 根拠
 
-- `metal/src/engine/window.cpp:60-70`: 環境値の全体比較、static cache、強制値とチップ・chunk 長に基づく既定選択。
-- `metal/src/engine/prompt_chain.inc:435-447`: prompt-chain の実行と chunk 分割。`metal/src/engine/prompt_chain.inc:204-242`: 同経路での GDN 層判定と、選択した名前による scan dispatch。
-- `metal/src/engine/window.cpp:2674-2698`: prompt GEMM 経路での GDN 層判定と scan dispatch。
-- `metal/src/engine/window.cpp:3045-3075`: prompt 経路の選択条件、`STRATA_METAL_PROMPT=window` 時などの window fallback。
-- `metal/src/engine/window.cpp:206-213,2499`: pipeline 名からの Metal pipeline 取得と GDN prompt kernel library の compile。
-- `metal/kernels/gdn_prompt.metal:329-334`: 強制候補に対応する kernel 名の登録。
-- `metal/CMakeLists.txt:50-61,71-83,110-130`: Metal runtime/engine の build 条件と engine target。
+- 実読み取り、受理値、fallback、機種・長さ別の自動選択: `engine/metal/src/engine/window.cpp:72-89`
+- prompt GDN scan と decode window の別 kernel: `engine/metal/src/engine/window.cpp:1173-1176,3255-3257`; `engine/metal/src/engine/prompt_chain.inc:357-360`
+- prompt 経路ゲートと Metal backend 呼び出し: `engine/metal/src/engine/window.cpp:3743-3776`; `engine/src/prefill/prefill.cpp:9633-9641`
+- kernel export と pipeline 作成失敗時の出力: `engine/metal/kernels/gdn_prompt.metal:329-334`; `engine/metal/src/mtl_rt.mm:229-265`

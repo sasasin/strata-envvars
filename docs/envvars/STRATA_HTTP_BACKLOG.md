@@ -1,39 +1,43 @@
 # `STRATA_HTTP_BACKLOG`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（2026-11-23 時点）。
 
 ## 役割
 
-Python HTTP サーバー `serve/server.py` のクラス属性 `Server.request_queue_size` を設定します。コメントでは、標準設定の backlog 5 では同時接続の burst 時に最初の接続で `connection reset by peer` が起きたため、既定値を 256 にしてこの変数で上書きできるようにしたと説明しています。Strata が行うのは属性値の設定です。ソケット backlog の実際の処理は Python 標準ライブラリ側のため、ここではその内部動作を Strata の挙動として扱いません。
+Strata の HTTP サーバー実装 `serve.server_parts.http_api.Server` が持つ `request_queue_size` クラス属性を設定する。クラスは `http.server.ThreadingHTTPServer` を継承し、Strata はこの属性を未設定時 256、設定時は整数変換後の最低 5 にする。これは Strata がサーバーのクラス属性へ与える値の説明であり、Python 標準ライブラリや OS がその値をどう扱うかの詳細はここでは扱わない（`terminal/serve/server_parts/http_api.py:37-44`）。
+
+通常の Strata サーバー起動時にこの `Server` が作られる（`terminal/serve/server.py:8263-8269, 9182`）。HTTP サーバーの待受キュー設定に関する値であり、モデル設定や生成処理を直接変更するコードは確認できない。
 
 ## 値と判定
 
-モジュール読み込み時に `os.environ.get(...) or 256` の結果を Python の `int()` で変換し、`max(5, ...)` を適用します。整数文字列全体を変換し、結果の下限は 5、上限は設けられていません。
+式は `max(5, int(os.environ.get("STRATA_HTTP_BACKLOG") or 256))`。環境変数が未設定の場合 `get()` は `None`、空文字の場合も `or 256` により 256 となる。空文字以外は Python の `int()` で文字列全体を変換し、その結果を最低 5 に clamp する（`terminal/serve/server_parts/http_api.py:44`）。
 
-| 環境変数の状態・値 | `Server.request_queue_size` | 結果 |
-|---|---:|---|
-| 未設定 | 256 | 既定値 |
-| 空文字 | 256 | `or 256` により既定値 |
-| `0`、`1`、負数、5 未満 | 5 | 整数変換後に下限 5 へ丸める |
-| `5` 以上の整数文字列 | 変換した整数 | 指定値 |
-| 整数として変換できない文字列 | 設定されない | `int()` の `ValueError` が発生し、モジュール読み込みが失敗する |
+| 条件 | 未設定 | 有効になる値・例 | 無効になる値・例 |
+|---|---:|---|---|
+| HTTP サーバーモジュールの import | `None` から 256 | 整数に変換できる文字列。`1`、`5`、`256` はそれぞれ 5、5、256。`0` や `-3` も変換できるが結果は 5 | 空文字は無効化ではなく既定値 256。`true`、`0anything`、空白だけの文字列など `int()` が変換できない値は無効で、`ValueError` になる |
 
-`int()` が受け付ける表記の詳細は Python の変換規則に従います。Strata 独自の文字列比較や CLI での上書きはありません。たとえば文字列 `0` は空文字ではないため整数 0 に変換され、その後 5 になります。
+`int()` は数値の範囲を個別に検証しない。前後の空白や符号を含む整数表記は変換でき、変換後の値が 5 未満なら 5 になる。小数表記や整数の後ろに余分な文字が付いた表記は変換できない。大文字小文字の比較は行わない（`terminal/serve/server_parts/http_api.py:44`）。
 
 ## 有効になる条件
 
-`serve.server` モジュールが読み込まれ、そこで定義された `Server` が使われる場合に適用されます。CUDA/HIP 等の backend、モデル状態、サーバーの mock/Strata engine の別による分岐はこの設定箇所にはありません。CLI 引数や設定ファイルからの別設定も見つかりません。
+- `serve.server_parts.http_api` が import されて `Server` クラスが定義される実行経路で評価される。`serve.server` はこのクラスを import し、CLI のサーバー起動経路で `serve()` が `Server` を生成する（`terminal/serve/server.py:250-263, 8263-8269, 9182`）。
+- CLI 引数や設定ファイルによる同じ値の上書きは見つからない。環境値が変換可能であれば `request_queue_size` はクラス定義で決まり、5 未満の値は 5 になる（`terminal/serve/server_parts/http_api.py:44`）。
+- OS / GPU backend / build macro / モデル状態による分岐はこの読み取り箇所にはない（`terminal/serve/server_parts/http_api.py:37-49`）。
 
 ## 実行時の詳細
 
-環境変数はリクエストごとではなく、`serve/server.py` のモジュール読み込み時に `Server` クラスを定義する際に一度読み取られます。したがって、読み込み後にプロセス環境を変更してもクラス属性は再評価されません。実サーバーの起動経路 `serve()` はこの `Server` を生成して `serve_forever` を開始します。また CLI はポートの事前確認でも同じクラスを生成します。
+`os.environ.get()` は `Server` クラス本体の評価時に一度呼ばれ、その結果はクラス属性 `request_queue_size` に保存される。`serve()` がそのクラスを使って HTTP サーバーを生成する。リクエストごとの読み直しや、プロセス起動後の環境変更を反映するコードはない（`terminal/serve/server_parts/http_api.py:37-49`; `terminal/serve/server.py:8263-8269`）。
 
-不正な整数文字列ではクラス定義中に `ValueError` となります。Strata 独自の警告・fallback・エラーメッセージ処理はなく、通常のモジュール読み込み／起動はこの例外で止まります。値が正常な場合、この変数専用のログはありません。
+不正な非空文字列は `int()` の `ValueError` を発生させる。`server.py` は `http_api` から `Server` を import するため、この場合はサーバー起動処理が `Server` を作る段階より前、モジュール import 時に失敗する（`terminal/serve/server.py:250-263`; `terminal/serve/server_parts/http_api.py:44`）。
+
+## ログと測定値
+
+この変数の値を表示する専用ログや、変換失敗を捕捉して出す警告は実装されていない。無効な整数表記は `ValueError` として import 呼び出し元へ伝播する（`terminal/serve/server_parts/http_api.py:44`; `terminal/serve/server.py:250-263`）。
+
+実装コメントは、既定の listen backlog 5 では 30〜40 クライアントの同時接続時に接続リセットが起きた経験（4 枚の R9700、1 リクエストずつの場合にも発生）と、既定値を 256 にする意図を記している。これはコメントに記録された背景であり、この調査で再測定した値ではない（`terminal/serve/server_parts/http_api.py:41-44`）。
 
 ## 根拠
 
-- `serve/server.py:8153-8165` — `Server` の定義、既定値 256、`int()` 変換、下限 5。
-- `serve/server.py:8438-8444` — `serve()` が `Server` を生成し、サーバーループを開始。
-- `serve/server.py:9144-9147` — CLI のポート事前確認も同じ `Server` を生成。
-- `serve/server.py:1-4` — Python サーバーの実行例。
-- `serve/test_parallel.py:718-723` — backlog 256 を前提とした同時接続テストの説明と属性の下限確認。これはテスト側の記述であり、実装動作の根拠は上記サーバーコード。
+- 読み取り・変換・既定値・下限・クラス属性: `terminal/serve/server_parts/http_api.py:37-49`
+- `Server` の import: `terminal/serve/server.py:250-263`
+- サーバー生成と起動: `terminal/serve/server.py:8263-8269, 9182`

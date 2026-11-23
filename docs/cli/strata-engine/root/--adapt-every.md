@@ -1,60 +1,67 @@
 # `strata --adapt-every`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの root 引数） |
+| コマンド | `strata`（推論エンジンのルート引数） |
 | オプション | `--adapt-every` |
 | 別名 | なし |
-| 値 | 整数。正の値は適応ラウンドの間隔、0 以下は適応 tier を停止 |
+| 値 | 整数。適応間隔（検証ラウンドまたは serve の window 数）。0 以下は適応 tier を無効にする条件として扱われる |
 
 ## 役割
 
-GPU cache に入っていない expert の routing 使用数を集計し、指定間隔ごとに、よく使われた expert と cache 内の使用頻度が低い expert の入れ替えを試みる頻度を指定します。既定値は4です。交換候補を最大いくつ扱うかは別オプション `--adapt-swaps` が担い、既定値は96です（`src/program/generate.cpp:873-880,911`）。
+GPU の専門家（expert）キャッシュに空き枠があるとき、ルーティング実績をもとに常駐する expert を入れ替える適応 tier の実行間隔を指定する。通常の speculative decode では検証ラウンド数、serve の一部では window 数を基準にする。実際に tier が働くには `--adapt-swaps` も正であり、GPU 側に全 expert が常駐していないなどの条件を満たす必要がある（`engine/src/program/generate.cpp:1043-1049,14906-14907,21949-21954`）。
 
 ## 使い方
 
 ```sh
-strata --native model.gguf --serve --adapt-every 8
+# 各 8 検証ラウンドの間隔で適応する
+strata --native MODEL.gguf --adapt-every 8
+
+# 静的な GPU 常駐構成にする（適応を無効化）
+strata --native MODEL.gguf --adapt-every 0
 ```
 
-この例では、適応 tier が有効な実行経路で、通常の適応ラウンドの間隔を8にします。`--serve` を使わない生成経路にも同じ root parser の値が適用されます。
+`MODEL.gguf` は利用するモデルのパスに置き換える。例はエンジンの通常のモデル引数にこのオプションを加える形を示す。
 
 ## 値と既定値
 
-- 省略時は4です（`src/program/generate.cpp:873-879`）。
-- parser は値を `std::atoi` で整数化し、`--adapt-every` を明示したことも記録します。個別の範囲検証や不正値エラーはありません（`src/program/generate.cpp:3503`）。したがって、`0` と負数は後段の正数条件を満たさず、適応 tier を無効にします。整数として読めない文字列も `atoi` の結果0となり、同様に無効になります。
-- 値を省略すると `--adapt-every needs a value` を stderr に出して終了コード2で終了します（共通の値取得処理 `src/program/generate.cpp:3295-3299`）。
-- 同じオプションを複数指定した場合、parser はその都度値を代入するため、最後に指定した値が残ります（`src/program/generate.cpp:3503`）。
-- 整数型の表現範囲を超える値の変換結果はソースで検証されていません。範囲外値の動作はここでは断定しません。
+- 値を必ず 1 個取る。値を省略すると parser の `next()` が `--adapt-every needs a value` を stderr に出して終了コード 2 で終了する（`engine/src/program/generate.cpp:3837-3842,4053`）。
+- 既定値は `4`（`engine/src/program/generate.cpp:1043-1046`）。正の値を interval として利用する。0 以下では適応用 usage 集計の初期化や適応処理が抑止され、tier は無効扱いになる（`engine/src/program/generate.cpp:11706,11723-11724,14906-14907`）。
+- parser は `std::atoi` で変換し、値の範囲や数値形式を独自に検証しない（`engine/src/program/generate.cpp:4053`）。したがって数値として読めない文字列は `atoi` の結果 0 となり、適応が無効になる。負数も正の interval ではなく無効側として扱われる。整数の上限や範囲エラーはこの parser からは確認できない。
+- 適応の実効間隔は、指定値のまま固定とは限らない。明示指定がなく speculative mode（`--spec >= 2`）のとき、環境変数 `STRATA_SPEC_ADAPT_EVERY` と `STRATA_SPEC_ADAPT_WARM` がともに条件を満たせば、最初の warm-up ラウンドだけ短い間隔を使う（`engine/src/program/generate.cpp:5072-5082`）。
+- GPU expert cache の占有率が 15〜65% の条件では、適応が有効で値を明示していなければ `--adapt-every` の実効既定値を `2` にする（`engine/src/program/generate.cpp:12066-12085,14858-14871`）。明示値はこの補正で上書きされない。この分岐は `--adapt-swaps` と `--adapt-decay` の未指定値も変更する。
 
 ## 実行時の動作
 
-- 適応 tier は `--adapt-every > 0` かつ `--adapt-swaps > 0` のときだけ有効です。さらに、全 expert が GPU cache に常駐している場合は routing 使用数を集計せず、入れ替えも行いません（`src/program/generate.cpp:9758,12216-12217`）。
-- 有効な場合、各適応ラウンドでは各層について、未常駐 expert のうち使用数が少なくとも2の候補と、常駐 expert の候補を比較します。候補が入れ替え先より `--adapt-min-gain` 以上多く使われているものを選び、全体で最大 `--adapt-swaps` 件に制限して交換します（`src/program/generate.cpp:12490-12516`）。使用数は各ラウンド後に `--adapt-decay` の係数で減衰します（`src/program/generate.cpp:880,12941-12945`）。
-- 通常の `--serve` 経路では、適応 tier が有効なら resident RAM mode の起動メッセージに交換の有効/無効が表示されます（`src/program/generate.cpp:9959-9970`）。通常の生成経路でも、集計が有効な場合は最後に交換数と間隔を出力します（`src/program/generate.cpp:20424-20426`）。
-- `--spec` が2以上で `--adapt-every` を明示しなかった場合に限り、`STRATA_SPEC_ADAPT_EVERY` と `STRATA_SPEC_ADAPT_WARM` が両方正の条件を満たし、前者が既定値より小さいと、最初の指定 verify round 数の間だけ短い間隔を設定します。その後は既定間隔に戻ります。明示した `--adapt-every` はこの短縮設定を抑止します（`src/program/generate.cpp:876-879,4177-4186`）。
-- `--serve --batch` の multi-GPU pipelined groups では、パイプライン中に独自の適応ラウンドは開始せず、別環境変数 `STRATA_PIPE_ADAPT_EVERY` が正の場合に限り、その値の group-window 間隔でパイプラインを空にして実行します。これは `--adapt-every` の通常間隔とは別のスケジュール条件です。また、適応 tier 自体が無効なら環境変数を設定しても実行されません（`src/program/generate.cpp:14435-14449,14687-14692`）。
+parser は値を `o.adapt_every` に設定し、コマンドラインで指定されたことを `o.adapt_every_given` に記録する（`engine/src/program/generate.cpp:4053`）。これにより speculative warm-up と 15〜65% cache coverage の適応既定値補正が、明示値を保持できる（`engine/src/program/generate.cpp:5076-5082,12073-12080`）。
+
+適応 tier が有効な経路では、expert routing の使用量を集計し、interval ごとに実績を snapshot して適応処理へ渡す。snapshot 時には累積 usage を `--adapt-decay` の係数で減衰させる（`engine/src/program/generate.cpp:15245-15251`）。適応処理は入れ替え候補を計算し、保留中の入れ替えがあれば新しい処理を開始しない（`engine/src/program/generate.cpp:15253-15257`）。通常の speculative decode は `adapt_iv(rounds)` を使って interval を判定する（`engine/src/program/generate.cpp:21949-21954,22953-22959`）。
+
+一部の serve loop では interval を window 数で数える（`engine/src/program/generate.cpp:15701-15712,17144-17152`）。`--batch-groups` の pipelined path は `STRATA_PIPE_ADAPT_EVERY` から別の interval を読み、その値を使うため、`--adapt-every` の値がその path の周期を直接決めない（`engine/src/program/generate.cpp:17902-17920`）。
 
 ## 適用条件と副作用
 
-- 適応ラウンドは routing 使用数と residency 表を参照して expert cache の入れ替えを行います。候補がない、または交換条件を満たす expert がないラウンドでは交換は発生しません（`src/program/generate.cpp:12496-12516`）。
-- `--serve --adapt-async` の非同期 tier も、`--adapt-every` と `--adapt-swaps` がともに正であることを必要とします。間隔を0以下にすると tier が停止し、非同期 tier を有効にできません（`src/program/generate.cpp:9768-9775`）。
-- speculative 実行では、通常の verify round 数を間隔として数えます。serve の通常 batch path では batch window 数、pipelined group path では前述の環境変数による group-window 数で動作します（`src/program/generate.cpp:17690-17693,14008-14020,14435-14449`）。
-- HIP AMD iGPU で `STRATA_IO_PREFETCH=1` かつ適応 tier が有効な場合、メモリ圧迫時に GPU reset が観測された組み合わせとして警告を stderr に出します。処理は中断せず続行します。警告は `--adapt-every 100000` での回避例にも触れますが、これは実装上の診断メッセージであり、一般的な推奨値とは確認できません（`src/program/generate.cpp:7190-7197`）。
+- 適応は `adapt_every > 0` かつ `adapt_swaps > 0` のとき有効判定される。expert が全て常駐している、または GPU 側に入れ替え可能な常駐枠がない場合などは、usage 集計・入れ替えが行われない（`engine/src/program/generate.cpp:11706,14906-14907`）。
+- `--adapt-every 0` は静的 residency の指定として help にも記載されている（`engine/src/program/generate.cpp:1397-1399`）。この値は適応 tier を無効にするため、`--expert-profile-save` が必要とする適応 tier の条件を満たさず、serve 時には保存を行わない旨の stderr メッセージが出る（`engine/src/program/generate.cpp:14996-15004`）。
+- `--adapt-async` を使う場合も、適応 tier が無効なら asynchronous tier は成立せず、無効理由として「the adaptive tier is off」が設定される（`engine/src/program/generate.cpp:11717-11732`）。
+- HIP の AMD iGPU で `STRATA_IO_PREFETCH` が有効なとき、適応 tier も有効なら既知の GPU reset 警告を stderr に出すが、そのまま処理を続ける（`engine/src/program/generate.cpp:8660-8666`）。
+- 適応処理に必要な交換バッファを確保できない場合、`--adapt-swaps` による容量縮小を試し、それも失敗するとエラーを stderr に出して終了コード 1 で戻る。この失敗経路は interval の値ではなく適応 tier 全体の条件に依存する（`engine/src/program/generate.cpp:12102-12110`）。
 
 ## 出力とエラー
 
-- このオプションの値に対する範囲エラーや警告は実装されていません。値なしの場合の stderr と終了コード2は「値と既定値」を参照してください（`src/program/generate.cpp:3295-3299,3503`）。
-- 適応処理自体が失敗すると、経路に応じて `ERR an adaptive refill failed` などを出して処理を失敗させます。たとえば pipelined batch 経路ではこのメッセージを stdout に出して false を返します（`src/program/generate.cpp:14662-14667`）。serve の resident RAM 予約に失敗した場合は理由を stderr に出し、終了コード1で終了します（`src/program/generate.cpp:9959-9963`）。
+適応が動作した generate 経路では、終了時の標準出力に入れ替えた expert 数と interval を表示する（`engine/src/program/generate.cpp:25208-25210`）。serve の asynchronous tier では起動時に interval として stderr に表示する（`engine/src/program/generate.cpp:15510-15517`）。適応 tier が無効な場合は tier off として状態表示される（`engine/src/program/generate.cpp:11717-11724,12117-12123`）。
+
+値の欠落は終了コード 2、交換バッファ確保の失敗は該当経路で終了コード 1 となる。値の負数や不正な数値文字列について、専用の validation error は parser にない（`engine/src/program/generate.cpp:3839-3842,4053,12102-12110`）。
 
 ## 根拠
 
-- parser、型変換、値なしエラー: `src/program/generate.cpp:3295-3299,3503`
-- 既定値・間隔の切り替え・decay: `src/program/generate.cpp:873-880,4177-4186,12934-12945`
-- 適応の候補選択と交換上限: `src/program/generate.cpp:12490-12516`
-- 適応 tier の有効条件、全 expert 常駐時の除外: `src/program/generate.cpp:9758,12216-12217`
-- batch / speculative scheduling と独立 pipeline 環境変数: `src/program/generate.cpp:14008-14020,14435-14449,17690-17693`
-- AMD iGPU 警告と失敗時出力: `src/program/generate.cpp:7190-7197,9959-9963,14662-14667`
+- `engine/src/program/generate.cpp:1043-1054` — interval の初期値と適応 tier の関連設定。
+- `engine/src/program/generate.cpp:3837-3842,4053` — 引数欠落時の処理と parser の変換・明示指定記録。
+- `engine/src/program/generate.cpp:5072-5082,12066-12085,14858-14871` — speculative warm-up と cache coverage による未指定時の interval 調整。
+- `engine/src/program/generate.cpp:15245-15257,21949-21954` — routing 使用量の減衰、snapshot、interval ごとの適応開始。
+- `engine/src/program/generate.cpp:14906-14907,14996-15004,12102-12110` — 適用条件、関連する保存条件、失敗経路。
+
+調査範囲は索引で `strata-engine` の `root/` parser として指定された `engine/src/program/generate.cpp`。この文書では同リポジトリ内の別 backend parser の挙動を統合していない。

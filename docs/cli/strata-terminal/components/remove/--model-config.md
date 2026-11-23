@@ -1,6 +1,6 @@
-# `strata components remove --model-config`
+# `strata components remove` の `--model-config`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（2026-11-23 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,55 +8,53 @@
 | コマンド | `strata components remove` |
 | オプション | `--model-config` |
 | 別名 | なし |
-| 値 | `RUN_CONFIG.json` として表示される値。parser は文字列として受け取り、型・選択肢・パスの検証を指定しない |
+| 値 | `RUN_CONFIG.json` として表示される値を1つ取る。parser 上は文字列で、形式やファイルの存在を検証しない |
 
 ## 役割
 
-このオプションは、共通 parser 上では「テスト起動に使うモデルの run config」を指定する引数です。しかし `strata components remove` はエンジンを削除する経路で、run config をテスト起動に使いません。このコマンドでは値は受理されますが、削除処理に影響しません。
+このオプションは共通 parser から `remove` にも登録されています。説明文は更新時のテスト起動に使う run config を示しますが、`remove` の実行経路では config を読み込まず、エンジン削除にも使いません。したがって `remove` に付けても削除対象や削除動作は変わりません（登録は `terminal/strata_cli/update_cmd.py:47-56,88-91`、共通 Context への格納は `terminal/strata_cli/update_cmd.py:314-321`、削除分岐は同 `:445-497`）。
 
 ## 使い方
 
-```sh
-strata components remove 0.1.54 --model-config /path/to/run.json
+構文上は次のように指定できます。これは引数の形を示す例であり、実行すると `<engine>` に一致するインストール済みエンジンを削除します。
+
+```text
+strata components remove <engine> --model-config <RUN_CONFIG.json>
 ```
 
-これは構文例です。`--model-config` はこのコマンドでは参照されないため、例のファイルを読み込んだり検証したりしません。削除対象は位置引数 `engine` で指定します。
+`<engine>` はバージョンまたはフォルダー名です。削除対象の選択に run config は関与しません（`terminal/strata_cli/update_cmd.py:88-91,466,492-497`）。
 
 ## 値と既定値
 
-- `_common()` が `--model-config` を `default=None`, `metavar="RUN_CONFIG.json"` で登録しています。`type` や `choices`、専用 validator の指定はありません（`strata_cli/update_cmd.py:47-56`）。
-- `remove` parser は位置引数 `engine` と `--family` を定義した後、この共通引数群を追加します（`strata_cli/update_cmd.py:88-91`）。値を省略した場合は `None` です。
-- `strata_cli/update_cmd.py:254-256` で値は `Context.run_config` に格納されますが、`remove` の処理では参照されません。したがって存在しないパスや不正な JSON を指定しても、このオプション自体を理由とするエラーにはなりません（削除処理が別の理由で失敗する可能性はあります）。
+- `argparse` の値引数で、指定時は後続の1値を `a.model_config` に格納します。別名、`type`、`choices`、独自 validator は定義されていません（`terminal/strata_cli/update_cmd.py:54-56`）。
+- 省略時の値は `None` です。`default=None` として登録されています（同 `:54-55`）。
+- 値を省略すると `argparse` の引数エラーになります。文字列の内容やパスの存在確認はこの parser では行われません。
+- 同じ引数を複数回指定した場合の独自処理はありません。標準の `argparse` の `store` 動作が適用されます。
 
 ## 実行時の動作
 
-1. `run()` は `a.model_config` を `Context.run_config` に渡します（`strata_cli/update_cmd.py:244-256`）。
-2. `components_command` が `remove` の場合、`_engines_command()` に進みます（`strata_cli/update_cmd.py:272-273`）。
-3. `_engines_command()` は engine 一覧から `engine` と任意の `--family` に一致する項目を選び、`lib.delete_engine()` を呼びます。呼び出しに渡されるのは context、family、folder、root であり、run config は引数として渡されません（`strata_cli/update_cmd.py:358-360,378,395`）。
-4. `delete_engine()` 内でも `ctx.run_config` は参照されず、engine の一覧・削除可否を調べて対象フォルダーを削除します（`strata_control/engine_library.py:294-334`）。
+`remove` parser は `_common(remove)` を呼ぶため `--model-config` を受理します。実行時には CLI dispatcher がこのサブコマンドを `update_cmd.run(a)` に渡し、同関数は `a.model_config` を `updater.Context.run_config` に格納します（`terminal/strata_cli/update_cmd.py:88-91,314-321`、`terminal/strata_cli/cli.py:2210-2212`）。
 
-対照として、`Context.run_config` は更新後 engine の test start 経路で使われ、値があればそのパスから JSON を読みます（`strata_control/updater.py:988-1005`）。この用途は更新処理のもので、`remove` の実行経路には接続されていません。
+その後 `remove` は `_engines_command` に入り、エンジン一覧から位置引数 `engine` と任意の `--family` で対象を選び、`lib.delete_engine(...)` を呼びます。この分岐では `ctx.run_config` を参照しません（`terminal/strata_cli/update_cmd.py:337-338,445-466,492`）。`delete_engine` も run config を引数に取らず、インストール済みエンジンの削除と関連状態の更新を行います（`terminal/strata_control/engine_library.py:317-366`）。
+
+従って、値が有効な JSON か、存在するファイルかに関係なく、`--model-config` 自体は `remove` の結果に影響しません。run config が利用されるテスト起動側の挙動は `remove` のスコープ外です。
 
 ## 適用条件と副作用
 
-- `--model-config` の指定による削除条件・選択・設定変更はありません。モデルの run config を変更・削除せず、削除対象エンジンの選択にも使いません。
-- 実際の削除では、稼働中のプログラムが使用している engine、および現在使用中の engine は拒否されます。削除先フォルダーを一時名 `.deleting-<識別子>` に rename してから再帰削除し、Qwen engine では更新状態の pin/previous/failed 情報や履歴も必要に応じて更新します（`strata_control/engine_library.py:167-176,294-334`）。
-- `--family` は `qwen` または `deepseek` の選択に関わります。`engine` は版番号またはフォルダー名として照合され、複数一致ならフォルダー名を使うようエラーになります（`strata_cli/update_cmd.py:88-91`; `strata_control/engine_library.py:198-211`）。
+- `--model-config` は `strata components remove` で parser により受理されますが、機能上の適用条件はなく、削除処理には作用しません。
+- 削除対象は `engine` と `--family` に基づいて特定されます。現在使用中のエンジンや実行中プログラムが使用するエンジンなど、削除不可の項目は拒否されます（`terminal/strata_cli/update_cmd.py:88-91,466,492`、`terminal/strata_control/engine_library.py:317-335`）。
+- 削除が成功すると対象フォルダーを一時名へ移動して削除し、Qwen 系または shape engine の状態・履歴を更新します。モデルと設定は変更しません（`terminal/strata_control/engine_library.py:337-366`）。この副作用は `--model-config` の値によるものではありません。
 
 ## 出力とエラー
 
-- 成功時は通常出力で削除した版と解放容量を表示し、JSON/JSONL モードでは成功結果を JSON で出力します（`strata_cli/update_cmd.py:395-400`）。`--json` と `--quiet` は個別 parser 宣言ではなく、CLI が update parser 群へ追加します（`strata_cli/cli.py:508-515`）。
-- 対象が見つからない、指定が曖昧、現在使用中、または稼働中のプログラムが使用している場合、`UpdateError` code 2 で拒否されます（`strata_control/engine_library.py:198-211,294-309`）。通常表示では stderr、機械可読出力ではエラー JSON になり、終了コードが返されます（`strata_cli/update_cmd.py:237-242,307-311`）。
-- フォルダーを退避名へ rename できない場合は、何も変更していない旨を含む `UpdateError` code 6 になります（`strata_control/engine_library.py:310-317`）。
-- `--model-config` の欠落・不正値・参照先の読み込み失敗による出力や終了コードは、この remove 経路ではありません。削除実装がこの値を読まないためです。
+- 成功時は通常出力で削除したエンジンのバージョンと解放容量を表示し、`--output json` または `jsonl` の場合は JSON を出力します（`terminal/strata_cli/update_cmd.py:305,492-497`）。
+- 対象が見つからない、または削除不可の場合は `UpdateError` になります。対象フォルダーの移動に失敗した場合は「何も変更されなかった」とするエラー（終了コード 6）になります（`terminal/strata_control/engine_library.py:331-342`、エラーの出力処理は `terminal/strata_cli/update_cmd.py:307-312,374-378`）。
+- `--model-config` の値を理由とする検証エラーや警告は、確認した `remove` 経路にはありません。
 
 ## 根拠
 
-- parser と既定値: `strata_cli/update_cmd.py:47-56,88-91`
-- context への格納とコマンド分岐: `strata_cli/update_cmd.py:244-256,272-273`
-- `remove` の対象解決・削除呼び出し・成功出力: `strata_cli/update_cmd.py:358-360,378-400`
-- 削除可否判定、rename・削除・状態更新: `strata_control/engine_library.py:167-176,294-334`
-- 更新の test start で run config を読む別経路: `strata_control/updater.py:988-1005`
-- JSON/quiet の後付けと失敗出力: `strata_cli/cli.py:508-515`; `strata_cli/update_cmd.py:237-242,307-311`
-
-調査範囲は上記 commit の checkout 内の Terminal CLI と engine library です。同一 revision の CLI `--help` や Release 配布物は確認していません。parser と実行経路のソースから、`remove` では値が使用されないことを確認しました。
+- `terminal/strata_cli/update_cmd.py:47-56` — 共通オプション parser 定義。`--model-config` の値表示と既定値。
+- `terminal/strata_cli/update_cmd.py:88-99` — `components remove` の parser と共通オプションの登録。
+- `terminal/strata_cli/cli.py:2210-2212` — `components remove` の dispatcher。
+- `terminal/strata_cli/update_cmd.py:314-321,337-338,445-466,492-497` — Context 作成後の remove 分岐と、config を参照せず削除する処理。
+- `terminal/strata_control/engine_library.py:317-366` — 削除対象の検証、ファイル操作、状態更新、返却値。

@@ -1,40 +1,44 @@
 # `HIP_COMPILER`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata の HIP エンジンをソースからビルドするとき、setup.py がビルド用プロセス環境に `HIP_COMPILER=clang` を設定します。これは利用者が値を指定して Strata の実行時動作を切り替える設定ではありません。調査対象の Strata ソースに、既存の `HIP_COMPILER` 値を読み取る箇所はありません。
+Strata のエンジン構築用 `terminal/setup.py` と HIP パッケージ構築用 shell スクリプトが、HIP のビルド環境を準備するときに `HIP_COMPILER=clang` を環境へ設定します。`terminal/setup.py` はエンジン再構築時に設定して CMake 実行へ渡し（`terminal/setup.py:5589-5617`）、画像用 HIP reader の一部の再構築経路でも設定します（`terminal/setup.py:5670-5690`）。パッケージ用スクリプトも同じ値を export します（`tools/packaging/build_hip_linux.sh:52-67`、`tools/packaging/build_split_hip.sh:27-35`）。
+
+Strata のソースには、利用者があらかじめ設定した `HIP_COMPILER` の値を取得・比較・変換する箇所はありません。上記の設定経路では、もとの値にかかわらず `clang` に置き換えます。エンジンの compiler パス自体は別途 `-DCMAKE_HIP_COMPILER=...` として CMake に渡しています（`terminal/setup.py:5611-5617`）。この環境変数によって CMake や HIP ランタイム側がどう動作するかは、Strata の挙動としては断定できません。
 
 ## 値と判定
 
-| 経路 | unset・空文字・その他の既存値 | Strata が設定する値 |
-|---|---|---|
-| HIP エンジンのローカルビルド | 区別せず、`os.environ.update` で上書き | `clang` |
-| GPU 用 HIP 画像 reader のビルド | `hipconfig` が見つからず、かつ `ROCM_PATH` も未設定の場合に上書き。それ以外は既存値を変更しない | 上書きする場合は `clang` |
-| `packaging/build_hip_linux.sh` | シェル内の既存値にかかわらず `export` で上書き | `clang` |
+Strata はこの名前の値を入力として判定しません。以下の構築経路では値を文字列 `clang` に設定するため、事前に未設定、空文字、`clang`、別の文字列のどれであっても、子プロセスへ渡す値は `clang` です。数値変換、大小文字比較、空白除去、範囲判定、無効値時の fallback はありません（`terminal/setup.py:5601-5604, 5670-5675`）。
 
-Strata は `HIP_COMPILER` の文字列比較、数値変換、空文字判定、無効値の警告や fallback を行いません。setup.py が環境を更新するのはビルド関数が実際に進むときで、エンジンが既に最新でビルド関数が早期 return する場合はそのエンジン経路で更新されません。CLI 引数との優先順位もありません。画像生成器の HIP 経路や `tools/image/qimage.py` は `HIP_COMPILER` を設定せず、CMake に `CMAKE_HIP_COMPILER` を明示して渡します。
+| 経路 | 条件 | 設定値 | 事前の値の扱い |
+|---|---|---|---|
+| AMD エンジン再構築 | `build_engine_hip()` が既存エンジンを再利用せず、ROCm root を決定して構築へ進む | `clang` | 無条件に上書き |
+| 画像用 HIP reader | `vision == "gpu"` かつ `hipconfig` が PATH に無く、`ROCM_PATH` も未設定のとき | `clang` | 無条件に上書き |
+| Linux HIP パッケージ構築 | `build_hip_linux.sh` を実行 | `clang` | shell の `export` で設定 |
+| HIP split パッケージ構築 | `build_split_hip.sh` を実行 | `clang` | shell の `export` で設定 |
+
+エンジンが既に有効なビルドとして再利用される場合、`build_engine_hip()` は環境設定より前に戻るため、この関数は `HIP_COMPILER` を変更しません（`terminal/setup.py:5585-5604`）。
 
 ## 有効になる条件
 
-- `build_engine_hip()` がキャッシュ済みエンジンの早期 return をせず、HIP エンジンのビルドへ進むと、選択された ROCm root に基づく環境設定の一部として `HIP_COMPILER` を `clang` にします。
-- `build_vision_hip()` では、GPU 用 reader を求め、かつ `hipconfig` が見つからず `ROCM_PATH` も未設定のときだけ、この変数を含む HIP 環境一式を設定します。その後の CMake 呼び出しには別途 `CMAKE_HIP_COMPILER` が渡されます。
-- `packaging/build_hip_linux.sh` はビルド処理の開始時に `HIP_COMPILER=clang` を export します。
-- Strata の通常のエンジン実行時にこの変数を読む分岐は見つかりません。実行時、サーバーモード、モデル状態による有効化条件はありません。
+- `HIP_COMPILER` を設定するのは Strata の構築・パッケージ作成経路です。通常のエンジン起動やサーバーの実行時にこの名前を読む箇所はありません。
+- エンジン再構築では、AMD GPU 用の `build_engine_hip()` が既存 build を再利用せず、ROCm を解決して CMake build に進む必要があります。CMake compiler は `-DCMAKE_HIP_COMPILER={rocm_clang(root)}` でも指定されます（`terminal/setup.py:5585-5617`）。
+- 画像用 HIP reader の経路では `vision == "gpu"` である必要があります。環境設定の追加自体は `hipconfig` が見つからず、かつ `ROCM_PATH` が未設定のときだけ行います。GPU reader の CMake configure にも compiler のパスを `-DCMAKE_HIP_COMPILER=...` で指定します（`terminal/setup.py:5670-5690`）。
+- `build_engine_hip()` が build 済みエンジンと必要な画像 reader を再利用できる場合は早期 return し、環境値を設定しません（`terminal/setup.py:5585-5593`）。
+- `build_image` の HIP 経路は `HIP_PLATFORM`、`ROCM_PATH`、`HIP_PATH` を設定しますが、`HIP_COMPILER` は設定しません。qimage の CMake 引数には別途 compiler path があります（`terminal/setup.py:5850-5855`、`terminal/tools/image/qimage.py:124-135`）。
 
 ## 実行時の詳細
 
-setup.py の `run()` は `env` を省略すると `os.environ` のコピーを子プロセス環境に使います。`cmake_build()` は configure と build の各コマンドを `run()` で起動します。このため、前述の setup.py 経路で設定された値はその後のビルド子プロセスへ渡されます。`build_engine_hip()` では同時に `HIP_PLATFORM=amd`、`HIP_RUNTIME=rocclr`、`ROCM_PATH`、`HIP_PATH` なども設定します。ここではそれら外部ツール側の解釈や効果は扱いません。
+`terminal/setup.py` では各 build 関数が実行された時点で `os.environ.update()` により親 Python プロセスの環境を変更します。`run()` は `env` を省略した場合に現在の `os.environ` を複製し、その環境で `subprocess.run()` を呼びます。そのためエンジン build で設定した `HIP_COMPILER=clang` は CMake configure / build の子プロセスへ渡ります（`terminal/setup.py:5601-5604, 1131-1152, 6716-6735`）。値を読み取って cache する処理はなく、設定はその Python プロセスの環境に残ります。
 
-setup.py が `HIP_COMPILER` の値に応じて出す専用ログ、警告、終了・失敗経路はありません。ビルド全体には通常の CMake コマンド失敗処理がありますが、Strata のコードは失敗を `HIP_COMPILER` の値に結び付けていません。`packaging/build_hip_linux.sh` では CMake の終了コードを `chk` が確認し、失敗時は build status に記録して終了します。
+画像用 HIP reader 経路では条件付きで同様に環境を設定してから `cmake_build()` を呼びます（`terminal/setup.py:5670-5690`）。HIP パッケージ用 shell script では `export` 後の `cmake` と build コマンドへ環境が継承されます（`tools/packaging/build_hip_linux.sh:52-67`、`tools/packaging/build_split_hip.sh:27-35`）。実行中に外から環境を変更した場合の反映を Strata が監視する仕組みはありません。
 
 ## 根拠
 
-- 候補一覧: `docs/envvars/000_envvers.md:413`。
-- HIP エンジンのキャッシュ判定と環境設定: `setup.py:4797-4803,4809-4816`。
-- GPU 画像 reader の条件付き環境設定と CMake 呼び出し: `setup.py:4876-4885,4890-4900`。
-- 子プロセスへの環境継承と CMake 実行: `setup.py:959-978,5800-5824`。
-- 画像生成器は env 設定ではなく `CMAKE_HIP_COMPILER` を渡す: `setup.py:5032-5037`, `tools/image/qimage.py:124-135`。
-- 同梱 Linux HIP ビルドスクリプトでの固定 export と失敗確認: `packaging/build_hip_linux.sh:52-56,60-65`。
-- 全参照検索では、上記以外に候補名の参照は文書・コメント・CMake 引数例に限られ、Strata コードによる既存値の読み取りは確認できませんでした。
+- `terminal/setup.py:5585-5617` — engine build の再利用判定、`HIP_COMPILER` を含む環境設定、明示的な CMake compiler 引数。
+- `terminal/setup.py:1131-1152, 6716-6735` — 既定の子プロセス環境が `os.environ` から複製され、CMake がその環境で実行される経路。
+- `terminal/setup.py:5670-5690` — vision GPU reader の環境設定条件と CMake build。
+- `terminal/setup.py:5850-5855`、`terminal/tools/image/qimage.py:124-135` — image HIP build 経路の環境設定と compiler の別指定。
+- `tools/packaging/build_hip_linux.sh:52-67`、`tools/packaging/build_split_hip.sh:27-35` — packaging shell script による export と CMake 実行。

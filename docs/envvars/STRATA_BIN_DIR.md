@@ -1,40 +1,44 @@
 # `STRATA_BIN_DIR`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Linux と macOS 向けの同梱 Terminal インストーラー `packaging/install.sh` が、`strata` コマンドへのシンボリックリンクを置くディレクトリを指定します。インストール時にディレクトリを作成し、展開した Terminal の `bin/strata` を指す `$BIN_DIR/strata` を作成します。実行時エンジンやモデルの設定ではありません。
+Linux と macOS 用の `tools/packaging/install.sh` が、インストール先の `strata` シンボリックリンクを置くディレクトリを指定する。値は `BIN_DIR` に設定され、インストーラはそこを作成し、署名確認済み Terminal の `bin/strata` を指すリンクを配置する。Strata Terminal の実行時設定ではなく、Windows 用 `install.ps1` にも参照はない。`tools/packaging/install.sh:1-2,20-27,149-151,176-185`、`tools/packaging/install.ps1:1-19`。
 
 ## 値と判定
 
-| `STRATA_BIN_DIR` の状態 | `BIN_DIR` の値 |
-|---|---|
-| 未設定 | `$HOME/.local/bin` |
-| 空文字 | `$HOME/.local/bin` |
-| 空でない値 | その値をそのまま使用 |
+POSIX shell の `${STRATA_BIN_DIR:-$HOME/.local/bin}` で読み取る。未設定または空文字なら `$HOME/.local/bin` が使われ、非空なら文字列全体が `BIN_DIR` に入る。パスとしての存在確認、絶対パス化、`~` 展開、空白除去、文字種やディレクトリ形式の検証は行わない。したがって `0`、`false`、`~/bin`、空白を含む値も、空文字でない限りそのままパス値として使われる。`tools/packaging/install.sh:22-27,151,180`。
 
-シェルの `${STRATA_BIN_DIR:-...}` 展開を使うため、空文字も未設定と同じ既定値になります。文字列の parse、空白除去、絶対パス化、パス検証や正規化はありません。空でなければ相対パスや空白を含む文字列も引用符付きでディレクトリ作成・リンク先指定に渡されます。別の環境変数や CLI 引数による `BIN_DIR` の上書きはありません。
+| 実行経路 | 未設定 | 設定時に使われる値 | 既定値に戻る値 |
+|---|---|---|---|
+| Linux / macOS の `install.sh` | `$HOME/.local/bin` | 空文字以外の任意の値（例: `/opt/strata-bin`、`0`、`~/bin`） | 空文字 `''` |
+| Windows の `install.ps1` | この変数を読まない | この変数を読まない | 該当なし。インストーラは別の場所を使う |
+
+この変数に対応する CLI 引数や別設定との優先順位はない。`install.sh` は引数を `main` に渡すだけで、`BIN_DIR` の設定を引数から変更しない。`STRATA_DATA_DIR` は Terminal のデータ配置先として別に使われ、バイナリリンク先の指定を上書きしない。`tools/packaging/install.sh:24-27,34-35,188`。
 
 ## 有効になる条件
 
-この変数を読むのは `packaging/install.sh` です。同スクリプトが対象とする Linux x86_64、Linux aarch64、macOS Apple silicon のインストールで、プラットフォーム判定・ダウンロード・チェックサム検証を通過して展開処理へ進んだ場合に使われます。Windows 用の `packaging/install.ps1` にこの名前の参照はなく、Strata のエンジンやサーバーからの読み取りも確認できません。
-
-`STRATA_BIN_DIR` はスクリプト開始時に一度 `BIN_DIR` に代入されます。シェルの実行中に環境を変更しても、この代入値は再評価されません。インストーラーはまず `mkdir -p "$DATA_DIR/terminal" "$BIN_DIR"` を実行し、最後に `ln -sf "$DATA_DIR/terminal/current/bin/strata" "$BIN_DIR/strata"` を作成します。インストール途中で失敗してこの段階に到達しない場合、値は配置先に影響しません。
+- `install.sh` を使う Linux または Apple silicon 搭載 Mac のインストール経路で有効。対応プラットフォームの選択は `tools/packaging/install.sh:59-67` にある。
+- インストーラがアーカイブのダウンロード、チェックサム検証、展開、署名済み feed の確認を通過し、配置段階に進んだときにディレクトリ作成とリンク作成に使われる。途中で失敗すればリンク作成には到達しない。`tools/packaging/install.sh:132-174,176-180`。
+- Windows では `install.ps1` が `%LOCALAPPDATA%\Strata\terminal\current\bin` をユーザー PATH に登録する独自の経路であり、`STRATA_BIN_DIR` を参照しない。この環境変数は Windows インストールには適用されない。`tools/packaging/install.ps1:5-11,18-19`。
+- `PATH` に `BIN_DIR` が含まれるかどうかは配置先を変えず、完了時に表示する起動方法だけを変える。`PATH` に含まれなければ、指定値を使った起動コマンドと PATH 追加用の行を表示する。`tools/packaging/install.sh:180-185`。
 
 ## 実行時の詳細
 
-`PATH` に `:$BIN_DIR:` が含まれるかを文字列として調べます。含まれる場合は `Installed. Run: strata launch`、含まれない場合は `Installed. Run: $BIN_DIR/strata launch` と PATH に追加するための `export PATH="$BIN_DIR:$PATH"` を案内します。空でない値が不適切な場所や書き込み不能な場所を指す場合、明示的な `STRATA_BIN_DIR` 警告はありません。`set -eu` の下で `mkdir` または `ln` が失敗するとスクリプトは失敗終了し、失敗コマンドのエラーが出力されます。
+シェル起動時に環境変数を一度展開して `BIN_DIR` に代入し、後続処理ではそのシェル変数を使う。スクリプトの途中で環境変数を読み直す処理や cache はない。値を代入した後の処理で環境側の値が変化しても、`BIN_DIR` は再評価されない。`tools/packaging/install.sh:22-27,34-35`。
 
-既定値と通常の配置は `docs/INSTALL.md` も「normally `~/.local/bin/strata`」として案内しています（`docs/INSTALL.md:67-80`）。
+インストーラは検証済みアーカイブを展開する段階で `mkdir -p "$BIN_DIR"` を実行する。配置段階では `ln -sf "$DATA_DIR/terminal/current/bin/strata" "$BIN_DIR/strata"` により、指定ディレクトリに `strata` リンクを作り、続けて `:$PATH:` に `:$BIN_DIR:` が含まれるかを調べる。含まれれば `Installed. Run: strata launch`、含まれなければ `$BIN_DIR/strata launch` と PATH に追加する `export` 行を表示する。PATH 自体は書き換えない。`tools/packaging/install.sh:149-151,176-185`。
+
+`mkdir` またはリンク作成が失敗した場合、`set -e` により失敗したコマンドでスクリプトが終了する。これらのコマンド固有の `die` メッセージはなく、配置完了メッセージにも到達しない。`tools/packaging/install.sh:22,151,176-185`。
+
+## ログと測定値
+
+独自の「`STRATA_BIN_DIR` が設定された」というログや値の妥当性警告はない。PATH の状態に応じて完了時の案内が異なる（実装文字列: `Installed. Run: strata launch`、または `Installed. Run: $BIN_DIR/strata launch` と `(To type just 'strata', add this line to your shell profile: export PATH="$BIN_DIR:\$PATH")`）。`tools/packaging/install.sh:181-185`。
 
 ## 根拠
 
-- `packaging/install.sh:20-27` — 対象設定の宣言と未設定・空文字時の既定値を含む代入。
-- `packaging/install.sh:34-35,53-61` — 主処理の開始と対応プラットフォーム。
-- `packaging/install.sh:83-109` — ダウンロード、検証を経て展開処理へ進む流れ。
-- `packaging/install.sh:22,98-102,125-134` — `set -eu`、対象ディレクトリ作成、リンク配置、PATH 判定と完了案内。
-- `packaging/install.ps1:18-46` — Windows スクリプトの設定一覧と `$env:STRATA_DATA_DIR` の読み取り。`STRATA_BIN_DIR` は参照しません。
-- `docs/INSTALL.md:67-80` — Linux / Mac と Windows のインストール経路、および既定のリンク場所の案内。
-
-候補一覧 `000_envvers.md:628` には名前があります。候補名の全参照検索では、実際の読み取りは `packaging/install.sh:27` のみでした。`tests/terminal/test_install_scripts_env.py:62-75` はテスト環境を組み立てる参照であり、本番の読み取り箇所ではありません。
+- `tools/packaging/install.sh:20-27` — 対象変数の設定説明と unset / empty 用既定値。
+- `tools/packaging/install.sh:149-161` — データ先とバイナリ先のディレクトリ作成、アーカイブ展開。
+- `tools/packaging/install.sh:163-185` — 署名確認後の配置、リンク作成、PATH に応じた結果表示。
+- `tools/packaging/install.ps1:1-19` — Windows インストーラの別経路と設定一覧（`STRATA_BIN_DIR` の記載なし）。

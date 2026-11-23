@@ -1,49 +1,63 @@
 # `STRATA_ISA_FLOOR`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-これはエンジンの実行時環境変数ではなく、ソース版セットアップが古い x86 CPU 向けエンジンを選んでビルドするときに読む環境変数です。`setup.py` の `cpu_floor()` が値を読み、選択した floor を `-DSTRATA_ISA_FLOOR=avx` または `-DSTRATA_ISA_FLOOR=none` として CMake に渡します。通常のエンジン実行ファイルにこの環境変数を設定しても、Strata の実行時動作は変わりません。
+この環境変数は Terminal の Python setup がローカル engine をビルドするときに、x86 CPU の最低 ISA floor を選ぶための入力です。認識する値は `avx` と `none` です。`avx` は AVX1、`none` は SSE4.2 + POPCNT の build を要求します。unset・空文字・その他の値ではこの指定を採用せず、setup が CPU 機能から floor を自動判定します。環境変数そのものを engine の実行中に読む処理は確認できません。setup が値を CMake の `-DSTRATA_ISA_FLOOR=...` に変換し、compile-time の定義と build 設定に反映します（`terminal/setup.py:1779-1799, 6755-6760`; `engine/CMakeLists.txt:46-56`）。
 
-`avx` は AVX（AVX2/FMA/F16C なし）、`none` は SSE4.2 + POPCNT の CPU を対象にする実験的なビルドです。空値はセットアップによる CPU 判定を使います。CMake の説明では通常ビルドの floor は AVX2 です（`setup.py:1465-1485,5842-5847`; `CMakeLists.txt:35-45`）。
+通常の NVIDIA 経路では、変数を設定しただけで ready-made engine の代わりにビルドすることはありません。CLI の `--build`、または AVX2 のない CPU で setup が自動的に選ぶローカル build が、値を engine に反映する主な経路です。Linux の HIP engine は setup がローカルビルドを行います（`terminal/setup.py:11727-11738, 9513-9542`）。
 
 ## 値と判定
 
-`os.environ.get("STRATA_ISA_FLOOR", "").strip().lower()` で値を取得・正規化し、正規化後が `avx` または `none` のときだけその値を返します。文字列全体を比較します。
+setup は `os.environ.get(..., "")` の結果に `strip().lower()` を適用し、全体が `avx` または `none` と一致するかを判定します。数値 parse はせず、前後空白を除去し、大文字小文字を区別しません。未設定と空文字は同じ扱いです。無効値もエラーにはせず、自動判定へ進みます（`terminal/setup.py:1779-1799`）。
 
-| 環境値 | `cpu_floor()` の扱い |
+| setup が読む値 | 判定結果 |
 |---|---|
-| 未設定、空文字、空白だけ | CPU を自動判定 |
-| `avx`（大文字小文字や前後空白は無視） | `avx` を強制 |
-| `none`（大文字小文字や前後空白は無視） | `none` を強制 |
-| その他（例: `0`, `true`, `bogus`） | エラーにはせず CPU を自動判定 |
+| unset、空文字、空白だけ | ARM64 なら通常 floor（空文字）。それ以外は CPU を自動判定し、AVX2 があれば通常 floor、なければ AVX があれば `avx`、SSE4.2 と POPCNT があれば `none`、どれもなければ `unsupported` |
+| `avx`（例: `avx`, ` AVX `） | 強制的に `avx` を選択 |
+| `none`（例: `none`, ` NONE `） | 強制的に `none` を選択 |
+| その他（例: `0`, `1`, `true`, `false`, `bogus`, `avx_f16c`） | 無効値として捨て、自動判定 |
 
-強制値の確認は CPU 自動判定より先です。そのため `avx` / `none` は AVX2 搭載 CPU でも返されます。無効値に対する専用の警告や終了経路はありません。自動判定では ARM64 は空値、AVX2 CPU も空値です。AVX2 未満では Windows は CPUID/XGETBV、Windows 以外は `/proc/cpuinfo` を使い、AVX があれば `avx`、SSE4.2 と POPCNT があれば `none`、どちらもなければ `unsupported` を返します（`setup.py:1433-1451,1454-1456,1465-1485`）。
+この環境変数の有効値を選んでも、setup が必ずビルドするわけではありません。CPU に AVX2 がない場合、`--check` でなければ setup は警告後にローカル build を選びます。一方、AVX2 がある PC では `--build` を指定しない限り、通常の NVIDIA 経路は ready-made engine を使い得ます。`--check` は floor 判定後に PC 情報を表示して終了し、engine をビルドしません（`terminal/setup.py:11718-11738, 11739-11758, 9513-9542`）。
 
 ## 有効になる条件
 
-- 値を読むのはソース版 `setup.py` の `cpu_floor()` が呼ばれたときです。主な呼び出しは setup の CPU 判定（`setup.py:9520`）と、ローカル CUDA/HIP エンジンの既存 build 照合・ビルド（`setup.py:4796,5927`）です。macOS の通常 setup は先に Mac 専用処理へ戻り、SYCL は専用 setup へ分岐するため、それらの経路ではこの通常の CPU 判定位置を通りません（`setup.py:9068-9069,9220-9225`）。
-- `cpu_floor()` の返値がコンパイル設定になるのはローカルエンジンをビルドする経路です。CUDA は `--build` などでビルドが選ばれた場合に `isa_floor_defs()` が CMake 引数を作り、HIP の Linux ビルドも同じ helper を使います（`setup.py:7772-7799,4821-4827,5842-5847,5944-5950`）。通常の ready-made engine を使う経路ではこの値をエンジンへ渡しません。したがって、AVX2 CPU で `STRATA_ISA_FLOOR=avx` を指定しただけでは、通常は ready-made engine が選ばれ、古い CPU 向け build には切り替わりません。ローカル build を行う必要があります。
-- CMake は値を空、`avx`、`none` に限定し、他の CMake 値なら configure を `FATAL_ERROR` で止めます。環境変数に未知の値を設定しても `setup.py` が空値または自動判定値に変換するため、この CMake エラーには直結しません（`CMakeLists.txt:39-45`）。
-- 非 x86 で CMake に非空の floor が渡された場合、CMake は警告して floor を空に戻します。`STRATA_PORTABLE` が有効な build と非空 floor は排他的です（`CMakeLists.txt:44-45,62-71`）。
-- CMake の非空 floor 経路では ggml CPU backend を build host の ISA ではなく指定 floor に設定し、`avx` と `none` に応じた compile definition を付けます。Strata 独自の高 ISA カーネルは CPU capability check の後段で使われる設計で、floor は主に ggml CPU 側と古い CPU 用カーネルの構成に適用されます（`CMakeLists.txt:1936-1951,1991-2023`; `src/kernels/cpu/expert_layout.cpp:224-226`）。
+- 値が効くのは setup がローカル engine build を実行するときです。NVIDIA の通常経路で既製 engine を使う場合、値が `avx` / `none` でもその engine の build 設定は変わりません。`--build` は既製 engine を選ばずビルドします（`terminal/setup.py:11317, 9531-9542`）。
+- AVX2 非対応 CPU では、setup が環境変数の指定（認識可能な場合）または CPU 自動判定から floor を選び、`--check` 以外では build に切り替えます。`unsupported` のときは「this CPU has neither AVX2 nor SSE4.2; Strata needs at least SSE4.2 (Intel Nehalem, 2008, or newer)」で setup を停止します（`terminal/setup.py:11718-11738`）。
+- AVX2 対応 CPU で `avx` / `none` を強制しても `--build` の代わりにはなりません。ローカル build が選ばれたときにその floor が使われます。Linux の HIP 経路は engine がない場合にローカル build へ進み、Windows の HIP 経路は ready-made engine がなければ停止します（`terminal/setup.py:9513-9542`）。
+- engine の CMake 設定では `STRATA_PORTABLE=ON` と非空の floor は併用できず、configure が「STRATA_ISA_FLOOR (an older-CPU build) and STRATA_PORTABLE (the AVX2 release build) exclude each other」で停止します。非 x86 build では警告後に floor を空へ戻します（`engine/CMakeLists.txt:50-56, 73-82`）。setup の認識値はこの親 CMake の `avx` / `none` に限られます。
+- floor は build 時に記録されるため、CLI 引数や別の環境変数で実行時に上書きする経路は見つかりません。CPU の実機能が選んだ floor に足りない場合は engine 起動時に拒否されます（`engine/src/program/generate.cpp:5309-5339`）。
 
 ## 実行時の詳細
 
-値は `cpu_floor()` を呼ぶたびに `os.environ.get()` で読み直され、関数内・モジュール内の cache には保存されません。setup プロセスの起動時点で親プロセスから引き継いだ環境値が使われます。setup 実行中に環境値を書き換える Strata の処理は見つかりません。CMake 引数を生成する時点では floor の文字列を明示的に `-DSTRATA_ISA_FLOOR=...` に変換します（`setup.py:1465-1485,5842-5847`）。
+setup の `cpu_floor()` は呼ばれるたびに環境変数を読みます。関数内 static cache はありません。環境値の確認後、ARM64 は通常 floor（空文字）を返します。その他の CPU では Windows は CPUID、Windows 以外は `/proc/cpuinfo` の `flags` を使い、ファイル読み取りに失敗すると機能フラグなしとして扱います。setup は初回の PC 検査で floor を決め、非 AVX2 CPU なら engine build を選びます。CUDA / HIP の build 関数でも floor を再取得し、既存のローカル engine の記録と異なれば再利用対象にせず、build 引数に floor を含めます。build directory の `CMakeCache.txt` に別 floor が記録されている場合は削除してから configure します（`terminal/setup.py:1768-1799, 5584-5589, 5611-5617, 6755-6760, 6840-6863`）。
 
-自動判定結果が `unsupported` の場合、setup は `this CPU has neither AVX2 nor SSE4.2; Strata needs at least SSE4.2 (Intel Nehalem, 2008, or newer)` を表示して終了します。AVX2 のない CPU でサポート対象 floor が得られると、setup は実験的で遅い対応である旨と `STRATA_ISA_FLOOR=<floor>`、10–20 分の一度限りのコンパイルを警告し、`a.build = True` にします。AMD GPU と Windows の組合せでは、続けて Linux での build を求める失敗メッセージを出して終了します（`setup.py:9520-9540`; 出力形式 `setup.py:896-909`）。
+CMake では `avx` / `none` 以外の非空値を直接渡すと configure が fatal error になります。setup 経由では未知の環境値を自動判定に置き換えるため、このエラーにはなりません（`engine/CMakeLists.txt:50-56`; `terminal/setup.py:1783-1799`）。floor build は ggml-cpu の ISA 設定をその floor に制限し、Strata の CPU kernels には floor 用 compile definition を付けます。AVX2 / AVX-512 kernels は binary 内に残りますが、実 CPU 機能の gate を通らない限り実行されません（`engine/cmake/strata_ggml.cmake:40-58`; `engine/cmake/backends/cpu.cmake:343-358`）。
 
-これらの警告は自動判定で AVX2 未満だった場合のものです。強制値 `avx` / `none` そのものに対応する専用ログはありません。エンジン実行時にこの環境変数を再読込する箇所もありません。
+engine 起動時に compile-time floor を `isa_floor_build()` が返し、AVX2 がない CPU では floor が空ならエラー終了（return 2）、floor がある場合は必要な AVX1 または SSE4.2 + POPCNT が CPU にあるか確認します。不足時もエラーを stderr に出して return 2 します。対応 CPU で AVX2 がない場合、CPU experts は ggml-cpu の kernels を使う旨を stderr に出します。これは build に記録された floor の検査であり、実行時に `STRATA_ISA_FLOOR` を再読込するものではありません（`engine/src/kernels/cpu/expert_layout.cpp:286-294`; `engine/src/program/generate.cpp:5303-5339`）。
+
+## ログと測定値
+
+AVX2 のない CPU で setup がローカル build を選ぶ場合、次の警告を表示します（floor を強制したときも選択値が含まれます）:
+
+> this CPU has no AVX2: Strata support for it is EXPERIMENTAL and slow. Setup compiles the engine on this PC for AVX (STRATA_ISA_FLOOR=avx; 10-20 minutes, once), and the CPU's share of the experts runs on ggml-cpu's kernels, a few times slower than on an AVX2 CPU. See "Older CPUs" in docs/INSTALL.md
+
+実際には `AVX` の部分と括弧内の値は選択された floor に応じて変わります（`terminal/setup.py:11727-11738`）。
+
+engine は floor build で必要な ISA が CPU にない場合、例えば次の形式を stderr に出し return 2 します。
+
+- `strata generate: this engine is the older-CPU build for AVX, which this CPU (<CPU名>) does not have; compile it with STRATA_ISA_FLOOR=none`
+- `strata generate: this engine is the older-CPU build for SSE4.2 with POPCNT, which this CPU (<CPU名>) does not have`
+
+floor build で AVX2 がない場合は `strata generate: EXPERIMENTAL older-CPU build (ggml-cpu for <floor>): this CPU has no AVX2, so the CPU's experts run on ggml-cpu's kernels - expect it to be slow` を stderr に出します。AVX2 対応 CPU 上で floor build を動かす場合は通常 build の方が速い旨を表示します（`engine/src/program/generate.cpp:5325-5339`）。
 
 ## 根拠
 
-- 環境からの直接読み取りと値判定: `setup.py:1465-1485`。
-- 読み取り呼び出し箇所: `setup.py:4796,5927,9520`。
-- 値を CMake cache 定義へ変換する箇所: `setup.py:5842-5847`。
-- CUDA/HIP build への引き渡し: `setup.py:4821-4827,5944-5950`。
-- CMake の値制限、対象 CPU、build 設定: `CMakeLists.txt:35-45,62-71,1936-1951,2008-2023`。
-- setup の unsupported 終了、古い CPU の警告と build 選択: `setup.py:9520-9540`。
-
-`STRATA_ISA_FLOOR` の全参照には上記の setup / CMake 実装のほか、説明コメントやテスト参照もあります。環境値を読む本番コードは `setup.py:1469` であり、エンジンの C++/GPU 実行コードに実行時読み取りはありません。テストコードは実装根拠として使用していません。
+- `terminal/setup.py:1779-1799` — setup の値取得・正規化・CPU 自動判定。
+- `terminal/setup.py:11718-11738` — unsupported CPU の停止、旧 CPU の警告と自動 build 選択。
+- `terminal/setup.py:5584-5589, 5611-5617, 6840-6863, 6755-6760` — HIP / CUDA build の floor 判定、CMake 引数化、cache 切替。
+- `terminal/setup.py:11317, 9513-9542` — `--build` と既製 engine 選択の関係。
+- `engine/CMakeLists.txt:46-56, 73-82` — CMake 側の許容値、portable との排他、非 x86 の扱い。
+- `engine/cmake/strata_ggml.cmake:40-58`; `engine/cmake/backends/cpu.cmake:343-358` — floor 別の CPU build 設定。
+- `engine/src/kernels/cpu/expert_layout.cpp:286-294`; `engine/src/program/generate.cpp:5303-5339` — build floor の埋め込み、実 CPU 機能の検査と観測可能な終了・ログ。

@@ -1,47 +1,46 @@
 # `PYTHONUTF8`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、`git status --short --branch` に未コミット変更の表示はありません。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata は `PYTHONUTF8` の既存値を設定として読み取って分岐するのではなく、Windows の CLI ランチャーとホストアプリの Python 子プロセス環境に `1` を明示設定します。Windows ランチャーのコメントは、Python のテキスト処理を UTF-8 にして、キリル文字などを含むフォルダー名を扱えるようにする意図を記しています（`START-HERE.bat:5-6`、`bin/strata.cmd:9-10`、`bin/strata.ps1:53-54`）。この文書は Strata が設定・引き渡す事実を記録するもので、Python ランタイム内部の環境変数処理は説明対象外です。
+Strata 自身が `PYTHONUTF8` を読み取って値を判定する箇所は見つからない。一方、Windows の Strata 起動スクリプトとホストアプリは、Python 子プロセス用の環境にこのキーを明示的に設定している。従って Strata 側で確認できる役割は、これらの起動経路で値 `'1'` をセットまたは転送することまでであり、Python がその値をどう解釈するかは本書の対象外である。
+
+Windows では `START-HERE.bat` がセットアップ／起動の前に設定し、Terminal の `strata.cmd` と `strata-direct.ps1` も `strata.py` を起動する前に設定する（`START-HERE.bat:4-8`, `terminal/bin/strata.cmd:8-10,42-44`, `terminal/bin/strata-direct.ps1:55-59`）。アプリのホスト側では、ソース checkout のサーバー、Control、インストーラー、調整 CLI、Time-skip の各子プロセスに渡す環境を組み立てるときに設定する（`app/host/server/control-runtime.mjs:82-107,114-120,140-146`, `app/host/server/native-control.mjs:142,197-203,689-692,735-742`, `app/host/server/index.mjs:890-895`, `app/host/server/timeskip.mjs:313-321,457-467`）。
 
 ## 値と判定
 
-Strata 所有の実行コードに `PYTHONUTF8` の取得、文字列比較、数値変換、未設定・空文字の判定は見つかりません。見つかった本番コードは、いずれも値を文字列 `'1'` に設定して Python プロセスを起動します。
+Strata 側に入力値の parse・文字列比較・数値変換はない。子プロセス向けの環境を作る箇所では、継承元の同名値を `'1'` で上書きする。従って親プロセスで未設定、空文字、`0`、`true` などのどれであっても、明示設定を行う経路では子プロセスに渡す値は `'1'` となる。たとえば `sourceServerEnvironment` は `{ ...env, ..., PYTHONUTF8: '1' }`、Control 用環境は最後に `PYTHONUTF8: '1'` を設定する（`app/host/server/control-runtime.mjs:82-95`）。同様に各 spawn 用環境でも固定値を指定する（`app/host/server/native-control.mjs:142,201,741`, `app/host/server/index.mjs:892-894`, `app/host/server/timeskip.mjs:316-320,465-466`）。
 
-| 起動経路 | 呼び出し元の `PYTHONUTF8` | 子プロセスに渡す値 |
-|---|---|---|
-| `START-HERE.bat` / `bin/strata.cmd` | 未設定、空文字、その他の値 | `1` に設定してからランチャー経由で Python を実行 |
-| `bin/strata.ps1` | 未設定、空文字、その他の値 | Python の選択後、実行直前に `1` を設定 |
-| ホストの Python 子プロセス | `process.env` 由来の値があればそれを含む | 環境オブジェクトで `PYTHONUTF8: '1'` を後から指定する経路では `1` に上書き |
+| 経路 | 親側の unset／空文字／`0`／`true` | 子プロセスへ渡す値 | 例外・上書き |
+|---|---|---|---|
+| Windows 起動スクリプト | 元の値を判定しない | スクリプト内で `'1'` に設定 | 起動前に無条件で代入（`START-HERE.bat:4-6`, `terminal/bin/strata.cmd:8-10`, `terminal/bin/strata-direct.ps1:55-58`） |
+| ホスト管理の通常の子プロセス | 元の値を判定しない | 組み立てた環境で `'1'` に固定 | `timeskip.startDetached` は固定値を設定した後に `extraEnv` を展開するため、呼び出し側が同名キーを渡せば上書き可能。現在の呼び出し側は `STRATA_HOST_URL` と `STRATA_INTERNAL_SECRET` のみを渡す（`app/host/server/timeskip.mjs:465-466`, `app/host/server/index.mjs:1284-1289`） |
 
-したがって利用者が親プロセス側で指定した値を Strata が解釈・尊重する設定ではありません。`apps/host/server/timeskip.mjs:455` は `extraEnv` を `PYTHONUTF8` 設定の後に展開しますが、実際の呼び出し元 `apps/host/server/index.mjs:1160-1165` が追加するのは `STRATA_HOST_URL` と `STRATA_INTERNAL_SECRET` だけで、`PYTHONUTF8` は上書きしません。値に範囲・境界・無効値という概念や、Strata 内の fallback はありません。
+ここでいう `true` は親環境にその文字列が設定されている例であり、Strata が真偽値として扱うことを意味しない。Strata の値域チェックや「無効値」時の fallback はない。子プロセスの env に別値を渡す `extraEnv` の例外を除き、CLI 引数との優先順位もない。
 
 ## 有効になる条件
 
-- `START-HERE.bat` と `bin/strata.cmd` は Windows バッチランチャーです。`setlocal` の後で `PYTHONUTF8=1` を設定し、後続の Python 起動に引き継ぎます（`START-HERE.bat:4-6,36-55`、`bin/strata.cmd:8-10,34-44`）。`START-HERE.bat` は `.venv` または同梱 Python で `setup.py` を実行するほか、必要なら Python を検出・導入して `.venv` を作ります（同 `:venv`, `:bundled`, `:run`）。
-- PowerShell ランチャーも Windows 用です。Python が選べない場合は `PYTHONUTF8` を設定する行より前にエラー終了します。選択できた場合は実行直前に `1` を設定し、`strata.py` を呼び出します（`bin/strata.ps1:25-51,53-57`）。
-- ホストアプリの source-checkout サーバー、Control CLI、installer、Time-skip、tuning、native-control の子プロセス環境にも設定があります（下記「実行時の詳細」）。これらの経路では `process.env` 等を展開した環境オブジェクトに `'1'` を明示指定します。
-- Strata コード中に、OS/backend/build macro/model 状態によって `PYTHONUTF8` の設定値を切り替える分岐は見つかりません。ホスト側の child process ごとに別の環境項目や実行条件はありますが、`PYTHONUTF8` 自体は固定値です。
+- Windows の `START-HERE.bat`、`terminal/bin/strata.cmd`、`terminal/bin/strata-direct.ps1` 経由では、起動時に無条件で `'1'` を設定する。これらは Python を選択した後、`strata.py` の実行前に設定する（`START-HERE.bat:4-8`, `terminal/bin/strata.cmd:8-10,42-44`, `terminal/bin/strata-direct.ps1:55-59`）。
+- ホストアプリのソース checkout 経路では `serve/server.py`、同梱 MCP ツール、native の調整・更新系 Python 子プロセスに設定する。packaged Control 経路は `controlEnvironment`／`installerEnvironment` を通り、同じく `'1'` になる（`app/host/server/native-control.mjs:142,197-203,689-692,735-742`, `app/host/server/control-runtime.mjs:82-119`）。
+- ホストの tuning CLI と Time-skip CLI も spawn ごとに設定する。Time-skip の detached 起動だけは `extraEnv` が後勝ちだが、現行の呼び出し元は対象キーを渡していない（`app/host/server/index.mjs:890-895,1284-1289`, `app/host/server/timeskip.mjs:313-320,457-467`）。
+- Strata ソース内に、OS 以外の backend、build macro、モデル状態、別環境変数または CLI 引数を条件として `PYTHONUTF8` の設定を切り替える分岐はない。これは Python 子プロセスを起動する前の環境設定であり、GPU backend の選択処理ではない。
 
 ## 実行時の詳細
 
-Windows の `START-HERE.bat` と `bin/strata.cmd` は `setlocal` のスコープ内で設定し、Python 起動を含む後続処理へ渡します。`START-HERE.bat` は `setup.py` を実行し（`START-HERE.bat:44-55`）、`bin/strata.cmd` は `strata.py` を実行して Python の終了コードを返します（`bin/strata.cmd:42-44`）。PowerShell 版は Python 実行ファイルを選択した後に環境変数を設定し、`strata.py` を呼び出して、その `$LASTEXITCODE` を返します（`bin/strata.ps1:25-57`）。
+この変数を読み取る値のキャッシュはない。Windows スクリプトは起動処理で代入する。ホストは各子プロセス起動時に環境オブジェクトを作り、spawn に渡す。たとえば Control CLI は `runCli` から `controlEnvironment` を経由し（`app/host/server/control-runtime.mjs:82-107,140-146`）、ソース版サーバーは起動時に `sourceServerEnvironment()` を渡す（`app/host/server/native-control.mjs:689-692`）。Tuning と Time-skip も各起動の spawn オプションに値を含める（`app/host/server/index.mjs:890-895`, `app/host/server/timeskip.mjs:313-320,457-467`）。
 
-ホストアプリでは次の Python 子プロセス環境を構築します。
+明示設定経路では、親から継承した値は子環境の組み立て時に置き換わる。Time-skip の detached 経路だけは先述の通り呼び出し側の `extraEnv` が後から上書きできる。起動済み子プロセスに対して後から値を読み直したり、実行中に変更を反映したりする Strata の処理はない。
 
-- source-checkout サーバー環境は `process.env` を元にし、`PYTHONUTF8='1'` と `PYTHONIOENCODING='utf-8'` 等を設定します。native-control はその環境で `serve/server.py` を起動します（`apps/host/server/control-runtime.mjs:82-85`、`apps/host/server/native-control.mjs:387-390`）。
-- Control 用環境は親環境を複製し、一部の Python 関連変数を削除した後、`PYTHONUTF8='1'` を含む固定値を設定します。Control CLI と installer の起動にもこの環境が使われます（`apps/host/server/control-runtime.mjs:88-111,124-130`、`apps/host/server/native-control.mjs:106`）。
-- Time-skip の通常・detached CLI、tuning CLI は親環境を展開した後に `PYTHONUTF8='1'` を指定します（`apps/host/server/timeskip.mjs:302-310,446-455`、`apps/host/server/index.mjs:839-844`）。
-- native-control の source-checkout autotuner と管理ジョブも、`process.env` を展開してから `'1'` を設定します。packaged autotuner は `controlEnvironment()` を使います（`apps/host/server/native-control.mjs:53-55,408-414`）。
+## ログと測定値
 
-これらの環境オブジェクトは子プロセスの起動時に渡されます。Strata 親プロセス内でこの変数を cache したり、リクエストごとに読み直したりする処理はありません。検索範囲で、この設定そのものを知らせるログ、警告、終了・失敗経路は確認できません。ランチャーや子プロセスには独立した起動エラー・終了コード処理がありますが、それらを `PYTHONUTF8` の値による結果とは判断できません。
+`PYTHONUTF8` の値に応じた Strata 固有のログ、警告、終了コードは確認できない。子プロセスが起動できない場合や終了した場合には、ホストは通常のプロセスエラーとして処理する。ソース版サーバーは終了を instance error として記録し（`app/host/server/native-control.mjs:689-692`）、detached Time-skip は起動エラー、終了コード、stderr 等を結果に返す（`app/host/server/timeskip.mjs:471-492`）。これらの経路は `PYTHONUTF8` の値を理由として判定していない。該当する測定値はない。
 
 ## 根拠
 
-- Windows ランチャーで固定値を設定し、Python を起動: `START-HERE.bat:4-6,36-55`; `bin/strata.cmd:8-10,34-44`; `bin/strata.ps1:25-57`。
-- ホストのサーバー・Control・Time-skip・tuning・native-control 子プロセス環境: `apps/host/server/control-runtime.mjs:82-111,124-130`; `apps/host/server/native-control.mjs:53-55,106,387-390,408-414`; `apps/host/server/timeskip.mjs:302-310,446-455`; `apps/host/server/index.mjs:839-844,1160-1165`。
-- 候補一覧: `docs/envvars/000_envvers.md:524`。候補名の完全一致検索では、上記の本番箇所はすべて設定・子プロセスへの引き渡しです。Strata が親環境から値を読み取る本番箇所は見つかりませんでした。このため、候補一覧は「Strata が利用者設定を読み取る環境変数」という意味では不正確です。
-- `tools/test_cyrillic_paths.py:34-50` はテスト用子プロセスの環境に値を設定しランチャー内の文字列を確認します。`bench/results/2026-10-09-community-rtx-3060-0141/scripts/strata_bench_run.py:302` はベンチマーク記録用スクリプトで環境辞書に値を設定します。いずれも通常実行コードにおける環境変数の読み取り根拠としては使用していません。
-- `docs/DETAILS.md` および他の設計資料に、この環境変数の追加の挙動説明は見つかりませんでした。
+- `START-HERE.bat:4-8` — Windows の初回セットアップ／起動前の設定。
+- `terminal/bin/strata.cmd:8-10,42-44`、`terminal/bin/strata-direct.ps1:55-59` — Terminal の Windows ランチャー。
+- `app/host/server/control-runtime.mjs:82-107,114-119,140-146` — source server、Control／installer 環境、および CLI 起動。
+- `app/host/server/native-control.mjs:142,197-203,689-692,735-742` — tuning、MCP／installer、source server、native 操作の子プロセス。
+- `app/host/server/index.mjs:890-895,1284-1289` — tuning 起動と Time-skip 呼び出し側の追加環境。
+- `app/host/server/timeskip.mjs:313-321,457-492` — Time-skip 通常／detached 起動と起動失敗の返却。

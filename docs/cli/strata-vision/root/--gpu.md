@@ -1,60 +1,60 @@
 # `--gpu`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（2026-11-23 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-vision` |
-| コマンド | `strata-vision` / `strata-vision-hip` / `strata-vision-sycl` |
+| コマンド | `strata-vision`（`strata-vision-hip` / `strata-vision-sycl` を含む） |
 | オプション | `--gpu` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ |
+| 値 | 取らないフラグ。省略時は CPU 読み込み。 |
 
 ## 役割
 
-画像読み取り CLI の vision encoder を GPU 利用モードで初期化します。CPU 版を既定としており、このフラグを指定すると `mtmd_context_params.use_gpu` に `true` を渡します。ビルドにより GPU backend は CUDA、HIP、SYCL、Metal のいずれかです（`tools/vision/strata_vision.cpp:89-101,214-215`; `tools/vision/CMakeLists.txt:18-20,31,68-80`）。
+画像 encoder（vision tower）の実行先を GPU に切り替えます。GPU 対応としてビルドされた reader で指定すると、画像 encoder の重みを GPU にロードし、起動時の warm-up と以後の画像 embedding 計算を GPU で行います。GPU 番号や複数 GPU の指定機能ではなく、実際に使うデバイスはビルドと実行環境に依存します。
 
 ## 使い方
 
 ```sh
-strata-vision --mmproj mmproj.gguf --model model.gguf --gpu
+# サーバーから使う GPU 対応の画像 reader を起動する例（起動後は ENC / QUIT の入力を待つ）
+strata-vision --mmproj /path/to/mmproj.gguf --gpu
 ```
 
-`--mmproj` と `--model` は必須です。HIP / SYCL ビルドでは実行ファイル名がそれぞれ `strata-vision-hip` / `strata-vision-sycl` になります。Apple では Metal 有効ビルドの `strata-vision` が CPU/GPU 両方に対応します（`tools/vision/CMakeLists.txt:71-80,96-116`）。
+`--mmproj` は必須です。`strata-vision` は常駐 reader として標準入力から `ENC <画像パス> <出力パス>` または `QUIT` を受け付けます。サーバーは設定で GPU reader を選んだとき `--gpu` を付けて起動します。
 
 ## 値と既定値
 
-値は不要です。省略時は `gpu=false` で CPU 実行になり、指定すると `gpu=true` になります。複数回指定した場合も同じ真偽値を設定するだけです（`tools/vision/strata_vision.cpp:88-101`）。
-
-`--mmproj` または `--model` が空・未指定なら usage を stderr に出して終了コード 2 で終了します。値を伴う別 option が値なしで末尾にあるときは `<option> needs a value` を stderr に出し、同じく終了コード 2 です（`tools/vision/strata_vision.cpp:93-100,125-128`）。
+- 値・別名はありません。parser は引数が `--gpu` と完全一致した場合に内部フラグを真にします。省略時の初期値は `false` です。
+- `--gpu 0` のように値を続けても GPU 番号としては解釈せず、余分な `0` は未知引数エラーになります。繰り返し指定は同じ真偽値を再設定します。
+- `--mmproj` が空または省略なら usage を標準エラーへ出して終了コード 2 です。未知引数も標準エラーへ出し、コード 2 で終了します。
 
 ## 実行時の動作
 
-- フラグを省略すると、CUDA / HIP の可視 GPU を隠すため `CUDA_VISIBLE_DEVICES=-1` と `HIP_VISIBLE_DEVICES=-1` をプロセス内環境に設定してから backend を初期化します。指定時はこの変更をしません（`tools/vision/strata_vision.cpp:130-143`）。
-- encoder の `cp.use_gpu` にフラグ値を渡します。CPU 実行では `--threads` が正値ならその値を使い、未指定または 0 以下なら CPU thread 数を hardware concurrency の半分（1〜16 に制限）にします。GPU 実行ではこの CPU thread 自動設定を行いません（`tools/vision/strata_vision.cpp:214-228`）。
-- GPU モードでは起動時に 2048×2048 の画像を encode して GPU work buffer を warm-up し、所要時間と token 数を stderr に出します。CPU モードでは warm-up を行いません（`tools/vision/strata_vision.cpp:249-283`）。
-- サーバーの画像 reader は設定の `gpu` が有効なときにこの option を付けます。設定上限 `max_tokens` があれば `--max-tokens` も併せて渡します（`serve/server.py:2792-2805,2807-2817`）。
+`--gpu` がない場合、CUDA/HIP の GPU が reader から見えないよう `CUDA_VISIBLE_DEVICES` と `HIP_VISIBLE_DEVICES` を `-1` に設定してから reader を実行します。指定した場合はこの CPU 用のマスクを設定せず、GPU 対応 reader が GPU backend を初期化します。reader は GPU index `0` を渡して重みをロードします。このオプション自体にデバイス番号の構文はありません。
+
+ビルドによって GPU backend は異なります。CUDA、HIP、SYCL、macOS の Metal が別々のビルド設定で組み込まれ、HIP / SYCL はそれぞれ `strata-vision-hip` / `strata-vision-sycl` という実行名になります。GPU 対応なしのビルドでは、フラグを受理しても reader は `ERR this build has no GPU backend for the own tower` を標準出力へ出し、終了コード 3 で失敗します。
+
+HIP reader は起動前に GPU の有無と、検出した GPU architecture がビルド対象に含まれるかを確認します。不一致時は kernel 実行前に `ERR` 行を出してコード 3 で終了します（`STRATA_VISION_ARCH_CHECK=0` はこの architecture 確認を省略します）。また GPU reader は attention head size が 96 を超える encoder を拒否し、reader の GPU 初期化・重みロード・warm-up が失敗した場合も `ERR` を出して起動を中止します。
 
 ## 適用条件と副作用
 
-実際に GPU を使えるかは実行ファイルの build backend と実行環境に依存します。CMake は CUDA、HIP、SYCL を相互排他の別構成として定義し、Apple では `STRATA_VISION_METAL`（既定 ON）により Metal を設定します（`tools/vision/CMakeLists.txt:18-31,68-83`）。HIP / SYCL の GPU モードは backend device 一覧に GPU / integrated GPU がない場合、説明行を stdout に出して終了コード 3 になります。HIP は加えて、検出した gfx architecture が build 対象外なら、`STRATA_VISION_ARCH_CHECK` が設定されていないか 0 以外の場合に同じく終了コード 3 で拒否します（`tools/vision/strata_vision.cpp:144-174`）。Metal ビルドも GPU モードで Metal GPU が見つからなければ stdout にエラーを出し、終了コード 3 です（`tools/vision/strata_vision.cpp:176-192`）。
-
-CUDA については、この実装内に HIP / SYCL / Metal と同型の GPU 有無チェックはありません。CUDA の GPU 初期化失敗時の挙動や backend 側の fallback はここからは確認できません。GPU モードで GPU がない場合の挙動を保証するものではありません。
-
-この option 自体は入力ファイルを書き換えません。通常起動後は stdin の `ENC <image> <output>` 要求ごとに出力パスを `wb` で開くため、同名ファイルがあれば上書きします。出力ファイルを開けない場合などは `ERR ...` を stdout に返して次の要求へ進みます（`tools/vision/strata_vision.cpp:286-334`）。GPU warm-up は実際の処理より前に実行されるため、GPU memory を初期化時に確保します（`tools/vision/strata_vision.cpp:249-255`）。
+- GPU 処理には GPU backend を含むビルドと利用可能な対応デバイスが必要です。reader は起動時に encoder を GPU にロードし、最大 4096 image tokens の画像を使って warm-up するため、起動時に GPU メモリを確保します。より大きな token limit の画像では後続処理で buffer が拡張されます。
+- サーバー経由では GPU reader の起動に失敗すると、CPU reader が用意されている構成ではサーバーが CPU reader に切り替えて続行します。直接起動した場合は reader 自身のエラー終了となり、同じ自動切り替えはありません。
+- サーバーは `--gpu` を画像 reader の設定から付与します。サーバー設定の `gpu` が真なら起動引数に追加し、偽なら追加しません。
 
 ## 出力とエラー
 
-- GPU がない HIP / SYCL / Metal build、および対象外 HIP architecture: `ERR ...` を stdout に出し、終了コード 3（`tools/vision/strata_vision.cpp:159-172,186-190`）。
-- encoder の初期化失敗: `ERR cannot load the vision encoder ...` を stdout に出し、終了コード 1（`tools/vision/strata_vision.cpp:231-235`）。
-- GPU が利用できるかの確認とは別に、テキストモデルを開けない場合はエラーを stdout に出し、終了コード 1（`tools/vision/strata_vision.cpp:210-212`）。
-- reader が起動して `READY` を返した後の画像読み込み・encode・出力エラーは `ERR ...` を stdout に返します。これは option parser の失敗ではなく、要求単位のエラーです（`tools/vision/strata_vision.cpp:283-334`）。
+- 起動成功時は標準出力に `READY <次元> own` を出します。サーバーは GPU reader の `ERR` 応答や起動失敗を検出して CPU fallback を試みます。
+- GPU reader の encoder・デバイス・warm-up の失敗は、通常 `ERR <理由>` を標準出力に出して非 0 で終了します。GPU backend なし、GPU が見つからない、HIP architecture 不一致はコード 3、encoder の形式・ロードや warm-up の失敗はコード 1 です。
+- 引数エラーと `--mmproj` 不足は標準エラーに表示され、終了コード 2 です。
 
 ## 根拠
 
-- parser と既定値: `tools/vision/strata_vision.cpp:88-101`
-- GPU 可視性の環境変数設定と backend 初期化: `tools/vision/strata_vision.cpp:130-143`
-- GPU 有無・HIP architecture 検査: `tools/vision/strata_vision.cpp:144-192`
-- encoder 設定、CPU thread 条件、warm-up: `tools/vision/strata_vision.cpp:214-283`
-- build backend と実行ファイル名: `tools/vision/CMakeLists.txt:18-31,68-83,96-116`
-- サーバーからの `--gpu` 付与: `serve/server.py:2792-2817`
+- `terminal/tools/vision/strata_vision.cpp:56-72` — option parser、既定値を持つ設定の生成、値を取らない `--gpu`。
+- `terminal/tools/vision/strata_vision.cpp:91-125` — 未知引数・必須 `--mmproj` のエラー、CPU 時の device visibility 設定、HIP の device / architecture 検証。
+- `terminal/tools/vision/own/own_reader.h:14-20` — `gpu` の初期値 `false` と reader 設定。
+- `terminal/tools/vision/own/own_reader.cpp:52-80, 91-118` — GPU backend がない場合の失敗、GPU reader の選択・device 0 へのロード、head size 制限、warm-up とエラー応答。
+- `terminal/tools/vision/CMakeLists.txt:25-39, 77-98`、`terminal/tools/vision/own/CMakeLists.txt:120-163` — CUDA / HIP / SYCL / Metal backend と実行名のビルド条件。
+- `terminal/serve/server.py:2967-2975, 3017-3029` — CPU fallback の用意、設定に基づく `--gpu` の付与。
+- `terminal/serve/server.py:3042-3057, 3130-3147` — GPU reader 起動失敗時の CPU reader への切り替えと起動応答の処理。

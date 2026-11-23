@@ -1,6 +1,6 @@
-# `--work-dir`
+# `strata presets recheck --work-dir`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,45 +8,49 @@
 | コマンド | `strata presets recheck` |
 | オプション | `--work-dir` |
 | 別名 | なし |
-| 値 | 作業ファイルを置くディレクトリのパス（文字列） |
+| 値 | 作業ディレクトリのパス（文字列） |
 
 ## 役割
 
-再チェック中に起動する worker の設定ファイルとログを指定ディレクトリへ保存します。既定の一時ディレクトリを使わず、実行後にログなどを確認したい場合に指定します。
+プリセットの短い再チェックで起動する計測用 worker の設定 JSON とログを置く場所を指定する。通常は一時ディレクトリが使われ、明示した場合は診断用ファイルを実行後も残せる。これは `strata tune auto` にもある同名オプションとは別の parser 引数で、ここでは `strata presets recheck` にだけ適用される（`terminal/strata_cli/tune_commands.py:21-48,55-96`）。
 
 ## 使い方
 
 ```sh
-strata presets recheck <preset> <profile-or-config.json> --work-dir ./recheck-work
+# 計測 worker の設定とログを ./recheck-work に残す
+strata presets recheck PRESET PROFILE --work-dir ./recheck-work
 ```
+
+`PRESET` は保存済みプリセット、`PROFILE` はそのプリセットが属する profile 名または run configuration JSON である。引数順と `--work-dir` の受理範囲は recheck parser に定義されている（`terminal/strata_cli/tune_commands.py:88-96`）。
 
 ## 値と既定値
 
-`argparse` は必須の文字列値を1つ受け取ります。パスの存在、種類、書き込み可否に関する事前 validation はありません。指定を省略した場合、`tempfile.mkdtemp(prefix="strata-recheck-")` で一時ディレクトリを作ります。空文字列を渡した場合も `a.work_dir` が偽となるため、一時ディレクトリが使われます。複数回指定時は通常の `argparse` の動作で最後の値が残ります。〔`strata_cli/tune_commands.py:84-92,432-434`〕
+- 値は必須の文字列で、parser にパス形式・存在・書込可否の事前 validation はない。既定値は `None`（未指定）。（`terminal/strata_cli/tune_commands.py:88-96`）
+- 指定値は `Path(a.work_dir)` に変換される。相対パスはプロセスの現在ディレクトリ基準で解決され、`expanduser()` などの展開処理は行われない。（`terminal/strata_cli/tune_commands.py:615-644`）
+- 空文字列を渡した場合は偽値として扱われ、明示指定なしと同様に自動生成ディレクトリが使われる。（`terminal/strata_cli/tune_commands.py:640-642`）
 
 ## 実行時の動作
 
-指定値は `Path(a.work_dir)` に変換され、`WorkerSession` に渡されます。`WorkerSession` は `mkdir(parents=True, exist_ok=True)` でディレクトリを作成するため、存在しない親ディレクトリも作られ、既存ディレクトリも受け入れます。相対パスは CLI プロセスの作業ディレクトリ基準です。〔`strata_cli/tune_commands.py:432-436`、`strata_control/tune_session.py:423-432`〕
+recheck はプリセットの状態と対象構成を照合した後、明示値があればそのパスを `WorkerSession` に渡す。未指定なら `strata-recheck-` 接頭辞の一時ディレクトリを作り、終了時の削除を `atexit` に登録する。明示したディレクトリは `WorkerSession` が親ディレクトリも含めて作成し、削除登録は行わないため、worker 設定とログが残る。（`terminal/strata_cli/tune_commands.py:615-644`; `terminal/strata_control/tune_session.py:484-500`）
 
-worker 起動ごとに `engine-N.log`、`worker-N.log`、`run-N.json` をこのディレクトリに書きます。ログは空にして書き始める／`w` モードで開くため、既存の同名ファイルは上書きされます。再チェックは通常、保存済み設定で測定し、必要に応じて prompt 速度の再測定や標準設定との比較のため追加 worker を起動します。〔`strata_control/tune_session.py:463-479`、`strata_control/autotune.py:907-945`〕
-
-明示したディレクトリはコマンド終了時に自動削除されません。一方、省略時に作成した専用一時ディレクトリは `atexit` に削除処理が登録されます。〔`strata_cli/tune_commands.py:432-434`〕
+各計測 worker は `engine-N.log`、`worker-N.log`、`run-N.json` をそのディレクトリに書く。既存ディレクトリを指定すると、同名ファイルはログ初期化や `open(..., "w")`、`write_text()` により上書きされる。（`terminal/strata_control/tune_session.py:527-552,562-569`）
 
 ## 適用条件と副作用
 
-このオプションは `strata presets recheck` 専用です。同名の `--work-dir` は `strata tune auto` にもありますが、索引上もコマンドスコープが異なります。〔`strata_cli/tune_commands.py:22-48,84-92`〕
-
-指定先がファイルである、または作成・書き込みできない場合はディレクトリ作成やファイル書き込みで失敗します。既存ディレクトリを指定すると、実行番号が `1` から始まるため既存の `engine-1.log`、`worker-1.log`、`run-1.json` が上書きされ得ます。ログ保持用に専用ディレクトリを指定してください。〔`strata_control/tune_session.py:431,463-468,477`〕
+- `--work-dir` は再チェックを実行する際の作業領域に適用される。再チェック本体は保存済み設定で worker を起動し、測定に失敗した場合など必要に応じて標準設定の比較も行う。計測結果は完了後にプリセットへ記録される。（`terminal/strata_cli/tune_commands.py:643-657`; `terminal/strata_control/autotune.py:937-1008`）
+- 指定ディレクトリは作成され、計測設定・worker/engine ログが書き込まれる。明示指定時は自動削除されず、同名の既存ファイルを上書きする可能性がある。（`terminal/strata_control/tune_session.py:494-495,547-552,562-569`）
+- 存在する通常ファイルをディレクトリとして指定した場合や、作成・書込みに失敗した場合の `OSError` は `strata presets` のエラー経路で処理される。（`terminal/strata_control/tune_session.py:494-495`; `terminal/strata_cli/tune_commands.py:472-530`）
 
 ## 出力とエラー
 
-再チェックの進捗・結果出力は `--output` の設定で制御されます。このコマンド自身は `--output` の既定値を `human` としており、`--work-dir` は出力形式を変えません。作業ディレクトリの作成・書き込みで発生した `OSError` は共通エラー経路で処理され、human 出力では stderr に `strata: <エラー>`、JSON 出力では `ok: false` のエラー JSON となります。〔`strata_cli/tune_commands.py:55-57,348-351`〕
+既定の人間向け出力は標準出力、進捗メッセージは標準エラーに出る。`--output json` を指定した場合は人間向け進捗を抑止し、JSON 結果を標準出力へ出す（この `--output` は `presets` の共通 parser 引数）。（`terminal/strata_cli/tune_commands.py:59-61,615-661`; `_print` / `_fail`: `terminal/strata_cli/tune_commands.py:101-114`）
+
+作業ディレクトリの作成・書込みに伴う `OSError` は人間向けでは標準エラーに `strata: <理由>`、JSON モードでは `ok: false` の JSON として報告され、通常の `OSError` は終了コード 2 になる。プリセット不整合など `PresetError` は終了コード 5。（`terminal/strata_cli/tune_commands.py:109-114,472-530`）
 
 ## 根拠
 
-- parser と既定値: `strata_cli/tune_commands.py:84-92`
-- 指定値の変換、一時ディレクトリと終了時削除: `strata_cli/tune_commands.py:416-436`
-- ディレクトリ作成: `strata_control/tune_session.py:423-432`
-- worker 用ファイルとプロセス起動: `strata_control/tune_session.py:463-485`
-- 再チェックが worker を起動する条件: `strata_control/autotune.py:885-945`
-- エラー整形: `strata_cli/tune_commands.py:105-110,348-351`
+- `terminal/strata_cli/tune_commands.py:55-96` — `presets recheck` の parser、位置引数、共通 `--output`、`--work-dir` の default と scope。
+- `terminal/strata_cli/tune_commands.py:615-644` — パスの選択、一時領域の生成と削除登録、worker への引き渡し。
+- `terminal/strata_control/tune_session.py:484-500,527-569` — 作業ディレクトリ作成、計測ファイル名と書込み、worker 起動。
+- `terminal/strata_control/autotune.py:937-1012` — 再チェックの測定と結果経路。
+- `terminal/strata_cli/tune_commands.py:101-114,472-530,652-661` — 出力、例外処理、結果保存後の表示。

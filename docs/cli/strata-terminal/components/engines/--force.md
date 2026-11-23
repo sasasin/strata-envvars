@@ -1,6 +1,6 @@
 # `strata components engines --force`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,41 +8,43 @@
 | コマンド | `strata components engines` |
 | オプション | `--force` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。`store_true`。 |
+| 値 | 値を取らない真偽フラグ。未指定時は `false`、指定時は `true`。 |
 
 ## 役割
 
-このコマンドでは `--force` は parser に登録されていますが、導入済み engine の一覧処理に再試行・強制処理はありません。`strata components engines --force` と指定しても、`--force` なしの場合と同じ一覧を出します。これは共通 option 群 `_common()` を `engines` parser に適用しているため受理されるものの、一覧経路では値を使わないためです。
+現行 parser はこのコマンドで `--force` を受け付けますが、`engines` の一覧処理はフラグを参照しません。したがって、このスコープで指定しても失敗した engine の再試行や一覧内容の変更は起きません。`--force` の help 説明にある再試行用途は update 系の処理に対する説明であり、`engines` には適用されません（`terminal/strata_cli/update_cmd.py:47-56,82-83,337-338,445-465`）。
 
 ## 使い方
 
 ```sh
+# インストール済み engine の一覧を表示する。--force を付けても一覧処理への効果はない
 strata components engines --force
 ```
 
-一覧表示に `--force` は不要です。JSON 形式で出す場合は `--output json` または `--json` を使えます。
-
 ## 値と既定値
 
-値は不要で、指定時は真、未指定時は偽です。文字列値は受け付けません。`argparse` の `store_true` で宣言されているため、同じフラグを複数回指定しても真のままです（`strata_cli/update_cmd.py:53`）。
+`argparse` の `action="store_true"` として登録され、値は不要です。省略時は偽、指定時は真になります。短縮別名は登録されていません。値を続けて渡す形式ではありません（`terminal/strata_cli/update_cmd.py:53`）。
 
 ## 実行時の動作
 
-`_common()` が `--force` を含む共通引数を登録し、`strata components engines` にも適用します（`strata_cli/update_cmd.py:47-56,82-83`）。CLI は `components engines` を `update_cmd.run()` に振り分け（`strata_cli/cli.py:2136-2138`）、`run()` は共通の `Context` に `force` 値を渡します（`strata_cli/update_cmd.py:254-256`）。しかし `engines` は続いて `_engines_command()` に分岐し、`lib.list_engines(ctx)` の結果を表示して戻ります（`strata_cli/update_cmd.py:272-273,358-377`）。一覧処理は導入済み package の情報を読み取ります（`strata_control/engine_library.py:180-195`）。この経路では `ctx.force` を参照しません。
+`engines` parser は `_common` を通じて共通引数として `--force` を登録します。実行時には値が `updater.Context.force` に格納されますが、コマンド分岐は `engine_library.list_engines(ctx)` を呼び、その処理はインストール済み engine の走査・適合性判定・一覧データの組み立てを行います。`list_engines` 以下の一覧処理には `ctx.force` の参照がなく、再試行や更新処理へ進む分岐もありません（`terminal/strata_cli/update_cmd.py:82-83,314-321,337-338,445-452`; `terminal/strata_control/engine_library.py:98-134,152-167`）。
 
-同じ `Context.force` は updater の更新判定では、失敗済み version の再試行などに使われます（`strata_control/updater.py:637-642,1098-1105`）。その更新効果は `strata components engines` には適用されません。
+同じ `_common` によって `--force` を受理する `strata update` や `strata components rollback` などでは `Context.force` が別の処理で利用されますが、その動作はこの `engines` 文書の適用範囲外です（`terminal/strata_cli/update_cmd.py:59-83`; `terminal/strata_control/updater.py:713-729`）。
 
 ## 適用条件と副作用
 
-このフラグは一覧コマンドでは効果を持たず、engine の download、切替、削除、test start を起こしません。一覧処理は engine の状態やファイル情報を読むほか、稼働中かどうかを確認します（`strata_cli/update_cmd.py:361-364`、`strata_control/engine_library.py:180-195`）。`--force` によって適用条件や表示対象が変わる処理は確認できません。
+`--force` 自体に一覧処理上の副作用はありません。一覧コマンドは engine を切り替えず、ダウンロードも行いません。通常の一覧生成は components ディレクトリ内の package を読み、backend / platform / driver などに基づく適合性を調べ、実行中プロセスの使用状況も一覧用データに付けます（`terminal/strata_control/engine_library.py:98-128,139-167`）。
 
 ## 出力とエラー
 
-`--force` 固有の警告やエラーはありません。通常の人向け出力は導入済み engine の一覧と「何も変更していない」旨です（`strata_cli/update_cmd.py:368-377`）。JSON 系出力では一覧オブジェクトを成功結果として出力します（`strata_cli/update_cmd.py:364-367`）。`--force` は一覧処理で validation に使われず、他の失敗経路を変える根拠も確認できません。
+このフラグに固有の出力・警告・実行時エラー経路はありません。人向け出力では engine 一覧を表示し「Nothing was changed.」と案内します。`--output json` または `--output jsonl` では一覧データを JSON で出力します。いずれも `--force` の有無を分岐条件にしていません（`terminal/strata_cli/update_cmd.py:56,305-306,445-465`）。値を付けて `--force true` のように書くと余分な引数となり、CLI の parser が usage error として終了コード 2 で拒否します（`terminal/strata_cli/cli.py:2325-2334`）。
 
 ## 根拠
 
-- parser 宣言と `engines` への共通 option 適用: `strata_cli/update_cmd.py:47-56,82-83`
-- CLI から updater command への分岐、force 値の Context 格納、一覧分岐: `strata_cli/cli.py:2136-2138`、`strata_cli/update_cmd.py:254-256,272-273,358-377`
-- 一覧処理の読み取り動作: `strata_control/engine_library.py:180-195`
-- `--force` が更新判定で使われる箇所（この文書のコマンドとは別経路）: `strata_control/updater.py:637-642,1098-1105`
+- `terminal/strata_cli/update_cmd.py:47-56` — 共通 parser でのフラグ定義。`store_true` で値なし、既定値 `false`。
+- `terminal/strata_cli/update_cmd.py:82-83` — `engines` に共通 parser 引数を登録。
+- `terminal/strata_cli/update_cmd.py:314-321` — CLI 値を `Context.force` に格納。
+- `terminal/strata_cli/update_cmd.py:337-338,445-465` — `engines` の分岐、一覧呼び出し、人向け / JSON 出力。分岐内で force を参照しない。
+- `terminal/strata_cli/cli.py:2325-2334` — 未認識引数の parser error 経路。
+- `terminal/strata_control/engine_library.py:98-134,139-167` — 一覧の走査・適合性判定・使用状態の集約。`ctx.force` は参照しない。
+- `terminal/strata_control/updater.py:713-729` — `ctx.force` が failed / rollback 済み engine の update 判定で使われる箇所。`engines` からは呼ばれない。

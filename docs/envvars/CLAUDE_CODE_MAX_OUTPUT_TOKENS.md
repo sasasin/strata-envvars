@@ -1,40 +1,47 @@
 # `CLAUDE_CODE_MAX_OUTPUT_TOKENS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata はこの名前の値を自分のプロセス環境から読み取って推論設定に適用するのではなく、`strata connect claude-code` が Claude Code 用に生成する設定値として `4096` を出力します。生成先は `~/.claude/settings.json` の `env` セクションで、同じ値は表示・コピー用の環境変数一覧にも含まれます。Strata 自身のモデル出力上限やサーバー応答をこの変数が変更する実装は確認できません。`strata connect` が表示する説明では、Claude Code 側のコンテキスト管理に必要な設定の一つとして案内されています。
+Strata の `strata connect claude-code` が、Claude Code 用設定ファイル `~/.claude/settings.json` の `env` オブジェクトに出力する環境設定名である。値は対象サーバーの context に応じた出力上限として生成される。`strata connect` はこの値を設定ファイル案と `Environment:` 表示に載せるが、Strata のサーバーや CLI がこの名前を実行プロセスの環境から読み取って推論上限を変更する実装は確認できない。`claude_env` は値を `str(t.output_cap)` として作り、`claude_file` が同じ辞書を JSON の `env` に入れる（`terminal/strata_cli/launch/harness.py:45-51,158-167,343-348`）。
 
 ## 値と判定
 
-Strata の設定生成では `OUTPUT_CAP = 4096` を定数として定義し、`claude_env()` が `str(t.context)` などとともに `"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(OUTPUT_CAP)` を辞書へ入れます。したがって生成値は常に文字列 `"4096"` です。値の parse、未設定・空文字・無効値の判定、clamp はありません。利用者のシェルで同名変数を設定していても、Strata がその値を取り込む処理はありません。
+Strata 自身は環境値を parse しない。新しい設定案で生成する値は `max(4096, context // 8)` の十進表記文字列である。context は `--context` が指定されればそれを使い、なければ実行中の launch または preset から取り、最後は `32768` を使う（`terminal/strata_cli/launch/harness.py:45-51,339-340`; `terminal/strata_cli/launch/cmd.py:1074-1080,703-725`）。たとえば context `32768` では `4096`、`40960` では `5120`、`65536` では `8192`、`131072` では `16384` を出力する。`--context` の値は数値または `k` / `m` 付きのサイズとして parse され、最低 `1024` token 未満は拒否される（`terminal/strata_cli/launch/cmd.py:46-50,173`; `terminal/strata_cli/launch/settings.py:71-81`）。
 
-| 状況 | Strata が出力する値 |
-|---|---|
-| `strata connect claude-code` の通常表示・JSON 出力・画面上のコピー | `4096` |
-| `~/.claude/settings.json` を生成 | `env.CLAUDE_CODE_MAX_OUTPUT_TOKENS` に文字列 `"4096"` |
-| `--context`、preset、サーバー情報でコンテキストを変更 | この変数は引き続き `4096`。別の `CLAUDE_CODE_MAX_CONTEXT_TOKENS` の値が変わる |
-| 既存の設定 JSON を `--write` で merge | マージは新しい値を優先するため、このキーは `"4096"` に置き換わる |
+| 条件 | 未設定 | 生成される値 | 既存設定の値 |
+| --- | --- | --- | --- |
+| `strata connect claude-code` の表示・新規設定 | OS 環境変数の未設定状態は Strata では参照しない | JSON の `env` に context 由来の十進文字列を出力 | 表示だけでは設定ファイルを読み戻さない |
+| `strata connect claude-code --write` で既存 JSON を merge | `env` にキーが無い、値が JSON `null`、または `env` がオブジェクトでない場合は生成値を使用 | 生成値を merge | 既存の非 `null` 値は、`str(value) == "4096"` の場合を除いてそのまま保持する。空文字、任意文字列、数値、真偽値も検証・変換せず保持する |
+
+Strata が保持判定で比較するのは既存値の `str(...)` と文字列 `"4096"` の完全一致であり、大小文字、空白、数値形式の妥当性を検査しない。`"4096"` または数値 `4096` は生成値で置き換わる。`"4096x"`、`" 4096"`、`"0"`、`""`、その他の非 `null` 値は保持される（`terminal/strata_cli/launch/harness.py:402-420`）。ここでの未設定・空文字の扱いは既存 JSON の merge に限る規則で、実行時の OS 環境変数の parse 規則ではない。
 
 ## 有効になる条件
 
-`claude-code` ハーネスを選び、Strata がその設定を描画または生成するときに出力されます。OS、CUDA/HIP/SYCL backend、build macro、サーバーモード、モデルの実行状態による分岐はありません。別の環境変数による上書きや、CLI 引数で出力上限を指定する経路も確認できません。`Target.context` は CLI の `--context`、preset、または既定値 `32768` から決まりますが、この値は出力上限ではなく別のコンテキスト設定に使われます。
+- この設定を出力するのは `claude-code` harness である。`strata connect` は対象を名前で解決し、その harness の renderer を実行する（`terminal/strata_cli/launch/harness.py:286-295,318-323`; `terminal/strata_cli/launch/cmd.py:1052-1080`）。
+- 値の生成には Strata server の context が必要である。明示した `--context` が最優先で、次に選択した launch / preset の context、なければ `32768` が使われる（`terminal/strata_cli/launch/cmd.py:1074-1080`; `terminal/strata_cli/launch/harness.py:339-340`）。
+- `--write` なしではファイルに書かず、案を表示する。`--write` は通常確認を求め、`--yes` で確認を省略できる。非対話入力で `--yes` がなければ終了コード `2` で書き込みを断る（`terminal/strata_cli/launch/cmd.py:1019-1038,1123-1140,1156-1167`）。
+- Strata ソース内に、OS、GPU backend、build macro、server mode、model 状態でこの設定値の適用を切り替える処理はない。設定を受け取った Claude Code 側の解釈・実際の出力制限は本調査の対象外であり、Strata の挙動としては断定しない。
 
 ## 実行時の詳細
 
-`strata connect` は harness を選択し、対象 URL・key・model・context から `Target` を作って `render()` を呼びます。Claude Code harness は `claude_env` を環境辞書生成関数として登録しており、その辞書を `~/.claude/settings.json` の `env` と `render()` の `env` 欄の両方に使用します。通常表示は JSON ファイル内容と環境行を出力し、`--output json` はその値を含む JSON を返します。画面のコピー機能も同じファイル内容と環境行をクリップボード向けに組み立てます。
+`run_connect` は引数・launch 情報から `Target` を作り、`render` で `claude_env` と `claude_file` を呼び出す。この時点で環境から `CLAUDE_CODE_MAX_OUTPUT_TOKENS` を読み取ることはない。標準出力には設定ファイル内容と環境設定の一覧を出す。`--write` の場合は `~/.claude/settings.json` を JSON merge し、新しい Strata 管理キーを設定する（`terminal/strata_cli/launch/cmd.py:1074-1080,1123-1140,1156-1167`; `terminal/strata_cli/launch/harness.py:158-167,343-348,355-369`）。
 
-`--write` を使う場合は（`--yes` を付けなければ確認後に）設定ファイルを書き込みます。既存ファイルは先にバックアップされ、JSON の merge では新しい設定値が同じキーの既存値に勝ちます。Strata は Claude Code 自体をこの処理で起動せず、親プロセスに既存の環境変数を設定する処理もありません。従って、この値の読み取り時期・キャッシュ・Strata 子プロセスへの転送は該当せず、Strata のログ・終了・失敗経路をこの値が制御することもありません。
+既存設定では、`_keep_output_cap` が既存の `env.CLAUDE_CODE_MAX_OUTPUT_TOKENS` を調べる。非 `null` かつ文字列化した値が `"4096"` と異なるとき、その値を merge 後の設定に戻して保持する。`"4096"` は旧 Strata の生成既定値とみなされ、新しい context から計算した値に更新される。これはファイル書き換え時だけの処理で、プロセス内 cache や起動後の再評価はない（`terminal/strata_cli/launch/harness.py:364-369,402-420`）。
 
-ソース全体の完全一致検索では、実装上の参照は `strata_cli/launch/harness.py` の生成処理と利用者向け説明文です。その他はテストの期待値です。環境読み取り API を通じてこの名前を読む箇所は確認できません。これは Strata が Claude Code 用に値を出力する設定キーとしての用法です。
+JSON の読み込み・書き込みで `OSError` が起きると、そのファイルを `failed` として報告し、以後のファイルがあれば `not_written` とする。通常出力では `Could not write <path>: <reason>.` を表示して終了コード `1` を返す。JSON 出力ではエラー情報を含む結果を返して同じコードで終了する（`terminal/strata_cli/launch/cmd.py:1039-1050,1108-1115,1156-1167`）。
+
+## ログと測定値
+
+Strata は `Good to know:` の案内に、context と生成値を埋めた `Set CLAUDE_CODE_MAX_CONTEXT_TOKENS to the served context (%d here) and CLAUDE_CODE_MAX_OUTPUT_TOKENS=%d: ...` を表示する。書き込み成功時は `Created` または `Merged` とファイルパスを表示する（`terminal/strata_cli/launch/harness.py:234-244`; `terminal/strata_cli/launch/cmd.py:1137-1141,1158-1162`）。
+
+ソースにこの変数の実行時効果を測定した Strata の測定値はない。上記案内は CLI が表示する説明文であり、Claude Code 側の動作を Strata が検証した結果とは扱わない。
 
 ## 根拠
 
-- `strata_cli/launch/harness.py:22-25` — `OUTPUT_CAP = 4096` の定義。
-- `strata_cli/launch/harness.py:111-120` — Claude Code 向け環境辞書で固定値を作り、設定ファイルの `env` にシリアライズ。
-- `strata_cli/launch/harness.py:222-231,276-281` — `claude-code` harness への登録と render の出力。
-- `strata_cli/launch/harness.py:288-320` — 既存 JSON 設定を merge する際に新しいキー値を優先。
-- `strata_cli/launch/cmd.py:923-952,978-991,1011-1028` — `strata connect` の対象生成、表示、`--write` 経路。
-- `strata_cli/launch/monitor_ext.py:136-149,155-178,319-323` — 画面の設定表示、コピー、確認後の書き込み。
-- `strata_cli/launch/harness.py:178-185` — Claude Code 向けの説明文。別の context 値と本変数の `4096` を併記。
+- `terminal/strata_cli/launch/harness.py:45-51` — context から出力上限を計算。
+- `terminal/strata_cli/launch/harness.py:158-167,286-295` — Claude Code 用 env map と settings ファイル定義。
+- `terminal/strata_cli/launch/harness.py:355-369,402-420` — settings の merge と既存値の保持・更新規則。
+- `terminal/strata_cli/launch/cmd.py:1019-1050,1074-1080,1123-1167` — `strata connect` の選択、表示、書き込み、失敗結果。
+- `terminal/strata_cli/launch/settings.py:71-81` — `--context` のサイズ parse と下限。

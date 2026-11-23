@@ -1,58 +1,65 @@
 # `strata-split-N --draft-vocab`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。Strata checkout は `main`（`origin/main` と一致）で、調査開始時の `git status --short --branch` は `## main...origin/main` でした。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-split` |
-| コマンド | `strata-split-N`（N はカード数別 executable） |
+| コマンド | `strata-split-N`（N = 2/3/4、`--serve` モード） |
 | オプション | `--draft-vocab` |
 | 別名 | なし |
-| 値 | draft vocabulary ファイルのパス |
+| 値 | 語彙 ID ファイルのパス。ファイル形式は方式によって異なる検査を受ける |
 
 ## 役割
 
-MTP draft head の行と native model の token ID を対応付ける語彙ファイルを指定します。`strata-split` は起動時にこのファイルを読み、MTP の初期化へ渡します。通常の MTP runtime では省略時に runtime directory 内の `draft_vocab.bin` が使われます。27B build では model に draft layer 自体が含まれるため、語彙ファイルの明示指定が必要です（`src/split/tools/sfnx.cpp:65-67,84,1055-1059`、`src/split/src/model.hpp:220-225`、`src/split/src/model.cpp:1142-1149,1193-1198`）。
+MTP または DFlash2 の speculative drafting で使う draft vocabulary ファイルを指定します。ファイルには main model の token ID が並び、その順序が draft head の行との対応を決めます。指定を省略した場合の既定パスは MTP runtime directory 内の `draft_vocab.bin` です。DFlash2 方式では `--mtp` のディレクトリを語彙ファイルの既定場所としても使えます。parser はオプション値を文字列として保存し、形式や存在確認はモデルのロード時に行います（`engine/src/split/tools/sfnx.cpp:65-87,110-114`、`engine/src/split/src/model.cpp:1230-1256`）。
 
 ## 使い方
 
 ```sh
-strata-split-2-sm90 --serve --native ./model.gguf --mtp ./mtp-runtime \
-  --draft-vocab ./mtp-runtime/draft_vocab_en.bin
-```
+# MTP 方式で独自の語彙ファイルを使う
+strata-split-2 --serve --native MODEL.gguf --mtp MTP_DIR --draft-vocab VOCAB.bin
 
-ここで `strata-split-2-sm90` はカード数・GPU architecture に合う実行ファイル名の例です。実際の起動では `--serve`、`--native`、`--mtp` も必要です。Terminal の起動経路は語彙ファイルを検出し、そのパスを `--draft-vocab` の値として組み立てます（`strata_control/split_engine.py:494-509`）。
+# DFlash2 方式で独自の語彙ファイルを使う
+strata-split-2 --serve --native MODEL.gguf --mtp MTP_DIR --draft dflash2 --draft-model DFLASH2.pack --draft-vocab VOCAB.bin
+```
 
 ## 値と既定値
 
-- parser は次の argv 要素を値として受け取ります。値を省略すると `--draft-vocab needs a value` になります。値の内容やファイルの存在確認は parser 段階では行わず、同じ option を複数指定したときは `Args` への後続代入で前の値を置き換えます（`src/split/tools/sfnx.cpp:72-85`）。
-- 通常の MTP build では、値が空（option を省略した場合を含む）なら `<--mtp で指定した runtime directory>/draft_vocab.bin` を開きます。空でない値はそのパスを直接開きます（`src/split/src/model.cpp:1193-1198`）。
-- `FNX_27B` build では省略・空値はエラーになり、非空の明示パスが必要です。`--mtp` の値は `nextn` でなければなりません（`src/split/src/model.cpp:1142-1149`）。
-- ファイルは raw な int32 token ID の列として読み込まれます。サイズが 4 の倍数であること、読み切れること、空でないこと、各 ID が `0 <= id < model vocab size` であることを検証します（`src/split/src/model.cpp:1149-1165,1196-1213`）。
-- ソースでは ID の重複を拒否していません。読み込んだ列の各 ID から draft head の行番号への map を構築し、重複 ID は後の行番号で上書きします（`src/split/src/engine.cu:1231-1232`）。
+- 値はパス文字列です。parser は次の argv 要素を受け取り、値がなければ `--draft-vocab needs a value` として引数解析を失敗させます。数値範囲やパスの形式は parser では検査しません（`engine/src/split/tools/sfnx.cpp:76-87`）。
+- 同じオプションを複数指定すると、引数を走査するたびに同じ文字列フィールドへ代入するため、最後の指定が残ります（`engine/src/split/tools/sfnx.cpp:76-86`）。
+- MTP では値を省略または空文字にすると `--mtp` の値に `/draft_vocab.bin` を連結したファイルを使います。通常の MTP 起動には `--native` と `--mtp` が必要です（`engine/src/split/src/model.cpp:1230-1234`、`engine/src/split/tools/sfnx.cpp:107-114`）。
+- DFlash2 では `--draft-vocab` を省略または空文字にすると、`--mtp DIR` があれば `DIR/draft_vocab.bin` を使います。`--mtp` も指定しない場合は明示的な `--draft-vocab FILE` が必要です（`engine/src/split/tools/sfnx.cpp:108-114`）。
+- MTP のファイルは空でなく、サイズが 4 byte 単位で、全要素が main model の語彙範囲 `0 <= id < vocab_size` に入る必要があります。読み取りエラーやファイルサイズまで読み切れなかった場合も拒否されます（`engine/src/split/src/model.cpp:1232-1255`）。
+- `FNX_27B` ビルドの MTP では例外があり、`--mtp` の値は `nextn` 固定で、語彙ファイルの明示が必須です。この分岐では同様に空ファイルと語彙範囲外 ID を拒否します（`engine/src/split/src/model.cpp:1172-1202`）。
+- DFlash2 のファイルは 4 byte ごとに `int32_t` として読み取られ、空ファイルと語彙範囲外の ID は拒否されます。MTP と異なり、ここではファイルサイズの 4 byte 整合性や `ferror` は別途検査していません（`engine/src/split/tools/sfnx.cpp:1061-1072`）。
+- 両方式ともコード上で ID の重複検査はありません。MTP は語彙 ID から draft index への表を構築し、同じ ID が重複すると後の位置が表に残ります（`engine/src/split/src/engine.cu:1307-1308`）。
+
+ファイルは生の `int32_t` 配列として読み取られ、Strata 側で byte order を変換する処理は確認できません。対応する byte order やファイル生成手順の仕様は、この調査範囲のソースからは確定できません。
 
 ## 実行時の動作
 
-`sfnx` は `--draft-vocab` の値を `Args::draft_vocab` に格納し、モデルを読み込んだ後 `fnx::Mtp` のコンストラクタへ `--mtp` の値とともに渡します（`src/split/tools/sfnx.cpp:82-84,1055-1059`）。コンストラクタは語彙ファイルを読み、MTP head の各行に対応する token ID の列を作ります。engine はその列から token ID → draft head 行番号の index を作成し、draft 処理や penalty の対応付けに使います（`src/split/src/model.cpp:1194-1226`、`src/split/src/engine.cu:1231-1232`、`src/split/src/engine_common.cu:1398-1407,1531-1540`）。
+`--draft-vocab` の文字列は MTP 方式では `Mtp` の構築に渡され、MTP runtime ファイル群とともに読み込まれます。読み込んだ ID のリストは各 GPU card に分割され、draft head の `output.weight` 行の選択に使われます。engine は同じリストから token ID を draft vocabulary 内の位置へ対応づけます（`engine/src/split/tools/sfnx.cpp:1123-1133`、`engine/src/split/src/model.cpp:1257-1275`、`engine/src/split/src/engine.cu:1251-1308`）。
 
-この option は `--mtp` と連携します。`--mtp` 自体は parser で必須とされますが、`--draft-vocab` は parser では必須扱いではありません。通常 build では `--mtp` directory の既定ファイルが使われ、27B build では明示値が必要です（`src/split/tools/sfnx.cpp:101`、`src/split/src/model.cpp:1145-1149,1194-1198`）。
+DFlash2 方式では同ファイルから ID を読み、main model の `output.weight` の該当行を選び、pack・選択行・embedding の callback とともに bridge へ渡します。bridge のロードは Engine の構築より先に行われます（`engine/src/split/tools/sfnx.cpp:1061-1091,1123-1133`）。
+
+`--draft` の選択は `FNX_DRAFT` が空でない場合に環境変数の値で上書きされます。そのため、`--draft dflash2` を指定していても `FNX_DRAFT=mtp` なら MTP 側が選ばれ、同じ `--draft-vocab` の値は MTP に渡ります。`FNX_DRAFT` の有効値は `mtp` と `dflash2` で、それ以外は引数解析エラーです（`engine/src/split/tools/sfnx.cpp:107-114`）。
 
 ## 適用条件と副作用
 
-語彙ファイルは engine 起動時に読み取られます。値を変更すると、同じ MTP runtime / model に対して draft head が参照する token ID の対応が変わります。読み込み時にファイルを開いて読む以外の書き込み処理はこの経路にはありません（`src/split/tools/sfnx.cpp:1055-1059`、`src/split/src/model.cpp:1149-1165,1196-1213`）。
-
-Terminal の `strata launch` 経路は、engine executable の隣、data directory、設定上の `cwd/data` の順に `draft_vocab_en.bin` を探し、見つからない場合は split engine を使わない判定を返します。この経路では検出したファイルを明示値として渡すため、通常 build の `draft_vocab.bin` 既定値とは異なる指定になります（`strata_control/split_engine.py:501-509`）。
+- このオプションは `strata-split-N` の `--serve` parser scope にあります。MTP と DFlash2 のどちらをロードするかは `--draft` と `FNX_DRAFT` の決定結果で変わります（`engine/src/split/tools/sfnx.cpp:82-87,107-114,1123-1133`）。
+- ファイルを読み込んでホストメモリ上の ID 配列を作り、モデル出力行を選択して GPU 側の draft 処理へ渡します。オプション自体によるファイルの書き換えはありません（`engine/src/split/src/model.cpp:1232-1275`、`engine/src/split/tools/sfnx.cpp:1061-1091`）。
+- モデル語彙にない ID、空ファイル、開けないファイルは起動時に拒否されます。MTP では MTP データのロード・card ごとの読み込み失敗も起動を失敗させます（`engine/src/split/src/model.cpp:1232-1275`）。DFlash2 では `output.weight` が存在しないか Q8_0 でない場合も拒否されます（`engine/src/split/tools/sfnx.cpp:1064-1074`）。
 
 ## 出力とエラー
 
-- option の値が無ければ parser が例外を投げ、`main` は stderr に `sfnx: <理由>` を出して status 2 で終了します（`src/split/tools/sfnx.cpp:77-79,1038-1048`）。
-- ファイルを開けない、サイズが int32 境界でない、読み込み途中の I/O error、空ファイル、model vocab 範囲外の token ID は MTP 初期化時に例外になります。起動時の初期化失敗経路は stdout に `ERR <理由>`、stderr に `sfnx: failed: <理由>` を出して status 1 で終了します（`src/split/src/model.cpp:1149-1165,1196-1213`、`src/split/tools/sfnx.cpp:1038-1061`）。
-- 27B build で語彙パスが空の場合は `mtp: the 27B needs a draft vocabulary file`、`--mtp` が `nextn` 以外の場合はその指定を示すエラーになります（`src/split/src/model.cpp:1145-1148`）。
+- 値の欠落、未知の引数、必須引数不足など引数解析時の例外は `stderr` に `sfnx: <理由>` と出力され、終了コード 2 になります（`engine/src/split/tools/sfnx.cpp:76-80,105-115,1107-1115`）。
+- モデル・語彙ファイルのロード失敗は `stdout` の protocol line `ERR <理由>` と `stderr` の `sfnx: failed: <理由>` に出力され、終了コード 1 で終了します（`engine/src/split/tools/sfnx.cpp:1094-1102,1123-1135`）。
+- DFlash2 ではロード成功時、選択した draft token 数・drafter 数・VRAM 使用量を `stderr` に表示します（`engine/src/split/tools/sfnx.cpp:1089-1092`）。
 
 ## 根拠
 
-- parser、値の代入、必須の関連引数: `src/split/tools/sfnx.cpp:65-104`
-- MTP 初期化への引き渡しと起動失敗時の出力: `src/split/tools/sfnx.cpp:1038-1061`
-- 27B build と通常 build のファイル選択・検証: `src/split/src/model.cpp:1142-1235`、宣言コメント `src/split/src/model.hpp:220-225`
-- 語彙 index の構築と利用: `src/split/src/engine.cu:1231-1232`、`src/split/src/engine_common.cu:1398-1407,1531-1540`
-- Terminal がこの値を組み立てる経路: `strata_control/split_engine.py:250-270,494-509`
+- `engine/src/split/tools/sfnx.cpp:73-117` — parser、必須引数、`FNX_DRAFT` による方式選択、DFlash2 の語彙パス補完。
+- `engine/src/split/tools/sfnx.cpp:1061-1092,1123-1135` — DFlash2 のファイル読み込み・検査・出力行選択・bridge への受け渡し、および失敗経路。
+- `engine/src/split/src/model.cpp:1230-1275` — MTP の既定パス、ファイル形式・値域検証、card 別の語彙 head ロード。
+- `engine/src/split/src/engine.cu:1251-1308` — MTP 語彙の engine への接続と token ID 対応表。

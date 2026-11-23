@@ -1,38 +1,44 @@
 # `STRATA_GGML_COMMON`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査対象リポジトリの開始時状態は `## main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Apple Silicon 向け Metal runtime が、実行時に Metal カーネルへ読み込む `ggml-common.h` のファイルパスを指定します。CUDA/HIP/SYCL の環境変数としては使われていません。Metal の `Context` を生成するときにパスを選び、その後 `compile()` が必要なカーネルソースの先頭にファイル内容を追加します。
+macOS Metal runtime が Metal shader source に追加する共通量子化ヘッダーのパスを指定する。`mtl::Context` の構築時にパスを一度決定し、通常の shader compile ではそのファイル内容を source に埋め込む。環境変数はファイルの存在・内容を検証せず、空でないパスを選んだ場合に compile 時の読み込み対象となる。Metal 以外の backend の処理には参照がない。`engine/metal/src/mtl_rt.mm:139-150,183-192`、`engine/metal/src/resource_path.h:56-70`。
 
 ## 値と判定
 
-| 状態 | Strata の処理 |
-|---|---|
-| 未設定 | `<実行ファイルの場所>/metal/ggml-common.h` が存在すればそのパスを使う。なければ Metal build 時に埋め込んだ `third_party/ggml/ggml-common.h` のパスを使う。 |
-| 設定あり（空文字を含む） | 環境変数の文字列をそのままパスとして採用する。空文字は未設定扱いにならず、空パスになる。 |
-| 設定あり（非空） | 文字列全体をパスとして使う。数値・真偽値への変換、形式検査、範囲制限、CLI による上書きはない。 |
+`resource2` は引数名 `STRATA_GGML_COMMON` を `std::getenv` に渡し、返り値が null かどうかだけを見る。値の parse、trim、空白除去、大小文字変換はしない。未設定なら実行ファイル横のパッケージ内ファイル、次にビルド時に埋め込んだ既定パスを選ぶ。設定されている場合は値をそのままパスとして返すため、空文字も既定値への fallback ではなく空パスになる。`engine/metal/src/resource_path.h:56-70`。
 
-環境変数で指定したパスは、存在確認や package/default path への fallback をせず、`read_file()` に渡されます。読み取りに失敗すると stderr に `mtl: cannot read <path>` を出して `exit(2)` します。空文字の場合、共通ヘッダーの挿入条件が偽となるためファイルを開きません。代わりのパスも選びません。
+| build / 状態 | unset | 有効になる値（例） | 無効・特別な値（例） |
+|---|---|---|---|
+| 通常の Metal engine build | 実行ファイル横の `metal/strata-quant-common.h`、次に `metal/ggml-common.h` が存在すればそちら、どちらもなければビルド時の `include/strata/quant/strata-quant-common.h` | 読み込み可能なヘッダーファイルのパス。例: `/opt/strata/quant.h` | 空文字は共通ヘッダーの取り込みを無効にする。存在しないパスや読めないファイルは compile 時にエラー終了する。 |
+| Inkling-2 / HY4 の同梱 Metal runtime build | それらの build は `STRATA_GGML_COMMON_DEFAULT` を空文字で定義するため、実行ファイル横の候補がなければ空パス | 読み込み可能なヘッダーファイルのパス | unset は空パスとなり、共通ヘッダーを使わない。設定値が空でも同じく無効。 |
+
+任意の非空文字列は path として採用されるため、`1`、`true`、`0`、`0anything` も boolean 値ではなくファイル名（相対パスならそのままの相対パス）として扱われる。値自体の境界・数値形式の検査はない。空白だけの値も trim されず、そのまま path になる。`engine/metal/src/resource_path.h:58-69`。
 
 ## 有効になる条件
 
-この読み取りは `metal/src/mtl_rt.mm` の `Context` に実装され、macOS 専用の `metal/` CMake build が対象です。CMake は `STRATA_GGML_COMMON_DEFAULT` に Strata checkout 内の `third_party/ggml/ggml-common.h` のパスを埋め込みます。runtime ライブラリ、Metal engine の kernel library、および `strata_ds4` 用の runtime object に同じ default 定義を渡しています。
-
-パスが選ばれても、全てのカーネル compile で共通ヘッダーが使われるわけではありません。`compile()` はパスが空でなく、かつ prelude に `NO_GGML_COMMON` が含まれない場合だけヘッダーを追加します。たとえば `Window` の主な quant/MoE kernel library は既定 prelude で compile されるため挿入対象ですが、GDN、QSA、sampling、PLE など `NO_GGML_COMMON` を指定する library では対象外です。
+- Metal runtime を含む macOS の実行経路で `mtl::Context` が作られること。通常の Metal engine ではモデルを開く処理から Context を生成する（`engine/metal/src/engine/window.cpp:736-738`）。
+- 共通ヘッダーの内容が実際に追加されるには、選ばれたパスが空でなく、かつ当該 compile の prelude に `NO_GGML_COMMON` という部分文字列が含まれないこと。空パスまたはこの marker がある場合はヘッダーを読まない（`engine/metal/src/mtl_rt.mm:183-189`）。
+- 通常の Metal engine build は既定パスとして `include/strata/quant/strata-quant-common.h` を埋め込む。Inkling-2 / HY4 では既定値が空だが、環境変数が設定されれば `resource2` がその値を優先する（`engine/metal/CMakeLists.txt:31-40,168-174`; `engine/src/inkling2/metal/CMakeLists.txt:27-45`; `engine/src/hy4flash/metal/build_mac.sh:11-13`）。
 
 ## 実行時の詳細
 
-`Context` の構築時に `resource("STRATA_GGML_COMMON", ...)` が `std::getenv()` を呼びます。ここで選んだ文字列は `ggml_common_path` に保持され、以後の compile はこの保存値を使います。したがって、Context 構築後にプロセス環境を変更しても、この Context のパス選択は再評価されません。Strata 側に CLI 引数、設定ファイル、他の環境変数との優先順位はありません。
+値を読むのは `mtl::Context` の constructor 内の `resource2` 呼び出し一回で、選択した文字列は `ggml_common_path` に保存される。compile ごとには環境を読み直さないため、同じ Context の構築後にプロセス環境を変えても、その Context のパスには反映されない。新しい Context は構築時点の環境を参照する。`engine/metal/src/mtl_rt.mm:139-150`; `engine/metal/src/mtl_rt.h:138-145`。
 
-実行ファイル横の package fallback の存在確認には `stat()` を使います。環境変数が設定済みなら、この package fallback の確認処理には進まず、環境値が優先されます。既定で選ばれた path または環境指定 path のファイルを読めないと `read_file()` が終了コード 2 でプロセスを終了します。ファイルを読めても Metal source compile が失敗した場合は `mtl: compile failed (<device>, macOS <version>; <kernel>):` と compiler の説明を stderr に出し、終了コード 3 で終了します。後者のログは Metal compile 一般の失敗経路です。
+パス選択順は、設定された環境値、実行ファイル横の新名称 `metal/strata-quant-common.h`、旧名称 `metal/ggml-common.h`、ビルド時既定値。横の候補は `stat` で存在を確認するが、環境値およびコンパイル時既定値はこの時点で存在確認しない（`engine/metal/src/resource_path.h:38-70`）。compile 時にパスが非空で `NO_GGML_COMMON` がなければ `read_file` で内容を読み、Metal source に追加する。ファイルを開けない場合は stderr に `mtl: cannot read <path>` を出し、プロセスを status 2 で終了する。これは `compile_try` から呼ばれても同じで、fallback 用の戻り値にはならない（`engine/metal/src/mtl_rt.mm:26-34,183-192`）。
+
+Metal source のコンパイル自体が失敗した場合は `compile_try` が `-1` と compiler message を返す。通常の `compile` 経路は `mtl: compile failed (...)` を stderr に出して status 3 で終了する。この失敗経路は環境変数の値を検証するものではなく、選ばれたヘッダーを含む source の compile 結果である（`engine/metal/src/mtl_rt.mm:170-179,183-189`）。
+
+## ログと測定値
+
+環境変数を設定したこと自体を知らせるログはない。選択パスを読み込めない場合の stderr と終了 status 2、および後続の Metal compile 失敗時の stderr と status 3 は上記のとおり（`engine/metal/src/mtl_rt.mm:26-30,170-177`）。この変数に関する測定値は確認できなかった。
 
 ## 根拠
 
-- `metal/src/resource_path.h:27-40,43-54` — 実行ファイル directory の解決、package resource の存在確認、環境変数→package→compiled-in path の選択順序。
-- `metal/src/mtl_rt.mm:292-316` — Metal `Context` の初期化時に `STRATA_GGML_COMMON` を読み、パスを保存する箇所。
-- `metal/CMakeLists.txt:16-18,29-39,121-127,155-159` — macOS 限定 build と、runtime/engine/DS4 runtime への compiled-in default path 定義。
-- `metal/src/mtl_rt.mm:32-40,331-360` — ファイル読み込み失敗の stderr・終了コード、空でない path と `NO_GGML_COMMON` による挿入条件、Metal compile failure のログ・終了コード。
-- `metal/src/engine/window.cpp:581-587,2497-2500` — `Window` の通常 library compile と `NO_GGML_COMMON` を指定する compile の例。
-- `metal/src/mtl_rt.h:98-103,138-139` — compile API と Context 内の保持フィールド。
+- `engine/metal/src/resource_path.h:38-70` — 実行ファイル横の候補・既定パスとの優先順位、`getenv` の設定有無判定。
+- `engine/metal/src/mtl_rt.mm:26-34,139-150,170-192` — Context 構築時の読み取り、ヘッダー埋め込み、ファイル読み込み失敗と compile の観測経路。
+- `engine/metal/src/mtl_rt.h:138-145` — Context に保存する `ggml_common_path`。
+- `engine/metal/CMakeLists.txt:31-40,168-174`, `engine/src/inkling2/metal/CMakeLists.txt:27-45`, `engine/src/hy4flash/metal/build_mac.sh:11-13` — build ごとの既定パス。
+- `engine/metal/src/engine/window.cpp:736-738` — 通常の Metal window 初期化時の Context 生成。

@@ -1,49 +1,49 @@
 # `STRATA_METAL_GDN_FUSE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。候補一覧 `docs/envvars/000_envvers.md` に記載されている名前です。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Metal の prompt chain が GDN 層の4入力射影（`attn_qkv`、`attn_gate`、`ssm_alpha`、`ssm_beta`）を一つの連結 GEMM として処理する経路を、`STRATA_METAL_GDN_FUSE=0` で無効にします。無効時は各射影を個別に dequantize し、4回の GEMM を実行します。この切替は prompt chain の GDN 入力射影に対するもので、GDN scan や decode 側の別処理を選ぶものではありません。
+Metal の prompt chain における GDN 入力投影 4 本（qkv、z、alpha、beta）を、別々の GEMM 4 回ではなく、連結した重みと出力を使う GEMM 1 回にまとめるかを制御する。オフにすると個別の GEMM と通常の `gdn_pre` / `gdn_post` dispatch を使う。GDN scan と出力投影はどちらの分岐にも残る（`engine/metal/src/engine/window.cpp:100-105`; `engine/metal/src/engine/prompt_chain.inc:327-370`）。
+
+この変数の実読み取りは `gdn_fused_inputs()` の `std::getenv` 1 箇所で、同関数は Metal prompt chain の setup から呼ばれる。候補一覧には名前があるが、候補名だけではなくこの読み取りを根拠に環境変数として扱う（`engine/metal/src/engine/window.cpp:103-105`; `engine/metal/src/engine/prompt_chain.inc:113`）。
 
 ## 値と判定
 
-`getenv()` の結果を文字列全体で `"0"` と比較します。数値変換や trim、大文字小文字変換はありません。
+`std::getenv` の戻り値が null かどうかを見た後、設定値全体を `std::string` と `"0"` で完全一致比較する。数値 parse、空白除去、大小文字変換はしない。したがって空文字や `"false"` は「無効値」ではなく、オフ指定に一致しない値として扱われる（`engine/metal/src/engine/window.cpp:103-105`）。
 
-| 環境値 | `off` | fused 経路の選択（Apple M5 系の場合） |
-|---|---:|---|
-| 未設定 | false | 有効 |
-| 空文字 | false | 有効 |
-| 文字列がちょうど `0` | true | 無効 |
-| その他すべて（例: `1`, `00`, `0 `, `false`） | false | 有効 |
+| 条件 | unset | 融合をオフにする値 | オフ指定に一致しない値 |
+|---|---|---|---|
+| Metal prompt chain の setup | `off == false`。Apple M5 系では融合を選ぶ | 完全一致する `"0"` | 空文字、`"1"`、`"00"`、`"0anything"`、`"false"`、`" 0"`、`"0 "`、`"TRUE"` など。値の全体が `"0"` でない限り `off == false` |
 
-値が `0` 以外でも、後述の Apple M5 系という条件を満たさなければ fused 経路にはなりません。CLI 引数や別の環境変数による上書きは、この選択関数では確認できません。
+表の右欄でも、実際に融合するのは device 名が `"Apple M5"` で始まる場合だけ。それ以外は `gdn_fused_inputs()` が false を返す（`engine/metal/src/engine/window.cpp:104-105`）。
 
 ## 有効になる条件
 
-- Metal backend の `Window` が prompt を処理し、prompt chain の `pc_setup()` が呼ばれること。
-- 通常の Metal prompt routing で、`STRATA_METAL_PROMPT=window` が選ばれておらず、streaming でなく、prompt 長が `STRATA_METAL_PROMPT_MIN` 以上であること。後者の既定値は 32 です。条件を満たさない prompt は別経路へ進むため、この変数は適用されません。
-- `gdn_fused_inputs()` に渡されたデバイス名が `"Apple M5"` で始まること。M5 系以外では環境値にかかわらず false です。
-- 上記に加えて、`STRATA_METAL_GDN_FUSE` が未設定、空文字、または文字列 `"0"` 以外であること。
+- Metal エンジンがビルドされていること。Metal runtime の構成があり、`STRATA_METAL_ENGINE` が有効である必要がある。CMake は Metal framework をリンクし、`STRATA_GPU_METAL=1` を定義する（`engine/metal/CMakeLists.txt:82-93,103-110`）。
+- 実行 device 名が `"Apple M5"` で始まること。M4 やそれ以外の名前では、変数が未設定または `"0"` 以外でも融合しない（`engine/metal/src/engine/window.cpp:103-105`）。
+- prompt が Metal の大きな prompt chain に進むこと。`STRATA_METAL_PROMPT=window` なら通常の window path に留まり、streaming 中もこの `Window::prompt` 経路には入らない。通常の非 streaming prompt では `n >= STRATA_METAL_PROMPT_MIN` が条件で、後者の既定値は 32 行（`engine/metal/src/engine/window.cpp:3743-3749`）。
+- prompt chain 内の GDN layer（`l % G_QI != G_QI - 1`）で融合分岐が使われる。環境変数は fused GEMM を選ぶだけで、prompt chain 自体や Metal backend を有効化しない（`engine/metal/src/engine/prompt_chain.inc:322-328`）。
 
-この変数による選択に CLI の別スイッチはありません。値が何であっても Metal prompt chain が使われない実行では効果はありません。
-
-prompt の routing 条件は `metal/src/engine/window.cpp:3047-3077` にあります。streaming prompt は別の prompt GEMM / decode-window 経路へ進み、`STRATA_METAL_PROMPT=window` も decode-window 経路を選択します。
+この環境変数に対する CLI 引数の上書き分岐は確認できない。`STRATA_METAL_PROMPT` と `STRATA_METAL_PROMPT_MIN` は GDN 融合の値を上書きするのではなく、prompt chain に到達するかを左右する（`engine/metal/src/engine/window.cpp:3746-3749`）。
 
 ## 実行時の詳細
 
-`gdn_fused_inputs()` 内の関数ローカル `static const bool off` は、最初に関数が呼ばれたときに環境を読み、その後はプロセス内で値を保持します。環境変数は起動後に変更しても再評価されません。`Window::pc_setup()` は prompt buffer を初期化・拡張するときにこの関数を呼び、結果を `PromptBufs::fused` に保存します。すでに確保済みの buffer で要求サイズが収まる場合は setup を早期終了するため、選択を再計算しません。
+`prompt_run_rows()` が非 streaming・window fallback ではない prompt を `Window::prompt()` に渡し、`Window::prompt()` が `pc_setup()` を呼ぶ。初回 setup では prompt buffer `b.fused` に `gdn_fused_inputs(cx_->device_name())` の結果を保存する。環境値 `off` は関数内 `static const bool` の初回評価時に一度だけ読み込まれ、以後の環境変更は反映されない。device 名による M5 判定は setup 呼び出しごとに評価される（`engine/metal/src/engine/window.cpp:103-105,3743-3749`; `engine/metal/src/engine/prompt_chain.inc:49-65,113`）。
 
-`fused` が true の場合、4つの重みを `Wcat` の連結領域に dequantize し、`gemm(..., 16480, N)` を1回実行します。その結果を stride 16480 の `gdn_pre` と `gdn_post` に渡します。false の場合は4つの重みを個別 buffer に dequantize して、出力サイズ 10240、6144、48、48 の GEMM をそれぞれ実行し、通常 stride の `gdn_pre` / `gdn_post` を使います。
+融合時は GDN の 4 重みを `Wcat` の連続領域へ dequantize し、`gemm(..., G_GDNF, N)` を 1 回 dispatch する。連結出力 `yf` を fused `gdn_pre_f` と `gdn_post_f` に渡し、間の scan は同じ `gdn_scan_name()` 選択の dispatch を使う。非融合時は各重みを別 buffer に dequantize し、qkv / z / alpha / beta の GEMM を 4 回行って通常の `gdn_pre` / `gdn_post` を呼ぶ。分岐後は両方とも同じ `gdn` scan と `ssm_out` 投影へ進む（`engine/metal/src/engine/prompt_chain.inc:113-139,327-370`）。
 
-この環境変数専用のログ、警告、エラー出力は見つかりませんでした。setup 時には一般的な `strata metal: prompt kernels ... ready ...` ログが出ます。`STRATA_METAL_TRACE` または `STRATA_METAL_PROFILE` が設定されている場合は prompt の計測ログも出ますが、いずれも fused 選択を表示しません。ソースコメントはこの連結 GEMM が個別 GEMM と bit-identical と記していますが、ここではその実測・正確性を独立検証していません。
+## ログと測定値
+
+この変数の値や fused / non-fused の選択を直接表示するログ、専用の警告・終了経路は確認できない。prompt setup は stderr に `strata metal: prompt kernels (mac-kern's prompt chain) for chunks of %d rows, %s, ready in %.0f ms` を出すが、メッセージは融合選択を示さない。`STRATA_METAL_TRACE` または `STRATA_METAL_PROFILE` が設定されると prompt の時間と token/s を stderr に表示するが、これも GDN の fused 状態を報告しない（`engine/metal/src/engine/prompt_chain.inc:151-153`; `engine/metal/src/engine/prompt_chain.inc:608-611`）。
+
+ソースコメントには M5 family、T=2048 の GDN 入力投影について `3.09 -> 2.87 ms a layer` とあるが、モデル・具体的な機種・測定条件が揃っていないため、測定値として一般化して記載しない（`engine/metal/src/engine/window.cpp:100-102`）。
 
 ## 根拠
 
-- `metal/src/engine/window.cpp:81-87` — 変数の読み取り、文字列 `"0"` との完全一致判定、Apple M5 系のデバイス条件。
-- `metal/src/engine/window.cpp:141` — `PromptBufs` に fused 選択を保持するフィールド。
-- `metal/src/engine/prompt_chain.inc:49-60,71-79,92-98` — prompt buffer setup と fused / 個別用バッファの確保。
-- `metal/src/engine/prompt_chain.inc:204-252` — prompt の GDN 層での重み dequantize、GEMM 回数、`gdn_pre` / `gdn_post` 呼び分け。
-- `metal/src/engine/prompt_chain.inc:435-461` — prompt chain の呼び出し、buffer setup、chunk 処理、関連する一般ログ。
-- `metal/src/engine/window.cpp:3045-3077` — この prompt chain が選ばれる長さ・streaming・`STRATA_METAL_PROMPT` 条件。
-- `docs/envvars/000_envvers.md:1035` — 候補一覧への掲載。
+- `engine/metal/src/engine/window.cpp:100-105` — 対象関数、完全一致 `"0"` 判定、Apple M5 名の prefix 条件。
+- `engine/metal/src/engine/prompt_chain.inc:49-65,113-139` — setup 時の呼び出し、fused / separate buffer 構成。
+- `engine/metal/src/engine/prompt_chain.inc:322-370` — GDN layer の判定と fused / separate GEMM・kernel dispatch。
+- `engine/metal/src/engine/window.cpp:3735-3749` — prompt chain の呼び出しと streaming / window / 最小行数条件。
+- `engine/metal/src/engine/prompt_chain.inc:151-153,608-611` — stderr の prompt setup / trace ログ。
+- `engine/metal/CMakeLists.txt:82-110,150-168` — Metal runtime、compile definition、Metal engine の build 条件。

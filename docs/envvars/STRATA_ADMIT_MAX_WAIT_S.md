@@ -1,47 +1,43 @@
 # `STRATA_ADMIT_MAX_WAIT_S`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-サーバーの StrataEngine が新しい要求を制御ライン（engine に prompt を送って admission を進める排他区間）へ通す順番を調整します。`STRATA_ADMIT_SHORT_FIRST` が正数のとき、長い prompt もこの秒数以上待つと短い要求と同じ優先グループに入り、長い要求が短い要求に後回しにされ続けるのを避けます。この変数単独では順序を変えません。
+この変数は、サーバーが初回の prompt admission の順番を短い prompt 優先にするとき、長い prompt も待機時間が指定秒数に達すれば短い側として扱う閾値です。単独では順番を変えず、生成内容や prompt の読み取り方も変えません。対象実装は `terminal/serve/server.py` の `StrataEngine._admit_next` です（`terminal/serve/server.py:443-451,1912-1922`）。
 
 ## 値と判定
 
-値は Python の `float()` で変換されます。`_timeout_env()` は変換に失敗した場合に既定値を返し、変換後の値が `0` 以下なら `None` を返します。その後、この変数の代入式が `None` を `0.0` に置き換えます。
+サーバー起動時に `_timeout_env` が `os.environ.get(name, default)` の値を `float` に変換します。未設定なら `30.0`、空文字または数値に変換できない文字列なら `ValueError` を捕捉して `30.0` に戻ります。変換後の値が `<= 0` なら helper は `None` を返し、呼び出し側の `or 0.0` により `0.0` になります。正の値はそのまま使われ、範囲制限や丸めはありません（`terminal/serve/server_parts/base.py:260-265`; `terminal/serve/server.py:451`）。
 
-| 環境変数の状態・値 | `ADMIT_MAX_WAIT_S` | 順序判定での意味 |
-|---|---:|---|
-| 未設定 | `30.0` | 長い新規要求は到着から30秒以上で優先グループへ入る |
-| 空文字、または `float()` が変換できない文字列 | `30.0` | 変換失敗時の既定値 |
-| 正の数値文字列 | その数値 | 長い新規要求がその秒数以上待つと優先グループへ入る |
-| `0`、負数 | `0.0` | 長い新規要求も直ちに優先グループへ入り、全新規要求が到着順で比較される |
-| `nan` | NaN | `経過秒 >= ADMIT_MAX_WAIT_S` が成立しないため、長い要求は待ち時間で優先グループへ移らない |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| すべての OS（Python サーバー） | `30.0` 秒 | `float` が受理する正の有限値。例: `0.1`, `30`, ` 2.5 ` | `0`, `-1`, `-inf` は `0.0` 扱い。空文字、`true`、`0anything`、`1s` は変換失敗して既定値 `30.0` |
 
-`float()` が受理する数値表記（例: 指数表記や `inf`）も数値として保持されます。正の無限大では実際の有限な待ち時間は閾値に達しません。正の通常値に上限・clamp はありません。明示的な `+0` や `-0` も `0.0` として扱われます。無効文字列や空文字で警告は出ません。
+大文字小文字や空白の独自判定はなく、Python の `float` 変換に従います。前後の空白は数値文字列として受理されます。`nan` も変換自体は成功し、`nan <= 0` は偽なので `nan` のまま残ります。`inf` は正の値として残ります。どちらにも clamp や警告はありません。`nan` と `inf` は経過時間との `>=` 比較が成立しないため、長い prompt が待機時間だけを理由に短い側へ昇格しません（`terminal/serve/server_parts/base.py:260-265`; `terminal/serve/server.py:1921-1922`）。
 
 ## 有効になる条件
 
-- `serve/server.py` の `ADMIT_SHORT_FIRST` が正数であることが必要です。この値は `STRATA_ADMIT_SHORT_FIRST` を整数変換し、未設定・空文字・無効値を `0`、負数を `0` にします（同ファイル `336-338` 行）。0 の場合、`_take_control()` は `_admit_next()` による優先順判定を行いません。
-- StrataEngine に新規要求の初回 admission が到着し、制御ラインを待つ新規要求がある場合に働きます。すでに admission 済みの要求が slot を続行するために制御ラインへ戻る経路は `new=True` を渡さず、この新規要求の順序付けの対象外です。
-- backend、OS、GPU、build macro、モデルの内容による条件はありません。効果があるのは Python サーバーの StrataEngine の要求スケジューリングです。`MockEngine` や Strata の C++ エンジン実装でこの名前を読み取る箇所はありません。
-- CLI 引数によるこの閾値の上書きはありません。`STRATA_ADMIT_SHORT_FIRST` が機能を有効にする別環境変数です。
+- `STRATA_ADMIT_SHORT_FIRST` が正の整数として有効である必要があります。同変数が未設定、空文字、`0`、負数、整数に変換できない文字列の場合は `ADMIT_SHORT_FIRST` が `0` となり、admission 順序の制御自体が無効です。この場合、この変数の値も使われません（`terminal/serve/server.py:443-451,1809-1815`）。
+- Strata engine が実行時に batch slot を 1 個以上報告し、`generate` から `generate_batched` に入る必要があります。mock engine と、実効 batch slot がない Strata engine ではこの判定経路を通りません（`terminal/serve/server.py:2531-2541`; `terminal/serve/server.py:960-975`）。
+- 並べ替えの対象は `_take_control(..., new=True)` で登録される初回 admission です。slot 内での後続処理や、譲った control line を再取得する待機は対象外です（`terminal/serve/server.py:1787-1795,2022-2024,2041-2046`）。
+- `--queue-timeout` / `queue_timeout` が設定されている場合は、初回 engine turn を待つ別の期限が適用されます。期限切れは `QueueWaitExpired` になり、`STRATA_ADMIT_MAX_WAIT_S` はその期限を延長・上書きしません（`terminal/serve/server.py:8667-8670,5689-5692,1800-1801`）。
 
 ## 実行時の詳細
 
-`_timeout_env()` と `ADMIT_MAX_WAIT_S` は `serve/server.py` のモジュール初期化時に評価され、モジュール定数に保存されます。サーバープロセス起動後に環境を変更しても再読み込みされません。設定ファイルの `env` は engine 子プロセス向け環境を組み立てる際に追加・上書きされますが、この Python 定数を変更しません（`child_env()` は `os.environ` を複製した後に設定値を適用します）。
+サーバーのモジュール初期化時に定数 `ADMIT_MAX_WAIT_S` として読み取られ、そのプロセスの間 cache されます。リクエストごとの再読込はないため、実行中に環境を変更しても反映されず、値を変えるにはサーバーを再起動します（`terminal/serve/server.py:451`; helper は `terminal/serve/server_parts/base.py:260-265`）。CLI 引数による直接の上書きはありません。
 
-初回の `StrataEngine.generate()` は `_take_control(..., new=True)` を呼びます。`_take_control()` は待機要求の prompt 長、単調時計による到着時刻、新規要求かどうかを `wait_lens` に記録します。`STRATA_ADMIT_SHORT_FIRST > 0` なら、制御 lock を得る前と得た後に `_admit_next()` を確認し、自分が選ばれていなければ lock を譲って待ち直します。選択関数は新規要求のうち、prompt 長が `ADMIT_SHORT_FIRST` 以下か、待ち時間がこの変数の閾値以上の要求を先のグループとし、そのグループ内は到着順にします。どの要求の prompt を engine に送るかが変わりますが、コード注釈によれば変更するのは順序であり、読み取る内容ではありません。
+複数の初回 admission が control line を待つと、サーバーは到着時刻と prompt token 数を待機リストへ登録します。`STRATA_ADMIT_SHORT_FIRST=N` が有効な場合、prompt が `N` token 以下か、到着からこの閾値以上待った request を「短い側」として先に選びます。両条件に当てはまる request の間は到着順です。したがって既定の `30` 秒は長い prompt が短い prompt に追い越され続けるのを抑えます。値が `0.0` の場合、経過時間は常に `>= 0.0` となるため、待機中の全 request が短い側になり、実質的に到着順で選ばれます。順番が変わるだけで、engine が読む prompt や生成する token は変更されません（`terminal/serve/server.py:1791-1795,1912-1922`）。
 
-この変数の値について専用のログ、警告、終了・timeout 経路はありません。通常の制御 lock 待ちでは最大0.5秒間隔で再評価し、待機中の要求は10秒ごとに heartbeat を yield します。これは待ち時間を打ち切る timeout ではありません。別途、要求に queue deadline が設定され期限を過ぎた場合は `QueueWaitExpired("the inference queue wait deadline expired; retry later")` になりますが、その期限はこの環境変数からは設定されません。
+## ログと測定値
+
+この変数の値の採用・無効値への fallback・待機時間による昇格について、専用のログや警告はありません。数値変換できない値も既定値に戻るだけです（`terminal/serve/server_parts/base.py:260-265`; `terminal/serve/server.py:451,1921-1922`）。
 
 ## 根拠
 
-- `serve/server.py:315-320,339`: 数値変換、既定値、非正値の処理、およびモジュール定数への代入。
-- `serve/server.py:331-338`: `STRATA_ADMIT_SHORT_FIRST` の値変換と、この変数が待ち時間で長い prompt を優先対象にする説明。
-- `serve/server.py:1747-1755,1767-1780`: 制御ライン待ち要求の記録、新規要求だけの選択確認、lock 取得後の再確認。
-- `serve/server.py:1788-1795`: lock 待ちの再試行間隔と heartbeat。
-- `serve/server.py:1861-1871`: 対象要求の絞り込みと、prompt 長・待ち時間・到着順による選択。
-- `serve/server.py:1913-1917,1933-1937,2051-2064`: 初回 admission は `new=True`、再入場や譲り後の制御ライン取得は `new` を指定しないこと。
-- `serve/server.py:3747-3763`: engine 子プロセス環境は親環境の複製から始まり、設定ファイルの `env` が追加・上書きされること。
-- `docs/BATCHING.md:125`: `STRATA_ADMIT_SHORT_FIRST` の説明と、この変数の既定30秒という資料上の説明。実際の判定根拠は上記コード。
+- `terminal/serve/server_parts/base.py:260-265` — env helper の取得、`float` 変換、無効文字列の fallback、非正値の扱い。
+- `terminal/serve/server.py:443-451` — `STRATA_ADMIT_SHORT_FIRST` と対象変数の module-level 設定。
+- `terminal/serve/server.py:1787-1815` — 初回 admission の待機登録と順番判定。
+- `terminal/serve/server.py:1912-1922` — 待機時間と prompt 長による選択規則。
+- `terminal/serve/server.py:2531-2541` — 有効 batch slot がある場合の batched 経路。
+- `terminal/serve/server.py:5689-5692` — 別設定である queue timeout の期限設定。

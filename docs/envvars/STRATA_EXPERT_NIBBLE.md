@@ -1,51 +1,61 @@
 # `STRATA_EXPERT_NIBBLE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（2026-11-23 時点）。
 
 ## 役割
 
-対応する CUDA ビルドで、条件に合う IQ2_S / IQ3_XXS / IQ3_S の native expert layer の gate/up 部分を、VRAM の expert slot 内で 4-bit code に変換して保持します。down 部分とホスト上の pack は GGUF 形式のままです。対象 shape は `n_embd=2560`, `n_ff=640` で、形式と layer は `STRATA_EXPERT_NIBBLE_FMTS` と `STRATA_EXPERT_NIBBLE_SKIP` でも絞れます。
+`1` を指定すると、対応する native expert pack の対象層について、GPU expert cache の gate/up 部分を 4-bit slot に変換し、その slot 用 CUDA kernel を使います。down rows とホスト上の GGUF pack はそのままです。対象になり得る format は既定で IQ2_S (22)、IQ3_XXS (18)、IQ3_S (21) ですが、各層の gate/up の形式・形状が条件を満たすものだけです。未設定または `0` では通常の GGUF slot を使います。設定値は生成開始時に読み、CLI 引数で有効化する機能ではありません。成功時には `--adapt-swaps` / `--peer-adapt-swaps` を 0 にします。`engine/include/strata/core/expert_nibble.hpp:50-60, 213-218, 238-269`、`engine/src/program/generate.cpp:5440-5480`。
 
-この変数に対応する CLI スイッチや別の環境変数による値の上書きはありません。設定が有効でも、ビルド・GPU・モデル・実行オプションが条件を満たさなければ変換を使わず通常の GGUF slot で起動するか、後段で起動を拒否します。
+この変数は Strata のエンジン実装が直接 `std::getenv` で読みます。ソース全体の完全一致検索では、実際の読み取りは `expert_nibble.hpp` の `config()` にある一箇所です。ほかの一致箇所はコメント、ログ、補助ツール名または資料で、別の読み取り経路ではありません。
 
 ## 値と判定
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | OFF |
-| 空文字 | OFF |
-| 文字列全体が `0` | OFF |
-| 文字列全体が `1` | ON を要求 |
-| 上記以外の非空文字列 | 不正値。`expected 0 or 1` を理由に ON を使わない |
+`config()` の関数内 `static const Config` が最初に呼ばれたときに値を保存します。文字列全体を `strcmp` で比較し、数値変換や前後空白の除去はしません。`1` だけが ON、`0` だけが明示的 OFF です。未設定と空文字も OFF です。それ以外の非空文字列は無効値となり、設定値を含むエラーを保存します。したがって `true`、`01`、`0anything`、` 1`、`1 `、`TRUE` は無効です。`engine/include/strata/core/expert_nibble.hpp:238-269`。
 
-`strcmp` による文字列全体の比較です。したがって `01`、`true`、`1 `、` 1` は不正値で、数値変換・空白除去・先頭文字だけの判定はしません。不正値では `Config::error` に `STRATA_EXPERT_NIBBLE=<値>: expected 0 or 1` が設定されます。起動処理はこのエラーも対象変数が要求された状態として警告し、当該起動では機能を無効にして GGUF slot を使います。
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| 全 build | OFF | `1`（完全一致） | 空文字は OFF。それ以外の非空値（例: `true`、`0anything`、`01`、空白付き `1`）は設定エラー。`0` は OFF |
 
-読み取り結果は `config()` 内の `static const Config` に保存され、最初の呼び出し時に一度だけ読みます。プロセス実行中に環境を変更しても再評価されません。Strata の CLI 引数にこの値を置き換えるものはありません。
+無効値でも通常はプロセスを終了せず、対象機能をこの起動では OFF にして警告を出し、GGUF slot のまま起動を続けます。対象環境変数のエラーは `nib_asked` の判定にも使われるため、`1` 以外の無効値もこの警告経路に入ります。`engine/src/program/generate.cpp:5446-5461`。
 
 ## 有効になる条件
 
-すべての条件を満たしたときに変換を設定します。
+値が `1` でも、以下を満たさないと変換は有効になりません。
 
-- CUDA でビルドされ、`STRATA_EXPERIMENTAL_SM60` が定義されていること。さらに `STRATA_NATIVE_EXPERTS` が定義されていること。HIP と Metal、および通常の CUDA ビルドでは対応 kernel がありません。
-- 利用可能な全 CUDA device が compute capability 6.0 であること。
-- native expert pack であること。
-- `--peer-device`、remote expert cache、`--kv-grow`、`--vram-elastic` を使わず、`--expert-profile` があり、`--expert-cache 0` でないこと。
-- 競合経路を有効にする環境値がないこと。`env_conflicts()` は非空値を調べ、`STRATA_MMQ_DIRECT` は `atoi()!=0`、`STRATA_PREFILL_MMQ` は `atoi()==0`、`STRATA_PF_FUSED` と `STRATA_EXPERT_V2` は先頭文字 `1`、`STRATA_FS_SLOTS` は `atoi()>0`、`STRATA_KV_GROW` は先頭文字が `0` 以外、`STRATA_EXP_MODE` は `atoi()` の値が 0 と 8 以外なら競合とします。
-- pack に、形式・shape・レイアウトが対応する変換対象 layer が少なくとも一つあること。形式の既定値は ggml type `22,18,21`（IQ2_S, IQ3_XXS, IQ3_S）で、`STRATA_EXPERT_NIBBLE_SKIP` に指定した layer は対象外です。
-- prompt 経路が各変換対象 layer を対応する MMQ で読み、必要な行列レイアウトを満たすこと。prompt MMQ がない、WMMA-only、fused prompt kernel が適用される、または行列サイズが pack と一致しない場合は使いません。
-
-条件不足が開始前に分かると、stderr に `WARNING: STRATA_EXPERT_NIBBLE is off for this start: ...; the expert slots stay GGUF blocks` を出し、変換を解除して通常経路で続行します。profile fill の後で初めて確認できる条件もあります。全 layer の全 expert が担当 GPU の VRAM に resident でなければ、理由を stderr に出して終了コード 1 で起動を拒否します。条件を満たした後は cache slot を seal し、`--adapt-swaps` と peer adaptive swaps を 0 に強制します。
+- **Build と GPU:** `STRATA_EXPERIMENTAL_SM60` を有効にした CUDA build で、`STRATA_NATIVE_EXPERTS` も定義されていること。HIP、Metal、またはその macro のない build では拒否理由を警告し、通常 slot に戻します。さらに実行時に見える CUDA device が 1 台以上あり、検査対象となる全 CUDA device が compute capability 6.0 である必要があります。`engine/include/strata/core/expert_nibble.hpp:33-38`、`engine/src/program/generate.cpp:3403-3424`。
+- **モデルと対象層:** native pack が必要です。各変換層は既定形式または `STRATA_EXPERT_NIBBLE_FMTS` に列挙された形式で、`n_embd=2560`、`n_ff=640`、想定された gate/up/down の配置、NVFP4 tail なし、down 部分が 16-byte 単位という条件を満たす必要があります。`STRATA_EXPERT_NIBBLE_SKIP` に列挙した層は GGUF slot に残ります。候補層が一つもなければ警告して機能を OFF にします。`engine/include/strata/core/expert_nibble.hpp:250-265, 315-356`、`engine/src/program/generate.cpp:5451-5461`。
+- **起動オプション:** `--peer-device`、`--expert-cache-device1..3` による remote expert cache、`--kv-grow`、`--vram-elastic` は GGUF slot を使うため同時利用できません。`--expert-profile` が空、または `--expert-cache 0` でも変換できません。`engine/src/program/generate.cpp:3425-3435`。
+- **他の設定:** `STRATA_MMQ_DIRECT` は `atoi` の結果が非 0、`STRATA_PREFILL_MMQ` は `atoi` の結果が 0、`STRATA_PF_FUSED` と `STRATA_EXPERT_V2` は値の先頭文字が `1`、`STRATA_FS_SLOTS` は `atoi` の結果が正数、または `STRATA_EXP_MODE` は `atoi` の結果が 0/8 以外なら、prompt または expert 経路が GGUF slot と両立しないため警告して OFF にします。たとえば `STRATA_PREFILL_MMQ=abc` は `atoi` が 0 となるため拒否条件です。各判定の根拠は `engine/include/strata/core/expert_nibble.hpp:277-298` です。`engine/include/strata/core/expert_nibble.hpp:277-298`。
+- **Prompt 経路:** 変換層すべてが prompt MMQ gather を使えなければなりません。MMQ がない層の FP16 dequant、WMMA tile、対応する fused kernel、または GGUF 行列配置と一致しない MMQ 行列があれば不適合です。`STRATA_MMQ_DIRECT` もここで拒否されます。`engine/src/prefill/prefill.cpp:3915-3938`。
+- **常駐と chunk:** profile fill 後に、全層の全 expert がその層を実行する GPU の cache に常駐できなければ開始を拒否します。prompt path が cache slot を借りる場合や、機能 OFF 時と異なる prompt chunk が必要な場合も開始を拒否します。serve 経路の chunk 検査では、明示した `--prefill N` はその N を維持する必要があります。`engine/src/program/generate.cpp:9957-9989, 12812-12843, 23961-23965`。
 
 ## 実行時の詳細
 
-起動処理は pack の expert layout を読み込んだ後に設定を判定し、slot サイズの見積もりより前に per-layer table を設定します。変換対象 slot は GGUF blob より大きくなる場合があり、そのサイズを cache の容量見積もりにも使います。profile fill 時には対象 pair を通常の slot copy ではなく 4-bit fill に渡します。GPU 側で item の往復変換と slot からの GGUF block 再構築を照合し、起動時には代表 slot も読み戻して検査します。fill や検査のエラーは stderr に出し、終了コード 1 になります。
+`config()` は初回呼び出し時に対象値と関連する `STRATA_EXPERT_NIBBLE_RECHECK`、`STRATA_EXPERT_NIBBLE_FMTS`、`STRATA_EXPERT_NIBBLE_SKIP` をまとめて読み、静的に保持します。プロセス起動後に環境を変更しても再読込されません。エンジンは expert layout の読込後、GPU cache の slot 見積もり・確保より前に適用可否を検査します。理由があれば `set_layers({})` に戻し、理由がなければ層ごとの slot table を設定します。`engine/include/strata/core/expert_nibble.hpp:238-269, 345-369`、`engine/src/program/generate.cpp:5355-5368, 5440-5464`。
 
-全 expert の VRAM 常駐が確認されると、`all ... experts ... are VRAM-resident; the expert caches are sealed` と stderr に出します。serve の prompt chunk が通常経路と異なる、prompt が expert-cache slot を借りる、といった条件は後段で検出されると `STRATA_EXPERT_NIBBLE refuses the start` の理由を出して終了コード 1 になります。prompt 経路は専用 buffer を使い、変換 slot を GGUF block として扱う経路には進みません。
+有効な場合、profile から cache を一度だけ埋めるとき、対象層の GGUF blob を CUDA 上で 4-bit slot に変換します。変換時に各 item の再 decode 比較と、slot から再構築した GGUF block と元 blob の比較を行い、slot hash を記録します。profile fill と検証に失敗した場合は stderr に理由を出して `generate` を終了コード 1 で返します。layer split では stage ごとに同じ fill を行います。成功後は全 expert の VRAM 常駐を確認して cache を seal し、slot の書き換えを防ぎます。`engine/src/program/generate.cpp:3162-3273, 3290-3314, 9671-9763, 9882-9931, 9957-9989`。
+
+`STRATA_EXPERT_NIBBLE_RECHECK=1` は別の補助スイッチで、serve では各完了 request の後に全変換 slot の hash をロード時の値と比較します。不一致理由を stderr に出し、layer が特定できる場合は `nib::fatal` が `abort()` します。これは対象変数自体の値の再読込ではありません。`engine/include/strata/core/expert_nibble.hpp:247-248, 394-400`、`engine/src/program/generate.cpp:23305-23324`。
+
+## ログと測定値
+
+適用条件を満たさないときは stderr に次の形式で警告し、GGUF slot で続行します（`%s` は実際の拒否理由）。
+
+```text
+strata generate: WARNING: STRATA_EXPERT_NIBBLE is off for this start: %s; the expert slots stay GGUF blocks
+```
+
+有効時は変換層数・format 別内訳・追加 VRAM 量・adaptive tier を無効化したことを stderr に表示します。fill の確保・変換・検証失敗は理由付き stderr の後に終了コード 1 となり、常駐不足や prompt 条件不適合もそれぞれ理由を stderr に出して終了コード 1 となります。`engine/src/program/generate.cpp:5457-5480, 9700-9705, 9732-9763, 9976-9989, 12837-12843`。
+
+不正な slot を GGUF block として扱う経路に到達した場合の最終防護は `stderr` に `strata: STRATA_EXPERT_NIBBLE: layer ... reached ... - stopping` を出して `abort()` します。`engine/include/strata/core/expert_nibble.hpp:394-400`。
+
+`docs/OLDER_GPUS.md:200-231` の適用条件・必要な常駐・prompt 制約は上記の実装と概ね一致します。実装では事前の互換性不足は警告して機能を OFF にし、profile fill 中の round-trip / GGUF 比較不一致は理由を stderr に出して終了コード 1 を返します。資料記載の性能値はここでは再測定・一般化していません。
 
 ## 根拠
 
-- 候補名の全参照検索では、文書・コメント・build macro 名としての記載もありますが、実際の環境値読み取りは `include/strata/core/expert_nibble.hpp:239-270` の `std::getenv("STRATA_EXPERT_NIBBLE")` 1 箇所です。同ブロックに既定値、厳密な文字列判定、エラー文字列、static cache と関連設定の読取があります。
-- ビルド条件は `include/strata/core/expert_nibble.hpp:33-38, 2666-2691`、CMake の experimental CUDA option は `CMakeLists.txt:236-283` です。GPU capability、CLI 条件、競合環境変数は `src/program/generate.cpp:2682-2718` と `include/strata/core/expert_nibble.hpp:272-299` にあります。
-- pack layout と layer 条件、非 native pack の拒否理由は `include/strata/core/expert_nibble.hpp:315-357`。起動時の fallback 警告と adaptive tier の無効化は `src/program/generate.cpp:4159-4200` です。
-- prompt MMQ の条件は `src/prefill/prefill.cpp:2642-2665`。後段の prompt chunk / slot loan 拒否は `src/program/generate.cpp:9722-9751`、profile fill の変換と検査は `src/program/generate.cpp:7306-7371`、全 expert の常駐確認と cache seal は `src/program/generate.cpp:7516-7548` です。
-- `docs/OLDER_GPUS.md:205-236` の GP100 向け説明は、対応ビルド、全 expert の常駐、競合時の warning fallback、後段での起動拒否、adaptive tier 無効というコード上の条件と整合します。`docs/DETAILS.md` にはこの変数の説明を確認できませんでした。性能値や正確性を独自に測定したものとしては記載していません。
+- 値の読み取り、cache、関連変数: `engine/include/strata/core/expert_nibble.hpp:211-298`
+- Build、GPU、CLI 条件と拒否理由: `engine/src/program/generate.cpp:3400-3437`
+- 層ごとの形式・形状判定と slot table: `engine/include/strata/core/expert_nibble.hpp:315-356`
+- prompt 経路の適合確認: `engine/src/prefill/prefill.cpp:3915-3938`
+- 変換、比較、read-back と異常経路: `engine/src/program/generate.cpp:3162-3348, 9671-9763, 9882-9931`
+- 常駐、serve の prompt 制約、hash 再検査: `engine/src/program/generate.cpp:9957-9989, 12812-12843, 23305-23324`

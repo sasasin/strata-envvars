@@ -1,51 +1,46 @@
 # `STRATA_GDN_TC_TILES`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-CUDA の GDN（DeltaNet recurrence）tensor-core scan が通常の scan を実行できず split scan に fallback するとき、1 value head あたりの tile 数を指定します。この変数だけでは tensor-core scan は有効になりません。通常の CUDA recurrence dispatch に入り、別変数 `STRATA_GDN_TC` が有効で、token 数が 128 以上で、通常 scan が失敗した場合に初めて tile 数が split scan の実行に影響します。
+CUDA の GDN tensor-core split scan で、value head あたりの tile 数を 1 または 2 に選びます。設定値は tensor-core scan 全体を有効にするスイッチではありません。通常の非 split tensor-core scan が成功した場合、この値による tile 数の切り替えは使われません。実装は `gdn_tc_tiles()` とその呼び出し元 `gdn_recurrence_impl()` です（`engine/src/prefill/kernels.cu:1339-1355, 3198-3202, 3227-3237`）。
 
 ## 値と判定
 
-実装は `std::atoi` で文字列を整数化し、全体の妥当性を検証しません。値が正なら `1` または `2` に制限します。
+`std::getenv` で値を取得し、`std::atoi` で整数化します。文字列全体の検証はなく、`atoi` が読む先頭の整数部分で判定します。未設定は `0`、空文字や数字で始まらない文字列も `atoi` が `0` を返すため自動選択です。変換後が正なら `1` は 1 tile、`2` 以上は 2 tiles に丸められます。変換後が 0 以下なら GPU の SM 数による自動選択です。したがって `1tail` は 1 tile、`2tail` や `99` は 2 tiles、`0`・`-1`・`true`・空文字は自動選択となります。先頭の空白や符号は `atoi` の規則で処理され、大文字小文字は判定対象になりません（`engine/src/prefill/kernels.cu:1340-1355`）。
 
-| 環境値 | `atoi` の結果 | tile 数 |
-|---|---:|---:|
-| 未設定 | 変換しない | 自動判定。GPU の SM 数が 96 以上なら 2、それ以外は 1 |
-| 空文字 | 0 | 自動判定 |
-| 数値として 1 | 1 | 1 |
-| 数値として 2 以上 | 正数 | 2 |
-| 0、負数、数値に変換できない文字列 | 0 以下 | 自動判定 |
-| 数字の後ろに文字がある値（例 `2x`） | `atoi` が読む先頭数値 | その結果に従う（`2x` は 2 tiles） |
-
-範囲外の整数文字列に対する `atoi` の結果は C/C++ の仕様上保証されないため、特定の値として扱えるとは記しません。値の大文字小文字や空白を別途検査するコードはありません。
-
-テスト用 `GdnProbe` が設定され、その `tc_tiles` が正なら、probe の値を先に 1/2 に丸めて使い、環境変数を読みません。通常の engine 経路では probe は設定されません。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA の split scan で環境値を参照 | 自動選択。SM 数が 96 以上なら 2、それ未満なら 1 | 整数化結果 `1` は 1 tile、`2` 以上は 2 tiles | 整数化結果 0 以下は自動選択（例: `0`, `-1`, `true`, 空文字） |
+| GDN probe の override | 正の `tc_tiles` がなければ環境値を使う | probe 値 1 は 1 tile、2 以上は 2 tiles | 0 以下の probe 値は override にならず環境値へ進む |
 
 ## 有効になる条件
 
-- CUDA 用の `src/prefill/kernels.cu` の通常 dispatch が対象です。HIP 用コードではこの CUDA dispatch ブロックがコンパイル対象外です。
-- serial 出力付き経路、`T <= 0`、または `variant == 2` の経路では通常 dispatch に入らず、この変数は使われません。
-- `STRATA_GDN_TC` が `std::atoi` で非ゼロと判定され、かつ `T >= 128` のとき tensor-core scan が候補になります。`STRATA_GDN_TC` が未設定または 0 なら、この変数は tensor-core scan を開始させません。
-- 最初の通常 tensor-core scan が成功すれば、tile 数の指定はその実行に使われません。指定値が作用するのは通常 scan がエラーを返し split scan を試す場合です。
-- split scan が選べるかは別途 GPU の compute capability、SM 数、shared memory、scratch allocation に依存します。split scan も失敗すると、dispatch は有効なら chunked scan、それも選ばれなければ key-head / pipelined / columns kernel へ進みます。
+- CUDA の `gdn_recurrence_impl()` の経路で使われます。HIP ビルドではこの CUDA dispatch 区間はコンパイルされません（`engine/src/prefill/kernels.cu:3073-3080, 3177-3186`）。
+- 自動 dispatch では、別途 `STRATA_GDN_TC` が `atoi` で 0 以外になり、token 数 `T >= 128` のときに tensor-core 経路を試します。これは別環境変数による条件であり、この文書の変数だけではその経路は有効になりません（`engine/src/prefill/kernels.cu:3186-3190, 3227-3237`）。
+- まず通常の tensor-core scan を試し、成功した場合は終了するため tile 数の指定は適用されません。通常 scan が使えず split scan に進んだ場合に tile 数が渡されます（`engine/src/prefill/kernels.cu:3227-3237`）。
+- split scan 自体にも GPU 条件があります。compute capability major が 8 以上、通常実行では 48 以上の SM、必要な shared memory が必要です。満たさない場合 `gdn_rec_tc()` はエラーを返します（`engine/src/prefill/kernels.cu:1365-1382`）。
+- probe がある場合は `tc_tiles > 0` が環境値より優先します。probe はスレッド単位の試験・計測用フックで、通常 engine には probe がないとヘッダーに記載されています（`engine/include/strata/prefill/gdn_probe.hpp:3-10, 29-44`; `engine/src/prefill/kernels.cu:1340-1344`）。
 
 ## 実行時の詳細
 
-`gdn_tc_tiles()` は通常 dispatch の `STRATA_GDN_TC` 分岐より前で呼ばれるため、probe override がない場合は tensor-core scan が有効でない呼び出しでも初期化されます。関数内の `static const int` は環境値を一度だけ読み取り、その結果をプロセス内に保持します。自動判定時の SM 数も device ごとに cache されます。したがって、初回評価後にプロセスの環境値を変えても再評価されません。
+通常の CUDA recurrence dispatch 節では `gdn_tc_tiles()` が呼ばれますが、その結果が tile 数として使われるのは split scan に進む場合です。probe の正の override がなければ関数内 `static const int` を初回評価時に一度だけ環境から読み、以後その値を使います。したがって環境値の初回読み取りは split scan の実行より前になる場合があり、実行中に環境値を変更してもキャッシュは再評価されません。自動選択時の SM 数も `sms_of[dev]` にデバイスごとにキャッシュされます（`engine/src/prefill/kernels.cu:1340-1355, 3198-3202`）。
 
-通常 scan が失敗した後の split scan では、tile 数 2 かつ `STRATA_GDN_TC_NP` の有効値が既定の 3 の場合、value head ごとに 2 blocks を起動する別 kernel を使います。それ以外の組み合わせは 1 block/head の split kernel です（`STRATA_GDN_TC_NP` は 1、2 以外を 3 に置換）。出力 norm がある経路では、tile 数 1 かつ `STRATA_GDN_TC_FUSE` が有効な場合に限り norm を split scan 内で融合でき、tile 数 2 では後段の norm kernel に進みます。
+split scan の `np == 3` かつ出力 norm を融合しない場合、2 tiles は `HV * 2` CTA の scan kernel、1 tile は `HV` CTA の scan kernel を起動します。正規化との融合が可能なときは 1 tile のみ融合用ポインタを渡し、2 tiles のときは後続の出力 norm kernel に任せます。2 tiles 以外の split variant（`np == 1` または `2`）は別の分岐で起動します（`engine/src/prefill/kernels.cu:1405-1423, 3198-3202, 3207-3208, 3234-3237, 3268-3269`）。
 
-この環境変数専用のログ、警告、終了動作はありません。通常 dispatch では通常 scan または split scan が使えない場合に後続 kernel へ fallback します。テスト probe 経由では選択経路と理由を `GdnProbe` の出力欄に記録しますが、これは engine の利用者向けログではありません。kernel launch 後のエラーは通常の `check("gdn_recurrence")` に渡されます。
+通常の自動実行で tensor-core scan と split scan が使えないときは、dispatch は後続の chunked 経路、さらに key-head / pipelined / columns 経路へ進みます。forced probe path では適格でなければ何も起動せず、`check("gdn_recurrence (forced path not eligible: nothing launched)")` を通します（`engine/src/prefill/kernels.cu:3239-3261`）。
 
-`docs/DETAILS.md:1539-1545` は `STRATA_GDN_TC` の概要と測定値を記載していますが、`STRATA_GDN_TC_TILES` の値、fallback 条件、tile 数の効果は説明していません。本書では測定値や速度差を推定していません。
+## ログと測定値
+
+この環境変数の読み取りや tile 選択自体に対応するログ出力はありません。最終的な `check("gdn_recurrence")` は CUDA エラーを検査し、エラー時は `exit_device_error("prefill gdn_recurrence", ...)` に渡します。理由ログと選択結果を記録する probe は試験用構造体の出力であり、通常 engine のログではありません（`engine/src/prefill/kernels.cu:110-116, 3259-3271`; `engine/include/strata/prefill/gdn_probe.hpp:35-39`）。
+
+`docs/DETAILS.md` と `docs/GDN_CONTRACT.md` には親機能 `STRATA_GDN_TC` の説明がありますが、`STRATA_GDN_TC_TILES` 固有の測定値は確認できませんでした。そのため tile 数による性能差や数値結果は記載しません。
 
 ## 根拠
 
-- `src/prefill/kernels.cu:1279-1299`: tensor-core scan の tile 値の読み取り、`atoi`、1/2 への丸め、自動 SM 数判定と cache。
-- `src/prefill/kernels.cu:1308-1327,1348-1368`: scan の適用条件、split/non-split の shared memory 判定と scan kernel launch。
-- `src/prefill/kernels.cu:2986-3002`: CUDA dispatch、`STRATA_GDN_TC` 判定、probe、tile 値取得、および norm 融合の条件。
-- `src/prefill/kernels.cu:3003-3069`: forced probe 経路と通常経路、TC 失敗後の split/chunked/base kernel fallback、probe の結果記録。
-- `include/strata/prefill/gdn_probe.hpp:29-39`: probe の tile override と結果欄。`src/prefill/gdn_harness.cu:168-207` は harness が probe 値を渡して結果を記録する箇所。
-- `docs/DETAILS.md:1539-1545`: 関連する `STRATA_GDN_TC` の説明。tiles 変数についての記載はありません。
+- `engine/src/prefill/kernels.cu:1339-1355` — 環境値の変換、1/2 への丸め、自動選択、SM 数キャッシュ。
+- `engine/src/prefill/kernels.cu:1365-1382, 1405-1423` — split scan の適格条件と tile 数別 kernel launch。
+- `engine/src/prefill/kernels.cu:3198-3237, 3239-3271` — norm 融合、通常/split scan の dispatch、fallback、エラー検査。
+- `engine/include/strata/prefill/gdn_probe.hpp:3-10, 29-44` — probe override と probe の用途。
+- `docs/DETAILS.md:1795-1803`, `docs/GDN_CONTRACT.md:62-70` — 親機能の説明との照合。対象環境変数固有の仕様・測定値は確認できない。

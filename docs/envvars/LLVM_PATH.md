@@ -1,39 +1,42 @@
 # `LLVM_PATH`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata のサーバーは HIP backend の子エンジン用環境を作るとき、`LLVM_PATH` が空でなく、指すパスが存在しない場合にその項目を環境から削除し、stderr に通知します。存在するパスはそのまま子エンジンへ渡します。このコードは値を LLVM の場所の選択や検証に使わず、ファイル種別や中身も調べません。子エンジンや HIP runtime が受け取った値をどう使うかは、この調査の対象外です。
+`LLVM_PATH` は Strata の推論設定や LLVM の場所を選ぶための変数ではない。`strata serve` が HIP backend 用の子プロセス環境を組み立てる際、値が空でなく、指すパスが存在しない場合に限り、その変数をエンジンへ渡さないよう削除する。削除対象を AMD runtime 起動前に取り除くガードである（`terminal/serve/server.py:3870-3925,3928-3940`）。
 
 ## 値と判定
 
-`child_env()` はまずサーバーの `os.environ` をコピーし、その後設定ファイルの `env` 項目を文字列化して同名キーにも上書きします。HIP backend の場合だけ `hip_env_guard()` が `env.get("LLVM_PATH")` を見ます（`serve/server.py:3747-3760,3782-3783`）。
+`child_env()` は呼び出しごとに親プロセス環境を辞書へコピーし、設定の `env` があればその値を文字列化して上書きした後、HIP backend なら `hip_env_guard()` を呼ぶ。helper は `env.get("LLVM_PATH")` の真偽値を確認し、真なら `Path(v).exists()` を調べる。文字列の parse や大文字小文字の比較はしない（`terminal/serve/server.py:3873,3890-3891,3917-3918,3935-3940`）。
 
-| 子環境の値 | Strata の処理 |
-|---|---|
-| キーなし | 何もしない。 |
-| 空文字 | 偽として扱われ、パス検査も削除も行わない。空文字のキーは子環境に残る。 |
-| 空でない値で、存在するパス | そのまま残し、子エンジンへ渡す。ファイルかディレクトリかは判別しない。 |
-| 空でない値で、存在しないパス | キーを削除し、`LLVM_PATH=<値> does not exist: not passed to the engine` と記録する。 |
+| 条件 | unset | 値の扱い | 無効・境界の例 |
+|---|---|---|---|
+| `backend == "hip"` | 子環境にも未設定 | 空でない値のパスが存在すれば、その値を保持してエンジンへ渡す | 空文字は未設定と同様に保持。`0`、`false`、空白だけの文字列も非空なのでパスとして調べ、存在しなければ削除 |
+| backend が `hip` 以外 | 親環境または設定 `env` の値をそのまま子環境に含める | このガードによる存在確認・削除なし | このガードでは値を判定しない |
 
-文字列の parse、大小文字変換、空白除去、正規化、長さや数値の境界判定はありません。パスの有無は `Path(v).exists()` の結果で決まり、存在しない値は警告扱いで除去されます（`serve/server.py:3823-3827`）。
+`Path.exists()` はファイルとディレクトリを区別せず存在を判定する。相対パスはサーバープロセスの現在の作業ディレクトリを基準に解決される。`LLVM_PATH` 固有の既定値や別値への fallback はない（`terminal/serve/server.py:3936-3940`）。
 
 ## 有効になる条件
 
-- `child_env()` が呼ばれ、`cfg["backend"] == "hip"` の場合に限り検査します。HIP 以外の backend ではこの guard は呼ばれず、コピー元の環境または設定ファイルで指定された値がそのまま環境辞書に残ります（`serve/server.py:3782-3783`）。
-- 通常の `--engine strata` 起動で環境を作り、StrataEngine に渡します（`serve/server.py:9186-9194,1077-1079`）。split serving では prefill/decode の各エンジン、replica serving では各 replica について `child_env()` を呼びます（`serve/server.py:8704-8710,8770-8777`）。
-- 同名キーが設定ファイルの `env` にあれば、継承環境をコピーした後で設定値が優先します。したがって設定側が空文字なら継承側の値にかかわらず guard は削除しません（`serve/server.py:3750,3759-3760,3823-3827`）。この guard に CLI 引数との優先順位はありません。
+- `child_env()` の呼び出し設定で `cfg.get("backend") == "hip"` の場合にだけガードが動く。ソースに OS 判定はない（`terminal/serve/server.py:3917-3918`）。
+- `strata serve --engine strata` のエンジン起動環境で使われる。レプリカ、split、fallback の各エンジンも `child_env()` から環境を作る（`terminal/serve/server.py:8870-8878,8304-8308,8334-8336,8402-8403`）。
+- 親プロセスから継承した値より設定の `env` が優先され、その後に HIP ガードが適用される。したがって設定側が存在しないパスで上書きした場合も削除対象になる（`terminal/serve/server.py:3873,3890-3891,3917-3918`）。
+- エンジンを直接起動する場合や、HIP backend 以外の場合、この `hip_env_guard()` による処理はない。
 
 ## 実行時の詳細
 
-チェックは子プロセスの環境辞書を作るたびに実行されます。値はモジュール静的変数などには cache されません。作成された辞書は `StrataEngine` の `popen(..., env=env)` に渡されるため、その後に親プロセスの環境が変わっても、すでに起動したエンジンの環境には反映されません（`serve/server.py:3747-3750,3782-3783,1077-1079`）。
+値はプロセス起動時に一度固定されるのではなく、`child_env()` がエンジン用の環境辞書を作るたびに、その時点の `os.environ` のコピーから評価される。関数内 cache はない。チェック後は親の `os.environ` を変更せず、子に渡す辞書だけから不在パスを除く（`terminal/serve/server.py:3873,3935-3940`）。
 
-存在しない非空パスがあれば、guard はキーを削除して変更内容を返し、`strata serve: AMD: LLVM_PATH=<値> does not exist: not passed to the engine` を stderr に flush します。これは警告と環境値の除去であり、guard 自体は起動を拒否しません（`serve/server.py:3823-3827,3843-3845`）。有効なパスや空文字についてはこの変数に関するログを出しません。
+存在する値または空文字は子環境に残り、存在しない非空値は削除される。`StrataEngine` にはこの環境辞書が渡される（`terminal/serve/server.py:8279-8280,8307-8308,8334-8336,8402-8403,8877-8878`）。Strata ソースが記述している効果は、この値を除去または転送するところまでであり、外部 runtime が値をどう解釈するかはここでは扱わない。
+
+## ログと測定値
+
+存在しない非空値を削除した場合、stderr に `strata serve: AMD: LLVM_PATH=<値> does not exist: not passed to the engine` を出す。未設定、空文字、存在するパスではこの変数についてログは出ない。削除自体は終了や失敗ではなく、子プロセスへの引き渡し方の変更である（`terminal/serve/server.py:3938-3940,3956-3958`）。該当する測定値はない。
 
 ## 根拠
 
-- `serve/server.py:3747-3760,3782-3783` — 継承環境のコピー、設定 `env` の上書き、HIP backend での guard 呼び出し。
-- `serve/server.py:3815-3827,3843-3845` — `LLVM_PATH` を含む検査、削除条件、stderr の文面。
-- `serve/server.py:8704-8710,8770-8777,9186-9194,1077-1079` — replica / split / 通常起動での環境生成と子エンジンへの引き渡し。
-- `docs/TROUBLESHOOTING.md:305-310` — Windows HIP 起動時の説明。実際の処理条件とログ文面の根拠は上記コード。
+- `terminal/serve/server.py:3870-3925` — 子環境の生成、設定値の上書き、HIP 条件でのガード呼び出し。
+- `terminal/serve/server.py:3928-3958` — パスの存在判定、値の削除、stderr 通知。
+- `terminal/serve/server.py:8272-8308,8334-8336,8402-8403,8870-8878` — ガード済み環境をエンジンへ渡す経路。
+- `docs/TROUBLESHOOTING.md:304-309` — Windows AMD の起動問題についての利用者向け説明。実際の適用条件と分岐は上記コードに従った。

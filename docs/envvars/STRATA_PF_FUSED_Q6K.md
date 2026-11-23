@@ -1,52 +1,55 @@
 # `STRATA_PF_FUSED_Q6K`
 
-調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Q6_K の MoE gate/up と Q8_0 down の組を、Strata の fused prompt expert int8 kernel で処理する opt-in スイッチ。CUDA では `native_kernel<T_Q6_K, true>` と Q8_0 down kernel の両方をセットアップし、対応 layer を MMQ などの通常経路からこの組へ切り替える。HIP では gfx12 の同じ組に `native_w11_kernel` を使う。変数単独では他の Q6_K の組や Q8_0 down を有効にしない（`src/prefill/moe_fused_iq.cu:2488-2494,2924-2928,3009-3013,3212-3213,3305-3307`）。
+Q6_K 量子化の MoE gate/up と Q8_0 down の組を、Strata の fused prompt expert kernel で処理する opt-in スイッチ。対象はこの量子化ペアであり、Q6_K down や他の down 形式まで対象を広げるものではない。CUDA では `native_kernel<T_Q6_K, true>` と Q8_0 down kernel、HIP では gfx12 の `native_w11_kernel<T_Q6_K, true>` へ到達する。設定は生成処理やモデル全体の量子化を変えない。`native_supported()` がこのペアを fused 対象と判定しない場合、上位の prefill planner がその層を別経路へ振り分ける。
 
-通常の `strata` の fused prompt path は `STRATA_PF_FUSED` の全体判定も通る。`strata-q36` は起動時にこの変数を未設定なら `1` にするため、このエンジンでは値が有効な Q6_K/Q8_0 layer の候補となり、最終的な layer 選択は同エンジンの card rule に従う（`src/prefill/moe_fused_iq.cu:2891-2908`; `src/qwen35/q36_engine.cu:3950-3957,1407-1410`; `src/prefill/moe_fused_iq_q36.cu:126-139`）。
+CUDA と HIP の両方で値を読む箇所があるが、利用できる GPU 条件は異なる。通常の CUDA/HIP ビルドでは未設定は opt-in なし。例外として、MMQ なしのビルドでは prompt 経路の起動初期化が未設定時に `1` を設定し、Qwen3.6 エンジンは両方のエントリで未設定時に `1` を設定する。いずれの初期化も既に設定された値を上書きしない。`engine/src/prefill/prefill.cpp:223-255`、`engine/src/qwen35/q36_engine.cu:5431-5454`、`engine/include/strata/prefill/own_only_switches.hpp:18-25,48-56,75-82`
 
 ## 値と判定
 
-CUDA と HIP の読み取り関数はいずれも `std::getenv` の戻り値が非 null で、先頭文字が `'1'` の場合だけ true とする。文字列全体の parse、数値検証、大文字小文字比較はしない（`src/prefill/moe_fused_iq.cu:2276-2278,2684-2687`）。
+CUDA と HIP の読み取り関数はいずれも `getenv()` の結果が null でなく、先頭バイトが文字 `'1'` の場合だけ true とし、その結果を関数内 `static const bool` に保存する。文字列全体や数値としての妥当性は検査しない。したがって `1`、`10`、`1anything` は true、`0`、`true`、` 1`、空文字は false。大文字小文字の変換、空白除去、数値変換、境界値処理はない。CUDA は `q6k_cuda_requested()`、HIP は `q6k_hip_requested()` で読み取る。`engine/src/prefill/moe_fused_iq.cu:2733-2737,3196-3202`
 
-| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+| 条件 | 未設定 | 有効になる値（例） | 無効になる値（例） |
 |---|---|---|---|
-| CUDA/HIP の直接読み取り | false | `1`, `10`, `1anything`, `1 true`（先頭が `1`） | 空文字、`0`, `0anything`, `true`, `01`, ` 1` |
-| `STRATA_PREFILL_FUSED` が定義され `STRATA_PREFILL_MMQ` が未定義の own-only build | 起動時に `1` を設定する | ユーザーが事前設定した値はそのまま。先頭が `1` なら有効 | 事前設定した空文字や `0...` は保持され、無効 |
-| `strata-q36` | `main` のモデル読み込み前に `1` を設定する | ユーザー設定を保持し、先頭が `1` なら有効 | 空文字や `0...` は上書きせず、無効 |
+| 通常の CUDA/HIP prefill | 無効 | `1`, `1anything` | 空文字、`0`, `true`, ` 1` |
+| `STRATA_PF_OWN_ONLY` の prompt build | 起動時に `1` を補う | 既存値は維持し、先頭が `1` なら有効 | 空文字を含む既存値で先頭が `1` でなければ無効 |
+| Qwen3.6 エンジン（`strata --model` 経由と standalone `strata-q36`） | `run` の初期化で `1` を補う | 既存値は維持し、先頭が `1` なら有効 | 空文字を含む既存値で先頭が `1` でなければ無効 |
 
-own-only build の初期化は環境に名前が存在するかだけで設定済みと判断するため、空文字もユーザー設定として保持する。非 Windows は `setenv(..., "1", 0)`、Windows は未設定時だけ `_putenv_s` する。`strata-q36` も非 Windows では overwrite 無効の `setenv`、Windows では `getenv(...) == nullptr` の場合だけ `_putenv_s` する（`include/strata/prefill/own_only_switches.hpp:48-56`; `src/prefill/prefill.cpp:204-237`; `src/qwen35/q36_engine.cu:3950-3957`）。
+2 種類の起動時既定値設定は `setenv(..., "1", 0)` 相当であり、環境変数が空文字でも既設定とみなして維持する。Qwen3.6 は `q36_entry_switches()` にこの名前を含め、MMQ の有無にかかわらず unset のときに既定値を入れる。`engine/include/strata/prefill/own_only_switches.hpp:18-25,48-56,75-82`、`engine/src/qwen35/q36_engine.cu:5431-5439`
 
 ## 有効になる条件
 
-- 対象 executable/library に CUDA または HIP の fused prefill 実装が組み込まれていること。CUDA は `STRATA_PREFILL_FUSED` を付けて `strata_pf_own` を構成し、MMQ 有無に応じて `strata_prefill` に fused/MMQ 定義を付ける（`cmake/backends/cuda.cmake:285-307`）。HIP own-only 構成も fused prefill source を含む（`cmake/backends/hip.cmake:102-120`）。
-- CUDA: compute capability 8.0 以上であること。`dev_info()` は 8 未満を返し、7.5/Turing 分岐は Q6_K をセットアップしない。さらに基本 native kernels が利用可能 (`d.ok`) で、Q6_K gate/up と Q8_0 down の `setup_one` が両方成功する必要がある。片方でも失敗すれば `d.q6k` は立たず、この pair は fused 対象にならない（`src/prefill/moe_fused_iq.cu:2428-2434,2488-2494`）。
-- HIP: `dev_info()` が認識する gfx12 WMMA device (`d.w12`) で、基本 native kernels が利用可能 (`d.ok`) であること。gfx11、gfx1151、および `STRATA_HIP_GFX906` の早期 return 経路はこの Q6_K pair を選択しない（`src/prefill/moe_fused_iq.cu:2386-2414,2396-2412,2580,3010-3013`）。
-- layer の gate/up が `T_Q6_K`、down が `T_Q8_0` の組であること。両 backend で `STRATA_PF_FUSED_NATIVE=0` または全体の `STRATA_PF_FUSED=0` は native pair を止める。CUDA では `STRATA_PF_FUSED_NT=256` / `STRATA_PF_FUSED_F16=1` が成功して `d.occ_nt > 0` になる場合、または `STRATA_PF_FUSED_WS=1` が成功して `d.ws` になる場合は、Q6_K pair 用 native wide kernel がないため通常の pair は選ばれない（`src/prefill/moe_fused_iq.cu:2318-2326,2329-2330,2891-2908,2924-2928`）。
-- CUDA の own-only build は未設定の Q6K スイッチを既定で `1` にする。HIP own-only build も同じリストに含めるが、実際の Q6_K pair は gfx12 限定。MMQ ありの通常ビルドでは既定で Q6K は要求されない（`include/strata/prefill/own_only_switches.hpp:18-24,48-56`; `src/prefill/prefill.cpp:204-237`; `src/prefill/moe_fused_iq.cu:2274-2278,2681-2687`）。
-- `strata-q36` は Q6K を含む fused switch 群を未設定時に `1` にする一方、全体の `STRATA_PF_FUSED` 判定と Qwen3.6 の device rule も適用する。よって Q6K が `1` でも layer が必ず fused になるわけではない（`src/qwen35/q36_engine.cu:3950-3972`; `src/prefill/moe_fused_iq_q36.cu:126-139`）。
+- **共通:** Q6_K gate/up と Q8_0 down のペアであること。CUDA 側の `native_supported()` はこの組だけを受け付ける。HIP 側も `gu_type == T_Q6_K` のとき down が Q8_0 の場合だけ受け付ける。`engine/src/prefill/moe_fused_iq.cu:3448-3452,3550-3554`
+- **共通:** 上位スイッチ `STRATA_PF_FUSED` が無効でなく、`STRATA_PF_FUSED_NATIVE=0` による native fused kernel 全体の抑止もないこと。`native_supported()` は `STRATA_PF_FUSED=0` 相当を先に拒否し、続いて `STRATA_PF_FUSED_NATIVE` を確認する。prompt path の small-card override が 0 の場合も拒否する。`engine/src/prefill/moe_fused_iq.cu:3415-3432`
+- **CUDA:** 通常は sm_80 以上であること。sm_75 は `STRATA_PF_FUSED_SM75=1` による Turing setup に入り、さらに Q6_K/Q8_0 用 kernel setup が成功する場合に対象となる。各必要 kernel の setup が両方成功し、device が fused kernel 対応 (`d.ok`) と判定されること。`engine/src/prefill/moe_fused_iq.cu:2899-2905,2913-2936,2984-2990,3448-3452`
+- **HIP:** gfx12 として認識され、HIP の `dev_info()` が WMMA kernel を利用可能と判定すること。gfx11 ではこの Q6_K pair の条件を満たさず、環境変数によって fused Q6_K path には入らない。`engine/src/prefill/moe_fused_iq.cu:2858-2885,3061-3077,3550-3554`
+- **共通:** `STRATA_PF_FUSED_NT=256` の setup が有効 (`occ_nt > 0`)、または `STRATA_PF_FUSED_WS` の warp-specialized setup が有効 (`ws`) の場合、この Q6_K pair は `native_supported()` が false を返す。`engine/src/prefill/moe_fused_iq.cu:3448-3452`
+- **モデル状態:** GGUF の expert gate/up/down 型がそれぞれ Q6_K/Q8_0 である必要がある。たとえば `docs/UNSLOTH_Q6.md:37-41` は UD-Q6_K_XL の 48 層中 47 層が Q6_K/Q8_0、残る 1 層が Q8_0/Q8_0 と記載する。この記述はモデル形式の説明であり、全 Q6_K モデルへの対応を意味しない。
 
 ## 実行時の詳細
 
-CUDA の `q6k_cuda_requested()` と HIP の `q6k_hip_requested()` は関数内 `static const bool` に結果を保存する。CUDA は device ごとの `dev_info()` 初期化時にフラグを評価し、Q6_K gate/up と Q8_0 down の setup 成功時だけ `d.q6k` と別 occupancy を記録する。HIP は pair の coverage 判定でフラグを使い、Q8_0 down も Q6_K gate/up の後続として coverage する（`src/prefill/moe_fused_iq.cu:2276-2278,2379-2385,2488-2494,2684-2687,2691-2703`）。
+読み取り関数は最初の呼び出し時に一度値を評価し、`static const bool` に保持する。プロセス中の環境変更を再読込しない。CUDA では最初の `dev_info()` 呼び出しで device ごとの setup 結果も `g_dev[]` に保存し、`d.done` 後は再 setup しない。HIP でも device ごとの `d.ok` と gfx12 判定を保存する。通常の起動では起動時点の値を利用し、Qwen3.6 はモデルロード前に未設定スイッチを補う。`engine/src/prefill/moe_fused_iq.cu:2735-2737,2847-2853,3199-3202`、`engine/src/qwen35/q36_engine.cu:5431-5454`
 
-値は各 reader の最初の呼び出しでキャッシュされ、後からプロセス環境を変えても反映されない。own-only build の既定設定は static 初期化で `main` より前、`strata-q36` の既定設定はモデル load より前に行われる（`src/prefill/prefill.cpp:204-237`; `src/qwen35/q36_engine.cu:3940-3957`）。
+CUDA は Q6_K gate/up と Q8_0 down の kernel setup を両方試し、両方成功した場合だけ `d.q6k` を true にする。sm_80+ では `setup_one`、Turing の sm_75 経路では 128-row の `setup_ww` を使う。HIP は gfx12 で同じ環境値を pair eligibility に使い、Q6_K gate/up を `native_w11_kernel` に dispatch する。`native_supported()` が true の場合、`experts_native()` は Q6_K gate/up kernel と Q8_0 down kernel を launch し、launch 後 `cudaGetLastError()` を確認する。`engine/src/prefill/moe_fused_iq.cu:2913-2936,2984-2990,3448-3452,3822-3823,3915-3918`
 
-CUDA では `native_supported` が Q6_K/Q8_0 pair を許可し、`experts_native` が gate/up を `T_Q6_K`、down を Q8_0 の native kernel に dispatch する。HIP では gfx12 の同じ pair を `native_w11_kernel` に dispatch する。対象 format が合わない、全体スイッチで止まる、GPU/setup 条件を満たさない場合はこの fused pair に入りません。後続の選択先は MMQ の有無など別経路の条件に依存する（`src/prefill/moe_fused_iq.cu:2565-2581,2924-2928,3009-3013,3212-3213,3293-3308`; `src/qwen35/q36_engine.cu:1412-1441`）。
+CLI 引数にこの環境変数と同じ指定はなく、対象値を CLI が上書きする処理もない。既存の環境値が優先される。Qwen3.6 エンジンは未設定の場合のみ値を設定する。MMQ ありの通常経路で pair が非対応なら planner が MMQ または FP16 経路を選び、MMQ なしの build では Strata の own-only prompt path が利用できる経路へ振り分ける。`docs/QWEN36.md:7-9` は Qwen3.6 専用エンジンへの切り替えを記載する。`engine/src/prefill/prefill.cpp:223-255,392-405`
 
 ## ログと測定値
 
-Q6K の値が無効、device が非対応、または CUDA の Q6K 専用 setup が失敗した場合に、この変数専用の警告・理由ログは見つからない。fused launch 後の `cudaGetLastError()` が失敗した場合は stderr に `prefill fused experts (native): experts_native: <CUDA error text>` を出して終了コード 1 で終了する（`src/prefill/moe_fused_iq.cu:60-65,2490-2494,3242,3339`）。
+スイッチが有効になったことを示す専用の成功ログは確認できない。CUDA の kernel setup が不成立の場合、`d.q6k` が立たず `native_supported()` が false になるため、Q6_K/Q8_0 ペアは fused launch に進まない。該当 setup 箇所には理由ログがない。実際に launch 後の CUDA error check が失敗した場合は stderr に `prefill fused experts (native): experts_native: <CUDA error text>` を出して終了コード 1 で終了する。`engine/src/prefill/moe_fused_iq.cu:68-72,2984-2990,3448-3452,3852-3853`
 
-Strata の資料には、このスイッチの性能値を記載しない（対象値について測定条件を満たす一次資料を確認できなかった）。CUDA/HIP の CTest は `STRATA_PF_FUSED_Q6K=1` と `STRATA_MMQ_KQ=1` を併記し、当該 pair を参照経路等と比較する設定だが、テスト設定自体を性能・正確性の実測根拠にはしていない（`cmake/backends/cuda.cmake:413-416`; `cmake/backends/hip.cmake:180-182`）。
+この環境変数による性能値や出力一致の測定値は本書では扱わない。`docs/UNSLOTH_Q6.md` は GGUF の型配置を説明するが、このスイッチの A/B 測定条件や測定値は記載していない。
 
 ## 根拠
 
-- 候補名と直接参照の全件確認: `src/prefill/moe_fused_iq.cu:2276-2278,2488-2494,2681-2687,2693,2700,2571,2580,2924-2928,3009-3013,3212-3213,3305-3307`; `src/qwen35/q36_engine.cu:3950-3957`。
-- own-only 起動時既定値と backend 別の名前一覧: `include/strata/prefill/own_only_switches.hpp:18-24,48-56`; `src/prefill/prefill.cpp:204-237`。
-- Qwen3.6 の値設定・layer 選択: `src/qwen35/q36_engine.cu:3950-3972,1407-1410`; `src/prefill/moe_fused_iq_q36.cu:115-139`。
-- CUDA/HIP の compile/backend 構成: `cmake/backends/cuda.cmake:285-307`; `cmake/backends/hip.cmake:102-120`。
-- CTest による候補値の使用（本番挙動の根拠ではない）: `cmake/backends/cuda.cmake:413-416`; `cmake/backends/hip.cmake:180-182`。
+- `engine/src/prefill/moe_fused_iq.cu:2733-2737` — CUDA の値判定
+- `engine/src/prefill/moe_fused_iq.cu:3196-3202` — HIP の値判定
+- `engine/src/prefill/moe_fused_iq.cu:2913-2936,2984-2990` — CUDA kernel setup と device cache
+- `engine/src/prefill/moe_fused_iq.cu:3448-3452,3550-3554` — CUDA/HIP の pair 条件
+- `engine/src/prefill/moe_fused_iq.cu:3822-3823,3915-3918` — Q6_K gate/up dispatch
+- `engine/src/prefill/prefill.cpp:223-255` — MMQ なし build の起動時既定値
+- `engine/src/qwen35/q36_engine.cu:5431-5454` — Qwen3.6 エンジンの起動時既定値
+- `docs/UNSLOTH_Q6.md:37-41`, `docs/QWEN36.md:7-9` — モデル形式と専用 engine の説明

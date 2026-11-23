@@ -1,46 +1,53 @@
 # `PYTHONPATH`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部 Python 実行環境の `PYTHONPATH` の意味・import 動作は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata の本番コードには、`PYTHONPATH` を Strata 自身の設定値として読み、値に応じて機能を選ぶ処理は見当たりません。参照の大半は、同梱 Python や Control の起動時にこの変数を子プロセス環境から除く処理です。一方、モデル準備の子プロセスには、継承値を除去した後で Strata ソースディレクトリを明示的に設定します。また Linux AppImage から外部プログラムを起動するときは、AppImage 内のパスを含む `PYTHONPATH` を外部向け環境から除去します。
+Strata は `PYTHONPATH` を設定値として読み解かず、実行経路ごとにプロセス環境から削除するか、子プロセス向けの値を明示的に設定する。システム Python やユーザー指定 Python を選んだ通常の Terminal 起動では、この変数を Strata の起動スクリプト自身が変更する処理はない。実装はセットアップ用シェル／バッチ、Terminal ランチャー、Control の子プロセス起動、AppImage の外部プログラム用環境に分かれる（`setup.sh:12-17`, `terminal/bin/strata:142-145`, `terminal/strata_cli/launch/runner.py:1650-1661`, `app/host/server/external-env.mjs:25-26,43-55,64-70`）。
 
 ## 値と判定
 
-`PYTHONPATH` 自体を真偽値や数値へ変換する Strata の読み取り箇所はありません。挙動は起動経路ごとに次のとおりです。
+Strata の実行時コードに、`PYTHONPATH` の値をパースして真偽値や設定値にする箇所はない。空文字・数値・区切り文字・大文字小文字を判定しない。対象経路では環境変数の有無に関係なく削除し、Control のモデル準備では固定の `cat.src` に置き換える。AppImage の外部プログラム用処理だけは、文字列を `:` で分割して AppImage 内の要素を除く（`terminal/strata_cli/launch/runner.py:1658-1661`, `app/host/server/external-env.mjs:25-26,47-55`）。
 
-CLI 引数による `PYTHONPATH` 設定や優先順位はありません。Strata の Python/シェル側の処理は子プロセス用辞書または起動直前の環境を作る時点で行われ、変数値の static cache はありません。AppImage helper も外部プログラム向け環境を作る呼び出し時に渡された環境（既定では `process.env`）をコピーして処理し、親プロセスの環境自体は書き換えません。
-
-| 経路 | 未設定・空文字 | 設定値 | 判定・変換 |
+| 条件 | unset | 設定値の扱い | Strata 側の判定 |
 |---|---|---|---|
-| バンドル Python の起動 | どちらも子プロセス環境から除去 | 値を問わず除去 | 値を parse せず `unset`、`Remove-Item`、`env_remove`、または `pop` |
-| `strata launch` のモデル準備 | いったん環境から除去 | 継承値を使わない | 最後に `PYTHONPATH` を `cat.src` の文字列表現で上書き |
-| Linux AppImage の外部プログラム向け環境 | 元環境の記録があれば記録値を使う。記録がなく `APPDIR` があれば空値は空要素として除かれ、結果の変数も削除 | `APPDIR` があり元環境記録がなければ、コロン区切り要素のうち `APPDIR` 内を指すものだけ除去。それ以外は維持 | `split(':')` 後に空要素と AppImage 内パスを filter。アプリ起動時の環境記録があればその値を復元 |
-| その他の起動・環境継承 | その経路の親環境に従う | 原則としてその経路の親環境に従う | `PYTHONPATH` を設定として検査する分岐なし |
+| Linux/macOS セットアップで `terminal/python/bin/python3` がある | 変更なし | 値を問わず `unset` してから同梱 Python で `setup.py` を実行 | 削除 |
+| Windows `START-HERE.bat` の bundled 分岐 | 変更なし | 値を問わず空にする | 削除 |
+| Terminal Unix ランチャーで `$PY` が `$HERE/../python/*` または `$HERE/python/*` に一致 | 変更なし | 値を問わず `unset` | 削除 |
+| Terminal Windows `.cmd` / `.ps1` の bundled 分岐 | 変更なし | 値を問わず空にする／環境から削除 | 削除 |
+| Control がセットアップを起動 | 値を問わず、子環境に `cat.src` を設定 | ユーザー値を除去した後に上書き | ソースディレクトリで上書き |
+| Control が pack 準備を起動 | 値を問わず、子環境に `cat.src` を設定 | ユーザー値を除去した後に上書き | ソースディレクトリで上書き |
+| AppImage 内から Strata が外部プログラムを起動 | 元環境の記録があれば記録値をそのまま使う。記録がなければ現在値を対象にする | 元環境の記録がない場合だけ、空要素と `APPDIR` 配下の要素を除去し、残りがなければ変数自体を削除 | 記録なしの場合に条件付きのパス要素除去 |
+| 上記以外の経路（例: ソース checkout の server 起動環境） | 通常の環境をコピー | `PYTHONPATH` はそのままコピー | 対象名による変更なし |
 
-AppImage のパス処理は、パス文字列全体の正規化や Python の import 解決ではありません。`APPDIR` がない場合、`PYTHONPATH` の要素から AppImage 内のパスを除く処理は行われません。元環境記録があるときは、記録中の環境を優先して使い、`withoutAppImage` による要素除去は行いません（`apps/host/server/external-env.mjs:28-40,43-57,67-70`）。
+（根拠: `START-HERE.bat:49-55`, `terminal/bin/strata:142-145`, `terminal/bin/strata.cmd:34-43`, `terminal/bin/strata-direct.ps1:30-41`, `terminal/strata_cli/launch/runner.py:1650-1661,1798-1805`, `app/host/server/control-runtime.mjs:82-95`, `app/host/server/external-env.mjs:25-26,43-55,64-70`, `app/host/server/native-control.mjs:689`。）
 
 ## 有効になる条件
 
-- `bin/strata` は、選択した Python が配布物内の `python/` 以下にある場合に限り `PYTHONHOME` と `PYTHONPATH` を除去します。通常のシステム Python や `STRATA_PYTHON` を選んだ場合、このラッパーは `PYTHONPATH` を変更しません（`bin/strata:31-49,128-133`）。
-- `bin/strata.ps1`、`bin/strata.cmd`、`setup.sh`、`START-HERE.bat` も、バンドル Python を使う分岐だけで `PYTHONPATH` を空にします。Windows の `.cmd` とバッチでは `set "PYTHONPATH="`、PowerShell では環境項目の削除、シェルでは `unset` です（`bin/strata.ps1:25-42`、`bin/strata.cmd:29-43`、`setup.sh:7-12`、`START-HERE.bat:9-13,44-54`）。
-- アプリがバンドル Control を起動・検査する経路では、継承環境から `PYTHONPATH` を除きます。これは desktop の Control 検査とエンジン不在確認、host の `controlEnvironment()`、Control handover、MCP の Control インストールで行われます（`apps/desktop/src-tauri/src/main.rs:625-653`、`apps/host/server/control-runtime.mjs:88-100`、`strata_cli/handover.py:117-123,148-158`、`tools/strata_mcp.py:2841-2852`）。
-- `strata launch` がモデル準備のため `setup.py` を起動するときは、`ensure_model()` 内で継承環境の `PYTHONPATH` を除いた後、`cat.src` を設定します。したがってこの子プロセスでは、ユーザーの値ではなく対象ソースディレクトリが渡されます（`strata_cli/launch/runner.py:674-685,1119-1153`）。同じファイルのエンジン更新子プロセスは通常 `_env()` を使い、`PYTHONPATH` の削除・上書きはしていません（`strata_cli/launch/runner.py:674-679,739-748`）。
-- `packaging/package_terminal.py` はビルド時に、バンドル依存をインストールする pip とバンドル Python の probe の環境から継承 `PYTHONPATH` を除きます（`packaging/package_terminal.py:199-211,434-440`）。これはパッケージ作成処理の環境清掃で、配布後の利用者向け設定ではありません。
-- `apps/host/server/external-env.mjs` は、AppImage が起動したホストプロセスから外部プログラム用環境を組み立てます。元環境の記録がなければ `APPDIR` 配下のパス要素を削り、記録があれば記録値を使います。この環境をフォルダ選択、通知、ファイルを開く処理などが利用します（同 `:2-13,25-26,64-70`; 呼び出し例 `apps/host/server/folder-dialog.mjs:111,146`、`apps/host/server/app-ui.mjs:38,56`、`apps/host/server/artifacts.mjs:6`）。AppImage の起動条件外では、`externalEnvironment()` は受け取った環境をコピーしてそのまま返します（同 `:64-70`）。
+- Terminal Unix ランチャーで削除されるのは、選ばれた `$PY` のパスがランチャー同梱の Python ディレクトリに一致する場合だけ。ソースではこの条件を外れた Python では `PYTHONPATH` を消していない（`terminal/bin/strata:142-145`）。
+- Windows の `.cmd` / `.ps1` は bundled Python 分岐で削除する。`.cmd` の `%STRATA_PYTHON%` を使う分岐は bundled 分岐を通らない（`terminal/bin/strata.cmd:29-43`, `terminal/bin/strata-direct.ps1:30-45`）。
+- Control のセットアップ・pack 準備では、入力環境に値があっても `cat.src` で置き換わる。Control を実行しない経路にはこの上書きは適用されない（`terminal/strata_cli/launch/runner.py:1650-1661,1798-1805`）。
+- AppImage 外部プログラム用の処理は `APPDIR` または記録環境があるときだけ環境の復元・掃除を行う。記録環境があればその `PYTHONPATH` をそのまま採用する。記録がない場合は `:` 区切りとし、空要素、および `APPDIR` に一致するか `APPDIR/` または `APPDIR//` で始まる要素を除去する。Windows の `;` 区切り等を解釈するコードではない（`app/host/server/external-env.mjs:43-55,60-70`）。
+- `sourceServerEnvironment()` は環境を複製して Python 関連変数を変更しない。Control の `controlEnvironment()` は `PYTHONPATH` を含むユーザー Python 環境変数を削除する（`app/host/server/control-runtime.mjs:82-95`）。
 
 ## 実行時の詳細
 
-通常の端末起動では、`bin/strata` は `STRATA_PYTHON`、バンドル Python、PATH 上の Python 等から実行ファイルを選びますが、`PYTHONPATH` は選択基準にしません。バンドル Python を選んだ場合にだけ、`strata.py` を実行する直前に親プロセス環境から `PYTHONPATH` を除去します。Windows と初回セットアップ用ラッパーも同様に、バンドル版を直接起動する分岐だけが対象です（`bin/strata:31-49,128-133`、`START-HERE.bat:11-13,44-54`、`bin/strata.ps1:28-42`、`bin/strata.cmd:29-43`）。値が無効という理由で警告・終了する処理は確認できません。
+この変数専用の cache や数値変換はない。セットアップ／ランチャーでは子プロセス起動前に環境変数を変更し、その子プロセスにだけ影響する。Control のモデル準備と pack 準備は `_env()` の環境から `PYTHONHOME`・`PYTHONPATH`・`VIRTUAL_ENV` を除去し、`PYTHONPATH=cat.src` を設定して `setup.py` を起動する（`terminal/strata_cli/launch/runner.py:1650-1661,1798-1805`）。Control の引き継ぎでは `_child_env()` が `PYTHONPATH` を除去する（`terminal/strata_cli/handover.py:117-123`）。MCP 経由の Control install も同名変数を子環境から除去するが、値を再設定しない（`terminal/tools/strata_mcp.py:3151-3162`）。
 
-`strata_cli/handover.py` は `strata.py` の冒頭から呼ばれます。新しい Control への handover が行われるとき、その子環境を複製して `PYTHONPATH` を削除します。hand-over をしない場合に、この関数が現在のプロセス環境を変更することはありません（`strata.py:32-36`、`strata_cli/handover.py:117-123,126-158`）。
+パッケージ作成ツールは、bundled Python の import probe と pip インストールの子プロセス環境からこの変数を除去する（`tools/packaging/package_terminal.py:146-156,218-229`）。アプリの Control 実行環境でも削除し、Desktop self-test の `strata.py` 起動でも削除する（`app/host/server/control-runtime.mjs:88-95`, `app/desktop/src-tauri/src/main.rs:688-716`）。これらの処理は変数値を読み取って保持・キャッシュするものではない。
 
-`strata launch` のモデル準備では、子環境を `os.environ` から作り、`PYTHONHOME`、`PYTHONPATH`、`VIRTUAL_ENV` を取り除き、`PYTHONPATH=cat.src` を設定して `setup.py` を起動します。子プロセスの出力は runner が読み取りますが、`PYTHONPATH` の値に起因する専用ログ、警告、終了コード分岐はありません（`strata_cli/launch/runner.py:1119-1153,1158-1178`）。
+## ログと測定値
+
+`PYTHONPATH` の値や有無だけを理由に Strata が出すログ、警告、終了コードは確認できない。該当コードは環境を削除・上書きするだけで、変数専用の失敗経路を持たない。
 
 ## 根拠
 
-- 環境参照を行う汎用 AppImage helper と外部起動への適用: `apps/host/server/external-env.mjs:25-40,43-57,64-70`。
-- バンドル Python ランチャーと初回セットアップ: `bin/strata:31-49,128-133`、`bin/strata.ps1:28-42`、`bin/strata.cmd:29-43`、`setup.sh:7-12`、`START-HERE.bat:9-13,44-54`。
-- 子プロセスからの除去・上書き: `strata_cli/handover.py:117-123,126-158`、`strata_cli/launch/runner.py:674-685,1119-1153`、`tools/strata_mcp.py:2841-2852`、`apps/desktop/src-tauri/src/main.rs:625-653`、`apps/host/server/control-runtime.mjs:88-100`。
-- パッケージ作成時の環境清掃: `packaging/package_terminal.py:199-211,434-440`。
+- `setup.sh:12-17`, `START-HERE.bat:49-55`: bundled Python のセットアップ起動前に削除。
+- `terminal/bin/strata:142-145`, `terminal/bin/strata.cmd:29-43`, `terminal/bin/strata-direct.ps1:30-45`: Terminal ランチャーの bundled 分岐とその条件。
+- `terminal/strata_cli/launch/runner.py:1650-1661,1798-1805`: Control の子プロセスでソースパスに設定。
+- `terminal/strata_cli/handover.py:117-123`, `terminal/tools/strata_mcp.py:3151-3162`: Control handover / MCP install 環境からの除去。
+- `tools/packaging/package_terminal.py:146-156,218-229`: パッケージ作成時の子プロセスからの除去。
+- `app/host/server/control-runtime.mjs:82-95`, `app/desktop/src-tauri/src/main.rs:688-716`: アプリの server / Control / self-test 環境。
+- `app/host/server/external-env.mjs:25-26,43-55,60-70`, `app/host/server/native-control.mjs:689`: AppImage の外部環境掃除とソース server 環境の呼び出し。
+

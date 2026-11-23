@@ -1,46 +1,47 @@
 # `STRATA_DL_CONNECTIONS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。Strata リポジトリの開始時状態は `## main...origin/main` で、未コミット変更は表示されなかった。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-セットアップ中に Strata が行う HTTP(S) ダウンロードの並列数を指定します。通常のモデル・エンジン等のファイル取得では、十分大きく、サイズが分かり、サーバーが byte range を受け付けるファイルに複数接続を使います。別経路の `tools/mtp_fetch.py` も同じ環境変数を読み、MTP チェックポイントの範囲取得や shard header 取得の並列度に使います。Strata の推論エンジンや GPU カーネルの環境変数ではありません。
+Strata Terminal のセットアップが大きなモデルファイルを HTTP byte range で取得するときの並列 worker 数を指定する。また、同梱 `terminal/tools/mtp_fetch.py` の MTP checkpoint 読み込みでも range worker 数に使われる。どちらも対象はダウンロード処理であり、エンジン実行時の推論並列度や GPU 設定は変えない。実装は `terminal/setup.py` の `dl_connections()` と `download()`、および `terminal/tools/mtp_fetch.py` の `connections()`、`inventory()`、`fetch()` にある（`terminal/setup.py:2754-2761,3556-3569`; `terminal/tools/mtp_fetch.py:285-292,374-381,407-424`）。
 
 ## 値と判定
 
-両読み取り箇所とも Python の `os.environ.get(... ) or ""` を使い、前後の空白を `strip()` してから `int()` に変換します。未設定、空文字、空白だけの値は既定値16です。整数に変換できない文字列は例外を捕捉して既定値16に戻ります。変換した整数は1〜32に clamp されるため、0や負数は1、32より大きい値は32になります。数値文字列は `int()` が受け付ける形式に従い、文字列全体が変換対象です。
+両実装とも `os.environ.get(...) or ""` の後に前後空白を `strip()` し、非空なら Python の `int()` で文字列全体を整数へ変換する。未設定・空文字・空白だけの値は既定値16。変換時の `ValueError` も16へ戻る。変換後は `max(1, min(n, 32))` で1〜32に制限する。したがって `0`、負数は1、33以上は32になる。`+4`、`-4` など整数として受理される書式を使える。`true`、`1x`、`1.5` は無効値で既定値16。大文字小文字は数値変換に関係しない。setup と MTP helper は同じ値規則と既定値を持つ（`terminal/setup.py:2754-2761`; `terminal/tools/mtp_fetch.py:285-292`）。
 
-| 入力 | 接続数 |
-|---|---:|
-| 未設定、`""`、空白のみ | 16 |
-| 有効な整数 `n`（1〜32） | `n` |
-| 有効な整数 `n`（1未満） | 1 |
-| 有効な整数 `n`（32超） | 32 |
-| 整数に変換できない値 | 16 |
+| 呼び出し経路 | unset / 空文字 / 空白 | 有効値の例 | 無効な整数・変換失敗の例 | 実際の上限・下限 |
+|---|---|---|---|---|
+| `terminal/setup.py` のモデルファイル取得 | 16 | `1`, ` 4 `, `+8` | `0`・`-2` は1へ制限、`33` は32へ制限、`true`・`1x` は16へ fallback | 1〜32 |
+| `terminal/tools/mtp_fetch.py` の `inventory` / `fetch` | 16 | `1`, ` 4 `, `+8` | `0`・`-2` は1へ制限、`33` は32へ制限、`true`・`1x` は16へ fallback | 設定上1〜32。`inventory` はさらに8および shard 数まで |
 
-値は都度読み取られ、関数内の static 値やモジュール初期化時のキャッシュには保存されません。CLI に接続数を指定する引数はなく、この環境変数が読み取り値を決めます。ただし個々の取得経路が並列取得を使う条件は別途あります。根拠: `setup.py:2347-2354,3069-3082`; `tools/mtp_fetch.py:245-251,334-341,367-385`。
+この変数に対応する CLI 引数はありません。setup は既定の接続数を先に読み、ファイルが256 MiB以上かつ接続数が1より大きいときに range 取得を試します。条件外、または range probe が失敗したときは1ストリームの `download_single()` 経路になります（`terminal/setup.py:2743-2748,3556-3569`; `terminal/setup.py:3188-3195`）。
 
 ## 有効になる条件
 
-`setup.py` の通常取得では、既に完了マークのあるファイルは取得処理をスキップします。ローカルパスまたは `file://` のコピーも HTTP 並列取得を通りません。HTTP(S) 取得はファイルサイズを HEAD 等で得た後に接続数を読み、256 MiB 以上かつ接続数が2以上の場合に range 並列取得を試します。サイズが小さい・不明、接続数が1、range 非対応、並列取得用メタデータの取得失敗などでは単一ストリームに切り替わります。したがって値を大きくしても、すべてのファイルでその数の接続が開くわけではありません。根拠: `setup.py:2332-2344,2744-2753,2996-3005,3008-3018,3061-3082`。
-
-MTP 取得では `inventory` が shard 一覧取得に `min(connections, 8, shard 数)` の worker 上限を使い、`fetch` は値を `workers` として範囲取得へ渡します。`workers > 1` なら chunk は16 MiB、1なら64 MiBです。`fetch` がネットワーク例外に遭遇すると worker 数を `max(4, workers // 2)` に変更して再試行するため、初期値1であってもこの回復経路では4に変わります。`verify` はオフライン検証であり、この環境変数を使いません。根拠: `tools/mtp_fetch.py:334-341,367-385,399-421,475-489`。
-
-setup の MTP ダウンロードは、対象モデルの導入経路で MTP が選択され、既存の MTP 成果物がない場合に実行されます。`--mtp off` で MTP がまだ存在しないときは fetch を行いません。`fetch_mtp()` は `tools/mtp_fetch.py fetch` を子プロセスで起動し、失敗時は最大3回実行し直します。ツール単体で `inventory` / `fetch` を実行する場合にも、そのプロセスの環境変数が読み取られます。根拠: `setup.py:959-978,981-997,8987-9001,10058-10073`; `tools/mtp_fetch.py:475-489`。
+- setup の通常モデルファイル取得では、既知の合計サイズが `DL_MIN_PARALLEL`（256 MiB）以上で、判定後の接続数が2以上であること。満たさない場合はこの値に関係なく単一ストリーム経路（または既存ファイル処理）になる（`terminal/setup.py:2747,3556-3569`）。
+- setup の parallel download が range 対応を probe し、サーバーが使える range response を返すこと。range 非対応なら `parallel_download()` が false を返し、呼び出し元が単一ストリーム取得へ進む（`terminal/setup.py:3188-3195,3567-3569`）。
+- MTP の `inventory` は shard header を並列取得するが、実 worker 数は `max(1, min(connections(), 8, len(shards)))`。環境値が32でも最大8で、shard が少なければその数まで（`terminal/tools/mtp_fetch.py:374-381`）。
+- MTP の `fetch` は `connections()` を一度呼び出し、各 tensor の byte range をその worker 数で処理する。tensor の残りが一つの range 以下なら `ranged()` は逐次読み込みへ進み、並列化されない（`terminal/tools/mtp_fetch.py:407-424,294-305`）。
+- `mtp_fetch.py verify` は hash 検証だけを行い、`connections()` を呼ばないため、この変数の影響を受けない（`terminal/tools/mtp_fetch.py:482-512,515-530`）。
+- setup の MTP ダウンロードは、モデル状態・設定により MTP が必要で、まだ取得済みでない場合に限り呼ばれる。たとえば `--mtp off` で未取得、または未取得の状態で drafter が `dflash2` の場合は fetch を省略する。MTP を使う経路では setup が `mtp_fetch.py fetch` を子プロセスとして起動する（`terminal/setup.py:1160-1173,11079-11103,12262-12273`）。
 
 ## 実行時の詳細
 
-通常取得では `download()` の HTTP(S) 経路が HEAD 等でサイズを確定した後に `dl_connections()` を呼びます。range 並列取得は完成済み piece を進捗ファイルに記録して再開し、進捗を端末へ表示します。取得不能が続けば `fail()` によるセットアップ失敗となり、Range 非対応なら単一ストリームへ戻ります。根拠: `setup.py:2744-2832,2949-2994,3008-3100`。
+値は関数が呼ばれるたびにプロセス環境から読み直され、関数内にもモジュール内にもこの値の cache はない。setup はファイルごとの `download()` で `dl_connections()` を評価し、その値を当該取得と SHA-256 不一致時の修復 callback に渡す（`terminal/setup.py:2754-2761,3556-3569`）。MTP の `inventory` と `fetch` も処理ごとに `connections()` を呼ぶ。setup から MTP helper を起動するときは `run()` が渡された環境辞書を subprocess に設定し、`fetch_mtp()` 自体は `STRATA_DL_CONNECTIONS` を上書きしないため、setup プロセスの値が子プロセスにも渡る（`terminal/setup.py:1141-1152,1160-1173`; `terminal/tools/mtp_fetch.py:285-292,407-424`）。
 
-MTP の `fetch` は環境変数から初期 worker 数を得て、tensor の byte range を並列取得します。ネットワークエラー時は stderr に接続数を変更した旨を表示し、同じ tensor の取得を続けます。失敗が繰り返されると `sys.exit()` でエラーを返し、setup 側は再試行し、最後まで失敗すれば setup の `fail()` 経路になります。進捗は stderr に表示されます。根拠: `tools/mtp_fetch.py:138-163,165-188,383-429`; `setup.py:981-997`。
+setup の range 取得は32 MiB pieceを管理し、最大 `min(conns, 残りpiece数)` 個の worker thread を起動する。接続あたりの失敗は再試行され、完了 piece の記録を保存して中断後の再開に使う。range が利用できないと単一ストリーム経路へ切り替える（`terminal/setup.py:2740-2750,3188-3255`）。MTP の `fetch` は `connections()>1` のとき16 MiB単位、それ以外は64 MiB単位で range を読み、失敗時には worker 数を `max(4, workers // 2)` にして再試行する。このため、初回値が1〜3であっても失敗後の再試行は最低4 worker を使う（`terminal/tools/mtp_fetch.py:407-424,294-322,452-461`）。
+
+## ログと測定値
+
+setup の並列取得中は2秒ごとに取得済み量と割合を表示し、停滞や再試行時は警告を出すが、接続数そのものを示すログはこの経路にはない（`terminal/setup.py:3205-3251`）。単一ストリームに fallback する理由も、ここでは接続数付きのログとしては出さない（`terminal/setup.py:3188-3195,3567-3569`）。MTP helper は range 取得失敗時に stderr へ `"<tensor>: <error> - continuing with <N> connections (try <N>)"` を出し、継続失敗時は失敗対象と接続確認・別 source の案内を含むメッセージで終了する（`terminal/tools/mtp_fetch.py:452-460`）。セットアップから起動した MTP fetch は失敗コードに応じて offline を許容するか、再試行して最終的にセットアップを失敗させる（`terminal/setup.py:1170-1189`）。
+
+`docs/DETAILS.md:210` は setup が既定16接続でダウンロードし、`STRATA_DL_CONNECTIONS` で1〜32を指定できると記しており、実装の範囲と一致する。速度向上の数値はここでは記載しない。
 
 ## 根拠
 
-- `setup.py:2332-2354` — 通常ダウンロードの既定値と環境変数の変換・clamp。
-- `setup.py:3061-3082` — サイズ・接続数に基づく並列取得の条件と fallback。
-- `tools/mtp_fetch.py:245-251` — MTP ツール側の同じ値判定。
-- `tools/mtp_fetch.py:334-341,367-385` — inventory と fetch での並列度利用。
-- `tools/mtp_fetch.py:399-421` — network failure 時の接続数変更とログ。
-- `setup.py:981-997,8987-9001,10058-10073` — setup から MTP fetch を呼ぶ条件と再試行。
-
-候補名の全参照は `rg -n --hidden --glob '!.git/**' 'STRATA_DL_CONNECTIONS'` で確認した。実装上の読み取りは `setup.py` と `tools/mtp_fetch.py` の2箇所であり、他の一致はテストコードまたはコメントだった。テストコードは挙動の根拠に使っていない。
+- `terminal/setup.py:2739-2761` — setup ダウンロード定数と値判定。
+- `terminal/setup.py:3188-3255,3556-3589` — range 条件、worker 起動、単一 stream fallback とファイル処理。
+- `terminal/setup.py:1141-1152,1160-1189,11079-11103,12262-12273` — 子プロセスへの環境引き継ぎと MTP fetch の呼び出し条件。
+- `terminal/tools/mtp_fetch.py:285-322,374-381,407-475,482-539` — MTP helper 内の判定、並列処理、ログ、verify の非該当経路。
+- `docs/DETAILS.md:210` — setup の接続数に関する説明。

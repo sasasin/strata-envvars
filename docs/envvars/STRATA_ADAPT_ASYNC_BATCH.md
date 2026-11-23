@@ -1,53 +1,46 @@
 # `STRATA_ADAPT_ASYNC_BATCH`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-expert arena を使う非 pipeline の非同期 adaptive tier で、1 回に GPU へ投入する expert の copy-in 件数に上限を設けます。0 は上限なしで、その round に選ばれたコピーを一度に投入します。この変数は adaptive tier 自体を有効化せず、コピー元や expert の選択方法も変えません。
-
-コード上の読み取りは `src/program/generate.cpp` の `a_env("STRATA_ADAPT_ASYNC_BATCH", 0)` だけです。`000_envvers.md` にある候補名はこの読み取りで実際に使われています。bench/results 以下にも値を設定する実験スクリプトがありますが、実装根拠にはしていません。
+CUDA/HIP の `strata serve` にある非同期 adaptive tier のうち、expert arena から GPU expert cache へコピーする際、1 バッチにまとめる copy-in の最大件数を指定する。これは swap 候補数や 1 ラウンド全体の上限ではなく、コピーを複数バッチに分ける上限である。`0` は全件を 1 バッチにする。arena 以外の resident RAM モードでは `a_batch` を常に `0` にするため、この変数は参照されても実際の分割数に影響しない（`engine/src/program/generate.cpp:15489-15502,15632-15646`; 分割規則は `engine/include/strata/program/adaptive_range.hpp:18-40`）。
 
 ## 値と判定
 
-`a_env` は環境値が存在し、かつ空文字でない場合に `std::atoi` を使います。それ以外は既定値を返します。その後 `std::max(0, ...)` で負値を 0 にし、`size_t` に変換します。
+`generate.cpp` 内の `a_env` が `std::getenv` で値を取得する。未設定または空文字なら既定値を返し、それ以外は `std::atoi` で変換する。その後 `std::max(0, ...)` で負値を `0` にし、`size_t` に変換する。全体の文字列検証はなく、`atoi` が読む先頭の数値部分が使われ、数値にできない文字列は `0` となる。従って `2tail` は `2`、`true` / `false` / `junk` / `0anything` は `0` として扱われる。符号と先頭空白も `atoi` の変換対象になる。`atoi` の表現範囲を超える値の結果は保証できない（`engine/src/program/generate.cpp:15494-15497,15502`）。
 
-| 環境値 | 読み取り結果 | copy-in 上限 |
-|---|---:|---:|
-| 未設定 | 既定値 `0` | 上限なし。残りの swap をまとめて投入 |
-| 空文字 | 既定値 `0` | 上限なし |
-| 数値 0 | `0` | 上限なし |
-| 正の整数 `N` | `atoi` の結果 `N` | 1 batch あたり最大 `N` 件 |
-| 負の整数 | `atoi` の負値を `max(0, ...)` で `0` にする | 上限なし |
-| 数字以外で始まる文字列 | `atoi` が通常 0 を返す | 上限なし |
-| 数字の後ろに文字が続く文字列 | `atoi` が先頭の数値部分を変換 | その正値を上限にする。例: `16x` は 16 |
+| 条件 | unset | 有効になる値（例） | 無効・その他の値（例） |
+| --- | --- | --- | --- |
+| expert arena (`a_arena == true`) | `0`（全件を 1 バッチ） | 正の整数。例 `1` は 1 件ずつ、`16` は最大 16 件ずつ | 空文字も既定値 `0`。`0`, `-1`, `true`, `junk`, `0anything` はすべて `0`（全件を 1 バッチ） |
+| arena 以外 | 適用なし。`a_batch` は `0` | 適用なし | 設定値はバッチ分割に使われない |
 
-整数全体の厳密な書式検査、末尾文字の検証、範囲エラーの警告はありません。`atoi` が `int` で表せない値を受け取った場合の結果は、この実装で定義・検査されていません。
-
-根拠: `src/program/generate.cpp:11689-11697`。
+正の上限が残りの swap 件数以上なら、そのバッチで残り全部を処理する。値が無効でも警告や fallback ログはなく、変換結果 `0` の通常規則（全件を 1 バッチ）が適用される（`engine/include/strata/program/adaptive_range.hpp:24-31`）。
 
 ## 有効になる条件
 
-- 上限が適用されるのは `srcp == &arena_src`、つまり expert arena 経路の場合です。arena 以外では `a_batch` を明示的に 0 にします。
-- 非同期 adaptive tier の job が作られ、実際に `a_post_batch()` が呼ばれる必要があります。明示的な `--adapt-async 1`、または対応条件下での自動選択が必要で、adaptive tier の swap がなければ対象コピーもありません (`src/program/generate.cpp:11700-11716,11901-11916`)。
-- 自動選択は CUDA build、`--serve`、adaptive tier 有効、arena、単一 GPU、pipeline 無効、batch slots 無効、peer / remote expert opt 無効、overlap 無効の条件を満たす場合だけ候補になります。`STRATA_ADAPT_ASYNC=0` は自動選択を止めます。`--adapt-async` を明示した場合は自動選択ではなく明示値が使われます (`src/program/generate.cpp:9026-9045`, `include/strata/core/adapt_async_default.hpp:19-55`)。
-- `--adapt-async 0` では async tier を明示的に無効にするため、この上限は使われません。HIP build では自動選択されません (`include/strata/core/adapt_async_default.hpp:21-23,43-55`)。
-- pipeline のコピー投入 (`a_stage_in` / `a_in`) は `a_batch` を参照せず、各 stage の gap にその stage のコピーを投入します。arena の async tier は `--pipeline-windows 2` と併用できず、無効化されます (`src/program/generate.cpp:9047-9062,11845-11855`)。
+- `srcp == &arena_src` の expert arena であること。expert arena 以外ではこの変数の値を使わない（`engine/src/program/generate.cpp:15489-15502`）。
+- 非同期 adaptive tier が実際に動くこと。tier は `--serve` と有効な adaptive 設定（`--adapt-every` / swap 数）を必要とし、`--adapt-async` または自動選択などが別途 tier の起動を決める。この変数自体は tier を有効化しない（`engine/src/program/generate.cpp:11675-11732,15503-15517`; 自動選択条件は `engine/include/strata/core/adapt_async_default.hpp:19-60`）。
+- arena の `--pipeline-windows 2` は非同期 adaptive tier の対象外。pipeline 用の arena copy-in 経路では全 round がひとつのバッチになるため、通常の `a_batch` 分割は使われない（`engine/src/program/generate.cpp:11717-11732,15762-15769`; `engine/include/strata/program/adaptive_range.hpp:33-37`）。
+- resident RAM モードでは非同期 tier が利用可能でも `a_batch` は `0` 固定であり、この変数は無効（`engine/src/program/generate.cpp:15491-15502`）。
+
+この値の判定自体に OS 別分岐はない。Windows の AMD/HIP で非同期 tier を拒否する場合など、tier の別の起動条件により copy-in 自体が実行されない経路はある（`engine/src/program/generate.cpp:11682-11690`）。
 
 ## 実行時の詳細
 
-環境変数は server の adaptive state 初期化時に一度読み、ローカルの `const size_t a_batch` に保持されます。static cache ではありませんが、同じ engine/server 実行中に環境を書き換えても再読込する箇所はなく、変更は次回の初期化まで反映されません (`src/program/generate.cpp:11686-11697`)。
+`a_batch` は adaptive tier の状態・job thread を準備する際に一度計算され、関数内に保持される。リクエストや decode tick ごとに環境を読み直す処理、プロセス起動後の環境変更を再取得する処理はない（`engine/src/program/generate.cpp:15494-15512`）。
 
-arena の逐次経路では、`a_post_batch()` が `a_lo` から `a_hi` までの範囲を次の copy-in batch にし、job thread に `a_copy_in()` を投稿します。`a_batch > 0` なら `a_hi = min(aswaps.size(), a_bi + a_batch)`、0 なら残り全部です。batch のコピー完了後に residency table を更新し、swap が残っていれば次の batch を投稿します (`src/program/generate.cpp:11827-11843,11972-11989`)。したがって正値は round 全体の swap 数を制限せず、各 batch の件数を制限します。
+serial loop では `a_post_batch` が `AdaptiveCopyRange::next_batch` に上限を渡し、job thread が指定範囲の arena blob を GPU cache slot へ非同期コピーする。コピー完了後にその範囲を resident として反映し、残りがあれば次のバッチを投入する。従って正の値は同時にキューへ送る copy-in 件数を区切り、`0` はラウンドの残りをまとめる（`engine/src/program/generate.cpp:15593-15625,15632-15646,15778-15795`; `engine/include/strata/program/adaptive_range.hpp:24-40`）。
 
-async tier の初期化があると stderr の累積統計に `arena, copy-in only, batch %zu` と実際の `a_batch` が出ます (`src/program/generate.cpp:17510-17518`)。値の形式が不正でもこの環境変数自体についての警告はありません。copy 元を読めない場合は `adaptive tier: layer ... could not be read`、GPU copy の投入に失敗した場合は `adaptive tier: copy of layer ... failed: ...` が stderr に出て、decode 側へ `ERR an adaptive refill failed` を返す経路があります (`src/program/generate.cpp:11798-11807,11810-11820,17083-17085`)。
+## ログと測定値
+
+arena で `ajob` がある場合、リクエスト終了時の累積ログに ` (arena, copy-in only, batch %zu, wait %d, pick %s %.2f ms/round)` と表示され、`batch` がこの変数から計算された値（未設定時は `0`）を示す。起動時にこの値だけを理由とするログや無効値警告はない（`engine/src/program/generate.cpp:23704-23713`）。
+
+`docs/DETAILS.md` は `--adapt-async` の概要と別変数の測定記録を載せるが、この batch 上限の値ごとの測定値は記載していない（`docs/DETAILS.md:274-276,1648-1651`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:11686-11697` — arena 判定、helper の変換、既定値、適用値の生成。
-- `src/program/generate.cpp:11827-11843` — batch 範囲と上限の適用。
-- `src/program/generate.cpp:11972-11989` — batch 完了後の residency 更新と次 batch の投稿。
-- `src/program/generate.cpp:9026-9045`, `include/strata/core/adapt_async_default.hpp:19-55` — async 自動選択条件と `STRATA_ADAPT_ASYNC` / CLI との関係。
-- `src/program/generate.cpp:9047-9062,11845-11855` — pipeline 経路の条件と、batch 上限を通らないコピー投入。
-- `src/program/generate.cpp:17510-17518` — arena async tier の統計ログ。
-- `src/program/generate.cpp:11798-11820,17083-17085` — コピー読み取り・投入失敗と decode 側のエラー。
+- 読み取り、既定値、arena 条件: `engine/src/program/generate.cpp:15489-15507`
+- copy-in と batch 分割: `engine/src/program/generate.cpp:15593-15646,15778-15795`; `engine/include/strata/program/adaptive_range.hpp:18-44`
+- 非同期 tier の適用条件: `engine/src/program/generate.cpp:11675-11732`; `engine/include/strata/core/adapt_async_default.hpp:19-60`
+- 観測ログと設計資料: `engine/src/program/generate.cpp:23704-23713`; `docs/DETAILS.md:274-276,1648-1651`

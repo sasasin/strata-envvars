@@ -1,6 +1,6 @@
 # `--backend`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。調査対象 checkout は `main`、`origin/main` と一致し、`git status --short --branch` は `## main...origin/main`（clean）でした。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,54 +8,54 @@
 | コマンド | `strata components remove` |
 | オプション | `--backend` |
 | 別名 | なし |
-| 値 | 必須の文字列。parser に `choices`、型変換、既定値の明示はない（省略時 `None`） |
+| 値 | backend family 名。parser は文字列を受け取り、選択肢や型を指定しない |
 
 ## 役割
 
-共通 parser 定義の説明は「この PC の GPU を検出する代わりに engine family を選ぶ」です。remove ではこの値を engine 一覧の互換性判定と Qwen engine の「使用中」判定に使います。削除候補そのものを backend で絞り込む機能ではありません。
+削除コマンド内でエンジン一覧を評価するときに、どの GPU backend のエンジンをこの PC で使用するものとして扱うかを指定します。削除対象は位置引数のバージョンまたはフォルダー名で決まり、`--backend` は対象の絞り込みには使われません。複数 GPU backend がある PC で、削除可否の「使用中」判定を特定 backend に合わせたい場合に関係します。
 
 ## 使い方
 
 ```sh
-strata components remove 0.2.10 --backend cuda
+strata components remove 0.1.54 --backend amd
 ```
 
-位置引数には engine の版番号または folder 名を指定します。複数 family に同じ版番号がある場合は `--family qwen` または `--family deepseek` で対象 family を絞れます。実際に削除を行うコマンドなので、実行前に `strata components engines` で対象を確認してください。
+`amd` は `hip` backend として解釈されます。実際に削除する前に対象を確認する場合は `strata components engines` で一覧を表示できます。
 
 ## 値と既定値
 
-- `--backend` は値を1つ取ります。省略時は `None` で、ハードウェア検出結果をそのまま使います。
-- CLI 値が空でなければ `split_backend()` が前後空白を除き小文字化します。`hip-rdna2` の形式は `hip` family と `rdna2` variant に分けられます。それ以外の値は backend 名としてそのまま渡されます。
-- parser は backend 名を `choices` で制約していません。したがって任意の文字列が parser を通ります。コード上で remove 専用の未知値エラーは確認できませんでした。
+- 省略時は `updater.detect_hardware()` による検出結果を使います。検出では `STRATA_ENGINE_BACKEND`、保存済みの選択、OS・GPU 情報が参照されます（`terminal/strata_cli/update_cmd.py:303-321`、`terminal/strata_control/updater.py:316-336`、`terminal/strata_control/engine_component.py:542-565`）。
+- 明示時は値を backend 名として正規化し、`cuda` / `hip` / `sycl` / `metal` / `cpu` など `BACKEND_MATRIX` の family 名を指定できます。別名 `nvidia` → `cuda`、`amd` → `hip`、`intel` / `arc` → `sycl` と、`hip-<variant>` 形式も処理されます（`terminal/strata_cli/update_cmd.py:283-300`、`terminal/strata_control/engine_component.py:490-502`、`terminal/strata_control/targets.py:25-30`）。
+- parser は `--backend` に `default=None` のみを設定し、`choices` や `type` による入力検証をしません。未登録の値も parser では拒否されず、`requested_hardware()` がその文字列を backend として一覧評価へ渡します（`terminal/strata_cli/update_cmd.py:47-56,88-91,283-300`）。無効な値では使用中エンジンを正しく特定できない可能性があるため、指定する場合は実在する backend family 名を使ってください。
+- 同じオプションを複数回指定した場合の独自処理はありません。値を取る `argparse` 引数の通常の解析に従い、後の値が使われます。
 
 ## 実行時の動作
 
-`update_cmd.run()` は最初にハードウェアを検出し、`--backend` が truthy なら検出した backend を CLI 値で上書きして、値の出所を `requested` と記録します。この値は `Context.hardware` に渡されます。`STRATA_ENGINE_BACKEND` は検出処理側で参照されますが、CLI の `--backend` が指定された場合はその backend が後から上書きします。remove 処理は `engine_library.list_engines()` から候補を探し、`delete_engine()` へ進みます（`strata_cli/update_cmd.py:244-256,272-273,358-378,395-400`、`strata_control/updater.py:261-281`）。
+`run()` は `--backend` が空でなければ `requested_hardware()` を呼び、明示された backend を含む hardware 情報を一覧処理へ渡します。backend が有効な family なら環境変数 `STRATA_ENGINE_BACKEND` にその family を一時的に設定して GPU 情報を検出し、variant がある場合は `variant_wanted` に保持します。`amd` のような alias は family に変換されます。空文字列は条件分岐で未指定扱いとなり、通常の検出へ進みます（`terminal/strata_cli/update_cmd.py:283-321`）。
 
-backend は一覧の行を消すフィルターではありません。Qwen engine は `ec.resolve(..., backend=wanted)` で選ばれる engine を `active` として扱い、DeepSeek engine は OS/backend との適合性を `fits` に記録します（`strata_control/engine_library.py:91-123,136-162`）。削除可否は一覧行の `active` と、実行中プロセスが対象 folder を使っているかで決まります。実行中の engine は `--backend` にかかわらず削除を拒否します（`strata_control/engine_library.py:84-88,167-178,294-309`）。
+削除対象の候補は、位置引数のフォルダー名またはバージョンと `--family` で選択されます。`--backend` は一覧の各項目について、指定 backend で解決されるエンジンを「使用中」と判定する処理、および PC との適合性判定に影響します（`terminal/strata_cli/update_cmd.py:445-466`、`terminal/strata_control/engine_library.py:98-134`）。そのため、指定 backend が実際の選択と異なると、既定で使用されるエンジンの active 判定が変わることがあります。無効な値も parser が拒否せず、選択中エンジンが見つからず active が未設定になる経路があります（`terminal/strata_control/engine_library.py:98-122`）。
 
-このため `--backend` は削除対象の選択条件ではありませんが、Qwen engine の `active` 判定には影響します。実際の環境と異なる backend を指定すると、選択中 engine の保護判定が変わる可能性があります。削除時は通常、実機を表す backend を指定するか、backend を省略して検出に任せてください。CLI 値を設定ファイルへ保存する処理は remove 経路にありません。
+削除時はロックを取り直して一覧を再評価し、active エンジンと実行中プロセスが使うエンジンを削除拒否します。`--backend` は実行中プロセスの実体確認を置き換えず、プロセスによる使用は別途チェックされます（`terminal/strata_control/engine_library.py:91-95,139-148,317-342`）。削除対象ディレクトリを一時名へ rename した後に再帰削除し、Qwen 系または shape engine の pin・履歴などの状態を更新します（`terminal/strata_control/engine_library.py:337-366`）。モデルや設定ファイル自体は削除対象ではありません（`terminal/strata_cli/update_cmd.py:88-91,492-497`）。
 
 ## 適用条件と副作用
 
-- `--components-dir DIR` を併用すると、一覧と削除対象の検索に使う component folder を指定できます。省略時は `engine_component.components_dir()` の per-user folder（または `STRATA_COMPONENTS_DIR`）です（`strata_cli/update_cmd.py:47-50,244`、`strata_control/engine_component.py:176-186`）。
-- 選択した engine が「使用中」、または実行中 program が利用している場合は削除されません。後者は process-use check で判定されます（`strata_control/engine_library.py:84-88,167-178,308-309`）。
-- 削除時は対象 folder を `.deleting-<識別子>` に rename してから削除を試み、残った `.deleting-*` directory を後続処理で掃除します。Qwen engine では対応する previous/pinned/failed state と履歴も更新します。DeepSeek engine では stale pin を解除する場合があります（`strata_control/engine_library.py:310-334,341-348`）。モデルや設定、および別 family の engine は変更しません。
-- `--backend` そのものはネットワークアクセスや GPU 実行を行いません。remove の処理はローカルの一覧・状態・ファイル操作です（`strata_control/engine_library.py:180-195,294-334`）。
+- `--backend` は `strata components remove` の共通引数として登録されています。削除対象のバージョンが複数 family に存在して曖昧な場合は、別の `--family` で指定します（`terminal/strata_cli/update_cmd.py:88-91`、`terminal/strata_control/engine_library.py:184-197`）。
+- 現在使用中、または実行中プログラムが使用するエンジンは削除できません。フォルダーの rename に失敗した場合も削除を中止し、元のエンジンを残します。ファイルを使用中で再帰削除できない場合、一時名 `.deleting-*` に残り、次回の削除時に掃除されます（`terminal/strata_control/engine_library.py:139-148,317-366,373-375`）。
+- 成功時はエンジンのファイルを削除し、関連する pin / previous / history 状態を更新します。ネットワーク取得処理はこの削除経路にはありません（`terminal/strata_cli/update_cmd.py:445-497`、`terminal/strata_control/engine_library.py:317-366`）。
 
 ## 出力とエラー
 
-成功時は通常、人間向けに削除した engine の version と空き容量を表示します。`--output json` または `--json` では成功内容を JSON で出力します。`--json` は CLI の dispatch 前に `output=json` へ正規化されます（`strata_cli/update_cmd.py:395-400`、`strata_cli/cli.py:2249-2252`）。
-
-`--backend` の値だけを理由とする parser validation error はありません。候補不在・版番号の曖昧さ・使用中 engine の削除拒否は `UpdateError` として終了コード 2 になり、通常出力では stderr に `strata: ...`、JSON モードでは error object が出ます。rename が OS error で失敗した場合は、変更なしとして終了コード 6 です（`strata_control/engine_library.py:198-211,294-316`、`strata_cli/update_cmd.py:237-242,307-311`）。
+- 成功時、人間向け出力は削除した engine の version と解放サイズを表示します。`--output json` または `jsonl` では成功結果を JSON で出力します（`terminal/strata_cli/update_cmd.py:303-312,445-497`）。
+- 対象なし、同じ version に複数候補がある場合、または active / running の場合は `UpdateError` として失敗します。通常出力では `strata: ...` を stderr に出し、エラーコードを返します。rename に失敗した場合はコード 6 です（`terminal/strata_control/engine_library.py:184-197,317-342`、`terminal/strata_cli/update_cmd.py:307-312,374-378`）。
+- 無効な `--backend` 値に対する専用の parser エラーはありません。値の不整合による一覧・active 判定への影響を、入力検証エラーとしては報告しません（`terminal/strata_cli/update_cmd.py:47-56,283-300`、`terminal/strata_control/engine_library.py:98-122`）。
 
 ## 根拠
 
-- 索引と scope: `docs/cli/README.md:309-325` — `strata components remove` の階層、`--backend` の予定リンク、共通 option の案内。
-- parser: `strata_cli/update_cmd.py:47-58,88-95` — `--backend` の共通定義、値を取る parser action、remove への登録。
-- backend 反映と remove 経路: `strata_cli/update_cmd.py:244-256,272-273,358-400`。
-- backend の分解と hardware 検出: `strata_control/engine_component.py:465-471`、`strata_control/updater.py:261-281`。
-- 一覧、active 判定、削除可否、ファイル・state 更新: `strata_control/engine_library.py:84-123,136-195,294-348`。
-- 共通出力 option と `--json` の正規化: `strata_cli/cli.py:508-515,2249-2252`。
-
-調査は記載した commit のソースに限定しています。実機ごとの検出結果や、削除対象を使う外部 process の状態はソース閲覧だけでは確認していません。
+- `terminal/strata_cli/update_cmd.py:47-56,88-91` — 共通 parser の `--backend` 宣言と `remove` 固有の引数。
+- `terminal/strata_cli/update_cmd.py:283-300,303-321` — 明示値の backend 変換と hardware 情報の構築。
+- `terminal/strata_cli/update_cmd.py:445-497` — 候補選択、削除呼び出し、成功出力。
+- `terminal/strata_control/engine_library.py:98-134,139-148` — backend に基づく active / 適合性評価と削除可否フラグ。
+- `terminal/strata_control/engine_library.py:317-366` — 再検証、削除、状態更新および失敗経路。
+- `terminal/strata_control/engine_component.py:490-502,542-565,1136-1231` — backend alias、未指定時の検出、engine 解決規則。
+- `terminal/strata_control/targets.py:22-30` — 現行 checkout が扱う backend family と platform の組み合わせ。
+- `terminal/strata_control/updater.py:316-336` — hardware 検出で参照する環境変数と GPU 情報。
