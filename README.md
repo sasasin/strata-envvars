@@ -65,15 +65,33 @@ codex exec --skip-git-repo-check --sandbox 'workspace-write' '`$HOME/src/github.
 uv run ./create-envvars-docs.py -p 5 -l 100
 ```
 
-`create-envvars-docs.py` は `000_envvers.md` の一覧のなかで `docs/envvars/${環境変数名}.md` が存在しない変数を先に確定してから、1 変数 1 セッションで codex を起動する。各 codex に「存在しないものを勝手に選ばせる」 `seq | xargs` 運用と違い、並列に走らせても同じ変数を重複調査せず、無駄なセッション（全件作成済みのときに何も作らない実行）も発生しない。
+`create-envvars-docs.py` は `000_envvers.md` の一覧のなかで `docs/envvars/${環境変数名}.md` が存在しない変数を先に確定してから、1 変数 1 セッションでエージェント（既定は codex）を起動する。各エージェントに「存在しないものを勝手に選ばせる」 `seq | xargs` 運用と違い、並列に走らせても同じ変数を重複調査せず、無駄なセッション（全件作成済みのときに何も作らない実行）も発生しない。
 
 - `-l`, `--doc-limit N` … 今回作成する件数の上限 (`0` で全件、既定 1)
-- `-p`, `--parallel N` … 同時に動かす codex の数
-- `--dry-run` … 対象を一覧するだけで codex は実行しない
+- `-p`, `--parallel N` … 同時に動かすエージェントの数
+- `-r`, `--runner {codex,pi}` … 調査・作成を任せるエージェント（既定 codex）
+- `--dry-run` … 対象を一覧するだけでエージェントは実行しない
 - `--include-tried` … 調べても文書ができなかった変数を再調査候補に加える
 - `--reset-state` … 試行記録を消して組み直す
 
-Strata が実際に読まない候補（テスト用 helper のログパス、外部ライブラリや driver だけの名前など）は、codex が `001_investigation.md` の手順どおり「索引との食い違い」として報告し、文書を作らない。そういう変数を毎回選び直さないよう、試行結果を `.create-envvars-docs.state.json` に記録して、既定では未調査の変数だけを選ぶ。最後のサマリに出る `残りの未作成 N 件（未調査 M 件 / 試行済み K 件）` の `M` が 0 になったら、その一覧に対しては調査は飽和している。試行記録は `.gitignore` してあるので、履歴をコミットしたければ外す。
+## ランナーの切り替え（codex / pi）
+
+`-r pi` にすると Codex の代わりに Pi を 1 文書 1 セッションで起動する。実際に叩くコマンドは次（依頼文は codex と同一）。
+
+```bash
+pi --provider ollama-cloud --model deepseek-v4.1-flash:1017 --thinking high \
+  --print --no-session --no-approve --no-extensions --no-mcp --no-skills \
+  --tools read,bash,edit,write -- <依頼文>
+```
+
+- `--print` の stdout が最終応答（codex の `--output-last-message` 相当）、stderr がログ。
+- `--no-extensions --no-mcp --no-skills` と `--tools` で、web 検索・MCP・このリポジトリの skill など調査に不要なツールをモデルに宣言しない。Strata のソースだけを一次情報にする基準を守るため。
+- codex の `--sandbox workspace-write` に相当する強制は Pi にない。Strata 側を読み取り専用にしているのは依頼文の制約だけなので、実行後に `git -C "$HOME/src/github.com/Niko1221/Strata" status --short` で確認する。
+- ollama-cloud の契約上、同時実行数は 3 まで。`-p` を 3 を超えない範囲で使う。
+
+`--model` / `--thinking` は両ランナー共通の既定値上書き（codex では `model_reasoning_effort`、pi では `--thinking`）。`--provider` と `--tools` は `-r pi` のときだけ効く。
+
+Strata が実際に読まない候補（テスト用 helper のログパス、外部ライブラリや driver だけの名前など）は、エージェントが `001_investigation.md` の手順どおり「索引との食い違い」として報告し、文書を作らない。そういう変数を毎回選び直さないよう、試行結果を `.create-envvars-docs.state.json` に記録して、既定では未調査の変数だけを選ぶ。最後のサマリに出る `残りの未作成 N 件（未調査 M 件 / 試行済み K 件）` の `M` が 0 になったら、その一覧に対しては調査は飽和している。試行記録は `.gitignore` してあるので、履歴をコミットしたければ外す。
 
 変更のあった環境変数の md の更新。
 
@@ -106,3 +124,5 @@ echo "今後検討"
 ```bash
 uv run ./create-cli-docs.py -p 12 -l 100
 ```
+
+`-l` / `-p` に加えて `-r {codex,pi}` が使える。挙動とランナーの切り替えは上の「ランナーの切り替え（codex / pi）」と同じ（試行記録を持たないぶん、`--dry-run` は無い）。

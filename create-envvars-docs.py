@@ -3,6 +3,8 @@
 
 候補一覧には Strata が実際に読まない名前も混じっているため、調査しても文書が作られない
 変数がある。そのような変数を毎回選び直さないよう、試行結果を STATE ファイルに記録する。
+
+調査・作成は --runner で選んだエージェント (codex / pi) に委譲する。起動部の詳細は agent_runner.py。
 """
 
 from __future__ import annotations
@@ -12,10 +14,19 @@ import json
 import re
 import subprocess
 import sys
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+
+from agent_runner import (
+    FAILURE_LOG_LINES,
+    RunnerConfig,
+    add_runner_args,
+    check_binary,
+    describe,
+    resolve_runner,
+    run_prompt,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -77,10 +88,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "docs/envvars/000_envvers.md の一覧から未作成の環境変数文書を決め、"
-            "1 変数 1 セッションで Codex に調査・作成させます。"
+            "1 変数 1 セッションで --runner で選んだエージェント (codex / pi) に調査・作成させます。"
         ),
         epilog="--doc-limit 0 は未作成文書をすべて対象にします。",
     )
+    add_runner_args(parser)
     parser.add_argument(
         "-l",
         "--doc-limit",
@@ -95,7 +107,7 @@ def parse_args() -> argparse.Namespace:
         type=positive_int,
         default=1,
         metavar="N",
-        help="同時に実行する codex の最大数 (default: 1)",
+        help="同時に実行するエージェントの最大数 (default: 1)",
     )
     parser.add_argument(
         "--include-tried",
@@ -105,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="作成対象を一覧するだけで codex は実行しない",
+        help="作成対象を一覧するだけでエージェントは実行しない",
     )
     parser.add_argument(
         "--reset-state",
@@ -116,7 +128,7 @@ def parse_args() -> argparse.Namespace:
         "--stale-report",
         type=Path,
         default=REPO_ROOT / ".strata-stale.json",
-        help="find-stale.py の報告。削除理由を codex へ渡す (存在しなければ無視)",
+        help="find-stale.py の報告。削除理由をエージェントへ渡す (存在しなければ無視)",
     )
     return parser.parse_args()
 
@@ -246,7 +258,11 @@ def find_missing(names: list[str]) -> tuple[list[str], list[str]]:
     return missing, skipped
 
 
-def create_doc(envvar: str, stale_note: str = "") -> tuple[str, int, str, str]:
+def create_doc(
+    config: RunnerConfig,
+    envvar: str,
+    stale_note: str = "",
+) -> tuple[str, int, str, str]:
     doc_path = DOC_ROOT / f"{envvar}.md"
     prompt = PROMPT_TEMPLATE.format(
         strata_root=STRATA_ROOT,
@@ -256,49 +272,17 @@ def create_doc(envvar: str, stale_note: str = "") -> tuple[str, int, str, str]:
         investigation=DOC_ROOT / "001_investigation.md",
         stale_note=stale_note,
     )
-    with tempfile.TemporaryDirectory(prefix="create-envvars-docs-") as temp_dir:
-        temp_path = Path(temp_dir)
-        last_message_path = temp_path / "last-message.md"
-        log_path = temp_path / "codex.log"
-        command = [
-            "codex",
-            "exec",
-            "--model",
-            "gpt-6-luna",
-            "--config",
-            "model_reasoning_effort=high",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "workspace-write",
-            "--cd",
-            str(REPO_ROOT),
-            "--output-last-message",
-            str(last_message_path),
-            prompt,
-        ]
-        with log_path.open("w", encoding="utf-8") as log_file:
-            result = subprocess.run(
-                command,
-                cwd=REPO_ROOT,
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-            )
-
-        last_message = (
-            last_message_path.read_text(encoding="utf-8").strip()
-            if last_message_path.is_file()
-            else ""
-        )
-        log_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        failure_log = "\n".join(log_lines[-60:]) if result.returncode != 0 else ""
-    return envvar, result.returncode, last_message, failure_log
+    returncode, last_message, failure_log = run_prompt(
+        config,
+        prompt,
+        temp_prefix="create-envvars-docs-",
+    )
+    return envvar, returncode, last_message, failure_log
 
 
 def main() -> int:
     args = parse_args()
+    config = resolve_runner(args, REPO_ROOT)
     try:
         names = read_index()
     except (FileNotFoundError, OSError) as exc:
@@ -340,6 +324,10 @@ def main() -> int:
             print(f"  {name} -> docs/envvars/{name}.md")
         return 0
 
+    if not check_binary(config):
+        return 2
+    print(f"{describe(config)} / 並列 {args.parallel}", flush=True)
+
     notes = load_stale_notes(args.stale_report, strata_head())
     if notes:
         hit = sum(1 for name in targets if name in notes)
@@ -351,13 +339,13 @@ def main() -> int:
         futures = {}
         for name in targets:
             print(f"\n=== 開始: {name} ===", flush=True)
-            futures[executor.submit(create_doc, name, notes.get(name, ""))] = name
+            futures[executor.submit(create_doc, config, name, notes.get(name, ""))] = name
         for future in as_completed(futures):
             envvar = futures[future]
             try:
                 name, returncode, last_message, failure_log = future.result()
             except OSError as exc:
-                print(f"codex を実行できませんでした: {exc}", file=sys.stderr)
+                print(f"{config.runner} を実行できませんでした: {exc}", file=sys.stderr)
                 record(state, envvar, "error")
                 failed_count += 1
                 continue
@@ -377,11 +365,14 @@ def main() -> int:
                 print(last_message)
             if returncode != 0:
                 print(
-                    f"codex が終了コード {returncode} で終了しました: {name}",
+                    f"{config.runner} が終了コード {returncode} で終了しました: {name}",
                     file=sys.stderr,
                 )
                 if failure_log:
-                    print(f"--- codex の末尾ログ（最大60行）---\n{failure_log}", file=sys.stderr)
+                    print(
+                        f"--- {config.runner} の末尾ログ（最大{FAILURE_LOG_LINES}行）---\n{failure_log}",
+                        file=sys.stderr,
+                    )
 
     created_now = sum(1 for name in targets if (DOC_ROOT / f"{name}.md").is_file())
     still_missing = [name for name in missing if not (DOC_ROOT / f"{name}.md").is_file()]

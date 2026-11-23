@@ -105,11 +105,12 @@ option 文字列そのものが出るか」（Stage 2）で候補を絞ること
 ```bash
 cd "$HOME/src/github.com/sasasin/strata-envvars"
 uv run ./create-envvars-docs.py --dry-run        # 対象を確認
-uv run ./create-envvars-docs.py -p 5 -l 100      # envvars
-uv run ./create-cli-docs.py -p 12 -l 100         # CLI
+uv run ./create-envvars-docs.py -p 5 -l 100      # envvars（codex）
+uv run ./create-cli-docs.py -p 12 -l 100         # CLI（codex）
+uv run ./create-envvars-docs.py -r pi -p 3 -l 100  # Pi ランナー（ollama-cloud は 3 並列まで）
 ```
 
-1 変数（1 オプション）= 1 codex セッション。CLI の `--help` は索引に載せないので作成されない。飽和判定・state ファイル・並列数の目安は `references/runner.md`。
+1 変数（1 オプション）= 1 セッション。既定のランナーは codex で、`-r pi` にすると Pi（ollama-cloud / deepseek-v4.1-flash:1017 / thinking high）に委譲する。CLI の `--help` は索引に載せないので作成されない。飽和判定・state ファイル・ランナーの起動形・並列数の目安は `references/runner.md`。
 
 ## D / E. 1 件の調査
 
