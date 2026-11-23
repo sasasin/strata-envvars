@@ -44,13 +44,23 @@ def similar_sha(a: str, b: str, max_diff: int = 3) -> bool:
     return 0 < sha_distance(a, b) <= max_diff
 
 
-QUOTED_RE = re.compile(r'"([A-Z][A-Za-z0-9_]{2,})"')
+QUOTED_RE = re.compile(r"[\"']([A-Z][A-Za-z0-9_]{2,})[\"']")  # JS はシングルクォートが多い
 SHELL_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
 BAT_REF_RE = re.compile(r"%([A-Z_][A-Za-z0-9_]{2,})%")
+# JS/TS のプロパティ参照: process.env.NAME / env.NAME / environ.NAME。
+# 大文字始まりかアンダースコアを含む名前だけ拾う（env.begin() などのメソッド名を避ける）。
+JS_REF_RE = re.compile(r"(?:process\.env|\benv|\benviron)\.([A-Z][A-Za-z0-9_]*|[A-Za-z0-9_]+_[A-Za-z0-9_]+)")
+# PowerShell: $env:NAME
+PS_REF_RE = re.compile(r"\$env:([A-Za-z][A-Za-z0-9_]*)")
+# CMake: $ENV{NAME}
+CMAKE_ENV_RE = re.compile(r"\$ENV\{([A-Za-z][A-Za-z0-9_]*)\}")
 GREP_PATTERNS = [
     r'"[A-Z][A-Za-z0-9_]{2,}"',
-    r"\$\{?[A-Za-z_][A-Za-z0-9_]*",
+    r"'[A-Z][A-Za-z0-9_]{2,}'",
+    r"\$\{?[A-Za-z_][A-Za-z0-9_]*",  # $NAME / ${NAME} / $env:NAME / $ENV{NAME} の行も拾う
     r"%[A-Z_][A-Za-z0-9_]{2,}%",
+    r"(process\.env|env|environ)\.[A-Z][A-Za-z0-9_]*",
+    r"(process\.env|env|environ)\.[A-Za-z0-9_]+_[A-Za-z0-9_]+",
 ]
 GREP_EXCLUDES = [
     ":(exclude)docs/**",
@@ -76,7 +86,14 @@ def build_name_index(strata: pathlib.Path, revision: str) -> dict[str, set[str]]
             if len(parts) < 3:
                 continue
             path, text = parts[0], parts[2]
-            for match in (*QUOTED_RE.finditer(text), *SHELL_REF_RE.finditer(text), *BAT_REF_RE.finditer(text)):
+            for match in (
+                *QUOTED_RE.finditer(text),
+                *SHELL_REF_RE.finditer(text),
+                *BAT_REF_RE.finditer(text),
+                *JS_REF_RE.finditer(text),
+                *PS_REF_RE.finditer(text),
+                *CMAKE_ENV_RE.finditer(text),
+            ):
                 index.setdefault(match.group(1), set()).add(path)
     return index
 
