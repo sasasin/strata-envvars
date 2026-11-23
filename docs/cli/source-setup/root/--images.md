@@ -1,67 +1,66 @@
 # `--images`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`update.sh` 等から委譲） |
+| コマンド | `setup.py`（モデルの setup。`setup.sh` / `START-HERE.bat` などから委譲） |
 | オプション | `--images` |
 | 別名 | なし |
 | 値 | `qwen-image` または `no` |
-| 既定値 | 未指定（`None`）。未指定時は画像生成の setup 処理を呼ばない |
 
 ## 役割
 
-ソース checkout の setup で、Qwen-Image-2.1-Turbo による画像**生成**機能をモデルの実行設定へ追加するか、設定から外すかを指定します。これはチャットで画像を読み取る `--vision` とは別の機能です（`setup.py:9090-9098`; [`docs/IMAGES.md`](https://github.com/Niko1221/Strata/blob/c62d5e3a15b40ea51c96aae9e8d36928965f53ab/docs/IMAGES.md)）。
+モデルの run config に画像生成設定を追加するか、設定を外すかを選びます。`qwen-image` は Qwen-Image-2.1-Turbo 用の `sd-cli` を選択 backend 向けに準備し、モデルファイルを取得・検証して、`serve/images.py` が読む `images` セクションを設定します。これはチャット入力画像の読取りを制御する `--vision` とは別機能です（parser の登録: `terminal/setup.py:11245-11254`、設定組立て: `terminal/strata_control/setup_config.py:561-575`）。
 
 ## 使い方
 
-```sh
-./setup.sh --setup --images qwen-image
-```
-
-画像生成を設定から外す場合:
+Strata の checkout ルートで実行します。初回は確認プロンプトがあり、`--yes` を付けると推奨回答として承認されます。
 
 ```sh
-./setup.sh --setup --images no
+# 画像生成を構成し、モデルの起動は行わない
+./setup.sh --setup --images qwen-image --no-start
+
+# 既存の画像生成設定を外す
+./setup.sh --setup --images no --no-start
 ```
 
-`setup.sh` は引数を `setup.py` に渡し、`update.sh` も `--update` を加えて `setup.sh` を実行します（`setup.sh:9-13`; `update.sh:62`）。Windows の `START-HERE.bat` も setup.py に委譲します（`START-HERE.bat:48-53`）。
+Windows では `START-HERE.bat` を使えます。`--images` は `setup.py` に登録され、同じトップレベル scope の setup ラッパーから委譲されます（`docs/cli/README.md` の `source-setup` 節、`docs/cli/000_cli_tools.md:15`）。
 
 ## 値と既定値
 
-- `argparse` の `choices` は `qwen-image` と `no` です。値の省略やそれ以外の値は parser の引数エラーになります（`setup.py:9096-9098`）。
-- この parser に明示的な `default` はなく、未指定では `a.images` は未設定値です。通常 setup は `a.images` が truthy の場合だけ `setup_images()` を呼びます（`setup.py:9097-9098,10434-10435`）。
-- `qwen-image` では denoiser の量子化や backend は別 option が未指定なら GPU と VRAM 等から選ばれます。関連する `--image-quant`、`--image-backend`、`--image-gpu-policy`、`--image-native` は同じ parser に定義されています（`setup.py:9099-9106,5065-5077`）。
+- `qwen-image`: Qwen-Image-2.1-Turbo の画像生成設定を作ります。
+- `no`: setup 処理で `images` セクションを削除します。
+- 省略時は parser の値が `None` です。config 組立て側はこの場合 `images` を書き換えず、以前の設定があれば `carry_over` で維持します（`terminal/setup.py:11253-11254`、`terminal/strata_control/setup_config.py:574-575`、`terminal/setup.py:7473-7484`）。
+- それ以外の値は `argparse` の `choices` により拒否されます。独自の alias や空値の補正はありません（`terminal/setup.py:11253-11254`）。
 
 ## 実行時の動作
 
-- `--images qwen-image` は、選ばれた backend と量子化を表示し、モデルファイルをダウンロードして画像生成を設定するか確認します。確認に「いいえ」と答えると設定生成を中止し、`None` を返します。`--yes` を付けたときの確認応答は `ask()` の共通動作に従います（`setup.py:5080-5091`）。
-- 承諾すると models directory を作成し、必要容量（3ファイルの合計 + 5 GB）に満たない空き容量なら警告します。その後 stable-diffusion.cpp の `sd-cli` を backend 向けにビルドし、選んだ denoiser、VAE、Qwen3-VL text encoder を取得して SHA-256 を検証します（`setup.py:5092-5104,5004-5061`; `tools/image/qimage.py:24-55,107-114`）。
-- 成功すると実行設定の `images` セクションに、実行ファイル、backend、quant、各モデルのパス、GPU policy 等を記録します。サーバーはこれを画像生成 API で使います（`tools/image/qimage.py:190-203`; `setup.py:10434-10435,10453,10474-10475`）。実装文書では API を `POST /v1/images/generations` としています（`docs/IMAGES.md:3-5,29-40`）。
-- `--images no` は `setup_images()` が `None` を返し、設定書き込み直前に `images` キーを削除します。既存設定が変更される場合、setup は旧ファイルを `.bak` にコピーしてから新しい設定を書きます（`setup.py:5080-5084,6666-6676`）。
-- `--images` を省略した場合は `setup_images()` を呼びません。再 setup 時は `images` が setup 管理キーに含まれないため、既存設定にある同キーは引き継がれます。初回 setup では引き継ぎ元がないため生成されません（`setup.py:6502-6503,6513-6524,10434-10435`）。
+`qwen-image` を指定すると、setup は backend と denoiser の量子化を選び、確認後に `sd-cli` をビルドまたは既存 build を再利用します。CUDA/HIP/Vulkan/CPU の選択処理は `terminal/setup.py:5883-5895` と `terminal/tools/image/qimage.py:65-104` にあります。GPU memory が 8 GB 以下なら `Q4_K_M`、12 GB 以下なら `Q6_K`、それより大きければ `Q8_0` を推奨し、CPU では `Q4_K_M` です。明示した `--image-quant` が推奨より大きい場合は警告して選択を維持します。`--image-backend`、`--image-quant`、`--image-gpu-policy` と、native/noise/VAE の各 image option は同じ parser にあります（`terminal/setup.py:11255-11266`）。
+
+確認に `n` と答えると画像用の設定生成を中止し、`None` が config に渡されます。`y`（既定）または `--yes` の場合、`engine-image/` に `sd-cli` と `BUILD.json` を作成・更新し、選んだ denoiser、VAE、text encoder を data folder 内の `models/qwen-image-2.1-turbo/` に取得して SHA-256 を検証します。その後、実行ファイル、backend、model file のパスなどを含む `images` セクションを返します（`terminal/setup.py:5898-5929`、`terminal/setup.py:5816-5879`、`terminal/tools/image/qimage.py:235-253`）。このセクションは画像生成 API の処理が参照します（`terminal/serve/images.py:20`）。
+
+`no` のとき helper は `None` を返し、保存前に `write_setup_config` が `images` キーを取り除きます。設定ファイルが変更される場合、以前のファイルは `.bak` として保持されます（`terminal/setup.py:5898-5903`、`terminal/setup.py:7631-7664`）。
 
 ## 適用条件と副作用
 
-- `--images` は「画像を読む」設定ではありません。画像読み取りは `--vision` 側の設定です（`setup.py:9090-9098`; `docs/IMAGES.md:3-5`）。
-- `qwen-image` は安定拡散系エンジンのコンパイル、ネットワークからのソース／モデル取得、ファイル作成を伴います。CUDA backend には CUDA Toolkit の `nvcc` が必要で、Vulkan では環境によって Vulkan SDK が必要です（`setup.py:4937-4956,4963-4990,5021-5058`）。
-- モデルは Qwen Research License の対象です。setup はライセンス確認を促す文言を表示します。商用利用前にライセンスを確認してください（`setup.py:5085-5089`; `tools/image/qimage.py:58-60`）。
-- macOS の通常 source setup は argparse より前に `metal/setup_mac.py` に委譲し、macOS Control setup も別関数で終了するため、これらの経路では `setup_images()` を通りません（`setup.py:9068-9069,7703-7707,9220-9223,8859-8865,9030`）。委譲先 `metal/setup_mac.py` がこの引数をどう扱うかは本調査では追っていません。
+- `qwen-image` は setup のモデル設定経路で処理されます。確認を断れば画像設定の build/download は行われません（`terminal/strata_control/setup_config.py:574-575`、`terminal/setup.py:5904-5919`）。
+- 画像生成の build が無効な CUDA/HIP/Vulkan SDK 環境では、必要な build tool の取得・利用またはコンパイルが必要です。CUDA で `nvcc` が見つからない場合は失敗し、Vulkan では必要に応じて SDK を `third_party/` に取得します（`terminal/setup.py:5731-5746`、`terminal/setup.py:5760-5785`、`terminal/setup.py:5838-5879`）。
+- 画像モデル3ファイルのダウンロードでネットワークエラー、サイズ不一致、または pinned SHA-256 不一致が起きると setup は失敗します。不一致ファイルは `.bad` に保持され、再実行を案内します（`terminal/setup.py:5920-5924`、`terminal/setup.py:3471-3539`、`terminal/setup.py:3772-3825`）。
+- 画像モデルは Qwen Research License の対象で、setup はライセンス案内を表示します（`terminal/setup.py:5905-5908`、`terminal/tools/image/qimage.py:58-60`）。
+- `--help` にはこのオプションは表示されません。parser の help が `argparse.SUPPRESS` です（`terminal/setup.py:11252-11254`）。
 
-## 出力と失敗
+## 出力とエラー
 
-- backend / モデル量子化、ライセンス案内、確認プロンプト、完了時の API URL を表示します。`--images no` または確認を断った場合は `images` セクションを設定に残しません（`setup.py:5086-5104,6666-6667,10474-10475`）。
-- 要求された backend の前提を満たさない場合、例えば CUDA 用 `nvcc` が見つからない場合や Windows で必要な Vulkan SDK がない場合は `fail()` 経路に入ります。ビルド後に `sd-cli` が存在しない場合もエラーになります（`setup.py:5021-5026,5038-5049,5052-5059`）。
-- ダウンロードに失敗する場合や、取得ファイルが期待するサイズ・SHA-256 と一致しない場合は処理が失敗します（`setup.py:5095-5100`; `tools/image/qimage.py:43-55`）。エラーごとの終了コードや stderr 文言は、このオプションの呼び出し経路から一律には特定できないため記載していません。
+setup は画像モデルの容量を表示して確認を求め、build/download の進捗、成功表示、量子化推奨との差の警告を出します（`terminal/setup.py:5905-5929`、`terminal/setup.py:5883-5895`）。無効な値は `argparse` の usage error（終了コード 2）になります。画像モデル取得や engine 準備で setup が `fail()` した場合、エラー案内を出して終了コード 1 です（`terminal/setup.py:1049-1056`）。
 
 ## 根拠
 
-- parser、非表示の help 設定、候補値: `setup.py:9096-9106`
-- setup 本体からの呼び出しと設定への反映: `setup.py:10434-10435,10453,10474-10475`
-- setup 処理、確認、ビルド・ダウンロード・検証: `setup.py:5004-5061,5065-5104`
-- 設定の引き継ぎ・削除・backup: `setup.py:6502-6503,6513-6524,6648-6676`
-- 生成モデル、保存パス、backend / quant の規則、ライセンス: `tools/image/qimage.py:1-15,37-71,88-114,190-203`
-- wrapper の委譲: `setup.sh:9-13`, `update.sh:62`, `START-HERE.bat:48-53`
-- platform 分岐: `setup.py:7703-7707,8859-8865,9030,9068-9069,9220-9225`
+- `terminal/setup.py:11252-11266` — `--images` と関連 image option の parser、choices、既定値、help 非表示。
+- `terminal/strata_control/setup_config.py:202`、`terminal/strata_control/setup_config.py:574-575` — setup config が `setup_images` を呼び出す条件。
+- `terminal/setup.py:5883-5929` — backend/quant 選択、同意確認、build・download・検証、設定生成。
+- `terminal/tools/image/qimage.py:43-71`、`terminal/tools/image/qimage.py:88-104`、`terminal/tools/image/qimage.py:235-253` — model file pin、quant/backend 選択、run config の `images` 構造。
+- `terminal/setup.py:7631-7664` — config の carry-over、`None` の削除、backup と書き込み。
+- `terminal/setup.py:3471-3539`、`terminal/setup.py:3772-3825` — download と SHA-256 検証の失敗経路。
+- `terminal/serve/images.py:20` — serve 側が読む設定セクション。

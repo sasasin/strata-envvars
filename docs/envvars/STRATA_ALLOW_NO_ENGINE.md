@@ -1,46 +1,60 @@
 # `STRATA_ALLOW_NO_ENGINE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-モデル準備用の setup が Strata engine を見つけられないとき、`strata launch` がモデル準備を続けるために使います。この変数は engine を取得したり、実行可能にしたりするものではありません。setup が engine 不在で停止する条件を解除し、警告を出してモデルのダウンロード・準備へ進ませます。
+setup が必要な engine component を取得・確認できなかった場合に、モデルの取得と準備を続けるかを制御する。文字列 `"1"` のときだけ続行を許可する。通常の `strata launch` は engine 不在時に事前確認を行い、続行が選ばれた場合、または `--yes` 等で確認を省いた場合に、モデル準備用の子 setup プロセスへこの値を設定する。これにより engine 不在のままモデル設定を保存するが、engine をインストールしたり、そのモデルを起動したりはしない。エンジン不在時の通常起動可否は `runner.py` 側の `engine_problem` によって決まる（`terminal/strata_cli/launch/runner.py:1207-1223, 1650-1661, 3173-3177`）。
 
-実際の読み取りは `setup.py` の `control_engine_step()` 内、`engine_component.resolve(full=False)` が `EngineMissing` を送出した場合に限られます。通常の `strata launch` は engine の確認・更新をモデル準備より先に行い、engine が使えない場合に確認を経て子 setup を起動します（`strata_cli/launch/runner.py:718-748,826-842,2286-2297`）。
+setup では、Control install mode の標準 engine 欠落時（`control_engine_step`）と、モデル固有 shape engine の取得失敗時（`shape_engine_fetch`）に読む。ソース checkout の通常 engine ビルド経路では前者の分岐は使われない。`CONTROL` は `STRATA_CONTROL_INSTALL == "1"` で決まる（`terminal/setup.py:97-103, 9513-9520`）。
 
 ## 値と判定
 
-setup は `os.environ.get("STRATA_ALLOW_NO_ENGINE") != "1"` を文字列全体で比較します。`"1"` だけが停止を抑止し、数値変換、空白除去、大文字小文字変換はありません。
+値は数値や一般的な真偽値として解析せず、Python の `os.environ.get(...) == "1"` で文字列全体を比較する。空白除去、大文字小文字変換、数値変換はない。したがって unset、空文字、`0`、`true`、`01`、`1 ` は許可にならず、文字列 `1` のみ許可になる。標準 engine の分岐では別途 `STRATA_NEED_ENGINE == "1"` も必要。shape engine の分岐ではこの別条件はなく、取得結果が `None` になったときに直接判定する（`terminal/setup.py:9387-9399, 9417-9422`）。
 
-| `STRATA_NEED_ENGINE` | `STRATA_ALLOW_NO_ENGINE` | EngineMissing 時の setup の処理 |
-|---|---|---|
-| 文字列 `"1"` | 文字列 `"1"` | 停止条件に入らず、警告後に続行 |
-| 文字列 `"1"` | 未設定、空文字、その他の値 | `fail()` を呼び、終了コード 1 で停止 |
-| 未設定、空文字、その他の値 | 任意 | この停止条件に入らず、警告後に続行 |
+| setup 経路 | `STRATA_NEED_ENGINE` | `STRATA_ALLOW_NO_ENGINE` | engine がない場合 |
+|---|---|---|---|
+| Control install の標準 engine | `"1"` | `"1"` | 警告を出してモデル準備を続ける |
+| Control install の標準 engine | `"1"` | unset、空文字、または `"1"` 以外 | step 5 より前に失敗終了 |
+| Control install の標準 engine | `"1"` 以外 | 任意 | 警告を出してモデル準備を続ける。この分岐では `ALLOW` は停止条件にならない |
+| shape engine | 任意 | `"1"` | engine なしで続ける扱いにする |
+| shape engine | 任意 | unset、空文字、または `"1"` 以外 | setup を失敗終了する |
 
-したがって、この変数単独で「engine 不在を許可」するわけではありません。判定は setup が `EngineMissing` を処理する時点で `os.environ` から行われ、static cache や設定ファイルへの保存はありません。CLI 引数による上書きはありません。根拠: `setup.py:7751-7763`。
+該当箇所は `terminal/setup.py:9387-9399, 9417-9422`。CLI 引数や設定ファイルによるこの値の上書きは見つからなかった。
 
 ## 有効になる条件
 
-- `setup.py` が Control install モードで動作し、engine 解決処理が `control_engine_step()` に到達する必要があります。Control モードは `STRATA_CONTROL_INSTALL == "1"` で決まります（`setup.py:77-88,7736-7745,7772-7776`）。
-- macOS の Control setup は `main()` から `mac_control_setup()` に分岐し、別の engine 不在処理を使います。この変数を読む `control_engine_step()` の判定は通りません（`setup.py:9068-9069,9220-9223`; macOS 側の engine 処理: `setup.py:8860-8864,8910-8925`）。
-- engine 解決が成功した場合、この変数は参照されません。`EngineMissing` 以外の失敗もこの判定の対象ではありません（`setup.py:7741-7753`）。
-- 停止を解除するには `STRATA_NEED_ENGINE` と `STRATA_ALLOW_NO_ENGINE` の両方が厳密に文字列 `"1"` である必要があります。`STRATA_NEED_ENGINE` が `"1"` でない場合は、この変数の値にかかわらず該当の停止条件は成立しません（`setup.py:7753`）。
-- `strata launch` は親プロセス環境をコピーして子環境を作ります。launch 内で `engine_problem` が設定されている場合は子環境の `STRATA_ALLOW_NO_ENGINE` を `"1"` に設定し、`STRATA_NEED_ENGINE` は削除します。engine 問題がなく、DeepSeek の複数ファイル経路でもない場合は `STRATA_NEED_ENGINE="1"` を設定します。親環境から継承した `STRATA_ALLOW_NO_ENGINE` は明示的には削除されないため、engine 解決の不一致などで setup 側が `EngineMissing` になれば、その継承値も判定に使われます（`strata_cli/launch/runner.py:674-679,1142-1153`）。
-- `strata launch` の DeepSeek 複数ファイル経路は Strata engine を使わず、runner はこの engine 必須判定を設定しません（`strata_cli/launch/runner.py:718-722,1145-1149`）。
+- 標準 engine の分岐では `CONTROL` が真で、`EC.resolve(full=False)` が `EngineMissing` を送出し、さらに `STRATA_NEED_ENGINE` が文字列 `"1"` のとき、`ALLOW` が停止を抑止する。既存 engine が見つかった場合はこの分岐に入らない（`terminal/setup.py:9373-9390, 9513-9520`）。
+- shape engine の分岐では `SHAPE_ENGINE["shape"]` が設定されたモデルで `shape_engine.ensure(...)` が engine の実行ファイルを返さず `None` になった場合に判定する。feed にこの PC 向け component がない場合、取得・feed 読み取りに失敗した場合などが `None` になる。使用中の既存 engine があり feed 側の更新に失敗したケースでは既存 engine を返すため、この許可分岐に入らない（`terminal/setup.py:9408-9422, 9486-9504`; `terminal/strata_control/shape_engine.py:349-355, 374-401, 402-410`）。
+- OS 固有の値検査や build macro はこの変数自体にない。Control install は Windows/Linux の共通 engine 経路と macOS の `mac_control_setup` で使われ、Intel Control setup も shape engine fetch を呼ぶ場合がある。通常の macOS setup は別経路に振り分けられる（`terminal/setup.py:10934-10940, 11198-11220, 11407-11417`）。
+- `strata launch` は engine 確認後にモデル準備 subprocess を起動する。engine 不在を `engine_problem` として記録したときは子環境へ `STRATA_ALLOW_NO_ENGINE="1"` を設定し、そうでないときは `STRATA_NEED_ENGINE="1"` を設定する。`_env()` は親環境を複製し、後者の分岐は既存の `STRATA_ALLOW_NO_ENGINE` を消さないため、呼び出し元が `STRATA_ALLOW_NO_ENGINE=1` を持っている場合は標準 engine の setup 停止条件も抑止される（`terminal/strata_cli/launch/runner.py:969-974, 1650-1661`）。
+- engine がなく、launch の対話確認で続行が拒否された場合は子 setup を起動せず、「Stopped. Nothing was downloaded.」で終了する。許可された場合でも engine がないため serving はせず、設定保存後に警告結果を返す（`terminal/strata_cli/launch/runner.py:1207-1223, 3173-3177`）。
 
 ## 実行時の詳細
 
-engine 不在で、`STRATA_NEED_ENGINE="1"` かつ `STRATA_ALLOW_NO_ENGINE` が `"1"` でなければ、setup は `fail()` に理由と案内を渡します。出力には `[X]` のエラー、`nothing was downloaded and files already downloaded are kept` の案内、`Setup stopped...` が含まれ、プロセスは終了コード 1 で終了します。runner は子 setup の出力を読み、非ゼロ終了を `setup_failure()` に渡して launch の失敗として返します（`setup.py:904-909,7753-7759`; `strata_cli/launch/runner.py:1197-1212`）。
+setup の各分岐で必要になった時点に `os.environ.get` を呼び、値を関数間で cache しない。setup 起動後にプロセス環境が変更されない通常の起動では、その時点の環境値が使われる。標準 engine 判定は `control_engine_step`、shape engine 判定は `shape_engine_fetch` で行われる（`terminal/setup.py:9373-9425`）。
 
-続行する場合、setup は `home() / "engine"` を仮の engine パスとして扱い、`component: missing` の metadata を作ります。stderr ではなく setup の標準出力に `[!] no engine is installed for this PC yet (...)` の警告を出し、「モデルを準備し、読み込み前に engine component をインストールする」よう案内します。Control モードの run config は engine 名 `component:strata-engine` を記録します（`setup.py:7751-7769,6643-6645`）。
+標準 engine がない場合、`STRATA_NEED_ENGINE="1"` かつ許可値がないと、step 5 のダウンロード前に `fail` し終了コード 1 となる。許可されると `home()/engine` を仮の engine directory とし、metadata に `component: "missing"` を記録して警告後に処理を戻す。Control install はこの metadata のとき engine family 検査を飛ばし、モデル取得・準備と `component:strata-engine` を参照する設定ファイル作成へ進む。後で engine が利用可能になってからモデルをロードする前提であり、この値が engine 自体を供給するわけではない（`terminal/setup.py:9393-9399, 9840-9857`）。
 
-ただし、`strata launch` 自体は setup 続行後に設定ファイルを作成しても serving を開始しません。`engine_problem` が残っていると final warning を出し、`serving=False` の結果で終了します（`strata_cli/launch/runner.py:2294-2309`）。つまり、この環境変数が許可するのはモデルの準備までです。
+shape engine がない場合、許可値なら `shape_engine.WORDS["setup_skip"]` の警告を出して `None` を返す。Control install の shape setup は missing component としてモデル処理を続ける。macOS Control setup は `None` を `EngineMissing` にし、共通の警告を出して model download/preparation へ続く。許可値がなければ `fail` により終了コード 1 となる（`terminal/setup.py:9417-9425, 9486-9510, 10994-11009`）。
+
+## ログと測定値
+
+標準 engine を許可値で続行する場合、setup は次の警告を出す（`plain` の内容と `EngineMissing` の文字列表現は環境により変わる）。
+
+```text
+{plain} no engine is installed for this PC yet ({e}). The model is downloaded and prepared now; install the engine component for your GPU (the app's Settings, or the Terminal) before loading it
+```
+
+許可値がなく、`STRATA_NEED_ENGINE="1"` なら `{plain or "no engine is installed for this PC"}` と「get the engine that matches this graphics card ...」の hint を出して setup を停止する。shape engine は許可値の場合 `no engine for {model} is installed: the model is downloaded and prepared now; set it up again when the engine can be fetched` を警告し、許可値がない場合は `shape_engine.WORDS["setup_failed"]` と `setup_failed_hint` を失敗文として使う（`terminal/setup.py:9387-9399, 9417-9422`; `terminal/strata_control/shape_engine.py:45-63`）。
+
+`docs/DETAILS.md` にこの変数の挙動や測定値を裏付ける記述は見つからなかった。ここに性能測定値はない。
 
 ## 根拠
 
-- 環境変数の読み取りと `EngineMissing` 時の分岐、警告・fallback: `setup.py:7736-7763`。
-- Control install の判定と engine component 名の run config: `setup.py:77-88,6643-6645`。
-- `strata launch` の子プロセス環境の生成と両変数の設定: `strata_cli/launch/runner.py:674-679,1142-1153`。
-- engine 確認、確認応答、engine 問題後の未起動終了: `strata_cli/launch/runner.py:718-748,826-842,2286-2309`。
-- setup 失敗の出力・終了と runner の非ゼロ終了処理: `setup.py:904-909`; `strata_cli/launch/runner.py:1197-1212`。
+- `terminal/setup.py:97-103` — Control install mode の判定。
+- `terminal/setup.py:9373-9399` — 標準 engine の解決、値判定、停止・続行処理。
+- `terminal/setup.py:9408-9425` — shape engine 取得結果に対する値判定。
+- `terminal/setup.py:9486-9520, 9840-9857, 10934-11009, 11198-11220, 11407-11417` — setup 経路と missing engine の後続処理。
+- `terminal/strata_control/shape_engine.py:349-410` — shape engine 取得関数が `None` を返す条件。
+- `terminal/strata_cli/launch/runner.py:969-979, 1013-1045, 1167-1184, 1207-1223, 1610-1661, 1711-1733, 3151-3177` — launch の engine 確認、子プロセス環境、続行確認と結果。

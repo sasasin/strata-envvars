@@ -1,61 +1,59 @@
-# `--image-backend`
+# `setup.py --image-backend`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。Strata checkout は `main` が `origin/main` と一致し、調査時点の作業ツリーに未コミット変更はありません。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`SETUP.bat`、update wrapper から委譲） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat`（root） |
 | オプション | `--image-backend` |
 | 別名 | なし |
 | 値 | `cuda`、`hip`、`vulkan`、`cpu` のいずれか |
 
 ## 役割
 
-画像生成 preview の `--images qwen-image` で使用する画像生成エンジン `sd-cli` の backend を指定します。テキスト推論エンジンの `--backend` とは別の設定です。`--images` を指定しない場合、この値は画像生成設定に使われません（`setup.py:9101-9102`, `setup.py:10434-10435`）。
+`--images qwen-image` で有効にする画像生成用 `sd-cli` のビルド backend を指定します。setup が GPU から自動選択する backend を上書きします。画像生成を指定しない実行では、この値を使う処理に入りません。
 
 ## 使い方
 
-Strata のソース checkout 内で、たとえば次のように指定します。
-
 ```sh
-./setup.sh --images qwen-image --image-backend vulkan
+# 画像生成エンジンを CPU backend で設定する（モデル取得の確認が表示される）
+./setup.sh --images qwen-image --image-backend cpu
 ```
-
-画像生成の設定を進めると、setup は画像モデルのダウンロード確認を表示します。`--yes` を併用した場合は通常の確認を自動承認する経路になります（`setup.py:5087-5095`）。
 
 ## 値と既定値
 
-`argparse` の `choices` により、指定できる値は `cuda`、`hip`、`vulkan`、`cpu` に限られます。省略時は GPU 情報から自動選択されます。GPU がない場合は `cpu`、NVIDIA は `cuda`、AMD は Windows または共有メモリ APU なら `vulkan`、それ以外は `hip`、その他の vendor（Intel Arc を含む）は `vulkan` です（`setup.py:9096-9102`, `setup.py:5065-5077`, `tools/image/qimage.py:88-97`）。
+parser は `cuda`、`hip`、`vulkan`、`cpu` のみを受理します。`argparse` の `choices` による検証で、別の値を渡すと引数エラーになります（`terminal/setup.py:11257-11258`）。値の省略時は `None` となり、setup が検出した GPU と OS から自動選択します。明示値と GPU の組み合わせを事前に照合して拒否する処理は見当たりません（`terminal/setup.py:5883-5895`）。
 
-無効な値は parser の引数検証で拒否されます。画像 backend を省略した場合に `--backend`（テキストエンジン用）の値を流用する処理は、この選択関数にはありません。`setup.py:5069-5070` は GPU vendor と `hip` 判定から画像 backend を選びます。
+| 値 | ビルド設定 |
+| --- | --- |
+| `cuda` | CUDA 用。GPU の architecture をビルド設定に渡します。 |
+| `hip` | HIP 用。GPU の architecture と ROCm 環境を使います。 |
+| `vulkan` | Vulkan 用。SDK またはシステムの Vulkan 開発ファイルを使います。 |
+| `cpu` | GPU backend を有効にしない CPU 用。 |
 
 ## 実行時の動作
 
-`--images qwen-image` があると setup は選んだ backend を `setup_images()` に渡します。明示値があれば自動判定より優先し、その backend 用の `stable-diffusion.cpp` の `sd-cli` を `engine-image/` に用意します。既存実行ファイルと build stamp が一致すれば再利用し、一致しなければ `build-image-<backend>/` でビルドして `engine-image/` へコピーし、`BUILD.json` を書きます（`setup.py:5080-5087`, `setup.py:5004-5062`）。
+このオプションは parser では受理されますが、画像生成設定の処理は `--images` が指定された場合だけ呼び出されます。`--images qwen-image` のとき、setup は明示値を自動選択結果より優先し、選んだ backend に合わせて `sd-cli` をビルドまたは既存ビルドを再利用します。backend は run config の `images.backend` に記録され、server の画像生成処理で参照されます（`terminal/strata_control/setup_config.py:574-576`、`terminal/setup.py:5883-5895,5901-5905,5816-5830`、`terminal/tools/image/qimage.py:235-253`）。
 
-backend によって必要な toolchain が異なります。CUDA は `nvcc`、HIP は ROCm、Vulkan は Vulkan SDK または利用可能なシステム開発ファイルを使います。CPU は backend 固有 SDK を要求せず CPU 用設定でビルドします（`setup.py:5021-5051`, `setup.py:4959-4991`）。Vulkan を選んだ場合、Linux で SDK/開発ファイルがなければ setup は SDK を `third_party/` にダウンロード・展開し、実行環境変数も設定します。Windows で SDK がなければ setup を停止します（`setup.py:4964-4990`）。
+明示値を省略した場合の自動選択は、GPU がなければ `cpu`、NVIDIA なら `cuda`、AMD なら APU または Windows で `vulkan`、それ以外の AMD で `hip`、その他の vendor で `vulkan` です（`terminal/tools/image/qimage.py:88-98`）。
 
-画像モデルのダウンロードを承認すると、選択された backend とモデル設定が run config の `images` セクションに保存されます。確認を拒否した場合は画像設定を作らず、続く設定書き込み時に `images: null` はセクションごと取り除かれます（`setup.py:5089-5104`, `setup.py:6663-6677`）。
+画像生成の設定へ進むと、setup は確認後に選択 backend のビルドを行い、必要な画像モデルファイルを取得・検証して run config に設定します。確認への回答が「いいえ」の場合はこの設定関数から戻り、ビルドやモデル取得を行いません（`terminal/setup.py:5898-5929`）。Vulkan 開発ファイルが Linux にない場合は SDK を `third_party/` に展開し、Windows では SDK がないと停止します（`terminal/setup.py:5750-5780`）。
 
 ## 適用条件と副作用
 
-- このオプションは `--images` を指定した場合だけ処理に使われます。既存設定の `images` は `--images` を今回指定しない限り別途 carry-over 対象です（`setup.py:10434-10435`）。
-- 明示した backend と実機・開発環境の互換性をこの parser は検証しません。たとえば必要な CUDA Toolkit が見つからない CUDA ビルドは setup のエラー経路に進みます。Vulkan も Windows で SDK がない場合は停止します（`setup.py:5021-5026`, `setup.py:4969-4972`）。
-- 画像モデルを承認すると、モデルファイル3点のダウンロードと SHA-256 検証、画像生成エンジンのビルドまたは再利用、モデル配置先ディレクトリの作成、run config の更新が発生します。空き容量が必要量 + 5 GB 未満なら警告しますが、その場では中止しません（`setup.py:5089-5103`）。
-- CUDA/HIP は GPU の architecture 値も build stamp とビルド定義に使います。HIP 経路は `HIP_PLATFORM`、`ROCM_PATH`、`HIP_PATH`、`LD_LIBRARY_PATH` を setup プロセス内で更新します（`setup.py:5010-5011`, `setup.py:5032-5037`）。
-- 通常の Apple Silicon setup は parser 作成前に `metal/setup_mac.py` へ委譲します。そのため本書の `setup.py` parser にあるこの option の適用範囲には含まれません（`setup.py:9068-9069`）。
+- `--images qwen-image` がなければ `setup_images` は呼ばれず、`--image-backend` は画像設定に反映されません。`--images no` の場合も画像設定関数は `None` を返します（`terminal/strata_control/setup_config.py:574-575`、`terminal/setup.py:5901-5902`）。
+- `cuda` は CUDA Toolkit の `nvcc` が見つからないと setup を終了します。`hip` は検出済み GPU architecture と ROCm を使い、`vulkan` は Vulkan SDK / 開発ファイルを必要とします。`cpu` は CPU backend の CMake 定義を選びます（`terminal/setup.py:5838-5869`、`terminal/tools/image/qimage.py:116-140`）。
+- ビルドでは `build-image-<backend>/` を使い、成果物を `engine-image/` に配置します。Linux の Vulkan SDK が必要な場合はダウンロードと展開も発生します（`terminal/setup.py:5763-5780,5816-5829,5870-5879`）。
+- 選択 backend と必要なモデルパスはモデルの run config に保存されます。画像モデルの取得前に空き容量の警告を出す場合があります（`terminal/setup.py:5905-5928`）。
 
 ## 出力とエラー
 
-setup は選択したモデル量子化と backend を表示し、モデルのダウンロード確認を出します。推奨量子化より大きい画像モデルを選ぶ設定（`--image-quant`）では警告が出ますが、backend オプション自体は自動で別値へ置き換えません（`setup.py:5071-5077`, `setup.py:5086-5094`）。
-
-CUDA Toolkit がない場合や、ビルド完了後に `sd-cli` が生成されていない場合は、`fail()` がエラーを表示して終了コード 1 で setup を停止します。無効な値は `argparse` が受理せず、usage と引数エラーを出します（`setup.py:5021-5026`, `setup.py:5056-5059`, `setup.py:904-909`, `setup.py:9101-9102`）。HIP/ROCm などその他の失敗条件の詳細な文言・終了経路は、この文書では網羅していません。
+選択内容は `Image generation: Qwen-Image-2.1-Turbo ... on <backend>` として表示されます。CUDA Toolkit 不足、Windows での Vulkan SDK 不足、またはビルド後に `sd-cli` が見つからない場合は `fail()` 経由で setup が停止し、終了コード 1 になります（`terminal/setup.py:5840-5844,5874-5879,5905`、`terminal/setup.py:1049-1056`）。HIP の ROCm 検出やビルド失敗など、それ以外の全ての失敗条件・終了コードはこのオプション単独の経路としては確認できません。
 
 ## 根拠
 
-- parser 定義・preview 注記: `setup.py:9096-9105`（`--image-backend` は `help=argparse.SUPPRESS` のため `--help` には表示されません）。
-- 適用条件と設定生成: `setup.py:5080-5104`, `setup.py:10434-10435`。
-- 明示値の優先と backend 自動判定: `setup.py:5065-5077`, `tools/image/qimage.py:88-97`。
-- backend ごとのビルドと SDK 条件: `setup.py:4959-4991`, `setup.py:5004-5062`。
-- setup options の概要: `docs/IMAGES.md:48-69`。同文書は利用者向け説明として参照し、この文書の値・動作の根拠は同一 revision の parser と処理コードに置いています。
+- `terminal/setup.py:11252-11258` — `--images` と `--image-backend` の parser 定義、choices、および通常の help から隠す設定。
+- `terminal/strata_control/setup_config.py:574-576` — `--images` が指定された時だけ画像設定を呼び出す条件。
+- `terminal/setup.py:5883-5895`、`terminal/tools/image/qimage.py:88-98` — 明示値の優先と未指定時の自動選択。
+- `terminal/setup.py:5816-5879,5898-5929`、`terminal/tools/image/qimage.py:116-140,235-253` — backend ごとのビルド処理、モデル設定、run config に記録する値。

@@ -1,42 +1,44 @@
 # `HIP_DEVICE_LIB_PATH`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査対象リポジトリの作業ツリーは `main...origin/main` で変更なし。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-この候補名を Strata エンジン本体が独自設定として読むコードは見つかりませんでした。Strata の Python サーバーは起動環境から値を子プロセス用環境へ引き継ぎ、AMD/HIP backend では値が空でなく、そのパスが存在しないときに子プロセスへ渡さないよう除去します。つまり Strata が行うのは環境の引き継ぎと stale path の除去です。転送後にエンジン、HIP runtime、driver が値をどう使うかはこの文書の対象外です。
+Strata 本体の HIP 設定値や GPU 計算を切り替える環境変数として読む箇所は見つからない。Strata の Python サーバーが HIP エンジン用の子プロセス環境を組み立てるとき、この変数が空でなく、指すパスが存在しない場合に限り、その子プロセスへ渡さないよう削除して stderr に知らせる。パスが存在すれば値を変更せず子プロセスへ渡す。実装は `child_env` と `hip_env_guard`（`terminal/serve/server.py:3870-3925`, `3928-3958`）。
 
 ## 値と判定
 
-`hip_env_guard()` は文字列を数値や真偽値に変換しません。`env.get("HIP_DEVICE_LIB_PATH")` の値が Python の真として評価される（空文字列でない）場合だけ `Path(v).exists()` を調べます。
+変数値自体の数値・真偽値変換はない。`hip_env_guard` は `env.get(k)` の Python truthiness と `Path(v).exists()` で判定する。`HIP_DEVICE_LIB_PATH` の文字列をパスとして扱い、ファイルかディレクトリかは区別しない。
 
-| 子環境に入った値 | HIP backend のサーバー処理 |
-|---|---|
-| 未設定 | 何もしない。未設定のままエンジンに渡す |
-| 空文字列 | `if v` が偽なので何もしない。空文字列のまま渡す |
-| 空でない文字列で、サーバーの現在の作業ディレクトリ基準でパスが存在する | その値を保ったまま渡す。`exists()` のみを確認し、ディレクトリかどうか、値の形式、内容は検証しない |
-| 空でない文字列で、パスが存在しない | 子環境からキーを削除し、stderr に `strata serve: AMD: HIP_DEVICE_LIB_PATH=<値> does not exist: not passed to the engine` を出す |
+| 条件 | unset | 設定時に維持してエンジンへ渡す値 | 削除して警告する値 |
+|---|---|---|---|
+| サーバー設定の `backend` が `hip` | 辞書にキーがなく、何もしない | 空文字以外で `Path(value).exists()` が真となる値（既存のファイルまたはディレクトリなど）。`0` や `false` も、同名パスが存在すれば維持する | 空文字以外で指すパスが存在しない値。例: `0`、`false`、`0anything` は通常は存在しないパスとして削除される（同名パスがあれば削除されない） |
+| `backend` が `hip` 以外 | 元の環境にキーがなければキーなし | `child_env` はこの変数を検査しないため、元の環境または設定の値をそのまま保持 | 該当なし |
 
-空白、相対パス、絶対パス、シンボリックリンクなどを Strata 独自の規則で変換する処理はありません。相対パスの存在確認は `Path(v).exists()` によるもので、`cfg["cwd"]` を基準に解決する処理ではありません（`serve/server.py:3823-3827`）。
+明示的な空文字は Python で偽となるため、HIP の場合も削除・警告されず、空文字のまま子プロセス環境に残る。空白だけの値は真となり、その文字列をパスとして存在確認する。大文字小文字、前後空白、数値としての妥当性は別途検証しない。相対パスはサーバーの現在の作業ディレクトリ基準で `Path.exists()` に渡される。 (`terminal/serve/server.py:3936-3940`)
 
 ## 有効になる条件
 
-- `child_env()` はまずサーバーの `os.environ` を辞書に複製し、設定の `cfg["env"]` があればその項目を `str(k)` / `str(v)` にして上書きします。したがって設定の `env.HIP_DEVICE_LIB_PATH` は親プロセス環境の値より優先され、その後の HIP guard の検査対象になります（`serve/server.py:3747-3760`）。
-- guard が呼ばれるのは `cfg["backend"] == "hip"` のときだけです。CUDA など他 backend の場合、サーバーはこの値を guard で検査せず、複製または設定から得た値を子環境に残します（`serve/server.py:3782-3790`）。
-- 通常のエンジン起動に加え、replica と split serving の各エンジンも `child_env()` の結果を使います（`serve/server.py:8704-8710,8769-8777,9193,9273-9279`）。
-- CLI 引数や別環境変数との値の優先順位、CLI による上書きはこのキーについて実装されていません。エンジン本体の設定として解釈するコードも確認できませんでした。
+- サーバーが `--engine strata` 経路で Strata エンジンを起動し、子環境の `backend` が文字列 `hip` の場合に検査する。通常起動の `child_env` に加え、レプリカ・split・fallback のエンジン起動も同関数を呼ぶ（`terminal/serve/server.py:8297-8308`, `8333-8336`, `8396-8403`, `8870-8878`）。
+- `backend` が HIP 以外ならこの検査は行わない。OS やビルド macro による追加条件はこの処理にはない。
+- サーバー設定の `env` に同名キーがあれば、親プロセス環境をコピーした後に設定値で上書きされる。その後 HIP 判定が行われるため、設定値が優先される。設定値が空文字なら、親環境に有効な値があっても空文字が残る（`terminal/serve/server.py:3873`, `3890-3891`, `3917-3919`）。
+- `HIP_PATH` と `LLVM_PATH` も同じループで個別に検査されるが、それらの値から `HIP_DEVICE_LIB_PATH` を補完・上書きする処理はない（`terminal/serve/server.py:3936-3940`）。CLI 引数によるこの値の変換・優先指定は確認できない。
 
 ## 実行時の詳細
 
-この値の処理は子エンジンの環境を組み立てるときに行われます。`child_env()` が呼ばれるたびに `os.environ` を複製し、HIP backend ならその時点で guard が存在確認します。値を static cache する処理はありません。作成された環境辞書は `StrataEngine` から `popen(..., env=env)` に渡され、起動した子プロセスの環境になります（`serve/server.py:3747-3790,1074-1079`）。したがって、サーバー稼働中に親環境が変わっても既に起動中の子の環境は変更されず、後で `child_env()` を再度呼ぶ起動ではその呼び出し時点の環境が使われます。
+`child_env` 呼び出し時に `dict(os.environ)` で親環境のスナップショットを作り、サーバー設定の `env` を反映する。HIP の場合はその辞書を `hip_env_guard` に渡す。パスが存在しなければ辞書からキーを削除し、存在すれば値をそのままにする。親サーバープロセスの `os.environ` 自体は変更しない（`terminal/serve/server.py:3870-3925`, `3928-3940`）。
 
-存在しない非空パスを guard が除去しても、この処理自体は例外終了させず、診断行を stderr に出して環境辞書を返します（`serve/server.py:3815-3845`）。パスが存在すると guard はその値を変更しません。エンジン起動後の値の利用、起動失敗や GPU runtime の挙動は、Strata がこの値を読む・転送するコードからは断定できません。
+作成した環境辞書は `StrataEngine` 起動時に `popen(..., env=env)` で子プロセスへ渡される（`terminal/serve/server.py:827-830`）。この変数用の static cache やリクエスト単位の再読込はない。値は `child_env` を呼んだ時点で決まり、同じ起動処理内の再試行は既に作られた `env` を使う。新しいエンジン起動で `child_env` が再度呼ばれれば、その時点の親環境と設定から作り直される。
+
+## ログと測定値
+
+HIP の子環境から値を削除した場合、stderr に `strata serve: AMD: HIP_DEVICE_LIB_PATH=<値> does not exist: not passed to the engine` と出す。値が空、またはパスが存在する場合、この変数についての警告は出ない（`terminal/serve/server.py:3936-3940`, `3956-3957`）。
+
+この処理自体は変数を削除して警告するだけで、終了・fallback・再試行を起こさない。Strata 所有ソースに、この変数をエンジン内部で直接読む箇所は確認できなかったため、エンジンや外部 HIP runtime が受け取った後に行う処理・失敗条件は本書では説明しない。
 
 ## 根拠
 
-- `serve/server.py:3747-3790` — 親環境の複製、設定 `env` の上書き、HIP backend での guard 呼び出し。
-- `serve/server.py:3815-3845` — `HIP_PATH` / `HIP_DEVICE_LIB_PATH` / `LLVM_PATH` の存在確認、削除条件、stderr の文言。
-- `serve/server.py:1074-1079` — 作成した環境辞書を `popen` に渡す箇所。
-- `serve/server.py:8704-8710,8769-8777,9193,9273-9279` — 通常、replica、split serving の起動経路。
-- `serve/test_server.py:1981-1995` — テストは存在しない `HIP_DEVICE_LIB_PATH` が環境辞書から除かれることを確認する（本番動作の根拠は上記実装）。
-- `docs/TROUBLESHOOTING.md:305-310` — Windows AMD の起動時問題の説明。詳細な挙動の根拠は実装箇所。
+- `terminal/serve/server.py:3870-3925` — 子プロセス環境の作成、設定 `env` の優先、HIP 条件、guard 呼び出し。
+- `terminal/serve/server.py:3928-3958` — 3 変数の存在確認、削除、stderr 警告。
+- `terminal/serve/server.py:827-830` — 作成済み環境辞書をエンジン subprocess に渡す箇所。
+- `terminal/serve/server.py:8297-8308`, `8333-8336`, `8396-8403`, `8870-8878` — 通常・fallback・replica・split の起動経路。

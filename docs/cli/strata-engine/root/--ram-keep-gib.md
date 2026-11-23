@@ -1,62 +1,63 @@
-# `strata` `--ram-keep-gib`
+# `--ram-keep-gib`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（推論エンジンの root） |
+| コマンド | `strata`（推論エンジンのトップレベル引数） |
 | オプション | `--ram-keep-gib` |
 | 別名 | なし |
-| 値 | `W`: GiB 単位の数値。0 以上。内部値は byte に変換され、最大 1024 GiB に制限される |
+| 値 | GiB 単位の数値 `W`（`0` 以上。内部では byte に変換し、上限 1024 GiB） |
 
 ## 役割
 
-expert の常駐方式を選ぶ起動時の RAM 目安を指定します。指定量 `W` GiB をユーザー作業用に空けられる場合に expert arena を使い、arena が使えないときの RAM copy fallback では少なくとも `W` GiB（または platform の安全 headroom）を残すようにします。ヘルプでは既定値 0 と説明されています（`src/program/generate.cpp:1285-1289`）。
+expert arena を使うときに、arena の読み込み後も空けておきたい RAM 量を指定します。利用可能 RAM が arena の必要量と `W` の合計に届かなければ、条件を満たす場合は arena の代わりに expert の一部を RAM に置く fallback を選び、そのコピー用 RAM 予算にも空き容量の目安を反映します。OS の RAM を予約したり、指定量が常に空くことを保証したりするオプションではありません。
 
 ## 使い方
 
 ```sh
-strata --pack /path/to/model --ram-keep-gib 12 --tokens '1,2,3'
+# 既存のモデルパックを使い、expert arena の後に 8 GiB を空ける目安を指定
+strata --pack ./my-model --ram-keep-gib 8
 ```
-
-この例は通常の `strata generate` 経路に 12 GiB を残す指定です。実行ファイルが受け付ける値は `--ram-keep-gib` の直後の引数で、parser はこれを `std::atof` で読みます（`src/program/generate.cpp:3293-3298,3657-3661`）。
 
 ## 値と既定値
 
-- 省略時は 0 byte です（`Options::ram_keep` の初期値、`src/program/generate.cpp:721-725`）。
-- CLI 値は `std::atof` で `double` に変換され、`gib >= 0` を満たさない場合は stderr に `strata generate: --ram-keep-gib needs N >= 0` を出して終了コード 2 になります。引数自体が欠けている場合は `needs a value` を stderr に出して終了コード 2 です（`src/program/generate.cpp:3295-3297,3657-3661`）。
-- GiB から byte への変換は `ram_keep_from_gib` が行い、0 以下は 0、1024 GiB 以上は 1024 GiB、それ以外は `gib * 1073741824` を `uint64_t` に変換します（`include/strata/core/ple_residency.hpp:82-89`）。
-- parser は `atof` のため、数値として解釈できない文字列は 0 として扱われ、負数と NaN は上記 validation で拒否されます。重複指定を拒否する処理はなく、引数走査で後に現れた値が `o.ram_keep` を上書きします（`src/program/generate.cpp:3293-3298,3657-3661`）。
-- [環境変数 `STRATA_RAM_KEEP_GIB`](../../../envvars/STRATA_RAM_KEEP_GIB.md) は CLI 引数を渡せない呼び出し元向けの同等設定です。CLI でこの option を指定すると、値が `0` でも環境変数より優先されます。CLI 未指定なら、空でなく `atof(v) > 0` の環境値を使用します（`src/program/generate.cpp:3692-3697`）。
+- 値は必須で、`--ram-keep-gib` の次の引数を `std::atof` で `double` に変換します。省略時の既定値は `0` です。`strata --help` の使用法表示も既定値を 0 としています（`engine/src/program/generate.cpp:1490-1494`）。
+- 変換後の値が 0 未満、または NaN なら `strata generate: --ram-keep-gib needs N >= 0` を stderr に出して終了コード 2 で拒否します。値を省略すると `--ram-keep-gib needs a value` を stderr に出して終了コード 2 になります（`engine/src/program/generate.cpp:3837-3841,4225-4229`）。
+- `atof` のため厳密な数値全体の検証はありません。数値として読めない文字列は 0 として扱われ、数値の後ろに変換できない文字があっても数値部分が使われます（`engine/src/program/generate.cpp:4225-4228`）。
+- 0 以下は内部 byte 値 0 になり、正の GiB 値は `1073741824` 倍して byte に切り捨てられます。1024 GiB 以上は 1024 GiB に飽和します（`engine/include/strata/core/ple_residency.hpp:148-155`）。
+- 同じフラグを複数回指定すると parser が順に値を代入するため、最後に指定した値が残ります。フラグを一度でも指定すると、値が 0 でも `STRATA_RAM_KEEP_GIB` よりフラグが優先されます（`engine/src/program/generate.cpp:3836-3837,4225-4229,4275-4277`）。
 
 ## 実行時の動作
 
-通常の engine parser は `o.ram_keep` に値を保持します。初期化後、`--resident-budget-gib` または `--resident-experts` が設定した resident headroom を `W` 未満から引き上げます。ただし `STRATA_RESIDENT_HEADROOM_GIB` が数値として 0 以上なら、その環境値が優先されます（`src/program/generate.cpp:3647-3672,3692-3700`）。
-
-expert arena を開く際には必要量に `W` を加えた値を空き RAM と比較します。プロセスの hard memory limit がある場合は、fallback が許可されていると `max(W, fallback headroom)` も limit 判定に加わります（`src/core/expert_source.cpp:5874-5889`; 計算式は `include/strata/core/ple_residency.hpp:93-106`）。
-
-arena が RAM 不足で使えず、自動 fallback が有効な場合、エンジンは `--mmap-experts` 相当の file source に切り替えます。expert profile があり、既に resident CPU mode でなく、fallback を無効化していない場合は、空き RAM から headroom を引いた範囲で profile 上位 expert の RAM copy も試します（`src/program/generate.cpp:7072-7088,7321-7343`）。この fallback の headroom は既定で Windows 8 GiB、その他 4 GiB と `W` の大きい方です。`STRATA_RESIDENT_HEADROOM_GIB` が設定されていればその値を使います（`include/strata/core/ple_residency.hpp:91,108-116`）。
-
-`STRATA_ARENA_RAM_FALLBACK=0` は自動切替を無効化します。また、明示的な `--ple-io ram` や `--shared-expert-arena` を使う場合も自動 fallback の対象外です（`src/core/ple_residency.hpp:65-72`; 呼び出し側は `src/program/generate.cpp:7072-7077`）。
+- このフラグを省略した場合、`STRATA_RAM_KEEP_GIB` が空でなく、`atof` の結果が正なら、その値を同じ GiB→byte 変換で読み込みます。環境変数が未設定・空・0 以下・数値として読めない場合、値は既定値 0 のままです。CLI フラグがあれば環境変数を読みません（`engine/src/program/generate.cpp:4272-4277`）。環境変数の仕様は [`STRATA_RAM_KEEP_GIB`](../../../envvars/STRATA_RAM_KEEP_GIB.md) を参照してください。
+- arena の通常の RAM 判定では、arena と予備 blob の必要量に `W` を加えた量が利用可能 RAM に収まる場合に arena を選ぶ条件になります。加算は整数 overflow を避けて飽和します（`engine/src/core/expert_source.cpp:6532-6537`、`engine/include/strata/core/ple_residency.hpp:159-162`）。
+- hard memory limit 下で arena 不足時の fallback が許可されている場合、arena の判定に使う必要量は arena と `max(W, fallback headroom)` の合計です。`STRATA_RESIDENT_HEADROOM_GIB` が `atof` で 0 以上になる値ならその値が fallback headroom を決め、OS は Windows で 8 GiB、それ以外で 4 GiB を既定の安全 headroom とします。ここも厳密な数値全体の検証はなく、数値として読めない文字列は 0 として headroom を上書きします（`engine/src/program/generate.cpp:8542-8546`、`engine/include/strata/core/ple_residency.hpp:157,174-177`）。
+- RAM 不足時に RAM-copy fallback が選ばれると、利用可能 RAM から headroom を差し引いた範囲で expert RAM 予算を決めます。headroom と 1 GiB の余裕を確保できない場合、RAM copy の予算は 0 になります（`engine/src/program/generate.cpp:8827-8837`、`engine/include/strata/core/ple_residency.hpp:180-183`）。この自動 fallback は expert profile があり、明示的な resident CPU mode がなく、`STRATA_ARENA_FALLBACK_RESIDENT=0` でもない場合に限って RAM-copy mode へ進みます。それ以外はファイルを読む経路などへ移ります（`engine/src/program/generate.cpp:8821-8839`）。
+- `--resident-budget-gib` または `--resident-experts` の明示的 RAM mode では、`W > 0` かつ `STRATA_RESIDENT_HEADROOM_GIB` の `atof` 結果が 0 未満または NaN でない場合、その環境値が優先されます（数値として読めない文字列も 0 として優先）。それ以外では既存の `resident_headroom` が `W` より小さければ `W` まで引き上げます（`engine/src/program/generate.cpp:4216-4223,4272-4280`）。
+- RAM 不足時の自動切替は常に有効ではありません。`--ple-io ram` を明示した場合、`--shared-expert-arena` を指定した場合、または `STRATA_ARENA_RAM_FALLBACK=0` の場合は fallback が無効です（`engine/src/program/generate.cpp:8526-8532`、`engine/include/strata/core/ple_residency.hpp:67-73`）。また shared arena file が指定されると、arena RAM 判定の host-memory probe 自体が行われません（`engine/src/core/expert_source.cpp:6532-6533`）。
+- RAM の必要量判定は `host_available_memory` が情報を取得できる場合の処理です。したがって、このオプションだけで他プロセスの RAM 消費を制限したり、常に `W` GiB の空きを保証したりすることはできません（`engine/src/core/expert_source.cpp:6532-6537`）。
 
 ## 適用条件と副作用
 
-- この値は起動時の expert RAM 配置判定に使われ、実行中に再読込する処理は確認できません。expert arena と file/RAM-copy のどちらを使うかに影響します（`src/program/generate.cpp:3692-3700,7306-7317`）。
-- 0 のときは arena の判定に追加 headroom を要求せず、RAM-copy fallback では platform の安全 headroom が適用されます（`src/program/generate.cpp:1288-1289`; `include/strata/core/ple_residency.hpp:79-81,108-112`）。
-- arena が選ばれると `ArenaExpertSource` に値が渡り、`W` GiB を空けられる場合だけ arena を選ぶ判定になります。利用可能 RAM を取得できない環境での判定詳細は、この条件分岐からは確定できません（`src/core/expert_source.cpp:5874-5905`）。
-- Qwen3.5 MoE モデルは通常 parser に入る前に `src/qwen35` の実装へ委譲されます。したがって、この文書が追った `src/program/generate.cpp` 側の option 動作はその実行経路には適用されません（`src/program/generate.cpp:3273-3283`）。
+- 通常の効果は expert arena の起動時 RAM 判定に現れます。すでに `--mmap-experts` などファイルベースの expert mode を選んでいる場合は、arena の採否判定ではなく、明示的 RAM mode における headroom 調整に関係します（`engine/src/program/generate.cpp:8550-8587,4272-4280`）。
+- arena が RAM 不足で fallback すると、expert の一部または全体がモデルファイルから読み込まれ、stderr に不足通知が出ます。`--serve` では同じ通知を stdout にも出します（`engine/src/program/generate.cpp:8810-8819`）。arena を使い続ける経路では、正の `W` のとき設定値と fallback headroom を説明する行が stderr に出ます（同 `generate.cpp:8791-8798`）。
+- fallback が無効で hard memory limit を満たせない場合、arena 読み込みは失敗し、エラーを stderr に出して終了コード 1 になります。通常の利用可能 RAM が不足しても fallback が無効なら、ソース上はその不足だけで必ず拒否するとはしておらず、警告後の扱いは RAM 判定経路に依存します（`engine/src/core/expert_source.cpp:6543-6559,6604-6605`、`engine/include/strata/core/expert_source.hpp:1384-1389`）。
 
 ## 出力とエラー
 
-`W > 0` の場合、expert arena を開く前に stderr へ arena の条件と RAM-copy fallback の headroom を説明する行を出します（`src/program/generate.cpp:7306-7315`）。RAM 不足で fallback に切り替えると、同じく stderr に arena 不足と file source への切替を通知します（`src/program/generate.cpp:7321-7327`）。arena が使えず fallback も許可されない場合や、後続の expert source を開けない場合は stderr に理由を出し、通常経路では終了コード 1 になります（`src/program/generate.cpp:7345-7347`; hard limit の拒否理由は `src/core/expert_source.cpp:5892-5899`）。
+値が無効または欠けている場合の stderr と終了コードは「値と既定値」を参照してください。正の値なら arena 起動前に stderr へ説明行を出します。arena 不足時の fallback 通知も stderr に出て、`--serve` の場合は stdout にも出ます（`engine/src/program/generate.cpp:8793-8798,8810-8817`）。
 
 ## 根拠
 
-- option のヘルプ説明と既定値: `src/program/generate.cpp:1285-1289`。
-- 値の parser、validation、変換と不足値処理: `src/program/generate.cpp:3293-3298,3657-3661`。
-- GiB→byte 変換、1024 GiB 上限、headroom 計算: `include/strata/core/ple_residency.hpp:74-116`。
-- 環境変数との優先順位と明示 resident mode への反映: `src/program/generate.cpp:3692-3700`。
-- arena の RAM/hard limit 判定: `src/core/expert_source.cpp:5874-5905`。
-- arena 不足時の file/RAM-copy fallback と通知: `src/program/generate.cpp:7072-7088,7321-7347`。
-- Qwen3.5 MoE の別 parser への分岐: `src/program/generate.cpp:3273-3283`。
+- `engine/src/program/generate.cpp:1490-1494` — help 表示上の値、既定値、RAM keep と fallback の説明。
+- `engine/src/program/generate.cpp:3836-3841,4225-4229` — root parser の値取り、変換、負値・NaN の拒否、フラグ優先を示す状態。
+- `engine/src/program/generate.cpp:4272-4280` — `STRATA_RAM_KEEP_GIB` の読み込みと `STRATA_RESIDENT_HEADROOM_GIB` との優先関係。
+- `engine/src/core/expert_source.cpp:6532-6537,6543-6559,6604-6605` — arena 必要 RAM の算定と不足時の判定・失敗経路。
+- `engine/include/strata/core/ple_residency.hpp:67-73,140-183` — fallback の抑止条件、GiB 変換・上限、安全 headroom と fallback 予算。
+- `engine/src/program/generate.cpp:8526-8546,8791-8819,8821-8839` — fallback 有効条件、RAM-copy headroom、起動時の出力と自動 RAM-copy 適用条件。
+- `engine/src/program/generate.cpp:8550-8587` — `--mmap-experts` を含む file-based expert mode の処理。
+- ツール ID と scope は `docs/cli/000_cli_tools.md:10`、対象リンクと root scope は `docs/cli/README.md:1036-1041,1187-1190` で照合しました。
+
+調査制約: 安全に実行できる同一 revision の既存 `strata` バイナリによる `--help` 確認は行わず、help 表示文字列と parser のソースを照合しました。Qwen3.6 系など独自 parser に振り分けられるモデルでは別 parser となるため、この文書の説明範囲は `engine/src/program/generate.cpp` の root parser です。

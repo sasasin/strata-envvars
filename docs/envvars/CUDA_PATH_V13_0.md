@@ -1,43 +1,41 @@
 # `CUDA_PATH_V13_0`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（2026-11-23 時点）。
 
 ## 役割
 
-Windows 用 vision reader (`strata-vision.exe`) を CUDA 13 variant としてビルドするときに、CUDA 13.0 toolkit の場所を指定するための環境変数です。`packaging/build_vision_windows.bat cuda13 <stage folder>` の経路だけで参照されます。Strata engine の通常起動時に読む設定ではありません。
-
-このバッチは変数が定義されていれば、その値をバッチ内の `CUDA_PATH` にコピーし、後続の検査と CMake 引数に使います。値自体を数値や真偽値として parse せず、パス文字列として扱います。
+Windows 向け CUDA 13 engine パッケージのビルド時に、CUDA 13.0 Toolkit のルートディレクトリを示す変数です。Strata の通常実行時に読む設定ではなく、同梱の packaging スクリプト `tools/packaging/build_cuda_windows.py` と、同スクリプトから呼ばれる `tools/packaging/build_vision_windows.bat` が読みます。engine ビルド用の Python スクリプトは候補ルートの存在と `nvcc --version` のリリース文字列を確認し、選んだルートを子プロセス用 `CUDA_PATH` として設定します。vision reader 用バッチは `cuda13` variant のとき、この変数が定義されていれば `CUDA_PATH` をその値で上書きして CMake に渡します（`tools/packaging/build_cuda_windows.py:96-105,151-174`、`tools/packaging/build_vision_windows.bat:26-35,54-58`）。
 
 ## 値と判定
 
-| 状態 | バッチの処理 |
-|---|---|
-| `cuda13` variant で未定義 | 既存の `CUDA_PATH` をそのまま使う。`CUDA_PATH` も未定義なら `CUDA_PATH is not set: install the cuda13 toolkit` を表示して終了コード 1。 |
-| `cuda13` variant で定義済み | 値を `CUDA_PATH` に代入する。値が空または無効なパスであっても、バッチ側に別の parse や fallback はない。 |
-| `cuda12` variant | `CUDA_PATH_V13_0` は参照しない。`CUDA_PATH_V12_9` が定義されていれば、そちらを `CUDA_PATH` に代入する。 |
+| 読み取り経路 | unset / 空文字 | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `build_cuda_windows.py cuda13` | Python 側は空文字を未指定相当として次候補 `CUDA_PATH` へ進む。`CUDA_PATH` も使えなければ終了する。 | `CUDA_PATH_V13_0` が指すディレクトリに `bin/nvcc.exe` があり、その実行結果の stdout にある `release X.Y` が `release 13.0` と完全一致する場合。 | `true`、`1` などの文字列自体を真偽値としては解釈しない。パスが存在しない、`nvcc.exe` がない、出力からリリース番号を抽出できない、または番号が `13.0` 以外なら候補として不採用。空白や大文字小文字の正規化は行わない。 |
+| `build_vision_windows.bat cuda13 <stage>` | `if defined` は偽となり、既存の `CUDA_PATH` をそのまま使う。両方未定義ならエラー終了。 | 空でない値は文字列をそのまま `CUDA_PATH` に代入。さらに `%CUDA_PATH%\bin\nvcc.exe` が存在すれば CMake 引数へ渡す。 | `0`、`false` なども空でなければ定義済みとして扱い、パスとして検査する。指定パスに `bin\nvcc.exe` がなければエラー終了。空白や CUDA バージョンの検証はしない。 |
 
-定義済みの `CUDA_PATH_V13_0` は既存の `CUDA_PATH` より優先されます。未定義なら既存の `CUDA_PATH` が fallback です。バッチは `setlocal` を使うため、代入された `CUDA_PATH` はこのバッチとその子プロセスの範囲に限られ、呼び出し元の環境には残りません。空文字が Windows の環境で定義済みとして扱われる場合も値の検証はなく、次の `CUDA_PATH` 未定義チェックまたは `nvcc.exe` 検査で失敗します。
+Python 側の検索順は `CUDA_PATH_V13_0`、次に `CUDA_PATH` です。候補ごとに `os.environ.get` で取得し、空でない値だけを検査します。パスの存在確認は `bin/nvcc.exe` に対して行い、`nvcc.exe --version` の stdout から正規表現 `release (\d+\.\d+)` で最初に一致した版を取り出し、`13.0` と比較します。数値や真偽値としての parse、パス文字列の trim はありません（`tools/packaging/build_cuda_windows.py:96-106`）。
+
+バッチ側では `cuda13` の分岐内の `if defined CUDA_PATH_V13_0` が定義有無だけを調べ、非空値なら `CUDA_PATH` に代入します。CLI variant が `cuda12` の場合はこの変数を参照しません（`tools/packaging/build_vision_windows.bat:26-32`）。
 
 ## 有効になる条件
 
-- Windows 上で `packaging\\build_vision_windows.bat cuda13 <stage folder>` を実行すること。variant の比較は大文字小文字を区別しません。
-- `CUDA_PATH_V13_0` が未定義なら、代わりに `CUDA_PATH` が利用可能であること。
-- 選ばれた toolkit root の下に `bin\\nvcc.exe` が存在すること。存在しなければ `no nvcc.exe in %CUDA_PATH%\\bin` を表示して終了コード 1。
-- Visual Studio の `cl.exe`、CMake、Ninja など後続のビルド要件も満たすこと。
-
-この環境変数は CUDA 13 variant の architecture list (`75;86;89;120`) や他のビルド設定を変更しません。`VISION_ARCHS` が定義されていれば architecture list はそちらで上書きされます。`CUDA_PATH_V13_0` は CUDA toolkit の選択に使われ、architecture の選択とは別です。
+- Python 経路では Windows 上で `build_cuda_windows.py cuda13` を実行する必要があります。別 OS では variant 処理より先に Windows 専用エラーで終了します（`tools/packaging/build_cuda_windows.py:151-168`）。
+- versioned path が適格であるには `bin/nvcc.exe` がファイルとして存在し、その stdout に `release 13.0` が必要です。適格でない場合は次の `CUDA_PATH` 候補が検査されます（`tools/packaging/build_cuda_windows.py:96-105`）。
+- vision reader のバッチでは `cuda13` variant が必要です。`CUDA_PATH_V13_0` が空でなく定義されていれば、Python 経路が選んで `CUDA_PATH` に設定した値よりもバッチ側の値が優先されます。このバッチ内では版番号を確認せず、`bin\nvcc.exe` の存在だけを検査します（`tools/packaging/build_cuda_windows.py:168-174,189-190`、`tools/packaging/build_vision_windows.bat:29-35`）。
+- バッチを直接呼び出す場合、`CUDA_PATH_V13_0` が未設定なら既存の `CUDA_PATH` が必要です。どちらも有効な `nvcc.exe` を指さない場合は CMake 前に失敗します（`tools/packaging/build_vision_windows.bat:31-35`）。
+- Python 経路で `CUDA_PATH_V13_0` と `CUDA_PATH` の両方が適格なら、前者が選ばれます。vision バッチで前者が定義済みの場合も前者が `CUDA_PATH` を上書きします。CLI 引数は variant を選び、パス候補の順序を変更します（`tools/packaging/build_cuda_windows.py:96-105,151-169`）。
 
 ## 実行時の詳細
 
-バッチ開始時に `setlocal EnableDelayedExpansion` を実行し、引数から variant と stage folder を取得します。`cuda13` 分岐で `CUDA_PATH_V13_0` が定義されていれば `CUDA_PATH` を設定し、その後 `CUDA_PATH` と `%CUDA_PATH%\\bin\\nvcc.exe` を検査します。CMake configure には `-DCMAKE_CUDA_COMPILER=%CUDA_PATH%/bin/nvcc.exe` と `-DCUDAToolkit_ROOT=%CUDA_PATH%` を渡し、続けて `strata-vision` target を build します。したがってこの変数が影響するのは、このパッケージング用 vision executable のビルド設定です。
+Python スクリプトは `find_cuda(variant)` の呼び出し時に環境を読みます。設定値をモジュールや関数内の cache に保存する実装ではありません。選んだ CUDA root は `env["CUDA_PATH"]` に設定され、PATH にもその `bin` が前置されます。続く engine の CMake 設定には同じ root が `CMAKE_CUDA_COMPILER` と `CUDAToolkit_ROOT` として渡されます（`tools/packaging/build_cuda_windows.py:96-106,167-175`）。
 
-必須引数の不足または未知の variant は usage を表示して終了コード 2 です。toolkit path / `nvcc.exe` の確認失敗、CMake configure/build、成果物コピー、package stamp の失敗は終了コード 1 になります。成功時は `built: ... (cuda13, archs ...)` を表示します。環境変数値の独自ログや警告はありません。読み取りはバッチ実行中の variant 分岐時で、プロセス内 cache はありません。
+その後、ステージングディレクトリと `VISION_BUILD_DIR` 等を含む環境で vision バッチを起動します。ここで `CUDA_PATH_V13_0` が定義されていると、Python が版検査後に選択した `CUDA_PATH` をバッチが再度上書きするため、engine と vision reader が異なる Toolkit root でビルドされる場合があります。バッチは上書き後の root を使って `nvcc.exe` の存在を確認し、CMake に compiler と toolkit root を渡します（`tools/packaging/build_cuda_windows.py:168-190`、`tools/packaging/build_vision_windows.bat:29-35,54-58`）。このバッチ経路では Toolkit の版一致は検査されません。
+
+バッチで `CUDA_PATH` が未定義なら `CUDA_PATH is not set: install the cuda13 toolkit` を表示して終了コード 1、`nvcc.exe` がなければ `no nvcc.exe in <パス>\bin` を表示して終了コード 1 です。CMake configure、build、copy、package stamp の失敗も `|| exit /b 1` で終了します（`tools/packaging/build_vision_windows.bat:34-35,54-60`）。変数値そのものを表示する成功ログはこのバッチにありません。
 
 ## 根拠
 
-- `packaging/build_vision_windows.bat:20-35` — `setlocal`、variant 分岐、`CUDA_PATH_V13_0` から `CUDA_PATH` への代入、未設定・`nvcc.exe` 検査。
-- `packaging/build_vision_windows.bat:57-64` — CMake に compiler/toolkit root を渡す処理、build、成果物コピー、成功ログ。
-- `packaging/build_vision_windows.bat:67-69` — usage と終了コード 2。
-- `packaging/build_vision_windows.bat:4-5,28-32` — variant ごとの toolkit / architecture の説明と CUDA 12 側の別変数。
-
-リポジトリ全体の `CUDA_PATH_V13_0` 完全一致検索では、このバッチのコメントと `cuda13` 分岐以外に参照はありませんでした。Strata の engine 起動時の読み取り、子 engine への転送、または実行時動作を変えるコードは確認できませんでした。
+- `tools/packaging/build_cuda_windows.py:96-106` — versioned 変数名を含む候補順、空値の扱い、`nvcc.exe` と CUDA 版の検査、候補不適格時の失敗。
+- `tools/packaging/build_cuda_windows.py:151-175,189-190` — Windows/variant 条件、選択 root の子プロセス環境への設定、vision バッチ呼び出し。
+- `tools/packaging/build_vision_windows.bat:26-35` — variant ごとの分岐、対象変数による `CUDA_PATH` 上書き、および未設定・ファイル不在時のエラー。
+- `tools/packaging/build_vision_windows.bat:54-60` — `CUDA_PATH` を CMake に渡し、後続の build / copy / stamp 失敗で終了する処理。

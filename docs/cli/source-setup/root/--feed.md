@@ -1,63 +1,72 @@
-# `--feed`
+# `source-setup setup.py --feed`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点、working tree clean）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`SETUP.bat`、update wrapper から委譲） |
+| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` などから起動） |
 | オプション | `--feed` |
 | 別名 | なし |
-| 値 | `URL` または `DIR`。parser は文字列として受け取る。 |
+| 値 | `URL` または `DIR`。署名付き更新 feed の URL、ファイル、または格納フォルダー |
 
 ## 役割
 
-DeepSeek-V4.1 用の独立 engine package を取得・更新するときに参照する署名付き update feed の場所を指定します。主にローカル feed を使ったテストや、release feed 以外の HTTPS feed を指定するための値です。`setup.py` の parser では `default=None`（既定値）で、値の形式や到達可能性を parser 段階では検証しません。
+セットアップ時に参照する署名付き更新 feed の場所を指定します。feed に含まれるモデル一覧をメニューへ加えるための任意読込と、feed 登録モデルに専用の shape engine が必要な場合の取得に使われます。通常の組み込みモデルを明示してセットアップするだけなら、この値は通常のモデルファイルのダウンロード先を変更しません（parser は `a.feed` を shape engine の取得と feed モデル読込へ渡します）。`terminal/setup.py` は Windows/Linux 用セットアップの入口で、Apple Silicon の通常経路は `engine/metal/setup_mac.py` へ委譲され、同じ feed モデル読込が行われます（`terminal/setup.py:1-4`, `terminal/setup.py:11218-11223`, `terminal/setup.py:9408-9417`, `engine/metal/setup_mac.py:361-374`）。
 
 ## 使い方
 
 ```sh
-python setup.py --family deepseek41 --feed /path/to/local-feed
+# feed のモデルも選べるように対話セットアップを開始
+python3 terminal/setup.py --feed ./test-feed
+
+# 公開 feed を使って、feed にあるモデルを指定してセットアップ
+python3 terminal/setup.py --feed https://github.com/Niko1221/Strata/releases/latest/download/strata-feed.json --family "$FEED_FAMILY" --model "$FEED_QUANT"
 ```
 
-HTTPS feed を明示する場合は、`/path/to/local-feed` を feed の URL に置き換えます。引数の受け取りは `setup.py:9142-9144`、DeepSeek family から専用 setup に進む分岐は `setup.py:9613-9618` です。
+2つ目の例では `FEED_FAMILY` と `FEED_QUANT` に、その feed のモデル定義にある値を設定します。ローカルの検証用ディレクトリを使う場合は、feed JSON と対応する署名ファイルを同じ場所に置きます。
 
 ## 値と既定値
 
-`--feed` の値は `URL|DIR` として一つ受け取り、`choices`・型変換・独自 validation は指定されていません (`setup.py:9142-9144`)。値を省略した場合、DeepSeek engine の feed source は次の順で決まります。
+`argparse` は値を文字列として受け取り、`choices` や専用の `type` validator は付けていません。既定値は未指定時の `None` です（`terminal/setup.py:11301-11303`）。
 
-1. 空でない `--feed` 値
-2. 環境変数 `STRATA_UPDATE_FEED`
-3. update 状態に保存された HTTPS feed（保存値が既定 feed の場合は platform 別既定値に解決）
-4. release の既定 feed
+feed の取得元は、空でない明示値 `--feed`、環境変数 `STRATA_UPDATE_FEED`、前回記録された HTTPS feed、それらがない場合のプロジェクト既定 feed の順です。明示値が空文字列なら `if a.feed` が偽になるため、次の候補へ進みます。記録済み URL は HTTPS のものだけ再利用し、ローカルパスや loopback URL は次回へ持ち越さず、再度指定しなければ既定 feed に戻ります（`terminal/strata_cli/update_cmd.py:142-158`）。
 
-この優先順位は `strata_cli/update_cmd.py:97-106` にあります。保存済み source のうち次回以降に引き継ぐのは HTTPS のみです (`strata_cli/update_cmd.py:109-111`)。空文字列は parser では受理されますが、`_feed_source()` の truth test では未指定と同じ扱いになります。
+値がフォルダーなら、ホスト用 feed 名（通常 `strata-feed.json`、Linux ARM64 では `strata-feed-linux-aarch64.json`）を探し、見つからず `strata-feed.json` があればそちらを使います。`.json` で終わる HTTP(S) URL はそのまま使い、それ以外の HTTP(S) URL にはホスト用 feed 名を追加します。署名ファイルは feed の場所に `.sig` を付けて読みます（`terminal/strata_control/feed.py:680-688`, `terminal/strata_control/feed.py:691-717`）。
+
+重複指定を拒否する処理はありません。`argparse` が作る引数値は最後の指定ですが、引数解析前に行う feed モデル探索の `_peek` は最初に現れた `--feed` を読むため、重複指定時には探索と後続処理で参照先が異なることがあります（`terminal/setup.py:11206-11210`, `terminal/setup.py:11223`, `terminal/setup.py:11301-11303`）。
 
 ## 実行時の動作
 
-DeepSeek-V4.1 を選び、適用可能な engine がまだなく、`--build` でも `--dsv41-package` でもない場合、`setup.py` は `--feed` 値を `get_dsv41_engine()` に渡します (`setup.py:8619-8626`)。既存の独自 engine を使っておらず、engine package が Strata 管理下にある場合は、起動前に feed を調べてより新しい package があれば更新を試します (`setup.py:8628-8630`)。feed からは現在の hardware に合う `dsv41` package を選び、取得・検証して `<data>/engine-dsv41/` 以下へ配置します (`setup.py:8173-8202`; `strata_control/dsv41_engine.py:150-179`)。
+feed モデルを必要とする未知の `--family` / `--model` を指定した場合、または対話式でモデル選択メニューを出す場合に feed を読み、検証済みのモデルを既存カタログへ加えます。`--yes` で family が未指定の場合はこのメニュー用 feed 読込を行わず、feed モデルを選ぶ対話メニューにも入りません。feed にモデル一覧がなければカタログは変わらず、確認済みの一覧キャッシュがあればオフライン時にそれを使います（`terminal/setup.py:11220-11225`, `terminal/setup.py:11767-11772`, `terminal/setup.py:9593-9607`, `terminal/strata_control/feed_models.py:110-137`, `terminal/strata_control/feed_models.py:204-220`）。
 
-`--feed` の値がローカル path、`file://`、または loopback URL の場合、DeepSeek engine 取得前に行う GitHub 到達性チェックを省略します。これは feed がローカルであることを示すチェックであり、feed package の署名やファイル hash 検証を無効にしません (`setup.py:8137-8146`; 検証・取得経路 `strata_control/dsv41_engine.py:150-163`)。
+指定元は `strata_control/feed.py` の取得処理へ渡され、信頼鍵による署名、stable channel、期限、最後に受理した sequence との比較を通過した feed だけが使われます。モデル一覧キャッシュは `<components>/.updates/feed-models.json` に保存され、読込時にも署名を再検証します。既存モデルとの ID・タグ・ファイル pin の衝突や不正な個別エントリーは警告ログを出して除外されます（`terminal/strata_control/feed.py:650-677`, `terminal/strata_control/feed.py:691-717`, `terminal/strata_control/feed_models.py:32-58`, `terminal/strata_control/feed_models.py:61-99`, `terminal/strata_control/feed_models.py:521-545`）。
 
-この値は通常の Qwen engine の取得に転送されません。通常 engine の feed 取得は `setup.py:4553-4557` で `strata update --no-control --output json` を別プロセスとして起動し、その argv に `--feed` を加えていません。また CUDA 12 engine の driver floor を feed から読む経路も `Namespace(feed=None)` で source を解決するため、このオプション値を使用しません (`setup.py:1727-1738`)。
+選ばれたモデルに shape engine が必要なら、同じ `--feed` 値が engine の feed 読込にも渡ります。対応する engine が新しければ取得・検証・配置し、テスト起動が通ってから使います。既存 engine があれば feed 読込や更新に失敗しても既存 engine を返して続行します。未導入で取得に失敗した場合は失敗文を表示してセットアップを止めます。通常の feed モデルの GGUF はモデル定義の固定 revision / SHA-256 pin で扱われ、`--feed` 自体はその GGUF のホストを指定しません（`terminal/setup.py:9408-9424`, `terminal/strata_control/shape_engine.py:289-343`, `terminal/strata_control/shape_engine.py:349-410`, `terminal/strata_control/feed_models.py:3-7`）。
 
 ## 適用条件と副作用
 
-- DeepSeek family の分岐でのみ engine package の取得・更新 source として利用されます (`setup.py:9613-9618`)。他 family では setup 全体の feed source を変更しません。
-- `--dsv41-package` を指定した場合はその package を検証・導入し、feed 取得を行いません (`setup.py:8179-8183`)。`--build` 指定時も feed からの package 取得・更新を行いません (`setup.py:8624-8630`)。
-- Feed package の取得時にはネットワークまたはローカル file access が発生します。正常導入後は `engine-dsv41` に新 package を置き、古い package directory を削除して一世代にします (`strata_control/dsv41_engine.py:162-179`)。更新時は新 engine を `--version` で起動確認してから古い世代を整理します (`strata_control/dsv41_engine.py:211-224`, `:227-233`)。
-- macOS で `STRATA_CONTROL_INSTALL=1` でない場合、`setup.py` 自身の parser より前に `metal/setup_mac.py` へ argv を委譲します (`setup.py:9068-9069`)。その parser は未知引数を `not used on a Mac` と警告して続行するため、この `--feed` は通常の Mac setup では消費されません (`metal/setup_mac.py:356-358`)。
+- `--feed` のモデル一覧読込は任意です。`STRATA_FEED_MODELS=0`、信頼鍵なし、feed の取得・検証エラー時は新しい一覧を使わず、利用可能なら最後の署名検証済みキャッシュを使います。セットアップのこのカタログ読込は feed 失敗を致命エラーとして表示しません（`terminal/strata_control/feed_models.py:110-137`, `terminal/setup.py:9593-9607`）。
+- `https`、loopback の `http`、`file:`、ローカルパスが扱われます。非 loopback の平文 HTTP は通常拒否されますが、`STRATA_UPDATE_ALLOW_HTTP=1` の場合は許可されます。不明な URL scheme は拒否されます（`terminal/strata_control/transfer.py:154-175`）。
+- feed モデルの新規一覧取得は最大5秒の timeout で行われ、成功時にはキャッシュを書き換えます。モデル専用 engine の初回取得は別経路で、未導入なら最大30秒の feed timeout で取得・検証・配置・テスト起動します（`terminal/strata_control/feed_models.py:34`, `terminal/strata_control/feed_models.py:124-134`, `terminal/strata_control/shape_engine.py:349-366`）。
+- モデル専用 engine の取得は既存 engine 置換後にテスト起動し、失敗した新しい配置は削除します。古い engine は成功した場合のみ保持数に従って整理されます（`terminal/strata_control/shape_engine.py:289-343`）。
+- Apple Silicon の通常セットアップでは `setup_mac.py` が引数解析前に `--feed` をモデルカタログ用に読みます。Metal 用 parser は未知引数を残す `parse_known_args` を使うため、この値を feed 探索後の通常処理へ渡さなくてもカタログ読込に使えます。Metal 側の通常モデルも同じ feed モデル一覧へ加えられます（`engine/metal/setup_mac.py:361-374`, `engine/metal/setup_mac.py:403`, `terminal/strata_control/feed_models.py:334-348`）。
 
 ## 出力とエラー
 
-ローカル feed でも署名付き feed の読込・package 選択・検証で失敗することがあります。取得できる DeepSeek package がない場合は理由を表示して engine 取得関数が `None` を返し (`strata_control/dsv41_engine.py:155-161`, `:180-182`)、setup は `no DeepSeek engine package could be fetched` と警告します (`setup.py:8199-8202`)。最後まで engine が得られない場合は「このコンピューターでは DeepSeek engine を利用できない」として失敗します (`setup.py:8640-8650`)。既存 engine の更新 feed に到達できない場合は更新を飛ばし、現在の engine で続行します (`setup.py:8205-8219`)。
+カタログ用 feed の失敗はログに記録されるだけで、最後の検証済み一覧があればそれにフォールバックします。カタログが空の場合はフィードモデルが表示されません（`terminal/strata_control/feed_models.py:123-137`）。
+
+専用 engine が必要な場合は挙動が異なります。未導入の engine を取得できない、feed に当該 engine がない、または当該 PC に合う package がない場合、`shape_engine.ensure` は失敗理由を出力し、セットアップ側は engine がない状態を許可する `STRATA_ALLOW_NO_ENGINE=1` がなければ `fail(...)` で停止します。既存 engine がある場合は feed が読めなくても既存 engine で続行します（`terminal/strata_control/shape_engine.py:349-410`, `terminal/setup.py:9408-9424`）。
 
 ## 根拠
 
-- parser 定義: `setup.py:9142-9144`
-- DeepSeek 用 feed source の優先順位: `strata_cli/update_cmd.py:97-111`
-- ローカル feed 判定と GitHub 到達性チェック、取得・更新条件: `setup.py:8137-8146`, `:8617-8630`
-- DeepSeek package の取得と失敗時の扱い: `setup.py:8173-8202`; `strata_control/dsv41_engine.py:150-182`
-- 更新時の起動確認と旧 directory 整理: `strata_control/dsv41_engine.py:211-233`
-- 通常 engine の別取得経路と CUDA 12 driver floor: `setup.py:4553-4557`, `:1727-1738`
-- Apple Silicon の委譲と未知引数の扱い: `setup.py:9068-9069`; `metal/setup_mac.py:356-358`
+- `terminal/setup.py:11218-11225` — OS 別の委譲と、未知 family/model のときの引数解析前 feed 探索。
+- `terminal/setup.py:11301-11303` — root parser の `--feed` 登録と表示形式。
+- `terminal/setup.py:11767-11772` — 対話メニューでの条件付き feed モデル読込。
+- `terminal/setup.py:9593-9607` — feed source の解決と任意カタログ読込。
+- `terminal/strata_cli/update_cmd.py:142-158` — 明示値・環境変数・記憶値・既定値の優先順。
+- `terminal/strata_control/feed.py:691-717` — URL/フォルダーから feed と署名を読み、署名・有効性を検証。
+- `terminal/strata_control/feed_models.py:110-137` — cache fallback とモデル一覧の保存。
+- `terminal/setup.py:9408-9424`, `terminal/strata_control/shape_engine.py:289-343`, `terminal/strata_control/shape_engine.py:349-410` — 選択モデルの専用 engine 取得、検証、失敗時の扱い。
+- `terminal/strata_control/transfer.py:154-175` — source scheme と HTTP policy。
+- `engine/metal/setup_mac.py:361-390` — Mac 側での feed モデル探索と parser 経路。

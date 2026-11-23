@@ -1,71 +1,64 @@
-# `setup.py --gpu`
+# `setup.py` / `setup.sh` / `START-HERE.bat` `--gpu`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` などから呼び出し） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat`（root） |
 | オプション | `--gpu` |
 | 別名 | なし |
-| 値 | GPU 番号を表す10進整数。NVIDIA は `nvidia-smi` の番号、AMD は setup が列挙する番号 |
+| 値 | GPU 番号を表す文字列。NVIDIA は `nvidia-smi` の番号、AMD は setup が列挙する番号。 |
 
 ## 役割
 
-モデルの setup で使う GPU を1枚に指定します。複数 GPU で1モデルを動かす指定は `--gpus`、カードごとの役割指定は `--gpu-roles` です。既存モデルを通常起動する場合にも使えますが、その場合は起動時だけの選択として処理されます（AMD の DeepSeek には選択を記憶する例外があります）。parser の help にもこの違いが記載されています（`setup.py:9111-9117`）。
+モデルのセットアップ時に使う GPU を1枚選びます。インストール済みモデルの通常起動では、その起動だけで使う GPU を指定します。複数 GPU でモデルを動かす設定は `--gpus`、カードごとの役割を指定する設定は `--gpu-roles` が担当します（`terminal/setup.py:11271-11280`）。
 
 ## 使い方
 
-Linux で NVIDIA GPU 1 を setup に指定する例:
-
 ```sh
-./setup.sh --setup --gpu 1
-```
+# セットアップ時に GPU 1 を選ぶ（<モデル名> は実際のモデル名に置き換える）
+./setup.sh --setup --model <モデル名> --gpu 1
 
-既に導入済みのモデルを GPU 1 で一度だけ起動する例:
-
-```sh
+# インストール済みモデルを、今回だけ GPU 1 で起動する
 ./setup.sh --gpu 1
+
+# Windows でインストール済みモデルを、今回だけ GPU 1 で起動する
+START-HERE.bat --gpu 1
 ```
 
-`setup.sh` は引数を `setup.py` に渡し（`setup.sh:8-12`）、Windows の `START-HERE.bat` も同様に転送します（`START-HERE.bat:44-54`）。`SETUP.bat` と `UPDATE.bat` もそれぞれ `--setup` / `--update` を加えて同じ入口を呼びます（`SETUP.bat:3`、`UPDATE.bat:79`）。
+Linux wrapper は `terminal/setup.py` を実行し、Windows wrapper も同ファイルへ引数を渡します（`setup.sh:6-18,80-81`; `START-HERE.bat:8-13,49-65`）。
 
 ## 値と既定値
 
-- 値は必須です。parser は型変換をせず文字列として受け取り、後段で `strip().isdigit()` を確認して整数化します（`setup.py:9111-9112, 9232-9238`）。負数、符号付き数値、文字列は拒否されます。空値は `argparse` の引数エラーです。
-- 番号は NVIDIA では `nvidia-smi` の番号、AMD では setup の GPU 一覧番号です（`setup.py:9111-9112`）。指定した番号が実機にない、または Strata が使えないカードの場合は後段のカード検査で失敗します（NVIDIA: `setup.py:1957-1959, 1853-1879`、AMD: `setup.py:9424-9428`）。
-- 省略時、NVIDIA では使えるカードが複数あれば組み合わせ可能なカード選択を尋ね、組み合わせられるカードがなければ VRAM が最大の使用可能カードを選びます（`setup.py:1950-1970`）。AMD では使用可能なカードから setup の順位で選択し、単独 GPU と UMA APU が混在する場合は専用メモリを持つカードを優先します（`setup.py:9429-9436`）。
-- `--gpu 0,2` のようにカンマを含む値は互換入力として `--gpus 0,2` に移され、単一 GPU 指定ではなくなります（`setup.py:9232-9235`）。複数カード指定の件数・重複・`all` の扱いは `--gpus` 側の処理です（`setup.py:1836-1850`）。`--gpu-roles` と `--gpu` / `--gpus` は同時指定できません（`setup.py:9240-9247`）。
-- 数値の `--gpu` と `--gpus` を併記した場合、setup のカード選択は `--gpus` を先に採用します（`setup.py:1953-1959`）。カンマ形式の `--gpu` と `--gpus` を併記した場合も、既に指定された `--gpus` は変換処理で保持されます（`setup.py:9232-9235`）。
+- `--gpu` は値を必須とし、1枚の GPU 番号を受け取ります。NVIDIA では `nvidia-smi` の番号、AMD では setup が表示する番号を使います（`terminal/setup.py:11271-11272`）。
+- parser 後に、カンマを含む値は `--gpus` の値として扱われます。したがって `--gpu 0,1` は複数 GPU 指定として解釈され、`--gpu` 自体の単一 GPU 指定にはなりません。カンマを含まない値は前後の空白を除いた後に数字か確認され、数字でなければ usage error になります（`terminal/setup.py:11424-11430`）。
+- `--gpu all` は受理されません。全カードや複数カードを選ぶ場合は `--gpus all` または `--gpus 0,1` を使います（`terminal/setup.py:11424-11430,2184-2198`）。
+- 省略時、セットアップでは複数カードを共有利用できる環境なら選択画面を出し、そうでなければ利用可能なカードのうち VRAM が最も大きいものを選びます（同量なら番号が小さい方）。インストール済みモデルの通常起動では保存済みの選択が使われ、複数カードを共有可能な場合は選択を尋ねる経路があります（`terminal/setup.py:2298-2319,11503-11507`）。
 
 ## 実行時の動作
 
-setup 経路では、指定した NVIDIA カードを `choose_gpus()` が検査して選択し、setup の GPU 情報・CUDA toolkit 選択・VRAM に基づく設定に使います（`setup.py:1950-1959, 9462-9485`）。複数 GPU が見つかった場合などは、選択カード番号をモデル設定の `gpu` に保存し、次回の起動で再質問しないよう `gpus_asked` も記録します（`setup.py:9464-9469, 10338-10346`）。明示した NVIDIA カードは `GPU_PICK` にも設定され、engine 更新時のカード選択より優先されます（`setup.py:9466-9468, 5468-5474`）。
-
-AMD setup では、指定番号を使用可能な AMD GPU 一覧から引きます。未指定時の自動選択とは別に、setup 内部で選んだ GPU 番号も後続処理向けに `a.gpu` に設定される場合があります。明示指定か自動選択かはその代入前に `_cards_named` へ記録されます（`setup.py:9420-9446`）。
-
-既存モデルの通常起動では `--gpu N` は選択した GPU を検査した後、起動する engine の引数 `--gpu N` に渡されます。NVIDIA のこの分岐ではモデル設定の選択を保存しません（`setup.py:9312, 7191-7209`）。AMD の HIP 起動でも engine に渡し、DeepSeek の場合は明示したカード選択をモデル設定に記憶できたとき、その旨を出力します（`setup.py:7153-7176`）。一方、既存モデル起動で `--gpus` を使うと複数カードを設定に保存し、以後そのモデルで使います（`setup.py:7157-7168, 7198-7205`）。
-
-`--gpu` は `--gpu-roles` や `--gpus` と値の意味が異なります。`--gpu-roles` との併用はエラーです。`--gpus` との併用は parser で一律拒否されず、両方が存在すると setup は `--gpus` を優先するため、意図しないカード選択を避けるには片方だけ指定します（`setup.py:9232-9247, 1953-1959`）。
+- **インストール済みモデルの通常起動:** `--gpu N` は `start()` に渡され、選択カードが検証された後、server 起動引数へ `--gpu N` として渡されます。ここでは「この起動だけ」の指定で、`--gpu` の値をモデル設定に保存する処理はありません（`terminal/setup.py:11503-11507,11540-11545,8554-8568`）。起動処理は server 用 subprocess を組み立てます（`terminal/setup.py:8517-8518`）。起動ルーチンは利用したモデル設定の更新日時を記録しますが、GPU 指定自体は保存しません（`terminal/setup.py:8512`）。
+- **モデルのセットアップ:** NVIDIA では選択した番号が `GPU_PICK` に入り、セットアップ中の GPU 情報取得と engine 更新対象の選定で優先されます（`terminal/setup.py:11662-11668,2579-2592,6317-6324`）。作成するモデル設定にも `gpu` として保存され、次回起動時の既定になります（`terminal/setup.py:9905-9907,10297-10299,10722-10724`）。
+- `--gpu` と `--gpu-roles` を同時に指定すると usage error になります。複数 GPU の `--gpus` が同時に指定された場合、NVIDIA セットアップの選択関数では `--gpus` が先に処理されます（`terminal/setup.py:11431-11450,2298-2307`）。
 
 ## 適用条件と副作用
 
-- 対象は `setup.py` の root parser です。setup wrapper は引数を委譲します。Apple Silicon で `STRATA_CONTROL_INSTALL=1` なしに `setup.py` を起動すると、冒頭で `metal/setup_mac.py` に委譲するため、このページの parser 検証経路とは異なります（`setup.py:9068-9070`）。
-- setup 時はカード選択によりモデルごとの設定ファイルを書きます（`setup.py:10338-10346, 10436-10454`）。既存モデル起動時の NVIDIA `--gpu` は、その起動プロセスに対する選択です。AMD DeepSeek での記憶動作は `gpu_pick.remember()` が設定ファイルを更新できた場合に限られます（`setup.py:7169-7176`）。
-- 選択 GPU の VRAM はモデル適合判定や設定値の算出にも使われます。`--gpu` 自体が GPU を有効化したり、異なるメーカーの GPU を同時利用したりするものではありません。setup は選択したカードについて必要な engine 対応等を確認し、満たさない場合は停止します（例: NVIDIA の選択・CUDA 判定 `setup.py:9462-9485`）。
+- NVIDIA では指定番号が検出済みカードに存在し、setup が利用可能と判定できる必要があります。AMD では選択番号が検出済みかつ対応 backend で利用可能である必要があります（`terminal/setup.py:2201-2227,11619-11629,4976-5007`）。
+- セットアップ時は選択カードに応じて GPU メモリ見積もりや engine の対象が変わり、作成するモデル設定ファイルに GPU 選択を書き込みます（`terminal/setup.py:11662-11680,9905-9907`）。通常起動時は engine にカードを渡してモデルを起動します。`--gpu` 単独では複数カードへの分割を指定しません。
+- macOS の通常経路は `terminal/setup.py` の共通 parser より前に `engine/metal/setup_mac.py` の parser へ委譲されます。この別スコープの parser に `--gpu` は索引登録されていません（`terminal/setup.py:11218-11219`; 索引のスコープは `docs/cli/README.md:1652-1719`）。Hy4-Flash / Inkling-2-Mini の Mac 経路は共通 parser を通りますが、Apple GPU を index `0` として固定してセットアップ関数に渡すため、指定番号による選択はしません（`terminal/setup.py:11150-11171,11174-11195`）。
 
 ## 出力とエラー
 
-- 数字以外の値（カンマを含む互換値を除く）は `ArgumentParser.error()` によりエラーとなり、エラーメッセージに形式例が示されます（`setup.py:9232-9238`）。
-- 選択した GPU が見つからない、または利用できない場合は、GPU 一覧と利用可能な選択肢を示して setup を停止します（`setup.py:1858-1879`）。AMD の番号が利用可能一覧にない場合も利用可能番号を案内します（`setup.py:9424-9428`）。通常の `fail()` は `[X]` と修正案を出し、終了コード 1 で終了します（`setup.py:904-909`）。
-- setup の NVIDIA でカードを複数検出し、指定カードが8 GB未満など共有利用時だけの VRAM 条件にかかるケースは、この単一 GPU 指定の検査とは別です。`--gpus` の複数カード検査が同条件を確認・質問します（`setup.py:1853-1869`）。
+- 数値でない値（例: `--gpu all`）は argparse の usage error になります（`terminal/setup.py:11424-11430`）。
+- NVIDIA の番号が見つからない、またはカードが利用不能の場合、検出カード一覧や代替指定のヒントを表示して setup を終了します（`terminal/setup.py:2201-2227,2585-2589`）。setup 内の `fail()` はエラーを表示し、終了コード `1` を返します（`terminal/setup.py:1049-1056`）。AMD の番号が未検出または未対応の場合も、利用可能カードの案内とともに `fail()` になります（`terminal/setup.py:11623-11625,4999-5007`）。
 
 ## 根拠
 
-- parser 定義と値の説明: `setup.py:9111-9117`
-- 入力の数値検査、カンマ値の互換変換、`--gpu-roles` との排他: `setup.py:9232-9259`
-- NVIDIA setup の選択・検証と既定選択: `setup.py:1853-1879, 1950-1970, 9462-9485`
-- AMD setup の選択・適用: `setup.py:9420-9446`
-- 起動時の選択と engine への転送、AMD DeepSeek の記憶: `setup.py:7153-7176, 7191-7210`
-- 設定ファイルと engine 更新への影響: `setup.py:5468-5474, 10338-10346, 10436-10454`
-- この調査は現行 checkout の parser と Strata ソースを確認したものです。同 revision の `--help` 実行、ビルド、実機 GPU での動作確認は行っていません。
+- `terminal/setup.py:11271-11280` — parser 定義と `--gpu` / `--gpus` / `--gpu-roles` の役割・既定動作。
+- `terminal/setup.py:11424-11450` — 値の正規化・validation、役割指定との排他。
+- `terminal/setup.py:2184-2227,2298-2319` — 複数指定の parse、カード検証、セットアップ時のカード選択。
+- `terminal/setup.py:11503-11507,11540-11545,8517-8518,8554-8568` — 通常起動時の一時指定と server 起動引数への転送。
+- `terminal/setup.py:11619-11629,11662-11680,9905-9907,10297-10299,10722-10724` — GPU 選択とセットアップ時の設定保存。
+- `terminal/setup.py:2579-2592,6317-6324` — 選択 GPU の情報取得と engine 更新対象への反映。
+- `terminal/setup.py:11218-11219`; `setup.sh:6-18,80-81`; `START-HERE.bat:8-13,49-65` — macOS の委譲経路と Linux / Windows wrapper。

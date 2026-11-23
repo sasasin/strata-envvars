@@ -1,61 +1,51 @@
 # `--image-quant`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査対象リポジトリの `git status --short --branch` は `## main...origin/main` で、未コミット変更はありません。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat` などから委譲） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat`（source setup、root） |
 | オプション | `--image-quant` |
 | 別名 | なし |
-| 値 | `Q4_K_M`、`Q6_K`、`Q8_0` のいずれか（必須） |
+| 値 | `Q4_K_M`、`Q6_K`、`Q8_0` のいずれか |
 
 ## 役割
 
-画像生成機能 Qwen-Image-2.1-Turbo の denoiser（DiT）に使う GGUF 量子化を選びます。このオプションは parser では受理されますが、プレビュー機能のため通常の `--help` には表示されません。画像生成の有効化自体は `--images qwen-image` が担い、量子化指定だけでは画像生成を構成しません。(`setup.py:9096-9101`, `setup.py:5080-5087`)
+画像生成モデル Qwen-Image-2.1-Turbo の denoiser quant を明示するための引数として parser に登録されています。ただし、現行 checkout では `setup_images()` の呼び出しがなく、`terminal/setup.py` 本体の通常の実行経路から `a.image_quant` が画像設定へ渡される箇所も確認できません。このため、source setup にこの引数を渡しても quant の選択・ダウンロード・設定への反映は起きないと判断できます。画像設定 helper 内には quant を使う実装がありますが、現行ソース上で同 helper を呼ぶ経路は別の画像 install ツールです。
 
 ## 使い方
 
-Linux の source checkout で、セットアップ時に画像生成と量子化を指定する例です。
-
 ```sh
-./setup.sh --setup --images qwen-image --image-quant Q6_K
+./setup.sh --image-quant Q6_K
 ```
 
-`setup.sh` は引数を `setup.py` に渡します。Windows では `START-HERE.bat --setup --images qwen-image --image-quant Q6_K` を使えます。(`setup.sh:76`, `START-HERE.bat:48`, `docs/IMAGES.md:16-21`)
+上記は parser が受理する形式の例です。現行 `setup.py` では当該値は画像設定処理に利用されないため、quant を変更する操作としては機能しません。
 
 ## 値と既定値
 
-- 有効値は `Q4_K_M`、`Q6_K`、`Q8_0` です。値を省くと argparse の既定値 `None` となり、量子化選択時に GPU メモリ容量から推奨値を選びます。(`setup.py:9099-9100`, `tools/image/qimage.py:56,65-71`)
-- 自動推奨は GPU メモリが 8 GB 以下なら `Q4_K_M`、8 GB 超〜12 GB 以下なら `Q6_K`、12 GB 超なら `Q8_0` です。選択 backend が CPU の場合は GPU 容量によらず `Q4_K_M` を推奨します。(`tools/image/qimage.py:65-71`, `setup.py:5069-5073`)
-- 選択肢以外の値は argparse が拒否し、通常の usage/error 表示と終了コード 2 になります。重複して指定した場合の argparse の通常動作では最後の値が残ります。専用の追加 validation はありません。(`setup.py:9099-9100`, `setup.py:9212`)
+- 値は `Q4_K_M`、`Q6_K`、`Q8_0` に限定されます。別の値は `argparse` の choices 検証で拒否されます。parser は既定値を指定していないため、未指定時の属性値は `None` です（`terminal/setup.py:11255-11256`）。
+- 画像設定 helper の実装では、明示値がなければ GPU メモリ量から quant を選びます。backend が CPU の場合は `Q4_K_M`、それ以外は GPU メモリが 8 GB 以下で `Q4_K_M`、12 GB 以下で `Q6_K`、それを超えると `Q8_0` です（`terminal/setup.py:5888-5891`、`terminal/tools/image/qimage.py:65-71`）。これは helper の規則であり、現行 `setup.py` CLI で実行される規則ではありません。
+- 重複指定時の明示的な独自処理はありません。`argparse` の通常の単一値引数として扱われます。
 
 ## 実行時の動作
 
-`setup.py` は `--image-quant` の値を `a.image_quant` に格納します。画像生成の設定処理が呼ばれると、`image_backend_choice()` が明示値を推奨値より優先し、`setup_images()` がその量子化名のファイルを選びます。さらに VAE とテキスト encoder を含む合計 3 ファイルをモデルディレクトリへダウンロードして SHA-256 を検証し、実行設定の `images` セクションに `quant` と denoiser のパスを書きます。(`setup.py:5065-5077`, `setup.py:5080-5104`, `tools/image/qimage.py:44-56,190-203`)
+`setup.py` の parser はこの引数を `help=argparse.SUPPRESS` で登録しているため、通常の `--help` 一覧には表示しません（`terminal/setup.py:11252-11256`）。しかし、parser への登録だけでは値は反映されません。現行 `terminal/setup.py` 内で `setup_images()` は定義されていますが、その呼び出しは見つからず、`a.image_quant` の参照は `image_backend_choice()` 内の quant 選択箇所だけです（`terminal/setup.py:5891-5895, 5898-5904`）。従って source setup でこのオプションを指定しても、現状は選択値が使われません。
 
-指定量子化が GPU 容量からの推奨より大きい場合も値は補正されず、そのまま使用されます。セットアップは推奨値と GPU 容量を示す警告を出し、コメント上は大きいモデルの一部が stable-diffusion.cpp により RAM に置かれ遅くなる可能性を説明しています。推奨以下の明示値について、この警告は出ません。(`setup.py:5072-5077`)
+同じ共通 helper は `terminal/tools/image/install.py` からも利用されますが、そちらは別 CLI であり、受け付ける引数名は `--quant` です。同ツールは `a.quant` を `image_quant` として helper に渡します（`terminal/tools/image/install.py:44-49, 69-71`）。この別 CLI の値規則を source setup の `--image-quant` の実行効果と混同しないでください。
 
-画像生成セクションは `--images` が指定された場合にのみ今回の設定で更新されます。`--images no` では設定値が `None` となり、設定書き込み時に `images` セクションを取り除きます。`--image-quant` だけを指定しても `a.images` が偽なら `setup_images()` は呼ばれず、この値は使われません。(`setup.py:5083-5084,10434-10436`, `setup.py:6666-6668`)
+helper が呼ばれる経路では、指定 quant が GPU メモリ量に対する推奨より大きい場合に警告を出し、指定値を維持します。コメントと警告文は、stable-diffusion.cpp が一部を RAM に置くため遅くなる可能性を述べています（`terminal/setup.py:5884-5895`）。画像設定処理まで進む場合は quant をモデルファイルの選択に使い、モデルのダウンロードと SHA-256 検証を行い、生成された `images` 設定に quant と denoiser のパスを記録します（`terminal/setup.py:5907-5927`、`terminal/tools/image/qimage.py:235-242`）。これらも source setup からは現在到達しない helper の処理です。
 
 ## 適用条件と副作用
 
-- 通常の `setup.py` parser ではこのオプションを受理しますが、画像生成の選択肢はプレビュー扱いで `--help` に隠されています。画像生成を構成する際には `sd-cli` のビルド、モデルファイルのダウンロード、run config の更新が行われます。ディスク空き容量が必要量 + 5 GB 未満でも処理は拒否されず、ダウンロードが容量不足になる可能性を警告します。(`setup.py:9096-9101`, `setup.py:5087-5104`)
-- `--image-backend cpu` などで backend を明示した場合、量子化の推奨容量計算は選択 backend に従い、CPU では `Q4_K_M` が基準です。backend の自動選択は GPU がない場合 CPU、NVIDIA CUDA、AMD の専用メモリ GPU HIP（Windows または APU は Vulkan）、Intel 等 Vulkan です。(`setup.py:5069-5073`, `tools/image/qimage.py:88-98`)
-- Apple Silicon で `STRATA_CONTROL_INSTALL=1` を指定せずに `setup.py` を実行すると `metal/setup_mac.py` に委譲されます。Metal 用 parser は未知の引数を `not used on a Mac: ...` と警告して続行するため、この文書の `--image-quant` はその経路では使われません。Intel SYCL wrapper は argv を保ったまま `setup.py` を再実行します。(`setup.py:9068-9069`, `metal/setup_mac.py:356-358`, `sycl/setup_intel.py:547-560`)
-- `--images qwen-image` を指定すると、セットアップは画像生成機能とライセンスに関する案内を表示し、確認を求めます。拒否すると画像生成設定を返さず、モデルのダウンロード・画像 engine ビルドへ進みません。`--yes` はこの確認を自動承認します。(`setup.py:5087-5095`)
+現行 `setup.py` の parser は値を受理しますが、画像 setup への接続が確認できないため、このオプション自体による画像モデルのダウンロード、ビルド、設定ファイル変更、GPU 利用は確認できません。無効値は parser の choices 検証で拒否されます。標準 `argparse` のエラー表示・終了コードの細部は本調査では実行していません。
 
-## 出力とエラー
-
-- 明示値が推奨より大きい場合、stderr 側の警告関数を通じて推奨量子化と容量を知らせます。量子化値だけを理由に処理を中断する分岐はありません。(`setup.py:5074-5076`)
-- 画像モデルのダウンロード後にサイズと SHA-256 が検証されます。また CUDA backend の画像 engine ビルドで `nvcc` がない場合は `fail()` によるエラー経路になります。ビルド完了後に `sd-cli` が見つからない場合も失敗します。(`setup.py:5022-5026,5056-5059,5095-5100`)
-- 画像生成設定はモデルごとの run config に書かれます。既存の同じ設定ファイルが変更される場合、setup は `.bak` を作成しようとし、バックアップ作成に失敗すると警告して本体の設定書き込みを続けます。(`setup.py:6653-6677`)
+将来または別経路で `image_backend_choice()` が利用された場合、helper は推奨 quant を超える指定値を強制的に下げず、警告のみ出します。CPU backend の推奨は `Q4_K_M` です（`terminal/setup.py:5888-5895`）。
 
 ## 根拠
 
-- parser 宣言、choices、help 非表示: `setup.py:9096-9101`。
-- 推奨量子化・明示値優先・警告: `setup.py:5065-5077`、`tools/image/qimage.py:56,65-71`。
-- 選択値を使う設定処理、確認、download/hash 検証、設定生成: `setup.py:5080-5104`、`tools/image/qimage.py:44-56,190-203`。
-- `--images` がない場合と `--images no` の動作、設定からの削除: `setup.py:5083-5084,10434-10436,6666-6668`。
-- wrapper、Mac 委譲、SYCL argv 再実行: `setup.sh:76`、`START-HERE.bat:48`、`setup.py:9068-9069`、`metal/setup_mac.py:356-358`、`sycl/setup_intel.py:547-560`。
-- 利用者向けのプレビュー手順とオプション表: `docs/IMAGES.md:16-21,48-55`。これは補助資料として参照し、上記の動作説明は parser と実装を根拠にしています。
+- `terminal/setup.py:11252-11256` — source setup parser における非表示の引数登録と choices。
+- `terminal/setup.py:5884-5895` — quant の既定選択、明示値の採用、および推奨より大きい場合の警告。
+- `terminal/setup.py:5898-5927` — `setup_images()` 内の条件、ダウンロード、設定生成。現行 checkout で呼び出し元は確認できず、`a.image_quant` は `image_backend_choice()` 内でのみ参照される。
+- `terminal/tools/image/qimage.py:56, 65-71, 235-242` — quant の一覧、GPU メモリによる推奨、および設定オブジェクトへの値の記録。
+- `terminal/tools/image/install.py:44-49, 69-71` — 別 CLI が `--quant` を受け付け、共通 helper へ渡す経路。

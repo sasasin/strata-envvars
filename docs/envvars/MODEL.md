@@ -1,41 +1,54 @@
 # `MODEL`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Strata 本体の C++/CUDA/HIP/SYCL エンジンが直接読む環境変数ではありません。Strata の Docker entrypoint がコンテナ起動時に値を `strata launch --model <値>` に変換し、起動するモデルサイズを指定します。NVIDIA / Intel / AMD の各 Compose 定義がホストの `MODEL` をコンテナへ渡します。また、host アプリのブラウザー操作用スクリプトでは、モデル選択メニューから選ぶ表示名の指定に使われます。
+Strata の Docker entrypoint が起動時のモデルサイズを受け取り、値が空でなければ `strata launch --model <値>` に渡す。モデル選択を実行するのは Terminal CLI であり、エンジンが `MODEL` 環境変数を直接読む実装は確認できない。通常のコンテナ起動（引数なし、`run` または `serve`）で使う。`strata` や `sh` など別コマンドを指定すると entrypoint はそのコマンドを直接実行するため、`MODEL` は適用されない。`tools/docker/entrypoint.sh:1-7,68-71,184-210`
 
 ## 値と判定
 
-| 経路 | 未設定・空文字 | 値がある場合 | 無効な値 |
-|---|---|---|---|
-| Docker entrypoint | 未設定と空文字は同じ扱い。`--model` を付けず、モデルも `MODEL_PATH` も指定されていなければ、Strata CLI がこのコンピューター向けの推奨モデルを選ぶ。保存済み preset があればその設定が使われる | 値全体を `--model` の引数として渡す。小文字・大文字を区別しないカタログ上のモデル名が受け付けられる | カタログにない名前は CLI が拒否する。`MODEL` 自体に trim、部分一致、真偽値化、fallback はない |
-| host のブラウザー操作スクリプト | JS の `??` により未設定時だけスクリプトごとの既定表示名を使う。明示した空文字は空文字のまま | 値を `new RegExp(MODEL)` に渡し、最初に一致するモデル選択メニュー項目をクリックする | 事前検証や空文字 fallback はない。一致項目がない場合は UI 操作が成立せず、スクリプト実行が失敗する |
+entrypoint は `[ -n "${MODEL:-}" ]` で未設定・空文字を同じく「モデル指定なし」と判定する。非空なら文字列をそのまま一つの `--model` 引数にする。entrypoint 自体は数値化・小文字化・空白除去・値域検査をしない。`tools/docker/entrypoint.sh:209`
 
-Docker 経路では `MODEL=0` も Boolean の false ではなく、文字列 `0` のモデル名として検索されます。先頭文字・数値・大文字小文字を使った特別な判定はありません。モデルサイズが複数の family に存在する場合は、別変数 `FAMILY` が選択を補います。Compose の `${MODEL:-}` は未設定または空値を空値としてコンテナへ渡します。
+| `MODEL` の値 | entrypoint の処理 | CLI 側の結果 |
+| --- | --- | --- |
+| 未設定、空文字 | `--model` を付けない | `MODEL_PATH` も未指定なら、preset がある場合はそのモデルを使う。preset がなくても `MODEL_PATH` がなければハードウェア向け推奨モデルを選ぶ。`MODEL_PATH` が指定されれば preset のモデルをクリアして自前ファイルを使う。`tools/docker/entrypoint.sh:191,209,264-271`; `terminal/strata_cli/launch/cmd.py:219-238,344-356` |
+| `IQ3_XXS`、`iq3_xxs` などカタログ上のサイズ名 | そのまま `--model` に渡す | カタログ名との大文字小文字を区別しない完全一致で解決する。`terminal/strata_cli/launch/catalog.py:550-572` |
+| `0`、`1`、`true`、`false`、`0anything` など | すべて非空なので `--model` に渡す | 真偽値や数値としては解釈せず、モデル名として解決する。カタログにない名前は無効。`terminal/strata_cli/launch/catalog.py:550-559` |
+| 前後に空白を含む名前 | 空白を含めたまま渡す | CLI の名前照合でも trim はなく、照合対象名と一致しなければ無効。`terminal/strata_cli/launch/catalog.py:550-559` |
+
+`--model` が使える名前は、実行時のモデルカタログと既存モデルのサイズ名による。未知名は CLI が `There is no model called '<値>'.`（候補があれば `Did you mean ...?` と一覧も付く）で失敗する。`FAMILY` が同時に指定されればその family 内でサイズを照合し、該当サイズがなければ別のエラーになる。family が省略され同じサイズが複数 family にあれば `qwen` を優先し、それ以外は最初の候補を使う。`terminal/strata_cli/launch/catalog.py:550-572`; Docker からの `FAMILY` 転送は `tools/docker/entrypoint.sh:209-211`。
 
 ## 有効になる条件
 
-- Docker 経路は entrypoint を通常起動した場合に有効です。コンテナへ `strata ...`、`sh` などのコマンドを指定すると entrypoint は直接そのコマンドを実行し、設定変数からの `strata launch` 組み立てには入りません。
-- NVIDIA / Intel / AMD 各 Compose 定義で `MODEL` をコンテナ環境に転送します。モデル名の解決は起動した Strata CLI のモデルカタログに依存します。
-- CLI の `--preset` は preset を読み込んだ後に引数を重ねます。非空の `MODEL` から作られた `--model` は preset のモデル選択を上書きします。空の `MODEL` は `--model` を作らないため、preset の既存モデル選択を保ちます。preset にモデルがなく、`MODEL_PATH` もない場合に推奨モデル選択へ進みます。
-- host アプリの読み取りは `apps/host/scripts/agent-flow.mjs`、`agent-flow-s4b.mjs`、`agent2-flow.mjs`、`agent2-tools-flow.mjs`、`mode-flow-s4b.mjs` の UI 自動操作専用です。Strata サーバーや推論エンジンの設定には転送されません。
+- Docker の通常起動経路であること。entrypoint に `strata …`、`sh` など別コマンドを渡すと直接 `exec` し、`MODEL` を `--model` に変換しない。`tools/docker/entrypoint.sh:68-71,209`
+- `MODEL` の非空値が、起動時の Terminal カタログで解決できるモデルサイズであること。サイズが複数 family に属する場合は `FAMILY` で絞れる。`terminal/strata_cli/launch/catalog.py:550-572`
+- モデルの取得・準備・起動が完了するには、選択モデルに合うカタログ、モデルファイル、engine/backend 等が必要。`MODEL` 自体に OS / backend 判定はない。解決後は通常の `Runner` が engine 確保、モデル確保、設定保存、serve 起動へ進む。`terminal/strata_cli/launch/cmd.py:876-902`; `terminal/strata_cli/launch/runner.py:3141-3187`
+- `PRESET` が既に存在し `MODEL` が未設定なら、entrypoint は `--preset` を渡すため、preset に保存されたモデルが使われる。`MODEL` が非空なら同じ preset を読み込んだ後に `--model` の指定が適用され、`--save-preset` も渡される場合は更新後の選択が保存される。`tools/docker/entrypoint.sh:264-268`; `terminal/strata_cli/launch/cmd.py:215-238`
+- `MODEL_PATH` は別設定で、未設定の `MODEL` の代替として使える。`MODEL_PATH` があるときは自前ファイルのモデルを使い、未設定のサイズを推奨モデルで埋めない。両方指定したときはモデルサイズとパスの両方が CLI に渡る。`tools/docker/entrypoint.sh:191-211`; `terminal/strata_cli/launch/cmd.py:222-238,344-356`
 
 ## 実行時の詳細
 
-Docker entrypoint は起動時に `MODEL` の非空判定を行い、値があれば引数配列へ `--model "$MODEL"` を追加します。値を追加したことは「設定あり」として記録され、preset の起動に使われます。開始ログは設定値があれば `Starting Strata: <MODEL> ...`、なければ model path または推奨モデルの文言になります。値が空で preset もなく model path もないときは `No MODEL was set, so Strata picks the model it recommends for this card...` を stderr に出します。Compose と entrypoint のこの判定はコンテナ起動時の処理で、稼働中に環境変数を書き換えても再評価されません。
+entrypoint は子プロセスを起動する前に環境値を参照し、argv の組み立てと開始ログの作成で展開する。環境値を cache する実装はなく、CLI が受け取った後は `--model` 引数で処理される。親プロセス側の値を変えても起動済みコンテナの環境は変化しないため、変更はコンテナ再起動後に反映される。選択値がある開始ログは `Starting Strata: $what (preset '$PRESET').`（`$what` は `FAMILY/MODEL`、必要なら ` from MODEL_PATH` 付き）。`tools/docker/entrypoint.sh:209,293-306`
 
-CLI は `--model` を preset に重ねて設定へ反映し、カタログ上のモデル名と大文字小文字を無視して照合します。名前が見つからない場合は `There is no model called '<値>'.`（近い候補があれば提案を追加）を `strata:` エラーとして stderr に出し、終了コード 2 を返します。Docker entrypoint は `strata launch` の非ゼロ終了を `strata launch stopped with code <終了コード> (the lines above say why). The container ends.` と報告し、コンテナを終了します。モデルがカタログ上で有効でも、ハードウェア適合性の警告など別の起動条件は CLI が別途判定します。
+`--model` を受けた CLI は preset を初期設定として読み込んだあと、`catalog.resolve()` でモデル名と任意の `FAMILY` を解決して設定を上書きする。選択結果は `Runner` のモデル準備・設定保存・サーバー起動に使われる。モデル名が無効なら `run_launch()` がエラー文字列を stderr に出して終了コード `2` を返し、Docker entrypoint は `strata launch stopped with code 2 (the lines above say why). The container ends...` として失敗終了する。`terminal/strata_cli/launch/cmd.py:215-238,753-764,876-902,1009-1014`; `terminal/strata_cli/launch/catalog.py:550-572`; `tools/docker/entrypoint.sh:300-312`
 
-ブラウザー操作スクリプトはプロセス開始時に `process.env.MODEL` を定数へ読み込み、モデルメニューを開いた後にその正規表現へ最初に一致する項目を選びます。通常の環境変数の再設定を監視する処理はありません。
+未設定時、preset がなく `MODEL_PATH` もなければ CLI の `apply_defaults()` はハードウェア向け推奨モデルを設定する。推奨できない場合はエラー notice を返す。`MODEL_PATH` の有無や preset の内容により未設定時のモデル選択が変わるため、「未設定なら常に推奨モデル」とはならない。`terminal/strata_cli/launch/cmd.py:219-238,344-356`
+
+Compose の NVIDIA / AMD / Intel 定義はいずれも `${MODEL:-}` をコンテナの `MODEL` に設定するため、Compose ホストで未設定なら空値となる。これは受け渡しであり、各 backend ごとの別の `MODEL` 判定はない。`tools/docker/compose/docker-compose.nvidia.yml:16-19`; `tools/docker/compose/docker-compose.amd.yml:16-18`; `tools/docker/compose/docker-compose.intel.yml:16-18`
+
+`app/host/scripts/agent-flow.mjs` などのブラウザフロー用スクリプトにも `process.env.MODEL` があるが、これは画面上のモデル picker を選ぶ自動操作の入力であり、Strata アプリのモデル設定を読む実装ではない。ソース全体の `MODEL` 参照を確認した範囲で、通常実行時の環境値読み取りは Docker entrypoint に限られ、engine や Terminal 側の env helper を介した別の `MODEL` 読み取りは確認できなかった。`app/host/scripts/agent-flow.mjs:15,31,68-70`
+
+## ログと測定値
+
+モデル値があれば entrypoint は `Starting Strata: $what (preset '$PRESET').` を stdout に出す。未設定で preset も entrypoint の選択設定もない場合、entrypoint は stderr に `[!] No MODEL was set, so Strata picks the model it recommends for this card. Set MODEL (for example MODEL=IQ3_XXS) to choose.` を出す。未設定時、CLI の推奨モデル通知文は `No model was named, so Strata picked {title} for this computer ({why}).`。`tools/docker/entrypoint.sh:52-54,270,295-300`; `terminal/strata_cli/launch/cmd.py:344-356`
+
+無効なモデル名は CLI が `strata: There is no model called '<値>'.`（必要に応じて候補名と `Models: ...` が続く）を stderr に出して終了コード `2` を返す。entrypoint はその後 `strata launch stopped with code $rc (the lines above say why). The container ends. Fix that and start it again: finished steps are not repeated, and an interrupted download continues where it stopped.` を出して同じ終了コードで失敗する。`terminal/strata_cli/launch/cmd.py:753-764,1009-1014`; `terminal/strata_cli/launch/catalog.py:550-559`; `tools/docker/entrypoint.sh:300-312`
 
 ## 根拠
 
-- Docker entrypoint の起動コマンド分岐と環境読み取り: `docker/entrypoint.sh:53-56,169-194,242-250,273-290`。
-- NVIDIA / Intel / AMD Compose からの転送: `docker/compose/docker-compose.nvidia.yml:16-19`, `docker/compose/docker-compose.intel.yml:15-18`, `docker/compose/docker-compose.amd.yml:15-18`。
-- CLI の `--model` 定義と preset への上書き: `strata_cli/launch/cmd.py:83-89`, `strata_cli/launch/cmd.py:205-224`。
-- モデル名の大文字小文字を無視した完全一致、無効名エラー: `strata_cli/launch/catalog.py:373-401`。CLI のエラー出力・終了コード: `strata_cli/launch/cmd.py:692-697,913-916`。
-- 未指定時の推奨選択と通知: `strata_cli/launch/cmd.py:321-333`。
-- Docker entrypoint が CLI の失敗を受けてコンテナを終了: `docker/entrypoint.sh:283-290`。
-- ブラウザー操作スクリプトでの既定値とメニュー選択: `apps/host/scripts/agent-flow.mjs:27-33,63-70`, `apps/host/scripts/agent-flow-s4b.mjs:20-30,86-92`, `apps/host/scripts/agent2-flow.mjs:19-26,65-70`, `apps/host/scripts/agent2-tools-flow.mjs:18-24,64-71`, `apps/host/scripts/mode-flow-s4b.mjs:8-12,21-26`。
+- `tools/docker/entrypoint.sh:1-7,68-71,184-210,264-312`
+- `tools/docker/compose/docker-compose.nvidia.yml:16-19`; `tools/docker/compose/docker-compose.amd.yml:16-18`; `tools/docker/compose/docker-compose.intel.yml:16-18`
+- `terminal/strata_cli/launch/cmd.py:215-238,344-356,753-764,876-902,1009-1014`
+- `terminal/strata_cli/launch/catalog.py:550-572`
+- `terminal/strata_cli/launch/runner.py:3141-3187`

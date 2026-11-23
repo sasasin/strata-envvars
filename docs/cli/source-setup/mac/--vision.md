@@ -1,67 +1,72 @@
 # `--vision`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査対象 checkout は `main`、working tree clean。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | Apple Silicon Mac のソース setup（`./setup.sh` → `setup.py` → `metal/setup_mac.py`） |
+| コマンド | Mac 用 `setup_mac.py`（`setup.py` が Apple Silicon で委譲） |
 | オプション | `--vision` |
 | 別名 | なし |
-| 値 | `yes`、`no`、`gpu`、`cpu` のいずれか。値は必須 |
+| 値 | `yes`、`no`、`gpu`、`cpu` |
 
 ## 役割
 
-選択したモデルに画像読み取り機能を設定し、画像 encoder と vision encoder weights（mmproj）を使うか、その encoder を Metal GPU または CPU のどちらで実行するかを選びます。この文書は `metal/setup_mac.py` 独自 parser の scope です。Apple Silicon で `STRATA_CONTROL_INSTALL=1` を設定せず `setup.py` を実行したとき、この parser に委譲されます（`setup.py:7703-7707, 9068-9069`）。
+Mac 用セットアップで、モデルに画像を読ませる画像エンコーダーを有効にするか、Metal GPU と CPU のどちらで実行するかを指定します。これは `source-setup/root/--vision.md` の同名オプションとは別スコープで、Mac 用 parser の値と処理を記載しています。
 
 ## 使い方
 
-リポジトリのルートで、たとえば次のように指定します。
-
 ```sh
-./setup.sh --vision cpu --no-start
+# 画像読み取りを有効にし、GPU を使う
+./setup.sh --setup --vision gpu
+
+# 画像読み取りを無効にする
+./setup.sh --setup --vision no
+
+# 画像読み取りを有効にし、CPU を使う
+./setup.sh --setup --vision cpu
 ```
 
-`--no-start` を付けても setup はモデルや encoder の準備と設定ファイル作成を行い、最後に server を起動しません（`metal/setup_mac.py:466-475, 542-570`）。
+`setup.py` は Apple Silicon の Mac で `engine/metal/setup_mac.py` に引数を渡します。`--setup` を付けず、既存の設定があり、モデル指定・確認・更新・再 build などの操作もない場合は既存モデルを起動する早期経路に入り、`--vision` の値はその設定に反映されません。
 
 ## 値と既定値
 
-- `--vision yes`: 画像対応を有効にし、encoder を GPU で実行します。
-- `--vision gpu`: `yes` と同じく画像対応を有効にして GPU を選びます。
-- `--vision cpu`: 画像対応を有効にして CPU encoder を選び、CPU 利用について注意を表示します。
-- `--vision no`: 画像対応を無効にします。
-- 省略時は「画像も読み取るか」を質問し、既定回答は yes です。`--yes` も指定されている場合、質問は表示せず既定の yes を採用します（`metal/setup_mac.py:353-355, 404-410`; 質問処理は `setup.py:930-944`）。
-
-値は `argparse` の `choices` によって上記4つに制限されます。引数なしや範囲外の値は parser が拒否し、usage とエラーを表示して終了します。`--vision` の後に値を付ける必要があります（`metal/setup_mac.py:328-356`）。
+- parser は `yes`、`no`、`gpu`、`cpu` 以外を拒否します。省略時の parser 値は `None` です。
+- セットアップがモデル選択後まで進むと、未指定の場合は「画像を読み取るか」の質問が出ます。質問の既定回答は yes です。`--yes` も指定されている場合、この既定回答が選ばれます。
+- `yes` と `gpu` は画像読み取りを有効にし、GPU 使用として設定します。`cpu` は有効にし、CPU 使用として設定します。`no` は無効にします。
+- 値は `argparse` の `choices` で検証されます。整数範囲などの追加検証はありません。
 
 ## 実行時の動作
 
-値を受け取った後、`cpu` 以外は `vision_gpu=True` とされ、`no` だけが無効値に正規化されます。したがって `yes` と `gpu` は同じ GPU 経路、`cpu` は CPU 経路になります（`metal/setup_mac.py:404-410`）。
+選択結果はセットアップ内で `no` または有効状態の `yes` に正規化され、`cpu` の場合だけ GPU フラグが false になります。有効時はモデルの画像 encoder projector（mmproj）が未取得ならダウンロードされ、Metal 版 `strata-vision` が既存かつソース stamp が現行でなければビルドされます。生成するモデル設定にはエンジン引数 `--vision` と、reader の実行ファイル・mmproj・モデル・GPU 使用有無・最大 token 数 1024 を記録します。`gpu` は `yes` と同じ GPU 設定です。
 
-画像対応が有効なら、選択した family の mmproj をモデル保存先へダウンロードし、必要な場合はサイズと SHA-256 を照合します。その後、`strata-vision` が存在し同一ソース digest の build stamp があれば再利用し、そうでなければ `tools/vision` を Metal 有効でビルドします（`metal/setup_mac.py:159-189, 466-475`）。生成設定には engine 引数 `--vision` と encoder 実行ファイル、mmproj、モデルファイル、GPU/CPU の選択、`max_tokens: 1024` が記録されます（`metal/setup_mac.py:547-550`）。`no` の場合は mmproj の取得・encoder build・設定内の vision 項目を省きます。
-
-例の `--no-start` がなければ、作成した設定を使って server 起動を試みます。起動時には設定で参照する engine/model ファイルの存在確認と、モデル準備中でないことの確認が行われます（`metal/setup_mac.py:302-323`）。
+無効時は mmproj の取得・画像 reader の build を行わず、生成設定にも vision セクションを追加しません。設定を書いた後、通常はサーバー起動へ進みますが、`--no-start` なら起動せず終了します。
 
 ## 適用条件と副作用
 
-- Apple Silicon の Metal setup 専用です。通常の `setup.py` parser（Control install 経路を含む）は別 parser で、そこでは `--vision` に `none` もありますが、この Mac 専用 parser では受理されません（`metal/setup_mac.py:353-355`; 通常 parser は `setup.py:9068-9091`）。
-- 既存設定がある状態で `--vision` だけを付けて起動すると、parser は値を読み取りますが、既存設定を直ちに起動する早期経路に入り、新しい値は反映されません。再設定するには `--setup`（または `--model` / `--no-start` など setup に進む指定）が必要です（`metal/setup_mac.py:369-371`）。
-- `--update` 経路では画像対応の設定確認に値が使われますが、update はモデルファイルを取得しません。画像対応を選んだのに mmproj が無い場合は警告して setup で追加する方法を案内し、そのまま終了します（`metal/setup_mac.py:435-448`）。
-- `cpu` は CPU encoder の注意を表示します。画像対応を有効にした通常 setup はネットワークから mmproj を取得し、画像 encoder のビルドが必要なら build directory と `build-vision.log`、stamp を作成・更新します。また run config と起動 script も書き込みます（`metal/setup_mac.py:165-189, 466-475, 547-561`）。
+- この parser は Apple Silicon / Metal 用です。共通 `setup.py` は通常の macOS 経路を `setup_mac.py` に委譲し、Mac 実装が Apple Silicon の環境確認を行います。
+- `--vision` だけを指定しても既存設定がある場合は早期の起動経路になり得るため、設定変更を意図する場合は `--setup` などセットアップ経路を明示してください。
+- 有効時にはネットワークから mmproj を取得する場合があり、画像 reader の build では `build-vision/` 配下に生成物、`build-vision.log`、`BUILD.json` が作られます。セットアップはモデル設定ファイルと起動スクリプトも生成・更新します。
+- `cpu` は同じ Metal 対応 `strata-vision` を GPU 指定なしで使う設定です。ソース内の注記は Mac の CPU 読み取りを GPU 読み取りより大幅に遅いものとして説明し、CPU 選択時に警告を出します。
+- `--update` 経路では通常のモデル取得・設定生成より前に終了します。画像 encoder が既にない場合は警告して `--setup` を案内します。
 
 ## 出力とエラー
 
-- `cpu` 指定時は `strata_control.vision_reader` の `MAC_CPU_NOTE` を警告表示します（`metal/setup_mac.py:406-408`）。
-- encoder の build command が失敗すると、`S.fail` が `build-vision.log` を案内して setup を失敗させます（`metal/setup_mac.py:179-187`）。
-- `--check` を指定すると Mac の問題有無を確認した時点で終了し、vision の選択処理には進みません（`metal/setup_mac.py:373-386`）。
+- `cpu` を選ぶと CPU reader の速度に関する警告を表示します。
+- 無効な値は `argparse` が usage とエラーを表示して拒否します。
+- reader の build に失敗すると、ログ `engine/metal/build-vision.log` を案内するエラーで停止します。mmproj の取得・検証失敗も共通 downloader / SHA 検証の失敗経路になります。
+- Mac の事前確認に失敗した場合は最初の問題をエラーとして停止します。これは `--vision` 固有の validation ではありません。
 
 ## 根拠
 
-- Parser、choices、parse の扱い: `metal/setup_mac.py:326-363`。
-- 既定 prompt、値の正規化、CPU 注意表示: `metal/setup_mac.py:404-410`; `setup.py:930-944`。
-- 既存設定起動と update 分岐: `metal/setup_mac.py:369-371, 435-448`。
-- mmproj 取得、encoder build/reuse: `metal/setup_mac.py:159-189, 466-475`。
-- config 生成と起動: `metal/setup_mac.py:542-570`; run config の原子的書き込み helper は `setup.py:6490-6496`。
-- `setup.py` からの Mac 委譲: `setup.py:7703-7707, 9068-9069`。
-
-調査範囲はこの checkout のソースです。実機でのビルド・ダウンロード・起動、各 Mac での CPU/GPU 性能は確認していません。
+- `engine/metal/setup_mac.py:1-16` — Mac 向け CLI の役割、共通処理を `setup.py` に委ねる範囲。
+- `terminal/setup.py:9205-9210` — Mac 用スクリプトへの引数付き委譲。
+- `terminal/setup.py:11216-11220` — macOS で Mac 実装へ振り分ける条件（Control / Hy4 / Inkling 経路を除く）。
+- `engine/metal/setup_mac.py:375-405` — parser 定義、許容値、未知引数の警告。
+- `engine/metal/setup_mac.py:416-418` — 既存設定時に通常起動へ進む早期経路。
+- `engine/metal/setup_mac.py:429-432` — `--check` の早期終了と Mac 要件エラー。
+- `engine/metal/setup_mac.py:451-457` — 省略時の質問と既定回答、値の正規化、CPU/GPU 選択。
+- `engine/metal/setup_mac.py:515-524` — 有効時の mmproj 取得、検証、encoder build。
+- `engine/metal/setup_mac.py:593-621` — 設定への反映、ファイル生成、`--no-start` と通常起動。
+- `engine/metal/setup_mac.py:169-193` — Metal 版 reader の既存 build 判定、build log、失敗処理。
+- `terminal/strata_control/vision_reader.py:102-113` — Mac reader の GPU/CPU 実行モードと CPU 時の注記。

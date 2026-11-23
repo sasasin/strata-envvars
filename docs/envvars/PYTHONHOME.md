@@ -1,43 +1,54 @@
 # `PYTHONHOME`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部 Python 実行環境が `PYTHONHOME` をどう解釈するかは対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-この commit の Strata 所有コードには、`PYTHONHOME` の値を設定項目として読み取り、値に応じて Strata のモデル処理や engine/backend を切り替える実装は見つからない。Strata は主に同梱 Python runtime や Control などの子プロセスを起動する前に、継承環境からこの名前を削除する。一方、AppImage 内からファイル選択・通知・外部ツール等を起動する共通経路では、起動元の環境を復元して渡す場合がある。
+Strata は `PYTHONHOME` を設定値として読み取って分岐したり、値を解析したりしない。確認できる用途は、Strata 同梱 Python や Control の子プロセスにユーザー環境の値を渡さないことと、AppImage から起動された外部プログラムの環境を組み立てるときに元の環境値を復元または AppImage 内のパスだけ除くこと。したがって値によって Strata のモデル、backend、CLI の選択が変わる設定ではない（例: `terminal/bin/strata:142-145`、`app/host/server/control-runtime.mjs:88-107`、`app/host/server/external-env.mjs:26,43-57,64-71`）。
 
 ## 値と判定
 
-Strata が値を boolean / 数値 / パス設定として parse する処理はない。したがって Strata 内部での unset・空文字・任意文字列の値判定、境界値、無効値 fallback は該当しない。
+値の文字列を比較・変換する読み取り箇所はない。削除処理は値の内容にかかわらずキー名で行う。従って空文字、`0`、`1`、`true`、任意のパスなどに Strata 固有の有効・無効判定はない。
 
-| 実行経路 | `PYTHONHOME` の扱い |
-|---|---|
-| Linux `bin/strata` から同梱 Python を使う | `unset PYTHONHOME` で継承値を削除する。空文字か否かを判定しない（`bin/strata:128-131`）。 |
-| Windows PowerShell / cmd の同梱 Python 分岐 | 環境変数を削除または空にする（`bin/strata.ps1:34-39`, `bin/strata.cmd:34-39`）。 |
-| setup / package 検査・handover・Control 起動 | 子プロセス用の env map からキーを削除する（`setup.sh:9-12`, `strata_cli/handover.py:117-123`, `apps/host/server/control-runtime.mjs:88-104`, `packaging/package_terminal.py:202-207,432-437`）。 |
-| Terminal のモデル準備 | 継承キーを削除後、`PYTHONPATH` は Strata source path に設定される。`PYTHONHOME` 自体は設定しない（`strata_cli/launch/runner.py:1142-1153`）。 |
-| AppImage から起動する外部プログラム | `externalEnvironment()` は記録された起動元環境があればそれを復元する。記録がなければ AppImage 専用値を削除し、`APPDIR` 内を指す path-list 要素を除く（`apps/host/server/external-env.mjs:15-26,28-57,63-70`）。 |
+| 処理経路 | unset / 空文字 | 任意の非空値 | 条件・結果 |
+|---|---|---|---|
+| 同梱 Python を使う Terminal ランチャー | unset のまま / `set "PYTHONHOME="` または `unset` で子プロセス環境から除去 | 同じく値を除去 | Unix shell、Windows `cmd.exe`、PowerShell で bundled runtime を選んだ分岐のみ（`terminal/bin/strata:142-145`、`terminal/bin/strata.cmd:34-40`、`terminal/bin/strata-direct.ps1:36-41`） |
+| Desktop の Control 起動・診断 | `Command` の子環境からキーを除去 | 値を見ず除去 | `control_runs` と `control_engine_notice` が同梱 interpreter を起動する際（`app/desktop/src-tauri/src/main.rs:688-716`） |
+| Host の Control 子プロセス | コピーした環境からキーを除去 | 値を見ず除去 | `controlEnvironment` の利用者が Control を起動する際（`app/host/server/control-runtime.mjs:88-107,140-146`） |
+| AppImage の外部プログラム環境 | 元の記録があれば元の値を復元し得る。古い AppImage の fallback では空要素を除去 | 記録があれば記録中の値を採用。fallback では `APPDIR` 内を指す path 要素だけ除去し、残りがなければキーごと除去 | AppImage 起動時または `STRATA_ORIGINAL_ENV` がある場合（`app/host/server/external-env.mjs:28-40,43-57,60-71`） |
+| App の agent 子環境 | 出力環境には含めない | 出力環境には含めない | `agentEnvironment` の許可名 `KEEP` に `PYTHONHOME` が含まれないため（`app/host/server/agent/harness-runtime.mjs:20-36`） |
 
-`external-env.mjs` の `PYTHONHOME` は、コメント上の値一覧と `PATH_LISTS` に現れ、独立した parse はしない。起動元環境の復元時には元の値を外部プロセスへ引き継ぎ、記録がない場合には `APPDIR` 内の要素だけを `:` 区切りで落とす。`APPDIR` がない場合、`withoutAppImage()` はその path-list 値に手を加えない。これは Strata の環境引き渡し処理の説明であり、受け取った Python 等での意味を示すものではない。
+他の環境変数や CLI 引数との優先順位はない。AppImage の外部環境経路だけは `APPIMAGE` / `APPDIR` と `STRATA_ORIGINAL_ENV` によって元環境の選び方が変わり、`extra` は最後にマージされる。通常の非 AppImage 起動では `externalEnvironment` は入力環境をコピーし、`PYTHONHOME` を変更しない（`app/host/server/external-env.mjs:60-71`）。
 
 ## 有効になる条件
 
-- ランチャーが同梱 Python を選んだ場合に限り、シェルラッパーが `PYTHONHOME` を明示的に除去する。外部指定 Python (`STRATA_PYTHON`) や既存 venv を選ぶ分岐では、これらの箇所による削除は同梱 runtime 分岐と異なる。PowerShell の分岐条件は `bin/strata.ps1:28-44`、POSIX ランチャーは `bin/strata:128-131` にある。
-- setup の `setup.sh` は `python/bin/python3` が存在する場合だけ削除して `setup.py` を exec する（`setup.sh:7-13`）。
-- Desktop が同梱 Python を用いる version / engine 検査 subprocess では `.env_remove("PYTHONHOME")` を設定する（`apps/desktop/src-tauri/src/main.rs:627-632,649-654`）。
-- Control の環境生成は呼び出し元の env を複製してから `PYTHONHOME` を削除する。Terminal のモデル準備と Control handover もそれぞれ専用 env を作る際に削除する。CLI 引数や別環境変数による `PYTHONHOME` の優先順位はない。
-- AppImage の外部プログラム経路は `externalEnvironment()` の呼び出し元（例: `apps/host/server/folder-dialog.mjs:111,146`, `apps/host/server/app-ui.mjs:38,56`, `apps/host/server/chat-files.mjs:92`）に適用される。AppImage 外で `APPIMAGE` / `APPDIR` と記録がなければ、関数は env を複製して `extra` を上書き追加するだけであり、`PYTHONHOME` を削除しない（`external-env.mjs:60-70`）。
+- Terminal の Unix / Windows ランチャーでは、同梱 runtime を選んだ場合に限り `PYTHONHOME` を消してから `strata.py` / `setup.py` を起動する。明示した `STRATA_PYTHON`、venv、PATH 上の Python を選ぶ分岐では、この箇所による除去は行わない（`terminal/bin/strata:45-63,142-147`、`terminal/bin/strata.cmd:16-43`、`terminal/bin/strata-direct.ps1:27-58`）。
+- Desktop の Control 確認コマンドおよび Host の Control 起動は同梱 interpreter 用の環境を作るため、元の値が設定されていても除去する（`app/desktop/src-tauri/src/main.rs:688-716`、`app/host/server/control-runtime.mjs:88-107,140-146`）。
+- Control の handover 先を起動する場合も、`_child_env` が環境を複製して `PYTHONHOME` を削除する。handover 自体が行われない場合、この子環境処理は適用されない（`terminal/strata_cli/handover.py:117-145`）。
+- インストール/準備用の子プロセスでも Control モードでは除去される。MCP installer は `spec.get("control")` の場合に削除し（`terminal/tools/strata_mcp.py:3151-3162`）、launch runner は準備コマンドの環境から削除して `PYTHONPATH` のみソースディレクトリに設定する（`terminal/strata_cli/launch/runner.py:1650-1661,1798-1805`）。
+- AppImage の外部プログラム向けには、`APPIMAGE` / `APPDIR` の存在または元環境レコードの有無で分岐する。レコードがあればその復元環境を使い、なければ `APPDIR` に含まれる path list 要素を除く。path list は `:` 区切りであり、他の残存要素があれば結合して保持する（`app/host/server/external-env.mjs:26,28-40,43-57,60-71`）。
+- AppImage 外部環境を使う folder chooser、opener、通知、ファイル関連コマンド、agent harness の呼び出し元は `app/host/server/` 内の `externalEnvironment()` 呼び出しを使う。外部プログラムが `PYTHONHOME` をどう解釈するかは本書の対象外（例: `folder-dialog.mjs:118,153`、`app-ui.mjs:39,57`、`agent/harness-runtime.mjs:26-36`）。
 
 ## 実行時の詳細
 
-削除は子プロセス用環境を組み立てる際、または同梱 runtime を exec する直前に行われる。シェルの `unset`, PowerShell の `Remove-Item`, Rust `Command::env_remove`, Python の `dict.pop`, JavaScript の `delete` であり、値を読み込んで cache する処理はない。後から同じプロセスの環境を変更したときの再評価機構もない。子プロセスに対しては、削除後の環境 map が渡される。
+設定値を起動時にキャッシュする処理はない。各ランチャーは子プロセス起動直前に自身の環境から値を除去する。Node.js の Control helper は呼び出し時に環境オブジェクトを shallow copy し、キーを削除した環境を `spawn` に渡す。Desktop の Rust helper も `Command` の子プロセス環境からキーを除去する。起動済みプロセスの環境を書き換える処理ではなく、これらの起動後に親側で環境が変わっても、すでに渡した子環境には反映されない（`terminal/bin/strata:142-147`、`app/host/server/control-runtime.mjs:89-107,140-146`、`app/desktop/src-tauri/src/main.rs:688-716`）。
 
-外部プログラム用環境では AppImage 起動元環境を復元するのが優先され、復元記録がない旧式経路だけ `APPDIR` に属する値・path-list 要素を掃除する。`PYTHONHOME` に関する Strata 固有の警告、エラー、終了コードは見つからなかった。`bin/strata.ps1` 等の別のエラー表示は Python 選択の失敗に関するもので、この変数の値検査ではない。
+AppImage の外部環境 helper は呼び出しごとに `env`（既定値は `process.env`）を読み、必要に応じて記録環境の復号または `APPDIR` パスの除去を行う。記録環境は `STRATA_ORIGINAL_ENV` の base64 を NUL 区切りの `NAME=value` 項目として読む。`PYTHONHOME` 自体は helper の path-list 名一覧に固定で含まれるため、別の環境変数名で動的に参照されることはない（`app/host/server/external-env.mjs:15,26,28-57,67-71`）。
+
+候補名の全参照には、上記のほか packaging ツールの subprocess 環境を作る際の削除（`tools/packaging/package_terminal.py:146-156,218-229`）と `setup.sh`、Windows の `START-HERE.bat` による bundled Python 起動前の削除（`setup.sh:12-17`、`START-HERE.bat:49-56`）がある。`terminal/tools/minimal_cli_smoke.py:26-32` と `terminal/tools/feed_model_install_gate.py:234-243`、`tools/layout/split/split_server_run.py:65-76` もそれぞれ smoke / gate / layout 作業用 subprocess の環境から削除する。テスト、コメント、README 上の参照は実装根拠として扱っていない。
+
+## ログと測定値
+
+`PYTHONHOME` の値や削除を理由に出す Strata のログ、警告、終了コードは確認できない。ランチャーの失敗メッセージや Control の起動結果は別の条件によるもので、この変数固有の結果ではない。性能測定値の記載もない。
 
 ## 根拠
 
-- 同梱 runtime 起動前の環境除去: `bin/strata:128-133`, `bin/strata.ps1:28-44`, `bin/strata.cmd:34-43`, `setup.sh:7-13`。
-- Control / handover / installer 子プロセスの env 構築: `strata_cli/handover.py:117-123`, `strata_cli/launch/runner.py:1142-1153`, `apps/host/server/control-runtime.mjs:88-104`, `tools/strata_mcp.py:2843-2848`。
-- Desktop / package helper subprocess の除去: `apps/desktop/src-tauri/src/main.rs:627-654`, `packaging/package_terminal.py:202-208,432-438`, `tools/minimal_cli_smoke.py:25-31`。
-- AppImage 外部プログラム向け環境の変換と適用箇所: `apps/host/server/external-env.mjs:15-26,28-70`, `apps/host/server/folder-dialog.mjs:111,146`, `apps/host/server/app-ui.mjs:38,56`, `apps/host/server/chat-files.mjs:92`, `apps/host/server/artifacts.mjs:6`, `apps/host/server/open-text-file.mjs:28`, `apps/host/server/agent/harness-runtime.mjs:30`。
-- テスト・文書の記載は候補や意図の補助情報に留め、本番挙動の根拠にはしていない。
+- `terminal/bin/strata:45-63,142-147` — Unix Terminal の Python 選択と bundled runtime 分岐での削除。
+- `terminal/bin/strata.cmd:16-43`、`terminal/bin/strata-direct.ps1:27-58` — Windows `cmd.exe` / PowerShell ランチャーの bundled runtime 分岐。
+- `setup.sh:12-17`、`START-HERE.bat:49-56` — setup 用 bundled runtime の起動前処理。
+- `app/desktop/src-tauri/src/main.rs:688-716`、`app/host/server/control-runtime.mjs:88-107,140-146` — Desktop / Host が Control 子プロセスへ渡す環境。
+- `terminal/strata_cli/handover.py:117-145` — 新しい Control への handover 環境。
+- `terminal/tools/strata_mcp.py:3151-3162`、`terminal/strata_cli/launch/runner.py:1650-1661,1798-1805` — installer / model preparation の子環境。
+- `app/host/server/external-env.mjs:15,26,28-57,60-71`、`app/host/server/agent/harness-runtime.mjs:20-36` — AppImage 外部環境の復元・清掃と agent 環境の許可リスト。
+- `tools/packaging/package_terminal.py:146-156,218-229` — package 作成時の interpreter / pip subprocess 環境。
+- `terminal/tools/minimal_cli_smoke.py:26-32`、`terminal/tools/feed_model_install_gate.py:234-243`、`tools/layout/split/split_server_run.py:65-76` — smoke / gate / layout 作業用の子プロセス環境。

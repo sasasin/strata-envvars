@@ -1,61 +1,58 @@
-# `--context`
+# `--context`（source-setup / Mac）
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | macOS の `setup.py` → `metal/setup_mac.py` |
-| オプション | `--context` |
-| 別名 | なし |
-| 値 | 10 進整数（`argparse` の `type=int`）。setup parser に範囲指定なし |
+| コマンド | `metal/setup_mac.py`（Mac 用セットアップ） |
+| 入口 | Apple Silicon の macOS で `setup.py` / `setup.sh` を実行すると委譲される |
+| parser | `engine/metal/setup_mac.py` |
 
 ## 役割
 
-Apple Silicon の Metal 用 setup が作るモデル実行設定のコンテキスト容量を指定する。setup が自動推奨する値を使わず、指定値を生成 engine 引数 `--max-context` に渡す。
+モデルのセットアップ時に、Strata が使うコンテキスト長（トークン数）を指定する。選んだ値は Metal エンジンの実行引数 `--max-context` に設定され、生成される設定ファイルに保存される。
 
 ## 使い方
 
-macOS で Strata ソース checkout のルートから実行する例:
-
 ```sh
-./setup.sh --context 32768 --no-start
+# Mac 用セットアップでコンテキストを 32768 トークンに指定
+./setup.sh --setup --context 32768
 ```
 
-`setup.sh` は引数を `setup.py` に渡し、macOS かつ Control installer でない場合、`setup.py` は受け取った argv を `metal/setup_mac.py` にそのまま委譲する（`setup.sh:76`、`setup.py:9068-9069`、`setup.py:7703-7707`）。
+これはセットアップの例であり、モデルのダウンロードやエンジンのビルドなど、通常のセットアップ処理も実行する。以後の起動だけを行う場合、既存の Mac 設定があれば引数なしの起動経路となり、このオプションを読み直して新しい値を設定する処理には入らない。
 
 ## 値と既定値
 
-- 省略時は Mac の unified memory が 96 GB 未満なら `32768`、96 GB 以上なら `65536`（`strata_control/mac_fit.py:180-181`）。
-- 指定値は `int` に変換される。数値でない値は `argparse` が拒否する。setup parser 自体には choices や正の範囲チェックがない（`metal/setup_mac.py:327-334`）。
-- 実装は `a.context or recommend_context(...)` を使うため、`0` は未指定と同じく推奨値へ置き換わる。負数は truthy のため保持される（`metal/setup_mac.py:411`）。
-- 推奨値一覧は `8192, 32768, 65536, 131072` だが、これは選択肢 UI の一覧であり、`--context` の受理範囲を制限するものではない（`strata_control/mac_fit.py:61`、`metal/setup_mac.py:333`）。
-- 指定値が `32768` を超えると、テスト済み上限が `32768` である旨を表示するが、値は変更せず継続する（`strata_control/mac_fit.py:68`、`metal/setup_mac.py:412-414`）。
+- 値は Python の `int` で解釈される。未指定時の parser 値は `None`。
+- 実際に使う値は `--context` が未指定または `0` なら RAM 容量に基づき決まる。96 GB 未満は `32768`、96 GB 以上は `65536` トークン（`terminal/strata_control/mac_fit.py:254-255`）。
+- 正の値に選択肢やセットアップ側の上限チェックはない。既定値より大きく、Mac で測定済みの `32768` を超える値も保持され、その場合は「測定は 32768 まで」と案内する（`engine/metal/setup_mac.py:458-461`、`terminal/strata_control/mac_fit.py:111`）。この表示は値を補正しない。
+- 負数もセットアップ側では検証されず、そのまま後述の `--max-context` として渡る。数値に変換できない入力は argparse がエラーとして扱う。
 
 ## 実行時の動作
 
-通常の setup 経路では、値は `engine_args(..., ctx, ...)` に渡り、設定 JSON の engine 引数列に `--max-context <値>` として記録される。Metal 側はこの engine 設定も生成する（`metal/setup_mac.py:542-560`、`strata_control/mac_fit.py:190-205`）。このため値はモデル準備の容量値として保持され、起動する engine の context/KV state capacity に使われる。setup の完了後は、生成された設定または起動スクリプトでモデルを起動する（`metal/setup_mac.py:302-323`、`metal/setup_mac.py:564-570`）。
+Mac 用 parser は `--context` を `type=int`、既定値なしで登録する（`engine/metal/setup_mac.py:372-403`）。macOS で通常のセットアップを行う際、`ctx = a.context or recommend_context(...)` により値を決定するため、`0` は未指定と同じく RAM 別の推奨値になる（`engine/metal/setup_mac.py:458`）。
 
-適用されるのは、macOS 上で `STRATA_CONTROL_INSTALL=1` を設定せず `setup.py` / `setup.sh` を実行し、モデル設定を作成する経路である。既存 Metal 設定があり、`--setup`、`--model`、`--check`、`--no-start`、`--update`、`--build` のいずれも指定されない通常の再起動経路は既存設定を起動して早期 return するため、ここで `--context` を渡しても既存設定は変更されない（`setup.py:82`、`setup.py:9068-9069`、`metal/setup_mac.py:369-371`）。`--check` は設定生成前に終了し、`--update` もモデル設定生成より前に終了する（`metal/setup_mac.py:382-383`、`metal/setup_mac.py:435-448`）。
+決定した `ctx` は Metal 用引数を組み立てる関数へ渡され、`--max-context <ctx>` として設定に入る（`engine/metal/setup_mac.py:596`、`terminal/strata_control/mac_fit.py:264-280`）。設定ファイルは `strata-<model>.json` として書かれ、通常は続けてサーバーを起動する。`--no-start` を併用すれば設定を書いた後に終了する（`engine/metal/setup_mac.py:610-621`）。
 
-## 適用条件と副作用
+## 適用条件と相互作用
 
-- `--context` 自体はファイル・ネットワーク操作を行わないが、setup の通常処理は engine build、モデル取得・準備、設定 JSON と起動スクリプトの作成を行う。`--no-start` は設定作成後の engine/server 起動を抑える（`metal/setup_mac.py:428-570`）。
-- 32768 を超える指定値は受け入れて設定に保持されるものの、ソース中の案内では Mac での測定上限は 32768 とされる。性能・メモリ適合性はこのオプションで検証・保証されない（`metal/setup_mac.py:412-414`、`strata_control/mac_fit.py:68`）。
-- Mac setup parser の `parse_known_args` は未知の引数を `not used on a Mac: ...` と警告して続行する。これは `--context` の値検証とは別の挙動（`metal/setup_mac.py:356-358`）。
+- 対象は Mac 用 Metal セットアップである。共通 `terminal/setup.py` は macOS で通常の Metal 経路に入ると `engine/metal/setup_mac.py` に引数を渡す（`terminal/setup.py:9206-9210,11218-11219`）。Control モードや特定の別ファミリー経路はこの分岐の対象外。
+- `--context` はモデル、他のセットアップ選択とは独立して `ctx` に反映される。モデルごとのコンテキスト上限をこの parser が検証する処理は確認できない。
+- `--context` による測定上限超過の案内は警告相当の情報表示であり、実行継続を止めない。設定が指す実効コンテキストやメモリ需要はモデルとエンジン側にも依存するため、任意の値で動作することをセットアップ側だけから保証できない。
 
 ## 出力とエラー
 
-setup は選択した context を `S.ok` の行で表示する。値が `32768` を超える場合は前述の測定範囲に関する案内も出す（`metal/setup_mac.py:412-414`）。
-
-setup parser は負数や非常に大きい整数を拒否しない。生成された設定で通常の Strata engine を起動すると、`src/program/generate.cpp` は `--max-context` を整数として読み、値が `0` 以下、または `2^31 - 8` より大きい場合に stderr へエラーを出して終了コード `2` を返す。また、prompt と生成分を指定 context に収められない場合も終了コード `2` となる（`src/program/generate.cpp:3032`、`3918-3926`、`4650-4653`）。setup に `--no-start` を付けた場合は engine を起動しないため、こうした engine 側の検査はその場では行われない。
+- 引数が整数でない場合、argparse が解析エラーを出し、通常の argparse エラー終了となる（parser 定義: `engine/metal/setup_mac.py:380,403`）。
+- `0` は自動推奨値に置き換わる。負数は Mac セットアップでは拒否されず、エンジンの `--max-context` に渡される（`engine/metal/setup_mac.py:458`、`terminal/strata_control/mac_fit.py:280`）。
+- エンジンは `--max-context` を読み取り、`0` 以下や `2^31-8` を超える値を不正として終了コード `2` で拒否する（`engine/src/program/generate.cpp:3866,5190-5197`）。したがってセットアップが設定ファイルを書いた後の起動で失敗する場合がある。
+- セットアップが最後まで進む場合、コンテキスト値は設定ファイルの `args` に保存される。設定ファイルは一時ファイルを書いてから置き換える方式（`engine/metal/setup_mac.py:610-612`、`terminal/setup.py:7447-7453`）。
 
 ## 根拠
 
-- macOS 委譲条件と argv 転送: `setup.py:82`、`setup.py:7703-7707`、`setup.py:9068-9069`。POSIX wrapper: `setup.sh:76`。
-- option parser、整数変換、未知引数処理、値選択・案内: `metal/setup_mac.py:327-358`、`metal/setup_mac.py:411-414`。
-- 推奨値とテスト済み context: `strata_control/mac_fit.py:61`、`strata_control/mac_fit.py:68`、`strata_control/mac_fit.py:180-181`。
-- engine 引数・設定生成・起動経路: `strata_control/mac_fit.py:190-205`、`metal/setup_mac.py:542-570`、`metal/setup_mac.py:302-323`。
-- 下流 engine の値検査: Metal build も `src/program/generate.cpp` を `strata` として build する（`metal/CMakeLists.txt:129`）。parser と検査は `src/program/generate.cpp:3032`、`src/program/generate.cpp:3918-3926`、`src/program/generate.cpp:4650-4653`。
-
-調査範囲は上記 checkout のソースです。同一 revision の macOS 実機での CLI 実行や Release 配布物との照合は行っていません。
+- `engine/metal/setup_mac.py:372-403` — Mac 用 parser と整数型の指定、未知引数の警告。
+- `engine/metal/setup_mac.py:416-432,458-461` — 既存設定で通常起動する分岐、値の既定化と測定上限の案内。
+- `engine/metal/setup_mac.py:596,610-621` — コンテキストをエンジン引数へ渡し、設定保存後に起動または終了する処理。
+- `terminal/strata_control/mac_fit.py:111,254-255,264-280` — 測定済み値、RAM 別既定値、`--max-context` への変換。
+- `terminal/setup.py:9206-9210,11218-11219` — 共通セットアップから Mac 用実装への委譲条件。
+- `engine/src/program/generate.cpp:3866,5190-5197` — エンジン側での引数読取とコンテキスト値の境界検査。

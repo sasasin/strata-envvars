@@ -1,62 +1,45 @@
 # `STRATA_CONTROL_INSTALL`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査対象リポジトリの作業ツリーは `main...origin/main` で、未コミット変更はありません。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（2026-11-23 時点）。
 
 ## 役割
 
-`setup.py` と `tools/strata_mcp.py` を Strata Control / Terminal の同梱 Python 向けインストールモードで動かすための内部フラグです。`setup.py` では Python パッケージや通常のエンジン実行ファイルをインストールする代わりに、モデルを準備してエンジン component を参照する設定を作る経路を選びます。`tools/strata_mcp.py` では MCP サーバー自身の Python をインストール用にも使い、インストール子プロセスへ Control mode を渡します。
+Control（デスクトップアプリ、および Terminal bundle の `strata launch`）が `setup.py` と `strata_mcp.py` を専用のインストール経路で動かすためのプロセス内フラグ。Python モジュール読み込み時に値を判定し、`CONTROL` 定数として保持する。GPU engine 自身や通常のモデル実行を直接制御する変数ではない。未設定または値が厳密に `1` でない場合、通常の Terminal installer / MCP server 経路になる（`terminal/setup.py:97-108`, `terminal/tools/strata_mcp.py:54-56`）。
 
-これは一般的なモデル設定やサーバー実行時の推論設定ではありません。通常のフルソース版セットアップで明示しなければ Control mode にはなりません。
+Control 経路では、モデルをダウンロード・準備し、設定に `component:strata-engine` を記録する。engine は Control の component として別途解決し、setup が通常の pip install や engine の取得・コンパイルを行わない。準備用ツールや gguf-py 用ソースの取得は別であり、すべてのネットワーク取得を無効にするフラグではない（`terminal/setup.py:1131-1157`, `4311-4316`, `7620-7628`, `9373-9377`, `9513-9520`）。
 
 ## 値と判定
 
-両方の読み取り箇所が `os.environ.get("STRATA_CONTROL_INSTALL") == "1"` で判定します。数値変換や truthy 判定はせず、文字列全体の完全一致です。
+両読み取り箇所とも `os.environ.get("STRATA_CONTROL_INSTALL") == "1"`。文字列全体を大文字小文字区別で比較し、数値変換や trim はしない。未設定、空文字、`0`、`true`、`True`、`01`、` 1`、`1 `、`1anything` はすべて無効。`1` だけが有効。空文字は「設定済み」として扱われない。境界値や負値の数値判定はない（`terminal/setup.py:102`, `terminal/tools/strata_mcp.py:56`）。
 
-| 環境値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| `1` | 有効 |
-| `0`、`01`、`true`、`1 `、その他の文字列 | 無効 |
+| 読み取り箇所 | unset / 空文字 | 有効値 | 無効値の例 |
+|---|---|---|---|
+| `terminal/setup.py` | `CONTROL=False` | 文字列 `1` | `0`, `true`, `01`, ` 1`, `1 ` |
+| `terminal/tools/strata_mcp.py` | `CONTROL=False` | 文字列 `1` | `0`, `true`, `01`, ` 1`, `1 ` |
 
-未設定時の既定は無効です。CLI 引数でこの値判定を上書きする処理はありません。ただし Strata の起動ラッパーは、対象モードで `1` を環境へ設定してから `setup.py` を起動します。判定値は各 Python モジュールの import 時にモジュール定数 `CONTROL` へ保存されます。そのプロセス内で後から環境を書き換えても再判定されません。子プロセスの環境は呼び出し元が明示的に構成します。
+既定値を CLI 引数で上書きする仕組みはない。CLI の `--backend sycl` などは Control 判定後に分岐を選ぶ別条件である。`STRATA_INSTALL_DIR` は別変数で、Control が有効かつ空でない場合にのみ `setup.py` の書き込み先 `home()` をその絶対パスにする。未設定・空文字なら `ROOT` が書き込み先になる（`terminal/setup.py:103-108`）。
 
 ## 有効になる条件
 
-### `setup.py`
-
-環境変数が厳密に `1` であることが必要です。さらに、実際に通る OS・CLI 経路によって効果が変わります。
-
-- macOS では Control mode の場合に `mac_control_setup()` または DeepSeek 用 `mac_dsv41_setup()` へ進みます。通常の macOS セットアップが `metal/setup_mac.py` に委譲される経路は `CONTROL` が偽の場合です (`setup.py:9062-9069, 9218-9223`)。
-- Windows/Linux の通常セットアップでは `engine_step()` が Control 専用の `control_engine_step()` を使います (`setup.py:7772-7777`)。
-- `--backend sycl` は Control 判定後の通常分岐で SYCL セットアップへ委譲します。従って同オプションでは Control 専用 engine step は使われません (`setup.py:9220-9225`)。
-- `STRATA_INSTALL_DIR` が設定され、かつ空でなければ、その値を絶対パス化した場所が書き込み先 `home()` になります。Control mode でも `STRATA_INSTALL_DIR` が未設定または空なら `ROOT` が使われます (`setup.py:82-88`)。
-
-Control mode の実行時効果は次のとおりです。
-
-- `pip_install()` は必要パッケージが同梱 Python にあるかを確認し、不足があればエラーにします。パッケージのインストールは行いません (`setup.py:3562-3571`)。FP4-Local の変換に PyTorch 等が不足すると、別の準備方法を案内して失敗します (`setup.py:3601-3617`)。
-- `run()` は外部コマンドを実行する前に、実行対象を現在の Python が起動する同梱 `tools/` または `tools/dsv41/` 内の準備ツールに制限します。許可外コマンドは `AcquisitionRefused` になります (`setup.py:959-967`)。
-- エンジン段階では component を検索し、エンジンを取得・ビルドしません。設定の `exe` はエンジン実行ファイルのパスではなく `component:strata-engine` です (`setup.py:7736-7747, 7772-7777, 6643-6645`)。モデル準備をエンジンなしで継続できる経路では警告が出ます。`STRATA_NEED_ENGINE=1` かつ `STRATA_ALLOW_NO_ENGINE!=1` ならモデル取得前に `fail()` で停止します (`setup.py:7751-7763`)。
-- Hip tuning の一部は通常セットアップでは設定ファイルへ直接書かれますが、Control mode ではその処理を行わず、コメント上はサーバー側の選択に委ねています (`setup.py:10305-10315`)。
-
-### `tools/strata_mcp.py` と起動元
-
-MCP サーバーの `CONTROL` も起動時に同じ完全一致で決まります。このとき `Strata.python_override` はサーバーの `sys.executable` になり、インストールジョブの spec に `control: true` が記録されます (`tools/strata_mcp.py:46-48, 493-508, 2417-2427`)。ジョブ実行時は子 `setup.py` の環境で `STRATA_CONTROL_INSTALL=1`、`STRATA_INSTALL_DIR=<root>`、`PYTHONNOUSERSITE=1` を設定し、`PYTHONHOME`、`PYTHONPATH`、`VIRTUAL_ENV` を取り除きます (`tools/strata_mcp.py:2841-2852`)。
-
-Strata の起動元には、Terminal の `strata launch` が setup 子プロセスへ `1` を設定する経路 (`strata_cli/launch/runner.py:1142-1153`)、Terminal の `strata install` が Terminal バンドルと識別できた場合に設定する経路 (`strata_cli/cli.py:2064-2082`)、デスクトップアプリの環境構築 (`apps/host/server/control-runtime.mjs:106-111`) と staging 検査 (`apps/desktop/scripts/stage-control.py:162-168`) があります。Dockerfile もビルド時の setup 呼び出しで `1` を明示しています (`Dockerfile:83`, `docker/Dockerfile:44`)。これらは環境値を設定・転送する箇所であり、別の値判定実装ではありません。
+- `setup.py` では import 時に `CONTROL` が確定する。通常の Windows/Linux installer 経路では `engine_step()` が Control 用の component 解決へ進む。モデル設定の engine 名は `component:strata-engine` になる（`terminal/setup.py:7620-7628`, `9513-9520`）。
+- macOS では通常モデルの経路が Control 用 `mac_control_setup()` へ進む。ただし Hy4-Flash と Inkling-2-Mini は先に専用 handler へ分岐するため、この通常 Control 経路とは異なる（`terminal/setup.py:11216-11219`, `11407-11417`）。
+- `--backend sycl` の場合、Control 有効時は Intel Arc 用の `intel_control_setup()` に進む。Linux 対応の Arc、対応モデル、および既存 GGUF ファイルが必要で、モデルファイルのダウンロードも engine のコンパイルも行わない。Control 無効時は source build の `sycl_setup()` に進む（`terminal/setup.py:9267-9272`, `9301-9325`, `11414-11417`）。
+- Control installer の `run()` は、同梱 preparation tool の実行（および Hy4/Inkling の tokenizer export）に実行対象を制限する。Python package は同梱済みか検査し、不足時は `this copy of Strata Control lacks ...` として終了する。NVIDIA FP4-Local の変換に必要な PyTorch 等が不足する場合も、Control 経路では別 installer を案内して失敗する（`terminal/setup.py:1131-1140`, `4286-4316`, `4346-4359`）。
+- engine component が見つからない場合、通常は警告後もモデルを準備できる。`STRATA_NEED_ENGINE=1` かつ `STRATA_ALLOW_NO_ENGINE` が厳密な `1` でなければ、ダウンロード前に失敗する。`strata launch` はこれらを自身の engine 状態に応じて子プロセスへ設定する（`terminal/setup.py:9387-9399`, `terminal/strata_cli/launch/runner.py:1650-1658`）。
 
 ## 実行時の詳細
 
-`setup.py` は import 時に `CONTROL` と `_CONTROL_HOME` を決めます。setup の各工程でその定数を参照するため、値の変更はその setup プロセスを起動し直すまで反映されません。Control mode で作成された run config は `component:strata-engine` を記録し、実際のエンジン component はモデル実行時に解決されます。Control mode の setup 自身がエンジンを取得する分岐はありません (`setup.py:77-88, 7736-7747, 8029`)。
-
-変数の値そのものを示す専用の有効化ログは見当たりません。周辺工程で同梱 Python のパッケージ不足、エンジン不足などがあれば `fail()` / `warn()` によるメッセージが出ます。Control mode の不足パッケージは再インストール案内を伴って失敗し、エンジン不足は `STRATA_NEED_ENGINE` と `STRATA_ALLOW_NO_ENGINE` の組み合わせで停止または警告付き継続になります。`setup.py` の正常終了コードは選択したセットアップ経路の戻り値によります。MCP インストール子プロセスは終了コードを記録し、`strata-mcp: setup ended with exit code ...` を出力します (`tools/strata_mcp.py:2855-2859`)。
-
-`docs/MAC.md` も、アプリと `strata launch` の Mac セットアップについて、Control mode はモデルファイルを取得・準備し `component:strata-engine` を記録し、Metal engine をビルドしないと説明しています (`docs/MAC.md:115-125`)。これは上記の実装分岐と一致します。
+- 値は `setup.py` と `strata_mcp.py` の各モジュール import 時に一度読み、`CONTROL` に保存される。プロセス稼働中に環境を変更しても読み直さない。子プロセスには起動時の環境が継承されるか、呼び出し側が `1` を明示して渡す。
+- `strata_mcp.py` の Control モードは現在の `sys.executable` を installer Python として使い、`.venv` を作らない。MCP の install job は `setup.py` を起動するとき `STRATA_CONTROL_INSTALL=1` と `STRATA_INSTALL_DIR=<root>` を設定し、Python 環境上書き用の3変数を除去する（`terminal/tools/strata_mcp.py:580-590`, `802-806`, `2727-2743`, `3134-3164`）。
+- デスクトップ app は installer environment に `STRATA_CONTROL_INSTALL=1` を設定する。Terminal bundle の `strata install` も bundle 判定時に同じ値を設定し、`strata launch` はモデル準備と Intel pack 準備の `setup.py` 子プロセスに設定する（`app/host/server/control-runtime.mjs:110-120`, `terminal/strata_cli/cli.py:2139-2157`, `terminal/strata_cli/launch/runner.py:1650-1661`, `1797-1805`）。
+- `CONTROL=True` では `setup.py --update` の git pull をスキップする（`terminal/setup.py:8302-8308`）。通常モデルの setup は model files を取得・準備し、run config を書く。Control 用 engine が未導入でも config は component 名を保持し、engine をモデル読み込み時に解決する（`terminal/setup.py:9373-9399`, `9840-9857`）。
+- 失敗・進捗はこの変数専用のログではない。setup の共通出力は stdout に表示される。engine 不在で続行する場合は `no engine is installed for this PC yet ...`、engine 必須で止める場合は engine 案内のエラーを出し、setup は exit code 1 で終了する（`terminal/setup.py:997-1005`, `1039-1056`, `9387-9399`）。
 
 ## 根拠
 
-- 環境値の全直接読み取りと import 時判定: `setup.py:77-88`; `tools/strata_mcp.py:46-48`。
-- Control mode の外部コマンド制限、Python パッケージ確認、engine component 選択: `setup.py:959-975, 3541-3571, 3601-3617, 6643-6645, 7736-7777`。
-- Engine 不在時の停止条件と警告: `setup.py:7751-7769`。
-- macOS と SYCL の分岐: `setup.py:9062-9069, 9218-9225`。
-- Terminal / app / MCP からの設定・転送: `strata_cli/launch/runner.py:1142-1153`, `strata_cli/cli.py:2064-2082`, `apps/host/server/control-runtime.mjs:106-111`, `apps/desktop/scripts/stage-control.py:162-168`, `tools/strata_mcp.py:2417-2433, 2841-2859`。
+- 値の読み取りと install root: `terminal/setup.py:97-108`。
+- installer の subprocess 制限・package/engine の扱い: `terminal/setup.py:1131-1157`, `4286-4316`, `9513-9520`。
+- Control server の Python 選択と install job: `terminal/tools/strata_mcp.py:54-56`, `580-590`, `2727-2743`, `3134-3164`。
+- app / Terminal launcher からの環境設定: `app/host/server/control-runtime.mjs:110-120`, `terminal/strata_cli/cli.py:2139-2157`, `terminal/strata_cli/launch/runner.py:1650-1661`。
+- engine 不在時の継続・終了、Intel Arc 経路: `terminal/setup.py:9267-9325`, `9373-9405`, `9840-9857`。
+- 関連資料 `docs/MAC.md:119-129` は Mac の Control install が model files を準備し、component engine を run config に書くことを説明している。上記の他 OS の差や値判定はソースコードで確認した。

@@ -1,63 +1,59 @@
-# `--image-native`
+# `source-setup --image-native`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。調査対象リポジトリの状態は `main...origin/main` で、未コミット変更はありません。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` 等から委譲） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat`（セットアップ実行） |
 | オプション | `--image-native` |
 | 別名 | なし |
 | 値 | `on` または `off` |
 
 ## 役割
 
-Qwen-Image-2.1-Turbo の画像生成で、Strata が追加するネイティブ DiT runner を使うかを指定します。これはチャットで画像を読む `--vision` とは別の画像生成機能です。
+画像生成をセットアップするとき、Strata 独自の Qwen-Image DiT runner を実行時に使うかを選びます。`on` は CUDA/HIP 用の画像生成設定に有効化を記録し、以後の画像生成で `sd-cli` にモデル引数を渡します。通常の画像読み取り (`--vision`) を切り替えるオプションではありません。
 
 ## 使い方
 
-ソース checkout のルートから、画像生成の setup とともに指定します。
-
 ```sh
+# Linux: Qwen-Image の生成を設定し、Strata の native runner を有効にする
 ./setup.sh --setup --images qwen-image --image-native on
-```
 
-`--image-native` は `setup.py` の parser に登録されていますが、preview option として `argparse.SUPPRESS` が指定されているため `--help` には表示されません。短縮 alias はありません。`setup.sh` などの wrapper は `setup.py` に委譲します（索引の `source-setup` 範囲）。
+# Windows: 同じ設定を行う
+START-HERE.bat --setup --images qwen-image --image-native on
+
+# runner を無効にして画像生成を設定する
+./setup.sh --setup --images qwen-image --image-native off
+```
 
 ## 値と既定値
 
-- `on` は設定値を真にし、`off` は偽にします。省略時は parser の既定値 `None` が `False` として扱われるため、ネイティブ runner は要求されません。
-- 他の値、値なし、または値の省略は `argparse` の choices 検証で拒否され、usage とエラーを表示して終了します（通常の argparse parse error、終了コード 2）。同じ option を複数回指定した場合は通常の `store` action により最後の値が残ります。
+- parser は `on` と `off` のみを受理します。値を省略したり、別の値を指定したりすると `argparse` の引数エラーになります（`terminal/setup.py:11259-11260, 11385`）。
+- 宣言時に `default` を指定していないため、未指定時は `None` です。画像設定を作る箇所では値が厳密に `on` の場合だけ真となり、未指定と `off` はどちらも無効です（`terminal/setup.py:5925-5927`）。
 
 ## 実行時の動作
 
-この値が実際に使われるのは `--images qwen-image` を指定し、確認プロンプトで画像モデルの setup を続けた場合です。`--images` が未指定なら既存の `images` 設定が引き継がれ、`--images no` なら画像生成設定を外す経路となり、この option は使われません。setup を続けない回答でも画像生成設定は作られません。
+`--image-native` は `--images qwen-image` と組み合わせて使います。セットアップ設定組み立て処理は `a.images` が指定されたときだけ画像生成の設定関数を呼びます。画像モデルのダウンロードとセットアップへの同意後、`image_config` は CUDA/HIP backend の場合に `native` キーを真偽値で記録します。画像生成時にその値が真なら、Strata は `sd-cli` の `--model-args` に `qwen_image_2_1_native=1` を加えます（`terminal/strata_control/setup_config.py:574-575`; `terminal/setup.py:5901-5909, 5920-5927`; `terminal/tools/image/qimage.py:235-248`; `terminal/serve/images.py:149-174`）。
 
-`on` なら setup は `images.native: true` を run config に記録します。画像生成要求時、Strata は別プロセスの `sd-cli` に `--model-args qwen_image_2_1_native=1` を加えます。ネイティブ runner は Qwen-Image-2.1 の diffusion runner を Strata 実装へ切り替える指定で、条件が合わなければ stable-diffusion.cpp の通常 runner が選ばれる実装です。
-
-適用 backend は CUDA と HIP だけです。Vulkan または CPU を `--image-backend` で選んだ場合も `on` 自体は parser で受理されますが、config に `native` キーを作らないため runner 指定は転送されません。backend の自動選択・明示選択は `--image-backend` の設定に従います。
+CUDA/HIP では `sd-cli` のビルド時に native runner のソースを組み込みますが、これは `--image-native on` の有無とは別です。実行時に runner を使うかどうかは上記の設定値で切り替わります（`terminal/setup.py:5828-5837`; `terminal/tools/image/qimage.py:169-170, 243-244`）。
 
 ## 適用条件と副作用
 
-画像生成 setup は `sd-cli` の build または既存 build の再利用、Qwen-Image モデルファイルのダウンロードと SHA-256 検証、run config の更新を行います。CUDA/HIP では setup が pinned stable-diffusion.cpp checkout に Strata の runner と CUDA/HIP kernel を適用してから build します。この option を調べるために build やダウンロードを実行したものではありません。
-
-ネイティブ runner の適用・build は CUDA/HIP backend で行われますが、`off` のときもその backend の build に runner のソースが含まれ得ます。実際に `sd-cli` へ切替指定を渡すかどうかは config の `native` 値で決まります。
+- `--images qwen-image` を指定しないと、画像設定関数は呼び出されず、このオプションの値は利用されません。画像生成を設定しない場合、関連する画像設定・ダウンロード・画像生成 engine のビルドもこの経路では行われません（`terminal/strata_control/setup_config.py:574-575`; `terminal/setup.py:5898-5902`）。
+- 設定キー `native` が作られるのは CUDA/HIP backend のみです。Vulkan/CPU backend ではこの値から `native` キーは記録されず、`sd-cli` に native runner のモデル引数も渡りません（`terminal/tools/image/qimage.py:169-170, 243-244`; `terminal/serve/images.py:165-174`）。
+- 画像生成セットアップを続ける場合、画像 engine のコンパイルと画像モデルファイルのダウンロードが行われます。画像設定を含む run config が既存内容から変われば、書き込み前に旧設定を `.bak` としてコピーします（`terminal/setup.py:5907-5927, 7653-7663`）。
+- 画像生成機能は preview 扱いで、これらの image オプションは通常の `--help` に表示されません（`terminal/setup.py:11252-11260`）。
 
 ## 出力とエラー
 
-無効値は parser 段階で拒否されます。画像生成 setup の継続を拒否すると setup は画像モデルを導入せず、画像生成 config を返しません。CUDA toolkit、ROCm、Vulkan SDK など backend の build 要件を満たさない場合は、該当 backend の setup 処理がエラーを出します。これらは `--image-native` 固有の検証ではありません。
+`--image-native` 固有の成功メッセージや追加の失敗分岐は確認できませんでした。無効な値の拒否は `argparse` の parser 段階で発生します。画像モデルの取得・検証や engine build の失敗は、画像生成セットアップの後続処理で発生し得ますが、このオプション固有のエラーではありません（`terminal/setup.py:11259-11260, 5907-5927, 11385`）。
 
 ## 根拠
 
-- `setup.py:9096-9105` — preview 画像生成 options の parser 宣言。`--image-native` の choices と hidden help 指定。
-- `setup.py:9212` — parser による引数解析。
-- `setup.py:5080-5104` — `--images` の適用条件、確認、build・download、config への `native` 引き渡し。
-- `setup.py:5017-5020` — CUDA/HIP backend で pinned checkout に native runner を適用。
-- `tools/image/qimage.py:169-198` — 対応 backend、build fingerprint、config の `native` キー作成条件。
-- `tools/image/sdcpp_native/apply.py:1-10, 27-45` — runner の切替条件と通常 runner への fallback。
-- `serve/images.py:111-128` — 画像生成時に config の `native` が真なら `sd-cli` に `--model-args qwen_image_2_1_native=1` を追加。
-- `docs/IMAGES.md:1-7, 16-27, 48-69` — 画像生成の用途、source checkout 前提、setup 利用例と backend 概要。native option 自体は同ページの setup option 表に記載されていないため、詳細は parser と実装を根拠とした。
-
-## 調査範囲
-
-同一 revision のソースを確認しました。`--help` は補助資料として実行していません（option が `argparse.SUPPRESS` で隠されているため）。この文書は setup の parser と Strata 側の config・runner 引き渡しを説明し、stable-diffusion.cpp の内部アルゴリズムや backend ごとの実行性能は評価していません。
+- `terminal/setup.py:11252-11260` — preview image オプション群と `--image-native` の choices。
+- `terminal/setup.py:5898-5929` — 画像セットアップの条件、確認、ビルド・ダウンロード、および値の `native` への変換。
+- `terminal/strata_control/setup_config.py:574-575` — `--images` 指定時だけ画像設定を組み立てる分岐。
+- `terminal/tools/image/qimage.py:169-170, 235-248` — native runner 対応 backend と run config の `native` キー。
+- `terminal/serve/images.py:149-174` — `native: true` を `sd-cli --model-args qwen_image_2_1_native=1` に反映する処理。
+- `terminal/setup.py:7653-7663` — 空の画像設定の除去と変更時のバックアップ。

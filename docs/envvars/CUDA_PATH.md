@@ -1,58 +1,54 @@
 # `CUDA_PATH`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-この checkout では `CUDA_PATH` は通常の engine 実行時設定ではありません。Strata 所有の setup とパッケージ作成・Windows vision build が、CUDA Toolkit の候補を見つけるか、Windows DLL のコピー元を組み立てるために読みます。
-
-主な用途は次の三つです。
-
-- `setup.py` は CUDA を使うローカル engine build、または NVIDIA image generator build で `nvcc` 候補の一つとして参照します。候補に採用された `nvcc` の場所と version が後続の build 設定へ渡ります。
-- `packaging/build_vision_windows.bat` は CUDA 12 / 13 の vision reader build 用 Toolkit root を `CUDA_PATH` から取り、variant 別変数があればそちらで上書きします。
-- `packaging/package_engine.py` は Windows 向け engine package の DLL 不足分を探すフォルダーとして `CUDA_PATH\bin\x64` と `CUDA_PATH\bin` を使います。
+Strata の setup と Windows 配布用ツールが、CUDA Toolkit のルートディレクトリを候補として参照するための環境変数。engine の実行時設定ではない。setup の `find_nvcc()` は `CUDA_PATH/bin/nvcc[.exe]` をコンパイラ候補に加え、CUDA ソースビルドと CUDA 画像生成ビルドで利用する。Windows 配布では CUDA DLL の検索元になり、専用ビルドスクリプトは CUDA 画像 reader のコンパイラと Toolkit root を指定する。通常の GPU 推論、モデル選択、CLI の実行時動作を直接変える読み取りは確認できない。根拠: `terminal/setup.py:2595-2629, 5838-5849, 6520-6549`; `tools/packaging/package_engine.py:239-249, 252-281`; `tools/packaging/build_cuda_windows.py:96-105, 168-174`; `tools/packaging/build_vision_windows.bat:26-35, 54-58`。
 
 ## 値と判定
 
-| 読み取り箇所 | 未設定・空文字 | 設定値の扱い | 選択・優先順位 |
+| 読み取り箇所・条件 | 未設定／空文字 | 有効になる値 | 無効・不採用になる値 |
 |---|---|---|---|
-| `setup.py:2231-2249` の `find_nvcc()` | CUDA_PATH 候補を追加しない | root として扱い、その下の `bin/nvcc`（Windows は `bin/nvcc.exe`）を候補に追加する。候補ファイルが存在し、`nvcc --version` 出力に `release 数字.数字` があれば version 候補になる | 非空の `STRATA_NVCC` が有効なファイルならそれだけを使う。そうでなければ PATH 上の `nvcc`、CUDA_PATH、CUDA_HOME、OS ごとの既知ディレクトリを重複排除して調べ、条件を満たす候補のうち最大の major/minor version を選ぶ。PATH が常に優先されるわけではない |
-| `packaging/build_vision_windows.bat:26-35` | variant 別 root も未設定なら失敗 | `cuda12` は `CUDA_PATH_V12_9`、`cuda13` は `CUDA_PATH_V13_0` が定義されていれば既存 CUDA_PATH を置き換える。空値は cmd の `if defined` では選ばれない | variant 別変数が定義済みならそれが優先。なければ継承した CUDA_PATH を使う。root が未設定、または `bin\nvcc.exe` がなければ build を中止 |
-| `packaging/package_engine.py:236-246,254-255` | 空なら CUDA_PATH の検索先を追加しない | 非空値の下に `bin\x64` と `bin` を検索先として追加する | 明示した `--search` が一つでもあれば既定検索先全体を置き換える。なければ CUDA_PATH の二つのフォルダー、HIP_PATH の二つのフォルダー、PATH の順 |
+| setup の `find_nvcc()`（Windows / Linux） | `os.environ.get()` は `None` / `""` を偽として候補を追加しない | 空でない文字列を Toolkit root として扱い、その下の `bin/nvcc.exe`（Windows）または `bin/nvcc`（それ以外）を候補にする。例: `C:\CUDA\v13.0`、`/opt/cuda-13.0` | `1` や `true` もフラグではなくパス文字列なので、通常はその下に nvcc がなく採用されない。空白の trim、大小文字変換、環境変数値そのものの存在検査はしない。nvcc が存在しても `--version` 出力に `release 数.数` がなければバージョン不明として選ばれない。 |
+| Windows `build_cuda_windows.py` | 空・未設定ならその候補を飛ばす | まず `CUDA_PATH_V12_9` または `CUDA_PATH_V13_0` を、その後 `CUDA_PATH` を調べる。root 内の `bin/nvcc.exe` が存在し、出力から取った `release X.Y` が対象 variant と完全一致すれば採用 | パスが空、nvcc がない、version 表記を読めない、または variant と不一致なら次の候補へ進む。両候補が不適合なら `fail()` で終了する。 |
+| Windows `build_vision_windows.bat` | `if defined CUDA_PATH` が偽ならエラーで終了 | `cuda12` では設定済み `CUDA_PATH_V12_9`、`cuda13` では設定済み `CUDA_PATH_V13_0` があれば `CUDA_PATH` を上書きする。その後 `CUDA_PATH\bin\nvcc.exe` の存在を確認 | `if defined` は値の内容や version を検証しない。空文字は未定義相当、`0` や空白は定義済みとして扱われ、後者は nvcc のファイル検査で落ち得る。 |
+| Windows 向け `package_engine.py` の既定 DLL 検索 | 空・未設定なら CUDA_PATH のディレクトリを加えない | 非空値なら `bin/x64` と `bin` を候補にする。ただし実在するディレクトリだけ残す | 数値・真偽値としての判定はなく、値を Path の root として使う。 |
 
-`setup.py` で `STRATA_NVCC` が非空で、指定パスが存在しない場合は警告を出し通常候補探索へ進みます。指定ファイルは存在するものの version を読めない場合は `(None, None)` を返し、通常候補には fallback しません。`below` 制約がある build で指定 version が上限以上の場合も警告して `(None, None)` を返します。CUDA_PATH 自体は単なる候補で、ファイルが存在しない、または version 文字列を読めない場合は選択対象になりません。文字列の部分一致や Toolkit 自体の探索規則をここから推測するものではありません。
+setup の候補選択では、空でない `STRATA_NVCC` が既存ファイルを指す場合は `CUDA_PATH` より先に単独で検査される。version を読めればそれを返し、指定された version 上限に合わない場合や version を読めない場合は通常候補へ fallback せず `(None, None)` を返す。指定ファイルが存在しない場合だけ警告を出して通常候補へ進む。通常探索では `PATH` 上の nvcc、`CUDA_PATH`、`CUDA_HOME`、さらに OS ごとの既定場所を走査し、要求された version 上限を満たすもののうち最も新しい version を選ぶ。同じ version の候補は先に見つかったものが残るため、`CUDA_PATH` は `PATH` より優先されず、`CUDA_HOME` より先に同率候補となる。`STRATA_NVCC` が空の場合は設定なしと同じ。根拠: `terminal/setup.py:2595-2629`。
 
 ## 有効になる条件
 
-- `setup.py` の engine build では、既存のローカル engine が source・architecture 等の条件を満たさず再 build が必要な場合に `install_build_tools()` が呼ばれます。CUDA 12 用 build は `find_nvcc(below=(13, 0))` を使い、CUDA 13 以上を候補から除外します。通常の CUDA engine build は `find_nvcc()` です。`STRATA_NVCC` の指定が有効なら CUDA_PATH や CUDA_HOME の候補より優先されます（`setup.py:2215-2249,5660-5677,5931-5947`）。
-- NVIDIA image generator を新規 build する経路も `find_nvcc()` を使います。既に同じ backend / architecture の build が揃っていればこの処理は行われません（`setup.py:5004-5031`）。
-- `packaging/build_vision_windows.bat` の CUDA_PATH 読み取りは Windows で同バッチを `cuda12` または `cuda13` variant と stage directory 付きで実行した場合だけ有効です。そこで見つけた `nvcc.exe` と root は CMake の `CMAKE_CUDA_COMPILER` と `CUDAToolkit_ROOT` に渡されます（`packaging/build_vision_windows.bat:20-35,57-63`）。このバッチは setup.py の `STRATA_NVCC` / `CUDA_HOME` / PATH 候補探索を呼びません。
-- package 作成時の CUDA_PATH 検索先は target が `windows...` のときだけ作られます。`--search` を指定すると既定検索先の代わりになります。見つかった DLL は package stage にコピーされ、DLL の import 依存を最大 8 回たどります（`packaging/package_engine.py:236-246,249-279,305-306,351-355`）。
+- setup の CUDA engine build では `install_build_tools()` が呼ばれる経路で候補になる。要求 Toolkit version は GPU architecture と toolkit 選択により変わり、CUDA 12 build (`old`) では 13.0 未満を検索し、通常 build は上限なしで検索する。必要 version 未満なら採用後も不足として扱われる。根拠: `terminal/setup.py:6520-6549, 6599-6606, 6849-6863`。
+- setup の CUDA 画像生成 build では、CUDA backend が選択され、既存生成物の stamp が一致せず再ビルドする場合に `find_nvcc()` を呼ぶ。GPU engine build の `install_build_tools()` とは異なり、画像生成側の `find_nvcc()` 呼び出しは version 上限を渡さない。nvcc が得られない場合は CUDA 画像生成を失敗させ、Vulkan または CPU backend を案内する。根拠: `terminal/setup.py:5816-5849`。
+- Windows の CUDA engine 配布ビルドでは、`build_cuda_windows.py` の `cuda12` / `cuda13` variant に対応した Toolkit が必要。専用 version 環境変数が有効な nvcc を指す場合は `CUDA_PATH` より先に選ばれる。選んだ root をプロセス環境の `CUDA_PATH` に設定し、後続の package tool がその Toolkit の DLL を検索できるようにする。根拠: `tools/packaging/build_cuda_windows.py:96-105, 151-174`。
+- Windows の CUDA 画像 reader build では `build_vision_windows.bat cuda12|cuda13 <stage>` を実行するときに必要。variant 専用変数が設定されていれば `CUDA_PATH` を上書きし、専用変数が空・未設定なら既存 `CUDA_PATH` を使う。`nvcc.exe` の存在、Visual Studio C++ compiler、CMake/Ninja など他の前提も満たす必要がある。根拠: `tools/packaging/build_vision_windows.bat:20-58`。
+- `package_engine.py` の `CUDA_PATH` 検索は target が `windows` で始まる場合だけ行う。`--search` が一つ以上渡される場合は `search or []` が非空となり、既定検索（`CUDA_PATH`、`HIP_PATH`、`PATH`）を置き換える。CUDA DLL が見つからない場合、他候補も含めて不足が解消しなければ package を拒否する。根拠: `tools/packaging/package_engine.py:239-281, 357-371`。
+- Nix の開発 shell は `shellHook` で同じ Toolkit root を `CUDA_HOME` と `CUDA_PATH` の両方に export する。これは Strata の読み取りではなく、setup が参照できるように環境を設定する側の記述。根拠: `tools/nix/flake.nix:39-44`。
 
 ## 実行時の詳細
 
-### Setup の nvcc 候補
+setup の `find_nvcc()` は呼び出されるたびに `os.environ.get()` を評価し、CUDA_PATH 用の static cache は持たない。env 値から組み立てた nvcc 候補について `Path.exists()` を確認し、`nvcc --version` の stdout から `release X.Y` を正規表現で探す。実行失敗または 60 秒 timeout は `out()` が空文字を返すため、その候補は version を得られず採用されない。候補の走査後も適格な nvcc がなければ、呼び出し側が Toolkit 不足として停止する。実行中にプロセス環境が変更された場合は次回の `find_nvcc()` 呼び出しで再評価されるが、すでに選択・ビルドされたコンパイラが遡って切り替わるわけではない。根拠: `terminal/setup.py:2595-2629, 1049-1056, 1192-1196`。
 
-`find_nvcc()` は呼ばれるたびに `os.environ` を読み、結果を cache しません。最初に非空の `STRATA_NVCC` を確認します。指定ファイルがなければ `STRATA_NVCC=<値>: no such file; looking for a CUDA toolkit as usual` を warning として出し、通常候補を検索します。指定ファイルがあればその `--version` 出力から version を取り、成功すれば他候補を比べずに返します。`below` が渡されていて指定 version が上限以上なら warning を出して候補なしを返します（`setup.py:2215-2230`）。
+`build_cuda_windows.py` は `find_cuda(variant)` 実行時に環境を読み、variant version と一致する CUDA_PATH root を返す。両環境変数の候補で見つからない場合、`fail()` は `[X] <variant> needs the CUDA <version> toolkit (CUDA_PATH_V... or CUDA_PATH)` を表示し、script を終了コード 1 で止める。`build_vision_windows.bat` は起動時の環境を `setlocal` 内で扱い、variant 用の変数から `CUDA_PATH` を設定して nvcc と CMake に渡す。package 呼び出しは選んだ root を含む Python 環境で起動される。根拠: `tools/packaging/build_cuda_windows.py:96-106, 168-174`; `tools/packaging/build_vision_windows.bat:20-35, 54-60`; `terminal/setup.py:1049-1056`。
 
-通常探索では PATH の `nvcc` を最初に列挙し、続いて非空の CUDA_PATH と CUDA_HOME それぞれの `bin`、さらに OS 別候補を調べます。候補順は優先順位ではなく、version を読み取れた候補の最大 major/minor を選びます。同じパスは一度だけ調べます。`below` がある場合は version がその値未満の候補だけが選択対象です（`setup.py:2231-2249`）。ここでの PATH の扱いは Strata が `shutil.which("nvcc")` で得た候補についてだけ述べています。
+`package_engine._default_search()` は Windows target かつ packaging が `--search` を受けていない場合に呼ばれる。DLL を見つけると `bundled <name> ...` を表示して package にコピーし、見つからないまま依存が残れば `refusing to package: ...` で停止する。CUDA_PATH はこの packaging 処理の中でのみライブラリ探索元として使われ、配布後の Strata runtime に環境変数を埋め込む読み取りは確認できない。根拠: `tools/packaging/package_engine.py:239-281, 252-281`。
 
-engine build では候補がない、または要求 version を満たさない場合、CUDA Toolkit が不足している旨の `fail()` で setup を止めます。CUDA 12 build の要求は GPU architecture により 12.0 または 12.8 以上です。CUDA 13 build は通常 12.0 以上、sm_120 を含む場合は 13.0 以上を要求します（`setup.py:5660-5689`）。setup が build tools を自動導入した後も候補を再確認し、不足なら `the CUDA Toolkit did not install` で停止します（`setup.py:5739-5746`）。選択した `nvcc` は engine build の `CMAKE_CUDA_COMPILER` と Toolkit root の導出に使われます（`setup.py:5936-5949`）。
+## ログと測定値
 
-### Windows vision build
-
-バッチは `setlocal` 内で環境を扱います。`cuda12` なら定義済みの `CUDA_PATH_V12_9`、`cuda13` なら定義済みの `CUDA_PATH_V13_0` を CUDA_PATH に代入します。variant 専用変数がなければ元の CUDA_PATH を使います。CUDA_PATH が未設定なら `CUDA_PATH is not set: install the <variant> toolkit`、root 内に `bin\nvcc.exe` がなければ `no nvcc.exe in <root>\bin` を表示して終了コード 1 で止まります。検証を通ると CUDA_PATH 由来の compiler と Toolkit root で CMake を構成します。CMake、build、copy、stamp の失敗も `|| exit /b 1` で伝播し、成功時は stage の exe と architecture を表示します（`packaging/build_vision_windows.bat:20-64`）。
-
-### Windows package の DLL 収集
-
-`package_engine.py` の既定検索先は target が Windows の場合だけ、CUDA_PATH の `bin\x64` と `bin`、HIP_PATH の同じ相対フォルダー、PATH の各要素をこの順で候補にします。実在するディレクトリーだけを残します。DLL が足りないとき、まずファイル名そのままで探し、次に大文字小文字を無視した名前で探します。見つかったファイルを stage へコピーすると `bundled <dll> (imported by the engine; from <folder>)` を表示します。依存 DLL が解決しきれない場合は `refusing to package: ...` と不足名を出し、clean PC で engine を開始できないとして package を拒否します（`packaging/package_engine.py:236-279`）。
+- setup の既定探索で CUDA_PATH 配下の nvcc が使われても、CUDA_PATH 自体を示す専用ログは確認できない。Toolkit が足りないときは setup の `[X] ...` と `Setup stopped. Fix the item above and run it again - everything already done is kept and skipped.` を表示し、終了コード 1 になる。根拠: `terminal/setup.py:1049-1056, 6531-6555, 6600-6606`。
+- `build_cuda_windows.py` の不適合経路は `fail()` のメッセージを表示して終了する。vision batch は `CUDA_PATH is not set: install the %VARIANT% toolkit` または `no nvcc.exe in %CUDA_PATH%\bin` を表示して終了コード 1。根拠: `tools/packaging/build_cuda_windows.py:105-106`; `tools/packaging/build_vision_windows.bat:34-35`。
+- 該当する性能測定値はない。CUDA_PATH が変えるのはビルド・配布時の Toolkit / DLL 候補選択であり、ここで参照したソースや資料には CUDA_PATH による実行性能差の測定値はない。
 
 ## 根拠
 
-- Setup が候補を読み、`STRATA_NVCC`、CUDA_PATH、CUDA_HOME と PATH 候補を比較する処理: `setup.py:2215-2249`。
-- setup の build tools 選択、CUDA version 条件、失敗経路、engine build への compiler 指定: `setup.py:5660-5689,5710-5746,5931-5949`。
-- NVIDIA image generator build で `find_nvcc()` を使う条件: `setup.py:5004-5031`。
-- Windows vision build の variant 選択、CUDA_PATH の検証、CMake 指定、終了経路: `packaging/build_vision_windows.bat:20-64`。
-- Windows package の既定 DLL 検索順、`--search` による置換、コピー・拒否ログ: `packaging/package_engine.py:236-279,305-306,341-358`。
-
-Strata の engine runtime 本体に CUDA_PATH を読む箇所はこの調査では見つかりませんでした。ここに記した挙動は Strata 所有の setup / Windows vision build / package 作成時の処理に限り、CUDA Toolkit、CMake、Windows loader など外部ツールや OS が環境変数をどう解釈するかは含めていません。
+- setup の nvcc 探索と version 判定: `terminal/setup.py:2595-2629`
+- setup での画像生成 CUDA build: `terminal/setup.py:5816-5849`
+- GPU 用 engine build の Toolkit 要件と呼び出し: `terminal/setup.py:6520-6606, 6849-6863`
+- Windows engine 配布の Toolkit 探索と環境引き渡し: `tools/packaging/build_cuda_windows.py:96-105, 151-174`
+- Windows 画像 reader の variant 選択と nvcc 指定: `tools/packaging/build_vision_windows.bat:20-58`
+- Windows package の CUDA DLL 検索: `tools/packaging/package_engine.py:239-281, 357-371`
+- Nix shell が CUDA_PATH を設定する箇所: `tools/nix/flake.nix:39-44`
+- setup の警告・停止・外部コマンド timeout: `terminal/setup.py:1044-1056, 1192-1196`
+- docs との照合: `docs/SOURCE_INSTALL.md:77-85` は CUDA Toolkit を要求する source build を案内し、`docs/TROUBLESHOOTING.md:210-217` は setup が Toolkit 候補を探すことと `STRATA_NVCC` の選択を記す。いずれも CUDA_PATH 固有の値規則は記載せず、上記の詳細は現行ソースから確認した。
+- `engine/third_party/strata-llama/cmake/arm64-windows-msvc-cuda.cmake:7-10` にも CMake が CUDA_PATH を参照する記述があるが、これは vendored external dependency のコードであり、本書では Strata の挙動の根拠・説明対象に含めていない。

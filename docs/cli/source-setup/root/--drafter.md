@@ -1,58 +1,67 @@
-# `setup.py` / `setup.sh` / `START-HERE.bat` / update wrappers `--drafter`
+# `setup.py --drafter`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`SETUP.bat`、`update.sh`、`UPDATE.bat` から委譲） |
+| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` からも引数を転送） |
 | オプション | `--drafter` |
 | 別名 | なし |
-| 値 | `mtp` または `dflash2`。値を1つ取る |
+| 値 | `mtp`、`dflash2`、`dfly2`、`dspark`、`off` のいずれか。省略時は `None` |
 
 ## 役割
 
-モデルのセットアップ時に、MTP ドラフト層を今回ダウンロードするかどうかを制御します。`dflash2` を選ぶと、MTP 層がまだない場合にその約5 GBの取得・生成を省き、DFlash2 用語彙ファイルを用意します。DFlash2 本体の取得はこのオプションでは行わず、ヘルプが案内する `strata drafting fetch` が別途必要です（`setup.py:9693-9696, 9491-9494, 10575-10585`）。
+モデルのセットアップ中に、ドラフターの取得やモデルに含めるドラフター関連ファイルを選ぶ引数です。ただし、値の意味はモデル系列で異なります。Qwen 系では主に DFlash2 と MTP の取得経路を選び、Inkling-2-Mini では `off` かどうかで DSpark を含めるかを決めます。Hy4-Flash のセットアップ処理はこの引数を参照しません。
 
 ## 使い方
 
-Strata のソースディレクトリで、例えば次のように指定します。
-
 ```sh
-./setup.sh --family qwen --model IQ3_S --drafter dflash2 --no-start
+# Qwen 系のセットアップで DFlash2 を使う選択にし、モデル起動は後で行う
+./setup.sh --setup --family qwen --model IQ3_S --drafter dflash2 --no-start
+
+# Inkling-2-Mini のセットアップで DSpark を含めない
+./setup.sh --setup --family inkling-2-mini --drafter off --no-start
 ```
 
-`setup.sh` は全引数を `setup.py` に渡します（`setup.sh:76`）。Windows の `START-HERE.bat` も `%*` を `setup.py` に渡します（`START-HERE.bat:48,53`）。
+`setup.sh` は `setup.py` に引数をそのまま渡します（`setup.sh:14-18`）。Windows の `START-HERE.bat` も `%*` を `setup.py` に渡します（`START-HERE.bat:49-56`）。
 
 ## 値と既定値
 
-- parser は `choices=["mtp", "dflash2"]` を指定し、型変換・追加の値域検査はありません（`setup.py:9693`）。それ以外の値は `argparse` が拒否し、usage とエラーを表示して終了します。
-- 既定値は `None`（未指定）です。実装上、未指定と `--drafter mtp` はどちらも DFlash2 専用分岐に入らず、MTP が必要で未配置なら従来どおり取得・生成します（`setup.py:9693, 10434-10435, 10575-10586`）。
-- `--drafter dflash2` と `--mtp off` を同時指定した場合、MTP を無効にする `--mtp off` の分岐が先に処理されます（`setup.py:10575-10579`）。
+- parser は上記5値を `choices` で受理し、既定値は `None` です。短縮名、独自の型変換、明示的な `required` 指定はありません（`terminal/setup.py:11357-11364`）。
+- 不正な値は `argparse` の選択肢検証で拒否されます。parser の解析は `main()` で行われます（`terminal/setup.py:11385`）。
+- 値を省略した場合、Qwen 系で MTP がまだない新規セットアップでは、ハードウェア・モデルに応じた Terminal の Auto 判定が DFlash2 を選ぶことがあります。MTP が既にある場合、`--mtp` が指定されている場合、または Auto が MTP を選ぶ場合は、この自動切替はありません（`terminal/setup.py:8963-8978`、`12111-12118`）。
 
 ## 実行時の動作
 
-通常のセットアップ経路では、ディスク必要量の見積もりから MTP の約5.2 GBを除外し（MTP が未配置で、`--mtp off` でもなく、`--drafter dflash2` でもない場合だけ加算）、セットアップ工程でも MTP 層がないときに DFlash2 用語彙を供給して MTP の取得・生成を飛ばします（`setup.py:10427-10438, 10568-10586`）。MTP が既に存在する場合、この分岐はそれを削除しません。DFlash2 のモデルデータはこの処理では取得されません。
+**Qwen 系:** `dflash2` の場合、MTP の約5.2 GB の取得見積もりと MTP 取得を抑止し、DFlash2 用語彙ファイルを用意します（`terminal/setup.py:12117-12121`、`12264-12273`）。明示した `--drafter dflash2` は自動選択フラグではないため、セットアップ中の `fetch_dflash2_drafter()` 呼び出しには入りません。同関数による取得は、未指定時の Auto 判定が DFlash2 を選んだ経路に限られます（`terminal/setup.py:12112-12113`、`12260-12266`）。明示的に DFlash2 を選んで取得も行う場合は、parser の説明にある別コマンド `strata drafting fetch` を使う経路です（`terminal/setup.py:11361-11364`）。
 
-**このオプション値自体は run config の `drafting` キーに書き込まれません。** parser 後の利用箇所は MTP の見積もりと取得分岐であり、生成 config の構築箇所は `drafting` キーを設定しません（`setup.py:10434, 10577-10579, 10613-10616, 10813-10815`）。保存時に setup が書くキーの一覧にも `drafting` は含まれず、既存 config にある setup 管轄外のキーは保持されます（`setup.py:6665-6670, 6680-6713, 6815-6845`）。したがって、ヘルプの「choice is its `drafting` key」という記述（`setup.py:9694-9696`）と異なり、新規 config に `--drafter dflash2` の選択は記録されません。既存 config の `drafting` 値があれば保存処理で保持され得ますが、この CLI 値でその値を変更する実装は確認できませんでした。
+Qwen 系で `dflash2` 以外の値を渡すと、Auto による DFlash2 の自動選択は抑止されますが、`--mtp off` も指定しない限り通常の MTP 取得分岐は残ります（`terminal/setup.py:8969`、`12112-12118`、`12262-12273`）。この処理では `--drafter` の値そのものを `drafting` 設定へ書き込む箇所を確認できません。`--mtp off` は別引数で、設定に `mtp: false` を書く処理があります（`terminal/strata_control/setup_config.py:539-549`）。したがって、Qwen 系で `--drafter off` を指定しても、それだけで永続設定上のドラフター無効化を意味するとは確認できません。`dfly2` と `dspark` も Qwen 系ではそれぞれのエンジン用ドラフターに切り替える処理が見当たりません。
+
+未指定時の Auto 判定が DFlash2 を選び、その取得に失敗した場合は警告を出し、MTP の取得へ戻します。これは自動選択経路の挙動です（`terminal/setup.py:8981-9005`、`12260-12273`）。一方、明示的な `dflash2` のセットアップはこの自動取得・MTP fallback の条件には該当しません。
+
+**Inkling-2-Mini:** 値が `off` なら DSpark を要求せず、生成する run config の `drafting` を `off` にします。それ以外の4値はすべて同じく DSpark を要求し、config には `inkling_family.DEFAULT_DRAFTER` を設定します。従って `mtp` や `dflash2` はこの系列では MTP / DFlash2 への切替指定ではありません（`terminal/setup.py:10605-10606`、`10617-10623`、`10646-10658`、`10669-10704`）。ローカル GGUF に必要な DSpark が見つからない場合は、そのモデルの `drafting` を `off` にします（`terminal/setup.py:10617-10620`、`10670`）。通常の取得経路で必要ファイル分の空き容量が足りなければ `fail()` でセットアップを中断します（`terminal/setup.py:10622-10632`）。
+
+**Hy4-Flash:** parser は値を受理しますが、Hy4 の run config は `hy4_family.DEFAULT_DRAFTER` から作られ、このオプションを参照する処理は確認できません（`terminal/setup.py:10278-10279`）。
 
 ## 適用条件と副作用
 
-- `--drafter dflash2` の MTP 抑止分岐は、MTP が未配置の場合にのみ働きます。MTP が既に存在すれば残り、通常の後続処理が既存層と語彙を更新します（`setup.py:10568-10593`）。
-- `--mtp off` が指定されている場合はそちらの分岐が優先し、MTP を取得しません。`--drafter` と `--mtp` の組み合わせ自体を拒否する validation はありません（`setup.py:9689-9696, 10575-10586`）。
-- Apple Silicon の通常の `setup.py` 実行は parser を作る前に `metal/setup_mac.py` へ委譲します（`setup.py:9566-9567`）。Mac 側 parser は未知の引数を警告して続行する実装であり、`--drafter` は同 parser の索引項目にありません（`metal/setup_mac.py:362-364`、`docs/cli/README.md` の `source-setup/mac/` 節）。このため、Mac の通常委譲経路で本オプションが有効とは確認できません。
-- wrapper と `setup.py` はモデルファイル、MTP 関連ファイル、run config を読み書きするセットアップ処理を起動します。DFlash2 用語彙の配置に失敗した場合は警告が出ます（`setup.py:7750-7755, 9491-9494, 10577-10579`）。
+- Qwen 系で `dflash2` または Auto による DFlash2 選択になった場合、MTP のドラフト層（約5 GB）の代わりに DFlash2 関連ファイルを使うセットアップ経路になります。明示的な `dflash2` はこのオプション単独では DFlash2 を取得しません（`terminal/setup.py:12117-12121`、`12260-12273`）。
+- Inkling-2-Mini では、`off` 以外を指定すると取得ファイル一覧に DSpark が含まれ得ます。ローカルファイルの探索またはモデルファイルのダウンロード・空き容量確認に影響します（`terminal/setup.py:10617-10632`、`10646-10658`）。
+- 既存のドラフト層があるかどうか、モデルの family、GPU backend / architecture / VRAM などが Qwen 系の Auto 判定・取得見積もりに関係します（`terminal/setup.py:8963-8976`、`12111-12121`）。
 
 ## 出力とエラー
 
-- 未対応値は `argparse` の choices 検証で拒否されます（`setup.py:9693, 9717`）。独自の終了コードや専用エラーメッセージは定義されていません。
-- MTP 層がなく `--drafter dflash2` が指定されたときは、MTP を取得しない旨をセットアップの通常出力へ表示します（`setup.py:10577-10579`）。この表示は DFlash2 の本体が取得済みであることを保証しません。
-- `--drafter dflash2` 専用の終了コードはありません。セットアップ全体のダウンロード、ディスク容量、エンジン準備などの失敗経路は通常の setup 処理に従います。
+- 不正値は parser が usage とエラーを出して終了します（`terminal/setup.py:11361-11364`、`11385`）。
+- Auto による DFlash2 取得が失敗すると、理由を含む警告を出して MTP 取得へ進みます（`terminal/setup.py:8997-9005`、`12260-12273`）。
+- Inkling の DSpark を含む取得経路で空き容量不足の場合、必要容量と `--data-dir` / `--models-dir` の案内を出して中断します（`terminal/setup.py:10630-10632`）。
 
 ## 根拠
 
-- parser とヘルプ説明: `setup.py:9693-9696`。
-- 値の受理後の参照、MTP 容量見積もりと通常の取得経路: `setup.py:10427-10438, 10568-10586`。
-- Apple Silicon の委譲: `setup.py:9566-9567`、Mac parser の未知引数処理: `metal/setup_mac.py:362-364`。
-- run config に書くキー、既存キーの保持、config 書き込み: `setup.py:6665-6713, 6815-6845, 10813-10815, 10951-10969`。
-- wrapper の引数委譲: `setup.sh:76`、`START-HERE.bat:48,53`。
+- `terminal/setup.py:11361-11364` — parser 定義、受理値と help 文。
+- `terminal/setup.py:8963-9005`、`12111-12121`、`12260-12280` — Qwen 系の Auto 判定、MTP の取得見積もり、DFlash2 と MTP の分岐・fallback。
+- `terminal/setup.py:10605-10632`、`10646-10704` — Inkling の DSpark 選択、取得ファイルと run config の構築。
+- `terminal/setup.py:10278-10279` — Hy4 の run config に使う既定値。
+- `terminal/strata_control/setup_config.py:539-549` — `--mtp` が設定ファイルへ反映される別経路。
+
+調査範囲はこの checkout の Strata 所有ソースです。DFlash2 ファイルの配布元内部の処理や、モデル起動時に最終選択されるドラフターの全条件は本オプションのセットアップ処理だけでは確定できないため、ここでは断定していません。

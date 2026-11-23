@@ -1,53 +1,49 @@
 # `STRATA_COALESCE_PREFILL`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-`serve/server.py` の `--batch`（並列 slot）経路で、control line を取得したリクエストが、control line 待ちの別リクエストの prompt を空き slot に先行して割り当て、engine に `BCO` 行で送ります。engine は次の `BGEN` の prompt と follower の prompt を同じ multi-prompt prefill pass で読みます。値 `N` は leader を含む coalesce 数の上限で、最大 `N-1` 件を follower にできます。
+Terminal の Python serve が、同じ engine で制御線を待っているリクエストの prompt を、先に制御線を取ったリクエストとまとめて読む上限を設定する。`N > 1` の場合、先行リクエストを含む最大 `N` 件（後続は最大 `N-1` 件）を候補にし、空き batch slot がある後続 prompt を engine の `BCO` protocol に送る。対応 engine は prompt 群を同じ layer-major pass で読み、後続リクエストは予約 slot の prompt を再利用する。通常の単独読みや出力 token の生成上限を直接変更する設定ではない。Python 側の読み取りと選別は `terminal/serve/server_parts/base.py:271-275`、`terminal/serve/server.py:1868-1909,2197-2199`、engine 側の protocol と co-read は `engine/src/program/generate.cpp:18338-18350,20708-20767`。
 
-これは server 側が読む設定です。engine は環境変数を直接読みません。engine は server から届く `BCO` / `BGEN` protocol を処理します。通常の非 batch 経路、batch 中でも単独リクエストを `GEN` で読む経路、embedding 入力にはこの coalesce 処理は適用されません。
+これは serve process の実験的な制御で、値を読むのは `terminal/serve/server_parts/base.py` である。`terminal/serve/server.py:73-80` がその定数を import する。候補一覧のほかの出現はコメントや `terminal/tools/par/variants/` の実験設定であり、追加の読み取り箇所ではない。
 
 ## 値と判定
 
-server は `serve/server.py` の import 時に `int(os.environ.get("STRATA_COALESCE_PREFILL") or 0)` を評価し、その後 `max(0, ...)` で下限を 0 にします。文字列全体を Python の `int()` で変換します。
+Python の `os.environ.get(...) or 0` の結果を `int` に変換し、`max(0, ...)` で負数を 0 にする。`unset` と空文字はどちらも 0。整数の文字列表現（前後の空白や符号を含む Python `int` が受理する形式）は変換され、値が 0 または 1 なら co-read は呼ばれない。2 以上で有効になる。小数、`true`、`1x`、空白だけなど `int` が受理しない値は import 時の `ValueError` となり、独自の fallback や設定警告はない。上限値の clamp はなく、大きな値も Python 整数として受理されるが、実際に選ばれる後続数は空き slot 数・待機数などで制限される。根拠: `terminal/serve/server_parts/base.py:271-275`、判定箇所 `terminal/serve/server.py:2022-2024,2197-2199`。
 
-| 環境値 | 判定 |
+| 値 | 判定 |
 |---|---|
-| 未設定 | `0`。無効 |
-| 空文字 | `or 0` により `0`。無効 |
-| `0` または負の整数 | `max(0, value)` により `0`。無効 |
-| 正の整数 `1` | 値は 1 だが、実行箇所の `COALESCE_PREFILL > 1` 条件を満たさず無効 |
-| 整数 `N >= 2` | coalesce を試行。leader 以外は最大 `N-1` 件 |
-| 整数でない文字列 | `int()` の `ValueError` が server module の import 時に発生する。ここでは例外を捕捉せず、server 起動を妨げる |
+| 未設定、空文字、`0`、負の整数（例 `-2`） | 0 に評価され、無効 |
+| `1` | 1 に評価されるが、実行条件が `> 1` のため無効 |
+| 2 以上（例 `2`, `8`, `+3`, ` 3 `） | 最大候補数として有効 |
+| `true`, `1x`, `1.0`, 空白だけ | `int` 変換で `ValueError`。serve module の読み込みに失敗 |
 
-正の値にコード上の上限 clamp はありません。実際の follower 数は、待ち行列にある適格リクエスト数、空き slot 数、prompt 合計 token 上限、および engine 側の受理条件でさらに制限されます。CLI 引数や設定ファイルからこの値を上書きする処理は確認できません。
+この変数に対する CLI 引数や設定ファイルからの上書きは見つからない。値は server module import 時に定数へ変換され、その server process の実行中には再読込されない。server が起動する engine にも環境は渡されるが、engine はこの名前を環境から読まず、server が送る `BCO` protocol を処理する。根拠: `terminal/serve/server_parts/base.py:275`、`terminal/serve/server.py:73-80,827-829`、`engine/src/program/generate.cpp:18338-18350`。
 
 ## 有効になる条件
 
-- Python server が `--batch` 等で batch slot を持ち、リクエストが `generate_batched()` に入ること。値が 2 以上でも、batch がなければ `generate_batched()` は呼ばれません。
-- 対象リクエストが embedding 入力でないこと。leader に対して `_coalesce()` を呼ぶ条件にも、待機 prompt を `_take_control()` に登録する条件にも `not embeddings` があります。
-- `COALESCE_MIN_REQS` 以上の最近到着リクエストがあること。既定値は 3 です。足りない場合、`COALESCE_WAIT_MS > 0` なら一度 10 ms 待って再確認し、それでも足りなければ通常読み込みに戻ります。十分なら設定された `COALESCE_WAIT_MS` だけ待ってから follower を選びます。
-- 待機 follower は同じ coalesce に重複参加しておらず、prompt が 32 token 以上で、leader と選択済み follower の合計が `COALESCE_TOKENS` 以下であること。`COALESCE_TOKENS` の既定値は 16384 です。さらに空き slot が必要です。
-- engine が `BCO` を有効 slot と 3 token 以上の ID 列として受け取り、次の `BGEN` と同じ batch admission の co-read に使うこと。engine は最初の prompt run で、画像 request がない場合にだけ multi-prompt run を試します。`run_multi()` が `prefill: multi-prompt read declined` で断った場合は leader の通常 `run()` に fallback します。
+- Terminal serve の batch-slot 経路で、`COALESCE_PREFILL > 1` かつ embeddings ではないリクエストであること。初回 admission の control line を取得した後の batch slot admission で `_coalesce` が呼ばれる。embeddings は候補登録・実行の両方から外れる。`terminal/serve/server.py:2022-2024,2197-2199`。
+- 後続リクエストが同じ engine の待ち行列にあり、まだ preslot を持たず、coalesce 済みでもなく、prompt が 32 token 以上であること。先行 prompt と候補 prompt の合計が `STRATA_COALESCE_TOKENS`（未設定・空文字なら 16384、下限 256）の範囲内で、`pick_slot` が空き slot を返す必要もある。選択数は `STRATA_COALESCE_PREFILL - 1` 以下。`terminal/serve/server.py:1886-1905`、`terminal/serve/server_parts/base.py:278`。
+- 適応条件として、直近 `STRATA_COALESCE_BURST_MS`（既定 250 ms、下限 10 ms）内の arrival 数または待ち数が `STRATA_COALESCE_MIN_REQS`（既定 3、下限 2）以上であること。閾値未満でも `STRATA_COALESCE_WAIT_MS` が正なら最初に 10 ms 待って再確認し、それでも未満なら通常の prompt read に戻る。閾値以上なら設定された `STRATA_COALESCE_WAIT_MS`（既定 0 ms、負値は 0）だけ待って候補を集める。これらは独立した環境変数で、CLI 引数からの優先指定はこの箇所にない。`terminal/serve/server.py:1874-1885`、`terminal/serve/server_parts/base.py:278-291`。
+- Engine が `BCO` を受理し、次の `BGEN` で取り込めること。engine は範囲内 slot かつ 3 token 以上の `BCO` だけを pending にし、次の BGEN admission に渡す。共読み込み対象が実際に残らない場合は通常の `sp.run` を使う。`engine/src/program/generate.cpp:18338-18350,18376-18395,20719-20735`。
+
+OS やこの変数専用の backend/build macro による追加分岐は、確認した読み取り・呼び出し箇所にはない。実際に利用可能な engine protocol や空き batch slot がなければ候補は選ばれず、通常の処理になる。
 
 ## 実行時の詳細
 
-設定値は server module の import 時に一度だけ読み取られ、module global に保持されます。稼働中にプロセス環境を変更しても再評価されません。値は engine 子プロセスへ環境変数として転送されず、server が `BCO <slot> <ids>` と次の `BGEN` を送って機能を依頼します。
+serve module の import 時に一度評価されるため、server process 起動後に環境を書き換えても定数には反映されない。`_take_control` は待機 prompt と request を `wait_lens` に登録し、制御線を取得したリクエストが `_coalesce` を呼ぶ。候補の slot を busy として予約し、request に preslot を記録してから `BCO <slot> <token IDs>` を送信する。続いて通常の `BGEN` を送る。先行分と後続分は engine の同じ co-read pass に渡され、成功した後続 slot には `BCOK <slot> <tokens>` が返る。serve は `BCOK` を制御行として受け取る（その行自体では追加処理をしない）。後続 request は自分の admission 時に preslot を使う。キャンセルなどで先行 admission 前に後続 request が離れた場合は予約 slot を解放する。根拠: `terminal/serve/server_parts/base.py:275`、`terminal/serve/server.py:1791-1796,1857-1866,1868-1909,1568-1569,2022-2034`、`engine/src/program/generate.cpp:18338-18350,20744-20767`。
 
-`_take_control()` は到着時刻、tokenized prompt、request cancel object を待ち行列に登録します。batch の admission が slot を取得すると、`_coalesce()` は最近の到着数を確認し、候補 follower ごとに prompt 長と合計 token 数を検査して空き slot を予約します。選択した follower の prompt ID を `BCO` 行として送ってから leader の `BGEN` を送ります。server は follower に予約 slot を持たせ、その後 follower 自身の admission 時には prompt を再読込しない経路に接続します。
+## ログと測定値
 
-engine は `BCO` 行を次の `BGEN` まで保留し、prompt 条件が許せば `Prefill::run_multi()` を実行します。成功時は follower slot に prompt state を置き、stdout に `BCOK <slot> <tokens>`、stderr に `strata batch: co-read: ...` を出します。server の `_control()` は `BCOK` を認識して処理を継続します（行を受け取っただけで追加処理はしません）。server 側では follower を選んだ場合に stdout へ `[strata] coalesce: ...` を出します。
+候補が選ばれ、server が少なくとも一つの `BCO` を送ったとき、serve は stdout に `[strata] coalesce: {件数} waiting prompt(s) ({token数} tokens) read with this request's {先行prompt長}` を出す。engine は stderr に `strata batch: co-read starting: ...` を出し、成功時は `strata batch: co-read: ... read in the same pass ...` を出す。multi-prompt read が `prefill: multi-prompt read declined` で辞退された場合は、engine が `strata batch: co-read of ... declined (...)` を stderr に出して通常の単独 `sp.run` に戻る。その他の co-read 失敗はその場で `false` を返し、通常 read に置き換えず失敗経路へ進む。根拠: `terminal/serve/server.py:1906-1910`、`engine/src/program/generate.cpp:20744-20767`。
 
-候補選択の結果 follower がなければ server 側の coalesce ログは出ません。engine が multi-prompt read を decline した場合は stderr に `strata batch: co-read of ... declined (...)` を出し、leader の通常読み込みを行います。その他の `run_multi()` 失敗は co-read lambda から失敗として返され、通常の request error 経路に進みます。`BCO` を protocol として受け付けても、slot 範囲外や ID が 3 token 未満なら engine は保留リストに加えず、その行自体について警告は出しません。
+この変数による速度・token 同一性の測定値は記載しない。参照した `docs/DETAILS.md` と関連する文書に、この名前に関する測定条件つきの説明は見つからなかった。
 
 ## 根拠
 
-- `serve/server.py:340-346` — 環境変数の値変換、既定値、関連する token/wait 設定。
-- `serve/server.py:1747-1755,1796-1804` — prompt と到着時刻の待ち行列登録、control line 待ちの管理。
-- `serve/server.py:1817-1859` — burst 条件、follower の選択・予約、`BCO` 送信とログ。
-- `serve/server.py:1916-1926,2078-2086,2327-2336` — prompt の登録条件、batch admission から coalesce を呼ぶ条件、batch 以外との分岐。
-- `src/program/generate.cpp:12570-12575,13530-13543,13565-13583` — engine の `BCO` parse、slot/ID 条件、次の `BGEN` への保留。
-- `src/program/generate.cpp:15178-15238,15240-15248` — multi-prompt 実行条件、decline fallback、成功時の `BCOK` と stderr ログ。
-
-`docs/DETAILS.md` にはこの変数名または co-read の説明が見つからず、性能値や測定条件は記載していません。
+- 環境読み取り・変換: `terminal/serve/server_parts/base.py:271-275`
+- Server への import: `terminal/serve/server.py:73-80`
+- 適用箇所と制限: `terminal/serve/server.py:1868-1909,2022-2034,2197-2199`
+- Engine protocol の取り込み・実行・fallback: `engine/src/program/generate.cpp:18338-18350,18376-18395,20708-20767`
+- 関連する coalesce 設定: `terminal/serve/server_parts/base.py:278-291`

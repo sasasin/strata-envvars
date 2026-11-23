@@ -1,42 +1,40 @@
 # `LLAMA`
 
-調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-`LLAMA` は Linux AMD/HIP のパッケージ用ビルドスクリプト `packaging/build_hip_linux.sh` が読む、llama.cpp checkout のパス指定です。空でなければ、エンジン用 ggml の選択値 `STRATA_GGML_DIR` と、画像 reader 用 CMake の `LLAMA_DIR` に変換して渡します。空または未設定なら、初回構成時は Strata に同梱されたソースを使います。これは Strata 実行ファイルが読む環境変数ではなく、このスクリプトを実行するときのビルド設定です（`packaging/build_hip_linux.sh:21-25,60-80`）。
+`LLAMA` は実行時設定ではなく、Linux HIP エンジン用パッケージを作る `tools/packaging/build_hip_linux.sh` が読むビルド時の互換 override です。空でなければ `-DSTRATA_GGML_DIR=<値>` としてエンジンの CMake configure に渡し、CMake が ggml のソースルートを vendored tree から指定 checkout に切り替えられるようにします。Strata の起動後に読む箇所はなく、通常の CPU/CUDA/SYCL/Metal ビルドや `strata-vision` の configure にはこの変数を渡しません（`tools/packaging/build_hip_linux.sh:10,24-25,63-80`）。
 
 ## 値と判定
 
-スクリプトは Bash の `${LLAMA:-}` で値を取り込み、その後 `[ -z "$LLAMA" ]` で空かどうかだけを判定します。`:-` により未設定と空文字はどちらも空になります。空でなければ値をパス文字列としてそのまま CMake に渡し、`LLAMA` 自体について数値・真偽値・存在確認・空白除去・パス正規化はしません（`packaging/build_hip_linux.sh:21-25,71-80`）。
+シェルで `${LLAMA:-}` により読みます。未設定と空文字はどちらも空文字になり、override の CMake 引数を作りません。空でない値は文字列を parse・正規化せず、配列の 1 引数 `-DSTRATA_GGML_DIR=<値>` として渡します。シェル配列なので値中の空白も引数分割されません（`tools/packaging/build_hip_linux.sh:24-25,63-65`）。
 
-| 条件 | 未設定 | 非空で有効になる値 | 空またはこのスクリプトで別扱いにならない値 |
+| 条件 | unset | 設定時に CMake へ渡す値 | CMake で override になる値 |
 |---|---|---|---|
-| `packaging/build_hip_linux.sh` を Bash で実行 | 空と同じ。初回 CMake 構成では同梱ツリーを使う | `../llama.cpp` のような checkout パス。`0` や空白だけの値も非空なので override として転送される | `LLAMA=''` は未設定と同様。`true` / `false` も真偽値として解釈されず、それぞれ文字列のパスとして転送される |
+| `build_hip_linux.sh` がエンジンを configure する場合 | 空として扱い、引数を省略。新規 cache では vendored `engine/third_party/strata-ggml` | 空でない値をそのまま `STRATA_GGML_DIR` に渡す | CMake の `if(STRATA_GGML_DIR)` が真になる値（checkout のルート）。`0`、`OFF` など CMake の false 定数は引数としては渡るが、override にはならず vendored tree が選ばれる（`engine/cmake/strata_ggml.cmake:11-16`） |
 
-`LLAMA` が非空でも、値が有効な checkout を指すかはこのシェルスクリプトでは検証しません。CMake の構成・ビルドがそのパスを扱い、失敗時は通常のビルド失敗経路に入ります（`packaging/build_hip_linux.sh:63-85`; `cmake/strata_ggml.cmake:8-13`; `tools/vision/CMakeLists.txt:18,122`）。
+このシェル側では有効パスかどうかを検査しません。CMake は真の値を ggml root とし、その下の `ggml` を `add_subdirectory` するため、必要な tree がない場合は configure が失敗します（`engine/cmake/strata_ggml.cmake:12-16,59`）。`LLAMA` には CLI 引数からの直接優先規則はありませんが、同じ configure 呼び出しの後段に `${STRATA_CMAKE_EXTRA:-}` も展開されるため、そこから同じ CMake cache 変数を指定する構成ではコマンドライン上に両方が渡り得ます（`tools/packaging/build_hip_linux.sh:63-65`）。
 
 ## 有効になる条件
 
-- この環境変数を読むのは `packaging/build_hip_linux.sh` です。他の実行経路がこの名前の環境値を参照する箇所はありません。`LLAMA` という名前の他の参照は、Windows スクリプト内で `STRATA_GGML_DIR` から作るローカル変数か、CMake 関数引数です（例: `tools/hip/build_windows.bat:94-99`, `cmake/strata_ggml_tq_overlay.cmake:20-23`）。
-- エンジン構成は `VISION_ONLY` が空のときだけ行われます。このとき非空の `LLAMA` は `-DSTRATA_GGML_DIR=...` として `cmake -S .` に渡されます。`STRATA_CMAKE_EXTRA` はその引数より後ろに追加されるため、同じ変数を含む CMake 引数を指定すればエンジン側の指定を後から変えられます（`packaging/build_hip_linux.sh:60-68`）。CMake は非空の `STRATA_GGML_DIR` を ggml の root とし、空なら `third_party/strata-ggml` を選びます（`cmake/strata_ggml.cmake:6-13`）。
-- `VISION_ONLY` の有無にかかわらず、このスクリプトは CPU reader と HIP reader の構成・ビルドへ進みます。非空の `LLAMA` は両方へ `-DLLAMA_DIR=...` として渡され、空なら `tools/vision/CMakeLists.txt` の同梱 `third_party/strata-llama` の既定値が使われます（`packaging/build_hip_linux.sh:60-85`; `tools/vision/CMakeLists.txt:18-20,122`）。
-- `OUT` の下に既存の CMake build directory/cache がある場合、スクリプトが空値のときに `-DSTRATA_GGML_DIR` / `-DLLAMA_DIR` を渡さないため、以前の構成で保存された値が残り得ます。したがって空または未設定でも、再利用 build directory では同梱ツリーが選ばれるとは限りません。明示的な非空値はそれぞれの `-D` として構成コマンドに渡されます（`packaging/build_hip_linux.sh:24-25,63-65,71-81`; `cmake/strata_ggml.cmake:8-13`; `tools/vision/CMakeLists.txt:18`）。
-- この設定は Linux HIP パッケージビルド経路に限られます。モデル状態、生成時 CLI、サーバーモード、GPU の実行時選択を `LLAMA` が変える読み取り箇所はありません。
+- Linux HIP 用パッケージスクリプト `tools/packaging/build_hip_linux.sh` を使うこと。スクリプト自体が `VARIANT` と ROCm root `HP` を必須にします（同:22,26）。
+- `VISION_ONLY` が空であること。設定されているとエンジン configure/build 部分を丸ごと飛ばし、この値は参照されません（同:60-70）。
+- `LLAMA` が空でないことに加え、CMake 条件で真と評価されること。そうでなければ vendored tree が選ばれます（同:24-25; `engine/cmake/strata_ggml.cmake:11-16`）。
+- 指定 tree を実際に ggml の subproject として追加するには `STRATA_NATIVE_EXPERTS` が ON で、かつ `STRATA_BUILD_TESTS` が ON または `STRATA_OWN_CPU_QUANT` が OFF である必要があります。`STRATA_NATIVE_EXPERTS` と `STRATA_OWN_CPU_QUANT` の既定値は ON です。スクリプトは `STRATA_BUILD_TESTS=OFF` を渡すため、既定構成では root を解決しても ggml subproject を追加しません。`STRATA_CMAKE_EXTRA` などで条件を変えない限り、`LLAMA` override は既定の release engine build に実体として使われません（`engine/CMakeLists.txt:154-162,176-184,641-650`; `tools/packaging/build_hip_linux.sh:63-65`）。
 
 ## 実行時の詳細
 
-環境変数の読み取りはスクリプト起動時、`set -u` の直後のシェル展開で一度行われ、以後はシェル変数 `LLAMA` が使われます。起動後の環境変更を再読込する処理はありません。プロセス起動後の Strata 実行ファイルへの引き継ぎもなく、値は CMake configure のコマンドライン引数に変換されます（`packaging/build_hip_linux.sh:21-25,63-80`）。
+スクリプト開始時に一度シェル変数へ取り込み、エンジンの CMake configure 呼び出しでだけ引き渡します。Strata 実行ファイルへの設定転送や実行時再読込はありません。`VISION_ONLY` の場合は読み取った値を引数に使う経路がありません（`tools/packaging/build_hip_linux.sh:24-25,60-65,71-80`）。
 
-エンジン用 CMake 構成は `OUT/b`、画像 reader は `OUT/bv` と `OUT/bh` に構成されます。`VISION_ONLY` が非空の場合はエンジン構成・ビルドを飛ばしますが reader の構成には `LLAMA` が使われます（`packaging/build_hip_linux.sh:29,60-85`）。
+CMake 側では `STRATA_GGML_DIR` を cache PATH として宣言し、真ならその値、そうでなければ `engine/third_party/strata-ggml` を root に選びます（`engine/cmake/strata_ggml.cmake:11-16`）。スクリプトは `$OUT/b` を configure build directory として使い、既存の build directory を先に消しません。そのため同じ `$OUT/b` の CMake cache に過去の `STRATA_GGML_DIR` が残っている場合、`LLAMA` が未設定でも CMake 側の選択に残る可能性があります。新規 cache では未指定時に vendored root が選ばれます（`tools/packaging/build_hip_linux.sh:29,63-65`; `engine/cmake/strata_ggml.cmake:11-16`）。
 
 ## ログと測定値
 
-`LLAMA` 専用のログや値の警告はありません。構成ログは `$OUT/cfg.log`、`$OUT/cfg-vision.log`、`$OUT/cfg-vision-hip.log` にリダイレクトされます。各 configure/build の終了コードが非ゼロなら `chk` が `$OUT/build.status` に `ABORT ... failed (rc=...)` を記録してスクリプトを終了します。HIP reader が生成されなかった場合は `ABORT no strata-vision-hip` を記録し、HIP reader の build log の末尾も status に追記します（`packaging/build_hip_linux.sh:44-47,63-85`）。
+`LLAMA` 専用の status / 警告はありません。エンジン configure の stdout/stderr は `$OUT/cfg.log` に記録され、終了コードは `build.status` に `engine configured rc=<値>` として記録されます。configure が失敗すると同ファイルに `ABORT engine configured failed (rc=<値>)` を追記してスクリプトが終了コード 1 で止まります（`tools/packaging/build_hip_linux.sh:44-47,63-68`）。値を指定した場合の性能・正確性測定値は Strata ソース資料に見つかりません。
 
 ## 根拠
 
-- `packaging/build_hip_linux.sh:21-25` — シェルでの取り込み、未設定・空文字の扱い、エンジン用 `STRATA_GGML_DIR` 引数。
-- `packaging/build_hip_linux.sh:60-85` — `VISION_ONLY` 分岐、CMake 引数の組み立て、engine / CPU reader / HIP reader の構成と失敗処理。
-- `cmake/strata_ggml.cmake:6-13` — `STRATA_GGML_DIR` の cache 変数と同梱 ggml への fallback。
-- `tools/vision/CMakeLists.txt:18-20,122` — `LLAMA_DIR` の同梱既定値と llama.cpp tree の追加。
+- `tools/packaging/build_hip_linux.sh:10,21-25,60-80` — 変数の宣言・空値判定・CMake 引き渡し・適用範囲。
+- `engine/CMakeLists.txt:154-162,183-184,638-650` — build tests と CPU quant の既定値、および ggml configure 条件。
+- `engine/cmake/strata_ggml.cmake:7-17,19-60` — ggml root の選択と subproject 追加。

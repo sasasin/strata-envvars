@@ -1,51 +1,54 @@
 # `STRATA_ARENA_RAM_WAIT_S`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-通常の expert arena を読み込む前に、arena に必要な RAM が現在の利用可能量を上回っている場合、空き RAM が戻るまで待つ上限秒数を指定します。既定は 20 秒です。待機後も不足が続くときは RAM 不足の警告を記録しますが、それだけを理由に読み込みを拒否しません。値を読むのは Strata 本体の `ArenaExpertSource::open()` です（`src/core/expert_source.cpp:5864-5887`）。
+`ArenaExpertSource::open` が RAM 上の expert arena を読み込む直前、空き RAM が必要量に足りないときに空き RAM の再確認を続ける最大秒数を指定する。既定は 20 秒、`0` は待たずに次の判定へ進む。待機は RAM を確保したり必要量を減らしたりせず、読み込み元の選択にも単独では影響しない。待機後も不足する場合は、呼び出し側の `--mmap-experts` fallback が有効ならファイル読み込みへ切り替え、無効なら不足警告を残して arena の読み込みを続ける。読み取りは `engine/src/core/expert_source.cpp` の `ArenaExpertSource::open` にある（同ファイル 6445-6447、6560-6604）。
 
 ## 値と判定
 
-環境変数を読むのは、利用可能 RAM の取得に成功し、共有 arena でなく、かつ必要量 `need = want + blob` より RAM が少ない場合だけです。`getenv()` が未設定、または値が空文字なら既定の `20.0` 秒のままです（`src/core/expert_source.cpp:5864-5867,5878-5887`）。
+値は不足分岐に入った時点で `std::getenv` から読み、`std::strtod` で変換する。未設定または空文字なら 20 秒のまま。不正な文字列や範囲外なら明示的なエラーや警告を出さず、やはり 20 秒のまま。変換後の値は `end != w`（少なくとも一文字を変換）かつ `*end == '\0'`（文字列末尾まで消費）かつ `0.0 <= v <= 3600.0` のときだけ採用される（`engine/src/core/expert_source.cpp:6565-6570`）。
 
-空でない値は `std::strtod()` で変換されます。変換が一文字も進まない、文字列末尾まで消費しない、または変換値が `0.0` 未満か `3600.0` を超える場合は無効値として扱い、既定の 20 秒に戻ります。したがって `0` は即時続行、`0.5` は 0.5 秒、`3600` は 1 時間です。負数、3600 超、`abc`、`10s`、末尾に空白などの余分な文字がある値は既定値に戻ります。`strtod` が受け付ける先頭空白や符号は許容されます。`NaN` や無限大は範囲比較を通らないため無効です。変換時の `errno` は検査していません。そのため、`strtod` が underflow で 0 を返し、文字列末尾まで変換した場合も 0 秒として受理されます（同 `src/core/expert_source.cpp:5882-5887`）。
+| 条件 | unset / 空文字 | 採用される値 | 既定値に戻る例 |
+|---|---|---|---|
+| RAM 不足の arena 経路 | unset と空文字はいずれも 20 秒 | `strtod` が全体を変換し、値が 0〜3600 秒（両端を含む）。例: `0`、`1`、`20`、`3600` | `-1`、`3601`、`true`、`false`、`0anything`、`20 `、`  ` |
 
-| 設定 | 待機上限 |
-|---|---:|
-| 未設定・空文字 | 20 秒 |
-| 数値として全体を変換でき、0〜3600 の範囲 | 変換値（0 は待機なし） |
-| 変換不能・余分な文字・範囲外 | 20 秒 |
-
-CLI 引数や設定ファイルによる上書きは、この読み取り経路にはありません。値は `open()` が RAM 不足を検出した時点で読み取られ、関数内にも static cache はありません。従って、同一プロセスでも `open()` の呼び出しごとに条件を満たせば読み直します。プロセス起動後の環境変更は、次の `open()` がこの分岐に入る場合に限り反映されます。
+`strtod` のため先頭の空白や符号付き数値は変換可能だが、末尾の空白・文字は全体一致条件を満たさない。大文字小文字の真偽値比較はない。`errno` は調べず、範囲条件だけで採否を決める。範囲内の `0` は採用されるが、待機関数を呼ぶ条件が `wait_s > 0.0` のため直ちに待機を省略する（同ファイル 6566-6574）。CLI にこの秒数を上書きする引数はなく、arena 不足時の判定における RAM 量や fallback 可否は別の条件で決まる（同ファイル 6533-6537、6590-6604）。
 
 ## 有効になる条件
 
-- expert arena 経路を使用し、通常の arena 読み込みへ進むこと。
-- `shared_arena_file` が空であること。`--shared-expert-arena` による共有 arena ではメモリ確認・この環境変数の読み取りをスキップします（`src/core/expert_source.cpp:5863-5865`）。
-- `STRATA_ARENA_MMAP` による既存の padded `experts.bin` の読み取り専用 mmap が成功して早期 return していないこと。mmap 成功時はこの待機処理に入りません（`src/core/expert_source.cpp:5822-5854`）。
-- OS のメモリ情報取得に成功すること。Linux では `MemAvailable` と可視 cgroup 制限を考慮し、Windows では物理メモリの利用可能量、macOS では free/inactive/purgeable、その他の対応 Unix 系では `_SC_AVPHYS_PAGES` を使います（`src/core/expert_source.cpp:401-508`）。
+- 実行経路が `ArenaExpertSource::open` による RAM arena の構築であること。generate 側は `o.mmap_experts` が false のとき arena を開く（`engine/src/program/generate.cpp:8548-8550、8799-8801`）。最初から `--mmap-experts` を選んだ実行は対象外。
+- `experts.bin` が `STRATA_ARENA_MMAP` によって正常に読み取り専用 mmap され、`open` が早期 return しないこと。Windows ではこの mmap 分岐自体を無効化している（`engine/src/core/expert_source.cpp:6490-6523`）。
+- `shared_arena_file` が空で、`host_available_memory` が RAM 情報を取得できること。共有 arena のとき、または RAM 情報を取得できないときは RAM 判定ブロックに入らず、この変数も読まれない（同ファイル 6533）。
+- cgroup の hard memory limit が arena の必要量を満たすこと。hard limit による拒否または fallback 判定が先に行われるため、その分岐では待機しない（同ファイル 6543-6559）。
+- RAM の空きが arena 必要量より少ないこと。十分なら待機も変数の読み取りも行わない（同ファイル 6560-6566）。
+- プロセス実行中に環境を変更しても、この分岐で読み取った後の待機には反映されない。起動時の static cache はなく、該当する `open` 呼び出しごとに不足時だけ読む（同ファイル 6566-6574）。
 
-OS/backend、CLI、モデル状態によって待機秒数自体の解釈が変わる分岐はありません。Linux で cgroup 上限そのものが arena 必要量より小さい場合は、この待機に入る前に `open()` が失敗します。また、利用可能 RAM の測定に失敗した場合はメモリ不足判定ブロックを実行せず、待ちません（`src/core/expert_source.cpp:5864-5877`）。
+RAM が不足して待機が終わった後も、`give_back_ram` callback があれば RAM を返す処理を行い、空き量を再取得してから不足を判定する。CLI 側では `--ple-io ram` を明示した場合、共有 arena 指定時、または `STRATA_ARENA_RAM_FALLBACK=0` の場合など fallback が許可されない。fallback が許可され、なお不足する場合は `--mmap-experts` 相当へ切り替える（`engine/src/program/generate.cpp:8526-8534、8788-8801、8805-8829`）。
 
 ## 実行時の詳細
 
-`detail::wait_for_ram()` は初回に利用可能 RAM を再測定し、その後 0.25 秒間隔で再測定します。上限に達するまで RAM が戻らなければ終了します。進捗通知間隔は 5 秒です（`src/core/expert_source.cpp:133-149,5890-5901`）。待機中は stderr に次の形式の行を出します（実際の書式文字列）:
+不足時は `detail::wait_for_ram(need, wait_s, 0.25, 5.0, ...)` を呼ぶ。空き RAM を 0.25 秒間隔で再取得し、最大時間まで待つ。待機中は最初の確認時と以降 5 秒ごとに進捗ログを出す。必要量に届けば arena の読み込みへ進み、届かなければ `give_back_ram` がある場合はそれを実行し、もう一度 RAM を調べる（`engine/src/core/expert_source.cpp:6571-6604`。待機ループは同ファイル 146-162）。
+
+`STRATA_ARENA_RAM_WAIT_S=0` または有効な小数値は待機時間だけを変える。最終的な不足時に fallback するかは `fall_back_when_ram_short` に従い、許可時は `open` が false と `ram_short_` を返して呼び出し側がファイル経路を選ぶ。許可されない場合は arena の読み込みを続け、RAM 不足警告を記録する（`engine/src/core/expert_source.cpp:6604-6676`; `engine/src/program/generate.cpp:8805-8829`）。
+
+## ログと測定値
+
+待機に入ると stderr に次の形式で出る。`wait_s` と `waited` は `%.0f` で表示されるため、ログ上は秒未満が丸められる。
 
 ```text
-strata generate: the expert arena needs ... GiB of RAM and ... GiB is available; waiting up to ... s for it (another engine still exiting?) - ... s so far (STRATA_ARENA_RAM_WAIT_S changes this)
+strata generate: the expert arena needs ... GiB of RAM... and ... GiB is available; waiting up to ... s for it (another engine still exiting?) - ... s so far (STRATA_ARENA_RAM_WAIT_S changes this)
 ```
 
-必要量に達すると stderr に `strata generate: ... GiB of RAM is available now (after ... s): loading the expert arena` を出します（`src/core/expert_source.cpp:5902-5905`）。時間切れ後も不足なら、`ram_warning_` に必要量・利用可能量・不足量を含む警告を格納し、arena の読み込みへ進みます。利用可能量が必要量の半分未満なら、警告にはメモリ回収でマシン全体が stall する可能性などが加わります（`src/core/expert_source.cpp:5907-5920`）。呼び出し元は読み込み後にこの内容を stderr の `strata generate: WARNING: ...` として出します（`src/program/generate.cpp:6735-6742,6761-6763`）。
+必要量に届いた場合は stderr に `strata generate: ... GiB of RAM is available now (after ... s): loading the expert arena` と出る（`engine/src/core/expert_source.cpp:6578-6588`）。`0` の場合は待機進捗・待機成功ログを出さない。タイムアウト後も不足し fallback 可能なら、generate は stderr に `strata generate: not enough RAM for the expert arena (...)` と出し、`--serve` の場合は同じ案内を stdout にも出してファイル読み込みへ切り替える。fallback が許可されない場合の不足警告文は `the expert arena needs ...` で、空き量が必要量の半分未満ならメモリー回収による停止の説明が追加される（`engine/src/program/generate.cpp:8805-8819`; `engine/src/core/expert_source.cpp:6663-6674`）。
 
-`docs/DETAILS.md:711-718` も既定 20 秒、`0` で即時続行、待機後も不足なら警告付きで読み込むと説明しており、実装と一致します。同資料にあるサーバーの旧 engine 終了待ち（最大 120 秒）は別の待機経路であり、この環境変数の対象ではありません。
+`docs/DETAILS.md:848-855` は既定 20 秒、`0` で即時に次へ進むことと、別 engine の終了待ちを説明している。ソースでは環境変数に 0〜3600 秒の上限があり、待機後も不足する場合は条件に応じて fallback または警告付き読み込みとなる。
 
 ## 根拠
 
-- 値の既定値、変換、範囲、RAM 不足時の呼び出し: `src/core/expert_source.cpp:5864-5887`
-- 待機間隔、再測定、タイムアウト、成功・進捗ログ: `src/core/expert_source.cpp:133-149,5890-5905`
-- 不足時の警告内容と続行: `src/core/expert_source.cpp:5907-5920`
-- OS ごとの利用可能 RAM の取得: `src/core/expert_source.cpp:401-508`
-- 呼び出しと stderr への警告出力: `src/program/generate.cpp:6735-6742,6761-6763`
-- 説明資料との照合: `docs/DETAILS.md:711-718`
+- 値の読み取り・変換・範囲・待機呼び出し・ログ: `engine/src/core/expert_source.cpp:6560-6588`
+- 空き RAM の再確認ループ: `engine/src/core/expert_source.cpp:146-162`
+- hard limit と不足後の fallback / 警告経路: `engine/src/core/expert_source.cpp:6533-6559、6590-6676`
+- arena 呼び出し条件と RAM fallback の設定: `engine/src/program/generate.cpp:8524-8547、8788-8829`
+- 説明資料との照合: `docs/DETAILS.md:848-855`

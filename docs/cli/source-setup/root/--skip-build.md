@@ -1,58 +1,51 @@
-# `--skip-build`
+# `setup.py --skip-build`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 調査）。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat` などから委譲） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat`（セットアップのルート） |
 | オプション | `--skip-build` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。指定時 `True`、省略時 `False` |
+| 値 | 値を取らないフラグ |
 
 ## 役割
 
-このオプションは parser に受理されますが、この commit の `setup.py` では解析結果 `a.skip_build` を参照する処理がありません。したがって、名前から想像される「ビルドをスキップする」効果はソース上で確認できず、現在は実行動作を変えない受理済みフラグです。parser のヘルプ表示からも隠されています。
+現行 parser は `--skip-build` を受理しますが、値を参照する処理がなく、エンジンのビルドを抑止しません。ビルドを選ぶ既知のフラグは `--build` で、通常のエンジン選択では `a.build` により既製エンジンを使わずビルド経路へ進みます。したがって `--skip-build` にビルド回避の効果を期待できません。
 
 ## 使い方
 
-Linux で `setup.sh` 経由に渡す例です。`--check` は PC の確認だけを行います。`--skip-build` 自体が確認処理やビルドの有無を変えるわけではありません。
-
 ```sh
-./setup.sh --skip-build --check
+# parser は受理するが、ビルド選択への効果はない
+./setup.sh --skip-build
 ```
 
 ## 値と既定値
 
-- 値は不要です。値を続けて指定する形式ではありません。
-- `argparse` の `store_true` により、指定時は真、未指定時は偽です。
-- 明示的な値検証や追加の条件分岐はありません。未知の引数・必要な値の不足など、他の parser エラーは通常の `argparse` の処理対象です。
-- `help=argparse.SUPPRESS` のため `setup.py --help` の通常のオプション一覧には表示されません。
+値を取らない `argparse` の `store_true` フラグです。指定時は parser の属性 `a.skip_build` が真になり、省略時は既定値の偽です。明示的な値は受け付けず、同じフラグを複数回指定しても真のままです。ヘルプ表示は `argparse.SUPPRESS` により抑制されています（`terminal/setup.py:11384-11385`）。
 
 ## 実行時の動作
 
-`setup.py` の root parser はこのフラグを受け取りますが、ソース全体で `skip_build` の参照は定義箇所だけです。実際のビルド選択は別の `a.build` を使い、`--build` が指定された場合は既成エンジンを選ばずビルドへ進みます。AMD の一部経路でも `a.build` を見て既成エンジンの取得を切り替えます。このため `--skip-build` はこれらの判断に作用しません。
+この checkout の `terminal/setup.py` 内では `skip_build` / `skip-build` の出現は parser 宣言のみです。`a.skip_build` を読む箇所や、その値を別処理へ渡す箇所は確認できませんでした。通常のエンジン選択は `a.build` によって既製エンジン取得を飛ばし、エンジンをビルドするか決めています（`terminal/setup.py:9513-9542`）。また、`--update --build` では `a.build` が再ビルド指定として転送されます（`terminal/setup.py:8413-8427`）。
 
-また、CPU が AVX2 を持たない経路では setup が `a.build = True` に設定してソースビルドを選択します。この自動設定も `a.skip_build` を参照しません。更新モードのエンジン更新分岐も `a.build` を参照します。
+Intel SYCL 経路では `setup.py` が生の引数列を `sycl_setup` に渡し、同関数は `--backend` を除く引数を `engine/sycl/setup_intel.py` に転送します（`terminal/setup.py:9213-9236`, `terminal/setup.py:11414-11417`）。転送先も `setup.py` の `main()` を呼び出します（`engine/sycl/setup_intel.py:594-607`）。ただし、この経路でも `--skip-build` を参照する処理は見つからず、同フラグによるビルド抑止は確認できません。
+
+通常の macOS 委譲経路では `setup.py` が引数を `engine/metal/setup_mac.py` に渡します（`terminal/setup.py:11218-11219`, `terminal/setup.py:9206-9210`）。Metal 側 parser は未知引数を残し、「not used on a Mac」と警告します（`engine/metal/setup_mac.py:372-405`）。この条件では `--skip-build` は抑止フラグとして働かず、未使用引数として扱われます。
 
 ## 適用条件と副作用
 
-- Linux/Windows の wrapper は引数を `setup.py` へ渡すため、この parser 経路では受理されます。SYCL 経路も argv を保持して `setup.py` を再実行します。
-- macOS で `CONTROL` が無効の場合、`main()` は root parser を作る前に `metal/setup_mac.py` へ引数を渡します。このとき `--skip-build` が受理されるかは別 parser の実装に依存し、本調査ではその parser の挙動をこの root option のものとして扱いません。
-- `CONTROL` が有効な macOS 経路では root parser を通りますが、フラグを消費する処理は見つかりません。
-- このフラグ自身がファイル、ネットワーク、子プロセス、エンジン build に及ぼす副作用は確認できません。後続の setup 処理が行う副作用は、他の引数と実行環境によります。
+トップレベル parser が動く経路では受理されますが、ビルド抑止の効果は確認できません。通常の CUDA/HIP 等の処理でビルドを避ける効果、設定ファイル・環境変数との優先順位、または `--build` との特別な相互作用はソースにありません。macOS の通常委譲経路では未使用引数の警告が出ます。ビルド自体の有無は別の条件や `--build` によって決まり、このオプションはそれを変更しません。
 
 ## 出力とエラー
 
-`--skip-build` 固有の出力・警告・失敗経路は確認できません。parser が隠しオプションとして受理し、値を読むコードもないためです。引数として受理されること以外の効果はありません。
+`terminal/setup.py` の parser ではこのフラグ固有の警告・エラー・終了コードは定義されていません。macOS の委譲先は未認識の残余引数を警告として出力し、処理を続けます（`engine/metal/setup_mac.py:403-405`）。それ以外の具体的な出力や失敗経路は、このオプション単独の分岐がないため確認できません。
 
 ## 根拠
 
-- parser 定義（`store_true`、ヘルプから抑制）と直後の parse: `setup.py:9211-9212`。
-- root parser より前に通常 macOS 経路を別 setup へ委譲: `setup.py:9068-9070`。root parser を通過後の Control Mac / SYCL 分岐: `setup.py:9220-9225`。
-- 更新時のエンジン取得は `a.build` で分岐: `setup.py:7034-7038`。
-- AMD Windows の既成エンジン選択、および通常経路の既成エンジン／ソースビルド選択: `setup.py:7779-7799`。
-- CPU 条件により `a.build` を自動設定: `setup.py:9529-9540`。
-- setup wrapper が `setup.py` に引数を渡す例: `setup.sh:9-12`、`START-HERE.bat:44-54`。SYCL setup は argv を再利用して `setup.py` を呼び直す: `sycl/setup_intel.py:547-560`。
-
-調査では `setup.py` の全参照検索を行い、`skip_build` は parser 定義以外に見つかりませんでした。別の OS / Control モード固有 parser の解釈は、この root parser からは確認していません。
+- `terminal/setup.py:11384-11385` — `store_true`、ヘルプ非表示、parser 実行。
+- `terminal/setup.py:9513-9542` — 通常のエンジン選択は `a.build` を参照。
+- `terminal/setup.py:8413-8427` — update 時の再ビルド指定も `a.build` を使用。
+- `terminal/setup.py:9213-9236`, `terminal/setup.py:11414-11417`, `engine/sycl/setup_intel.py:594-607` — SYCL 経路の引数転送。
+- `terminal/setup.py:11218-11219`, `terminal/setup.py:9206-9210`, `engine/metal/setup_mac.py:372-405` — macOS の委譲と未知引数警告。
+- `docs/cli/README.md:1652-1710` — `source-setup` ルート階層の索引リンクと配置スコープ。

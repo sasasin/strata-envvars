@@ -1,39 +1,48 @@
 # `API_KEY`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。対象は Strata 所有コード。Docker 起動スクリプトで使われる変数であり、通常の engine/server プロセスがこの名前を直接読む設定ではない。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-Docker イメージの標準起動で、クライアントが送る API key を指定します。entrypoint は値を `STRATA_LAUNCH_KEY` に移し、`strata launch --api-key-env STRATA_LAUNCH_KEY` で CLI に渡します。CLI はその環境変数を読み、起動設定の `api_key` に設定します。コンテナの healthcheck は API_KEY の値を `Authorization: Bearer ...` に使います（`docker/entrypoint.sh:225-226,278-282`; `strata_cli/launch/cmd.py:131,270-276`; `docker/healthcheck.sh:4-14`）。
+Docker イメージの起動スクリプトで、コンテナ内の `strata launch` に渡す API キーを指定する変数。`tools/docker/entrypoint.sh` が値を選び、非空なら `STRATA_LAUNCH_KEY` と `--api-key-env STRATA_LAUNCH_KEY` を使って `strata launch --no-tui --access lan` に渡す（`tools/docker/entrypoint.sh:177-185,247,299-304`）。`strata launch` は指定された環境変数を読み、空または未設定ならエラー、値があれば起動設定の API キーに採用する（`terminal/strata_cli/launch/cmd.py:288-301`）。
 
-この `API_KEY` を直接読むのは Docker の entrypoint と healthcheck です。`serve/server.py` の通常サーバー起動で読む環境変数は別名の `STRATA_API_KEY` です（`serve/server.py:9013-9014`）。Docker entrypoint は `API_KEY` を `STRATA_API_KEY` として渡さず、launch CLI の `STRATA_LAUNCH_KEY` 経由で設定します。
+この名前を直接読む実装は Docker 用シェルスクリプトにあり、通常の Strata CLI や engine が `API_KEY` を直接読む経路は見つからない。Docker Compose の NVIDIA / Intel / AMD 定義はホストの `API_KEY` をコンテナへ渡す（`tools/docker/compose/docker-compose.nvidia.yml:23-24`、`docker-compose.intel.yml:21-23`、`docker-compose.amd.yml:21-23`）。
 
 ## 値と判定
 
-| `API_KEY` の状態 | entrypoint の処理 |
-|---|---|
-| 未設定または空文字 | 空として扱う。`API_KEY_FILE` に非空のパスがあればそのファイルへ進む。ファイルも指定されない場合は `strata launch` に key を渡さず、標準起動で key がなければ Strata が生成する。 |
-| 非空 | その文字列をそのまま key として優先する。長さが16文字未満なら stderr に短い key の警告を出すが、起動を拒否したり値を変更したりはしない。 |
+| 条件 | `API_KEY` の扱い | 結果 |
+|---|---|---|
+| 未設定または空文字 | `key="${API_KEY:-}"` で空として扱う | `API_KEY_FILE` が非空ならそちらを読む。そうでなければ `--api-key-env` を渡さず、`strata launch` 側の LAN 向けキー選択へ進む（`tools/docker/entrypoint.sh:178-182,247`; `terminal/strata_cli/launch/cmd.py:402-411`）。 |
+| 非空 | 文字列をそのまま `key` に代入 | `API_KEY_FILE` より優先し、`STRATA_LAUNCH_KEY` として launch に渡す（`tools/docker/entrypoint.sh:178-182,247,300-303`）。 |
+| 16 文字未満 | 拒否・切り詰めはしない | 起動スクリプトが `[!] API_KEY is short (<長さ> characters). Use 16 or more; 'openssl rand -hex 24' makes a good one.` を stderr に出し、その値で続行する（`tools/docker/entrypoint.sh:88-90`）。 |
+| 16 文字以上 | 長さによる追加処理なし | その値で続行する。 |
 
-`API_KEY` 自体について、entrypoint は文字種、数値、空白、大文字小文字を検証せず、trim もしません。長さだけを警告判定に使います（`docker/entrypoint.sh:77-79,163-167`）。
+`API_KEY` 自体は数値・真偽値・文字種として parse されない。たとえば `0`、`false`、空白だけの非空文字列も、シェルの非空判定では設定値である。大文字小文字の変換、前後空白の除去、値の形式検証はない。短さの判定は長さだけで、境界は 16 未満で警告、16 以上で警告なし（`tools/docker/entrypoint.sh:88-90,178-182`）。`strata launch --api-key-env` 側は参照先が空または未設定の場合だけ `ValueError` にし、その他の非空文字列を設定値にする（`terminal/strata_cli/launch/cmd.py:290-294`）。
 
-`API_KEY_FILE` は別の入力経路です。`API_KEY` が空の場合に限り参照され、指定パスが読めなければ `API_KEY_FILE=<path> cannot be read.` を stderr に出して終了コード1で停止します。読める場合は CR と LF をすべて除去した内容を key とします。除去後も空なら key は渡されません（`docker/entrypoint.sh:163-167`）。したがって優先順位は、非空の `API_KEY`、非空の `API_KEY_FILE` 内容、既存 preset の設定または Strata の key 生成です。
-
-CLI の `--api-key-env` 側も、指定した環境変数が未設定または空なら `The environment variable STRATA_LAUNCH_KEY is empty or not set.` の `ValueError` になります。ただし entrypoint は key が非空の場合にだけこのオプションを追加します（`strata_cli/launch/cmd.py:270-276`; `docker/entrypoint.sh:225-226`）。
+`API_KEY` が空で `API_KEY_FILE` が非空なら、起動スクリプトはそのファイルを読める必要があり、内容からすべての CR と LF を削除する。読めなければ `[X] API_KEY_FILE=<path> cannot be read.` を stderr に出して終了コード 1 で停止する。読めたファイルが空ならキーなしとして扱う（`tools/docker/entrypoint.sh:54,178-182,247`）。
 
 ## 有効になる条件
 
-- Docker イメージを通常のサーバー起動経路で起動する場合に有効です。entrypoint は `launch` 用の引数を組み立てます（`docker/entrypoint.sh:169-170`）。Compose の NVIDIA / AMD / Intel 定義は `API_KEY` をコンテナ環境へ渡し、値が空なら空文字を設定します（`docker/compose/docker-compose.nvidia.yml:23`; `docker/compose/docker-compose.amd.yml:22`; `docker/compose/docker-compose.intel.yml:22`）。
-- `docker run IMAGE strata ...` や `docker run IMAGE sh` のように別コマンドを指定した場合、entrypoint は標準起動処理を通らず、そのコマンドを `exec` します。この経路では entrypoint による `API_KEY` の読み取り・変換はありません（`docker/entrypoint.sh:53-56`）。
-- key が非空なら、entrypoint は launch CLI に `--api-key-env STRATA_LAUNCH_KEY` を追加し、その子プロセスに値を設定して起動します。CLI で `--no-api-key` は追加されないため、CLI の既存 preset に key があっても与えた key が `s.api_key` に設定されます（`docker/entrypoint.sh:225-226,278-282`; `strata_cli/launch/cmd.py:270-283`）。
-- API_KEY が空で `API_KEY_FILE` も使わない初回起動では、entrypoint は launch CLI に key を指定しません。起動後に `strata launch --show-key --preset "$PRESET"` の出力を `/data/state/api-key`（または `STRATA_KEY_FILE` で指定したパス）へ保存し、key が空だった場合は stderr に自動生成した旨と表示コマンドを警告します（`docker/entrypoint.sh:32,293-299`）。保存済み preset が使われる再起動では、その設定との関係も含めて launch CLI の preset 動作に従います。
+- Docker イメージの既定起動（引数なし、または `run` / `serve`）を通ること。`entrypoint.sh` はそれ以外のコマンドを早期に `exec` するため、その経路では `API_KEY` を選択・転送しない（`tools/docker/entrypoint.sh:68-71`）。
+- `API_KEY` が空なら `API_KEY_FILE` が代替入力になる。両方から非空の値を得られない場合、起動スクリプトは API キー用 CLI 引数を付けず、`strata launch` が LAN アクセス向けの保存済みキーを維持するか、新しいキーを作る（`tools/docker/entrypoint.sh:178-182,247`; `terminal/strata_cli/launch/cmd.py:402-411`）。
+- `API_KEY` が非空なら `API_KEY_FILE` と保存済みプリセットのキーより優先される。`strata launch` は `--api-key-env` の値を `s.api_key` に代入し、`--no-api-key` が同時に指定された場合もキーを保持するコードだが、Docker 起動スクリプトは `--no-api-key` を付けない（`terminal/strata_cli/launch/cmd.py:288-301`; `tools/docker/entrypoint.sh:184-185,247`）。
+- Compose 定義では `${API_KEY:-}` を使うため、Compose 側で値を省略した場合は空文字としてコンテナへ渡る。スクリプト上は未設定と同じ分岐になる（`tools/docker/compose/docker-compose.nvidia.yml:23-24`、`docker-compose.intel.yml:23`、`docker-compose.amd.yml:23`）。
 
 ## 実行時の詳細
 
-entrypoint 起動時に `API_KEY` を shell 展開して判定します。`API_KEY` の読み取り結果は entrypoint 内の `key` 変数に保持され、その値は launch CLI の子プロセスを開始するときだけ `STRATA_LAUNCH_KEY` として渡されます。entrypoint は環境変数を後から再読込しません。Docker の healthcheck は別プロセスとして実行され、その都度 `API_KEY` を読み、空なら `STRATA_KEY_FILE`（既定 `/data/state/api-key`）の key を使います。key があれば Bearer header を付けて `http://127.0.0.1:${PORT:-8080}/v1/models` を4秒 timeout で要求し、HTTP 200 かつ `data` が非空の場合だけ成功します。例外は `not healthy: ...` を stderr に出して失敗します（`docker/healthcheck.sh:4-17`）。
+`entrypoint.sh` の起動ごとに環境を参照する。`API_KEY` の値は起動時の長さ警告（`tools/docker/entrypoint.sh:88-90`）と、後段のキー選択（`tools/docker/entrypoint.sh:177-182`）で読み直される。起動後に環境変数を変更しても、すでに選択した `key` や起動中の launch には反映されない。
 
-entrypoint は起動後、key file を `umask 077` の下で書きます。保存に失敗するか空ファイルなら削除を試みます。標準の Dockerfile はこの healthcheck を30秒間隔、8秒 timeout、3 retry で登録しています（`docker/entrypoint.sh:293-299`; `Dockerfile:109`）。
+値を得た場合、スクリプトは `--api-key-env STRATA_LAUNCH_KEY` を引数に加え、launch 子プロセスの環境だけに `STRATA_LAUNCH_KEY="$key"` を設定して起動する（`tools/docker/entrypoint.sh:247,299-304`）。CLI はその変数を launch の設定へ読み込む（`terminal/strata_cli/launch/cmd.py:290-301`）。launch が正常終了すると、スクリプトは `strata launch --show-key --preset "$PRESET"` の出力を既定 `/data/state/api-key`（または `STRATA_KEY_FILE` の指定先）へ権限 `077` の umask で保存し、空ファイルなら削除する（`tools/docker/entrypoint.sh:46-47,315-317`）。キー未入力で launch がキーを作った場合は「No API_KEY was set...」と表示して、表示方法も案内する（`tools/docker/entrypoint.sh:318-320`）。
+
+Docker healthcheck は実行のたびに `API_KEY`、次に読める `API_KEY_FILE`、最後に保存済みキーの順で選び、`/v1/models` へ Bearer 認証付き GET を行う。`API_KEY_FILE` が読めない場合はここでは停止せず、保存済みキーを試す。応答が HTTP 200 かつ `data` が空でないときだけ終了コード 0、それ以外や例外時は失敗終了し、例外内容を `not healthy: ...` と stderr に出す（`tools/docker/healthcheck.sh:4-18`）。これは healthcheck 用の読み取りで、サーバー起動時のキー選択とは別に行われる。
+
+## ログと測定値
+
+短い `API_KEY` の警告と `API_KEY_FILE` の読み取り失敗は上記のとおり stderr に出る。Docker 起動後に launch 子プロセスが非 0 で終了すると、entrypoint は `[X] strata launch stopped with code <終了コード> ...` を出してコンテナを終了する（`tools/docker/entrypoint.sh:310-312`）。キー未入力時の警告は launch が正常終了した後に出る（`tools/docker/entrypoint.sh:318-320`）。測定値は該当しない。
 
 ## 根拠
 
-候補一覧 `docs/envvars/000_envvers.md` の `API_KEY` は実読み取りを伴う候補です。全参照を調べた結果、設定値の実装は Docker entrypoint / healthcheck にあり、他の一致は Docker Compose の環境受け渡し、例・文書、テストやサンプルでした。`API_KEY` を直接読む engine/server の実装は確認できませんでした。Docker の説明も、16文字以上を推奨し、未指定時に key を作成して volume に保持する旨を記載しています（`docs/DOCKER.md:126,159-170`）。
+- Docker からの値選択・警告・CLI への転送・保存: `tools/docker/entrypoint.sh:46-47,68-71,88-90,177-185,247,299-320`
+- launch CLI による環境変数の読み取りと LAN 用キーの維持・生成: `terminal/strata_cli/launch/cmd.py:288-301,402-411`
+- healthcheck での別読み取り: `tools/docker/healthcheck.sh:4-18`
+- Compose からの環境変数受け渡し: `tools/docker/compose/docker-compose.nvidia.yml:23-24`、`docker-compose.intel.yml:23`、`docker-compose.amd.yml:23`

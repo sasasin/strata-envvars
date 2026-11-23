@@ -1,50 +1,47 @@
 # `STRATA_ATTN_BATCH`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリや GPU driver の環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 ## 役割
 
-SYCL backend の prompt prefill において、QSA attention の FP32 decode kernel に一度に渡す query 数の上限を設定します。設定値はその query 数分の attention scratch の確保量にも使われます。`sycl/src/prefill/prefill.cpp` に読み取り箇所があり、CUDA/HIP 側の Strata ソースに同名の読み取りはありません。
-
-実行時に tensor-core prompt attention が成功すれば、設定値はその計算の query 分割には使われません。`STRATA_PROMPT_ATTN_OLD` が設定されている場合、または tensor-core prompt attention が対応できず `false` を返す場合に、FP32 decode kernel の分割数として使われます。
+SYCL の prompt prefill で、旧式 FP32 QSA attention 経路が一度に処理する query 数を指定する。実際の値は `min(設定値, 現在の prompt chunk の token 数)` で、最低 1。QSA attention scratch の容量と prefill の領域見積もりにも同じ値が使われる。読み取りと適用箇所は `engine/sycl/src/prefill/prefill.cpp` の `attn_batch_setting()`、`attn_batch_for()`、`Prefill::init()`、QSA 処理部にある（`engine/sycl/src/prefill/prefill.cpp:764-772, 1674-1688, 1731-1735, 3873-3895`）。
 
 ## 値と判定
 
-`std::getenv` で値を取り、設定されていれば `std::atoll` で `long long` に変換します。変換後の値が 1 から 1024 まで（両端を含む）なら採用し、それ以外は 32 に戻します。環境変数の文字列全体が数値かどうかは検査しません。
+`std::getenv` で値を取得し、設定されていれば `std::atoll` で数値に変換する。変換結果が 1〜1024 のときだけ採用し、それ以外は 32 にする。未設定も 32。空文字、数値に変換できない文字列、`0`、負数、1025 以上は `atoll` の結果が範囲外になるため 32 に戻る。`atoll` は文字列全体の厳密な検証ではないため、数値の後ろに文字が続く場合も数値部分が変換される（例: `12xyz` は 12）。先頭の空白や符号も変換規則に従う。範囲内の値も prompt chunk 長 `T` で上限を受ける（`engine/sycl/src/prefill/prefill.cpp:764-772`）。
 
-| 環境変数の状態・値 | 判定結果 |
-|---|---:|
-| 未設定 | 32 |
-| 空文字 | `atoll("")` が 0 となるため 32 |
-| `1`～`1024` に変換される値 | 変換後の整数値 |
-| 0、負数、1024 より大きい値 | 32 |
-| 数字に変換できない文字列 | 32 |
-| 数字の後に文字が続く文字列 | 数字部分が 1～1024 ならその値（例: `128junk` → 128） |
+| 条件 | unset | 有効になる値（例） | 無効値・fallback の例 |
+|---|---:|---|---|
+| SYCL `Prefill` | 32 | `1`〜`1024`（例: `1`, `32`, `1024`） | 空文字、`0`, `-1`, `1025`, `true` は 32 |
+| chunk 長 `T` での適用 | 上記の 32 を使用 | `attn_batch = max(1, min(設定値, T))` | `T` より大きい設定値は `T` に制限 |
 
-`atoll` のため、先頭の空白や符号は通常の整数変換規則で扱われます。オーバーフローする入力の結果はこの実装で保証されていません。
-
-根拠: `sycl/src/prefill/prefill.cpp:707-715`。
+この変数を読むコードは SYCL prefill 実装にだけある。CUDA/HIP や他の backend で同名変数を読む箇所はない（`engine/sycl/src/prefill/prefill.cpp:764-767`）。
 
 ## 有効になる条件
 
-- この読み取りは `sycl/src/prefill/prefill.cpp` にあり、同ファイルは SYCL port の `strata_prefill` に組み込まれます（`sycl/CMakeLists.txt:265-277`）。トップレベルでは `STRATA_ENABLE_SYCL`（既定 `OFF`）が有効な場合に `sycl/` を追加します（`CMakeLists.txt:12-20`）。この環境変数の Strata 側の効果は SYCL build に限られます。
-- 実際の query 分割への効果は、モデルの prompt に QSA attention layer があり、その層で FP32 decode attention 経路が実行される場合に現れます。tensor-core prompt attention が成功する経路では、全 chunk の `T` query を一度に渡します（`sycl/src/prefill/prefill.cpp:3446-3477`）。
-- `STRATA_PROMPT_ATTN_OLD` が設定されていると、値の内容にかかわらず（空文字を含む）tensor-core prompt attention を使わず、FP32 decode attention 側へ進みます。その場合、`STRATA_ATTN_BATCH` は最大 query 数を決めます（同:3450,3470-3476）。変数が未設定でも decode 経路自体は必要に応じて選ばれ、batch の既定値は 32 です。
-- `T` が設定値より小さい場合、使用 batch は `T` に制限されます。`attn_batch_for(T)` は `max(1, min(setting, T))` を返します（同:712-715）。
-- CLI 引数によるこの値の上書きは確認できません。別環境変数 `STRATA_PROMPT_ATTN_OLD` はどの attention 経路を使うかに関わりますが、`STRATA_ATTN_BATCH` の値判定自体は変更しません。
+- SYCL backend の `Prefill` が使われること。`strata_prefill` は SYCL の CMake target に `src/prefill/prefill.cpp` を含む（`engine/sycl/CMakeLists.txt:304-311`）。
+- `Prefill::init()` と prefill の chunk sizing が `attn_batch_for(T)` を呼ぶため、SYCL prefill の scratch 領域確保・見積もりに反映される（`engine/sycl/src/prefill/prefill.cpp:1674-1688, 1731-1735, 2423-2475`）。
+- QSA layer の prompt attention で `old_attn` が設定されているか、`qsa_prompt_attn_batch(...)` が `false` を返して旧式経路に入る場合、query を `m.attn_batch` ごとに分けるループ幅として使われる。最適化経路が `true` を返せば、その呼び出しには chunk 全体 `T` が渡され、環境変数はその経路の query 数を分割しない（`engine/sycl/src/prefill/prefill.cpp:3873-3895`）。
+- `STRATA_PROMPT_ATTN_OLD` が存在すると `old_attn` が true になり、最適化経路を呼ばず分割ループへ進む。値の内容ではなく設定有無を見ており、空文字も有効（`engine/sycl/src/prefill/prefill.cpp:3853-3854, 3873-3876`）。
+- `STRATA_SYCL_TLA_ATTN` の build option が有効な場合、その分割ループ内でさらに `STRATA_SYCL_TLA_ATTN` の実行時値が先頭文字 `1` かを調べる。`nb == 32` かつ `m.cap == 2051` の場合に TLA kernel が成功すると、その batch はそこで処理される。build option は `STRATA_SYCL_AOT=bmg-g31` と Level Zero などを要求する（`engine/sycl/src/prefill/prefill.cpp:3877-3882`, `engine/sycl/CMakeLists.txt:313-335`）。
+- 旧式経路内で `STRATA_ATTN_PERCELL` が未設定、または先頭文字が `0` 以外なら per-cell kernel を使い、先頭文字が `0` なら `qsa_decode_attn_batch` を使う。どちらも同じ `nb` を処理する（`engine/sycl/src/prefill/prefill.cpp:3884-3895`）。
 
 ## 実行時の詳細
 
-`attn_batch_setting()` は `static` cache を使わず、呼ばれるたびに `getenv` と変換を行います。`attn_batch_for(T)` は chunk の確保サイズを数える `bytes_needed_impl` と、実バッファを組み立てる `Prefill::carve` の両方から呼ばれます。`carve` は `m.attn_batch` にその chunk の値を保存し、その値で `m.attn_scratch` を確保します（`sycl/src/prefill/prefill.cpp:1102-1111,1443-1485,2151-2184`）。従って通常の prompt 実行では値は起動時に一度だけ読むのではなく、サイズ見積もりやバッファ構築時に読み直され、構築後の chunk の実行には `m.attn_batch` が使われます。見積もりと構築の間にプロセス内で環境値を変更すると、両者が異なる値を読む可能性があります。
+`attn_batch_setting()` に static cache はなく、呼び出すたびに環境を読み直す。`attn_batch_for(T)` は `Prefill::init()` の carve 前と bytes-needed の計算からも呼ばれるため、設定は scratch 見積もりと確保の双方に反映される（`engine/sycl/src/prefill/prefill.cpp:764-772, 1674-1688, 2423-2475`）。プロセス実行中に環境値を変更した場合、次の helper 呼び出しから読み直されるが、既に確保した領域は自動で再確保されない。
 
-FP32 decode 経路は `t0` を `m.attn_batch` 刻みで進め、最後の batch は残り query 数までに制限して `qsa_decode_attn_batch` を呼びます。設定値を大きくすると scratch の query 次元も大きくなり、同じ scratch は chunk 内の呼び出しで再利用されます（同:1102-1111,1461-1485,3470-3477）。`bytes_needed` 系の計算も同じ値で QSA scratch のサイズを見積もるため、prefill のバッファ予算に反映されます。
+QSA scratch は `attn_batch * qsa_decode_attn_scratch_floats(cap, s)` 個の `float` として数えられ、同じサイズで確保される。従ってバッチ値を増やすと領域見積もりと scratch 消費量が増える。chunk より大きい値は chunk 長までに抑えられる（`engine/sycl/src/prefill/prefill.cpp:1220-1238, 1674-1688, 1731-1735, 2471-2475`）。
 
-この変数専用のログや警告はありません。バッファ構築に失敗した場合は `Prefill::init` が失敗し、上位の生成経路が `strata generate: <error>` を stderr に出して終了コード 1 を返します（`sycl/src/program/generate.cpp:12385-12389`）。借用バッファの再配置で chunk 用 device buffer が足りない場合は `prefill: device buffers for a chunk of ... tokens do not fit (...)` というエラー文字列を作ります（`sycl/src/prefill/prefill.cpp:1541-1582`）。値そのものに対する無効値警告やエラーはなく、範囲外値は既定値へ静かに fallback します。
+この値は CLI の `--prefill` chunk 長とは別で、`T` は選択済み chunk 長から渡される。`--prefill` の値をこの変数が上書きする処理はない（`engine/sycl/src/prefill/prefill.cpp:1674-1677, 3873-3876`）。
+
+## ログと測定値
+
+この変数の読み取りや fallback 自体を知らせるログはない。確保領域が足りず `Prefill::init()` の carve が失敗すると、`err` に `prefill: device buffers for a chunk of ... tokens do not fit (...)` を設定して false を返す。呼び出し側は `strata generate: ` を付けて stderr に出し、終了コード 1 で戻る（`engine/sycl/src/prefill/prefill.cpp:1613-1632`, `engine/sycl/src/program/generate.cpp:13329-13334`）。SYCL exception の場合は `exc.what()` とソース位置を stderr に出して `std::exit(1)` する（`engine/sycl/src/prefill/prefill.cpp:1635-1639`）。
 
 ## 根拠
 
-- 読み取り、変換、範囲制限、chunk による上限: `sycl/src/prefill/prefill.cpp:701-715`。
-- scratch サイズ見積もりと実確保: `sycl/src/prefill/prefill.cpp:1102-1111,1443-1485,2151-2184`。
-- tensor-core / FP32 decode の選択、`STRATA_PROMPT_ATTN_OLD`、FP32 query 分割: `sycl/src/prefill/prefill.cpp:3446-3477`。
-- SYCL target への組み込み条件: `CMakeLists.txt:12-20`, `sycl/CMakeLists.txt:265-277`。
-- 上位の init 失敗ログと終了: `sycl/src/program/generate.cpp:12385-12389`。
+- `engine/sycl/src/prefill/prefill.cpp:764-772` — 読み取り、既定値、範囲判定、chunk 長による制限。
+- `engine/sycl/src/prefill/prefill.cpp:1220-1238, 1674-1688, 1731-1735, 2423-2475` — scratch の見積もりと確保。
+- `engine/sycl/src/prefill/prefill.cpp:3853-3895` — QSA の最適化経路、分割、関連する環境条件。
+- `engine/sycl/src/prefill/prefill.cpp:1613-1639`; `engine/sycl/src/program/generate.cpp:13329-13334` — 失敗の返却、stderr、終了経路。
+- `engine/sycl/CMakeLists.txt:304-335` — SYCL prefill target と任意 TLA build option。

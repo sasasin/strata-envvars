@@ -1,63 +1,60 @@
 # `--kv-grow`
 
-調査対象: Strata commit `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 調査）。調査対象リポジトリの `git status --short --branch` は `## main...origin/main`。
+調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン） |
+| コマンド | `strata`（エンジン引数。通常の `generate.cpp` parser） |
 | オプション | `--kv-grow` |
-| 別名 | なし。無効化用の独立 option `--no-kv-grow` あり |
-| 値 | 値なしのフラグ |
+| 別名 | なし。反対動作の `--no-kv-grow` がある |
+| 値 | 値を取らない真偽フラグ |
 
 ## 役割
 
-QSA の K/V cache 用 VRAM を、起動時に `--max-context` 全体ぶん物理確保する代わりに、要求が使う cell 数に合わせて段階的に割り当てます。必要な VRAM は expert cache の slot を空けて K/V に渡し、短い要求の後は一部を expert cache に返して profile 上位の expert を補充します。K/V が保持できる論理上限は `--max-context` のままです。ソースの説明では slot の address を移動しないため、captured graph の参照を保つ設計です（`src/program/generate.cpp:8794-8800`）。
+要求が実際に使う分だけ K/V cache の物理 VRAM を割り当て、長い要求で必要量が増えたときに拡張する。条件を満たすと、拡張分の領域を expert cache から借り、そこにいた expert を cache の別 slot へ移動するか退避する。短い要求の後には K/V の領域を cache へ返す経路もある。これは `--max-context` 自体を縮める指定ではなく、未到達の context 分を開始時に全て物理確保しないための指定である（`engine/src/program/generate.cpp:11441-11447`, `11482-11496`, `11597-11605`）。
 
 ## 使い方
 
-engine の引数例です。`--tokens` は必須で、profile は `--expert-profile` で指定します。
-
 ```sh
-./strata --pack ./pack --tokens "1,2,3" --expert-profile ./profile.bin --kv-grow
+# pack と token 入力を指定して生成時に有効化する
+strata --pack pack/full --tokens "1,2,3" --kv-grow
 ```
 
-engine usage は `strata generate --pack DIR --tokens "1,2,3" [options]` の形を示しています（`src/program/generate.cpp:930-936`）。
+フラグ自体は値を取りません。`--no-kv-grow` は parser 上で同じ設定値を false に戻します（`engine/src/program/generate.cpp:3901-3904`）。
 
 ## 値と既定値
 
-- parser は値を読み取らず `--kv-grow` で有効、`--no-kv-grow` で無効にします。同じ実行引数に両方あれば、parser の走査順で後に現れた方が `kv_grow` の値になります（`src/program/generate.cpp:3067-3070`）。
-- 既定値は無効です（`src/program/generate.cpp:606`）。
-- `STRATA_KV_GROW` が空でない場合は CLI 値を上書きします。先頭文字が `0` なら無効、それ以外なら有効です。未設定または空文字なら CLI 値を使います。したがって `STRATA_KV_GROW=0` は `--kv-grow` を打ち消し、`STRATA_KV_GROW=1` は `--no-kv-grow` を打ち消します（`src/program/generate.cpp:5943-5946`）。
-- 初期割当量は `STRATA_KV_GROW_INIT` の正の整数値、または既定の 16384 cells です。増分・cache の下限 slot 数はそれぞれ `STRATA_KV_GROW_STEP`（既定 8192 cells）と `STRATA_KV_GROW_FLOOR`（既定 128 slots）で、正の値だけが採用されます（`src/program/generate.cpp:5955-5956`, `8815-8818`, `src/core/layer.cpp:625-626`）。これらの環境変数の個別仕様は [`STRATA_KV_GROW`](../../../envvars/STRATA_KV_GROW.md)、[`STRATA_KV_GROW_INIT`](../../../envvars/STRATA_KV_GROW_INIT.md)、[`STRATA_KV_GROW_STEP`](../../../envvars/STRATA_KV_GROW_STEP.md)、[`STRATA_KV_GROW_FLOOR`](../../../envvars/STRATA_KV_GROW_FLOOR.md) を参照してください。
+- `--kv-grow` の既定値は false で、指定すると true になります（`engine/src/program/generate.cpp:824`, `3903`）。
+- フラグの後に値は指定しません。余分な値は別引数として解釈され、未知の引数なら usage を表示して終了コード 2 になります（`engine/src/program/generate.cpp:3903-3904`, `4263-4268`）。
+- 複数回指定したときは parser が順に代入するため、最後の `--kv-grow` / `--no-kv-grow` が CLI 内の値になります（`engine/src/program/generate.cpp:3903-3904`）。
 
 ## 実行時の動作
 
-parser 受理後、起動時に次のすべてを満たす場合だけ elastic K/V を有効にします: 有効化が要求されていること、単一 GPU、`--kv-resident` が 0 以下（全 K/V を VRAM に置くモード）、`--expert-profile` の指定、resident CPU expert mode でないこと、expert cache が 0 でないこと、remote expert cache がないこと、VMM が利用可能であること、`--batch 0`、`--vram-elastic` 無効、`--peer-device` 無効。条件の判定と不成立時の警告は `src/program/generate.cpp:5940-5957` にあります。さらに実際の初期化には VMM range、residency table、RAM 上の expert residency、expert source がそろい、cache slot 数が floor より大きい必要があります（`src/program/generate.cpp:8810-8813`）。
+起動時に `STRATA_KV_GROW` が空でない値で設定されていれば、その先頭文字が `0` かどうかで有効・無効を決め、CLI の値より優先します。空または未設定なら `--kv-grow` / `--no-kv-grow` の結果を使います（`engine/src/program/generate.cpp:7647-7651`）。
 
-起動時には仮想 range を予約し、初期 cells 分だけ K/V pool を map します。要求長に応じて cells を `STRATA_KV_GROW_STEP` 単位に切り上げ、必要な pool を増やします。増加前に device work を静止させ、profile の下位 expert slot を空け、より上位の resident expert を空いた slot へ移せる場合は移し、必要な chunk を K/V に割り当てます（`src/program/generate.cpp:8828-8835`, `8856-8890`, `src/core/layer.cpp:654-675`）。通常の要求、park 済み会話の復元、session file の復元からも必要量に応じた grow が呼ばれます（`src/program/generate.cpp:14141-14147`, `14520-14526`, `13818-13827`）。
+要求された場合も、通常 parser では単一 GPU、`--kv-resident` が無効（0 以下）、expert profile 指定あり、CPU 側 expert residency を使わない、expert cache が有効、remote expert cache なし、VMM 利用可能、`--batch` が 0、`--vram-elastic` なし、`--peer-device` なし、という条件をすべて満たすときだけ K/V pool を elastic にします。条件を満たさない場合は標準エラーに無効化理由の要約を出し、通常の固定割り当てで進みます（`engine/src/program/generate.cpp:7651-7661`）。
 
-要求が短くなり、park 済み会話が必要とする長さも下回る場合は K/V を縮小し、解放した VRAM を expert cache に戻して profile 順に補充します（`src/program/generate.cpp:8937-8947`, `8964-9005`）。session file 復元時に grow できなければ復元を拒否します。復元後の device transfer 失敗では stdout に `FATAL` を出して engine は終了します（`src/program/generate.cpp:13818-13836`）。
+elastic pool は初期セル数（通常 16,384。`STRATA_KV_GROW_INIT` が正の値ならその値）から始まり、必要量を `STRATA_KV_GROW_STEP`（正の値があれば指定値、既定 8,192 cells）の単位に切り上げ、`--max-context` を上限として拡張します。cache から領域を借りる経路では、expert profile・residency table・expert source・VMM cache range が揃い、cache の slot 上限が floor を超える場合に限り cache slot を使います。揃わなくても elastic pool 自体は有効であれば新規 VRAM から成長し、cache は縮まりません（`engine/src/program/generate.cpp:11448-11474`, `engine/include/strata/core/kv_grow_rules.hpp:23-36`）。
+
+成長前に GPU 処理を静止させ、必要に応じて cache の expert を移動・退避し、K/V 用の VMM chunk を map します。cache が floor に達した後は新規 VRAM を使います。short request の後は、park 中の会話の保持設定がなければ K/V の余剰分を expert cache に返す処理があります（`engine/src/program/generate.cpp:11482-11595`, `19958-19968`）。
 
 ## 適用条件と副作用
 
-- `--kv-grow` を要求しても上記の起動条件を満たさなければ無効のまま進み、stderr に `--kv-grow is off (...)` の警告を出します（`src/program/generate.cpp:5952-5954`）。Metal、gfx906、ROCm 6 未満、または `STRATA_HIP_VMM=0` など VMM 非対応時も利用できません（`src/core/vmm.cpp:154-158`）。
-- K/V が増えると GPU expert slot が減り、profile に従って保持されなかった expert は RAM から CPU 計算に回る場合があります。profile が参照する expert data を RAM から読むため、CPU/RAM 側にも依存します（`src/program/generate.cpp:8794-8800`, `5940-5948`）。
-- 初期 pool の予約・map/clear や後続の grow が VRAM 不足等で失敗することがあります。pool の map/clear エラーは stderr に出ます（`src/core/layer.cpp:654-675`, `833-835`）。grow 失敗時も stderr に理由を表示し、呼び出し元の要求処理は失敗終了します（`src/program/generate.cpp:8917-8935`, `14142-14147`）。
-- 実行統計が有効な経路では、最終 K/V cells 数、grow/trim 回数、手放した expert 数、補充数を stdout に表示します（`src/program/generate.cpp:19005-19008`）。
+- `--kv-resident` による K/V streaming、複数 GPU、batch slot、remote expert cache、`--peer-device`、`--vram-elastic` とは併用できません。VMM が使えない環境でも有効化されません（`engine/src/program/generate.cpp:7651-7658`）。SYCL の VMM 実装は `vmm_available()` を常に false とし、この経路を利用不可にします（`engine/sycl/src/core/vmm.cpp:1-13`）。
+- K/V が増えると expert cache の保持数が減り、移動対象 expert の device-to-device copy、residency table 更新、VMM map/unmap が発生します。増加先の VRAM を確保できない場合は成長失敗になります（`engine/src/program/generate.cpp:11515-11568`, `11570-11595`）。
+- `STRATA_KV_GROW` は CLI の on/off より優先します。特に `STRATA_KV_GROW=0` は CLI で `--kv-grow` を付けても無効にし、空でない `0` 以外の文字列は有効化を要求します（`engine/src/program/generate.cpp:7647-7651`）。
+- 索引では Qwen3.6 専用 parser を別の `qwen36/` scope として扱っています。ここで調べた `generate.cpp` root parser の効果をその parser に適用できるかは、本調査では確認していません（`docs/cli/README.md` の Qwen3.6 scope、`docs/cli/000_cli_tools.md:10`）。
 
 ## 出力とエラー
 
-起動条件を満たさない場合の無効化警告はエラー終了とはせず、通常の割当経路に進みます。実行中の prompt grow 失敗は stdout に `ERR the K/V cannot grow to this prompt: no VRAM is left` を出して終了コード 1、park 済み会話の grow 失敗も同様にエラー出力して終了します（`src/program/generate.cpp:14142-14147`, `14522-14526`）。引数自体に値を付ける option ではなく、`--kv-grow` 固有の値 validation はありません。未知の引数は stderr に `unknown argument`、usage を出して parser が拒否します（`src/program/generate.cpp:3374-3378`）。
+要求があるのに適用条件を満たさない場合、`strata generate: --kv-grow is off (...)` を標準エラーへ出し、elastic pool を無効にします（`engine/src/program/generate.cpp:7656-7661`）。実行中の成長で expert 移動、residency table 更新、K/V map が失敗した場合はエラーを標準エラーに出し、呼び出し側が終了コード 1 で終了する経路があります（`engine/src/program/generate.cpp:11553-11568`, `11577-11595`, `23990-23996`）。フラグに値を付けるなど未知引数を渡すと、usage を出して終了コード 2 になります（`engine/src/program/generate.cpp:4263-4268`）。
 
 ## 根拠
 
-- parser と既定値: `src/program/generate.cpp:606`, `3067-3070`。
-- 表示される option 説明: `src/program/generate.cpp:960-963`。
-- 有効化条件・環境変数上書き・初期化: `src/program/generate.cpp:5940-5957`。
-- grow/trim の動作・失敗経路: `src/program/generate.cpp:8794-8935`, `8937-9006`。
-- K/V pool の VMM map と初期化: `src/core/layer.cpp:624-675`, `680-683`, `813-835`。
-- VMM 対応範囲: `src/core/vmm.cpp:154-158`。
-- option の索引と root scope: `docs/cli/README.md:1151-1158`。
-
-GPU/backend ごとの動作確認、ビルド、実行試験は行っていません。記述は上記 commit のソースに基づきます。
+- parser の既定値とフラグ登録: `engine/src/program/generate.cpp:824`, `3901-3904`。
+- help の用途・適用条件: `engine/src/program/generate.cpp:1236-1239`。
+- 環境変数優先順位と有効化条件: `engine/src/program/generate.cpp:7644-7661`。
+- 初期状態、拡張量、cache slot の移動・失敗: `engine/src/program/generate.cpp:11441-11595`、補助ロジック `engine/include/strata/core/kv_grow_rules.hpp:23-36`。
+- SYCL の VMM 非対応: `engine/sycl/src/core/vmm.cpp:1-13`。
+- 索引の tool-id と root / Qwen3.6 の parser scope: `docs/cli/000_cli_tools.md:10`、調査リポジトリ側 `docs/cli/README.md:1036-1041`, `1240-1243`。
