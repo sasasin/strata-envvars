@@ -45,7 +45,13 @@ this-repo 参照 1,298、ファイル名のみ 134、実在せず 1。
 python3 .agents/skills/strata-investigate/scripts/find-stale.py
 ```
 
-文書ごとの `doc_sha..基準 revision` で `git diff -U0` を引き、引用行範囲が hunk と交差するかを見る。
+文書ごとの `doc_sha..基準 revision` で `git diff -M -U0` を引き、引用行範囲が hunk と交差するかを見る。
+
+**diff は pathspec なしで全ツリーを引く**（`staleness_lib.hunk_data()`）。引用ファイルだけに絞ると、
+大きなレイアウト移動（Strata 0.2.16 の `src/` → `engine/src/` 等、コミット `4058aa782`）で old パスが
+diff に入らず rename 検出が壊れて「全文追加」の巨大 hunk になり、token-in-diff が本文の 9 割超まで
+量産された（2026-11-23 実測: 候補 2731 件のうち 1136 件が移動由来の誤検知）。`-M` を効かせれば
+純粋な移動 (R100) は hunk を出さず、内容が動いた箇所だけが候補になる。
 
 | 判定 | 意味 | 処置 |
 | --- | --- | --- |

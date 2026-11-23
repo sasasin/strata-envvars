@@ -90,6 +90,7 @@ def git(cwd: pathlib.Path, *args: str) -> str:
         ("git", "-C", str(cwd)) + args,
         capture_output=True,
         text=True,
+        errors="replace",  # 全ツリー diff は非 UTF-8 のバイナリ行を含むことがある
         stdin=subprocess.DEVNULL,
     )
     return result.stdout
@@ -160,15 +161,20 @@ class StrataTree:
         )
         return [line for line in out.split("\n") if line]
 
-    def hunk_data(self, since: str, paths: list[str]) -> dict[str, list[tuple[int, int, int, int, list[str]]]]:
-        """`since..HEAD` の hunk を行範囲と差分テキストで集める（1 回の diff）。"""
-        if not paths:
-            return {}
+    def hunk_data(self, since: str) -> dict[str, list[tuple[int, int, int, int, list[str]]]]:
+        """`since..HEAD` の hunk を行範囲と差分テキストで集める（1 回の diff、全ツリー）。
+
+        pathspec は使わない。引用ファイル（新パス）だけに絞ると、大きなレイアウト移動
+        （例: Strata 0.2.16 の src/ → engine/src/）では old パスが diff に入らず
+        rename 検出が壊れて「全文追加」の巨大 hunk になり、token-in-diff が量産される
+        （2026-11-23 実測: 候補 2731 件のうち 1136 件が移動由来の誤検知）。
+        全ツリーの diff にすれば -M が効き、純粋な移動 (R100) は hunk を出さない。
+        """
         per: dict[str, list[tuple[int, int, int, int, list[str]]]] = collections.defaultdict(list)
         cur_path: str | None = None
         pending: tuple[int, int, int, int] | None = None
         lines: list[str] = []
-        out = git(self.strata, "diff", "-U0", "--no-color", f"{since}..{self.revision}", "--", *paths)
+        out = git(self.strata, "diff", "-M", "-U0", "--no-color", f"{since}..{self.revision}")
         for line in out.split("\n"):
             if line.startswith("+++ b/"):
                 if cur_path and pending:

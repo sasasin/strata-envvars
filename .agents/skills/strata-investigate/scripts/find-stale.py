@@ -124,11 +124,11 @@ def stage1_2(
         sha for sha in by_sha if sha and git_ok(strata, "cat-file", "-e", f"{sha}^{{commit}}")
     }
     hunk_cache: dict[str, dict[str, list[tuple[int, int, int, int, list[str]]]]] = {}
-    for sha, keys in by_sha.items():
+    for sha in by_sha:
         if sha == revision or not sha or not git_ok(strata, "cat-file", "-e", f"{sha}^{{commit}}"):
             continue
-        files = sorted({path for key in keys for path in doc_cite_files(docs[key])})
-        hunk_cache[sha] = tree.hunk_data(sha, files)
+        # pathspec なしの全ツリー diff（rename 検出を壊さないため。staleness_lib.hunk_data 参照）
+        hunk_cache[sha] = tree.hunk_data(sha)
 
     for key, doc in docs.items():
         sha = str(doc["doc_sha"])
