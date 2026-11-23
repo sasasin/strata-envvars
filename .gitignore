@@ -4,3 +4,4 @@ __pycache__/
 .cli-grammar.json
 .strata-stale.json
 .strata-stale.removed.json
+.strata-stale.verified.json
