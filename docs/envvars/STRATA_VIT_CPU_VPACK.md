@@ -1,6 +1,6 @@
 # `STRATA_VIT_CPU_VPACK`
 
-調査対象: Strata `main` の HEAD `f6173c039578003038d98bbbd2c90c3ecb818146`（`2026-11-17` 時点）。
+調査対象: Strata `main` の HEAD `c77572806996349b49995e4f98d41b5294d36a21`（`2026-11-17` 時点）。
 
 ## 役割
 
