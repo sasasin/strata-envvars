@@ -30,6 +30,23 @@ PI_THINKING = "high"
 # 「Strata のソースだけを一次情報にする」調査基準から外れた挙動になりうるため、
 # print モードでは明示的に無効化する。
 PI_TOOLS = "read,bash,edit,write"
+# pi (DeepSeek) は調査基準の「全部挙げる」「結果まで追う」を字面どおりに広げ、
+# codex の 2〜3 倍の分量になりやすい。常用の pi 設定には手を入れず、
+# この起動に限って system prompt へ分量の歯止めを追記する。
+# 目安は codex が作った既存文書の分布（中央値 約 6KB、9 割が 8KB 以下）。
+PI_DOC_BUDGET_BYTES = 8000
+PI_APPEND_SYSTEM_PROMPT = f"""\
+# 調査文書の分量
+
+調査は依頼どおり丁寧に行い、文書は読み手が使う事実に絞って短く書く。
+
+- 文書 1 件の大きさは 4000〜{PI_DOC_BUDGET_BYTES} バイト（`wc -c`）を目安にする。調査基準の各項目は満たしつつ、各項目を数行で済ませる。
+- 対象以外の環境変数・CLI option・内部の仕組みは、名前と必要な値と参照先を 1 行で書くだけにする。それらの判定表、分岐の全列挙、内部データ構造の説明は書かない。
+- 同じ事実を複数の節に書かない。表に書いたことを本文で言い直さない。
+- `path:line` は主張の近くに置く。末尾の根拠節は本文の引用を繰り返さず、主要な箇所 5〜8 行にする。
+- 対象の挙動の理解に必要か迷う事項（隣接機能の詳細、同梱台帳との細かな差、自己テストの話など）は書かない。
+- 書き終えたら `wc -c` で文書の大きさを測る。{PI_DOC_BUDGET_BYTES} バイトを超えていたら、上の優先度の低いものから削り、`path:line` の根拠は残したまま {PI_DOC_BUDGET_BYTES} バイト以下にしてから作業を終える。
+"""
 
 FAILURE_LOG_LINES = 60
 
@@ -161,6 +178,8 @@ def build_command(config: RunnerConfig, prompt: str, last_message_path: Path) ->
         "--no-extensions",
         "--no-mcp",
         "--no-skills",
+        "--append-system-prompt",
+        PI_APPEND_SYSTEM_PROMPT,
     ]
     if config.tools:
         command += ["--tools", config.tools]
