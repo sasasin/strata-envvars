@@ -1,39 +1,47 @@
 # `FAMILY`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 ## 役割
 
-Docker image の通常起動で、同じ model size が複数の model family にある場合に、起動する family を選びます。Strata の C++ engine や Terminal は `FAMILY` 環境変数を直接読みません。Docker entrypoint が空でない `FAMILY` を `strata launch --family VALUE` に変換し、Terminal がその CLI 引数を model catalog と照合します。
+`FAMILY` は Docker コンテナの標準起動経路でモデルファミリーを指定する入力です。Strata の実行ファイルが環境変数 `FAMILY` を直接読む箇所は見つかりません。`tools/docker/entrypoint.sh` が値を `strata launch --family VALUE` に変換し、`strata launch` の CLI がモデルサイズの解決または保存済み preset のファミリー指定に使います。任意のコマンドをコンテナ引数で起動した場合は entrypoint の標準起動処理を通らず、この変換はありません（`tools/docker/entrypoint.sh:68-71, 184-185, 213-215`）。
 
 ## 値と判定
 
-| Docker entrypoint の値 | entrypoint の処理 |
-|---|---|
-| 未設定 | `--family` を追加しない。既存 preset の model 選択、または model 未指定時の通常の推奨処理に進む |
-| 空文字 | `${FAMILY:-}` が空になり、`--family` を追加しない |
-| 空でない文字列 | 値を変換せず `--family` の引数として渡す |
+| 条件 | 未設定 | 有効になる値（例） | 無効・未適用の値（例） |
+|---|---|---|---|
+| Docker entrypoint の標準起動 | `FAMILY` が未設定または空文字なら `--family` を追加しない。ファミリー選択を指定しない状態で後続処理へ進む | 空白以外を含む文字列はそのまま `--family` の値として渡す。たとえば `qwen`、`qwen36`、`hy4-flash`、`inkling-2-mini` | 空白だけの値も非空なのでそのまま渡る。entrypoint は trim、大小文字変換、値の検証をしない（`tools/docker/entrypoint.sh:213-215`） |
+| `strata launch` の CLI 解決 | `--family` がなければ、`--model` はカタログ上のファミリーから解決される。複数候補時は `qwen` があればそれを選び、なければ先頭候補 | カタログにあるファミリー名とモデルサイズの組み合わせ。`--model` と共に指定した場合、モデルサイズは大小文字を区別せず解決し、指定ファミリーがそのサイズを提供する必要がある | 知らないファミリー、またはそのファミリーが提供しないサイズは拒否される。空白や大文字小文字を自動補正しない（`terminal/strata_cli/launch/catalog.py:550-572`） |
 
-entrypoint は空かどうかだけを検査し、大小文字変換・前後空白の除去・値域検査をしません。`--model` も与えられると、Terminal は model 名を大小文字を無視して検索し、family は catalog の family ID と完全一致で検査します。指定 family が存在しない場合、またはその family が指定 model size を提供しない場合はエラーです。family を省略した場合、複数 family が同じ size を提供すると `qwen` を優先し、それ以外は catalog 上の最初の候補を選びます。`strata_cli/launch/catalog.py:397-428`。
+`FAMILY` の判定自体は文字列全体の比較や数値変換ではなく、entrypoint の `[ -n ... ]` による空文字判定です。未設定と空文字は同じく省略されます。値に trim や大小文字変換はありません。受理されるファミリー名はモデルカタログにより決まり、固定の環境変数専用リストではありません（`tools/docker/entrypoint.sh:213-215`, `terminal/strata_cli/launch/catalog.py:550-572`）。
 
 ## 有効になる条件
 
-- Docker entrypoint の通常サーバー起動経路で使われます。`docker run IMAGE strata ...` のように任意の Strata コマンドを指定した場合は、entrypoint が設定引数を組み立てる前にコマンドを `exec` するため、`FAMILY` はこの仕組みでは渡されません（`docker/entrypoint.sh:53-56`）。
-- 空でない `FAMILY` は `--family` に渡されますが、選択には対応する model が必要です。`MODEL` も指定したときはその組み合わせを catalog が検証します（`docker/entrypoint.sh:190-192`, `strata_cli/launch/cmd.py:225-230`）。
-- 保存済み preset に model があり、`MODEL` を省略して `FAMILY` だけを指定すると、Terminal は preset を読み込んだ後で family をその値に置き換えます（`strata_cli/launch/cmd.py:212-218,231-232`）。この分岐では `catalog.resolve()` による family の検証は行われず、後続処理での扱いは preset の model と指定 family に依存します。
-- preset に model がなく `FAMILY` だけを指定した場合、Terminal は model を選択せず、family も設定に適用しません。推奨 model が選ばれる通常経路では推奨 family/model が設定されます（`strata_cli/launch/cmd.py:231-232,372-384`）。Docker entrypoint はこの値が非空なら `have=1` としますが、`strata launch` の `have_choices` 判定に `--family` 単独は含まれません。そのため `--no-tui` で model/preset なしに family だけを渡す場合、選択がないとして失敗します（`docker/entrypoint.sh:190-192,243-251`; `strata_cli/launch/cmd.py:879-890`）。
+- Docker の標準起動経路であること。`docker run IMAGE strata ...`、`docker run IMAGE sh` など任意コマンド経路では entrypoint は `exec` で抜けるため、`FAMILY` を CLI 引数へ変換しません（`tools/docker/entrypoint.sh:68-71`）。
+- `FAMILY` が空でないこと。未設定・空文字では CLI オプションを付加しません（`tools/docker/entrypoint.sh:213-215`）。
+- ファミリー名が CLI のモデルカタログに存在し、指定した `MODEL` がある場合はそのファミリーで提供されていること（`terminal/strata_cli/launch/catalog.py:550-569`）。
+- 新規の非対話 Docker 起動では、ファミリーだけを指定してもモデル選択には足りません。entrypoint は `MODEL` も preset もなく `--no-tui` で起動するため、CLI は `--family` を「選択あり」と数えず失敗します（`terminal/strata_cli/launch/cmd.py:849-862`）。
+- 保存済み `PRESET` を指定する起動では preset が基礎設定となり、コマンドライン指定が上書きします。`FAMILY` があり `MODEL` がない場合、既存 preset にモデルがあればファミリーだけを置き換えます。サイズとファミリーの不一致は後続のモデル状態確認でエラーになります（`terminal/strata_cli/launch/cmd.py:215-239`; `tools/docker/entrypoint.sh:268-275`）。
 
 ## 実行時の詳細
 
-entrypoint は通常起動の引数列を作るときに `${FAMILY:-}` を評価し、非空なら `--family` と値を追加します。読み取りはこの shell 起動時の一度だけで、継続中の server request ごとに環境を再評価する処理はありません。family 値は Docker entrypoint から CLI 引数として引き渡され、CLI は model が指定されていれば preset の family/model よりもその model と family の組み合わせを採用します。model がない場合は、preset に model があると family だけを上書きします（`docker/entrypoint.sh:169-192`; `strata_cli/launch/cmd.py:212-232`）。
+entrypoint は標準起動時に `FAMILY` を一度シェル展開し、空でなければ `--family` と値を別々の引数として追加します。値をプロセス内キャッシュする処理や、実行中に再読込する処理はありません。変更は次のコンテナ起動時に反映されます。環境値は `strata launch` の子プロセスへ環境変数のまま渡すのではなく、CLI 引数として渡されます（`tools/docker/entrypoint.sh:184-185, 213-215, 295-308`）。
 
-`--model` と組み合わせた family が catalog にない場合は `There is no model family called ...`、その family に size がない場合は `... has no size ...` の `ValueError` になります。launch command はこれを stderr の `strata: ...` と終了コード 2 にします（`strata_cli/launch/catalog.py:412-424`; `strata_cli/launch/cmd.py:1048-1051`）。Docker entrypoint は launch の非 0 終了を `[X] strata launch stopped with code ...` として出し、その終了コードでコンテナを終了します（`docker/entrypoint.sh:289-292`）。
+CLI は preset の値を読み込んだ後、`--model` があれば指定ファミリーと合わせてカタログで解決します。`--model` がなく、既存 preset にモデルがある場合は `--family` で preset のファミリーを上書きします。新規起動で `FAMILY` だけを渡した場合、`settings_from_args` はファミリーだけの設定を作らず、`--no-tui` かつ非対話のため「何を起動するか指定されていない」として終了します（`terminal/strata_cli/launch/cmd.py:215-239, 849-862`）。
+
+ファミリーとサイズが解決されると、カタログのモデル行・モデル名・モデルフォルダーの選択に用いられ、Runner がその組み合わせを使ってモデル状態を確認しセットアップ／起動を進めます（`terminal/strata_cli/launch/catalog.py:550-584`; `terminal/strata_cli/launch/runner.py:1571-1585, 1666-1695`）。
+
+## ログと測定値
+
+entrypoint は `MODEL` が非空なら `Starting Strata: [FAMILY/]MODEL ...` を出力します。`MODEL` が空で model path もない場合は `Starting Strata: the recommended model ...` と表示し、FAMILY 名をこの行に含めません（`tools/docker/entrypoint.sh:299-303`）。
+
+`--model` と一緒に指定された無効なファミリー名や、サイズとの不一致は `Catalog.resolve` が `ValueError` にします。未知の名前では `There is no model family called '...'.`、組み合わせ違いでは `... has no size ...` のエラー文になります。CLI はこのエラーを stderr に `strata: ...` と出して終了コード 2 で返します（`terminal/strata_cli/launch/catalog.py:560-568`; `terminal/strata_cli/launch/cmd.py:753-764, 1011-1012`）。Docker entrypoint は `strata launch` が非ゼロ終了すると `strata launch stopped with code ...` を stderr に出してコンテナを終了します（`tools/docker/entrypoint.sh:310-316`）。
 
 ## 根拠
 
-- 候補一覧には `FAMILY` が掲載されています（調査対象 strata-envvars の `docs/envvars/000_envvers.md:515`）が、実際の環境読み取り箇所は Strata の Docker entrypoint です。
-- Docker entrypoint の説明と値転送: `docker/entrypoint.sh:9-12,169-192`。
-- CLI の `--family` 定義: `strata_cli/launch/cmd.py:83-90`。
-- preset/引数からの設定優先順位: `strata_cli/launch/cmd.py:212-232`。
-- model-family 対応検証と省略時の選択: `strata_cli/launch/catalog.py:397-428`。
-- Docker 利用例と family の役割: `docs/DOCKER.md:39-44,48-71,114-117`。
+- `tools/docker/entrypoint.sh:68-71` — 標準起動以外のコマンド処理。
+- `tools/docker/entrypoint.sh:184-215` — 起動引数の作成と `FAMILY` の読み取り・転送。
+- `tools/docker/entrypoint.sh:268-275, 299-316` — preset の指定、開始表示、終了経路。
+- `terminal/strata_cli/launch/cmd.py:215-239, 838-862` — preset と引数の合成、新規非対話起動の判定。
+- `terminal/strata_cli/launch/catalog.py:550-572` — ファミリーとモデルサイズの検証・解決。
+- `terminal/strata_cli/launch/runner.py:1571-1585, 1666-1695` — 解決したファミリー・サイズによるモデル状態確認と準備。

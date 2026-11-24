@@ -1,50 +1,53 @@
 # `COMMIT`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。Strata の作業ツリーは `main...origin/main` で変更なし。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 ## 役割
 
-Linux 向けビルド・パッケージ用シェルスクリプトが、ソースツリーに `.git` がない場合などに、ビルド対象の commit 識別子を受け取るための環境変数です。主にビルド ID やパッケージの `--build-id` に使われます。実行時の `strata` / `strata-dsv41` がこの名前の環境変数を読む箇所は確認できません。
+`COMMIT` は Strata の実行時設定ではなく、特定の engine package build script がソース revision を build ID や package metadata に記録するために読む環境変数である。確認できた読み取り元は Linux ARM64 CUDA、Windows CUDA、Linux SYCL、Linux HIP の packaging script で、他の実行経路で engine の動作を切り替える読み取りは見つからなかった。
 
-値は commit ハッシュとして形式検証されません。いくつかの DeepSeek-V4.1 ビルドでは先頭 9 文字を `BUILD_ID` に書き、`strata-dsv41 --version` と verbose 起動時に表示される ID にします。SYCL/CUDA/HIP のパッケージでは、別途、引数や JSON の build metadata に使われます。
+- ARM64 CUDA では build ID の末尾 12 文字に使う（`tools/packaging/build_cuda_linux_aarch64.sh:20-28,36-41`）。
+- Windows CUDA では `BUILD.json` の commit 欄と package build ID に先頭 12 文字を使う（`tools/packaging/build_cuda_windows.py:135-142,167-168,186-196`）。
+- Linux SYCL では package build ID の先頭に使う（`tools/packaging/build_sycl_linux.sh:53-55,71-75`）。
+- Linux HIP では status、`BUILD.json` の source、package build ID に使い、tarball checkout で `BUILD_ID` がまだない場合は先頭 9 文字を書き込む（`tools/packaging/build_hip_linux.sh:31,48-57,86-90,131-136`）。
 
 ## 値と判定
 
-各スクリプトは Bash/POSIX shell の parameter expansion で扱い、数値変換やハッシュ形式・長さの検査はしません。`${COMMIT:-fallback}` は未設定と空文字の両方で fallback します。
-
-| ビルド経路 | 未設定または空文字 | 設定値の扱い |
+| ビルド | unset / 空文字 | 設定時に使われる値と検査 |
 |---|---|---|
-| Linux SYCL | `git rev-parse --short=12 HEAD` の結果。git 情報もなければ `unknown` | その文字列を package `--build-id` の `${commit}-oneapi${iccver}` に含める |
-| Linux CUDA aarch64 (DGX Spark) | `git rev-parse HEAD` の結果。得られなければ stderr に `build_cuda_linux_aarch64.sh: set COMMIT=<hex> (no .git here)` を出して exit 2 | 文字列全体を子の `spark/build_engine.sh` に export し、12 文字までを Qwen package build ID に使う |
-| Linux HIP engine package | `unknown` | 先頭 9 文字を `BUILD_ID` に書く場合がある。package build ID は `${COMMIT}+rocm` |
-| Linux HIP DeepSeek-V4.1 package | `unknown` | 先頭 9 文字を `BUILD_ID` に書く場合がある。値が `unknown` でなければバイナリ内の先頭 9 文字を照合し、package build ID にも全体を含める |
-| CUDA DeepSeek-V4.1 helper / Spark engine helper | unset/空は、ソースに `.git` も `BUILD_ID` もない状態で DeepSeek-V4.1 をビルドするとエラー | `.git` と `BUILD_ID` がない場合、先頭 9 文字を `BUILD_ID` に書く。CUDA helper は設定値が非空なら、ビルド後もバイナリに同じ先頭 9 文字があるか確認 |
+| Linux ARM64 CUDA | `${COMMIT:-...}` のため unset と空文字は同じ。`git rev-parse HEAD` に fallback し、失敗または空なら stderr に `build_cuda_linux_aarch64.sh: set COMMIT=<hex> (no .git here)` を出して exit 2。 | 非空の値は文字種・長さ・SHA 形式を検査せず採用。build ID にその先頭 12 文字を使用する。例: `abc`, `A B`, 40 桁以外もこの箇所では拒否されない。 |
+| Windows CUDA | Python の `os.environ.get("COMMIT", "")`。unset と空文字は同じで、`git -C <src> rev-parse HEAD` の成功した stdout に fallback。 | 全体が小文字の 16 進文字列 12〜40 桁のときだけ受理（`[0-9a-f]{12,40}`）。大文字、空白、短すぎ・長すぎ、その他の文字は拒否。無効な非空値も git fallback せず `build_cuda_windows.py: set COMMIT=<hex> (no git commit found here)` で失敗する。 |
+| Linux SYCL | `${COMMIT:-...}` のため unset と空文字は同じ。`git rev-parse --short=12 HEAD` に fallback し、失敗時は文字列 `unknown`。 | 非空の値は形式検査なしで採用し、`${commit}-oneapi${iccver}` の形で build ID に含める。 |
+| Linux HIP | `${COMMIT:-unknown}` のため unset と空文字は `unknown`。 | 非空の値は形式検査なしで採用。先頭 9 文字や値全体を build metadata に使う。 |
+
+この変数を読む箇所には数値変換、大文字小文字の正規化、trim、無効値からの一般的 fallback はない。Windows CUDA だけが値全体に形式検査を行う。各判定は build script の実行時に行われ、engine runtime のキャッシュや実行中の再読込には該当しない（上記各 script の読み取り行を参照）。
 
 ## 有効になる条件
 
-これは実行エンジンの設定ではなく、対象のビルド・パッケージスクリプトが起動されたときだけ参照される値です。OS/backend そのものを切り替えません。確認できた対象は Linux 向けの SYCL、CUDA、HIP ビルドスクリプトです。
-
-- `packaging/build_cuda_linux_aarch64.sh` は `COMMIT` が空なら checkout の HEAD を代用し、どちらも得られない場合に終了します。その値を `export` して `spark/build_engine.sh` に渡します。同 helper は `BUILD_DSV41=1`（既定）かつソースに `.git` と `BUILD_ID` がないときだけ `COMMIT` を必須にします。`BUILD_DSV41=0` ならこの helper 内での COMMIT 要求は発生しません（`build_cuda_linux_aarch64.sh` 自体は別途 commit 値を必須にします）。`packaging/build_cuda_linux_aarch64.sh:27-34`, `spark/build_engine.sh:49-54`。
-- `packaging/build_dsv41_cuda.sh` はソースに `.git` も `BUILD_ID` もない場合だけ `COMMIT` を必須とします。`packaging/build_dsv41_hip_linux.sh` と `packaging/build_hip_linux.sh` は値が `unknown` でなく、`.git` と `BUILD_ID` がない場合にだけ `BUILD_ID` を作ります。既存の `BUILD_ID` はこれらのスクリプトから上書きされません。`packaging/build_dsv41_cuda.sh:21-25`, `packaging/build_dsv41_hip_linux.sh:23-37`, `packaging/build_hip_linux.sh:30-51`。
-- `packaging/build_sycl_linux.sh` は commit 値をパッケージ作成時に決めます。未設定/空なら checkout の短縮 ID（12 文字）を使い、git 情報がなければ `unknown` になります。`packaging/build_sycl_linux.sh:48-50,68-69`。
+- ARM64 CUDA script は Linux `aarch64` / `arm64` 以外では、`COMMIT` の読み取りより前に `build_cuda_linux_aarch64.sh:20-23` の OS/architecture check で exit 2 する。値が有効でも、そのほかの build prerequisites が満たされなければ package 作成まで到達しない。
+- Windows CUDA script は Windows 上で `cuda12` または `cuda13` variant を引数に取る経路でだけ進み、それ以外は先に失敗する（`build_cuda_windows.py:151-158`）。有効な `COMMIT` は variant build 後に metadata/package ID に反映される。
+- Linux SYCL script は Linux x86_64 と oneAPI/`icpx` 等を前提とする packaging 経路で読む。AOT 指定の可否や compiler/tool prerequisites は別途検査される（`build_sycl_linux.sh:1-18,20-38,49-55`）。値自体は package build ID のみに渡る（同:71-78）。
+- Linux HIP script は `VARIANT` と ROCm build environment を必要とする。`COMMIT=unknown` の場合は commit 由来の `BUILD_ID` を書かず、package build ID には `unknown+rocm` が使われる（`build_hip_linux.sh:21-31,48-50,131-136`）。
+- HIP の `VISION_ONLY` 経路は engine build と package 作成を省くが、`COMMIT` fallback と tarball checkout に対する `BUILD_ID` 書き込み判定はその分岐より前に実行される（`build_hip_linux.sh:31,48-50,60,85`）。
+- `SHAPE` は ARM64 CUDA / SYCL / HIP の package shape 選択を変えるが、各 script にある `COMMIT` の読み取り・判定規則は変えない（`build_cuda_linux_aarch64.sh:29-31`, `build_sycl_linux.sh:41,70-75`, `build_hip_linux.sh:59-60,127,134-136`）。
 
 ## 実行時の詳細
 
-各ビルドスクリプトの実行中に shell が環境から読みます。プロセス起動後の変更を監視・再読込する仕組みや、ビルド済み `strata` の実行時に `COMMIT` を読む仕組みはありません。
+ここでの「実行時」は packaging script の実行を指す。ARM64 CUDA script は環境値（空なら git HEAD）を確定し、`export COMMIT=$commit` で `engine/spark/build_engine.sh` と後続コマンドへ渡した後、`release-<version>-cuda13-<cuda>-aarch64-<先頭12文字>` を作って `package_engine.py --build-id` に渡す（`build_cuda_linux_aarch64.sh:24-41`）。
 
-DeepSeek-V4.1 の CMake 設定は、`STRATA_BUILD_ID` が未指定ならソースの `BUILD_ID` ファイル、次に git の短縮 HEAD、最後に `unknown` を採用して `DS4_BUILD_ID` compile definition に設定します（`CMakeLists.txt:946-957`）。ビルドスクリプトから `COMMIT` が `BUILD_ID` へ書かれた場合は、このビルド ID の入力になります。`strata-dsv41 --version` は `strata-dsv41 <version> build <id>` を stdout に出して終了し、`--verbose` は同じ ID を stderr に表示します（`src/dsv41/ds4_main.cpp:2567-2572`）。
+Windows CUDA の `source_commit(src)` は環境値をまず確認し、空の場合だけ git の HEAD を取得して検証する。返された値は engine build 後の `BUILD.json` で 12 文字に切られ、package build ID にも同じ 12 文字が使われる（`build_cuda_windows.py:135-142,167-168,186-196`）。
 
-明示的な失敗経路は以下です。
+SYCL は build 成功後に `COMMIT` または fallback 値を決め、build ID として packer に渡す。HIP は script 冒頭で値を固定し、checkout に `.git` がなく `BUILD_ID` もまだない場合にのみ先頭 9 文字を `BUILD_ID` に書く。すでに `BUILD_ID` がある場合は `COMMIT` からの上書きはしない。続いて値を status 行・`BUILD.json`・package build ID に使う（`build_sycl_linux.sh:49-55,71-75`, `build_hip_linux.sh:31,48-57,86-90,131-136`）。
 
-- CUDA DeepSeek helper: tarball 相当（`.git` なし）で `BUILD_ID` も `COMMIT` もなければ、stderr に `build_dsv41_cuda.sh: ... set COMMIT=<hex> so the engine can print its commit` を出し exit 2。値が設定されていても、生成バイナリにその先頭 9 文字がなければ exit 1。`packaging/build_dsv41_cuda.sh:23-25,34-36`。
-- CUDA aarch64 package: `COMMIT` も checkout HEAD も得られなければ、stderr に `build_cuda_linux_aarch64.sh: set COMMIT=<hex> (no .git here)` を出し exit 2。`packaging/build_cuda_linux_aarch64.sh:27-29`。
-- Spark helper: DeepSeek-V4.1 をビルドする条件で値が必要なのに unset/空なら stderr に `build_engine.sh: ... set COMMIT=<hex> so the DeepSeek engine can print its commit` を出し exit 2。`spark/build_engine.sh:50-53`。
-- HIP DeepSeek helper: `COMMIT` が `unknown` 以外ならバイナリ内に先頭 9 文字があるかを確認し、なければ build status に `ABORT strata-dsv41 does not carry the build id ...` を記録して exit 1。`packaging/build_dsv41_hip_linux.sh:36-37,53`。
+これらは packaging 用のプロセス起動時環境値であり、Strata server の request ごとに読む設定ではない。確認した script 内では子プロセスに環境全体が通常継承されるか、ARM64 のように明示 export される。実行中に親環境を書き換えて再評価する経路はない。
 
-HIP engine package の build status には開始時の commit 値が記録されます。HIP の package metadata には `COMMIT` 由来の文字列も記録されます。これらはビルド時の記録であり、Strata の実行時設定としての効果を示すものではありません（`packaging/build_hip_linux.sh:58,94-95,122-125`）。
+## ログと測定値
+
+環境値の未指定・不正に対して明示エラーを出すのは ARM64 CUDA の git fallback も空だった場合（標準エラー、exit 2）と Windows CUDA の commit が規定形式でない場合（`fail()` が `SystemExit` を出す）である（`build_cuda_linux_aarch64.sh:26-28`, `build_cuda_windows.py:135-142,48-49`）。SYCL は git fallback に失敗すると `unknown` を build ID に含め、HIP は `unknown` を status と metadata に記録する。これらの値について専用の警告・失敗分岐はない（`build_sycl_linux.sh:54,74-75`, `build_hip_linux.sh:31,57,89,135`）。測定値は該当しない。
 
 ## 根拠
 
-- 候補一覧に `COMMIT` が含まれます（`docs/envvars/000_envvers.md:116`）。同名の全参照を検索し、環境値として使う参照は上記のビルド用シェルスクリプトに限られることを確認しました。その他には `.git` のサンプル hook、Windows の `MEM_COMMIT`、識別子名・コメント、ディスク上の `COMMIT` ファイルの読み取りがありますが、環境変数 `COMMIT` の読み取りではありません。
-- ビルドスクリプトでの読み取りと転送: `packaging/build_dsv41_cuda.sh:21-36`, `packaging/build_sycl_linux.sh:48-50,68-69`, `packaging/build_cuda_linux_aarch64.sh:27-39`, `packaging/build_dsv41_hip_linux.sh:23-37,43,53,63-80`, `packaging/build_hip_linux.sh:30-51,58,94-95,122-125`, `spark/build_engine.sh:49-54`。
-- `BUILD_ID` から compile definition への設定と、実行時の表示箇所: `CMakeLists.txt:946-957`, `src/dsv41/ds4_main.cpp:2567-2572`。
+- `tools/packaging/build_cuda_linux_aarch64.sh:20-28,34-42`
+- `tools/packaging/build_cuda_windows.py:135-142,151-177,186-196`
+- `tools/packaging/build_sycl_linux.sh:18-38,49-55,71-80`
+- `tools/packaging/build_hip_linux.sh:21-32,48-60,85-90,127-136`

@@ -1,38 +1,52 @@
 # `CUDA_MODULE_LOADING`
 
-調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。外部 CUDA ランタイムやドライバーがこの変数をどう解釈するかは対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 ## 役割
 
-Strata の生成エンジンが起動時にこの変数を確認し、未設定ならプロセス環境へ `EAGER` を設定します。CUDA カーネルのロード時期を選ぶ値そのものを Strata が解析・検証するコードは確認できません。Strata が行うのは既定値の補完です。
+Strata はこの変数を CUDA のモジュール読み込み設定として値解析せず、起動時に設定有無を確認し、未設定ならプロセス環境へ既定文字列を設定する。共通 CUDA/HIP 系エンジンと CUDA を使う Inkling / Hy4 / Qwen3.6 エンジンでは、volta-forever 検出時に `LAZY`、それ以外では `EAGER` を選ぶ。SYCL エンジンは volta-forever 分岐を持たず、未設定なら `EAGER` を設定する（`engine/include/strata/core/volta_forever.hpp:74-93`、`engine/src/program/generate.cpp:3770-3776`、`engine/sycl/src/program/generate.cpp:1867-1875`）。
 
-CUDA 生成エンジンと SYCL 生成エンジンの `main`、および Qwen 3.5 専用エンジンに設定処理があります。メインエンジンでは `--version` / `-V` の早期終了より後、通常のオプション処理やモデル実行に入る前に確認します。
+このコードが行うのは環境変数の有無確認と設定だけである。明示値の意味や、その後 CUDA runtime / driver がそれをどう扱うかは Strata の挙動としては説明しない。
 
 ## 値と判定
 
-| 起動経路 | 変数が未設定 | 変数が設定済み（空文字を含む） |
-|---|---|---|
-| CUDA/SYCL の通常生成エンジン | `EAGER` を設定 | 既存値をそのまま残す |
-| Qwen 3.5 専用エンジン、非 Windows | `EAGER` を設定（`setenv` の `overwrite=0`） | 既存値をそのまま残す |
-| Qwen 3.5 専用エンジン、Windows | `EAGER` を設定 | 既存値をそのまま残す |
+| 経路 | 未設定 | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 共通 CUDA/HIP 系、CUDA Inkling / Hy4 / Qwen3.6 | volta-forever 非検出なら `EAGER`、検出なら `LAZY` を設定 | Strata による値判定なし。既存値をそのまま保持 | Strata による値判定なし。既存値をそのまま保持 |
+| SYCL | `EAGER` を設定 | Strata による値判定なし。既存値をそのまま保持 | Strata による値判定なし。既存値をそのまま保持 |
 
-判定は値の内容ではなく `getenv(...) == nullptr`、つまり環境変数の有無です。空文字も設定済みとして扱われます。`LAZY`、`0`、その他任意の文字列も上書きされず、文字列比較、数値変換、大小文字変換、範囲制限はありません。コマンドライン引数や設定ファイルからこの変数を上書きする処理は見つかりません。
+両経路とも `std::getenv(...) == nullptr` のみを未設定とみなす。空文字 `""` は設定済みなので上書きされず、`0`、`1`、`true`、`false`、小文字値、前後に空白がある値、その他の文字列も同様にそのまま残る。文字列比較、数値変換、範囲検査、無効値時の fallback は Strata 側にない（`engine/include/strata/core/volta_forever.hpp:82-93`、`engine/sycl/src/program/generate.cpp:1870-1875`）。
 
 ## 有効になる条件
 
-- `strata --version` / `-V` または `--families` でメインエンジンが早期終了する場合、この設定処理には到達しません。
-- 通常生成エンジンでは CUDA と SYCL の双方のソースに同じ既定値設定があります。OS により設定 API が異なり、Windows は `_putenv_s`、それ以外は `setenv(..., 0)` を使います。
-- Qwen 3.5 専用エンジンでは、非 Windows は `setenv(..., 0)`、Windows は未設定時のみ `_putenv_s` を使います。
-- この処理は子プロセスを起動したり、親プロセスの環境を変更したりしません。確認できるのは現在のエンジンプロセスの環境を設定する処理です。
+- 共通エンジンでは `apply_default_cuda_module_loading()` が実行される経路で有効。標準エンジンの起動処理から呼ばれ、値設定の直後に `--gpu` の環境設定や後続の引数処理へ進む（`engine/src/program/generate.cpp:3770-3802`）。
+- CUDA Inkling と CUDA Hy4 はそれぞれ `INKLING_ENABLE_CUDA` / `INKLING_ENABLE_EP_CUDA`、`HY4_CUDA` のビルド条件内で helper を呼ぶ。Inkling の通常エントリは CUDA build のとき、別の CUDA エントリも起動直後に呼ぶ。Hy4 は `HY4_CUDA` 条件内で呼ぶ（`engine/src/inkling2/ink_main.cpp:832-836`、`engine/src/inkling2/cuda/ink_cuda_main.cu:38-41`、`engine/src/hy4flash/run/hy4_main.hip.cpp:350-354`）。Qwen3.6 は独立 engine の引数処理後、モデル必須確認を通った場合に呼ぶ（`engine/src/qwen35/q36_engine.cu:5419-5423`）。
+- 共通 helper の volta-forever 判定は、`STRATA_VOLTA_FOREVER` が空でなく先頭文字が `0` 以外なら強制 on、先頭が `0` なら他の検出より優先して off とする。それ以外では `VOLTA_FOREVER` が空でなく文字列全体が `0` でない場合、version symbol が空でない場合、または `LD_PRELOAD` に `libvolta_forever` が含まれる場合に on となる（`engine/include/strata/core/volta_forever.hpp:40-65`）。この判定が on で、かつ `CUDA_MODULE_LOADING` が未設定のときに限って helper は `LAZY` を選ぶ。
+- SYCL の実装は別の entry point にあり volta-forever 判定を行わず、他の起動条件にかかわらず未設定なら `EAGER` を設定する（`engine/sycl/src/program/generate.cpp:1822-1828,1867-1875`）。
+- 明示された環境値を上書きする CLI 引数や設定ファイルはこの読み取り箇所にない。明示値（空文字を含む）がある場合、volta-forever 検出も既定値の選択に使われず、共通 helper は設定を行わず `false` を返す（`engine/include/strata/core/volta_forever.hpp:82-93`）。
 
 ## 実行時の詳細
 
-通常生成エンジンは、CUDA/SYCL のエンジン初期化とオプション解析に先立って環境を確認します。ソースコメントは、専門家キャッシュが空き VRAM を使う前に全 CUDA カーネルをロードする意図を記しています。また、遅延ロード時に長い prompt 中で初めて使う MMQ カーネルのための VRAM がなくなり、エンジンが `out of memory: cudaFuncSetAttribute` で終了した事例と、およそ 30 MB の VRAM コストを説明しています。これは実装コメントに書かれた背景であり、本調査で測定した値ではありません。
+共通 helper は呼び出しごとに volta-forever 判定を行い、その後 `CUDA_MODULE_LOADING` を一度取得する。未設定なら Windows では `_putenv_s`、それ以外では `setenv(..., 0)` で値を設定し、設定済みなら何もしない。SYCL は同じ設定有無判定を entry point で一度行い、同じ OS 分岐で `EAGER` を設定する。static cache やリクエストごとの再読込はない。起動時に一度設定された後の変更を Strata が監視・反映するコードも、この変数については見つからない（`engine/include/strata/core/volta_forever.hpp:61-93`、`engine/sycl/src/program/generate.cpp:1870-1875`）。
 
-Qwen 3.5 専用エンジンは引数解析後、モデル読み込み前に同じ既定値を設定します。どのコンポーネントが設定値を読み、その後どのように動作するかは Strata 所有コードの範囲では確認できないため、外部 CUDA 側の挙動としてここでは説明しません。Strata のコードに、この変数に対応するログ、警告、値検査、失敗時 fallback はありません。
+共通 helper は `setenv` / `_putenv_s` の戻り値を確認しない。したがって設定失敗を検出して fallback する処理や、それ専用のエラー出力はない。volta-forever を検出し、かつ変数が未設定だった場合は helper が `true` を返し、呼び出し元が設定成功を確認せず「setting ... LAZY」のログを出す。非 volta-forever 時の `EAGER` 設定、明示値がある場合、および SYCL の設定時には、この設定処理専用のログはない（`engine/include/strata/core/volta_forever.hpp:81-93`、`engine/src/program/generate.cpp:3773-3776`、`engine/sycl/src/program/generate.cpp:1870-1875`）。
+
+## ログと測定値
+
+volta-forever 検出かつ未設定時、呼び出し元により次の stderr ログが出る。
+
+- 標準エンジン: `strata: volta-forever detected (%s): setting CUDA_MODULE_LOADING=LAZY`（`%s` は version string。取得できない場合は `env`）（`engine/src/program/generate.cpp:3773-3776`）
+- Qwen3.6: `strata-q36: volta-forever detected: setting CUDA_MODULE_LOADING=LAZY`（`engine/src/qwen35/q36_engine.cu:5421-5423`）
+- Inkling: `[inkling] volta-forever detected: setting CUDA_MODULE_LOADING=LAZY` または `[inkling-cuda] volta-forever detected: setting CUDA_MODULE_LOADING=LAZY`（`engine/src/inkling2/ink_main.cpp:833-835`、`engine/src/inkling2/cuda/ink_cuda_main.cu:39-41`）
+- Hy4 CUDA: `[gpu] volta-forever detected: setting CUDA_MODULE_LOADING=LAZY`（`engine/src/hy4flash/run/hy4_main.hip.cpp:351-353`）
+
+この変数の設定による Strata 自身の終了・エラー経路や、生成結果への影響は上記コードからは確認できない。測定値は記載しない。
 
 ## 根拠
 
-- `src/program/generate.cpp:2336-2350,2361-2369` — 早期終了と、通常生成エンジンの未設定確認・既定値設定。
-- `sycl/src/program/generate.cpp:1724-1753` — SYCL 生成エンジンの同等処理。
-- `src/qwen35/q36_engine.cu:3797-3806` — Qwen 3.5 専用エンジンの OS 別既定値設定。モデル読み込みはその後の `3810` 行以降。
+- `engine/include/strata/core/volta_forever.hpp:40-65,74-93` — volta-forever の判定、既定値選択、環境値の有無判定と設定。
+- `engine/src/program/generate.cpp:3770-3776` — 標準エンジンの helper 呼び出しとログ。
+- `engine/src/qwen35/q36_engine.cu:5419-5423` — Qwen3.6 の呼び出し位置とログ。
+- `engine/src/inkling2/ink_main.cpp:832-836`、`engine/src/inkling2/cuda/ink_cuda_main.cu:38-41` — Inkling の呼び出し条件とログ。
+- `engine/src/hy4flash/run/hy4_main.hip.cpp:350-354` — Hy4 CUDA の呼び出し条件とログ。
+- `engine/sycl/src/program/generate.cpp:1867-1875` — SYCL の `EAGER` 既定値設定。

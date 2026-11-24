@@ -1,47 +1,49 @@
 # `BUILD`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 ## 役割
 
-Linux 向けの CUDA / SYCL エンジンパッケージ作成スクリプトと DGX Spark 用エンジン作成スクリプトで、CMake の build tree の場所を指定します。Strata エンジンの実行時設定ではなく、これらのスクリプトを実行するときだけ参照されるビルド用環境変数です。
+`BUILD` は Strata のエンジンをビルドする 4 本のパッケージスクリプトが、CMake のビルドツリーを置くパスとして読む環境変数です。対象は Linux x86_64 向け CUDA パッケージ、Linux x86_64 向け SYCL パッケージ、DGX Spark（Linux arm64）向け CUDA エンジン、Windows x86_64 向け CUDA パッケージです。各スクリプトは選んだパスを CMake の configure/build に渡し、ビルド後の `strata` などもその場所から読み出します。エンジン実行時の動作を変える設定ではありません。根拠: `tools/packaging/build_cuda_linux.sh:16-18,26-27,43-50,65-66`、`tools/packaging/build_sycl_linux.sh:18-19,25-29,49-51,57`、`engine/spark/build_engine.sh:17-23,48-51,63-65,78-79`、`tools/packaging/build_cuda_windows.py:15-19,151-177,181-185`。
 
 ## 値と判定
 
-3 スクリプトとも POSIX shell の `${BUILD:-既定値}` を使います。`BUILD` が未設定または空文字なら既定ディレクトリを選びます。空でない値は文字列のまま build path として使い、真偽値・数値・ディレクトリの存在を事前検査しません。
+Linux のシェルスクリプトは `${BUILD:-既定値}` で読み、Windows の Python スクリプトは `os.environ.get("BUILD") or 既定値` で読みます。どちらも未設定または空文字なら既定値を使い、空でない値はビルドディレクトリのパスとして渡します。値の数値変換、文字列比較、範囲検査、clamp はありません。シェル版は引用符付きで後続コマンドに渡すため、空白を含む値も単一のパス引数です。絶対パス・相対パスのいずれも値として特別扱いされず、明示値のパスが使用されます。
 
-| スクリプト | unset / 空文字 | 空でない値 |
-|---|---|---|
-| CUDA Linux x86_64 package | リポジトリ直下の `build-cuda13`（`VARIANT=cuda13`）または `build-cuda12`（`VARIANT=cuda12`） | 指定値を CMake の build tree として使う |
-| SYCL Linux x86_64 package | リポジトリ直下の `build-sycl` | 指定値を CMake の build tree として使う |
-| DGX Spark engine | リポジトリ直下の `build-spark` | 指定値を CMake の build tree として使う |
+| ビルドスクリプト | unset または空文字 | 設定時に使う値 | 値の検査 |
+|---|---|---|---|
+| `tools/packaging/build_cuda_linux.sh` | `$repo/build-$variant`（既定の `VARIANT=cuda13` なら `build-cuda13`） | 非空の `BUILD` | BUILD 自体の検査なし。`VARIANT` は `cuda12` / `cuda13` 以外だと別途終了コード 2 で終了 |
+| `tools/packaging/build_sycl_linux.sh` | `$repo/engine/build-sycl` | 非空の `BUILD` | BUILD 自体の検査なし |
+| `engine/spark/build_engine.sh` | `$repo/build-spark` | 非空の `BUILD` | BUILD 自体の検査なし |
+| `tools/packaging/build_cuda_windows.py <cuda12|cuda13>` | `<repo>/build-win-<variant>` | 非空の `BUILD` | `os.environ.get("BUILD") or default` を `pathlib.Path` に渡す。数値等の検査なし |
 
-相対パスは各スクリプトがリポジトリ直下へ `cd` した後に CMake へ渡されるため、そのディレクトリからの相対パスです。空白を含む値も引用符付きでパスとして渡されます。パスの有効性はこの変数の読み取り箇所では検査されず、使用時の CMake やファイル操作の結果に委ねられます。
+Python の Windows スクリプトでは設定値を `Path` にし、CMake configure 用の `-B` と `cmake --build` に文字列化して渡します。OS 判定で Windows 以外は早期終了するため、その経路では `BUILD` は読みません。根拠: `tools/packaging/build_cuda_windows.py:151-177`、`tools/packaging/build_cuda_windows.py:68-72`。
+
+根拠: `tools/packaging/build_cuda_linux.sh:17-27`、`tools/packaging/build_sycl_linux.sh:19-29`、`engine/spark/build_engine.sh:18-25`、`tools/packaging/build_cuda_windows.py:151-177`。
 
 ## 有効になる条件
 
-- `packaging/build_cuda_linux.sh` を Linux x86_64 向け CUDA package 作成に使う場合。`VARIANT` は `cuda12` または `cuda13` で、未設定時は `cuda13` です。選ばれた build tree は configure/build とそこからの package staging に使われます。
-- `packaging/build_sycl_linux.sh` を Linux x86_64 向け SYCL package 作成に使う場合。選ばれた build tree は configure/build と staging 時の実行ファイル取得に使われます。
-- `spark/build_engine.sh` を Linux aarch64 / DGX Spark 向けに使う場合。選ばれた build tree は configure/build、古い `strata-dsv41` の削除、成果物のコピー元に使われます。
-- `packaging/build_cuda_linux_aarch64.sh` は `spark/build_engine.sh` を `sh` で起動します。`BUILD` の明示的な上書きはなく、呼び出し環境の値が子スクリプトへ継承されます。
-
-これらのスクリプト以外に `BUILD` を読むエンジン・サーバー・CLI の実行時コードは見つかりませんでした。ビルドが済んだバイナリへこの変数を設定しても、Strata の実装による効果は確認できません。
+- 変数を読むのは上記のビルドスクリプトを起動したときだけです。通常の Strata エンジンやサーバーを起動するときに読む実装は見つかりません。
+- CUDA パッケージスクリプトは CUDA 12/13 の variant と一致する `nvcc` を要求し、違えば `build_cuda_linux.sh:30-33` のエラーメッセージを stderr に出して終了コード 2 で終了します。`BUILD` の値はこの判定に影響しません。
+- SYCL パッケージスクリプトは `patchelf` と oneAPI の `icpx` を要求し、欠けていれば各確認箇所で stderr に理由を出し終了コード 2 で終了します（`tools/packaging/build_sycl_linux.sh:30-38`）。AOT 指定時の `ocloc` 要件も同様です。同変数はビルドディレクトリを変えるだけです。
+- Spark スクリプトは Linux arm64 以外なら stderr に `build_engine.sh: this builds on arm64 Linux (the DGX Spark)` を出し、終了コード 2 で終了します。また CUDA 13 toolkit を要求します（`engine/spark/build_engine.sh:29-45`）。`BUILD` はこれらの条件を上書きしません。
+- Windows CUDA パッケージスクリプトは Windows 以外では `BUILD` を読む前に `this builds the Windows engine; on Linux use tools/packaging/build_cuda_linux.sh` で失敗します（`tools/packaging/build_cuda_windows.py:151-162`）。Windows 上では variant が CLI 引数 `cuda12` / `cuda13` のいずれかであることが必要で、無効なら使い方を表示して戻り値 2 です（同:152-158）。
+- これらのスクリプトに `BUILD` を上書きする CLI オプションはありません。`BUILD_VISION_DIR` は画像 reader 用の別ビルド先で、`BUILD` を置き換えません（`tools/packaging/build_cuda_linux.sh:54-59`、`engine/spark/build_engine.sh:21-23,67-72`）。
 
 ## 実行時の詳細
 
-各スクリプトは開始時に `BUILD` を一度 shell 変数 `build` へ代入します。CUDA スクリプトでは `cmake -B "$build"` と `cmake --build "$build"` に使い、後に `$build/strata` と `$build/libstrata_kq.so` を staging へコピーします（`packaging/build_cuda_linux.sh:23,33-37,51-52`）。`VARIANT` の確認や `nvcc` の版が合わない場合は `BUILD` の利用より前に stderr へエラーを出して終了コード 2 で終了します（同 `:15-20,25-29`）。
+値は各スクリプトの起動時に一度読みます。シェル版は通常のシェル展開、Windows Python 版は `main` での `os.environ.get` で決め、スクリプト実行中に親環境の変更を再読込しません。選択したパスを CMake の configure/build に渡します。Linux 3 経路はリポジトリのルートへ移動してから CMake を呼び、CUDA と Spark ではさらに同じビルドツリーから実行ファイル等をコピーします（`tools/packaging/build_cuda_linux.sh:37,43-50,65-66`、`tools/packaging/build_sycl_linux.sh:40,49-51,57`、`engine/spark/build_engine.sh:50-51,63-65,75-79`）。Windows 版は `build` を configure args・target discovery・build command・成果物コピーに使います（`tools/packaging/build_cuda_windows.py:162,174-185`）。
 
-SYCL スクリプトでは CMake の configure/build に同じ build tree を使い、`$build/strata` を package staging へコピーします（`packaging/build_sycl_linux.sh:26,39,44-46,52`）。前提コマンドや oneAPI setup が失敗した場合は `BUILD` の build 操作へ進む前に診断を stderr に出して終了します（同 `:29-36`）。
+この値を Strata の実行時にキャッシュする処理はありません。Windows 版は元の環境を含む `env` を CMake subprocess に渡しますが、選択したビルド先は別途コマンド引数でも指定します（`tools/packaging/build_cuda_windows.py:111-123,169-177`）。名前が似た `BUILD_DIR` は `engine/sycl/tools/build.sh:39` で読む別の環境変数です。
 
-Spark スクリプトでは CMake の configure/build、`$build/strata-dsv41` の削除、そこからの engine / DeepSeek engine / `libstrata_kq.so` のコピーに使います（`spark/build_engine.sh:20,58-68,80-83`）。アーキテクチャや CUDA toolkit の条件を満たさない場合などは build tree 使用前に stderr へ診断を出して終了します（同 `:27-48`）。
+## ログと測定値
 
-いずれも CMake または後続コマンドの失敗を個別に `BUILD` 用の fallback へ置き換える処理はありません。CUDA / SYCL スクリプトは `set -eu` により失敗コマンドで停止します（各 `:14`, `:17`）。Spark スクリプトも `set -eu` で失敗時に停止します（`spark/build_engine.sh:16`）。成功時は最終的に package または engine の出力先を `built: ...` と表示します。`BUILD` 自体に専用ログや値の警告はありません。
+`BUILD` の値だけを表示するログや、値を検査して出す警告・エラーはありません。選んだパスを CMake に渡した後の configure/build の出力や失敗は各ツールから出ます。スクリプト側で明示している失敗メッセージは、CUDA variant/toolkit、SYCL の依存ツール、Spark の OS/architecture/toolkit など別条件のものです（`tools/packaging/build_cuda_linux.sh:24,32`、`tools/packaging/build_sycl_linux.sh:23,30,34,36-37`、`engine/spark/build_engine.sh:31,41-45`）。測定値の記載はありません。
 
 ## 根拠
 
-- 候補一覧に `BUILD` があること: `docs/envvars/000_envvers.md` の `BUILD` 項目（索引は候補名の手掛かりであり、動作根拠ではない）。
-- CUDA package の読み取り、既定値、CMake への受け渡し、成果物参照: `packaging/build_cuda_linux.sh:14-16,22-24,33-37,51-52`。
-- SYCL package の読み取り、既定値、CMake への受け渡し、成果物参照: `packaging/build_sycl_linux.sh:17-18,24-28,39,44-46,52`。
-- DGX Spark engine の読み取り、既定値、CMake への受け渡し、成果物参照: `spark/build_engine.sh:16-23,58-68,78-83`。
-- aarch64 packaging wrapper からの呼び出しと `BUILD` の非上書き: `packaging/build_cuda_linux_aarch64.sh:32`。
-- 候補名の全参照を `rg` で確認したところ、環境から読む実装は上記 3 箇所の `${BUILD:-...}` でした。その他の `BUILD` はローカル shell 変数、ビルドログ・文書中の語、または `BUILD.json` 等のファイル名であり、環境変数の読み取りではありません。
+- `tools/packaging/build_cuda_linux.sh:16-27,30-33,37-50,65-66`
+- `tools/packaging/build_sycl_linux.sh:18-29,30-38,40-51,57`
+- `engine/spark/build_engine.sh:17-25,29-45,50-51,63-79`
+- `tools/packaging/build_cuda_windows.py:15-19,68-85,111-123,151-203`
+- `engine/sycl/tools/build.sh:39`（異なる `BUILD_DIR` の読み取り）

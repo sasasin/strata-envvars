@@ -1,6 +1,6 @@
 # `strata doctor --profile`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,55 +8,55 @@
 | コマンド | `strata doctor` |
 | オプション | `--profile` |
 | 別名 | なし |
-| 値 | 保存済み profile 名、または run config JSON のパス。必須ではありません。 |
+| 値 | 保存 profile 名、または run config JSON のパス（文字列）。省略可能。 |
 
 ## 役割
 
-モデル固有のコンポーネント診断に使う run config を選びます。保存済み profile 名を指定すると、その profile が参照する `source_config` を診断します。JSON パスを指定すると、その run config 自体を診断します。どちらも推論エンジンの起動は行いません。
+モデル固有の engine、tokenizer、run config が参照する component を調べる対象 profile / config を選びます。保存 profile を指定した場合も、doctor が診断するのはその profile の `source_config` です。profile の serving overrides を実行設定へ適用する機能ではありません（`terminal/strata_cli/cli.py:1062-1067`、`terminal/strata_control/profiles.py:400-406`、`terminal/strata_control/doctor.py:297-315`）。
 
 ## 使い方
 
 ```sh
 # 保存済み profile の source config を診断
-strata doctor --profile four-gpu
+strata doctor --profile local
 
-# run config JSON を直接指定
-strata doctor --profile /absolute/path/to/strata-model.json --output json
+# 明示した run config JSON を診断
+strata doctor --profile ./configs/model.json
+
+# profile を指定せず、CLI 自体などの基本項目を確認
+strata doctor
 ```
 
 ## 値と既定値
 
-- parser は `--profile` に値を取る引数を定義しますが、`required=True` ではありません。省略時はモデル固有診断をせず、Terminal CLI と任意 monitor 依存だけを確認します（`strata_cli/cli.py:109-113`、`strata_control/doctor.py:146-160`）。
-- 値が `.json` 拡張子（大文字小文字を問わない）、絶対パス、または `/`・`\` を含む場合はパスとして扱い、それ以外は保存済み profile 名として解決します。パスは `expanduser()` と `resolve()` を通ります。パスらしい値が不正でも profile 名へのフォールバックはありません（`strata_control/profiles.py:382-388`）。
-- 保存名は `a-z` の小文字で始まり、以降は小文字英字・数字・`_`・`-` のみ、最大64文字です（`strata_control/profiles.py:25,48-55`）。
-- 指定しなかった場合の既定値は `None` です。値の存在確認や形式検査は parser ではなく、実行時の profile/config 読み込みで行います。
+- 値を一つ取ります。parser は型・選択肢を指定せず、`required` でもありません（`terminal/strata_cli/cli.py:130-134`）。このオプション自体に既定 profile はなく、省略すると profile/config を選択しない経路になります。
+- 値が `.json` で終わる（大文字小文字を問わない）、絶対パスである、または `/`・`\\` を含む場合、明示 config path として扱います。`~` を展開して絶対パス化し、profile 名にはフォールバックしません。したがって相対 JSON パスは実行時の作業ディレクトリ基準です（`terminal/strata_control/profiles.py:400-405`）。
+- それ以外の値は保存 profile ID として解釈されます。ID は小文字英字で始まり、小文字英数字・`_`・`-` のみ、最大64文字です（`terminal/strata_control/profiles.py:25,48-55`）。
+- 明示 config は `args` が文字列配列であり、`exe` と `tokenizer` が空でない文字列である必要があります。読めない JSON、形式不正、必須項目の欠落は拒否されます（`terminal/strata_control/profiles.py:135-150`）。保存 profile は schema version 1、profile ID、絶対 `source_config`、対応 override を検証します（`terminal/strata_control/profiles.py:120-132`）。
 
 ## 実行時の動作
 
-- 保存済み profile 名の場合、profile を読み込み、profile の `source_config` を診断対象にします。`_doctor` が診断関数へ渡す profile 固有情報は `id` のみで、profile の `overrides` は診断対象 config に適用されません（`strata_cli/cli.py:1023-1028`、`strata_control/profiles.py:382-388`）。
-- JSON パスの場合、指定ファイルを run config として読みます。run config は `args` が文字列の配列であり、`exe` と `tokenizer` が空でない文字列であることが必要です（`strata_control/profiles.py:135-147`）。
-- run config を選ぶと engine 実行ファイル、tokenizer ファイル、`args` 内の特定のパス引数（`--pack`、`--native`、`--ple-gguf`、`--expert-profile`、`--mtp`、`--control-vector-scaled`）、vision ファイル、任意 monitor 依存などを検査します。相対パスは config の `cwd` があればそこを基準にし、なければ config ファイルの親を基準にします（`strata_control/doctor.py:19-53,146-235`）。
-- GPU 選択・driver との照合を試みるには `--live` が必要です。`--profile` を省略して `--live` を使うと profile 未選択の error issue になり、レポートは失敗扱いになります（`strata_cli/cli.py:112,1027-1028`、`strata_control/doctor.py:151-160`）。
-- `--output json` または alias の `--json` はレポートを JSON で stdout に出します。human 出力では component の状態と issue を表示し、`--live` の probe 結果も表示します（`strata_cli/cli.py:508-515,1024-1045`）。
-- `--components` は parser 上受理されますが、`_doctor` はこの値を参照せず、診断関数も常に component 一覧を作ります。そのためこの revision では `--components` の有無で診断内容は変わりません（`strata_cli/cli.py:111,1023-1028`、`strata_control/doctor.py:146-160,162-235`）。索引の項目名だけから任意指定の効果を想定しないでください。
+`strata doctor` は `--profile` があれば `profiles.resolve()` で値を解決し、その path と保存 profile ID を `inspect_components()` に渡します。保存 profile の場合、run config は profile の `source_config` から読み込まれます。profile の `overrides` は doctor の component 検査には渡されず、検査対象の engine / tokenizer / 引数で指定された component の所在・状態を調べます（`terminal/strata_cli/cli.py:1062-1067`、`terminal/strata_control/profiles.py:400-406`、`terminal/strata_control/doctor.py:297-318,348-399`）。
+
+省略時はモデル固有検査を行わず、`terminal_cli` と任意の monitor dependency を報告します。通常は `ok: true` で終了しますが、`--live` も指定して profile を省略した場合は live probe 用 profile がないエラーを含み、終了コード5になります（`terminal/strata_control/doctor.py:302-311`）。
 
 ## 適用条件と副作用
 
-- `--profile` を省略した場合、profile やモデル用ファイルの検査は行われません。profile/run config を指定した場合も診断はファイル・設定の読み取りを中心とし、engine を起動しません（`strata_control/doctor.py:146-235`）。
-- 保存済み profile の読み込みで通常の読み取りに `PermissionError` が起き、Strata が所有するファイルとして修復可能と判断した場合、読み直しの前にアクセス権を修復する経路があります。従って profile 名での呼び出しには、条件付きで profile ファイルの ACL/permission を変更する副作用があります（`strata_control/profiles.py:150-166`、`strata_control/private_files.py:476-484`）。
-- `--live` は `nvidia-smi` を最大5秒の timeout 付きで実行し、カード一覧・driver 文字列を取得します。NVIDIA 以外の backend はこのコマンドでは未検証として報告されます。GPU 実行互換性や topology、モデル hash の検証までは行いません（`strata_control/doctor.py:80-115,118-143`）。
-- report の `ok` は必須 component の missing/invalid や error severity の issue がない場合に true です。`--profile` なしの通常診断は `ok: true` になりますが、`--live` を加えると profile が必要なため false になります（`strata_control/doctor.py:151-160,223-235`）。
+- 保存 profile 名が未保存、または profile の内容・schema が不正なら失敗します。profile 読み込みは最大1 MiBのファイルを対象とします（`terminal/strata_control/profiles.py:153-173`）。
+- 明示 config path の読み込みでは JSON を読み、Strata 管理下の component path を現在のインストール先へ再解決することがあります。診断は engine を起動せず、component の取得や run config の書き換えも行いません（`terminal/strata_control/profiles.py:135-150`、`terminal/strata_control/doctor.py:121-149,297-318`）。
+- 保存 profile を読む際、Windows でアクセス拒否が起き、対象がユーザー領域にある場合は、`read_bytes_repairing()` がアクセス権を修復して再読込する経路があります。この場合は profile ファイルのアクセス権が変わる可能性があります（`terminal/strata_control/profiles.py:153-160`、`terminal/strata_control/private_files.py:479-487`）。
+- `--live` を併用すると、対象 run config の GPU 選択とホストの NVIDIA GPU を比較します。NVIDIA の場合は `nvidia-smi` を最大5秒で実行します。これは engine の実行互換性や topology の確認ではありません（`terminal/strata_control/doctor.py:269-294,406-409`）。
 
 ## 出力とエラー
 
-- 成功時は human または JSON のレポートを stdout に出し、`report["ok"]` が true なら終了コード `0`、false なら `5` です（`strata_cli/cli.py:1029-1045`）。
-- 保存 profile が存在しない・壊れている、run config が読めない・形式不正などの例外は共通エラー処理へ渡ります。human 出力では `strata: ...` を stderr に表示し、JSON 出力では `{schema_version, ok: false, error}` を stdout に出します。終了コードは例外に設定された値を使い、個別指定がなければ `2`、ファイル読み込み失敗や profile 不在など明示的に `5` とされたケースは `5` です（`strata_control/profiles.py:135-147,150-166`、`strata_cli/cli.py:527-532,2166-2188`）。
+- 診断結果が問題なしなら終了コード0、必須 component の不足・無効など error severity の issue があれば5です。`--output json` では `{schema_version, ok, report}` の JSON を stdout に出します。通常表示では component 状態と issue を行ごとに stdout へ出します（`terminal/strata_cli/cli.py:1068-1084`、`terminal/strata_control/doctor.py:396-410`）。
+- 保存 profile がない場合や profile/config の内容が不正な場合、CLI はエラーを stderr に出し、通常は終了コード2を返します。読み込み I/O エラーは profile reader が終了コード5を設定する場合があります。`--output json` では共通エラー形式 `{schema_version, ok: false, error}` を stdout に出します（`terminal/strata_control/profiles.py:135-150,153-173`、`terminal/strata_cli/cli.py:558-563,2248-2265`）。
 
 ## 根拠
 
-- `strata_cli/cli.py:109-113` — `doctor` parser と `--profile`、関連 option。
-- `strata_cli/cli.py:1023-1045` — profile 解決、report 出力、終了コード。
-- `strata_cli/cli.py:508-515,2166-2188` — `--json` alias と例外の出力・終了コード。
-- `strata_control/profiles.py:25,48-55,120-147,150-166,382-388` — profile 名と形式、run config 読み込み、profile/path の判定。
-- `strata_control/private_files.py:476-484` — PermissionError 時のアクセス修復と再読み込み。
-- `strata_control/doctor.py:19-53,80-143,146-235` — 検査対象、live probe、report 内容と `ok` 判定。
+- `terminal/strata_cli/cli.py:130-134` — `doctor` parser における `--profile` の値と optional 性。
+- `terminal/strata_cli/cli.py:1062-1084` — 値の解決、inspect 呼び出し、出力形式、終了コード。
+- `terminal/strata_control/profiles.py:25,48-55,120-150,153-173,400-406` — profile ID・schema・run config の検証と name/path の解決。
+- `terminal/strata_control/doctor.py:297-318,348-410` — profile/config を使う component 検査と `ok` 判定。
+- `terminal/strata_control/doctor.py:269-294,406-409` — live GPU probe の条件と範囲。
+- `terminal/strata_control/private_files.py:479-487` — 保存 profile のアクセス拒否時に行う読み込み修復。

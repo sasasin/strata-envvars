@@ -1,6 +1,6 @@
 # `--no-control`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,50 +8,53 @@
 | コマンド | `strata components update` |
 | オプション | `--no-control` |
 | 別名 | なし |
-| 値 | 取らないフラグ。未指定時は無効（`False`）。 |
+| 値 | 値を取らないフラグ（`store_true`） |
 
 ## 役割
 
-通常は更新対象となる Strata Control の取得・検証・切り替えを、この更新実行では省略します。エンジン更新や `--app` によるデスクトップアプリ更新を止めるフラグではありません。
+通常のコンポーネント更新から Control の更新を除外します。Engine の更新は独立して実行されます。`--no-engine` も併用した場合、`--app` を指定していなければ Engine と Control の更新ステップはいずれも実行されません。
 
 ## 使い方
 
 ```sh
+# Engine は更新対象にし、Control の更新を除外する
 strata components update --no-control
 ```
 
+この例はフィードを読み、Engine など選択された対象を更新し得ます。更新処理自体を実行せずフィードの状況だけ確認するには `--check` を使えますが、その場合 `--no-control` は確認結果を絞りません。
+
 ## 値と既定値
 
-引数 parser は `action="store_true"` で定義され、値を取りません。省略時は `False`、指定時は `True` です。値の検証や値域はありません。`strata update` にも同じ定義がありますが、この文書の対象は `strata components update` のスコープです。`rollback` parser には定義されていません。`strata_cli/update_cmd.py:42-59`
+値は不要です。指定時は真、未指定時は偽です。値の範囲や追加 validation はありません。同じフラグを繰り返しても真のままです（parser は `argparse` の `store_true`）。
 
 ## 実行時の動作
 
-通常更新では `update_cmd.run` が `--no-control` の真偽を反転し、`updater.run_update(..., control=...)` に渡します。`run_update` は `control=False` の場合、Control 更新関数を実行ステップ一覧に加えません。そのため Control feed 項目の選択、Control パッケージのダウンロード・展開・`--version` による試験起動、`active.json` の切り替え、Control 更新履歴の記録は行われません。`strata_cli/update_cmd.py:210-224`、`strata_control/updater.py:1145-1192`、`strata_control/updater.py:1274-1296`
+parser は `strata components update` にこのフラグを登録し、CLI は同コマンドを `update_cmd.run` に渡します。通常更新では `control=not a.no_control` として更新処理へ渡します。Control が無効の場合、実際の Control 更新ステップに加え、実行中モデルがある場合の「更新予定」判定からも Control を外します。Engine の更新と、Engine が有効な場合の既設モデル形状別 Engine ステップは別に扱われます。
 
-このフラグだけではエンジンは無効になりません。エンジンは既定で更新対象のままで、`--no-engine` は別のフラグです。`--app` を併用すればアプリ installer の処理も独立して実行されます。`strata_cli/update_cmd.py:48-56`、`strata_control/updater.py:1283-1285`
+このフラグは `--app` の選択には影響しません。`--no-control --app` では Control を更新せず、アプリのインストーラー取得・検証処理は引き続き対象になります。また、フィードの取得、署名検証、更新ロック、更新状態の保存は共通処理です。Control の更新を省略しても、Control のパッケージ情報がフィード内にあればフィード自体は読み込まれ、通常更新の最後には通知用の `last_check` 情報が保存されます。
 
-`--check` を併用すると更新ステップには進まず、`updater.check` が Control を含む feed 状態を報告します。したがって `--no-control` は check 結果から Control を除外しません。`strata_cli/update_cmd.py:203-209`、`strata_control/updater.py:624-640`
+`--check` 指定時は `update_cmd.run` が `updater.check` を呼び、Engine・Control・アプリの状態を含むレポートを返して終了します。この分岐では `no_control` は参照されないため、Control もレポート対象です。
 
-Control 更新を省略しても、更新コマンド全体の acquisition 許可確認、feed のオープンと状態保存、engine の更新処理は独立して残ります。また `--wait` を指定していない場合、Control を更新しないときでも更新前の serving 確認・待機判定を通ります。`strata_control/updater.py:1277-1285`、`strata_cli/update_cmd.py:197-245`
-
-内部では Terminal の起動 runner が `strata update --no-control --output jsonl` を起動してエンジンを取得します。この経路でも Control 更新を含めず、イベント出力を JSON Lines にします。`strata_cli/launch/runner.py:542-575`
+同じ parser 関数はトップレベルの `strata update` にも独立して `--no-control` を登録します。指定文書のスコープは索引どおり `strata components update` です。トップレベルコマンドは索引上の別スコープです。
 
 ## 適用条件と副作用
 
-このオプションが影響するのは `run_update` の Control 更新ステップだけです。Control はインストール済みのままになり、更新は後続の別の更新実行まで行われません。Control 更新ステップを省くため、そのステップに固有の Control archive の取得、stage folder の作成・削除、Control version の試験起動、既存 Control directory の整理や active pointer の置換も発生しません。`strata_control/updater.py:1145-1192,1283-1285`
+通常更新では Control の存在確認・新しい Control のダウンロード・展開・起動テスト・`active.json` の切り替えを行う Control 更新ステップを省略します。Engine、アプリのインストーラーなど、他に有効な更新対象があればそれらの処理は継続します。フィード取得や共通の状態ファイル更新など、Control ステップ外の処理は抑止しません。
+
+このフラグは引数の受理後に値を補正・拒否する個別 validation を持ちません。更新処理自体は acquisition が禁止された環境で拒否され、フィード・署名関連の例外も通常の失敗経路で返されます。
 
 ## 出力とエラー
 
-省略した Control は `run_update` の `results` に結果項目を作らないため、通常の結果一覧や JSON 出力にも Control の更新結果は含まれません。ほかの有効な更新ステップの結果は通常どおり出力されます。`strata_control/updater.py:1283-1297`、`strata_cli/update_cmd.py:211-224`
+人向け出力では、通常更新結果として実行されたステップの結果が表示されるため、除外した Control の更新結果行は作られません。`--output json` / `jsonl` でも結果は同じ選択対象に基づきます。`--check` の人向け・機械向けレポートには Control の状態が含まれます。
 
-このフラグは feed 取得や acquisition 制限を回避しません。たとえば acquisition が拒否された場合、CLI は人間向けには標準エラーへ `strata: ...`、JSON/JSONL 向けには `ok: false` とエラーを出し、終了コード 5 を返します。Ctrl-C は終了コード 130 です。`strata_cli/update_cmd.py:163-234`
+更新エラーは既定の human 出力では標準エラーに `strata: <メッセージ>` として出力され、対応する終了コードを返します。機械出力ではエラーオブジェクトを JSON で出力します。Control を省略しても、フィード取得や残る更新対象の失敗は通常どおり発生し得ます。
 
 ## 根拠
 
-- Parser と同一コマンド階層の定義: `strata_cli/update_cmd.py:42-59`、トップレベルへの登録と dispatch: `strata_cli/cli.py:139-140,2135-2137`。
-- フラグの `control=not a.no_control` への変換、check 分岐および出力: `strata_cli/update_cmd.py:197-224`。
-- `check` が Control 状態を常に含める実装: `strata_control/updater.py:624-640`。
-- Control 更新処理と `run_update` のステップ選択: `strata_control/updater.py:1145-1192,1274-1297`。
-- 起動 runner による内部呼び出し: `strata_cli/launch/runner.py:542-575`。
-
-この調査は指定 revision のソース checkout に基づきます。CLI help や Release 配布物との照合は行っていません。
+- `terminal/strata_cli/update_cmd.py:59-79` — `strata update` と `strata components update` の parser 登録。どちらも値なしの `store_true`。
+- `terminal/strata_cli/cli.py:135-161,2210-2212` — `components` 階層と parser 登録、対象コマンドの `update_cmd.run` への dispatch。
+- `terminal/strata_cli/update_cmd.py:361-377` — `--check` の分岐と、通常更新で `control=not a.no_control` を渡す箇所。
+- `terminal/strata_control/updater.py:2066-2079,2082-2096` — Engine/Control の保留変更判定と、稼働モデルがある場合に判定結果を使う箇所。
+- `terminal/strata_control/updater.py:2109-2139` — 有効な対象だけを更新ステップに加える処理、共通フィード読込・状態保存、結果と終了コード。
+- `terminal/strata_control/updater.py:1936-1984` — Control 更新ステップのダウンロード、テスト起動、active pointer の更新と一時ディレクトリの後始末。`control=False` ではこの関数を呼ぶステップが追加されない。
+- `terminal/strata_cli/update_cmd.py:311-316,378-390` — human / 機械出力の失敗経路、acquisition 拒否、割り込み時の処理。

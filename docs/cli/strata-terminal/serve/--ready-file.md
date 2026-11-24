@@ -1,6 +1,6 @@
-# `strata serve --ready-file`
+# `--ready-file`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,56 +8,51 @@
 | コマンド | `strata serve` |
 | オプション | `--ready-file` |
 | 別名 | なし |
-| 値 | 作成する JSON ファイルのパス。絶対パスが必要 |
+| 値 | 新規に作る JSON instance record の絶対パス |
 
 ## 役割
 
-API サーバーが bind され、モデル状態が決まった時点で、その instance を識別する JSON ファイルを作成します。起動スクリプトやローカルの管理プロセスが起動結果を知るための補助情報です。ファイルだけでは現在もサーバーが稼働中である証明にならず、利用側は instance ID を稼働中サーバーの telemetry と照合する必要があります。
+サーバーの API が bind され、モデル状態が確定した後に、稼働中インスタンスを示す JSON ファイルを作ります。監視プロセスなどが起動完了を知るために使えます。このファイルは稼働証明として単独で信頼するものではなく、利用側は instance ID をライブ telemetry と照合する必要があります。
 
 ## 使い方
 
 ```sh
-strata serve --profile ./run-config.json --ready-file /home/alice/.local/state/strata/ready.json
+# 既存の設定ファイルを使い、起動完了時に新しい instance record を作る
+strata serve --profile /path/to/run-config.json --ready-file /tmp/strata-ready.json
+
+# 起動せずにパスを含む有効な起動計画を確認する（ファイルは作らない）
+strata serve --profile /path/to/run-config.json --ready-file /tmp/strata-ready.json --plan
 ```
 
-`--profile`（alias `--config`）には既存の run config を指定します。指定したファイルがなければ起動後に作られるのではなく、起動前に親ディレクトリと出力先を検証し、API 起動後に ready record を書きます。例の出力先は、事前に作成した他ユーザーが読めない専用ディレクトリ内に置いてください。
+指定先の親ディレクトリが存在し、ファイルもシンボリックリンクもまだ存在しないパスを指定してください。`--plan` でもこの条件は検証されるため、例のパスを再利用する場合は前回の正常終了でファイルが削除されたことを確認します。
 
 ## 値と既定値
 
-- 値は必須で、省略時は ready file を作りません。オプションに短縮 alias はありません。
-- パスは絶対パスでなければなりません。親ディレクトリは事前に存在するディレクトリである必要があります。相対パス、存在しない親ディレクトリは拒否されます。
-- 出力先が既に存在する場合や dangling symlink の場合も拒否され、上書きしません。再利用する場合、残存ファイルが stale でないか確認し、確認後に利用者側で削除してください。
-- 指定パスは `pathlib.Path` として扱われますが、`resolve()` による正規化は行われません。親ディレクトリへの書き込み可否などは実際の作成時に判明します。
+値は文字列として受け取り、既定値はありません。Terminal CLI は起動計画を組み立てるときに値を検証します。パスは絶対パスでなければならず、親ディレクトリは既存のディレクトリでなければなりません。指定先が既存ファイルまたはシンボリックリンクなら拒否されます。チェックは `terminal/serve/ready.py:16-24` にあります。空文字列は Terminal CLI の条件分岐で未指定と同じ扱いになり、転送されません（`terminal/strata_cli/cli.py:845-849`）。
 
 ## 実行時の動作
 
-CLI はサーバー引数を組み立てる際に `serve.ready.preflight()` を呼び、検証済みパスを `serve.server` の `--ready-file` に渡します。`--plan` を指定した場合もこの事前検証は行いますが、計画を表示して終了するため ready file は作成されません。`--ready-file` の値は設定ファイルや環境変数からは補われません。
+Terminal CLI は値を `serve.ready.preflight` に渡し、検証済みのパスを内部サーバーの `--ready-file` 引数に転送します。`--plan` の場合も起動計画にはパスが含まれますが、サーバーを起動しないためファイルは作成されません（`terminal/strata_cli/cli.py:845-865, 979-981`）。
 
-API の bind 後、実際に割り当てられた port、instance ID、サーバー PID、API URL、bind host/port、model ID、model state、API state、作成時刻、schema version を含む JSON を作成します。model state は通常 `ready`、遅延ロード構成では `unloaded` です。ready file 自体に API key や認証情報は含まれません。
+通常起動では、サーバー自身も同じ検証を行います。API bind 後、instance ID、PID、API URL、bind 済み host/port、model ID、モデル状態、API 状態、作成時刻を含む schema version 1 の JSON record を出力します。遅延ロードが有効な場合の `model_state` は `unloaded`、それ以外は `ready` です（`terminal/serve/server.py:9285-9288, 9721-9723, 9752-9767`）。
 
-作成は排他的な新規作成で行い、POSIX では mode `0600` を指定します。Windows ではアクセス制御が親ディレクトリの ACL を継承するため、private な親ディレクトリを使ってください。書き込みが例外で中断したときは作成途中のファイルを削除します。通常の停止処理では、ファイル内の instance ID と PID が現在のサーバー自身に一致する場合に限り削除します。強制終了など停止処理を通らない終了ではファイルが残ることがあります。
+ファイルは UTF-8 の JSON と改行で書かれ、POSIX では作成モード `0600` を指定し、排他的作成で既存ファイルを上書きしません。書き込み・flush・fsync が行われます（`terminal/serve/ready.py:27-37`）。Windows の ACL の実効設定は、このソース範囲だけでは確認できません。
 
 ## 適用条件と副作用
 
-このオプションは `strata serve` の foreground 起動に対して任意で使います。未指定ならこの記録の作成・削除処理はありません。ready file は起動後の API bind に続いて書かれるため、プロセスがファイルを書けないと起動は失敗します。
-
-ready file は起動 instance の手掛かりです。ファイル内の PID を使ってプロセスを操作してはいけません。古いファイルが残った場合は、記録された instance ID を live `/v1/telemetry` と照合して stale であることを確認してから、再利用前に削除してください。
+このオプションを省略すれば ready file は作られません。指定時は API が bind された後にファイルを作成します。正常な停止処理では、ファイル内の instance ID と PID が現在のサーバーに一致する場合だけ削除します（`terminal/serve/server.py:9811-9814`、`terminal/serve/ready.py:40-46`）。プロセスが強制終了されるなど停止処理を通らない場合はファイルが残り得るため、再利用前に稼働中インスタンスと照合し、古いファイルだと確認してから手動で除去してください。ファイルは credentials を含まず、PID への操作権限を与えるものでもありません。利用側は instance ID をライブ telemetry と照合する必要があります（`terminal/serve/ready.py:1-6`）。
 
 ## 出力とエラー
 
-- 相対パス、親ディレクトリ不在、既存パスなどの事前検証エラーは `ValueError` になります。通常の human/json 出力では CLI の共通エラー処理で報告され、終了コードは既定で `2` です。`--output jsonl` では `failed` イベントで報告します。
-- 実際のファイル作成で `OSError` が発生すると stderr に `[strata] could not write ready file (<例外型>)` を出し、server は終了コード `6` を返します。作成に失敗した場合はサーバーの HTTP server、engine、関連リソースを閉じます。
-- `--plan` はパス検証エラーを報告し得ますが、ready record は書きません。
+絶対パスでない、親ディレクトリがない、または対象が既に存在する場合は preflight が拒否します。Terminal CLI では通常のエラー出力経路を通り、JSONL モードでは `failed` event と終了コードを返します（`terminal/strata_cli/cli.py:970-978, 2248-2255`）。内部サーバーを直接起動した場合は argparse のエラーになります（`terminal/serve/server.py:9285-9288`）。
+
+preflight 後のファイル作成に失敗すると、stderr に `[strata] could not write ready file (<例外型>)` を出し、終了コード `6` で終了処理に進みます。書き込み途中の例外では作成したファイルを削除します（`terminal/serve/server.py:9763-9768`、`terminal/serve/ready.py:27-37`）。
 
 ## 根拠
 
-- `strata_cli/cli.py:46-67` — `strata serve` parser。`--ready-file` は値を取るオプションで、default・alias は宣言されていません。
-- `strata_cli/cli.py:782-826` — launch plan の組み立て、パス事前検証、server への引き渡し、plan 内の表示値。
-- `strata_cli/cli.py:915-955, 2166-2183` — plan 時の終了、foreground 起動、および値・OS エラーの CLI 報告。
-- `serve/ready.py:16-46` — 絶対パス・親ディレクトリ・既存ファイル検査、排他的作成、JSON 書き込み、所有 instance のみ削除。
-- `serve/server.py:8156-8159, 8255-8258` — server parser と再度行う事前検証。
-- `serve/server.py:8615-8622, 8645-8662` — API bind 後の実ポート取得、ready record の構成と公開。
-- `serve/server.py:8651-8660, 8703-8713` — 公開失敗時の終了コード・cleanup と handled stop 時の削除。
-- `docs/TERMINAL.md:230` — 利用者向けの ready file 説明（ソース実装の補足）。
-
-調査範囲は上記 commit の checkout にある Terminal CLI と server 実装です。Windows 上の実際の ACL 設定や異常終了時のファイルシステム挙動はこの調査では実行確認していません。
+- `terminal/strata_cli/cli.py:67-88` — Terminal CLI の `serve` parser と `--ready-file` の登録。引数に型変換や既定値の指定はない。
+- `terminal/strata_cli/cli.py:821-865` — launch plan での preflight、内部サーバーへの引き渡し、計画へのパス記録。
+- `terminal/strata_cli/cli.py:954-994` — `--plan` ではサーバーを起動せず、通常時に foreground server を開始する分岐。
+- `terminal/serve/server.py:9157-9177, 9283-9288` — 内部サーバー側 parser と起動時の再検証。
+- `terminal/serve/server.py:9721-9723, 9752-9768, 9811-9814` — API bind 後の record 作成・公開、書き込み失敗、正常停止時の削除。
+- `terminal/serve/ready.py:16-46` — パス条件、JSON の排他的作成、POSIX の作成モード、所有インスタンス確認付き削除。

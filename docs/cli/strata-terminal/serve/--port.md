@@ -1,6 +1,6 @@
-# `--port`
+# `strata serve --port`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,57 +8,49 @@
 | コマンド | `strata serve` |
 | オプション | `--port` |
 | 別名 | なし |
-| 値 | 整数 `N`、0〜65535 |
+| 値 | 整数。`0`〜`65535`。`0` は OS に空きポートを割り当てさせる |
 
 ## 役割
 
-`strata serve` が前景で起動する HTTP 推論 API の listen port を指定します。指定値は run config や保存 profile の port を上書きします。`0` を指定すると OS が空いている port を割り当てます。
+推論 API と Web UI を待ち受ける TCP ポートを指定する。`strata serve` はこの値を一時的な起動引数としてサーバーへ渡す。設定ファイルや保存済み profile の値を書き換える操作ではない。
 
 ## 使い方
 
 ```sh
-strata serve --profile /path/to/strata-model.json --port 8096
+strata serve --profile /path/to/model.json --port 8081
 ```
 
-`--profile`（alias `--config`）には run config のパスまたは解決可能な profile を指定します。実サーバーを起動せず有効設定を確認する場合は `--plan` を加えます。
-
-```sh
-strata serve --profile /path/to/strata-model.json --port 0 --plan
-```
+`--profile` にはモデルの run config JSON を指定する。`--port 0` とすると OS が割り当てたポートで起動し、起動後の案内には実際に割り当てられた番号が表示される。
 
 ## 値と既定値
 
-- 値は `argparse` の `int` で変換されます。未指定なら、保存 profile の `port`、run config の `port`、既定値 `8095` の順で採用されます。CLI の `--port` を指定した場合はそれが最優先です。port 専用の環境変数はこの解決処理にありません。
-- 有効範囲は両端を含む `0..65535` です。`0` は範囲内の特別な値で、固定 port ではなく OS に割当を委ねます。
-- 整数に変換できない値は parser が拒否します。範囲外の整数は `strata: --port must be in 0..65535` と stderr に出して終了コード 2 になります。profile/run config 由来の port も serving override 検証で整数・同範囲を要求します。
+- 値は `int` として解析され、`0`〜`65535` の範囲が受理される。範囲外は `--port must be in 0..65535` として拒否される（`terminal/strata_cli/cli.py:73,959-960`、profile / run config 由来の値も `terminal/strata_control/profiles.py:98-105` で検証）。
+- `--port` を省略した場合、優先順位はコマンドライン、保存済み profile の override、run config の `port`、既定値 `8095`。コマンドラインに値があれば profile や run config より優先する（`terminal/strata_cli/cli.py:783-803`）。
+- 整数でない値は parser の型変換で受理されない（`terminal/strata_cli/cli.py:67-74`）。
 
 ## 実行時の動作
 
-- `_effective` が CLI 指定、saved profile override、run config、既定値 `8095` の優先順で有効値を決め、その値を serving override として検証します。起動計画の `server_argv` に `--port <値>` として含まれます。`--plan` はこの計画を出力して終了し、listen socket は作りません。
-- 通常起動では実サーバーがその値で `ThreadingHTTPServer` を bind します。port `0` のときは bind 後に実際の port を取得し、`ready:` の URL と `--ready-file` の `bound_port` / `api_url` に反映します。
-- 既定 host は loopback `127.0.0.1` です。到達範囲は `--host` および設定の host にも依存します。`--port` 自体は HTTP API の認証や host の公開範囲を変更しません。
+有効値はサーバー引数列の `--port <値>` に変換される（`terminal/strata_cli/cli.py:821-835`）。サーバー側も整数として解析し、HTTP server を `(host, port)` で作成して待ち受ける（`terminal/serve/server.py:9174,8779-8785`）。待ち受けるアドレスは `--host` または設定側で別に決まり、`--port` 自体は変更しない（`terminal/serve/server.py:9324,9721`）。
+
+起動前に同じ host と port で一度 bind して使用可能か確かめ、確認用 socket を閉じてから残りの起動処理に進む（`terminal/serve/server.py:9341-9345`）。`--port 0` の場合、確認用 bind と実サーバーの bind はそれぞれ OS に割当を求める。実サーバーの `server_address[1]` を採用し、ready 表示と instance record にその実ポートを使う（`terminal/serve/server.py:9721-9729,9752-9757`）。
 
 ## 適用条件と副作用
 
-- 範囲検証は計画・起動の前に行われます。起動経路では、モデル読み込みに入る前に指定 host/port で listen 可能かを一度 bind/unbind して確認します。その後の実 listen は別の bind なので、確認後に他プロセスが port を取得した場合も起動に失敗し得ます。
-- 実起動では TCP listen socket を開き、前景 server の終了まで API を受け付けます。`--plan` では socket を開きません。
+この値は `strata serve` の起動時に使われ、起動中の待ち受けポートを変更するものではない。指定した port が利用中の場合は起動前確認で拒否される。Windows では Strata の HTTP server が address reuse を無効にして二重起動時の同一 port bind を失敗させる（`terminal/serve/server_parts/http_api.py:37-40`）。
+
+ポートの bind が OS に拒否された場合、エラーには host、port、OS の理由と状況に応じた案内が含まれる。使用中なら別の `--port` を使うよう案内し、権限不足や当該 host がこの PC のアドレスでない場合も区別する（`terminal/serve/server_parts/base.py:42-62`、呼び出し元 `terminal/serve/server.py:9341-9345`）。1024 未満の port は Linux / macOS では管理者権限を要する場合があると案内する。実際に bind できるかは OS とその時点のポート状態に依存する。
 
 ## 出力とエラー
 
-- 有効値は `--plan` の結果の `effective.port` と `server_argv` で確認できます。
-- bind の事前確認に失敗すると server parser の usage と `listen_problem` の診断が表示され、通常は終了コード 2 です。port 使用中の場合は別 port 指定を案内します。OS のエラーが address unavailable や permission error の場合は原因に応じて host/port または OS 側の制約を案内します。
-- `--port 0` では指定した `0` ではなく、OS が割り当てた実 port が ready URL と ready record に出ます。
+- 範囲外の値は `strata` 側でエラーになり、通常形式では終了コード `2`（`terminal/strata_cli/cli.py:868-874,954-960`）。
+- bind できない場合は server parser の usage error と `listen_problem` の説明が出る（`terminal/serve/server.py:9341-9345`、文面の分岐 `terminal/serve/server_parts/base.py:42-62`）。
+- 起動成功時は `ready: http://...:<実ポート>/v1` などの URL が表示される（`terminal/serve/server.py:9721-9729`）。`--port 0` なら `<実ポート>` は OS が割り当てた番号。
 
 ## 根拠
 
-- `strata_cli/cli.py:46-53` — `serve` parser、必須 profile、`--port` の整数変換。
-- `strata_cli/cli.py:745-779` — CLI / saved profile / run config / default (`8095`) の優先順と serving 値の検証。
-- `strata_cli/cli.py:782-826` — 有効 port を server argv と計画に反映。
-- `strata_cli/cli.py:915-942` — `0..65535` の CLI 範囲検証、plan と実起動の分岐。
-- `strata_control/profiles.py:98-105` — profile/run config port の整数・範囲検証。
-- `serve/server.py:144-160` — bind 失敗理由の診断。
-- `serve/server.py:8143-8156`, `8288-8308` — server 側の既定値、host の決定、listen 前の bind 確認。
-- `serve/server.py:7718-7724`, `8615-8623`, `8645-8654` — 実 listen、割当 port の取得、ready 出力・record。
-- `docs/cli/README.md` — `strata-terminal` の `strata serve` 配下に本 option を掲載。
-
-調査は上記 commit の checkout のソースに基づきます。別 OS 上での bind 失敗文言の実例や各 OS の port 割当動作は実行確認していません。
+- `terminal/strata_cli/cli.py:62-74` — `strata serve` parser と `--port` の整数型宣言。
+- `terminal/strata_cli/cli.py:783-835,954-960` — 値の優先順位、既定値、サーバー引数への転送、範囲検証。
+- `terminal/strata_control/profiles.py:98-105` — profile / run config と共有する port 値の検証範囲。
+- `terminal/serve/server.py:9174,9324,9341-9345,9721-9757` — server 側 parser、起動前 bind 確認、待ち受けと OS 割当 port の報告。
+- `terminal/serve/server_parts/http_api.py:37-55` — HTTP server の bind 設定と IPv6 address family の選択。
+- `terminal/serve/server_parts/base.py:42-62` — bind 失敗理由の説明と案内。

@@ -1,6 +1,6 @@
 # `--output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,60 +8,65 @@
 | コマンド | `strata serve` |
 | オプション | `--output` |
 | 別名 | なし |
-| 値 | `human`、`json`、`jsonl` のいずれか |
+| 値 | `human`、`json`、`jsonl` |
 
 ## 役割
 
-`strata serve` の標準出力形式を選びます。`human` はサーバーの人間向け出力、`json` は `--plan` で計画を一度だけ出力する形式、`jsonl` はサーバーの起動・終了を追う JSON Lines 形式です。出力先ファイルを指定するオプションではなく、機械可読形式も標準出力へ出します（`strata_cli/cli.py:64-65, 838-867, 940-941`）。
+計画表示または前景サーバーの出力形式を選ぶ。`human` は通常の人向け表示、`json` は `--plan` の計画を単一 JSON オブジェクトで出力し、`jsonl` はサーバーの起動・準備完了・停止などの lifecycle event を stdout に1行ずつ出力する。`strata serve` は既存の run config（または保存済み profile）を読み、計画時は有効な設定と起動引数を組み立て、通常時はその設定で推論サーバーを前景起動する。
 
 ## 使い方
 
 ```sh
-# 通常の前景サーバー出力（既定）
-strata serve --profile /path/to/run-config.json
+# 設定を検証し、計画を人向け形式で表示する
+strata serve --profile ./run.json --plan --output human
 
-# 起動せず、検証済みの起動計画を JSON で出力
-strata serve --profile /path/to/run-config.json --plan --output json
+# 計画を機械処理できる JSON で表示する
+strata serve --profile ./run.json --plan --output json
 
-# 前景サーバーの lifecycle を JSON Lines で出力
-strata serve --profile /path/to/run-config.json --output jsonl
+# 前景サーバーの lifecycle event を JSON Lines で受け取る
+strata serve --profile ./run.json --output jsonl
 ```
 
-`--profile` は必須です。`json` は `--plan` と組み合わせ、`jsonl` は `--plan` を付けず前景実行に使います（`strata_cli/cli.py:46-47, 63-65, 915-953`）。
+`--profile` は `--config` の別名で、parser 上必須である。`--output` 自体には短縮別名はない。
 
 ## 値と既定値
 
-- 値は `human`、`json`、`jsonl` の3つに限定されます。`argparse` の `choices` による検査で、大文字小文字を変えた値や他の文字列は受理されません（`strata_cli/cli.py:64-65`）。
-- 省略時は `human` です。値は1つ必須で、同じオプションを複数回指定した場合は `argparse` が最後に解析した値を保持します（同所）。
-- 対応する環境変数や設定ファイル値はありません。選択値は serve コマンドの処理分岐に直接使われます（`strata_cli/cli.py:915-955`）。
+- 省略時は `human`。
+- parser が受け付ける値は `human`、`json`、`jsonl` の3つだけ。別の値は argparse の選択肢エラーとなり、usage とエラーを表示して終了コード 2 で終了する。
+- 同じオプションを複数回指定した場合の独自処理はない。argparse の通常の `store` 動作で最後の値が残る。
+- `human` と `json` は `--plan` と併用できる。`json` を `--plan` なしで使うと実行前に拒否される。`jsonl` は通常の前景起動用で、`--plan` と同時には使えない。
 
 ## 実行時の動作
 
-- **`human`**: `--plan` がなければサーバーを前景起動し、サーバーの標準出力をそのまま端末へ流します（`strata_cli/cli.py:900-912, 942-953`）。`--plan` と併用した場合は起動せず、計画を整形 JSON として標準出力へ出します（`strata_cli/cli.py:940-941, 535-542`）。
-- **`json`**: `--plan` が必須です。計画を `schema_version: 1`、`ok: true`、`plan` を含む1行の JSON として出力し、サーバーは起動しません（`strata_cli/cli.py:915-918, 940-941, 535-542`）。`--plan` なしでは終了コード2となり、機械可読エラー JSON を出します（`strata_cli/cli.py:915-918, 829-835, 527-532`）。
-- **`jsonl`**: `--plan` とは併用できません。前景サーバーの lifecycle を1イベント1行で標準出力へ flush します。CLI が出す `starting` に続き、サーバーから `ready`、停止時の `stopping` / `draining` / `stopped`、または失敗時の `failed` などが出ます（イベントのフィールドは `strata_cli/cli.py:838-867`、サーバー側の通知は `serve/server.py:8127-8137, 8645-8662, 8670-8710`）。`--plan` と併用すると、`failed` イベントを出して終了コード2になります（`strata_cli/cli.py:915-919, 829-835`）。
+- `--plan --output json` は起動計画を組み立て、`{"schema_version":1,"ok":true,"plan":...}` の JSON を stdout に出して終了する。計画には有効設定とその出所、サーバー引数、エンジン実行ファイル・引数（引数は redaction 処理後）、注意事項などが含まれる。`human` の計画出力は `_success` に人向け文字列を渡さないため、同じ計画 payload を整形 JSON として stdout に出す。
+- 前景起動時に `jsonl` を選ぶと、CLI が `starting` を出した後、サーバーから受け取った `ready`、停止時の `stopping` / `draining` / `stopped` などを schema version 付き JSON Lines として stdout に出す。起動または実行に失敗した場合は `failed` event を出す。イベントの `at` は時刻で、各 event に含めるフィールドは event ごとに限定される。
+- JSONL 中のサーバー人向け出力は stderr に振り向ける。`--quiet` も指定した場合はその人向け出力を `/dev/null` に送る一方、JSONL event は stdout に出す。JSONL の受信側が stdout を閉じても、イベント出力を止めてサーバー自体は継続する。
+- `--output` は出力先ファイルを指定せず、serve の起動・停止条件を変えない。foreground を選ぶとサーバーは停止されるまで実行を続ける。
 
-いずれの値も計画作成時には設定ファイルの読込・検証を行います。実際にサーバーを起動する場合、POSIX/Windows では runtime activity lease を取得してサーバーを実行し、終了時に lease を閉じます（`strata_cli/cli.py:931-955`）。`--quiet` は人間向け標準出力を抑えますが、`jsonl` のイベント出力は維持します。JSONL 経路ではイベント出力先が閉じた後もサービスを停止させず、以後のイベント記録を止めます（`strata_cli/cli.py:838-867, 900-912`）。
+### 関連オプションとの相互作用
+
+- `--output json` には `--plan` が必須。欠けている場合は JSON 形式のエラーオブジェクトを stdout に出し、終了コード 2 となる。
+- `--output jsonl --plan` は拒否され、`failed` event を stdout に出して終了コード 2 となる。
+- `--json` の parser help は「`--plan --output json` の alias」と説明している。しかし実装では、`--json` が指定されると `output` を `json` にするだけで `plan` は有効にしない。そのため `strata serve --profile ./run.json --json` は `--output json requires --plan` エラーになる。計画 JSON を得るには明示的に `--plan` を付ける必要がある。
+- `--output jsonl` では、値・設定などを検査している段階で `ValueError`、`OSError`、`ClientError` 等が起きた場合も、serve のエラー経路は `failed` JSONL record に整形する。通常の `human` は `strata: ...` を stderr に出し、`json` は schema version、`ok: false`、エラーコードとメッセージを持つ JSON を stdout に出す。
 
 ## 適用条件と副作用
 
-- `json` は計画表示に限られ、稼働中サーバーの JSON ログ形式としては使えません。その用途は `jsonl` です（`strata_cli/cli.py:915-919`）。
-- `jsonl` はサーバーの標準出力を標準エラーへ振り替え、イベントだけを標準出力に保ちます。`--quiet` 指定時は人間向け標準出力を `/dev/null` に振り替えます（`strata_cli/cli.py:868-873, 900-912`）。
-- 起動経路では inference server がポートを bind し、停止時には所有するリクエストの drain などを行います。これらは `--output` 自体の効果ではなく、選択した出力形式で同じ serve 実行を観測するものです（`serve/server.py:8645-8662, 8670-8710`）。
-- parser のヘルプは `--json` を「`--plan --output json` の alias」と説明しますが、実装は `--json` を指定すると `output=json` に変換するだけで、`plan` は有効にしません。そのため `--json` 単独は `--output json requires --plan` で拒否されます。説明と実装に不一致があり、計画 JSON には明示的に `--plan --output json` を指定してください（`strata_cli/cli.py:66, 915-918, 2232-2235`）。
+`json` / `jsonl` の選択は出力形式だけに作用する。`jsonl` はサーバーを前景で稼働させ、起動時から停止時までイベントを出力する。出力先ファイルの作成や設定の保存はこのオプションでは行わない。stdout の Broken pipe は JSONL の記録を止めるが、推論サービスは終了させない。
 
 ## 出力とエラー
 
-- 不正な値は parser が拒否し、`argparse` の usage とエラーを標準エラーへ出して終了コード2になります（parser 宣言 `strata_cli/cli.py:64-65`）。
-- `--output json` と `--plan` の不整合は `schema_version`、`ok: false`、`error.code`、`error.message` を含む JSON を出して終了コード2になります。`jsonl` と `--plan` の不整合は `event: "failed"`、`exit_code: 2`、`error.message` を持つ JSONL イベントになります（`strata_cli/cli.py:829-835, 915-919`）。
-- JSONL の通常イベントには `schema_version: 1` と `event`、時刻 `at`、各イベントに対応する項目が含まれます。stdout の Broken pipe はサービスを停止させず、イベント出力のみを閉じます（`strata_cli/cli.py:838-867`）。
-- JSON/JSONL 実行時の serve 処理で捕捉される `ValueError`、`OSError`、`ClientError`、割り込みは機械可読エラーへ変換されます。JSONL では `failed` イベント、JSON ではエラー JSON です（`strata_cli/cli.py:2166-2193`）。
+- 計画 JSON 成功時は `_success` が JSON 1件と終了コード 0 を出す。
+- `human` モードの `_serve_error` は `strata: <message>` を stderr に出す。`json` は `_error` のエラー JSON を stdout に出し、検査エラーは既定で終了コード 2。
+- `jsonl` の事前エラーは `{"schema_version":1,"event":"failed",...}` の1行を stdout に出す。サーバー実行中の例外は終了コード 6、割り込みは 130 として扱い、failed event を出す。停止時には server の返した終了コードが反映され、drain deadline 超過は 8。
+- 有効でない値は serve の実行関数に入る前に parser が拒否するため、出力形式ごとの JSON エラーにはならず、argparse の usage error となる。
 
 ## 根拠
 
-- `strata_cli/cli.py:46-67` — serve parser、`--output` の choices/default と `--json` の説明。
-- `strata_cli/cli.py:829-955` — serve 固有の出力・エラー処理、計画モード、foreground 実行。
-- `strata_cli/cli.py:527-542, 2166-2193, 2232-2243` — JSON success/error、例外処理、`--json` の変換。
-- `serve/server.py:8127-8137, 8645-8710` — JSONL で利用する lifecycle 通知とサーバー側の状態遷移。
-
-調査対象の checkout は `main` で `git status --short --branch` は `## main...origin/main`（変更表示なし）でした。既存の CLI help は実行せず、同一 revision の parser と実装を根拠にしています。
+- `terminal/strata_cli/cli.py:67-88` — serve parser、`--output` の choices と既定値、`--json` の help。
+- `terminal/strata_cli/cli.py:558-573` — 成功・失敗時の human / JSON 出力と終了コード。
+- `terminal/strata_cli/cli.py:821-864` — 計画の構築、エンジン引数の redaction、plan の内容。
+- `terminal/strata_cli/cli.py:868-874, 877-936` — JSONL failed record、lifecycle event の stdout 出力、Broken pipe と例外処理。
+- `terminal/strata_cli/cli.py:939-994` — human / JSONL の前景実行、JSON と JSONL の `--plan` 制約、serve の validation error。
+- `terminal/strata_cli/cli.py:2194-2198, 2248-2275, 2325-2343` — serve の dispatch、例外整形、`--json` が `output` のみを書き換える処理。
+- `terminal/serve/server.py:9145-9155, 9763-9822` — ready、停止・drain・stopped event とサーバー終了コード。

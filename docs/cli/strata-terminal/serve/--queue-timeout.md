@@ -1,6 +1,6 @@
-# `strata serve --queue-timeout`
+# `--queue-timeout`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,56 +8,52 @@
 | コマンド | `strata serve` |
 | オプション | `--queue-timeout` |
 | 別名 | なし |
-| 値 | 秒数（有限の数値、0.1〜600、両端を含む） |
+| 値 | 秒数（浮動小数点数、有限値 `0.1..600`） |
 
 ## 役割
 
-推論要求が engine の最初の turn を得るまで待てる上限時間を設定します。待機要求に期限を付けるには、待機要求数を制限する `--max-queue` も必要です。期限を省略すると無効（期限なし）です。
+API 推論リクエストが最初のエンジン処理ターンを待つ時間に上限を設定する。キュー待ちが期限を超えると、そのリクエストを `queue_wait_timeout` として失敗させる。待ち時間の上限を設ける設定であり、エンジンが最初のプロンプトを受け取った後の生成時間は制限しない。
 
 ## 使い方
 
 ```sh
-strata serve --profile ./run-config.json --max-queue 32 --queue-timeout 15
+strata serve --profile ./run-config.json --max-queue 16 --queue-timeout 12.5
 ```
 
-`--profile` は `strata serve` で必須です。例では pending call を最大32件に制限し、それらが最初の engine turn を待つ時間を15秒にしています。プロファイルに値を保存して使う方法は `strata profile set <profile> max_queue=32 queue_timeout=15` です。
+`--queue-timeout` を使う場合は `--max-queue` も指定するか、選択した run config / 保存済み profile に `max_queue` を設定する。上の例では、キュー制限を有効にしたサーバーで待ち期限を 12.5 秒にする。
 
 ## 値と既定値
 
-- Terminal CLI parser は `float` として読み取ります。範囲外、`nan`、`inf` は受理されません。明示値がなければ `None`（期限なし）です。
-- 値を省略した場合、保存プロファイルの `queue_timeout`、次に run config の `queue_timeout` があればそれを使います。明示した CLI 値は両方より優先します。値は起動時に有効設定へ解決され、launch plan の `effective` と `origin` に反映されます。
-- CLI の parser は通常の `argparse` の値格納を使うため、同じ指定を複数回書いた場合は最後に解析された値が残ります。特別な複数値処理はありません。
-- 値の指定漏れや数値として解析できない値は CLI parser のエラーです。有限性と範囲は CLI 側と server 側で検査されます。
+- Terminal CLI とサーバーの parser は値を `float` に変換する。受理範囲は有限値 `0.1..600` 秒（両端を含む）。`nan`、無限大、範囲外は受理されない。
+- 未指定時の値は `None` で、待ち期限は無効。設定ファイルの `queue_timeout` があればそれを使う。
+- `strata serve` では明示した CLI 値が保存済み profile の override より優先し、次に run config、最後に既定値が使われる。設定値が出所の場合も同じ範囲検証を行う。
+- `queue_timeout` が有効なのに `max_queue` が未設定なら起動前に拒否される。`max_queue=0` は設定上有効な値だが、過負荷時の追加待機を許さない。
 
 ## 実行時の動作
 
-1. `strata serve` は CLI 値、保存プロファイル、run config の順に設定を解決します（上位の値を優先）。run config 由来の値は設定ファイルのまま server に渡し、それ以外の有効値は server argv に `--queue-timeout <秒数>` として渡します。
-2. server は CLI 値があればそれを、なければ run config の `queue_timeout` を選び、有限数かつ `0.1 <= 値 <= 600` であることを確認します。`bool` は数値の派生型ですが明示的に不許可です。
-3. `queue_timeout` が有効なのに `max_queue` が未設定なら、server は `--queue-timeout requires --max-queue / max_queue to bound pending calls` で起動を拒否します。Terminal CLI の有効設定検査でも同じ組み合わせを拒否します。`--max-queue 0` は有効な値ですが、待機枠を設けず overload を受け付けない設定です。
-4. 要求が inference 実行へ入ると単調時計による deadline を設定します。シリアル時は FIFO の turn を待つ間、並列 engine 時は制御線や slot を待つ間に期限を確認します。要求を engine に送信して最初の turn が始まると deadline を消去するため、生成全体や最初の token の待ち時間を制限する timeout ではありません。
-5. timeout の回数は server の `queue_timeouts` カウンタに加算されます。telemetry の `work.queue_timeout_s` と `work.queue_timeouts` に設定値・累積回数が載り、monitor 表示にも使われます。
+`strata` の Terminal CLI は有効値を `--queue-timeout <秒>` としてサーバー起動引数へ転送する。CLI 指定値は profile / run config の値より優先され、CLI から渡さない場合は設定値が使われる（`terminal/strata_cli/cli.py:783-809`, `terminal/strata_cli/cli.py:833-840`）。サーバーは CLI 値を設定ファイルの `queue_timeout` より優先し、検証後に `Service.queue_timeout_s` に格納する（`terminal/serve/server.py:9289-9298`, `terminal/serve/server.py:9498-9499`）。
 
-`max_queue` は同時 admission 上限にも関与します。上限は engine の有効 slot 数に `max_queue` を加えた数で、これを超える要求は待ち続けず `admission_full` として HTTP 429 になります。`--queue-timeout` はこの admission 上限とは別に、受け入れ済み要求が turn を待てる時間を制限します。
+サーバーはリクエストが API key ごとの同時実行上限で待つ場合に期限を設け、エンジン処理へ進む `_run` 側でも期限を設定する。したがって、API key 制限待ちとエンジン待ちは別々の待ちとして期限が適用され、両方を通るリクエストは合計で設定値の約 2 倍まで待つ場合がある。エンジン側の期限は FIFO の単一ターン待ち、または batch engine が未ロードのときのロード待ちに渡される。エンジンが最初のプロンプトを受け入れた後は、この期限によって生成を中断しない（`terminal/serve/server.py:5854-5862`, `terminal/serve/server.py:5997-6001`, `terminal/serve/server.py:6023-6044`, `terminal/serve/server.py:6063-6067`）。
+
+`--max-queue` は別途、実効エンジンスロット数に追加する HTTP admission 上限を定める。`--queue-timeout` 自体は待機枠数を決めず、`max_queue` なしでは利用できない。admission 上限到達時は待たせず `admission_full` を返し、待機中の期限切れは `queue_wait_timeout` になる（`terminal/serve/server.py:4354-4357`, `terminal/serve/server.py:7775-7791`）。
 
 ## 適用条件と副作用
 
-- 有効になるのは `strata serve` が起動する server の推論要求です。期限が来ると、その要求は engine に送信されず、待機状態から終了します。engine に送信済みの処理をキャンセルしたり、server 全体を停止したりする指定ではありません。
-- timeout は OpenAI chat completions、OpenAI responses、Anthropic messages 等の推論経路で処理されます。通常の非 stream 要求では HTTP 429 と `queue_wait_timeout` が返り、`Retry-After: 1` が付きます。stream 要求では HTTP headers の送信後に API 形式の error event が送られ、stream が終了します。
-- 保存プロファイルや run config に設定する場合も同じ有限範囲と `max_queue` 必須条件が適用されます。profile assignment の数値変換・検証は調査対象ソースの `strata_control/profiles.py` にあります（行番号は根拠を参照）。
-- CLI の起動時エラーは human 出力では stderr に `strata: ...` と表示され、通常 exit code 2 です。JSON モードではエラー object、JSONL モードでは `failed` event を stdout に出します。server parser の `ap.error` も usage とエラーを stderr に出し、argparse の標準エラー終了になります。
+- この設定は `strata serve` が起動するサーバーインスタンスに適用され、保存済み profile や run config 自体を書き換えない。
+- 待機中にクライアントが切断した場合は、期限切れ応答ではなく切断として扱われる。待機リクエストは `queued` 状態から除去され、期限切れ時は `queue_timeouts` カウンターが増える（`terminal/serve/server.py:6030-6046`, `terminal/serve/server.py:6516-6536`）。
+- `/v1/telemetry` の `work.queue_timeout_s` に設定値が現れ、`work.queue_timeouts` に累計期限切れ数が記録される（`terminal/serve/server.py:7464-7472`）。
+
+## 出力とエラー
+
+- CLI は非有限値または範囲外の値を `--queue-timeout must be finite seconds in 0.1..600` で拒否し、`max_queue` がない場合は `--queue-timeout requires --max-queue / max_queue to bound pending calls` で拒否する（`terminal/strata_cli/cli.py:954-967`, `terminal/serve/server.py:9293-9298`）。
+- 非ストリーミング推論の期限切れは HTTP 429、エラーコード `queue_wait_timeout`、`Retry-After: 1` となる（`terminal/serve/server.py:7885-7890`, `terminal/serve/server.py:8374-8376`）。
+- ストリーミングでは HTTP ヘッダー送信後に期限切れとなるため、HTTP ステータスを 429 に変更せず、OpenAI Chat Completions、Anthropic Messages、Responses のそれぞれの形式でエラーイベントを送る（`terminal/serve/server.py:8274-8278`, `terminal/serve/server.py:8417-8418`, `terminal/serve/server.py:8576-8580`）。
 
 ## 根拠
 
-- `strata_cli/cli.py:46-56` — `serve` parser、`--queue-timeout` の `float` 値指定。
-- `strata_cli/cli.py:745-779` — CLI / saved profile / run config の優先順位と `max_queue` 必須条件。
-- `strata_cli/cli.py:782-805` — run config 由来でない有効値を server argv へ転送。
-- `strata_cli/cli.py:829-835, 915-939` — 値の範囲検証と CLI エラー出力経路。
-- `serve/server.py:8165-8168, 8259-8268` — server parser、config fallback、有限値・範囲・`max_queue` の検証。
-- `serve/server.py:3962-3965, 3981-3996` — admission limit（engine slots + `max_queue`）と超過時カウンタ。
-- `serve/server.py:5171-5174, 5201-5218` — request deadline の設定とシリアル FIFO 待機中の期限処理。
-- `serve/server.py:1690-1717, 1809-1817, 1876-1880, 1935-1945` — control / slot 待機中の確認、および engine turn 送信時に期限を解除する処理。
-- `serve/server.py:5570-5590, 8444-8446` — timeout 回数の加算と Service への設定。
-- `serve/server.py:6487-6501, 6857-6862, 7192-7199, 7264-7266, 7300-7304, 7425-7429` — telemetry と非 stream / stream の timeout 応答。
-- `strata_control/profiles.py:66-95, 98-117` — 保存プロファイルの `queue_timeout` 値変換と検証。
-
-調査範囲は上記 commit の Terminal CLI と `serve/server.py` のソースです。同一 revision の `--help` や Release 配布物との照合は行っていません。実際の GPU/backend ごとの待ち時間差や server 外部の HTTP client の再試行動作は確認していません。
+- Parser と型: `terminal/strata_cli/cli.py:67-77`（`strata serve` の引数。`--profile` / `--config` も同じ command scope）、`terminal/serve/server.py:9183-9186`（サーバー parser）。
+- Terminal CLI の優先順位・転送・検証: `terminal/strata_cli/cli.py:783-809`, `terminal/strata_cli/cli.py:833-840`, `terminal/strata_cli/cli.py:954-967`。
+- サーバー側の設定優先順位・範囲・必須条件・格納: `terminal/serve/server.py:9289-9299`, `terminal/serve/server.py:9498-9499`。
+- 待機期限の設定・適用とキュー整理: `terminal/serve/server.py:5854-5865`, `terminal/serve/server.py:5997-6001`, `terminal/serve/server.py:6023-6046`, `terminal/serve/server.py:6516-6536`。
+- admission 制限と API エラー経路: `terminal/serve/server.py:4354-4357`, `terminal/serve/server.py:7775-7791`, `terminal/serve/server.py:7885-7890`, `terminal/serve/server.py:8274-8278`, `terminal/serve/server.py:8374-8376`, `terminal/serve/server.py:8576-8580`。
+- テレメトリ項目: `terminal/serve/server.py:7464-7472`。
