@@ -1,49 +1,51 @@
 # `FNX_DRAFT_SAMPLE`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。対象は Strata 所有ソース。外部ライブラリの動作は含めない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 ## 役割
 
-sFNX split engine の MTP draft token を、draft head の argmax で固定するか、draft head が出す候補とサンプリング設定から抽選するかを切り替えます。未設定時はサンプリング draft が有効です。ただし通常の `Session::generate()` では、sampling が有効なときにだけこの環境変数を読みます。temperature が 0 以下なら draft は argmax のままで、この設定は参照されません。
+温度サンプリング時に、通常の MTP draft head が提案 token を自分の分布からサンプルするか、argmax に固定するかを切り替える。未設定時は有効（`1` 相当）。`0` にすると draft token は argmax になるが、検証側は固定提案として扱い、対象モデルの出力分布から受理・棄却後の token を選ぶ処理を続ける。したがって、この変数は draft の提案方法を変えるもので、検証後の出力 sampler を greedy に切り替えるものではない（`engine/src/split/src/session.cpp:403-411,440-450,490-524`）。
 
-適用先は `STRATA_BUILD_SPLIT` で別途有効化する opt-in split engine です。Strata の通常 engine 全般を制御する設定ではありません。CMake の設定は既定 OFF で、split engine は Linux の CUDA/HIP 向けに構成されています（`CMakeLists.txt:2945-2949`, `src/split/CMakeLists.txt:1-5`）。
+単一 lane の `Session::generate` と、複数 lane 用 `BatchDecoder` の双方で読み取る。対象は Strata の split engine（`engine/src/split/src/`）であり、一般の全 engine 共通設定ではない。通常の MTP draft head を使う経路に効く。lookup の後続固定 draft 自体や DFlash2 の提案方法をこの変数がサンプル化するわけではない（`engine/src/split/src/session.cpp:595-619`; `engine/src/split/src/batch.cpp:262-288,330-379`）。
 
 ## 値と判定
 
-`env_int("FNX_DRAFT_SAMPLE", 1)` が環境値全体を符号付き base-10 `long long` に変換し、その結果が 0 かどうかで判定します。未設定の既定値は `1` です。0 以外の整数（負数も含む）は有効、0 は無効です。値の範囲制限や clamp はありません。
+共通 helper `env_int` が `getenv` で値を得て、符号付き base-10 `long long` として文字列全体を parse する。先頭の `+` / `-` は許されるが、空文字、空白、末尾文字、数値範囲外は無効で、`std::runtime_error` を投げる。整数を `!= 0` で bool 化するため、`0` のみ無効、0 以外の全整数が有効。clamp や値域検査はない（`engine/src/split/src/env.hpp:15-21,33-40`）。
 
-| 値 | 結果 |
-| --- | --- |
-| 未設定 | `1` として扱い、sampling draft を許可 |
-| `0`, `+0`, `-0` | 無効 |
-| 0 以外の整数（例: `1`, `-1`, `12`） | 有効 |
-| 空文字、前後の空白、整数以外の文字、範囲外の整数 | 変換エラー |
+| 条件 | 未設定 | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `Session::generate` で温度 `> 0` | `1`（有効） | `1`, `-1`, `+2`, `01` | `0`, `+0`; 空文字、`true`, `0anything`, ` 1`, `1 ` は整数 parse エラー |
+| `Session::generate` で温度 `<= 0` | helper を呼ばず、この変数を読まない | ― | 値が不正でも、この経路では本変数による parse エラーは起きない |
+| `BatchDecoder` の構築 | `1`（有効） | `1`, `-1`, `+2`, `01` | `0`, `+0`; 空文字、`true`, `0anything`, ` 1`, `1 ` は整数 parse エラー |
 
-変換は `strtoll` を使いますが、先頭文字が符号または数字であること、文字列末尾まで数字列として消費されること、overflow/underflow でないことも検査します。そのため ` 1`, `1 `, `1x`, 小数、空文字は受理されません。無効な文字列は `FNX_DRAFT_SAMPLE: '<値>' is not a whole number` という例外になります（`src/split/src/env.hpp:15-21,33-40`）。
+helper に CLI 引数や設定ファイルからの上書きはなく、既定値は単一 lane・batch とも `1`。batch では lane ごとの温度判定と AND され、各 lane の温度が `0` ならその lane の draft はサンプリングされない（`engine/src/split/src/batch.cpp:65-87,105-118`）。
 
 ## 有効になる条件
 
-- `Session::generate()` では、まず sampling 設定の検査後に `sample = (temperature > 0)` を計算します。`sample` が false のとき C++ の短絡評価で `env_int()` 自体を呼ばないため、greedy 生成では値を読まず、誤った値でもこの経路からは変換エラーになりません（`src/split/src/session.cpp:397-410`）。
-- `sample` が true で、かつ環境値が 0 以外なら draft 候補を sampling します。環境値が 0 なら draft head の argmax を使います（`src/split/src/session.cpp:439-449`）。
-- batch decoder は `BatchDecoder` の構築時に無条件で値を読み、decoder インスタンスの `samp_drafts_` に保存します。実際の batch lane では、さらにその lane の `temperature > 0` が必要です（`src/split/src/batch.cpp:64-76,104-116`）。したがって batch decoder を作る経路では、greedy lane だけでも不正値は構築時の例外になります。
-- CLI 引数による `FNX_DRAFT_SAMPLE` の上書きは見つかりません。CLI 等から渡された sampling 設定のうち、コード上この環境変数との併用条件になっているのは temperature です。
+- `Session::generate` は `temperature > 0` のときだけ `FNX_DRAFT_SAMPLE` を読み、`sample && env_int(...) != 0` を draft sampling の条件にする。温度 `0` の greedy 生成では設定値によらずこの変数を読まない（`engine/src/split/src/session.cpp:398-411`）。
+- MTP の通常 draft head の候補を使う場合に効く。`1` では draft head の候補から `Sampling`（temperature、top-k / top-p / min-p）に従い draw し、その分布 `q` を検証に渡す。`0` では draft head の argmax を固定提案として渡す（`engine/src/split/src/session.cpp:440-450,490-524`; `engine/src/split/src/batch.cpp:105-118`）。
+- `Session::generate` が DFlash2 (`e_.df2_on()`) 経路に入ると draft head の `draft_one` を通らず、この設定による proposal sampling は行われない（`engine/src/split/src/session.cpp:453-456,565-593`）。
+- Batched decoding では `BatchDecoder` が構築される必要がある。`FNX_BATCH_DRAFTS=0` なら batch drafts は off で decoder は作れず、`lookup` モードは lookup draft のみを供給するため MTP draft head のサンプリング設定は使わない。`FNX_BATCH_DRAFTS` の未設定または `1` の MTP mode では batch decoder が本変数を使う（`engine/src/split/src/engine_common.cu:1044-1052`; `engine/src/split/src/batch.cpp:65-78,262-288`）。
+- penalty 適用は別条件で、`FNX_DRAFT_PEN` と request の penalty 設定により決まる。本変数は draft token の選び方を制御し、draft logits への penalty 適用を単独では有効化しない（`engine/src/split/src/session.cpp:406-411,440-445`; `engine/src/split/src/batch.cpp:70-77,105-110`）。
+- OS / CUDA・HIP build macro による本変数自体の分岐は、読み取り箇所にはない。batch draft 実行形態には別途 `FNX_HIP` 分岐があるが、`samp_drafts_` の値判定は共通（`engine/src/split/src/batch.cpp:72-77`）。
 
 ## 実行時の詳細
 
-Session 経路では `Session::generate()` の呼び出しごとに値を評価し、結果を関数内ローカル変数に持ちます。プロセス全体の static cache ではありません。sampling が有効な場合、draft 呼び出しに候補出力を要求し (`Engine::draft(..., samp_drafts)`)、候補一覧から同じ `Sampling` の設定で分布を作って抽選します。無効の場合は候補出力を要求せず、draft head の argmax が draft token になります（`src/split/src/session.cpp:439-449`, `src/split/src/engine_common.cu:1371-1379`）。
+`Session::generate` は各 generate 呼び出しの冒頭で、サンプリング時に `env_int("FNX_DRAFT_SAMPLE", 1)` を評価する。`env_int` 自体には static cache がないため、呼び出しごとの環境値を読む。greedy 時は短絡評価で読み取りを省略する（`engine/src/split/src/session.cpp:398-411`; `engine/src/split/src/env.hpp:33-40`）。
 
-sampled output の検証では、各 draft に対応する分布 `q` を用いて受理確率を計算し、不受理時は target 分布から draft 分布を差し引いた分布で補います。固定 draft の場合は `q` をその token に質量 1 の分布として扱います。このため、この変数は draft の選び方を変えますが、最終 token を draft head の分布から単純に出力する設定ではありません（`src/split/src/session.cpp:481-522`）。
+`BatchDecoder` は構築時に一度値を読んで `samp_drafts_` に保持し、その decoder の各 lane と window で再利用する。既に構築された decoder では、後から環境値を変えてもこの bool は更新されない（`engine/src/split/src/batch.cpp:65-87,105-118,382-403`; `engine/src/split/src/batch.hpp:62-65`）。
 
-batch 経路も同様に、sampling lane で `make_dist()` と lane RNG による抽選を行います。ここで読み取った値は `BatchDecoder` オブジェクトの寿命中保持されます（`src/split/src/batch.cpp:64-76,104-116,373-394`）。
+有効値かつ温度サンプリングでは、MTP 提案を draft head の分布 `q` から draw し、検証時に対象モデル側の分布 `p` に対して `min(1, p/q)` の受理判定を行う。棄却時は正の部分 `max(0, p-q)` から置換 token を引く。無効値 `0` では draft argmax を `q` が空の固定提案として扱い、同じ検証で argmax が受理されるか、棄却時にモデル側の分布から補う（`engine/src/split/src/session.cpp:447-450,490-524`; `engine/src/split/src/batch.cpp:113-118,185-216`）。コードコメントは、いずれの場合も出力分布はモデル側のものとしている（`engine/src/split/src/session.cpp:407-409`）。
 
-不正値は共通 helper が `std::runtime_error` を投げます。standalone `fnx_run` の main は例外を stderr に `fnx_run: <例外内容>` と出し、終了コード 1 を返します（`src/split/tools/fnx_run.cpp:44-53`）。別の呼び出し元では、その呼び出し元の例外処理が結果を決めます。
+## ログと測定値
+
+この変数専用の成功ログや値の表示はない。読み取り箇所で無効な整数を渡すと `env_int` が `NAME: 'VALUE' is not a whole number` 形式の例外を投げる（`engine/src/split/src/env.hpp:34-39`）。`fnx_run` は `fnx_run: <例外内容>` を stderr に出して終了コード `1` を返す。`sfnx` では例外が `fail()` に届くと `ERR <例外内容>` を stdout に、`sfnx: failed: <例外内容>` を stderr に出し、終了コード `1` で終了する。batch decoder は `--batch > 1` かつ batch drafts 有効時に `Server` 構築中に作られるため、その場合は不正値が起動時にこの経路へ届く（`engine/src/split/tools/fnx_run.cpp:1365-1373`; `engine/src/split/tools/sfnx.cpp:448-458,1097-1102,1107-1115`）。
 
 ## 根拠
 
-- 候補一覧には `FNX_DRAFT_SAMPLE` が載っています（strata-envvars `docs/envvars/000_envvers.md:534`）。Strata 本番ソースの完全一致参照は `src/split/src/session.cpp:406-410`, `src/split/src/batch.cpp:76`, `src/split/src/batch.hpp:62`。header の記載は注釈で、読み取り箇所は `session.cpp` と `batch.cpp` の2箇所です。
-- 整数 parse と例外文言: `src/split/src/env.hpp:15-21,33-40`。
-- sampling 条件、draft head 呼び出し、候補からの抽選: `src/split/src/session.cpp:397-410,439-449`。
-- verify 時の sampled/fixed draft 処理: `src/split/src/session.cpp:481-522`。
-- batch decoder の読み取り時期と lane ごとの sampling 条件: `src/split/src/batch.cpp:64-76,104-116,373-394`。
-- split engine の opt-in build 条件: `CMakeLists.txt:2945-2949`, `src/split/CMakeLists.txt:1-5`。
-- `docs/DETAILS.md` と他の設計文書に、この環境変数固有の追加条件や測定結果は見つかりませんでした。
+- 整数 parse と未設定時 fallback: `engine/src/split/src/env.hpp:15-21,33-40`
+- 単一 lane の温度 gate、draft 候補 draw、および検証: `engine/src/split/src/session.cpp:398-411,440-450,490-524`
+- DFlash2 分岐と通常 MTP draft への移行: `engine/src/split/src/session.cpp:453-456,565-619`
+- batch decoder の読み取り・保持と lane 温度 gate: `engine/src/split/src/batch.cpp:65-87,105-118,382-403`; `engine/src/split/src/batch.hpp:62-65`
+- batch mode の既定値および off / lookup / MTP の区別: `engine/src/split/src/engine_common.cu:1044-1052`; `engine/src/split/src/batch.cpp:262-288`
+- `fnx_run` / `sfnx` の例外出力: `engine/src/split/tools/fnx_run.cpp:1365-1373`; `engine/src/split/tools/sfnx.cpp:448-458,1097-1115`

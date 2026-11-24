@@ -1,42 +1,48 @@
 # `AOT`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。調査時の作業ツリーは `main...origin/main` で変更なし。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 ## 役割
 
-`AOT` は SYCL GPU エンジンのビルド用シェルスクリプトが参照する環境変数です。`sycl/tools/build.sh` と `packaging/build_sycl_linux.sh` が値を CMake の `STRATA_SYCL_AOT` に渡し、空でなければ SYCL の ahead-of-time device target を指定します。実行時の Strata エンジンが `AOT` を読む箇所は見つかりません。
+`AOT` は SYCL 用ビルドスクリプトが CMake の `STRATA_SYCL_AOT` に渡すビルド時設定で、指定時は GPU device code を `spir64_gen` 向けにコンパイルする。未指定または空なら CMake は `-fsycl` のみを使う JIT 用構成にする。Strata のエンジン実行時に `AOT` を読む箇所はなく、ビルド成果物の構成を選ぶ変数である（`engine/sycl/tools/build.sh:38-44`、`tools/packaging/build_sycl_linux.sh:20-24,49-59`、`engine/sycl/CMakeLists.txt:50,98-105`）。
+
+この値は次の二つの Strata 所有スクリプトで読まれる。開発用 `engine/sycl/tools/build.sh` は値を検証せず CMake に渡し、さらに `bmg` / `lnl` 始まりかを既知の `ocloc` 不具合の事前チェックに使う。Linux engine package 用 `tools/packaging/build_sycl_linux.sh` は Battlemage 用値だけを受け付ける。どちらも実行時の CLI 引数や環境変数による選択ではない。
 
 ## 値と判定
 
-| 入口 | 未設定・空文字 | 非空値 | 検証・失敗 |
-| --- | --- | --- | --- |
-| `sycl/tools/build.sh` | `${AOT:-}` を空として CMake に渡す。JIT 構成になる | 値を文字列として `-DSTRATA_SYCL_AOT=...` に渡す | このスクリプト自体は一般的な値検証をしない。`bmg` または `lnl` で始まる値は別途 `ocloc` 既知不具合ガードの対象 |
-| `packaging/build_sycl_linux.sh` | `aot` は空。CMake には AOT 指定を追加せず、成果物メタデータは `JIT from SPIR-V` とする | `bmg-*` またはカンマ区切りの `bmg-*` 形式を許可し、CMake に渡す | 他の形式は `build_sycl_linux.sh: AOT is empty ...` を stderr に出して終了コード 2。非空なら `ocloc` が PATH に必要で、なければ `AOT needs ocloc ...` を出して終了コード 2 |
+| 条件（build など） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `engine/sycl/tools/build.sh` | `${AOT:-}` は空文字。CMake に空の `STRATA_SYCL_AOT` を渡す | 任意の非空文字列を CMake に渡す（`0`、`1`、`true`、`false` もすべて非空）。`bmg-g31`、`lnl-*`、`pvc-*` はそれぞれ記載の CMake 分岐に一致 | スクリプト段階では無効値検査なし。空白や未知の文字列も転送され、CMake/toolchain の処理に委ねられる |
+| `tools/packaging/build_sycl_linux.sh` | `${AOT:-}` が空文字。JIT package の経路 | `bmg-*` 1 件、または `bmg-*,bmg-*` の2件（例 `bmg-g21,bmg-g31`） | `0`、`1`、`true`、`false`、空白、Battlemage 以外の文字列など上記以外は stderr に `build_sycl_linux.sh: AOT is empty (the release package) or a Battlemage device list such as bmg-g21,bmg-g31` を出して status 2 で終了 |
 
-値の数値変換や真偽値化はありません。`sycl/tools/build.sh` では `bmg` / `lnl` の先頭一致を既知 `ocloc` ガードに使い、CMake に値全体を渡します。パッケージ用スクリプトは空文字を除き `bmg-` で始まる形式に制限します。どちらもデバイス名の完全な妥当性をここでは確認せず、実際のコンパイルを下流に委ねます。
+いずれも空文字は未設定と同じ値として扱われる（開発用は `${AOT:-}`、package 用は代入後の `$aot` が空かを判定）。値を大文字小文字変換したり、数値として parse したりする処理はない。開発用の事前チェックは Bash の正規表現 `^(bmg|lnl)` なので、文字列全体ではなく先頭だけを照合する。package 用の `case` は大文字小文字を区別し、シェル glob による形状検査であり device 名の詳細までは検証しない（`engine/sycl/tools/build.sh:25`、`tools/packaging/build_sycl_linux.sh:20-24`）。
 
 ## 有効になる条件
 
-- 対象は SYCL ビルド入口だけです。CUDA/HIP の実行時設定、CLI 引数、モデル状態で `AOT` を有効化する経路はありません。
-- CMake は `STRATA_SYCL_AOT` が空でないとき `spir64_gen` target を使い、`-device <値> -options -cl-fp32-correctly-rounded-divide-sqrt` を device compiler 向けの link option に設定します。空の場合は通常の `-fsycl` を使い、JIT build 用の `spir64` backend option を設定します。
-- CMake の値が `bmg` / `lnl` で始まる場合は `STRATA_XMX_SG16=1`、`pvc` で始まる場合は `STRATA_NO_DG2_XMX=1` を定義します。また `STRATA_SYCL_I8_ESIMD=AUTO` かつ AOT 値が非空で `bmg` / `lnl` 以外なら fused int8 ESIMD kernels を stub にします。これは同じビルドの別設定との相互作用です。
-- `sycl/tools/build.sh` は `AOT` が `bmg` / `lnl` で始まり、`I8_ESIMD` が `OFF` でなく、`ALLOW_BAD_OCLOC` が `1` でない場合に `ocloc --version` を調べます。既知の失敗版 `26.22.38646`（および同じ prefix の suffix 付き版）なら説明を stderr に出して終了コード 2 にします。version を取得できない場合、このガードによる停止はありません。
+- SYCL をビルドし、`engine/sycl/tools/build.sh` または `tools/packaging/build_sycl_linux.sh` のいずれかを使うこと。CUDA/HIP や既に作成済みのバイナリの実行時にはこの環境変数を読む経路がない（各スクリプトの CMake 呼び出し: `engine/sycl/tools/build.sh:40-41`、`tools/packaging/build_sycl_linux.sh:49-51`）。
+- `engine/sycl/tools/build.sh` で `AOT` が非空なら、CMake は `-fsycl-targets=spir64_gen` と `-device ${STRATA_SYCL_AOT}` を含む linker option を構成する。空なら `spir64_gen` の AOT target は加えず、JIT 用の `spir64` オプションを使う（`engine/sycl/CMakeLists.txt:98-124`）。
+- `bmg` または `lnl` で始まる値は `STRATA_XMX_SG16` を定義する。`pvc` で始まる値は `STRATA_NO_DG2_XMX` を定義する。これらは文字列の先頭一致で、先頭一致しない未知値でも AOT の CMake 分岐自体は非空判定で入る（`engine/sycl/CMakeLists.txt:72-76,98-105`）。
+- `STRATA_SYCL_I8_ESIMD=AUTO` かつ AOT が非空で `bmg` / `lnl` 始まりでない場合、CMake は fused int8 ESIMD kernels を stub にする。`STRATA_SYCL_I8_ESIMD=OFF` なら AOT 値にかかわらず stub になる（`engine/sycl/CMakeLists.txt:78-97`）。
+- `STRATA_SYCL_TLA_ATTN=ON` を指定する構成では `STRATA_SYCL_AOT` が厳密に `bmg-g31` でなければ configure が fatal error になる（`engine/sycl/CMakeLists.txt:313-323`）。
+- `STRATA_SYCL_TLA_EXPERT_GU` の自動有効化条件には、AOT が空、または `bmg-g21` / `bmg-g31` だけからなるカンマ区切りリストであることが含まれる。Level Zero と必要なローカル header も必要（`engine/sycl/CMakeLists.txt:338-362`）。
+- 開発用スクリプトでは `AOT` が `bmg` / `lnl` 始まり、`I8_ESIMD` が `OFF` でなく、`ALLOW_BAD_OCLOC` が `1` でない場合に `ocloc --version` を調べる。既知の版 `26.22.38646` または `26.22.38646.*` なら警告を stderr に出して configure/build 前に status 2 で終了する（`engine/sycl/tools/build.sh:15-35`）。
+- package 用スクリプトでは AOT 値が非空なら `ocloc` が PATH 上に必要で、なければ `build_sycl_linux.sh: AOT needs ocloc (apt install intel-ocloc)` を stderr に出して status 2 で終了する。package 用スクリプトの許容値は Battlemage 形状に限定される（`tools/packaging/build_sycl_linux.sh:20-24,37`）。
 
 ## 実行時の詳細
 
-`sycl/tools/build.sh` は、`build.ninja` がまだない場合にだけ `AOT` を CMake configure に渡します。既存 build directory ではこのスクリプトのコメントどおり CMake cache が維持されるため、後から `AOT` を変更しても AOT target の切替には反映されません（ただし既知 `ocloc` 版の事前チェックは呼び出しごとに評価されます）。値が空なら新規 configure は空の `STRATA_SYCL_AOT` を設定します。
+`AOT` は各シェルスクリプトの起動時に参照され、その呼び出し中の値が CMake configure 引数に展開される。実行中に環境を書き換えて再評価する処理や、エンジンからの再読み取り・cache はない。開発用スクリプトは `$BUILD_DIR`（既定 `$repo/build-sycl`）に `build.ninja` が既にあるとき CMake configure を省くため、新しい `AOT` 値は既存 build directory の cache には反映されない。スクリプト自身も「既存 build folder keeps its cache」と記している（`engine/sycl/tools/build.sh:38-43`）。package 用スクリプトは毎回 `cmake -S engine/sycl -B "$build" ...` を実行し、非空値だけ `-DSTRATA_SYCL_AOT=$aot` を渡す（`tools/packaging/build_sycl_linux.sh:49-51`）。
 
-`packaging/build_sycl_linux.sh` は毎回 CMake を呼び、`AOT` が非空なら `-DSTRATA_SYCL_AOT=<値>` を渡します。空ならその引数を省略するため、既存 build directory の `STRATA_SYCL_AOT` cache を空に戻しません。空の値が JIT を選ぶのは、既存 cache に以前の AOT 値がない場合です。パッケージ処理では非空値をカンマで分割して `--arch` に渡し、`BUILD.json` に `AOT <値>`、空なら `JIT from SPIR-V` と記録します。
+`AOT` の値は子プロセス CMake にコマンドライン定義として渡され、コンパイル対象・SYCL flags・一部の compile definitions を決める。ビルド後の実行ファイルが `AOT` の環境値を参照するコードは、候補名の全参照検索では確認できなかった。package 用スクリプトは生成した `BUILD.json` に `AOT <値>` または `JIT from SPIR-V` を記録し、成果物を package 化する（`tools/packaging/build_sycl_linux.sh:57-59`）。
 
-観測できる出力・失敗は次のとおりです。
+## ログと測定値
 
-- `sycl/tools/build.sh` の既知版ガードは、該当条件で IGC/`ocloc` の既知クラッシュ説明と回避方法を stderr に出して `exit 2` します。
-- `packaging/build_sycl_linux.sh` は無効形式や `ocloc` 不在を stderr に出して `exit 2` します。
-- 通常ビルドでは `sycl/tools/build.sh` が `BUILD EXIT <status>` と `errors: <件数>` を出します。AOT 値自体による実際のコンパイル成否は `cmake` / device compiler の結果に依存し、ここでは未検証です。
+package 用スクリプトは許容外の値、`ocloc` 不在を上記の文言で stderr に報告して status 2 で終了する。開発用スクリプトは既知の `ocloc` 版を検出すると `build.sh: this image's ocloc is ... It is known to crash while it compiles the int8 ESIMD kernels for AOT=... (#3219).` を含む案内を stderr に出して status 2 で終了する。CMake 側では不適合な `STRATA_SYCL_TLA_ATTN` の組み合わせが fatal error になる。通常の AOT/JIT 選択だけを理由に Strata が出す実行時ログは見つからなかった（`engine/sycl/tools/build.sh:25-35`、`tools/packaging/build_sycl_linux.sh:20-24,37`、`engine/sycl/CMakeLists.txt:317-323`）。
+
+`docs/INTEL.md` と `docs/INTEL_ARC.md` は空値を JIT、Battlemage target を AOT とする説明で、現行 CMake の選択と整合する（`docs/INTEL.md:69-87`、`docs/INTEL_ARC.md:75-76,109-110`）。これらの文書にある起動時間や性能の記述はここでは測定値として引用しない。調査はソースを読む範囲に限り、build・GPU 実行・性能測定・テストは行っていない。
 
 ## 根拠
 
-- `sycl/tools/build.sh:25-35,38-47`: AOT prefix と他変数を使う既知 `ocloc` ガード、configure 時の受け渡し、build status。
-- `packaging/build_sycl_linux.sh:19-36,44-46,48-54,65-69`: 値の case 検証、`ocloc` 必須条件、CMake への受け渡し、ビルド識別情報と package architecture の設定。
-- `sycl/CMakeLists.txt:31,47-79,86-100`: `STRATA_SYCL_AOT` による target 選択、device 指定、XMX macro および JIT 用 option。
-- `docs/envvars/000_envvers.md:59` には候補 `AOT` がある。全参照を検索した結果、環境値を扱う本番箇所は上記2つのビルドスクリプトであり、他のソース・文書にある AOT は説明上の用語やテスト参照だった。
+- `engine/sycl/tools/build.sh:15-44` — 開発用スクリプトの値判定、警告・終了、CMake への転送、build directory cache。
+- `tools/packaging/build_sycl_linux.sh:18-59` — package 用スクリプトの許容値、ocloc 確認、CMake 転送、build metadata。
+- `engine/sycl/CMakeLists.txt:50-124` — AOT target 判定、compile definition、ESIMD 条件と SYCL flags。
+- `engine/sycl/CMakeLists.txt:313-362` — AOT target に依存する TLA configure 条件。

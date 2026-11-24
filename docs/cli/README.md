@@ -1,6 +1,6 @@
 # CLI コマンド・オプション索引
 
-調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 ## `strata-terminal`
 
@@ -1511,11 +1511,16 @@
 ### `strata-inkling` (CUDA/HIP; `engine/src/inkling2/ink_main.cpp`)
 
 - [コマンド概要](strata-inkling/root/README.md)
+- [`--batch-check`](strata-inkling/root/--batch-check.md)
 - [`--bench`](strata-inkling/root/--bench.md)
 - [`--chunk`](strata-inkling/root/--chunk.md)
 - [`--cpu`](strata-inkling/root/--cpu.md)
 - [`--cpu-threads`](strata-inkling/root/--cpu-threads.md)
 - [`--draft`](strata-inkling/root/--draft.md)
+- [`--draft-adapt`](strata-inkling/root/--draft-adapt.md)
+- [`--draft-beam`](strata-inkling/root/--draft-beam.md)
+- [`--draft-cost`](strata-inkling/root/--draft-cost.md)
+- [`--draft-plain`](strata-inkling/root/--draft-plain.md)
 - [`--dspark`](strata-inkling/root/--dspark.md)
 - [`--dump-ref`](strata-inkling/root/--dump-ref.md)
 - [`--ep-split`](strata-inkling/root/--ep-split.md)
@@ -1535,8 +1540,10 @@
 - [`--prompt-ids`](strata-inkling/root/--prompt-ids.md)
 - [`--prompt-len`](strata-inkling/root/--prompt-len.md)
 - [`--ram-experts-gb`](strata-inkling/root/--ram-experts-gb.md)
+- [`--ring-check`](strata-inkling/root/--ring-check.md)
 - [`--selfcheck`](strata-inkling/root/--selfcheck.md)
 - [`--serve`](strata-inkling/root/--serve.md)
+- [`--spec-check`](strata-inkling/root/--spec-check.md)
 - [`--ssd-experts`](strata-inkling/root/--ssd-experts.md)
 - [`--temp`](strata-inkling/root/--temp.md)
 - [`--threads`](strata-inkling/root/--threads.md)
@@ -1695,6 +1702,7 @@
 - [`--no-start`](source-setup/root/--no-start.md)
 - [`--output`](source-setup/root/--output.md)
 - [`--parallel`](source-setup/root/--parallel.md)
+- [`--peer-reserve-mib`](source-setup/root/--peer-reserve-mib.md)
 - [`--port`](source-setup/root/--port.md)
 - [`--prebuilt`](source-setup/root/--prebuilt.md)
 - [`--prepare-pack`](source-setup/root/--prepare-pack.md)

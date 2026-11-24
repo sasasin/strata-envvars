@@ -1,55 +1,47 @@
 # `FNX_ARENA`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。調査開始時の作業ツリーは `main...origin/main` で、未コミット変更はありません。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-24 時点）。
 
 ## 役割
 
-`strata-split` の sFNX エンジンで、最大の expert pool の VRAM slot を K/V pool が借りて拡張する arena 機能を選びます。未設定時は有効です。無効にすると expert slot を K/V pool に貸さず、K/V pool は独立した VRAM allocation になります。これはレイヤー分割等の全 Strata エンジン共通設定ではなく、`src/split` のモデル・エンジン経路で使われます。
-
-`FNX_ARENA=1` でも expert RAM cache が無効なら起動できません。arena は cache の expert slot を借りる機能であり、`FNX_EXPERT_RAM_GIB=off` と併用する場合は `FNX_ARENA=0` が必要です（`src/split/src/model.cpp:1474-1488`）。
+CUDA の all-cards split engine（`engine/src/split/src/`）で、MoE expert cache の最大 pool の slot を K/V pool が必要に応じて借りる arena を有効にする。未設定時は arena が有効で、`0` は無効、`1` は有効。arena 有効時は coldest-first に並べた expert slot を K/V page 用に貸し、使われなくなった page の slot を expert に戻す。`0` の場合はこの貸し借りを行わず、通常の K/V page pool を確保する。split launcher は専用実行設定へ `FNX_ARENA=0` を明示しているため、その経路では既定の arena は使わない（`engine/src/split/src/model.cpp:1517-1525`、`engine/src/split/src/engine.cu:319-327,390-413`、`terminal/strata_control/split_engine.py:267-284`）。
 
 ## 値と判定
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 有効。`arena = !arena_s || ...` により既定で ON。 |
-| `1` | 有効。 |
-| `0` | 無効。 |
-| 空文字、`true`、`false`、空白付き、その他の文字列 | 無効値として例外。文字列全体を `strcmp` で比較し、数値変換や前後空白の除去はしない。 |
+`Model::choose_residency()` が `std::getenv` で値を読み、文字列全体を `strcmp` で `0` または `1` と比較する。空文字も含め、それ以外はエラー。数値変換や空白除去、大文字小文字変換はしない（`engine/src/split/src/model.cpp:1514-1525`）。
 
-大文字小文字を変えた `TRUE` 等も受理されません。設定時に許される文字列は厳密に `0` と `1` の二つです。判定は `src/split/src/model.cpp:1476-1479` にあります。
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| `FNX_27B` 以外の PLAIN load で `choose_residency()` を呼ぶ split engine | arena ON | `1`（完全一致） | `0`（完全一致）。空文字、`true`、`false`、`01`、`0anything`、前後空白付きの値は無効値として例外 |
+| `FNX_27B` build、または `Model` の `PLAIN` 以外の load | 値をこの変数で判定しない | 該当なし | 該当なし |
+
+無効値の例外は `fnx: FNX_ARENA: 0 or 1, not '<値>'`。この設定は `FNX_EXPERT_RAM_GIB` と組み合わせて検査され、arena を有効にしたまま `FNX_EXPERT_RAM_GIB=off` にすると `fnx: FNX_EXPERT_RAM_GIB=off needs FNX_ARENA=0 (the arena lends the cache's slots)` で失敗する（`engine/src/split/src/model.cpp:1520-1533`）。
 
 ## 有効になる条件
 
-- **実行経路:** `Model::choose_residency()` が呼ばれる sFNX モデル経路で有効です。通常の plain load は `FNX_27B` が偽のビルドでこの関数をモデル読み込み中に呼びます（`src/split/src/model.cpp:1441-1443`）。sFNX の CMake ターゲットは `FNX_27B=0` を定義しています（`src/split/CMakeLists.txt:102-113`）。`FNX_27B` が真の plain-load 経路ではこの箇所から `choose_residency()` を呼ばないため、`FNX_ARENA` は読み取られません。
-- **他の環境変数:** `FNX_EXPERT_RAM_GIB` の既定は 3 GiB cache ありです。値が厳密に `off` なら cache 無しとなり、arena が有効の場合は `fnx: FNX_EXPERT_RAM_GIB=off needs FNX_ARENA=0 ...` で拒否します（`src/split/src/model.cpp:1475-1488`）。cache があると expert profile を読み、既定の `data/expert-routes.bin` または `FNX_EXPERT_PROFILE` の順位で expert residency を決めます（同 `:1489-1518`）。
-- **arena の容量:** arena 有効時に限り `FNX_ARENA_RESERVE_MIB`（既定 512 MiB）と、設定されていれば `FNX_ARENA_BASE_PAGES` が容量計算に使われます。これらは arena 自体の ON/OFF を変えません（`src/split/src/engine.cu:276-286,329-345`）。
-- **CLI:** `FNX_ARENA` を読む CLI 引数は見つかりませんでした。通常の run-config から自動選択される all-cards split engine では、ラッパーが既存の `env` をマージした後に `FNX_ARENA=0` と `FNX_EXPERT_RAM_GIB=off` を設定するため、親環境やプロフィールの `FNX_ARENA` 値はその子プロセスでは上書きされます（`strata_control/split_engine.py:250-264`）。`child_env()` は config の env を子環境に適用します（`serve/server.py:4054-4068`）。このラッパー経路では arena は意図的に使われません。
-- **モデル・要求状態:** 値はモデルの residency / expert placement と Engine 初期化に反映されます。個々の request で有効・無効を切り替える処理はありません。
+- `FNX_27B` ではないビルドで、モデルを `Load::PLAIN` として読み込む経路が値を評価する。コンストラクタはこの条件で `choose_residency()` を呼ぶ。`FNX_27B` build ではこの呼び出しがコンパイル対象外（`engine/src/split/src/model.cpp:1485-1488`）。
+- `Load::ATTACH` は holder の image を復元して expert を再配置し、`choose_residency()` を呼ばずに戻る。この経路ではこの変数を読み直さない（`engine/src/split/src/model.cpp:1478-1488`）。`place_experts()` 自体は設定を再評価する（`engine/src/split/src/model.cpp:1587-1589`）。
+- arena の確保・貸し出しは `m.arena` が真のときだけ行われる。利用できる GPU メモリが不足すると coldest experts を RAM に移して再配置し、8 回の再配置後も不足する場合や arena pool がない場合は例外。lane の page が収まらない場合も例外となる（`engine/src/split/src/engine.cu:326-357,360-379`）。
+- `FNX_ARENA=1` でも `FNX_EXPERT_RAM_GIB=off` との組み合わせは拒否される。通常の `FNX_EXPERT_RAM_GIB` の cache 設定では expert profile を読んで coldest expert を選び、arena の slot 順にもその score が使われる（`engine/src/split/src/model.cpp:1525-1544`、`engine/src/split/src/model.cpp:333-355`）。
+- split engine launcher は通常実行設定を元に専用設定を作る際、既存 `base.env` の同名値を `FNX_ARENA=0` で上書きする。fallback 用 config には元の `base.env` を保持する（`terminal/strata_control/split_engine.py:267-284`）。
 
 ## 実行時の詳細
 
-### 値の読み取りと反映
+評価は環境変数から呼び出しごとに行い、`choose_residency()` 内に static cache はない。コンストラクタの PLAIN load 時に一度読み、後続の `place_experts()` でも再度読む。したがって、これらの呼び出しより前のプロセス環境が使われる。arena の有効値は Engine 構築時に K/V pool の初期 page 数と expert pool 配置へ反映され、実行時には page 不足時に arena の上端を拡張し、不要な page の slot を返す（`engine/src/split/src/model.cpp:1485-1488,1514-1525,1587-1589`、`engine/src/split/src/engine.cu:319-327,381-413,638-668`）。
 
-`choose_residency()` は `std::getenv("FNX_ARENA")` で直接読み、関数内の `static` には保存しません（`src/split/src/model.cpp:1469-1479`）。通常の sFNX plain load ではモデルの初期化中に一度呼ばれます。`place_experts()` も同じ関数を呼ぶため、VRAM 不足時に expert allocation を解放して再配置する経路では再読込されます（同 `:1441-1443,1550-1565`; `src/split/src/engine.cu:290-315`）。通常は Engine 作成後の request ごとには読み直しません。
+`strata_control` の split config は `base.env` を複製したうえで `FNX_ARENA` を `0` に設定して engine に渡す。分割 engine の通常 config では arena は無効となるが、保持された fallback config の環境値は元の設定である（`terminal/strata_control/split_engine.py:267-284`）。
 
-### arena 有効時
+## ログと測定値
 
-resident expert のうち最大サイズの pool では、profile 順で冷たい slot を arena 用に取り置き、初期配置時に割当・充填しません（`src/split/src/model.cpp:319-323,339-357`; `src/split/src/model.cpp:1562-1565`）。Engine は既存の prompt / draft 用 buffer 確保後にカードごとの空き VRAM、expert slot、reserve、lane の block を使って初期 K/V page 数を見積もります（`src/split/src/engine.cu:274-328`）。`FNX_ARENA_BASE_PAGES` が設定されていれば、計算された範囲内で初期 page 数を指定できます。初期 K/V pool と expert slot は同じ allocation の領域になり、K/V pool の拡張時に expert slot を貸し、縮小時に返します。貸せる範囲は、各カードで少なくとも `2 * MAXT * TOPK` slot を残す制限を受けます（同 `:329-345`; `src/split/src/engine.hpp:252-254`; `src/split/src/engine.cu:551-592,618-625`）。
+arena 有効時は初期化時に `fnx: arena: card %d: %zu MiB free after its arena` と、全カードの pool 初期化後に `fnx: arena: the K/V pool's own %d pages (%d positions), up to %d (%d positions) by lending the slots of %s` を stderr に出す（`engine/src/split/src/engine.cu:398-410,441-452`）。実際に貸出量が変わると `fnx: arena: K/V pool %d -> %d pages (own %d, at most %d); slots lent %s (up to %.2f GiB of a card's experts in RAM), in %.1f ms` を出す（`engine/src/split/src/engine.cu:625-635`）。`FNX_ARENA=0` の場合、これら arena 固有ログは出ない。
 
-開始時の stderr には各カードの arena 後の空き VRAM と、K/V pool の own pages・最大 pages・貸し元 pool の slot 数が出ます（`src/split/src/engine.cu:355-366,397-409`）。拡張・返却時には `fnx: arena: K/V pool ...; slots lent ...` が出ます（同 `:590-592`）。
-
-### arena 無効時と失敗
-
-`FNX_ARENA=0` では arena の共有 allocation と expert slot の貸し借りを行わず、Engine は通常の K/V pool allocation と prefill stages の経路に進みます（`src/split/src/engine.cu:283,347-370`）。
-
-設定値が `0` / `1` 以外なら `choose_residency()` が例外を投げます。sFNX の起動処理は `ERR <理由>` を stdout に出し、stderr に `sfnx: failed: <理由>` を出して終了コード 1 で終了します（`src/split/tools/sfnx.cpp:1050-1062,1027-1035`）。server が all-cards split engine の起動に失敗した場合は、その理由を含む一行を出し、保持していた通常の layer-split 設定で起動を試みます（`serve/server.py:9107-9144`）。また、arena 初期化時に pool がない、VRAM 不足が 8 回の再配置後も解消しない、または slot・reserve・lane block が収まらない場合も例外になります（`src/split/src/engine.cu:290-328`）。
+arena pool がない、VRAM 不足を解消できない、または lane page が収まらない場合の例外文言は `engine/src/split/src/engine.cu:338-371` にある。設定値の検証エラーは上記「値と判定」の文言となる（`engine/src/split/src/model.cpp:1521-1533`）。この調査では build・実行を行っておらず、ログの実出力や性能値は測定していない。
 
 ## 根拠
 
-- 全参照を `rg -n --hidden --glob '!.git/**' 'FNX_ARENA'` で確認しました。実環境から対象値を読む実装は `src/split/src/model.cpp:1476` のみです。残りのコード参照は arena の説明コメント、別変数 `FNX_ARENA_*`、自動起動ラッパーによる env の設定、またはテストです。
-- 直接読み取り・値判定・`FNX_EXPERT_RAM_GIB` との条件: `src/split/src/model.cpp:1469-1489`。
-- ExpertCache の pool 選択と slot の配置: `src/split/src/model.cpp:319-365,1550-1565`。
-- arena の容量計算、初期 allocation、貸し借り、ログ: `src/split/src/engine.cu:276-409,448-592,618-625`。
-- 通常の all-cards split wrapper による値の固定と子環境への反映: `strata_control/split_engine.py:250-264`; `serve/server.py:4054-4068`。
-- 起動失敗の通知と通常 engine への fallback: `src/split/tools/sfnx.cpp:1027-1035,1050-1062`; `serve/server.py:9107-9144`。
+- 値の取得・厳密判定・既定値および RAM cache との整合: `engine/src/split/src/model.cpp:1514-1533`
+- 呼び出し条件、`FNX_27B` と load mode: `engine/src/split/src/model.cpp:1478-1488`
+- expert pool 配置と profile score: `engine/src/split/src/model.cpp:333-364,1534-1551`
+- arena の VRAM 判定、fallback 配置、page 設定と失敗: `engine/src/split/src/engine.cu:319-389`
+- pool 確保、ログ、貸出・返却: `engine/src/split/src/engine.cu:390-452,625-668`
+- launcher による値の上書きと fallback config: `terminal/strata_control/split_engine.py:267-284`

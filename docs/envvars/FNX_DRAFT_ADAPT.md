@@ -1,46 +1,50 @@
 # `FNX_DRAFT_ADAPT`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。調査対象 checkout は `## main...origin/main` で、開始時に未コミット変更はなかった。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 ## 役割
 
-`strata-split` の単独セッション生成経路で、MTP draft chain の長さを受理率に合わせて選ぶか、`--spec` で指定した最大長 `K_` まで毎回作るかを切り替えます。適応を有効にしても、ngram lookup draft が見つかったラウンドは lookup の長さが使われ、この変数による MTP chain 長の選択には入りません（`src/split/src/session.cpp:566-579`）。
+`Session::generate` が MTP draft chain の長さを受理率に合わせて毎回選ぶか、上限 `K` まで固定するかを切り替える。未設定時は適応選択が有効。`0` のときは通常 MTP chain を常に `K` 個、DFlash2 chain を信頼度条件で得られる最大数まで使う。`K` 自体は変更せず、sFNX の `--spec K`（既定 6）などで与えた上限に従う。読み取りと選択処理は `engine/src/split/src/session.cpp` の `Session::generate` にある（`engine/src/split/src/session.cpp:398-417, 581-612`; `engine/src/split/tools/sfnx.cpp:67-90, 453-457`）。
 
-これは通常の `strata` エンジン全体の設定ではありません。split engine は `STRATA_BUILD_SPLIT=ON` の任意ビルドで作られる別実行ファイルであり、Linux CUDA/HIP の条件を満たさない場合や必要な GGML checkout がない場合は CMake が構築をスキップします（`src/split/CMakeLists.txt:1-5,20-30,64-77,92-103`）。
+対象はこの split-engine の `Session` 経路である。sFNX の単独 decode は `Session::generate` を呼ぶ。バッチ decoder が有効な複数 slot 経路は別の `BatchDecoder` planner を使い、この変数を読まない（`engine/src/split/tools/sfnx.cpp:448-458, 860`; `engine/src/split/src/batch.cpp:65-87, 260-301`）。`fnx_run decode` も `Session::generate` を使う。候補名のソース全体検索では他の読み取り箇所は見つからなかった。
 
 ## 値と判定
 
-`env_int("FNX_DRAFT_ADAPT", 1)` が `env_int` 共通 helper を通じて値全体を 10 進整数として読み、結果が 0 かどうかで判定します（`src/split/src/session.cpp:415`; `src/split/src/env.hpp:15-21,33-40`）。
+`fnx::env_int` は `getenv` で取得し、`parse_whole` が符号付き base-10 整数として文字列全体を `strtoll` で変換する。先頭・末尾の空白、空文字、数値の後ろの文字、整数範囲外は受け付けず、`FNX_DRAFT_ADAPT: '<値>' is not a whole number` の例外になる。変換後は `!= 0` 判定であり、値域 clamp はない（`engine/src/split/src/env.hpp:15-21, 33-40`; `engine/src/split/src/session.cpp:416`）。
 
-| 環境変数 | 判定・動作 |
-| --- | --- |
-| 未設定 | 既定値 `1`。適応を有効にする |
-| `0`（符号付き表記 `+0`、`-0` を含む） | 適応を無効にし、MTP chain 長を常に `K_` にする |
-| 0 以外の有効な整数 | 適応を有効にする。正負を問わず、数値が 0 以外なら同じ扱い |
-| 空文字、整数でない文字列、整数の後ろに余分な文字がある値、`long long` の範囲外 | `std::runtime_error`。値全体を parse するため、例 `1x` や空白は受理しない |
+| 条件 | unset | 有効になる値（適応選択） | 無効になる値（固定上限側） |
+|---|---|---|---|
+| split `Session::generate` | `1`（既定） | 任意の非ゼロ整数。例: `1`, `-1`, `+2` | `0`, `+0`, `-0` |
 
-数値の上限・下限をこの変数用に追加制限する処理はありません。整数としての境界は `strtoll` の `long long` 範囲です。無効値を既定値へ置き換える処理もありません（`src/split/src/env.hpp:15-21,33-40`）。
+`true`、`false`、空文字、`1x`、` 1`、`1 ` は整数全体でないため「無効側」ではなくエラーになる。負数を含む任意の非ゼロ整数は適応を有効にする。`--spec`/`K` は chain の上限として適用され、環境変数による `K` の上書きはない（`engine/src/split/src/session.cpp:419-427, 589-612`; `engine/src/split/tools/sfnx.cpp:67-90`）。
 
 ## 有効になる条件
 
-- `strata-split` または同じセッション実装を含む `split_fnx_run` がビルドされ、その生成処理で `Session::generate()` が呼ばれること。CMake は `session.cpp` をこの2系統のターゲットに含めます（`src/split/CMakeLists.txt:64-77,152-160`）。
-- `Session::generate()` 内で MTP draft chain の経路に達すること。`speculate` が false なら draft を消去して次の round へ進むため chain は作られません。通常の `Session` の既定値は true です（`src/split/src/session.hpp:117-120`; `src/split/src/session.cpp:562-585`）。
-- lookup draft が空であること。lookup が空でなければ、その drafts を次の round に使い、MTP chain 長の選択を行いません（`src/split/src/session.cpp:566-579`）。
-- `--spec` が指定する `K_` が上限になります。適応時の長さは `K_` を超えず、適応無効時は `K_` 固定です。CLI にはこの環境変数を上書きする専用引数はありません（`src/split/tools/sfnx.cpp:67,86,440,454`; `src/split/src/session.cpp:419-426,576-579`）。
-
-`sfnx` の複数スロット経路で `BatchDecoder` が使われる場合、この変数は同 decoder に渡されず、`BatchDecoder` 側の計画ロジックが動きます。`FNX_DRAFT_ADAPT` の直接参照は `Session::generate()` のみです（`src/split/tools/sfnx.cpp:438-445,646-666`; `src/split/src/batch.cpp:261-310`; `src/split/src/session.cpp:415`）。
+- `Session::generate` が呼ばれること。適応値は生成呼び出しの先頭で毎回読み取られるため、draft を使わない場合でも不正値なら例外になる（`engine/src/split/src/session.cpp:398-416`）。
+- MTP chain が候補になること。通常の MTP chain は `e_.draft` で d1 を作り、lookup draft が見つからない場合に chain を伸ばす（`engine/src/split/src/session.cpp:596-619`）。
+- DFlash2 を使う場合は `e_.df2_on()` が真であること。DFlash2 は累積確率が `FNX_DF2_CONF` 未満になるまでの候補数を先に定め、その数を適応選択または固定選択で制限する（`engine/src/split/src/session.cpp:453-456, 565-593`）。
+- `FNX_SPECULATE=0` では検証後に draft を保持せず次の round に進むため、chain 長の選択結果は利用されない。値の読み取り自体は行われる（`engine/src/split/src/session.cpp:142, 565-569, 596-600`）。
+- lookup draft が見つかった round は MTP chain の長さ選択へ進まず、lookup drafts が使われる（`engine/src/split/src/session.cpp:575-580, 601-607`）。`--lookup` は lookup の上限を設定する（`engine/src/split/tools/sfnx.cpp:67-90, 453-457`）。
+- sFNX で `--batch > 1` かつ `FNX_BATCH_DRAFTS` により `BatchDecoder` が使われる経路には適用されない。そこでは `choose_rows` による別の計画処理を行う（`engine/src/split/tools/sfnx.cpp:448-458`; `engine/src/split/src/batch.cpp:65-87, 260-301`）。
 
 ## 実行時の詳細
 
-`sfnx` サーバーの通常の `GEN` は `Session::generate()` を呼び、そこでは各生成要求の開始時に `env_int` を実行します。値は `static` に保存されないため、同一プロセスで後続の要求を始める前に環境が変更されれば次の要求では再読込されます。実行中の要求では、ローカル定数 `adapt` がその要求の間使われます（`src/split/tools/sfnx.cpp:793-816,839-847`; `src/split/src/session.cpp:397-416`）。
+環境値は `Session::generate` の各呼び出しで一度読み、ローカル定数 `adapt` に保持する。関数内 static cache はなく、プロセス環境を次回呼び出しまでに変更すれば次の呼び出しで再評価される。呼び出し中の変更は反映されない（`engine/src/split/src/session.cpp:398-417`）。
 
-適応有効時は、各チェーン位置について `stood / tried`（初期値はそれぞれ `0.7 / 1.0`）を指数係数 `0.97` で更新し、各候補長の期待 token 数を定数で見積もった round/verify/draft 時間で割ります。最も高い率となる長さを選びます。初期推定では長さ `1..K_` を比較し、チェーンの4回ごとに一つ長い長さも試します。適応無効時は `K_` をそのまま選びます（`src/split/src/session.cpp:411-426,524-530,573-584`）。
+適応有効時、生成呼び出しごとに各 chain 位置の `tried` / `stood` を初期化し、draft の受理結果で更新する。`chain_len` は長さ 1..`K` の期待 token 数を定数の round・verify row・draft call コストで割り、最大率の長さを返す。通常 MTP では選択長に最大 `K` を適用し、4 chain ごとに次の位置を測るため 1 個追加して `K` 以下に制限する。`FNX_DRAFT_ADAPT=0` ならこの選択を行わず通常 chain は `K` 個を作る（`engine/src/split/src/session.cpp:417-427, 529-535, 608-619`）。
 
-環境値に不正な整数があると `env_int` は変数名と値を含む例外を投げます（例: `FNX_DRAFT_ADAPT: '1x' is not a whole number`）。単独 `GEN` の `generate()` 呼び出しは要求単位の例外捕捉の外にあり、サーバーループの捕捉から `fail()` に進みます。プロトコル出力に `ERR <例外文>`、stderr に `sfnx: failed: <例外文>` を出してプロセスを終了コード 1 で終了します（`src/split/src/env.hpp:33-40`; `src/split/tools/sfnx.cpp:839-847,1086-1095,1030-1035`）。
+DFlash2 では `FNX_DF2_CONF`（既定 `0.35`）と最大 `K` / drafter の `kDrafts` から `kmax` を求める。適応有効時は `chain_len(0.0)` と 4 chain ごとの探索分を使って `kmax` 以下にし、無効時は `kmax` を採る（`engine/src/split/src/session.cpp:453-456, 581-593`）。ドラフトは検証 window に加えられ、メインモデル側で受理・拒否された結果だけが出力されるため、この変数はドラフト提案数の選択を変え、sampling 設定そのものは変えない（`engine/src/split/src/session.cpp:467-471, 490-525, 536-557`）。
+
+## ログと測定値
+
+有効・無効を示す専用ログはない。値が整数でない場合、helper が例外 `FNX_DRAFT_ADAPT: '<値>' is not a whole number` を投げる。`fnx_run` は `fnx_run: <例外>` を stderr に出して終了コード 1 を返す（`engine/src/split/src/env.hpp:33-40`; `engine/src/split/tools/fnx_run.cpp:1364-1373`）。sFNX は要求処理中の未処理例外を `ERR <例外>` と stderr の `sfnx: failed: <例外>` で通知し、終了コード 1 で終了する（`engine/src/split/tools/sfnx.cpp:1094-1103, 1160-1165`）。
+
+ソースコメントには Q4 lab の通常 MTP chain 長固定時の round 時間 `K=1/2/3/4: 12.47/14.76/16.60/18.34 ms`（2026-10-25）と記されているが、コメントだけでは測定環境・回数などを特定できないため、一般的な効果の測定値としては扱わない（`engine/src/split/src/session.cpp:412-417`）。
 
 ## 根拠
 
-- 全直接参照は `src/split/src/session.cpp:414-415` の1箇所。索引の候補名が実際に読み取られていることを確認した。
-- 数値全体の parse、unset 時の fallback、不正値例外: `src/split/src/env.hpp:15-21,33-40`。
-- 適応長のスコア計算、固定長との分岐、chain 更新: `src/split/src/session.cpp:411-426,524-530,573-584`。
-- split engine の別実行ファイルとビルド条件: `src/split/CMakeLists.txt:1-5,20-30,64-77,92-103`。設計資料も split engine を通常 engine とは別の opt-in engine と説明しています（`docs/SPLIT_ENGINE.md:1-5,79-82`）。
+- `engine/src/split/src/session.cpp:398-427, 467-525, 529-619` — 読み取り、適応選択、MTP / DFlash2 / lookup 経路。
+- `engine/src/split/src/env.hpp:15-21, 33-40` — 整数全体の変換、未設定時既定値、無効値例外。
+- `engine/src/split/tools/sfnx.cpp:67-90, 448-458, 860, 1094-1103, 1160-1165` — sFNX の K/lookup 設定、Session と batch decoder の選択、失敗経路。
+- `engine/src/split/tools/fnx_run.cpp:461-492, 1364-1373` — `fnx_run decode` の Session 使用と失敗表示。
+- `engine/src/split/src/batch.cpp:65-87, 260-301` — batch decoder が使う別 planner。
