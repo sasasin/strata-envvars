@@ -1,64 +1,61 @@
 # `--yarn-beta-fast`
 
-調査対象: Strata commit `e17975c3bd27b75386f2fcc262485ff334282232`（`2026-11-25` 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate` |
+| コマンド | `strata`（推論エンジン、root 引数） |
 | オプション | `--yarn-beta-fast` |
 | 別名 | なし |
-| 値 | 正の有限浮動小数点数 `F` |
+| 値 | `F`。有限な正の数 |
 
 ## 役割
 
-YaRN の RoPE 周波数補正ウィンドウの下端を決める beta 値です。`--rope-scaling yarn` で YaRN を有効にしたとき、回転次元のどの位置から補正を始めるかの計算に使われます。
+YaRN の RoPE 補正窓で、学習済み角度を保つ側の境界を決める値です。`RopeScaling::corr_dims()` がこの値を使って補正窓の開始ペアを算出し、補正が有効な回転設定では回転テーブル／解析カーネルに渡します。よく使われるのは YaRN 設定ですが、設定タイプが `none` の場合は値がリセットされ、効果はありません。
 
 ## 使い方
 
 ```sh
-strata generate --pack model.gguf --tokens 1,2,3 --max-new 1 --rope-scaling yarn --yarn-beta-fast 32
+# モデルのトークン列を入力し、YaRN の fast beta を 24 にして推論する例
+strata --pack MODEL.gguf --tokens 1,2,3 --max-new 1 --rope-scaling yarn --rope-scale 2 --yarn-beta-fast 24
 ```
 
-モデルと入力 token 列を指定して生成する例です。`--yarn-beta-fast` は単独では RoPE scaling の種類を有効にしません。
+`--yarn-beta-fast` は単独で RoPE scaling を有効にしません。`--rope-scaling` が省略された場合はモデルの RoPE 設定が参照されるため、設定タイプと拡張条件もあわせて確認してください。
 
 ## 値と既定値
 
-- 値は `std::atof` で `double` に変換されます。既定値は `32.0` です。文字列全体が数値として厳密に解析されたかの確認はなく、先頭部分が数値なら後続文字があってもその数値部分が使われます。
-- 変換後の値は有限で、かつ `0` より大きい必要があります。上限はこの parser の validation では設けられていません。
-- `nan` / `inf` など有限でない値、および 0 以下の値は起動時 validation で拒否されます。数値として解釈できない文字列は `atof` により 0 となり、同じく拒否されます。
-- 同じオプションを複数回指定すると、引数走査で後から読まれた値が設定を上書きします。
+- parser は次の argv 要素を `std::atof()` で `double` に変換します。値を省略すると `--yarn-beta-fast needs a value` を stderr に出し、終了コード 2 で終了します（`engine/src/program/generate.cpp:3844-3846, 3879`）。
+- 未指定時は `32.0` です。明示値には有限性と `> 0` が要求されます。0、負数、`NaN`／無限大、および数値に変換できず 0 になる文字列は拒否されます（`engine/src/program/generate.cpp:800, 5243-5264`）。
+- 同じオプションを複数回指定した場合、parser は各値を順に代入し、重複を拒否しないため最後の値が残ります（`engine/src/program/generate.cpp:3842-3847, 3879`）。
+- 解析時にモデルの GGUF から読み取る RoPE 項目は type、base、factor、original context であり、beta-fast はこの読み取り一覧にありません。そのためこの parser の既定値は 32 で、明示指定値は常にそれを置き換えます（`engine/src/program/generate.cpp:5650-5673, 5724-5726`）。
 
 ## 実行時の動作
 
-parser は値を `Options::yarn_beta_fast` に格納し、RoPE 設定解決時に `RopeScaling::beta_fast` へ渡します。YaRN 補正窓の開始側は `floor(rope_yarn_corr_dim(..., beta_fast, ...))` で算出され、上端側は対応する `--yarn-beta-slow` の値から算出されます。このため、実際の位置は beta 値だけでなく回転次元数、元の context、周波数 base との組み合わせで決まります。
+CLI 値は `rope_cfg.beta_fast` に設定されます。補正窓の開始境界は `floor(rope_yarn_corr_dim(n_rot, orig_ctx, beta_fast, freq_base))` から求められます。`kernel_args()` は `none` 以外の設定でこの境界を補正カーネル引数に含め、回転テーブル経路では `build_rope_table()` が設定を使って cos/sin 値を作ります（`engine/src/program/generate.cpp:5721-5726`; `engine/include/strata/kernels/rope_scaling.hpp:92-116`; `engine/src/core/layer.cpp:961-970`）。
 
-値の既定は 32 です。モデルの GGUF RoPE beta metadata をこの CLI 値に取り込む処理は、確認した engine の設定解決箇所にはありません。`--rope-scaling none`（または model metadata も scaling を指定しない場合）には補正ノブが使われず、同時にこの値自体の有限性・正値 validation は行われます。RoPE 設定は起動時に解決・設定されるもので、リクエスト単位の切り替えではありません。
+オプション自体は scaling type を切り替えません。型は明示された `--rope-scaling` が優先され、省略時はモデルの RoPE type が使われます。`--yarn-ext-factor` が省略時には YaRN で 1、それ以外で 0 となるため、通常の YaRN では補正境界が使われます。明示的に ext-factor を 0 にすると補正は止まり、beta-fast の境界は計算されても回転結果に影響しません（`engine/src/program/generate.cpp:5700-5726`; `engine/include/strata/kernels/rope_scaling.hpp:148-160`）。
 
-engine の通常 parser と SYCL parser は同じ既定値、引数変換、validation、RoPE 設定反映を持ちます。
+設定は起動時に一度解決され、セッション初期化で回転テーブルが作られます。リクエスト単位で切り替わる設定ではありません（`engine/include/strata/kernels/rope_scaling.hpp:186-190`; `engine/src/core/layer.cpp:961-970`）。
 
 ## 適用条件と副作用
 
-- 有効な補正として使うには YaRN scaling を選ぶ必要があります。YaRN の設定をしない場合、この値を変えても回転設定への効果はありません。
-- `--yarn-beta-slow` は補正窓の上端側を決める対になる値です。`--rope-scaling`、`--rope-scale`、`--yarn-orig-ctx` など、他の RoPE 設定と合わせて一つの起動時設定に解決されます。
-- 直接のファイル変更やネットワーク処理はありません。非既定の RoPE scaling が有効な場合、起動時に解決した scaling 情報を標準エラーへ出力します。
+- `--rope-scaling none` を選ぶと scaling 設定全体が初期値に戻るため、このオプションの正の値は効果を持ちません。ただし reset より前に CLI 値の有限性・正数チェックが行われるので、`none` でも無効値は拒否されます（`engine/src/program/generate.cpp:5243-5264, 5727-5739`）。なお `none` 時の通知判定は beta-fast 単独の指定を含まないため、正の値だけを指定しても無効化の注記が出ない場合があります（同 `5731-5739`）。
+- `engine/sycl/src/program/generate.cpp` にも同じ既定値・parser・validation・設定反映があります（`484, 1918, 2657-2679, 2995-3000`）。ビルドされた実行ファイルの backend によって該当する処理本体が異なります。
+- 値の適用は起動時の RoPE 設定と回転テーブル／カーネル引数に限られます。ファイルへの書き込みやネットワークアクセスをこのオプションが行う処理は確認できません。
 
 ## 出力とエラー
 
-- 値がない場合は `--yarn-beta-fast needs a value` を標準エラーに出して終了コード 2 で終了します。
-- 非有限値または 0 以下の場合は `invalid rope scaling knob` 系の診断を標準エラーに出し、終了コード 2 を返します。
-- 指定値が正しくても、他の RoPE ノブを含む解決済み設定が不正なら `invalid rope scaling configuration` を標準エラーに出し、終了コード 2 で終了します。
-- 未知の引数は `unknown argument: ...` と usage を標準エラーに出し、終了コード 2 を返します。
+- 値がない場合は stderr に `--yarn-beta-fast needs a value` を出して終了コード 2 です（`engine/src/program/generate.cpp:3844-3846`）。
+- `NaN`／無限大など有限でない値は stderr に `a rope scaling knob is not a finite number (...)`、0 以下の値や数値変換されない文字列は stderr に `invalid rope scaling knob (...)` を出して、いずれも終了コード 2 です（`engine/src/program/generate.cpp:5243-5264`）。
+- 値が有効で scaling type が `none` 以外なら、起動時に解決された scaling の概要が stderr に出ます。type が `none` なら beta-fast 指定だけを理由とする出力はありません（`engine/src/program/generate.cpp:5727-5739, 5759-5778`）。
 
 ## 根拠
 
-- `engine/src/program/generate.cpp:800` — option の保存先と既定値。
-- `engine/src/program/generate.cpp:1278-1279` — usage 表示と既定値の説明。
-- `engine/src/program/generate.cpp:3844-3847, 3879` — 必須値の取得と `std::atof` 変換。
-- `engine/src/program/generate.cpp:4268-4273` — 未知引数をエラーとして扱う経路。
-- `engine/src/program/generate.cpp:5243-5248, 5260-5264` — 有限値・正値 validation と失敗時の終了コード。
-- `engine/src/program/generate.cpp:5724-5726, 5749-5759` — YaRN beta を含む設定への反映と解決済み設定の validation。
-- `engine/include/strata/kernels/rope_scaling.hpp:74-75, 92-100` — beta の既定値と beta fast/slow から補正窓を計算する処理。
-- `engine/src/program/generate.cpp:5727-5738` — scaling type が `None` の場合に scaling ノブを無効化する処理。
-- `engine/sycl/src/program/generate.cpp:484, 866-867, 1918, 2657-2679, 2998-3000`、`engine/sycl/include/strata/kernels/rope_scaling.hpp:74-75, 95-103` — SYCL parser と補正設定の対応実装。
-- `docs/cli/README.md:1235`、`docs/cli/000_cli_tools.md:10` — 索引リンク、`strata-engine` の parser と root scope。
+- `engine/src/program/generate.cpp:790-801` — parser の Options 値と既定値。
+- `engine/src/program/generate.cpp:3842-3847, 3879` — 引数読み取り、数値変換、値省略時の失敗。
+- `engine/src/program/generate.cpp:5243-5264` — 有限性と正数の検証、エラー出力・終了コード。
+- `engine/src/program/generate.cpp:5650-5673, 5700-5759` — モデル metadata の読み取り範囲、設定の優先と beta-fast の反映、`none` の reset。
+- `engine/include/strata/kernels/rope_scaling.hpp:92-116, 148-160, 164-190` — 補正窓の計算、カーネル引数・設定検証・起動時設定。
+- `engine/src/core/layer.cpp:961-970` — 解決済み設定を使った回転テーブル作成と device 転送。
+- `engine/sycl/src/program/generate.cpp:484, 1918, 2657-2679, 2995-3000` — SYCL parser と同等の既定値・検証・設定反映。

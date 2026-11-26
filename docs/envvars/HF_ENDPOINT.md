@@ -1,52 +1,56 @@
-# HF_ENDPOINT
+# `HF_ENDPOINT`
 
-調査対象: Strata main の HEAD d46f5f268f8ed797e83a5c63a69bffbd7a581cf6（2026-11-25 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Hugging Face を参照する一部の Strata のダウンロード URL のホストを、環境で指定したホストへ置き換える。setup の pinned revision ファイル・画像生成用ファイル、MTP draft layer、picture reader、DFlash2 drafter、デスクトップ画像モデル API、同梱の調査ツールにそれぞれ読み取り箇所がある。Strata 全体の Hugging Face URL を一括で置き換える設定ではなく、通常の GGUF family shard 等にはこの値を使わない取得経路がある。主な実装は terminal/setup.py の hf_endpoint()、strata_control.pictures.Projector.url()、strata_control.drafting.base_url()、strata_control.transfer._hf_host()、app/host/server/image-models.mjs（terminal/setup.py:129-137, 3947-3948, 6003-6008; terminal/strata_control/pictures.py:72-75; terminal/strata_control/drafting.py:241-249; terminal/strata_control/transfer.py:220-251; app/host/server/image-models.mjs:35-46, 87-91）。
+Hugging Face を使う Strata のモデル・画像関連ファイルの URL のホスト部分を指定する。setup の通常モデル、ready-made pack、画像 reader、MTP draft tensors、DFlash2 drafter は、この値を基に Hugging Face のパスを組み立ててダウンロードする。設定してもファイル名・revision・Strata 側のサイズや SHA-256 検証は切り替わらない。モデル取得元を ModelScope にする設定ではなく、`--source modelscope` / `STRATA_SOURCE=modelscope` が優先される。ただし Hugging Face 専用ファイルや ModelScope が応答しない場合の fallback URL はこの値を使う（`terminal/setup.py:129-137, 169-183, 212-220, 3546-3552, 3927-3948, 12380-12414`、`terminal/tools/mtp_fetch.py:43-57`）。
+
+また、更新用 transfer helper は、`HF_TOKEN` または `HUGGING_FACE_HUB_TOKEN` があるとき、指定ホストを Hugging Face と認識して認証 header の送信を許可する。標準ホストと `HF_ENDPOINT` が指す host の比較にだけ使い、別 host への redirect では Authorization header を除く（`terminal/strata_control/transfer.py:220-251, 254-264, 298-316, 405-420`）。
 
 ## 値と判定
 
-setup、pictures、drafting、デスクトップ画像モデルは、値を文字列として URL の先頭へ連結し、strip() で前後の空白を除去、rstrip("/") で末尾の / をすべて除去する。未設定、空文字、空白だけ、除去後に空になる値は https://huggingface.co を使う。値全体の URL 妥当性や scheme は検査しない。https://mirror.example/// は https://mirror.example になる一方、ftp://mirror や not a URL も値としては拒否されず、後続の URL 要求に渡る（terminal/setup.py:126-137; terminal/strata_control/pictures.py:72-75; terminal/strata_control/drafting.py:241-249; app/host/server/image-models.mjs:45）。
+設定値を URL として検証する共通処理はない。経路により trim と空文字の扱いが異なる。
 
-| 経路 | unset | 有効になる値（例） | 無効・既定値になる値（例） |
+| 読み取り経路 | 未設定 | 設定時の変換 | 空文字・例 |
 |---|---|---|---|
-| setup / pictures / drafting / app image models | https://huggingface.co | https://mirror.example、前後に空白があり末尾に /// がある値 → https://mirror.example | 空文字、空白だけ、/// → https://huggingface.co |
-| tools/mtp_fetch.py | https://huggingface.co | 前後の空白を除去し、末尾 / を除いた値 | 空文字、空白だけ、/// → 既定値 |
-| tools/qwen4_intake.py | https://huggingface.co | https://mirror.example/ → https://mirror.example | 空文字は既定値にならず空の base URL。空白は trim されない |
-| tools/quantscope.py | 既定の Hugging Face URL 群 | truthy な値を末尾 / のみ除いて HF URL 群に設定 | unset または空文字は既定 URL 群。空白は trim されない |
-| strata_control.transfer._hf_host() | Hugging Face の固定 hostname のみ認識 | strip() 後の値から URL hostname を取り、完全一致する host を認識 | 空白だけ、hostname を取り出せない値はカスタム HF host として認識しない |
+| setup の `hf_endpoint()`、drafting、pictures、MTP fetch | `https://huggingface.co` | 前後の空白を `strip()` で除き、末尾の `/` をすべて除く | 空文字または空白だけは既定 host。`https://mirror/` は `https://mirror` |
+| 画像モデル host (`app/host/server/image-models.mjs`) | `https://huggingface.co` | 前後空白を trim し、末尾 slash を除去 | 空文字または空白だけは既定 host |
+| transfer の HF host 判定 | host 比較に追加条件なし（標準 Hugging Face host は常に許可） | trim 後 URL parse、hostname を小文字化して完全一致 | 空文字は追加 host なし |
+| `quantscope.py` | `https://huggingface.co` の HUBS 定義を維持 | 値が truthy の場合だけ末尾 `/` を除去。前後空白は除去しない | 空文字は未設定同様。`/` は空の base になる |
+| `qwen4_intake.py` | `https://huggingface.co` | 末尾 `/` のみ除去。前後空白は除去しない | 明示的な空文字は空の base のまま。組み立て URL は `/api/...` 等になる |
 
-ツールごとの差は実装どおりである。mtp_fetch.py はモジュール読込時に正規化済みの定数を作る。qwen4_intake.py は hf_list() / read_hf_entry() の呼び出し時に既定値付きで os.environ.get し、空文字も明示値として残す。quantscope.py はモジュール読込時に設定の truthiness だけを判定し、値全体は trim しない（terminal/tools/mtp_fetch.py:48-51; terminal/tools/qwen4_intake.py:663-679; terminal/tools/quantscope.py:34-44）。
-
-無効な URL 文字列、大小文字、空白、数値、0/1、true/false を endpoint 用の boolean や数値として parse する処理はない。空でない値は URL base として扱う。transfer の host 認識だけは urlparse(...).hostname を使い、ValueError を無視する。このため無効値なら既定 endpoint に戻るのは、各経路で正規化後が空になる場合に限られる（terminal/setup.py:129-132; terminal/strata_control/transfer.py:227-235）。
+URL の scheme・host・path の妥当性、大文字小文字、空白以外の文字、数値境界は検査しない。`https://mirror///` は trim する経路では `https://mirror`、`https://mirror///` の末尾 slash 除去だけをする経路でも同じになる。`quantscope.py` は空でない値に限って差し替え、`qwen4_intake.py` は環境変数が存在する空文字を既定値に戻さない（`terminal/setup.py:126-137`、`terminal/strata_control/drafting.py:241-249`、`terminal/strata_control/pictures.py:72-75`、`terminal/tools/mtp_fetch.py:46-57`、`terminal/tools/quantscope.py:34-44`、`terminal/tools/qwen4_intake.py:663-681`、`app/host/server/image-models.mjs:35-46`）。
 
 ## 有効になる条件
 
-- setup の --source / STRATA_SOURCE が ModelScope を選ぶと、通常の ModelScope 対応ダウンロードはそちらが優先される。CLI --source は STRATA_SOURCE に設定される。HF_ENDPOINT は source 選択を切り替えない。ModelScope が応答しない場合の警告は hf_endpoint() の値を表示するが、実際の fallback URL は download() に渡された元の URL のままなので、caller が hf_endpoint() で URL を組み立てていない取得経路では endpoint は反映されない。Hugging Face 専用 ready-made pack の URL は hf_endpoint() で組み立てる（terminal/setup.py:212-220, 11536-11539, 11622-11623, 3546-3552, 3947-3948）。
-- setup で検証済みファイルがある場合や、同一 SHA-256 の別パックから hard link できる場合、そのファイルは再取得されず endpoint も接続先を変えない（terminal/setup.py:3919-3948, 3513-3519）。
-- 通常の GGUF model shard / vision encoder の一部は fam["hf"] / fam["mmproj_hf"] から直接 URL を作るため、この変数でホストを書き換えない（terminal/setup.py:11258-11274, 12408-12430）。
-- tools/mtp_fetch.py では STRATA_SOURCE=ms または modelscope が設定されると MODELSCOPE_ENDPOINT から REPO と PINNED を作り直し、HF_ENDPOINT は使われない。--repo は fetch/inventory 用の REPO をさらに上書きする（terminal/tools/mtp_fetch.py:48-57, 521-525; setup からの起動: terminal/setup.py:1160-1165）。
-- strata_control.transfer の読み取りは URL 選択用ではなく Bearer 認証対象 host の判定用。固定の Hugging Face host、または HF_ENDPOINT の hostname と一致する host で、HF_TOKEN / HUGGING_FACE_HUB_TOKEN が設定されている場合だけ認証 header を返す。HTTP(S) 以外や一致しない host には返さない（terminal/strata_control/transfer.py:220-251）。
-- picture 取得で明示的な endpoint 引数が渡されると、それを使って URL を作り、HF_ENDPOINT は参照しない（terminal/strata_control/pictures.py:72-75, 378-382, 468-475）。
-- デスクトップ画像モデル API は library() が返す download URL に endpoint を反映するが、実際のネットワーク取得は real モードの install 経路だけ。シミュレーションではダウンロードしない（app/host/server/image-models.mjs:35-46, 77-91）。
-- quantscope.py の差し替えは hf: ソースに対するもの。ms:、直接 URL、ローカルファイルにはこの HF URL 群を使わない（terminal/tools/quantscope.py:34-44, 78-80）。
+- setup のモデルファイル取得で Hugging Face URL が使われること。`--source modelscope`（または `STRATA_SOURCE=ms|modelscope`）なら一般の対応モデルは ModelScope URL を選ぶが、ready-made pack は Hugging Face 専用であり `HF_ENDPOINT` から取得する。通常モデルでも ModelScope が応答しない場合は `hf_endpoint()` が fallback 先になる（`terminal/setup.py:212-220, 3546-3552, 12382-12399`）。
+- 取得対象ファイルが未取得であること。既存ファイルが検証済みなら download を省略する。モデルごとの pinned revision と検証は引き続き適用される（`terminal/setup.py:3932-3948, 12400-12419`）。
+- MTP fetch は setup が起動する `tools/mtp_fetch.py` にも環境を渡す。setup は `STRATA_SOURCE` を明示的に設定して起動するが、`HF_ENDPOINT` はこの環境辞書から除去・上書きされない。MTP fetch は `STRATA_SOURCE` が ModelScope のとき ModelScope URL に切り替える（`terminal/setup.py:1160-1164`、`terminal/tools/mtp_fetch.py:48-57`）。
+- DFlash2 fetch では呼び出し元から `endpoint` 引数が明示された場合、その値が環境変数より優先する。引数が `None` の経路で `HF_ENDPOINT` を読み、既存の検証済みファイルがあればネットワーク取得は行わない（`terminal/strata_control/drafting.py:244-249`、`terminal/strata_control/drafting_fetch.py:388-415`）。画像 reader fetch も `endpoint` 引数があれば優先し、なければ環境変数を読む（`terminal/strata_control/pictures.py:72-75, 433-460`）。
+- アプリの画像モデルでは URL を library 情報に含める。実 download は `real` モードの場合だけで、選択 variant が未導入で、install が実行されたときにその URL を使用する。simulated モードでは download の代わりに進捗を模擬する（`app/host/server/image-models.mjs:12, 35-46, 64-90`）。
+- `quantscope.py` と `qwen4_intake.py` の HF 経路を実行すること。`quantscope` の `ms:` URL やローカルファイル、`qwen4_intake` のローカル入力など、Hugging Face 以外の入力にはこの値は関与しない（`terminal/tools/quantscope.py:34-44, 78-90`、`terminal/tools/qwen4_intake.py:663-681, 1018-1022`）。
+- transfer helper の環境変数読み取りは、URL host が Hugging Face と標準判定されない場合に限り `HF_ENDPOINT` host を認証対象に追加する。token が空なら Authorization header は作られない。redirect が別 host に移ると header が削除される（`terminal/strata_control/transfer.py:220-251, 254-264`）。
 
 ## 実行時の詳細
 
-setup の hf_endpoint() は呼ぶたびに環境を読み、値を cache しない。ready-made pack の不足ファイル URL、setup の画像生成モデル URL、ModelScope 失敗時の警告表示に使う。ModelScope 失敗時も download() の元 URL が hf_endpoint() 由来でなければ fallback の接続先は変わらない。model_source() は (STRATA_SOURCE, 生の HF_ENDPOINT, MODELSCOPE_ENDPOINT) をキーに結果を辞書 cache するが、source 選択結果は STRATA_SOURCE の ms / modelscope 判定のみで決まる。環境変更後は新しいキーで判定される（terminal/setup.py:129-137, 178-183, 212-220, 3546-3552, 3947-3948, 6003-6008）。
+- setup の `hf()` は `hf_endpoint()` を使って URL を生成し、family 定義 (`MODELS` 等) に保存する。通常 GGUF shard の `model_hf()` / `download()` はこの保存済み URL を使うため、endpoint は setup モジュールの初期化時に決まり、同一プロセス中に環境値を変えても反映されない（`terminal/setup.py:129-137, 726-793, 2451-2456, 12414`）。一方、ready pack (`ready_fetch()`)、画像ファイルなど `hf_endpoint()` を直接呼ぶ経路は呼び出し時に読む（`terminal/setup.py:3927-3948, 6004-6008`）。`model_source()` は `STRATA_SOURCE`、生の `HF_ENDPOINT`、ModelScope endpoint を key とする辞書に取得元を cache するが、結果は `STRATA_SOURCE` だけで決まり、HF_ENDPOINT が選択する host は別に URL へ反映される（`terminal/setup.py:178-220`）。
+- setup の CLI `--source` は `STRATA_SOURCE` に代入され、取得元選択に使われる。`HF_ENDPOINT` を上書きする CLI 引数はこの処理にない（`terminal/setup.py:11536-11539, 11622-11623`）。
+- `mtp_fetch.py` は import 時に endpoint、`REPO`、`PINNED` を一度構築するため、同一プロセス内で後から環境変数を変更しても URL には反映されない（`terminal/tools/mtp_fetch.py:46-57`）。一方、`quantscope.py` も import 時に `HUBS` を変更するため同様。`qwen4_intake.py` は `hf_list()` / `read_hf_entry()` の呼び出しごとに読み、画像モデル host は `library()` 呼び出しごと、transfer helper は認証 header を作るたびに読み取る（各箇所は「根拠」参照）。
+- `setup.run()` は子プロセス環境を元の環境から複製する。`fetch_mtp()` は `STRATA_SOURCE` だけを追加設定し、`HF_ENDPOINT` を変更しない（`terminal/setup.py:1138-1152, 1160-1164`）。`tools/feed_model_install_gate.py` の隔離実行環境は `HF_` で始まる変数を親環境から除外し、ローカル fixture server の `HF_ENDPOINT` を設定する（`terminal/tools/feed_model_install_gate.py:234-243`）。
+- `HF_ENDPOINT` の不正値に対する Strata 共通の fallback や専用エラーはない。生成された URL の接続・HTTP エラーは各 download 呼び出し元の通常の失敗経路に進む。setup の download は失敗を表示して install を止める。MTP fetch は通信失敗を retry し、最後に失敗を標準エラーへ出す。DFlash2 fetch は `DraftingError` に変換し、画像モデル download は `error` state に例外文を入れる（`terminal/setup.py:3557-3570, 1153-1156`、`terminal/tools/mtp_fetch.py:177-186`、`terminal/strata_control/drafting_fetch.py:405-413`、`app/host/server/image-models.mjs:90-118`）。
 
-MTP helper は import 時の環境値から REPO / PINNED を一度作るため、同じ Python プロセス内で後から HF_ENDPOINT を変えても URL は変わらない。setup は mtp_fetch.py を子プロセスとして起動し、環境 dict に STRATA_SOURCE を明示し、他の環境変数は継承する（terminal/tools/mtp_fetch.py:48-57; terminal/setup.py:1131-1151, 1160-1165）。Qwen intake は hf_list() と read_hf_entry() ごとに読む。quantscope は import 時に HUBS を作る。pictures と DFlash2 は URL 生成時に読む。transfer の認証判定は各リクエスト生成時に読む。デスクトップ画像モデルは library() 呼び出しごとに URL を生成し、install がその URL を取得する（terminal/tools/qwen4_intake.py:663-679; terminal/tools/quantscope.py:34-44; terminal/strata_control/pictures.py:72-75; terminal/strata_control/drafting.py:244-249; terminal/strata_control/transfer.py:227-251, 303-308, 405-415; app/host/server/image-models.mjs:35-46, 87-91）。
+## ログと測定値
 
-setup の download 経路では、ネットワーク失敗時に host とエラーを含めて cannot reach ... を出し、TLS 証明書問題は cannot download from <host>: its security certificate was not accepted として停止する。ModelScope 選択時の接続失敗 fallback では ModelScope does not answer; downloading it from <HF endpoint> の警告がある（terminal/setup.py:3551-3552, 3573-3581）。picture 取得は接続可能な URL がなければ There is no internet connection, so the picture files can't be downloaded now.、取得失敗なら The picture files could not be downloaded. Try again; it continues where it stopped. のエラー経路に進む（terminal/strata_control/pictures.py:390-408, 470-482）。デスクトップ画像モデルの失敗は API が返す error 状態の error.message に入り、ファイル過大・検証失敗などはコード上のメッセージで報告される（app/host/server/image-models.mjs:91-118）。
+非既定 host で通常の GGUF shards を取得するときは `  Downloading from {host} (HF_ENDPOINT)` を表示する。`ready` pack の取得元が ModelScope になっていた場合は、HF 専用 pack を `hf_endpoint()` から取る旨を warning に出す。setup の他のファイル取得や各同梱ツールに endpoint 専用の成功ログは見当たらない（`terminal/setup.py:12382-12399`）。測定値の記載はない。
 
 ## 根拠
 
-- terminal/setup.py:126-137, 173-220, 3513-3581, 3919-3948, 5998-6008, 11536-11539, 11622-11623, 12380-12414 — setup の endpoint 正規化、source 選択、URL 使用、fallback、ログ。
-- terminal/strata_control/pictures.py:65-75, 378-408, 455-483 — projector URL と endpoint 引数、取得・失敗経路。
-- terminal/strata_control/drafting.py:235-249、terminal/strata_control/drafting_fetch.py:388-412 — DFlash2 URL base と取得。
-- terminal/strata_control/transfer.py:220-251, 303-318, 405-420 — endpoint host の認識と HF token header の適用箇所。
-- terminal/tools/mtp_fetch.py:43-57, 515-539、terminal/tools/qwen4_intake.py:663-681, 1013-1023、terminal/tools/quantscope.py:34-44, 78-80、terminal/tools/strata_inspect.py:13, 31-33 — 同梱ツールの読み取りと利用条件。
-- app/host/server/image-models.mjs:35-46, 64-118、app/host/server/index.mjs:1596-1605 — デスクトップ画像モデル API、実ダウンロードと状態報告。
-- docs/SAFETY.md:45 — 利用者向け資料もモデルファイル、picture reader、MTP layer の取得先を Hugging Face または指定 mirror と記載。
+- `terminal/setup.py:129-137, 178-220, 3546-3570, 3927-3948, 11536-11539, 1160-1164, 12380-12419`
+- `terminal/strata_control/transfer.py:220-264, 298-316, 405-420`
+- `terminal/strata_control/drafting.py:241-249`、`terminal/strata_control/drafting_fetch.py:388-415`
+- `terminal/strata_control/pictures.py:72-75, 433-460`
+- `terminal/tools/mtp_fetch.py:43-57, 177-186`、`terminal/tools/quantscope.py:34-44, 78-90`
+- `terminal/tools/qwen4_intake.py:663-681, 1018-1022`
+- `app/host/server/image-models.mjs:12-46, 64-118`
+- `terminal/tools/feed_model_install_gate.py:234-243`
