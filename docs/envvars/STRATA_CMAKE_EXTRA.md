@@ -1,51 +1,63 @@
 # `STRATA_CMAKE_EXTRA`
 
-調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。調査時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata `main` の HEAD `c234774038d1c9249cb33637d27b895d47b39786`（2026-11-26 時点）。作業ツリーは `## main...origin/main`（未コミット変更なし）。
 
 ## 役割
 
-これは Strata の実行時設定ではなく、いくつかの Strata エンジン構築スクリプトが CMake のエンジン configure 呼び出しに追加引数を挿入するためのビルド時環境変数です。Strata のエンジン実行ファイルやサーバーがこの名前を読み取る箇所はありません。渡した引数の効果は、その引数が指定する CMake 変数とビルド構成次第です。Linux CUDA/HIP/SYCL のパッケージビルド、DGX Spark の CUDA ビルド、Windows CUDA パッケージビルド、および Windows HIP ビルドで参照されます（`tools/packaging/build_cuda_linux.sh:40-45`; `tools/packaging/build_hip_linux.sh:60-67`; `tools/packaging/build_sycl_linux.sh:40-51`; `engine/spark/build_engine.sh:46-54`; `tools/packaging/build_cuda_windows.py:151-177`; `terminal/tools/hip/build_windows.bat:71-89`）。
+engine の cmake configure 行に追加の `-D...` 引数を差し込むためのビルド時専用の置き場所。実行ファイルはこの名前を読まない（`rg STRATA_CMAKE_EXTRA` の全参照はビルド用スクリプト 7 本で、`engine/` の C++ / CMake 側に参照はない）。
 
-Windows CUDA では `configure_args()` が固定引数に ggml 指定を加え、その後ろに `extra` を連結します。同じ CMake cache 変数を重ねて渡した場合は extra 側が後段です（`tools/packaging/build_cuda_windows.py:68-78,166-174`）。
+読み取りは 6 本のビルドスクリプトだけ: `build_cuda_linux.sh:46`、`build_hip_linux.sh:66`、`build_sycl_linux.sh:51`、`engine/spark/build_engine.sh:55`（以上 `${STRATA_CMAKE_EXTRA:-}` の未クォート展開）、`build_cuda_windows.py:173,80`（`.split()`）、`terminal/tools/hip/build_windows.bat:84`（`%STRATA_CMAKE_EXTRA%`）、`tools/packaging/shape_build.sh:23`（後述の shape 判定）。`tools/packaging/make_model_release.py:149` は手順書の文字列として名前を出すだけで読まない。
+
+Strata は値の意味を解釈しない。有効・無効を決めるのは受け取る cmake で、未知の `-D` は無視され、不正な引数なら configure が失敗する。指定できるのは cmake のキャッシュ変数一般で、例は `-DSTRATA_GEOMETRY_FILE=<abs path>` / `-DSTRATA_GEOMETRY=<name>`（`engine/cmake/strata_geometry.cmake:3-4,11-12`）や `-DSTRATA_WINDOW_MAX_T=8`（`terminal/tools/hip/build_windows.bat:25`）。ビルドされるカーネルや選択ヘッダは変わるが、実行時挙動は変わらない。
 
 ## 値と判定
 
-実行時機能の ON/OFF 値として parse されません。構築スクリプトが環境から取り出した文字列を、CMake の引数列へ展開するだけです。
+Strata 側の parse は無く、判定は「引数へどう分割されるか」と後述の shape 判定 1 箇所だけ。
 
-| 経路 | 未設定・空文字 | 値の分割・処理 | 引数順と適用 |
+- POSIX sh の 4 本は未クォート展開。空白区切りで複数引数になり、未設定と空文字はどちらも 0 個の引数（`${VAR:-}`）。`# shellcheck disable=SC2086` は分割を意図した抑止（`tools/packaging/build_cuda_linux.sh:43` など）。
+- 値の中の引用符は再解釈されない。`STRATA_CMAKE_EXTRA='-DSTRATA_GEOMETRY_FILE="/a b/g.hpp"'` は 2 引数に割れる。クォート無し展開なので `*` などはパス名展開の対象になる。
+- Python は whitespace 区切りの `.split()` で、未設定と `""` は同じ `[]`。batch は `%STRATA_CMAKE_EXTRA%` の素の置換で、未定義なら空（`terminal/tools/hip/build_windows.bat:84`）。
+- 大文字小文字・数値妥当性・先頭文字の検査はない。`1` / `true` / `0` / 空はいずれも「cmake への引数列」としてのみ意味を持つ。
+
+| 条件 | unset | 有効な値の例 | 無効・効果なしの例 |
 |---|---|---|---|
-| Linux CUDA、HIP、SYCL、および Spark CUDA (POSIX shell) | `${STRATA_CMAKE_EXTRA:-}` が空に展開され、追加引数なし | クォートされていない shell 展開。空白で単語分割され、各単語は pathname expansion の対象にもなる。引用符やエスケープを含む文字列をシェルコードとして再評価する処理はない | エンジンの CMake configure 時に展開。CUDA/HIP/SYCL では固定引数や ggml 引数の後、shape helper が作る引数の前に置かれる（`tools/packaging/build_cuda_linux.sh:42-45`; `tools/packaging/build_hip_linux.sh:63-65`; `tools/packaging/build_sycl_linux.sh:48-51`; `engine/spark/build_engine.sh:51-54`） |
-| Windows CUDA (Python) | `os.environ.get(...) or ""` により未設定と空文字はともに空 | Python の `str.split()` が連続する whitespace で分割する。shell の quoting/escaping や glob 展開はしない | token の配列を configure 引数 builder に渡す（`tools/packaging/build_cuda_windows.py:166-174`） |
-| Windows HIP (batch) | 未定義なら `%STRATA_CMAKE_EXTRA%` は空 | batch の通常の `%...%` 展開で CMake コマンド行へ挿入。独自 parse・検証はない | `build.ninja` がまだない場合の configure に挿入（`terminal/tools/hip/build_windows.bat:76-85`） |
+| sh 4 本 | 引数 0 個 | `-DSTRATA_GEOMETRY_FILE=/abs/geo.hpp`、`-DA=1 -DB=2` | 空文字（0 個）、`-D` の無い語、値中の空白（2 引数に割れる） |
+| Python | `[]` | 同上 | 同上（`""` は `[]`） |
+| batch | 空 | 同上 | 同上。既存ビルドディレクトリでは読まれない |
 
-たとえば POSIX shell で `-DSTRATA_WINDOW_MAX_T=8 -DSTRATA_MMQ=ON` のように渡すと、空白で分かれた各項目が別の CMake 引数になります。`0`、`1`、`true`、`false`、空文字に対する Strata 独自の真偽判定や数値境界はありません。任意の文字列が構築スクリプト側の検査を通る場合も、CMake が受理するかはその引数次第です（例として Windows HIP の説明は `-DSTRATA_WINDOW_MAX_T=8` を挙げます: `terminal/tools/hip/build_windows.bat:25`）。
-
-`SHAPE` も設定された POSIX ビルドでは、helper がこの値を `-DSTRATA_GEOMETRY` を含むかどうかの部分文字列パターンとして調べます。一致すれば既定の `-DSTRATA_GEOMETRY=<SHAPE>` を追加せず、一致しなければ該当 geometry header の存在を確認してその既定引数を追加します。この確認は CMake 引数の parse ではなく文字列パターン判定です（`tools/packaging/shape_build.sh:12-29`）。
+Strata が値の中身を見る唯一の箇所は shape 判定 `case " ${STRATA_CMAKE_EXTRA:-} " in *-DSTRATA_GEOMETRY*)`（`tools/packaging/shape_build.sh:23-28`）。空白で挟んだ文字列への部分一致で大文字小文字を区別する。`-DSTRATA_GEOMETRY_FILE=...`、`-DSTRATA_GEOMETRY=...`、`-DSTRATA_GEOMETRY_XYZ=1` は当たり、`-dstrata_geometry=...` は当たらない。
 
 ## 有効になる条件
 
-- 対応する Strata の構築スクリプトを実行し、エンジンの CMake configure 経路に到達する必要があります。実行ファイル起動時、CLI、サーバーリクエストから読む機能ではありません（上記各 configure 箇所）。
-- Windows HIP は `%BUILD_DIR%\build.ninja` が存在しない場合だけ configure するため、既存 build tree がある経路ではこの値を CMake に渡しません（`terminal/tools/hip/build_windows.bat:76-85`）。
-- HIP Linux は `VISION_ONLY` が空の場合にだけエンジン configure を行います（`tools/packaging/build_hip_linux.sh:60-69`）。
-- POSIX の対応スクリプトで `SHAPE` も指定する場合、値に `-DSTRATA_GEOMETRY` が含まれるかで helper の geometry 引数と header 検査が変わります。自動追加引数がない場合に header が存在しなければ、標準エラーに `shape_build.sh: no header ...` を出して終了コード 2 で停止します。ビルド後の `shape_check` で `strata --geometry` が shape 名と異なればエラーを出して終了します（`tools/packaging/shape_build.sh:15-37`）。
-- 対象スクリプトは CUDA、HIP、SYCL 等のそれぞれの構築要件を満たし、configure に到達する必要があります。これは当該変数の値判定ではなく、各スクリプトの実行条件です。
+- 効くのはビルド時の configure だけで、出荷済み `strata` の起動・推論には影響しない。
+- shape 判定は `SHAPE` が設定されているときだけ走る（`tools/packaging/shape_build.sh:15`）。`SHAPE` 未設定なら、extra が geometry を名指していても `shape_check` も `--shape` パッケージ化も行われない（同 `:29,33`）。
+- `SHAPE` あり かつ extra に `-DSTRATA_GEOMETRY` を含む → スクリプトは `-DSTRATA_GEOMETRY=$SHAPE` を足さない（同 `:23-27`）。ヘッダ存在チェックは省略され、代わりにビルド後の `strata --geometry` が `SHAPE` と一致するかの検査だけが残る（同 `:32-36`）。
+- `SHAPE` あり かつ extra に geometry 指定なし → `engine/include/strata/core/geometries/$SHAPE.hpp` が無ければ `exit 2`（同 `:25-26`）。
+- `terminal/tools/hip/build_windows.bat` は `%BUILD_DIR%\build.ninja` が無いときだけ configure する（同 `:76`）。configure 済みなら extra を変えても再 configure されない。
+- `tools/packaging/build_hip_linux.sh` は `VISION_ONLY` が空のときだけ engine を configure する（同 `:61`）。
+- ピクチャリーダ (`strata-vision`) の configure には渡らない（`tools/packaging/build_cuda_linux.sh:58-59`、`tools/packaging/build_vision_windows.bat:54` は `STRATA_SYM_CMAKE` だけを読む）。
 
 ## 実行時の詳細
 
-値はエンジン configure 呼び出し時に環境から展開されます。POSIX スクリプトは configure のたびに現在の環境値を展開します。Windows CUDA Python スクリプトも `main()` 内で値を取得して configure 引数を組み立てます。子プロセスへ渡す後続の build 実行には `STRATA_CMAKE_EXTRA` 自体を専用設定する処理はなく、configure 呼び出しの argv にだけ追加値が載ります（`tools/packaging/build_cuda_windows.py:166-177`; `tools/packaging/build_cuda_linux.sh:42-50`; `tools/packaging/build_sycl_linux.sh:48-51`）。
-
-POSIX CUDA/HIP/SYCL の行ではこの変数由来の引数は固定 configure 引数や ggml 指定より後ろにあります。`SHAPE` が設定され helper が `shape_cmake` を作った場合はその後ろです（`tools/packaging/build_cuda_linux.sh:43-45`; `tools/packaging/build_hip_linux.sh:63-65`; `tools/packaging/build_sycl_linux.sh:49-51`; `engine/spark/build_engine.sh:51-54`）。同じ CMake cache 変数を重ねて指定した場合の最終的な扱いは CMake configure に委ねられ、Strata 側の独自優先規則はありません。Windows CUDA では extra が ggml 指定より後ろです（`tools/packaging/build_cuda_windows.py:68-78`）。
-
-Windows HIP は `build.ninja` の存在確認で再 configure を省くため、既存 build tree の cache を使う場合は環境値を変えても configure には反映されません（`terminal/tools/hip/build_windows.bat:76-85`）。他の記載したビルドスクリプトにはこの変数専用の cache や起動後再読込機構はありません。
-
-configure の失敗時は各ビルド手順に従って停止します。HIP Linux は configure 出力を `$OUT/cfg.log` にリダイレクトし、終了コードを status log に記録して失敗なら終了します（`tools/packaging/build_hip_linux.sh:63-67`; `tools/packaging/build_hip_linux.sh:44-47`）。Windows HIP は CMake の失敗で `exit /b 1` します（`terminal/tools/hip/build_windows.bat:76-85`）。他の経路も `set -e` や `run()` の失敗処理で停止します（`tools/packaging/build_cuda_linux.sh:16,43-50`; `tools/packaging/build_sycl_linux.sh:18,49-51`; `tools/packaging/build_cuda_windows.py:145-148,174-177`）。
+- 読み取り時期: スクリプト実行中に configure 行を組み立てる 1 回。sh 4 本は `shape_build.sh` を source した時点でもう一度参照する（`tools/packaging/build_cuda_linux.sh:39`、`engine/spark/build_engine.sh:46` など）。`static` のようなキャッシュは無く、実行中に値を変えても走っている configure には影響しない。
+- 配置: arch・バックエンド・`-DSTRATA_BUILD_TESTS` などスクリプト固有の `-D` より後ろ。ただし sh 4 本では `$shape_cmake` と `$sym_cmake` がさらに後ろに来る（`tools/packaging/build_cuda_linux.sh:46`、`tools/packaging/build_hip_linux.sh:66`、`tools/packaging/build_sycl_linux.sh:51`、`engine/spark/build_engine.sh:55`）。同じ変数を重ねると後ろの値が使われるため、extra で `-DSTRATA_KEEP_SYMBOLS` は打ち消せず（`tools/packaging/symbols_build.sh:12-13`）、`-DSTRATA_GEOMETRY` は shape 判定側が自己抑制する。Python と batch では extra が最後（`build_cuda_windows.py:80`、`build_windows.bat:84`）。
+- 子プロセス: sh 各本は extra をコマンド引数として cmake に渡すだけで、環境変数としての転送は制御しない。Python は configure 用 `env` を vision ビルドにも複製して渡すが（`tools/packaging/build_cuda_windows.py:201`）、vision 側の configure 行にこの名前は現れない。
+- `BUILD.json`（`tools/packaging/build_cuda_linux.sh:73`）と `package_engine.py` の `--arch` / `--variant` はスクリプト変数から作られる（同 `:35-36,78-82`）。extra で `-DCMAKE_CUDA_ARCHITECTURES` を上書きすると、実際のマシンコードとパッケージ記載の arch が食い違い得る。
 
 ## ログと測定値
 
-この変数自体が値や有効状態を報告するログはありません。configure が不正・不適合な引数を拒否した場合は CMake の configure 失敗として構築が止まります。HIP Linux ではその出力先は `$OUT/cfg.log` で、status に `engine configured rc=<終了コード>` または `ABORT engine configured failed (rc=<終了コード>)` を追記します（`tools/packaging/build_hip_linux.sh:44-47,63-67`）。他の固有のログ文言や実行時の結果は、渡された CMake 引数の内容に依存します。
+専用のログ・警告は無い。値は configure の出力に現れるだけ。
+
+- `tools/packaging/build_cuda_windows.py:153` が configure 行全体を `+ ` 付きで stdout に出す。
+- `tools/packaging/build_hip_linux.sh` は configure 出力を `$OUT/cfg.log` に落とし、失敗時は `build.status` に `ABORT engine configured failed (rc=..)` を残して `exit 1`（同 `:45-47,66-67`）。他の sh は `set -eu`（`tools/packaging/build_cuda_linux.sh:16` など）、batch は `|| exit /b 1` で打ち切る。
+- 測定値は該当なし。
 
 ## 根拠
 
-- 候補名の全参照と用途: `tools/packaging/build_cuda_linux.sh:40-45`; `tools/packaging/build_sycl_linux.sh:43-50`; `tools/packaging/build_hip_linux.sh:61-65`; `tools/packaging/build_cuda_windows.py:15-16,166-174`; `tools/packaging/shape_build.sh:5-6,23-27`; `engine/spark/build_engine.sh:10,51-54`; `terminal/tools/hip/build_windows.bat:25,76-85`。
-- `tools/packaging/make_model_release.py:149` と各ファイルのコメントにも名前が出ますが、前者は生成文書内の説明文字列、後者は説明コメントであり、環境からの読み取り箇所ではありません。
-- `docs/DETAILS.md` は対象 checkout に存在しませんでした。対象変数について Strata が実際に環境値を読む実装は構築ラッパーの上記箇所に限られ、engine runtime / server 側の読み取りは確認されませんでした。
+- `tools/packaging/build_cuda_linux.sh:41-46`（説明コメント、configure 行と extra の位置）
+- `tools/packaging/build_hip_linux.sh:59-67` / `tools/packaging/build_sycl_linux.sh:41-51`（source 時期と configure 行）
+- `engine/spark/build_engine.sh:46-55`（arm64 CUDA 版）
+- `tools/packaging/build_cuda_windows.py:68-80,168-181,201-204`（`.split()`、末尾連結、vision への env 複製）
+- `terminal/tools/hip/build_windows.bat:25,76-84`（設定一覧、`build.ninja` ガード、展開位置）
+- `tools/packaging/shape_build.sh:12-30,32-37`（部分一致での自己抑制と `--geometry` 検査）
+- `tools/packaging/symbols_build.sh:12-13`（後置される `-DSTRATA_KEEP_SYMBOLS=ON`）

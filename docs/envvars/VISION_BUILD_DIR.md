@@ -1,43 +1,41 @@
 # `VISION_BUILD_DIR`
 
-調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
+調査対象: Strata `main` の HEAD `c234774038d1c9249cb33637d27b895d47b39786`（`2026-11-26` 時点）。
 
 ## 役割
 
-Windows CUDA packaging の vision reader ビルド用ディレクトリを指定する環境変数です。`tools/packaging/build_vision_windows.bat` がこの値を CMake の `-B`、ビルド先、および生成された `strata-vision.exe` のコピー元に使います（`tools/packaging/build_vision_windows.bat:37,54-59`）。通常の engine build directory や package 出力先は指定しません。
+Windows CUDA engine package 用の `strata-vision.exe` をビルドする作業ディレクトリを指定する。`tools/packaging/build_vision_windows.bat` が CMake の build directory として使い、生成物をそこから stage folder へコピーする。Strata の通常実行時の vision 動作を切り替える変数ではない（`tools/packaging/build_vision_windows.bat:2-19,37,54-60`）。
 
-このバッチを `tools/packaging/build_cuda_windows.py` 経由で実行すると、親プロセスの `VISION_BUILD_DIR` はそのまま使われません。Python 側は別変数 `BUILD_VISION_DIR` から directory を選び、その値で子環境の `VISION_BUILD_DIR` を常に設定します（`tools/packaging/build_cuda_windows.py:161-165,189-190`）。
+バッチを直接起動する場合は、非空の値が build directory になる。CUDA Windows package driver の `tools/packaging/build_cuda_windows.py` 経由では、driver が `VISION_BUILD_DIR` を子プロセス環境へ設定して呼び出すため、呼び出し元から継承した値はこの値に置き換わる（`tools/packaging/build_cuda_windows.py:168-172,191-207`）。
 
 ## 値と判定
 
-| 経路 | unset / 空文字 | 設定値の扱い | 無効値・境界 |
-|---|---|---|---|
-| `build_vision_windows.bat` を直接実行 | unset または空文字なら `%SRC%\build-vision-%VARIANT%-win` | 空でない文字列をパスとしてそのまま引用し、CMake `-B`、build、copy に使う | 真偽値や数値への parse、trim、存在確認による値の検証はない。`0`、`false`、空白だけも空でない値として使われる（`tools/packaging/build_vision_windows.bat:25,37,54-59`）。 |
-| `build_cuda_windows.py` が起動する子バッチ | 子環境では Python が必ず値を設定する | Python は `BUILD_VISION_DIR` の未設定・空文字を variant 別 default に置き換えて `Path` 化し、文字列化して `VISION_BUILD_DIR` に設定する | 親の `VISION_BUILD_DIR` は採用されず、子環境で上書きされる。`BUILD_VISION_DIR=0` や `false` は非空なのでパスとして使われる（`tools/packaging/build_cuda_windows.py:162-163,189-190`）。 |
+バッチは `if not defined VISION_BUILD_DIR` で有無だけを判定する。整数や真偽値への変換、文字列内容の検証、境界値判定はない。未設定と空文字は同じく未定義として扱われ、`%SRC%\build-vision-%VARIANT%-win` が設定される。非空ならその文字列をそのまま引用符で囲んで CMake に渡す。空白を含む path も一つの引数として渡る。`VARIANT` は先行処理で `cuda12` / `cuda13` に限定される（`tools/packaging/build_vision_windows.bat:21-37,54-58,64-65`）。
 
-バッチでの「設定あり」は `if not defined` 判定なので、環境変数が未設定か空文字なら default を選びます。空白は空文字ではなく値として扱われます。値全体を boolean / 数値として解釈する処理はありません（`tools/packaging/build_vision_windows.bat:37`）。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| バッチを直接起動（`cuda12` または `cuda13`） | variant に応じて `%SRC%\build-vision-cuda12-win` または `%SRC%\build-vision-cuda13-win` | `C:\work\vision build` のような任意の非空パス文字列 | 値の形式を使った無効判定はない。空文字は unset と同じ扱い |
+| `build_cuda_windows.py` 経由 | driver が `vision_dir` を設定するため unset 状態では呼ばれない | `BUILD_VISION_DIR` の値、または driver の既定 `REPO/build-vision-<variant>-win` | この変数自体の無効値判定はない。空の `BUILD_VISION_DIR` は Python 側で既定値へ fallback |
 
 ## 有効になる条件
 
-- 直接使う場合は Windows の `cmd` から `tools/packaging/build_vision_windows.bat <cuda12|cuda13> <stage>` を実行する経路です。指定値はバッチの reader build に使われます（`tools/packaging/build_vision_windows.bat:4-5,20-25,54-59`）。
-- Python packaging wrapper 経由では Windows (`os.name == "nt"`) かつ `cuda12` / `cuda13` variant が必要です。wrapper は `BUILD_VISION_DIR` を入力にし、`VISION_BUILD_DIR` を子プロセスへ設定します（`tools/packaging/build_cuda_windows.py:151-163,189-190`）。
-- バッチは variant に応じた CUDA Toolkit と `nvcc.exe`、CMake、Ninja、`cl.exe` も要求します。これらの条件を満たさない場合は directory 指定値に関係なく先に終了します（`tools/packaging/build_vision_windows.bat:26-46`）。
-- Linux の `tools/packaging/build_cuda_linux.sh` と `engine/spark/build_engine.sh` は別名 `BUILD_VISION_DIR` を読みます。Linux packaging ではさらに `BUILD_VISION=1` が reader build の条件です。これらの経路は `VISION_BUILD_DIR` を読みません（`tools/packaging/build_cuda_linux.sh:52-60`、`engine/spark/build_engine.sh:18-22`）。
+- Windows CUDA packaging の `tools/packaging/build_vision_windows.bat` が実行されること。Linux 向けや通常の Strata engine 実行時にはこの変数の参照はない（`tools/packaging/build_vision_windows.bat:2-19`）。
+- バッチ引数の variant が `cuda12` または `cuda13` で、stage folder が指定されていること。満たさない場合は usage を出して終了コード 2（`tools/packaging/build_vision_windows.bat:21-32,64-66`）。
+- CUDA toolkit の `nvcc.exe` と MSVC `cl.exe` が利用可能であること。CUDA_PATH が未設定なら `CUDA_PATH is not set: install the %VARIANT% toolkit`、nvcc がなければ `no nvcc.exe in ...`、cl がなければ `cl.exe not found: run this from an x64 Native Tools prompt` を出して終了コード 1（`tools/packaging/build_vision_windows.bat:26-35,40-46`）。
+- 通常の `build_cuda_windows.py` 経由では driver が `VISION_BUILD_DIR` と `VISION_ARCHS` を設定してバッチを起動する。ここでは外部から渡した `VISION_BUILD_DIR` は採用されず、Python 側の `BUILD_VISION_DIR`（空なら variant 別既定値）に従う（`tools/packaging/build_cuda_windows.py:168-172,191-204`）。
 
 ## 実行時の詳細
 
-バッチは実行時に環境変数を参照します。バッチを直接呼び出した場合、`VISION_BUILD_DIR` が空でなければその値を使い、空または未設定ならソース checkout 直下の variant 別 `build-vision-<variant>-win` を使います。読み取った場所に対する設定の cache はありません（`tools/packaging/build_vision_windows.bat:25,37,54-59`）。
+バッチは `setlocal` の後、引数から variant と stage folder を得る。`VISION_BUILD_DIR` が未定義または空なら variant を含む build directory を設定する。その値を `cmake -B` に渡して Release 構成を行い、同じディレクトリで `strata-vision` target を build する。続いて `<VISION_BUILD_DIR>\bin\strata-vision.exe` を stage folder の `strata-vision.exe` へコピーし、`package_engine.py --stamp-vision` を実行して vision architecture 情報を記録する（`tools/packaging/build_vision_windows.bat:20-38,48-61`）。
 
-Python wrapper では `BUILD_VISION_DIR` を `os.environ.get(...) or default` で一度取得し、選択した directory を子バッチの環境変数 `VISION_BUILD_DIR` に設定して起動します。wrapper の CLI 引数には vision build directory の指定はなく、wrapper 実行時に親の `VISION_BUILD_DIR` を変更しても反映されません。親側で指定するには `BUILD_VISION_DIR` を使います（`tools/packaging/build_cuda_windows.py:151-165,189-190`）。
+この値はバッチ内で各処理のたびに参照され、バッチ実行中に環境を外から変更して再評価する仕組みや cache はない。通常の Python driver は `venv` 辞書を作って `run(..., venv)` に渡す時点で値を固定する（`tools/packaging/build_cuda_windows.py:201-204`）。CLI 引数との優先順位はなく、直接バッチを起動したときは環境値が使われ、Python driver 経由では driver が環境値を上書きする。build directory の作成・有効性検査は CMake に委ねられ、Strata バッチは独自の path 正規化や事前検査をしない。
 
-有効値は CMake configure の `-B`、`cmake --build`、`strata-vision.exe` のコピー元に順に使われます。directory の存在・作成や CMake の処理はこの変数の値判定とは別です。CMake configure/build、copy、package stamp が失敗するとバッチは `exit /b 1` します（`tools/packaging/build_vision_windows.bat:38,54-60`）。
-
-## ログと測定値
-
-成功時、バッチは `built: <stage>\strata-vision.exe  (<variant>, archs <ARCHS>)` を表示します。reader build directory 自体を表示するログはありません。CUDA Toolkit が未設定なら `CUDA_PATH is not set: install the <variant> toolkit`、`nvcc.exe` がなければ `no nvcc.exe in <CUDA_PATH>\bin`、`cl.exe` がなければ `cl.exe not found: run this from an x64 Native Tools prompt` を出して終了コード 1 です。引数不足・variant 不正は usage を表示して終了コード 2 です（`tools/packaging/build_vision_windows.bat:23-35,40-46,60-65`）。測定値の記載はありません。
+CMake configure、build、copy、または stamp の各コマンドが失敗すると、各 `|| exit /b 1` によりバッチは終了コード 1 で止まり、それ以降の工程は実行されない（`tools/packaging/build_vision_windows.bat:54-60`）。成功時は `built: <stage>\strata-vision.exe  (<variant>, archs <archs>)` を表示する（同:61）。変数値そのものについての Strata 独自ログや警告はない。
 
 ## 根拠
 
-- `tools/packaging/build_vision_windows.bat:25-37,54-65` — 直接の環境変数判定、既定 directory、CMake/build/copy、失敗・成功ログ。
-- `tools/packaging/build_cuda_windows.py:151-165,189-190` — Windows/variant 条件、別名 `BUILD_VISION_DIR` の fallback と子環境への転送・上書き。
-- `tools/packaging/build_cuda_linux.sh:52-60`、`engine/spark/build_engine.sh:18-22` — Linux 経路が `BUILD_VISION_DIR` を使うこと、および Linux packaging の `BUILD_VISION` 条件。
+- `tools/packaging/build_vision_windows.bat:16-19` — Windows CUDA vision packaging 用設定としての記載。
+- `tools/packaging/build_vision_windows.bat:21-37` — variant 判定、未設定値の既定 directory、CUDA 条件。
+- `tools/packaging/build_vision_windows.bat:54-61` — CMake configure/build、stage への copy、stamp、失敗時の終了。
+- `tools/packaging/build_cuda_windows.py:168-172,191-207` — Python driver の build directory 既定値、環境上書き、バッチ呼び出し。
+- `tools/packaging/README.md:25-31` — Windows CUDA engine package recipe が `cuda12` / `cuda13` であること。
