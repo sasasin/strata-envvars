@@ -1,44 +1,52 @@
 # `STRATA_NODE_VERSION`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の Strata 作業ツリーは `## main...origin/main` で、未コミット変更はありません。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-desktop アプリに同梱する Node.js 実行ファイルを取得・確認する開発・パッケージ作業用スクリプトのバージョン指定です。`apps/desktop/scripts/fetch-node.sh` と Windows 用の `fetch-node.ps1` が環境から直接読み取ります。Strata アプリの通常起動時にこの環境変数を読むコードは確認できません。Node runtime はバンドル内の `node` / `node.exe` を選び、開発時の候補パスにも `v24.12.0` が固定されています（`apps/desktop/src-tauri/src/main.rs:309-335`）。
+この変数は、デスクトップアプリに同梱する Node.js を取得する `app/desktop/scripts/fetch-node.sh` と Windows 用 `fetch-node.ps1` が使うバージョン文字列です。未設定または空文字なら `24.12.0` を選び、値をアーカイブ名・取得 URL・展開対象パス・`--check` の期待バージョンに埋め込みます。これは Strata エンジンの実行時設定ではなく、Node sidecar を準備するパッケージ作業用の入力です（`app/desktop/scripts/fetch-node.sh:21,63-72,95-103`; `app/desktop/scripts/fetch-node.ps1:20-24,37-45,64-69`）。
+
+取得スクリプトがインストールする sidecar は `resources/node` に置かれ、Tauri の resource 設定でアプリへ同梱されます。アプリは同梱 Node が存在すればそれを選び、なければ開発用候補を探します（`app/desktop/scripts/fetch-node.sh:22-23,95-103`; `app/desktop/src-tauri/tauri.conf.json:33-40`; `app/desktop/src-tauri/src/main.rs:350-379`）。
 
 ## 値と判定
 
-どちらのスクリプトも環境変数の文字列を数値や SemVer として parse せず、バージョン文字列として URL、アーカイブ名、アーカイブ内パスに埋め込みます。
+両スクリプトとも、プロセス開始時に環境から文字列を読みます。数値・形式の parse、trim、大文字小文字変換はありません。未設定と空文字は既定値になり、それ以外の文字列はそのまま使われます。たとえば `24.12.0`、`0`、`false`、`24.12.0 ` はいずれも非空の設定値として採用されます。妥当な Node バージョンかどうかの検査はなく、文字列が URL やファイル名に反映されます（`app/desktop/scripts/fetch-node.sh:21,63-72`; `app/desktop/scripts/fetch-node.ps1:20-21,37,45`）。
 
-| 実行経路 | 未設定・空文字 | 非空文字列 | 検査と結果 |
-|---|---|---|---|
-| Bash (`fetch-node.sh`) | `${STRATA_NODE_VERSION:-24.12.0}` により、未設定と空文字は `24.12.0` | 文字列全体をそのまま採用。形式・範囲検証なし | `--check` では installed Node の出力が厳密に `v${NODE_VERSION}` と一致するか確認。不一致は stderr に `fetch-node: expected v...`、終了コード 1。取得時は対象向けアーカイブを組み立てる。 |
-| PowerShell (`fetch-node.ps1`) | `if ($env:STRATA_NODE_VERSION)` が偽になるため未設定と空文字は `24.12.0` | 文字列全体をそのまま採用。形式・範囲検証なし | `-Check` では installed Node の出力と `v${NodeVersion}` を完全一致比較。不一致は `Fail` の stderr 出力、終了コード 1。 |
+`--check` の比較は Bash では大文字小文字を区別する文字列比較、PowerShell の `-ne` では既定で大文字小文字を区別しない比較です（`app/desktop/scripts/fetch-node.sh:56-61`; `app/desktop/scripts/fetch-node.ps1:29-34`）。
 
-空白だけの値や不正なバージョン表記も非空なら採用されます。入力を trim したり、semver の大小関係を判定したりする処理はありません。コメント上の App Host 要件は Node `>= 24.12.0` ですが、取得スクリプトはこの下限を検証しません（`apps/desktop/scripts/fetch-node.sh:18-21`, `apps/desktop/scripts/fetch-node.ps1:11-20`; 要件記載は `apps/host/package.json:47-49`）。
+| 実行経路 | unset | 空文字 | 設定時に使われる値 | 既定値以外での digest 判定 |
+|---|---|---|---|---|
+| Bash `fetch-node.sh` | `24.12.0` | `24.12.0`（`${VAR:-...}`） | 任意の非空文字列をそのまま使用。たとえば `24.13.0`、`0`、`false` | `digest_for` は target ごとの記録済み digest を返す。記録のある target は別バージョンの archive も同じ digest と比較して不一致なら取得物を拒否する。記録のない target は警告を出して続行する（`app/desktop/scripts/fetch-node.sh:21,30-38,74-93`）。 |
+| Windows PowerShell `fetch-node.ps1` | `24.12.0` | `24.12.0`（空文字は条件偽） | 任意の非空文字列をそのまま使用。たとえば `24.13.0`、`0`、`false` | バージョンが `24.12.0` 以外なら警告を出し、digest を比較せず続行する。`24.12.0` の場合は固定 digest と照合し、不一致なら拒否する（`app/desktop/scripts/fetch-node.ps1:20-23,51-60`）。 |
+
+既定版 `24.12.0` 以外へ変更する場合、Bash では target 用 digest の更新も必要です（`app/desktop/scripts/fetch-node.sh:25-38,82-93`）。PowerShell は非既定版を認証なしとして警告する実装です（`app/desktop/scripts/fetch-node.ps1:51-60`）。
 
 ## 有効になる条件
 
-- Bash スクリプトを明示的に実行した場合、または Windows で PowerShell スクリプトを明示的に実行した場合にだけ値が評価されます。`packaging/README.md:55-68` は同梱 Node の取得・確認手順として両スクリプトを案内しています。
-- Bash は `--target` で対象 platform を選べます。Node version と対象名を組み合わせて URL とアーカイブ名を作ります（`apps/desktop/scripts/fetch-node.sh:40-53,63-75`）。PowerShell 側の対象は `win-x64` 固定です（`apps/desktop/scripts/fetch-node.ps1:20-25,37-49`）。
-- `--check` / `-Check` ではダウンロードを行わず、既存の実行ファイルの version だけを比較します。`-FromFile` は PowerShell のダウンロード元を変えますが、期待するバージョンやアーカイブ内パスには同じ環境変数の値が使われます（`apps/desktop/scripts/fetch-node.sh:56-61`; `apps/desktop/scripts/fetch-node.ps1:29-35,37-45,64-67`）。これらの CLI 引数は環境変数の version 値を上書きしません。
-- Bash の digest は対象 platform ごとの記録値で、version ごとの選択ではありません。対象に記録 digest があれば、別 version の正常なアーカイブでも通常その digest と一致せず拒否されます。対象に digest がなければ警告を出して未認証のまま続行します（`apps/desktop/scripts/fetch-node.sh:30-38,74-93`）。
-- PowerShell は version が `24.12.0` と異なると、digest の一致確認を行わず警告を出して続行します。`24.12.0` では記録済み digest と異なるアーカイブを拒否します（`apps/desktop/scripts/fetch-node.ps1:22-23,51-60`）。
+- `fetch-node.sh` または `fetch-node.ps1` を実行する必要があります。Strata の通常起動時にこの変数を読む箇所は見つかりません（全参照の検索結果では、実装読み取りは上記 2 スクリプトのみ）。
+- Bash スクリプトは実行ホストを `uname` で判定し、macOS arm64、Linux x64/arm64、Windows互換 shell を自動選択します。`--target` で対象を指定できます。archive 分岐には `darwin-x64` もありますが、digest 一覧にはありません（`app/desktop/scripts/fetch-node.sh:30-47,51-74`）。未対応 host は `unsupported host: ...` で終了コード 2、archive 分岐にない target は `fetch-node: no archive known for ...` で終了コード 2 です。
+- PowerShell スクリプトは target を `win-x64` に固定しています（`app/desktop/scripts/fetch-node.ps1:20-23,37`）。
+- `--check`（PowerShell は `-Check`）では既存ファイルの Node `--version` と `v<変数値>` を照合します。ファイルがない場合、またはバージョンが一致しない場合は失敗します。通常の取得時は、指定バージョンの Node 配布 archive が取得可能である必要があります（`app/desktop/scripts/fetch-node.sh:56-61`; `app/desktop/scripts/fetch-node.ps1:29-35`）。
+- Bash の記録済み digest がある target では、環境変数だけを既定値以外に変えても digest は連動更新されず、不一致で拒否されます。記録のない target は認証なし警告後に処理を続けます。PowerShell は既定版以外について同じく認証なし警告を出し、処理を続けます（`app/desktop/scripts/fetch-node.sh:30-38,74-93`; `app/desktop/scripts/fetch-node.ps1:22-23,51-60`）。
+- バンドル後のアプリは `STRATA_NODE_VERSION` を再評価しません。同梱 Node が見つかればそれを使用します（`app/desktop/src-tauri/src/main.rs:364-379`）。
 
 ## 実行時の詳細
 
-両スクリプトはプロセス開始後、スクリプト本体の冒頭で一度だけ値を変数に読み込み、その実行中はその値を使います。環境変更を再読込するループや cache はありません。子プロセスに環境変数を転送する処理も見つかりません。
+値は各スクリプトの起動時に一度シェル変数へ代入されます。スクリプト実行中に親プロセス側の環境値を変更しても、その代入値は変わりません。子プロセスへ環境変数を設定し直す処理はなく、Node archive の URL、展開先の名前などを組み立てるために値を使います（`app/desktop/scripts/fetch-node.sh:19-23,63-79,95-103`; `app/desktop/scripts/fetch-node.ps1:18-24,37-49,61-69`）。
 
-取得モードでは version を使って nodejs.org の URL を作り、その URL を表示してダウンロードします。Bash では `curl` が失敗すると `set -e` により後続処理へ進まず、PowerShell では `$ErrorActionPreference = 'Stop'` のもとで Web request のエラーが停止経路になります（`apps/desktop/scripts/fetch-node.sh:19,63-80`; `apps/desktop/scripts/fetch-node.ps1:18,37-50`）。ハッシュ検証失敗は `REFUSING` を stderr に出して終了コード 1、digest 未登録または PowerShell の非既定 version は `WARNING` と計算済み SHA-256 を stderr に出し、その後インストールへ進みます（`apps/desktop/scripts/fetch-node.sh:81-103`; `apps/desktop/scripts/fetch-node.ps1:51-69`）。
+Bash の通常取得では `curl` で archive を取得し、記録済み digest があれば SHA-256 不一致時に展開前に終了します。PowerShell は `-FromFile` の指定時にローカル zip を使い、それ以外は URL から取得します。いずれも展開後に `resources/node` へ Node 実行ファイルを配置します（`app/desktop/scripts/fetch-node.sh:74-103`; `app/desktop/scripts/fetch-node.ps1:37-69`）。
 
-`--check` / `-Check` の出力は、成功時に現在の Node version を表示して終了コード 0、不在時または version 不一致時にエラーを表示して終了コード 1 です（`apps/desktop/scripts/fetch-node.sh:56-61`; `apps/desktop/scripts/fetch-node.ps1:29-35`）。取得スクリプトは結果を desktop resource directory に配置します。通常アプリの起動コードはそこにある Node を選びますが、`STRATA_NODE_VERSION` 自体を起動時の runtime 選択に使いません（`apps/desktop/src-tauri/src/main.rs:309-335`）。
+## ログと測定値
 
-候補一覧 `docs/envvars/000_envvers.md:1131` に名前があります。候補名の全参照検索では上記2スクリプトに加えて、`packaging/README.md` の説明と `tests/desktop/test_fetch_node.py:26-27` の既定値整合確認が見つかりました。テスト参照は実装動作の根拠にはしていません。共通 env helper や動的な変数名を介した追加の読み取りは見つかりませんでした。
+Bash は URL、digest の検証結果、認証なしの警告、インストール先を `fetch-node:` 付きで出力します。記録済み digest との不一致では `fetch-node: REFUSING — ...` を stderr に出して終了コード 1、digest 未記録では `fetch-node: WARNING — no recorded digest for ...; this download is NOT authenticated.` を stderr に出して続行します（`app/desktop/scripts/fetch-node.sh:78-93,103`）。`--check` は未導入またはバージョン不一致の場合に stderr へ理由を出して終了コード 1 です（同:56-61）。
+
+PowerShell は URL と成功結果を標準出力へ、認証なしの警告を stderr へ出します。既定版の hash 不一致、`-Check` で未導入・版不一致、または zip に `node.exe` がない場合は `Fail` 経由で stderr に `fetch-node: ...` を出して終了コード 1 です（`app/desktop/scripts/fetch-node.ps1:27-35,45-59,64-69`）。
+
+対象変数に関する Strata の性能測定値はありません。
 
 ## 根拠
 
-- 直接読み取りと既定値: `apps/desktop/scripts/fetch-node.sh:21`; `apps/desktop/scripts/fetch-node.ps1:20`
-- CLI、取得 URL、digest、インストールとログ: `apps/desktop/scripts/fetch-node.sh:30-103`; `apps/desktop/scripts/fetch-node.ps1:22-71`
-- packaging 手順: `packaging/README.md:55-79`
-- App Host が要求する Node 下限: `apps/host/package.json:47-49`
-- desktop runtime が選ぶ実行ファイル: `apps/desktop/src-tauri/src/main.rs:309-335`
+- Bash での既定値、target 別 digest、archive 取得・検証・配置: `app/desktop/scripts/fetch-node.sh:21-38,40-103`
+- PowerShell での既定値、Windows target、digest 分岐、取得・展開: `app/desktop/scripts/fetch-node.ps1:18-72`
+- Node sidecar のバンドルと選択: `app/desktop/src-tauri/tauri.conf.json:33-40`; `app/desktop/src-tauri/src/main.rs:350-379`
+- パッケージ手順と digest 更新の説明: `tools/packaging/README.md:41-54`

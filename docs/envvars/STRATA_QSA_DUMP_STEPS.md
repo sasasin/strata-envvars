@@ -1,42 +1,43 @@
 # `STRATA_QSA_DUMP_STEPS`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA/HIP の prompt prefill で、QSA の選択記録に各 query の `steps` 配列を追加します。これは環境変数の値に基づいて処理を切り替える診断用フックです。通常の QSA 計算や結果を有効化するスイッチではありません。実際の記録には別途 `STRATA_QSA_DUMP` にファイル名を設定する必要があります。
+`Prefill::run_impl` が QSA の選択結果を `STRATA_QSA_DUMP` のファイルへ追記するとき、各レコードの末尾に各 query の QSA step 情報も保存します。既存のレコードは `int32` 4 個のヘッダーと `T * cap` 個の選択 cell で、その後ろに `T * kStepCount` 個の `int32` が続きます。`kStepCount` は 4 で、step は位置、KV cell 数、完了 block 数、選択幅を表します（`engine/src/prefill/prefill.cpp:5507-5527`、`engine/include/strata/kernels/qsa.hpp:160-177`）。
+
+この分岐はデータをファイルへコピーする診断用処理です。step や選択結果を変更せず、読み取った値で QSA の計算分岐も変えません。一方、step の device-to-host コピーとファイル書き込みが加わります（`engine/src/prefill/prefill.cpp:5517-5529`）。
 
 ## 値と判定
 
-値は parse されません。記録処理の該当箇所で `std::getenv("STRATA_QSA_DUMP_STEPS")` が null でないかだけを判定します。
+値そのものは変換・比較せず、対象箇所で `std::getenv(...) != nullptr` かどうかだけを判定します。したがって空文字、`0`、`1`、`true`、`false`、その他の文字列はいずれも「設定あり」です。大文字小文字、空白、数値としての妥当性は検査しません（`engine/src/prefill/prefill.cpp:5524`）。
 
-| 状態 | 挙動 |
-|---|---|
-| 未設定 | 選択セルの配列までを書き、`steps` 配列を追加しない |
-| 設定あり（空文字を含む） | `steps` 配列も追加する |
+この判定が行われるのは、`STRATA_QSA_DUMP` が設定され、対象の prompt 範囲と QSA layer が dump 条件に合い、ファイルを開けた場合だけです（`engine/src/prefill/prefill.cpp:5512-5524`）。
 
-`1`、`0`、その他の文字列の区別、大文字小文字、数値変換、範囲制限はありません。設定値が空でも有効です。
+| 条件 | 未設定 | 設定ありの例 | 無効になる値の例 |
+|---|---|---|---|
+| `STRATA_QSA_DUMP` のファイル出力が実行される | steps を付けない | 空文字、`0`、`1`、`true`、`false` | なし。設定値の内容による無効値はない |
 
 ## 有効になる条件
 
-`STRATA_QSA_DUMP_STEPS` だけでは出力されません。次の条件も必要です。
-
-- QSA の処理が実行される prompt prefill 経路である。
-- `STRATA_QSA_DUMP` が設定されている。値はファイルパスとして使われ、空文字なら空のパスで開こうとするため、通常はファイルを開けません。
-- 現在の chunk が記録対象の末尾位置に重なる。境界は `p0 + T > pos0 + n - last` で判定され、`last` は `STRATA_QSA_DUMP_LAST` が未設定なら 4096、設定時は `atoll` の結果です。
-- `STRATA_QSA_DUMP_LAYER` が未設定、またはその `atoi` の結果が現在の QSA layer index と一致する。未設定時の既定値は `-1`（全 QSA layer）。
-
-このコードは `src/prefill/prefill.cpp` にあり、同ファイルは `strata_prefill` ターゲットに含まれます。CMake の当該ターゲットは CUDA/HIP runtime とリンクされます。SYCL 側の `sycl/src/prefill/prefill.cpp` には `STRATA_QSA_DUMP` と `STRATA_QSA_DUMP_LAST` の別実装がありますが、`STRATA_QSA_DUMP_STEPS` の読み取りは確認できません。
+- `STRATA_QSA_DUMP` が設定されている必要があります。未設定なら外側の分岐に入らず、この変数も読み取られません。`STRATA_QSA_DUMP` が空文字の場合も設定済みとして分岐しますが、空のパスを `fopen` するため通常ファイルを開けず、steps は出力されません（`engine/src/prefill/prefill.cpp:5512-5524`）。
+- 対象 chunk が prompt の末尾範囲にかかり、かつ `STRATA_QSA_DUMP_LAYER` が未設定または現在の QSA layer と一致する必要があります。末尾範囲は `STRATA_QSA_DUMP_LAST` で決まり、未設定時は 4096 です（`engine/src/prefill/prefill.cpp:5513-5516`）。
+- QSA layer を処理する `run_impl` の経路が必要です。`STRATA_PREFILL_LAYER_MAJOR` / `STRATA_DEFAULTS` による設定解決後に layer-major が選ばれ、その prompt の `lm_prepare_chain` が通ると `Prefill::run` は `run_impl` を呼ばずに戻ります。layer-major の QSA 処理には debug dump がなく、`STRATA_QSA_DUMP_STEPS` 自体も layer-major を無効にする条件には含まれません（`engine/src/prefill/prefill.cpp:8205-8208, 9346-9349, 9657-9705`）。Metal は独自の `prompt_run` を呼んで戻るため、この箇所を通りません（`engine/src/prefill/prefill.cpp:9629-9651`）。
 
 ## 実行時の詳細
 
-対象 chunk/layer では GPU 上の `m.sel_ids` をホストにコピーして stream を同期し、`STRATA_QSA_DUMP` のパスを append binary mode (`"ab"`) で開きます。ファイルには順に、4 個の `int32` ヘッダー `{qsa layer, p0, T, cap}`、`T * cap` 個の選択 cell (`int32`)、そしてこの変数が設定済みなら `T * kStepCount` 個の `int32` steps が書かれます。したがって、この変数を設定しない記録は steps を必要とする `tests/cuda/pa_bench.cpp` の入力形式を満たしません。
+`STRATA_QSA_DUMP` のポインター、`STRATA_QSA_DUMP_LAST`、`STRATA_QSA_DUMP_LAYER` は関数内 `static` として初回評価時に保存されます。これに対し `STRATA_QSA_DUMP_STEPS` は dump 対象レコードごとに `getenv` されるため、その値をキャッシュしません。実行中に環境を変更できる場合、次の対象レコードの判定に反映されますが、既にキャッシュされた dump path・末尾長・layer 選択は再読込されません（`engine/src/prefill/prefill.cpp:5512-5525`）。
 
-`STRATA_QSA_DUMP_STEPS` は各該当記録で直接 `getenv` され、関数内の `static` キャッシュには入りません。プロセス内で環境を書き換える場合、後続記録の判定に反映されます。`STRATA_QSA_DUMP_LAST` と `STRATA_QSA_DUMP_LAYER` は `static` ローカル初期化で一度だけ読み込まれます。ファイルを開けない場合は記録をスキップし、この箇所からは警告・エラーを出しません。`fwrite` の戻り値も確認していません。
+ファイルは `"ab"` で開かれ、既存内容の後ろへヘッダー、選択 cell、続けて step 配列を書きます。step 配列は `m.steps_dev` から `T * 4` 個の `int32` としてコピーされます（`engine/src/prefill/prefill.cpp:5517-5529`）。CLI 引数による上書きや優先順位はなく、この変数は値を読む他の環境変数もありません。`STRATA_QSA_DUMP`、`STRATA_QSA_DUMP_LAST`、`STRATA_QSA_DUMP_LAYER` が出力経路を絞ります。
+
+## ログと測定値
+
+この変数の読み取り・書き込みに伴う専用ログはありません。ファイルを開けない場合はそのレコードの書き込みを行わず、警告やエラーを出しません。step の device-to-host コピー、`fwrite` の戻り値もこの箇所では検査されないため、コピー失敗や短い書き込みを Strata が報告する経路は確認できません（`engine/src/prefill/prefill.cpp:5518-5529`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:3231-3254` — dump の条件、既定値、層フィルター、ヘッダー・selection・steps の出力、append mode。
-- `CMakeLists.txt:679-685` — `src/prefill/prefill.cpp` を含む `strata_prefill` ターゲットと GPU runtime のリンク。
-- `sycl/src/prefill/prefill.cpp:3129-3134` — SYCL 側の QSA dump 実装。ここでは `STRATA_QSA_DUMP_STEPS` を読み取らない。
-- `tests/cuda/pa_bench.cpp:1-3,27-34` — steps 付き dump の形式を利用するベンチマーク側の説明と、steps 不足時のエラー。ただしベンチマークは変数の本番動作根拠には用いていない。
+- `engine/src/prefill/prefill.cpp:5507-5529` — dump 条件、環境変数の読み取り、追記形式、steps の追加。
+- `engine/src/prefill/prefill.cpp:4586-4591` — chunk の各位置について step レコードを作成し device に upload。
+- `engine/include/strata/kernels/qsa.hpp:160-177` — 4 個の `int32` step フィールドと意味。
+- `engine/src/prefill/prefill.cpp:9346-9349, 9629-9651, 9657-9705` — layer-major / Metal と `run_impl` の経路差。
+- `engine/tests/cuda/pa_bench.cpp:1-3, 25-33` — 生成されたレコードを読み、steps がない場合に短い dump として扱うテスト用ツール。動作仕様の根拠にはしていません。

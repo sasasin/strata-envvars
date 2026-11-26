@@ -1,6 +1,6 @@
 # `--profile`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,58 +8,50 @@
 | コマンド | `strata ops runs` |
 | オプション | `--profile` |
 | 別名 | なし |
-| 値 | 保存済みプロファイル名（必須） |
+| 値 | 保存済み serving profile 名（値を必須とする） |
 
 ## 役割
 
-履歴を表示する対象の保存済みプロファイルを選びます。履歴はプロファイルごとに保存され、別のプロファイルの実行記録は列挙されません。
+`--profile` は、`strata ops runs` が一覧表示するローカル operation journal の profile を指定する。ここでの `runs` は記録の読み取りだけを行い、operation を実行しない。recipe 実行に加えて、一部の直接 runtime/calibration 実行も同じ journal に記録される（`terminal/strata_cli/cli.py:1474-1478`、`docs/TERMINAL.md:133`）。
 
 ## 使い方
 
 ```sh
 strata ops runs --profile four-gpu
+strata ops runs --profile four-gpu --limit 50 --output json
 ```
 
-JSON で取得する場合:
-
-```sh
-strata ops runs --profile four-gpu --output json
-```
+`--profile` は必須で、`--output` の既定値は `human`。JSON 表示は `--output json` または共通 one-shot alias `--json` で選べる（`terminal/strata_cli/cli.py:286-297,539-545`）。
 
 ## 値と既定値
 
-- 値は必須で、省略すると `argparse` が usage と引数エラーを表示して終了コード 2 で終了します。値を取らないフラグです。
-- プロファイル名は小文字英字で始まり、小文字英字・数字・`_`・`-` のみを使えます。保存済みのプロファイルが必要です。パスや run-config JSON の指定ではありません。
-- `--profile` 自体に既定値はありません。`strata ops` の各サブコマンド parser に共通して必須指定として追加されていますが、この文書の対象スコープは `strata ops runs` です。
+- 値は `--profile NAME` の形式で必須。省略すると argparse が usage error として拒否する。profile 名は小文字英字で始まり、小文字英数字・`_`・`-` を使用でき、長さは最大 64 文字（`terminal/strata_cli/cli.py:294`、`terminal/strata_control/profiles.py:25,48-55`）。
+- 有効な既定 profile はない。`recipes._directory()` が `profiles.load()` を呼ぶため、その名前の profile ファイルが必要（`terminal/strata_control/recipes.py:38-41`）。未保存の名前はエラーになる。launch preset 名も独立した保存済み profile とは扱われず、別途 `strata profile create` を案内する（`terminal/strata_control/profiles.py:153-168`）。
+- profile の探索先は `STRATA_PROFILE_DIR` があればその値、Windows では `APPDATA` 配下（未設定時は home 配下）、それ以外では `XDG_CONFIG_HOME` または `~/.config` 配下（`terminal/strata_control/profiles.py:38-45`）。
+- 同じ `--profile` の複数回指定時の意味は parser で定義されていないため、挙動を保証できない。
 
 ## 実行時の動作
 
-CLI は `--profile` を `journal.list_runs(profile, limit=...)` に渡します。処理はプロファイルの保存先にある `.ops/<profile>/.runs/` を参照し、ID が32桁の小文字16進数である JSON 記録を更新日時の新しい順に読みます。ディレクトリがまだなければ空の一覧になります。
+parser は値を文字列として受け取り、`_ops()` はこれを `journal.list_runs(profile, limit=...)` に渡す。profile は `~/.config/strata/profiles`（または設定された profile directory）の `<NAME>.json` から読み込まれ、その profile の recipe 配下にある `.runs` が一覧対象となる（`terminal/strata_cli/cli.py:294,1474-1478`、`terminal/strata_control/profiles.py:38-55,153-168`、`terminal/strata_control/recipes.py:38-64`、`terminal/strata_control/journal.py:47-63,259-278`）。
 
-既定の表示件数は `--limit 20` です。`--limit` は整数で、1〜100 の範囲に限られます。0 以下または101以上は `ProfileError` となり、既定の human 出力では stderr に `strata: operation list limit must be 1..100` を出して終了コード 2 になります。これは `--profile` の値自体の制約ではなく、この一覧コマンドとの相互作用です。
-
-human 出力では各記録の operation ID と state を1行に表示し、一覧が空なら `No operation runs recorded` と表示します。`--output json` では `profile` と `runs` を含む成功 JSON を出します。各正常な一覧要素には operation ID、recipe（直接操作では null）、origin、kind、state、開始・終了時刻が含まれ、`running` 状態は `completion_unverified: true` として示されます。記録ファイルを読めない、または検証できない場合、その記録は一覧から落とされず operation ID と error を持つ要素になります。
+記録はファイル更新時刻の降順で並び、`--limit` 件まで読み込まれる。各行には operation ID、recipe/direct の由来、kind、state、開始・終了時刻が含まれ、実行中の記録は `completion_unverified` として示される。壊れている、またはサポートされない個別記録は一覧全体を止めず、その行に `error` として返る。journal ディレクトリが存在しない場合は空一覧になる（`terminal/strata_control/journal.py:259-278`）。
 
 ## 適用条件と副作用
 
-- 指定名の保存済みプロファイルがない場合は一覧を取得できず、エラー `profile '<name>' is not saved; use strata profile create` と終了コード 5 になります。
-- 一覧処理は run 記録の作成・編集・削除を行いません。`.runs` が存在する場合はシンボリックリンクや所有者限定アクセス権を検査し、不適切なディレクトリは拒否します。
-- 履歴ディレクトリを解決する前にプロファイル本体を読み込みます。プロファイルファイルへのアクセス拒否時、実装はアクセス権修復を一度試してから再読込するため、条件によってはこのファイルのアクセス権が修復される副作用があります。
-- Windows で CLI を管理者権限で起動した場合、CLI の共通初期化が後続作成ファイル用にプロセスの既定 owner/DACL をユーザーへ合わせようとします。この一覧処理自体は履歴ファイルを作成しません。
+このコマンドは記録を参照する読み取り操作で、operation の開始・停止や journal 記録の作成は行わない。profile の読込時に `private_files.read_bytes_repairing()` が使われるため、昇格実行でロックされた profile は必要に応じてその場で修復される（`terminal/strata_control/profiles.py:153-162`）。journal directory が symlink である場合や POSIX で owner-only の権限要件を満たさない場合は拒否される（`terminal/strata_control/journal.py:47-57`）。
 
 ## 出力とエラー
 
-- 名前の形式が不正な場合は終了コード 2、プロファイルが未保存の場合や `.runs` の型・アクセス権が不適切な場合は通常終了コード 5 でエラーになります。human 出力ではエラーメッセージを stderr に出します。
-- `--limit` の整数変換失敗や範囲外は終了コード 2 です。整数変換失敗は parser の usage エラー、範囲外は `strata:` 付きのエラーとして扱われます。
-- `--output json` の場合、コマンド処理エラーは `ok: false` と error code/message を持つ JSON になります。成功時は `ok: true`、`profile`、`runs` を含みます。
+- human 出力では、各記録の operation ID と state を表示する。該当記録がなければ `No operation runs recorded` と表示（`terminal/strata_cli/cli.py:1474-1478`）。
+- JSON 出力は `schema_version`、`ok`、指定 profile 名、`runs` 配列を stdout に出す（`terminal/strata_cli/cli.py:566-573,1474-1478`）。
+- 一覧上限 `--limit` は既定 20、整数 1〜100。範囲外は `operation list limit must be 1..100` で失敗する（`terminal/strata_cli/cli.py:296-297`、`terminal/strata_control/journal.py:259-262`）。
+- ProfileError は human 時 stderr、JSON 時 stdout にエラーを出し、例外に exit code があればそれを使用する。通常の未知の profile は code 5、option の不足・不正な profile 名は parser/profile validation のエラーとなる（`terminal/strata_cli/cli.py:558-563,2248-2255`、`terminal/strata_control/profiles.py:30-35,48-55,163-172`）。
 
 ## 根拠
 
-- parser と必須指定・型・既定値: `strata_cli/cli.py:255-270`。
-- `strata ops runs` から journal への値の転送、human/JSON 表示: `strata_cli/cli.py:1391-1408`。
-- プロファイル名の検証・保存先解決・プロファイル読込時のアクセス権修復: `strata_control/recipes.py:38-59`、`strata_control/profiles.py:48-55`、`strata_control/profiles.py:150-166`、`strata_control/private_files.py:476-484`。
-- 一覧上限、対象ディレクトリ、降順、欠損ディレクトリ、各記録の検証とエラー要素化: `strata_control/journal.py:47-57`、`strata_control/journal.py:185-244`、`strata_control/journal.py:254-273`。
-- 共通エラー・成功出力と `ProfileError` の終了コード処理: `strata_cli/cli.py:527-542`、`strata_cli/cli.py:2119-2173`、`strata_control/profiles.py:30-35`。
-- CLI 起動時の Windows 向け既定アクセス権調整: `strata_cli/cli.py:2217-2223`、`strata_control/private_files.py:349-375`。
-
-この調査ではソースコードを確認し、CLI の `--help` は実行していません。Release 配布物や他 OS 上での実動作は確認していません。
+- `terminal/strata_cli/cli.py:283-297` — `ops runs` parser と必須 `--profile` 定義、`--limit` の既定値。
+- `terminal/strata_cli/cli.py:1461-1478` — profile を journal 一覧処理へ渡し、human/JSON を出力。
+- `terminal/strata_control/profiles.py:25,38-55,153-172` — profile 名規則、保存先、profile 読み込みと未保存時のエラー。
+- `terminal/strata_control/recipes.py:38-64` — profile を検証して `.ops/<profile>` の recipe directory を特定。
+- `terminal/strata_control/journal.py:47-57,259-278` — journal directory、limit validation、mtime 降順の一覧と破損記録の扱い。
+- `docs/TERMINAL.md:125,133` — 利用例と `ops runs` が journal を読み取る説明。ソース挙動の根拠には上記実装を使用。

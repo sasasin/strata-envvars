@@ -1,46 +1,49 @@
 # `STRATA_DF2_NO_PROMPT_CTX`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。対象は Strata 所有ソース。候補一覧 `000_envvers.md` に名前がある。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL 版の `strata serve --draft dflash2` で、batched prompt prefill が得た tap rows を DFlash2 drafter の context に追加しないための測定用フックです。prompt の読み込み自体や verifier の処理を止める変数ではありません。通常の `strata generate` 経路にはこの変数の読み取りがありません。
+SYCL の `strata serve` で DFlash2 を使うとき、プロンプト読み込み中に計算した tap 行を DFlash2 drafter の context に渡す処理を省略する、測定用フラグです。prompt callback はこの変数が設定されていると即座に成功を返し、`df2.context(...)` を呼びません。コードコメントは、プロンプト行を drafter に渡さないため最初の draft の品質が下がり、プロンプト読込時間から drafter の処理分を切り分けられる用途としています（`engine/sycl/src/program/generate.cpp:7905-7914`）。
+
+この分岐が対象にするのはサーバーの prompt-read callback です。通常の `strata generate` では別の callback が同じ prompt taps を `df2.context(...)` に渡し、この変数を確認しません（`engine/sycl/src/program/generate.cpp:13373-13389`）。
 
 ## 値と判定
 
-値の内容は parse せず、`std::getenv(...) != nullptr` だけで設定有無を判定します。
+`std::getenv(...) != nullptr` による設定有無だけの判定です。値の parse、数値変換、文字列比較はありません。未設定なら通常どおり context を更新し、空文字を含め何らかの値が設定されていれば更新をスキップします（`engine/sycl/src/program/generate.cpp:7907-7912`）。
 
-| 環境状態 | 判定 | batched prompt の tap callback |
-|---|---|---|
-| 未設定 | `skip == false` | `df2.context(taps, rows, pos0, e)` を呼ぶ |
-| 設定あり | `skip == true` | `true` を返して正常扱いにし、`df2.context(...)` を呼ばない |
+| ビルド・経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| SYCL `strata serve` の DFlash2 prompt callback | skip=false。`df2.context(...)` を実行 | 空文字、`0`、`1`、`false`、その他すべて（設定値の内容は見ない） | 該当なし。環境変数が存在すれば値にかかわらず有効 |
+| SYCL `strata generate` の prompt callback | この callback では参照しない | 該当なし | 該当なし。この変数による制御はない |
 
-したがって `1` だけでなく `0`、`false`、空文字を含む任意の設定値で抑止します。数値変換、境界値、無効値時の fallback はありません。CLI 引数や別の環境変数による上書きも、この判定箇所にはありません。
-
-判定は callback 内の `static const bool` で初回実行時に一度行われ、その値をプロセス内で再利用します。初回評価後にプロセス環境を変更しても再評価されません。DFlash2 を使わず callback が設定・実行されない場合、この値は読み取られません。
+大文字小文字、前後の空白、数値としての妥当性は判定に影響しません。既定は未設定時の skip=false です（`engine/sycl/src/program/generate.cpp:7908-7912,13373-13376`）。
 
 ## 有効になる条件
 
-- SYCL 実装の `sycl/src/program/generate.cpp` で、`use_df2` が真のサーバー経路に限ります。同箇所で `--draft dflash2` の bind / prepare と tap 確保が行われてから callback が設定されます。
-- 抑止されるのは `sp.on_taps` callback を通る batched prompt prefill です。prompt の各区間は `windows_ok` の結果で verify-window 読み込みか batched 読み込みに分けられ、後者が `sp.run(...)` を呼びます。verify-window 経路は `df2.context(...)` を直接呼ぶため、この変数の抑止対象ではありません。
-- `strata generate` の prompt path は別 callback を使い、環境変数を参照しません。
-- `STRATA_DF2_TIMING` は別の計時用設定であり、この変数の有効条件や値判定を変えません。
+- SYCL の実行経路であること。名前を読む箇所は `engine/sycl/src/program/generate.cpp` に 1 箇所あり、CUDA/HIP 等の別 backend で同名を読む実装はこの checkout の全参照検索では見つかりません（`engine/sycl/src/program/generate.cpp:7907-7908`）。
+- `strata serve` で `--draft dflash2` を選び、DFlash2 の setup が成功していること。DFlash2 には `--draft-model PACK`、`--spec 2` 以上、`--mtp DIR` または `--mtp-draft-vocab FILE` が必要で、複数 GPU、`--batch`、`--pipeline-windows` はこの build では拒否されます（`engine/sycl/src/program/generate.cpp:4499-4517,4557-4567,7892-7903`）。
+- DFlash2 tap が設定され、prompt のチャンクに tap rows があると callback が呼ばれます。tap がない経路ではこのフラグの分岐も実行されません（`engine/sycl/src/program/generate.cpp:11105-11117`; `engine/sycl/src/prefill/prefill.cpp:2831-2833,5611-5614`）。
+- `strata generate` では prompt callback が `df2.context(...)` を直接呼ぶため、この変数は効きません（`engine/sycl/src/program/generate.cpp:13373-13376`）。
 
 ## 実行時の詳細
 
-通常の batched prompt path では `Prefill::run` が tap rows の準備後に `on_taps` を呼びます。環境変数が設定されていると callback は成功 (`true`) を返すだけで、DFlash2 の `context` 更新をスキップします。その結果、prompt の tap rows は drafter に渡されず、prompt 全体の文脈を使えないため初期の DFlash2 draft の質が下がり得ます。これは測定用の経路であり、ここでは性能・生成結果への定量的な影響を示す資料は確認できません。
+サーバーはリクエストの DFlash2 tap layers を prefill に設定し、prefill は tap rows があるとき callback を呼びます。callback 内の関数ローカル `static const bool skip` が、最初に callback が実行された時点の環境を一度だけ読みます。したがってプロセス起動後でも初回 callback より前の環境変更は読み取りに反映されますが、初回 callback の後に変更しても、そのプロセス内では反映されません（`engine/sycl/src/program/generate.cpp:7907-7912,11105-11117`; `engine/sycl/src/prefill/prefill.cpp:5611-5614`）。
 
-対象外の経路では更新が続きます。verify-window prompt read は commit 後に `df2.context(...)` を直接実行します。また request 終了時には、生成した window rows を `df2.context(...)` に渡す処理があります。したがって、設定時も DFlash2 context が全面的に無効になるわけではありません。
+skip=true の callback は tap rows を `Dflash2Drafter::context` に渡さず `true` を返します。prefill 側は callback が false の場合だけ失敗を返すため、このスキップ自体は prompt 読み込みを失敗させません（`engine/sycl/src/program/generate.cpp:7910-7912`; `engine/sycl/src/prefill/prefill.cpp:5611-5614`）。通常経路では `df2.context` が各 tap row 群を処理し、`have_ctx_` と `ring_hi_` を進めます（`engine/sycl/src/core/dflash2.cpp:740-758`）。
 
-callback 内で `skip` が偽のときの `df2.context(...)` が失敗すると callback は `false` を返し、`Prefill::run` も失敗します。サーバーの prompt 読み込み側は stderr に `strata serve: <理由>`、stdout に `ERR <理由>` を出して要求処理を終了します。`skip` が真のときは callback 自体が成功を返すため、この prompt-context 更新に由来する失敗経路には入りません。環境変数の判定自体によるログや警告はありません。
+このフラグは request-end の context update を抑止しません。その更新は別経路で `df2.context(...)` を直接呼びます（`engine/sycl/src/program/generate.cpp:12912-12918`）。また、コードコメントは prompt の行を drafter に渡さない場合「最初の drafts は poor」と記しています。draft の品質が変わり得る測定用設定であり、出力の同一性は保証されていません（`engine/sycl/src/program/generate.cpp:7905-7906`）。
+
+## ログと測定値
+
+この変数自体によるログ出力はありません。`STRATA_DF2_TIMING` が設定されていれば通常 callback は `strata serve: DFlash2: prompt context update, %lld rows at %lld, %.1f ms` を stderr に出しますが、skip=true の場合はその前に return するため、この prompt-update ログは出ません（`engine/sycl/src/program/generate.cpp:7908-7914`）。request-end update の timing log は別経路なので、この変数だけでは抑止されません（`engine/sycl/src/program/generate.cpp:12914-12918`）。
+
+この変数を使った性能測定値は、調査対象ソースおよび `docs/DETAILS.md` では確認できません。
 
 ## 根拠
 
-- `sycl/src/program/generate.cpp:7674-7685` — サーバーの DFlash2 初期化条件と tap / VRAM 準備失敗時の起動拒否。
-- `sycl/src/program/generate.cpp:7687-7699` — コメント上の測定用途、設定有無判定、cache、batched prompt callback と有効ログ。
-- `sycl/src/prefill/prefill.cpp:4994-4997` — tap rows がある場合に `on_taps` を呼び、false を失敗として返す処理。
-- `sycl/src/program/generate.cpp:10644-10659,11132-11150` — prompt 区間を verify windows / batched path に振り分ける条件。
-- `sycl/src/program/generate.cpp:10786-10830` — verify-window prompt path が `df2.context(...)` を直接呼ぶ処理。
-- `sycl/src/program/generate.cpp:10836-10841,11153-11170` — batched prompt の完了と prompt 読み込み失敗の stderr / `ERR` 出力。
-- `sycl/src/program/generate.cpp:12255-12264` — request 終了時の DFlash2 context 更新。
-- `sycl/src/program/generate.cpp:12712-12715` — `strata generate` の別 callback。対象変数の判定はない。
+- `engine/sycl/src/program/generate.cpp:7905-7917` — 用途コメント、設定有無の static cache、skip 分岐、通常時の context 更新と timing log。
+- `engine/sycl/src/program/generate.cpp:4499-4517,4557-4567,7882-7903` — DFlash2 の CLI 要件、非対応構成、serve 側 setup。
+- `engine/sycl/src/program/generate.cpp:11105-11117,12912-12918,13373-13389` — リクエスト prompt taps、request-end update、通常 generate 経路との差。
+- `engine/sycl/src/prefill/prefill.cpp:2831-2833,5611-5614` — tap rows がある場合の callback 呼び出しと false 時の失敗経路。
+- `engine/sycl/src/core/dflash2.cpp:740-758` — 通常時の DFlash2 context 更新と状態の更新。

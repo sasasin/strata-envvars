@@ -1,61 +1,56 @@
-# `--data-dir`
+# `strata drafting fetch --data-dir`
 
-調査対象: Strata commit 7dd5cf18e68c639a8773e096c5c79f971ea2a9f5（2026-10-25 時点）。調査対象 checkout は main...origin/main で、未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
-| ツール ID | strata-terminal |
-| コマンド | strata drafting fetch |
-| オプション | --data-dir |
+| ツール ID | `strata-terminal` |
+| コマンド | `strata drafting fetch` |
+| オプション | `--data-dir` |
 | 別名 | なし |
-| 値 | DIR。文字列をそのままパスとして扱う |
+| 値 | `DIR`。モデルデータ用フォルダーのパス文字列 |
 
 ## 役割
 
-DFlash2 drafter の取得・pack 先となるモデルデータフォルダーを指定します。完成した pack は DIR/dflash2/qwen3.8-flash-next-dflash2.q8.pack に置かれます。ダウンロード元の一時ファイルも DIR/dflash2/src/ 以下に作られます。
+ダウンロードまたは既存ファイルの確認・packを行う場所を指定します。DFlash2 の tuned pack または標準 pack、語彙ファイルなどは、このフォルダー配下の `dflash2/` に置かれます。モデル・drafting mode など fetch 対象を決める設定は `--config` 等から別に決まり、このオプションは保存先を指定します（`terminal/strata_cli/drafting_cmd.py:101-120,241-246`、`terminal/strata_control/drafting.py:295,676-688`）。
 
 ## 使い方
 
 ```sh
-strata drafting fetch --data-dir /mnt/models
+strata drafting fetch --data-dir /mnt/models/Strata-data
 ```
 
 ## 値と既定値
 
-- 値は必須の単一文字列です。parser は型変換、存在確認、絶対パス確認などを行わず、指定値から Path を作ります。相対パスはプロセスの現在ディレクトリー基準です。~ もホームディレクトリーへ展開されません。
-- 省略時、まず --config で読み込んだ JSON の args からデータフォルダーを推定します。--pack の値があればそのパスの2階層上を、なければ --mtp の値の2階層上を使います（--mtp の値の basename が数字の場合は候補にしません）。どちらも導けない場合は Strata の既定フォルダーを解決します。
-- 既定フォルダー解決は、Terminal とデスクトップアプリの設定のうち更新日時が新しい方、既存の Documents/Strata モデルフォルダー、インストール先の順に選びます。設定の不一致を同期する際は、古い側の設定ファイルを書き換える場合があります。
-- --data-dir "" は空文字列として受理されますが、truthiness 判定により明示指定とは扱われず、省略時と同じ解決に進みます。
+- `DIR` は値を1つ取ります。parser は型変換や選択肢検査をせず文字列を受け取り、実行時に `Path(DIR)` にします。相対パスはプロセスの作業ディレクトリ基準となり、`~` の展開や絶対パス検査はこのコマンドでは行いません（`terminal/strata_cli/drafting_cmd.py:24-25,110-116`）。
+- オプションを省略するか空文字列を渡した場合は、まず設定ファイルの engine 引数にある `--pack` / `--mtp` からデータフォルダーを推定し、推定できなければ Strata が選ぶ既定フォルダーを使います（`terminal/strata_cli/drafting_cmd.py:110-116`、`terminal/strata_control/drafting.py:1662-1671`、`terminal/strata_cli/launch/catalog.py:753-760`）。既定フォルダー選択では保存済み設定、Desktop app のフォルダー、モデルを含む Documents フォルダー、インストール場所近くの既定値の順に調べます（`terminal/strata_control/discovery.py:258-306`）。
+- `--data-dir` を複数回指定したときの個別処理は実装されていません。argparse の通常の値引数として登録されています（`terminal/strata_cli/drafting_cmd.py:24-25`）。
 
 ## 実行時の動作
 
---data-dir があれば、その値が --config から推定した場所より優先されます。選ばれたフォルダーから pack の有無を調べ、必要な場合 dflash2/src を作成し、固定 revision のファイルを取得・検査して engine 用 pack を生成します。取得した pack は指定データフォルダー配下に保存されます。既に有効な pack（ファイルサイズが1 MiB超）があれば、そのファイルを再利用します。
+`DIR` が空でなければ、config から推定したフォルダーや既定フォルダーより優先して fetch 関数へ渡されます。`--config` が併用されていればその設定からモデル名・backend 等を読みますが、保存先は `DIR` になります（`terminal/strata_cli/drafting_cmd.py:101-120,240-246,281-283`）。config の `args` にある `--pack` または `--mtp` からの推定は、それらの引数のパス階層を使います（`terminal/strata_control/drafting.py:1662-1671`）。
 
---if-needed との相互作用に注意してください。この revision では ENGINE_SERVES_DFLASH2 が False であり、needs_pack() は drafter が実際に使われる場合にだけ true です。そのため --if-needed を付けると、--data-dir に pack がなくても取得をスキップします。--if-needed を付けない通常の fetch は、pack がなければ取得を試みます。
+fetch は対象モデル・backend に応じて tuned pack を試し、適用対象外または tuned pack を取得できず fallback する場合は標準 pack を使います。tuned pack はサイズ・SHA-256 を確認し、標準 pack は既存の利用可能なファイルを確認して再利用します。どちらも必要なら `DIR/dflash2/` 以下へ取得・packし、標準 pack の準備が正常完了すると一時ソースファイルを削除します。pack と語彙ファイル等の書き込み先は指定したフォルダーです（`terminal/strata_control/drafting_fetch.py:349-373,376-442`、`terminal/strata_control/drafting.py:295,669-727,823-827,1482-1503`）。
+
+`--if-needed` と併用すると、現在の選択が drafter を使い、必要なファイルがまだない場合にだけ fetch します。不要な場合は「Nothing to download.」を出して終了し、ファイルを変更しません（`terminal/strata_cli/drafting_cmd.py:243-246,267-272`）。裸の `strata drafting fetch` では、DFlash2 対応モデルが1つだけインストール済みなら、そのモデルの run config を自動選択します。複数ある場合は `--model` または `--config` の指定が必要で、`--data-dir` だけでは選択を解決しません（`terminal/strata_cli/drafting_cmd.py:80-98,234-239`）。
+
+このオプション自体は保存済みのデータフォルダー設定を書き換えません。指定先へのディレクトリ作成、ダウンロード、pack、ライセンス・通知ファイルや語彙ファイルの配置は fetch の通常の副作用です（`terminal/strata_cli/drafting_cmd.py:110-116,281-283`、`terminal/strata_control/drafting_fetch.py:323-346,397-442`）。
 
 ## 適用条件と副作用
 
-- --data-dir 自体によるパス妥当性検証はありません。ディレクトリーは取得時に必要に応じて作成されます。OS がパスを扱えない、または作成・書き込みできない場合は処理に失敗します。
-- pack が未準備の場合、明示的な fetch はネットワークアクセスを行います。取得ファイルは repository 内で固定されたサイズと SHA-256 に照合され、不一致の一時ファイルは削除されます。中断時は .part を残し、次回再開に使います。
-- 成功後、元の config.json と model.safetensors は削除され、pack のみが残ります。pack 生成に失敗した場合は一時 .tmp を削除します。
-- --config が指定されても、JSON 読み込み失敗・不正 JSON はここではエラーにならず空設定として扱われます。その場合、--data-dir がなければ既定フォルダー解決へ進みます。
-- 既定値の解決では、Terminal / app 設定同期や Catalog の初期化によるディレクトリー作成が起こり得ます。明示的な --data-dir があれば Catalog 経由の既定フォルダー解決は行いません。
+- `strata drafting plan` にも同じ parser ループで登録されますが、plan は取得内容を表示するだけで変更を行いません。この文書の対象は `fetch` です（`terminal/strata_cli/drafting_cmd.py:19-38`）。
+- fetch に専用のフォルダー validation はありません。パスが書き込み不可、または作成できない場合はファイル操作が失敗し、未処理の `OSError` は CLI 共通処理でエラー表示・終了コード `6` になります（`terminal/strata_control/drafting_fetch.py:323-326,397-405`、`terminal/strata_cli/cli.py:2258-2265`）。
+- 明示した `--data-dir` は設定に記憶されず、既存モデル・設定を移動しません。tuned pack は pinned size と SHA-256 を照合し、標準 pack は pack path 上に利用可能なファイルがあるかを確認して再利用します。取得が必要ならネットワークを使います（`terminal/strata_control/drafting_fetch.py:349-387`、`terminal/strata_control/drafting.py:669-727,823-827`）。
 
 ## 出力とエラー
 
-- 成功時は通常、人間向け出力として完成した pack のパスを表示し、終了コード 0 を返します。--output json / jsonl では結果を JSON で出力します。jsonl は取得・pack の進捗を JSON Lines で出します。
-- --if-needed によるスキップも終了コード 0 で、通常は Nothing to download.、機械向け出力では skipped: true を返します。
-- DraftingError または取得禁止を示す AcquisitionRefused は終了コード 5 です。通常出力では strata: ... を stderr に、機械向け出力では ok: false と drafting_failed を含む JSON を stdout に出します。
-- パス作成など OSError は共通 CLI handler で処理され、終了コード 6 になります。parser が値を受け取れない場合（DIR の欠落など）は argparse の usage/error 経路です。
+通常の成功時は進捗を表示し、最後に作成・利用した pack のパスを表示します。`--output json` / `jsonl` では結果を JSON、進捗を JSONL event として出力します（`terminal/strata_cli/drafting_cmd.py:274-305`）。取得・検査・pack の `DraftingError` や `AcquisitionRefused` は stderr（machine 出力時は JSON）に表示し、終了コード `5` です。ネットワーク不通、チェックサム不一致、中断などがこの経路に含まれます（`terminal/strata_control/drafting_fetch.py:30-37,328-342,405-431`、`terminal/strata_cli/drafting_cmd.py:290-301`）。
 
 ## 根拠
 
-- 索引上の配置とコマンド scope: docs/cli/README.md:339-349（調査対象文書の索引エントリー）。
-- parser、既定値への分岐、--config の扱い、--if-needed、成功・失敗出力: strata_cli/drafting_cmd.py:17-29,40-54,57-99。
-- コマンド登録と dispatch: strata_cli/cli.py:172-173,2144-2146。
-- config の args からのフォルダー推定、pack path と有効判定、現行の serve 対応条件: strata_control/drafting.py:114-122,141-146,179-211。
-- pack の作成、取得前の安全ゲート、部分ファイルの再開、hash 検査、pack 後の元ファイル削除: strata_control/drafting_fetch.py:29-39,54-102。
-- 既定フォルダー候補と設定ファイル同期: strata_cli/launch/catalog.py:223-251,494-501、strata_control/discovery.py:227-259,262-289。
-- 共通 CLI の OSError エラー処理: strata_cli/cli.py:2176-2183。
-
-調査範囲は上記の同一 checkout に含まれるソースです。CLI の help や配布済み Release artifact は別途実行・照合していません。
+- `terminal/strata_cli/drafting_cmd.py:19-38` — `plan` と `fetch` に共通する parser 登録。`DIR` の metavar と他 option とのスコープ。
+- `terminal/strata_cli/drafting_cmd.py:101-120` — 明示値、config 内の engine 引数、Strata の既定値の優先順。
+- `terminal/strata_cli/drafting_cmd.py:234-246,267-305` — 複数モデル時の拒否、必要性判定、fetch 呼び出し、出力とエラー終了コード。
+- `terminal/strata_control/drafting.py:1662-1671`、`terminal/strata_cli/launch/catalog.py:753-760`、`terminal/strata_control/discovery.py:258-306` — config 引数からのフォルダー推定と既定フォルダー選択。
+- `terminal/strata_control/drafting_fetch.py:349-442`、`terminal/strata_control/drafting.py:295,676-688,1482-1503` — tuned / 標準 pack の選択、指定先への書き込み、再利用・検査・一時ファイル削除。
+- `terminal/strata_cli/cli.py:2258-2265` — ファイル操作の `OSError` に対する CLI 共通エラー処理。

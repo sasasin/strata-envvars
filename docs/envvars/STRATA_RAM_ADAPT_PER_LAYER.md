@@ -1,47 +1,57 @@
 # `STRATA_RAM_ADAPT_PER_LAYER`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`strata serve` の resident RAM 適応機能 `STRATA_RAM_ADAPT2` が、各モデル層についてRAM上のexpertを入れ替える候補数を制限します。RAMにある未使用expertを追い出す候補は最大 `N` 個、RAMへ昇格させる候補は最大 `2N` 個まで、その層から選びます。実際の入れ替え数を直接指定する値ではありません。
+`--serve` の resident RAM expert copy を staged promotion で入れ替えるとき、各 layer で比較する incoming / outgoing 候補数を調整する。未設定時は 2。値を `P` とすると、候補計算は各 layer で incoming を最大 `2P` 件、outgoing を最大 `P` 件に絞る。これは候補数であり、実際に stage される交換数の保証ではない。`STRATA_RAM_ADAPT` の総数上限や候補の gain、queue 状態で実数は減る（`engine/src/program/generate.cpp:12333-12348,22847-22918`; `engine/src/core/expert_source.cpp:5009-5031`）。
+
+この設定は resident RAM copy の内容を選ぶ staged 枝に作用する。GPU tier の選択規則、routing、重みを直接変更しない。従来の同期 RAM 置換枝では参照されない（`engine/src/program/generate.cpp:22847-22849,22919-22926`）。
 
 ## 値と判定
 
-| 状態 | 値 |
-|---|---|
-| 未設定 | 既定値 `2` |
-| 設定あり | `std::atoi` で整数変換した結果と `1` の大きい方 |
+serve 初期化時に `std::getenv` で設定有無を確認し、設定されていれば `std::atoi` の結果を `std::max(1, ...)` に渡す。設定値は最低 1 に clamp される。未設定だけが既定値 2 のままで、空文字も含む設定済みの値は変換後に最低 1 になる（`engine/src/program/generate.cpp:12334-12348`）。
 
-文字列全体の妥当性は検査しません。`atoi` のため、先頭の空白と符号は整数変換で扱われ、数字列の後ろに文字があっても数字のprefixが変換されます。空文字や数字で始まらない文字列は `0` になり、最終値は `1` です。`0` および負数も `1` に切り上げられます。正の値に上限 clamp はありません。整数型に収まらない値の結果はコードで別途定義されていません。
+| 条件 | unset | 変換後の実効値（入力例） | `atoi` が 0 を返す入力例（実効値） |
+|---|---:|---|---|
+| `--serve` の初期化 | 2 | `1`, `2`, `4`, `+3`, ` 3tail` はそれぞれ `1`, `2`, `4`, `3`, `3` として扱う | 空文字、`0`, `0anything`, `-2`, `true`, `n/a` は変換結果 0 が 1 に clamp される |
+
+`atoi` は数値文字列全体の検証をしないため、先頭の空白・符号の後の十進数の先頭部分を読み、後続の非数値部分を無視する。数値部分がなければ 0 となる。設定値は拒否されず、`int` の範囲内なら設定済み入力はすべて実効値 1 以上になる（上限 clamp はない）。`int` の範囲を超える入力についてコードに検証処理はなく、値を規定できない（同 `generate.cpp:12347`）。
 
 ## 有効になる条件
 
-この値が候補選択に使われるのは、次の条件を満たす `strata serve` のwindow境界処理です。
+値の読み取り自体は `o.serve` の初期化ブロック内で行われるが、値が候補計算に使われるには次の条件がすべて必要（`engine/src/program/generate.cpp:12302-12307,22843-22849`）。
 
-- `STRATA_RAM_ADAPT` が `atoi` で正数になる。
-- `STRATA_RAM_ADAPT2` が設定され、その `atoi` 結果が0以外になる。
-- 初回windowではなく、適応usageが空でなく、前回の適応swapが残っていない。
-- 非同期適応jobがないか idle で、resident RAM complement が準備済み。
-- 単一GPUで、peer device / remote expert optを使わず、`--batch` が0。
+- `STRATA_RAM_ADAPT2` が設定され、`atoi` の結果が非 0 であること。
+- `STRATA_RAM_ADAPT` が設定され、decode loop 内で一度評価される `atoi` の結果が正であること。これは staged promotion の window あたりの総数上限にもなる。
+- 初回 window ではなく、adaptive usage があり、pending swap がなく、adaptive round が idle であること。
+- `src.complement_ready()` が真で resident RAM complement が利用可能であること。コード上この枝は複数 GPU、peer-device、remote optimization、`--batch` 実行を除外する。
+- layer に VRAM 外の resident outgoing expert と、VRAM 外かつ RAM 非 resident で候補スコアが 2 以上の incoming expert があること。`STRATA_RAM_ADAPT_SKIP_TOP` は incoming 候補から decode usage 上位を除外する。
 
-したがってこの変数単独では機能を有効化しません。`STRATA_RAM_ADAPT2` が無効なら `per_layer` は読み取られますが候補選択へ到達しません。また、旧来の `STRATA_RAM_ADAPT` 経路（`STRATA_RAM_ADAPT2` 無効時）はこの上限を使わず、層ごと最大1組を選びます。
+`STRATA_RAM_ADAPT_PROMPT_W`（既定 0.25）が正なら prompt routing seed が incoming score に加算され、window ごとに seed は 0.95 倍される。`STRATA_RAM_ADAPT_CACHED_W`（既定 0.15）は page-cache tier の incoming score に掛かる。これらは候補順位に関わるが、本変数の候補数上限とは別の値である（`engine/src/program/generate.cpp:12345-12348,16056-16067,22856-22900`）。
 
 ## 実行時の詳細
 
-値は`serve`のRAM適応設定を初期化するときに一度読み取られます。環境変数を後から変更しても、そのserve実行中の設定値は変わりません。読み取り自体にログ出力はありません。
+`STRATA_RAM_ADAPT_PER_LAYER` は `--serve` 初期化時に一度読み、`RamAdapt2::per_layer` に保持する。リクエストごとや window ごとに環境から再読込する処理はなく、実行中の環境変更は反映されない。専用 CLI 引数による上書きもない（`engine/src/program/generate.cpp:12332-12349`）。
 
-各適応window境界でRAM適応2が動くと、GPUに常駐していないexpertについてusageとprompt由来seedを合算し、候補を作ります。`STRATA_RAM_ADAPT_SKIP_TOP` が正なら、まずusageが上位の昇格候補を指定数だけ除外します。その後この変数の値を `N` として、昇格候補は最大 `2N`、RAMから追い出す候補は最大 `N` に絞り、usage/推定読み出しコストに基づいて組み合わせます。候補が不適格、既にI/O queueにある、または利益条件を満たさない場合は入れ替えが少なくなるか発生しません。
+staged 枝が有効な window 境界で、各 layer の候補から incoming を最大 `2P`、resident outgoing を最大 `P` に絞る。その後、既に queue にある候補を除外・減点し、差分 gain が 1 未満なら採用せず、全 layer の候補を gain 順に並べて `STRATA_RAM_ADAPT` 件まで `ram_stage` に渡す。従って `P` を増やしても交換が必ず増えるわけではない。queue が `STRATA_RAM_ADAPT_QUEUE` の上限（未設定時 64）に達した場合や同じ layer の競合 job がある場合、`ram_stage` は false を返して stage しない。成功した読み込みは source の I/O thread で行われ、後の window 境界で install 対象になる（`engine/src/program/generate.cpp:22850-22918`; `engine/src/core/expert_source.cpp:5007-5031`）。
 
-層ごとに作った入れ替え候補はgain順にまとめられ、全層を通じて最大 `STRATA_RAM_ADAPT` 個までI/O threadへstageされます。従って、この変数は層ごとの候補範囲を広げますが、全体のstage上限を増やしません。`STRATA_RAM_ADAPT_CACHED_W` はpage cache上のexpertの推定miss costに、`STRATA_RAM_ADAPT_PROMPT_W` はprompt routing seedに関係します。処理結果はserve終了時に `resident RAM (STRATA_RAM_ADAPT2)` の累積read/install/skipログへ反映されます。
+この初期化と利用箇所に OS / backend 固有の分岐は見当たらない。実際の適用は上記 serve・resident RAM・単一 GPU 等の実行条件に従う（同 `generate.cpp:12332-12349,22847-22849`）。
+
+## ログと測定値
+
+この変数の値、parse 結果、候補数を直接表示するログや、無効文字列に対する警告・エラーはない。`STRATA_RAM_ADAPT2` が有効なら request 終了時に次の累積カウンター行を stderr に出す。実際の promotion が 0 件でも、`ram_adapt2.on` が真なら表示条件を満たす（`engine/src/program/generate.cpp:23801-23805`）。
+
+```text
+strata serve: resident RAM (STRATA_RAM_ADAPT2): <n> promotions read on the I/O thread, <n> installed, <n> skipped at the install (<n> of them: the GPU tier took one of the pair)
+```
+
+`docs/DETAILS.md:277-282` は `STRATA_RAM_ADAPT` の従来の同期置換動作を説明しているが、`STRATA_RAM_ADAPT2` の staged 枝や本変数の候補数制御は説明していない。同資料に本変数の測定値はないため、性能値は記載しない。
 
 ## 根拠
 
-- `src/program/generate.cpp:8267-8283` — serve用設定、既定値2、`atoi` と下限1の処理。
-- `src/program/generate.cpp:10831-10843` — RAM適応2有効時のprompt routing seed。
-- `src/program/generate.cpp:14794-14817` — 適応window境界でのRAM適応条件、前windowのinstallとseed更新。
-- `src/program/generate.cpp:14820-14875` — 層ごとの候補生成、`2N`/`N`の制限、候補gain条件、全体のstage上限。
-- `src/program/generate.cpp:14878-14900` — `STRATA_RAM_ADAPT2` が無効な旧経路ではこの値を使わず層ごと最大1組とする分岐。
-- `src/program/generate.cpp:15361-15375` — resident RAM適応処理の累積ログ。
-
-`docs/DETAILS.md` および既存の設計資料には、この環境変数固有の値域や性能測定の記載を確認できませんでした。ここでは測定値や性能効果を主張しません。
+- `engine/src/program/generate.cpp:12302-12307,12332-12349` — serve 初期化、既定値と環境値の読み取り。
+- `engine/src/program/generate.cpp:22843-22918` — 適用条件、候補数への反映、stage 上限。
+- `engine/src/core/expert_source.cpp:5007-5031` — RAM stage queue と I/O thread の起動。
+- `engine/src/program/generate.cpp:23801-23805` — staged promotion の累積ログ。
+- `docs/DETAILS.md:274-282` — resident RAM の既存説明との照合。

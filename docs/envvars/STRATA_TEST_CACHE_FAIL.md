@@ -1,47 +1,48 @@
 # `STRATA_TEST_CACHE_FAIL`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。調査した作業ツリーは `main` で clean。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-ExpertCache の初期化ループで、指定回数だけキャッシュの open がメモリ不足で失敗したように扱います。コードコメントが示すとおり、自動サイズのキャッシュが割り当て失敗後に小さくして再試行する経路を確認するためのテスト用フックです。失敗を注入した回は実際の `xcache.open()` / `xcache.open_sized()` を呼びません。
+expert cache の初期化ループで、指定回数だけキャッシュの open が失敗した状態を擬似的に作ります。コメントには out-of-commit の `cudaMalloc` 失敗時の retry を試す用途とあります。該当コードは CUDA/HIP 側の `engine/src/program/generate.cpp` と SYCL 側の `engine/sycl/src/program/generate.cpp` にあります。値が正なら、指定回数の試行では実際の `xcache.open` / `xcache.open_sized` を呼ばず、失敗文字列をセットします（`engine/src/program/generate.cpp:9640-9657`、`engine/sycl/src/program/generate.cpp:5117-5135`）。
 
-通常の利用者設定ではなく、`src/program/generate.cpp` と `sycl/src/program/generate.cpp` にある生成プログラムのキャッシュ初期化経路に実装されています。どちらにも同じ変数読み取りと失敗処理があります。
+この名前はテスト用コメントを伴いますが、読み取りと分岐は通常の `generate.cpp` にあり、テスト用 build macro の条件で囲まれていません。従ってビルドされた該当経路で実行時に有効です。リポジトリ内の全参照検索では Metal 側の読み取りは見つからず、Metal での効果は確認できません。
 
 ## 値と判定
 
-環境変数を `std::getenv()` で読み、設定されていれば `std::atoi()` で `int` に変換し、未設定なら `0` にします。変換した値が正の間、キャッシュ open の試行ごとに1ずつ減らし、その試行を失敗扱いにします。
+両実装とも `getenv` で設定有無を確認し、設定されていれば値を `std::atoi` に渡します。変換後の `fake_fails` が正の場合にだけ擬似失敗します。文字列全体の検証、範囲制限、clamp はありません（`engine/src/program/generate.cpp:9645-9652`、`engine/sycl/src/program/generate.cpp:5122-5129`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | `0`。失敗を注入しない |
-| 空文字 | `atoi("")` は `0`。失敗を注入しない |
-| `0`、負数 | 正数ではないため失敗を注入しない |
-| 正数（例: `3`、`+3`） | 最初の3回の cache open 試行を失敗扱いにする |
-| 数字で始まり後ろに文字がある値（例: `2xyz`） | `atoi` は数値部分を変換するため、2回失敗を注入する |
-| 数字に変換できない値（例: `true`） | `0` となり失敗を注入しない |
+| 条件 | unset | 擬似失敗を起こす値 | 擬似失敗にならない値 |
+|---|---|---|---|
+| CUDA/HIP・SYCL の expert cache 初期化 | `0` | `atoi` の結果が正の整数。例: `1`, `3`, `+2`, ` 2`, `2tail` | 結果が 0 以下。例: 空文字, `0`, `0tail`, `true`, `-1` |
 
-`atoi` のため、先頭の空白と符号は数値変換時に扱われ、文字列全体の妥当性検査はありません。`int` の範囲を超える値の結果は C/C++ の `atoi` の仕様上保証されません。
+`atoi` は先頭の空白と符号を許し、先頭から読める十進数部分を変換します。したがって `2tail` は 2 回、`0tail` は 0 回として扱われ、`true` や空文字は 0 になります。正の値に上限は設けられていません。`int` で表せない数値の扱いをこのコードは検査しません。`getenv` が未設定の場合も 0 です（上記同じ行）。
 
 ## 有効になる条件
 
-- `generate` の ExpertCache 初期化処理まで到達し、調整後の `o.expert_cache > 0` であること。この条件を満たさない場合、環境変数の読み取りも行いません。
-- ExpertCache の初期化ループでだけ効きます。後続の別 GPU 用キャッシュの open やリクエストごとの cache hit/miss を直接操作するものではありません。
-- `auto_cache` はキャッシュ初期化時点の `o.expert_cache < 0` から決まります。自動サイズでは失敗時に縮小して再試行する分岐があります。固定サイズの失敗ではその分岐を通らず、初回失敗でエラー終了します。
+- `generate.cpp` の該当 backend 実装がビルドされていること。読み取り箇所は CUDA/HIP 側と SYCL 側にあります。Metal 側にはこの名前の参照がありません（全参照検索結果。該当実装は `engine/src/program/generate.cpp:9645-9657`、`engine/sycl/src/program/generate.cpp:5122-5135`）。
+- expert cache 初期化時点で `o.expert_cache > 0` であること。この条件の内側でのみ読み取ります。cache が 0 以下なら環境変数は読み取られず、このフックは動きません（`engine/src/program/generate.cpp:9602-9603`、`engine/sycl/src/program/generate.cpp:5068`）。
+- `--expert-cache` が cache のサイズと自動縮小の可否に関係します。CUDA/HIP 側では `--expert-cache auto` を内部値 `-1` にし、自動 cache の初期化後に正の slot 数になった場合にこの処理へ進みます。自動 cache なら失敗後に小さくして再試行します。明示サイズでは自動縮小しません（`engine/src/program/generate.cpp:3984-3987, 9050`、`engine/sycl/src/program/generate.cpp:2002-2005`、`engine/src/program/generate.cpp:9671-9683`）。
+- OS、サーバーモード、モデル状態、別の環境変数による値の上書きは、この読み取りと擬似失敗分岐にはありません。Windows では最終的な失敗時に追加案内を出す条件分岐がありますが、擬似失敗の発生条件は変わりません（`engine/src/program/generate.cpp:9677-9683`、`engine/sycl/src/program/generate.cpp:5159-5165`）。
 
 ## 実行時の詳細
 
-環境値はキャッシュ初期化ループへ入る際にローカル変数 `fake_fails` に一度変換されます。正の間、各ループ試行は `fake_fails` を減らし、`ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)` をエラー文字列に設定します。その後は実際の割り当て失敗と共通のエラー処理へ進みます。
+cache 初期化ループに入ると、環境値をローカル変数 `fake_fails` に一度読み込みます。ループの各回で `fake_fails > 0` ならカウンターを 1 減らし、`ok` を false のままにしてエラー文字列 `ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)` を設定します。この回は実際の cache open 関数を呼びません。カウンターが 0 になった回から `xcache.open` または `xcache.open_sized` を呼びます（`engine/src/program/generate.cpp:9645-9659`、`engine/sycl/src/program/generate.cpp:5122-5136`）。
 
-自動サイズでは、失敗回数 `failed` が8未満で、キャッシュを現在のバイト数の4分の3へ縮小できる場合に再試行します。各縮小時に stderr へ `trying a smaller expert cache: ... slots` を含む行を出します。縮小できない場合、または8回の縮小後も失敗する場合は stderr にエラーを出し、`generate` は `1` を返します。初期化が成功し、1回以上縮小を経てキャッシュが残っていれば、そのサイズと縮小回数のログも出します。
+読み取りは cache 初期化時の一度だけで、static cache やリクエストごとの再読込ではありません。実行中に環境値を変えても `fake_fails` の残数には反映されません。
 
-このフックは実際の GPU メモリ不足を起こしたり測定したりしません。失敗扱いにした試行では実割り当てを飛ばし、エラー処理と自動縮小分岐を実行させます。Windows では最終失敗時にページファイルに関する追加メッセージも出すコードですが、擬似失敗固有の追加動作ではありません。SYCL 側もエラー文字列は `cudaMalloc failed` としています。
+擬似失敗後、`--expert-cache auto` の場合は縮小でき、かつ失敗 retry が 8 回未満なら cache サイズを縮めて再試行します。縮小は現在のサイズのおよそ 3/4 です。縮小できない場合、または 8 回の縮小 retry 後も失敗した場合はエラーを stderr に出して `1` を返します。明示 cache サイズでは最初の失敗で同じく `1` を返します。カウンターが尽きて実際の open が成功すれば初期化は続行します（`engine/src/program/generate.cpp:9671-9685`、`engine/sycl/src/program/generate.cpp:5153-5167`）。
+
+## ログと測定値
+
+自動 cache で縮小 retry を行う場合、stderr に `strata generate: ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL); trying a smaller expert cache: %d slots`（Windows では commit 情報が間に入る場合あり）を出します。retry できない場合は `strata generate: ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)` を出し、Windows では続けて page file と `--expert-cache` に関する案内を出して `1` を返します（`engine/src/program/generate.cpp:9671-9683`、`engine/sycl/src/program/generate.cpp:5153-5165`）。
+
+この環境変数に関する測定値は、参照した `docs/DETAILS.md` にありません。
 
 ## 根拠
 
-- `src/program/generate.cpp:4844-4847` は ExpertCache と `auto_cache` 判定を設定します。
-- `src/program/generate.cpp:5114-5120` は自動キャッシュの初期化ループと環境変数の読み取りを示します。
-- `src/program/generate.cpp:5123-5157` は失敗注入、実際の open 呼び出し、自動縮小再試行、エラー終了を示します。
-- `src/program/generate.cpp:5177-5180` は縮小後のログを示します。
-- `sycl/src/program/generate.cpp:4303-4306,4535-4541,4544-4578,4598-4601` に対応する SYCL 実装があります。
-- `docs/DETAILS.md:601-609` は `--expert-cache auto` の一般的な割り当て失敗後の縮小確認を説明しますが、`STRATA_TEST_CACHE_FAIL` 自体の説明はありません。
+- `engine/src/program/generate.cpp:9044-9051` — CUDA/HIP 側 cache 初期化と auto 判定。
+- `engine/src/program/generate.cpp:9640-9685` — 値の読み取り、擬似失敗、縮小 retry、失敗時のログと戻り値。
+- `engine/sycl/src/program/generate.cpp:4823-4830` — SYCL 側 cache 初期化と auto 判定。
+- `engine/sycl/src/program/generate.cpp:5117-5167` — SYCL 側の読み取り、擬似失敗、縮小 retry、失敗時のログと戻り値。
+- `engine/src/program/generate.cpp:3984-3987`、`engine/sycl/src/program/generate.cpp:2002-2005` — `--expert-cache auto` の内部値。

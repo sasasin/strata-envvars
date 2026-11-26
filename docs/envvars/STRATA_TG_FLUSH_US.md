@@ -1,41 +1,43 @@
 # `STRATA_TG_FLUSH_US`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（`2026-10-13` 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-トークングラフ実行中、GPU が次のレイヤーの doorbell を鳴らすのを CPU が待つ際に、実行キューを再確認する間隔をマイクロ秒で指定する。遅いレイヤーの待機中にキューの完了・エラーを検出するためのポーリング間隔であり、トークングラフ自体を有効化する設定ではない。
+CUDA/HIP 共通 GPU engine と SYCL engine の token graph 実行中に、GPU が各 layer の doorbell を鳴らすのを CPU が待つ間、submission queue を再 query する間隔をマイクロ秒単位で指定する。指定値はグラフの計算や layer 順序を変えず、待機中の追加 flush と graph 完了・失敗の検出タイミングに関係する。CUDA/HIP 側では `session_run_token`、SYCL 側では同名関数が読み取る（`engine/src/core/session.cpp:923-936, 941-964`、`engine/sycl/src/core/session.cpp:1337-1370, 1375-1412`）。
 
 ## 値と判定
 
-| 環境変数の状態・値 | `flush_us` の値と処理 |
-| --- | --- |
-| 未設定 | `2000`（2,000 マイクロ秒） |
-| 設定あり | `std::atoi` の戻り値を使用 |
-| 空文字、または整数として先頭を変換できない文字列 | `0` |
-| 整数の後ろに文字が続く文字列 | `atoi` が変換した先頭の整数を使用（例: `25ms` は `25`） |
-| 負数 | 負の値をそのまま使用 |
+両実装とも `std::getenv` で値を取得し、未設定なら `2000`、設定されていれば `std::atoi` の戻り値を使う。関数内 `static const int` のため、各プロセスで最初に `session_run_token` がこの箇所へ到達した時点の値を一度だけ読み、その後は環境を変えても反映されない。空文字は設定済みなので `atoi("") == 0` となり、既定値には戻らない（`engine/src/core/session.cpp:934-937`、`engine/sycl/src/core/session.cpp:1367-1370`）。
 
-文字列全体の検証、範囲チェック、clamp、無効値時の既定値への戻しはない。値は待機ループ内で `std::chrono::microseconds(flush_us)` と比較され、経過時間がその値を**超えた**ときに追加のキュー確認を行う。実際の確認はループの各反復ではなく、spin カウンターが 1024 回ごとの箇所に限られる。したがって `0` や負数はその確認箇所に来るたび条件を満たすが、指定値がそのまま一定周期のタイマーになるわけではない。
+`atoi` は整数として読める先頭部分を変換する。先頭の空白と符号は受け付け、数値の後ろの文字列は検査しない。数値に変換できない文字列は `0` になる。値の範囲検証や clamp はなく、`atoi` で `int` に表現できない数値は C/C++ の仕様上定義されない結果となり得る。
+
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP 共通 engine または SYCL engine の token graph 実行 | `2000` µs | `1`, `2000`, `+25`, ` 25`, `25us`（それぞれ `atoi` の結果は 1, 2000, 25, 25, 25） | `0`, `-1`, 空文字, `true`, `abc`, `0anything`（いずれも待機ループの flush 間隔としては即時相当の 0 以下） |
+
+この値は flush 周期として使われるが、コードは正値チェックをしない。0 または負値では、1024 回ごとの spin 後に調べる時刻差が常にその値を上回るため、待機中はそのたびに queue query を行う。`atoi` は小数・基数接頭辞・文字列全体の妥当性を検証しない（`engine/src/core/session.cpp:947-965`、`engine/sycl/src/core/session.cpp:1381-1412`）。
 
 ## 有効になる条件
 
-SYCL の `strata generate` は、`--no-capture` がなく、`--no-token-graph` がなく、レイヤー単位または半精度の dump がなく、必要な hit 設定がそろい、native pack と multi-GPU split の経路でない場合にトークングラフを capture する。トークングラフが capture された場合、生成ループは `session_run_token` を呼ぶ。この関数でのみ当変数による待機間隔が適用される。条件を満たさず通常の `session_loop` などに進む場合、この設定は参照されない。
-
-CUDA 側の `src/core/session.cpp` にも同じ読み取り・待機処理がある。ただし、この HEAD でリポジトリ内から `session_run_token` を呼んでいる箇所は `sycl/src/program/generate.cpp` の2箇所で、`src/program/generate.cpp` には呼び出しがない。CUDA 側の実装も存在するが、ここで確認した generate の呼び出し経路では利用されていない。
+- 対象プロセスが token graph 経路で `session_run_token` を呼ぶ必要がある。`--no-capture` では通常の `session_token` 経路となり、この変数は読まれない。`--no-token-graph`、layer/half dump などにより token graph が capture されない場合も、`session_run_token` には到達しない（`engine/src/program/generate.cpp:10969-10978, 11069-11076, 24296-24314`）。SYCL の `generate.cpp` にも同じ呼び分けがある（`engine/sycl/src/program/generate.cpp:13504-13522`）。
+- CUDA/HIP の共通 engine では `engine/src/core/session.cpp` が GPU engine に組み込まれ、SYCL engine では `engine/sycl/CMakeLists.txt` が対応する `src/core/session.cpp` を組み込む（`engine/CMakeLists.txt:22`、`engine/cmake/strata_gpu_engine.cmake:305-316`、`engine/sycl/CMakeLists.txt:290-300`）。この環境変数の判定自体に OS、GPU 世代、モデル形式、CLI の数値引数による追加分岐はない。
+- graph が未 capture の場合、multi-GPU または native-pack などで別の layer loop に進む場合、あるいは通常の非 graph 経路では、この設定による追加 query はない。CLI の `--no-token-graph` は token graph を無効にする（`engine/src/program/generate.cpp:954, 1375, 4262, 11069-11076`）。
 
 ## 実行時の詳細
 
-CUDA/SYCL それぞれの `session_run_token` 内で、関数ローカルの `static const int` として初回初期化時に一度だけ読み取る。同じ関数の後続呼び出しではキャッシュ値が使われるため、初回読み取り後に環境変数を変更しても反映されない。未設定かどうかは null 判定であり、空文字は「未設定」ではなく `atoi("") == 0` として扱う。
+token graph を各 token で launch した後、両実装は一度 queue を query/flush し、各 layer の sequence counter が進むのを spin 待ちする。spin を 1024 回行うごとに時刻を確認し、前回 flush から `flush_us` を超えていれば追加 query を行う。CUDA/HIP は `cudaStreamQuery` が `cudaErrorNotReady` 以外を返し、まだ doorbell が鳴っていない場合に `session_run_token: layer N never rang (...)` を返す。SYCL は `ext_oneapi_empty()` で graph 完了を確認し、まだ doorbell が鳴っていなければ同じ形式のエラーを返す。SYCL runtime exception は catch 節が `exc.what()` と file/line を stderr に出して終了コード 1 で終了する。別に各 layer 待機には 20 秒の timeout があり、経過すると `session_run_token: timed out waiting for layer N` を返す（`engine/src/core/session.cpp:931-965`、`engine/sycl/src/core/session.cpp:1344-1412, 1462-1465`）。
 
-各レイヤーで CPU は GPU の doorbell 値を spin 待ちする。指定間隔を超えた確認時には flush カウンターを増やし、CUDA では `cudaStreamQuery`、SYCL では `ext_oneapi_empty()` を使ってキュー状態を調べる。GPU が対象レイヤーの doorbell を鳴らす前にグラフが終了した場合、関数は `session_run_token: layer <番号> never rang (graph finished)` をエラーにする。キュー確認でこの状態を検出できない場合でも、レイヤー待ちは別途20秒で timeout し、`session_run_token: timed out waiting for layer <番号>` を返す。この20秒 timeout は `STRATA_TG_FLUSH_US` の値では変わらない。generate の呼び出し元は失敗時にエラーを `stderr` へ出して終了コード1を返す。
+関数内 static cache なので、CLI 引数や他の環境変数による優先順位・上書きはない。値が変えるのは待機中の再 query 頻度であり、GPU graph の演算や pool に渡すデータ自体をこの変数が変更するコードはない。標準の生成経路はエラー文字列を `strata generate: ...` として stderr に出し、終了コード 1 で終わる（`engine/src/program/generate.cpp:24302-24314`、SYCL は `engine/sycl/src/program/generate.cpp:13510-13522`）。
+
+## ログと測定値
+
+この変数を読み取ったことや値を適用したことを示す専用ログはない。`--stats` の token graph 集計は待機時間、pool 時間、flush 数、呼び出し位置数を表示するが、設定値そのものは表示しない（`engine/src/program/generate.cpp:25522-25526`）。Strata の `docs/DETAILS.md`、`docs/SETTINGS.md` にこの変数の説明や条件付き測定値は見つからなかった。コードコメントは既定周期 2000 µs とし、0 µs と 5 µs が同程度に速く「fault の検出のみ」と記すが、これは測定条件の記載がないコメントであり、一般的な性能値としては扱えない（`engine/src/core/session.cpp:936`、`engine/sycl/src/core/session.cpp:1369`）。
 
 ## 根拠
 
-- `src/core/session.cpp:912-952` — CUDA 実装。設定の読み取り、既定値、spin 待ち、キュー再確認、エラーと20秒 timeout。
-- `sycl/src/core/session.cpp:1335-1407` — SYCL 実装。設定の読み取りから待機中の状態確認まで。SYCL では追加 flush に `ext_oneapi_empty()` を使う。
-- `include/strata/core/session.hpp:399-409` — `TokenGraph` の状態と `flushes` カウンターの説明。
-- `sycl/src/program/generate.cpp:5827-5835` — SYCL 側でトークングラフを capture する条件。
-- `sycl/src/program/generate.cpp:11822-11833`, `12606-12614` — SYCL generate の両ループで、capture 済みなら `session_run_token`、そうでなければ `session_loop` を選ぶ。
-- `src/program/generate.cpp:6169-6176` — CUDA generate 側の capture 条件。トークングラフの実行呼び出しは同ファイル内にない。
-- `docs/DETAILS.md` — `STRATA_TG_FLUSH_US` およびトークングラフのこの待機間隔についての説明は見つからなかった。
+- `engine/src/core/session.cpp:923-983` — CUDA/HIP 共通 token graph 実行、値の読み取り、周期 query、失敗・timeout。
+- `engine/sycl/src/core/session.cpp:1337-1465` — SYCL の対応実装。
+- `engine/src/program/generate.cpp:10969-11076, 24296-24314, 25522-25526` — graph capture 条件、実行経路、エラー出力、stats。
+- `engine/sycl/src/program/generate.cpp:13504-13522` — SYCL 側の実行経路。
+- `engine/CMakeLists.txt:22`、`engine/cmake/strata_gpu_engine.cmake:305-316`、`engine/sycl/CMakeLists.txt:290-300` — 対応 session 実装の build 対象。

@@ -1,52 +1,61 @@
 # `ProgramFiles`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Windows 上で標準の Program Files ディレクトリを参照し、cloudflared と NVML DLL の探索候補、システム領域の判定、エージェントの成果物追跡除外範囲を組み立てます。Windows 用 vision build スクリプトでは Visual Studio 2022 の探索候補にも使います。Strata は値を数値や真偽値に変換せず、パスの一部として扱います。
+Windows の標準インストール場所を探すために読む環境変数です。アプリの cloudflared 探索と Terminal CLI の cloudflared 探索では候補ディレクトリを組み立て、フォルダー判定では Windows のシステム領域に含まれるかを判定し、Terminal の Monitor は NVML DLL の候補パスを組み立てます。Strata が `ProgramFiles` を設定・変更する処理は確認できません。
+
+アプリの agent file tracker は `ProgramFiles` を除外フォルダー一覧にも加えます。チャットの workspace 内にそのフォルダーがある場合、tracker はそこを走査せず、生成物として報告しません（`app/host/server/agent/agent-bridge.mjs:181-190,529-535`、`app/host/server/agent/deliverables.mjs:90-123`）。
+
+加えて、Windows 用の開発・配布スクリプトが Visual Studio の場所を探すために参照します。これらは利用者向け実行時設定ではなく、ビルドや開発チェックの経路です（`tools/packaging/build_cuda_windows.py:43-45`、`tools/packaging/build_vision_windows.bat:40-44`、`tools/check:161-189`）。
 
 ## 値と判定
 
-参照箇所ごとに未設定・空文字の扱いが異なります。空白の trim、パスの存在確認による環境変数値の補正、値の正当性検証はありません。
+| 読み取り箇所・条件 | 未設定 | 設定時の扱い |
+|---|---|---|
+| アプリの cloudflared 探索、Windows (`app/host/server/cloudflared-find.mjs:43-48,58-64`) | `ProgramFiles` は `C:\\Program Files` を使う | 空文字を含め値をそのまま root として候補パスに連結。文字列の検証・正規化・大小文字判定はせず、Windows パスとして候補を作る |
+| Terminal CLI の cloudflared 探索、Windows (`terminal/strata_cli/launch/access.py:122-146`) | `C:\\Program Files` を使う | 空文字を含め値をそのまま `Path(root) / "cloudflared" / name` に使う。検証・正規化なし |
+| 保存先のシステム領域判定、Windows (`terminal/strata_control/folders.py:31-41`) | 値なしとして root 一覧に加えない | 空文字は偽として無視し、非空値を root に加える。パス比較時は `normcase(normpath(...))` を使う |
+| MCP のデータ保存先チェック、Windows (`terminal/tools/strata_mcp.py:566-572`) | 値なしとして root 一覧に加えない | 空文字は後段で除外し、非空値を正規化して system folder 一覧に加える |
+| Monitor の NVML DLL 探索、Windows (`terminal/serve/telemetry.py:41-52`) | `C:\\Program Files` を使う | 空文字を含め値を `NVIDIA Corporation\\NVSMI\\nvml.dll` の親 root に使う。値の検証なし |
+| Windows 開発・配布スクリプト | Python の `os.environ.get` では各箇所に記載の既定パスを使う。batch は `%ProgramFiles%` を展開する | Python は未設定時だけ既定値。batch は環境変数の通常の展開結果を使う。値の追加検証なし |
 
-| 経路 | 未設定 | 空文字 | 設定値の使い方 |
-|---|---|---|---|
-| Python cloudflared 探索 | `C:\Program Files` を使う | 空の root として `cloudflared\cloudflared.exe` を候補化 | `ProgramFiles\cloudflared\cloudflared.exe` を候補に追加 |
-| Windows telemetry | `C:\Program Files` を使う | `NVIDIA Corporation\NVSMI\nvml.dll` を候補化 | 値に `NVIDIA Corporation\NVSMI\nvml.dll` を連結 |
-| Control のモデル保存先検査 | この変数由来の root を追加しない | 同左 | root の一覧にそのまま追加 |
-| MCP の保存先検査 | root の一覧に追加しない | falsy 値として除外 | 絶対パス等への正規化後、root の一覧に追加 |
-| Host agent の成果物追跡 | `undefined` として除外 | falsy 値として除外 | tracker の除外候補に追加 |
-| Windows vision build batch | `%ProgramFiles%` 展開値で候補を作る。既定値の補完なし | prefix が空の候補になる | Visual Studio 2022 BuildTools / Community の候補パスに展開 |
-
-Windows 以外では Python cloudflared 探索はこの変数を参照せず、telemetry は `os.name == "nt"` のときだけ Windows 用候補を作ります。Control と MCP の各システム root 関数も Windows 判定のときだけ環境変数を列挙します。Host agent は渡された `env` オブジェクトから値を取り、既定の `env` は `process.env` です。
+これらは bool や数値として parse されません。`1`、`0`、`true`、`false`、`0anything` は文字列のままパス部品として扱われます。大文字小文字を変換する判定もありません。空文字は各箇所で異なり、Node.js の `??` と Python の `dict.get(key, default)` は空文字を fallback にしませんが、フォルダー一覧では空文字を除外します（`cloudflared-find.mjs:61-64`、`access.py:135-140`、`folders.py:35-41`、`strata_mcp.py:566-572`）。
 
 ## 有効になる条件
 
-- **Python cloudflared 探索**: Windows で、`STRATA_CLOUDFLARED` に空でない明示パスがない場合に候補へ加わります。`PATH` の候補が先に調べられ、Program Files の候補は `ProgramFiles(x86)` の候補とともにその後に調べられます。ファイルが見つからない、または実行・バージョン条件を満たさない場合は次の場所へ進みます。探索全体で見つからなければ、呼び出し元は `cloudflared is not installed` の案内を返します。Linux/macOS ではこの Windows 分岐を通りません。`strata_cli/launch/access.py:70-94,124-137,242-255,270-274`。
-- **Host app の cloudflared 探索**: `apps/host/server/cloudflared-find.mjs` も Windows で `env.ProgramFiles ?? 'C:\\Program Files'` を使います。`null` / `undefined` は既定値になりますが、空文字は既定値に置き換わりません。Strata 自身・component の候補と PATH の後で通常の場所として候補化し、`STRATA_CLOUDFLARED` が truthy なら単一候補で早期 return、`STRATA_CLOUDFLARED_SEARCH === 'own'` なら自前フォルダー候補の後で探索を終了します。候補は順に実行可能ファイル・バージョンを調べ、見つからなければ `found: null` を返します。`apps/host/server/cloudflared-find.mjs:42-70,95-110`; installer からの呼び出しは `apps/host/server/cloudflared-install.mjs:34-43`。
-- **NVML telemetry**: Windows で、かつ AMD backend ではない GPU reader を作る経路に限ります。最初に名前だけの `nvml.dll` をロードし、失敗時に Program Files 配下の候補を試します。そのため、先の候補がロードできれば `ProgramFiles` の値は使用結果に影響しません。Program Files 配下を含む候補でも reader が初期化できない場合、GPU reader は無効になります。Telemetry は無効 reader を通常の GPU 読み取り対象から外し、GPU 情報なしで CPU/RAM 等の記録を続けます。`serve/telemetry.py:36-64,348-355,535-589`; 起動経路は `serve/server.py:5247-5255,8854-8857`。
-- **モデル保存先のシステム領域検査**: `strata_control.folders.problem()` が Windows 上で指定されたフォルダーを検査するときに参照します。指定先が Program Files root 配下で、利用者のホーム配下ではない場合はシステムフォルダーとして拒否します。環境変数が未設定または空でも `SystemDrive` 由来の Windows 固定候補（`<drive>\Program Files` 等）は別途検査されます。CLI は理由を表示し、値を保存しません。`strata_control/folders.py:27-37,63-80`; CLI 呼び出しは `strata_cli/launch/cmd.py:233-238` と `strata_cli/launch/screens.py:882-889`。
-- **MCP の保存先検査**: `strata_install` の `data_dir` が既存の許可先でない場合に、Windows のシステム領域一覧に加わります。配下のパスは `ToolError("data_dir ... is inside a system folder")` で拒否されます。ProgramFiles が未設定または空ならこの root は加わりません。`tools/strata_mcp.py:483-489,2269-2293`。
-- **Host agent の成果物追跡**: 各 agent turn の tracker を作る際に `ProgramFiles` を除外候補として渡します。tracker はこの root 配下を成果物探索から除外します。値が未設定または空なら候補に入りません。`apps/host/server/agent/agent-bridge.mjs:121-140,364-378`; 適用は `apps/host/server/agent/deliverables.mjs:52-85`。
-- **vision build batch**: `where cl` で compiler が見つからない場合に限って、Windows の batch 展開で Program Files 配下の Visual Studio 2022 を探します。見つけた場合 `vcvars64.bat` を呼び、最後まで `cl.exe` が見つからなければ batch はエラー終了します。`packaging/build_vision_windows.bat:43-49`。
+- アプリの connector 探索では `platform === 'win32'` の場合だけ `ProgramFiles` が参照されます。探索の優先順位は Strata の connector フォルダー、任意 component フォルダー、`PATH`、その後のシステム候補です。`STRATA_CLOUDFLARED` が truthy ならその単一パスで早期 return し、`STRATA_CLOUDFLARED_SEARCH === 'own'` なら Strata 自身の候補までで探索を止めるため、いずれも `ProgramFiles` の候補に進みません（`app/host/server/cloudflared-find.mjs:43-64`）。見つかった候補は実行可能性と `--version` 出力を検査し、見つからない・起動できない・古い場合は探索結果の `found` が null になり、スキップ理由を返します（同 `:95-110`）。
+- Terminal CLI の cloudflared 探索も Windows のみです。`STRATA_CLOUDFLARED` が空でない場合はそれだけを返し、それ以外は `PATH` を先に探索します。Program Files の候補が有効でないと次候補へ進み、条件を満たす cloudflared がなければ `None` になります（`terminal/strata_cli/launch/access.py:122-146,176-189`）。アクセス方法一覧では cloudflared がない旨を表示し、トンネル開始時には導入案内を返します（同 `:294-320,327-330,438-445`）。
+- `strata_control.folders.problem()` が Windows で使われる場合、`ProgramFiles` 配下はシステム領域候補です。指定データフォルダーがその領域内にあり、ユーザー home 配下でなければ問題として返します。CLI の `--data-dir` はこの問題を `ValueError` にし、画面のフォルダー選択も理由を表示します（`terminal/strata_control/folders.py:31-60,77-94`、`terminal/strata_cli/launch/cmd.py:240-245`、`terminal/strata_cli/launch/screens.py:948-950`）。`SystemRoot`、`windir`、`ProgramFiles(x86)`、`ProgramW6432`、`SystemDrive` と固定の Windows パスも同時に調べるため、`ProgramFiles` の値だけで判定が決まるとは限りません（`folders.py:31-41`）。
+- MCP の `strata_install` に `data_dir` が渡され、Windows で候補がシステム folder 配下か判定するとき、`ProgramFiles` が root 集合に入ります。既存の現在データディレクトリーなど特別扱いされるパスはこの判定より前に通過します。該当すれば `ToolError("data_dir ... is inside a system folder")` になります（`terminal/tools/strata_mcp.py:566-572,2478-2502`）。
+- Monitor の NVML 探索は Windows 上で NVIDIA reader を作るときに有効です。AMD reader または macOS reader ではこの `ProgramFiles` のコード経路を通りません。Linux では別名の共有ライブラリ候補を使います（`terminal/serve/telemetry.py:41-52,1417-1430,1433-1445`）。
+- ビルド・開発経路では、CUDA Windows package builder が指定値を Visual Studio 2022 の BuildTools / Community 候補に使い、`build_vision_windows.bat` は `cl` が PATH にないときに同じ場所を探索します。`tools/check` は `cl` が `base_env` の PATH にない場合に Visual Studio 2022 の `vcvars64.bat` を探します。`ProgramFiles` が不正・空で候補が見つからない場合、後続のビルド確認で失敗するか、`tools/check` は `no C++ compiler: cl is not on PATH and Visual Studio 2022's vcvars64.bat was not found` を返します（`tools/packaging/build_cuda_windows.py:43-45`、`tools/packaging/build_vision_windows.bat:40-46`、`tools/check:161-189`）。
 
 ## 実行時の詳細
 
-Python cloudflared 探索は `os.environ.get("ProgramFiles", default)` で値を取得するため、未設定時だけ既定値になり、空文字は保持されます。各探索呼び出しで候補一覧を組み直します。cloudflared のバージョン結果は `path` と更新時刻でプロセス内キャッシュされますが、候補 root 自体の値をキャッシュする処理はありません。別経路の `STRATA_CLOUDFLARED` が非空ならその単一候補を返し、ProgramFiles の候補を作りません。`strata_cli/launch/access.py:70-94,97-115`。
+- アプリの `createConnectorInstaller` は既定で `process.env` を受け取り、`look()` ごとに `findConnector()` を呼びます。ProgramFiles の値自体を別変数へ cache していません。Windows 候補は `cloudflared\\cloudflared.exe` を追加し、`ProgramFiles(x86)` の候補も別に追加します。Strata の directory / component / PATH に有効な connector があればそちらが優先です（`app/host/server/cloudflared-install.mjs:34-45`、`cloudflared-find.mjs:43-70,95-110`）。
+- Terminal CLI は `cloudflared_info()` の呼び出し時に環境を読み、`options()`、`missing_helper()`、`start_tunnel()` が探索結果を使います。ProgramFiles の値を cache しません。一方、`cloudflared_version()` は実行結果を `(path, mtime)` キーで `_cf_seen` に cache します。これは候補の探索結果や環境変数値の cache ではありません（`terminal/strata_cli/launch/access.py:119-124,149-167,176-189,294-300,327-330,438-445`）。
+- `folders._system_roots()` と `strata_mcp.system_folders()` は呼び出しごとに `os.environ` を参照します。`folders.problem()` は Windows に限らず呼ばれますが、Windows 環境変数 root の分岐は `os.name == "nt"` の場合だけです。これらの関数には値の static cache はありません（`terminal/strata_control/folders.py:31-60,77-94`、`terminal/tools/strata_mcp.py:566-572,2478-2502`）。
+- Monitor は `Telemetry.__init__()` で各 GPU の `monitor_reader()` を一度作成し、reader を保持してサンプルに使います。NVML 初期化時には最初に `nvml.dll`、次に ProgramFiles 配下の DLL を `ctypes.CDLL` で試します。どちらもロードできない場合 `_Nvml.ok()` は false となり、Linux の場合だけ Intel reader への fallback があります。ここでは ProgramFiles は DLL 候補パスの構成にのみ使われ、NVML 自身の環境変数解釈は説明対象に含めません（`terminal/serve/telemetry.py:41-69,1417-1430,1704-1726`）。
+- 開発スクリプトでは `tools/check.msvc_env()` の成功・失敗結果を `_vc_env` に cache します。`terminal/setup.py` の `find_vcvars()` は `ProgramFiles(x86)` だけを参照し、`STRATA_VCVARS` が truthy ならそれを優先するため、これは `ProgramFiles` の読み取り箇所ではありません（`tools/check:158-189`、`terminal/setup.py:2674-2699`）。
 
-Host app の探索は `env` 引数で環境オブジェクトを受け、既定値は `process.env` です。`createConnectorInstaller` はその `env` を `findConnector` へ渡します。ProgramFiles の値は探索のたびに候補生成時に読み、候補パスは同モジュール内でキャッシュしません。`STRATA_CLOUDFLARED` や検索制限が候補処理を短絡すると、この値は参照されても探索結果には使われません。`apps/host/server/cloudflared-find.mjs:42-70,95-110`; `apps/host/server/cloudflared-install.mjs:34-43`。
+## ログと測定値
 
-Windows telemetry も `os.environ.get` を使い、値の取得は `_Nvml` reader の生成時です。`Telemetry` は server 起動時に作成されます。環境変数を後から変更しても、すでに作成済み reader の候補パスは再評価されません。NVML の候補ロード・初期化に失敗しても、この変数に関する警告は出しません。通常の sampling 例外が起きた場合は `[strata] metrics: a sample failed (...)` を一度出して sampling を継続しますが、これは ProgramFiles の失敗専用ログではありません。`serve/telemetry.py:36-64,535-589,648-672`; `serve/server.py:5247-5255,8854-8857`。
-
-Control と MCP の root 一覧は各検査時に環境から読み直します。Control では空文字は `if value` で除外し、MCP も `if p` で除外します。MCP の実行中に検査が拒否されると `ToolError` になります。`strata_control/folders.py:27-37,63-80`; `tools/strata_mcp.py:483-489,2269-2293`。
-
-Host agent は `createAgentBridge` に渡された `env` を保持し、turn ごとの `trackerFolders()` 呼び出しで `ProgramFiles` を読むため、その値は成果物追跡の除外リストに反映されます。ここでは Program Files の存在確認や実ディレクトリの列挙はせず、成果物 tracker に除外 root として渡すだけです。`apps/host/server/agent/agent-bridge.mjs:121-140,364-378`; `apps/host/server/agent/deliverables.mjs:52-85`。
-
-候補一覧にある `ProgramFiles(x86)` は別名として各所で独立して読まれます。`setup.py:2363` は `ProgramFiles(x86)` のみを `vswhere.exe` のパス構築に使い、`ProgramFiles` の読み取りではありません。テスト内の名前出現は実装挙動の根拠にしていません。
+ProgramFiles 自体について値を記録するログや測定値はありません。探索が失敗した後の cloudflared 不在表示・導入案内、保存先の拒否文言、`tools/check` の compiler 不在理由は上記の条件で発生します。Monitor は DLL 候補の `ctypes.CDLL` が `OSError` になると次候補へ進み、すべて失敗してもこの箇所ではログを出しません（`terminal/serve/telemetry.py:46-52`）。
 
 ## 根拠
 
-- 候補名の全参照と用途: `strata_cli/launch/access.py:83-84`; `serve/telemetry.py:36-40`; `tools/strata_mcp.py:483-489`; `strata_control/folders.py:27-37`; `apps/host/server/cloudflared-find.mjs:43-70`; `apps/host/server/agent/agent-bridge.mjs:135-140`; `packaging/build_vision_windows.bat:43-49`。
-- Host agent の `exclude` が tracker でサブツリー探索・成果物登録を除外する処理: `apps/host/server/agent/deliverables.mjs:52-85,111`。
-- checkout 状態: 調査対象 Strata の `git rev-parse HEAD` は `ffa80d73133ea5c548aefe57889a16e8085a938f`、`git status --short --branch` は `## main...origin/main`（未コミット変更表示なし）。
+- `app/host/server/cloudflared-find.mjs:43-70,95-110`
+- `app/host/server/cloudflared-install.mjs:34-45`
+- `app/host/server/agent/agent-bridge.mjs:181-190,529-535`
+- `terminal/strata_cli/launch/access.py:119-146,149-189,294-320,327-330,438-445`
+- `terminal/strata_control/folders.py:31-60,77-113`
+- `terminal/tools/strata_mcp.py:566-572,2478-2502`
+- `terminal/serve/telemetry.py:41-69,1417-1430,1704-1726`
+- `tools/packaging/build_cuda_windows.py:43-45`
+- `tools/packaging/build_vision_windows.bat:40-46`
+- `tools/check:158-189`
+- `terminal/setup.py:2674-2699`、`terminal/tools/hip/build_windows.bat:60-65`（`ProgramFiles(x86)` のみ。対象変数との部分一致を確認）
+
+検索で見つかった `app/host/tests/cloudflared-find.test.mjs` と `terminal/tests/terminal/test_cloudflared_find.py` の参照は、テスト入力の疑似環境辞書です。環境から値を読む本番処理の根拠にはしていません。

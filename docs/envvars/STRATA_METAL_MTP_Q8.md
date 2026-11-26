@@ -1,44 +1,41 @@
 # `STRATA_METAL_MTP_Q8`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal backend の MTP draft layer をロードするとき、適格な BF16 重みを Q8_0 に変換して使うかを選びます。既定では変換し、`STRATA_METAL_MTP_Q8=0` なら変換せず BF16 のまま使います。実装コメントでは draft step が読む重みのバイト数を半分にする狙いとされています。対象は MTP の draft 計算であり、通常の decode/verify window の重みを変換する設定ではありません。
-
-MTP は `--mtp` が指定され、`--spec` が 2 以上の場合にロード対象になります。`--mtp` が空でない場合でも `--spec < 2` なら generate は MTP を無視します（`src/program/generate.cpp:4612-4616`）。Metal build では MTP load/draft が `strata::metal_engine` に委譲されます（`src/core/mtp.cpp:249-256,1516-1525`）。
+Metal の MTP draft layer を読み込むとき、対象となる BF16 行列を Q8_0 に変換して別バッファに置くかを選ぶ。未設定時は変換する。値が文字列全体で `0` の場合だけ変換を行わず、draft 行列は GGUF 内の BF16 のまま使う。対象は Metal の MTP draft layer であり、主モデルや verifier の重みを切り替える設定ではない。実装は `Window::mtp_load()` と同ファイルの MTP 行列参照処理にある（`engine/metal/src/engine/window.cpp:2497-2521,2524-2552,2648-2653,2707-2722`）。
 
 ## 値と判定
 
-`Window::mtp_load()` 内で環境変数を読み、値が文字列全体で `"0"` と一致する場合だけ BF16 のままにします（`metal/src/engine/window.cpp:1506-1510`）。数値変換や先頭文字判定ではありません。
+`Window::mtp_load()` が `std::getenv` で取得し、値全体を `std::string(e) == "0"` と比較する。数値変換や trim、真偽値の解釈はしない。したがって空文字は「設定済み」でも Q8 変換を止めず、`0` との完全一致だけが無効化値になる（`engine/metal/src/engine/window.cpp:2520-2522`）。
 
-| 環境変数の状態 | 結果 |
-|---|---|
-| 未設定 | Q8_0 変換を行う |
-| 空文字 | Q8_0 変換を行う（`"0"` とは一致しない） |
-| `0` | 変換しない。元の BF16 重みを使う |
-| `00`, `0 `, `false`, `1` など | Q8_0 変換を行う。文字列全体が `"0"` でないため |
+| 条件 | unset | Q8_0 変換を行う値 | 変換を止め BF16 を使う値 |
+| --- | --- | --- | --- |
+| Metal の MTP layer 読み込み時 | 変換する | `1`, `true`, `false`, 空文字, `00`, `0anything`, ` 0`, `-0` など、文字列全体が `0` でない値 | `0` のみ |
 
-この判定は MTP GGUF をロードするたびに行われます。環境値はその時点で取り込まれ、変換後の `mq8_` とテンソル対応表が Window に保持されるため、ロード後に環境を変更しても既にロード済みの MTP 重みには反映されません（`metal/src/engine/window.cpp:1489-1494,1506-1540`）。
+値の長さ・数値としての妥当性・大文字小文字は検査しない。CLI 引数や別の環境変数との優先順位もこの判定にはなく、読み込み時点の環境値だけで決まる（同 `2520-2522`）。
 
 ## 有効になる条件
 
-- Strata が Metal backend でビルドされ、MTP drafter を実際にロードする経路でのみ参照されます。CUDA/HIP の MTP 実装はこの変数を読みません（`src/core/mtp.cpp:249-258`）。
-- 変換対象は MTP GGUF 内で、型が BF16、shape の次元数が 2 以上、かつ `shape[0]` が 32 の倍数であるテンソルに限られます。その他の BF16 tensor や別形式の tensor は変換されず、元の MTP weight buffer を参照します（`metal/src/engine/window.cpp:1511-1525`）。
-- 適格テンソルについて要素数を shape の積として算出し、BF16 を float に dequantize してから Q8_0 に quantize します。Q8_0 用領域の各テンソル開始位置は 256 byte 単位に揃え、変換スレッド数は `hardware_concurrency()` を 1〜16 に制限します（`metal/src/engine/window.cpp:1512-1539`）。
-- MTP の hyper-connection 読み出しは、down/up/inject の3テンソルがすべて Q8_0 の場合に Q8 用 kernel を選びます。通常の MTP GEMV も tensor の型と対応するバッファを選ぶため、変換された tensor だけ Q8_0 コピーを読みます（`metal/src/engine/window.cpp:1624-1652,1685-1703`）。
-
-`STRATA_METAL_MTP_Q8=0` は MTP 自体を無効にせず、その重みの Q8_0 コピー生成を止めるだけです。MTP のロード自体は既定パスで `<rt-dir>/../mtp-q2_0.gguf` を使うか、別変数 `STRATA_METAL_MTP_GGUF` で指定したパスを読みます（`metal/src/engine/window.cpp:2524-2541`）。
+- `STRATA_GPU_METAL` を定義したビルドの Metal 経路で使われる。共通 `MtpDrafter::load()` はこのビルド条件で Metal engine の `mtp_load()` を呼ぶ（`engine/src/core/mtp.cpp:81-90,345-354`）。
+- MTP drafter のロード後に Metal decode window が初期化され、保留中の MTP GGUF が読み込まれる必要がある。MTP が設定されていない場合 `mtp_load_pending()` は `true` を返して draft layer のロードを行わず、この変数も評価されない（`engine/metal/src/engine/window.cpp:3627-3635,3705-3729`）。
+- Q8 変換が有効な値でも、変換対象は MTP GGUF 内で型が BF16、rank が 2 以上、shape の第 0 次元が 32 の倍数である tensor に限る。それ以外の tensor は変換対象外（同 `2524-2536`）。
 
 ## 実行時の詳細
 
-変換は MTP GGUF を開き、norm buffer を用意して MTP kernel を compile した後、draft 用 Q8_0 buffer を構築するロード処理中に同期的に実行されます。各対象 tensor について、元の BF16 データを `ref::dequant()` で float 配列へ展開し、`ref::quantize_q8_0()` の出力を `mq8_` の該当 offset に格納します（`metal/src/engine/window.cpp:1489-1540`）。専用の有効/無効ログはありません。ロードが成功すると、通常の `strata metal: MTP draft layer from ...` ログが出ます（同:1618-1620）。
+共通 MTP loader は Metal engine にロードを依頼し、Metal 側はロード先パスを保持する。decode window の初期化時に `mtp_load_pending()` が `Window::mtp_load()` を呼ぶ。この関数は MTP GGUF を開き、Metal buffer の wrap と MTP kernel の compile の後、環境変数を一度読む（`engine/src/core/mtp.cpp:345-354`; `engine/metal/src/engine/window.cpp:2515-2522,3627-3635,3708-3729`）。読み取り結果は変数専用の static cache には保存されないが、同じ `mtp_load()` の中で一度だけ判定され、そのロードで作る `mq8t_` / `mq8_` の構成に反映される。ロード後に環境を変えても、その既存 draft layer の形式は変わらない。
 
-Q8_0 に変換したテンソルは `TQ()` が返す型・offset と `MB()` が返す buffer の組で参照します。別の変換されていない tensor は元の `Wm_` と GGUF tensor 情報を使います（`metal/src/engine/window.cpp:328-346`）。MTP が提案した token は verifier 側の処理に渡される draft 候補です。ここでは Q8_0 と BF16 の生成結果の同一性や、速度差を独自に測定していません。
+変換を行う場合、対象 tensor の Q8_0 サイズを積算して Metal buffer を確保し、最大 16 本（`hardware_concurrency()` に応じて 1〜16 本）の thread で BF16 を float に dequantize してから Q8_0 に quantize する。`mq8t_` は変換 tensor の型・offset・byte 数を記録し、`TQ()` / `MB()` はその tensor に限って変換後の metadata と `mq8_` を返す。MTP の `gr_read_m()` と `mtp_encode()` 内の GEMV はこの選択を通じて Q8_0 tensor と対応 buffer を使い、対象外または変換停止時は元の MTP buffer `Wm_` を使う（`engine/metal/src/engine/window.cpp:2522-2552,625-629,2648-2653,2707-2722`）。
+
+## ログと測定値
+
+この変数の値や Q8 変換件数だけを報告するログはない。MTP load が成功すると、設定値にかかわらず stderr に `strata metal: MTP draft layer from ...` の行が出る（`engine/metal/src/engine/window.cpp:2639-2642`）。変換無効化時専用のログや、この変数に結び付いた測定値はソースで確認できない。
 
 ## 根拠
 
-- `metal/src/engine/window.cpp:1489-1540` — MTP load、厳密な `"0"` 判定、変換対象選別、Q8_0 copy の作成。
-- `metal/src/engine/window.cpp:328-346,1624-1652,1685-1703` — 変換 tensor の型・buffer 選択と draft kernel dispatch。
-- `src/core/mtp.cpp:249-256,1516-1525`、`src/program/generate.cpp:4612-4619` — Metal MTP load/draft の委譲と `--mtp` / `--spec` 条件。
-- `docs/MAC.md:183-191` — `STRATA_METAL_MTP_Q8=0` を BF16 の draft matrix を使うスイッチとして記載。ソースでは未設定時に適格 BF16 tensor を Q8_0 化することを確認。
+- `engine/src/core/mtp.cpp:81-90,345-354` — Metal build guard と共通 MTP loader からの委譲。
+- `engine/metal/src/engine/window.cpp:2520-2552` — 値判定、対象 tensor 条件、buffer 確保と変換。
+- `engine/metal/src/engine/window.cpp:625-629,2648-2653,2707-2722` — 変換後 tensor と buffer の選択、および MTP GEMV からの参照。
+- `engine/metal/src/engine/window.cpp:3627-3635,3705-3729` — window 初期化、MTP がない経路、保留ロード。
+- `engine/metal/src/engine/window.cpp:2639-2642` — MTP load 成功時の stderr ログ。

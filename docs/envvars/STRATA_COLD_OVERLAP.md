@@ -1,51 +1,56 @@
 # `STRATA_COLD_OVERLAP`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CPU が担当する expert のファイル読み込みを、同じ layer の ready な expert の計算と重ねるか、GGUF のページキャッシュに全体が載っている expert を staging buffer にコピーせずマッピングから計算するかを選びます。適用箇所は multi-token expert pool の dispatch です。CPU が計算する expert がない layer では、この処理は呼ばれません。
-
-環境変数は dispatch と `FileExpertSource::prefetch_begin()` でそれぞれ `static` に一度読み取られます。通常は値が同じでも、プロセス内で環境を書き換えた場合、各読み取りが初めて行われる時期の違いで値が異なる可能性があります。
+`--mmap-experts`（または RAM 不足時の同じ file-tier fallback）で `FileExpertSource` が使われる実行経路において、verify-window の CPU expert 読み込みを同期で行うか、読み込み中に読了済み expert を先に計算するか、Linux の GGUF mapping 上で page cache に全量ある expert を stage buffer へコピーせず計算するかを選ぶ。`expert_pool_dispatch_multi` が `d.cold_mode` を選び、`FileExpertSource::prefetch_begin` と CPU pool の dispatch が処理する（`engine/src/program/generate.cpp:8621-8647,1630-1637`、`engine/src/core/expert_source.cpp:5426-5469,5761-5787`）。
 
 ## 値と判定
 
-非空の値は `atoi()` で整数に変換されます。文字列全体の検証はなく、先頭の空白や符号を許し、数字列の後ろは無視します（例: `2junk` は2、数字に変換できない文字列は0）。明示的な空文字は unset と同じ既定値です。
+dispatch 側は最初の `expert_pool_dispatch_multi` 呼び出しで `getenv` の結果を function-local `static` に保存する。未設定または空文字列は sentinel `-1` になり、Linux の GGUF in-place mapping なら既定値 4、それ以外は 0。非空値は `atoi` で変換後に 0〜4 へ clamp する。文字列全体の妥当性検査はなく、整数の先頭部分だけが使われる（`engine/src/core/expert_source.cpp:5462-5468`）。
 
-| 設定 | dispatch のモード | 動作 |
-|---|---:|---|
-| unset / 空文字 | Linux の GGUF read-in-place なら4、それ以外0 | 条件付きで zero-copy のみ。既定4の条件は下記参照 |
-| 0 | 0 | 従来どおり、CPU が使う expert の読み込みを同期 prefetch してから計算 |
-| 1 | 1 | 読み込みを背景スレッドで開始し、ready な expert を計算してから、読み込み完了した expert を順次計算 |
-| 2 | 2 | 測定用。背景読み込みを開始した直後に join してから計算するため、読み込みと計算は重ならない。読み込み時間を別計測 |
-| 3 | 3 | 1 の overlap に、条件を満たす expert の zero-copy を加える |
-| 4 | 4 | zero-copy を有効にし、残りの読み込みは同期で行う |
-| 5以上 | 4 | dispatch は `atoi` の結果を0〜4に clamp するため、zero-copy 判定では4として扱う。ただし `prefetch_begin()` は clamp 前の値を使い、値が4と等しくないため非同期読み込みも開始する。従って実際は3相当の overlap + zero-copy になる |
-| 負数 | 0 | dispatch が0に clamp する |
+| 条件 | unset / 空文字列 | 有効値 | 変換例・範囲外 |
+|---|---|---|---|
+| `expert_pool_dispatch_multi` の選択 | Linux 上で `role_ptr_` を持つ GGUF in-place source は 4、それ以外は 0 | 0〜4。0=同期読み込み、1=読み込みと計算を重ねる、2=計測用、3=1 + 条件付き zero-copy、4=zero-copy + 同期読み込み | `atoi`: `1tail`→1、`0anything`→0、`true` / `false` / `x`→0、` 2`→2、`-1`→0、`9`→4。大文字小文字は関係しない。数値としての全体妥当性は検証しない。 |
+| `FileExpertSource::prefetch_begin` の独立 parser | Linux GGUF in-place source は 4、それ以外は 0 | 同じ値を意図した分岐だが、ここでは `atoi` 結果を clamp しない | 空文字列は unset と同じ。`5` 以上では dispatch が 4 に clamp する一方、この parser は 5 以上のまま扱い、4 専用の同期読み込み分岐に入らず非同期読み込みを起動しうる（`engine/src/core/expert_source.cpp:2557-2563,5464-5468`）。 |
 
-この値は文字列全体比較ではなく `atoi()` によるため、大文字小文字は関係しません。dispatch の mode は `src/core/expert_source.cpp:4816-4820`、FileExpertSource の読み込み側は `src/core/expert_source.cpp:2202-2208` で判定されます。5以上の差はこの二つの変換処理の相違によります。
+`atoi` は不正な先頭文字列を 0 として扱い、数値後方の文字を無視する。`atoi` が表現できない範囲の入力は C/C++ の規則上安全な値として保証されず、Strata 側のエラー処理もない。上表のうち 0〜4 が意図された値域であり、5 以上は上記 parser 不一致のため無効値として扱うべきである。
+
+モード 2 は `prefetch_begin` で読込みを開始した後、pending があれば全 read の完了を待ってから計算し、読込み時間を別計測する。モード 1 は pending のない expert を先に計算し、読込み完了ごとに残りを計算する。モード 3 はモード 1 に zero-copy 条件を加える。モード 4 は必要な blob を同期的に埋め、zero-copy 条件に合う expert は mapping から直接計算する（`engine/src/core/expert_source.cpp:2561-2573,5781-5787,5840-5865,5885-5920`）。
 
 ## 有効になる条件
 
-- overlap は CPU 側で処理する未 ready expert があり、`d.src` が非同期 prefetch を実装する `FileExpertSource` である場合に限り実際の読み込みと重なります。基底 `ExpertSource::prefetch_begin()` は通常の `prefetch()` を同期実行し、pending を作りません（`include/strata/core/expert_source.hpp:252-260`）。
-- FileExpertSource でも staged source でない場合、layer / expert 範囲外、対象がない場合は `prefetch_begin()` が読み込みを開始しません（`src/core/expert_source.cpp:2192-2199`）。RAM complement や override にある expert、既に staging 済みの expert も読み込み対象になりません（同: `2125-2185`）。
-- mode 3/4 の zero-copy は Linux の `cached_bytes()` によるページ常駐確認が必要です。GGUF の role mapping があり、mapping が開いた状態、unbuffered/direct 読み込みでないこと、native expert layout で対象 layer の `tail_off == 0` が条件です。expert の3 tensorすべての span がページキャッシュに載っていると確認でき、既存 staging entry がない場合に限り、マッピングを直接使います（`src/core/expert_source.cpp:1000-1015,2125-2171`）。Linux 以外では `cached_bytes()` は0を返すため zero-copy にはなりません。
-- unset / 空文字の既定4は `FileExpertSource::linux_file_defaults()` が true の場合だけです。Linux かつ GGUF read-in-place（`role_ptr_` がある場合）に true となり、`experts.bin` pack には適用されません（`include/strata/core/expert_source.hpp:1010-1012`）。明示値1〜4はこの既定判定を経ず dispatch mode になりますが、上記のsource / CPU処理条件は残ります。
+- File expert source が選ばれる必要がある。`--mmap-experts` の経路で `FileExpertSource::open` が呼ばれ、RAM 不足時にも同じ source へ fallback する（`engine/src/program/generate.cpp:8621-8647`）。通常の expert arena / RAM copy だけを使う場合、この変数の file-tier 分岐は使われない。
+- 対象処理は `drive_pool_multi_impl` から呼ばれる verify-window の CPU expert dispatch。対象層に CPU が処理する未 resident expert がない場合、読み込み・重ね合わせの仕事自体がない（`engine/src/program/generate.cpp:1630-1637`、`engine/src/core/expert_source.cpp:5737-5748,5771-5788`）。
+- モード 1〜3 の非同期部分は、source が staged で、`io_fill_ && io_pf_ && direct_.empty()` の page-fill 経路でない場合に限り `prefetch_begin` の async worker を起動する。この page-fill 経路では同期的な `prefetch` 呼び出しに委ね、関数は pending なしで戻る（`engine/src/core/expert_source.cpp:2547-2553,2575-2612`）。
+- zero-copy はモード 3 / 4 で要求されるだけでは足りない。GGUF の role mapping があり、mapping が unmap されておらず、direct-read でなく、CPU expert layout が native で、層 format の `tail_off == 0` であることが必要。さらに対象 expert の全 span が page cache に resident で、RAM complement や override にない場合に限り mapping の role pointers を返す。条件を満たさなければ stage buffer 経由で処理する（`engine/src/core/expert_source.cpp:2480-2498,2519-2530`）。Linux 以外では `linux_file_defaults()` は true にならず、zero-copy 判定の page-residency query を行う実装も Linux の `mincore` による（`engine/include/strata/core/expert_source.hpp:1081-1083`、`engine/src/core/expert_source.cpp:1088-1110`）。
+- `STRATA_IO_PREFETCH` が page-fill 経路を有効にしている構成では cold-overlap の async worker 分岐が bypass される。`STRATA_IO_PREFETCH` や `STRATA_IO_PF_GATE` は別の file-tier read-ahead 機能であり、`STRATA_COLD_OVERLAP=0` だけではそれらを無効にしない（`engine/src/core/expert_source.cpp:2550-2553`、`engine/src/program/generate.cpp:8693-8704`）。
+- `experts.bin` source は `linux_file_defaults()` が false のため未設定時の cold mode は 0。明示的な 1〜4 は overlap を選べるが、`role_ptr_` がないため GGUF mapping の zero-copy 条件は満たさない（`engine/include/strata/core/expert_source.hpp:1081-1089`、`engine/src/core/expert_source.cpp:2486-2498`）。
 
 ## 実行時の詳細
 
-mode 0 は `prefetch()` で必要な blob を埋めてから CPU pool が計算します。mode 1/3 は `prefetch_begin()` が pending blob を背景スレッドで読み、dispatch はまず ready expert の job を pool で実行します。読み込みが着地するたびにその expert の job を追加実行し、最後に読み込み thread を join します。direct I/O の場合は最大4 threadで16件単位、それ以外は `fetch_threads_` を上限に thread を作ります（`src/core/expert_source.cpp:2220-2255,2258-2272,5128-5173`）。mode 2 は最初の読み込みをすべて join して所要時間を記録してから、ready / 読み込み済みの expert を計算します。mode 4 は `prefetch_begin()` 内で同期 `fill_many()` を行い、pendingを0にして返します（同: `2208-2218`）。
+`cold_env` と `mode_env` は別々の function-local `static` であり、それぞれ最初に評価された値をプロセス内で保持する。実行中に環境値を変更しても、dispatch mode と `prefetch_begin` の mode は更新されない。`cold_log` も最初の serve log 判定時に static cache される（`engine/src/core/expert_source.cpp:2557-2561,5464-5468`、`engine/src/program/generate.cpp:23879-23880`）。
 
-zero-copy の対象は `claim_todo()` が page-cache resident と判定すると staging 対象から外し、`zc_roles()` が gate / up / down の各 role pointer を返します。native CPU kernel の job にそのポインタと role 間 offset を渡して、マッピング上のデータを直接計算します（`src/core/expert_source.cpp:2168-2171,2275-2287,5093-5119`）。mode 3/4 の設定だけで全 expert が zero-copy になるわけではありません。
+モード 0 は CPU が必要とする miss をまとめて同期 `prefetch` してから pool 計算に進む。モード 1 / 3 は pending miss の読み込みを worker thread で進め、decode thread は ready expert を計算し、worker が読み終えた expert ごとに残りを計算する。pending が残る場合は landing 待ちを行い、最後に worker を join する。モード 2 は開始した非同期 read を先にすべて join し、それから ready 分と read 分を計算するため、overlap の実行モードではなく計測モード。モード 4 は read を同期で埋めるが、zero-copy 条件に合う expert は mapping から読む（`engine/src/core/expert_source.cpp:2547-2612,5776-5790,5885-5929`）。
 
-`STRATA_COLD_OVERLAP` が設定されていれば（空文字を含む）、または `STRATA_IO_STATS` が設定されていれば、mode が0以外のとき request ごとの cold read 集計を stderr に出します。出力には mode、mappingから直接計算したexpert数、読み込み対象layer/expert数、ready expert数、pool batch数、読み込み・計算・待機時間が含まれます（`src/program/generate.cpp:15445-15462`）。Linux file-tier既定の起動ログにも、cold overlap値と関連する read-ahead の状態が含まれます（同: `5655-5684`）。
+mode 3 / 4 の zero-copy expert は `zc_roles` が返す3つの mapping pointers を native CPU job format に組み直して使い、stage buffer を使わない。通常の miss は blob を取得して同じ CPU pool job に入る。ソースのコメントでは同一 token の expert 重み付き合算と結果 bit は batch order によって変わらないとしているが、この調査では別途実行検証していない（`engine/src/core/expert_source.cpp:5840-5865`）。
+
+worker の direct read が失敗すると `fill_stage` fallback を試み、publish 失敗時には待ち側が blob を再読込する経路がある。最終的に source が blob を返せなければ dispatch は `d.failed` を設定し、`the expert source could not produce a blob` を失敗理由にする。環境変数の値自体に対する専用エラー・警告はない（`engine/src/core/expert_source.cpp:2590-2603,2621-2625,5842-5850`）。
+
+## ログと測定値
+
+Linux file-tier default により `io_pf_default` が成立して io prefetch が有効な場合、起動時に `strata generate: file tier (Linux defaults, ...): page-cached experts computed from the mapping (STRATA_COLD_OVERLAP=...), ...` を stderr に出す。ここで変数が未設定または空なら GGUF in-place source は `4`、別 source は `0` と表示する。これは cold mode 実行後の確認ログではなく、環境値（または既定値）の表示である（`engine/src/program/generate.cpp:8693-8714`）。
+
+serve の各 request では、`STRATA_COLD_OVERLAP` が設定済み（空文字も含む）または `STRATA_IO_STATS` が設定済みで、かつ `cold_mode != 0` のとき stderr に `strata serve: cold reads (STRATA_COLD_OVERLAP=%d) this request: ...` から始まる累積差分ログを出す。cold mode 0 ではこのログを出さない（`engine/src/program/generate.cpp:23879-23896`）。
+
+`docs/DETAILS.md:302-318` は Linux file tier の既定動作として GGUF in-place source の zero-copy（mode 4）を記載し、`docs/release-notes-0.2.0.md:60` は特定の構成での速度比を報告している。これらは Strata 文書に記載された測定値であり、本調査では再測定していない。モード 1〜3 の効果や一般的な性能差としては扱わない。
 
 ## 根拠
 
-- `src/core/expert_source.cpp:4814-4820` — dispatchでの `atoi()`、clamp、未設定時の既定値。
-- `src/core/expert_source.cpp:2192-2255` — `prefetch_begin()` の早期条件、既定値、mode 4 の同期読み込み、その他modeの非同期読み込み。
-- `src/core/expert_source.cpp:1000-1015,2125-2171` — Linux page-cache resident byte確認とzero-copy対象の選定。
-- `src/core/expert_source.cpp:5029-5045,5128-5173` — CPU missの収集、mode 0/2/その他のdispatch処理、着地待ち。
-- `src/core/expert_source.cpp:5093-5119,2275-2287` — native jobへのmapping pointer引き渡し。
-- `include/strata/core/expert_source.hpp:252-260,1010-1012` — 基底実装とLinux既定適用範囲。
-- `docs/DETAILS.md:272-295` — Linux GGUF read-in-placeではzero-copy、I/O prefetch、decode gateを既定有効とする説明、および測定条件。記載測定は機能群をまとめて比較したもので、STRATA_COLD_OVERLAP単体の性能値としては扱わない。
+- 値の読み取り、既定値、clamp と parser の差: `engine/src/core/expert_source.cpp:2557-2563,5462-5468`
+- mode に応じた CPU dispatch / wait / failure: `engine/src/core/expert_source.cpp:5761-5790,5840-5865,5885-5929`
+- zero-copy の前提と stage buffer 回避: `engine/src/core/expert_source.cpp:2480-2530,2632-2644`
+- file source / Linux default 判定: `engine/src/program/generate.cpp:8621-8647`、`engine/include/strata/core/expert_source.hpp:1081-1089`
+- 起動・request log: `engine/src/program/generate.cpp:8693-8718,23879-23896`
+- 関連資料: `docs/DETAILS.md:302-318`、`docs/release-notes-0.2.0.md:60`

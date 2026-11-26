@@ -1,44 +1,48 @@
 # `STRATA_POOL_TRACE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-SYCL エンジンの複数トークン検証経路で、CPU expert pool の処理段階を標準エラーに出す診断用スイッチ。expert の割り当てや計算結果を変更せず、pool dispatch 内の進行状況を観測する。
+CUDA 系と SYCL 系の `expert_pool_dispatch_multi` が、verify window の expert pool 処理段階を stderr に出す診断用スイッチ。`expert_pool_dispatch` の通常の単一 token dispatch では読まれず、multi dispatch に入った場合だけ使われる。ログ出力以外にこの変数を使う分岐はなく、pool の割り当て・実行結果を変えない（`engine/src/core/expert_source.cpp:5426-5459`, `engine/sycl/src/core/expert_source.cpp:2559-2591`）。生成側では verify window 用 callback として multi dispatch が登録される（`engine/src/program/generate.cpp:13697-13700`, `engine/sycl/src/program/generate.cpp:7978-7980`）。
 
 ## 値と判定
 
-| 環境変数の状態 | 判定 |
-|---|---|
-| 未設定 | 出力しない |
-| 空文字を含む任意の設定値（`0`、`1`、その他の文字列） | 出力する |
+両実装とも `static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;` で設定有無だけを見る。値の文字列や数値は解析しない。
 
-`std::getenv(...) != nullptr` の有無だけで判定し、文字列の変換や内容比較はしない。判定結果は関数内の `static const bool` に保存されるため、初回にこのコードへ到達した後の環境変更は反映されない。
+| 実装 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA 系 `engine/src/core/expert_source.cpp` | 無効 | 空文字、`0`、`1`、`true`、その他すべての値 | なし（環境変数が存在すれば有効） |
+| SYCL 系 `engine/sycl/src/core/expert_source.cpp` | 無効 | 空文字、`0`、`1`、`true`、その他すべての値 | なし（環境変数が存在すれば有効） |
+
+大文字小文字、空白、数値としての妥当性、値の境界は判定されない。CLI 引数・設定ファイル・他の環境変数との優先順位や上書きもない（`engine/src/core/expert_source.cpp:5456-5459`, `engine/sycl/src/core/expert_source.cpp:2588-2591`）。
 
 ## 有効になる条件
 
-- `sycl/src/core/expert_source.cpp` にある `expert_pool_dispatch_multi` が呼ばれたときに適用される。同ソースは SYCL エンジンのビルド対象に含まれる（`sycl/CMakeLists.txt`）。
-- この関数は複数トークンの検証ウィンドウ用で、通常の単一トークン dispatch（`expert_pool_dispatch`）にはこのトレースはない。
-- 複数 GPU の layer split を使う場合も、`drive_pool_split` が各層の設定を選んで `drive_pool_multi` に委譲するため対象になる。
-- 先行する入力検査で失敗して関数が戻る場合、または呼び出し自体がない場合は出力されない。トレース判定は入力検査後に行われる。
+- 実行ファイルに対応する CUDA 系または SYCL 系実装が含まれていること。コードに OS 判定や実行時 backend 判定はなく、使われる実装はビルドされた経路による。
+- `expert_pool_dispatch_multi` が呼ばれる verify window の処理であること。未設定なら段階ログは出ない。
+- dispatch がすでに失敗状態ではなく、`n_tok` と `k` が関数冒頭の検査を通ること。範囲外の場合は関数が失敗状態を設定して戻るため、trace 用 static の初期化にもログ出力にも進まない（`engine/src/core/expert_source.cpp:5429-5447`, `engine/sycl/src/core/expert_source.cpp:2562-2574`）。
 
 ## 実行時の詳細
 
-有効時は各呼び出しで、stderr に `pool trace: layer <層番号> <段階> <整数>` を出し、直ちに flush する。記録する段階は次のとおり。
+値は各 backend 実装の関数内 `static` として、最初に上記の検査を通過して trace 判定箇所へ到達したときに一度読み取られ、その後はプロセス内で cache される。実行中に環境を変更してもこの判定には反映されない。子プロセスへの転送・上書き処理はこの実装にない（`engine/src/core/expert_source.cpp:5456-5459`, `engine/sycl/src/core/expert_source.cpp:2588-2591`）。
 
-- `begin`（整数は既定値 `-1`）: source の層開始処理の直前。
-- `begun`（`-1`）: source の層開始処理の直後。
-- `publish <fetches>` と `fetch <fetches>`: GPU plan が利用可能な経路で、それぞれ plan 公開・fetch 開始の直前。plan がない経路ではこの2行は出ない。
-- `run <njobs>`: CPU pool のジョブ実行直前。`njobs` は組み立てた CPU expert job 数。
-- `ran`（`-1`）: CPU job の実行と remote/peer の完了処理の後。
+有効時は `fprintf(stderr, "pool trace: layer %lld %s %lld\n", ...)` で出力し、各行の後に `fflush(stderr)` する。出力される段階と末尾の数値は次のとおり。
 
-ログは時間計測値や個々の expert ID を含まず、これらの段階まで処理が進んだことを示す。トレースの出力は処理制御や pool の結果を変えない。コード上、環境変数を子プロセスへ転送する特別な処理はない。
+- `begin -1` と `begun -1`: `begin_layer` の前後。
+- `publish <fetches>` と `fetch <fetches>`: plan の publish/fetch 処理の前後。CUDA 系では `P.device_hits_only` でない plan 経路、SYCL 系では plan 経路で出る。
+- `run <njobs>` と `ran -1`: CPU pool の multi-job 実行の直前と、pool 実行および remote/peer 完了処理を通過した後。
+
+`publish` / `fetch` が出ない経路があり、途中で失敗して早期 return した場合は後続ラベルが出ない。dispatch の範囲エラーや peer GPU の失敗は別の既存経路で処理され、この変数自体が警告・終了・fallback を発生させることはない（`engine/src/core/expert_source.cpp:5692-5695,5933-5956`, `engine/sycl/src/core/expert_source.cpp:2693-2696,2780-2813`）。
+
+## ログと測定値
+
+ログ文言は `pool trace: layer %lld %s %lld`。測定値を出力する機能ではなく、この変数に関連する Strata 資料記載の測定値も確認できなかった。
 
 ## 根拠
 
-- `sycl/src/core/expert_source.cpp:2547-2577`: 対象関数、入力検査、環境変数の有無判定と `begin` / `begun` の出力。
-- `sycl/src/core/expert_source.cpp:2670-2679`: GPU plan が有効な場合の `publish` / `fetch` 出力。
-- `sycl/src/core/expert_source.cpp:2711-2737, 2785-2812`: CPU pool job 数、`run` / `ran` の位置と dispatch 完了処理。
-- `sycl/src/program/generate.cpp:1002-1020, 1038-1049, 7207-7209, 12359-12375`: 検証窓からの呼び出し、および layer split 経路。
-- `sycl/CMakeLists.txt:220-227`: `expert_source.cpp` を含む SYCL engine ソースの構成。
-- `docs/DETAILS.md`: 関連する CPU expert pool の説明はあるが、この変数名やこのトレース形式の説明は見つからなかった。
+- `engine/src/core/expert_source.cpp:5426-5459` — CUDA 系 multi dispatch の入口、入力検査、環境読み取りと trace 出力形式。
+- `engine/src/core/expert_source.cpp:5469-5471,5692-5695,5933-5956` — begin、publish/fetch、pool 実行と完了後の trace 呼び出し。
+- `engine/sycl/src/core/expert_source.cpp:2559-2595` — SYCL 系 multi dispatch の入口、入力検査、環境読み取りと begin trace。
+- `engine/sycl/src/core/expert_source.cpp:2693-2696,2780-2813` — SYCL 系 publish/fetch、失敗時 return、pool 実行と完了後の trace。
+- `engine/src/program/generate.cpp:13697-13700`, `engine/sycl/src/program/generate.cpp:7978-7980` — verify window 用 multi pool callback の選択。

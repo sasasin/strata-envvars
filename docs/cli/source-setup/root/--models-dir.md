@@ -1,62 +1,56 @@
 # `--models-dir`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（調査日: 2026-10-25）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`SETUP.bat`、`update.sh`、`UPDATE.bat` からも委譲） |
+| コマンド | `setup.py`（root。`setup.sh`、`START-HERE.bat` 等からも渡される） |
 | オプション | `--models-dir` |
 | 別名 | なし |
-| 値 | GGUF や ready-made model pack の配置先ディレクトリ（文字列、必須） |
+| 値 | 1 個のディレクトリパス文字列。parser に型・選択肢・パス形式の制約はない |
 
 ## 役割
 
-GGUF モデルファイルの配置場所を指定します。省略時は選択された Strata データフォルダー内の `models` です。GGUF を使う通常 family ではモデルごとのサブディレクトリが使われます。ready-made pack family でも同じ指定が pack の探索・取得先になります（`setup.py:8488, 9197-9209, 9285-9291`）。
+モデルの GGUF ファイルを置くルートディレクトリを指定する。既定はデータフォルダ内の `models` で、通常の GGUF モデルではさらにモデル識別用ディレクトリを下に使う。NVFP4 の ready-made pack ではリポジトリ別ディレクトリを下に使う。既存のモデルファイルを移動する指定ではなく、配置先を変える指定である。
 
 ## 使い方
 
-リポジトリのルートで、モデルファイルを置くディレクトリを指定する例です。
-
 ```sh
-./setup.sh --setup --family qwen --model IQ3_XXS --models-dir ./model-files --yes --no-start
+# モデルの GGUF を大容量ドライブ配下に置き、モデルを導入して終了する
+python terminal/setup.py --family qwen --model IQ3_S --models-dir /mnt/large/strata-models --no-start
 ```
-
-相対パスは `Path` にそのまま渡されるため、setup を起動したカレントディレクトリからの相対指定です。`--yes` は対話時の推奨回答を受け入れ、`--no-start` はインストール後のモデル起動を抑止します（`setup.py:8493-8496`）。
 
 ## 値と既定値
 
-- parser は `ap.add_argument("--models-dir", ...)` としており、`type`、`choices`、明示的な `default` はありません。値は文字列で、省略時は `None` です。値を省略すると argparse の引数エラーになります（`setup.py:8488`）。
-- 空文字列は parser では拒否されませんが、通常の初期化では `a.models_dir is None` の判定により空文字列は既定値に置き換わりません。その後 `Path("")` はカレントディレクトリを指します（`setup.py:8608-8612`）。macOS 経路では `a.models_dir` の真偽値で判定するため、空文字列は既定の `<data folder>/models` にフォールバックします（`metal/setup_mac.py:367`）。
-- 専用の存在・書き込み可否 validation は parser または初期化箇所にありません。ダウンロード経路では必要に応じてディレクトリを作成します。相対パス、`~` を含む文字列の展開などの専用処理は確認できません（`setup.py:8488, 9292-9295`; `metal/setup_mac.py:367, 440-442`）。
+`--models-dir` は値を取る引数で、既定値は parser には設定されていない。通常の setup 経路では省略時に `data / "models"` が設定される。値そのものに対する存在確認、ディレクトリ形式の検証、ホームディレクトリ展開は parser と利用箇所には見当たらない。値は `Path(...)` に渡され、ディレクトリが必要になった時点で `mkdir(parents=True, exist_ok=True)` を呼ぶ経路がある。無効なパスや作成権限がない場合の個別エラー処理は確認できない。
 
 ## 実行時の動作
 
-- `--data-dir` はデータルートを選びます。`--models-dir` を省略すると、そのデータルートの `models` が使われます（`setup.py:8608-8612`）。`--models-dir` を明示した場合は GGUF の置き場所を別にできますが、packs、tokenizer など他の準備データは引き続き `data` 側に置かれる処理があります（例: `setup.py:9341-9344, 9355-9356`）。
-- 通常の GGUF 経路は `Path(a.models_dir) / tag` をモデル別のフォルダーとして使い、容量を確認し、不足ファイルがあればダウンロード前にそのフォルダーを作成します（`setup.py:9206-9209, 9249-9256, 9292-9319`）。Qwen3.8 系の共通 shard 再利用も `a.models_dir` 直下を検索します（`setup.py:9309-9316`）。
-- ready-made pack 経路は `--models-dir` を pack の保存先として使いますが、既存の別データフォルダーに検証済み pack があればそちらを選ぶことがあります（`setup.py:9197-9205`）。DeepSeek-V4.1 の共有ファイルも `Path(a.models_dir)` の下に専用共有ディレクトリを設けます（`setup.py:7859-7862`）。
-- `--gguf-dir` は別の指定で、通常の GGUF shard 読み込み先を優先します。`--models-dir` は引き続き、共有ファイルや画像 encoder 等の別ファイルの保存先として使われる場合があります（`setup.py:9206-9209, 9326-9335`; `setup.py:7865-7873`）。
-- インストール済みモデルを単純起動する経路は、保存済み実行設定のモデルパスを使います。`--models-dir` は `plain_start` 判定から除外されていないため、単純起動になった場合は指定先がモデルのパスを置き換えません。インストール先の選択へ進む場合は、明示した値が保持されます（`setup.py:8602-8612, 8684-8695`）。
+- 通常の GGUF モデルでは、配置先を `Path(a.models_dir) / tag` として shard のパスを組み立てる。モデルファイルが未完了ならダウンロードし、準備工程では同じモデル配置先を参照する。
+- NVFP4 ready-made pack では `--models-dir` が pack ファイルの配置ルートとなり、その下に `<owner>--<repo>` と pack 内の相対パスを作る。
+- `--gguf-dir` が同時に指定された通常 GGUF モデルでは、`--gguf-dir` が既存 GGUF の読み込み元として使われ、`--models-dir` 配下のモデル別ディレクトリは shard の参照先にならない。ready-made pack に `--gguf-dir` を指定した場合は警告を出して `--gguf-dir` を無効化する。
+- 指定先に必要な通常モデルの shard が揃っていない場合、Strata が把握している別のデータルートも検索し、そこに全 shard があればそちらを使用する。ready-made pack でも別ルートに検証済みファイルがあればそちらを選ぶ。
+- 起動専用の既存インストール経路では、モデルの実パスは保存済み run config から読み込まれる。`--models-dir` はその経路の判定条件に含まれず、指定値を使った移動・再配置は行わない。
 
 ## 適用条件と副作用
 
-- setup がモデルを取得・準備する経路で適用されます。容量不足の場合は `fail()` で停止する経路があり、余裕が少ないだけなら警告して続行します（`setup.py:9249-9256`; family 固有の例: `setup.py:7613-7621, 8191-8199`）。
-- ダウンロード先の作成、モデルファイルの取得・hash 検証、完了マーク作成などが起こり得ます。指定先に書き込めない場合の挙動は処理段階により異なり、ディレクトリ作成やファイル書き込みが失敗する可能性があります。一般的な事前書き込み検査は見つかりません（`setup.py:9292-9325`; `metal/setup_mac.py:440-452`）。
-- macOS では通常 parser より前に `metal/setup_mac.py` へ委譲されます。同ファイルでも `--models-dir` を定義し、同様に `data/models` を既定にします（`setup.py:8418-8419`; `metal/setup_mac.py:342, 367`）。Mac の GGUF 経路は指定ディレクトリ内にモデル別フォルダーを作ります（`metal/setup_mac.py:438-442`）。
-- `--update` も同じ引数 parser を使いますが、`update_install()` は既存インストールの更新処理です。全ての更新処理が `--models-dir` を消費するとは確認できず、モデル再取得が発生する場合の実際の保存先は処理経路に依存します（呼び出し: `setup.py:8617-8619`）。
+このオプションは setup 時のモデルファイル配置に作用する。通常経路ではディスク空き容量を配置先で確認し、不足すれば setup を失敗させる。必要になった配置先ディレクトリは作成され、モデルのダウンロードや変換・準備ファイルの書き込みが行われる場合がある。低 RAM 用の expert コピー先はデータフォルダの `packs` であり、`--models-dir` とは別に空き容量を確認する。
+
+Mac では `terminal/setup.py` が引数を `engine/metal/setup_mac.py` に転送する。Mac 側も `--models-dir` を受理し、省略時にデータフォルダの `models` を使う。通常モデルはその下にモデル別ディレクトリを作る。
 
 ## 出力とエラー
 
-- ダウンロード時には保存先を表示し、空き容量不足で失敗する場合は `--models-dir` または `--data-dir` で容量の大きい場所を使うよう案内します（`setup.py:9250-9256, 9292-9296`）。
-- ダウンロード中にディスク書き込みエラーが起きると、部分取得情報を保存して `fail()` により終了する経路があります（`setup.py:2587-2597`）。無効なパス文字列や書き込み不能パスに対する統一的なエラー文言・終了経路は確認できません。
+空き容量が不足した場合、通常の setup は不足している配置先と必要量・空き容量を含むエラーを出し、別の `--models-dir` を選ぶよう案内する。ダウンロード中の書き込み失敗では partial ファイルの再開情報を保存し、空き容量を確保するか別の `--models-dir` を選んで再実行するよう案内する。ディレクトリ作成やアクセス拒否など、これ以外の OS エラーの表示・終了経路はこの調査では特定できなかった。
 
 ## 根拠
 
-- `setup.py:8488` — 通常 parser の定義。
-- `setup.py:8602-8612, 8684-8695` — 既定値決定、単純起動と別モデル選択時の扱い。
-- `setup.py:9197-9256, 9285-9325` — GGUF / ready-made pack の探索、容量確認、取得、検証。
-- `setup.py:7859-7862, 9309-9319, 9326-9335, 9341-9356` — 共有ファイル、付随ファイル、別データ領域への出力。
-- `setup.py:2587-2597` — ダウンロード時の書き込み失敗経路。
-- `setup.py:8418-8419`; `metal/setup_mac.py:342, 367, 438-452` — macOS 委譲、parser と配置先処理。
-
-調査対象は上記 commit の checkout 内ソースです。CLI help は実行していません。配布済み実行環境ごとの挙動や、OS ごとのパス・権限エラーの詳細は確認していません。
+- `terminal/setup.py:11434-11437` — macOS の通常 root setup を `engine/metal/setup_mac.py` に委譲する条件と引数転送。
+- `terminal/setup.py:11510-11518` — root parser の `--models-dir` 宣言と説明（GGUF の保存先、既定は data folder の `models`）。
+- `terminal/setup.py:11680-11691` — setup 経路での `data / "models"` 既定値の設定。
+- `terminal/setup.py:12295-12312` — ready-made pack と通常 GGUF での配置先・shard パス構築、および別ルート検索。
+- `terminal/setup.py:2741-2757` — 空き容量確認時の配置先ディレクトリ作成と不足時の失敗情報。
+- `terminal/setup.py:3307-3310` — ダウンロード書き込みエラー時の再開情報保存と案内。
+- `terminal/setup.py:3886-3890` — ready-made pack のルート下に配置パスを構築する処理。
+- `engine/metal/setup_mac.py:386-390`, `414-415`, `497-501` — Mac parser、既定の models root、通常モデルの配置先。
+- `docs/cli/README.md:1661-1698` — `source-setup` の root scope と `--models-dir` の索引項目。

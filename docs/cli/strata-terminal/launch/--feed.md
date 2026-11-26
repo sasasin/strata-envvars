@@ -1,6 +1,6 @@
-# `--feed`
+# `strata launch --feed`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,54 +8,53 @@
 | コマンド | `strata launch` |
 | オプション | `--feed` |
 | 別名 | なし |
-| 値 | `URL|DIR`。署名付き更新フィードの URL またはローカルのディレクトリ／ファイルを指定 |
+| 値 | `URL|DIR`。署名済み更新 feed の URL またはフォルダー。parser では文字列として受け取る。 |
 
 ## 役割
 
-`strata launch` が起動に必要な推論エンジンを取得するときに参照する更新フィードを指定します。通常の起動で、使用可能なエンジンが既にあり更新も不要なら、この値はそのエンジン確認経路では使われません。エンジンが未導入または古い場合、launch は `strata update --no-control --output jsonl` を子プロセスとして実行し、指定されたフィードを渡します。対話画面での起動にも同じ値が引き継がれます。（`strata_cli/launch/cmd.py:139,706-716,780-783`; `strata_cli/launch/runner.py:546-568`; `strata_cli/launch/app.py:438-455`）
+エンジンやモデル形状専用エンジンを取得・更新するときに参照する署名済み feed を指定する。起動コマンド内ではこの値が `strata update`、形状専用エンジン取得処理、起動計画の feed 照会、およびモデル設定を行う `setup.py` に渡される。利用できるエンジンがすでにあり更新も不要なら、通常のエンジン確認経路は feed を読まずに進む。
 
 ## 使い方
 
 ```sh
-strata launch --model iq3_xxs --feed https://updates.example.invalid/strata-feed.json --no-tui
+# 指定した feed を使った起動計画を表示する（feed の照会が必要な計画ではネットワークアクセスが発生する）
+strata launch --plan --family qwen --model q2_0 --feed https://updates.example/strata-feed.json
 ```
 
-`--feed` 自体はフィードを取得しません。上の例では launch がエンジンの確認・取得を必要とした場合に使われます。HTTPS URL、ローカルの feed ファイル／ディレクトリを渡せます。URL が `.json` で終わらない場合は末尾に `/strata-feed.json` を付け、ローカルのディレクトリにも `strata-feed.json` を加えて読みます。フィード本体と隣接する `.sig` ファイルが必要です。（`strata_control/feed.py:342-360`）
+`URL|DIR` は parser の表示上の値形式であり、実際の URL やディレクトリの妥当性は後続の feed 読み込み処理が扱う。
 
 ## 値と既定値
 
-parser は `--feed` に `URL|DIR` という metavar を表示しますが、型変換や値検証は行わず、文字列を `None` 既定で受け取ります。同じオプションを複数回指定した場合、argparse の通常の `store` 動作により最後の値が残ります。（`strata_cli/launch/cmd.py:139`）
-
-launch が指定値を受け取った場合、runner はエンジン更新コマンドにその値を `--feed` として転送します。明示値がない場合のフィード選択は、update 側で `STRATA_UPDATE_FEED`、端末に記録された前回の feed source、プロジェクト既定 URL `https://github.com/Niko1221/Strata/releases/latest/download/strata-feed.json` の順です。空文字列は parser では受理されますが、launch と update のどちらも真偽値で判定するため明示指定として扱わず、この既定選択に進みます。（`strata_cli/launch/runner.py:561-569`; `strata_cli/update_cmd.py:23-26,87-95`）
-
-受理される場所は HTTPS、loopback の HTTP、`file:` URL、またはファイル／ディレクトリのパスです。通常の HTTP は loopback 宛てか `STRATA_ALLOW_HTTP=1` の場合に限り許可されます。URL scheme が未対応の場合や URL policy に反する場合は転送層が拒否します。（`strata_control/transfer.py:65-86`; `strata_control/feed.py:342-360`）
+- `--feed` は値を1つ取る。`argparse` 登録に `type`、`choices`、独自 validator はなく、空文字列も parser 自身では拒否しない（`terminal/strata_cli/launch/cmd.py:153`）。
+- 省略時、まず `STRATA_UPDATE_FEED` が使われる。その環境変数もなければ、`strata update` が記憶済みの HTTPS feed を使い、利用可能な記憶値がなければプロジェクトの既定 feed を選ぶ（`terminal/strata_cli/launch/runner.py:1094-1106`、`terminal/strata_cli/update_cmd.py:33-45,142-151`）。
+- CLI 値が空文字列の場合は `self.feed` が偽となり、CLI 値なしとして環境変数・既定値へ進む（`terminal/strata_cli/launch/runner.py:1094`）。複数回指定時の扱いは Strata 独自に定義されておらず、`argparse` の通常の単一値引数として最後に解析された値が残る。
 
 ## 実行時の動作
 
-通常エンジン経路では、利用可能な engine が見つかり、古い engine 判定にも該当しなければ `ensure_engine()` はそこで終了し、feed は参照しません。必要な場合は feed を明示した更新子プロセスを起動します。更新結果は JSONL で読み取られ、進捗・警告が launch のイベントに反映されます。（`strata_cli/launch/runner.py:546-568,575-595`）
+`strata launch` の parser は値を `run_launch` に渡し、対話画面経路には `feed` として、非対話経路には `Runner` の `feed` として渡す。`--plan` でも計画処理に渡され、画面または計画で必要な tuned drafter の有無を feed に照会する（`terminal/strata_cli/launch/cmd.py:870-877,897-899,945-948`、`terminal/strata_cli/launch/app.py:127-128,162-172`）。
 
-DeepSeek 用の専用 engine には別の更新経路があります。明示的な `STRATA_DSV41_EXE` または `--dsv41-package` の指定がなく、検出された実行ファイルが `engine-dsv41` 配下にある場合、feed を選び、source が到達可能なら更新を試みます。例外や到達不能は launch を止めず、既存 engine を使います。（`strata_cli/launch/runner.py:1896-1915`）
+通常エンジンの確認では、利用可能なエンジンがありモデルに必要な最低版を満たす場合、そこで戻るため feed は参照されない。エンジンがない、または古い場合は、`--feed` があればその値を `strata update --no-control --output jsonl` に付けて子プロセスを起動する。指定がなければ子プロセスが環境変数・記憶値・プロジェクト既定値を解決する（`terminal/strata_cli/launch/runner.py:1077-1107`、`terminal/strata_cli/runner.py:1263-1269`）。
 
-feed の取得後、Strata は信頼鍵で署名を検証し、JSON/schema、channel、有効期限、端末に記録された sequence より古くないことを確認します。これらは `--feed` 値自体の検証ではなく、読み込んだ feed の検証です。（`strata_control/feed.py:312-339`; `strata_control/updater.py:355-366`）
+モデル固有の形状エンジンが必要な場合は、CLI 値または `STRATA_UPDATE_FEED` を feed source として直接解決し、その feed から対応エンジンを確保する（`terminal/strata_cli/launch/runner.py:1231-1248`）。通常エンジンの取得後にモデル用 `setup.py` を呼ぶ経路では、明示した `--feed` を `setup.py --feed` として転送する。環境変数は子プロセス環境にも引き継がれる（`terminal/strata_cli/launch/runner.py:1033-1043,1412-1413`）。
 
 ## 適用条件と副作用
 
-このオプションは起動設定や preset に保存されず、launch の runner に渡される feed source です。エンジン取得が必要ならネットワークまたはローカル feed を読み、更新処理が選択した engine package をダウンロード・検証・導入することがあります。feed の URL／パスは信頼鍵による署名検証を迂回しません。（`strata_cli/launch/cmd.py:715`; `strata_cli/launch/runner.py:561-575`; `strata_control/feed.py:312-360`）
-
-`--plan` は計画表示後に終了する分岐であり、`runner.run()` に進まないため、このエンジン取得経路を実行しません。（`strata_cli/launch/cmd.py:733-760,784-787`）
+- feed のネットワーク照会・ダウンロードは、起動時にエンジンが未導入または古い場合、形状エンジン確認時、または計画・画面が feed 掲載の tuned drafter を確認するときに起きる。通常エンジンが利用可能で必要版を満たす場合は feed を使った更新を行わない（`terminal/strata_cli/launch/runner.py:1087-1107`）。
+- ダウンロードされたエンジンは `strata update` / 形状エンジン管理処理が署名等を検証して導入する。`--feed` 自体は署名検証を無効化するオプションではない（通常更新経路: `terminal/strata_cli/update_cmd.py:33-35`、形状エンジン経路: `terminal/strata_control/shape_engine.py:290-295`）。
+- ローカルフォルダーや loopback feed は一回限りのテスト feed として扱われ、記憶 feed として次回へ持ち越さない。通常更新の記憶値として許されるのは HTTPS URL（`terminal/strata_cli/update_cmd.py:148-158`）。
+- feed にこの PC 向けエンジンがない場合、更新コマンドが成功終了しても起動側はエンジン未導入を警告として扱う。モデルのダウンロードを続ける前に確認する経路があり、`--yes` では質問を省略する（`terminal/strata_cli/launch/runner.py:1148-1154,1271-1287`）。
 
 ## 出力とエラー
 
-エンジン取得を行ったとき更新処理が非 0 で終わると、launch は `LaunchError`（code 6）を返し、「The engine could not be installed.」と、可能なら子プロセスの最後のエラー内容を含めます。通常出力では `strata: ...` を stderr に出し、`--output json` ではエラー code と message を含む JSON を stdout に出します。指定フィードを読めない場合、更新側の feed 転送エラーは code 6 として launch に伝わります。（`strata_cli/launch/runner.py:617-629`; `strata_cli/launch/cmd.py:630-641,784-787`; `strata_control/feed.py:355-358`; `strata_cli/update_cmd.py:225-230`）
-
-署名が信頼されない、feed が壊れている、channel／期限／sequence 条件を満たさない場合も feed 検証で拒否されます。エラー文言や終了 code は失敗の種類に依存します。（`strata_control/feed.py:312-339`; `strata_cli/update_cmd.py:225-230`）
+- 通常エンジン取得の子 `strata update` が非0で終わると、起動は `LaunchError`（終了コード `6`）にし、feed の指定先を見直す案内を表示する（`terminal/strata_cli/launch/runner.py:1155-1167`）。
+- 形状エンジンが取得できない場合は理由を警告として記録し、モデルをダウンロードするかの確認へ進み得る（`terminal/strata_cli/launch/runner.py:1240-1246,1271-1287`）。
+- `--plan` は人向け出力に「Nothing was changed.」を表示するが、feed に tuned drafter の有無を尋ねる計画経路では読み取りのための照会は行う（`terminal/strata_cli/launch/cmd.py:897-925`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:139` — `--feed` parser 定義と help 表示。
-- `strata_cli/launch/cmd.py:706-716,780-787` — 対話式／通常 launch への feed 引き渡し、計画分岐、失敗表示。
-- `strata_cli/launch/runner.py:546-568,575-629` — engine 状態に応じた update 子プロセスへの転送と失敗処理。
-- `strata_cli/update_cmd.py:23-31,87-95,197-230` — feed の既定値、優先順位、update 側の選択とエラー処理。
-- `strata_control/feed.py:312-360` — 署名・feed 条件の検証、feed と署名ファイルの取得。
-- `strata_control/transfer.py:65-86,159-187` — source 種別、HTTP policy、feed ファイル読み込み。
-- `strata_cli/launch/runner.py:1896-1915` — DeepSeek 専用 engine の条件付き更新。
+- `terminal/strata_cli/launch/cmd.py:153` — `--feed` の parser 定義、値形式、help。
+- `terminal/strata_cli/launch/cmd.py:870-877,897-899,945-948` — 対話画面・`Runner`・計画への値の受け渡し。
+- `terminal/strata_cli/launch/runner.py:1033-1043,1077-1107` — 環境の引き継ぎ、通常エンジンの適用条件、子 `strata update` への転送。
+- `terminal/strata_cli/update_cmd.py:33-45,142-158` — プロジェクト既定値、feed の優先順位、記憶可能な値。
+- `terminal/strata_cli/launch/runner.py:1148-1167,1231-1248,1271-1287,1412-1413` — 更新失敗、形状エンジン、未導入時の処理、モデル設定処理への転送。
+- `terminal/strata_control/shape_engine.py:290-295` — 形状エンジン取得時の検証・導入処理。

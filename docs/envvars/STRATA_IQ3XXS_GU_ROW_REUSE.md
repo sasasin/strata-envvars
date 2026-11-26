@@ -1,46 +1,54 @@
 # `STRATA_IQ3XXS_GU_ROW_REUSE`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL の IQ3_XXS grouped expert gate/up 計算で、連続する 2 行をまとめて計算する row-reuse kernel を選びます。この kernel は各行の重みを別々に処理しつつ、同じ入力 activation の読み込み・展開を 2 行で共有します。設定が無効、または適用条件を満たさない場合は通常の lane kernel へ進みます（`sycl/src/kernels/cuda/iq_kernels.dp.cpp:4720-4765,4768-4819,4873-4896,5014-5026`）。
+SYCL grouped expert の IQ3_XXS gate/up 計算で、通常の grouped kernel の代わりに 2 行をまとめて計算し、行データの再利用を行う kernel を選ぶ制御です。IQ3_XXS は `TG == 18` としてこの分岐に入ります。選ばれる kernel は gate/up の浮動小数点出力を書きます。環境変数がモデル形式や expert の選択自体を変える処理はありません。読み取りと選択は `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:5895-5909`、2 行の計算と出力先は同ファイル `:4374-4425` にあります。
+
+この変数を読むコードは SYCL kernel のみです。CUDA/HIP 側の IQ3_XXS kernel に同名の読み取りはありません（候補名の全参照検索で確認）。
 
 ## 値と判定
 
-判定は `strata::bm_default_on()` が行います。値が未設定または空文字なら、既定値引数 `true` と GPU 世代判定の結果を使い、Battlemage では有効、それ以外では無効です。空でない値は文字列全体を parse せず、先頭文字だけを見ます。先頭文字が `0` なら無効、それ以外なら有効です（`sycl/include/strata/sycl_queue.hpp:159-166`）。
+読み取りは `bm_default_on(name, device)` に委譲されます。同 helper は `getenv` の結果が null でなく、かつ先頭文字が NUL でない場合に、先頭文字が `'0'` かどうかだけを判定します。文字列全体の parse、数値妥当性、大文字小文字、空白の除去は行いません。未設定または空文字なら Battlemage 判定に基づく既定値へ進みます（`engine/sycl/include/strata/sycl_queue.hpp:193-200`）。
 
-| 環境変数の値 | helper の判定 | 呼び出し側での結果 |
-|---|---|---|
-| 未設定 | Battlemage なら有効、それ以外は無効 | Battlemage の条件を満たす場合だけ row-reuse 候補 |
-| 空文字 | 未設定と同じ。Battlemage なら有効 | 同上 |
-| `0` または `0` で始まる文字列 | 無効 | 通常の lane kernel |
-| `1`、`true`、空白で始まる文字列など、`0` 以外で始まる非空文字列 | 有効 | ただし呼び出し側の Battlemage 等の条件も必要 |
+| 条件 | unset | 設定時に reuse 判定が ON | 設定時に reuse 判定が OFF |
+|---|---|---|---|
+| SYCL grouped expert IQ3_XXS。通常の `STRATA_GRID_SLM=0` ビルド | Battlemage は ON、それ以外は OFF | 空でない値の先頭文字が `0` 以外（例: `1`, `true`, `false`, ` 1`, `2tail`） | 空でない値の先頭文字が `0`（例: `0`, `0anything`, `00`） |
 
-数値変換、空白除去、大文字小文字変換、文字列全体の妥当性検査はありません。したがって `false` も helper 上は有効判定です。明示値がある場合も、実際の row-reuse 選択は後述の条件で絞られます。
+空文字は unset と同じ既定判定です。したがって `false` は先頭文字が `f` のため ON、`0anything` は後続文字を読まず OFF です。明示値による helper の判定が ON でも、後述の Battlemage 条件などを満たさないと kernel は選ばれません。
 
 ## 有効になる条件
 
-次の条件をすべて満たす経路で使われます。
-
-- SYCL CUDA-port kernel の `STRATA_GRID_SLM` が 0。1 の場合は `#if !STRATA_GRID_SLM` 節ごとコンパイル対象外となり、この環境変数を読むコードもありません。ソース内の既定値は 0 です（`sycl/src/kernels/cuda/iq_kernels.dp.cpp:452-456,4873-4888`）。
-- grouped expert の gate/up 型が `18`（IQ3_XXS）で、8 lanes の `launch_gu_port` specialization に入ること。既定 lane 数 `STRATA_EXPERT_LANES` は 8 で、lane 数は `STRATA_GU_LANES` で実行時に選べます（`sycl/src/kernels/cuda/iq_kernels.dp.cpp:957-961,4855-4864,4873-4896`）。
-- helper の結果が有効で、デバイス世代が Battlemage、旧 kernel (`g_old_kernels`) が無効、multi-entry split (`g_split_multi`) が無効であること（`sycl/src/kernels/cuda/iq_kernels.dp.cpp:4873-4888`）。
-
-Battlemage 以外では、環境変数を `1` や別の非ゼロ先頭文字にしても呼び出し側の世代条件を通らず、row-reuse は選択されません。lane 数が 4/16/32 の場合も対象 specialization には入らないため、この変数はそこでは評価されません（`sycl/src/kernels/cuda/iq_kernels.dp.cpp:4917-4927,4873-4888`）。
-
-関連する `STRATA_EXPERT_ROW_E3` は row-reuse kernel 内の 3-entry tail 処理を制御します。既定では無効で、明示的な非空値が `0` 以外で始まると有効になります。IQ3_XXS ではこの設定が有効だと 3-entry tail 用 kernel variant を使い、その旨を stderr に記録します（`sycl/src/kernels/cuda/iq_kernels.dp.cpp:4822-4853`）。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp` の `STRATA_GRID_SLM` が 0 でコンパイルされている必要があります。1 の場合は対象分岐が `#if !STRATA_GRID_SLM` で除外されます。同ファイルは未定義時に 0 とします（`:484-489`, `:5895-5910`）。
+- grouped expert の gate/up が IQ3_XXS（`L.gu_type == 18`）として `launch_gu` へ到達する必要があります。形式別 dispatch は同ファイル `:7874-7878`、IQ3_XXS の型番号は `:1393` にあります。
+- grouped lane 経路で 8 lanes/row（テンプレートの `LN == 8`）が選ばれる必要があります。lane 数は `STRATA_GU_LANES`、コンパイル時の `STRATA_EXPERT_LANES`（未定義時 8）で決まり、IQ split 形式では `STRATA_KQ_GU_LANES` が設定されていればそちらが使われます。受理される lane 値は 4, 8, 16, 32 で、不正値は compile-time default に戻ります（同ファイル `:1175-1180`, `:4478-4488`, `:4515-4518`, `:5940-5949`）。
+- `STRATA_OLD_IQ_MMVQ` が有効でなく、`STRATA_EXPERT_SPLIT` が有効でないことが必要です。どちらかが有効ならこの reuse 分岐を通らず、旧 kernel または multi kernel 経路になります（同ファイル `:3931-3938`, `:5897-5908`, `:6053-6067`）。
+- 実行 device は Battlemage でなければなりません。`bm_default_on` は明示値で helper 判定を上書きできますが、reuse 分岐には別途 `intel_gpu_gen(...) == Battlemage` の条件があります。したがって他世代の SYCL GPU で `=1` を指定してもこの kernel は選ばれません（同ファイル `:5897-5900`; helper は `engine/sycl/include/strata/sycl_queue.hpp:193-200`）。
+- 通常の expert grouped dispatch で gate/up を実行する必要があります。`g_exp_phase == 2` では gate/up を実行しません。また `fused_gu_sycl` が選ばれる実行では fused kernel を使い、この通常 dispatch 内の reuse 分岐を通りません（同ファイル `:7797-7819`）。
 
 ## 実行時の詳細
 
-`launch_gu_port<TG, LN>` の `TG=18, LN=8` specialization で helper を最初に評価した結果は `static const bool` に保存されます。同一プロセスで以後環境を書き換えても再評価されません。選択されると stderr に `strata: IQ3_XXS raw two-row GU reuse enabled (8 lanes, SIMD16)` を一度出し、`launch_gu_row_reuse<18>()` を起動して通常の `native_gu_kernel` を迂回します。条件が成立しない場合は通常の `native_gu_kernel<TG,LN,KM>` が起動されます（`sycl/src/kernels/cuda/iq_kernels.dp.cpp:4873-4896`）。
+`launch_gu_port<TG,LN,KM>` の `TG == 18`, `LN == 8` specialization で初めて該当箇所に到達したとき、関数内 `static const bool` を初期化します。値判定は specialization ごとにキャッシュされ、プロセス中に環境を変更しても再評価されません。`KM` の true/false は別 specialization です。static 初期化に渡す device は最初の呼び出しの device であり、この bool 自体は device ごとの map ではありません（同ファイル `:5895-5899`、helper `engine/sycl/include/strata/sycl_queue.hpp:196-200`）。
 
-row-reuse kernel は 64 個の出力 row slot を扱う work-group 内で、各 lane group が `row0` と `row0+32` の 2 行を用意します。各 expert group・各 sub-block について入力 activation の整数表現と scale を一度作り、それぞれの重み行との積を計算して gate または up の出力に書きます（`sycl/src/kernels/cuda/iq_kernels.dp.cpp:4774-4819,4720-4765`）。
+reuse 条件が成立すると `launch_gu_row_reuse<18>` を呼び出して通常 kernel を return します。kernel は 8 lanes を 1 row に割り当て、work item ごとに 2 行分の weight row を処理し、各 expert entry の結果を gate/up の該当バッファへ書きます。entry は 4 件単位で処理し、残りは 3（`STRATA_EXPERT_ROW_E3` が有効な場合）、2、1 件に分けます（同ファイル `:4374-4425`, `:4428-4459`）。reuse 条件が成立しない場合は `native_gu_kernel` を使う通常経路へ続きます（同ファイル `:5895-5918`）。
 
-ここに示した有効ログ以外に、この環境変数が無効・条件不成立のとき専用の警告やエラーを出す処理はありません。その場合のコード経路は通常 lane kernel です。カーネル起動後のエラー確認は共通の `check("native_expert_grouped/gu")` を通りますが、この環境変数固有の失敗メッセージや終了動作は確認できません（`sycl/src/kernels/cuda/iq_kernels.dp.cpp:4876-4896,6126-6135`）。
+## ログと測定値
+
+reuse kernel を選んだ最初の呼び出しでは stderr に次の行を出します。C++ の関数内 static により、その specialization につき 1 回です。
+
+```text
+strata: IQ3_XXS raw two-row GU reuse enabled (8 lanes, SIMD16)
+```
+
+`STRATA_EXPERT_ROW_E3` により 3-entry tail kernel も選択された場合、`launch_gu_row_reuse` 側からさらに `strata: IQ3_XXS exact three-entry row reuse enabled` が stderr に出ます。通常 kernel に戻る場合、この reuse 固有ログは出ません。対象変数の無効値に対する専用警告やエラーはありません（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4437-4444`, `:5897-5906`）。
+
+この変数に対する性能測定値は、参照した現行 Strata ソース内では確認できません。近接する `STRATA_GRID_SLM` コメントの計測値は別の機能についての記述であり、ここには転用していません（同ファイル `:484-489`）。
 
 ## 根拠
 
-- 候補一覧には名前があります（`docs/envvars/000_envvers.md:1329`）。実装上の環境読み取りは `sycl/src/kernels/cuda/iq_kernels.dp.cpp:4875` の 1 箇所で、値判定 helper は `sycl/include/strata/sycl_queue.hpp:159-166` です。
-- grouped expert dispatch と IQ3_XXS 型の分岐は `sycl/src/kernels/cuda/iq_kernels.dp.cpp:6048-6075,6126-6135` にあります。
-- `docs/INTEL.md:518-540` は Battlemage での既定有効と row reuse の対象を説明しています。ここでは速度値を挙げず、実行条件と挙動は対象 commit のコードを根拠にしています。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:5895-5918` — 環境変数 helper 呼び出し、Battlemage・旧 kernel・split 条件、reuse kernel と通常 kernel の分岐。
+- `engine/sycl/include/strata/sycl_queue.hpp:193-200` — helper の値判定と未設定時の Battlemage default。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4374-4459` — 2 行 reuse kernel、gate/up への出力、E3 分岐とログ。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:1175-1180`, `:4478-4488`, `:4515-4518`, `:5940-5949` — lane 数の compile-time default、環境変数による選択、許容 lane 値。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:3931-3938`, `:6020-6067`, `:7797-7819`, `:7874-7878` — 旧 kernel / split / fused / expert type dispatch の条件。

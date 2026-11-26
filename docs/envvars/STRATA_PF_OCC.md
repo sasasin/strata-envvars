@@ -1,46 +1,46 @@
 # `STRATA_PF_OCC`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。対象は Strata 所有ソース。外部ライブラリやGPUドライバーが読む環境変数の動作は含めない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP版の融合prefill expertカーネルで、WGP（gfx11では2 CUをまとめた単位）あたりの永続グリッドのブロック数を上書きする実験用設定です。対象カーネルは複数のwork itemをグリッド内の各ブロックが繰り返し処理するため、ここで指定する数は処理タイル数そのものではなく、同時に用意するブロック数の上限です。
-
-この変数は `STRATA_PF_FUSED` などにより融合prefill経路が選ばれた後のグリッド計算に関与します。CUDAビルドでは読み取られません。
+HIP の fused prompt-expert kernel が使う persistent grid の上限を、WGP あたりの block 数で指定する実験用設定です。値が正なら occupancy API から得た既定 block 数の代わりにその値を使います。変わるのは gate/up と down の grid 上限で、タイル数、kernel の算術処理自体を切り替える設定ではありません。Q2_0 pack の gfx11 kernel と native pack の HIP kernel が読み取り、Qwen3.6 用 native pack copy にも同じ native 実装が含まれます（`engine/src/prefill/moe_fused.cu:635-647,771-789`; `engine/src/prefill/moe_fused_iq.cu:2813-2825,3774-3780`; `engine/src/prefill/moe_fused_iq_q36.cu:1-6,33-37,168-175`）。
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換し、変換結果が正の場合に限り指定値を使います。文字列全体の妥当性検査や範囲 clamp はありません。
+読み取りは `std::getenv` の戻り値を `std::atoi` に渡し、結果が `> 0` かを判定します。文字列全体の数値検証はありません。未設定は `0` 扱い、空文字・数値に変換できない文字列も `atoi` が `0` を返すため既定値に戻ります。先頭の空白と符号は `atoi` の整数変換規則に従い、数値の後ろにある非数字は変換を止めます。大文字小文字の比較はありません（`engine/src/prefill/moe_fused.cu:641-647`; `engine/src/prefill/moe_fused_iq.cu:2819-2825`）。
 
-| 値 | ブロック数/WGP |
-|---|---|
-| 未設定 | occupancy query の値を使い、`2 * max(occ, 1)` |
-| 正の整数に変換される文字列 | 変換された整数 |
-| 空文字、非数値、ゼロ、負数 | 既定計算 `2 * max(occ, 1)` |
+| 条件 | unset / 空文字 | 有効になる値（例） | 既定値へ戻る値（例） |
+|---|---|---|---|
+| HIP の `wgp_blocks()` を使う経路 | unset は `env=0`。空文字も `atoi` が `0` | `1`, `2`, `+3`, ` 4`, `5anything` は正の整数として変換され、その数を使用 | `0`, `0anything`, `-1`, `true`, `  ` は `env <= 0` となり既定値を使用 |
+| CUDA build | この名前の読み取り箇所なし | 該当なし | 該当なし |
 
-`atoi` のため、たとえば `3tail` は `3`、`tail3` は `0` として扱われます。先頭の空白と符号は `atoi` の整数変換規則に従います。大きすぎて `int` に収まらない値の結果は移植可能な動作として保証されないため、利用可能な上限値とはみなしません。
-
-指定値はグリッド上限の計算に使われ、各launchの実際のgridは `min(タイル数に基づく上限, multiprocessor数 × 指定ブロック数)` です。したがって小さいworkloadでは指定値までブロックが作られないことがあります。
+正値は grid の block 上限に使われますが、実際の grid は `min(処理 tile 数, device の multiprocessor 数 × block 数)` です。したがって値を増やしても、処理 tile 数を超える grid にはなりません。`atoi` の整数範囲を超える文字列の結果はこのコードでは検査・規定していません（`engine/src/prefill/moe_fused.cu:778-781`; `engine/src/prefill/moe_fused_iq.cu:3774-3777`）。
 
 ## 有効になる条件
 
-- `__HIPCC__` でコンパイルされた経路であること。CUDA側の occupancy grid は `d.sms * d.occ_*` で計算され、`STRATA_PF_OCC` の参照はありません。
-- 対象の融合expertカーネルが実行されること。HIP側の `moe_fused` はgfx11 WMMA経路であり、IQの融合経路も対応するgfx11/gfx12 native kernel等が利用可能であることを確認してから呼ばれます。
-- IQ native経路では、型によって `occ_gu` / `occ_d` が真になる場合、グリッド上限は `STRATA_PF_OCC` ではなく `occ_blocks(...)` の値で決まります。現在のコードではgate/upのIQ2・IQ3・IQ4_XSと、downのQ2_0・Q8_0・IQ4_NLが該当し、`STRATA_PF_OCC_W` の正値による上書きがなければ、通常は4、gfx12のgate/up IQ2_S・IQ2_XSは3です。`STRATA_W_NO_OCC` ビルドではこれらの専用variantを無効にするため、`wgp_blocks()` 側の設定が使われます。
-- `STRATA_PF_FUSED` 等によって該当形式とデバイスで融合prefill自体が有効にならなければ、この値は実行結果に影響しません。通常のMMQなど別経路のgrid設定には使われません。
+- **HIP build であること。** `wgp_blocks()` とその環境読み取りは `#if defined(__HIPCC__)` 内だけにあります。CUDA 側の `experts()` は occupancy API の `d.occ_gu` / `d.occ_d` をそのまま grid に使い、この名前を読みません（`engine/src/prefill/moe_fused.cu:635-648,779-789`; native pack の HIP/CUDA build も同ファイル `:2813-2825,2847-2886`）。HIP build の fused prompt kernel source には両実装と Qwen3.6 copy が含まれます（`engine/cmake/backends/hip.cmake:30-42`）。
+- **Q2_0 pack:** gfx11 WMMA 対応 device で `dev_info()` が kernel 属性と occupancy を確認し、`d.cc` が利用可能を示す必要があります。そこで `experts()` に進む場合、gate/up と down の grid にこの値が使われます。HIP の gfx12 ではこの Q2_0 pack kernel の対象条件を満たしません（`engine/src/prefill/moe_fused.cu:660-675,771-783`）。
+- **Native pack:** `dev_info()` が gfx11 または gfx12 の WMMA 対応 kernel を確認して `d.ok` を立て、上流が当該層を native fused 経路に選ぶ必要があります。上流の選択には `STRATA_PF_FUSED` / `STRATA_PF_FUSED_NATIVE`、layer format、stream-all、MMQ/fused-only 状態なども関与します。この変数単独で native 経路を有効にはしません（`engine/src/prefill/moe_fused_iq.cu:2858-2885,3415-3432`; `engine/src/prefill/prefill.cpp:5692-5704`）。
+- Native pack のうち `occ_gu` / `occ_d` が true の occupancy variant は `occ_blocks()` を使うため、`STRATA_PF_OCC` はその grid に適用されません。通常の variant は `wgp_blocks()` を使います。`STRATA_PF_KQ_OCC=1` は K-quant の対象 kernel を occupancy variant に含めます。`STRATA_W_NO_OCC` build では occupancy variant 自体を止めるため、該当 grid は `wgp_blocks()` 側になります（`engine/src/prefill/moe_fused_iq.cu:2832-2845,3754-3777`）。
+- Qwen3.6 native copy は `moe_fused_iq.cu` を別 namespace で include し、同じ native `wgp_blocks()` 判定を持ちます。Qwen3.6 の該当 fused 呼び出しは `experts_native_ext()` 経由です（`engine/src/prefill/moe_fused_iq_q36.cu:33-37,148-175`; caller `engine/src/qwen35/q36_engine.cu:2966`）。
 
 ## 実行時の詳細
 
-各ファイルの `wgp_blocks()` 内で関数ローカル `static const` として最初の呼び出し時に一度読みます。そのプロセスで初回評価した後に環境を書き換えても再評価されません。値はexpert計算のgate/upとdownのgrid計算に渡されます。CPU側のgrouping gridや活性値のquantize gridには使われません。
+環境値はプロセス起動時ではなく、各コンパイル済み `wgp_blocks()` の最初の呼び出しで関数内 `static const int` として一度読み、以後そのコピー内で cache します。Q2_0 pack、通常の native pack、Qwen3.6 copy は別 translation unit / include copy なので、それぞれ独立した static cache を持ちます。読み取り後にプロセス環境を書き換えても、その cache の値は更新されません（`engine/src/prefill/moe_fused.cu:641-647`; `engine/src/prefill/moe_fused_iq.cu:2819-2825`; Qwen3.6 の include は `engine/src/prefill/moe_fused_iq_q36.cu:33-37`）。
 
-通常の融合経路ではoccupancy queryが返すactive block数を2倍してWGPあたりの上限にします。ソースコメントは、このqueryがgfx11のWGPをmultiprocessorとして数えた際に、実際に並行実行できる2ブロックに対して1と報告する問題への補正と説明しています。コメント記載のgfx1151実験（20 WGP、8192 tokens、top 10、IQ3_S / IQ4_NL、1 layer）では、1/2/3/4 blocks per WGP の時間がそれぞれ60.7/44.7/49.9/45.2 msで、work itemと演算は同じと記録されています。これはソースコメント中の特定実験記録であり、他のGPUやモデルでの速度を示すものではありません。
+Q2_0 pack は grid 上限を `d.sms * wgp_blocks(d.occ_gu/occ_d)` とし、native pack は occupancy variant でない gate/up/down に `d.sms * wgp_blocks(d.occ)` を使います。いずれも処理 tile 数との小さい方を launch grid にします（`engine/src/prefill/moe_fused.cu:778-783`; `engine/src/prefill/moe_fused_iq.cu:3774-3780`）。Qwen3.6 copy も同じ式で native grid を作ります（`engine/src/prefill/moe_fused_iq_q36.cu:165-175`）。
 
-設定値による診断ログはありません。カーネル起動エラーがあれば各実装の通常のCUDA/HIPエラーチェック経路で扱われます。
+コードコメントには gfx1151（20 WGP）、8192 tokens × top 10、IQ3_S / IQ4_NL、1 layer の記録として、1/2/3/4 blocks per WGP でそれぞれ 60.7 / 44.7 / 49.9 / 45.2 ms とあります。また同じ work items と算術で結果は変わらないと記されています。これはソースコメント上の一条件の測定記録であり、今回実測した結果ではありません（`engine/src/prefill/moe_fused.cu:636-640`; native pack の同記述 `engine/src/prefill/moe_fused_iq.cu:2814-2818`）。
+
+## ログと測定値
+
+この変数の読み取り値や grid 上限を出す専用ログ・警告はありません。Q2_0 pack の launch 後に CUDA/HIP runtime error を検出すると、stderr に `prefill fused experts: experts: <error>` の形式で出して終了コード 1 になります（`engine/src/prefill/moe_fused.cu:37-41,791`）。Native pack は同様に `prefill fused experts (native): <処理名>: <error>` を出して終了コード 1 で終了します（`engine/src/prefill/moe_fused_iq.cu:68-72`）。上記の条件付き時間はソースコメントの記録です。`docs/DETAILS.md` にこの変数の追加測定値は見つかりませんでした。
 
 ## 根拠
 
-- `src/prefill/moe_fused.cu:581-594` — HIP限定の環境読み取り、正値の採用、既定値、gfx1151実験コメント。
-- `src/prefill/moe_fused.cu:606-622,652-673,705-725` — HIPデバイスのgfx11 WMMA適格性確認、融合経路の選択条件、WGP単位のgrid上限計算。CUDA側は別のgrid計算。
-- `src/prefill/moe_fused_iq.cu:988-1015` — IQ用 `wgp_blocks()` と、occupancy variant用の別設定 `STRATA_PF_OCC_W`。
-- `src/prefill/moe_fused_iq.cu:1027-1050,1067-1139,1148-1200` — HIP native kernelの適格性確認、融合経路の条件、型によるoccupancy variant選択とgrid計算。
-- `docs/DETAILS.md`、`docs/AMD_HIP.md`、`docs/STRIX_HALO.md` — `STRATA_PF_OCC` の値規則や独立した利用者向け説明は確認できなかった。性能値の記載には上記ソースコメントのgfx1151実験記録だけを用いた。
+- `engine/src/prefill/moe_fused.cu:635-647,660-675,771-791` — HIP 専用の値読み取り、device 条件、Q2_0 pack の launch grid とエラー処理。
+- `engine/src/prefill/moe_fused_iq.cu:2813-2825,2832-2845,2847-2886,3754-3780` — native pack の値読み取り、occupancy variant との分岐、HIP device 条件、launch grid。
+- `engine/src/prefill/moe_fused_iq_q36.cu:1-8,33-37,148-175` — Qwen3.6 copy と native launch。
+- `engine/src/prefill/prefill.cpp:5692-5704`; `engine/src/qwen35/q36_engine.cu:2966` — 通常 prompt / Qwen3.6 からの呼び出し条件。
+- `engine/cmake/backends/hip.cmake:30-42` — HIP build のソース登録。

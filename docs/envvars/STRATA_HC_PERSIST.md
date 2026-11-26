@@ -1,48 +1,51 @@
 # `STRATA_HC_PERSIST`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP ビルドで verifier の hyper-connection read を、通常の複数 kernel による read から 80-block persistent kernel に切り替えます。kernel は列方向に分割した down projection と up projection を一つの launch 内で処理し、途中に二つの grid barrier を置きます。加算順は通常経路と異なるため結果は bitwise 一致しません。
-
-この経路を試すのは verifier の read だけです。drafter の read は対象外です。`Verifier::init()` が各 GPU で初期化検査を呼び、検査を通った場合に限って後続の read で利用します（`src/core/verify.cpp:634-647,1228-1249`、`src/kernels/cuda/fused_gr.cu:2591-2599`）。
+GPU verifier の hyper-connection read について、通常の multi-kernel 読み取りの代わりに、複数ブロック常駐と grid barrier を使う persistent kernel を選ぶ opt-in 変数。実装は `engine/src/kernels/cuda/fused_gr.cu` にあり、`Verifier::init` でカードごとの事前確認を行い、verify window の read 時に条件を満たすと切り替える。drafter 側や、この変数が呼ばれない通常の read 経路を切り替えるものではない（`engine/src/core/verify.cpp:968-969,1796-1818`、`engine/src/kernels/cuda/fused_gr.cu:4831-4838`）。
 
 ## 値と判定
 
-環境変数の文字列全体は検証せず、C の `atoi()` で整数に変換します。空文字、数字で始まらない文字列は `0` 相当です。先頭の空白や符号の後の数字は変換され、数値以降の文字は無視されます。
+`env_on()` は `std::getenv` の結果を `std::atoi` に渡し、変換値が 0 以外なら opt-in とする。未設定・空文字・先頭が数値でない文字列は 0 となり無効。`atoi` は文字列全体の厳密な数値検証ではないため、先頭の空白や符号は許容され、数値部分の後ろは判定に使われない（例: `" 1x"` は有効、`"0anything"` と `"true"` は無効）。負の非ゼロ値も有効。`dp_on()` は同じ環境変数を別に `atoi` し、変換値がちょうど 3 のときだけ double accumulation 用 kernel を選ぶ（`engine/src/kernels/cuda/fused_gr.cu:5136-5140,5156-5158`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定、空文字、`0`、数字で始まらない値 | 無効 |
-| `atoi()` の結果が 0 以外（例: `1`, `-1`, `2`, `3`, `1abc`） | 有効化を試みる |
-| `atoi()` の結果がちょうど 3（例: `3`, `3abc`） | 有効化を試み、persistent kernel 内の部分和と二乗和を double で蓄積する参照モード |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| CUDA / HIP の persistent 実装がコンパイルされた場合 | 無効。通常 read に進む | `1`, `2`, `-1`, `1tail`。`3` は有効で、double accumulation kernel を選択 | 空文字、`0`, `0anything`, `true` |
+| persistent 実装がないビルド経路 | 関数 stub が常に無効を返す | なし | すべて。`fused_gr_persist_init()` は空、read は `false`（`engine/src/kernels/cuda/fused_gr.cu:5318-5320`） |
 
-有効判定と double 参照モード判定は別々の `static const` 値として初回評価時にキャッシュされます。したがって実行中に環境を変更しても再評価されません。`-3` のような負の非ゼロ値も機能を有効化しますが、double 参照モードにはなりません（`src/kernels/cuda/fused_gr.cu:2856-2873`）。
+数値の全体検証、上限・下限 clamp、無効文字列の警告はない。`atoi` の戻り値が 3 であること以外、非ゼロ値の大小で挙動は変わらない。CLI 引数や設定ファイルから値を上書きする読み取りは見つからなかった。
 
 ## 有効になる条件
 
-値が有効でも、以下の条件を満たさない GPU や read は通常経路に戻ります。
-
-- HIP コンパイル時だけ persistent 実装が存在します。非 HIP ビルドでは初期化関数は何もせず、read 関数は常に「未実行」を返します（`src/kernels/cuda/fused_gr.cu:2599,3029-3031`）。
-- GPU ordinal が 0..63 の範囲で、warp size が 32 であることが必要です。
-- gfx11 / gfx12 は barrier timeout に使う `s_memrealtime` がないため初期化時に無効化されます。
-- 起動時検査で、その GPU 上に 80 block が常駐でき、1..8 token の各サイズについて結果が通常 read と許容範囲内で一致する必要があります。利用可能な最大 token 数はこの検査で決まります。timeout や結果不一致より大きい token 数では default の read を使います。
-- read の `q8_down` または `q8_up` が非 null（`STRATA_HC_Q8` 経路）、あるいは対象 token のいずれかの `q8_mixed` が非 null（`STRATA_QFUSE` 経路）の場合は persistent read を使いません。
-
-初期化では `cudaMalloc` による workspace 確保も必要です。warp size、gfx 世代、確保、数値検査、常駐検査で使えない場合は stderr に `strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: ...` を出します。利用可能な場合は、GPU ごとに最大 token 数、timeout 数、default read との最大相対差を含む `strata hc: CUDA%d: STRATA_HC_PERSIST=1: ...` 行を出します（`src/kernels/cuda/fused_gr.cu:2877-3013`）。
+- GPU engine の `fused_gr.cu` で CUDA または HIP コンパイラ向け persistent 実装が有効であること。その他のコンパイル経路では stub が常に通常 read への fallback を返す（`engine/src/kernels/cuda/fused_gr.cu:4839,5318-5320`）。
+- `Verifier::init` 時に選択されている GPU が 0–63 の範囲で、warp size が 32 であること。wave64 では初期化を打ち切り、通常 read を使う（`engine/src/kernels/cuda/fused_gr.cu:5163-5175`）。
+- HIP では gfx11 / gfx12 に該当しないこと。該当時は barrier timeout 用の `s_memrealtime` がないとして初期化を打ち切る（`engine/src/kernels/cuda/fused_gr.cu:5177-5182`）。CUDA 側にこの gfx 判定はない。
+- ワークスペース確保と初期の結果確認に成功すること。起動時確認は token 数ごとに通常 read と比較し、許容差内で有限な結果になり、全 80 blocks が同時常駐できる範囲を `max_t` として記録する。初期化で確認できなかった token 数以上は通常 read に戻る（`engine/src/kernels/cuda/fused_gr.cu:5185-5194,5230-5280,5287-5301`）。
+- 実 read の token 数が 1 以上かつ `max_t` 以下であること。HC Q8 (`q8_down` / `q8_up`)、HC REQ8 (`s_down` / `s_up`)、または QFUSE (`q8_mixed`) の引数がある read は persistent kernel を使わない（`engine/src/kernels/cuda/fused_gr.cu:5304-5316`）。
+- この呼び出し箇所は verifier の hyper-connection read であり、persistent read の並行実行を避ける verifier 側の単一 stream を前提にする。drafter は通常 kernel を使用する（`engine/src/kernels/cuda/fused_gr.cu:4837-4838`）。
 
 ## 実行時の詳細
 
-初期化は `Verifier::init()` から呼ばれ、GPU ordinal ごとの `tried` フラグで一度だけ行われます。検査では決定的な乱数 seed で作った入力と BF16 重みを使い、各 token 数について通常 read と persistent read の出力を比較します。出力が有限で、最大相対差が `1e-4` 未満であることを要求します。検査時の barrier timeout は「その token 数では 80 block が同時常駐できない」として扱い、それより大きい token 数も有効にしません（`src/kernels/cuda/fused_gr.cu:2908-2912,2913-3013`）。
+`Verifier::init` は現在の GPU に対して `fused_gr_persist_init()` を呼ぶ。`env_on()` の結果は関数内 `static` に一度保存されるため、最初の評価後にプロセス環境を変更しても反映されない。カードごとの `DevState::tried` も初期化試行後に立ち、同じカードでは再試行しない。`dp_on()` も別の関数内 `static` として最初の呼び出しで値を保存する（`engine/src/core/verify.cpp:956-970`、`engine/src/kernels/cuda/fused_gr.cu:5111-5119,5136-5140,5156-5169`）。
 
-実行時の barrier は `s_memrealtime` を使い、待機が 2 秒を超えると abort flag を立てます。persistent read の起動関数は launch 後に実行済みとして caller に返るため、実行時 timeout が起きても通常 read へ戻る動作ではありません。kernel は未完成の出力を残し、abort flag がクリアされないままなら後続の persistent read も barrier で即時 abort します。通常の正常動作では発生しないとされる状態ですが、opt-in を測定用途に留める制約として既存の `docs/AMD_HIP.md` も記載しています（`src/kernels/cuda/fused_gr.cu:2618-2657,3016-3027`、`docs/AMD_HIP.md:547-549`）。
+起動時確認に通ったカードでは、verify window ごとに `fused_gr_read_persist()` が環境値・token 数・Q8/QFUSE 引数を確認する。使わない場合は `false` を返し、呼び出し元が `fused_gr_read_multi()` を実行する。使う場合は persistent kernel を指定 stream に enqueue し、`true` を返して通常 read を省略する（`engine/src/core/verify.cpp:1816-1818`、`engine/src/kernels/cuda/fused_gr.cu:5304-5316`）。
+
+この kernel は通常 read と異なる加算順序で計算するため bitwise 同一ではない。初期確認では最大相対差が `1e-4` 未満であることを採用条件とする。実行中の grid barrier は CUDA で約 2 秒相当、HIP で 2 秒相当の timeout を持ち、block が揃わないと kernel 内で中断する設計だが、実 read 時の barrier 中断をホスト側で検出して通常 read に再実行する分岐は、この呼び出し経路にはない（`engine/src/kernels/cuda/fused_gr.cu:5141-5149,4867-4908,5271-5279`）。
+
+値 `3` は有効値の一つで、persistent kernel の部分 dot と二乗和の蓄積に double を使う variant を選ぶ。それ以外の非ゼロ値は float variant を選ぶ（`engine/src/kernels/cuda/fused_gr.cu:4864-4865,5136-5140,5156-5158`）。
+
+## ログと測定値
+
+初期化で wave size 不一致、HIP gfx11/gfx12、workspace 確保失敗、結果確認失敗、80 blocks 非常駐のいずれかになると、stderr に `strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: ...` の理由行を出す。確認に通ると、stderr に `strata hc: CUDA%d: STRATA_HC_PERSIST=1: the verifier's hyper-connection read runs as one persistent kernel ...` と token 上限・timeout 数・通常 read との最大相対差を出す（`engine/src/kernels/cuda/fused_gr.cu:5172-5181,5191-5194,5287-5301`）。未設定または 0 なら `fused_gr_persist_init()` の先頭で戻り、persistent 用ログは出さない（`engine/src/kernels/cuda/fused_gr.cu:5163-5165`）。
+
+`docs/AMD_HIP.md:520,811` と `docs/bench-results/2026-10-12-hc-persist-gfx1030/README.md:75-107` には RX 6900 XT 2 枚・ROCm 10.0 等での verify window 時間の測定が記載されている。ただしその計測資料は別の旧 commit `a0116b27` のコードに基づくため、本調査対象 commit の性能値としては扱わない。
 
 ## 根拠
 
-- 値の読み取り、static cache、整数 `3` の double モード: `src/kernels/cuda/fused_gr.cu:2856-2873`
-- HIP 限定実装と非 HIP stub: `src/kernels/cuda/fused_gr.cu:2599,3029-3031`
-- GPU ごとの初期化、適用条件、診断ログ、検査: `src/kernels/cuda/fused_gr.cu:2877-3014`
-- persistent read の fallback 条件: `src/kernels/cuda/fused_gr.cu:3016-3027`
-- verifier からの呼び出しと通常経路への fallback: `src/core/verify.cpp:634-647,1228-1249`
-- 同梱資料の説明とgfx1030での測定条件: `docs/AMD_HIP.md:539-549`。資料では2枚のRX 6900 XT、ROCm 10.0、layer split の測定を報告しています。これは当該構成での値であり、他のRDNAカードの性能を示すものではありません。
+- 読み取り、数値判定、cache、kernel variant: `engine/src/kernels/cuda/fused_gr.cu:5136-5140,5156-5158`
+- 初期化と backend / GPU 条件・ログ: `engine/src/kernels/cuda/fused_gr.cu:5163-5194,5287-5301`
+- verifier の初期化と実 read fallback: `engine/src/core/verify.cpp:956-970,1796-1818`
+- persistent read 選択条件: `engine/src/kernels/cuda/fused_gr.cu:5304-5320`
+- verifier 専用・計算特性・barrier: `engine/src/kernels/cuda/fused_gr.cu:4831-4839,4867-4908`

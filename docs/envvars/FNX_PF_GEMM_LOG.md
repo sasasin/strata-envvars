@@ -1,38 +1,45 @@
 # `FNX_PF_GEMM_LOG`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-split engine の prompt prefill が呼び出す `pf_gemm()` について、行列形状を診断目的で stderr に出します。計算方法の選択や GEMM の結果は変更しません。読み取り箇所は `src/split/src/prefill.cu` の1箇所で、候補一覧にある名前が実際に Strata の環境から読まれています。
+split engine の prompt prefill が `pf_gemm` を呼んだとき、その GEMM の形状 `(rows, cols, C, ldo)` を stderr に出す診断用スイッチです。値で演算を選んだり、GEMM の引数・結果を変えたりはしません。`pf_gemm` はこの判定の後、従来どおり `p.f16acc` に応じた cuBLAS GEMM を実行します（`engine/src/split/src/prefill.cu:463-479`）。
+
+このコードは CUDA/HIP の split engine ターゲットに含まれる共有 prefill 実装です（`engine/src/split/CMakeLists.txt:76-92,116-129`）。split prefill の通常経路から `pf_dense` / `pf_dense_xh` を経由して呼ばれるため、コメントにあるベンチマーク専用の読み取りではありません（`engine/src/split/src/prefill.cu:482-496,1300-1308,1651-1663,1756-1759`）。
 
 ## 値と判定
 
-`std::getenv("FNX_PF_GEMM_LOG")` の戻り値が null でないかだけを判定します。
+`std::getenv("FNX_PF_GEMM_LOG") != nullptr` 相当の設定有無だけを判定します。値を parse・比較しません。未設定ならログなし、設定されていれば空文字、`0`、`1`、`true`、大文字小文字、空白、数値として無効な文字列を含めてログ有効です。CLI 引数や別の環境変数による上書きはこの箇所にありません（`engine/src/split/src/prefill.cu:463-467`）。
 
-| 環境変数の状態 | 動作 |
-|---|---|
-| 未設定 | この診断ログを出さない |
-| 設定あり（空文字を含む） | `pf_gemm` の各形状について、プロセス内で初めての呼び出し時にログを出す |
-
-値の文字列、数値、大文字小文字は調べません。したがって `0`、`false`、空文字も、設定されていれば有効です。CLI 引数や他の環境変数による上書き・優先順位はありません。
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| split engine の `pf_gemm` 呼び出し | ログしない | 環境変数が設定済みのすべての値（空文字、`0`、`1`、`true` など） | なし（未設定のみログしない） |
 
 ## 有効になる条件
 
-このコードは `STRATA_BUILD_SPLIT` で追加される split engine の `prefill.cu` にあります。CMake 設定では split engine は Linux 上の CUDA または HIP 向けで、ビルド対象が作られない構成ではこの読み取り箇所は実行ファイルに入りません（`CMakeLists.txt:2946-2949`; `src/split/CMakeLists.txt:4,64-80,92-120`).
-
-実行時には split engine の prompt prefill が `pf_gemm()` に到達した場合に限りログが出ます。通常の decode window はこの箇所を通りません。`pf_gemm()` は Q8 split-layout の dense 行列および hyper-connection read から呼ばれ、さらに prefill の shared expert 行列積からも呼ばれます（`src/split/src/prefill.cu:429-438,451-456,982-1036,1293-1297`）。
+- `strata-split-2`、`strata-split-3`、`strata-split-4` のいずれかを CUDA または HIP でビルドし、そのプロセスが `pf_gemm` を通る prefill 処理を実行する必要があります。これらのターゲットに `prefill.cu` が含まれ、HIP ビルドでは同ファイルを HIP 言語としてコンパイルします（`engine/src/split/CMakeLists.txt:76-92,116-129`）。
+- 値が設定されていても、`pf_gemm` が呼ばれなければ出力はありません。これは split engine の prefill 用フックで、他の engine/backend に同名の読み取りはありません（候補名の全参照は `engine/src/split/src/prefill.cu:464` のみ）。
+- モデル・chunk・layer によって呼び出し形状や回数は変わりますが、形状ログ自体に CLI やモデル状態による追加ゲートはありません。
 
 ## 実行時の詳細
 
-各 `pf_gemm()` 呼び出しで環境変数を再確認し、設定されている場合は `(rows, cols, C, ldo)` をキーにした `static std::set` に登録します。同じ4値の組み合わせは一つのプロセス内で一度だけ stderr に出力されます。別の形状はそれぞれ一度ずつ出ます。環境変数の判定自体は static cache されていませんが、既に記録した形状は環境値を後から変更しても再出力されません。
+環境変数は `pf_gemm` の呼び出しごとに `getenv` で確認されます。環境変数の有効／無効状態を static cache しません。一方、出力済み形状を保持する `static std::set<std::tuple<int, int, int, int>>` はプロセス内で共有され、同一の `(rows, cols, C, ldo)` は最初の 1 回だけ出力されます。したがって実行中に環境値が設定されれば、その後の呼び出しで未出力形状を記録できますが、すでに出力した形状は再出力されません（`engine/src/split/src/prefill.cu:463-467`）。
 
-出力形式は `pf_gemm: rows %d cols %d C %d ldo %d\n` です。ログ判定は `p.f16acc` 分岐と cuBLAS 呼び出しより前に行われます。その後の f16 accumulate 経路と f32 accumulate 経路の選択、および cuBLAS 呼び出しは `p.f16acc` によるもので、この環境変数では変わりません。環境変数による警告、エラー、終了経路もありません。GEMM 実行時のエラー処理は既存の `ckb(...)` によります。
+この分岐は `fprintf` のみで、GEMM の演算経路やその結果を変更しません。後続の cuBLAS 呼び出しが失敗する場合は通常の `ckb` エラー処理に進みますが、この環境変数固有の失敗・fallback 経路はありません（`engine/src/split/src/prefill.cu:468-479`）。
+
+## ログと測定値
+
+有効時、各形状の初回に stderr へ次の書式で出力します。`rows`、`cols`、`C`、`ldo` は `pf_gemm` に渡された整数値です。
+
+```text
+pf_gemm: rows %d cols %d C %d ldo %d
+```
+
+ログは通常の split prefill でも出ます。Strata の資料にこの診断変数に関する測定値はありません（実装: `engine/src/split/src/prefill.cu:464-467`）。
 
 ## 根拠
 
-- `src/split/src/prefill.cu:410-427` — 唯一の環境読み取り、形状ごとの重複抑制、stderr 出力、およびログ後に行う GEMM の分岐。
-- `src/split/src/prefill.cu:429-438,451-456,1293-1297` — `pf_gemm()` の呼び出し元。
-- `src/split/src/prefill.cu:982-1036` — prompt prefill の入口と chunk 処理。
-- `src/split/src/engine_common.cu:328-339`; `src/split/tools/fnx_run.cpp:155-162` — warm-up と実行ドライバーから prefill が呼ばれる例。
-- `CMakeLists.txt:2946-2949`; `src/split/CMakeLists.txt:4,64-80,92-120` — split engine のビルド条件と CUDA/HIP ソース設定。
+- `engine/src/split/src/prefill.cu:463-479` — 環境変数判定、形状ごとの重複抑制、stderr 出力、GEMM の実行。
+- `engine/src/split/src/prefill.cu:482-496,1300-1308,1651-1663,1756-1759` — 通常の split prefill から `pf_gemm` へ至る呼び出し。
+- `engine/src/split/CMakeLists.txt:76-92,116-129` — CUDA/HIP split engine ターゲットへの prefill 実装の組み込み。

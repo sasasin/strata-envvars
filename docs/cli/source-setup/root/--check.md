@@ -1,58 +1,61 @@
 # `--check`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat` / update wrappers |
+| コマンド | `setup.py`（source setup、トップレベル） |
 | オプション | `--check` |
 | 別名 | なし |
-| 値 | 値を取らない boolean flag。省略時 `False` |
+| 値 | 取らないフラグ。省略時は `False`、指定すると `True`。 |
 
 ## 役割
 
-PC のハードウェア・メモリ条件を調べ、Strata のモデルが動作可能かを表示して終了します。通常の Linux/Windows 経路では、RAM、GPU の適合性、CPU 命令セットなどを確認し、各モデルのおおよその適合状況を列挙します（`setup.py:8515`, `setup.py:8697-8709`, `setup.py:8816-8859`, `setup.py:8860-8909`）。
+通常の CUDA/HIP セットアップ経路では、この PC の CPU、RAM、GPU と各モデルのメモリ目安を表示して、セットアップやモデル起動へ進まず終了する。これは現在の PC で全モデルが実行可能かを測定するベンチマークではなく、Strata の適合判定ルールに基づく目安である。Intel SYCL と Apple Silicon は別経路へ委譲され、それぞれの判定内容・副作用が異なる。
 
 ## 使い方
 
-リポジトリのルートで実行します。
+Strata checkout のルートから実行する例:
 
 ```sh
-python3 setup.py --check
+python3 terminal/setup.py --check
 ```
 
-Linux の `./setup.sh --check`、Windows の `START-HERE.bat --check` でも引数は `setup.py` に渡されます（`setup.sh:6-13, 76`, `START-HERE.bat:48, 53`）。ただし wrapper は Python 環境がない場合に venv や Python の準備を先に行うため、確認だけの用途ではその副作用も考慮してください（`setup.sh:14-75`, `START-HERE.bat:14-39`）。`update.sh` / `UPDATE.bat` は `--update` を付けて setup に渡し、`--update` の分岐は `--check` の判定より先に処理されるため、更新用 wrapper に `--check` を渡しても check-only 実行にはなりません（`update.sh:62`, `UPDATE.bat:79`, `setup.py:8617-8619, 8860`）。
+トップレベルの `setup.sh` や Windows の `START-HERE.bat` も引数を `setup.py` に渡す入口である（`setup.sh:6-17`、`START-HERE.bat:49-65`）。
 
 ## 値と既定値
 
-値は不要です。`argparse` の `store_true` で定義され、指定すると `a.check` が `True`、省略すると `False` です。同じ flag を複数回指定しても効果は変わりません（`setup.py:8515`）。値を付けた形式は parser のエラーになります。
+値は不要で、parser は `action="store_true"` として登録する。指定なしでは通常モードの選択に従い、`--check` を指定したときだけ検査モードになる。同じフラグを複数回指定しても真偽値が増えることはない。数値範囲など `--check` 固有の値 validation はない（`terminal/setup.py:11552`）。
 
 ## 実行時の動作
 
-- 既存モデルがあっても通常起動へ進まず、PC 検査の経路を選びます（`setup.py:8602-8620`, `setup.py:8677-8692`）。
-- 通常の CUDA/HIP 経路では GPU・RAM・CPU などを調べ、モデルごとに `fits` / `tight` / `does not fit` や低 RAM モード、既定の Unsloth RAM 予算に基づく説明を表示します。DeepSeek-V4.1-Flash の一部サイズも別の計画結果として表示します（`setup.py:8697-8709`, `setup.py:8816-8859`, `setup.py:8860-8901`）。この一覧はセットアップ時の推定で、実際のモデル起動を保証するものではありません。
-- `--check` 中は、低 RAM を理由とする通常の確認停止を抑止し、判定一覧まで進みます（`setup.py:8819-8834`）。ただし GPU が見つからない、NVIDIA ドライバーが古い、CPU が SSE4.2 未満など、検査続行に必要な条件を満たさない場合は失敗します（`setup.py:8787-8812`, `setup.py:8845-8858`）。
-- NVIDIA と AMD の両方が使える場合の選択質問は、`--check` または `--yes` があると回答待ちをせず NVIDIA を選びます。AMD を検査したい場合は `--backend hip` を指定します（`setup.py:8710-8729`）。`--gpu` / `--gpus`、backend、`--low-ram` など他の指定は検査対象や表示に影響し得ます。`--resident-budget-gib` は check 一覧の計算へ渡されず、表示には既定の予算が使われます（`setup.py:8868-8877, 8973`; `resident_budget_gib` の定義は `setup.py:3095`）。
-- `--check` と `--calibrate` を同時に指定すると、チューニングは実施せず警告を出します（`setup.py:8652-8656`）。
-- Apple Silicon の通常の Metal 経路では `setup.py` から `metal/setup_mac.py` に引数を転送し、そちらの parser が `--check` を定義します。Mac では unified memory と macOS 要件を表示し、問題があれば終了コード 1、なければ 0 です（`setup.py:7314-7318`, `setup.py:8418-8419`, `metal/setup_mac.py:350-356, 373-385`）。Control mode の Mac 経路は `mac_control_setup` 側で同様に問題の有無を判定します（`setup.py:8561-8562`, `setup.py:8236-8259`）。
-- Intel SYCL backend を指定すると `setup.py` は引数を `sycl_setup` に渡して Intel 用 setup 経路へ委譲します。`--check` の個別動作はその経路の別実装に依存し、この文書では確認していません（`setup.py:8563-8564`, `setup.py:7321-7335`）。
+通常の CUDA/HIP 経路では、既存モデルの通常起動を抑止し、GPU 選択・ハードウェア情報の取得後に各モデルの必要ファイル量と RAM + GPU メモリを比べて結果を表示する。モデル一覧は `MODELS` を走査し、結果に `EXPERIMENTAL` や AMD 側の NVIDIA 専用注記を付ける場合がある（`terminal/setup.py:11681-11688`、`terminal/setup.py:11761-11766`、`terminal/setup.py:11877-11912`、`terminal/setup.py:11960-11971`）。
+
+適合ラベルはモデルファイル量（PLE 等の lookup table を除く）と RAM・カードメモリを比較し、収まれば `fits`、収まらなければ `may run slower` とする。ここではカードの VRAM reserve は差し引かれない。最終的に「`fits` かつ通常モデル（`mem_total` でない）が1つ以上あるか」を確認し、1つもなければ終了コード `1`、あれば `0` を返す（`terminal/setup.py:7042-7054`、`terminal/strata_control/fit_label.py:40-58`、`terminal/setup.py:11960-11979`）。
+
+ただし `--check` は全経路で純粋な読み取り専用とは限らない。main は検査より先に旧ディレクトリ配置の移行を試み、条件が合えばファイルを移動して設定内パスを書き換える（`terminal/setup.py:11607-11610`、`terminal/setup.py:8436-8493`）。また通常経路はモデルデータの置き場所を解決する際、既定データフォルダーを作成し、既存データの移動・設定保存を行う場合がある（`terminal/setup.py:11681-11690`、`terminal/setup.py:7428-7444`、`terminal/setup.py:7475-7510`）。
 
 ## 適用条件と副作用
 
-通常の check 分岐に到達した後はモデルのインストール、取得、engine build、起動へ進みません。ただし通常の `setup.py` 経路では、その分岐より前に `data_folder_for(a)` が呼ばれます。これはデータディレクトリを作成し、同じドライブ上の既存モデルファイルを集約・移動し、設定ファイルを付け替えたり `settings.json` を保存したりすることがあります（`setup.py:8602-8612`, `setup.py:6136-6139`, `setup.py:6042-6066, 6100-6133`）。したがって `--check` は常に読み取り専用ではありません。Mac の `setup_mac.py` と Control mode の Mac 経路でも `data_folder_for(a)` は check 判定前に呼ばれます（`metal/setup_mac.py:356-367, 373-383`, `setup.py:8251-8257`）。
-
-Windows では `main()` の冒頭で `adopt_user_defaults()` も呼ばれます。これは管理者実行時に、プロセスが今後作るファイルの owner と default DACL を現在ユーザー向けに設定する処理です。`--check` のハードウェア判定とは別ですが、プロセス内の token 設定に触れます（`setup.py:8412-8419`, `strata_control/private_files.py:349-385`）。
+- `--update` を同時に指定すると、main は検査分岐より前に update 処理へ進むため、`--check` のモデル適合一覧は出ない（`terminal/setup.py:11692-11698`）。`--prepare-pack` と `--inspect` も `--check` の判定より前に処理される（`terminal/setup.py:11622-11627`）。
+- `--calibrate` と併用した場合、通常経路では「`--check` と同時なので calibration は何もしない」という警告を出す（`terminal/setup.py:11730-11733`）。
+- `--backend sycl` は Linux の Intel Arc 経路へ委譲され、Windows では未対応として停止する。SYCL 側は `--check` の判定前に `engine-sycl` の reader ディレクトリを作成し、`BUILD.json` を書く。表示も Intel 向けに置き換わる（`terminal/setup.py:11635-11638`、`terminal/setup.py:9297-9320`、`engine/sycl/setup_intel.py:461-492`）。
+- Apple Silicon では `setup.py` が `metal/setup_mac.py` へ引数を渡す。macOS 側の `--check` は Mac 情報・問題・空きディスクを表示し、検出した問題があれば `1`、なければ `0` を返す。この分岐では通常経路のモデル別適合一覧を作らない（`terminal/setup.py:11434-11437`、`terminal/setup.py:9290-9294`、`engine/metal/setup_mac.py:372-430`）。Mac 側も先にデータフォルダーを解決するため、通常経路と同様にフォルダー作成や既存データの整理が起こり得る（`engine/metal/setup_mac.py:411-414`、`terminal/setup.py:7428-7510`）。
+- 通常経路で NVIDIA GPU が見つからない、利用可能な AMD GPU がない、CPU が必要命令セットを満たさない、ドライバーが古い等の場合は `fail()` 経由で停止し、終了コード `1` となる（例: `terminal/setup.py:1049-1056`、`terminal/setup.py:11838-11839`、`terminal/setup.py:11877-11901`、`terminal/setup.py:11939-11942`）。CLI parser の引数エラーは `argparse` が usage とエラーを出して終了する。
 
 ## 出力とエラー
 
-結果や警告は `say()` / `warn()` を通じて標準出力に表示されます（`setup.py:808-823`）。通常経路では、少なくとも一つの対象モデルが適合すると「This PC can run Strata...」を表示して終了コード `0`、適合するモデルがない場合はその旨を表示して終了コード `1` です（`setup.py:8902-8909`）。Mac の各経路も問題なしなら `0`、問題ありなら `1` を返します（`metal/setup_mac.py:377-385`, `setup.py:8248-8259`）。GPU 不在、利用できない GPU/driver、対応 ISA 不足など `fail()` に到達した場合は説明を標準出力へ出し、`sys.exit(1)` します（`setup.py:825-830`, `setup.py:8787-8812`, `setup.py:8845-8858`）。引数の型・未知 option など parser エラーは `argparse` が処理します（`setup.py:8420`, `setup.py:8553`）。
+通常経路は `say()` で標準出力に PC 情報、警告、モデルごとの `needs ~N GB of RAM + VRAM` と判定を出す。合格時は「この PC で Strata を実行できる。インストールするには `--check` なしで再実行」と案内し、終了コード `0`。適合モデルがない場合は不足 RAM と `--model NAME --yes` での続行可能性を案内し、終了コード `1`（`terminal/setup.py:997-999`、`terminal/setup.py:11960-11979`）。Mac 経路の出力・終了コードは上記の別実装に従う。
 
 ## 根拠
 
-- option 定義と parser: `setup.py:8420-8425, 8513-8517, 8553`
-- 通常経路の mode 判定と PC 検査: `setup.py:8602-8620, 8697-8709, 8816-8859`
-- モデル適合一覧、DeepSeek の追加情報、終了コード: `setup.py:8860-8909`
-- check 前に行われるデータディレクトリ処理: `setup.py:6042-6066, 6100-6139, 8602-8612`
-- Mac/SYCL の委譲と別経路: `setup.py:7314-7335, 8236-8259, 8412-8419, 8561-8564`; `metal/setup_mac.py:350-385`
-- wrapper の引数委譲・bootstrap: `setup.sh:6-13, 14-75`; `START-HERE.bat:14-53`; `update.sh:62`; `UPDATE.bat:79`
+- `terminal/setup.py:11552` — `--check` の parser 定義。
+- `terminal/setup.py:11607-11610`、`terminal/setup.py:11622-11638`、`terminal/setup.py:11681-11698` — 初期処理、他モードとの優先関係、通常起動の抑止とデータ場所解決。
+- `terminal/setup.py:11730-11733`、`terminal/setup.py:11877-11979` — calibration 相互作用、PC 情報確認、モデル判定と終了コード。
+- `terminal/setup.py:7042-7054`、`terminal/strata_control/fit_label.py:40-58` — モデルファイル量と適合ラベルの計算。
+- `terminal/setup.py:8436-8493`、`terminal/setup.py:7428-7444`、`terminal/setup.py:7475-7510` — check 前に起こり得る配置移行、データフォルダー作成・移動・設定保存。
+- `terminal/setup.py:9290-9320`、`engine/metal/setup_mac.py:372-430`、`engine/sycl/setup_intel.py:461-492` — macOS / Intel SYCL の委譲先、分岐固有の判定と副作用。
+- `setup.sh:6-17`、`START-HERE.bat:49-65` — ラッパーから `setup.py` への引数転送。
+
+調査範囲は上記 commit の Strata 所有ソース。CLI の実行や build は行っていない。特に、データフォルダーの移動は既存設定・配置に依存するため、この文書では実行される条件をソース上で確認できた範囲に限定して記載した。

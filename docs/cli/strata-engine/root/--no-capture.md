@@ -1,57 +1,67 @@
-# `--no-capture`
+# `strata --no-capture`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout は `main` で、調査開始時の作業ツリーに未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate` |
+| コマンド | `strata`（推論エンジンの root 引数） |
 | オプション | `--no-capture` |
 | 別名 | なし |
-| 値 | 値なしのフラグ |
+| 値 | 取らない boolean flag。`--no-capture` を指定すると有効 |
 
 ## 役割
 
-層の実行に CUDA graph の capture/replay を使わず、各層を通常の呼び出しで直接実行します。主に通常のグラフ経路と比較する診断・測定用です。ソースでは初期値が `false` で、指定時に `true` になります（`src/program/generate.cpp:507,2504`）。
+通常の token-by-token 生成経路で、層の実行を CUDA graph の capture/replay から、層を順に直接呼び出す経路へ切り替える。これは実行経路を選ぶフラグであり、CPU expert pool を保ったまま切り替えることはできない。`--no-pool` と併用した GPU-only の測定・診断用途に限られ、ルーティングされた expert を含む通常の推論結果を得るための指定ではない。`engine/src` と `engine/sycl/src` の parser に同じ flag と pool／dump 制約がある（`engine/src/program/generate.cpp:845-846,10557-10586`; `engine/sycl/src/program/generate.cpp:529-530,5970-6000`）。
 
 ## 使い方
 
 ```sh
-strata generate --pack pack/full --tokens "1,2,3" --no-capture --no-pool
+# GPU-only の測定・診断例。CPU expert pool を使わず、通常の完全な推論出力を得る用途ではない。
+strata --pack MODEL.strata --tokens 1,2 --no-capture --no-pool
 ```
 
-`--no-capture` 自体は値を取りません。`--no-pool` も付ける必要があります。`strata generate` の usage は `--pack` と `--tokens` を示し、`--no-capture` を「層を直接実行する」フラグとして列挙しています（`src/program/generate.cpp:806-811,887`）。
+`--pack` と `--tokens` は実行に必要な入力例であり、モデルと token ID は手元の環境に合わせる。`--no-capture` 自体には値を付けない（`engine/src/program/generate.cpp:3842-3853,3930`）。
 
 ## 値と既定値
 
-- 値は不要です。`--no-capture` を指定するだけで有効になります（`src/program/generate.cpp:2504`）。
-- 省略時は `false` で、通常の capture/replay 経路を使います（`src/program/generate.cpp:507,6952-6962,7471-7478`）。
-- 重複指定を拒否する処理はなく、繰り返しても同じ真偽値を設定します（`src/program/generate.cpp:2416-2422,2504`）。
-- 値を取る parser 分岐ではありません。別の未知引数は `unknown argument` を stderr に出し、usage を表示して終了コード `2` になります（`src/program/generate.cpp:2787-2792`）。
+値・別名・数値範囲はない。`Options::no_capture` の初期値は `false` で、parser が引数と完全一致したとき `true` にする。重複指定を拒否する分岐はなく、複数回指定しても同じ状態になる。`--no-capture=true` のような値付き表記はこの parser の分岐に一致せず、unknown argument として exit code 2 になる（`engine/src/program/generate.cpp:845,3930,3980-3984,4269-4272`）。
 
 ## 実行時の動作
 
-指定時は `session_capture` を呼ばず、token graph の `session_capture_token` も呼ばない条件になります（`src/program/generate.cpp:6952-6962,7471-7478`）。各 token の層処理では `session_token(...)` を選び、層を順に `block_layer(...)` へ渡します。指定しない場合は、作成済み token graph があれば `session_run_token`、なければ `session_loop` を選びます（`src/program/generate.cpp:15932-15950`、`src/core/session.cpp:805-832`）。
+通常の token-by-token 生成では、フラグなしなら session graph を capture し（native pack の場合を除く）、各 token で captured token graph または `session_loop` を使う。指定時は session graph と token graph の capture を抑止し、各 token で `session_token` を呼ぶ。`session_token` は全層を順番に走査し、各層について `block_layer` を直接呼ぶ。`--sync-every-layer` も指定した場合は各層の後に stream 同期を行う。SYCL 実装にも同じ通常生成経路の分岐がある（`engine/src/program/generate.cpp:10544-10555,10999-11000,24296-24314`; `engine/src/core/session.cpp:801-842`; `engine/sycl/src/program/generate.cpp:5957-5968,13504-13518`; `engine/sycl/src/core/session.cpp:1148-1188`）。
 
-この直接実行経路には CPU expert pool の hook がありません。そのまま `--no-capture` だけを指定すると routed experts が計算されないため、engine は `--no-pool` も要求し、満たさない場合は理由を stderr に出して終了コード `2` で拒否します。したがって併用時の意図は CPU pool を使わない GPU-only の実行です（`src/program/generate.cpp:6965-6979`）。
+`session_token` には CPU expert pool の hook がない。そのため `--no-capture` 単独では routed experts が計算されない実行になる。parser 後のチェックで `--no-pool` がなければ stderr に理由を出して exit code 2 で拒否する。両方を指定するとこの拒否は避けられるが、CPU expert pool は無効であり、GPU-only floor の測定・診断として扱う（`engine/src/program/generate.cpp:846,10557-10571,10479-10484`）。
 
 ## 適用条件と副作用
 
-- `--stage-timing` は capture 内で CUDA event を記録できないことを理由に、`--no-capture` なしでは終了コード `2` で拒否されます。併用時は stage timing を有効化し、初期化失敗なら stderr に `stage_timing_enable failed` を出して終了コード `1` です（`src/program/generate.cpp:6881-6894`）。
-- `--dump-layers` はこの経路では staging buffer が埋まらないため、`--dump-halves` は graph に capture されるデータであるため、それぞれ併用すると stderr に理由を出して終了コード `2` で拒否されます（`src/program/generate.cpp:6981-6994`）。
-- `--sync-every-layer` は `session_token` に渡され、指定すると各層後に stream を同期します。非同期 GPU error を層単位で検出する診断動作です（`src/program/generate.cpp:2506,15932-15936`、`src/core/session.cpp:834-843`）。
-- 有効な生成経路では model の層を GPU 上で実行し、通常の token 生成・出力処理を続けます。層の失敗は `session_token` のエラーを stderr に出し、終了コード `1` になります（`src/program/generate.cpp:15932-15937`）。
-- Qwen3.5 MoE の GGUF は `src/qwen35` の別 parser へ引き渡されます（`src/program/generate.cpp:2393-2407`）。その parser に `--no-capture` はなく、通常の generate mode では未知引数として usage を表示し終了コード `2` になります。serve mode でも `--serve` より前に現れた場合は未知引数です。`--serve` の後に現れる場合は、このエンジンにない `--...` 引数を無視する処理により効果なく無視されます（`src/qwen35/q36_engine.cu:3742-3743,3782-3795`）。
+- `--dump-layers` とは併用できない。これは `session_loop` が埋める staging buffer を書き出す機能で、`session_token` はその buffer を埋めないため、指定すると stderr に理由を出して exit code 2 で拒否する（`engine/src/program/generate.cpp:10573-10580`）。
+- `--dump-halves` とは併用できない。half の記録は layer graph に capture されるため、直接実行経路では記録されず、指定すると exit code 2 で拒否する（`engine/src/program/generate.cpp:10582-10586`）。
+- `--stage-timing` は逆に `--no-capture` を必要とする。`--stage-timing` だけを指定すると capture 内の CUDA event が記録されない理由を stderr に出して exit code 2 で拒否する。`--no-capture --stage-timing` の組合せでは timing 初期化を行い、初期化に失敗すると `stage_timing_enable failed` を stderr に出して exit code 1 になる（`engine/src/program/generate.cpp:10432-10445`）。
+- フラグ自体によるファイル出力や設定ファイル変更は確認できない。層の実行経路を変え、`--no-pool` との併用時には routed experts を含まない GPU-only 経路になる。
+- `--serve` との組合せを parser が専用に拒否する処理は確認できなかった。直接 `session_token` を呼ぶ箇所は通常の token loop にあり、serve の要求処理は別経路であるため、この調査では `--serve` 時の効果を通常生成と同じとは断定しない（`engine/src/program/generate.cpp:24296-24314`）。
 
 ## 出力とエラー
 
-`--no-capture` 単独の成功時に専用メッセージやファイル出力を追加する処理は確認できません。通常の生成出力に加え、上記の組み合わせ違反・層実行エラーは stderr に出力されます。組み合わせ違反は終了コード `2`、層実行失敗は `1` です（`src/program/generate.cpp:6974-6994,15932-15937`）。
+`--no-capture` 単独を受理したときに専用の表示はない。主な拒否・失敗経路は次のとおり。
 
-## 根拠と調査範囲
+| 条件 | 確認できる出力・終了 |
+| --- | --- |
+| `--no-pool` なし | `strata generate: --no-capture runs ...` を stderr に出し、exit code 2 |
+| `--dump-layers` または `--dump-halves` と併用 | 各組合せの理由を stderr に出し、exit code 2 |
+| `session_token` / 層の実行が失敗 | `session_token: <層番号とエラー>` を stderr に出し、exit code 1 |
 
-- parser の既定値・受理分岐・help: `src/program/generate.cpp:507,806-808,887,2416-2422,2504`。
-- graph 経路の抑止と診断 option の validation: `src/program/generate.cpp:6881-6894,6952-6994,7471-7478`。
-- 直接実行と失敗経路: `src/program/generate.cpp:15932-15950`、`src/core/session.cpp:805-846`。
-- Qwen3.5 MoE の別 parser: `src/program/generate.cpp:2393-2407`、`src/qwen35/q36_engine.cu:3742-3795`。
+これらの分岐と表示は `engine/src/program/generate.cpp:10566-10586,24296-24301` にある。その他の起動・GPU エラーは個別の初期化・実行処理が返すため、このオプション固有の失敗とは区別する。
 
-この文書は checkout 内のソース調査に基づきます。同一 revision のビルド済み CLI help は実行しておらず、ビルド別・GPU 別の実行結果や性能差は確認していません。
+## 根拠
+
+- `engine/src/program/generate.cpp:845-849` — flag の既定値と隣接する `--no-pool`／`--stage-timing` の関係。
+- `engine/src/program/generate.cpp:1289,3930` — help 表記と parser 登録。`engine/src/program/generate.cpp:3980-3984,4269-4272` は未知引数の扱い。
+- `engine/src/program/generate.cpp:10544-10555,10999-11000` — graph capture と token graph capture の抑止条件。
+- `engine/src/program/generate.cpp:10557-10586,10432-10445` — `--no-pool` 必須条件、dump 系との非互換、stage timing の条件とエラー。
+- `engine/src/program/generate.cpp:24296-24314` — token ごとの直接実行と graph replay 経路の分岐。
+- `engine/src/core/session.cpp:801-842` — `session_token` が層を順番に `block_layer` へ渡す実装、失敗時と任意の層ごと同期。
+- `engine/sycl/src/program/generate.cpp:1969,5957-6000,13504-13518` と `engine/sycl/src/core/session.cpp:1148-1188` — SYCL parser、同じ制約と直接実行分岐、層の反復実装。
+- 索引 `docs/cli/README.md:1036-1043,1142` — tool ID、root scope、および対象 option の掲載。索引は動作の根拠ではなく、文書配置の確認にのみ使用。
+
+調査対象は上記 commit の checkout に限る。`--serve` の要求処理全体に対する効果、ならびに実機での backend 別挙動は実行せず確認していない。

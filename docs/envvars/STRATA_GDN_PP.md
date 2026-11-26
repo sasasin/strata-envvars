@@ -1,51 +1,48 @@
 # `STRATA_GDN_PP`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-AMD HIP の GDN prompt recurrence で、`STRATA_GDN_HEAD` が選んだ quad recurrence のカーネル形状を切り替えます。未設定相当では標準の quad カーネル、値 `2` では1レーンが2列を処理するカーネル、それ以外の非ゼロ値では別の PP カーネルを選びます。GDN の recurrence 自体を有効にするスイッチではありません。
+HIP の GDN（gated-delta-net）再帰で、`STRATA_GDN_HEAD` により選ばれた quad recurrence のカーネル形状を切り替える。値 `2` は 1 lane あたり 2 列を処理する `gdn_rec_quad2c_kernel`、その他の非ゼロ値は `gdn_rec_quad_pp_kernel`、ゼロは標準の `gdn_rec_quad_kernel` を選ぶ。対象は再帰の計算経路であり、環境変数自体を読むだけのログ設定ではない（`engine/src/prefill/kernels.cu:3122-3130`）。
 
 ## 値と判定
 
-値は `std::atoi()` で整数に変換されます。変換値の範囲検査や文字列全体の妥当性検査はありません。
+`std::getenv` の結果を `std::atoi` に渡す。未設定なら 0。空文字、数値に変換できない文字列、先頭の数値が 0 の文字列も 0 になり、標準の quad kernel を選ぶ。`atoi` は先頭の空白と符号を受け付け、数字列の後ろは無視するため、`"2x"` は 2、`"1anything"` は 1、`"0anything"` は 0 と判定される。大文字小文字による比較はなく、`true` / `false` は数値として解釈されず 0 になる。整数として表現できない値の動作はコードで検査・制限されていない。
 
-| `atoi()` の結果 | 選択される recurrence |
-|---|---|
-| `0` | `gdn_rec_quad_kernel`（PP 分岐なし） |
-| `2` | `gdn_rec_quad2c_kernel`（2列/レーン） |
-| 0以外で2以外 | `gdn_rec_quad_pp_kernel` |
+| 条件 | unset | 値による選択 | 0 と判定される例 |
+|---|---|---|---|
+| HIP、quad recurrence の `variant == 1`、`T > 0` | 0（標準 quad） | `2` → 2-column kernel。`0` 以外で `2` ではない整数 → PP kernel | `0`、`-0`、空文字、`true`、`0anything` |
 
-未設定、空文字、数値に変換できない文字列は通常 `0` になります。たとえば `2junk` は `atoi()` が `2` を返すため2列カーネル、`1`・`-1`・`junk` はそれぞれ PP カーネル・PP カーネル・標準カーネルです。コードが最初にこの分岐へ入った時点で判定値を関数内 `static const` に保存するため、プロセス中の環境変更は再評価されません。
-
-根拠: `src/prefill/kernels.cu:1951-1959`。同じ分岐のコードは `sycl/src/prefill/kernels.dp.cpp:2627-2635` にもありますが、いずれも `#if defined(__HIPCC__)` のブロック内です。
+`1`, `-1`, `3`, `-2` はいずれも非ゼロで `2` ではないため PP kernel を選ぶ。`2x` や `2.0` は `atoi` が先頭の整数部分を読むため 2 として扱われる（`engine/src/prefill/kernels.cu:3122-3130`）。
 
 ## 有効になる条件
 
-- AMD/HIP の quad recurrence 分岐であること（`src/prefill/kernels.cu` では `__HIPCC__` 条件内）。CUDA ではこの分岐がコンパイル対象になりません。
-- `STRATA_GDN_HEAD` が `atoi()` で非ゼロとなり、かつ `STRATA_GDN_REC_HEADS` が未設定であること。そうでなければ `gdn_recurrence()` は variant 1 を渡さず、この変数の分岐に入りません。
-- recurrence の token 数 `T` が正であること。この場合に限って `pp` を読み、カーネルを起動します。`T <= 0` ではこの読み取りと起動を行いません。
-- 設定が未指定でも、起動時の GPU arch defaults が値を補う場合があります。HIP エンジンはデバイス情報の取得後、エンジンが各スイッチを初めて読む前に `apply_arch_defaults()` を呼びます。gfx1151 では `STRATA_GFX1151_DEFAULTS`、gfx12 では `STRATA_GFX12_DEFAULTS` が未設定、または先頭文字が `0` でないとき、既存のユーザー設定がなければ `STRATA_GDN_PP=2` を設定します。いずれかの defaults 無効化変数が先頭文字 `0` ならテーブル全体を適用しません。その他の arch ではこの表から値を補いません。
-- `apply_arch_defaults()` は `getenv()` で変数の存在を確認し、既に存在すれば値を問わず保持します。したがって `STRATA_GDN_PP=0` や空文字も明示設定として保持され、2列カーネルに上書きされません。
+- `STRATA_GDN_HEAD` が数値として非ゼロで、`STRATA_GDN_REC_HEADS` が未設定であること。標準の GDN 呼び出しはこの条件で `variant == 1` を渡す。`STRATA_GDN_REC_HEADS` は値が空でも設定されていれば serial 経路を選ぶ（`engine/src/prefill/kernels.cu:3286-3293`, `3309-3314`）。
+- GDN 再帰が呼ばれ、`T > 0` であること。別のモデル経路、`T <= 0`、または別 variant ではこの値を読まない（`engine/src/prefill/kernels.cu:3122-3124`）。
+- HIP の AMD kernel 経路であること。quad kernels と `STRATA_GDN_PP` の分岐は `__HIPCC__` 条件内にある。CUDA ではこの変数を読まず、SYCL の Intel 向け CMake build も `icpx` を使い、`.dp.cpp` の AMD-only `__HIPCC__` 節を有効にしない（`engine/src/prefill/kernels.cu:3088-3090`, `engine/src/prefill/kernels.cu:3122-3144`, `engine/sycl/CMakeLists.txt:1-11`, `engine/sycl/src/prefill/kernels.dp.cpp:2821-2863`）。
+- `STRATA_GDN_CHUNKED` が有効で、`gdn_rec_wmma(...)` がその呼び出しを処理できた場合は、PP 分岐より前に chunked kernel を起動して戻るため `STRATA_GDN_PP` は参照されない。chunked 側が処理しない場合は後続の variant 分岐に進む（`engine/src/prefill/kernels.cu:3088-3099`, `3122-3140`）。
 
-根拠: `src/core/arch_defaults.cpp:12-34,61-70`; 呼び出しは `src/program/generate.cpp:2152-2158` および `sycl/src/program/generate.cpp:1970-1976`; variant の決定は `src/prefill/kernels.cu:1996-2003`。
+起動時の HIP arch defaults は、未設定の場合に `STRATA_GDN_PP=2` を設定する。対象は gfx12（`STRATA_GFX12_DEFAULTS` が `0` で始まらない場合）、gfx1151（`STRATA_GFX1151_DEFAULTS` が `0` で始まらない場合）、および discrete RDNA3 gfx1100/1101/1102（`STRATA_GFX11_DEFAULTS` が `0` で始まらず、`STRATA_DEFAULTS` が `026` / `0.2.6` / `v0.2.6` のいずれでもない場合）。既に設定済みなら空文字や `0` を含めその値を維持する。`apply_arch_defaults` は HIP の起動時に GPU 情報を得た後で呼ばれる（`engine/src/core/arch_defaults.cpp:28-50`, `64-73`, `engine/include/strata/core/gfx11_extra.hpp:27-50`, `engine/include/strata/core/defaults_026.hpp:21-29`, `engine/src/core/arch_defaults.cpp:302-323`, `engine/src/program/generate.cpp:4287-4320`）。この既定値も、`STRATA_GDN_HEAD` が有効であることや chunked 経路が先に成功しないことを上書きしない。
 
 ## 実行時の詳細
 
-`STRATA_GDN_PP=2` の `gdn_rec_quad2c_kernel` は、各 lane が2列を計算し、同じ lane の列同士で q/k の shared-memory 読み出しを共有します。実装コメントは列ごとの算術順序を元の quad kernel と同じとしています。`STRATA_GDN_PP=1` など2以外の非ゼロ値は `gdn_rec_quad_pp_kernel` を選びます。どちらの場合も、選ばれた recurrence kernel の後に `gdn_out_norm_loop_kernel` が起動されます。
+`variant == 1` の GDN 再帰で最初に `T > 0` となったとき、関数内 `static const int pp` を初期化する。この値はプロセス内でキャッシュされ、同じ実行中に環境を変更しても反映されない。環境変数が初期化前に未設定なら 0 が固定される（`engine/src/prefill/kernels.cu:3122-3130`）。
 
-起動時に arch defaults が値を補った場合は、`strata: gfx12 (RDNA4): ... exact speed switches on by default ...` または gfx1151 の同形式のログに `GDN_PP` が含まれます。既に値が設定されていた場合や、defaults を無効にした場合、この関数は `GDN_PP` の設定ログを出しません。`STRATA_GDN_PP` 自体の parse エラーや選択カーネル名の個別ログは確認できません。
+値 `2` は 2 列処理の kernel を起動し、それ以外の非ゼロ値は PP kernel を起動する。0 の場合は標準 quad kernel に戻る。通常の `gdn_recurrence` と state-only 呼び出しの双方が `variant == 1` になり得るため、後者でも `T > 0` なら同じ選択が適用される（`engine/src/prefill/kernels.cu:3122-3130`, `3286-3293`, `3309-3314`）。
 
-## 文書・測定との照合
+起動時 defaults は `getenv` で設定の有無を確認し、未設定時のみ値を入れる。従って CLI 引数による `STRATA_GDN_PP` の上書き経路はなく、環境変数の明示値が arch default より優先される（`engine/src/core/arch_defaults.cpp:218-224`, `307-310`）。
 
-`docs/STRIX_HALO.md:83-96` は gfx1151 で arch defaults がスイッチを設定すること、`STRATA_GDN_PP=2` が GDN prompt recurrence の「two columns per lane」に当たることを説明しています。同文書はそこで示す結果を maintainers の環境での確認として記述しています。`src/core/arch_defaults.cpp:39` のコメントには「64K prompt +2.9% (stream A, round 2)」とありますが、コメント単体では測定対象の詳細な機種・モデル・反復手順が揃わないため、一般的な性能効果とは扱いません。`docs/DETAILS.md` にこの変数固有の測定条件・数値は見つかりませんでした。
+## ログと測定値
+
+この値の parse 結果や選択 kernel を直接表示するログはない。GPU 別 defaults が適用されたとき、gfx11 discrete では `apply_arch_defaults` が「exact speed switches on by default」の一覧を stderr に出し、名前を `GDN_PP` として含めることがある。gfx12 / gfx1151 の `STRATA_GDN_PP` 設定には、この関数からの個別表示はない（`engine/src/core/arch_defaults.cpp:318-332`, `engine/src/program/generate.cpp:4320`）。起動後の kernel check は `gdn_recurrence (quad)` のラベルを使うが、これは PP 値の診断ログではない（`engine/src/prefill/kernels.cu:3138-3140`）。
+
+Strix Halo / Radeon 780M 資料は `STRATA_GDN_PP=2` を GDN prompt switch 群に列挙しているが、この変数単独の測定条件・測定値は示していないため、本書では性能値を記載しない（`docs/STRIX_HALO.md:109-113`, `docs/RADEON_780M.md:82-87`）。
 
 ## 根拠
 
-- 値の読み取りとカーネル選択: `src/prefill/kernels.cu:1951-1968`
-- GDN head variant と serial override: `src/prefill/kernels.cu:1996-2003`
-- 2列カーネルの lane 配置・実装意図: `src/prefill/kernels.cu:1309-1329`
-- gfx1151/gfx12 での既定値と defaults 有効化条件: `src/core/arch_defaults.cpp:12-40`
-- 既存環境値の保持と設定ログ: `src/core/arch_defaults.cpp:61-80`
-- HIP 起動時の defaults 適用位置: `src/program/generate.cpp:2152-2158`
-- gfx1151 でのスイッチ説明: `docs/STRIX_HALO.md:83-96`
+- `engine/src/prefill/kernels.cu:3122-3140` — HIP variant 1 における読み取り、値の分岐、fallback、kernel check。
+- `engine/src/prefill/kernels.cu:3286-3293`, `3309-3314` — 通常再帰と state-only 呼び出しが variant 1 を選ぶ条件。
+- `engine/src/core/arch_defaults.cpp:28-50`, `64-73`, `302-323` — 対象 GPU 世代、既定値、ユーザー設定の保持。
+- `engine/src/program/generate.cpp:4287-4320` — HIP 起動時に GPU defaults を適用する箇所。
+- `engine/sycl/CMakeLists.txt:1-11`, `engine/sycl/src/prefill/kernels.dp.cpp:2821-2863` — SYCL Intel build と AMD-only guard。

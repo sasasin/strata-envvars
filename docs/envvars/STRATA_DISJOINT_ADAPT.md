@@ -1,57 +1,44 @@
 # `STRATA_DISJOINT_ADAPT`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-適応型 GPU expert cache が次に常駐させる expert を選ぶとき、helper GPU の `RemoteExperts` cache が現在保持する `(layer, expert)` を候補から除外します。これにより primary 側の適応 cache が helper と同じ expert を追加するのを避けます。既定では無効です。
-
-判定と候補選定は CUDA 実装 `src/program/generate.cpp` と SYCL 実装 `sycl/src/program/generate.cpp` の両方にあります。CLI の generate 経路と serve 経路（通常の同期適応および非同期適応）の候補選定に適用されます。
+主 GPU の adaptive expert cache が入れ替え候補を作るとき、helper GPU の cache が現在保持している `(layer, expert)` を候補から外す。これにより、適応によって helper と主 GPU の cache に同じ expert を載せる選択を避ける。helper cache の中身を変更したり、adaptive tier 自体を有効にしたりする設定ではない。環境変数を無効にした場合も、peer cache など別の既存候補除外規則はそのまま働く。CUDA/HIP 系の `engine/src/program/generate.cpp` と SYCL 系の `engine/sycl/src/program/generate.cpp` に同じ読み取りと helper 判定がある。`RemoteExperts::holds` はその時点で cache が該当 expert を保持するかを返す（`engine/include/strata/core/remote_experts.hpp:41-43`、SYCL 版 `engine/sycl/include/strata/core/remote_experts.hpp:37-39`）。
 
 ## 値と判定
 
-値は `std::getenv()` で読み、`std::atoi(v) != 0` で判定します。文字列全体の妥当性検査はありません。
+両実装とも `std::getenv` の戻り値を `std::atoi` に渡し、未設定でなく、変換結果が 0 以外なら有効とする。文字列全体の妥当性検査や `1` との比較はない。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（`atoi("")` は 0） |
-| 数値として 0 | 無効。符号や先行空白を含む 0 も無効 |
-| 数値として 0 以外 | 有効。負数も 0 以外として有効 |
-| 数字で始まらない文字列 | `atoi` が 0 を返すため無効 |
-| 数字の後ろに文字が続く文字列 | 数字部分が 0 以外なら有効（例: `1abc`） |
+| 条件（build など） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP 系または SYCL 系の `generate` 実装 | 無効（`v == nullptr`） | `1`、`-1`、`2tail`、` 1`（`atoi` が 0 以外を返す場合） | 空文字、`0`、`0anything`、`true`、`false`、数字に変換できない文字列 |
 
-数値は `int` に変換され、追加の範囲制限や clamp はありません。変数は generate 初期化部のローカル `const bool` として一度だけ評価されるため、その後の環境変更は実行中の判定に反映されません。反映にはプロセス再起動が必要です。
+したがって、空文字は「設定済み」でも無効。先頭の空白と符号は `atoi` の変換規則に従い、数字列の後ろは検査されない。数値に変換できない場合は 0 となる。範囲制限・clamp・別値への fallback はない。`int` の範囲を超える入力を安全に検査する処理もないため、その場合の変換結果はこのコードから規定できない。表の読み取り式は CUDA/HIP 系 `engine/src/program/generate.cpp:10232-10240` と SYCL 系 `engine/sycl/src/program/generate.cpp:5768-5777` にある。
 
 ## 有効になる条件
 
-- `--adapt-every` と `--adapt-swaps` により適応型 GPU cache が有効で、適応候補を作る経路を実行すること。候補選定は、layer ごとに現在 primary cache にない expert（`r[e] < 0`）のうち利用回数が `u[e] >= 2.0f` のものを対象とします。
-- 少なくとも一つの remote helper cache が初期化され、その cache に候補 expert が現在 resident であること。helper がない場合や、その expert を保持していない場合は、この変数による候補除外は起きません。
-- `STRATA_DISJOINT_ADAPT` が有効と判定されること。
-
-候補への追加時に `helper_holds(l, e)` を呼び、true ならその expert を候補 vector に入れません。その後の候補順位付け、入れ替え利得判定、swap 数上限の処理は既存のままです。
+- `generate` が該当する CUDA/HIP 系または SYCL 系実装で動くこと。環境値の判定箇所自体に OS 固有の条件分岐はない（上記各ファイルの読み取り箇所）。
+- 主 cache の adaptive tier が実際に候補を選ぶこと。通常のオプション既定値は `--adapt-every` が 4、`--adapt-swaps` が 96 で、CLI の `--adapt-every` と `--adapt-swaps` はそれぞれ独立に設定できる（`engine/src/program/generate.cpp:1045-1048,1084-1085,4058-4061,4202`、SYCL 系 `engine/sycl/src/program/generate.cpp:692-694,721,2052-2054,2166`）。`adapt_every` または `adapt_swaps` が 0 以下なら adaptive tier が動かない経路がある（例: CUDA/HIP 系 `engine/src/program/generate.cpp:15601-15603,24704-24705`、SYCL 系 `engine/sycl/src/program/generate.cpp:13800,13858`）。この環境変数はその条件を上書きしない。
+- helper cache が設定・初期化され、少なくとも一つの helper が対象 expert を保持していること。候補判定は `drive.d.remote[]` の `remote_count` 件を調べる。helper cache は `--expert-cache-remote` に対応する値が正の場合に追加される（CUDA/HIP 系 `engine/src/program/generate.cpp:10235-10243`、SYCL 系 `engine/sycl/src/program/generate.cpp:5772-5780`）。helper がない、またはその expert を保持していない場合、この設定による候補除外は起きない。
+- helper に保持されていても、主 cache にすでに載っている expert は元から「missing expert」の候補ではない。残る候補にも使用回数、peer/remote ownership、fetch 状態、入替利得など既存条件が適用される（CUDA/HIP 系 `engine/src/program/generate.cpp:15354-15375,24728-24745`、SYCL 系 `engine/sycl/src/program/generate.cpp:8854-8877,13874-13895`）。
 
 ## 実行時の詳細
 
-`helper_holds` は環境変数が無効なら即座に false を返します。有効なら `drive.d.remote[0..remote_count)` を順に調べ、いずれかの `RemoteExperts::holds(l, e)` が true なら候補を除外します。`holds` は helper の現在の `ExpertCache::slot_of(layer, expert) >= 0` を返すため、起動時に複製した所有 mask ではなく、入れ替え後の cache 状態が候補評価時に参照されます。
+各実装は `RemoteExpertOpt::init` の後に値を読み、ローカルの `const bool disjoint_adapt` に保存する。従って、同じ `generate` 実行内で後からプロセス環境が変わっても、この判定値は読み直されない。一方、helper の保持状態は `helper_holds` が adaptive candidate を評価するたびに `RemoteExperts::holds(l, e)` で問い合わせるため、初期化時の一覧を固定保存しない（CUDA/HIP 系 `engine/src/program/generate.cpp:10230-10243`、SYCL 系 `engine/sycl/src/program/generate.cpp:5767-5780`）。
 
-候補選定箇所ごとの既存条件には差があります。
+有効時、主 cache に未常駐で利用カウントが閾値以上の候補を集める段階で、helper が保持中なら候補に加えない。CUDA/HIP 系の serve 用 blocking adaptive tier と asynchronous tier、非 serve の適応処理にこの判定がある（`engine/src/program/generate.cpp:15349-15379,15632-15653,24704-24745`）。SYCL 系も serve 用 blocking tier、asynchronous tier、非 serve の適応処理で同様に除外する（`engine/sycl/src/program/generate.cpp:8851-8877,9104-9125,13858-13895`）。その後の適応処理が選ぶ resident victim、入替数、コピー処理は既存の条件に従う。ルータの expert 選択・expert 計算そのものをこのフラグが変更する処理は見つからない。
 
-- serve の通常適応（CUDA/SYCL）は、helper 保持に加えて、peer cache が保持する expert と `remote_opt` が所有する expert も別々に候補から除外します。
-- serve の非同期適応（CUDA/SYCL）では `helper_holds` を使って helper 保持を除外します。
-- CLI generate の適応（CUDA/SYCL）でも `helper_holds` を使います。
+## ログと測定値
 
-この環境変数自体はログを出さず、適応機能の有効/無効や適応頻度を変更しません。helper が保持する expert が候補から外れることで、同じ layer の別の候補が選ばれる場合があります。候補がなくなればその expert の追加は行われません。
+この変数専用の有効・無効ログ、警告、終了経路はない。無効値でも警告は出ず、設定値によって adaptive tier の失敗処理が変わるコードもない。adaptive refill 自体の失敗は既存処理として `strata generate: an adaptive refill failed` などを出し、呼び出し側の失敗経路へ進む（CUDA/HIP 系 `engine/src/program/generate.cpp:24746-24750,24772-24782`、SYCL 系 `engine/sycl/src/program/generate.cpp:13896-13900,13915-13923`）。`STRATA_TRACE_ADAPT` が有効な場合の round / swap 数ログも一般の adaptive tier のログであり、この変数が除外した候補数は報告しない（CUDA/HIP 系 `engine/src/program/generate.cpp:24707-24717,24799-24801`、SYCL 系 `engine/sycl/src/program/generate.cpp:13861-13871,13945-13948`）。
 
-## 文書との照合
-
-`docs/DISJOINT_EXPERT_CACHE.md` は既定 OFF、server と CLI の双方で helper 所有 expert を promotion 候補から外すこと、および `RemoteExperts::holds` による動的な確認を説明しており、調査対象 HEAD の実装と一致します。同文書の性能表は別の歴史的な複合ビルドでの値であり、同文書自身が pure-upstream port の測定値ではないと明記しています。そのため、この HEAD での速度向上や性能値としては扱えません。`docs/DETAILS.md` にはこの変数の説明を確認できませんでした。
+この文書では性能値を記載しない。`docs/DISJOINT_EXPERT_CACHE.md` には過去の検証条件と結果があるが、同文書は公式 main への移植結果がその測定値を再測定したものではないと明記しており、現行 checkout の性能測定は本調査では行っていない。
 
 ## 根拠
 
-- `src/program/generate.cpp:5467-5480`: `atoi` による一度限りの判定、helper cache 探索、remote helper の登録。
-- `src/program/generate.cpp:8341-8364,8565-8586,12870-12904`: serve 通常適応、serve 非同期適応、CLI generate の候補選定。
-- `sycl/src/program/generate.cpp:5042-5055,7817-7839,8045-8065,12173-12193`: SYCL の同等の判定と候補選定。
-- `include/strata/core/remote_experts.hpp:41-43`: `RemoteExperts::holds` が helper cache の `slot_of` を調べる実装。
-- `src/program/generate.cpp:579-581,8239-8240,12828-12829`: 適応周期・swap 数に基づく適応候補機能の設定。
-- `docs/DISJOINT_EXPERT_CACHE.md:13-19,30-33,35-48`: 既定値、意図、過去測定の条件と適用範囲。
+- CUDA/HIP 系の読み取り、helper の live 判定: `engine/src/program/generate.cpp:10230-10243`。
+- CUDA/HIP 系 blocking・async・非 serve の候補選別: `engine/src/program/generate.cpp:15349-15379,15632-15653,24704-24745`。
+- SYCL 系の読み取り、helper の live 判定: `engine/sycl/src/program/generate.cpp:5767-5780`。
+- SYCL 系 blocking・async・非 serve の候補選別: `engine/sycl/src/program/generate.cpp:8851-8877,9104-9125,13858-13895`。
+- helper 保持判定の実装: `engine/include/strata/core/remote_experts.hpp:41-43`、`engine/sycl/include/strata/core/remote_experts.hpp:37-39`。

@@ -1,49 +1,57 @@
 # `STRATA_ADAPT_OVERLAP_RESIDENT`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--serve` の適応層で行う `STRATA_ADAPT_OVERLAP` のコピー重ね合わせを、resident RAM mode でも許可するための追加 opt-in です。この変数単独では overlap を有効にせず、通常の適応層や overlap の条件も満たす必要があります。resident RAM mode 以外ではこの変数の判定結果は使われません。
+`STRATA_ADAPT_OVERLAP_RESIDENT=1` は、resident RAM mode のときに adaptive overlap を止める既定の条件を解除します。この変数だけでは overlap を起動しません。別の opt-in `STRATA_ADAPT_OVERLAP` が有効で、ほかの実行条件も通った場合に、adaptive tier の swap コピーを次の decode window と重ねられます。判定は `engine/src/program/generate.cpp` の serve 初期化中、`aov_why` の理由判定で行われます（`engine/src/program/generate.cpp:15113-15136`）。
 
 ## 値と判定
 
-`src.complement_ready()` が真のとき、環境変数が設定されており、値の先頭文字が `1` なら resident RAM mode に対する拒否理由を取り除きます。文字列全体や数値としての妥当性は検査しません。
+コードは環境変数全体を parse せず、`getenv` が非 null で、値の先頭文字が `'1'` かを直接確認します（`engine/src/program/generate.cpp:15132-15134`）。
 
-| 値 | resident RAM mode での判定 |
-|---|---|
-| 未設定 | 無効（overlap を許可しない） |
-| 空文字 | 無効（設定済みだが先頭文字が `\0`） |
-| `1`, `10`, `1abc` | 有効（先頭文字だけを見る） |
-| `0`, `true`, ` 1`, その他 `1` 以外で始まる値 | 無効 |
+| resident RAM mode | 値 | resident mode による停止理由を解除するか |
+|---|---|---|
+| あり | 未設定 | いいえ |
+| あり | 空文字 | いいえ（先頭文字は `\0`） |
+| あり | `1`、`10`、`1anything` | はい（先頭文字だけを見る） |
+| あり | `0`、`true`、` 1`、`-1`、`01` | いいえ |
+| なし | 任意 | この判定は適用されず、変数は実行条件に影響しない |
 
-この変数の値は static cache されず、overlap gate の初期化時に直接 `getenv()` で調べられます。コード上、リクエストごとに再評価する処理ではありません。
+数値変換、空白除去、大文字小文字変換、末尾の検査、範囲チェックはありません。空文字を含む設定値は「先頭が `1`」でなければ無効です。無効値に対する警告やエラーはありません。
 
 ## 有効になる条件
 
-この opt-in が働くのは `src.complement_ready()` が真、つまり resident RAM mode が構築された経路に限られます。さらに次の条件も必要です。
-
-- `STRATA_ADAPT_OVERLAP` 自体が有効。Linux CUDA は既定で有効（先頭文字が `0` の設定で無効）、Windows CUDA と HIP は先頭文字が `1` の場合だけ有効。
-- `--adapt-every` と `--adapt-swaps` による適応層が有効。
-- 単一 GPU で、layer split、`--peer-device`、`--remote-expert-opt` を使わない。
-- `--adapt-async`、`--pipeline-windows`、page-locked swap source、`STRATA_DMA_BATCH` を使わない。
-- `STRATA_ADAPT_LAG` が 1 で、`STRATA_ADAPT_NOWAIT` が有効でない。
-- `STRATA_VERIFY_DEVICE_PLAN` による device-planned layers が無効。
-
-これらの条件に合わない場合、この変数では overlap を強制できません。resident RAM mode 以外では本変数の値に関係なく resident mode のチェックを通過します。
+- serve の adaptive overlap 判定で `src.complement_ready()` が真、つまり resident RAM copy が利用可能な場合にだけ、この変数が resident mode の拒否条件を解除します。resident RAM mode は GPU cache にない expert を RAM に置き、GPU cache との adaptive swap の対象にする経路です（`engine/src/program/generate.cpp:11747-11756`, `12196-12202`）。resident RAM mode が動いていない場合、この変数は不要です。
+- overlap 自体を要求する `STRATA_ADAPT_OVERLAP` が別途先頭文字 `1` である必要があります。これは `adapt_overlap()` が static local に読み、先頭文字のみで判定します（`engine/src/program/generate.cpp:2269-2288`, `15122`）。この変数はその opt-in を上書きしません。
+- 次の条件も必要です。これらは `aov_why` の優先順で判定され、満たさないときは最初の理由が採用されます（`engine/src/program/generate.cpp:15122-15136`）。
+  - multi-GPU / layer split でない。
+  - `--remote-expert-opt`、`--adapt-async`、`--pipeline-windows` を使わない。
+  - page-locked swap sources (`pin_blobs_on()`) が無効。これは HIP / `STRATA_HIP_GFX906` の非 Windows build で `STRATA_ARENA_MMAP` の先頭文字が `1` のときだけ blocker になります（`engine/src/program/generate.cpp:595-601`）。
+  - `STRATA_DMA_BATCH` の mode が 0。空または未設定は既定値 0、空でない値は `atoi` で変換され、変換後が非 0 なら blocker です（`engine/include/strata/core/dma_batch.hpp:28-35`）。
+  - `STRATA_ADAPT_LAG` の parse 結果が 1（未設定は 1、設定時は `max(1, atoi(value))`）で、`STRATA_ADAPT_NOWAIT` の先頭文字が `1` ではない（`engine/src/program/generate.cpp:2237-2250`）。
+  - adaptive tier が動作する（`drive.d.usage` が空でない。通常は `--adapt-every` と `--adapt-swaps` が有効な状態）。
+- 条件を通った後も `ver.set_adapt_gate(&agate)` が成功する必要があります。`STRATA_VERIFY_DEVICE_PLAN` による device-planned layers が有効なら gate を設定できず、この overlap は使われません（`engine/src/program/generate.cpp:15137-15144`）。
+- 条件を通るかの判定後、`STRATA_ADAPT_SIGNAL` の値に従って layer copy 完了の通知方法を選びます。これはこの環境変数の有効条件そのものではありませんが、overlap の実行準備に関係します（`engine/src/program/generate.cpp:15144-15170`）。
+- `--serve` の server decode 初期化・window 処理で判定される値です。通常の単発 CLI 経路や別プロセスへ設定を書き出す処理は見つかりません（`engine/src/program/generate.cpp:15113-15122`, `22819-22835`）。
 
 ## 実行時の詳細
 
-overlap が有効なとき、次の decode window の開始時に pending swap の residency table を先に更新します。resident RAM mode では `soft_commit_exchanges()` で RAM copy 側の交換を予約し、コピーが届くまでの扱いを分けます。交換予約に失敗した場合は通常のコピー完了待ち `apply_pending(true)` に fallback し、overlap を行いません。
+変数は serve 初期化時の `aov_why` 評価で、その場で2回 `std::getenv` を呼び、static cache には保存しません（`engine/src/program/generate.cpp:15122-15136`）。ただし結果の `aov` は初期化時に決まり、後の decode window はその値を使います。したがってサーバープロセス実行中に環境を変更しても、この server session の overlap 判定には反映されません（`engine/src/program/generate.cpp:15176-15186`, `22819-22835`）。
 
-有効時の stderr ログは共通の `adaptive overlap ...` です。条件に合わない場合は、`STRATA_ADAPT_OVERLAP` が明示設定されているときに `STRATA_ADAPT_OVERLAP=1 is off: not in the resident RAM mode unless STRATA_ADAPT_OVERLAP_RESIDENT=1` などの理由が表示されます。resident opt-in 専用の成功ログはありません。
+overlap が有効になると、pending swap の residency table を window 前に反映し、各 layer のコピーが着地するまでその layer の verify 計画を gate で待たせます。resident RAM mode では `soft_commit_exchanges()` を使い、RAM copy 側の場所はコピー完了まで維持します。`soft_commit_exchanges()` が失敗した場合は通常の待機付き `apply_pending(true)` に戻ります（`engine/src/program/generate.cpp:22819-22835`）。
 
-実装コメントには resident RAM mode での測定例として RTX A4000 +7.0%（5/5 pairs）と、46 GB RAM の環境の RTX 3060 -2.6%（0/5）が記されています。これはソースコメントに記録された個別結果であり、一般的な性能向上を示すものではありません。`docs/DETAILS.md` は通常の `STRATA_ADAPT_OVERLAP` の条件と測定を記載しますが、この resident 専用 opt-in の測定は記載していません。
+## ログと測定値
+
+- overlap が有効なら stderr に `strata serve: adaptive overlap (STRATA_ADAPT_OVERLAP=0 turns it off): ...` が出ます。実行終了時には overlap が処理した window 数と layer wait 合計の `strata decode adapt overlap: ...` も出ます（`engine/src/program/generate.cpp:15176-15181`, `23382-23384`）。
+- overlap の要求があり、resident RAM mode がこの変数の未設定・無効値で拒否された場合は `strata serve: STRATA_ADAPT_OVERLAP=1 is off: not in the resident RAM mode unless STRATA_ADAPT_OVERLAP_RESIDENT=1` が出ます（`engine/src/program/generate.cpp:15130-15135`, `15182-15183`）。先行する別条件に当たる場合は、その条件の理由が表示されます。
+- `STRATA_ADAPT_OVERLAP` 自体が要求されていない場合は `strata serve: adaptive overlap: off...` が出て、resident 例外が通っても有効化されません（`engine/src/program/generate.cpp:15122`, `15184-15186`）。
+- ソースコメントは resident RAM mode での overlap の結果として RTX A4000 `+7.0% (5/5 pairs)`、RTX 3060 `-2.6% (0/5)` と記しますが、モデルや実行設定などはそのコメントに記載されていません。これはコードコメント上の限定的な報告で、一般的な性能値とは扱えません（`engine/src/program/generate.cpp:15130-15131`）。`docs/DETAILS.md` は `STRATA_ADAPT_OVERLAP` の一般条件・別構成での測定を説明していますが、この resident 例外変数の記載はありません（`docs/DETAILS.md:1260`, `1720`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:8272-8304` — overlap の条件判定、`STRATA_ADAPT_OVERLAP_RESIDENT` の先頭文字判定、失敗理由とログ。
-- `src/program/generate.cpp:1330-1347` — 基本の `STRATA_ADAPT_OVERLAP` の既定値と platform ごとの値判定。
-- `src/program/generate.cpp:11856-11875` — pending swap 適用時の resident RAM soft commit と通常待ちへの fallback。
-- `src/program/generate.cpp:6600-6613,6765-6785` — resident RAM mode の説明、RAM copy と適応 swap の設定。
-- `docs/DETAILS.md:1699-1706` — 基本の overlap 動作と通常モードの測定条件。resident opt-in 固有の記述はない。
+- `engine/src/program/generate.cpp:15113-15136` — overlap の起動判定、resident RAM 例外、他の拒否条件。
+- `engine/src/program/generate.cpp:15137-15186` — gate 準備、ログ、無効理由。
+- `engine/src/program/generate.cpp:22819-22835` — window ごとの pending swap 適用と resident RAM の soft commit。
+- `engine/src/program/generate.cpp:11747-11756`, `12196-12202` — resident RAM mode と adaptive swap の説明・状態ログ。
+- `engine/src/program/generate.cpp:23382-23384` — overlap の実行結果ログ。

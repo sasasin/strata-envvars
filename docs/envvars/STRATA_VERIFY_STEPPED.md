@@ -1,52 +1,51 @@
 # `STRATA_VERIFY_STEPPED`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありません。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-SYCL verifier の window 実行を、GPU queue の境界ごとに分割し、その間に CPU expert pool を処理する stepped 経路を有効にします。実装コメントは Intel Arc A-series / DG2 向けの opt-in と説明していますが、環境変数の判定自体に GPU 世代や OS の検査はありません。CUDA/HIP の `src/core/verify.cpp` にはこの変数の読取箇所がなく、実装は `sycl/src/core/verify.cpp` にあります。
+SYCL verifier の speculative window 実行を、doorbell の各 serve point で分割した command graph として実行するための opt-in です。window 内の各 segment を完了させてから CPU experts を処理し、後続 segment を投入するため、segment 実行中に host と kernel が互いの store を読む構成を避けます。変数が有効でも、all-resident 経路では CPU serve はなく、window 開始時に host flag を立てる処理になります。通常の未設定時は既存の graph / host wait 経路です。実装は `engine/sycl/src/core/verify.cpp` の `Verifier::capture` と `Verifier::run` にあります（`verify.cpp:192-194`, `2098-2105`, `2476-2494`）。
 
-この経路は verifier が動く実行に限られます。`Verifier::init()` は VRAM expert tier の profile/cache や対応するモデル geometry などを要求し、条件不足なら verifier 初期化を失敗させます（`sycl/src/core/verify.cpp:482-506`）。そのため通常の verifier 非使用実行にこの値だけで stepped 処理が追加されるわけではありません。
+この読み取りは SYCL 実装にあります。CUDA/HIP 側がこの名前を読む実装は確認できません。設定レジストリ上の名前の登録は実際の環境読み取りではなく、実際の読み取り箇所は SYCL verifier の `env_on("STRATA_VERIFY_STEPPED")` です。
 
 ## 値と判定
 
-`env_on()` は `std::getenv()` の結果が存在し、空文字でなく、先頭文字が `'0'` でない場合に true を返します。文字列全体の parse や数値変換はしません。
+`env_on` は `std::getenv` で取得し、値が存在し、先頭文字が NUL でも `'0'` でもなければ true にします。文字列全体や数値としての parse はしません（`engine/sycl/src/core/verify.cpp:151-154`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| 先頭が `0` の文字列（`0`, `0abc`） | 無効 |
-| それ以外（`1`, `true`, `false`, `2`, ` 1` など） | 有効 |
+| 条件（build など） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| SYCL verifier | false | `1`, `true`, `false`, ` 0`, `01` | 空文字、`0`, `0anything` |
 
-大文字小文字や後続文字は評価されません。したがって文字列 `false` も有効です。CLI 引数による同値の上書きは確認できません。
+大文字小文字や空白を検査しません。したがって `false` や先頭が空白の ` 0` も有効、`01` は先頭が `0` のため無効です。境界は先頭 1 文字だけで決まり、値の残りは無視されます。`g_stepped` は翻訳単位の初期化時に一度だけ評価されるため、プロセス起動後の環境変更は反映されません（`verify.cpp:191-194`）。
 
 ## 有効になる条件
 
-- この実装が組み込まれた SYCL verifier を実際に使うこと。対象コードは SYCL ディレクトリにあります（`sycl/src/core/verify.cpp:94-105`）。
-- 通常の非 all-resident window では、`STRATA_VERIFY_EAGER` が未設定で segment capture ができていること。`capture()` は stepped かつ non-resident のとき `capture_segments()` を呼びます（`sycl/src/core/verify.cpp:1830-1837`）。`run()` は segment が存在する場合に stepped serve を実行します（`sycl/src/core/verify.cpp:2163,2177-2179`）。
-- all-resident window は別経路です。test-stall 中でなければ stepped 用に host flag を graph launch 前に立て、その後 window 内の per-layer serve をスキップします（`sycl/src/core/verify.cpp:2164-2175,2307-2309`）。
-
-`STRATA_VERIFY_EAGER` は run 時の `stepped_run` 条件と capture 時の segment capture を無効にしますが、all-resident の `stepped_ar` 条件には含まれません（同 `:1833,2163-2164`）。`STRATA_VERIFY_SPLIT=0` は capture 時に split-point hook を設定せず、層 group ごとの serve boundary は残します（同 `:1799-1809`）。`STRATA_VERIFY_PIPE=0` は split segment と CPU pool の並行実行を無効にします。未設定・空文字・先頭が `0` 以外なら並行実行を許します（同 `:2209-2212`）。
-
-`STRATA_VERIFY_HOST_UNCACHED` が未設定または `env_on()` で無効なら、stepped mode 中は verifier の window buffer に uncached host memory を要求しません。有効にすると uncached host memory を使う分岐を維持します（同 `:220-243`）。
+- この読み取りがあるのは `engine/sycl` の verifier です。SYCL 以外の backend で有効になるとはソースから確認できません（`engine/sycl/src/core/verify.cpp:187-194`）。コメントは Arc A-series / DG2 を動機として挙げていますが、値判定自体に GPU 型の guard はありません（`engine/sycl/include/strata/core/verify.hpp:400-405`）。
+- `STRATA_VERIFY_EAGER` が未設定で all-resident でない場合、`capture` が segment capture を選びます。`STRATA_VERIFY_EAGER` が空文字を含め設定されている場合はこの分岐を抑止し、通常の capture ではなく eager replay を選びます（`verify.cpp:2098-2105`, `2479-2480`, `2587-2590`）。
+- all-resident 判定 (`ar_on()`) は `all_resident_ && !ar_off_` です。そこで verifier は serve segment ではなく全体の graph を使い、`STRATA_VERIFY_STEPPED` が有効なら launch 前に host flag を立てます。all-resident 状態は verifier 初期化時の residency 表と各 window 前の更新で決まります（`engine/sycl/include/strata/core/verify.hpp:364-370`, `engine/sycl/src/core/verify.cpp:897-917`, `2035-2048`, `2479-2490`）。
+- `STRATA_VERIFY_EAGER` が未設定で segment 方式が選ばれても、`remote_opt_` が設定されていると stepped run は `false` を返し、`verify: STRATA_VERIFY_STEPPED does not serve --remote-expert-opt` をエラーにします（`verify.cpp:2493-2495`）。
+- `STRATA_VERIFY_SPLIT` の初期値は未設定時 true で、値の先頭が `0` の場合だけ false です。true なら CPU serve point に加えて VRAM expert group 後にも split point を記録します（`verify.cpp:2067-2077`）。
+- `STRATA_VERIFY_PIPE` は segment 間に split point があるとき、値の先頭が `0` でなければ CPU pool 処理を helper thread と次の GPU segment に重ねます。未設定・空文字・`true` は有効、`0` や `0anything` は無効です。未設定時に helper thread を使わない serial 経路ではなく、split point のある場合は helper thread 経路が既定です（`verify.cpp:2525-2557`）。
+- `STRATA_VERIFY_HOST_UNCACHED` が未設定または `env_on` 判定で無効なら stepped 時の window host buffer は通常の host USM 側を選びます。有効なら uncached host allocation を維持します。この判定は関数内 static cache です（`verify.cpp:309-330`）。
 
 ## 実行時の詳細
 
-`g_stepped` は namespace scope の `const bool` として初期化されるため、プロセス起動時の環境値を読み、その後は再読込しません（`sycl/src/core/verify.cpp:94-105`）。`STRATA_VERIFY_STEPPED` 自体を読む箇所はこの一箇所です。non-resident 経路では window の token 数 `T` ごとに segment graph を capture し、`seg_[T]` が埋まっていれば再利用します（同 `:1783-1819,1830-1837`）。
+`g_stepped` はプロセス開始時に読み取られます。doorbell 経路では `capture_segments` が command graph の記録を始め、record 中の `step_hook_` が各 CPU serve 後の境界を記録します。`STRATA_VERIFY_SPLIT` が有効なら `step_hook2_` が VRAM expert group 後の境界も記録します。segment graph は window token 数 `T` ごとの `seg_[T]` に保持され、既存の segment があれば再 capture しません（`verify.cpp:2051-2087`, `2098-2105`）。
 
-segment は queue boundary で閉じられ、serve point では queue を待って doorbell の sequence と payload を確認し、CPU pool に expert を処理させます。必要なら次の split segment を先行 submit し、DMA copy 完了後に flag B と次の window flag を立てます（同 `:1799-1809,2185-2267`）。`STRATA_VERIFY_PIPE` の既定はこの並行化を許可する値です。`STRATA_VERIFY_SPLIT` は split-point を追加する設定です。
+実行時は各 serve segment を投入し、serve point で queue drain を待って doorbell sequence を確認し、plan を設定して CPU pool にその layer/group の CPU experts を処理させます。次 segment が split point なら `STRATA_VERIFY_PIPE` の設定に応じ CPU pool を helper thread で GPU segment と重ね、そうでなければ順に実行します。その後 flag B と通常の window flag を上げて GPU 側を進めます（`verify.cpp:2493-2586`）。通常の分割なし経路では host が各 layer の ring を spin wait するコードがありますが、stepped run はその逐次 wait loop を通りません（`verify.cpp:2623-2645`）。
 
-値が有効でも、all-resident window は segment serve を行わず、prefill expert row があれば gather 後に flag を graph launch 前に設定する一括 graph 経路です（同 `:2163-2175,2307-2309`）。また `STRATA_VERIFY_STEPPED` が有効な間は shared-expert stream fork と verifier の lean 経路も抑止されます（同 `:830,1361`）。
+変数が有効でも、test stall 条件が成立した all-resident window は `stepped_ar` が false になり、通常の stall 用処理に進みます（`verify.cpp:2479-2480`, `2620-2637`）。doorbell stepped run が remote expert opt で拒否された場合や segment capture / 実行で失敗した場合は verifier が false とエラー文字列を返します。GPU window 全体の同期失敗も `verify: ...` のエラーで返されます（`verify.cpp:2082-2095`, `2493-2495`, `2583-2586`, `2753-2781`）。
 
-non-resident stepped 経路は `--remote-expert-opt` に対応せず、`run()` は `verify: STRATA_VERIFY_STEPPED does not serve --remote-expert-opt` を返して失敗します（同 `:2177-2179`）。segment serve 中に sequence が届かない場合は `verify (stepped): layer ... did not ring after its queue drained ...`、pool が失敗した場合や queue/graph の例外も `err` に格納して `false` を返す経路があります（同 `:2185-2194,2212-2236,2258-2270`）。呼び出し元の generate 経路は verifier failure を `ERR ...` として出力し終了コード 1 を返します（`sycl/src/program/generate.cpp:11834-11839`）。この変数固有の有効化ログは確認できません。
+## ログと測定値
+
+この変数自体を有効化したことを示す専用ログはありません。別途 `STRATA_VERIFY_NODES` が設定されている場合、segment capture 時に stderr へ `strata verify: the %d-token window as %zu graph segments` を出します。このログ条件は値ではなく設定有無です（空文字でも出力。`verify.cpp:2089-2090`）。remote expert opt の拒否時は上述のエラー文字列が verifier の呼び出し元へ返ります。
+
+ソースコメントには、Arc A770 / xe / Coder IQ1_M / 8K prompt で host memory を uncached にした場合 GPU が window あたり約 70 ms CPU を待ち、uncached を外すと約 42 ms、decode が 22.8–25.0 から 26.9–28.9 tok/s と記録されています。これはコメントに記載された条件下の値であり、本調査で再測定した値ではありません（`verify.cpp:309-314`）。
 
 ## 根拠
 
-- `sycl/src/core/verify.cpp:94-105` — 値判定 helper と起動時の `g_stepped` 初期化。
-- `sycl/src/core/verify.cpp:830,1361` — stepped 有効時の lean / shared-expert fork 抑止。
-- `sycl/src/core/verify.cpp:220-243` — stepped 時の host uncached memory 選択と `STRATA_VERIFY_HOST_UNCACHED`。
-- `sycl/include/strata/core/verify.hpp:365-376` — stepped mode と serve/split hook の説明。
-- `sycl/src/core/verify.cpp:1783-1819,1830-1837` — segment capture、再利用、eager/all-resident 条件。
-- `sycl/src/core/verify.cpp:2160-2270,2307-2309` — run 時の分岐、serve、失敗経路。
-- `sycl/src/program/generate.cpp:11834-11839` — verifier 失敗の CLI 出力と終了。
+- `engine/sycl/src/core/verify.cpp:151-154` — `env_on` の値判定。
+- `engine/sycl/src/core/verify.cpp:191-194` — `g_stepped` の初期化時読み取り。
+- `engine/sycl/src/core/verify.cpp:2051-2095`, `2098-2105` — segment graph capture と eager / all-resident 分岐。
+- `engine/sycl/src/core/verify.cpp:2384-2400`, `2476-2495`, `2525-2586`, `2623-2645` — window 実行、CPU serve、helper、失敗条件。
+- `engine/sycl/include/strata/core/verify.hpp:364-370`, `400-411` — all-resident 定義と stepped hook の説明。

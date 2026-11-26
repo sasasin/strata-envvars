@@ -1,50 +1,56 @@
 # `STRATA_GDN_REC_WARP`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-CUDA の実験ビルドで、Volta (compute capability 7.0) 上の GDN prompt recurrence に使うカーネルを選びます。unset または整数変換結果が 0 なら従来の pipelined recurrence、値が `2` なら依存 FMA chain を4分割したカーネル、それ以外の非0値なら warp 内 reduction を使うカーネルです。変数名に `WARP` とありますが、値 `2` は別の chain-split カーネルを選びます。
+実験的 CUDA build の Volta (compute capability 7.0) 向け GDN prompt recurrence で、既定の pipelined kernel の代わりに warp-reduction kernel または chain-split kernel を選ぶ opt-in 変数です。`2` は `gdn_rec_cols_pipe_fast_kernel`、`1` 以外の非ゼロ値は `gdn_rec_cols_warp_kernel` を選びます。後者はコードコメントで pipelined kernel と bit-exact、前者は和の順序が変わり bit-exact ではない FP32-level の差と説明されています。いずれも recurrence の出力 `y` と状態を計算し、通常の出力付き呼び出しでは続けて `gdn_out_norm_kernel` が `y16` を書きます。通常の Strata 起動で使う CLI 引数による上書きは見つかりませんでした。
+
+この dispatch 部分は `engine/src/prefill/kernels.cu` の `gdn_recurrence_impl` にあり、通常の GDN prompt 経路から `gdn_recurrence` 経由で呼ばれます（`engine/src/prefill/kernels.cu:3145-3184, 3286-3294`; 呼び出し元 `engine/src/prefill/prefill.cpp:5203-5210, 9339-9343`）。
 
 ## 値と判定
 
-実装は値を `std::atoi` に渡します。空文字だけは変換前に 0 とされます。文字列全体の妥当性は確認せず、`atoi` が先頭の空白と符号の後から読める整数部分を使います。そのため `2tail` は 2、`1tail` は 1、`0tail` や `word` は 0 になります。数値の範囲検査や clamp はありません。
+実装は `std::getenv` の結果が null または空文字なら `0`、それ以外は `std::atoi` で整数化します。文字列全体の妥当性確認や値域チェックはありません。従って先頭に空白や符号がある数値は `atoi` の変換に従い、数値の後ろの文字も検証されません。`2tail` は `2`、`1x` は `1`、`true` や `x1` は `0` になり、`0anything` も `0` です。大文字小文字の判定はありません。
 
-| 値・状態 | 判定と選択（有効条件を満たす場合） |
-|---|---|
-| unset、空文字、`atoi` 結果が 0 | warp recurrence を選ばず、通常の dispatch に進む。既定では pipelined kernel だが、`STRATA_GDN_PIPELINE`、`STRATA_GDN_CHUNKED` など通常 dispatch 側の条件が適用される。 |
-| `atoi` 結果が `2`（例: `2`, `+2`, `2tail`） | 4 accumulator chain-split kernel。積和の合算順序が変わるため FP32 レベルで従来版と異なり、bit-exact ではない。 |
-| その他の非0整数（例: `1`, `-1`, `3`） | sync-free warp-reduction kernel。ソースコメントは従来の pipelined recurrence と bit-exact としている。 |
+| 条件（build / 実行経路） | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `STRATA_EXPERIMENTAL_SM60` を有効にした CUDA build、かつ下記の Volta dispatch 条件を満たす | `warp_env=0`: 既定の pipelined recurrence | `atoi` 結果 `2`: chain-split kernel。その他の非ゼロ整数（例 `1`, `-1`, `3`）: warp-reduction kernel | `atoi` 結果 `0`（例 `0`, 空文字, `true`, `0tail`）: 既定の pipelined recurrence |
+| 上記以外の build / GPU / recurrence 条件 | 同じ既定経路 | dispatch されず無視 | dispatch されず無視 |
+
+未設定時と空文字は同じく `0` です。`atoi` の返り値が `2` かどうかだけを特別扱いし、それ以外の非ゼロ整数をまとめて `1` 相当の kernel に送ります（`engine/src/prefill/kernels.cu:3161-3163, 3173-3182`）。
 
 ## 有効になる条件
 
-- `STRATA_EXPERIMENTAL_SM60` を有効にした CUDA ビルドであること。通常配布の CUDA build ではこの dispatch はコンパイルされず、この変数は読み取られません。CMake ではこの設定を Pascal / Volta 向けの実験 build と説明しています。
-- 実行デバイスの compute capability が 7.0 であること。`gdn_chunk_available()` が runtime capability 70 の場合だけ true を返し、その結果は `static` に一度だけ保存されます。別の capability ではこの変数が非0でも warp recurrence に入りません。
-- `T > 0` で、`STRATA_GDN_REC_HEADS` が設定されていないこと。後者は値に関係なく「設定されているか」で判定され、初回評価結果が static に保存されます。
-- `STRATA_GDN_CHUNK` が同じ呼び出しで chunked recurrence を選んでいないこと。`STRATA_GDN_CHUNK` は呼び出しごとに読み直され、chunked が選ばれると `STRATA_GDN_REC_WARP` の値にかかわらず warp recurrence 分岐は使われません。chunked が選ばれても `T < 64` なら chunk kernel 自体は起動せず通常 recurrence に戻ります。
+- `engine/src/prefill/kernels.cu` の `STRATA_EXPERIMENTAL_SM60` compile guard 内にある dispatch が build に含まれること。この macro は CUDA build 設定で既定 OFF、ON の場合に compile definition として追加されます（`engine/cmake/backends/cuda.cmake:28, 76-80`）。HIP は対象外です。
+- 実行中の GPU が compute capability 7.0 であること。`gdn_chunk_available()` はこの build 以外や HIP では false、実験的 CUDA build では現在デバイスの CC が 70 のとき true を返します（`engine/src/prefill/gdn_chunk.cu:525-530`）。sm_60、sm_86、sm_120 等では warp kernel の分岐は選ばれません（`docs/GDN_CONTRACT.md:71-72` はこの条件を記載）。
+- `STRATA_GDN_REC_HEADS` が設定されていないこと。値の内容ではなく `getenv(...) != nullptr` を関数内 static に保存しており、空文字でも設定されていれば serial 経路となり warp dispatch を抑止します（`engine/src/prefill/kernels.cu:3087, 3163`）。
+- `STRATA_GDN_CHUNK` により chunked recurrence が選ばれていないこと。実験的経路ではこの変数を各呼び出しで `atoi` し、0 以外の非負整数なら `chunked` になります。その場合 `warp_rec` は false です（`engine/src/prefill/kernels.cu:3150-3164`）。chunked 側は `T >= 64` のとき先に実行され、短い残りは pipelined recurrence で処理されます（同 `3164-3172`）。
+- recurrence の token 数 `T` が正であること。`T <= 0` では warp 分岐に入りません（`engine/src/prefill/kernels.cu:3163-3164`）。
 
-warp 分岐に入らないときの通常 dispatch は `STRATA_GDN_PIPELINE`、CUDA の `STRATA_GDN_CHUNKED`、`STRATA_GDN_REC_HEADS` などの設定でも変わります。これらは `STRATA_GDN_REC_WARP` の parse 値そのものを変えません。
-
-この実験 dispatch は `__HIPCC__` では使われません。CUDA の通常 build や非Volta GPU、上記の抑止条件では、処理は serial / 通常 recurrence など後続の既存 dispatch に進みます。
+GPU 条件の `volta` は `static const bool` なので、プロセスで最初に `gdn_recurrence_impl` がこの箇所に到達したときのデバイス判定が保持されます。一方、対象変数自体は static に保存されず、warp dispatch に到達するたびに読み直されます。複数 GPU を使う場合、最初の判定後に別 GPU へ切り替えた際の `volta` 再判定は行われません（`engine/src/prefill/kernels.cu:3152, 3161-3163`）。
 
 ## 実行時の詳細
 
-環境変数は `gdn_recurrence_variant()` の呼び出しごとに `getenv()` し、`atoi` で判定します。プロセス中の環境変更は次の recurrence 呼び出しで反映されます。一方、Volta 判定と `STRATA_GDN_REC_HEADS` の判定は初回呼び出し時の `static` 値です。
+通常の prefill 処理で GDN recurrence に到達すると、実験的 CUDA build では `STRATA_GDN_CHUNK` と `STRATA_GDN_REC_WARP` をその呼び出しで読みます。serial / chunked / `T > 0` / `volta` を組み合わせて `warp_rec` を決め、`warp_env == 2` のときは 4 accumulator の chain-split kernel、それ以外の非ゼロ値では warp-local reduction kernel を起動します。どちらも state を更新し、recurrence 出力 `y` を作ります。`with_out` が真なら後続の norm kernel で `y16` も生成します。warp dispatch が選ばれない場合は後続の標準 recurrence dispatch に進み、`STRATA_GDN_PIPELINE` 等の別条件が通常 kernel を選びます（`engine/src/prefill/kernels.cu:3161-3188`）。
 
-`2` のときは、従来 pipelined kernel の2本の積和 chain を各4 accumulator に分割した kernel を起動します。各 accumulator の部分和をまとめるため、FP32 の加算順序が変わります。それ以外の非0値では、8列を warp が担当し、row group の reduction を shuffle で行う kernel を起動します。こちらは従来 kernel と同じ演算順序を保ち、同期 barrier を使わない実装です。どちらの経路も recurrence の後に `gdn_out_norm_kernel` を起動します。
+この変数について CLI 引数、設定ファイル、子プロセスへの転送、起動時の engine 側設定は確認できませんでした。実行中に環境値を変更した場合は次の recurrence 呼び出しから値の読み直しが反映されます。ただし build macro と一度だけ評価される `volta` / `serial` 条件は変わりません。
 
-環境変数に由来する専用ログや警告はこの実装箇所にはありません。
+失敗時、kernel launch 後の CUDA エラーは `check("gdn_recurrence")` が `cudaGetLastError()` で検出し、`strata::core::exit_device_error` に渡します。対象変数固有の警告や fallback ログはありません（`engine/src/prefill/kernels.cu:110-116, 3273-3279`）。
 
-## 文書・測定値との照合
+## ログと測定値
 
-`docs/NVIDIA_V100.md` は `STRATA_GDN_REC_WARP=2` を V100 の opt-in chain-split とし、recurrence の +6–9% を contributor の測定値として記載しています。同文書は測定が contributor によるもので maintainers によるものではないと説明しています。ソースのコメントも +6–9% と記載し、FP32 レベルで summation order が異なることを明記しています。測定条件の詳細は同資料の該当表にないため、ここでは性能値を他環境へ一般化しません。`STRATA_GDN_REC_WARP=1` の bit-exact sync-free variant については、同じ資料が測定上遅かったため bitwise control として残したと記しています。
+本番 recurrence dispatch は、この値の選択や選択 kernel をログ出力しません。CUDA launch error があれば上記の共通エラー経路に進みます。開発用 `gdn_harness` は設定されていれば環境値を `env STRATA_GDN_REC_WARP=<値>` の形式で表示しますが、これは harness の診断出力です（`engine/src/prefill/gdn_harness.cu:450-452`）。
+
+`docs/NVIDIA_V100.md` は `STRATA_GDN_REC_WARP=2` について recurrence の `+6-9%` と記載し、同資料の opt-in 表では FP32 summation order を変えるとしています（`docs/NVIDIA_V100.md:79, 128-138`）。この測定表には当該行のモデル、量子化、prompt 長、試行回数等の条件が示されていないため、この値は資料上の報告としてのみ扱い、一般的な速度向上とは断定できません。
 
 ## 根拠
 
-- `src/prefill/kernels.cu:435-480` — warp-reduction kernel と計算順序。
-- `src/prefill/kernels.cu:641-704` — chain-split kernel と演算順序の差。
-- `src/prefill/kernels.cu:2666-2703` — compile guard、値の読み取り、dispatch、chunked recurrence との優先関係、後続 norm。
-- `src/prefill/kernels.cu:2611-2614` — `STRATA_GDN_REC_HEADS` による serial 選択。
-- `src/prefill/gdn_chunk.cu:523-529` — HIP / build 条件と runtime capability 70 の判定。
-- `CMakeLists.txt:181-219,707-718` — 実験 build の説明と prefill source の構成。
-- `docs/NVIDIA_V100.md:93-105` — V100 opt-in switch と contributor 測定値。
+- 値読み取り、分岐、起動、norm: `engine/src/prefill/kernels.cu:3145-3184`
+- recurrence の通常呼び出し: `engine/src/prefill/prefill.cpp:5203-5210, 9339-9343`
+- build macro: `engine/cmake/backends/cuda.cmake:28, 76-80`
+- CC 判定: `engine/src/prefill/gdn_chunk.cu:498-530`
+- serial gate と一度だけの評価: `engine/src/prefill/kernels.cu:3083-3088, 3152-3163`
+- kernel の演算差: `engine/src/prefill/kernels.cu:553-597, 759-820`
+- 共通 CUDA error 経路: `engine/src/prefill/kernels.cu:110-116, 3273-3279`
+- harness の環境値表示: `engine/src/prefill/gdn_harness.cu:450-452`
+- 設計上の適用条件と測定表: `docs/GDN_CONTRACT.md:71-72`, `docs/NVIDIA_V100.md:79, 128-138`

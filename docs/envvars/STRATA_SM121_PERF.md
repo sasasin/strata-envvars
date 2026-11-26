@@ -1,47 +1,58 @@
 # `STRATA_SM121_PERF`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。対象は Strata 所有ソースであり、外部ライブラリや GPU driver の環境変数動作は含めない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-NVIDIA compute capability 12.1（sm_121、GB10 / DGX Spark）で、Strata が起動時に設定する4個の性能関連環境変数の既定値セットを有効にするか抑止するスイッチです。sm_121 は Strata の CUDA ビルドで、可視 CUDA device がすべて同じ compute capability 12.1 の場合に限って対象になります。値が有効でも `STRATA_DEFAULTS=026` が有効ならセットは適用されません。
+CUDA compute capability 12.1（GB10 / DGX Spark）向けの起動時既定値セットと、sm_120 系 kernel のうち GB10 でも測定済みの既定を制御する。未設定時は有効で、`STRATA_SM121_PERF=0` はその既定を無効にする。既定値セットは engine 初期化処理で個別スイッチが読まれる前に環境へ設定され、設定された個別スイッチが各処理を選ぶ。個々の既定ルールは CUDA kernel からも GPU ごとに評価される。ソース上の対象は `engine/src/core/nv_defaults.cpp`、`engine/include/strata/core/sm120_series.hpp` と CUDA kernel 群。
 
-この変数が有効な場合、プロセス環境にまだ設定されていない次の値を設定します: `STRATA_PF_FUSED=1`、`STRATA_PREFILL_NVFP4=w4a4`、`STRATA_HC_UPMIX=1`、`STRATA_SPEC_COST=1`。対象の個別スイッチが環境にすでにあれば、その値が何であっても保持されます。
+既定値表は `STRATA_PF_FUSED=1`、`STRATA_PF_FUSED_KQ=1`、`STRATA_HC_UPMIX=1`、`STRATA_SIDE_MIXER=2`、`STRATA_SPEC_COST=1`、`STRATA_DEQUANT_SIDE=1`、`STRATA_QFUSE=1`、`STRATA_LFUSE=1`、`STRATA_PLE_COMPACT=1`、`STRATA_PLE_COPY_STREAM=1`、`STRATA_PREFILL_NVFP4=w4a4`。主 GPU の報告 VRAM が閾値以下なら `STRATA_ADAPT_FETCH=2`、そうでなく閾値より大きければ `STRATA_VERIFY_DEVICE_HITS=1` も候補に加わる。各個別変数が既に環境にあれば、その値は変更しない。加えて、CUDA kernel の既定値ルールでは GB10 に `STRATA_ATTN_DAILY` と `STRATA_GR_DOWN_TG` の既定も有効になる（後者は 48 SM の GB10 で 2）。さらに CUDA grouped expert mode は `STRATA_EXP_MODE` が未設定なら GB10 で 8 を選ぶ。これらの kernel 既定も対象変数または `STRATA_DEFAULTS=026` により無効になる。`STRATA_SM121_PERF` 自体は、個別スイッチの一般的な実行時効果を一括して書き換えるのではなく、これらの既定選択を止めるスイッチである。`engine/src/core/nv_defaults.cpp:176-217`、`engine/src/core/nv_defaults.cpp:222-255`、`engine/include/strata/core/sm120_series.hpp:63-81`、`engine/src/kernels/cuda/iq_kernels.cu:6792-6802`、`engine/src/kernels/cuda/fused_gr.cu:1582-1607`
 
 ## 値と判定
 
-| `STRATA_SM121_PERF` | 表の判定 |
-|---|---|
-| 未設定 | 有効（既定） |
-| 空文字 | 有効。設定値は存在するが、先頭文字は `\0` であり `'0'` ではない |
-| 先頭文字が `0` の値（例: `0`, `0anything`） | 無効 |
-| その他の設定値（例: `1`, `false`, `0` 以外で始まる任意文字列） | 有効 |
+値の規則は読み取り箇所で一致しない。`nv_defaults.cpp` の表は設定値の先頭文字が `0` なら停止し、それ以外なら有効とする。一方、GPU kernel の GB10 既定判定は `atoi(value) != 0` を使う。従って、空文字や `false` などでは表の設定だけ行われて GPU kernel 側の既定は停止する場合がある。`engine/src/core/nv_defaults.cpp:14-18`、`engine/include/strata/core/sm120_series.hpp:66-73`
 
-実装は文字列全体を parse せず、先頭文字が `'0'` かだけを比較します。したがって `false` や `no` も有効、`0anything` も無効です。空白除去、大文字小文字変換、数値変換、範囲検査はありません。根拠: `src/core/nv_defaults.cpp:13-16,53-57`。
+| 読み取り経路 | 未設定 | 有効になる値の例 | 無効になる値の例 |
+|---|---|---|---|
+| GB10 の起動時既定値表 (`off`) | 有効 | `1`, `true`, 空文字, ` 0`, `abc` | `0`, `0anything`, `01` |
+| sm_120 系 CUDA kernel の GB10 既定判定 (`atoi`) | 有効 | `1`, `2`, `1anything` | `0`, `0anything`, 空文字, `false`, ` 0` |
+
+`atoi` は先頭の空白と符号付き整数部分を読み、整数に変換できない文字列は 0 として扱う。変換後の値が非ゼロかだけを判定するため、小数部・末尾文字列は無視される。表側の判定は文字列全体を parse せず `v[0] == '0'` のみを見る。いずれも大文字小文字を変換・比較しない（表側は最初の文字だけなので、`false` は停止条件に当たらない）。`engine/src/core/nv_defaults.cpp:14-18`、`engine/include/strata/core/sm120_series.hpp:67-71`
 
 ## 有効になる条件
 
-- NVIDIA CUDA ビルドであること。呼び出しは `!STRATA_USE_HIP && !STRATA_GPU_METAL` のコンパイル条件内にあります。
-- CUDA の可視 device が1台以上あり、全 device から取得した compute capability major/minor が同じであること。異なる capability、device 数が0、または取得失敗の場合、この既定値適用ブロックは実行されません。
-- capability が 12.1 であること。sm_120 など他の GPU にはこの表はありません。
-- `STRATA_DEFAULTS` が `026`、`0.2.6`、`v0.2.6` のいずれでもないこと。これらは完全一致で判定され、該当すれば sm_121 の表は空になります。`STRATA_SM121_PERF` を `1` にしてもこのマスター設定を打ち消しません。
-
-適用対象となる個別スイッチについては、プロセス環境にすでに値があればその値を維持します。たとえば個別スイッチの値が `0` でも既定の `1` や `w4a4` で上書きしません。ここでの優先順位は、表の適用可否では `STRATA_SM121_PERF=0` または `STRATA_DEFAULTS=026` が表全体を止め、表が適用可能な場合の各値では利用者が設定した個別環境変数が既定値より優先、です。該当する CLI 引数による上書き処理はこの表の実装にはありません。
-
-根拠: `src/program/generate.cpp:3445-3462`, `src/core/nv_defaults.cpp:19-24,53-57,82-92`, `include/strata/core/defaults_026.hpp:21-29`。
+- 起動時の既定値表を適用する経路は CUDA build であり、`generate.cpp` の呼出しは HIP と Metal を除外する。CUDA device が 1 台以上見つかり、全可視 device の compute capability が同一で、その値が 12.1 のとき `apply_nv_defaults` が呼ばれる。異種 GPU 構成、device 属性取得失敗、CUDA device がない場合、この起動時表は適用されない。`engine/src/program/generate.cpp:4421-4449`
+- 表は `STRATA_DEFAULTS` が `026`、`0.2.6`、`v0.2.6` のいずれかと完全一致する場合も空になる。`STRATA_DEFAULTS` は初回呼出し時に cache される。`engine/include/strata/core/defaults_026.hpp:21-29`、`engine/src/core/nv_defaults.cpp:176-180`
+- 表の各変数が既に設定されていれば、値が `0` や空文字でもユーザー設定として保持され、表から上書きされない。個別変数の最終的な有効・無効規則はその変数の読み取り実装に従う。`engine/src/core/nv_defaults.cpp:222-234`
+- `STRATA_ATTN_DAILY` と `STRATA_GR_DOWN_TG` の GPU 既定判定は CUDA kernel の経路で使われ、HIP build ではそれぞれ早期に無効を返す。`sm12x_default` に渡された当該スイッチの GB10 測定定数が true のときだけ `STRATA_SM121_PERF` が判定に参加する。ほかの GB10 定数は false である。`engine/include/strata/core/sm120_series.hpp:93-101`、`engine/src/kernels/cuda/qsa_decode_attn.cu:902-923`、`engine/src/kernels/cuda/fused_gr.cu:1582-1607`
+- 対象変数は sm_121 向けで、sm_120 の既定規則は `sm12x_default` の別分岐であるため、この変数では止まらない。`engine/include/strata/core/sm120_series.hpp:60-81`
+- `STRATA_EXP_MODE` が未設定のときの CUDA grouped expert mode 8 は、compute capability 12.1、`STRATA_DEFAULTS=026` 以外、そして `STRATA_SM121_PERF` が未設定または `atoi` で非ゼロという条件を使う。HIP ではこの CUDA mode-selection 経路を使わない。`engine/src/kernels/cuda/iq_kernels.cu:6792-6802`
+- CLI 引数による `STRATA_SM121_PERF` の上書き読み取りは見つからなかった。モデル内に K-quant experts がある場合だけ、別個に設定される `STRATA_PF_FUSED_KQ` がその prompt 経路に関係するが、対象変数の表適用自体にモデル種別の条件はない。`engine/src/program/generate.cpp:4421-4449`、`engine/src/core/nv_defaults.cpp:185-192`
 
 ## 実行時の詳細
 
-Strata の `generate` 起動経路は CUDA device 数と各 device の compute capability を調べ、全 device が同一なら `apply_nv_defaults()` を呼びます。この呼び出しは engine のスイッチ読み取りより前に行われます。`nv_default_env()` は sm_121 の条件と両方の抑止条件を確認して既定値一覧を作り、`apply_nv_defaults()` は未設定の項目だけをプロセス環境へ追加します（Windows は `_putenv_s`、その他は `setenv(..., 0)`）。この関数には `STRATA_SM121_PERF` の独自キャッシュはありませんが、起動経路で表を適用するのはこの初期化時です。`STRATA_DEFAULTS` の判定は `qwen_defaults_026()` 内の `static const bool` に保存され、最初の評価後はプロセス中に環境値を変更しても再評価されません。
+CUDA engine の初期化では、可視 GPU の compute capability がすべて同一の場合に、代表値と `STRATA_PRIMARY_DEVICE`（未設定時は device 0）で選ばれる主 GPU のメモリ量を使い `apply_nv_defaults` を呼ぶ。GB10 かつ `STRATA_SM121_PERF` の表判定が有効で、`STRATA_DEFAULTS=026` でなければ既定値表を作る。未設定のスイッチだけを Windows では `_putenv_s`、それ以外では `setenv(..., 0)` でプロセス環境に追加し、以後の engine/kernel が読む。`engine/src/program/generate.cpp:4421-4449`、`engine/src/core/nv_defaults.cpp:176-180`、`engine/src/core/nv_defaults.cpp:222-239`
 
-1つ以上の値を新たに設定したときだけ stderr に1行出ます。sm_121 の場合の形式は `strata: sm_121 (GB10): N speed switches on by default (STRATA_SM121_PERF=0 turns them off, as does STRATA_DEFAULTS=026; a switch you set is kept): ...` です。すべての個別値がすでに設定済みの場合、抑止条件に該当する場合、または対象外の GPU 条件の場合は、この呼び出しから既定値設定ログは出ません。終了やエラーをこの変数単独で発生させる処理は確認できません。
+起動時表判定の `off("STRATA_SM121_PERF")` は関数呼出しごとに `getenv` し、static cache は持たない。`sm121_series()` の kernel 既定判定と `iq_kernels.cu` の grouped expert mode 判定は初回呼出し時の `getenv` と `atoi` の結果を関数内 `static` に保存する。関連 kernel もスイッチ判定を static に保存し、GPU ごとの既定を `per_dev[64]` に cache する。従って実行中に環境値を変更しても、既に評価された既定判定や device の選択は更新されない。子プロセスへの転送を行うコードはこの変数について確認できなかった。`engine/src/core/nv_defaults.cpp:14-18`、`engine/include/strata/core/sm120_series.hpp:67-73`、`engine/src/kernels/cuda/iq_kernels.cu:6792-6802`、`engine/src/kernels/cuda/qsa_decode_attn.cu:906-922`、`engine/src/kernels/cuda/fused_gr.cu:1587-1607`
 
-Strata の `docs/DGX_SPARK_LINUX.md:114-123` は同じ4設定を GB10 上の既定として記載し、`STRATA_SM121_PERF=0` または `STRATA_DEFAULTS=026` で全体を止められると説明しています。同文書の測定表は release-candidate 0.2.7.1、DGX Spark 1台、2026-10-27 の測定として記載されています（`docs/DGX_SPARK_LINUX.md:90-103`）。この文書ではそこに記載された測定値を一般的な性能保証として扱いません。
+## ログと測定値
+
+既定値表から一つ以上の変数を追加した場合は stderr に次の形式で一行を出す。件数と個別スイッチ名は実行条件と、既にユーザー設定されているスイッチにより変わる。
+
+```text
+strata: sm_121 (GB10): %zu speed switches on by default (STRATA_SM121_PERF=0 turns them off, as does STRATA_DEFAULTS=026; a switch you set is kept): ...
+```
+
+表が無効、または個別変数がすべて既に設定されていて追加がない場合、このログは出ない。GPU kernel の `sm121_series()` 判定自体はログを出さない。測定値はこの文書では扱わない。`engine/src/core/nv_defaults.cpp:240-255`
 
 ## 根拠
 
-- 読み取りと表選択、sm_121 の4既定値: `src/core/nv_defaults.cpp:13-16,19-24,53-79`
-- 既定値の注入、個別設定の保持、stderr ログ: `src/core/nv_defaults.cpp:82-106`
-- CUDA ビルド条件、可視 device の capability 一致判定、engine の読み取り前に適用: `src/program/generate.cpp:3445-3462`
-- `STRATA_DEFAULTS` の受理文字列と初回評価キャッシュ: `include/strata/core/defaults_026.hpp:21-29`
-- GB10 のスイッチ説明と測定条件: `docs/DGX_SPARK_LINUX.md:90-103,114-123`
+- `engine/src/core/nv_defaults.cpp:14-18` — 起動時表の値判定 helper。
+- `engine/src/core/nv_defaults.cpp:176-219` — GB10 の表、`STRATA_DEFAULTS=026` 条件、主 GPU メモリ依存の追加。
+- `engine/src/core/nv_defaults.cpp:222-255` — 個別設定の保持、プロセス環境への追加、stderr ログ。
+- `engine/include/strata/core/sm120_series.hpp:63-81` — GB10 判定、対象変数の `atoi` と static cache、sm_120 系既定規則。
+- `engine/src/program/generate.cpp:4421-4449` — CUDA 起動経路、同一 compute capability 条件、主 GPU の選択と表適用。
+- `engine/src/kernels/cuda/iq_kernels.cu:6792-6802` — `STRATA_EXP_MODE` の GB10 既定判定にも対象変数を直接使用し、device 別に cache。
+- `engine/src/kernels/cuda/qsa_decode_attn.cu:902-923` — `STRATA_ATTN_DAILY` の CUDA / HIP 分岐と device 別既定 cache。
+- `engine/src/kernels/cuda/fused_gr.cu:1582-1607` — `STRATA_GR_DOWN_TG` の値解釈と GB10 device 判定。
+- `engine/include/strata/core/defaults_026.hpp:21-29` — `STRATA_DEFAULTS` の許容文字列と static cache。

@@ -1,50 +1,50 @@
 # `STRATA_DEC_BATCH`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。CUDA/HIP 実装と Strata の SYCL エンジンを確認。外部ライブラリの環境変数の動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-検証用 decode window に複数行があるとき、対応する GPU 計算やデータ転送を複数 token まとめて処理する経路を許可します。無効にすると、これらの経路の一部が token ごとの処理に戻ります。検証 window 自体や lookahead の有効・無効を切り替える変数ではありません。
+CUDA/HIP 系と SYCL の verifier が、複数行をまとめて処理する decode/verify window の経路を使うかを制御する。未設定では有効、`0` 相当では対象の処理をトークン単位に戻す。window の query/key/value 投影・RoPE・KV/indexer 追記、router、expert combine、hyper-connection write など複数の箇所に適用される（CUDA/HIP 系: `engine/src/core/verify.cpp:1489,2059-2060,2105-2110,2352-2355,2636-2660,2956-2964,2984-2988`; SYCL: `engine/sycl/src/core/verify.cpp:1048,1342-1352,1367-1418,1576-1605,1815-1823,1839-1843`）。また native shared expert の gate projection も複数行で実行する分岐があり、expert source の mapped-hit 行を GPU 側でゼロ化済みとして扱う条件にも使われる（`engine/src/kernels/cuda/shared_expert.cu:263-280`; `engine/sycl/src/kernels/cuda/shared_expert.dp.cpp:379-420`; `engine/src/core/expert_source.cpp:5727-5735,5827-5835`; `engine/sycl/src/core/expert_source.cpp:2724-2728,2762-2769`）。
 
-対象は CUDA/HIP の `Verifier::record_window()`、SYCL エンジンの同名処理、および CUDA/SYCL の shared expert 実装です。効果には別の backend 機能、window 行数、モデル形状、他の設定を必要とするものがあります。
+この変数は出力や選択結果を直接指定する CLI 引数ではない。multi-row kernel が選べるかを変える。個々のコードコメントは一部の演算について行ごとの算術が single-token 経路と同じと説明するが、このフラグが全モデル・全機能で出力同一性を保証するという記述はない（CUDA/HIP: `engine/src/core/verify.cpp:2047-2059,2629-2655`; SYCL: `engine/sycl/src/core/verify.cpp:1341-1347,1576-1601`）。
 
 ## 値と判定
 
-値は `std::atoi()` で変換し、結果が 0 かどうかで判定します。文字列全体の厳密な数値検証はしません。
+読み取りは `std::getenv("STRATA_DEC_BATCH")` の後 `std::atoi`。各読み取り箇所で「未設定なら true、設定されていれば `atoi(value) != 0`」を判定する。したがって空文字、数字で始まらない文字列、`0`、`0anything` は false。`1`、`-1`、`2`、`1anything` は true（`atoi` が数値として変換する先頭部分を使う）。先頭空白は `atoi` の規則で読み飛ばされる。`true`/`false` は文字列として認識されず、どちらも `atoi` は 0 を返す。大文字小文字の比較はない。
 
-| 環境変数の状態・値 | 判定 |
-|---|---|
-| 未設定 | 有効 |
-| 空文字 | 無効（`atoi("")` は 0） |
-| `0`、`00`、`0xyz`、数値で始まらない文字列 | 無効 |
-| `1`、`-1`、`2`、先頭の空白や符号の後に非ゼロ数値がある文字列 | 有効 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP verifier、SYCL verifier、expert source、native shared expert の各読み取り | 有効 (`true`) | `1`, `2`, `-1`, `1junk` | 空文字, `0`, `0anything`, `false`, `junk` |
 
-読み取りは各ソース内の関数ローカル `static const bool` の初回初期化時です。CUDA/HIP verifier、SYCL verifier、CUDA shared expert、SYCL shared expert はそれぞれ独立して判定値を保持します。通常これらは同じプロセス内で同一の環境を読みますが、判定後に環境を書き換えても、既に初期化された判定は更新されません。
+既定値と判定は読み取り箇所ごとに同じで、CLI 引数や設定ファイルによる上書き処理はこれらの箇所にない。`STRATA_NO_BATCH_KV_STEP=1` は verifier の KV/indexer 追記を別途逐次化し、`STRATA_NO_MULTI_GR=1` は GR write を別途逐次化するため、`STRATA_DEC_BATCH` が有効でも該当処理はまとめられない（`engine/src/core/verify.cpp:348-349,2105-2110,2352-2355,2984-2988`; SYCL: `engine/sycl/src/core/verify.cpp:1369-1389,1409-1418,1839-1843`）。
 
 ## 有効になる条件
 
-- 複数行の処理を持つ検証 window で効果が現れます。個々の分岐には `n > 1` の条件があり、1 行ならバッチ専用経路を使いません。
-- CUDA/HIP では `record_window()` の `dec_batch` 判定が residual write、Q/K/V や indexer の処理、MoE router・combine、CPU 側 expert 結果の GPU 転送などの条件に使われます。別の switch（例: `STRATA_NO_MULTI_GR`、`STRATA_NO_BATCH_KV`）や batch-recording 経路により、個別の最適化が使われない場合があります。
-- `STRATA_PLE_BATCH` が有効な場合の PLE key/value projection の一括処理にも `dec_batch` が必要です。また resident mode の shared expert gate 融合は `dec_batch` に加え、`STRATA_LFUSE`、native combine/BF16 条件、2〜8 行を必要とします（`src/core/verify.cpp:853-855, 961-975`）。
-- MoE router の一括経路は、CUDA では native router が有効で `NE == 512`、`K == 10` の場合に使われます。HIP `gfx906` には `moe_route_window()` 経路があります。それ以外は token ごとの router にフォールバックします。SYCL では native router の一括経路が `NE == 512` または `256`、`K == 10` に対応します。
-- Shared expert の gate projection を一回の multi-row GEMV にするには、native BF16 経路と `n_tok > 1` が必要です。条件が合わないと token ごとの処理に戻ります。
-- 文書・ベンチ結果ディレクトリには変数名の記載がありますが、`docs/` にこの変数の設定仕様を説明する記述は見当たりませんでした。速度や出力の同一性はこの調査では測定していません。
+- 実行経路が該当 verifier または native shared expert に到達すること。環境変数を読むだけで、別の通常 decode 経路を強制的に batch 化するものではない（CUDA/HIP verifier の `Verifier::record_window`: `engine/src/core/verify.cpp:1468-1489`; SYCL: `engine/sycl/src/core/verify.cpp:1018-1048`）。
+- 多くの multi-row 分岐は `n > 1` を条件にする。1 行の window ではこの設定による複数行処理は発生しない（例: `engine/src/core/verify.cpp:2059,2636,2956`; SYCL: `engine/sycl/src/core/verify.cpp:1343,1583,1815`）。
+- QSA の query/key/value 複数行経路は native QSA と native RoPE が使える場合に限られる。CUDA/HIP ではさらに `STRATA_DF_QB_Q4` が unset または `atoi != 0` であることが必要で、KV が Q4 のとき `STRATA_DF_QB_Q4=0` ならこの経路を使わない。SYCL 側は `st.kv_q4` の場合に無効（`engine/src/core/verify.cpp:2035-2059`; `engine/sycl/src/core/verify.cpp:1338-1347`）。KV/indexer の一括追記は、さらに `STRATA_NO_BATCH_KV_STEP` が無効で、batch-rec window でないことが条件（CUDA/HIP: `engine/src/core/verify.cpp:2105-2112,2352-2355`; SYCL: `engine/sycl/src/core/verify.cpp:1367-1389,1409-1418`）。
+- Router の一括経路は backend の native router・expert 数・top-k などの条件にも依存する。CUDA/HIP では native 経路が `NE == 512 && K == 10`、または `route_window_on()` のとき。SYCL native 経路は `NE == 512 || NE == 256` と `K == 10`、HIP gfx906 では別の `moe_route_window` 経路がある（CUDA/HIP: `engine/src/core/verify.cpp:2631-2660`; SYCL: `engine/sycl/src/core/verify.cpp:1578-1605`）。条件が合わない場合は `moe_route` の行ループへ進む。
+- multi-row MoE combine には `native_moe_combine_enabled()` も必要。それ以外では `moe_combine_parts` を行ごとに呼ぶ（CUDA/HIP: `engine/src/core/verify.cpp:2944-2964`; SYCL: `engine/sycl/src/core/verify.cpp:1810-1823`）。shared expert の gate を複数行で計算する分岐にはさらに `native_bf16` と `n_tok > 1` が必要。`gate_deferred` の場合はその分岐より前に関数から戻る（CUDA: `engine/src/kernels/cuda/shared_expert.cu:216-220,258-280`; SYCL: `engine/sycl/src/kernels/cuda/shared_expert.dp.cpp:315-320,355-420`）。
+- expert source の `gpu_zeroes_hits` は値が有効なだけでは使われず、`d.plan != nullptr`、window entry 数が上限以下、`n <= d.plan->cap`、`STRATA_VERIFY_DEVICE_PLAN` と（CUDA/HIP では）`STRATA_VERIFY_DEVICE_HITS` の両方が有効でないことも条件。SYCL は `STRATA_VERIFY_DEVICE_PLAN` のみを確認する（CUDA/HIP: `engine/src/core/expert_source.cpp:5730-5735`; SYCL: `engine/sycl/src/core/expert_source.cpp:2727-2728`）。この条件を満たすと kind 0/1 の hit 行をホストで再度ゼロ化しない。
+- ソース上の読み取りは CUDA/HIP 系と SYCL 系にある。OS による値規則の差は見つからない。適用されない backend/build 経路での動作は、これらの読み取り箇所からは判断しない。
 
 ## 実行時の詳細
 
-CUDA/HIP verifier は `record_window()` の冒頭で値をキャッシュします。既定では decode window の複数行をまとめ、たとえば条件が揃った場合に residual write、QSA の K/V append と indexer append、router/top-10、MoE combine を複数行のカーネル呼び出しにします。行単位の計算に対応する箇所には token ごとの実装も残っています（`src/core/verify.cpp:845, 853-855, 965-1012, 1223, 1265-1322, 1433-1462, 1663-1679`）。
+`Verifier::record_window` 内では最初にその関数が実行されたときに関数ローカル `static const bool dec_batch` が評価され、以後そのプロセス内で同じ関数の値を再利用する（CUDA/HIP: `engine/src/core/verify.cpp:1468-1489`; SYCL: `engine/sycl/src/core/verify.cpp:1018-1048`）。expert source と CUDA/SYCL shared-expert 関数にも別のローカル static があるため、それぞれの関数で初回評価時に独立してキャッシュされる（`engine/src/core/expert_source.cpp:5727`; `engine/sycl/src/core/expert_source.cpp:2724`; `engine/src/kernels/cuda/shared_expert.cu:263`; `engine/sycl/src/kernels/cuda/shared_expert.dp.cpp:379`）。したがって初回評価後にプロセス環境を変更しても、すでに評価済みの static には反映されない。読み取り時点はプロセス起動時とは限らず、それぞれの関数の初回到達時である。
 
-MoE の CPU expert 結果がある場合は、バッチ有効時に GPU 自身が処理する行を除いた mapped-memory の行コピーを使い、GPU hit 行のゼロ初期化も GPU 側に任せられる条件があります。`STRATA_VERIFY_DEVICE_PLAN` が有効な場合はこのゼロ化条件から除外されます（`src/core/verify.cpp:1635-1639`; SYCL expert source: `sycl/src/core/expert_source.cpp:2706-2710, 2751-2759`）。
+有効時、条件を満たす verifier 処理は window の複数行を一括で投影・追記・router・combine 等へ渡し、条件が成立しないか値が false の場合は行ループの経路へ進む。無効時も `STRATA_DEC_BATCH` 自体によるエラーや終了処理はない。CUDA/HIP の verifier には batch-rec window 時、`dec_batch` と `STRATA_BATCH_SLOT_RUNS` の両方が有効なら同じ slot の行をまとめる別分岐もある（`engine/src/core/verify.cpp:1490-1501`）。SYCL にこの `slot_runs` 分岐はない。
 
-SYCL verifier も同様の既定値と `atoi` 判定を持ちますが、router の native multi-row 条件は CUDA/HIP と完全には同じではありません（`sycl/src/core/verify.cpp:825, 1309-1334`）。
+expert source では、GPU による mapped-row copy が hit 行をゼロ化する場合に限り、後続の CPU 側 `memset` を省く。`STRATA_VERIFY_DEVICE_PLAN=1`（CUDA/HIP では `STRATA_VERIFY_DEVICE_HITS=1` も）を使う経路では、この GPU-side zeroing 判定から外れる（`engine/src/core/expert_source.cpp:5727-5735,5827-5835`; `engine/sycl/src/core/expert_source.cpp:2724-2728,2762-2769`）。
 
-設定値に応じた専用ログは見つかりませんでした。失敗時のエラーは各処理の既存経路から返されます。たとえば CUDA verifier の router/combine は例外を `verify router: ...` / `verify combine: ...` として `err` に設定します（`src/core/verify.cpp:1438-1448, 1652-1667`）。
+## ログと測定値
+
+この変数専用の警告・ログ・失敗文言はない。CUDA/HIP verifier は router 分岐後に `router layer: batched native router=...` を `dispatch::notef` で通知し、combine では `combine layer: kind ... (0 per-token, 1 multi, 2 multi+hits, 3 multi+hits gated)` を通知する。ただしこれらは実際の経路状態を示す診断であり、`STRATA_DEC_BATCH` の値そのものの表示ではない（`engine/src/core/verify.cpp:2662-2663,2944`）。SYCL 側に同じ router/combine 文言の `notef` はない。エラー時は router/combine/shared expert の失敗が verifier の `err` に設定される（例: `engine/src/core/verify.cpp:2646,2752-2755,2956-2964`; SYCL router/combine: `engine/sycl/src/core/verify.cpp:1593,1811-1823`）。この変数による起動失敗や終了コードの分岐はない。
+
+`docs/DETAILS.md` の opt-in switches 表にはこの変数の仕様・測定値の記載がない。リポジトリ内の過去ベンチ記録には設定値を使った比較があるが、現行コードの仕様や一般的な性能値の根拠にはしていない。
 
 ## 根拠
 
-- `src/core/verify.cpp:845, 853-855, 965-1012, 1223, 1265-1322, 1433-1462, 1627-1645, 1663-1679` — CUDA/HIP verifier の判定と使用箇所。
-- `src/kernels/cuda/shared_expert.cu:246-264` — CUDA shared expert の判定と multi-row / per-token 分岐。
-- `sycl/src/core/verify.cpp:825, 838-839, 920-957, 1097, 1123-1168, 1309-1334, 1487-1515, 1522` — SYCL verifier の判定と使用箇所。
-- `sycl/src/kernels/cuda/shared_expert.dp.cpp:377-428` — SYCL shared expert の判定と分岐。
-- `sycl/src/core/expert_source.cpp:2706-2710, 2751-2759` — SYCL expert source が GPU hit 行のゼロ化を省略する条件。
-- `docs/DETAILS.md`, `docs/AMD_HIP.md` — 関連する検証・backend 説明を照合。`STRATA_DEC_BATCH` の仕様記述は確認できず。
+- `engine/src/core/verify.cpp:1468-1501,2035-2060,2105-2120,2350-2355,2631-2663,2737-2755,2847-2861,2944-2964,2984-2992`
+- `engine/sycl/src/core/verify.cpp:1018-1065,1338-1352,1367-1418,1576-1608,1658-1675,1805-1823,1839-1847`
+- `engine/src/core/expert_source.cpp:5727-5735,5827-5835`; `engine/sycl/src/core/expert_source.cpp:2724-2728,2762-2769`
+- `engine/src/kernels/cuda/shared_expert.cu:216-220,258-283`; `engine/sycl/src/kernels/cuda/shared_expert.dp.cpp:315-320,355-420`

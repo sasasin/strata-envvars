@@ -1,52 +1,54 @@
 # `STRATA_DF_BRANCH`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-推測検証 (`Verifier`) が記録する CUDA graph の中で、同じレイヤー入力だけを読む一部の計算を追加 stream に分岐させる opt-in 設定。分岐先は GDN レイヤーの gate/beta と `z` の計算、および条件を満たす QSA レイヤーの query と indexer query である。通常の演算を別の値に置き換える設定ではなく、入力依存が独立した計算を並行して graph に記録する。既定値は無効。
+CUDA/HIP verifier の graph capture 内で、GDN mixer のゲート `a/b` と投影 `z`、および条件を満たす QSA 層の query 計算を、入力だけを読む並列 side stream に分ける opt-in スイッチ。main stream 上の K/V 投影や convolution などと重ねて graph に記録し、イベントで依存関係をつなぐ。使うのは `Verifier::record_window` の単独 window 経路であり、通常の逐次実行や出力値を選ぶ機能ではない（`engine/src/core/verify.cpp:1364-1375,1549-1552,1610-1617,1922-1929,1958-1960,2061-2075,2414,2578`）。
+
+初期値は `false`。ただし verifier の CUDA/HIP 初期化時に値が有効なら、side stream 2 本と fork/join event を用意する。確保に失敗した場合はフラグを `false` に戻し、従来経路を使う（`engine/src/core/verify.cpp:1364-1375`）。
 
 ## 値と判定
 
-| 環境変数の状態・値 | `df_branch_` |
-| --- | --- |
-| 未設定 | 無効 |
-| 空文字 | 無効 (`atoi("")` は 0) |
-| 数値変換結果が 0 | 無効 |
-| 数値変換結果が 0 以外 | 有効 |
+`Verifier::init` 内で `std::getenv` し、未設定ポインタでないことと `std::atoi(v) != 0` の両方を判定する。文字列全体の妥当性確認や `true` / `false` の解釈はない。`atoi` が読む先頭の整数部分が 0 なら無効、非 0 なら有効となる。したがって空文字・数値に変換できない文字列は 0 扱い、`0anything` は無効、`1anything` と `-1` は有効。先頭の空白や符号を含む整数文字列も `atoi` の変換規則に従う。整数範囲外の入力の結果はこのコードで保証されない（`engine/src/core/verify.cpp:1367-1368`）。
 
-読み取りは `Verifier::init` 中に一度行い、`std::atoi` の結果を `!= 0` で判定する。文字列全体の厳密な数値検証ではないため、先頭の空白や符号の後に数字があればその数値で判定し、数字の後ろの文字列は判定に影響しない（例えば `1x` は有効、`x1` は無効）。負の非ゼロ値も有効になる。初期化後の環境変更は保存済みの `df_branch_` を変えない。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP verifier の初期化 | 無効 | `1`、`-1`、`1anything` | 空文字、`0`、`0anything`、`true`、`abc` |
+| Metal verifier | `Verifier::init` が Metal 分岐で先に return するため、この読み取りに到達しない | 該当なし | 該当なし |
 
-有効時は共通の fork event、2組の side stream/event を作成する。これらの作成に失敗した場合は CUDA エラー状態を取得して `df_branch_` を無効に戻すため、分岐なしの経路へ進む。ここで専用の警告ログは出さない。
+CLI 引数による値の上書きはこの読み取り箇所にはない。Strata 内でこの変数を設定・転送する参照も確認できず、プロセス環境から直接読む（同名参照の全体検索結果では `verify.cpp` が唯一の実コード読み取り箇所）。
 
 ## 有効になる条件
 
-各 `record_window` 呼び出しで、さらに以下をすべて満たすときにだけ `br` が有効になる。
+- CUDA/HIP の verifier が初期化されること。Metal は `Verifier::init` の早期 return により読み取り・適用されない（`engine/src/core/verify.cpp:978-993,1367-1368`）。
+- window が単一グループであること。`G` は split window または長い window を二分すると 2 になり、それ以外は 1（`engine/src/core/verify.cpp:1484-1486`）。
+- batch capture (`batch_rec_`) でなく、`STRATA_VERIFY_PROFILE` が設定されておらず、`STRATA_SIDE_MIXER` が無効であること。`br` は `df_branch_ && G == 1 && !batch_rec_ && !prof_on_ && !side_mixer`（`engine/src/core/verify.cpp:1262,1503-1505,1610`）。
+- `STRATA_SIDE_MIXER` が未設定の場合、HIP は `g_side_mixer()` の既定値 0。CUDA は device compute capability が 12.0 の場合に既定で mode 2、それ以外は 0。したがって CUDA 12.0 では別途 `STRATA_SIDE_MIXER=0` を指定しない限り、この変数の分岐は抑止される。明示値は 0..2 に clamp され、1 または 2 なら side mixer が優先される（`engine/src/core/verify.cpp:272-292,1610`）。
+- 初期化時に stream/event の作成がすべて成功すること。失敗するとエラーをクリアして `df_branch_` を無効化し、通常の stream 経路に戻る（`engine/src/core/verify.cpp:1369-1375`）。
+- GDN 層ではゲートと `z` の計算を枝分けする。QSA 層の query 側の枝分けはさらに `qb` が真の場合だけ行われる（`engine/src/core/verify.cpp:1922-1930,2061-2075`）。
 
-- `df_branch_` が有効。
-- `G == 1`。`G` は通常 1 だが、batch でない `split_` の `T >= 2` ウィンドウでは 2 となり、その場合は分岐しない。
-- batch-rec 経路でない (`!batch_rec_`)。
-- stage profiler が有効でない (`!prof_on_`)。profiler の stamp は主 stream `cs` に記録されるため、分岐経路と併用しない。
-
-GDN レイヤーでは `br` が有効なら分岐を使う。QSA レイヤーでは追加条件として `qbr = br && qb` が必要である。`qb` は `STRATA_DEC_BATCH` が有効、ウィンドウ内の行数 `n > 1`、native QSA と native RoPE が有効、かつ KV cache が Q4 の場合には `STRATA_DF_QB_Q4` も有効であることを要求する。従って環境変数を有効にしても、これらの実行条件に合わない QSA 経路では通常の主 stream 処理となる。
+ソースには OS による分岐はない。初期化コメントは Linux の open modules/GSP 環境で過去に graph が停止した報告を理由に既定 OFF と記すが、Windows だけを有効化する条件などは実装されていない（`engine/src/core/verify.cpp:1364-1366`）。
 
 ## 実行時の詳細
 
-fork は主 stream `cs` の直前までの処理を event に記録し、side stream にその event を待たせる。join は side stream の完了 event を記録し、主 stream に待たせる。この依存関係により、分岐処理は fork より前の主 stream 処理を待ち、join より後の主 stream 処理は分岐処理を待つ。これらの stream/event 操作は `record_window` 内で graph capture される。
+設定は各 `Verifier::init` の初期化中に読み取られ、インスタンスの `df_branch_` に保持される。実行中に環境を変更しても既存 verifier の値は再読込されない。値が有効なら、初期化中に `df_fork_` と2組の side stream/join event を作る（`engine/src/core/verify.cpp:956-966,1364-1375`）。
 
-レイヤー処理では次の用途に使われる。
+`capture` は window の graph を初回に記録し、既に同じ graph executable があれば再 capture しない。`record_window` は `br` の条件を計算し、fork event を main stream に記録して side stream を待たせ、side stream の処理後に join event を記録して main stream を待たせる（`engine/src/core/verify.cpp:1610-1617,3254-3289`）。
 
-- ウィンドウ入力の step/position のコピーを最初のレイヤー処理と並行して side stream 1 に載せる。
-- GDN では、入力 `xm` からの gate/beta (`gdn_ab_multi`) と `z` (`native_mmvq`) を side stream 0/1 で実行する。主 stream は q/k/v 投影と convolution を進め、recurrence が gate/beta/z を読む前に両 side stream を join する。
-- 条件を満たす QSA では、query 投影と query の norm/RoPE/回転を side stream 0、indexer query とその norm/RoPE を side stream 1 で実行する。indexer query は block score の計算前に、query は attention 前に join する。
+GDN 層では `a/b` と `z` をそれぞれ side stream 0/1 で qkv projection と convolution に並行して投入し、再帰計算の前に両方を join する（`engine/src/core/verify.cpp:1922-1930,1958-1960`）。QSA 層では `qb` の場合、Q query の projection・norm/RoPE等を side 0、indexer query を side 1 で処理し、block score 前に indexer query、attention 前に query を join する（`engine/src/core/verify.cpp:2061-2075,2414,2578`）。同じ計算処理を異なる stream 順序で graph に記録する実装であり、分岐条件が満たされない場合は既定の main stream 経路を通る。
 
-コードコメントには Linux の open modules/GSP 構成で NVML query（例: `nvidia-smi`）がリクエスト間に入った際、分岐を使う stage の window が graph 内で停止した報告が記録されており、そのため既定で無効とされている。コメント記載の条件は 2x RTX 3090 と 2x RTX 2080 Ti で、Windows では未観測とされる。これは実装コメント内の過去報告であり、この調査で再現・測定した結果ではない。
+## ログと測定値
+
+`STRATA_DF_BRANCH` 固有の有効・無効ログや確保失敗の警告はない。初期化時の side stream/event 作成失敗では `df_branch_` を false に戻して継続する（`engine/src/core/verify.cpp:1369-1375`）。dispatch 記録が有効なら、window の note に `win df_branch=%ld sh_stream=%ld prof=%ld`、GDN 層に `gdn layer: side_gates=%ld side_proj=%ld df_branch=%ld` が記録される。実際に window で使う値は後者の `br` 条件付き値であり、前者は同じ適用条件をそのまま表す。dispatch note は `STRATA_DISPATCH_STATS=0` で抑止される（`engine/src/core/verify.cpp:1545-1548,1932`; `engine/include/strata/core/dispatch_stats.hpp:114-119,145-152`）。
+
+調査対象の `docs/DETAILS.md` にこの変数の測定値は見つからなかったため、速度・正確性の数値は記載しない。
 
 ## 根拠
 
-- `src/core/verify.cpp:540-541, 746-757`: `Verifier::init` 内の環境変数読み取り、`atoi` 判定、分岐用 stream/event 作成と失敗時の無効化。
-- `src/core/verify.cpp:826, 867-879`: graph window の記録、`br` の実行条件、fork/join の event 依存。
-- `src/core/verify.cpp:885-899, 1117-1127, 1147-1161`: 入力コピーと GDN の並行処理、recurrence 前の join。
-- `src/core/verify.cpp:1214-1241, 1324-1328, 1386-1392`: QSA query 分岐、`qbr` 条件に使う `qb`、block score/attention 前の join。
-- `include/strata/core/verify.hpp:443-448`: 分岐状態と side stream/event の保持。
-- `docs/DETAILS.md` および `docs/` 内に `STRATA_DF_BRANCH` の説明は見つからなかった。上記の挙動と制約は実装コードに基づく。
+- `engine/src/core/verify.cpp:1364-1375` — 環境読み取り、初期値判定、stream/event 確保と失敗時の fallback。
+- `engine/src/core/verify.cpp:1262,1484-1486,1503-1505,1610-1617` — profiler・window 分割・side mixer による適用条件と fork/join。
+- `engine/src/core/verify.cpp:1922-1930,1958-1960,2061-2075,2414,2578` — GDN/QSA の実際の並列処理と join。
+- `engine/src/core/verify.cpp:3254-3289` — window graph の capture と再利用。
+- `engine/include/strata/core/verify.hpp:677-682` — verifier に保持する flag・stream・event。
+- `engine/src/core/verify.cpp:272-292` — `STRATA_SIDE_MIXER` の mode と CUDA/HIP の既定値。

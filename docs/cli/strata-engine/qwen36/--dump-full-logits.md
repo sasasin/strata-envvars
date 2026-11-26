@@ -1,58 +1,56 @@
-# `--dump-full-logits`
+# `strata` / `strata-q36 --dump-full-logits`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査開始時の Strata checkout は `main...origin/main` で、`git status --short --branch` に未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | Qwen3.6 専用 parser（`strata --model QWEN35MOE.gguf` または `strata-q36`） |
+| コマンド | `strata`（Qwen3.6 モデル選択時）または `strata-q36` |
 | オプション | `--dump-full-logits` |
 | 別名 | なし |
-| 値 | 出力ファイルのパス（1 引数） |
+| 値 | 出力ファイル名。引数は文字列として受け取る。 |
 
 ## 役割
 
-`--tokens` による Qwen3.6 の単発生成で、各生成ステップの語彙全体の logits を float32 のバイナリファイルへ書き出します。実装コメントでは `tools/qwen35/kl.py` の比較用インターフェースとして位置付けられています。出力は通常の生成トークン表示とは別です（`src/qwen35/q36_engine.cu:17-18, 3960-3977`）。
+`--tokens` による単発生成で、生成各ステップの全語彙 logits を float32 のバイナリファイルへ順に保存します。推論結果の token ID だけではなく、各 token 候補の logits を後から比較・解析したい場合に使います。Qwen3.6 用 parser がこのオプションを登録し、通常の `strata` はモデル GGUF の architecture が `qwen35moe` の場合に同じ parser へ処理を渡します（`engine/src/qwen35/q36_engine.cu:5368`, `engine/src/program/generate.cpp:3805-3817`）。
 
 ## 使い方
 
 ```sh
-strata-q36 --model QWEN35MOE.gguf --tokens 1,2,3 --n 4 --dump-full-logits /tmp/q36-logits.bin
+strata --model model.gguf --tokens 1,2,3 --n 4 --dump-full-logits logits.f32
 ```
 
-同じ parser は `strata` にも組み込まれており、`--model` / `--native` で指定した GGUF の architecture が `qwen35moe` のとき選択されます。独立実行ファイル `strata-q36` は `src/qwen35/q36_main.cpp` から同じ `strata::qwen35::run` を呼びます（`src/program/generate.cpp:2393-2407`、`src/qwen35/q36_main.cpp:1-5`、`CMakeLists.txt:776-794`）。
+`strata-q36` を直接使う場合も、同じ引数を指定します。`--tokens` は prompt の token ID 列、`--n` は生成数です。実運用ではモデルと ID を対象データに合わせてください。
 
 ## 値と既定値
 
-- 値は次の argv 要素から取得されます。値を省略すると `strata-q36: --dump-full-logits needs a value` を stderr に出して終了コード 2 で終了します（`src/qwen35/q36_engine.cu:3742-3747, 3762`）。値のパス形式や拡張子の検証はありません。
-- 既定ではダンプしません。指定値は `dump_full` に保存され、トークン生成経路で空でなければ `fopen(path, "wb")` が呼ばれます。空文字列は空パスとして保持されますが、`dump_full.empty()` によりダンプ無効として扱われます（`src/qwen35/q36_engine.cu:3735-3741, 3916-3920`）。
-- 1回の通常トークン生成につき、既定の生成数は64ステップです。`--n N` または `--max-new N` が同じ `n_gen` を設定します。`--force IDS` が空でない場合は強制列の長さ + 1 に上書きします（`src/qwen35/q36_engine.cu:3736-3738, 3750, 3759-3762, 3916-3918`）。
+- 値を1つ必須で受け取ります。値を省略すると `strata-q36: --dump-full-logits needs a value` を標準エラーへ出し、終了コード 2 で終了します（`engine/src/qwen35/q36_engine.cu:5350-5352`）。
+- option を指定しない場合、ファイル出力はありません。指定値は `std::string` に保持され、空文字列なら出力ファイルを開かず、非空文字列ならそのパスを `fopen(..., "wb")` に渡します（`engine/src/qwen35/q36_engine.cu:5340`, `5368`, `5598`）。数値範囲などの値検証はありません。
+- 同じ option を複数回指定すると parser の代入により最後の値が使われます（`engine/src/qwen35/q36_engine.cu:5368`）。
 
 ## 実行時の動作
 
-- ダンプ対象の実行経路は `--tokens IDS` を使う単発生成です。各反復で greedy token を選び、その直後に現在の logits 行をホストへコピーし、float 4バイト単位でファイルに書きます（`src/qwen35/q36_engine.cu:2785-2789, 3960-3969`）。
-- ファイルは生成ループの前に `wb` で開くため、同名の既存ファイルは切り詰められます。書き込みレイアウトはステップ順の float32 logits 行列 `[steps][vocab]` です。Qwen3.6 比較スクリプトは語彙幅を 248320 として読み込んでいます（`src/qwen35/q36_engine.cu:3916-3920, 3960-3965`; `tools/qwen35/q36_lgcmp.py:1-5`）。出力バイト順は実行環境のネイティブ表現です。コードは各行の書き込み結果や `fclose` の結果を検査しません。
-- `--force` を指定すると、ログ出力後に次の入力 token を強制列から選びます。したがって各行は生成ステップの logits で、同じ行の次 token が forced token になる比較用途に利用できます（`src/qwen35/q36_engine.cu:3916-3918, 3960-3970`）。
-- ダンプファイルを正常に開けた場合は `ff` が有効になり、通常なら MTP を使う条件（MTP 有効、forced 列なし）から外れて、通常の greedy ループで各行を書き出します（`src/qwen35/q36_engine.cu:3935-3950, 3960-3965`）。
-- `--serve` は serving 処理へ、`--bench-pp` / `--bench-tg` は benchmark 処理へ先に分岐するため、これらのモードではこのオプションによるファイル出力は行われません。ダンプ用ファイルを開く処理は両分岐より後です（`src/qwen35/q36_engine.cu:3888-3919`）。
+出力ファイルを開くのは、`--serve` と benchmark の分岐を抜け、`--tokens` の prompt が空でないことを確認した後です。ファイルは `wb` モードで開かれるため、同名ファイルがあれば内容を切り詰めて作り直します。`--n` が省略された場合は生成数の初期値 64 が使われます。`--force` に有効な ID 列がある場合は、生成数がその列の長さ + 1 に設定されます（`engine/src/qwen35/q36_engine.cu:5342`, `5593-5598`）。
+
+各生成ステップで `E.host_logits` が現在ステップの語彙 logits を GPU から host にコピーし、stream を同期します。その後 `fwrite` で `m->g.n_vocab` 個の float（各4 byte）をそのまま書き込みます。ヘッダーや token ID は含まれず、行境界もない連続した float32 配列です。1ステップの出力サイズは `4 * n_vocab` byte です（`engine/src/qwen35/q36_engine.cu:4061-4065`, `5640-5645`）。
+
+`--force` を併用すると、そのステップの logits を保存した後、次の入力 token として forced 列の対応 ID を `E.process` に渡します。forced 列を使い切った後は直前の greedy token を渡します（`engine/src/qwen35/q36_engine.cu:5646-5648`）。
 
 ## 適用条件と副作用
 
-- `strata` では `--model` または `--native` の GGUF architecture が `qwen35moe` の場合に限り、この Qwen3.6 parser へ切り替わります。他の model family は通常の engine parser です（`src/program/generate.cpp:2393-2407`）。
-- 通常経路では `--tokens` が空だと usage error（終了コード 2）になります。`--serve`、benchmark は別経路です（`src/qwen35/q36_engine.cu:3789-3795, 3888-3918`）。
-- `fopen` の戻り値をエラー確認せず `ff` に入れます。パスが開けず `ff == nullptr` になると、エラー表示なしにダンプを行わず、MTP 条件判定でも「ダンプなし」と同じ扱いになります。書き込み失敗やディスク容量不足も明示的に報告する処理は確認できません（`src/qwen35/q36_engine.cu:3919-3920, 3935-3950, 3960-3971`）。
-- ファイル作成・切り詰めの副作用があります。指定先を上書きしてよいことを確認し、必要な場合は新しいパスを使ってください。
+- 実際のダンプ処理は `--tokens` の単発生成経路だけです。`--serve` は serve loop を呼んで先に return し、benchmark も反復計測後に先に return するため、これらのモードではこの指定はファイルを作成せず出力にも使われません（`engine/src/qwen35/q36_engine.cu:5562-5598`）。
+- Qwen3.6 の MTP が有効で、`--force` と正常に開いたダンプファイルのどちらもない場合は speculative decode の分岐になります。ファイル出力が有効な場合はこの分岐を通らず、通常の1 token ごとの greedy 生成ループで logits を保存します（`engine/src/qwen35/q36_engine.cu:5614-5648`）。
+- ファイルを開けなかった場合の戻り値は検査されていません。`ff` が null となるため、エラーメッセージなしでダンプが無効になり、MTP 条件にも「ファイルなし」として扱われます。また、`fwrite` の書き込み件数も確認されず、書き込み失敗を報告する処理はありません（`engine/src/qwen35/q36_engine.cu:5598`, `5614`, `5642-5645`）。
+- 空でない出力パスはモデル準備と prompt の検査後に開きますが、画像入力の `--emb` が `--vision` なし、または画像組み立て失敗となると、ファイルを開いた後で終了コード 2 を返します。その際に `ff` を閉じる処理は確認できません（`engine/src/qwen35/q36_engine.cu:5595-5605`, `5650`）。
 
 ## 出力とエラー
 
-値の欠落は stderr にエラーを出して終了コード 2 です。未知の引数は通常モードでは usage を stderr に出して終了コード 2 ですが、`--serve` モードでは未知の `--` 引数を警告して読み飛ばす分岐があります（`src/qwen35/q36_engine.cu:3744-3746, 3782-3795`）。通常生成では stdout に `gen:` と token ID 列、stderr に prompt / 生成の所要時間と速度が出ます。ダンプファイルを開けない場合の専用エラーや警告はありません（`src/qwen35/q36_engine.cu:3969-3977`）。
+成功時は通常の `gen: ...` token ID 列を標準出力へ出し、生成時間などを標準エラーへ出します。logits 本体は指定ファイルへバイナリ出力されます（`engine/src/qwen35/q36_engine.cu:5650-5656`）。ファイル open / write 失敗を検出して通知する処理はありません（`engine/src/qwen35/q36_engine.cu:5598`, `5642-5645`）。
 
 ## 根拠
 
-- `src/qwen35/q36_engine.cu:3735-3765` — parser、値の取得、関連 option。
-- `src/qwen35/q36_engine.cu:3789-3797, 3888-3919` — usage、model 必須条件、serve / benchmark / tokens の経路とファイルオープン。
-- `src/qwen35/q36_engine.cu:2785-2789, 3916-3977` — logits のホストコピー、force/MTP との関係、ファイル書き込みと通常出力。
-- `src/program/generate.cpp:2393-2407`、`src/qwen35/q36_main.cpp:1-5`、`CMakeLists.txt:776-794` — family switch と独立 executable の entry point。
-- `tools/qwen35/q36_lgcmp.py:1-5` — 比較ツールが読む float32 `[steps][248320]` 形式。
-
-この調査ではソースと既存の比較スクリプトを確認しました。CLI `--help` や実行バイナリの出力、Release 配布物は確認していません。
+- `engine/src/qwen35/q36_engine.cu:5339-5368` — Qwen3.6 parser の状態、値取得方法、オプション登録。
+- `engine/src/qwen35/q36_engine.cu:5350-5352`, `5412-5417` — 値不足と未知引数のエラー・終了経路。
+- `engine/src/program/generate.cpp:3805-3817` — `qwen35moe` architecture を検出し、Qwen3.6 parser へ振り分ける箇所。
+- `engine/src/qwen35/q36_engine.cu:5593-5605`, `5614-5656` — prompt 条件、ファイル open、MTP との相互作用、logits の書き込みと通常出力。
+- `engine/src/qwen35/q36_engine.cu:4061-4065` — logits を host に取得する処理。

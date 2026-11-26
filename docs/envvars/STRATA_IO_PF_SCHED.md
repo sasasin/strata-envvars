@@ -1,51 +1,53 @@
 # `STRATA_IO_PF_SCHED`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux の file tier I/O prefetch にある、予測読み込み用ジョブのスケジューリングを有効にします。通常の prefetch は予測された expert をキューに入れます。有効時は lookahead predictor の confidence と対象 layer までの距離を受け取り、confidence による採用判定、decode window ごとの読み込み byte 予算、layer 到達期限を使って予測ジョブを選びます。レイヤー自身が要求する読み込みは、予測ジョブより先に処理されます。
-
-これは prefetch のスケジュールだけを変えます。この変数単独で I/O prefetch を開始するものではありません。
+Linux の file tier I/O prefetch で、router lookahead が予測した専門家の先読みをスケジュールする。ON の場合、予測の確信度による採否、decode layer までの期限、decode window あたりの推測読み込み byte 予算を使う。OFF の場合は従来の先読み queue に入れる。需要が発生した専門家の読み込みや router の選択自体を変える設定ではない。読み取りと scheduler は `FileExpertSource` にある（`engine/src/core/expert_source.cpp:1228-1258,1261-1304`）。
 
 ## 値と判定
 
-`FileExpertSource::set_io_prefetch()` が呼ばれたときに `std::atoi()` で判定し、戻り値が 0 以外なら有効です。
+`set_io_prefetch()` が Linux で有効化されたとき `std::getenv()` で読み、値全体ではなく `std::atoi(v) != 0` で判定する。未設定、空文字、数字で始まらない文字列、`0` や `0anything` は OFF。`1`、`-1`、`+1`、`1anything`、先頭空白の後に非ゼロ数字がある値は ON。`true` / `false` はどちらも OFF。先頭の符号と数字列の後ろは `atoi` の規則に従い、文字列の大文字小文字は判定に関係しない。明示的な範囲検査や clamp はない（`engine/src/core/expert_source.cpp:1292-1295`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字、数値に変換できない文字列 | 無効（`atoi` が 0 を返す） |
-| 数値部分の変換結果が 0 | 無効（例: `0`, `0suffix`） |
-| 数値部分の変換結果が 0 以外 | 有効（例: `1`, `-1`, `2suffix`） |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| Linux の buffered file tier で I/O prefetch が開始された場合 | OFF | `atoi` が 0 以外を返す値（例: `1`, `-1`, `1x`） | `atoi` が 0 を返す値（例: 空文字, `0`, `0x`, `true`） |
+| 非 Linux、prefetch 無効、または buffered file tier でない場合 | scheduler の値を読まない／実行しない | なし | なし |
 
-文字列全体の一致や `1` との比較はしません。`atoi` は先頭の空白と符号を許し、数値の後ろの文字を判定に使いません。値は prefetch のセットアップ時にメンバー `io_sched_` に保存され、そのセットアップ中に再読込されません。
+`atoi` の結果が `int` で表せない入力の結果は C/C++ の変換仕様上保証できないため、利用可能な値域として扱わない。
 
 ## 有効になる条件
 
-- Linux の file tier で `set_io_prefetch()` が進み、mapped file のパスを開けること。Windows ではこの関数の Linux 専用処理は実行されません。
-- I/O prefetch 自体が有効であること。`STRATA_IO_PREFETCH` が非 0、または Linux file tier の既定条件により `src.linux_io_defaults()` が成立して、呼び出し元が `set_io_prefetch(true, ...)` を呼ぶ必要があります。
-- source が unbuffered (`direct_` が空でない) ではないこと。`set_io_prefetch()` はその場合に戻り、スケジューラ設定も読みません。
-- 予測読み込みが許可されていること。`STRATA_IO_PF_AHEAD=0` なら worker の予測キューへ読み込みを追加しません。decode gate が閉じている間も `warm_scored()` は通常の `warm()` にフォールバックし、gate が開いていないため I/O worker に読み込みを追加しません。
-
-`STRATA_IO_PREFETCH` 自体の既定条件や decode gate の判定は別変数の実装によります。`STRATA_IO_PF_SCHED=1` だけでは、それらの条件を上書きしません。
+- `STRATA_IO_PREFETCH` が明示的に非空かつ `atoi` が非ゼロであるか、Linux file tier の既定条件で prefetch が選ばれる必要がある。`STRATA_IO_PF_SCHED` 自体は I/O prefetch を開始しない（`engine/src/program/generate.cpp:8693-8704`）。
+- `FileExpertSource::set_io_prefetch(true, ...)` が Linux で呼ばれ、file mapping の base と paths があり、`direct_` が空である必要がある。非 Linux ではこの関数の Linux 部分がコンパイルされず、unbuffered reader でも初期化を早期終了する（`engine/src/core/expert_source.cpp:1261-1267,1310-1312`）。
+- 予測候補は `RouterLookahead` が動作して `warm_scored()` に届く必要がある。生成経路では `STRATA_LOOKAHEAD=0` が lookahead を止め、router weights が BF16 でない場合も開始しない（`engine/src/program/generate.cpp:10302-10320,10334-10338`）。
+- `STRATA_IO_PF_AHEAD=0`、または decode gate が閉じている間は `warm_scored()` が通常の `warm()` に委譲し、deadline / confidence / scheduler budget による job 登録はしない。`STRATA_IO_PF_GATE=0` は gate を常時 open にする（`engine/src/core/expert_source.cpp:1228-1229,1284,1299-1300,3487-3495`）。
+- `STRATA_IO_PF_MINCONF` は空 queue 時の基準確信度（既定 `0.5`、読み取り値を `[0,1]` に clamp）、`STRATA_IO_PF_BUDGET_MB` は固定予算（既定 `0` で自動）、`STRATA_IO_PF_BUDGET_FRAC` は自動予算の係数（既定 `0.5`、`[0.01,4]` に clamp）、`STRATA_IO_PF_TARGET` は使われた先読み byte の目標割合（既定 `0.5`、`[0,1]` に clamp。`0` は feedback 無効）を変える（`engine/src/core/expert_source.cpp:1295-1298,1192-1200,1211-1222`）。
+- Linux 既定で有効になった prefetch は、全専門家が GPU cache に保持されると file tier idle policy によって止まることがある。明示的な `STRATA_IO_PREFETCH=1` はその停止対象ではない。cache の状態が変わって既定 prefetch を再開すると `set_io_prefetch()` が再度呼ばれる（`engine/src/program/generate.cpp:10251-10285,10341-10368`）。
 
 ## 実行時の詳細
 
-`io_sched_` と I/O prefetch がともに有効なら lookahead predictor はスコアを要求します。スコアは expert ごとの router rank に基づき、上位ほど大きく、次 layer より先の予測ほど小さくなります。同じ expert が複数 token から予測された場合は最大 confidence が使われます。予測ジョブの期限は現在の layer clock に予測距離を加えた値です。
+値は `set_io_prefetch(true, ...)` ごとにメンバー `io_sched_` に読み込まれ、起動時だけの `static` cache ではない。設定を process 実行中に変えても有効中のメンバー値は自動更新されず、再度 prefetch を有効化する経路が通ればその時点の値を読み直す（`engine/src/core/expert_source.cpp:1261-1267,1292-1295`; 再有効化呼び出しは `engine/src/program/generate.cpp:10364-10367`）。
 
-`warm_scored()` は resident RAM にある expert を除き、confidence 下限とキュー圧力、window byte 予算を確認します。既定の confidence 下限は `0.5`、budget fraction は `0.5` です。固定 budget が指定されない場合、読み込み速度と window 時間がまだ測定できていない間は 256 MiB、その後は worker の測定読み込み速度・worker 数・window 時間・budget fraction・feedback scale から予算を計算します。キューが混むほど confidence 下限が上がり、予算を超える候補は採用されません。これらの基準値は `STRATA_IO_PF_MINCONF`、`STRATA_IO_PF_BUDGET_MB`、`STRATA_IO_PF_BUDGET_FRAC`、`STRATA_IO_PF_TARGET` で調整されます。
+有効時、lookahead は GPU にない予測専門家について rank と先の layer 数から confidence を作り、各候補を `warm_scored()` に渡す（`engine/src/core/expert_source.cpp:3700-3705,3749-3759,3789`）。scheduler は queue 圧力に応じて必要 confidence を上げ、窓予算を超える候補を拒否し、通過した job に layer deadline を持たせる。worker は demand queue を先に処理し、decode が到達済みの job を遅延として捨てた後、最も早い deadline、同じ期限なら confidence の高い順に処理する（`engine/src/core/expert_source.cpp:1225-1258,1355-1389`）。予算は固定 byte 数があればそれを使い、そうでなければ worker の読み込み速度・window 時間・係数に基づきます。初期値は測定値が揃うまで 256 MiB、自動予算には 16 MiB の下限があります（`engine/src/core/expert_source.cpp:1192-1200`）。window ごとに先読みの利用率を EWMA で追い、target 未満なら予算係数を縮小し、以上なら回復します（`engine/src/core/expert_source.cpp:1202-1222`）。
 
-worker は layer 自身の demand read キューが空のときに予測ジョブを処理します。期限切れジョブは破棄され、期限が近いものを優先し、同じ期限なら confidence が高いものを先にします。decode window ごとに budget 使用量をリセットし、予測 byte のうち実際の demand より前に使われた割合に応じて後続 window の自動 budget を縮小・回復します。
+`docs/DETAILS.md` の「Linux file tier」は I/O prefetch と decode gate の基本条件・関連設定を記載していますが、`STRATA_IO_PF_SCHED` 自体の記述はありません。上記 scheduler の効果と値判定は現行ソースの記述に基づきます（`docs/DETAILS.md:302-317`）。
 
-prefetch が実際に有効で、スケジューラも有効な場合、stderr に `strata generate: io prefetch scheduling ON (STRATA_IO_PF_SCHED=1): ...` が出ます。request ごとの I/O ログには予測読み込み byte、利用された byte、late 件数、confidence で不採用になった件数、budget 超過件数、window budget が表示されます。スケジューラの設定を読んでも、prefetch が利用できない経路ではこの ON ログは出ません。
+## ログと測定値
+
+prefetch が有効で scheduler が ON のとき、生成経路は stderr に次を出します（`engine/src/program/generate.cpp:8715-8721`）。scheduler OFF 時にはこの scheduler ON 行は出ません。
+
+```text
+strata generate: io prefetch scheduling ON (STRATA_IO_PF_SCHED=1): a deadline per read, confidence admission (STRATA_IO_PF_MINCONF), a per-window byte budget (STRATA_IO_PF_BUDGET_MB / _FRAC)
+```
+
+request ごとの file-tier I/O 診断が有効な場合、stderr の行に `read ahead ... MB, ... MB of it used; ... late, ... not admitted (confidence), ... (budget ... MB/window)` が含まれます。診断対象は scheduler の late / confidence rejection / budget rejection と予算で、prefetch が動作し `proc_io_sample()` が有効な場合に出力されます（`engine/src/program/generate.cpp:23837-23873`）。この環境変数についての独立した性能測定値は `docs/DETAILS.md` にありません。
 
 ## 根拠
 
-- `src/core/expert_source.cpp:1114-1161` — Linux mapped file の確認、変数読み取り、`atoi` 判定、スケジューラ worker の起動。
-- `src/core/expert_source.cpp:1045-1076,1081-1112` — 自動 byte budget、window feedback、confidence と budget による候補採用。
-- `src/core/expert_source.cpp:1201-1243` — demand read 優先、期限切れの破棄、期限と confidence による worker の選択。
-- `src/core/expert_source.cpp:3276-3291` — layer clock と decode window の更新。
-- `include/strata/core/expert_source.hpp:280-286,924-930,1146-1165` — scored prefetch の API、適用条件、既定値。
-- `src/program/generate.cpp:5655-5690,15413-15438` — prefetch の有効化、スケジューラ ON ログ、request ごとの観測ログ。
-- `docs/DETAILS.md:272-306` は Linux file tier prefetch の基本と測定を説明しますが、この scheduler の有効化フラグや性能測定値は記載していません。そのため本書では `STRATA_IO_PF_SCHED` 固有の性能効果を主張しません。
+- 値の取得と関連設定: `engine/src/core/expert_source.cpp:1261-1304`
+- 候補の confidence / deadline 付与と scheduler の採否: `engine/src/core/expert_source.cpp:1225-1258,1355-1389,3700-3790`
+- 有効化、既定条件、lookahead 条件、GPU cache idle policy: `engine/src/program/generate.cpp:8693-8724,10251-10338,10341-10377`
+- 診断出力: `engine/src/program/generate.cpp:8715-8721,23837-23873`
+- 関連設計説明: `docs/DETAILS.md:302-317`

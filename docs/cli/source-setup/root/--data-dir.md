@@ -1,58 +1,62 @@
 # `setup.py --data-dir`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（調査日: 2026-10-25）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
-対象スコープは `source-setup` の `setup.py` と、それに引数を渡す setup/update wrapper です（[索引](../../README.md#source-setup)）。
+| 項目 | 内容 |
+| --- | --- |
+| ツール ID | `source-setup` |
+| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` などの入口からも同じ parser を使用） |
+| オプション | `--data-dir` |
+| 別名 | なし |
+| 値 | データフォルダーのパス。parser は文字列を受け取り、実行時にユーザー領域へ展開して絶対パスに解決する。 |
 
-## 概要
+## 役割
 
-`--data-dir DIR` は、モデルファイル、準備済み pack などを置くデータフォルダーを指定します。引数は文字列として受け取り、既定値は parser 上 `None` です。指定がなければ、設定ファイルに記録済みの場所、または Strata の配置場所の隣にある `Strata-data` が使われます。`setup.py` の help は新規環境で約 70–120 GB と説明していますが、必要量はモデルや処理によって異なります。
+モデルのダウンロード先を含む Strata のデータフォルダーを指定します。未指定なら設定に保存されたフォルダー、保存値がなければ Strata フォルダーの隣の `Strata-data` が候補です。`--data-dir` で別の場所を指定しても既存データは自動では移動せず、新規ダウンロードだけを新しい場所へ置けます。既定では同じデータルートの `models/` が GGUF の配置先になり、pack や MTP データもこのルートを使います。GGUF のみ別の場所に置く場合は `--models-dir` を併用します。
+
+## 使い方
 
 ```sh
-./setup.sh --setup --data-dir "$HOME/Strata-data"
+# 新しいモデルのセットアップ先を指定する
+./setup.sh --setup --family qwen --model IQ3_S --data-dir /mnt/models/Strata-data
+
+# 既存ファイルは元の場所に残し、新しい場所を今後の既定先にもする
+./setup.sh --setup --family qwen --model IQ3_S --data-dir /mnt/models/Strata-data --set-default-data-dir
+
+# 既存データも新しいフォルダーへ移す（移動対象は同じドライブ上のデータ）
+./setup.sh --setup --family qwen --model IQ3_S --data-dir /mnt/models/Strata-data --move-data
 ```
 
-`--data-dir` の指定だけでは既存モデルを移動しません。移動する場合は `--move-data`、移動せず新しい場所を既定フォルダーとして記憶する場合は `--set-default-data-dir` を併用します。これらは別 option であり、この文書では `--data-dir` との相互作用に限って説明します。
+## 値と既定値
 
-## 値と検証
+- parser には `type`、`choices`、明示的な既定値がありません。値を省略した場合は `None` となり、保存済みの `data_dir`、または Strata フォルダーの隣にある `Strata-data` が選ばれます（`terminal/setup.py:11510-11511`, `7419-7430`）。
+- 指定値は `Path(...).expanduser().resolve()` で解決されます。その後、存在するフォルダーならディレクトリーかつ書き込み可能か、未作成なら作成元の親フォルダーが存在して書き込み可能かを確認します。システムフォルダー、ファイル、書き込み不可の場所などは拒否されます（`terminal/setup.py:7430-7434`; `terminal/strata_control/folders.py:77-113`）。
+- 値の文字列形式や最大長を parser は制限しません。相対パスは実行時の作業ディレクトリーを基準に絶対パスへ解決されます（`terminal/setup.py:7430`）。
 
-- Parser は `ap.add_argument("--data-dir", help=...)` として定義し、`type`、`choices`、`required`、明示的な `default` を付けません。したがって値は文字列で、指定なしの値は `None` です（`setup.py:8481–8482`）。値を省略すると argparse が引数エラーにします。
-- 実処理では指定値に `expanduser()` と `resolve()` を適用して保存先を決めます（`setup.py:6051–6055`）。`~` を含む入力はホームディレクトリーへ展開されます。
-- `strata_control.folders.problem()` が保存先を検査します。空でない指定は絶対パスである必要があり、Windows の不正文字、システムフォルダー（実行ユーザー自身のホームを除く）、ファイルをフォルダーとして使う指定、書き込み不能な既存フォルダー、存在しない親や書き込み不能な親を拒否します（`strata_control/folders.py:63–100`）。
-- 検査時、存在するフォルダーまたは最も近い既存の親へ小さな一時ファイルを作成して削除し、書き込み可能かを確認します（`strata_control/folders.py:49–60, 82–99`）。通常は一時ファイルを残しませんが、削除に失敗した場合は残る可能性があります。
-- 指定した保存先が検証に失敗すると `fail()` が理由と案内を表示し、「ダウンロードも変更も行わず、保存先として記録しない」と伝えて終了します（`setup.py:6054–6057, 825–830`）。検証後の作成時に `mkdir` が失敗した場合は警告を表示して `home()` を代わりに使います（`setup.py:6062–6066`）。
+## 実行時の動作
 
-## 動作と適用条件
+- `data_folder_for()` が `--data-dir` と `--move-data`、`--yes`、`--set-default-data-dir` の値をまとめてデータフォルダー選択処理に渡します（`terminal/setup.py:7513-7516`）。通常の既存モデル起動だけなら `data_folder_in_place()` を使い、フォルダー作成・移動・設定保存をしません。ただし `--data-dir` があると単純起動判定から外れ、`data_folder_for()` の経路になります（`terminal/setup.py:11681-11690`）。
+- 指定先が現在の既定先と異なり、既存モデルファイルが見つかった場合、`--move-data` がなければそれらは残り、新しいダウンロード先として指定先が使われます。同じドライブ上の既存データがあり、`--yes` もない場合は「keep / move」を尋ね、既定回答は `keep` です。`--yes` を付けた場合は質問を省略し、`--move-data` がなければ既存データを移しません（`terminal/setup.py:7451-7473`）。
+- 移動する場合、同じドライブ上で `models/` の内容を統合し、移動先の同名ファイルを保持します。`packs/` の各項目と `mtp/` は移動先に同じ項目がない場合に移し、移動済みファイルを参照するモデル設定も更新します。使用中などで移せないファイルは元に残ります。別ドライブ上の既存データはコピーせず、その場所で引き続き利用する対象として扱われます（`terminal/setup.py:7349-7367`, `7482-7506`）。
+- 指定先が選ばれ、既存データを残す場合、`--set-default-data-dir` を付けると移動せずに設定へ保存します。既存データがない場合または移動処理を進めた場合も、選択先を設定へ保存します。設定保存時、`data_dir` が変わると `data_dir_at` も更新されます（`terminal/setup.py:7471-7475`, `7507-7509`, `7299-7306`）。
+- `--models-dir` を省略すると GGUF の場所は `<data-dir>/models` になります。明示した場合は GGUF の場所を別指定できますが、pack などデータルート下の生成先は `data-dir` 側を使います（`terminal/setup.py:11517`, `11687-11690`, `12305-12307`, `12328-12340`）。
 
-通常の setup/update 処理は `data_folder_for(a)` を通じて指定値を `data_folder()` に渡します（`setup.py:6136–6139`）。同関数は指定値があればそれを保存先に選び、なければ保存済み `data_dir`、さらに未設定なら `home().parent / "Strata-data"` を選びます（`setup.py:6051–6053`）。選択フォルダーは必要に応じて作成されます（`setup.py:6062–6066`）。
+## 適用条件と副作用
 
-選んだフォルダーはモデルデータのルートとなり、既定の GGUF 配置場所はその下の `models` です（`setup.py:8609–8612`）。モデル準備時の pack 保存にも使われます（例: `setup.py:7660–7665, 8081–8084`）。`--models-dir` が別途指定されている場合、GGUF 配置はそちらになりますが、データルート自体は tokenizer や pack 等に引き続き使われます。
+- `--data-dir` が指定され、フォルダーが妥当なら、選択処理でフォルダーを作成します。妥当性の確認では、既存フォルダーまたは未作成先の親に小さな一時ファイルを書いて削除し、書き込み可否を確かめます（`terminal/setup.py:7439-7443`; `terminal/strata_control/folders.py:63-74`, `95-110`）。
+- 移動は同一ドライブのデータに限られ、既存の同名データが移動先にある場合は移動先を保持します。ファイル使用中などで移動できないデータは残り、警告されることがあります（`terminal/setup.py:7482-7506`; `7349-7367`）。
+- `--data-dir` と `--move-data`、`--set-default-data-dir` は別の制御です。前者だけでは既存ファイルを動かさず、後二者はそれぞれ既存データの移動と、移動しない場合の既定先保存を指定します（`terminal/setup.py:11510-11516`, `7451-7475`）。
 
-`--data-dir` の有無は起動経路も変えます。既存モデルを引数なしで起動する場合は `data_folder_in_place()` が設定を読むだけで、作成・移動・コピー・設定保存をしません。一方、`--data-dir` を指定するとこの単純起動判定から外れ、通常の setup 処理を通ります（`setup.py:8602–8612, 6142–6151`）。`--update` の経路は `update_install()` へ進み、その処理中も指定フォルダーがデータルートになります（`setup.py:8617–8619`）。
+## 出力とエラー
 
-## 既存ファイル、保存、相互作用
-
-- 指定先が現在記憶されているフォルダーと異なる場合、Strata は既存モデルを持つ候補フォルダーを調べます。別ドライブにあるモデルは移動せず、既存場所を使い続けます（`setup.py:6067–6081, 6105–6109`）。
-- 同一ドライブに移動可能なモデルがあり、`--move-data` がなく `--yes` もない場合は、対話で keep/move を尋ねます。`--yes` のときは既定の keep が選ばれます。keep では既存モデルを残し、新しいダウンロードだけを指定先に置きます（`setup.py:6081–6096`; `ask()` の yes 時は既定値を返す: `setup.py:851–865`）。
-- `--move-data` を併用すると既存モデルを新しい場所へ移す選択になります。モデルファイルはファイル単位で移動し、packs や MTP は移動先に同名物がない場合に移し、設定ファイル内のモデルパスも更新します。移動後にデータが残る場合は「使用中または移動先に同じデータがある」と警告します（`setup.py:6081–6096, 6110–6129`）。移動先と異なるドライブのデータは移動対象ではありません。
-- `--set-default-data-dir` は keep の場合でも選択先を `settings.json` の `data_dir` として記録します。通常の移動経路でも処理完了時に `data_dir` と Strata install の一覧を保存します（`setup.py:6091–6096, 6130–6133`）。新しい場所にモデルが一つも見つからない場合は移動扱いとして記録されます（`setup.py:6097–6098`）。
-- 記録済みの場所を指定なしで使う場合、その場所が後日利用不能なら既定の `Strata-data` に戻し、無効な `data_dir` 設定を除いて警告します（`setup.py:6058–6061, 6146–6151`）。
-
-## 出力・失敗経路と wrapper
-
-選んだ場所や既存モデルの場所を標準出力に説明し、保存先を設定へ記録します。指定値の検証失敗はセットアップを停止します。保存先の作成時に発生する `OSError` は警告して Strata 配置場所 (`home()`) にフォールバックします（`setup.py:6054–6066`）。ファイル移動時の個別失敗表示や、全 OS での権限・ドライブ挙動の詳細まではこのソース範囲から一般化できません。
-
-`setup.sh` は `setup.py "$@"`、`START-HERE.bat` は `setup.py %*` を起動します。更新 wrapper も `setup.py` に委譲します（`setup.sh:9–13, 76`; `START-HERE.bat:44–55`; `update.sh:62`; `UPDATE.bat:79`）。したがって wrapper 独自の `--data-dir` 解釈はありません。
-
-macOS の通常 setup は `setup.py` から `metal/setup_mac.py` へ委譲します（`setup.py:8418–8419`）。Metal 側にも同名引数と `--move-data` / `--set-default-data-dir` があり、共通の `data_folder_for()` を呼びます（`metal/setup_mac.py:339–342, 365–367`）。macOS Control mode は `setup.py` の別分岐です（`setup.py:8561–8562, 8251–8254`）。
+- 明示したフォルダーが検査に失敗すると、フォルダーの問題と「何もダウンロード・変更されず、既定先にも保存されない」旨を出して停止します。`fail()` はエラーイベント（JSONL 出力時）を出し、終了コード 1 で終了します（`terminal/setup.py:7431-7434`, `1049-1056`）。
+- 検査後のフォルダー作成で `OSError` が起きると警告し、データ先を `home()` に切り替えて続行します（`terminal/setup.py:7439-7443`）。設定ファイルの保存に失敗した場合も警告し、処理自体は続行します（`terminal/setup.py:7299-7306`）。
 
 ## 根拠
 
-- `setup.py:8481–8487` — parser 定義と関連 option の説明。
-- `setup.py:6042–6151` — 保存先選択、検査、既存データの扱い、記録、読み取り専用の単純起動。
-- `setup.py:8602–8612, 8617–8619` — `--data-dir` が起動/setup/update 分岐に与える影響。
-- `strata_control/folders.py:49–104` — 保存先の書き込み検査とエラー文言。
-- `setup.sh:9–13, 76`; `START-HERE.bat:44–55`; `update.sh:62`; `UPDATE.bat:79` — wrapper からの引数委譲。
-- `metal/setup_mac.py:339–342, 365–367`; `setup.py:8418–8419, 8561–8562` — macOS の parser / 委譲経路。
-
-調査は指定 revision の `setup.py`、関連 helper、wrapper のソースを対象としました。CLI help は実行していません。setup/update はネットワーク取得やモデル配置などの副作用を持ち得るため、ソース parser と使用箇所を根拠にしています。
+- `terminal/setup.py:11510-11517` — parser 登録と隣接する `--move-data`、`--set-default-data-dir`、`--models-dir` の定義。
+- `terminal/setup.py:7419-7516` — パス選択、既存フォルダーの検出、対話・移動・保存、および引数との接続。
+- `terminal/setup.py:11681-11690` — 通常起動とデータフォルダー選択処理の分岐、および `models/` の既定位置。
+- `terminal/setup.py:7349-7382`, `7482-7509` — ファイル移動・統合、設定内パスの更新、保存。
+- `terminal/strata_control/folders.py:63-113` — 書き込み確認とフォルダー検証。
+- `terminal/setup.py:1049-1056` — 失敗時の表示、JSONL エラーイベント、終了コード。

@@ -1,50 +1,60 @@
 # `STRATA_API_KEY`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`serve/server.py` の HTTP サーバーで受け付ける API キーを指定します。設定されると、API とサーバー状態を返す一部の GET、および全 POST リクエストで認証が有効になります。値はサーバー起動時にサービスへ保存され、リクエストごとに環境変数を読み直すのではなく、その保存値とリクエストヘッダーを照合します。
-
-同梱ツール `tools/hip/bench_prefill.py` もリクエストごとにこの変数を読み、空でない場合に Bearer ヘッダーを付けます。これはクライアント側の送信動作で、サーバー側のキー設定とは別です。
+Strata の Python HTTP サーバーでは、この値が inference API の認証キーになる。キーが設定されると、認証を通らない API リクエストには HTTP 401 を返す。設定しない場合もサーバーは起動できるが、ネットワーク公開時にはキーなしの警告が出る。サーバーのほか、Terminal の接続・benchmark コマンドや同梱 HIP prefill benchmark が、接続先へ送る認証情報として同名を読む経路がある。GPU backend やモデル状態による有効条件はない。サーバーの判定と認証は `terminal/serve/server.py`、キー書式の処理は `terminal/serve/server_parts/http_api.py` にある。`docs/DETAILS.md:710-722` もネットワーク公開時の推奨、キーなし運用、複数キーを説明しており、以下の起動時検証と一致する。
 
 ## 値と判定
 
-| 状況 | 動作 |
+サーバーは argparse の `--api-key` 既定値として起動時に `os.environ.get("STRATA_API_KEY", "")` を読み、空白だけの環境値が明示されている場合は起動前に拒否する。優先順は `--api-key` 引数、環境変数、設定ファイルの `api_key`、キーなし。CLI 引数で環境値を置き換えられるが、環境変数が空白だけなら CLI 引数を指定しても別の空値検査で終了する。`terminal/serve/server.py:9202-9204,9326-9339`。
+
+| サーバー入力 | 判定と結果 |
 |---|---|
-| 環境変数が未設定 | `--api-key` の既定値は空文字。CLI オプションもなければ、設定ファイルの `api_key` にフォールバックする。 |
-| 変数が空、または空白だけ | 起動時に stderr へ `[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out` を出し、終了コード 2 で起動を中止する。CLI に非空のキーを指定しても、この環境変数のチェック自体は先に行われる。 |
-| 非空の文字列 | `--api-key` の既定値として採用。CLI で非空値を指定すれば CLI 値が優先される。CLI 値が空なら環境値または設定ファイル値が使われるが、明示した空の CLI 値は別のチェックで起動エラーになる。 |
-| 設定ファイル由来の空文字列 | 認証なしで起動し、`api_key` が設定ファイルに存在すると stderr に「this server has no API key ...」という警告を出す。 |
-| 文字列のキー | カンマ区切りを複数キーとして扱い、各要素の前後空白を除き、空要素を捨てる。区切りだけ・空白だけなど、有効なキー要素がない非空文字列は `ValueError` となり、エラーメッセージを stderr に出して終了コード 2 で起動を中止する。 |
+| 環境変数 unset | `--api-key` の既定値は空文字。設定ファイルの `api_key` があればそれを使い、なければキーなし。 |
+| 空文字または空白だけ | 変数が存在し `.strip()` が空なら、stderr に `[strata] an API key was given but it is empty: set a key, or leave it out` を出して終了コード 2。前後の空白だけでなくタブ等も空扱い。 |
+| `none`（大文字小文字不問、前後空白可） | `explicit_no_key` が意図的なキーなしとして扱う。環境変数値全体が ` none ` / `NONE` 等の場合。 |
+| 通常の非空文字列 | `api_key_of` が前後空白を除去。カンマ区切りなら `key_list` が各要素を trim し、空要素を落として複数キーとして扱う。例: `alpha, beta` は2キー、`alpha,` は1キー。 |
+| カンマ区切りの結果が空 | `,` や空白要素だけなら `[strata] an API key was given but it is empty: set a key, or leave it out` を stderr に出し終了コード 2。 |
+| 設定値の `none` 以外の値 | 数値や `true` / `false` として parse せず、文字列キーとして扱う。キー照合は大文字小文字を区別する。文字列中の内部空白は保持される。 |
 
-文字列全体を数値や真偽値として parse しません。`api_key` の設定値がリストの場合は各要素を文字列化して前後空白を除きますが、空リストまたは空要素があれば起動エラーです。文字列形式のカンマ区切りではキー中のカンマをエスケープできません。カンマを含むキーには設定ファイルのリスト形式を使う実装です。CLI ヘルプと `docs/DETAILS.md` にも複数キーの形式があります。
+書式上の区切りはカンマで、キーにカンマを含める用途は設定ファイルの配列形式が案内されている。環境変数からの値は配列には変換されず文字列として処理される。`terminal/serve/server_parts/http_api.py:211-225,238-253`。
 
-キーの照合では `Authorization` が大文字小文字を区別せず `Bearer ` で始まる場合、その後ろを trim して使います。それ以外の場合は `x-api-key` ヘッダーを使います。Bearer ヘッダーがあるもののキーが誤っている場合、`x-api-key` へのフォールバックはしません。キーは `hmac.compare_digest` で比較し、非 ASCII キーについて UTF-8 と Latin-1 の表現を照合します。
+サーバーの設定ファイル `api_key` は、環境変数・引数が空のときの fallback であり、`api_keys` による追加キーは設定配列から別途加わる。`STRATA_TELEMETRY_KEY` はテレメトリー用の別キーで、inference キーと重複するとサーバー起動は stderr のエラーと終了コード 2 になる。`--no-api-key` を指定すると `no_key_chosen` が true になり `api_keys` との併用は拒否されるが、現行コードではそれ自体が `preflight_api_key` を空にしない。環境変数または設定ファイルでキーが選ばれていればサービスにはそのキーが設定される。キーなしを明示する値は `api_key: "none"` または `STRATA_API_KEY=none`。`terminal/serve/server.py:9331-9339,9568-9593`。
 
 ## 有効になる条件
 
-- 対象は `serve/server.py` のサーバー起動経路です。値は `main()` の argparse 初期化時に環境から既定値として取得され、その後、サービス生成時に一度決定されます。起動中に環境を変更しても、認証キーは更新されません。
-- 優先順位は、非空の `--api-key`、`STRATA_API_KEY`、設定ファイルの `api_key`、認証なしの順です。ただし設定された環境変数が空白だけの場合は、CLI 値にかかわらず起動チェックで失敗します。
-- キーが設定されていると、`parse_request()` の Host 名チェックと `/v1/*` POST のブラウザー Origin チェックはスキップされます。キーがない場合はこれらのチェックが適用されます。`STRATA_ALLOWED_HOSTS` や `cors_origins` は関連する別設定です。
-- キーがあるとき、`_authorized()` は `GET /metrics/prometheus`、`/metrics`、有効時の `/api/requests`、`/settings`、`/config`、`/mcp`、`/status`、`/models` と `/v1/models`、`/props`、`/slots`、`/v1/status` などの該当 GET を保護し、すべての POST の処理開始時に認証します。キー不一致・欠落時は HTTP 401 と `{"error":{"type":"authentication_error","message":"missing or wrong API key"}}` を返します。
-- すべての URL がキーで保護されるわけではありません。少なくとも `/` と `/web/...` の静的ページ、`/health` と `/api/health` は GET でキー照合を通らず、`OPTIONS` も別実装です。キー未設定時に認証なしで通るエンドポイントは、Host/Origin 等の別チェックがあればそちらを受けます。
-- サーバーがループバック以外で待ち受ける場合、キー未設定ならネットワーク上の誰でもモデルを使える旨の警告を stdout に出します。キー設定時の起動完了行には `API key required` が付きます。
+- サーバー経路では、`terminal/serve/server.py` を起動して API リクエストを受けること。OS、CUDA/HIP/SYCL backend、モデルのロード状態はキー設定自体の条件ではない。キーはモデル読み込み前に検証・サービスへ設定される。`terminal/serve/server.py:9202,9326-9339,9566-9584`。
+- CLI の `--api-key` があれば環境値より優先される。さらに設定ファイルの `api_key` は、選択された CLI 引数値が空のときの fallback。ただし環境変数が設定済みの空文字・空白だけの場合はこの fallback に進まず、上記の終了になる。`terminal/serve/server.py:9326-9339`。
+- `api_key: "none"` は意図したキーなし運用。`--no-api-key` はヘルプにキーなしと記載されるが、現行実装では環境値や設定のキーを消さないため、キーが有効な状態では認証が残る。キーなし経路ではホスト名とブラウザー Origin の保護分岐が引き続き適用される。`terminal/serve/server.py:9205-9207,9331-9339,9568,7138-7179`。
+- Terminal の接続コマンドでは通常 `STRATA_API_KEY` が credential 環境変数の既定値。`--credential-env` または保存済み connection の `credential_env` が別名を指定すればその変数を読み、`--url` はサーバーURLを選ぶだけでキーの既定名を変えない。monitor/status 等は同名キーか指定キーをリクエストに使う。`terminal/strata_cli/connections.py:273-301`、`terminal/strata_cli/monitor_commands.py:195-204`。
+- `strata bench run` は `--credential-env` の既定を `STRATA_API_KEY` とし、明示した別名を使える。standard suite では指定環境値が空扱いなら、profile の設定ファイル `api_key` が代わりに使われる。`terminal/strata_cli/cli.py:340-341,1319-1342`。
+- `strata launch --api-key-env STRATA_API_KEY` は明示的にこの名前を指定した場合だけ値を読む。空または未設定なら `The environment variable ... is empty or not set.` の `ValueError` 経路となる。`--api-key` と両方を指定した場合は env 読み取りが後なので環境値が採用される。`terminal/strata_cli/launch/cmd.py:137-138,288-299`。
+- Docker 内の wrapper は `STRATA_API_KEY` が空の場合に限り、`STRATA_KEY_FILE`（既定 `/data/state/api-key`）の内容を読んで同名環境変数として export してから Terminal を起動する。`tools/docker/strata-wrapper.sh:4-9`。
 
 ## 実行時の詳細
 
-`argparse` は `--api-key` の既定値を `os.environ.get("STRATA_API_KEY", "")` から作ります。サービス初期化では `api_key_of(a.api_key or cfg.get("api_key", ""))` を呼び、その戻り値を `svc.api_key` に保持します。サーバーの各認証付き経路はこの保持値を参照します。認証なしなら `_authorized()` は即時に成功し、設定ありなら照合に失敗したリクエストを 401 にします。
+サーバーでは argparse parser 作成時に環境値を既定値へ取り込み、その後の空値検査・`api_key_of` 検証を起動時に一度行い、`svc.api_key` に保存する。リクエストごとに環境を再読込する処理はなく、同一サーバープロセス中に環境値を変更しても設定済みキーは変わらない。設定されたキーがある場合、`/v1/*` の認証で `Authorization: Bearer ...`（または `x-api-key`）を照合し、不一致・欠落には HTTP 401 と `missing or wrong API key` を返す。キーなしなら `_authorized` は認証を要求しない。`terminal/serve/server.py:9202,9326-9339,9568,7283-7294`。
 
-API キーは、認証が必要な GET 情報の閲覧と POST 処理を制限します。キー設定時は DNS rebinding 対策の Host チェックと、キーなしの場合に行うブラウザー Origin チェックが省略されます。設定値は Bearer または `x-api-key` ヘッダーで送ります。未設定時にループバック以外へ公開した場合の警告と、起動完了ログはソースに実装されています。
+キーなしの場合も DNS rebinding 対策として許可されない Host を HTTP 403 にし、別サイト Origin の `/v1` API 要求も HTTP 403 にする（POST の許可 Origin では JSON content type を要求）。これらはキーなし経路に限る。ネットワーク bind でキーがなければ起動時に警告する。`terminal/serve/server.py:7138-7179,9730-9740`。
 
-## 文書との照合
+Terminal の client 側は各コマンド実行時に `os.environ.get(...)` でキーを読み、設定された endpoint に Bearer credential として渡す。status 等では credential の有無を表示情報に含める処理があり、接続先の応答が必要な操作はキー不足・不一致を server 応答として受ける。benchmark の managed profile 起動では `STRATA_API_KEY` を worker に継承させず、生成した `api_key` を run config に入れる経路がある。`terminal/strata_cli/cli.py:1325-1342`、`terminal/strata_control/benchmarking.py:210-220`、`terminal/strata_control/tune_session.py:550-560`。
 
-`docs/DETAILS.md` は環境変数または設定ファイルでの設定方法、カンマ区切り複数キー、設定ファイルのリスト形式、キー設定時に任意 Host を受け付ける点を説明しており、サーバー実装と一致します（`docs/DETAILS.md:878-901`）。`SECURITY.md` は `/v1/*` や状態情報などへの適用と constant-time 比較を説明しています（`SECURITY.md:23-28`）。実装では、すべての POST が先に照合される一方、`/health`、`/api/health`、トップページや静的ファイルの GET はキー照合を通さないため、全 URL が一律に保護されるという意味ではありません。
+## ログと測定値
+
+- 空の明示値: stderr `[strata] an API key was given but it is empty: set a key, or leave it out`、終了コード 2。無効な書式のキー: stderr に `api_key_of` の `ValueError` 文言を付け、終了コード 2。`terminal/serve/server.py:9326-9339`。
+- キーなしで config に空 `api_key` が明記されていると stderr に `the api_key in the config is empty...` を出す。ネットワーク bind でキーがなければ stdout に `no API key: anyone who can reach port ... can use the model` の警告を出す。`terminal/serve/server.py:9595-9597,9738-9740`、警告文生成 `terminal/serve/server_parts/http_api.py:228-235`。
+- 認証失敗は HTTP 401 JSON `missing or wrong API key`。キーなしで不許可 Host または Origin の要求は HTTP 403。`terminal/serve/server.py:7150-7154,7171-7174,7283-7294`。
+- この変数による性能測定値は、対象ソースと参照資料に記載がない。
 
 ## 根拠
 
-- 環境変数と CLI 引数の読み取り、設定値の選択、空値チェック、起動ログ: `serve/server.py:6160-6162, 6303-6316, 6402-6418`
-- キー分割、空値とリストの検証、ヘッダー値との比較: `serve/server.py:5822-5863`
-- サービスへの保存、Host / Origin の条件、HTTP 認証と保護経路: `serve/server.py:2811, 4703-4741, 4827-4835, 4872-4983, 4985-4995`
-- 同梱 HIP prefill ベンチマークのクライアント側ヘッダー設定: `tools/hip/bench_prefill.py:29-40`
-- 設定方法および利用条件の説明: `docs/DETAILS.md:878-901`; 認証方針: `SECURITY.md:19-28`
+- `terminal/serve/server.py:9202-9207,9326-9339,9568-9597,9726-9740` — サーバーの読取、優先順、検証、設定、観測結果。
+- `terminal/serve/server.py:7138-7179,7283-7305` — キーあり・なしで異なるリクエスト認証と保護。
+- `terminal/serve/server_parts/http_api.py:211-253` — カンマ分割、`none` 判定、trim と空キー拒否。
+- `terminal/strata_cli/connections.py:273-301`, `terminal/strata_cli/monitor_commands.py:195-204` — Terminal の既定・動的 credential 環境変数。
+- `terminal/strata_cli/cli.py:340-341,825-831,1319-1342`, `terminal/strata_control/readiness.py:42-52`, `terminal/strata_control/benchmarking.py:210-220` — profile 検証、readiness、benchmark クライアントでの利用。
+- `terminal/strata_cli/launch/cmd.py:137-140,288-301`, `terminal/strata_cli/launch/runner.py:725-739` — launch の明示的な環境変数指定と設定ファイル化。
+- `terminal/strata_control/tune_session.py:550-560`, `tools/docker/strata-wrapper.sh:4-9`, `terminal/tools/hip/bench_prefill.py:34-40` — worker からの除去、Docker 内の補完・転送、同梱 benchmark の任意 Bearer header。
+- `docs/DETAILS.md:710-730,1046-1052` — サーバーの公開・複数キーとクライアント設定例。コードと説明の矛盾は見つからなかった。

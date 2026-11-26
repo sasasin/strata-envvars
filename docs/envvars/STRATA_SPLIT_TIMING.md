@@ -1,47 +1,46 @@
 # `STRATA_SPLIT_TIMING`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-サーバーがリクエストを処理した後、各 verify stage のホスト側時間を stderr に出します。表示する内訳は GPU 到達待ち、CPU pool と plan、ホスト staging、commit で、各 stage の累積時間を verify window 数で割った値です。これは計測値を表示する診断用フックであり、GPU stage のイベント計測や decode の動作変更を有効にする設定ではありません。
+serve のリクエスト処理後に、各 verifier stage の window 数と、window あたりの host 側時間を stderr に出す診断スイッチです。検証や layer split の処理を切り替えるコードではなく、既に集計されている時間を表示する条件だけを変えます。通常 engine と SYCL engine の両方に同じ判定と出力があります（`engine/src/program/generate.cpp:23898-23906`、`engine/sycl/src/program/generate.cpp:13236-13244`）。
 
 ## 値と判定
 
-コードは環境変数の文字列を parse せず、`std::getenv("STRATA_SPLIT_TIMING") != nullptr` だけを確認します。
+両実装とも `std::getenv("STRATA_SPLIT_TIMING") != nullptr` の真偽だけを使います。値の parse、空白除去、大文字小文字変換、数値判定はありません。
 
-| 環境変数の状態 | 結果 |
-|---|---|
-| unset | stage timing の行を出さない |
-| 空文字を含む、何らかの値が設定済み | stage timing の行を出す |
-
-`1`、`0`、`false` などの値による違いはありません。大文字小文字や数値形式も検査しません。CLI オプションや設定ファイルによる上書きはありません。
+| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 通常 engine（`engine/src/program/generate.cpp`） | 出力しない | 空文字、`0`、`false`、`1`、`0anything` など、値を問わず設定されていれば出力 | なし（環境変数が存在する場合） |
+| SYCL engine（`engine/sycl/src/program/generate.cpp`） | 出力しない | 空文字、`0`、`false`、`1`、`0anything` など、値を問わず設定されていれば出力 | なし（環境変数が存在する場合） |
 
 ## 有効になる条件
 
-- CUDA 系または SYCL 系の `generate` 実装にあるサーバーのリクエスト処理後のログ経路で評価されます。通常の単発生成経路にはこの環境変数の読み取りはありません。
-- `n_stages` 回のループで出力します。layer split がなければ1 stage（stage 0）、layer split があれば split の各 stage が対象です。単一 GPU か複数 GPU かを問わず、stage 数は実際の layer split 設定に従います。
-- 環境変数を設定しても計時自体や stage の実行方式は切り替わりません。設定がなければ、この追加ログだけが抑止されます。
+- 上記の engine 実装を使い、serve のリクエスト完了処理まで実行することが必要です。値はその完了処理の診断出力を有効にします（`engine/src/program/generate.cpp:23576-23585,23898-23906`、SYCL 側: `engine/sycl/src/program/generate.cpp:13130-13135,13236-13244`）。
+- `n_stages` が 1 の場合も stage 0 の行を出します。複数 stage の場合は `0` から `n_stages - 1` までを出力します。通常 engine では `n_stages` は分割 GPU がないと 1、分割があると `split_at.size() + 1` です（`engine/src/program/generate.cpp:13252-13256`）。
+- 他の環境変数や CLI 引数によるこのログの抑止・上書きは、該当する出力条件にはありません。stage 数自体は実行時の分割構成で決まります。
 
 ## 実行時の詳細
 
-CUDA 系と SYCL 系の両方で、リクエスト後のサーバーログ処理に同じ判定と出力があります。設定値の有無は関数内の `static const bool` に保持され、最初にこの条件へ到達した時に一度だけ環境を読みます。その後プロセス中に環境を書き換えても再評価されません。
+判定は出力箇所の関数ローカル `static const bool` で初回に評価され、その後のリクエストではキャッシュされた値を使います。したがって、判定が初めて実行された後にプロセス環境を変更しても、このスイッチの値は再評価されません（`engine/src/program/generate.cpp:23900`、`engine/sycl/src/program/generate.cpp:13238`）。
 
-設定済みの場合、stage ごとに次の形式の行を stderr に出します（値は実装で計算した値です）。
+リクエスト完了後、各 stage の `Verifier` から `windows` と `ms_wait`、`ms_pool`、`ms_host`、`ms_commit` を読み、各時間を window 数で割って 3 桁のミリ秒で表示します。window 数が 0 の場合は除数を 1 とします。出力時にカウンターをリセットしたりリクエスト単位の差分を取ったりせず、`Verifier` に蓄積された値を使います。カウンターのフィールドは `engine/include/strata/core/verify.hpp:455-456` にあり、SYCL 側にも同じフィールドがあります（`engine/sycl/include/strata/core/verify.hpp:278`）。
+
+## ログと測定値
+
+環境変数が設定されている場合、stage ごとに次の形式を stderr に出します（数値は実行時の値です）。
 
 ```text
 strata serve: stage 0: <windows> windows; per window: wait for the GPU <ms> ms, pool + plan <ms> ms, host staging <ms> ms, commit <ms> ms
 ```
 
-`windows`、`ms_wait`、`ms_pool`、`ms_host`、`ms_commit` は verifier の統計です。表示値はそれぞれ `ms_wait / windows`、`ms_pool / windows`、`ms_host / windows`、`ms_commit / windows` です。window 数が0ならゼロ除算を避けるため分母を1にします。これらの統計は verify の実行中に加算され、同じ verifier に蓄積した範囲を表示します。出力頻度はリクエスト処理後です。
-
-各指標の意味は verifier の実装経路で計上されるホスト時間の区分です。GPU の各 kernel の時間はこの環境変数では表示されません。`docs/DETAILS.md` の decode timing 説明は `STRATA_DECODE_TIMING` と、GPU 側計測用の `STRATA_VERIFY_PROFILE` を挙げていますが、`STRATA_SPLIT_TIMING` のこの stage 別ホスト時間ログについては説明していません。したがって、ここでは資料にない精度や性能上の効果を主張しません。
+実装上の出力書式は `engine/src/program/generate.cpp:23904-23906` と `engine/sycl/src/program/generate.cpp:13242-13244` にあります。この変数に伴う警告・エラー・終了経路はありません。`docs/DETAILS.md` にこの変数の測定結果はなく、調査対象はログ出力の実装に限ります。
 
 ## 根拠
 
-- `src/program/generate.cpp:12488-12497` — 設定有無の判定、stage ごとの統計参照、stderr の書式と平均計算。
-- `sycl/src/program/generate.cpp:11615-11623` — SYCL 実装の対応箇所。
-- `include/strata/core/verify.hpp:312-313` — verifier が保持する時間区分と window 数。
-- `src/core/verify.cpp:2149-2166,2275-2276,2528,3450-3453` — CUDA verifier での host staging、GPU 待ち、commit の時間加算と pipelined verifier 統計の集約。
-- `sycl/src/core/verify.cpp:2026,2149-2150,2299-2300,2704,3956-3958` — SYCL verifier の時間加算と統計集約。
-- `docs/DETAILS.md:299-306` — 別の decode timing / GPU profile の説明。`STRATA_SPLIT_TIMING` の読み取り値や測定結果を裏付ける記述ではありません。
+- `engine/src/program/generate.cpp:23898-23906` — 設定有無の判定、stage ループ、stderr の書式と値。
+- `engine/sycl/src/program/generate.cpp:13236-13244` — SYCL 側の同じ判定と出力。
+- `engine/src/program/generate.cpp:13252-13256` — 通常 engine の stage 数と stage verifier の対応。
+- `engine/include/strata/core/verify.hpp:455-456`、`engine/sycl/include/strata/core/verify.hpp:278` — 集計カウンターのフィールド。
+- `engine/src/program/generate.cpp:23576-23585`、`engine/sycl/src/program/generate.cpp:13130-13135` — 診断箇所の前にある serve の応答完了処理。

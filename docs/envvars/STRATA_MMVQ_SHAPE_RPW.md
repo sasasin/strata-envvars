@@ -1,55 +1,40 @@
 # `STRATA_MMVQ_SHAPE_RPW`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL backend の native MMVQ wide kernel で、Battlemage GPU 上の一部 Q4_K / Q5_K dense projection shape に限り、rows per subgroup（RPW）を 2 にして行方向の row reuse を選びます。対象の計算では列ごとの activation を一度読み、2 行の dot product で共有します。Q4_K / Q5_K の全 shape や他の backend を一律に変更する設定ではありません。
+SYCL native MMVQ の wide Q4_K/Q5_K カーネルで、Battlemage 向けに限定された projection shape のとき、1 subgroup が処理する行数を 1 行から 2 行にし、同じ入力列の activation をその 2 行で再利用します。自動選択の対象外では、この変数による選択は行わず、`STRATA_MMVQ_WIDE_K_RPW` がなければ `rpw=1` のままです。制御判定は `launch_wide`、行再利用カーネルは `native_mmvq_wide_rpw_kernel` にあります（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1883-1916,1961-2004`）。
 
 ## 値と判定
 
-値は `strata::bm_default_on()` が判定します。設定値は文字列全体や数値として parse せず、先頭文字だけを調べます。
+`strata::bm_default_on` は `std::getenv` の結果が null でなく、かつ空文字でない場合、先頭文字が `'0'` なら false、それ以外なら true を返します。文字列全体の parse や数値検査はしません。未設定と空文字はどちらも Battlemage 判定に戻り、それ以外のデバイスでは false です（`engine/sycl/include/strata/sycl_queue.hpp:193-200`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | Battlemage なら有効、それ以外は無効 |
-| 空文字 | 未設定と同じ。Battlemage なら有効、それ以外は無効 |
-| 空でない値の先頭が `0` | 無効（例: `0`, `0abc`） |
-| 空でない値の先頭が `0` 以外 | 有効（例: `1`, `true`, `false`, `2`, 空白で始まる値） |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| SYCL `launch_wide<F, NCOLS>`（既定引数 `bm_default=true`） | Battlemage なら true、それ以外は false | 空でなく先頭文字が `0` 以外。例: `1`, `true`, `false`, ` 0`, `anything` | 空文字は unset と同じ。先頭が `0` の値（`0`, `0anything`）は false |
 
-大文字小文字、空白、数値としての妥当性、後続文字は検査されません。明示した空でない値はデバイス世代の既定値に優先します。判定結果は `launch_wide<F, NCOLS>()` の `static const bool` に保存されるため、各テンプレート特殊化では初回評価後に環境値を変えても再評価されません。異なるデバイスを同一プロセスで同じ特殊化から使う場合も、最初に評価したデバイスで得た判定が共有されます。
+大文字小文字、前後空白、後続文字は検査されません。したがって `false` は有効、`0anything` は無効、先頭に空白がある ` 0` は有効です。`launch_wide` 内の関数 template ごとの `static const bool` に保存され、各 `<F, NCOLS>` の初回呼び出し時に渡されたデバイスと環境から一度だけ決まります（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1961-1966`）。
 
 ## 有効になる条件
 
-値判定に加えて、次をすべて満たす場合だけ自動的に `rpw = 2` になります。
-
-- SYCL の native MMVQ wide kernel が呼ばれる。`STRATA_MMVQ_WIDE_K` が未設定または `atoi` の結果が 0 以外であることが必要。`STRATA_MMVQ_WIDE_K=0` なら wide kernel 自体が使われません。
-- デバイスが `intel_gpu_gen()` により Battlemage と判定される。ただし明示した空でない対象変数は値判定を上書きし、対象デバイス条件自体は引き続き Battlemage のまま必要。
-- `STRATA_MMVQ_WIDE_K_RPW` が未設定である。変数が存在するだけで自動 shape 選択を抑止します。値の妥当性や空文字かどうかは、この抑止判定では見ません。
-- Kernel type と寸法がこの表に一致する。
-
-| Weights | `n_in` | `n_out` |
-|---|---:|---:|
-| Q4_K | 2560 | 6144, 10240, 12288 |
-| Q4_K | 6144 | 2560 |
-| Q5_K | 2560 | 12288 |
-| Q5_K | 6144 | 2560 |
-
-- `NCOLS <= 4`。`try_wide()` が許す列数は 1〜8 で、5〜8 列はこの shape reuse の対象外。
-
-形状が一致しない場合、通常の `STRATA_MMVQ_WIDE_K_RPW` 由来の RPW（既定 1）または後続の通常 wide kernel が選ばれます。`STRATA_MMVQ_WIDE_K_RPW` は `atoi` で整数化され、2 または 4 なら対応する RPW kernel、1 やそれ以外の値なら通常の wide kernel に進みます。環境変数自体の範囲検証・警告はありません。この値が shape reuse より優先されるため、明示設定時は値が `2` でも shape 自動選択のログは出ません。
+- SYCL の native MMVQ 経路で Q4_K または Q5_K が選ばれ、`try_wide` が `STRATA_MMVQ_WIDE_K` を有効と判定し、`1 <= ncols <= 8` かつ `n_in` が QK の倍数である必要があります。`STRATA_MMVQ_WIDE_K` は未設定なら有効、設定時は `atoi` が 0 以外なら有効です（空文字や数値に変換できない文字列は 0 扱い）。他の変数や CLI から `STRATA_MMVQ_SHAPE_RPW` の値を上書きする処理はこの経路にはありません（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2066-2083,3861-3868,3457`）。
+- Shape 自動選択には、呼び出し時点のデバイスが Battlemage で、`STRATA_MMVQ_WIDE_K_RPW` が未設定であり、`ncols <= 4` であることも必要です。この変数が設定されていると、値が空でも自動選択は抑止されます。設定値は `atoi` で読む別の RPW 制御に渡され、2 または 4 のときは対応する行再利用カーネルを選びます（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1918-1920,1967-1975,1984-1991`）。
+- Q4_K の対象は `(n_in,n_out)=(2560,6144)`, `(2560,10240)`, `(2560,12288)`, `(6144,2560)`。Q5_K は `(2560,12288)`, `(6144,2560)` です。他の shape、`ncols` が 5〜8、IQ4_XS 等の別形式はこの制御では 2 行再利用にしません（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1970-1975,2071-2083,3867,3465,3773-3776`）。
+- 通常の SYCL native MMVQ の dispatch は GGML type 12 を Q4_K、13 を Q5_K に振り分けます。wide 経路に入らない場合は既存の multi/kernel 経路へ進みます（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:4204-4222,3867-3872,3465-3467`）。
 
 ## 実行時の詳細
 
-Q4_K、Q5_K、IQ4_XS の native MMVQ 関数が `try_wide()` を呼びますが、この環境変数の shape 分岐で対象になる型は Q4_K と Q5_K だけです。条件に合うと `rpw` を 2 にし、2 行を扱う `native_mmvq_wide_rpw_kernel` を launch します。同 kernel は各列の activation を取得して 2 行それぞれの accumulator に適用し、各行の出力を書き込みます。IQ4_XS は同じ wide dispatch を使いますが、shape 判定の型条件に含まれず、この変数では変更されません。
+`native_mmvq` から Q4_K/Q5_K 実装に入り、`try_wide` が wide kernel 経路を選ぶと、列数ごとに `launch_wide<F, NCOLS>` が呼ばれます。`STRATA_MMVQ_SHAPE_RPW` の判定値はその template specialization ごとに static cache されます。プロセス実行中に環境を変更しても、既に初期化された specialization には反映されません。異なるデバイスを同一プロセスで使う場合も、その specialization は最初に渡されたデバイスでの結果を再利用します（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1961-1968,2071-2083,4204-4217`）。
 
-有効な shape reuse が選択されたとき、stderr に `strata: shape-guarded Q4_K/Q5_K dense row reuse enabled` を出します。出力は `launch_wide<F, NCOLS>` のテンプレート特殊化ごとに一度です。変数が無効、shape 不一致、非 Battlemage、列数超過、または `STRATA_MMVQ_WIDE_K_RPW` が設定済みの場合、この変数専用の無効理由ログはありません。カーネル launch 後には既存の `launch_check()` が実行されますが、対象変数に固有の終了・失敗経路は見つかりません。
+条件を満たすと `rpw=2` となり、`native_mmvq_wide_rpw_kernel<F,NCOLS,2>` を launch します。各 subgroup は連続する 2 行分の重みを読み、各入力列の activation を読み込んで両行の dot 積に使います。Q4_K/Q5_K はこの条件でのみ対象となり、対象外なら `rpw` の初期値 1 に対応する通常 wide kernel が使われます（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1883-1916,1962-2004`）。
+
+## ログと測定値
+
+初めて条件を満たした `launch_wide<F, NCOLS>` specialization では stderr に `strata: shape-guarded Q4_K/Q5_K dense row reuse enabled` を出力します。同じ specialization では `note` も static なので以後この箇所からは再出力しません。条件に合わない場合、このログは出ません（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1975-1982`）。この checkout の対象コードから本変数による測定値は確認できません。
 
 ## 根拠
 
-- `sycl/include/strata/sycl_queue.hpp:123-157` — SYCL device の GPU 世代判定。
-- `sycl/include/strata/sycl_queue.hpp:159-166` — `bm_default_on()` の空値・先頭文字・既定世代の判定。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1940-1977` — RPW kernel が列ごとの activation を RPW 行で共有して出力する処理。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1979-1981,2008-2037` — `STRATA_MMVQ_WIDE_K_RPW` の parse、対象環境変数のキャッシュと shape/type/列数 gate、stderr ログ、および RPW kernel launch。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:2053-2069,3463-3475,3777-3789` — wide kernel の有効条件と Q5_K / Q4_K の呼び出し経路。
-- `docs/INTEL.md:525-532` — SYCL runtime controls の Battlemage 既定設定に関する説明。値の詳細は上記実装を根拠とした。
+- `engine/sycl/include/strata/sycl_queue.hpp:193-200` — 値の解釈と Battlemage 既定値。
+- `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1883-1916,1961-2004` — wide row reuse kernel、shape 条件、ログ、launch 分岐。
+- `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2066-2083,3457-3467,3861-3872,4204-4222` — wide 経路の条件と Q4_K/Q5_K dispatch。

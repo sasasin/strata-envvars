@@ -1,41 +1,47 @@
 # `STRATA_METAL_TRACE`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal エンジンのデコード window と prompt の処理時間・出力 token の診断行を stderr に出します。計算方法や token 選択を切り替える分岐ではなく、ログ出力だけを制御します。対象は `metal/src/engine/` の Metal 実装で、CUDA/HIP/SYCL の実装からはこの名前を読み取るコードは見つかりませんでした。
+Metal エンジンで推論ウィンドウとプロンプト処理の時間・ログ出力を stderr に追加する診断スイッチ。ウィンドウでは head を計算したとき、入力 token と出力 token、logits 上位 2 件と差、処理時間、GPU 時間、dispatch 数を記録する。プロンプトでは処理経路に応じてチャンクごとの時間、またはプロンプト全体の時間内訳と token/s を記録する。ログ以外の計算や token 選択を切り替える分岐はこの変数の読み取り箇所にはない（`engine/metal/src/engine/window.cpp:2111-2122,3466-3467`; `engine/metal/src/engine/prompt_chain.inc:608-611`）。
 
 ## 値と判定
 
-値の parse はありません。3か所とも `std::getenv("STRATA_METAL_TRACE")` のポインターが null かどうかで判定するため、未設定なら無効、設定されていれば値を問わず有効です。
+すべての読み取り箇所で文字列の内容は parse せず、`getenv` が null かどうかだけを見る。したがって未設定だけが無効であり、空文字、`0`、`false`、`0anything` を含む任意の設定値が有効になる。大文字小文字、空白、数値としての妥当性は検査しない（`engine/metal/src/engine/window.cpp:2111,3466`; `engine/metal/src/engine/prompt_chain.inc:608`）。
 
-| 環境の状態 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| `1`、`0`、`false`、その他の文字列 | 有効 |
-| 空文字（`STRATA_METAL_TRACE=`） | 有効 |
+| 読み取り箇所 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `Window::finish` のウィンドウ trace | 無効 | 空文字、`0`、`1`、`true` など、値を問わず有効 | なし（null 以外は有効） |
+| `Window::prompt_chunk` のチャンク trace | 無効 | 空文字、`0`、`1`、`false` など、値を問わず有効 | なし（null 以外は有効） |
+| `Window::prompt` の全体 summary | `STRATA_METAL_PROFILE` も未設定なら無効 | `STRATA_METAL_TRACE` または `STRATA_METAL_PROFILE` のどちらかが設定済みなら有効 | 両方とも未設定の場合 |
 
-文字列全体・先頭文字・大文字小文字・数値としての妥当性はいずれも検査しません。CLI や設定ファイルによる上書きは、この変数の読み取り箇所にはありません。
+既定値は未設定時の無効。CLI 引数や設定ファイルの値との優先順位・上書き処理は、この名前の参照箇所にはない。
 
 ## 有効になる条件
 
-Metal エンジンの該当経路が実行されることが条件です。リポジトリの Mac 向け説明では、エンジンの実装は `metal/` にあり、`STRATA_METAL_TRACE=1` はテスト用スイッチとして案内されています（`docs/MAC.md:183-205`）。ビルド設定で Metal エンジン自体が無効、または利用可能な Metal エンジンを通らない場合、このログは出ません。
-
-プロンプト全体の集計行は `STRATA_METAL_PROFILE` が設定されている場合にも出ます。そのため `STRATA_METAL_TRACE` が未設定でも、`STRATA_METAL_PROFILE` が設定され、prompt chain の処理が通れば集計行は出ます。この条件は window 単位の trace 行には適用されません。
+- macOS 向け Metal エンジンを含むビルドであること。`engine/metal/CMakeLists.txt` は Apple 以外の構成を拒否する。Metal C++ ヘッダーの指定がない場合は runtime と engine をビルドせず、`STRATA_METAL_ENGINE=OFF` でも engine を作らない（`engine/metal/CMakeLists.txt:15-20,83-89,103-111`）。
+- ウィンドウ trace は `Window::finish` が呼ばれ、`head` が true であること。head なしの prompt window ではログを出さない（`engine/metal/src/engine/window.cpp:1558,1641,2107-2122`）。
+- プロンプトのチャンク trace は streaming の prompt であること、`STRATA_METAL_PROMPT=window` でないこと、`STRATA_METAL_PROMPT_GEMM=0` でないこと、prompt token 数が `STRATA_METAL_PROMPT_GEMM_MIN`（既定 64）以上であることが必要。条件を満たすと `prompt_run_rows` が `Window::prompt_chunk` を呼ぶ（`engine/metal/src/engine/window.cpp:3743-3765,3455-3467`）。
+- プロンプト全体 summary は `Window::prompt` が最後まで成功して到達すること。`prompt_run_rows` は `STRATA_METAL_PROMPT=window` でないこと、非 streaming であること、かつ prompt token 数が `STRATA_METAL_PROMPT_MIN`（既定 32）以上の場合にこの経路を選ぶ。条件を満たさない場合は通常の window 処理などに進み、この summary は出ない（`engine/metal/src/engine/window.cpp:3743-3774`; `engine/metal/src/engine/prompt_chain.inc:583-612`）。
+- `STRATA_METAL_TRACE` が未設定でも、`STRATA_METAL_PROFILE` が設定されていれば `Window::prompt` の全体 summary は出る。ただしこの代替条件は全体 summary だけにあり、ウィンドウ trace とチャンク trace は有効にしない（`engine/metal/src/engine/window.cpp:2111-2122,3466-3467`; `engine/metal/src/engine/prompt_chain.inc:608-611`）。
 
 ## 実行時の詳細
 
-- `Window::finish()` は最初の呼び出しで `STRATA_METAL_TRACE` の有無を `static const bool` に保存します。有効で、その window が `head` を持つ場合、stderr に位置、入力 token、出力 token、logits 上位2候補と margin、window の経過時間・GPU 時間・dispatch 数を出します。`head` がない window ではこの行を出しません（`metal/src/engine/window.cpp:1319-1348`）。
-- `Window::pc_chunk()` も最初の呼び出しで値の有無を static に保存します。有効なら各 prompt chunk の位置、行数、実行時間を stderr に出します（`metal/src/engine/window.cpp:2413-2426`）。
-- prompt chain の処理後には、各呼び出しで `STRATA_METAL_TRACE` と `STRATA_METAL_PROFILE` の有無を調べます。どちらかが設定されていれば、prompt token 数、総時間、GPU 時間、host row 時間、drafter row 時間、token/s の集計行を stderr に出します（`metal/src/engine/prompt_chain.inc:400-420`）。
+`Window::finish` と `Window::prompt_chunk` は、それぞれ関数内 `static const bool` として初回到達時に設定有無を保存する。その各関数で最初に評価された後に環境を変更しても、対応する trace の判定には反映されない。両関数は別々に cache する。一方、`Window::prompt` の全体 summary は各 prompt 完了時に `getenv` を評価するため、コード上は呼び出しごとの判定である（`engine/metal/src/engine/window.cpp:2111,3466`; `engine/metal/src/engine/prompt_chain.inc:583-611`）。
 
-最初の2経路は環境変数を初回に読むため、その後プロセス内で環境を変更しても当該経路の判定は変わりません。prompt chain の集計行は毎回 `getenv()` を呼ぶため、呼び出し時点の値を判定します。これらの読み取りは処理結果を変更しません。
+`Window::finish` は head がある場合に logits の全 vocabulary を走査して最大値と 2 位を求め、`stderr` に位置、`tokens[0]` から `out[0]` への値、上位 logits と margin、経過時間、GPU 時間、dispatch 数を出す。`Window::prompt_chunk` は GPU graph 実行後に prompt 位置、行数、graph 時間を出す。`Window::prompt` は全 chunk と drafter rows の処理が成功した後、総時間、GPU・host・embeddings・PLE・drafter の時間内訳と token/s を出す（`engine/metal/src/engine/window.cpp:2107-2122,3455-3467`; `engine/metal/src/engine/prompt_chain.inc:593-612`）。
+
+trace 自体が `false` を返したり `err` を設定したりする経路はなく、プロンプト処理が途中で失敗して `Window::prompt` を抜けた場合は、完了時の全体 summary には到達しない（`engine/metal/src/engine/prompt_chain.inc:589-612`）。
+
+## ログと測定値
+
+有効なウィンドウでの出力形式は `strata metal: window pos %lld token %d -> %d (top %d %.4f, 2nd %d %.4f, margin %.4f) %.2f ms (GPU %.2f ms, %d dispatches)`。prompt chunk は `strata metal: prompt chunk pos %lld, %d rows: %.0f ms`、prompt 全体は `strata metal: prompt %lld tokens in ... -> %.1f tok/s` で stderr に出る（`engine/metal/src/engine/window.cpp:2120-2121,3467`; `engine/metal/src/engine/prompt_chain.inc:609-611`）。Strata の資料にこの変数による性能測定値はない。`docs/MAC.md:282` は「Per-window traces」と記載するが、ソースには prompt chunk と prompt 全体の診断ログも実装されている。
 
 ## 根拠
 
-- 全リポジトリの名前検索で確認した読み取り箇所: `metal/src/engine/window.cpp:1336,2424`、`metal/src/engine/prompt_chain.inc:416`。
-- decode trace の出力と `head` 条件: `metal/src/engine/window.cpp:1336-1347`。
-- prompt chunk trace: `metal/src/engine/window.cpp:2413-2426`。
-- prompt 全体の集計と `STRATA_METAL_PROFILE` との OR 条件: `metal/src/engine/prompt_chain.inc:400-420`。
-- Mac 向け資料のスイッチ一覧と Metal 実装の説明: `docs/MAC.md:183-205`。資料の表は trace の概要を示していますが、空文字・`0` も有効となる判定規則はソースに基づきます。
+- `engine/metal/src/engine/window.cpp:2111-2122` — head window の設定有無判定、上位 logits の走査、stderr 出力。
+- `engine/metal/src/engine/window.cpp:3455-3467` — prompt chunk graph の後に設定有無を cache し、チャンク時間を出力。
+- `engine/metal/src/engine/prompt_chain.inc:583-612` — prompt 完了時に trace/profile の設定有無を都度確認して全体 summary を出力。
+- `engine/metal/src/engine/window.cpp:3743-3774` — prompt の分岐と全体 summary を出す経路の選択条件。
+- `engine/metal/CMakeLists.txt:15-20,83-89,103-111` — Metal ビルドの OS 条件、ヘッダー指定、エンジン build option。

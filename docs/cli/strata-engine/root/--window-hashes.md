@@ -1,70 +1,70 @@
 # `--window-hashes`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数 parser） |
+| コマンド | `strata`（ネイティブ推論エンジン、root 引数） |
 | オプション | `--window-hashes` |
 | 別名 | なし |
-| 値 | 出力ファイルのパス（文字列） |
+| 値 | 出力ファイルのパス (`PATH`) |
 
 ## 役割
 
-投機的デコードの各 verify window について、window の位置・幅、最終 residual rows のハッシュ、各行の argmax token ID をテキストファイルへ記録します。推論結果そのものの保存や、モデルの重みのハッシュではありません。実装コメントはこの記録をテスト用の経路としています（`src/program/generate.cpp:677-678, 16628-16637`）。
+speculative decoding の verify 窓ごとに、最終残差行列の 64 bit ハッシュと argmax token ID 列を記録します。異なるビルドや speculative 設定を比較する診断・ベンチマーク向けの出力です。単発推論の speculative loop が実行される場合に書き込みます。
 
 ## 使い方
 
-モデルと入力 token ファイルを指定する通常の起動例です。`--spec-follow` には比較対象の continuation token ID 列を置き、出力先には新しいファイルを指定します。
-
 ```sh
-strata --pack model.gguf --tokens-file prompt.tokens \
-  --spec 4 --spec-follow continuation.tokens --adapt-every 0 \
-  --window-hashes /tmp/window-hashes.txt
+# 例: token ID 列を使う単発推論の verify 窓を記録する。
+# pack、PLE、token ID は実際のモデルと環境に合わせる。
+strata --pack pack/full --tokens "1,2,3" --ple-gguf /path/to/ple.gguf \
+  --spec 4 --adapt-every 0 --window-hashes /tmp/window-hashes.txt
 ```
 
-`--spec-follow` と `--adapt-every 0` の併用は、同じ continuation と固定した適応設定で build 間を比較する用途として help に案内されています（`src/program/generate.cpp:979-984`）。verify loop が実際に走るには、モデル・入力・実行環境の条件も満たす必要があります。
+このオプションだけでは speculative loop は開始しません。`--spec` など推論条件が整い、生成可能な token が残っていて、EOS で終了していない場合に記録されます。
 
 ## 値と既定値
 
-- 値は `next("--window-hashes")` で次の argv 要素からそのまま読み取られます。専用の形式・範囲検査はありません（`src/program/generate.cpp:2418-2420, 2622`）。
-- 省略時は空文字列のままで、ファイルを開かず記録もしません（`src/program/generate.cpp:678, 16418`）。別の既定パスはありません。
-- 値を省略すると `--window-hashes needs a value` を stderr に出し、parser 内の `exit(2)` で終了します（`src/program/generate.cpp:2418-2420`）。空文字列を明示した場合は空値として保持され、ファイル出力は無効になります。
-- 複数回指定した場合の重複拒否はなく、parser は同じフィールドへ順に代入するため最後の値が残ります（`src/program/generate.cpp:2416-2422, 2622`）。
+`PATH` は次の argv 要素から文字列として受け取り、パーサー段階では形式や書き込み可能性を検証しません。値を省略すると `--window-hashes needs a value` を stderr に出して終了コード 2 で終了します。複数回指定した場合は、引数走査で後から代入されたパスが使われます。空文字列は受理されますが、空の値は未指定と同じ扱いになりファイルを開きません。
+
+既定値は空文字列（出力なし）です。speculative loop に入ると、指定パスを `fopen(..., "w")` で開くため、既存ファイルは切り詰められます。親ディレクトリは作成されません。
 
 ## 実行時の動作
 
-parser はパスを `Options::window_hashes` に格納します。投機的デコードの loop が開始された後に限り、空でないパスを `fopen(path, "w")` で開きます。そのため既存ファイルがあれば切り詰められ、追記ではありません。通常の非投機 decode や、生成上限・停止条件などで verify loop に入らない実行では、この箇所でファイルは開かれません（`src/program/generate.cpp:16091-16102, 16408-16420`）。
+speculative loop の開始後、窓の処理に先立って出力ファイルを開きます。開けない場合は `strata generate: cannot write <PATH>` を stderr に出し、終了コード 1 を返します。各 verify 窓の処理が成功すると、次の空白区切りの1行を追記します。
 
-各 verify window の検証後、`T * (g.hc * g.n_embd)` 個の float に相当する final residual rows を GPU から host にコピーします。コピーした float の生バイト列を走査し、コード中の初期値 `1469598103934665603` と乗数 `1099511628211` を使って 64-bit 値を計算します。その後、1行に次の順で記録します（`src/program/generate.cpp:16628-16637`）。
+```text
+ラウンド番号 位置 窓サイズ 16桁の16進ハッシュ argmax-token-ID ...
+```
 
-1. window の round index `rounds`
-2. window の開始位置 `p`
-3. 実際に検証した幅 `T`
-4. 16桁の16進表記の residual hash
-5. `T` 個の argmax token ID
+ハッシュ対象は窓の最終残差行列を float のバイト列として並べたものです。実装は FNV-1a の初期値 `1469598103934665603` と乗数 `1099511628211` を使います。行の後半には窓の各位置の `outv`（verify 結果の argmax token ID）が出力されます。`--spec-follow` が指定されていても、記録は follow の token ID で `outv` を置き換える処理より前に行われます。
 
-hash は follow token 適用前に計算・出力されます。`--spec-follow` が指定されていれば、その後で `outv` を continuation token に置き換えて続行します（`src/program/generate.cpp:16628-16644`）。help は、同じ演算を行う build で同じファイルを得る用途として説明しています（`src/program/generate.cpp:982-984`）。
+`--window-hashes` 自体は推論結果や採択判定を変更しません。help はビルド間の比較用途として `--spec-follow` と `--adapt-every 0` を併用する例を案内しています。`--adapt-every 0` は適応的な cache 更新を止める設定ですが、ハッシュ出力オプションの必須条件ではありません。
 
 ## 適用条件と副作用
 
-- この記録処理は `spec_loop_runs(...)` が true の投機的デコード経路内にあります。通常 decode の出力には作用しません（`src/program/generate.cpp:16095-16102, 16416-16420`）。
-- `--spec-follow` は同じ continuation で比較するための関連 option です。ファイルが読めない、または token 列として解析できない場合はエラーを stderr に出して終了コード 2 になります（`src/program/generate.cpp:16103-16116`）。
-- help は `--adapt-every 0` を併用例として示しています。明示指定は parser で `adapt_every` に保存されますが、適応処理全般をこの option が無効化するわけではありません（`src/program/generate.cpp:2626, 982-984`）。
-- 出力先は `"w"` モードで作成または切り詰められます。既存データを残したい場合は別パスを指定してください（`src/program/generate.cpp:16418`）。
-- ファイルを開けない場合は `strata generate: cannot write <path>` を stderr に出し、終了コード 1 で失敗します（`src/program/generate.cpp:16418-16421`）。書き込み・close の戻り値はこのコードで確認していません（`src/program/generate.cpp:16635-16637, 16725`）。
-- SYCL 実装にも同じ parser、`"w"` の open と同じ列構成の出力があります（`sycl/src/program/generate.cpp:1920, 12638-12641, 12734-12746, 12830`）。この調査では実行バイナリを用いた platform 別の挙動確認はしていません。
+- 対象は `strata-engine` の root 引数です。Terminal CLI の同名 `strata` wrapper のオプションではありません。
+- 記録処理は speculative loop 内にあります。loop は開始位置が設定され、`produced < max_new` かつ EOS 終了済みでない場合に実行されます。したがって、loop が実行されない経路ではファイルを開かず、出力しません。
+- 通常の `engine/src/program/generate.cpp` と SYCL 用 `engine/sycl/src/program/generate.cpp` の双方に同じ用途の parser・書き込み処理があります。実際に使われる実装はビルドされた engine/backend によります。
+- ファイルは指定先に作成または上書きされます。処理途中で別のエラーが起きると、すでに書いた行だけが残る可能性があります。書き込みや `fclose` の戻り値を検査するコードは確認できません。
 
 ## 出力とエラー
 
-通常の parser は値を検証しません。値欠落は終了コード 2、投機 loop での出力ファイル open 失敗は終了コード 1 です。open 失敗が検出されるのは verify 用の初期化処理後であり、その時点までに行われた初期化の副作用はこの option では取り消されません（`src/program/generate.cpp:16121-16141, 16408-16421`）。正常時の各行は専用ファイルに `fprintf` されます。標準出力にはこの option 固有の完了メッセージはありません。
+- 値がない場合: `--window-hashes needs a value`、終了コード 2。
+- 出力ファイルを開けない場合: `strata generate: cannot write <PATH>`、終了コード 1。
+- 窓の verify が失敗した場合などは通常の推論エラー経路で終了し、ファイルにはそれまでの行が残ることがあります。
+- 行書き込み後のディスクエラーやクローズ失敗について、専用の診断・終了コード処理はソースで確認できません。
 
 ## 根拠
 
-- parser と値欠落時の処理: `src/program/generate.cpp:2418-2420, 2622`
-- option の保存先・help の用途説明: `src/program/generate.cpp:677-678, 982-984`
-- verify loop と出力ファイル open: `src/program/generate.cpp:16091-16102, 16408-16421`
-- hash 算出・1行の形式・follow 処理との順序: `src/program/generate.cpp:16628-16644`
-- 正常時の close: `src/program/generate.cpp:16720-16727`
-- SYCL 実装: `sycl/src/program/generate.cpp:639, 1920, 12638-12641, 12734-12746, 12830`
+- `engine/src/program/generate.cpp:1034-1035` — オプション値の格納先。
+- `engine/src/program/generate.cpp:1396-1401` — help 上の用途と `--spec-follow`、`--adapt-every 0` との使用例。
+- `engine/src/program/generate.cpp:3842-3847,4053-4058` — argv 値取得、値の不足処理、オプション parser、関連する `--spec` と `--adapt-every` の parser。
+- `engine/src/program/generate.cpp:24464-24489`、`engine/include/strata/spec/spec_start.hpp:14-18` — speculative loop の開始条件と loop 前の失敗経路。
+- `engine/src/program/generate.cpp:24859-24866,25149-25165,25250-25256` — ファイルの open/truncate、verify 窓ごとのハッシュと token ID の書き込み、follow 適用順、close。
+- `engine/sycl/src/program/generate.cpp:13981-13989,14139-14156,14233-14238` — SYCL 実装の対応するファイル処理。
+- `docs/cli/000_cli_tools.md:7-10`、`docs/cli/README.md:1036-1041,1233` — tool ID/parser scope と、作成対象リンクの配置。
+
+この調査では既存バイナリの help 表示や実行、ビルド、GPU 動作を確認していません。値の検証を行わない範囲、書き込み失敗時の戻り値未検査、実行時の backend 差はソースから確認できる範囲に限って記載しました。

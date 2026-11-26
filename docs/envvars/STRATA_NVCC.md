@@ -1,47 +1,59 @@
 # `STRATA_NVCC`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。作業ツリーは `main...origin/main` で、未コミット変更はありません。外部ライブラリ・GPU driver の挙動は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-ソースセットアップが CUDA コンパイラ `nvcc` を探す際、ユーザー指定のパスを候補探索より優先する変数です。値を読むのは `setup.py` で、ビルド用ツールキットの選択および CUDA 画像エンコーダーのビルドに使われます。通常のインストール済みエンジンの実行時設定ではありません。
+`STRATA_NVCC` は Strata の `terminal/setup.py` がローカルの CUDA ビルドに使う `nvcc` の場所を指定する。空でない値は `nvcc` 実行ファイルのパスとして扱われ、通常の候補探索を止めて指定先だけを検査する。これはセットアップ時のビルドツール選択であり、ビルド済みエンジンの起動時に読む設定ではない。CUDA エンジンまたは CUDA 画像生成器をビルドする経路で作用し、HIP・Vulkan・CPU のビルド経路からは `find_nvcc()` が呼ばれない（`terminal/setup.py:2637-2671, 5900-5933, 6902-6965`）。
+
+値が採用されると、エンジンと CUDA 画像エンコーダーの CMake に `-DCMAKE_CUDA_COMPILER=<nvcc>` が渡り、選択された nvcc の toolkit root が `/usr` 以外なら `CUDAToolkit_ROOT` も指定される（`terminal/setup.py:6861-6867, 6941-6965`）。CUDA 画像生成器では同じ nvcc から toolkit root を組み立て、CMake 定義と実行時ライブラリ候補を選ぶ（`terminal/setup.py:5922-5933`）。
 
 ## 値と判定
 
-`os.environ.get("STRATA_NVCC")` の値を真偽値で判定します。空文字列は未設定と同じく通常探索へ進みます。空白除去や文字列全体の形式検査はせず、非空の値をパスとして `Path.exists()` で確認します。
+`find_nvcc()` は呼ばれるたびに `os.environ.get("STRATA_NVCC")` を読み、Python の真偽値で分岐する。値の空白除去や `strip()`、数値変換はしない。非空値はそのまま `Path(pick)` と `[pick, "--version"]` に渡され、バージョン出力から正規表現 `release (\d+)\.(\d+)` の最初の一致を探す。バージョンは major/minor の整数タプルで扱う。空白・大文字小文字・パス形式は正規化されない（`terminal/setup.py:2637-2652`）。
 
-| 値・条件 | `find_nvcc()` の処理 |
-|---|---|
-| 未設定、または空文字 | `PATH`、`CUDA_PATH`、`CUDA_HOME`、OS別の標準配置を探索する。 |
-| 非空だがパスが存在しない | `STRATA_NVCC=<値>: no such file; looking for a CUDA toolkit as usual` と警告し、通常探索へ進む。 |
-| 非空でパスが存在する。`--version` の標準出力に `release 数字.数字` がある | 指定パスと `(major, minor)` を返す。ただし `below` が指定され、その版が `below` 以上なら警告して `(None, None)` を返す。指定パスを拒否した後に別候補へは進まない。 |
-| 非空でパスは存在するが、版数を読めない | `(None, None)` を返す。通常候補探索には進まない。 |
+| 条件 | 未設定 | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 通常の CUDA ビルド（`below` なし） | `PATH`、`CUDA_PATH`、`CUDA_HOME`、OS 固有の標準場所から候補を集め、バージョンを読める中で最も新しいものを選ぶ | 存在し、`--version` 出力に `release M.m` がある実行可能な nvcc パス。例: `/opt/cuda-13.0/bin/nvcc` | 空文字は未設定と同じ。存在しないパスは警告後に通常探索。存在するが起動できない、60 秒以内に完了しない、または出力にバージョンがないパスは `(None, None)` となり、通常探索には戻らない |
+| CUDA 12 ビルド（`below=(13, 0)`） | 上記候補から `13.0` 以上を除いて最新を選ぶ | 指定 nvcc の版が `13.0` 未満であること。実際のビルド要件は GPU により `12.0` または `12.8` 以上 | 指定 nvcc が `13.0` 以上なら警告し、候補探索へ戻らない。必要最低版未満も後段で不足扱い |
+| RTX 50 / sm_120 の CUDA 13.2.0・13.2.1 補正 | 条件に合えば、ユーザー指定がない場合に限り古い 13.x を再探索する | ユーザーが選んだ版は保持。指定なしなら 13.0 以上 13.2 未満の nvcc が自動選択され得る | 非空値があると自動差し替えしない。空文字は「ユーザー指定なし」として扱われる |
 
-版数は `release (\\d+)\\.(\\d+)` の正規表現で標準出力から抽出します。コマンド実行は最大60秒で、`OSError` または timeout 時は空文字列扱いです。`below` の比較は厳密な下限で、たとえば CUDA 12 エンジン用の `(13, 0)` なら 13.0 以上は不適合です。自動探索では候補ごとに同じ形式で版数を読み、条件を満たす候補のうち最も新しい版を選びます。`PATH` の `nvcc`、`CUDA_PATH` / `CUDA_HOME` 配下、Windows の標準 CUDA 配置、または Linux の `/usr/local/cuda*` と `/opt/cuda*` が探索元です。
+空文字は `if pick:` と `if not os.environ.get(...)` の双方で未指定扱いであり、指定パスを意味しない。`0` や `true` のような文字列も特別扱いされず、文字通りのパスとして調べられる。値が存在しない場合だけ通常探索に進み、存在しない指定パスの場合も警告後に通常探索する。一方、存在するパスで `--version` が失敗する・時間切れになる・出力形式が合わない場合は通常探索にフォールバックせず、nvcc 不明として返す。`below` が設定されている場合、指定版が境界以上なら警告して同じく候補探索へは戻らない（`terminal/setup.py:2637-2671, 1192-1197`）。
+
+通常探索は `PATH` の `nvcc`、`CUDA_PATH` と `CUDA_HOME` の下の `bin/nvcc`（Windows は `nvcc.exe`）、Windows の NVIDIA toolkit 標準フォルダー、または非 Windows の `/usr/local/cuda*` と `/opt/cuda*` を調べる。重複を除き、版を読めて条件を満たす候補のうち最大の major/minor を選択する（`terminal/setup.py:2653-2671`）。
 
 ## 有効になる条件
 
-- Strata のソースセットアップで CUDA 用エンジンのビルドが必要になり、`install_build_tools()` がコンパイラを選ぶときに参照されます。CUDA 12 系エンジンでは 13.0 未満を探し、必要な CUDA 版は GPU architecture に応じて判定されます。選択後の `nvcc` パスは CMake の `CMAKE_CUDA_COMPILER` に渡されます。
-- CUDA backend の画像エンジンを新たにビルドする経路でも `find_nvcc()` が呼ばれます。ここでは版の上限指定はなく、見つからなければセットアップを停止します。
-- CUDA 13.2 の版が RTX 50（sm_120）向けビルドに選ばれた場合、`nvcc` build 番号が 86 未満または読めないときの自動代替探索は、`STRATA_NVCC` が空でない場合には行われません。指定済みコンパイラを維持して警告を出します。変数が未設定または空なら、13.2 未満の候補を探し、13.0 以上が見つかった場合はそちらを使います。
-- 既製エンジンが使われ、CUDA コンパイルが発生しない通常の起動経路では、この選択処理に入りません。HIP ビルド用経路も `STRATA_NVCC` を参照しません。
+- ローカル CUDA エンジンを新規ビルド・再ビルドする経路で `install_build_tools()` が呼ばれること。既存エンジンと必要な画像エンコーダーが最新と判定されればビルドを省略し、この値も読み取られない（`terminal/setup.py:6902-6933`）。
+- CUDA 画像生成器をビルドする場合は `backend == "cuda"` のときに読み取る。既に同じ backend と build stamp の生成器があれば `find_nvcc()` より先に返る（`terminal/setup.py:5900-5928`）。
+- CUDA 12 の旧 GPU ビルド、または `--cuda 12` 相当では `13.0` 未満が必要で、sm_120 を含む場合の最低版は `12.8`。他の CUDA ビルドでは基本的に CUDA `12.0` 以上が必要で、sm_120 を含む場合は CUDA `13.0` 以上が必要（`terminal/setup.py:6607-6623, 6615-6621`）。
+- RTX 50 / sm_120 向けに CUDA 13.2.0 / 13.2.1 の nvcc build number が 86 未満または読めない場合、指定がなければ古い 13.x を探す。`STRATA_NVCC` が非空なら指定版を維持し、警告を出す場合がある（`terminal/setup.py:6563-6593`）。
+- Windows では選択された CUDA 版に対応する Visual Studio 環境も別途必要。非 Windows では `g++` が必要。これらは `STRATA_NVCC` の値によって代替されない（`terminal/setup.py:6624-6634`）。
+- HIP・Vulkan・CPU 経路では対象の `find_nvcc()` を呼ばない。CUDA 以外の backend にこの変数が転送される処理も見つからない（`terminal/setup.py:5900-5953, 5656-5712`）。
 
 ## 実行時の詳細
 
-値は `find_nvcc()` の呼び出しごとに読み直され、モジュール内キャッシュはありません。したがってセットアップ中に環境が書き換えられれば次の呼び出しでは再評価されます。`nvcc` や CMake などの子プロセスには通常の環境継承がありますが、この変数を子プロセス用に書き換える処理はありません。選択されたパスは `build_engine()` から CMake の `-DCMAKE_CUDA_COMPILER=...` として渡され、CUDA toolkit のルート定義にも使われます。
+セットアップの Python プロセス内で `find_nvcc()` を呼ぶ都度、環境から読み直す。関数内 static cache やモジュール起動時の固定読み取りはないため、同一プロセス内で環境が変更された場合、後続呼び出しにはその時点の値が使われる。通常、ツールキット確認後は戻り値の nvcc を CMake 引数に使う。`STRATA_NVCC` 自体を子プロセスへ設定し直す処理はないが、nvcc のパスを CMake 定義へ渡す（`terminal/setup.py:2637-2671, 6615-6634, 6683-6690, 6941-6965`）。
 
-明示パスが存在しない場合は警告後に自動探索します。指定パスの CUDA 版が `below` 以上の場合は警告し、別候補へ fallback せず `(None, None)` を返します。通常のエンジンビルドでは必要な compiler/toolkit がないとしてインストール案内またはエラー停止に至り得ます。版数が読めない既存パスも `(None, None)` となり、通常探索はされません。CUDA 13.2 の sm_120 向け警告は stdout に `[!]` 付きで出ます。`warn()` と `fail()` は stdout に表示し、`fail()` は `sys.exit(1)` でセットアップを終了します。
+指定ファイルが存在しない場合は「そのパスだけを候補とする」扱いにはならず、通常の候補探索に進む。指定パスが存在してもバージョンを取得できない場合、`find_nvcc()` は `(None, None)` を返す。ツール導入前の確認では必要ツール不足としてインストール案内へ進む場合があり、導入後の再確認では CUDA Toolkit が入らなかったとしてセットアップを終了する。CUDA 12 ビルドで必要版に届かない場合は、通常のツールインストール案内より前に `fail()` で終了する（`terminal/setup.py:2641-2652, 1049-1056, 6615-6621, 6683-6689`）。
 
-ソース内の案内と一致して、`docs/OLDER_GPUS.md` は CUDA 12.x の選択、`docs/TROUBLESHOOTING.md` は特定 toolkit の明示指定を説明しています。`docs/DETAILS.md` は通常の `nvcc` 探索場所を説明していますが、この変数の空文字・無効パス時の詳細は記載していません。
+## ログと測定値
+
+観測可能な文言は次のとおり。`warn()` は `  [!]  ` を付けてセットアップ出力に表示し、warning event も記録する。`fail()` は `  [X]  ` と案内を表示し、error event の `exit_code=1` を記録して終了する（`terminal/setup.py:1044-1056`）。
+
+- 指定パスが存在しない: `STRATA_NVCC=<値>: no such file; looking for a CUDA toolkit as usual`
+- `below` の境界以上を指定: `STRATA_NVCC=<値> is CUDA M.m; this build needs one older than X.Y`
+- RTX 50 向けの不具合版をユーザーが指定: CUDA 13.2.0 / 13.2.1 が誤った回答を生むという警告。自動で指定を差し替えない。
+- `--version` が失敗・timeout・不一致でも、それ自体の警告はない。後続の要件検査が失敗すれば、不足または CUDA Toolkit の導入失敗として終了する。
+
+`docs/OLDER_GPUS.md:117-119` と `docs/TROUBLESHOOTING.md:210-217, 287-291` は指定 nvcc による CUDA toolkit 選択と既知の CUDA 版条件を記述しており、コードの選択処理と一致する。`STRATA_NVCC` 自体の性能測定値は該当資料にない。
 
 ## 根拠
 
-- `setup.py:2215-2249` — 値の取得、空文字を含む真偽判定、明示パスの存在確認と版数抽出、`below` 判定、fallback、自動候補探索。
-- `setup.py:1000-1004` — `--version` 実行の timeout と例外時の空出力。
-- `setup.py:896-909` — 警告・停止メッセージの出力先と終了動作。
-- `setup.py:5022-5031` — CUDA 画像エンジンのコンパイル時にも `find_nvcc()` を呼び、選択パスを CMake に渡す。
-- `setup.py:5624-5649` — RTX 50 / sm_120 向け CUDA 13.2 build 判定、変数が未指定の場合だけ行う代替探索と警告。
-- `setup.py:5660-5690, 5739-5746` — CUDA toolkit 要件判定、通常・CUDA 12 の compiler 選択、ビルドツール不足時の処理。
-- `setup.py:5905-5976` — engine build から `install_build_tools()` へ進み、選択した `nvcc` を CMake へ渡す箇所。
-- `setup.py:7772-7804` — 通常のセットアップ engine 経路。既製品がない場合または明示 build の場合にビルドへ進む。
-- `docs/OLDER_GPUS.md:111-113`, `docs/TROUBLESHOOTING.md:211-218,288-292`, `docs/DETAILS.md:197-201` — 既存説明との照合。
+- 候補の読取、指定値の検査、fallback と通常候補選択: `terminal/setup.py:2637-2671`
+- nvcc のコマンド出力・timeout 処理: `terminal/setup.py:1192-1197`
+- CUDA 画像生成器の読取と適用: `terminal/setup.py:5900-5933`
+- sm_120 の自動代替と警告: `terminal/setup.py:6563-6593`
+- CUDA ビルドの版要件と不足時の分岐: `terminal/setup.py:6604-6634, 6683-6690`
+- CMake へのコンパイラ・toolkit root 適用: `terminal/setup.py:6861-6867, 6941-6965`
+- 出力・warning/error event: `terminal/setup.py:1039-1056`

@@ -1,89 +1,61 @@
-# `--set`
+# `strata launch` `--set`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
 | コマンド | `strata launch` |
-| オプション | `--set KEY=VALUE` |
+| オプション | `--set` |
 | 別名 | なし |
-| 値 | エンジン引数または環境変数名と、その値を `=` でつないだ一組。複数回指定可 |
+| 値 | `KEY=VALUE`。engine 引数または環境変数の設定を一つ指定する。繰り返し指定可能。 |
 
 ## 役割
 
-`strata launch` がモデルを起動するときに使う、上級者向けのエンジン設定を追加・上書きします。キーが小文字のエンジンオプション形式なら run config の `args` を変更し、大文字を含む環境変数名形式なら `env` を変更します。
-
-通常の `strata launch` オプションに専用の選択肢がないエンジン設定や環境変数を使いたい場合に利用します。どの設定が利用可能か、その設定の効果や条件は、Strata エンジンの対応状況を別途確認してください。
+保存済み preset または今回起動するモデルに、engine の追加引数や環境変数を重ねます。指定した engine 引数は今回の launch の明示値として run config に反映され、設定の優先順位では保存済みの利用者指定値や較正値より上になります。`STRATA_*` など大文字を含む環境変数名は run config の `env` に設定され、サーバーが engine 子プロセスを起動するときにその環境へ反映します（`terminal/strata_control/arg_layers.py:3-18,75-108`; `terminal/strata_cli/launch/runner.py:801-815`; `terminal/serve/server.py:4007-4028`）。
 
 ## 使い方
 
 ```sh
-# エンジンの --prefill をこの起動だけ 65536 にする
-strata launch --preset Office --set prefill=65536 --no-tui
+# preset の今回の起動だけに engine 引数と環境変数を追加
+strata launch --preset Office --set prefill=65536 --set STRATA_PIN_BY_NEED=1 --no-tui
 
-# 環境変数 STRATA_PIN_BY_NEED をエンジンへ 1 として渡す
-strata launch --preset Office --set STRATA_PIN_BY_NEED=1 --no-tui
-
-# 複数の設定を指定する
-strata launch --preset Office \
-  --set prefill=65536 \
-  --set STRATA_PIN_BY_NEED=1 \
-  --no-tui
+# サーバー設定の idle-unload を300秒にする
+strata launch --preset Office --set idle-unload=300 --no-tui
 ```
 
-キーは `prefill=65536` のように書き、エンジン引数を表す先頭の `--` は省略できます。キー自体に `--` を含める場合は `--set=--prefill=65536` の形で渡します。設定ペアの中に空白がある値は、shell で `--set 'key=value with spaces'` のように全体を引用符で囲みます。
+## 値と既定値
 
-## キーと値の解釈
+- `--set` は `action="append"`、既定値 `[]` で登録されており、値は必須です（`terminal/strata_cli/launch/cmd.py:124-125`）。この option 自体に既定の設定値はありません。
+- 最初の `=` でキーと値を分け、前後の空白を除きます。`=` より後ろにある追加の `=` は値に残ります。通常のキーは小文字始まりの `[a-z][a-z0-9-]*` に合い、`--prefill` のような `--` 付きも指定できます。通常キーの `_` は `-` に正規化されます。大文字を一つ以上含む環境変数キーは `[A-Za-z_][A-Za-z0-9_]*` の形式です（`terminal/strata_cli/launch/settings.py:361-377`）。
+- `=` を省略した場合も値は空文字として受理されます。engine の値を取る引数では空値は変更なしとして扱われますが、環境変数では空文字が設定値になります（`terminal/strata_cli/launch/settings.py:365-385,392-417`）。
+- 同じ正規化後のキーを複数回指定した場合は後の値が残ります（`terminal/strata_cli/launch/settings.py:380-385`）。preset に同じキーがある場合も CLI の `--set` が上書きします（`terminal/strata_cli/launch/cmd.py:215-221,302-303`）。
 
-### キー
+## 実行時の動作
 
-- **エンジン引数:** `prefill=65536`、`--prefill=65536`、`no-pool=on`。小文字で始まるキーは `--` が付いていてもいなくてもエンジンフラグとして扱われます。キー中の `_` は `-` に正規化されます。例: `--pool_cores=2-14:2` は `--pool-cores` になります。
-- **環境変数:** `STRATA_PIN_BY_NEED=1`、`IGC_EnableDPEmulation=1`。ASCII 大文字を少なくとも一つ含む環境変数名形式のキーは、その名前のまま環境変数として扱われます。`STRATA_` 接頭辞に限定されません。
-- `=` が最初の区切りです。値の中にさらに `=` があれば値の一部として保持されます。キーと値の前後の空白は取り除かれます。
-- エンジン引数キーは、先頭が小文字英字で、残りが小文字英字・数字・ハイフンである必要があります。環境変数キーは英字または `_` で始まり、続きに英数字または `_` を使えます。
-- `--set` の値自体を省略すると argparse のエラーになります。`KEY` または `KEY=` のようにペア内の `=` と値を省略・空にする形は受理されますが、適用方法は以下の通りキー種別で異なります。
+parser は値を文字列のリストとして受け取り、`settings_from_args()` が preset の `extra` に CLI 指定をマージします。engine 引数キーは `--key` 形式に正規化され、真偽値 option では空値または `on` / `true` / `yes` が有効化、`off` / `false` / `no` / `none` が除去を表します。その他は値として適用されます。環境変数キーは値をそのまま保持し、`off` / `unset` / `none`（大文字小文字を区別しない）なら run config の `env` からそのキーを除去します（`terminal/strata_cli/launch/settings.py:392-417`; `terminal/strata_cli/launch/runner.py:801-806`; `terminal/strata_control/tune_knobs.py:536-543`）。
 
-### 値による制御と空値
+通常の engine 引数は `arg_layers.layer()` で今回の明示値として `args` と `user_args` に反映されます。設定ソースの優先順は今回の launch 指定、保存済み利用者指定、適合する較正値、Auto です。ただし `launch_set` に今回限りの指定を記録するため、次回起動時に今回の `--set` が利用者の恒久設定として引き継がれるわけではありません（`terminal/strata_control/arg_layers.py:3-18,75-108`）。`--save-preset NAME` を併用すると、マージ後の選択をその名前の preset に保存または置換します。保存しない場合は preset 自体は更新せず、起動履歴のみ更新します（`terminal/strata_cli/launch/cmd.py:893-895,962-966`; `terminal/strata_cli/launch/store.py:76-86`）。
 
-`--set` では一部の文字列を設定の削除やフラグの切り替えに使います。これらの文字列は大文字・小文字を区別しません。
+`idle-unload` は engine 引数ではなくサーバー設定 `idle_unload_s` に変換され、engine argv には渡りません。数値文字列は秒数として数値化され、整数値なら整数で保存されます。`off` 等は設定キーを削除します。数値に変換できない値は launch error になります（`terminal/strata_cli/launch/runner.py:586-610,801-815`）。
 
-| キーの種類 | 値 | 結果 |
-| --- | --- | --- |
-| Boolean エンジンフラグ | 値なし、空値、`on` / `true` / `yes` | フラグを引数に追加 |
-| Boolean エンジンフラグ | `off` / `false` / `no` / `none` | フラグを引数から削除 |
-| 値を取るエンジンオプション | `off` / `false` / `no` / `none` | そのオプションを引数から削除 |
-| 値を取るエンジンオプション | 空値 | 変更しない |
-| 環境変数 | `off` / `unset` / `none` | run config から環境変数を削除 |
-| 環境変数 | 空値 | 値が空文字列の環境変数を設定 |
-| 環境変数 | その他の文字列 | その文字列を環境変数の値に設定 |
+## 適用条件と副作用
 
-「Boolean エンジンフラグ」は Terminal が値なしのフラグとして認識するオプションです。たとえば `--set no-pool=on` は `--no-pool` を追加し、`--set no-pool=off` は削除します。値を取るオプションで空値を指定した場合、空の値を渡すのではなく変更しません。値を取るオプションに `on` / `true` / `yes` を指定すると bare flag として渡されるため、その使い方は避けてください。
+- 起動対象を `--preset` または `--model` などで指定して使います。`--set` だけでは `have_choices` に数えられず、非対話または `--no-tui` では起動対象を指定するよう終了コード 2 で拒否されます（`terminal/strata_cli/launch/cmd.py:849-862`）。
+- engine 引数名が実際の engine に存在するかは、CLI の `--set` 値を設定へ変換する段階では検証しません。対話画面で手入力する advanced 設定には未知 flag の警告処理がありますが、CLI parser の `--set` 経路からは呼び出されません（`terminal/strata_cli/launch/settings.py:365-385`; `terminal/strata_cli/launch/params.py:212-221`; `terminal/strata_cli/launch/screens.py:1619-1625`）。engine が知らない引数を受け取った場合の起動可否やメッセージは対象 engine に依存し、この CLI の検証では保証されません。
+- 起動処理では private run config を作成・更新し、そこから server が engine 子プロセスを起動します。環境変数指定はその子プロセス環境へ反映されます（`terminal/strata_cli/launch/runner.py:2204-2238`; `terminal/serve/server.py:4007-4028`）。
 
-`off` などの予約語自体は通常値として渡せません。特に環境変数の値として実際の文字列 `off`、`unset`、`none` を渡したくても、このオプションでは削除を意味します。
+## 出力とエラー
 
-## 優先順位と保存範囲
-
-- `--preset NAME` と併用すると、preset の `extra` 設定を読み込んでから `--set` の値を重ねます。同じ正規化後のキーを複数回指定した場合は、コマンドラインで最後に指定した値が残ります。別表記のキーが正規化後に同じキーになる場合も一つにまとめられます。
-- `--preset` と併用した `--set` の変更は、通常この起動だけに適用されます。次回以降も使うには `--save-preset NAME` を指定します。`--save-preset` は値を preset JSON の `extra` 項目に保存します。保存先は既定で profiles フォルダーの隣にある `launch-presets/` で、`STRATA_LAUNCH_PRESET_DIR` で変更できます。
-- 起動時、Terminal はインストール済み run config を元に、その launch 専用の設定を作ります。`--set` のエンジンフラグは `args` に、環境変数は `env` に反映されます。setup が作成した元のモデル run config は変更しません。
-- 同じ機能に関わるエンジンフラグと環境変数を両方指定した場合の優先順位は、各設定の実装に従います。関連するオプション文書と環境変数文書を確認してください。
-
-## 無効な設定・未対応の設定
-
-空のキーや無効なキー形式は設定構築時に拒否されます。`--set` 自体の値を省略した場合も拒否されます。前者は `ValueError` として終了コード `2` で返ります。
-
-`--set` は、構文上正しいエンジンフラグが選択中のエンジンに実装されているかを、コマンドライン処理で常に事前検証するわけではありません。Terminal の Advanced 画面では、エンジンの help にないフラグに警告を表示し、入力値を保持します。古いエンジンなどがそのフラグを受け付けず、起動に失敗する場合があります。キーの綴り、エンジンのバージョン、backend を確認してください。
+- 空の設定名や形式に合わない名前は `ValueError` となり、通常出力では `strata: <理由>` を stderr に出して終了コード 2、`--output json` では error JSON を stdout に出して同じコードで終了します（`terminal/strata_cli/launch/settings.py:365-377`; `terminal/strata_cli/launch/cmd.py:759-764,1011-1012`）。
+- `idle-unload` が数値に変換できない場合も同じ launch error 経路で失敗します（`terminal/strata_cli/launch/runner.py:592-609`; `terminal/strata_cli/launch/cmd.py:950-961`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:16-29,75-115` — `strata launch` の使用例、`--set` の反復指定と help 説明。
-- `strata_cli/launch/cmd.py:270-272` — 保存済み `extra` にコマンドラインの `--set` を重ねる処理。
-- `strata_cli/launch/settings.py:77-105,120-128` — preset に保存される `LaunchSettings.extra`。
-- `strata_cli/launch/settings.py:223-269` — キーの構文、`_` の正規化、値の変換、フラグと環境変数それぞれの扱い。
-- `strata_cli/launch/runner.py:371-407,1235-1243` — `args` / `env` への適用と launch 専用 run config の生成。
-- `strata_cli/launch/runner.py:1246-1263` — launch の選択内容から shared profile を用意する処理（`--set` の preset 保存とは別の経路）。
-- `strata_cli/launch/store.py:1-7,27-36,75-85` — preset の保存先と `extra` を含む保存処理。
-- `strata_cli/launch/params.py:162-201` — Advanced 画面で未登録エンジンフラグを表示・警告する処理。
-- `docs/TERMINAL_LAUNCH.md:57-75` — コマンドライン例と、`--preset` に続くオプションが通常その起動にのみ適用される説明。
-
+- `terminal/strata_cli/launch/cmd.py:73-80,124-125` — `strata launch` の parser、用途説明、`--set` の反復指定。
+- `terminal/strata_cli/launch/settings.py:361-385,392-417` — キーの形式、正規化、重複統合、値の解釈。
+- `terminal/strata_cli/launch/cmd.py:215-221,302-303,849-862` — preset への上書きと適用条件。
+- `terminal/strata_control/arg_layers.py:3-18,75-108` — engine 引数の優先順位と今回限りの明示指定。
+- `terminal/strata_cli/launch/runner.py:586-610,801-815,2204-2238` — `idle-unload` 特例、run config 組み立てと保存。
+- `terminal/strata_control/tune_knobs.py:536-543`; `terminal/serve/server.py:4007-4028` — 環境変数の run config 反映と engine 子プロセス環境への適用。
+- `terminal/strata_cli/launch/params.py:212-221`; `terminal/strata_cli/launch/screens.py:1619-1625` — 対話画面での未知 flag 警告。CLI `--set` の設定変換経路にはこの検査呼び出しがない。

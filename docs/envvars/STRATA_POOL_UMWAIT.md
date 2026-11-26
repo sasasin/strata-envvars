@@ -1,45 +1,43 @@
 # `STRATA_POOL_UMWAIT`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CPU expert pool の worker が次の仕事を待つ間の spin 方式を、条件付きで `UMONITOR` / `UMWAIT` に切り替えます。通常の worker は `epoch_` が変わるまで `_mm_pause()` を繰り返します。有効時は `epoch_` のキャッシュラインを監視し、host による publish で値が変わるか、指定した TSC cycles 分待つたびに状態を確認します。対象は expert pool worker の待機ループです。host 側の `wait_parked()` / `wait_done()` などの待機までは切り替えません。
-
-この変数は実験的な設定です。expert pool は通常の `generate` 経路と Qwen 3.6 CUDA engine から生成されますが、実際に CPU worker が仕事を待つ区間がなければ、設定しても UMWAIT による待機の機会はありません。
+CPU expert pool の worker が仕事を待つ park ループで、一定時間の `_mm_pause` による spin を x86 WAITPKG の `UMONITOR` / `UMWAIT` に切り替える TSC cycle 数を指定する実験用設定です。worker は公開 epoch の cache line を監視し、仕事の公開で起きるか、指定 cycle の deadline で戻って epoch を再確認します。pool の仕事の割当や計算内容を変える設定ではありません。実装は `strata::kernels::cpu::umwait_cycles()` と `ExpertPool::worker()` です（`engine/src/kernels/cpu/pool.cpp:40-62,1062-1113`）。
 
 ## 値と判定
 
-値は `std::atoll()` で変換され、正の値だけが UMWAIT の待ち時間として使われます。文字列全体の検査や末尾の文字の検査はありません。
+`std::getenv` の値を `std::atoll` に渡し、その戻り値が正の場合だけ有効候補とします。文字列全体の妥当性確認や範囲 clamp はありません。`atoll` が読む先頭の整数部分が使われるため、例として `" 12junk"` は 12、`"1e3"` は 1、数値で始まらない文字列と空文字は 0 になり無効です。正の整数 prefix だけが有効候補で、0・負数は無効です。大文字小文字は関係ありません。整数変換の範囲外入力の結果はコードで検査されません（`engine/src/kernels/cpu/pool.cpp:45-60`）。
 
-| 値 | 判定・結果 |
-|---|---|
-| 未設定 | 0 cycles として spin |
-| 空文字、数値に変換できない文字列、変換結果が 0 以下 | spin |
-| 正の整数として変換される文字列 | UMWAIT を有効化し、その cycles 数を待ち時間に使う |
-| 数字の後ろに文字がある文字列 | `atoll()` が読める先頭部分が正なら有効（例: `1000junk`） |
-
-`atoll()` は先頭の空白と符号を許容するため、たとえば `  +1000` は正の値として扱われます。小数点を含む値や、変換できない接頭部は正の値になりません。値の全体 parse、上限 clamp、範囲検証はありません。
+| ビルド・CPU 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| MSVC x64（clang-cl を除く）、CPU が CPUID leaf 7 subleaf 0 の ECX bit 5（WAITPKG）対応 | 0 cycles。従来の spin | `1`、`5000`、または `12junk` のように `atoll` が正数を返す文字列 | 空文字、`0`、`-1`、`true`、`0anything`、整数で始まらない文字列 |
+| 同ビルドだが CPU が WAITPKG 非対応 | 0 cycles。従来の spin | 正数は対応確認まで進むが、機能は無効 | 上記の無効値 |
+| その他のビルド（Linux、macOS、非 MSVC、clang-cl、非 x64 など） | 0 cycles。従来の spin | 値は読み取られるが、実装が 0 を返すため有効にならない | 有効にならない |
 
 ## 有効になる条件
 
-- `src/kernels/cpu/pool.cpp` が MSVC の x64 (`_MSC_VER` と `_M_X64`) でコンパイルされ、`__clang__` が定義されていない場合だけ、UMWAIT intrinsic の分岐に入ります。clang-cl を使う Windows HIP build を含むその他の build では、この変数が正でも spin のままです。
-- 対応するコンパイラ build では、実行 CPU の CPUID leaf 7, subleaf 0 の ECX bit 5（WAITPKG）が必要です。未対応なら spin に戻り、stderr に `strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin` と出します。
-- 対応コンパイラ・CPUの両方で値が正の場合、stderr に `strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (<cycles> cycles)` と出します。出力値も `atoll()` で変換した値です。
-
-したがって、Linux や GCC/Clang build で値を設定しても、このソースの UMWAIT 分岐は使われません。未対応 build では診断ログも出ません。
+- `ExpertPool` worker が仕事待ちの park ループに入る必要があります。pool の生成・worker 起動経路は通常の generate で `engine/src/program/generate.cpp:9001-9008`、実際の待機分岐は `engine/src/kernels/cpu/pool.cpp:1062-1113` です。
+- `UMONITOR` / `UMWAIT` を実行するのは `_MSC_VER && _M_X64 && !__clang__` のビルドだけです。CPU が WAITPKG 非対応なら無効化され、対応するビルドでもそれ以外では spin のままです（`engine/src/kernels/cpu/pool.cpp:49-60,1084-1103`）。CMake では pool 実装自体は CPU kernel library に含まれますが、CMake の包含だけではこのコンパイル条件を満たしません（`engine/cmake/backends/cpu.cmake:241-247`）。
+- CLI 引数による値の上書きや別名の fallback はありません。`STRATA_POOL_UMWAIT_C02` は正の cycle 数で UMWAIT が動く場合に待機状態を選び、値の有効・無効を変えません。`STRATA_POOL_UMWAIT_ESC` が正なら park 開始からその cycle 数を超えるまで C0.1、その後 C0.2 に切り替えます（`engine/src/kernels/cpu/pool.cpp:64-72,1085-1096`）。
+- `STRATA_POOL_SPIN_US` は UMWAIT の有効化には関与しませんが、worker が park 後に UMWAIT / spin を続けてから condition variable sleep に移る時間を変えます。既定は 20 ms で、環境変数があれば `atoi` を 0 以上に clamp した microseconds です（`engine/include/strata/kernels/cpu/pool.hpp:297-304`; `engine/src/kernels/cpu/pool.cpp:803-810,1104-1112`）。
 
 ## 実行時の詳細
 
-`umwait_cycles()` 内の関数 static 初期化で環境変数を読みます。最初に worker がこの関数を呼んだ時点の値と CPUID 判定がプロセス内で共有され、以降の読み直しはありません。pool 作成後に環境変数を変更しても設定は反映されません。値が 0 なら worker は従来どおり `_mm_pause()` を使い、1024 回ごとに時刻を確認して `spin_before_sleep_` を超えると condition variable の sleep に移ります。UMWAIT が有効な場合、`epoch_` の値を確認してから `_umwait(state, now + cycles)` を呼び、最大で指定 cycles ずつ待ちます。16 回ごとに時刻の確認を行い、別の待機要因があれば従来の condition variable 経路へ移ります。
+`umwait_cycles()` は worker の park ループから呼ばれ、関数内 `static` 初期化で環境変数の値、CPU の WAITPKG 対応判定、結果を一度だけ取得・保持します。したがって設定は最初の呼び出し時点で固定され、その後プロセス内で環境を変更しても反映されません。複数 worker から呼ばれても同じ cache 値を使います（`engine/src/kernels/cpu/pool.cpp:45-62,1081-1088`）。
 
-待機 state は別の `STRATA_POOL_UMWAIT_C02` と `STRATA_POOL_UMWAIT_ESC` にも影響されます。`STRATA_POOL_UMWAIT_ESC` が正なら、park 開始からその cycles に達する前は state `1`、達した後は state `0` を使います。そうでなければ `STRATA_POOL_UMWAIT_C02` の先頭文字が `1` の場合 state `0`、それ以外は state `1` です。ソースコメントでは state `1` を軽い C0.1、state `0` を深い C0.2 としています。これらの変数は待機時間を有効化する `STRATA_POOL_UMWAIT` の代わりにはなりません。
+対応ビルドで値が正の場合、待ちループは epoch の cache line を `_umonitor` で監視し、UMWAIT の直前に epoch を読み直して既に仕事が公開されていたら待たずに抜けます。それ以外は現在の TSC 値に cycle 数を加えた deadline で `_umwait` し、最大 16 回の wait ごとに通常の pool loop 条件を確認します。値が未設定・0 以下、CPU 非対応、または対象外ビルドでは `strata_cpu_pause()` による従来の spin 分岐が使われます。park の合計経過時間が `spin_before_sleep_` 以上になると condition variable sleep へ移る既存経路も残り、この時間は既定 20 ms、`STRATA_POOL_SPIN_US` 設定時はその値に従います（`engine/include/strata/kernels/cpu/pool.hpp:297-304,378-383`; `engine/src/kernels/cpu/pool.cpp:803-810,1081-1113`）。この設定による失敗・終了経路は確認できません。
+
+## ログと測定値
+
+対応ビルドで正数が設定され、CPU が WAITPKG 非対応の場合、stderr に `strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin` を出します。CPU が対応している場合は stderr に `strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)`（`%lld` は `atoll` の値）を一度出します。値が未設定または正数でない場合、対象外ビルドではこの設定固有のログは出ません（`engine/src/kernels/cpu/pool.cpp:47-60`）。`docs/DETAILS.md` に本変数の測定値は見つかりませんでした。
 
 ## 根拠
 
-- `src/kernels/cpu/pool.cpp:33-55`: 目的、`atoll()` による値判定、MSVC x64 / WAITPKG の条件、stderr のログ、static cache。
-- `src/kernels/cpu/pool.cpp:57-65`: C0.2 選択と段階的 state 変更の関連設定。
-- `src/kernels/cpu/pool.cpp:529-584`: worker の park loop、epoch 監視、UMWAIT intrinsic の使用、pause / sleep への経路。
-- `src/kernels/cpu/pool.cpp:475-504`: ExpertPool 作成時に worker thread を起動する箇所。
-- `src/program/generate.cpp:5050-5055`: generate 経路の ExpertPool 作成。
-- `src/qwen35/q36_engine.cu:2117-2128`: Qwen 3.6 engine の ExpertPool 作成と CPU thread 数のログ。
+- 値の取得、static cache、変換、build/CPU 判定、ログ: `engine/src/kernels/cpu/pool.cpp:40-62`
+- 補助変数の cache: `engine/src/kernels/cpu/pool.cpp:64-72`
+- pool worker の park、UMONITOR/UMWAIT と従来 spin の分岐: `engine/src/kernels/cpu/pool.cpp:1062-1113`
+- pool library へのソース包含: `engine/cmake/backends/cpu.cmake:241-247`
+- park から condition variable sleep に移る既定時間と `STRATA_POOL_SPIN_US` の適用: `engine/include/strata/kernels/cpu/pool.hpp:297-304,378-383`; `engine/src/kernels/cpu/pool.cpp:803-810,1104-1112`
+- generate からの pool 生成と pool 情報ログ: `engine/src/program/generate.cpp:9001-9008`

@@ -1,51 +1,46 @@
 # `STRATA_PIPED_CONCURRENT_UNPIN`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。対象は Strata 所有ソース。外部ライブラリや GPU driver の動作は含めない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`STRATA_PIPED_CONCURRENT=1` で使う、slot の pipelined decode と同時にプロンプトを読む経路で、読み取り thread と doorbell thread、および一部の既存 thread の CPU 配置を制御する補助スイッチです。既定では、host thread の CPU に留まりやすい thread を host の CPU から移します。`=0` はこの移動を抑え、継承した CPU affinity のままにする A/B 用設定です。
-
-この変数は並行読み取り自体を有効にしません。親の `STRATA_PIPED_CONCURRENT` が有効で、pipelined 経路が選ばれた場合にだけ評価されます。
+パイプライン同時読み込みが実行されるとき、プロンプト読取スレッドと doorbell スレッド、および条件によっては先行して作られていた host thread 継承スレッドを host の CPU から移す処理を切り替える。未設定または `atoi` の結果が非 0 なら移動処理を許可し、結果が 0 ならスレッド配置をそのままにする。これは `STRATA_PIPED_CONCURRENT` の機能を有効・無効にする変数ではなく、CPU 配置だけを変える（`engine/src/program/generate.cpp:21068-21111`）。
 
 ## 値と判定
 
-値は `std::atoi` で整数化され、結果が 0 かどうかで判定されます。文字列全体の妥当性検査はありません。
+値は、同時読み込み分岐に初めて入ったとき `std::getenv` で取得し、`std::atoi` の結果が 0 かどうかで判定する。文字列全体の妥当性検査や `true` / `false` の特別扱いはない。空文字、非数値文字列、`0` や `0anything` は `atoi` が 0 を返すため移動しない。`1`、`-1`、`1anything` などは非 0 となり移動を許可する。先頭の空白や符号を含む数値も `atoi` の変換規則に従う。未設定は移動を許可する（`engine/src/program/generate.cpp:21070-21073`）。
 
-| 値 | `conc_unpin` | 動作 |
-|---|---:|---|
-| 未設定 | true | CPU 配置の移動を許可（既定） |
-| 空文字 | false | `atoi("") == 0` のため移動しない |
-| `0`、`00`、`abc`、`  ` | false | `atoi` の結果が 0 |
-| `1`、`-1`、`2`、`1abc`、` 1` | true | `atoi` の結果が非 0 |
-
-数値変換は C の `atoi` に従い、先頭の空白と符号を扱い、数字列の後ろは検査しません。数値として範囲外の文字列に対する挙動はこの実装で別途検証・定義していません。判定値は関数内の `static const bool` に保存されるため、この経路で初めて判定した後に環境を書き換えても再評価されません。
-
-根拠: `src/program/generate.cpp:12909-12912`。
+| 条件 | unset | 移動を許可する値 | 移動しない値 |
+| --- | --- | --- | --- |
+| 全プラットフォーム共通の値判定 | `true` | `atoi(value) != 0`（例: `1`, `-1`, `1abc`） | `atoi(value) == 0`（例: 空文字, `0`, `0abc`, `true`, `abc`） |
 
 ## 有効になる条件
 
-- `--batch > 0`、`--batch-groups > 1`、layer split の stage 数が 1 より大きく、`piped` 経路に入ること（`src/program/generate.cpp:11092-11094`）。
-- `STRATA_PIPED_CONCURRENT` が設定され `atoi` の結果が非 0 であること。さらに、`STRATA_PREFILL_HELP`、`STRATA_SPLIT_MTP_BATCH`、`STRATA_FS_SLOTS`、`--pcie-mode dma`、helper cache、ステージングする GGUF source、その他の expert source のいずれも concurrent read の禁止条件にならないこと（`src/program/generate.cpp:12870-12892`, `include/strata/program/batch_read.hpp:30-53`）。
-- 実際に concurrent read の処理へ進み、画像入力がないこと（`src/program/generate.cpp:12893`）。
-
-Linux で `--aux-cpus` / `STRATA_AUX_CPUS` の配置機能が有効な場合、環境変数が未設定または非 0 でも、ここでの特別な host 外配置処理は一部スキップされます。代わりに、作成 thread の `pin_current_thread()` が aux CPU 計画に従います。Windows では aux CPU helper は no-op です。この変数による本番の追加配置処理は Linux 分岐にあり、Windows で host CPU affinity を一時的に設定する箇所は `STRATA_TEST_CONC_ON_HOST_CPU` によるテスト専用分岐です。
+- 設定値はプロセス内の配置分岐に限って作用する。`STRATA_PIPED_CONCURRENT` が有効であることに加え、`--batch` が正、`--batch-groups` が 1 より大きく、層分割で `n_pipe > 1` のパイプ経路である必要がある（`engine/src/program/generate.cpp:17529-17532`）。
+- 対象リクエストに画像がなく、読み取る token 数が `STRATA_PIPED_CONCURRENT_MIN` 以上であることが必要。`STRATA_PIPED_CONCURRENT_MIN` は未設定なら 0（全ての長さ）、設定時は `atoll` 後に 0 未満を 0 に丸める（`engine/src/program/generate.cpp:21047-21054`）。
+- 同時読み込み自体は、`STRATA_PIPED_CONCURRENT` が設定され `atoi` で非 0 の場合に opt-in される。`STRATA_PREFILL_HELP`、`STRATA_SPLIT_MTP_BATCH`、`STRATA_FS_SLOTS` がそれぞれ `atoi` で非 0、`--pcie-mode dma`、helper cache の利用、GGUF source の staging、または GGUF source / arena 以外の expert source のいずれかがあると同時読み込みを止め、stderr に `strata batch: STRATA_PIPED_CONCURRENT is off beside <理由>` を出す。この場合、本変数の配置分岐にも到達しない（`engine/src/program/generate.cpp:21024-21045`; `engine/include/strata/program/batch_read.hpp:30-53`）。
+- Linux では aux CPU 配置が有効なら、新規スレッドは `pin_current_thread()` でその配置先に移る。無効なら、本変数が移動を許可したときだけ `release_host_inheritors()` と `place_off_host()` が呼ばれ、host の CPU から外す配置を試みる（`engine/src/program/generate.cpp:21096-21111`; `engine/include/strata/platform/aux_cpus.hpp:256-263,315-348`）。`--aux-cpus` / `STRATA_AUX_CPUS` は配置先の設定であり、serve request の `strata_tune aux_cpus=0|1` はその request 中の aux CPU 配置を切り替える（`engine/src/program/generate.cpp:1463-1469,4715-4724,21431-21440`）。
+- Windows では通常、本変数による CPU 配置処理はない。`STRATA_TEST_CONC_ON_HOST_CPU` が設定されている場合に限り、テスト用経路で読取・doorbell スレッドを host の CPU set に置き、その後、本変数が移動を許可すれば CPU set 指定を解除する。`STRATA_TEST_CONC_ON_HOST_CPU` は値の内容でなく設定有無で判定される（`engine/src/program/generate.cpp:21074-21093,21102-21109`）。Linux 以外の aux CPU helper は no-op である（`engine/include/strata/platform/aux_cpus.hpp:407-423`）。
 
 ## 実行時の詳細
 
-`conc_unpin` が true のとき、Linux で aux CPU 配置が無効なら、まず `release_host_inheritors()` を呼びます。これは host thread 自身と pool worker を除き、現在の affinity mask が host thread と完全一致する既存 thread を列挙し、host CPU と pool worker CPU を避ける mask へ移します。1つ以上移動した場合は stderr に `strata batch: %d threads that ran on the host thread's core moved off it, for reads beside the slots` と出します。CPU topology や affinity の取得・設定に失敗した場合などは、helper が移動数 0 を返すことがあります。
+本変数は `read_part` 内の、同時読み込みに進む条件を満たしたブロックで初めて評価される。値を関数内 `static const bool` に保持するため、そのプロセスでは最初に到達した時点の値が以後も使われ、実行中に環境値を変更しても再読込されない（`engine/src/program/generate.cpp:21054,21070-21073`）。
 
-doorbell thread と各 prompt reader thread は `conc_thread_cpus` を呼びます。そこではまず `pin_current_thread()` を実行し、Linux で `conc_unpin` が true かつ aux CPU 配置が無効なら、続けて `place_off_host()` を試します。この helper は host CPU と pool worker CPU を避けた許可 CPU mask をその thread に設定します。`place_off_host()` の成否は呼び出し元でログ化されません。`conc_unpin` が false なら、この追加移動は行わず、作成元から継承した affinity を保ちます。
+移動許可時、Linux かつ aux CPU 配置が無効なら、まず host の CPU を継承している既存スレッドを移す。続いて doorbell スレッドと各読取スレッドの冒頭で `conc_thread_cpus` を呼び、aux CPU 配置が無効ならそれぞれを host の CPU から外す。aux CPU 配置が有効なら `pin_current_thread()` による設定済み配置を使う。移動しない値では、既存スレッドの移動処理と新規スレッドの host 外配置を行わないが、別条件を満たせば concurrent read と doorbell service は通常どおり動く（`engine/src/program/generate.cpp:21096-21115,21138-21143,21190-21206`）。
 
-Windows では `STRATA_TEST_CONC_ON_HOST_CPU` が設定されていると、テスト経路が thread の CPU set を一時的に host thread と同じにし、`conc_unpin` が true なら空の CPU set を指定して解除します。このテスト分岐の開始時には `strata batch: test: the read's and the doorbell threads start on the host thread's %zu CPU set(s)...` を一度 stderr に出します。Windows の通常経路ではこの環境変数による host 外配置は行われません。
+Linux の affinity 設定 API の戻り値はこの呼び出し経路では無視されるため、配置に失敗した場合の専用エラーや fallback ログは確認できない。`release_host_inheritors()` が 1 本以上を移した場合だけ、移動本数を stderr に出す（`engine/src/program/generate.cpp:21098-21101,21110`; `engine/include/strata/platform/aux_cpus.hpp:318-348`）。
 
-`STRATA_PIPED_CONCURRENT_UNPIN` 自体の値に関するログはありません。親の concurrent read 条件を満たさない場合や、画像入力がある場合は、設定値に関係なくこの変数の判定・配置処理まで到達しません。
+## ログと測定値
 
-根拠: `src/program/generate.cpp:12907-12950`; `include/strata/platform/aux_cpus.hpp:290-347,406-421`。
+本変数が直接出すログはない。Linux で先行スレッドを 1 本以上移した場合は `strata batch: %d threads that ran on the host thread's core moved off it, for reads beside the slots` が stderr に出る。Windows の `STRATA_TEST_CONC_ON_HOST_CPU` 経路では初回に CPU set 数と、移動処理を行うかどうかを示す `strata batch: test: the read's and the doorbell threads start on the host thread's %zu CPU set(s)%s` が出る（`engine/src/program/generate.cpp:21086-21093,21098-21101`）。
+
+同時読み込みが実行された場合は、別途読取 token 数・時間・並行して slot が decode した row 数の stderr 行が出るが、これは本変数の値や配置成功を示すログではない（`engine/src/program/generate.cpp:21263-21269`）。`docs/BATCHING.md` の同時読み込み説明と実装を照合したが、本変数自体の定量的な効果を示す測定値は確認できない。
 
 ## 根拠
 
-- 値の取得と static cache: `src/program/generate.cpp:12909-12912`。
-- 適用経路と除外条件: `src/program/generate.cpp:11092-11094,12870-12893`; `include/strata/program/batch_read.hpp:30-53`。
-- Linux の既存 thread の移動: `src/program/generate.cpp:12935-12940`; `include/strata/platform/aux_cpus.hpp:325-347`。
-- 新規 thread の移動と Windows テスト分岐: `src/program/generate.cpp:12941-12950`; `include/strata/platform/aux_cpus.hpp:255-262,314-323,406-421`。
+- `engine/src/program/generate.cpp:21068-21111` — 値の取得、既定値、OS 分岐、既存および新規スレッドの配置処理。
+- `engine/src/program/generate.cpp:17529-17532,21024-21054` — パイプ構成、同時読み込みの設定・抑止条件、画像と token 数の条件。
+- `engine/src/program/generate.cpp:21138-21206` — doorbell と読取スレッドの起動、配置関数の呼び出し。
+- `engine/include/strata/program/batch_read.hpp:30-53` — concurrent read を止める構成と理由。
+- `engine/include/strata/platform/aux_cpus.hpp:256-263,315-348,407-423` — Linux の配置処理と Linux 以外の no-op 実装。
+- `engine/src/program/generate.cpp:1463-1469,4715-4724,21431-21440` — aux CPU 配置の CLI・環境変数・request 単位の設定。

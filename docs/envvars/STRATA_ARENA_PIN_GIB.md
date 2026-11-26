@@ -1,104 +1,55 @@
 # `STRATA_ARENA_PIN_GIB`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。
 
 ## 役割
 
-expert arena（ホスト RAM 上の expert 重み）を `cudaHostRegister`（HIP では `hipHostRegister`）で page-lock する量の上限（GiB）を決める。#243 の設定。
-
-arena 全体が登録できるか、何 GiB まで登録されるかで、GPU が直接読める領域（`registered_bytes` の prefix）が決まる。登録された prefix 内の expert だけが arena から直接 DMA でき、prefix の外は staging ring 経由のコピーになる（`src/prefill/prefill.cpp:3649,3669-3675`、`src/core/expert_source.cpp:4707-4720`）。登録されなかった残りは `STRATA_ARENA_LOCK` の lock 対象になる（`src/core/pinned.cu:413-422`）。
-
-読み取り箇所は `src/core/pinned.cu` の `arena_pin_cap_gib()`（`src/core/pinned.cu:299-305`）と `src/program/generate.cpp:4707`、その SYCL 移行コピー `sycl/src/core/pinned.dp.cpp:305-311` と `sycl/src/program/generate.cpp:4208`。Python サーバー・setup・同梱ツールはこの名前を直接読まない（サーバーは `dict(os.environ)` を engine 子プロセスへ渡すので、サーバー環境の値は engine に届く: `serve/server.py:2554-2565,671-672`）。
+expert arena のホストメモリを GPU 用に登録する量と、登録しない UMA 経路を選びます。通常は arena 全体を登録しますが、非負の GiB 数を指定すると上限を設け、`none` は arena を登録しない経路を選びます。登録の上限は arena の割り当て量や GPU キャッシュ容量そのものではありません。CUDA/HIP 実装は `PinnedArena` 作成時に設定を読み、登録・分割登録・残り領域の resident lock を決めます（`engine/src/core/pinned.cu:611-629,1054-1098,1115-1143`）。
 
 ## 値と判定
 
-`std::getenv` の結果を int に変換する。判定順は次のとおり。
+読み取りは `std::getenv`。空文字と未設定は同じ扱いです。`none` と `auto` は小文字の文字列全体との完全一致で判定し、それ以外は `std::atoi` に渡します。したがって数値を厳密に検証せず、先頭の空白・符号・数字以降の文字は `atoi` の規則に従います（例: `12x` は 12、`x12` や `true` は 0）。負数の変換結果は `-1` に正規化されます。大文字の `NONE` / `AUTO` は特別値ではなく `atoi` 経由です（`engine/src/core/pinned.cu:623-630`; SYCL も同じ判定: `engine/sycl/src/core/pinned.dp.cpp:311-317`）。
 
-| 状態 | `arena_pin_cap_gib()` の返り値 | 意味 |
-|---|---|---|
-| 未設定（`nullptr`） | `-1` | 上限なし（engine が決める） |
-| 空文字 `""` | `-1` | 未設定と同じ |
-| 文字列全体が `auto`（大小文字区別あり） | `-2` | Windows の shared-memory budget で sliced pin を上限（後述） |
-| `atoi` が負を返す値（例 `-5`） | `-1` | 未設定と同じ |
-| `atoi` が 0 を返す値（`0`、`abc`、`0x10`、`0.7`） | `0` | 明示的な「上限なし」＝ arena 全体を pin |
-| `atoi` が正を返す値（`5`、`5x`、` 5`、`+5`、`5.7`） | その整数 | 最大 N GiB |
+| 条件 | unset / 空文字 | 設定値と効果 | 無効値・境界例 |
+|---|---|---|---|
+| 全 backend の共通判定 | `-1`（明示的な上限なし） | `0` は arena 全体を登録する設定。正の `N` は `N GiB` 上限 | 負数は上限なし。数値でない文字列は `atoi` により 0 となり全体登録扱い。数値後続の文字は無視される |
+| CUDA/HIP の arena 登録モード | 明示的な「登録しない」指定ではない。エンジンの UMA no-register flag に従う | 完全一致の `none` は登録しない。数値（`0` を含む）や他の非空値は flag を上書きし、登録する側を選ぶ | `none `、`NONE` は `none` と一致しない。空文字は flag に戻る |
+| Windows の CUDA/HIP sliced fallback | 通常の未指定上限。ByNeed arena では既定 29 GiB | `auto` は WDDM 共有メモリ予算から上限を計算。整数 `N>0` は明示上限、`0` は上限なし | ByNeed で `auto` の予算を算出できない場合は 29 GiB。通常 arena の `auto` は全体登録が拒否された後の sliced fallback にだけ使う |
+| Windows 以外の sliced fallback | 上限なし | 整数 `N>0` は上限、`0` は上限なし | `auto` は Windows 用予算計算に入らず、実質上限なし |
 
-- 変換は `std::atoi`（`src/core/pinned.cu:303`）。`auto` は `std::string(e) == "auto"` の完全一致で、`atoi` より前に検査される（`src/core/pinned.cu:302`）。
-- 数値の後ろの文字は無視される（`atoi` は最初の非数字で止まる）。先頭空白は skip される。
-- clamp・範囲検査はない。`v < 0 ? -1 : v` だけで、`INT_MAX` を超える文字列の `atoi` 結果は実装依存（このコードは特別扱いしない）。
-- 未設定・空・負の parse 結果は `-1`（「engine が決める」）で、`0` は「上限なし＝全体 pin」として明示的に区別される（`src/core/pinned.cu:301`、`src/program/generate.cpp:4712`）。
+整数上限は、呼び出し元が既に渡した `max_pinned_bytes` が正ならそちらが優先されます。上限は byte 数に換算され、arena 全体より小さいときに登録対象の prefix / ranges を途中で止めます（`engine/src/core/pinned.cu:1088-1098,1193-1205,1229-1238`）。
 
 ## 有効になる条件
 
-値が正でも、arena 構築時に `max_pinned_bytes`（呼び出し側の cap）が 0 のときだけこの env が cap として使われる。
-
-- `src/core/pinned.cu:369-374`: `cap = max_pinned_bytes`、`if (cap == 0 && env_gib > 0) cap = env_gib << 30`。
-- engine の arena 経路では `max_pinned_bytes` が `src/program/generate.cpp:4709` の `pin_limit` で、`pin_env >= 0` のとき `pin_env << 30`、`pin_env < 0` のとき `pin_wddm_cap ? 8 GiB : 0`。したがって engine 経路では env の値は `max_pinned_bytes` として渡される。
-- `capped = cap > 0 && cap < bytes && bounds.size() >= 2`（`src/core/pinned.cu:375`）。`bytes` は arena の capacity（`want + blob`、ファイルサイズより 1 blob 大きい: `src/core/expert_source.cpp:4543`）。cap が arena 以上なら `capped` は false になり、arena 全体の登録が試みられる。
-- `bounds.size() >= 2` を満たさない呼び出し（同梱ツール `strata-load`・`strata-overlap`・`strata-concurrent` は bounds なしで arena を作る: `src/core/load_main.cpp:56`、`src/core/overlap_main.cpp:69`、`src/core/concurrent_main.cpp:82`）では `capped` が常に false。エンジンの arena は layer ごとに bounds を持つので `n_layers >= 1` で常に size >= 2（`src/core/expert_source.cpp:4522-4528`）。
-- `--mmap-experts`（`FileExpertSource`）は `PinnedArena` を使わない。この env は効かない（`src/program/generate.cpp:4622`、`src/core/expert_source.cpp:4451-4482`）。
-- `STRATA_ARENA_MMAP=1`（Linux）で file mapping を選んだ arena も `PinnedArena` を使わない（`src/core/expert_source.cpp:4454-4476`）。
-
-`auto`（`-2`）は Windows 専用で、しかも engine cap が無いときだけ参照される（`src/core/pinned.cu:388-393` の `#ifdef _WIN32` と `if (!capped && env_gib == -2)`）。Linux では `sliced_pin_limit()` がコンパイルされず、`gpu_shared_memory_budget()` は "DXGI is Windows-only" で false を返す（`src/platform/memory.cpp:135-139`）。`auto` は `pin_env < 0` 側なので、multi-GPU/remote experts で WDDM の 8 GiB cap が成立する状況では `capped` が true になり、`auto` の budget 判定は走らない。
+- 設定が機能するには、expert arena を使う実行経路が必要です。変数は通常の CUDA/HIP engine と `engine/sycl` の arena 実装で読み取られます。設定を読む CLI parser はなく、CLI 引数に同名の優先規則はありません（`engine/src/core/pinned.cu:623-629`; `engine/sycl/src/core/pinned.dp.cpp:311-317`）。
+- `max_pinned_bytes` が呼び出し元で既に指定されている場合、正の上限は環境値より優先されます。たとえば Windows/WSL2 の multi-GPU または remote expert 経路では、環境値が未設定なら engine 側の 8 GiB 制限が使われます。非負の環境値はその制限を置き換えます（`engine/src/program/generate.cpp:8748-8761`; SYCL: `engine/sycl/src/program/generate.cpp:4761-4775`）。
+- Windows の通常 arena で正の上限が arena より小さい場合は最初から分割登録します。上限がない場合はまず全体登録を試し、失敗時に分割登録します。`auto` が予算計算に使われるのは後者です。共有 arena / remote experts / engine 側上限などで異なる登録経路に入る場合は、その caller 側制限が優先されます（`engine/src/core/pinned.cu:1088-1118`; `engine/src/core/expert_source.cpp:6742-6759`）。
+- `STRATA_PIN_BY_NEED` が有効な Windows の経路では、GPU resident と推定された expert ranges を選んで登録します。ここでも `max_pinned_bytes` が先に適用され、そうでなければ正の環境値が上限です。`auto` はこの ByNeed 経路では使われません（`engine/src/core/pinned.cu:1192-1217`; `engine/src/program/generate.cpp:8773-8795`）。
+- UMA の既定で登録しない経路でも、空でない設定はエンジンの flag より優先されます。特に `none` は登録しない、数値は登録する側です。Radeon 780M / Linux HIP の KFD NOREG 経路もこの優先規則を使います（`engine/src/core/pinned.cu:611-620`; `engine/include/strata/core/kfd_quiet.hpp:111-116`; `engine/src/program/generate.cpp:4326-4354`）。
+- SYCL の `pinned.dp.cpp` は同じ文字列と上限判定を行いますが、arena 登録箇所では変換済み `cudaHostRegister` 呼び出しが `0` に置き換えられています。そのため、このソースからは CUDA/HIP と同じ実際の GPU 登録が行われるとは確認できません（`engine/sycl/src/core/pinned.dp.cpp:378-402`）。
 
 ## 実行時の詳細
 
-`arena_pin_cap_gib()` は arena 構築時に呼ばれる。関数内に `static` cache はなく、呼び出しごとに `std::getenv` を読む。`src/program/generate.cpp:4707` は起動時（arena 分岐）に一度読む。プロセス起動後の環境変更は、その後に作られる arena には反映されるが、すでに構築済みの arena には反映されない。
+`arena_pin_cap_gib()` と `arena_no_register()` は値を関数ローカルにキャッシュせず、呼び出しのたびに `getenv` を評価します。arena 構築中に上限判定と no-register 判定が別々に呼ばれるため、プロセス内で環境を変更した場合、後続の読み取りには反映されます（`engine/src/core/pinned.cu:611-630,1087-1098,1193-1215`）。
 
-engine での流れ:
+通常 arena は登録不要モードでなければ全体登録を試みます。全体が拒否された場合、layer 等の境界に沿って slice ごとに登録し、上限に達した位置または登録失敗で止まります。未登録部分は `STRATA_ARENA_LOCK` が `0` でない限り resident lock を試みます。登録失敗そのものはエラーを消費して arena を resident のまま続行する fallback で、note に `cudaHostRegister FAILED (...) - the arena is NOT pinned, so copies will be slow` を記録します（`engine/src/core/pinned.cu:1096-1147,1159-1172`）。
 
-1. `src/program/generate.cpp:4708-4709` で `pin_wddm_cap`（`pin_env < 0` かつ `o.expert_cache_remote[0] > 0 || multi_gpu` かつ `under_wddm()`）と `pin_limit` を決める。`under_wddm()` は Windows では常に true、Linux では `/dev/dxg` の存在で判定（static cache）（`src/program/generate.cpp:132-139`）。
-2. `pin_env >= 0` なら stderr に print（後述）。
-3. `pin_limit` を `ArenaExpertSource::open(..., max_pinned_bytes, ...)`（`src/program/generate.cpp:4716`、`include/strata/core/expert_source.hpp:920`）へ渡す。
-4. `PinnedArena` 構築（`src/core/pinned.cu:354-454`）。`capped` が true なら arena 全体の `cudaHostRegister` は最初から試みられず、bounds（layer ごと）を順に slice 登録し、`off > limit || n > limit - off` で止まる（`src/core/pinned.cu:394-404`）。`registered_bytes` は登録できた prefix。
-5. `registered_bytes < bytes` のとき、残りは `STRATA_ARENA_LOCK` の判定に従って lock される（`src/core/pinned.cu:413-422`）。
-6. `src/core/expert_source.cpp:4630-4645` が `pinned_bytes_` と `dev_slice_`（device alias）を作る。`pinned(layer, expert)` は blob が `pinned_bytes_` 内か只看る（`src/core/expert_source.cpp:4707-4711`）。
+no-register 経路では GPU driver への登録を行わず、通常は arena 全体の resident lock を試みます。Linux HIP KFD NOREG が選んだ場合は既定で `mlock` を試さない扱いがありますが、`STRATA_ARENA_LOCK` が明示されていれば別途判定されます（`engine/src/core/pinned.cu:1054-1085`; `engine/include/strata/core/kfd_quiet.hpp:118-123`）。
 
-`#285` の deferred registration 経路（`STRATA_DEFERRED_REGISTER`）は `max_pinned_bytes == 0 && arena_pin_cap_gib() == -1` のときだけ選ばれる（`src/core/expert_source.cpp:4535-4541`）。つまりこの env が cap として有効な値（正の整数）のときは deferred 経路に入らず、`register_slices()` 内には cap 判定が存在しない（`src/core/pinned.cu:467-496`）。
+エンジンの通常 arena の起動ログは `strata generate: expert arena: ...` に arena note を出します。明示的な非負値については、`strata generate: STRATA_ARENA_PIN_GIB=N: the whole expert arena is pinned`（0）または `...: the expert arena's pinning is capped`（正数）を stderr に出します。未設定で Windows/WSL2 multi-GPU / remote 経路が engine 上限を使うときは `strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned (STRATA_ARENA_PIN_GIB changes it)` です（`engine/src/program/generate.cpp:8753-8761`; SYCL: `engine/sycl/src/program/generate.cpp:4766-4774,4780-4785`）。
 
-CUDA/HIP ビルドは `src/core/pinned.cu` をそのまま使う（`CMakeLists.txt:293`、`cmake/hip_backend.cmake:114-121`、`include/strata/hip_compat/cuda_runtime.h:76-78`）。SYCL ビルドは `sycl/CMakeLists.txt:88-103,195` により `sycl/src/core/pinned.dp.cpp` を使う。そのファイルでは `cudaHostRegister` が DPCT1027 で `0` に置換され、capped でない限り常に「成功」扱いになる（`sycl/src/core/pinned.dp.cpp:384-396`）。よって SYCL ビルドで sliced 経路に到達するのは cap が成立したときだけで、`STRATA_ARENA_PIN_GIB=N` が note と registered prefix を決める唯一の入口になる。
+後段の必須 pinned staging allocation が失敗すると、Strata は `[pinned-memory-exhausted] the OS gave no more page-locked memory` を付け、arena の pinned 量が 2 GiB より大きければ「現在より 2 GiB 少なくする」`STRATA_ARENA_PIN_GIB=N` の再起動案内も付けます。SYCL の verify 経路では `verify: mapped staging allocation failed` を設定して失敗を返します（`engine/include/strata/core/pin_budget.hpp:212-218`; `engine/sycl/src/core/verify.cpp:708`）。
 
-## 観測できる結果
+Strata host UI の `saferStart` は失敗ログに `pinned-memory-exhausted` または `mapped staging` が含まれ、かつ設定オブジェクトの `env.STRATA_ARENA_PIN_GIB` が falsy のとき、ログ内の数値ヒント、または RAM / 2 − 8 GiB（最低 4 GiB）、情報がなければ 16 GiB を環境設定へ加えて再起動を提案します。これは engine の `getenv` ではなく、ホスト側の再試行設定です（`app/host/server/native-resources.mjs:193-201`）。
 
-起動時の print（arena 分岐のみ、`--mmap-experts` では出ない）:
+## ログと測定値
 
-- `pin_env >= 0`（`atoi` が 0 以上を返すあらゆる値を含む）:
-  `strata generate: STRATA_ARENA_PIN_GIB=%d: %s`（`src/program/generate.cpp:4710-4712`）。`%d` は parse 後の整数なので、`abc` や `0.7` は `=0` として表示され、文言は `the whole expert arena is pinned`。
-- `pin_env < 0`（未設定・空・負・`auto`）で `pin_wddm_cap` が成立:
-  `strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned (STRATA_ARENA_PIN_GIB changes it)`（`src/program/generate.cpp:4713-4715`）。`auto` のときはこの文言が出る（`pin_env < 0` 側だから）。
-
-arena note（`src/program/generate.cpp:4723` の `strata generate: expert arena: <note>`、同梱ツール `strata-load` は `backing: <note>`、`src/core/load_main.cpp:57`）:
-
-- cap が成立したとき（`capped`）:
-  `cudaHostRegister limited to <cap >> 30> GiB <cap_why>; <n> slices pinned (<m> GiB); <backing note>`（`src/core/pinned.cu:407-412`）。`cap >> 30` は整数 GiB（切り捨て）。
-  engine 経路では `cap` が `max_pinned_bytes`（= `pin_limit`）から来るので、`cap_why` は `by the engine (multi-GPU under WDDM, or remote experts)` になる。`by STRATA_ARENA_PIN_GIB` の文字列（`src/core/pinned.cu:373`）は `cap == 0 && env_gib > 0` のときだけ代入され、その条件は bounds を持つ呼び出しで engine 経路から到達しない（bounds なしツールでは `capped` が false で `cap_why` は note に出ない）。
-- cap が成立せず sliced fallback に入り、かつ Windows で `auto` のとき:
-  `cudaHostRegister of the whole arena FAILED (<error string>); slices capped at <%.1f> GiB (<limit_why>; STRATA_ARENA_PIN_GIB=auto; N sets a cap; #243); <n> slices pinned (<m> GiB); <backing note>`（`src/core/pinned.cu:408-412`）。`limit_why` は DXGI 成功時 `the GPU's shared-memory budget <B> GiB - <U> GiB in use - 4 GiB`、DXGI 失敗時 `<err>: RAM/2 - 8 GiB of <R> GiB`（`src/core/pinned.cu:324-326,333`）。
-- cap が成立せず、`auto` でもない（または Linux）: `slices capped at ...` の部分が無い。note は `cudaHostRegister of the whole arena FAILED (...); <n> slices pinned (<m> GiB); ...`。
-- cap が arena 以上、または `0`/未設定で全体登録成功: `cudaHostRegister PORTABLE ok; <backing note>`（`src/core/pinned.cu:379`）。このとき `capped` は false で、cap の文言は出ない。
-
-エラー・終了は発生しない。判定結果は起動時の print と note として見えるだけ。
-
-## docs との照合
-
-- `docs/MULTI_GPU.md:217-220`: WDDM 下では arena の 8 GiB だけ pin、`STRATA_ARENA_PIN_GIB=N` は最大 N GiB、`0` は arena 全体、"on any OS"。コードの `pin_limit`（`src/program/generate.cpp:4709`）と一致する。
-- `docs/SECOND_GPU.md:37-42`: WDDM 下で registration は 8 GiB 上限、`STRATA_ARENA_PIN_GIB` がそれを override、Linux では全体 registered。一致。
-- 資料中の測定主張（条件付き）: `docs/MULTI_GPU.md:219` は 8 GiB cap が 4090 + 3060 split の prompt speed を 2/3 失わせた（#253）とする。`src/program/generate.cpp:131` の注釈は同じ #253 を "3x of its prompt speed" と書く。`src/core/pinned.cu:390-391` の注釈は、64 GB PC では budget を 30 GiB 超え pin しても問題なく、26 GiB に cap すると prompt speed が約 20% 落ちた、と書く（`auto` が既定でない理由）。いずれも機種・OS・モデル・回数が示されていない主張であり、こちらで再確認した事実としては書かない。
-- `auto` が `docs/` に記載されていない: `docs/MULTI_GPU.md` と `docs/SECOND_GPU.md` は `N` と `0` だけを書き、`auto`（返り値 `-2`）はコード注釈（`src/core/pinned.cu:302,389-391`、`include/strata/core/pinned.hpp:26-28`）にしか現れない。
+`docs/DETAILS.md` は Windows の既定 29 GiB と pinned staging 失敗時の案内を記載しています（`docs/DETAILS.md:293-297`）。現行ソースでは 29 GiB は Windows ByNeed arena の未指定 / `auto` 予算取得失敗時の fallback であり、すべての Windows arena の一律既定ではありません（`engine/src/core/pinned.cu:1198-1206`）。ここでは性能値を追加しません。
 
 ## 根拠
 
-- 読み取りと parse: `src/core/pinned.cu:299-305`、`src/program/generate.cpp:4707`、`sycl/src/core/pinned.dp.cpp:305-311`、`sycl/src/program/generate.cpp:4208`
-- 宣言と意味（-1/-2/0/N）: `include/strata/core/pinned.hpp:26-29`
-- cap の適用と `capped` 判定: `src/core/pinned.cu:367-383`、`sycl/src/core/pinned.dp.cpp:375-383`
-- sliced 登録と limit break: `src/core/pinned.cu:394-404`、`sycl/src/core/pinned.dp.cpp:409-430`
-- `auto` の Windows 限定: `src/core/pinned.cu:388-393`、`sycl/src/core/pinned.dp.cpp:403-408`
-- `sliced_pin_limit()` と DXGI: `src/core/pinned.cu:314-336`、`src/platform/memory.cpp:69-109,111-115,135-139`
-- bounds（layer ごと）と capacity: `src/core/expert_source.cpp:4520-4528,4543`、`src/core/pinned.cu:341-352`
-- deferred 経路の条件: `src/core/expert_source.cpp:4535-4541`、`sycl/src/core/expert_source.cpp:3442`
-- registered prefix の効果（device alias / pinned）: `src/core/expert_source.cpp:4630-4645,4707-4720`、`src/prefill/prefill.cpp:3649,3669-3675`
-- `STRATA_ARENA_LOCK` との接続: `src/core/pinned.cu:413-422`
-- 起動時 print: `src/program/generate.cpp:4702-4715,4723`、`src/core/load_main.cpp:57`
-- 子プロセスへの継承: `serve/server.py:2554-2565,671-672`
-- backend 選択: `CMakeLists.txt:293`、`cmake/hip_backend.cmake:114-121`、`include/strata/hip_compat/cuda_runtime.h:76-78`、`sycl/CMakeLists.txt:88-103,195`
-- docs: `docs/MULTI_GPU.md:217-220`、`docs/SECOND_GPU.md:37-42`
+- 読み取りと値変換: `engine/src/core/pinned.cu:611-630`, `engine/sycl/src/core/pinned.dp.cpp:311-317`
+- arena 登録、上限、fallback: `engine/src/core/pinned.cu:1054-1147,1192-1238`; `engine/sycl/src/core/pinned.dp.cpp:378-417`
+- caller 側上限、ログ、mode 選択: `engine/src/program/generate.cpp:4326-4354,8748-8761`; `engine/sycl/src/program/generate.cpp:4761-4785`
+- ByNeed / helper 経路: `engine/src/core/expert_source.cpp:6742-6759`; `engine/include/strata/core/kfd_quiet.hpp:111-123`
+- pinned staging の失敗とホスト再試行: `engine/include/strata/core/pin_budget.hpp:212-218`; `engine/sycl/src/core/verify.cpp:708`; `app/host/server/native-resources.mjs:193-201`

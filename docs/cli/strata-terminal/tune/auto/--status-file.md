@@ -1,6 +1,6 @@
-# `--status-file`
+# `strata tune auto --status-file`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,11 +8,11 @@
 | コマンド | `strata tune auto` |
 | オプション | `--status-file` |
 | 別名 | なし |
-| 値 | JSON の進捗状態を書き込むファイルパス（文字列） |
+| 値 | JSON 状態を書き出すファイルパス（文字列）。既定値は `None`（出力しない） |
 
 ## 役割
 
-チューニングの進捗と完了結果を JSON ファイルに出力します。デスクトップアプリが別プロセスから進捗を読む用途を含みます。省略時はファイル出力を行いません。この値自体はチューニング設定や測定内容を変えません。
+自動チューニング中の進捗と最終結果を JSON ファイルに書き出します。parser の説明ではデスクトップアプリ向けとされていますが、CLI からも任意のパスを指定できます。チューニングの対象・設定は位置引数 `target` で渡します。
 
 ## 使い方
 
@@ -20,42 +20,39 @@
 strata tune auto my-profile --status-file /tmp/strata-tune-status.json
 ```
 
-`my-profile` は保存済みプロファイル名、または run configuration の JSON ファイルです。`strata tune auto` はその設定を測定し、結果に応じてプリセットを保存するコマンドです（`strata_cli/tune_commands.py:20-25, 174-181`）。
+`target` にはインストール済みモデル、保存済み profile、または実行設定 JSON を指定できます。`--status-file` を省略した場合は状態ファイルを出力しません。
 
 ## 値と既定値
 
-- parser は値を取る引数として登録し、型変換・`choices`・パス検査を指定していません。既定値は `None` です（`strata_cli/tune_commands.py:44`）。
-- 値はファイルパスとして扱われます。相対パスを絶対化する処理はなく、通常のプロセス作業ディレクトリからの相対パスです（`strata_cli/tune_commands.py:149-155`）。
-- 空文字列は parser では拒否されませんが、書込 helper が falsy なパスを無視するため、ファイルは作成・更新されません（`strata_cli/tune_commands.py:149-152`）。
-- 重複指定時の parser 上の特別処理はありません。`argparse` の通常の単一値引数として扱われます。
+- 値はパス文字列で、parser に型変換・存在確認・書込み可能性などの事前検証はありません。既定値は `None` です (`terminal/strata_cli/tune_commands.py:21-49`)。
+- 親ディレクトリは作成されません。指定先や一時ファイルへの書込み、置換で `OSError` が起きても、その例外は状態出力処理内で無視されます (`terminal/strata_cli/tune_commands.py:240-248`)。
 
 ## 実行時の動作
 
-進捗 callback のたびに進捗データを状態辞書へ反映し、`minutes_left` と人向け `text` を加えて書き込みます。測定側の進捗データには `stage`、`message`、経過秒、完了済み・予定 run 数、推定残り秒、測定速度が含まれます（`strata_cli/tune_commands.py:202-215`; `strata_control/autotune.py:221-229`）。チューニングが終了すると `state: done`、結果、`stage: done` を書き込みます（`strata_cli/tune_commands.py:235-261`）。初期状態はメモリ上に作られますが、最初の進捗 callback が来るまでファイルへは書かれません（同: `202-215`）。
+`strata tune auto` の進捗 callback は受け取った進捗情報を状態辞書に反映し、残り時間の表示用フィールドを加えてから、指定先へ JSON を書きます。処理完了時には `state: "done"`、`stage: "done"` とチューニング結果を含めた状態をもう一度書きます (`terminal/strata_cli/tune_commands.py:355-369`, `terminal/strata_cli/tune_commands.py:383-385`, `terminal/strata_cli/tune_commands.py:414-420`)。
 
-書込 helper は JSON（UTF-8、非 ASCII 文字をそのまま出力）を `<指定パス>.tmp` に書き、その後 atomic replace で指定パスへ置き換えます。既存の指定先ファイルは置き換わります。replace 実装は Windows で読み手がファイルを開いていることによる `PermissionError` を最大 5 秒再試行し、それ以外のエラーは送出します（`strata_cli/tune_commands.py:149-157`; `strata_control/atomic.py:18-35`）。
+書込みは UTF-8 の JSON を `<指定パス>.tmp` に一旦作成し、atomic replace 関数で指定パスへ置換します。既存の指定先があれば置き換わります。置換関数は Windows で読取り中のファイルへの `PermissionError` を最大 5 秒再試行し、それ以外のエラーは呼出し元へ返しますが、このオプションの状態書込み処理は `OSError` を捕捉して無視します (`terminal/strata_cli/tune_commands.py:240-248`, `terminal/strata_control/atomic.py:18-34`)。
+
+`--plan` は計画を表示して tuner を開始せずに戻る分岐であり、その前に進捗 callback は設定されません。このため `--status-file` は更新されません。また、対象解決や validation など tuner 開始前に返るエラー経路でも状態ファイルへの書込みはありません (`terminal/strata_cli/tune_commands.py:314-353`, `terminal/strata_cli/tune_commands.py:355-369`)。
+
+同じ文字列の `--status-file` は `strata presets recheck` にもありますが、そちらは別コマンドの parser と実行経路です。本書の対象は `strata tune auto` のみです (`terminal/strata_cli/tune_commands.py:21-49`, `terminal/strata_cli/tune_commands.py:88-96`)。
 
 ## 適用条件と副作用
 
-- `--status-file` は `strata tune auto` 固有です。索引には同名の別スコープ `strata presets recheck` もありますが、そちらの parser・進捗処理は別です。本書では対象を `tune auto` に限定します（`docs/cli/README.md:802-824`; `strata_cli/tune_commands.py:82-90`）。
-- 指定先の親ディレクトリは自動作成されません。`.tmp` への書き込みまたは置換で `OSError` が起きると helper が例外を握りつぶすため、status ファイルが更新されなくても CLI はこの理由だけでは失敗しません（`strata_cli/tune_commands.py:149-157`）。
-- `strata launch` の tuning 経路は自分で status ファイルを選び、このオプションを子 CLI に渡して定期的に読みます。起動前にそのファイルを削除しようとしますが、これは `strata launch` 側の処理であり、直接 `strata tune auto` を呼ぶときの挙動ではありません（`strata_cli/launch/runner.py:1350-1377`）。
-- `--output json` は最終結果を標準出力へ JSON で出す指定で、status ファイルとは独立です。JSON 出力モードでは進捗行を stderr に出さず、status ファイルには引き続き進捗を書きます（`strata_cli/tune_commands.py:178-179, 205-215, 255-261`）。
+- `--status-file` が指定され、通常のチューニングが進捗 callback を呼ぶときに状態ファイルを書きます。省略時は `_write_status` が何もしません (`terminal/strata_cli/tune_commands.py:240-242`, `terminal/strata_cli/tune_commands.py:362-369`)。
+- 指定先と同じディレクトリに一時ファイル `<指定パス>.tmp` を作成し、最終ファイルを置換します。したがって一時ファイルの作成権限も必要です。書込み失敗は CLI の処理失敗として通知されず、進捗がファイルに反映されない場合があります (`terminal/strata_cli/tune_commands.py:243-248`)。
+- status ファイル自体を削除する処理はこの経路では確認できません。`--work-dir` の有無による作業用ディレクトリの後始末は別処理であり、status ファイルの指定先とは連動しません (`terminal/strata_cli/tune_commands.py:371-373`)。
 
 ## 出力とエラー
 
-オプション自身に対する値検証エラーは定義されていません。対象設定の読込や `--goal` の解析に失敗した場合、および engine が見つからない場合は、チューニング開始前に `_fail` からエラーを返します。この経路では status ファイルへの書き込みは行われないため、既存ファイルはそのまま残ります（`strata_cli/tune_commands.py:174-190`; `_fail` は同: `103-108`）。
-
-通常の完了では最終状態を status ファイルに書いた後、`--output json` なら結果 JSON を stdout に出し、human 出力なら結果文を stdout に出します。終了コードは `improved` / `default_confirmed` が `0`、キャンセルが `130`、その他の outcome が `6` です（`strata_cli/tune_commands.py:255-261`）。進捗ファイルが書けない場合の警告・終了コード変更はありません（同: `149-157`）。
+状態ファイルへの `write_text` または atomic replace で発生した `OSError` は握りつぶされます。専用の警告、標準エラー出力、終了コード変更はこの書込み処理にはありません (`terminal/strata_cli/tune_commands.py:240-248`)。ただし状態ファイル以外のチューニング処理の失敗は、このオプションの説明範囲外です。
 
 ## 根拠
 
-- parser 定義、既定値、説明: `strata_cli/tune_commands.py:20-46`
-- status JSON の作成・置換と書込失敗の扱い: `strata_cli/tune_commands.py:149-157`
-- `auto` における進捗・最終状態・結果出力: `strata_cli/tune_commands.py:174-261`
-- progress payload の項目: `strata_control/autotune.py:221-229`
-- Windows の replace 再試行: `strata_control/atomic.py:18-35`
-- `strata launch` からの利用例と status 読取: `strata_cli/launch/runner.py:1350-1377`
-- 索引上のコマンド階層: `docs/cli/README.md:802-824`
-
-調査は上記 commit の checkout にあるソースを対象としました。Release 配布物や他 OS での実動作は確認していません。
+- `terminal/strata_cli/tune_commands.py:21-49` — `strata tune auto` parser と `--status-file` の既定値・help。
+- `terminal/strata_cli/tune_commands.py:240-248` — JSON 化、`.tmp` への書込み、atomic replace、`OSError` の無視。
+- `terminal/strata_cli/tune_commands.py:314-353` — `--plan` と事前失敗の return 経路。
+- `terminal/strata_cli/tune_commands.py:355-385` — status 初期値、進捗 callback、tuner 実行。
+- `terminal/strata_cli/tune_commands.py:414-425` — 完了状態の書込みと通常出力。
+- `terminal/strata_control/atomic.py:18-34` — replace の再試行条件と `os.replace`。
+- `terminal/strata_cli/tune_commands.py:88-96` — 別コマンド `strata presets recheck` にある同名オプション。

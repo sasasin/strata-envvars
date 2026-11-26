@@ -1,53 +1,48 @@
 # `STRATA_DF_PLE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Verifier の複数 token window で、PLE の key/value 投影後に行う post-projection 処理を token ごとの反復から window 一括処理へ切り替えます。結果と token ごとの PLE history snapshot は従来経路と一致させる設計です。環境変数が有効でも、PLE の BF16 key/value 投影を一括実行する既存経路が成立しなければ切り替わりません。
+複数行の verify window で PLE の key/value 投影後の処理を、行ごとのループではなく一括 CUDA kernel `native_ple_postops_batch_snap` で実行するための opt-in です。適用時は各行の hidden/residual、PLE history、および commit 用の行別 history snapshot を更新します。通常の行ごとの `ple_block_projected` と `ple_history_advance` の経路も残っており、条件を満たさない場合はそちらへ進みます（`engine/src/core/verify.cpp:1748-1752,1756-1792`）。
+
+この切り替えは `--native-ple-postops`（または全 native 経路を有効にする `--native`）で native post-ops を有効にした場合にだけ到達可能です。環境変数単独では native post-ops を有効化しません（`engine/src/program/generate.cpp:3923,5164,6141`; `engine/src/kernels/cuda/ple.cu:202-205`）。
 
 ## 値と判定
 
-`src/core/verify.cpp` の関数内 `static const bool` が `getenv("STRATA_DF_PLE") != nullptr && std::atoi(e) != 0` を評価します（1005-1008行）。値全体の比較ではなく `atoi` による整数変換です。
+verify 実装内の関数ローカル `static` 初期化で `std::getenv` の値を `std::atoi` に渡し、戻り値が 0 でなければ有効とします（`engine/src/core/verify.cpp:1748-1751`）。文字列全体の妥当性検査や `true` / `false` の比較はありません。`atoi` は先頭の空白と符号を許し、先頭の整数部分を読み、後続文字は無視します。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| `1`、`2`、`-1` など、`atoi` が 0 以外に変換する値 | 有効 |
-| 空文字、数値で始まらない文字列、`0`、`0suffix` | 無効 |
-| 数字の後ろに文字が続く値（例: `1abc`） | 数字部分が 0 以外なら有効。後続文字は判定されない |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `atoi(e) != 0` | 無効 | `1`, `-1`, `2`, `1junk`, ` 1` | 空文字、`0`, `0anything`, `false`, `true`, 数字で始まらない文字列 |
 
-空白や符号などの細かな変換規則は C ランタイムの `atoi` に従います。変換可能な整数範囲を外れた値の結果はここでは保証できません。
+`atoi` が認識する整数部分が 0 なら無効、0 以外なら有効です。したがって `-1` も有効で、`0anything` は無効です。大文字小文字の比較はありません。整数として表現できない範囲の入力に対する `atoi` の結果は、この実装から規定できません（同所）。
 
 ## 有効になる条件
 
-この変数が実際に選択する `ple_post` は、次のすべてが真の場合だけです（`src/core/verify.cpp:965-967,1009`）。
+`STRATA_DF_PLE` が有効値でも、次の条件をすべて満たした verify window の PLE 処理でのみ一括 post-ops が実行されます（`engine/src/core/verify.cpp:1482,1704-1710,1752`）。
 
-- `STRATA_PLE_BATCH` が未設定、または値の先頭文字が `0` ではない。これは別の static 判定です。
-- `STRATA_DEC_BATCH` が未設定、または `atoi` の結果が 0 ではない。
-- 対象の verify group の token 数 `n` が 1 より大きい。
-- PLE の key と value の両方に BF16 weights がある。
-- `ple_native_bf16_enabled()` と `ple_native_postops_enabled()` が真。
-- `batch_rec_` が偽（batch recording 中ではない）。
-- 呼び出しが `record_window()` 内の layer 1 かつ PLE が利用可能で有効な経路に到達する。
+- PLE が ready で、現在の層が PLE を実行する段階であること（`ple_on`; `engine/src/core/verify.cpp:1482,1698`）。
+- PLE バッチ投影条件 `ple_batch_kv` が成立すること: `STRATA_PLE_BATCH` が未設定または先頭文字が `'0'` ではなく、`STRATA_DEC_BATCH` が有効で、グループに 2 行以上あり、key/value の BF16 重みがあり、native BF16 と native PLE post-ops が有効であること（`engine/src/core/verify.cpp:1489,1704-1710`）。`STRATA_DEC_BATCH` は未設定時有効、設定時は `atoi(value) != 0` です。`STRATA_PLE_BATCH` のここでの判定は「未設定または先頭文字が `0` 以外」であり、`0` 始まりなら無効です（同所）。
+- `batch_rec_` が false であること。複数 slot の batch-recording 経路では `STRATA_DF_PLE` が有効でもこの一括 post-ops 分岐を使いません（`engine/src/core/verify.cpp:1752`）。
+- 個別指定時は `--native-bf16-extra` が native PLE BF16 を有効にし、`--native-ple-postops` が post-ops を有効にします。どちらも既定では無効です。`--native` は両方を有効にします（`engine/src/program/generate.cpp:780-781,803,3914-3923,5162-5164,6116,6141`; `engine/src/kernels/cuda/ple.cu:202-205`）。
+- 環境変数の判定自体には OS/backend 条件がありません。ただし実動作には `verify.cpp` と対応する `native_ple_postops_batch_snap` 実装を含むビルドが必要です。確認した実装は CUDA kernel です（`engine/src/core/verify.cpp:1748-1752,1766`; `engine/src/kernels/cuda/native_ple_postops.cu:275-289`）。
 
-したがって、`STRATA_DF_PLE=1` 単独では機能を有効化しません。条件が不足すると token ごとの PLE 処理に進みます。`STRATA_DEC_BATCH=0` などで一括 projection が無効ならこの分岐も無効です。
+上記の一つでも満たさなければ、`STRATA_DF_PLE` の値による変更はなく、通常の逐次処理経路に進みます（`engine/src/core/verify.cpp:1772-1792`）。
 
 ## 実行時の詳細
 
-`STRATA_DF_PLE` は、`record_window()` が layer 1 の PLE 処理に初めて到達した時に読み込まれ、その値がプロセス内で固定されます。最初の判定後に環境を変更しても反映されません（`src/core/verify.cpp:955,1005-1009`）。
+変数の読み取りはプロセス起動時ではなく、`verify.cpp` の PLE 層で `ple_post_env` 初期化に初めて到達した時です。その値は関数ローカル `static const` に保存され、以降の verify window で環境を変更しても反映されません（`engine/src/core/verify.cpp:1698,1748-1751`）。同じ関数内の `dec_batch` も初回の verify 処理でキャッシュされます（同所:1489）。
 
-有効な場合、既存の一括 key/value projection の後、各 row の hyper-connection residual write をまとめて実行し、`native_ple_postops_batch_snap()` で PLE post-ops、history の逐次更新、および各 token 後の history snapshot 作成を行います。native GR の複数 row 実装が無効なら residual write は row ごとに行います（`src/core/verify.cpp:1010-1028`）。その後に使われる各 token の snapshot は従来の commit 用データです。
+条件成立時、まず前段で各行の key/value 投影を行い、hyper-connection residual write を行った後、バッチ kernel に key、hidden、value、PLE history、scratch、および行ごとの history snapshot バッファを渡します（`engine/src/core/verify.cpp:1718-1723,1756-1767`）。kernel は key と hidden の正規化、gate の計算、value の gate 適用、gated 値の正規化、history を使った convolution/residual、history 更新と各行後の snapshot 書き込みを launch します（`engine/src/kernels/cuda/native_ple_postops.cu:275-289`）。逐次経路では `ple_block_projected` の後に `ple_history_advance` し、commit 用 snapshot をコピーします（`engine/src/core/verify.cpp:1773-1792`）。
 
-無効または適用条件を満たさない場合は row ごとに residual write、PLE post-processing、history advance、history snapshot copy を行います（`src/core/verify.cpp:1029-1049`）。一括 post-ops が例外を投げた場合は `record_window()` が `verify PLE (window): <例外内容>` をエラー文字列に設定して失敗します（`src/core/verify.cpp:1023-1027`）。
+## ログと測定値
+
+この環境変数を有効化したことを示す専用ログは、読み取り・分岐箇所にありません（`engine/src/core/verify.cpp:1748-1767`）。バッチ処理で例外が発生すると、呼び出し側は `err` に `verify PLE (window): ` と例外文字列を設定して `false` を返します。通常経路の例外は `verify PLE: ` を設定します（`engine/src/core/verify.cpp:1766-1770,1781-1790`）。測定値は記載できる根拠がありません。
 
 ## 根拠
 
-- `src/core/verify.cpp:840-845` — PLE 有効状態、window group、`STRATA_DEC_BATCH` の既定値。
-- `src/core/verify.cpp:955-974` — layer 1 の処理、`STRATA_PLE_BATCH` の判定、一括 projection 条件。
-- `src/core/verify.cpp:1001-1049` — `STRATA_DF_PLE` の parse、適用条件、batch/per-token の分岐、snapshot とエラー処理。
-- `include/strata/kernels/native_ple_postops.hpp:38-43` — window 版関数が per-token 呼び出しと同じ演算を行い、各 token 後の snapshot を書くというインターフェース上の説明。
-- `src/kernels/cuda/native_ple_postops.cu:273-287` — snapshot 付き batch 関数の実処理と launch error 確認。
-- `src/kernels/verify_batch_parity.cpp:100-152` — GPU 合成データで 2、3、4、8 token の結果、最終 history、各 snapshot を比較する parity 検証コード。これは測定値ではなく、調査中にテストを実行してはいません。
-
-`docs/DETAILS.md` に `STRATA_DF_PLE` の説明や性能測定値は見つかりませんでした。ここではコードとインターフェースコメントから確認できる挙動だけを記載しています。
+- `engine/src/core/verify.cpp:1482-1489,1698-1717,1744-1792` — PLE の実行条件、補助環境変数、値の読み取り、分岐と fallback。
+- `engine/src/program/generate.cpp:3923,5162-5164,5209-5211,6114-6117,6141` — CLI / `--native` による native PLE 設定。
+- `engine/src/kernels/cuda/ple.cu:202-205` — native BF16 / post-ops フラグの保持。
+- `engine/src/kernels/cuda/native_ple_postops.cu:275-289` — 一括 kernel が行う処理。

@@ -1,46 +1,47 @@
 # `STRATA_UPDATE_APP_ENDPOINT`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Strata Desktop アプリ内の署名付きアプリ更新が参照する更新 endpoint を、実行時に差し替えます。ソースコメントでは用途をローカルテスト feed とし、受け付ける URL は HTTPS または loopback HTTP に制限しています。これは Desktop アプリ本体の更新用です。モデルや engine の更新（`strata update`）には使われません（`apps/desktop/src-tauri/src/updater.rs:11-14,24-25`）。
+Desktop アプリの Tauri updater が使う endpoint を、通常の `tauri.conf.json` の endpoint から差し替えるための環境変数です。実装コメント上の用途はローカルのテスト feed で、HTTPS または loopback HTTP の URL に限定されます。変数名を定数に置いた箇所は `app/desktop/src-tauri/src/updater.rs:25-26`、選択処理は同ファイル `:224-240` です。
 
-未設定、空文字、または許可 prefix に一致しない値では、アプリ設定の endpoint を使います。設定ファイルの既定 endpoint は `https://github.com/Niko1221/Strata/releases/latest/download/latest.json` です（`apps/desktop/src-tauri/src/updater.rs:51-67`、`apps/desktop/src-tauri/tauri.conf.json:65-74`）。
+対象は Desktop アプリ自身の更新です。Terminal の `strata update` やエンジン・モデル更新の設定ではありません。通常の feed 確認は Settings の「Check for updates」操作で行われ、Settings の表示やアプリ起動だけでは行われません。更新ジョブ完了後には結果を更新する再確認もあります。インストールは「Update」操作から始まります（`app/host/src/components/SettingsUpdates.tsx:26-37,81-90`、`app/host/server/updates.mjs:50-64,87-97`、`app/host/server/native-control.mjs:808-830`）。
 
 ## 値と判定
 
-| 環境値 | Strata の判定と処理 |
-| --- | --- |
-| 未設定 | `std::env::var` が値を返さず override なし。設定済み endpoint に戻る。 |
-| Unicode でない値 | `std::env::var(...).ok()?` が `None` になるため override なし。 |
-| 空文字 | どの prefix にも一致しないため override なし。 |
-| `https://` で始まる値 | override 候補として受理し、URL parse と updater 構築へ進む。 |
-| `http://127.0.0.1:` で始まる値 | 同上。 |
-| `http://localhost:` で始まる値 | 同上。 |
-| 上記以外 | override なし。設定済み endpoint に戻る。 |
+`std::env::var(ENDPOINT_ENV).ok()` で Unicode 文字列として読み、文字列の先頭を大文字小文字を区別して比較します。数値変換、空白除去、URL 全体に対する許可リスト照合はありません（`app/desktop/src-tauri/src/updater.rs:224-230`）。
 
-prefix 判定は大文字小文字を区別する `starts_with` で、値全体の形式をここでは検査しません。したがって `HTTPS://...` や `http://example.com/...` は override として扱われません。許可 prefix に続く文字列は `tauri::Url` に parse され、失敗すると `bad update endpoint: ...` エラーになります。その場合は設定済み endpoint への fallback はしません。parse 後も `endpoints(vec![url])` または `build()` が失敗すればエラーを返します（`apps/desktop/src-tauri/src/updater.rs:51-67`）。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| Desktop updater の endpoint 選択 | `None` となり、`tauri.conf.json` の endpoint を使う | `https://`、`http://127.0.0.1:`、`http://localhost:` のいずれかで始まり、さらに Tauri の URL 型に parse できる文字列。例: `https://updates.example.com/latest.json`、`http://127.0.0.1:19080/app/latest.json`、`http://localhost:19080/latest.json` | 空文字、`0`、`1`、`true`、`false`、`http://example.com/feed`、`HTTPS://updates.example.com/feed`、先頭に空白がある値などは接頭辞判定に失敗し、設定 endpoint に戻る。非 Unicode 値も `var(...).ok()` が失敗するため unset と同じ扱い |
+
+接頭辞判定を通った後に URL parse が失敗すると `bad update endpoint: {parse error}` が返ります。この場合は設定 endpoint へ戻りません。例えば接頭辞だけの `https://` は接頭辞判定を通りますが、parse エラーになります（`app/desktop/src-tauri/src/updater.rs:233-240`）。
+
+有効な override は一つの URL を `endpoints(vec![url])` に渡します。無効値や未設定では Tauri 設定の endpoint に切り替えます。設定ファイルの既定値は `https://github.com/Niko1221/Strata/releases/latest/download/latest.json` です（`app/desktop/src-tauri/src/updater.rs:233-240`、`app/desktop/src-tauri/tauri.conf.json:66-75`）。CLI 引数や別環境変数による優先順位はこの実装にはありません。
 
 ## 有効になる条件
 
-- Desktop Tauri アプリの updater bridge が起動している必要があります。Windows/macOS では embedded app の `start_host` が bridge を起動し（`apps/desktop/src-tauri/src/main.rs:495-505`）、Linux では window process の setup が bridge を起動して App Host に登録します（`apps/desktop/src-tauri/src/main.rs:1134-1179`）。
-- endpoint の読み取り・更新確認はアプリ起動時には行われません。ユーザー操作に応じた bridge の `GET /app-update/check` または `POST /app-update/install` が updater を作る時点で評価されます（`apps/desktop/src-tauri/src/updater.rs:13-14,60-72,80-94,197-210`）。
-- 環境値の判定は `endpoint_override()` 内に保存されず、check/install ごとの `updater_for()` 呼び出しで再実行されます。読み取り結果を保持する cache はありません（`apps/desktop/src-tauri/src/updater.rs:51-67,70-72,80-90`）。
-- CLI 引数や別環境変数との優先順位分岐はこの実装にありません。候補 endpoint が有効な場合は `updater_builder().endpoints(vec![url])` に一件を設定し、候補がない場合は `app.updater()` を使います（同:60-67）。
+- Desktop アプリの Tauri updater 経路で使われます。Windows/macOS では shell が App Host を起動して bridge を渡し（`app/desktop/src-tauri/src/main.rs:554-568`）、Linux では shell が window child を起動し、その child が updater bridge を登録します（`app/desktop/src-tauri/src/supervisor.rs:390-400,552-555`、`app/desktop/src-tauri/src/main.rs:1295-1349`）。
+- bridge が作成できることが必要です。loopback listener を bind できない場合 `updater::start` は `None` を返し、アプリ内 updater は利用できません（`app/desktop/src-tauri/src/updater.rs:441-455`）。
+- Host 側から token 付き loopback bridge に check/install の要求が来たときに endpoint を選びます。通常の check は Settings のボタンから、または更新ジョブ完了後の再確認から呼ばれます（`app/host/src/components/SettingsUpdates.tsx:26-37,81-90`、`app/host/server/updates.mjs:50-64,87-97`、`app/host/server/native-control.mjs:808-830`、`app/host/server/app-updater.mjs:19-28,35-42`、`app/desktop/src-tauri/src/updater.rs:402-415`）。
+- 変数が未設定または接頭辞判定に失敗した場合は、`tauri.conf.json` の既定 endpoint が使われます。許可接頭辞を満たすが URL parse に失敗する値では、その操作がエラーになります（`app/desktop/src-tauri/src/updater.rs:224-240`）。
+- GPU backend、モデル状態、サーバーモードには依存しません。Terminal updater は別経路です。候補名の全参照を検索した結果、この updater 実装以外に本番コードの読み取りはありません。
 
 ## 実行時の詳細
 
-check 経路では `updater_for()` のエラーは bridge から `502 Bad Gateway` と JSON の `error` に返されます。check 成功時は更新有無、version、current、notes が返ります（`apps/desktop/src-tauri/src/updater.rs:70-78,197-200`）。
+`endpoint_override()` に static cache はなく、`updater_for()` が呼ばれるたびに現在のプロセス環境を読みます。更新確認は bridge の `GET /app-update/check` から `check()` を呼び、インストールは `POST /app-update/install` から非同期 `install()` を起動します。したがって check と install はそれぞれ updater を作り、その時点で endpoint を選びます（`app/desktop/src-tauri/src/updater.rs:224-245,257-270,402-415`）。
 
-install 経路では、POST の受理時に `202 Accepted` が返されてからバックグラウンド処理が始まります。endpoint 判定・構築、check、download などで失敗すると progress の `state` が `error` になり、エラー文字列が `error` フィールドに設定されます。進行状態は `GET /app-update/status` で確認できます。更新がない場合の実装上の文言は `There is no newer version of the Strata app.` です（`apps/desktop/src-tauri/src/updater.rs:80-94,201-212`）。
+Windows/macOS では updater を持つ shell 自身が値を読みます。Linux では supervisor が環境を明示的に消さずに window child を起動し、window child 側で bridge を作るため、その child のプロセス環境から読みます（`app/desktop/src-tauri/src/supervisor.rs:390-400,552-555`、`app/desktop/src-tauri/src/main.rs:1295-1349`）。App Host へ渡す `apply_env` が追加するのは bridge URL/token とアプリ version で、この endpoint 値を別途転送・上書きする処理はありません（`app/desktop/src-tauri/src/updater.rs:457-464`）。
 
-この bridge は loopback listener を開けない場合 `None` を返し、インアプリ更新を提供しません。ソースコメントでは Terminal の `strata update --app` は引き続き利用できるとしています（`apps/desktop/src-tauri/src/updater.rs:227-240`）。これは環境変数による endpoint 上書きとは別の実行経路です。
+## ログと測定値
+
+この変数の値を報告する専用 stdout/stderr ログはありません。check 時に updater 作成または確認が失敗すると、shell bridge は `502 Bad Gateway` と `{ "error": ... }` を返します。install 時は同じ種類の失敗が progress の `state: "error"` と `error` に入り、Host はその error を例外として扱います。これらのエラー経路は `app/desktop/src-tauri/src/updater.rs:243-270,402-415`、Host 側の受け取りは `app/host/server/app-updater.mjs:23-28,41-64` にあります。専用の性能測定値はありません。
 
 ## 根拠
 
-- 全参照の検索では、候補名は `apps/desktop/src-tauri/src/updater.rs:25` の定数、同ファイルの本番読み取り `:52`、および `#[cfg(test)]` 内のテスト設定・解除 `:282-286` にありました。リポジトリ内の他の本番参照は見つかりませんでした。
-- 環境値の取得、許可 prefix、parse、設定 endpoint への切り替え: `apps/desktop/src-tauri/src/updater.rs:51-67`。
-- check/install での updater 生成と結果の返却: `apps/desktop/src-tauri/src/updater.rs:70-94,197-212`。
-- Desktop の bridge 起動経路: `apps/desktop/src-tauri/src/main.rs:495-505,1134-1179`。
-- 設定 endpoint: `apps/desktop/src-tauri/tauri.conf.json:65-74`。
+- `app/desktop/src-tauri/src/updater.rs:25-26,224-240` — 変数名、値の判定、設定 endpoint との切り替え。
+- `app/desktop/src-tauri/tauri.conf.json:66-75` — 設定 endpoint。
+- `app/desktop/src-tauri/src/updater.rs:243-310,379-417,441-464` — check/install、bridge と App Host への環境設定。
+- `app/desktop/src-tauri/src/main.rs:554-568,1295-1349`、`app/desktop/src-tauri/src/supervisor.rs:390-400,552-555` — OS ごとの updater bridge 起動経路。
+- `app/host/server/app-updater.mjs:19-28,35-64` — Host から bridge を呼ぶ契機と応答エラーの扱い。

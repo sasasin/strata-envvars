@@ -1,53 +1,46 @@
 # `STRATA_PROMPT_ATTN_IMMA`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-QSA（query-selected attention）の prompt 処理で、int8 KV 用 CUDA kernel を v2 から v3 に切り替えます。v3 は q.k と p.v の積を INT8 tensor core MMA で計算し、v2 は FP16 MMA を使います。対象は CUDA の int8 KV prompt attention だけです。decode attention、Q4_0 KV、K8V4 hybrid KV をこの変数が切り替えるわけではありません。
+CUDA の QSA prompt attention で、int8 K/V を使うときに v3 の INT8 tensor-core kernel `prompt_attn_i8v3_kernel` を選ぶかを制御する。v3 を選ぶと K と V の積を INT8 tensor core で計算する。環境変数が無効なら同じ分岐から従来の `launch_i8`（v2）を選ぶ。値は prompt attention の kernel 選択に使われ、decode attention を切り替えるものではない。実装は `engine/src/kernels/cuda/qsa_prompt_attn.cu` の `qsa_prompt_attn_batch` にある（同ファイル 1154-1200, 1401-1431, 2471-2477, 2558-2568）。
 
 ## 値と判定
 
-`std::getenv()` の有無と値の先頭 1 文字だけで判定します。数値 parse、文字列全体の比較、大文字小文字変換はしません。
+`std::getenv` の戻り値を一度読み、未設定なら内部値 `2`（既定動作）、設定されていれば先頭文字だけを調べる。先頭が `'1'` なら強制 ON、その他はすべて強制 OFF。数値変換や文字列全体の比較はしない（`engine/src/kernels/cuda/qsa_prompt_attn.cu:2563-2568`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効（v2） |
-| 空文字 | 無効（v2） |
-| 先頭文字が `1` | 有効要求（v3） |
-| その他（`0`, `true`, `2`, 空白など） | 無効（v2） |
+| 条件（build / 経路） | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA の QSA prompt attention、INT8 K/V 経路 | 内部値 `2`。Ampere（CC 8.0）以降で v3 を選ぶ | 先頭が `1` の文字列。例: `1`, `10`, `1anything` | 空文字、`0`, `2`, `true`, ` 1` など先頭が `1` でない文字列 |
 
-たとえば `1`, `10`, `1anything` は有効要求になります。`true` は無効です。
-
-値は `qsa_prompt_attn_batch()` の int8 KV 分岐が v1/Turing 用経路を通過した後、最初に v3/v2 を選択するときに `g_pa_imma` へ保存されます。同一プロセスでは以降の呼び出しで環境を再読しないため、読み取り後に環境を変更しても反映されません。テスト用 `qsa_prompt_attn_set_imma()` はこの状態を明示的に上書きできますが、通常の実行経路からは呼ばれません。
+空文字は「設定済み」だが空文字の先頭 `v[0]` は `'1'` ではないため OFF になる。大文字小文字、空白、残りの文字列、数値としての妥当性を検査しない。負値も先頭が `1` でないため OFF（同 `qsa_prompt_attn.cu:2564-2565`）。
 
 ## 有効になる条件
 
-環境変数が有効要求でも、次の条件を満たす呼び出しに限られます。
-
-- HIP ビルドではないこと。HIP のコードは独自 WMMA 判定の後に戻り、CUDA の `g_pa_imma` 判定へ到達しません。
-- `qsa_prompt_attn_batch()` が呼ばれること。通常の prefill では `STRATA_PROMPT_ATTN_OLD` が設定されていない場合にこの関数を試します。関数が利用不可を返すと prefill 側は `qsa_decode_attn_batch()` にフォールバックします。
-- KV が純粋な int8 形式であること（`k_q`, `v_q`, `k_scale`, `v_scale` が存在し、先に判定される Q4_0 / K8V4 分岐ではないこと）。
-- query head geometry、ページ容量、選択 ID などが prompt kernel の要件を満たすこと。prompt tensor-core 経路は compute capability 70 未満では利用されず、v3 自体は 80 以上でなければ選択されません。
-- `STRATA_PROMPT_ATTN_V1` が設定されていないこと。また、Turing 相当（compute capability 8.0 未満）では v1 / v2t 系の分岐を通るため、この変数による v3 選択に到達しません。`STRATA_QSA_WARP` などで compute capability を 7.5 相当に扱う場合も同様です。
-- 実際に v3 kernel が使えること。共有メモリ属性設定が失敗すると `launch_i8v3()` は `false` を返し、呼び出し元は通常の prompt attention にフォールバックします。
+- CUDA の `qsa_prompt_attn_batch` が呼ばれること。HIP ビルドでは先に WMMA 経路を試し、使えなければ `false` を返すため、この環境変数の判定箇所へ進まない。Metal もこの CUDA kernel 選択経路ではない（`engine/src/kernels/cuda/qsa_prompt_attn.cu:2471-2481, 2509-2518`）。
+- 現在の device が Turing（CC 7.5）ではなく、CC 8.0 以上であること。device 能力は device ごとにキャッシュされ、Turing は v1 経路へ分岐する。これより古い GPU や不適合条件では prompt tensor-core 関数が `false` を返し、呼び出し側が別経路へ進む（同 `qsa_prompt_attn.cu:2474-2507, 2567-2568`）。
+- QSA prompt attention の K が int8（`pools.k_q != nullptr`）で、V が int8、両方の scale があり、Q4 K/V 経路や K8V4 hybrid 経路ではないこと。形状・selection data・page table などの検査に失敗すれば同関数は `false` を返す（同 `qsa_prompt_attn.cu:2519-2543`）。
+- 呼び出し側が `STRATA_PROMPT_ATTN_OLD` によって旧 attention 経路を強制していないこと。この別変数は値の内容ではなく設定有無で判定され、設定されると `qsa_prompt_attn_batch` を呼ばない。通常の prefill 呼び出し箇所は `engine/src/prefill/prefill.cpp:5537-5557` と `9462-9468`。
+- unset の既定 ON は `strata::prompt_attn_imma_default(false, 80, strata::qwen_defaults_026())` が真の場合に限る。同 helper は CUDA、CC 8.0 以上、`v026` 既定値でないことを条件とする。`STRATA_DEFAULTS` が `026` / `0.2.6` / `v0.2.6` なら `v026` となり、unset 時は OFF。明示して先頭 `1` を設定した場合はこの default 判定を迂回するため、`STRATA_DEFAULTS=026` より本変数の明示値が優先する。`STRATA_DEFAULTS` は helper 内で一度 cache される（`engine/src/kernels/cuda/qsa_prompt_attn.cu:2567`; `engine/include/strata/core/sm120_series.hpp:146-149`; `engine/include/strata/core/defaults_026.hpp:21-29`）。
+- `STRATA_PROMPT_ATTN_OLD` やテスト用 `qsa_prompt_attn_set_imma` 以外に、CLI 引数による同値の上書きはこの読み取り経路にはない。テスト用 setter は `g_pa_imma` を直接変更する（`engine/src/kernels/cuda/qsa_prompt_attn.cu:2432`）。
 
 ## 実行時の詳細
 
-通常の prefill 呼び出し元は `STRATA_PROMPT_ATTN_OLD` が設定されている場合、または `qsa_prompt_attn_batch()` が `false` を返す場合に、decode attention kernel を query batch ごとに実行します。`STRATA_PROMPT_ATTN_IMMA` 自体は失敗時のログやエラーを出さず、v3 を要求するだけです。
+`qsa_prompt_attn_batch` は QSA attention のバッチ単位で呼ばれ、形状・device・KV pool の検査後、INT8 K/V 分岐に到達した時点で環境変数を読む。結果はプロセス内の `g_pa_imma` に保存され、以後は再読み込みしない。したがって起動後に環境を書き換えても通常は反映されず、最初の該当呼び出しより前に設定する必要がある。`qsa_prompt_attn_set_imma` が sentinel `-1` を設定した場合は再読込可能だが、これはテスト用 API である（`engine/src/kernels/cuda/qsa_prompt_attn.cu:2376, 2432, 2563-2567`）。
 
-v3 の起動時には device ごとに動的共有メモリ上限を設定します。その設定に失敗した場合は起動せず `false` を返します。kernel launch 後の CUDA エラーは `qsa_prompt_attn_batch (v3): <CUDA error>` を stderr に出し、プロセスを終了します（この場合は通常経路へのフォールバックではありません）。v3 選択箇所まで進んだ CUDA sm_80 以上では、無効要求なら v2 の int8 kernel が選択されます。Turing 相当ではその選択箇所に進まず、先行する v1 / v2t 系の分岐が使われます。
+値が強制 ON、または unset かつ default 条件を満たす場合、`launch_i8v3` は kernel ごとに dynamic shared-memory 属性を設定してから `prompt_attn_i8v3_kernel` を投入する。それ以外は `launch_i8` の v2 kernel を投入する（同 `qsa_prompt_attn.cu:1401-1431, 2567-2568`）。v3 kernel の投入が false を返す場合、prompt 関数も false となり、prefill 側では利用可能な別の QSA attention 経路または decode attention のループへフォールバックする（`engine/src/prefill/prefill.cpp:5556-5569, 9466-9472`）。
 
-## 文書・測定値
+## ログと測定値
 
-`docs/DETAILS.md` はこのスイッチを「int8-KV prompt attention on INT8 tensor cores」と記載し、rounding-level の差（KL at the floor）、prompt read +2.5% としています。表にはこの値の個別 GPU・モデル等の測定条件は示されていないため、一般的な性能向上値とは扱えません。kernel のヘッダー説明も FP32 基準の計算と bitwise 一致ではないことを述べています。
+環境変数の読み取りや ON/OFF 自体を示すログは見つからない。v3 の shared-memory 属性設定に失敗した場合は `launch_i8v3` が CUDA エラーを消去して `false` を返し、上位の fallback に進む。kernel launch error の場合は stderr に `qsa_prompt_attn_batch (v3): <CUDA error text>` を出して `exit(1)` する（`engine/src/kernels/cuda/qsa_prompt_attn.cu:1408-1429`）。
+
+`docs/DETAILS.md:1302` は Ampere 以降での既定 ON と `=0` による旧 kernel 選択を要約している。実装上は `=0` 固定ではなく、先頭文字が `1` でない設定値が OFF となる。また `docs/SETTINGS.md:270` は適用先を NVIDIA and AMD としているが、この変数を読むのは CUDA kernel 経路であり、HIP は別の WMMA 分岐から戻る。性能値はこの文書では記載しない。
 
 ## 根拠
 
-- 値の読み取り、v1/Turing 分岐、v3/v2 の dispatch: `src/kernels/cuda/qsa_prompt_attn.cu:2317-2340`
-- v3 kernel の INT8 MMA と演算説明: `src/kernels/cuda/qsa_prompt_attn.cu:1079-1085,1147-1160`
-- device 共有メモリ設定、起動エラー: `src/kernels/cuda/qsa_prompt_attn.cu:1394-1424`
-- compute capability と HIP 分岐: `src/kernels/cuda/qsa_prompt_attn.cu:2254-2294`
-- prefill 呼び出しと decode attention fallback: `src/prefill/prefill.cpp:3260-3272`
-- parity 用 setter: `include/strata/kernels/qsa_prompt_attn.hpp:39-40`, `src/kernels/cuda/qsa_prompt_attn.cu:2252`
-- 測定表: `docs/DETAILS.md:2220-2236`
+- `engine/src/kernels/cuda/qsa_prompt_attn.cu:2376, 2432, 2471-2481, 2509-2518, 2519-2568` — 状態、test setter、backend/device/KV 条件、値判定と kernel 選択。
+- `engine/src/kernels/cuda/qsa_prompt_attn.cu:1154-1200, 1401-1431` — v3 kernel と launch、失敗時の扱い。
+- `engine/include/strata/core/sm120_series.hpp:146-149`, `engine/include/strata/core/defaults_026.hpp:21-29` — unset 時の default 条件と `STRATA_DEFAULTS` との関係。
+- `engine/src/prefill/prefill.cpp:5537-5569, 9462-9472` — 呼び出し元、旧経路指定、失敗時の fallback。
+- `docs/DETAILS.md:1302`, `docs/SETTINGS.md:270` — ソース実装との照合対象となる要約。

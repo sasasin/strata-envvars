@@ -1,56 +1,55 @@
-# `--ple-sync-submit`
+# `strata generate --ple-sync-submit`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（ネイティブ推論エンジン） |
+| コマンド | `strata generate`（エンジン引数） |
 | オプション | `--ple-sync-submit` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ |
+| 値 | 値を取らない真偽フラグ |
 
 ## 役割
 
-PLE table の Direct 読み込みを発行するスレッドを切り替える A/B 用フラグです。既定では PLE reader が I/O worker thread を作成します。このフラグを付けると worker を作らず、読み込み処理を呼び出し側のスレッドで行います。ソースコメントではこれを token thread からの submit と説明しています。
+PLE n-gram テーブルを直接読み込むとき、読み込み要求の投入と完了処理を専用 I/O worker に任せず、呼び出し側のスレッドで行う A/B 用フラグです。既定では worker thread が使われます。この設定はスレッド配置を変えるもので、読み込み方式そのものを選ぶ `--ple-io` とは別です。実測による速度上の推奨は、このソース調査からは判断できません。
 
 ## 使い方
 
 ```sh
-strata generate --pack pack/full --tokens "1,2,3" --ple-gguf model-ple.gguf --ple-sync-submit
+# PLE テーブルを直接読み込む構成で、I/O worker を使わずに実行する
+strata generate --pack pack/full --tokens "1,2,3" --ple-gguf /path/to/ple.gguf --ple-sync-submit
 ```
 
-実際の prompt、pack、PLE GGUF のパスは利用するモデルに合わせてください。`--ple-gguf` を省略できる場合や必要な shard はモデル形式に依存します。
+`--tokens` はこのエンジンの通常実行に必要です。`--ple-gguf` を省略しても `--native` のモデルに PLE tensor があり `--no-ple` が指定されていなければ、その tensor を含む shard が PLE table として選ばれる場合があります。
 
 ## 値と既定値
 
-- 指定時は `ple_sync_submit` を `true` にします。未指定時は `false` で、I/O worker thread を使います。フラグ自体に値は不要で、同じ引数を複数回指定しても同じ真偽値を設定します。
-- parser にこのフラグ固有の値検証はありません。別の値を続けて書く構文ではありません。
-- 一般の実行では PLE は既定で必要で、`--no-ple` は診断用の明示的な ablation です。`--no-ple` と `--ple-gguf` は併用できません。
+このオプション自体は値を取りません。未指定時は `ple_sync_submit = false` で、`io_thread` は有効になります。指定時は `ple_sync_submit = true` となり、`io_thread` が無効になります。parser は同じ引数を複数回受けても真を再設定するだけです。後続の値を消費する処理はなく、値・範囲の validation もありません。
 
 ## 実行時の動作
 
-parser はこの引数を見つけるとフラグを立てます（`src/program/generate.cpp:2473-2479`）。PLE table の設定時に `pio.io_thread = !o.ple_sync_submit` として reader に渡すため、このフラグは worker thread の有無を反転します（`src/program/generate.cpp:4033-4054`）。
+parser は `--ple-sync-submit` を見つけるとフラグを true にします。PLE table を開く段階で `pio.io_thread = !o.ple_sync_submit` として `PleTable::open` に渡し、direct 読み込みではさらに `PleReader::open` に転送します（`engine/src/program/generate.cpp:3905, 6270-6288`; `engine/src/kernels/ngram.cpp:449-460`）。
 
-I/O worker を使う既定経路では、worker が DirectFile 呼び出しと完了処理を担当し、呼び出し側の `issue` はジョブ構築と worker の wake にとどまります。worker を使わない場合は呼び出し側がそれらを実行します（`src/ngram/ple_reader.cpp:95-99,336-378`）。PLE table 自体が開かれるのは `--ple-gguf` が設定されている場合です（`src/program/generate.cpp:4033-4054`）。
-
-`--ple-io` の既定値は `direct` です。`mmap` または `ram` は Direct reader を使わないため、このフラグによる worker の切り替えは読み込み経路に適用されません（`src/program/generate.cpp:479-481,4033-4040`; `src/kernels/ngram.cpp:340-354`）。
+direct 読み込みでは、既定の worker 方式は worker が direct-file 操作を行い、呼び出し側は要求を組み立てて worker を起こします。`--ple-sync-submit` を付けると worker を生成せず、`issue` 側が読み込みを投入し、呼び出し側が完了を処理します（`engine/src/ngram/ple_reader.cpp:105-108, 375-389, 548-579`）。worker 方式では thread 作成に失敗すると PLE table の open が失敗し、エンジンはエラーを stderr に出して終了します。このフラグを有効にした経路ではその worker 作成は行われません（`engine/src/ngram/ple_reader.cpp:376-389`; `engine/src/program/generate.cpp:6288-6290`）。
 
 ## 適用条件と副作用
 
-- フラグは PLE table を開く処理で反映されるため、PLE を使わない診断実行では読み込み worker に影響しません（`src/program/generate.cpp:4033-4040,4177-4180`）。
-- Direct mode では `--ple-sync-submit` により `pio.io_thread` が無効になると、`STRATA_SSD_KEEPALIVE` 等から設定した keep-alive 値も 0 にされます。Direct mode の SSD keep-alive は無効となり、起動時にその旨が stderr に出ます（`src/program/generate.cpp:4041-4050,4107-4112`）。
-- 呼び出し側が Direct I/O と完了待ちを担うため、I/O worker への仕事の委譲はありません。worker 作成失敗の経路（`PleReader: cannot create I/O worker`）は通らなくなりますが、呼び出し側に I/O 処理が移ります（`src/ngram/ple_reader.cpp:95-99,364-375`）。性能上の優劣はこの調査では測定していません。
+- PLE table が有効なときだけ設定が読み込み経路に伝わります。`--ple-gguf` で明示するほか、`--native` のモデルに `per_layer_token_embd.weight` があれば、`--no-ple` がない場合に shard が自動選択されます（`engine/src/program/generate.cpp:3899-3905, 5127-5134`）。PLE table が開かれない場合、このフラグの実行時効果はありません。
+- `--ple-io direct`（既定）の場合に I/O worker の有無に作用します。`--ple-io mmap` / `ram` は mapped table の経路なので、このフラグによる `io_thread` 設定は読み込みに使われません（`engine/src/program/generate.cpp:6271-6276`; `engine/src/kernels/ngram.cpp:448-466`）。
+- direct から mmap に切り替える自動 residency / probe 経路でも、最終的に mmap table が開かれれば `PleReader` の worker は使われません（`engine/src/program/generate.cpp:6304-6347, 6352-6375`）。
+- direct 読み込み時は I/O worker thread の作成を抑止し、読み込み処理の担当スレッドを変えます。ファイル内容や PLE の値は変更しません。別スレッドでの処理による速度差や最適な設定は、性能測定をしていないため記載しません。
+- CUDA 系 parser と SYCL parser の両方に同じフラグと `io_thread` の反転設定があります（`engine/src/program/generate.cpp:823, 3905, 6276`; `engine/sycl/src/program/generate.cpp:507, 1944, 3357`）。
 
 ## 出力とエラー
 
-このフラグ専用の出力や validation error はありません。PLE table の open が失敗した場合、エラー内容を `strata generate: ...` として stderr に出し、終了コード 1 で終了します（`src/program/generate.cpp:4052-4054`）。worker 作成失敗の具体的なエラーは reader が返しますが、このフラグを付けると worker 作成処理自体を行いません（`src/ngram/ple_reader.cpp:364-375`）。Direct 読み込みの token gather が失敗した場合は `PleTable::gather: ...` を stderr に出して PLE embedding 出力をゼロ埋めします（`src/kernels/ngram.cpp:639-648`）。この経路は gather 側でログと代替値を処理し、ここからエラー終了コードを返してはいません。
+このフラグ専用の標準出力・警告はありません。PLE table を開けない場合は open のエラー文字列を `strata generate:` 付きで stderr に出し、終了コード 1 になります。I/O worker の作成失敗は、worker を必要とする既定経路で `PleReader: cannot create I/O worker`（例外文字列があればその内容を付加）として返されます。direct 読み込み・table open に必要なファイルなど、他の失敗要因まではこのフラグで回避されません（`engine/src/ngram/ple_reader.cpp:376-389`; `engine/src/program/generate.cpp:6288-6290`）。
 
-## 根拠と調査範囲
+## 根拠
 
-- parser の既定値・help 表示・引数設定: `src/program/generate.cpp:485,806-827,2473-2479`。
-- PLE reader への設定、適用条件、Direct mode の keep-alive 相互作用: `src/program/generate.cpp:4033-4054,4107-4112`。
-- worker と caller-thread の動作、worker 作成失敗: `src/ngram/ple_reader.cpp:95-99,336-378`。
-- Direct の token gather 失敗時のログとゼロ埋め: `src/kernels/ngram.cpp:639-648`。
-- Direct mode で reader に渡す処理と mmap/ram の区別: `src/kernels/ngram.cpp:340-354`。
-- 索引は `strata-engine` root の parser を `src/program/generate.cpp` と定義しています（`docs/cli/README.md`）。同じフラグ文字列は `sycl/src/program/generate.cpp` にもありますが、この文書では索引の root parser 対象に合わせて説明しています。SYCL executable の配布・実行条件は確認していません。
+- `engine/src/program/generate.cpp:823, 1228, 3905` — CUDA 系 option の既定値、help 表記、parser 登録。
+- `engine/src/program/generate.cpp:6270-6288, 6304-6375` — PLE I/O 設定、direct/mmap 選択、自動切替、table open。
+- `engine/src/kernels/ngram.cpp:449-466` — direct mode だけが `PleReader` を開き、`io_thread` を渡す。
+- `engine/src/ngram/ple_reader.cpp:105-108, 375-389, 548-579` — worker 方式と呼び出し側処理の違い、worker 作成失敗経路。
+- `engine/sycl/src/program/generate.cpp:507, 816, 1944, 3351-3357` — SYCL 系 parser と I/O 設定。
+- `docs/cli/README.md:1036-1041, 1169-1175` — `strata-engine` の root scope と対象リンク（索引のみ。動作説明の根拠には使用していません）。

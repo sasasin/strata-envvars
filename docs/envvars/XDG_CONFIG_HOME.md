@@ -1,53 +1,59 @@
 # `XDG_CONFIG_HOME`
 
-調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Strata のコマンドライン版と関連ツールが使う設定ファイル、保存済み接続、操作プロファイルの基準ディレクトリを指定します。また Linux のデスクトップアプリは、ユーザーの Documents フォルダー設定ファイル `user-dirs.dirs` をこのディレクトリから探します。
+Strata のターミナル版・セットアップ・接続管理・プロファイル管理が、ユーザー設定ファイルの場所を決めるために読む。Unix 系環境では、主に `${XDG_CONFIG_HOME}/strata/` を使い、未設定時は `~/.config/strata/` を使う。設定ファイルは `settings.json`、`profiles/`、`connections/` に分かれる。調査した Strata 所有コードでは、値はファイル保存先と Linux デスクトップの既定モデル場所決定に使われ、推論計算やバックエンド選択を変える用途は見つからない。
+
+デスクトップホストは別に、Linux で既定モデル場所を決める際、`user-dirs.dirs` を読むディレクトリとしてこの変数を参照する。ここでは `STRATA_MODELS_DIR` が明示されていない場合に限り、また `XDG_DOCUMENTS_DIR` が環境変数で与えられていない場合に限り参照される（`app/host/server/model-directory-default.mjs:8-25`）。
 
 ## 値と判定
 
-環境変数の値を数値やフラグとして parse する箇所はありません。各箇所は文字列をパスとして使います。多くの読み取り箇所では未設定または空文字ならホームディレクトリ配下の `.config` に戻ります。空白の除去、絶対パス検査、正規化は共通には行われません。
+この変数を真偽値や数値として parse する実装はない。値はディレクトリパス文字列として使われ、内容の形式、大文字小文字、空白、数値らしさは検証されない。`0`、`true`、`false` もパス文字列として扱われる。大半の読み取り箇所では未設定と空文字のどちらも既定値に戻るが、プロファイル保存先では空文字が既定値にならない。
 
-| 読み取り経路 | 未設定時 | 空文字 | 非空文字 |
+| 読み取り経路 | unset | 空文字 | 非空値の扱い |
 |---|---|---|---|
-| setup の設定ファイル、`strata_control.discovery`、接続ファイル、MCP ツール、Terminal の共有設定ファイル | `~/.config` を使う | `~/.config` を使う | その値を設定ルートとして使う |
-| `strata_control.profiles.profile_dir()` | `~/.config` を使う | 値が設定済みとして扱われ、相対パス `strata/profiles` になる | その値を設定ルートとして使う |
-| Linux アプリの Documents 検出 | `~/.config/user-dirs.dirs` を読む | 同じく `~/.config/user-dirs.dirs` を読む | `<値>/user-dirs.dirs` を読む |
+| Unix 系の `settings.json`（セットアップ、設定探索、MCP ツール、デスクトップホストがターミナル設定を探す場合） | `~/.config/strata/settings.json` | 同じ既定値 | `<値>/strata/settings.json` |
+| Unix 系の接続保存先 | `~/.config/strata/connections` | 同じ既定値 | `<値>/strata/connections` |
+| Unix 系のプロファイル保存先 | `~/.config/strata/profiles` | `strata/profiles`（相対パス） | `<値>/strata/profiles` |
+| Linux デスクトップの Documents 設定探索 | `<home>/.config/user-dirs.dirs` を読む | `<home>/.config/user-dirs.dirs` を読む | `<値>/user-dirs.dirs` を読む |
 
-Python の多くの経路は `os.environ.get("XDG_CONFIG_HOME") or ...`、Node.js の経路は `env.XDG_CONFIG_HOME || ...` です。一方、プロファイル保存先だけは `os.environ.get("XDG_CONFIG_HOME", 既定値)` なので、空文字の場合の結果が異なります。非空の相対パスは拒否されず、プロセスの作業ディレクトリからの相対パスになります。
+根拠は `terminal/strata_control/discovery.py:126-134`、`terminal/setup.py:7276-7289`、`terminal/tools/strata_mcp.py:780-785`、`terminal/strata_cli/connections.py:72-90`、`terminal/strata_control/profiles.py:38-46`、`app/host/server/model-folder.mjs:67-72`、`app/host/server/model-directory-default.mjs:14-25`。Python の `or` と JavaScript の `||` を使う箇所は空文字を fallback させる一方、`profiles.py` は `os.environ.get(name, default)` なので、設定済みの空文字をそのまま `Path` に渡す。
+
+パスの絶対性や `~` 展開を `XDG_CONFIG_HOME` 自体に対して検証・実行する共通処理はない。相対値は相対パスとして後続処理に渡る。たとえば接続保存先では `STRATA_CONNECTION_DIR` が非空ならそちらが先に使われ、相対値はエラーになるが、これは XDG 値の検証ではない（`terminal/strata_cli/connections.py:72-90`）。
 
 ## 有効になる条件
 
-- Windows では、設定ファイルや接続・プロファイルの基準ディレクトリに `APPDATA` が使われ、この変数はその経路で参照されません。
-- `setup.py` の `STRATA_SETTINGS_FILE` が非空なら、設定ファイルはそのパスになり、`XDG_CONFIG_HOME` より優先します。`strata_control.discovery` も同様に `STRATA_SETTINGS_FILE` を優先します。
-- 接続情報では非空の `STRATA_CONNECTION_DIR` が優先し、プロファイルでは非空の `STRATA_PROFILE_DIR` が優先します。操作プリセットは非空の `STRATA_PRESET_DIR`、Terminal の launch preset は非空の `STRATA_LAUNCH_PRESET_DIR` がそれぞれ優先します。
-- アプリの Terminal 共有用設定ファイルは非空の `STRATA_TERMINAL_SETTINGS_FILE` を優先します。
-- Linux アプリの新規モデル保存先決定では、`STRATA_MODELS_DIR` があれば先に採用し、次に `STRATA_DOCUMENTS_DIR`、その次に `XDG_DOCUMENTS_DIR` を見ます。これらがない場合に限り、`XDG_CONFIG_HOME` を使って `user-dirs.dirs` を探します。このファイルから読んだ Documents 値は `$HOME` を展開し、絶対パスで、他の `$` 参照を含まない場合に採用します。ファイルを読めない、該当値がない、値が不正な場合はホーム直下の `Documents/Strata/Models` に戻ります（`apps/host/server/model-directory-default.mjs:8-19`）。
+- `os.name != "nt"` / `platform !== "win32"` の設定パス分岐で使われる。Windows では設定ファイル・接続・プロファイルの場所は `APPDATA` または `~/AppData/Roaming` が優先され、この変数は参照されない（`terminal/strata_control/discovery.py:126-134`、`terminal/strata_control/profiles.py:38-45`、`terminal/strata_cli/connections.py:72-82`、`terminal/setup.py:7283-7289`、`app/host/server/model-folder.mjs:67-72`）。
+- `STRATA_SETTINGS_FILE` が非空なら、セットアップ、設定探索、MCP ツールの設定ファイルでは、その明示パスが XDG の場所に優先する。デスクトップホストがターミナル設定を探す関数では別名 `STRATA_TERMINAL_SETTINGS_FILE` が優先する（`terminal/strata_control/discovery.py:126-134`、`terminal/setup.py:7276-7289`、`terminal/tools/strata_mcp.py:780-785`、`app/host/server/model-folder.mjs:67-72`）。
+- `STRATA_PROFILE_DIR` が非空ならプロファイル保存先を置き換える（`terminal/strata_control/profiles.py:38-45`）。`STRATA_CONNECTION_DIR` が非空なら接続保存先を置き換え、絶対パスでない場合は `ConnectionError` になる（`terminal/strata_cli/connections.py:72-82`）。
+- セットアップの設定ファイルを読む `discovery.places()` は、`STRATA_INSTALL_DIR` が明示されるとその場所だけを候補にして早期 return するため、XDG 配下の「記憶済み install」探索には進まない（`terminal/strata_control/discovery.py:174-192`）。XDG は候補の優先順位を直接変えず、その候補となる `settings.json` の場所を選ぶ。
+- Linux デスクトップの既定モデル場所に限り、`STRATA_MODELS_DIR` が非空ならそのパスを返し、`XDG_CONFIG_HOME` は読まれない。次に `XDG_DOCUMENTS_DIR` が非空ならそれを Documents とし、これも XDG 設定ファイルより優先する（`app/host/server/model-directory-default.mjs:8-25`）。この `documentsFolder()` 分岐は Linux 以外では `user-dirs.dirs` を読まない。
+- デスクトップホストの既定モデル場所は `app/host/server/store.mjs` のモジュール評価時に `DEFAULT_MODELS_DIRECTORY` として一度計算される。従ってそのプロセス内で後から環境を変更しても、この既定値は再計算されない。保存済みモデル場所は優先され、既定場所が使えない場合には `STRATA_HOME/models` に fallback する（`app/host/server/store.mjs:62-85`）。
 
 ## 実行時の詳細
 
-コマンドライン版 `setup.py` は、他の設定ファイル指定がない非 Windows 環境で `<XDG_CONFIG_HOME>/strata/settings.json` を使います。読み込みに失敗すると空の設定として扱い、保存時は親ディレクトリを作成して JSON を書きます。ここに保存された `data_dir` は setup と Terminal が共有するモデルデータ場所の選択に使われます（`setup.py:5995-6025`, `strata_control/discovery.py:123-131,241-280`）。アプリ内プロセスは `STRATA_SETTINGS_FILE` でアプリ専用ファイルを指定し、古いコマンドライン版のファイルをそのまま設定ファイルとして使わない設計です。
+- `terminal/strata_control/discovery.py:126-134` の `own_settings_file()` は、`STRATA_SETTINGS_FILE`、Windows の `APPDATA`、それ以外の `XDG_CONFIG_HOME` の順で設定ファイルを決める。`places()` はこのファイルから過去の install 一覧を読み、見つかった install の設定候補に加える（`terminal/strata_control/discovery.py:174-208`）。`strata_control/models.py:49-59` も同じ helper を通じて記憶済み install を読む。
+- `terminal/setup.py:7283-7306` は同じ優先順位で `settings.json` を決め、`data_dir` などを読み書きする。保存できない場合は `could not save {path} ({error})` の警告を出す。設定の読み込み失敗は空の設定として扱う（`terminal/setup.py:7292-7306`）。
+- `terminal/tools/strata_mcp.py:780-800` は同じ設定場所から `data_dir` を読み、無効・欠落時には `self.root.parent / "Strata-data"` を使う。これはMCPツール側の許可ルート判定に使う。
+- `terminal/strata_cli/connections.py:72-90` は接続保存先を `connection_dir()` の呼び出しごとに計算する。ディレクトリ作成または既存のディレクトリ・ファイルの所有者や権限に問題があれば `ConnectionError`（コード 5）になり、一覧取得時に不正な接続記録はエラー項目として返る（`terminal/strata_cli/connections.py:149-164`）。
+- `terminal/strata_control/profiles.py:38-55` はプロファイル保存先を関数呼び出しごとに計算する。保存先はプロファイル・履歴・編集用一時ファイルの場所になる。環境変数の値をプロセス開始時に静的 cache する実装は見つからない。
+- デスクトップホストの `terminalSettingsFile()` は、packaged アプリが `shareDataFolder()` でターミナル設定とモデル場所を同期するときに使われる。同期は packaged 条件下で行われ、失敗は catch されアプリ起動を止めない（`app/host/server/model-folder.mjs:67-72`、`app/host/server/native-control.mjs:186-189`）。
+- Linux の `user-dirs.dirs` では、`XDG_DOCUMENTS_DIR="..."` という行に一致する値を取り出し、`$HOME` / `${HOME}` を home に置換する。置換後に他の `$` が残るか、絶対パスでなければ `<home>/Documents` に戻す。ファイル読み込み失敗も握りつぶす。モデル場所はその Documents に `Strata/Models` を加えたパスである（`app/host/server/model-directory-default.mjs:14-25`）。
 
-非 Windows の接続情報は `<XDG_CONFIG_HOME>/strata/connections/<名前>.json` に保存・列挙されます。設定ディレクトリを作る際はプライベートなディレクトリとして作成し、既存ディレクトリやファイルの所有者・権限なども検査します（`strata_cli/connections.py:72-95,130-164,190-218`）。
+## ログと測定値
 
-プロファイルは `<XDG_CONFIG_HOME>/strata/profiles/<名前>.json` に置かれ、編集履歴は同じ場所の `.history/<名前>/` 以下に置かれます。保存・編集・ロールバック時に `profile_dir()` を呼び直すため、Python プロセスではこの環境変数を各呼び出し時に参照します（`strata_control/profiles.py:38-55,169-189,270-295,312-357`）。プリセットや Terminal の launch preset もそれぞれプロファイルディレクトリの隣を基準にするため、個別の override がなければこの変数の影響を受けます（`strata_control/presets.py:45-50`, `strata_cli/launch/store.py:32`）。
-
-`tools/strata_mcp.py` も非 Windows では同じ `strata/settings.json` を参照します（`tools/strata_mcp.py:594-608`）。デスクトップアプリの Terminal 共有処理は `terminalSettingsFile()` の呼び出し時に環境を参照します（`apps/host/server/model-folder.mjs:67-72`, `apps/host/server/native-control.mjs:94`）。これに対し、Linux の `user-dirs.dirs` を使ったモデル既定フォルダーの計算結果は `apps/host/server/store.mjs` のモジュール読み込み時に定数へ保存されるため、読み込み後に `process.env` を変更しても再計算されません（`apps/host/server/store.mjs:60-61`）。
-
-## 文書との照合
-
-`docs/TERMINAL.md` は接続ファイルとプロファイルの Unix 側保存先として `${XDG_CONFIG_HOME:-~/.config}/strata/...` を説明しており、コードと一致します（同ファイル `:44,156`）。`docs/DETAILS.md:1102` は Linux の標準設定ファイル位置を `~/.config/strata/settings.json` と記していますが、これは変数未設定時の既定値です。コードでは `XDG_CONFIG_HOME` が設定されていればその値が使われます。
+`XDG_CONFIG_HOME` の値だけを記録する専用ログはない。通常は選ばれた場所が設定ファイルや保存先に反映される。セットアップの設定保存に失敗したときだけ、選んだパスと OS エラーを含む `could not save ...` 警告が出る（`terminal/setup.py:7299-7306`）。packaged デスクトップホストのモデル場所同期エラーは握りつぶされる（`app/host/server/native-control.mjs:188-189`）。資料に本変数の性能測定値はない。
 
 ## 根拠
 
-- `setup.py:5995-6025` — `STRATA_SETTINGS_FILE` の優先と設定ファイルの読み書き。
-- `strata_control/discovery.py:123-131,241-280` — Terminal 側の設定ファイル選択と、アプリとのデータディレクトリ同期。
-- `strata_cli/connections.py:72-95,130-164,190-218` — 接続ディレクトリ、列挙、権限検査、ロック。
-- `strata_control/profiles.py:38-55,169-189,270-295,312-357` — プロファイル本体、保存履歴、編集用一時ファイル。
-- `strata_control/presets.py:45-50`, `strata_cli/launch/store.py:32` — プロファイルに隣接するプリセット保存場所。
-- `tools/strata_mcp.py:594-608` — MCP ツールの設定ファイル選択。
-- `apps/host/server/model-folder.mjs:67-72`, `apps/host/server/native-control.mjs:94` — アプリと Terminal 間の設定共有。
-- `apps/host/server/model-directory-default.mjs:8-19`, `apps/host/server/store.mjs:60-61` — Linux の Documents 設定ファイル探索と、その結果を既定値に使う時期。
-- `docs/TERMINAL.md:44,156`, `docs/DETAILS.md:1102` — 保存先についての既存説明。
+- `terminal/strata_control/discovery.py:126-134,174-208,258-290` — 設定ファイル選択と設定・記憶済み install の探索。
+- `terminal/strata_control/models.py:49-59` — 同じ設定ファイルからの記憶済み install 読み取り。
+- `terminal/setup.py:7276-7306` — 設定ファイル選択、読込、保存と警告。
+- `terminal/tools/strata_mcp.py:780-800` — 設定ファイル選択とデータ場所の許可判定。
+- `terminal/strata_control/profiles.py:38-55` — プロファイル保存先。
+- `terminal/strata_cli/connections.py:72-90,149-164` — 接続保存先と不正状態の扱い。
+- `app/host/server/model-folder.mjs:67-72`、`app/host/server/native-control.mjs:186-189` — デスクトップホストからターミナル設定を参照する条件。
+- `app/host/server/model-directory-default.mjs:8-25`、`app/host/server/store.mjs:62-85` — Linux の XDG user directories 読み取りとモデル既定場所への反映。
+- `docs/TERMINAL.md:55,167` は接続・プロファイル保存先を説明する。`docs/DETAILS.md:1540` は `~/.config` を例示するが、現行コードでは非 Windows 環境で `XDG_CONFIG_HOME` を使って置き換えられる。

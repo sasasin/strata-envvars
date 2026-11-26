@@ -1,6 +1,6 @@
-# `--output`
+# `strata update --output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,45 +12,46 @@
 
 ## 役割
 
-更新確認・更新処理の出力形式を選びます。`--output` は `strata update` と `strata components update` / `strata components rollback` に共通の parser helper で登録されますが、この文書の対象は索引上の別スコープである `strata update` です。
+更新確認・更新処理の表示形式を選びます。`human` は人向けの進捗や結果、`json` は進捗イベントを出さず処理結果を JSON で出力し、`jsonl` は更新中のイベントを 1 行ずつ JSON Lines 形式で出力した後、最終結果も JSON で出力します。
 
 ## 使い方
 
 ```sh
+# 更新内容だけを確認し、機械可読な JSON を受け取る
 strata update --check --output json
-```
 
-署名付き更新 feed を読み取り、変更候補を JSON で出力します。更新のダウンロードは行いません（`strata_cli/update_cmd.py:203-209`）。
+# 更新を実行し、イベントと最終結果を JSON Lines で受け取る
+strata update --yes --output jsonl
+```
 
 ## 値と既定値
 
-- 省略時は `human` です。
-- `human` は通常の人向け表示、`json` は一回の結果を JSON で出力、`jsonl` は処理中イベントを JSON Lines 形式で出力します。
-- `argparse` の `choices` により、他の値は受理されません。値を省略した場合も parser の usage error になります（`strata_cli/update_cmd.py:30-40`）。
-- `argparse` の通常の単一値引数であり、複数回指定時は最後に指定した値が採用されます。
+値は `human`、`json`、`jsonl` の固定選択肢で、省略時は `human` です。別名や値の大文字小文字変換は定義されていません。別の値や値なしは argparse の引数エラーとなり、更新処理には進みません（`terminal/strata_cli/update_cmd.py:47-57`）。
 
 ## 実行時の動作
 
-- `human` では更新元を示す見出し、結果概要を出力します。ダウンロード進捗は TTY では同じ行を更新し、非 TTY では進捗が 10 ポイント以上進んだ時または完了時に出力します。ダウンロード以外の phase と待機メッセージも表示します（`strata_cli/update_cmd.py:62-84, 211-224`）。
-- `json` と `jsonl` はどちらも machine output として扱われ、人向けの進捗・phase 表示を抑制します。`json` は `--check` の report、または更新処理の結果全体を `schema_version` と `ok` を含む JSON で出力します（`strata_cli/update_cmd.py:63-71, 203-215`）。
-- `jsonl` は updater が通知するイベントごとに `{"schema_version": 1, ...}` を stdout に1行ずつ flush し、処理終了時には最終結果 JSON も出力します。したがって最後の行はイベント行と同じ形とは限らず、機械処理側はイベントと結果を区別する必要があります（`strata_cli/update_cmd.py:62-69, 213-215`）。
-- `--json` は共通 one-shot parser 群に後付けされるフラグで、指定時は `--output json` 相当に `a.output` を変更します。`--output jsonl --json` の組合せは one-shot 出力との不整合として拒否されます（`strata_cli/cli.py:510-515, 2232-2235`）。
-- `--quiet` も共通 parser で追加されます。`--output human --quiet` では stdout を一時捕捉し、処理が失敗した場合は捕捉した出力を stderr に返します。machine output は quiet の分岐を通らず、JSON/JSONL をそのまま出します（`strata_cli/cli.py:512-515, 2236-2248`）。
+- `human` では更新開始表示、更新中の進捗・段階表示、完了結果を人向けに表示します。ダウンロード進捗は TTY なら同じ行を更新し、TTY 以外では概ね 10% 刻みと完了時に表示します（`terminal/strata_cli/update_cmd.py:117-139, 368-377`）。
+- `json` は進捗イベントを抑止し、処理後に `schema_version: 1` と `ok` を含む結果オブジェクトを標準出力へ出します。`--check` の場合は確認レポートを同様に出力します（`terminal/strata_cli/update_cmd.py:117-126, 361-377`）。
+- `jsonl` は進捗・段階・モデル状態のイベントごとに、`schema_version: 1` を付けた JSON を 1 行出力して flush します。通常処理の最後には `ok` を含む結果オブジェクトも出力します（`terminal/strata_cli/update_cmd.py:121-139, 371-377`; `terminal/strata_control/updater.py:391, 435, 586`; `terminal/strata_control/engine_update.py:309, 347, 355, 388, 390, 398`）。
+- `--check` は機械出力モード（`json` または `jsonl`）でもイベント列ではなく、確認レポート 1 個を出します（`terminal/strata_cli/update_cmd.py:361-367`）。
+- 機械出力モードでは、実行中モデルを止めるかの対話確認を行わず、確認用コールバックも出力しません。`--yes` と同様に質問を省く動作ですが、`--output` 自体がモデル停止を許可するわけではありません。モデルを停止して更新するには別途 `--stop-model` が必要です（`terminal/strata_cli/update_cmd.py:404-421`）。
+- `strata update` parser には `--json` alias はありません。CLI の `--json` 一括処理は `update` を対象外としているため、このコマンドでは `--output` を指定します（`terminal/strata_cli/update_cmd.py:60-69`; `terminal/strata_cli/cli.py:2335-2338`）。
 
 ## 適用条件と副作用
 
-このオプションは出力表現を変えます。更新対象の選択や更新処理自体は `--output` では変わりません。更新処理は `strata_cli/update_cmd.py:213-224` で `updater.run_update(...)` に進みます。`--output jsonl` はイベントを逐次 stdout に書き出すため、stdout は純粋な最終結果 JSON だけにはなりません。
+出力形式の選択は更新対象や更新可否を変えません。通常の `strata update` は署名済み feed を読み、必要に応じてネットワーク取得・検証・エンジン切替を行います。`--output` はファイルを指定せず、標準出力への表示方法を変えます（`terminal/strata_cli/update_cmd.py:355-377`）。
+
+機械出力モードではプロンプトが無効になるため、TTY で実行した場合も対話的なモデル停止確認には進みません。エラーは `json` / `jsonl` では `schema_version`、`ok: false`、`error` を含む JSON を標準出力へ出し、人向けモードでは `strata: ...` を標準エラーへ出します。返される終了コードは失敗の種類に応じます（`terminal/strata_cli/update_cmd.py:307-316, 378-390`）。
 
 ## 出力とエラー
 
-- 更新処理内で捕捉される `UpdateError`、`FeedError`、署名エラー、取得拒否、割り込みは、`human` なら `strata: ...` を stderr に出し、`json` / `jsonl` なら `schema_version`、`ok: false`、エラーコードとメッセージを含む JSON を stdout に出します。終了コードは例外側のコードを使い、署名エラーと取得拒否は 5、割り込みは 130 です（`strata_cli/update_cmd.py:163-172, 225-234`）。
-- 無効な format 値など parser 段階の引数エラーは `argparse` の usage error です。個別の `--output` 値検証用処理はなく、受理値は parser の choices で制限されます（`strata_cli/update_cmd.py:39`）。
-- `jsonl` の処理中に出すイベントは stdout に即時 flush されます（`strata_cli/update_cmd.py:66-69`）。
+選択肢外の値は argparse が拒否し、usage とエラーを表示して終了コード 2 となります（parser 登録: `terminal/strata_cli/update_cmd.py:56`; CLI の引数解析: `terminal/strata_cli/cli.py:2325-2334`）。処理中の feed・署名・取得拒否・中断などの例外は、機械出力なら JSON エラー、人向けなら標準エラーに変換されます。中断時の終了コードは 130 で、部分ダウンロードは次回に再開できる旨をエラーに含めます（`terminal/strata_cli/update_cmd.py:311-316, 378-390`）。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:30-59` — `--output` の choices・既定値と、トップレベル `update` / `components update` への共通登録。
-- `strata_cli/update_cmd.py:62-84, 163-234` — 出力形式別の進捗・結果・失敗経路。
-- `strata_cli/cli.py:510-515, 2135-2137, 2232-2248` — 共通 `--json` / `--quiet` の追加、update handler への委譲、quiet 出力処理。
-- `docs/cli/README.md:244-262` — `strata update` の索引上のコマンド階層と `--output` の掲載。
-- `docs/cli/001_investigation.md:62-69, 73-76` — revision 記録、parser と使用箇所の調査、文書作成基準。
+- `terminal/strata_cli/update_cmd.py:47-57` — `--output` の parser 定義、選択肢、既定値。
+- `terminal/strata_cli/update_cmd.py:117-139` — 人向け進捗と JSONL イベントの生成、機械出力時の進捗抑止。
+- `terminal/strata_cli/update_cmd.py:307-390` — 出力モード判定、確認・更新結果、エラー変換と終了コード。
+- `terminal/strata_cli/update_cmd.py:404-421` — 機械出力時の対話確認抑止とモデル停止許可の分離。
+- `terminal/strata_control/updater.py:391, 435, 586`、`terminal/strata_control/engine_update.py:309, 347, 355, 388, 390, 398` — 更新中に送られる待機・段階・進捗・モデル状態イベント。
+- `terminal/strata_cli/cli.py:2325-2338` — argparse による引数処理と `--json` の適用対象。

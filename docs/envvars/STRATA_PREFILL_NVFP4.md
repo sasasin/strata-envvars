@@ -1,50 +1,56 @@
 # `STRATA_PREFILL_NVFP4`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。作業ツリーは clean。Strata 所有ソースを対象とし、外部ライブラリ内部の動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の batched prompt prefill で、NVFP4 量子化された MoE expert の gate/up・down 積に使う MMQ 精度を選びます。既定の `w4a8` は NVFP4 重みと Q8_1 活性値を使い、`w4a4` は重みと活性値の両方を NVFP4 にして Blackwell FP4 MMA を使います。`fp16` は NVFP4 重みを MMQ 対象から外し、FP16 の経路を使わせます。
+NVFP4 の MoE expert を含む prompt prefill で、Strata の fused expert 経路が使う活性値の精度・計算経路を選ぶ。現在のソースでは `w4a4` は Blackwell の Strata 所有 mxf4nvf4 kernel、未設定・空・`w4a8` は fused W4A8（int8 tensor core、Q8_1 活性値）、その他の明示値は legacy MMQ または FP16 経路に振り分ける（`engine/include/strata/prefill/nvfp4_prefill_mode.hpp:27-53`）。実際に prompt の NVFP4/NVFP4 expert pair を fused 経路へ載せるには `STRATA_PF_FUSED` の判定と、device・layer 条件も満たす必要がある（`engine/src/prefill/moe_fused_iq.cu:3415-3432,3465-3489`）。decode の計算方法はこの分岐の対象ではない。
 
-この変数は通常の decode 精度を選ぶものではなく、NVFP4 以外の重み形式にも影響しません。設定は最初の NVFP4 mode 判定時に `static` 変数へ保存され、そのプロセス内では以後再読込されません。
+`docs/NVFP4.md` の MMQ 用 `w4a4` / `w4a4x2` 表は、この checkout の Strata 所有実装の説明とは一致しない。同ファイルは MMQ kernel を前提に記述している一方、現行 CUDA/HIP の own-kernel target は `mmq_absent.cpp` をリンクし、W4A4 は `moe_fp4_tc.cu` の Strata kernel として実装されている（`engine/cmake/backends/cuda.cmake:94-136`、`engine/cmake/backends/hip.cmake:30-46`）。ここでは現行コードの分岐だけを記す。
 
 ## 値と判定
 
-値は `strcmp` による文字列全体の完全一致で判定します。trim、大小文字変換、数値変換はありません。
+CUDA の共通 resolver は文字列全体を大文字小文字を区別して比較する。数値変換、trim、prefix 判定はしない。未設定・空文字・完全一致の `w4a8` は W4A8、完全一致の `w4a4` は条件付き W4A4、それ以外の明示値は `LegacyMmqOrF16` を選ぶ（`engine/include/strata/prefill/nvfp4_prefill_mode.hpp:27-46`）。現在の own-kernel build は MMQ を含まないため、legacy 側は prompt planner の FP16 path となる（`engine/src/prefill/mmq_absent.cpp:1-23`、`engine/src/prefill/prefill.cpp:399-404`）。
 
-| 値 | NVFP4 の MMQ 判定・活性値 |
-|---|---|
-| unset | `w4a8`。Q8_1 活性値を使う既定経路 |
-| `w4a8` | `w4a8` |
-| `w4a4` | W4A4 が実行可能なら FP4 活性値。実行できなければ警告して W4A8 に fallback |
-| `fp16` | NVFP4 は `supported()` が false となり、MMQ を使わない |
-| 空文字、`W4A8`、前後に空白がある値、`w4a4x2` など | `stderr` に `STRATA_PREFILL_NVFP4=<値>: expected w4a8, w4a4 or fp16` を出して `exit(1)` |
+| 条件 | unset / 空文字 | 有効値 | 無効値・結果 |
+| --- | --- | --- | --- |
+| CUDA resolver。モデルに `<stem>.input_scale` があり、native FP4 kernel が利用可能 | W4A8 | `w4a4` → W4A4、`w4a8` → W4A8 | `fp16`、`w4a4x2`、`W4A4`、空白付きなど → legacy MMQ/FP16 |
+| CUDA resolver。`w4a4` だがモデル scale がない | W4A8 | `w4a4` → lossless W4A8 へ degrade | 上と同じ。scale 不足は W4A8 へ degrade しない別条件 |
+| CUDA resolver。`w4a4` だが native FP4 kernel が利用不能 | W4A8 | `w4a4` → MMQ が build にあれば legacy MMQ/FP16、なければ W4A8 へ degrade | その他の明示値 → legacy MMQ/FP16 |
+| HIP の fused NVFP4 pair | unset・空・`w4a8` のみ fused W4A8 判定を通る | 完全一致 `w4a8` | `w4a4` を含む他の明示値は fused NVFP4 pair の条件を満たさない（`engine/src/prefill/moe_fused_iq.cu:3555-3559`） |
 
-ただし値を読むのは NVFP4 type の判定時です。NVFP4 重みがない場合、また `STRATA_PREFILL_MMQ=0` で MMQ plan が NVFP4 type を検査しない場合は、この parser が呼ばれず、不正値でもこのエラーが出ない経路があります。MMQ plan 自体も初回評価後に cache されます。
-
-根拠: `src/prefill/moe_mmq.cu:188-198,200-221`; `src/prefill/prefill.cpp:1012-1038`。
+`getenv(...) != nullptr` は空文字も「設定済み」として扱うため、起動時の GPU 既定値適用では空文字を含む利用者の値を上書きしない（`engine/src/core/nv_defaults.cpp:222-234`）。resolver 自体では空文字は未設定と同じ W4A8 である。
 
 ## 有効になる条件
 
-- NVFP4 mode は CUDA MMQ にだけ実装されています。`GGML_USE_HIP` では `supported()` の NVFP4 case と NVFP4 の dispatch が compile-time で除外され、`fp4_activations()` も常に false を返します。
-- MMQ は build に含まれ、prefill が MMQ を選ぶ必要があります。`STRATA_PREFILL_MMQ=0` は MMQ plan を無効化し、既定では環境変数 unset の場合に有効です。MMQ が使われない経路ではこの設定は prefill の積の選択に作用しません。
-- `fp16` を選ぶと NVFP4 type は MMQ 非対応になります。資料ではこの mode を dequantize + cuBLAS FP16 GEMM と説明しています。実際の layer ごとの最終経路は他の prefill 条件にも依存します。
-- `w4a4` は実行時 probe が成功した場合に限り選ばれます。CMake は W4A4 専用 unit を CUDA architectures の 12x 対象から `12xa` に変換して build します。device code を実行できない GPU/build の組み合わせでは W4A8 に fallback します。W4A8 は通常の MMQ unit で動き、W4A4 と同じ arch-specific unit を必要としません。
-
-根拠: `src/prefill/moe_mmq.cu:200-221,281-294`; `src/prefill/prefill.cpp:1012-1035`; `CMakeLists.txt:1442-1457`; `src/prefill/mmq_nvfp4_w4a4.cu:22-46`。
+- CUDA の `w4a4` native kernel は CUDA compiler 13.0 以上で、build の CUDA architecture list に 120 または 121 が含まれる場合にだけ target に組み込まれる。実行時にも現在の device が compute capability 12.0/12.1 で、shape と kernel occupancy の検査を通る必要がある（`engine/cmake/backends/cuda.cmake:97-130`、`engine/src/prefill/moe_fp4_tc.cu:497-537`）。
+- 対象 expert pair は gate/up と down の両方が NVFP4 で、native pack の fused prompt 経路が選ばれる場合。mixed pair は対象外。CUDA の NVFP4 pair 判定は `STRATA_PF_FUSED` の effective 値が `1` の場合だけ通る。未設定でも MMQ なし build は pre-main 初期化で `1` を入れるが、既に設定済みの値は保持する。さらに native kernel の device/layer 条件、非 warp-specialized 等の制約がある（`engine/src/prefill/moe_fused_iq.cu:3415-3432,3465-3489`、`engine/src/prefill/prefill.cpp:223-255`）。
+- `w4a4` ではロード済みモデルの対象 NVFP4 expert に `<stem>.input_scale` が必要。`--native` のモデル走査で対象 tensor の scale 欠落が一つでも見つかると、モデル全体の `fp4_tc::wanted()` は W4A4 を選ばず W4A8 に degrade する（`engine/src/program/generate.cpp:5135-5149`、`engine/src/prefill/moe_fp4_tc.cu:543-568`）。
+- CUDA 起動時の自動既定値は、可視 device がすべて同じ compute capability の場合に適用される。compute capability 12.0 / 12.1 の既定表はそれぞれ `STRATA_SM120_PERF=0` / `STRATA_SM121_PERF=0`、または `STRATA_DEFAULTS=026` で外れる。利用者が `STRATA_PREFILL_NVFP4` を何らかの値で設定していれば既定値 `w4a4` は追加されない（`engine/src/program/generate.cpp:4421-4449`、`engine/src/core/nv_defaults.cpp:104-129,176-214,222-234`）。
+- 同一 compute capability でない複数 CUDA device では上記の GPU 既定表は適用されない。明示値は残るが、native kernel の可用性は呼出し中の device ごとに判定される（`engine/src/program/generate.cpp:4428-4469`、`engine/src/prefill/moe_fp4_tc.cu:497-537`）。
+- HIP には FP4 tensor-core target の absent stub が入り、`fp4_tc::available()` / `wanted()` は false。HIP の NVFP4 fused pair 判定は unset・空・`w4a8` のみを受け付ける（`engine/cmake/backends/hip.cmake:32-46`、`engine/src/prefill/moe_fp4_tc_absent.cpp:10-16`、`engine/src/prefill/moe_fused_iq.cu:3555-3559`）。
 
 ## 実行時の詳細
 
-`mmq_plan()` が layer の weight type を調べると `mmq::fits()` から `supported()` が呼ばれ、NVFP4 type の場合に mode が決まります。`FP16` mode では `supported()` が false を返すため、その type は MMQ layer として plan されません。`W4A8` / `W4A4` は他の MMQ 対応条件（全 visible GPU に適合する tile があること等）を満たせば MMQ 対象になります。tile 条件を満たさない場合は既存の別経路に回ります。
+CUDA の NVFP4 W4A4 kernel が組み込まれている場合、`fp4_tc::wanted()` は利用可能 device を確認してから `std::getenv("STRATA_PREFILL_NVFP4")` を resolver に渡す。環境値自体はこの関数呼び出しごとに読み直され、関数内に値の static cache はない。一方、device 可用性は device ごとの `DevState` に cache される（`engine/src/prefill/moe_fp4_tc.cu:497-558`）。model の scale 有無は `--native` ロード時に設定される（`engine/src/program/generate.cpp:5135-5149`）。
 
-`W4A4` が選ばれた場合、初回の `fp4_activations()` で `w4a4_available()` を一度 probe します。probe は device buffer を確保して W4A4 unit の kernel を起動し、その結果を host に読み戻します。失敗時は `prefill mmq: STRATA_PREFILL_NVFP4=w4a4 needs an sm_12x card in a 12x build; W4A8` を stderr に出し、false を cache します。続く quantize と積の dispatch は Q8_1 活性値および W4A8 kernel を使います。成功時は NVFP4 活性値を量子化し、W4A4 kernel に dispatch します。gate/up の積、SwiGLU、down の積それぞれに同じ mode 判定が使われます。
+W4A4 が選ばれると、prompt prefill は活性値を NVFP4 に量子化し、Blackwell mxf4nvf4 tensor-core kernel を用いる。prefill の fused layer walk は gate/up と down の NVFP4 pair かつ `fp4_tc::wanted()` のときだけ `fp4_nat` として扱い、該当 kernel の利用ログを一度出す（`engine/src/prefill/prefill.cpp:5740-5766`）。同じ `wanted()` 判定は staged group と layer-major の prompt 経路にも使われる（`engine/src/prefill/prefill.cpp:6423-6441,8843-8850`）。
 
-同梱診断ツール `mmq_expert_bench` と `mmq_nvfp4_parity` も環境値を表示し、`fp4_activations()` を通じて同じ mode/probe を使います。parity tool の `--group`、`--real`、`--layers` 分岐は mode 表示より前に return するため、それらの分岐では直接の mode 表示・評価を行いません。
+W4A8 / W4A4 以外の値では fused NVFP4 pair を選ばず、現行 own-kernel build では MMQ がないため planner が FP16 経路を選ぶ。HIP の `mode_ok` は関数内 `static` で初回判定を cache する。CUDA の `native_supported()` も `STRATA_PF_FUSED` を static に読み取るが、対象の `STRATA_PREFILL_NVFP4` はその関数内では毎回 resolver に渡される（`engine/src/prefill/moe_fused_iq.cu:3425-3428,3475-3489,3555-3559`）。
 
-根拠: `src/prefill/prefill.cpp:1012-1038,3873-3929`; `src/prefill/moe_mmq.cu:281-325,373-377`; `src/prefill/mmq_nvfp4_w4a4.cu:34-52`; `src/prefill/mmq_expert_bench.cpp:108-115`; `src/prefill/mmq_nvfp4_parity.cpp:328-345`。
+## ログと測定値
 
-## 文書との照合
+- `w4a4` が要求されたが native Blackwell FP4 kernel を build/device で使えず、W4A8 に degrade する場合、stderr に `strata: STRATA_PREFILL_NVFP4=w4a4 requested, but native Blackwell FP4 tensor-core prompt kernels are not active on this device/build; staying on fused W4A8 tensor cores instead of falling back to FP16 cuBLAS` を一度出す（`engine/src/prefill/moe_fused_iq.cu:3478-3485`）。
+- 対象 model に `<stem>.input_scale` がない場合、stderr に `strata: STRATA_PREFILL_NVFP4=w4a4 requested, but model lacks <stem>.input_scale; degrading to lossless W4A8 prefill.` を一度出す（`engine/src/prefill/moe_fp4_tc.cu:559-567`）。
+- W4A4 の kernel が実際に prompt layer で使われると、stderr に `strata: prompt NVFP4 experts on the Blackwell mxf4nvf4 tensor-core kernels (STRATA_PREFILL_NVFP4=w4a4)` を一度出す（`engine/src/prefill/prefill.cpp:5740-5751`）。
+- 12.0/12.1 の自動既定値が追加された場合、`apply_nv_defaults()` は stderr にカード別の「speed switches on by default」行を出し、その switch 名一覧に `PREFILL_NVFP4` を含める（`engine/src/core/nv_defaults.cpp:240-255`）。
 
-`docs/NVFP4.md:127-155` は `w4a8`、`w4a4`、`fp16` と既定値、適用経路を記述しています。同節の測定では、8 prompts（code/prose、1K–8K tokens）の first-token KL mean が W4A8 0.0018、W4A4 0.0080、FP16 基準で、4–8K prompt prefill がそれぞれ 2,503、2,904、1,905 tok/s と記されています。資料記載の測定値であり、ここで再測定した結果ではありません。
+## 根拠
 
-同じ `docs/NVFP4.md:99-103` には `STRATA_PREFILL_NVFP4=w4a4x2` の測定記述がありますが、調査対象 HEAD の parser は `w4a4x2` を受け付けず、上記エラーで終了します。この説明は現行ソースと一致しません。
+- 値解決: `engine/include/strata/prefill/nvfp4_prefill_mode.hpp:27-53`
+- native kernel build / device 条件: `engine/cmake/backends/cuda.cmake:97-130`、`engine/src/prefill/moe_fp4_tc.cu:497-568`
+- 自動既定値と利用者設定の優先: `engine/src/core/nv_defaults.cpp:104-129,176-234`、`engine/src/program/generate.cpp:4421-4449`
+- model scale の検査: `engine/src/program/generate.cpp:5135-5149`
+- fused NVFP4 条件と HIP 判定: `engine/src/prefill/moe_fused_iq.cu:3415-3432,3465-3489,3555-3559`
+- prompt dispatch と観測ログ: `engine/src/prefill/prefill.cpp:5740-5766,6423-6441,8843-8850`
+- legacy/FP16 path: `engine/cmake/backends/cuda.cmake:135-136`、`engine/src/prefill/mmq_absent.cpp:1-23`、`engine/src/prefill/prefill.cpp:399-404`

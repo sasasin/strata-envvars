@@ -1,58 +1,58 @@
 # `STRATA_SPLIT_MTP_BATCH`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。対象は Strata 所有ソース。作業開始時の Strata 作業ツリーは `main` で clean。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-`--serve` の層分割（複数 GPU）で MTP draft layer の prompt K/V を作る方法を切り替えます。有効にすると、prompt を処理した最後の stage の `Prefill::draft_kv()` がチャンク単位のバッチ処理を試します。無効または条件不足なら、従来どおり `MtpDrafter::prefill()` が処理します。単一 GPU の serve では同じバッチ経路が環境変数と無関係に計画されるため、この変数は実質的に層分割用の opt-in です。
+レイヤー分割時に、MTP drafter の prompt K/V を drafter 自身の逐次 pass で作る代わりに、最後の stage の prompt 処理 `Prefill::draft_kv` でバッチ計算する opt-in です。主な読み取りは `engine/src/program/generate.cpp` の chunk callback にあり、計算本体は `engine/src/prefill/prefill.cpp` にあります（`engine/src/program/generate.cpp:14763-14798`、`engine/src/prefill/prefill.cpp:2991-3000`）。
 
-バッチ経路では draft K/V の射影に、利用可能な場合 Q8_1 x Q8_0 MMQ を使います。従来経路と丸めが異なるため draft の内容や採用数は変わり得ます。verify window が実モデルで token を検証して出力を決める構造です。
+この切替は drafter の K/V 計算経路を変えます。通常の layer split では drafter 自身の pass が使われ、切替後にバッチ経路が成立すれば、その pass は省かれます。バッチ経路を試さない場合や辞退した場合は `mtp.prefill(...)` に戻ります。コードコメントは K/V の計算方式が異なるため draft 値が変わる可能性と、target の検証 token は変わらない旨を記しています（`engine/src/program/draft_kv_plan.hpp:3-7`）。
 
 ## 値と判定
 
-値は `split_env_on()` が `std::atoi()` で整数変換し、結果が `0` かどうかで判定します。文字列全体の厳密な数値検証ではありません。
+主経路は `std::getenv` の結果を `split_env_on` に渡し、`value != nullptr && std::atoi(value) != 0` で判定します。数値文字列全体の検証はなく、`atoi` が読む先頭の整数部分が 0 以外なら有効です。未設定と空文字は無効、符号付き整数や先頭空白の後の非ゼロ整数は有効です。`1tail` は有効、`0tail` は無効、`true` / `false` はどちらも `atoi` が 0 を返すため無効です。`-1` も 0 以外なので有効です。整数として表現できないほど大きい値の扱いはこのコードで検査されません（`engine/include/strata/program/draft_kv_plan.hpp:16-18`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | OFF |
-| 空文字、数字で始まらない文字列 | `atoi` の結果が 0 となり OFF |
-| `0`、`00suffix`、`-0` など変換結果が 0 | OFF |
-| `1`、`-1`、`2suffix` など変換結果が非 0 | ON |
+| 読み取り経路 | unset | 有効になる値の例 | 無効になる値の例 |
+| --- | --- | --- | --- |
+| MTP prompt K/V の経路選択 | 無効 | `1`, `2`, `-1`, ` 1`, `1tail`, `1.5` | 空文字, `0`, `0tail`, `true`, `false`, `off` |
+| `STRATA_PIPED_CONCURRENT` の抑止判定 | 無効 | `1`, `-1`, `1tail`, `1.5` | 空文字, `0`, `true`, `off` |
 
-`atoi` の通常の規則により、先頭空白と符号を受け付け、最初の数字列の後ろは判定に使いません（例: `  +2tail` は ON、`0tail` は OFF）。大文字小文字の比較はありません。コードは変換エラーや整数範囲外を個別に検査せず、clamp もしません。
+後者も同じ C の `atoi(...) != 0` 型判定ですが、別の制御です。値が有効でも `STRATA_PIPED_CONCURRENT` が有効でなければ、この読み取りによる抑止は発生しません（`engine/src/program/generate.cpp:21024-21046`）。
 
 ## 有効になる条件
 
-変数によるバッチ化には、serve で MTP (`--mtp`) が有効で、実際に異なる GPU を使う layer split が必要です。設定値が ON でも split の最終 stage に GGUF 形式の token embedding table がない（`--native` pack ではない）場合、計画段階で従来経路に戻ります。
-
-計画を通過した後も `Prefill::draft_kv()` が実行条件を確認します。少なくとも次のいずれかに当たる場合は理由を返して decline し、draft の従来 pass に戻ります。
-
-- `STRATA_MTP_BATCH=0`（先頭文字が `0`）でバッチ経路自体が停止されている。
-- prompt scratch がない、チャンク行数が 0 以下、または 64-row batch に足りる scratch がない。
-- draft K/V が通常の paged mode でない。ring mode は利用可能だが、`STRATA_MTP_BATCH_RING` の先頭文字が `0` なら対象外。hybrid K/V も対象外。
-- drafter と prompt stage の GPU が異なる。
-- 必要な drafter tensor が欠けている、または token embedding をこの経路で gather できない。
-
-ring の batch size は、同じ batch 内のセルが ring slot を共有しないよう制限されます。MMQ が使えない、または行列サイズに合わない場合も、この変数による全経路の失敗とはせず、`draft_kv()` 内で native GEMM を選びます。
+- prompt K/V の切替には MTP drafter が使われている必要があります。`use_mtp` が false なら plan はバッチを選びません（`engine/include/strata/program/draft_kv_plan.hpp:28-30`）。MTP は `o.mtp` が空でない場合に有効です（`engine/src/program/generate.cpp:12310-12314`）。
+- 単一 GPU では、この環境変数に関係なく plan が `Prefill::draft_kv` を試します。変数が選択条件になるのは layer split の場合です（`engine/include/strata/program/draft_kv_plan.hpp:31-41`）。
+- layer split では値が有効で、かつ drafter が first stage に置かれていない必要があります。`mtp_first` の場合、値を `plan` に渡す際に false にされるため、従来の drafter pass を使います（`engine/src/program/generate.cpp:14779-14780`）。
+- layer split の最後の stage が token embedding を参照できる native embedding を持つ必要があります。ない場合はバッチを試さず、理由を一度 stderr に出して drafter 自身の pass に戻ります（`engine/include/strata/program/draft_kv_plan.hpp:25-41`、`engine/src/program/generate.cpp:14781-14798`）。
+- `Prefill::draft_kv` が呼ばれても、`STRATA_MTP_BATCH=0`、非対応の K/V 配置（hybrid、paged/ring 以外、または `STRATA_MTP_BATCH_RING=0` の ring）、異なる device、必要 tensor や gather 可能な embedding の欠落、scratch 不足などで辞退します。辞退時は drafter 自身の pass に戻ります（`engine/src/prefill/prefill.cpp:3001-3037`、`3049-3052`）。
+- Metal 実装では `Prefill::draft_kv` が即座に辞退する実装です。SYCL 側の `engine/sycl/src/program/generate.cpp` にはこの環境変数の読み取りがありません（CUDA 系と SYCL の参照比較: `engine/src/program/generate.cpp:14766`、`engine/sycl/src/program/generate.cpp:8626`、`13369`）。
+- `STRATA_PIPED_CONCURRENT` が非ゼロで有効な場合、この変数も非ゼロなら pipelined concurrent read を使わず、「`STRATA_SPLIT_MTP_BATCH` が理由」と一度 stderr に出します。これは prompt K/V バッチ経路そのものの選択とは別の抑止条件です（`engine/src/program/generate.cpp:21024-21046`）。
 
 ## 実行時の詳細
 
-`generate.cpp` は `STRATA_SPLIT_MTP_BATCH` を `split_env_on()` に渡し、その結果と `use_mtp`、`multi_gpu`、native embedding の有無で計画を作ります。環境値の結果は関数内の `static const bool` に保存されるため、宣言に初めて到達した後の同一プロセス内の環境変更では再評価されません。要求値は起動時または初回 prompt chunk callback の設定時に反映させる必要があります。
+prompt K/V 経路の値は `generate.cpp` の関数内 `static const bool` に初期化されるため、その static 初期化に到達したプロセスで一度読み取られます。同じ変数を concurrent-read の判定でも別途 `static const bool` 初期化内から読みます。したがって、各読み取りの初期化後にプロセス環境を変更しても、その読み取り結果には反映されません（`engine/src/program/generate.cpp:14763-14780`、`21024-21046`）。
 
-層分割で有効化され、追加条件も通ると、最後の stage の `Prefill` に対し `draft_kv(mtp, R_rows, next_tokens, T, p0, ...)` を呼び、当該 chunk の draft K/V をまとめて書きます。成功時に stderr へ `strata serve: draft layer prompt K/V batched on CUDA%d (E-9 on the layer split, K/V mode %d)` を一度出します。計画または `draft_kv()` が条件不足で decline し、エラー文字列が空なら、stderr に `strata serve: STRATA_SPLIT_MTP_BATCH=1 declined, the drafter's own pass runs: <reason>` を一度出し、従来の `mtp.prefill()` を実行します。バッチ処理自体のエラーで `e` が設定されたときは旧方式への fallback ではなく、その prompt callback は失敗します。
+各 chunk で `draft_kv::plan` が経路を決め、バッチを試す場合は layer split の `stages.back()->sp`（drafter の stage）の `draft_kv` を呼びます。成功時はその chunk の K/V をバッチ経路で作り、`mtp.prefill` は呼びません。試さない、または `draft_kv` が辞退した場合は `mtp.prefill` が使われます。いずれかでエラー文字列が立つと callback は false を返し、prompt 処理を続けません（`engine/src/program/generate.cpp:14775-14798`）。
 
-単一 GPU では `plan()` が環境値より先に単一 GPU 用バッチ経路を選ぶので、この変数を unset または OFF にしても `Prefill::draft_kv()` は試されます。ただし `STRATA_MTP_BATCH` など `draft_kv()` 側の条件による decline は共通です。MTP を使わないときは draft K/V 処理そのものがありません。
+バッチ計算側では、`STRATA_MTP_BATCH=0` なら辞退します。K/V は paged (`kv_mode == 0`) または許可された ring (`kv_mode == 2` かつ `STRATA_MTP_BATCH_RING` が `0` で始まらない) であること、hybrid でないこと、drafter と prefill が同じ device であることなどを確認します（`engine/src/prefill/prefill.cpp:3001-3037`）。リングでは slot 共有を避けるためバッチ行数にも上限を設け、scratch から得られる batch が 64 行未満なら辞退します（同 `:3047-3052`）。
 
-## 文書・測定との照合
+バッチ処理中の upload 失敗や最終 stream 同期失敗は `err` に理由を設定して false を返します。この場合は通常の辞退時のように drafter pass へ fallback せず、chunk callback が false を返します（`engine/src/prefill/prefill.cpp:3105-3114`、`3161-3170`、`engine/src/program/generate.cpp:14784-14798`）。
 
-`docs/MULTI_GPU.md` はこの設定を restart-only、default off の層分割 opt-in と説明し、`--native`、paged/ring draft K/V の条件と decline log を記載しています。ソースではさらに `draft_kv()` 内の scratch、device、tensor、K/V mode 条件を確認できます。
+## ログと測定値
 
-同資料の測定は 2x RTX 3080 20 GB、UD-Q4_K_XL、`--layer-split 23`、`--batch-mtp`、2 slots、`--prefill auto:16384` の構成で、prompt read の pooled median が 25K tokens で 1,996→2,129 tok/s（+6.7%）、51K で 2,448→2,553（+4.3%）、104K で 2,846→2,940（+3.3%）と報告されています。記載された試行条件での値であり、他環境の性能を示すものではありません。同資料は draft の経路差により drafts が変わり得ること、decode の中央値は約 3%低かったがその差は確定していないことも記載しています。これらは資料中の測定報告であり、本調査では再測定していません。
+layer split では、バッチ成功または理由付き辞退のどちらかをプロセス中一度だけ stderr に出します。成功時の書式は `strata serve: draft layer prompt K/V batched on CUDA%d (E-9 on the layer split, K/V mode %d)`、辞退時は `strata serve: STRATA_SPLIT_MTP_BATCH=1 declined, the drafter's own pass runs: %s` です。値が未設定/無効で通常 pass を選んだだけの場合、この箇所からはログを出しません（`engine/src/program/generate.cpp:14785-14795`）。
+
+`docs/MULTI_GPU.md:149` は native pack と paged/ring K/V を条件として記載しており、ソースの条件と整合します。同ページ `:295` には 2x RTX 3080 20 GB、Xeon E5-2696 v4、UD-Q4_K_XL、`--layer-split 23` での prompt read の測定が記載されていますが、この文書ではその性能値を別環境へ一般化しません。`docs/BATCHING.md:273-277` も `STRATA_SPLIT_MTP_BATCH=1` のとき piped concurrent read を抑止する説明を含み、ソース分岐と整合します。
 
 ## 根拠
 
-- `include/strata/program/draft_kv_plan.hpp:16-42` — `atoi` による値判定と MTP / GPU split / embedding 条件。
-- `src/program/generate.cpp:6940,8170-8201` — serve の MTP 状態、環境値の static cache、計画、stage 選択、ログ、従来 pass への fallback。
-- `src/program/generate.cpp:2348` — `multi_gpu` の定義。
-- `src/prefill/prefill.cpp:1346-1399,1422-1426,1448-1516` — `draft_kv()` の追加条件、batch sizing、処理およびエラー。
-- `docs/MULTI_GPU.md:103-123` — 文書上の条件、観測ログ、測定条件と結果。
+- `engine/include/strata/program/draft_kv_plan.hpp:16-41`
+- `engine/src/program/generate.cpp:14763-14798`
+- `engine/src/program/generate.cpp:21018-21046`
+- `engine/src/prefill/prefill.cpp:2991-3037`
+- `engine/src/prefill/prefill.cpp:3047-3052`
+- `engine/src/prefill/prefill.cpp:3105-3114`
+- `engine/src/prefill/prefill.cpp:3161-3170`
+- `engine/sycl/src/program/generate.cpp:8626,13369`
+- `docs/MULTI_GPU.md:149,295`; `docs/BATCHING.md:273-277`

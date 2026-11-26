@@ -1,61 +1,57 @@
 # `--no-ple`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | ネイティブ推論エンジン `strata` |
+| コマンド | `strata`（エンジン引数、root） |
 | オプション | `--no-ple` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ |
+| 値 | 取らない真偽フラグ |
 
 ## 役割
 
-PLE（Per-Layer Embedding）層を明示的に無効にする診断用の ablation フラグです。ソースは通常推論の既定動作ではないと位置付け、無効化時のトークンはモデル本来のものではなく、A/B 測定に限って有用だと stderr に表示します（`src/program/generate.cpp:437`, `4177-4180`）。
+PLE（Per-Layer Embedding）を無効にする診断用の ablation 指定です。ソースは通常推論の設定ではなく「明示的な診断 ablation」と位置付け、PLE を外した実行で得られる token はモデル本来のものではないと警告します。性能・動作の A/B 計測向けで、通常の推論結果を得る用途には適しません（`engine/src/program/generate.cpp:775,1220,6433-6436`）。
 
 ## 使い方
 
-通常 parser 経路で PLE 無効化を診断する例です。`--tokens` は tokenizer を介さない、カンマ区切りの事前 token ID 列です。
+エンジンの `--pack` 実行で、既存 tokenizer の token ID を与えて診断実行します。
 
 ```sh
-strata --pack /models/pack --tokens 1,2,3 --no-ple
+strata --pack <pack-dir> --tokens 1,2,3 --max-new 1 --no-ple
 ```
 
-エンジンの usage は `--pack DIR`、`--tokens LIST` と `--no-ple` を案内しています（`src/program/generate.cpp:806-818`）。
+`--tokens` はこの parser で必須で、カンマ区切りの整数列として読み込まれます（`engine/src/program/generate.cpp:3852-3856,5002-5004`）。
 
 ## 値と既定値
 
-- 値や引数は不要です。parser がこの文字列を見つけると `no_ple` を `true` にします。既定値は `false` で、同じ指定を複数回しても真のままです（`src/program/generate.cpp:436-437`, `2413-2425`, `2473-2475`）。
-- PLE を有効にする通常経路では `--ple-gguf PATH` が必須です。`--no-ple` を指定するとこの必須条件が免除され、`--ple-gguf` を省略できます（`src/program/generate.cpp:3290-3300`）。
+オプション自体に値はありません。parser は引数を消費せず `no_ple` を `true` にします。指定しなければ初期値 `false` で、PLE の通常経路に従います。同じ指定を複数回しても真偽値を再設定するだけです（`engine/src/program/generate.cpp:775,3900`）。
 
 ## 実行時の動作
 
-- `--no-ple` を指定し `--ple-gguf` を指定しないと、PLE 表の open、PLE 重みの接続、PLE 用 GPU buffer の確保を行うブロックを通らず、PLE を未初期化のままにします（`src/program/generate.cpp:4023-4033`, `4161-4180`）。通常の token 処理は `ss.ple.ready()` の場合にだけ PLE token の発行・完了処理を呼ぶため、この状態ではその処理もスキップされます（`src/program/generate.cpp:15891-15910`）。
-- これは出力品質を保つ通常推論向けの選択肢ではありません。エンジン自身が「以下の tokens はこのモデルのものではない」「A/B measurement のみ」と警告しています（`src/program/generate.cpp:4177-4180`）。性能向上や同等品質を保証する根拠はこのソース範囲から確認できません。
-- `--ple-gguf` と同時に指定すると、相互排他として拒否されます。PLE を使わない指定では PLE 表パスを渡さないでください（`src/program/generate.cpp:3290-3293`）。
-- `--native` は PLE を必須とする別条件があり、指定時は `--no-ple` または PLE shard を特定できない状態を stderr に出して拒否します。そのため `--no-ple` と `--native` は併用できません（`src/program/generate.cpp:3247-3261`）。
-- `--native-ple-postops` と `--native-ple-key` も PLE を必要とし、併用時は拒否されます（`src/program/generate.cpp:3294-3297`, `3403-3405`）。
+`--no-ple` を指定すると `--ple-gguf` が省略されていても PLE table shard の自動検出を行いません。PLE GGUF の読み込み・wire 処理・PLE 用 embedding / scratch buffer の確保は `ple_gguf` が空の場合に実行されず、stderr に PLE を明示的に無効化した旨と、出力 token はモデル本来のものではない旨を出します（`engine/src/program/generate.cpp:5127-5134,6264-6269,6433-6437`）。
+
+実行中は `ss.ple.ready()` が偽になるため、通常層処理や token 処理へ PLE state を渡す箇所、PLE の token 行の issue / finish がスキップされます（`engine/src/core/session.cpp:244-248,818-823`、`engine/src/program/generate.cpp:24255-24262,24268-24276`）。session 全体の確保には別途 PLE history の領域も含まれるため、このフラグだけで session memory の全 PLE 関連領域がなくなるとは限りません（`engine/src/core/session.cpp:47-68,123`）。
 
 ## 適用条件と副作用
 
-- 対象は CMake の `strata` 実行ファイルが使う `src/program/generate.cpp` の通常引数 parser です（`CMakeLists.txt:759-762`, `src/program/generate.cpp:2413-2425`, `2473-2475`）。
-- `--native` / `--model` で Qwen3.6-35B-A3B が選ばれる build では、通常 parser に入る前に `src/qwen35` 実装へ引数全体を転送します（`src/program/generate.cpp:2393-2407`）。この調査では `src/qwen35` に `--no-ple` の parser または使用箇所を確認できなかったため、その別実装での受理や効果は断定しません。
-- PLE 表の読込みと PLE 用 GPU buffer の確保を避けます。起動時に `PLE OFF by explicit --no-ple diagnostic request` と、モデル本来の token ではない旨を stderr に出します（`src/program/generate.cpp:4033-4054`, `4177-4180`）。
+- `--ple-gguf` と同時に指定できません。同時指定時は stderr に `--no-ple and --ple-gguf are mutually exclusive` を出して終了コード `2` で終了します（`engine/src/program/generate.cpp:5205-5207`）。
+- `--native-ple-postops` と併用できません。stderr に PLE が必要とのエラーを出し、終了コード `2` で終了します（`engine/src/program/generate.cpp:5209-5211`）。
+- `--native` を使う経路では PLE shard が必須で、`--no-ple` を指定すると validation で拒否されます。stderr は `--native requires --ple-gguf ...` の診断を出し、終了コード `2` です（`engine/src/program/generate.cpp:5155-5158`）。従って、この ablation はこの native GGUF 経路では利用できません。
+- `--native-ple-key` も PLE と `--native-dense-gguf` が必要なため、`--no-ple` との組み合わせは拒否されます（`engine/src/program/generate.cpp:5318-5320`）。
+- 実行時の PLE 無効化メッセージは stderr です。その他の PLE table 読み込み副作用は、PLE table を開く分岐に入らないため発生しません（`engine/src/program/generate.cpp:6269-6272,6433-6437`）。
 
 ## 出力とエラー
 
-- `--no-ple --ple-gguf PATH`: `strata generate: --no-ple and --ple-gguf are mutually exclusive` を stderr に出し、終了コード `2`（`src/program/generate.cpp:3290-3293`）。
-- `--native --no-ple`: `strata generate: --native requires --ple-gguf ...` を stderr に出し、終了コード `2`（`src/program/generate.cpp:3258-3262`）。
-- `--native-ple-postops --no-ple`: PLE 有効化が必要とのエラーを stderr に出し、終了コード `2`（`src/program/generate.cpp:3294-3297`）。
-- `--native-ple-key --no-ple`: PLE と `--native-dense-gguf` が必要とのエラーを stderr に出し、終了コード `2`（`src/program/generate.cpp:3403-3405`）。
-- 有効な通常 parser 経路では、PLE を外した診断モードである旨を stderr に出します（`src/program/generate.cpp:4177-4180`）。
+成功経路では `strata generate: PLE OFF by explicit --no-ple diagnostic request.` と、出力 token はモデル本来のものではないという警告を stderr に出します。少なくとも上記の競合・native 条件の拒否は終了コード `2` です（`engine/src/program/generate.cpp:6433-6437,5155-5158,5205-5215,5318-5320`）。
 
 ## 根拠
 
-- オプションの既定値と診断用途: `src/program/generate.cpp:436-437`
-- usage と parser: `src/program/generate.cpp:806-818`, `2413-2425`, `2473-2475`
-- PLE 必須条件、相互排他、native 関連の拒否: `src/program/generate.cpp:3247-3261`, `3290-3300`, `3403-3405`
-- PLE 初期化の分岐と無効化メッセージ: `src/program/generate.cpp:4023-4033`, `4161-4180`
-- PLE token 処理の適用条件: `src/program/generate.cpp:15891-15910`
-- engine target と Qwen3.6-35B-A3B の別 parser への転送: `CMakeLists.txt:759-762`, `src/program/generate.cpp:2393-2407`
+- `engine/src/program/generate.cpp:775,1218-1220,3899-3900` — 状態の初期値、help 文言、root parser の `--ple-gguf` / `--no-ple` 登録。
+- `engine/src/program/generate.cpp:5127-5158,5205-5215,5318-5320` — native 経路の必須条件、自動 shard 選択、相互排他と validation の失敗経路。
+- `engine/src/program/generate.cpp:6264-6272,6410-6437` — PLE table と buffer の初期化条件、ablation 時の stderr 出力。
+- `engine/src/core/session.cpp:244-248,818-823`、`engine/src/program/generate.cpp:24255-24276` — ready 判定を使った PLE 処理の適用条件。
+- `docs/cli/README.md:1036-1042,1151`（strata-envvars）— `strata-engine` root の scope と当該 option の索引リンク。
+
+調査対象は索引が指定する `engine/src/program/generate.cpp` の root parser です。別 backend 用に複製された parser の挙動はこの文書では一般化していません。

@@ -1,6 +1,6 @@
-# `--gpu-stages`
+# `strata generate --gpu-stages`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,50 +8,62 @@
 | コマンド | `strata generate` |
 | オプション | `--gpu-stages` |
 | 別名 | なし |
-| 値 | 取らないフラグ |
+| 値 | 値なしの boolean flag |
 
 ## 役割
 
-モデルの通常生成を行わず、層ごとに分けた GPU graph を再生し、`mixer`、`ffn front + router`、`post` の時間を計測します。さらに mixer の層種別ごとの内訳などを標準出力へ表示します。これは診断用の計測モードで、実際の推論速度を測る通常実行とは目的が異なります（`src/program/generate.cpp:597-600,985-987,7136-7169`）。
+各モデル層の GPU graph を mixer、FFN front + router、post の3区間に分けて replay し、区間ごとの GPU 時間を表示する計測モードです。`--stage-timing` のような未 capture の区間時間ではなく、capture した graph の replay を計測します。測定値を出した後は通常の token 生成・serve ループへ進まず終了します。
 
 ## 使い方
 
 ```sh
-strata generate --pack DIR --tokens "1,2,3" --gpu-stages
+# pack と必須 token 列を指定して、各 GPU stage の replay 時間を表示する
+strata generate --pack /path/to/pack --tokens "1,2,3" --gpu-stages
 ```
 
-`--pack` はモデルの pack ディレクトリ、`--tokens` はカンマ区切りの入力 token ID です。どちらかの入力方法が必要です（`src/program/generate.cpp:806-812`）。例の `DIR` と token ID は手元のモデルに合わせてください。
+`--pack` と `--tokens` は usage に示される通常の入力です。GPU-stage の replay には layer graph を作れるモデルと単一 GPU の実行構成が必要です。
 
 ## 値と既定値
 
-- 値や引数を取りません。parser は指定されると `gpu_stages = true` にし、初期値は `false` です。未指定ならこの計測分岐は実行されません（`src/program/generate.cpp:597-600,2753`）。
-- parser に値の範囲検証はありません。同じフラグを繰り返しても真にするだけです（`src/program/generate.cpp:2753`）。フラグの後ろに別の値を置く構文は定義されていません。
+- 値は取りません。`--gpu-stages` が現れると `gpu_stages` を `true` にします。
+- 既定値は `false` です。複数回指定しても同じ boolean を true にするだけです。
+- parser にこの flag 固有の値検証はありません。
 
 ## 実行時の動作
 
-指定すると graph capture 時に `split=true` を渡し、各層の処理を mixer、FFN 前半＋router、post に分けて capture します。続いて各層の graph を順に再生し、GPU event の区間時間から集計します（`src/program/generate.cpp:6952-6962`; `src/core/session.cpp:205-223,332-376,379-386`）。CUDA/HIP の実装では主な集計を20回行い、平均 ms/token、ms/layer、比率などを表示します（`src/program/generate.cpp:7149-7169`）。
+graph capture が有効で native pack でない場合、通常の pre/post graph に加え、split capture と5段階 prefix 用 graph を各層に対して作ります。stage replay は各層の mixer、FFN front + router、post graph を同一 stream 上で順に実行し、GPU event から区間時間を集計します。CUDA 実装では初回の集計後に20回を平均し、GDN/QSA 別の mixer 表、5段階 prefix と sweep による追加計測も行います。最後に `--gpu-only-full` との比較案内を表示し、graph と関連 buffer を解放して終了コード 0 を返します。
 
-計測分岐は capture 後、通常の生成ループへ進む前に実行され、終了コード 0 でプロセスを終えます。出力先ファイルを指定するオプションではなく、この分岐自身はファイルやネットワークへ出力しません。GPU 上では graph capture と replay を実行し、セッションの計測用状態を使います（`src/program/generate.cpp:7136-7147,7277-7283`）。
+この計測用 capture では fused GR を無効にします。出力は標準出力の表で、指定した出力ファイルへの書き込みはこの分岐にはありません。モデルや GPU の初期化・重み読み込みは計測分岐より前に行われるため、この flag は起動コストを省くものではありません。
+
+`--no-capture` を同時指定すると capture が省略されますが、stage 分岐自体は実行されます。その結果 split graph がないという replay error で終了コード 1 になります。`--graph-only` と `--gpu-only-full` を同時に付けても、先に評価される `--gpu-stages` 分岐が計測後に終了するため、それらの計測には進みません。
 
 ## 適用条件と副作用
 
-- `--layer-split` で複数 GPU に層を分ける構成とは併用できません。検出時はモデル読み込み前の validation で拒否されます。単一の全層セッションで再生する計測のためです（`src/program/generate.cpp:3386-3392`）。
-- `--native-flash-attn-short` とも併用できません。この計測モードは通常 decode loop の status validation を通らないため、組み合わせると拒否されます（`src/program/generate.cpp:3378-3384`）。
-- `--no-capture` も指定すると graph capture が省略されます。既定の pool 設定では先に `--no-capture` の validation が終了コード 2 で拒否します。`--no-pool` も指定してその検査を通した場合は、後段の stage replay が split graph 未 capture のエラーで終了コード 1 になります。`--gpu-stages` との専用 validation はありません（`src/program/generate.cpp:6954-6962,6974-6979,7137-7147`; `src/core/session.cpp:332-337`）。
-- native (IQ) pack では per-layer graph を capture しないため、この計測は利用できません。replay 失敗となり、serve 経路で `STRATA_VERIFY_PROFILE=1` と `STRATA_DECODE_TIMING=1` を使う代替案が stderr に案内されます（`src/program/generate.cpp:3753-3765,6954-6962,7140-7147`; [DETAILS.md「Where a decode window's time goes」](../../../DETAILS.md#where-a-decode-windows-time-goes)）。
-- `--gpu-stages` が有効なときは fused GR kernel を無効にし、計測に使う非 fused の layout を選びます。したがってこの出力は、その fused 経路の性能値を表しません（`src/program/generate.cpp:3924-3931`）。
-- capture・replay とイベント計測で GPU を使用し、計測用 graph と状態を確保します。通常生成を実行せずに終了します。計測は複数回 replay するため、負荷や時間を要しますが、性能測定や実機実行は本調査では行っていません。
-
-## 出力とエラー
-
-成功時は標準出力に `per-stage GPU time on the CAPTURED graph` の表、各 stage の ms/token・ms/layer・比率、合計などを表示して終了コード 0 を返します（`src/program/generate.cpp:7160-7169,7277-7283`）。
-
-失敗時は標準エラーへ理由を出します。相互作用の validation エラーは終了コード 2 です（`src/program/generate.cpp:3378-3392`）。capture または stage replay の失敗はエラー文を出して終了コード 1 です。native pack では per-layer graph がない旨と serve 経路の代替設定も追加表示します（`src/program/generate.cpp:6958-6962,7140-7147`）。GPU event 作成、graph launch、最終同期の失敗は `session_replay_stages_per_layer` が失敗として返します（`src/core/session.cpp:345-364`）。
+- `--layer-split` による複数 GPU 実行とは併用できません。parser 後の validation が stderr に理由を出し、終了コード 2 で拒否します。
+- `--native-flash-attn-short` とも併用できません。同じく通常 decode loop の status validation を要するため終了コード 2 になります。
+- `--no-capture` は parser では拒否されず、後段の stage replay が「split capture されていない」として失敗します。
+- native pack（IQ pack）は per-layer graph を capture しないため、この計測は利用できません。計測分岐で replay graph がないエラーを stderr に出し、native pack 向けの serve 時 profile の案内を付けて終了コード 1 になります。
+- capture や replay、GPU event/synchronization に失敗した場合もエラーを stderr に出して終了コード 1 になります。
+- 重み・GPU state を使って graph replay と計時を繰り返します。通常生成の応答文や token stream は出力しません。
+- Qwen3.5 MoE family は `generate` の共通 parser より前に `engine/src/qwen35` の runner へ dispatch されます。`--gpu-stages` の受理をその parser について確認できなかったため、この文書の適用範囲には含めません。
 
 ## 根拠
 
-- parser の既定値・help 表示・フラグ設定: `src/program/generate.cpp:597-600,985-987,2753`。
-- graph capture と split の指定: `src/program/generate.cpp:6952-6962`、capture の split graph 生成: `src/core/session.cpp:205-223,231-253`。
-- GPU event による計測、集計、出力・正常終了: `src/core/session.cpp:332-386`、`src/program/generate.cpp:7136-7169,7277-7283`。
-- 適用制限と fused GR への影響: `src/program/generate.cpp:3378-3392,3924-3931`。
-- SYCL 実装でも同じフラグを parser が受理し、split capture と stage replay を行います: `sycl/src/program/generate.cpp:5469-5479,5681-5691`、`sycl/src/core/session.cpp:194-219,413-495`。本調査では既存 CLI の help 実行、ビルド、GPU/SYCL 実行、テストは行っていません。
+- `engine/src/program/generate.cpp:948-951` — flag の説明と既定値 false の field。
+- `engine/src/program/generate.cpp:1402-1404` — help に記載された3 graph の計測内容と出力後終了する動作。
+- `engine/src/program/generate.cpp:3810-3818` — Qwen3.5 MoE を別 parser へ dispatch する分岐。
+- `engine/src/program/generate.cpp:4215-4219` — `--gpu-stages` を値なし flag として parser が受理する箇所。
+- `engine/src/program/generate.cpp:5293-5307` — `--native-flash-attn-short` と複数 GPU layer split の拒否・stderr・終了コード。
+- `engine/src/program/generate.cpp:6112-6113` — stage 計測時に fused GR を無効にする設定。
+- `engine/src/program/generate.cpp:10544-10554` — capture の実行条件、split capture 指定、capture 失敗時の終了コード。
+- `engine/src/program/generate.cpp:10728-10761`、`10868-10874` — stage replay、20回平均の表、終了処理と成功終了。
+- `engine/src/core/session.cpp:200-218, 226-280` — 通常 graph と split capture の初期化、および層ごとの追加 graph capture。
+- `engine/src/core/session.cpp:327-381` — 3区間 graph の replay、GPU event による計時と集計。
+- `engine/src/core/session.cpp:424-469` — prefix 計測のため residual を保存・復元しながら prefix graph を replay する処理。
+- `engine/src/core/layer.cpp:1549-1556, 1570-1597` — prefix の区間境界と mixer / FFN-front-plus-router の stage 構成。
+- `engine/sycl/src/program/generate.cpp:614-616, 2179` — SYCL 側も同じ既定値と値なし parser 分岐を持つこと。
+- `engine/sycl/src/program/generate.cpp:2711-2721` — SYCL 側の同じ併用条件の拒否。
+
+## 調査範囲
+
+同一 revision の CUDA/HIP 系 `engine/src` と SYCL 系 `engine/sycl/src` の parser・処理経路を確認しました。CLI help は既存実行ファイルを起動していないため補助資料には使わず、ソースの usage/help 文字列と照合しています。実機での出力値、GPU ごとの計測精度、追加 backend における動作は確認していません。

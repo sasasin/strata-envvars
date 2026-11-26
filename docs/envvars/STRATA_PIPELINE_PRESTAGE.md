@@ -1,51 +1,47 @@
 # `STRATA_PIPELINE_PRESTAGE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--pipeline-windows 2` の speculative decode で、次の window B の verifier 入力を実際の launch より前に host 側で stage するかを制御します。既定では stage を先行させます。無効にすると、B を launch する箇所で通常の stage 処理を行います。対象名は `src/program/generate.cpp` と `sycl/src/program/generate.cpp` に各1箇所あり、どちらも `Verifier::prestage()` の呼び出しを制御します。
+`--pipeline-windows` の speculative decode で、次の B 窓を stage 0 で launch する前に入力を host 側で staging するかを切り替える診断・調整用変数。既定では先行 staging し、`0` にすると B の launch 時に通常の `pl_stage` が実行される。CUDA/HIP 共通実装と SYCL 実装の両方に読み取り箇所がある。`STRATA_PIPELINE_DEBUG` が有効でないとこの変数は helper から読まれず、既定の先行 staging が使われる（`engine/src/program/generate.cpp:681-686`、`engine/sycl/src/program/generate.cpp:337-339`、`docs/MULTI_GPU.md:203`）。名前は `terminal/data/settings-register.json` にも登録されているが、実行時の値読み取りは記載の engine helper 経由である（同ファイル:33981-33995）。
+
+先行 staging は `Verifier::prestage` で B の入力を準備し、後続の `pl_launch` が T・位置・token 列（PLE が有効なら PLE 前状態も）が一致すると準備済み入力を再利用する仕組み。token の選択や受理判定そのものを変更する設定ではない（`engine/src/core/verify.cpp:5932-5960,5980-5985`、`engine/sycl/src/core/verify.cpp:4194-4222,4240-4245`）。
 
 ## 値と判定
 
-この設定は `pipe_dbg_env()` を通して読みます。同 helper は `STRATA_PIPELINE_DEBUG` を初回呼び出し時に `static` へ cache し、値が未設定・空文字・先頭文字 `0` の場合は、すべての `STRATA_PIPELINE_*` tuning/test 値について `nullptr` を返します。それ以外の値なら、指定された名前を `getenv()` で取得します。したがってデバッグ gate が無効の場合、この変数は未設定と同じ既定値になります。
+読み取りは `pipe_dbg_env("STRATA_PIPELINE_PRESTAGE")` 経由で、値が得られた場合は `std::atoi(v) != 0`、得られない場合は `true`。文字列全体の検証はなく、`atoi` が数値として読める先頭部分で判定する。
 
-gate が有効な場合、`STRATA_PIPELINE_PRESTAGE` 自体の判定は次のとおりです。
+| 条件 | unset | 有効になる値（先行 staging） | 無効になる値（launch 時 staging） |
+|---|---|---|---|
+| CUDA/HIP (`engine/src/program/generate.cpp:22120-22123`) | `true` | `1`, `2`, `-1`, `1anything`, ` 1` | `0`, `0anything`, `-0`, 空文字, `true`, `false`, 数字で始まらない文字列 |
+| SYCL (`engine/sycl/src/program/generate.cpp:12124-12127`) | `true` | `1`, `2`, `-1`, `1anything`, ` 1` | `0`, `0anything`, `-0`, 空文字, `true`, `false`, 数字で始まらない文字列 |
 
-| `STRATA_PIPELINE_DEBUG` | `STRATA_PIPELINE_PRESTAGE` | 結果 |
-|---|---|---|
-| unset、空文字、先頭が `0` | 任意 | helper が `nullptr` を返し、既定 ON |
-| gate 有効 | unset | 既定 ON |
-| gate 有効 | `atoi(value) != 0` | ON |
-| gate 有効 | `atoi(value) == 0` | OFF |
-
-変換は `std::atoi` で、文字列全体の厳密な検証ではありません。空文字、数字で始まらない文字列、`0` または `0` の後に文字が続く値は 0 となり OFF です。先頭の空白と符号付き10進整数は `atoi` の規則で処理され、整数部分の後ろの文字列は判定に使われません（例: `1junk` は ON、`-1` は ON）。範囲 clamp や無効値の警告・fallback はありません。
-
-`STRATA_PIPELINE_DEBUG` の gate 結果はプロセス内で初回 `pipe_dbg_env()` 呼び出し時に cache されます。`pl_prestage` も pipeline decode 経路で初めて初期化される `static const bool` です。その後に環境変数を変更しても、このプロセス内の判定は再評価されません。
-
-根拠: `src/program/generate.cpp:461-467,16365-16368`; `sycl/src/program/generate.cpp:298-303,11377-11380`。
+`atoi` は先頭の空白と符号を許し、数値の後ろの文字列を無視する。整数として読めない先頭部分は 0 になる。整数型で表せない値の結果は C/C++ ライブラリ仕様上未定義で、実装は範囲検査・fallback を行わない。`STRATA_PIPELINE_DEBUG` の判定は別規則で、未設定・空文字・`0` で始まる文字列では helper が対象変数を読まず、非空で先頭文字が `0` 以外なら読める（`engine/src/program/generate.cpp:684-686`、`engine/sycl/src/program/generate.cpp:337-339`）。
 
 ## 有効になる条件
 
-- 呼び出し側は `--serve` の layer split pipeline を必要とします。pipeline loop は `o.pipeline_windows > 0`、少なくとも2 stage、同一 GPU 上の split ではないこと、および stage 数が設定された数と一致することを条件に作られます。`--pipeline-windows 2` 自体は serve、複数 GPU の layer split、MTP drafter と `--spec` 2以上を必要とし、batch slots、peer device、helper cache 等との併用は無効化されます。
-- この変数の参照箇所は `--pipeline-windows 2` loop 内です。加えて `pl_snap_ok` が必要です。通常の request がこの loop を使うには `pipe && pl_pw >= 2 && pl_snap_ok` が成立し、repetition penalty (`penalty_last_n`) または coupled draft sampling の request でないこと、キャンセルされておらず、まだ出力上限に達していないことが必要です。これらの理由で loop を使わない request は serial decode へ進み、この設定は効果を持ちません。
-- 変数が ON でも、B が用意され、B の前 window 全体の受理見込み `B.p_on` が speculative gate `theta` 以上で、B 用 verifier が in-flight でなく、rollback が pending (`doomed`) でない場合だけ先行 stage します。`theta` は別の `STRATA_PIPELINE_THETA` debug tuning 値から取得され、既定は `0.2` です。
-- CUDA と SYCL の両方に同じ判定と条件分岐があります。OS 固有の値判定、build macro による差、CLI 引数によるこの変数の上書きは実装にありません。debug tuning 群を有効にする `STRATA_PIPELINE_DEBUG` が必要です。
-
-根拠: `src/program/generate.cpp:4988-5020,10005,16079-16099,16496-16500`; `sycl/src/program/generate.cpp:300-303,11377-11380,11504-11508`; pipeline の制約説明 `docs/MULTI_GPU.md:188-197`。
+- `--pipeline-windows` の decode 経路が有効であること。パイプライン自体は serve 中の GPU layer split 等の条件に従い、要求の `--pipeline-windows` 値や既定選択で決まる（`engine/src/program/generate.cpp:6532-6537,6584-6601`）。
+- pipeline loop が B 窓を準備し、その B が gate を通ること。CUDA/HIP では `B.ready && B.go`、SYCL では `B.ready && B.p_on >= theta` が条件である。`theta` は pipeline gate の値（`STRATA_PIPELINE_THETA` による診断調整を含む）であり、条件を満たさない B は先行 staging されない（`engine/src/program/generate.cpp:22288-22298`、`engine/sycl/src/program/generate.cpp:12308-12318`）。
+- B の stage 0 verifier が in-flight でなく、rollback 対象の `doomed` 状態でもないこと。条件に合わなければこの分岐では staging しない（同上）。
+- `STRATA_PIPELINE_DEBUG` が helper の有効判定を通ること。通らない場合、対象変数は未設定扱いになるため既定の `true` が使われる（`engine/src/program/generate.cpp:684-686,22120-22123`、`engine/sycl/src/program/generate.cpp:337-339,12124-12127`）。
 
 ## 実行時の詳細
 
-MTP chain から B が決まったとき、ON かつ上記 gate 条件を満たせば、実装は A の token 列から B より前に成立する PLE の直近2 token を作り、B 用 verifier の `prestage(B.T, B.tok, B.p, prev, err)` を呼びます。これは host 上で `pl_stage()` を実行し、入力を prestaged として記録します。後続の `pl_launch()` は window サイズ・position・token 列を照合し、PLE staging が有効なら直近 token 2個も照合します。一致すれば staging を再利用し、異なれば `pl_stage()` を launch 時にやり直します。従ってこの設定は B の入力 staging の時期を変え、token の推測や受理条件そのものは変更しません。
+各 backend の `pl_prestage` は関数内 `static const bool` で、pipeline loop が初めて評価した時に一度だけ決まる。`pipe_dbg_env` 内の `STRATA_PIPELINE_DEBUG` 判定も関数内 static で最初の呼び出し時に cache される。したがって、起動後に環境を変更しても、そのプロセス内の判定は更新されない（`engine/src/program/generate.cpp:684-686,22120-22123`、`engine/sycl/src/program/generate.cpp:337-339,12124-12127`）。
 
-OFF の場合、`prestage()` 呼び出しを飛ばします。B の front stage が A の後ろで launch 可能になると `pl_launch()` が呼ばれ、通常の staging が launch 処理内で行われます。
+先行 staging が選ばれ、B の gate と状態条件を満たすと、A が判定された時点で `A` の token 列から次の PLE 前状態を作り、`VF(0, B).prestage(...)` / `V0(B).prestage(...)` を呼ぶ。これは `stage_inputs` を行い、PLE が ready かつ stage 対象なら PLE 行を準備してページを prefetch する。B の `pl_launch` は準備済み状態を一度消費し、T・位置・各 token が一致し、PLE が適用される場合は PLE 前状態も一致すると再利用する。一致しない場合は launch 時に改めて `pl_stage` を実行する（`engine/src/core/verify.cpp:5932-5960,5980-5985`、`engine/sycl/src/core/verify.cpp:4194-4222,4240-4245`）。
 
-先行 staging に失敗した場合は pipeline loop の `die(err)` に入り、stderr に `strata serve: pipelined decode: <error>`、stdout に `ERR <error>` を出して戻り値1で終了します。CUDA/SYCL とも、たとえば verifier が in-flight、window size 不正、または pipeline window 用に準備されていない場合に `prestage()` が失敗を返します。環境変数の値だけを理由にしたログはありません。
+この変数を `0` にすると `prestage` 呼び出しを飛ばすため、B の `pl_launch` が必要な staging を行う。これは staging の時点を変えるもので、B を gate に通す条件や pipeline 自体の有効条件は変えない。`prestage` が失敗した場合、pipeline loop は `die(err)` を通り、stderr に `strata serve: pipelined decode: <理由>`、stdout に `ERR <理由>` を出して `1` を返す（`engine/src/program/generate.cpp:21917-21928,22295-22298`、`engine/sycl/src/program/generate.cpp:11894-11901,12314-12317`）。
 
-根拠: `src/program/generate.cpp:16492-16500,16529-16558,16166-16180`; `src/core/verify.cpp:4859-4867,4884-4890`; `sycl/src/program/generate.cpp:11500-11508,11526-11529`; `sycl/src/core/verify.cpp:3785-3793,3808-3815`。
+## ログと測定値
+
+この変数の値だけを示す専用ログは見つからない。pipeline 用ログ `STRATA_PIPELINE_LOG` は別設定で、B の chain 情報を出力する。先行 staging の失敗時は上記の pipeline decode エラーが出る（`engine/src/program/generate.cpp:21917-21928,22120-22123`、`engine/sycl/src/program/generate.cpp:11894-11901,12124-12127`）。Strata の資料にこの変数の性能測定値はない。
 
 ## 根拠
 
-- 候補名の全参照を `rg` で調べた結果、Strata ソースの直接参照は CUDA `src/program/generate.cpp:16365-16368` と SYCL `sycl/src/program/generate.cpp:11377-11380` の2箇所です。両方とも同じファイル内の `pipe_dbg_env()` を経由します。その他の出現は helper の説明コメントと環境変数候補一覧 `docs/envvars/000_envvers.md:1266` です。
-- `pipe_dbg_env()` の debug gate は `src/program/generate.cpp:464-466` と `sycl/src/program/generate.cpp:300-302` にあります。対象変数の `atoi` 判定と静的 cache は前記の各 `pl_prestage` 初期化箇所にあります。
-- `--pipeline-windows` の対応 backend・制約に関する説明は `docs/MULTI_GPU.md:188-197` にあります。同資料も `STRATA_PIPELINE_*` tuning/test 値は `STRATA_PIPELINE_DEBUG=1` のときだけ読むと説明しています。コード上は `1` 固定の比較ではなく、未設定・空文字・先頭 `0` 以外を gate 有効と判定します。
+- `engine/src/program/generate.cpp:681-686,21802-21825,22120-22123,22288-22304`
+- `engine/sycl/src/program/generate.cpp:337-339,12124-12131,12308-12323`
+- `engine/src/core/verify.cpp:5932-5961,5980-5985`
+- `engine/sycl/src/core/verify.cpp:4194-4223,4240-4245`
+- `docs/MULTI_GPU.md:203`

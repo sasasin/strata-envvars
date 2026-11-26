@@ -1,64 +1,67 @@
 # `--pipeline-windows`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | CMake で生成するネイティブ `strata` 推論エンジン |
+| コマンド | `strata`（エンジン引数、`--serve` 時） |
 | オプション | `--pipeline-windows` |
 | 別名 | なし |
-| 値 | 整数 `N`。実効値は `0`、`1`、`2` の範囲 |
+| 値 | 整数相当の値。parser は `atoi` で読み、0〜2 に丸める |
 
 ## 役割
 
-`--serve` と複数 GPU の layer split で、隣り合う verify window を GPU stage 間で重ねて処理します。`1` は対応する prompt の短い読み込みだけ、`2` はそれに加えて decode window も投機的に重ねます。どちらも条件を満たさなければ無効化されることがあります。parser と実行時の適用判定は `src/program/generate.cpp:767-772, 2671, 4238-4288` にあります。
+レイヤー分割した複数 GPU 上で、単一リクエストの prompt 処理や decode の verify window を、各 stage が順番に処理する代わりに重ねて実行します。`1` は prompt の short-read window を重ね、`2` はそれに加えて decode window も投機的に重ねます。適用されない条件では値を 0 に戻し、通常の逐次経路で続行します。(`engine/src/program/generate.cpp:1145-1150, 6532-6537, 6584-6601`)
 
 ## 使い方
 
-既存の layer split と MTP drafter を使う `strata serve` の起動例です。
-
 ```sh
-strata --serve --pack /path/to/pack --tokens "1,2,3" --layer-split 20 --mtp /path/to/drafter --spec 4 --pipeline-windows 2
+strata --serve --layer-split 24 --mtp ./draft --spec 4 --pipeline-windows 2
 ```
 
-エンジンの usage は `--pack` と `--tokens` を含む呼び出し形式、および `--serve` と layer split での使用を示しています（`src/program/generate.cpp:806-812, 917-920`）。`--layer-split` の指定形式やモデルの配置条件はこのオプション文書の対象外です。
+`--layer-split` などで GPU 間のレイヤー分割を構成した `--serve` 起動に指定します。上の例は引数の組み合わせを示すもので、モデルや GPU によって実行可能性は異なります。(`engine/src/program/generate.cpp:6584-6598`)
 
 ## 値と既定値
 
-- parser は `atoi` で整数変換後、`0..2` に clamp します。したがって負数は `0`、`2` より大きい数は `2` になります。整数として読めない値は `atoi` により `0` 相当です。複数回指定した場合は parser が順に代入するため最後の値が残ります（`src/program/generate.cpp:2416-2421, 2671`）。
-- 値を省略すると parser の共通処理が `--pipeline-windows needs a value` を stderr に出し、終了コード `2` で終了します（`src/program/generate.cpp:2418-2420`）。
-- 省略時の内部値は `-1`（自動判定）です。HIP build では `STRATA_PIPELINE_AUTO` が `0` でなく、`--serve`、異なる GPU を使う layer split、stage 数、MTP (`--mtp` と `--spec >= 2`) を含む条件を満たし、helper cache・batch slots・peer device・async adaptation が使われていなければ自動有効化の候補になります。GPU architecture が gfx12 WMMA であることも必要です。既定の最小 stage 数は通常 3、MTP drafter を最初の GPU に置く設定が既定で有効なら 2 です。`STRATA_PIPELINE_AUTO_MIN_STAGES` は最小値を上書きしますが、値は少なくとも 2 に補正されます（`src/program/generate.cpp:1956-1967, 4246-4268`）。
-- 明示値 `0` は自動判定を上書きして無効にします。明示値 `1` / `2` は自動判定に依存せず、以下の適用条件で検査されます（`src/program/generate.cpp:2671, 4253-4273`）。
+- `0`: 無効。stage は窓ごとに順番に処理します。
+- `1`: prompt の short-read window だけを重ねます。2 stage の分割に限られます。
+- `2`: prompt と decode の window を重ねます。decode 側は stage 0 が次の window を投機実行し、stage 1 が現在の window を検証し、予測が不一致なら先行側の状態を戻します。(`engine/src/program/generate.cpp:1145-1149`)
+- 省略時の内部初期値は `-1` で、自動判定になります。自動で有効になる場合は値 `2` です。(`engine/src/program/generate.cpp:1150, 6560-6579`)
+
+parser は `atoi` の結果を `max(0, min(2, value))` に通します。そのため負数は `0`、2 より大きい値は `2`、空値や数値として読めない文字列は `0` になります。複数回指定した場合は引数走査中に後の値が上書きします。値を省略すると `needs a value` を stderr に出して終了コード 2 で終了します。(`engine/src/program/generate.cpp:3842-3847, 4119`)
+
+自動判定は `--serve`、GPU 間のレイヤー分割、別 GPU 上の各 stage などを前提とし、HIP build でのみ有効化されます。さらに `decode_defaults_arch_ok()` の GPU architecture 条件を満たす必要があります。既定の最小 stage 数は通常 3 で、MTP drafter を先頭 stage に置ける構成かつその配置が既定で選ばれる場合は 2 です。`STRATA_PIPELINE_AUTO_MIN_STAGES` を設定すると `atoi` 値を下限 2 で使い、`STRATA_PIPELINE_AUTO=0` は自動有効化を止めます。自動で有効になるには MTP と `--spec` 2 以上も必要です。(`engine/src/program/generate.cpp:6540-6546, 6560-6579`)
 
 ## 実行時の動作
 
-- 値 `1` は、2 stage の layer split で `read_windows_pl` を使い、stage 0 が次の window を処理している間に stage 1 が現在の window を処理します。適用時は prompt verify window の hand-off と stage ごとの stream を使います（`src/program/generate.cpp:8987-9012, 13105-13110, 13194-13199`）。3 stage 以上で明示した `1` はサポートされず、無効化されます。
-- 値 `2` は prompt の重ね合わせに加え、decode でも stage 0 が次の window を投機実行し、最後の stage が現 window を検証します。予測が外れた場合は front stage の GDN state を snapshot から戻し、確定 token で処理を進めます。適用には MTP drafter と `--spec >= 2` が必要です（`src/program/generate.cpp:767-772, 9237-9254, 14223-14242`）。
-- 2 stage の明示値 `2` では、drafter を最初の GPU に置けない場合も指定自体は維持され、共有 GPU 上での競合について stderr に注意が出ます。自動有効化では同条件なら通常 3 stage 以上が必要です（`src/program/generate.cpp:4246-4264, 4289-4300, 4403-4411`）。
-- second verifier などの追加領域は expert cache のサイズ決定時に予約されます。値が正なら各 GPU の expert cache から約 160 MiB を除き、値 `2` では先頭 stage の GDN snapshot 領域も見積もりに加えます（`src/program/generate.cpp:4505-4518, 6021-6027`）。
+正の値が設定されると、後続の `--serve` 初期化で各 stage に偶数・奇数 window 用の verifier を用意し、stage ごとの非同期 stream と parity ごとの hand-off を作成します。これにより stage 0 は次の window を処理しながら、後段は前の window を処理できます。値 `2` ではさらに各 front stage の GDN 状態 snapshot を使い、投機 decode の状態を復元できるようにします。(`engine/src/program/generate.cpp:13263-13288, 13725-13753`)
+
+2 以上を指定したときは各 stage の GDN snapshot 用に追加 VRAM が必要です。pipeline 用 verifier 等の領域は expert cache の容量見積もりから差し引かれます。CUDA/HIP 経路では CUDA0 について予約量を stderr に表示します。(`engine/src/program/generate.cpp:6842-6850, 9052-9058`)
 
 ## 適用条件と副作用
 
-有効にするには `--serve`、異なる GPU にまたがる 2 stage 以上の layer split、MTP drafter (`--mtp`) と `--spec >= 2` が必要です。`--batch` slots、`--peer-device`、helper cache (`--expert-cache-device1..3` / `--remote-expert-opt`) とは併用できません。3 stage 以上で `--adapt-async` と値 `2` を明示した場合も pipeline 側が無効になります。これらの条件を満たさない明示値は stderr に理由を出して `0` に変更し、起動を続けます（`src/program/generate.cpp:4273-4288`）。
+正の値を指定しても、次の条件では stderr に理由を表示して `pipeline_windows=0` に戻し、起動は逐次経路で続きます: `--serve` でない、各 stage が別 GPU でない、GPU 間 layer split がない、値 `1` なのに 2 stage ではない、3 stage 以上で `--adapt-async` を使う、`--draft dflash2` を明示し `--draft-fallback mtp` を指定していない、MTP がないか `--spec` が 2 未満、`--batch`（後述の例外を除く）、`--peer-device`、helper expert cache を使う場合です。(`engine/src/program/generate.cpp:6584-6601`)
 
-追加 verifier や hand-off、stream、値 `2` の GDN snapshot と drafter row buffer を GPU/host memory に確保します。stream または hand-off の作成、second verifier / row buffer の確保に失敗すると `strata serve` はエラーを stderr に出して終了コード `1` で終了します（`src/program/generate.cpp:9000-9007, 9112-9159`）。値 `2` の GDN snapshot が確保できない場合は decode の重ね合わせをやめて serial decode に戻します。prompt 側の pipeline 判定は別に行われます（`src/program/generate.cpp:9251-9289, 14231-14242`）。
+`--batch` との併用は通常 pipeline を無効にします。`STRATA_PW_WITH_BATCH=1` の場合は単独リクエスト用経路でだけ pipeline を維持し、batch window 自体は pipeline を使いません。自動判定は `STRATA_PIPELINE_AUTO=0` で止められます。(`engine/src/program/generate.cpp:6547-6559, 6602-6604`)
 
-`--pipeline-windows` の pipeline が有効な場合、`STRATA_SPLIT_OVERLAP` による別の stage overlap は併用せず、その旨を stderr に出します（`src/program/generate.cpp:9030-9041`）。値 `2` でも repetition penalty (`penalty_last_n`) を使う request と coupled draft sampling は decode を serial にします（`src/program/generate.cpp:14231-14240`）。
+stream 作成、2つ目の verifier、hand-off、drafter row buffer の GPU/host allocation に失敗した場合、初期化は stderr に具体的な失敗理由を出して `return 1` します。値 `2` の GDN snapshot allocation だけが失敗した場合は警告を出し、decode を逐次実行に落として継続します。(`engine/src/program/generate.cpp:13276-13283, 13434-13483, 13725-13741`)
+
+値 `2` の decode pipeline は repetition penalty 履歴や coupled draft sampling があるリクエストでは逐次化され、その理由は stderr に一度表示されます。(`engine/src/program/generate.cpp:21810-21819`)
+
+この文書は CLI 索引が parser として指定する `engine/src/program/generate.cpp`（CUDA/HIP の `strata` エンジン経路）に基づきます。SYCL 側にも同名 parser がありますが自動既定条件が異なり、2枚の Battlemage GPU と MTP が条件です。この別実装は索引上の parser scope 外として、ここでは個別仕様を統合していません。(`engine/sycl/src/program/generate.cpp:760-765, 3590-3618`)
 
 ## 出力とエラー
 
-- 自動有効化時は stderr に既定で有効になった旨、実際に pipeline を組んだ場合は値と stage 数を出します（`src/program/generate.cpp:4268-4271, 9285-9289`）。
-- 対応外の明示値は無効化理由を stderr に出しますが、その理由だけでは起動失敗になりません（`src/program/generate.cpp:4273-4288`）。
-- 値 `2` の GDN snapshot が確保できない場合は serial decode へ切り替える旨を stderr に出します（`src/program/generate.cpp:9264-9270`）。pipeline 実行中の準備失敗は `ERR <理由>` を stdout に出し終了コード `1` になります（`src/program/generate.cpp:14242-14246`）。
-- 調査した source では、このオプション単独の通常完了時に必ず出す stdout メッセージは確認できません。prompt pipeline の進捗出力 `PP ...` は処理経路内にあります（`src/program/generate.cpp:13185-13191`）。
+自動有効時、または指定値が条件を満たさず無効化された時は stderr に状態または理由を表示します。pipeline 初期化が成功すると stage 数と decode の overlap 状態を stderr に出します。`--pipeline-windows` 自体に対応する独自の終了コードはなく、値の不足は共通 `next()` 処理による終了コード 2、stream/verifier/hand-off 等の初期化失敗は終了コード 1 です。(`engine/src/program/generate.cpp:3844-3846, 6575-6582, 6599-6601, 13283, 13442-13483, 13756-13760`)
 
 ## 根拠
 
-- parser・既定値・usage: `src/program/generate.cpp:767-772, 917-920, 2418-2421, 2671`。
-- 自動選択と適用可否: `src/program/generate.cpp:1956-1967, 4246-4300`。
-- メモリ見積もりと verifier / stream 初期化: `src/program/generate.cpp:4505-4518, 6021-6027, 8987-9012, 9112-9159, 9251-9289`。
-- prompt / decode の使用箇所と request 単位の serial fallback: `src/program/generate.cpp:13105-13110, 13194-13199, 14223-14246`。
-- 利用者向け説明: `docs/MULTI_GPU.md:427-499`。同文書は `1` と `2` の動作、メモリ負担、無効条件を説明しています。usage の「two GPUs」という記載 (`src/program/generate.cpp:917`) は概要で、ソース上は3 stage 以上でも値 `2` が適用されます。
-
-この調査では指定 revision のソースと checkout 内文書を確認しました。Release 配布物や、各 GPU / model / backend 上での実行結果は確認していません。`--help` の実機出力も実行していません。
+- `engine/src/program/generate.cpp:1145-1150` — 値の意味と未指定時の初期値。
+- `engine/src/program/generate.cpp:3842-3847, 4119` — 値取得、欠落値エラー、整数変換と範囲補正。
+- `engine/src/program/generate.cpp:6540-6579` — 自動既定値、HIP 条件、MTP/spec、環境変数による制御。
+- `engine/src/program/generate.cpp:6584-6617` — 適用条件、無効化と batch の例外。
+- `engine/src/program/generate.cpp:6842-6850, 9052-9058` — VRAM 予約と cache 見積もり。
+- `engine/src/program/generate.cpp:13263-13288, 13434-13487, 13725-13760` — verifier、stream、hand-off、snapshot の作成と初期化失敗。
+- `engine/src/program/generate.cpp:21810-21825` — decode の逐次 fallback と実行経路。
+- `engine/sycl/src/program/generate.cpp:760-765, 3590-3634` — scope 外の SYCL 実装における parser 初期値と自動条件の差。

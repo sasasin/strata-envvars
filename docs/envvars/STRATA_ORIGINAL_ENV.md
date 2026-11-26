@@ -1,50 +1,50 @@
 # `STRATA_ORIGINAL_ENV`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux AppImage の起動時に、AppImage 側の環境設定が加わる前の環境を NUL 区切りで記録し、Strata ホストが外部プログラム用の環境を組み立てるための内部引き継ぎ値です。AppImage の再パッケージ時に `AppRun` へ追加される処理が、`env -0` の出力を base64 化してこの変数へ設定します（`apps/desktop/scripts/repack-appimage.sh:52-58`）。
+AppImage の `AppRun` が、Strata を起動した時点の環境全体を `env -0 | base64 -w0` で記録するための内部記録値です。Strata は主に、同梱ライブラリや GTK 設定が混ざった AppImage 環境をシステムの外部プログラムへそのまま渡さず、記録があれば起動元環境を復元します。対象はフォルダ選択、ファイル・URL opener、通知、assistant shell などの外部プロセス用環境です（`app/desktop/scripts/repack-appimage.sh:79-85`; `app/host/server/external-env.mjs:1-13,64-71`; 呼び出し例 `app/host/server/folder-dialog.mjs:112-126`, `app/host/server/app-ui.mjs:39-47,57-60`, `app/host/server/agent/harness-runtime.mjs:25-36`）。
 
-Strata ホストの `externalEnvironment()` はこの値を復元し、フォルダー選択ダイアログ、`xdg-open` 等の起動、通知、プレビュー成果物を開く処理、および Harness の shell/tool 環境に使います（`apps/host/server/external-env.mjs:1-13,67-71`; 使用箇所は下記「実行時の詳細」）。これは通常のユーザー向け設定値ではなく、AppImage launcher とホスト間の記録です。
+もう一つの読み取り経路は Linux デスクトップアプリの更新後再起動です。shell が起動した通常の window child ではなく、updater から再起動された `--window-child` が Strata を再起動するときに、Rust supervisor が元環境を復元して新プロセスへ渡します（`app/desktop/src-tauri/src/main.rs:929-941`; `app/desktop/src-tauri/src/supervisor.rs:332-368`）。この変数自体は推論設定やモデル・GPU の選択を変えません。
 
 ## 値と判定
 
-値は `apps/host/server/external-env.mjs:15,29-41` で `process.env`（または呼び出し側が渡す env object）から読みます。文字列として真偽値や数値を parse するのではなく、base64 として `Buffer.from(raw, 'base64').toString('utf8')` で復号します。
+この値は真偽値や数値としては解釈されず、環境変数群を NUL 区切りにした Base64 記録として処理されます。作成側は AppImage の `AppRun` に hook がまだ無い場合に限り、`this_dir=` の後へ `export STRATA_ORIGINAL_ENV="$(env -0 | base64 -w0)"` を追加します（`app/desktop/scripts/repack-appimage.sh:79-85`）。
 
-| 入力 | Strata の処理 |
-| --- | --- |
-| 未設定または空文字 | `if (!raw)` により記録なしとして `null`。AppImage 内なら後述の `withoutAppImage()` へ fallback します。 |
-| 非空文字列で復号後に `KEY=VALUE\0` 形式の項目がある | NUL で分割し、最初の `=` より前が空でない項目を環境オブジェクトへ追加します。値に後続の `=` があればそのまま保持します。 |
-| 非空文字列だが有効な項目が 0 件 | `null`。現在環境から AppImage の設定を除く fallback を使います。 |
-| 壊れた、または不完全な base64 | 明示的な base64 形式検証はありません。Node の `Buffer.from(..., 'base64')` の復号結果を上記の項目規則で処理し、項目がなければ `null` になります。例外が発生した場合も `catch` で `null` です。 |
+| 読み取り経路 | unset | 空文字 | 非空値・無効値 |
+|---|---|---|---|
+| Node `externalEnvironment` | `APPIMAGE` / `APPDIR` もなければ環境を複製して返す。どちらかがあれば復元を試し、失敗時は AppImage 用項目を除去した環境へ fallback | JavaScript の falsy 判定で記録なし。AppImage 外なら環境を複製し、AppImage 内なら除去 fallback | Node `Buffer.from(raw, 'base64')` で復号し UTF-8 化する。NUL 区切りの各項目のうち、`=` があり、その前の名前が空でないものを復元する。少なくとも一つ復元できればその環境を採用し、できなければ `null` として fallback。Node の Base64 decoder に渡す前の厳密な文字列・padding 検証はない（`app/host/server/external-env.mjs:28-40,60-70`） |
+| Rust `original_environment`（更新再起動） | `std::env::var(...).ok()` が `None` となり、現在環境を引き継ぐ fallback | 空文字も `Some("")` として decoder に渡る。空バイト列を復号でき、空の環境 `Some(vec![])` になるため、新プロセスの環境を空にする | decoder は ASCII whitespace を除去し、末尾の `=` または `==` を取り除いてから Base64 alphabet 外の文字があれば失敗する。padding 形式や残り bit の妥当性までは検査しない。復号後は UTF-8 loss replacement を使い、NUL 区切りの `NAME=value` 項目を復元する。Base64 不正なら `None` となり fallback（`app/desktop/src-tauri/src/supervisor.rs:245-271,277-299,359-367`） |
 
-項目のキー・値に追加の文字種、長さ、数値範囲の検査はありません。同じキーが複数回あれば後の項目が先の値を置き換えます。値が `"1"` かどうかの判定はありません（`external-env.mjs:30-40`）。
+Node 経路では `=` より後ろの値は追加の `=` を含めそのまま値にし、同じ名前が複数あれば後の項目が先の値を上書きします。Rust 経路は `split_once('=')` で名前と値に分け、復元した項目をベクターで保持します。どちらも各値に boolean・数値・大小文字の検査はありません（`app/host/server/external-env.mjs:33-39`; `app/desktop/src-tauri/src/supervisor.rs:282-291`）。
 
 ## 有効になる条件
 
-- launcher 側の記録生成は `apps/desktop/scripts/repack-appimage.sh` の再パッケージ処理で、展開した AppImage の `AppRun` に同名の記録行がまだない場合に追加されます（`apps/desktop/scripts/repack-appimage.sh:47-60`）。同名文字列がすでにあれば、このスクリプトは新しい行を追加しません。
-- ホスト側は `APPIMAGE` または `APPDIR` が truthy、あるいはこの記録変数が truthy の場合に外部環境の再構成を行います（`apps/host/server/external-env.mjs:60-70`）。したがって、AppImage 外で記録もなければ変数は環境を変えません。
-- 有効な記録が復元できると、それが外部プログラム用の環境全体になります。ホストプロセスの現在環境とのマージではありません。復元できない場合は現在環境を複製し、AppImage 専用の名前を削除します。`APPDIR` があれば、AppImage 内を指す GTK/GDK/GIO/GST/GI/GSETTINGS/WEBKIT 値や、列挙された path-list 内の AppImage ディレクトリも除きます（`apps/host/server/external-env.mjs:17-26,43-57,69-70`）。
-- 呼び出し時の `extra` は復元環境または fallback 環境の後に展開されるため、同じキーがあれば `extra` が優先します（`external-env.mjs:63-70`）。これはこの helper の呼び出し元から渡される環境上書きであり、CLI 引数との優先順位ではありません。
+- `repack-appimage.sh` で AppImage を再パックするとき、`AppRun` に名前がまだ現れない場合に記録用 export が挿入されます。既に名前があればこの hook は追加されません（`app/desktop/scripts/repack-appimage.sh:79-85`）。
+- Node 側で外部プロセス用環境を作るとき、`APPIMAGE` または `APPDIR` が truthy、あるいは記録値が truthy なら復元・除去処理へ入ります。復元できれば記録環境を丸ごと元にし、復元できなければ現在環境から AppImage 専用名を削除し、`APPDIR` 配下の GTK/GDK/GIO/GST/GI/GSETTINGS/WEBKIT 値と path-list 項目を清掃します（`app/host/server/external-env.mjs:17-26,43-57,60-71`）。この条件は GPU backend や model state に依存しません。
+- Node 経路は helper 呼び出し時に渡された環境を使います（引数省略時はその時点の `process.env`）。`extra` が指定される場合は復元・清掃結果より優先して最後にマージされます。すでに起動した子プロセスには後から反映されません（`app/host/server/external-env.mjs:28-30,44-46,64-70`）。
+- Rust 側の読み取りは Linux の `--window-child` が shell から起動されたものではないと判定され、`restart_after_update()` に入ったときだけ行います。Linux 以外や通常の shell 起動経路ではこの読み取りに進みません（`app/desktop/src-tauri/src/main.rs:929-944`; `app/desktop/src-tauri/src/supervisor.rs:232-237,336-359`）。
+- Rust で記録中に `STRATA_ORIGINAL_ENV` 自体が入れ子で見つかると最大 8 回までその記録をたどります。各階層の記録キーは復元結果から除外されます。8 回の上限まで到達した場合、それ以上の内側記録は読まれません（`app/desktop/src-tauri/src/supervisor.rs:277-299`）。
 
 ## 実行時の詳細
 
-再パッケージスクリプトは `AppRun` の `this_dir=` 行の直後に、`export STRATA_ORIGINAL_ENV="$(env -0 | base64 -w0)"` を挿入します。従って launcher 実行時点の環境を NUL 区切り・base64 形式で子の Strata プロセスへ渡す実装です（`apps/desktop/scripts/repack-appimage.sh:52-58`）。
+Node の `recordedOriginal(env)` は呼び出しごとに `env.STRATA_ORIGINAL_ENV` を読み、値を保存する cache はありません。復元した元環境が一項目以上あれば現在の AppImage 環境とマージせず置き換えます。復元に失敗した場合の `withoutAppImage()` は `APPIMAGE_ONLY` の固定名から `STRATA_ORIGINAL_ENV` も削除します。環境の生成結果は複数の外部プロセス起動経路に渡されますが、Strata 同梱の Node/Python/engine 自身の環境を書き換える処理ではありません（`app/host/server/external-env.mjs:17-26,28-57,67-71`; caller: `app/host/server/chat-files.mjs:92`, `app/host/server/artifacts.mjs:6`, `app/host/server/open-text-file.mjs:28`）。
 
-ホストの `recordedOriginal()` が `env[RECORD]` を読むため、環境値は `externalEnvironment()` を呼ぶたびに評価され、読み取り結果の static cache はありません（`apps/host/server/external-env.mjs:15,29-40,67-71`）。実際の主な呼び出し先は次のとおりです。
+Rust の `restart_after_update()` はこの変数を一度読みます。復元成功時は `env_clear().envs(vars)` で再起動先の環境を復元値に置き換えます。変数が unset、非 Unicode で `std::env::var` が失敗、または decoder が失敗した場合は現在環境を引き継ぎ、`STRATA_WINDOW_PORT`、`STRATA_SHUTDOWN_TOKEN`、`STRATA_SHELL_PID` を取り除きます。この fallback 分岐では `STRATA_ORIGINAL_ENV` 自身は削除対象に含まれません（`app/desktop/src-tauri/src/supervisor.rs:359-367`）。
 
-- Harness 起動時の `agentEnvironment()` は復元環境をもとに、許可リストにあるユーザー環境だけを残し、資格情報らしい名前を除外してから Harness 子プロセスへ渡します（`apps/host/server/agent/harness-runtime.mjs:20-36,75-84`）。
-- Linux のフォルダー選択は `zenity`、`kdialog`、portal 用 `gdbus` に同じ外部環境を渡します（`apps/host/server/folder-dialog.mjs:112-146,153-164`）。
-- ブラウザー opener / `notify-send`、chat file の opener、artifact opener、システムエディター判定にも `externalEnvironment()` の戻り値を渡します（`apps/host/server/app-ui.mjs:38-59`; `apps/host/server/chat-files.mjs:85-94`; `apps/host/server/artifacts.mjs:5-6`; `apps/host/server/open-text-file.mjs:26-29`）。
+Rust decoder が Base64 として受理した内容に `=` を含む NUL 区切り項目がない場合も、失敗ではなく空の復元環境になります。したがって空文字は Node 経路では復元不能扱い、Rust の更新再起動経路では空環境として成功扱いになり、両経路で異なります（`app/host/server/external-env.mjs:30-40,69-70`; `app/desktop/src-tauri/src/supervisor.rs:277-299,359-367`）。
 
-この変数自体について Strata は警告やログを出しません。復元不能時も helper は fallback を返し、そこで終了・例外にはしません（`external-env.mjs:29-41,67-71`）。その後の外部プログラムが起動できるか、どう失敗を表示するかは各呼び出し元で異なります。例えば opener は短時間内の起動エラーや非ゼロ終了を `false` とし、フォルダ選択は候補を順に試して利用不可理由を返します（`app-ui.mjs:34-52`; `folder-dialog.mjs:123-146`）。これらは外部プログラムの挙動そのものをこの変数の効果として断定するものではありません。
+## ログと測定値
+
+Node 側にこの記録値の復元成功・失敗を出す専用ログはありません。Rust の更新再起動は、処理開始時に `started as the app window by the app updater, not by Strata (old app process {old:?}): restarting Strata` を記録し、成功時は `started {program} again (process {id})`、spawn 失敗時は `could not start {program} again: {error}` を記録します。記録値の有無や decode 結果だけを示すログはありません（`app/desktop/src-tauri/src/supervisor.rs:336-339,358-384`）。
+
+元 shell の停止待ちが期限を超える場合は `the old Strata (process {pid}) did not stop within {seconds} s: not starting a second one` を記録して終了コード 0、別の live session がある場合もログを記録してコード 0 で戻ります。再起動先の特定に失敗した場合、または spawn に失敗した場合はコード 1 です（`app/desktop/src-tauri/src/supervisor.rs:340-356,376-384`）。この環境変数に関する性能測定値はありません。
 
 ## 根拠
 
-- `apps/desktop/scripts/repack-appimage.sh:52-60` — AppImage 再パッケージ時の記録行の挿入条件と記録形式。
-- `apps/host/server/external-env.mjs:15,17-26,29-41,43-71` — 変数名、復元、空・不正記録時の扱い、AppImage 専用環境の除去、分岐と優先順位。
-- `apps/host/server/agent/harness-runtime.mjs:20-36,75-84` — Harness へ渡す環境のフィルターと起動。
-- `apps/host/server/folder-dialog.mjs:112-146,153-164`; `apps/host/server/app-ui.mjs:34-59`; `apps/host/server/chat-files.mjs:85-94`; `apps/host/server/artifacts.mjs:5-6`; `apps/host/server/open-text-file.mjs:26-29` — helper の外部プログラム起動経路。
-
-`apps/host/tests/external-env.test.mjs` に復元値や不正値のテスト参照がありますが、上記の挙動判断は本番実装に基づいています。調査対象の HEAD では、環境変数の実読み取りは helper 内の `env[RECORD]` で確認できました。
+- `app/desktop/scripts/repack-appimage.sh:79-85` — AppImage 起動元環境の記録を launcher に追加。
+- `app/host/server/external-env.mjs:15-26,28-40,43-57,60-71` — 記録名、復元処理、AppImage 環境判定、外部環境の選択。
+- `app/host/server/folder-dialog.mjs:112-126`, `app/host/server/app-ui.mjs:39-47,57-60`, `app/host/server/agent/harness-runtime.mjs:25-36` — 外部プロセス環境への適用例。
+- `app/desktop/src-tauri/src/main.rs:929-944` — Linux window-child と updater 再起動の分岐。
+- `app/desktop/src-tauri/src/supervisor.rs:245-271,274-299,336-384` — Rust decoder、最大 8 階層の復元、子プロセス環境と観測可能な結果。

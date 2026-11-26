@@ -1,50 +1,49 @@
 # `STRATA_CHECK_SWAPS`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL の `strata generate` にある resident RAM mode の adaptive tier swap を検査する診断用フックです。通常の推論設定ではなく、入れ替えで GPU cache から退避した expert のバイト列が元の model file と一致するか、実行後に expert の保持状態と RAM copy の内容が整合しているかをログに出します。リポジトリ全体の完全一致検索では、環境変数を読む実装は `sycl/src/program/generate.cpp` の2箇所だけです。
+SYCL 版の resident RAM mode で adaptive swap を行うとき、退避した expert の exchange buffer がモデルファイル上の blob と一致するかを調べる診断用スイッチです。さらに、通常の `generate` 実行の最後に resident RAM と GPU cache の所在数、および RAM blob とファイルの差異を全 expert について監査します。候補選択、swap の選択や生成結果を制御する設定ではありません。`resident_stage_swaps` の swap 処理と `generate` の終了時監査で参照されます（`engine/sycl/src/program/generate.cpp:360-364,404-428,13897-13900,14302-14325`）。
 
 ## 値と判定
 
-どちらの読み取り箇所も `std::getenv()` の結果を文字列全体として parse せず、次の条件で有効・無効を決めます。
+両読み取り箇所とも `std::getenv` の結果を文字列全体ではなく先頭文字で判定します。未設定、空文字、先頭が `0` の文字列は無効です。それ以外は有効で、数値変換、真偽値の文字列比較、空白除去、大文字小文字の判定はありません（`engine/sycl/src/program/generate.cpp:405,14305`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効（`getenv()` が null） |
-| 空文字 | 無効（先頭文字が `\0`） |
-| 先頭文字が `0` | 無効（例: `0`, `0anything`） |
-| それ以外の非空文字列 | 有効（例: `1`, `true`, `false`, `2`, `x`） |
+| 条件（build など） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| SYCL の `resident_stage_swaps` 内 | 診断しない | `1`, `true`, `false`, ` 0`, `00x` 以外で先頭が `0` でない文字列 | 空文字、`0`, `0anything` |
+| SYCL `generate` の終了時監査 | 監査しない | 上と同じ | 上と同じ |
 
-大文字小文字、空白、数値としての妥当性、文字列全体は検査されません。値は関数内で都度読み取られ、`static` cache には保存されません。そのため、各検査が呼ばれる時点でのプロセス環境が判定に使われます（実行中に環境を変更するコードは確認できません）。
-
-根拠: `sycl/src/program/generate.cpp:363,12599`。
+たとえば `false` も有効です。`0anything` は先頭が `0` なので無効です。値に範囲や不正値のエラー処理はありません。
 
 ## 有効になる条件
 
-- swap 中の検査は `FileExpertSource::complement_ready()` が true で、adaptive tier に swap があり、実際に交換用 buffer へ退避する expert が staging 対象になった場合に限り評価されます。resident RAM mode でない場合、swap が空の場合、または対象 swap がない場合は検査されません。
-- 実行後の監査も `src.complement_ready()` が true の場合だけ行われます。
-- 本番ソースで確認できるのは SYCL 側の `generate.cpp` です。CUDA/HIP の同名動作はこの commit の完全一致検索では見つかりません。
+- Strata の SYCL 実装であること。コード参照は `engine/sycl/src/program/generate.cpp` にあり、他 backend の同名読み取りはありません。
+- Swap 時の比較には resident RAM mode が成立して (`src.complement_ready()`)、退避対象 swap があり、exchange buffer へのコピーと stream 同期が成功する必要があります。成立しない場合、関数は診断比較を行わず戻ります（`engine/sycl/src/program/generate.cpp:360-364,370-403`）。
+- 終了時の全体監査は `src.complement_ready()` の場合だけ実行され、上記値条件も満たす必要があります（`engine/sycl/src/program/generate.cpp:14302-14306`）。
+- Resident RAM mode は `--resident-experts` または resident budget 系の CLI 経路で構築され、adaptive tier は `--adapt-every` と `--adapt-swaps` がともに正のときに有効です。環境変数はこれらの CLI 条件を上書きしません（`engine/sycl/src/program/generate.cpp:7056-7067,7098-7137`）。Serve の blocking adaptive 経路も共通の `resident_stage_swaps` を呼びます（`engine/sycl/src/program/generate.cpp:8851-8855,8908-8917`）。
+- GPU 世代、OS、モデル形式、build macro による値判定の違いはありません。SYCL mirror adaptive の経路はこの resident swap helper を経由せず、同 helper の buffer 比較対象ではありません（`engine/sycl/src/program/generate.cpp:8878-8907`）。
 
 ## 実行時の詳細
 
-### Swap ごとの退避内容検査
+`resident_stage_swaps` は、GPU cache から退避する expert を交換用 host buffer にコピーし、使用 stream を待った後で環境変数を読みます。有効時は各 staged blob を `copy_blob_from_file` でモデルファイルから別途読み、buffer と `memcmp` します。一致しない場合は layer/expert を stderr に出し、不一致数を累積します。一致数・不一致数の累計 atomic はプロセス内で保持されますが、環境変数自体は static cache されず、helper が呼ばれるたびに読み直されます（`engine/sycl/src/program/generate.cpp:394-423`）。
 
-`resident_stage_swaps()` は、GPU cache だけが保持している退避対象 expert の bytes を owning device の stream から exchange buffer にコピーし、stream の完了を待ちます。その後、環境変数が有効なら `copy_blob_from_file()` で model file(s) から参照 bytes を読み、exchange buffer と `memcmp()` で比較します。参照読み込みに失敗した場合も「異なる」として数えます。
+比較後も `stage_exchange` による通常の swap 処理を続けます。不一致だけを理由に swap を拒否したり、終了コードを変えたりはしません。`stage_exchange` 自体が失敗した場合は helper が失敗を返し、呼び出し元の adaptive refill エラー経路に進みます（`engine/sycl/src/program/generate.cpp:424-428,13897-13900`）。
 
-不一致ごとに stderr へ `strata: STRATA_CHECK_SWAPS: layer %d expert %d: the exchange buffer differs from the file` を出し、各 batch の集計として `%zu staged, %lld differ (total %lld ok, %lld differ)` を出します。ここでの差異や参照読込失敗は記録されますが、そのこと自体では swap を中止しません。続けて `stage_exchange()` を呼びます。実際の適応 swap からは serve 側と通常 generate 側の双方で `resident_stage_swaps()` が呼ばれます。
+通常の `generate` 実行の終了時は、resident RAM にある全 expert をファイルから再読込して比較し、GPU cache または RAM のどちらにもない expert 数と、ファイルと異なる RAM blob 数を集計します。ファイル読込失敗も blob の差異として数えます。ここでも不一致や未保持 expert はログに出すだけで、監査自体は exit/return を行いません。serve にはこの終了時全体監査の箇所はありませんが、blocking adaptive swap 内の buffer 比較は共通 helper 経由で行われます（`engine/sycl/src/program/generate.cpp:14304-14325,8851-8855,8917`）。
 
-根拠: `sycl/src/program/generate.cpp:318-323,336-386,7903-7912,12253-12256`; `sycl/include/strata/core/expert_source.hpp:573-577`。
+## ログと測定値
 
-### 実行後の保持状態と RAM 内容監査
+Swap 時の不一致は stderr に `strata: STRATA_CHECK_SWAPS: layer %d expert %d: the exchange buffer differs from the file`、各回の件数とプロセス累計は `strata: STRATA_CHECK_SWAPS: %zu staged, %lld differ (total %lld ok, %lld differ)` と出ます（`engine/sycl/src/program/generate.cpp:414-422`）。差異ゼロでも staged swap があれば集計行は出ます。
 
-生成処理の終了付近で、resident RAM mode かつ環境変数が有効なら全 layer/expert を走査します。expert が RAM にも GPU cache にもない数を `held by neither` として数え、RAM copy がある expert については model file(s) の bytes と比較し、不一致数を数えます。不一致の詳細は最大8件 stderr に出し、集計を stdout に `STRATA_CHECK_SWAPS ... audit: ...` として出力します。
+終了時監査では不一致の最初の最大 8 件を stderr に `strata: STRATA_CHECK_SWAPS: layer %d expert %d: the RAM copy differs from the file` と出し、stdout に `STRATA_CHECK_SWAPS audit: ...` の形式で RAM/GPU/未保持/不一致数を出します（`engine/sycl/src/program/generate.cpp:14319-14325`）。差異が見つかった場合も、この診断箇所自体は異常終了させません。
 
-この監査は結果を表示するもので、`lost` や `stale` が0でない場合に終了コードを変更したり処理を失敗させたりする分岐はありません。どちらの検査もファイルから参照 bytes を読むため、診断が有効な実行では追加の読み込みと比較処理が発生します。
+## 根拠
 
-根拠: `sycl/src/program/generate.cpp:12592-12620`。
-
-## 文書との照合
-
-`docs/DETAILS.md` および `docs/` 内に `STRATA_CHECK_SWAPS` の説明は見つかりませんでした。性能値や正確性の測定結果はこの変数について記載していません。
+- `engine/sycl/src/program/generate.cpp:360-433` — resident swap の前提、exchange buffer の検査、ログ、swap 継続。
+- `engine/sycl/src/program/generate.cpp:7056-7137` — resident RAM mode と adaptive swap の CLI 条件。
+- `engine/sycl/src/program/generate.cpp:8851-8917` — serve adaptive 経路と helper 呼び出し。
+- `engine/sycl/src/program/generate.cpp:14302-14325` — generate 終了時の全体監査。
+- `engine/sycl/include/strata/core/expert_source.hpp:499-514,575-579` — resident/exchange の契約と、モデルファイルから読む `copy_blob_from_file`。
+- `docs/DETAILS.md:261-282` — resident RAM mode と adaptive tier の説明。`STRATA_CHECK_SWAPS` 自体の説明はなく、上記の診断挙動はソースコードに基づきます。

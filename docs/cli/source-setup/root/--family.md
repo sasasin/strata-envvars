@@ -1,64 +1,63 @@
 # `--family`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`SETUP.bat`、`update.sh`、`UPDATE.bat` からも委譲） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat`（root） |
 | オプション | `--family` |
 | 別名 | なし |
-| 値 | family ID を1つ指定。通常の Windows/Linux setup では `qwen`、`swift`、`coder`、`unsloth`、`gyro`、`nvfp4`、`qwen36`、`deepseek41` |
+| 値 | family ID 文字列。root parser の組み込み候補は `qwen`、`swift`、`coder`、`unsloth`、`gyro`、`nvfp4`、`qwen36`、`hy4-flash`、`inkling-2-mini`。署名済み update feed にモデル定義がある場合は追加候補が動的に読み込まれる。 |
 
 ## 役割
 
-インストールまたは設定変更時に対象モデルのファミリーを選びます。ファミリーはモデルファイルの出所・形式や、その後に使う準備・engine 経路を選ぶ識別子です。値を省略した場合は通常 setup のモデル選択メニューで選びます（`setup.py:8911-8937`）。
+導入・設定するモデル群を選び、family に対応したモデル一覧、ファイル定義、セットアップ経路を決める。省略時は対話メニューで選択する。指定した場合も通常 family では `--model` を省略でき、その family のサイズ選択に進む。`--model` と併用すると、family とサイズの組み合わせを検証する。
 
 ## 使い方
 
-```sh
-./setup.sh --family swift --model IQ3_XXS --no-start
+```bash
+# Qwen family の IQ3_S を導入し、モデル起動は行わない。モデル等の取得・準備と設定書き込みは行う。
+./setup.sh --family qwen --model IQ3_S --yes --no-start
 ```
 
-Linux では `setup.sh` が引数を `setup.py` に渡します。Windows の `START-HERE.bat` も同様に全引数を渡し、`SETUP.bat` は `--setup` を付けて `START-HERE.bat` を呼びます（`setup.sh:9-13`、`START-HERE.bat:44-54`、`SETUP.bat:1-3`）。更新 wrapper も引数を setup に渡します（`update.sh:62`、`UPDATE.bat:1-6`）。
+`setup.sh` は引数を `terminal/setup.py` に転送する。Windows の `START-HERE.bat` も同様に `setup.py` を起動する。Apple Silicon の通常モデル導入は `engine/metal/setup_mac.py` に委譲され、その parser は別スコープのためこの文書の対象外（`setup.sh:8-17`、`START-HERE.bat:8-17,49-65`、`terminal/setup.py:11436-11437`）。
 
 ## 値と既定値
 
-通常の Windows/Linux setup では `argparse` の `choices` が `FAMILIES`、`PREVIEW_FAMILIES`、`MULTI_FILE_FAMILIES` のキーを受け付けます。現在の値は `qwen`、`swift`、`coder`、`unsloth`、`gyro`、`nvfp4`、`qwen36`、`deepseek41` です。`PREVIEW_FAMILIES` は `OWN_PATH_FAMILIES` の別名で、ここでは `qwen36`、複数ファイル family は `deepseek41` です（`setup.py:568-619`、`setup.py:633-656`、`setup.py:735-777`、`setup.py:8420-8424`）。
-
-値は必須で、既定値は未指定（`None`）です。同じオプションを複数回指定した場合、通常 parser は標準の `argparse` の単一値 action を使うため最後の値が残ります。未対応値や値の欠落は parser が usage error として拒否し、setup 本体には進みません（`setup.py:8420-8424`）。
-
-`setup.py` 冒頭の説明は `qwen|swift` のみを例示していますが、現行 parser の choices と一致しません（`setup.py:23`、`setup.py:8421-8424`）。上記の値一覧は実際の parser 定義と family 辞書に基づきます。
+- root parser は `FAMILIES`、`PREVIEW_FAMILIES`、`HY4_FAMILIES`、`INKLING_FAMILIES` のキーを `choices` として受理する。現行の組み込みキーはそれぞれ通常 family が `qwen` / `swift` / `coder` / `unsloth` / `gyro` / `nvfp4`、独自 engine path が `qwen36`、個別 engine family が `hy4-flash` と `inkling-2-mini`（`terminal/setup.py:723-775,789-812,818-832,11444-11448`）。
+- 未指定時に parser が入れる family 既定値はない。導入メニューを出す経路では family を対話選択する。`--yes` を指定しても family の固定値は設定されず、tier と候補に基づく推奨 family が選ばれる（`terminal/setup.py:11988-12018`）。
+- 初回の引数確認で組み込み表にない family が見つかると、署名済み feed のモデル一覧（または最後に検証済みの一覧）を読み込み、候補表を更新してから argparse を構築する。このため受理候補は checkout 内の固定リストだけでは完結しない（`terminal/setup.py:11438-11448,9645-9647,9677-9692`）。
+- 値なし、未登録の family、または parser の候補に入らなかった値は argparse の選択肢検証で拒否される。`--family` を付けた状態でサイズがその family に属さない場合も、利用可能なサイズを示して失敗する（`terminal/setup.py:11445-11448,12046-12054`）。
 
 ## 実行時の動作
 
-通常の Windows/Linux 経路では、family を指定すると `a.family` が明示的な setup 条件になります。インストール済みモデルの通常起動分岐を避け、モデル選択時に指定値を使います。続いて `qwen36` は `install_own_path`、`deepseek41` は `install_dsv41`、その他は `FAMILIES` の定義に基づく標準の family install 経路へ進みます（`setup.py:8603-8620`、`setup.py:8677-8682`、`setup.py:8911-8938`）。setup はモデル取得・準備・設定ファイルと run script の作成を行い、`--no-start` がなければ最後にモデルを起動します（`setup.py:8146-8158`）。
+family が明示されると対話の family 選択を省き、その値で分岐する。`qwen36` は `install_own_path`、`hy4-flash` は `install_hy4_flash`、`inkling-2-mini` は `install_inkling2` へ入り、その他は `FAMILIES[family]` の定義を使う通常のセットアップ経路に進む（`terminal/setup.py:11993-12025`）。通常経路では family に属するモデル候補だけを表示・検証し、family 定義から対応するファイルや設定を決める（`terminal/setup.py:723-775,12046-12055`）。
 
-`--model` と併用すると、指定 family のモデル一覧からその値を選びます。対応しないモデル値は family ごとの選択肢を示すエラーになります。モデル値だけを指定する場合も、family が判明しない特別なモデルでは対応 family を指定するよう parser error になります（`setup.py:8553-8556`、`setup.py:8952-8960`）。
-
-`--calibrate` と併用した場合は新規 setup の family 選択ではなく、既存設定のうち指定 family に一致するモデルを calibration 対象に絞ります。該当するインストールがなければ失敗します（`setup.py:6433-6442`、`setup.py:8656-8662`）。`--update` 経路は通常の setup 選択より先に処理されるため、その経路では `--family` によるモデル選択は行われません（`setup.py:8617-8620`）。
+`--model` を併記するとそのサイズを選び、family に属さないサイズなら family 名・有効サイズを含むエラーになる。`--gguf-dir` の GGUF ファイル名から family と model の組み合わせが一意に特定できる場合は、`--family` を省略しても値が補われる（`terminal/setup.py:11983-11987,12046-12054`）。
 
 ## 適用条件と副作用
 
-- 通常の Windows/Linux setup で `nvfp4` を選び AMD HIP backend を使うと、HIP engine に NVFP4 kernel がないため停止します（`setup.py:8938-8942`）。
-- macOS の通常（非 Control）setup は `setup.py` の parser より前に `metal/setup_mac.py` へ引数を渡します。この parser が受理する family は `qwen`、`unsloth`、`gyro` のみです。モデル指定がある場合、実際の family はモデル定義から決まり、指定 family が異なると警告してモデル側の family を使います（`setup.py:8418-8419`、`metal/setup_mac.py:327-331`、`metal/setup_mac.py:392-419`）。
-- macOS の Control setup は `setup.py` parser を通りますが、family として `qwen` / `gyro` 以外を指定すると失敗します（`setup.py:8561-8563`、`setup.py:8261-8265`）。
-- family 選択は実際のインストール経路に影響するため、モデルファイルのダウンロードや準備、設定・起動 script の書き込みを伴い得ます。起動を避ける場合は `--no-start` を併用します（`setup.py:8932-8938`、`setup.py:8146-8158`）。
+- `--check`、`--prepare-pack`、`--inspect` など先行する別モードは通常のモデル導入分岐より前に処理されるため、その経路では `--family` が通常のモデル導入を開始するわけではない（`terminal/setup.py:11624-11638,11775-11779`）。
+- root parser の `--family` 候補の事前確認では、組み込み表にない名前に対して feed を取得できる設定なら feed を読み込む。feed source が得られない場合は最後に検証済みのモデル一覧を使う（`terminal/setup.py:11438-11444,9677-9692`）。
+- family の選択後に進む導入処理は、モデルファイル取得・検証、モデル準備、エンジンや実行設定の用意を行い得る。`--no-start` は導入後のモデル起動を抑えるが、これらの導入処理を取り消さない（通常 family の選択・モデル導入開始: `terminal/setup.py:12019-12025,12046-12055`）。
+- DeepSeek の退役 family 名は parser に到達する前に案内を表示して終了コード `2` で終了する。`--model` だけが退役名の場合も条件により同様に拒否する（`terminal/setup.py:11429-11433`）。
+- `engine/metal/setup_mac.py` は `--family` の別 parser を持ち、Mac では `qwen` / `unsloth` / `gyro` と feed family を受け付ける。Mac parser は不明な残余引数も警告して続行する。この挙動は root parser の検証と異なる（`engine/metal/setup_mac.py:361-379,403-410`）。
 
 ## 出力とエラー
 
-不正な値・値の欠落は `argparse` が usage とエラーを表示して終了します。setup 内の非対応条件は `fail()` が理由と任意の案内を表示し、終了コード1で停止します（`setup.py:825-830`）。たとえば macOS Control setup で対応外 family を指定した場合や、AMD HIP で NVFP4 を選んだ場合が該当します（`setup.py:8263-8265`、`setup.py:8939-8942`）。
-
-## 調査範囲
-
-同一 revision のソースを参照しました。`--help` は実行しておらず、説明文と parser の食い違いはソース上で確認しています。全 OS・backend の実機実行、ダウンロードや engine 起動の結果は調査していません。
+標準の argparse により無効な候補は usage と選択肢エラーになり、終了コードは argparse の通常のエラー経路に従う。退役 family は独自メッセージを表示して `2` を返す。Intel Arc 経路で通常 family が SYCL engine に対応しない場合は family 選択後に失敗する（`terminal/setup.py:11429-11448,9378-9382`）。family と model の不一致は候補 family と有効サイズを含むセットアップエラーになる（`terminal/setup.py:12046-12054`）。
 
 ## 根拠
 
-- Parser と早期検証: `setup.py:8418-8424`、`setup.py:8553-8564`
-- Family 定義: `setup.py:568-619`、`setup.py:633-656`、`setup.py:735-777`
-- setup 起動判定と family 分岐: `setup.py:8603-8620`、`setup.py:8911-8945`
-- Model 選択・設定書き込み・起動: `setup.py:8952-8960`、`setup.py:8146-8158`
-- Calibration の family 絞り込み: `setup.py:6433-6442`、`setup.py:8656-8662`
-- macOS Metal parser と family 解決: `metal/setup_mac.py:327-358`、`metal/setup_mac.py:392-419`
-- Wrapper の引数委譲: `setup.sh:9-13`、`START-HERE.bat:44-54`、`SETUP.bat:1-3`、`update.sh:62`、`UPDATE.bat:1-6`
+- `terminal/setup.py:11427-11448` — 早期の family 確認、動的 feed 読み込み条件、root parser の `choices`。
+- `terminal/setup.py:723-832` — 組み込み family 定義と独自導入経路 family。
+- `terminal/setup.py:9645-9692` — feed family 表と署名済み feed モデルの読み込み。
+- `terminal/setup.py:11619-11638` — model/family の初期検証とモード分岐。
+- `terminal/setup.py:11983-12025` — `--gguf-dir` からの補完、対話選択、family 別の導入関数への分岐。
+- `terminal/setup.py:12046-12055` — family に属する model サイズの候補化と不一致エラー。
+- `terminal/setup.py:9363-9382` — SYCL 経路での family 既定値と対応可否検証。
+- `setup.sh:8-17`、`START-HERE.bat:8-17,49-65` — POSIX / Windows wrapper から `setup.py` への引数転送。
+- `engine/metal/setup_mac.py:361-410` — Mac 用の別 parser と引数処理。
+
+調査範囲は Strata 所有ソースの root setup parser、family 表、選択・分岐処理、および Mac 委譲境界。調査中に CLI を実行しておらず、feed の実行時内容は確認していないため、動的な feed family 名は列挙していない。

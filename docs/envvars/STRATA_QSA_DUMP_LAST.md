@@ -1,46 +1,43 @@
 # `STRATA_QSA_DUMP_LAST`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点、HEAD の commit 日付は 2026-10-12）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-QSA の prompt prefill で、各 layer が選んだセル ID をダンプする位置範囲の末尾を指定します。これは診断用データ出力の範囲指定で、QSA の選択や attention の計算方法は変えません。
-
-この変数だけではダンプは始まりません。`STRATA_QSA_DUMP` が設定されている場合に限り、ダンプ対象の判定に使われます。CUDA/HIP 側の `src/prefill/prefill.cpp` と SYCL 側の `sycl/src/prefill/prefill.cpp` に同じ処理があります。
+QSA の選択セルを `STRATA_QSA_DUMP` のファイルへ追記する診断処理について、どの prompt position の chunk を dump するかを指定する。CUDA/HIP と SYCL の chunk 処理で、`p0 + T > pos0 + n - last` のときにその chunk の選択セルを出力する。変数単独では dump を有効にせず、`STRATA_QSA_DUMP` が設定されている場合にだけ値を読む。通常の QSA 選択・attention の計算そのものを切り替える値ではない（CUDA/HIP: `engine/src/prefill/prefill.cpp:5507-5531`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3820-3844`）。
 
 ## 値と判定
 
-| `STRATA_QSA_DUMP_LAST` | 判定結果 |
-|---|---|
-| unset | `4096` |
-| 設定あり | `std::atoll()` で変換した `long long` 値 |
+`STRATA_QSA_DUMP` が設定され、該当する QSA prefill 処理に到達したとき、`std::getenv` で取得した文字列を `std::atoll` に渡す。変換後の値を clamp したり、文字列全体が数値であることを検査したりするコードはない。未設定だけ既定値 `4096` となる。明示的な空文字や数値として読めない文字列は `atoll` の変換結果 `0` となる。符号と先頭の空白は数値変換で扱われ、数値の後ろの文字は検査されないため、例えば `12tail` は `12` として扱われる。オーバーフロー値の扱いはこのコードで検査・規定していない（CUDA/HIP: `engine/src/prefill/prefill.cpp:5512-5516`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3823-3826`）。
 
-文字列全体の妥当性検査や範囲 clamp はありません。`atoll` の変換規則に従い、先頭の空白と符号は受け付け、数字列の後ろに続く文字は数値変換に使われません。空文字や数字で始まらない文字列は `0` になります。負値も正値と同様に比較へ使われます。
+| 条件 | unset | 有効になる値（例） | 無効になる値・範囲例 |
+|---|---|---|---|
+| `STRATA_QSA_DUMP` が未設定 | 関連処理に入らず、この変数も読まない | なし | すべて無視 |
+| CUDA/HIP または SYCL の dump 処理に到達し、`STRATA_QSA_DUMP` が設定済み | `4096` | 正の値（`1`, `4096`, `12tail`）で、chunk の終端が指定した末尾境界を越えると dump 対象になる | `0`, 負値（通常の position 範囲では条件成立なし）、空文字、`true`, `false`, `0anything`（いずれも変換結果 0） |
 
-ダンプするかは `p0 + T > pos0 + n - last` で判定します。`last` は「必ず最後の N 位置だけを切り出す」上限ではありません。条件に合った chunk の全 `T` 行を出力するため、境界が chunk の途中にあれば境界より前の行も含まれます。`last` が 0 または負数なら通常この条件を満たさず、正数が prompt 全体より大きい場合は全 chunk が対象になり得ます。
+「有効」は末尾境界の計算に使われるという意味で、chunk が実際に条件を満たすかは別に判定される。`0` なら境界は prompt の終端 `pos0 + n` となり、chunk 終端は通常これを越えないため dump されない。正値でも chunk 単位の判定なので、指定位置数より多い position が含まれる chunk 全体が出力されることがある。値が prompt 長より大きい場合、境界が prompt 開始位置より前になり得るため、全 chunk が対象になり得る（同上）。
 
 ## 有効になる条件
 
-- QSA を含む prompt prefill 経路を実行すること。
-- `STRATA_QSA_DUMP` が環境に設定されていること。空文字も「設定あり」として扱われますが、空のファイル名は通常 `fopen` に失敗します。
-- 判定対象の chunk が上記の位置条件を満たすこと。
-
-`STRATA_QSA_DUMP` が unset なら、この変数の値は読み取られません。CUDA/HIP 実装では CUDA stream の同期と device-to-host copy、SYCL 実装では queue の待機と device-to-host copy を行ってからファイルへ出力します。そのため、対象 chunk では診断用の同期・転送・ファイル I/O が追加されます。
+- `STRATA_QSA_DUMP` が設定されている必要がある。値が空文字でも設定済みとして分岐に入るが、空のパスへの `fopen` は失敗し、dump は作られない（`engine/src/prefill/prefill.cpp:5512,5520`、`engine/sycl/src/prefill/prefill.cpp:3823,3838`）。
+- 実行が QSA prefill layer/chunk 処理まで到達する必要がある。decode-only 処理にはこの読み取り位置がない（CUDA/HIP: `engine/src/prefill/prefill.cpp:5507-5516`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3820-3826`）。
+- CUDA/HIP の `Prefill::run` が layer-major 経路を選ぶと `run_layer_major` を呼んで戻るため、`run_impl` 内にあるこの dump 処理を通らない。Metal は `Prefill::run` で Metal prompt 経路へ分岐して戻る。これらの経路では本変数は適用されない（`engine/src/prefill/prefill.cpp:9629-9651,9657-9705`）。SYCL の `Prefill::run` は `run_impl` を呼ぶ（`engine/sycl/src/prefill/prefill.cpp:5959-5963`）。
+- CUDA/HIP ではさらに `STRATA_QSA_DUMP_LAYER` が設定されている場合、`atoi` で得た値が負値なら全 QSA layer、非負なら一致する `qsa_index` だけを出力する。この条件は `STRATA_QSA_DUMP_LAST` の末尾判定と AND で適用される。SYCL 実装にはこの layer filter がない（CUDA/HIP: `engine/src/prefill/prefill.cpp:5515-5516`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3823-3826`）。
+- `STRATA_QSA_DUMP_STEPS` は CUDA/HIP で追加の step 配列も書くかを設定するが、末尾境界の計算には影響しない。SYCL の同 dump 箇所では step 配列を出力しない（`engine/src/prefill/prefill.cpp:5524-5529`、`engine/sycl/src/prefill/prefill.cpp:3838-3843`）。
 
 ## 実行時の詳細
 
-`STRATA_QSA_DUMP` と `STRATA_QSA_DUMP_LAST` は、prefill 中の該当コードに初めて到達したとき `static` 変数へ保存されます。設定をプロセス起動後に変更しても、そのプロセスでは再評価されません。先に `STRATA_QSA_DUMP` が unset の状態で初期化されると、後から設定してもダンプは有効になりません。
+両 backend とも、`STRATA_QSA_DUMP` の path は関数内 `static` として初めて該当処理に到達したときに読み込まれ、その後はプロセス内で cache される。`STRATA_QSA_DUMP_LAST` も static local で、dump path が設定されている場合に初めて評価され、一度変換した値がその後の呼び出しで使われる。したがって実行中に環境を変更しても、初回読み込み後は反映されない。`STRATA_QSA_DUMP` が未設定のままなら `STRATA_QSA_DUMP_LAST` の初期化自体が実行されない（CUDA/HIP: `engine/src/prefill/prefill.cpp:5512-5515`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3823-3825`）。
 
-ファイルは `STRATA_QSA_DUMP` の値をパスとして `ab`（追記・バイナリ）で開きます。各対象 QSA layer / chunk について、先頭に int32 4 個（QSA layer index、chunk の `p0`、行数 `T`、capacity `cap`）、続けて `T * cap` 個の int32 cell ID を書きます。ID 配列は GPU から host へコピーされます。既存ファイルの形式確認や初期化はせず、そのまま追記します。
+条件を満たす chunk では、選択セル ID 配列を host memory にコピーして stream/queue を同期し、`STRATA_QSA_DUMP` のファイルを append binary (`ab`) で開く。各 record は int32 4 個の `{qsa_index, p0, T, cap}` header と `T * cap` 個の int32 selection ID からなる。ファイルは複数 record を追記する形式で、既存内容を truncate しない。CUDA/HIP では `STRATA_QSA_DUMP_STEPS` が設定されていると `T * kStepCount` 個の int32 step data も続けて書く（`engine/src/prefill/prefill.cpp:5516-5529`）。
 
-ファイルを開けない場合はそのレコードを書きませんが、この箇所から警告やエラーは出ません。`fwrite` の戻り値も確認されていません。設定が出力先として意図したファイルに書けたかは、このコードだけでは利用者に通知されません。
+## ログと測定値
 
-コメントは `tools/qsa_locality.py` 用のデータとしていますが、調査対象 HEAD にはそのツールも `STRATA_QSA_DUMP_LAST` の説明も見つかりませんでした。`docs/DETAILS.md` にもこの診断変数の説明や測定値はありません。
+この変数に固有のログや警告はない。ファイルを `fopen` できなかった場合は if 文内の書き込みを行わず、その失敗をログや戻り値に反映しない。`fwrite` の戻り値も検査しない（CUDA/HIP: `engine/src/prefill/prefill.cpp:5520-5529`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3838-3842`）。実装コメントは `tools/qsa_locality.py` 用の dump と説明しているが、測定結果はこの値の仕様根拠として記載していない（`engine/src/prefill/prefill.cpp:5507-5511`、`engine/sycl/src/prefill/prefill.cpp:3820-3822`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:2844-2860`: 環境変数の読み取り、既定値、位置判定、CUDA 側の copy / append 出力。
-- `sycl/src/prefill/prefill.cpp:3131-3155`: SYCL 側の同じ判定と出力。
-- `src/prefill/prefill.cpp:2142`: `p0` は `pos0 + c0`、`T` は現在の prompt chunk の行数。
-- `CMakeLists.txt:589-592`: CUDA/HIP の `strata_prefill` が `src/prefill/prefill.cpp` を含む。
-- `sycl/CMakeLists.txt:233-235`: SYCL の `strata_prefill` が対応する prefill 実装を解決して含める。
+- `engine/src/prefill/prefill.cpp:5507-5531` — CUDA/HIP の読み取り、境界判定、layer filter、データ追記。
+- `engine/sycl/src/prefill/prefill.cpp:3820-3844` — SYCL の読み取り、境界判定、データ追記。
+- `engine/src/prefill/prefill.cpp:9629-9705` — Metal と CUDA/HIP layer-major 経路の分岐、および `run_impl` 呼び出し。
+- `engine/sycl/src/prefill/prefill.cpp:5959-5963` — SYCL の `run_impl` 呼び出し。

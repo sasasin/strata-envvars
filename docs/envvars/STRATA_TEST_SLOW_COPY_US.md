@@ -1,47 +1,47 @@
 # `STRATA_TEST_SLOW_COPY_US`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-checkpoint の host-side コピーを意図的に遅くする診断用フックです。`src/core/conversation_copy.hpp` のコメントは tests only としていますが、値を読むコードにテスト専用のビルド条件はありません。設定すると、そのプロセスでこの共通コピー処理を通る checkpoint capture に遅延が加わります。
-
-このコピー処理は、会話切り替え時に現在の会話を RAM に退避する処理と、session 保存時の checkpoint capture から呼ばれます。復元処理や GPU 上の K/V コピーを遅くする変数ではありません。
+CUDA/HIP エンジンの会話 checkpoint をホストメモリ上で複製するとき、複製の各約 1 MiB 区間の後に指定マイクロ秒だけ待つフックです。コピー内容や checkpoint の選択は変えず、区間ごとの待ち時間を加えます。コメントは「tests only」としていますが、この値を読むコードにテスト専用の `#if` や build macro ガードはなく、`strata_engine` に含まれる共有実装です。実際に効くのは checkpoint / snapshot のコピー関数が呼ばれたときです（`engine/src/core/conversation_copy.hpp:167-183,206-216`、`engine/cmake/strata_gpu_engine.cmake:305-316`）。
 
 ## 値と判定
 
-値は `std::atol()` で `long` に変換され、その結果が 0 より大きい場合だけ遅延に使われます。文字列全体の厳密な検証はありません。
+`test_slow_copy_us()` が `std::getenv` で読み、`std::atol` で `long` に変換します。文字列全体の検証、`errno` 確認、範囲制限はありません。`atol` が読める先頭の符号付き整数部分だけを使い、先頭の空白は許容し、後続の非数字は無視します。得た値が `> 0` の場合だけ待ちます（`engine/src/core/conversation_copy.hpp:169-171,182,215`）。
 
-| 入力例 | 結果 |
-|---|---|
-| 未設定 | 0。遅延なし |
-| 空文字、数値に変換できない文字列、`0`、`-5` | 0 以下。遅延なし |
-| `250` | 250 マイクロ秒の遅延 |
-| `250us`、`250.9` | `atol()` が先頭の整数部分を読むため、250 マイクロ秒 |
+| 条件 | 未設定 | 待ちが有効になる値の例 | 待ちが無効になる値の例 |
+|---|---|---|---|
+| この CUDA/HIP コピー実装 | `0`（待ちなし） | `1` は区間ごとに 1 µs、`12tail` は 12 µs、`  +12x` は 12 µs、`2.5` は 2 µs | 空文字、`0`、`0anything`、`true`、`-1` は変換結果が正にならず待ちなし |
 
-`atol()` のため、先頭の空白や符号を受け付け、数字の後ろに続く文字は変換結果に含まれません。先頭から数値として変換できない文字列は 0 になります。
+数値として読めない先頭部分は `atol` により `0` です。`long` の表現範囲外の文字列に対する `atol` の結果は安全に扱うコードがなく、この実装では有効な設定値として保証されません（`engine/src/core/conversation_copy.hpp:169-170`）。
 
 ## 有効になる条件
 
-- 会話 checkpoint の vector が空でなく、`copy_beating()` が少なくとも1回のコピー区間を処理すること。
-- 読み取った値が `long` として正しく変換され、かつ正であること。
-- 環境変数の評価は `test_slow_copy_us()` 内の `static const long` に保存されます。最初にコピー区間が処理された時点の値がプロセス内で再利用され、その後の環境変更は反映されません。
-
-変数が未設定でも checkpoint コピー自体は行われます。遅延だけが追加されません。空 vector はループ本体を通らないため helper を呼ばず、その時点では値の初回評価も起きません。
+- `engine/src/core/conversation_copy.hpp` を含む CUDA/HIP の `strata_engine` が使われること。この名前の読み取りはリポジトリ内で同ファイルの 1 箇所だけにあり、SYCL / Metal 側の別実装では見つかりません（`engine/src/core/conversation_copy.hpp:169-170`、`engine/cmake/strata_gpu_engine.cmake:310-316`）。
+- checkpoint の保存・snapshot・交換で、`copy_checkpoints_beating` または `copy_beating` / `assign_beating` が実行され、対象 vector に少なくとも 1 区間の要素があること。呼び出し元には会話の park、セッション保存、park 済み会話の交換があります（`engine/src/core/conversation_state.cpp:563-592,703-721,829-845`、`engine/src/program/generate.cpp:14467-14482,18687-18703,19803-19809`）。空の vector はループに入らず、この値を読む呼び出しも起きません。
+- CLI 引数による上書きや、この値の既定値を変える別環境変数はありません。読み取りはプロセス環境から直接行われます（`engine/src/core/conversation_copy.hpp:169-171`）。
 
 ## 実行時の詳細
 
-`copy_beating()` は各 vector を `max(1, 1 MiB / sizeof(T))` 要素ずつ複製します。各区間の複製後、設定値が正なら `std::this_thread::sleep_for(std::chrono::microseconds(us))` を実行し、その後 watchdog 用の `progress_beat()` を呼びます。したがって遅延は vector 1個あたりの合計ではなく、各処理区間ごとに追加されます。区間が 1 MiB 未満で終わる場合もその最後の区間に遅延します。
+最初に非空のコピー区間で `test_slow_copy_us()` が呼ばれると、関数内 `static` に変換値を保存します。その後のコピーでは同じ値を使い、プロセス実行中に環境を変更しても反映されません。未設定ならキャッシュされる値は `0` です（`engine/src/core/conversation_copy.hpp:169-171,175-183`）。
 
-`copy_checkpoint_beating()` は `ids`, `imgs`, `gdn`, `ple`, `tails`, `dead`, `block_pos` の各 vector をこの方法で複製し、`stage_parts` も再帰的に処理します。`copy_checkpoints_beating()` は checkpoint 群すべてに適用します。呼び出し元は `conversation_snapshot_save()` と `conversation_snapshot_sources()` で、前者は会話の RAM 退避、後者は session file 保存時の metadata capture に使われます。
+`copy_beating` と `assign_beating` は各 vector を最大およそ 1 MiB 相当の要素数に分けて複製し、各区間の複製後に値が正なら `sleep_for(microseconds(us))` を呼び、その後 `progress_beat()` を行います。最後の短い区間にも待ちが入ります。checkpoint 内の複数 vector と再帰的な `stage_parts` それぞれで同じ処理を行います。park 済み会話の交換では checkpoint に加えて live の `ids` と `images` も `copy_beating` で複製されます（`engine/src/core/conversation_copy.hpp:175-216,188-203,220-250`、`engine/src/core/conversation_state.cpp:842-845`）。
 
-環境変数そのものによるログ出力やエラー処理はありません。正の値では各区間の待機時間が増え、待機後も `progress_beat()` が続きます。資料 `docs/DETAILS.md:655-665` は会話退避中の checkpoint copy が OS の page-in により長時間かかる事例と進捗通知を説明していますが、このテスト用環境変数の説明や測定値は記載していません。
+この処理はコピーを遅らせますが、コピーする配列の値は通常どおり複製されます。`progress_beat()` は進捗カウンターを増やします（`engine/include/strata/core/progress.hpp:56-70`）。serve watchdog は進捗が止まった時間を監視し、既定で 60 秒間 heartbeat がなく、I/O 猶予も適用されない場合は stderr に停止メッセージを出して `abort()` します。したがって、非常に長い待ちの最中に他の進捗がなく watchdog の期限に達すれば、追加待ちが停止経路に関係します。これはこの変数固有のログやエラーではありません（`engine/src/program/generate.cpp:16261-16271,16287-16321`）。
+
+## ログと測定値
+
+この変数を読み取ったことや待ちを加えたことを示す専用ログはありません。上記 watchdog 条件に該当すると、実装は `strata serve: no progress for %lld s during a request (%s) - stopping the engine so the server starts it again (issue #29)` を stderr に出し、GPU wait を解放して `abort()` します（`engine/src/program/generate.cpp:16313-16321`）。
+
+この変数を使った性能測定値は `docs/DETAILS.md` に見つかりません。同資料の会話コピー表は別の `STRATA_CKPT_*` / `STRATA_PARK_*` スイッチの測定であり、本変数の測定値としては扱いません（`docs/DETAILS.md:1784-1800`）。
 
 ## 根拠
 
-- `src/core/conversation_copy.hpp:46-62`: tests only という注釈、`atol()`、static cache、区間サイズ、正値時の sleep、および progress 通知。
-- `src/core/conversation_copy.hpp:67-87`: checkpoint vector 群と stage checkpoint への適用。
-- `src/core/conversation_state.cpp:249-287`: snapshot save / session sources が checkpoint copy helper を呼ぶ箇所。
-- `src/program/generate.cpp:7883-7892,8013-8025`: 会話切り替え時の退避経路と各 stage snapshot capture。
-- `src/program/generate.cpp:10009-10024`: session 保存時の `conversation_snapshot_sources()` 呼び出し。
-- `docs/DETAILS.md:655-665`: 会話退避の遅い checkpoint copy と watchdog 進捗に関する背景説明。
+- 環境読み取り・変換・キャッシュ: `engine/src/core/conversation_copy.hpp:167-171`
+- 区間分割・追加待ち・進捗通知: `engine/src/core/conversation_copy.hpp:175-216`
+- checkpoint vector の複製と再帰処理: `engine/src/core/conversation_copy.hpp:188-252`
+- snapshot / session / swap の呼び出し元: `engine/src/core/conversation_state.cpp:563-592,703-721,829-845`、`engine/src/program/generate.cpp:14467-14482,18687-18703,19803-19809`
+- CUDA/HIP エンジンへの組み込み: `engine/cmake/strata_gpu_engine.cmake:305-316`
+- heartbeat の実装と serve watchdog: `engine/include/strata/core/progress.hpp:56-75`、`engine/src/program/generate.cpp:16261-16321`
+- 関連コピー機能の資料との照合: `docs/DETAILS.md:1784-1800`

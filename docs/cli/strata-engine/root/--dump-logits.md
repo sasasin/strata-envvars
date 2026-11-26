@@ -1,54 +1,58 @@
 # `--dump-logits`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン、root parser） |
-| オプション | `--dump-logits PATH` |
+| コマンド | `strata generate`（root） |
+| オプション | `--dump-logits` |
 | 別名 | なし |
-| 値 | 出力ファイルのパス。文字列を1つ取る。 |
+| 値 | 出力先ファイルのパス（`PATH`） |
 
 ## 役割
 
-生成位置ごとの語彙 logits を raw float データとしてファイルへ保存します。推論結果の比較・検査など、後段ツールで各位置の logits を読む用途向けです。トークナイザーはこのエンジンに含まれず、入力 token は `--tokens` または `--tokens-file` で別途与えます。
+通常の token loop が計算した各位置の raw logits を、後から比較・解析できるバイナリファイルに保存します。既定では出力しません。CUDA/HIP 系 `engine/src/program/generate.cpp` の parser と実行箇所を確認しました。この parser はパスの形式や拡張子を検証せず、指定先を `wb`（書き込み・既存内容を切り詰めるモード）で開きます。
 
 ## 使い方
 
 ```sh
-strata --pack pack/full --tokens 1,2,3 --max-new 1 --dump-logits /tmp/strata-logits.f32
+strata generate --pack pack/full --tokens "1,2,3" \
+  --ple-gguf ./path/to/ple.gguf --dump-logits ./logits.bin
 ```
 
-モデル pack や必要な追加データの指定は環境に合わせてください。この例は `--dump-logits` の引数形式を示すもので、モデル固有の実行条件を保証するものではありません。
+`--tokens` は pack に対応した token ID 列、`--ple-gguf` は必要な PLE テーブルを指定する例です。入力やモデルに必要な他の設定は利用環境に合わせてください。
 
 ## 値と既定値
 
-- `PATH` は `next("--dump-logits")` でそのまま受け取り、数値形式・拡張子・親ディレクトリの事前検証は行いません。値を省略すると parser が stderr に `--dump-logits needs a value` を出して終了コード 2 で終了します。空文字列は代入されますが、後段の `empty()` 判定で dump 無指定と同じ扱いになります。【`src/program/generate.cpp:2418-2420,2460,7066-7071`】
-- 未指定時は空文字列で、dump ファイルを作りません。【`src/program/generate.cpp:428,7066`】
-- 同じオプションを複数回指定した場合、値は単純代入されるため最後の指定が残ります。【`src/program/generate.cpp:2460`】
-- 出力は `fopen(PATH, "wb")` で開くため、既存ファイルは切り詰められます。作成・上書きされる可能性があるパスを指定してください。【`src/program/generate.cpp:7071`】
+- `PATH` は次の argv 要素からそのまま取得されます。省略すると `--dump-logits needs a value` を stderr に出して終了コード `2` で終了します（`engine/src/program/generate.cpp:3842-3847,3886`）。
+- 既定値は空文字列で、空のままなら dump を開きません（同 `engine/src/program/generate.cpp:766,10652-10658`）。
+- 値の形式、拡張子、重複指定を個別に検証する処理はありません。複数回指定すると parser は同じフィールドを上書きし、最後に読んだ値が使われます（同 `engine/src/program/generate.cpp:3842-3847,3886`）。
 
 ## 実行時の動作
 
-- 出力は先頭に2個の `int32_t`（`n_vocab`, `n_rows`）を置き、その後に各行の語彙 logits を `float` で連続出力するバイナリです。ヘッダーは最初の logits 行と同時に書かれます。行データは位置ごとに `n_vocab` 個の float です。【`src/program/generate.cpp:7060-7065,7083-7084,16010-16020`】
-- 通常の生成ループでは `dump_positions = tokens.size() - 1 + max_new` を位置範囲とし、`--logits-stride` が既定の 1 なら各位置を保存します。stride を指定すると0始まりの stride 倍の位置と最後の位置を選び、重複する最後の位置は1回だけ記録します。【`src/program/generate.cpp:7065,15994-15995`; `include/strata/program/logits_selection.hpp:20-28`】
-- `--logits-stride` が1より大きい場合は `--max-new 1` と `--dump-logits` の併用が必須です。条件を満たさないと stderr に要件を表示し、終了コード2になります。stride 自体は正の10進 int64 のみ受理し、符号、空白、接尾辞、ゼロ、範囲外値は拒否されます。【`src/program/generate.cpp:2461-2466,3286-3288`; `include/strata/program/logits_selection.hpp:9-18`】
-- logits が通常ループで取得されるとき、このオプションは GPU から host への読み戻しを必要にし、全語彙値の有限値検査を経て行を書き込みます。したがってファイル I/O とデータ転送・走査の追加コストがあります。性能向上を意味するオプションではありません。【`src/program/generate.cpp:15994-16008,16017-16020`】
+- dump を有効にすると、生成開始前に `PATH` を `fopen(..., "wb")` で開きます。既存ファイルは切り詰められます。開けない場合は `strata generate: cannot write PATH` を stderr に出し、終了コード `1` です（`engine/src/program/generate.cpp:10652-10667`）。
+- ファイルはテキスト行ではなく、ソース上はバイナリです。最初にヘッダーとして `int32` 2個（語彙数、書き込み行数）を1組書き、その後に各行の語彙数分の `float` を保存します。各値は `d_logits` から host の `float` 配列へ読み戻されて出力されます（同 `engine/src/program/generate.cpp:10652-10677,24358-24365,24375-24385`）。ソースはファイルのバイト順を別途規定していません。
+- `--logits-stride` が既定値 `1` のとき、対象位置を連続して保存します。総対象位置数は prompt token 数 `- 1 + --max-new` として算出されます（同 `engine/src/program/generate.cpp:759,767,10657-10677`）。`--logits-stride N` を併用すると、0 始まりの位置で `N` の倍数にあたる行と最終位置が保存されます（`engine/include/strata/program/logits_selection.hpp:20-28`）。stride を `1` より大きくする場合は `--max-new 1` と `--dump-logits` の両方が必須です。条件を満たさなければ stderr にエラーを出して終了コード `2` です（`engine/src/program/generate.cpp:5201-5203`）。
+- native pack では prompt 処理後に通常の per-token loop を抜けて speculative loop に移るため、この dump の読み戻し・書き込み箇所を通りません。ヘッダーも最初のデータ行と同時に書く設計なので、native pack でこのパスを指定すると、ソースの経路上はファイルが切り詰められた後に空のままになります（同 `engine/src/program/generate.cpp:10653-10655,24237-24240,24358-24385`）。
 
 ## 適用条件と副作用
 
-- `--serve` では parser が受理し、通常の生成ループより前にファイルを開きますが、serve の要求処理からは logits dump の行書き込み経路へ進みません。そのため指定先は空ファイルとして作成・切り詰められたままになり得ます。serve 用途にはこの dump を使わないでください。【`src/program/generate.cpp:7066-7075,8354-8359,15685-15694`】
-- native pack の経路は通常の per-token ループへ入らず verify window を使うため、このオプションでは logits 行が記録されません。ソースコメントも native pack は per-token dump 箇所に到達しないと説明しています。ファイルは先に開かれるので、空ファイルが残り得ます。【`src/program/generate.cpp:7061-7063,15873-15875,16651-16654`】
-- ファイルを開けない場合は `strata generate: cannot write PATH` を stderr に出して終了コード1です。次元が int32 に収まらない場合は `strata generate: logits dump dimensions exceed int32`、終了コード2です。ヘッダー・行の書き込みや close に失敗した場合も stderr にエラーを出し、終了コード1になります。【`src/program/generate.cpp:7066-7074,16011-16020,16843-16845`】
-- 生成処理が書き込み後に別のエラーで中断すると、部分ファイルが残る可能性があります。ヘッダーは最初の行が得られるまで書かれないため、dump 行に到達する前の失敗ではファイルが空のままの場合があります。【`src/program/generate.cpp:7061-7063,16010-16020`】
+- `--logits-stride > 1` を使う場合、`--max-new` は `1` でなければなりません。stride は保存する行を選ぶだけで、prompt token をモデルへ与える処理を省く設定ではありません（`engine/src/program/generate.cpp:5201-5203`、`engine/include/strata/program/logits_selection.hpp:9-23`）。
+- 書き込み開始時に指定ファイルを切り詰めます。保存内容を残す必要がある場合は既存ファイルを指定しないでください（`engine/src/program/generate.cpp:10663-10667`）。
+- 語彙数または計算された位置数が `int32` の上限を超える場合は、ファイルを開く前にエラー終了します（同 `engine/src/program/generate.cpp:10657-10662`）。
+- logits の device-to-host 読み戻しに失敗した場合、または値に非有限値がある場合は stderr にエラーを出して終了します（同 `engine/src/program/generate.cpp:24361-24372`）。ヘッダー・行の書き込み失敗もエラーとなり、正常終了時の close に失敗した場合は `cannot finish logits dump` で終了します（同 `engine/src/program/generate.cpp:24375-24385,25379-25382`）。
+
+## 出力とエラー
+
+正常に dump を閉じると、stdout に `logits dumped` と出力先パスを表示します（`engine/src/program/generate.cpp:25379-25382,25553`）。dump に関する主な失敗は、出力先を開けない・次元が `int32` を超える場合（それぞれ終了コード `1` / `2`）、読み戻しまたは書き込みに失敗した場合（`1`）、stride の条件違反（`2`）です。エラーメッセージは stderr に出力されます（同 `engine/src/program/generate.cpp:5201-5203,10659-10666,24361-24385,25379-25382`）。
 
 ## 根拠
 
-- 索引上のスコープとリンク: `docs/cli/README.md` の `strata-engine` root 節（`--dump-logits` は `--dump-layers` と `--dump-mixed` の間）。
-- parser、値の取得、既定値: `src/program/generate.cpp:418-429,2416-2420,2460`。
-- stride 検証と制約: `src/program/generate.cpp:2461-2466,3286-3288`、`include/strata/program/logits_selection.hpp:9-28`。
-- ファイル形式・オープン・行出力・終了処理: `src/program/generate.cpp:7060-7085,15994-16020,16843-16845`。
-- serve/native の適用範囲: `src/program/generate.cpp:8354-8359,15685-15694,15873-15875,16651-16654`。
-
-調査はこの checkout のソースに限定しました。既存 `bin/strata` は POSIX shell wrapper であり、この checkout と同一 revision のビルド済みエンジン CLI help であることを確認できなかったため、help 出力を根拠には使用していません。出力バイナリの読み手側ツールの仕様までは調査していません。
+- `docs/cli/000_cli_tools.md:10` — `strata-engine` の parser 所在と root scope。
+- `engine/src/program/generate.cpp:766-767,1283-1284` — dump path と stride の既定値、help 表示。
+- `engine/src/program/generate.cpp:3842-3847,3886-3892` — parser、値の取得、隣接する stride の検証。
+- `engine/src/program/generate.cpp:5201-5203` — stride との相互作用と失敗経路。
+- `engine/src/program/generate.cpp:10652-10677,24358-24385,25379-25382` — ファイル形式、通常 loop での読戻しと書込み、close。
+- `engine/include/strata/program/logits_selection.hpp:9-28` — stride 値の構文、行選択、行数。
+- `engine/src/program/generate.cpp:24237-24240,25173-25175` — native pack が per-token dump 読み取り箇所を通らない条件。

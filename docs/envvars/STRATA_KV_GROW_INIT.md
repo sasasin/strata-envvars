@@ -1,53 +1,41 @@
 # `STRATA_KV_GROW_INIT`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--kv-grow` の elastic K/V を有効にしたとき、各 QSA state の K/V pool で起動時に物理メモリを割り当てる初期セル数を指定します。初期値を超える K/V は、コンテキストが伸びたときに expert cache からチャンクを受け取って拡張されます。変数は elastic K/V 自体を有効にしません。既定の初期セル数は `16384` です。
+`--kv-grow` で有効になる elastic K/V の初期 VRAM 割当セル数を指定する。CUDA/HIP 共通の `engine/src/program/generate.cpp` と SYCL の `engine/sycl/src/program/generate.cpp` が読み、`qsa_set_kv_elastic` に渡す。elastic K/V が無効でもこの変数は読み取られ初期セル数のグローバル値を更新するが、その値を使った pool 作成は行われない。成長機能の有効化は別設定 `--kv-grow` / `STRATA_KV_GROW` と複数条件で決まり、この変数単独では有効にならない（`engine/src/program/generate.cpp:7715-7732`、`engine/sycl/src/program/generate.cpp:4282-4299`）。
 
 ## 値と判定
 
-CUDA と SYCL の `generate` は、環境変数を `std::atoll` で読み、変換後の値が正の場合だけ採用します。それ以外は `16384` を渡します。文字列全体の妥当性や数値の後続文字は検査しません。
+両実装とも `std::getenv` の戻り値を `std::atoll` に渡し、変換結果が正のときだけ採用する。未設定、空文字、数値に変換できない文字列、0、負値は既定値 `16384` にフォールバックする。`atoll` は文字列全体の厳密な数値検証には使われておらず、数値の後ろに文字がある場合も数値部分を変換する（例: `12000tail` は 12000）。先頭空白と符号も `atoll` の変換規則に従う。大文字小文字の区別は該当しない。整数範囲を超える入力の結果はコードで検証・規定されていない。採用値に対する `max_context` との clamp はこの読み取り箇所にはないが、pool の初期 mapping は pool の slot 数を超えない（`engine/src/program/generate.cpp:7730-7732`、`engine/sycl/src/program/generate.cpp:4297-4299`、`engine/src/core/layer.cpp:638-640,654-656`、`engine/sycl/src/core/layer.cpp:593-595,609-612`）。
 
-| 環境変数の値 | 渡される初期セル数 |
-|---|---:|
-| 未設定 | 16384 |
-| 空文字 | 16384（`atoll` の結果が 0） |
-| `4096` | 4096 |
-| `+4096`、先頭空白の後の `4096` | 4096（符号・先頭空白を `atoll` が処理） |
-| `4096tail` | 4096（数値の後ろは変換対象外） |
-| `0`、`-1`、`words` | 16384（結果が正でない） |
-
-数値の全体 parse、上限チェック、エラー通知はありません。変換可能な正数でも、各 pool の実際の初期割り当てはその state の QSA ページ数を超えません。`pool_slots` がセル数をページ単位に切り上げ、state のスロット数で上限を設けます。したがって指定セル数と実際に確保されるセル数は、ページ境界やモデルの context 上限によって異なります。
+| ビルド経路 | unset | 設定時に採用される値 | 既定値へ戻る値 |
+|---|---|---|---|
+| CUDA / HIP | 16384 cells | `atoll(value) > 0` の整数。例: `1`, `16384`, `12000tail` | 空文字、`0`, `-1`, `true`, `n/a` |
+| SYCL | 16384 cells | `atoll(value) > 0` の整数。例: `1`, `16384`, `12000tail` | 空文字、`0`, `-1`, `true`, `n/a` |
 
 ## 有効になる条件
 
-この値が初期確保に使われるのは、`STRATA_KV_GROW` または `--kv-grow` によって elastic K/V が要求され、さらに次の条件を満たして `on` になったときです。
-
-- 単一 GPU。
-- resident K/V ではなく、全 K/V を VRAM に置く設定。
-- expert profile があり、全 expert を RAM に置くモードで、expert cache が有効。
-- remote expert cache を使わない。
-- VMM が利用できる。
-- `--batch`、`--vram-elastic`、`--peer-device` を使わない。
-
-条件を満たさず `on` が false の場合も `STRATA_KV_GROW_INIT` は読み取られて setter に渡されますが、`qsa_state_init` は elastic pool を作らないため、初期セル数には効果がありません。`STRATA_KV_GROW` が空文字なら `--kv-grow` の CLI 状態が使われ、空でない値なら先頭文字が `0` かどうかで要求状態を判定します（例: `false` は要求扱い）。この enable 判定は初期セル数の parse とは別です。
+- 起動経路は `strata generate`。変数は同じ `generate.cpp` の session 構築ブロックで読み取られる（`engine/src/program/generate.cpp:7712-7732`、`engine/sycl/src/program/generate.cpp:4280-4299`）。
+- 初期セル数が実際の pool 割当に使われるのは `qsa_set_kv_elastic` が elastic 状態を有効にした場合。上位判定は `--kv-grow` または `STRATA_KV_GROW` の要求に加えて、単一 GPU、K/V streaming 無効、expert profile あり、CPU resident experts 無効、expert cache 有効、remote expert cache なし、VMM 利用可能、`--batch` 無効、`--vram-elastic` 無効、`--peer-device` 未指定を要求する（`engine/src/program/generate.cpp:7718-7729`、SYCL: `engine/sycl/src/program/generate.cpp:4285-4296`）。
+- `STRATA_KV_GROW` が空または未設定なら CLI の `o.kv_grow` が使われる。空でない値は先頭文字だけを見て、`'0'` 以外なら要求扱い（`engine/src/program/generate.cpp:7718-7726`、SYCL: `engine/sycl/src/program/generate.cpp:4285-4293`）。
+- elastic 状態が有効でなければ `STRATA_KV_GROW_INIT` の正値を設定しても初期 elastic pool は作られず、その値による K/V 拡張も起きない（`engine/src/core/layer.cpp:680-683,828-849`、SYCL: `engine/sycl/src/core/layer.cpp:657-660,798-819`）。
+- `kv_grow_start` / `kvg_start` にはさらに cache の VMM range、residency table、expert source 等の条件があり、expert cache からの slot 再利用ができない場合は新規 VRAM で拡張する経路となる（`engine/include/strata/core/kv_grow_rules.hpp:23-31`、`engine/src/program/generate.cpp:11541-11552`）。この初期値はそれらの cache 条件を変更しない。
 
 ## 実行時の詳細
 
-環境変数は `generate` の session 構築前に一度読み取られます。CUDA と SYCL の双方で `qsa_set_kv_elastic(on, init_cells)` を呼び、setter は elastic K/V の有効状態と正の `init_cells` をプロセス内の共有状態に保存します。後から環境変数を変更しても、すでに保存された初期値は再評価されません。
+環境変数は session 状態の確保直前に同期的に一度読み取られ、`qsa_set_kv_elastic(on, 初期セル数)` が共有状態を設定する。設定後にプロセス環境を変更しても、この起動済み generate 処理の初期値には反映されない。`qsa_set_kv_elastic` は `enabled && vmm_available()` を有効状態として保存し、正の初期値を `g_kv_elastic_init` に保存する（`engine/src/program/generate.cpp:7712-7734`、`engine/src/core/layer.cpp:624-626,680-684`。SYCL: `engine/sycl/src/program/generate.cpp:4280-4303`、`engine/sycl/src/core/layer.cpp:579-581,657-661`）。
 
-elastic K/V が有効な QSA state では、初期セル数に必要なページ分の K/V pool を VMM range に map します。各 QSA state の配列はその state 専用 range に置かれ、map に失敗した場合は `strata: the elastic K/V could not reserve or map its pools` を stderr に出し、session state の初期化を失敗させます。以後の拡張では現在のセル数や必要量に応じて pool を map します。初期値そのものを表示する専用ログはありません。起動後に現在の elastic K/V セル数を出すログは `elastic K/V: ... cells in VRAM` です。
+有効な場合、各 QSA state の K/V pool は全 context 分の仮想範囲を予約し、初回は `g_kv_elastic_init` cells 分の slot を物理 mapping する。セル数は `pool_slots` 内でページ単位に切り上げられ、pool の slot 数を上限にする。以後、要求に必要なセル範囲が mapped 範囲を超えると `kvg_ensure` が必要範囲を拡張し、設定済みの grow step や cache 状態に従って mapping する（`engine/src/core/layer.cpp:638-676,807-849`、`engine/src/program/generate.cpp:11561-11568,11649-11674`。SYCL: `engine/sycl/src/core/layer.cpp:593-648,777-819`、`engine/sycl/src/program/generate.cpp:6807-6813`）。
 
-`docs/DETAILS.md` は `--kv-grow` の用途と有効条件を説明していますが、`STRATA_KV_GROW_INIT` の値や既定値は記載していません。ここでの既定値と変換規則は実装から確認したものです。
+## ログと測定値
+
+この変数の値自体を表示する専用ログはない。elastic 初期 pool の予約または mapping に失敗すると `strata: the elastic K/V could not reserve or map its pools` を出し、QSA state 初期化失敗として `strata generate: session_init failed` を出して終了コード 1 で戻る（`engine/src/core/layer.cpp:847-849`、`engine/src/program/generate.cpp:7738-7740`）。SYCL でも同じ予約・mapping 失敗文言を出して session 初期化失敗経路に入る（`engine/sycl/src/core/layer.cpp:817-819`、`engine/sycl/src/program/generate.cpp:4308-4310`）。後続の拡張時には mapping 不足や chunk 初期化失敗、拡張失敗の診断が出る（CUDA/HIP: `engine/src/core/layer.cpp:663-674`、`engine/src/program/generate.cpp:11649-11674`。SYCL: `engine/sycl/src/core/layer.cpp:619-645`）。この変数自体について Strata の測定値は記載されていない。
 
 ## 根拠
 
-- `src/program/generate.cpp:4221-4238` — CUDA 側の enable 条件、`STRATA_KV_GROW_INIT` の `atoll` 判定、QSA setter 呼び出し。
-- `sycl/src/program/generate.cpp:3768-3785` — SYCL 側の同じ判定と setter 呼び出し。
-- `src/core/layer.cpp:520-528,576-579,689-730` — 初期値の初期化、setter の保存、elastic pool の初期確保。
-- `sycl/src/core/layer.cpp:581-589,659-662,779-821` — SYCL 側の同じ状態と初期確保。
-- `src/core/layer.cpp:530-536,550-572` — セル数をページ単位に丸め、state のスロット数で上限を設けて map する処理。
-- `include/strata/core/layer.hpp:285-289` — 初期セルと拡張の API 説明。
-- `docs/DETAILS.md:260-264` — `--kv-grow` の用途と有効条件。初期セル数の環境変数に関する記載はありません。
+- CUDA/HIP の読み取り、既定値、elastic gate: `engine/src/program/generate.cpp:7712-7734`
+- SYCL の読み取り、既定値、elastic gate: `engine/sycl/src/program/generate.cpp:4280-4303`
+- 初期値の保存と pool 初期 mapping: `engine/src/core/layer.cpp:624-626,638-676,680-684,807-849`、`engine/sycl/src/core/layer.cpp:579-581,593-648,657-661,777-819`
+- grow 条件と実行時拡張: `engine/include/strata/core/kv_grow_rules.hpp:23-31`、`engine/src/program/generate.cpp:11541-11568,11649-11674`、`engine/sycl/src/program/generate.cpp:6791-6813`

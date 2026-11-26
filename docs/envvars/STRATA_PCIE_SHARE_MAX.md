@@ -1,43 +1,43 @@
 # `STRATA_PCIE_SHARE_MAX`
 
-調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CPU pool の速度から PCIe の expert share (`pcie_frac`) を自動計算するとき、その値の上限を指定します。自動計算の開始値と、その後の decode window による更新、および自動 layer split の後段 GPU 向け share に使われます。`--pcie-frac` で値を固定した場合は自動計算を使わず、この変数も参照されません。
+CPU pool と GPU 間の expert 転送を分担する PCIe share の自動調整に、上限を与える。`generate.cpp` の `pcie_share_max()` がこの値を一度取得し、初期 share の算出および decode 中の自動更新を clamp する。固定 share を使う経路そのものを有効化する変数ではなく、明示的な `--pcie-frac` の値も変更しない（`engine/src/program/generate.cpp:3101-3104, 3144-3149, 14913-14929, 15004-15040`）。
 
 ## 値と判定
 
-| 環境変数 | 判定 |
-|---|---|
-| 未設定 | discrete GPU かつ `STRATA_DEFAULTS=026` でない場合は上限 `0.95`。それ以外は `0.60`。 |
-| 空文字 | 未設定と同じ既定値。 |
-| 非空文字列 | `std::atof` で数値変換し、`0.10..1.0` に clamp。 |
+`std::getenv` の結果を `pcie_share_ceiling()` に渡す。未設定 (`nullptr`) または空文字 (`env[0] == '\0'`) なら既定値を使う。空でない値は `std::atof` で数値変換し、結果を `[0.10, 1.0]` に clamp する。文字列全体の妥当性検査や parse 成功確認はないため、例として `0.4junk` は `0.4`、`0anything`・`true`・`false`・非数値文字列は変換結果 `0` から下限 `0.10`、`-1` も `0.10`、`0` は `0.10`、`2` は上限 `1.0` になる。`0.7` は `0.7`。大文字小文字比較は行わず、数値の後ろに続く文字列も検査しない（`engine/include/strata/core/pcie_share_rule.hpp:59-63`）。
 
-`atof` のため文字列全体の厳密な検証はありません。数値として読めない文字列は `0` になり、上限は `0.10` です。`0.05` や負数も `0.10`、`0.10` はそのまま、`0.95` はそのまま、`1` やそれ以上は `1.0` になります。数値の後ろに続く文字は変換を止めた後に検査されません。空白・指数表記等は `atof` の変換規則に従います。環境変数を読む箇所で不正値の警告やエラーは出しません。
-
-未設定時の `discrete` 判定は `spill_discrete_gpu()` によります。Metal build では `spill_allowed(true, false)`、その他では現在の GPU の `integrated` 属性を使った `spill_allowed(false, integrated)` の結果です。したがって単に CUDA/HIP build かどうかだけで既定値は決まりません。
+| 条件 | unset / 空文字 | 設定時に使われる上限 | 備考 |
+|---|---:|---:|---|
+| discrete GPU かつ `STRATA_DEFAULTS=026` ではない | `0.95` | `atof` の結果を `0.10..1.0` に clamp | discrete 判定は `spill_discrete_gpu()` による（`engine/src/program/generate.cpp:326-338`）。 |
+| integrated GPU、または `STRATA_DEFAULTS=026` | `0.60` | 同上 | 明示値は master switch より優先する。`STRATA_DEFAULTS` 自体は `026`, `0.2.6`, `v0.2.6` の完全一致で有効（`engine/include/strata/core/defaults_026.hpp:21-29`）。 |
 
 ## 有効になる条件
 
-- `--pcie-frac` を省略し、自動 share 設定が選ばれた経路でのみ有効です。CLI 値は `std::atof` で読み込まれ、`pcie_frac` の初期値 `-1.0` を非負値で置き換えるため、その場合は後続の環境変数ベース自動計算を通りません。
-- 自動設定には PCIe 帯域 probe 成功や pack/backend の条件があります。CUDA の native pack は single GPU で自動化され、layer split では discrete GPU かつ `STRATA_DEFAULTS=026` でない場合に既定で自動化されます。split 自動化は `STRATA_PCIE_AUTO_SPLIT` の非空値で `atoi(value) != 0` に明示設定できます。HIP は gfx1200/gfx1201 が対象 arch の既定経路で、他の HIP arch は `STRATA_PCIE_FRAC_DEFAULT=auto` が必要です。`STRATA_PCIE_FRAC_DEFAULT=old` は自動更新を無効にします。関連条件: `src/program/generate.cpp:2445-2456,2461-2469,2498-2509,4711-4755`。
-- Decode serve 側の `PcieAuto` が動くには、`pcie_frac_auto` が有効で、全 expert が VRAM に resident ではなく、`--batch` が 0、peer GPU を使わず、single stage または split 自動化が有効である必要があります。満たさない場合は値が設定されていてもこの自動更新には使われません (`src/program/generate.cpp:12607-12617`)。
-- `STRATA_PCIE_START=old` は CUDA の pool-rate を使った開始値の設定を抑えますが、その後の `PcieAuto` 更新は別条件を満たせば行われます。HIP は開始値更新が `STRATA_PCIE_START=new` の opt-in です (`src/program/generate.cpp:12538-12554`)。
-- `STRATA_PCIE_SHARE_MAX` は `STRATA_PCIE_K_RULE` が選ぶ pool 係数 `k` や、`STRATA_PCIE_AUTO_SPLIT` が決める自動化の可否を変えません。`STRATA_DEFAULTS=026` は明示されたこの変数を無効化せず、未設定時の既定上限を `0.60` にします。
+- 自動 share 算出が走る経路に限り有効。CUDA では `--pcie-frac` の値が負のままで、PCIe probe が成功した native pack の初期 share、および `PcieAuto` の pool rate に基づく更新で使われる（`engine/src/program/generate.cpp:5535-5579, 14913-14929, 15004-15040`）。
+- 自動更新は全 expert が GPU resident ではなく、batch が `0`、peer device が未指定 (`< 0`) などの条件を満たす場合に開始する。layer split では `STRATA_PCIE_AUTO_SPLIT` 等により自動調整が有効である必要がある（`engine/src/program/generate.cpp:15004-15014`, `engine/src/program/generate.cpp:2833-2844`）。
+- HIP では gfx12 の decode defaults や `STRATA_PCIE_FRAC_DEFAULT=auto` 等で自動調整が有効になる経路がある。`STRATA_PCIE_FRAC_DEFAULT=old` は自動 refinement を止める（`engine/src/program/generate.cpp:2893-2912, 5570-5576`）。
+- `--pcie-frac` に非負値を指定すると自動初期化・更新の対象外で、CLI の固定 share が使われる。本変数はその CLI 値を clamp しない。負値は `o.pcie_frac < 0.0` の自動設定経路に入る（`engine/src/program/generate.cpp:4057, 5535, 15004`）。
+- `STRATA_PCIE_FRAC_DEFAULT` は自動 refinement を使う経路や初期 share を左右するが、本変数より優先する上限設定ではない。`STRATA_PCIE_START` も自動調整開始時の初期値選択に関わり、その初期値も本変数で clamp される（`engine/src/program/generate.cpp:5538-5576, 14913-14929`）。
+- 固定 share を扱うだけの経路、probe 失敗で default share に留まる経路、または PcieAuto が有効化されない経路では、この上限を使った自動調整は行われない（`engine/src/program/generate.cpp:5553-5579, 15004-15008`）。
 
 ## 実行時の詳細
 
-`pcie_share_max()` 内の `static const double` が初回呼び出し時に helper を実行し、値をプロセス内で cache します。プロセス起動後に環境を変更しても再評価されません (`src/program/generate.cpp:2693-2701`)。初回呼び出しは自動設定が有効な場合の開始 share 計算、または decode window 後の自動更新で起きます (`src/program/generate.cpp:12538-12554,12621-12646`)。
+値は `pcie_share_max()` 内の関数ローカル `static const double` に保存され、最初の呼び出し時に一度だけ読み取られる。以後プロセス内で環境を変更しても再取得されない（`engine/src/program/generate.cpp:3101-3104`）。`STRATA_DEFAULTS` も `qwen_defaults_026()` の static により初回呼び出し時に一度読む（`engine/include/strata/core/defaults_026.hpp:26-29`）。
 
-上限は `link / (link + k * pool_rate)` から得た比率を `0.05` 刻みに丸めた値に適用されます。比率には別途 `0.10` の下限があります。したがって上限を `0.10` 未満には設定できず、上限を `1.0` より大きくもできません。初期の自動 share と後続更新は `drive.d.pcie_num` に反映され、split 後段は各 stage の probe link に基づき個別計算されます (`include/strata/core/pcie_share_rule.hpp:24-28,45-49`; `src/program/generate.cpp:12550-12556,12628-12646`)。
+PcieAuto は pool の測定値と link probe から share を計算し、`0.05` 刻みに丸めて下限 `0.10` と本変数の上限の間に収める。CPU pool の missed expert 数が不足する間は更新を見送り、十分な測定後の更新は最大 3 回。layer split の後続 stage も各 stage の link rate から同じ上限で share を計算する（`engine/include/strata/core/pcie_share_rule.hpp:28-32`, `engine/src/program/generate.cpp:3127-3149, 15015-15040`）。算出した share は `pcie_num`（最大 256）に変換され、verify の routing 設定へ反映される（`engine/src/program/generate.cpp:14931, 15026-15040`）。
 
-通常の値 parse に対するログや終了・失敗経路はありません。自動 share の開始時には `strata serve: PCIe share: start ...`、decode 後に値が変わった場合は `strata serve: PCIe share: the CPU pool takes ...`、split 後段の更新時は `strata serve: PCIe share: stage ...` が stderr に出ます。後続更新は最初の 48 window、その後 96 window ごとに pool rate を集計し、最大 3 回です。300 未満の missed experts では判断を保留し、2000 window までに十分な missed experts がなければ更新を止めます (`src/program/generate.cpp:2724-2747,12621-12646`)。
+## ログと測定値
+
+自動初期 share が更新されると `strata serve: PCIe share: start ...`、decode 中に share が変わると `strata serve: PCIe share: the CPU pool takes ...` が stderr に出る。後者は更新値が現在値から少なくとも約 `0.025` 離れた場合に限る。layer split では stage ごとの `strata serve: PCIe share: stage ...` も出る。ログに本変数名や採用上限値を直接表示する処理は見当たらない（`engine/src/program/generate.cpp:3144-3149, 14923-14928, 15021-15040`）。
 
 ## 根拠
 
-- 候補名の全参照は `include/strata/core/pcie_share_rule.hpp:4-5,45-49`、`src/program/generate.cpp:2693-2701,2698-2699` および `docs/DETAILS.md:1050`。実際の環境読み取りは `generate.cpp:2699` だけで、共通 helper や動的な変数名経由の別読み取りはありません。
-- clamp と unset fallback: `include/strata/core/pcie_share_rule.hpp:45-49`。既定値に使う discrete GPU / master switch 判定: `src/program/generate.cpp:276-289`, `include/strata/core/defaults_026.hpp:21-29`。
-- CLI 優先と自動 share の選択: `src/program/generate.cpp:879-880,3574,4024-4026,4711-4755`。
-- 開始 share、更新条件、出力: `src/program/generate.cpp:12538-12556,12607-12646`。share の丸め式: `include/strata/core/pcie_share_rule.hpp:24-28`。
-- `docs/DETAILS.md:1050` は自動 PCIe share の概要と RTX PRO 6000 の測定値を記載しています。そこに記載の値は当該環境の資料上の測定であり、この調査で再測定していません。
+- `engine/include/strata/core/pcie_share_rule.hpp:59-63` — unset 規則、変換、clamp。
+- `engine/src/program/generate.cpp:326-338, 3096-3107` — discrete 判定、環境値の static cache。
+- `engine/src/program/generate.cpp:5535-5579, 14913-14931, 15004-15040` — 初期値・自動調整の条件、share 反映、ログ。
+- `engine/src/program/generate.cpp:4057` — `--pcie-frac` の CLI parse。
+- `engine/include/strata/core/defaults_026.hpp:21-29` — `STRATA_DEFAULTS` の認識と cache。

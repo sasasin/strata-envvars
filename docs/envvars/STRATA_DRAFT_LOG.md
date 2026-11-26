@@ -1,46 +1,54 @@
 # `STRATA_DRAFT_LOG`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--serve` のリクエスト処理で、DFlash2 drafter が利用可能なエンジンについて、リクエスト単位の draft 計測値を stderr に出す診断スイッチです。draft の選択や生成処理を有効化する変数ではなく、ログ出力だけを制御します。宣言と出力条件は `src/program/generate.cpp:13404,18673-18676` にあります。
+サーバー要求ループが、DFlash2 drafter を利用する構成で、要求ごとの drafter 名・生成 token 数・round 数・時間を stderr に記録する診断フラグです。生成処理や drafter の選択を切り替える変数ではありません。値を読む箇所は `engine/src/program/generate.cpp` のサーバーループにある `draft_log` 初期化だけで、実際の出力は要求終了時の `draft_log && use_df2` が成立した場合に限られます（`engine/src/program/generate.cpp:16416`, `23226-23239`）。
+
+完全一致検索では、この読み取り箇所のほかに `terminal/data/settings-register.json:7622-7650` の登録情報があります。登録情報は実行時の値読み取りではありません。
 
 ## 値と判定
 
-値の内容は parse せず、`std::getenv("STRATA_DRAFT_LOG") != nullptr` で設定の有無だけを判定します。
+`std::getenv(...) != nullptr` のみで判定し、値を parse しません。未設定ならフラグは false、何らかの値が設定されていれば true です。明示的な空文字も「設定あり」として有効です。したがって `0`、`false`、`0anything`、空白だけ、大文字小文字を問わず、すべて設定済みとして扱います。数値変換・文字列比較・値域検査・clamp はありません（`engine/src/program/generate.cpp:16416`）。
 
-| 状態 | 判定 | 結果 |
-|---|---|---|
-| 未設定 | `getenv` が `nullptr` | ログを無効化 |
-| 設定あり | 値の文字列を問わず非 `nullptr` | DFlash2 が利用可能な場合、リクエストのログを有効化 |
-| 空文字 | 非 `nullptr` | 設定ありとして有効 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 全 build | ログフラグ false | 空文字を含む、環境変数が存在するすべての値 | なし（値による無効判定なし） |
 
-`1` など特定の値は要求されません。`0`、`false`、空文字を含め、何らかの値が設定されていれば同じ判定です。数値変換、大小文字判定、値域チェック、無効値時の fallback はありません。`STRATA_DRAFT_LOG` に対応する CLI 引数や、別設定との優先順位も実装されていません。
+ただしログ出力には別途 `use_df2` が true である必要があります。`STRATA_HAVE_DFLASH2` がない build では `use_df2` は定数 false なので、環境変数を設定しても出力されません（`engine/src/program/generate.cpp:8151-8158`, `23236-23239`）。
 
 ## 有効になる条件
 
-- 判定箇所は `--serve` のリクエスト処理内です。`--serve` の分岐とその serve 要件は `src/program/generate.cpp:10054-10065` にあります。
-- 変数が設定されているだけでは出力されません。出力側が `draft_log && use_df2` を条件としているため、DFlash2 がエンジンで利用可能である必要があります（`src/program/generate.cpp:18673-18676`）。
-- DFlash2 の実装は `STRATA_HAVE_DFLASH2` ビルド macro の下で宣言され、macro がないビルドでは `use_df2` は常に `false` です（`src/program/generate.cpp:6683-6692`）。DFlash2 は `--draft dflash2` 等の設定後に初期化され、初期化失敗時は無効化される経路があります（`src/program/generate.cpp:6765-6778,11146-11172`）。従って変数単独では DFlash2 をロードしません。
-- `--draft auto` でエンジンに DFlash2 がロードされていれば、個々のリクエストが MTP を選んだ場合も、この診断行は出ます。行の `drafter=` はそのリクエストの選択 (`req_df2`) を表示します（`src/program/generate.cpp:15190-15234,18673-18676`）。
+- 環境変数はサーバーループで初めて評価される時点までに設定されている必要があります。
+- 要求ループの実行中に DFlash2 が有効 (`use_df2 == true`) である必要があります。DFlash2 が build に含まれ、起動時に `--draft dflash2` の条件を満たして読み込まれ、サーバーループで drafter の bind・prepare・tap reserve が成功することが必要です。セットアップに失敗し MTP fallback へ切り替わる場合、または DFlash2 非対応 build ではこのログは出ません（`engine/src/program/generate.cpp:8151-8158`, `8266-8326`, `13584-13610`, `23236-23239`）。
+- `--draft auto` で要求ごとに MTP が選ばれた場合も、DFlash2 自体が有効ならログ対象です。`req_df2` に応じて `drafter=mtp` または `drafter=dflash2` と表示します（`engine/src/program/generate.cpp:18944-19005`, `23236-23239`）。
+- `STRATA_DRAFT_LOG` は CLI 引数や他の環境変数によって値を上書きされません。`STRATA_DRAFT_KEEP=0`（空文字も `atoi` では 0）などは auto モードの idle drafter upkeep を変え、ログ中の `keep_ms` に影響しますが、ログの有効・無効条件ではありません（`engine/src/program/generate.cpp:16416-16418`, `23089-23103`）。
 
 ## 実行時の詳細
 
-値は関数内の `static const bool` で一度だけ評価されます。最初にこの宣言へ到達した時点の環境変数の有無がプロセス内で保持され、以後のリクエストやプロセス起動後の環境変更では再評価されません（`src/program/generate.cpp:13404`）。
+`draft_log` は block-scope `static const bool` です。サーバーループがこの宣言に初めて到達したときに一度だけ環境を読み、それ以降の要求ではキャッシュ値を使います。その後に環境を変更しても反映されません（`engine/src/program/generate.cpp:16397-16418`）。
 
-ログ条件を満たすと、リクエストの decode loop 後に stderr へ次の形式で出力します（`src/program/generate.cpp:18664-18676`）。
+`GEN` / `GENI` 等の要求処理後、upkeep の同期が成功し、要求の decode 時間を確定した後にログ判定を行います。ログは `use_df2` が true のとき、`STRATA_DRAFT_LOG` が設定済みであれば一要求につき一行です。要求の構文・入力検証で早期に `continue` する経路や、upkeep エラーで `return` する経路ではこの出力位置に到達しません（`engine/src/program/generate.cpp:18808-18819`, `18974-19017`, `23218-23239`）。
+
+`tokens` は `produced_n`、`rounds` は要求開始時からの round 増分、`decode_ms` は要求内の `d0` から upkeep 同期完了までの経過時間です。`keep_ms` は `--draft auto` で要求に使わない側の drafter を追いつかせる処理にかかった時間で、その処理が動かない要求では初期値 0 のままです。末尾の `keep_ms / round` は要求中に round があった場合だけ計算され、round が 0 なら 0.0 を出します（`engine/src/program/generate.cpp:21755-21779`, `23089-23103`, `23226-23239`）。
+
+## ログと測定値
+
+ログは stderr に次の書式で出ます（実際には `%` 指定子が値に置き換わります）。連番はこのログを出した要求ごとに増えます。
 
 ```text
-strata draft: request <連番> drafter=<dflash2|mtp> window<=<幅> tokens=<生成数> rounds=<round数> decode_ms=<decode時間> keep_ms=<upkeep時間> (<roundあたり時間> per round)
+strata draft: request %lld drafter=%s window<=%d tokens=%lld rounds=%lld decode_ms=%.1f keep_ms=%.1f (%.3f per round)
 ```
 
-連番はこのログの出力ごとに増えます。値は対象リクエストの drafter、window 上限、生成 token 数、round 数、decode 時間、`--draft auto` 時の idle drafter upkeep 時間です。`keep_ms` は同モードでなければ通常 0 のままです。ログは `ver.wait_commit()` の最終確認より前に出るため、その後の commit 待ちが失敗する場合にも先に出力されることがあります（`src/program/generate.cpp:18673-18681`）。この変数による警告、終了、fallback はありません。
+この文書では測定結果を記載しません。ソースにはログの項目と計算式はありますが、条件をそろえた測定値は確認できません（`engine/src/program/generate.cpp:23236-23239`）。
 
 ## 根拠
 
-- 候補名の実装参照は `src/program/generate.cpp:13404` のみです。全参照検索で別の読み取り箇所や helper 経由の参照は見つかりませんでした。
-- `std::getenv` の存在判定、static cache: `src/program/generate.cpp:13404`。
-- serve 内の DFlash2 有効状態とビルド条件: `src/program/generate.cpp:6683-6692,11146-11172`。
-- `--draft auto` のリクエスト別 drafter 選択: `src/program/generate.cpp:15190-15234`。
-- ログの出力条件、書式、タイミング: `src/program/generate.cpp:18664-18681`。
+- `engine/src/program/generate.cpp:16397-16418` — サーバーループとフラグの static 初期化。
+- `engine/src/program/generate.cpp:8151-8158` — DFlash2 compile macro による `use_df2` の定義。
+- `engine/src/program/generate.cpp:8266-8326`, `13584-13610` — DFlash2 の起動条件、失敗時の fallback。
+- `engine/src/program/generate.cpp:18808-18819`, `18974-19017` — 要求認識・入力検証。
+- `engine/src/program/generate.cpp:18944-19005` — `--draft auto` の要求単位の drafter 選択。
+- `engine/src/program/generate.cpp:21755-21779`, `23089-23103`, `23218-23239` — 時間・counter とログ出力。
+- `terminal/data/settings-register.json:7622-7650` — 候補一覧の登録情報（コードによる実行時読み取り箇所ではない）。

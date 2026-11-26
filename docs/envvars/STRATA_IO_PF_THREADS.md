@@ -1,48 +1,45 @@
 # `STRATA_IO_PF_THREADS`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux の mapped file tier I/O prefetch が作る I/O ワーカー数を指定します。この変数だけでは prefetch は有効になりません。`--mmap-experts` 経路で `STRATA_IO_PREFETCH` が `atoi` で 0 以外になるときにだけ読み取られ、`FileExpertSource` に渡されます。設定数のワーカーは expert blob の demand read と、router が予測した後続 layer の read-ahead を処理します。後続 layer の予測深度は別設定の `STRATA_IO_PREFETCH_DEPTH` が扱います。
+Linux の file tier で I/O prefetch が有効なときに、`FileExpertSource` が起動する I/O worker thread 数を指定する。worker は expert blob の `pread` を使った先読みや、現在の層で必要な未キャッシュ blob の読み込みを担当する。正の数値を指定するとその数だけ worker を作り、それ以外は 8 個にする。通常の生成結果やスレッド数以外の設定をこの変数が直接変更する処理はない（`engine/src/core/expert_source.cpp:1261-1310`）。
 
 ## 値と判定
 
-`std::atoi` で文字列を整数変換し、結果が正ならその値を使います。未設定時は `0` を渡し、FileExpertSource 側の既定値 8 が適用されます。設定済みでも変換結果が 0 以下なら同じく 8 です。
+呼び出し元は `std::getenv` で値を得て、未設定なら `0`、設定済みなら `std::atoi` の結果を `set_io_prefetch` に渡す。`set_io_prefetch` は `threads > 0` の場合だけその整数を採用し、それ以外は 8 にする。従って未設定・空文字・`0`・`0anything`・`true`・`-3` はいずれも 8 worker、`1` は 1 worker、`12tail` は 12 worker になる。`atoi` は先頭の空白と符号に続く十進数字列を変換し、数字の後ろは検査しない。正の値に上限 clamp はない。整数型で表せない入力の結果は C ライブラリの `atoi` の範囲外変換に依存するため、ここでは有効値として扱わない（`engine/src/program/generate.cpp:8701-8703,10364-10367`; `engine/src/core/expert_source.cpp:1282-1283`）。
 
-| 環境変数の値 | `atoi` の結果 | ワーカー数 |
-|---|---:|---:|
-| 未設定 | 呼び出し側が `0` を渡す | 8 |
-| `8` | 8 | 8 |
-| `3workers` | 3 | 3 |
-| `  +4tail` | 4 | 4 |
-| 空文字、`0`、`abc` | 0 | 8 |
-| `-2` | -2 | 8 |
-
-文字列全体の数値検証はなく、先頭から整数として変換できる部分が使われます。したがって `3workers` は 3 です。正の上限値や clamp は実装にありません。`atoi` で表現できない範囲の入力について、コードは独自のエラー処理を設けていません。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| Linux で I/O prefetch が有効 | 8 worker | `atoi` が正となる整数（例: `1`, `8`, `12tail`） | `atoi` が 0 以下（例: 空文字, `0`, `0anything`, `true`, `-2`）は 8 worker |
+| I/O prefetch が無効、または Linux 以外 | この変数は読まれず影響しない | 該当なし | 該当なし |
 
 ## 有効になる条件
 
-- `strata generate` が `--mmap-experts` の FileExpertSource 経路を使うこと。
-- `STRATA_IO_PREFETCH` が設定され、`atoi(value) != 0` となること。この条件を満たさなければ `STRATA_IO_PF_THREADS` は読み取られません。
-- Linux ビルドで、FileExpertSource に有効な mapped base と file paths があり、unbuffered 用の `direct_` が空であること。
-- ファイルごとの読み取り descriptor を開けること。descriptor の open に失敗すると prefetch 設定は有効にならず、ワーカーも起動しません。
-
-Linux 以外では `set_io_prefetch` は `on` とスレッド数を無視し、I/O prefetch を有効にしません。unbuffered reads の経路でも有効化されません。呼び出し側はこの場合 stderr に `strata generate: STRATA_IO_PREFETCH=1 is not available here (Linux mapped file tier only, not with unbuffered reads); the file tier reads as before` を出します。この文言は descriptor open 失敗時にも同じく使われ、失敗理由を区別しません。
+- `generate` / `serve` の生成経路で file-backed `FileExpertSource` が使われること。通常は `--mmap-experts`（およびそれを有効にする関連 file-tier モード）で、resident arena を使う経路ではこの設定を利用しない（`engine/src/program/generate.cpp:8621-8628,8688-8703`）。
+- I/O prefetch 自体が有効なこと。Linux では `STRATA_IO_PREFETCH` が未設定または空文字なら `src.linux_io_defaults()` に従う。値が非空なら `atoi` が非ゼロのとき有効で、`0` などは Linux の既定有効化も抑止する。既定有効化は GGUF をその場で読む場合、または experts.bin のページ cache に十分な余裕がある場合に適用される（`engine/src/program/generate.cpp:8693-8703`; `engine/src/core/expert_source.hpp:1081-1093`）。
+- `FileExpertSource::set_io_prefetch` は Linux のみ worker を起動する。非 Linux では引数を使わず、prefetch の状態も有効にしない（`engine/src/core/expert_source.cpp:1264-1266,1309-1312`）。
+- file tier が unbuffered 読み込み中なら `set_io_prefetch` は有効化を中止する。ファイル descriptor を開けない場合も同様に戻る。明示的に `STRATA_IO_PREFETCH` を要求していた場合、呼び出し元は「`STRATA_IO_PREFETCH=1 is not available here...`」を stderr に出す（`engine/src/core/expert_source.cpp:1264-1277`; `engine/src/program/generate.cpp:8722-8724`）。
+- file tier idle policy が有効で、GPU cache が全 expert を保持している間、既定動作で開始した prefetch は一時停止される。`STRATA_IO_PREFETCH` で明示的に有効にした場合はこの既定停止の対象外。後で cache から expert が外れたとき、停止していた既定 prefetch を再開し、その時点でこの変数を再読する。`STRATA_FILE_TIER_IDLE=0` はこの停止・再開ポリシーを無効化する（`engine/src/program/generate.cpp:10251-10285,10343-10377`）。
 
 ## 実行時の詳細
 
-設定は `strata generate` の FileExpertSource 準備時に一度読み取られ、`set_io_prefetch(true, ...)` に渡されます。関数は既存の I/O worker を止めてから Linux 条件を確認し、I/O 用 descriptor を開き、渡された値が正ならそれを、そうでなければ 8 を `io_threads_` に保存します。その数だけ worker thread を起動します。この設定値をリクエストごとに読み直す処理はありません。
+初回の値読み取りは file tier の起動時で、関数内 static cache はない。`set_io_prefetch` は既存 worker を停止してから設定を適用し、Linux で必要な file descriptor を開いた後、`threads > 0 ? threads : 8` を worker 数に設定してその数の thread を起動する。従って正の値はスレッドプールの大きさを直接変える（`engine/src/program/generate.cpp:8701-8704`; `engine/src/core/expert_source.cpp:1261-1310`）。
 
-ワーカーは I/O queue から layer/expert の仕事を取り出します。現在の layer の uncached expert reads や router により予測された後続 layer の expert を読み、設定に応じて page cache を満たすか staging buffer に置きます。予測が実際に行われるか、どの layer を読むかは prefetch/lookahead の別条件にも依存します。設定数は queue 容量や予測深度を変更しません。
+serve の file tier idle policy が既定 prefetch を停止した後に再開するときは、`STRATA_IO_PF_THREADS` を再び `getenv` する。環境値をプロセス実行中に外部から変更した場合、その変更が反映される機会はこの停止後の再開に限られ、通常は起動時の値が使われる。再開判定は GEN / GENI request の開始時に行われる。停止・再開判定の呼び出しは serve request 経路にあり、通常の単発 generate は初期化時に読み取る（`engine/src/program/generate.cpp:10343-10377,18808-18812`）。子プロセスへの転送はこのコードにない。
 
-有効時の起動ログは `file tier io prefetch ON ... read by %s I/O threads (STRATA_IO_PF_THREADS, default 8)` です。ここで `%s` に環境変数の生文字列を出すため、たとえば `3workers` を指定するとログには `3workers` と表示されますが、実際のワーカー数は `atoi` の結果である 3 です。未設定時は `8` と表示されます。prefetch が有効にならない場合、このスレッド数ログは出ません。
+worker 数は実際の読み取り・先読みの並列度に影響する。I/O prefetch は層の未キャッシュ expert や router lookahead が予測した次層の expert を whole-blob `pread` で扱い、先読み worker として使われる（`engine/src/core/expert_source.hpp:1012-1022`; `engine/src/core/expert_source.cpp:2451-2475,3487-3490`）。
+
+## ログと測定値
+
+初期化ログは有効時に「`... read by %s I/O threads (STRATA_IO_PF_THREADS, default 8)`」または Linux 既定動作の説明を stderr に出す。ここで `%s` には設定値の生文字列が入り、未設定なら `8`。そのため `0` や空文字を指定して内部で 8 worker に fallback した場合、ログ上の表示は実際の worker 数と一致しないことがある（`engine/src/program/generate.cpp:8705-8718`）。再開時は thread 数の設定と worker 起動を行うが、この変数の値を表示する専用ログはない（`engine/src/program/generate.cpp:10364-10368`）。
+
+この変数のスレッド数を比較した Strata の測定値は、調査対象ソースと関連する `docs/DETAILS.md` に記載されていないため記載しない。`DETAILS.md` は既定 8 を示すにとどまる（`docs/DETAILS.md:302-310`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:4667-4678` — `STRATA_IO_PREFETCH` の有効判定、`STRATA_IO_PF_THREADS` の取得と `atoi`、設定成否に応じたログ。
-- `src/core/expert_source.cpp:636-669` — Linux 条件、file descriptor の準備、正値または既定 8 の選択、worker 数分の thread 起動。非 Linux の no-op も同箇所。
-- `src/core/expert_source.cpp:690-771` — worker queue の処理と読み取り。
-- `src/core/expert_source.cpp:1426-1483, 2136-2139` — demand と先読みの仕事が queue に渡される経路。
-- `src/program/generate.cpp:5510-5518` — `STRATA_IO_PREFETCH_DEPTH` は別変数として lookahead depth を設定。
-- `docs/DETAILS.md:225-232` — Linux file-tier I/O path の概要と既定 8 の説明。測定表は I/O prefetch 条件の比較であり、`STRATA_IO_PF_THREADS` の値ごとの性能差は示していません。
+- 読み取り、既定 I/O prefetch 判定、初期化ログ: `engine/src/program/generate.cpp:8688-8724`
+- serve 中の既定 prefetch 停止・再開と再読: `engine/src/program/generate.cpp:10251-10285,10341-10377,18808-18812`
+- 値を thread 数へ変換し worker を起動する処理、Linux 限定: `engine/src/core/expert_source.cpp:1261-1312`
+- worker 数の役割と Linux default 条件: `engine/src/core/expert_source.hpp:1012-1022,1081-1093`

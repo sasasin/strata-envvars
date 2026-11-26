@@ -1,56 +1,54 @@
 # `--kv-resident`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン） |
-| オプション | `--kv-resident N` |
+| コマンド | `strata generate`（エンジン引数。索引では `strata` の root scope） |
+| オプション | `--kv-resident` |
 | 別名 | なし |
-| 値 | KV の resident 上限を表す cell 数。parser は `std::atoll` で読み取る |
+| 値 | `N`: 10 進整数。各 QSA 層で VRAM に保持する KV cell 数。`0` は通常全 KV を VRAM に置く。 |
 
 ## 役割
 
-QSA 層ごとに VRAM に置く KV cell 数を指定し、それを超える KV を pinned RAM 側に保持して必要時にストリームする設定です。`0`（既定値）ではストリーミングせず、KV 全体を VRAM に置きます。VRAM 上の KV を減らした分は expert cache などに使える余地になりますが、実際に何へ割り当てられるかは他の設定や空き VRAM によります（`src/program/generate.cpp:487`, `src/program/generate.cpp:833-835`, `src/core/layer.cpp:738-755`）。
+各 QSA 層の KV cache の一部を VRAM に置き、残りを pinned host RAM に置いて必要なブロックを読み戻す KV streaming を設定する。長い context で KV が占める VRAM を抑え、その分を expert cache などに回せる一方、全 KV 分の pinned RAM が必要になり、host と GPU 間の転送も発生する。オプション値はセッション初期化前に設定される。
 
 ## 使い方
 
 ```sh
-strata --native MODEL.gguf --kv-resident 32768
+# 32,768 cells を各 QSA 層の VRAM resident window にする
+strata generate --pack ./pack/full --tokens "1,2,3" --kv-resident 32768
 ```
-
-`MODEL.gguf` を読む通常のエンジン経路で、各 QSA 層あたり 32,768 cell を基準に KV streaming を有効にします。モデルの最大 context は別途 `--max-context` で決まります（`src/program/generate.cpp:2480-2481`, `src/program/generate.cpp:833-835`）。
 
 ## 値と既定値
 
-- 未指定時の値は `0` です。`0` は全 KV を VRAM に置く指定で、負数は標準エラーへ `strata generate: --kv-resident must be >= 0` を出して終了コード `2` になります（`src/program/generate.cpp:487`, `src/program/generate.cpp:3200-3204`）。
-- parser は値の欠落を `--kv-resident needs a value` と標準エラーに出し、終了コード `2` で終了します（`src/program/generate.cpp:2418-2420`）。値の変換は `std::atoll` で行い、数値形式を厳密に検証する処理はありません。したがって、整数でない入力を厳密な validation error として扱う実装ではありません（`src/program/generate.cpp:2481`, `src/program/generate.cpp:3200-3204`）。
-- 同じオプションを複数回指定すると parser の走査順に値を代入するため、最後の指定値が残ります（`src/program/generate.cpp:2416-2420`, `src/program/generate.cpp:2481`）。
-- `N > 0` の場合でも実効 resident は最低 20,480 cell です。さらに QSA の page 単位に切り上げます。実効 resident page 数が `--max-context` に必要な page 数以上なら streaming mode にならず、全 KV が VRAM に残ります（`src/core/layer.cpp:738-755`, `src/core/layer.cpp:769-771`）。
+- `N` が省略された場合の parser 既定値は `0`。値が後続引数にない場合は stderr に `--kv-resident needs a value` を出して終了コード 2 で終了する。値は `std::atoll` で整数化され、負数は後段の validation で拒否される（`engine/src/program/generate.cpp:825,3842-3847,3907,5028-5032`、SYCL parser: `engine/sycl/src/program/generate.cpp:509,1882-1887,1946,2542-2546`）。
+- 数値形式の厳密な検査はなく、`std::atoll` が整数として読めない値は `0` になり、数値の後ろにある非数字は値の解析を止める（同 parser 箇所）。
+- 同じ引数を複数回渡すと parser は順に同じフィールドへ代入するため、最後の値が使われる（上記 parser 分岐）。
+- `N < 0` は stderr に `strata generate: --kv-resident must be >= 0` を出して終了コード 2。`N = 0` は共通設定関数で全 VRAM 常駐を意味するが、下記の SYCL 自動選択条件では自動値を選ぶ合図にもなる（`engine/src/core/layer.cpp:769-785`; `engine/sycl/src/core/layer.cpp:753-755`）。
+- 正数は要求値として保持される。実際の resident page 数はページ単位に切り上げられ、実装下限より小さい正数は下限へ引き上げられる。context の全 cell 数がその window 以下なら streaming にはならない（`engine/src/core/layer.cpp:738-755,771-785`; `engine/sycl/src/core/layer.cpp:722-739,753-755`）。
+- 通常の CUDA/HIP 実装での下限は 4096 cells（`STRATA_KV_RESIDENT_MIN` が 1024 以上ならその値で上書き）。Metal は既定 20480 cells。同名 help 表示は「min 20480」としているが、CUDA/HIP の現行ソース実装とは一致しない（`engine/src/program/generate.cpp:1235-1237`; `engine/src/core/layer.cpp:771-785`）。SYCL 実装の下限は 20480 cells（`engine/sycl/src/core/layer.cpp:753-755`）。
 
 ## 実行時の動作
 
-parser が設定した値は `qsa_set_kv_resident` に渡され、QSA state の KV plan が各層の VRAM slot 数と streaming mode を選びます。streaming 時は最大 context 分の KV を pinned RAM にも確保し、デバイスから参照可能な host copy を用意します。KV append は選択中の形式（標準、Q4、INT8、K8V4）に応じてその host copy にも書き込みます（`src/program/generate.cpp:3200-3204`, `src/core/layer.cpp:738-755`, `src/core/layer.cpp:903-920`, `src/core/layer.cpp:1207-1227`）。
-
-指定値は会話 session の構成 fingerprint に含まれるため、会話の構成識別にも反映されます（`src/program/generate.cpp:9440-9443`, `src/core/conversation_file.cpp:880-885`）。
+- parser は値を `Options::kv_resident` に取り込み、負数 validation 後に `qsa_set_kv_resident` へ渡す（CUDA/HIP: `engine/src/program/generate.cpp:825,3907,5028-5032`; SYCL: `engine/sycl/src/program/generate.cpp:509,1946,2542-2546`）。
+- CUDA/HIP では正数かつ context が値より大きい場合、QSA 層ごとの KV 全体を pinned host copy として確保し、resident window を VRAM に割り当てる。選択された attention block を読み出す前に必要な block を resident にする。値が `0` 以下なら全 KV を VRAM に置く（`engine/src/core/layer.cpp:738-755,920-942,1284-1285`; `engine/include/strata/core/layer.hpp:234-237,288-292`）。
+- SYCL では `N <= 0`、`--max-context > 20480`、単一 GPU、`--kv-grow` 無効、expert cache 有効、unified-memory device ではない、という条件で VRAM 容量を検査し、自動的に streaming window を選ぶ。候補は 65536、32768、20480 cells の順で、収まる最大値を選び、どれも収まらない場合は 20480 を選ぶ。RAM の空きが算出した KV streaming 必要量に届かない場合は自動選択を取り消し、stderr に理由を出す。したがって、この条件下では明示的な `--kv-resident 0` も自動選択を止めない（`engine/sycl/src/program/generate.cpp:4234-4277`; `engine/sycl/include/strata/core/short_cache.hpp:42-50`）。
+- `--kv int8`、`q4_0`、`k8v4` などの KV 格納形式と組み合わせ可能。streaming は KV 全体の形式を変えず、その host copy と VRAM window に適用される（`engine/src/program/generate.cpp:1230-1237,5020-5027`; `engine/src/core/layer.cpp:757-765`）。
+- `--kv-grow` は「全 KV を VRAM に置き、必要に応じて割り当てる」別方式で、CUDA/HIP では `--kv-resident` が正数だと有効条件を満たさない（`engine/src/program/generate.cpp:7715-7729`; `engine/include/strata/core/layer.hpp:288-297`）。
 
 ## 適用条件と副作用
 
-- 対象は索引にある `strata-engine` の通常 `strata` エンジン引数 parser です。Qwen3.6 専用 parser は別 scope です。`--native` が Qwen3.6-35B-A3B を選んだ場合は通常 parser より前に専用実装へ振り分けられるため、本書ではその専用経路の挙動を説明しません（索引 [`docs/cli/README.md:1128-1134`](../../README.md#strata-engine)、`src/program/generate.cpp:2393-2407`）。
-- `--kv k8v4` も streaming に対応します。KV の保存形式は `--kv` が選び、本オプションは VRAM と pinned RAM への配置を制御します（`src/program/generate.cpp:827-835`, `src/core/layer.cpp:757-765`, `src/core/layer.cpp:1207-1219`）。
-- `--kv-grow` が要求されても、`--kv-resident` が正値なら KV-grow は有効条件を満たさず、標準エラーに「`--kv-grow is off`」と警告されます。KV-grow は全 KV を VRAM に置く条件を必要とするためです（`src/program/generate.cpp:5198-5210`）。
-- `--batch` の slot session が VRAM に収まらない場合、エンジンは `--max-context` の縮小または KV streaming を候補として警告します。ただし本オプションを指定すれば必ず batch が有効になるという保証ではありません（`src/program/generate.cpp:5418-5427`）。
-- pinned RAM の確保またはデバイス mapping が失敗すると、該当 layer の初期化は失敗し、通常の初期 session では `session_init failed` を標準エラーに出して終了コード `1` になります。確保失敗時には `lower the context, or run without --kv-resident` という案内も標準エラーに出ます（`src/core/layer.cpp:907-917`, `src/program/generate.cpp:5215-5221`）。
-
-## 関連オプション
-
-- [`--kv`](--kv.md): KV の保存形式を選択します。
-- [`--max-context`](--max-context.md): KV state の最大 context を設定します。
-- [`--kv-grow`](--kv-grow.md): 条件付きの elastic KV allocation を要求します。本オプションの正値とは同時に有効化されません。
+- QSA 層を持つモデルの KV state に作用する。context が指定値以下なら streaming mode にならない。MTP drafter の KV ring にも streaming の仕組みがあるが、ring window は別途 drafter の window 値から sizing される（`engine/src/core/layer.cpp:743-755`; `engine/sycl/src/core/layer.cpp:727-739`; `engine/include/strata/core/layer.hpp:288-292`）。
+- streaming 時は KV 全体に対応する pinned host memory を確保する。CUDA/HIP は CUDA host allocation / registration を試し、失敗時は別方式へ fallback する。SYCL は `sycl::malloc_host` を使う（`engine/src/core/layer.cpp:577-620,925-942`; `engine/sycl/src/core/layer.cpp:917-927`）。
+- pinned RAM を確保できない場合は stderr に確保失敗と対処案を出して state initialization が失敗し、エンジンは `session_init failed` で終了する（CUDA/HIP: `engine/src/core/layer.cpp:930-937`, `engine/src/program/generate.cpp:7738-7740`; SYCL: `engine/sycl/src/core/layer.cpp:917-925`）。
+- 初期化が成功して streaming mode が有効なとき、CUDA/HIP は resident cells、context、pinned RAM 使用量を stderr に表示する（`engine/src/program/generate.cpp:7742-7746`）。
 
 ## 根拠
 
-索引上の配置は `strata-engine` の `strata`（エンジン引数）です（[`docs/cli/README.md:1128-1134`](../../README.md#strata-engine)、オプションの掲載は [`docs/cli/README.md:1192-1195`](../../README.md#strata-engine)）。値の既定値、parser、負数 validation は `src/program/generate.cpp:487`, `src/program/generate.cpp:2416-2420`, `src/program/generate.cpp:2480-2483`, `src/program/generate.cpp:3200-3204` で確認しました。実効 page 数、pinned host copy、KV append、失敗経路は `src/core/layer.cpp:738-755`, `src/core/layer.cpp:903-920`, `src/core/layer.cpp:1207-1227` と `src/program/generate.cpp:5215-5221` で確認しました。
-
-この調査ではソース checkout と索引を参照し、ビルド済み CLI の `--help` および Release artifact は確認していません。GPU/OS/backend ごとの pin 上限や確保可否は実行環境に依存するため、ここではコード上の失敗経路までを記載しています。
+- `engine/src/program/generate.cpp:825,1235-1237,3907,5028-5032` — CUDA/HIP parser option の既定値、help、値の読み込み、負数 validation と設定。
+- `engine/sycl/src/program/generate.cpp:509,1946,2542-2546,4234-4277` — SYCL parser と自動 window 選択、RAM 条件。
+- `engine/src/core/layer.cpp:738-785,920-942,1284-1285` — CUDA/HIP の window sizing、下限、pinned copy と attention 前の block 解決。
+- `engine/sycl/src/core/layer.cpp:722-755,917-927`; `engine/sycl/include/strata/core/short_cache.hpp:42-50` — SYCL の window sizing、下限、pinned allocation と自動候補。
+- `engine/include/strata/core/layer.hpp:234-237,288-292` — resident/streaming state の意味と初期化前設定の契約。

@@ -1,38 +1,47 @@
 # `STRATA_RING_BYTES`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-prompt prefill の expert streaming ring と、`--prefill auto` が決める chunk サイズを連動させる方式を選びます。既定では ring を pack の blob サイズに応じた byte budget で扱い、旧方式の固定 slot 数・chunk 候補リストへ戻すには値の先頭を `0` にします。対象実装は CUDA/HIP 系の `src` と SYCL 系の `sycl/src` にあります。
+prefill のリングをバイト予算として扱う方式と、それに合わせた自動 chunk／expert-cache loan の選択を切り替える。既定（unset）では有効で、`0` で旧方式に戻す。CUDA/HIP 系の `engine/src/prefill/prefill.cpp` と SYCL の `engine/sycl/src/prefill/prefill.cpp` に同じ読み取り関数があり、CLI・サーバーどちらから呼ばれても engine 内で作用する。SYCL では追加で特定の 8192-token window workspace 再利用の条件にも使われる。`engine/src/prefill/prefill.cpp:833-835, 3912`、`engine/sycl/src/prefill/prefill.cpp:281-284, 2523, 1323-1325`。
 
 ## 値と判定
 
-値は文字列全体を parse せず、`std::getenv()` の結果の先頭文字だけを判定します。判定結果は関数内の `static const bool` に保存され、最初の評価後にプロセス環境を変更しても再評価されません。
+両実装とも `std::getenv` の戻り値を関数内 `static const bool` に保存し、値全体を parse せず先頭 1 byte だけを見る。unset は有効、設定値の先頭が文字 `0` なら無効、それ以外は有効。したがって空文字は有効、`0`・`0anything`・`00` は無効、`1`・`true`・`false`・`anything`・先頭空白の ` 0` はいずれも有効。数値妥当性、大文字小文字、末尾文字は検査しない。`engine/src/prefill/prefill.cpp:833-835`、`engine/sycl/src/prefill/prefill.cpp:281-284`。
 
-| 環境変数の状態・値 | 判定 |
-|---|---|
-| 未設定 | 有効（byte-budget 方式） |
-| 空文字 | 有効（先頭文字は `\0` であり `0` ではない） |
-| 先頭文字が `0`（例: `0`, `0anything`） | 無効（旧方式へ戻る） |
-| それ以外（例: `1`, `true`, `false`, `anything`） | 有効 |
-
-数値変換、空白除去、大文字小文字の変換はありません。したがって `false` も有効です。根拠: `src/prefill/prefill.cpp:266-269`、`sycl/src/prefill/prefill.cpp:185-188`。
+| 実装 | unset | 有効になる設定値 | 無効になる設定値 |
+|---|---|---|---|
+| CUDA/HIP 系共通 engine | 有効 | 空文字、`1`、`true`、`false`、`anything`、` 0` | `0`、`0anything`、`00` |
+| SYCL engine | 有効 | 空文字、`1`、`true`、`false`、`anything`、` 0` | `0`、`0anything`、`00` |
 
 ## 有効になる条件
 
-byte-budget の ring と chunk の組み合わせを選ぶのは、expert cache から prompt 用バッファを借りる `--prefill auto` の計画経路です。CUDA/HIP 系では単一 cache の `plan_lend` と複数 stage の `scan`、SYCL 系でも対応する同じ経路に判定があります。explicit な `--prefill N` はこの auto chunk scan を使いませんが、バッファ必要量の見積もりにはこの変数の分岐が使われます（`src/program/generate.cpp:6317-6386,6975-7066`、`sycl/src/program/generate.cpp:5973-6040,6529-6615`）。
-
-有効時の ring byte budget は Q2_0 blob のサイズと pinned share から定め、実際の pack の最大 blob サイズで slot 数へ換算し、ring 上限で clamp します。自動計画は cache の空き byte 数を見て ring と chunk の組を探します。非 pinned share の経路は従来どおり slot 数 96 を使います。`STRATA_PREFILL_RING` が設定されている場合は、その値から得た ring 数が計算上の budget より優先されます。また、`--prefill auto` 自体が選ばれない経路（利用可能な expert cache loan がない場合など）では、この auto scan の効果はありません。根拠: `src/prefill/prefill.cpp:241-274,276-297`、`src/program/generate.cpp:6282-6317,6360-6386`。
+- バイト予算を使った chunk／loan 選択は `--prefill auto` の自動選択経路で使われる。明示的な `--prefill N` は自動選択の旧 chunk リスト／バイト予算スキャンを通らない。CUDA/HIP 系では `engine/src/program/generate.cpp:11346-11351, 11388-11409`、SYCL では `engine/sycl/src/program/generate.cpp:6713-6718, 7311-7332`。
+- 自動経路では、CUDA/HIP 系は expert cache から借りる余地をバイトで計算し、収まる ring と chunk を探索する。SYCL も同様に room を計算する。値が有効でも、chunk が収まらない場合は旧方式の候補／fallback が使われる。`engine/src/program/generate.cpp:11361-11409`、`engine/sycl/src/program/generate.cpp:7317-7332`。
+- `STRATA_PREFILL_RING` が設定されると ring slot 数の選択ではその値が優先され、bytes 方式の計算した予算が ring 数を置き換えない。なお、変数が有効な場合の自動 chunk 探索自体は残り、探索時にも `STRATA_PREFILL_RING` を考慮する。`engine/src/prefill/prefill.cpp:843-879`、`engine/sycl/src/prefill/prefill.cpp:291-323`、`engine/src/program/generate.cpp:11388-11397`、`engine/sycl/src/program/generate.cpp:7320-7327`。
+- SYCL の `pair_window` は bytes 方式が有効で、window layout、`T == 8192`、gate workspace 共有が成立し、CVEC がロードされていない場合だけ有効になる。`STRATA_RING_BYTES=0` ではこの追加条件を満たさない。`engine/sycl/src/prefill/prefill.cpp:1306-1327, 1648-1652`。
+- 判定関数に OS・backend・build macro の条件分岐はない。ただし、そのソース実装を含む実行経路に限られる。CUDA/HIP 系と SYCL のコードが別に存在する。`engine/src/prefill/prefill.cpp:833-835`、`engine/sycl/src/prefill/prefill.cpp:281-284`。
 
 ## 実行時の詳細
 
-- **有効時（既定）:** auto chunk scan は 256-token grid 上で byte budget に収まる chunk を探します。従来の auto chunk で収まる場合はその ring を維持し、それより大きい chunk を選ぶ場合に、chunk と ring の byte budget を合わせて ring slot 数を決めます。auto planner が選んだ budget は `Prefill::set_ring_budget()` で保存されます。
-- **先頭文字が `0` の場合:** auto planner は旧候補 `{32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256}` から最初に適合する chunk を選び、ring budget を設定しません。候補は `--prefill auto:N` の上限、context、loan 可能 slot 数などでも制限されます。実際の ring 数は、明示的な `STRATA_PREFILL_RING` や split ring override がなければ pinned-share に応じた従来の 1024/384/96 slot（ring 上限内）です。
-- **バッファ見積もり:** `Prefill::bytes_needed_impl()` は有効時に実際の carve に合わせた `xn` / `grs` / `HC` バッファの数え方を使い、無効時は旧版の数え方を使います。この見積もりは loan 可否や chunk/ring が収まるかの判定に使われ、GPU メモリの実割当そのものをこの環境変数が直接切り替えるわけではありません。根拠: `src/prefill/prefill.cpp:1830-1855`、SYCL 実装 `sycl/src/prefill/prefill.cpp:1862-1886`。
+初回に `ring_bytes_on()`／`ring_bytes_enabled()` が呼ばれた時点のプロセス環境を読み、関数内 static に保存する。その後プロセス内で環境値を変更しても判定は更新されない。共通 helper `Prefill::ring_bytes_enabled()` はこの保存値を返す。`engine/src/prefill/prefill.cpp:833-835, 3912`、`engine/sycl/src/prefill/prefill.cpp:281-284, 2523`。
 
-auto 選択時の serve 経路は stderr に `strata serve: prompt chunk auto: ... tokens, a ...-slot ring` と実際に解決した chunk / slot 数を出します。変数専用の警告やエラーは見つかりません。CUDA/HIP 系と SYCL 系で判定・auto planning の分岐が並行して実装されています。根拠: `src/program/generate.cpp:7095-7105`、`sycl/src/program/generate.cpp:6615-6621`。
+有効時、`ring_slots()` は自動設定された `g_ring_budget` があり、chunk が `g_ring_small_max` を超えると、その予算を既定 slot 数より優先する。slot 数は blob サイズから換算され、上限 `ring_cap()` に clamp される。ring override、`STRATA_PREFILL_RING`、pinned share、fused ring などにより最終 slot 数は変わる。無効時はこの `g_ring_budget` 経路を使わず、従来の pinned ring と旧自動 chunk 候補リストを使う。`engine/src/prefill/prefill.cpp:808-841, 843-879`、`engine/sycl/src/prefill/prefill.cpp:264-289, 291-323`、`engine/src/program/generate.cpp:11335-11409`、`engine/sycl/src/program/generate.cpp:6701-6718`。
 
-## 文書・測定値との照合
+値は ring 選択だけでなく、`Prefill::bytes_needed_impl()` の scratch buffer 見積もりにも使われる。有効時は `gr_unfused()` に応じた追加領域を数え、無効時は旧式の領域サイズを数える。SYCL では `reuse_hc` が成立する場合に共有領域の分を省く。したがって見積もりと、それを使う fit／loan 判断も変わる。`engine/src/prefill/prefill.cpp:3718-3742`、`engine/sycl/src/prefill/prefill.cpp:2423-2462`。
 
-`docs/DETAILS.md:1843-1856` は、既定の byte-budget ring と `--prefill auto` の連動、および `STRATA_RING_BYTES=0` による旧 ring / loan / chunk choice の復元を説明しています。同資料では RTX 5070 の 32K prompt の比較として IQ3_XXS +18.5%（別 memory state で +9%）、Coder +3%、IQ3_S は変化なし、4K prompt は -0.7%〜+1.1% の範囲で同一出力と記載されています。長い prompt では cached / streamed experts の組み合わせが変わり、出力 bits も変わる旨も記載されています。これらは資料に記載された環境・測定条件での結果であり、他の GPU やモデルでの性能を保証しません。固定 `--prefill 2048` の Q2_0 は影響を受けなかったと同資料にあります。
+## ログと測定値
+
+この変数専用のログ、警告、終了コードはない。選ばれた chunk が通常の prefill 情報として表示される経路では `strata prefill: ... tokens in ...-token chunks ...` が出る。バッファ割当てが失敗した場合は `prefill: device buffers for a chunk of ... tokens do not fit (...)` がエラー文字列となり、呼び出し元に返る。`engine/src/prefill/prefill.cpp:3694-3699, 2738-2746, 2949-2958`。
+
+`docs/DETAILS.md:1766-1769` は RTX 5070 の 32K prompt、`STRATA_RING_BYTES=0` との 2–3 回の交互測定（engine 0.1.39b）として量子化別の差と teacher-forced 指標を記載している。これは同資料に記載された測定結果であり、この調査で再測定した値ではない。`docs/DETAILS.md:1766-1769`。
+
+## 根拠
+
+- 判定と cache: `engine/src/prefill/prefill.cpp:833-835, 3912`; `engine/sycl/src/prefill/prefill.cpp:281-284, 2523`
+- ring slot の優先順位と clamp: `engine/src/prefill/prefill.cpp:814-841, 843-879`; `engine/sycl/src/prefill/prefill.cpp:267-289, 291-323`
+- CUDA/HIP 自動選択: `engine/src/program/generate.cpp:11335-11409`
+- SYCL 自動選択と pair window: `engine/sycl/src/program/generate.cpp:6713-6718, 7311-7332`; `engine/sycl/src/prefill/prefill.cpp:1323-1327, 1648-1652`
+- 見積もり差と割当て失敗: `engine/src/prefill/prefill.cpp:3718-3742, 2738-2746`; `engine/sycl/src/prefill/prefill.cpp:2423-2462`
+- 資料上の測定値: `docs/DETAILS.md:1766-1769`

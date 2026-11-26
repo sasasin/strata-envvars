@@ -1,42 +1,45 @@
 # `STRATA_PREFILL_DUMP_R_ALL`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-プロンプト prefill の各 token 位置について、最終 multi-stream residual `R` を BF16 に丸め、指定ファイルへ追記します。コードコメントでは draft-layer distillation data 用の opt-in フックとされています。通常の生成結果や prefill の計算を切り替える設定ではなく、追加の同期・device-to-host copy・ファイル書き込みを行う調査用出力です。
+chunk-major prefill が各 chunk の最終 multi-stream residual `R` を GPU から host にコピーし、BF16 の生データとして指定パスへ出力する診断・データ収集用フックです。CUDA/HIP 実装と実験的 SYCL 実装にあります。全 token 位置を出力し、通常の生成結果や residual の計算自体は変更しません。データには位置番号や shape header が含まれず、呼び出しを区切る情報もありません。`engine/src/prefill/prefill.cpp:7858-7882`、`engine/sycl/src/prefill/prefill.cpp:5587-5609`。
 
 ## 値と判定
 
-| 環境変数の状態 | 動作 |
-|---|---|
-| 未設定 | 出力処理を行わない |
-| 空文字を含む任意の設定値 | 設定値をファイルパスとして `fopen(path, "ab")` に渡す。文字列比較や数値変換はしない |
-| パスを開けない値 | `fopen` が失敗し、出力を黙ってスキップする |
+| 条件（backend） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP chunk-major (`engine/src`) | ダンプしない | `path.bin`、`0`、`true`、`0anything`（いずれも文字列全体をパスとして使う） | 有効値の形式検査はない。空文字 `""` も設定済みとして分岐するが、空パスを `fopen` できずファイル出力されない |
+| SYCL chunk-major (`engine/sycl/src`) | ダンプしない | `path.bin`、`0`、`true`、`0anything`（文字列全体をパスとして使う） | 有効値の形式検査はない。空文字 `""` も設定済みとして分岐するが、空パスを `fopen` できずファイル出力されない |
 
-値は `getenv` で各 chunk の出力箇所に到達した時点で読みます。`static` cache はありません。したがって、コード上は後続 chunk で環境値を再取得します。
+どちらも `std::getenv` の null 判定だけで、文字列比較、数値変換、空白除去、大文字小文字変換はありません。値が存在すればパスとして使います。開けないパスでは `fopen` が失敗し、ファイル出力は行われませんが、この分岐は診断ログやエラーを出しません。CUDA/HIP は `fopen` 成功後の `fwrite` / `fclose` 結果も確認しません。同じ実行経路で chunk ごとに環境を読み直すため cache はなく、実行中に環境を変更すれば後続 chunk の判定に反映され得ます。`engine/src/prefill/prefill.cpp:7858-7882`、`engine/sycl/src/prefill/prefill.cpp:5587-5609`。
 
 ## 有効になる条件
 
-- CUDA 実装（`src/prefill/prefill.cpp`）または SYCL 実装（`sycl/src/prefill/prefill.cpp`）の prefill 経路を通ること。
-- layer-split prefill では `next_ == nullptr` の最終 stage のみがこの書き出し箇所に到達します。中間 stage は後続 stage に hand-off して `continue` するため、この箇所では出力しません。
-- Metal は `Prefill::run()` から `metal_engine::prompt_run()` に分岐して `run_impl()` を呼ばないため、この環境変数の読み取り箇所を通りません。
-
-通常の prefill 呼び出し、プロンプト chunk 分割、server/CLI のどれかに限定する判定は、この変数の実装箇所にはありません。各 chunk の終端 stage で値が設定されていれば出力します。
+- CUDA/HIP: `Prefill::run` が layer-major prefill を選ばず `run_impl` に進み、chunk の最終 residual を処理する必要があります。layer-major を試す経路では、この変数が設定されていると `lm_prepare` が `"a routing or row debug dump"` を理由に拒否し、通常の chunk-major 経路に戻ります。ただし `lm_prepare` の先行条件（短い prompt など）が先に拒否した場合は、この理由判定には到達しません。`engine/src/prefill/prefill.cpp:8205-8209, 8235-8238, 9657-9705`。
+- SYCL: `run_impl` の最終 stage が各 chunk を完了する経路で出力します。`engine/sycl/src/prefill/prefill.cpp:5572-5610`。
+- SYCL には別に、この変数の設定有無を `run_expert_window` の fast-path 条件から除外する判定があります。現行 checkout ではこの関数の呼び出し箇所を確認できなかったため、この guard が実行時に fast path を変えるとは断定しません。`engine/sycl/src/prefill/prefill.cpp:5838-5848`。
+- 出力パスを渡す CLI 引数や、他の環境変数による path の上書きはありません。少なくとも直接参照箇所では、モデル geometry から得る `D`（`hc * n_embd`）の全 residual 列が対象です。ファイルには全 chunk・全 request 分が区切りなく連結されます。`engine/src/prefill/prefill.cpp:7858-7882`、`engine/sycl/src/prefill/prefill.cpp:5587-5609`。
 
 ## 実行時の詳細
 
-`m.R` は `T` 行、各 `D` 個の float を持つ最終 residual バッファです（このソースでは `D = N * HC`）。環境変数が設定されていると、まず CUDA stream または SYCL queue を同期し、`m.R` を最大 512 行ずつ host にコピーします。各 float の IEEE 754 bit pattern `u` に `0x7fff + ((u >> 16) & 1)` を加えた後、上位 16 bit を保存しており、BF16 の round-to-nearest-even への丸めです。
+chunk-major の最終 stage は device residual `R` を host にコピーする前に CUDA stream または SYCL queue を同期し、最大 512 行ずつ処理します。各行の `D` 個の float を BF16 に丸め、`fopen(path, "ab")` で追記します。1 token あたり `D * 2` byte で、行順は chunk 内の位置順です。ファイルは初回も切り詰めず、既存ファイルがあれば末尾へ追記します。位置番号、shape、request 境界は保存されません。`engine/src/prefill/prefill.cpp:7858-7882`、`engine/sycl/src/prefill/prefill.cpp:5587-5609`。
 
-出力は token 位置順に並ぶ raw な `uint16_t`（BF16）の連続列です。ファイルにはヘッダー、位置番号、chunk/request 境界は書きません。各 chunk で `fopen(path, "ab")` を使うため、既存ファイルの末尾へ追記し、複数 chunk・複数 request のデータも同じファイルに連結されます。固定寸法のこの実装では各行 10,240 BF16 値（20,480 byte）です。
+CUDA/HIP 版は NaN を quiet NaN にしてから BF16 化します。SYCL 版は float の bit pattern に round-to-nearest-even の加算をして上位 16 bit を保存し、NaN 専用処理はありません。どちらも出力値は BF16 相当ですが、NaN の扱いには実装差があります。`engine/src/prefill/prefill.cpp:7868-7879`、`engine/sycl/src/prefill/prefill.cpp:5597-5606`。
 
-ファイルを開けない場合の警告・エラー設定はありません。`fwrite` や residual copy の戻り値もこの箇所では検査せず、ログ出力もありません。`STRATA_PREFILL_DUMP_R` は別の出力経路で、64 token ごとに位置番号と F32 residual を別形式で書きます。
+この名前は、CUDA/HIP の layer-major prefill が持たない row dump hook としても設定有無を確認します。layer-major prefill の選択自体は別設定やモデル・prompt 条件にも依存し、通常経路では `strata prefill: layer-major off for this prompt: a routing or row debug dump` が理由ごとに一度出ます（デフォルト選択の短い prompt などは抑制されます）。16 回連続で長い prompt が layer-major を使えない場合は継続ログも出ます。`engine/src/prefill/prefill.cpp:8205-8209, 9694-9702`。
+
+## ログと測定値
+
+ダンプ成功を知らせる専用ログはありません。出力先を開けない場合も明示的なログや Strata エラーにはならず、このフックによる終了もしません。GPU 同期・コピー呼び出しの戻り値もダンプ部分ではエラー判定に使われていません（後続処理で別途失敗する可能性はあります）。SYCL の同期・コピーが例外を投げた場合は `run_impl` を囲む `sycl::exception` handler が `what()` と source 行を stderr に出し、`exit(1)` します。`engine/src/prefill/prefill.cpp:7861-7882`、`engine/sycl/src/prefill/prefill.cpp:5589-5609, 5792-5796`。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:4180-4214`: CUDA の `STRATA_PREFILL_DUMP_R_ALL` 読み取り、同期、最大 512 行単位の copy、BF16 丸め、追記。
-- `sycl/src/prefill/prefill.cpp:4463-4500`: SYCL の対応実装。形式と追記動作は CUDA と同じ。
-- `src/prefill/prefill.cpp:4169-4179, 4180-4193`: 中間 layer-split stage の hand-off と最終 stage 側の出力箇所。
-- `src/prefill/prefill.cpp:4338-4354`: Metal 経路は `prompt_run()` に分岐し、通常経路の `run_impl()` より前に戻る。
-- `src/prefill/prefill.cpp:118`: `N = 2560`, `HC = 4`, `D = N * HC` の寸法定義。
-- `docs/DETAILS.md` および他の設計資料に、この変数の説明や出力形式・測定値の記載は見つかりませんでした。
+- `engine/src/prefill/prefill.cpp:7858-7882` — CUDA/HIP chunk-major dump の読み取り、同期、出力形式。
+- `engine/src/prefill/prefill.cpp:8205-8209` — layer-major prepare における debug dump の拒否。
+- `engine/src/prefill/prefill.cpp:9657-9705` — layer-major の試行、理由ログ、chunk-major `run_impl` への fallback。
+- `engine/sycl/src/prefill/prefill.cpp:5587-5609` — SYCL chunk-major dump。
+- `engine/sycl/src/prefill/prefill.cpp:5838-5848` — SYCL expert window fast-path 条件からの除外。
+- `engine/sycl/src/prefill/prefill.cpp:5792-5796` — SYCL exception の stderr 出力と終了。
+- `engine/CMakeLists.txt:23-32`、`engine/cmake/strata_gpu_engine.cmake:482-488`、`engine/sycl/CMakeLists.txt:303-308` — CUDA/HIP 共通 prefill と独立した SYCL prefill の build 定義。

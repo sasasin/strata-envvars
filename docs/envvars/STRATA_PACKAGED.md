@@ -1,57 +1,50 @@
 # `STRATA_PACKAGED`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。Strata 所有コードを調査。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Desktop shell が Host プロセスへ `STRATA_PACKAGED=1` を渡し、Host に「パッケージ済みアプリとして扱う」状態を伝えます。Host では主に、推論用デモへの fallback を禁止する判定、エンジン／connector の自動取得を拒否する判定、Control status の表示、および listen 完了後の Control cleanup に使います。Desktop shell の通常の Host 起動では `host_command()` がこの値を設定します。self-test の Host 起動でも設定します（`apps/desktop/src-tauri/src/main.rs:442-483,668-745`）。
+Host がインストール済み desktop app として動いていることを示すフラグ。desktop shell は Host の子プロセス起動時に `STRATA_PACKAGED=1` を設定し、同時に `STRATA_REAL_ENGINE=1` も設定する。Host はこの値を使い、実エンジンが無い場合にデモ推論へ切り替えない、ソフトウェア取得を拒否する、パッケージ状態を API で返すなどの処理を行う。値だけで Host 全体のシミュレーションを切り替えるわけではなく、カタログやモデル状態等の通常モードは `STRATA_REAL_ENGINE` にも依存する（`app/desktop/src-tauri/src/main.rs:522-537`、`app/host/server/inference.mjs:40-50`、`app/host/server/models.mjs:18-20`）。
 
 ## 値と判定
 
-packaged-mode の判定は文字列の完全一致です。`true`、空文字、`01` などを `1` と同じ値には扱いません。地域設定の分岐だけは別途 `STRATA_TEST_LOCALE` の truthiness も見ます。
+本番 Host の読み取りはいずれも `process.env.STRATA_PACKAGED === '1'` の厳密比較で、数値変換や大文字小文字変換はしない。未設定、空文字、`0`、`false`、`true`、`0anything`、`01`、`1anything` は `"1"` と一致しない。`"1"` だけが一致する（`app/host/server/inference.mjs:47-50`、`app/host/server/acquisition.mjs:24-26`、`app/host/server/region.mjs:62-64`、`app/host/server/index.mjs:1427-1429,2571-2575`）。
 
-| 読み取り箇所 | `STRATA_PACKAGED=1` | unset、空文字、その他の値 |
-|---|---|---|
-| 推論の `requiresRealEngine()` | デモ推論を禁止 | この変数単独では禁止しない |
-| 取得判定 `forbidden()` | 取得を禁止 | この変数単独では禁止しない |
-| `/api/control/status` | `packaged: true` | `packaged: false` |
-| Host の listen 完了 callback | `control` があれば `control.cleanup()` を呼ぶ | 呼ばない |
-| `systemLocale()` のテスト locale 分岐 | `STRATA_TEST_LOCALE` を使う分岐を通らない | `STRATA_TEST_LOCALE` が truthy なら分岐する |
+| 判定箇所 | unset / 空文字 / `"true"` 等 | `"1"` | 優先関係 |
+|---|---|---|---|
+| 推論で実エンジンを必須にするか | `STRATA_FORCE_DEMO=1` ならデモ可。それ以外は `STRATA_REAL_ENGINE=1` なら必須、どちらも該当しなければデモ可 | 必須。`STRATA_FORCE_DEMO=1` でも解除されない | `STRATA_PACKAGED=1` が最優先。通常時は `STRATA_FORCE_DEMO=1` が `STRATA_REAL_ENGINE=1` より先に判定される |
+| 取得禁止 | `STRATA_NO_ACQUIRE` が `1`/`true`/`yes`/`on`（前後空白除去・小文字化後）なら禁止、それ以外はこの変数による禁止なし | 禁止 | どちらかの条件で禁止 |
+| テスト用 locale 上書き | `STRATA_TEST_LOCALE` が truthy なら上書き候補になる | 上書きを抑止 | `"1"` の場合、OS locale 検出へ進む |
+| `/api/control/status` の `packaged` と listen 後の処理 | `false`。packaged 固有処理を行わない | `true`。Control がある場合に後述の処理を行う | 他変数との優先順位なし |
 
-推論判定の優先順位は次のとおりです。
-
-- `STRATA_PACKAGED=1` なら、`STRATA_FORCE_DEMO=1` があっても demo を許可しません。`STRATA_REAL_ENGINE` の値にもかかわらず `requiresRealEngine()` は true になります。
-- packaged でない場合、`STRATA_FORCE_DEMO=1` は最初に評価され、`STRATA_REAL_ENGINE=1` より優先して false を返します。
-- それ以外では `STRATA_REAL_ENGINE=1` なら true、そうでなければ false です。
-
-取得判定は `STRATA_NO_ACQUIRE` の既存判定との OR です。`STRATA_NO_ACQUIRE` が `1` / `true` / `yes` / `on`（trim 後、大文字小文字を無視）でも取得禁止になります。`STRATA_PACKAGED` 側は厳密に `=== '1'` です。
-
-根拠: `apps/host/server/inference.mjs:38-42`, `apps/host/server/acquisition.mjs:12-30`。
+推論のデモ抑止は `STRATA_REAL_ENGINE` とは別に `STRATA_PACKAGED` 単独でも働く。ただし desktop shell は両方を設定する。`STRATA_TEST_LOCALE` は JS の truthy 判定なので unset と空文字は上書きせず、空白だけの文字列は候補として parse された後、locale 無しの結果になり得る（`app/desktop/src-tauri/src/main.rs:528-532`、`app/host/server/inference.mjs:47-50`、`app/host/server/region.mjs:62-65`）。
 
 ## 有効になる条件
 
-この値を設定して Host を起動するのは Desktop shell のコードです。Rust の `host_command()` は Node Host のコマンドへ `.env("STRATA_PACKAGED", "1")` を加えます。self-test 用の別起動も同じ値を渡します。Host の listen 後処理は `control` が存在することも条件です（`apps/desktop/src-tauri/src/main.rs:463-483,734-745`; `apps/host/server/index.mjs:2262-2266`）。
-
-デモ禁止は「特定 engine だけを必須にする」条件ではありません。Host は Strata worker、supervised engine、または検出できた OpenAI-compatible server を使える経路を先に調べ、実 engine が見つからない場合にだけ `requiresRealEngine()` に従って unavailable/demo を選びます。従って `STRATA_PACKAGED=1` は demo fallback を止めますが、他の実 backend の利用を止めません（`apps/host/server/inference.mjs:84-156`）。
-
-`STRATA_TEST_LOCALE` は packaged でない場合だけテスト用地域設定として採用されます。地域情報の通常の検出結果は `systemLocale()` 内に cache されますが、これは `STRATA_PACKAGED` 自体の cache ではありません（`apps/host/server/region.mjs:58-65`）。
+- 推論の抑止は Host の `inference.mjs` を通る chat 経路で適用される。`STRATA_PACKAGED=1` でも Strata API worker、supervised engine、または識別された localhost の OpenAI 互換サーバーが使える場合は、その実エンジン経路を選ぶ。どれも無い場合は demo backend を返さず `unavailable` となる（`app/host/server/inference.mjs:93-165`）。
+- `/api/control/status` の `packaged` 表示と listen 後処理は `control` が生成されている場合だけ Control 部分が動く（`app/host/server/index.mjs:1418-1436,2569-2576`）。
+- 取得禁止は `cloudflared` の自動インストールで `requireAcquisition` に到達した場合に適用される。既に利用可能な connector が見つかる場合はそのまま返り、モデルをユーザーが明示的にダウンロードする操作はこの helper の対象外（`app/host/server/cloudflared-install.mjs:46-52`、`app/host/server/acquisition.mjs:7-9,24-30`）。
+- locale の抑止は `/api/locale` が `systemLocale()` を呼ぶ経路で有効。`STRATA_PACKAGED=1` では `STRATA_TEST_LOCALE` を使わず、OS の locale 情報を検出する（`app/host/server/index.mjs:2217`、`app/host/server/region.mjs:32-55,58-65`）。
+- desktop shell の通常 Host 起動では値を `"1"` に固定し、`STRATA_REAL_ENGINE=1` も同時に渡す。self-test 起動でも両方を `"1"` にする（`app/desktop/src-tauri/src/main.rs:522-537,797-807`）。OS/backend の個別分岐はこの値の比較にはない。
 
 ## 実行時の詳細
 
-推論では Host の起動処理が `detectBackend({ force: true })` を呼び、後続の chat は `streamChat()` から backend を検出します。Strata worker、supervised engine、OpenAI-compatible server が見つからず、`requiresRealEngine()` が true なら backend は `kind: 'unavailable'` になり、エラー文に `Simulated output is disabled in this build.` を含めます。`streamChat()` はその backend で demo を実行せず例外を投げます。逆に実 engine 必須でない場合のみ `kind: 'demo'` に進みます。backend 情報は module 変数に保持され、非 engine backend は強制再検出でなければ 20 秒以内 cache されます。環境変数判定そのものを `static` 等へ保存する処理はなく、`requiresRealEngine()` の呼び出しごとに process environment を参照します（`apps/host/server/index.mjs:278-284`; `apps/host/server/inference.mjs:28-42,84-156,199-234`）。
+- desktop shell が Host 子プロセスを起動するとき環境へ設定する。推論の `requiresRealEngine()`、取得判定、locale 分岐、状態 API は Host 実行中に `process.env` を参照する。`requiresRealEngine()` 自体に static cache はないが、起動時に `detectBackend({ force: true })` が一度評価され、backend の状態を保持する。以後の chat でも `detectBackend()` が呼ばれる。backend の一部候補結果は 20 秒間再利用される（`app/desktop/src-tauri/src/main.rs:522-537`、`app/host/server/inference.mjs:37-50,93-120,142-165,209-210`、`app/host/server/index.mjs:306-314`）。
+- 推論先がすべて見つからず、実エンジン必須なら backend は `kind: 'unavailable'` となる。chat 側では `streamChat()` が `No Strata engine answered at … and no supervised engine is running. Start Strata (or load a model) and retry. Simulated output is disabled in this build.` の Error を投げ、Host はエラー frame として通知し、request を error 付きで終了する（`app/host/server/inference.mjs:142-153,241-246`、`app/host/server/index.mjs:732-768,785-797`）。
+- 取得禁止時、connector が未導入で自動取得へ進もうとすると `AcquisitionRefused` を投げる。code は `acquisition_refused`、status は `409`、message は `<対象> is not installed here, and the app never downloads it while it runs. Install it from <案内>.`（`app/host/server/acquisition.mjs:14-21,28-30`、`app/host/server/cloudflared-install.mjs:46-52`）。
+- listen 完了後、`control` があり値が `"1"` なら `control.cleanup()` を開始し、`native.refresh(false)` で初回状態を読み込む。refresh の失敗はこの呼び出しでは握りつぶされ、ページ側の読み取りに委ねる（`app/host/server/index.mjs:2569-2576`）。
+- locale は通常検出結果を module-level `cached` に保持する。packaged の場合はこの cache を使う通常経路に入り、`STRATA_TEST_LOCALE` は参照しない（`app/host/server/region.mjs:58-65`）。
 
-取得制限は engine installer と connector installer が取得処理に入る前に `requireAcquisition()` を呼ぶ形です。禁止条件では `AcquisitionRefused`（`code: 'acquisition_refused'`, `status: 409`）を throw します。既に使える connector が見つかる場合、connector installer はそのパスを返すため取得判定まで進みません（`apps/host/server/engine-install.mjs:16,65-90`; `apps/host/server/cloudflared-install.mjs:46-52`; `apps/host/server/acquisition.mjs:14-30`）。
+## ログと測定値
 
-`/api/control/status` は完全一致の結果を JSON の `packaged` として返します。Host は listen 完了後、`control` があり値が `'1'` の場合に `control.cleanup().catch(() => {})` を開始します。cleanup の失敗はここでは握りつぶされます（`apps/host/server/index.mjs:1291-1303,2262-2266`）。
-
-## ログと失敗経路
-
-実 engine が見つからない packaged Host では、起動ログの `inference · ...` は Control の状態に応じて「エンジン未搭載」等を表示し、inference を必要とする要求は demo 応答の代わりに unavailable のエラーへ進みます。起動時の文言は `inferenceLine()` にあり、chat 側は unavailable backend のエラーを throw します（`apps/host/server/index.mjs:278-284`; `apps/host/server/inference.mjs:131-142,229-232,532-537`）。取得禁止時は `AcquisitionRefused` が発生しますが、ここで確認したコードは例外型・code・status を設定するところまでです。環境変数固有のログ文言は確認できません（`apps/host/server/acquisition.mjs:14-30`）。
+この変数固有のログ出力や測定値はない。確認可能な結果は `/api/control/status` の `packaged` boolean、推論 backend の `unavailable` と chat error frame、取得拒否の例外、および `/api/locale` の結果である（`app/host/server/index.mjs:1418-1436,2217`、`app/host/server/inference.mjs:142-153`、`app/host/server/acquisition.mjs:14-21`）。
 
 ## 根拠
 
-- Desktop shell が Host と self-test Host の環境に値を設定: `apps/desktop/src-tauri/src/main.rs:442-483,668-745`。
-- 推論での完全一致判定、demo 抑止、fallback: `apps/host/server/inference.mjs:38-42,84-156,199-234`。
-- 取得禁止判定と typed error: `apps/host/server/acquisition.mjs:12-30`; 呼び出し元 `apps/host/server/engine-install.mjs:65-90`, `apps/host/server/cloudflared-install.mjs:46-52`。
-- status API と listen 後 cleanup: `apps/host/server/index.mjs:1291-1303,2262-2266`。
-- locale test 分岐: `apps/host/server/region.mjs:58-65`。
+- `app/desktop/src-tauri/src/main.rs:522-537,797-807` — desktop shell と self-test Host に `"1"` を設定。
+- `app/host/server/inference.mjs:40-50,93-165,209-210,241-246` — 実エンジン必須判定、backend 選択、demo 禁止時の unavailable / Error。
+- `app/host/server/acquisition.mjs:7-9,12-30`、`app/host/server/cloudflared-install.mjs:46-52` — 取得禁止判定と拒否。
+- `app/host/server/region.mjs:32-65`、`app/host/server/index.mjs:2217` — テスト用 locale の抑止と `/api/locale`。
+- `app/host/server/index.mjs:1418-1436,2569-2576` — packaged 状態 API、listen 後の cleanup と初回 refresh。
+- `app/host/server/models.mjs:18-20` — モデルの real/simulated モードは `STRATA_REAL_ENGINE` から決定。
+

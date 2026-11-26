@@ -1,47 +1,71 @@
 # `STRATA_SH_STREAM`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-MoE の shared expert（共有 expert）計算を、routed experts の処理と並行する別 GPU stream に分岐するかを制御します。分岐した場合、layer 内で event を使って分岐元と shared expert の完了を接続し、その後 shared expert の結果を routed expert の結果と combine します。環境変数は計算方式を切り替え、shared expert 自体を省略するものではありません。
+MoE の shared expert（共有 expert）の計算を、その層の routed expert 等が使う通常の GPU stream から分け、専用 stream で並行実行するかを制御する。CUDA/HIP の実装では `Verifier::record_window` 内で shared expert の計算を `sh_cs_` に投入し、event で通常 stream と依存関係を結ぶ。SYCL 実装も同様に専用 queue と barrier を使う。変数が切り替えるのは実行 stream と同期順序であり、ルーターの expert 選択を変更する分岐ではない（CUDA: `engine/src/core/verify.cpp:2615-2628,2735-2758`、SYCL: `engine/sycl/src/core/verify.cpp:1561-1575,1653-1677`）。
 
-CUDA 実装と SYCL 実装の verifier が同じ値判定を持ちます。CUDA verifier は `src/core/verify.cpp`、SYCL verifier は `sycl/src/core/verify.cpp` にあります。
+未設定時の基準は CUDA と SYCL で ON、HIP で OFF。ただし HIP は gfx1151 の Linux 既定表や gfx1103/gfx1150 用のセットアップ設定で ON になる場合がある。明示的な設定はアーキテクチャ既定値より優先される（`engine/src/core/verify.cpp:415-424`、`engine/sycl/src/core/verify.cpp:253-263`、`engine/src/core/arch_defaults.cpp:64-105,302-310`）。
 
 ## 値と判定
 
-値全体を parse せず、設定値の先頭文字だけを調べます。未設定時の値は backend によって異なります。
+エンジンは `std::getenv` で値を取得し、文字列全体の parse や比較はせず `v[0] != '0'` だけで判定する。環境変数が未設定なら build macro に応じた既定値を使う。空文字は「設定あり」だが、実行時判定では先頭文字が `'0'` でないため ON になる。文字列の後続部分、大文字小文字、数値としての妥当性、空白は検査しない（CUDA/HIP: `engine/src/core/verify.cpp:415-424`、SYCL: `engine/sycl/src/core/verify.cpp:253-263`）。
 
-| 状態 | CUDA (`STRATA_USE_HIP` なし) | HIP (`STRATA_USE_HIP`) |
-|---|---:|---:|
-| 未設定 | 有効 | 無効 |
-| 設定値の先頭文字が `0` | 無効 | 無効 |
-| 空文字、または先頭文字が `0` 以外 | 有効 | 有効 |
+| 条件 | unset | ON になる例 | OFF になる例 |
+| --- | --- | --- | --- |
+| CUDA build | ON | `1`, `true`, 空文字, ` 0`, `00x` | `0`, `0anything`, `01` |
+| HIP build | 原則 OFF。ただし起動時の既定表・セットアップが値を設定する場合は、その設定値を読む | `1`, `true`, 空文字, ` 0`, `00x` | `0`, `0anything`, `01` |
+| SYCL build | ON（`STRATA_USE_HIP` が定義された共用実装では HIP の OFF 分岐） | `1`, `true`, 空文字, ` 0`, `00x` | `0`, `0anything`, `01` |
 
-たとえば `false`、`off`、`2` は先頭文字が `0` ではないため有効です。`0`, `0anything` は無効です。空文字は「設定済み」として扱われ、先頭文字が `\0` なので有効になります。大文字小文字、空白、数値としての妥当性は検査されません。
-
-値は `sh_stream_on()` の `static const bool` として初回呼び出し時に評価されます。そのため初回判定後にプロセス環境を変更しても再評価されません。CUDA では初回判定前にアーキテクチャ既定値の適用はありません。HIP は後述の gfx1151 既定値適用後に判定されます。
-
-根拠: `src/core/verify.cpp:212-222`, `sycl/src/core/verify.cpp:162-172`。
+したがって `false` や `0.5` は OFF を意味せず、どちらも先頭が `0` でないので ON。`0anything` は先頭が `0` のため OFF。無効値エラーや数値の範囲チェックはない。アーキテクチャ既定値の適用側は値を parse せず、環境変数が存在するだけで利用者設定として扱うため、空文字や `0anything` も既定値によって上書きされない（`engine/src/core/arch_defaults.cpp:302-310`、`engine/src/core/nv_defaults.cpp:222-234`）。
 
 ## 有効になる条件
 
-値判定が有効でも、実際に fork されるのは verifier が profiling 中でなく、分岐用 stream と fork/join event が利用可能なときです。CUDA は `sh_cs_`, `ev_fork_`, `ev_join_` が必要です。SYCL では分岐先 queue が in-order queue と異なり、両 event が利用でき、stepped 実行でないことも条件です。これらの条件を満たさないと、shared expert は通常の verifier stream で実行されます。
-
-HIP では未設定時は無効です。ただし `src/program/generate.cpp` と `sycl/src/program/generate.cpp` は HIP ビルドでデバイス情報を取得し、engine の switch 初回読み取り前に `apply_arch_defaults()` を呼びます。gfx1151 用の既定値表は `STRATA_SH_STREAM=1` を含み、ユーザー環境に同名変数が既に存在すれば、空文字を含めその値を上書きしません。したがって gfx1151 では通常既定で有効、明示的に `0` で始まる値なら無効です。gfx1151 以外の AMD GPU にはこの既定値は入りません。`STRATA_GFX1151_DEFAULTS` の先頭文字が `0` なら gfx1151 の既定値表自体が適用されず、未設定の `STRATA_SH_STREAM` は無効になります。
-
-根拠: `src/program/generate.cpp:2248-2254`, `sycl/src/program/generate.cpp:2016-2022`, `src/core/arch_defaults.cpp:32-35, 56, 61-70`。
+- 検証 window の層処理で shared expert が実行されること。CUDA/HIP は `sh_stream_on()` が真、profiler が OFF、専用 stream と fork/join event が作成済みなら `sh_fork` を有効にする。SYCL はこれらに加えて stepped 実行でなく、専用 queue が in-order queue と異なることが条件（`engine/src/core/verify.cpp:2617-2628`、`engine/sycl/src/core/verify.cpp:1563-1575`）。
+- `STRATA_VERIFY_PROFILE` が設定されていると profiler が有効になり fork は抑止される（CUDA/HIP: `engine/src/core/verify.cpp:1262-1276,2621`、SYCL: `engine/sycl/src/core/verify.cpp:816,1567-1569`）。
+- SYCL の stepped serve（`g_stepped`）では fork を使わない（`engine/sycl/src/core/verify.cpp:1567-1569`）。
+- CUDA/HIP の stream または event 作成に失敗すると検証初期化が `verify: stream create failed` または `verify: event create failed` で失敗する。これは変数値の検証エラーではない（`engine/src/core/verify.cpp:1352-1362`）。
+- HIP で unset のときは通常 OFF。gfx1151 の既定表は Linux で `STRATA_SH_STREAM=1` を加えるが、通常の Windows gfx1151 表では除外される。`STRATA_DEFAULTS=026` は旧表を返すため Windows の除外より先に戻り、SH stream を含む表になる。`STRATA_GFX1151_DEFAULTS` が先頭 `0` ならこの表全体を止める（`engine/src/core/arch_defaults.cpp:64-105`）。
+- HIP の gfx1103 と gfx1150 は `terminal/setup.py` が用意する `GFX1103_SWITCHES` / `GFX1150_SWITCHES` に含まれ、対応する設定の `env` に `STRATA_SH_STREAM=1` を書く。エンジン単体の HIP 既定 OFF をこの明示設定が上書きする（`terminal/setup.py:4465-4485,7543-7547`）。
+- CUDA は unset なら既定 ON。さらに sm_70 の CUDA 既定表にも `STRATA_SH_STREAM=1` があり、`STRATA_SM70_PERF=0` または `STRATA_DEFAULTS=026` でその表を止めた場合も、unset の実行時既定は CUDA の ON のまま（`engine/src/core/verify.cpp:417-422`、`engine/src/core/nv_defaults.cpp:136-153,222-234`）。
+- CUDA/HIP の gfx1151 表や NVIDIA の既定表は環境変数が既に存在すると値を設定しないため、明示値が表より優先される（`engine/src/core/arch_defaults.cpp:302-310`、`engine/src/core/nv_defaults.cpp:222-234`）。
+- Server は親プロセスの環境を引き継いだ後、設定ファイルの `env` を上書き適用して engine 子プロセスに渡す。したがって設定の `env` にある値は親環境の同名値に優先し、その後に engine がアーキテクチャ既定値を適用する（`terminal/serve/server.py:4007-4028`）。`STRATA_SH_STREAM` 専用の CLI 引数による別優先順位は見つからなかった。
 
 ## 実行時の詳細
 
-CUDA verifier は有効条件を満たす layer で shared expert 用 stream を選び、必要な箇所で `ev_fork_` を記録して shared stream を待たせます。shared expert の入力変換と `shared_expert_multi()` はその stream に投入され、処理後に `ev_join_` を記録します。routed expert 側の処理後、combine 前に主 stream が join event を待ちます。fork が無効なら shared expert は主 stream を使います。`STRATA_SH_FORK_LATE` は fork を layer の先頭で行うか routed work の公開後に行うかに関係する別変数で、shared stream の有効判定そのものは変えません。
+CUDA/HIP の `sh_stream_on()` と SYCL の同名関数は関数内 `static const bool` で初回評価結果を cache する。通常はアーキテクチャ既定値が適用された後、最初の verify window の記録時に評価される（`engine/src/program/generate.cpp:4319-4320`、`engine/src/core/verify.cpp:415-424,1546-1548`、`engine/sycl/src/core/verify.cpp:253-263`）。同一プロセスで後から環境を書き換えても、この cache を経由する判定には反映されない。
 
-SYCL verifier も別 queue に shared expert を投入し、fork/join event の barrier で依存関係を接続します。profiling 時は fork と join wait の条件から除外されます。SYCL の stepped 実行では fork しません。
+fork が有効な場合、通常 stream の処理を event で区切り、shared expert の gate/up/down と必要な変換を専用 stream に投入する。shared expert の完了 event を通常 stream が待ってから後続の combine に進む。fork が無効なら同じ計算を通常 stream に投入する（`engine/src/core/verify.cpp:2621-2628,2735-2758,2939-2943`、`engine/sycl/src/core/verify.cpp:1567-1575,1653-1677,1803-1809`）。
 
-実装には `STRATA_SH_STREAM` 自体の有効・無効ログや警告はありません。HIP gfx1151 でアーキテクチャ既定値が適用された場合は、設定された speed switches の件数を示す起動ログが出ますが、そのログが個別にこの変数の動作を報告するわけではありません。
+CUDA の all-resident / partial-residency や CPU expert の有無は fork 自体の有効条件ではない。ただし CPU expert がある通常の window では `STRATA_SH_FORK_LATE`（未設定または先頭が `0` 以外）により shared expert の fork を routed expert の doorbell 公開後へ遅らせる。all-resident の場合は遅延しない（`engine/src/core/verify.cpp:2617-2628,2716-2720`）。また CUDA の L2 prefetch が有効な経路では同じ専用 stream/event を使って次層の重みを先読みする条件にも `sh_stream_on()` が使われる（`engine/src/core/verify.cpp:2838-2845,2897-2906`）。
 
-根拠: `src/core/verify.cpp:1453-1464, 1546-1576, 1682-1686`; stream/event の作成は `src/core/verify.cpp:769-779`。SYCL 側の分岐条件と join は `sycl/src/core/verify.cpp:1285-1293, 1487-1493`。
+## ログと測定値
 
-## 文書との照合
+CUDA の gfx1151、HIP の gfx1151 などで既定表が新しい値を設定したときは、起動時に `strata: gfx1151 (Strix Halo): ... exact speed switches on by default ...` の一覧に `SH_STREAM` が出る。sm_70 の NVIDIA 既定表も同様に設定した switch 名を stderr に列挙する。既に環境変数が設定済みならその項目は一覧に含まれない（`engine/src/core/arch_defaults.cpp:302-310,397-404`、`engine/src/core/nv_defaults.cpp:222-255`）。
 
-`docs/AMD_HIP.md:213-217` は HIP での通常既定 OFF、gfx1151 の例外、カードにより測定結果が異なることを説明しています。`docs/STRIX_HALO.md:98` は gfx1151 での有効化と、8K decode に関する記載値（UD-IQ4_XS +1.8%、UD-Q4_K_XL +6.7%）を載せています。`src/core/verify.cpp:204-211` の注釈にも別測定の条件が記されています。これらは文書・注釈上の測定報告であり、本調査で性能を再測定した結果ではありません。コード上の機能は shared expert を別 stream/queue に分岐することで、性能効果は backend と GPU に依存します。
+verify の dispatch 統計を出す場合、各 window に `win df_branch=%ld sh_stream=%ld prof=%ld` を記録し、`sh_stream` に cache 済み判定の `0` / `1` を出す。dispatch 統計は `STRATA_DISPATCH_STATS=0` で停止でき、レポートは `STRATA_DISPATCH_REPORT=<path>` または CLI の `--stats` で取得する（`engine/src/core/verify.cpp:1546-1548`、`engine/include/strata/core/dispatch_stats.hpp:9-12,107-120`）。
+
+`terminal/serve/server_parts/engines.py` は Windows で HIP を使い、設定 env の値を空・`0` 以外（Python の `strip()` 後）にして `--kv-resident` も指定している場合、次の警告を出す。警告は拒否や値の削除をせず、そのまま engine に環境を渡す（`terminal/serve/server.py:4027-4028,4054-4058`、`terminal/serve/server_parts/engines.py:1091-1102`）。
+
+```text
+[strata] WARNING: STRATA_SH_STREAM=1 with --kv-resident (KV streaming) failed on the first request on one Windows RX 6000 PC ("verify: unspecified launch failure", #3895). If the engine stops that way, take STRATA_SH_STREAM out of the config's env (AMD runs without it by default) or run without --kv-resident, and tell us the card and the driver.
+```
+
+警告側は空白を `strip()` して比較する一方、engine は先頭文字だけを比較するため、たとえば値 `" 0"` は警告上は OFF 扱いでも engine では ON になる。
+
+`terminal/tools/calibrate.py` は HIP で `STRATA_SH_STREAM=0` と `=1` を engine 再起動ごとに測り、既定の `0` を 3% 超えて上回った場合だけ `=1` を設定に残す。Windows で `--kv-resident` の組み合わせは測定をスキップする（`terminal/tools/calibrate.py:21-25,431-454,464-468`）。これらは calibrator の条件であり、エンジン自体が性能向上を保証するものではない。
+
+## 根拠
+
+- `engine/src/core/verify.cpp:405-424` — CUDA/HIP の用途、値の判定、既定値、初回 cache。
+- `engine/src/core/verify.cpp:1262-1276,1352-1362,2615-2628,2716-2720,2735-2758,2838-2845,2897-2906,2939-2943` — profiler 抑止、stream/event の初期化、fork と join、関連する CUDA 経路。
+- `engine/sycl/src/core/verify.cpp:245-263,816,1561-1575,1638-1642,1653-1677,1803-1809` — SYCL の値判定、 stepped 条件、queue と barrier。
+- `engine/src/core/arch_defaults.cpp:28-29,64-105,218-223,302-310,397-404` — gfx1151 の platform 差、明示値優先、起動ログ。
+- `engine/src/core/nv_defaults.cpp:136-153,222-255` — sm_70 既定値と適用ログ。
+- `engine/src/program/generate.cpp:4319-4320` — GPU 検出後の arch defaults 適用時期。
+- `terminal/setup.py:4465-4485,7543-7547` — gfx1103/gfx1150 設定への値の登録。
+- `terminal/serve/server.py:4007-4028,4054-4058`、`terminal/serve/server_parts/engines.py:1091-1102` — 子プロセスへの環境引き渡しと Windows HIP の警告。
+- `terminal/tools/calibrate.py:21-25,431-454,464-468` — HIP の校正経路。
+- `engine/include/strata/core/dispatch_stats.hpp:9-12,107-120` — 統計の出力条件。
+- `docs/DETAILS.md:1480-1488` — sm_70 表に `STRATA_SH_STREAM=1` が載る。現行ソースの `nv_defaults.cpp` と一致。

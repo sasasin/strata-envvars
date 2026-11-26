@@ -1,54 +1,49 @@
 # `STRATA_SPLIT_OVERLAP`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-複数 GPU の layer split で、verify window の hand-off を直列に処理せず、先行 stage の GPU が hand-off データを書き終えて ready flag を立てる方式に切り替えます。後続 stage の graph は先行 stage の処理中に起動し、GPU 上でその flag を待ちます。これにより stage 間のホスト側 stream 同期を避けます。
+serve の複数 GPU layer split で、ある stage の verify window が次 stage へ hidden state を渡すとき、ホスト側で stage 間を同期してから次の graph を起動する順序を、GPU 上の ready flag を介した重ね合わせに切り替える。設定は任意で、通常は無効。`engine/src/program/generate.cpp` が値を読み、各 `Verifier` に hand-off flag を設定する。後続 stage の graph は前 stage の hand-off を GPU 上で待つため、window の計算内容そのものを変える分岐ではない（`engine/src/program/generate.cpp:13351-13387`、`engine/include/strata/core/verify.hpp:215-225`、`engine/src/core/verify.cpp:1642-1651,2998-3013`）。
 
-この環境変数は hand-off 機能を要求するスイッチです。実際に使われるには、異なる GPU に stage が分かれ、`--pipeline-windows` が無効である必要があります。通常の非 split 実行では読み取り箇所に到達しません。
+この読み取りは `n_stages > 1` の serve 初期化経路にあり、生成 CLI や単一 GPU 実行には適用されない。読み取り箇所には OS 別の分岐がない。CUDA API を使う GPU 実行経路で、資料は NVIDIA と AMD の測定を掲載している（`engine/src/program/generate.cpp:13247-13256,13351-13362`、Strata checkout 内 `docs/MULTI_GPU.md:155,172-178`）。
 
 ## 値と判定
 
-`src/program/generate.cpp` は layer split の stage 数が 2 以上のとき、一度だけ `std::getenv()` で値を読み、`std::atoi(v) != 0` で判定します。文字列全体の検証はありません。
+`std::getenv` で取得した文字列を `std::atoi` に渡し、その整数が 0 以外かを判定する。文字列全体の検証やエラー報告はなく、`atoi` が先頭から整数として変換できる範囲だけを使う。空文字、数値変換できない文字列、先頭の数値部分が 0 の文字列は無効。負の非ゼロ値も有効になる。整数範囲を超える入力の結果は `atoi` の範囲外動作に依存するため、設定値としては定義できない（`engine/src/program/generate.cpp:13354-13357`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（`atoi` が 0 を返す） |
-| 先頭の数値部分が 0、または数値として読めない文字列 | 無効 |
-| 0 以外の整数に変換される値（負数を含む） | 要求あり |
+| 条件 | 未設定 | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| serve の複数 stage layer split 初期化時 | `overlap_asked=false` | `1`, `2`, `-1`, `1suffix`（`atoi` の結果が非ゼロ） | 空文字、`0`, `0suffix`, `true`, `false` |
 
-`atoi` のため、先頭空白や符号は変換規則に従い、数値の後ろに文字が続いても数値部分で判定されます。たとえば `1junk` と `-1` は有効、`0junk` と `true` は無効です。設定値は stage 初期化時の `static const bool` に保存され、プロセス実行中に環境を書き換えても再評価されません。
+この変数に CLI 引数や他の設定値から値を上書きする処理はない。明示的な設定があっても、下記の適用条件を満たさなければ実動作は有効にならない。値はこの初期化経路で一度読み、リクエストごとには再読しない（`engine/src/program/generate.cpp:13354-13362`）。
 
 ## 有効になる条件
 
-- `--split` 等で複数 stage の layer split が構成されていること（stage 数が 2 以上）。
-- stage が別々の GPU に置かれること。`--split-device 0` のように同一 GPU に置く場合は `split_same` となり、要求値が真でも overlap は無効です。
-- `--pipeline-windows` が無効であること。これが有効な場合は本機能を併用せず、要求値が真なら stderr に `strata serve: STRATA_SPLIT_OVERLAP is off beside --pipeline-windows %d (that loop overlaps the stages itself)` と出します。
-- 対象 stage 間で後続 verifier が PLE stage ではないこと。`Verifier::chain_overlap()` は、次 stage の device が異なり、handoff flag が接続され、かつ次 stage が PLE stage ではない場合にだけ先行 stage の graph の先行起動を行います。
-
-バッチ window はこの hand-off の `wait_handoff` / `handoff_publish` 経路を通らず、直列順を使います。Metal verifier は `Verifier::run()` 内で Metal 実装へ分岐するため、この CUDA/HIP verifier の動作説明には含めません。HIP build では CMake が CUDA 形式の `.cu` ソースを HIP 言語として扱う経路があります。性能測定は `docs/MULTI_GPU.md` に記載された AMD 環境の結果であり、NVIDIA の性能効果は同文書で未測定とされています。
+- `--serve` による server 実行で、2 stage 以上の layer split が組まれること。読み取り自体がその初期化ブロック内にある（`engine/src/program/generate.cpp:13247-13256,13354-13359`）。
+- hand-off 先が別 GPU であること。`--split-device 0` のように同じ GPU 上へ stage を置く場合は overlap しない。実行時の chain 判定も、次 stage の device が異なり、次 stage が PLE stage でないことを要求する（`engine/src/program/generate.cpp:13351-13359`、`engine/src/core/verify.cpp:3705-3708`）。
+- `o.pipeline_windows == 0` であること。正の値ではこの設定を無効にし、`--pipeline-windows` 側のループに任せる。自動設定でも `o.pipeline_windows` が正になる場合があり、HIP gfx12 の複数 stage split などでは既定で pipeline windows が選ばれ得る。`--pipeline-windows 0` は明示的に off にする設定（`engine/src/program/generate.cpp:6532-6537,6560-6582,13358-13362`）。
+- バッチ window は ready flag の wait/publish 条件 `!batch_rec_` を通らず、シリアル順で処理される（`engine/src/core/verify.cpp:1645-1651,3003-3013`）。
+- flag 用の mapped host memory の確保に成功すること。確保または device pointer 取得に失敗すると stderr に `strata serve: the layer-split hand-off flag allocation failed` を出して初期化を終了する（`engine/src/program/generate.cpp:13363-13372`）。
 
 ## 実行時の詳細
 
-layer split 初期化時、要求があり、同一 GPU ではなく、`--pipeline-windows` も無効なら、各 hand-off boundary 用に mapped host/device ready flag を確保して verifier に設定します。起動ログの `strata serve: layer split: ...` 行には ` (overlapped: STRATA_SPLIT_OVERLAP=1)` が付きます。無効時はこの接尾辞が付きません。
+有効時、各 stage 間に mapped ready flag を割り当て、Verifier に hand-off の入力・出力 flag を設定する。前 stage の GPU は residual 等の hand-off payload を書いた後に ready word を上げる。後 stage の graph は hand-off 入力を読む前に GPU 上で ready word を待つ。ホスト thread は stage 間の同期を挟まず次 stage の `run` へ進み、chain 完了後に各 stream を同期する（`engine/src/program/generate.cpp:13363-13387`、`engine/include/strata/kernels/verify_kernels.hpp:109-118`、`engine/src/core/verify.cpp:1642-1651,3003-3013,3840-3846,4123-4139`）。
 
-window 実行時、先行 stage は residual、pending write、inject を hand-off buffer に書き、GPU kernel `handoff_publish` で ready flag を立てます。後続 stage は helper thread から先行 stage の処理中に prelaunch され、自分の graph 内の `wait_handoff` で flag を待ってから hand-off buffer を読みます。stage の処理後に先行 stage の stream を同期します。3 stage 以上では途中 stage 自身の hand-in も確認されます。
+flag の GPU wait は別変数 `STRATA_SPLIT_WAIT_MS` で制限され、既定は 30000 ms、0 は無期限。wait が時間切れになると GPU 側の error word が立ち、Verifier は `verify: layer split: the hand-off into layer ... did not arrive within ... ms (STRATA_SPLIT_WAIT_MS); the window was not used. STRATA_SPLIT_OVERLAP=0 runs the serial order` をエラーとして返す（`engine/src/core/verify.cpp:658-664,3696-3702`）。serve の decode window 呼び出し元は `ERR <理由>` を stdout に出して終了コード 1 で戻る（`engine/src/program/generate.cpp:22990-22994`）。
 
-GPU 側 flag 待ちは `STRATA_SPLIT_WAIT_MS`（別の環境変数）で制限され、既定 30000 ms、0 は無制限です。timeout するとエラー word が立ち、window は使用されず、`verify: layer split: the hand-off into layer ... did not arrive within ... ms (STRATA_SPLIT_WAIT_MS); the window was not used. STRATA_SPLIT_OVERLAP=0 runs the serial order` のエラーになります。ホスト側の layer wait watchdog が先に異常を検知して GPU wait を解放する場合もあります。
+## ログと測定値
 
-## 文書と測定値
+`overlap_asked` が真で `--pipeline-windows` の実効値が正なら、stderr に `strata serve: STRATA_SPLIT_OVERLAP is off beside --pipeline-windows %d (that loop overlaps the stages itself)` を出す。overlap が有効な layer split の起動行には ` (overlapped: STRATA_SPLIT_OVERLAP=1)` が付く。無効値や未設定ではこの追記はない（`engine/src/program/generate.cpp:13358-13362,13423-13429`）。
 
-`docs/MULTI_GPU.md` は既定では各 stage を順番に実行し、この変数で別 GPU 間 hand-off を overlap すると説明しています。2x RX 7900 XTX（gfx1100、ROCm、Linux）、Ryzen 9 9900X、Swift 1.5 IQ3_XXS、128K context、8-bit KV、512-token greedy answer、8 run の中央値として、decode は code prompt 53→70.1 tok/s、prose prompt 45→55.9 tok/s と記載されています。同文書は NVIDIA では未測定と明記しています。これらは記載条件に限る測定値です。
+`docs/MULTI_GPU.md` は、2x RX 7900 XTX・Swift 1.5 IQ3_XXS・128K・中央値8回で code decode 53→70.1 tok/s、prose 45→55.9 tok/s、2x RTX A4000・IQ3_XXS では story +0.3%、code +2.1%、facts -0.3%（同資料の記述ではノイズ範囲）と報告している。これは文書に記載された測定値であり、今回の調査で再測定したものではない（`docs/MULTI_GPU.md:286-300`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:8404-8409` — stage 数と pipeline 判定。
-- `src/program/generate.cpp:8448-8469,8470-8485,8516-8522` — 環境変数判定、条件、flag 設定、起動ログ。
-- `src/core/verify.cpp:2614-2617,2645-2647,2667-2672,2723-2745` — chain overlap 条件、Metal 分岐、次 stage の prelaunch。
-- `src/core/verify.cpp:1074-1083,2090-2100,2864-2880` — hand-off の読み書きと stage 間の実行順。
-- `src/core/verify.cpp:450-456,2605-2611` — GPU wait timeout の設定とエラー。
-- `src/kernels/cuda/verify_kernels.cu:1183-1218` — bounded wait と hand-off publish kernel。
-- `CMakeLists.txt:1991-2000` — HIP gfx906 build で CUDA 形式の `.cu` を HIP として扱う設定。
-- `docs/MULTI_GPU.md:218-244` — 機能説明、測定条件、測定値、NVIDIA 未測定の注記。
+- `engine/src/program/generate.cpp:13247-13256` — layer split の stage 数と serve 経路。
+- `engine/src/program/generate.cpp:13351-13387,13423-13429` — 値の読み取り、pipeline windows との排他、flag 確保・設定、起動ログ。
+- `engine/src/program/generate.cpp:6532-6582` — `--pipeline-windows` の自動選択条件。
+- `engine/include/strata/core/verify.hpp:215-225`、`engine/src/core/verify.cpp:1642-1651,2998-3013,3705-3708,3840-3846,4123-4139` — Verifier の hand-off wait/publish と chain の実行。
+- `engine/include/strata/kernels/verify_kernels.hpp:109-118`、`engine/src/core/verify.cpp:658-664,3696-3702` — ready flag と timeout。
+- `engine/src/program/generate.cpp:22990-22994` — serve decode のエラー出力と終了。
+- `docs/MULTI_GPU.md:155,172-178,286-300` — 利用条件と資料上の測定値。

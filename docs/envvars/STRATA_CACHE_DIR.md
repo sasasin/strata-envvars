@@ -1,37 +1,50 @@
 # `STRATA_CACHE_DIR`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。対象は Strata 所有ソース。外部ライブラリやドライバーが独自に読む環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL の prompt expert int8 経路で使う、int8 と FP16 の処理時間が逆転する平均 rows/expert（crossover）のキャッシュファイルを置くディレクトリを指定します。ファイル名は常に `i8-crossover.txt` です。この変数はキャッシュの場所だけを変え、int8 経路を有効化したり、測定値や閾値を直接指定したりしません。
+SYCL prefill の int8 expert 経路が `auto` 判定に使う crossover 測定値を保存するファイルの親ディレクトリを指定する。値そのものを有効・無効として判定するスイッチではなく、読み書きする `i8-crossover.txt` の場所を変える。変数を読んでいるのは `engine/sycl/src/prefill/prefill.cpp` の `i8_cache_file()` である。同じ名前は SYCL 起動ラッパー `engine/sycl/serve/strata-sycl.sh` にもあり、コンテナ内の既定ディレクトリを指定して環境へ渡す。
 
 ## 値と判定
 
-| `STRATA_CACHE_DIR` | 使用するファイル |
-|---|---|
-| 未設定、または空文字 | `HOME` が設定されていれば `$HOME/.cache/strata/i8-crossover.txt`。未設定なら `LOCALAPPDATA` が設定されている場合 `%LOCALAPPDATA%/strata/i8-crossover.txt`。両方未設定ならキャッシュなし。 |
-| 非空文字列 | 値をディレクトリとしてそのまま使い、末尾に `/i8-crossover.txt` を連結。 |
+エンジンは `std::getenv` で値を得て、値が非 null かつ先頭文字が NUL でなければ、その文字列をディレクトリとして採用し、末尾に `/i8-crossover.txt` を連結する。数値・真偽値・存在するディレクトリかどうかの検査や trim はない。相対パス、空白を含む文字列、末尾 `/` もそのまま使われる（末尾 `/` の場合は `/` が二つ続く）。
 
-空白除去、パス正規化、存在確認はありません。`HOME` または `LOCALAPPDATA` が空文字で設定されている場合も getenv は成功するため、それぞれ `/.cache/strata/i8-crossover.txt` または `/strata/i8-crossover.txt` になります。末尾が `/` の値では `//i8-crossover.txt` になります（通常の POSIX パス解釈では同じ場所を指します）。Windows でもコードは `/` を連結します。ファイルを読めない、存在しない、または一致するキーがない場合はキャッシュヒットになりません。書き込み時は、最初の `fopen` が失敗した場合に対象ディレクトリへ `mkdir(..., 0755)` を一度試してから再度開きます。親ディレクトリを再帰作成せず、書き込み失敗のログも出しません。
+| 条件 | unset | 設定時に有効になる値 | 空文字・その他 |
+|---|---|---|---|
+| SYCL エンジン | `HOME` が設定されていれば `$HOME/.cache/strata/i8-crossover.txt`。`HOME` が未設定なら `LOCALAPPDATA` が設定されている場合に `$LOCALAPPDATA/strata/i8-crossover.txt`。両方未設定なら cache path を空にする。 | 空でない文字列 `D` を使い `D/i8-crossover.txt`。 | 明示的な空文字は未設定と同様に扱い、上記 fallback に進む。`HOME` は getenv が非 null なら値が空でも採用し `/.cache/strata/i8-crossover.txt` になる。`HOME` が未設定の場合に限り `LOCALAPPDATA` を同様に確認し、空文字なら `/strata/i8-crossover.txt` になる。 |
+| `strata-sycl.sh` 経由のコンテナ起動 | ラッパーが `/work/.strata-cache` を既定値として設定する。 | 呼び出し側から渡された非空の `STRATA_CACHE_DIR` は既定値を上書きし、値を `docker run -e` で渡す。 | 呼び出し側の値が空ならコンテナへは渡されない。ラッパーの既定値も空に置き換わっているため、エンジン内の `HOME` / `LOCALAPPDATA` fallback に進む。 |
+
+根拠: `engine/sycl/src/prefill/prefill.cpp:958-965`; `engine/sycl/serve/strata-sycl.sh:28-43`。
 
 ## 有効になる条件
 
-この変数が使われるのは、SYCL prompt の expert 処理が int8 の `auto` モードで crossover を必要とした場合です。既定では、Battlemage と識別され、該当 int8 kernel が利用可能なデバイスで `auto` が選ばれます。`STRATA_PREFILL_MMQ=auto`（またはその alias `STRATA_PF_I8=auto`）でも選べます。他の GPU では既定は FP16 経路であり、`STRATA_CACHE_DIR` を指定しただけでは測定もキャッシュ読み書きも行いません。
-
-さらに対象 layer が native expert で、対応する gate/up・down format、640×2560 の形状、kernel availability などの int8 経路条件を満たす必要があります。auto で crossover を初回計算するとき、デバイス名・driver version・gate/up と down の形式番号・形状からキーを作ります。同一プロセス内では queue と形式ごとに計算結果を map に保持するため、同じキーで毎 group ごとにファイルを読み直すわけではありません。
+- SYCL エンジンで、int8 expert の `auto` モードが crossover 校正を呼び出す経路に入ったときだけ、このパスが cache read/write に使われる。主経路では `i8on` かつ `i8m == 2` の expert group flush 時に校正し、native expert layout、指定の gate/up・down format、`n_ff == 640`、`n_embd == 2560`、int8 kernel の利用可能性などが必要である（`engine/sycl/src/prefill/prefill.cpp:4775-4780,4862-4872`）。
+- ペア処理経路では `fmt.gu_type == 22`、int8 モードが非ゼロ、kernel が利用可能で、さらに `i8m == 2` の場合に校正する（`engine/sycl/src/prefill/bmg_expert_window_walk.tpp:8-16`）。
+- モードは `STRATA_PREFILL_MMQ`、空または未設定なら `STRATA_PF_I8` で選ばれる。先頭が `a` / `A` の文字列は auto、空でない値の先頭から連続する数字がすべて 0 なら off、それ以外は int8 強制となる。これらが空または未設定なら Battlemage 系デバイスかつ kernel 利用可能時に auto、それ以外は FP16 であり、auto でない場合は校正しない（`engine/sycl/src/prefill/prefill.cpp:333-345`; `engine/sycl/include/strata/prefill/esimd_moe.hpp:39-50`）。
+- `STRATA_I8_FORCE` の先頭文字が `0` の場合、またはデバイスに必要な ESIMD / s8 matrix combination がない場合、kernel は利用不可となり auto 校正経路に入らない（`engine/sycl/src/prefill/esimd_moe.dp.cpp:840-858`）。利用可能判定はデバイスごとに static map へ保存される。
+- CUDA、HIP、その他の backend の cache directory をこのコードが切り替える根拠は見つからない。CLI 引数による `STRATA_CACHE_DIR` の上書きもこの実装にはない。SYCL server のラッパーを使う場合は、上記の環境転送・既定値が適用される。
 
 ## 実行時の詳細
 
-auto 経路でキーがまだ map にないとき、実装はキャッシュを検索します。一致行があれば rows と confident flag を読み込み、stderr に `strata: int8 experts: crossover ... from the cache for ...` と出して計測を省略します。一致しなければ合成 expert を使って 16、32、64、128、256 rows の int8/FP16 chain を測り、crossover を算出します。測定成功時は結果をファイルへ書き、auto は group の平均 rows/expert が crossover 未満なら int8、そうでなければ FP16 を使います。測定に失敗すると閾値64 rows、confidence false の結果となり、ソース上その失敗結果はキャッシュへ書きません。
+`i8_cache_file()` は呼び出されるたびに `STRATA_CACHE_DIR` と fallback 環境を読み直すため、プロセス環境が実行中に変更されれば次回の path lookup に反映される。読み取ったパスは `i8_cache_read()` / `i8_cache_write()` から使われる。通常の held-group 経路は queue と format の組ごとに `static std::map` へ校正結果を保持し、ペア処理経路は `Prefill::Impl::pair_i8_cutoff` に保持するため、同じプロセス内の同じ経路・format では初回校正後に再校正しない。cache file はプロセスをまたいで測定結果を再利用するためのもので、キーは device name、driver version、gate/up・down type、`n_ff`、`n_embd` である（`engine/sycl/src/prefill/prefill.cpp:1005-1018,4868-4872`; `engine/sycl/src/prefill/prefill.cpp:774-779`; `engine/sycl/src/prefill/bmg_expert_window_walk.tpp:11-14`）。
 
-キャッシュファイルは行ごとに `key<TAB>rows<TAB>confident` の形式です。読み取りは `sscanf` で数値変換し、走査中に一致した行を結果へ代入します。書き込みでは同じ key の既存行を除いて他の key の行を残し、現在の結果を書きます。読み取り時・書き込み時に `i8_cache_file()` がそれぞれ環境を参照するため、値は静的変数に一度だけ保存される形ではありません。通常の運用でプロセス中に環境を変更した場合の挙動は、読み込みと書き込みの間で別ディレクトリになる可能性があり、サポートされた設定変更としては示されていません。
+cache path が空なら読み書きを行わない。読み込みは `fopen(..., "r")` が失敗するか、一致キーを parse できなければ miss となり、その呼び出しで測定する。書き込みは既存ファイルの他キー行を残し、一致するキーの行を置き換える。最初の書き込み open が失敗すると親 directory に `mkdir(..., 0755)` を一度試し、再度 open する。mkdir または再 open に失敗しても書き込みは中止され、エラーは報告されない。親 directory を再帰作成する処理はない（`engine/sycl/src/prefill/prefill.cpp:967-1003`）。
+
+## ログと測定値
+
+- cache hit では stderr に `strata: int8 experts: crossover %.0f rows per expert (%s) from the cache for %s\n` を出す（`engine/sycl/src/prefill/prefill.cpp:1015-1018`）。
+- miss 時に校正が成功すると stderr に `strata: int8 experts, measured here (%s): us per expert at 16/32/64/128/256 rows, int8 %.1f/%.1f/%.1f/%.1f/%.1f, FP16 %.1f/%.1f/%.1f/%.1f/%.1f -> crossover %.0f rows per expert (%s)\n` を出す。その後 cache へ書き込むが、書き込み失敗のログはない（`engine/sycl/src/prefill/prefill.cpp:1126-1129`）。
+- 校正中の例外では stderr に `strata: int8 experts: the crossover measurement failed (%s): the int8 path is used below 64 rows per expert` を出し、64 rows を cutoff として返す。この失敗結果はこの分岐から cache へ書かれない（`engine/sycl/src/prefill/prefill.cpp:1099-1108`）。
+- 読み込み miss、cache path が空、cache file の読み込み失敗、書き込み失敗について、それ自体を示すログはない。
 
 ## 根拠
 
-- `sycl/src/prefill/prefill.cpp:858-865` — `STRATA_CACHE_DIR` の読み取り、空値時の `HOME` / `LOCALAPPDATA` fallback、ファイル名。
-- `sycl/src/prefill/prefill.cpp:867-903` — ファイルの読み書き、行形式、既存 key の保持、単一階層の mkdir。
-- `sycl/src/prefill/prefill.cpp:906-919,999-1029` — cache hit のログ、計測、失敗時の64 rows fallback、成功時の保存。
-- `sycl/src/prefill/prefill.cpp:275-292,4230-4235,4266-4276` — int8 mode の既定と適用条件、auto 閾値での group 選択。
-- `sycl/include/strata/prefill/esimd_moe.hpp:39-50` — auto / 強制 / 既定 mode の判定。
-- `docs/INTEL_INT8_EXPERTS.md:18-27` — auto の crossover 利用と既定 cache path の説明。コード上の path fallback は同文書の短い説明より細かく上記の通り。
+- 環境値の読み取りと fallback path: `engine/sycl/src/prefill/prefill.cpp:958-965`
+- cache file の read / write と失敗時の扱い: `engine/sycl/src/prefill/prefill.cpp:967-1003`
+- 校正、キー、cache hit / miss、ログ: `engine/sycl/src/prefill/prefill.cpp:1005-1019,1099-1129`
+- 主経路の条件と queue ごとの保持: `engine/sycl/src/prefill/prefill.cpp:4775-4780,4862-4878`
+- ペア処理経路: `engine/sycl/src/prefill/bmg_expert_window_walk.tpp:8-16`; cutoff の初期値: `engine/sycl/src/prefill/prefill.cpp:774-779`
+- int8 mode の環境値読み取りと選択: `engine/sycl/src/prefill/prefill.cpp:333-345`; `engine/sycl/include/strata/prefill/esimd_moe.hpp:39-50`
+- kernel availability 条件: `engine/sycl/src/prefill/esimd_moe.dp.cpp:840-858`
+- SYCL server wrapper の既定値と環境転送: `engine/sycl/serve/strata-sycl.sh:28-43,47-53`

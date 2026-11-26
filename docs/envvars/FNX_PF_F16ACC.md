@@ -1,42 +1,40 @@
 # `FNX_PF_F16ACC`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`strata-split` のプロンプト用 dense GEMM と hyper-connection の up projection で、積和の出力を f16 で扱う経路を選びます。既定値は OFF です。設定しても通常の Strata エンジンや decode 全般を切り替える変数ではありません。`strata-split` は別 executable としてビルドされる任意の all-cards split エンジンです（`src/split/CMakeLists.txt:1-5,64-68,92-120`）。
+sFNX の prompt prefill 経路で行う一部の FP16 行列積を、FP32 累積・FP32 出力から FP16 累積・FP16 出力へ切り替える。FP16 出力は直後に Strata の kernel で FP32 に変換して後続計算へ渡す。対象は `pf_gemm()` を使う dense GEMM、hyper-connection の down/up GEMM などで、decode 経路全般を切り替える設定ではない。変数は `Engine::prefill_alloc()` が各カード用の状態 `Pf::f16acc` に保存し、`pf_gemm()` と `pf_hc_read()` が分岐に使う（`engine/src/split/src/prefill.cu:391-392,463-479,629-645,854-875`）。
+
+このコードは任意ビルドの `strata-split-N` に属する。通常の Strata 実行ファイル全般に適用される設定ではない（`engine/src/split/CMakeLists.txt:1-7,76-92,116-129`）。コメントは V100 と llama.cpp `COMPUTE_16F` を例に挙げるが、現行コードは split の CUDA/HIP BLAS 呼び出しを通じて設定される。コメントだけから性能、精度、出力 token の同一性は断定できない。 `docs/DETAILS.md` と `docs/SPLIT_ENGINE.md` にこの変数固有の記述や測定値は見つからないため、速度・精度の測定値は記載しない。
 
 ## 値と判定
 
-環境変数は `env_flag()` から `env_int(name, 0)` に渡され、10 進の整数として全体を parse した後、0 以外を true とします。文字列の真偽値判定ではありません（`src/split/src/env.hpp:15-21,33-39,51-52`）。
+`env_flag(name)` は `env_int(name, 0) != 0`。未設定なら `0`、設定時は符号付き base-10 整数全体を `strtoll` で読み、末尾まで数字（先頭の `+` / `-` は可）で、`long long` 範囲内である必要がある。したがって空文字、空白、数字以外の接尾辞、範囲外は無効値として例外になる。整数として有効な値は `0` だけが OFF、その他は正負を問わず ON。真偽文字列としての解釈や値の clamp はない（`engine/src/split/src/env.hpp:15-21,33-40,51-52`）。
 
-| 値 | 結果 |
-| --- | --- |
-| 未設定 | OFF（既定値 0） |
-| `0`, `+0`, `-0`, `000` | OFF |
-| `1`, `2`, `-1` など、範囲内の 0 以外の整数 | ON |
-| 空文字、前後の空白、`true`、`1x`、整数範囲外 | `std::runtime_error` |
-
-整数は省略可能な符号と数字だけを許し、文字列末尾まで消費される必要があります。空白の読み飛ばしや小数・接尾辞の許容はありません。範囲外は `strtoll` の `ERANGE` で無効になります。無効値の fallback はなく、例外メッセージは `FNX_PF_F16ACC: '<値>' is not a whole number` です（`src/split/src/env.hpp:15-21,33-39`）。
+| 条件 | unset | 有効になる値（例） | 無効値・OFF の例 |
+|---|---|---|---|
+| `strata-split-N` の CUDA または HIP 実行時 | `env_int` の既定値 `0` により OFF | `1`, `-1`, `+2`（整数全体が 0 以外） | `0`, `00` は OFF。空文字、`true`, `1x`, 前後の空白付き値、`long long` 範囲外は parse error |
 
 ## 有効になる条件
 
-- `STRATA_BUILD_SPLIT=ON` で対応する `strata-split-N` executable がビルドされ、その executable が選択・起動される必要があります。split engine のビルドは既定 OFF で、CMake は Linux CUDA または Linux HIP の構成以外をスキップします（`src/split/CMakeLists.txt:1-5,20-30,64-80,92-120`）。
-- 起動した split engine のプロンプト経路で、dense GEMM または hyper-connection の up projection が実行されると値が使われます。通常の Strata engine を起動しただけでは、この `src/split` の読み取りは通りません（`src/split/src/engine.cu:275`, `src/split/src/prefill.cu:625-646,410-427,451-468`）。
-- CLI 引数や別環境変数による上書き分岐はありません。`Engine::prefill_alloc()` が各カードの `Pf` を作る際に値を読み、`p->f16acc` に保持します。static cache はなく、各カードの初期化時に読み取ります。初期化後に環境値を変えても、作成済みの `Pf` の設定は変わりません（`src/split/src/prefill.cu:625-646`）。
+- `STRATA_BUILD_SPLIT=ON` でビルドされ、実行しているのが `strata-split-N` であること。CMake は split を opt-in とし、CUDA/HIP 用に同じ `prefill.cu` をビルドする（`engine/src/split/CMakeLists.txt:1-7,20-27,76-92,116-129`）。
+- split engine の `Engine` が構築され `prefill_alloc()` まで到達すること。値は prompt が実際に読まれる時ではなく、engine 構築中に各カードの `Pf` を作る際に読み込まれる（`engine/src/split/src/engine.cu:317-319`; `engine/src/split/src/prefill.cu:854-875`）。
+- その後 `pf_gemm()` または `pf_hc_read()` の該当 GEMM 分岐が実行されること。対象の処理を通らない実行では計算への影響はない（`engine/src/split/src/prefill.cu:463-479,623-645,1756-1759`）。
+- CLI 引数や別の環境変数でこの値を上書きする処理は確認できない。候補名の全参照は、`prefill.cu` の説明コメントと `env_flag("FNX_PF_F16ACC")` の読み取り箇所のみ。
 
 ## 実行時の詳細
 
-OFF の `pf_gemm()` は f16 の重み・入力を使い、出力を f32 として GEMM に渡します。ON では一時出力を f16 とし、`CUBLAS_COMPUTE_16F` を指定してから `k_f16_f32` で f32 の出力バッファへ変換します（`src/split/src/prefill.cu:410-427`）。この共通経路は `pf_dense_xh()` から dense projection に使われます（`src/split/src/prefill.cu:429-443,1201,1210-1211,1293-1296`）。
+`Engine` の構築から `prefill_alloc()` に進み、カードごとに `p->f16acc = env_flag("FNX_PF_F16ACC")` として値を保持する。関数内 static cache ではなく、各カードの `Pf` に構築時の値を保存し、その後の GEMM がその bool を参照する。実行中にプロセス環境を書き換えても、既に作られた `Pf` の値は更新されない（`engine/src/split/src/engine.cu:317-319`; `engine/src/split/src/prefill.cu:391-392,463-479,629-645,854-875`）。
 
-hyper-connection の down projection に続く up projection も同じフラグで分岐し、ON の場合は f16 出力と `CUBLAS_COMPUTE_16F` を使ってから f32 に変換します。OFF は f32 出力と `CUBLAS_COMPUTE_32F` を使います（`src/split/src/prefill.cu:451-468`）。
+OFF の `pf_gemm()` は入力・重みを FP16 として渡し、FP32 出力バッファと `CUBLAS_COMPUTE_32F` を指定する。ON では同じ FP16 入力に対し、作業領域へ FP16 出力、`CUBLAS_COMPUTE_16F` を指定し、`k_f16_f32` で結果を FP32 に変換する。共有 expert の dense GEMMも `pf_gemm()` を通る。hyper-connection の down/up GEMM も ON 時に FP16 累積・出力へ分岐する。CUDA の down GEMM で cublasLt 経路が利用可能でも、`p.f16acc` が真ならそれを避けて `pf_gemm()` に進む。HIP では該当 cublasLt 分岐自体がコンパイル対象外（`engine/src/split/src/prefill.cu:463-479,481-490,623-645,1756-1759`）。
 
-この変数専用の有効化ログはありません。整数 parse に失敗すると例外で初期化が中断します。GEMM の cuBLAS 呼び出しが失敗した場合も、`ckb` が `prefill: cublas <処理名>: <status>` の例外にします（`src/split/src/pf_common.cuh:30-32`）。Strata ソースから確認できるのはこの呼び出し設定・変換・エラー経路までです。cuBLAS / GPU が実際に選ぶ内部実装や、精度・性能への定量的影響はここでは断定しません。
+不正値は helper が `FNX_PF_F16ACC: '<値>' is not a whole number` の `std::runtime_error` を投げる。sfnx の engine 構築失敗処理は stdout に `ERR ...`、stderr に `sfnx: failed: ...` を出し、終了コード 1 で終了する。値を有効化したことを示す専用ログは見当たらない（`engine/src/split/src/env.hpp:33-39`; `engine/src/split/tools/sfnx.cpp:1094-1103,1123-1135`）。
 
 ## 根拠
 
-- 候補名のソース全体検索では、実際の読み取りは `src/split/src/prefill.cu:645` の一箇所でした。もう一つの参照は同ファイル冒頭の説明コメント（`src/split/src/prefill.cu:1-3`）です。helper `env_flag()` と `env_int()` の定義、および全 helper 呼び出しも確認しました。
-- `src/split/src/env.hpp:15-21,33-39,51-52` — 整数 parse、既定値、0 判定。
-- `src/split/src/prefill.cu:410-427,451-468,625-646` — 値の保存先と f16/f32 の処理分岐。
-- `src/split/src/engine.cu:275`、`src/split/CMakeLists.txt:1-5,20-30,92-120` — 初期化呼び出しと実行ファイルの build 条件。
-- `src/split/src/pf_common.cuh:30-32` — cuBLAS エラーの例外化。
+- `engine/src/split/src/env.hpp:15-21,33-40,51-52` — 整数全体の parse、未設定既定値、flag 判定。
+- `engine/src/split/src/prefill.cu:391-392,463-490,623-645,854-875,1756-1759` — 状態保持、各 GEMM 分岐、構築時読み取りと呼び出し。
+- `engine/src/split/src/engine.cu:317-319` — engine 構築から prompt buffer 初期化への呼び出し。
+- `engine/src/split/tools/sfnx.cpp:1094-1103,1123-1135` — 起動失敗時の標準出力・標準エラーと終了。
+- `engine/src/split/CMakeLists.txt:1-7,20-27,76-92,116-129` — split の対象 build と executable。

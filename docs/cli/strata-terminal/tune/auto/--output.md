@@ -1,6 +1,6 @@
-# `--output`
+# `strata tune auto --output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -9,50 +9,59 @@
 | オプション | `--output` |
 | 別名 | なし |
 | 値 | `human` または `json` |
-| 既定値 | `human` |
 
 ## 役割
 
-調整結果の表示形式を選びます。`human` は人向けの結果表示、`json` は結果・エラーを機械処理向けの JSON として標準出力へ出します。JSON モードは Desktop 側からも利用されており、呼び出し側は進捗を `--status-file` で受け取れます。
+自動チューニングの進捗・結果・エラーを、人向け表示または JSON で出力します。省略時は `human` です。チューニング対象や試行内容、プリセット保存の判断は別の引数と実行結果で決まり、このオプションは出力形式を選びます。
 
 ## 使い方
 
 ```sh
-strata tune auto default --output json
+# 進捗と結果を人向けに表示する（既定値）
+strata tune auto IQ3_S
+
+# 結果を JSON として標準出力へ出す
+strata tune auto IQ3_S --output json
+
+# 実行せず、予定を JSON で確認する
+strata tune auto IQ3_S --plan --output json
 ```
 
-`default` は調整対象の保存済み profile 名または run configuration を表す位置引数です。`--output` は `strata tune auto` parser に属し、他の `tune` サブコマンドや `presets` コマンドの同名オプションとは別スコープです（`strata_cli/tune_commands.py:20-46,49-55`）。
+`target` にはインストール済みモデル名、保存済みプロファイル名、または実行設定 JSON を指定できます。 (parser: `terminal/strata_cli/tune_commands.py:27`)
 
 ## 値と既定値
 
-- parser は `choices=("human", "json")`、`default="human"` として定義しています。値の省略時は `human` です（`strata_cli/tune_commands.py:45-46`）。
-- `json` と `human` 以外の値は `argparse` が受け付けません。これは `auto()` の処理に入る前の parser エラーであり、通常の usage / error 表示経路になります（parser 定義: `strata_cli/tune_commands.py:45-46`、parser の呼び出し: `strata_cli/cli.py:2217-2231`）。
-- この parser は同じオプションの繰り返し指定を特別扱いしていません。`argparse` の通常動作により最後の値が `a.output` になります。
+- `human` と `json` のみ受理され、既定値は `human` です。短縮別名はありません。 (`terminal/strata_cli/tune_commands.py:21-50`)
+- `human` では結果を人向けテキストにし、実行中の進捗メッセージは標準エラーへ出します。 (`terminal/strata_cli/tune_commands.py:358-369,421-424`)
+- `json` では進捗メッセージを `say` から出さず、最終結果を標準出力に1行の JSON として出します。 (`terminal/strata_cli/tune_commands.py:314,358-360,421-424`)
+- `--plan` の場合も選択した形式が使われます。JSON は `_print` の `schema_version: 1`, `ok: true`, `plan` を含むオブジェクトです。 (`terminal/strata_cli/tune_commands.py:349-353,101-106`)
 
 ## 実行時の動作
 
-- `a.output == "json"` を `machine` として使い、JSON の場合は進捗 callback の `say()` が何も出力しません。`human` の場合、進捗メッセージは stderr に flush 付きで出ます（`strata_cli/tune_commands.py:174-179,202-215`）。
-- 調整完了時、`json` は stdout に `{"schema_version":1,"ok":true,"result":...}` を1行で出します。`human` は `_human_result()` の整形結果を stdout に出します（`strata_cli/tune_commands.py:257-260`）。
-- `--output` は tuner の選択肢・測定・preset 保存条件を変更しません。たとえば改善結果または既定値確認結果は、`--no-save` がない限りどちらの形式でも保存対象になります（`strata_cli/tune_commands.py:194-197,246-254`）。
-- JSON でも `--status-file` を指定すると、進捗ごと、および完了時に JSON 状態ファイルを書き換えます。書き込みは一時ファイルから atomic replace で行い、`OSError` は無視されるため、状態ファイル更新失敗はこの helper 内では報告されません（`strata_cli/tune_commands.py:149-157,209-215,255-256`）。Desktop 呼び出し側も `--output json` と status file を渡しています（`strata_cli/launch/runner.py:1356`）。
+コマンド登録時に `--output` は `choices=("human", "json")`、既定値 `human` として追加されます。`strata tune auto` の処理は `a.output == "json"` を機械可読モードとして使い、通常のチューニング処理へ進みます。 (`terminal/strata_cli/tune_commands.py:21-50,309-315`; `terminal/strata_cli/cli.py:514-515,1722-1723`)
+
+JSON 成功時は `schema_version: 1`, `ok: true`, `result` を含むオブジェクトを標準出力へ出します。人向け成功時は `_human_result` の要約を出力します。どちらの形式でも、チューニングが改善または既定設定の確認に至り `--no-save` が指定されていなければプリセット保存を試みます。したがって `--output` の値は保存動作を切り替えません。 (`terminal/strata_cli/tune_commands.py:408-425`)
+
+エラー経路では `json` は `schema_version: 1`, `ok: false`, `error`（`code`, `message`）を標準出力へ出し、人向け形式は `strata: ...` を標準エラーへ出します。両方とも `_fail` が返す終了コードは同じです。 (`terminal/strata_cli/tune_commands.py:109-114,314-338`)
 
 ## 適用条件と副作用
 
-- このオプションは `strata tune auto` の表示経路だけに適用されます。`strata tune` の他のサブコマンドでは、それぞれ個別の parser 定義があり、同じ値でもここで説明する挙動を共有するとは限りません（`strata_cli/cli.py:400-486`）。
-- JSON は stdout に出力されます。tuning 中に発生する human 進捗メッセージは JSON モードでは抑制されますが、tuner が行う測定や試行記録、条件を満たした preset 保存は別の処理です（`strata_cli/tune_commands.py:205-215,230-260`）。
-- `--output` 自体はファイルを作りません。ファイル出力がある場合は、別指定の `--status-file` による進捗状態の書き込みです（`strata_cli/tune_commands.py:42-46,149-157`）。
+`--output` 自体は形式選択で、チューニングの測定やプリセットの保存条件を変更しません。`--status-file` が指定されている場合の進捗 JSON ファイル更新は別経路で、`--output` の値にかかわらず進捗時と完了時に行われます。書き込みは一時ファイルから置換し、`OSError` は無視します。 (`terminal/strata_cli/tune_commands.py:240-248,362-369,419-420`)
+
+対象の読み込みや適用可否など、処理前の失敗も選択された形式で報告されます。無効な値は parser の `choices` に合わず、コマンド処理に入る前に拒否されます。 (`terminal/strata_cli/tune_commands.py:21-50,314-338`)
 
 ## 出力とエラー
 
-- コマンド処理内で `_fail()` に到達した場合、`human` は `strata: <message>` を stderr に出し、JSON は stdout に `{"schema_version":1,"ok":false,"error":{"code":...,"message":"..."}}` を出します。返却終了コードは `_fail()` に渡された値です（`strata_cli/tune_commands.py:95-108,178-190`）。
-- JSON の最終結果は、tuning outcome が `improved` / `default_confirmed` でない場合も `ok: true` の result envelope で出力されます。終了コードは `improved` / `default_confirmed` が `0`、`cancelled` が `130`、その他が `6` です（`strata_cli/tune_commands.py:230-261`）。したがって `ok` はこの JSON envelope の生成を示し、終了コードや `result.outcome` と併せて結果を判定してください。
-- 選択肢外の値など parser 段階の失敗は `_fail()` を通らず、CLI parser の usage / error 経路になります（`strata_cli/cli.py:2217-2231`）。
+- `human` の進捗は標準エラー、最終結果は標準出力に出ます。成功時には保存済みチューニング記録への案内が付く場合があります。 (`terminal/strata_cli/tune_commands.py:358-369,417-425`)
+- `json` は進捗行を出さず、最終結果または `_fail` のエラーオブジェクトを標準出力に出します。 (`terminal/strata_cli/tune_commands.py:358-360,421-424,109-114`)
+- `_fail` を通るエラーはその箇所のコードを終了コードにします。チューニング完了後は `improved`、`default_confirmed` が `0`、`cancelled` が `130`、それ以外の結果が `6` です。 (`terminal/strata_cli/tune_commands.py:109-114,425`)
 
 ## 根拠
 
-- 索引上の配置とコマンド scope: `docs/cli/README.md:804-823`。
-- `auto` parser と `--output` の choices / default: `strata_cli/tune_commands.py:20-46`。
-- JSON・human の進捗と最終出力、エラー形式: `strata_cli/tune_commands.py:95-108,174-215,257-261`。
-- tuner 結果・保存条件および status file 更新: `strata_cli/tune_commands.py:149-157,230-256`。
-- コマンド dispatch と parser 実行: `strata_cli/cli.py:486-486,1652-1653,2217-2237`。
-- Desktop 側の JSON 呼び出し: `strata_cli/launch/runner.py:1356`。
+- `terminal/strata_cli/tune_commands.py:21-50` — `strata tune auto` の parser と `--output` の選択肢・既定値。
+- `terminal/strata_cli/cli.py:514-515,1722-1723` — tune サブコマンドへの parser 登録と `auto` 処理のディスパッチ。
+- `terminal/strata_cli/tune_commands.py:101-114,309-338` — JSON/人向けの成功・失敗出力選択と、処理前エラーの経路。
+- `terminal/strata_cli/tune_commands.py:349-353,358-369,408-425` — plan、進捗、チューニング後の保存・結果出力・終了コード。
+- `terminal/strata_cli/tune_commands.py:240-248,362-369,419-420` — `--status-file` の独立した進捗書き込み処理。
+
+調査範囲: 同一 revision の Strata ソースにある parser、dispatch、出力処理を確認しました。CLI `--help` は補助資料として実行していません。

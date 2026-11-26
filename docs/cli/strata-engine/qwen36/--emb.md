@@ -1,6 +1,6 @@
-# `--emb`
+# `strata` / `strata-q36` `--emb`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,54 +8,50 @@
 | コマンド | `strata` / `strata-q36`（Qwen3.6 専用 parser） |
 | オプション | `--emb` |
 | 別名 | なし |
-| 値 | `strata-vision` が出力した埋め込みファイルのパス |
+| 値 | 画像埋め込みを格納した `strata-vision` 出力ファイルのパス |
 
 ## 役割
 
-`--tokens` で与える prompt に含まれる画像位置 (`<|image_pad|>` token ID `248056`) へ、画像 encoder が作成した埋め込み行を割り当てます。画像埋め込みを使うには `--vision` も指定します。Qwen3.6 エンジンは `--emb` のファイルを読み、画像位置に対応する行を GPU に転送して、通常の token embedding の代わりに使用します（`src/qwen35/q36_engine.cu:3074-3096`, `src/qwen35/q36_engine.cu:3922-3929`, `src/qwen35/q36_engine.cu:2381-2400`, `src/qwen35/q36_engine.cu:2088-2091`）。
+`--tokens` で渡す token ID 列に画像 token が含まれる場合、その token に対応する画像埋め込みを `strata-vision` 形式のファイルから読み込みます。画像 token の埋め込み行で通常の token embedding を置き換え、画像位置を含む M-RoPE 表も設定します。Qwen3.6 の専用 parser は `engine/src/qwen35/q36_engine.cu` にあります。parser は `--emb` の値を受け取りますが、ファイルを処理するのは `--tokens` による通常推論経路です（同ファイル:5367, 5561-5609）。
 
 ## 使い方
 
-`strata-q36` を利用する例です。`IDS` は通常の token ID 列に、画像ごとの行数だけ連続した `248056` を含むカンマ区切り列です。`image.sve` は対応する `strata-vision` の出力ファイルです。
-
 ```sh
-strata-q36 --model model.gguf --vision --tokens IDS --emb image.sve --n 64
+strata-q36 --model model.gguf --vision --tokens '1,248056,...' --emb image.sve
 ```
 
-ソースには比較用ツールから同じ指定を渡す例があります（`tools/qwen35/q36_vision_cmp.py:117-119`）。`strata-q36` は `src/qwen35/q36_main.cpp:1-5` の専用 entry point で、通常の `strata` もモデルを Qwen3.6 family に振り分けると同じ `run()` parser を使います（`src/qwen35/q36_engine.cu:3735-3742`）。
+`--tokens` にはモデルの prompt token ID を指定します。画像ごとに、その画像の埋め込み行数と同数の連続した `<|image_pad|>` token（Qwen3.6 では ID `248056`）が必要です。例の `...` は実際の token ID に置き換えてください（同ファイル:4621, 4675-4695）。
 
 ## 値と既定値
 
-- 値は parser が次の argv 要素から文字列として受け取り、形式・拡張子の検査は行いません。値を省略すると `strata-q36: --emb needs a value` を stderr に出し、終了コード 2 で終了します（`src/qwen35/q36_engine.cu:3742-3747`, `src/qwen35/q36_engine.cu:3761`）。
-- 既定値は空文字列です。`--emb` を省略した場合は画像ファイルを読みません。空文字列を値にした場合も空のままなので、後段の読み込み処理は行われません（`src/qwen35/q36_engine.cu:3736`, `src/qwen35/q36_engine.cu:3922`）。
-- 複数回指定した場合は parser が同じ変数へ順に代入するため、最後の値が残ります（`src/qwen35/q36_engine.cu:3742-3747`, `src/qwen35/q36_engine.cu:3761`）。
-- ファイルは複数 record を連結した形式です。各 record は int32 5個（magic `SVE1`、行数 `n`、幅 `nx`、高さ `ny`、埋め込み幅 `n_embd`）に続いて `n × n_embd` 個の float32 を持ちます。encoder 側の書き出しと engine 側の読み込み形式は一致します（`tools/vision/strata_vision.cpp:14`, `tools/vision/strata_vision.cpp:324-326`, `src/qwen35/q36_engine.cu:3092-3097`）。engine は行数・幅・高さが正、`nx × ny == n`、`n_embd` がモデルの埋め込み幅と一致することを検証します（`src/qwen35/q36_engine.cu:3100-3115`）。
+値は次の引数として渡すファイルパスです。省略時は空で、画像埋め込みファイルを読みません。別名や `--emb=PATH` 形式は parser に定義されていません。`--emb` の後に値がない場合は `strata-q36: --emb needs a value` を標準エラーに出して終了コード 2 で終了します（同ファイル:5348-5353, 5367）。同じオプションを複数指定した場合は parser が `emb_file` を都度代入するため、最後の値が残ります（同ファイル:5367）。
+
+パスの存在やファイル内容は parser 段階では検証されません。`--emb ""` のように空文字を渡すと `emb_file` が空のままになり、後段の画像ファイル処理は行われません（同ファイル:5367, 5601）。
 
 ## 実行時の動作
 
-- `--emb` は値を保存するだけで、単発実行の処理に入った後、prompt を parse したうえで読み込みます。`--vision` がない場合は stderr に `strata-q36: --emb needs --vision` を出し、終了コード 2 になります（`src/qwen35/q36_engine.cu:3758-3762`, `src/qwen35/q36_engine.cu:3916-3926`）。
-- ファイルを開けない場合、header 不正またはモデルの埋め込み幅と不一致の場合、float32 payload が不足する場合はエラーになります。さらに、prompt と file の画像数、および各画像 record の行数と連続する `248056` の数が一致しなければ拒否します。画像位置が prompt の末尾にある場合も拒否します（`src/qwen35/q36_engine.cu:3096-3118`, `src/qwen35/q36_engine.cu:3127-3155`）。
-- record の行は順番に画像位置へ割り当てられます。各行の座標は record の `nx` を使って `(t, h, w) = (p, p + row, p + column)` とし、画像の後の text の位置は `max(nx, ny)` だけ進めます（`src/qwen35/q36_engine.cu:3092-3095`, `src/qwen35/q36_engine.cu:3141-3155`）。
-- 読み込み成功後、埋め込み行と cell→row map、M-RoPE table を GPU 側へ転送します。forward 時には画像 cell の行を `d_img` から入力 hidden rows へ書き込みます（`src/qwen35/q36_engine.cu:2386-2400`, `src/qwen35/q36_engine.cu:2410-2426`, `src/qwen35/q36_engine.cu:2088-2091`, `src/qwen35/q36_engine.cu:2139-2142`）。
-- `--serve` は model load 後に単発実行の分岐へ進まず serve loop に入るため、起動時の `--emb` ファイルはそこで消費されません。serve の画像要求は `GENI` protocol の各要求が埋め込みファイル名を持ち、`build_images()` を要求単位で呼びます。serve で画像を受けるには起動時 `--vision` が必要です（`src/qwen35/q36_engine.cu:3888-3890`, `src/qwen35/q36_engine.cu:3486-3516`）。
+`--emb` が空でない場合、単発 token 推論の開始前に `--vision` の有無を確認し、埋め込みファイルを開いて画像レコードを読みます。レコードは5個の `int32`（`SVE1` magic、埋め込み行数 `n`、格子幅 `nx`、格子高さ `ny`、埋め込み幅）に続いて `n × 幅` 個の `float` を持ちます。読み込む幅はモデルの embedding 幅と一致し、`n` は正、`nx` と `ny` も正で `nx × ny == n` である必要があります（同ファイル:4638-4664）。
+
+読み込んだレコードは prompt 内の `<|image_pad|>` の連続区間に順番に対応付けられます。画像 token の位置ごとに対応する埋め込み行を割り当て、画像と後続テキストの M-RoPE 位置を構成します（同ファイル:4665-4702）。その後、埋め込み行と位置表を GPU メモリへ転送して推論に使います。埋め込み行の割り当て先では通常の token embedding が画像行で置き換わります（同ファイル:3642-3657, 3670-3682, 3036-3038）。
+
+`--vision` は画像入力を有効にする別オプションです。`--emb` が指定されても `--vision` がなければ画像ファイルを読み込む前に失敗します（同ファイル:5381, 5601-5605）。
 
 ## 適用条件と副作用
 
-- `--emb` は Qwen3.6 parser のオプションです。通常 engine parser の `--embd-gguf` とは別の名前・用途です（索引 [`README.md`](../../../README.md) の Qwen3.6 scope、および `src/qwen35/q36_engine.cu:3761`）。
-- prompt 上の各画像は、対応する行数分の連続した image-pad token を必要とします。record が余る、足りない、あるいは prompt が画像 token で終わる場合は失敗します（`src/qwen35/q36_engine.cu:3127-3155`）。
-- ファイルは `fopen(..., "rb")` で読み、成功時に閉じます。読み込み後の embedding row buffer GPU へ転送され、モデル forward 中に参照されます（`src/qwen35/q36_engine.cu:3099-3118`, `src/qwen35/q36_engine.cu:2391-2400`）。ファイルへの書き込みや削除はこの経路では行いません。
-- `--emb` の単発画像処理は `--tokens` 実行経路であり、`--serve` の画像入力とは形式の渡し方が異なります。単発経路では file の画像 embedding の hash を画像識別子に含めます（`src/qwen35/q36_engine.cu:3133-3140`）。
+- `--emb` のファイル処理は、`--serve` またはベンチマークではなく、通常の `--tokens` 推論経路で行われます。実行順では serve と benchmark の分岐が `emb_file` を使う処理より先にあります（同ファイル:5555-5595）。serve で画像を送る場合はリクエストの `GENI` 経路が別途埋め込みパスを受け取ります（同ファイル:5059-5068, 5086-5089）。
+- ファイルはバイナリ読み取り専用で開かれ、内容全体をホスト側の行バッファへ読み込みます。推論用に GPU バッファの確保・更新も行います（同ファイル:4646-4663, 3642-3656）。
+- ファイル中の画像数が prompt の画像 token 区間より少ない・多い場合、または画像 token の数が画像の行数に足りない場合は拒否されます。prompt の最後を `<|image_pad|>` にすることもできません（同ファイル:4675-4701）。
 
 ## 出力とエラー
 
-単発経路ではファイル読込や画像配置のエラー文を stderr に出し、終了コード 2 を返します。確認できる失敗には、`--vision` の欠落、ファイルを開けない、bad embeddings file、short embeddings file、prompt/file 間の画像数不一致、画像 row 数に対する image-pad token 不足、prompt が画像で終わる場合があります（`src/qwen35/q36_engine.cu:3100-3114`, `src/qwen35/q36_engine.cu:3130-3155`, `src/qwen35/q36_engine.cu:3922-3926`）。正常時は画像数・行数・画像後の text の cell offset を stderr に出力します（`src/qwen35/q36_engine.cu:3927-3929`）。
+- `--vision` がない場合は標準エラーに `strata-q36: --emb needs --vision` を出し、終了コード 2 です（同ファイル:5601-5603）。
+- ファイルを開けない場合、壊れたヘッダー・embedding 幅不一致・短いデータの場合、または prompt と画像レコードが対応しない場合は、エラー内容を標準エラーに出し、終了コード 2 で終了します（同ファイル:4646-4664, 4675-4705, 5604-5605）。
+- 読み込みに成功すると、画像数・埋め込み行数・画像後のテキスト位置補正値を標準エラーに表示します（同ファイル:5606-5608）。
 
 ## 根拠
 
-- parser と既定状態: `src/qwen35/q36_engine.cu:3735-3762`
-- ファイル形式と検証、画像位置への配置: `src/qwen35/q36_engine.cu:3092-3157`
-- encoder のファイル書き出し形式: `tools/vision/strata_vision.cpp:14`, `tools/vision/strata_vision.cpp:324-326`
-- GPU への設定と forward 入力への反映: `src/qwen35/q36_engine.cu:2381-2426`, `src/qwen35/q36_engine.cu:2088-2091`, `src/qwen35/q36_engine.cu:2139-2142`
-- 単発実行での条件・エラー・ログ: `src/qwen35/q36_engine.cu:3916-3929`
-- serve 要求ごとの画像指定と検証: `src/qwen35/q36_engine.cu:3486-3516`, `src/qwen35/q36_engine.cu:3888-3890`
-- CLI 使用例: `tools/qwen35/q36_vision_cmp.py:117-119`
+- `engine/src/qwen35/q36_engine.cu:5348-5353, 5367` — Qwen3.6 parser の値受け取りと、値がない場合の終了。
+- `engine/src/qwen35/q36_engine.cu:4638-4664` — `strata-vision` レコードの読み込みとヘッダー・幅・データ長の検証。
+- `engine/src/qwen35/q36_engine.cu:4665-4702` — `<|image_pad|>` との対応付け、格子位置の設定、過不足の検証。
+- `engine/src/qwen35/q36_engine.cu:5381, 5555-5609` — `--vision` の有効化、serve・benchmark・通常推論の分岐、`--emb` の適用とエラー出力。
+- `engine/src/qwen35/q36_engine.cu:3642-3682, 3036-3038` — 画像行・位置表の GPU 転送と、通常 embedding 行の置換。

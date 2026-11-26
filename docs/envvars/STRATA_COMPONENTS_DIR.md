@@ -1,57 +1,47 @@
 # `STRATA_COMPONENTS_DIR`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。Strata 所有の Control、CLI、デスクトップホスト、セットアップコードを対象とし、テストコードと外部ライブラリの動作は実装根拠から除外した。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata の engine / Control などのコンポーネントを置くルートディレクトリを指定する。指定先の下に `engine/`、`control/`、`cloudflared/` などのサブディレクトリが使われる。主な利用経路は、Control が engine component を検索・起動・更新する処理、Terminal が更新済み Control へ hand-over する処理、デスクトップホストがコンポーネントの場所を決めて Control 子プロセスへ渡す処理である。
+Strata Control とデスクトップ App Host が、エンジンや Control などのコンポーネントを置くルートディレクトリを選ぶ。値が空でなければ指定値をルートとして使い、未設定または空文字なら OS ごとのユーザーデータディレクトリから既定値を作る。ルートの選択後、エンジンは `<root>/engine`、更新状態は `<root>/.updates`、形状別エンジンは `<root>/shapes`、更新された Control は `<root>/control` 以下を参照する。App Host は同じルートに設定ファイルも配置する。`engine_component.components_dir()` と Host の `componentsDirectory()` によるパス選択で、GPU backend や build macro による値の解釈差はない。〔`terminal/strata_control/engine_component.py:179-193,205-220,252-259`; `terminal/strata_control/shape_engine.py:143-151`; `terminal/strata_control/discovery.py:47-59`; `app/host/server/control-runtime.mjs:26-31,88-99`〕
+
+`tools/packaging/ENGINE-COMPONENT.md:18` のコンポーネント既定位置と、この値で場所を指定できるという説明は実装と一致する。`docs/release-notes-0.2.1.md:64` は engine bundle の移動として説明しているが、現行コードでは更新 Control、更新状態、形状別 engine、App Host の設定ファイルにも同じルートが使われる。〔`terminal/strata_control/engine_component.py:179-193,205-220,252-259`; `terminal/strata_control/discovery.py:52-59`; `app/host/server/control-runtime.mjs:88-99`〕
 
 ## 値と判定
 
-Python の `engine_component.components_dir()` と `handover.components_dir()`、Node の `componentsDirectory()` は、値を文字列として parse せず、truthy / 非空かどうかで判定する。空白除去、パス検証、絶対パス化はこの判定箇所では行わない。
+Python Control と JavaScript Host はどちらも環境マップから名前を直接参照し、値が truthy（空でない文字列）ならディレクトリ値として採用する。整数・真偽値への変換、trim、存在確認、絶対パス化、正規化はこの選択関数では行わない。したがって空文字は未設定と同じだが、空白だけの文字列、`0`、`false` は空でないパスとして採用される。〔`terminal/strata_control/engine_component.py:179-189`; `terminal/strata_cli/handover.py:34-42`; `app/host/server/control-runtime.mjs:26-31`〕
 
-| 状態 | 使用されるルート |
-|---|---|
-| 未設定 | OS ごとの既定ルート |
-| 空文字 | OS ごとの既定ルート（Python の `dict.get()` と JavaScript の truthy 判定で指定値扱いにならない） |
-| 空でない文字列 | その文字列をパスとして使用。相対パスや空白を含む値もこの箇所では拒否しない |
+| 条件 | 未設定・空文字 | 採用される値 | この変数としての無効値 |
+|---|---|---|---|
+| 全 OS（Control / App Host） | Windows では `%LOCALAPPDATA%\Strata\components`。`LOCALAPPDATA` が未設定または空なら `<home>/AppData/Local/Strata/components`。Windows 以外では `$XDG_DATA_HOME/strata/components`。`XDG_DATA_HOME` が未設定または空なら `<home>/.local/share/strata/components`。 | 空文字以外はそのままパス文字列として採用。例: `/srv/strata/components`、`C:\Strata`、`0`、`false`、空白のみ。 | parse による無効値判定はない。ディレクトリが存在するか、または書込み可能かは選択時に検証しない。 | 
 
-既定ルートは次のとおり。
-
-| OS | 環境変数 | 既定ルート |
-|---|---|---|
-| Windows | `LOCALAPPDATA` が非空ならその値、そうでなければユーザー home | `<LOCALAPPDATA または home>/Strata/components` |
-| Windows 以外 | `XDG_DATA_HOME` が非空ならその値、そうでなければユーザー home | `<XDG_DATA_HOME または home>/.local/share/strata/components` |
-
-Python では `Path(explicit)` を返し、Node では指定文字列を返すため、`STRATA_COMPONENTS_DIR` 自体に `engine` などのサブフォルダー名は付け足されない。下位コードが必要に応じて `engine/` 等を加える。
+既定値の決定では、Windows かどうかに加えて `LOCALAPPDATA` または `XDG_DATA_HOME` の値が使われる。これは `STRATA_COMPONENTS_DIR` より優先度が低い。〔`terminal/strata_control/engine_component.py:181-189`; `app/host/server/control-runtime.mjs:27-31`〕
 
 ## 有効になる条件
 
-- Control の `engine_component.components_dir()` を既定値として呼ぶ処理では、指定値が engine component の格納ルートになる。engine 検索はその下の `engine/` を走査し、run config の `component:strata-engine` 解決も同じルートを使う。CLI の `strata components engine` は `--components-dir` があればそれを環境変数より優先して渡す。
-- `strata update` / `strata components update|rollback` は `--components-dir` が空でなければそれを使い、そうでなければ上記の環境変数解決を使う。
-- デスクトップホストは `componentsDirectory()` でルートを決め、Control 子プロセスの環境にその値を `STRATA_COMPONENTS_DIR` として設定する。子プロセス起動時は、ホストが渡す値が継承元の値を上書きする。ホストは同じルートから更新済み Control、同梱 engine の配置先、cloudflared component の場所も構成する。
-- Terminal の hand-over 判定も同じ環境変数から `control/active.json` を探す。ただし通常のソース checkout から起動した場合、hand-over は既定で行われない。通常のインストール経路で更新済み Control を探す場合にこのルートが使われる。
-- CLI から明示的な `--components-dir` を指定する処理では、その CLI 引数が環境変数で選んだルートに優先する。すべての Strata データがこの環境変数で移動するわけではなく、モデル等の install 先は別設定（例: `STRATA_INSTALL_DIR`）である。
+- Control の既定パス参照では、呼び出し側から明示的な root/path が渡されないこと。たとえば `strata components engine` は `--components-dir` がなければ `status()` を通してこの環境変数を使う。〔`terminal/strata_cli/cli.py:153-159,2087-2094`; `terminal/strata_control/engine_component.py:1340-1356`〕
+- `strata update` など `--components-dir` を受け付けるコマンドでは、空でない CLI 引数が環境変数より優先される。明示引数がないと `default_components_dir()` が環境変数由来のパスを使う。値が設定されている場合は source checkout 内の `engine-feed` への特例切替も行わない。〔`terminal/strata_cli/update_cmd.py:47-55,269-284,318-324`〕
+- Source checkout の `setup.py` にある `engine_from_feed()` は、更新子プロセス用に値を `<checkout>/engine-feed` へ設定し直す。その処理内では、親プロセスから継承した値を使わない。〔`terminal/setup.py:5366-5377`〕
+- App Host は `componentsDirectory()` で値（または既定値）を選び、`controlEnvironment()` がその値を `STRATA_COMPONENTS_DIR` として Control 子プロセスの環境へ設定する。App Host の設定では親環境の値より、選択済みの `components` 引数が優先される。〔`app/host/server/control-runtime.mjs:26-31,88-99`〕
+- CLI の Control handover と Terminal launcher の修復対象も同じ環境変数で決まる。ただし handover は既に更新処理を抑止する guard/off 変数がある場合や、checkout 自身の Control を使う場合などには実行されない。変数が指す場所に更新 Control の pointer がない場合は handover 先もない。〔`terminal/strata.py:37-51`; `terminal/strata_cli/handover.py:34-42,70-78,126-150`; `terminal/strata_cli/launcher_heal.py:24-27`〕
 
 ## 実行時の詳細
 
-Python 側は `components_dir()` が呼ばれた時点の `os.environ`（引数 `environ` が渡された場合はその辞書）を参照する。読み取った値は `Path` に変換されて返るが、この関数内でディレクトリの作成や存在確認はしない。engine の `scan()` は `<root>/engine` を列挙し、存在しない場合は空の一覧を返す。`resolve()` は適合する engine を選び、見つからないときは `EngineMissing` とする。更新処理は同じ component root の下で engine / Control の更新状態を扱う。
+Python の `components_dir()` は、`environ` 引数がなければ呼び出し時点の `os.environ` を参照する。関数内 cache はなく、呼び出しのたびに環境を評価するため、プロセス内で環境値が変更され、その後に root を再取得すれば新しい値が使われる。既に `Path` として渡された root や、呼び出し元で選択済みの root は再評価されない。〔`terminal/strata_control/engine_component.py:179-189,1211-1215,1340-1344`; `terminal/strata_cli/handover.py:34-42`〕
 
-Node 側は `process.env` を既定入力として関数呼び出し時に参照する。ホストの `controlEnvironment()` は元の環境を複製した後に `STRATA_COMPONENTS_DIR` を決定済みルートで上書きし、Control 起動時に渡す。ホストが呼び出し側から `components` 引数を受け取った場合は、その値が環境変数から計算した既定値より優先する。
+値はファイルシステム上のルート選択に使われる。エンジン解決はそのルートをスキャンして実行可能な package を探し、status は同じルートから installed engine、pin/previous 状態、更新通知を組み立てる。形状別 engine と updater の state/cache も同じルート配下に置かれる。App Host は選択したルートを Control 子プロセスへ明示的に渡す。〔`terminal/strata_control/engine_component.py:1211-1217,1340-1364`; `terminal/strata_control/shape_engine.py:143-151,349-363`; `terminal/strata_control/feed_models.py:55-58`; `app/host/server/control-runtime.mjs:88-99`〕
 
-Terminal の hand-over は選択ルートの `control/active.json` を読み、更新先 Control を探す。環境変数が空なら Windows は `%LOCALAPPDATA%\Strata\components` 相当、その他は `$XDG_DATA_HOME/strata/components` 相当を探す。hand-over の子プロセス環境は元の環境をコピーして構成されるため、`STRATA_COMPONENTS_DIR` は引き継がれる。
+CLI の `strata components engine` では、対象ルートに利用可能な engine がなければ `status()` が notice を返し、human 出力では notice を stderr に出して終了コード `5` を返す。JSON 出力でも `ok: false` と report を出して `5` を返す。ここで環境変数自体の構文エラーは発生せず、値が指す場所の内容に応じて missing/unusable の結果となる。〔`terminal/strata_control/engine_component.py:70-88,1211-1217,1340-1360`; `terminal/strata_cli/cli.py:2087-2109`〕
+
+## ログと測定値
+
+この変数の値を採用したこと自体を知らせるログは、パス選択コードにはない。エンジンが見つからない場合の利用者向け notice と終了コードは「実行時の詳細」を参照。性能測定値は該当しない。〔`terminal/strata_control/engine_component.py:179-189,1211-1217`; `terminal/strata_cli/cli.py:2087-2109`〕
 
 ## 根拠
 
-- `strata_control/engine_component.py:59,176-190`: 環境変数名、空でない値の採用、OS ごとの既定ルート、engine サブディレクトリ。
-- `strata_control/engine_component.py:727-740,806-814,904-913,916-930`: engine 格納先の走査、起動用 component 解決、component status のルート使用。
-- `strata_control/discovery.py:44-56`: Control の component directory helper を委譲し、app install/settings の既定場所もその親ディレクトリから構成。
-- `strata_cli/cli.py:2001-2027`: `strata components engine` の `--components-dir` 引数を status 呼び出しへ渡し、結果に component folder を表示。
-- `strata_cli/update_cmd.py:30-38,167-175`: 更新・rollback CLI の `--components-dir` と、引数がない場合の環境変数ベースの既定値。
-- `strata_cli/handover.py:34-42,70-78,126-140,148-150`: hand-over 用の component root 選択、checkout 時の抑止、`control/active.json` 読み取り先、子プロセス環境。
-- `apps/host/server/control-runtime.mjs:26-31,37-43`: Node ホスト側の値判定、既定ルート、更新済み Control の探索先。
-- `apps/host/server/control-runtime.mjs:78-100,108-119`: Control / installer の子プロセス環境での設定と `STRATA_COMPONENTS_DIR` の上書き。
-- `apps/host/server/index.mjs:125-128,179-180,918-919`: 同梱 engine の配置、host 管理オブジェクト、cloudflared component のルート利用。
-- `strata_cli/launch/runner.py:416-426`: runner に component directory が設定されている場合、起動する子プロセスへ環境変数として渡す。
-- `setup.py:4103-4112`: セットアップが独自の `engine-feed` staging root を設定して update 子プロセスを実行する例。これは環境変数より専用 staging root を明示する内部処理。
-- `docs/INSTALL.md:56,324` および `packaging/ENGINE-COMPONENT.md:15-19`: component folder として既定場所または `STRATA_COMPONENTS_DIR` を案内。現行の分岐詳細は上記ソースに基づく。
+- 値の選択、OS 別既定値、エンジン・更新状態のルート: `terminal/strata_control/engine_component.py:59-64,179-193,205-220,252-259,1209-1217,1340-1364`
+- Control の handover、CLI の明示パス、update 先の選択: `terminal/strata_cli/handover.py:34-42,70-78,126-155`; `terminal/strata_cli/cli.py:153-159,2087-2109`; `terminal/strata_cli/update_cmd.py:47-55,269-284,318-324`
+- App Host の環境読み取りと子プロセス環境への設定: `app/host/server/control-runtime.mjs:26-31,88-99`
+- 形状別 engine と model feed cache: `terminal/strata_control/shape_engine.py:143-151,349-363`; `terminal/strata_control/feed_models.py:55-58`
+- setup 子プロセスでの上書き: `terminal/setup.py:5366-5377`

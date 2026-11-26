@@ -1,48 +1,49 @@
 # `STRATA_SELECT_LONG`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。Strata リポジトリの作業ツリーは `## main...origin/main` で、表示された未コミット変更はありません。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。調査対象 checkout は `## main...origin/main` で、作業ツリーに未コミット変更はなかった。
 
 ## 役割
 
-Verifier の QSA 検索で、コンテキスト位置がしきい値以上の window に長文脈用 select variant を選べるようにします。通常 variant の代わりに `qsa_block_scores_long` と `qsa_block_topk_long` を window graph に記録します。環境変数を有効にすると verifier は通常用と長文脈用の二組の window graph を用意し、各 window の `pos0 + T` によって選択します。値が有効でも、しきい値未満の window は通常 variant です。
-
-これは CUDA の `STRATA_EXPERIMENTAL_SM60` build に含まれる機能です。該当する multi-CTA scratch がない build では警告を出して switch を無視します。
+CUDA 検証器の QSA 選択で、長い context の decode window に別の block-score / top-k 経路を使う opt-in スイッチ。通常経路と選択 ID・スコア bit は同じとソースコメントに記されている。値を有効にすると閾値以上の window 用に別の CUDA graph 群を保持するため、閾値未満の window は通常 graph のまま。対象は検証器の window decode で、batch-row の選択は明示的に通常の one-CTA 経路を使う。`STRATA_SELECT_LONG` 自体は CLI 引数ではなく、`Verifier` の共通 env 読み取り関数で評価される（`engine/src/core/verify.cpp:195-212,2266-2276,4684-4689`）。
 
 ## 値と判定
 
-`src/core/verify.cpp` は `std::getenv("STRATA_SELECT_LONG")` の戻り値が null でなく、先頭文字が `'1'` のときだけ有効とします。文字列全体の parse や比較は行いません。
+`std::getenv` の結果が null でなく、かつ先頭文字が `'1'` のときだけ要求を有効とする。文字列全体の比較や数値変換はしない。したがって空文字、`0`、`true`、`01` は無効だが、`1`、`10`、`1anything` は要求として有効。空白を含む場合も先頭文字だけを見るため、` 1` は無効。設定有無だけで動かす判定ではない（`engine/src/core/verify.cpp:200-210`）。
 
-| 値 | switch の判定 |
-|---|---|
-| 未設定 | OFF |
-| 空文字 | OFF（値は設定済みだが、先頭文字が `'1'` ではない） |
-| `1`, `10`, `1anything` | ON（先頭文字が `'1'`） |
-| `0`, `true`, ` 1`, その他 `1` 以外で始まる文字列 | OFF |
-
-数値変換、範囲検査、clamp、無効値の fallback はありません。判定結果は `select_long_on()` の関数内 `static const bool` にキャッシュされます。最初の呼び出し後にプロセス環境を書き換えても再判定されません。根拠: `src/core/verify.cpp:181-193`。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| 通常の読み取り | `select_long_on()` は false | `1`, `10`, `1anything` | 空文字、`0`, `true`, `01`, ` 1` |
+| `select_long_on()` が呼ばれる build に `STRATA_EXPERIMENTAL_SM60` がない（HIP など） | false、警告なし | `1` で要求を検出するが無効化し、警告を一度出す | 上段と同じく false、警告なし |
+| 同一 compute capability の NVIDIA GPU 群が sm_70 で、起動時に `STRATA_SM70_PERF=0` / `STRATA_DEFAULTS=026` 等で既定セットを除外していない | 既定設定処理が unset を `1` にする | ユーザーが設定した値はそのまま上段の規則で判定 | ユーザーが空文字や `0` を設定すれば無効 |
 
 ## 有効になる条件
 
-- CUDA の `STRATA_EXPERIMENTAL_SM60` build であること。`qsa_topk_multi_scratch_ints()` は `!__HIPCC__ && STRATA_EXPERIMENTAL_SM60` のときだけ正の scratch サイズを返し、それ以外は 0 を返します。CMake のこの option は既定 OFF です（`CMakeLists.txt:236,280-284`; `src/kernels/cuda/qsa_select.cu:3077-3084`）。
-- `STRATA_SELECT_LONG` が上表の ON 判定であること。
-- window end position `pos0 + T` が `STRATA_SELECT_LONG_AT` 以上であること。`STRATA_SELECT_LONG_AT` は別環境変数で、未設定または空文字なら 65,536、空でない値は `std::atoll` で変換します。したがって `0` は常に該当し、負値もそのまま比較に使われます。文字列の先頭が数値として読めなければ `atoll` の結果 0 です。しきい値との比較は `>=` です（`src/core/verify.cpp:194-200,3013-3018,3076-3078`）。
-- `capture_all()` は switch 有効時に `sel_long_` 0 と 1 の両方の window graph を capture します。通常の run、prelaunch、pipelined launch は window 位置から同じ variant を選びます（`src/core/verify.cpp:4815-4823,3013-3018,3076-3084,4870-4902`）。
-
-HIP では scratch サイズが 0 のため、値が `1` で始まる場合でも `select_long_on()` は stderr に `strata verify: STRATA_SELECT_LONG=1 needs the CUDA build with STRATA_EXPERIMENTAL_SM60; ignored` を一度出して OFF をキャッシュします。通常の CUDA build でも同じ経路です。Metal の engine stub には「Metal では到達しない」と記載されています（`src/core/verify.cpp:183-192`; `metal/src/engine/stubs_0145.cpp:155`）。
+- `STRATA_SELECT_LONG` が上記の先頭文字判定を通ること。関数内 `static` に結果をキャッシュするため、実行中に環境を変更しても再評価されない（`engine/src/core/verify.cpp:200-212`）。
+- `qsa_topk_multi_scratch_ints(1) > 0` であること。multi-CTA カーネルを含む CUDA build（`STRATA_ENABLE_CUDA` かつ CMake の `STRATA_EXPERIMENTAL_SM60`）でなければならない。非対応 build では要求が無視される（`engine/cmake/strata_gpu_engine.cmake:14-16`; `engine/src/kernels/cuda/qsa_select.cu:3219-3227`）。
+- window の終端 cell `pos0 + T` が `STRATA_SELECT_LONG_AT` 以上であること。閾値は別の環境変数で、未設定または空文字なら 65,536、非空なら `std::atoll` で変換する。`0` は常時対象、負値も比較上すべての通常 window を閾値以上にする。変換不能文字列は `atoll` の結果 0 となる。これは long switch が有効なときだけ window 選択に使われる（`engine/src/core/verify.cpp:213-219,3710-3714,3837-3839`）。
+- 検証器が通常の単一 window QSA 経路を実行すること。batch capture 中は `sel_long_ = 0` とし、batch rows では長文脈分岐を通らない（`engine/src/core/verify.cpp:2200-2276,4677-4690`）。
+- 長経路 wrapper 内の高速カーネルにも条件がある。top-k multi-CTA は `STRATA_TOPK_OLD` が未設定、呼び出しが 1〜`MT_MAXQ` query、active count なし、QSA block 幅・選択容量の条件を満たす必要がある。`STRATA_TOPK_MULTI=0` なら無効、正の整数ならカード条件を問わず有効、unset / 空文字なら compute capability 6.x（または `sm70_default_on`）で register kernel の到達範囲を超える場合に有効。これらを満たさない場合は通常 top-k に戻る。`STRATA_TOPK_MULTI_N` は multi-CTA kernel を選んだ場合の CTA 数を指定し、正値を最大数まで clamp する（`engine/src/kernels/cuda/qsa_select.cu:3174-3196,3200-3205,3230-3245`）。
+- shuffle-free score kernel は `STRATA_SCORES_MULTI` の `atoi` 結果が非ゼロであること（unset は有効、空文字や数値変換結果 0 は無効）、QSA shape が一致し query 数が `MQ` 以下であることが必要。`STRATA_SCORES_DX=0` は無効、非ゼロならどの CUDA card でも有効、unset / 空文字なら CC 6.x または `sm70_default_on` の GPU で有効。条件不成立なら通常 score kernel に戻る（`engine/src/kernels/cuda/qsa_select.cu:1607-1609,3108-3132,3248-3257`）。
+- 同一 compute capability の可視 NVIDIA GPU 群が sm_70 の場合、起動時の `apply_nv_defaults` がユーザー未設定の環境変数に限り `STRATA_SELECT_LONG=1` を設定する。明示設定は空文字を含め維持される。`STRATA_SM70_PERF=0` または `STRATA_DEFAULTS=026` などで表を除外するとこの既定設定は適用されない。混在 compute capability ではこの一括既定設定を適用しない（`engine/src/program/generate.cpp:4425-4449`; `engine/src/core/nv_defaults.cpp:136-163,222-234`）。
 
 ## 実行時の詳細
 
-Verifier の通常 window graph は、長文脈 variant の場合 `qsa_block_scores_long(...)` と `qsa_block_topk_long(...)` を呼び、そうでなければ `qsa_block_scores(...)` と `qsa_block_topk(...)` を呼びます。選択された long wrapper は適用条件を満たさない場合に通常 kernel 呼び出しへ fallback できます。scratch は switch 有効かつ scratch サイズ正の場合だけ arena に確保されます（`src/core/verify.cpp:965-968,1775-1787`; `src/kernels/cuda/qsa_select.cu:3086-3113`）。
+`select_long_on()` は初回呼び出し時に環境値と build capability を一度評価して static cache する。対応しない build で値が先頭 `1` の場合、stderr に `strata verify: STRATA_SELECT_LONG=1 needs the CUDA build with STRATA_EXPERIMENTAL_SM60; ignored` を一度出して false を cache する（`engine/src/core/verify.cpp:200-212`）。GPU の architecture 判定自体はこの変数では行わず、実際に DX scorer / multi-CTA top-k を使うかは各 wrapper の別条件と `STRATA_SCORES_DX`・`STRATA_TOPK_MULTI` が決める。
 
-長文脈 wrapper 内の実 kernel 選択は別環境変数にも依存します。`STRATA_TOPK_MULTI` は未設定・空文字なら compute capability major 6 で自動選択し、それ以外の GPU では OFF、非ゼロ値なら任意の CUDA card で ON、0 なら OFF です。`STRATA_TOPK_OLD` が設定されている場合や形状・capacity 条件に合わない場合も通常 top-k に fallback します（`src/kernels/cuda/qsa_select.cu:3031-3052,3086-3101`）。長文脈 score wrapper は `STRATA_SCORES_DX` が 0 なら DX kernel を使わず通常 scorer に fallback し、未設定時は compute capability 6.x、正値なら任意カードで DX を許可します。加えて形状と query 数の条件を満たす必要があります（同 `:2966-2989,3104-3113`）。従って `STRATA_SELECT_LONG=1` は二つの long wrapper を選択しますが、内部の各最適化 kernel が必ず実行されることまでは保証しません。
+対応 build では verifier arena に scratch を確保し、window 終端が閾値以上なら long graph variant を選択する。QSA 選択時には `qsa_block_scores_long` と `qsa_block_topk_long` を呼び、両 wrapper は専用条件が成立しなければ通常の `qsa_block_scores` / `qsa_block_topk` へ fallback する。選択結果を後続の attention が使う流れは通常経路と共通（`engine/src/core/verify.cpp:1205-1208,2266-2276,3831-3846`; `engine/src/kernels/cuda/qsa_select.cu:3230-3257`）。
 
-`select_long_on()` と `select_long_at()` はそれぞれ static cache されます。しきい値は最初の `select_long_at()` 呼び出し時に一度 `atoll` で評価され、window position 自体は run ごとに比較されます。CLI 引数による上書きはこの読み取り箇所にはありません。batch rows 用の記録経路は明示的に `sel_long_ = 0` とし、long variant を選びません（`src/core/verify.cpp:3755-3757`）。
+通常 window graph と long window graph を別々に capture するため、グラフ用 VRAM が増える。pipeline 用 `capture_all` も switch 有効時は両 variant を capture し、各 window の context に応じて launch variant を選ぶ（`engine/src/core/verify.cpp:3254-3262,5909-5917,5964-5974`）。CLI 引数がこの環境値を上書きする処理は確認できなかった。sm_70 自動既定はエンジンが switch を読む前に適用される。既定設定の適用時に stderr へ出る一覧ログは、他の適用 switch と同じ行に `STRATA_SELECT_LONG=1` が含まれる（`engine/src/program/generate.cpp:4425-4449`; `engine/src/core/nv_defaults.cpp:222-255`）。
 
-ビルド条件を満たさない場合に Strata が出すのは上記の警告で、その後は通常 variant を使います。graph capture / launch の失敗時には verifier の既存エラー経路（例: `verify: begin capture failed`、`verify: launch: ...`）がありますが、これはこの環境変数専用の失敗ではありません（`src/core/verify.cpp:2590-2603,3134-3143`）。
+## ログと測定値
+
+非対応 build で先頭 `1` を指定したときの warning は上記のとおり。対応 build で有効になったことだけを示す専用ログはこの読み取り箇所にはない。kernel launch error 時は専用経路で `qsa_block_topk multi: <CUDA error>` または `qsa_block_scores (dx): <CUDA error>` を stderr に出し、`std::exit(1)` する（`engine/src/kernels/cuda/qsa_select.cu:3167-3170,3207-3215`）。
+
+`docs/OLDER_GPUS.md` は四枚の GP100、全 expert VRAM resident、`--pipeline-windows 3`、context 115K で 400 token decode の作者測定を 51.0 → 52.5 tok/s と記し、64K 未満では変化なしとしている。また同文書は未測定と明記している。これは文書に記録された測定であり、本調査で再測定していない（`docs/OLDER_GPUS.md:184-191`）。同資料は専用 parity test がランダムデータで同じ ID / score bits を確認すると記すが、テストは本調査では実行していない（同:186-188）。
 
 ## 根拠
 
-- 候補一覧の名前は実装でも環境から読み取られています: `src/core/verify.cpp:181-193`。
-- CUDA build option と macro 定義: `CMakeLists.txt:236,280-284`。
-- scratch の build/backend 条件と long wrapper 内の fallback: `src/kernels/cuda/qsa_select.cu:2966-2989,3031-3101,3104-3113,3077-3084`。
-- 既存資料 `docs/OLDER_GPUS.md:178-185` も CUDA `STRATA_EXPERIMENTAL_SM60`、既定しきい値 65,536、別変数による score/top-k 内部経路の制御、非対応 build での警告を説明しています。上記の値判定と分岐の詳細は調査対象 commit の実装を根拠にしています。
+- `engine/src/core/verify.cpp:195-219` — 値判定、非対応 build 警告、関連閾値の既定値と cache。
+- `engine/src/core/verify.cpp:1205-1208,2200-2276,3710-3717,3831-3846,4677-4690,5909-5917,5964-5974` — scratch 確保、通常 / batch / pipeline の window variant 選択。
+- `engine/cmake/strata_gpu_engine.cmake:14-16`; `engine/src/kernels/cuda/qsa_select.cu:1607-1609,3108-3132,3174-3257` — build macro と backend wrapper の fallback 条件。
+- `engine/src/program/generate.cpp:4425-4449`; `engine/src/core/nv_defaults.cpp:136-163,222-255` — sm_70 の自動既定と明示値の優先。
+- `docs/OLDER_GPUS.md:184-191` — 記載済み測定条件・結果と未測定の注記。

@@ -1,6 +1,6 @@
 # `strata ops history --profile`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,11 +8,11 @@
 | コマンド | `strata ops history` |
 | オプション | `--profile` |
 | 別名 | なし |
-| 値 | 保存済み profile の ID（文字列） |
+| 値 | 保存済み serving profile の名前。小文字英字で始まり、小文字英字・数字・`_`・`-` を使う 1〜64 文字の識別子 |
 
 ## 役割
 
-履歴を表示する recipe と、その recipe 履歴の保存領域を profile ID で指定します。recipe 名は別の位置引数です。`--profile` は `ops` 配下の各操作 parser に共通で必須です。
+履歴を表示する recipe の所属先 profile を指定する。recipe 名は別の位置引数で指定する。`--profile` は `strata ops` の `init`、`list`、`history` など各アクションに共通して必須であり、history ではその profile を使って現行 recipe と保存 revision の一覧を取得する（`terminal/strata_cli/cli.py:283-295,1501-1505`）。
 
 ## 使い方
 
@@ -20,40 +20,36 @@
 strata ops history restart --profile four-gpu
 ```
 
-`restart` は recipe 名、`four-gpu` は保存済み profile ID です。機械可読形式が必要なら `--output json` または `--json` を追加できます。
+`restart` は recipe 名、`four-gpu` は保存済み serving profile 名の例。JSON 出力にする場合は `--output json`（または `--json`）を追加できる（`terminal/strata_cli/cli.py:294-295,539-546`）。
 
 ## 値と既定値
 
-- 値は1つの文字列で、省略できません。既定値はありません。parser は `required=True` で登録しています。
-- 値の形式は先頭が小文字英字で、続く文字は小文字英字・数字・`_`・`-`、長さは1〜64文字です。大文字、空文字、その他の記号は受理されません。
-- recipe 名にも同じ形式制約が適用されます。
-- このオプションに数値変換や列挙値の選択肢はありません。
+- 値を必ず 1 つ指定する。parser では `required=True` で、既定値はない（`terminal/strata_cli/cli.py:283-295`）。
+- profile 識別子は小文字英字で始まり、以降は小文字英字・数字・`_`・`-` のみ、最大 64 文字。profile 名の検証は `profiles.load()` から `_name()` を通じて行われる（`terminal/strata_control/recipes.py:38-41`、`terminal/strata_control/profiles.py:48-55`）。
+- 指定した名前の保存済み profile が必要。ファイルパスを profile 名として扱う分岐は確認できず、recipe の profile/name として同じ識別子が検証される（`terminal/strata_control/recipes.py:32-40,62-64`）。
 
 ## 実行時の動作
 
-指定値は `recipes.history(profile, name)` に渡されます。処理は profile を読み込んで検証し、`.ops/<profile>` 以下の指定 recipe を読み込みます。現在の recipe revision を先頭に置き、履歴ディレクトリにある過去 revision を `saved_at` の新しい順に返します。人間向け出力は各 revision と `current` / `saved` の印、JSON 出力は `profile`、`recipe`、`history` を含む成功オブジェクトです。
+`strata ops history` の処理は `recipes.history(a.profile, a.name)` に引数を渡す。profile データは `STRATA_PROFILE_DIR` が設定されていればその場所から、未設定なら OS ごとの既定設定ディレクトリから読む（`terminal/strata_cli/cli.py:1501-1503`、`terminal/strata_control/profiles.py:38-45`）。
 
-履歴ディレクトリがまだなければ、過去 revision の項目はなく、現行 revision のみが返ります。この経路は履歴を読み取るもので、履歴ディレクトリを作成したり recipe を変更したりしません。recipe の作成・編集で過去版が保存されます。
+history API は先に指定 profile の recipe を読み込み、現在の revision を得る。次に `.ops/<profile>/.history/<recipe>` にある通常ファイルのうち、ファイル名 stem が 16 桁の小文字 16 進数であるものを履歴候補として列挙する。結果は現行 revision を先頭に置き、過去 revision は保存時刻（mtime）の降順にする。履歴ディレクトリが存在しない場合は現行 revision のみを返す（`terminal/strata_control/recipes.py:240-250`）。このオプション自体は表示対象を絞るだけで、履歴の作成・更新・削除は行わない。
 
-`--output` の既定値は `human` です。`--json` は `ops history` にも追加される one-shot 共通オプションで、指定すると JSON 出力になります。`--quiet` も共通 parser に追加され、人間向け成功出力を抑制します。
+人間向け出力は revision ごとに `current` または `saved` を表示する。`--output json` / `--json` では `profile`、`recipe`、`history` を含む成功 JSON を出力する。`--quiet` を指定した場合も JSON 出力は抑制されない（`terminal/strata_cli/cli.py:1501-1505,539-546,566-573,2335-2340`）。
 
 ## 適用条件と副作用
 
-- profile ID はユーザーの profile 保存領域にある保存済み profile を指します。保存場所は `STRATA_PROFILE_DIR` が指定されればその値、未指定なら Windows は `APPDATA/Strata/profiles`（APPDATA がなければユーザーホーム配下）、それ以外は `XDG_CONFIG_HOME/strata/profiles`（未指定時は `~/.config/strata/profiles`）です。
-- profile ファイル、recipe ファイル、存在する履歴ディレクトリを検査・読み取りします。profile の読み取りでアクセス拒否が起きた場合、実装は Strata 管理ファイルのアクセス権修復を試して再読込することがあります。
-- recipe / 履歴ディレクトリがシンボリックリンク、通常ファイルでない、または POSIX で所有者限定の権限でない場合は拒否されます。履歴エントリとして採用するファイルは、16桁の小文字16進 revision 名で、通常ファイルかつシンボリックリンクでないものに限られます。
+profile と recipe の読み取りが必要であり、profile の保存場所は `STRATA_PROFILE_DIR` または OS ごとの既定値で決まる。recipe がない場合や profile の内容・権限・ファイル種別が不正な場合は履歴を列挙できず失敗する。history 保存先が存在する場合、シンボリックリンクや不正なディレクトリ・所有者権限も拒否される（`terminal/strata_control/recipes.py:32-64,180-196,71-86,240-250`）。
 
 ## 出力とエラー
 
-- 成功時の人間向け出力は revision ごとの1行です。JSON では `schema_version: 1` と `ok: true` を含むオブジェクトが stdout に出ます。
-- 指定 profile が保存されていない場合や recipe が存在しない場合、recipe の内容が不正な場合、検査対象のパスが安全条件を満たさない場合は失敗します。人間向けエラーは `strata: ...` として stderr に出て、JSON モードではエラーオブジェクトが stdout に出ます。
-- `ProfileError` の通常終了コードは2です。profile / recipe の欠落や不正ファイルなど、明示的にコード5を指定する失敗もあります。
+- recipe が見つからない場合、`strata ops init --profile <profile>` を案内する `ProfileError` となる。壊れた recipe やアクセス不能などのエラーは CLI の共通処理でエラーとして返される（`terminal/strata_control/recipes.py:180-196`、`terminal/strata_cli/cli.py:2248-2265`）。
+- 人間向けエラーは `strata: <message>` を stderr に出力し、例外に設定された終了コードを返す。機械向け出力では `schema_version`、`ok: false`、エラーコードとメッセージを含む JSON を stdout に出力する（`terminal/strata_cli/cli.py:558-563,2248-2265`）。
+- 有効な recipe がある場合の成功終了コードは 0。人間向けの空履歴ディレクトリでも現在 revision が返るため、history の成功結果が空配列になる経路はありません（`terminal/strata_cli/cli.py:1501-1505`、`terminal/strata_control/recipes.py:240-250`）。
 
 ## 根拠
 
-- parser のコマンド階層、位置引数、必須 `--profile`、出力形式、`--json` / `--quiet` の追加: `strata_cli/cli.py:255-267`, `strata_cli/cli.py:508-515`。
-- `history` の呼び出し、返却値と表示: `strata_cli/cli.py:1391-1394`, `strata_cli/cli.py:1431-1435`。
-- profile ID の書式、保存場所、profile 読込とアクセス修復: `strata_control/profiles.py:25`, `strata_control/profiles.py:38-50`, `strata_control/profiles.py:150-166`, `strata_control/private_files.py:476-484`。
-- recipe profile / 名前検証、profile 読込、履歴パスの安全確認: `strata_control/recipes.py:32-35`, `strata_control/recipes.py:38-64`, `strata_control/recipes.py:71-86`, `strata_control/recipes.py:180-196`。
-- 履歴の抽出条件と並び順: `strata_control/recipes.py:240-250`。
-- 成功・失敗時の stdout / stderr と終了コード処理: `strata_cli/cli.py:527-542`, `strata_cli/cli.py:2166-2183`; `ProfileError` の既定終了コード: `strata_control/profiles.py:30-35`。
+- parser と必須指定、値の共有 scope: `terminal/strata_cli/cli.py:283-295`
+- profile / recipe のディスパッチと出力: `terminal/strata_cli/cli.py:1461-1464,1501-1505`
+- `--json`、`--quiet` の追加と成功・エラー形式: `terminal/strata_cli/cli.py:539-546,558-573,2335-2340`
+- profile 識別子、保存場所、recipe の profile 解決: `terminal/strata_control/profiles.py:25,38-55`、`terminal/strata_control/recipes.py:32-41,62-64`
+- recipe 読み込み時の失敗、履歴ファイルの列挙と順序: `terminal/strata_control/recipes.py:71-86,180-196,240-250`

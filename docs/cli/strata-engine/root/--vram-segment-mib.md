@@ -1,61 +1,65 @@
 # `--vram-segment-mib`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（エンジン引数） |
+| コマンド | `strata`（エンジン引数、root scope） |
 | オプション | `--vram-segment-mib` |
 | 別名 | なし |
-| 値 | MiB 単位の整数。parser は `atoll` で変換する |
+| 値 | MiB 単位の整数。`--vram-elastic` と併用する場合は 64 以上 |
 
 ## 役割
 
-`--vram-elastic` が使う expert cache の VRAM セグメントサイズを MiB で指定します。これ単独では elastic cache を有効にしません。elastic モードでは cache を複数の物理セグメントとして確保し、`--serve` 中の `VRAM <reserve_mib>` コマンド（server の `POST /v1/vram`）による縮小・再拡張に使います（`src/program/generate.cpp:907-909`, `src/program/generate.cpp:6282-6298`, `include/strata/core/expert_cache.hpp:117-124`）。
+`--vram-elastic` が使う expert cache の物理 VRAM segment の要求サイズを MiB で指定する。segment 化した cache は server の request 間 VRAM resize で縮小・再拡張できる。これ単独では elastic cache を有効にしない。
 
 ## 使い方
 
 ```sh
-strata --serve --vram-elastic --vram-segment-mib 512 ...
+strata --serve --vram-elastic --vram-segment-mib 256 <model.strata>
 ```
-
-`...` はモデル等、このエンジン実行に必要な引数を表します。例の `512` はソース上の既定値です（`src/program/generate.cpp:613-616`）。
 
 ## 値と既定値
 
-- 省略時は `512` MiB です（`src/program/generate.cpp:616`）。
-- オプションに値が続かない場合、parser は `--vram-segment-mib needs a value` を stderr に出し、終了コード `2` で終了します（`src/program/generate.cpp:2416-2420`）。
-- parser は値を `std::atoll` で読み、厳密な整数形式・全桁消費・上限を検証しません。したがって、無効文字列を含む値を安全な入力として扱わないでください。複数回指定した場合は、parser のループで後の値が代入されます（`src/program/generate.cpp:2604-2605`）。
-- `--vram-elastic` が有効な条件で値が `64` MiB 未満なら、起動をエラー終了させるのではなく elastic 機能を無効化し、stderr に `strata generate: --vram-elastic is off: --vram-segment-mib is below 64` と出します（`src/program/generate.cpp:6284-6295`）。
-- このオプションだけを指定し `--vram-elastic` を付けない場合、値は保存されますが `set_segment_bytes` に渡されず、通常の cache 割当には作用しません（`src/program/generate.cpp:2604-2605`, `src/program/generate.cpp:6284-6298`）。
+- 既定値は `512` MiB。
+- parser は値を `std::atoll` で `int64_t` に変換する。専用の数値形式検査や上限検査は見当たらない。数値として読めない文字列は `atoll` の結果 0 となり、後述の elastic 下限条件に該当する。
+- 値を複数回指定した場合は parser のループで後の値が同じフィールドを上書きする。
+- `--vram-elastic` が有効な場合、64 MiB 未満（0、負値を含む）は受理されず、elastic が無効化される。64 MiB 以上についてソース上の上限は確認できない。
+- segment の実サイズは CUDA driver の推奨割当粒度に切り上げられるため、要求値と実サイズは一致しない場合がある。
 
 ## 実行時の動作
 
-elastic 条件を満たすと、値を MiB からバイトへ変換して expert cache に設定します（`src/program/generate.cpp:6297`）。`ExpertCache` は要求サイズを CUDA driver の割当粒度に切り上げて実際の segment size とし、expert cache の仮想アドレス範囲を予約して初期セグメントを map します（`src/core/expert_cache.cpp:297-321`, `src/core/expert_cache.cpp:323-345`）。したがって、実際の粒度は指定値と完全一致するとは限りません。
+root parser は値を `Options::vram_segment_mib` に格納する。expert cache の初期値は 512 MiB である。後段は `--vram-elastic` が指定された場合に限って、`--serve` であること、helper cache がないこと、値が 64 MiB 以上であることを確認する。条件を通ると `MiB << 20` で byte 数へ変換して ExpertCache に設定し、cache open 時に CUDA virtual memory management を使った segment 化 arena を構成する。segment 化は固定アドレス範囲を予約し、各 segment に物理割当を map する。通常の cache 割当（segment 要求値 0）は従来どおり単一 `cudaMalloc` である。
 
-segment は `VRAM` コマンドを受けたときに必要な単位で解放・再 map されます。縮小時は末尾の segment を解放し、再拡張時は先頭側から map します。segment の丸めにより、要求された空き VRAM と実際の解放量は一致しないことがあります（`src/core/expert_cache.hpp:137-146`, `src/core/expert_cache.cpp:384-445`, `src/program/generate.cpp:11197-11204`, `src/program/generate.cpp:11221-11245`）。このサイズ指定自体が自動的に VRAM を返すわけではありません。
+server は設定の `vram_elastic: true` で `--vram-elastic` を追加し、`vram_segment_mib` が正の整数で CLI 引数に未指定の場合に本オプションを engine 引数へ追加する。起動後の resize は `VRAM <reserve_mib>` / `POST /v1/vram` によって request 間に行われ、segment 境界に合わせて cache を縮小・再拡張する。segment 境界の解像度と、resize で解放・再取得できる単位にこの値が関係する。
 
 ## 適用条件と副作用
 
-- `--vram-elastic` が必要です。elastic は `--serve`、単一 GPU、helper cache なしの場合に限り有効です。layer split、別 GPU の helper cache、または 64 MiB 未満では起動時に機能を無効化して理由を stderr に出します（`src/program/generate.cpp:6282-6295`）。
-- HIP build では NVIDIA 専用として機能を無効化します（`src/program/generate.cpp:6290-6295`）。CUDA driver/GPU が仮想メモリ管理を提供しない場合、cache の segmented allocation は `ExpertCache: --vram-elastic needs the driver's virtual memory management, which this GPU or driver does not offer` で失敗します（`src/core/expert_cache.cpp:303-311`）。
-- elastic 時は expert cache の確保・解放単位と、VRAM 再拡張時の段階を変えます。縮小で cache から外れた expert は CPU miss として処理され、他のモデル重みや KV 等すべての VRAM が返却されるわけではありません（`src/program/generate.cpp:11197-11204`, `include/strata/core/expert_cache.hpp:117-123`）。
-- 正の大きな値に対する MiB からバイトへのシフトや driver の上限について、CLI parser 側に明示的な範囲検証はありません。上限値はソースから確認できないため、ここでは保証しません（`src/program/generate.cpp:2605`, `src/program/generate.cpp:6297`）。
+- 効果には `--vram-elastic` も必要。`--vram-segment-mib` だけを指定した場合、この値は cache の割当に使われない。
+- elastic は `--serve` 用で、通常の非 serve 実行では有効化されず警告を出して無効化される。helper cache が他 GPU にある場合も同様。
+- 現行 root parser は HIP build では elastic を NVIDIA 専用として無効化する。CUDA 側でも GPU/driver が virtual memory management を提供しない場合は ExpertCache の open が失敗する。
+- cache の segment を縮小すると、解放範囲に入る resident expert は追い出され CPU miss になる。再拡張は空 slot から始まり、driver が追加 VRAM を確保できなければ grow が失敗する。アドレス範囲は保持される。
+- SYCL 側にも同名 parser があるが、索引上の `strata-engine` root scope は `engine/src/program/generate.cpp`。SYCL parser の elastic 条件は layer split を無効化理由に含み、CUDA root と条件が異なる。SYCL 実行時の segment allocator 挙動はこの調査では確定していないため、CUDA root の説明をそのまま適用しないこと。
 
 ## 出力とエラー
 
-値が 64 MiB 未満のときの警告付き無効化は上記の通りです。CUDA VMM 非対応や segmented cache の確保失敗は、初期化先でエラー文字列となります。初期 segment を map できない場合は `ExpertCache: cudaMalloc failed: segment ... of the segmented cache could not be allocated` を返します（`src/core/expert_cache.cpp:333-342`）。cache 確保が最終的に失敗すると `strata generate: <エラー>` を stderr に出して終了コード `1` で終了します（`src/program/generate.cpp:6362-6390`）。これらは `--vram-segment-mib` 固有の parser 拒否ではありません。
-
-未知の引数は `unknown argument: ...` を stderr に出し、usage を表示して終了コード `2` になります（`src/program/generate.cpp:2786-2793`）。
+- 値が不足すると `--vram-segment-mib needs a value` を stderr に出して exit code 2。
+- `--vram-elastic` と併用して serve でない、helper cache がある、または値が 64 MiB 未満の場合、`strata generate: --vram-elastic is off: ...` を stderr に出し、elastic をオフにして続行する。
+- CUDA driver の VMM 非対応、segment の予約・割当失敗などは cache open エラーになる。具体的な起動結果は GPU、driver、空き VRAM に依存する。
 
 ## 根拠
 
-- 索引上の位置と scope: `docs/cli/README.md:1128-1136`, `docs/cli/README.md:1307-1310`。`strata-engine` のルート引数 parser は `src/program/generate.cpp` と説明されています。
-- 既定値・help の説明: `src/program/generate.cpp:613-616`, `src/program/generate.cpp:907-909`。
-- parser と不足値の処理: `src/program/generate.cpp:2416-2420`, `src/program/generate.cpp:2604-2605`。
-- elastic の条件、値の設定と警告: `src/program/generate.cpp:6282-6298`。
-- segmented cache の CUDA VMM 要件と実割当: `src/core/expert_cache.cpp:297-345`, `src/program/generate.cpp:6362-6390`。
-- resize が扱うセグメントと cache の制約: `include/strata/core/expert_cache.hpp:117-146`, `src/core/expert_cache.cpp:384-445`, `src/program/generate.cpp:11197-11245`。
+- `docs/cli/README.md:1036-1042,1229-1233` — `strata-engine` root scope と対象リンク。
+- `engine/src/program/generate.cpp:964-968` — elastic の用途、segment 既定値。
+- `engine/src/program/generate.cpp:4036-4038` — parser と整数変換。
+- `engine/src/program/generate.cpp:3842-3847` — 値不足時の stderr と exit code。
+- `engine/src/program/generate.cpp:9575-9591` — serve/helper-cache/下限/NVIDIA 条件、警告、MiB から bytes への変換。
+- `engine/include/strata/core/expert_cache.hpp:119-148` — segmented arena、shrink/grow と slot の契約。
+- `engine/src/core/expert_cache.cpp:415-464` — CUDA VMM 対応確認、粒度への切り上げ、segment の予約と map、割当失敗。
+- `engine/src/core/expert_cache.cpp:503-575` — shrink/grow の失敗経路と live slot 更新。
+- `terminal/serve/server.py:3751-3757` — server 設定から CLI 引数への追加条件。
+- `terminal/serve/server.py:1284-1307,4991-5005` — VRAM resize の request 間動作と server 側の拒否条件。
+- `engine/sycl/src/program/generate.cpp:2032-2034,5050-5067` — 同名 parser と SYCL 側の有効化条件。
 
-調査範囲は上記 commit の checkout にある parser、cache 実装、索引です。実バイナリの `--help`、Release artifact、各 GPU/driver での実行結果は確認していません。
+調査制約: 安全に使える同一 revision の既存 engine binary を確認していないため `--help` は実行していない。性能や特定 GPU/driver での segment 粒度・resize 成功率は測定していない。

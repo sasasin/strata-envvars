@@ -1,46 +1,41 @@
 # `STRATA_REMOTE_ZEROCOPY`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-remote expert cache を使う GPU が入力 activation と出力行を pinned host staging buffer から直接読み書きする経路を選びます。通常の経路では入力を GPU buffer に転送し、計算後の出力行を host staging buffer に戻します。この環境変数を unset にした場合はゼロコピー経路を試みますが、host pointer の GPU 側 alias を取得できなければ通常のコピー経路に戻ります。
-
-対象の読み取りは CUDA 実装と SYCL 実装の `RemoteExperts::open()` にあります。`--expert-cache-device1`（必要なら device2/3 も）で remote expert cache を作る実行経路でのみ読み取られます。primary GPU だけを使う実行ではこのコードに到達しません。
+helper GPU の remote expert 処理で、入力と計算結果の pinned host buffer を GPU が直接参照する zero-copy 経路を選ぶ。`0` で始まる値を指定するとこの経路を使わず、通常の host-to-device / device-to-host コピーを行う。対象コードは CUDA/HIP 共用実装と SYCL 実装の `RemoteExperts::open`、`begin` である。helper GPU の remote expert cache を使わない実行では読み取り箇所に到達せず、この変数は作用しない（`engine/src/core/remote_experts.cpp:136-139,233-238`; `engine/sycl/src/core/remote_experts.cpp:136-139,312-317`）。
 
 ## 値と判定
 
-値全体の parse はせず、先頭文字だけを見ます。大文字小文字、空白、数値としての妥当性は検査されません。
+両実装とも `std::getenv` で文字列を読み、値全体の parse はせず、設定値の先頭文字が `'0'` かだけを見る。未設定、空文字、先頭が `0` でない値は候補として ON。文字列の大文字小文字、数値としての妥当性、後続文字は検査しない。
 
-| 値 | 判定 |
-|---|---|
-| unset | ゼロコピーを試す |
-| 空文字 | ゼロコピーを試す |
-| 先頭文字が `0`（例: `0`, `0abc`） | ゼロコピーを無効にする |
-| それ以外（例: `1`, `true`, `false`, `-1`） | ゼロコピーを試す |
+| 実装・追加条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP 共用実装。さらに CUDA では pinned buffer の device pointer 取得が両 buffer とも成功すること | zero-copy を試す | 空文字、`1`、`true`、` 0`、`false`、先頭が `0` でない文字列 | `0`、`0anything`。また CUDA でどちらかの `cudaHostGetDevicePointer` が失敗した場合 |
+| SYCL 実装 | zero-copy を試す | 空文字、`1`、`true`、先頭が `0` でない任意の文字列 | `0`、`0anything` |
 
-「試す」場合、CUDA では `cudaHostGetDevicePointer()` が入力・出力 staging buffer の両方で成功したときだけ有効です。片方でも失敗すると通常のコピー経路を使います。SYCL 側では staging buffer のポインタをデバイスから使うポインタに割り当て、両方の `DPCT_CHECK_ERROR` が成功した場合に有効になります。
+`0` の判定は `zc && zc[0] == '0'` なので、空文字は設定済みでも無効化せず、`0.5` や `0anything` は無効化する一方、` 0` や `false` は無効化しない。CUDA/HIP 共用実装では判定後に `cudaHostGetDevicePointer` の成否も必要で、失敗時は `zero_copy_` が false になりコピー経路に戻る。SYCL 実装では `z_x_` と `z_out_` に pinned host buffer のアドレスを設定し、変数が先頭 `0` でなければそのポインター経路を選ぶ（`engine/src/core/remote_experts.cpp:233-239`; `engine/sycl/src/core/remote_experts.cpp:312-317`）。
 
 ## 有効になる条件
 
-- remote expert cache が実際に設定され、その `RemoteExperts::open()` が実行される必要があります。生成コードは `--expert-cache-device1..3` の正の slot 数について helper を開きます。remote expert cache 自体にも、profile、CUDA0 expert cache、expert pool などの前提条件があります。
-- `STRATA_REMOTE_ZEROCOPY` が先頭 `0` でなくても、staging buffer の GPU 側 pointer を取得できなければ機能しません。この失敗による専用ログはありません。
-- CUDA の `--remote-expert-opt` 経路では、入力のゼロコピーは維持されますが、出力行は reduction 用 GPU buffer `d_out_` に書かれるため、出力の host への転送は別経路です。`--remote-expert-opt` は `--serve` が必要です。
-- SYCL 側の同名コードでも環境変数を読み、host staging pointer を直接使う経路を持ちます。CUDA API の `cudaHostGetDevicePointer` を使う CUDA 実装とは pointer 準備が異なります。
+- 起動引数で helper remote expert cache を 1 つ以上有効にし、`RemoteExperts::open` が呼ばれること。通常の CUDA0 単独実行や `--peer-device` だけの経路では、この環境変数を読むコードを通らない（`engine/src/program/generate.cpp:10123-10130,10197-10207`; `docs/SECOND_GPU.md:11-20,28-48,70-74`）。
+- CUDA/HIP 共用実装では helper device に pinned host buffer を確保し、CUDA の場合は入力・出力両 buffer の device pointer 取得に成功すること。取得失敗は機能を無効にしてコピー経路へ戻る（`engine/src/core/remote_experts.cpp:211-239`）。
+- SYCL では remote experts の SYCL 実装が使われること。そこで `STRATA_REMOTE_ZEROCOPY` 以外の環境変数や CLI フラグを使った追加の zero-copy 判定はない（`engine/sycl/src/core/remote_experts.cpp:312-317`）。
+- `--remote-expert-opt` が有効な CUDA remote expert 処理では、zero-copy の入力側は引き続き使われる。CUDA の通常出力先は `reduce` 時に `d_out_` となり、結果集約は `RemoteExpertOpt::reduce` に進む。SYCL のこの箇所には同じ `reduce` 分岐がないため、出力条件は異なる（`engine/src/core/remote_experts.cpp:320-348`; `engine/src/core/remote_expert_opt.cu:100-112`; `engine/sycl/src/core/remote_experts.cpp:431-452`）。
 
 ## 実行時の詳細
 
-環境変数は各 `RemoteExperts::open()` の staging buffer 確保後に読み取られ、`zero_copy_` に保存されます。同じ helper の実行中に環境を書き換えても再評価されません。別の helper を開く場合にはその `open()` で再び読み取ります。
+値は `RemoteExperts::open` の初期化中に通常の局所変数として一度読み、`zero_copy_` に保存される。CUDA/HIP 共用実装では各 helper の `open` ごと、SYCL でも同様に初期化時に評価する。関数内 static cache やリクエストごとの再読込はないので、プロセス実行中に環境を変更しても既に開いた helper には反映されず、再初期化が必要となる（`engine/src/core/remote_experts.cpp:136-139,233-239`; `engine/sycl/src/core/remote_experts.cpp:312-317`）。
 
-`begin()` は、入力 `x` をまず pinned host の `h_x_` に CPU memcpy します。ゼロコピーが有効なら CUDA では `z_x_`（SYCL では `z_x_`）を量子化 kernel に渡し、通常経路なら `h_x_` から `d_x_` への転送後に `d_x_` を渡します。ゼロコピーでは grouped expert kernel の出力先も pinned `h_out_` にできます。`finish()` は stream/queue の完了を待ってから、該当する compact 行を呼び出し元の出力へ CPU memcpy します。
+`begin` は入力を pinned host buffer にコピーした後、zero-copy が無効なら入力を device buffer に転送する。zero-copy が有効なら CUDA/HIP 共用実装は `z_x_`、SYCL は `z_x_` を量子化処理に渡す。計算結果は通常、zero-copy 無効時に device buffer から pinned host buffer にコピーされ、zero-copy 有効時はホスト側の出力 buffer を出力先に選ぶ。CUDA の `--remote-expert-opt` 有効時はその出力先選択に例外がある（`engine/src/core/remote_experts.cpp:311-354`; `engine/sycl/src/core/remote_experts.cpp:400-452`）。
 
-通常経路への fallback 時に警告ログは出しません。`STRATA_REMOTE_ZEROCOPY=0` は明示的に通常経路を選びます。コードにはこの切り替えによる速度や token 結果の測定値はありません。
+CUDA で zero-copy を選べなかった場合、あるいは環境変数で無効化した場合に行う通常コピーの失敗は、`copy input` または `copy results` と CUDA エラー文字列を含む `err` になる。呼び出し側は `strata generate: <err>` を stderr に出して終了コード 1 を返す。zero-copy を使わないこと自体を知らせるログはなく、CUDA のポインター取得失敗後は `cudaGetLastError()` でエラー状態を読み捨てる。初期化成功時には helper のスロット数・GiB と「results return through pinned host rows」を stderr に出すが、このログは zero-copy の成否を示さない（`engine/src/core/remote_experts.cpp:235-239`; `engine/src/program/generate.cpp:10197-10207`）。SYCL の API エラーは `check` の `err` 経路のほか、捕捉された `sycl::exception` について例外文字列とファイル・行を stderr に出して `exit(1)` する（`engine/sycl/src/core/remote_experts.cpp:346-350,458-461`）。
 
 ## 根拠
 
-- `src/core/remote_experts.cpp:195-221`: pinned staging buffer の確保後に環境変数を読み、CUDA host alias の取得結果を含めて `zero_copy_` を設定。
-- `src/core/remote_experts.cpp:292-345`: 入力 staging、通常経路の入力・出力転送、量子化と grouped kernel の buffer 選択、完了待ちと compact 行の取り出し。reduction 有効時の出力先選択も含む。
-- `sycl/src/core/remote_experts.cpp:256-315,392-469`: SYCL staging allocation、環境変数判定、入力・出力 pointer の選択と fallback 転送。
-- `src/program/generate.cpp:5431-5435,5501-5511`: remote cache の前提条件と正の remote slot 設定ごとの `RemoteExperts::open()` 呼び出し。
-- `src/program/generate.cpp:2641-2643`: `--remote-expert-opt` が `--serve` を要求する検証。
-- `docs/SECOND_GPU.md:3-8,18-22,87-100`: helper GPU、pinned host buffer、remote expert optimization の利用説明。環境変数の値判定と pointer fallback はソース実装に基づいて記載。
+- `engine/src/core/remote_experts.cpp:136-139,211-239,311-358` — helper 初期化時の環境値判定、CUDA/HIP 共用経路でのポインター取得、入力・出力コピーの分岐。
+- `engine/sycl/src/core/remote_experts.cpp:136-139,312-317,400-452` — SYCL 実装の判定と入出力経路。
+- `engine/src/program/generate.cpp:10123-10130,10197-10207` — helper cache 条件、初期化、失敗・起動ログ。
+- `engine/src/core/remote_expert_opt.cu:100-112` — CUDA の remote expert 最適化における出力集約。
+- `docs/SECOND_GPU.md:11-20,28-48,56-74` — remote helper の利用条件。

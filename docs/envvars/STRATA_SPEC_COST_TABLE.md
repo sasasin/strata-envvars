@@ -1,50 +1,52 @@
 # `STRATA_SPEC_COST_TABLE`
 
-調査対象: Strata `main` の HEAD `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`STRATA_SPEC_COST=1` で使う speculative decoding の `DraftPolicy` に、window 幅ごとの初期実測コスト（ミリ秒/round）を与えます。コンテキスト長に応じた3区分それぞれに、window の行数 T1〜T8 のコストを渡せます。ポリシーはこの値を初期値として使い、処理中に観測した round 時間で更新します。
+`strata generate` の speculative decoding で、コストを考慮した MTP 検証幅選択に初期コスト表を与える値です。`STRATA_SPEC_COST=1` のときに限り、表の値を `DraftPolicy` に投入します。幅選択のコスト推定を始める材料であり、候補 token の生成や検証そのものを置き換える値ではありません（`engine/src/program/generate.cpp:24871-24897`、`engine/include/strata/spec/draft_policy.hpp:196-201,287-301`）。
 
-本番コード上の読み取り箇所は `src/program/generate.cpp` の単発生成ループです。serve の要求処理ループにも `STRATA_SPEC_COST` のポリシーはありますが、`STRATA_SPEC_COST_TABLE` を読む処理はありません。
+読み取り箇所は `engine/src/program/generate.cpp:24875` の 1 箇所です。永続 serve ループにも `STRATA_SPEC_COST` の判定はありますが、そこではこの表を読みません（同ファイル `16411-16429`）。したがって、この変数はその serve ループに初期表を渡しません。
 
 ## 値と判定
 
-| 値 | 扱い |
-|---|---|
-| 未設定、空文字 | 表を読み込まない。 |
-| 非空文字列 | `STRATA_SPEC_COST` が有効な場合だけ、カンマとセミコロンで区切って解析する。 |
-| `STRATA_SPEC_COST` が無効 | この変数が設定済みでも表は無視される。 |
+値全体を検証する parser はなく、カンマ区切りを `std::atof` で数値化します。セミコロンで最大 3 個の context bucket のリストに分けます。各リストの先頭から最大 16 個が読み取られ、位置 1 の値は T1、位置 2 は T2 の窓コストとして扱われます（`engine/src/program/generate.cpp:24875-24888`、`engine/include/strata/spec/draft_policy.hpp:152-155`）。
 
-表の形式は `T1,T2,...;T1,T2,...;T1,...` です。セミコロンで区切った各リストが、順にコンテキスト `<6K`、`<24K`、`>=24K` のコストになります。各リストの値は T1 から順に最大8個まで読みます。3リストを超える部分は処理しません。最後のリストはセミコロンがなくても終端で確定します。
+| 条件 | unset / 空文字 | 有効になる値（例） | 無効・無視される値（例） |
+|---|---|---|---|
+| `STRATA_SPEC_COST` が有効 | unset または空文字は表を parse / 投入しない | `1.2,2.4,3.1`、`1,2;1.1,2.2;1.3,2.5` | `0,0,-2,abc` は各要素が正数でないためコストとして登録されない |
+| `STRATA_SPEC_COST` が無効 | unset / 空文字を含め、表は利用されない | なし | `STRATA_SPEC_COST_TABLE` が非空でも、環境値は取得するが内容は parse / 登録しない |
 
-各フィールドは `std::atof` で変換されます。文字列全体が数値であることは検証されず、先頭の数値部分が変換対象です（例: `12ms` は 12、数値に変換できない文字列は 0）。`atof` が返した値が `> 0.0` の場合だけ初期コストとして登録されます。0、負値、数値に変換できないフィールドは登録されませんが、フィールド位置は消費するため、後続値が前の T 番号へ詰め直されることはありません。空フィールドも0相当です。
+`STRATA_SPEC_COST` 自体は文字列の先頭 1 文字が `'1'` かで判定されます。`1`, `10`, `1anything` は有効、`0`, `true`, ` 1`, 空文字、未設定は無効です（`engine/src/program/generate.cpp:16419,24827`）。ただし CUDA の全可視 GPU が同一の compute capability 12.1 で、`STRATA_SM121_PERF` が先頭 `'0'` でなく、`STRATA_DEFAULTS=026` による既定無効化もない場合は、起動時に Strata が未設定の `STRATA_SPEC_COST=1` を設定します。ユーザーが空文字を含む何らかの値を設定済みならその値が優先されます（`engine/src/program/generate.cpp:4425-4449`、`engine/src/core/nv_defaults.cpp:15-18,176-205,222-233`）。
 
-`STRATA_SPEC_COST` 自体は unset で無効、設定値の先頭文字が `1` なら有効です。そのため `1`, `10`, `1anything` は有効、空文字、`0`, `true`, `01` は無効です。文字列全体の比較ではありません。
+表の値は `atof` の変換結果が `> 0.0` の場合だけ採用されます。従って `2.5junk` や前後に空白のある数値は数値 prefix が変換され、`abc`・`0`・負数・NaN は採用されません。正の値に上限・有限値チェックはありません。欠けた項目は登録されず、空の要素は `atof` が 0 とするためその幅のコストとして登録されませんが、要素位置は消費します（例: `1,,3` の `3` は T3）。カンマ後に終端した末尾の未完了リストは `seed_costs` に渡されません。4 個目以降の bucket と各 bucket の 17 個目以降は処理されません（`engine/src/program/generate.cpp:24879-24888`、`engine/src/spec/draft_policy.cpp:521-528`）。
+
+各非空リストは `seed_costs(..., 6.0, bucket)` に渡されます。各正数はその窓幅のコストとして 6 サンプル分の重みで初期化され、実測コストが既にある幅は上書きしない実装です（この CLI 経路では新しい `DraftPolicy` を作ってから投入します）（`engine/src/program/generate.cpp:24871-24888`、`engine/src/spec/draft_policy.cpp:521-528`）。
 
 ## 有効になる条件
 
-- `STRATA_SPEC_COST` の判定が有効であること。これが無効なら表は読み込まれません。
-- 表の解析コードがある単発生成ループを通ること。serve の要求処理ループではこの表は読み取られません。
-- 初期値が選択判断に影響するのは、`DraftPolicy` が該当の speculative window 選択に使われる場合です。cost-aware な MTP draft chain の設定は `use_mtp` の場合に限られます。
+- speculative decoding のループに入る必要があります。`--spec` が 0 などで `spec_loop_runs(...)` が偽なら、この表を読む位置まで進みません（`engine/src/program/generate.cpp:24459-24489`）。
+- 同じ実行経路で `STRATA_SPEC_COST` 判定が有効で、かつ `STRATA_SPEC_COST_TABLE` が未設定でなく空文字でもない必要があります（`engine/src/program/generate.cpp:24875-24890`）。
+- `--spec` と `--mtp-max-t` が実際の上限を定めます。MTP の上限 `S_mtp` は `--mtp-max-t` が正なら `min(--mtp-max-t, --spec)`、それ以外は `--spec` です。コスト表によりこの上限を越える窓が選ばれることはありません（`engine/src/program/generate.cpp:24836-24845,24868-24897`）。
+- MTP が読み込まれていない場合、MTP の逐次 draft chain に対する `keep_draft` callback は登録されず、この変数の「MTP draft を追加するか」という作用はありません（`engine/src/program/generate.cpp:24507-24511,24890-24896`）。
+- serve ループでは `STRATA_SPEC_COST` によるコスト幅ルール自体は設定されますが、`STRATA_SPEC_COST_TABLE` の読み取り・seed はありません。表を設定しても serve 用 `DraftPolicy` には渡りません（`engine/src/program/generate.cpp:16411-16429` と `24871-24890`）。
 
 ## 実行時の詳細
 
-環境変数は単発生成ループで `DraftPolicy` を作った後に読み取られます。プロセス起動後に環境変数を変更する実装はなく、この読み取り後に値を書き換えても、その `DraftPolicy` には反映されません。
+CLI の speculative decoding 部分で `DraftPolicy` を新規作成した後、環境値を一度走査して表を seed します。その後 `policy.set_robust(spec_cost)` と `mtp.set_chain_rule(...)` を設定し、各 MTP draft の確率を `keep_draft` に渡します。policy はコスト表と draft の受理率推定から次の検証窓の候補を比較し、最良幅を選んで追加 draft を続けるかを決めます（`engine/src/program/generate.cpp:24871-24897,25030-25040`、`engine/src/spec/draft_policy.cpp:975-1000`）。
 
-各セミコロン区切りリストを `seed_costs` に渡す際、重みは6です。`DraftPolicy` は正の値だけを、まだ値のない T 幅の初期コストとして登録します。以後、各幅の測定 round 時間が観測されるとコスト値が更新されます。cost-aware モードでは初回利用幅の graph capture 等による突出時間をそのままコストにしない処理もあります。
+context bucket は `< 6000`、`6000..23999`、`>= 24000` の位置区分です。該当 bucket に値がなければ、`set_context` が近い bucket のコストを重み 1 でコピーします。表にない幅のコストは既知幅からスケールした推定値、または組み込み形状値になります（`engine/src/spec/draft_policy.cpp:495-507,530-550`）。ここでいう「表」はプロセス間に保存される設定ファイルではなく、この `DraftPolicy` インスタンスに初期値を渡すものです。
 
-次の window の開始位置に応じて、ポリシーは `<6000`、`6000〜23999`、`24000以上` の区分を選びます。選択区分に初期コストが1つもない場合は、距離の近い区分から既知コストをコピーして初期推定にします。未測定の幅のコストは、同じ区分の既知幅から幅の形状比を使って推定されます。実測が得られた幅は、その後のコスト判断に使われます。
+表の読み取り後にプロセス環境を変更しても、この policy の初期値は再読込されません。表に関する個別の警告・エラー経路はなく、無効な要素は `seed_costs` の正数条件で登録されません（`engine/src/program/generate.cpp:24875-24890`、`engine/src/spec/draft_policy.cpp:521-528`）。
 
-`STRATA_SPEC_COST` が有効な単発生成では、終了時に stdout へ `spec cost table` として各区分・幅のコストおよびサンプル数を出力します。表の解析失敗を示す専用エラーや警告はありません。serve 側では `STRATA_SPEC_COST` を参照する別のポリシー経路がありますが、`STRATA_SPEC_COST_TABLE` の値は渡されず、終了時の同じ表出力もありません。
+## ログと測定値
+
+`STRATA_SPEC_COST` が有効な `strata generate` は処理後に stdout へ `spec cost table` と `policy.cost_table_text()` の結果を出します。ここには各 bucket の T 幅・コスト・サンプル重みが表示されます。表の不正値について専用ログはありません（`engine/src/program/generate.cpp:25264-25279`、`engine/src/spec/draft_policy.cpp:552-568`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:16400-16402`: 単発生成ループでの `STRATA_SPEC_COST` 判定。
-- `src/program/generate.cpp:16429-16448`: 表の条件付き読み取り、区切り解析、`atof`、重み6での登録、cost-aware policy への設定。
-- `src/program/generate.cpp:11178-11183`: serve の要求処理ループで `STRATA_SPEC_COST` は読むが、`STRATA_SPEC_COST_TABLE` の読み取りがない。
-- `src/program/generate.cpp:16535-16542,16745`: 単発生成でのコンテキスト別 policy 利用と、終了時の表出力。
-- `src/spec/draft_policy.cpp:41-53,55-73,76-96,98-114`: 未測定幅の推定、外れ値処理、初期値登録、コンテキスト区分と欠損区分の補完、表示形式。
-- `include/strata/spec/draft_policy.hpp:25-29,50-60`: 最大幅・区分数・API の定義。
-
-関連する説明資料に `STRATA_SPEC_COST_TABLE` の利用手順や測定値は見つからなかったため、性能上の効果は記載していません。
+- `engine/src/program/generate.cpp:24871-24897` — CLI 側での表読み取り、seed、cost rule 設定。
+- `engine/src/program/generate.cpp:16411-16429` — serve loop に表の読み取りがないこと、および `STRATA_SPEC_COST` の評価。
+- `engine/src/program/generate.cpp:4425-4449`、`engine/src/core/nv_defaults.cpp:15-18,176-205,222-233` — NVIDIA sm_121 での関連既定値とユーザー値の優先。
+- `engine/src/spec/draft_policy.cpp:495-550,521-528,552-568,975-1000` — コスト推定・bucket fallback・表の表示・幅選択。
+- `engine/include/strata/spec/draft_policy.hpp:152-155,196-206,287-301` — 表の形と cost-aware MTP rule の説明。

@@ -1,59 +1,62 @@
 # `--dump-layers`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（推論エンジン引数） |
+| コマンド | `strata`（エンジンの root 引数。通常の生成経路） |
 | オプション | `--dump-layers` |
 | 別名 | なし |
-| 値 | 出力ファイルのパス（`PATH`） |
+| 値 | 出力ファイルパス（`PATH`） |
 
 ## 役割
 
-各処理位置について、入力残差と全レイヤー処理後の残差を float32 バイナリとして保存します。層ごとに推論結果を比較し、差異の発生位置を調べる診断用オプションです。ヘルプは「各位置について全レイヤー後の R を書く」と説明しています（`src/program/generate.cpp:881-886`）。
+各処理位置について、入力残差と各層の後の残差 `R` を float32 のバイナリファイルへ順に書きます。層間のどこで参照結果と差が生じるかを調べるためのダンプです。`strata-engine` の root option であり、Qwen3.6 専用 parser の option ではありません（索引の scope は [`docs/cli/README.md`](../../README.md) の `strata-engine` 節、`000_cli_tools.md` は `engine/src/program/generate.cpp` と `qwen36/` を別 scope としています）。
 
 ## 使い方
 
 ```sh
-strata --native model.gguf --tokens 1,2,3 --dump-layers /tmp/layers.f32
+# モデルとトークン列を指定して通常の生成経路を実行し、位置ごとの層残差を保存する
+strata --native model.gguf --tokens 1,2,3 --max-new 1 --dump-layers /tmp/layers.f32
 ```
 
-`--native` と `--tokens` は通常の実行に必要な入力例です。CLI の入力形式の全体はこの文書の対象外です。
+`--native` と `--tokens` は例示用の入力です。実際のトークン列は対象モデルに合うものを指定してください。
 
 ## 値と既定値
 
-- 値は次の argv 要素から取得します。値を省略すると `--dump-layers needs a value` を stderr に出して終了コード 2 で終了します（`src/program/generate.cpp:2416-2421`）。
-- parser は文字列をそのまま保存し、形式・存在確認・空文字の拒否・重複指定の拒否を行いません。複数指定時は後の値で上書きされます（`src/program/generate.cpp:2468-2472`）。
-- 既定値は空文字で、指定しなければ dump は作成されません。空文字を明示した場合も空文字判定により出力処理は無効です（`src/program/generate.cpp:497`, `7091-7095`）。
+- `PATH` は `--dump-layers` の直後の argv 要素をそのままファイル名として受け取ります。数値形式、拡張子、空白を含むパスの追加検証はありません。引数を省略すると `--dump-layers needs a value` を stderr に出し、終了コード 2 です（`engine/src/program/generate.cpp:3842-3846,3896`）。
+- 既定値は空文字列で、未指定ならダンプを作りません。明示的に空文字列を渡した場合も、後段の `empty()` 判定により有効化されません（`engine/src/program/generate.cpp:835,10683-10687`）。
+- 同じ option を複数回指定した場合は `Options::dump_layers` に順次代入されるため、最後の値だけが使用されます。重複指定のエラーやパス検証はありません（`engine/src/program/generate.cpp:3896`）。
 
 ## 実行時の動作
 
-指定時、エンジンは `PATH` を `fopen(..., "wb")` で開きます。既存ファイルは切り詰められます。モデルの層数を `L`、`hc` をストリーム数、`n_embd` を埋め込み幅とすると、位置ごとに `(L+1) × hc × n_embd` 個の float を書きます。ヘッダーや位置番号はこの出力には付かず、位置ごとのレコードを連結します（`src/program/generate.cpp:7091-7095`, `15970-15972`, `16847-16852`）。
-
-各レコードの slot 0 は layer 0 に入る入力残差、slot `l+1` は layer `l` の後の残差です。`session_loop` が device-to-host コピーを層ごとに enqueue し、ループ末尾の同期で完了させます（`include/strata/core/session.hpp:345-353`, `src/core/session.cpp:664-674`, `758-770`）。記録有効時は pinned host staging buffer が割り当てられ、各位置の処理後にその全体をファイルへ書きます（`src/program/generate.cpp:7091-7104`, `15946-15949`, `15970-15972`）。
-
-ダンプ指定中は token graph のキャプチャ条件から外れ、通常の graph 経路で `session_loop` が呼ばれます（`src/program/generate.cpp:7406-7407`, `7471-7474`, `15938-15949`）。また fused GR の有効化条件からも除外されます（`src/program/generate.cpp:3930`）。
+- 指定パスを `fopen(..., "wb")` で開きます。既存ファイルは切り詰められます。開けない場合は `strata generate: cannot write <PATH>` を stderr に出し、終了コード 1 です。続けて `(n_layers + 1) * hc * n_embd` 個の float 用の pinned host staging buffer を確保し、確保失敗時はエラーを出して終了コード 1 です（`engine/src/program/generate.cpp:10683-10695`）。
+- 各 `session_loop` 呼び出しで、最初のスロットに層0への入力残差 `s.R` をコピーし、次のスロットから各層 `l` の処理後の残差をコピーします。1位置あたり `(n_layers + 1) * hc * n_embd` 個の float です。デバイスから staging buffer へのコピーは CUDA stream に非同期で積まれ、session loop 後に位置単位でファイルへ書かれます（`engine/src/core/session.cpp:659-668,754-765`; `engine/src/program/generate.cpp:24310-24312,24334-24335`）。
+- ファイルにヘッダーや位置番号を付ける処理はなく、`fwrite` で float 配列をそのまま追記します。従ってサイズは出力された位置数 × `(n_layers + 1) * hc * n_embd * sizeof(float)` bytes です（`engine/src/program/generate.cpp:10685,24334-24335`）。位置ごとの書き込みは通常の生成 loop で `session_loop` を通った位置が対象です。
+- ダンプ中は `--no-capture` を指定できません。併用すると `session_loop` ではなく staging buffer を埋めない `session_token` が使われるため、エラーメッセージを stderr に出して終了コード 2 で拒否されます（`engine/src/program/generate.cpp:10573-10580`）。
+- `--dump-layers` を指定すると、通常は条件が合えば使う fused GR カーネルを無効化します（`engine/src/program/generate.cpp:6112-6113`）。また、per-layer host work が必要なため、条件付き token graph の作成対象から外れます（`engine/src/program/generate.cpp:10977-10979,11069-11076`）。
+- `--serve` は別の server 処理経路です。ダンプファイルの open は serve 分岐より前にありますが、その後の `dump_layers` の参照・`session_loop` への引き渡し・位置ごとの書き込みは通常生成経路に限られます。したがって server request のダンプ用途には使えず、指定するとパスを開いて既存ファイルを切り詰める副作用だけが発生し得ます（`engine/src/program/generate.cpp:10683-10695,11884-11905,24310-24335`）。
 
 ## 適用条件と副作用
 
-- `--no-capture` と同時指定すると、`session_loop` が使われず staging buffer が埋まらないため、実行前に stderr へ理由を出し終了コード 2 で拒否します（`src/program/generate.cpp:6984-6986`）。
-- 通常実装は CUDA の pinned host buffer と GPU からの層ごとのコピーを使います。SYCL 実装も同じ出力構造で、SYCL host allocation と queue memcpy を使います（`sycl/src/program/generate.cpp:5629-5648`, `sycl/src/core/session.cpp:893-905`, `1057-1070`）。
-- `strata` が Qwen3.6-35B-A3B のモデルを検出すると、通常 parser の前に `src/qwen35` 実装へ引数ごと委譲します（`src/program/generate.cpp:2393-2407`）。`src/qwen35` 内ではこの option の parser・使用箇所を確認できなかったため、そのモデル経路での受理・動作は確認できません。別の診断用 `src/qwen35/q36ref.cu` にも同名フラグがありますが、これはエンジンの family 委譲先であることを示す根拠ではなく、本書の説明には含めません（同ファイル `:722-746`, `:790-805` は参考 CLI の実装）。
+- `session_loop` を使う captured path が対象です。`--no-capture` とは併用できません。ダンプ中のファイル出力と GPU→host copy により、通常の生成処理へ追加の I/O と転送が入ります（`engine/src/core/session.cpp:662-668,758-765`; `engine/src/program/generate.cpp:10573-10580,24334-24335`）。
+- 出力は既存ファイルを上書きします。パスの親ディレクトリは作成されません（`fopen` のみ、`engine/src/program/generate.cpp:10686-10690`）。
+- 通常完了時はファイルを閉じ、staging buffer を解放し、stdout に `layers dumped` と出力形状を表示します（`engine/src/program/generate.cpp:25383-25388`）。
 
 ## 出力とエラー
 
-- 出力先を開けない場合は `strata generate: cannot write PATH` を stderr に出し、終了コード 1 で終了します（`src/program/generate.cpp:7094-7098`）。
-- pinned staging buffer を確保できない場合は stderr に失敗理由を出し、終了コード 1 です（`src/program/generate.cpp:7100-7104`）。
-- `session_loop` 内の入力または各層のコピーが失敗するとエラー文字列を返し、呼び出し側が `strata generate: session_loop: ...` を stderr に出して終了コード 1 とします（`src/core/session.cpp:667-673`, `762-769`; `src/program/generate.cpp:15946-15949`）。
-- 終了時にファイルを閉じ、出力先・次元を stdout に表示します。`fwrite` と `fclose` の戻り値はこの dump 経路では検査されていません（`src/program/generate.cpp:15970-15972`, `16847-16852`）。
+- ファイルを開けない場合、pinned staging buffer を確保できない場合は前述のエラーで終了します（`engine/src/program/generate.cpp:10686-10695`）。
+- 各層の device-to-host copy が enqueue に失敗した場合、`session_loop` は `dump the input residual` または `dump layer <n>` を含むエラーを返し、呼び出し側は `session_loop: <error>` を stderr に出して終了コード 1 とします（`engine/src/core/session.cpp:662-668,758-765`; `engine/src/program/generate.cpp:24310-24313`）。
+- `fwrite` の戻り値と layer dump の `fclose` の戻り値は検査されていません。そのため、書き込み途中や close 時の OS エラーを CLI が検出する経路は確認できません（`engine/src/program/generate.cpp:24334-24335,25383-25388`）。
 
 ## 根拠
 
-- help 表示: `src/program/generate.cpp:881-886`
-- parser と値取得: `src/program/generate.cpp:2416-2421`, `2468-2472`
-- staging buffer とファイル open: `src/program/generate.cpp:7091-7104`
-- session loop による各位置の記録: `src/program/generate.cpp:15938-15949`, `15970-15972`; `src/core/session.cpp:664-674`, `758-770`
-- データ配置の契約: `include/strata/core/session.hpp:345-353`
-- 通常・SYCL の実装差、および family 委譲: 本文の該当箇所を参照。
+- `engine/src/program/generate.cpp:835` — option の保存先（空文字列が既定値）。
+- `engine/src/program/generate.cpp:1285-1289,3894-3898` — help の説明と parser 登録。
+- `engine/src/program/generate.cpp:6112-6113,10573-10580,10683-10695,10977-10979,11069-11076` — カーネル選択、`--no-capture` 拒否、ファイル・staging buffer の準備、token graph との相互作用。
+- `engine/src/core/session.cpp:659-668,754-765` — 入力残差および各層後残差の非同期コピー。
+- `engine/src/program/generate.cpp:24310-24313,24334-24335,25383-25388` — 通常生成 loop での session 呼び出し、位置単位の raw 出力、正常終了時の close と表示。
+- `engine/src/program/generate.cpp:11884-11905` — serve 分岐の位置。索引 `docs/cli/README.md:1036-1081,1240-1243` と `docs/cli/000_cli_tools.md:10` — tool ID と root / Qwen3.6 parser scope。
+
+調査時に Strata checkout は `## main...origin/main` と表示され、作業ツリーの変更はありませんでした。CLI は実行せず、挙動は同一 revision のソースで確認しました。

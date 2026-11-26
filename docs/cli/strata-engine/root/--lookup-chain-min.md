@@ -1,70 +1,66 @@
 # `--lookup-chain-min`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` の engine 引数（`generate` 実行経路） |
+| コマンド | `strata generate`（エンジン引数） |
 | オプション | `--lookup-chain-min` |
 | 別名 | なし |
-| 値 | 整数 `M`。照合対象にする末尾コンテキストの最小 token 数。実効値は最低 3。 |
+| 値 | `M`。整数として変換され、最小値は 3。 |
 
 ## 役割
 
-`--lookup-chain` が MTP の draft の後ろに prompt lookup draft を継ぎ足すとき、候補を採用するために必要な context match の最小長を指定します。`--lookup-chain-min` 単独では lookup chain は有効になりません。
+`--lookup-chain` が MTP のドラフト列の後ろに prompt-lookup の候補をつなぐとき、候補が基づく一致長の最低値をトークン数で指定します。一致長には未検証のドラフトも含まれます。既定値は 3 で、指定値が 3 未満なら 3 に補正されます。
 
 ## 使い方
 
 ```sh
-strata generate --pack ./pack --tokens "1,2,3" --lookup-chain 2 --lookup-chain-min 8
+strata generate --pack pack/full --tokens "1,2,3" --lookup-chain 4 --lookup-chain-min 5
 ```
 
-これは構文例です。`--pack` と token 列は実際に利用するモデル・入力に合わせてください。
+この例では lookup chain を最大 4 トークンまで試し、一致長が 5 トークン以上の候補を受け付ける設定です。トークン列は例示用です。
 
 ## 値と既定値
 
-- 既定値は `3` token です。
-- parser は次の引数を `atoi` で整数化し、`std::max(3, 値)` を設定します。したがって `3` 未満の整数（負数を含む）は `3` に補正され、3 未満を指定して lookup を無効にはできません。
-- `atoi` が数値として読めない値も `0` となり、この parser ではエラーにせず実効値 `3` になります。上限の clamp はありません。
-- 同じオプションを複数回指定した場合、走査中に値が順次代入されるため最後の指定が残ります。
-- 値を省略すると `next` が `--lookup-chain-min needs a value` を stderr に出して終了コード `2` で終了します。
+- 値は必須です。省略すると parser の共通値取得処理が `--lookup-chain-min needs a value` を標準エラーに出して終了コード 2 で終了します。
+- 既定値は 3 です。
+- parser は `std::atoi` で変換した値と 3 の大きい方を採用します。したがって `0`、負数、数値に変換できない文字列は 3 になります。完全な整数形式かどうかの検証や上限値チェックはありません。数値の後ろに文字が続く値も `atoi` の変換規則で扱われます。
+- 整数型で表現できない入力の結果は、この parser から保証できません。
 
 ## 実行時の動作
 
-値は、候補 source の提案長ではなく、その候補が根拠とする末尾 context の match 長に対する閾値です。engine は prompt lookup source と登録済みの追加 draft source を調べ、match 長がこの値以上で、これまでの候補より長い source の提案を採用します。同じ match 長なら先に調べた source が残ります。内蔵 source は request の prompt と確定済み出力を履歴に持ち、MTP draft を仮の末尾として lookup を続けます。
+オプション単独では候補生成を有効にしません。`--lookup-chain` が 0（既定値）のときは chain の提案分岐に入らず、この下限値は使われません。chain が有効な場合、MTP ドラフトを含む末尾コンテキストを使って候補を問い合わせ、`propose_from_sources` が一致長 `m` と `M` を比較し、`m < M` の候補を破棄します。条件を通った候補のうち最長一致のソースを選び、同じ長さなら先に調べたソースを維持します。候補提案数は `--lookup-chain` の値と検証ウィンドウの残り幅でも制限されます。
 
-通常の生成ループでは、`--lookup-chain > 0`、初回ではない window、suffix lookup による window 置換がないこと、そして window に余地があることが実行条件です。サーバーの batch/serve ループにも同様の条件があり、MTP が有効で、初回でなく、suffix lookup を使わず、window の空きがある場合だけ提案を求めます。提案数は `--lookup-chain` の値と空き行数の小さい方までです。採用された token は MTP の draft に続けて同じ verify window に入り、greedy 検証を通った token だけが出力に残るため、この候補 source 自体は生成内容を直接確定しません。
+通常の生成経路では、最初のウィンドウ、既に suffix lookup のウィンドウを使っている場合、またはドラフトがウィンドウを満たす場合には chain の候補問い合わせを行いません。serving 経路にも同様の条件分岐があります。候補が選ばれても、通常はドラフト policy が確率と一致長、実測コストに基づいてさらに短縮または除外できます。環境変数 `STRATA_LOOKUP_CHAIN_FIXED` が設定されている場合、少なくとも通常生成側の policy によるこの調整を迂回します。
 
-通常は `DraftPolicy::chain` が候補数をさらに絞ります。MTP の draft 確率、過去の chained draft 受理数、match 長別の受理率、および window 幅ごとの測定コストを使って、期待 token 数/時間が改善すると見込む幅を選びます。`STRATA_LOOKUP_CHAIN_FIXED` が環境に存在するとこの policy gate を迂回し、得られた提案をそのまま使用します（値の内容ではなく変数の存在を判定）。この環境変数は `--lookup-chain-min` の閾値を変更しません。
+lookup chain は検証ウィンドウに候補を足す投機的な処理です。検証で採用されたトークンだけが出力にコミットされるため、この下限値自体は出力内容を直接変更せず、採用候補数や生成処理に影響します。chain が有効な実行では、chain の候補・採用数が生成結果の統計に表示されます。
 
 ## 適用条件と副作用
 
-- `--lookup-chain` の既定値は `0`（off）です。正の値を指定しない限り、閾値は実行時の候補検索に使われません。`--lookup-chain` は parser で `0..7` に clamp されます。
-- 有効時も、初回 window、既に suffix lookup の window を選んだ場合、window の残りがない場合は chain 候補を検索しません。通常生成経路では `T < S`、サーバー経路では MTP 有効かつ `T < room` が条件です。
-- prompt lookup は通常、request の prompt と受理済み token の履歴を参照します。履歴照合および追加 source の参照が行われますが、この option 固有のファイル・ネットワーク書き込みは確認できません。
-- 検証窓の大きさは最大 8 行です。chain 用の窓サイズ調整は `--lookup-chain` の設定値を使い、`--lookup-chain-min` の数値では窓幅を変えません。
+- `strata generate` の native 実装と SYCL 実装の双方に parser と同じ既定値・下限補正があります。
+- `--lookup-chain` が有効で、ドラフト候補に空きがあり、候補の一致長がこの下限を満たす場合にだけ値が実行時の選択に影響します。
+- 大きな値は一致条件を厳しくし、候補が採用されない場合があります。ソース上、値の上限補正はありません。
+- オプションによるファイル・ネットワーク等への直接の副作用は確認できません。候補選択は検証ウィンドウの幅と処理量に影響し、生成統計に chain の件数が出ることがあります。
 
 ## 出力とエラー
 
-不足値は上記のとおり stderr と終了コード `2` になります。範囲外や非数値の値に対する個別の警告・拒否はなく、下限 3 へ補正されます。未知の引数は通常の parser 経路で `unknown argument` と usage を stderr に出して終了コード `2` になります。
-
-サーバー経路では `--lookup-chain` 有効時に `DONE` レコードへ chain accepted/offered、suffix accepted/offered、window 数が追加されます（`src/program/generate.cpp:15365-15388`）。この記録は `--lookup-chain-min` 単独の指定有無を示すものではありません。通常生成経路も chain window/draft/accepted の集計を行います（`src/program/generate.cpp:16455-16467`, `16679-16715`, `16744`）。
+- 値を省略した場合は標準エラーに不足メッセージを出し、終了コード 2 で終了します。
+- このオプションに不正値専用のエラー経路はなく、`atoi` の変換結果を 3 以上に補正します。
+- chain 有効時、通常の `strata generate` は標準出力に `lookup chain` の窓数と候補採用数を表示します。serving は標準エラーに窓数・候補数・採用数を表示します。
 
 ## 根拠
 
-- 索引上の scope と文書配置: `docs/cli/README.md:1128-1134`, `1195-1200`（`strata-engine` の root engine 引数）。索引の説明では parser の根拠を `src/program/generate.cpp` としています。
-- parser 既定値: `src/program/generate.cpp:780-784`。
-- help 表示と説明: `src/program/generate.cpp:942-944`。
-- 値の取得、整数変換、下限補正: `src/program/generate.cpp:2418-2420`, `2674-2675`。
-- 不足値と未知引数の失敗経路: `src/program/generate.cpp:2418-2420`, `2787-2793`。
-- chain window の上限調整: `src/program/generate.cpp:3212-3219`。
-- 通常生成経路の条件、閾値の適用、候補の window 追加: `src/program/generate.cpp:14904-14929`。
-- サーバー経路の条件と閾値適用: `src/program/generate.cpp:16567-16584`。
-- source 選定で match 閾値・最長 match を使う処理: `src/spec/draft_source.cpp:13-34`; interface の説明: `include/strata/spec/draft_source.hpp:29-33`, `57-60`。
-- 内蔵 prompt lookup source が MTP draft を末尾として提案する処理: `include/strata/spec/draft_source.hpp:36-52`。
-- suffix matcher の match 判定・最大 64 token の match と続きの提案: `src/spec/suffix_drafter.cpp:64-95`。
-- policy gate と `STRATA_LOOKUP_CHAIN_FIXED` の条件: `src/program/generate.cpp:14912-14917`, `16577-16581`; policy の選択: `src/spec/draft_policy.cpp:226-253`。
-- server の `DONE` レコード: `src/program/generate.cpp:15365-15388`。
-
-調査範囲は上記 commit の checkout 内ソースです。Release 配布物との照合や実機での CLI 実行は行っていません。
+- `engine/src/program/generate.cpp:1163-1167` — `--lookup-chain` と下限値の既定値・意味。
+- `engine/src/program/generate.cpp:1353-1355` — `strata generate --help` の option 説明。
+- `engine/src/program/generate.cpp:3842-3847` — 値がない場合の標準エラーと終了コード 2。
+- `engine/src/program/generate.cpp:4125-4126` — parser、`atoi` 変換、3 への下限補正。
+- `engine/src/program/generate.cpp:1036-1042` — lookup chain に渡す末尾コンテキストへ未検証ドラフトを加える処理。
+- `engine/src/spec/draft_source.cpp:13-33` — 一致長の下限判定、長い一致の優先、同長時の先行ソース優先。
+- `engine/src/program/generate.cpp:11722,22769-22786` — `STRATA_LOOKUP_CHAIN_FIXED` 判定、通常生成側の適用条件、候補数制限、policy による追加調整。
+- `engine/src/program/generate.cpp:25065-25077` — serving 側の適用条件と候補数制限。
+- `engine/src/program/generate.cpp:25167-25204` — 検証結果の一致数に応じた commit と採用統計の計上。
+- `engine/src/program/generate.cpp:14254-14256` — 通常生成時の chain 統計表示。
+- `engine/src/program/generate.cpp:13264-13266` — serving 時の chain 統計表示。
+- `engine/sycl/src/program/generate.cpp:777,922,2100,12713-12724,14075-14086` — SYCL 実装にある同等の既定値、help、parser、候補適用経路。

@@ -1,49 +1,43 @@
 # `STRATA_VERIFY_ALL_RESIDENT`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Verifier の GPU window で、検証対象 layer の全 expert が VRAM cache に常駐している場合に使う「zero-doorbell graph」を許可するか制御します。有効な場合、GPU が常駐表から実行計画を作り、CPU から layer ごとの doorbell と非常駐 expert の処理を受け取らずに window を実行します。
-
-対象の読み取りは CUDA/HIP の `src/core/verify.cpp` と SYCL 実装の `sycl/src/core/verify.cpp` にあります。Metal は `Verifier::init()` が Metal window の初期化へ戻るため、この判定箇所に到達しません。通常の native decode ではなく、Verifier の window 経路に対する設定です。
+CUDA/HIP と SYCL の verifier が、初期化時にその stage の全 expert が VRAM 常駐している場合に all-resident（zero-doorbell）graph を選ぶかどうかを制御する。未設定なら選択判定を行い、値を `atoi` で変換して 0 以外なら判定を行う。`0` と変換される値を設定するとこの経路を明示的に無効化し、通常の doorbell graph を使う。expert の VRAM 配置やモデルの重み自体は変更しない。実装は CUDA/HIP の `Verifier::init` と SYCL の `Verifier::init` にある（`engine/src/core/verify.cpp:956-958,1377-1403`、`engine/sycl/src/core/verify.cpp:624-626,897-918`）。
 
 ## 値と判定
 
-各 `Verifier::init()` で `getenv()` を読み、設定値は `std::atoi()` で整数に変換して判定します。文字列全体の厳密な数値検査はありません。
+両 backend とも `std::getenv` の結果を `std::atoi` に渡し、戻り値が 0 以外なら全 expert の常駐検査を行う。文字列全体の厳密な parse やエラー検出はしない。`atoi` は先頭の空白と符号の後の10進数部分を読み、数字がなければ 0 になるため、後続文字は無視される。
 
-| 値 | all-resident 判定 |
-|---|---|
-| 未設定 | 有効（既定） |
-| 空文字 | 無効（`atoi("")` は 0） |
-| 数値として 0 に変換される値（例 `0`, `00`, `abc`） | 無効 |
-| 数値として 0 以外に変換される値（例 `1`, `2`, `-1`, `1tail`） | 有効 |
+| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP verifier、SYCL verifier | 常駐検査を行う（既定） | `1`、`-1`、`+2`、`1x`、` 1` など、先頭の数値部分が 0 以外 | 空文字、`0`、`0anything`、`true`、`false`、`x1`、`  ` など、数値部分がないか 0 |
 
-`atoi` は先頭の空白と符号を受け付け、数字列の後ろは判定に使いません。数値に変換できない先頭なら 0 です。clamp や独自 fallback はありません。設定値は verifier ごとの初期化時に評価され、その verifier の間は環境を書き換えても再評価されません。
+大文字小文字は判定しない。`true` / `false` は真偽値として扱われず、どちらも数値部分がないため 0 になる。小数点以降や数値の後ろの文字は検証されず、たとえば `1.5` は先頭の整数部分 1 として有効。`atoi` の範囲外値について Strata は検出・処理していない。判定箇所は `engine/src/core/verify.cpp:1386-1402` と `engine/sycl/src/core/verify.cpp:904-917`。
 
 ## 有効になる条件
 
-値判定が有効でも、次の条件が必要です。
-
-- Verifier の初期化が成功し、`hits.h_res`、`hits.d_res`、`hits.cache_base` がすべて非 null である。
-- verifier の layer 範囲 `[lb_, le_)` の全 layer・全 expert について、host residency table `hits.h_res` の値が 0 以上である。
-- all-resident 用の GPU 資源確保が成功する。初期化時の確保に失敗すると `all_resident_` と device-plan の両方が無効化される。
-
-`STRATA_VERIFY_ALL_RESIDENT=0` などでこの経路を止めても、`STRATA_VERIFY_DEVICE_PLAN` が非 0 で、`always_publish_` が無効なら、layer ごとの device-plan 経路が別途選ばれる場合があります。all-resident が選ばれた場合は `device_plan_` は無効です。
+- verifier が CUDA/HIP または SYCL backend の `Verifier::init` を実行すること。CUDA/HIP ソース内の Metal 分岐は初期化の早期 return（`engine/src/core/verify.cpp:978-993`）より後に判定箇所があるため、その分岐ではこの読み取りに到達しない。SYCL 版には別の `Verifier::init` がある（`engine/sycl/src/core/verify.cpp:624-626`）。
+- `hits.h_res`、`hits.d_res`、`hits.cache_base` がすべて非 null であること。この条件を満たさない場合は変数を読み取らず、`all_resident_` は false のまま。CUDA/HIP では「no expert table on this device」の理由を dispatch note に記録する（`engine/src/core/verify.cpp:1380-1387`）。SYCL も同じポインタ条件で判定を囲む（`engine/sycl/src/core/verify.cpp:900-905`）。
+- 変換値が 0 以外（または未設定）で、stage の `[lb_, le_)` に属する全 layer・全 expert の host residency table が 0 以上であること。どれかが負なら all-resident graph を選ばない（`engine/src/core/verify.cpp:1388-1400`、`engine/sycl/src/core/verify.cpp:906-917`）。
+- CLI 引数や設定ファイルによる値の上書きは、この読み取り箇所にはない。`STRATA_VERIFY_DEVICE_PLAN`（CUDA/HIP では `STRATA_VERIFY_DEVICE_HITS` も参照）は別の device planning 経路を制御するが、`all_resident_` が true の場合はその経路を抑止する（`engine/src/core/verify.cpp:1414-1428`、`engine/sycl/src/core/verify.cpp:919-925`）。
 
 ## 実行時の詳細
 
-初期化時に layer 範囲内を走査し、いずれかの expert が residency table 上で負値（非 resident / swap 中を示す値）なら all-resident は選びません。選択されると stderr に `strata verify: window up to ... (100% VRAM resident: zero-doorbell graph)` と出ます。
+変数は `Verifier::init` の実行中、expert table のポインタ条件を満たしたときに読み取られる。関数内 static cache ではなく、その初期化ごとに `getenv` する。読み取り結果は `all_resident_` メンバーに反映されるため、初期化後にプロセス環境を書き換えても既存 verifier の選択は変わらない。stage ごとに verifier が初期化されれば、それぞれの table と環境値で判定する（`engine/src/core/verify.cpp:956-958,1380-1398`、`engine/sycl/src/core/verify.cpp:624-626,900-916`）。
 
-CUDA/HIP と SYCL の `run()` および batch 経路は各 window の前に `refresh_ar()` を呼び、同じ host residency table を再確認します。実行中に prompt loan、VRAM 縮小、swap などで対象 expert が resident でなくなれば通常の doorbell graph に切り替え、stderr に `strata verify: layers [...] have experts out of VRAM (a prompt loan, a shrink or a swap): the doorbell graph runs the windows` と出します。再び全 expert が resident になると zero-doorbell graph に戻り、その旨を stderr に出します。これらの更新は環境変数を読み直すものではなく、初期化時に all-resident が許可されていた場合だけ行われます。
+選択された graph は expert を device 上で計画し、`parts_` へ直接書き込むゼロ doorbell 経路で、CPU expert への doorbell や PCIe staging を必要としない（`engine/src/core/verify.cpp:1377-1379`、同 `:2829`）。初期化後も実行前に residency table を確認し、prompt loan・VRAM shrink・swap 等で expert が常駐でなくなれば doorbell graph へ切り替え、すべて常駐に戻れば再び zero-doorbell graph に戻す。この動的切り替えは初期化時に all-resident が選ばれた場合だけ行われる（`engine/src/core/verify.cpp:3235-3251,3836-3844`、`engine/sycl/src/core/verify.cpp:2032-2048,2391-2397`）。
 
-zero-doorbell graph が実行中に、residency table が示す状態と実際の VRAM 配置が食い違った場合は、window を失敗させ `verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)` を返す経路があります。
+## ログと測定値
+
+- CUDA/HIP は選択・不選択理由を `strata::dispatch::note` に記録する。文言は `init: all-resident graph selected (every expert of this stage is in VRAM)`、`init: all-resident graph declined: some expert is not resident (doorbell graph with CPU / PCIe experts)`、`init: all-resident graph declined: STRATA_VERIFY_ALL_RESIDENT=0`、または `init: all-resident graph declined: no expert table on this device (no cache, or no residency map)`。これは通常の stderr 直書きではなく dispatch stats の記録で、stats が有効な場合に `--stats` の出力または `STRATA_DISPATCH_REPORT` の JSON から観測できる。dispatch stats は既定で有効であり、`STRATA_DISPATCH_STATS=0...` で無効になる（`engine/src/core/verify.cpp:1383-1402`、`engine/include/strata/core/dispatch_stats.hpp:9-11,59-69,107-119`）。
+- CUDA/HIP と SYCL は初期化時に stderr へ `strata verify: window up to ... tokens, ... MiB of device buffers` を出し、all-resident が選択済みなら末尾に ` (100% VRAM resident: zero-doorbell graph)` を付ける（`engine/src/core/verify.cpp:1450-1453`、`engine/sycl/src/core/verify.cpp:995-998`）。CUDA/HIP は residency が変わって graph を切り替える際にも stderr へ `strata verify: layers [...] have experts out of VRAM (a prompt loan, a shrink or a swap): the doorbell graph runs the windows` または `strata verify: layers [...] are 100% VRAM resident again: the zero-doorbell graph` を出す（`engine/src/core/verify.cpp:3245-3251`）。
+- CUDA/HIP と SYCL の all-resident graph が実行中に非常駐 expert を検出した場合、window は `verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)` で失敗し得る（`engine/src/core/verify.cpp:4140-4144,4168-4171`、`engine/sycl/src/core/verify.cpp:2901-2904`）。この環境変数自体に専用の終了処理はない。
+- Strata の資料にこの変数の動作を裏付ける条件付き測定値は見つからなかったため、性能値は記載しない。
 
 ## 根拠
 
-- `src/core/verify.cpp:557-581,797-845`: Verifier 初期化、値の parse、全 expert の residency 確認、GPU 資源確保、初期化ログ。Metal は環境判定より前に専用 window 初期化へ戻る。
-- `sycl/src/core/verify.cpp:696-771`: SYCL の同じ初期化判定とログ。
-- `include/strata/core/verify.hpp:400-407`: all-resident 状態と per-window `ar_on()` の定義。
-- `src/core/verify.cpp:1862-1878,2235-2251,2952`: CUDA/HIP の residency 再確認と graph 切替。SYCL にも同等の `refresh_ar()` があり、`sycl/src/core/verify.cpp:1660-1676,1988-1999,3010` で確認できる。
-- `src/core/verify.cpp:3031-3054,3212-3229,2423-2426`: batch 時に host の layer service を省く処理と residency 不整合時のエラー。
-- `docs/A770_SPEED_SPEC.md:279-300`: all-resident graph の説明と SYCL の multi-GPU layer-split での制約。環境変数の parse 規則や性能測定の根拠にはしていない。
+- `engine/src/core/verify.cpp:956-958,978-993,1377-1403,1414-1428,1439-1453,2829,3235-3251,3836-3844,4140-4144,4168-4171`
+- `engine/sycl/src/core/verify.cpp:624-626,897-925,995-998,2032-2048,2391-2397,2901-2904`
+- `engine/include/strata/core/dispatch_stats.hpp:9-11,59-69,107-119`

@@ -1,40 +1,49 @@
 # `HUGGINGFACE_HUB_CACHE`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata の DFlash2 ドラフター取得処理が、Hugging Face Hub のキャッシュに既にあるピン留め済みスナップショットを探すときの候補ディレクトリの一つです。Strata はこの変数をライブラリへ転送したり、Hub のキャッシュ設定として使ったりしません。環境変数からパスを読み、対象ファイルが既に存在するかを調べます。
-
-この参照は `strata_control/drafting_fetch.py` の `_hub_snapshots()` にあります。同関数は `ensure()` がまだ DFlash2 pack を持たず、通常のファイル一覧を使うときに呼ばれます。pack が既に利用可能な場合や `ensure(..., files=...)` でファイル一覧を渡した場合は、このキャッシュ探索経路に入りません（`strata_control/drafting_fetch.py:76-85,144-160`）。
+Strata の Terminal が DFlash2 の元ファイルを準備するとき、既にある Hugging Face Hub のキャッシュを探す場所の一つとして読み取る。また、利用者自身の GGUF の隣に Strata 用データを置いてよいか判定するとき、そのパスを Hugging Face キャッシュとして扱う根拠にもする。どちらもキャッシュを読み取り専用で調べる処理であり、この変数はダウンロード先や Strata のデータフォルダーを直接指定しない。読み取りは `terminal/strata_control/drafting_fetch.py` の `_hub_snapshots()` と `terminal/strata_control/discovery.py` の `in_hf_cache()` にある。 (`terminal/strata_control/drafting_fetch.py:121-130`, `terminal/strata_control/discovery.py:455-479`)
 
 ## 値と判定
 
-| 状態 | Strata の処理 |
-|---|---|
-| 未設定 | この変数からキャッシュ root を追加しない。 |
-| 空文字 | `os.environ.get(name)` が偽となるため、未設定と同じく追加しない。 |
-| 空でない値 | 値全体を `Path` に渡し、そのディレクトリを root に追加する。数値変換、trim、値域検証はしない。 |
+`os.environ.get("HUGGINGFACE_HUB_CACHE")` で値を取得する。`drafting_fetch._hub_snapshots()` では値が truthy の場合だけ `Path(value)` を検索 root に追加し、`discovery.in_hf_cache()` も falsey 値を飛ばす。空文字と未設定は同じく root として使われない。`"0"`、`"false"`、空白だけの文字列なども特別な真偽値・数値として parse せず、空でなければパス文字列として扱う。文字列の trim、存在確認、絶対パス化の明示的な処理は `_hub_snapshots()` にはない。`in_hf_cache()` 側は `expanduser()` と `resolve()` を試みる。 (`terminal/strata_control/drafting_fetch.py:123-130`, `terminal/strata_control/discovery.py:459-479`)
 
-空白だけの値も空でないため root として追加されます。相対パス、`~` を含む文字列、環境変数参照文字列の展開処理はこの箇所にありません。root の下に `models--incoai--Qwen3.8-Flash-Next-DFlash2/snapshots/<revision>` を組み立て、その snapshot 内の pinned ファイルを探します（`strata_control/drafting_fetch.py:76-85`）。
+| 条件 | 未設定・空文字 | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| DFlash2 の通常 fetch (`files is None`) | この root は追加されない | 空でないパス。例: `/mnt/hf/hub`、`0`、`false` | 空文字。`0` や `false` は無効値ではなく、その名前のパスとして検索される |
+| モデル隣接フォルダーの判定 | この root との包含関係は判定しない | 空でないパス。`expanduser()` と `resolve()` 後に調べる | 空文字。root 判定には使わない |
+
+`HF_HUB_CACHE` と `HUGGINGFACE_HUB_CACHE` は同じ順序付き root リストに別々に追加され、片方が他方を上書きしない。さらに `HF_HOME/hub` と標準の `~/.cache/huggingface/hub`（隣接フォルダー判定では `HF_HOME` 自体と `~/.cache/huggingface`）も候補になる。値の優先設定ではなく、複数 root の順次検索・照合である。 (`terminal/strata_control/drafting_fetch.py:123-130`, `terminal/strata_control/discovery.py:467-479`)
 
 ## 有効になる条件
 
-- DFlash2 pack がまだ ready でなく、`ensure()` が通常の `drafting.FILES` を使う場合に探索します（`strata_control/drafting_fetch.py:149-160`）。
-- `files` 引数が指定されている呼び出しでは Hugging Face cache roots を探索しません（`strata_control/drafting_fetch.py:159-160`）。
-- 変数が空でない場合でも、組み立てた pinned snapshot 配下に必要なファイルがなければ再利用されません。各ファイルは通常のローカル `src` を先に、次にキャッシュ root の順で探し、存在・サイズ・SHA-256 が pinned 値と一致したものだけを採用します（`strata_control/drafting_fetch.py:88-100,159-160`）。
-- 複数の root を同時に調べます。root の順序は `HF_HUB_CACHE`、`HUGGINGFACE_HUB_CACHE`、`HF_HOME/hub`、`~/.cache/huggingface/hub` です。したがって `HUGGINGFACE_HUB_CACHE` は専用の上書き優先設定ではなく、`HF_HUB_CACHE` の後に試す追加候補です（`strata_control/drafting_fetch.py:78-85`）。
+- DFlash2 の stock drafter が必要で、Strata の pack がまだ準備されていない場合に、`ensure()` が通常の固定ファイル一覧で呼ばれること。テスト用の `files` を明示した呼び出しでは Hugging Face cache の探索を行わない。 (`terminal/strata_control/drafting_fetch.py:376-392`)
+- cache 内の対象は `drafting.REPO` と `drafting.REVISION` の snapshot ディレクトリーに限られる。各ファイルは存在に加え、固定サイズと SHA-256 が一致しなければ採用されない。条件不一致や `OSError` は候補不在として扱われ、別 root または通常ダウンロードへ進む。 (`terminal/strata_control/drafting_fetch.py:121-145`)
+- 対象ファイルが揃わずネットワークにも到達できない場合は `OfflineError` になる。DFlash2 の準備自体は `strata drafting fetch`、Load（launch）、setup 経路から呼ばれる。Launch では DFlash2 が必要な場合だけ fetch を行い、失敗しても起動を止めず、MTP または drafter なしで続ける。 (`terminal/strata_control/drafting_fetch.py:388-396`, `terminal/strata_cli/drafting_cmd.py:281-301`, `terminal/strata_cli/launch/runner.py:2115-2129`, `terminal/strata_cli/launch/runner.py:2140-2158`, `terminal/setup.py:9079-9080`)
+- 隣接データフォルダー判定では、GGUF のそばに推定したフォルダーまたはその `models` がこの root 内にあると、その場所を Strata の書き込み先として使わない。`models--` で始まるパス要素を含む場合も cache と判定する。この関数はモデル隣接の保存先を選ぶ Terminal の app / launch から呼ばれる。 (`terminal/strata_control/discovery.py:455-479`, `terminal/strata_control/discovery.py:484-497`, `terminal/strata_cli/launch/app.py:311-326`, `terminal/strata_cli/launch/runner.py:1514-1525`)
 
 ## 実行時の詳細
 
-`_hub_snapshots()` は呼び出しのたびに `os.environ` を読み、結果をキャッシュしません。`ensure()` で pack が未準備なら、まず `data_dir` 内の `src` を候補にし、その後にこの関数が返す snapshot paths を追加して `_present()` に渡します。ファイルごとに候補を順番に確認し、サイズと SHA-256 が pinned 値に一致した最初のものを再利用します。キャッシュ内のファイルを変更・削除する処理はこの探索にありません。必要ファイルの一部しか見つからず、オンライン確認にも失敗する場合は `DraftingError` を送出します（`strata_control/drafting_fetch.py:88-100,159-163`）。
+`_hub_snapshots()` は呼び出し時に環境を読み、各設定 root の下に `models--<org>--<repo>/snapshots/<pinned revision>` を組み立てる。探索順は、まず `ensure()` が渡す `<data>/dflash2/src`、次に `HF_HUB_CACHE`、`HUGGINGFACE_HUB_CACHE`、`HF_HOME/hub`、最後に標準 cache である。ファイルごとに最初にサイズとハッシュが合ったものを採用する。両方の環境変数が設定されていても両 root を調べる。 (`terminal/strata_control/drafting_fetch.py:121-145`, `terminal/strata_control/drafting_fetch.py:389-405`)
 
-この変数によるログ出力や独自の無効値エラーはありません。値が空ならこの変数由来の root は追加されず、その root が存在しない、または pinned snapshot が見つからない場合はこの候補からファイルを再利用しません。他の root も含めて必要なファイルが揃わなければ通常の取得手順へ進みます。実際の通信・pack 作成はキャッシュ探索の後段です（`strata_control/drafting_fetch.py:159-195`）。
+見つけた元ファイルは packer への入力に使われるが、cache 内のファイルは削除・移動されない。後片付けで削除するのは Strata 自身の `src` に置いたファイルだけである。作成される pack は Strata の data directory 配下に置かれる。変数値は関数呼び出しのたびに `os.environ` から参照され、Strata 側に static cache はない。 (`terminal/strata_control/drafting_fetch.py:392-420`, `terminal/strata_control/drafting_fetch.py:432-440`)
+
+この探索は stock drafter の取得経路だけにある。既に pack があれば `ensure()` は早期 return する。モデルに合う tuned drafter の取得関数 `ensure_tuned()` は Hugging Face cache を検索せず、tuned 版が得られないとき stock 版へ fallback する経路では上記探索が行われる。 (`terminal/strata_control/drafting_fetch.py:294-320`, `terminal/strata_control/drafting_fetch.py:349-392`)
+
+隣接フォルダー判定では、`HUGGINGFACE_HUB_CACHE` を含む cache root に GGUF の推定データフォルダーがある場合、Strata はそこを自身のファイル置き場にせず、通常の data directory を使う。明示的な `--data-dir` がある場合は `beside_refused()` がこの判定を省く。 (`terminal/strata_control/discovery.py:467-479`, `terminal/strata_control/discovery.py:484-497`, `terminal/strata_cli/launch/runner.py:1548-1560`)
+
+## ログと測定値
+
+環境変数専用のログや警告はない。隣接フォルダーが cache と判定されて保存先を切り替える場面では、launch の通知本文は `Your model files are used where they are. <path> is a Hugging Face download folder, so Strata keeps its own files (the prepared data and the picture reader) in <data_dir>.` となる（山括弧内は実際のパス）。cache に対象ファイルがなく offline の場合、明示 fetch は stderr に `strata: There is no internet connection, so the DFlash2 drafter can't be downloaded now.` を出して終了コード 5 を返す。Load は警告を表示して続行する。 (`terminal/strata_cli/launch/runner.py:1710-1718`, `terminal/strata_cli/drafting_cmd.py:290-301`, `terminal/strata_cli/launch/runner.py:2144-2158`)
 
 ## 根拠
 
-- `strata_control/drafting_fetch.py:76-85` — `HF_HUB_CACHE` と `HUGGINGFACE_HUB_CACHE` の読み取り、`HF_HOME` と既定 root、snapshot path の構成。
-- `strata_control/drafting_fetch.py:88-100` — 候補ファイルの存在・サイズ・SHA-256 検証と、候補順で最初に一致したファイルの採用。
-- `strata_control/drafting_fetch.py:144-163` — pack ready の早期 return、`files` による探索省略、cache 探索後のオンライン確認と失敗経路。
-- `strata_control/drafting_fetch.py:166-195` — 見つからなかったファイルのダウンロード、チェック、pack 作成とエラー経路。
-
+- 環境値を cache root に加え、pinned snapshot の候補を作る: `terminal/strata_control/drafting_fetch.py:121-130`
+- ファイルの存在・サイズ・SHA-256 検査と候補採用: `terminal/strata_control/drafting_fetch.py:133-145`
+- fetch の cache 探索条件、ネットワーク fallback、pack 後の cleanup: `terminal/strata_control/drafting_fetch.py:376-442`
+- cache path の判定と隣接フォルダーの書き込み先選択: `terminal/strata_control/discovery.py:455-497`
+- launch の保存先拒否通知: `terminal/strata_cli/launch/runner.py:1710-1718`
+- fetch CLI、Load、setup の呼び出し・失敗時の扱い: `terminal/strata_cli/drafting_cmd.py:281-301`, `terminal/strata_cli/launch/runner.py:2115-2158`, `terminal/setup.py:9079-9080`
+- DFlash2 の測定条件や対象については `docs/DETAILS.md:1591-1595` に記載があるが、この環境変数の cache 解決規則は記載されていないため、規則は上記実装から記述した。

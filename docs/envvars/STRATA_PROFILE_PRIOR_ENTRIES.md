@@ -1,41 +1,43 @@
 # `STRATA_PROFILE_PRIOR_ENTRIES`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL 版 `strata serve` が保存する learned expert profile のうち、デバイス上で数えたルーティング回数へ、起動時に読み込んだ expert profile の順位情報をどれだけ加算するかを指定します。通常の CUDA/HIP 実装にはこの名前の参照がなく、調査対象 HEAD では SYCL の `sycl/src/program/generate.cpp` にある1箇所だけで読み取られます。
+SYCL エンジンが `--expert-profile-save` で学習済み expert profile を保存するとき、読み込んだ profile の順位をどれだけ事前カウントとして残すかを指定する。起動時に読み込んだ profile の順位ごとに指数減衰する重みをルーティング実績へ足し、保存する順位を決める。通常の実績だけで順位付けする処理や、実行中の GPU キャッシュ配置を直接変更しない。読み取り箇所は SYCL 版 `save_profile` の device-count 分岐だけである（`engine/sycl/src/program/generate.cpp:9343-9376`）。
+
+このコードは通常の CUDA/HIP エンジンではなく、Linux x86_64 向けの別プロジェクト SYCL エンジンにある（`engine/sycl/CMakeLists.txt:253-256`）。トップレベルでは `STRATA_ENABLE_SYCL` が既定 OFF で、ON のとき CUDA/HIP と併用できず `sycl/` を追加する（`engine/CMakeLists.txt:23-32`）。SYCL の `strata` 実行ファイルは `generate.cpp` を含む（`engine/sycl/CMakeLists.txt:375-377`）。
 
 ## 値と判定
 
-| 状態 | `prior_entries` |
-|---|---:|
-| 未設定 | `800000.0` |
-| 設定あり | `max(0.0, std::atof(値))` |
+`save_profile` が呼ばれるたびに `std::getenv` で取得する。未設定なら `800000.0` routed entries を使う。設定時は `std::atof` の結果を `std::max(0.0, value)` に渡す。全体文字列の厳密な検証やエラー報告はなく、数値として読めない文字列は通常 0 になり、数値の後ろにある文字は `atof` が消費しない。空文字も 0 として扱われる。負値は 0 に clamp される。たとえば `12.5` は 12.5、`0`・空文字・`abc`・`-1` は 0、`12tail` は数値 prefix の 12 として扱われる。先頭の空白と符号は数値変換に従い受け付ける。真偽値の単語を照合する処理はない。`atof` を使うため、整数限定や小数桁の制限はない。`NaN` などの非有限値について個別の検査・エラー処理はない（`engine/sycl/src/program/generate.cpp:9354-9359`）。
 
-文字列全体の厳密な検証はありません。`std::atof` による数値変換なので、空文字や数値として読めない文字列は通常 `0` になり、数値の後ろに文字が続く場合は数値として読める先頭部分が使われます。負数は 0 に切り上げられ、上限は設けられていません。たとえば `-5` は 0、`12tail` は 12、空文字は 0 です。大文字小文字や真偽値文字列の判定はありません。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---:|---|---|
+| SYCL の device-count 保存分岐 | 800000.0 | 0 より大きく `atof` で読める数値（例 `1`, `12.5`, `12tail`） | 0 以下、空文字、数値 prefix のない文字列（例 `0`, `-1`, ``, `abc`）は prior 加算量 0 |
 
 ## 有効になる条件
 
-この値は、`--expert-profile-save` が指定され、保存時に `usage_dev_srv != nullptr` となる経路でのみ使われます。このデバイス集計領域は `mirror_table_d` が存在するときに割り当てられます。ソース上、mirror table は `--stream-experts`、GGUF source、正の expert cache、かつ実際に expert を pinned host memory へ mirror できた経路で作られます。`STRATA_VERIFY_NO_HOST` でも使われる device-plan の集計経路ですが、この環境変数自体に `STRATA_VERIFY_NO_HOST` の値を調べる条件はありません。通常のホスト側 `heat` を使う保存経路では、この環境変数は参照されません。
+- SYCL バックエンドの `strata` を実行していること。CUDA/HIP 側の `engine/src/program/generate.cpp` にはこの名前の読み取りがない。
+- `--serve` 経路で `--expert-profile-save PATH` を指定し、終了時または周期保存時に `save_profile` が呼ばれること。周期は `--expert-profile-save-every`（既定 10 分、0 以下なら周期保存なし）で制御され、終了時の保存呼び出しは別にある（`engine/sycl/src/program/generate.cpp:605-609,2175-2178,10285-10289,13283`）。
+- `usage_dev_srv` が確保されること。これは `mirror_table_d` があり、かつ保存先が指定されている場合に作られる（`engine/sycl/src/program/generate.cpp:7685-7693`）。`mirror_table_d` は `--stream-experts`、GGUF ソース、VRAM expert cache があり、VRAM 外の expert の mirror が作成できた経路で設定される（`engine/sycl/src/program/generate.cpp:5426-5435,5486-5505`）。この条件がなければ `save_profile` は device-count 分岐を通らず、この変数を読み取らない。
+- prior を実際に足すには、`profile_loaded` に順位があることも必要。これは保存先が指定されたとき、読み込まれた `profile` のコピーとして用意される（`engine/sycl/src/program/generate.cpp:3825-3828`）。空なら加算ループは 0 回で、この変数による順位 prior は生じない（`engine/sycl/src/program/generate.cpp:9361-9365`）。
 
 ## 実行時の詳細
 
-`save_profile()` はサーバーの終了時、および `--expert-profile-save-every` の間隔に達したリクエスト間で呼ばれます。環境変数はこの関数の実行ごとに読み直され、static cache されません。デバイスの routing count を読み出した後、各 expert の基礎値に count を入れ、読み込んだ profile の順位 `r` に対して次の重みを加えます。
+device-count 分岐では、まず `usage_dev_srv` のカウントをホストへコピーして合計を計算する。各 profile 順位 `r` の expert について `x = r / n`、`n = 層数 × expert 数` とし、`prior_entries * 2 * exp(-2*x) / (1-exp(-2)) / n` をその expert の実績へ加える。続いて `rank_learned_profile` が実績の大きい順に並べ、同点では読み込んだ prior 順位、さらに pair index の順で安定した tie-break を行い、`write_expert_profile` が保存先へ書く（`engine/sycl/src/program/generate.cpp:9350-9370`; `engine/src/core/expert_cache.cpp:246-272`）。従ってこの値が変えるのは保存 profile の順位であり、現在の実行中に使うキャッシュや生成 token ではない。
 
-```text
-prior_entries * 2 * exp(-2 * r / n) / (1 - exp(-2)) / n
-```
+環境値は `save_profile` 内で保存のたびに再取得し、static cache には保存しない。周期保存は次のリクエストを処理する前に条件を確認し、終了時にも保存を試みる（`engine/sycl/src/program/generate.cpp:10285-10289,13283`）。CLI の `--expert-profile-save-every` は周期条件だけを変え、prior 値を上書きしない。未設定時の 800000 は環境変数の既定値であり、別の CLI 引数による prior 値の指定はない（`engine/sycl/src/program/generate.cpp:9356-9358`）。
 
-ここで `n = n_layers * n_expert` です。その後 `rank_learned_profile()` が加算後の値の降順で並べ、同値なら読み込み profile の順位、さらに同値なら pair の index で順序を決めます。このため値を大きくすると、起動時 profile の先頭側へ指数分布の prior mass を強く与え、起動後の routing count と合わせた保存順位に影響します。`0` なら加算はありません。起動時 profile が空なら prior の加算対象もありません。
+## ログと測定値
 
-保存に成功すると stderr に `strata serve: expert profile saved to ...`、失敗すると `strata serve: the expert profile was not saved: ...` が出ます。保存後の profile は次回起動時の expert 配置に使える形式で書かれます。`docs/DETAILS.md` は learned profile の保存タイミングと、Battlemage の `STRATA_VERIFY_NO_HOST` で device-side routing counts から順位を作る経路を説明していますが、この環境変数の既定値や重み式は記載していません。
+この変数専用のログや無効値警告はない。保存成功時は `strata serve: expert profile saved to %s (%s, %.0f routed entries counted on the device)`、失敗時は `strata serve: the expert profile was not saved: %s` を stderr に出す（`engine/sycl/src/program/generate.cpp:9370-9374`）。この変数について再現条件を伴う測定値は、確認したソースと `docs/DETAILS.md` には記載がない。
 
 ## 根拠
 
-- `sycl/src/program/generate.cpp:8441-8470` — 保存関数、デバイス count の読出し、既定値 `800000.0`、環境変数の変換、順位重みの加算、成功・失敗ログ。
-- `sycl/src/program/generate.cpp:3481-3482` — `--expert-profile-save` が指定された場合に、読み込んだ profile 順を保持。
-- `sycl/src/program/generate.cpp:7105-7113,7890-7900` — device count 領域の割当条件と保存用 count の準備。
-- `sycl/src/program/generate.cpp:9300-9304,11815` — 定期保存と終了時保存。
-- `sycl/src/core/expert_cache.cpp:210-236` — learned profile の並べ替えと同順位時の tie-break。
-- `docs/DETAILS.md:605-615` — learned profile の保存・再利用、および SYCL の device-side routing count 経路。環境変数自体の説明はなし。
+- `engine/sycl/src/program/generate.cpp:9343-9376` — device usage を用いた保存分岐、既定値・読み取り・prior 加算・成功／失敗ログ。
+- `engine/sycl/src/program/generate.cpp:3825-3828,7685-7693,8761-8771` — 読み込んだ順位の保存、device counter の確保と profile 保存準備。
+- `engine/sycl/src/program/generate.cpp:5426-5505` — stream expert と mirror table の作成条件。
+- `engine/sycl/src/program/generate.cpp:10285-10289,13283` — 周期保存と終了時保存。
+- `engine/src/core/expert_cache.cpp:246-272` — 学習済み順位のソートと tie-break。
+- `engine/CMakeLists.txt:23-32`; `engine/sycl/CMakeLists.txt:375-377` — SYCL が別 backend であり、対象ファイルが SYCL 実行ファイルに含まれること。

@@ -1,64 +1,63 @@
 # `--kv`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-24 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`SETUP.bat`、`update.sh`、`UPDATE.bat` から委譲） |
+| コマンド | `setup.py`（`./setup.sh` / `START-HERE.bat` 経由を含む） |
 | オプション | `--kv` |
 | 別名 | なし |
-| 値 | `int8`、`q4_0`、`k8v4` のいずれか |
+| 値 | `int8`、`q4_0`、`k8v4`、`fp16`、`fp8`、`k8v8` のいずれか |
 
 ## 役割
 
-Flash-Next 系の通常セットアップで、生成するエンジン起動設定の KV cache 精度を選びます。コンテキスト長が 8K を超える場合に使われます。`int8` は8-bit、`q4_0` はHadamard回転を使う4-bit、`k8v4` は8-bit K + 4-bit V の混合形式です（`setup.py:8436-8438`, `setup.py:250-251`）。
+モデルの会話履歴を保持する KV cache の形式を指定する。setup が選んだ値は、対象 family の設定に応じて起動設定へ書かれ、engine に渡される。値の意味と受理範囲は family / engine によって異なるため、setup parser が受理する6値すべてを、すべてのモデルで使用できるわけではない。
 
 ## 使い方
 
+Linux でモデルをセットアップし、コンテキスト長が8Kを超える場合に4-bit KVを指定する例:
+
 ```sh
-./setup.sh --setup --family qwen --kv q4_0 --no-start
+./setup.sh --model 8B --context 32768 --kv q4_0 --no-start
 ```
 
-Windows では同じ引数を `START-HERE.bat` または `SETUP.bat` に渡します。POSIX / Windows の各ラッパーは `setup.py` に引数を渡し、独自には解釈しません（`setup.sh:6-13,76`, `START-HERE.bat:8-11,48-55`, `SETUP.bat:1-3`）。既存環境の更新用 wrapper も最終的に同じ parser に委譲します（`update.sh:62`, `UPDATE.bat:79`）。
+`--kv` は値を1つ取る。`setup.sh` は `terminal/setup.py` に引数を転送し、Windows の `START-HERE.bat` も同じ `setup.py` に引数を渡す（`setup.sh:6-17`、`START-HERE.bat:53-64`）。
 
 ## 値と既定値
 
-- `argparse` の `choices` で `int8`、`q4_0`、`k8v4` だけを受け付けます。parser 上の既定値は `None` です。大文字・別表記は choices に含まれません（`setup.py:8420,8436-8438`）。
-- 通常セットアップではコンテキストが 8192 以下なら `fp16` を選び、`--kv` の値は生成引数に使いません。8192 を超える場合、明示値を使い、省略時は `int8` です（`setup.py:9097-9099`）。
-- 8K 超で値を省略し、対話端末で `--yes` を付けない場合は `int8` / `q4_0` の選択質問が出ます。`--yes` では質問をせず `int8` になります。対話メニューには `k8v4` はありませんが、コマンドラインで明示すれば受理されます（`setup.py:9098-9105`）。
-- 無効値はセットアップ処理に入る前に `argparse` が拒否します。`argparse` 標準の usage とエラーを表示して終了コード 2 になります（parser 定義 `setup.py:8420,8436`; `setup.py:8553` で `parse_args()`）。
+- parser の `choices` は `int8`、`q4_0`、`k8v4`、`fp16`、`fp8`、`k8v8`。省略時は `None` で、構文上のデフォルト値は設定されていない（`terminal/setup.py:11460-11462`）。選択肢以外の値は `argparse` が拒否する。重複指定の独自処理はなく、標準 parser は最後に指定された値を `a.kv` に設定する（同ファイル `:11444`、`:11606`）。
+- 通常の Flash-Next 系では、context が8Kを超えるか、VRAMが少ない条件なら既定は `int8`、それ以外は `fp16`。context が8Kを超え、`--yes` を付けず `--kv` を省略した場合は対話選択があり、既定選択は `int8`。VRAM条件は全モデルで12.5 GB以下、または Unsloth model で16.5 GB以下（context 64K以上なら24.5 GB以下）（`terminal/setup.py:12190-12205`）。
+- `q4_0` は4-bit、`int8` は8-bit、`k8v4` はINT8 K + 4-bit V、`fp16` は16-bitとして通常系の説明とメモリ計算に使われる（`terminal/setup.py:11460-11462`、`:302-303`、`:8804`）。
 
 ## 実行時の動作
 
-8K 超では選択した値を `args` に `--kv <値>` として加え、セットアップが作る実行設定に格納します。したがってこのオプション自体は setup 実行中の推論を切り替えるものではなく、生成された設定からエンジンを起動するときに適用されます（`setup.py:9418-9425`, `setup.py:9597`, `setup.py:6312`）。KV streaming の RAM 見積もりは形式ごとの bytes/cell を参照し、`k8v4` は 816、`q4_0` は 576、既定の `int8` は 1056 として計算します（`setup.py:250-251,5714-5717`）。
-
-相互作用と例外:
-
-- Qwen3.6 の専用エンジン経路と DeepSeek-V4.1 の専用経路では `--kv` は使われず、指定があると Flash-Next 用設定である旨を警告します（`setup.py:8932-8938,7610-7612,8030-8031`）。
-- Intel SYCL セットアップでは共通 parser の後に専用 setup へ引数を渡し、生成設定中の `--kv` を読み取ります（`setup.py:8563-8564`, `sycl/setup_intel.py:317-327`）。
-- 既存の設定を新しい checkout に引き継ぐ際、選択復元処理は保存済み値のうち `int8` と `q4_0` のみを認識し、`k8v4` は復元しません。そのためこの経路では `k8v4` が以前の選択から自動復元されるとは限りません（`setup.py:6388-6424,8622-8633`）。
-- Unsloth の小容量 GPU 向け自動調整は、明示した `--kv` を固定値として扱い変更しません。値を自動選択した場合は起動可能性の見積もりに応じて `q4_0` へ変更する場合があり、その変更を警告に含めます（`setup.py:9540-9573`, 特に `9550-9565`）。
-- セットアップの表示は `int8` 以外を一律「4-bit (Hadamard-rotated)」と表示するため、明示した `k8v4` の形式説明としては正確でありません（`setup.py:9106-9107`）。また、並列 slot の VRAM 見積もりは `q4_0` 以外を 1056 bytes として扱います。エンジンに渡す値とは別のセットアップ側見積もりです（`setup.py:7031-7035`）。
-- macOS の非 Control 経路は共通 parser より前に `metal/setup_mac.py` へ引数を委譲します。この経路については `setup.py` の `--kv` parser が適用されるとは確認できず、本書の値検証・通常経路の説明対象外です（`setup.py:8412-8420`, `setup.py:7314-7318`）。
+- 通常の Flash-Next 系では選択値を使ってセットアップ設定の `args` を作る。context が8K超、または選んだ形式が `fp16` 以外なら `--kv <値>` を engine 起動引数に加える（`terminal/strata_control/setup_config.py:218-225`）。低VRAM Unsloth向けの起動見積もりが不足する場合は、ユーザーが `--kv` を明示していなければ、起動可能性を高める候補に変更することがある。明示指定時は `kv_fixed` としてその形式を保持する（同ファイル `:378-400`）。
+- 通常系の engine `strata generate` は `fp16`、`int8`、`q4_0`、`k8v4` のみを有効値として検証し、KV実装の形式切替に使う（`engine/src/program/generate.cpp:3906`、`:5014-5020`）。したがって parser が受理する `fp8` / `k8v8` は、この通常系には適合しない。これらを通常系で指定すると setup parser では通るが、生成された設定を使う engine 起動時に拒否される。
+- Qwen3.6 の own-path 分岐は `fp32`、`fp16`、`fp8`、`fp4` を専用形式として扱う。setup parser が受理した値のうち `fp16` と `fp8` は転送し、`int8` / `q4_0` / `k8v4` / `k8v8` は警告を表示して既定の `fp32` に任せる。一方、`fp32` / `fp4` は説明上の対応形式でも setup parser の choices にないため、このCLIから指定できない（`terminal/setup.py:9911-9913`、`:9984-9988`、`:11460-11462`）。
+- Inkling-2-Mini では `fp16` / `fp8` / `k8v8` / `k8v4` だけを転送する。HIP / Metal / SYCL backend で `k8v8` または `k8v4` を指定すると警告して `fp8` に置き換える。ほかの parser 受理値はこの分岐では黙って転送対象外となる（`terminal/setup.py:10891-10897`）。
+- `--kv-streaming` が有効になる通常系では、選んだ KV 形式を使ってRAM必要量を見積もり、64K以上のcontextで条件を満たすと `--kv-resident 32768` を追加する。これは `--kv` の形式とは別の配置制御で、WSLではstreamingしない（`terminal/strata_control/setup_config.py:301-332`）。
+- 以前の設定を新しいcheckoutへ引き継ぐ場合、通常系は保存済み `--kv` のうち `int8` / `q4_0` のみ再利用する。Qwen3.6、Hy4-Flash、Inkling-2-Mini は own-path扱いでKV値を引き継がない（`terminal/setup.py:7808-7825`、`:11702-11710`）。
 
 ## 適用条件と副作用
 
-`--kv` はセットアップが選んだモデルのコンテキスト、RAM、GPU 条件を変えず、実行設定の KV cache 引数を変えます。setup はモデル設定・起動スクリプト等を生成する通常の副作用を伴います。エンジンが実際にその形式を利用するのは生成設定から起動した後です（`setup.py:9418-9425,9597`）。
+- Apple Silicon の通常モデルは `setup.py` の parser に入る前に `metal/setup_mac.py` へ委譲されるため、この root parser の `--kv` は使えない。Hy4-Flash / Inkling-2-Mini はこの委譲を迂回する経路がある（`terminal/setup.py:11435-11437`）。
+- 既存モデルを単に起動する実行では `--kv` は保存済み設定を変更せず、指定されると「モデルの再セットアップ時だけ有効」と警告される。変更するには `--setup --model ... --kv ...` が必要（`terminal/setup.py:11734-11739`）。
+- セットアップは起動設定を書き、通常は起動スクリプトを作る。`--no-start` を併用した例はセットアップ後の自動起動を抑止する（設定生成とスクリプト作成は `terminal/setup.py:12521-12527`、終了分岐は同ファイル `:12555-12556`）。
 
 ## 出力とエラー
 
-- 8K 超の通常経路では KV 精度を `[ok]` 行で表示します。ただし前述のとおり `k8v4` も4-bit Hadamard回転として表示されます（`setup.py:9106-9107`; `ok()` は `setup.py:817-818`）。
-- 専用 family での無視は `[!]` 警告です（`setup.py:821-823,7610-7612,8030-8031`）。不正な値は `argparse` のエラー経路です。指定値そのものに対する追加の明示的 validation / setup 独自の失敗経路は確認できませんでした。
+- 通常系で8K超のcontextを指定した場合、選択したKV形式を `KV cache: ...` として表示する（`terminal/setup.py:12204-12205`）。
+- parser の choices 外の値は `argparse` のエラーとなる（parser 定義と `parse_args()` は `terminal/setup.py:11460-11462`、`:11606`）。通常系のengineが非対応値を受けた場合は `strata generate: --kv must be fp16, int8, q4_0 or k8v4` を stderr に出し、終了コード2を返す（`engine/src/program/generate.cpp:5014-5017`）。
+- Qwen3.6 でFlash-Next形式を指定した場合、および Inklingの指定値が backend 非対応の場合は、setup が警告を表示して既定値または `fp8` に切り替える（`terminal/setup.py:9911-9913`、`:10892-10897`）。
 
 ## 根拠
 
-- parser と値の説明: `setup.py:8420-8438`, `setup.py:8553`
-- 既定値、対話選択、8K 条件: `setup.py:9097-9107`
-- 生成するエンジン引数: `setup.py:9418-9425`; family 固有経路の分岐: `setup.py:8932-8938`
-- family による無視: `setup.py:7610-7612,8030-8031`
-- KV streaming の値別 RAM 計算: `setup.py:250-251,5714-5727`
-- 既存設定からの値復元: `setup.py:6388-6424,8622-8633`
-- Unsloth GPU 見積もり・補正: `setup.py:6972-7007,9540-9573`
-- wrapper 委譲: `setup.sh:6-13,76`, `START-HERE.bat:8-11,48-55`, `SETUP.bat:1-3`, `update.sh:62`, `UPDATE.bat:79`
-- macOS / SYCL の委譲: `setup.py:7314-7318,8412-8420,8563-8564`, `sycl/setup_intel.py:317-327`
+- parser と選択値: `terminal/setup.py:11444-11462`。
+- 通常系の既定値と対話選択: `terminal/setup.py:12190-12205`。
+- 通常系の設定引数への反映、KV streaming、低VRAM補正: `terminal/strata_control/setup_config.py:218-225`、`:301-332`、`:378-400`。
+- 通常系engineの受理値と検証: `engine/src/program/generate.cpp:3906`、`:5014-5020`。
+- Qwen3.6 / Inkling固有の値処理: `terminal/setup.py:9911-9913`、`:9984-9988`、`:10891-10897`。
+- wrapperとMac委譲: `setup.sh:6-17`、`START-HERE.bat:53-64`、`terminal/setup.py:11435-11437`。
+
+調査時点のcheckoutは `git status --short --branch` で `## main...origin/main` と表示され、未コミット変更は確認されなかった。実行時のengine引数以降の効果は、Strata内の各engine実装が確認できた範囲に限って記載した。

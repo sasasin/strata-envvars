@@ -1,71 +1,45 @@
 # `STRATA_RAM_ADAPT2`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`strata serve` の resident RAM mode で、RAM に置く expert の選択を会話中のルーティングに合わせて更新します。GPU cache にない expert のうち、直近の decode window で使われた候補を RAM に読み込み、同じ layer の RAM 内で使われていない expert と入れ替えます。RAM 使用量は増やさず、読み込みは専用 I/O thread に先行させます。
-
-`STRATA_RAM_ADAPT` が実装する同期読み込み経路を置き換える変数ではありません。新経路では両方の変数を有効にする必要があります。`STRATA_RAM_ADAPT2` だけでは promotions の選定・stage は行われません。
+`--serve` の常駐 RAM expert copy に対し、会話中に利用頻度が変わった expert を RAM copy 内で入れ替える staged promotion を有効にする。候補 expert のファイル読み込みを I/O thread に先行させ、後続 decode window の境界で RAM copy に反映する。変数だけでは動かず、`STRATA_RAM_ADAPT` も正数である必要がある。GPU tier の選択規則や routing 自体はこの変数では変更しない（`engine/src/program/generate.cpp:22836-22857`）。
 
 ## 値と判定
 
-| `STRATA_RAM_ADAPT2` | 結果 |
-|---|---|
-| unset | 無効 |
-| `atoi` の結果が `0` | 無効。空文字、数字で始まらない文字列、`0` で始まる整数など |
-| `atoi` の結果が 0 以外 | 有効。負数も有効 |
+serve 初期化時に `std::getenv` で取得し、`std::atoi(v) != 0` を `on` とする（`engine/src/program/generate.cpp:12333-12349`）。文字列全体の検証はなく、`atoi` が読む先頭の整数部分で判定する。したがって空文字・数字で始まらない文字列・`0anything` は 0 となり無効、`1`、`-1`、`2tail` は非 0 となり有効。先頭空白や符号も `atoi` の変換対象で、大文字小文字の規則はない。
 
-文字列全体を検証せず、C/C++ の `std::atoi` で変換します。したがって、先頭の空白や符号の後の整数部分が変換され、後続文字は判定に使われません（例: `1xyz` は有効、`0xyz` は無効）。変換エラーを別扱いする処理はありません。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 全ビルド（serve 初期化で読み取り） | `on=false` | `atoi` の結果が非 0（例: `1`, `-1`, `2tail`） | `atoi` の結果が 0（例: 空文字, `0`, `0anything`, `true`, `false`, `x1`） |
 
-有効化後に同じブロックで読み込む関連設定の既定値と変換は次のとおりです。
-
-| 変数 | 既定値 | 設定時の処理 |
-|---|---:|---|
-| `STRATA_RAM_ADAPT_PROMPT_W` | `0.25` | `atof` 後、下限 0 に clamp。プロンプト routing の seed の重み |
-| `STRATA_RAM_ADAPT_CACHED_W` | `0.15` | `atof` 後、0〜1 に clamp。page cache にある候補の miss cost の重み |
-| `STRATA_RAM_ADAPT_PER_LAYER` | `2` | `atoi` 後、下限 1。各 layer の候補上限 |
-| `STRATA_RAM_ADAPT_SKIP_TOP` | `2` | `atoi` 後、下限 0。GPU tier が取り込みそうな上位候補を選定から除く数 |
-
-これらの関連設定は `STRATA_RAM_ADAPT2` が無効でも初期値を更新しますが、主変数が無効なら機能には使われません。
+対象変数に CLI 引数による上書きはない。`on=true` でも、`STRATA_RAM_ADAPT` の値が `atoi` で正数にならなければ staged promotion は実行されない（同 `generate.cpp:22843-22849`）。
 
 ## 有効になる条件
 
-値が有効でも、実際の入れ替えにはすべて次の条件が必要です。
-
-- `strata serve` の window 処理である。
-- `STRATA_RAM_ADAPT` が正数（unset は 0）。この値は最大で何件の promotion を一度に stage するかにも使われる。
-- 最初の window の後で、decode usage が存在し、adaptive swap が pending でない。
-- 非同期 adaptive round が実行中でない。
-- resident RAM copy が利用可能（`src.complement_ready()`）。
-- single GPU で、peer device / remote expert optimization がなく、`--batch` が 0。
-
-layer split、peer/helper GPU、batch serve ではこの選定・stage 経路に入りません。`STRATA_EXCHANGE_ROTATE` などにより RAM copy の place を入れ替えられない場合、個別の install は失敗して skip されます。
+- `--serve` の初期化と decode window loop を通ること。この設定を読むコードは serve の初期化経路にある（`engine/src/program/generate.cpp:12302-12344`）。
+- `STRATA_RAM_ADAPT` が正数であること。これが 1 window あたりに stage する promotion 数の上限にもなる（`engine/src/program/generate.cpp:22843-22849`, `22913-22918`）。
+- 初回でない window で、decode usage があり、前回の adaptive swap が未完了でなく、resident RAM copy が ready であること。
+- single GPU で peer tier がなく、multi-GPU でなく、remote expert optimization がなく、`--batch 0` であること。条件外ではこの staged 経路を通らない（同 `generate.cpp:22847-22849`）。
+- RAM copy に入れる・出す候補 expert が存在し、評価上の gain が 1 以上であること。GPU tier に入った expert は後の install 時に除外される（同 `generate.cpp:22868-22909`; `engine/src/core/expert_source.cpp:5083-5092`）。
 
 ## 実行時の詳細
 
-主変数と4つの関連重みは serve の初期化中に `getenv` で読み、serve 内の `RamAdapt2` 状態に保存します。serve 起動後の環境変更は再評価されません。`STRATA_RAM_ADAPT` は最初の対象 window 境界で `static` 初期化され、プロセス内で一度だけ読みます。
+`STRATA_RAM_ADAPT2` は serve の初期化時に `RamAdapt2` へ一度読み込まれ、実行中に環境を変更しても同じ serve 実行の `on` には反映されない。関数内 static cache ではない。一方、併用必須の `STRATA_RAM_ADAPT` は decode loop 内の static local で初回評価時に cache される（`engine/src/program/generate.cpp:12333-12349`, `22843-22849`）。
 
-有効な経路では各 decode window の境界で、まず完了済みの staged reads を RAM copy に install します。続いて、layer ごとに GPU cache 外の候補と RAM に resident な候補を usage から評価します。候補 expert の基礎値は decode usage と prompt routing の seed の和で、値が 2 未満の非 resident 候補は除外されます。page cache にある候補には `STRATA_RAM_ADAPT_CACHED_W` を掛け、RAM 内候補のうち低いものと比べます。`STRATA_RAM_ADAPT_SKIP_TOP` は GPU tier が選びそうな decode usage 上位を先に除外します。最大 `STRATA_RAM_ADAPT_PER_LAYER` ペア/layer を候補にし、利得を blob byte 当たりで比較して全体順位を作り、`STRATA_RAM_ADAPT` の件数まで stage します。prompt の routing は `STRATA_RAM_ADAPT_PROMPT_W` で seed に反映され、seed は各後続 window で 0.95 倍に減衰します。
+`STRATA_RAM_ADAPT_PROMPT_W` が未設定なら 0.25。`on` かつこの重みが正なら prompt の routing ID を受け取る callback を設定し、各 expert に `prompt_w * 20 * n_expert_used / n` を加算した seed を記録する。prompt 経路が routing ID を host にダウンロードしない場合 callback は呼ばれない（`engine/src/program/generate.cpp:16056-16067`; `engine/src/prefill/prefill.cpp:5938-5940`; `engine/include/strata/prefill/prefill.hpp:265-267`）。
 
-`ram_stage` は I/O thread を起動し、ファイルから新 expert の blob を読みます。read が完了した job は次の対象 window 境界で install されます。install 時に GPU tier が対象 expert のいずれかを取得済みなら skip し、読み込み失敗や RAM copy への install 不可も skip されます。これにより RAM copy を更新するのは window 間であり、window 実行中の RAM read と place の書き換えを重ねません。後続 prompt にも更新後の resident RAM copy が使われます。
+各 decode window 境界では、読み込み済み job を先に install し、prompt seed を 0.95 倍に減衰させる。その後、GPU 外の expert の `decode usage + seed` を候補順位に使い、resident RAM expert を入れ替え先に選ぶ。既定では各 layer 最大 2 組まで stage する。`STRATA_RAM_ADAPT_PER_LAYER` と `STRATA_RAM_ADAPT_SKIP_TOP` が候補数を、`STRATA_RAM_ADAPT_CACHED_W` が OS page cache にある候補の miss cost を調整する（`engine/src/program/generate.cpp:22850-22917`）。先行読み込みは `FileExpertSource::ram_stage` から I/O thread に queue され、既定 queue 上限は 64、`STRATA_RAM_ADAPT_QUEUE` で変更できる。queue が満杯・対象が重複・source が利用不可なら stage は追加されない（`engine/src/core/expert_source.cpp:5007-5031`）。次の window 境界で読み込み済みデータを install し、読み込み失敗、RAM copy 側の install 不可、または候補のどちらかを GPU tier が取得済みなら install を skip する（同 `expert_source.cpp:5041-5093`）。
 
-stage queue の上限は関連変数 `STRATA_RAM_ADAPT_QUEUE` で決まり、既定値は 64、設定値は `atoi` 後に最低 1 へ clamp されます。値は最初の `ram_stage` 呼び出しで static cache されます。queue が満杯、同じ layer の重複 job、または RAM copy が無い場合は `ram_stage` が false を返し、その候補はその境界では stage されません。
+## ログと測定値
 
-serve 終了時の累積ログは `strata serve: resident RAM (STRATA_RAM_ADAPT2): %lld promotions read on the I/O thread, %lld installed, %lld skipped at the install (%lld of them: the GPU tier took one of the pair)` です。これは staged read / install / skip の件数で、性能値ではありません。
-
-## 文書との照合
-
-`docs/DETAILS.md:172-181` は `STRATA_RAM_ADAPT` による同期読み込み方式を記載しています。今回確認した `STRATA_RAM_ADAPT2` の先読み、prompt seed、複数候補選定の実装説明はその記述にはありません。同資料の測定値は旧 `STRATA_RAM_ADAPT` の説明箇所にあるため、ここでは `STRATA_RAM_ADAPT2` の性能値として扱いません。
+serve の request 終了時、`on=true` なら stderr に累積値を出す。実装上の文言は `strata serve: resident RAM (STRATA_RAM_ADAPT2): %lld promotions read on the I/O thread, %lld installed, %lld skipped at the install (%lld of them: the GPU tier took one of the pair)`。この行は有効値だけで出て、条件不足や実際の promotion 数が 0 でも表示される（`engine/src/program/generate.cpp:23801-23805`）。個々の queue 拒否・読み込み失敗をこの機能専用に通知するログは確認できない。
 
 ## 根拠
 
-- `src/program/generate.cpp:8266-8283` — 主変数と関連設定の読み取り、既定値、変換・clamp。
-- `src/program/generate.cpp:10831-10843` — prompt routing seed の収集。
-- `src/program/generate.cpp:14801-14877` — `STRATA_RAM_ADAPT` との併用条件、候補評価、install と次回分の stage。
-- `src/program/generate.cpp:15368-15372` — serve 終了時の累積ログ。
-- `src/core/expert_source.cpp:4368-4393,4402-4455` — queue への登録、I/O thread の読み込み、window 境界での install と skip。
-- `src/core/expert_source.cpp:4370-4389` — `STRATA_RAM_ADAPT_QUEUE` の queue 上限と stage 拒否条件。
-- `src/core/expert_source.cpp:4346-4365` — resident copy の範囲検査と実際の place 更新。
-- `include/strata/core/expert_source.hpp:823-832` — stage/install の契約とカウンター。
-- `docs/DETAILS.md:172-189` — 既存資料にある `STRATA_RAM_ADAPT` の説明と、その測定対象。
+- `engine/src/program/generate.cpp:12333-12349` — 対象変数の唯一の読み取りと parse、関連重みの初期値。
+- `engine/src/program/generate.cpp:16056-16067` — prompt routing seed の記録。
+- `engine/src/program/generate.cpp:22836-22919` — `STRATA_RAM_ADAPT` との依存、実行条件、候補選択と stage。
+- `engine/src/core/expert_source.cpp:5007-5093` — I/O thread queue、読み込み、install と skip。
+- `engine/src/program/generate.cpp:23801-23805` — serve の累積ログ。

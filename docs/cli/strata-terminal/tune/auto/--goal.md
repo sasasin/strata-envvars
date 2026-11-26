@@ -1,6 +1,6 @@
 # `--goal`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout は `main...origin/main` で、`git status --short --branch` に未コミット変更は表示されませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,64 +8,67 @@
 | コマンド | `strata tune auto` |
 | オプション | `--goal` |
 | 別名 | なし |
-| 値 | `speed`、`full`、`room`、`room:MiB`。parser では文字列として受け取り、実行時に解釈する |
+| 値 | `speed`、`full`、`room`、`room:MiB`。`MiB` 部分は整数 |
 
 ## 役割
 
-探索する候補設定の選び方と、候補が基準設定よりメモリを多く使う場合の扱いを指定します。`speed`（既定値）/`full` は性能優先、`room` はメモリを空ける方針、`room:MiB` は指定量の VRAM を空ける方針です。`--goal` 自体はエンジン設定を直接適用する指定ではありません。探索結果に改善があれば、通常はチューニング preset として保存されます。
+自動チューニングの目的を、速度優先にするか、実行時にメモリを空けることを優先するか指定する。`room:MiB` は空けたいグラフィックスメモリ量も指定する。値は候補設定の選別と、候補がベース設定よりメモリを余分に使う場合の採否に使われる。既定値は `speed`（`terminal/strata_cli/tune_commands.py:31-32`、`terminal/strata_cli/tune_commands.py:192-199`）。
 
 ## 使い方
 
 ```sh
-strata tune auto my-profile --goal room:4096
+# 速度優先（既定値）
+strata tune auto qwen/IQ3_S --goal speed
+
+# メモリを空ける目的でチューニング
+strata tune auto qwen/IQ3_S --goal room
+
+# グラフィックスメモリを 2048 MiB 空ける指定
+strata tune auto qwen/IQ3_S --goal room:2048
+
+# 実行せず、目的に沿った候補と計画を表示
+strata tune auto qwen/IQ3_S --goal room:2048 --plan
 ```
 
-`my-profile` は保存済み profile 名、または実行設定 JSON を指します。コマンドには対象が必要です。
+`target` はインストール済みモデル、保存済みプロファイル、または run configuration の JSON を指定する（`terminal/strata_cli/tune_commands.py:27`）。`--plan` は実測を開始せず計画を返す（`terminal/strata_cli/tune_commands.py:349-353`）。
 
 ## 値と既定値
 
-- 省略時は `speed`。
-- `speed` と `full` は同じ内部値 `speed`、VRAM reserve `0` に変換されます。`full` は parser のヘルプ文字列には列挙されていませんが、実装が受理する別表記です。
-- `room` は内部値 `room`、reserve `0` です。
-- `room:<MiB>` は `<MiB>` を整数として読み、負数は `0` に丸めます。例: `room:-1` は reserve `0` と同じになります。
-- 空文字列、不正な整数、`room` 以外の未知の値は実行時エラーになります。数値に上限はコード上確認できません。
-- argparse 定義に `choices` や型変換はなく、値の検証はコマンド実行時に行われます。
+- 未指定時は `speed`。
+- `speed` と `full` はどちらも内部値 `speed`、予約量 `0` に正規化される。`full` は parser の help 文にはないが、実際の値解釈では受理される（`terminal/strata_cli/tune_commands.py:31-32`、`terminal/strata_cli/tune_commands.py:192-194`）。
+- `room` は内部値 `room`、予約量 `0`。
+- `room:<整数>` は内部値 `room` とその整数を MiB 単位の予約量として扱う。負数は `0` に丸められ、上限値の検査はない（`terminal/strata_cli/tune_commands.py:195-198`）。
+- 大文字小文字を変えた値、空値、整数でない `room:` 値などは受理されない。`argparse` の定義に `choices` や独自 `type` はなく、実行時の `_parse_goal` が不正値を `ValueError` にする（`terminal/strata_cli/tune_commands.py:31-32`、`terminal/strata_cli/tune_commands.py:192-199`）。
+- 同じ `--goal` を複数回指定した場合の独自処理はなく、`argparse` の通常の単一値引数として最後に指定した値が使われる（`terminal/strata_cli/tune_commands.py:31-32`）。
 
 ## 実行時の動作
 
-値は `_parse_goal()` で `(goal, reserve_mib)` に変換され、`autotune.Options` と候補計画の context に渡されます。候補 knob は、候補定義の `goals` に goal または `--use` の値が含まれる場合に限って計画対象になります。そのため `--use chat|coding` と候補の backend、モデル family、機器条件なども候補集合に影響します。`--goal` は測定スコアの種類を選びません。測定指標は別オプション `--use` によって決まります。
+`auto()` は最初に値を正規化し、チューニング対象を解決する。不正な goal は対象解決と同じ例外処理経路でエラーになり、JSON 出力時は JSON エラー、それ以外は `strata: ...` を標準エラーへ出し、終了コード `2`（通常の不正 goal）を返す（`terminal/strata_cli/tune_commands.py:309-323`、`terminal/strata_cli/tune_commands.py:101-114`）。
 
-`room` では、探索候補の測定後に基準設定と比較して、RAM peak が基準より 5% と 512 MiB の許容幅を超えて増えた場合、VRAM 使用量が基準より 256 MiB を超えて増えた場合など、その候補を除外します。`room:<MiB>` では、基準が指定 reserve を満たしていたのに候補が満たさなくなる場合も除外します。これらは候補選定の制約であり、実行中の基準設定自体のメモリ使用量をこのオプションが保証・変更するものではありません。
+`room` はチューニング文脈へ渡され、候補ノブの goal 条件に合わない設定は候補から外される。`--use` で選んだ用途に合致する候補は goal が異なっても残り得る（`terminal/strata_cli/tune_commands.py:342-345`、`terminal/strata_control/autotune.py:926-932`、`terminal/strata_control/tune_knobs.py:425-448`）。
 
-全 goal に共通して、測定中の最小空き RAM が 3584 MiB を下回り、基準よりさらに 512 MiB 超少ない候補は除外されます。`room` と `--leave-ram` を併用した場合は、最小空き RAM が基準より `max(512 MiB, 総 RAM の 3%)` を超えて減った候補も除外されます。
+実測時、goal が `room` なら候補がベースより RAM 使用量を大きく増やす場合、空き RAM を減らす場合、VRAM を 256 MiB 超多く使う場合などに候補を拒否する。`room:<MiB>` の VRAM 予約は、合計 VRAM が取得でき、ベース実行で指定した空き量を満たしているときに限り、候補が許容誤差 128 MiB を超えて予約分を侵食する場合に拒否条件となる。いずれも候補の採否条件であり、goal 自体がベース設定のメモリ使用量を必ず減らす保証ではない（`terminal/strata_control/autotune.py:713-732`）。
 
-さらに `room:<MiB>` の reserve は、設定にすでに `--vram-reserve-mib` がなく、engine family が `flash-next`、backend が `cuda` または `hip` で、engine がそのフラグを受け付ける（フラグ一覧が取得できない場合を含む）とき、基準引数へ `--vram-reserve-mib <MiB>` として追加されます。この引数が実際に有効かどうかは engine 側の対応状況に依存します。preset の選択情報には正規化後の goal と reserve が記録されます。
+`room:<MiB>` の予約量は、`flash-next` 系で backend が `cuda` または `hip`、かつエンジンフラグ情報が未取得か `--vram-reserve-mib` をサポートすると判断できる場合、ベース引数に同フラグが未設定ならベース設定へ追加される。それ以外の family/backend や非対応と判明したエンジンでは、この追加は行われない（`terminal/strata_cli/tune_commands.py:336-345`、`terminal/strata_cli/tune_commands.py:377-382`）。
+
+`--leave-ram` が 0 より大きく、goal が `speed` なら goal を `room` に切り替える。したがって `--goal speed --leave-ram 20` の実行では room の候補選別・メモリ制約が適用される（`terminal/strata_cli/tune_commands.py:328-332`）。
 
 ## 適用条件と副作用
 
-- `room` 向け候補の有無は候補定義に依存し、全 backend・全モデルで同じ設定が試されるわけではありません。条件不一致や `--use` との不一致で候補が計画から外れることがあります。
-- `--leave-ram PERCENT` を併用すると、値が `1..50` の場合、goal が `speed` でも内部 goal は `room` に変更されます。`0` は変更しません。範囲外はコード `2` で拒否されます。goal を `room` にしただけでは RAM の割合は指定されません。
-- チューニングはモデル engine を複数回起動して測定します。`--work-dir` を指定しなければ一時作業ディレクトリを作り、試行ごとの設定・ログを置きます。`--status-file` を指定した場合は進捗 JSON を一時ファイル経由で置換しながら更新します。
-- 試行記録は preset 保存の有無にかかわらず記録されます。結果が `improved` または `default_confirmed` なら、`--no-save` がない限り preset を作成します。`--goal` は既存の profile 設定ファイルを直接書き換えるオプションではありません。
+`--plan` を付けない実行では、現在の設定と候補設定をエンジンで測定する。チューニング結果が `improved` または `default_confirmed` で `--no-save` を付けていない場合、goal と予約量を含む選択条件で preset を保存する。測定結果のレポートも保存される（`terminal/strata_cli/tune_commands.py:355-387`、`terminal/strata_cli/tune_commands.py:395-425`）。
+
+room のメモリ判定は使用可能な測定値や総メモリ情報がある場合に限られる。特に VRAM 予約の追加・侵食判定は family、backend、エンジンフラグ情報、VRAM 計測値に依存する。各 backend における外部エンジンの `--vram-reserve-mib` の完全な実装意味までは、この CLI 側コードだけでは確定できない。
 
 ## 出力とエラー
 
-- 通常出力では進捗を stderr、最終結果を stdout に出力します。`--output json` では JSON 結果を stdout に出し、通常の進捗行は出しません。
-- 未知の goal や `room:<MiB>` の整数変換失敗は、通常形式で `strata: <エラー>` を stderr に出し、終了コード `2`（または例外が持つ `exit_code`）になります。JSON 形式では `ok:false` と `error` を出します。
-- 対象設定の解決に失敗した場合も同じエラー経路です。実行 engine が見つからない場合はコード `5`。
-- ベース測定失敗、探索失敗または判定不能の結果は結果オブジェクトに含まれ、通常は終了コード `6`。成功（改善または既定設定確認）は `0`、割り込みによるキャンセルは `130` です。
+不正値は終了コード `2` で失敗する。通常出力ではエラー文を標準エラーに、`--output json` では `ok: false` とエラー内容を標準出力に出す（`terminal/strata_cli/tune_commands.py:101-114`、`terminal/strata_cli/tune_commands.py:314-323`）。
 
 ## 根拠
 
-- parser、既定値と構文: `strata_cli/tune_commands.py:20-46`。`--goal` の宣言は 29-30 行。
-- goal の解釈、負数の補正、未知値エラー: `strata_cli/tune_commands.py:139-146`。
-- 設定解決、`--leave-ram` の相互作用、reserve 引数の付加、候補 context と preset choice: `strata_cli/tune_commands.py:174-198`, `221-239`。
-- エラー表示と JSON エラー: `strata_cli/tune_commands.py:103-108`。
-- 実行結果の保存・出力・終了コード: `strata_cli/tune_commands.py:241-261`。
-- goal と `--use` による候補絞り込み: `strata_control/tune_knobs.py:380-418`。
-- goal による RAM/VRAM 候補上限の判定: `strata_control/autotune.py:692-711`。この判定は candidate の測定後に呼ばれます（`strata_control/autotune.py:479-500`）。
-- 測定指標が `--use` により決まること: `strata_control/autotune.py:139-153`, `379-433`。
-- 作業ディレクトリと試行ごとの config/log: `strata_cli/tune_commands.py:217-219`, `strata_control/tune_session.py:420-431`, `443-468`。
-- 索引上のコマンド階層と文書パス: `docs/cli/README.md:804-824`。
-
-調査は指定 revision の Python CLI と tuning 実装に限定しました。CLI `--help` の実行、Release 配布物、各 backend/engine が reserve をどのように実装するかは確認していません。
+- `terminal/strata_cli/tune_commands.py:21-50` — `strata tune auto` の parser。`--goal` は既定値 `speed` の文字列引数で、`choices` 制約や別名はない。
+- `terminal/strata_cli/tune_commands.py:192-199` — goal の実値解釈、`full` の互換受理、`room:MiB` の整数変換と負数の丸め。
+- `terminal/strata_cli/tune_commands.py:309-345` — goal 検証、`--leave-ram` との相互作用、Options と tuning context への受け渡し。
+- `terminal/strata_cli/tune_commands.py:349-353`, `377-425` — 計画のみの経路、room 予約のベース引数への追加、測定後の preset / report 保存。
+- `terminal/strata_control/tune_knobs.py:425-452` — goal と用途による候補設定の選別。
+- `terminal/strata_control/autotune.py:713-732` — RAM / VRAM 使用量による候補の拒否条件。
+- `docs/cli/README.md:736-755` — `strata tune auto` のコマンド階層と `--goal` の索引リンク。

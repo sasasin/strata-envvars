@@ -1,45 +1,49 @@
 # `STRATA_SEARCH_KEY`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Settings → Tools → Web search で保存した検索サービス用キーを、エージェント（Harness）プロセスへ渡すための環境変数です。ホストが任意の親プロセス環境から値を読む設定ではなく、保存済みの検索設定から `profile.env` に値を設定し、Harness 起動時に子プロセス環境へ明示的に渡します。キー値は Harness の profile patch には含めず、patch には環境変数名だけを設定します（`apps/host/server/agent/profile.mjs:304-311,338-344`、`apps/host/server/agent/agent-bridge.mjs:218-223`）。
+ホストアプリの Web 検索設定に保存された Exa / Perplexity / DeepSeek の API key を、coding assistant の Harness プロセスへ渡すための環境変数名である。環境変数そのものを設定する利用者向け CLI オプションではなく、Settings → Tools に保存された検索サービスと key から Strata が値を設定する。検索グループが無効、サービスが builtin、または key が空なら Strata はこの名前を agent 用環境に追加しない。profile には key の値ではなく環境変数名だけを含める（`app/host/server/agent/profile.mjs:440-447,480-485`）。
 
 ## 値と判定
 
-この環境変数を Strata が数値や真偽値として parse する箇所はありません。通常の設定経路では、`tools-settings.mjs` が保存値を文字列として取り込み、`profile.mjs` が設定済みサービスと空でないキーの組み合わせに限り、その文字列をそのまま `profile.env.STRATA_SEARCH_KEY` に代入します（`apps/host/server/agent/tools-settings.mjs:29-35,167-177`、`apps/host/server/agent/profile.mjs:304-311`）。
+Strata はこの名前を `getenv` で読むのではない。`buildProfile` が設定オブジェクト `tools.search.key` を判定し、条件を満たすと `env.STRATA_SEARCH_KEY` に代入する。保存設定の正規化では provider を `builtin` / `exa` / `perplexity` / `deepseek` のいずれかに限定し、key は文字列以外なら空文字にする。Settings 更新経由で key を登録すると前後空白を除去し、空文字、501 文字以上、空白または NUL を含む値を拒否する。一方、key のサービス側での有効性や文字種は Strata では検証しない（`app/host/server/agent/tools-settings.mjs:19,30-36,183-193`）。
 
-| 検索設定 | `profile.env` への設定 | Harness に渡す検索設定 |
-|---|---|---|
-| 検索ツールが OFF | 設定しない | 検索行を作らない |
-| provider が `builtin`、または provider がキー対応でもキーが空 | 設定しない | DuckDuckGo を選ぶ（DeepSeek 行は無効） |
-| provider が `exa` / `perplexity` / `deepseek` かつキーが空でない | 保存されたキーを設定 | 選択したサービスに対応する行を設定し、`STRATA_SEARCH_KEY` を参照させる |
+| 条件 | unset / 空文字 | 値が設定される条件 | 無効・非該当の例 |
+|---|---|---|---|
+| 検索グループが有効 | provider が `builtin`、または key が空なら環境変数を追加しない。builtin の検索設定を使う | provider が `exa` / `perplexity` / `deepseek` のいずれかで、key が空でない文字列なら、その文字列を設定 | 未設定・`""` は false 扱い。provider が未知なら正規化で `builtin` となる |
+| 検索グループが無効 | 値を追加せず、Web 検索用 profile entry も作らない | なし | 保存 key があっても `tools.off` に `search` があれば使わない |
+| 通常の Settings 更新で保存する key | 空文字は拒否され、保存値を消す値としても受け付けない | 前後空白を除いた 1〜500 文字で、空白文字と NUL を含まない文字列 | 空白だけ、空白入り、NUL 入り、501 文字以上は拒否。`true` / `false` / `0` に特別な意味はなく、文字列としての key |
 
-`STRATA_SEARCH_KEY` が設定されない経路では、Harness 子プロセス環境の元になるホスト環境からも ambient credential は除かれます。`agentEnvironment()` は `KEY` を含む名前を `SECRET_NAME` として通常の継承対象から除外し、`profile.env` など `extra` の明示分だけを後から追加します（`apps/host/server/agent/harness-runtime.mjs:20-36,76-83`）。したがって、親環境に同名変数だけを設定しても、この経路で Harness に渡るとは限りません。
-
-Settings API で新しく保存するキーは、前後の空白を trim した後、空文字、500 文字超、空白文字または NUL を含む値を拒否します。サービス変更時は以前のサービスに属するキーを空にします（`apps/host/server/agent/tools-settings.mjs:167-177`）。これは設定保存時の検証であり、環境変数値自体を受け取る parser の規則ではありません。既存設定の読み込みでは文字列型かどうかのみを確認し、保存時と同じ再検証はしません（同 `:29-35`）。
+`buildProfile` の有効判定は文字列全体の parse や `1` 比較ではなく、許可された provider かつ `tools.search.key` の truthiness である。従って通常の保存経路では空 key は設定されず、任意の非空文字列は形式検証なしに設定される。設定ファイルに手で空白だけの文字列を置いた場合は正規化で trim されないため truthy として扱われるが、Settings 更新経由ではその値は保存できない（`app/host/server/agent/tools-settings.mjs:30-36,183-193`; `app/host/server/agent/profile.mjs:440-447`）。
 
 ## 有効になる条件
 
-- `search` ツールグループが OFF でないこと（`apps/host/server/agent/profile.mjs:304-311,330-331`）。
-- `tools.search.provider` が `exa`、`perplexity`、`deepseek` のいずれかで、保存キーが空でないこと。provider の許容値は `builtin` を含む4種類です（`apps/host/server/agent/tools-settings.mjs:18,29-35`）。
-- 実際の Harness 起動が必要です。API の選択やキーの設定だけでは環境変数を使う子プロセスは起動しません（`apps/host/server/agent/agent-bridge.mjs:212-229,250-274`）。
-
-`exa` と `perplexity` では Strata の `strata-search.mjs` が `config.keyEnv` で示された名前から `process.env` を読み、キー付き provider を登録します（`apps/host/server/agent/plugins/strata-search.mjs:16-24`）。`deepseek` では Strata は Harness の `web-search-deepseek` 設定に `apiKeyEnv: 'STRATA_SEARCH_KEY'` を渡すところまでを行います（`apps/host/server/agent/profile.mjs:308-310`）。Harness 側の読み取りや通信動作はこの調査の対象外です。
+- agent bridge が利用可能で、Harness runtime を起動すること。Strata は profile を組み立て、Harness の子プロセス起動時に `profile.env` を追加環境として渡す（`app/host/server/agent/agent-bridge.mjs:295-312`; `app/host/server/agent/harness-runtime.mjs:25-36,75-83`）。
+- Settings → Tools で Search the web が有効であること。無効なら検索 provider の entry 自体を作らない（`app/host/server/agent/profile.mjs:440-447`）。
+- 有料検索 provider の場合は `exa` / `perplexity` / `deepseek` のいずれかを選び、その provider に属する非空 key を保存していること。provider を変更すると既存 key を空に戻す（`app/host/server/agent/tools-settings.mjs:183-192`）。
+- Exa / Perplexity は Strata の `strata-web-search` plugin を登録する経路である。plugin は設定名 `config.keyEnv` を通じて `process.env[config.keyEnv]` を検索時に参照する。DuckDuckGo 経路には key は使われない（`app/host/server/agent/profile.mjs:444-447`; `app/host/server/agent/plugins/strata-search.mjs:16-24`）。
+- DeepSeek を選んだ場合、Strata は Harness の `web-search-deepseek` entry に `apiKeyEnv: 'STRATA_SEARCH_KEY'` を渡す。Harness provider 内での読み取りや通信の細部は Strata 所有コードではないため、ここでは断定しない（`app/host/server/agent/profile.mjs:444-445`）。
+- OS、GPU backend、モデル種別、CLI 引数による分岐はこの値設定箇所にはない。環境変数名に `KEY` が含まれるため、親プロセスからの値は agent の通常環境を作る際に秘密情報として除外される。Strata が profile に明示した値だけが追加環境として子プロセスに渡る（`app/host/server/agent/harness-runtime.mjs:20-36,80-83`）。
 
 ## 実行時の詳細
 
-`agent-bridge.mjs` はプロフィールを作り直して設定を確認し、Harness 起動時に `profile.env` を `HarnessProcess` に渡します。`HarnessProcess.start()` はそれを `agentEnvironment(process.env, { ...this.extraEnv, DSH_HOME: ... })` に合成して子プロセスを起動します（`apps/host/server/agent/agent-bridge.mjs:180-185,218-223`、`apps/host/server/agent/harness-runtime.mjs:67-83`）。このため、ホスト側の保存設定を変えただけで実行中プロセスの環境が書き換わるわけではありません。
+`buildProfileNow` は Settings を読み直して profile を作る。条件が成立すると `profile.env` に key を入れ、Harness 起動時に `agentEnvironment` の `extra` として渡す。このため値は起動する Harness プロセスの環境に固定される。Exa / Perplexity 用 plugin の `keyOf` は `apply` 時ではなく provider が key を求めるたびに `process.env[config.keyEnv] ?? ''` を評価するが、実行中の親 Strata の設定変更で既存 child process の環境値は書き換わらない（`app/host/server/agent/agent-bridge.mjs:251-263,295-312,334-355`; `app/host/server/agent/harness-runtime.mjs:25-36,75-83`; `app/host/server/agent/plugins/strata-search.mjs:16-23`）。
 
-プロフィールは次の要求時にも再生成されます。キー値は `toolsSignature` の入力に含まれ、変更が検出されると、進行中の turn が終わるまで待って Harness を止め、新しいプロフィールと環境で起動します（`apps/host/server/agent/profile.mjs:342-348`、`apps/host/server/agent/agent-bridge.mjs:250-274`）。Exa / Perplexity 用プラグインの `keyOf()` はサービス呼び出し時に `process.env[config.keyEnv] ?? ''` を評価するため、子プロセス内では固定された環境値を参照します（`apps/host/server/agent/plugins/strata-search.mjs:16-24`）。
+key は profile patch へ書かず、agent が利用できる環境変数として分離する。値そのものは profile の署名に含まれ、Web 検索設定の signature にも含まれるため、key の変更は次の message で runtime が既存値と異なると判定される。既存 runtime が動作中なら idle になるのを待って停止し、新しい profile で起動する。key は画面へは渡さず、画面側に返るのは `keySet` の真偽値だけである。起動ログ保存時や失敗情報では追加環境の値を redact する（`app/host/server/agent/profile.mjs:480-491`; `app/host/server/agent/tools-settings.mjs:124-130,145-163`; `app/host/server/agent/agent-bridge.mjs:347-364`; `app/host/server/agent/harness-runtime.mjs:88-112`）。
 
-不正なキーを送った場合、Strata 実装の Exa / Perplexity 呼び出しは HTTP 401/403 を「`<service> did not accept the key. Check it in Settings, Tools.`」という `SearchUnavailable` にします。通信失敗、429、その他の HTTP エラーもそれぞれ `WEB_PROVIDER_ERROR` / `WEB_RATE_LIMITED` 等へ変換します（`apps/host/server/web-search-keyed.mjs:10-25`）。DeepSeek のキー拒否時の具体的な表示・失敗動作は Harness 側なので、ここでは断定しません。
+この変数自体の値に対する CLI 引数や別の環境変数による優先順位はない。検索 service の選択は Settings の provider による。key が空、または provider が `builtin` なら `keyed` は null となり、検索グループが有効な場合は Strata が DuckDuckGo provider を profile に指定する（`app/host/server/agent/profile.mjs:440-447`）。
+
+## ログと測定値
+
+Strata は key の設定・未設定を示す専用ログを出さない。Exa / Perplexity の検索要求で Strata の `web-search-keyed.mjs` が 401 または 403 を受けると `SearchUnavailable` に `"<service> did not accept the key. Check it in Settings, Tools."` を設定する。429 は `"<service> says there have been too many searches. Try again in a minute."`、通信失敗は `"The search could not reach <service>. Check the internet connection and try again."` とする（`app/host/server/web-search-keyed.mjs:10-25`）。これらは検索処理のエラーであり、この環境変数を設定しただけで出る起動ログではない。DeepSeek provider 側の失敗表示は Strata 所有コードから確認できない。
 
 ## 根拠
 
-- 全参照検索: `STRATA_SEARCH_KEY` は Strata 所有ソースでは `apps/host/server/agent/profile.mjs:307,309,311,347` に現れ、動的な読み取りは `apps/host/server/agent/plugins/strata-search.mjs:17` の `process.env[config.keyEnv]` です。ほかの一致は README とテストにあり、候補名の参照を含めて確認しました。
-- 設定の検証・保存値の公開範囲: `apps/host/server/agent/tools-settings.mjs:29-45,116-157,167-189`。
-- キーの設定条件・profile patch との分離・変更署名: `apps/host/server/agent/profile.mjs:304-311,338-348`。
-- 子プロセス環境のフィルタと明示的な追加: `apps/host/server/agent/harness-runtime.mjs:20-36,76-83`。
-- 認証失敗などの Strata 側エラー変換: `apps/host/server/web-search-keyed.mjs:10-25`。
+- 設定値の正規化、画面向けの `keySet`、更新時の validation: `app/host/server/agent/tools-settings.mjs:19-36,124-130,145-163,183-193`
+- provider と key の判定、profile entry、signature: `app/host/server/agent/profile.mjs:440-447,480-492`
+- Settings 読み直し、profile 生成、runtime 更新: `app/host/server/agent/agent-bridge.mjs:251-263,295-312,334-364`
+- 親環境の秘密値除外と Harness への追加環境の引き渡し: `app/host/server/agent/harness-runtime.mjs:20-36,75-112`
+- 動的環境名参照と Exa / Perplexity plugin の登録: `app/host/server/agent/plugins/strata-search.mjs:13-24`
+- Exa / Perplexity の key 使用と Strata 側のエラー処理: `app/host/server/web-search-keyed.mjs:10-25,28-64`

@@ -1,43 +1,39 @@
 # `STRATA_NO_MULTI_GR`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-複数 token の gated-residual（GR）処理で、まとめて行う読み書きや token 数ごとに特殊化した CUDA kernel を避けるための診断・A/B 用スイッチです。設定すると、通常の `gr_read_multi` / `gr_write_multi` は可能な場合でも token ごとの `gr_read` / `gr_write` にフォールバックします。MTP の residual write も同様に分岐します。
+`STRATA_NO_MULTI_GR` は、複数 token をまとめて行う hyper-connection（GR）の一部の読出し・残差書込み最適化を避けるための実行時フラグです。Strata はこの値を真と判定すると、CUDA/HIP の `gr_read_multi` / `gr_write_multi` が使う native multi-token 経路を選ばず token ごとの呼出しへフォールバックします。また、Verifier と MTP の窓処理で GR 書込みを token ごとに呼び、CUDA fused GR の一部で token 数ごとに特殊化したカーネルを選ばないようにします（`engine/src/kernels/cuda/gr.cu:466-509,531-549`、`engine/src/kernels/cuda/fused_gr.cu:1816-1820,1836-1854`、`engine/src/core/verify.cpp:348,1753-1775`、`engine/src/core/mtp.cpp:1458-1477`）。
 
-ただし、すべての経路が完全に逐次化されるわけではありません。`fused_gr_read_multi` は複数 token の fused 経路を保ち、この変数を使って kernel の token 数特殊化を選ばないようにします。
+これは全演算を逐 token 化する指定ではありません。GR の外側にある MoE router、expert grouping / combine 等の batch 経路は、このフラグによる分岐の対象ではありません（例: `engine/src/core/mtp.cpp:1422-1450,1462-1477`）。また、fused GR の `exact_t` を無効にする分岐では複数 token を扱う fused kernel 自体は残ります（`engine/src/kernels/cuda/fused_gr.cu:1820-1829,1847-1854`）。
 
 ## 値と判定
 
-読み取り側は `getenv()` の結果を、未設定か、空文字か、先頭文字が `0` かで判定します。文字列全体や数値としての妥当性は調べません。
+各読み取り箇所は `getenv` の値について「未設定ではない」「先頭 byte が NUL でない」「先頭 byte が文字 `'0'` でない」を調べます。文字列全体の parse や数値変換はしません。従って `1` だけでなく `true`、`TRUE`、`-1`、` 0` は有効、空文字・`0`・`0anything` は無効です。空白の trim、大文字小文字変換、数値としての妥当性検査はありません。CUDA/HIP の共通 kernel と MTP、SYCL の同等箇所はこの規則です。Verifier の `env_on` helper も同じ先頭 byte 判定を使います（`engine/src/core/verify.cpp:336-339,348`、`engine/src/core/mtp.cpp:1458-1461,2592-2595`、`engine/src/kernels/cuda/gr.cu:466-472`、`engine/src/kernels/cuda/fused_gr.cu:1816-1820`、`engine/sycl/src/core/verify.cpp:151-154,242`、`engine/sycl/src/core/mtp.cpp:1173-1176`、`engine/sycl/src/kernels/cuda/gr.dp.cpp:689-695`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | OFF |
-| 空文字 | OFF |
-| 先頭文字が `0`（例: `0`, `0abc`） | OFF |
-| その他の非空文字列（例: `1`, `2`, `true`, `false`, `-1`, ` 1`） | ON |
+| 条件 | unset | 無効値の例 | 有効値の例 |
+|---|---|---|---|
+| CUDA/HIP/SYCL の掲載箇所 | false（multi-token 経路の条件を維持） | `""`, `"0"`, `"0anything"` | `"1"`, `"true"`, `"-1"`, `" 0"` |
 
-CUDA/SYCL の GR kernel と MTP には同じ判定式が複数あります。Verifier は `env_on()` を使い、同じく「未設定でなく、空でなく、先頭文字が `0` でない」場合に ON とします（`src/core/verify.cpp:172-182`, `sycl/src/core/verify.cpp:92-104`）。
+`STRATA_NO_MULTI_GR` を上書きする CLI 引数や別の設定値は、対象の分岐では参照されません。判定は boolean であり、境界数値や fallback 値はありません。
 
 ## 有効になる条件
 
-- 通常の GR の multi-token 読み書きへの影響は、`gr_read_multi` / `gr_write_multi` が呼ばれ、`native_mmvf` が有効で、対象 token 数が 1 より大きい場合に現れます。この条件で OFF なら native multi-token 経路を使い、ON なら token ごとの関数呼び出しに進みます（`src/kernels/cuda/gr.cu:422-457,479-497`; SYCL 対応実装: `sycl/src/kernels/cuda/gr.dp.cpp:696-702,786-800`）。
-- Verifier の residual write は `dec_batch` が有効で、複数行を処理するときだけ multi-write の選択が関係します。`STRATA_NO_MULTI_GR` が ON なら各 token の `gr_write()` を呼びます（`src/core/verify.cpp:1011-1032,1676-1680`; SYCL: `sycl/src/core/verify.cpp:956-962,1520-1524`）。
-- MTP の residual write は `fuse_head_gr` が無効な場合に分岐します。ON ならループ内で token ごとの `gr_write()`、OFF ならループ後に `gr_write_multi()` を使います。`fuse_head_gr` が有効な場合はこの分岐を通らず、fused 経路を使います（`src/core/mtp.cpp:924-943,945-957`; SYCL: `sycl/src/core/mtp.cpp:1072-1091,1093-1105`）。
-- fused CUDA GR kernel では ON の場合 `exact_t` を無効にし、`gr_down_staged_kernel` の token 数ごとの `<1..6, true>` 特殊化を選ばず、汎用 kernel 分岐へ進みます。また `gr_up` 側は実 token 数でなく `kFusedGrMaxT` を使った switch になります。ここでも複数 token をまとめる fused 呼び出し自体は残ります（`src/kernels/cuda/fused_gr.cu:1052-1082,1097-1117`）。
+- CUDA/HIP の GR kernel では、`gr_read_multi` / `gr_write_multi` が呼ばれ、token 数が 1 より大きい場合に native multi-token 経路を外します。`native_mmvf` が無効なら元からその経路を通らず、フラグによる追加の切替はありません。`gr_read_multi` は通常の `gr_read` を token ごとに呼び、`gr_write_multi` も `gr_write` を token ごとに呼びます（`engine/src/kernels/cuda/gr.cu:474-509,531-549`）。
+- SYCL の移植 kernel にも同じ条件があります。`native_mmvf` が有効で複数 token の場合に限り、multi-token GR 読み書きの最適化を避けます（`engine/sycl/src/kernels/cuda/gr.dp.cpp:697-710,787-803`）。
+- Verifier の batch decode では、`dec_batch` と group の `n > 1` 等を満たす GR 書込みを個別 token にします。最終 layer の `dec_batch` 書込みも `g_no_multi_gr` が真なら個別呼出しです（CUDA: `engine/src/core/verify.cpp:1753-1775,2984-2988`、SYCL: `engine/sycl/src/core/verify.cpp:1183-1188,1839-1843`）。
+- MTP では `T` 件の draft token の GR 書込みについて、head GR を fuse していない場合に token ごとの `gr_write` を選びます。fused head GR が有効な場合、この明示的な書込み分岐は実行されず、後段の fused GR 読み出し側の処理が使われます（CUDA: `engine/src/core/mtp.cpp:1458-1477,1481-1512,2592-2612`、SYCL: `engine/sycl/src/core/mtp.cpp:1173-1192`）。
+- CUDA fused GR read では `exact_t = false` となり、staged down read の `exact_t` による token 数別 template 分岐（`ct == 1..6`）を通しません。その後は `max4` 条件を満たせば `<4>` kernel、それ以外は generic kernel を選びます。また、複数の up kernel 選択で `no_multi_gr` が真なら `kFusedGrMaxT` を template token 数として渡します。ここは fused GR 経路内のカーネル選択であり、外側の fused multi-token 呼出しを止めるものではありません（`engine/src/kernels/cuda/fused_gr.cu:1816-1820,1836-1854,1872-1925`）。
+- 1 token の呼出し、batch / MTP の対象外経路、または GR の multi-token API を呼ばない経路には、これらの分岐による効果はありません。生成 token や routing 選択を変更する条件分岐は、ここで確認した読み取り箇所にはありません。
 
 ## 実行時の詳細
 
-Verifier 側の値は `verify.cpp` のグローバル `const bool` 初期化時に読み取られます。GR kernel と MTP の関数内にある値は、それぞれの static 初回評価時に保存されます。いずれも一度評価した後は環境を書き換えても同じプロセスでは反映されません。起動時に設定して使います。
+CUDA/HIP と SYCL Verifier の `g_no_multi_gr` は namespace-scope `const bool` 初期化時に読みます。プロセス開始後の環境変更はこの値に反映されません（`engine/src/core/verify.cpp:336-349`、`engine/sycl/src/core/verify.cpp:151-154,242-243`）。CUDA/HIP `gr.cu`、CUDA fused GR、CUDA/SYCL MTP および SYCL `gr.dp.cpp` は関数内 `static const bool` の初回評価で値を保存します。それぞれ最初に該当 kernel / MTP 経路へ到達した後の変更は反映されません（`engine/src/kernels/cuda/gr.cu:466-472`、`engine/src/kernels/cuda/fused_gr.cu:1816-1820`、`engine/src/core/mtp.cpp:1458-1461,2592-2595`、`engine/sycl/src/core/mtp.cpp:1173-1176`、`engine/sycl/src/kernels/cuda/gr.dp.cpp:689-695`）。
 
-この変数を読んで値に応じた専用ログを出す箇所は、調査対象ソースでは確認できませんでした。変更するのは GR/MTP の処理経路と kernel の選択です。`docs/DETAILS.md` には CPU の IQ multi-token kernel と丸め差に関する説明がありますが、`STRATA_NO_MULTI_GR` の説明や、この変数による GR の数値同一性・性能測定は見つかりませんでした（`docs/DETAILS.md:97-105`）。そのため、この資料から GR 側の出力同一性や速度効果は断定しません。
+値の不一致による警告や設定値のログは、これらの読み取り・分岐にはありません。後続 kernel の実行失敗時には各経路の既存エラー処理が働きますが、`STRATA_NO_MULTI_GR` 固有の終了・失敗経路は見当たりません。たとえば CUDA `gr_read_multi` / `gr_write_multi` は同期失敗を stderr に出して終了するコードを持ちますが、これはフラグ値を理由とするものではありません（`engine/src/kernels/cuda/gr.cu:491-501,534-549`）。
 
 ## 根拠
 
-- 共通の値判定と Verifier の multi-write 分岐: `src/core/verify.cpp:172-182,1011-1032,1676-1680`; SYCL: `sycl/src/core/verify.cpp:92-104,956-962,1520-1524`。
-- CUDA の multi-token GR read/write の切替: `src/kernels/cuda/gr.cu:414-457,479-497`; SYCL: `sycl/src/kernels/cuda/gr.dp.cpp:688-702,786-800`。
-- MTP の値判定と residual write: `src/core/mtp.cpp:924-943`; SYCL: `sycl/src/core/mtp.cpp:1072-1091`。
-- Fused CUDA GR kernel の token 数特殊化: `src/kernels/cuda/fused_gr.cu:1052-1082,1097-1117`。
-- 関連する資料の範囲: `docs/DETAILS.md:97-105`。
+- 全直接参照と候補確認: `engine/src/core/verify.cpp:348`、`engine/src/core/mtp.cpp:1458-1461,2592-2595`、`engine/src/kernels/cuda/gr.cu:466-472`、`engine/src/kernels/cuda/fused_gr.cu:1816-1820`、`engine/sycl/src/core/verify.cpp:242`、`engine/sycl/src/core/mtp.cpp:1173-1176`、`engine/sycl/src/kernels/cuda/gr.dp.cpp:689-695`。その他の一致はコメント、生成設定データ、または調査対象外の test のみでした。
+- `docs/DETAILS.md` にはこの変数名の記載がなく、動作根拠には使用していません。

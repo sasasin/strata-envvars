@@ -1,59 +1,47 @@
 # `STRATA_GR_V3_PF`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-CUDA/HIP fused hyper-connection read の v3（stream-split）経路で、`gr_down_v3_kernel` と `gr_up_v3_kernel` が使う load-ordering variant を bit mask で選びます。対象は読み込み順や shared-memory staging の variant で、kernel 内の計算結果は plain variant と bitwise 同じになるよう実装されています。環境変数自体は kernel 選択を直接有効化しません。v3 read が別途選ばれた場合に限り、その一部の dispatch を変えます。
+CUDA/HIP fused hyper-connection の v3 read が選ばれた場合に、down/up カーネル内の load ordering variant をビットマスクで選ぶ。通常の v3 kernel と同じ値・演算順序を保つ load scheduling variant で、読み出しアルゴリズム自体を v3 に切り替える変数ではない。v3 の選択は別の `STRATA_GR_V3` が決める。読み取りと dispatch は `engine/src/kernels/cuda/fused_gr.cu` の `v3_pf_mask()` / `fused_gr_read_multi_slice()` にある（同ファイル:4117-4141, 4351-4397）。
 
 ## 値と判定
 
-`std::getenv` の結果を `std::atoi` で整数に変換します。文字列全体の検証はなく、先頭の空白と符号を受け付け、数字の先頭部分を変換し、後続文字は無視します。数字が始まらない値（空文字を含む）は `0` になります。
+最初に v3 read の実行経路から `v3_pf_mask()` が呼ばれた時、関数内 `static const int` 初期化で `std::getenv` を一度だけ行い、設定されていれば `std::atoi` の結果を保存する。未設定は sentinel `-1` となり、負の数値も `env >= 0` を満たさないため自動既定値へ進む。空文字列や数値として読めない文字列は `atoi` により 0。先頭の空白・符号の後の数値接頭辞が変換され、末尾の非数字は検査されない（例: `5tail` は 5、`true` は 0）。変換後の値域検査・clamp はなく、非負値がそのまま bit mask として使われる（`engine/src/kernels/cuda/fused_gr.cu:4123-4141`）。
 
-| 値 | mask の扱い |
-|---|---|
-| 未設定 | device ごとの既定値を使う（以下参照） |
-| `0`、空文字、数字で始まらない文字列 | 明示 mask `0`。PF variant を無効化 |
-| 0 以上の整数 | その整数を bit mask として使う。例: `5tail` は `5` |
-| 負の整数 | `env >= 0` の条件を満たさず、未設定時と同じ device 既定値へ進む |
+| ビルド・条件 | unset または負値 | 有効値の例 | 無効値・効果の例 |
+|---|---|---|---|
+| CUDA、v3 read が動く | compute capability 12.0 かつ `STRATA_SM120_PERF` が無効化しておらず、`STRATA_DEFAULTS` が v0.2.6 指定でなければ既定 mask `133`。それ以外は `0` | `0` は plain v3 kernels、`5` は down bit 0 と up bit 2、`128` は bit 7 | 空文字、`true`、`0tail` は `atoi` 結果 0 なので plain v3 kernels。`-1` は自動既定値 |
+| HIP | `0` | 明示した非負 mask は返される | unset は常に `0`。ただし変数を設定しただけでは v3 read を選択しない |
 
-使われる bit は次のとおりです。
+mask の対応は bit 0=down staging load variant、bit 1=down weight prefetch、bit 2=up partial/input loads、bit 3=up weight prefetch、bits 4-5=down rows-per-warp 2/4、bit 7=down register-blocked dot（5 token 以上の window）、bit 8=同 variant の 4-row dispatch。bit 6 とそれ以外の未参照 bit は dispatch に効果がない（`engine/src/kernels/cuda/fused_gr.cu:4117-4122, 4358-4389`）。
 
-| bit | 対象 | variant |
-|---:|---|---|
-| 0 | down | staging の token load をまとめて発行 |
-| 1 | down | weight prefetch |
-| 2 | up | partial sum と row input の load を先行 |
-| 3 | up | weight prefetch |
-| 4–5 | down | warp あたり 2 / 4 rows（`T <= 4` の dispatch） |
-| 7 | down | register-blocked dot。dispatch は `n_tok >= 5` で R2V=2 の場合 |
-| 8 | down | register-blocked dot。dispatch は R2V=4 の場合 |
-
-bit 6 と上記以外の bit はこの dispatch では参照されません。mask は bits の組み合わせなので、`1` は down の bit 0、`5` は down bit 0 と up bit 2、`133` は bit 0・2・7 を指定します。負値を「全 bit 有効」として扱うことはなく、device 既定値に戻ります。
-
-未設定時の既定 mask は CUDA compute capability 12.0 で `133`、それ以外では `0` です。compute capability 12.0 の既定値は `STRATA_SM120_PERF` が無効化していないこと、かつ `STRATA_DEFAULTS=026` 相当でないことを条件にします。明示した 0 以上の値はこの既定値に優先し、これらの既定値スイッチが off でも使われます。
-
-根拠: `src/kernels/cuda/fused_gr.cu:2669-2693,2901-2907`; `include/strata/core/bw_dense_defaults.hpp:14-16`; `include/strata/core/sm120_series.hpp:30-40,58-64`; `include/strata/core/defaults_026.hpp:21-29`。
+CUDA の自動既定値は `gr_v3_pf_default()` が計算し、sm_120 のみ `133`、その他は `0`。sm_121/GB10 はこの mask の既定を有効にしない定数設定。sm_120 でも `STRATA_SM120_PERF=0` または `STRATA_DEFAULTS=026`（同義指定 `0.2.6` / `v0.2.6` を含む）が既定値を 0 にする。これらの変数は本変数が未設定または負値のときの自動既定にだけ関係し、本変数の非負値が優先する（`engine/include/strata/core/bw_dense_defaults.hpp:14-16`, `engine/include/strata/core/sm120_series.hpp:32-38, 60-81, 100-106`, `engine/include/strata/core/defaults_026.hpp:22-29`）。
 
 ## 有効になる条件
 
-- `fused_gr_read_multi` が v3 read に進む必要があります。`STRATA_GR_V3` が明示されていれば `atoi(...) != 0` が on/off を決め、未設定時は CUDA の compute capability 12.0、離散 GPU、13 GiB 超などの既定規則で決まります。HIP build の v3 既定値は off です。別環境変数 `STRATA_GR_V3` が off、または v3 が選ばれなければ、この mask は read に影響しません。
-- Q8 down/up の入力がある read は先に Q8 kernel 経路へ return するため、v3 mask は適用されません。
-- v3 が選ばれ、shared-memory 属性設定に成功して `split == 1` となった経路で mask を読み、down/up kernel の dispatch に使います。必要な shared memory が収まらない場合は `split` が `-1` のままで、v3 read 自体が使われず mask も適用されません。二分割が必要なカードでは stderr に `strata: STRATA_GR_V3=1 needs the two-half split on this card, which fails its checks (#375): the default read is used` と出します。
-- bit 7 の down variant は `n_tok >= 5` で R2V=2、bit 8 は R2V=4 の dispatch を試します。bit 4–5 の row-per-warp variant は 1〜4 token 用です。これら mask 指定の dispatch が選ばれないとき、`STRATA_GR_R2` が 5〜8 token の通常 down kernel の R2V を選びます（既定 2、1/2/4 以外は 0 として generic kernel）。
+- `fused_gr_read_multi_slice()` の通常経路まで到達する必要がある。Q8 down/up weights がある場合は先行する Q8 経路へ戻り、`rdna_gr_enabled()` が true の場合も RDNA 経路へ戻るため、いずれもこの mask を使わない（`engine/src/kernels/cuda/fused_gr.cu:4279-4303`）。
+- さらに `STRATA_GR_V3` により v3 が選ばれ、デバイスの shared-memory 条件を満たして split が正に決まる必要がある。`STRATA_GR_V3` 未設定時の v3 自動選択は CUDA の discrete sm_120、13 GiB 超などに限られる。HIP は自動選択しないが、別変数 `STRATA_GR_V3` で明示的に選択された経路はコード上 mask 判定に進み得る（`engine/src/kernels/cuda/fused_gr.cu:4099-4113, 4304-4351`）。
+- `STRATA_GR_V3=0`、または v3 split が成立せず既定 read に fallback する場合は本変数は効果を持たない。split が 2 の経路では down/up とも split-2 kernels を直接起動し、mask による variant dispatch を行わない（`engine/src/kernels/cuda/fused_gr.cu:4351-4382`）。
+- 非負の環境 mask は自動既定値を置き換える。ベンチ/診断用 API `fused_gr_v3_pf(mask)` が先に `g_v3_pf_force` を非負値に設定した場合は、その強制値が環境変数より優先される。通常の CLI 引数による上書きはこのコードにない（`engine/src/kernels/cuda/fused_gr.cu:4142, 4358, 4440`; 宣言は `engine/include/strata/kernels/fused_gr.hpp:78-82`）。
 
 ## 実行時の詳細
 
-環境値は `v3_pf_mask()` 内の function-local `static const int` で初回評価時に一度だけ読みます。初回評価は v3 read が `split == 1` となり dispatch に到達した時です。それ以降、プロセス内で環境を変更しても再評価しません。既定値の GPU 判定は別に device ごとに cache します。
+環境値は v3 mask が初めて必要になった時に一度だけキャッシュされ、プロセス実行中に環境を変更しても再読込されない。自動既定 mask は別に device ごと（最大 64 slot）にキャッシュされる。CUDA では down/up dispatch が mask bits 0-5, 7, 8 に応じて variant を選び、該当しない token window では通常の v3 kernel に戻る。たとえば bit 7 は `n_tok >= 5` のとき先に試され、bit 8 はその後に試される。既定 mask 133 (`128 + 4 + 1`) は bit 7 と down bit 0 / up bit 2 を指定する（`engine/src/kernels/cuda/fused_gr.cu:4123-4141, 4358-4391`）。
 
-通常の read ではこの環境値が採用されます。ベンチマーク用 API `fused_gr_v3_pf(mask)` が呼ばれて global override が 0 以上なら、その mask が環境値に優先します。`-1` を設定すると環境値に戻ります。この API はヘッダーで bench only とされており、通常の CLI option ではありません。該当する環境変数の読み取り・警告・ログ出力以外に、値をユーザーへ表示するログはありません。
+`fused_gr_read_multi_slice()` は 1..8 token window を処理し、より広い window は複数 slice に分割して同関数へ渡す。single-read `fused_gr_read()` ではなく multi-read path が対象であり、engine verifier / MTP などから `fused_gr_read_multi()` が呼ばれる（入口は `engine/src/kernels/cuda/fused_gr.cu:4470-4484`; 代表的呼び出しは `engine/src/core/verify.cpp:1817`, `engine/src/core/mtp.cpp:1243`）。ビルドでは CUDA GPU engine のソース一覧に `src/kernels/cuda/fused_gr.cu` が含まれる（`engine/cmake/strata_gpu_engine.cmake:88-100`）。
 
-v3 kernel launch の直後に `cudaGetLastError()` を確認します。失敗時は stderr に `fused_gr_read_multi v3: <CUDA error>` を出して `exit(1)` します。ここで調べた範囲では、mask の値自体が不正であることを知らせる警告や fallback はありません。`atoi` が整数 0 を返す値は mask 0 として通常 dispatch に進みます。
+## ログと測定値
 
-根拠: `src/kernels/cuda/fused_gr.cu:2675-2693,2838-2853,2854-2894,2901-2940,2983`; `include/strata/kernels/fused_gr.hpp:78-82`。
+環境値の受理・mask 選択を知らせる専用ログや無効値警告はない。v3 kernel launch 後の CUDA error は `fused_gr_read_multi v3: %s` を stderr に出して `exit(1)` する（`engine/src/kernels/cuda/fused_gr.cu:4392-4397`）。
+
+ソースコメントは RTX PRO 5000、cold weights、16 sets、down+up read で mask 5 が T=1..8 に 4–8% 高速（T=4 で 26.45→24.90 µs）、weight-prefetch mask 2 は T=4 で 17% 遅く、2/4 rows-per-warp も遅かったとして、それらを既定では使わないと記録する。このコメント上の測定条件を超えて一般化しない（`engine/src/kernels/cuda/fused_gr.cu:4117-4122`）。`docs/DGX_SPARK_LINUX.md` は GB10 で本変数が level または slower だったとして既定 off と記す（`docs/DGX_SPARK_LINUX.md:124-126`）。
 
 ## 根拠
 
-- 候補名の全参照を確認したところ、実際の環境読み取りは `src/kernels/cuda/fused_gr.cu:2676` のみです。ほかの一致はコメント、既定値 helper の説明、kernel variant の説明、bench/test 用 API 呼び出しです。
-- bit の意味、kernel variant のロード順・計算順は `src/kernels/cuda/fused_gr.cu:736-755,773-785,961-991` にあります。mask による呼び分け、通常 dispatch、および `STRATA_GR_R2` の fallback は `src/kernels/cuda/fused_gr.cu:2894-2934,1592-1597` にあります。
-- `docs/DETAILS.md` にはこの変数名の記述が見つからず、外部測定値は本書に転記していません。
+- `engine/src/kernels/cuda/fused_gr.cu:4117-4141` — mask の意味、環境値変換、既定値分岐。
+- `engine/src/kernels/cuda/fused_gr.cu:4279-4309, 4351-4397` — 適用前の Q8/RDNA 分岐、v3 条件、kernel dispatch とエラー経路。
+- `engine/include/strata/core/bw_dense_defaults.hpp:14-16`, `engine/include/strata/core/sm120_series.hpp:32-38, 60-81, 100-106`, `engine/include/strata/core/defaults_026.hpp:22-29` — 自動既定値と関連変数。
+- `engine/include/strata/kernels/fused_gr.hpp:78-82`, `engine/src/kernels/cuda/fused_gr.cu:4142, 4440` — bench API による強制上書き。
+- `engine/cmake/strata_gpu_engine.cmake:88-100`, `engine/src/core/verify.cpp:1817`, `engine/src/core/mtp.cpp:1243` — build inclusion と multi-read caller の例。

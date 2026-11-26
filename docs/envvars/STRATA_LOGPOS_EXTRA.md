@@ -1,46 +1,43 @@
 # `STRATA_LOGPOS_EXTRA`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`STRATA_LOGPOS` が有効な verify-window の測定出力に、追加で記録する語彙 ID を指定します。各行には、実際の次トークンの log-probability に加え、この追加 ID の log-probability と、その ID を語彙から除外して再正規化した実際の次トークンの log-probability が出力されます。値がプロンプト処理や生成時の token 選択を変える分岐はありません。
+`STRATA_LOGPOS` が出力する prompt の teacher-forced log-probability 行に、指定 token ID の log-probability と、その token の確率質量を除いた正解 token の log-probability を追加するための token ID を指定する。既定値は `248046`（コードコメント上の `<|im_end|>`）である。対象コードは CUDA/HIP 系の `engine/src/program/generate.cpp` と SYCL 系の `engine/sycl/src/program/generate.cpp` にあり、どちらもサーバーの prompt verify windows を読む経路で使われる。値は診断出力の計算だけに渡され、生成 token や verifier の採用結果を変更しない（`engine/src/program/generate.cpp:20453-20467`、`engine/sycl/src/program/generate.cpp:11303-11317`、`engine/src/core/verify.cpp:4482-4503`）。
 
 ## 値と判定
 
-| 値 | 扱い |
-|---|---|
-| 未設定 | `248046` を使用。実装コメントはこの ID を `<|im_end|>` と記載している。 |
-| 設定あり | `std::atoi` の戻り値を `int32_t` に変換して使用。整数全体の厳密な検証はしない。 |
-| 空文字、数字で始まらない文字列 | `atoi` の結果は `0`。 |
-| 数字の後ろに文字がある文字列 | 数字として読める先頭部分を使い、後続文字は無視する（例: `123tail` は `123`）。先頭の空白や符号も `atoi` の規則に従う。 |
-| 負数またはモデルの語彙範囲外 | ID の範囲チェックで追加 token は適用されず、追加 log-probability と除外後 log-probability の列は `nan` になる。 |
+両実装とも `std::getenv` で取得し、未設定なら `248046`、設定されていれば `std::atoi` の結果を `int32_t` にして使う。文字列全体の検証、clamp、別値への fallback はない。`atoi` は先頭の空白と符号を許し、先頭から数値として読める部分を変換するため、`"  -3tail"` は `-3`、`"17x"` は `17`、空文字や数字で始まらない文字列は `0` になる。大文字小文字の区別は該当しない。変換結果が token ID として語彙範囲外なら、その追加 log-probability 欄は `NaN` になる。
 
-数値変換のオーバーフロー値に対する `atoi` の結果はコードで定義・検査されていません。語彙範囲内の値かを設定時に検証したり、fallback したりする処理もありません。
+| 条件 | 未設定 | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP 系・SYCL 系共通 | `248046` | 語彙サイズを `V` としたとき `0` から `V-1`。例: `0`、`248046`（そのモデルの語彙内の場合） | 負値、`V` 以上。例: `-1`、`V`。変換後に範囲外なら追加欄は `NaN` |
+
+明示的な空文字、`abc`、`0anything` は `atoi` により `0` となるため、token ID 0 が語彙内なら有効な ID である。`1` と `true` はそれぞれ ID 1 と 0 として扱われ、真偽値として判定されない。整数の後ろに続く文字は無視される。`atoi` の整数型の範囲を超える入力は C/C++ の変換規則で結果が保証されないため、使用可能な境界値として扱えない（読み取りコードに範囲検査はない）。根拠: `engine/src/program/generate.cpp:20461-20464`、`engine/sycl/src/program/generate.cpp:11311-11314`、範囲判定と出力は `engine/src/core/verify.cpp:4482-4503`、`engine/sycl/src/core/verify.cpp:3116-3137`。
 
 ## 有効になる条件
 
-`STRATA_LOGPOS_EXTRA` 単独では出力を有効にしません。`STRATA_LOGPOS` が設定され、その値で `fopen(path, "ab")` が成功して `logpos` が開けた場合にだけ `window_logprobs()` が呼ばれます。`STRATA_LOGPOS` が未設定、またはパスが空・無効などでファイルを開けなければ、追加 ID を含むログ出力は行われません。open 失敗自体を知らせる専用ログはこの箇所にはありません。
-
-パイプラインの prompt verify 経路では、`STRATA_LOGPOS` が設定されていると並列の `read_windows_pl()` 経路を避け、通常の verify-window loop に進みます。空文字や開けないパスでも環境変数が設定済みならこの分岐判定は同じですが、ログ出力関数は `logpos != nullptr` のときだけ呼ばれます。`STRATA_LOGPOS_EXTRA` はこのパイプライン経路の選択には使われません。
+- `STRATA_LOGPOS` が設定され、その値で追記モード (`"ab"`) の出力ファイルを開ける必要がある。未設定または `fopen` が失敗した場合は `logpos == nullptr` となり、`window_logprobs` は呼ばれず、この変数の値は出力に影響しない。空文字なら空のパスが `fopen` に渡され、戻り値が null のときは同じく行出力されない（`engine/src/program/generate.cpp:20457-20465`、`engine/sycl/src/program/generate.cpp:11307-11315`）。
+- サーバーの prompt が `read_windows` の verify-window 経路を通る必要がある。バッチ化された `read_part` 経路ではこの箇所の行出力は行われない（`engine/src/program/generate.cpp:21551-21555`、`engine/sycl/src/program/generate.cpp:11642-11653`）。
+- `STRATA_LOGPOS` があると、パイプラインの prompt windows も並列の `read_windows_pl` を避けて serial な窓読み取りへ進む。これはログ取得側の条件であり、`STRATA_LOGPOS_EXTRA` 自体がこの経路を選ぶわけではない（`engine/src/program/generate.cpp:20416-20419`、`engine/sycl/src/program/generate.cpp:11277-11281`）。
+- CLI 引数や別設定による `STRATA_LOGPOS_EXTRA` の上書きはこの読み取り箇所にはない。値は各 backend の `read_windows` 内の function-local `static const` として初回到達時に一度だけ読み取られ、その後の環境変更は同プロセス内で反映されない。CUDA/HIP 系と SYCL 系では別々の実行ファイル・実装に属する（同上）。
 
 ## 実行時の詳細
 
-CUDA/HIP と SYCL の `generate.cpp` は、verify-window loop 内の関数ローカル `static const int32_t` として値を初回評価時に取得します。したがって、最初の該当 window の評価後にプロセス環境を書き換えても再読込されません。読み取り自体は `STRATA_LOGPOS` のファイルが開けたかどうかにかかわらず static 初期化箇所に到達すれば行われますが、値が結果に反映されるのはファイルが開けて `window_logprobs()` が実行される場合だけです。
+各 verify window の `ver.run` 後、prompt の次 token ID 配列 `nxt` を教師あり正解として `window_logprobs` に渡す。この関数は head logits を読み、各行について通常の正解 token の log-probability、top token、指定 token ID の log-probability、指定 token ID の確率質量を除いて再正規化した正解 token の log-probability を TSV 行に出す。指定 ID が語彙範囲外なら指定 token の欄は `NaN`、正解 token 自身が指定 ID の場合は「除外後」の欄も `NaN` になる。各行の出力後に flush する。`STRATA_LOGPOS_TOPK` が有効なら上位 token 欄も追加されるが、これは別変数の制御である（`engine/src/core/verify.cpp:4482-4521`、`engine/sycl/src/core/verify.cpp:3116-3155`）。
 
-`window_logprobs()` は各 window の head logits をホスト側へコピーし、各行について全語彙の log-sum-exp を計算します。出力はタブ区切りで、基本列は `pos`, `target`, `logprob`, `top`, `top_logprob`, `hit`, `extra_logprob`, `target_logprob_without_extra` です。`extra_logprob` は指定 ID の確率、`target_logprob_without_extra` はその ID を除いた語彙上で target を再正規化した確率です。target 自体が追加 ID の場合、除外後の target 確率は `nan` になります。各 window の後に出力を flush します。
+ログ計算が失敗すると窓読み取りが失敗する。CUDA/HIP 系では `strata serve: <error>` を stderr、`ERR <error>` を stdout に出す失敗経路があり、SYCL 系にも同形式の serve エラー出力がある（`engine/src/program/generate.cpp:20465-20467, 21593-21596`、`engine/sycl/src/program/generate.cpp:11315-11317, 11659-11662`）。ファイルを開けない場合はこの変数に関する明示的な警告はなく、logprob 行も書かれない。
 
-追加 ID が語彙範囲内であるかの確認は各行の出力時に行います。設定値が不正でも処理を終了させる専用エラーはなく、無効 ID なら追加関連列が `nan` になります。一方、head logits がない場合や CUDA のコピーに失敗した場合には `window_logprobs: no head logits for this window` または `window_logprobs: the head logits copy failed` がエラー文字列に設定され、呼び出し元の prompt 処理が失敗します。SYCL 版では SYCL 例外を `window_logprobs: <例外内容>` に変換します。
+## ログと測定値
 
-## 文書との照合
-
-`docs/UNSLOTH_Q4.md` は `STRATA_LOGPOS` と `STRATA_LOGPOS_TOPK` を使った verify-window の比較測定を説明していますが、`STRATA_LOGPOS_EXTRA` の値や列の説明は見つかりませんでした。したがって、この文書の値判定と出力列の説明は HEAD の実装に基づきます。性能・正確性の測定値は本変数について記載されていません。
+Strata の `docs/DETAILS.md`、`docs/QUANTS.md`、`docs/UNSLOTH_Q4.md` は `STRATA_LOGPOS` による log-probability 計測を説明するが、`STRATA_LOGPOS_EXTRA` 固有の測定値は記載していない。ソースコメントが示す用途は `<|im_end|>` の確率質量を別欄に出し、その質量を除いた正解 token の値を得ること。コメント以外に、この変数による性能・精度の測定結果は確認できない。関連する出力形式と測定手順の資料: `docs/QUANTS.md:56-66`、`docs/UNSLOTH_Q4.md:224-226`。
 
 ## 根拠
 
-- `src/program/generate.cpp:10648-10650,10679-10693`: パイプライン経路の選択、`STRATA_LOGPOS` ファイルを開く処理、`STRATA_LOGPOS_EXTRA` の既定値・変換、ログ関数呼び出し。
-- `sycl/src/program/generate.cpp:9964-9966,9989-10003`: SYCL 実装の同等箇所。
-- `include/strata/core/verify.hpp:278-285`: `window_logprobs()` の出力列と layer split 時の転送についての宣言コメント。
-- `src/core/verify.cpp:2438-2491`: CUDA/HIP 側の語彙範囲判定、log-probability 計算、列出力と flush。
-- `sycl/src/core/verify.cpp:2558-2612`: SYCL 側の対応処理と例外変換。
-- `docs/UNSLOTH_Q4.md:192-198,224-226`: `STRATA_LOGPOS` による測定方法の説明。
+- `engine/src/program/generate.cpp:20416-20419, 20453-20467` — CUDA/HIP 系の prompt window 経路、ログ出力ファイルと環境変数の読み取り。
+- `engine/sycl/src/program/generate.cpp:11277-11281, 11303-11317` — SYCL 系の対応経路。
+- `engine/src/core/verify.cpp:4435-4466, 4482-4521` — CUDA/HIP 系の log-probability 算出、語彙範囲判定、TSV 出力と flush。
+- `engine/sycl/src/core/verify.cpp:3105-3115, 3116-3158` — SYCL 系の同処理。
+- `engine/src/program/generate.cpp:21551-21555, 21593-21596`、`engine/sycl/src/program/generate.cpp:11642-11662` — window 経路の呼び出しと失敗表示。
+- `docs/QUANTS.md:56-66`、`docs/UNSLOTH_Q4.md:224-226` — 関連する Strata の計測方法。

@@ -1,66 +1,61 @@
 # `--control-vector-scaled`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | ネイティブ推論エンジン `strata`（エンジン引数） |
+| コマンド | `strata generate` |
 | オプション | `--control-vector-scaled` |
 | 別名 | なし |
-| 値 | `FILE:SCALE`。カンマ区切りで複数組を指定可能 |
+| 値 | `FILE:SCALE[,...]`。GGUF ファイルのパスと浮動小数点 scale の組をカンマ区切りで指定する |
 
 ## 役割
 
-GGUF 形式の control vector をエンジン起動時に読み込み、モデルの各レイヤーの FFN 書き込み後に残差ストリームへ適用します。指定がなければベクトルは読み込まれません。読み込んだベクトルは通常の生成では有効で、`--serve` ではリクエストごとに有効・無効を切り替えられます（`src/program/generate.cpp:797-803, 953-957, 12304, 12520, 12922-12927`）。
+GGUF の control vector を読み込み、指定 scale を反映した方向ベクトルをモデルの residual stream に適用する。`strata generate` の起動時にロードされ、通常は有効状態で開始する。`--serve` ではリクエストごとに適用を切り替えられる（`engine/src/program/generate.cpp:1199-1205, 1369-1374, 18835, 19149, 20048-20053`）。
 
 ## 使い方
 
-モデルとパックを指定する起動例です。ファイル名とスケールの区切りは最後の `:` です。
-
 ```sh
-./engine/strata --pack ./packs/model --native ./models/model.gguf \
-  --control-vector-scaled ./vectors/style.gguf:0.7 --serve
+strata generate --pack ./pack --tokens "1,2,3" --control-vector-scaled ./vector.gguf:0.7
 ```
 
-ベクトルの適用レイヤー・方式・方向を調整する場合は、関連する [`--control-vector-layer-range`](--control-vector-layer-range.md)、[`--cvec-mode`](--cvec-mode.md)、[`--cvec-dir`](--cvec-dir.md) も指定します（`src/program/generate.cpp:953-957`）。
+複数ファイルは一つの値の中でカンマ区切りにできる。`strata generate` は `--pack` と token 入力を受け取る形式で、例では必要な入力も明示している（`engine/src/program/generate.cpp:1208-1214, 3849-3868, 4164-4178`）。
 
 ## 値と既定値
 
-- 各要素は `FILE:SCALE` で、複数ファイルは `FILE1:SCALE1,FILE2:SCALE2` のように一つの引数内でカンマ区切りにできます。最後のコロンで分割するため、Windows のドライブ文字に含まれるコロンはファイル名側に残ります。ファイル名にカンマを含む場合のエスケープ機能は parser にありません（`src/program/generate.cpp:2703-2716`）。
-- `SCALE` は `strtof` で float に変換します。数値の一部しか読めない値、数値が空の値、`FILE` が空の値、区切りのない値は `--control-vector-scaled: expected FILE:SCALE, got ...` を stderr に出し、終了コード 2 で失敗します。有限値かどうかやスケール範囲の追加検証はありません。負値・ゼロも parser では拒否されません（同上）。
-- 省略時はファイル一覧が空で、何もロードされません。オプション自体の既定スケールはありません。`--control-vector FILE` を同時に指定すると、そのファイルは scale 1 で同じ一覧へ追加されます（`src/program/generate.cpp:797-803, 2702-2716`）。
-- 複数ファイルの同じレイヤーの `direction.<layer>` は、それぞれのスケールを掛けた後に加算されます（`src/program/generate.cpp:1863-1866, 1872-1895`）。
+- 各要素は `FILE:SCALE`。最後の `:` で分割するため、Windows のドライブ文字を含むパスも扱える。scale は `strtof` で変換し、数値部分が空または末尾に未解釈文字がある場合は parser が拒否する。明示的な有限値・範囲チェックはない（`engine/src/program/generate.cpp:4165-4178`）。
+- カンマで複数要素を指定でき、オプションを複数回指定した場合も各ファイルが追加される（`engine/src/program/generate.cpp:4165-4178`）。読み込み時、同じ層の `direction.<layer>` は各ファイルの scale を掛けて加算される（`engine/src/program/generate.cpp:2748-2777`）。
+- オプションを省略するとファイルはロードされない。`--control-vector` は同じファイル一覧に scale `1.0` で追加される（`engine/src/program/generate.cpp:1202, 4164-4165`）。
+- 値を省略すると `--control-vector-scaled needs a value` を stderr に出して終了コード 2 で終了する（`engine/src/program/generate.cpp:3844-3846`）。形式不正は `--control-vector-scaled: expected FILE:SCALE, got ...` を stderr に出し、終了コード 2 を返す（`engine/src/program/generate.cpp:4170-4177`）。
 
 ## 実行時の動作
 
-値を受け取った時点ではファイルを読み込まず、モデル初期化後に `load_control_vectors` が実ファイルを開きます。GGUF の `general.architecture` が `controlvector` であることを要求し、`direction.<layer>` テンソルはモデルの埋め込み幅と同じ要素数の f32 でなければなりません。レイヤー 0 とモデル範囲外のテンソルは無視されます。各ファイルに有効な `direction.<layer>` が一つもない場合は失敗します（`src/program/generate.cpp:1867-1901`）。
+起動時にファイルを開き、GGUF の `general.architecture` が `controlvector` であることを確認する。該当層の `direction.<layer>` tensor を読み、scale を掛けて層ごとに加算した後、GPU 用の方向・scale テーブルをアップロードする（`engine/src/program/generate.cpp:2743-2777, 2813-2829`）。各層では FFN の residual write 後に control vector を適用する（`engine/src/core/layer.cpp:1638-1649`）。
 
-受理したファイルのベクトルはレイヤーごとに合算されます。既定の適用範囲はレイヤー 1 から最終レイヤーまで（両端を含む）です。実際の適用範囲は `--control-vector-layer-range A B` で指定できます。既定の方式は `add` で、このとき合算ベクトル `d` を加えます。`--cvec-mode project` を指定すると合算ベクトルを単位化して `h ← h − (h·v)v` の射影除去を行い、ベクトルのノルムを係数に使います。ゼロベクトルのレイヤーは適用対象になりません。`--cvec-dir single:L` は project 方式でレイヤー L の方向を範囲内の各レイヤーに使います（`src/program/generate.cpp:801-803, 1903-1930`; `include/strata/kernels/cvec.hpp:5-16`）。
+併用する `--cvec-mode` は効果の式を選ぶ。既定の `add` は residual に方向ベクトルを加算し、`project` は方向を単位化して residual のその方向成分を scale 分だけ差し引く。`project` ではファイル群から合成した方向のノルムが scale として使われる（`engine/src/program/generate.cpp:1203-1205, 2793-2809`; `engine/src/kernels/cuda/cvec.cu:84-92`）。
 
-読み込み時に GPU 用のテーブルをアップロードし、レイヤー分割時は処理する各 CUDA デバイスにも複製します。ベクトルは各トークンの各残差ストリームに対して、そのレイヤーの FFN 書き込み後に適用されます（`src/program/generate.cpp:3960-3968, 4368-4371`; `src/core/layer.cpp:1614-1630`; `include/strata/kernels/cvec.hpp:59-63`）。ロード状態・方式・範囲・テーブルはセッション識別 digest にも含まれます（`src/program/generate.cpp:1930-1946`）。
+併用する `--control-vector-layer-range A B` は両端を含む適用層範囲を指定する。省略時、または `A` が 0 以下なら層 1 から、`B` が 0 以下または層数以上なら最終層までとなる。layer 0 に方向はなく、モデル層数を超える tensor は無視される（`engine/src/program/generate.cpp:1203, 2786-2787, 2760-2764`）。範囲内の方向がある層だけが対象になる（`engine/src/program/generate.cpp:2793-2812`）。
+
+`--serve` ではリクエストの `cvec=0|1` キーで切替でき、省略値は 1。有効状態が変わると live session は無効化され、制御ベクトル状態を切り替えてから処理する（`engine/src/program/generate.cpp:18835, 18885-18889, 19149, 20048-20053`）。
 
 ## 適用条件と副作用
 
-- 指定ファイルが開けない、GGUF でない、アーキテクチャ metadata が違う、テンソル形状・型が合わない、対象範囲内に適用可能な方向がない場合、推論開始時に stderr へ `strata generate: control vector: ...` を出し、終了コード 2 で終了します（`src/program/generate.cpp:1872-1901, 1903-1930, 3963-3968`）。
-- `controlvector.model_hint` が存在し、値が `qwen4exp` 以外なら stderr にモデル不一致の警告を出しますが、この箇所ではロードを中止しません（`src/program/generate.cpp:1880-1883`）。
-- ロード成功時は stderr に方式、方向指定、レイヤー範囲、適用レイヤー数を表示します。`--serve` の `INFO` 行には `cvec=<mode>:<first>-<last>` が含まれます（`src/program/generate.cpp:1942-1946, 11078-11092`）。
-- `--serve` はリクエスト属性 `cvec=0|1` を読み、属性が省略されたときは有効として扱います。ロード済みの場合に限って有効・無効を切り替え、状態が変わると live session やチェックポイントの再利用条件を更新します（`src/program/generate.cpp:12304, 12325-12339, 12520, 12922-12927`）。ロードされていない場合、この属性だけではベクトルは適用されません。
-- 通常の CUDA 実装ではロード時にデバイスメモリを確保し、失敗するとロードエラーになります。また、適用カーネル起動の失敗は例外として呼び出し元へ伝わります（`src/kernels/cuda/cvec.cu:26-39, 101-132, 162-171`; `src/core/layer.cpp:1628-1630`）。
-- Metal エンジンでは `cvec()` が空の状態を返す実装であり、このオプションは移植されていません。Metal でのロード・適用はできません（`metal/src/engine/missing.cpp:32-40`; `docs/MAC.md:257`）。SYCL 側には同オプションの parser とカーネル実装ファイルがありますが、この調査では対応する各種デバイス・モデルでの実行は確認していません（`sycl/src/program/generate.cpp:1980-1993`; `sycl/src/kernels/cuda/cvec.dp.cpp`）。
-- Strata に同梱される実験用 speed projection は Qwen3.8-Flash-Next 向けの control vector で、説明文書は拒否方向の射影除去と安全挙動への影響を記載しています。任意の vector の挙動やモデル適合性をこの同梱例から一般化できません（`data/experimental-speed-projection/README.md:3-17`）。
+- 少なくとも一つの指定ファイルに、適用範囲内でモデル層に対応する `direction.<layer>` が必要。layer 0 とモデル層数以上の層は使われない（`engine/src/program/generate.cpp:2760-2764, 2793-2812`）。
+- ファイルの `controlvector.model_hint` が存在し `qwen4exp` 以外の場合は stderr に警告するが、この条件だけではロードを拒否しない（`engine/src/program/generate.cpp:2756-2758`）。
+- Control vector は起動時に読み込まれ、GPU テーブルとして保持される。CUDA の layer split では各デバイスへ複製する（`engine/src/program/generate.cpp:6142-6150, 6693-6697`; `engine/src/kernels/cuda/cvec.cu:26-39, 135`）。
+- Metal 側の実装コメントは control vector が未移植であると明記している。Metal でのこの option の実行結果は、ここで確認したソース範囲からは確定できない（`engine/metal/src/engine/missing.cpp:32-40`）。
 
 ## 出力とエラー
 
-- 引数が `FILE:SCALE` 形式でない場合は parser が stderr にエラーを出して終了コード 2 を返します（`src/program/generate.cpp:2703-2716`）。
-- ファイル読み込み・GGUF 検査等に失敗すると、エラー理由を stderr に出して終了コード 2 を返します（`src/program/generate.cpp:1872-1901, 3963-3968`）。
-- 未知の引数は `unknown argument: ...` と usage を表示して終了コード 2 になります（`src/program/generate.cpp:2787-2792`）。
+- 正常ロード時は stderr に mode、方向の選択方法、層範囲、適用層数を表示する（`engine/src/program/generate.cpp:2825-2829`）。
+- GGUF が control vector でない、必要 tensor がない、tensor がモデルの埋め込み幅・f32 条件に合わない、payload が途中で切れている、ファイル読込で例外が発生した、適用範囲に方向がない、または GPU table upload に失敗した場合、エラーを `strata generate: control vector: ...` と stderr に出し、終了コード 2 で終了する（`engine/src/program/generate.cpp:2750-2783, 2789-2813, 6145-6150`）。
+- `direction.<layer>` の tensor は埋め込み幅と f32 を検証し、読み出し前にファイル範囲も検証する（`engine/src/program/generate.cpp:2760-2774`）。
 
 ## 根拠
 
-- 索引上のスコープとリンク: `docs/cli/README.md:1128-1148`（`strata-engine` の root parser と対象オプション）。
-- オプション parser と usage: `src/program/generate.cpp:953-957, 2702-2732`。
-- GGUF 読み込み、テンソル検査、複数方向の集約、適用テーブル構築: `src/program/generate.cpp:1863-1946`。
-- 残差への適用と GPU 実装: `include/strata/kernels/cvec.hpp:5-16, 59-63`; `src/core/layer.cpp:1614-1630`; `src/kernels/cuda/cvec.cu:42-95, 101-171`。
-- `--serve` のリクエスト切替: `src/program/generate.cpp:12304, 12325-12339, 12520, 12922-12927`。
-- プラットフォーム制約と実験用 vector の説明: `metal/src/engine/missing.cpp:32-40`; `docs/MAC.md:257`; `data/experimental-speed-projection/README.md:3-17`。
+- parser と usage: `engine/src/program/generate.cpp:1208-1214, 1369-1374, 3844-3846, 4164-4183`
+- GGUF 読込、validation、scale 合成、range 適用: `engine/src/program/generate.cpp:2743-2830`
+- residual stream への適用: `engine/src/core/layer.cpp:1638-1653`; `engine/src/kernels/cuda/cvec.cu:45-95`
+- serve リクエストごとの切替: `engine/src/program/generate.cpp:18835-18889, 19149-19155, 20048-20053`
+- Metal の実装範囲: `engine/metal/src/engine/missing.cpp:32-40`

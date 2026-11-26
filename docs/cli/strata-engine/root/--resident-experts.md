@@ -1,49 +1,63 @@
-# `strata` エンジンの `--resident-experts`
+# `--resident-experts`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（調査日: 2026-10-25）。調査開始時の作業ツリーは `main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
-## 概要
+| 項目 | 内容 |
+| --- | --- |
+| ツール ID | `strata-engine` |
+| コマンド | `strata`（エンジン引数、root） |
+| オプション | `--resident-experts` |
+| 別名 | なし |
+| 値 | 値を取らないフラグ |
 
-`--resident-experts` は値を取らないフラグです。GPU の expert cache に載らない expert を起動時に RAM へコピーする resident RAM mode を有効にします。コマンド例:
+## 役割
+
+GPU の expert cache にない experts を起動時にホスト RAM へ常駐させ、回答中にファイルから読み直す場面を減らす低 RAM 向けモードです。全 complement が RAM に収まらない場合も、profile で順位付けされた hot experts を可能な範囲で RAM に置き、残りは mmap したモデルファイルから読みます。CUDA/HIP の実装では mmap 読み込みだけに戻る soft fallback も行います。オプションは `--mmap-experts`、`--resident-cpu-experts`、4 GiB の headroom、page-lock を組み合わせます（`engine/src/program/generate.cpp:877-880,4221-4228`）。
+
+## 使い方
 
 ```sh
-strata generate --pack /path/to/model --expert-profile /path/to/profile.bin --resident-experts
+# pack と静的 expert profile を指定し、resident RAM mode で実行する
+strata --pack /path/to/pack --expert-profile /path/to/expert-profile.bin --resident-experts --tokens '1,2,3'
 ```
 
-`--expert-profile` にはモデルの layer/expert に対応する静的 profile を指定します。profile を読み込む処理は `src/program/generate.cpp:4415-4457` にあり、resident mode はこの profile の順位を使って RAM に保持する expert を選びます。上のパスは例示です。
+この例の pack、profile、token は説明用の値です。`--tokens` などの生成入力は別の引数で指定します。
 
 ## 値と既定値
 
-- 引数値・短縮 alias はありません。parser がフラグを見つけると `mmap_experts`、`resident_cpu_experts`、`resident_pin`、`resident_soft` を有効にし、RAM headroom を4 GiBに設定します（`src/program/generate.cpp:2757-2765`）。help の説明も `src/program/generate.cpp:1066-1071` にあります。
-- フラグを省略した場合、これらの状態は既定で無効です。内部の通常 headroom は8 GiBですが、このフラグを指定すると4 GiBへ変わります（`src/program/generate.cpp:536-549`）。
-- このフラグ単独の値 validation はありません。`--expert-profile` が空、または `--mmap-experts` が無効のまま `--resident-cpu-experts` が有効なら、検証で stderr に要件を出して終了コード2になります。`--resident-experts` は mmap も同時に有効にしますが、静的 profile は別途必要です（`src/program/generate.cpp:3040-3046`）。
+- フラグ自体に値は不要で、明示したとき `mmap_experts`、`resident_cpu_experts`、`resident_pin`、`resident_soft` を有効にし、resident headroom を 4 GiB にします（`engine/src/program/generate.cpp:4221-4228`）。未指定時はこのフラグ由来の resident 設定を行いません（各 bool の初期値は `engine/src/program/generate.cpp:874-886`）。
+- `STRATA_RESIDENT_PIN=0` のときコピーを page-locked にせず、それ以外（未設定を含む）では page-locked を要求します（`engine/src/program/generate.cpp:4224-4226`, `engine/include/strata/core/resident_ram_copy.hpp:11-15`）。ドライバーが page-lock できない場合の実際の lock 状態は起動時の報告に反映されます（`engine/src/program/generate.cpp:12196-12202`）。
+- `STRATA_RESIDENT_HEADROOM_GIB` が `atof` で 0 以上になる値なら、4 GiB の headroom をその GiB 値で置き換えます。条件を満たさない値はこの分岐では採用されません（`engine/src/program/generate.cpp:4224-4228`）。`--ram-keep-gib` または `STRATA_RAM_KEEP_GIB` がより大きい headroom を要求し、かつ `STRATA_RESIDENT_HEADROOM_GIB` が有効値でなければ、そちらまで headroom を引き上げます（`engine/src/program/generate.cpp:4277-4285`）。
+- 重ねて指定した場合も同じフラグ設定を繰り返します。回数を数える処理や重複指定エラーは parser にありません（`engine/src/program/generate.cpp:3842-3849,4221-4229`）。
 
 ## 実行時の動作
 
-起動時に expert source が GPU cache の補集合を計画し、profile の順位を渡して RAM resident copy を構築します。GPU cache 所有分や layer split / helper GPU cache 所有分はコピー対象から除かれます（`src/program/generate.cpp:8059-8065`, `8123-8134`, `8203-8205`; 実装 `src/core/expert_source.cpp:3477-3496`）。resident copy が使われると expert の file bytes を RAM から使い、通常の mmap file cache 経由と同じ bytes・配置なので、コメント上は同じ配置で同じ回答になるとされています（`src/program/generate.cpp:8060-8065`）。
+1. resident CPU copy を有効にすると `--mmap-experts` も有効になります。engine は pack の `experts.bin`、または対応 pack で experts が含まれる GGUF shard をファイル tier として開きます（`engine/src/program/generate.cpp:8621-8647`）。
+2. GPU cache にない expert を特定し、静的 expert profile の順位を使って RAM copy を作ります。GPU cache が保持する expert と、layer split の各 stage cache が保持する expert は copy の対象から除かれます（`engine/src/program/generate.cpp:11908-11910,11933-11948,12077-12080`）。resident source の実装は cache complement を構築し、GPU cache が開いていること、全 slot の fill 完了、GPU 同期などを確認します（`engine/src/core/expert_source.cpp:3985-4003,4012-4024`）。
+3. prefill が cache slot を借りる構成では、借用中に file から読み出される expert も RAM が許す限り copy に含めます（`engine/src/program/generate.cpp:11908-11931`; `engine/src/core/expert_source.cpp:4219-4232`）。resident mode では、GPU cache にない expert を一度 RAM にコピーし、decode や prompt 中にファイルから読み直さない設計です（`engine/src/program/generate.cpp:11747-11753`）。
+4. 全 complement を headroom 内に収められない場合、`resident_soft` による二度目の試行で利用可能 RAM に合わせた予算を決め、profile 上位の expert を保持します。残りの expert はファイル tier を使い、警告を出します（`engine/src/program/generate.cpp:12079-12106`; `engine/src/core/expert_source.cpp:4040-4066,4133-4151`）。起動に成功したときは RAM に保持した GiB 数、page-lock 状態、GPU cache 数、および adaptive swap の状態を stderr に出します（`engine/src/program/generate.cpp:12196-12202`）。
 
-フラグは `--mmap-experts` を含意するため `--shared-expert-arena` とは併用できず、検証エラー（終了コード2）になります（`src/program/generate.cpp:3040-3042`）。`--resident-cpu-experts` も含意します。RAM copy は page lock を試み、page lock の可否にかかわらず起動ログに `page-locked`、`locked`、`pageable` のいずれかが表示されます（`src/program/generate.cpp:8264-8270`）。
+## 適用条件と副作用
 
-## 適用条件と相互作用
+- resident CPU copy には `--mmap-experts` と静的 `--expert-profile` の両方が必要です。このフラグは前者を自動設定しますが、profile は自動生成しません。条件を満たさない場合は `--resident-cpu-experts requires --mmap-experts and a static --expert-profile` を stderr に出して終了コード 2 で拒否します（`engine/src/program/generate.cpp:4870-4873`）。
+- resident RAM はモデルファイルの expert bytes をコピーするため、使えるホスト RAM を消費します。既定では 4 GiB を headroom とし、OS の利用可能 RAM（Windows では commit 容量も）に合わせて予算を調整します。page-lock はドライバーが許す場合に使われ、設定や環境により pageable または別の lock 状態になります（`engine/src/core/expert_source.cpp:4044-4066,4190-4217`; `engine/src/program/generate.cpp:12196-12202`）。
+- まず全量 resident を試み、それが失敗した soft mode では可能な分だけに縮小します。縮小試行でも expert を一つも保持できないなどの条件では `--mmap-experts` 相当の file tier に戻り、警告を出して続行します（`engine/src/core/expert_source.cpp:4145-4147`; `engine/src/program/generate.cpp:12092-12106,12203-12217`）。そのため指定しても全 experts の RAM 常駐は保証されません。
+- `--shared-expert-arena` は resident arena 用であり、`--resident-experts` が設定する `--mmap-experts` と併用できません。併用時は明示的なエラーを出して終了コード 2 になります（`engine/src/program/generate.cpp:4866-4869`）。
+- `--adapt-async` を指定する場合、resident RAM mode が必要条件の一つです。resident が使えないときは async を無効にして blocking adaptive tier に切り替えます（`engine/src/program/generate.cpp:11801-11811`）。
+- SYCL engine にも同名の値なし parser と resident 設定があります（`engine/sycl/src/program/generate.cpp:2184-2193`）。同 parser も resident CPU copy に `--mmap-experts` と静的 profile を要求し（`engine/sycl/src/program/generate.cpp:2339-2342`）、resident 全量が収まらない場合に縮小を試して mmap fallback を警告します（`engine/sycl/src/program/generate.cpp:7098-7107,7138-7151`）。上記の詳細な RAM/file-source の挙動は CUDA/HIP 側の実装位置を示しています。
 
-- profile が必須です。`--expert-profile` 自体の読込失敗は別途 profile reader のエラー経路を通ります（`src/program/generate.cpp:4415-4457`）。
-- `STRATA_RESIDENT_PIN=0` を設定すると page-lock 要求を無効にします。`STRATA_RESIDENT_HEADROOM_GIB` に `atof` で0以上と解釈される値を設定すると、headroom をその GiB 値へ変更します（`src/program/generate.cpp:2760-2765`）。不正文字列の扱いは `atof` に従うため、厳密な数値形式 validation はありません。
-- RAM に全補集合を確保できない場合、このフラグが有効にする soft fallback は profile 上位のうち確保できる分だけ RAM に残し、残りを model folder の mmap/file cache 経由で読みます。1件も保持できない場合は resident copy を使わず mmap 読みに戻ります（`src/program/generate.cpp:8204-8221`, `8271-8274`; `src/core/expert_source.cpp:3558-3560`）。
-- prompt path が GPU cache slot を借りる構成では、その slot の expert も RAM copy に含める計画が行われます。実際に保持できる量は headroom と available RAM に制約されます（`src/program/generate.cpp:8112-8117`, `8204-8219`; `src/core/expert_source.cpp:3631-3645`）。
-- `--adapt-every` と `--adapt-swaps` を有効にした構成では、resident RAM copy と GPU cache の間で expert を交換できます。成功時ログは adaptive swaps の有無も示します（`src/program/generate.cpp:8264-8270`; 用途説明 `src/program/generate.cpp:8066-8071`）。
+## 出力とエラー
 
-## 出力と失敗
+- 不明な引数は `unknown argument: <引数>` と usage を stderr に出して終了コード 2 です（`engine/src/program/generate.cpp:4268-4273`）。
+- resident の構築・利用可能メモリ確認に失敗して soft fallback も成立しない場合は `CPU expert residency: ...` を stderr に出し、終了コード 1 になります。一方、soft fallback の対象では mmap 継続の警告を出して処理を続けます（`engine/src/program/generate.cpp:12203-12217`; `engine/src/core/expert_source.cpp:3991-4003,4047-4053`）。
+- `--resident-experts` の分岐自体は出力ファイルを作る処理を行いません。expert bytes を起動時に RAM へ読み込み、fallback 時は pack/GGUF のファイル tier から読みます（`engine/src/program/generate.cpp:8621-8647,11747-11753`）。
 
-成功時は stderr に RAM 上の expert 量、page-lock 状態、GPU cache の resident 数、adaptive swap 状態を表示します（`src/program/generate.cpp:8264-8270`）。soft fallback 時は全量が収まらなかった理由と、残りを model folder から mmap 読みする旨を `WARNING` として出します（`src/program/generate.cpp:8271-8274`）。
+## 根拠
 
-resident copy 作成に失敗して soft fallback も成立しない場合は `CPU expert residency: <理由>` を stderr に出して終了コード1になります。GPU cache が完全に fill されていない、mapped source が開いていない、同期失敗、メモリ不足などは `pin_cache_complement` が失敗理由を返す経路です（`src/program/generate.cpp:8204-8221`, `8271-8284`; `src/core/expert_source.cpp:3463-3475`, `3611-3628`）。
-
-## 根拠と調査範囲
-
-- 索引上の scope は CMake 生成のネイティブ推論 engine `strata` の `src/program/generate.cpp` parser です（`docs/cli/README.md:1128-1134`, option link `docs/cli/README.md:1269-1271`）。
-- parser/help/state: `src/program/generate.cpp:536-549`, `1066-1071`, `2754-2776`。
-- validation/profile: `src/program/generate.cpp:3040-3046`, `4415-4457`。
-- resident copy と結果: `src/program/generate.cpp:8059-8071`, `8112-8134`, `8203-8284`。
-- 補集合計画、headroom 検査、profile 順位付け: `src/core/expert_source.cpp:3457-3496`, `3512-3564`, `3600-3645`。
-
-記述は上記 commit の checkout に含まれる parser と使用箇所に基づきます。Release 配布バイナリ、全 OS / driver の page-lock 実動作、各 pack での必要 RAM 量はこの調査では実行・測定していません。
+- `engine/src/program/generate.cpp:874-886` — resident 関連 option state と初期値。
+- `engine/src/program/generate.cpp:1486-1496,4221-4228` — usage 表示および parser の設定、関連環境変数。
+- `engine/src/program/generate.cpp:4277-4285,4866-4873` — RAM headroom の優先関係と起動時 validation。
+- `engine/src/program/generate.cpp:8621-8647,11908-11931,11933-11948,12077-12106,12196-12217` — file source、resident copy の適用、soft fallback、出力・失敗経路。
+- `engine/src/core/expert_source.cpp:3985-4003,4040-4066,4133-4151,4190-4217` — resident complement の前提確認、予算調整、profile 順の保持、headroom 検査。
+- `engine/include/strata/core/resident_ram_copy.hpp:11-15` — `STRATA_RESIDENT_PIN` の解釈。
+- `engine/sycl/src/program/generate.cpp:2184-2193,2339-2342,7098-7107,7138-7151` — SYCL parser、validation、resident/fallback 経路。

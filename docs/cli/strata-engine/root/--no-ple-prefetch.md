@@ -1,53 +1,51 @@
-# `--no-ple-prefetch`
+# `strata --no-ple-prefetch`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数） |
+| コマンド | `strata`（推論エンジンのトップレベル引数） |
 | オプション | `--no-ple-prefetch` |
 | 別名 | なし |
 | 値 | 値を取らないフラグ |
 
 ## 役割
 
-PLE（Per-Layer Embedding）テーブルを読む前に行う OS のページ先読みヒントを無効にします。A/B 比較用のフラグで、PLE の値や推論結果を切り替えるものではありません。ソースコメントは、mapped table の16行をまとめて先読みする経路と、これを無効にして行単位で読む比較を説明しています（`src/program/generate.cpp:580-582,997-998`、`include/strata/kernels/ngram.hpp:228-239`）。
+PLE（n-gram）テーブルをメモリマップで読むときの OS 先読みヒントを止める A/B 用フラグです。既定では PLE の読み出し前に必要な行をまとめて先読みする設定が有効です。このフラグを付けると、そのヒントを無効にし、後続の行読み出しにページフォールトを任せます。エンジンの CUDA/HIP 系と SYCL 系の parser の両方に定義されています（`engine/src/program/generate.cpp:927,3977`、`engine/sycl/src/program/generate.cpp:599,1995`）。
 
 ## 使い方
 
 ```sh
-strata --native /path/to/model.gguf --ple-gguf /path/to/ple.gguf --no-ple-prefetch --tokens 1,2,3
+# mmap 読み込みとの A/B 比較用に、PLE の先読みヒントを止めて実行する
+strata --pack ./pack --tokens "1,2,3" --ple-gguf ./ple.gguf --ple-io mmap --no-ple-prefetch
 ```
 
-モデルや PLE shard のパス、入力 token は手元のファイル・入力に置き換えます。`--native` 時はモデル shard から PLE shard を自動検出する経路もありますが、検出できない場合は起動に失敗します（`src/program/generate.cpp:3247-3261`）。
+この例はエンジンの usage が示す `--pack` と `--tokens` の入力形式に、PLE shard と mmap 読み込みを指定しています（`engine/src/program/generate.cpp:1208-1224`）。実際のモデルやトークン列に合わせて入力を置き換えてください。
 
 ## 値と既定値
 
-値を取りません。省略時は `Options::no_ple_prefetch` が `false` で、PLE の先読み設定は有効です。指定すると `true` になり、同じフラグを複数回指定しても同じ状態です。parser に値の validation はありません（`src/program/generate.cpp:580-582,2550-2553`）。
+値は不要です。parser は引数文字列との一致だけで `no_ple_prefetch` を `true` にし、値の変換・範囲検証はしません（`engine/src/program/generate.cpp:3977`、`engine/sycl/src/program/generate.cpp:1995`）。未指定時の option 値は `false` です（`engine/src/program/generate.cpp:927`、`engine/sycl/src/program/generate.cpp:599`）。同じフラグを重複して指定しても同じ `true` の設定になります。フラグに余分な値を続けると、その値は別の引数として解析され、未知の引数なら usage を stderr に出して終了コード 2 になります（`engine/src/program/generate.cpp:4268-4274`）。
 
 ## 実行時の動作
 
-引数 parser はこのフラグを `Options` に記録し、初期化後に `ple_prefetch_enable(false)` を呼びます。これはプロセス内の PLE テーブル実装が参照する共有フラグを false にします（`src/program/generate.cpp:2550-2553,6012`、`src/kernels/ngram.cpp:35-41`）。
+parser 後、CPU pool の構築時にこの設定が真なら `ple_prefetch_enable(false)` を呼びます（`engine/src/program/generate.cpp:9043`、SYCL: `engine/sycl/src/program/generate.cpp:4822`）。先読みスイッチの初期値は `true` です（`engine/src/kernels/ngram.cpp:43-49`）。メモリマップ経路では、Windows の `PrefetchVirtualMemory` 呼び出しと、その他のプラットフォームでの `madvise(..., MADV_WILLNEED)` の双方がこのスイッチを条件にしています。無効時はそれらのヒントを出さず、後続の行読み出しが必要なページを読み込みます（`engine/src/kernels/ngram.cpp:737-762,907-924`）。ヒントの呼び出し自体は値を変えない best-effort の処理として実装されています。
 
-効果があるのは mapped mode の OS 先読みヒントです。Windows の単一 token 読み出しでは、通常は16行分を1回の `PrefetchVirtualMemory` 呼び出しで要求する処理を省略し、後続の行読み出しに任せます（`src/kernels/ngram.cpp:496-520,639-681`）。バッチ読み出しでは Windows の `PrefetchVirtualMemory` と、非 Windows の `madvise(MADV_WILLNEED)` の両方を止めます（`src/kernels/ngram.cpp:538-617`）。ヒントが無効または OS に実行されなくても、後続の read が必要なページを読みます。先読み API の戻り値も利用していません（同: `601-608,664-681`）。
+`--ple-io direct` は別経路です。Direct モードでは `prefetch_rows` が reader に読み出しを発行して早期 return するため、このフラグの有効・無効を確認する分岐を通りません（`engine/src/kernels/ngram.cpp:558-581`）。したがって Direct I/O の読み出し動作はこのオプションでは切り替わりません。`--ple-io` の既定値は `direct` です（`engine/src/program/generate.cpp:818`）。効果を比較する場合は、例のように mmap 経路を選ぶ必要があります。
 
 ## 適用条件と副作用
 
-- PLE テーブルを使う実行でのみ意味があります。通常の parser は `--ple-gguf` が必要で、`--no-ple` と `--ple-gguf` は併用不可です。`--no-ple` を指定した実行では PLE 自体が無効なため、このフラグの先読み効果もありません（`src/program/generate.cpp:3290-3299,4033-4036`）。
-- `--native` のモデルが `qwen35moe` と判定される場合、通常 parser の前に `strata::qwen35::run` へ全引数を渡します。この別 parser には `--no-ple-prefetch` がありません。通常モードでは未知引数として usage を表示して終了コード 2 になり、`--serve` を先に解析した場合は未対応 option として警告してスキップされます（`src/program/generate.cpp:2393-2408`、`src/qwen35/q36_engine.cu:3742-3795`）。
-- `--ple-io direct` は mapped mode ではなく `PleReader` の読み出し経路です。この direct 経路の `prefetch_rows` は reader の ticket を発行し、`g_ple_prefetch` を参照しません。そのため `--no-ple-prefetch` は direct I/O の reader 内部先読みを止めません（`src/kernels/ngram.cpp:425-434,496-505,538-581`）。
-- 単一 token の mapped 読み出しでこの OS 先読み呼び出しを持つのは Windows の条件付きコードです。非 Windows では単一 token の `gather` は行を順に読みます。一方、mapped batch 読み出しでは非 Windows も `madvise` を使うため、このフラグが効きます（`src/kernels/ngram.cpp:602-608,639-681`）。
-- データ値は変えず、先読み要求だけを変えます。性能差はストレージ、ページキャッシュ、OS に左右されるため、この調査では速度の向上・低下を断定しません。
+- メモリマップされた PLE テーブルの先読みヒントを無効化します。Direct reader の発行・完了制御、テーブル内容、行のデコード方法はこのフラグでは変更しません（`engine/src/kernels/ngram.cpp:558-581,907-924`）。
+- 既定の `direct` I/O では先読みスイッチの判定箇所に到達しないため、通常は `--ple-io mmap` などのマップ経路と組み合わせたときに差が出ます（`engine/src/program/generate.cpp:818`、`engine/src/kernels/ngram.cpp:558-581`）。
+- 先読みヒントの停止によりページ読み込みのタイミングは変わりますが、ソースはヒントが取得できない場合も実読み出しでページフォールトすると説明しています。性能差は実機測定なしには判断できません（`engine/src/kernels/ngram.cpp:737-762,904-906`）。
 
 ## 出力とエラー
 
-このフラグ固有の警告や成功メッセージはありません。引数 parser はこの値を拒否する追加検査を行いません。誤記など未認識の引数は `unknown argument: ...` と usage を stderr に出して終了コード 2 になります（`src/program/generate.cpp:2787-2792`）。
+このフラグ固有のログ出力や検証エラーは確認できませんでした。未知の引数は `unknown argument: ...` と usage を stderr に出し、終了コード 2 になります（`engine/src/program/generate.cpp:4268-4274`）。
 
 ## 根拠
 
-- parser の既定値、help 表示、受理箇所、反映箇所: `src/program/generate.cpp:580-582,997-998,2550-2553,6012`
-- PLE 読み出しでの OS 先読みの有効条件・無効化箇所: `src/kernels/ngram.cpp:35-41,425-448,496-520,538-617,639-681`
-- 共有設定の説明と A/B 比較の意図: `include/strata/kernels/ngram.hpp:228-239`
-- SYCL 実装にも同名フラグの parser と反映箇所がある: `sycl/src/program/generate.cpp:558-560,898-899,1871,4476`
-- 対象はソース checkout です。既存の同一 revision の CLI バイナリや Release artifact は照合していません。性能測定、build、テストは実施していません。
+- `engine/src/program/generate.cpp:925-927,1414-1415,3977,9043` — CUDA/HIP 系の option 初期値、help 表示、parser、実行時のスイッチ切り替え。
+- `engine/sycl/src/program/generate.cpp:597-599,971-972,1995,4822` — SYCL 系の同じ option 定義と切り替え。
+- `engine/src/kernels/ngram.cpp:43-49,558-581,737-762,907-924` — スイッチの初期値、Direct と mmap の分岐、および OS ごとのマップ先読み処理。
+- `engine/src/program/generate.cpp:818,1208-1224,4268-4274` — `--ple-io` の既定値、エンジンの入力例・PLE 読み込みモード、未知引数の失敗経路。

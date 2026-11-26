@@ -1,68 +1,64 @@
 # `--split-device`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査時の作業ツリーは `main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数 parser） |
+| コマンド | `strata`（engine の root option。層分割を使う場合は `--serve` と `--layer-split` を併用） |
 | オプション | `--split-device` |
 | 別名 | なし |
-| 値 | 後段 stage の可視 GPU 番号をカンマ区切りで指定（例: `1,2`）。 |
+| 値 | 後段ステージごとの可視 GPU デバイス番号をカンマ区切りで指定。例: `1,2` |
 
 ## 役割
 
-`--serve` の layer split で、先頭 stage が使う CUDA0 に続く各 stage の GPU を指定します。stage は `--layer-split` の各境界から作られます。後段 stage はそれぞれ自身の GPU 上に重み・session・expert cache・verify window などを持ち、最後の stage は head も持ちます。GPU 番号はプロセスから見えるデバイス番号です。
+`--layer-split` で分けたモデルの後段ステージを、どの可視 GPU で実行するか指定します。値の順序は後段ステージの順序に対応し、先頭 GPU（device 0）が最初の区間を実行します。省略時は次に列挙される可視デバイスが順に選ばれます。`--layer-split` が空なら、この値はステージ構成に使われません。
 
 ## 使い方
 
 ```sh
+# serve モードで層境界 24 の後段を可視 GPU 1 に割り当てる
+strata --serve --layer-split 24 --split-device 1
+
+# 後段の2ステージを可視 GPU 1、2 に割り当てる
 strata --serve --layer-split 24,36 --split-device 1,2
+
+# 境界を自動決定し、後段ステージを可視 GPU 2、1 の順に割り当てる
+strata --serve --layer-split auto --split-device 2,1
 ```
 
-この例では stage 0 が CUDA0、境界 24 からの stage が CUDA1、境界 36 からの stage が CUDA2 を使います。実際に起動するにはモデル等の通常の engine 引数も指定してください。
+GPU 番号は Strata が見る可視デバイスの番号です。CUDA/HIP では通常 0 が先頭デバイスです。SYCL では後段に使えるのは device 0 と同じ backend の GPU です。
 
 ## 値と既定値
 
-- 値は空でない十進整数のカンマ区切りリストです。空要素や数字以外を含む値は拒否されます。負数や符号付き表記もこの形式には合いません。
-- `--split-device` を省略すると、可視 GPU 番号 1 から順に後段 stage 用として割り当てます。明示的な `--layer-split K` が一つだけで、後段用 GPU が自動割当てされなかった場合は CUDA0 が選ばれ、同じ GPU 上の二段構成になります。
-- 通常の複数 GPU 構成では、指定する番号は 1 以上かつ可視 GPU 数未満で、各番号は重複できません。明示値 `0` は境界が一つだけの構成でのみ許され、同一 GPU 上の stage として扱われます。`--layer-split auto` では `0` はこの例外に該当しません。
-- `--split-device` の値は `--layer-split` がある場合に検証されます。`--layer-split` がなければ保存された値は split 構成に使われません。
-- 同じオプションを複数回書いたときは parser の代入で後の値が残ります。重複指定自体を拒否する処理はありません。
+- 値は空でない10進整数のカンマ区切りです。空要素、負数、符号付き数値、非数字は受理されません。値の個数は、明示的な `--layer-split K[,K2..]` の K の個数と一致する必要があります。`--layer-split auto` ではこの個数照合は行われません（`engine/src/program/generate.cpp:4790-4801, 4840-4845`、SYCL: `engine/sycl/src/program/generate.cpp:2274-2285, 2317-2323`）。
+- `--split-device` 自体の parser は次の argv 要素を文字列として受け取り、独自の数値変換や範囲検証をしません。値を省略すると `--split-device needs a value` を stderr に出して終了コード 2 です（CUDA/HIP: `engine/src/program/generate.cpp:3842-3847, 4065-4067`、SYCL: `engine/sycl/src/program/generate.cpp:1882-1887, 2058-2060`）。
+- `--layer-split` 使用時にこの指定を省略すると、CUDA/HIP は device 1 から順に、SYCL は device 1 以降のうち device 0 と同じ backend の GPU を順に選びます。`--split-device` を複数回指定した場合は parser の後の値で前の値が置き換わります（CUDA/HIP: `engine/src/program/generate.cpp:4065-4067, 4803-4809`、SYCL: `engine/sycl/src/program/generate.cpp:2058-2060, 2287-2307`）。
+- 1つの K に対する `--split-device 0` は、両ステージを同じ GPU に置く特別な指定です。device 0 は複数 K の後段デバイスとしては使えません（`engine/src/program/generate.cpp:4808-4809, 4843-4845`、SYCL: `engine/sycl/src/program/generate.cpp:2306-2307, 2320-2323`）。
 
 ## 実行時の動作
 
-オプション parser は値を文字列として保存し、layer split の初期化時に `--layer-split` とともに整数リストへ変換します。layer split は `--serve` が必須です。明示的な境界リストでは境界数と GPU 数が一致し、境界は 2 以上で昇順でなければなりません。`--layer-split auto` では境界数が後段 GPU 数から決まります。
-
-有効な構成では `split_devs` の各番号が後段 `GpuStage` の `dev` に設定されます。実行時にはそのデバイス上で stage の重みを読み込み、stream 等を作成します。GPU 間の stage hand-off 用に mapped pinned host memory も確保します。よって、このオプションは GPU 配置を指定するもので、メモリ不足や GPU 初期化失敗を回避する保証ではありません。
-
-`--split-skip-if-fits` は `--layer-split auto` と併用したときだけ判定されます。プロファイルがない・読めない場合や remote expert cache 使用時は split を維持します。CUDA0 に profiled expert pair、session、drafter/head、reserve を含めて収まると判定した場合、split 設定をクリアして CUDA0 のみで実行します（`src/program/generate.cpp:4190-4235`）。
+option は `Options::split_device` に文字列として保存されます。実行時に `--layer-split` が指定されている場合だけ CSV を整数列に解析し、その順に `split_devs` を構成します。後段 GPU ごとに `GpuStage` を作り、該当デバイスに切り替えて重みなどの stage resource を用意し、層の分割実行に使います（`engine/src/program/generate.cpp:4065-4067, 4783-4809, 4856, 13248-13267`、stage 作成: `engine/src/program/generate.cpp:3693-3708`）。
 
 ## 適用条件と副作用
 
-- `--layer-split` と `--serve` が必要です。`--layer-split` がなければ `--split-device` 単独では stage を作りません。
-- `STRATA_PRIMARY_DEVICE` が 0 以外のとき layer split は拒否されます。現行実装の layer split は先頭 stage を device 0 とする前提です。
-- `--split-device 0` の同一 GPU 二段構成では、conversation parking（`--conversation-cache-mib`、`--conversation-cache-slots`、`--prompt-cache` がすべて有効な条件）は未対応で、該当時は起動エラーになります。
-- GPU の stage 配置に伴い、後段 GPU ごとにメモリ確保、重みロード、CUDA stream/event 作成が発生します。mapped hand-off 領域の確保失敗も起動を失敗させます。
+- `--layer-split` は `--serve` が必要です。`--split-device` だけを指定しても、層分割の選択には使われません（`engine/src/program/generate.cpp:4786, 4803-4805`、SYCL: `engine/sycl/src/program/generate.cpp:2266, 2287-2288`）。
+- 通常の複数 GPU 指定では device 番号は 1 以上、可視デバイス数未満で、重複できません。CUDA/HIP の検証はデバイス番号範囲と一意性を確認します。SYCL は加えて、指定先が GPU であり device 0 と同じ backend であることを確認します（`engine/src/program/generate.cpp:4840-4845`、`engine/sycl/src/program/generate.cpp:2317-2323`）。
+- 明示的な `--layer-split K[,K2..]` では境界 K が 2 以上で昇順である必要があります。device リストとの個数不一致も不正です。いずれも layer split の診断を stderr に出し、終了コード 2 で失敗します（`engine/src/program/generate.cpp:4840-4853`、SYCL: `engine/sycl/src/program/generate.cpp:2317-2330`）。
+- `STRATA_PRIMARY_DEVICE` が 0 以外の場合、CUDA/HIP の layer split は未対応として stderr に理由を出し終了コード 2 になります（`engine/src/program/generate.cpp:4768-4773, 4857-4863`）。SYCL 側の同環境変数との相互作用は、この調査では確認できませんでした。
+- 1つの K と `--split-device 0` の同一 GPU 分割は、conversation parking が有効（cache MiB、slots、prompt cache がいずれも正数）の場合に拒否され、終了コード 2 になります（`engine/src/program/generate.cpp:4808-4813`、SYCL: `engine/sycl/src/program/generate.cpp:2306-2311`）。
+- server の `split_serve` 構成で prefill/decode を別々の GPU に置く機能とは別です。その機能に渡す engine 引数では `--split-device` は禁止されています（`terminal/serve/split.py:37-45`）。
 
 ## 出力とエラー
 
-- 値が欠落すると `--split-device needs a value` を stderr に出して終了コード 2 です（共通 `next()` 処理）。
-- 不正な整数リスト、stage 数との不整合、範囲外・重複 GPU、または `--serve` なし等は `--layer-split ... needs --serve ...` の診断を stderr に出して終了コード 2 です。
-- 同一 GPU split と conversation parking の組合せ、または非ゼロの `STRATA_PRIMARY_DEVICE` との組合せも stderr の診断後、終了コード 2 です。
-- 後段 GPU の事前確認・CUDA リソース確保・stage 重みロードに失敗した場合は `strata generate:` のエラーを stderr に出し、該当する初期化経路で 1 を返します。
-- 起動成功時は使用する CUDA 番号と layer split を stderr に記録します。`--split-skip-if-fits` で単一 GPU に切り替えた場合も、その判定を stderr に記録します。
+- 値が欠けている場合は parser が stderr に不足を表示して終了コード 2 で終了します（`engine/src/program/generate.cpp:3844-3846`）。
+- 値の書式、個数、デバイス範囲、重複などが layer split の条件を満たさない場合は、`--layer-split ... needs --serve ...` の診断が stderr に出て終了コード 2 になります（`engine/src/program/generate.cpp:4848-4853`、SYCL: `engine/sycl/src/program/generate.cpp:2325-2330`）。
+- `--split-device` 自体には既定値を表示する専用出力や警告はありません。自動割当の実際の選択は `--layer-split` の処理に依存します。
 
 ## 根拠
 
-- parser の値保存と `Options` の初期値: `src/program/generate.cpp:710-719`, `src/program/generate.cpp:2633-2635`
-- 共通値取得処理（値欠落時の終了コード）: `src/program/generate.cpp:2416-2421`
-- CSV 整数リスト、既定 GPU、stage 条件・validation、parking と `STRATA_PRIMARY_DEVICE` の拒否: `src/program/generate.cpp:2981-3037`
-- 後段 stage への device 設定とリソース確保: `src/program/generate.cpp:4303-4365`
-- split の説明、stage hand-off、同一 GPU 構成の実行動作: `src/program/generate.cpp:2970-2976`, `src/program/generate.cpp:8977-9029`
-- `--split-skip-if-fits` の判定: `src/program/generate.cpp:4190-4235`
-- 利用者向けの layer split 概要: `docs/MULTI_GPU.md:179-181`（ソース実装を優先して記述）。
-
-## 調査範囲
-
-指定 revision の source checkout の parser と使用箇所を調べました。同一 revision の既存 CLI `--help` や Release 配布バイナリは実行・確認していません。GPU を使った起動検証、build、テストも行っていないため、実機・backend ごとの runtime 成否は確認対象外です。
+- parser と値取得: `engine/src/program/generate.cpp:3842-3847, 4065-4067`、SYCL: `engine/sycl/src/program/generate.cpp:1882-1887, 2058-2060`。
+- CSV 解析、既定割当、特別な device 0、範囲・重複・個数の検証と失敗: `engine/src/program/generate.cpp:4783-4856`、SYCL: `engine/sycl/src/program/generate.cpp:2263-2334`。
+- 後段 GPU stage の生成と split 実行計画: `engine/src/program/generate.cpp:3693-3708, 13248-13267`。
+- split-serve 側での併用禁止: `terminal/serve/split.py:37-45`。
+- 利用者向け説明（補助資料）: `docs/MULTI_GPU.md:156`。

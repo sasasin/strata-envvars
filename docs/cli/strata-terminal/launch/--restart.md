@@ -1,6 +1,6 @@
 # `--restart`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,59 +8,55 @@
 | コマンド | `strata launch` |
 | オプション | `--restart` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。省略時は `False`。 |
+| 値 | 値を取らない真偽フラグ。省略時は `False`。 |
 
 ## 役割
 
-異なる設定で `strata launch` を実行するとき、同じ preset のサーバー、または指定 port を使っている別の `strata launch` サーバーを停止し、新しい設定で起動します。対話画面の再起動確認を省略し、非対話実行でも再起動を許可します。
+指定した launch の選択内容が、すでに稼働中のモデルと異なる場合などに、確認を挟まず既存サーバーを停止して新しい選択で起動します。対話画面では再起動確認を省略し、`--no-tui` など画面を使わない経路では、通常なら既存サーバーが異なるため拒否されるケースを実行可能にします（`terminal/strata_cli/launch/cmd.py:146-148`, `terminal/strata_cli/launch/runner.py:2554-2589`）。
 
 ## 使い方
 
 ```sh
-strata launch --model q2_0 --context 64k --restart --no-tui
+# Office プリセットを、同じ launch が別設定で稼働中でも置き換えて起動する
+strata launch --preset Office --restart --no-tui
 ```
 
-この例では q2_0 を context 64k で起動します。現在の選択と異なる設定が同じ preset または同じ port で稼働中なら、そのサーバーを置き換えます。
+このコマンドは停止・起動を伴います。`--restart` は確認フラグではなく、確認なしで置き換える指定です。
 
 ## 値と既定値
 
-- `argparse` の `store_true` フラグで、値は指定しません。指定すると真、未指定なら偽です。短縮 alias はなく、重ねて指定しても真偽値以上の効果はありません。
-- `--restart=false` のような値付き形式は定義されていません。
-- `--plan` と併用すると計画表示の分岐で終了するため、再起動処理は実行されません。
+- `argparse` では `action="store_true"` として登録されており、引数値・選択肢・範囲の validation はありません（`terminal/strata_cli/launch/cmd.py:141-149`）。
+- 省略時は偽です。同じフラグを複数回指定しても真のままです。値を付ける形式（例: `--restart=true`）は定義されていません。
+- `--yes` は別の質問（エンジンがない場合のダウンロード確認など）に使われる設定であり、再起動の許可にはなりません（`terminal/strata_cli/launch/cmd.py:146-152`, `terminal/strata_cli/launch/runner.py:978-986`）。
 
 ## 実行時の動作
 
-`run_launch` はこの値を `Runner(restart=...)` に渡します。対話画面を開く呼び出しでも同じ値を画面アプリへ渡します。`Runner.run()` は起動処理に入ると、モデルやエンジンの準備・設定構築より前に稼働中の launch を確認します。
+引数値は TUI の `run_tui` と通常の `Runner` の両方へ渡され、Runner の `restart` 属性になります（`terminal/strata_cli/launch/cmd.py:871-877`, `terminal/strata_cli/launch/cmd.py:945-950`, `terminal/strata_cli/launch/app.py:693-712`, `terminal/strata_cli/launch/runner.py:975-986`）。通常起動ではモデル等のファイル確認後、モデル取得や停止より前に `check_serving()` が現在の launch を調べます（`terminal/strata_cli/launch/runner.py:3296-3314`）。
 
-- 同じ preset で同じ選択・port が既に稼働し、再チューニング中でもなければ、`--restart` の有無に関係なく既存サーバーを再利用します。停止・再起動はせず、稼働中のアドレスを返します。
-- 同じ preset で異なる選択が稼働している場合、または別の launch profile が要求 port を使っている場合、`--restart` があれば確認なしで続行します。別 profile が同じ port を使う場合は、その profile を停止対象に登録します。自分の profile のサーバーは起動段階で停止します。
-- 実際の停止は設定の準備後、エンジン起動時に行います。別 profile の停止には `runtime.stop(..., timeout=120)` と関連 tunnel の停止を試み、自分の profile の停止にも最大120秒の timeout を指定します。
-- 別 profile の launch が異なる port で稼働中なら、`--restart` がなくても並行起動します。グラフィックスメモリーが足りず新しい起動に失敗する可能性がある旨を通知します。
-- `--yes` は再起動の承認にはなりません。`--restart` がなければ、画面ありの経路では確認画面を一度表示し、`--no-tui` など確認画面のない経路では拒否します。
+- 同じ profile で同じ選択・同じ port がすでに稼働し、再調整 (`--retune`) もしない場合は既存サーバーをそのまま再利用します。`--restart` を付けても停止・再起動しません（`terminal/strata_cli/launch/runner.py:2562-2570`）。
+- 同じ profile の異なる設定、または指定 port を使う別 profile がブロック対象です。`--restart` があれば確認を求めず、その profile を停止対象にします（`terminal/strata_cli/launch/runner.py:2571-2589`）。
+- 停止対象はエンジンの用意後、モデル準備より前に停止します。置き換え対象が保持する GPU メモリをモデル準備に使うためです。別 profile の停止時には関連 tunnel も停止します（`terminal/strata_cli/launch/runner.py:3311-3316`, `terminal/strata_cli/launch/runner.py:2591-2608`, `terminal/strata_cli/launch/runner.py:2632-2643`）。
+- 置き換え対象がなく、別 port で動いている launch だけの場合は並行起動となり、そのモデルが GPU メモリに収まらず起動に失敗する可能性について通知します。`--restart` は別 port のサーバーを止めません（`terminal/strata_cli/launch/runner.py:2571-2577`）。
+- `--plan` を指定すると `Runner.plan()` の結果を表示して終了し、起動時の `Runner.run()` と `check_serving()` には進みません。そのため `--restart --plan` でも既存サーバーは停止しません（`terminal/strata_cli/launch/cmd.py:897-925`, `terminal/strata_cli/launch/runner.py:3123-3145`, `terminal/strata_cli/launch/runner.py:3296-3314`）。
 
 ## 適用条件と副作用
 
-このオプションが確認するのは `launch-` で始まる Strata launch profile の稼働状態とその port です。任意の外部プロセスを探して停止する指定ではありません。同じ port で別の launch サーバーを置き換える場合、そのサーバーは新しい設定の起動前に停止されます。画面の説明と利用者向け資料は、処理中の応答が止まることを明記しています。
-
-`--retune` を併用すると、チューニング測定のため同じ profile のサーバーが起動処理より前に停止される場合があります。測定の終了後は新設定で起動する通常の経路に戻ります。
+- 同じ設定のサーバー再利用、置き換え対象のない起動、`--plan` では停止副作用はありません。`--restart` は「常に再起動」ではなく、Runner が差異と port の競合を見つけた場合に確認を省略する指定です（`terminal/strata_cli/launch/runner.py:2562-2589`）。
+- TUI ではこのフラグがない場合、ブロック対象があれば一度だけ確認します。キャンセルすると稼働中のモデルをそのままにします。フラグがある場合はこの確認を通りません（`terminal/strata_cli/launch/app.py:498-503`, `terminal/strata_cli/launch/app.py:563-584`, `terminal/strata_cli/launch/runner.py:2579-2589`）。
+- TUI を使わない経路でフラグがなく、異なる設定または port の競合がある場合は `LaunchError` code 6 で拒否し、`--restart` または先に `strata launch --stop` を使うよう案内します（`terminal/strata_cli/launch/runner.py:2579-2585`）。
+- 置き換えの停止前に、モデル取得に必要な空きディスク容量を確認します。容量不足が分かった場合は code 6 で失敗し、稼働中サーバーは停止しません。停止そのものに失敗した場合も code 6 で失敗し、`strata launch --stop` を案内します（`terminal/strata_cli/launch/runner.py:2591-2608`, `terminal/strata_cli/launch/runner.py:2609-2625`）。
 
 ## 出力とエラー
 
-- `--restart` なしで確認画面もない状態のまま競合するサーバーがあると、エラーを返します。通常出力は `strata: ...` を stderr に出し、終了コードは `6` です。JSON 出力では `ok: false` とエラーコード・文面を JSON で出力します。
-- 対話画面で再起動をキャンセルすると、稼働中のサーバーを維持し、終了コード `130` のキャンセルエラーになります。
-- 対象サーバーの停止に失敗すると、停止できなかった旨と `strata launch --stop` の案内を出し、終了コード `6` で失敗します。
-- 再利用できた場合は `Already serving these choices; nothing was restarted.` とアドレスを表示します。通常の起動成功時は `Strata is serving.` と接続先を表示します。
+通常の非 JSON 出力では失敗文を `stderr` に `strata: ...` として出し、JSON 出力 (`--output json`) では `ok: false` と code・message を JSON にして、同じ code を終了値にします（`terminal/strata_cli/launch/cmd.py:759-764`, `terminal/strata_cli/launch/cmd.py:949-961`）。置き換えを実行した場合は停止中の profile を示す進行メッセージが出ます（`terminal/strata_cli/launch/runner.py:2602-2607`, `terminal/strata_cli/launch/runner.py:2632-2642`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:132-134` — parser の `store_true` 定義、説明、`--yes` と同一選択時の注意。
-- `strata_cli/launch/cmd.py:688-716,780-787` — 対話・非対話の分岐と `Runner` への値の伝達、失敗表示。
-- `strata_cli/launch/cmd.py:636-641,801-811` — stderr/JSON のエラー出力、起動結果・再利用結果の表示。
-- `strata_cli/launch/runner.py:2011-2044` — 起動順序と、稼働確認から準備・起動までの流れ。
-- `strata_cli/launch/runner.py:1460-1480,1505-1539` — 対象となる稼働 profile、同一設定の再利用、port 競合、確認・拒否条件。
-- `strata_cli/launch/runner.py:1546-1572` — 同一 port の別 profile と自身の profile の停止、および停止失敗経路。
-- `strata_cli/launch/runner.py:1396-1415` — 再チューニング時の稼働サーバー停止。
-- `strata_cli/launch/app.py:280-319` — 対話画面への伝達と再起動確認画面。
-- `docs/TERMINAL_LAUNCH.md:69,77` — 利用例、応答中断・`--yes` との関係、異なる port の扱い（利用者向け補助資料）。
+- `terminal/strata_cli/launch/cmd.py:141-152` — launch parser の定義、`--restart` の説明、`--yes` と `--plan` の別定義。
+- `terminal/strata_cli/launch/cmd.py:849-877`, `terminal/strata_cli/launch/cmd.py:897-925`, `terminal/strata_cli/launch/cmd.py:945-961` — 対話判定、フラグの伝達、plan の早期終了、起動時のエラー処理。
+- `terminal/strata_cli/launch/app.py:498-503`, `terminal/strata_cli/launch/app.py:563-584` — TUI Runner への伝達と再起動確認の挙動。
+- `terminal/strata_cli/launch/runner.py:975-986`, `terminal/strata_cli/launch/runner.py:2554-2589` — Runner の値保持、稼働状態・設定・port の判定、再利用・確認・拒否・置き換え対象の決定。
+- `terminal/strata_cli/launch/runner.py:2591-2625`, `terminal/strata_cli/launch/runner.py:2632-2643`, `terminal/strata_cli/launch/runner.py:3296-3349` — 停止順序、ディスク容量・停止失敗、通常実行経路。
+- `docs/cli/README.md:836-884` — `strata launch` の索引上のスコープと作成対象リンク。
 
-調査範囲は上記 commit の Terminal CLI ソースと同 revision の利用者向け文書です。別 OS・外部プロセス・リリース済み配布物の個別挙動は実行確認していません。
+調査制約: 同一 revision の CLI `--help` は実行していません。parser 定義と Strata 内の呼び出し・実装を根拠にしています。

@@ -1,48 +1,48 @@
 # `STRATA_MTP_KEEP`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-単一 GPU の起動時に、空き VRAM が MTP draft 層などの見積もり必要量を下回った場合でも、`--mtp` で指定した draft 層を自動で外さずロードを試みます。変数が未設定なら、条件に応じて Strata は `--mtp` をクリアして draft 層なしで起動します。
+GPU メモリ不足が見込まれるときに、Strata が MTP draft layer（または特定の分割 GPU 経路の DFlash2 drafter）を外して起動を続ける処理を抑止する。値を読み取っているのは `strata generate` の初期化処理で、`--serve` も同じ `generate.cpp` の経路を使う。環境変数が設定されているだけで抑止され、値の内容は機能選択に使われない（`engine/src/program/generate.cpp:8195-8217,8220-8240`）。
+
+この変数は drafter を有効化するものではなく、GPU に収まらない場合の自動除去を止めるだけである。drafter 自体は `--mtp`、`--spec T` などの指定が別途必要であり、保持した結果の load に失敗すれば起動は失敗し得る（同 `:4040,4055,8243-8265`）。
 
 ## 値と判定
 
-値の内容は読みません。`std::getenv("STRATA_MTP_KEEP") == nullptr` だけを判定するため、**変数が存在すれば値が空文字、`0`、`false`、その他の文字列でも**自動除外を抑止します。従って説明ログの `STRATA_MTP_KEEP=1` は設定例であり、`1` だけを有効値として parse する実装ではありません。
+両方の読み取り箇所で `std::getenv("STRATA_MTP_KEEP") == nullptr` を判定する。`atoi` や文字列比較はなく、未設定なら除去処理が候補になり、設定済みなら除去処理を通らない。明示的な空文字、`0`、`false`、任意の文字列はいずれも「設定済み」で同じ結果になる。大文字小文字、空白、数値としての妥当性は検査しない（`engine/src/program/generate.cpp:8197,8220`）。
 
-| 状態 | 低 VRAM 時の処理 |
-|---|---|
-| 未設定 | 他の適用条件も満たせば必要量を見積もり、不足時に MTP 層を外す |
-| 設定あり（空文字を含む） | この自動除外ブロックを通らず、後続の MTP ロードを試す |
-
-根拠: `src/program/generate.cpp:6721-6740`。
+| 条件 | unset | 設定時に除去を抑止する値 | 除去を抑止しない値 |
+|---|---|---|---|
+| 対象の MTP または分割 DFlash2 経路 | GPU メモリ判定が不足なら drafter を外す | 空文字、`0`、`false`、`1`、その他すべて（`getenv` が非 null） | なし（値を parse しない） |
 
 ## 有効になる条件
 
-自動除外（この変数を unset にしたときの既定動作）は、次のすべてを満たす場合だけ評価されます。
-
-- `--mtp` が空でない。
-- DFlash2 単独ロードの経路ではない（`use_df2` が false）。
-- `multi_gpu` が false で、staged 経路も空（`stages.empty()`）。
-- `STRATA_MTP_KEEP` が未設定。
-- `spill_discrete_gpu()` が true。
-
-Metal ビルドでは `spill_discrete_gpu()` は false を返します。その他のビルドでは CUDA device / properties の取得が成功し、`integrated` でない GPU の場合にだけ true です。したがって Metal、統合 GPU、device 情報取得失敗時は、この変数の有無によらず当該自動除外判定は行われません。根拠: `src/program/generate.cpp:271-284`, `include/strata/core/spill_gate.hpp:8-14`。
-
-この判定の後、`--spec` が 2 未満なら `--mtp` 自体が無視されます。保持指定は `--spec` の条件を上書きしません。根拠: `src/program/generate.cpp:6742-6747`。
+- MTP の場合、`--mtp DIR` が指定されて `o.mtp` が空でなく、`--spec` が 2 以上であること。`--spec` が 2 未満なら後続処理が MTP を無視して `o.mtp` を clear する（`engine/src/program/generate.cpp:4040,4055,8243-8247`）。
+- 自動除去判定は、単一 GPU 経路（`!multi_gpu && stages.empty()`）または `STRATA_SPILL_OFF` が未設定の layer-split 経路（`multi_gpu && !stages.empty()`）で行われる。加えて `spill_discrete_gpu()` が true である必要がある（同 `:327-339,8195-8198`）。
+- `spill_discrete_gpu()` は Metal build では false。その他の build では CUDA 互換 runtime から現在デバイスと属性を取得でき、現在デバイスが integrated GPU でない場合だけ true になる。したがって Metal と integrated GPU ではこの自動除去自体が走らず、本変数の効果もない（同 `:327-339`; `engine/include/strata/core/spill_gate.hpp:8-14`）。
+- MTP の判定は `use_df2` が false の場合に限る。`--draft dflash2` の単独 fallback（`--draft-fallback none`）では MTP を先に無効化して `df2_solo` にし、DFlash2 側の専用判定へ進む（同 `:6493-6530,8197,8220`）。その専用判定は layer split 時だけで、単一 GPU の DFlash2 solo 経路はこの変数では制御されない（同 `:8220-8240`）。
+- `--serve` 専用の条件ではなく、`generate.cpp` の共通初期化で判定される。環境変数に CLI 引数や別の変数の値を代入する優先順位はない。`STRATA_SPILL_OFF` は layer-split の drafter 除去経路を止めるが、単一 GPU 経路の条件には含まれない（同 `:8195-8198`）。
+- GPU メモリが不足していない場合、ファイルサイズ取得に失敗した場合、または free memory が 0 と報告された場合は、該当する除去分岐には入らず、この変数による差は出ない（同 `:8199-8217,8221-8240`; `engine/include/strata/program/split_walk.hpp:57-67`）。
 
 ## 実行時の詳細
 
-判定は `generate` の起動処理中、MTP load より前に一度実行されます。環境値は static cache されません。判定ブロックでは `--mtp` の `dense.bin` と `experts.bin` のサイズを足し、必要時には native output head のサイズも見積もります。必要量は `layer_b + head_b + 220 MiB + 1550 MiB` で、空き量が正かつ必要量未満なら stderr に `short of GPU memory: ... this start runs without the draft layer (decode is slower; STRATA_MTP_KEEP=1 keeps it` と出し、`o.mtp.clear()` します。ファイルサイズ取得に失敗した場合や空き量が 0 の場合は、この不足判定に入りません。根拠: `src/program/generate.cpp:6726-6740`。
+判定は `generate.cpp` の GPU/model 初期化中、drafter の load より前に行われる。プロセス起動時に値を parse して cache する実装ではなく、該当する初期化経路で `getenv` を直接確認する。server モードではこの判定後にリクエスト処理へ進むため、リクエストごとに再評価するコードではない（`engine/src/program/generate.cpp:8195-8243`; `--serve` parser は同 `:4069`）。
 
-`o.mtp` が残れば `mtp.load(...)` が実行され、失敗時はエラーと VRAM の補足を stderr に出して終了コード 1 を返します。したがって変数設定はロード成功を保証せず、メモリ不足などによるロード失敗を無視する指定でもありません。根拠: `src/program/generate.cpp:6761-6764`; `src/core/mtp.cpp:302-323,329-340`。
+未設定の場合、MTP は `dense.bin` と `experts.bin` のサイズ取得が成功し、free memory が正値かつ `layer_bytes + head_bytes + (220 MiB) + (1550 MiB)` 未満なら `o.mtp` を clear する。layer split では drafter を置く stage の free memory を調べる。DFlash2 solo の layer-split 経路では pack と draft head を含む `pack_bytes + 250 MiB + head_bytes + 220 MiB + 1550 MiB` を境界とし、free memory が正値かつ必要量未満なら `df2_solo` を false にして draft 設定を clear する（同 `:8199-8240`; `engine/include/strata/program/split_walk.hpp:57-67`）。
 
-自動除外された場合は、Strata の `docs/DETAILS.md` が説明する suffix / prompt-lookup drafter による draft 経路が残り、token は引き続き検証されます（`docs/DETAILS.md:338`）。これは Strata 文書の説明であり、この調査では生成結果や速度を実行測定していません。
+除去が発生すると起動は drafter なしで続行し、ログ上は decode が遅くなる旨が示される。環境変数が設定されていると除去を抑えるため、後続の `mtp.load(...)` などが失敗した場合は `strata generate: <error>...` を stderr に出して終了コード 1 で戻る。設定済みでも起動成功は保証されない（`engine/src/program/generate.cpp:8211-8217,8233-8240,8264-8265`）。
+
+## ログと測定値
+
+メモリ不足で MTP を外す場合の stderr は `strata generate: short of GPU memory: ... this start runs without the draft layer (decode is slower; STRATA_MTP_KEEP=1 keeps it)`。分割 DFlash2 を外す場合は `... this start runs without a drafter (decode is slower; STRATA_MTP_KEEP=1 keeps it)`。どちらも実際に境界を下回り、ファイルサイズが読めた場合にだけ出る。変数を設定したこと自体を知らせるログはない（`engine/src/program/generate.cpp:8211-8216,8233-8236`）。
+
+`docs/SETTINGS.md:183` は値を `on / off` と分類し、`docs/MULTI_GPU.md:226` と実装ログは `STRATA_MTP_KEEP=1` と記すが、実装は設定有無だけを見る。よってコード上は `0` や空文字でも除去を止める。測定値はこの変数の効果を条件付きで示す資料が見当たらないため記載しない。
 
 ## 根拠
 
-- 候補一覧への掲載: `docs/envvars/000_envvers.md:1506`。
-- 唯一の実装参照（判定、見積もり、警告、`o.mtp.clear()`）: `src/program/generate.cpp:6721-6740`。
-- GPU 種別によるゲート: `src/program/generate.cpp:271-284`, `include/strata/core/spill_gate.hpp:8-14`。
-- 後続の MTP load と失敗時終了: `src/program/generate.cpp:6742-6764`, `src/core/mtp.cpp:302-323,329-340`。
-- MTP 層を使わない場合の draft 経路の説明: `docs/DETAILS.md:334-340`。
+- `engine/src/program/generate.cpp:8195-8217` — MTP の読み取り、メモリ判定、ログ、`o.mtp` の無効化。
+- `engine/src/program/generate.cpp:8220-8240` — layer-split DFlash2 solo の読み取り、メモリ判定と無効化。
+- `engine/src/program/generate.cpp:327-339`、`engine/include/strata/core/spill_gate.hpp:8-14` — Metal / integrated GPU を除く spill 判定。
+- `engine/include/strata/program/split_walk.hpp:57-67` — メモリ境界式。
+- `engine/src/program/generate.cpp:4040,4055,4069,6493-6530,8243-8265` — CLI 条件、server mode、drafter 初期化と失敗経路。

@@ -1,74 +1,62 @@
 # `--adapt-swaps`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（推論エンジンの引数 parser） |
+| コマンド | `strata`（エンジン引数。`strata generate`） |
 | オプション | `--adapt-swaps` |
 | 別名 | なし |
-| 値 | 整数 `N`。1回の expert cache 適応で選ぶ交換数の上限 |
+| 値 | 整数 `N`。適応ステップで入れ替える expert 数の上限。 |
 
 ## 役割
 
-ルーティング状況に応じて GPU の expert cache の常駐内容を入れ替える適応 tier について、1回の適応で選ぶ交換数を制限します。値を正にするだけでは適応 tier は始まりません。`--adapt-every` も正であること、GPU cache に未常駐 expert があることが必要です。
+GPU expert cache の適応型 tier が有効なとき、1 回の適応ステップで VRAM cache に入れ替える expert 数の上限を指定する。利用率の高い非 resident expert を、利用率の低い resident expert と交換する。既定値は 96、0 以下なら適応型 tier は無効になる（`engine/src/program/generate.cpp:1045-1047`, `1084-1085`, `15001-15002`）。
 
 ## 使い方
 
 ```sh
-strata --pack pack/full --tokens "1,2,3" --adapt-swaps 32
+strata generate --pack ./pack/full --tokens "1,2,3" --adapt-swaps 0
 ```
 
-この例は `src/program/generate.cpp` に記載された engine parser の `--pack` / `--tokens` 構文に基づきます。実際に使うモデルや pack に合わせて入力を指定してください。
+この例では CUDA/HIP 系 parser で適応 swap を無効にする。`strata generate` の引数形式は `engine/src/program/generate.cpp:1208-1214`、オプションの解析は同 `:4202`。
 
 ## 値と既定値
 
-- 既定値は `96` です。
-- parser は次の引数を `std::atoi` で整数に変換し、`adapt_swaps` に設定します。明示的な範囲検証や上限補正はこの parser 分岐にはありません。数値として読めない値は `atoi` により `0` となり、適応を止める値として扱われます。
-- `0` 以下では適応用の routing usage 配列を作らず、適応 tier はオフになります。したがって負数もこの条件では無効化として働きます。
-- 同じオプションを複数回指定した場合、引数を順に読み込んで同じフィールドへ代入するため、後の指定が残ります。
-- 値を省略すると `--adapt-swaps needs a value` を stderr に出し、parser は終了コード `2` で終了します。
+- 指定値は `std::atoi` で整数化され、既定値は `96`。専用の範囲検証は parser にない。値を省略すると `--adapt-swaps needs a value` を stderr に出して終了コード 2 で終了する（`engine/src/program/generate.cpp:1084-1085`, `3844-3847`, `4202`）。
+- 数字に変換できない文字列や空文字列は `atoi` の結果 0 として扱われ、適応型 tier を止める。負数も正数条件を満たさず適応型 tier は無効になる。複数回指定した場合は、解析のたびに同じ設定値を更新するため最後の値が残る（同 `:3842-3847`, `4202`, `15001-15002`）。
+- 指定値が正でも、適応処理は `--adapt-every` が正で、かつ VRAM cache に空き枠があり全 expert が resident ではない場合などに限られる。0 以下なら使用量カウンタも作られず、swap は実行されない（同 `:15001-15002`, `24570`; 適応周期判定は同 `:22055-22059`, `25188-25191`）。
 
 ## 実行時の動作
 
-適応用の usage 配列は、`--adapt-every > 0` かつ `--adapt-swaps > 0` の場合にだけ確保されます。全 expert がすでに GPU 上にある場合も確保されず、適応処理は走りません。したがって、この値は交換数を指定するだけで、cache の構築や常駐可能数を直接決めるものではありません。
+各適応ステップでは、routing 利用数に基づき不足 expert と追い出し候補を順位付けし、指定数を超える候補を切り詰める。decay は各ステップ後に利用数へ適用される。実際の交換は expert の読み出し元と cache 構成に応じ、CPU/RAM 側の expert と GPU cache の間で行われる（`engine/src/program/generate.cpp:15342-15346`, `15349-15379`）。
 
-適応間隔ごとに各 layer の routing usage を見て、未常駐のうち usage が `2.0` 以上の expert を候補にし、常駐中の usage が少ない expert と比較します。serve の通常経路では差が `--adapt-min-gain` を超えた候補を採用します。全 layer の候補を優先度順に並べた後、primary cache ではこのオプションの値を超える分を切り捨てます。別の speculative decode 経路では同じ差の閾値 `1.5` がコードに固定されています。選ばれた expert のデータを cache にコピーし、追い出された expert は CPU 側の source に戻します。routing usage は適応後に `--adapt-decay` 倍されます。
+CUDA/HIP 系の CUDA 実装では、VRAM cache が全 routed expert の 15% 以上 65% 以下で適応 tier が既に有効なとき、`STRATA_ADAPT_MID` と build 既定値に応じて既定値を `--adapt-swaps 192` に変更する。明示的に `--adapt-swaps` を渡した場合はその値を保持する。この coverage 調整は resident RAM 初期化、serve、非 serve decode の各経路にある（`engine/include/strata/core/adapt_coverage_rules.hpp:20-39`, `engine/src/program/generate.cpp:12145-12164`, `14943-14964`, `24558-24568`）。詳細は [`STRATA_ADAPT_MID`](../../../envvars/STRATA_ADAPT_MID.md)。
 
-適応は decode の window / round の進行に沿って行われます。間隔には `--adapt-every` が使われ、内部の warm-up interval が有効な経路では一時的にそちらが使われます。`--adapt-async` や `--pipeline-windows` が有効な経路では、適応の選択・コピーが推論 window と並行または非同期で進む場合があります。
+`--serve` では、cache coverage が 15% 未満で `STRATA_TINY_CACHE=1` のとき、未指定の既定値を抑制する規則が適用される。resident slot が 0 なら 0、12.5% 未満なら最大 16、12.5% 以上 25% 未満なら最大 32 に抑える。明示値（0 を含む）は保たれる（`engine/src/program/generate.cpp:14965-14973`, `engine/include/strata/core/low_vram_rules.hpp:100-115`）。詳細は [`STRATA_TINY_CACHE`](../../../envvars/STRATA_TINY_CACHE.md)。
 
-値の上限は経路で異なります。resident RAM の通常経路では交換 buffer の確保数が `min(N, 96)` に制限され、arena 経路では内部 cap が `N` です。したがって 96 を超える値が毎回その数の交換を実行する保証はなく、実際の候補数や経路の制約も受けます。
-
-`--peer-device` を使う場合、この値は primary cache の交換上限に加えて、peer 側の `--peer-adapt-swaps` の既定値にもなります。peer 用の値が明示されていれば、そちらが peer の交換上限を決めます。remote expert optimization の適応処理にも同じ値が別途渡されます。
+`STRATA_EXPERT_NIBBLE` の nibble 経路が起動条件を満たすと、parser 値にかかわらず `adapt_swaps` と `peer_adapt_swaps` を 0 にする（`engine/src/program/generate.cpp:5475-5493`）。
 
 ## 適用条件と副作用
 
-- `--adapt-every` が `0` 以下、`--adapt-swaps` が `0` 以下、または全 expert が GPU cache に常駐している場合、適応 tier は動きません。
-- 適応対象は、未常駐で routing usage が閾値を満たし、peer / remote tier や helper に保持されていない expert です。常駐 expert の中から利用回数が低いものを選んで入れ替え先にします。
-- resident RAM mode では、正の適応設定に応じて交換 buffer を確保します。初期化時の説明出力は、このモードの適応交換を「GPU cache と交換（ファイル読み込みなし）」として示します。
-- 交換時には expert データの host-to-device copy が発生し、追い出した expert は非常駐扱いになって source から再利用できるようにされます。実際に選ばれる数やタイミングは routing と実行経路に依存します。
+適応処理は利用状況に応じて GPU cache の expert residency を変更し、後続の decode / verify 窓で使う expert を変える。peer GPU tier がある場合、peer 側の swap 上限には `--peer-adapt-swaps` が指定されていればその値、未指定なら本オプションの値が渡される（`engine/src/program/generate.cpp:15505-15513`）。
+
+通常の交換バッファ確保では `adapt_swaps` を最大 192 に制限する。確保に失敗し、値が 96 を超えていて未指定の既定値であれば 96 で再試行し、設定値も 96 に下げる。再試行できない場合はエラーを stderr に出して終了コード 1 で失敗する（`engine/src/program/generate.cpp:12166-12189`）。
+
+SYCL parser にも同名引数があり、既定値 96 と `atoi` 変換は同じだが、明示指定を記録する flag や上記 coverage/tiny-cache 補正は確認できない。また SYCL の交換バッファ確保・適応上限は最大 96 である。したがって CUDA/HIP 系の補正規則を SYCL に当てはめない（`engine/sycl/src/program/generate.cpp:721`, `1884-1887`, `2166`, `7126-7129`, `8877`）。
 
 ## 出力とエラー
 
-- 起動時に parser 独自の値範囲エラーはありません。値を省略した場合は前述の stderr メッセージと終了コード `2` になります。
-- resident RAM mode の初期化で交換 buffer を確保できない場合、理由を stderr に出して engine は終了コード `1` で抜けます。
-- 実行中の adaptive refill / copy に失敗すると、serve 経路では `strata serve: adaptive swap copy failed...` 等を stderr に出し、適応失敗として処理します。decode 経路でも `ERR an adaptive refill failed` などを出して終了コード `1` となる経路があります。
-- このオプション単独では専用の出力を行いません。適応が無効な場合の理由表示は、serve の他設定や実行モードによって異なります。
+指定値の形式・範囲を理由にした専用 validation error は parser にない。値の欠落時は stderr に `--adapt-swaps needs a value` を出して終了コード 2。resident RAM mode で交換バッファ確保に失敗し、96 件への fallback もできないときは `strata generate: CPU expert residency: ...` を stderr に出して終了コード 1（`engine/src/program/generate.cpp:3844-3847`, `12181-12188`）。
+
+起動時の coverage 補正が値を変更した場合は変更前後の値を stderr に出す。tiny-cache 規則が値を抑制した場合も、その変更を stderr に出す（同 `:12159-12164`, `14965-14973`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:688-702,724` — 適応間隔・decay・async の既定値と `adapt_swaps = 96`。
-- `src/program/generate.cpp:2416-2421,2740` — parser の値取得と `std::atoi` による代入。欠落値は parser 共通処理で終了コード `2`。
-- `src/program/generate.cpp:2787-2793` — 未知引数の stderr、usage 表示、終了コード `2`。
-- `src/program/generate.cpp:8250-8270` — resident RAM mode の交換 buffer 確保、確保失敗、適応の on/off 表示。
-- `src/program/generate.cpp:10028-10029,16185-16197` — 正の適応設定と未常駐 expert がある場合の usage 配列確保、および適応関連状態。
-- `src/program/generate.cpp:10302-10328,10336-10435,10446-10460` — serve 経路の候補選定、交換上限、コピー・失敗処理、peer / decay との関係。
-- `src/program/generate.cpp:10450-10458` — `--peer-adapt-swaps` が未指定なら `--adapt-swaps` を peer の上限に使う処理。
-- `src/program/generate.cpp:10530-10545` — arena と通常経路の非同期交換 cap。
-- `src/program/generate.cpp:14442-14453,15119-15133,16662-16675` — 適応の cadence と非同期実行、decode 時の失敗報告。
-- `src/program/generate.cpp:16281-16325,16341-16379` — 別の speculative decode 経路での適応選定、交換上限、copy と usage decay。
-
-## 調査範囲
-
-調査対象は上記 commit の checkout 内の parser と実装です。調査時に Release artifact やビルド済み CLI の help は照合していません。また、build・GPU 実行・性能測定は行っていないため、backend や機器ごとの実測効果は記載していません。
+- parser の既定値・明示指定追跡・引数解析: `engine/src/program/generate.cpp:1084-1085`, `3844-3847`, `4202`
+- 適応ステップの候補選定と上限: `engine/src/program/generate.cpp:15342-15379`
+- 適応を有効にする条件と周期実行: `engine/src/program/generate.cpp:15001-15002`, `22055-22059`, `25188-25191`
+- coverage 補正と tiny-cache 補正: `engine/src/program/generate.cpp:12145-12164`, `14943-14973`, `24558-24570`; `engine/include/strata/core/adapt_coverage_rules.hpp:20-39`; `engine/include/strata/core/low_vram_rules.hpp:100-115`
+- peer tier への値の引き渡しと nibble 経路: `engine/src/program/generate.cpp:5475-5493`, `15505-15513`
+- SYCL parser / 交換上限: `engine/sycl/src/program/generate.cpp:721`, `2166`, `7126-7129`, `8877`

@@ -1,50 +1,45 @@
 # `STRATA_HOST_CORE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CPU expert pool が通常予約する最初の物理コアではなく、最後の物理コアを host thread（GPU の layer loop を進めるスレッド）用に予約します。残りのコアは pool worker に割り当てます。これは CPU thread の配置を変える設定です。ソースコメントは結果を変えないと説明しています（`include/strata/kernels/cpu/pool.hpp:83-89`）。
-
-環境変数を読むのは通常版と SYCL 版の `strata generate` 起動処理です。どちらも `--host-core` が指定されていればそちらが優先されます（通常版: `src/program/generate.cpp:1896-1901,2196-2200`; SYCL 版: `sycl/src/program/generate.cpp:1979-1983`）。
+生成エンジンの host thread（GPU の layer loop を進めるスレッド）に割り当てる論理 CPU を選びます。`last` は通常の先頭コアから最後の物理コアへ host を移し、先頭コアを worker pool に戻します。`sibling` は先頭物理コアの SMT sibling に host を移し、その論理 CPU を worker pool から外します。いずれもスレッド配置の変更で、計算結果を変える設定ではありません。CUDA/HIP 経路では `first|last|sibling`、SYCL 経路では `first|last` が扱われます（`engine/src/program/generate.cpp:4696-4702`、`engine/sycl/src/program/generate.cpp:2232-2237`、`engine/src/kernels/cpu/pool.cpp:249-267`）。
 
 ## 値と判定
 
-環境変数の文字列を整数や真偽値には変換せず、`last` と完全一致する場合だけ `HostCore::Last` にします。大文字小文字、前後の空白、後続文字を含む値は一致しません。
+エンジン初期化時、CLI の `o.host_core` が空の場合だけ `std::getenv("STRATA_HOST_CORE")` の値を文字列のまま取得し、完全一致で判定します。空白除去、大小文字変換、部分一致、数値変換はありません。未設定と空文字はどちらも設定を変えず、既定の `First` のままです。CLI に `--host-core first` を指定すると、環境変数より優先して `First` が選ばれます（`engine/src/program/generate.cpp:3947-3953,4696-4702`、`engine/sycl/src/program/generate.cpp:1977-1982,2232-2237`）。
 
-| CLI `--host-core` | 環境変数 | 起動設定 |
-|---|---|---|
-| `first` | 任意 | `First`（CLI が優先） |
-| `last` | 任意 | `Last`（CLI が優先） |
-| 未指定または空 | `last` | `Last` |
-| 未指定または空 | unset、空、`first`、その他 | `First`（既定値） |
+| 経路 | 未設定 / 空文字 | 有効値 | 判定されない値 |
+|---|---|---|---|
+| CUDA/HIP (`engine/src/program/generate.cpp`) | `First` | `last`, `sibling`。`first` も既定値を明示する値として無操作 | `LAST`, ` last`, `last `, `true`, `1` などは無視され、警告なしで `First` |
+| SYCL (`engine/sycl/src/program/generate.cpp`) | `First` | `last`。`first` は既定値を明示する値として無操作 | `sibling` を含むその他の値は無視され、警告なしで `First` |
 
-CLI に指定できる値は `first` と `last` のみで、それ以外は `strata generate: unknown --host-core value '…' (expected first or last)` を stderr に出して終了コード 2 で終了します。環境変数に不明な値を設定してもエラーにはならず、既定の `First` のままです（`src/program/generate.cpp:1896-1900,2196-2200`; `src/kernels/cpu/pool.cpp:36-40`）。
+既定値は `pool.cpp` の process-wide atomic `g_host_core` の初期値 `HostCore::First` です（`engine/src/kernels/cpu/pool.cpp:80-85`）。環境変数で有効なのはコードが小文字の `last` / `sibling` と完全一致した場合だけです。環境変数の無効値は CLI と異なりエラーになりません。CLI は CUDA/HIP で `first|last|sibling`、SYCL で `first|last` 以外をエラー終了コード 2 にします（同上 CLI parser の行）。
 
 ## 有効になる条件
 
-- CPU topology の検出が `skip_first=true` で呼ばれ、host 用コアと worker 用コアの両方が見つかった場合に、予約コアの位置を入れ替えます。
-- hybrid CPU では `Last` の入れ替えを行いません。検出処理は `topo.is_hybrid` が false の場合だけ切り替えます。したがって hybrid CPU では、環境変数が `last` でも host は通常の topology 検出で選ばれた先頭側のままです（`src/kernels/cpu/pool.cpp:44-54`）。
-- topology が得られず host core が `-1` の場合や worker list が空の場合も切り替えません。
-- 通常版と SYCL 版が共有する CPU topology 実装は Windows と Linux の分岐を持ち、同じ `detect_cpu_topology()` の切り替え処理を使います。別 OS の挙動は、このソース範囲から確認できません。
+- 起動した実行ファイルが該当する generate 経路に入り、設定ブロックまで進む必要があります。設定は pool と session がスレッドを pin する前に行われます（`engine/src/program/generate.cpp:4696-4702`、`engine/sycl/src/program/generate.cpp:2232-2237`）。
+- `last` の配置変更は topology が hybrid ではなく、host と worker core が検出できる場合だけ適用されます。条件を満たさない hybrid CPU では `First` 相当の配置のままです（`engine/src/kernels/cpu/pool.cpp:249-258`）。
+- `sibling` は検出された host core の SMT sibling がある場合だけ適用されます。sibling がない、または topology を取得できない場合は host core の変更がありません（`engine/src/kernels/cpu/pool.cpp:259-265`）。SYCL 経路は環境変数から `sibling` を設定しません（`engine/sycl/src/program/generate.cpp:2232-2237`）。
+- macOS の topology 分岐は host core / sibling を埋めずに戻ります。その場合、session は設定値に基づく pin をせず fallback の `physical_cores(false)` を試しますが、この関数も同じ topology の空の worker 列を返すため、ここからは pin されません（`engine/src/kernels/cpu/pool.cpp:206-209,618-620`、`engine/src/core/session.cpp:558-566`）。
+- host thread の pin に失敗しても生成を止めず、直前の affinity を保ちます。Windows は CPU Set 選択失敗、その他の実装は affinity 設定失敗を stderr に出します（`engine/src/kernels/cpu/pool.cpp:699-722`）。
 
 ## 実行時の詳細
 
-起動処理は pool や session が thread を pin する前に `STRATA_HOST_CORE` を一度読みます。CLI の `o.host_core` が空の場合だけ `getenv()` を呼び、取得値が厳密に `last` の場合に atomic な設定を `Last` に変更します。それ以外では初期値 `First` が保たれます。通常版と SYCL 版の両方に同じ読み取りがあります。プロセス起動後の環境変更は再読込されません（通常版: `src/program/generate.cpp:2196-2200`; SYCL 版: `sycl/src/program/generate.cpp:1979-1983`; 共通設定: `src/kernels/cpu/pool.cpp:35-40`）。
+CUDA/HIP と SYCL はそれぞれ generate 初期化時に一度環境を読み、`set_host_core` で process-wide atomic 設定を更新します。設定ブロック内に static cache はなく、起動後にプロセス環境を変更しても読み直されません。各リクエストごとの評価ではありません（`engine/src/program/generate.cpp:4696-4702`、`engine/sycl/src/program/generate.cpp:2232-2237`、`engine/src/kernels/cpu/pool.cpp:80-85`）。
 
-topology 検出は通常の予約コアを worker list の先頭から取り出し、`Last` が有効で非 hybrid、かつ worker list が残る場合、worker list の末尾を host core にし、元の host core を worker list の先頭へ移します（`src/kernels/cpu/pool.cpp:44-54`）。`SessionLoopScratch` は `planned_host_core()` の結果に従って host thread を pin し、core pool は検出された worker core に各 worker を pin します（`src/core/session.cpp:542-560`; `src/kernels/cpu/pool.cpp:459-465`）。
+pool の topology 検出では、`last` のとき先頭の予約 core を worker 列の先頭へ戻し、最後の worker core を host にします。`sibling` のとき sibling を worker 列から外し、その sibling を host core にします（`engine/src/kernels/cpu/pool.cpp:249-267`）。session 開始時に `planned_host_core()` の結果を取得して host thread を pin し、成功状態を保持します。host core が検出できない場合は physical core 列の先頭を試します（`engine/src/core/session.cpp:550-570`、SYCL は `engine/sycl/src/core/session.cpp:775-793`）。
 
-起動時の stderr topology ログには host の論理 CPU 番号と `(--host-core first|last)` が出ます。通常版と SYCL 版の両方にこのログがあります。環境変数専用の警告やエラーはありません（通常版: `src/program/generate.cpp:4761-4764`; SYCL 版: `sycl/src/program/generate.cpp:4253-4260`）。
+## ログと測定値
 
-## 文書との照合
+pool の初期化後、stderr に `strata generate: N pool workers on logical processors ..., the host thread on ... (--host-core last|sibling|first)` の形式で worker / host の論理 CPU と設定値を出します（`engine/src/program/generate.cpp:9022-9036`、SYCL は `engine/sycl/src/program/generate.cpp:4810-4820`）。topology 条件により配置変更されない場合も括弧内は設定値を表示するため、host の実 CPU は `the host thread on ...` の番号で確認します。pin に失敗した場合は `strata cpu pool: host CPU Set selection for processor ... failed: ...; previous placement kept`（Windows）、または `strata cpu pool: host affinity for CPU ... failed: ...; previous affinity kept`（それ以外）が出ます（`engine/src/kernels/cpu/pool.cpp:699-722`）。環境変数の無効値自体に対するログはありません。
 
-`docs/DETAILS.md:265-267` は Windows での `STRATA_HOST_CORE=last` を説明し、Windows の GPU 割り込みを理由として挙げています。現行コードの `Last` による topology 入れ替えは Linux 側にも適用されますが、hybrid CPU では抑止されます。資料にある割り込みの説明は Windows に関するものです。
+`docs/SETTINGS.md:112` はこの変数の値を `on / off` としていますが、現行ソースが受け取るのは `last` / `sibling`（または既定値を明示する `first`）です（`engine/src/program/generate.cpp:4696-4702`、`engine/sycl/src/program/generate.cpp:2232-2237`）。`docs/DETAILS.md:1283` は Windows の `last|sibling` と一台での測定を記載していますが、現行ソースでは topology 条件に応じて配置を選びます。記載された性能値については測定条件の詳細をこの実装から確認できないため、一般的な効果としては扱いません。
 
 ## 根拠
 
-- 環境変数と CLI の優先順位、値の厳密比較: `src/program/generate.cpp:1896-1901,2196-2200`; `sycl/src/program/generate.cpp:1979-1983`
-- 既定値と topology の切り替え条件: `src/kernels/cpu/pool.cpp:35-57`
-- host thread の pin: `src/core/session.cpp:542-560`
-- worker thread の pin: `src/kernels/cpu/pool.cpp:459-465`
-- 起動時ログ: `src/program/generate.cpp:4757-4764`
-- 設計説明: `include/strata/kernels/cpu/pool.hpp:83-89`; `docs/DETAILS.md:265-267`
+- 環境変数の読み取りと CLI 優先順位: `engine/src/program/generate.cpp:3947-3953,4696-4702`、`engine/sycl/src/program/generate.cpp:1977-1982,2232-2237`
+- 既定値と topology 変更: `engine/src/kernels/cpu/pool.cpp:80-85,249-267`
+- topology が得られない場合と host pin: `engine/src/kernels/cpu/pool.cpp:206-209,699-722`、`engine/src/core/session.cpp:550-570`、`engine/sycl/src/core/session.cpp:775-793`
+- 配置ログ: `engine/src/program/generate.cpp:9022-9036`、`engine/sycl/src/program/generate.cpp:4810-4820`

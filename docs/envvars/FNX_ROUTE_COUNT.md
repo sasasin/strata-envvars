@@ -1,46 +1,50 @@
 # `FNX_ROUTE_COUNT`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`sFNX` split engine の expert 選択回数を GPU 上で集計する診断・測定用スイッチです。モデルの routing 結果や生成処理を変更せず、各 layer で選ばれた expert の tally を追加で記録します。通常の Strata 実行全般の環境変数ではなく、split engine を使う `strata-split`（CUDA/HIP）と `split_fnx_run`（CUDA）に実装されています（`src/split/CMakeLists.txt:64-80,95-120,153-165`）。
+CUDA split engine が router の選択結果を expert ごとに数え、`Engine::route_counts()` から取得できる集計を有効にする診断用スイッチ。集計領域は card 0 にだけ確保され、`[decode | prompt][layer][expert]` の順に `unsigned` 値を持つ。router の選択や生成結果を変更する分岐ではなく、選択済み expert ID を追加集計する（`engine/src/split/src/engine.cu:235-238, 706-712, 955-959`; `engine/src/split/src/prefill.cu:1739-1744`; `engine/src/split/src/kernels.cu:1802-1805, 1878-1880`）。
 
-集計配列は `unsigned` の `[decode | prompt][NL][NEXP]` 形式です。各 expert の要素に top-k の選択回数を加算します。結果の保存先は別環境変数 `FNX_ROUTE_FILE` で指定します（`src/split/src/engine.hpp:124-125`, `src/split/src/engine_impl.hpp:144`, `src/split/src/kernels.hpp:260-261`, `src/split/src/kernels.cu:1786-1789`）。
+主な利用先は sfnx サーバーと `fnx_run`。sfnx は返信ごとに集計ファイルを更新する。`fnx_run` は終了時に `FNX_ROUTE_FILE` が設定されていれば書き出す。変数自体に CLI 引数による上書きはない（`engine/src/split/tools/sfnx.cpp:527-531, 544-564`; `engine/src/split/tools/fnx_run.cpp:1145-1152`）。
 
 ## 値と判定
 
-`fnx::env_flag("FNX_ROUTE_COUNT")` は `env_int(name, 0) != 0` です。未設定なら既定値 0 で無効です。設定されている場合は、空白なしの符号付き base-10 整数として文字列全体を parse し、`long long` の範囲内である必要があります。0 は無効、0 以外（負数を含む）は有効です。`1`, `true`, 空文字、前後空白、数字の後ろに文字がある値、範囲外整数は整数として受け付けられず、`<NAME>: '<value>' is not a whole number` 形式の例外になります。小数・真偽文字列の解釈や値の clamp はありません（`src/split/src/env.hpp:15-22,33-40,51-52`）。
+エンジンの `env_flag` は `env_int(name, 0) != 0`。未設定なら `false`。設定時は符号付き base-10 整数として文字列全体を parse し、任意の符号と数字列だけを許す。値が 0 なら無効、0 以外（負数を含む）なら有効。空文字、空白、`true` / `false`、数字の後ろに文字がある値、long long の範囲外は無効値ではなく例外になる。空白を飛ばしたり、先頭の数値だけを採用したりはしない（`engine/src/split/src/env.hpp:15-22, 33-40, 51-52`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | OFF |
-| `0`, `+0`, `-0` | OFF |
-| 0 以外の整数（例: `1`, `-2`） | ON |
-| 空文字、非整数、整数の前後に空白や文字、`long long` 範囲外 | parse エラー |
+| 条件 | unset | 有効になる値（例） | 無効・エラーになる値（例） |
+|---|---|---|---|
+| sfnx の起動検査 | off | `1`, `-1`, `2` | `0` は off。空文字、`true`、`0anything`、` 1`, 範囲外整数は parse エラー |
+| CUDA split Engine の初期化 | off | 0 以外の whole number | 0 は off。parse 規則は上記と同じ |
+
+sfnx はモデルを読む前にこの値を検査するため、不正値は `sfnx: FNX_ROUTE_COUNT: '<値>' is not a whole number` の形式で stderr に出し、終了コード 2 で終了する。値が on で `FNX_ROUTE_FILE` が未設定なら `sfnx: FNX_ROUTE_COUNT needs FNX_ROUTE_FILE` を出し、同じく終了コード 2。`FNX_ROUTE_FILE` の検査は設定有無のみなので空文字も設定済み扱いとなり、後のファイル書き込み時に失敗する（`engine/src/split/tools/sfnx.cpp:1022-1028, 1107-1116`; `engine/src/split/src/env.hpp:34-39`）。
 
 ## 有効になる条件
 
-- split engine の `strata-split` または `split_fnx_run` が実行されること。CMake では `strata-split` を Linux CUDA/HIP 用に構成し、`split_fnx_run` は CUDA target として定義しています（`src/split/CMakeLists.txt:20-30,64-80,95-120,153-165`）。
-- `sfnx` では `FNX_ROUTE_COUNT` が ON の場合、`FNX_ROUTE_FILE` が設定されている必要があります。ファイル名が空文字でも「設定あり」のチェックは通りますが、後のファイル書き込みは成功しません。条件不足または値の parse エラーはモデル読込前に検出されます（`src/split/tools/sfnx.cpp:1007-1012,1040-1048`）。
-- `fnx_run` は `FNX_ROUTE_FILE` が設定されている場合に tally 出力を試みますが、counter を有効化するための同じ起動前チェックはありません。従って `FNX_ROUTE_FILE` だけを設定し `FNX_ROUTE_COUNT` を未設定または 0 にすると、空の tally として終了時にエラーになります（`src/split/tools/fnx_run.cpp:1145-1152`）。
-- 別変数 `FNX_EXPERT_PROFILE` は、モデルの expert 配置に使うプロファイルの選択です。`FNX_ROUTE_COUNT` が自動で profile を設定したり、CLI 引数で上書きされたりする処理は確認できません（`src/split/src/model.hpp:250-261`, `src/split/src/model.cpp:1491-1498`）。
+- CUDA split engine を使う実行経路であること。直接の読み取りとカウンターの実装は `engine/src/split/src/engine.cu` / `.cu` カーネルにある。別 backend の読み取りは見つからなかった（`engine/src/split/src/engine.cu:235-238`; `engine/src/split/src/kernels.cu:1802-1805`）。
+- モデル処理で router が実行されること。decode は各 layer の `router_route` 後に、prompt は prefill の top-i を得た後に数える。これらの経路を通らない間は値が増えない（`engine/src/split/src/engine.cu:950-959`; `engine/src/split/src/prefill.cu:1739-1744`）。
+- sfnx では、on にするなら `FNX_ROUTE_FILE` も設定すること。これは必須の出力先であり、CLI からは指定できない（`engine/src/split/tools/sfnx.cpp:1024-1027`）。
+- `fnx_run` は `FNX_ROUTE_COUNT` と `FNX_ROUTE_FILE` の組み合わせを起動前検証しない。ファイル名が設定されている場合にだけ、終了時に集計を要求して保存する。したがって count を on にしても file が unset ならファイル出力は行わない（`engine/src/split/tools/fnx_run.cpp:1145-1152`）。
 
 ## 実行時の詳細
 
-`sfnx` は引数解析後、モデルロード前に環境変数を検査します。検査時に tally が有効なら `FNX_ROUTE_FILE` が未設定の場合は `FNX_ROUTE_COUNT needs FNX_ROUTE_FILE` を stderr に出し、終了コード 2 で終了します。無効値の parse 例外も `sfnx: ...` として stderr に出し、終了コード 2 になります（`src/split/tools/sfnx.cpp:1007-1012,1040-1048`）。engine の GPU buffer 割り当て時にも、card 0 で同じ flag を読み、`2 * NL * NEXP` 個のゼロ初期化済み tally buffer を確保します。環境値を `static` に cache する実装ではなく、この buffer 初期化時に評価します（`src/split/src/engine.cu:193-196`）。
+sfnx では CLI 引数解析後、モデル読込前に `check_route_env()` が `FNX_ROUTE_COUNT` を読み、Engine 初期化時に CUDA engine が再度読み取る。`env_flag` 自体に static cache はないが、この値を使う分岐は Engine 初期化時だけなので、実行中に環境値を変更しても確保済みのカウンターは切り替わらない。初期化時に card 0 上へ `2 * NL * NEXP` 個を確保してゼロ初期化する（`engine/src/split/tools/sfnx.cpp:1107-1132`; `engine/src/split/src/engine.cu:235-238`; `engine/src/split/src/env.hpp:33-52`）。
 
-decode は各 layer の routing 後に top-k index を集計配列へ加算し、prompt の prefill も別領域へ同様に加算します。集計関数は各 index に対して `atomicAdd(&cnt[topi[i]], 1u)` を行います。カウンターは 32-bit unsigned で、飽和・overflow 検査はありません（`src/split/src/engine.cu:905-914`, `src/split/src/prefill.cu:1276-1281`, `src/split/src/kernels.cu:1786-1789`）。
+各 decode layer の `topi` の `P` 個、各 prompt layer の prefill `topi` の `P` 個について、それぞれ対応する `[layer][expert]` カウンターを atomic increment する。prompt 用領域は decode 用の `NL * NEXP` 個の後ろに置かれる。`route_counts()` は全領域を device から host にコピーして返す（`engine/src/split/src/engine.cu:706-712, 950-959`; `engine/src/split/src/prefill.cu:1740-1744`）。
 
-`sfnx` は応答完了時に tally を host 側へコピーし、`FNX_ROUTE_FILE.tmp` に全配列を書いてから指定先へ rename します。したがって同じファイルは各応答完了ごとに最新 tally で置き換えられます。書き込みまたは rename に失敗すると stderr に `sfnx: FNX_ROUTE_FILE: cannot write ...: route counting stopped` を出し、その後の tally 保存を止めますが、engine の serving は継続します（`src/split/tools/sfnx.cpp:531-551,554-570,846-855`; host へのコピーは `src/split/src/engine.cu:663-669`）。
+sfnx は返信完了時に `save_routes()` を呼び、集計が空でなければ `FNX_ROUTE_FILE + ".tmp"` へ全 `unsigned` 値を書いてから指定先へ rename する。カウンターを返信ごとにリセットする処理はなく、ファイル内容は Engine 起動後の累積値で、返信ごとに更新される。書き込みまたは rename が失敗すると stderr に `sfnx: FNX_ROUTE_FILE: cannot write <path> (<error>): route counting stopped` を出し、それ以降の route count 保存を止めるが、サーバー処理は続ける（`engine/src/split/tools/sfnx.cpp:544-564, 567-582, 860-868`）。
 
-`fnx_run` はその実行終了時に `FNX_ROUTE_FILE` が設定されている場合、配列を読み出して指定先へ直接 `wb` で書きます。tally が空、ファイルを開けない、または書き込みに失敗すると `FNX_ROUTE_FILE <path>: no tallies (FNX_ROUTE_COUNT=1?) or not written` を stderr に出し、終了コード 1 になります（`src/split/tools/fnx_run.cpp:1145-1152`; route tally 取得は `src/split/src/engine.cu:663-669`）。
+`fnx_run` は `FNX_ROUTE_FILE` 設定時、処理終了時に `route_counts()` の内容を指定先へ binary write する。集計が空、open 失敗、write 失敗時は `FNX_ROUTE_FILE <path>: no tallies (FNX_ROUTE_COUNT=1?) or not written` を stderr に出して終了コード 1 を返す（`engine/src/split/tools/fnx_run.cpp:1145-1152`）。
+
+## ログと測定値
+
+有効化だけを知らせるログはない。sfnx の必須出力先不足・不正値・保存失敗の文言と終了・継続条件は上記のとおり。CUDA の確保・コピー・kernel launch に失敗した場合は engine の CUDA エラー処理経路に進むが、この変数専用の追加警告文はない（`engine/src/split/src/engine.cu:235-238, 706-712, 958`; `engine/src/split/tools/sfnx.cpp:1097-1103`）。性能測定値は該当する Strata の資料で確認できなかった。
 
 ## 根拠
 
-- 厳密な整数変換、未設定時の既定値、flag 判定: `src/split/src/env.hpp:15-22,33-40,51-52`
-- counter buffer の割当と初期化: `src/split/src/engine.cu:193-196`; buffer 定義: `src/split/src/engine_impl.hpp:144`
-- decode / prompt の tally 更新と kernel: `src/split/src/engine.cu:905-914`, `src/split/src/prefill.cu:1276-1281`, `src/split/src/kernels.cu:1786-1789`
-- sfnx の出力先検査、起動時エラー、応答ごとの保存と継続動作: `src/split/tools/sfnx.cpp:1007-1012,1040-1048,531-551,554-570,846-855`
-- fnx_run の終了時出力とエラー: `src/split/tools/fnx_run.cpp:1145-1152`
-- split executable の build 経路: `src/split/CMakeLists.txt:64-80,153-165`
+- `engine/src/split/src/env.hpp:15-22, 33-52` — 整数全体の parse と flag 判定。
+- `engine/src/split/src/engine.cu:235-238, 706-712, 950-959` — card 0 の領域確保、取得、decode 集計。
+- `engine/src/split/src/prefill.cu:1739-1744` — prompt の top-i 集計。
+- `engine/src/split/src/kernels.cu:1802-1805, 1878-1880` — expert ID ごとの atomic increment。
+- `engine/src/split/tools/sfnx.cpp:1022-1028, 1107-1135, 527-564, 567-582, 860-868` — 起動前検査、server 出力。
+- `engine/src/split/tools/fnx_run.cpp:1145-1152` — CLI ツールの終了時出力。

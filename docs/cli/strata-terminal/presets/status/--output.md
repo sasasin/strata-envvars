@@ -1,6 +1,6 @@
-# `strata presets status --output`
+# `--output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,54 +12,48 @@
 
 ## 役割
 
-status の結果を人向けテキストか JSON で標準出力へ出します。保存済み設定に対応する tuning preset の有効状態を調べるコマンドで、`--output` 自体は調査対象を変えません。
+対象構成に対応する保存済みチューニング preset の状態を表示する形式を選ぶ。status 処理は preset や run config を更新せず、エンジンも起動しない。ただし、対象を保存 profile 名で指定したとき、profile の読込でアクセス権エラーが起きると、profile 読込 helper が権限を修復して再読込する経路がある。
 
 ## 使い方
 
 ```sh
-strata presets status my-profile --output json
+# 人間向け表示（既定値）
+strata presets status my-profile
+
+# スクリプトなどから扱う JSON 表示
+strata presets status /path/to/run-config.json --output json
 ```
 
-`my-profile` は保存済み profile 名、または JSON run config のパスに置き換えます。位置引数 `target` は必須です（`strata_cli/tune_commands.py:59-60`）。
+`target` は保存 profile、run config JSON のパス、または一意に特定できるインストール済みモデル名を指定できる。CLI の parser は `status` に `target` と `--output` を登録し、`--output` の既定値を `human` としている（`terminal/strata_cli/tune_commands.py:59-66`）。
 
 ## 値と既定値
 
-- `human`: 人向けの一行表示です。省略時の既定値です。
-- `json`: JSON オブジェクトを一行で標準出力へ出します。`schema_version: 1` と `ok: true` に加え、slot、推奨名、choices、有効 preset、state、reasons、同じ slot の presets、undo 可否、無効化状態、直前の active preset を含みます。
-- parser は `choices=("human", "json")` で受理値を制限します。別名や出力ファイル指定はありません（`strata_cli/tune_commands.py:53-60`）。
-
-例:
-
-```sh
-strata presets status my-profile
-strata presets status ./run-config.json --output json
-```
+- `human`: 省略時の値。結果を人間向けの短い文として標準出力へ出す。
+- `json`: `schema_version: 1`、`ok: true` と status データを含む JSON オブジェクトを標準出力へ出す。
+- `choices=("human", "json")` による parser 検証があり、その他の値は argparse が拒否する。短縮別名や重複指定時の特別な処理は定義されていない（`terminal/strata_cli/tune_commands.py:59-66,101-106`）。
 
 ## 実行時の動作
 
-`--output json` のとき `machine` が真になり、`_print` が `{"schema_version":1,"ok":true,...}` の形式を標準出力へ出します。`human` の場合は、有効 preset があれば `Active: '<name>' (<state>)`、なければ `No saved tuning for these choices yet.` と表示します（`strata_cli/tune_commands.py:95-100,289-303,391-408`）。
+`--output` は結果のシリアライズ形式だけを切り替え、status の計算は共通である。対象構成から model・context・KV・vision・goal などの選択値を読み取り、現在のハードウェア、engine、モデルファイルの identity とともに preset slot を特定する。該当 slot の active preset、staleness と理由、同 slot の preset 一覧、undo 可能性、前回 active だった preset を集めて出力する（`terminal/strata_cli/tune_commands.py:595-612`; 選択値と slot の構成は `terminal/strata_control/presets.py:89-117,128-132`）。
 
-出力形式以外の処理は共通です。`target` を profile 名または JSON パスとして解決し、現在の hardware / engine / model identity と choices から slot を求めます。active index と preset 一覧を読み、active preset の staleness (`fresh` / `soft` / `hard`) と理由を計算して出力します（`strata_cli/tune_commands.py:391-408`、`strata_control/profiles.py:382-388`、`strata_control/presets.py:136-155,158-197`）。
-
-`--output` は `presets/status` の subparser に登録されており、`strata presets` の全階層に共通するグローバルオプションではありません（`strata_cli/tune_commands.py:49-60`）。他の `presets` サブコマンドにも同名オプションがありますが、それぞれの subparser に登録されています。
+`human` は active preset があれば名前と状態を、なければ「該当選択肢の保存 tuning はない」旨を出力する。`json` は同じ結果を機械可読な object にして出力する（`terminal/strata_cli/tune_commands.py:101-106,606-612`）。どちらも status の取得範囲やエラー条件は変えない。
 
 ## 適用条件と副作用
 
-この status 分岐は preset の active 状態を変更せず、GPU 上で推論や tuning を実行しません。現在状態の照合に hardware 情報、engine manifest、model file identity を読み取ります。GPU 情報取得には環境により `nvidia-smi` の照会または Linux の sysfs 読み取りが使われます（`strata_control/tune_machine.py:70-117,264-309`）。
-
-対象が profile 名の場合、profile 解決時に profile を読み込みます。権限エラー等で読み込みに失敗した場合の既知ルート修復が行われ得るため、呼び出し全体をファイル非変更とは断定できません。JSON パスは run config として読み込まれます（`strata_control/profiles.py:150-166,382-388`）。
+status は構成ファイルと preset store を読み、identity 判定のためにローカルの CPU・メモリ・GPU 情報を調べる。NVIDIA では `nvidia-smi` を呼び出す場合があり、macOS ではメモリ取得のため `sysctl` と `vm_stat` を呼び出す。エンジン実行や測定、preset の書き換えはこの経路にない（`terminal/strata_control/tune_machine.py:47-65,70-117,264-309`; 読み取り処理の呼び出しは `terminal/strata_control/presets.py:162-182`）。probe が使えない場合、同モジュールは例外を抑えて情報を欠落値として返す。profile 名で対象を解決すると `profiles.load` を通り、ファイルアクセス権のエラー時は `read_bytes_repairing` が権限修復を試みてから再読込するため、この条件では profile の権限に副作用があり得る（`terminal/strata_control/profiles.py:153-173`; `terminal/strata_control/private_files.py:479-487`）。
 
 ## 出力とエラー
 
-- 有効 preset がない場合も通常結果として終了コード `0` で、human 表示では「まだ保存 tuning がない」旨を返します（`strata_cli/tune_commands.py:391-408,95-100`）。
-- `--output` に `human` / `json` 以外を指定すると argparse の選択肢検証で拒否され、status 処理には進みません。CLI は parser で引数を解析してから dispatch します（`strata_cli/tune_commands.py:53-60`、`strata_cli/cli.py:2223-2231`）。
-- 対象 profile / config の解決・読み込みに失敗した場合、`ProfileError` は `ValueError` の派生として捕捉され、既定の exit code（通常 `2`、読み込み不能など明示指定時は `5`）で返されます。`PresetError` は `5` です。JSON 形式では `ok: false` と `error` を標準出力に出し、human 形式では `strata: ...` を標準エラーに出します（`strata_cli/tune_commands.py:103-108,344-347`、`strata_control/profiles.py:30-35,135-147`）。
+- 成功時は JSON／人間向けのいずれも標準出力へ出し、終了コード `0` を返す（`terminal/strata_cli/tune_commands.py:101-106`）。
+- 対象 profile や run config を解決・読込できない場合など、`ValueError` 系または `OSError` は共通 handler で処理される。JSON 指定時は `schema_version: 1`、`ok: false`、`error.code` と `error.message` の JSON を標準出力へ出し、人間向けでは `strata: ...` を標準エラーへ出す。ProfileError が持つ終了コードを優先し、それ以外の例外は既定で `2` となる（`terminal/strata_cli/tune_commands.py:109-114,527-530`; ProfileError の型と終了コードは `terminal/strata_control/profiles.py:30-35`）。
+- 不正な `--output` 値はコマンド処理に入る前に argparse が拒否する。parser 定義で許可値を限定している（`terminal/strata_cli/tune_commands.py:59-60`）。
 
 ## 根拠
 
-- `strata_cli/tune_commands.py:49-60` — `presets status` parser、必須 target、`--output` の値と既定値。
-- `strata_cli/tune_commands.py:95-108,289-303,391-408` — 成功・失敗時の出力、status の処理と返却項目。
-- `strata_control/profiles.py:30-35,135-147,150-166,382-388` — profile/config の読込、解決、エラー。
-- `strata_control/presets.py:136-155,158-197,202-215` — identity、staleness、active index / preset の読み込み。
-- `strata_control/tune_machine.py:70-117,264-309` — hardware 情報と engine/model identity の取得。
-- `strata_cli/cli.py:2223-2231` — parser 実行と未知・不正引数の拒否。
+- `terminal/strata_cli/tune_commands.py:55-66` — presets の parser 階層、`status` の引数、`--output` の値と既定値。
+- `terminal/strata_cli/tune_commands.py:101-114,472-485,527-530` — 成功・失敗出力の形式、status への振り分け、例外処理。
+- `terminal/strata_cli/tune_commands.py:595-612` — status の計算内容と表示形式。
+- `terminal/strata_control/presets.py:89-117,128-132,162-182` — 対象選択値、slot、現在 identity の構築。
+- `terminal/strata_control/tune_machine.py:47-65,70-117,264-309` — ローカル環境 probe と engine／model identity の読み取り。
+- `terminal/strata_control/profiles.py:153-173`; `terminal/strata_control/private_files.py:479-487` — profile 名指定時のアクセス権修復を伴う再読込。
+- `docs/cli/README.md:773-776` — 作成対象の索引リンク、コマンド階層、option scope。

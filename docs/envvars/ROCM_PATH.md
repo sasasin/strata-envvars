@@ -1,52 +1,57 @@
 # `ROCM_PATH`
 
-調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。外部ライブラリや GPU ドライバーが読む値の意味は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-ソース checkout から HIP backend のエンジン、HIP 画像 reader、HIP を使う画像生成器をビルドするときに、システム ROCm のルートディレクトリを指定します。`setup.py` の `rocm_root()` は値をシステム ROCm の候補として調べ、条件を満たせばそのパスを使います。使えない場合は GPU architecture に応じた AMD TheRock wheel を `.venv` に導入して使います。
+`ROCM_PATH` は Strata の常駐 inference server の実行設定ではなく、Strata の Python setup と HIP build 補助ツールが ROCm SDK の prefix を探すためのパスとして読む。主な利用箇所は `terminal/setup.py` の `rocm_root()` で、Linux の AMD HIP engine または HIP 画像 engine をソースからビルドするときに使う。システム ROCm が利用可能ならその root と hipBLAS の library directory を build に渡し、利用できなければ TheRock wheel へ進む (`terminal/setup.py:5550-5573`, `5681-5701`, `5934-5939`)。
 
-この変数は実行時の Strata engine ではなく、セットアップ・ビルド処理が読むものです。
+同じ値は `strata bench run` のレポート作成時に ROCm version ファイルの探索先としても使われる (`terminal/strata_cli/bench_facts.py:288-304`, `371-422`)。別の Strata 所有 build 経路として、Inkling HIP の CMake、`tools/hy4/build_hy4_hip_linux.sh`、画像 gate の `build_sd.py` も値を参照する (`engine/src/inkling2/hip/CMakeLists.txt:10-18,43-63,99-109`, `tools/hy4/build_hy4_hip_linux.sh:1-38`, `terminal/tools/image/gate/build_sd.py:72-85`)。
 
 ## 値と判定
 
-| 値 | `setup.py` の扱い |
-|---|---|
-| 未設定 | `/opt/rocm` をシステム ROCm 候補にする |
-| 空文字 | Python の `or` により未設定と同じく `/opt/rocm` を候補にする |
-| 空でない文字列 | そのまま `pathlib.Path` に渡し、システム ROCm 候補にする |
-| 存在しないパス、必要ファイルのないパス | システム ROCm として採用せず、TheRock wheel の経路へ進む |
+| 経路 | unset / 空文字 | 設定時に有効になる値 | 無効・未発見時 |
+|---|---|---|---|
+| `setup.py` の `rocm_root()` | `os.environ.get("ROCM_PATH") or "/opt/rocm"` により `/opt/rocm` を基点にする。 | 文字列を `Path` にするだけで、文字種・版・絶対パスの parse はしない。空白だけの値も trim されず、その文字列の path として扱われる。 | 基点、その親、その親の親、最後に `PATH` 上の `hipcc` から得た prefix を順に検査する。各候補で `bin/hipcc` と `libhipblas.so*` が必要。条件に合う root がないと wheels 経路へ進む。`terminal/setup.py:5522-5536,5550-5573` |
+| `strata bench run` の version probe | 空値は空文字となり、最初の候補を skip。続いて `/opt/rocm` を探す。 | 設定値を path として使い、`<path>/.info/version`、`<path>/core/.info/version` の順に読む。ファイル内容は `.strip()` し、空でない最初の内容を返す。 | ファイルを開けない場合は次の場所へ進み、どちらも値がなければ `amd-smi -h` の出力から `ROCm version: <数字とドット>` を探す。`terminal/strata_cli/bench_facts.py:288-304` |
+| `tools/hy4/build_hy4_hip_linux.sh` | `${ROCM_PATH:-/opt/rocm}` により `/opt/rocm`。 | 値を `ROCM` に代入し、compiler、`--rocm-path`、library path の組み立てに使う。 | 別 prefix 探索や値の検証はせず、その prefix の compiler がなければ後続 compiler 呼び出しで失敗する。`tools/hy4/build_hy4_hip_linux.sh:3-19,32-38` |
+| Inkling HIP CMake | `ROCM_PATH` は compiler / library の hint として使われない。 | `find_program` の hint (`bin`, `llvm/bin`) と `find_library` の hint (`lib`) に展開される。空値なら `/bin` 等の形の hint が生成され得る。 | compiler 選択では `CMAKE_HIP_COMPILER` が先にあれば環境変数の探索 hint を使わない。ROCm root 用の compiler flag は `STRATA_ROCM_PATH`、次に `CMAKE_HIP_COMPILER_ROCM_ROOT` を使い、`ROCM_PATH` はその root を直接決めない。`engine/src/inkling2/hip/CMakeLists.txt:10-18,43-63,99-109` |
+| `terminal/tools/image/gate/build_sd.py` の HIP build | `env.get("ROCM_PATH") or "/data/Strata/.venv/lib/python3.12/site-packages/_rocm_sdk_devel"` により記載の SDK path。 | 指定文字列を `Path` 化し、子プロセス用 `env` の `ROCM_PATH` / `HIP_PATH`、`PATH`、`LD_LIBRARY_PATH` と CMake definitions に使う。 | パスの妥当性確認や別 system prefix 探索はせず、build に進む。`terminal/tools/image/gate/build_sd.py:72-85` |
 
-前後空白の除去、文字列全体の書式検査、パスの環境変数展開はありません。空白だけの値も非空文字列としてパスに使われます。
+`setup.py` では受理値が存在するかの判定ではなく、path の候補で `hipcc`、hipBLAS library、および HIP development files を検査する。共有 library の候補は `lib`, `lib64`, `lib/x86_64-linux-gnu`, `lib/x86_64-unknown-linux-gnu`, `lib/aarch64-linux-gnu`。版 header が読めず `rocm_version()` が `None` でも、他条件を満たせば system ROCm を許容する。版が判明して `7.0` 未満なら system ROCm を採用しない (`terminal/setup.py:5494-5509,5512-5519,5560-5573`)。
 
-システム候補を採用するには、少なくとも `bin/hipcc` と `lib/libhipblas.so*` が存在し、HIP の開発ファイルがそろっている必要があります。`rocm-core/rocm_version.h` からバージョンを読めた場合は 7.0 以上が必要です。バージョンヘッダーがなくバージョンを取得できない場合でも、他の要件を満たせば採用されます。古い、または開発ファイルが不足する場合は警告を出し、wheel 側へ進みます。
+CLI に `ROCM_PATH` 専用 option はない。`--backend hip` または GPU 判定で選ばれた HIP 経路、`--build`、画像 generation の `--image-backend hip` が処理経路を選ぶ。`STRATA_ROCM_VERSION` は wheels の版選択に関係する別変数で、system root の選択を上書きしない (`terminal/setup.py:4451-4453,9614-9625`; image build `--image-backend` の定義は同 `11470-11485`)。
 
 ## 有効になる条件
 
-- ROCm SDK を必要とする HIP ビルド経路で `rocm_root()` が呼ばれる場合に評価されます。主な呼び出し元は HIP エンジン構築、GPU HIP 画像 reader 構築、HIP backend の画像生成器構築です。
-- HIP エンジンが既に構築済みでも、`--vision gpu` で GPU 画像 reader を追加構築する経路では ROCm 環境を復元するため `rocm_root()` が呼ばれます。
-- システム候補を利用できない場合は GPU architecture ごとの TheRock wheel に fallback します。複数 GPU family に対応する単一の wheel index がない場合は `fail()` でセットアップを中止し、システム ROCm 7 を使うよう案内します。
-- ビルド関数は選択した root を `ROCM_PATH` と `HIP_PATH` に設定し、関連する `HIP_PLATFORM`、`HIP_COMPILER`、`HIP_RUNTIME`、`PATH`、`LD_LIBRARY_PATH` も更新します。これは `setup.py` が後続ビルド用に行う環境設定です。
+- 通常の setup では Linux の AMD HIP engine をコンパイルする経路で `rocm_root()` が呼ばれる。既存 engine が有効で再 build が不要なら `build_engine_hip()` は `rocm_root()` より前に戻るため、この setup run では値を使わない (`terminal/setup.py:5656-5677`)。Windows は ready-made HIP engine を使い、通常 setup の同じ system root 選択を通らない (`terminal/setup.py:9606-9615,9624-9629`)。
+- HIP image backend の build でも `rocm_root()` を呼ぶ。GPU image reader の再 build が必要な場合は `build_vision_hip()` が HIP compiler / root を組み立てる。vision が `gpu` でなく、engine の build も不要なら、この用途では読まれない (`terminal/setup.py:5750-5780,5900-5940`)。
+- `rocm_root()` は指定 root を見つけられないと、親・祖父パスと `PATH` 上の `hipcc` prefix も検査する。候補に `bin/hipcc` と hipBLAS library があり、ROCm version が未知または 7.0 以上で、development files が揃う場合に採用する。候補に compiler/library がない場合は次候補へ進む。一方、compiler/library のある候補が古いか development files 不足なら理由を警告して system 候補探索を打ち切り、wheel 選択へ進む (`terminal/setup.py:5522-5536,5555-5573`)。
+- wheel fallback はカード family ごとの TheRock index を使う。対応 wheel のない architecture では setup は終了し、複数 family のカードは system ROCm 7 を要求して終了する (`terminal/setup.py:5574-5582`)。wheel 利用時の `ROCM_PATH` は選択された wheel root で setup 自身が上書きし、`HIP_PATH`、`PATH`、`LD_LIBRARY_PATH` も build 子プロセス向けに設定する (`terminal/setup.py:5601-5615,5681-5701`)。
+- Inkling HIP CMake はその HIP target を build する時だけ該当する。明示 CMake cache 値 `CMAKE_HIP_COMPILER` が compiler 探索を先取りし、`STRATA_ROCM_PATH` または `CMAKE_HIP_COMPILER_ROCM_ROOT` が compiler flag 用 root を決めるため、環境変数はそこでは compiler / library の探索 hint に限られる (`engine/src/inkling2/hip/CMakeLists.txt:10-18,43-63,99-109`)。
+- `strata bench run` は Linux でカードが検出され、CUDA runtime がない場合のみ `rocm_version()` を呼び、読めた版を benchmark software block の ROCm runtime 値に入れる。GPU 選択や inference backend を変更しない (`terminal/strata_cli/bench_facts.py:371-422`, `terminal/strata_cli/bench_standard.py:881-885`)。
+- `terminal/tools/image/gate/build_sd.py` と `tools/hy4/build_hy4_hip_linux.sh` はそれぞれの HIP build tool が実行された時のみに適用される。server mode や各 inference request で `ROCM_PATH` を読む Strata code はこの調査で見つからなかった。
 
 ## 実行時の詳細
 
-`rocm_root(archs)` は `os.environ.get("ROCM_PATH") or "/opt/rocm"` で一度値を取り、システム ROCm のファイルを確認します。未設定・空文字以外はすべてパス候補として扱います。候補の存在確認に失敗しても、その時点ではエラーにせず TheRock wheel 選択へ進みます。
+setup の `rocm_root()` は呼び出しのたびに `os.environ` を読み直し、関数内 static cache はない。プロセス起動後に環境を変更した場合も、その後の呼び出しは変更後の値を見る。system root の検査後、setup は選択 root を `ROCM_PATH` / `HIP_PATH` に設定し、compiler、CMake root、prefix path、library path を build command に渡す (`terminal/setup.py:5550-5566,5681-5701`)。同じ Python setup process の環境は HIP engine / image engine の build subprocess へ渡される。
 
-システム ROCm が古い場合は `the ROCm in <path> is M.m; Strata needs 7.0 or newer: using AMD's wheels in .venv instead` の警告を出します。HIP 開発ファイルが不足する場合も不足項目を示す警告を出します。wheel の導入が必要な場合は `Installing ROCm ... for AMD GPUs into .venv (AMD's TheRock wheels, ~10 GB, no sudo) ...` と出力し、インストール先は `.venv` 内です。システムの標準位置 `/opt/rocm` 以外を指定する場合に使う値ですが、不適切な値を受け取ったこと自体を専用エラーとして報告するのではなく、通常は wheel 経路に移ります。
+benchmark 側も `rocm_version()` の呼び出し時に環境を参照し、module global に値を cache しない。hardware report がこの関数を呼ぶのは Linux AMD 判定時だけで、通常は benchmark report の生成中に一度である (`terminal/strata_cli/bench_facts.py:288-304,371-422`; 呼び出し `terminal/strata_cli/bench_standard.py:881-885`)。
 
-GPU 画像 reader の復元処理では `vision == "gpu"` かつ `hipconfig` が見つからず、かつ `ROCM_PATH` が未設定または空のときにだけ `rocm_root()` を呼んで `ROCM_PATH` などを再設定します。非空値が設定済みならこの復元分岐は通りませんが、その後の画像 reader のビルド処理でも `rocm_root()` が呼ばれるため、設定値は改めて候補として評価されます。
+## ログと測定値
 
-## 文書との照合
+setup が指定 root 以外の親や `hipcc` prefix を採用した場合は `System ROCm: <prefix> (this distribution keeps hipcc, the libraries and the development files in separate folders)` を表示する。ROCm が古い場合は `the ROCm in <prefix> is <major>.<minor>; Strata needs 7.0 or newer: using AMD's wheels in .venv instead`、development files 不足なら `the ROCm in <prefix> has no HIP development files (...)` で始まる warning を表示する (`terminal/setup.py:5563-5573`)。warning / `say` は標準出力に出る (`terminal/setup.py:997-999,1044-1046`)。
 
-`docs/AMD_HIP.md` はシステム ROCm 7 を `/opt/rocm` または `$ROCM_PATH` から使い、条件が合わない場合は TheRock wheel を `.venv` に導入すると説明しています。コードではシステム ROCm の判定に `hipcc`、hipBLAS、開発ファイル、および取得可能な場合のバージョン確認も行います。ドキュメントの概要と整合しています。
+対応 wheel がない architecture や複数 family のカードで system ROCm が必要なのに使えない場合、`fail()` がエラーと hint を出して exit code 1 で setup を終了する (`terminal/setup.py:5574-5582`; `fail()` 実装 `1049-1056`)。選択した system root で engine / image build が失敗する場合の表示は各 build 経路による。GPU picture reader の build 例外は `the GPU picture reader did not compile (<error>): pictures are read on the CPU` と警告され、CPU reader に戻る (`terminal/setup.py:5776-5780`)。
+
+benchmark の version file が読めた場合、結果の `software.runtime` に ROCm version が含まれる。見つからない場合に `ROCM_PATH` 固有の警告はなく、他 runtime もなければ `/software/runtime` の missing reason が記録される (`terminal/strata_cli/bench_facts.py:419-422,478-490`)。この変数に結び付く Strata の測定値は記載されていない。
+
+資料との照合では、`docs/AMD_HIP.md:104-112` が system ROCm 7 と `/opt/rocm` / `ROCM_PATH`、hipcc・hipBLAS・development files、および利用できない場合の TheRock wheels を説明しており、`rocm_root()` の条件と整合する。同資料の概要には親 directory や `PATH` 上の `hipcc` を再探索する詳細はない。`docs/DETAILS.md` には `ROCM_PATH` の記述は見つからなかった。
 
 ## 根拠
 
-- `setup.py:3480`: システム ROCm の最低バージョンを `(7, 0)` と定義。
-- `setup.py:4482-4497`: ROCm バージョンと開発ファイルの判定。
-- `setup.py:4500-4520`: `ROCM_PATH` の読み取り、`/opt/rocm` の既定値、採用条件、fallback と警告。
-- `setup.py:4522-4553`: TheRock wheel の選択・導入、および wheel SDK root の取得。
-- `setup.py:4619-4637`: HIP engine ビルドで root を選び、ビルド環境を設定して CMake に渡す。
-- `setup.py:4690-4710`: GPU HIP 画像 reader の環境復元とビルド。
-- `setup.py:4842-4847`: HIP 画像生成器ビルドで root を選び、環境を設定。
-- `docs/AMD_HIP.md:98-109`: セットアップ時のシステム ROCm / TheRock wheel の説明。
+- `terminal/setup.py:5494-5509,5512-5519,5522-5578` — system ROCm 候補・版・development file の判定。
+- `terminal/setup.py:5656-5701,5750-5780,5900-5940,9606-9629` — engine、image reader、image generator の適用経路と build 引き渡し。
+- `engine/src/inkling2/hip/CMakeLists.txt:10-18,43-63,99-109` — Inkling HIP CMake の環境値の使い分け。
+- `terminal/strata_cli/bench_facts.py:288-304,371-422,478-490`; `terminal/strata_cli/bench_standard.py:881-885` — benchmark report の ROCm version 探索と反映。
+- `terminal/tools/image/gate/build_sd.py:72-85`; `tools/hy4/build_hy4_hip_linux.sh:1-38` — 専用 HIP build tool の既定値と引き渡し。

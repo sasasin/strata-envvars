@@ -1,6 +1,6 @@
 # `strata drafting fetch --mode`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,47 +12,47 @@
 
 ## 役割
 
-モデルにどの drafting 方式を適用するかを fetch コマンドの「必要なら取得する」判定へ渡します。このオプション単独で取得対象を選択したり、実行後のモデル設定を変更したりはしません。通常の無条件 fetch では値は取得処理に影響しません。
+fetch がどの drafting の選択を前提に「DFlash2 drafter が必要か」を判定するかを指定します。`--if-needed` と併用すると、その選択で DFlash2 を使い、かつ drafter が未配置の場合だけ取得します。`--mode` 単独では取得を抑止しません。
 
 ## 使い方
 
 ```sh
-strata drafting fetch --config ./run-config.json --mode dflash2 --if-needed
+strata drafting fetch --config ./run.json --mode dflash2 --if-needed
 ```
-
-`--config` を省略してこの判定をモデル構成へ結び付けない場合は、必要に応じて `--family` と `--data-dir` も指定します。`--mode` の値を選ぶ判定を確認するだけなら、対応する `strata drafting plan` を使います。
 
 ## 値と既定値
 
-- `--mode` は `drafting.MODES` を choices として parser に登録しており、現行値は `auto`、`mtp`、`dflash2`、`off` です。値の省略は許されます。既定値として parser が埋める値はなく、`--config` の `drafting` 値があればそれを使い、なければ `auto` 相当で判定します。
-- choices 以外の値は `argparse` が拒否し、usage と invalid choice のエラーを出します。複数回指定時の扱いは argparse の通常の単一値引数です（後の値が有効値なら最後の値が残ります）。
-- `--mode` と `--config` の両方がある場合、明示した `--mode` が config の `drafting` より優先します。config の読み込みに失敗した場合は空の設定として処理されます。
+- parser は `drafting.MODES` を選択肢として指定しており、受理値は `auto`、`mtp`、`dflash2`、`off` です。値を省略した場合、`--config` があればその JSON の `drafting` 値を使い、なければ `normalize(None)` により `auto` になります。
+- 存在しない値は argparse の choices 検査で拒否されます。別名はありません。
+- `--mode` が明示されると、config の `drafting` 値より優先されます。
 
 ## 実行時の動作
 
-`--mode`（または config の `drafting`）は `_inputs()` から `drafting.needs_pack()` に渡され、pack が未配置かつ選んだ方式が DFlash2 を必要とするかを判定します。この判定が `--if-needed` の分岐条件です。`--if-needed` があり `needed` が偽ならネットワーク取得を行わず、「Nothing to download.」または JSON の `skipped: true` を返して終了コード 0 になります。
+`--mode` は config から得た model・backend・hardware 情報とともに drafting の選択判定へ渡されます。`auto` はモデル、engine/backend、GPU arch・VRAM などに応じて MTP または DFlash2 を選び、`mtp` と `off` はそれぞれその選択、`dflash2` は DFlash2 を要求します。要求先が未対応の条件や pack 未配置時の代替可否も含め、`needed` は選択が DFlash2 で pack が未配置の場合に真になります。
 
-現 revision では `ENGINE_SERVES_DFLASH2` が `False` です。そのため `needs_pack()` は `dflash2` や `auto` を含め、すべての mode で偽となり、`--if-needed` を指定した fetch は常にスキップします。一方、`--if-needed` を付けない fetch はこの判定を使って取得可否を決めず、`drafting_fetch.ensure()` を実行します。したがって `--mode` は無条件 fetch の取得量・保存先・pack 内容を変えません。
+ただし fetch の通常動作は `needed` を条件にせず `drafting_fetch.ensure_for(...)` を呼びます。したがって `--mode off` や `--mode mtp` を指定しても、`--if-needed` を付けなければ DFlash2 drafter の取得処理を実行します。`--if-needed` があり `needed` が偽なら取得を省略し、「Nothing to download.」または JSON の `skipped: true` を返します。
 
-この fetch コマンドは config を読んで判定に使いますが、config を書き換えません。実際にサーバー起動へ適用される drafting 設定は別の経路です。
+config の `mtp: false` と `--mode auto` の組み合わせは `off` として扱われます。さらに `auto` / `mtp` は、`--no-split` がなく split engine がこの config の起動を引き受けると判定された場合、split 用 MTP を選ぶよう `mtp` に切り替わります。この調整後の mode が `needed` 判定に使われます。
 
 ## 適用条件と副作用
 
-`--if-needed` による判定は mode に加え、GPU arch から分類した card class、モデル名または family、data dir と pack の有無も参照します。DFlash2 がサポートする family は `qwen` と `gyro`、または run config の適合するモデル名です。現在は engine の serving 条件が無効化されているため、この判定では実際の取得には至りません。
-
-無条件 fetch は `--mode` と独立に、pack が既にあればそのファイルを保持します。なければ pinned な配布元からファイルを取得・検証し、エンジン用 pack を生成して保存します。これはネットワーク通信とデータディレクトリへの書き込みを伴います。
+- `--config` を指定すると、config から data directory（`--data-dir` があればそちらが優先）、model/backend、drafting 設定を読みます。config がない場合の model/family 指定と、Strata が検出する hardware 情報も判定に影響します。
+- `--mode` は選択・必要性の判定値であり、`--if-needed` なしの取得実行を止めるスイッチではありません。ネットワーク取得を望まない状況では実行しないでください。
+- 実際に取得されると、データディレクトリ配下に drafter 用ファイルを取得・pack し、検証済みの出力を配置します。詳細な配置先や取得内容は `drafting_fetch.ensure_for` / `ensure` の処理に依存します。
 
 ## 出力とエラー
 
-このオプション自身に固有の出力はありません。無効値は parser 段階で拒否されます。`--if-needed` で不要と判定された場合は成功扱いでスキップします。無条件 fetch の取得・pack で `DraftingError` または `AcquisitionRefused` が発生すると、人間向け出力は stderr に `strata: ...` を出し、JSON 系出力では `ok: false` と `drafting_failed` を返し、終了コード 5 になります。
+- fetch が成功すると、人向け出力は ready になったパスを表示し、`--output json` / `jsonl` では結果イベントを出します。進捗は `jsonl` の場合 progress event になります。
+- `--if-needed` で不要と判定された場合は成功扱いで skip します。
+- 取得・検証等で `DraftingError` または取得拒否が起きると、human 出力は stderr に `strata:` エラーを表示して終了値 5、機械向け出力は `ok: false` の error JSON を返します。`--throttle` による未取得 `None` は黙って skip する別経路です。
 
 ## 根拠
 
-- `strata_cli/drafting_cmd.py:17-29` — `plan` と `fetch` の parser。両方で同じ `--mode` choices を使い、fetch 固有の `--if-needed` を追加。
-- `strata_cli/drafting_cmd.py:40-54` — config 読み込み、明示 `--mode` の優先、未指定時の config 値および data dir 解決。
-- `strata_cli/drafting_cmd.py:57-99` — mode を含む入力の組み立て、`needs_pack` 判定、`--if-needed` のスキップ、無条件 `ensure()`、出力と終了コード。
-- `strata_control/drafting.py:23-25,136-138` — 有効 mode と正規化時の既定値 `auto`。
-- `strata_control/drafting.py:141-146,162-183` — DFlash2 serving 条件、方式決定および必要 pack 判定。
-- `strata_control/drafting_fetch.py:54-102` — pack の再利用、ネットワーク取得、検証、pack 作成、元データ削除。
-- `strata_control/acquisition.py:32-44,70-84` — 取得拒否時の例外と終了コード。
-- 索引: [`strata drafting fetch`](../../../README.md) の `--mode` 項目。
+- parser、選択肢、config/default の説明: `terminal/strata_cli/drafting_cmd.py:19-38`。
+- config と `--mode` の優先順位、`mtp: false` および split 判定による mode 調整、hardware 等の入力: `terminal/strata_cli/drafting_cmd.py:101-136`。
+- 値の正規化と選択肢一覧: `terminal/strata_control/drafting.py:37-39`, `terminal/strata_control/drafting.py:882-885`。
+- mode ごとの選択効果と hardware/model 条件: `terminal/strata_control/drafting.py:1527-1545`。
+- 未配置判定: `terminal/strata_control/drafting.py:1611-1622`。
+- `--if-needed` の skip と通常 fetch の呼び分け、出力・失敗コード: `terminal/strata_cli/drafting_cmd.py:243-301`。
+- fetch による ensure 呼び出しと tuned drafter / stock drafter の fallback: `terminal/strata_control/drafting_fetch.py:349-373`。
+- ダウンロード・pack の実処理: `terminal/strata_control/drafting_fetch.py:376-430`。

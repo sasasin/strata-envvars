@@ -1,59 +1,45 @@
 # `STRATA_PIPED_DECODE_MIN_MS`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。調査対象は Strata 所有ソース。外部ライブラリや GPU driver の内部動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-layer split 上で pipelined slot groups が稼働しているとき、分割した prompt read の合間に slot groups が decode する時間の下限（ミリ秒）を指定します。read piece の処理時間に `STRATA_BATCH_DECODE_SHARE` を掛けた decode budget がこの値より小さいとき、下限まで延ばします。read は piece ごとに pipeline を drain してから decode を進め、次の piece に移ります。
+`--batch-groups` で GPU stage 間に pipelined slot groups を作り、さらに `STRATA_PIPED_READ_PIECE` で prompt read を複数 piece に分けたとき、piece 間に slot groups を decode させる時間の下限（ミリ秒）を指定する。通常の decode 予算 `STRATA_BATCH_DECODE_SHARE × piece の所要時間` が短い場合にも、この下限まで decode を続ける。生成 token や slot の選択規則を直接変更する値ではなく、prompt read と decode の時間配分を変える。読み取りと適用は `engine/src/program/generate.cpp` の request prompt-read 処理にある。
 
 ## 値と判定
 
-環境変数は `std::atof()` で変換し、`std::max(0.0, 値)` で負数を 0 にします。値はミリ秒の `double` です。
+`std::getenv` の結果を `std::atof` で変換し、`std::max(0.0, 値)` を適用する。未設定は `0`。設定済みの空文字、数値に変換できない文字列、負数も変換後または clamp 後に `0` になる。`atof` のため文字列全体の妥当性検査はせず、数値部分の後ろに文字があっても数値部分を採用する（例: `50ms` は `50`、`0anything` と `no` は `0`）。先頭の空白は数値変換で読み飛ばされる。正数はそのままミリ秒として使われる（`1` は 1 ms）。`NaN` はこの `std::max(0.0, ...)` で `0` になり、`inf` は正の無限大として扱われるため、batch decode が続く間は予算時間だけで decode loop を終えない値になる。大文字小文字を区別する比較や整数丸めは行わない。
 
-| 値 | `pr_floor` |
-|---|---:|
-| 未設定 | `0.0` |
-| 空文字、数値に変換できない文字列 | `0.0`（`atof` の変換結果） |
-| 数値文字列 | 変換された値。ただし負数は `0.0` |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---:|---|---|
+| `generate.cpp` の piped prompt-read 経路 | `0 ms` | `1` → `1 ms`, `50`, `50.5`, `50ms` → `50`, `.5` → `0.5 ms`, `inf` → 無限大 | 空文字、`true`, `false`, `no`, `0`, `0anything`, `-1`, `NaN` → `0 ms` |
 
-`atof` は文字列全体の厳密な検証をしません。先頭の空白を許し、数値として読める先頭部分を変換します。したがって `12.5ms` は `12.5` として扱われ、`-3` は clamp により `0` になります。コードに上限 clamp はありません。
-
-この値は関数内の `static const double` に保存され、該当コードを最初に実行したときに一度読み取られます。その後プロセス内で環境を書き換えても再評価されません。根拠: `src/program/generate.cpp:13126-13134`。
+値の読み取りは関数内 `static const` 初期化で一度だけ行われ、最初にその宣言へ到達した時点の値がプロセス内で cache される。以後の環境変更は反映されない。`STRATA_PIPED_DECODE_MAX_MS` は share 由来の予算に上限を付けるが、通常の piece 間予算ではこの下限を最後に適用するため、min が max より大きければ min が max を超える（`generate.cpp:21288-21295`, `batch_read.hpp:72-75`）。
 
 ## 有効になる条件
 
-この値が decode budget に使われるのは、次の条件を満たす場合です。
-
-- `piped` が真であること。実装では `--batch` が正、`--batch-groups` が 1 より大きく、layer split による stage 数が 1 より大きい条件です（`src/program/generate.cpp:11092-11095`）。
-- `STRATA_PIPED_READ_PIECE` が正であること。未設定時は 0 なので、piecewise read は opt-in されません。`pr_on` は `piped && pr_piece > 0` で決まります（`src/program/generate.cpp:13117-13135`）。
-- Decode budget を実際に走らせる箇所では batch slot が稼働していること。slot が止まっていれば、piece のログだけを出して次へ進み、この下限による decode は行いません（`src/program/generate.cpp:13211-13226`）。
-
-したがって、この変数だけでは piecewise read や slot decode を有効にしません。`STRATA_PIPED_READ_PIECE` が未設定・0以下、pipelined groups が使われない、または slot が稼働していない場合は値を読んでも実際の budget に影響しません。
+- `--batch` が正数で、`--batch-groups` の解決結果が 1 より大きく、layer split の stage が存在して piped 経路 (`piped`) が成立すること（`generate.cpp:17529-17533`）。
+- Prompt-read piece 化も有効であること。これは `STRATA_PIPED_READ_PIECE` が正数 (`pr_piece > 0`) の場合だけで、未設定や 0 以下では piece 全体を一度に読むため、この変数は piece 間 decode 予算に使われない（`generate.cpp:21284-21300`, `21342-21345`）。
+- piece の後に batch decode が継続中である場合に限り、計算した予算時間まで `pump(true)` を繰り返す。`batch_on()` がすでに false なら、下限が正でも追加 decode 時間は保証されない（`generate.cpp:21303-21320`, `21373-21387`）。
+- CLI 引数や別設定による値の上書きはない。`STRATA_BATCH_DECODE_SHARE` が share 由来の時間を、`STRATA_PIPED_DECODE_MAX_MS` がその時間の上限を決める。通常の piece 間では min が最後に適用される。連続する prompt read の先行 decode でも同じ budget helper を使うが、プロセス内で前回の piece 実績がない場合の初回 lead-in は別式で決まる（次節）。
 
 ## 実行時の詳細
 
-通常の piece 間 decode budget は、`piped_decode_budget_ms()` が次の順で計算します。
+piece 後に slot が動作中なら、Strata は `piped_decode_budget_ms(piece_ms, decode_share, pr_cap, pr_floor)` を呼ぶ。計算は `max(0, share) × max(0, piece_ms)` を基礎に、正の max があれば cap し、その後 `max(0, floor)` を適用する。したがってこの環境変数は負の share や小さい share で生じる短い予算を引き上げる。算出予算を使って `pump(true)` を少なくとも一度実行し、batch decode が続き、経過時間が予算未満の間は繰り返した後、pipeline を drain してから次の prompt piece に進む（`batch_read.hpp:69-75`, `generate.cpp:21302-21320`, `21379-21387`）。
 
-1. `max(0, STRATA_BATCH_DECODE_SHARE) × max(0, piece の処理時間 ms)` を求める。
-2. `STRATA_PIPED_DECODE_MAX_MS` が正なら、その値で上限をかける。
-3. 最後に `max(計算値, STRATA_PIPED_DECODE_MIN_MS)` を取る。
+連続 prompt read の lead-in では、過去の piece 実績があれば同じ helper で予算を出す。過去実績がない場合は、`STRATA_PIPED_DECODE_MAX_MS` が正ならその値を使い、そうでなければ `max(pr_floor, 200 ms)` を使う。この初回 lead-in 式では max が正の場合に min floor を再適用しない（`generate.cpp:21322-21340`）。Read piece を有効にした prompt が終わると、その終了時刻を次回 lead-in 判定用に保存する（`generate.cpp:21406-21407`）。
 
-このため floor は cap の後に適用され、floor が cap より大きい設定では最終 budget は cap を超えて floor になります。`STRATA_PIPED_DECODE_MAX_MS` が未設定・0以下なら上限はありません。計算は `include/strata/program/batch_read.hpp:69-75` にあります。
+値は子プロセスへ転送されず、このコード内で読み取られて使われる。対象コードにこの変数固有の警告や parse error はない。pipeline decode / drain に失敗すると `a pipelined batch window failed` をエラーにし、server 経路で stderr に `strata serve: a pipelined batch window failed`、stdout に `ERR a pipelined batch window failed` を出して失敗終了する（`generate.cpp:21307-21315`, `21593-21604`）。
 
-budget を受け取る処理は少なくとも一回 pipeline を pump し、slot batch が稼働中かつ経過時間が budget 未満の間 pump を続け、最後に in-flight group を drain します。従って指定値は時間判定の下限であり、実時間を厳密にその値へ一致させる指定ではありません（`src/program/generate.cpp:13140-13159`）。
+## ログと測定値
 
-piecewise read の直後に別の read が続く場合にも lead-in decode budget を使います。前の read の piece 時間が記録されていれば同じ share/cap/floor 計算を行います。まだ前の piece がない場合は、cap が正なら cap、そうでなければ `max(floor, 200.0)` ms を lead-in budget にします（`src/program/generate.cpp:13160-13175`）。この分岐では cap が正のとき floor と cap の大小を比較しません。
-
-実行中は piece ごとに `strata batch: piped read ... then the slots decoded ...` の stderr ログが出ます。slot が稼働していない場合は decode 部分のない piece ログです。floor 値そのものを表示する専用ログは確認できません（`src/program/generate.cpp:13211-13225`）。
-
-## 文書との照合
-
-`docs/BATCHING.md:287-310` は、pipelined groups による opt-in の prompt read について、piece 間 decode 時間を share 値から計算し、`STRATA_PIPED_DECODE_MAX_MS` と `STRATA_PIPED_DECODE_MIN_MS` で上下させると説明しています。計算関数の実装と一致します。
+下限値そのものを表示するログはない。piece 間に slot decode が行われた場合は stderr に `strata batch: piped read N tokens in X ms (to Q of T), then the slots decoded R rows in Y ms` が出る。slot decode が動作していない場合は decode 部分を省いた `strata batch: piped read N tokens in X ms (to Q of T)` が出る（`generate.cpp:21373-21387`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:11092-11100` — pipelined groups の成立条件。
-- `src/program/generate.cpp:13117-13159` — read piece 設定、cap/floor の読み取り、適用条件、decode budget 実行。
-- `src/program/generate.cpp:13160-13175,13211-13225` — 連続 read の lead-in budget と piece ごとの処理・ログ。
-- `include/strata/program/batch_read.hpp:69-75` — share、cap、floor の計算順。
-- `docs/BATCHING.md:287-310` — 設計説明との照合。
+- `engine/src/program/generate.cpp:17529-17533` — piped 経路の成立条件。
+- `engine/src/program/generate.cpp:21279-21300` — 環境変数の static 読み取り、piece 有効条件。
+- `engine/include/strata/program/batch_read.hpp:69-75` — decode budget の計算式。
+- `engine/src/program/generate.cpp:21302-21340` — decode pump / drain と連続 read の lead-in。
+- `engine/src/program/generate.cpp:21373-21387` — piece 間の適用とログ。
+- `engine/src/program/generate.cpp:21406-21407`, `21593-21604` — lead-in 用状態と失敗時の観測結果。

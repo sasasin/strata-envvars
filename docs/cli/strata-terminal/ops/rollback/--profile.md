@@ -1,6 +1,6 @@
-# `--profile`
+# `strata ops rollback --profile`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,55 +8,50 @@
 | コマンド | `strata ops rollback` |
 | オプション | `--profile` |
 | 別名 | なし |
-| 値 | 保存済み profile の名前。必須。 |
+| 値 | 保存済み serving profile の名前。引数なしでは実行できない |
 
 ## 役割
 
-ロールバックする operation recipe の保存先となる Strata の serving profile を名前で指定します。このコマンドで `--profile` に JSON ファイルのパスを渡す形式ではありません。profile 名と recipe 名は別の引数です。
+`--profile` は、指定した操作レシピ `NAME` をどの serving profile のローカル保存領域から読み、どの領域の履歴へ戻すかを選びます。プロフィールの設定自体を巻き戻す指定ではありません。ロールバック先は別の必須引数 `--to REVISION` で選びます（`terminal/strata_cli/cli.py:283-305`、`terminal/strata_cli/cli.py:1506-1509`）。
 
 ## 使い方
 
 ```sh
+# profile `local` にある `restart` レシピを指定 revision へ戻す
 strata ops rollback restart --profile local --to 0123456789abcdef
 ```
 
-`restart` は recipe 名、`local` は保存済み profile 名、`--to` の値は戻す recipe revision です。例の revision は書式を示す値であり、実際には `strata ops history restart --profile local` などで確認できる保存済み revision を指定します。
+`REVISION` は事前に `strata ops history restart --profile local` で確認できる履歴 revision を指定します。コマンド名・レシピ名・`--profile`・`--to` はそれぞれ別の値です（`terminal/strata_cli/cli.py:292-305`、`terminal/strata_cli/cli.py:1501-1509`）。
 
 ## 値と既定値
 
-- `--profile` は値を1つ取り、必須です。既定値はありません。`ops` の全 action parser が同じ `required=True` の定義を共有します。
-- 値は `[a-z][a-z0-9_-]{0,63}` に一致する profile 名で、先頭は小文字英字、以降は小文字英字・数字・`_`・`-`、長さは1〜64文字です。パスや大文字を含む値は profile 名として受理されません。
-- 指定した profile が未保存の場合はエラーになります。
+- 値を取る文字列オプションで、`ops` 配下の各操作 parser に共通して登録され、必須です。既定値、短縮別名、parser 上の選択肢はありません（`terminal/strata_cli/cli.py:283-295`）。
+- 実処理では profile ID とレシピ名の両方が `^[a-z][a-z0-9_-]{0,63}$` に合う必要があります。さらに、その名前の保存済みプロフィールが読み込めなければ処理できません（`terminal/strata_control/profiles.py:25,48-55,153-173`、`terminal/strata_control/recipes.py:32-40`）。
+- `ops rollback` ではレシピ名も位置引数で必須、`--to` も必須です。`--to` は16桁の小文字16進 revision でなければなりません（`terminal/strata_cli/cli.py:292-305`、`terminal/strata_control/recipes.py:253-256`）。
 
 ## 実行時の動作
 
-parser は `--profile` を `a.profile` に格納します。rollback 分岐はこの値と位置引数の recipe 名、および必須の `--to REVISION` を `recipes.rollback()` に渡します。profile 名は `strata_control.profiles.profile_dir()` 配下の保存済み profile と `.ops/<profile>/<recipe>.json` の recipe 保存領域を選びます。保存領域は `STRATA_PROFILE_DIR`、Windows では `APPDATA`、それ以外では `XDG_CONFIG_HOME`（未設定時はホーム配下の `.config`）に基づきます。
+CLI は `--profile` を `recipes.rollback(a.profile, a.name, a.to)` に渡します。レシピの保存先は、プロフィール設定ディレクトリの `.ops/<profile>/` です。設定ディレクトリは `STRATA_PROFILE_DIR` があればそれを使い、なければ Windows では `%APPDATA%/Strata/profiles`（`APPDATA` がなければユーザープロファイル下）、その他の OS では `$XDG_CONFIG_HOME/strata/profiles`（未設定時は `~/.config/strata/profiles`）です（`terminal/strata_cli/cli.py:1506-1509`、`terminal/strata_control/recipes.py:38-59`、`terminal/strata_control/profiles.py:38-45`）。
 
-この option 自体は serving profile の内容を書き換えず、rollback 対象を profile ごとに特定します。ただし recipe 操作の前提として保存済み profile を読み込みます。profile 読み込みは、管理者実行などでロックされた profile ファイルのアクセス権を必要に応じて修復する処理を含みます。実際の recipe の復元では、指定 revision の履歴 JSON を検証して現在の recipe と入れ替え、現在版を履歴に保全します。値は `--to` が指定する履歴内容の適用先を決めるため、異なる profile を指定すれば別の recipe store が対象になります。
-
-成功時は既定の human 出力で復元前後の revision を表示します。`--output json` またはその alias の `--json` を併用すると、recipe と `previous_revision` / `revision` を含む JSON を出力します。`--quiet` も parser では受理されますが、この rollback 成功分岐はその値を参照せず、human 出力を抑止しません。
+指定 revision の履歴ファイルを読み、revision の一致、ファイル形式・サイズ、保存内容と profile / recipe ID の整合を確認してから現行レシピへ保存します。保存時はロック下で現在 revision が変わっていないことを再確認し、現在版を履歴に保全して、復元内容を現行レシピファイルへ原子的に書き込みます。したがってこの操作は `--profile` が指す配下のレシピファイルを変更します。プロフィール本体や他 profile のレシピはこの処理の対象ではありません（`terminal/strata_control/recipes.py:253-275,214-237`）。
 
 ## 適用条件と副作用
 
-- 保存済み profile、および指定 recipe とその履歴が読み取り可能である必要があります。recipe データは通常 `profiles` 設定領域の `.ops/<profile>/` 以下から読み取られます。
-- recipe の `--to` は16桁の小文字16進 revision でなければなりません。該当履歴が存在し、その内容の SHA-256 先頭16桁がファイル名と一致し、現在の profile と recipe ID に対して有効な schema である必要があります。
-- rollback は現在 revision を比較してロック下で更新します。更新時は現在版を `.history/<recipe>/<current-revision>.json` に保管し、指定履歴の内容で recipe JSON を原子的に置き換えます。指定 revision と現行内容が既に同一なら `save()` はファイルを更新しません。
-- recipe と履歴は通常最大64 KiBの通常ファイルであることが確認され、POSIX では owner-only 権限が要求されます。profile / recipe 名の不正、ファイル種別・サイズ・権限の問題、履歴の欠落・不整合は失敗要因になります。
+プロフィールが保存されていない場合は失敗します。launch preset 名を直接指定してもこのコマンドの profile 引数としては別名解決されず、保存済み profile として読み込める必要があります（`terminal/strata_control/recipes.py:38-40`、`terminal/strata_control/profiles.py:153-173,176-184`）。
+
+レシピと履歴は通常のファイルとして読み込まれ、POSIX ではレシピ・履歴ファイルに owner-only の権限が要求されます。recipe/history ディレクトリの symlink や不正な権限・形式、履歴内容と revision の不一致も拒否されます（`terminal/strata_control/recipes.py:38-59,72-86,180-196,253-273`）。
 
 ## 出力とエラー
 
-- `--profile` がない、または値を伴わない場合、`argparse` が usage/error を表示して終了コード2で拒否します。
-- profile 名が不正、保存 profile が存在しない、recipe や revision が見つからない、履歴が壊れている場合、CLI は通常 stderr に `strata: <理由>` を出し、`ProfileError` の終了コードを返します。エラーに `--json` / `--output json` を指定すると JSON error object を出力します。一般の入力エラーはコード2、保存データやファイルの問題はコード5、編集中に内容が変わった場合はコード6です。
-- 成功時は終了コード0です。人間向け出力は `Restored recipe <name>: <old> -> <new>`、JSON 出力には recipe と復元前後 revision が含まれます。
+成功時は既定の human 出力で `Restored recipe NAME: OLD_REVISION -> NEW_REVISION` を表示し、終了コード `0` です。`--output json` を指定すると、復元した recipe と変更前後の revision を含む JSON を出力します（`terminal/strata_cli/cli.py:1461-1464,1506-1509,566-573`）。
+
+引数不足・形式不正は argparse のエラー（通常終了コード `2`）になります。profile / recipe / history が見つからない場合や保存内容が不正な場合はエラーとなり、通常の不正・未検出は `ProfileError` の既定コード `2`、保存ファイルや履歴の問題はコード `5`、編集中に recipe が変わった場合はコード `6` です。エラーは human 出力では stderr、JSON 出力時はエラー JSON になります（`terminal/strata_cli/cli.py:558-563,2248-2255`、`terminal/strata_control/profiles.py:30-35`、`terminal/strata_control/recipes.py:190-195,214-236,253-275`）。
 
 ## 根拠
 
-- parser の `ops` action、共通 `--profile`、rollback 専用 `--to`、および `--json` / `--quiet`: `strata_cli/cli.py:255-277`, `strata_cli/cli.py:508-516`
-- rollback の dispatch と成功出力: `strata_cli/cli.py:1391-1394`, `strata_cli/cli.py:1436-1439`
-- profile 名の形式と保存先: `strata_control/profiles.py:25`, `strata_control/profiles.py:38-55`
-- 保存 profile の読み込みと権限修復: `strata_control/profiles.py:150-166`
-- recipe 領域の profile 検証、パス構成、POSIX 権限条件: `strata_control/recipes.py:32-64`
-- recipe 読み込み時の通常ファイル・サイズ検証と欠落時のエラー: `strata_control/recipes.py:180-196`
-- 履歴の保存、atomic 更新、rollback revision 検証と復元処理: `strata_control/recipes.py:214-237`, `strata_control/recipes.py:253-275`
-- JSON / human 成功出力とエラー出力: `strata_cli/cli.py:527-542`
-- 指定 revision と調査日の確認: 対象リポジトリ `git rev-parse HEAD` / `git status --short --branch`（commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`、`main...origin/main`、変更表示なし）。
+- `terminal/strata_cli/cli.py:283-305` — `ops` サブコマンド群への `--profile` 登録、必須指定、および rollback の `NAME` / `--to`。
+- `terminal/strata_cli/cli.py:1461-1464,1506-1509` — `--profile` を rollback helper へ渡し、成功結果を出力する処理。
+- `terminal/strata_control/recipes.py:32-59,180-196` — profile と recipe の識別・保存場所・読み込み検証。
+- `terminal/strata_control/recipes.py:214-237,253-275` — 履歴 revision の検証、現行版の保全、復元値の保存と失敗経路。
+- `terminal/strata_control/profiles.py:25,38-55,153-184` — profile 名の形式、設定ディレクトリ、保存済み profile 読み込み。
+- `terminal/strata_cli/cli.py:558-573,2248-2255` — 成功・失敗時の human / JSON 出力と終了コード処理。

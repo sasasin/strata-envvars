@@ -1,39 +1,43 @@
 # `STRATA_COMMIT_SYNC`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-単一 GPU の speculative verification で、採用 token の状態を確定する commit graph の非同期実行を抑止します。設定すると、commit の stream/queue 完了をその場で待つ同期経路になります。commit の内容や採用 token 数を変える環境変数ではありません。
-
-CUDA と SYCL の `Verifier::set_commit_async()` に同じ判定があります。通常の `generate` 経路は GPU 数から `set_commit_async(!multi_gpu)` を呼び、単一 GPU のときだけ非同期を候補にします（`src/program/generate.cpp:3345`, `sycl/src/program/generate.cpp:3197`）。
+CUDA/HIP と SYCL の `Verifier::commit` で、単一 GPU 用に有効化される非同期 commit を止め、commit graph の完了をその場で待たせる。環境変数の値は解釈されず、設定されているかどうかだけを使う。生成初期化で `set_commit_async(!multi_gpu)` が呼ばれ、`multi_gpu` は layer split があり、かつ同一 GPU の split でない場合に true になる（CUDA/HIP: `engine/src/program/generate.cpp:4856,6493`、SYCL: `engine/sycl/src/program/generate.cpp:2333,3586`）。
 
 ## 値と判定
 
-| 状態 | 判定 |
-|---|---|
-| unset | `on` が true のとき非同期を許可。通常の単一 GPU 経路では非同期 commit が有効 |
-| 空文字を含む任意の設定値 | 設定値の内容は parse せず、環境変数が存在するため非同期を無効化 |
-| 複数 GPU | `on` が false で渡されるため、変数が unset でも同期 |
+`Verifier::set_commit_async` は `on && std::getenv("STRATA_COMMIT_SYNC") == nullptr` をグローバル状態 `g_commit_async` に代入する。したがって値の内容は parse されず、空文字を含め、変数が存在すれば非同期 commit は無効になる（CUDA/HIP: `engine/src/core/verify.cpp:4524-4525`、SYCL: `engine/sycl/src/core/verify.cpp:3161-3162`）。
 
-したがって `STRATA_COMMIT_SYNC=0` も非同期を無効にします。`1` だけを有効・無効の値として比較したり、数値変換したりする処理はありません。判定式は `on && std::getenv("STRATA_COMMIT_SYNC") == nullptr` です。
+| 条件 | unset | 設定時に非同期になる値 | 設定時に非同期にならない値 |
+|---|---|---|---|
+| 生成初期化で `on=true`（`multi_gpu=false`） | 非同期を有効化 | なし | 空文字、`0`、`1`、`true`、その他すべての文字列 |
+| 生成初期化で `on=false`（`multi_gpu=true`） | 同期 | なし | 空文字、`0`、`1`、`true`、その他すべての文字列 |
 
-根拠: `src/core/verify.cpp:2494-2495`, `sycl/src/core/verify.cpp:2614-2615`。
+文字列比較、数値変換、大文字小文字、空白、境界値の検査はない。CLI 引数や他の環境変数による値の上書きは、この setter にはない。
 
 ## 有効になる条件
 
-環境変数 unset で非同期 commit が選ばれるのは、呼び出し元が `on=true` にした場合だけです。通常の `generate` ではこれは `!multi_gpu` に対応します。複数 GPU / layer split では `on=false` のため、変数の有無にかかわらず同期です。
-
-さらに verifier が `next_` verifier を持つ場合、非同期フラグが true でも各 commit は同期されます。commit graph の後続処理と stream/queue の所有関係を保つための条件です。環境変数はこの条件を上書きしません。
+- 通常の非同期化は `multi_gpu=false` のときに限り候補になる。コードでは `multi_gpu = !split_devs.empty() && !split_same` とし、`--split-skip-if-fits` が分割を取り消す経路もある（CUDA/HIP: `engine/src/program/generate.cpp:4856,6472-6493`、SYCL: `engine/sycl/src/program/generate.cpp:2333,3566-3586`）。
+- `STRATA_COMMIT_SYNC` が設定されていれば、この単一 GPU 用の非同期化を止める。未設定でも `next_ != nullptr` の verifier chain では `commit` が待つため、非同期にはならない（CUDA/HIP: `engine/src/core/verify.cpp:4568-4575`、SYCL: `engine/sycl/src/core/verify.cpp:3197-3243`）。
+- commit graph 自体を実行しない一 token の self-commit 経路では、この変数による待機の違いはない（CUDA/HIP: `engine/src/core/verify.cpp:4537-4540`、SYCL: `engine/sycl/src/core/verify.cpp:3171-3173`）。
+- Metal の `commit` は `STRATA_GPU_METAL` 分岐から `metal_engine::window_commit` に直接委譲され、`wait_commit` も成功を返すため、確認した `g_commit_async` の待機分岐は通らない（`engine/src/core/verify.cpp:4527-4530,4597-4601`）。
+- ソース上の読み取りは CUDA/HIP と SYCL の verifier にあり、OS、サーバーモード、モデル状態による追加の環境値判定はない。サーバーや通常生成での違いは、生成初期化時に決まる `multi_gpu` と verifier chain による。
 
 ## 実行時の詳細
 
-`set_commit_async()` が呼ばれた時点で環境変数の存在を調べ、結果をプロセス内の `g_commit_async` に保存します。候補一覧にある他の環境変数 helper のような `static` 初回読み取りではなく、この関数の呼び出しごとに評価します。ただし通常の generate ソースでの呼び出し箇所は上記の初期化箇所です。設定後にプロセス環境を書き換えても、既に設定された `g_commit_async` は変わりません（再度 `set_commit_async()` が呼ばれれば再評価されます）。
+環境値は各 backend の `set_commit_async` 呼び出し時に一度調べ、結果を `g_commit_async` に保存する。commit ごと・リクエストごとに `getenv` を再評価するコードはない。`generate` は `multi_gpu` を確定した後に setter を呼び、その後の verifier の commit がこの状態を参照する（CUDA/HIP: `engine/src/program/generate.cpp:6493`、SYCL: `engine/sycl/src/program/generate.cpp:3586`）。
 
-非同期経路では commit graph を CUDA stream / SYCL queue に投入し、完了 event/barrier を記録して `commit_pending_` を立てて戻ります。次の window は同じ stream/queue 上で続けられ、drafter は別 stream で処理できます。host や別 stream から状態を読む前には `wait_commit()` が pending commit の完了を待ちます。同期経路では commit graph の直後に stream/queue を待ちます。CUDA では commit の起動・待機エラーを `err` に設定して呼び出し元へ返します。SYCL では同様のエラー値を `err` に設定する経路に加え、捕捉された `sycl::exception` は stderr に出力してプロセスを終了する処理があります。
+同期経路では CUDA/HIP は `cudaGraphLaunch` 後に `cudaStreamSynchronize`、SYCL は graph enqueue 後に `cs_->wait()` を行う。非同期経路では commit 完了 event を記録して pending 状態にし、後続の `wait_commit` がその event を待つ。コードコメントは、同じ stream 上の次 window と独立した drafter が処理を進められる一方、別 stream や host から session を読む前には待つ設計を示す（CUDA/HIP: `engine/src/core/verify.cpp:4562-4575,4597-4608`、SYCL: `engine/sycl/src/core/verify.cpp:3174-3244,3259-3269`）。生成側も request 間や run 終了前の session 読み取りに `wait_commit` を呼ぶ（CUDA/HIP: `engine/src/program/generate.cpp:19150-19153,23346-23349,25250-25253`、SYCL: `engine/sycl/src/program/generate.cpp:10775-10780,12952-12955,14233-14237`）。
 
-根拠: CUDA `src/core/verify.cpp:2497-2520,2532-2539`; SYCL `sycl/src/core/verify.cpp:2617-2697,2713-2736`; 待機前に session を読む例 `src/program/generate.cpp:10207-10212`。
+## ログと測定値
 
-## 文書との照合・制限
+この変数の設定・未設定を知らせる専用ログは見つからない。CUDA/HIP の commit graph 起動失敗は `verify: commit launch: ...`、同期失敗は `verify: commit: ...`、非同期 event 記録失敗は `verify: commit event: ...` を `err` に設定して失敗を返す。SYCL も同じ prefix のエラーを返し、`wait_commit` 中の `sycl::exception` は `record_verify_sycl_exception("wait_commit", ...)` に渡す（CUDA/HIP: `engine/src/core/verify.cpp:4562-4573,4597-4608`、SYCL: `engine/src/core/verify.cpp:3189-3214,3223-3243,3259-3269`）。生成側の一部経路では失敗時に `ERR <err>` または `strata generate: <err>` を出して終了する（例: `engine/src/program/generate.cpp:23346-23350,25250-25254`）。この変数に関する条件付き測定値は確認できなかった。
 
-`docs/DETAILS.md` にはこの環境変数の説明や commit 非同期化の測定値は見当たりません。`docs/INTEL.md:556-557` は upstream の `set_commit_async` / `wait_commit` に対応する SYCL 移植上の deferred commit について述べていますが、`STRATA_COMMIT_SYNC` の値判定や性能は説明していません。したがって、この文書では性能向上を主張しません。
+## 根拠
+
+- 候補一覧: `docs/envvars/000_envvers.md:860`。
+- 環境値を読む全実装: `engine/src/core/verify.cpp:4525`、`engine/sycl/src/core/verify.cpp:3162`。他に同名があるのはコメント・宣言と `terminal/data/settings-register.json` の登録情報であり、環境値の読み取り箇所ではない。
+- setter の呼び出しと multi-GPU 判定: `engine/src/program/generate.cpp:4856,6493`、`engine/sycl/src/program/generate.cpp:2333,3586`。
+- commit の同期・非同期分岐と待機・失敗処理: `engine/src/core/verify.cpp:4527-4575,4597-4608`、`engine/sycl/src/core/verify.cpp:3164-3244,3259-3269`。

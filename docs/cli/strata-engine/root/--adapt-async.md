@@ -1,63 +1,58 @@
-# `--adapt-async`
+# `strata --adapt-async`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数 parser） |
+| コマンド | `strata`（エンジン引数。`--serve` 時に適用） |
 | オプション | `--adapt-async` |
 | 別名 | なし |
-| 値 | 整数として読み、0 は無効、0 以外は有効（内部値 1） |
+| 値 | 値を取る。`atoi` で整数変換し、0 は blocking、0 以外は asynchronous の要求として扱う |
 
 ## 役割
 
-`--serve` で動く適応型 expert tier の swap を、verify window 全体が終わるまで待つ方式から、window 間に段階的に進める非同期方式へ切り替えます。resident RAM mode では swap のコピーや RAM 移動をバックグラウンド job と CUDA stream に分け、expert arena mode では主に GPU への copy-in を進めます。既定値は `0` で、同期方式です（`src/program/generate.cpp:699-702`, `10463-10514`）。
+適応型 expert tier の交換を、decode/verify window が一巡するまで同期的に待つ代わりに、バックグラウンド job thread で進める指定です。明示 `1` は asynchronous tier を要求し、`0` は blocking tier を選びます。対象は `--serve` の resident RAM mode（`--resident-experts` など）または expert arena で、arena では交換 round は GPU への copy-in のみです。この機能は実行ごとに結果が bit-exact になるとは限りません（`engine/src/program/generate.cpp:1057-1062,1499-1504`）。
 
 ## 使い方
 
 ```sh
-strata --pack ./model --serve --resident-experts --adapt-async 1
+# 適応 tier を有効にして非同期交換を要求する（MODEL.gguf は実際のモデルパスに置き換える）
+strata --serve --model MODEL.gguf --resident-experts --adapt-every 100 --adapt-swaps 32 --adapt-async 1
+
+# 明示的に blocking tier を選ぶ
+strata --serve --model MODEL.gguf --resident-experts --adapt-every 100 --adapt-swaps 32 --adapt-async 0
 ```
 
-この例は `--serve` を有効にし、resident RAM mode を要求したうえで非同期 tier を opt-in します。実際に有効になる条件は「適用条件と副作用」を参照してください。エンジンの help も `--adapt-async 1` と `0` を説明しています（`src/program/generate.cpp:1072-1077`）。
+`--adapt-every` と `--adapt-swaps` が正であることが適応 tier の前提です。実際のモデル引数・serve 設定に合わせて指定してください。
 
 ## 値と既定値
 
-- 値は必須です。後続 argv を `std::atoi` で整数変換し、0 なら 0、0 以外なら 1 に正規化します。したがって負数も有効扱いになり、数値として読めない文字列は `atoi` の結果が 0 となって無効扱いです。parser にこの値固有の範囲検証はありません（`src/program/generate.cpp:2416-2421`, `2626-2630`）。
-- オプション省略時は `Options::adapt_async` の初期値 `0` です（`src/program/generate.cpp:699-702`）。同じオプションを複数回指定した場合、parser は各回の値を順に代入し、最後の値が残ります（`src/program/generate.cpp:2416-2421`, `2626-2630`）。
-- 値を省略すると `%s needs a value` を stderr に出し、終了コード `2` で終了します（`src/program/generate.cpp:2418-2420`）。
+- `--adapt-async` の parser は次の argv を `atoi` で読み、0 以外を `1`、0 を `0` にして保存します。したがって `1` / `0` のほか、`2` や `-1` も asynchronous 要求になります。数値として読めない文字列や空文字列は `atoi` の結果が 0 となり、blocking 指定として扱われます。値の範囲検証や専用エラーはありません（`engine/src/program/generate.cpp:3842-3847,4061`）。
+- 値が欠けると `--adapt-async needs a value` を stderr に出して終了コード 2 で終了します。オプションを複数回指定すると、引数走査中に同じフィールドへ順に代入されるため最後の指定が残ります（同: `3842-3847,4061`）。
+- オプション省略時の `adapt_async` 初期値は 0 ですが、未指定を示す別フィールドも保持されます。自動選択条件を満たす場合に限り、serve セッション中の計測で asynchronous tier を試します。`STRATA_ADAPT_ASYNC=0` はこの自動選択を止めます。明示 `--adapt-async 0` も自動選択を止めます（`engine/src/program/generate.cpp:1057-1062,11774-11795`; `engine/include/strata/core/adapt_async_default.hpp:35-60`）。
 
 ## 実行時の動作
 
-非同期方式が有効な場合、adaptive round の選択とコピーを一度に完了させず、window の間で段階的に進めます。resident RAM mode では退避 expert を交換 buffer に戻し、新 expert を RAM copy から GPU cache に入れ、RAM 上の配置を移し、最後に offset を反映します。window が読み取り中の slot や RAM 領域を上書きしないよう、段階ごとに CUDA event / stage の gap を使います。arena mode は arena 内の expert を保持したまま、退避・resident 状態の更新と copy-in を行います（`src/program/generate.cpp:10463-10514`）。
+明示 `1` または自動選択により tier が有効になった場合、適応交換用の job thread と cache home を準備し、expert の cache/RAM 間の交換や arena からの copy-in を decode window 間で進めます。resident RAM mode では交換 buffer を追加で確保し、page-lock できることを確認します。初期ログには asynchronous tier、round あたりの swap 上限、round の間隔が stderr に出ます（`engine/src/program/generate.cpp:12166-12180,15582-15616`; job thread: `engine/src/program/generate.cpp:2454-2476`）。
 
-通常の resident RAM mode では交換用 buffer を非同期コピー向けに追加確保し、page-lock を試みます。buffer を確保できない場合、または exchange buffer を page-lock できない場合は理由を stderr に出して `adapt_async` を 0 に戻し、同期 tier を使います（`src/program/generate.cpp:8250-8258`, `8073-8075`）。非同期 worker は routing usage があり、resident complement と十分な交換容量がある場合（または arena mode）に作られ、起動時に swap 上限と interval を stderr に表示します（`src/program/generate.cpp:10532-10551`）。
+オプションを省略した自動選択は、CUDA build、`--serve`、有効な適応 tier、expert arena、単一 GPU、pipeline windows なし、batch slots なし、peer/remote expert tier なし、`STRATA_ADAPT_OVERLAP` なし、`STRATA_ADAPT_FETCH` が無効、かつ `STRATA_ADAPT_ASYNC` が 0 でない、など全条件が成立する場合に限られます。HIP build では自動選択しません（`engine/src/program/generate.cpp:11777-11794`; `engine/include/strata/core/adapt_async_default.hpp:19-60`）。適用されると blocking tier で warm-up 64 windows、その後 64 windows を計測し、window の待ち時間が計測時間の 5% 以上なら asynchronous tier を試します。試行開始後4 windowsを除外して64 windowsを計測し、ms/token が blocking 計測より悪化しなければそのセッション中は維持し、悪化すれば blocking に戻ります（`engine/include/strata/core/adapt_async_default.hpp:63-106`; ログと切替: `engine/src/program/generate.cpp:23163-23183`）。
 
 ## 適用条件と副作用
 
-非同期 tier の初期 gate は次の条件を確認します。満たさない場合は `--adapt-async 1 is off (<理由>): the blocking adaptive tier` を stderr に出し、同期 tier に戻します（`src/program/generate.cpp:8066-8092`）。
-
-- `--serve` が必要です。
-- 適応 tier が有効である必要があり、`--adapt-every` と `--adapt-swaps` がともに正数である必要があります。
-- resident CPU expert mode または expert arena が必要です。arena を使う layer split、および arena と `--pipeline-windows 2` の組み合わせは無効です。
-- `--batch` 使用時の `--batch-groups` が 1 より大きい構成、`--peer-device`、`--remote-expert-opt` とは併用できません。
-- `--pipeline-windows 2` は `STRATA_PIPELINE_ADAPT_ASYNC=0` で無効化できます。この環境変数が 0 の場合、pipeline と非同期 tier の組み合わせを同期 tier に戻します。自動 pipeline の選択条件にも `!o.adapt_async` が含まれます（`src/program/generate.cpp:4253-4271`, `8077-8092`）。
-- layer split が 3 stage 以上の pipeline では `--adapt-async` と併用できません（`src/program/generate.cpp:4273-4288`）。
-
-help は resident RAM mode または arena、single GPU を opt-in の用途として説明しています（`src/program/generate.cpp:1074-1077`）。source では layer split 上の pipeline との互換処理も実装されているため、上記 gate と組み合わせて判断してください。
-
-arena mode では `STRATA_ADAPT_PICK_INLINE`（既定 1）、`STRATA_ADAPT_ASYNC_WAIT`（既定 1）、`STRATA_ADAPT_ASYNC_BATCH`（既定 0、0 は tick あたり全 copy）が選択動作を調整します。これらは arena 使用時だけ読み取られます（`src/program/generate.cpp:10535-10543`）。非同期 swap のタイミングによって、どの verify window が swap-in 済み expert を最初に使うかが変わり得るため、結果は bit-exact ではありません（`src/program/generate.cpp:10475-10480`; help の説明は `src/program/generate.cpp:1074-1077`）。
-
-## 出力とエラー
-
-適用条件を満たさない場合や、必要な exchange buffer の確保・page-lock に失敗した場合は stderr に理由を表示して同期 tier に戻します。これらの条件では、このオプション単独を理由に終了するのではなく fallback する実装です（`src/program/generate.cpp:8073-8092`, `8250-8258`）。非同期 worker が作成されると `strata serve: adaptive tier asynchronous (--adapt-async 1): ...` を stderr に出します（`src/program/generate.cpp:10544-10551`）。値不足は終了コード `2` です（`src/program/generate.cpp:2418-2420`）。
+- 明示 `1` は `--serve`、`--adapt-every > 0` と `--adapt-swaps > 0`、resident RAM mode・`--resident-experts`・expert arena のいずれかを必要とします。arena では layer split と `--pipeline-windows 2` は不可です。さらに `--batch` と `--batch-groups > 1` の組合せ、peer device、remote expert optimization は不可です。pipeline windows の resident mode は `STRATA_PIPELINE_ADAPT_ASYNC=0` でも無効になります（`engine/src/program/generate.cpp:11796-11811`）。条件を満たさない要求は stderr に `strata generate: --adapt-async 1 is off (<理由>): the blocking adaptive tier` を出し、blocking tier へ戻します。
+- `--adapt-async 1` は Windows HIP build で既定拒否されます。`STRATA_WIN_HIP_RISKY=1` による解除時は警告を出して後続条件へ進みます（`engine/src/program/generate.cpp:2259-2265,11761-11768`）。この環境変数の説明は [STRATA_WIN_HIP_RISKY](../../../envvars/STRATA_WIN_HIP_RISKY.md) を参照してください。
+- resident RAM mode で async 用の交換 buffer を確保できない場合、最大192 swap分を要求し、96より大きい要求で失敗した際は96で再試行します。再試行も失敗する、buffer を page-lock できない、または resident RAM mode が実際には稼働していない場合は理由付きで blocking に戻します（`engine/src/program/generate.cpp:12166-12180,12257-12258`）。
+- asynchronous tier は helper thread と GPU transfer を伴います。実行時に adaptive refill が失敗すると `ERR an adaptive refill failed` を出す経路があります（`engine/src/program/generate.cpp:22958-22960,23159-23161`）。GPU/backend ごとの実行成否や性能は、このソース調査では測定していません。
 
 ## 根拠
 
-- parser・値変換・既定値: `src/program/generate.cpp:699-702`, `2416-2421`, `2626-2630`
-- help 表示: `src/program/generate.cpp:1072-1077`
-- 条件判定・同期 fallback: `src/program/generate.cpp:8066-8092`, `8250-8258`, `8310`
-- 自動 pipeline / batch との関係: `src/program/generate.cpp:4253-4288`, `5280-5297`
-- worker の作成、環境変数、非同期 round の処理: `src/program/generate.cpp:10463-10551`
+- `engine/src/program/generate.cpp:1057-1062` — 既定値と「未指定」・自動選択状態を分ける option fields。
+- `engine/src/program/generate.cpp:3842-3847,4061` — 値の取得、欠値エラー、`atoi` による0/非0変換。
+- `engine/src/program/generate.cpp:1499-1504` — engine usage の値表記と説明。
+- `engine/src/program/generate.cpp:11761-11811` — Windows HIP guard、自動選択入力、明示要求の適用条件とblocking fallback。
+- `engine/include/strata/core/adapt_async_default.hpp:35-60,63-106` — 環境変数の読み取り、自動選択条件、計測・試行の閾値と継続判定。
+- `engine/src/program/generate.cpp:12166-12180,12257-12258,15582-15616,23163-23183` — buffer確保/fallback、job thread 起動、起動・計測・切替ログ。
+- `engine/src/program/generate.cpp:22958-22960,23159-23161` — adaptive refill 失敗時のエラー出力。
 
+調査範囲は上記 revision の Strata ソースに限ります。CLI help は実行せず、usage 文字列を parser と照合しました。

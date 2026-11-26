@@ -1,52 +1,47 @@
 # `STRATA_VERIFY_PROFILE_EVERY`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-SYCL verifier の GPU stage profile を、何 window 分ためて stderr に表示するかを指定します。対象は実験的な SYCL backend です。共有の `src/core/verify.cpp` にはこの名前の読み取りがなく、CUDA/HIP の同機能をこの変数が制御する根拠はありません。
+SYCL verifier の GPU stage profiling が有効なとき、集計した window 数が指定数に達した段階で stderr に集計行を出す間隔を指定する診断用変数。計測値や verifier の計算・出力 token は変えず、プロファイル集計の表示タイミングだけを制御する。読み取り箇所は `engine/sycl/src/core/verify.cpp` の `Verifier::collect_profile()` と `Verifier::run()` 内の2箇所で、CUDA/HIP 実装にはこの名前の読み取りがない（`engine/sycl/src/core/verify.cpp:2337-2346, 2919-2935`）。
 
-この変数だけではプロファイルを有効にしません。`STRATA_VERIFY_PROFILE` が設定され、プロファイル用 device memory の確保にも成功している必要があります。値は出力間隔にだけ作用し、検証計算や生成値の選択を変更する処理はありません。
+この機能が使われるには `STRATA_VERIFY_PROFILE` が設定されている必要がある。SYCL verifier 初期化時に `getenv(...) != nullptr` で有効化し、プロファイル用 GPU メモリの確保に失敗すると `prof_on_` を無効にする。したがって `STRATA_VERIFY_PROFILE` の空文字も設定済みとして扱われるが、この変数だけを設定してもプロファイルは始まらない（`engine/sycl/src/core/verify.cpp:816-829`）。
 
 ## 値と判定
 
-両読み取り箇所とも `std::atoll()` で文字列を `long long` に変換し、結果が `> 0` の場合だけ出力条件になります。未設定は `0`、空文字や数値変換できない文字列も `atoll` の結果が `0` となるため無効です。符号付き整数の先頭部分を読み、後続の非数値部分は変換値に含めません（例: `32junk` は 32、`-2` は負値なので無効、`0` は無効）。全体一致や値域チェック、上限 clamp はありません。
+両読み取り箇所とも `std::atoll` で `long long` に変換する。未設定なら `0`、変換後が `0` 以下なら interval 判定は通らず、この変数による定期ログは出ない。正数 `N` では集計 window 数が `N` 以上になったときに出力する。文字列全体の妥当性検査や後続文字の検査はなく、`atoll` の数値接頭部変換に従う。たとえば `32` と `32tail` はどちらも 32、`0`、`-1`、空文字、`true`、`tail32` は変換結果が正数にならず定期ログを有効にしない。先頭空白の後の符号・数字も変換対象になる。大きさの上限や範囲 clamp はコードにない（`engine/sycl/src/core/verify.cpp:2337-2345, 2926-2934`）。
 
-| 値の例 | 変換後 | 間隔出力 |
-|---|---:|---|
-| unset / 空文字 / `true` / `0` | 0 | しない |
-| `32` / `32junk` | 32 | 32 window 以上たまったときに出力 |
-| `-2` | -2 | しない |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| SYCL verifier の interval 集計 | `0` として扱い、interval ログなし | `1`, `32`, `32tail` | 空文字, `0`, `-1`, `true`, `tail32` |
 
-巨大値の `atoll` 変換について、Strata はエラー検査や別の fallback を行いません。
+2箇所の `static` は関数ごとに別の値を保持する。それぞれ `collect_profile()` または通常 `run()` の該当分岐が初めて評価された時に読み取り、その後の環境変更は反映されない（同上）。
 
 ## 有効になる条件
 
-- ビルドが `STRATA_ENABLE_SYCL=ON` で構成された実験的 SYCL backend であること。トップレベル CMake はこの設定時に SYCL サブプロジェクトへ分岐し、通常の CUDA/HIP 構成とは分けています（`CMakeLists.txt:12-21`）。SYCL engine のソース一覧には `sycl/src/core/verify.cpp` が含まれます（`sycl/CMakeLists.txt:253-260`）。
-- `STRATA_VERIFY_PROFILE` が unset ではないこと。空文字を含め、存在すれば profile を有効化しようとします。
-- profile buffer の `sycl::malloc_device` が成功すること。失敗時は `prof_on_` が false に戻され、interval 値による出力もありません。
-- 集計された window 数が正の interval 以上であること。
-
-CLI 引数や設定ファイルによる `STRATA_VERIFY_PROFILE_EVERY` の上書きは見つかりません。実行中に process environment を変更しても、各読み取り箇所の初回評価後は反映されません。
+- SYCL backend の verifier 経路であること。この名前の実コード参照は SYCL ソースに限られ、SYCL CMake はエンジンを Linux x86_64 向けとして構成している（`engine/sycl/src/core/verify.cpp:2339, 2928`; `engine/sycl/CMakeLists.txt:255`）。
+- `STRATA_VERIFY_PROFILE` が verifier 初期化時に設定済みで、プロファイル用 `sycl::malloc_device` が成功すること。未設定または確保失敗なら `prof_on_` が false となり、interval 判定箇所に到達しない（`engine/sycl/src/core/verify.cpp:816-829, 2919`）。
+- `STRATA_VERIFY_PROFILE_EVERY` の `atoll` 結果が正数であること。未設定・空文字・0 以下・数字で始まらない値は間隔指定として機能しない（`engine/sycl/src/core/verify.cpp:2338-2343, 2927-2932`）。
+- 通常の `run()` では `G == 1` のときだけこの変数の分岐を使う。`STRATA_VERIFY_EAGER` が設定されている通常 window 経路はこの間隔分岐を通らず、window ごとに `verify stages T=...` を出す。`collect_profile()` 内の `prof_S_ > 0` の batch-window 判定は別分岐であり、interval が正数なら batch 経路で集計ログを出す（`engine/sycl/src/core/verify.cpp:2337-2346, 2919-2935`）。
+- CLI 引数やサーバー設定からこの値を設定・上書きする Strata 所有コードは見つからなかった。`STRATA_VERIFY_PROFILE` と、通常 `run()` の表示方式を変える `STRATA_VERIFY_EAGER` が関係する（同上）。
 
 ## 実行時の詳細
 
-環境変数は次の2経路で読みます。
+`Verifier::collect_profile()` は GPU stamp を host 側へコピーし（`STRATA_VERIFY_EAGER` 未設定時）、`accumulate_profile()` で stage ごとの累積値と window 数を更新する。`prof_S_ > 0` の batch window では interval 到達時に `verify stages batch window of %d rows (ms/window over %lld, GPU clock):` を stderr に出す（`engine/sycl/src/core/verify.cpp:2327-2346, 2350-2382`）。
 
-1. `collect_profile()` 内では `prof_S_ > 0`、つまり batch window の集計後に読みます。正の interval 以上の window がたまると、`verify stages batch window of ... rows (ms/window over ..., GPU clock):...` 形式の行を stderr に出し、flush します。`profile_report()` が集計値と window counter をゼロに戻すため、その後も同じ interval ごとに集計行が出ます（`sycl/src/core/verify.cpp:2050-2070, 2098-2105`）。
-2. 通常の `run()` 完了時は `prof_on_ && G == 1` の場合に GPU stage stamps を集計します。`STRATA_VERIFY_EAGER` が unset なら、正の interval 以上で `verify stages T=... (ms/window over ..., GPU clock):...` を stderr に出して flush します。ここでも出力後に集計値と counter がリセットされます（`sycl/src/core/verify.cpp:2522-2540`, `1738-1761`）。`G != 1` の window はこの経路の出力条件を満たしません。
+通常 `Verifier::run()` の `prof_on_ && G == 1` 経路も集計後に interval を判定し、到達時に `verify stages T=%d (ms/window over %lld, GPU clock):` を stderr に出す（`engine/sycl/src/core/verify.cpp:2918-2935`）。出力時に `profile_report()` が平均値の文字列を作り、累積値と window 数をゼロに戻すため、正数 interval では出力後に次の集計が始まる（`engine/sycl/src/core/verify.cpp:2006-2029`）。
 
-各箇所の interval は別々の関数内 `static const long long` です。それぞれ、その経路で初めて評価された値を process 内に保持します。したがって変数の変更が反映されるのは、まだ初回評価されていないもう一方の経路だけです。両経路は `prof_windows_` の累積値を使い、閾値判定は `>=` です。
+この環境変数を読むのは初回の該当関数実行時で、各関数の `static` に値を保持する。環境変数をプロセス稼働中に変更しても、その関数の interval には反映されない。既定値 `0` のままならこれらの interval ログは出ず、条件判定のために累積値がリセットされない。`STRATA_VERIFY_EAGER` が設定されている通常 `run()` の per-window ログは別経路なので、この interval の値では抑制されない（同上）。
 
-`STRATA_VERIFY_EAGER` が設定されている場合（値が空でも存在判定）は通常 `run()` 経路が host-clock の `verify stages T=... (ms/window):...` を window ごとに出すため、そこでは `STRATA_VERIFY_PROFILE_EVERY` の判定を通りません（`sycl/src/core/verify.cpp:2523-2539`）。batch 経路の `collect_profile()` 内 interval 判定は別途存在します。
+## ログと測定値
 
-プロファイル自体の初期化は verifier 構築時に行われます。`STRATA_VERIFY_PROFILE` の存在で `prof_on_` を設定し、device buffer を確保できた場合に stamp 用領域と host 側配列を初期化します（`sycl/src/core/verify.cpp:638-651`）。プロファイル出力は診断用であり、出力頻度によるログ以外の終了・失敗経路はこの変数からは発生しません。
+該当 interval の到達時のみ stderr に、batch 経路では `verify stages batch window of ...`、通常 window 経路では `verify stages T=...` が出る。出力行には stage 別の `ms/window` と集計 window 数が含まれ、出力後に集計がリセットされる（`engine/sycl/src/core/verify.cpp:2342-2345, 2931-2934, 2006-2029`）。この環境変数自体について `docs/DETAILS.md` に設定方法や測定値の記載はない。同資料は `STRATA_VERIFY_PROFILE=1` による GPU profiling を紹介しているが、この変数の interval の説明ではない（`docs/DETAILS.md:364-366`）。
 
 ## 根拠
 
-- `sycl/src/core/verify.cpp:2050-2070` — batch profile の集計、interval の読み取り、stderr 出力。
-- `sycl/src/core/verify.cpp:1738-1761,2098-2105` — profile report が平均を作って集計を reset し、window counter が増える処理。
-- `sycl/src/core/verify.cpp:2522-2540` — 通常 window の出力条件、`STRATA_VERIFY_EAGER` 分岐、interval の読み取りと stderr 出力。
-- `sycl/src/core/verify.cpp:638-651` — `STRATA_VERIFY_PROFILE` によるプロファイル有効化と buffer 確保。
-- `CMakeLists.txt:12-21`; `sycl/CMakeLists.txt:253-260` — SYCL が別 backend として構成され、その engine に verifier 実装が入ること。
-- `docs/DETAILS.md:303-305` — 既存資料は `STRATA_VERIFY_PROFILE` による GPU 側 profile を説明していますが、`STRATA_VERIFY_PROFILE_EVERY` の interval 仕様は説明していません。
+- `engine/sycl/src/core/verify.cpp:816-829` — `STRATA_VERIFY_PROFILE` による計測有効化と確保失敗時の無効化。
+- `engine/sycl/src/core/verify.cpp:2327-2348, 2350-2382` — batch 集計時の読み取り、出力条件、累積。
+- `engine/sycl/src/core/verify.cpp:2006-2029, 2918-2935` — 通常 window 経路の条件、ログ、出力後のリセット。
+- `engine/sycl/CMakeLists.txt:255` — SYCL engine の対象 OS/architecture。
+- `docs/DETAILS.md:364-366` — `STRATA_VERIFY_PROFILE` に関する説明との照合。

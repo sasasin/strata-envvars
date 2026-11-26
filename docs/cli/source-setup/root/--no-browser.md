@@ -1,62 +1,58 @@
-# `--no-browser`
+# `source-setup` `--no-browser`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` および委譲する更新 wrapper） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat` / update wrappers の root parser |
 | オプション | `--no-browser` |
-| 別名 | なし。同じ設定先を変更する反対指定は `--browser` |
-| 値 | 値を取らないフラグ。既定は未指定（`None`） |
+| 別名 | なし |
+| 値 | 値を取らないフラグ |
 
 ## 役割
 
-モデルの起動準備完了時にチャット画面を自動でブラウザーに開かないようにします。API クライアントや harness から使う場合などに利用できます。設定はモデルごとの run config に保存され、生成される `run-<model>.sh` / `.bat` にも反映されます（`setup.py:8476-8480`、`setup.py:7260-7269`）。
+モデルのセットアップまたは起動後、チャットページをブラウザーで開かないようにします。API を利用する harness やアプリからの利用を想定した設定です。セットアップ時にはモデルの run config と生成 start script に記録され、既存モデルの通常起動時には server へブラウザーを開く指定を渡しません。
 
 ## 使い方
 
-Linux で既定の setup / 起動経路を使う例:
-
 ```sh
+# 既定モデルのセットアップ／起動をブラウザーなしで行う
 ./setup.sh --no-browser
-```
 
-Windows では `START-HERE.bat --no-browser` と指定できます。これらの wrapper は引数を `setup.py` に渡します（`setup.sh:6-13,75-76`、`START-HERE.bat:8-10,44-54`）。更新用 wrapper も同じ引数を委譲します（`update.sh:62`、`UPDATE.bat:79`）。
+# Windows のセットアップ／起動
+START-HERE.bat --no-browser
+```
 
 ## 値と既定値
 
-値は不要で、型変換や値域検証はありません。parser は `dest="browser"`、`action="store_false"`、`default=None` として登録しています。したがって通常は未指定の `None` で、明示すると `False` になります（`setup.py:8476-8480`）。同じ parser の `--browser` は同じ `browser` 値を `True` にするため、両方を指定した場合はコマンドライン上で後に現れた方が有効です。
+値は不要です。省略時の parser 値は `None` で、コマンドライン上で `--no-browser` を指定すると `False` になります。反対の `--browser` は同じ `browser` 属性を `True` にし、後から指定された方が有効です（`terminal/setup.py:11505-11509`）。オプションに値を続けると余分な引数として argparse が usage とエラーを出し、通常は終了コード 2 になります。
 
-無関係な引数を付ける形式（例: `--no-browser yes`）はこのフラグの値としては受理されず、余分な位置引数として argparse のエラーになります。`--no-browser` と `--browser` の指定順を含む使用例以外に、別の値・境界値はありません。
+明示指定がない場合、既存設定の `open_browser` 値は再セットアップ時に保持されます。新規設定では `open_browser` が省略され、通常起動時の既定はブラウザーを開く動作です（`terminal/setup.py:7540-7545, 7557-7568, 7715-7733, 8670-8672`）。
 
 ## 実行時の動作
 
-- 既存モデルを通常起動するとき、`main()` は `a.browser` を `start(..., keep={"open_browser": a.browser})` に渡します。明示指定が未指定 (`None`) 以外なら `start()` が既存 config の値と比較して `open_browser` を更新・保存します。`--no-browser` は `False` を保存し、設定が変わった場合は「no browser」と表示します（`setup.py:6766-6771,8677-8691`）。
-- 新しい設定を生成する経路（通常の setup、native / DeepSeek / Mac の設定生成）では、`a.browser is not None` のときだけ `cfg["open_browser"]` に値を設定します。生成する run script は `open_browser` が `False` の場合に server の `--open` 引数を付けません（`setup.py:7685-7690,7717-7718,8140-8148,8388-8405,7260-7269`）。
-- `setup.py --no-start` で設定だけ作る場合も、run config と run script に値を保存しますが、その場でモデルを起動しません（通常設定の保存と `--no-start` 分岐: `setup.py:9729-9730,9759-9760`）。
-- オプションを省略した場合、既存モデルの通常起動では保存済み設定をそのまま使います。新規設定ではキーがなければブラウザーを開く側が既定です。setup の再実行では `open_browser` は setup が再生成するキー集合 `SETUP_KEYS` に含まれず、ユーザー設定として carry over の対象です（`setup.py:6162-6167,6312-6342`）。`--browser` を明示すれば `True` に戻せます。
-
-実際の起動では setup が server 起動引数に `--open` を加えるかを決め、server は `--open` があり、かつ config の `open_browser` が `False` でない場合にのみ `webbrowser.open()` を別スレッドで呼びます。`--no-browser` はブラウザー起動を抑止しますが、server の準備完了表示やローカル URL 表示は残ります（`setup.py:6844-6846,6864-6866`、`serve/server.py:8177,8620-8623,8639-8644`）。
+- モデルをセットアップする経路では、指定値を `open_browser` として run config に保存します。指定しなければ既存の `open_browser` は carry-over されます（`terminal/strata_control/setup_config.py:531-538`; `terminal/setup.py:7557-7568, 7715-7736`）。
+- セットアップで書かれる `run-<model>.bat` / `.sh` は、設定が `False` のとき server 起動引数から `--open` を外します（`terminal/setup.py:9233-9246, 12521-12527`）。
+- 既存モデルの通常起動では `--no-browser` が `start()` に渡され、設定の `open_browser` を `False` に更新して保存します。server 起動コマンドに `--open` が付かず、チャットページを自動で開きません（`terminal/setup.py:11761-11775, 8558-8563, 8590-8595, 8601-8602, 8670-8672`）。
+- `--browser` を併記する場合は指定順が結果を決めます。例えば `--no-browser --browser` はブラウザーを開く設定になります（`terminal/setup.py:11505-11509`）。
 
 ## 適用条件と副作用
 
-このオプションは setup の Python parser にあるため、同 parser に委譲する各 wrapper で利用できます。既存 config の起動時は `open_browser` の値をモデル設定ファイルに書き込みます。新規設定時にはモデル別の `strata-<model>.json` と `run-<model>.sh` / `.bat` の生成内容に反映します（`setup.py:6766-6768,7260-7269,7694-7718`）。このフラグ自体はブラウザーを開く処理を起動せず、setup のモデル準備・server 起動を止めるものではありません。
+このオプションは root parser の設定・起動経路に適用されます。通常の macOS 起動は `setup.py` から `engine/metal/setup_mac.py` に委譲されるため、そちらの parser と設定経路は別 scope です（`terminal/setup.py:11434-11437`; 索引上の `source-setup/mac/`）。
 
-`--update` との併用では update が設定を更新してもモデルを起動しないため、ブラウザー抑止は保存され、後の起動で使われます（`setup.py:8496-8498` および update wrapper の `update.sh:62` / `UPDATE.bat:79`）。なお、対象は setup の `setup.py` parser です。server の直接起動用 CLI には別の `--open` があり、`--no-browser` は server のオプションではありません（`serve/server.py:8177`）。
+設定・起動時にブラウザーを自動で開かないことが効果です。モデルのセットアップ、run config の書き込み、および server 起動自体は抑止しません。セットアップの再実行で既存設定が変わる場合、run config は書き換えられ、変更前のファイルは `.bak` として保存されます（`terminal/setup.py:7715-7744`）。通常起動時にも明示した設定は run config に保存されます（`terminal/setup.py:8590-8595`）。
 
 ## 出力とエラー
 
-明示指定した `--no-browser` によって既存モデルの保存値が変わる場合、setup は設定保存後に `saved for this model: no browser` を表示します（`setup.py:6766-6771`）。通常起動ではブラウザーの自動起動を省き、server は準備完了時に URL を表示します（`setup.py:6864-6866`、`serve/server.py:8620-8623`）。オプション固有の警告や失敗経路は確認できませんでした。無効な option や余分な値のエラーは argparse の一般的な引数エラーで、オプション固有の validation ではありません（parser: `setup.py:8420,8476-8480,8553`）。
+起動時の説明文はブラウザーが開く代わりに「server が準備完了を知らせる」と案内し、設定サマリーには `no browser` と表示します（`terminal/setup.py:8546-8555, 8690-8697`）。フラグ自体に専用の validation や失敗経路はありません。余分な値など parser が受け付けない引数は argparse のエラーになります。
 
 ## 根拠
 
-- parser 定義と対になる `--browser`: `setup.py:8476-8480`
-- 既存 config の永続化と表示: `setup.py:6745-6771`
-- ブラウザー起動の条件・案内: `setup.py:6844-6846,6864-6866`、`serve/server.py:8177,8639-8644`
-- 設定生成・run script への反映: `setup.py:7260-7269,7685-7718,8140-8148,8388-8405,9729-9730`
-- setup の設定 carry over と update 時の非起動: `setup.py:6162-6167,6312-6342,8496-8498,9759-9766`
-- wrapper の引数委譲: `setup.sh:6-13,75-76`、`START-HERE.bat:8-10,44-54`、`update.sh:62`、`UPDATE.bat:79`
-- 索引上の所属と scope: `docs/cli/README.md:13,1465-1502`
-
-調査は上記 commit の checkout 内の parser・使用箇所・wrapper・server 起動処理に限定しました。CLI help、Release artifact、他 OS での実行結果は補助確認していません。
+- `terminal/setup.py:11505-11509` — `--no-browser` / `--browser` の parser 定義、既定値、反転動作。
+- `terminal/setup.py:11434-11437` — 通常の macOS 経路が Metal setup へ委譲される条件。
+- `terminal/strata_control/setup_config.py:531-538` — 指定値を設定へ反映。
+- `terminal/setup.py:7540-7545, 7557-7568, 7715-7736` — 未指定時の既存キー引継ぎと設定書き込み。
+- `terminal/setup.py:9233-9246, 12521-12527` — run script 生成時に `--open` を含める条件。
+- `terminal/setup.py:8558-8563, 8590-8595, 8601-8602, 8670-8672` — 通常起動での設定保存、server 引数、ブラウザー起動条件。
+- `terminal/setup.py:8546-8555, 8690-8697` — 設定サマリーと起動時メッセージ。

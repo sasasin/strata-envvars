@@ -1,38 +1,51 @@
 # `LD_LIBRARY_PATH`
 
-調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata のソースでは、この値を実行時に単独で解釈して機能を切り替えるのではなく、主にビルド・起動する子プロセス向けの環境を組み立てる際に使う。既存値を引き継ぎながら ROCm/Vulkan SDK やエンジンパッケージ、設定で指定されたライブラリ用ディレクトリを追加する用途と、Linux AppImage の外部プログラム起動時に AppImage 内のパスを除く用途がある。ライブラリ探索そのものの挙動は OS のローダー側に属するため、ここでは扱わない。
+Strata 自身が値を機能フラグとして解釈する環境変数ではない。Linux など Windows 以外の複数の起動経路で、子プロセス用環境にパッケージや SDK のライブラリディレクトリを先頭追加し、元の `LD_LIBRARY_PATH` を後ろに残す。対象は主にエンジン、HIP/Vulkan のビルド・検査、画像処理エンジンである。実際にライブラリを検索するのは起動されたプログラム側であり、その検索規則はこの文書の対象外である（`terminal/serve/server.py:4007-4053`、`terminal/setup.py:5192-5204`）。
+
+Linux AppImage では別の目的で、Strata の同梱パスを継承した外部プログラムの環境から取り除く。これはアプリ本体のライブラリ環境をシステムのファイル選択・通知・ブラウザー等へ持ち込まないための処理である（`app/host/server/external-env.mjs:5-13,26,43-70`）。
 
 ## 値と判定
 
-- Strata の Python コードでは環境辞書の `LD_LIBRARY_PATH` を文字列として読み、存在して非空かを `env.get(...)` で判定する箇所がある。特定の値や数値形式は要求しない。
-- 追加パスは `os.pathsep`（Unix では `:`）で連結し、既存値の前または後ろに置く。設定ディレクトリがない場合は、コードにより既存値をそのままにするか、空値を連結した結果から末尾区切りを取り除く。
-- `serve/images.py` と `serve/server.py` は Windows では `PATH` を選ぶため、Windows 上では `LD_LIBRARY_PATH` を更新しない。`strata_control.updater.binary_smoke()` は Windows で `PATH`、macOS で `DYLD_LIBRARY_PATH`、それ以外で `LD_LIBRARY_PATH` を選ぶ。一方 `strata_control.tuning.engine_env()` や一部ツールは Windows 以外を `LD_LIBRARY_PATH` として扱う。
-- 環境変数名はコード上で大文字小文字を区別して指定される。Strata のコードに、空白除去やパス要素の正規化を一律に行う処理はない。
+Strata はこの変数を数値や真偽値として parse しない。パス区切り文字は Python の `os.pathsep`（Linux では `:`）。値の空白、大文字小文字、各要素の妥当性、重複は検査しない。空文字と未設定は、既存値を追加する箇所では同じ扱い（追加元なし）だが、起動時にディレクトリを付けない経路では元の環境をそのまま維持する。
+
+| 条件・経路 | 未設定 / 空文字 | 値がある場合 | 上書き・無効値 |
+|---|---|---|---|
+| サーバーからエンジンを起動（Windows 以外） | 有効な `cfg.lib_dirs` があればそれらだけを設定 | `cfg.lib_dirs` の既存ディレクトリを先頭にし、元の値を後ろに連結 | Strata は値を無効とは判定しない。`cfg.env` に `LD_LIBRARY_PATH` があれば、この合成値を後から置き換える（`terminal/serve/server.py:4007-4053`） |
+| インストール済みエンジンの検査・トークナイザー抽出（Linux/macOS） | 有効なパッケージ lib dir があればそのディレクトリを設定 | パッケージ自身のディレクトリ群を先頭にし、元の値を後ろに連結 | Windows は `PATH`、macOS は `DYLD_LIBRARY_PATH` を使う経路がある（`terminal/strata_control/shape_engine.py:217-228`、`terminal/strata_control/local_engine.py:48-55`、`terminal/setup.py:5192-5204,10233-10241,10715-10724`） |
+| HIP / Vulkan セットアップ、HIP 画像ビルド | `os.environ.get(..., "")` で空の末尾要素を作り、最後の区切り文字を除去 | 選択した SDK のディレクトリ群を先頭に追加 | 受理・拒否される値はない。Strata プロセスの環境を書き換え、以降の子プロセスに継承させる（`terminal/setup.py:5681-5688,5754-5759,5860-5864,5934-5939`） |
+| Linux AppImage から外部プログラムを起動 | 値がない場合はないまま | 起動時環境の記録があればその値を使う。記録がなく `APPDIR` があるときは `:` で分割して AppImage 内の要素を除去 | 要素が全て除かれた場合は変数自体を削除。AppImage 外で記録もなければ変更しない（`app/host/server/external-env.mjs:43-70`） |
+
+たとえばサーバーの `cfg.lib_dirs=["/pkg/lib"]`、元値が未設定なら子環境値は `/pkg/lib`、元値が `/usr/local/lib` なら `/pkg/lib:/usr/local/lib` となる。`cfg.env` が同じキーを指定すればその文字列が最終値になる。通常の起動経路に「`0`」「`1`」「`true`」などの有効・無効境界はない。
 
 ## 有効になる条件
 
-- セットアップでは ROCm ビルド経路、Vulkan SDK のセットアップ、および HIP の画像エンジン経路で SDK のディレクトリを追加する。これらの処理が選ばれない場合、このセットアップコードによる変更はない（`setup.py:4619-4626,4690-4695,4796-4799,4842-4846`）。
-- サーバーと画像処理の子プロセスでは、設定の `lib_dirs` のうち実在するディレクトリがある場合だけ、子プロセス用環境に追加する（`serve/server.py:3528-3537`, `serve/images.py:131-150`）。
-- `strata_control.tuning.engine_env()` はエンジンの隣に `engine-component.json` がある場合のみパッケージ用環境を返し、そのフォルダーと `BUILD.json` の相対 `lib_dirs` のうち存在するものを前置する。通常のエンジンでは `None` を返し、呼び出し元環境のままになる（`strata_control/tuning.py:189-202`, `strata_control/engine_component.py:155-171`）。
-- Linux AppImage 内から外部プログラムを起動する環境では、元の起動環境が記録されていればそれを使う。記録がない場合は `APPDIR` 以下を指す `LD_LIBRARY_PATH` の要素だけを除き、空になれば変数自体を削除する。AppImage 外では環境をコピーし、変更しない（`apps/host/server/external-env.mjs:43-57,63-71`）。
+- OS により対象キーが異なる。サーバーの通常エンジン起動は Windows で `PATH`、それ以外で `LD_LIBRARY_PATH` を使う。部品検査・トークナイザー抽出の一部は Windows で `PATH`、macOS で `DYLD_LIBRARY_PATH`、その他で `LD_LIBRARY_PATH` を使う（`terminal/serve/server.py:4050-4053`、`terminal/strata_control/shape_engine.py:223-228`）。
+- サーバーでは `cfg.lib_dirs` のうち存在するディレクトリがある場合だけ先頭追加する。エンジン起動時に構成の `env` がキーを含めば追加後の値を上書きする。環境変数自体が有効な値でも、追加対象ディレクトリがなければサーバーは値を変更しない（`terminal/serve/server.py:4050-4053`）。
+- セットアップ側の HIP/Vulkan 変更は該当するビルド・SDK 準備関数が実行された場合だけ起きる。HIP ビルドは `rocm_root()` が返すディレクトリ、Vulkan は SDK の `VulkanLoader/lib` を追加する（`terminal/setup.py:5681-5688,5858-5864,5934-5939`）。
+- 起動時に元値を読むラッパーに CLI の値判定や専用 CLI フラグはない。サーバーの設定 `env` は `cfg.lib_dirs` より後に適用されるため、同じキーを明示すれば優先する（`terminal/serve/server.py:4027-4028,4050-4053`）。
+- AppImage の外部プログラム向け処理は、ランチャーが記録した元環境を優先する。記録がなければ `APPDIR` 内のパスだけを取り除く。記録も `APPDIR` もなければ `LD_LIBRARY_PATH` を変えない（`app/host/server/external-env.mjs:43-70`）。
 
 ## 実行時の詳細
 
-- `serve/server.py` と `serve/images.py` は `os.environ`（または渡された基底環境）を複製し、既存の `LD_LIBRARY_PATH` が非空なら設定されたライブラリディレクトリの後ろに連結する。画像処理側ではその後 `cfg.env` の値を反映するため、設定に `LD_LIBRARY_PATH` があれば追加した値を上書きできる（`serve/images.py:134-150`）。サーバー側は HIP 環境ガードなどを続けて適用する（`serve/server.py:3528-3537`）。
-- エンジン更新時の `binary_smoke()` はパッケージ内ライブラリディレクトリを既存値の前に連結した環境で `<engine> --version` を実行する。パッケージ化エンジンのチューニング実行も同様に既存値を後ろへ置く（`strata_control/updater.py:746-754`, `strata_control/tuning.py:195-202`）。
-- `setup.py` の HIP/Vulkan セットアップは `os.environ` 自体を更新し、その後のビルドやサブプロセスに SDK パスを引き継ぐ。HIP では SDK の `dirs` を既存値より前へ、Vulkan では `VulkanLoader/lib` を前へ置く。HIP の一部では空の既存値を末尾から除去する（`setup.py:4623-4626,4692-4695,4796-4799,4844-4846`）。
-- `packaging/collect_libs.py` は `--search` の各パスを先頭にした環境辞書を作り、`ldd` に渡す（`packaging/collect_libs.py:85-89`）。`tools/batch_test.py`, `tools/quant_quality.py`, `tools/trellis/sanity_greedy.py`, `tools/dsv41/tune.py` も設定のライブラリディレクトリを既存値より前に置いた環境で子プロセスを起動する（各ファイル `:56`, `:113,189`, `:39`, `:85-91`）。`tools/dsv41/mkprompts.py` は起動時の値を読み、tokenizer 子プロセスの環境に同じ値を明示して渡す（`:19-26`）。
-- `packaging/build_hip_gfx1103.sh` は SDK の `lib`, `lib/rocm_sysdeps/lib`, `lib/llvm/lib` を前置して export する（`:11`）。
-- パス追加はそれぞれの関数・スクリプト実行時に行われる。値を読むコードがプロセス起動後に変更された環境変数を監視する処理は確認できない。子プロセスへの適用範囲は、その起動時に `env` として渡された環境に限られる。
+この変数の値自体をグローバルに cache する処理は確認できない。Python のサーバーは `child_env()` の呼び出しごとに `dict(os.environ)` を作り、実際にエンジンを起動する際の環境として渡す。通常起動、レプリカ、分割エンジンの各起動経路でこの関数を呼ぶ（`terminal/serve/server.py:4007-4053,8820-8824,8845-8852,8912-8919,9386-9394`）。`.strata` モデルのトークナイザーが見つからない場合は、サーバーが実行ファイルのディレクトリと有効な `lib_dirs` を先頭にした環境で `--export-tokenizer` を起動する（`terminal/serve/server.py:9112-9128`）。画像エンジンも `image_env()` が起動時に環境辞書を作り、`cfg.env` を最後に適用して子プロセスへ渡す（`terminal/serve/images.py:177-196,467-468`）。一方、Hy4 / Inkling の `--info` 結果はプロセス内 `_PROBES` に cache されるため、同じキーの probe が再利用されれば環境を作り直して再起動する処理は通らない。これらの cache キーには `LD_LIBRARY_PATH` は含まれない（`terminal/serve/hy4_kind.py:78-95`、`terminal/serve/inkling_kind.py:82-108`）。
 
-## 文書との照合
+パッケージ検査では `package_lib_dirs()` がパッケージ自身と `BUILD.json` の相対 `lib_dirs` のうち実在するものを返し、検査用の環境に先頭追加する（`terminal/strata_control/engine_component.py:158-174`、`terminal/strata_control/shape_engine.py:217-228`）。エンジン追加時の `--version` 検査やチューニング用 `--help` probe も同じく、毎回の起動環境を作って子プロセスへ渡す（`terminal/strata_control/local_engine.py:48-55`、`terminal/strata_control/tuning.py:208-240`）。HIP の GPU 列挙も `engine_env()` で同様に環境を作って `strata-device --list-devices` を実行するが、パッケージが HIP でない・実行ファイルがない・起動 timeout・非ゼロ終了なら列挙結果を返さない（`terminal/setup.py:5192-5204,5223-5247`）。
 
-`docs/STRIX_HALO.md:55-58` は ROCm SDK の3ディレクトリを `LD_LIBRARY_PATH` の前に追加するシェル例を示し、`docs/AMD_HIP.md:614-616` は ROCm ライブラリディレクトリを設定してチューニング実行する例を示す。これらは利用例であり、Strata のコードにおける全ての子プロセス環境構築を列挙する説明ではない。`docs/DETAILS.md` に本変数の詳細な仕様説明は見当たらない。
+開発・診断用の同梱 Python ツールにも子環境を作る箇所がある。例として `par_run.py` と `batch_test.py` は現在値を保持しながら指定 lib dir を先頭に追加してサーバー／エンジンを起動する（`terminal/tools/par_run.py:133-147`、`terminal/tools/batch_test.py:47-62`）。パッケージ収集ツールは `ldd` の実行環境だけに `--search` のパスを先頭追加する（`tools/packaging/collect_libs.py:138-142`）。これらは製品サーバーの設定フラグではない。
+
+## ログと測定値
+
+`LD_LIBRARY_PATH` の値を表示する専用ログ、値の不正を知らせる警告、値に関する測定値は確認できない。子プロセスが起動に失敗した場合の報告は呼び出し元による。たとえばコンポーネントの `--version` 検査では起動不能または非ゼロ終了を `TestStartFailed` として報告し、共有ライブラリ不足を検出した場合はライブラリ名を理由・案内に含める（`terminal/strata_control/updater.py:1031-1074`）。HIP デバイス検査は失敗時に `None` を返し、この箇所では専用エラー文を出さない（`terminal/setup.py:5237-5247`）。
 
 ## 根拠
 
-主な環境の組み立ては `serve/server.py:3528-3537`, `serve/images.py:131-150`, `strata_control/engine_component.py:155-171`, `strata_control/updater.py:746-754`, `strata_control/tuning.py:189-202`。SDK セットアップは `setup.py:4619-4626,4690-4695,4796-4799,4842-4846`、パッケージ検査は `packaging/collect_libs.py:85-89`。AppImage 外部環境の処理は `apps/host/server/external-env.mjs:43-57,63-71`。
+- `terminal/serve/server.py:4007-4053,8820-8824,8845-8852,8912-8919,9112-9128,9386-9394` — サーバーが元の環境、設定ディレクトリ、設定 `env` を組み合わせてエンジン子プロセスへ渡す。
+- `terminal/serve/images.py:177-196,467-468`、`terminal/serve/hy4_kind.py:78-95`、`terminal/serve/inkling_kind.py:82-108` — 画像エンジン環境と、結果を cache する `--info` probe。
+- `terminal/setup.py:5192-5204,5223-5247,5681-5688,5750-5759,5858-5864,5934-5939,9634-9642,10233-10245,10715-10725` — セットアップの子プローブ、HIP/Vulkan ビルド環境、エンジン情報取得、トークナイザー抽出。
+- `terminal/strata_control/engine_component.py:158-174`、`terminal/strata_control/shape_engine.py:217-245`、`terminal/strata_control/local_engine.py:48-74`、`terminal/strata_control/updater.py:1031-1074`、`terminal/strata_control/tuning.py:208-240` — コンポーネントのライブラリディレクトリと、検査・実行時の子環境。
+- `app/host/server/external-env.mjs:5-13,26,43-70` と同 helper の利用箇所 `app/host/server/app-ui.mjs:39-59`、`app/host/server/artifacts.mjs:5-6`、`app/host/server/chat-files.mjs:89-94` — AppImage 外部プログラムへの環境引き渡し。
+- `terminal/tools/par_run.py:133-147`、`terminal/tools/batch_test.py:47-62`、`tools/packaging/collect_libs.py:138-151` — 同梱ツールが診断・パッケージ処理の子プロセス環境を構築する箇所。

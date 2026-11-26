@@ -1,52 +1,50 @@
 # `STRATA_FUSE_DECODE`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の実験ビルドで、decode 中の複数の処理をまとめたカーネルへ切り替えます。該当するのは activation の複数形式への変換、BF16 projection の組、MoE の gate/up・SwiGLU・中間量子化などです。呼び出し箇所は `STRATA_EXPERIMENTAL_SM60` のコンパイル条件内にあり、通常の CUDA リリースビルドや HIP ビルドではこの変数を設定してもこれらの分岐は入りません。
+実験的 CUDA ビルドに含まれる decode 時の演算融合を選ぶ。対象は activation 量子化画像の一括生成、対応する BF16 射影のペア実行、shared expert の gate/up GEMV と SwiGLU、MoE SwiGLU と Q8 量子化など。値が有効でも、該当するモデル層・重み形式・通常経路に到達しない場合はその融合は使われない。読み取り関数は `strata::kernels::fuse_decode()` である（`engine/include/strata/kernels/fuse_decode.hpp:9-15`）。
+
+このヘッダー内の関数が `STRATA_EXPERIMENTAL_SM60` の下で呼ばれる箇所に限って実際の融合分岐がコンパイルされる。CMake はこの macro を CUDA と `STRATA_EXPERIMENTAL_SM60` の両方が有効なときに定義する。これは Pascal sm_60 / Volta sm_70 向けの実験ビルドで、通常の配布エンジンには該当コードが入らない（`engine/cmake/backends/cuda.cmake:28,47-57,76-80`; `engine/cmake/strata_gpu_engine.cmake:14-17`）。
 
 ## 値と判定
 
-`include/strata/kernels/fuse_decode.hpp` は `getenv()` の戻り値が存在し、先頭文字が `'1'` なら有効とします。文字列全体の parse はしません。
+`fuse_decode()` は `std::getenv` で値を取得し、値が存在し、かつ先頭文字が文字 `'1'` の場合だけ true とする。文字列全体の parse や数値変換はしない。値は関数内 `static const bool` に初回呼び出し時保存され、その後の環境変更は反映されない（`engine/include/strata/kernels/fuse_decode.hpp:9-14`）。
 
-| `STRATA_FUSE_DECODE` | 判定（直接読み取り時） |
-|---|---|
-| 未設定 | 無効。ただし後述の sm_60 既定値が起動時に設定する場合がある |
-| 空文字 | 無効（設定済みだが先頭文字は `\0`） |
-| `1`, `10`, `1anything` | 有効 |
-| `0`, `01`, `true`, `2`, ` 1` | 無効 |
+| 状況 | 判定 | 例 |
+|---|---|---|
+| 初回読み取り時に未設定 | false | unset |
+| 空文字 | false | `STRATA_FUSE_DECODE=` |
+| 先頭が `1` | true | `1`, `10`, `1anything` |
+| その他 | false | `0`, `0anything`, `true`, `2`, ` 1`, `TRUE` |
 
-大文字小文字・後続文字・数値としての妥当性は判定しません。読み取り結果は関数内の `static const bool` に初回呼び出し時に保存され、その後の環境変更は反映されません。
+CUDA の NVIDIA 既定値処理は、環境変数が未設定のときだけ値 `1` を設定するため、既に定義された空文字や無効値はそのまま残る。sm_60 では `STRATA_SM60_PERF` の先頭文字が `0` の場合は既定値テーブルを使わず、それ以外（未設定を含む）では `STRATA_FUSE_DECODE=1` を既定値候補に含める。テーブル適用時、ユーザーが対象変数を何らかの値で定義済みならその値を優先する（`engine/src/core/nv_defaults.cpp:14-18,164-175,222-234`）。
 
 ## 有効になる条件
 
-機能の呼び出し箇所は `STRATA_EXPERIMENTAL_SM60` 定義時にだけコンパイルされます。CMake では `STRATA_EXPERIMENTAL_SM60=ON` は CUDA の Pascal sm_60 / Volta sm_70 向け実験ビルドを選びます。したがって環境変数が `1` であっても、通常の既成エンジンでは効果がありません。
-
-sm_60 では起動時の `apply_nv_defaults()` が条件を満たすと未設定変数へ `1` を設定します。条件は、CUDA デバイスが少なくとも1台あり、可視デバイスすべてが同じ compute capability 6.0 であること、かつ `STRATA_SM60_PERF` の先頭文字が `0` でないことです。`STRATA_SM60_PERF` が `0` で始まると既定値群は作られません。ユーザーが `STRATA_FUSE_DECODE` に空文字を含む何らかの値を明示している場合、既定値設定処理は上書きしません。その値が `1` で始まらなければ機能は無効のままです。明示した `STRATA_FUSE_DECODE=1` は、`STRATA_SM60_PERF=0` でも直接判定では有効です。
-
-sm_70（V100 など）にはこの自動設定はありません。実験ビルドで `STRATA_FUSE_DECODE=1` を設定した場合に有効になります。複数 GPU の compute capability が混在する場合も `apply_nv_defaults()` は呼ばれず、自動設定されません。
+- 融合コードがビルドに含まれるには CUDA ビルドで `STRATA_EXPERIMENTAL_SM60=ON` が必要。CMake は Pascal / Volta の実験ビルドとして説明し、CUDA 12.x を要求している。HIP、Metal、SYCL、および通常の sm_75 以降用配布ビルドではこの macro 付き融合経路はコンパイルされない（`engine/cmake/backends/cuda.cmake:47-57,76-80`; `engine/cmake/strata_gpu_engine.cmake:14-17`）。
+- 自動で `=1` が入るのは、実行時に NVIDIA CUDA 初期化が成功し、可視 GPU が 1 台以上あり、全可視 GPU の compute capability が同一で、その capability が sm_60 である場合。さらに `STRATA_SM60_PERF` の先頭文字が `0` ならテーブル全体が適用されない。既定値処理は環境変数未設定時にだけ値を設定する（`engine/src/program/generate.cpp:4421-4449`; `engine/src/core/nv_defaults.cpp:164-175,222-234`）。
+- sm_70 では既定値テーブルにこの変数は含まれないが、ユーザーが `STRATA_FUSE_DECODE` を有効値に設定し、実験ビルドに該当コードがあれば呼び出し側の分岐条件を満たす箇所で使われる（`engine/src/core/nv_defaults.cpp:136-163`; `engine/src/core/layer.cpp:326-335`; `engine/src/kernels/cuda/shared_expert.cu:350-378`）。
+- モデル側の条件として、GDN 層、MoE/shared expert、QSA 層などの対応コードを実行する必要がある。例えば GDN 的 activation 画像生成は必要な重みが native 形式でない場合に行い、QSA の画像生成も K/V/Q のいずれかが native でない場合に行う。QSA の BF16 射影ペアは `fuse_decode()` が true の場合に選ばれる（`engine/src/core/layer.cpp:263-273,326-335,1172-1186,1204-1217`）。
+- shared expert の gate/up ペア GEMV は両方の射影が native でない場合にのみ試され、S-family 条件を満たせない場合は通常の個別射影に戻る。MoE SwiGLU-Q8 の専用 fast 経路が成立する場合はそちらが先に選ばれ、`fuse_decode()` の分岐には入らない（`engine/src/kernels/cuda/shared_expert.cu:350-378`; `engine/src/kernels/cuda/s2_expert_grouped.cu:601-625,1296-1321`）。
 
 ## 実行時の詳細
 
-有効時は、該当経路で次の処理を置き換えます。
+既定値が適用される NVIDIA 起動経路では、device 検出後、エンジンの switch 読み取り前に `apply_nv_defaults` が呼ばれる。変数が未設定なら値 `1` を設定し、設定した switch 名をまとめた stderr の既定値案内に出す。出力には `strata: sm_60 (Pascal):`、`speed switches on by default`、`STRATA_SM60_PERF=0 turns them off`、`a switch you set is kept` が含まれ、一覧には接頭辞を除いた `FUSE_DECODE` と表示される。ユーザーが既に変数を設定している場合、その変数は既定値として追加されない（`engine/src/program/generate.cpp:4421-4449`; `engine/src/core/nv_defaults.cpp:222-255`）。
 
-- GDN、shared expert、QSA layer では、必要な activation 形式を別々の量子化・変換カーネルで作る代わりに `quantize_act_images()` でまとめて生成します。対象 weight が native data を持つ場合など、もともと変換が不要な経路では呼び出されません。
-- GDN の alpha/beta BF16 projection と QSA indexer の key/query projection は、それぞれ対の projection カーネルへ切り替わります。
-- shared expert と grouped S2 MoE の複数経路では、SwiGLU と中間値の Q8_0 量子化を一つのカーネルで行います。grouped S2 の fast 経路で `swiglu_q8` が有効な場合は別の fused カーネル経路が先に選ばれ、この変数の分岐には入りません。
+初回 `fuse_decode()` 呼び出し時に判定を cache する。したがって、呼び出し後に同一プロセス内で環境値を書き換えても切り替わらない。対応する呼び出し箇所では、通常の複数処理を融合版に置き換える。例として、GDN の二つの BF16 射影を `project_bf16_pair` にまとめ、通常時の二回の `project_bf16` を省く（`engine/src/core/layer.cpp:326-335`）。shared expert では条件成立時、gate/up の S-family GEMV と SiLU 積を一つの kernel で行い、条件不成立時は通常の個別射影経路を使う（`engine/src/kernels/cuda/shared_expert.cu:350-378`）。MoE grouped expert では通常の SwiGLU と量子化の別処理を融合呼び出しに置き換える（`engine/src/kernels/cuda/s2_expert_grouped.cu:1307-1321`）。
 
-sm_60 の既定値が新たに環境へ設定された場合、stderr に `strata: sm_60 (Pascal): ... exact speed switches on by default (STRATA_SM60_PERF=0 turns them off; a switch you set is kept): ...` の形式で設定したスイッチ一覧を出します。変数を直接読む `fuse_decode()` 自体に有効化ログはありません。
+この環境変数専用の CLI 引数や設定ファイル上書き経路は見つからなかった。明示設定と NVIDIA の自動既定値の関係は上記のとおりで、CLI からの別優先順位はない。環境値による独立した警告・エラー・終了経路もない。NVIDIA sm_60 で既定値が設定されたときの一般的な既定値ログ以外に、融合の有効化を示す専用ログは確認できなかった。
 
-## 文書・測定値との照合
+## ログと測定値
 
-`docs/DETAILS.md` は sm_60（Tesla P100）の既定スイッチ群に本変数を含め、`STRATA_SM60_PERF=0` で群を止められると記載しています。ソースの sm_60 既定表および適用条件と一致します。P100 の +14.2% はスイッチ群全体の測定であり、本変数単独の効果としては扱えません。`docs/NVIDIA_V100.md` は CUDA 12 実験ビルドの V100 向け opt-in として本変数を記載し、寄稿者測定の「token あたり 4–16 us saved」を載せていますが、表に測定条件の詳細がないため一般的な性能値とは判断できません。
+コードコメントは融合経路について「bitwise」相当の一致を述べている（例: shared expert の gate/up ペアは unfused sequence と bit-exact、`engine/src/kernels/cuda/shared_expert.cu:352-355`）。Strata の `docs/NVIDIA_V100.md` には V100 で `STRATA_FUSE_DECODE=1` のとき「4-16 us per token saved, not visible end to end」と記載されているが、同じ表のこの項目には個別レポートや測定条件が付いていないため、ここでは資料上の記載としてのみ扱う（`docs/NVIDIA_V100.md:138`）。環境変数自体についての専用ログ文言はない。自動既定値のログ条件と形式は「実行時の詳細」を参照。
 
 ## 根拠
 
-- 値判定と static cache: `include/strata/kernels/fuse_decode.hpp:8-15`
-- CUDA 実験ビルドの定義と Pascal / Volta の条件: `CMakeLists.txt:181-219`
-- sm_60 の既定値、`STRATA_SM60_PERF` 判定、ユーザー値の保持、stderr 出力: `src/core/nv_defaults.cpp:11-15,18-49,52-69`
-- 同一 compute capability の可視 CUDA デバイスだけで既定値を適用: `src/program/generate.cpp:2800-2817`
-- GDN/shared expert/QSA layer の activation と projection: `src/core/layer.cpp:263-272,325-335,482-492,1150-1164,1181-1190`
-- shared expert および grouped S2 SwiGLU + quantization: `src/kernels/cuda/shared_expert.cu:334-415`, `src/kernels/cuda/s2_expert_grouped.cu:644-658,751-764,798-811,1204-1219`
-- 文書記載: `docs/DETAILS.md:2425-2453`, `docs/NVIDIA_V100.md:93-100`
+- `engine/include/strata/kernels/fuse_decode.hpp:9-15` — 値の読み取り、先頭文字判定、初回評価 cache。
+- `engine/src/core/nv_defaults.cpp:14-18,164-175,222-255` — sm_60 既定値条件、ユーザー設定優先、環境への設定とログ。
+- `engine/src/program/generate.cpp:4421-4449` — CUDA 起動時の device 条件と既定値適用箇所。
+- `engine/cmake/backends/cuda.cmake:28,47-57,76-80`; `engine/cmake/strata_gpu_engine.cmake:14-17` — 実験ビルド条件。
+- `engine/src/core/layer.cpp:263-273,326-335,374-383,483-495,1172-1217`; `engine/src/kernels/cuda/shared_expert.cu:350-378`; `engine/src/kernels/cuda/s2_expert_grouped.cu:601-625,1296-1321` — 呼び出し経路と条件付き fallback。

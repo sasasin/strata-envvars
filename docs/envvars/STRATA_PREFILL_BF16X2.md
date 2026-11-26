@@ -1,46 +1,44 @@
 # `STRATA_PREFILL_BF16X2`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-プロンプト prefill の BF16 重み GEMM で、BF16 に丸めた活性値だけでなく、その丸めで落ちた残差も別の BF16 GEMM として加算するかを選びます。実装コメントでは BF16 の有効精度をおよそ16 bitにするモードとして説明されています。対象は hyper-connection、SSM alpha/beta、indexer、router、shared gate、PLE のバッチ key/value 経路などの BF16 重み投影です。値を変えるため opt-in で、decode の経路を切り替える変数ではありません（`src/prefill/prefill.cpp:316-322,1989-1994`）。
+CUDA/HIP 系と SYCL 系の prefill にある BF16 重みの projection で、BF16 に丸めた活性値だけでなく、その丸めで失われた BF16 remainder も別 GEMM で積算するかを選びます。出力は通常の積 `W·hi` に remainder の積 `W·lo` を加えた形になり、prompt の数値結果が変わります。これ自体が decode の計算を切り替えるものではありません（`engine/src/prefill/prefill.cpp:885-898`、`engine/sycl/src/prefill/prefill.cpp:355-369`）。
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換され、環境変数が未設定なら `0` です。文字列全体の厳密な数値検査はせず、`atoi` が変換した整数を使います。したがって空文字や数字で始まらない文字列は通常 `0`、`1tail` は `1`、`2tail` は `2`、`-1` は `-1` と判定されます。空白と符号を含む数字も `atoi` の規則で変換され、数値の後ろに続く文字列は判定されません。
+両実装とも `std::getenv` の結果を `std::atoi` に渡し、未設定なら `0` とします。変換した整数がちょうど `1` の場合は hyper-connection の remainder も有効にし、その他の非ゼロ値は hyper-connection を除く BF16 projection で remainder を有効にします。整数として `0` になる値は無効です。範囲検証・clamp はありません（`engine/src/prefill/prefill.cpp:891-898,998`、`engine/sycl/src/prefill/prefill.cpp:362-369,381`）。
 
-| `atoi` の結果 | 通常の BF16 活性入力 | hyper-connection の BF16 活性入力 |
-|---|---|---|
-| `0`（未設定、空文字、無効な先頭文字を含む） | 無効 | 無効 |
-| `1` | 有効 | 有効 |
-| `2` | 有効 | 無効 |
-| その他の非0整数 | 有効 | 無効 |
+| 実装経路 | unset | hyper-connection を含む有効値 | hyper-connection 以外の有効値 | 無効になる値の例 |
+|---|---|---|---|---|
+| CUDA/HIP (`engine/src/prefill`)・SYCL (`engine/sycl/src/prefill`)、FP16 I/O ではない場合 | `0` | `1` | `2`、`-1` など `atoi` 結果が非ゼロで `1` 以外 | 空文字、`0`、`0anything`、`true`、`false` |
+| 同じ経路で `f16_io` が有効な場合 | `0` | 無効 | 無効 | 設定値にかかわらず remainder は無効 |
 
-判定関数は最初の呼び出しで環境変数を読み、`static const int` に保存します。以後、プロセス内で環境変数を書き換えても設定は再読込されません。また各判定に `f16_io` が渡され、これが真なら `atoi` の結果にかかわらずモードを `0` として扱います（`src/prefill/prefill.cpp:323-342`、SYCL実装 `sycl/src/prefill/prefill.cpp:244-263`）。
+`atoi` は文字列全体の厳密な検証ではありません。先頭の空白と符号を許し、数値接頭部を変換するため、たとえば `" 1tail"` は `1`、`"2tail"` は `2`、数値接頭部のない文字列と空文字は `0` になります。したがって `"1anything"` は hyper-connection を含むモード、`"0anything"` は無効です。大文字小文字を判定する文字列比較はありません。`atoi` の表現可能範囲を超える入力の結果はこの実装で規定されていません。
 
 ## 有効になる条件
 
-- prefill の BF16 活性入力経路で有効です。HIP の `STRATA_HIP_PROMPT_F16` などにより、その stage が FP16 入出力（`f16_io`）を選んだ場合は無効です。FP16 活性値にはこの BF16 残差を適用しません（`src/prefill/prefill.cpp:1220-1225,323-342`）。
-- モード `1` では hyper-connection の down/up/inject などにも残差バッファを使います。モード `2` 以上や負の非0値では、一般の BF16 投影向け残差は有効ですが、hyper-connection 用の残差バッファは確保されず、hyper-connection 投影は対象外です（`src/prefill/prefill.cpp:1257-1258,2617-2668`）。
-- 有効値でも、対象経路で BF16 重み・活性値を使う投影にのみ作用します。native 重みの projection や他の GEMM 全般を一律に置き換える設定ではありません（`src/prefill/prefill.cpp:1983-1994,2692-2695,2718-2722,2944-2947`）。
-- 同じ判定とバッファ条件は SYCL 側にもあります（`sycl/src/prefill/prefill.cpp:244-263,1170-1171,2831-2881`）。
+- BF16 活性値を使う prefill の BF16 projection が実行される必要があります。CUDA/HIP 系と SYCL 系にはそれぞれ読み取り実装があります。Metal 側はこの名前を読みません（ソース全体の完全一致検索では、読み取りは `engine/src/prefill/prefill.cpp:893` と `engine/sycl/src/prefill/prefill.cpp:364` のみ）。
+- 各段の `f16_io` が false である必要があります。`f16_io` が true ならモード値にかかわらず `bf16x2_mode` は `0` を返します。HIP の FP16 prompt 経路は `prompt_f16()` が決め、`Prefill::init` が段ごとに `m.f16_io` へ設定します（`engine/src/prefill/prefill.cpp:2724-2729`、`engine/src/prefill/gemm.cu:681-699`）。SYCL の同じ初期化位置は `engine/sycl/src/prefill/prefill.cpp:1606-1611` です。
+- `f16_io` を有効にする要因は別環境変数 `STRATA_HIP_PROMPT_F16` とそのデバイス別既定値です。この場合は本変数が数値的に有効でも remainder 部分は使われません。CLI 引数や設定ファイルが本変数の値を上書きする経路は確認できません。
+- 対象の BF16 projection がモデル経路上で実行される必要があります。たとえば SSM alpha/beta、QSA indexer、MoE router、shared-expert gate、PLE key/value は mode が非ゼロのとき low-part バッファを使います。mode が `1` のときだけ hyper-connection の down/up/inject も low-part バッファを使います（`engine/src/prefill/prefill.cpp:2779-2780,5124-5157,5191-5192,5239-5240,5586,5654-5656`、SYCL の例: `engine/sycl/src/prefill/prefill.cpp:3459-3509,3541-3542,3574-3575,3925-3937`）。
 
 ## 実行時の詳細
 
-設定モードに応じて、prefill chunk 用の追加 device buffer を確保します。mode `1` は hyper-connection の `xn16_lo` / `lo16_lo` と一般投影用の `mixed_bf_lo`、mode `2` 等の非0値は `mixed_bf_lo` を確保します。必要な分の chunk サイズはメモリ必要量の見積もりにも加算されます（`src/prefill/prefill.cpp:1257-1258,1905-1907`）。
+環境変数を読む `bf16x2_mode` の `v` は関数内 `static const` です。初回呼び出し時の `getenv` / `atoi` 結果をプロセス内でキャッシュし、その後の環境変更は反映しません。mode の参照は prefill の workspace sizing と carve、および実際の projection 処理にあります（例: `engine/src/prefill/prefill.cpp:2255-2260,2779-2780,3746-3748`、`engine/sycl/src/prefill/prefill.cpp:1672-1673,2463-2465`）。そのため読み取りは初期化より前の sizing 呼び出しで起こる場合があります。
 
-float 活性値を BF16 へ変換するカーネルは高位 BF16 値に加え、要求された場合に低位残差を別バッファへ書きます（`src/prefill/kernels.cu:1727-1733,1840-1843`）。各対象 projection はまず高位 BF16 活性値と BF16 重みの GEMM を行い、低位バッファがあれば同じ重みに対して `beta=1` の GEMM を追加し、同じ出力へ加算します（`src/prefill/prefill.cpp:1989-1994`）。このため prefill の中間値、router の logits や選択結果を含む後続計算が変わり得ます。実装コメントも、残差込みなら router の選択が同じ入力の decode に近づく意図を記していますが、token や routing の同一性を保証するコード上の仕組みは確認できません。
+非 HC projection 用の low-part バッファは mode が非ゼロのとき確保され、HC 用の `xn16_lo` / `lo16_lo` は mode がちょうど `1` のときだけ確保されます。実行時は活性値を BF16 image と remainder に分け、通常の BF16 GEMM 後に remainder を同じ出力へ加算します。PLE では BF16 key weight がある場合に両方を GEMM し、key weight が native 型の場合は key projection 自体は native GEMM のままですが、value projection に remainder を加えます（`engine/src/prefill/prefill.cpp:5033-5045`）。router projection の結果は expert routing に渡されるため、丸め差が routing 結果に波及する可能性があります（同 `5584-5587`）。
 
-具体的な対象呼び出しには、hyper-connection の down/up/inject（`src/prefill/prefill.cpp:2638-2668`）、GDN の alpha/beta（同 `2692-2695`）、QSA indexer（同 `2721-2722`）、MoE router（同 `2944-2947`）、共有 expert gate（同 `3014-3016`）があります。PLE key/value の batched 経路も低位残差を使います（同 `2553-2577`）。設定値専用のログ出力や無効値の警告は、確認した実装にはありません。
+## ログと測定値
+
+この変数を直接報告するログ、専用の警告、専用の終了経路はありません。関連する BF16 projection が失敗を返した場合は既存の prefill 呼び出し元へ `false` が伝播しますが、この環境変数用のエラー文言はありません（例: `engine/src/prefill/prefill.cpp:5124,5155-5157,5191-5192`）。
+
+Strata の benchmark report は `STRATA_PREFILL_BF16X2=1` を「各 BF16 活性値に low part も加える旧経路」の比較基準として挙げていますが、ここではその結果を本変数の一般的な速度・品質効果として扱いません（`docs/bench-results/2026-10-04-rdna2-fp16-prompt/README.md:125-129,149-155`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:316-342` — 役割、既定値、mode 1/2、static cache、FP16 抑止。
-- `src/prefill/prefill.cpp:1257-1258,1905-1907` — 追加バッファの割当てとサイズ見積り。
-- `src/prefill/prefill.cpp:1989-1994` — 高位 GEMM と残差の加算 GEMM。
-- `src/prefill/kernels.cu:1727-1733` — BF16 活性値と低位残差の生成。
-- `src/prefill/prefill.cpp:2553-2577,2617-2675,2692-2695,2721-2722,2944-2947,3014-3016` — PLE、hyper-connection、GDN、indexer、router、shared gate での適用。
-- `sycl/src/prefill/prefill.cpp:238-263,1170-1171,2755-2779,2811-2881` — SYCL実装の同等箇所。
-
-`docs/DETAILS.md` と `README.md` には、この変数の利用者向け説明や性能測定値を確認できません。性能・精度の定量的な効果はここでは記載していません。
+- 値変換、既定値、mode `1` と `2` の分岐、FP16 I/O 抑制: `engine/src/prefill/prefill.cpp:885-898,998`、`engine/sycl/src/prefill/prefill.cpp:355-369,381`。
+- 初期化と段ごとの FP16 I/O 設定: `engine/src/prefill/prefill.cpp:2724-2729`、`engine/src/prefill/gemm.cu:681-699`、`engine/sycl/src/prefill/prefill.cpp:1606-1611`。
+- 追加バッファと実際の low-part GEMM: `engine/src/prefill/prefill.cpp:2779-2780,5033-5045,5124-5157,5191-5192,5239-5240,5586,5654-5656`、`engine/sycl/src/prefill/prefill.cpp:1672-1673,3459-3509,3541-3542,3574-3575,3925-3937`。
+- 関連資料の比較基準: `docs/bench-results/2026-10-04-rdna2-fp16-prompt/README.md:125-129,149-155`。

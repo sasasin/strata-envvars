@@ -1,41 +1,42 @@
 # `STRATA_SERVER_URL`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の状態は `## main...origin/main` で、未コミット変更はありません。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata の App Host が接続を試す Strata API worker の URL を指定します。指定先が Strata worker と確認できれば、App Host はそこを最初の推論バックエンドにします。URL を指定しない場合は `http://127.0.0.1:8095/v1` を使います。デスクトップアプリのホスト起動コードは、親プロセスでこの変数を Unicode 文字列として取得できた場合に子 Node ホストへ設定します（`apps/desktop/src-tauri/src/main.rs:487-491`）。この起動経路は Windows/macOS 向けです（同 `:495-501`）。
+App Host の推論ブリッジが、Strata の API worker を探す URL を指定する。`detectBackend()` はこの URL を最初に probe し、Strata worker と確認できればその `baseUrl` を使ってチャット要求を転送する。接続先そのものを起動したり、モデルをロードしたりはしない。worker が応答しない場合や Strata worker と確認できない場合は、supervisor 管理下の engine、既知の localhost OpenAI-compatible server、または build 設定に応じた unavailable/demo 経路へ進む（`app/host/server/inference.mjs:53-58,68-90,93-167,209-247`）。
 
 ## 値と判定
 
-| プロセス環境での値 | Strata の処理 |
-|---|---|
-| 未設定、空文字、空白だけ | `trim()` 後に空となるため既定値 `http://127.0.0.1:8095/v1`。 |
-| 空白以外の値 | 前後の空白を除き、末尾の `/` をすべて除去する。末尾が大文字小文字を区別して `/v1` ならそのまま、そうでなければ `/v1` を追加する。 |
-| URL として不正、応答なし、非 2xx の status 応答、または Strata worker と識別できない応答 | この変数の値自体を検証してエラー終了する処理はない。status probe の失敗は捕捉され、後続のバックエンド候補へ進む。 |
+App Host は `process.env.STRATA_SERVER_URL?.trim()` で前後の空白を除く。未設定または trim 後に空なら `http://127.0.0.1:8095/v1` を使う。値があれば末尾の `/` をすべて除き、結果が大文字小文字を区別して `/v1` で終わる場合はその値を使い、そうでなければ `/v1` を付け足す。URL parser による検証、scheme・host・port の検査、値全体の比較はない（`app/host/server/inference.mjs:20-21,53-58`）。
 
-根拠: `apps/host/server/inference.mjs:19-20,44-49,59-82`。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| App Host の URL 正規化 | `http://127.0.0.1:8095/v1` | trim と末尾 `/` 除去の後 `/v1` で終わる値はそのまま。それ以外は末尾に `/v1` を追加する。例: `http://127.0.0.1:9000` → `http://127.0.0.1:9000/v1`、`http://127.0.0.1:9000/v1///` → `http://127.0.0.1:9000/v1` | 値文字列として拒否される形式はコード上定義されていない。空文字および空白だけの値は unset と同じ既定値になる。 |
+
+したがって `1`、`true`、`false`、`0` に特別な真偽値の意味はなく、いずれも文字列 URL として処理され、通常はそれぞれ `/v1` が付く。大文字小文字は trim と末尾スラッシュ処理を除いて変換されない。たとえば `http://host/V1` は `/v1` と一致しないため `/v1` が追加される。空白は前後だけ除去し、内部の空白は検査しない。構文不正などで `fetch()` が失敗した場合、`probeStrata()` は `null` を返して次の backend 探索へ進む（`app/host/server/inference.mjs:55-58,68-90`）。
 
 ## 有効になる条件
 
-- Node の `apps/host/server` が推論ブリッジを使い、プロセス環境に値がある場合に評価されます。候補名の実際の参照は `apps/desktop/src-tauri/src/main.rs:489-490` と `apps/host/server/inference.mjs:46` です。その他の出現は同ファイルの説明コメントです。
-- URL が Strata worker として採用されるには、`/v1/status` が成功し、JSON object の `service` が文字列 `strata` である必要があります。`/models` の取得はモデル一覧の補足に使われ、失敗しても status が Strata と確認できていれば採用されます（`apps/host/server/inference.mjs:59-78`）。
-- Strata worker の probe が通らない場合、起動済みの Strata 管理エンジン、固定候補（llama.cpp、Ollama、LM Studio）の順に確認します。いずれも使えず `STRATA_REAL_ENGINE=1` または `STRATA_PACKAGED=1` の実行なら `unavailable` となり、デモ応答は使いません。それ以外の開発実行では demo backend に進み得ます。デスクトップの `host_command` は両 real-engine 変数を `1` に設定します（`apps/host/server/inference.mjs:38-42,84-157`; `apps/desktop/src-tauri/src/main.rs:469-473`）。
-- CLI 引数や別の環境変数でこの URL を上書きする処理は、対象ソース内では見つかりませんでした。`STRATA_SERVER_URL` 自体に優先されるのは、上記の Strata worker probe が成功するかどうかであり、失敗時には別バックエンド選択へ移ります。
+- App Host の推論ブリッジを通る推論経路で参照される。起動時に `detectBackend({ force: true })` が一度走り、チャットの `streamChat()` からも `detectBackend()` が呼ばれる（`app/host/server/index.mjs:306-314,732-767`; `app/host/server/inference.mjs:93-100,209-223`）。
+- 指定先が `/v1/status` に成功応答し、JSON object の `service` が文字列 `strata` と完全一致すると、Strata backend として採用される。条件を満たさない、HTTP が成功しない、JSON が読めない、または fetch が失敗する場合は採用されず、他 backend の探索へ進む（`app/host/server/inference.mjs:68-90,93-117`）。
+- 指定先が Strata worker と認識されても、モデル一覧取得は採用条件ではない。`/models` の応答から `data[].id` を backend 情報に入れるが、取得失敗時は空一覧になる。`/status` の `model` がなければ chat 要求の model id は `strata` になる（`app/host/server/inference.mjs:75-86,212-223`）。
+- URL probe が失敗した場合、すでに動作中の supervisor engine があればそちらが優先される。その次に、既知の localhost 候補（llama.cpp、Ollama、LM Studio）が探索される。URL はこれらを無効化する専用・排他的な指定ではない（`app/host/server/inference.mjs:23-27,93-139`）。
+- Strata URL と他 backend が見つからない場合の最後の扱いは `STRATA_REAL_ENGINE` / `STRATA_PACKAGED` に依存する。real engine 必須なら `unavailable`、そうでなければ demo backend になる。`STRATA_FORCE_DEMO=1` は packaged build 以外で real engine 必須判定を解除する。この条件は URL の優先順位ではなく、すべての probe が失敗した後の fallback を変える（`app/host/server/inference.mjs:40-50,142-166`）。
+- Windows/macOS の Tauri shell は、起動時に親プロセスの `STRATA_SERVER_URL` を `std::env::var` で読み、取得できれば App Host の `Command` に同じ値を設定する。`std::env::var` が成功しない場合はこの明示設定を行わない（`app/desktop/src-tauri/src/main.rs:503-551,554-560`）。
 
 ## 実行時の詳細
 
-`detectBackend()` はまず `strataUrl()` で URL を組み立て、status endpoint を最大 900 ms で確認します。応答が 2xx で、JSON の `service` が `strata` のときに限り Strata backend として記録し、その `/models` から model ID を収集します。status の通信・JSON parse 失敗は `probeStrata()` 内で `null` になります（`apps/host/server/inference.mjs:59-90`）。
+Rust shell の forwarding は App Host 起動時に一度行われる。App Host 側の `strataUrl()` は `detectBackend()` が呼ばれるたびに環境変数を読み直し、関数内やモジュール内に URL の cache はない。したがって App Host プロセス内で環境値が変更されれば次の probe で参照される。一方、`detectBackend()` は Strata probe の失敗後に backend を最大 20 秒再利用する経路を持つため、変更後の Strata probe が失敗した場合に fallback backend の表示・選択が直ちに更新されるとは限らない。`force: true` はこの fallback cache を迂回する（`app/host/server/inference.mjs:37-38,53-58,93-120`）。
 
-ホスト起動時に `apps/host/server/index.mjs:278` が `detectBackend({ force: true })` を呼び、その結果を `inference · ...` の起動ログに出します（同 `:280-284`; 表示文字列は `apps/host/server/inference.mjs:532-536`）。チャット推論では `streamChat()` が改めて `detectBackend()` を呼ぶため、URL は各呼び出しで再評価されます（同 `:84-86,199-205`）。値の parse 結果を static cache する実装はありません。なお、バックエンド状態は別途保持されます。Strata probe と管理エンジン確認の後、候補の再確認を最大 20 秒省く経路があります（同 `:28-29,98-110`）。
+Strata worker として採用されると、チャット要求は `${baseUrl}/chat/completions` に POST される。probe 時には `${baseUrl}` から `/v1` を除いた URL の `/v1/status` と、`${baseUrl}/models` を GET する。probe 先が不正または応答しない場合は Strata worker としては採用されず、後続探索または fallback に移る（`app/host/server/inference.mjs:68-90,212-223,251-279`）。
 
-Strata worker が採用されると `/v1/chat/completions` に streaming POST します。HTTP が成功しない、または body がない場合は `Engine responded <status>` の Error を投げます（`apps/host/server/inference.mjs:199-234,239-267`）。Strata worker を含む全候補がなく real-engine が必須の場合は `No Strata engine answered at <URL> ... Simulated output is disabled in this build.` を error として返します（同 `:131-143,199-234`）。起動時には backend 名または `No Strata engine` 等が `inference · ...` に表示されます（同 `apps/host/server/index.mjs:278-284`; `apps/host/server/inference.mjs:532-536`）。probe の接続失敗そのものに対する専用 warning はありません。
+real engine 必須の状態ですべての backend が見つからない場合、backend の `error` に `No Strata engine answered at <正規化後URL> and no supervised engine is running. Start Strata (or load a model) and retry. Simulated output is disabled in this build.` が入る。チャットはこの error を例外にし、要求処理が `type: 'error'` frame として返す。起動時ログは `inference · ...` 行に backend 名または Control の engine 状態を出し、health endpoint は `currentBackend()` を返す（`app/host/server/inference.mjs:142-154,241-244,546-550`; `app/host/server/index.mjs:308-314,785-796,1407-1415`）。
 
 ## 根拠
 
-- デスクトップ親プロセスから子ホストへの値の受け渡しと Windows/macOS の起動経路: `apps/desktop/src-tauri/src/main.rs:487-501`
-- URL の既定値・正規化: `apps/host/server/inference.mjs:19-20,44-49`
-- Strata worker の照合と timeout: `apps/host/server/inference.mjs:59-82`
-- backend の優先順位・cache・real-engine 時の unavailable 分岐: `apps/host/server/inference.mjs:84-157`
-- 起動時 probe / ログ、推論からの再 probe、real backend の選択: `apps/host/server/index.mjs:278-284`; `apps/host/server/inference.mjs:199-234`
-- 推論 POST と HTTP 失敗: `apps/host/server/inference.mjs:239-267`
+- `app/desktop/src-tauri/src/main.rs:501-551,554-560` — App Host 起動コマンドと環境変数の引き渡し。
+- `app/host/server/inference.mjs:20-27,37-38,53-58` — 既定 URL、候補、cache 状態、値の正規化。
+- `app/host/server/inference.mjs:68-120,142-167` — Strata worker の probe、採用・fallback・cache。
+- `app/host/server/inference.mjs:209-247,251-279` — 推論経路の選択と HTTP 転送。
+- `app/host/server/index.mjs:306-314,732-767,785-796,1407-1415` — 起動時判定、チャット要求、エラー frame、health 応答。

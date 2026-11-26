@@ -1,60 +1,58 @@
 # `STRATA_PIPE_ADAPT_EVERY`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-複数 GPU の layer split で `--serve` と `--batch-groups` 2以上を使うパイプライン経路において、適応 VRAM expert tier の swap round を何 group window ごとに開始するかを指定します。未設定時は、このパイプライン経路は独自の round を開始しません。正値を設定すると、指定数の group window が完了した後に新しい group の開始を止め、進行中の group を完了させてから一度 round を実行します。
+`--serve` の multi-GPU layer split で、`--batch-groups` による pipelined slot groups を使うとき、VRAM expert tier の適応ラウンドを何 group windows ごとに実行するかを指定する。既定は無効（0）で、通常の pipelined loop は独自の適応ラウンドを開始しない。正の値を指定すると、指定数の group windows が完了した後に新しい group の開始を止め、実行中の group を完了させてから適応ラウンドを実行する。`auto` は初期間隔 32 から始め、ラウンドで移動した expert 数に応じて間隔を調整する。対象は `engine/src/program/generate.cpp` の pipelined loop と `engine/include/strata/program/batch_groups.hpp` の判定 helper（`pipe_adapt_every`、`pipe_adapt_due`、`pipe_adapt_next`）。
 
-この変数は適応 tier 自体を有効にしません。`--adapt-every` と `--adapt-swaps` が正で、モデル全体が VRAM 常駐ではないなど、Strata の既存適応 tier が利用可能なことが必要です。`--adapt-async 1` を使う場合、この変数による blocking round は行いません。
+この変数は適応 tier 自体を有効化する設定ではない。`--adapt-every` と `--adapt-swaps` が正で、VRAM に全 expert が載っていないなどの条件を満たして tier が有効な場合にだけラウンドを実行できる。起動時の案内ログは `--serve`、batch、複数 group、multi-GPU の条件下だけで出る（`engine/src/program/generate.cpp:11813-11826`、`15001-15002`、`17529-17533`）。
 
 ## 値と判定
 
-値は `std::getenv()` で取得し、共通 helper が `std::atoi()` で変換します。変換結果が正の場合だけその整数を interval として使い、それ以外は無効（0）です。文字列全体の妥当性検査や警告はありません。
+`generate.cpp` は環境値を `std::getenv` で取得し、helper は `auto` だけを文字列全体で `std::strcmp` 比較する。それ以外は `std::atoi` の結果が正ならその整数を group-window 間隔として使い、0 以下なら無効にする。厳密な数値文字列検査や上限 clamp はない。`atoi` が読む先頭の空白や符号、数値以降の文字列の扱いに従う（例えば `" 12tail"` は 12、`"0anything"` と `"off"` は 0）。`auto` は小文字の完全一致だけで、大文字小文字を区別する。整数範囲を超える入力の扱いはこの実装で検査されない（`engine/include/strata/program/batch_groups.hpp:29-39`）。
 
-| 環境値 | 判定 |
-| --- | --- |
-| 未設定 | 0（無効） |
-| 空文字 | `atoi` 結果 0（無効） |
-| `0`、負数、数字で始まらない文字列 | 0 以下または 0（無効） |
-| 正の整数文字列（例: `8`, `+8`, ` 8`) | その正の整数を group window interval にする |
-| 数字の後ろに文字が続く文字列（例: `8x`) | `atoi` が先頭の整数を変換するため interval 8 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 共通 | 0（無効） | `"auto"`（初期値 32）、`"1"`、`"128"` など `atoi` の結果が正の値 | 空文字、`"0"`、`"-5"`、`"off"`、`"AUTO"`、`"0anything"` など `atoi` が 0 以下を返す値 |
 
-範囲外の値を `int` に変換した場合の結果は、この実装で保証されません。値を読むときに CLI 引数や設定ファイルで上書きする処理はありません。`--adapt-every` は環境変数の値を置き換える指定ではなく、適応 tier が動作可能かを決める別の条件です。
+`--adapt-every` は適応 tier の有効化・通常の batch window 側の間隔を決め、`STRATA_PIPE_ADAPT_EVERY` は pipelined loop 側の group-window 間隔を決める。どちらかが他方の値を上書きする仕組みではない。`--adapt-every 0` または `--adapt-swaps 0` なら環境変数が正値でも tier が無効である。`--adapt-swaps` は1回の適応で選べる上限にも使われる。CLI 値の parse 箇所は `engine/src/program/generate.cpp:4058,4202`、起動時に tier usage を用意する条件は `15001-15002` にある。
 
 ## 有効になる条件
 
-実際に round が開始されるには、すべての条件が揃う必要があります。
+- 実行経路が `--serve` で、batch が正、`--batch-groups > 1`、複数 GPU の layer split であること。pipelined loop 自体も batch、複数 group、複数 stage を条件にする（`engine/src/program/generate.cpp:11815-11817,17529-17533`）。
+- 適応 tier が有効であること。少なくとも `--adapt-every > 0`、`--adapt-swaps > 0`、全 expert が VRAM 常駐ではなく GPU cache slot がある場合に usage 配列が用意され、loop は `!drive.d.usage.empty()` を tier 有効条件としている（`engine/src/program/generate.cpp:14932-14933,15001-15002,18018-18027`）。適応の swap 候補は使用量、常駐状態、最小 gain、`--adapt-swaps` 上限などでも絞られる（`15349-15379`）。
+- `--adapt-async` の job が動いていないこと。`pipe_adapt_due` は async tier 中に false を返す（`engine/include/strata/program/batch_groups.hpp:62-76`、`engine/src/program/generate.cpp:18018-18027`）。また `--adapt-async 1` は pipelined groups と併用できない経路として起動時に無効化理由が出る（`engine/src/program/generate.cpp:11796-11811`）。
+- Slot groups の横で prompt read が進行中でないこと、前回 swap のコピーが未完了でないこと。どちらも round の開始を保留する（`engine/include/strata/program/batch_groups.hpp:62-76`）。
+- `STRATA_ADAPT_MID` は中程度の cache coverage で `--adapt-every` / `--adapt-swaps` の既定値を調整し得る。`STRATA_TINY_CACHE` は小さい cache の swap 数を調整し得る。これらはこの変数の値を変更せず、tier の有効性や1 round の swap 数に影響し得る（`engine/src/program/generate.cpp:14943-14975`）。`STRATA_CACHE_PIN_FRAC` 等による pinning も選択可能な cache entry に影響する（`14976-14999,15364-15379`）。
 
-- serve の batch 経路が複数 GPU の layer split 上でパイプライン実行されること（`--batch` が正、`--batch-groups` が2以上、stage 数が1以上）。
-- 変換後の interval が正であること。
-- 適応 tier の usage table が存在すること。Strata は `--adapt-every > 0`、`--adapt-swaps > 0`、かつ全 expert が VRAM 常駐でない場合に usage table を作ります。
-- `--adapt-async 1` が動作中でないこと。
-- prompt read が slot と並行していないこと。
-- 前の round の swap copy が pending でないこと。
-- interval 以上の group window が前回の round 以後に完了していること。
-
-prompt read 中は round を延期します。適応 tier が無効な場合、値が正でも round は実行されません。開始時の案内ログは `--serve`、`--batch > 0`、`--batch-groups > 1`、複数 GPU の条件で正値を検出したときに出ますが、適応 tier が無効なら `- but the adaptive tier is off` が付きます。
+条件を満たさない場合、この値は pipeline の適応を発生させない。起動案内では `--adapt-every` または `--adapt-swaps` が無効なら ` - but the adaptive tier is off` が付く（`engine/src/program/generate.cpp:11818-11826`）。
 
 ## 実行時の詳細
 
-環境変数は Strata の起動処理で一度、適用条件付きの案内ログ用に読み、パイプライン loop の初期化時にもう一度読みます。helper は値を static cache しません。loop 内の値は request ごとではなく、そのパイプライン loop の間使われます。
+起動案内用に条件付きで1回読み、pipelined loop の初期化時に再度 `getenv` して `pa_auto` と `pipe_adapt_every` に保持する。loop 中に環境を読み直す処理はなく、この値の実行中変更は反映されない（`engine/src/program/generate.cpp:11815-11826,18014-18017`）。static cache ではなく、当該 loop のローカル状態として保持する。
 
-完了した group window ごとに counter が増えます。round が due になると stage 0 に次の group を割り当てず、すでに in-flight の group を進めます。pipeline が空になった時点で `adapt()` を呼び、適応 tier の usage と residency をもとに候補 expert と退避 expert を選びます。差が `--adapt-min-gain` 未満の swap は除外され、round あたりの swap 数は `--adapt-swaps` で制限されます。copy の完了と residency table 更新を待ってから次の launch に進みます。round 後に interval counter の基準を更新し、次の周期を数えます。
+固定の正値 `N` では、完了済み group windows 数が前回 round から `N` に達すると新しい stage 0 group を開始せず、in-flight group がなくなったところで `snapshot_usage` と `adapt` を実行する。adaptive refill が失敗すると stdout に `ERR an adaptive refill failed` を出して処理を失敗終了する。round 後は `apply_pending(true)` で swap copy を待って cache table を更新し、次の group launch に進む（`engine/include/strata/program/batch_groups.hpp:73-76`、`engine/src/program/generate.cpp:18118-18120,18135-18138,18330-18347`）。
 
-観測できる出力:
+`auto` は 32 windows で開始し、round の swap 数が `--adapt-swaps` の 75% 以上なら間隔を半分（下限32）、25% 以下なら倍（上限256）、中間なら据え置く。閾値判定には整数演算 `swaps * 4` と `cap * 3` / `cap` を使う（`engine/include/strata/program/batch_groups.hpp:26-29,51-59`、`engine/src/program/generate.cpp:18341-18345`）。
 
-- 起動時 stderr: `strata batch: STRATA_PIPE_ADAPT_EVERY=N: ...`。適応 tier が無効なら上記の補足が付きます。
-- pipelined batch の stderr 集計: `adaptive tier (STRATA_PIPE_ADAPT_EVERY): ... rounds, ... experts swapped in, ... ms`。この集計は batch の処理区間が終了した時に出ます。
-- adaptive refill が失敗すると stdout に `ERR an adaptive refill failed` を出して pipelined 処理が失敗し、serve loop は終了コード 1 を返します。
+## ログと測定値
+
+適用条件を満たす `--serve` 起動時、stderr に次のいずれかを出す。tier が無効なら括弧書きの補足が続く（`engine/src/program/generate.cpp:11818-11826`）。
+
+- auto: `strata batch: STRATA_PIPE_ADAPT_EVERY=auto: the pipelined groups run an adaptive-tier round every %d to %d group windows, more often while the rounds find experts to move (the pipeline empties for each)%s`
+- 正値: `strata batch: STRATA_PIPE_ADAPT_EVERY=%d: the pipelined groups run an adaptive-tier round every %d group windows (the pipeline empties for it)%s`
+
+pipelined batch の timing 行には、有効値なら `; adaptive tier (STRATA_PIPE_ADAPT_EVERY%s): %lld rounds, %lld experts swapped in, %.0f ms%s` が追加される。`auto` の場合は末尾に現在の間隔が付く。0 相当では起動案内・timing 行の適応情報は出ない（`engine/src/program/generate.cpp:18360-18371`）。適応 refill 失敗時は stdout の `ERR an adaptive refill failed` で loop が失敗する（`18334-18339`）。
+
+`docs/BATCHING.md:425-440` は同じ pipeline drain・prompt read 中の停止・`--adapt-async 1` との関係、および2x RTX 5090、layer split 25、Swift-Qwen3.8-Flash-Next IQ3_S、`--batch 6 --batch-groups 2`、resident experts、profile-filled cache、`--adapt-every 16`、6 streams × 1,024 greedy tokens、8 bursts、各設定2 fresh engines の測定表を記載する。これは資料上の条件付き測定であり、この調査で再測定していない。コードでは `auto` も実装されており、資料の `N` 表記より値判定の詳細は helper に従う。
 
 ## 根拠
 
-- 値変換: `include/strata/program/batch_groups.hpp:24-30`。周期成立条件: `include/strata/program/batch_groups.hpp:32-45`。
-- 起動時の条件付き読み取りと案内ログ: `src/program/generate.cpp:9064-9071`。
-- 適応 tier が有効な場合の usage table 作成: `src/program/generate.cpp:11181-11182`。
-- パイプライン条件、2回目の読み取り、runtime の due 判定入力: `src/program/generate.cpp:13012-13016,13223-13243`。
-- window の完了計数と due の間は stage 0 の新 group を止める処理: `src/program/generate.cpp:13332-13335,13338-13350`。
-- pipeline drain 後の round、失敗出力、swap 適用、集計: `src/program/generate.cpp:13437-13448,13461-13471`。
-- swap 選定と上限: `src/program/generate.cpp:11455-11481`。
-- 既存資料の説明と測定条件: `docs/BATCHING.md:389-425`。2x RTX 5090、記載のモデル・設定・負荷に限定された rows/s 測定であり、ここでは再測定していません。
+- `engine/include/strata/program/batch_groups.hpp:26-39` — `auto`、`atoi`、既定値と固定間隔の判定。
+- `engine/include/strata/program/batch_groups.hpp:51-76` — auto 間隔の調整規則と round 開始条件。
+- `engine/src/program/generate.cpp:11813-11826` — 起動条件、環境読み取りと stderr 案内。
+- `engine/src/program/generate.cpp:14932-15002` — adaptive tier の coverage / CLI 条件と usage 配列。
+- `engine/src/program/generate.cpp:15349-15379` — 適応 refill と swap 選定。
+- `engine/src/program/generate.cpp:17529-17533,18014-18027,18118-18120,18135-18138,18330-18347,18360-18371` — pipelined path、loop 内の値保持、適用・失敗・結果ログ。
+- `docs/BATCHING.md:411-440` — 実装説明と条件付き測定資料。

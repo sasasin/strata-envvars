@@ -1,46 +1,43 @@
-# STRATA_SLOT_CKPT_KV_DIRECT
+# `STRATA_SLOT_CKPT_KV_DIRECT`
 
-調査対象: Strata main の HEAD 73d4f4196c25a65e02f6b9ef25d354826ce55105（2026-11-23 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-バッチ処理でスロットから会話のターン checkpoint を復元するとき、checkpoint の実行状態を復元した後の K/V をスロットの GPU 上の session state からメイン session state へ直接コピーする経路を選びます。これによりこの分岐では K/V を ConversationKv のホスト image に保存してから復元する手順を通りません。通常の会話内容や checkpoint 選択を変える設定ではありません（engine/src/program/generate.cpp:16861-16886,16888-16911）。
+バッチ slot に保存された turn checkpoint から会話を再開するとき、checkpoint の実行状態に加えて K/V を slot の state pool から main session へ直接コピーする経路を選ぶ。対象は `engine/src/program/generate.cpp` の `copy_from_slot` で、既定の host image 経由を使う経路から切り替わる。これはコピー経路の選択であり、値だけでは有効にならず、`STRATA_SLOT_COPY_DIRECT` も有効でなければならない（`engine/src/program/generate.cpp:16868-16872, 16967-16993`）。
 
 ## 値と判定
 
-copy_from_slot 内の関数内 static const bool 初期化で std::getenv の値を一度読み、値が存在し、空でなく、先頭文字が '0' 以外なら有効です。文字列全体の parse や数値変換はしません。空白の trim、大文字小文字の判定、後続文字の検査もありません（engine/src/program/generate.cpp:16867-16870）。
+`copy_from_slot` 内の関数ローカル `static const bool` が、最初にその経路へ到達したとき `std::getenv` で読み取る。未設定 (`nullptr`) と空文字は無効。設定されている場合は先頭文字だけを見て、`'0'` 以外なら有効とする。文字列全体の parse、数値変換、大文字小文字変換、空白除去はない（`engine/src/program/generate.cpp:16973-16976`）。
 
-| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| 実行経路 | unset | 有効になる値の例 | 無効になる値の例 |
 |---|---|---|---|
-| CUDA/HIP の非 Metal バッチ復元経路 | 無効。checkpoint K/V は従来の image save/restore 経路 | 1, true, false, x,  0（空白始まり） | 空文字、0, 00, 0anything |
+| Metal 以外の slot checkpoint restore | 無効 | `1`, `true`, ` 0`, `00x` | 空文字, `0`, `0anything` |
+| Metal の slot restore | この変数を読まない | 該当なし | 該当なし |
 
-値に境界値や数値の範囲はありません。CLI 引数による値の上書きはなく、適用には別途 STRATA_SLOT_COPY_DIRECT が有効である必要があります（下記）。STRATA_SLOT_COPY_DIRECT が無効ならこの変数だけでは経路を切り替えません（engine/src/program/generate.cpp:16763-16766,16871-16873）。
+Metal の場合は `copy_from_slot` がこの環境変数を読む箇所より前に `window_slot_copy_main` を呼んで戻る（`engine/src/program/generate.cpp:16958-16976`）。
 
 ## 有効になる条件
 
-- この読み取りと分岐は Metal の STRATA_GPU_METAL 分岐の後にあり、同じ設定登録情報も backend を cuda-hip としています。したがって対象は CUDA/HIP のバッチ復元コードです。Metal は専用の window_slot_copy_main 経路を通ります（engine/src/program/generate.cpp:16757-16766,16852-16860; terminal/data/settings-register.json:42540-42550）。
-- 対象は --batch のスロットから会話状態を戻す経路です。リクエスト選択では o.prompt_cache > 0、画像入力なし、互換する cvec の idle/cached slot が条件です。active slot の checkpoint を候補にするには STRATA_SLOT_CKPT_MOVE が有効で、slot が tainted でなく、drafting 条件も満たす必要があります（engine/src/program/generate.cpp:19216-19235）。
-- この変数の効果が出るのは、選ばれた slot restore が checkpoint を指定する場合（at != nullptr）かつ STRATA_SLOT_COPY_DIRECT が有効な場合だけです。slot 全体の末尾から戻す場合（at == nullptr）は STRATA_SLOT_COPY_DIRECT の直接コピー分岐を使い、この変数は分岐選択に関与しません（engine/src/program/generate.cpp:16871-16873）。
-- STRATA_SLOT_COPY_DIRECT も未設定・空文字・先頭が 0 なら無効、それ以外なら有効です。両方の値は初期化時に一度だけ読み取られます（engine/src/program/generate.cpp:16763-16766,16867-16870）。
-- checkpoint restore に失敗した場合、設定値にかかわらず checkpoint 経路は完了しません。呼び出し側は slot の状態を破棄して prompt を先頭から読み直します（engine/src/program/generate.cpp:19757-19770）。
+- サーバーのバッチ slot から prompt-cache state を再利用し、その slot の turn checkpoint (`at != nullptr`) を使う必要がある。slot source の候補選択は `--prompt-cache` が有効で、画像入力がなく、control vector が一致する経路に限られる。idle slot は cached であること、active slot は未 tainted で `STRATA_SLOT_CKPT_MOVE` が有効であることなどの条件もある（`engine/src/program/generate.cpp:19310-19341`）。
+- `STRATA_SLOT_COPY_DIRECT` も有効であること。これは同じく未設定・空文字・先頭が `0` の値を無効、それ以外の設定値を有効とする（`engine/src/program/generate.cpp:16868-16872`）。どちらかが無効なら checkpoint の実行状態と K/V は従来の save/restore image 経由でコピーされる（`engine/src/program/generate.cpp:16977-17017`）。
+- slot の最後の状態 (`at == nullptr`) を戻す場合、この変数は経路選択に関与しない。`STRATA_SLOT_COPY_DIRECT` が有効なら `direct_slot_copy`、そうでなければ image 経由になる（`engine/src/program/generate.cpp:16977-16993`）。
+- Metal では専用の `window_slot_copy_main` 経路を通るため、この変数の判定は使われない（`engine/src/program/generate.cpp:16963-16965`）。
+- CLI 引数や別設定がこの値を上書きする処理はない。`STRATA_SLOT_COPY_DIRECT` は追加の必須条件である。
 
 ## 実行時の詳細
 
-STRATA_SLOT_COPY_DIRECT と本変数はそれぞれ関数内 static に保存されます。前者はバッチ slot copy 用コードの実行時、後者は copy_from_slot が最初に呼ばれて宣言に到達したときに初期化され、そのプロセス内では再読込されません。起動後の環境変更は反映されません（engine/src/program/generate.cpp:16763-16766,16852-16870）。
+有効な checkpoint restore では、各 stage について slot session の checkpoint state を main session に復元し、続けて各 QSA state の K/V を checkpoint の token 数 (`upto`) まで `conversation_kv_copy` でコピーする。コピー元は slot の pool、コピー先は main session の pool。core 側では両者の layout を検証し、K/V の data・scale・pooled buffer と residency state をコピーまたは更新する（`engine/src/program/generate.cpp:16979-16992`; `engine/src/core/conversation_snapshot.cpp:625-661`）。checkpoint の state 復元は `conversation_checkpoint_restore` が行う（`engine/src/core/conversation_state.cpp:417-465`）。
 
-checkpoint 指定かつ両設定が有効なら、各 stage で対象 device を同期し、対応する checkpoint（stage 0 は *at、後続 stage は at->stage_parts）の実行状態を復元します。その後、slot session の各 QSA state からメイン session の対応する QSA state へ、checkpoint の token 数 upto まで conversation_kv_copy(..., true, ..., false) で K/V をコピーし、再度 device を同期します。対して本変数が無効の場合は各 stage で checkpoint を復元したうえ、K/V を conversation_kv_save で image 化し、conversation_kv_restore で戻す従来経路です（engine/src/program/generate.cpp:16855-16856,16873-16911）。
+環境変数の値は関数ローカル `static` に保存され、最初に `copy_from_slot` が非-Metal の該当箇所へ到達した後はプロセス内で再評価されない。実行中に環境を書き換えても反映されない。子プロセスへの転送・上書き処理はこの読み取り箇所にはない（`engine/src/program/generate.cpp:16973-16976`）。
 
-この分岐は checkpoint の実行状態を復元する処理を省略せず、K/V コピー方法だけを変えます。成功時は slot の token 数まで戻し、request path が slot の会話を再利用します（engine/src/program/generate.cpp:16879-16885,19770-19783,19826-19843）。
-
-## ログと測定値
-
-この環境変数の有効・無効を知らせる専用ログはありません。復元処理が失敗すると stderr に「strata batch: restoring slot %d failed (%s); reading the prompt」を出し、live state と checkpoint をクリアして prompt を読み直します。同期失敗時の error は「batch slot restore: device sync failed」です。別の checkpoint restore / K/V copy が失敗した場合は、その処理が設定した error 文字列が同じ stderr 行に含まれます（engine/src/program/generate.cpp:16878-16885,16892-16911,19760-19770）。本変数について、条件付きの測定値を示す Strata 資料は確認できません。
+同期、checkpoint 復元、K/V copy のいずれかが失敗すると `copy_from_slot` は失敗を返す。呼び出し側は `strata batch: restoring slot %d failed (%s); reading the prompt` を stderr に出し、状態をクリアして prompt を先頭から読み直す（`engine/src/program/generate.cpp:19863-19875`）。成功時は後続で `strata batch: slot %d gave back %lld tokens of this conversation (%s) in %.1f ms` を stderr に出し、checkpoint から戻した場合は `its turn checkpoint` と表示する（`engine/src/program/generate.cpp:19932-19949`）。対象変数の有効・無効を直接示すログはない。
 
 ## 根拠
 
-- engine/src/program/generate.cpp:16763-16766 — 連携する STRATA_SLOT_COPY_DIRECT の値判定。
-- engine/src/program/generate.cpp:16852-16870 — 対象変数の読み取りと checkpoint restore の分岐。
-- engine/src/program/generate.cpp:16871-16911 — 直接コピー経路と従来の image 経路。
-- engine/src/program/generate.cpp:19216-19235 — slot/checkpoint の候補条件。
-- engine/src/program/generate.cpp:19757-19783,19826-19843 — restore 失敗時の再読込と成功後の状態処理。
-- terminal/data/settings-register.json:42540-42550 — 設定登録上の backend と読み取り位置。
+- `engine/src/program/generate.cpp:16957-16993` — slot restore、Metal 分岐、環境変数判定、直接コピーと image 経路。
+- `engine/src/program/generate.cpp:19310-19341` — slot と turn checkpoint の候補条件。
+- `engine/src/program/generate.cpp:19863-19875, 19932-19949` — 失敗時の prompt 再読込と成功時のログ。
+- `engine/src/core/conversation_state.cpp:417-465` — checkpoint state の復元。
+- `engine/src/core/conversation_snapshot.cpp:625-661` — K/V と residency の直接 copy。
+- `docs/BATCHING.md:115-123` — batching のコピー系 opt-in switch の説明。対象変数固有の条件は上記実装に基づく。

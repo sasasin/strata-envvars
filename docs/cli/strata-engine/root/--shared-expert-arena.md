@@ -1,65 +1,60 @@
-# `--shared-expert-arena`
+# `strata generate --shared-expert-arena`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。調査開始時の作業ツリーは `## main...origin/main` で、変更表示はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（推論エンジンの引数 parser） |
+| コマンド | `strata generate`（エンジン引数） |
 | オプション | `--shared-expert-arena` |
 | 別名 | なし |
-| 値 | arena backing に使うファイルパスを1つ指定 |
+| 値 | resident expert arena の共有 backing file のパス（Linux） |
 
 ## 役割
 
-Linux で resident expert arena の backing を匿名メモリではなく `MAP_SHARED` のファイルにし、複数の Strata プロセスが同じファイルをマップできるようにします。engine の help は `/dev/shm` のような tmpfs を案内し、通常の SSD 上には置かないよう記しています（`src/program/generate.cpp:1063-1065`）。共有ファイルには4 KiBの識別ヘッダーが付き、その後ろが arena 本体です（`src/core/pinned.cu:89-91,158-159,223-234`）。
+resident expert arena の backing にファイルの共有マッピングを使います。同じモデルを読む複数の engine process が同じ backing を指定すると、先行 process が expert を読み込み、後続 process はロード状態を見て読み込みを省略できます。help は Linux 用として説明し、`/dev/shm` 上のファイルを例示しています（`engine/src/program/generate.cpp:1483-1485`）。
 
 ## 使い方
 
 ```sh
-strata generate --pack pack/full --tokens "1,2,3" \
-  --shared-expert-arena /dev/shm/strata-experts.arena
+# Linux: 同じ pack を使う複数の engine process に、同じ共有 backing のパスを渡す
+strata generate --pack /path/to/pack --tokens "1,2,3" \
+  --shared-expert-arena /dev/shm/strata-experts.bin
 ```
 
-`--tokens` は事前トークン化済み入力です。例のパスは共有用ファイルとして新規作成または再利用され、モデルの expert arena とほぼ同じ大きさの領域を必要とします。engine の usage とオプション説明は `src/program/generate.cpp:806-810,1063-1065` にあります。
+`--pack` と token 入力は generate の基本引数です。モデル・pack の指定方法に合わせて例を調整してください。
 
 ## 値と既定値
 
-- parser は次の argv を文字列として受け取り、数値・パス形式・空文字を検証しません。省略時は空文字で、通常の arena backing を使います（`src/program/generate.cpp:536-538,2754-2756`）。
-- 値を省略すると `--shared-expert-arena needs a value` を stderr に出して終了コード2になります（`src/program/generate.cpp:2418-2420`）。値に空文字 `""` を明示した場合も空文字として扱われ、共有ファイル backing は有効になりません。複数回指定時は parser の走査で最後の値が残ります（`src/program/generate.cpp:2416-2420,2755`）。
-- 相対パスはプロセスの作業ディレクトリ基準です。パスはそのまま `open()` に渡されます（`src/core/pinned.cu:158-161`）。
+値は必須です。parser は次の argv 要素を文字列としてそのまま保存し、パス形式や空文字列の検証はしません。同じオプションを複数回指定した場合は後の値で置き換わります。未指定時は空文字列で、共有 backing を使わず通常の resident arena を確保します。値を省略すると stderr に `--shared-expert-arena needs a value` を出して終了コード 2 で終わります（`engine/src/program/generate.cpp:874,3842-3847,4217-4220`）。
 
 ## 実行時の動作
 
-- オプション値が空でない場合、通常の resident arena 初期化から `ArenaExpertSource::open()` に渡され、`PinnedArena` が共有ファイルの予約を行います（`src/program/generate.cpp:5905-5913`, `src/core/expert_source.cpp:5867-5878`）。
-- Linux ではファイルを `O_RDWR | O_CREAT | O_CLOEXEC`、mode `0600` で開きます。サイズ0のファイルは `ftruncate()` でヘッダーと arena 分のサイズにし、識別ヘッダーを書き込みます。既存ファイルは期待サイズ、magic/version、arena サイズ、pack hash が一致しないと拒否されます（`src/core/pinned.cu:149-219`）。
-- pack hash は expert geometry、pack の `manifest.json` / `index.txt` / `native_experts.txt`、および `experts.bin` または参照 GGUF のサンプルを使って作られます（`src/core/expert_source.cpp:5389-5423`）。これは別 pack の backing を取り違えないための照合です。既存 arena の中身を読み込み済みキャッシュとして再利用する処理はなく、通常の arena load が expert データを書き込みます（`src/core/expert_source.cpp:5880-5925`）。
-- マップは `PROT_READ | PROT_WRITE, MAP_SHARED` です。arena の読込が進むと backing ファイルにも反映され、別プロセスが同じファイルをマップできます。ファイルは arena 解放時に unlink されません（`src/core/pinned.cu:223-234,657-678`）。
-- shared file 使用時は cgroup/空きRAM の事前警告・拒否判定をスキップします。ソースコメントは別 engine がすでに同じ arena を RAM に持つ可能性を理由として挙げています（`src/core/expert_source.cpp:5760-5789`）。
-- `--mmap-experts` とは併用できません。両方を有効にすると stderr に理由を出して終了コード2です（`src/program/generate.cpp:3039-3043`）。`--resident-experts` も `--mmap-experts` を有効化するため、同じ併用拒否になります（`src/program/generate.cpp:2757-2760,3039-3043`）。
-- shared arena を使うと pin-by-need 用のページ境界パディングは使わず、プロセス間で共通の packed layout になります（`src/core/expert_source.cpp:5805-5817`）。
+共有指定があると、arena の確保前に pack fingerprint を計算します。fingerprint は expert layout と pack metadata に加え、`experts.bin` または native pack の GGUF shard のサンプルを含みます（`engine/src/core/expert_source.cpp:6154-6189,6679-6681`）。
+
+Linux では指定パスを `O_RDWR | O_CREAT` で開き、空ファイルなら arena サイズと 4 KiB header 分に拡張して、version・arena サイズ・pack fingerprint を記録します。既存ファイルは期待サイズと header、fingerprint が一致する必要があります。その後 `MAP_SHARED` で writable mapping を作り、arena はこの mapping の後半を使います。ファイルは自動削除されません。新規ファイルの作成 mode は `0600`（プロセスの umask の影響を受けます）です（`engine/src/core/pinned.cu:328-360,363-409,444-455`）。
+
+共有状態 header の state word でロード担当を選びます。別 engine が読み込み中なら待ち、ロード完了済みなら読み込みを省略します。担当 process が終了した場合は別 process が再ロードし、待機が45分を超えた場合は自分でロードします（`engine/src/core/expert_source.cpp:6784-6819,6832-6843,6860`）。
 
 ## 適用条件と副作用
 
-- 通常 parser の resident expert arena 経路が対象です。`--mmap-experts` 経路とは排他です（`src/program/generate.cpp:5707-5719,5905-5913,3039-3043`）。dense モデル等で resident expert arena の初期化に到達しない場合、この値が backing に使われることはありません。
-- 実装は POSIX 側のファイル mmap です。Windows は明示的に未実装で、値が空でなければ arena 予約失敗になります（`src/core/pinned.cu:97-100`）。help も Linux 用としています（`src/program/generate.cpp:1063`）。
-- 新規 backing は指定ディレクトリに作成され、必要容量まで伸長されます。ディレクトリ・権限・容量不足などで open、stat、truncate、header write、mmap に失敗すると、arena 予約エラーになります（`src/core/pinned.cu:158-192,223-228`）。共有 backing を通常の永続 SSD に置く運用は help が推奨していません（`src/program/generate.cpp:1063-1065`）。
-- 既存のサイズ0以外のファイルは切り詰められません。サイズやヘッダー、pack hash が不一致なら失敗します（`src/core/pinned.cu:194-219`）。
-- 同一ファイルを複数プロセスが使う場合も、読込自体は各プロセスで実施されます。ソース上、共有ファイルの作成・読込をプロセス間で排他するロック処理は確認できませんでした。異なる pack で同じファイルを同時に初回作成する場合の動作は保証できる根拠が見つからず、ここでは断定しません。
+- `--mmap-experts` との併用は拒否されます。stderr に理由を出し、終了コード 2 です（`engine/src/program/generate.cpp:4866-4868`）。
+- shared arena 指定時は、resident arena に対する通常の host available RAM / cgroup の事前判定を行いません。また RAM 不足時に `--mmap-experts` へ自動 fallback する条件からも除外されます。共有先が RAM に載る場合でも、既に共有されているページの有無をこの判定では数えません（`engine/src/core/expert_source.cpp:6530-6537`; `engine/include/strata/core/ple_residency.hpp:67-74`; `engine/src/program/generate.cpp:8602-8604`）。
+- Linux の tmpfs では起動時に空き RAM と cgroup の余裕を確認し、確保可能な場合は `posix_fallocate` で領域を確保します。空きが足りない場合や mapping に失敗した場合は arena 確保失敗となります。通常のディスク上のファイルは sparse のままになり得るため、help は `/dev/shm` を推奨し、通常の SSD への配置を勧めていません（`engine/src/core/pinned.cu:412-454`; `engine/src/program/generate.cpp:1483-1485`）。
+- shared backing を開けない、サイズ・header・pack fingerprint が合わない、または expert load に失敗した場合、engine は arena 初期化エラーを stderr に出し、終了コード 1 で終わります（`engine/src/core/pinned.cu:328-409,444-449`; `engine/src/core/expert_source.cpp:6760-6765,6848-6858`; `engine/src/program/generate.cpp:8913-8915`）。
 
 ## 出力とエラー
 
-- 予約失敗は `ArenaExpertSource: the arena could not be reserved (...)` に原因文字列を付け、呼び出し元が `strata generate: ...` を stderr に出して終了コード1にします（`src/core/expert_source.cpp:5872-5878`, `src/program/generate.cpp:5906-5913`）。ファイル読込の失敗や読込 byte 数の不足も同様にエラーで終了します（`src/core/expert_source.cpp:5911-5925`）。
-- `--mmap-experts` との併用拒否は stderr・終了コード2です（`src/program/generate.cpp:3040-3043`）。値の欠落も stderr・終了コード2です（`src/program/generate.cpp:2418-2420`）。
-- 予約後の arena 読込経路は stderr に `expert arena read ...` を出します（`src/core/expert_source.cpp:5911-5919`）。通常、option 専用の stdout 出力は確認できませんでした。
-
-## 調査範囲
-
-索引の `strata-engine` は `src/program/generate.cpp` の parser を対象にしています（`docs/cli/README.md:1128-1134`）。同一 revision の既存実行ファイルは使わず、help 文言は同 revision のソース内 usage を補助資料として parser と照合しました。ビルド、実行、GPU 試験は行っていません。shared file の複数プロセス同時起動時における書き込み競合の挙動は実行確認していません。
+起動時には stderr に `expert arena: MAP_SHARED file ... (pack hash checked)` 相当の backing 情報とロード量を表示します。共有先が既にロード済みなら `already filled by another engine; the read is skipped` と表示します（`engine/src/core/pinned.cu:451-454`; `engine/src/core/expert_source.cpp:6832-6836`; `engine/src/program/generate.cpp:8934-8939`）。
 
 ## 根拠
 
-- parser、help、排他条件、arena 呼び出し: `src/program/generate.cpp:1063-1065,2416-2420,2753-2756,3039-3043,5905-5913`
-- arena の値検証、pack fingerprint、RAM 判定、予約後の読込: `src/core/expert_source.cpp:5389-5423,5680-5695,5760-5793,5805-5817,5867-5878,5911-5925`
-- Linux/Windows backing 実装、ファイル生成と header 照合、mmap と解放: `src/core/pinned.cu:89-100,149-234,657-678`
-- 文書配置と `strata-engine` の scope: `docs/cli/README.md:1128-1134,1280`; 配置・調査基準: `docs/cli/001_investigation.md`
+- `engine/src/program/generate.cpp:1483-1485` — help の値・Linux 適用・`/dev/shm` 推奨。
+- `engine/src/program/generate.cpp:874,4217-4220,3842-3847` — option の格納、parser、値不足時の処理。
+- `engine/src/program/generate.cpp:4866-4868,8602-8604,8871-8872,8913-8915` — 併用拒否、fallback 判定、arena 呼び出しと失敗終了。
+- `engine/src/core/expert_source.cpp:6154-6189,6679-6681` — pack fingerprint の構成と計算。
+- `engine/src/core/pinned.cu:328-409,412-455,1030-1038` — Linux file 作成・header 検証・tmpfs 容量処理・`MAP_SHARED` と state word の配置。
+- `engine/src/core/expert_source.cpp:6530-6537,6784-6819,6832-6858` — RAM 判定の省略、process 間のロード調停、load 失敗経路。
+- `engine/include/strata/core/ple_residency.hpp:67-74` — shared arena 指定時に RAM fallback を許可しない条件。
+
+調査範囲はこの checkout の `strata generate` parser と、その値を受ける CUDA expert arena 実装です。help は Linux の file path を説明しています。Windows の named section および SYCL 固有の挙動はこの文書の利用対象に含めていません。

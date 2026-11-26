@@ -1,53 +1,58 @@
 # `STRATA_QFUSE`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-verify window 内で使う q8_1 活性値を、後段の量子化 kernel で作らず、その活性値を生む kernel に作らせます。主な対象は GDN 出力 norm と hyper-connection（GR）read の出力です。生成値そのものを変える設定ではなく、既存の q8_1 量子化結果を producer 側で用意して後続 projection / expert の入力に使う経路を選びます。
+verify window 内で activation の Q8_1 量子化データを、後段の利用元で別途作る代わりに、その activation を作る GDN 出力正規化と hyper-connection (HC) 読み取りの producer が同じバッファへ書く制御です。通常経路では HC 読み取り後の `mixed` と GDN の `y_` を `quant_in` しますが、QFUSE が出力を書いた場合はこの個別量子化を省きます。HC 入力は attention 側と FFN 側の読み取りで扱われます（`engine/src/core/verify.cpp:1796-1820,1880-1906,2005-2013,2613-2614,2740-2772`）。
 
-実装は CUDA/HIP と SYCL の verifier にあり、通常の prefill 経路全体を切り替える設定ではありません。設定判定は `g_qfuse()` の関数内 `static const bool` に保持され、プロセス内の初回評価後に環境を書き換えても再評価されません（`src/core/verify.cpp:156`, `sycl/src/core/verify.cpp:76`）。
+CUDA/HIP の verify では QFUSE が有効だと one-token self-commit を使わず、window commit 側の処理を通します（`engine/src/core/verify.cpp:1486-1489,4531-4541,4588-4594`）。同一バイト列・性能向上などの一般保証はここではしません。
 
 ## 値と判定
 
-`getenv()` が返す文字列を `atoi()` に渡し、変換結果が 0 以外なら ON です。文字列全体の検証ではありません。
+`engine/src/core/verify.cpp:320` と `engine/sycl/src/core/verify.cpp:135` で `std::getenv` の結果を `std::atoi` に渡し、非 null かつ変換結果が非ゼロなら ON とします。文字列全体の検証はなく、数値として読める先頭部分を `atoi` が変換します。設定値は各プロセスで最初に `g_qfuse()` が呼ばれた時に関数内 `static` へ保存されます。
 
-| 値 | 判定 |
-|---|---|
-| 未設定、空文字、`0`、`false`、数字で始まらない文字列 | OFF |
-| `1`、`2`、`-1`、`1junk`、先頭の空白の後に非ゼロ数字がある文字列 | ON |
-| `0junk`、`0x1` | OFF（`atoi()` が読む先頭の数値部分が 0）|
+| 条件 | unset | ON になる値の例 | OFF になる値の例 |
+|---|---|---|---|
+| 明示値（CUDA/HIP/SYCL の verify） | `false` | `1`, `-1`, `2`, `1tail`, ` 1` | 空文字, `0`, `0tail`, `true`, ` 0` |
 
-`src/core/verify.cpp:156`, `sycl/src/core/verify.cpp:76`。
+`atoi` の整数変換に収まらない値の結果は文書化された入力として扱えず、コードに範囲検証・警告・fallback はありません。環境変数を実行中に変更してもキャッシュ済み判定は変わりません。
 
-HIP の gfx1151 では、別の条件により起動時に未設定の `STRATA_QFUSE` を `1` にします。利用者が値を設定済みなら、空文字や `0` を含めその値を保持します。`STRATA_GFX1151_DEFAULTS=0` なら一括既定値設定を止めます。これは `STRATA_USE_HIP` のビルドに限られ、gfx1151 以外の AMD GPU と CUDA には適用されません。gfx12 (RDNA4) 用の既定値表には `STRATA_QFUSE` はありません（`src/program/generate.cpp:2190-2196`, `src/core/arch_defaults.cpp:32-59,61-70`）。
+起動時には、対象 GPU の arch defaults がこの名前を未設定の場合だけ値 `1` を追加することがあります。すでに空文字や `0` を含む値が設定されていれば、それが優先されます（`engine/src/core/arch_defaults.cpp:64-90,302-310`; `engine/src/program/generate.cpp:4287-4320`; `engine/src/core/nv_defaults.cpp:104-129,176-214,222-234,240-255`）。
+
+| 起動経路 | unset 時に自動設定される条件 | 自動設定を止める条件 |
+|---|---|---|
+| HIP、gfx1151 (Strix Halo) | `STRATA_GFX1151_DEFAULTS` が先頭 `0` でなく、ユーザー値が未設定なら `1`。Windows/Linux とも arch table に含まれる | `STRATA_GFX1151_DEFAULTS=0` または任意の明示値 |
+| CUDA、sm_120 / sm_121 | 同一 compute capability の可視 GPU 群で defaults table が適用され、`STRATA_SM120_PERF` / `STRATA_SM121_PERF` が先頭 `0` でなく、`STRATA_DEFAULTS=026` でない場合、未設定なら `1` | 上記 switch、`STRATA_DEFAULTS=026`、任意の明示値。混在 compute capability の GPU 群では当該 table 自体が適用されない |
+| その他 | 自動設定なし | — |
+
+`STRATA_DEFAULTS=026` は `026`、`0.2.6`、`v0.2.6` の完全一致で有効です（`engine/include/strata/core/defaults_026.hpp:21-29`）。gfx1151 table はこのフラグで QFUSE を除外しません。上表の default は arch table の値であり、明示された `STRATA_QFUSE` の値判定とは別です。
 
 ## 有効になる条件
 
-- verifier が verify window を作って処理する経路で参照されます。`STRATA_QFUSE` が ON の場合、GDN layer では `gdn_step_norm_multi()` に q8_1 出力先を渡し、GDN 出力 norm と q8_1 store を同じ kernel 側で行います（`src/core/verify.cpp:1174-1180`, `src/kernels/cuda/verify_kernels.cu:467-497,993-1017`; SYCL 版: `sycl/src/kernels/cuda/verify_kernels.dp.cpp:734-786,1831-1834,1894-1938`）。
-- GR read の出力 `mixed` にも q8_1 destination と group counter を渡します。CUDA/HIP 実装は融合 read kernel がこの image を書けた場合、GDN 入力 projection と MoE expert 用の通常 quantize 呼び出しを省略します（`src/core/verify.cpp:1053-1072,1116,1416,1543-1547`; `src/kernels/cuda/fused_gr.cu:1848-1864`）。GR 側の image 用 counter は verifier 準備時に確保・zero 初期化されます。確保に失敗した場合は pointer が null となり、GR read は q8_1 image を書かず、後段の通常量子化が残ります（`src/core/verify.cpp:789-795,1053-1072`）。
-- batch recurrence (`batch_rec_`) では GDN recurrence に q8_1 出力先を渡しません。このケースは明示的に通常の `native_quantize_q8_1()` を実行します。GR read の融合出力とは別の例外です（`src/core/verify.cpp:1163-1180`）。
-- QSA layer の出力側 q8_1 は引き続き通常の `native_quantize_q8_1()` で作ります（`src/core/verify.cpp:1395-1409`）。
-- CUDA/HIP では別変数 `STRATA_QFUSE_HC` が hyper-connection read だけの image 書き込みを独立して有効化できます。counter は `STRATA_QFUSE` またはこの別設定のどちらかが有効なら確保されます。gfx12 の既定分岐は `STRATA_QFUSE_HC` 側にあり、`STRATA_QFUSE` の gfx1151 既定値とは別です（`src/core/verify.cpp:140-154,789-795`）。
-- SYCL の GDN norm kernel は q8_1 image を書けますが、SYCL の fused GR read 実装は q8_1 image をサポートせず `false` を返し、呼び出し側が通常 quantize を実行します。したがって、この backend では GR read 側の融合効果はありません（`sycl/src/kernels/cuda/fused_gr.dp.cpp:1755,1882`; `sycl/src/core/verify.cpp:982-1003,1025,1063-1065,1286`）。
+- `g_qfuse()` を使う verify window の実行が必要です。CLI 引数による個別の上書きはこの実装にありません（`engine/src/core/verify.cpp:1486-1489,1796-1820,2005-2013`）。
+- GPU バッファ `qcnt_` の確保が成功した時、HC 読み取りへ Q8_1 出力先を渡します。確保またはゼロ初期化に失敗するとポインタを null に戻し、HC 側はこの経路を使いません。コード上、ここで QFUSE 専用のエラーや警告は出しません（`engine/src/core/verify.cpp:1431-1437,1810-1817`）。
+- QFUSE は GDN 出力にも適用されますが、batch recurrence 経路は出力先を渡さず、その後 `quant_in` します（`engine/src/core/verify.cpp:1995-2013`）。
+- CUDA/HIP の QFUSE 対応 kernel を含む build が必要です。SYCL 側も値を読み、GDN 出力にポインタを渡しますが、SYCL port の fused HC read は Q8_1 image を書かず `false` を返すため、HC 読み取りの生成経路は使われません（`engine/sycl/src/core/verify.cpp:1209-1231,1307-1312`; `engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3289-3297`）。
+- `STRATA_HC_PERSIST=1` の persistent HC read は `q8_mixed` が設定されている場合に fallback して既定 read を使います（`engine/src/core/verify.cpp:1810-1817`; `engine/src/kernels/cuda/fused_gr.cu:5304-5315`）。
+- folded native expert layer は、HC 側で作った未回転 activation の Q8_1 image を後段で回転済み入力から書き直します（`engine/src/core/verify.cpp:2761-2772`）。
 
 ## 実行時の詳細
 
-CUDA/HIP の GR read は、全 token 分の destination と token 0 の group counter が揃った場合にだけ q8_1 image 書き込みを有効にします。揃わない場合は destination を無効化し、呼び出し元が後段で量子化します。image が書かれた場合、GDN layer の attention-side入力では通常 quantize を飛ばし、FFN 側では CPU expert layout が native のときに MoE 用の通常 quantize を飛ばします。CPU expert layout が native でない場合は q8_0 用の別の変換経路が使われます（`src/kernels/cuda/fused_gr.cu:1848-1864`, `src/core/verify.cpp:1116,1521-1526,1543-1547`）。
+`g_qfuse()` の判定は function-local `static` です。arch defaults は `generate.cpp` が engine switch の初回読み取り前に適用します。HIP の gfx1151 では `apply_arch_defaults` がユーザー設定のない変数だけを追加し、CUDA の sm_120 / sm_121 では `apply_nv_defaults` が同様に設定します。追加した場合、CUDA の既定 switch 一覧は stderr に `strata: sm_120 (Blackwell): ... speed switches on by default ...` または `strata: sm_121 (GB10): ...` 形式で出ます（`engine/src/program/generate.cpp:4287-4320,4421-4449`; `engine/src/core/arch_defaults.cpp:302-310`; `engine/src/core/nv_defaults.cpp:222-255`）。gfx1151 の `apply_arch_defaults` は設定した switch 名を返しますが、当該関数内で QFUSE 専用のログは出しません。
 
-`STRATA_QFUSE` が ON のときは one-token self-commit 経路も選ばれません（`src/core/verify.cpp:844`, `sycl/src/core/verify.cpp:824`）。QFUSE 専用のログは見つかりません。gfx1151 の自動既定値が環境に追加された場合は、arch defaults の集約ログに設定された switch 名が出ます（`src/core/arch_defaults.cpp:61-80`）。
+CUDA/HIP は QFUSE または `STRATA_QFUSE_HC` が有効な場合、HC の q8 group counter buffer を `n_embd / 32` 個確保・ゼロ初期化します。QFUSE が有効で buffer が使える場合、HC read の各出力へ `q8_mixed` を設定し、GDN norm にも `xq_` を渡します。通常の後段 `quant_in` は HC image が用意されていれば省略し、GDN では QFUSE が有効かつ batch recurrence でないときに省略します（`engine/src/core/verify.cpp:1431-1437,1796-1820,1880-1906,2005-2013,2613-2614`）。
 
-## 文書との照合
+buffer が存在するかを示す診断行は `strata::dispatch::notef` の `hc read: weights Q8_0 copies=%ld (0 = bf16 rows), half=%ld, qfuse=%ld` です。これは環境変数の文字列値ではなく、HC read 時点の `qcnt_ != nullptr` を出します（`engine/src/core/verify.cpp:1796-1798`）。
 
-`docs/STRIX_HALO.md:85-98` は gfx1151 の既定 switch 表に `STRATA_QFUSE` を挙げ、activation image を producer が書く機能として説明しています。現在の既定値コードでは gfx1151 表に `STRATA_QFUSE=1` があり、説明と一致します。同資料は maintainers の測定環境で各 switch が bitwise 同一だったと述べていますが、ここではその測定を独自に再実行していません。`docs/DETAILS.md` にはこの変数の追加説明を確認できませんでした。
+## ログと測定値
+
+QFUSE の明示 ON/OFF に対する専用ログ、無効値警告、終了コード経路はありません。CUDA の defaults table が QFUSE を含む複数 switch を追加した場合は、上記の起動時一覧が stderr に出ます。HC read 時の `qfuse` 診断値は buffer 確保状態の表示です（`engine/src/core/nv_defaults.cpp:240-255`; `engine/src/core/verify.cpp:1796-1798`）。
 
 ## 根拠
 
-- 値の読み取りと初回キャッシュ: `src/core/verify.cpp:156`, `sycl/src/core/verify.cpp:76`。
-- verifier の counter、self-commit 抑止、GR read destination: `src/core/verify.cpp:789-795,844,1053-1072`。
-- GDN と QSA の quantize 分岐、batch recurrence 例外: `src/core/verify.cpp:1163-1180,1395-1409`。
-- FFN 入力 image と fallback: `src/core/verify.cpp:1416,1521-1526,1543-1547`; `src/kernels/cuda/fused_gr.cu:1848-1864`。
-- CUDA GDN producer store: `src/kernels/cuda/verify_kernels.cu:467-497,993-1017`。
-- SYCL GDN producer store と GR 未対応: `sycl/src/kernels/cuda/verify_kernels.dp.cpp:734-786,1894-1938`; `sycl/src/kernels/cuda/fused_gr.dp.cpp:1755,1882`。
-- gfx1151 の起動時既定値と opt-out: `src/program/generate.cpp:2190-2196`; `src/core/arch_defaults.cpp:32-59,61-80`。
-- 関連資料: `docs/STRIX_HALO.md:85-98`。
+- 値の読み取り・cache: `engine/src/core/verify.cpp:320`; `engine/sycl/src/core/verify.cpp:134-135`
+- arch defaults: `engine/src/core/arch_defaults.cpp:64-90,302-310`; `engine/src/core/nv_defaults.cpp:104-129,176-234`; `engine/src/program/generate.cpp:4287-4320,4421-4449`
+- HC/GDN output wiring, fallback, commit path: `engine/src/core/verify.cpp:1431-1437,1486-1489,1796-1820,1880-1906,1995-2013,2613-2614,2732-2774,4531-4541,4588-4594`
+- SYCL HC behavior: `engine/sycl/src/core/verify.cpp:1209-1231,1307-1312`; `engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3289-3297`
+- Persistent HC fallback: `engine/src/kernels/cuda/fused_gr.cu:5304-5315`

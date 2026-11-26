@@ -1,58 +1,47 @@
 # `STRATA_SSD_KEEPALIVE_WINDOW`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリ・ドライバーの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-PLE（n-gram テーブル）を `--ple-io direct` で読むときの SSD keep-alive 読みを続ける時間窓を秒単位で指定します。窓の基準は最後に PLE 行を要求した時刻（`PleReader::issue()`）です。期限内に reader の I/O ワーカースレッドがアイドルになると、テーブル内のページを読む keep-alive が実行されます。期限を過ぎると keep-alive は止まり、次の行要求で再開します。
-
-環境変数は `strata generate` が PLE テーブルを開くときに読み、`PleIoOptions` から `PleReader::set_keepalive()` へ渡します。ソースには同じ設定処理が CUDA/HIP 側と SYCL 側にあります。
+PLE（per-layer token embedding）テーブルを direct I/O で読むとき、最後に行を要求してから SSD keep-alive のページ読み込みを続ける時間を秒で指定する。`engine/src` 側と SYCL 側の `strata generate` が `PleIoOptions::keepalive_window_s` に設定し、`PleTable::open` から `PleReader::set_keepalive` に渡す。keep-alive 自体の周期は別変数 `STRATA_SSD_KEEPALIVE` が決める。この変数だけでは keep-alive を有効化せず、周期が 0 の場合や direct I/O でない場合には window 値は使われない（`engine/src/program/generate.cpp:6269-6288`, `engine/sycl/src/program/generate.cpp:3350-3369`, `engine/src/kernels/ngram.cpp:449-465`）。
 
 ## 値と判定
 
-`std::getenv` で取得し、未設定または空文字なら `60.0` 秒です。それ以外は `std::atof` の結果を `std::clamp(..., 1.0, 86400.0)` に渡します。文字列全体の妥当性は検査しません。
+PLE テーブルの初期化時に `std::getenv` で読み、空でなければ `std::atof` を適用して `[1, 86400]` 秒に `std::clamp` する。文字列全体の妥当性検査はない。`atof` が数値として読めない文字列は 0 となり下限 1 秒へ clamp される。数値の後ろの文字は無視される。未設定または空文字は 60 秒。CUDA 系と SYCL 系で同じ判定である（`engine/src/program/generate.cpp:6281-6286`, `engine/sycl/src/program/generate.cpp:3362-3367`）。
 
-| 入力 | `keepalive_window_s` |
-|---|---:|
-| 未設定、空文字 | 60 秒 |
-| 数値（例 `30`, `2.5`, `1e2`） | 数値を秒として使用 |
-| 数値の後ろに文字がある（例 `30sec`） | `atof` が読んだ先頭部分、つまり 30 秒 |
-| 数値に変換できない文字列 | `atof` の 0 を下限 clamp し、1 秒 |
-| 0 または負数 | 下限 clamp により 1 秒 |
-| 1 未満 | 1 秒 |
-| 86400 超 | 86400 秒（24 時間） |
+| 条件 | unset | 有効になる値（例） | 無効値・境界の例 |
+|---|---|---|---|
+| `engine/src` 側 / SYCL 側で PLE 初期化 | `60` 秒 | `30` → 30 秒、`1tail` → 1 秒、`90000` → 86400 秒 | 空文字 → 60 秒、`0` / `-5` / `true` / `abc` / `0anything` → 1 秒、`0.5` → 1 秒 |
 
-空白は `atof` の数値変換規則に従います。大文字小文字や真偽文字列による判定はありません。例えば `false` は 1 秒、`60s` は 60 秒です。値は double で保持されます。
+値を明示したとき負数や 0 を使って window を無効化することはできず、最小値は 1 秒。`atof` が認識する NaN 表記は通常の数値範囲へ clamp されない可能性がある（`std::clamp` は NaN を数値へ置換しない）。変換・範囲制限は `generate` 内で一度行われ、環境を実行中に変更しても既に初期化された reader の値は変わらない（`engine/src/program/generate.cpp:6281-6288`, `engine/src/ngram/ple_reader.cpp:596-604`）。
 
 ## 有効になる条件
 
-- PLE テーブルが指定され、`o.ple_gguf` が空でない場合に限り読み取られます。
-- 値が動作に使われるのは PLE の Direct I/O 経路です。`--ple-io mmap` / `--ple-io ram` では `STRATA_SSD_KEEPALIVE` 側の周期が 0 にされるため、この窓を設定しても keep-alive は発生しません。
-- `--ple-sync-submit` で I/O ワーカーを使わない場合も周期が 0 になります。reader 側も keep-alive の周期を有効にする条件として threaded mode を要求します。
-- Direct 読みの速度プローブが遅く、`--ple-io` が明示指定されていない場合、実装は mmap に切り替えて周期を 0 にします。この fallback 後は窓の設定は効きません。
-- 周期を有効にする `STRATA_SSD_KEEPALIVE` が 0 なら窓だけを設定しても読みは走りません。
-- PLE の行要求が少なくとも一度あり、最後の要求から設定窓以内で、reader がエラー状態でなく、ワーカーがアイドルである間に限り keep-alive が行われます。要求処理中（キューまたは in-flight job がある間）にはアイドル時の keep-alive 判定を行いません。
+- `strata generate` が PLE テーブルを開く経路であること。`o.ple_gguf` が空でない場合だけ環境値を読み込む。PLE が無効、または `--ple-gguf` がない経路では読み取りも適用もない（`engine/src/program/generate.cpp:6269-6288`; オプション判定は `engine/src/program/generate.cpp:5205-5215`）。
+- `--ple-io` が `direct`（既定）であること。`mmap` / `ram` は `PleIo::Mmap` となり、keep-alive 周期を 0 にするため window は作用しない（`engine/src/program/generate.cpp:6270-6286`）。
+- `--ple-sync-submit` を指定していないこと。同期 submit では `pio.io_thread` が false となり、周期も 0 にされる。reader 側も worker thread がない場合は周期を 0 にする（`engine/src/program/generate.cpp:6274-6286`, `engine/src/ngram/ple_reader.cpp:596-602`）。
+- `STRATA_SSD_KEEPALIVE` の周期が正であること。未設定・空文字の既定は 100 ms、空でない値は `atof` 後 `[0, 10000]` に clamp されるため、`STRATA_SSD_KEEPALIVE=0` では window に関係なく停止する（`engine/src/program/generate.cpp:6282-6286`）。
+- 初期設定が direct でも、その後 mmap に切り替わる経路では周期が 0 にされる。`engine/src` 側では条件を満たす PLE residency policy が `--ple-io ram` を選ぶ場合、また `engine/src` 側・SYCL 側とも direct 読み取りの低速 probe 後に `STRATA_PLE_AUTO_MMAP` が許可して自動切替する場合が該当する（`engine/src/program/generate.cpp:6303-6331,6352-6375`, `engine/sycl/src/program/generate.cpp:3373-3397`）。
+- reader worker が行要求を受けてからの window であり、要求後に無通信の時間が window を超えると keep-alive を止める。次の行要求で再び window を開始する（`engine/src/ngram/ple_reader.cpp:190-194,433-441`）。
 
 ## 実行時の詳細
 
-- `PleReader::set_keepalive()` は窓を秒からマイクロ秒へ換算し、reader の状態に保存します。`keepalive_due()` は `now - last_issue_us > keep_window_us` なら期限切れとして keep-alive を無効扱いにします。境界ちょうど（経過時間が窓と等しい間）は期限内です。
-- keep-alive の周期そのものは別環境変数 `STRATA_SSD_KEEPALIVE` で決まります。worker は idle wait 中に周期到来を判定し、期限内なら PLE テーブル内の 1 ページを読みます。
-- 窓を過ぎると読みを止めます。後の `issue()` が窓外であれば、行がすべてキャッシュヒットで新しい I/O job がなくても worker を起こし、keep-alive を再開します。
-- 環境変数の取得・変換は PLE 構築時に一度だけです。生成中にプロセス環境を書き換えても再読込されません。設定値そのものは `static` キャッシュではなく、その reader インスタンスの状態に保存されます。
-- keep-alive の起動ログは周期が正の場合に出ます。`keepalive_window_s` は `%.0f` 表示のため、たとえば小数秒を指定してもログでは整数秒に丸めて表示されます。mmap 経路では keep-alive のログ行は出ません。
+設定は `PleIoOptions` に格納され、direct モードで PLE table を開いた直後に `PleReader::set_keepalive` へ渡る。reader は `window_s` をマイクロ秒へ換算して保持する。worker は周期ごとにテーブル内の異なる 1 ページをキューし、最後の行要求から window を過ぎた場合は新しい行要求まで追加しない。ページは表データの範囲から選ぶ（`engine/src/kernels/ngram.cpp:449-465`, `engine/src/ngram/ple_reader.cpp:596-604,190-208,310-320`）。
 
-## 文書と資料の照合
+値は各 `generate` の PLE 初期化時に環境から読み、reader に渡した後はその reader の設定として保持される。リクエストごとの再読込や CLI 引数による window の上書きはこの実装にはない。なお `STRATA_SSD_KEEPALIVE` の有効値により周期が 0 でも、設定された window 自体は reader に渡るが、周期が 0 なので keep-alive は発生しない。`engine/src` 側の residency policy による RAM 化または両実装の auto-mmap 切替は、reader の再 open 時に keep-alive 周期を明示的に 0 にする（`engine/src/program/generate.cpp:6281-6288,6324-6344,6369-6375`; `engine/sycl/src/program/generate.cpp:3362-3369,3385-3397`; `engine/src/ngram/ple_reader.cpp:596-603`）。
 
-`docs/DETAILS.md` にはこの変数の記載は見つかりませんでした。既存資料 `STRATA_SSD_KEEPALIVE.md` の「関連するもう一方の値」の記述は、読み取り箇所と clamp の実装に一致します。実装コメントは既定 60 秒と説明していますが、具体的な窓の効果や測定値を示す資料は確認できませんでした。
+## ログと測定値
+
+両実装は周期が有効なら stderr に `strata generate: the SSD is kept awake while rows are read: one page of the table after %.0f ms without a read, until %.0f s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)` を出し、window 値を秒表示する。direct モードで周期が 0 なら `strata generate: SSD keep-alive off: the SSD may fall asleep between reads` を出す。mmap モードではこの keep-alive の有効／無効ログ分岐は出ない（`engine/src/program/generate.cpp:6404-6409`, `engine/sycl/src/program/generate.cpp:3424-3429`）。
+
+keep-alive ページ読み込みが失敗した場合、reader は周期を 0 にして keep-alive のみを止め、通常の reader error にはしない（`engine/src/ngram/ple_reader.cpp:167-172,218-227`）。Strata の `docs/DETAILS.md` にこの変数の説明や測定値は見つからなかった。速度・遅延への効果を定量化する資料は確認できていない。
 
 ## 根拠
 
-- CUDA/HIP 側での読み取り、既定値、変換、clamp、適用条件: `src/program/generate.cpp:3149-3167`
-- 起動時の keep-alive ログ: `src/program/generate.cpp:3216-3221`
-- mmap への fallback と周期の無効化: `src/program/generate.cpp:3174-3199`
-- SYCL 側の同じ値判定と条件: `sycl/src/program/generate.cpp:2975-2994`
-- Direct mode のみ `set_keepalive()` を呼ぶ箇所: `src/kernels/ngram.cpp:314-328`
-- 窓の秒からマイクロ秒への変換: `src/ngram/ple_reader.cpp:517-525`
-- 期限判定、ページ読み、idle worker の処理: `src/ngram/ple_reader.cpp:180-198,299-325`
-- 次の `issue()` による再開: `src/ngram/ple_reader.cpp:422-430,471-478`
-- options の既定値と適用範囲の説明: `include/strata/kernels/ngram.hpp:149-164`
+- `engine/src/program/generate.cpp:6269-6288,6404-6409`
+- `engine/sycl/src/program/generate.cpp:3350-3369,3424-3429`
+- `engine/include/strata/kernels/ngram.hpp:167-181`
+- `engine/src/kernels/ngram.cpp:449-465`
+- `engine/include/strata/ngram/ple_reader.hpp:75-81`
+- `engine/src/ngram/ple_reader.cpp:167-172,190-208,218-227,310-320,433-441,596-604`

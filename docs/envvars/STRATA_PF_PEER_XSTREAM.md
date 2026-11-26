@@ -1,48 +1,44 @@
 # `STRATA_PF_PEER_XSTREAM`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の `--peer-device` を使う prompt 処理で、2枚の GPU 間に P2P 経路がなく、mapped host memory を経由する場合に、primary GPU と host 間のコピーを専用 CUDA stream に置くか、primary の計算 stream に置くかを選びます。既定では専用 stream を作ります。値を変えても peer の行の割り当てや演算を直接変える処理はありません。
+P2P を使わない peer prefill で、primary GPU から mapped host memory へ送る入力コピーなどを専用の非ブロッキング stream に載せるかを選びます。未設定または `atoi` の結果が非ゼロなら専用 stream を使い、ゼロなら primary の compute stream `m.cs` を使います。変数名の全参照はこの読み取りと、その直前の説明コメントです（`engine/src/prefill/prefill.cpp:3380-3387`）。
 
 ## 値と判定
 
-`Prefill::set_peer()` で `std::getenv()` と `std::atoi()` を使い、一度の prompt path 初期化時に判定します。文字列全体の妥当性検査はなく、`atoi` が変換した整数が 0 かどうかで分岐します。
+`std::getenv` で値を読み、設定値には `std::atoi` を適用した結果が `0` かどうかだけを見ます。文字列全体の検証や範囲制限はありません。
 
-| 状況 | 判定・動作 |
-|---|---|
-| unset | unset 用の条件分岐で専用 stream と event の作成を試みる |
-| `0`、空文字、数値に変換できない文字列（例: `abc`） | `atoi` が 0 を返し、専用 stream を作らない。コピーは primary の計算 stream を使う |
-| `1`、その他 `atoi` が非 0 を返す値（例: `2`, `-1`, `2tail`） | 専用 stream と event の作成を試みる |
+| peer の経路 | unset | 専用 copy stream を使う値 | compute stream を使う値 |
+|---|---|---|---|
+| `pp->p2p == false` | 専用 stream（既定） | `atoi` の結果が非ゼロ。例: `1`, `-1`, `1tail` | `atoi` の結果がゼロ。例: `0`, `0anything`, 空文字, `true`, `false`, 数字で始まらない文字列 |
+| `pp->p2p == true` | 読み取りなし | 該当なし | この変数による変更なし |
 
-空白や符号、数値の後ろの文字は `atoi` の変換規則に従います。たとえば `0tail` は 0、`1tail` は 1 になります。設定値を初期化後に変更しても、この `PeerPrefill` の選択は再評価されません。
-
-根拠: `src/prefill/prefill.cpp:1649-1673`。
+`atoi` は先頭の空白と符号を許し、最初の数字列の後ろは判定に使いません。そのため ` 1x` は非ゼロ、`0x` はゼロです。大文字小文字の比較はありません。整数としての妥当性・範囲を別途検査せず、範囲外の値はこのコードで定義された入力として扱えません（`engine/src/prefill/prefill.cpp:3381-3384`）。
 
 ## 有効になる条件
 
-- CUDA の `--peer-device` prompt 経路で `Prefill::set_peer()` が成功すること。server は peer が有効で `--peer-prefill-rows` が 0 でない場合に設定を呼びます。既定の行数は prompt chunk の半分です（`src/program/generate.cpp:7368-7372`）。
-- peer GPU との P2P が使えないこと（`peer->p2p()` が false）。P2P 経路ではこの環境変数を読みません。P2P が使えない場合でも `STRATA_PF_PEER_HOST=0` なら peer prompt 経路自体が拒否されます（`src/prefill/prefill.cpp:1652-1655`）。
-- peer prompt の MMQ 経路が利用可能であること。`mmq_plan().any` が false なら初期化を拒否します（`src/prefill/prefill.cpp:1656`）。
-
-したがって、変数を設定しても P2P 経路、peer prompt を無効にした設定、または peer prompt の初期化に失敗した場合には stream 選択へ影響しません。専用 stream/event の作成に失敗すると `set_peer()` は `prefill peer: copy stream` を返し、呼び出し元は「the prompt path stays on the primary GPU」と stderr に出して peer prompt を設定しません。
+- `--peer-device N` で peer GPU を有効にし、`--peer-prefill-rows` が 0 以外であることが必要です。server の prompt helper 設定が `Prefill::set_peer` を呼びます。`--peer-prefill-rows 0` なら呼び出されず、prompt は primary GPU に残ります（`engine/src/program/generate.cpp:13146-13153`）。
+- `set_peer` が有効な peer を受け取り、少なくとも一つのレイヤーが peer の MMQ または int8 prompt path に対応する必要があります。NVFP4 experts の場合は setup が拒否され、Hadamard-folded pack の場合は警告を出して peer path を使わずに戻るため、この変数の読み取りまで進みません（`engine/src/prefill/prefill.cpp:3333-3372`）。
+- `PeerExperts` の P2P 判定が false のときだけ読み取ります。P2P が使えない場合のほか、`STRATA_PEER_NO_P2P` による無効化や topology / copy 検証による host route もこの条件に入ります（`engine/src/core/peer_experts.cpp:208-235`; `engine/src/prefill/prefill.cpp:3335-3340,3373-3384`）。
+- P2P が true ならこの変数は参照されず、peer transfer は P2P 経路を使います（`engine/src/prefill/prefill.cpp:3375-3384,6636-6647`）。
+- `set_stage_helper` が作る layer-split helper も mapped host route を使いますが、この関数ではこの環境変数を読みません。直接の読み取りは `set_peer` の peer-device 経路だけです（`engine/src/prefill/prefill.cpp:3212-3253,3333-3387`）。読み取り箇所には OS や build macro による追加の分岐はありません。
 
 ## 実行時の詳細
 
-P2P のない経路で値が unset または非 0 の場合、`set_peer()` は primary 側の `x_stream` と `ev_x` を作成します。各 layer で peer 向け処理を始める際、primary の計算 stream `m.cs` に event を記録し、専用 stream がその event を待ってから activation や routing data の host 向け転送を行います。転送の完了 event `ev_in` も同じ選択 stream に記録され、peer 側の stream はそれを待って計算を始めます。この配置により、host 経由コピーを primary の expert 計算と並行して進められる構成です。
+値は `Prefill::set_peer` の setup 時に読みます。static cache には保存されませんが、作成済みの `PeerPrefill` はその時点で決まった stream を使い続けます。prompt path を作り直して `arm_prompt_helpers` が再実行されれば、その setup で改めて環境を読みます（`engine/src/prefill/prefill.cpp:3333-3387`; `engine/src/program/generate.cpp:13143-13169,19221-19230`）。
 
-値が `atoi` で 0 になる場合は `x_stream` が null のままなので、同じ転送処理は `m.cs` 上に enqueue されます。専用 stream を選んだ場合、`PeerPrefill` の破棄時に stream を同期してから破棄します。専用 stream はコピーの stream 配置だけを変え、peer の演算結果を primary に戻して prompt 結果へ加える処理は共通です。
+専用 stream を使う場合、primary compute stream 上の event を専用 stream が待ってから host route の activation と、必要な routing weight などのコピーを発行します。peer stream はコピー完了 event を待ちます。値がゼロならこれらのコピーを `m.cs` 上に発行するため、コピーと primary 側の後続計算を別 stream に分けません（`engine/src/prefill/prefill.cpp:6611-6633`）。専用 stream と event の作成に失敗すると `set_peer` は `prefill peer: copy stream` を返し、caller は `strata serve: prefill peer: copy stream - the prompt path stays on the primary GPU` を stderr に出して peer prompt 経路を使いません（`engine/src/prefill/prefill.cpp:3381-3386`; `engine/src/program/generate.cpp:13149-13153`）。
 
-根拠: `src/prefill/prefill.cpp:645-646,664-686,1665-1673,3398-3427`。
+## ログと測定値
 
-## 文書との照合
-
-`docs/SECOND_GPU.md:131-148` は `--peer-device` による peer prompt と `--peer-prefill-rows` を説明していますが、`STRATA_PF_PEER_XSTREAM` の記載はありませんでした。値ごとの挙動は上記の実装に基づきます。
+この環境変数の値に応じた有効・無効ログはありません。専用 stream 作成失敗時の文言と caller の fallback ログは「実行時の詳細」に記載したとおりです。Strata の資料・実装コメントに、この切替単独の測定値は記載されていません。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:1649-1673` — peer prompt 初期化、P2P 判定、環境変数の読み取りと stream/event 作成。
-- `src/prefill/prefill.cpp:3398-3427` — primary 計算 stream と host route copy stream の event 依存関係、および activation/weight 転送。
-- `src/prefill/prefill.cpp:645-646,664-686` — stream/event の保持と破棄。
-- `src/program/generate.cpp:7368-7372` — server 側の peer prompt 初期化呼び出しと失敗時のログ。
+- `engine/src/prefill/prefill.cpp:3333-3340,3373-3387` — peer setup、P2P 条件、環境変数の読み取りと stream 作成。
+- `engine/src/prefill/prefill.cpp:1373-1393,1414-1436` — host route の状態、stream/event の保持と破棄。
+- `engine/src/prefill/prefill.cpp:6611-6633,6636-6647` — stream の選択とコピー発行。
+- `engine/src/core/peer_experts.cpp:208-235` — P2P 判定から host route になる条件。
+- `engine/src/program/generate.cpp:13143-13153,13169,19229` — peer prefill の setup 条件、失敗時の fallback、prompt path 再構築時の再 setup。

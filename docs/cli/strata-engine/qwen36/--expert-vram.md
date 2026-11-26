@@ -1,73 +1,62 @@
-# `--expert-vram`
+# `strata` / `strata-q36` `--expert-vram`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` の Qwen3.6 専用経路、または `strata-q36` |
-| オプション | `--expert-vram GiB` |
+| コマンド | `strata`（Qwen3.6 を選択した場合）または `strata-q36` |
+| オプション | `--expert-vram` |
 | 別名 | なし |
-| 値 | `std::atof` で変換される数値。GiB 単位 |
+| 値 | routed experts 用の VRAM 予算（GiB、数値）。負数は自動予算として扱う |
 
 ## 役割
 
-Qwen3.6 の routed expert を VRAM に配置する際の予算を指定します。負値（省略時を含む）では、その時点の空き VRAM から既定 reserve を差し引く自動予算を使い、0 以上では指定 GiB を予算にします。予算に収まらない場合、CPU expert pool がある build では expert をホストメモリにも置く hybrid 配置に切り替わります。
-
-このオプションは通常の `strata-engine/root/` parser ではなく Qwen3.6 専用 parser の option です。`strata` は `--model` または `--native` が指す GGUF の architecture が Qwen3.6 family の場合に専用実装へ振り分けます。
+Qwen3.6 専用エンジンで、routed experts の VRAM 予算を GiB 単位で指定します。expert 配置の上限や hybrid 配置で常駐させる expert slot 数の計算に使われます。モデル本体、コンテキスト、セッション、hybrid 用バッファなどを含むプロセス全体の VRAM 上限ではありません。`strata` はモデルの family を判定して Qwen3.6 の parser に引き渡し、`strata-q36` も同じ parser を使います（`engine/src/program/generate.cpp:3805-3817`、`engine/src/qwen35/q36_engine.cu:5339-5385`）。
 
 ## 使い方
 
 ```sh
-strata --model /path/to/qwen3.6.gguf --serve --expert-vram 20
+# Qwen3.6 の生成で routed experts の予算を 20 GiB にする
+strata --model ./Qwen3.6.gguf --tokens "1 2 3" --n 1 --expert-vram 20
 ```
 
-自動予算を明示する場合は負値を指定します。省略時も同じ自動モードです。
-
-```sh
-strata-q36 --model /path/to/qwen3.6.gguf --serve --expert-vram -1
-```
+同じ引数は、専用実行ファイルがある環境では `strata-q36 --model ...` にも渡せます。索引上もこの option は Qwen3.6 専用 parser の scope に置かれています（`docs/cli/README.md:1240-1255`）。
 
 ## 値と既定値
 
-- 省略時の内部値は `-1.0` です。`--expert-vram -1` など負値は自動予算になります。
-- `0` 以上は GiB で指定した明示予算です。たとえば `20` は `20 × 2^30` bytes に換算されます。0 は「予算なし」相当で、expert の全 VRAM 配置条件を満たしません。
-- 値は `std::atof` で変換され、整数・小数の厳密な文法検証や有限値・正値の検証はありません。数値として読めない文字列は通常 `0` に変換されます。また `20xyz` のような数値で始まる文字列は先頭の数値部分が変換されます。
-- 値が必要なのに後続引数がない場合は `strata-q36: --expert-vram needs a value` を stderr に出して終了コード `2` で終了します。
-- 同じオプションを複数回指定すると、引数走査で後の値が前の値を上書きします。`--expert-vram=20` 形式の parser 分岐はありません。`--serve` より前など通常の不明 option として扱われる位置では usage を出して終了コード `2`、`--serve` の後では server mode の不明 option 処理により警告して無視される場合があります。
+- 値は `std::atof` で `double` に変換されます。明示的な数値形式・範囲検証はありません。省略時の内部値は `-1.0` で、自動予算を選びます（`engine/src/qwen35/q36_engine.cu:5342-5344,5384`）。
+- `--expert-vram` の後に値がない場合は stderr に `needs a value` を出して終了コード 2 で終了します（`engine/src/qwen35/q36_engine.cu:5350-5352`）。同じ option を複数回指定すると、parser の逐次代入により最後の値が残ります（同 `:5348-5385`）。
+- 値が負数なら未指定時と同じ自動予算経路です。0 以上なら指定値に `2^30` を掛けて byte 予算に変換します（`engine/src/qwen35/q36_engine.cu:4264-4266`）。0 は 0 byte の予算になります。
+- 自動予算は配置開始時点の空き VRAM から 768 MiB を差し引いた値（空きがそれ以下なら 0）です。明示値はこの expert 予算を置き換えます（`engine/src/qwen35/q36_engine.cu:4262-4266`）。
 
 ## 実行時の動作
 
-1. Qwen3.6 parser は値を `double` に変換して保持し、モデル読み込みと engine buffer 初期化の後に `place_experts` へ渡します。
-2. 自動モードでは `cudaMemGetInfo` の空き VRAMから 768 MiB を差し引いた量を予算とします。配置時に packed Q8_0 decode copy を解放できる条件も調べ、条件を満たして `STRATA_Q36_KEEP_PACKED` が未設定なら copy を解放して再計測します。
-3. 明示モードでは予算を指定 GiB から換算します。この場合、配置関数内の通常の 768 MiB 自動 reserve 差し引き、packed copy の自動解放、後述の MTP 専用配置判定は使われません。ただし全 expert を VRAM に置く分岐には、予算内であることに加えて実際の空き VRAMに 256 MiB の余裕があることも必要です。
-4. 予算に収まらず hybrid 配置になった場合、`--expert-slots` が正値ならその値（expert 数を上限）を各 layer の GPU slot 数に使い、非正値なら残りの予算から slot 数を算出します。`--expert-slots` が正値のときは、予算が大きくても全 VRAM 配置分岐を使いません。
-5. `--chunk` / `--prefill` を省略または `auto` にした場合の chunk 判定にも使われます。`--expert-slots` が非正値なら、負の `--expert-vram` は空き量と buffer 見積もりを使って fit を判定し、0 以上なら routed expert 量と指定 GiB を比較します。明示予算では自動予算専用の大きな chunk 候補選択を行いません。`STRATA_Q36_CHUNK` が設定されていると、この自動判定結果は環境変数の値（256〜4096 に clamp）で置き換わります。
+`place_experts` は全 routed experts の必要量を計算し、明示値が 0 以上ならその値を予算として、未指定または負数なら自動予算として配置を決めます。全 expert を VRAM に置く条件には、expert 予算に加えて実際の空き VRAM が必要量と追加 256 MiB を満たすことも含まれます（`engine/src/qwen35/q36_engine.cu:4256-4266,4318-4335`）。
 
-## 適用条件と相互作用
+全量を置けない場合、CPU expert pool を含む build では `hybrid_plan` が予算から VRAM 常駐 slot 数を算出し、残りの experts は host memory に置きます。計画には hybrid buffer と headroom の実空き VRAM 条件も適用されます（`engine/src/qwen35/q36_engine.cu:4343-4385`、`engine/include/strata/qwen35/hybrid_fit.hpp:20-35,46-77`）。`--expert-slots` に正数を指定すると hybrid 計画の slot 数はその指定値（expert 数を上限）で決まるため、予算から slot 数を算出する通常経路を上書きします（`engine/include/strata/qwen35/hybrid_fit.hpp:49-63`）。
 
-- 適用対象は Qwen3.6 専用実装です。独立実行ファイル `strata-q36` と、architecture 判定後に専用実装へ転送される `strata --model` / `--native` の双方で処理されます。他 family ではこの専用 parser の意味は適用されません。
-- 自動モードで MTP block があり、通常配置が収まらない場合、main layer experts を全て VRAM に置き、MTP の expert だけ hybrid 配置する判定を行うことがあります。明示した `--expert-vram` はこの例外を無効にし、指定予算に基づく通常の配置判定になります。`STRATA_Q36_NO_MTP_CPU` が設定されている場合も MTP 専用 CPU 配置を抑止します。
-- `STRATA_Q36_KEEP_PACKED` が設定されている場合、自動モードでも packed Q8_0 copy の解放を抑止します。`STRATA_Q36_NO_MTP_CPU` と併せて、これらの環境変数はこの option の配置分岐に関係します。
-- hybrid 配置は全 expert blob をホストメモリに構築し、GPU slot、CPU pool、必要に応じて prompt 用 staging buffer を確保します。main layer が hybrid なら graph を無効化します。したがって予算設定は VRAM の使用だけでなく、GPU/CPU 間の実行経路や prompt chunk の選択にも影響します。
-- CMake の `STRATA_NATIVE_EXPERTS=OFF` build では Qwen3.6 の CPU pool がなく、hybrid 経路を利用できません。全 routed experts が VRAM に収まらないと配置失敗になります。build 条件・Release 配布物の組み合わせは今回確認していません。
+`--chunk` / `--prefill` を省略または `auto` にした場合、chunk の初期選択でもこの予算が参照されます。slot 強制指定がなく、main experts が明示予算以下なら `fits` と判定されて初期値 512 になり、それ以外は空き VRAM に応じて 2048 / 1024 / 512 になります。明示 `--expert-vram` のときは、自動で大きい chunk を探す追加処理（1024 以上の候補選択）は走りません。`STRATA_Q36_CHUNK` があれば後段で 256..4096 に clamp した値に上書きされます（`engine/src/qwen35/q36_engine.cu:5475-5519`）。
+
+自動予算のときだけ、必要量に応じて packed Q8_0 decode copies を解放して全 expert を VRAM に収める経路、および MTP block だけを CPU pool に置く経路が判定されます。明示予算（0 以上）ではこれらの auto-only 分岐条件を満たしません（`engine/src/qwen35/q36_engine.cu:4271-4301`）。
+
+## 適用条件と副作用
+
+- 対象は索引に示された Qwen3.6 専用 parser です。他の model family の parser に同名 option があるとは限りません（`docs/cli/README.md:1240-1255`、`engine/src/program/generate.cpp:3805-3817`）。
+- CPU expert pool なしの build で全 routed experts が VRAM に収まらない場合、配置は失敗します。CPU pool ありでも hybrid 用 buffer / slot が空き VRAM に収まらなければ失敗します（`engine/src/qwen35/q36_engine.cu:4337-4343,4380-4385`）。
+- `--expert-vram` を明示しても、その他の engine buffer や別プロセスの VRAM 使用量までは制限しません。実際の割当失敗は起こり得ます（`engine/src/qwen35/q36_engine.cu:4318-4326,4413-4425`）。
+- Terminal の setup は VRAM reserve を構成すると、GPU の公称 VRAM から 3.0 GiB と予約 MiB を差し引いた値（下限 0）をこの engine option として生成引数に加えます（`terminal/setup.py:9994-9999`）。
 
 ## 出力とエラー
 
-- packed copy を解放した場合は、その容量と「全 expert を VRAM に置くために解放した」旨を stderr に表示します。
-- 全 expert を VRAM に配置できた場合は、使用量と所要時間を stderr に表示します。hybrid の場合は GPU slot 数、ホストメモリの量・pinned/pageable の別、CPU pool、staging 容量などを表示します。
-- CPU pool を含まない build で全 expert が収まらない場合、`the routed experts (...) do not fit in VRAM, and this build has no CPU expert pool` を stderr に出し、呼び出し側は終了コード `1` で終了します。
-- hybrid 用 buffer/slot に空き VRAMが足りない場合は必要量と空き量を含むエラーを出し、終了コード `1` で終了します。メッセージは `--batch` / `--max-context` の縮小を案内し、明示 slot 指定時は `--expert-slots` の縮小も案内します。
+option 固有の値検証エラーや警告は確認できません。CPU pool が無効で VRAM 不足の場合は配置理由を stderr に出し、呼び出し側は終了コード 1 を返します。hybrid 計画が空き VRAM に収まらない場合も不足量と対処候補を stderr に出して終了コード 1 になります（`engine/src/qwen35/q36_engine.cu:4337-4343,4380-4385,5523-5526`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:2393-2407` — `--model` / `--native` の GGUF architecture を確認し、Qwen3.6 family を専用実装へ振り分ける処理。
-- `src/qwen35/q36_engine.cu:3735-3745,3778-3781` — option の初期値、値欠落時の終了、`std::atof` による parser 定義と関連 slot option。
-- `src/qwen35/q36_engine.cu:3817-3865` — engine 初期化後の `--chunk auto` 判定、`STRATA_Q36_CHUNK` による上書き、配置関数の呼び出し。
-- `src/qwen35/q36_engine.cu:2792-2813` — routed expert の容量計算、空き VRAM計測、既定 reserve と明示予算の算出。
-- `src/qwen35/q36_engine.cu:2814-2864` — packed copy の解放条件、MTP-only 配置条件とログ。
-- `src/qwen35/q36_engine.cu:2865-2886` — 全 VRAM 配置条件、および CPU pool がない build の失敗経路。
-- `src/qwen35/q36_engine.cu:2888-2918,2920-3008` — hybrid slot 数・buffer 要求量の判定、失敗経路、ホストメモリと GPU/CPU 配置。
-- `CMakeLists.txt:128,785-788` — `STRATA_NATIVE_EXPERTS` の build option と、Qwen3.6 CPU pool compile definition の条件。
-
-今回の確認は指定 commit のソースと strata-envvars 側の CLI 索引・調査規約に限定しています。同一 revision の既存 CLI help、build 生成物、Release archive は確認していません。
+- `engine/src/program/generate.cpp:3805-3817` — model family による Qwen3.6 parser への振り分け。
+- `engine/src/qwen35/q36_engine.cu:5342-5385` — parser の初期値、値取得、`--expert-vram` 登録。
+- `engine/src/qwen35/q36_engine.cu:4247-4266,4271-4301,4318-4343` — 予算計算、auto-only の配置分岐、全量配置と CPU pool 不在時の失敗。
+- `engine/src/qwen35/q36_engine.cu:4343-4385,4413-4425,5523-5526` — hybrid 配置計画、実 VRAM 不足時の失敗と呼び出し元。
+- `engine/src/qwen35/q36_engine.cu:5475-5519` — auto chunk との相互作用。
+- `engine/include/strata/qwen35/hybrid_fit.hpp:20-35,46-77` — expert budget と forced slot 数から hybrid slot / 必要 VRAM を計画する規則。
+- `terminal/setup.py:9994-9999` — setup が VRAM reserve から `--expert-vram` を組み立てる経路。

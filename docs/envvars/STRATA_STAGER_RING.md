@@ -1,46 +1,43 @@
 # `STRATA_STAGER_RING`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-プロンプト処理で、通常の pinned arena に収まらない expert blob をホスト側で読み込み／コピーし、GPU への DMA に渡すための Stager ring の深さを指定します。各 job は `job 番号 % kRing` のホストバッファを使い、同じバッファを再利用する前に前回の DMA 完了を待ちます。そのため値は同時に先行できるコピー数の上限に関わり、リング用バッファや完了管理データの数も変えます。対象はプロンプトの expert staging 経路であり、通常の pinned expert の読み出しを直接変更する設定ではありません。
+prompt prefill の expert stager が、未 resident の expert blob をコピーしておく host buffer ring の深さを指定する。ring の各 slot は最大 blob サイズのバッファを持ち、コピー thread は DMA が終わった slot を再利用する。値を大きくすると同時に先行できるコピー数と確保する host buffer 数が増える。通常の CUDA/HIP 経路と SYCL 経路に読み取りがある。`Prefill::init` が stager を作るときの設定であり、CLI 引数による上書きは見つからなかった。`engine/src/prefill/prefill.cpp:1121-1129,1156-1162,1297-1305`、`engine/sycl/src/prefill/prefill.cpp:464-472,502-515,620-638`。
 
 ## 値と判定
 
-| 状態 | `kRing` |
-|---|---:|
-| unset、通常の RAM／非 transient source | 16 |
-| unset、GGUF transient source のファイル profile | `4 * threads`（通常 128。`STRATA_STAGER_THREADS` を指定した場合はそのスレッド数の4倍） |
-| 設定あり | `clamp(atoi(value), 2, 256)` |
+両実装とも `std::getenv` で設定有無を見て、設定されていれば `std::atoi` の結果を `std::clamp(..., 2, 256)` に渡す。数値文字列全体の妥当性検査や文字列比較はない。`atoi` が読む数値の接頭部分が使われ、先頭空白や符号も `atoi` の規則で処理される。空文字や数値に変換できない文字列は 0 になり、下限の 2 になる。数値の後ろの文字は検査されず、たとえば `16junk` は 16、`0anything` は下限の 2 になる。範囲内の整数はそのまま、2 未満は 2、256 超は 256 に制限される。`atoi` の整数型範囲外入力の結果はコードで検査されない。`engine/src/prefill/prefill.cpp:1156-1158`、`engine/sycl/src/prefill/prefill.cpp:502-505`。
 
-設定値は `std::atoi` で変換し、結果を 2～256 に clamp します。文字列全体の妥当性は検査しないため、数値の後ろの文字は無視されます。数値に変換できない文字列や空文字は `atoi` が 0 を返すため 2 になります。負値も 2、256 を超える値も 256 です。変換後の値を clamp するので、例えば `1tail` は 2、`20tail` は 20 になります。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値・変換結果 |
+|---|---|---|---|
+| CUDA/HIP および SYCL の stager 初期化 | 通常は 16。`ExpertSource::transient` が true となる file-tier の expert があり、後述の profile 選択も files のままなら `4 * threads` | `2`〜`256`（例: `16`, `16junk`, ` 16` は 16） | `0`, `1`, `-3`, 空文字, `true`, `abc` はいずれも 2。`257` は 256 |
 
-`getenv()` が非 null なら値が明示設定されたものとして扱います。従って空文字も unset とは異なり、2 に設定されます。また、明示設定があればファイル profile の `4 * threads` 自動設定は適用されず、明示値の parse 結果で上書きされます。
+unset 時の `4 * threads` は、stager 初期値 16 を `init` より前に置き換える分岐による。通常 engine では `STRATA_STAGER_THREADS` が設定されていればその `atoi` 値を 1〜32 に制限した値が threads 数となる。未設定なら files profile で 32、通常 profile では hardware concurrency から 2〜4 を選ぶ。通常 engine で `files && !STRATA_STAGER_THREADS` の場合は `STRATA_STAGER_SSD` が非空なら先頭文字が `'0'` 以外で files profile を強制し、空または先頭 `'0'` なら無効にする。未設定または空なら `cached_share(256) >= 0.9` のとき files profile をやめる。SYCL は transient source なら files profile を選び、`STRATA_STAGER_THREADS` の有無でこの分岐自体を無効にはしない。明示的に `STRATA_STAGER_RING` が設定されると、この profile ごとの ring 既定値より `atoi` と clamp の結果が優先される。`engine/src/prefill/prefill.cpp:2523-2546`、`engine/sycl/src/prefill/prefill.cpp:1491-1503`。
 
 ## 有効になる条件
 
-設定は CUDA 系実装と SYCL 実装の Stager 初期化にあります。Stager は `Prefill::init()` で初回に作られ、`m.stager` が存在する間は再初期化されません。値は `static` cache ではありませんが、すでに作られた Stager に対してプロセス実行中に環境を変更してもリング深度は変わらず、新しい Stager の初期化時に読み直されます。
-
-明示設定はファイル source の自動 profile に優先します。CUDA 系では transient source を検出し、`STRATA_STAGER_THREADS` が未指定の場合、さらに `STRATA_STAGER_SSD` またはページキャッシュの判定でファイル profile を使うか決めます。ファイル profile でない場合は通常のスレッド数（2～4）と深さ16が使われます。SYCL では transient source ならファイル profile のスレッド数（指定がなければ32）を選び、リング深度は同様にスレッド数の4倍にします。スレッド数自体は `STRATA_STAGER_THREADS` により1～32に clamp されます。
-
-実際にリングのバッファを使うのは、prompt staging が必要で、expert が source から一時的に読み出されるか、通常メモリ上にあるが pinned でない場合です。全 expert が pinned である場合など、Stager job を使わない経路ではリング深度によるコピー進行の変化はありません。
+- Strata の CUDA/HIP または SYCL engine で prompt prefill の `Prefill::init` が stager を初期化すること。Metal 分岐は `Prefill::init` の冒頭で別経路へ return するため、この stager 設定は使わない。`engine/src/prefill/prefill.cpp:2443-2455`。
+- ring の slot 数は stager 初期化時に配列・host buffer を確保する数となる。CUDA/HIP 側では各 slot に `MAXBLOB()` bytes の buffer を確保し、pinned allocation に失敗した slot は pageable buffer に fallback する。SYCL 側も同じ深さで host allocation を試し、失敗時は pageable buffer を使う。`engine/src/prefill/prefill.cpp:1156-1170`、`engine/sycl/src/prefill/prefill.cpp:502-535`。
+- stager は `m.stager` がまだない場合にだけ作られる。file-tier source の有無は unset 時の自動 ring 値に影響するが、明示値を読む条件にはならない。`engine/src/prefill/prefill.cpp:2523-2555`、`engine/sycl/src/prefill/prefill.cpp:1491-1503`。
+- `STRATA_STAGER_BATCH` は別設定で、CUDA/HIP 経路では job のまとめ数を 1〜32 に制限した後、ring 深さ以下にする。したがってリングを小さくすると batch の実効上限も小さくなる。SYCL の該当箇所では batch 設定を確認できなかった。`engine/src/prefill/prefill.cpp:2547-2555`。
 
 ## 実行時の詳細
 
-初期化時に `kRing` 個のホストバッファと対応する DMA 完了管理要素を用意します。CUDA 系では各バッファに CUDA event、SYCL では event と sequence 管理用 host memory を割り当てます。pinned host allocation に失敗したバッファは pageable な `std::vector` の領域にフォールバックします。Stager の初期化または必要な host buffer/event の準備に失敗すると、prompt 初期化は失敗し、`prefill: host buffers or events for a chunk of ... tokens` をエラーとして返します。
+値は `Stager::init` のたびに読み取られ、読み取った深さで `buf`, `pinned`, DMA event の配列と pageable fallback を初期化する。`Prefill::init` は `m.stager` が null のときだけ stager を作成し、その後の relayout や同じ `Prefill` インスタンス内の再利用では ring 値を読み直さない。したがって初期化後の環境変更は既存 stager に反映されない。プロセス起動時に一度だけ読む static cache ではなく、stager 初期化時の読み取りである。`engine/src/prefill/prefill.cpp:1156-1162,2523-2557`、`engine/sycl/src/prefill/prefill.cpp:502-515,1491-1505`。
 
-コピー thread は job をホストバッファへ読み込み、launch 側はその job の準備完了を待って DMA を queue します。同じ ring slot を再利用するとき、コピー thread は slot の前回 DMA が完了するまで待機します。値を大きくすると先行できる job と同時に確保する staging 用領域が増えます。ログ出力や生成値を直接切り替える環境変数ではなく、この ring 深度を介して prompt の staging／DMA 重なりに影響します。
+worker は job `j` を buffer `j % kRing` にコピーする。以前の job の DMA が終わるまで同じ slot の再利用を待ち、launch thread はコピー完了後にその buffer から device への DMA を記録する。CUDA/HIP では同期 event を使い、SYCL では event / sequence 値を使う。よって ring 深さは host copy が DMA より先行できる幅と host buffer の個数を変える。これは prefill の expert staging 用であり、ソース上では routing や model parameter を選ぶ設定としては使われていない。`engine/src/prefill/prefill.cpp:1205-1248,1297-1305`、`engine/sycl/src/prefill/prefill.cpp:567-638`。
 
-## 文書との照合
+## ログと測定値
 
-`docs/DETAILS.md` は、GGUF を in-place で読む SSD profile の例を32 threads・128 deep ring、通常の RAM profile を既定4 threads・16 deep ring と記載しています。`docs/UNSLOTH_Q4.md` も、GGUF から読み込む場合に `STRATA_STAGER_THREADS` / `STRATA_STAGER_RING` で自動設定を override できると説明しています。現行コードでは、unset 時のファイル profile 深度が `4 * threads` であり、32 threads なら128、通常 profile なら16となるため、記載と一致します。測定値は特定の SSD/GGUF とハードウェアの説明であり、この環境変数単独の性能保証ではありません。
+この変数専用の有効化・無効化ログはない。CUDA/HIP 経路で `STRATA_PF_ALLOC_TRACE` が設定されている場合は、初期化の `prefill alloc trace` 行に stager ring の確保要求量（`kRing * MAXBLOB()` bytes を MiB にした値）が出るが、ring の slot 数そのものを表示する行ではない。`engine/src/prefill/prefill.cpp:1063-1080,2557`。
+
+stager 初期化で CUDA/HIP の event 作成または SYCL の host memory / event 作成に失敗すると `Prefill::init` は失敗する。呼び出し元は `strata generate: <err>` を stderr に出して終了コード 1 を返す。エラー文字列は ring 専用ではなく `prefill: host buffers or events for a chunk of <N> tokens`。SYCL 例外は catch 節で例外文字列と file/line を stderr に出し `exit(1)` する。`engine/src/prefill/prefill.cpp:1156-1171,2632`、`engine/sycl/src/prefill/prefill.cpp:502-534,1596,1635-1638`、`engine/src/program/generate.cpp:24118-24123`、`engine/sycl/src/program/generate.cpp:13354-13359`。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:402-410,435-449` — CUDA 系 Stager の目的、既定値、値の parse/clamp、リング資源の確保。
-- `src/prefill/prefill.cpp:485-505,552-563` — ring slot 再利用時の DMA 完了待ち、job 完了待ち、DMA event 記録。
-- `src/prefill/prefill.cpp:1101-1133,1180` — Stager 初期化、transient/file profile、thread 数と ring 深度の関係、初期化エラー。
-- `sycl/src/prefill/prefill.cpp:344-352,382-417,498-529` — SYCL 側の既定値、parse/clamp、資源確保、job 完了と再利用待ち。
-- `sycl/src/prefill/prefill.cpp:999-1016,1104` — SYCL 側の Stager 作成、file profile と `STRATA_STAGER_THREADS` の扱い。
-- `docs/DETAILS.md:1562`、`docs/UNSLOTH_Q4.md:174-179,228-235` — ring 深度を含むファイル／RAM profile と override の説明。
+- `engine/src/prefill/prefill.cpp:1121-1129,1156-1162,1205-1248,1297-1305,2523-2557`
+- `engine/sycl/src/prefill/prefill.cpp:464-515,567-638,1389-1403,1491-1505,1596,1635-1638`
+- `engine/src/program/generate.cpp:24118-24123`
+- `engine/sycl/src/program/generate.cpp:13354-13359`

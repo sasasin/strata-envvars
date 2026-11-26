@@ -1,47 +1,43 @@
 # `STRATA_TUNE_GPU_LOCK`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-`strata tune auto` と `strata presets recheck` が起動する各測定用 engine の実行中に保持するファイルロックのパスを指定します。複数のチューナーが同じ GPU を使うマシンで、同じロックファイルを指定すると測定 run を順番にできます。この変数は Strata のチューニング CLI が読みます。通常の推論起動には使われません。
+`strata tune auto` と `strata presets recheck` が各測定用エンジンを動かす間、指定ファイルの排他ロックを保持するためのパスです。複数の Strata チューナーが同じロックファイルを指定した場合、そのエンジン実行が重ならないようにします。`tune auto` の計画表示（`--plan`）はエンジンを起動せず、ロックも取得しません。Strata はこの値をエンジンの設定・子プロセス環境へ渡していません。CLI parser が環境変数を `--gpu-lock` の既定値として読み、共通セッションへロック生成関数を渡します（`terminal/strata_cli/tune_commands.py:21-45,88-96,185-189,349-376`）。
 
 ## 値と判定
 
-| 入力 | 動作 |
-|---|---|
-| 未設定 | `--gpu-lock` の既定値は `None`。ロックを作らず、通常どおり測定 run を行う |
-| 環境変数が空文字 | 既定値は `""`。Python の偽値判定でロックを作らない |
-| 環境変数に非空文字列を設定 | その文字列をロックファイルのパスとして使用する |
-| `--gpu-lock PATH` を指定 | 環境変数にかかわらず CLI 引数の `PATH` を使用する |
-| `--gpu-lock ""` を指定 | 空文字が優先され、ロックを作らない |
+| CLI 経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `strata tune auto` / `strata presets recheck` | argparse の既定値は `None`。ロックなし | 空でない文字列。値全体をファイルパスとして使う | 空文字列 `""` はロックなし |
 
-値は数値や真偽値として parse されず、trim・正規化もされません。相対パスは起動時の作業ディレクトリから解決されます。パスの親ディレクトリは必要に応じて作成され、ファイルは append モードで開かれます。
-
-根拠: `strata_cli/tune_commands.py:39-40,85`, `strata_cli/tune_commands.py:132-136`, `strata_control/tune_session.py:196-207`。
+Python の `os.environ.get` で文字列を取得し、数値変換、真偽文字列の解釈、trim、大文字小文字変換、パス形式の事前検証はしません。空白だけの値も空ではないためパスとして使われます。`--gpu-lock PATH` を明示すると環境変数由来の既定値より CLI 値が優先されます。`--gpu-lock ""` を渡した場合は `_lock_factory` の falsy 判定によりロックが無効になります。対象の parser 定義は `terminal/strata_cli/tune_commands.py:21-45,88-96`、無効判定は同 `:185-189` です。
 
 ## 有効になる条件
 
-- `strata tune auto` の測定と `strata presets recheck` の再測定で使われます。各コマンドには環境変数を既定値とする `--gpu-lock` があり、CLI 引数が優先します。
-- 対象処理で `_lock_factory()` が非空のパスを受け取った場合だけロックが有効です。変数が未設定または空文字の場合は無効です。
-- `strata presets` の list/show/apply 等、通常の `serve.server` 起動、その他の実行経路はこの設定を参照しません。
-- 同じパスを指定したプロセス間で協調する advisory lock です。異なるパスを指定したプロセスや、このファイルロックを使わないプロセスを制御する処理はありません。
-
-根拠: `strata_cli/tune_commands.py:20-41,49-90,132-136,217-219,412-430`; CLI parser の登録は `strata_cli/cli.py:486-487`。
+- `strata tune auto` では、対象や設定の検証が通り、`--plan` を指定せず実際の測定に進むことが必要です。計画表示は `auto` 内で `WorkerSession` を作る前に返ります（`terminal/strata_cli/tune_commands.py:349-376`）。
+- `strata presets recheck` では、preset・対象設定・環境同一性の検証を通過して測定に進む必要があります（`terminal/strata_cli/tune_commands.py:615-645`）。
+- どちらも `--gpu-lock` を省略したときは環境変数値が使われます。CLI オプションを指定した場合はその値が使われます（`terminal/strata_cli/tune_commands.py:43-45,91-96`）。
+- OS によってロック実装が分かれます。Windows は `msvcrt.locking`、それ以外は `fcntl.flock` を使用します。待ち方は非 Windows のメインスレッドでは blocking flock、それ以外では polling です（`terminal/strata_control/tune_session.py:224-229,231-277,279-292`）。
+- この設定名を読む箇所は Python CLI の上記 2 箇所だけです。ビルド macro、GPU backend、モデル状態、サーバー通常起動による別の読み取りや適用はありません。
 
 ## 実行時の詳細
 
-環境値は CLI parser の構築時に `os.environ.get()` で読み取られ、parse された引数の既定値になります。auto/recheck 処理はその値から `FileLock` factory を作り、`WorkerSession` に渡します。設定された場合、`WorkerSession.engine()` は engine worker の準備や起動より前にロックを取得し、測定用 engine の終了後に解放します。したがって、同じ Python CLI プロセスの実行中に環境変数を変更しても、既に parse された引数は変わりません。再評価用の static cache はありません。
+環境変数は `add_tune_auto` / `add_presets` が argparse parser に引数を登録するときに一度読み、parser の default に保存します。実行中にプロセス環境を変更しても、その parser にすでに設定された既定値には反映されません。実際に測定を始める際 `_lock_factory` は `gpu_lock` が空かを調べ、空でなければ `FileLock` を返します（`terminal/strata_cli/tune_commands.py:21-45,55-96,185-189,375-376,643-644`）。
 
-Unix のメインスレッドでは `flock(LOCK_EX)` で待ち、その他の経路では 2 秒間隔でロックを再試行します。Windows は `msvcrt.locking` を使って再試行します。どの経路も既定の待ち上限は 5400 秒です。待機に入ると人間向け出力では `waiting for the lock <path>` が記録され、上限超過時は `TIMEOUT` の `StartFailed`（`the lock <path> was not free within 5400 s`）になります。auto の測定ではその失敗は run 結果に記録され、recheck では測定失敗として扱われ、保存済み設定を再調整する判定になります。JSON 出力時は CLI が進捗ログを stderr に出さないため、この待機メッセージは表示されません。
+`WorkerSession.engine` は各エンジン実行の直前にロックを取得し、エンジン起動・測定・停止と後処理を終えて context を抜けるまで保持します。親ディレクトリを作成し、ロックファイルを append モードで開きます（`terminal/strata_control/tune_session.py:224-229,527-570,598-611`）。既定の待ち上限は 5400 秒です。競合時、人間向け出力では `waiting for the lock <path>` を stderr に出します。メインスレッドの POSIX 経路は上限到達で `StartFailed("TIMEOUT", "the lock <path> was not free within 5400 s")`、polling 経路も期限切れで同じ status/reason を返します（`terminal/strata_control/tune_session.py:218-218,231-277`）。JSON モードでは `say` がログを抑制します（`terminal/strata_cli/tune_commands.py:314-315,358-360,639`）。
 
-根拠: `strata_control/tune_session.py:199-210,212-258,260-273,443-450`; auto の失敗結果化は `strata_control/autotune.py:303-338`、recheck は `strata_control/autotune.py:907-923`。JSON モードのログ抑止は `strata_cli/tune_commands.py:178-179,205-208,427`。
+`strata tune auto` では `StartFailed` は測定 trial の失敗 status と reason に記録され、最初の基準測定で発生した場合は「現在の設定を測定できない」結果になり、終了コードは通常の失敗値 `6` になります（`terminal/strata_control/autotune.py:338-354,415-427`; `terminal/strata_cli/tune_commands.py:392-425`）。`recheck` ではロック失敗が `retune` verdict の理由に入り、結果を保存したうえで表示します（`terminal/strata_control/autotune.py:959-975`; `terminal/strata_cli/tune_commands.py:652-661`）。ファイルの作成・オープン自体に失敗した場合は `OSError` となります。`presets recheck` は `presets_command` 内で捕捉して `strata: <理由>` を stderr に出し、`tune auto` は CLI 共通の `OSError` ハンドラに渡します（`terminal/strata_control/tune_session.py:224-229`; `terminal/strata_cli/tune_commands.py:472-531`; `terminal/strata_cli/cli.py:2194-2259`）。
+
+## ログと測定値
+
+ロック競合時の人間向けログは `waiting for the lock <path>`、取得できないまま 5400 秒に達した場合の理由は `the lock <path> was not free within 5400 s` です。前者は人間向けログ関数経由で stderr に出て、JSON モードでは抑制されます。測定値について、この変数による性能変化を Strata の資料で確認できませんでした（`terminal/strata_control/tune_session.py:218-277`; `terminal/strata_cli/tune_commands.py:358-360,639`）。
 
 ## 根拠
 
-- 変数を読む全箇所: `strata_cli/tune_commands.py:39,85`。リポジトリ全体の完全一致検索でもこの 2 箇所以外に参照はありません。
-- 引数の優先順位とロック生成: `strata_cli/tune_commands.py:39-40,85,132-136`。
-- auto/recheck から worker session への受け渡し: `strata_cli/tune_commands.py:217-219,412-430`。
-- ロック取得タイミングと測定用 worker の実行: `strata_control/tune_session.py:443-479`。
-- ファイルロックの OS 別実装、待機上限、ログと timeout: `strata_control/tune_session.py:196-273`。
-- timeout の呼び出し側での扱い: `strata_control/autotune.py:322-338,907-923`。
+- `terminal/strata_cli/tune_commands.py:21-45,88-96` — parser での環境変数読み取りと `--gpu-lock` の既定値。
+- `terminal/strata_cli/tune_commands.py:185-189,349-376,615-645` — 空値の判定、`auto` / `recheck` のセッションへの引き渡し。
+- `terminal/strata_control/tune_session.py:215-292,527-570,598-611` — ロック作成、OS 別取得・解放、測定実行中の保持。
+- `terminal/strata_control/autotune.py:338-354,415-427,959-975` — timeout を含むロック失敗の結果への反映。
+- `terminal/strata_cli/tune_commands.py:358-360,392-425,639,652-661,472-531`; `terminal/strata_cli/cli.py:2194-2259` — ログ抑制、コマンド結果、失敗出力。

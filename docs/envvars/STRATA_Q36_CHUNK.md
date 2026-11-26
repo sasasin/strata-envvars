@@ -1,49 +1,45 @@
 # `STRATA_Q36_CHUNK`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Qwen3.6-35B-A3B（GGUF architecture `qwen35moe`）専用エンジンが使う prompt chunk サイズを指定します。プロンプトを何 token ずつ処理するかを変えます。`strata` はモデルヘッダーから `qwen35moe` を判定した場合にこのエンジンへ切り替わります。単独実行ファイル `strata-q36` も同じ実装を呼びます。
+Qwen3.6-35B-A3B 用 `strata-q36` エンジンが自動で選ぶ prompt chunk（1 回の forward step で処理する prompt token 数）を、指定値で上書きします。通常は利用可能な GPU メモリ、expert の配置、slot 数などから選ばれる値を固定できます。変更するのは prompt の分割幅であり、環境変数自体はモデル、context、KV cache の幅を変更しません。実装は `engine/src/qwen35/q36_engine.cu` の `strata::qwen35::run` です（同ファイル:5339-5347, 5475-5522）。
 
 ## 値と判定
 
-環境変数は `std::atoi` で整数変換し、結果を 256〜4096 に clamp します。文字列全体の妥当性検査はありません。
+環境変数は `std::getenv` で設定有無を見て、設定されていれば値全体の検証なしに `std::atoi` へ渡し、その結果を 256〜4096 に clamp します。`atoi` は先頭の空白と符号を許し、先頭の十進数字列までを変換し、後続文字を無視します。数字として読めない場合（空文字を含む）は 0 となり、下限の 256 になります。大文字小文字を調べる文字列判定はありません（同ファイル:5517）。
 
-| 値 | 結果 |
-|---|---|
-| unset | この変数による上書きなし。自動選択されたサイズを使う |
-| 空文字 | `atoi` の結果 0 を 256 に clamp |
-| 数字 | 整数として変換後、256 未満は 256、4096 超は 4096 |
-| 数字以外で始まる文字列（例 `abc`） | `atoi` の結果 0 を 256 に clamp |
-| 数字の後ろに文字が続く文字列（例 `512abc`） | 数字部分を変換して clamp（この例は 512） |
-| 先頭の空白や符号 | `atoi` の規則で変換される。負数は 256 に clamp |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値・例 |
+|---|---|---|---|
+| `chunk == 0`（既定値、または CLI で `--chunk 0` / `--prefill auto`） | GPU メモリ等に基づく自動選択値 | `256`〜`4096` はその値。`512tail` は 512、`+1024` は 1024 | 空文字、`abc`、`0`、`-1`、`255`、`0anything` は 256 に clamp。`4097` は 4096 に clamp。空白だけも 256 |
+| `chunk != 0`（CLI の `--chunk N` / `--prefill N`） | CLI 指定値 | この変数は参照されず CLI 指定値が使われる | 同左。環境変数の内容は判定されない |
 
-範囲制限は環境変数から得た値にだけ適用されます。`atoi` が表現範囲外の値を受けた場合の結果は C/C++ の規則上保証されないため、設定値として扱えません。
+明示的な CLI 値は `std::atoi` で読み、`auto` だけが 0 になります。CLI 値は環境変数の clamp と異なり、後段の検査で負数または 4096 超過なら `bad --chunk / --max-context` を stderr に出して終了コード 2 になります。CLI 引数を複数回指定した場合は最後の指定が残ります（同ファイル:5348-5364, 5456-5457）。
 
 ## 有効になる条件
 
-- `strata` ではモデルヘッダーが `qwen35moe` の場合に専用エンジンへ切り替わります。`strata-q36` は Qwen3.6-35B-A3B 用です。
-- CLI の `--chunk` または `--prefill` が正の値なら、その値が使われ、この環境変数は読まれません。
-- CLI の `--chunk auto` / `--prefill auto` は内部値 0 になるため、この環境変数の対象です。オプションを省略した場合も初期値は 0 です。
-- CLI で `--chunk` / `--prefill` に 0 を指定した場合も自動選択経路に入り、この環境変数が適用されます。
-- `--chunk` / `--prefill` の CLI 値には 0〜4096 の範囲検査がありますが、環境変数には同じエラー検査ではなく 256〜4096 の clamp が使われます。
+- `strata-q36` の実行、または `strata` が Qwen3.6 (`qwen35moe`) モデルを同じエンジンへ切り替えて実行する経路で有効です（`engine/src/qwen35/q36_main.cpp:1-5`; `engine/cmake/strata_gpu_engine.cmake:565-584`）。
+- CUDA または HIP の GPU engine build が必要です。`strata_qwen35` は HIP gfx906 build では作られず、CUDA/HIP 共通 GPU engine の外（SYCL 等）ではこの読み取り箇所は実行されません（`engine/cmake/strata_gpu_engine.cmake:1-8,565-584`）。
+- CLI の `--chunk` / `--prefill` が既定の 0 または `auto` のときだけ環境変数の値が使われます。正の CLI chunk は環境変数より優先します。自動値を算出した後に環境変数値を代入するため、自動選択時の VRAM 空き量や expert 配置の判定結果は上書きされます（`engine/src/qwen35/q36_engine.cu:5362-5364,5475-5517`）。
+- モデルをロードできない場合は chunk 選択処理に到達せず、環境変数も読みません（同ファイル:5458-5464,5475-5522）。
+- `STRATA_Q36_PLACE_DEBUG` が設定されている場合に限り、選択済み chunk を含む `strata-q36: chunk rule: ...` の stderr 行が出ます。この診断変数が未設定なら、その行は出ません（同ファイル:5518-5520）。
 
 ## 実行時の詳細
 
-モデルをロードした後、`chunk == 0` の場合に限って VRAM の空き容量、全 expert が収まるか、batch/context の条件から初期 chunk を選びます。その後 `STRATA_Q36_CHUNK` が設定されていれば、その自動選択結果を環境変数の値で上書きし、`Engine::init()` に渡します。したがって、明示した正の CLI chunk は環境変数より優先されます。環境変数はエンジン起動時の選択に使われ、リクエストごとには再評価されません。
+引数解析時点では `chunk` の初期値は 0 です。`--chunk` または `--prefill` は数値を `atoi` で読み、文字列 `auto` の場合に 0 を設定します。モデルのロード後、`chunk == 0` のときだけ CUDA の空きメモリとモデル内の expert サイズ等から自動値を決め、その直後に `STRATA_Q36_CHUNK` を 1 回読み、設定済みなら値を上書きします。関数内 static cache やリクエストごとの再読込はありません。選択した値は `E.init(m, ctx, chunk, ...)` に渡り、prompt は `tmax` token 以下の単位で処理されます（同ファイル:5342,5348-5364,5458-5522,1962-1969,3720-3747）。
 
-`STRATA_Q36_PLACE_DEBUG` も設定されている場合、自動選択経路の stderr に `strata-q36: chunk rule: ... chunk N` が出て、上書き後の chunk を確認できます。通常の初期化ログにも `strata-q36: context N cells, prompt chunk N, ... GiB of VRAM free` として実際に使うサイズが表示されます。
+この読み取り箇所からは環境変数値によるエラー終了や警告はありません。変換後の値は clamp されてから engine に渡ります。起動時に一度読むため、その後プロセス環境を変えても選択済み chunk には反映されません。chunk の実値は通常の初期化ログ `strata-q36: context ... prompt chunk ...` に出ます（同ファイル:2254-2259）。
 
-## 文書・測定値との照合
+## ログと測定値
 
-`docs/QWEN36.md` は `STRATA_Q36_CHUNK=512` を `--prefill 512` と同等の設定として説明しています。ソースでは環境変数の上書きは chunk が 0 の自動選択経路だけで行われるため、環境変数を指定する場合は CLI の正の chunk を同時に指定しない必要があります。同文書には chunk 512/1024/2048/4096 の prompt 処理速度や出力比較の測定が記載されていますが、これらは記載された R9700 等の条件下の測定であり、一般的な性能保証ではありません。
+`STRATA_Q36_PLACE_DEBUG` も設定されていると、stderr に `strata-q36: chunk rule: free ... GiB (raw ..., with ... packed), main experts ... GiB, chunk %d` が出て、この変数による上書き後の chunk を確認できます。通常の初期化 stderr 行にも `prompt chunk %d` が出ます。環境変数別の測定値はソースから確認できません（`engine/src/qwen35/q36_engine.cu:5517-5520,2254-2259`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:2253-2265` — `qwen35moe` のモデルで Qwen3.6 専用エンジンへ切り替える。
-- `src/qwen35/q36_main.cpp:1-5`, `CMakeLists.txt:711-724` — 専用エンジンのライブラリと実行ファイル。
-- `src/qwen35/q36_engine.cu:3732-3754` — CLI の初期値と `--chunk` / `--prefill` の parse。
-- `src/qwen35/q36_engine.cu:3805-3809,3814-3859` — CLI 範囲検査、自動選択、環境変数の clamp・上書き、デバッグログ。
-- `src/qwen35/q36_engine.cu:3860,1506-1509` — 選択値を初期化へ渡し、実際の prompt chunk を stderr に表示。
-- `docs/QWEN36.md:163-174` — chunk の説明と測定条件・結果。
+- 候補名の全参照を現行 checkout で `rg` 検索し、実コードで値を読む箇所は `engine/src/qwen35/q36_engine.cu:5517` の 1 箇所と確認しました。docs・settings registry の記載は実装根拠にしていません。
+- 初期値、引数上書き、CLI の値変換: `engine/src/qwen35/q36_engine.cu:5342,5348-5364`。
+- CLI 範囲検査とモデルロード順: `engine/src/qwen35/q36_engine.cu:5456-5464`。
+- 自動選択と環境変数上書き、診断ログ、初期化への引き渡し: `engine/src/qwen35/q36_engine.cu:5475-5522`。
+- 実際の prompt 分割と初期化ログ: `engine/src/qwen35/q36_engine.cu:1962-1969,2254-2259,3720-3747`。
+- 対応 backend / build 条件、standalone と `strata` からの利用: `engine/cmake/strata_gpu_engine.cmake:1-8,565-584`; standalone entry: `engine/src/qwen35/q36_main.cpp:1-5`。

@@ -1,67 +1,61 @@
 # `--access`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25）。調査 checkout は `main...origin/main` で、`git status --short --branch` に未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
 | コマンド | `strata launch` |
-| オプション | `--access KIND` |
+| オプション | `--access` |
 | 別名 | なし |
-| 値 | `local`、`lan`、`cloudflare`、`tailscale` |
-| 既定値 | `local`（preset を読み込む場合は保存値を引き継ぎ、明示した `--access` で上書き） |
+| 値 | `local`、`lan`、`address`、`cloudflare`、`tailscale` のいずれか |
 
 ## 役割
 
-起動する推論サーバーへの到達範囲を選びます。`local` はこのコンピューターだけ、`lan` はローカルネットワーク、`cloudflare` は Cloudflare quick tunnel、`tailscale` は tailnet 経由です。値は前後の空白を取り除いて小文字化してから照合されるため、大文字・小文字は区別されません。
+起動する Strata server をどのネットワーク範囲で利用可能にするか選びます。選択は server の bind host に反映されます。`local` はこの PC 内だけ、`lan` と `tailscale` は全インターフェース、`address` はこの PC の指定アドレス1つ、`cloudflare` は loopback server に Cloudflare quick tunnel を組み合わせます。
+
+## 使い方
 
 ```sh
-strata launch --preset Office --access lan --no-tui
-strata launch --model iq3_xxs --access tailscale --no-tui
-strata launch --plan --model q2_0 --access cloudflare
+# LAN からアクセスできるようにして起動
+strata launch --model q2_0 --access lan --no-tui
+
+# Cloudflare quick tunnel を使って起動
+strata launch --model q2_0 --access cloudflare --no-tui
 ```
 
-## 値と動作
+## 値と既定値
 
-| 値 | bind address と追加動作 |
-| --- | --- |
-| `local` | `127.0.0.1` に bind し、このコンピューター内からのみ接続する設定です。 |
-| `lan` | `0.0.0.0` に bind し、LAN アドレスで到達できるようにします。ネットワークアドレスが見つからない場合は警告しますが、設定値自体は拒否しません。 |
-| `cloudflare` | サーバーは `127.0.0.1` に bind したまま、`cloudflared tunnel --no-autoupdate --url http://127.0.0.1:<port>` を起動して公開 URL を得ます。 |
-| `tailscale` | `0.0.0.0` に bind し、Tailscale のアドレスまたは名前を接続先として表示します。Tailscale が未導入・未接続なら警告しますが、サーバー起動は続けます。 |
+値は大文字小文字を区別せず、前後の空白を取り除いてから小文字化され、上記5種類と照合されます。省略可能な値ではなく、`--access` を指定した場合は必ず1値が必要です。既知の値以外は parser が拒否し、選択肢を示します。型変換後の既定値は `local` ですが、保存済み preset を使う場合はその preset の値が引き継がれ、明示した `--access` で置き換わります。
 
-`--access` を省略したときの `local` は `LaunchSettings` の初期値です。`--preset NAME` を指定するとまず preset を読み込み、コマンドラインの値がその上に適用されます。`--access local` も明示的な値として preset の共有設定を上書きします。
+## 実行時の動作
 
-## API key との相互作用
+- `local` と `cloudflare` は `127.0.0.1` に bind します。`lan` と `tailscale` は `0.0.0.0`、つまり全インターフェースに bind します。`address` は `--listen` の値に bind します。
+- `--listen ADDRESS` を同時指定すると `--access` の指定値にかかわらず access は `address` になり、ADDRESS が使われます。`--listen` なしで `--access address` を指定した場合は、検出したローカルアドレス一覧の先頭を使います。指定アドレスが起動時にこの PC のアドレスでなくなっていれば、全インターフェースへ黙って切り替えず起動を失敗させます。
+- `local` 以外では API key が未設定かつ `--no-api-key` でない場合、既存 launch の key を再利用するか、新しい key を生成します。key なしで共有する設定では、到達可能な利用者がモデルやそのツールを使える旨を警告します。`cloudflare` の key なしはインターネットに公開される危険を明記した警告です。
+- `cloudflare` を選ぶと、利用可能な `cloudflared` がある場合に quick tunnel を開始します。成功時は tunnel URL をアクセス先として扱います。`lan` は検出できた LAN アドレス、`tailscale` は接続済みなら tailnet 名や IP もアクセス先に表示します。
 
-`local` 以外を選び、key がなく、preset も key なしを指定していない場合、launch は以前の key を再利用できればそれを使い、なければ新しい key を生成します。`--api-key KEY` または `--api-key-env NAME` で明示した key はこの自動選択に優先します。`--no-api-key` は key なし共有を明示し、その場合も拒否されず警告が出ます。key を明示したうえで `--no-api-key` を付けた場合は key が保持され、警告されます。
+## 適用条件と副作用
 
-key なしで LAN/Tailscale に共有すると、そのアドレスへ到達できる利用者がモデルを使えます。Cloudflare はインターネット上で URL を知る利用者が到達でき、ソースの警告ではモデルとそのツールを通じてコンピューター上のファイルを読んだり変更したりできる旨を案内しています。key なし公開を選ぶ場合は、この警告を考慮してください。
+`lan` にローカルネットワークアドレスがない場合、`address` にローカルアドレスがない場合、または `tailscale` が未導入・未接続の場合、起動経路は不足条件を警告します。Cloudflare helper が見つからない場合も案内を警告しますが、server 自体はこの PC 上で動作し続けます。これらの helper の不足を理由に firewall、router、Tailscale の設定を Strata が変更することはありません。
 
-## 適用条件、副作用、失敗経路
+Windows で `lan`、`address`、`tailscale` を使うと、python.exe のネットワーク許可を求める Windows firewall prompt が出ることがあります。`lan` や `tailscale` を選ぶと全インターフェースに bind するため、API key を設定しない場合はアクセス可能な相手が server を利用できます。
 
-- `--plan` は選択した access と port を計画として表示して終了し、通常起動時の server や Cloudflare tunnel を開始しません。
-- 通常の起動では、launch 用 config に access から決まる host と port、key の設定を書き、launch profile の host/port override も同じ値に置き換えます。`--save-preset` を使わなければ、preset を基にした CLI の変更は通常その起動に適用されます。
-- LAN アドレスが見つからない、Tailscale が未導入・未接続、または Cloudflare helper がない場合、access の問題は警告として出ます。Cloudflare helper がない場合も server はこのコンピューター上で稼働します。
-- Cloudflare helper が見つかった場合、Strata は `cloudflared` を別プロセスで起動し、最大45秒 URL を待ちます。URL を取得できなければその tunnel を停止して警告を返しますが、server 自体はこのコンピューター上で動作します。成功時は Cloudflare URL を表示します。停止時はこの launch が開始した tunnel だけを終了します。
-- server 起動自体が失敗すると、runner は `LaunchError` を返し、CLI は理由と次の手順を表示して終了コードを返します。access の helper 警告は server 起動後に評価されるため、server 起動失敗時には access URL まで進みません。
-- `lan` と `tailscale` は `0.0.0.0` bind ですが、この処理は firewall、router、Tailscale の設定を変更しません。Windows の人向け表示では LAN/Tailscale 選択時、初回のネットワーク許可確認について案内します。
+## 出力とエラー
 
-## 入力検証
-
-指定できるのは `local`、`lan`、`cloudflare`、`tailscale` の4値です。別の値を渡すと argparse の型変換が拒否し、候補と近い綴り（あれば）をエラー表示します。値は小文字化されるため `LAN` は `lan` として受理されます。port の数値範囲は同じ parser の `--port` が別途検証します。
+未知の値は argparse の型変換で拒否され、候補値と近い入力があれば候補を示します。`address` の listen 先が現在のローカルアドレスでない場合、起動前検査が `LaunchError` と終了コード `2` を返します。利用可能な helper やアドレスの不足は、起動を必ず中止するのではなく警告として出力される経路があります。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:37-45,75-82,119-126` — choice 値の正規化・検証、`--access` の parser 定義と関連する API key オプション。
-- `strata_cli/launch/settings.py:23-25,77-100` — 許可値と `LaunchSettings.access` の既定値。
-- `strata_cli/launch/cmd.py:197-203,252-269,341-350` — preset 読み込み、CLI 値の適用、共有時の key 再利用・生成と `--no-api-key` の扱い。
-- `strata_cli/launch/settings.py:168-191` — key なし共有の警告と access 検査。
-- `strata_cli/launch/access.py:1-6,28-32,270-296,299-304` — host bind の対応、アドレス・helper の検出、Windows firewall 案内、firewall 等を変更しないこと。
-- `strata_cli/launch/runner.py:371-382,1235-1263` — access に基づく run config、key の反映、launch config と profile の書き込み。
-- `strata_cli/launch/runner.py:1560-1605,1674-1694,2011-2044` — server 起動失敗、起動後の access 処理、plan と通常実行の順序。
-- `strata_cli/launch/access.py:376-423,426-449` — Cloudflare tunnel の起動、最大待ち時間、失敗時の停止、状態記録と停止処理。
-- `strata_cli/launch/settings.py:173-191`、`strata_cli/launch/runner.py:1674-1694` — LAN/Tailscale/Cloudflare helper が使えない場合の警告継続。
-- `docs/cli/README.md:925-935` — `strata launch` のコマンド階層と本 option 文書への索引リンク。
+- `terminal/strata_cli/launch/cmd.py:35-43` — choice 値を trim・小文字化して許容値と照合し、無効値を parser error にする。
+- `terminal/strata_cli/launch/cmd.py:130-140` — `strata launch` parser の `--access` 宣言と共有関連 option の scope。
+- `terminal/strata_cli/launch/settings.py:23-28`、`terminal/strata_cli/launch/settings.py:143-145` — 許容値と設定既定値 `local`、`listen` の保存先。
+- `terminal/strata_cli/launch/cmd.py:278-286` — 明示 access の適用、`--listen` が `address` に設定を上書きする処理、listen 省略時のアドレス選択。
+- `terminal/strata_cli/launch/cmd.py:402-413`、`terminal/strata_cli/launch/settings.py:246-264` — 共有時の API key 再利用・生成と、key 不在時の警告条件。
+- `terminal/strata_cli/launch/access.py:28-36`、`terminal/strata_cli/launch/runner.py:724-739` — access 値から bind host を導き、実行 config に host・port・key を設定する処理。
+- `terminal/strata_cli/launch/access.py:77-84`、`terminal/strata_cli/launch/runner.py:3296-3308` — address の再検査と、条件不一致時に起動前に停止する経路。
+- `terminal/strata_cli/launch/access.py:327-363`、`terminal/strata_cli/launch/runner.py:2884-2904` — helper・ネットワーク状態の確認、警告、URL 表示、Cloudflare tunnel 開始経路。
+- `terminal/strata_cli/launch/settings.py:241-264` — key なしで共有する場合の注意文。
+- `terminal/strata_cli/launch/cmd.py:1011-1014` — `ValueError` と割り込み時の失敗出力・終了コード。
 
-調査範囲は指定 commit の Terminal CLI ソース checkout です。別 revision のインストール済み CLI、OS ごとの firewall の実際の表示、外部サービス側の到達性は実行確認していません。
+調査対象は上記 commit の Strata checkout 内の parser と実装に限定しました。実際の OS firewall 表示や Cloudflare/Tailscale 側のネットワーク動作は実行しておらず、Strata ソースが示す条件と処理までを記載しています。

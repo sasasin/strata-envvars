@@ -1,49 +1,57 @@
 # `STRATA_MTP_FULL_HEAD`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-MTP ドラフターの候補語彙を、通常の `draft_vocab.bin` による部分集合から、メインモデルの出力ヘッド全語彙へ切り替える診断用フックです。ソースコメントは、部分集合による受理率への影響を全語彙ヘッドと比較する用途を示しています。通常設定では部分集合の行をメインヘッドから gather して専用の draft head として使います。この変数が有効なら gather を行わず、MTP のドラフト計算でメインヘッド全体を直接使います。
+MTP drafter がドラフト候補を計算するとき、`rt/draft_vocab.bin`（または `--mtp-draft-vocab FILE`）で選んだ語彙部分集合を使わず、native model の出力 head 全体を使う診断用スイッチである。CUDA/HIP 実装と SYCL 実装の両方で、部分集合 head のロードを飛ばし、ドラフト head の行列積に native head の重みを渡す。ドラフト候補の語彙幅は部分集合の件数でなくモデル全体の語彙数になる（`engine/src/core/mtp.cpp:939-945,1516-1519`、`engine/sycl/src/core/mtp.cpp:612-617,820-825`）。
+
+これは MTP が使われる実行経路にだけ関係し、MTP 自体を有効にはしない。`--mtp` と `--spec T`（`T >= 2`）が必要で、`--spec` が足りないと `--mtp` は無視される（`engine/src/program/generate.cpp:8243-8247`）。Metal では共通 `MtpDrafter::bind` が即時 return するため、この bind 内の部分集合選択は実行されない（`engine/src/core/mtp.cpp:908-913`）。
 
 ## 値と判定
 
-`getenv()` の値が存在し、先頭文字が `1` の場合だけ有効です。文字列全体の比較や数値変換はしません。
+CUDA/HIP 共通実装および SYCL 実装では、`std::getenv` の戻り値が null でなく、かつ先頭文字が `'1'` かだけを関数内 `static const bool` に保存する。文字列全体の parse・比較はしない（`engine/src/core/mtp.cpp:693-696`、`engine/sycl/src/core/mtp.cpp:615-618`）。
 
-| 環境変数の値 | 判定 |
-|---|---|
-| 未設定 | 無効。通常の部分集合を読み込む |
-| 空文字 | 無効。通常の部分集合を読み込む |
-| `1`、`10`、`1anything` | 有効 |
-| `true`、`01`、` 1`、`0` など | 無効 |
+| 判定箇所 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| MTP の subset 読み込み抑止・full-head 動作 | full head モードではない | 先頭が `1` の値（`1`, `10`, `1anything`） | 空文字、`0`, `0anything`, `true`, ` 1` など |
+| `mtp_first_ok`（layer split で drafter を最初の stage に置く判定） | subset file の有無など他条件を評価 | 先頭が `1` なら配置不可 | 先頭が `1` でなければこの変数による拒否なし |
+| DFlash2 の MTP head 共有見積もり | 共有候補になり得る | 値を問わず「設定あり」として共有見積もりを無効化 | 該当なし（空文字を含め、設定されていれば無効） |
 
-判定結果は `full_head_env()` 内の関数ローカル `static const bool` にキャッシュされます。最初にこの関数が呼ばれた後にプロセス環境を変更しても反映されません。読み取り箇所は CUDA/HIP 用 `src/core/mtp.cpp` と SYCL 用 `sycl/src/core/mtp.cpp` の各1箇所で、判定内容は同じです。
+MTP 側の読み取りは初回呼び出し時に `static` へ cache され、そのプロセス中の環境変更は反映されない。対して `generate.cpp` の2箇所は初期化時に直接 `getenv` し、MTP 側の先頭文字判定と、DFlash2 見積もり側の設定有無判定は別の規則である（`engine/src/program/generate.cpp:6540-6546,8408-8410`）。大文字小文字や数値としての妥当性は検査しない。
 
 ## 有効になる条件
 
-- `--mtp` で MTP ドラフト層を使い、`--spec T`（`T >= 2`）の実行経路に入る必要があります。`--mtp` は省略可能で、`--spec` が2未満なら generate は `--mtp` を無視します。
-- MTP の `bind()` がメインの native output head を必要とします。ヘッドがない、または未ロードなら bind はエラーになります。
-- 対象は Strata の MTP 実装内の分岐です。CUDA/HIP 系と SYCL 系で同じ分岐があります。
-- `--mtp-draft-vocab FILE` で別の部分集合ファイルを指定していても、この変数が有効な場合は部分集合の読み込み分岐自体を通らず、ファイルを使いません。
-- `--expert-cache auto` の VRAM 見積もりにも同じ判定が使われ、部分集合 head 用の追加容量を予約しません。`--expert-cache` を明示して自動見積もりを通らない場合でも、bind 時の分岐は適用されます。
+- `--mtp` が指定され、`--spec` が 2 以上であること。MTP がロードされない経路では MTP 側の full-head 動作はない（`engine/src/program/generate.cpp:8243-8253,8264`）。
+- CUDA/HIP または SYCL の MTP 実装であること。CUDA/HIP の `engine/src/core/mtp.cpp` と SYCL の `engine/sycl/src/core/mtp.cpp` は同じ先頭文字判定を持つ。Metal は共通 bind 内の subset 読み込みに進まない（`engine/src/core/mtp.cpp:908-913`）。
+- `--mtp-draft-vocab FILE` や `<mtp>/draft_vocab.bin` が存在しても、full-head 判定が有効なら MTP はその subset を読み込まず、通常の subset head は作らない。値が無効または未設定なら、通常どおりファイルの存在と内容が処理される（`engine/src/core/mtp.cpp:939-945`、`engine/sycl/src/core/mtp.cpp:820-825`）。
+- layer split で drafter を最初の stage に置くには、別途 `--mtp`、`--spec >= 2` と draft vocabulary ファイルが必要であり、変数が先頭 `1` の場合は `mtp_first_ok` が false になる（`engine/src/program/generate.cpp:6538-6546`）。
+- `STRATA_MTP_FULL_HEAD` が設定されていると、値が空または先頭が `1` 以外でも `df2_expect_share` は false になる。この変数は MTP の full-head 判定とは異なり、DFlash2 の head 共有を見込むメモリー見積もりを抑止する条件である（`engine/src/program/generate.cpp:8404-8410`）。
 
 ## 実行時の詳細
 
-通常は `bind()` が `vocab_file()`（既定は `<mtp>/rt/draft_vocab.bin`。CLI で別ファイルを指定可能）を読み、4バイト整数列として妥当なサイズなら token ID 一覧を保持し、その語彙数分の head 行を `gather_rows()` でメイン native head からコピーします。ファイルがない、またはサイズが不正なら、この箇所では部分集合 head を作らず、全語彙 head の経路になります。
+MTP の `full_head_env()` は `bind_bytes()` と `bind()` の subset 処理より前に参照される。初回参照時に環境値を一度だけ読む。full-head が有効なら `bind_bytes()` は subset head の追加バイトを見積もらず、`bind()` は語彙ファイルからの ID 読み込み・native head 行の gather を行わない（`engine/src/core/mtp.cpp:772-780,939-945`、`engine/sycl/src/core/mtp.cpp:654-669,820-825`）。
 
-`STRATA_MTP_FULL_HEAD` が有効なら `bind()` の部分集合ロード条件が偽になり、`dhead_` は null のままです。ドラフト計算は `dhead_` が null の場合にメイン native head の重みと `n_vocab_` を使い、全語彙の logits から候補を選びます。部分集合 ID への変換も行いません。`bind_bytes()` も部分集合ファイルの容量を加算しません。ドラフト logits 用バッファの見積もりは引き続き必要です。
+ドラフト計算では `dhead_ == nullptr` のため、native head の全語彙行と全語彙数が使われる。部分集合 ID への逆写像も行わず、候補 ID はそのまま全語彙の ID として扱われる（`engine/src/core/mtp.cpp:1516-1543`）。この設定は MTP の候補計算を変えるもので、別の verifier をなくしたり MTP の起動条件を置き換えたりはしない。
 
-batch 用など共有ドラフターを bind する場合、共有先は共有元の `dhead_`、語彙数、token map を引き継ぎます。したがって、共有構成では環境変数の判定が共有元で選ばれた head に反映されます。
+MTP の head share は subset が実際にロードされている場合に限り可能であり、`draft_head_view()` は `dhead_` と `dvocab_` がないと false を返す。したがって full-head では DFlash2 へ subset head を渡さない（`engine/src/core/mtp.cpp:789-799`、`engine/src/program/generate.cpp:8411-8418`）。ただし `df2_expect_share` のメモリー見積もりは環境変数の設定有無だけを条件にするため、空文字や `0` でも共有を見込まない。
 
-この変数自体の専用ログ出力は見当たりません。MTP 層が draft 候補を提案し、その候補を検証 window が確認する構成です。全語彙にすると提案候補や計算量、head のメモリ要件が変わり得ます。ソースおよび `docs/DETAILS.md` から、この環境変数を使った性能値や受理率の実測値は確認できません。ドキュメントは通常時の部分集合を説明していますが、この診断変数は記載していません。
+## ログと測定値
+
+この変数専用の有効ログや無効値警告はない。`--mtp-q4 head` または `--mtp-q4 all` と組み合わせ、subset head がない場合は stderr に次の警告を出す。これは full-head 設定だけでなく、subset ファイルが不在または空の場合にも出る。
+
+```text
+strata mtp: --mtp-q4 head/all has no effect: it requantizes the draft head's subset, and none is installed (rt/draft_vocab.bin or --mtp-draft-vocab FILE is absent or empty, or STRATA_MTP_FULL_HEAD=1 excludes it); drafting runs over the full head. Install a subset (tools/draft_vocab.py) to use it
+```
+
+subset 読み込みの失敗をこの変数が直接エラーにすることはない。full-head 経路では subset の割り当て・gather が省かれる一方、native head と MTP logits の確保は別途必要であり、確保失敗時には通常の MTP エラー経路となる（`engine/src/core/mtp.cpp:921-925,939-951,1007-1014`）。この変数による性能測定値は、調査対象ソース・資料から確認できない。
 
 ## 根拠
 
-- `src/core/mtp.cpp:456-463`, `sycl/src/core/mtp.cpp:549-556`: 環境変数の読み取り、先頭文字判定、診断用途のコメント。
-- `src/core/mtp.cpp:490-499`, `sycl/src/core/mtp.cpp:591-600`: `bind_bytes()` で部分集合 head の容量を見積もる条件。
-- `src/core/mtp.cpp:610-665`, `sycl/src/core/mtp.cpp:730-780`: native head の必須条件、部分集合ファイルの読み込み、行の gather。
-- `src/core/mtp.cpp:977-1003`, `sycl/src/core/mtp.cpp:1125-1146`: `dhead_` の有無に応じて部分集合または全語彙の head を使い、必要時だけ ID を map する処理。
-- `src/program/generate.cpp:4436-4453`: `--mtp` と `--spec` の適用条件、MTP 初期化。
-- `src/program/generate.cpp:4830-4846`, `sycl/src/program/generate.cpp:4297-4312`: 自動 expert-cache 容量計算での MTP bind 用 VRAM 予約。
-- `include/strata/core/mtp.hpp:65-67,78-83,207`: `--mtp-draft-vocab` の設定と既定ファイル名、bind 用容量 API。
-- `docs/DETAILS.md:128-144`: 通常の MTP 部分語彙とその説明。ここには `STRATA_MTP_FULL_HEAD` の説明や同変数を用いた測定値はありません。
+- `engine/src/core/mtp.cpp:691-696` — CUDA/HIP 側の値判定と static cache。
+- `engine/sycl/src/core/mtp.cpp:612-618` — SYCL 側の値判定と static cache。
+- `engine/src/core/mtp.cpp:772-780,908-945`、`engine/sycl/src/core/mtp.cpp:654-669,790-825` — subset のメモリー見積もりと bind 時の読み込み条件。
+- `engine/src/core/mtp.cpp:1516-1543` — subset がない場合に full vocabulary でドラフトを計算する経路。
+- `engine/src/program/generate.cpp:8243-8253,8264` — `--mtp` / `--spec` 条件と MTP のロード。
+- `engine/src/program/generate.cpp:6538-6546,8404-8418` — layer split 配置と DFlash2 head 共有見積もり・提供条件。
+- `engine/src/core/mtp.cpp:1007-1014` — `--mtp-q4` と subset 不在時の警告および bind の失敗伝播。

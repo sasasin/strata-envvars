@@ -1,60 +1,66 @@
 # `--tokens`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` の Qwen3.6 family parser / `strata-q36` |
+| コマンド | `strata` の Qwen3.6 parser（または専用実行ファイル `strata-q36`） |
 | オプション | `--tokens` |
 | 別名 | なし |
-| 値 | prompt の token ID 列。カンマまたは空白で区切る |
+| 値 | 10 進整数の token ID 列。カンマまたは空白で区切る |
 
 ## 役割
 
-トークナイザーを介さず、数値 token ID の列を Qwen3.6 engine に prompt として渡します。Qwen3.6 専用 parser は `strata-q36` executable と、`strata` が Qwen3.6 family に切り替わった場合に使われます。通常 engine parser の `--tokens` とは別 scope です（索引の [Qwen3.6 節](../../README.md)）。
+Qwen3.6 エンジンに token ID の prompt を直接渡し、その prompt を処理して greedy decode した token ID 列を得る単発実行用オプションです。テキスト tokenizer で prompt を変換する経路ではありません。画像を含む prompt は、`<|image_pad|>` の ID 列に `--emb` と `--vision` を組み合わせて渡します。
 
 ## 使い方
 
 ```sh
-strata-q36 --model /path/to/model.gguf --tokens '248045,846,198' --n 32
-```
+# Qwen3.6 モデルの token ID 1, 42, 314 を prompt として処理し、既定数を生成
+strata --model /path/to/qwen36.gguf --tokens 1,42,314
 
-`strata` から呼び出す場合も、Qwen3.6 family に選択されたとき専用 parser に引数が渡ります。Qwen3.6 専用実装では `--tokens-file` は定義されていません。
+# 専用エンジンを直接呼び出し、生成数を 8 にする
+strata-q36 --model /path/to/qwen36.gguf --tokens "1 42 314" --n 8
+```
 
 ## 値と既定値
 
-- 値は1つの文字列で、`,` または `strtol` が前置空白として扱う空白を区切りに読み取られます。usage にはカンマ区切り形式が記載されています。
-- オプション自体に既定値はありません。通常の一回生成モードでは空の token 列となり、空列はエラーになります。`--tokens` を複数回指定すると、後の値が前の値を置き換えます。
-- `parse_ids` は `strtol` で各数値の先頭部分を読み、`int32_t` に変換します。負数や語彙範囲外の値を拒否する検査はこの parser にありません。また、数値として読めない部分に達するとそこで解析を止め、すでに読んだ ID があればその列を返します。そのため、厳密な整数列 validation が必要な入力ではありません。
-- 値を省略すると `strata-q36: --tokens needs a value` を stderr に出して終了コード 2 で終了します。
+- `--tokens` は次の引数を文字列として受け取り、`parse_ids()` が `strtol(..., 10)` で先頭から整数を読みます。カンマと空白を読み飛ばし、整数に変換できない位置に達するとそこで解析を止めます。したがって値全体が厳密に検証されるわけではありません（`engine/src/qwen35/q36_engine.cu:4604-4615`）。
+- 省略時は空文字列です。`--serve` またはベンチマーク経路でない通常実行では、解析後に prompt が空なら `strata-q36: --tokens, --serve or --bench-pp is required` を標準エラーに出し、終了コード 2 で終了します（`engine/src/qwen35/q36_engine.cu:5340-5343, 5595-5596`）。
+- 同じオプションを複数回指定すると parser の文字列代入により最後の値が残ります（`engine/src/qwen35/q36_engine.cu:5364`）。値を省略すると `--tokens needs a value` を標準エラーに出して終了コード 2 です（同 `5350-5352`）。
+- token ID の範囲はこの単発経路で事前検証されません。サーバーの `GEN` request には別途語彙範囲検証がありますが（`engine/src/qwen35/q36_engine.cu:5067-5085`）、その検証を `--tokens` に適用するコードは確認できません。
 
 ## 実行時の動作
 
-通常の一回生成モードでは、読み取った列を `prompt` として `Engine::process` に渡し、その後 greedy token を生成します。`--n` と `--max-new` は同じ生成数を設定し、両方を指定した場合は後に現れた方が有効です。指定がなければ 64 です。`--force` の列が空でなければ、生成数はその列の長さ + 1 に置き換わります。`--greedy` はこの経路では何もせず、生成は元から greedy です。
+通常経路では解析した ID 列を `E.process()` に渡し、prompt 全体の状態と最後の token の logits を作ってから `E.greedy()` で次 token を生成します（`engine/src/qwen35/q36_engine.cu:3685-3727, 5595-5612, 5639-5649`）。生成列は標準出力へ `gen: <ID> ...` の形式で出力し、prompt/生成時間などの集計は標準エラーへ出します（同 `5650-5657`）。`--tokens` 単独では出力テキストに復号しません。
 
-`--tokens` は serve / benchmark と組み合わせても一回生成経路には使われません。serve mode は request ごとに token 列を受け取り、benchmark mode は別途合成 token 列を作ります。`--mtp` を有効にして通常生成する場合も同じ prompt を使い、MTP 経路で生成・検証します。
+既定の生成数は 64 で、`--n` がその数を設定します。`--max-new` も同じ変数を設定するため、両方を指定したときは引数列で後に現れた方が有効です。強制 token 列の `--force` が空でなければ、生成数はその列の長さ + 1 に置き換わり、通常の逐次 decode 経路で指定した token を次の入力として使います（`engine/src/qwen35/q36_engine.cu:5340-5343, 5356, 5365-5366, 5595-5597, 5639-5649`）。
+
+`--mtp N` が有効でモデルに MTP block がある場合、`--force` が空かつ `--dump-full-logits` の出力ファイルを開けていない単発経路では speculative decode 分岐を通ります。ここでも prompt は `--tokens` の ID 列で、生成は greedy です（`engine/src/qwen35/q36_engine.cu:5614-5637`）。`--greedy` はこの parser では何もしません。`--tokens` 経路自体が greedy と明記されています（同 `5360`）。
+
+`--serve` が指定されている場合は `serve(E)` に入り、通常の `--tokens` 処理より先に戻ります。正の `--bench-pp` または `--bench-tg` があればベンチマーク経路も token 列の処理より先に実行されます（`engine/src/qwen35/q36_engine.cu:5561-5564, 5595-5596`）。
 
 ## 適用条件と副作用
 
-- `--model` が必要です。通常生成では token 列が空だと、model load と（既定で有効な）warmup の後に必要引数エラーを出します。
-- 通常の一回生成経路には、prompt 長と context 長の比較や prompt token ID の語彙範囲検査が見当たりません。`Engine::process` は受け取った列を chunk に分けて処理します。意図しない ID や context を超える列を安全に扱えるとはソースから確認できないため、有効な model の token ID と context 内に収まる列を指定してください。
-- serve 経路では別途、各 request の token 列が空でないこと、`prompt + max_new` が context 内に収まること、各 ID が語彙範囲内であることを検査します。失敗 request は `ERR ...` を stdout に出し、その request を処理しません。
-- `--tokens` 自体によるファイル書き込みやネットワーク通信はありません。通常生成は prompt と生成 token ID を `gen:` 行として stdout に出し、処理時間等を stderr に出します。
+- Qwen3.6 専用 parser のオプションです。`docs/cli/README.md` は `strata` / `strata-q36` の Qwen3.6 専用 scope に索引し、parser は `engine/src/qwen35/q36_engine.cu` の `strata::qwen35::run()` にあります（`docs/cli/README.md:1242-1275`; ソース `engine/src/qwen35/q36_engine.cu:5339-5348`）。
+- `--emb FILE` を使う場合は `--vision` も必要です。ファイルが開けない、形式・幅が不正、画像数と `<|image_pad|>` の数が合わない、prompt が画像 marker で終わる場合などはエラー文字列を標準エラーへ出して終了コード 2 になります（`engine/src/qwen35/q36_engine.cu:4638-4702, 5601-5608`）。
+- `--dump-full-logits FILE` を併用し、出力ファイルを開けた場合は `wb` で開くため同名ファイルが切り詰められます。各生成 step で logits を float のバイナリとして書き込み、MTP speculative 分岐は使いません（`engine/src/qwen35/q36_engine.cu:5598-5599, 5614, 5640-5645, 5650`）。
+- `--model` は `--tokens` とは別に必須です。モデル読込後に `--tokens` が空と判定されたときの終了コードは 2 です（`engine/src/qwen35/q36_engine.cu:5420, 5458-5464, 5595-5596`）。
 
 ## 出力とエラー
 
-- 通常生成で token 列が空の場合、`strata-q36: --tokens, --serve or --bench-pp is required` を stderr に出して終了コード 2 になります。
-- `--tokens` に値がない場合は前述の parser エラーで終了コード 2 です。
-- 一回生成経路に明示的な token 値検証がないため、不正値に対する専用エラー出力は確認できません。値の解釈で安全に処理できる範囲は parser だけから保証できません。
+- `--tokens` の値がない場合、または単発実行で prompt が空の場合は標準エラーにエラーを出し終了コード 2 です（`engine/src/qwen35/q36_engine.cu:5350-5352, 5595-5596`）。
+- `--tokens` が空で、`--serve` もベンチマークも指定されていない場合も同じ空 prompt エラーになります（同 `5561-5564, 5595-5596`）。
+- 成功時は生成 token ID を標準出力へ、処理時間と生成速度を標準エラーへ出します（`engine/src/qwen35/q36_engine.cu:5650-5657`）。
 
 ## 根拠
 
-- 専用 parser と既定値: `src/qwen35/q36_engine.cu:3735-3761`（`tokens` の初期値、`--tokens`、`--n` / `--max-new`、`--greedy`）。
-- token 列の読み取り規則: `src/qwen35/q36_engine.cu:3058-3069`。
-- 通常生成の空列エラー、prompt 適用、出力: `src/qwen35/q36_engine.cu:3916-3933`, `src/qwen35/q36_engine.cu:3960-3978`。warmup 呼び出しは `src/qwen35/q36_engine.cu:3890`。
-- prompt の chunk 処理: `src/qwen35/q36_engine.cu:2429-2470`。
-- serve request の長さ・語彙検査: `src/qwen35/q36_engine.cu:3494-3512`。
-- 独立 executable の entry point と build target: `src/qwen35/q36_main.cpp:1-5`, `CMakeLists.txt:790-794`。
+- `engine/src/qwen35/q36_engine.cu:5339-5368` — Qwen3.6 parser と `--tokens`、`--n`、`--force`、`--emb` の受理。
+- `engine/src/qwen35/q36_engine.cu:4604-4615` — token ID 列の変換規則。
+- `engine/src/qwen35/q36_engine.cu:3685-3748, 5595-5657` — prompt 処理、greedy decode、MTP 分岐、出力。
+- `engine/src/qwen35/q36_engine.cu:5067-5085` — サーバー request 側にある token ID の範囲検証。
+- `engine/src/qwen35/q36_engine.cu:4638-4702, 5601-5608` — 画像埋め込みファイルの読み込みと条件・失敗経路。
+- `docs/cli/README.md:1242-1275` — `strata-engine` の Qwen3.6 command path と索引項目。
 
-調査はこの checkout のソースと索引に限定しました。同一 revision の既存バイナリによる `--help` は確認していません。専用 parser には `--help` action がなく、parser 宣言と処理箇所を根拠にしています。
+調査対象は指定 revision の checkout 内ソースに限定しました。既存バイナリの `--help` は実行していません。

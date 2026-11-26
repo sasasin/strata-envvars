@@ -1,62 +1,65 @@
 # `--rope-scale`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-24 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat` 等の wrapper からも同じ parser を使用） |
+| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat` などから同じ setup に渡される） |
 | オプション | `--rope-scale` |
 | 別名 | なし |
-| 値 | 浮動小数点数 `F` |
+| 値 | 浮動小数点数 `F`。有限値かつ `F >= 1` |
 
 ## 役割
 
-標準の Strata モデルセットアップで、RoPE（回転位置埋め込み）の拡張係数を指定します。学習済みコンテキスト長 262144 を越えるコンテキストで拡張率を手動指定する用途が中心です。`setup.py` はこの値を `--rope-scaling` の方式（`linear` または `yarn`）と組み合わせて起動設定に保存し、推論エンジンへ渡します。
+標準の Qwen3.8-Flash-Next 系モデルセットアップで、RoPE のコンテキスト拡張係数を指定します。セットアップは選択されたコンテキスト長と `--rope-scaling` の方式から最終設定を解決し、方式が有効な場合は `--rope-scaling` と `--rope-scale` を生成する run config のエンジン引数に記録します。エンジンはその設定をプロセス起動時に読み、RoPE 設定を確定します。
 
 ## 使い方
 
 ```sh
-./setup.sh --context 393216 --rope-scaling yarn --rope-scale 1.5 --yes --no-start
+# Qwen3.8-Flash-Next を 384K context、YaRN、係数 1.5 で設定する
+./setup.sh --family qwen --model Q2_0 --context 393216 \
+  --rope-scaling yarn --rope-scale 1.5 --yes --no-start
 ```
 
-`--no-start` はインストール後にモデルサーバーを起動しない指定です。この例でもセットアップ処理は実行され、必要なファイルの取得や設定ファイル・起動スクリプトの作成が行われます。Windows では同じ値を `START-HERE.bat` に渡せます。
+この例では `--no-start` によりセットアップ完了後のモデル起動を省きます。セットアップ自体は実行され、run config と起動スクリプトを作成します。係数を省略すると、方式が有効であれば最終 context を学習済み長 `262144` で割った値（最低 `1`）が使われます。
 
 ## 値と既定値
 
-- `argparse` の `type=float` で変換されます。未指定時は `None` で、セットアップが最終コンテキスト長を学習済み長 262144 で割った値（最低 1）を係数にします。たとえば 393216 なら 1.5、524288 なら 2 です。
-- 指定値はセットアップ内で補正されず、そのまま使われます。コンテキスト長を RAM 規則で減らさずユーザー指定を保つ処理もあるため、係数は最終的に採用された context に合わせて自動変更されません。
-- セットアップ側の `float` 変換・RoPE 解決には係数の範囲検査がありません。エンジン側は有限値であること、および `0` 以外は `1` 以上であることを検査します。したがって `0.5`、負数、`nan`、`inf` などはセットアップを通過してもエンジン起動時に拒否されます。エンジンでは `0` は「未指定」を表し、モデルファイルに係数があればそちらを使い、なければ既定係数 1 になります。
-- 同じオプションを複数回指定した場合は通常の `argparse` の値保持により最後の値が使われます。
+- parser は `type=float` で変換し、既定値は `None`（未指定）です。数値変換に失敗する値は parser が拒否します（`terminal/setup.py:11457-11459`）。
+- `resolve_rope()` は明示値が有限で `1` 以上かを検証します。`nan`、`inf`、`-inf`、`1` 未満はセットアップで拒否されます（`terminal/setup.py:9260-9273`）。
+- 未指定時、拡張方式が有効なら `max(1, 最終context / 262144)` を係数にします。たとえば `393216` では `1.5`、`524288` では `2` です（`terminal/setup.py:9251-9257, 9263-9268, 9280, 9286`）。明示値は context の調整後も自動変更されず、そのまま使われます（`terminal/setup.py:9263-9268`）。
+- 同じ引数を複数回渡した場合の特別な重複処理はありません。重複時の選択規則はこのソース調査では確認していません。
 
 ## 実行時の動作
 
-標準モデル経路では、コンテキストが 262144 以下で `--rope-scale` を指定する場合、`--rope-scaling linear` または `--rope-scaling yarn` も必要です。方式を省略した場合や `none` と組み合わせた場合はセットアップが組み合わせエラーにします。262144 を越えるコンテキストでは、方式を省略すると対話実行では方式を尋ね（既定候補 `yarn`）、`--yes` では `yarn` を選びます。`--rope-scaling none` は学習済み長を越える context と併用できません。
-
-解決後、方式が `none` でなければセットアップは `--rope-scaling <方式> --rope-scale <係数>` をエンジン引数に追加し、生成する run config に保存します。エンジンは明示値をモデル GGUF の RoPE 係数より優先し、係数を含む RoPE 設定をプロセス起動時に一度解決します。セッション初期化前に RoPE テーブルを構築し、推論中の回転計算に使うため、リクエスト単位の切り替えではありません。
+- 選択 context が `262144` 以下の場合、`--rope-scale` を指定するには `--rope-scaling linear` または `--rope-scaling yarn` が必要です。方式の省略または `none` との組み合わせはセットアップエラーになります。方式を明示して係数を省略した場合は係数 `1` になります（`terminal/setup.py:9274-9280`）。
+- context が `262144` を超え、方式が省略されている場合、対話セットアップは方式を尋ね、`yarn` を初期選択にします。`--yes` の非対話経路では質問を出さず、`resolve_rope()` が省略方式を `yarn` にします（`terminal/setup.py:12170-12183, 9260-9268, 9281-9286`）。
+- context が `262144` を超えるときに `--rope-scaling none` を明示すると、標準セットアップは方式を黙って上書きせず拒否します（`terminal/setup.py:9281-9286`）。
+- 有効な方式と係数は `[ok] rope scaling: ...` として表示され、`strata_control/setup_config.py` が `--rope-scaling <方式> --rope-scale <係数>` をエンジン引数へ追加します（`terminal/setup.py:12180-12188, 12521-12525`; `terminal/strata_control/setup_config.py:218-225`）。設定は `write_setup_config()` に渡され、既存のモデル設定が変更される場合は `.bak` を作成してから書き込みます（`terminal/setup.py:7715-7747, 12525-12527`）。
+- エンジン側では明示係数がモデルファイル由来の係数より優先され、RoPE 設定は session 初期化前に確定されます。リクエスト単位の切替ではありません（`engine/src/program/generate.cpp:788-796, 5715-5717, 5752-5759`）。
 
 ## 適用条件と副作用
 
-- このオプションは `setup.py` の共通 parser にありますが、RoPE 値をエンジン引数に加えるのは標準 `FAMILIES` のセットアップ経路です。Qwen3.6 の独自エンジン経路や DeepSeek の独自経路では Flash-Next 用設定として警告され、値は使われません。
-- macOS の通常セットアップは `setup.py` の parser を作る前に `metal/setup_mac.py` へ引数を委譲します。この文書ではその別 parser の `--rope-scale` 受理・効果を確認していません。
-- `--backend sycl` は共通 parser の後に `sycl/setup_intel.py` へ委譲されます。SYCL セットアップでのこの値の受理・効果は確認できていないため、標準経路と同じ動作とはみなしません。
-- 設定生成は RoPE 引数を run config に保存し、setup の起動スクリプトも生成します。通常の setup 完了時は既定でモデルを起動するため、係数はそのエンジンプロセスに反映されます。`--no-start` を付けた場合は設定生成までで、後から生成された起動スクリプト等で起動した際に反映されます。
+- この文書は `setup.py` の root parser が処理する標準セットアップ経路を対象にします。Qwen3.6 などの独自エンジン経路、および Hy4-Flash / Inkling-2-Mini の専用経路は別の処理へ分岐し、この引数を Flash-Next 用設定として使わない旨を警告します（`terminal/setup.py:9908-9910, 10328-10330, 12019-12025`）。
+- 通常の macOS 経路は root parser を作る前に `metal/setup_mac.py` へ引数を転送します。索引の mac scope に `--rope-scale` はなく、macOS 側での受理・効果はこの root 文書の対象外です（`terminal/setup.py:9290-9294, 11434-11444`; `docs/cli/README.md:1725-1748`）。
+- `--backend sycl` は通常のモデル設定処理より先に `sycl_setup()` へ分岐します。この分岐で `--rope-scale` が受理・適用されるかは調査範囲から確認できないため、標準経路と同じ動作とは扱いません（`terminal/setup.py:11635-11638`）。
+- `--no-start` を付けない場合の起動時挙動はこのオプション自体が決めるものではありません。ここで確認できる副作用は、setup が run config と起動スクリプトを生成し、RoPE 引数を設定に保存することです。
 
 ## 出力とエラー
 
-- RoPE 方式との不整合（学習済み範囲内で方式なし／`none` と係数指定、または学習済み範囲を越えて `none` を指定）は `setup.py` のエラー表示 `[X]` と「Setup stopped」を出し、終了コード 1 で停止します。
-- 数値として変換できない値は `argparse` が usage とエラーを表示して終了コード 2 で拒否します。
-- 変換できてもエンジン側の範囲・有限値検証に違反する値は、エンジンが stderr に `strata generate:` のエラーを出し、終了コード 2 で拒否します。セットアップは適用時に `[ok] rope scaling: ... factor ...` を表示し、エンジンも起動時に方式・係数・context の診断を stderr に出します。
+- 数値へ変換できない値は `argparse` の型変換で拒否されます（parser 定義: `terminal/setup.py:11457-11459`）。
+- 有限値でない、または `1` 未満の値、および context と方式の不整合は `resolve_rope()` が `ValueError` にし、呼び出し元が `fail()` に渡します。`fail()` は `[X]` と停止案内を表示し、error event を出して終了コード `1` で終了します（`terminal/setup.py:9272-9286, 12180-12183, 1049-1056`）。
+- 設定が有効で拡張方式がある場合は方式・係数とその由来を `[ok]` 行に表示します。最終 context が学習済み長以下で方式なしの場合は、`resolve_rope()` が `(None, None)` を返すため、この `[ok] rope scaling` 行は出ません（`terminal/setup.py:9278-9280, 12184-12188`）。
 
 ## 根拠
 
-- parser と型: `setup.py:8429-8435`。
-- 自動係数、指定値の保持、学習済み範囲内外での方式解決・拒否: `setup.py:7277-7310`。
-- 対話時の方式選択、エラー処理、表示: `setup.py:9078-9095`。`fail()` は `[X]` 表示後に `sys.exit(1)` する（`setup.py:825-830`）。
-- エンジン引数への追加と run config への格納: `setup.py:9418-9424`, `setup.py:9597-9599`。
-- 独自モデル経路での適用外警告・分岐: `setup.py:7610-7612`, `setup.py:8030-8031`, `setup.py:8932-8938`。
-- SYCL セットアップへの委譲: `setup.py:8563-8564`。
-- POSIX / Windows wrapper の委譲: `setup.sh:9-13`, `START-HERE.bat:44-54`。
-- エンジン parser、有限値・最小値検証、`0` の意味、GGUF との優先順位、設定確定時の診断: `src/program/generate.cpp:2446-2447`, `src/program/generate.cpp:3312-3339`, `src/program/generate.cpp:3642-3647`, `src/program/generate.cpp:3696-3738`。
+- `terminal/setup.py:11444-11459` — root parser と `--rope-scale` の型・既定値。
+- `terminal/setup.py:9251-9286` — 自動係数、明示値の検証、方式との組み合わせ、学習済み context 外の解決。
+- `terminal/setup.py:12170-12188` — 対話時の方式選択、解決呼び出し、エラー処理、表示。
+- `terminal/setup.py:9908-9910, 10328-10330, 12019-12025` — 独自セットアップ経路での警告と分岐。
+- `terminal/setup.py:7715-7747, 12521-12527`; `terminal/strata_control/setup_config.py:218-225` — run config 生成とエンジン引数への保存。
+- `engine/src/program/generate.cpp:788-796, 5715-5717, 5752-5759` — エンジンの係数既定・優先順位・プロセス設定。
+- `terminal/setup.py:9290-9294, 11434-11444, 11635-11638`; `docs/cli/README.md:1725-1748` — macOS / SYCL の委譲境界。
 
-調査は指定 checkout のソースと文書を対象とし、CLI 実行、build、GPU 実行、性能測定、テストは行っていません。macOS および SYCL の委譲先での option 挙動はこの文書の調査範囲外です。
+調査は上記 commit のソースを対象に行い、CLI 実行、build、GPU 実行、性能測定、テストは行っていません。セットアップから分岐する SYCL 側および macOS 専用 parser での本オプションの扱いは、この root scope から確定できません。

@@ -1,47 +1,49 @@
 # `STRATA_VISION_READY_S`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-`serve/server.py` が画像用の外部 vision reader を起動した後、その reader が `READY` 行を返すまで待つ秒数を設定します。既定値は 300 秒です。期限内に何も返さない場合は reader プロセスを kill し、サーバー側で起動失敗として扱います。これは Strata の Python サーバーの待機時間であり、reader 内部の処理時間設定ではありません。
-
-候補一覧には名前があります（`docs/envvars/000_envvers.md:1646`）。Strata ソースでの実参照は `serve/server.py:312,362` で、コメントと `_timeout_env` の引数です。名前を動的に受ける helper の定義は `serve/server.py:315-320` です。
+`terminal/serve/server.py` が起動する画像エンコーダーの開始時に、標準出力から `READY` または `ERR` の応答を待つ秒数を指定する。期限内に応答がない場合は encoder を終了させて起動失敗として扱う。既定は 300 秒、0 以下なら期限を設けない。これは画像 encoder の起動応答待ちの設定であり、通常の engine の `READY` 待ちや encoder の画像 encode 応答待ちには適用されない（`ENGINE_READY_S`、`VISION_ENCODE_S` は別設定）。`terminal/serve/server.py` のモジュール読み込み時に値を取り込み、`VISION_READY_S` として使う（`terminal/serve/server.py:460`, `terminal/serve/server.py:3224`, `terminal/serve/server.py:439-462`）。
 
 ## 値と判定
 
-`_timeout_env` は `os.environ.get(name, default)` の結果を Python の `float()` に渡し、`ValueError` のとき既定値へ戻します。その後 `v <= 0` なら `None`（無期限待ち）、それ以外なら数値を返します。既定値は `300.0` です（`serve/server.py:315-320,362`）。
+`terminal/serve/server_parts/base.py` の `_timeout_env` は `float(os.environ.get(name, default))` で変換し、変換時の `ValueError` では既定値に戻す。その後 `v <= 0` なら `None`（無期限）、それ以外は秒数の float を返す（`terminal/serve/server_parts/base.py:272-277`）。
 
-| 環境変数の状態・値 | `VISION_READY_S` | 結果 |
-|---|---:|---|
-| 未設定 | 300.0 | 300 秒待つ |
-| 空文字、数値でない文字列 | 300.0 | `float()` の `ValueError` を捕捉し、既定値へ戻る |
-| `0`、負数 | `None` | `_readline` が timeout なしで待つ。従来どおり無期限待ち |
-| 正の数値 | その float 値 | 指定秒数待つ。整数への丸めや上限 clamp はしない |
+| 条件 | unset | 有効になる値（例） | 無効値・境界の例 |
+|---|---|---|---|
+| `terminal/serve/server.py` のサーバー実装 | 300 秒 | `1`、`0.5`、`1e2` は秒数として受理。`float()` が受理する数値文字列を変換する | 空文字 `""`、`true`、数値でない文字列は `ValueError` となり既定の 300 秒。`0`、`-1` は無期限。空白だけの文字列も変換失敗で既定値 |
 
-`float()` が認識する表記を使い、文字列全体を数値として解釈します。たとえば前後空白のある数値や指数表記は変換できますが、数値の後ろに余分な文字があれば変換失敗して既定値になります。`NaN` / `Infinity` なども有限性の検査はなく、`v <= 0` の判定を通った値がそのまま待機関数へ渡ります。これら非有限値を意図した設定として扱う分岐はありません。
+数値文字列全体を Python の `float()` で変換し、先頭文字だけの判定ではない。大文字小文字を区別する真偽値文字列の判定もなく、`true` / `false` は数値として無効。負の有限値と `-0.0` は 0 以下として無期限になる。`float()` の結果に有限値チェックがないため `inf` / `nan` も変換自体は通り、`inf` は実質期限なし、`nan` は期限比較を満たさずタイムアウトしない値になる。`nan` / `inf` の利用は推奨値としてコードに記載されてはいない（`terminal/serve/server_parts/base.py:272-277`; deadline 判定は `terminal/serve/server.py:3277-3289`）。
 
 ## 有効になる条件
 
-- `serve/server.py` のサーバープロセスで有効です。変数はモジュール読み込み時に `VISION_READY_S` へ格納されます。その後の環境変更を再読込するコードはありません（`serve/server.py:362`）。
-- `Vision` オブジェクトが作られる必要があります。`Service` 初期化は `cfg.get("vision")` が真のとき Vision reader を構成します（`serve/server.py:9202-9224`）。`Vision.__init__` は `lazy` でなく、かつ `elastic` でない場合にその場で起動します（`serve/server.py:2770-2790`）。lazy または elastic の構成では起動が遅延し、後の reader 起動時に同じ値が使われます。
-- 実際の適用箇所は GPU/CPU の reader に共通する `_start_reader` です。GPU reader の起動が失敗して CPU fallback が設定されている場合、fallback reader の起動にも同じ `VISION_READY_S` が適用されます (`serve/server.py:2830-2857`).
-- サーバーが vision reader を持たない場合、この待機はありません。画像を送ると reader がない旨のエラーになります（`serve/server.py:5221-5226`）。DeepSeek-V4.1 の `DsPictures` 経路はエンジン内蔵 tower に画像を渡し、通常の `Vision.encode()` を通らないため、この reader の READY 待機も対象外です（`serve/server.py:5235-5242`）。
-- CLI 引数や設定ファイルから `VISION_READY_S` を上書きする処理は確認できません。別名の `STRATA_VISION_ENCODE_S` は画像 encode 応答の待機用であり、この変数とは別設定です（`serve/server.py:362-364,3023-3029`）。
+- `terminal/serve/server.py` の画像 encoder 起動経路で有効。画像機能を持たない server や、画像 encoder を起動しない経路では待ち時間は発生しない。別プロセスで起動する encoder が対象で、`Vision.__init__` は `lazy` でなく `elastic` でもない場合に初期化中に起動し、lazy / elastic の場合は後の起動経路で開始する（`terminal/serve/server.py:3059-3090`, `terminal/serve/server.py:4684-4699`）。
+- GPU encoder の起動が失敗し CPU fallback が構成されている場合、timeout も失敗理由として GPU reader の失敗処理に入り、CPU reader を開始する。fallback がない場合は起動失敗が上位へ伝播する（`terminal/serve/server.py:3142-3157`）。
+- Python サーバープロセスの環境から読み取る。CLI 引数や config の同名キーによる上書きはこの読み取り箇所にはない。値はモジュール定数に保存されるため、サーバープロセス起動後に環境を変更しても反映されない（`terminal/serve/server.py:460`, `terminal/serve/server.py:3224`）。
+- `vision.env` 等で子 encoder に渡す環境を作る処理は別にあるが、この変数の待ち秒数を再読込するものではない（`terminal/serve/server.py:4134-4156`）。
 
 ## 実行時の詳細
 
-`_start_reader` は `popen()` で reader を起動し、その標準出力の1行を別スレッドで読みます。`_readline` は `queue.get(timeout=...)` で待ち、期限切れではプロセスを kill して `RuntimeError` を送出します。`None` が渡る場合は queue の無期限待ちになります（`serve/server.py:2844-2857,2872-2892`）。応答が `READY` で始まらない場合も起動失敗で、プロセスを停止し `vision_start_error()` のメッセージを返します（`serve/server.py:2858-2869,2703-2742`）。
+`Vision._start_reader()` は encoder を起動した後、`_await_ready(VISION_READY_S, strays)` を呼ぶ。`_await_ready` は stdout を読む daemon thread と期限を設定し、`READY` または `ERR` で始まる行を応答として返す。その他の stdout 行は stray として保持・ログ出力し、そのまま同じ期限まで待つ。期限が来ると encoder に `kill()` を試みて `RuntimeError` を送出する。既定の 300 秒は encoder が何も言わない場合の上限であり、0 以下の設定では deadline を作らず待ち続ける（`terminal/serve/server.py:3214-3229`, `terminal/serve/server.py:3256-3305`）。
 
-timeout の場合、`_start_reader` は `self.proc` をクリアして停止状態にし、正の timeout なら `vision_start_error(..., waited=VISION_READY_S)` に変換します。通常はそのエラーが `_start()` に戻り、CPU fallback があれば警告ログを出して fallback を起動します。fallback がない場合は呼び出し元へ伝播します（`serve/server.py:2830-2842,2852-2857`）。モデル再ロードに伴う Vision 再起動時は、エラーを `EngineDied` として送出する経路があります（`serve/server.py:4675-4682`）。
+timeout の例外は encoder を停止状態にしてから処理される。有限の正数設定では `vision_start_error` に待ち秒数を渡して起動エラーにし、0 以下では無期限待ちなのでこの timeout 経路自体は起きない。受信行が `READY` で始まらない場合は encoder を kill し、応答内容や終了コード、stderr の末尾などを含む起動エラーにする。GPU reader に CPU fallback があれば `_start()` がそのエラーを捕捉して CPU reader を開始する（`terminal/serve/server.py:3224-3243`, `terminal/serve/server.py:3142-3157`）。
 
-`Vision` の初回起動はサーバーの画像機能初期化時、遅延起動なら画像リクエスト時です。画像エンコード要求への待機時間は別変数 `STRATA_VISION_ENCODE_S` によって定まり、`STRATA_VISION_READY_S` はその値を変更しません（`serve/server.py:3023-3029,362-363`）。
+この値はモジュール読み込み時に一度評価され `VISION_READY_S` に保持される。各 encoder の起動時に定数が `_await_ready` へ渡されるが、環境変数自体は再読込されない。複数回の起動があれば各起動でその待ち時間が適用される（`terminal/serve/server.py:460`, `terminal/serve/server.py:3224`）。
+
+## ログと測定値
+
+timeout では `_await_ready` 内で `the vision encoder did not start: it said nothing for N s` という例外文を作る（`N` は秒数を整数表示）。有限 timeout の上位エラー文は `vision_start_error` が `the vision encoder did not start: it said nothing for N s (it never reported READY)` の形に整える。GPU reader に CPU fallback がある場合、さらに `[strata] the GPU picture reader did not start (...); pictures are read on the CPU`（elastic の場合は `until it is idle` を含む）を stdout に出して CPU reader に切り替える（`terminal/serve/server.py:3282-3288`, `terminal/serve/server_parts/engines.py:618-665`, `terminal/serve/server.py:3152-3157`）。
+
+この変数に関する性能測定値は、対象ソースと参照した `docs/DETAILS.md` に記載を確認できなかった。
 
 ## 根拠
 
-- 候補一覧: `docs/envvars/000_envvers.md:1644-1647`
-- helper の変換・既定値・無期限判定と定数設定: `serve/server.py:312-320,362-364`
-- reader の構成・lazy/elastic 条件・起動: `serve/server.py:2770-2790,2829-2857`
-- timeout 待機・kill とエラー文言: `serve/server.py:2703-2742,2872-2892`
-- 画像処理の有無・DeepSeek 経路: `serve/server.py:5221-5242`
-- モデル再ロードでの再起動: `serve/server.py:4675-4682`
+- `terminal/serve/server_parts/base.py:272-277` — 環境変数の変換、既定値への fallback、0 以下を無期限にする処理。
+- `terminal/serve/server.py:439-462` — timeout 群の既定値と `VISION_READY_S` のモジュール定数化。
+- `terminal/serve/server.py:3059-3090` — Vision 初期化と eager 起動条件。
+- `terminal/serve/server.py:3142-3157` — GPU 起動失敗時の CPU fallback とログ。
+- `terminal/serve/server.py:3214-3248` — encoder 起動、READY 判定、起動エラー処理。
+- `terminal/serve/server.py:3256-3305` — READY 待ち、deadline、timeout 時の kill、stray 行処理。
+- `terminal/serve/server.py:4134-4156` — encoder 子プロセス向け環境構築。
+- `terminal/serve/server_parts/engines.py:618-665` — 起動失敗メッセージの組み立て。

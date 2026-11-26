@@ -1,58 +1,56 @@
-# `--check-logits`
+# `strata --check-logits`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate` |
+| コマンド | `strata`（通常の推論 engine parser） |
 | オプション | `--check-logits` |
 | 別名 | なし |
-| 値 | 値を取らない真偽フラグ |
+| 値 | 取らないフラグ |
 
 ## 役割
 
-`--stream-token` 使用時に、各トークン位置で語彙全体の logits を GPU からホストへコピーし、非有限値（NaN または ±Inf）がないか検査します。通常の token-by-token decode で logits の異常を検出する診断用オプションです。
+`--stream-token` を使う推論で、各生成位置の全語彙 logits をホストへ読み戻し、非有限値（NaN / ±Inf）を検出します。stream-token を使わない通常経路では logits の読み戻しと検査が元から有効なので、このフラグを追加しても検査範囲は変わりません（`engine/src/program/generate.cpp:24358-24372`）。
 
 ## 使い方
 
 ```sh
-strata generate --pack pack/full --tokens "1,2,3" --stream-token --check-logits
+strata --pack model.gguf --stream-token --check-logits
 ```
 
-トークン ID 列は例です。`strata generate` の基本構文は `src/program/generate.cpp:806-812` にあります。
+`--pack` には推論対象の pack を指定します。`--check-logits` 自体に引数はありません（`engine/src/program/generate.cpp:1230-1244, 3851-3852, 3910-3912`）。
 
 ## 値と既定値
 
-- 値・別名はなく、指定すると内部フラグ `check_logits` を `true` にします。既定値は `false` です（`src/program/generate.cpp:438-439,2484-2485`）。
-- parser にこのフラグ固有の値検証はありません。同じフラグを複数回指定しても `true` を再設定するだけです。値を続けて書くと、その値は次の引数として処理され、未知引数エラーになります（`src/program/generate.cpp:2416-2424,2484-2485,2787-2792`）。
+- 値を取らず、parser は指定されたとき `o.check_logits = true` にします。既定値は `false` です（`engine/src/program/generate.cpp:776-777, 3910-3912`）。
+- 繰り返し指定を拒否する分岐はなく、複数指定しても同じ真偽値を `true` にするだけです（`engine/src/program/generate.cpp:3910-3912`）。
+- 値の validation はありません。値を続けて書く構文はこのフラグの引数として消費されず、後続の引数として処理されます。未認識の引数は usage を表示して終了コード `2` になります（`engine/src/program/generate.cpp:3842-3847, 4268-4274`）。
 
 ## 実行時の動作
 
-- 1 トークンずつ処理する decode ループでは、`--stream-token` がない場合は `read_logits` が常に真で、logits 全体の読み戻しと有限値検査がすでに行われます。そのためこの条件で `--check-logits` を付けても検査範囲は変わりません（`src/program/generate.cpp:15994-16008`）。
-- `--stream-token` がある場合、通常は logits を読み戻しません。このオプションを指定すると `read_logits` が真になり、各位置の `n_vocab` 個の float（`n_vocab * 4` bytes）を device-to-host コピーし、stream を同期してから全要素を `std::isfinite` で検査します（`src/program/generate.cpp:15996-16008`）。
-- `--native` はこの parser の経路で `stream_token` を有効にするため、通常の token-by-token decode では `--check-logits` が読み戻し・検査を有効にします（`src/program/generate.cpp:3232-3267`）。
-- `--dump-logits` と併用すると、出力対象に選ばれた位置では `emit_logits` によって `read_logits` が真になり、フラグなしでもその位置の logits が読み戻されます。dump 選択位置以外も毎回検査するには `--check-logits` が必要です（`src/program/generate.cpp:15994-16008`）。
+各生成位置で、実装は `read_logits = !o.stream_token || o.check_logits || emit_logits` を判定します。したがって stream-token 経路ではこのフラグが全位置の読み戻しを有効にし、選択位置だけを出力する `--dump-logits` が併用されている場合も、dump 選択の有無とは別に全位置を検査します（`engine/src/program/generate.cpp:24358-24372`）。通常経路では `!o.stream_token` が真のため、フラグなしでも読み戻しと検査が行われます。
+
+CUDA 実装は語彙数分の float logits を device-to-host コピーし、token stream を同期した後、各値に `std::isfinite` を適用します。SYCL 実装も同じ条件でコピーと queue wait を行ってから同じ有限値検査をします（`engine/src/program/generate.cpp:24360-24372`; `engine/sycl/src/program/generate.cpp:13585-13607`）。この追加読み戻しは stream-token の非同期処理に同期点を加え、全 logits のホスト走査を行います。
+
+`--native` の通常 engine preset は `o.stream_token = true` に設定します。その経路でも `--check-logits` を指定すれば全位置の読み戻し・検査が有効です（`engine/src/program/generate.cpp:5160-5165`）。
 
 ## 適用条件と副作用
 
-- `--stream-token` と組み合わせると、毎位置で語彙全体をホストへ転送して同期し、全 logits を走査します。出力・失敗経路以外に、転送量や同期コストの定量値はこのソースからは分かりません。
-- ネイティブ pack の speculative verify 経路は通常ループから抜けた後に別処理へ進みます。`check_logits` の参照は通常ループ内に限られるため、verify window の logits 検査をこのオプションが行うとは確認できません（`src/program/generate.cpp:15874-15878,15994-16008,16097-16129`）。
-- Qwen3.5 系モデルは、モデル family 判定後に `strata::qwen35::run` へ分岐し、このファイルの通常 parser を通りません（`src/program/generate.cpp:2393-2407`）。この別経路での同オプションの扱いは、本オプションの parser・利用箇所からは確認できません。
+このオプションの効果が追加されるのは通常 engine parser の stream-token 経路です。フラグなしの stream-token 実行は、dump 対象位置を除いて logits のホスト読み戻しを省略します（`engine/src/program/generate.cpp:24358-24372`）。
+
+Qwen3.6 family は通常 parser より前に専用 engine へ振り分けられます。専用 parser はこのフラグを登録しておらず、通常実行では未認識引数として usage を出して終了コード `2` にします。serve mode では未対応オプションを stderr に無視すると出力します（`engine/src/program/generate.cpp:3804-3818`; `engine/src/qwen35/q36_engine.cu:5339-5358, 5405-5418`）。索引上も Qwen3.6 は別の `qwen36/` scope です（`docs/cli/README.md:1240-1244`）。
 
 ## 出力とエラー
 
-- 読み戻しまたは stream 同期に失敗すると、stderr に `strata generate: reading the logits back failed` を出して終了コード `1` で戻ります（`src/program/generate.cpp:15996-16002`）。
-- 非有限値が1つ以上あると、stderr に非有限 logits 数、語彙数、位置を出して終了コード `1` で戻ります（`src/program/generate.cpp:16003-16008`）。すべて有限なら、このオプション固有の成功メッセージはありません。
-- 未知引数（フラグの後ろに余計な値を置いた場合を含む）は stderr に `unknown argument` と usage を出し、終了コード `2` になります（`src/program/generate.cpp:2787-2792`）。
+- logits の device-to-host 読み戻しまたは同期に失敗すると、`strata generate: reading the logits back failed` を stderr に出し、終了コード `1` を返します（CUDA: `engine/src/program/generate.cpp:24361-24365`; SYCL: `engine/sycl/src/program/generate.cpp:13594-13600`）。
+- 非有限値が1つ以上あれば、個数・語彙数・生成位置を stderr に出し、終了コード `1` を返します（CUDA: `engine/src/program/generate.cpp:24367-24372`; SYCL: `engine/sycl/src/program/generate.cpp:13601-13607`）。
+- 正常時、このフラグ固有のメッセージは出力しません。
 
 ## 根拠
 
-- `src/program/generate.cpp:438-439` — `stream_token` と `check_logits` の初期値。
-- `src/program/generate.cpp:806-841` — `strata generate` の usage と `--check-logits` の説明。
-- `src/program/generate.cpp:2416-2424,2484-2485` — 引数 parser。
-- `src/program/generate.cpp:3232-3267` — `--native` による `stream_token` の有効化。
-- `src/program/generate.cpp:15874-15878,15994-16008` — 通常 decode と logits 読み戻し・有限値検査。
-- `src/program/generate.cpp:16097-16129` — 通常ループ後の speculative verify 経路。
-- `src/program/generate.cpp:2393-2407` — Qwen3.5 系の別実装への分岐。
-- `src/program/generate.cpp:2787-2792` — 未知引数の失敗経路。
+- `engine/src/program/generate.cpp:776-777, 1242-1244, 3910-3912` — 通常 engine parser の状態、help 表記、フラグ設定。
+- `engine/src/program/generate.cpp:24358-24372` — 読み戻し条件、CUDA 同期、有限値検査と失敗経路。
+- `engine/sycl/src/program/generate.cpp:13585-13607` — SYCL 実装の同等処理。
+- `engine/src/program/generate.cpp:3804-3818`; `engine/src/qwen35/q36_engine.cu:5339-5358, 5405-5418` — Qwen3.6 専用 parser への振り分けと未対応引数処理。

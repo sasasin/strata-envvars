@@ -1,50 +1,60 @@
 # `STRATA_READ_AHEAD`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux で Strata がファイルの読み込み前に OS へ先読みを依頼する処理を止めるスイッチです。エンジンでは `madvise(..., MADV_WILLNEED)` と `posix_fadvise(..., POSIX_FADV_WILLNEED)` の呼び出しを抑止します。Windows のエンジン実装はこの先読み API を何もしないため、この変数は影響しません。
+ファイルを読む前に Strata が OS へ出す先読みヒントを有効・無効にする。Linux/macOS の engine では、メモリマップ範囲に `madvise(..., MADV_WILLNEED)`、ファイル範囲に `posix_fadvise(..., POSIX_FADV_WILLNEED)` または macOS の `fcntl(..., F_RDADVISE, ...)` を要求する。いずれも 128 KiB 単位で要求し、要求自体は待たず、戻り値も無視する。Windows の共通 memory helper は常に無効で、この変数を読まない（`engine/src/platform/memory.cpp:160-162,205-231`）。
 
-対象は同期読み込みそのものではなく、OS への先読みヒントです。ヒントの失敗は戻り値を無視するため、環境変数を有効にしても OS が読み込みを完了する保証はありません。
+engine では重み・ネイティブ tensor・MTP draft ファイルを読み込む前のヒント、および mapped expert の profile fill / expert-cache 構築時のヒントが対象（`engine/src/core/weights.cpp:315-320`、`engine/src/core/native_dense.cpp:424-427`、`engine/src/core/native_head.cpp:185-188,241-245,534-542`、`engine/src/core/mtp.cpp:159-166,473-481`、`engine/src/core/expert_source.cpp:2675-2689,4607-4613`）。SYCL にも対応する呼び出しがある（`engine/sycl/src/core/weights.cpp:303-320`、`engine/sycl/src/core/native_dense.cpp:297-300`、`engine/sycl/src/core/native_head.cpp:59-62,190-197`、`engine/sycl/src/core/mtp.cpp:156-163,395-405`、`engine/sycl/src/core/expert_source.cpp:962-976,2059-2065`）。
+
+この変数が止めるのは OS への advisory 要求であり、実際のファイル読み込みや Strata 内部の expert prefetch 全般を止めるものではない。unbuffered expert 読み込みの batch prefetch は別経路で行われ、`STRATA_IO_PREFETCH` 等の制御も別である（`engine/src/core/expert_source.cpp:2659-2673,2692-2719`）。
+
+別プロセスの `strata-vision` も Linux で mmproj を読む前に同名変数を直接読み、同ファイル全体への `posix_fadvise` 要求を行う（`terminal/tools/vision/strata_vision.cpp:127-140`）。
 
 ## 値と判定
 
-| 経路 | unset | 設定時の判定 |
-|---|---|---|
-| Linux エンジン（CUDA/SYCL 共通の platform helper） | 有効 | `std::atoi(value) != 0` なら有効、`== 0` なら無効 |
-| Windows エンジン | 常に無効 | `read_ahead_enabled()` が常に `false`。値を読まない |
-| `strata-vision`（非 Windows の同梱ツール） | 有効 | `std::atoi(value) != 0` なら有効、`== 0` なら無効 |
-| `strata-vision`（Windows） | この処理を実行しない | 先読み箇所全体が `!_WIN32` で除外される |
+engine の Linux/macOS 共通 helper は `std::getenv` の結果を `std::atoi(v) != 0` で判定する。未設定は ON、設定済みは `atoi` の変換結果が非 0 なら ON。文字列全体の妥当性検査、clamp、警告はない（`engine/src/platform/memory.cpp:205-211`）。
 
-`atoi` を使うため、文字列全体の厳密な数値検証はありません。空文字や数値に変換できない文字列は 0 と判定され無効です。先頭の空白や符号の後から数字列を読み、数字列より後ろの文字は判定に使われません（例: `2junk` は有効、`0junk` は無効、`01` は有効）。負の非ゼロ整数も有効です。整数範囲を超える値について、ソースは検証や fallback を設けていません。
+| 条件（build / 実行経路） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| Windows 以外の engine 共通 helper | ON | `1`、`-1`、`2`、`1tail`、` 1`（`atoi` が非 0） | `0`、`0anything`、空文字、`true`、空白だけ（`atoi` が 0） |
+| Windows の engine | OFF（値を読まない） | なし | 常に無効 |
+| Linux の `strata-vision` | ON | engine と同じ `atoi` 判定 | engine と同じ `atoi` 判定 |
+| Windows / macOS の `strata-vision` | 適用外 | なし | このコードは判定箇所ごと compile 対象外 |
 
-根拠: `src/platform/memory.cpp:150-155`, `src/platform/memory.cpp:117-119`, `tools/vision/strata_vision.cpp:102-113`。
+`atoi` は先頭の空白と符号を許し、数字列の後ろは検査しないため、`1tail` は ON、`0tail` は OFF、`1.5` は ON になる。`true` / `false` はどちらも 0 として扱われる。数値の範囲検査は実装されていない。vision での `getenv` も同じ条件式を使う（`terminal/tools/vision/strata_vision.cpp:127-135`）。
 
 ## 有効になる条件
 
-- エンジンの先読みは非 Windows ビルドでのみ実装されています。Windows は `read_ahead_enabled()` が常に false を返し、両方の `advise_willneed` overload も空実装です。
-- Linux エンジンの値は `read_ahead_enabled()` の関数内 static 変数に保存されます。したがって最初の呼び出し時に一度読み、プロセス内で後から環境を書き換えても判定は変わりません。
-- `strata-vision` の projector 先読みは `llama_backend_init()` の後、モデル読み込み前に環境を直接読みます。エンジン helper の static cache とは別判定です。
-- CUDA/SYCL や機能経路が先読み API を呼ばない場合、この変数による追加の処理はありません。ファイル tier が unbuffered の場合は、expert source が mapped-read の `advise_pairs` を拒否します。
+- engine の OS advisory は Windows 以外でのみ実装される。Windows は `read_ahead_enabled()` が常に `false` を返し、両方の `advise_willneed` overload も no-op（`engine/src/platform/memory.cpp:160-162`）。
+- マッピングへの要求はポインターが null でなく byte 数が正の場合に限る。file descriptor への要求は fd が非負の場合に限る（`engine/src/platform/memory.cpp:213-223`）。
+- expert source の mapped-file hint は、source が開かれ、unmapped でなく、direct/unbuffered でない場合に限る。SYCL 実装も mapped source かつ非 direct の場合に限る（`engine/src/core/expert_source.cpp:2675-2689`、`engine/sycl/src/core/expert_source.cpp:962-976`）。
+- profile-fill の先読み候補数は別の `STRATA_FILL_AHEAD` が設定されていればその `atoi` 値（負数は 0 に clamp）、未設定なら 256。候補数が正でも `advise_pairs` が false（例えば `STRATA_READ_AHEAD=0` または Windows）なら候補数は 0 になる（`engine/src/program/generate.cpp:9767-9774`、`engine/sycl/src/program/generate.cpp:5375-5382`）。
+- `strata-vision` の専用ヒントは `!_WIN32 && !__APPLE__` のビルドだけで実行する。mmproj 引数が必須で、ファイルを開けた場合に限って `lseek` で得た長さまで 128 KiB ごとに要求する（`terminal/tools/vision/strata_vision.cpp:93-95,127-140`）。
 
 ## 実行時の詳細
 
-Linux の helper は環境変数が unset なら先読みを有効にし、設定されていれば `atoi` の結果が非ゼロかを初回に判定します。有効時、メモリマップ範囲には 128 KiB ごとの `madvise(..., MADV_WILLNEED)`、開いたファイルの範囲には 128 KiB ごとの `posix_fadvise(..., POSIX_FADV_WILLNEED)` を依頼します。範囲が null/0 byte、または fd が負なら何もしません。各 OS 呼び出しの戻り値は無視されます（`src/platform/memory.cpp:146-169`）。
+- engine の `read_ahead_enabled()` は関数内 `static const bool` に初回評価結果を保存する。したがって Linux/macOS の engine では最初の helper 呼び出し時に一度読み、プロセス実行中に環境を変更しても反映しない（`engine/src/platform/memory.cpp:205-211`）。CLI 引数による上書きはない。
+- engine は memory-mapped データに対してページ境界から 128 KiB ごとに `madvise` を行い、fd に対しても範囲の先頭から 128 KiB ごとに要求する。macOS の fd 経路は `F_RDADVISE`、その他は `POSIX_FADV_WILLNEED`。各 OS 呼び出しの戻り値は無視され、失敗時に Strata の fallback 処理や終了にはつながらない（`engine/src/platform/memory.cpp:213-231`）。
+- GPU/backend の CUDA・SYCL 等に応じて上記 platform helper の実装が変わるのではなく、engine の呼び出し元が helper を使う箇所で共通判定される。Windows は platform 実装によって全て無効。読み込み自体の失敗は各読み込み元の通常のエラー処理に従い、この変数はそれを抑止しない。
+- mapped expert profile fill が `advise_pairs` に依存する場合、無効時はその advisory が行われず fill の `fill_ahead` も 0 にされる。一方、direct/unbuffered source の `prefetch_pairs` batch 読み込みは別経路で、`STRATA_READ_AHEAD` の判定を受けない（`engine/src/program/generate.cpp:9764-9793`、`engine/src/core/expert_source.cpp:2659-2673`）。
+- vision は `main` 内で mmproj の advisory 前に環境を直接読む。engine helper の static cache とは共有せず、プロセスごとに一度判定する。mmproj を open できない場合は advisory を飛ばして通常の reader に進み、advisory のエラー戻り値も無視する（`terminal/tools/vision/strata_vision.cpp:127-140`）。
+- `STRATA_READ_AHEAD` が変えるのは読み込みの先行要求である。tensor/expert の選択やデータ内容を変更する分岐はこれらの呼び出し元にはない。OS が要求をどう実行するかは Strata のコードからは保証されない。
 
-エンジンでは、プロファイルから GPU expert cache を埋める際に mapped expert の先読みを行います。CUDA 経路では `STRATA_FILL_AHEAD` が別途先読みする expert 数を決め、既定 256 です。`STRATA_READ_AHEAD=0` はその数を変えず、OS への先読み依頼を無効にします（`src/program/generate.cpp:5152-5173`）。SYCL にも同様の profile fill 経路があります（`sycl/src/program/generate.cpp:4714-4733`）。また SYCL の file expert source は mapped complement を構築する際、layer 内の対象 expert を `advise_pairs` で先読みします（`sycl/src/core/expert_source.cpp:2048-2054`）。peer expert cache の mapped fill も先読み helper を使います（`src/core/peer_experts.cpp:160-168`）。
+## ログと測定値
 
-ほかに、非 Windows の native dense/native head/native embedding 読み込み（`src/core/native_dense.cpp:264-267`, `src/core/native_head.cpp:47-55`, `src/core/native_head.cpp:131-140`）、native weights pack のファイル読み込み（`src/core/weights.cpp:277-289`）、MTP draft ファイル読み込み（`src/core/mtp.cpp:117-124,301-315`）が同じ helper を使います。同梱 `strata-vision` は非 Windows で projector ファイル全体を 128 KiB 単位に先読みしてからモデルをロードします（`tools/vision/strata_vision.cpp:101-113`）。
+memory helper と `strata-vision` はこの変数について有効・無効ログを出さない。OS advisory の失敗もログ化しない。例外的に engine の profile fill では `strata generate: the profile fill asks for %lld pairs ahead (STRATA_FILL_AHEAD)` を stderr に出し、`STRATA_READ_AHEAD=0` などで `advise_pairs` が使えない場合、表示される候補数は 0 になる（`engine/src/program/generate.cpp:9767-9774`、SYCL: `engine/sycl/src/program/generate.cpp:5375-5382`）。
 
-## 文書との照合
-
-`docs/DETAILS.md:282-286` は Linux で weights、native dense matrices、GPU cache fill、resident RAM copy、MTP draft files を 128 KiB 単位で先読みし、`STRATA_READ_AHEAD=0` で止めると説明しています。呼び出しコードと整合します。同節の性能値（Gen3 NVMe / RTX 5090 / 32 GB / Q2_0 resident at 262K で ready 70 秒対約 920 秒、fill 39 MB/s 対 3.2 GB/s）は資料に記載された測定としての引用であり、この調査で再測定した値ではありません。`docs/TROUBLESHOOTING.md:64-67` も Linux の先読みと無効化を説明しています。
+Strata の `docs/DETAILS.md:320-322` は weights と MTP draft を読み込み前に 128 KiB 単位で要求し、この変数で無効化できると記す。`docs/TROUBLESHOOTING.md:119-121` は Linux での先読みと変数による停止を案内する。これらは advisory の効果を保証する記述ではない。資料中の cold-start 測定値はこの変数の比較条件・測定環境と結び付いていないため、本書では性能値として扱わない。
 
 ## 根拠
 
-- 判定と OS ごとの差: `src/platform/memory.cpp:117-119,146-169`; API 宣言と説明: `include/strata/platform/memory.hpp:56-62`。
-- profile fill と別変数 `STRATA_FILL_AHEAD`: `src/program/generate.cpp:5152-5173`, `sycl/src/program/generate.cpp:4714-4733`。
-- mapped expert source / peer fill: `sycl/src/core/expert_source.cpp:951-966,2048-2054`, `src/core/peer_experts.cpp:160-168`。
-- その他のエンジン読み込み経路: `src/core/native_dense.cpp:264-267`, `src/core/native_head.cpp:47-55,131-140`, `src/core/weights.cpp:277-289`, `src/core/mtp.cpp:117-124,301-315`。
-- 同梱ツール: `tools/vision/strata_vision.cpp:101-113`。
-- 説明と測定条件: `docs/DETAILS.md:282-286`, `docs/TROUBLESHOOTING.md:64-67`。
+- `engine/src/platform/memory.cpp:160-162,201-231` — Windows no-op、非 Windows の変換/cache、および OS advisory。
+- `engine/include/strata/platform/memory.hpp:80-86` — API の範囲と Windows / `STRATA_READ_AHEAD=0` の説明。
+- `engine/src/core/expert_source.cpp:2675-2689,4607-4613`、`engine/sycl/src/core/expert_source.cpp:962-976,2059-2065` — mapped expert に対する条件付き advisory。
+- `engine/src/program/generate.cpp:9764-9793`、`engine/sycl/src/program/generate.cpp:5372-5391` — `STRATA_FILL_AHEAD` との連携と観測ログ。
+- `engine/src/core/weights.cpp:315-320`、`engine/src/core/native_dense.cpp:424-427`、`engine/src/core/native_head.cpp:185-188,241-245,534-542`、`engine/src/core/mtp.cpp:159-166,473-481` — CUDA engine のファイル / tensor 読み込み前呼び出し。
+- `engine/sycl/src/core/weights.cpp:303-320`、`engine/sycl/src/core/native_dense.cpp:297-300`、`engine/sycl/src/core/native_head.cpp:59-62,190-197`、`engine/sycl/src/core/mtp.cpp:156-163,395-405` — SYCL の対応呼び出し。
+- `terminal/tools/vision/strata_vision.cpp:127-140` — Linux の vision reader が行う直接判定と mmproj advisory。
+- `docs/DETAILS.md:320-322`、`docs/TROUBLESHOOTING.md:119-121` — Strata 文書との照合。

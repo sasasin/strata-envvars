@@ -1,41 +1,42 @@
 # `TEMP`
 
-調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Strata が `TEMP` を明示的に参照する箇所は、HIP エンジン起動前の一時ディレクトリ検査と、画像エンコーダーが GGUF のメタデータだけを一時ファイルに保存する処理です。前者は `TEMP` が書き込み不可のとき子エンジンへ渡す値を差し替え、後者は一時ファイル名の親ディレクトリ候補を選びます。通常の Strata CUDA エンジンの動作を直接切り替える設定ではありません。
+Strata のサーバーは、HIP backend を使う子プロセス用環境を作るとき、設定された `TEMP` のディレクトリへ一時ファイルを作れるか確認します。値が空でないのに書き込み不能なら、ログファイルまたは作業ディレクトリの近くに作った `tmp`（作れなければ Strata のルートにある `tmp`）へ差し替えます。値が有効で書き込み可能なら変更しません。このチェックは HIP backend のみで、他 backend では `TEMP` を個別に検査・変更せず、子プロセス環境に渡します（`terminal/serve/server.py:4007-4010,4027-4028,4054-4062,4065-4095`）。
 
 ## 値と判定
 
-- HIP 用の `child_env()` は親プロセスの環境をコピーし、設定プロファイルの `env` があればその値で上書きします。`TEMP` は文字列のまま扱われ、空白除去やパス正規化はしません。
-- `hip_env_guard()` は `TEMP` が空文字でない場合に限り、そのディレクトリで `tempfile.TemporaryFile()` を作れるか確認します。未設定または空文字は検査対象になりません。
-- 画像エンコーダーの C++ 側では、`TMPDIR` が未設定または空文字なら `TEMP`、それも未設定または空文字なら `TMP`、最後に `/tmp` を使います。この選択ではパスの存在・書き込み可否・空白を事前検査しません。
+`child_env` はプロセス環境をコピーし、プロフィールの `cfg.env` をその上に適用します。従って `TEMP` は親プロセスの値を引き継ぎ、プロフィールの `env.TEMP` があればその値が優先されます。HIP backend の `hip_env_guard` は `TEMP`、`TMP`、`TMPDIR` をそれぞれ `env.get(k)` で調べます。未設定と空文字はともに偽として検査対象外です。値の trim、パス正規化、文字列形式検証、大小文字変換はせず、非空の値を `_dir_writable` に渡して `tempfile.TemporaryFile(dir=p)` が成功するかで判定します。失敗する OS エラーは書き込み不可として扱います（`terminal/serve/server.py:4010,4027-4028,4078-4079`; `terminal/serve/server_parts/engines.py:1083-1088`）。
+
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| HIP backend の `TEMP` 検査 | 検査を行わず、値を新たに設定しない | 空でない値のディレクトリに一時ファイルを作れる場合（例: `C:\\Users\\me\\AppData\\Local\\Temp`、`/tmp`） | 空でない値のディレクトリに一時ファイルを作れない場合。`0`、`true` なども特別扱いせず、文字列が指すディレクトリで通常どおり検査 |
+| HIP 以外 | Strata は個別検査を行わない | 子プロセス環境へ値を渡す | Strata による値の判定なし |
+
+空文字と未設定は HIP の書き込み検査上は同じですが、`child_env` がその値をプロセス環境から削除するわけではありません。`TEMP` が無効で、置換先も見つからない場合、Strata は元の値を残します。`TMP` または `TMPDIR` だけが無効なら、その変数だけが差し替えられます（`terminal/serve/server.py:4078-4092`）。
 
 ## 有効になる条件
 
-- サーバーの HIP backend では `child_env()` から `hip_env_guard()` が呼ばれます。CUDA backend ではこのガードを通らず、`TEMP` を修正しません。
-- HIP 起動環境に `TEMP`、`TMP`、`TMPDIR` のいずれか書き込み不可の値がある場合、ガードはそれらの不正なキーを同じ代替ディレクトリへ変更します。1つでも該当すれば、書き込み可能な代替先を `cfg.log` の親の `tmp`、次に Strata の `ROOT/tmp` の順で探します。
-- 代替先を作成・検査できない場合、元の環境値は残ります。ガードはエラー文字列を stderr に出しますが、この関数自体は終了や起動拒否を行いません。
-- 画像エンコーダーでは `TEMP` より `TMPDIR` が優先されます。`TEMP` が空でなくても、`TMPDIR` が空でない場合はこの処理では使われません。
+- ディレクトリ書き込みの検査・修正・警告は `cfg.backend == "hip"` のときだけ行います。CUDA、SYCL、CPU など HIP 以外の経路にはこのガードは適用されません（`terminal/serve/server.py:4054-4059`）。
+- HIP でも `TEMP` が未設定または空文字なら `bad` に含まれません。`TEMP` 自体は設定されていても、`TMP` や `TMPDIR` のいずれかが書き込み不能なら、それらの無効な変数だけを同じ置換先へ差し替えます（`terminal/serve/server.py:4078-4089`）。
+- 無効値の置換先は、`cfg.log`、それがなければ `cfg.cwd`、さらにそれもなければ `ROOT` を基準にした `tmp` が最初の候補です。そこへディレクトリを作成できず、または書き込み検査に失敗した場合は `ROOT/tmp` を試します。どちらにも書けなければ値を直さず、警告だけ出します（`terminal/serve/server.py:4080-4092`）。
+- CLI 引数による `TEMP` の優先順位変更はありません。サーバー設定の `env` が親プロセス環境より優先され、HIP の検査・置換後の値がエンジン用環境になります（`terminal/serve/server.py:4010,4027-4028,4054-4059,9391-9394`）。
 
 ## 実行時の詳細
 
-HIP の子エンジン環境は `child_env()` が起動ごとに組み立てます。環境値は親プロセスからコピーされた後にプロファイルの `env` で上書きされ、その環境に対して HIP ガードが動きます。書き込み不可の値を置換した場合は、変更された各変数について `strata serve: AMD: <変数>=<元の値> is not writable: using <代替先>` を stderr に出します。代替先が見つからない場合は `strata serve: AMD: <変数一覧> not writable (AMD's runtime needs a writable temporary folder)` を出します。
+サーバーの `child_env` 呼び出しごとに `os.environ` のコピーから環境を組み立て、プロフィールの `env` を適用した後、HIP の場合に `hip_env_guard` を実行します。これは環境スナップショット作成時のチェックで、`TEMP` をプロセス起動後に監視・再読込する処理ではありません。通常の Strata engine 起動では作成した `env` を `StrataEngine` に渡し、分割起動の fallback でも `child_env` を再作成します（`terminal/serve/server.py:4007-4010,4027-4028,4054-4055,8820-8824,9391-9394`）。
 
-画像エンコーダーの `strata_open_text_model()` は選んだディレクトリに `strata-vision-meta-<PID>.gguf` を作り、GGUF のキー・値ヘッダーをコピーして語彙のみのモデル読み込みを試みます。一時ファイルを削除した後、ヘッダーコピー経由で読み込めなければ元のモデルファイルを直接開きます。`TEMP` のパスが無効な場合、ヘッダーコピーが失敗して直接読み込みへ進む可能性があります。
+空でない `TEMP` が書き込み不能で、置換用ディレクトリを用意できるときは、Strata は `TEMP` の値を置換してからエンジン環境として渡します。候補をどちらも使えない場合は元の `TEMP` を渡し続けます。`TEMP` を単独で既定ディレクトリに設定する処理はありません（`terminal/serve/server.py:4078-4092`）。
 
-Python の `Vision.work_dir()` も `tempfile.mkdtemp()` を引数 `dir` なしで呼び、作成できた一時ディレクトリのパスに空白がある場合は cwd、Windows のシステムドライブ直下を順に試します。この箇所は Strata が `TEMP` を直接読むのではなく、Python の一時ディレクトリ選択に委ねています。
+## ログと測定値
 
-## 文書との照合
-
-`docs/DETAILS.md`、`docs/AMD_HIP.md`、`docs/DOCKER.md` には `TEMP` の Strata 側処理を説明する記述は見つかりませんでした。上記は調査対象 HEAD のコードに基づきます。
+値を変更した場合、Strata は stderr に `strata serve: AMD: TEMP=<元の値> is not writable: using <置換先>` を出します。`TMP`/`TMPDIR` も同時に置換した場合は変数ごとに行を出します。置換先がない場合は `strata serve: AMD: TEMP, ... not writable (AMD's runtime needs a writable temporary folder)` の形で出し、元の値は維持します。値が unset、空、または書き込み可能ならこの `TEMP` に関する行は出ません（`terminal/serve/server.py:4087-4095`）。
 
 ## 根拠
 
-- `serve/server.py:3499-3537` — 子プロセス環境の複製、設定値の上書き、および HIP backend でのガード呼び出し。
-- `serve/server.py:3540-3578` — 一時ディレクトリ書き込み確認、代替先、値の置換、stderr ログ。
-- `serve/server.py:7980-7985,8349-8352` — エンジン起動と `child_env()` の使用箇所。
-- `serve/server.py:2582-2600` — 画像エンコーダー用ディレクトリの作成と空白パスの回避。
-- `tools/vision/gguf_meta.h:136-155` — `TMPDIR`、`TEMP`、`TMP`、`/tmp` の優先順、一時 GGUF の生成・削除、読み込み fallback。
-- `tools/vision/strata_vision.cpp:208-212` — `strata_open_text_model()` を画像エンコーダーの起動時に呼ぶ箇所。
+- `terminal/serve/server.py:4007-4010,4027-4028,4054-4062` — 子環境の複製、プロフィール設定の適用、HIP 条件と返却。
+- `terminal/serve/server.py:4065-4095` — HIP ガードの対象変数、置換先の順序、警告と stderr 出力。
+- `terminal/serve/server_parts/engines.py:1083-1088` — 一時ファイル作成によるディレクトリ書き込み確認。
+- `terminal/serve/server.py:8820-8824,9391-9394` — エンジン起動とサーバーモードでの子環境利用。

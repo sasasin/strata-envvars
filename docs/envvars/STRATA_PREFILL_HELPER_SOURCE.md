@@ -1,61 +1,67 @@
 # `STRATA_PREFILL_HELPER_SOURCE`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--serve` の prompt prefill で、helper GPU の VRAM expert cache にある blob を、モデルファイルから読み直す代わりに host 側の prompt staging buffer へコピーします。helper cache にない blob は従来の `ExpertSource` へ渡されます。通常の `generate` 経路ではこの変数を読まず、serve 経路でも既定は無効です。
+`strata serve` の prompt prefill が、別 GPU の remote expert helper が VRAM cache に保持している expert blob を、その cache から host staging buffer へコピーして使う opt-in スイッチです。未設定または 0 判定では prefill の source は元の `srcp` のままです。有効時も変わるのは blob の取得元だけで、helper にない blob は従来の source に渡され、prefill の判断や計算は変更されません（`engine/src/program/generate.cpp:12315-12330`、`engine/include/strata/core/remote_experts.hpp:107-115`）。
+
+この読み取りは `strata serve` の初期化中に一度だけ行われます。通常の `generate` 経路ではこの判定ブロックに入りません。`strata` 実行ファイルは CUDA/HIP GPU engine の CMake 定義にあり、SYCL は別プロジェクト、Metal は別 engine です（`engine/src/program/generate.cpp:12302-12330`、`engine/cmake/strata_gpu_engine.cmake:548-551`、`engine/CMakeLists.txt:3-7,20-32`）。
 
 ## 値と判定
 
-`src/program/generate.cpp` は環境変数が設定されているかを確認した後、値を `std::atoi()` に渡し、結果が 0 以外かを判定します。文字列全体の厳密な検証や `1` との比較ではありません。
+`std::getenv` で設定有無を確認し、設定されていれば `std::atoi(hv) != 0` を条件にします。全体の文字列比較や変換エラー検査はありません。`atoi` は先頭の空白と符号を許し、先頭の 10 進整数部分だけを読み、数字以降の文字列を検査しません。数字で始まらない文字列と空文字は 0 になります（`engine/src/program/generate.cpp:12325-12326`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字、数字に変換できない文字列（例: `true`） | `atoi` が 0 を返すため無効 |
-| 整数として 0 になる値（例: `0`, `00`, `-0`） | 無効 |
-| 整数として 0 以外になる値（例: `1`, `2`, `-1`） | 有効候補 |
-| 数字の後ろに文字が続く値（例: `1junk`） | 数字の prefix が 0 以外なら有効候補。文字列全体は検証しない |
+| 環境値 | 判定 | 例 |
+|---|---|---|
+| 未設定 | 無効 | 既定では helper source を使わない |
+| 空文字、先頭が数値でない | 無効 | `""`, `true`, `false` |
+| 先頭の整数部分が 0 | 無効 | `0`, `+0`, `-0`, `0anything`, `0x1` |
+| 先頭の整数部分が 0 以外 | 有効候補 | `1`, `-1`, `2`, `1anything`, `  +1tail` |
 
-`atoi` の通常の変換規則により先頭の空白と符号は許され、最初の数字以外で変換が止まります。数値範囲外の文字列の結果には依存しないでください。判定は serve 起動時の初期化で行われ、リクエストごとの再評価やプロセス起動後の環境変更を反映するコードはありません。
-
-根拠: `src/program/generate.cpp:7244-7259`。
+`atoi` の戻り値が 0 以外でも、有効条件を満たさなければ helper source は作成されません。`int` に表せない数値文字列について、コードはエラー検査や fallback 値を定めていません（`engine/src/program/generate.cpp:12325-12327`）。
 
 ## 有効になる条件
 
-値が 0 以外でも、次の条件をすべて満たしたときだけ prompt source を切り替えます。
+- サーバーモードであること。通常の `generate` にはこの環境変数を使う判定がありません（`engine/src/program/generate.cpp:12302-12327`）。
+- `srcp != nullptr` であること（同 `12325-12327`）。
+- `multi_gpu` が false で `stages` が空、つまり layer split の複数 GPU prompt path ではないこと（同 `12325-12327`）。
+- `o.batch <= 0` であること。batch slot を使う設定では helper source に切り替えません（同 `12325-12327`）。
+- `prefill_helpers` が空でないこと。これは `drive.d.remote[]` に登録された remote expert cache が少なくとも一つあることを要します（同 `12320-12327,10242-10244`）。remote expert cache の起動には `--expert-cache-device1` といった設定に加えて `--expert-profile`、CUDA0 の `--expert-cache`、expert pool が必要です（`engine/src/program/generate.cpp:10127-10132`）。
+- helper cache に対象の `(layer, expert)` があること。起動時に helper source が作られても個々の cache miss は元の source から取得します（`engine/include/strata/core/remote_experts.hpp:121-124,152-155`、`engine/src/core/remote_experts.cpp:457-493`）。
 
-- コマンドが `--serve` の経路に入っている。
-- `srcp` が有効な expert source を指している。
-- `multi_gpu` が false で、layer split がない。
-- `stages` が空である。
-- `o.batch <= 0` で、batch slots を使わない。
-- helper の `prefill_helpers` が空でない（`drive.d.remote_count` 個の helper を列挙した結果）。
-
-条件を満たさない場合、変数を有効値にしても source は `srcp` のままです。ソース上、この変数に対応する CLI 引数や別の環境変数による上書きはありません。helper expert cache 自体の設定・容量は別の serve 引数で決まり、この変数だけでは cache を作成しません。
+この環境変数を読むほかの環境変数、CLI 引数、設定ファイルによる値の上書きはありません。CLI は値の既定を上書きしませんが、`--expert-cache-device1..3` などで作られる helper cache の有無や上記 mode 条件には影響します。
 
 ## 実行時の詳細
 
-有効条件を満たすと `RemotePrefillSource` が作られ、`Prefill::init()` に元の `srcp` の代わりに渡されます。prefill 側は helper cache に現在ある `(layer, expert)` を transient source として扱い、複数 blob の staging では helper ごとにまとめて読み取り、cache hit でない blob は元 source の `copy_blobs()` に渡します。これにより file source の batching などの fallback 処理は維持されます。通常の `generate` は別の `Prefill::init()` 呼出しで `srcp` をそのまま渡しています。
+サーバー初期化時、環境値が非ゼロで条件を満たすと `RemotePrefillSource` を作り、`prefill_src` を元の `srcp` から wrapper に切り替えます。`Prefill::init` にはこの `prefill_src` が渡されます（`engine/src/program/generate.cpp:12320-12330,13032-13040`）。環境値の判定結果自体は起動時に一度だけ決まり、実行中に環境を書き換えても wrapper の有効・無効は切り替わりません。
 
-helper 側は専用 CUDA read stream で VRAM cache から host buffer へ `cudaMemcpyAsync` し、その stream を同期してから呼出し元へ戻ります。複数の prefill staging thread から読めるよう mutex で同時読取りを直列化します。cache hit はコピー時に調べられ、ラッパー側に別 cache はありません。したがって、リクエスト間に helper cache の内容が変わった場合は次の読み取り時の状態が使われます。
+wrapper は blob ごとの問い合わせ時に helper の現在の cache 保持状態を調べます。保持されていれば helper の CUDA stream から blob を host buffer へ device-to-host コピーして stream を同期し、hit として返します。読み出し対象は helper cache の blob bytes です。保持されていない blob は元の source に渡され、helper の cache 状態を wrapper 内に固定保存しません（`engine/include/strata/core/remote_experts.hpp:56-63,107-115,121-124`、`engine/src/core/remote_experts.cpp:394-424,447-493`）。
 
-CUDA 読取りが失敗すると、stderr に `prefill: a helper cache read failed (%s); the file source fills that blob instead` を一度出し、失敗した blob を元 source から補います。読み取り済み hit のコピーが完了していることを確認できない場合は hit 扱いを取り消して fallback します。helper source が作られた場合、各 request の終了時に `strata serve: prefill helper source: %lld blobs / %.1f MiB taken from a helper's cache in this request` を stderr に出します。起動時には有効化した旨の行も出ます。
+複数 blob の copy では helper ごとにまとめて読み出し、helper hit 以外を一括で元の source に渡します。helper cache の読み出しで失敗した場合、コピー完了が確認できた hit は使い、残りは元の source へ回します。失敗理由の stderr 警告はプロセス内で最初の一度だけ出します。元の source の `copy_blobs` も失敗すると prefill stager はエラーを stderr に出して `std::abort()` します（`engine/src/core/remote_experts.cpp:408-423,464-500`、`engine/src/prefill/prefill.cpp:1233-1247`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/SECOND_GPU.md` は helper GPU cache と prompt prefill が CUDA0 で動く構成を説明しています（72-74行）が、この環境変数の個別説明はありません。`docs/DETAILS.md` の関連箇所（600-603行）は helper cache と layer split が VRAM elastic 機能の適用外であることを記載しています。今回確認したソースは cache hit 時に helper cache から prompt staging buffer へ blob をコピーする実装を示しますが、この調査では性能測定や token 結果を検証していません。
+条件を満たして wrapper を作成したとき、stderr に次の行を出します。
+
+```text
+strata serve: the prompt path reads the experts a helper cache holds from that cache (STRATA_PREFILL_HELPER_SOURCE)
+```
+
+各 server request の終了時には wrapper がその request で helper cache から得た blob 数と MiB を出します。helper read error 時は以下の警告が一度だけ出ます（`engine/src/program/generate.cpp:12329-12330,23949-23955`、`engine/src/core/remote_experts.cpp:496-500`）。
+
+```text
+strata serve: prefill helper source: N blobs / M.M MiB taken from a helper's cache in this request
+prefill: a helper cache read failed (...); the file source fills that blob instead
+```
+
+`docs/DETAILS.md` には expert cache や helper cache に関する説明はありますが、この環境変数固有の動作や性能測定値は確認できませんでした。ここではソースから確認できる挙動のみ記載し、速度や出力への性能影響は断定しません。
 
 ## 根拠
 
-- 環境変数の判定、helper 列挙、適用条件、起動ログ: `src/program/generate.cpp:7244-7260`
-- helper source を prompt path に渡す箇所: `src/program/generate.cpp:7608-7612`
-- `generate` 経路では元の `srcp` を渡す箇所: `src/program/generate.cpp:13205-13211`
-- helper cache read stream の作成: `src/core/remote_experts.cpp:195-213`
-- VRAM cache から host へのコピー、同期、read lock: `src/core/remote_experts.cpp:349-379`
-- cache hit の識別、fallback、1回の警告: `src/core/remote_experts.cpp:381-455`
-- source wrapper の fallback semantics と transient/pinned 判定: `include/strata/core/remote_experts.hpp:104-163`
-- prompt stager の複数 blob 読取り呼出し: `src/prefill/prefill.cpp:534`
-- helper cache 関連の serve 構成: `docs/SECOND_GPU.md:72-74`
-- docs の関連機能制約: `docs/DETAILS.md:592-603`
+- `engine/src/program/generate.cpp:12302-12330` — serve 条件、変数の読み取り、値判定、source の切替、初期ログ。
+- `engine/src/program/generate.cpp:10127-10132,10242-10244,13032-13040,23949-23955` — helper cache の起動条件・登録、prefill への渡し方、request 単位のログ。
+- `engine/include/strata/core/remote_experts.hpp:56-63,107-159` — helper cache コピー API と wrapper の source 動作。
+- `engine/src/core/remote_experts.cpp:136-145,394-424,426-500` — remote cache の初期化、device-to-host copy、fallback、警告。
+- `engine/src/prefill/prefill.cpp:1233-1247` — copy failure 時の prefill 側エラーと abort。
+- `engine/cmake/strata_gpu_engine.cmake:548-551`、`engine/CMakeLists.txt:3-7,20-32` — GPU engine の対象と SYCL の分離。

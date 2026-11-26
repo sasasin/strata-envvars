@@ -1,48 +1,51 @@
 # `STRATA_IO_PF_STAGE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux の mapped file tier で `STRATA_IO_PREFETCH` が有効なとき、未キャッシュの expert を worker が scratch buffer に読み込んで OS page cache を温める既定動作を、expert ごとの staging buffer へ読み込む動作に切り替える。staging された expert はファイル mapping ではなく staging buffer から供給され、現在層の必要な expert の読み込みが終わるまでその層の処理が待つことがある。対象は主に pack の `experts.bin` 経路である。
+Linux のファイル層 I/O prefetch が有効なとき、`experts.bin` の先読み先をページキャッシュにするか、expert blob 用 staging buffer にするかを切り替える。既定では I/O worker が未キャッシュ範囲を scratch buffer に `pread` してページキャッシュを埋め、計算側は mapped file を読む。値が非ゼロなら worker は blob を staging buffer に読み、要求側はその buffer を使う。これは I/O prefetch 自体を有効化する設定ではない。`FileExpertSource::set_io_prefetch` が切替を設定し、`io_worker`、`prefetch`、`io_blob` が経路を実行する（`engine/src/core/expert_source.cpp:1261-1289,1406-1433,1468-1479,2449-2467`）。
 
 ## 値と判定
 
-値は文字列全体として比較せず、C/C++ の `std::atoi` で整数に変換し、結果が 0 以外なら staging を選ぶ。
+有効化判定は `std::getenv` の null 判定後に `std::atoi(v) != 0` を使う。文字列全体の数値検証やエラー処理、clamp はない。`atoi` が変換した整数が非ゼロなら staging 側、ゼロなら既定の page-fill 側になる。例えば `1`、`2`、`-1`、`1x` は非ゼロ扱い、`0`、`0x`、空文字、数字で始まらない文字列はゼロ扱い。先頭空白と符号は `atoi` の変換規則に従う。大きすぎる値の変換結果はコードで安全に定義・検査されていない（`engine/src/core/expert_source.cpp:1285-1288`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 0 と同じ。staging は選ばず、`experts.bin` では page cache を埋める既定方式 |
-| 空文字、数字で始まらない文字列、`0`、`0tail` | `atoi` の結果が 0。staging しない |
-| `1`、`-1`、`2tail` など、変換結果が 0 以外 | staging を選ぶ |
+| 条件 | unset | 設定時に staging になる値 | 設定時に staging にならない値 |
+|---|---|---|---|
+| Linux、mapped `experts.bin`、I/O prefetch 有効 | page-fill（`io_fill_ = true`） | `atoi` 結果が非ゼロ。例: `1`, `-1`, `1x` | `atoi` 結果がゼロ。例: `0`, `0x`, 空文字, `true` |
+| Linux、GGUF shard をその場で読む経路 | `io_fill_ = false` | 値にかかわらず同じ経路 | 値にかかわらず同じ経路 |
+| I/O prefetch が無効、または Linux 以外 | この変数による切替なし | この変数による切替なし | この変数による切替なし |
 
-`atoi` は先頭の空白と符号を許し、先頭の10進整数部分を変換するため、`  +1tail` も有効、`  -0x` は 0 となる。全体の構文検証や値域 clamp はない。変換結果が `int` に収まらない文字列の挙動はこの実装から保証できない。根拠: `src/core/expert_source.cpp:659-662`。
+GGUF 直読みでは `role_ptr_` が空でないため、代入式の左辺 `role_ptr_.empty()` が false となり、値が非ゼロでも `io_fill_` は false のまま。これは staging 経路を選ぶ状態ではあるが、`STRATA_IO_PF_STAGE` の値による差は生じない（`engine/src/core/expert_source.cpp:1285-1288,1812-1813,1875-1880`）。
 
 ## 有効になる条件
 
-- `strata generate` が `STRATA_IO_PREFETCH` を設定済みかつ `atoi(value) != 0` と判定し、`FileExpertSource::set_io_prefetch(true, ...)` を呼ぶ必要がある。I/O prefetch 自体は Linux で mapped file tier を使い、unbuffered reader ではない場合に限り開始する。使えない場合は `STRATA_IO_PREFETCH=1 is not available here ...` と出て、設定値は適用されない（`src/program/generate.cpp:4667-4678`; `src/core/expert_source.cpp:636-640,667-669`）。
-- `set_io_prefetch` は Linux 以外では I/O prefetch を開始しない。Linux でも mapping がない、パスが空、または direct reader がある場合は、設定を読む前に戻る（`src/core/expert_source.cpp:636-640`）。
-- `experts.bin` では `role_ptr_` が空なので、この値が staging と page-cache fill の切り替えになる。GGUF shard を直接 mapping する経路では `role_ptr_` が空でなく、`io_fill_` は値に関係なく false になるため、この変数による切り替えはない（`src/core/expert_source.cpp:659-662,1112-1115`）。
-- どちらの方式も router-aware lookahead が必ず成立することを意味しない。次層の予測読み込みは `STRATA_LOOKAHEAD` の条件、ルーター重みの形式、予測器の起動成功に依存する（`src/program/generate.cpp:5496-5523`）。
+- `strata generate` の `--mmap-experts` ファイル層を使う必要がある。通常の expert arena 経路では `FileExpertSource` のこの設定を通らない（`engine/src/program/generate.cpp:8621-8628,8745-8748`）。
+- Linux で `set_io_prefetch(true, ...)` が実際に有効になる必要がある。`STRATA_IO_PREFETCH` が非空かつ `atoi` 非ゼロなら明示的に要求し、未設定または空なら `src.linux_io_defaults()` が既定を決める。既定が有効でも全 expert が GPU cache にあると Linux 既定の I/O prefetch が停止される場合があり、明示的な `STRATA_IO_PREFETCH=1` はその停止を防ぐ（`engine/src/program/generate.cpp:8693-8704,10251-10258,10275-10285`）。
+- `set_io_prefetch` は Linux でのみ worker を起動する。`on` が false、mapping がない、path がない、または unbuffered reader の場合は有効にならない。必要なファイル descriptor を開けない場合も途中で戻り、prefetch は開始されない（`engine/src/core/expert_source.cpp:1261-1277,1310-1312`）。この場合、値自体をエラーとして扱う処理はない。
+- `experts.bin` で page-fill 方式と staging 方式を切り替えるのは `role_ptr_` が空のときだけ。GGUF shard 直読みでは `role_ptr_` が設定されているため、この変数による違いはない（`engine/src/core/expert_source.cpp:1285-1288,1812-1813,1875-1880`）。
+- `STRATA_IO_PF_STAGE` は prefetch の可否、I/O thread 数、decode gate を上書きしない。これらは別途 `STRATA_IO_PREFETCH`、`STRATA_IO_PF_THREADS`、`STRATA_IO_PF_GATE` などで決まる（`engine/src/program/generate.cpp:8693-8718`; `engine/src/core/expert_source.cpp:1283-1303`）。
 
 ## 実行時の詳細
 
-値は file tier の初期化時、`STRATA_IO_PREFETCH` によって `set_io_prefetch` が呼ばれるたびに一度読み込まれ、`io_fill_` に保存される。static cache ではないが、同じ `FileExpertSource` が起動後にこの値を読み直す経路は確認できない。したがって実用上は初期化前に設定する。
+初回のファイル層設定で `set_io_prefetch` が呼ばれ、`STRATA_IO_PF_STAGE` がその時点で読み取られて `io_fill_` に反映される。GPU cache の全 expert 保持を理由に Linux 既定の prefetch が停止されたあと、cache resize や eviction で再有効化される経路でも `set_io_prefetch` が再度呼ばれるため、その都度この値を読み直す。変数は expert ごと・request ごとには読まれず、active 中の環境値変更だけでは `io_fill_` は更新されない（`engine/src/program/generate.cpp:8701-8704,10275-10285,10341-10369`; `engine/src/core/expert_source.cpp:1261-1289`）。
 
-既定の `experts.bin` page-cache fill では、worker が uncached な blob を scratch buffer に `pread` し、データを page cache に置く。compute 側は mapping を使う。非0値では worker が uncached blob を staging buffer に読み、需要層は `prefetch` で対象 expert をまとめて stage し、worker に先読みを渡した場合は `io_blob` が staged blob を返す。page cache にある blob は mapping から返る。`STRATA_IO_PF_AHEAD=0` は予測先読みを止める別設定であり、`STRATA_IO_PF_STAGE` が非0でも demand read の staging 経路は残る（`src/core/expert_source.cpp:702-770,777-803,1426-1484`; `src/core/expert_source.cpp:2137`）。
+page-fill 方式では worker が各 span の未 resident 範囲を thread-local scratch buffer へ `pread` し、そのページを cache に置く。`prefetch` は worker に仕事を渡して戻り、kernel 側は mapping を読む。非ゼロ設定の staging 方式では、worker が mapped blob の未 cache データを stage buffer へコピーし、要求側は stage buffer を利用する。`io_blob` は stage 済みでない場合、cache 上の blob は mapping から返す（`engine/src/core/expert_source.cpp:1406-1433,1440-1464,1468-1495,2451-2467`）。
 
-`STRATA_IO_PREFETCH` が有効で、この変数も `atoi` で非0のとき、起動時に次の案内が stderr に出る。これは推奨の測定注記であり、処理を強制・抑止しない。
+## ログと測定値
+
+prefetch が有効で、`STRATA_IO_PF_STAGE` の `atoi` 結果が非ゼロなら、stderr に次の注意行が出る。これは切替の成功確認ログではなく、測定についての案内であり、無効値や unset では出ない（`engine/src/program/generate.cpp:8725-8729`）。
 
 ```text
 strata generate: note: STRATA_IO_PF_STAGE=1 (staging) measured faster only on a 32 GB-class box (+25% on an RTX 3060, 32 GB); it was slower at 16 GB and on an iGPU (docs/DETAILS.md, file tier I/O)
 ```
 
-Strata の `docs/DETAILS.md:225-245` は staging mode が未キャッシュ expert を buffer に読み、層がそれを待つと説明する。記載された測定条件は、interleaved A/B 10 組、200-token greedy median、各 run 前の page cache drop、cgroup memory limit。RTX 3060 32 GB / IQ3_XXS では default -3.4%、staging +25.7%、RTX 3060 16 GB / IQ3_XXS では -1.8% / -32.6%、Radeon 780M iGPU 16 GB / Q2_0 では -0.7% / -19%（この iGPU の測定は adaptive tier off）。これは記載条件での結果であり、他環境の性能を示すものではない。ソースには iGPU で適応層と I/O prefetch を併用した際の GPU reset 警告もあるが、原因は未特定と docs は述べている（`src/program/generate.cpp:4680-4691`）。
+`docs/DETAILS.md` の測定表は、0.1.40.2、RTX 3060 と Radeon 780M、interleaved A/B 10 pairs、200-token greedy、page cache dropped と記し、`experts.bin` で staging と fill を比較した値として RTX 3060 / IQ3_XXS の 32 GB 時 +25.7%、16 GB 時 -32.6%、Radeon 780M / Q2_0 の 16 GB 時 -19% を載せている。これは Strata 資料に記録された結果であり、ここで再測定したものではない（`docs/DETAILS.md:1667`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:4667-4683` — I/O prefetch の起動条件、利用可否ログ、staging 測定注記。
-- `src/core/expert_source.cpp:636-669` — Linux 限定の初期化、変数の parse、`io_fill_` の決定。
-- `src/core/expert_source.cpp:702-770,777-803,1426-1484` — worker の cache fill / staging、blob の供給、需要層の prefetch。
-- `src/program/generate.cpp:5496-5523` — lookahead の成立条件。
-- `docs/DETAILS.md:225-245` — 設計説明、記録された測定条件と値。
+- `engine/src/core/expert_source.cpp:1261-1289` — Linux 条件、descriptor 確保、`atoi` による値判定と `io_fill_` 設定。
+- `engine/src/core/expert_source.cpp:1406-1433,1468-1495,2451-2467` — page-fill と staging の worker / 読み出し動作。
+- `engine/src/program/generate.cpp:8693-8729,10275-10285,10341-10369` — prefetch 起動・停止・再開条件と注意ログ。
+- `engine/src/core/expert_source.cpp:1570-1580,1812-1880` — `experts.bin` と GGUF 直読みの source 構成。
+- `docs/DETAILS.md:1667` — 資料に記録された staging 対 fill の測定条件と値。

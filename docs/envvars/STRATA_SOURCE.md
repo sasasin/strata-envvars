@@ -1,53 +1,50 @@
 # `STRATA_SOURCE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-セットアップ時に、モデル関連ファイルを Hugging Face から取得するか、明示的な指定がある場合に ModelScope から取得するかを選びます。セットアップはネットワーク状況を見て自動で ModelScope へ切り替えません。環境変数に未知の値があってもセットアップ自体は失敗せず、Hugging Face を選びます。
-
-この選択は `setup.py` の `download()` によるダウンロードのうち、`HF_REVISIONS` に登録された Hugging Face のモデルファイル URL を ModelScope URL に対応づけられる場合に限って使われます。llama.cpp や engine 等、登録済みリポジトリのファイル URL でないダウンロードはこの選択で切り替わりません。既存 GGUF を指定する `--gguf-dir` や、既にダウンロード済みのファイルを再利用する場合も、モデルファイルの取得元選択は発生しません。
+セットアップ時にモデルファイルと MTP（speculative decoding 用ドラフト層）の取得元を Hugging Face にするか ModelScope にするか選ぶ。既定の `auto` は常に Hugging Face を選び、疎通失敗を理由に Strata が自動で ModelScope へ切り替えることはない。ModelScope が選ばれても、同サービスに応答がないモデルファイルは Hugging Face へ fallback する。モデルの実行時設定を変える変数ではない。選択処理は `terminal/setup.py` の `model_source()`、MTP 取得側は `terminal/tools/mtp_fetch.py` にある（`terminal/setup.py:212-220, 3546-3552`; `terminal/tools/mtp_fetch.py:43-57`）。
 
 ## 値と判定
 
-| 指定 | `setup.py` の選択 |
-|---|---|
-| 未設定、または空文字 | `auto` として扱い、Hugging Face |
-| `ms` / `modelscope` | ModelScope |
-| `auto` / `huggingface` | Hugging Face |
-| その他の文字列 | Hugging Face（エラーにはならない） |
+セットアップの `model_source()` は `os.environ.get("STRATA_SOURCE") or "auto"` の結果を前後空白除去し、小文字化する。`ms` と `modelscope` だけを ModelScope と判定し、それ以外はすべて Hugging Face になる。空文字は `auto` と同じ。空白だけの値は strip 後に空文字となり、Hugging Face になる。無効値をエラーにしたり警告したりしない（`terminal/setup.py:212-220`）。
 
-環境変数の値は前後の空白を除去し、小文字化してから判定されます。したがって ` MODELSCOPE ` も ModelScope です。全体一致であり、`modelscope-extra` のような値は ModelScope になりません。`auto` は自動選択を意味せず、Hugging Face を選びます。
+| 経路 | 未設定・空文字 | ModelScope になる値 | Hugging Face になる値 |
+|---|---|---|---|
+| `terminal/setup.py` のセットアップ | `auto` → Hugging Face | `modelscope`, `ms`（大文字小文字を区別せず、前後空白を除去） | `auto`, `huggingface`、空白のみ、その他すべて。値全体を enum として検証しない |
+| セットアップ CLI `--source` | 指定なしなら既存環境変数を使う | `modelscope` | `auto`, `huggingface`。CLI はこの 3 値だけ受け付ける |
+| `terminal/tools/mtp_fetch.py` の直接実行 | Hugging Face | `modelscope`, `ms`（前後空白を除去し小文字化） | 空文字、空白のみ、その他すべて |
 
-CLI の `--source` は `auto`、`modelscope`、`huggingface` のいずれかに制限されます。これを指定すると、引数解析後に `STRATA_SOURCE` をその値で上書きするため、CLI が環境変数に優先します。たとえば `STRATA_SOURCE=modelscope` でも `--source auto` を指定すれば Hugging Face です。
+CLI の `--source` は `choices=("auto", "modelscope", "huggingface")` で検証され、指定されると既存の `STRATA_SOURCE` を上書きする。`--source ms` は CLI では拒否されるが、環境変数では受理される（`terminal/setup.py:176, 11536-11539, 11606-11623`; Mac セットアップにも同じ選択肢と上書きがある: `engine/metal/setup_mac.py:392-410`）。
 
 ## 有効になる条件
 
-ModelScope への切り替えには、次の条件があります。
-
-- `model_source()` が `modelscope` を返すこと（値は `ms` または `modelscope`）。
-- `download()` に渡された HTTP(S) URL が既知の Hugging Face ファイル URL で、対応するリポジトリが `HF_REVISIONS` に登録されていること。
-- 対応する ModelScope URL への HEAD 要求が成功すること。失敗した場合は Hugging Face の URL で続行します。
-
-ModelScope は固定 revision ではなくリポジトリの現在のファイルを配信します。取得後、セットアップは ModelScope API からファイルのサイズと SHA-256 を取得でき、SHA-256 がある場合はそれで検証します。メタデータを取得できない場合や SHA-256 がない場合は、検証しない旨を警告して完了マークを付けます。MTP tensor は別途、固定チェックポイント由来の SHA-256 で検査されます。これらのハッシュ値の意味や配信サービス内部の動作は Strata の環境変数処理の範囲外です。
-
-`HF_ENDPOINT` は Hugging Face の取得先（ミラーを含む）を設定し、`MODELSCOPE_ENDPOINT` は ModelScope の取得先を設定します。`STRATA_SOURCE` が Hugging Face を選ぶ場合、ModelScope endpoint はモデル取得先の決定に使われません。
+- これは `terminal/setup.py` と同梱セットアップ用スクリプトが読む値であり、Strata C++ エンジンやサーバーのモデル実行時には参照されない（全参照の走査結果。直接の読み取りは `terminal/setup.py:216` と `terminal/tools/mtp_fetch.py:55`）。
+- `setup.py` の通常のモデル取得で ModelScope を使うのは、選択結果が `modelscope` で、取得 URL が Strata の把握する Hugging Face リポジトリ (`HF_REVISIONS`) のファイルに対応するときだけ。ModelScope は `master` の URL にマップされる。疎通確認が失敗すると警告を出し、元の Hugging Face URL から取得する（`terminal/setup.py:244-253, 3546-3552`）。
+- ModelScope 用のモデル URL は `MODELSCOPE_ENDPOINT`（空・空白なら `https://www.modelscope.cn`）から組み立てる。Hugging Face 側の URL は `HF_ENDPOINT` の設定を使う。これらは別の環境変数で、`STRATA_SOURCE` 自体の値判定には使わない（`terminal/setup.py:182-184, 252-253, 3551`）。
+- ready-made pack の取得経路は `STRATA_SOURCE=modelscope` でも ModelScope に切り替わらず、Hugging Face のみである旨を警告して通常の ready pack 取得へ進む（`terminal/setup.py:12380-12386`）。ローカルファイルのコピーや、すでに揃ったファイルにも取得元選択は作用しない（`terminal/setup.py:3513-3546, 12387-12414`）。
+- MTP の取得はセットアップが MTP 層を必要とし、既存の層がなく、オフ指定や別 drafter による取得抑止がない場合にだけ行われる。Mac 経路でも `use_mtp` が真で成果物がないときに fetch する（`terminal/setup.py:11297-11321, 12474-12494`; `engine/metal/setup_mac.py:567-584`）。セットアップは選択済みの `model_source()` の結果を子 `mtp_fetch.py` に `STRATA_SOURCE` として明示的に渡す（`terminal/setup.py:1160-1173`; Mac: `engine/metal/setup_mac.py:582-584`）。
+- `mtp_fetch.py` を直接起動し `--repo` を指定した場合、コマンドライン値が `REPO` を上書きする。これはソース環境変数の選択とは別に取得先 URL を差し替える経路（`terminal/tools/mtp_fetch.py:515-525`）。
 
 ## 実行時の詳細
 
-`setup.py` の `model_source()` は呼び出し時に `STRATA_SOURCE` を読み、結果を `(STRATA_SOURCE, HF_ENDPOINT, MODELSCOPE_ENDPOINT)` に基づくプロセス内辞書へ保存します。同じキーで再度呼ばれれば保存値を返します。環境変数が後から変更されても、キーが変われば別の選択として評価されます。セットアップの CLI 処理では `--source` があれば環境変数自体を上書きします。
+`terminal/setup.py` の `model_source()` は呼び出しごとに現在の環境変数を読み直し、正規化後の値、`HF_ENDPOINT` の生値、正規化した ModelScope endpoint の組を `_sources` のキーにして結果をキャッシュする。同じ組での呼び出しはキャッシュ済み結果を返す。いずれかの値が変われば別キーとして再判定されるため、プロセス内で環境を変更した場合も次の呼び出しで反映される（`terminal/setup.py:178, 182-184, 212-220`）。ただし通常の CLI 実行では `--source` を解析後に環境へ書き込み、その後のセットアップ処理が参照する（`terminal/setup.py:11606-11623`）。
 
-既知の Hugging Face URL が ModelScope に対応する場合、セットアップは ModelScope の対応 URLに HEAD 要求を送り、成功すればそちらから取得します。取得後は公開メタデータに SHA-256 があれば照合し、なければ未検証の警告を出します。応答しなければ `ModelScope does not answer; downloading it from ...` の警告を出し、Hugging Face endpoint を使います。ダウンロード失敗時の `source_hint()` は、Hugging Face または `hf-mirror` の URL に対して ModelScope を明示指定する方法を案内します。
+`mtp_fetch.py` は import 時に `STRATA_SOURCE` を一度読み、ModelScope のときは `REPO` と `PINNED` を ModelScope の `master` URL に設定する。以降の環境変更は再 import なしでは反映されない。既定の Hugging Face 経路では固定 `REVISION` を使い、ModelScope 経路ではリポジトリの現行ファイルを使う構成だが、MTP の各テンソルは固定チェックポイントの SHA-256 と照合される（`terminal/tools/mtp_fetch.py:43-57, 334-336, 407-475`）。
 
-MTP取得では、セットアップが `tools/mtp_fetch.py` を起動する際に `model_source()` の戻り値（`modelscope` または `huggingface`）を子プロセスの `STRATA_SOURCE` として渡します。同ツールは起動時に値を読み、空白除去と小文字化後に `ms` / `modelscope` なら ModelScope endpoint を使います。それ以外は `HF_ENDPOINT`（空なら Hugging Face 既定 endpoint）を使います。直接 `mtp_fetch.py` を起動した場合も環境変数を読みますが、通常の `setup.py` が `ms` を `modelscope` に正規化して渡す点とは異なり、同ツール側でも `ms` を受け付けます。
+通常のモデルファイル取得で ModelScope が応答しない場合は `"<file>: ModelScope does not answer; downloading it from <HF endpoint>"` の警告後に Hugging Face へ戻る。ready-made pack では `"these packs are on Hugging Face only: downloading them from ..."` と警告する。MTP 取得がネットワーク無応答なら子ツールは終了コード 4 を返し、セットアップは停止案内を出して終了する。完全オフライン時の終了コード 5 では MTP を使わずにセットアップを続ける。これらの取得失敗は値の変換エラーではない（`terminal/setup.py:1170-1189, 12382-12386`; `terminal/tools/mtp_fetch.py:536-539`）。
+
+## ログと測定値
+
+通常の Hugging Face 選択時にソース選択だけを示すログは確認できない。ModelScope 選択時のダウンロード案内・警告、および ModelScope 疎通失敗時の fallback 警告は `terminal/setup.py:3551, 12384-12399` にある。MTP の継続失敗では `terminal/tools/mtp_fetch.py:457-460` が取得エラーと接続数を stderr に出し、成功時はテンソルごとに `done` を stderr に出す（`terminal/tools/mtp_fetch.py:452-476`）。
+
+`docs/DETAILS.md` にこの環境変数の追加動作説明は見当たらなかった。`docs/SAFETY.md:45-46` は ModelScope を明示選択した場合のみ使い、自動切替しない点で実装と一致する。MTP の完全オフライン時に層なしでセットアップ継続する条件は同資料の記述だけでは詳述されていないため、ここではコードを根拠に記載した。
 
 ## 根拠
 
-- `setup.py:93-128`: ModelScope の位置づけ、許容ソース一覧、環境変数の正規化と選択結果のキャッシュ。
-- `setup.py:139-148`: Hugging Face URL と既知リポジトリの対応付け、および ModelScope URL の構築。
-- `setup.py:1449-1491,1531-1538`: ローカルコピーと HTTP(S) ダウンロードの分岐、ModelScope 到達確認、Hugging Face fallback、取得後の SHA-256 検証または未検証警告、失敗時の案内。
-- `setup.py:4846-4849,4893-4896`: `--source` の選択肢と環境変数への上書き。
-- `setup.py:5471-5498,5511`: モデル shard / vision encoder の取得と共通 `download()` 呼び出し。
-- `setup.py:5477-5483,5547-5552`: 選択ソースの表示と MTP 子プロセスへの値の引き渡し。
-- `tools/mtp_fetch.py:33-43`: MTP取得側の環境変数読み取り、既定値、ModelScope URL の切り替え。
-- `docs/INSTALL.md:283-291`: ModelScope の明示指定、固定 revision ではないこと、ハッシュ確認についての説明。記載の測定値は同資料にある中国本土の PC・2026-10-05 の条件によるもので、本調査で再測定していません。
+- `terminal/setup.py:169-220` — ソース選択肢、判定方法、キャッシュ。
+- `terminal/setup.py:244-253, 3513-3556` — 対象 URL のマッピング、ModelScope 接続失敗時の fallback。
+- `terminal/setup.py:11315-11321, 1160-1189, 12380-12414` — MTP の取得条件、子プロセスへの値の引き渡し、観測可能な終了経路。
+- `terminal/tools/mtp_fetch.py:43-57, 334-336, 407-476, 515-539` — import 時の選択、ModelScope URL、取得・検証・失敗経路。
+- `engine/metal/setup_mac.py:392-410, 567-584` — Mac セットアップ CLI の上書きと MTP への引き渡し。

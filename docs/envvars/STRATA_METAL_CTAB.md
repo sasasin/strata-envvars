@@ -1,51 +1,44 @@
 # `STRATA_METAL_CTAB`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal backend の MoE expert 行列積カーネルで、IQ 量子化テーブルを threadgroup memory にコピーして読むか、Metal function constant `QUANT_CTAB` を通じて既存の定数配列から読むかを選びます。既定は有効です。対象のテーブル値は同じであり、切り替わるのはテーブルの読み方です。
+Metal backend の routed expert gate/up kernel で、i-quant のグリッドと sign table を threadgroup memory にコピーして参照する代わりに、定数配列から参照する経路を選びます。Metal の decode window と、ロード済み MTP draft layer の gate/up dispatch が対象です。`quant.metal` はこの切替で同じ table 値を使うと説明しています。変わるのは table の読み方で、環境変数による Strata 側の値変換や別の量子化形式への切替ではありません（`engine/metal/src/engine/window.cpp:150-158,1372-1383,2833-2844`; `engine/metal/kernels/quant.metal:104-115,409-435`）。
 
 ## 値と判定
 
-`metal_ctab()` は `std::getenv("STRATA_METAL_CTAB")` の結果を `std::string` にして、文字列全体がちょうど `"0"` か比較します。数値変換、前後空白の除去、先頭文字だけの判定はありません。
+`metal_ctab()` は `std::getenv` の結果を `std::string` にして、文字列全体がちょうど `"0"` かどうかを比較します。未設定または `"0"` 以外なら ON です。空文字も ON になり、数値変換・空白除去・大文字小文字変換・形式検証はありません（`engine/metal/src/engine/window.cpp:152-157`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 有効 |
-| 空文字 | 有効 |
-| `0` | 無効 |
-| `00`、`0 `、`0anything` | 有効 |
-| `1`、`false`、その他の文字列 | 有効 |
+| 条件（build / 経路） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| Metal engine の `moe_gu` dispatch（通常の decode window、および MTP draft layer） | ON | `1`, `true`, `00`, 空文字 | `0` |
+| `moe_gu16` を使う特別な経路 | CTAB 設定は pipeline に渡されず、この変数では切り替わらない | 該当なし | 該当なし |
 
-判定結果は関数内の `static const bool` に保存されます。プロセス内で最初に `metal_ctab()` が呼ばれた時点の値が使われ、その後にプロセス環境を変更しても再評価されません。
-
-根拠: `metal/src/engine/window.cpp:67-73`。
+「無効」は値のパースエラーではなく、`"0"` のときに CTAB 経路を OFF にする意味です。たとえば `0anything`、` 0`、`false` は文字列全体が `"0"` ではないため ON です。`moe_gu16` の条件は、`f16_enc_ && !stream_ && tg_.type == ref::Q2_0 && dq2 && !had_gu(l) && !had_dn(l)` です。この場合は gate/up pipeline の作成に function constant 23 を渡さず、通常の CTAB 分岐に入りません（`engine/metal/src/engine/window.cpp:1353,1372-1383`）。
 
 ## 有効になる条件
 
-- Metal backend の `metal/src/engine/window.cpp` が実行される経路に限られます。CUDA/HIP/CPU backend に対する制御ではありません。
-- MoE の routed expert gate/up と down カーネルで、この関数定数が使われます。通常の `Window::layer()` 経路では `QUANT_CTAB` を gate/up と down の両方へ渡します。単一 token 用の別経路では gate/up に渡しますが、down の dispatch には渡していません。
-- カーネルが IQ2/IQ3 系のテーブルを読むときに差が現れます。`load_tab` はこれらの形式について、有効時には threadgroup テーブルのコピーを省き、無効時には定数配列から threadgroup テーブルへコピーします。ヘルパー関数は有効時に定数配列を、無効時に threadgroup テーブルを参照します。他の量子化形式はこの分岐対象ではありません。
-
-根拠: `metal/src/engine/window.cpp:657-675,842-868,1811-1827`; `metal/kernels/quant.metal:65-76,95-118`; `metal/kernels/moe.metal:206-219,273-284`。
+- `STRATA_GPU_METAL` でビルドされ、Metal engine が含まれている必要があります。CMake は Metal engine のビルドに Apple Metal C++ headers を要求し、Metal backend を定義します（`engine/metal/CMakeLists.txt:82-109,150-177`）。共有 verifier はこの build 条件下で Metal window に処理を渡します（`engine/src/core/verify.cpp:99-107,978-992,3792-3806`）。
+- 実行が Metal window の routed expert gate/up `moe_gu` dispatch に到達する必要があります。通常 decode では各層の routed gate/up dispatch に設定値を適用します（`engine/metal/src/engine/window.cpp:1330-1353,1372-1383`）。
+- MTP draft layer の経路では draft layer がロードされ、その routed gate/up dispatch が実行される場合に適用されます。MTP は独立した draft model / layer の経路です（`engine/metal/src/engine/window.cpp:292-296,2497-2505,2833-2844`）。
+- `moe_gu16` の特殊経路では設定値は使われません（`engine/metal/src/engine/window.cpp:1353,1372-1383`）。また、この変数は prompt 用 kernel library の pipeline 作成箇所には現れず、対象は上記の `window.cpp` の gate/up dispatch です（同ファイル `:1372-1383,2833-2844`; `engine/metal/src/engine/msl_libs.h:25-29,39-42`）。
+- i-quant の grid / sign table を使わない重み形式では、CTAB の lookup 分岐自体に差はありません。対応する i-quant table accessors は `quant.metal` にあります（`engine/metal/kernels/quant.metal:104-115,409-435`）。
 
 ## 実行時の詳細
 
-通常の `Window::layer()` は gate/up カーネルの pipeline 定数に index 23 の bool を設定し、キャッシュキーにも有効時の `#ct` を加えます。down カーネルにも同じ定数オブジェクトとキー接尾辞を渡します。単一 token 用の MoE 経路も gate/up の pipeline に index 23 を設定します。pipeline は `Window::P()` の `pcache_` にキー単位で保存されます。
+値は `metal_ctab()` 内の関数ローカル `static const bool` 初期化子で初回に読み取られ、その後プロセス内で cache されます。環境を実行中に変更しても反映されません。通常 decode の gate/up pipeline は function constant 23 と `#ct` を含む pipeline key を使い、MTP draft layer も同じ function constant と key suffix を設定します。ストリーミング中の通常 decode は、追加の function constant 20 と `#arena` を同時に設定します（`engine/metal/src/engine/window.cpp:152-157,1378-1383,2833-2840`）。
 
-Metal shader 側では `QUANT_CTAB` が定数として定義されます。有効なら IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S の `load_tab` specialization がテーブルコピーを行わず、参照関数が Metal 側の定数テーブルを読みます。無効ならテーブルを threadgroup にコピーしてから参照します。カーネル呼び出し側には `threadgroup_barrier` が明示的に残っているため、環境変数が有効な場合に barrier 自体も必ず消える、とはコードから言えません。
+`quant.metal` では CTAB ON の場合、i-quant grid と IQ2_XS sign table を constant arrays から読み、threadgroup table のロードを省略します。OFF の場合は threadgroup table をロードする処理が使われます。カーネルコメントは両経路が同じ値を使い、CTAB 経路は threadgroup 開始時の table load と barrier wait を省くとしています（`engine/metal/kernels/quant.metal:104-115,409-435`）。Strata 側には、この変数専用の CLI 引数、別環境変数による上書き、警告や失敗時 fallback は見当たりません。
 
-`window.cpp:66` のコメントは M5 Max で 3–7% 高速だったと記していますが、測定条件や手順を示す資料は今回確認した `docs/DETAILS.md` には見つかりませんでした。この値は実装コメントの記載として扱い、一般的な性能向上の保証とはしません。
+## ログと測定値
 
-根拠: `metal/src/engine/window.cpp:148-155,842-868,1811-1827`; `metal/kernels/quant.metal:65-76,95-118`; `metal/kernels/moe.metal:206-219,246-284`。
+この変数の判定や有効化を表示するログはありません。`window.cpp` のコメントには「M5 Max で 3-7% faster」とありますが、該当コメントにモデル、量子化、測定区間、試行回数などの条件は記されていません。そのため、これはソースコメントに記載された範囲の主張であり、他機種・モデル・実行経路に一般化できる測定値ではありません（`engine/metal/src/engine/window.cpp:150-151`）。
 
 ## 根拠
 
-- 環境変数の読み取りと既定値: `metal/src/engine/window.cpp:65-73`
-- 通常の decode window での pipeline 設定: `metal/src/engine/window.cpp:842-868`
-- 単一 token 経路での pipeline 設定: `metal/src/engine/window.cpp:1811-1827`
-- function constant と IQ テーブル参照: `metal/kernels/quant.metal:65-76`
-- IQ2/IQ3 テーブルの threadgroup コピー: `metal/kernels/quant.metal:95-118`
-- MoE gate/up と down の table load: `metal/kernels/moe.metal:206-219,273-284`
-- Metal backend の compile definition: `metal/CMakeLists.txt:60`
+- 環境変数の読み取りと値判定: `engine/metal/src/engine/window.cpp:150-158`
+- 通常 decode の routed gate/up pipeline: `engine/metal/src/engine/window.cpp:1330-1353,1372-1383`
+- MTP draft layer の routed gate/up pipeline: `engine/metal/src/engine/window.cpp:2497-2505,2800-2844`
+- Metal function constant と i-quant table access: `engine/metal/kernels/quant.metal:100-115,409-435`
+- Metal backend / engine の build 条件: `engine/metal/CMakeLists.txt:82-109,150-177`; Metal window への verifier handoff: `engine/src/core/verify.cpp:99-107,978-992,3792-3806`

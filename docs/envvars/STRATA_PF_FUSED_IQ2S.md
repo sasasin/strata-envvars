@@ -1,58 +1,48 @@
 # `STRATA_PF_FUSED_IQ2S`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP の gfx12 (RDNA4) で、native IQ prompt fused kernel の対象に IQ2_S と IQ4_XS の gate/up 層を含める既定値を切り替えます。CUDA の native fused kernel 選択にも同じ既定判定が使われ、Linux の SM 12.0・80 SM 以上で IQ2_S / IQ4_XS gate/up を既定対象にする判定に関与します。`STRATA_PF_FUSED=0` は全 fused prompt kernel を無効にし、`STRATA_PF_FUSED` を明示的に `1` にすると、この変数による既定対象の絞り込みを迂回して、対応する native 形式を opt-in できます。
+Linux の HIP gfx12 で既定有効になっている、ネイティブ fused prompt kernel の IQ3_S pack 内 IQ2_S / IQ4_XS gate/up 層を既定経路から外すスイッチです。値が `0` で始まると既定の fused 経路を拒否し、それ以外の値で既定経路を有効にします。これは IQ2_S / IQ4_XS を個別に opt-in する変数ではありません。判定は `gfx12_iq2s_default()` と `native_supported()` にあります（`engine/src/prefill/moe_fused_iq.cu:3389-3398,3562-3587`）。
 
-対象は prompt の MoE expert 計算です。対応層では GGUF block を読む Strata の native int8 kernel が MMQ 経路に代わって選ばれます。decode の設定ではありません。実装は `src/prefill/moe_fused_iq.cu`、呼び出し側の layer 選択は `src/prefill/prefill.cpp` にあります。
+fused 経路が選ばれると、Strata の HIP `native_w11_kernel` が gate/up と down を計算します（`engine/src/prefill/moe_fused_iq.cu:3810-3827,3845-3849`）。prompt の MMQ に必要な tile がない層で `native_supported()` が偽なら、呼び出し側は fused 層を選ばず、FP16 経路へ fallback します（`engine/src/prefill/prefill.cpp:2062-2071`）。ソースコメントは fused と MMQ で出力が同一バイト列ではないと記しています（`engine/src/prefill/moe_fused_iq.cu:3562-3567`）。
 
 ## 値と判定
 
-数値 parse や文字列全体の比較はせず、環境文字列の先頭文字が `'0'` かだけを見ます。空文字は設定済みでも先頭文字が `\0` のため、このスイッチでは OFF になりません。
+値は `std::getenv` で取得し、文字列全体の parse ではなく先頭文字だけを `\0`（文字 `'0'`）と比較します。大文字小文字、空白、数値としての妥当性は検査しません。空文字はポインターが非 null でも先頭文字が `'0'` ではないため、この変数単独の判定では既定を止めません（`engine/src/prefill/moe_fused_iq.cu:3389-3397`）。
 
-| `STRATA_PF_FUSED_IQ2S` | `gfx12_iq2s_default()` の判定 |
-|---|---|
-| 未設定 | Linux では ON、Windows では OFF |
-| 空文字 | Linux では ON、Windows では OFF |
-| 先頭が `0`（例 `0`, `0abc`） | OFF |
-| その他（例 `1`, `true`, `false`, `2`, ` 0`） | Linux では ON、Windows では OFF |
+| 条件 | 未設定 | 変数の値 | 判定 |
+|---|---|---|---|
+| HIP、Linux、gfx12、`STRATA_PF_FUSED` が未設定または空 | 既定 ON | `0`, `0anything`, `00` など | 先頭が `0` なら既定を OFF |
+| 同上 | 既定 ON | 空文字、`1`, `true`, `false`, `anything`, ` 0` など | 先頭が `0` でなければ既定 ON |
+| HIP、Windows gfx12 | 既定 OFF | どの値でも | この変数だけでは ON にならない。明示的な `STRATA_PF_FUSED=1` が fused 経路を opt-in する |
+| CUDA | この変数による既定変更なし | どの値でも | 現行の `native_supported()` は CUDA の既定判定で先に return するか、明示 opt-in 経路に進むため、この個別判定に到達しない |
 
-この判定は `STRATA_PF_FUSED` も読み、そちらが先頭 `0` のときも OFF にします。`STRATA_PF_FUSED` の明示値は native kernel の選択時にも優先されます。
-
-| `STRATA_PF_FUSED` | `STRATA_PF_FUSED_IQ2S` の役割 |
-|---|---|
-| 未設定または空文字 | gfx12 の既定判定に適用。`STRATA_PF_FUSED_IQ2S=0` で IQ2_S / IQ4_XS の既定経路を止められる |
-| 先頭が `0` | 全 native fused 経路が無効。対象変数を有効にしても使われない |
-| 先頭が `1` | 明示 opt-in 経路。対象変数による既定形式の絞り込みを通らず、他の条件を満たす対応形式で使える |
-| その他の非空値 | `native_supported()` では無効扱い（先頭が `1` でないため）。対象変数は既定判定に適用されるが、全体 fused は有効にならない |
-
-`STRATA_PF_FUSED` の判定は未設定または空文字を同じ既定状態として扱います。非空なら先頭文字 `1` だけが明示 opt-in、それ以外は無効です。`STRATA_PF_FUSED_IQ2S` 自体は先頭 `0` 以外の文字を有効側として扱います（大文字小文字・空白・後続文字は検査しません）。根拠: `src/prefill/moe_fused_iq.cu:1977-1985,1988-2003`。
+`STRATA_PF_FUSED` は別途 `native_supported()` で読み取られます。未設定または空文字なら既定判定に進みます。先頭が `1` でない非空値は fused native kernels を全体的に止め、先頭が `1` の値は明示 opt-in となります（`engine/src/prefill/moe_fused_iq.cu:3425-3432`）。明示 opt-in の `STRATA_PF_FUSED=1` では IQ2S 個別判定を通らないため、`STRATA_PF_FUSED_IQ2S=0` でもその opt-in は取り消されません。これは `native_supported()` の分岐順に基づく実装上の挙動です（同 `:3517-3533,3562-3587`）。
 
 ## 有効になる条件
 
-既定経路（`STRATA_PF_FUSED` 未設定または空文字）では、次の条件が必要です。
-
-- `kGfx12PromptDefaultsOn` が true であること。実装では Linux が true、Windows が false です。
-- 対象層の gate/up 形式が IQ2_S または IQ4_XS であること。このスイッチは IQ2_XXS / IQ2_XS を追加しません。
-- device が native kernel 対応であり、down 形式も `d_covered_on()` が認めること。IQ2_S / IQ4_XS は `gu_covered()` に含まれますが、down 側の形式判定も別に行います。
-- 複数 GPU の peer portable 経路、hadamard-folded 層、stream-all 以外の小さい chunk など、呼び出し側が native fused 経路を選ばない条件に当たらないこと。
-
-`STRATA_PF_FUSED=1` の明示 opt-in はこの変数による Linux 既定 gate を迂回しますが、device / 形式対応条件は残ります。CUDA では既定経路の形式判定後、SM 12.0・80 SM 以上などの device 条件も必要です。HIP では `d.w12` が gfx12 を表し、明示 opt-in の場合も `requested() || d.w12` の判定に進みます。`STRATA_PF_FUSED_NATIVE=0` は native packs の経路を別途無効にします。小さいカード用の `pf_fused_override()` が 0 の場合も `native_supported()` は false です。根拠: `include/strata/core/gfx12_platform_defaults.hpp:10-16`, `src/prefill/moe_fused_iq.cu:1873-1890,1988-2032`, `include/strata/prefill/moe_fused.hpp:36-45`, `src/prefill/prefill.cpp:4535-4541`。
+- 既定動作を変えるのは HIP build の gfx12 device です。Linux では `kGfx12PromptDefaultsOn` が true、Windows では false です（`engine/src/prefill/moe_fused_iq.cu:3389-3397`; `engine/include/strata/core/gfx12_platform_defaults.hpp:10-16`）。
+- `STRATA_PF_FUSED` が未設定または空であるときに、この変数の `0` 先頭判定が使われます。`STRATA_PF_FUSED=0` は先に native fused 経路を無効にします。`STRATA_PF_FUSED=1` は opt-in となり、この変数の判定を飛ばします（`engine/src/prefill/moe_fused_iq.cu:3425-3432,3562-3587`）。
+- モデル層の gate/up type が IQ2_S または IQ4_XS であり、現在の device で native kernels と down type が対応している必要があります。通常の gfx12 対象 down type は Q2_0 / IQ4_NL です。gfx12 の Q8_0 down は別の `STRATA_PF_FUSED_Q8D=1` を含む対応条件を満たす必要があります（同 `:3562-3581`; `engine/src/prefill/moe_fused_iq.cu:3206-3216`）。
+- `STRATA_PF_FUSED_NATIVE=0` または process 内の `pf_fused_override()==0` でも `native_supported()` は false になります（同 `:3416-3432`）。この変数には CLI 引数を直接読む処理はありません。
+- CUDA ではこの個別スイッチの判定に到達しません。CUDA は unset/empty のとき CUDA 専用の `fused_tile::default_takes_env` を評価して return し、明示 opt-in の場合も後段の `env < 0` 条件を通らないためです（同 `:3517-3533,3562-3587`）。
 
 ## 実行時の詳細
 
-`gfx12_iq2s_default()` は関数内の `static const bool` を初回呼び出し時に初期化し、`STRATA_PF_FUSED_IQ2S` と `STRATA_PF_FUSED` の値を cache します。したがって、その呼び出し後にプロセス環境を変更してもこの既定判定は再評価されません。`native_supported()` も `STRATA_PF_FUSED` と `STRATA_PF_FUSED_NATIVE` を関数内 static に保存します。
+`gfx12_iq2s_default()` 内の `static const bool on` 初期化で、対象変数と `STRATA_PF_FUSED` を最初にこの関数が呼ばれたとき一度だけ読みます。そのため、初回判定後にプロセス環境を変えても反映されません。親変数 `STRATA_PF_FUSED` 自体も `native_supported()` 内の `static const int env_set` で初回に cache されます（`engine/src/prefill/moe_fused_iq.cu:3389-3397,3425-3428`）。
 
-`native_supported()` が true でも、prefill の layer loop は `stream_all`、peer 不使用、native expert layout、folded gate/up と down がないことを確認してから `fused_nat` を選びます。選択されると activation を int8 化し、native experts kernel を起動します。選ばれない対応層は MMQ または FP16 経路に残ります。fused 経路を使った場合、stderr に一度 `strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)` が出ます。このログ文字列は IQ2S 専用スイッチ名を表示しません。対象変数だけを理由にした警告やエラー出力はありません。根拠: `src/prefill/moe_fused_iq.cu:1977-1985,1988-2032`, `src/prefill/prefill.cpp:4535-4584`。
+この関数は prompt prefill の layer ごとの native fused 対応判定から呼ばれます。設定により IQ2_S / IQ4_XS 層が fused 対応と判定されない場合、MMQ がその層に使えなければ呼び出し側は FP16 GEMM fallback を選択します（`engine/src/prefill/prefill.cpp:2062-2071`）。サーバーモード専用の読み取りや子プロセスへの転送はありません。
 
-HIP gfx12 では同じ判定値が既定 CPU prefill share の chunk 上限にも使われます。`gfx12_iq2s_default()` が true なら share limit は 1,536 token、false なら一般の新上限（`kShareLimitNew`、3,072）です。CPU share の起動条件を満たすと stderr に `prefill: the CPU share is ON by default ...` が出ます。これは fused kernel の実行を保証するものではなく、CPU share の既定上限選択です。根拠: `include/strata/prefill/share_rules.hpp:24-29`, `src/prefill/prefill.cpp:2845-2867`。
+## ログと測定値
 
-`STRATA_PF_FUSED=1` があると native kernel 選択は IQ2S 変数の既定 gate を迂回しますが、CPU share limit の計算は `gfx12_iq2s_default()` の値を使い続けます。そのため、たとえば `STRATA_PF_FUSED=1 STRATA_PF_FUSED_IQ2S=0` では対象 fused kernel が選択可能でも、CPU share の既定上限は fused IQ2S 用の 1,536 ではなく 3,072 になります。
+この変数の値を表示する専用ログや警告はありません。ソースコメントには R9700、IQ3_S pack、`serve`、3 interleaved pairs での prompt 2K / 8K / 32K がそれぞれ +9.7% / +12.2% / +8.8%、MMQ を基準とした first-token KL が 1,025 token の 29 prompts で 0.017（top-1 は 29 中 28）と記録されています。これは実装コメントの記載値であり、この調査で再測定した値ではありません（`engine/src/prefill/moe_fused_iq.cu:3562-3565`）。
 
 ## 根拠
 
-- 候補名の実コード読み取りは `src/prefill/moe_fused_iq.cu:1977-1985` のみ。`include/strata/prefill/moe_fused_iq.hpp:32-34` は説明コメントと宣言で、追加の読み取り箇所ではありません。
-- CUDA/HIP の fused IQ 実装を build source に含む箇所: `CMakeLists.txt:2298-2302,2542-2567`。
-- 関連資料 `docs/DETAILS.md:1052` は fused prompt experts の全体既定を説明しています。個別の IQ2_S / IQ4_XS 追加条件と優先関係は、上記ソース実装を根拠にしています。
+- `engine/src/prefill/moe_fused_iq.cu:3389-3398` — 変数の読み取り、先頭文字判定、既定値、static cache。
+- `engine/include/strata/core/gfx12_platform_defaults.hpp:10-16` — Linux / Windows の gfx12 prompt default。
+- `engine/src/prefill/moe_fused_iq.cu:3415-3432,3517-3533,3562-3587` — 親変数との優先関係、CUDA/HIP 分岐、device / layer 判定。
+- `engine/src/prefill/moe_fused_iq.cu:3810-3827,3845-3849` — native gate/up・down kernel dispatch。
+- `engine/src/prefill/prefill.cpp:2062-2071` — 非対応層の fallback 選択。

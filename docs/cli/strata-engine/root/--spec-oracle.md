@@ -1,57 +1,54 @@
-# `--spec-oracle`
+# `strata --spec-oracle`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの root。内部の生成処理名は `generate`） |
+| コマンド | `strata`（エンジン引数） |
 | オプション | `--spec-oracle` |
 | 別名 | なし |
-| 値 | token ID 列を記録したテキストファイルのパス |
+| 値 | 続く引数にトークン ID リストを含むテキストファイルのパス |
 
 ## 役割
 
-speculative decoding の verify window で、通常の draft 供給元の代わりにファイル内の token ID を使います。ソースコメントは「期待 continuation を使う exactness test」と説明しており、通常利用向けの生成設定ではなく、推測デコードの検証・比較用の入力です（`src/program/generate.cpp:650-652`）。
+投機的デコード時に、モデルのドラフトの代わりとして、ファイルに記録した期待継続トークンを検証ウィンドウへ入れる診断用オプションです。期待列に一致する継続では各行の受理を確認でき、`--spec` のウィンドウ幅を変えた比較などに使えます。単独では投機的デコードを有効にしません。
 
 ## 使い方
 
 ```sh
-strata --model model.gguf --tokens 1,2,3 --max-new 32 --spec 4 --spec-oracle expected-ids.txt
+strata --model MODEL.gguf --tokens 1,2,3 --max-new 16 --spec 4 --spec-oracle expected.ids
 ```
 
-`--spec` が正の値で speculative loop が動く実行経路で指定します。実際に使うにはモデルと prompt token IDs など、エンジンが要求する他の入力も必要です。
+`expected.ids` は現在の作業ディレクトリから読めるファイルの例です。ファイルに生成継続のトークン ID をカンマまたは空白区切りで記録します。
 
 ## 値と既定値
 
-- 値はファイルパスです。相対パスはプロセスの作業ディレクトリを基準に解決されます（`std::ifstream` にそのまま渡します。`src/program/generate.cpp:16103-16107`）。
-- ファイル内容はカンマまたは空白で区切った整数 token ID の列です。各値は `0` 以上 `2147483647` 以下でなければならず、空の列は拒否されます（`src/program/generate.cpp:1097-1114`）。
-- この読み取り処理では token ID の上限を整数型の範囲まで確認しますが、モデルの語彙数との照合はしていません（`src/program/generate.cpp:1097-1114`）。
-- 省略時は空文字列で、oracle ファイルを読みません（`src/program/generate.cpp:671`）。同じオプションを複数回指定すると parser の代入により最後のパスが残ります（`src/program/generate.cpp:2619`）。
-- `--spec` の既定値は Metal build で `2`、それ以外で `0` です。`--spec` が `0` 以下なら speculative loop に入らず、このオプションのファイルも読みません（`src/program/generate.cpp:653-657,16091-16092`）。
+- パス値は次の引数から受け取り、オプション自体の既定値は空（指定なし）です。オプションを複数回指定した場合は、parser が同じ文字列フィールドへ順に代入するため最後の値が残ります（`engine/src/program/generate.cpp:4051`、`engine/sycl/src/program/generate.cpp:2045`）。
+- ファイル全体を読み、トークン ID の区切りとしてカンマ、空白、タブ、改行などを受理します。各 ID は `[0, 2147483647]` の整数で、リストは空にできません（`engine/src/program/generate.cpp:1554-1580`）。
+- `--spec` の既定値は通常 0（無効）で、Metal ビルドでは 2 です（`engine/src/program/generate.cpp:1010-1017`）。`--spec-oracle` のファイル読み込みは投機的ループに入った場合に行われるため、通常ビルドで `--spec` を有効にしない場合、このファイルは消費されません（`engine/src/program/generate.cpp:24464-24475`、`engine/sycl/src/program/generate.cpp:13709-13728`）。
 
 ## 実行時の動作
 
-speculative loop に入るとファイル全体を読み込み、読み取りまたは整数列の解析に失敗した場合は `strata generate: cannot read --spec-oracle <path>` を stderr に出して終了コード `2` で戻ります（`src/program/generate.cpp:16102-16112`）。ファイルは読み取り専用で開かれます。
+CUDA/HIP 系の `engine/src/program/generate.cpp` と SYCL 系の `engine/sycl/src/program/generate.cpp` の両 parser がこの値を `spec_oracle` に保存します。投機的ループでは指定パスを開いて全内容を読み、共通の整数リスト parser で解析します。ファイルを開けない場合、読み取りに失敗した場合、内容が空または不正な場合は `strata generate: cannot read --spec-oracle <path>` を stderr に出して終了コード 2 を返します（`engine/src/program/generate.cpp:24467-24476`、`engine/sycl/src/program/generate.cpp:13720-13729`）。
 
-verify window の各 draft 位置では、suffix draft を選んでいれば suffix の値、MTP が有効なら MTP の draft、それ以外では oracle 列の値を使います。oracle 値は生成済み continuation の位置に対応して参照されます。列が必要な位置まで届かない場合は token ID `0` を draft として補います（`src/program/generate.cpp:16591-16598`）。モデルの verify 結果と draft が一致する範囲が受理され、最初に異なる位置で window の出力が決まります（`src/program/generate.cpp:16646-16647,16668-16686`）。したがって、MTP または suffix draft が選ばれる場合、その箇所では oracle が優先されるわけではありません。
+各検証ウィンドウで、接尾辞検索の候補がなく、MTP/DFlash2 などのドラフトも使わない行には、生成済みトークン数に対応する oracle の ID をドラフトとして使います。oracle の要素が尽きた位置には ID 0 を入れます。接尾辞検索候補、ドラフト、後続の lookup-chain 候補がある場合はそれぞれそちらが使われ、`--spec-corrupt` が有効なら oracle 由来の候補も変更され得ます（`engine/src/program/generate.cpp:25087-25094`、`engine/sycl/src/program/generate.cpp:14097-14104`）。したがって、指定ファイルはモデルの最終出力を固定する設定ではなく、検証対象となる候補列を供給します。
 
 ## 適用条件と副作用
 
-- 通常の `src/program/generate.cpp` parser では受理されますが、値の形式検査とファイルアクセスは speculative loop に進んだ場合だけです。`--spec` が無効、生成上限に到達、または loop が開始されない場合、ファイル指定が不正でもこの経路では検査されません（`src/program/generate.cpp:16091-16112`）。
-- Qwen3.6-35B family は model header による切替後、`src/qwen35/q36_engine.cu` の独自 parser に渡ります。同 parser に `--spec-oracle` の処理はなく、通常の生成モードでは未知 option として usage を出して終了コード `2` になります。serve mode では独自 parser が未知の `--` option を警告して読み飛ばす経路があります（`src/program/generate.cpp:2393-2407`、`src/qwen35/q36_engine.cu:3735-3795`）。
-- 読み取った値は token file のみを参照し、Strata がそのファイルを書き換える処理は確認できません。生成出力は通常どおり標準出力に prompt と出力 token ID 列、生成統計を表示します（`src/program/generate.cpp:16867-16875`）。
+- `--spec` が 0 の実行では投機的ループに入らず、指定パスは読み込まれません。投機的デコードには、モデルや実行経路に応じた他の要件もあります。たとえば verifier の初期化に必要なデバイス residency table がない場合は `--spec needs the device residency table ...` と stderr に出して終了コード 2 になります（`engine/src/program/generate.cpp:24480-24486`）。
+- 指定ファイルを読み取りますが、このオプションによる書き込みは確認できません。oracle の ID がモデルの語彙範囲内かどうかを事前検証する処理は、確認した parser と読み込み箇所にはありません。
+- 同じ parser で `--spec-oracle` と `--spec-follow` の両方を指定しても、後者の継続列は出力継続の制御に使われます。oracle はドラフト候補列として別に読み込まれます（`engine/src/program/generate.cpp:24473-24480`）。
 
 ## 出力とエラー
 
-- 値の欠落は parser の `next()` が `<option> needs a value` を stderr に出し、終了コード `2` で終了します（`src/program/generate.cpp:2416-2421`）。
-- ファイルを開けない場合、または内容が空・整数列として不正の場合は、`cannot read --spec-oracle <path>` を stderr に出して終了コード `2` です。解析関数が返す詳細理由（不正な token ID／空列）はこの option のエラー表示には含まれません（`src/program/generate.cpp:1097-1114,16103-16112`）。
-- speculative verify や commit 自体の失敗は別の実行エラー経路で stderr に出力され、終了コード `1` で戻ります（`src/program/generate.cpp:16609-16620,16668-16673`）。
+- 値を省略すると共通の引数取得処理が `<option> needs a value` を stderr に出し、終了コード 2 で終了します（`engine/src/program/generate.cpp:3844-3846`）。
+- ファイル読み込み・内容解析に失敗すると前述の `cannot read --spec-oracle` を stderr に出して終了コード 2 です。エラーメッセージではファイルを開けない場合と ID リスト不正を区別しません（`engine/src/program/generate.cpp:24467-24476`）。
 
 ## 根拠
 
-- parser と option state: `src/program/generate.cpp:650-657,671,2619`。
-- token 列の形式検査: `src/program/generate.cpp:1097-1114`。
-- ファイル読み込みと失敗処理: `src/program/generate.cpp:16102-16112`。
-- draft 値の選択、verify、受理・出力: `src/program/generate.cpp:16591-16598,16609-16620,16646-16647,16668-16686`。
-- Qwen3.6 family への切替と別 parser: `src/program/generate.cpp:2393-2407`、`src/qwen35/q36_engine.cu:3735-3795`。
+- `engine/src/program/generate.cpp:1010-1028` — 値の保存先、spec の既定値、コメントにある oracle の用途。
+- `engine/src/program/generate.cpp:1554-1580` — ID リストの区切り、整数範囲、空リスト拒否。
+- `engine/src/program/generate.cpp:4050-4053`、`engine/sycl/src/program/generate.cpp:2044-2047` — CUDA/HIP 系と SYCL 系の parser 登録。
+- `engine/src/program/generate.cpp:24467-24476`、`engine/sycl/src/program/generate.cpp:13720-13729` — ファイル読み込み、解析失敗時の出力と終了経路。
+- `engine/src/program/generate.cpp:25087-25094`、`engine/sycl/src/program/generate.cpp:14097-14104` — oracle ID の検証ウィンドウへの代入と候補の優先関係。

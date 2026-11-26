@@ -1,49 +1,50 @@
 # `STRATA_GR_DOWN_TG`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-CUDA の fused hyper-connection read にある staged down kernel で、1ブロック行が処理する token 数（`tg`）を指定します。通常の staged kernel を置き換える設定ではなく、値が許可され、token 数を割り切り、該当する staged 経路が選ばれたときだけ、token 群を `tg` ごとのブロック行に分ける特別な launch を使います。HIP ビルドではこの環境変数を読みません。
+CUDA の fused hyper-connection read が staged down projection を使うとき、1 block row が処理する token 数 `tg` を指定する。`tg` を `ct`（その down launch の token 数）の約数にすると、down kernel の grid y は `ct / tg`、dynamic shared memory は `tg` token 分となる。これは同じ down projection を処理する kernel の分割方法を変える設定で、norm や up projection の選択を直接変えるものではない（`engine/src/kernels/cuda/fused_gr.cu:1580-1607,1836-1845`）。
 
 ## 値と判定
 
-値は `std::atoi` で変換されます。空白や数値の後続文字を含む文字列も `atoi` の変換規則で扱われ、文字列全体の妥当性は検査されません。変換結果に対する動作は次の通りです。
+CUDA build では `down_tg()` の最初の呼出し時に `std::getenv` で読み、`std::atoi` で整数化した結果を関数内 `static const int` に保存する。`atoi` は数値の先頭部分を読むため、空文字や数値で始まらない文字列は `0`、`"2tail"` は `2` になる。真偽文字列としては解釈しない。数値変換で表現できない範囲の入力はここでは規定しない（`engine/src/kernels/cuda/fused_gr.cu:1582-1589`）。
 
-| 状態・変換値 | `down_tg(ct)` の結果 |
-|---|---|
-| unset（内部値 `-1`） | 自動選択へ進む。対応する Turing GPU では `ct` が4または6のとき `2`、それ以外は `0`。 |
-| 0（空文字、非数値文字列を含む） | `0`。環境変数による分割 launch を使わない。 |
-| 1、2、3 | `ct >= 2` かつ `ct % 値 == 0` の場合にその値を返す。それ以外は `0`。 |
-| 4以上 | `0`。許可範囲外。 |
-| 負数 | 自動選択へ進む（unset と同じ分岐）。 |
+| 条件 | unset | 有効になる値（例） | 無効・特別扱いの値（例） |
+|---|---|---|---|
+| CUDA、staged down read、`ct >= 2` | GPU に応じた既定値 | `1`、`2`、`3` のうち `ct` を割り切る値。さらに `tg < ct` のとき専用分割 launch を使う | `0` は分割なし。正の値 `1..3` でも `ct` を割り切らない、または `tg == ct` なら専用分割 launch なし。`4` など範囲外の非負値も分割なし。負値は自動既定値へ |
+| CUDA、`ct < 2` | `0` | なし | `ct` を見て直ちに `0` を返す |
+| HIP build | `0` | なし | この関数は引数を使わず `0` を返し、環境変数を読み取らない |
 
-`ct < 2` は環境変数の値にかかわらず `0` です。したがって `STRATA_GR_DOWN_TG=0` は「staged down kernel を無効化」する指定ではなく、特別な `tg` 分割だけを無効にします。`atoi` のため、例えば `2junk` は2、`junk` は0、`-2` は自動選択扱いです。
+具体例では、空文字、`0`、`0anything`、`true` は `atoi` の結果が `0` なので分割を無効化する。`1` は `ct` が 2 以上で割り切れ、`tg < ct` の場合に使われる。`3` は `ct=6` なら使われるが、`ct=3` では `tg == ct` のため専用分割にはならない。`-1` や `-2` は負値なので unset と同様に自動既定値へ進む（`engine/src/kernels/cuda/fused_gr.cu:1587-1607,1839-1845`）。
+
+unset 時の CUDA 既定値は device ごとに初回判定時に保存される。Turing（compute capability 7.5）は `STRATA_SM75_PERF` が有効な場合に `ct=4` または `6` で `2`。compute capability 12.0 は `STRATA_SM120_PERF` が有効なら 80 SM 以上で `ct>=2` に `1`、80 SM 未満では偶数 `ct` に `2`。GB10（12.1）は `kGb10GrDownTg=true` の対象で、`STRATA_SM121_PERF` が有効かつ `STRATA_DEFAULTS=026` 相当の既定無効化がない場合に同じ 12.0 系判定を適用する。その他の device や条件では `0`（分割なし）。世代別 helper は各系列の環境変数を `atoi(...) != 0` で判定する（`engine/src/kernels/cuda/fused_gr.cu:1592-1607`; `engine/include/strata/core/sm75_series.hpp:24-37`; `engine/include/strata/core/sm120_series.hpp:32-38,66-81,93-97`）。
 
 ## 有効になる条件
 
-- CUDA の `fused_gr.cu` でのみ環境値を読みます。HIP コンパイル時の `down_tg()` は常に0を返します。
-- `fused_gr_read_multi()` の標準経路を通る必要があります。Q8 down/up 重みの経路と、利用可能な場合の `STRATA_GR_V3` 経路は `launch_multi()` より前に分岐するため、この設定はその経路には適用されません。
-- `launch_multi()` で staged variant が選ばれ、かつ `s_down == nullptr` である必要があります。staged variant は `STRATA_HC_SPLIT` と per-device の fused GR 検査により決まり、対応 variant が検査で通らなければ plain または split へ fallback します。
-- `STRATA_NO_MULTI_GR` が空でなく、先頭文字が `0` でない場合、`exact_t` が false になり、この特殊分割と token 数別の staged kernel 選択は使われません。
-- 自動選択は `sm75_default()` を満たすデバイスでのみ行います。これは compute capability 7.5（または `STRATA_EMULATE_CC=75` による同等判定）かつ `STRATA_SM75_PERF` が `atoi` で非0の場合です。環境変数を明示した正の値1〜3による指定には、この自動選択の Turing 条件は掛かりませんが、上記の CUDA/staged 経路条件は残ります。
-
-実行ファイルで fused GR が設定されるのは native MMVF が有効で、`--no-fused-gr`、GPU stages、layer/half dump、stage timing によって無効化されない場合です。
+- この読み取りと分割 launch は CUDA build に限られる。HIP build では `down_tg()` が常に `0` を返す（`engine/src/kernels/cuda/fused_gr.cu:1582-1587`）。
+- fused multi-token hyper-connection read が `launch_multi()` に到達する必要がある。Q8 weight の早期経路と RDNA 専用経路は `launch_multi()` より前に戻り、`STRATA_GR_V3` が選ぶ v3 経路も対象外（`engine/src/kernels/cuda/fused_gr.cu:4286-4303,4304-4310,4424-4429`）。
+- `launch_multi()` 内で `variant >= kHcStaged` かつ `s_down == nullptr` の staged down read が必要。Q8 weight は staged を使わない（`engine/src/kernels/cuda/fused_gr.cu:1173-1174,1808-1815`）。`STRATA_HC_SPLIT=0` で plain read が選ばれる場合も staged ではない。read variant の選択は `STRATA_HC_SPLIT` と fused read check による（`engine/src/kernels/cuda/fused_gr.cu:1933-1943,4732-4740,4756-4803`）。
+- `STRATA_NO_MULTI_GR` が空でなく、先頭文字が `0` でもない場合は `exact_t=false` になり、`down_tg()` の結果を使う専用 launch 条件を満たさない。その場合は generic staged kernel 側へ進む（`engine/src/kernels/cuda/fused_gr.cu:1816-1820,1836-1854`）。
+- launch 時点の `ct` は `down_chunk()` が決める staged chunk 上限で分割された token 数。環境値はこの実際の `ct` を割り切る必要がある（`engine/src/kernels/cuda/fused_gr.cu:1490-1507,1821-1845`）。
+- 明示的な非負値は GPU 世代別既定値より優先する。`0` や範囲外値も「自動判定へ戻す」のではなく分割なしを選ぶ。CLI 引数による上書きは確認できず、コード上の判定は環境値・device default・launch 条件で決まる。
 
 ## 実行時の詳細
 
-CUDA の `down_tg()` 内で環境値を関数ローカル `static const int` にキャッシュします。したがって最初の評価後にプロセス環境を書き換えても、この設定値は再読込されません。デバイス別の自動選択可否も `per_dev[64]` にキャッシュされます。
+`fused_gr_read_multi()` は Q8 / RDNA / v3 の早期経路に該当しなければ `launch_multi()` を呼ぶ。そこで staged read の各 chunk について `down_tg(ct)` を評価し、`exact_t && 0 < tg < ct` の場合に grid y=`ct/tg`、shared memory=`tg * per_tok` の `gr_down_staged_kernel<tg, true>` を起動する。`tg` は範囲検査後 1、2、3 のみなので、それぞれ対応する template specialization に進む。条件を満たさない場合は token 数に応じた通常の staged kernel、または `STRATA_NO_MULTI_GR` 下の generic kernel を使う（`engine/src/kernels/cuda/fused_gr.cu:1815-1854,4424-4429`）。
 
-`tg` が1〜3で `tg < ct` の場合、launch grid のY次元を `ct / tg` とし、各ブロック行が `tg` token を処理する staged kernel を選びます（`tg` 1、2、3の明示的な template instantiation）。返り値が0、または `tg >= ct` の場合は通常の staged kernel dispatch に進みます。そこで `exact_t` が有効なら `ct` 1〜6の専用 instantiation、それ以外は一般 kernel を使います。
+環境値はプロセス内で初めて `down_tg()` が呼ばれた時の値に固定され、起動後に環境を変更しても再読込されない。unset の場合の GPU 判定も 64 device 分の static 配列に保存される（`engine/src/kernels/cuda/fused_gr.cu:1587,1592-1607`）。
 
-ソースコメントには、RTX 2080 Ti の cold `fused_gr_bench` で down と stamp を含む時間が token 4で29.1→27.3 µs、token 6で38.5→32.2 µs（pairs）と記載されています。これはソースコメントに記されたベンチ結果であり、通常の decode 性能を保証する測定ではありません。`docs/DETAILS.md` はこの変数を Turing kernel series の個別スイッチとして列挙しています。
+## ログと測定値
+
+この変数の値を表示する専用ログや、無効値に対する警告・終了処理はない。分割 launch の CUDA エラーは後続の `cudaGetLastError()` により `fused_gr_read_multi: <CUDA error string>` として stderr に出力され、`exit(1)` する経路がある（`engine/src/kernels/cuda/fused_gr.cu:4424-4429`）。
+
+ソースコメントには、RTX 2080 Ti の cold `fused_gr_bench` で down（stamp 含む）が T=4 で 29.1→27.3 µs、T=6 で 38.5→32.2 µs（pairs）と記録される。RTX PRO 5000（80+ SM）のコメントには、`tg=1` で token 数 2/3/4/5 がそれぞれ -2.1/-2.3/-0.2/-2.5%、4 token で pairs を使わない場合との比較が -2.4% とある。GB10（48 SM）については、IQ3_S と DFlash2 drafter を使った rented Spark での 3 paired rounds の decode 値が chat/code/JSON/agent の順に -0.1/+0.7/+1.1/+0.9% と記録される。これらは資料にある個別の測定値で、別の構成での効果を示すものではない（`engine/src/kernels/cuda/fused_gr.cu:1590-1607`; `engine/include/strata/core/sm120_series.hpp:83-90`; `docs/DGX_SPARK_LINUX.md:119-126`）。
 
 ## 根拠
 
-- `src/kernels/cuda/fused_gr.cu:1208-1230` — 値の読み取り、`atoi`、明示値の範囲・割り切り判定、および Turing 自動選択。
-- `src/kernels/cuda/fused_gr.cu:1252-1259,1271-1294` — staged 条件、`STRATA_NO_MULTI_GR` 条件、特殊 launch と通常 staged dispatch。
-- `src/kernels/cuda/fused_gr.cu:2217-2324` — Q8/V3 分岐と標準 `launch_multi()` 経路。
-- `src/kernels/cuda/fused_gr.cu:1360-1370,2530-2571` — `STRATA_HC_SPLIT` による variant 選択と per-device 検査・fallback。
-- `include/strata/core/sm75_series.hpp:24-43` — `STRATA_SM75_PERF` の読み取りと compute capability 7.5 判定。
-- `src/program/generate.cpp:3670-3679` — generate 実行経路で fused GR を有効にする条件。
-- `docs/DETAILS.md:2244-2257` — Turing kernel series と同変数の位置付け。
+- `engine/src/kernels/cuda/fused_gr.cu:1580-1608` — 値の読み取り、判定、既定値。
+- `engine/src/kernels/cuda/fused_gr.cu:1808-1854` — staged 経路、chunk、分割 launch と `STRATA_NO_MULTI_GR`。
+- `engine/src/kernels/cuda/fused_gr.cu:4286-4431` — Q8 / RDNA / v3 の先行経路、`launch_multi()` 呼出しとエラー経路。
+- `engine/include/strata/core/sm75_series.hpp:24-37`, `engine/include/strata/core/sm120_series.hpp:32-38,66-81,83-100` — Turing / 12.0 / GB10 既定条件。
+- `docs/SETTINGS.md:91` — 一覧には NVIDIA と AMD とあるが、実装は HIP build で環境変数を読まず `0` を返す。実際に本変数の分割 launch を行う根拠は CUDA 側コード。

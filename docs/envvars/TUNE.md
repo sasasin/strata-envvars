@@ -1,48 +1,48 @@
 # `TUNE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリや GPU driver が読む環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-`TUNE` は Strata の Docker image が既定の server 起動を行うとき、起動時にチューナーを実行するか、実行する場合のモードを選ぶための entrypoint 設定です。`docker/entrypoint.sh` が値を読み、`quick` または `thorough` を `strata launch --tune` に渡します。Strata の通常の `strata launch` CLI や engine が `TUNE` を直接読む実装は見つかりません。
-
-Docker Compose の NVIDIA / AMD / Intel 定義は `${TUNE:-skip}` でコンテナへ渡すため、Compose ではホスト側の値が未設定または空なら `skip` になります。Compose を使わず Docker entrypoint を起動した場合も、未設定・空は調整を行わず、CLI の既定値 `skip` と同じ結果になります (`docker/compose/docker-compose.nvidia.yml:22`, `docker/compose/docker-compose.amd.yml:21`, `docker/compose/docker-compose.intel.yml:21`, `strata_cli/launch/settings.py:116`)。
+Docker イメージの通常起動で、`strata launch --no-tui` にチューニングモードを渡す。`quick` または `thorough` は launch 中にモデル用のチューナーを実行し、`skip` は実行しない。Strata CLI 自体に `TUNE` の読み取り箇所はなく、Docker entrypoint を通さず `strata launch` を直接起動した場合、この環境変数は CLI の選択に影響しない。entrypoint は値を CLI 引数 `--tune` へ変換する。`tools/docker/entrypoint.sh:184-185,253-266`、`terminal/strata_cli/launch/cmd.py:121`。
 
 ## 値と判定
 
-entrypoint は `${TUNE:-}` を取り出して ASCII 大文字を小文字へ変換します。空文字は未設定と同じく空として扱い、空または `skip` のときは `--tune` 引数を追加しません。その他の値はそのまま一つの `--tune` 引数として CLI に渡します (`docker/entrypoint.sh:228-239`)。
+entrypoint は `${TUNE:-}` で未設定・空文字を空にし、`tr 'A-Z' 'a-z'` で ASCII の大文字を小文字化する。空か `skip` なら `--tune` を付けない。それ以外の値は `--tune <値>` に渡され、CLI の `_choice` が前後空白を除いて小文字化し、`quick`・`thorough`・`skip` のいずれかと完全一致するか検査する。数値への変換や値域 clamp はない。`tools/docker/entrypoint.sh:254-266`、`terminal/strata_cli/launch/cmd.py:35-43,121`、`terminal/strata_cli/launch/settings.py:29,141`。
 
-| 入力 | entrypoint がすること | 結果 |
-| --- | --- | --- |
-| 未設定 / 空文字 | `--tune` を追加しない | CLI の既定 `skip`。調整を実行しない |
-| `skip`（大文字小文字は不問） | `--tune` を追加しない | 調整を実行しない |
-| `quick` / `thorough`（大文字小文字は不問） | 小文字化して `--tune <値>` を追加 | CLI が受け付ける調整モード |
-| その他の非空文字列 | 小文字化して `--tune <値>` を追加 | CLI の選択肢検査で拒否 |
+| 起動経路・条件 | unset / 空文字 | 有効になる値（例） | 無効・または実質無効な値（例） |
+|---|---|---|---|
+| Docker Compose の NVIDIA / AMD / Intel 定義 | `${TUNE:-skip}` により `skip` をコンテナへ設定 | `quick`, `thorough`。大文字小文字は entrypoint で小文字化 | `skip` はチューニングしない。Compose 補間で空値も既定値 `skip` になる |
+| entrypoint を使う Docker 起動（Compose 以外） | `--tune` を渡さず、CLI の既定 `skip` | `quick`, `thorough`。例: `QUICK` も `quick` として渡る | `skip` は引数なしと同じ。その他は CLI の選択肢検査で拒否 |
+| 既に調整済み preset があり、`RETUNE` が `1` でない | ― | 値が `quick` / `thorough` でも再測定せず既存設定を保持 | この経路では値を `--tune` に渡さないため、不正な非空値も検査されず無視される |
 
-CLI の `--tune` は `quick`, `thorough`, `skip` のいずれかに限られ、選択肢 helper は前後空白を除いて小文字化します。したがって `TUNE=" QUICK "` は `quick` として受け付けられますが、entrypoint 自体は空白を除去しません。無効値は CLI の argparse エラーになり、entrypoint は終了コードを `strata launch stopped with code ...` として stderr に出して終了します。CLI のエラーには `argument --tune:` に続いて `'<値>' is not a tuning mode. Choose one of: quick, thorough, skip.`（近い選択肢があれば候補の案内を追加）が含まれます (`strata_cli/launch/cmd.py:37-45,115`; `docker/entrypoint.sh:228-239,285-290`)。
-
-`RETUNE` は別の環境変数です。entrypoint は `RETUNE` が文字列 `1` のときだけ、自身の「preset は既に調整済み」という早期スキップを通過させます。`TUNE=skip` または空ならこの判定に入らないため、`RETUNE=1` 単独では調整しません (`docker/entrypoint.sh:230-239`)。
+entrypoint の正規化では前後空白を除去しないが、CLI の `_choice` が引数の前後空白を除去するため、例えば `" QUICK "` も受理される。空白を含む値は CLI に渡った後に判定される。CLI の他の値（例 `true`、`0`、`1`）は選択肢ではなく、`argument --tune: '値' is not a tuning mode. Choose one of: quick, thorough, skip.` の形式で拒否される。未調整 preset で不正値を渡すと launch プロセスは引数エラーで終了し、entrypoint は非 0 の戻り値をコンテナ終了として報告する。`terminal/strata_cli/launch/cmd.py:35-43`、`tools/docker/entrypoint.sh:254-264,303-316`。
 
 ## 有効になる条件
 
-- entrypoint が既定の server 起動経路を通る必要があります。コンテナに `strata ...`、`sh` などのコマンド引数を渡すと、entrypoint は設定処理より前に `exec` するため `TUNE` を読まず、引数付き `strata launch` でも `TUNE` は適用されません (`docker/entrypoint.sh:53-56,228-239`)。
-- 通常起動経路では、エンジンの適合性確認などの準備後に `TUNE` を評価します。`quick` / `thorough` は既存 preset が調整済みでないときに `--tune` として CLI へ渡されます。preset が既に調整済みで `RETUNE` が `1` 以外なら、entrypoint が「This preset is already tuned; keeping the tuned settings ...」と表示して `--tune` を付けません (`docker/entrypoint.sh:136-160,228-239`)。
-- `TUNE_ALLOW_SMALL=1` の場合、`TUNE` の値とは独立に `--tune-allow-small` も渡します。その他の値では渡しません (`docker/entrypoint.sh:240`; CLI option `strata_cli/launch/cmd.py:115-116`)。
-- チューニングの backend やモデル別処理は `TUNE` ではなく CLI の tuning 実装に委ねられます。CLI は `thorough` のとき thorough mode、それ以外の調整実行時は quick mode を選び、複数ファイルモデル経路では DeepSeek 専用 tuner に分岐します (`strata_cli/launch/runner.py:1512-1524,1555-1589`)。
+- Docker の既定 entrypoint 起動であること。entrypoint は任意の別コマンド（`strata ...` を含む）を受け取ると起動処理を切り替えるため、その経路では TUNE を CLI に渡さない。`tools/docker/entrypoint.sh:68-70`。
+- 値が空でも `skip` でもないこと。さらに `RETUNE=1` でない場合、entrypoint が preset 一覧から調整済みと判定した既存 preset では再測定しない。`RETUNE=1` のときは `--retune` も追加する。`tools/docker/entrypoint.sh:253-263`。
+- launch にチューナーへ渡せるモデル・実行条件があること。`Runner.tune()` は `skip`、および Qwen tuning knobs を持たない native Strata family の Hy4-Flash / Inkling-2-Mini では直ちに戻る。既存 tuning preset、標準設定が既に最速だった記録、同じモデルと選択内容の保存済み tuning があれば、`--retune` なしでは再測定を省く。`terminal/strata_cli/launch/runner.py:2372-2395`。
+- launch が engine 問題でチューニング段階より前に終了しないこと。runner は engine 問題を検出すると結果を返し、その後の `self.tune()` へ進まない。`terminal/strata_cli/launch/runner.py:3328-3337`。
+
+Docker Compose の3 backend 定義はいずれも未設定時に `skip` を注入する。entrypoint が起動する `launch --no-tui` の設定では、`--tune` が生成された場合に preset 由来の設定へ反映される。`tools/docker/compose/docker-compose.nvidia.yml:16-24`、`tools/docker/compose/docker-compose.amd.yml:15-23`、`tools/docker/compose/docker-compose.intel.yml:15-23`、`terminal/strata_cli/launch/cmd.py:274-277`。
 
 ## 実行時の詳細
 
-値を読むのはコンテナ起動のたびに entrypoint が設定引数を組み立てる時点で、同じ起動中に再読込・cache する処理はありません。`quick` または `thorough` を指定し、preset が未調整なら「Tuning is on (TUNE=...): ...」を stdout に出し、最終的に `strata launch --no-tui ... --tune <モード>` を実行します。既定では preset 側に調整結果が記録され、次の起動では再測定を避ける設計です (`docker/entrypoint.sh:228-239,273-290`; `docs/DOCKER.md:125,132-135`)。
+TUNE は Docker コンテナの entrypoint 実行時に一度シェルで読み取られる。プロセス起動後に環境変数を変更しても、その起動で組み立て済みの引数は変わらない。CLI 側の `LaunchSettings` の既定値も `skip`。`quick` / `thorough` のとき、runner はそれぞれ同名の `--mode` を付けた `strata tune auto <profile>` 子プロセスを起動する。測定状態ファイルを1秒間隔で読み、進捗を出し、完了時の結果を preset に記録した後にモデルを開始する。`skip` はチューナー起動を行わない。`tools/docker/entrypoint.sh:254-266,303-310`、`terminal/strata_cli/launch/settings.py:141`、`terminal/strata_cli/launch/runner.py:2372-2407,2411-2439,3323-3342`。
 
-`RETUNE=1` の再測定にはコード上の食い違いがあります。Docker 文書は `RETUNE=1` で再調整すると説明しますが、entrypoint が CLI に加えるのは `--tune <モード>` で、`--retune` は追加していません。preset を CLI に読み込むと保存済み `tuned_preset` / `tuned_at` が残り、`Runner.tune()` は `retune` が false で tuning 情報がある場合に測定を省略します。そのため、すでに調整済み preset に `TUNE=quick RETUNE=1` を指定しても、entrypoint の早期スキップは通過しますが、CLI runner は既存結果を再利用し、実測を再実行しない経路があります。これは `docs/DOCKER.md:125,215` の説明と現行コードの差です (`docker/entrypoint.sh:233-239`; `strata_cli/launch/cmd.py:136-138,205-211,781-784`; `strata_cli/launch/runner.py:1555-1579`; `strata_cli/launch/settings.py:129-133`)。
+実行されるのは引数どおり `quick` または `thorough` の tuning mode で、Docker entrypoint は別環境変数 `TUNE_ALLOW_SMALL=1` の場合に限り `--tune-allow-small` も追加する。再測定を許可する `RETUNE=1` は `TUNE` が空または `skip` のとき entrypoint から作用せず、チューニング値が有効な分岐でのみ `--retune` になる。`tools/docker/entrypoint.sh:253-266`、`terminal/strata_cli/launch/cmd.py:121-122,143-145`。
 
-調整実行時は runner が通常モデル向け tuner または複数ファイルモデル向け DeepSeek tuner を起動します。測定の開始・結果は CLI の tune event として出力され、保存済み情報があれば「This preset is already tuned ...」または「Already tuned on ...」などを出して再測定しません。Docker entrypoint は CLI が非ゼロ終了すると `phase failed` を記録し、上記の終了コードでコンテナ起動を終了します (`strata_cli/launch/runner.py:1512-1553,1555-1624`; `docker/entrypoint.sh:285-290`)。
+## ログと測定値
+
+entrypoint はチューニング引数を付けると `Tuning is on (TUNE=<小文字化した値>): the first start takes longer (up to about 20 minutes, once).`（`quick`）または上限表示が `about 120 minutes`（`thorough`）のログを出す。測定を飛ばす既存 preset では `This preset is already tuned; keeping the tuned settings (set RETUNE=1 to tune again).` を出す。runner は測定を始めると `Tuning for the best speed. Close other heavy programs while it measures.` を通知し、完了時に `Tuning result: ...` を通知する。これらは実装上の案内・進捗文言であり、測定時間の保証ではない。`tools/docker/entrypoint.sh:258-263`、`terminal/strata_cli/launch/runner.py:2381-2393,2405-2421,2431-2439`。
 
 ## 根拠
 
-- `docker/entrypoint.sh:53-56,228-240,273-290` — 対象経路、値の処理、preset / `RETUNE` 判定、CLI への引数付加、起動ログと失敗終了。
-- `docker/compose/docker-compose.nvidia.yml:22`, `docker/compose/docker-compose.amd.yml:21`, `docker/compose/docker-compose.intel.yml:21` — Compose からの転送と `skip` fallback。
-- `strata_cli/launch/settings.py:26,116,129-133` — CLI の tuning 候補、既定値、tuned marker の意味。
-- `strata_cli/launch/cmd.py:37-45,115-116,136-138,205-211,262-265,781-784` — CLI 値検証、preset 設定合成、`--retune` の意味と runner への伝達。
-- `strata_cli/launch/runner.py:1512-1553,1555-1624,2286-2318` — 実行モード、tuned marker による再測定省略、起動内での tuning 呼び出し。
-- `docs/DOCKER.md:125,132-135,214-215` — 文書上のモード・既定値・再調整説明。`RETUNE=1` の説明は entrypoint / runner 実装と一致しない。
+- `tools/docker/entrypoint.sh:68-70,184-185,253-266,303-316`
+- `tools/docker/compose/docker-compose.nvidia.yml:16-24`
+- `tools/docker/compose/docker-compose.amd.yml:15-23`
+- `tools/docker/compose/docker-compose.intel.yml:15-23`
+- `terminal/strata_cli/launch/cmd.py:35-43,121-122,143-145,274-277`
+- `terminal/strata_cli/launch/settings.py:29,141-142`
+- `terminal/strata_cli/launch/runner.py:2372-2439,3328-3342`

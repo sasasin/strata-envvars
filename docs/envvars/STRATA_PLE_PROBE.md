@@ -1,38 +1,45 @@
 # `STRATA_PLE_PROBE`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。調査対象リポジトリの作業ツリーは `## main...origin/main`。
 
 ## 役割
 
-PLE（ngram）テーブルを `--ple-io direct` で開いた直後に行う、ランダム行読み取り速度の起動時 probe を抑止します。名前に `PROBE` とありますが、実装上はこの変数を設定すると probe は実行されません。probe を強制する用途ではありません。
+PLE テーブルを direct I/O で開いた後に行う起動時の読み取り速度計測を抑止する。設定が無い場合は `ple_direct_rows_per_s()` を呼び、結果に応じて速度ログ、低速警告、または `STRATA_PLE_AUTO_MMAP` による mmap への切り替えを行う。設定があると、この分岐全体を実行しない。環境変数自身が PLE の I/O モードを指定したり、必ず direct を選んだりするわけではない。CUDA/HIP 共通の `engine/src/program/generate.cpp` と SYCL の `engine/sycl/src/program/generate.cpp` に同じ判定がある（`engine/src/program/generate.cpp:6350-6383`、`engine/sycl/src/program/generate.cpp:3373-3406`）。
 
 ## 値と判定
 
-値の内容は parse されず、`std::getenv("STRATA_PLE_PROBE") != nullptr` かどうかだけを見ます。
+両実装とも `std::getenv("STRATA_PLE_PROBE") == nullptr` のときだけ計測ブロックに入る。値の内容は読み取らず、文字列比較・数値変換・真偽値 parse はしない。unset は計測を許可し、空文字を含む何らかの設定値は計測を抑止する。
 
-| 状態 | 動作 |
-|---|---|
-| 未設定 | `--ple-io direct` の場合に probe を実行 |
-| 任意の値を設定 | probe をスキップ。`1`、`0`、その他の文字列で差はない |
-| 空文字を設定 | probe をスキップ（環境変数は存在するため） |
+| 条件 | unset | 計測を抑止する値 | 無効値・境界 |
+|---|---|---|---|
+| CUDA/HIP `generate` と SYCL `generate` の PLE direct 経路 | 計測を行う | 空文字、`0`、`1`、`true`、`false`、その他すべての設定値 | 値の形式・大文字小文字・空白・数値としての妥当性を検査しない。設定されていれば一律に抑止する（`engine/src/program/generate.cpp:6352`、`engine/sycl/src/program/generate.cpp:3375`）。 |
 
 ## 有効になる条件
 
-変数が未設定で、PLE テーブルが指定されて正常に開かれ、I/O mode が `Direct` の場合だけ probe に進みます。`--ple-io` の既定値は `direct` です。`--ple-io mmap` または `--ple-io ram` ではこの probe 分岐に入りません。PLE テーブルを使わない場合も読み取り箇所へ到達しません。
-
-CUDA/HIP を使う `src/program/generate.cpp` と SYCL の `sycl/src/program/generate.cpp` に同じ判定があります。両方とも環境変数が設定済みなら mode に関係なく値を使わず、probe だけでなく probe 内の遅い読み取りに対する警告や自動切替判定も飛ばします。ほかの PLE 読み取りやテーブル mode 自体はこの変数で変更されません。
+- `o.ple_gguf` が空でなく、PLE テーブルを開く経路であること。PLE GGUF がない場合は、この読み取りを含むテーブル処理に入らない（`engine/src/program/generate.cpp:6264-6271`、`engine/sycl/src/program/generate.cpp:3346-3353`）。
+- テーブルの現在の I/O モードが `Direct` であること。`--ple-io` の既定値は `direct` で、`mmap` または `ram` は `Mmap` に設定されるため、直接指定された場合は計測ブロックの対象外（`engine/src/program/generate.cpp:817-819, 6271-6272`、`engine/sycl/src/program/generate.cpp:501-503, 3352-3353`）。
+- `STRATA_PLE_AUTO_RAM` のポリシーで先にテーブルが `Mmap` に切り替わった場合も対象外。CUDA/HIP 実装では direct かつ `--ple-io` 未指定のときにポリシーを評価し、採用時に `pio.mode` を変更してから probe 条件を判定する（`engine/src/program/generate.cpp:6303-6327, 6352`）。
+- 他の環境変数との相互作用として、probe が許可され、測定値が低速域に入った後でのみ `STRATA_PLE_AUTO_MMAP` が自動切替を制御する。`STRATA_PLE_PROBE` が設定済みなら、その後段まで到達しない（`engine/src/program/generate.cpp:6352-6375`、`engine/sycl/src/program/generate.cpp:3375-3398`）。
 
 ## 実行時の詳細
 
-テーブルを開いた後、未設定なら `ple_direct_rows_per_s()` が最大64 batch（batch あたり64行）でランダム行を読み、経過が約0.6秒を超えた時点で止めて rows/s を計算します。テーブルが4096行未満、読み取り失敗など、測定できない場合は非正の値を返します。測定値が15,000 rows/s以上なら `PLE direct read probe: ... (fine)` を stderr に出します。0より大きく15,000未満なら、通常は低速警告を出します。加えて `STRATA_PLE_AUTO_MMAP` が非ゼロとして parse され、かつ `--ple-io` が明示指定されていない場合には、テーブルを mmap mode で開き直します。これらはすべて `STRATA_PLE_PROBE` が未設定のときだけ起きます。
+判定はテーブル open 後、初回の prompt 処理に進む前の `generate` 実行中に行われる。関数内 static cache はなく、この箇所で `getenv` を評価する。読み取りは PLE GGUF が存在する場合に限られ、現在のモードが direct のときだけ値の有無が条件に使われる（`engine/src/program/generate.cpp:6269-6288, 6352`、`engine/sycl/src/program/generate.cpp:3350-3369, 3375`）。
 
-`STRATA_PLE_PROBE` はテーブルを開いた後の起動処理で直接読み取られ、結果を static cache しません。この箇所の判定後に環境を変更しても、その起動中の probe の実施・抑止は変わりません。コード上、子プロセスへの転送・上書きは確認できません。
+未設定なら、テーブルの行数が 4096 未満のとき計測関数は `-1` を返し、それ以外では疑似乱数で行を選び、4 token 分（1 batch 64 行）の `gather_batch` を最大 64 batch、経過時間が約 0.6 秒を超えるまで実行して rows/s を算出する。読み取りに失敗した場合も `-1` を返す。値が 15000 rows/s 以上なら `PLE direct read probe: … (fine)` を出し、0 より大きく 15000 未満なら、`--ple-io` が明示されておらず、かつ `STRATA_PLE_AUTO_MMAP` の `atoi` 結果が非ゼロの場合に限り mmap に切り替える。それ以外は警告を出して direct を維持する（`engine/src/program/generate.cpp:3446-3472, 6352-6383`、`engine/sycl/src/program/generate.cpp:1774-1797, 3375-3406`）。
+
+`STRATA_PLE_PROBE` が設定済みなら計測用 `gather_batch` とこのブロック内のログ・自動切替を丸ごと省略する。従って `STRATA_PLE_AUTO_MMAP=1` もこの条件を迂回しない。明示的な `--ple-io` は CLI parser で `ple_io_explicit` に記録され、低速時の自動切替を抑える（`engine/src/program/generate.cpp:3901, 6362-6375`、`engine/sycl/src/program/generate.cpp:1940, 3385-3398`）。この変数単独による終了・エラー経路はない。
+
+## ログと測定値
+
+`STRATA_PLE_PROBE` 自体を示すログはない。設定すると、probe 分岐内の正常時 `strata generate: PLE direct read probe: %.0f rows/s (fine)`、低速時の `WARNING: --ple-io direct measures slow here ...`、または mmap 切替時の `using --ple-io mmap instead ...` は出ない。計測結果が 0 以下の場合は、変数 unset でもこの probe 分岐内のログは出ない。いずれも stderr への出力（`engine/src/program/generate.cpp:6354-6381`、`engine/sycl/src/program/generate.cpp:3377-3404`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:387` — `--ple-io` の既定値は `direct`。
-- `src/program/generate.cpp:3187-3214,3217-3244` — PLE table を開いた後の env 判定、probe、閾値、ログと `STRATA_PLE_AUTO_MMAP` による切替。
-- `src/program/generate.cpp:1743-1765` — probe がランダム行 batch を読み、最大約0.6秒測定する処理。
-- `sycl/src/program/generate.cpp:460,3004-3031,3034-3061` — SYCL 側の既定値と同じ env 判定・probe 分岐。
-- `sycl/src/program/generate.cpp:1631-1653` — SYCL 側 probe 実装。
-- `docs/DETAILS.md:1868-1870` — direct I/O が既定であること、起動 probe が15K rows/s未満で警告すること、および `STRATA_PLE_AUTO_MMAP` による切替の説明。`STRATA_PLE_PROBE` 自体の説明はありません。
+- CUDA/HIP の PLE open、direct 判定、自動 RAM policy、probe の読み取りと結果分岐: `engine/src/program/generate.cpp:6264-6288, 6303-6348, 6350-6383`
+- CUDA/HIP の probe 実装と計測上限・失敗時の戻り値: `engine/src/program/generate.cpp:3446-3472`
+- CUDA/HIP の `--ple-io` 既定値と明示指定の記録: `engine/src/program/generate.cpp:817-819, 3901`
+- SYCL の PLE open と probe の読み取り・結果分岐: `engine/sycl/src/program/generate.cpp:3346-3369, 3373-3406`
+- SYCL の probe 実装と計測上限・失敗時の戻り値: `engine/sycl/src/program/generate.cpp:1774-1797`
+- SYCL の `--ple-io` 既定値と明示指定の記録: `engine/sycl/src/program/generate.cpp:500-503, 1940`
+- `terminal/data/settings-register.json` にも名前が登録されているが、これは設定レジストリ上の参照であり、実際の環境変数読み取り箇所は上記 2 箇所（`terminal/data/settings-register.json:34709-34725`）。
+- `docs/DETAILS.md` は `--ple-io direct` の起動時 probe と `STRATA_PLE_AUTO_MMAP=1` による切替を説明するが、`STRATA_PLE_PROBE` による抑止は記載していない（`docs/DETAILS.md:1215`）。

@@ -1,56 +1,47 @@
 # `STRATA_ARENA_RAM_FALLBACK`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-expert arena を RAM に読み込む起動経路で、必要 RAM が足りない場合に、その起動だけ expert の読み出し元を `--mmap-experts` と同じファイル経路へ自動で切り替えるかを制御します。通常は既定で切替を許可します。`--mmap-experts` がすでに指定されている起動では arena の不足判定を使わないため、この変数による自動切替もありません。
-
-この切替は起動を拒否する代わりにファイルから読む選択です。静的 expert profile があり、別の条件も満たす場合は、切替後に profile 上位 expert の一部を RAM に置く resident-budget 形式も自動で有効になります（後述）。
+`generate` が expert arena を必要な RAM に読み込めないと判定したとき、expert をファイルから読む `--mmap-experts` 経路へ自動で切り替えてよいかを決める。通常（未設定）は切替を許可する。これは判定の許可だけを制御し、RAM 不足の解消や `--mmap-experts` 自体の強制ではない。すでに `--mmap-experts` が選ばれている実行経路ではこの変数による判定は使われない（`engine/src/program/generate.cpp:8621-8622,8745-8747,8602-8604`）。
 
 ## 値と判定
 
-`arena_ram_fallback_allowed()` は環境変数の値全体を検証せず、空でない値を `std::atoi()` に渡し、変換結果が 0 かどうかで判定します。
+`std::getenv` で値を取得し、未設定または空文字なら許可する。空でない値は `std::atoi(value) != 0` で判定するため、文字列全体の数値検証や真偽値の文字列比較はしない（`engine/src/program/generate.cpp:8602-8603`, `engine/include/strata/core/ple_residency.hpp:70-74`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 許可 |
-| 空文字 | 許可（未設定と同じ） |
-| `0`、`00`、`0abc`、数値に変換できない文字列 | 不許可（`atoi` の結果が 0） |
-| `1`、`-1`、`2x`、` 2` など、`atoi` の結果が非 0 | 許可 |
+| 条件 | unset | 許可になる設定値の例 | 許可されない設定値の例 |
+|---|---|---|---|
+| arena 経路で、後述の CLI 条件を満たす | 許可 | `1`、`-1`、`1tail`、` 1`（`atoi` の結果が非ゼロ） | `0`、`0tail`、`true`、`false`、`x1`、空文字（空文字は unset と同じく許可） |
 
-したがって厳密な `0` / `1` のみを受け付ける設定ではありません。小数や範囲の検証もありません。たとえば `0.5` は整数変換結果が 0 なので不許可です。無効な文字列をエラーにはせず、0 相当として自動切替を止めます。
+したがって `true` は有効化文字列ではなく、`atoi` が 0 を返すため許可しない。先頭の空白と数値接頭辞は `atoi` の変換に従い、後続文字は数値変換後に検証されない。数値として変換できない文字列は 0 となる。範囲検査もないため、`int` の範囲外の文字列は設定値として頼れない。先に `--ple-io ram` を明示した場合、または共有 arena ファイルを指定した場合は、値にかかわらず許可されない（`engine/include/strata/core/ple_residency.hpp:70-73`）。
 
 ## 有効になる条件
 
-次の条件で自動切替が許可されます。
-
-- 実行が arena を開く経路である。
-- `--ple-io ram` が明示されていない。明示された場合、環境変数が非 0 でも自動切替しません。`--ple-io` の他の値や未指定は、この抑止条件には該当しません。
-- `--shared-expert-arena` が指定されていない。
-- 環境変数が未設定、空文字、または `atoi` の結果が非 0。
-
-許可されても、arena が必要量の RAM を使える場合は切替を行いません。メモリ情報が取得できない場合も不足判定を通らず、通常の arena 読み込みを試みます。固定した選択を尊重する `--ple-io ram` と共有 arena は、この変数より優先されます。
-
-不足判定では arena 本体と最大 blob 1 個分に `--ram-keep-gib` の指定量を加えて必要量を計算します。hard limit（cgroup 等）がある場合、切替許可時はさらに `max(--ram-keep-gib, headroom)` を limit 判定に加えます。headroom は通常 Windows 8 GiB、その他 4 GiB で、`STRATA_RESIDENT_HEADROOM_GIB` が有効な数値として指定されればその値に置き換わります。
+- `generate` が `o.mmap_experts == false` の arena 経路に入ること。すでに `--mmap-experts` が有効なら file source 側に進み、arena RAM fallback の判定は行われない（`engine/src/program/generate.cpp:8621-8622,8745-8747`）。
+- `--ple-io ram` を明示していないこと。`--ple-io ram` を指定すると、`ple_io_explicit && ple_io == "ram"` が true になり、自動切替は抑止される。これは CLI 引数が環境変数より優先する条件である（`engine/src/program/generate.cpp:3901,8602-8603`）。
+- `--shared-expert-arena` のパスが空であること。共有 arena を指定すると自動切替は抑止される（`engine/src/program/generate.cpp:4218-4219,8602-8603`）。
+- arena を開く際に、利用可能 RAM またはハードメモリ上限に対して不足と判定され、RAM fallback の分岐が実際に選ばれること。RAM が足りていればこの変数が許可でも挙動は変わらない（`engine/src/core/expert_source.cpp:6533-6537,6543-6549,6604-6605,6652-6661`）。
+- Linux では、shortfall がホストの空きページ・破棄可能な file cache・適合する huge page pool で賄えると判定される別経路があり、その場合は arena をロードするため自動切替には進まない（`engine/src/core/expert_source.cpp:6604-6649`）。
 
 ## 実行時の詳細
 
-値は generate の起動処理中、`ArenaExpertSource::open()` より前に読み取られ、1 回の起動中に判定結果が使われます。`static` cache ではありません。環境変数を変更しても、すでに起動したプロセスの判定は変わりません。CLI 引数がこの環境変数の値を設定する仕組みはありませんが、明示 `--ple-io ram` と共有 arena が自動 fallback を禁止します。
+変数は `generate.cpp` の arena 初期化時に一度読み、プロセス内の `ram_fallback_ok` に保持する。以降の arena 再試行で読み直さないため、実行中の環境変更はこの判定に反映されない（`engine/src/program/generate.cpp:8595-8604,8860-8872`）。helper は「`--ple-io ram` を手動指定したか」「共有 arena が指定されたか」を先に判定し、どちらかなら環境値を見ずに false を返す（`engine/include/strata/core/ple_residency.hpp:67-74`）。
 
-hard limit が不足していて切替可能なら、arena の割当て・登録を行わず `ram_short` を返し、呼び出し元が expert ファイル経路に切り替えます。通常の利用可能 RAM が足りない場合は、既定で最大 20 秒、`STRATA_ARENA_RAM_WAIT_S` の指定があればその範囲内の秒数だけ空きを待ちます。待機後も不足し、切替可能なら同じファイル経路へ切り替えます。切替不可のときは hard limit 不足で起動エラーになり、通常 RAM 不足は警告して arena 読み込みを続けます。
+RAM 不足判定は arena の読み込み前に行われる。ハードメモリ上限が必要量を下回る場合、fallback 許可時は arena を開かず `ram_short` を返し、呼び出し側が file source を選ぶ。許可されない場合は上限エラーを出して起動に失敗する。利用可能 RAM の不足が待機後も続く場合、fallback 許可時は同じく file source に切り替える。許可されない場合は不足警告を出したうえで arena のロードを続行する（`engine/src/core/expert_source.cpp:6543-6559,6560-6564,6652-6675`）。
 
-切替先を開けなかった場合、呼び出し元はそのエラーを出し、arena を従来どおり再試行します。この再試行では同じ RAM 不足による fallback を無効にします。2 回目も開けなければエラーを出して終了します。
+自動切替時は `o.mmap_experts` を true にし、最大 2 pass のループでファイル経由の source を開き直す。ファイル source を開けなければ、切替状態を戻して arena を従来どおり試す。固定 profile があり、既存の resident CPU expert 指定がなく、`STRATA_ARENA_FALLBACK_RESIDENT` の先頭文字が `0` でない場合は、fallback のファイル経路で profile 順の RAM copy も設定される。このとき RAM 予算は利用可能 RAM から headroom を引いて算出される（`engine/src/program/generate.cpp:8600-8601,8631-8640,8890-8911`）。
 
-切替成功時は stderr に `not enough RAM for the expert arena (...): this run reads the experts from the file, like --mmap-experts (slower; the answers are the same).` と出し、続いて `experts via mmap (not enough RAM for the expert arena: the same source as --mmap-experts; ...)` を出します。expert file source を開けない場合は追加で診断を出し、arena 再試行を行います。
+## ログと測定値
 
-profile が空でなく、既に resident CPU experts が有効でなく、かつ `STRATA_ARENA_FALLBACK_RESIDENT` の先頭文字が `0` でない場合は、切替後に profile 上位 expert を利用可能 RAM と headroom の範囲で resident RAM copy に置き、残りをファイルから読みます。`STRATA_ARENA_FALLBACK_RESIDENT=0...` はこの resident 化だけを止め、`STRATA_ARENA_RAM_FALLBACK` によるファイル経路への切替は止めません。
+この変数の設定値自体を表示するログはない。fallback が実際に選ばれると stderr に `strata generate: not enough RAM for the expert arena (...)` で始まる行を出し、`--serve` では同じ案内を stdout にも出す。その後ファイル source が開けると `strata generate: experts via mmap (not enough RAM for the expert arena: the same source as --mmap-experts; ...)` と表示する（`engine/src/program/generate.cpp:8876-8888,8645-8647`）。
+
+fallback を許可しない状態で利用可能 RAM だけが不足する場合は arena を続行し、stderr に `the expert arena needs ...: the load may swap or be stopped by the OS...` の警告を出す。ハードメモリ上限不足では `ArenaExpertSource: the expert arena needs ...: it would be killed while loading...` をエラーとして返し、呼び出し側が終了コード 1 で終了する（`engine/src/core/expert_source.cpp:6551-6558,6663-6675`, `engine/src/program/generate.cpp:8913-8915`）。測定値は記載しない。`docs/DETAILS.md` にこの環境変数の記述は見当たらず、コード内コメントの測定主張をこの変数自体の測定結果としては扱わない。
 
 ## 根拠
 
-- 全参照の検索では本番読み取りは `src/program/generate.cpp:7072-7073` の一箇所です。`include/strata/core/ple_residency.hpp:65-72` の helper が優先条件、空文字、`atoi` 判定、既定許可を定義します。残る同名参照はコメントと `src/core/ple_residency_test.cpp:72-78` のテストです。
-- `src/program/generate.cpp:3352` は `--ple-io` の明示状態を記録し、`src/program/generate.cpp:3645` は共有 arena 引数を受け取ります。判定結果の設定、fallback 状態、headroom は `src/program/generate.cpp:7065-7088,7306-7317` にあります。
-- hard limit と RAM 必要量判定は `src/core/expert_source.cpp:5871-5900`、待機・ロック解放・不足時の fallback / 警告は `src/core/expert_source.cpp:5901-5968` にあります。判定に使う `arena + blob + ram_keep` は同ファイル `5874-5878`、helper は `include/strata/core/ple_residency.hpp:58-63,98-105` です。
-- 切替後のファイル source 開始、open 失敗時の arena 再試行、resident RAM fallback とログは `src/program/generate.cpp:7091-7117,7321-7347` にあります。`STRATA_ARENA_FALLBACK_RESIDENT` の判定は `src/program/generate.cpp:7074-7075,7333-7341` です。
-- `STRATA_ARENA_RAM_WAIT_S` の既定・変換範囲（全体を `strtod` で読み、0〜3600 秒）と待機ログは `src/core/expert_source.cpp:5906-5929` にあります。
-- 関連する RAM 方針の説明は `docs/DETAILS.md:740-764` にあります。同資料の記述を超える性能値はこの文書では主張しません。
+- `engine/src/program/generate.cpp:8595-8605` — 環境変数の唯一の実読み取り、CLI/共有 arena 条件、起動時の値保存。
+- `engine/include/strata/core/ple_residency.hpp:67-74` — fallback 許可条件と `atoi` 判定。
+- `engine/src/program/generate.cpp:8621-8622,8745-8747,8860-8872,8876-8915` — arena/file source 分岐、fallback 後の再試行、通知、失敗時の終了。
+- `engine/src/core/expert_source.cpp:6533-6675` — RAM / hard limit 判定、待機、Linux file-cache 判定、fallback または警告。
+- `engine/src/program/generate.cpp:3901,4218-4219` — `--ple-io` と `--shared-expert-arena` の引数記録。

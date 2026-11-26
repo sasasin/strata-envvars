@@ -1,38 +1,38 @@
 # `REPO`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`REPO` は通常の Strata エンジンの実行設定ではなく、SYCL 開発用ビルドスクリプト `sycl/tools/build.sh` が Strata checkout のルートを指定するために読みます。指定したルートの `sycl/` を CMake のソースディレクトリにし、既定の build directory もそのルート内の `build-sycl` に置きます。Docker を使う Intel SYCL ビルド手順では、コンテナ内の checkout 位置を `REPO` に渡しています（`docs/INTEL.md:69-79`、`docs/INTEL_ARC.md:73-79`）。
+`REPO` は `engine/sycl/tools/build.sh` が SYCL 開発ビルドの Strata checkout のルートを指定するために読む環境変数である。値が使われる場合、スクリプトは `$repo/engine/sycl` を CMake のソースディレクトリとして渡す。未設定または空文字なら、スクリプトを実行したカレントディレクトリから `git rev-parse --show-toplevel` で求めたルートを使う。これは開発・ビルド用スクリプト内の設定であり、Strata の通常実行時の動作を変える環境変数ではない（`engine/sycl/tools/build.sh:38-44`）。
 
 ## 値と判定
 
-シェルの `${REPO:-$(git rev-parse --show-toplevel)}` で読みます。値をパース・検証・正規化しません。
+| 条件 | unset | 有効になる値（例） | 空文字・無効値の扱い |
+| --- | --- | --- | --- |
+| `engine/sycl/tools/build.sh` の実行時 | `git rev-parse --show-toplevel` の出力を使う | 空でない値（例: `/work/Strata`）を `repo` に代入する | `:-` の Bash 展開なので未設定と同様に Git ルートへフォールバックする。値の存在確認、パス検証、正規化は行わない（`engine/sycl/tools/build.sh:38`）。 |
 
-| 状態 | `repo` の値 |
-| --- | --- |
-| `REPO` 未設定 | スクリプトを起動した現在のディレクトリに対する `git rev-parse --show-toplevel` の出力 |
-| `REPO` が空文字 | 同じ git checkout ルートへのフォールバック |
-| `REPO` が非空 | その文字列をそのまま使用 |
-
-非空値が実在する checkout か、絶対パスか、`sycl/` を含むかは確認しません。後続のコマンドでは `$repo` が引用符なしで展開されるため、空白を含むパスは一つのパスとして渡されません。`REPO` 未設定・空文字時の fallback は、スクリプトを git checkout 内から起動することを前提にしています。
+シェル文字列を数値や真偽値に変換せず、空でない文字列をそのまま代入する。したがって `0`、`false`、空白を含む文字列も設定値として扱われ、`REPO=0` や `REPO=false` は無効値として拒否されない。ただし値が実在する checkout のパスであることは検査されない。代入後の `$repo/engine/sycl` は引用符なしで展開されるため、空白を含む値は単一のパス引数として扱われない（`engine/sycl/tools/build.sh:38,40-43`）。
 
 ## 有効になる条件
 
-この変数を読むのは `sycl/tools/build.sh` の SYCL 開発ビルド経路です。エンジン起動時や通常の CLI / サーバー処理からは読みません。スクリプトは `REPO` を明示指定した場合にその値を優先し、未設定または空文字の場合に git ルートを使います。
-
-`BUILD_DIR` は build directory を別途指定でき、未設定・空文字なら `$repo/build-sycl` です。これは `REPO` のソースルート指定を置き換えません。ビルドターゲット引数も CMake の `--target` に渡されるだけで、ソースルートを変更しません（`sycl/tools/build.sh:38-44`）。
+- この変数を読むのは SYCL 開発用 `engine/sycl/tools/build.sh` を実行した場合だけである。同スクリプトは `/opt/intel/oneapi/setvars.sh` を試行した後、`repo` を設定する（`engine/sycl/tools/build.sh:1-8,38`）。
+- `$BUILD_DIR/build.ninja` が存在しない場合、`REPO` のパスを `cmake -S` に渡してビルドツリーを構成する。`BUILD_DIR` が未設定または空ならビルド先は `$repo/build-sycl`（`engine/sycl/tools/build.sh:39-41`）。
+- `build.ninja` が既にある場合、初回の CMake 構成は飛ばされる。そのとき `REPO` を変更しても既存の CMake キャッシュのソース位置は切り替わらない。`I8_ESIMD` が空でない場合の再構成も同じ `$repo/engine/sycl` を指定し、変更する設定は `STRATA_SYCL_I8_ESIMD` のみ（`engine/sycl/tools/build.sh:40-43`）。
+- `build.sh` の位置引数は `cmake --build` の `--target` に使われ、`REPO` の値を上書きしない（`engine/sycl/tools/build.sh:44`）。
 
 ## 実行時の詳細
 
-スクリプト実行時に `repo` を一度決め、その後 `cmake -S $repo/sycl` として構成し、構成済み directory に対してビルドします。プロセス内の再読み込みや cache はありません。`build.ninja` が既にある場合、通常の構成コマンドはスキップされます。そのため、同じ `BUILD_DIR` を再利用して `REPO` だけ変えても、既存の CMake 構成が自動で作り直されるとは限りません。`I8_ESIMD` が非空なら別の CMake 構成コマンドも実行されますが、そこでも `-S $repo/sycl` が使われます（`sycl/tools/build.sh:38-43`）。
+スクリプト実行中の 1 回、`repo=${REPO:-$(git rev-parse --show-toplevel)}` でシェル変数 `repo` に値を保存する。したがって実行中に親プロセス側の環境値を変えて再読込する仕組みはない。フォールバックの Git コマンドはスクリプトのカレントディレクトリで実行される。フォールバック結果を検査する分岐はなく、CMake のソース指定と既定ビルド先の組み立てに使われる（`engine/sycl/tools/build.sh:38-41`）。
 
-`REPO` 自体に対応するログや警告はありません。指定パスが不正で CMake 構成に失敗しても、スクリプトは `set -e` を使っていないため、その場で終了せず後続の build を試みます。ビルド段階では `BUILD EXIT <終了コード>` を表示し、`cmake --build` の終了コードをスクリプトの終了コードにします。詳細ログは `$b/build.log` への記録を試みます（`sycl/tools/build.sh:40-52`）。
+`docs/INTEL.md` は Docker 実行時に `-e REPO=/work/$H` を指定して同スクリプトを呼ぶ例を示しており、SYCL 開発ビルドでの checkout 指定という用途と一致する（`docs/INTEL.md:53-83`）。
+
+## ログと測定値
+
+`REPO` 自体の値や、空値から Git ルートへフォールバックしたことを出力するログはない。CMake 構成の出力は末尾 15 行に絞られ、ビルド時には `BUILD EXIT <終了コード>` と `errors: <件数>`、失敗ターゲット名が表示される。最後の終了コードは CMake build のパイプライン先頭のステータスである。無効なパスに対する `REPO` 固有の診断文はなく、失敗は CMake/Ninja のエラーとこの一般的な終了表示を通じて観測される（`engine/sycl/tools/build.sh:40-50`）。
 
 ## 根拠
 
-- `sycl/tools/build.sh:38-44` — `REPO` と git ルートの選択、`BUILD_DIR` の既定値、CMake 構成・ビルドでの使用。
-- `sycl/tools/build.sh:7,40-52` — `set -e` がないこと、構成失敗後の継続、ビルド終了コードと表示。
-- `docs/INTEL.md:69-79`、`docs/INTEL_ARC.md:73-79` — Docker 内から SYCL ビルドを行う手順と `REPO` の指定例。挙動の根拠は実装 `sycl/tools/build.sh` によります。
-
+- `engine/sycl/tools/build.sh:38-44` — `REPO` の読み取り、空値時の既定値、CMake のソース指定、既存 build.ninja 時の分岐、ビルド呼び出し。
+- `engine/sycl/tools/build.sh:45-50` — ビルド結果・エラー件数・失敗ターゲット・コンパイラ失敗のログと終了コード。
+- `docs/INTEL.md:53-83` — SYCL 開発ビルドの Docker 実行例と `REPO` の指定方法。

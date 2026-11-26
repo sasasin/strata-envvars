@@ -1,56 +1,52 @@
 # `STRATA_WDDM_BUDGET`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの内部動作と生成された SYCL 移植コードは対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Windows の HIP ビルドで、WDDM がこのプロセスに割り当てたローカル video memory budget を空き VRAM の見積もりに反映する処理を無効化します。既定では処理が有効です。Strata は HIP の `hipMemGetInfo` が返した `free_bytes` から、カード総量と DXGI budget の差を差し引きます。`total_bytes` は変更しません。
+Windows 上の HIP ビルドで、Strata が `cudaMemGetInfo`（HIP 互換層では `hipMemGetInfo`）から得た空き VRAM を、DXGI のプロセス別ビデオメモリ予算に合わせて小さく補正する処理を無効にするスイッチです。設定値が `atoi` で 0 になると補正を止めます。未設定時は補正を有効にします（`engine/src/core/device.cu:115-127,191-217`）。
 
-この値を参照するのは `STRATA_USE_HIP && _WIN32` の実装です。Windows CUDA、Linux の HIP、その他の build では、この環境変数を読むこの処理は有効になりません。
+このラッパーを通るメモリ情報の空き量が変わり、例えば expert cache の空き容量判定に使われます。変数自体が GPU メモリを割り当てたり、モデルや生成内容を選んだりはしません（`engine/include/strata/hip_compat/cuda_runtime.h:88-99`; `engine/src/core/expert_cache.cpp:99-114,619-638`）。
 
 ## 値と判定
 
-コードは値全体を検証せず、C の `std::atoi` で `int` に変換し、変換結果が `0` かどうかだけを見ます。
+実装は `std::getenv` の結果を関数内 `static const bool` に一度保存し、設定されていて `std::atoi(v) == 0` のときだけ補正を無効にします。文字列全体の数値妥当性は検査しません。`atoi` が先頭の整数部分を読める文字列では、その整数が 0 かどうかで判定し、整数として読めない文字列も 0 として無効化側になります。空文字も 0 です。空白の後の `0` や `0anything` は無効化、`1`・`true`・`-1` は補正を有効にし、`0.5` は先頭整数が 0 のため無効化します。整数変換の範囲外の文字列について、コードに明示的な検査や fallback はありません（`engine/src/core/device.cu:194-198`）。
 
-| 環境変数 | `off` の値 | free VRAM 調整 |
-|---|---|---|
-| 未設定 | `false` | 有効（既定） |
-| 空文字 | `true`（`atoi("") == 0`） | 無効 |
-| 数字で始まらない文字列 | `true`（変換結果 0） | 無効 |
-| `0`、`00`、`0suffix` | `true` | 無効 |
-| `1`、`1suffix`、`-1` | `false`（変換結果が非 0） | 有効 |
-
-先頭の空白と符号は `atoi` の変換規則に従い、数字列の後ろにある文字列は判定されません。したがって、これは「`0` のときだけ無効」ではなく、「`atoi` の結果が 0 なら無効」です。`atoi` の変換範囲外の値について、Strata 側に検証や fallback はありません。
+| ビルド・経路 | unset | 補正を無効にする値 | 補正を有効にする値 |
+|---|---|---|---|
+| Windows + HIP (`STRATA_USE_HIP`、`_WIN32`) | 有効 | `0`、空文字、`true`、`0anything`、`0.5` など `atoi` 結果が 0 の値 | `1`、`-1` など `atoi` 結果が非 0 の値 |
+| CUDA、Linux HIP、通常の Intel Arc SYCL | 対象処理なし | 対象処理なし | 対象処理なし |
 
 ## 有効になる条件
 
-- Windows (`_WIN32`) かつ HIP (`STRATA_USE_HIP`) の build であること。
-- `cudaMemGetInfo` に null ではない二つの出力ポインターを渡し、最初の呼び出しで `off` が初期化されること。
-- `hipMemGetInfo` が成功し、環境変数で無効化されていないこと。
-- 現在の HIP device と DXGI adapter の対応を取得でき、`QueryVideoMemoryInfo` が成功し、DXGI の `local.Budget` が 0 より大きく、HIP の `total_bytes` 未満であること。
-
-条件を満たさない場合は、HIP が返した `free_bytes` をそのまま返します。DXGI DLL、adapter、budget 情報を使えない場合にも、Strata は別の見積もりで置き換えません。
+- 対象の補正コードは `STRATA_USE_HIP` と `_WIN32` の両方が定義されたビルドに限られます。HIP 互換ヘッダーはその場合 `cudaMemGetInfo` を Strata の `strata::hip_compat::mem_get_info` に割り当てます。CUDA ビルドは NVIDIA の API を使い、Linux HIP は HIP の API に直接割り当てます（`engine/src/core/device.cu:115,191-198`; `engine/include/strata/hip_compat/cuda_runtime.h:88-99`）。
+- 変数が未設定または `atoi` 結果が非 0 でも、HIP のメモリ情報取得が成功し、現在の HIP device を取得でき、DXGI adapter とローカルメモリ予算を取得できる必要があります。adapter が見つからない、DXGI 問い合わせが失敗する、予算が 0、または予算が総 VRAM 以上の場合、元の `hipMemGetInfo` の値を返します（`engine/src/core/device.cu:198-209`）。
+- `STRATA_WDDM_BUDGET=0`（または同じく `atoi` 結果が 0）なら、メモリ取得が成功しても DXGI による差し引きと予算ログを行いません。CLI 引数や他の環境変数による上書きは、この読み取り箇所にはありません（`engine/src/core/device.cu:194-217`）。
+- SYCL ソースにも同じ実装がありますが、こちらも `STRATA_USE_HIP && _WIN32` の条件内です。標準の Intel Arc SYCL 経路はこの条件に該当しません。環境変数一覧の `AMD, Intel Arc` という適用先表示は、このコード条件とは一致しません（`engine/sycl/src/core/device.dp.cpp:148-151,224-251`; `engine/CMakeLists.txt:23-31`）。
 
 ## 実行時の詳細
 
-Windows HIP 用互換ヘッダーは `cudaMemGetInfo` を `strata::hip_compat::mem_get_info` に割り当てます。そのため、エンジン各所の空きメモリー照会はこの関数を通り、値は device のメモリー情報や expert cache、その他の GPU バッファーの空き容量見積もりに使われます。たとえば `device_info()` は返された free/total を `DeviceInfo` に保存し、起動時のメモリー計画表示に使います。キャッシュ自動サイズ決定なども `cudaMemGetInfo` または `device_free_bytes()` を利用します。
+最初に有効な引数で `mem_get_info` が呼ばれたときに環境値を読み、`static` に保存します。その後プロセス内で環境値を変更しても判定は更新されません。NULL の出力ポインターで呼ばれた場合は直接 `hipMemGetInfo` を呼んで戻るため、その呼び出しだけでは環境値の `static` 判定を初期化しません（`engine/src/core/device.cu:191-198`）。
 
-環境変数の判定結果は関数内の `static const bool off` に保存され、最初の有効な引数での呼び出し時に一度だけ読み取られます。その後プロセス内で環境を書き換えても反映されません。無効でない場合、毎回現在の HIP free/total を取得し、現在の device の DXGI local budget を問い合わせます。budget が使えるときは `withheld = total_bytes - local.Budget` を計算し、`free_bytes` から差し引きます。差し引く量が free より大きい場合は 0 にします。成功した最初の調整時だけ、次の stderr ログを出します。
+補正が有効な場合、Strata は `total_bytes - DXGI local.Budget` を差し引き量とし、HIP が返した `free_bytes` からそれを引きます。空き量が差し引き量以下なら 0 にします。総量や予算、HIP runtime の値自体はこの補正では書き換えません。各 GPU の DXGI adapter は初回検索結果を保持し、予算補正のログはプロセス内で一度だけ出します（`engine/src/core/device.cu:143-168,204-217`）。
+
+この値は `device_info` の空き・総量表示にも入り（`engine/src/core/device.cu:282-285`; `engine/src/core/device_main.cpp:68-79`）、expert cache は空き量を確認して要求容量が足りなければ `ExpertCache::open` を失敗させ、「Lower --expert-cache.」を含む理由を返します。空きメモリ照会そのものに失敗した場合、`device_free_bytes` は空き量を 0 とし、エラー理由を一種類につき一度 stderr に出します（`engine/src/core/expert_cache.cpp:99-114,619-638`）。
+
+## ログと測定値
+
+DXGI による差し引きが実行される最初の成功時に、stderr に次の形式で一度出します。`STRATA_WDDM_BUDGET` により補正が無効な場合、または前述の条件を満たさず差し引きが行われない場合、このログは出ません（`engine/src/core/device.cu:204-217`）。
 
 ```text
-strata: Windows budgets N of this card's M MiB for this process; free VRAM is counted within that (STRATA_WDDM_BUDGET=0: off)
+strata: Windows budgets <予算 MiB> of this card's <総量 MiB> MiB for this process; free VRAM is counted within that (STRATA_WDDM_BUDGET=0: off)
 ```
 
-## 文書との照合
-
-`docs/AMD_HIP.md` は Windows HIP で `hipMemGetInfo` の free 値を Windows の video memory budget に合わせて引き下げることと、`STRATA_WDDM_BUDGET=0` で無効化できることを説明しています。実装上は `atoi(...) == 0` による判定なので、空文字や数字で始まらない文字列も無効化します。資料にある RX 6800 の速度比較は既存の報告値であり、この調査で再測定した値ではありません。
+`docs/AMD_HIP.md:148-150` の説明は、Windows HIP の空き量をプロセス予算に合わせて減らし、`STRATA_WDDM_BUDGET=0` で止めるという現行実装と一致します。ここでは測定値を追加しません。
 
 ## 根拠
 
-- `include/strata/hip_compat/cuda_runtime.h:84-95` — Windows HIP で `cudaMemGetInfo` を Strata の互換関数へ割り当てる条件。
-- `src/core/device.cu:106-127,182-209` — Windows HIP 限定の関数、環境変数判定、DXGI budget 取得、free 値の補正とログ。
-- `src/core/device.cu:134-159` — device ordinal から DXGI adapter を取得し、一度試した adapter を保存する処理。
-- `src/core/device.cu:247-279` — `device_info()` の free/total 取得。
-- `src/core/expert_cache.cpp:28-30,490-491` — `device_free_bytes()` が `cudaMemGetInfo` を呼ぶ経路。
-- `src/program/generate.cpp:4801-4828` — expert cache 自動サイズ決定時に使う空き容量と Windows HIP の予約量判定。
-- `docs/AMD_HIP.md:92-98` — 仕様説明と報告された RX 6800 の比較。速度値は測定条件付きの文書記載であり、本調査による検証ではない。
+- `engine/src/core/device.cu:115-127,191-217` — Windows HIP 実装、値の判定、DXGI 問い合わせ、差し引き、ログ。
+- `engine/include/strata/hip_compat/cuda_runtime.h:88-99` — Windows HIP 時の `cudaMemGetInfo` の割り当て。
+- `engine/src/core/expert_cache.cpp:99-114,619-638` — 空き量の利用、照会失敗時の扱い、cache 容量不足の失敗。
+- `engine/src/core/device.cu:282-285`; `engine/src/core/device_main.cpp:68-79` — device 情報としての空き・総量の取得と表示。
+- `engine/sycl/src/core/device.dp.cpp:148-151,224-251`; `engine/CMakeLists.txt:23-31` — SYCL 側コードの条件と Intel Arc SYCL のビルド入口。
+- `docs/AMD_HIP.md:148-150` — 補正と無効化スイッチの説明。

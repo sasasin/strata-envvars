@@ -1,43 +1,50 @@
 # `STRATA_SELECT_GEMM`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-SYCL の indexed QSA prompt prefill で、pooled indexer key と複数 query の block score を計算する方法を選びます。GEMM 経路は oneMKL FP32 GEMM と `qsa_block_scores_reduce` を使い、通常経路は tensor-core score kernel が使えればそれを使い、使えない場合は warp kernel に進みます。対象名を読む実装は `sycl/src/prefill/prefill.cpp` のみです（3367 行）。
+SYCL prefill 中の QSA block selection で、pooled indexer keys と indexer queries のスコア計算に oneMKL FP32 GEMM を使うかを選ぶ。`1` 以上ならカード世代・active block 数に関係なく GEMM を選択し、`0` は warp scorer に固定する。未設定または負数は自動選択となり、既定では active blocks が閾値以上の Battlemage GPU だけが GEMM 候補になる。選んだスコアから `qsa_block_topk` が selection ID を作るため、経路は prompt の選択結果に関わる。CUDA/HIP の同名変数読み取りはなく、この制御は SYCL prefill の実装に限られる。`engine/sycl/src/prefill/prefill.cpp:3666-3719`
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換され、結果で分岐します。文字列全体の妥当性検査はありません。
+値は `std::getenv` で読み、未設定は `-1`、設定時は `std::atoi` で整数化する。文字列全体の妥当性検査はなく、先頭の整数変換結果だけで `> 0` / `< 0` / `== 0` を判定する。したがって空文字、`true`、`false`、`0anything` は `0` となり warp 固定、`1anything` は `1` となり GEMM を要求する。先頭の空白や符号は `atoi` の変換規則に従う。数値に変換できない文字列も `0` になる。`engine/sycl/src/prefill/prefill.cpp:3685-3688`
 
-| 環境値 | `atoi` の結果 | 選択モード |
+| `STRATA_SELECT_GEMM` の状態 | mode | 選択判定 |
 |---|---:|---|
-| unset | −1（既定値） | 自動選択。active block 数がしきい値以上で、GPU 世代が Battlemage のとき GEMM を選ぶ |
-| `0`、空文字、整数に変換できない文字列 | 0 | 自動選択をせず、GEMM を選ばない |
-| 正の整数（例: `1`, `2`） | 正数 | 自動選択条件によらず GEMM を要求する |
-| 負の整数（例: `-1`, `-2`） | 負数 | unset と同じ自動選択 |
+| unset | `-1` | `STRATA_SELECT_GEMM_MIN` 以上の active blocks かつ Battlemage なら GEMM 候補 |
+| `0` に変換される値（例: `0`, 空文字, `false`, `0anything`） | `0` | warp scorer を使用 |
+| 正数に変換される値（例: `1`, `2`, `1anything`） | 正数 | 常に GEMM を候補にする |
+| 負数に変換される値（例: `-1`, `-2`） | 負数 | unset と同じ自動選択 |
 
-`atoi` のため、先頭の空白や符号を含む整数表記は変換され、整数の後ろに続く文字列は判定されません（例: `1xyz` は 1、`0xyz` は 0）。`true` など数値変換できない文字列は 0 です。範囲外の整数表記に対する結果はこの実装で検査・制限されません。自動選択のしきい値は別変数 `STRATA_SELECT_GEMM_MIN` で、unset 時は 2,048 blocks です。
-
-根拠: `sycl/src/prefill/prefill.cpp:3367-3370`。
+自動選択の閾値 `STRATA_SELECT_GEMM_MIN` も同じ場所で一度だけ `std::atoll` され、unset 時は `2048` blocks。設定値に clamp や明示的な検証はないため、閾値以上かどうかをその変換値で比較する。`engine/sycl/src/prefill/prefill.cpp:3686-3688`
 
 ## 有効になる条件
 
-- この読み取り箇所は SYCL の prefill 実装にあります。トップレベルでは `STRATA_ENABLE_SYCL` が有効なとき SYCL を別 backend として構成し、CUDA/HIP と同時には有効にできません。CUDA/HIP・Metal の実装がこの名前を読む箇所は見つかりません（`CMakeLists.txt:12-21`; 全参照検索結果は `sycl/src/prefill/prefill.cpp:3363-3369`）。
-- 自動選択（unset または負数）には、対象バッチの `active` が `STRATA_SELECT_GEMM_MIN` 以上であることと、デバイス世代が `Battlemage` であることの両方が必要です。`active` は当該バッチ最後の query の `n_bid + 1` です（`sycl/src/prefill/prefill.cpp:3350-3355,3368-3370`）。
-- 正数はこの自動選択条件を迂回しますが、実際の GEMM 実行には `STRATA_SELECT_OLD` が未設定、attention scratch が存在、index dimension が 128、index head 数が 4、計算された `sel_tile` が 256 以上であることも必要です。これらを満たさない場合は GEMM を実行せず通常の score 経路へ進みます（`sycl/src/prefill/prefill.cpp:3356-3357,3371-3375`）。
-- `STRATA_SELECT_OLD` は値の内容ではなく設定の有無で判定され、空文字でも旧選択を有効にします。この場合 GEMM と tensor-core score の両方を通らず、warp kernel に進みます（`sycl/src/prefill/prefill.cpp:3356-3357,3395-3399`）。
+- GEMM 判定は `engine/sycl/src/prefill/prefill.cpp` の SYCL `Prefill::run_impl` 内にある。非 SYCL 実装にはこの環境変数の読み取りがない。`engine/sycl/src/prefill/prefill.cpp:2692-2694, 3685-3688`
+- unset / 負数の自動選択では、`active >= STRATA_SELECT_GEMM_MIN` かつ `strata::intel_gpu_gen(...) == Battlemage` が必要。デバイス世代判定は `STRATA_INTEL_GEN` による override を受けるため、同変数で `battlemage` を指定すれば自動選択条件に影響し、`unknown` なら Battlemage 条件を満たさない。`engine/sycl/src/prefill/prefill.cpp:3687-3688`; `engine/sycl/include/strata/sycl_queue.hpp:141-156`
+- `STRATA_SELECT_GEMM=0` は自動選択条件を無視して GEMM 判定を false にする。正数は閾値と GPU 世代の条件を無視して GEMM 候補にする。
+- GEMM 候補でも、`STRATA_SELECT_OLD` が設定されている場合は GEMM 経路を使わず warp scorer へ進む。値の内容ではなく設定有無を見ている。`engine/sycl/src/prefill/prefill.cpp:3674-3675, 3692-3717`
+- さらに `m.attn_scratch != nullptr`、QSA shape が `idx_dim == 128` かつ `idx_n_head == 4`、計算された `sel_tile >= 256` が必要。条件に合わない場合は GEMM を試さず既存 scorer に進む。`engine/sycl/src/prefill/prefill.cpp:3689-3694`
+- GEMM が使えない、または試行後に完了しなかった場合、既存の tensor-core scorer が利用可能ならそちらを試し、それも使えない場合は warp scorer に fallback する。`STRATA_SELECT_GEMM` はこの fallback を無効にしない。`engine/sycl/src/prefill/prefill.cpp:3713-3717`
 
 ## 実行時の詳細
 
-`STRATA_SELECT_GEMM` と `STRATA_SELECT_GEMM_MIN` はどちらも関数内の `static const` で初回評価結果を保存します。実行中に環境を変えても同じプロセスでは再評価されません。読み取りはこの indexed QSA selection loop に初めて到達したときに行われます（`sycl/src/prefill/prefill.cpp:3350-3369`）。
+環境値は `Prefill::run_impl` 内の関数局所 `static` 初期化子で読み取られる。最初にその選択コードへ到達したときの値がプロセス内で cache され、同じプロセスで後から環境を変更しても反映されない。`STRATA_SELECT_GEMM_MIN` も同様に cache される。CLI 引数や設定ファイルから値を上書きする処理は、この変数の参照経路にはない。`engine/sycl/src/prefill/prefill.cpp:2693-2697, 3685-3688`
 
-GEMM 条件が成立すると、`active` blocks を `sel_tile` ごとに処理し、oneMKL GEMM の出力を `qsa_block_scores_reduce` に渡します。成功すればその結果で top-k selection を行います（`sycl/src/prefill/prefill.cpp:3371-3388,3400-3401`）。GEMM から例外が出た場合、stderr に `prefill: the GEMM block scores failed (%s); the warp kernel instead` を一度だけ出し、warp kernel に fallback します。GEMM を使わない場合も、旧選択が有効でなければ先に tensor-core score kernel を試し、それが使えない場合に warp kernel を呼びます（`sycl/src/prefill/prefill.cpp:3389-3399`）。この変数による独立した終了・エラー経路は確認できません。
+GEMM 経路では active blocks を `sel_tile` 幅の区間に分け、各区間で oneMKL の column-major FP32 GEMM を実行してから `qsa_block_scores_reduce` に渡す。全区間の処理後に `sel_done` を立て、その score を `qsa_block_topk` が選択 ID に変換する。GEMM の `std::exception` は握りつぶさず理由を stderr に一度だけ出し、その回は既存 scorer に fallback する。`engine/sycl/src/prefill/prefill.cpp:3689-3719`
+
+## ログと測定値
+
+通常の unset / warp / GEMM 選択を通知するログはない。GEMM 中の例外時には、プロセスで最初の一度だけ stderr に次を出し、warp scorer に fallback する。
+
+```text
+prefill: the GEMM block scores failed (<例外文字列>); the warp kernel instead
+```
+
+文字列は `engine/sycl/src/prefill/prefill.cpp:3707-3711`。ソースコメントには特定 GPU / prompt 長での速度・スコア差の記述があるが、測定条件の全体をこの実装から確定できないため、一般的な性能値としては記載しない。
 
 ## 根拠
 
-- 候補名の唯一の参照と `atoi` による読み取り: `sycl/src/prefill/prefill.cpp:3367`。
-- unset の既定値、関連しきい値、Battlemage 判定: `sycl/src/prefill/prefill.cpp:3368-3370`。
-- GEMM 実行条件、処理、例外時ログと fallback: `sycl/src/prefill/prefill.cpp:3371-3399`。
-- GEMM 後の top-k と通常経路: `sycl/src/prefill/prefill.cpp:3395-3401`。
-- SYCL backend のビルド入口: `CMakeLists.txt:12-21`。
+- `engine/sycl/src/prefill/prefill.cpp:3666-3719` — active block の計算、旧 scorer の優先、環境変数の読み取り、GEMM eligibility・計算・fallback・top-k。
+- `engine/sycl/include/strata/sycl_queue.hpp:141-156` — 自動判定に使う Intel GPU 世代と `STRATA_INTEL_GEN` override。

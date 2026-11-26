@@ -1,57 +1,55 @@
 # `--no-pool`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン、root） |
+| コマンド | `strata generate`（SYCL エンジン） |
 | オプション | `--no-pool` |
 | 別名 | なし |
-| 値 | 取らない真偽フラグ。指定すると有効 |
+| 値 | 取らないフラグ。指定すると有効 |
 
 ## 役割
 
-CPU expert pool を推論経路から外すための診断・比較用フラグです。GPU 側の下限を測る目的で用意されています。通常のモデル推論では routed expert の計算を欠くため、通常設定で得るモデル出力との比較や品質評価に使うフラグではありません。parser は値なしで `no_pool` を true にします（`src/program/generate.cpp:507-508,2504-2505`）。
+CPU expert pool を使わず、GPU 側だけの経路を実行する診断用フラグです。通常の expert pool を用いた生成と同じ結果を得る設定ではありません。`--no-capture` と組み合わせると、CPU expert pool の hook がない `session_token` 経路を明示的に選ぶ条件を満たします。parser は `Options::no_pool` を `false` で初期化し、このフラグを読むと `true` にします（`engine/sycl/src/program/generate.cpp:530,941,1970`）。
 
 ## 使い方
 
-```text
-strata [通常の生成引数] --no-pool
+```sh
+strata generate --pack /path/to/pack --tokens "1,2,3" --no-pool
 ```
 
-`[通常の生成引数]` は説明用プレースホルダーで、実行時にはモデルなど通常必要な引数を指定します。エンジンの usage はこのフラグを「CPU expert pool を飛ばす」と記載しています（`src/program/generate.cpp:967`）。
+この例は GPU-only の診断経路を指定します。pack と token 入力は `strata generate` の必須入力です（`engine/sycl/src/program/generate.cpp:802-806`）。
 
 ## 値と既定値
 
-- 引数値は不要です。未指定時は `false`（pool を無効化しない）、指定時は `true` です（`src/program/generate.cpp:508,2505`）。
-- 値の形式・範囲 validation や複数回指定時の専用処理はありません。parser は一致する引数を見つけるたびに true を設定します。
-- SYCL 側 parser も同じフラグを値なしで受理し、既定値も false です（`sycl/src/program/generate.cpp:491,1846`）。
+値は不要です。省略時は `no_pool == false` で、指定時は `true` になります。数値や文字列の validation はありません。同じフラグを複数回指定しても同じ真偽値を代入するだけです。値を続けて書く構文はありません（`engine/sycl/src/program/generate.cpp:530,1970`）。
 
 ## 実行時の動作
 
-- layer loop に渡す CPU pool callback と user pointer を null にし、GPU expert-cache hit callback も無効化します（`src/program/generate.cpp:6928-6933`）。したがって cache を指定していても、この条件では GPU cache hit 経路も走りません（hit 用 scratch の確保条件は `src/program/generate.cpp:6838-6848`）。
-- プロンプト処理では CPU share を arm せず、単一 GPU 経路であっても prefill に CPU pool を設定しません（`src/program/generate.cpp:15702-15705,15781-15784`）。
-- pool 自体の初期化・worker 数の取得はこの分岐より前に行われるため、フラグが pool worker thread の生成や初期化コストを必ずなくすとは限りません。ログにも worker 数が出て、フラグ指定時は ` (UNUSED: --no-pool)` が付加されます（`src/program/generate.cpp:6934-6936`）。
-- 出力を「GPU-only floor」と呼ぶのはソース内の説明ですが、このフラグ単体が GPU 上の全処理を実行する／計測する保証ではありません。実装上は CPU expert pool と関連 hit hook を外す指定です。
+parser が値を保持し、実行準備時に `pool_fn` と `pool_user` を null にします。また `hit_fn` も null になり、VRAM expert cache の hit 計算 hook は使われません（`engine/sycl/src/program/generate.cpp:5933-5938`）。`session_loop` は GPU の doorbell を待つ一方、pool 関数は null でない場合に限って呼びます（`engine/sycl/src/core/session.cpp:995-1016`）。このため routed expert の CPU 計算を省いた診断経路となり、通常の expert pool を使ったモデル生成と結果が同等であることは保証されません。
+
+実行時には pool worker 数を stderr に出し、フラグ指定時は ` (UNUSED: --no-pool)` を添えます（`engine/sycl/src/program/generate.cpp:5939-5941`）。
 
 ## 適用条件と副作用
 
-- `--expert-cache-remote` の CUDA0 側 slot 数が正の場合、expert profile、CUDA0 expert cache、expert pool が必要という検査にこのフラグも含まれ、stderr に理由を出して終了コード 2 で拒否します（`src/program/generate.cpp:6666-6670`）。
-- `--dump-routing` と併用すると、routing ID が pool の doorbell 経由で host に届く前提を満たせないため、ファイルを開く前に stderr へエラーを出し、終了コード 2 で拒否します（`src/program/generate.cpp:6878-6880,6914-6920`）。
-- `--no-capture` と併用する場合は `--no-pool` も必要です。`--no-capture` 単独では routed expert が欠落するため、逆にこのフラグがない組合せは stderr の説明とともに終了コード 2 になります（`src/program/generate.cpp:6968-6979`）。
-- pool を外すため routed experts が通常どおり CPU で計算されず、GPU expert-cache hit callback も無効になります。したがって生成結果の意味が変わります。測定用途では「通常の生成結果」ではなく、pool 無効時の比較値として扱ってください（`src/program/generate.cpp:6928-6933,6970-6978`）。
+- `--no-capture` だけを指定し、このフラグを付けない場合、`session_token` には CPU expert pool hook がなく routed experts が寄与しないため、処理は stderr に理由を出して終了コード `2` で拒否されます。`--no-capture --no-pool` はこの拒否条件を満たさず、フラグのコメントもこれを GPU-only floor の明示指定として説明しています（`engine/sycl/src/program/generate.cpp:5970-5984`）。
+- remote experts を有効にした場合、expert profile、CUDA0 expert cache、expert pool が必要です。`--no-pool` を併用すると stderr に要件を出して終了コード `2` になります（`engine/sycl/src/program/generate.cpp:5664-5669`）。
+- `--dump-routing PATH` との併用は拒否されます。stderr に理由を出して終了コード `2` で戻るため、この分岐では出力ファイルを開きません。pool が読む doorbell 経由で routed IDs を host に渡す仕組みに依存するためです（`engine/sycl/src/program/generate.cpp:5919-5929`）。
+- `--no-pool` 単独について、ソース上の追加ファイル書き込み・ネットワーク動作は確認できません。ほかの出力オプションの副作用はそれぞれのオプションに従います。
 
 ## 出力とエラー
 
-このフラグ単独に対する専用エラーや終了コード変更はありません。上記の `--expert-cache-remote`、`--dump-routing`、`--no-capture` との条件違反は stderr に診断を出して終了コード 2 になります（`src/program/generate.cpp:6667-6670,6916-6920,6974-6979`）。通常の進行時は expert-pool worker 数の stderr ログに未使用表示が付きます（`src/program/generate.cpp:6934-6936`）。
+`--no-pool` 固有の成功時出力は、stderr の worker 数表示に付く ` (UNUSED: --no-pool)` です。上記の `--no-capture` 条件、remote experts、`--dump-routing` との不整合は、いずれも診断を stderr に出して終了コード `2` を返します（`engine/sycl/src/program/generate.cpp:5665-5668,5921-5924,5939-5941,5979-5984`）。未知の引数は別途 `unknown argument` と usage を stderr に出し終了コード `2` です（`engine/sycl/src/program/generate.cpp:2214-2219`）。
 
 ## 根拠
 
-- 主 parser と既定値: `src/program/generate.cpp:507-508,2504-2505`。SYCL parser と既定値: `sycl/src/program/generate.cpp:491,1846`。
-- 表示上の説明: `src/program/generate.cpp:967`。
-- pool callback、hit callback、および未使用 worker ログ: `src/program/generate.cpp:6838-6848,6928-6936`。
-- remote expert / routing dump / no-capture の制約: `src/program/generate.cpp:6666-6670,6878-6880,6914-6925,6968-6979`。
-- prompt CPU pool の適用条件: `src/program/generate.cpp:15702-15705,15781-15784`。
+- `engine/sycl/src/program/generate.cpp:530,941,1969-1971` — option state の初期値、usage 表示、parser 登録。
+- `engine/sycl/src/program/generate.cpp:5664-5669` — remote experts との適用条件と失敗経路。
+- `engine/sycl/src/program/generate.cpp:5919-5941` — routing dump の拒否、pool/hit hook の選択、stderr 表示。
+- `engine/sycl/src/program/generate.cpp:5970-5984` — `--no-capture` との条件と失敗経路。
+- `engine/sycl/src/core/session.cpp:995-1016` — doorbell payload 待機後、pool callback を条件付きで呼ぶ処理。
+- 配置と scope は `docs/cli/README.md:1036-1041,1153`、tool ID と parser 所在は `docs/cli/000_cli_tools.md:10` を確認しました。
 
-調査範囲はこの checkout の CUDA 実装と対応する SYCL parser・主要な共通動作です。全 backend の実行結果や Release 配布物との照合は行っていません。CLI `--help` の実行、build、GPU 実行、性能測定、テストは行っていません。
+調査範囲はこの checkout の Strata 所有ソースです。既存バイナリの `--help` は実行していません。オプションの parser と利用箇所はソースで確認しました。

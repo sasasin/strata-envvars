@@ -1,50 +1,44 @@
 # `STRATA_WMMA_BF16`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-HIP の prompt 用 BF16 dense GEMM で、RDNA3 / RDNA3.5 向け WMMA kernel を使うかどうかを制御します。この変数は WMMA GEMM 全体を有効にするスイッチではありません。別変数 `STRATA_WMMA_GEMM` が有効なときに、BF16 GEMM も WMMA の候補に含める既定動作を切り替えます。`STRATA_WMMA_GEMM` が無効なら、この変数だけを設定しても BF16 WMMA は呼ばれません。根拠: `src/prefill/gemm.cu:629-636`。
+HIP ビルドの prefill BF16 GEMM で、専用 WMMA GEMM を試すかどうかを制御します。この変数単独では WMMA を有効にしません。別の `STRATA_WMMA_GEMM` が有効で、形状などの条件を満たした場合に限り、値が無効でないと専用 BF16 WMMA 関数を呼びます。関数が処理しない場合は通常の BF16 GEMM 経路へ進みます（`engine/src/prefill/gemm.cu:1154-1168,1183-1193,1295-1300`）。
+
+読み取りは `Gemm::bf16` にあり、HIP 用の `strata_prefill` に WMMA 実装を加える構成です（`engine/cmake/strata_gpu_engine.cmake:482-488`）。同じ HIP 条件付きの分岐は SYCL 側の BF16 GEMM 実装にもあります（`engine/sycl/src/prefill/gemm.dp.cpp:845-860`）。CUDA-only ビルドではこのゲートはコンパイルされません。
 
 ## 値と判定
 
-値全体や数値としての妥当性は parse せず、最初の1文字で判定します。
+`std::getenv` の結果を関数ローカル `static const bool` に保存し、文字列全体の parse ではなく、未設定かどうかと先頭 byte だけを判定します（`engine/src/prefill/gemm.cu:1162-1164`; `engine/sycl/src/prefill/gemm.dp.cpp:854-857`）。
 
-| `STRATA_WMMA_BF16` | BF16 WMMA の追加ゲート |
-|---|---|
-| 未設定 | 有効 |
-| 空文字 | 無効 |
-| 先頭文字が `0`（例: `0`, `0abc`） | 無効 |
-| それ以外（例: `1`, `true`, `false`, `2`） | 有効 |
+| 条件 | unset | WMMA BF16 を許可する値の例 | WMMA BF16 を許可しない値の例 |
+|---|---|---|---|
+| `STRATA_USE_HIP` が定義されたビルド | 許可（`getenv` が null なら true） | `1`, `true`, `false`, `no`, ` 0` | 空文字、`0`, `00`, `0anything` |
+| `STRATA_USE_HIP` が未定義 | この変数の判定コードなし | 該当なし | 該当なし |
 
-したがって、この変数の既定は「BF16 WMMA を許可」ですが、全体の WMMA は `STRATA_WMMA_GEMM` が別途有効な場合に限り候補になります。両方の判定は `static const bool` に保存されるため、各判定箇所で初回評価された後にプロセス環境を書き換えても反映されません。根拠: `src/prefill/gemm.cu:632-635`、同じ HIP 条件分岐を持つ `sycl/src/prefill/gemm.dp.cpp:751-758`。
+空文字は設定済みですが、先頭 byte が NUL なので false です。非空値は先頭が文字 `0` のときだけ false で、残りの文字、数値としての妥当性、空白、大文字小文字は検査しません。したがって `false` や `no` は先頭が `f` / `n` のため true、` 0` は先頭が空白のため true です。境界値・無効文字列のエラーや fallback はなく、単純にこの真偽値として扱われます。
 
 ## 有効になる条件
 
-`STRATA_WMMA_BF16` が有効で、さらに `STRATA_WMMA_GEMM` も有効なとき、`Gemm::bf16()` は次の条件を満たせば WMMA dispatch を試します。
-
-- `ldx <= K`（この場合 `Gemm::bf16()` が `ldx` を 0 に正規化する）。`ldx > K` の padded 入力では WMMA dispatch を試しません。
-- `T >= 16`。
-- `beta` が `0.0f` または `1.0f`。
-- WMMA 実装が現在の device を対応 gfx11 と判定し、`K` が 16 の倍数、`ldy >= N` など内部条件も満たす。
-
-内部 dispatch は `gfx1100`, `gfx1101`, `gfx1102`, `gfx1103`, `gfx1150`, `gfx1151` のみを対応対象とします。条件を満たさない場合は `false` を返して通常の GEMM 経路へ進みます。`STRATA_WMMA_GFX11` がビルド時に定義されなければ、実装ファイルの fallback stub も常に `false` を返します。根拠: `src/prefill/gemm.cu:624-638`、`src/prefill/wmma_gemm.cu:31-56,264-289,732-735`、`include/strata/kernels/gfx_arch.hpp:22-25`。
+- ビルドで `STRATA_USE_HIP` が定義されていること。HIP backend 以外ではこの変数を読む分岐がありません（`engine/src/prefill/gemm.cu:1159-1168`; `engine/sycl/src/prefill/gemm.dp.cpp:851-860`）。
+- 別の `STRATA_WMMA_GEMM` が同じ `Gemm::bf16` 実装で true と判定されること。これは未設定または空文字、先頭が `0` の値では false で、それ以外の非空値で true です（`engine/src/prefill/gemm.cu:1162-1164`）。
+- GEMM 呼び出しが初期の `T <= 0 || N <= 0` で return せず、正規化後の `ldx` が 0、`T >= 16`、`beta` が `0.0f` または `1.0f` であること（`engine/src/prefill/gemm.cu:1154-1165`）。`ldx <= K` は事前に 0 に正規化されます（同:1157-1158）。
+- `strata_wmma_gemm_bf16` が入力・寸法・デバイスなどの内部条件を受理すること。gfx11 のディスパッチは有効なポインター、正の寸法、`K % 16 == 0`、許容 beta、`ldy >= N` を要求します（`engine/src/prefill/wmma_gemm.cu:277-301`）。HIPCC で gfx11 以外の場合は別実装 `hip_unsloth_wmma_gemm_bf16` に渡されます（同:315-324）。いずれかが false を返すと呼び出し側は後続経路へ進みます。
 
 ## 実行時の詳細
 
-この環境変数を読む箇所は `Gemm::bf16()` 内の HIP 条件分岐です。`Gemm::bf16()` は通常の BF16 prompt projection などから呼ばれます（例: `src/prefill/prefill.cpp:1989-1994,2567-2577`）。対応条件を通ると BF16 入力を WMMA intrinsic で積和し、FP32 出力 `Y` を計算して通常経路へ戻ります。`T` と `N` がともに32以上なら 64×64 tile の kernel、それ以外は 16×16 tile の kernel を選びます。`K` の端数は内部 dispatch 条件で拒否されます。根拠: `src/prefill/wmma_gemm.cu:75-85,88-148,150-262,264-301`。
+対象は BF16 の prefill GEMM だけです。ゲートを通り専用関数が true を返した場合に限り、その GEMM は早期 return します。`engine/src/prefill/gemm.cu` ではそうでない場合、HIPBLASLt が利用可能ならその経路を試し、続いて条件に合えば RDNA2 用の SGEMM 変換経路を試し、最後はネイティブ BF16 `cublasGemmEx` 呼び出しへ進みます（同:1164-1168,1183-1193,1295-1300）。SYCL ソースでは決定的 BF16 経路、HIPBLASLt（HIPCC かつ利用可能な場合）、staging 経路を順に試し、最後は `dpct::blas::gemm` へ進みます（`engine/sycl/src/prefill/gemm.dp.cpp:875-945`）。この変数が false でも BF16 GEMM 自体を停止しません。
 
-WMMA 呼び出しが成功した場合はその場で return します。対応外の device / shape / parameter では後続経路へ進みます。HIP の `f16_io_` が有効なら、まず BF16 weight を FP16 scratch へ変換する経路を通ります。そうでなければ、HIPBLASLt が利用可能で dispatch が受理すると hipBLASLt、それ以外は通常の BF16 GEMM fallback になります。`f16_io_` 用経路も WMMA 判定より後にあるため、WMMA 判定が成功する条件では先に return します。根拠: `src/prefill/gemm.cu:634-660,720-725`。
+値は `Gemm::bf16` が初期寸法チェックを通過して HIP 用ゲートに到達した際に初めて読み取られ、関数ローカル `static` に一度だけ保存されます。以降の同じプロセス内の呼び出しでは環境を読み直さないため、その後の環境変更は反映されません。寸法チェックで先に return した呼び出しではまだ初期化されません（`engine/src/prefill/gemm.cu:1154-1164`; `engine/sycl/src/prefill/gemm.dp.cpp:845-857`）。
 
-CUDA ビルドではこの環境変数を読むコードは実行されません。WMMA ソースは CMake 上 HIP build の場合だけ `strata_prefill` に追加され、gfx11 用のビルドでは `STRATA_WMMA_GFX11` が設定されます。根拠: `CMakeLists.txt:607-611`、`cmake/hip_backend.cmake:85-98`。SYCL 側にも同じ判定があり、`sycl/src/prefill/gemm.dp.cpp:751-760` の `STRATA_USE_HIP` 分岐内で使われます。
+## ログと測定値
 
-この変数について、`docs/DETAILS.md` や `docs/AMD_HIP.md` に個別の速度測定値や品質測定値は見当たりません。ここでは性能・出力の同一性を主張しません。
+このスイッチの読み取り、有効化、無効化、または WMMA 関数の false 戻りを知らせるログはありません。ゲートが通らない場合は上記の通常経路へ進みます。そこで別の条件によるエラーが発生し得ますが、この変数に固有の失敗として扱うコードはありません（`engine/src/prefill/gemm.cu:1164-1168,1183-1193,1295-1300`）。`docs/DETAILS.md` にこの変数固有の測定値は見当たりません。
 
 ## 根拠
 
-- 読み取り、既定値、併用ゲート、入力 stride と `T` / `beta` 条件: `src/prefill/gemm.cu:624-638`
-- HIP/SYCL 系の同等分岐: `sycl/src/prefill/gemm.dp.cpp:746-760`
-- gfx11 WMMA の build/runtime gate、shape 条件、tile 選択、BF16 intrinsic: `src/prefill/wmma_gemm.cu:31-56,75-85,264-301`
-- 対応 gfx arch: `include/strata/kernels/gfx_arch.hpp:22-25`
-- HIP build への WMMA ソース追加と gfx11 compile macro: `CMakeLists.txt:607-611`、`cmake/hip_backend.cmake:85-98`
-- BF16 projection 呼び出し例: `src/prefill/prefill.cpp:1989-1994,2567-2577`
+- `engine/src/prefill/gemm.cu:1154-1168,1183-1193,1295-1300` — HIP 用ゲート、値の読み取り、失敗時の後続処理。
+- `engine/sycl/src/prefill/gemm.dp.cpp:845-860` — SYCL 側ソースにある同じ HIP 条件付き読み取り。
+- `engine/src/prefill/wmma_gemm.cu:277-324` — gfx11 ディスパッチ条件と gfx11 以外の委譲。
+- `engine/cmake/strata_gpu_engine.cmake:482-488` — `strata_prefill` と HIP 時の WMMA 実装の組み込み。

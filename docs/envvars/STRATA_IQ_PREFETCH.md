@@ -1,43 +1,52 @@
 # `STRATA_IQ_PREFETCH`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CPU の i-quant expert row カーネルが、重みブロックの読み取りに先立って発行するソフトウェアプリフェッチの先読み距離をバイト単位で指定します。AVX1、AVX2（AVX-VNNI を含む）、AVX-512 の各実装に同じ名前の設定があります。プリフェッチ命令には `_MM_HINT_T0` が指定されます。設定は算術結果や出力値を直接変更しません。
+Strata の x86 CPU expert row kernels が、重みブロックの読み取り中に現在のブロックから何 byte 先をソフトウェア prefetch するかを指定する。AVX1、AVX2、AVX-512 の各実装で `std::getenv` から読み、正の値なら現在の重みブロック `blk` から `N` byte と `N+64` byte の 2 箇所に `_MM_HINT_T0` の prefetch を要求する。0 以下ではこの要求を行わない。行の積和計算、expert の選択、出力値を直接変更する分岐ではない（`engine/src/kernels/cpu/iq_avx1.cpp:133-145,239-245`; `engine/src/kernels/cpu/iq_avx2.cpp:178-195`; `engine/src/kernels/cpu/iq_avx512.cpp:48-53,216-224`）。
+
+この変数が使われるのは native CPU expert dispatcher が対応 kernel を選んだ場合だけである。AVX2 側は gate/up i-quant rows と IQ4_NL down rows、AVX-512 側は gate/up i-quant rows と Q5_0 down rows、AVX1 側は gate/up rows と IQ4_NL / Q2_0 down rows に組み込まれている（`engine/src/kernels/cpu/native_expert.cpp:681-708,820-835,840-844`; `engine/src/kernels/cpu/iq_avx1.cpp:310-326,345-361,394-444`; `engine/src/kernels/cpu/iq_avx2_rows.inl:618-625`; `engine/src/kernels/cpu/iq_avx512.cpp:795-807`）。pool の native expert 経路から dispatcher が呼ばれる（`engine/src/kernels/cpu/pool.cpp:1290-1309`）。
 
 ## 値と判定
 
-各実装は `std::getenv()` の値を `std::atoi()` で整数に変換します。文字列全体の妥当性検査や範囲 clamp はありません。
+各実装は `std::getenv` の返す文字列を `std::atoi` に渡す。未設定だけが既定値 `2048` になる。空文字は設定済みなので `atoi("") == 0` となり prefetch を無効にする。文字列全体の検証や上限 clamp はなく、`atoi` が先頭から変換できる整数を返すため、例として `64tail` は 64、`true`・空白だけ・`0anything` は 0、`-1` は負値になる。先頭の空白や符号は `atoi` の規則で扱われる。大文字小文字の比較はない。数値変換可能範囲を超える入力の結果は C の `atoi` の範囲外動作となり、Strata 側に独自のエラー処理はない（`engine/src/kernels/cpu/iq_avx1.cpp:134-139`; `engine/src/kernels/cpu/iq_avx2.cpp:184-190`; `engine/src/kernels/cpu/iq_avx512.cpp:50-53`）。
 
-| 設定 | 判定と動作 |
-|---|---|
-| unset | 既定値 `2048` バイトを使用 |
-| `0`、負数、空文字、数値に変換できない文字列 | `atoi` の結果が 0 以下となり、プリフェッチを発行しない |
-| 正の整数 | 現在の重みブロック先頭からそのバイト数先、およびさらに64バイト先をプリフェッチ |
-| 数字の後ろに文字が続く値 | 数字部分の先頭を `atoi` が変換する（例: `512tail` は512）。先頭空白や符号も `atoi` の規則で処理される |
+| 読み取り実装 | unset | 正の変換値 | 0 / 負値 / 変換できない値 |
+|---|---:|---|---|
+| AVX1 (`iq_avx1.cpp`) | 2048 byte | `blk + N`, `blk + N + 64` を prefetch | prefetch なし |
+| AVX2 (`iq_avx2.cpp`) | 2048 byte | `blk + N`, `blk + N + 64` を prefetch | prefetch なし |
+| AVX-512 (`iq_avx512.cpp`) | 2048 byte | `blk + N`, `blk + N + 64` を prefetch | prefetch なし |
 
-設定値は AVX1/AVX2 では関数内の `static const int` に保存され、最初のカーネル呼び出し時に読み取られます。AVX-512 では翻訳単位スコープの `const int` 初期化で読み取られます。いずれも読み取り後にプロセス環境を書き換えても再評価されません。
-
-根拠: `src/kernels/cpu/iq_avx1.cpp:135-148`, `src/kernels/cpu/iq_avx2.cpp:177-195`, `src/kernels/cpu/iq_avx512.cpp:34-39`。
+`1` は 1 byte 先、`2048` は 2048 byte 先、`16384` は 16384 byte 先を指す。正の値に下限以外の妥当性検査はなく、設定値の単位は byte である。AVX1/AVX2 は関数内 `static const int` に初回評価値を保存し、AVX-512 は translation unit の静的初期化時に値を保存する。したがって実行中に環境を変更しても再読込されない（同上）。
 
 ## 有効になる条件
 
-この変数は CPU の Strata native expert カーネルにだけ作用します。要求値が正でも、対応カーネルが実行されない場合は効果がありません。
-
-- AVX-512 カーネルは、CPU が AVX-512 対応で `STRATA_NO_IQ512` が未設定、対象形式が IQ2_XXS / IQ2_XS / IQ3_XXS / IQ3_S / IQ2_S のいずれかで、token 数 `nt` が `STRATA_IQ_MT_MIN` 由来の閾値以上の場合に使われます。
-- AVX2 カーネルは、CPU が AVX2 対応で `STRATA_NO_IQ256` が未設定、対象形式に対応し、`nt` が同じ閾値以上の場合に使われます。AVX-512 対応 CPU では対応する AVX-512 カーネルが無効な場合の fallback となり、AVX-512 非対応 CPU では AVX2 が候補になります。閾値は `STRATA_IQ_MT_MIN` 未設定時は2です。
-- AVX1 カーネルは、AVX2 非対応かつ AVX1 対応 CPU で `STRATA_NO_IQ128` が未設定、`nt` が閾値以上の場合に使われます。gate/up は IQ3_XXS / IQ3_S / IQ2_S、down は IQ4_NL / Q2_0 が対象です。
-- 条件に合わない形式や無効化された経路は、該当する native SIMD カーネルを通らず ggml-cpu 側の dot 経路などへ進みます。その経路にこの設定のプリフェッチ処理はありません。
-
-AVX-512 と AVX2/AVX1 の選択、および閾値・無効化条件は `src/kernels/cpu/native_expert.cpp:124-140,143-193` にあります。AVX-512 の対象形式は `src/kernels/cpu/native_expert.cpp:40-46`、AVX1 の対象形式は `src/kernels/cpu/iq_avx1.cpp:396-405` にあります。
+- x86 向け native CPU kernels が build に含まれていること。CPU CMake は `STRATA_CPU_X86` の場合に AVX1/2/512 のソースを追加する。SYCL の native-expert 構成も同ソースを含む（`engine/cmake/backends/cpu.cmake:303-317`; `engine/sycl/CMakeLists.txt:220-247`）。非 x86 build にはこれらの x86 kernel translation units が追加されない（`engine/cmake/backends/cpu.cmake:308-317`）。
+- 実行時に pool が native expert row dispatcher を通り、対応する kernel が選択されること（`engine/src/kernels/cpu/pool.cpp:1290-1309`; `engine/src/kernels/cpu/native_expert.cpp:560-584,681-708,820-844`）。CPU ISA、format、token 数の threshold によって generic ggml dot や別 kernel に進む場合、この値はその row 計算には使われない。AVX2 の exact-one gate/up 分岐は `gu_ggml_one` を呼び、通常の row loop の `prefetch_distance()` を通らない（`engine/src/kernels/cpu/native_expert.cpp:594-599`; `engine/src/kernels/cpu/iq_avx2.cpp:457-489`）。
+- AVX-512 gate/up kernel は `cpu_vnni_ok()` と `STRATA_NO_IQ512` 未設定が選択条件。AVX2 は `cpu_avx2_ok()` と `STRATA_NO_IQ256` 未設定、AVX1 は AVX2 がなく `cpu_avx1_ok()` かつ `STRATA_NO_IQ128` 未設定が条件（`engine/src/kernels/cpu/native_expert.cpp:568-584,694-708`）。これらの `STRATA_NO_*` 値の parse は別設定であり、本変数の値の parse には影響しない。
+- AVX1 down kernel は IQ4_NL (type 20) と Q2_0 (type 42) のみ。AVX1 gate/up dispatcher が直接対応するのは IQ3_XXS (18), IQ3_S (21), IQ2_S (22)（`engine/src/kernels/cpu/iq_avx1.cpp:394-404`）。AVX2 gate/up rows は native dispatcher の `iq256_supported` 判定を通る形式、AVX2 down は IQ4_NL (type 20) の経路（`engine/src/kernels/cpu/native_expert.cpp:681-703,828-831`）。AVX-512 gate/up rows は types 16, 17, 18, 21, 22 を switch で処理し、down 側では Q5_0 (type 6) 分岐が `q50_512_down_rows` を呼ぶ（`engine/src/kernels/cpu/iq_avx512.cpp:618-628,641-649`; `engine/src/kernels/cpu/native_expert.cpp:820-826`）。
+- `STRATA_IQ_PREFETCH` を無効化・上書きする専用 CLI 引数や設定ファイルの読み取りは、Strata ソース内で確認できない。別 ISA kernel/generic fallback への dispatcher 選択や、format・token 条件の不成立は結果的に本値を使わない。
 
 ## 実行時の詳細
 
-各 row カーネルは量子化重みのブロックを順に処理し、現在のブロックをデコードする前に `blk + 距離` と `blk + 距離 + 64` をプリフェッチします。AVX1 の i-quant gate/up row と IQ4_NL / Q2_0 down row、AVX2 の i-quant row、AVX-512 の i-quant row で実行されます。値が 0 以下ならこの要求を省きます。engine のカーネル以外では `iq_avx2_parity` が環境変数の現在値（未設定時は `-`）を診断出力に表示しますが、この表示自体は値を解釈・変更しません。engine 側に追加ログ、エラー、終了条件はありません。
+AVX1/AVX2 では `prefetch_distance()` の最初の呼び出しで環境変数を取得して関数内 static に保存する。その後、row dot の各 weight block loop が保存値を `rows_ahead` に渡し、正値の場合だけ 64 byte 間隔の 2 箇所に T0 prefetch を発行する（`engine/src/kernels/cpu/iq_avx1.cpp:134-145,237-245`; `engine/src/kernels/cpu/iq_avx2.cpp:184-195`; `engine/src/kernels/cpu/iq_avx2_rows.inl:81-88`）。AVX1 の IQ4_NL と Q2_0 down rows も同じ helper を使う（`engine/src/kernels/cpu/iq_avx1.cpp:310-326,345-361`）。AVX2 の IQ4_NL down rows も `prefetch_distance()` を使う（`engine/src/kernels/cpu/iq_avx2_rows.inl:618-625`）。
 
-根拠: `src/kernels/cpu/iq_avx1.cpp:239-268,312-328,351-364`, `src/kernels/cpu/iq_avx2_rows.inl:31-49,98-104,249-256`, `src/kernels/cpu/iq_avx512.cpp:155-168`, `src/kernels/cpu/iq_avx2_parity.cpp:528-534`。
+AVX-512 は `prefetch_ahead` を静的初期化で一度決め、i-quant row loops と Q5_0 down rows で正値の場合に同じ 2 箇所を prefetch する（`engine/src/kernels/cpu/iq_avx512.cpp:50-53,206-224,795-807`）。値を CLI・リクエストごとに再評価する処理、設定値を検証して失敗させる処理、値に関する fallback や理由ログは見当たらない。0 以下は単に prefetch 呼び出しを skip する。Strata 側に prefetch が失敗した場合の分岐・終了処理はない。
 
-## 文書・測定値との照合
+## ログと測定値
 
-`docs/DETAILS.md` に `STRATA_IQ_PREFETCH` の記述は見つかりませんでした。AVX2 実装のコメントには Zen 3 5700X3D（AVX-512 なし）の IQ3_S decode で、2048バイト距離により gate/up phase が4%短縮、row throughput が1.0 GB/s増加、round 時間が1.3%短縮した測定とあります（`src/kernels/cpu/iq_avx2.cpp:177-182`）。これは実装コメントに書かれた当該条件の測定値であり、他の CPU やモデルでの効果を示すものではありません。AVX-512 側にも IQ3_S decode の gate/up 時間に関する2–3%の記載がありますが、コメントだけでは測定機材を特定できないため、一般化できる性能値としては扱いません（`src/kernels/cpu/iq_avx512.cpp:34-36`）。
+通常の native kernels はこの値をログに出さない。`iq_avx2_parity` 診断プログラムは raw 環境文字列を `STRATA_IQ_PREFETCH` 欄に表示し、未設定なら `-` と表示するが、これは診断プログラムの出力であり通常の engine 起動ログではない（`engine/src/kernels/cpu/iq_avx2_parity.cpp:561-568`）。
+
+ソースコメントは AVX2 の IQ3_S decode について、Zen 3 5700X3D（AVX-512 なし）で gate/up phase 4% 減、行読み取り +1.0 GB/s、round 全体 -1.3% と報告し、AVX-512 コメントは IQ3_S decode の gate/up time 2–3% 減と記す（`engine/src/kernels/cpu/iq_avx2.cpp:178-183`; `engine/src/kernels/cpu/iq_avx512.cpp:48-49`）。コメントに測定手順・反復回数・build 条件の全ては示されていないため、これらはその記述の範囲に限られ、一般的な性能保証ではない。調査中に測定は行っていない。
+
+## 根拠
+
+- `engine/src/kernels/cpu/iq_avx1.cpp:133-145,237-245,310-326,345-361,394-444`
+- `engine/src/kernels/cpu/iq_avx2.cpp:178-195`
+- `engine/src/kernels/cpu/iq_avx2_rows.inl:81-88,618-625`
+- `engine/src/kernels/cpu/iq_avx512.cpp:48-53,206-224,618-628,795-807`
+- `engine/src/kernels/cpu/native_expert.cpp:560-584,594-599,681-708,820-844`
+- `engine/src/kernels/cpu/pool.cpp:1290-1309`
+- `engine/cmake/backends/cpu.cmake:303-317`; `engine/sycl/CMakeLists.txt:220-247`
+- `engine/src/kernels/cpu/iq_avx2_parity.cpp:561-568`

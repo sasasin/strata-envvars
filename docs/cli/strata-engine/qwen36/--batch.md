@@ -1,57 +1,59 @@
-# `--batch`
+# `strata` / `strata-q36` `--batch`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-24 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` の Qwen3.6 専用 parser、または `strata-q36` |
-| オプション | `--batch N` |
-| 別名 | `--slots N` |
-| 値 | 整数として `atoi` で読み取る session 数 |
+| コマンド | Qwen3.6 専用 parser（`strata` のモデル選択後、または `strata-q36`） |
+| オプション | `--batch` |
+| 別名 | `--slots` |
+| 値 | 整数。実際に使うセッション数は 1〜8 |
 
 ## 役割
 
-Qwen3.6 engine が保持する会話 session 数を指定します。`--serve` と併用すると、各 session が独立した recurrent state と KV cache を持ち、複数の要求を同じ decode window で処理できます。Qwen3.6 は通常の `src/program/generate.cpp` engine parser と異なる実装経路なので、この説明は `qwen36/` scope に限ります。`strata` は GGUF architecture が `qwen35moe` の場合、この parser に処理を渡します。 (`src/program/generate.cpp:2394-2406`、`src/qwen35/q36_main.cpp:1-5`)
+Qwen3.6 エンジンが保持する独立した会話セッション数を指定します。`--serve` のバッチプロトコルでは、各セッションを slot として複数リクエストを同時に進めます。1 slot ごとにコンテキスト長に応じた KV キャッシュと GDN 状態を確保するため、枠を増やすと必要 VRAM も増えます（`engine/src/qwen35/q36_engine.cu:1752-1767, 1962-1967, 2140-2159, 4720-4724`）。
 
 ## 使い方
 
 ```sh
+# Qwen3.6 エンジンを4セッションで起動し、serve プロトコルを使う
 strata --model /path/to/qwen36.gguf --serve --batch 4
-```
 
-この例では最大4 sessionを作ります。Qwen3.6 の識別条件に合うモデルが必要です。`--batch` の別名を使う場合は `--slots 4` と指定できます。 (`src/qwen35/q36_engine.cu:3748-3777`、`src/qwen35/q36_engine.cu:965-975`)
+# 専用実行ファイルでも同じ parser を使う
+strata-q36 --model /path/to/qwen36.gguf --serve --slots 4
+```
 
 ## 値と既定値
 
-- 省略時は `0`。初期値の session 数1で動き、バッチ slot はありません。 (`src/qwen35/q36_engine.cu:3735-3741`、`src/qwen35/q36_engine.cu:1342`)
-- 値は `std::atoi` で読み込み、session 数は `max(1, min(N, 8))` に制限されます。したがって `0`、負数、整数として読めない文字列は1 sessionになり、8を超える値は8 sessionになります。 `--batch` と `--slots` を両方指定した場合は、後に解析された値が残ります。 (`src/qwen35/q36_engine.cu:1208`、`src/qwen35/q36_engine.cu:1342`、`src/qwen35/q36_engine.cu:3740-3742`、`src/qwen35/q36_engine.cu:3776`)
-- 値を省略すると parser は `strata-q36: <指定した option> needs a value` を stderr に出して終了コード2で終了します。 (`src/qwen35/q36_engine.cu:3742-3746`)
+値は必須で、parser は `std::atoi` で整数化します。省略時の parser 値は `0` で、セッション数への変換時に 1〜8 へ clamp されるため、実効既定値は 1 です。負数、0、整数として読めない文字列は `atoi` の結果が 0 以下となる場合は1枠になります。9以上は8枠になります。明示的な範囲エラーはありません。複数回指定した場合は parser の最後の代入値が使われます（`engine/src/qwen35/q36_engine.cu:5345, 5348-5353, 5382, 1962-1967`; 上限8は同ファイル `1640`）。
+
+値を省略すると `strata-q36: --batch needs a value` を標準エラーへ出して終了コード2で終了します（`engine/src/qwen35/q36_engine.cu:5350-5352`）。
 
 ## 実行時の動作
 
-`--batch N` は session ごとに recurrent state、attention KV cache、MTP block の KV cache（モデルに MTP block がある場合）を持ちます。各 session の状態を GPU に確保し、同時に処理中の slot の行を一つの decode window にまとめます。通常の `GEN`/`GENI` は単一要求の経路です。複数要求を slot に割り当てるには `--serve` を指定し、server protocol の `BGEN` または `BGENI` 要求を使います。 (`src/qwen35/q36_engine.cu:1194-1218`、`src/qwen35/q36_engine.cu:3174-3178`、`src/qwen35/q36_engine.cu:3431-3450`)
+`--batch N` は `Engine::init` に渡され、内部セッション数を1〜8に正規化します。その数だけセッション状態とキャッシュを確保し、複数枠ではセッション状態を参照するデバイステーブルも作ります（`engine/src/qwen35/q36_engine.cu:5522, 1962-1967, 2140-2148, 2184-2203`）。
 
-`--serve` 時は session 数が2以上なら起動時に `INFO batch_slots=N slot_cache=1` を stdout に出し、その後 `READY` を出します。session の状態は slot 間で独立します。 (`src/qwen35/q36_engine.cu:3678-3681`)
+`--serve` では起動時に複数枠の数を `INFO batch_slots=N slot_cache=1` として標準出力へ出し、`READY` の後に入力を受けます。複数枠のリクエストは `BGEN <slot> ...` / `BGENI <slot> ...` で slot を指定し、他 slot の decode window をプロンプト読み込みの合間に実行します。単独枠では BGEN は拒否されます（`engine/src/qwen35/q36_engine.cu:4720-4724, 5012-5023, 5281-5285`）。
+
+自動 `--chunk` の一部の経路では、複数枠時にプロンプト chunk の候補上限が1024になります。これは expert が VRAM に収まる条件での chunk 選択に限られ、明示的な `--chunk` や hybrid 経路の chunk 選択とは別です（`engine/src/qwen35/q36_engine.cu:5493-5517`）。
 
 ## 適用条件と副作用
 
-- `--serve` なしでも指定数の session を初期化するため VRAM を使いますが、複数要求を同時 decode する BGEN/BGENI protocol は serve 経路でのみ処理されます。通常の `GEN`/`GENI` は単一要求用です。 (`src/qwen35/q36_engine.cu:3863-3864`、`src/qwen35/q36_engine.cu:3174-3178`、`src/qwen35/q36_engine.cu:3431-3450`)
-- session 数に応じて GPU メモリ使用量が増えます。engine は複数 session の場合、context 長に基づく session ごとの VRAM 見積もりと空き量を stderr に表示します。必要量と1 GiB の余裕を確保できなければ、VRAM 不足メッセージを出して終了コード1で終了します。 (`src/qwen35/q36_engine.cu:1450-1469`)
-- 要求を受け付ける際に指定 slot が範囲外、使用中、または session 数が1の場合は stdout に `ERR BGEN: no such free slot ...` を返します。 (`src/qwen35/q36_engine.cu:3441-3449`)
-- `--batch-mtp` は複数 session と `--mtp N`（Nが正数）の両方がある場合に有効です。必要条件を満たさない `--batch-mtp` は stderr に注意を出して無視されます。`STRATA_BATCH_MTP` による有効化もあります。 (`src/qwen35/q36_engine.cu:3882-3887`)
+- 枠数は `--serve` の有無にかかわらずエンジン初期化へ渡され、セッション状態を確保します。一方、複数リクエストを slot 指定で投入する BGEN/BGENI は serve プロトコルの機能です（`engine/src/qwen35/q36_engine.cu:5522, 5559-5563, 4720-4724`）。
+- 複数枠では各枠の KV キャッシュと再帰状態の合計を見積もり、見積もりにさらに1 GiBの余裕を加えた量が確保前の空きVRAMを超えると、必要量を示すメッセージを標準エラーへ出して `exit(1)` します。メッセージは `--batch` の縮小または `--max-context` の短縮を案内します（`engine/src/qwen35/q36_engine.cu:2142-2159`）。
+- `--batch-mtp` は `--batch` で複数枠があり、かつ `--mtp N` が正の場合にだけ有効です。条件を満たさない `--batch-mtp` は無視され、その理由を標準エラーへ出します（`engine/src/qwen35/q36_engine.cu:5556-5561`）。
 
 ## 出力とエラー
 
-- 値が欠落した場合は stderr と終了コード2です。未知の引数は serve mode では警告してスキップされ、それ以外では usage を表示して終了コード2になります。 (`src/qwen35/q36_engine.cu:3742-3746`、`src/qwen35/q36_engine.cu:3782-3795`)
-- session allocation が失敗した場合、VRAM 不足の詳細を stderr に出し終了コード1で終了します。指定数より少ない session に自動縮小する処理は確認できません。 (`src/qwen35/q36_engine.cu:1450-1469`)
+複数枠のVRAM見積もり失敗は標準エラーに診断を出して終了コード1です。`--batch` 値の欠落は標準エラーと終了コード2です（`engine/src/qwen35/q36_engine.cu:5350-5352, 2155-2159`）。serve 起動時には `INFO batch_slots=...` と `READY ...` を標準出力へ出します（`engine/src/qwen35/q36_engine.cu:5281-5285`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:2394-2406` — `qwen35moe` を検出した場合の Qwen3.6 parser への振り分け。
-- `src/qwen35/q36_engine.cu:3735-3797` — Qwen3.6 parser、`--batch`/`--slots` の受理、必須値処理、serve mode。
-- `src/qwen35/q36_engine.cu:1194-1218`、`src/qwen35/q36_engine.cu:1339-1344` — session の状態と 1〜8 の上限。
-- `src/qwen35/q36_engine.cu:1450-1471` — session ごとの VRAM 見積もり・不足時の終了・割り当て。
-- `src/qwen35/q36_engine.cu:3174-3178`、`src/qwen35/q36_engine.cu:3431-3450`、`src/qwen35/q36_engine.cu:3678-3681` — serve protocol、slot の選択・エラー、起動時出力。
+- `engine/src/qwen35/q36_engine.cu:5345-5353, 5382`: 既定 parser 値、値の取得、`--batch` / `--slots` の別名、整数変換、値欠落の処理。
+- `engine/src/qwen35/q36_engine.cu:1640, 1962-1967`: セッション数の最大値8と1〜8への正規化。
+- `engine/src/qwen35/q36_engine.cu:2140-2159, 2184-2203`: セッション別状態の確保、複数枠のVRAM見積もりと失敗経路、バッチ用デバイステーブル。
+- `engine/src/qwen35/q36_engine.cu:4720-4724, 5012-5023, 5281-5285`: serve の BGEN/BGENI slot 利用、slot 検証、起動時出力。
+- `engine/src/qwen35/q36_engine.cu:5493-5517, 5522, 5556-5563`: 自動 chunk との相互作用、初期化への値の受け渡し、batch MTP 条件と実行モード分岐。
 
-調査範囲はこの checkout のソースです。同一 revision の既存 `strata-q36` binary や Release artifact は確認していません。
+索引の Qwen3.6 専用 parser scope に対応する `--batch` リンクを確認しました（`docs/cli/README.md`）。

@@ -1,52 +1,53 @@
 # `STRATA_SPLIT_NEAR_TIE_PCT`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--serve --layer-split auto` の自動配置を終えた後、予測時間が選択配置に近い別の layer split があれば、その候補を試す方法とともに stderr に表示するための割合（%）です。配置を選ぶコストモデルや、最終的に選ばれる split はこの値では変わりません。対象処理は CUDA の multi-GPU split 探索です。
+`--layer-split auto` の探索で採用済みの分割に近い、別の分割候補を「NEAR TIE」として案内する許容率（百分率）です。候補の絞り込みと案内ログだけに使われ、最良候補の選択、実際に使う分割、生成結果はこの値では変わりません。採用分割 `best` を `split_at` に設定した後に別候補を調べる処理です（`engine/src/program/generate.cpp:7510-7518,7525-7545`）。
+
+この参照は `multi_gpu && split_auto` の自動探索ブロック内にあります。手動 `--layer-split K,...` ではこの探索に入らず、この設定による案内もありません（`engine/src/program/generate.cpp:6959`）。同名の実行コード参照はこの箇所だけです。設定登録データにも候補名がありますが、実行時の挙動の根拠にはしていません。
 
 ## 値と判定
 
-値は `std::atof` で `double` に変換されます。文字列全体の妥当性検査、範囲制限、clamp はありません。
+コードは `getenv` が null かどうかで未設定を判定し、設定されていれば `std::atof` で `double` に変換します。変換後の値を `near_pct > 0` で判定し、正の値だけが別候補の閾値計算に進みます。文字列全体の検証、範囲制限、clamp、警告はありません（`engine/src/program/generate.cpp:7525-7526`）。
 
-| 環境変数の状態 | `near_pct` | 結果 |
-|---|---:|---|
-| 未設定 | `4.0` | 選択配置の予測時間より最大 4% 高い予測時間までを候補にする |
-| 数値文字列 | 変換された値 | 正の値なら候補範囲に使う。例: `2.5` は 2.5%、`0.5` は 0.5% |
-| 空文字 | `0.0` | `near_pct > 0` を満たさず案内しない |
-| 数字で始まらない文字列 | `0.0` | 同上。`atof` が変換できない場合の値 |
-| `0` または負数 | 0 以下 | 案内しない |
+| 条件 | 判定値 | この設定による動作 |
+| --- | ---: | --- |
+| 未設定 | `4.0` | 別候補が最良候補の予測時間の 4% 以内なら案内対象になり得る |
+| 空文字 | `atof("")` → `0` | 案内を無効化 |
+| 数値文字列が正の値 | 変換された値 | その百分率以内の別候補を探す。例: `1`, `4`, `10`, `0.5` |
+| `0` または負の値 | 0 以下 | 案内を無効化 |
+| 数値として読めない文字列 | `atof` の変換結果は `0` | 案内を無効化。無効値としてのエラーや fallback ログはない |
+| 数値の後ろに文字がある文字列 | `atof` が読めた先頭部分の値 | 先頭部分が正ならその値で判定。例: `4anything` は `4` として扱われる |
 
-`atof` は文字列全体が数値かを検証しないため、数値の後ろにある文字は変換結果に影響しない場合があります（例: `4abc` は `4` として変換されます）。大文字小文字の比較や真偽値としての解釈はありません。`nan` など正数比較を満たさない値も案内条件を通りません。
+`atof` の結果に全体 parse の成否確認はありません。したがって `true` のような数値で始まらない文字列や、空白だけの文字列は 0 となります。比較は大小文字を調べる文字列比較ではありません（`engine/src/program/generate.cpp:7525-7526`）。
 
 ## 有効になる条件
 
-環境変数の判定結果が正の値でも、次の条件をすべて満たすときだけ候補を探します。
-
-- `--serve` と `--layer-split auto` が指定されている。
-- 自動 split が実際に複数 GPU で動く（GPU が1台だけなら自動 split は解除される）。
-- GPU 数 `ns` が2または3。4 GPU 以上はこの案内処理の対象外。
-- GPU 間の差が「混在」と判定される。コードでは、最速と最遅の GPU の推定 layer 時間の比が10%を超えるか、PCIe miss cost scale の比が10%を超える場合です。
-- 探索後の最良予測時間が正で、価格付け済み候補がある。
-- 最良配置の境界から少なくとも3 layer 離れ、かつ閾値内に入る別候補がある。feasibility gate が有効なときは、その候補も prompt を開始できる配置である必要があります。
-
-明示的な `--layer-split K[,K2...]`、serve でない実行、単一 GPU、4 GPU 以上、差の小さい GPU 構成ではこの変数は参照されても警告条件に到達しません。CUDA device の layer 時間は SM 数と clock から見積もられ、link scale は split 探索中の PCIe probe 結果（native pack でない場合は各段階 1.0）から作られます。
+- 複数 GPU の `--layer-split auto` の探索が実行され、探索で有効な最良候補が得られること（`engine/src/program/generate.cpp:6959,7501-7515`）。
+- 各段の予測レイヤー時間またはリンクのミスコスト倍率に 10% を超える差があること（`hi > lo * 1.10 || lhi > llo * 1.10`）。差がなければこの設定値にかかわらず案内探索をしません（`engine/src/program/generate.cpp:7520-7526`）。
+- 変換値が正、GPU 段数 `ns` が 3 以下、最良候補の予測時間が正で、価格付け済み候補が存在すること（同上）。したがってこの案内探索は最大 3 GPU（2 または 3 段）に限られます。
+- 別候補は最良候補の `best_ms * (1 + near_pct / 100)` 以下の予測時間でなければなりません。境界と等しい候補は閾値内です。さらに、既に見つかった別候補より時間が小さく、分割境界の最大距離が 3 層以上であり、開始可能性ゲートが有効ならその候補も開始可能である必要があります（`engine/src/program/generate.cpp:7529-7537`）。
+- `STRATA_SPLIT_NEAR_TIE_PCT` を上書きする CLI 引数や別環境変数は、この設定の直接参照箇所にはありません。`--layer-split` は探索経路を選びますが、この百分率を指定する引数ではありません（`engine/src/program/generate.cpp:4805-4854,7525`）。
 
 ## 実行時の詳細
 
-値は `src/program/generate.cpp` の自動配置探索が完了した後、近似候補のログを組み立てる箇所で読み取られます。式は `getenv` で設定有無を調べ、設定時には再度 `getenv` した文字列を `atof` に渡します。static cache ではなく、この判定箇所で評価されます。候補条件は `pc.first <= best_ms * (1 + near_pct / 100)` で、境界間距離が3 layer未満の近傍配置は除外します。最も予測時間が小さい適格な別配置を表示します。
+自動 split の探索で候補を価格付けし、最良候補を決めて `split_at = best` に設定した後、近い候補のログを出すために読みます。最良候補はそれ以前に探索内で選択済みであり、この値は `consider()` の比較処理では参照されません（`engine/src/program/generate.cpp:7253-7269,7510-7526`）。
 
-候補があれば、stderr に `strata generate: layer split auto: NEAR TIE - ...` の行を出し、候補の K、予測時間、最良配置との差、予測は decode window の価格付けで prompt を価格付けしていないこと、`--layer-split K` で試す方法を表示します。候補がなければこの行は出ません。この変数がログ以外の動作や配置結果を変える処理はありません。
+関数内 `static` への保存はなく、設定値はこの案内ブロックを通るたびに取得されます。起動後にプロセスの環境を外部から変更して反映させる処理や、子プロセスへの転送処理はこの変数の参照箇所にはありません（`engine/src/program/generate.cpp:7525`）。
 
-## 文書との照合
+条件を満たす別候補が見つかった場合に限り、stderr に次の形式で案内します。候補がない、値が 0 以下、段数が 3 を超える、または段・リンクの差が 10% 以下などの場合、この NEAR TIE 行は出ません。値の parse 失敗自体も別のログや終了コードを発生させません（`engine/src/program/generate.cpp:7526-7547`）。
 
-`docs/MULTI_GPU.md` は `--layer-split auto` が各カードの VRAM を見て配置することと、起動ログの例を説明していますが、`STRATA_SPLIT_NEAR_TIE_PCT` や近似候補の案内については記載していません。変数の値域、既定値、条件、ログ動作はソースコードを根拠にしています。
+```text
+strata generate: layer split auto: NEAR TIE - K=... is predicted ... ms per decode window, within ...% of K=... (... ms); the cards differ, so the prediction may not rank them (it prices decode, not the prompt). To try the other: --layer-split ...
+```
+
+案内対象がなくても自動 split の開始処理はこの設定を理由に失敗しません。この設定による終了・timeout・警告経路はありません。
 
 ## 根拠
 
-- `src/program/generate.cpp:2299-2346` — layer split は `--serve` が必要で、`auto` は可視 GPU が1台なら解除される。
-- `src/program/generate.cpp:3582-3598,3692-3727` — 自動 split 探索、GPU 数と layer/link コスト推定。
-- `src/program/generate.cpp:3964-3978,3995-4094` — 2/3 GPU の候補価格付けと選択、4 GPU の別探索経路。
-- `src/program/generate.cpp:4162-4200` — near-tie 候補条件、環境変数の既定値・変換、stderr の案内文。
-- `docs/MULTI_GPU.md:41,63-68,180-187` — 自動 split の概要と標準起動ログ例。
+- `engine/src/program/generate.cpp:6959` — 複数 GPU かつ自動 split の探索ブロック。
+- `engine/src/program/generate.cpp:7253-7269` — 価格付け候補と最良分割の選択。
+- `engine/src/program/generate.cpp:7510-7547` — 最良候補決定後の環境変数読み取り、候補条件、stderr 案内。
+- `engine/src/program/generate.cpp:4805-4854` — `--layer-split auto` の分岐と手動 split の区別。

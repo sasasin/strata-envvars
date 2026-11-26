@@ -1,6 +1,6 @@
-# `strata drafting plan --output`
+# `--output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。調査時の作業ツリーは `main...origin/main` で、`git status --short --branch` に未コミット変更の表示はなかった。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,50 +8,57 @@
 | コマンド | `strata drafting plan` |
 | オプション | `--output` |
 | 別名 | なし |
-| 値 | `human`、`json`、`jsonl` のいずれか |
+| 値 | `human`、`json`、`jsonl` |
 
 ## 役割
 
-計画結果を人向けの文章か機械向け JSON で標準出力に出します。値は出力形式だけを選び、ダウンロード計画や drafter の選択内容は変えません。`strata drafting plan` 自体は取得計画を表示するコマンドです（`strata_cli/drafting_cmd.py:17-30,63-73`）。
+ドラフター取得計画の表示形式を選びます。`human` は人向けの文章、`json` と `jsonl` は機械向けの JSON オブジェクトを標準出力に出します。このコマンドの JSONL 指定でも計画は複数行イベントではなく単一 JSON オブジェクトです。
 
 ## 使い方
 
 ```sh
-strata drafting plan --output json
-```
+# 人向けの計画を表示
+strata drafting plan --output human
 
-対象モデルの設定を指定して調べる場合は、たとえば次のように実行します。
+# スクリプト向けに計画を JSON で取得
+strata drafting plan --config ./run-config.json --output json
 
-```sh
-strata drafting plan --config /path/to/run-config.json --output json
+# jsonl も plan では単一の JSON オブジェクトを返す
+strata drafting plan --family qwen --model IQ3_S --output jsonl
 ```
 
 ## 値と既定値
 
-- 省略時は `human` です。
-- `human` は通常、人向けの説明を出力します。
-- `json` と `jsonl` はどちらも機械向け出力になります。`plan` の実装ではいずれも同じ JSON オブジェクトを一行で出し、JSONL のイベント列にはしません。
-- 他の値は parser の `choices` により拒否されます。短縮 alias はありません（`strata_cli/drafting_cmd.py:20-30`）。
+- 値は `human`、`json`、`jsonl` のいずれかで、省略時は `human` です。parser は選択肢以外を拒否します。`terminal/strata_cli/drafting_cmd.py:19-38`
+- `--output` は `plan` と `fetch` の両方の parser に登録されていますが、この文書の対象である `plan` は計画を表示するだけです。`fetch` での進捗出力の違いは別コマンドの scope です。`terminal/strata_cli/drafting_cmd.py:22-38`
 
 ## 実行時の動作
 
-`json` / `jsonl` の場合、標準出力には `schema_version: 1`、`ok: true` と計画情報を含む JSON オブジェクトが一行で出ます。計画情報には pack の有無、必要量、保存先、取得元と revision、選択された drafter、判断メモなどが含まれます。`human` の場合は通常、取得量・pack 後の容量などを含む説明文を出します。モデル設定を指定し、選択内容により取得不要で判断メモがある場合は、そのメモを含む短い行を出します（`strata_cli/drafting_cmd.py:63-73`; `strata_control/drafting_fetch.py:29-39`）。
+parser は共通の `drafting plan` オプションとして `--output` を受け取り、実行時に `human` かどうかで表示分岐します。`json` と `jsonl` はともに machine 出力として扱われます。`terminal/strata_cli/drafting_cmd.py:19-38, 211-213`
 
-表示する計画内容は `--config`、`--mode`、`--family`、`--data-dir` と現在の drafter pack の状態に基づきます。これらは `--output` の値とは別の入力です。設定ファイルを読めない、または JSON として解釈できない場合、`--config` の内容は空として扱われ、既定のデータフォルダー等を使って計画を続けます（`strata_cli/drafting_cmd.py:40-54`）。
+計画作成時は、選択されたドラフティング方式、ローカルのドラフター有無、モデル・backend・対応状況などから結果を組み立てます。machine 出力には `schema_version: 1` と `ok: true` に加え、取得要否 (`needed`)、状態 (`ready`)、サイズ (`gb`)、選択 (`choice`)、ドラフター名 (`drafter`)、説明などを含めて JSON 化し、標準出力へ一度出します。human 出力は通常 `result["text"]`、計画上の注記がある場合には `result["line"]` を出します。`terminal/strata_cli/drafting_cmd.py:240-266`
+
+Hy4-Flash または Inkling-2-Mini の内蔵 drafter と判定された場合は、取得不要の計画を返します。この特別経路でも `json` と `jsonl` は JSON オブジェクト、`human` は説明文です。`terminal/strata_cli/drafting_cmd.py:211-233`
+
+計画本体は `drafting_fetch.plan` を呼び、既存 pack の準備状況や必要サイズ、VRAM 見積もり等を計画結果に含めます。`plan` 分岐は `ensure_for` に進まないため、ここで drafter をダウンロード・pack する処理は行いません。`terminal/strata_control/drafting_fetch.py:68-88`、`terminal/strata_cli/drafting_cmd.py:247-266, 267-283`
 
 ## 適用条件と副作用
 
-この option は `strata drafting plan` と `strata drafting fetch` の各 parser に登録されていますが、この文書の対象は `plan` 側です（`strata_cli/drafting_cmd.py:20-30`）。`plan` 経路では pack 状態を確認して結果を組み立てるだけで、ダウンロード・pack 作成は行いません。取得と pack 処理は `fetch` が `drafting_fetch.ensure()` を呼ぶ別経路です（`strata_cli/drafting_cmd.py:63-73,74-101`; `strata_control/drafting_fetch.py:54-101`）。
+このオプションは `strata drafting plan` の出力形式に作用します。設定ファイルや環境変数との優先順位はありません。計画作成では設定ファイルやローカル状態を読み、hardware・installed engine・ドラフターの状態を調べることがありますが、`plan` 自体は取得処理へ進みません。設定ファイルが読み取れない場合 `_inputs` は空設定にフォールバックするため、意図したモデルの計画にならない可能性があります。`terminal/strata_cli/drafting_cmd.py:101-120, 247-266, 267-283`
 
 ## 出力とエラー
 
-有効な値なら計画成功時の終了コードは `0` です。無効な値は `argparse` の parser で拒否され、通常の usage エラーになります。処理中に CLI が捕捉する `ValueError`、`OSError`、`KeyboardInterrupt` などが起きた場合、machine output では `schema_version: 1` と `ok: false` を含む JSON を標準出力に出し、human output では `strata: ...` を標準エラーに出します。終了コードはエラーの種類に応じます（`strata_cli/cli.py:527-532,2119-2193,2217-2235`）。
+- `human`: 取得計画の説明文を標準出力に表示します。
+- `json` / `jsonl`: `schema_version` と `ok` を含む単一 JSON オブジェクトを標準出力に表示します。plan 経路では JSON Lines のイベント列にはなりません。`terminal/strata_cli/drafting_cmd.py:247-266`
+- 許可値以外は argparse の choices 検証で拒否されます（標準の argparse エラー経路）。この parser で choices を定義している箇所は `terminal/strata_cli/drafting_cmd.py:38` です。
+
+調査した `plan` の出力分岐には、計画結果を JSON として返す成功経路が確認できました。計画内部で起きる全ての例外の標準出力・標準エラー形式や終了コードは、このオプションの処理だけからは特定できないため記載していません。
 
 ## 根拠
 
-- 索引上のコマンド階層と予定パス: `docs/cli/README.md:322-338`（調査対象リポジトリ外の文書）。
-- parser の値、既定値、`plan` と `fetch` への登録: `strata_cli/drafting_cmd.py:17-30`。
-- `plan` 時の JSON/human 分岐、計画結果の組み立て、戻り値: `strata_cli/drafting_cmd.py:57-73`。
-- plan 情報と pack 状態の読み取り: `strata_control/drafting_fetch.py:29-39`; `strata_control/drafting.py:114-122`。
-- fetch 側の取得・検証・pack 処理との区別: `strata_cli/drafting_cmd.py:74-101`; `strata_control/drafting_fetch.py:54-101`。
-- CLI 共通の機械向けエラー形式と例外経路: `strata_cli/cli.py:527-532,2119-2193`。
+- `terminal/strata_cli/drafting_cmd.py:19-38` — `plan` と `fetch` の parser 定義、`--output` の選択肢・既定値。
+- `terminal/strata_cli/drafting_cmd.py:211-233` — machine 出力判定と内蔵 drafter の plan 出力。
+- `terminal/strata_cli/drafting_cmd.py:240-266` — DFlash2 の plan 結果の組み立て、JSON/human の出力分岐。
+- `terminal/strata_cli/drafting_cmd.py:267-305` — `fetch` の分岐と取得処理。plan 出力と取得処理の境界確認に使用。
+- `terminal/strata_control/drafting_fetch.py:68-88` — plan が返すローカル準備状況・サイズ・説明情報。
+- `docs/cli/README.md:337-347` — `strata drafting plan` の階層と対象 option の索引登録。

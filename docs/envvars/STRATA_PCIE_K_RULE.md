@@ -1,44 +1,56 @@
 # `STRATA_PCIE_K_RULE`
 
-調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CPU pool と PCIe link が分担する expert miss share の計算に使う係数 `k` の規則を選びます。`k` は `link / (link + k × R)` の分母に入り、`R` は CPU pool の expert byte rate です。変数を有効にすると、弱い CPU pool では `k` が 1.85 から 0.8 へ下がり、計算される link share が大きくなります。無効なら `k` は常に 1.85 です。これは share 計算用の設定であり、単独で PCIe share の自動計測・更新を有効にするものではありません（`include/strata/core/pcie_share_rule.hpp:16-27,38-43`）。
+PCIe 経由で GPU に渡す expert miss の割合を自動調整する `PcieAuto` の式にある、CPU pool 速度 `R` の係数 `k` のルールを選ぶ。ルールが有効なとき、pool が遅いほど `k` を 1.85 から 0.8 へ下げる。無効時は常に 1.85。自動調整率は `link / (link + k * R)` を 0.05 刻みに丸め、下限 0.10 と上限の間に収めるため、他の条件が同じなら小さい `k` は PCIe 側の割合を増やす。これは GPU と CPU のどちらに miss を割り当てるかを変える。`docs/DETAILS.md:1206` はこの分担変更に伴い出力の最下位 bit が変わると報告している（同資料の測定値で、この調査では再測定していない）（`engine/src/program/generate.cpp:3105-3107, 3145-3149`; `engine/include/strata/core/pcie_share_rule.hpp:20-31`）。
+
+自動分担が有効な CUDA / HIP の serve 経路で使われる。`--pcie-frac` により自動分担が設定されない経路、または後述の適用条件を満たさない経路では、この係数による更新はない（`engine/src/program/generate.cpp:5535-5579, 15003-15010`）。
 
 ## 値と判定
 
-読み取り値は `std::getenv("STRATA_PCIE_K_RULE")` から helper に渡されます。変数が設定されていても空文字列なら既定値の分岐に進みます。空でない文字列は `std::atoi` で変換し、結果が 0 以外なら有効、0 なら無効です。文字列全体の検証や範囲制限はありません。従って `1`, `-1`, `2tail` は有効、`0`, `0tail`, `true`, `n/a` は無効です。`atoi` が数値変換できない文字列は 0 になります。
+`generate.cpp` が `std::getenv` で値を読み、`pcie_k_rule_default()` に渡す。関数は未設定または空文字なら機器状態に応じた既定値を返し、それ以外は `std::atoi(env) != 0` で判定する。文字列全体の妥当性検査はなく、整数として読める先頭部分だけが `atoi` の判定に使われる（`engine/src/program/generate.cpp:3105-3107`; `engine/include/strata/core/pcie_share_rule.hpp:42-47`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定、空文字 | discrete GPU かつ `STRATA_DEFAULTS=026` でない場合に有効。それ以外は無効 |
-| 空でない文字列で `atoi(value) != 0` | 有効。既定値と `STRATA_DEFAULTS` に優先 |
-| 空でない文字列で `atoi(value) == 0` | 無効。既定値に優先 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| 離散 GPU、`STRATA_DEFAULTS` が `026` でない | ON（可変 `k`） | `1`, `-1`, `1tail`（`atoi` が非ゼロ） | `0`, `0tail`, `true`, 空文字ではない非数値文字列（`atoi` が 0） |
+| 統合 GPU、または `STRATA_DEFAULTS=026` | OFF（`k=1.85`） | `1`, `-1`, `1tail` など（明示値が既定に優先） | `0`, `0tail`, `true` など（`atoi` が 0） |
 
-係数の具体値は有効時、`R >= 30 GB/s` で 1.85、`R <= 12 GB/s` で 0.8、その間は線形補間です。無効時は `R` にかかわらず 1.85 です（`include/strata/core/pcie_share_rule.hpp:16-21,40-43`）。
+空文字は「設定あり」としては扱われず、unset と同じ既定値になる。先頭の空白や符号は `atoi` に従い、数値の後ろの文字列は値の判定に影響しない。たとえば ` 1x` は非ゼロ、` 0x` はゼロとして扱われる。小数文字列 `0.5` は `atoi` が `0` を返すため無効、`-0` も無効。範囲 clamp はなく、値は 0 / 非ゼロに二値化される（`engine/include/strata/core/pcie_share_rule.hpp:44-46`）。
+
+既定では `spill_discrete_gpu()` の結果が離散 GPU で、かつ `qwen_defaults_026()` が false の場合だけ ON。`STRATA_DEFAULTS=026`（または同関数が受け付ける `0.2.6`, `v0.2.6`）は既定を OFF にするが、この環境変数に非空の明示値があれば先に評価されるため、`STRATA_PCIE_K_RULE=1 STRATA_DEFAULTS=026` ではルールが ON になる（`engine/src/program/generate.cpp:327-338, 3105-3107`; `engine/include/strata/core/pcie_share_rule.hpp:44-46`; `engine/include/strata/core/defaults_026.hpp:21-29`）。
 
 ## 有効になる条件
 
-明示値は helper の既定条件に優先し、integrated GPU や `STRATA_DEFAULTS=026` の場合も `atoi` の結果で係数規則を選びます。ただし、係数が有効でも PCIe share 自動調整が実行されるとは限りません。実際に `pcie_pool_k()` が使われるのは、probe 等を経て `o.pcie_frac_auto` が有効になり、PCIe share の開始値または decode window 後の更新値を計算するときです。
-
-- `--pcie-frac` を指定すると `o.pcie_frac` が既定値の負数ではなくなり、初期 probe/auto 設定の分岐を通りません。要求ごとの `pcie_frac` 指定は共有値の自動更新を適用しません（`src/program/generate.cpp:879-880,3574,4024-4026,4711-4755,15560,18986`）。
-- 自動更新の起動には `o.pcie_frac_auto` と有効な link probe が必要です。全 expert が GPU resident、batch slots 使用、peer device 使用の場合は `PcieAuto` が起動しません（`src/program/generate.cpp:12609-12616`）。
-- layer split は `STRATA_PCIE_AUTO_SPLIT` の判定も受けます。HIP の既定は opt-in、discrete CUDA は既定で有効、integrated GPU と `STRATA_DEFAULTS=026` では既定で無効です（`include/strata/core/pcie_share_rule.hpp:30-36`; `src/program/generate.cpp:2445-2456,4746-4751,12610`）。HIP の arch gate や `STRATA_PCIE_FRAC_DEFAULT` によって `o.pcie_frac_auto` が設定されない経路もあります（`src/program/generate.cpp:2490-2509,4746-4751`）。
-- 初期 share の係数計算は CUDA では `STRATA_PCIE_START` の既定動作が新しい start を選ぶ場合に行われます。HIP では `STRATA_PCIE_START=new` の opt-in が必要です（`src/program/generate.cpp:12538-12554`）。decode 後の更新は最大 3 回で、miss が少なすぎる状態が続くと自動調整を止めます（`src/program/generate.cpp:2724-2747`）。
+- `PcieAuto` が使われるため、起動時に自動 PCIe share が有効で、PCIe 帯域の probe が成功していること。`--pcie-frac` は `atof` で変換され、変換後の値が 0 以上なら自動設定分岐を外すため、環境変数による係数も使われない（負値ならこの条件だけでは分岐を外さない）（`engine/src/program/generate.cpp:4057, 5535-5579`）。
+- PCIe share の更新対象となる expert miss があること。全 expert が GPU cache に常駐している場合、batch 実行、peer-device 経路などでは `PcieAuto` の有効化条件から外れる（`engine/src/program/generate.cpp:14932-14933, 15003-15010`）。
+- layer split で各 stage の share も更新する場合、`STRATA_PCIE_AUTO_SPLIT` の判定が ON であること。未設定時は離散 CUDA GPU かつ `STRATA_DEFAULTS=026` でない場合に ON、HIP は OFF。明示値は空でなければ `atoi != 0` で判定される（`engine/src/program/generate.cpp:2833-2844`; `engine/include/strata/core/pcie_share_rule.hpp:34-40, 44-46`）。
+- HIP の単一 GPU 自動 share は gfx12 既定、または `STRATA_PCIE_FRAC_DEFAULT=auto` 等で `pcie_auto_fork_arch_ok()` が有効になる対象であること。通常の未対応 HIP 部品ではこの変数を設定しただけでは自動分担が始まらない。`STRATA_PCIE_FRAC_DEFAULT=old` は測定後の自動更新を無効にする（`engine/src/program/generate.cpp:2893-2912, 5570-5576`）。
+- `STRATA_PCIE_START` は初期 share の式を使うかどうかを決めるが、後続の pool 測定による `PcieAuto` 更新の可否とは別。CUDA は未設定または `old` 以外で初期式を使い、HIP は `new` のときだけ使う（`engine/src/program/generate.cpp:14913-14928`）。
 
 ## 実行時の詳細
 
-`pcie_pool_k()` 内の `static const bool on` が初回呼び出し時に環境値を読み、プロセス内に保持します。以後 `STRATA_PCIE_K_RULE` を変更しても再評価されません。係数計算の helper 自体は `R` ごとに実行されますが、有効/無効の選択はキャッシュされたままです（`src/program/generate.cpp:2702-2705`）。
+読み取りは `pcie_pool_k()` 内の関数ローカル `static const bool` の初期化時に一度だけ行われ、そのプロセス内ではキャッシュされる。初期化自体も `pcie_pool_k()` が呼ばれたときに限られる。呼び出しは自動 share の初期値計算（条件が揃う場合）または測定後の share 更新から発生するため、該当経路に入らなければ値は読まれない。実行中に環境を変えてもキャッシュ後の判定には反映されない（`engine/src/program/generate.cpp:3105-3107, 14913-14928, 15015-15020, 15035-15036`）。
 
-この係数は初期 share の計算（CUDA/HIP の `STRATA_PCIE_START` 経路）と、decode window 後の `PcieAuto` 更新で使われます。更新値は `pcie_frac` と GPU dispatch の PCIe expert count に反映され、layer split では各 stage の link bandwidth に基づいて後続 stage の share も計算します（`src/program/generate.cpp:12538-12556,12621-12646,18986`）。更新時には stderr に `strata serve: PCIe share:` が出ます。係数の有効/無効そのものを示す専用ログ、無効値の警告、環境変数を理由とする終了経路はありません。probe に失敗した場合は初期 share の既定値を使い、自動調整値を設定しません（`src/program/generate.cpp:4731-4754`）。
+ルールが ON の場合、測定された pool rate `R` が 30 GB/s 以上なら `k=1.85`、12 GB/s 以下なら `k=0.8`、その間は線形補間する。OFF の場合は `R` によらず `k=1.85`。share は `link / (link + k * R)` を 0.05 刻みに丸め、下限 0.10、上限 `STRATA_PCIE_SHARE_MAX`（設定時 0.10..1.0 に clamp、未設定時は離散 GPU かつ master switch 無効で 0.95、それ以外で 0.60）に制限する（`engine/include/strata/core/pcie_share_rule.hpp:16-31, 59-63`; `engine/src/program/generate.cpp:3101-3107, 3145-3149`）。
+
+自動更新は decode window 後に pool の miss 処理時間を集計する。初回は 12 window、その後は 48 window ごとに評価し、300 miss 未満なら測定を延期（2000 window まで不足なら停止）。正常に評価できた場合は最大 3 回更新し、丸め後の差が 0.025 未満なら share を変更しない。layer split では各後続 stage の link 測定値にも同じ `k` を適用する（`engine/src/program/generate.cpp:3127-3149, 15003-15010, 15015-15040`）。
+
+## ログと測定値
+
+この環境変数だけを示す専用ログはない。条件を満たして初期 share を計算した場合は `strata serve: PCIe share: start ...`、測定後に share が変化した場合は `strata serve: PCIe share: the CPU pool takes ...` が stderr に出る。layer split の後続 stage で計算された場合は `strata serve: PCIe share: stage ...` が出る（`engine/src/program/generate.cpp:14923-14928, 15021-15040`）。
+
+probe 失敗時は `strata generate: PCIe probe failed -> pcie_frac default ...` が出て probe ベースの自動更新は設定されない。測定時に pool rate / blob bytes / link の必要条件を満たさない場合、または share が 0.025 未満しか変わらない場合は更新ログが出ない（`engine/src/program/generate.cpp:5566-5579, 3144-3149`）。
+
+`docs/DETAILS.md:1206` も、離散カードでの `k` の低下、0.95 の上限、`STRATA_PCIE_K_RULE=0` による旧ルール復帰を説明しており、現行の実装と一致する。同表の速度値・品質値は資料に記載された測定値であり、この調査では再測定していない。
 
 ## 根拠
 
-- 読取とキャッシュ、係数 helper 呼出し: `src/program/generate.cpp:2693-2705`。
-- 値変換、既定条件、係数式: `include/strata/core/pcie_share_rule.hpp:16-27,38-43`。
-- `STRATA_DEFAULTS=026` は一度読み取られ、明示的な機能設定に優先されるマスタースイッチ: `include/strata/core/defaults_026.hpp:10-12,21-29`。
-- 初期 share と CLI/probe 条件: `src/program/generate.cpp:3574,4024-4026,4711-4755,12538-12556`。
-- 自動更新の起動条件、適用、ログ: `src/program/generate.cpp:12609-12646,18986`。
-- 更新回数と miss 数条件: `src/program/generate.cpp:2724-2747`。
-- 概要資料も CPU pool の速度に応じた係数と `STRATA_PCIE_K_RULE` の制御を記載しています: `docs/DETAILS.md:1050`。
+- `engine/src/program/generate.cpp:327-338` — 離散 / 統合 GPU の判定元。
+- `engine/src/program/generate.cpp:3101-3107` — ceiling と対象環境変数の読み取り・cache。
+- `engine/src/program/generate.cpp:5535-5579` — CLI 指定、形式・probe・backend による自動 share の有効化。
+- `engine/src/program/generate.cpp:14913-14931, 15003-15040` — 初期 share、測定更新、結果ログと stage 適用。
+- `engine/include/strata/core/pcie_share_rule.hpp:20-31, 42-63` — `k` の計算、値判定、既定値、share ceiling。
+- `engine/include/strata/core/defaults_026.hpp:21-29` — master switch の値と cache。
+- `docs/DETAILS.md:1206` — 実装と照合した設計資料。

@@ -1,45 +1,52 @@
 # `STRATA_IGPU_DEFAULTS`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-統合 AMD GPU 向けの「matrix-core prompt set」をまとめて無効にするスイッチです。対象セットは `STRATA_HIP_WMMA`、`STRATA_PF_GEMM`、`STRATA_PA_FAST`、`STRATA_SELECT_WMMA`、`STRATA_HC_UPMIX` の5個で、適用されると未設定の変数だけを値 `1` にします。通常の gfx1151 / gfx12 アーキテクチャ既定値テーブル全体を止める変数ではありません。
+統合 Radeon GPU 向けの行列コア prompt set をまとめて無効化する停止スイッチ。設定値を真偽値として parse するのではなく、値の先頭文字が `0` かを見ている。先頭が `0` なら `STRATA_IGPU_PROMPT_SET=1` より優先して set 全体を無効にする。それ以外は `STRATA_IGPU_PROMPT_SET` と OS・GPU に応じた既定判定へ進む（`engine/src/core/arch_defaults.cpp:124-138`）。
+
+set が有効な場合、Strata は対象の prompt 用環境変数を、まだプロセス環境に存在しないものだけ設定する。通常の対象は `STRATA_HIP_WMMA`、`STRATA_PF_GEMM`、`STRATA_PA_FAST`、`STRATA_SELECT_WMMA`、`STRATA_HC_UPMIX`。Windows の `gfx1151` では `STRATA_SELECT_WMMA` を含む12個の表に差し替わる（`engine/src/core/arch_defaults.cpp:172-215,406-421`）。
 
 ## 値と判定
 
-| `STRATA_IGPU_DEFAULTS` | 結果 |
-|---|---|
-| 未設定 | 他の条件と `STRATA_IGPU_PROMPT_SET` に従う |
-| 空文字 | 無効化しない（設定値の先頭文字が `\0`） |
-| 先頭文字が `0`（例: `0`, `0anything`） | prompt set を無効化する |
-| それ以外（例: `1`, `true`, `false`, ` 0`） | 無効化しない |
+この変数に「有効化する値」はない。`getenv` の結果が非 null で、最初の文字が `0` のときだけ全体を止める。文字列全体の比較、数値変換、空白除去、大文字小文字変換はしない（`engine/src/core/arch_defaults.cpp:124-129`）。
 
-文字列全体の parse や数値変換はなく、先頭文字だけを大文字小文字区別ありで比較します。無効化判定は `STRATA_IGPU_PROMPT_SET` より先に行われるため、`STRATA_IGPU_DEFAULTS=0 STRATA_IGPU_PROMPT_SET=1` でも set は無効です。
+| 条件 | unset | 設定時に停止する値 | 設定しても停止しない値 |
+|---|---|---|---|
+| `igpu_prompt_set_enabled` を呼ぶ経路 | `STRATA_IGPU_PROMPT_SET` と OS・GPU の既定判定へ進む | 先頭が `0`（`0`, `00`, `0anything`） | 空文字、`1`, `true`, `false`, ` 0`, `anything` など。これらは次の判定へ進む |
+
+停止しない値の場合、続いて `STRATA_IGPU_PROMPT_SET` を同じく先頭文字だけで判定する。先頭 `1` なら有効、先頭 `0` なら無効。それ以外（unset、空文字を含む）は OS・GPU 既定へ進む。したがって `STRATA_IGPU_DEFAULTS=0` は `STRATA_IGPU_PROMPT_SET=1` を上書きして停止し、逆に `STRATA_IGPU_DEFAULTS=1` は prompt set を強制有効化せず、次の変数・既定判定に委ねる（同 `:124-138`）。
 
 ## 有効になる条件
 
-この変数が無効化する set が適用されるのは HIP ビルドです。`src/program/generate.cpp` は HIP の場合にデバイス 0 の GPU 情報を取得し、統合 GPU かつ対象アーキテクチャであることを調べてから既定値を適用します。複数 GPU がある場合、見えている全 GPU が統合 GPU で、先頭7文字の GCN アーキテクチャ名も一致するときだけ `all_igpu` が真になります。離散 GPU が同居する構成では set は適用されません。
+全て満たす必要がある。
 
-対象アーキテクチャは `gfx1103`、`gfx1150`、`gfx1151` です。既定で有効なのは Linux の統合 `gfx1103` のみです。他の対象アーキテクチャでは `STRATA_IGPU_PROMPT_SET` の先頭文字が `1` なら opt-in できますが、`STRATA_IGPU_DEFAULTS` の先頭文字が `0` なら opt-in よりも優先して無効になります。Windows では既定で有効にならず、AMD_HIP の説明では未テストとされています。
+- HIP の通常の生成経路で、デバイス情報取得が成功し、`apply_arch_defaults` が呼ばれること。呼び出しは `STRATA_USE_HIP` ビルド条件内にある（`engine/src/program/generate.cpp:4287-4320`）。
+- 使用 GPU が統合 GPU で、アーキテクチャが `gfx1103`、`gfx1150`、`gfx1151` のいずれかであること。複数 GPU の場合、この呼び出し元は device 0 と device 1〜63 を調べ、それらが統合 GPU かつ device 0 と同じ先頭7文字の arch 名であるときだけ `integrated=true` を渡す（64台を超える場合、index 64 以降はこの判定ループの対象外。同 `:4291-4302,4320`; 対象 arch は `engine/src/core/arch_defaults.cpp:119-121,172-180`）。
+- `STRATA_IGPU_DEFAULTS` の先頭が `0` でないこと。
+- `STRATA_IGPU_PROMPT_SET` が先頭 `0` でなく、またはその変数が set を有効化する値であること。set の既定有効は Linux の `gfx1103` と Windows の `gfx1151`。他の対象 arch / OS の組み合わせは既定で無効（同 `:127-138`）。
+
+CUDA 生成経路はこの HIP 条件付き初期化を通らない。SYCL 側にある呼び出しは `apply_arch_defaults(ad.gcnArchName)` と1引数で、宣言上 `integrated` は既定値 `false` のため、この iGPU set は適用されない（`engine/sycl/src/program/generate.cpp:2223-2229`; `engine/include/strata/core/arch_defaults.hpp:157-162`）。CPU / Metal についても、この iGPU 用の呼び出し経路は確認できない。
+
+対象変数自体が無効条件となるほか、個別の set 変数が環境に既に存在すれば値が何であっても Strata は上書きしない。空文字や `0` も「ユーザー設定あり」として保持される（`engine/src/core/arch_defaults.cpp:406-410,218-223`）。
 
 ## 実行時の詳細
 
-判定箇所は `igpu_prompt_set_enabled()` で、環境をその呼び出し時に読みます。`apply_arch_defaults()` は `strata generate` の引数処理後、GPU の既定値を各エンジン機能が読む前に実行されます。環境変数は static cache されていません。プロセス起動後に値を変更した場合に再評価されるかどうかは、この起動時の呼び出し経路からは通常の生成処理で再評価されないと判断できます。
+`STRATA_IGPU_DEFAULTS` は `igpu_prompt_set_enabled` の呼び出しごとに `std::getenv` で読み、static cache はない。通常の HIP 生成経路では CLI 引数を処理した後、エンジンが各スイッチを読む前の初期化中に一度 `apply_arch_defaults` から評価される（`engine/src/program/generate.cpp:4287-4320`; 適用順の説明は `engine/include/strata/core/arch_defaults.hpp:157-162`）。CLI 引数との上書き関係はなく、別の環境変数 `STRATA_IGPU_PROMPT_SET` が次の判定を担う。
 
-prompt set が有効なら5個のスイッチを順に確認し、環境にすでに存在するものは値が空でも `0` でも上書きせず、それ以外を `1` に設定します。1個以上を設定したときは stderr に `strata: integrated GPU (<arch>): the matrix-core prompt set is on ...` の行を出力します。ログには各スイッチ名が並び、Windows ビルドでは `Not yet tested on Windows` も付加されます。
+set が有効なら、Strata は表の各名前について `getenv(...) != nullptr` のものを維持し、未設定のものだけ値を設定する。Windows では `_putenv_s`、それ以外では `setenv(..., 0)` を使ってプロセス環境へ設定する。この処理後に `STRATA_IGPU_DEFAULTS` を変更しても、すでに挿入された個別スイッチは取り消されない（`engine/src/core/arch_defaults.cpp:218-223,406-421`）。通常経路での起動後再評価や子プロセスへの引き渡しは、この実装からは確認できない。
 
-`STRATA_IGPU_DEFAULTS` は `arch_default_env()` の gfx1151 / gfx12 テーブルを参照しません。そのテーブルは `STRATA_GFX1151_DEFAULTS` / `STRATA_GFX12_DEFAULTS` が制御します。また、この変数は UMA arena の登録方法を制御しません。
+通常の表は5スイッチをすべて `1` にする。Windows の `gfx1151` は12スイッチに差し替わり、`STRATA_PF_F16` は `2`、残りは `1`（`engine/src/core/arch_defaults.cpp:183-213`）。スイッチ値をすでに設定している場合は、その値を保持するため一部だけが適用されることもある。
 
-## 文書との照合
+## ログと測定値
 
-`docs/AMD_HIP.md` は set の対象、個別スイッチ、`STRATA_IGPU_PROMPT_SET` との関係、およびこの変数が set 全体を無効にする点を記述しており、現行コードと一致します。同文書にある Radeon 780M の性能値や出力差の説明は同文書記載の測定報告であり、本調査で測定を再実施したものではありません。
+少なくとも1個のスイッチを新たに設定した場合、stderr に `strata: integrated GPU (%s): the matrix-core prompt set is on (1.6x to 2x faster prompts on a Radeon 780M, the answers differ in the last bits): ` で始まる行を出し、今回設定した名前を並べる。末尾は `Turn one off with NAME=0 (for example STRATA_HC_UPMIX=0), all of them with STRATA_IGPU_PROMPT_SET=0`。Windows ビルドではさらに `.  Not yet tested on Windows` を付加する。全スイッチがすでに環境にある場合、または set が無効ならこの行は出ない（`engine/src/core/arch_defaults.cpp:406-420`）。この文言中の性能値はログ文字列であり、本調査で再測定した値ではない。
 
 ## 根拠
 
-- `src/core/arch_defaults.cpp:62-74` — 先頭文字による無効化、`STRATA_IGPU_PROMPT_SET` との優先順位、gfx1103/Linux の既定条件。
-- `src/core/arch_defaults.cpp:88-107` — 統合フラグとアーキテクチャ条件、set を構成する5変数。
-- `src/core/arch_defaults.cpp:117-150` — 既存環境値の保持、未設定値への `1` の設定、stderr ログ。
-- `src/program/generate.cpp:2769-2786` — HIP ビルドでの起動時呼び出しと全 GPU の統合・アーキテクチャ確認。
-- `include/strata/core/arch_defaults.hpp:28-33,43-54` — 既定値と適用関数の説明。
-- `docs/AMD_HIP.md:598-630` — 利用者向け説明と測定報告。
+- `engine/src/core/arch_defaults.cpp:124-138` — 対象変数の値判定、`STRATA_IGPU_PROMPT_SET` との優先順位、OS / arch の既定。
+- `engine/src/core/arch_defaults.cpp:172-215` — 統合 GPU・対象 arch 条件、通常表と Windows `gfx1151` 表。
+- `engine/src/core/arch_defaults.cpp:218-223,302-310,406-421` — 環境への反映とログ。
+- `engine/src/program/generate.cpp:4287-4320` — HIP 生成経路での GPU 検出と適用時点。
+- `engine/sycl/src/program/generate.cpp:2223-2229`, `engine/include/strata/core/arch_defaults.hpp:157-162` — SYCL 呼び出しと `integrated` 引数の既定値。

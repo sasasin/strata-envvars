@@ -1,38 +1,55 @@
 # `STRATA_F16_RANGE`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの内部動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP の prompt prefill で FP16 に変換される activation と BF16 weight、および FP16 GEMM から戻る出力について、最大絶対値と FP16 の有限範囲を超えた値・NaN の個数を数え、prompt ごとに stderr へ出します。これは診断用カウンターであり、計算方式や値を切り替える設定ではありません。
+HIP の prefill 処理で FP16 に変換される値の最大絶対値と、FP16 の有限範囲を超えた値などの個数を数え、prompt ごとに stderr へ診断行を出すための計測スイッチです。数値として parse されず、設定有無だけで計測フラグを有効にします。計測分岐は `hf_sat` と FP16 GEMM の変換・出力処理にあります（`engine/src/prefill/prefill.cpp:2724-2731,7968-7974`、`engine/src/prefill/kernels.cu:58-77`、`engine/src/prefill/gemm.cu:88-124`）。
+
+この変数自体は FP16 prompt 経路を有効化しません。HIP の FP16 prompt GEMM は別の `STRATA_HIP_PROMPT_F16` 判定で選ばれます（`engine/src/prefill/gemm.cu:681-712`）。
 
 ## 値と判定
 
-値の内容は parse されず、`std::getenv("STRATA_F16_RANGE") != nullptr` だけで設定有無を判定します。unset は無効、設定済みなら値が空文字でも `0`、`false`、その他どの文字列でも有効です。数値変換、範囲検査、CLI や別変数との優先順位はありません。実装上、初期化時と出力時にそれぞれ関数内 `static const bool` へ結果を保存するため、各箇所の最初の評価後は環境を変更しても再評価されません。
+`std::getenv(...) != nullptr` による設定有無の判定です。文字列の変換、空白・大文字小文字・数値形式の検査はありません。空文字も設定済みとして有効で、`0`、`false`、`0anything` も同じく有効です。未設定だけが無効です（`engine/src/prefill/prefill.cpp:2730-2731,7969-7971`）。
+
+| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| HIP (`__HIPCC__`) | 診断フラグを有効にしない | 空文字を含む、環境に存在するすべての値 | なし（値の内容は判定しない） |
+| CUDA / その他の `prefill.cpp` ビルド | 診断フラグを有効にしない | 読み取り側では設定済みと判定するが、計測関数が実効化されない | なし |
+
+CUDA では `set_f16_range` と `gemm_set_f16_range` が引数を無視し、`f16_range_read` と `gemm_f16_range_read` は `false` を返します。そのため設定しても診断行は出ません（`engine/src/prefill/kernels.cu:2921-2950`、`engine/src/prefill/gemm.cu:130-155`）。
 
 ## 有効になる条件
 
-- 実カウンターと読み出し処理は HIP ビルドでのみ実装されています。CUDA では設定有無を読んで有効化関数を呼びますが、それらは no-op で、読み出し関数は `false` を返すため範囲ログは出ません。
-- HIP でも prompt prefill の初期化と完了処理が通る必要があります。調査時点のコードではこの設定による集計処理は gfx103x の FP16 経路だけには限定されておらず、HIP の FP16 活性値変換箇所および FP16 GEMM が使う対象箇所を数えます。FP16 入出力 GEMM の選択自体は別設定 `STRATA_HIP_PROMPT_F16` が制御します。
-- prompt が複数の prefill stage/device に分かれる場合、カウンターは GPU device symbol に保持されます。コードの集計ログには device ID が含まれません。
+- `STRATA_F16_RANGE` が設定されていること。`Prefill::init` 内の設定有無判定が true になると、activation と GEMM の各計測フラグを on にします（`engine/src/prefill/prefill.cpp:2724-2731`）。
+- 計測カウンターを持つ実装は HIP のみです。CUDA カーネルは `hf_sat` で計測フラグを読まず、計測用 device symbol も HIP 条件内にあります（`engine/src/prefill/kernels.cu:62-77`、`engine/src/prefill/gemm.cu:85-99`）。
+- ログを出すには prompt 完了時に activation と GEMM の両方の読み取りが成功する必要があります。どちらかが false なら `fprintf` は実行されません（`engine/src/prefill/prefill.cpp:7968-7974`）。
+- 実際に FP16 prompt GEMM の重み・出力が計測対象になるには、別条件として `Gemm::bf16` の HIP 実装で `f16_io_` が true である必要があります。これは `Prefill::init` が `prompt_f16()` の結果を設定し、`prompt_f16()` は `STRATA_HIP_PROMPT_F16` と device 判定で決めます（`engine/src/prefill/prefill.cpp:2727-2729`、`engine/src/prefill/gemm.cu:681-712,1169-1181`）。
 
 ## 実行時の詳細
 
-初期化時に `set_f16_range(true)` と `gemm_set_f16_range(true)` が HIP device symbol の計測 flag を設定します。activation 側では `hf_sat` に入る値の絶対値最大と、`abs(value) > 65504` または NaN の件数を数えます。これは変換後の値ではなく、飽和変換に入る前の値です。GEMM 側では BF16 weight を FP16 に変換する入力値（slot 0）と、rocBLAS が FP16 で書いた出力を FP32 に widen する際の値（slot 1）を数えます。最大値は浮動小数点値の bit 表現による atomic max、超過数は atomic count です。
+環境変数は `Prefill::init` の関数内 `static const bool` で初回評価され、その後の init では再読込されません。prompt 終了側にも別の `static const bool` があり、最初にその箇所へ到達したときの設定有無を保持します。したがって、実行中に環境変数を追加・削除しても、各 cache の初期化後は反映されません（`engine/src/prefill/prefill.cpp:2724-2731,7968-7971`）。
 
-prompt 完了後、CUDA stream 同期などの後処理を経て両カウンターを読み出し、成功時に次の形式で stderr に出します: `strata f16 range: <tokens> tokens: activation images max |x| ... (... beyond 65504 or NaN), BF16 weights max |w| ... (...), FP16 GEMM outputs max |y| ... (... not finite)`。この集計では weight と activation の超過数は 65504 超または NaN、GEMM output の超過数は非有限値の件数として表示されます。読み出し後に最大値と件数はゼロへ戻されます。符号付きの有限値は absolute value で測定されます。
+HIP では init 中に現在の stage device のもとでカーネルの計測フラグを設定します。activation 側の `hf_sat` は `|f| > 65504` または NaN を数え、最大絶対値を保持します。FP16 GEMM 側は BF16 重みを飽和付き FP16 に変換する値（slot 0）と、FP16 GEMM 出力を FP32 に widen する際の値（slot 1）を計測します（`engine/src/prefill/prefill.cpp:2724-2731`、`engine/src/prefill/kernels.cu:66-77`、`engine/src/prefill/gemm.cu:94-124`）。
 
-設定時の flag を device symbol に書けない場合は stderr に `prefill: setting the FP16 range check failed: ...` または `prefill gemm: setting the FP16 range check failed: ...` を出し、`exit(1)` します。読み出し copy に失敗した場合、その読み出し関数は `false` を返し、上記の範囲ログは出ません。
+prompt 終了時にカウンターを読み、読み取り成功時はリセットを要求します。両方の読み取りに成功すると `strata f16 range: ...` を stderr に出します。activation 側の読み取り・リセットに失敗した場合は false、GEMM 側の読み取り失敗も false となり、この診断行は出ません（`engine/src/prefill/kernels.cu:2932-2949`、`engine/src/prefill/gemm.cu:141-155`、`engine/src/prefill/prefill.cpp:7968-7974`）。
 
-## 文書との照合
+device symbol への計測フラグ設定に失敗した場合は、activation 側が `prefill: setting the FP16 range check failed: %s`、GEMM 側が `prefill gemm: setting the FP16 range check failed: %s` を stderr に出し、どちらも `exit(1)` します（`engine/src/prefill/kernels.cu:2921-2927`、`engine/src/prefill/gemm.cu:130-139`）。
 
-`docs/AMD_HIP.md` はこの設定を prompt ごとの FP16 範囲診断として説明しており、コードの HIP 限定カウンターと整合します。同文書の性能値は特定の AMD 機、ROCm、モデル・量子化・prompt 条件での測定であり、この環境変数による性能効果を示すものではありません。本調査では新たな測定をしていません。
+## ログと測定値
+
+計測行は次の実装文字列で stderr に出ます。`n` はその prompt の token 数、`xm/xo` は activation 計測、`wy[0]/wyo[0]` は BF16 重みから FP16 への変換、`wy[1]/wyo[1]` は FP16 GEMM 出力の値です。
+
+```text
+strata f16 range: %lld tokens: activation images max |x| %.1f (%llu beyond 65504 or NaN), BF16 weights max |w| %.3f (%llu), FP16 GEMM outputs max |y| %.1f (%llu not finite)
+```
+
+設定がないときは計測行を出しません。計測値そのものや性能測定値はソースから確認できず、本書には記載していません（`engine/src/prefill/prefill.cpp:7968-7974`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:1382-1390` — prefill stage 初期化、FP16 activation mode 設定と環境変数の読み取り。
-- `src/prefill/prefill.cpp:4718-4726` — prompt 完了時の読み出し、stderr の実際の文言。
-- `src/prefill/kernels.cu:44-67,80-85,2318-2355` — activation 計測、HIP/CUDA 分岐、読み出しと reset。
-- `src/prefill/gemm.cu:63-131` — weight/output の HIP 計測と読み出し、CUDA no-op。
-- `include/strata/prefill/kernels.hpp:43-49`, `include/strata/prefill/gemm.hpp:15-19` — カウンター API の説明と対応範囲。
-- `docs/AMD_HIP.md:523-534` — HIP FP16 prompt 経路と診断に関する資料。
+- `engine/src/prefill/prefill.cpp:2724-2735` — init 時の読み取り、static cache、stage device 上の計測 flag 設定、および独立した `STRATA_HIP_PROMPT_F16` との関係。
+- `engine/src/prefill/prefill.cpp:7968-7974` — prompt 終了時の読み取り、reset 要求、出力条件と stderr の文言。
+- `engine/src/prefill/kernels.cu:58-77,2921-2950` — HIP 限定の activation counter、65504/NaN 判定、設定失敗時の終了、CUDA の no-op / false。
+- `engine/src/prefill/gemm.cu:85-155,1169-1181` — HIP 限定の重み・GEMM 出力 counter、read/reset、および FP16 prompt GEMM の条件。
+- `engine/src/prefill/gemm.cu:681-712` — `prompt_f16()` が HIP で別途 `STRATA_HIP_PROMPT_F16` と device 情報から FP16 prompt 経路を決める箇所。

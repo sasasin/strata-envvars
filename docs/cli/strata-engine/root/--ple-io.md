@@ -1,60 +1,64 @@
 # `--ple-io`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` エンジンの引数 parser（`generate` 実行経路） |
+| コマンド | `strata generate`（エンジン引数。`strata` / `strata.exe`） |
 | オプション | `--ple-io` |
 | 別名 | なし |
 | 値 | `direct`、`mmap`、`ram` のいずれか |
 
 ## 役割
 
-PLE（per-layer token embedding）/n-gram テーブルの読み込み方式を選びます。テーブルは `--ple-gguf PATH` で指定します。通常は直接 I/O の `direct`、OS のファイルマッピングを使う `mmap`、マップした全テーブルのページを起動時に読み込んで RAM にロックする `ram` から選びます。エンジンの help では `direct` が既定値と説明されています（`src/program/generate.cpp:819-822`）。
+PLE（n-gram）テーブルの読み出し方を選ぶ。`direct` はテーブルをメモリマップせず行を直接読み、`mmap` はファイルをマップしてOSのファイルキャッシュを使い、`ram` はマップしたテーブルを起動時にページインしてロックを試みる。`--ple-gguf` でPLEテーブルを指定した実行経路に適用される。エンジンのusageにも3値と既定値が記載されている（`engine/src/program/generate.cpp:1218-1224`）。
 
 ## 使い方
 
 ```sh
-strata --pack pack/full --tokens "1,2,3" --ple-gguf /models/ple.gguf --ple-io mmap
-```
+# 指定したPLEテーブルをOSのファイルキャッシュ経由で読む
+strata generate --pack /path/to/pack --tokens "1,2,3" --ple-gguf /path/to/ple.gguf --ple-io mmap
 
-通常 parser の使用例です。実際に PLE を有効にするには `--ple-gguf` が必要で、`--no-ple` と `--ple-gguf` は併用できません（`src/program/generate.cpp:3290-3300`）。
+# 対応環境でテーブルをページインし、RAMロックを試みる
+strata generate --pack /path/to/pack --tokens "1,2,3" --ple-gguf /path/to/ple.gguf --ple-io ram
+```
 
 ## 値と既定値
 
-- `direct`: 既定値です。テーブル行を非バッファの直接読み込みで取得し、PLE テーブルをプロセスのマップ領域として保持しません。
-- `mmap`: PLE を含む GGUF のテーブル領域をマップし、OS のページキャッシュ経由で参照します。
-- `ram`: `mmap` と同じマップを使い、起動時にテーブル全体のページを読み込み、可能ならメモリにロックします。
-
-parser は値を文字列として受け取り、同じオプションを複数回指定した場合は後の値が残ります。値の検証は引数解析後に行われ、3種類以外の値は `invalid --ple-io/...` エラーで終了コード 2 になります。値を省略すると `--ple-io needs a value` を stderr に出し、終了コード 2 で終了します（`src/program/generate.cpp:480-481,2418-2421,2475,3181-3185`）。
+- 省略時は `direct`。parser の初期値は `"direct"`（`engine/src/program/generate.cpp:817-819`）。
+- `direct`、`mmap`、`ram` 以外は受理されず、空文字列も同じ検証により不正値となる。値を省略すると `--ple-io needs a value` を stderr に出して終了コード `2`（`engine/src/program/generate.cpp:3842-3847, 5009-5012`）。
+- 同じオプションを複数回指定した場合、parser は各出現で値を代入するため最後の値が残る。いずれかを明示した事実も記録され、自動選択より明示指定が優先される（`engine/src/program/generate.cpp:3901`）。
+- オプションの値は常に検証されるが、読み出し方式の設定は `--ple-gguf` が空でない場合にテーブルを開く処理で使用される（`engine/src/program/generate.cpp:6269-6276`）。
 
 ## 実行時の動作
 
-`--ple-gguf` が指定されていると、`direct` は `PleIo::Direct`、`mmap` と `ram` は `PleIo::Mmap` に変換されます。`ram` の場合だけロック要求も有効にします（`src/program/generate.cpp:4033-4040`）。テーブルの GGUF、tensor 名・形状・形式、データ範囲が不正な場合は開けず、理由を `strata generate:` 付きで stderr に出し、終了コード 1 になります（`src/kernels/ngram.cpp:255-267,271-295,316-337,339-354`; 呼び出し側 `src/program/generate.cpp:4052-4055`）。
+`direct` は非バッファの直接読み込み経路を選び、`mmap` と `ram` はメモリマップ経路を選ぶ。`ram` の場合のみロックを要求する。直接読み込み経路では、reader にテーブルのオフセットと行数を渡し、マッピングを保持しない（`engine/src/program/generate.cpp:6270-6276`; `engine/src/kernels/ngram.cpp:448-466`）。
 
-`direct` では起動時に短いランダム行読み込み probe を行います。`STRATA_PLE_PROBE` が設定されている場合は probe をスキップします。測定値が 15,000 rows/s 未満で正の値なら通常は警告だけで `direct` を維持します。`STRATA_PLE_AUTO_MMAP` が非ゼロで、かつ `--ple-io` を明示していない場合に限り `mmap` へ切り替えてテーブルを開き直します。従って明示的な `--ple-io direct` は環境変数が有効でも切り替えられません。15,000 rows/s 以上の場合は probe 結果を stderr に表示します（`src/program/generate.cpp:2219-2240,4056-4089`）。環境変数の条件は [`STRATA_PLE_AUTO_MMAP`](../../../STRATA_PLE_AUTO_MMAP.md) の文書も参照してください。
+CUDA/HIP 側の `engine/src/program/generate.cpp` では、値を明示せず `direct` のままの場合、使用可能メモリ、PLEテーブルと専門家アリーナのサイズ、8 GiBの余裕を基に `ram` への自動切替を判定する。未知のメモリ情報・テーブルサイズ・アリーナサイズは適格とせず、`STRATA_DEFAULTS=026` の既定方針でも自動選択しない。Appleでは `STRATA_PLE_AUTO_RAM=1` がなければこの自動方針を無効にする。`STRATA_PLE_AUTO_RAM` が設定されている場合は `0` が無効、それ以外の整数値は有効として判定される（`engine/include/strata/core/ple_residency.hpp:25-37`; `engine/src/program/generate.cpp:6303-6325`）。条件を満たしてマップ・ロックを再試行できると direct から `ram` に切り替えた旨を stderr に出す。再オープンに失敗した場合は direct に戻し、それも失敗なら終了コード `1` で失敗する（`engine/src/program/generate.cpp:6324-6346`）。明示した `--ple-io` はこの自動RAM選択を抑止する。SYCL側の同じ起動処理にはこの自動RAM選択がなく、`direct` として開始する（`engine/sycl/src/program/generate.cpp:3350-3372`）。
 
-直接読み込みは `--ple-inflight` の同時読み込み数や `--ple-row-cache` の行キャッシュと併用され、`--ple-sync-submit` を付けない限り I/O worker thread を使います。SSD の keep-alive も `direct` の worker 使用時だけ有効です。これらは当オプションとは別の設定ですが、読み込み経路に影響します（`src/program/generate.cpp:4038-4050`）。
+direct 読み込みの起動時プローブは `STRATA_PLE_PROBE` が未設定の場合に走る。測定値が 15,000 rows/s 未満かつ0より大きいと遅い旨を警告する。既定では直接方式を維持する。未指定のまま `STRATA_PLE_AUTO_MMAP` に非0値を設定している場合だけ `mmap` に切り替える。明示した `--ple-io direct` はこの自動切替を抑止し、遅い場合も警告にとどまる（`engine/src/program/generate.cpp:6350-6383`; SYCL側も同じ判定: `engine/sycl/src/program/generate.cpp:3373-3407`）。
 
 ## 適用条件と副作用
 
-- `ram` は全テーブルの読み込みを伴うため、テーブル容量分の RAM とページロック可能量が必要です。POSIX では `madvise`、並列ページ読み込み、`mlock` を行います。Windows ではページをロックする helper を使います。ロック失敗時も起動は続きますが、全ページを触れて常駐を試みるだけとなり、ページは回収され得ます。成功・失敗はログに表示されます（`src/kernels/ngram.cpp:356-410`; 表示 `src/program/generate.cpp:4103-4106`）。
-- POSIX で `direct` の PLE ファイルが回転ディスク上にあると判定された場合、prompt が長時間停止する可能性について警告します。自動変更はしません（`src/program/generate.cpp:4091-4101`）。
-- Windows で PLE shard が expert tensor も含み、expert 側のマップを閉じた場合、`mmap`/`ram` では PLE shard のマッピングを維持するため、そのファイルからの expert 読み込みが直列化される旨を note として出します（`src/program/generate.cpp:8314-8323`）。
-- `--ple-gguf` を指定しない通常経路では PLE テーブルの読み込み処理は実行されません。ネイティブモデル経路では対象 shard の自動選択条件もあります（`src/program/generate.cpp:3247-3253,4033`）。
+- `mmap` はテーブルを実行中マップしてファイルキャッシュを利用する。Windowsで、PLEテーブルと専門家データが同じGGUFにあり、専門家側のマップを閉じた場合には、PLE側のマップが残るため専門家読み込みが直列化されることを通知する（`engine/src/program/generate.cpp:12266-12271`）。
+- `ram` は起動時に全テーブルのページを触り、ページロックを試す。テーブルサイズが搭載RAMの半分を超えるWindows環境では警告する。Windowsのロック失敗は部分ロックを解除してページを触るだけにし、POSIXの `mlock` 失敗もページを常駐させたまま警告して続行する。したがってロック失敗自体は起動失敗ではない（`engine/src/kernels/ngram.cpp:467-491, 497-545`）。
+- SYCLビルドでは Windows 上の `--ple-io ram` は stderr に利用不可の案内を出して終了コード `2` となり、`mmap` を案内する。CUDA/HIP側の処理とは異なる（`engine/sycl/src/program/generate.cpp:2517-2526`）。
+- 非Windowsで `direct` のテーブルが回転ディスク上にあると検出された場合は、プロンプト処理が長時間停止し得る旨を警告する。方式を強制変更はしない（`engine/src/program/generate.cpp:6385-6395`; SYCL側: `engine/sycl/src/program/generate.cpp:3408-3418`）。
+- `mmap` / `ram` はテーブルのマッピングを保持する一方、`direct` では保持しない。通常のGGUF読込・テーブル形式検証に失敗すると stderr に理由を出し、エンジン処理は終了コード `1` で失敗する（`engine/src/kernels/ngram.cpp:364-446`; 呼び出し側: `engine/src/program/generate.cpp:6288-6291`）。
 
 ## 出力とエラー
 
-低速 probe、回転ディスクの警告、`ram` のロック状態や失敗、必要に応じて SSD keep-alive の状況は stderr に出ます。PLE ファイルを開けない場合や `mmap` への自動再オープンに失敗した場合はエラーを stderr に出して終了コード 1 です。値の不正や値の欠落は終了コード 2 です（`src/program/generate.cpp:3181-3185,4052-4055,4071-4087,4103-4112`）。
+- 値が不正: `strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us` を stderr に出し、終了コード `2`（`engine/src/program/generate.cpp:5009-5012`）。
+- 値の欠落: `--ple-io needs a value` を stderr に出し、終了コード `2`（`engine/src/program/generate.cpp:3844-3847`）。
+- 明示的な `ram` がロックできない場合: `strata: PLE table ... lock failed` 等を stderr に出して続行する。出力はOSとロック失敗理由で異なる（`engine/src/kernels/ngram.cpp:467-491, 516-542`）。
+- direct の遅い測定、回転ディスク、または自動RAM選択は警告・案内を stderr に出す。通常はそれ自体で異常終了せず、自動切替は上記の条件に限られる（`engine/src/program/generate.cpp:6333-6345, 6352-6395`）。
 
 ## 根拠
 
-- Parser の既定値・明示指定フラグ: `src/program/generate.cpp:480-481`
-- help 記載: `src/program/generate.cpp:819-822`
-- 値の引数受け取り: `src/program/generate.cpp:2418-2421,2475`
-- 値の検証と終了コード: `src/program/generate.cpp:3181-3185`
-- PLE I/O 設定・環境変数・probe・自動 `mmap`・警告: `src/program/generate.cpp:4033-4112`
-- GGUF テーブルの形式・サイズ検証と `direct`/`ram` の実装: `src/kernels/ngram.cpp:255-414`
-- PLE shard 内の expert 読み込みに関する注意: `src/program/generate.cpp:8314-8323`
+- ツール・scope: `docs/cli/README.md:1036-1042` は `strata-engine` のトップレベル「エンジン引数」を `strata-engine/root/` に配置している。
+- 値の初期値・usage: `engine/src/program/generate.cpp:817-819, 1218-1224`。
+- 値取得・検証: `engine/src/program/generate.cpp:3842-3847, 3901, 5009-5012`。SYCL parser: `engine/sycl/src/program/generate.cpp:1882-1887, 1940, 2517-2526`。
+- 読み方の指定・メモリ方針・probe: `engine/src/program/generate.cpp:6269-6289, 6292-6383`。SYCL側の読み方・probe: `engine/sycl/src/program/generate.cpp:3350-3407`。
+- テーブルのマッピング、直接reader、ページロックと失敗時の継続: `engine/src/kernels/ngram.cpp:364-466, 467-545`。
+- ディスク警告とWindowsでの同一GGUFへの影響: `engine/src/program/generate.cpp:6385-6395, 12266-12271`。

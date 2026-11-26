@@ -1,6 +1,6 @@
-# `--output`
+# `strata components rollback --output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,57 +8,56 @@
 | コマンド | `strata components rollback` |
 | オプション | `--output` |
 | 別名 | なし |
-| 値 | `human`、`json`、`jsonl` |
+| 値 | `human`、`json`、`jsonl` のいずれか |
 
 ## 役割
 
-rollback の結果やエラーを標準出力・標準エラーへどの形式で表示するかを選びます。engine の切り戻し内容や実行条件は変更しません。
+rollback の結果や失敗を、人向けテキストか機械処理向け JSON で出力します。エンジンの切り替え処理自体は出力形式によって変わりません。`jsonl` は rollback 中に待機が発生した場合の待機イベントも1行の JSON として出し、完了時には結果オブジェクトを出します（`terminal/strata_cli/update_cmd.py:117-139,326-340`）。
 
 ## 使い方
 
 ```sh
-strata components rollback --output json
-```
+# 人向けの結果表示（既定値）
+strata components rollback
 
-このコマンドは実際に前回の更新で保存された engine へ切り戻します。意図して切り戻す場合に実行してください。出力形式だけを確認する目的なら `strata components rollback --help` を使えます。
+# 結果を JSON で受け取る
+strata components rollback --output json
+
+# 待機イベントと最終結果を JSON Lines として受け取る
+strata components rollback --wait 30 --output jsonl
+```
 
 ## 値と既定値
 
-- 省略時は `human` です。
-- `human`、`json`、`jsonl` のいずれかだけを受理します。その他の値は `argparse` の choices 検証で拒否され、コマンド本体に入る前に usage とエラーが表示されます（終了コード 2）。
-- 短縮 alias や `--json` alias はこの parser にありません。
+`--output` は `human`、`json`、`jsonl` のいずれかを受け取り、省略時は `human` です。値なし、またはこの3種類以外の値は `argparse` の引数エラーになります。別名や短縮形はありません（`terminal/strata_cli/update_cmd.py:47-57,80-82`）。
 
 ## 実行時の動作
 
-- `human` は成功時に切り戻し元・先のバージョン、保存済み tuning preset の扱い、再試行方法を人向けの文で表示します。
-- `json` は成功時に `schema_version: 1`、`ok: true` と rollback 結果を含む JSON オブジェクトを標準出力へ1行で出します。
-- `jsonl` も成功結果は同じ JSON オブジェクトです。`--wait` により serving 中の engine が止まるのを待つ場合は、待機イベントが先に JSON Lines で出ることがあります。rollback 自体からは進捗イベントを出しません。
-- `json` と `jsonl` の失敗は `schema_version: 1`、`ok: false`、`error.code`、`error.message` を含む JSON オブジェクトとして出力されます。`human` の失敗は `strata: ...` の形式で標準エラーへ出ます。
+- `human` では切り替え結果と、保存済み tuning preset の扱い、および次の操作案内を通常の文章で標準出力へ表示します（`terminal/strata_cli/update_cmd.py:332-339`）。
+- `json` では成功時に `schema_version: 1`、`ok: true` と rollback 結果を含む JSON オブジェクトを標準出力へ出します。エラー時は `schema_version: 1`、`ok: false`、エラーコードとメッセージを含む JSON オブジェクトになります（`terminal/strata_cli/update_cmd.py:309-316,326-332,378-388`）。
+- `jsonl` も成功・失敗の結果オブジェクトを1行の JSON として出します。エンジンが稼働中で `--wait` による待機が始まった場合、待機イベントも先に JSON 行で出力されます。待機がない rollback は、出力形式が JSON Lines でも結果行だけです（`terminal/strata_cli/update_cmd.py:117-139,326-332`、`terminal/strata_control/updater.py:383-394`）。
+
+この option は `update_cmd` が登録する `strata components rollback` parser の共通引数です。CLI は同コマンドを `update_cmd.run()` へ渡し、rollback 分岐では `.updates` の状態に記録された前回のエンジンへ戻ります。`--feed` は使わず、rollback はダウンロードしません。`--backend` は検出対象のハードウェア指定に使われます。`--wait` は稼働中エンジンへの待機条件を変えます。`--force` と `--model-config` は rollback 分岐では参照されません（`terminal/strata_cli/cli.py:2210-2212`、`terminal/strata_cli/update_cmd.py:47-57,307-340`、`terminal/strata_control/updater.py:1776-1798`）。
 
 ## 適用条件と副作用
 
-`--output` 自体の副作用は表示形式の選択です。rollback コマンドは選択した形式にかかわらず、前回の engine が記録されていなければ失敗します。実行できる場合は前回の engine package を検証して pin し、次回の起動でそれが選ばれることを確認します。状態ファイルには pin・active/previous の更新と履歴が保存されます。engine の切り替えで tuning preset の再確認が必要になった場合は印を付けますが、preset は削除しません。
+出力形式は rollback の可否や対象バージョンを変更しません。rollback はコンポーネントフォルダーの更新ロックを取得し、記録済みの前バージョンを読み込みます。対象パッケージの manifest と全ファイルを検証してから、エンジンの pin、active/previous/skipped 状態、履歴を更新し、状態ファイルへ保存します。エンジンの内容をダウンロード・削除する処理ではありません（`terminal/strata_control/updater.py:1776-1798,1723-1773`、状態保存: 同 `:227-265`）。
 
-`--wait` で serving 中の engine の停止を待つとき、`--output jsonl` では待機イベントを出力します。待機指定がなくても human 対話端末なら確認を促しますが、machine 出力または非対話実行では待たずに Busy エラーになります。`--components-dir` は rollback state/package を探す場所を指定し、`--backend` はこの PC で復元 engine が利用可能かの判定に使われます。
+保存済み tuning preset は削除されません。エンジンの識別情報が変わった場合は短い再確認が必要な印を記録し、同一識別情報への復帰など印が不要な場合は新たに付けません（`terminal/strata_control/updater.py:1768-1773`、`terminal/strata_control/preset_marks.py:72-96`）。
+
+エンジンが稼働中なら `--wait` の秒数だけ停止を待てます。対話端末で待機時間を指定せずに実行した場合は、待つかを質問し、肯定時は最大6時間待ちます。機械出力または入力が端末でない場合は質問せず、稼働が続いていれば終了コード `7` で拒否します（`terminal/strata_cli/update_cmd.py:504-520`、`terminal/strata_control/updater.py:383-394`）。
 
 ## 出力とエラー
 
-- `--output` の未対応値は parser 段階で終了コード 2 です。
-- 保存された前回 engine がない、またはすでにその engine が有効な場合は終了コード 2 です。
-- 前回 engine の package が欠損・破損している場合、または現在の PC に適合しない場合は終了コード 5 です。
-- serving 中で待機しない場合や待機時間内に停止しない場合は Busy エラー（終了コード 7）になります。その他の updater エラーもそれぞれの終了コードで返されます。
-- JSON/JSONL モードの JSON は `stdout`、human エラーは `stderr` です。`jsonl` の待機イベントは `schema_version: 1` と event 情報を持つ JSON 行です。
+- 前バージョンの記録がない、またはすでにそのバージョンを使っている場合は終了コード `2` です。
+- 前バージョンの manifest / ファイル検証に失敗した場合、またはそのエンジンが現在の PC で使えなくなっていた場合は終了コード `5` です。
+- エンジンが稼働中で待機できない場合は終了コード `7` です。これらの `UpdateError` は `human` では `strata: ...` を標準エラーへ、`json` / `jsonl` ではエラー JSON を標準出力へ出します（`terminal/strata_control/updater.py:1776-1798,72-82`、`terminal/strata_cli/update_cmd.py:311-316,378-388`）。
+- `update_lock` は `.updates` ディレクトリと `update.lock` を開いて排他します。同じコンポーネント領域で別の updater が動作中なら終了コード `7` です。状態保存中などに起きた `OSError` も CLI の共通エラー処理へ渡り、機械出力時には JSON エラーになります（`terminal/strata_control/updater.py:195-224,255-265`、`terminal/strata_cli/cli.py:2258-2265`）。
 
 ## 根拠
 
-- parser と値の choices、既定値、rollback parser への登録: `strata_cli/update_cmd.py:30-40,57-59`
-- 実行形式の判定、出力内容、rollback 呼び出しとエラー形式: `strata_cli/update_cmd.py:62-84,163-196,225-234`
-- 共通 parser から dispatch まで: `strata_cli/cli.py:139-140,2135-2137`
-- updater state の読込・原子的保存・履歴保持: `strata_control/updater.py:165-204`
-- rollback の前提確認、待機、package 検証、pin と履歴の更新: `strata_control/updater.py:1033-1078`
-- serving 待機イベント: `strata_control/updater.py:300-311`
-- `--wait` の既定・human 対話と machine 出力の違い: `strata_cli/update_cmd.py:237-252`
-- 起動時に手動 rollback の pin が優先される処理: `strata_control/engine_component.py:937-944`
-- オプションの索引上の scope: `docs/cli/README.md` の `strata components rollback` 節
-
-調査範囲は上記 commit の checkout 内の Terminal CLI parser と実装です。別環境の配布バイナリや Release artifact は照合していません。
+- `terminal/strata_cli/update_cmd.py:47-57,80-82` — 共通 parser の `--output` 定義と rollback parser への登録。
+- `terminal/strata_cli/cli.py:2210-2212`、`terminal/strata_cli/update_cmd.py:307-340` — dispatch、rollback の出力分岐と成功時の形式。
+- `terminal/strata_cli/update_cmd.py:117-139,504-520` — JSONL イベント、待機時の質問と非対話動作。
+- `terminal/strata_control/updater.py:383-394,1776-1798,1723-1773` — 稼働中チェック、前バージョン検証と切り替え状態の更新。
+- `terminal/strata_control/updater.py:195-265`、`terminal/strata_control/preset_marks.py:72-96` — 排他ロック、状態ファイル保存、preset 再確認印。

@@ -1,51 +1,39 @@
 # `STRATA_REFILL_SERIAL`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-serve のプロンプト処理で、プロンプト用に一時貸し出しした expert-cache slot を返却するとき、複数 GPU stage の refill を stage ごとに完了させるか、全 stage のコピーを先に発行してから待つかを切り替えます。通常の設定では、各 stage のコピーをすべてキューに入れてから、それぞれの完了を待ちます。変数が設定されていると、1 stage 分のコピーを発行して完了を待ち、次の stage に進みます。
-
-読み取りは CUDA/HIP 系の `src/program/generate.cpp` と SYCL 版の `sycl/src/program/generate.cpp` に各1箇所あります。両方とも同じ判定・分岐です。プロンプト用 slot の貸し出しがない場合や、refill 対象の stage が1つ以下の場合は、設定の有無で処理順序は変わりません。
+prompt path が expert cache から借りた slot を返す refill 処理の順序を切り替える。CUDA/HIP 側 (`engine/src/program/generate.cpp`) と SYCL 側 (`engine/sycl/src/program/generate.cpp`) の両方に読み取りと同じ分岐がある。複数の参加 stage がある通常経路では、未設定なら全参加者のコピーを先に発行してから待ち、設定ありなら参加者ごとにコピーを発行して完了を待つ。各経路は借りた slot を同じ cache に戻す処理であり、この変数が直接変えるのは refill の順序である（`engine/src/program/generate.cpp:20543-20568`, `engine/sycl/src/program/generate.cpp:11373-11399`）。
 
 ## 値と判定
 
-値を parse せず、`getenv("STRATA_REFILL_SERIAL") != nullptr` だけを見ます。
+| ビルド | unset | 設定時に有効になる値 | 無効になる値 |
+|---|---|---|---|
+| `engine/src` (CUDA/HIP) と `engine/sycl/src` (SYCL) | `refill_serial == false` | 空文字、`0`、`1`、`true`、`false`、`0anything` を含む、環境変数が存在するすべての場合 | なし |
 
-| 状態 | 動作 |
-|---|---|
-| 未設定 | 複数 stage に refill がある場合、全 stage のコピー発行後に各 stage を待つ |
-| 設定あり | 複数 stage に refill がある場合、stage ごとにコピー発行と完了待ちを行う |
-
-`1` 以外の値でも、空文字でも、環境変数が存在すれば逐次方式になります。値の大文字小文字、数値形式、範囲は検査されません。CLI 引数や設定ファイルによる上書きはありません。
-
-判定結果は関数内の `static const bool` に保存されます。宣言箇所の実行に初めて到達した際に読み取られ、その後プロセス内で環境を書き換えても再評価されません。
+両実装とも `std::getenv("STRATA_REFILL_SERIAL") != nullptr` の真偽だけを `static const bool` に保存する。文字列の変換・比較はせず、空白、大文字小文字、数値としての妥当性も調べない。したがって `=0` や空文字も有効である。未設定だけが false になる（`engine/src/program/generate.cpp:20545-20546`, `engine/sycl/src/program/generate.cpp:11375-11376`）。
 
 ## 有効になる条件
 
-- serve のプロンプト経路で、expert-cache の slot をプロンプト用バッファとして貸し出し、後で expert データを戻す処理に入ること。
-- refill 時点で `p.lent` が空でない `PfPart` が2つ以上あること。`PfPart` は CUDA0 と layer split の各 stage のキャッシュを表します。実際に複数 `PfPart` に貸出中 slot がある場合にだけ、並列方式と逐次方式の分岐が異なります。
-- layer split の各 stage が自分の cache/device にコピーを戻します。コピー先 slot と residency table を復元してから、各 device の residency table を再 upload します。
-
-1 GPU の場合、または layer split でも貸出中 slot のある stage が1つだけの場合は、`refill_one()` が使われ、変数による差はありません。slot を貸し出していない構成でも refill 対象がなく、処理は変わりません。
+- 実行バイナリが該当する `engine/src` または `engine/sycl/src` の実装を使うこと。両方のコードに同じ判定がある（上記行）。
+- prompt path が expert cache の slot を借りて返す refill を通ること。CUDA/HIP 側では `pf_borrow` が `!o.no_prefill_borrow && !o.expert_profile.empty()` で始まり、auto cache sizing がこれを解除する経路もある。SYCL 側にも同じ初期条件がある（`engine/src/program/generate.cpp:6821`, `engine/src/program/generate.cpp:9334-9343`, `engine/sycl/src/program/generate.cpp:3847-3850`）。
+- この設定が refill 順序を変えるのは、全体 refill 時に lent slot を持つ参加者が 2 つ以上 (`n_parts > 1`) の場合だけ。参加者が 0 または 1 なら両設定とも同じ `refill_one` 経路になる（`engine/src/program/generate.cpp:20549-20560`, `engine/sycl/src/program/generate.cpp:11379-11390`）。layer split の各 stage はそれぞれ自身の cache から slot を借りる（`engine/src/program/generate.cpp:12442-12455`）。
+- chunk の再設定時など、単独の参加者だけを返す `refill_one(p, e)` の直接呼び出しは、この変数を判定せず同じ順序で実行する（`engine/src/program/generate.cpp:20629-20637`, `engine/sycl/src/program/generate.cpp:11403-11424`）。
+- `--no-prefill-borrow`、空の `--expert-profile`、または cache sizing による borrowing 無効化などで slot を借りない場合、この変数が切り替える refill は発生しない。CLI や他の環境変数がこの変数の値を上書きする処理はない。
 
 ## 実行時の詳細
 
-各 stage の `refill_issue()` は、貸し出された expert blob を元の cache slot に戻し、host 側の residency 表を元に戻します。既定方式ではまず全 stage の `refill_issue()` を呼んでから、全 stage の `refill_wait()` で queued copy を同期します。`STRATA_REFILL_SERIAL` が設定されている場合は、stage ごとに `refill_issue()` の後すぐ `refill_wait()` を実行します。いずれも完了後に residency table を全 device へ upload します。これはコピーのスケジュールを変える設定で、refill する expert や slot の選択を変える処理ではありません。
+値は各 backend の生成処理中に到達した関数スコープの `static` 初期化で一度読み取られ、その後プロセス内で cache される。実行中に環境を書き換えても再評価されない（`engine/src/program/generate.cpp:20545-20547`, `engine/sycl/src/program/generate.cpp:11375-11377`）。
 
-`STRATA_REFILL_BLOCKING` も設定されていると、`refill_issue()` 内で各 slot の `fill_slot_blocking()` が使われます。この場合は各コピーがその場で待たれるため、複数 stage の「全コピー発行後に待つ」という既定方式もコピーの完了を先に待ちます。`STRATA_REFILL_SERIAL` の分岐自体は残りますが、非同期コピーを stage 間で重ねる差は生じません。
+設定なしで `n_parts > 1` のときは、lent slot を持つ各 `PfPart` の `refill_issue` を順に呼び、その後各 `refill_wait` を順に呼ぶ。設定ありでは各参加者について `refill_one`（issue と wait）を順に完了させてから次へ進む。全体 refill 完了後は `res_upload()` を呼ぶ。1 participant の場合は `refill_one` のみで、設定の有無による順序差はない（`engine/src/program/generate.cpp:20547-20561`, `engine/sycl/src/program/generate.cpp:11377-11391`）。
 
-通常の refill は専用ログを出しません。`STRATA_TRACE` が設定されており、refill 対象があれば `strata trace: refilled <slot数> slots on <stage数> stage(s) in <時間> ms` を stderr に出します。refill に失敗した場合、呼び出し側は `ERR refilling a lent slot failed: ...` を stdout に出して要求処理を終了します。
+CUDA/HIP 実装は `blob_stable` が null、slot への copy、または queued copy の失敗で false を返す。SYCL 実装は `blob` が null、slot への copy、途中の queued sync、または最終 sync の失敗で false を返す（`engine/src/program/generate.cpp:20498-20518,20520-20522`, `engine/sycl/src/program/generate.cpp:11341-11359`）。prompt の window 前または prompt 処理後の全体 refill が失敗すると、両実装とも stdout に `ERR refilling a lent slot failed: <error>` を出して `1` を返す（`engine/src/program/generate.cpp:21551-21558,21625-21628`, `engine/sycl/src/program/generate.cpp:11639-11645,11687-11689`）。
 
-## 文書・測定との照合
-
-`docs/DETAILS.md` は prompt path が cache slot を借りて使い、refill 後に戻す構成を説明していますが、`STRATA_REFILL_SERIAL` 自体の既定値・挙動や性能測定は記載していません（同ファイル 206-213 行）。コードコメントには、逐次方式が旧 0.1.30/0.1.31 の stage ごとの処理であるとありますが、これはコメント上の説明として扱い、現在の動作根拠は以下の実装分岐とします。性能差はこの調査では測定していません。
+成功時の refill 所要時間は `STRATA_TRACE` が設定され、かつ lent participant がある場合に stderr へ `strata trace: refilled %lld slots on %lld stage(s) in %.1f ms` の形式で出る。`STRATA_REFILL_SERIAL` 自体はログを有効化しない（`engine/src/program/generate.cpp:16069-16072,20561-20567`, `engine/sycl/src/program/generate.cpp:9461-9465,11391-11397`）。
 
 ## 根拠
 
-- 値の読み取り、複数 stage の判定、既定の一括発行・待機と設定時の stage ごとの発行・待機: `src/program/generate.cpp:10831-10893`, `sycl/src/program/generate.cpp:10075-10139`。
-- `PfPart` が CUDA0 と各 stage の cache/device/layer 範囲を保持すること、および貸出対象の組み立て: `src/program/generate.cpp:6517-6538,6576-6583`。
-- 借りた slot の返却・refill 呼び出し、および refill 失敗時の結果: `src/program/generate.cpp:11190-11191,11240-11241`, `sycl/src/program/generate.cpp:10363-10369,10411-10415`。
-- `STRATA_REFILL_BLOCKING` が slot ごとの blocking fill を選ぶこと: `src/program/generate.cpp:244-247,10838-10849`, `sycl/src/program/generate.cpp:286-289,10082-10095`。
-- trace の出力: `src/program/generate.cpp:10886-10891`, `sycl/src/program/generate.cpp:10132-10137`。
-- prompt slot の貸し出しと refill 後に戻す設計の記載: `docs/DETAILS.md:206-213`。
+- 変数の全読み取り箇所と分岐: `engine/src/program/generate.cpp:20543-20568`, `engine/sycl/src/program/generate.cpp:11373-11399`。
+- 借用参加者の構成と有効条件: `engine/src/program/generate.cpp:6821,12442-12455`; SYCL は `engine/sycl/src/program/generate.cpp:3847-3850,7243-7250`。
+- refill の失敗と観測可能な戻り: `engine/src/program/generate.cpp:20498-20522,21551-21558,21625-21628`; `engine/sycl/src/program/generate.cpp:11341-11367,11639-11645,11687-11689`。

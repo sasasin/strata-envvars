@@ -1,60 +1,61 @@
-# `--cpu-oracle-q8-0`
+# `strata generate --cpu-oracle-q8-0`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout は `main...origin/main` で、`git status --short --branch` に未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（CMake 生成の推論エンジン。`strata-terminal` の wrapper とは別） |
+| コマンド | `strata generate` |
 | オプション | `--cpu-oracle-q8-0` |
 | 別名 | なし |
-| 値 | 値を取らない boolean フラグ。指定すると有効。既定値は `false`（無効） |
+| 値 | 値を取らない真偽フラグ。指定すると有効 |
 
 ## 役割
 
-CPU expert の活性値量子化と Q2_0 dot reduction に、ソースコメントが「pinned x86 / llama.cpp-CPU-exact」と呼ぶ Q8_0 oracle 経路を選びます。CPU expert の数値経路を比較・固定するための実験用フラグです。help も実験的な CPU expert quantization / dot reduction と説明しています（`src/program/generate.cpp:855`）。
+CPU 上の expert 計算で、通常の activation 量子化と dot reduction の代わりに、x86 Q8_0 oracle 用の契約を選びます。モデルや重みを変更するオプションではなく、実行中の CPU expert 計算経路を切り替えます。CUDA と SYCL の `generate` 実装に同じフラグがあります。
 
 ## 使い方
 
 ```sh
-strata --pack ./model.strata --cpu-oracle-q8-0 --tokens 1,2,3
+# pack/full と token ID 1,2,3 を入力し、CPU expert の Q8_0 oracle 経路を選ぶ
+strata generate --pack pack/full --tokens "1,2,3" --cpu-oracle-q8-0
 ```
 
-ここでは pack を読み、token ID `1,2,3` を入力する例です。`--pack`、`--tokens` と本フラグは同じエンジン parser の引数です（`src/program/generate.cpp:2425-2442`）。
+`--pack` と token 入力は `generate` の別の必須・入力引数です。この例の pack は実行環境に存在するものへ置き換えてください。
 
 ## 値と既定値
 
-- 値や追加引数は不要です。parser は指定時に `o.cpu_oracle_q8_0 = true` とし、フラグ未指定時は options 構造体の初期値 `false` のままです（`src/program/generate.cpp:467`, `src/program/generate.cpp:2499`）。
-- 同じフラグを複数回指定した場合も同じ boolean を `true` にするだけで、追加動作はありません（`src/program/generate.cpp:2499`）。
-- parser にこのフラグ固有の値 validation はありません。
+値は不要です。parser はオプションを見つけると `cpu_oracle_q8_0` を `true` にし、`Options` の初期値は `false` です。したがって未指定時は従来の CPU quantizer と reduction のままです。同じフラグを複数回指定しても同じ bool を再度 `true` にするだけです。値を後置した場合、その値は別引数として解釈され、未知引数として失敗します（CUDA parser: `engine/src/program/generate.cpp:805, 3925, 4268-4273`、SYCL parser: `engine/sycl/src/program/generate.cpp:489, 1964`）。
 
 ## 実行時の動作
 
-起動時の整合性確認後、エンジンは `expert_set_oracle_q8_0(o.cpu_oracle_q8_0)` を呼び、CPU expert 側で参照する process-wide atomic flag を設定します（`src/program/generate.cpp:3407-3415`; `src/kernels/cpu/expert_layout.cpp:299-310`）。
+1. parser は設定を受理し、expert cache/profile との併用を検査した後、`expert_set_oracle_q8_0()` で CPU kernel 側のプロセス内フラグを設定します（`engine/src/program/generate.cpp:5322-5330`、`engine/src/kernels/cpu/expert_layout.cpp:400-411`。SYCL 側は `engine/sycl/src/program/generate.cpp:2736-2744`）。
+2. フラグ有効時、各32要素 chunk の最大絶対値から scale を作り、FP16 に丸めた scale を使って nearest-even の整数コードを生成します。通常経路の half-away rounding と FP32 scale とは異なります（`engine/src/kernels/cpu/expert.cpp:76-111, 385-410`、型・既定契約の説明は `engine/include/strata/kernels/cpu/expert.hpp:57-67`）。
+3. expert の gate/up と down 投影で oracle の row dot を使い、Q2_0 のコード offset を chunk ごとに除いた後、chunk scale と weight scale を順に積算します（`engine/src/kernels/cpu/expert.cpp:262-312, 364-376, 452-474`）。
+4. CPU expert pool はこのモードで分割・複数 token 用 kernel を使わず、single-token 経路へフォールバックします（`engine/src/kernels/cpu/pool.cpp:1500-1513, 1520-1529`、`engine/src/kernels/cpu/expert.cpp:605-610`）。
 
-有効時、CPU expert の第一段・第二段の活性値を `quantize_oracle_q8_0` で量子化し、oracle の row-dot を使います。実装は各 chunk の絶対値最大を求め、scale を最大値 / 127 とし、値を丸めて int8 code にします。その後 gate/up の dot、SiLU gate と up の積、第二活性の量子化、down projection の dot の順で処理します（`src/kernels/cpu/expert.cpp:75-110`, `src/kernels/cpu/expert.cpp:323-335`, `src/kernels/cpu/expert.cpp:341-345`, `src/kernels/cpu/expert.cpp:408-430`）。
-
-この oracle 経路には multi-token expert kernel がないため、有効時は複数 token 用の CPU expert 関数も token ごとの単一経路にフォールバックします。また expert pool の `run_split` は通常の split 処理を迂回して `run` を呼び、`run_split_multi` も単一 token job に展開します（`src/kernels/cpu/expert.cpp:561-566`, `src/kernels/cpu/pool.cpp:1300-1303`, `src/kernels/cpu/pool.cpp:1320-1335`）。したがってこのフラグで性能が上がるとはソースからは言えません。コメントには特定のベンチ測定で oracle が pool time を増やした記録がありますが、他環境での性能予測には使えません（`src/program/generate.cpp:3283-3284`）。
+ヘッダーはこの設定を worker thread 起動前に行い、request 中に変更しないこと、GPU expert cache との parity が未確立であることを記しています（`engine/include/strata/kernels/cpu/expert.hpp:111-117`）。このオプション自体によるファイル出力は確認できません。
 
 ## 適用条件と副作用
 
-- `--expert-cache` の値が 0 以外、または `--expert-profile` が指定されている場合は併用できません。GPU expert contract が一致するまでの制約として、エンジンはエラーメッセージを stderr に出して終了コード 2 で拒否します（`src/program/generate.cpp:3407-3409`）。
-- `--native` preset はこのフラグを自動的には有効化しません。該当箇所のコメントは、native preset では CPU expert は通常 VNNI kernel のままで、明示的な `--cpu-oracle-q8-0` が oracle を選ぶと記しています（`src/program/generate.cpp:3283-3285`）。
-- Apple Metal build については同じ起動処理でフラグを設定しますが、その分岐のコメントは expert が GPU 上で実行されるとしています。CPU oracle の実行経路が適用されるかは、確認したこの箇所だけでは断定できません（`src/program/generate.cpp:3415-3425`）。
-- このフラグは session configuration fingerprint の `cpu_oracle_q8_0` switch に含まれます。該当する session identity では有効・無効が設定差として扱われます（`src/program/generate.cpp:9450-9462`）。
-- 通常 build の起動時には CPU expert kernels に必要な AVX2 + FMA + F16C がなければ、CPU 名と要件を stderr に出して終了コード 2 で拒否します。これはフラグ専用の validation ではなくエンジンの起動条件です。Apple Metal および `STRATA_ISA_FLOOR` を使う older-CPU build には別分岐があります（`src/program/generate.cpp:3416-3448`）。oracle の ISA 条件はビルド構成にも関係するため、確認していない build / CPU 組み合わせの可否は断定しません。
+- `--expert-cache` の値が0以外、または `--expert-profile` が指定されている場合は併用できません。stderr に `--cpu-oracle-q8-0 cannot be combined with --expert-cache or --expert-profile until the GPU expert contract matches` を出し、`generate` は 2 を返します。`--expert-cache auto` も0以外の設定としてこの条件に該当します（`engine/src/program/generate.cpp:5322-5325`、SYCL: `engine/sycl/src/program/generate.cpp:2736-2739`）。
+- x86 以外の通常ビルドでは、このフラグを指定すると stderr に scalar quantizer は対象契約である x86 Q8_0 ではない旨を出して 2 を返します（CUDA: `engine/src/program/generate.cpp:5370-5375`）。SYCL の該当箇所は x86 専用分岐外にあり、同じ拒否分岐は確認できません（`engine/sycl/src/program/generate.cpp:2741-2757`）。
+- フラグなしでも既存の AVX2/CPU ISA 要件は別途適用されます。上記の x86 oracle quantizer は AVX 命令を使う実装です。実行可能な CPU ISA の詳細なビルド境界は、このオプション文書の調査だけでは全構成を特定できません。
+- CPU カーネルのヘッダーは GPU expert cache との契約一致が未確立と明記しています。cache/profile 併用は parser 後の検証で拒否されます。
 
 ## 出力とエラー
 
-このオプション単独では成功時に専用メッセージを出しません。`--expert-cache` または `--expert-profile` と競合すると、`strata generate: --cpu-oracle-q8-0 cannot be combined with --expert-cache or --expert-profile until the GPU expert contract matches` を stderr に出し、終了コード 2 で終了します（`src/program/generate.cpp:3407-3409`）。
+上記の cache/profile 併用拒否と CUDA の非 x86 拒否はいずれも stderr に診断を出し、終了コード 2 を返します。フラグに値を誤って付けた場合や未知引数も、CUDA parser では `unknown argument` と usage を stderr に出し 2 を返します（`engine/src/program/generate.cpp:4268-4273`）。正常時にこのフラグ専用のメッセージを出す処理は確認できません。
+
+## 補足
+
+CUDA/SYCL の usage は `--native` の説明で CPU q8_0 contract が含まれる旨を示します（CUDA: `engine/src/program/generate.cpp:1257-1260`、SYCL: `engine/sycl/src/program/generate.cpp:845-849`）。ただし、この checkout の両 parser で `cpu_oracle_q8_0` を `true` にする代入は当該フラグの parser 分岐だけで、`--native` の処理による自動有効化は確認できません（CUDA: `engine/src/program/generate.cpp:3925, 5112-5125`、SYCL: `engine/sycl/src/program/generate.cpp:1964`）。そのため `--native` のみで有効になるとは扱わず、明示的にこのフラグを指定してください。
 
 ## 根拠
 
-- `src/program/generate.cpp:467, 855, 2499` — option の既定値、help 表記、parser。
-- `src/program/generate.cpp:3407-3448` — expert cache/profile との拒否、CPU oracle 設定、CPU/ISA 起動条件。
-- `src/program/generate.cpp:3283-3285` — `--native` preset と oracle の関係。
-- `src/kernels/cpu/expert.cpp:75-110, 323-335, 341-345, 408-430, 561-566` — oracle quantization、二段 expert 計算、multi-token fallback。
-- `src/kernels/cpu/expert_layout.cpp:299-310` — process-wide atomic flag。
-- `src/kernels/cpu/pool.cpp:1300-1303, 1320-1335` — expert pool の分岐。
-- `src/program/generate.cpp:9450-9462` — session configuration fingerprint への記録。
-- 索引上の scope は `docs/cli/README.md:1128-1156` に記載された `strata-engine/root` です。SYCL variant にも同じ option 名、初期値、競合確認、flag 設定があります（`sycl/src/program/generate.cpp:450, 784, 1840, 2573-2581`）。本書の動作追跡は索引が指定する通常の `src/program/generate.cpp` と CPU kernel 実装を対象にしました。
+- `engine/src/program/generate.cpp:805, 1257-1260, 3925, 4268-4273, 5322-5375` — CUDA 実装の既定値、usage、parser、失敗経路、設定適用。
+- `engine/sycl/src/program/generate.cpp:489, 845-849, 1964, 2736-2757` — SYCL 実装の parser、併用検査、設定適用、CPU 条件。
+- `engine/include/strata/kernels/cpu/expert.hpp:57-67, 111-117` — activation contract、API の適用範囲と制約。
+- `engine/src/kernels/cpu/expert.cpp:76-112, 262-312, 364-376, 385-410, 452-474, 605-610` — oracle quantizer、dot reduction、expert 使用箇所と multi-token fallback。
+- `engine/src/kernels/cpu/expert_layout.cpp:400-411` — プロセス内 oracle フラグ。
+- `engine/src/kernels/cpu/pool.cpp:1500-1513, 1520-1529` — pool の分割経路からの fallback。

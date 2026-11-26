@@ -1,62 +1,66 @@
-# `--api-key`
+# `setup.py --api-key`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` および setup を委譲する wrapper） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat` / `UPDATE.bat` 等の wrapper（root scope） |
 | オプション | `--api-key` |
 | 別名 | なし |
-| 値 | クライアント認証キーを表す文字列。parser で型・選択肢・長さの制約は定義されていない |
+| 値 | `KEY` 文字列。複数キーはカンマ区切りで指定可能 |
 
 ## 役割
 
-モデルの実行設定に API キーを指定します。キーを設定すると、サーバーの API クライアントは認証キーを送る必要があります。`--host 0.0.0.0` などで LAN に公開する場合、setup の help は API キーの利用を推奨しています（`setup.py:8473-8475`）。
+セットアップで作る、または既存モデルを起動する run config に API キーを設定します。server はそのキーを使って推論 API へのリクエストを認証します。ネットワークインターフェースを広く公開する場合にキーを設定するよう、setup の parser は案内しています。`--api-key` 自体は listen host を変更しません。
 
 ## 使い方
 
 ```sh
-./setup.sh --setup --api-key 'replace-with-a-long-random-key'
+# 新しいモデルの setup にキーを設定
+./setup.sh --model IQ3_S --api-key 'local-demo-key'
+
+# 既に setup 済みのモデルを起動し、キーを保存
+./setup.sh --api-key 'local-demo-key'
+
+# 複数のクライアント用キーを設定
+./setup.sh --host 0.0.0.0 --api-key 'client-a-key,client-b-key'
 ```
 
-Windows では同じ引数を `START-HERE.bat --setup --api-key ...` に渡せます。POSIX wrapper は引数を `setup.py` に渡し、Windows wrapper も同様に `%*` を渡します（`setup.sh:76`、`START-HERE.bat:48-54`）。
+実際の起動時には、クライアントが設定したいずれかのキーを送ります。例のキーは説明用であり、実運用では推測されにくい値を使ってください。
 
 ## 値と既定値
 
-- `--api-key` の後には一つの文字列を渡します。値を省略すると `argparse` が usage error を出して終了します。setup parser 自身は文字列に追加の型・形式・長さ validation を行いません（`setup.py:8420`、`setup.py:8475`、`setup.py:8553`）。
-- 省略時の parser 値は `None` です。既存モデルの通常起動では指定されたキーだけを保持対象として渡すため、未指定なら保存済みキーを維持します（`setup.py:8677-8691`）。一方、`--setup` で設定を作り直すと `api_key` は setup 管理項目であり carry-over 対象ではないため、未指定なら新しい設定に引き継がれません（`setup.py:6162-6167`、`setup.py:6177-6187`、`setup.py:9671-9672`）。
-- カンマ区切りで複数キーを指定できます（例: `key1,key2`）。サーバーは各キーの前後の空白を除去し、空要素を除いて受理します。キー自体にカンマを含める形式は CLI ではなく、設定ファイルの `api_key` 配列で指定する必要があります（`setup.py:8475`、`serve/server.py:7638-7646`）。
-- `none`（大文字小文字を区別しない）を指定すると、サーバーはこれを認証キーではなく「キーなしを明示した値」として扱います。ネットワークへ公開した場合も認証を無効にするため、通常のキーとして `none` を使うことはできません（`serve/server.py:7649-7652`）。
-- 空文字（`--api-key ""` または `--api-key=`）は、setup の生成設定には書き込まれません。既存モデルの通常起動では空文字も保持対象に含まれて `api_key` を空にするため、認証を外します。`--setup` で再構成した場合も新しい設定に既存キーが引き継がれません（`setup.py:6177-6187`、`setup.py:6745-6771`、`setup.py:9671-9672`）。空白だけの値は setup parser では拒否されませんが、サーバー起動時に空キーとして扱われ、stderr にエラーを出して終了コード `2` で終了します（`serve/server.py:8290-8303`）。
+- 値は必須の文字列で、parser に `type`、`choices`、長さなどの追加制約はありません。値を省略すると argparse が usage を表示して失敗します（`terminal/setup.py:11503`）。
+- 複数の `--api-key` を繰り返した場合の setup 側の指定値は、argparse の通常の `store` 動作により最後の値です。複数キーを指定する書式は一つの値のカンマ区切りです（`terminal/setup.py:11503-11504`）。
+- setup の設定組み立てでは値が truthy の場合に `api_key` として保存します（`terminal/strata_control/setup_config.py:531-534`）。新規 setup で空文字を渡した場合はこの代入を通らず、空キーを明示的に検証する処理もありません。
+- `none`（大文字小文字を問わず前後空白を除いて一致）は server 側で「キーなしを明示した」値として扱われ、キー認証を無効にします。parser の help に記載されていない server 共通の特別値です（`terminal/serve/server_parts/http_api.py:222-225`、`terminal/serve/server.py:9331-9336`）。
 
 ## 実行時の動作
 
-新規 setup では、`--api-key` の値をモデル設定 JSON の `api_key` に格納し、設定を書き込みます。標準の setup 経路では設定ファイルを生成・更新して起動用スクリプトを作ります。既存設定を変更する場合は `.bak` のバックアップを作成します（`setup.py:6312-6345`、`setup.py:9669-9672`、`setup.py:9729-9730`）。Mac 用 Metal setup も独自 parser で同名オプションを受理し、同じ `api_key` 設定項目へ保存します（`metal/setup_mac.py:328-336`、`metal/setup_mac.py:539-548`）。
+setup がモデル用 run config を作るとき、値が空でなければ `api_key` フィールドへ格納します（`terminal/strata_control/setup_config.py:531-534`）。既存モデルの通常起動では、指定された値を `start(..., keep=...)` に渡し、保存値と異なるとき run config を更新してから server を起動します（`terminal/setup.py:11761-11775`、`terminal/setup.py:8566-8602`）。setup の再実行で既存 config を書き直す際は、旧 config を読み込み、setup が管理するキーは新しい設定値で構成します（`terminal/setup.py:7540-7545`、`terminal/setup.py:7715-7735`）。
 
-インストール済みモデルの通常起動時に指定した場合は、起動前に既存設定 JSON の `api_key` を更新して保存し、その後 `serve/server.py` を設定ファイル付きで起動します。保存時の表示は秘密値そのものではなく `api key` とだけ示します（`setup.py:6745-6775`）。
-
-サーバーは設定値を API 認証キーとして使います。`Authorization: Bearer ...` または `x-api-key` ヘッダーのキーが一致しなければ API リクエストに HTTP 401 を返します（`serve/server.py:3842`、`serve/server.py:6352-6360`）。キーが未設定ならこの認証判定は通過します（同: `6352-6354`）。
+起動時の server はコマンドラインの `--api-key` があれば config の値より優先し、なければ config の `api_key` を読みます。setup は server を config 付きで起動します（`terminal/setup.py:8601-8602`、`terminal/serve/server.py:9331-9339`）。キー文字列はカンマで分割され、各要素の前後空白と空要素が除かれます。HTTP リクエストは `Authorization: Bearer …` または `x-api-key` ヘッダーで照合されます（`terminal/serve/server_parts/http_api.py:211-219`、`terminal/serve/server.py:7283-7294`）。
 
 ## 適用条件と副作用
 
-- オプションの値は設定ファイルへ保存されるため、後続の起動でも使われます。既存設定ファイルのキーを変える副作用があります（`setup.py:6766-6771`、`setup.py:9671-9672`）。
-- 既存モデルを普通に起動する経路と setup 経路で反映されます。`--update` は `update_install` に早期委譲し、モデルを起動しない更新専用経路なので、このオプションを指定しても API キーの変更は行いません（`setup.py:8617-8619`、`setup.py:6682-6709`）。
-- キーなしで LAN に待ち受けると、setup の完了表示はネットワーク上の誰でも利用できる旨を示し、サーバーも警告します。`--host` の未指定時は loopback が既定ですが、host 指定自体は別オプションです（`setup.py:8473-8475`、`setup.py:9744-9747`、`serve/server.py:8624-8633`）。
-- `setup.py` の共通 parser を使う Linux/Windows 経路に加えて、Mac は `metal/setup_mac.py` の parser に分岐します。SYCL 経路は共通 `setup.py` の `main()` を引数付きで再利用します（`setup.py:8418-8420`、`sycl/setup_intel.py:541-554`）。
+- 指定したキーはモデルごとの `strata-<model>.json` run config に保存されます。config は JSON として一時ファイルへ書き、置換して更新されます。キーはそのファイルに平文で含まれます（`terminal/setup.py:7531-7537`）。
+- 既存モデルを通常起動する経路で空文字を渡すと、`keep` から `None` だけが除かれるため空文字が保存されます（`terminal/setup.py:8577`、`terminal/setup.py:8590-8595`）。server は空 config 値を認証なしとして起動し、config に `api_key` が存在する場合は未設定の警告を stderr に出します（`terminal/serve/server.py:9331-9339`、`terminal/serve/server.py:9595-9597`）。空文字をキー解除手段として使う場合の動作は、新規 setup の場合と異なります。
+- キーが有効なとき、キーのない、または一致しない API リクエストは HTTP 401 になります（`terminal/serve/server.py:7283-7294`）。ネットワーク listen がキー設定を必須にするわけではありません。
+- 通常の Apple Silicon setup は `terminal/setup.py` から `engine/metal/setup_mac.py` へ引数ごと委譲されます（`terminal/setup.py:11434-11437`）。その CLI は索引上 `source-setup/mac` の別 scope で、parser は `engine/metal/setup_mac.py:383` にあります。この文書の root scope と区別してください。
 
 ## 出力とエラー
 
-- 引数値を省略した場合の usage error は `argparse` によるものです。setup 側に `--api-key` 専用の validation error はありません（`setup.py:8475`、`setup.py:8553`）。
-- 空白だけのキーなど、サーバー側で空と判定された値は `[strata] an API key was given but it is empty` を stderr に出し、終了コード `2` でサーバー起動を中止します（`serve/server.py:8290-8303`）。
-- 認証キーがない、または一致しない API リクエストは HTTP `401` と `authentication_error` JSON を返します（`serve/server.py:6352-6360`）。
-- `--host` が loopback 以外でキーがなければ、サーバーの標準出力にネットワーク利用者への警告を出します（`serve/server.py:8624-8633`）。
+- `--api-key` の値を指定しない場合、argparse の引数解析エラーになります（parser 定義 `terminal/setup.py:11444`、オプション登録 `terminal/setup.py:11503`）。
+- setup parser 自身には API キー値の形式検証がありません。空白だけの文字列など、server が空キーと判定する値は server 起動時の検証対象です。server は `[strata] an API key was given but it is empty: set a key, or leave it out` を stderr に出して終了コード 2 で戻ります（`terminal/serve/server_parts/http_api.py:238-252`、`terminal/serve/server.py:9335-9339`）。
+- 正しく設定されたキーの内容は setup の「保存した」通知には出ず、`api key` とだけ表示されます（`terminal/setup.py:8590-8595`）。一方、run config ファイルには値が保存されます。
 
 ## 根拠
 
-- `setup.py:8420-8420`、`setup.py:8473-8475`、`setup.py:8553-8553` — 共通 parser と `--api-key` 定義、引数 parsing。
-- `setup.py:8617-8619`、`setup.py:8677-8691`、`setup.py:9669-9672`、`setup.py:9729-9730` — 更新専用経路、起動時の保持、setup 設定への書き込み。
-- `setup.py:6745-6775` — 起動時の設定 JSON 更新と server 起動引数。
-- `serve/server.py:7638-7679`、`serve/server.py:8290-8303` — 複数キーの分解、`none` と空キーの扱い、起動時 validation。
-- `serve/server.py:6352-6360`、`serve/server.py:8624-8633` — HTTP 認証とキーなしでのネットワーク警告。
-- `metal/setup_mac.py:328-336`、`metal/setup_mac.py:539-548`、`sycl/setup_intel.py:541-554` — Mac parser と SYCL の共通 parser 委譲。
+- `terminal/setup.py:11444-11504` — root parser と `--api-key` の値・help。型や choices の追加検証なし。
+- `terminal/strata_control/setup_config.py:531-534` — setup が truthy な値を config の `api_key` に保存。
+- `terminal/setup.py:7531-7537`、`terminal/setup.py:7715-7735` — run config の JSON 書き込みと既存設定の引き継ぎ。
+- `terminal/setup.py:8566-8602`、`terminal/setup.py:11758-11775` — 起動時の明示値保存と server 起動。
+- `terminal/serve/server_parts/http_api.py:211-252`、`terminal/serve/server.py:9331-9339` — カンマ区切りキーの正規化、`none` の扱い、起動時検証。
+- `terminal/serve/server.py:7283-7294` — API キー認証と不一致時の 401。
+- `terminal/setup.py:11434-11437`、`engine/metal/setup_mac.py:375-384` — Apple Silicon の委譲先と別 parser scope。

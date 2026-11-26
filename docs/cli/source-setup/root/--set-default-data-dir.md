@@ -1,70 +1,61 @@
-# `--set-default-data-dir`
+# `source-setup` `--set-default-data-dir`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（調査日: 2026-10-25）。調査開始時の checkout は `main...origin/main` で、作業ツリーに未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、更新 wrapper からの委譲を含む） |
+| コマンド | `terminal/setup.py`（`setup.sh` / `START-HERE.bat` などから起動される setup） |
 | オプション | `--set-default-data-dir` |
 | 別名 | なし |
-| 値 | 値を取らない `store_true` フラグ。既定値は `False` |
+| 値 | 値を取らないフラグ。指定すると真になる（既定値は偽）。 |
 
 ## 役割
 
-`--data-dir` で新しい保存先を指定したとき、既存のモデルデータは元の場所に残しつつ、新しい場所を今後の既定データフォルダーとして記憶させます。`--move-data` のように既存データを移動する指定ではありません。
+`--data-dir` で選んだ新しいモデル保存先を、既存モデルを移動せずに Strata の記憶済みデータフォルダーとして保存するためのフラグです。既存モデルを旧フォルダーに残して新しいダウンロードだけを新フォルダーへ置く選択時に使います。`terminal/setup.py` の root parser が受理しますが、通常の Apple Silicon 用 Metal setup は引数を `terminal/engine/metal/setup_mac.py` に委譲し、別スコープの parser で処理します（`terminal/setup.py:9290-9294,11436-11437`、`terminal/engine/metal/setup_mac.py:388`）。
 
 ## 使い方
 
-```sh
-./setup.sh --setup --data-dir "$HOME/Strata-data-new" --set-default-data-dir
+```bash
+# 既存モデルをそのまま残し、以後のデータフォルダーを指定する
+python terminal/setup.py --data-dir "$HOME/Strata-data" --set-default-data-dir
 ```
 
-この例は新しい保存先を指定し、その場所を既定として記憶します。既存モデルが別の場所にあればそこに残り、新規ダウンロードは指定先に置かれます。Windows では `START-HERE.bat` に同じ引数を渡せます。
+これは通常の setup の実行も続けます。新しいモデル保存先を指定し、既存ファイルを移動せずに処理する意図を示す例です。起動後のモデル設定・インストールなどは通常フローに従います。
 
 ## 値と既定値
 
-- Linux/Windows の `setup.py` parser では値なしの `action="store_true"` として定義されています。省略時は偽で、重複指定しても有効のままです（`setup.py:8486-8487`）。macOS の Metal 用 parser も同じ値なしフラグとして受け取ります（`metal/setup_mac.py:339-342`）。
-- このフラグ単独では保存先を指定しません。保存先は `--data-dir DIR` で指定します。
-- `--data-dir` の値は `expanduser()` と `resolve()` で解決され、フォルダー利用可否を検査します。指定先の検証に失敗すると理由と「何も変更・ダウンロードしていない」旨を表示して終了コード 1 で停止します（`setup.py:6051-6057,825-830`）。
+- parser は `action="store_true"` で登録し、値は不要です。省略時は `False` です（`terminal/setup.py:11515-11516`）。
+- 実際に記憶先を選ぶには `--data-dir PATH` も指定します。`data_folder_for()` は `data_dir`、`move_data`、`yes`、本フラグを `data_folder()` に渡します（`terminal/setup.py:7513-7516`）。
+- PATH は本フラグの値ではなく `--data-dir` の値です。指定先は展開・解決され、存在するディレクトリーで書き込み可能か、または作成可能か検証されます。相対パス、システムフォルダー、ファイルを指すパス、書き込み不可などは拒否対象です（`terminal/setup.py:7430-7434`、`terminal/strata_control/folders.py:77-113`）。
+- フラグを付けても `--data-dir` がなければ、記憶先をこのフラグによって変更する分岐には入りません（`terminal/setup.py:7451-7475`）。通常起動で既存モデルがあり、ほかのセットアップ条件もない場合は `data_folder_in_place()` が使われるため、このフラグによるフォルダー作成・移動・保存も行われません（`terminal/setup.py:11681-11688`）。
 
 ## 実行時の動作
 
-`data_folder_for()` は `--data-dir`、`--move-data`、`--yes`、`--set-default-data-dir` の値を共通の `data_folder()` に渡します（`setup.py:6136-6139`）。指定先が現在の記憶済みフォルダーと異なるとき、Strata はこのインストールや過去のインストール、記憶済みフォルダーなどにモデルデータがあるかを調べます（`setup.py:6067-6081`）。
+`--data-dir` が現在の記憶先と異なる場合、Strata は既存のモデルデータを含むフォルダーを調べます。同一ドライブ上に既存データがあり、`--move-data` がなく、`--yes` もないときは「旧フォルダーに残す / 新フォルダーへ移す」を質問します。「残す」を選んだ場合、本フラグがあれば新フォルダーを `settings.json` の `data_dir` として保存して終了し、既存データは移動しません。`--yes` を指定した場合も移動は行わず、その既存データを旧フォルダーに残す経路に進み、本フラグがあれば新しい記憶先を保存します。別ドライブ上の既存データはその場で使われ、移動の質問は出ません（`terminal/setup.py:7451-7473,7482-7486`）。
 
-移動対象のデータがあり、`--move-data` がない場合は、`--yes` なしの実行では keep/move を尋ねます。`--yes` がある場合や質問への回答が keep の場合、既存データは元の場所に残ります。通常この分岐では新しい保存先は記憶されませんが、このフラグを付けると `settings.json` の `data_dir` に指定先が保存されます（`setup.py:6082-6096`）。例えば次の形では、質問なしで既存データを残し、新しい場所を記憶します。
+`--move-data` を指定した場合は本フラグとは別の移動経路に進み、同一ドライブ上の既存モデルファイルを新しいフォルダーへ移動・統合し、設定ファイル内の移動済みパスを更新します。この経路では処理後に新しい `data_dir` が保存されるため、本フラグは記憶先の保存に追加の効果を与えません（`terminal/setup.py:7474-7509`）。既存モデルデータが見つからない場合も新しいフォルダーが既定先となり、通常の保存処理で記録されます（同 `terminal/setup.py:7474-7476,7507-7509`）。
 
-```sh
-./setup.sh --setup --data-dir "$HOME/Strata-data-new" --set-default-data-dir --yes
-```
-
-このフラグなしでも、見つかったデータがなく移動元を失う心配がない場合は、通常処理が指定先を既定場所として保存します。移動を選んだ場合も、処理後に `data_dir` と Strata install 一覧を保存します（`setup.py:6097-6098,6105-6133`）。したがって、このフラグ固有の効果が必要なのは主に「既存データを残すが、指定先を次回以降の既定にする」場合です。
-
-保存先を作れない場合は警告して `home()` を代わりに使います（`setup.py:6062-6066`）。設定ファイルは通常 POSIX では `$XDG_CONFIG_HOME/strata/settings.json`（未設定時 `~/.config/strata/settings.json`）、Windows では `%APPDATA%/Strata/settings.json` にあります。`STRATA_SETTINGS_FILE` が設定されている場合はそのパスが使われます（`setup.py:5900-5912`）。設定書き込みが失敗すると警告しますが、`save_settings()` は例外を再送出しません（`setup.py:5922-5929`）。
+保存先は Windows では `%APPDATA%/Strata/settings.json`、それ以外では `$XDG_CONFIG_HOME/strata/settings.json`（未設定時は `~/.config/strata/settings.json`）です。新しいデータフォルダーを保存すると `data_dir_at` も更新されます（`terminal/setup.py:7276-7305`）。
 
 ## 適用条件と副作用
 
-- `--data-dir` を指定しない場合、`set_default` は `data_folder()` 内の「別の指定先を選んだ」分岐で参照されないため、このオプション単独では保存先を変更しません（`setup.py:6051-6053,6074-6096`）。
-- 既存の別フォルダーを選んだ場合、既存モデルは移動されません。データを元の場所で使い続け、新しいダウンロード先を変える動作です（`setup.py:6091-6096`）。他のドライブにあるデータもその場所に残ります（`setup.py:6105-6109`）。
-- 既存モデルがない場合や移動を選んだ場合は、通常の処理でも選択先が保存されるため、オプションがなくても記憶結果は同じです（`setup.py:6097-6098,6130-6133`）。
-- 通常の既存モデル起動は `data_folder_in_place()` を使用し、設定を読むだけでフォルダー作成・移動・コピー・保存を行いません。`--data-dir` がある呼び出しはこの単純起動判定から外れて `data_folder_for()` を通ります（`setup.py:6142-6151,8602-8610`）。
-- macOS の通常 setup は `setup.py` が Metal 用 `metal/setup_mac.py` に処理を委譲し、同 parser がこのフラグを受けて共通の `data_folder_for()` を呼びます（`setup.py:8412-8419; metal/setup_mac.py:339-365`）。
-- `setup.sh` と `START-HERE.bat` は受け取った引数を `setup.py` に渡します。ラッパー固有の解釈はありません（`setup.sh:9-12,76; START-HERE.bat:44-54`）。
+- 対象は `terminal/setup.py` の root parser と、その値を `data_folder_for()` に渡す setup 経路です。通常の Apple Silicon 用 Metal setup は先に別 CLI へ委譲されます。Intel SYCL の checkout 用 setup も別 setup スクリプトへ引数を転送します（`terminal/setup.py:9290-9294,11628-11638`）。同名オプションの Metal 文書は [`mac scope`](../mac/--set-default-data-dir.md) を参照してください。
+- `--data-dir` の指定先を作成することがあります。指定先の妥当性検査後に作成し、検査で問題があれば変更前に失敗します。作成時に OS エラーが起きた場合は警告を出し、`home()` を保存先として続行します（`terminal/setup.py:7431-7443`）。
+- 本フラグ単独では既存モデルを移動しません。`--move-data` を付けると既存モデルの移動・統合、空になった `packs` フォルダーの削除、モデル設定内パスの更新が起き得ます（`terminal/setup.py:7487-7506`）。
+- `settings.json` の書き込みに失敗した場合は警告を出して続行します。保存先設定が永続化されたことまでは保証されません（`terminal/setup.py:7299-7307`）。
 
 ## 出力とエラー
 
-- 既存データを残す場合、既存モデルが元の場所に留まり、新しいダウンロードが指定先に置かれる旨を表示します（`setup.py:6091-6095`）。
-- 明示した保存先の検証に失敗すると `fail()` がメッセージを表示して終了コード 1 で停止します（`setup.py:6054-6057,825-830`）。
-- 保存先ディレクトリーの作成に失敗すると警告して `home()` にフォールバックします。設定ファイルへの書き込みに失敗した場合も警告します（`setup.py:6062-6066,5922-5929`）。
+- 指定した `--data-dir` が不正な場合、Strata は「Nothing was downloaded or changed...」を含む説明を標準出力へ出し、終了コード 1 で停止します（`terminal/setup.py:7431-7434,1049-1056`）。
+- 記憶済みフォルダーが利用不能な場合は警告し、既定の `Strata-data` へ戻して保存済み `data_dir` を破棄します（`terminal/setup.py:7435-7438`）。
+- フォルダー作成や設定保存に失敗した場合は標準出力への警告であり、それ自体は `fail()` による停止経路ではありません（`terminal/setup.py:7440-7443,7299-7307`）。
 
 ## 根拠
 
-- `setup.py:8481-8487` — `--data-dir`、`--move-data`、本オプションの parser 宣言。
-- `setup.py:6042-6098` — 保存先選択、既存データの keep/move 判断、本オプションによる keep 時の保存。
-- `setup.py:6105-6139` — データ処理、設定保存、CLI 値の共通処理への受け渡し。
-- `setup.py:5900-5929` — 設定ファイルの選択と書き込み失敗時の警告。
-- `setup.py:6142-6151,8602-8610` — 通常起動と setup 系経路の違い。
-- `setup.py:8412-8419`; `metal/setup_mac.py:339-365` — macOS parser への委譲と共通処理呼び出し。
-- `setup.sh:9-12,76`; `START-HERE.bat:44-54` — wrapper から `setup.py` への引数委譲。
-
-調査は指定 revision の parser、使用箇所、設定保存処理と wrapper を対象にしました。CLI `--help` は実行していません。setup/update はデータ配置などの副作用を伴い得るため、help 実行でなくソースを根拠にしています。
+- `terminal/setup.py:11510-11516` — `--data-dir`、`--move-data`、本オプションの parser 定義。
+- `terminal/setup.py:7419-7516` — 保存先決定、既存データの保持・移動、記憶先の保存と CLI 引数の受け渡し。
+- `terminal/setup.py:11681-11688` — 通常起動時に既存データフォルダーを読み取り専用で使う分岐。
+- `terminal/setup.py:7276-7307` — settings ファイルの場所、ロード・保存、保存失敗時の警告。
+- `terminal/strata_control/folders.py:77-113` — `--data-dir` で指定したフォルダーの検証条件。
+- `terminal/setup.py:9290-9294,11436-11437`、`terminal/engine/metal/setup_mac.py:388` — 通常の Mac setup の委譲と、Metal 側に別 parser があること。

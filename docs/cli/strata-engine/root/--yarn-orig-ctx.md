@@ -1,63 +1,61 @@
 # `--yarn-orig-ctx`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | ネイティブ推論エンジン `strata`（root parser） |
-| オプション | `--yarn-orig-ctx N` |
+| コマンド | `strata generate` |
+| オプション | `--yarn-orig-ctx` |
 | 別名 | なし |
-| 値 | 浮動小数点数。`0` はモデル値または既定値を使う。 |
+| 値 | 数値 `N`。内部では `double` として扱う。0 は既定値選択、負数・非有限値は拒否される。 |
 
 ## 役割
 
-RoPE の YaRN 補正が基準にする「学習時コンテキスト長」を指定する。解決後の値は RoPE 補正区間（pair index の low/high）を求める計算に使われる。位置ごとの生成上限を設定するオプションではない（`--max-context` とは別）。`RopeScaling::corr_dims` は `orig_ctx` と beta 値から区間を計算し、RoPE テーブル構築がその区間を補正角度の混合に使う（`include/strata/kernels/rope_scaling.hpp:92-100`、`src/kernels/cuda/rope.cu:61-83`）。
+YaRN の RoPE 補正が基準にする、モデルの学習時コンテキスト長を指定します。値は起動時に解決され、同じプロセスの RoPE 設定全体に適用されます。エンジンは KV cache に RoPE 適用後の K を保持するため、リクエストごとに変更するオプションではありません（`engine/src/program/generate.cpp:789-792`）。
 
 ## 使い方
 
 ```sh
-strata --native /path/to/model.gguf --rope-scaling yarn --yarn-orig-ctx 131072
+# 例: 学習時コンテキストを 131072 として YaRN scaling を使う
+strata generate --native MODEL.gguf --tokens 1 --rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 131072
 ```
 
-`--native` で通常エンジンに GGUF モデルを指定する実行例。`--rope-scaling yarn` を省略した場合、この値だけで YaRN が有効になるわけではなく、モデルの scaling metadata または別の `--rope-scaling` 指定に従う（`src/program/generate.cpp:3642-3647,3681-3694`）。
+`--native`、`--tokens`、`--rope-scaling`、`--rope-scale` は同じ `strata generate` parser で受理されます（`engine/src/program/generate.cpp:3851-3855,3871-3876,3924-3927`）。
 
 ## 値と既定値
 
-- オプションの値は `std::atof` で `double` に変換される。繰り返し指定した場合は parser が順に代入するため最後の値が残る（`src/program/generate.cpp:2416-2421,2450`）。値を省略すると `--yarn-orig-ctx needs a value` を stderr に出して終了コード `2` で終了する（同 `2418-2420`）。
-- 値は有限かつ `0` 以上でなければならない。NaN/無限大および負数は validation で拒否され、終了コード `2`（同 `3328-3334,3345-3350`）。
-- `0` は明示的なコンテキスト長としては使われず、モデル metadata に対象 arch の `rope.scaling.original_context_length` があり値が `1` 以上ならその値を採用する。モデル値がない場合の構造体既定値は `262144`（同 `3651-3653,3673-3674,3700-3701`、`include/strata/kernels/rope_scaling.hpp:66-75`）。オプション省略も parser 初期値 `0` のままなので同じ解決経路になる（`src/program/generate.cpp:459,2450,3700-3701`）。
-- `0` より大きい明示値はモデル metadata より優先される。0 以外の値は parser 検査では `>= 1` まで要求されず、たとえば `0 < N < 1` は scaling が有効な構成では解決後 validation に失敗する。一方 `--rope-scaling none` のときは scaling knobs をリセットするため、この値は構成の有効性検査対象から外れ、効果もない（`src/program/generate.cpp:3345-3349,3700-3719`、`include/strata/kernels/rope_scaling.hpp:169-183`）。
-- `atof` は厳密な数値構文検査ではないため、数値に変換できない文字列は `0` となり、上記の fallback と同様に扱われる。これは parser の変換方式から分かる範囲であり、入力形式として推奨される使い方ではない（`src/program/generate.cpp:2450`）。
+- オプションを省略した場合、構成値は GGUF の `*.rope.scaling.original_context_length` が 1 以上ならその値、そうでなければ `RopeScaling` の既定値 262144 になります（`engine/src/program/generate.cpp:5650-5652,5668-5673,5719-5720`; `engine/include/strata/kernels/rope_scaling.hpp:66-75`）。
+- `--yarn-orig-ctx 0` も省略時と同じく GGUF 値（利用可能な場合）へフォールバックし、GGUF 値がなければ 262144 です。したがって、0 では GGUF 値を明示的に上書きできません（`engine/src/program/generate.cpp:5719-5720`）。
+- 0 より大きい有限値は CLI 指定値として優先されます。整数チェックや上限チェックはありません。RoPE scaling が有効な場合、最終構成の検査で 1 未満は拒否されます（`engine/src/program/generate.cpp:5243-5249,5260-5265,5719-5720`; `engine/include/strata/kernels/rope_scaling.hpp:177-183`）。
+- 負数は CLI 検証で拒否されます。NaN や無限大も有限性検査で拒否されます。値の変換には `std::atof` が使われ、変換末尾や変換失敗を個別に検査する処理はありません（`engine/src/program/generate.cpp:3876,5243-5249,5260-5265`）。
+- 同じ引数を複数回指定した場合、引数ループが同じフィールドを順に代入するため、最後の指定値が残ります（`engine/src/program/generate.cpp:3842-3847,3876`）。
 
 ## 実行時の動作
 
-値は起動時に一度だけ解決される。モデルを読む場合、エンジンは arch prefix 付きの GGUF key `rope.scaling.original_context_length` を取得する。明示値 `N > 0` があればそれを優先し、そうでなければ metadata 値 `>= 1`、それもなければ `RopeScaling` の `262144` を使う（`src/program/generate.cpp:3651-3674,3700-3701`、`include/strata/kernels/rope_scaling.hpp:66-75`）。
+parser は値を `double` に変換して保持します。起動時、正の CLI 値があればそれを `rope_cfg.orig_ctx` に設定し、そうでなければ GGUF の元コンテキスト値を採用します。解決済み構成は RoPE scaling 設定として登録されます（`engine/src/program/generate.cpp:3876,5650-5673,5719-5720,5752-5759`）。
 
-解決値は `RopeScaling::corr_dims` が YaRN の周波数補正区間を計算する入力になる。RoPE table builder はその区間を使い、`ext_factor` が 0 でないとき補間角と学習時角の混合を行う（`include/strata/kernels/rope_scaling.hpp:92-100`、`src/kernels/cuda/rope.cu:67-83`）。そのため値は `--rope-scaling yarn` など RoPE scaling が有効な構成で意味を持つ。`none` では係数を初期状態に戻して無効化する。`linear` でも共通設定に値は格納され、区間は計算されるが、`--yarn-ext-factor` が既定の自動値から `0` になるため table builder の補正角混合は行われない（`src/program/generate.cpp:3700-3719`、`src/kernels/cuda/rope.cu:69-83`）。
+YaRN 補正窓の境界 `corr_dims` は `orig_ctx`、回転次元、`beta_fast` / `beta_slow`、周波数基底から算出され、その境界が解析カーネル引数にも渡されます。このため、この値は RoPE scaling が有効なときにどの回転ペアが学習済み角度を保つか、補間へ移るかを左右します（`engine/include/strata/kernels/rope_scaling.hpp:92-116`）。`--rope-scaling` が `none` の場合は scaling 設定を既定状態に戻すため、値は回転計算には使われません。ただし、`--max-context` が学習時長を超えた場合の警告判定には、リセット前の値が使われます（`engine/src/program/generate.cpp:5727-5747`）。
 
-RoPE 設定は session 初期化より前にプロセス全体の設定として固定される。1つの KV cache 内で異なる RoPE scaling を混ぜないため、リクエストごとの切り替えはない（`src/program/generate.cpp:450-454,3642-3647,3731`）。
+構成は起動時に検証されます。無効な解決済み RoPE 構成は stderr に `invalid rope scaling configuration` を出して終了コード 2 になります（`engine/src/program/generate.cpp:5749-5757`; `engine/include/strata/kernels/rope_scaling.hpp:169-183`）。
 
 ## 適用条件と副作用
 
-- 値はモデルの RoPE metadata より優先されるので、誤った学習時コンテキスト長を指定すると YaRN 補正区間が意図と異なる値になる。
-- 有効な scaling 構成で解決後の `orig_ctx` が有限かつ `>= 1` でなければ、全体構成 validation が失敗する（`include/strata/kernels/rope_scaling.hpp:164-183`）。
-- `--rope-scaling none` では `--yarn-orig-ctx` を含む YaRN knobs がリセットされる。警告は `--rope-scale > 1`、`--rope-freq-scale > 0`、`--yarn-ext-factor > 0`、または `--yarn-attn-factor != 1` のいずれかを検知した場合に限られるため、`--yarn-orig-ctx` 単独指定は効果がなくてもこの警告条件には含まれない（`src/program/generate.cpp:3708-3719`）。
-- 有効な scaling 時は stderr に resolved type、factor、context、学習時 context を含む診断行が出る。実行の主な副作用は起動時の RoPE 設定と、それを使う RoPE table / kernel 構成への反映（`src/program/generate.cpp:3731-3743`、`src/kernels/cuda/rope.cu:48-83`）。
+- 実際に YaRN の補正窓へ作用するには RoPE scaling が `yarn` である必要があります。`linear` でも解決済み構成には値が保持されますが、YaRN 補正窓による効果はありません。`none` では回転に不使用です（`engine/src/program/generate.cpp:5719-5739`; `engine/include/strata/kernels/rope_scaling.hpp:92-116`）。
+- モデル GGUF の元コンテキスト長は既定値としてのみ使われ、正の CLI 指定値が優先します。RoPE 構成は重みの読み込み後、session 初期化でテーブルを作る前に一度設定されます（`engine/src/program/generate.cpp:5649-5652,5719-5759`; `engine/include/strata/kernels/rope_scaling.hpp:185-193`）。
+- ファイル生成やネットワークアクセスはこのオプションの処理では行いません。確認できた出力は、不正値のエラーと、RoPE 無効時の context 超過警告など stderr の診断です（`engine/src/program/generate.cpp:5260-5264,5737-5747,5752-5757`）。
 
 ## 出力とエラー
 
-- 値不足: stderr に `--yarn-orig-ctx needs a value`、終了コード `2`（`src/program/generate.cpp:2418-2420`）。
-- NaN / 無限大: stderr に `strata generate: a rope scaling knob is not a finite number (...)`、終了コード `2`（`src/program/generate.cpp:3328-3334`）。
-- 負数: stderr に `strata generate: invalid rope scaling knob ...`、終了コード `2`（`src/program/generate.cpp:3345-3349`）。
-- scaling 有効時に metadata 由来を含む解決値が `1` 未満の場合: `invalid rope scaling configuration: the original (trained) context must be finite and > 0 ...` を stderr に出し、終了コード `2`（`include/strata/kernels/rope_scaling.hpp:177`、`src/program/generate.cpp:3724-3729`）。
+- 値が省略されると stderr に `--yarn-orig-ctx needs a value` を出し、終了コード 2 で終了します（`engine/src/program/generate.cpp:3844-3846,3876`）。
+- 非有限値は `a rope scaling knob is not a finite number`、負数などの範囲外値は `invalid rope scaling knob` を stderr に出し、終了コード 2 になります（`engine/src/program/generate.cpp:5243-5249,5260-5265`）。
+- 未知の引数は stderr に `unknown argument` と usage を出し、終了コード 2 になります（`engine/src/program/generate.cpp:4268-4273`）。
+- RoPE scaling が有効な状態で、最終的な `orig_ctx` が 1 未満なら構成検証で失敗します（`engine/include/strata/kernels/rope_scaling.hpp:177-183`; `engine/src/program/generate.cpp:5752-5757`）。
 
 ## 根拠
 
-- 索引上の tool/command scope: `docs/cli/README.md:1128-1134,1312-1316`（調査対象リポジトリ）。
-- parser の既定値、help 表示、値の読取り: `src/program/generate.cpp:459,875-877,2416-2421,2450`。
-- CLI 値の validation、GGUF metadata と優先順位、解決後の適用と診断: `src/program/generate.cpp:3328-3350,3642-3674,3681-3743`。
-- YaRN の `orig_ctx` 既定値・補正区間・有効構成 validation: `include/strata/kernels/rope_scaling.hpp:66-75,92-100,164-183`。
-- RoPE table での角度補正: `src/kernels/cuda/rope.cu:61-83`。
-
-調査時に確認した Strata checkout は `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`、作業状態は `main...origin/main`（`git status --short --branch`）だった。別 revision の help や Release artifact は参照していない。
+- `engine/src/program/generate.cpp:797,1277,3871-3880` — option の保存先、help 記述、parser 登録。
+- `engine/src/program/generate.cpp:5243-5265` — 数値の有限性・範囲検証。
+- `engine/src/program/generate.cpp:5650-5673,5719-5759` — GGUF 値との優先順位、`none` の扱い、構成検証と登録。
+- `engine/include/strata/kernels/rope_scaling.hpp:66-75,92-116,169-183` — 既定値、補正窓への反映、解決済み構成の検証。
+- SYCL parser にも同様の登録・変換・検証・構成設定があります（`engine/sycl/src/program/generate.cpp:481,865,1915,2657-2679,2943-2947,2993-2994,3017-3024`）。

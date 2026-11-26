@@ -1,45 +1,48 @@
 # `STRATA_MTP_HIP_PRIO`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP バックエンドの MTP drafter が使う非同期ストリームを、可能なら最高優先度で作成するかを制御します。対象は `src/core/mtp.cpp` の `MtpDrafter::load()` にある HIP 分岐です。CUDA と Metal の経路ではこの変数を読みません。
-
-MTP を使う生成経路では drafter の処理が `cs_` 上で実行されます。変数が有効で HIP の優先度ストリーム作成にも成功すると、その `cs_` を最高優先度指定で作ります。優先度のストリームを作れない場合は通常の非同期ストリーム作成へフォールバックします。
+HIP ビルドで MTP drafter が使う `cs_` ストリームについて、最優先度を指定した non-blocking stream の作成を有効にするか選ぶ。MTP の prefill、draft graph、chain の起動はこの `cs_` を使うため、変わるのは drafter の stream 作成時に Strata が要求する優先度である（`engine/src/core/mtp.cpp:629-646,1577-1656,1936-1948,2110-2154`）。CUDA の `STRATA_MTP_PRIORITY` 分岐とは別で、この変数は HIP ビルドの分岐でのみ読まれる（同 `:613-645`）。
 
 ## 値と判定
 
-環境変数が未設定または空文字なら、現在の HIP device のアーキテクチャを調べ、`gfx1200` または `gfx1201` なら有効、それ以外または device 情報を取得できない場合は無効です。アーキテクチャ名の後ろに `:...` が付く表記も、この2名称として認識します。
+`std::getenv` で取得し、未設定または空文字なら値を `atoi` に渡さず、GPU 世代による既定値を使う。空でない文字列は `std::atoi` で変換し、結果が 0 以外なら優先 stream を要求する。文字列全体の検証、範囲検査、大文字小文字の判定はない。したがって `1`、`-1`、` 1`、`1tail` は有効、`0`、`0tail`、`true`、`false`、`x1` は無効になる（`atoi` が数値接頭部を変換し、先頭の空白を読み飛ばすため）。
 
-空でない値は `std::atoi()` で変換し、結果が 0 以外なら有効、0 なら無効です。文字列全体の数値 parse ではありません。
+| ビルド・GPU | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `STRATA_USE_HIP` かつ `STRATA_HIP_GFX906` ではない。gfx1200 / gfx1201 | GPU 情報の取得に成功すれば ON。空文字もこの既定値 | 空でない文字列の `atoi` 結果が 0 以外（例: `1`, `-1`, ` 1`, `1tail`） | 空でない文字列の `atoi` 結果が 0（例: `0`, `0tail`, `true`, `x1`） |
+| 同 HIP ビルド。他の GPU、または既定判定で GPU 情報を得られない場合 | OFF。空文字もこの既定値 | 同上 | 同上 |
+| CUDA、gfx906 互換 HIP、Metal、およびこの環境変数を読む分岐を持たない build | この変数による判定なし | 適用なし | 適用なし |
 
-| 値 | 判定 |
-|---|---|
-| 未設定、空文字 | gfx1200/gfx1201 のとき有効。それ以外は無効 |
-| `1`、`2`、`-1` | `atoi` の結果が非0なので有効 |
-| `0`、`0suffix`、`nonnumeric` | `atoi` の結果が0なので無効 |
-| `1suffix`、` 1tail` | 先頭から `atoi` が読む整数が非0なので有効 |
-
-空文字は明示的な無効指定ではなく、自動判定に入ります。空白の扱い、整数部分の後ろの文字、大文字小文字は独自に検査せず、`atoi` の変換規則に従います。値の判定結果は関数内の `static const bool` に保存されます。最初の判定後にプロセス環境を変更しても再評価されません。
+GPU 既定値の gfx12 判定は `gfx_arch_is_gfx12` が `gfx1200` / `gfx1201` と完全一致（または `:` で続く arch 名）する場合に true を返すもの（`engine/src/core/mtp.cpp:634-639`、`engine/include/strata/kernels/gfx_arch.hpp:15-19,41-42`）。数値として表現できない文字列は `atoi` が 0 を返すため無効扱いになる。数値の範囲外を含む `atoi` のオーバーフロー時の結果はここで定義されていない。
 
 ## 有効になる条件
 
-- `STRATA_USE_HIP` でビルドされ、`STRATA_HIP_GFX906` ではないこと。GFX906 互換ビルド、CUDA、Metal ではこの変数による判定はありません。
-- MTP drafter の `MtpDrafter::load()` が呼ばれること。生成側では `--mtp` の指定があり、`--spec` が2未満でない場合に MTP をロードします。`--mtp` がなければこのストリーム設定処理は通りません。
-- 値が有効で、`hipDeviceGetStreamPriorityRange()` が成功し、`hipStreamCreateWithPriority()` も成功すること。優先度取得または優先度ストリーム作成が失敗すると、通常優先度の非同期ストリームを作成します。
+- `engine/src/core/mtp.cpp` の HIP 分岐は `STRATA_USE_HIP` が定義され、`STRATA_HIP_GFX906` が未定義のときだけコンパイルされる（`engine/src/core/mtp.cpp:623-645`）。gfx906 互換 build は別 macro を定義する（`engine/cmake/backends/hip.cmake:6-26`）。
+- MTP drafter をロードする経路で判定される。generate は `--spec` が 2 未満なら `--mtp` を無視してクリアし、MTP パスが残った場合に `mtp.load(...)` を呼ぶ（`engine/src/program/generate.cpp:8243-8265`）。
+- HIP 以外の backend ではこの名前を読む実装がない。HIP の gfx12 以外で優先 stream を使うには、環境変数を空でない値にし、`atoi` が 0 以外を返す必要がある（`engine/src/core/mtp.cpp:623-646`）。
+- `hipDeviceGetStreamPriorityRange` が成功し、続く `hipStreamCreateWithPriority` も成功したときに限り優先 stream が使われる。どちらかが失敗すると通常 stream の作成に進む（同 `:640-646`）。
 
 ## 実行時の詳細
 
-`MtpDrafter::load()` は HIP 経路でまず現在の device id を保存し、バッファ確保後に `cs_` を作成します。変数の判定はこのストリーム作成処理内で行われ、初回は unset/空文字の場合に device property も取得します。有効なら `hipDeviceGetStreamPriorityRange(&lo, &hi)` で範囲を取得し、`hi` を `hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi)` に渡します。無効または優先度ストリームの作成失敗時は `cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking)` を使います。通常ストリームも作成できなければ `load()` は `mtp: stream` エラーで失敗します。優先度 API の失敗自体は通常ストリームへの fallback となり、それ専用の警告ログはありません。
+`MtpDrafter::load` が GPU バッファを確保した後、`cs_` を作る時点で `getenv` を評価する。対象変数自体は `static` に保存されないため、同一プロセスでも後続の `load` はその時点の環境値を読み直す。一方、未設定・空文字時に使う GPU 世代判定器 `gfx12_dev` は関数内 static で、device ordinal ごとに最初の probe 結果を保存する。環境を実行中に変更して後続 load へ反映する場合も、明示値が設定されればそれが使われ、unset / empty の GPU 判定は probe 済み device では再取得されない（`engine/src/core/mtp.cpp:623-639`、`engine/include/strata/core/per_device_flag.hpp:13-30`）。
 
-HIP 分岐は `!STRATA_HIP_GFX906` の条件付きコンパイルです。`gfx_arch_is_gfx12()` は `gfx1200` と `gfx1201` の完全なアーキテクチャ名（任意の `:feature` suffix 付き）だけを受け入れます。ソースコメントは、この設定の狙いを drafter stream の優先度引き上げとして説明していますが、コメントが参照する `notes-latency.md` は調査対象内に見つからず、`docs/DETAILS.md` にもこの変数の測定記載はありません。そのため性能値や他の ROCm スケジューリング動作はここでは主張しません。
+優先が有効なら `hipDeviceGetStreamPriorityRange` から得た `hi` を渡して `hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi)` を呼ぶ。`prio` が立たなければ `cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking)` で `cs_` を作る。以降、MTP の prefill / draft graph の capture と graph launch は `cs_` を使用する（`engine/src/core/mtp.cpp:640-646,1577-1656,1936-1948`）。この設定は MTP の有効化や draft の値・選択を直接変更する分岐ではなく、stream 作成時の指定を選ぶ。
+
+## ログと測定値
+
+優先 stream を選んだことや、優先 stream 作成に失敗して通常 stream に fallback したことを知らせる専用ログはない。優先度取得・作成 API の失敗は `cudaGetLastError()` を呼んでクリアし、通常 stream 作成へ進む。通常 stream も作れなければ `err = "mtp: stream"` として load が失敗し、generate は `strata generate: %s%s%s` を stderr に出して終了コード 1 を返す（`engine/src/core/mtp.cpp:640-646`、`engine/src/program/generate.cpp:8264`）。
+
+ソースコメントには R9700 / UD-Q4_K_XL で draft wall が 1 window あたり 5.8 ms から 3.5 ms になったという記載があるが、コメントが参照する `notes-latency.md` は checkout 内で確認できなかったため、測定値としては採用しない（`engine/src/core/mtp.cpp:624-628`）。
 
 ## 根拠
 
-- `src/core/mtp.cpp:249-264` — `MtpDrafter::load()` と対象デバイスの保存。
-- `src/core/mtp.cpp:434-464` — CUDA の別判定、HIP 専用コンパイル条件、環境変数 parse、優先度指定ストリームと通常ストリームへの fallback。
-- `include/strata/kernels/gfx_arch.hpp:15-20,35-36` — device 名の照合方法と gfx1200/gfx1201 判定。
-- `src/program/generate.cpp:4611-4629` — `--mtp` が指定され、`--spec < 2` でない場合に drafter をロードする呼び出し。
-- `include/strata/core/mtp.hpp:87-100` — drafter の stream と draft/prefill API。
-- `CMakeLists.txt:64-67,128-143`、`cmake/hip_backend.cmake:89` — HIP と GFX906 互換ビルドの定義。
+- `engine/src/core/mtp.cpp:613-646` — CUDA と HIP の別分岐、HIP の値判定、優先 stream 作成と通常 stream fallback。
+- `engine/src/core/mtp.cpp:345-356,623-646` — MTP load と backend macro 条件。
+- `engine/src/core/mtp.cpp:1577-1656,1936-1948` — 選択された `cs_` を使う graph capture / launch。
+- `engine/src/program/generate.cpp:8243-8265` — `--spec` 条件と MTP load 呼び出し。
+- `engine/include/strata/core/per_device_flag.hpp:13-30` — device ごとの既定値 probe の cache。
+- `engine/include/strata/kernels/gfx_arch.hpp:15-19,41-42` — gfx12 arch 名の判定。
+- `engine/cmake/backends/hip.cmake:6-26` — gfx906 互換 build の macro 定義。

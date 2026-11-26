@@ -1,40 +1,55 @@
 # `STRATA_VERIFY_PROFILE`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数の意味は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Verifier の decode window で GPU stage の時間を記録し、GDN/QSA layer ごとの区分（例: `attention`、`VRAM hits`、`PCIe grp`、`head`）と合計を ms/window で報告します。設定自体がログを常に出すわけではありません。通常の `--serve` では `STRATA_DECODE_TIMING` も設定され、リクエスト終了時に集計を出力する必要があります。SYCL の `STRATA_VERIFY_EAGER` 経路には、各 window ごとに出す例外があります。
+GPU の verify window 内の処理区間に時刻印を取り、GDN/QSA 層などの GPU ステージ時間を集計して出力する診断用スイッチです。通常の `--serve` decode では `STRATA_DECODE_TIMING=1` と併用すると、リクエストごとのログに `strata decode GPU stages (ms/window):` が出ます。これは処理時間を測る機能で、トークン選択や検証条件を設定する変数ではありません。ただし計測用の記録・読出しを行い、一部の融合・並行実行経路を無効にするため、計測時の実行時間は通常経路と同じではありません。`docs/DETAILS.md` も GPU profile は decode を遅くすると説明しています。`engine/src/core/verify.cpp:1516-1518,1548,1610,2621,2847-2860`、`docs/DETAILS.md:364-366`。
+
+環境から値を読む実装は CUDA/HIP 側の `Verifier::init` と SYCL 側の `Verifier::init` にあります。Metal 用の `Verifier::init` はこの読み取り箇所より前に初期化から戻るため、このスイッチによる同じ計測は行いません。`engine/src/core/verify.cpp:956-993,1262-1276`、`engine/sycl/src/core/verify.cpp:624-626,816-829`。
 
 ## 値と判定
 
-CUDA/HIP と SYCL の両実装で `std::getenv("STRATA_VERIFY_PROFILE") != nullptr` を使います。文字列を parse しないため、unset のみ無効です。`1`、`0`、`false`、空文字を含め、何らかの値が設定されていれば有効化を試みます。Verifier の初期化時に `prof_on_` に保存され、そのインスタンスでは後から環境を変更しても再評価されません。
+両実装とも `std::getenv("STRATA_VERIFY_PROFILE") != nullptr` で設定の有無だけを判定し、文字列を parse しません。値が空か、`0` / `false` か、`1` か、大文字小文字、前後の空白、文字列末尾の内容かは問いません。環境変数が存在すれば有効扱い、存在しなければ無効です。CUDA/HIP では記録バッファの確保に失敗すると無効に戻ります。SYCL も device バッファ確保に失敗すると無効に戻します。いずれもこの失敗をこの箇所で利用者向けログには出しません。`engine/src/core/verify.cpp:1262-1276`、`engine/sycl/src/core/verify.cpp:816-829`。
 
-有効化時は layer 数に比例する device profile buffer を確保して初期化します。確保に失敗すると `prof_on_` を false に戻し、計測・レポートを行いません（この箇所に専用の警告ログはありません）。pipelined windows 用の pinned host buffer が別途確保できない場合、その経路は window の計測を行いません。
+| 条件 | unset | 有効になる値の例 | 無効になる値の例 |
+|---|---|---|---|
+| CUDA/HIP の verifier 初期化 | 計測なし | 空文字、`0`、`false`、`1`、`0anything` | 該当なし（変数が設定されていれば値の形式による無効化なし）。計測バッファ確保失敗時は無効化 |
+| SYCL の verifier 初期化 | 計測なし | 空文字、`0`、`false`、`1`、`0anything` | 該当なし（変数が設定されていれば値の形式による無効化なし）。計測バッファ確保失敗時は無効化 |
+| Metal verifier | 読み取り箇所なし | 該当なし | この変数による計測なし |
 
-## 有効になる条件と相互作用
+CLI 引数や別の設定値でこの判定を上書きする処理はありません。サーバーログへ出す通常の decode profile には別途 `STRATA_DECODE_TIMING` が関係します。`engine/src/core/verify.cpp:1262-1276`、`engine/sycl/src/core/verify.cpp:816-829`、`docs/DETAILS.md:364-365`。
 
-- CUDA/HIP (`src/core/verify.cpp`) および SYCL (`sycl/src/core/verify.cpp`) の GPU Verifier で使われます。CPU-only 経路の環境変数ではありません。
-- window の stamp 集計は `prof_on_ && G == 1` の場合に行われます。複数 group の window は通常の集計対象外です。layer split では各 Verifier が担当 layer の時間を計測します。
-- CUDA/HIP の `--serve` でリクエスト単位の GPU stage 行を出す条件は、少なくとも decode window があり、`STRATA_DECODE_TIMING` が設定されていることです。`STRATA_VERIFY_PROFILE` だけでは同じ per-request の行は出ません。SYCL でも同様に per-request の出力は `STRATA_DECODE_TIMING` による集計内で行われます。
-- SYCL ではさらに `STRATA_VERIFY_EAGER` が設定されていると、各 window 後に `verify stages T=... (ms/window):...` を stderr に出します。この経路は host-clocked とソースコメントに記されています。通常の SYCL 経路は集計された GPU stamp を報告します。
-- 計測 stamp を使う都合で一部の重ね合わせ・融合経路を抑止します。CUDA/HIP では side-stream の DF branch と shared-expert fork、conv/ab 融合、wait/copy 融合、hit combine 融合などに `!prof_on_` 条件があります。プロファイル中の速度を通常実行の速度として扱わないでください。
+## 有効になる条件
+
+- CUDA/HIP または SYCL の verify window 実装を通り、verifier 初期化が完了すること。Metal 実装は `init` 内で先に戻るため対象外です。`engine/src/core/verify.cpp:978-993,1262`、`engine/sycl/src/core/verify.cpp:624-626,816`。
+- 計測バッファの確保が成功すること。失敗時は `prof_on_` を false に戻すため、profile は記録・出力されません。`engine/src/core/verify.cpp:1273-1276`、`engine/sycl/src/core/verify.cpp:817-829`。
+- 通常のサーバー decode でリクエストごとの GPU profile を見る場合は `STRATA_DECODE_TIMING=1` も必要です。decode timing 出力ブロックの中で `profile_report()` を呼び、空でない結果を stderr に出します。`engine/src/program/generate.cpp:23352-23358,23385-23390`。プロジェクトの説明もこの二変数の併用を案内しています。`docs/DETAILS.md:364-366`。
+- `--batch` 系にも集計後に `profile_report()` を出す経路があります。`STRATA_VERIFY_PROFILE_EVERY` は SYCL の GPU-clock profile を window ごとに途中出力する別変数で、`STRATA_VERIFY_PROFILE` 自体の有効条件ではありません。`engine/src/program/generate.cpp:17495-17509`、`engine/sycl/src/core/verify.cpp:2337-2346,2921-2935`。
 
 ## 実行時の詳細
 
-window 内で GPU stage の stamp を集め、`collect_profile()` / `accumulate_profile()` が layer 種別（GDN または QSA）ごとに時間差を加算します。`profile_report()` は各項目を `prof_windows_` で割って ms/window にし、`GDN layers:`、`QSA layers:`、`total ... ms/window over ... windows` の形式で返します。呼び出し後に累計値と window 数をゼロに戻すため、次回の報告は前回報告以降の分です。
+値は verifier の `init` 中に読み、`prof_on_` に保存します。各 verify 呼び出しで環境を読み直す実装ではないため、初期化後の環境変更は既存 verifier には反映されません。後から初期化される別 verifier は、その初期化時点の環境を判定します。CUDA/HIP は GPU 用バッファを確保・ゼロ初期化し、verify window のステージ境界で GPU stamp を追加します。window 終了後にデータをホストへ読み戻し、集計します。`engine/src/core/verify.cpp:1262-1276,1516-1518,3594-3607,4146-4180`。
 
-CUDA/HIP の serve 経路では、`STRATA_DECODE_TIMING` のレポート時に stderr へ `strata decode GPU stages (ms/window):...` を出します。後段の layer stage は `strata decode GPU stages, stage N (ms/window):...` です。SYCL の eager 経路では前述の per-window 行も出ます。ほかに batch の集計時にも profile report を stderr へ出す呼び出しがあります。
+このフラグは計測だけでなく実行経路にも影響します。CUDA/HIP では `prof_on_` が true のとき、`STRATA_SIDE_MIXER` の分岐ストリーム経路、共有 expert の fork 経路、行コピー融合、hit の combine 融合、融合 wait-and-copy を使わない条件があります。また dispatch の診断行に `prof=1` と記録します。`engine/src/core/verify.cpp:1548,1610,2621,2847-2860,2868-2875,2933-2942`。したがって profile の値は実行時間や並行性を変え得ます。コード上、このフラグ自体がトークンの選択結果を変える設定として使われてはいません。
 
-`docs/DETAILS.md` は `STRATA_DECODE_TIMING=1` と `STRATA_VERIFY_PROFILE=1` を合わせて使い、各 request の decode 内訳と GPU stage 内訳を読む手順を案内しています。同資料は GPU stage の event 計測が decode を少し遅くすると説明しており、速度測定ではなく比較・内訳確認向けです。特定環境の性能値はこの調査では確認していません。
+CUDA/HIP の通常のリクエスト集計は、集めた window 数でステージ時間を平均し、`GDN layers` / `QSA layers` と合計 ms/window を `profile_report()` に整形します。decode timing が有効なサーバー経路では stderr に `strata decode GPU stages (ms/window):` として出力し、複数 GPU stage では stage 番号付きの行も出します。集計後の profile カウンターはリセットされます。`engine/src/core/verify.cpp:3208-3232`、`engine/src/program/generate.cpp:23385-23390`。
+
+SYCL も `init` で設定有無を保存し、確保成功時に buffer を用意します。通常の single-group window (`G == 1`) は集計対象です。`STRATA_VERIFY_EAGER` が設定されていれば window ごとに `verify stages T=... (ms/window):` を出し、未設定なら GPU stamp を集計し、`STRATA_VERIFY_PROFILE_EVERY` が正数ならその数の window ごとに GPU-clock の行を出します。後者の間隔値は関数内 static で初回評価されます。これらの SYCL 出力条件は CUDA/HIP のサーバー出力条件と異なります。`engine/sycl/src/core/verify.cpp:816-829,2919-2935`。
+
+## ログと測定値
+
+CUDA/HIP 側のステージ集計文字列は ` GDN layers:`、` | QSA layers:`、` | total %.2f ms/window over %lld windows` を含み、サーバーでは `strata decode GPU stages (ms/window):` の後ろに出ます。通常の decode timing 自体が無効ならこのサーバー出力経路は呼ばれません。`engine/src/core/verify.cpp:3208-3232`、`engine/src/program/generate.cpp:23352-23358,23385-23390`。
+
+SYCL 側では条件に応じて `verify stages T=%d (ms/window):` または `verify stages T=%d (ms/window over %lld, GPU clock):` を stderr に出します。バッチ window では `STRATA_VERIFY_PROFILE_EVERY` が正数で閾値に達した場合に `verify stages batch window of ... (GPU clock):` を出します。`engine/sycl/src/core/verify.cpp:2337-2346,2919-2935`。
+
+計測バッファ確保失敗時の明示的な profile エラーや fallback 警告は該当箇所にありません。性能値は環境・GPU・backend・モデル等に依存するため、この調査では測定していません。`docs/DETAILS.md:364-366` は profile が decode を遅くすると記載していますが、特定環境での数値は示していません。
 
 ## 根拠
 
-- 値の有無判定、profile buffer 確保と失敗時の無効化: `src/core/verify.cpp:733-738`, `sycl/src/core/verify.cpp:628-641`。
-- stamp の集計条件: `src/core/verify.cpp:2434`, `sycl/src/core/verify.cpp:2401-2405`。
-- GDN/QSA の名称、平均値の計算、報告後の累計リセット: `src/core/verify.cpp:1836-1859`, `sycl/src/core/verify.cpp:1634-1657`。
-- CUDA/HIP の計測によって一部経路を抑止する条件: `src/core/verify.cpp:906,1161,1459,1634,1662,1677`。
-- SYCL eager の per-window host-clocked report: `sycl/src/core/verify.cpp:1946-1952,2401-2405`。
-- serve における `STRATA_DECODE_TIMING` 判定と GPU report 出力: `src/program/generate.cpp:11883-11884,12767-12788`, `sycl/src/program/generate.cpp:10610-10611,11499-11516`。
-- batch report: `src/program/generate.cpp:10157-10159,10301-10303`。
-- 利用手順と計測コストの説明: `docs/DETAILS.md:314-321`。
+- `engine/src/core/verify.cpp:956-993,1262-1276` — CUDA/HIP verifier 初期化、Metal の早期 return、設定有無の判定とバッファ確保。
+- `engine/src/core/verify.cpp:1516-1518,1548,1610,2621,2847-2860,2868-2875,2933-2942` — stamp、診断値、profile 時に抑制される実行経路。
+- `engine/src/core/verify.cpp:3594-3607,4146-4180,3208-3232` — window 後の集計と report 生成。
+- `engine/src/program/generate.cpp:23352-23358,23385-23390,17495-17509` — decode timing/server と batch の出力呼び出し。
+- `engine/sycl/src/core/verify.cpp:624-626,816-829,2337-2346,2919-2935` — SYCL 初期化、集計・出力条件。
+- `docs/DETAILS.md:364-366` — サーバーでの設定併用例と計測時の速度に関する注意。

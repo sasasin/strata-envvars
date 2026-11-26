@@ -1,43 +1,47 @@
 # `STRATA_MTP_SHARED_BRANCH`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-MTP draft layer の MoE 計算で、shared expert を router と routed experts の計算と別 stream / queue に分岐させるかを制御します。分岐を有効にすると shared expert の計算を先に side stream / queue へ投入し、routed experts の処理と並行させ、combine の前に完了を待ちます。無効の場合は routed experts の処理後、同じ主 stream / queue 上で shared expert を計算します。MTP drafter の当該処理を実行しないプロセスでは効果はありません。
+MTP draft layer の MoE decode で、shared expert を router と routed experts と並行して別 stream/queue で計算するかを切り替える。非 HIP の CUDA と SYCL では未設定時に分岐を使い、`0` 相当の値を設定すると主 stream/queue 上で routed experts の後に shared expert を実行する。HIP はこの分岐をコンパイル時に無効にしており、変数を読み取らない。これは計算スケジュールの切替で、router の選択値や combine の入力形式を直接変更するコードではない。実装は CUDA/HIP 共通の `MtpDrafter::record_rest` / `record_rest_slots` と SYCL 版 `record_rest` にある（`engine/src/core/mtp.cpp:1309-1312,1391-1455,2445-2448,2537-2590`; `engine/sycl/src/core/mtp.cpp:1102-1147`）。
 
 ## 値と判定
 
-HIP ビルド以外では `std::getenv()` で取得した値を `std::atoi()` に渡し、結果が 0 でなければ分岐を有効にします。文字列全体の妥当性検査はありません。`atoi` が先頭の空白と符号付き10進数を読めるため、たとえば `2`、`-1`、`1junk` は有効、`0`、`0junk`、空文字、数値に変換できない文字列は無効です。
+各 decode 関数内の関数ローカル `static const bool` を初期化するとき `std::getenv` で読み、`std::atoi(v) != 0` で判定する。未設定は `true`。設定値は先頭の整数部分を `atoi` が変換し、変換結果が 0 以外なら有効とする。文字列全体の検証、大文字小文字判定、真偽語の解釈、範囲制限はない。
 
-| ビルド | 未設定 | 設定時 |
-|---|---|---|
-| CUDA / SYCL（非-HIP） | 有効 | `atoi(value) != 0` のとき有効 |
-| HIP | 無効 | 値を読み取らず、常に無効 |
+| 経路 | unset | 分岐を有効にする値の例 | 分岐を無効にする値の例 |
+| --- | --- | --- | --- |
+| CUDA (`STRATA_USE_HIP` 未定義) / SYCL | 有効 | `1`, `-1`, `2`, `1tail` | `0`, 空文字, `true`, `false`, `0tail`, `nonnumeric` |
+| HIP (`STRATA_USE_HIP` 定義) | 無効（変数を読まない） | 該当なし | 常に無効 |
 
-判定値は関数内の `static const bool` に保存されます。最初に MTP draft 関数がこの判定へ到達した後、プロセス内で環境変数を書き換えても再評価されません。明示的なログ出力や値不正時の警告はありません。
+`atoi` は先頭の空白や符号を許容する整数変換で、数値の後ろは判定に使わない（例: `  +1tail` は有効、`  0tail` は無効）。整数に変換できない先頭なら 0 となる。CUDA/SYCL の単発 decode と batch decode にそれぞれ別の `static` があるため、各関数が初めて評価された後に環境を変更しても、その関数の値は変わらない。設定ファイルや CLI 引数との優先順位を決める処理はこれらの実装にはなく、engine はこの環境変数を直接読む（`engine/src/core/mtp.cpp:1392-1398,2537-2544`; `engine/sycl/src/core/mtp.cpp:1104-1111`）。
 
 ## 有効になる条件
 
-- MTP drafter のこの MoE 実行経路に入ること。
-- 非-HIP ビルドであり、環境変数が未設定、または設定値の `atoi()` 結果が非ゼロであること。
-- HIP では常に無効。HIP 用実装は side stream / event を作らず、shared expert を主 stream で実行します。
-
-この値は shared expert の並列実行方法を切り替えます。shared expert の出力は routed expert の計算と別の `shared_` バッファに書かれ、両方の完了後に combine が実行されます。
+- MTP drafter の decode が実行され、単発経路の `record_rest` または batch 経路の `record_rest_slots` に到達する必要がある。CUDA/HIP の両経路は `decode_ready` が偽なら先に失敗する（`engine/src/core/mtp.cpp:1309-1312,2445-2448`）。SYCL 版の単発 `record_rest` は `engine/sycl/src/core/mtp.cpp:1013-1022` にある。
+- CUDA では `STRATA_USE_HIP` が未定義であること。HIP build では `#if defined(STRATA_USE_HIP)` が `false` を返し、環境変数の読み取り自体を除外する（`engine/src/core/mtp.cpp:1392-1398,2537-2544`）。
+- batch 経路では、値が有効でも `side_`, `sh_fork_`, `sh_join_` がすべて非 null の場合に限り `use_branch` が真になる。null なら shared expert は主 queue 上で routed experts の後に実行される（`engine/src/core/mtp.cpp:2545-2545,2584-2590`）。
+- SYCL では同ファイルの `record_rest` がこの分岐を使う。SYCL 対応 build と MTP decode が必要（`engine/sycl/src/core/mtp.cpp:1104-1113`）。
+- Metal build は対象の CUDA/HIP 共通・SYCL の実装ではない。batch の `draft_slots` は Metal で `mtp batch: unsupported on Metal` を返す（`engine/src/core/mtp.cpp:2735-2744`）。
 
 ## 実行時の詳細
 
-CUDA 実装は未設定を既定 ON とし、`STRATA_USE_HIP` のビルドでは環境変数の読み取り自体をコンパイル時に除外して OFF に固定します。CUDA は drafter 初期化時に side stream と fork/join event を作成します。分岐 ON では主 stream 上で fork event を記録し、side stream がそれを待ってから shared expert を実行します。同時に主 stream は router と routed experts を処理し、routed experts の処理後に join event を待ってから combine に進みます。分岐 OFF では routed experts の処理後、主 stream 上で shared expert を実行してから combine します。
+単発 decode では有効時に CUDA event を主 stream に記録し、side stream を待たせてから shared expert の計算を side stream に投入する。router と routed experts は主 stream で進み、主 stream は shared expert の join event を待ってから combine に進む。無効時は同じ `shared_rows` 計算を routed experts の後に主 stream で実行する（`engine/src/core/mtp.cpp:1400-1418,1437-1455`）。
 
-SYCL 移植版にも同じ値判定があります。side queue と event を用いて shared expert の投入を分岐し、combine の前に queue barrier で合流します。いずれの実装も分岐設定を理由とする標準出力・標準エラーのログは出しません。stream / event / barrier の失敗時は `err` に `mtp: the shared expert's branch` または `mtp: the shared expert's join` を設定して処理を失敗させます。
+Batch decode も同様に fork/join するが、補助 stream/event が揃わない場合は分岐せず直列実行する。単発と batch の各 `static` はそのコード経路で初回評価された時点の値を保持する。プロセス起動後に環境値を変えた場合の再読み込みはない（`engine/src/core/mtp.cpp:2537-2566,2584-2590`）。
+
+SYCL では queue の barrier で fork/join し、`side_` に shared expert を投入する。無効時は主 queue 上で routed experts の後に実行する（`engine/sycl/src/core/mtp.cpp:1112-1147,1165-1173`）。CUDA/SYCL の各実装は MTP drafter の初期化時に補助 stream/queue と event を作り、作成に失敗すると初期化を失敗させる（CUDA: `engine/src/core/mtp.cpp:646-653`; SYCL: `engine/sycl/src/core/mtp.cpp:578-590`）。
+
+## ログと測定値
+
+この変数の値や分岐選択を報告する専用ログは、該当する実装経路にはない。fork/join の CUDA API が失敗すると `record_rest` は `mtp: the shared expert's branch` または `mtp: the shared expert's join` をエラー文字列に設定して `false` を返す（`engine/src/core/mtp.cpp:1402-1405,1416-1419,1452-1454`）。batch は `mtp batch: shared expert fork failed`, `mtp batch: shared expert join record failed`, `mtp batch: shared expert join wait failed` を設定して `false` を返す（`engine/src/core/mtp.cpp:2547-2551,2560-2565,2584-2587`）。SYCL は `mtp: the shared expert's branch` / `mtp: the shared expert's join` を設定して `false` を返す（`engine/sycl/src/core/mtp.cpp:1120-1125,1139-1145,1165-1169`）。この調査では性能測定を行っていない。
 
 ## 根拠
 
-- `src/core/mtp.cpp:867-895` — 値の読み取りと既定値、CUDA の fork、shared expert の side stream 実行と join event 記録。
-- `src/core/mtp.cpp:914-923` — routed experts の後に join を待つ経路、および分岐 OFF 時の shared expert 実行。
-- `src/core/mtp.cpp:433-440` — 非-HIP ビルドで side stream と event を初期化し、HIP はその初期化を除外。
-- `sycl/src/core/mtp.cpp:1001-1045,1059-1070` — SYCL 移植版の値判定、shared expert の queue 分岐と combine 前の合流。
-- `sycl/src/core/mtp.cpp:523-529` — SYCL queue と event の初期化。
-- `cmake/hip_backend.cmake:89` — HIP runtime target に `STRATA_USE_HIP=1` を定義。
-
-`docs/DETAILS.md` と関連 docs には、この環境変数の挙動や測定値の説明を確認できませんでした。したがって性能差や出力同一性については記載していません。
+- CUDA/HIP 単発 decode の値判定、分岐、合流: `engine/src/core/mtp.cpp:1391-1418,1452-1455`。
+- CUDA/HIP batch decode の値判定、補助リソース条件、分岐、合流: `engine/src/core/mtp.cpp:2537-2566,2584-2590`。
+- CUDA/HIP 補助 stream/event の生成と HIP の除外: `engine/src/core/mtp.cpp:646-672`。
+- SYCL の判定、queue barrier、合流: `engine/sycl/src/core/mtp.cpp:1102-1147,1165-1173`。
+- SYCL 補助 queue/event の生成: `engine/sycl/src/core/mtp.cpp:578-590`。
+- Metal batch の非対応経路: `engine/src/core/mtp.cpp:2735-2744`。

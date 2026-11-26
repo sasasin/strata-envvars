@@ -1,70 +1,68 @@
 # `--kv-streaming`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` などの wrapper 経由を含む） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat` のセットアップ |
 | オプション | `--kv-streaming` |
 | 別名 | なし |
 | 値 | `auto`、`on`、`off` |
-| 既定値 | `auto` |
 
 ## 役割
 
-長い context で KV cache を RAM に置き、attention が使う窓だけを VRAM に常駐させる設定を選びます。`setup.py` がモデル用の実行設定を作る際に判定され、engine の `--kv-resident 32768` として反映されます。この option 自体は engine の引数ではありません。
+長いコンテキストで KV キャッシュをホスト RAM に置き、attention が使う窓だけを GPU の VRAM に保持する設定を、セットアップが生成する実行構成に反映します。VRAM に余裕を作ってモデルの expert cache に回せますが、KV の RAM 使用量が増えます。実際に有効にするとセットアップはエンジン引数へ `--kv-resident 32768` を追加します（`terminal/strata_control/setup_config.py:297-314`）。エンジン側はこの指定で各 QSA 層の KV をストリームし、指定したセル数を VRAM に保持します（`engine/src/program/generate.cpp:1234-1235,3907`）。
 
 ## 使い方
 
-Linux で 128K context の KV streaming を明示して設定し、モデルを起動しない例です。
-
 ```sh
-./setup.sh --setup --context 131072 --kv-streaming on --no-start
+# セットアップ時に RAM 判定を上書きして有効化する。構成を書き、モデルは起動しない。
+python setup.py --setup --kv-streaming on --yes --no-start
+
+# RAM 判定に任せる（省略時と同じ）。
+python setup.py --setup --kv-streaming auto --yes --no-start
+
+# 明示的に無効化する。
+python setup.py --setup --kv-streaming off --yes --no-start
 ```
 
-`setup.sh` は引数を `setup.py` に渡します。Windows では同じ値を `START-HERE.bat --setup --context 131072 --kv-streaming on --no-start` のように指定できます（[`docs/cli/README.md`](../../README.md) の `source-setup` 節）。
+実行場所にある `setup.py` を使う例です。セットアップは構成ファイルと起動スクリプトを書きます。`--no-start` はモデルの起動を省きますが、セットアップやダウンロードを省略する指定ではありません（`terminal/setup.py:11524-11525,12521-12527,12555-12562`）。
 
 ## 値と既定値
 
-- `auto`（既定）: 64K 以上の context で、モデルの RAM 見積もり、KV cache の見積もり、および 1 GB の余裕を RAM が満たす場合に有効化します。
-- `on`: 同じ 64K 以上の条件で RAM 判定を上書きし、有効化します。ただし RAM 不足の警告が出ます。WSL では有効化されません。
-- `off`: 有効化しません。
-- 値は `argparse` の `choices` により小文字の3値に限定されます。他の値は parser error となります。値の省略は `auto` と同じです。
-
-RAM の見積もりは `context × 13 × KV_CELL_BYTES[kv] / 1e9` で、`q4_0` は 576 bytes、`k8v4` は 816 bytes、それ以外は辞書の fallback 1056 bytes を使います。コードコメントでは 12 QSA layers と draft layer 分と説明されています。
+- parser は `auto`、`on`、`off` のみを受け付け、既定値は `auto` です。別名はありません（`terminal/setup.py:11598-11600`）。それ以外の値は `argparse` の choices 検証で受理されません（同: `11444,11598-11606`）。
+- ストリーミング用 RAM の概算は、KV の種類とコンテキスト長から計算します。非 budget モデルでは「モデル RAM + KV RAM + 1 GB」と「expert arena + headroom + KV RAM」の小さい方、budget モデルでは `max(16 GB, headroom + KV RAM + 4 GB)` が自動判定の閾値です（`terminal/setup.py:7068-7091`）。
+- KV RAM 概算は `ctx × 13 × KV_CELL_BYTES[kv] / 1e9` です。ソースコメントの目安は int8 で約 13.7 KB/トークン、K8V4 で約 10.6 KB、4-bit で約 7.5 KB です（`terminal/setup.py:7068-7071`; `terminal/strata_control/setup_config.py:297-304`）。
 
 ## 実行時の動作
 
-通常の 64K 以上の context では、`off` なら KV cache を VRAM に残します。`auto` は RAM が `model["ram_gb"] + KV 見積もり + 1 GB` 以上の場合に有効化し、`on` はその RAM 判定を満たさなくても有効化します。有効時は生成する engine 引数列に `--kv-resident 32768` を加えます。context が 64K 未満なら `on` でも引数は加わりません。
+| 値 | セットアップの判断 |
+| --- | --- |
+| `auto` | コンテキストが 65,536 以上で、計算した RAM 閾値を満たすと有効化します。閾値を満たさなければ KV は VRAM に残ります。 |
+| `on` | 65,536 以上なら RAM 閾値を超えていても有効化します。RAM 不足時はページングまたはメモリ不足の可能性を警告します。65,536 未満では有効にならず、その旨を警告します。 |
+| `off` | 自動判定の結果にかかわらず無効化します。 |
 
-有効時の KV RAM は resident budget とも関係します。対象モデルに budget があり、利用者が `--resident-budget-gib` を指定していない場合、setup は KV 分を差し引いて budget を計算します。利用者が budget を指定した場合はその値を保ち、KV cache 分が上乗せになる旨を警告することがあります。
+この分岐は `terminal/strata_control/setup_config.py:301-332` にあります。Windows Subsystem for Linux (WSL) では 65,536 以上のコンテキストでも常に無効です。`on` を指定しても WSL での制限と警告が表示されます（同: `305-309`）。また、セットアップが既存の実行構成を整える経路でも WSL 上の `--kv-resident` を削除して構成を書き直します（`terminal/setup.py:8288-8295`）。
 
-生成した `args` はモデルの run config に保存され、run script から server/engine に渡されます。setup は設定ファイルを一時ファイルへ書いてから置換します。`--no-start` を付けなければ、設定生成後に通常の起動経路へ進みます。
+ソース内の判定説明には差があります。`terminal/setup.py:7094-7104` の `kv_streaming_wanted` は、budget モデルかつ VRAM が 16.5 GB 以下なら 32,768 から有効化可能としています。一方、セットアップが実際に構成引数へ `--kv-resident` を追加する `terminal/strata_control/setup_config.py:312-313` は、モデル種別にかかわらず 65,536 以上を条件にしています。この文書では構成を書き出す側の分岐を実際の効果として記載しました。両方の条件が異なる理由はこの範囲のコードから確認できません。
+
+有効時は `--kv-resident 32768` を生成引数に加えます。`--kv` の種類で KV の RAM 見積もりが変わり、`--context` の値が判定対象の長さになります（`terminal/setup.py:11452,11460-11462`; `terminal/strata_control/setup_config.py:301-314`）。budget があり、layer split でないモデルでは、明示的な `--resident-budget-gib` がない場合、セットアップは KV の RAM 分を差し引いて budget を計算します。明示 budget がある場合に KV RAM がその外に加算されると警告する場合があります（`terminal/strata_control/setup_config.py:319-326`）。
+
+生成された構成は一時ファイルへ書いてから置換され、起動スクリプトも作成されます。通常はその後モデルを起動しますが、`--no-start` なら起動せず終了します（`terminal/setup.py:7531-7537,12521-12527,12555-12562`）。
 
 ## 適用条件と副作用
 
-- 有効化の context 下限は 65536 tokens（64K）です。
-- WSL は streaming 非対応として常に無効扱いです。`on` を指定しても `--kv-resident` は生成せず、`on` の指定に対して無効化理由を表示します。
-- `auto` で RAM 見積もりを満たさない場合は VRAM 常駐のままとなり、必要 RAM と搭載 RAM の説明が出ます。`on` で見積もりを超えて有効化すると paging または負荷時の RAM 枯渇の可能性を警告します。
-- 設定再生成により `--kv-resident` の有無が変わり得ます。setup は run config と起動用 script を生成・更新します。
-
-## 出力とエラー
-
-- RAM に余裕がある場合、有効化時に KV cache の RAM 見積もりと「more experts fit in VRAM」に相当する `[ok]` 行を表示します。
-- WSL、RAM 不足、または 64K 未満で `on` を指定した場合は、指定が適用されない理由または RAM リスクを `[!]` warning として表示します。これらは当該分岐での warning であり、`--kv-streaming` 自体による parser error ではありません。
-- 定義済み以外の値は `argparse` が拒否します。CLI の引数検証後に実行されるため、setup のモデル設定処理には進みません。
+- `--kv-streaming` は `terminal/setup.py` の root parser にあります。通常の macOS セットアップ経路は parser の作成前に `metal/setup_mac.py` へ委譲されるため、この文書の説明は通常の macOS 経路には適用しません（`terminal/setup.py:11416-11417,11436-11437`）。索引でも macOS は別の `source-setup/mac` スコープです。
+- `on` は RAM 判定を飛び越えるため、推定必要量を満たさない PC では警告後も設定が保持されます。負荷時のページングやメモリ不足の可能性があります（`terminal/strata_control/setup_config.py:312-318`）。
+- `auto` で RAM が足りない場合、あるいは `off` の場合は KV キャッシュを VRAM に残し、その結果 cached experts が少なくなる旨を表示します（同: `310-330`）。
+- セットアップの注記は `[ok]` または `[!]` として標準出力に出ます（`terminal/setup.py:997-1000,1039-1047`）。無効値は parser の検証で拒否されます。その他のエラー終了条件はセットアップ全体に依存し、このオプション固有のものとしては確認できません。
 
 ## 根拠
 
-- 索引上の tool ID、wrapper 共有、コマンドスコープ: `docs/cli/README.md:13,1465-1495`（この文書の作成先リンクは `:1494`）。
-- Parser の選択肢と既定値: `setup.py:8545-8547`。
-- KV RAM 計算式と mode 判定（64K、RAM 見積もり、WSL 除外）: `setup.py:5714-5727`。
-- `q4_0` / `k8v4` の KV cell サイズ: `setup.py:251`。
-- WSL 判定: `setup.py:6519-6521`。
-- 有効化・無効化・RAM 不足時の出力、engine 引数追加、resident budget 相互作用: `setup.py:9472-9506`。
-- 設定の一時ファイル書き込みと置換: `setup.py:6154-6159`。
-- run config 保存、run script 生成、起動経路: `setup.py:9712-9730,9759-9766`。
-- POSIX wrapper が全引数を渡す箇所: `setup.sh:12,76`。Windows wrapper が `setup.py` に渡す箇所: `START-HERE.bat:48,53`。
-
-調査範囲は上記 commit の `setup.py` と確認可能な wrapper / 索引です。別 platform の runtime 実測、WSL 上での実行、各 backend の性能差は調べていません。
+- parser の選択肢・既定値: `terminal/setup.py:11598-11600`。
+- RAM 使用量と自動判定の閾値計算: `terminal/setup.py:7068-7104`。
+- セットアップ構成への反映、RAM 判定、WSL と明示指定時の警告: `terminal/strata_control/setup_config.py:297-332`。
+- エンジンへ渡す `--kv-resident` とその値の説明: `engine/src/program/generate.cpp:1234-1235,3907`。
+- 構成の書き込み、起動スクリプト作成、起動省略: `terminal/setup.py:7531-7537,12521-12527,12555-12562`。
+- 既存構成から WSL 上のストリーミング指定を除去: `terminal/setup.py:8288-8295`。

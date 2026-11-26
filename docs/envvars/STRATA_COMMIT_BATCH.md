@@ -1,44 +1,48 @@
 # `STRATA_COMMIT_BATCH`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA/HIP verifier が speculative verify window 後に実行する commit graph で、GDN 層と QSA 層の commit 処理を複数層まとめた GPU kernel に切り替えます。GDN では convolution history と state の更新を層ごとに発行する代わりに、複数層をまとめた処理を試みます。QSA では複数層の indexer tail 復元と append をまとめます。対象処理が使えない場合は、該当部分だけ従来の層ごとの処理に戻ります。
+CUDA/HIP エンジンの verifier が window の commit graph を作るとき、GDN 層の状態・畳み込み履歴を層ごとではなく複数層まとめて commit する経路を選びます。まとめ処理が使えない場合は層ごとの処理へ戻ります。値が有効なときは、QSA 層の indexer append も条件を満たせば複数層まとめます。生成する token や層の計算対象を選ぶ設定ではありません。読み取りと分岐は `Verifier::capture_commit` にあります（`engine/src/core/verify.cpp:3425-3454`, `3462-3473`）。
 
 ## 値と判定
 
-CUDA/HIP 側では文字列全体を parse せず、環境変数の有無と先頭文字だけを見ます。
+Metal 以外の当該実装では `std::getenv` の結果について先頭 1 文字だけを検査し、先頭が `'0'` なら無効、それ以外なら有効です。文字列全体の parse、真偽値変換、空白除去はしません（`engine/src/core/verify.cpp:3448-3452`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 有効（既定値） |
-| 空文字 | 有効（設定文字列の先頭は `\0` で、`'0'` ではない） |
-| 先頭文字が `0` | 無効。例: `0`, `0abc` |
-| それ以外 | 有効。例: `1`, `true`, `false`, ` 0` |
+| 条件（build など） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP の `STRATA_GPU_METAL` なしの build | 有効 | 空文字、`1`、`true`、`false`、` 0` など先頭が `0` でない値 | `0`、`0anything`、`00`、`0 ` など先頭が `0` の値 |
+| `STRATA_GPU_METAL` build | 無効（環境値を読まない） | なし | 常に無効 |
 
-大文字小文字、空白、後続文字、数値としての妥当性は検査されません。Metal 用のコードでは値にかかわらず `false` 固定です。
+空文字は設定済みでも先頭文字が終端文字 `\0` なので有効です。`false` も先頭が `f` のため有効で、`0anything` は文字列全体が数値として不正でも無効です。大文字小文字や後続文字は判定に影響しません（`engine/src/core/verify.cpp:3448-3452`）。
 
 ## 有効になる条件
 
-- CUDA/HIP verifier の標準 commit graph 経路で使われる必要があります。Metal は別 engine に処理を渡し、この環境変数を読みません。
-- GDN 層がないモデルでは GDN のまとめ処理はありません。QSA 層がないモデルでは QSA のまとめ処理はありません。
-- GDN のまとめ kernel は、`STRATA_GDN_SPLIT=1`、`STRATA_GDN_COMMIT_SPLIT=0`、`STRATA_DBG_GDN=1` のいずれかが有効な場合、または kernel の引数制約を満たさない場合に失敗扱いとなり、従来の層ごとの処理になります（`src/kernels/cuda/verify_kernels.cu:1019-1031`）。これらは helper 内で別途評価されます。
-- QSA のまとめ処理は `g_no_batch_kv` が偽で、QSA 層数が `QsaIndexerLayers::kMax` 以下、各層の `max_cells` が同一で、必要な `indexer.k_norm.weight` がある場合に使われます。上限・容量が合わない場合は層ごとの処理に戻ります。必要な weight がない場合は commit graph の capture 自体が失敗します（`src/core/verify.cpp:2061-2085,2088-2119`）。
+- CUDA/HIP で `STRATA_GPU_METAL` が定義されていない build であること。Metal build は常に層ごとの GDN 処理を使います（`engine/src/core/verify.cpp:3448-3452`）。
+- verifier が `capture_commit` を実行する経路であること。通常の verifier 実行では `run` が window graph と commit graph を capture します（`engine/src/core/verify.cpp:3776-3839`）。
+- batched GDN commit には GDN 層があり、必要な各層の `ssm_norm.weight` が見つかることが必要です。重みが欠けると `ok` が false になり、commit capture は失敗します（`engine/src/core/verify.cpp:3454-3469`, `3498-3512`）。
+- batched GDN kernel が受け付けない場合は層ごとの経路へ fallback します。CUDA/HIP kernel は `STRATA_GDN_SPLIT` の先頭文字が `1`、`STRATA_GDN_COMMIT_SPLIT` の先頭文字が `0`、または `STRATA_DBG_GDN` の先頭文字が `1` のとき batched kernel を起動せず `false` を返します。また、GDN 層数が 65535 を超える、window 行数が 1 未満または `kVerifyLongT` 超、`n_keep` が null、head 数が正でないか割り切れない場合も batch を拒否します（`engine/src/kernels/cuda/verify_kernels.cu:1231-1244`）。この判定は helper の初回呼び出し時に static cache されます。
+- QSA 層のまとめ処理は `g_no_batch_kv` が false であること、indexer の重みが揃うこと、層数上限および `max_cells` の一致条件を満たすことが必要です。条件を満たさない場合は QSA 層ごとの append 処理になります（`engine/src/core/verify.cpp:3471-3497`, `3523-3536`）。
 
 ## 実行時の詳細
 
-`Verifier::capture_commit()` 内の関数 static が最初に初期化されるときに環境変数を読み、その後は値をキャッシュします。通常の window 実行は `capture()` とともに commit graph を capture し（`src/core/verify.cpp:2251`）、pipelined 用の `capture_all()` も commit graph を capture します（同:3374）。したがって、初回 capture 後にプロセス環境を変更しても、同じプロセス内では再判定されません。
+`commit_exec_` が未作成の場合に commit graph を capture し、CUDA/HIP build では `static const bool` の初期化 lambda が `STRATA_COMMIT_BATCH` を評価します。そのため読み取りはプロセス内の最初の該当 capture 時だけで、以後の verifier や実行中の環境変更では値が再評価されません（`engine/src/core/verify.cpp:3425-3427`, `3448-3452`）。Metal build は同じ static 値を `false` に固定します。
 
-変数が有効なら、GDN 層の `ssm_norm.weight` を確認して `gdn_commit_layers()` を試します。成功すれば各 GDN 層の convolution history と state をまとめて更新し、失敗すれば後続の層ループが `gdn_conv_commit()` と `gdn_step_norm_multi()` を各層で呼びます（`src/core/verify.cpp:2043-2059,2088-2105`、`src/kernels/cuda/verify_kernels.cu:1019-1039`）。QSA 層は条件を満たせばまとめた append を発行し、そうでなければ tail を復元して各層で append します（`src/core/verify.cpp:2061-2085,2107-2119`）。
+有効なら GDN 層数と重みを調べて `gdn_commit_layers` を呼び、kernel が対応可能な場合は履歴と状態の commit を層まとめで行います。コメントは層ごとの 2 launch ずつから 2 launch にし、約 70 graph node を減らすこと、および層ごとの算術は bitwise に同じであることを設計上の説明として述べています。実測条件はこのソース箇所に記載されていません（`engine/src/core/verify.cpp:3445-3447`, `3462-3469`）。GDN batch が成立しなければ通常の層ループで `gdn_conv_commit` と `gdn_step_norm_multi` を呼びます（`engine/src/core/verify.cpp:3498-3521`）。
 
-この環境変数専用の有効・無効ログはありません。capture や graph launch が失敗した場合は、通常の verifier error が返されます。実装コメントはまとめ処理が従来と同じ演算（bitwise）で graph node を減らす設計と説明していますが、この調査では性能測定を行っていません（`src/core/verify.cpp:2035-2037`）。`docs/DETAILS.md` を含む docs に、この変数の追加説明は見つかりませんでした。
+`max_t_`（`--lookup-max-t` による window 上限）が `kVerifyMaxT` より大きく、GDN batch が成立しない場合、per-layer `gdn_step_norm_multi` に上限があるため capture は失敗し、`verify commit: windows past <上限> tokens (--lookup-max-t) need the batched GDN commit (unset STRATA_COMMIT_BATCH=0, STRATA_GDN_SPLIT, STRATA_GDN_COMMIT_SPLIT=0)` を `err` に設定します（`engine/src/core/verify.cpp:3504-3510`）。CUDA の capture / instantiate に失敗した場合も `verify: commit capture: ...` または instantiate 側のエラーを返します（`engine/src/core/verify.cpp:3545-3559`）。SYCL の `Verifier::capture_commit` は `STRATA_COMMIT_BATCH` を参照せず、別の `STRATA_SYCL_GDN_STATE_COMMIT` を読みます（`engine/sycl/src/core/verify.cpp:2204-2243`）。
+
+## ログと測定値
+
+この環境変数の有効・無効を通知する専用ログは確認できません。値が先頭 `0` で GDN 層があり `--lookup-max-t` の window が `kVerifyMaxT` を超える場合、上記の `err` が verifier の失敗として呼び出し元に返ります。commit launch の実行時エラーは `verify: commit launch: ...`、同期エラーは `verify: commit: ...` として返されます（`engine/src/core/verify.cpp:3504-3510`, `4550-4574`）。
+
+約 70 graph node 減という数値は実装コメントにある設計説明で、計測条件や再測定結果ではありません（`engine/src/core/verify.cpp:3445-3447`）。
 
 ## 根拠
 
-- 読み取り、既定値、Metal 固定値、GDN/QSA 分岐: `src/core/verify.cpp:2015-2044`
-- GDN 層の重み確認とまとめ処理: `src/core/verify.cpp:2045-2059`
-- QSA のまとめ条件と層ごとの fallback: `src/core/verify.cpp:2061-2119`
-- verifier の capture 呼び出し: `src/core/verify.cpp:2251,3367-3374`
-- GDN まとめ kernel の追加条件と起動: `src/kernels/cuda/verify_kernels.cu:1019-1039`
-- SYCL の別実装には `STRATA_COMMIT_BATCH` の直接参照がなく、CUDA/HIP のこの分岐を適用できる根拠はありません（`sycl/src/core/verify.cpp` 全体検索）。
+- `engine/src/core/verify.cpp:3425-3452` — verifier commit capture、Metal 分岐、環境変数の読み取りと値判定。
+- `engine/src/core/verify.cpp:3453-3521` — GDN / QSA の batching 条件、層ごとの fallback、window 上限エラー。
+- `engine/src/kernels/cuda/verify_kernels.cu:1231-1252` — GDN batch kernel の追加条件と失敗時の戻り値。
+- `engine/src/core/verify.cpp:3545-3559`, `4550-4574` — commit graph 作成・launch の失敗処理。
+- `engine/sycl/src/core/verify.cpp:2204-2243` — SYCL 実装は別の変数を参照。

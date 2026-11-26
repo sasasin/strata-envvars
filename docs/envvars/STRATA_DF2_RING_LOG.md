@@ -1,48 +1,56 @@
 # `STRATA_DF2_RING_LOG`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-DFlash2 ドラフターが各 context 更新から activation の量子化行をホスト側の lineage log に保存する機能を切り替えます。ログがあると、会話の再開・巻き戻し・別会話への切り替えでリングの必要行が上書き済みでも、保存した行からリングを再構築できます。無効時は従来の動作となり、再開位置に必要な行がリングに残っていなければリングを新しい epoch にします。
+DFlash2 drafter の会話再開用 ring log を無効化するスイッチです。通常は、DFlash2 が各 context 更新で K/V を作る前の量子化 activation row と scale をホスト側に記録し、会話の rewind・分岐・切替後に必要な ring 行を再構築します。無効時はこのログを記録・利用せず、再開時は従来の履歴照合規則で ring を継続するか cold start にします。設定は DFlash2 の ring 復元経路に作用し、DFlash2 の選択自体や別の drafter を有効化するものではありません（CUDA/HIP: `engine/src/core/dflash2.cpp:820-835,871-889,954-977`、SYCL: `engine/sycl/src/core/dflash2.cpp:215-225,633-655`）。
 
-この設定が参照されるのは `STRATA_HAVE_DFLASH2` 付きで組み込まれる DFlash2 実装です。`generate` で DFlash2 を使うには `--draft dflash2` と draft pack などの起動条件を満たす必要があります。コードにこの環境変数を設定する CLI 引数はありません。主な復元効果は `serve` の継続リクエストで現れます。
+この環境変数は `Dflash2Drafter::alloc()` 中に読み取られます。CUDA/HIP では通常 load 時と clone の allocation 時、SYCL では drafter の allocation 時です。serve の各 request で参照される値ではありません（CUDA/HIP: `engine/src/core/dflash2.cpp:305-345,658-667,822-830`、SYCL: `engine/sycl/src/core/dflash2.cpp:168-225`）。
 
 ## 値と判定
 
-実装は値全体を parse せず、環境変数が設定されていて先頭文字が `'0'` かだけを見ます。
+両 backend とも `getenv` の結果が存在し、先頭 byte が文字 `'0'` の場合だけ無効化します。文字列全体は parse せず、`0` の後ろも検査しません。空文字は設定済みでも先頭 byte が終端文字なので無効化条件に当たらず、有効側です。大小文字・空白・boolean 表記の解釈はありません（CUDA/HIP: `engine/src/core/dflash2.cpp:825-827`、SYCL: `engine/sycl/src/core/dflash2.cpp:215-216`）。
 
-| 環境値 | リングログ |
-|---|---|
-| 未設定 | 有効（既定） |
-| 空文字 | 有効。先頭は NUL であり `'0'` ではない |
-| 先頭文字が `0`（例: `0`, `0abc`） | 無効 |
-| その他（例: `1`, `10`, `true`, `false`, ` 0`） | 有効 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| CUDA/HIP の drafter allocation | pinned staging の両領域を確保できれば有効。確保できなければ無効 | 空文字、`1`、`true`、`false`、` 0` | `0`、`0anything`、`00` |
+| SYCL の drafter allocation | 有効 | 空文字、`1`、`true`、`false`、` 0` | `0`、`0anything`、`00` |
+| CUDA split bridge の load | bridge が未設定値を `0` にするため無効 | 既存の値が先頭 `0` 以外なら有効 | 既存値の先頭が `0`、または未設定（bridge が `0` を設定） |
 
-数値変換、空白除去、大文字小文字の判定はありません。したがって `false` も有効で、`0anything` は無効です。CLI 引数や別の設定ファイルによる上書き経路は、この設定の読み取り実装にはありません。
+CUDA/HIP では `init_ring_log()` の初期値 `log_on_ = false` から始まり、変数の先頭が `0` でなければ pinned host staging を確保して、両方確保できた場合に有効になります。SYCL は `log_on_ = true` が初期値で、先頭 `0` の場合だけ無効化した後に host staging を確保します。したがって staging の確保失敗時の fallback も含め、未設定時の実効値は backend 間で同じではありません（`engine/include/strata/core/dflash2.hpp:252-258`、`engine/src/core/dflash2.cpp:822-834`、`engine/sycl/include/strata/core/dflash2.hpp:165-170`、`engine/sycl/src/core/dflash2.cpp:215-225`）。
 
-関連する `STRATA_DF2_LOG_MIB` は、リングログが有効な場合に lineage stash の容量を MiB 単位で指定します。リングログを先頭 `0` で無効にした CUDA/HIP 経路では、この stash 容量設定も読みません。
+この変数に対応する CLI 引数や別設定値による上書きは実装にありません。CUDA split bridge は Windows では未設定なら `_putenv_s(..., "0")`、それ以外では `setenv(..., "0", 0)` を呼びます。後者は既存値を上書きしない指定であり、Windows 側も `getenv` が null の場合に限って設定するため、利用者が設定した値は保持されます（`engine/src/split/src/df2_bridge.cpp:44-61`）。
 
 ## 有効になる条件
 
-- DFlash2 がビルドに含まれ、DFlash2 drafter が実際にロード・割り当てされる必要があります。`generate.cpp` は `STRATA_HAVE_DFLASH2` の下で `o.draft == "dflash2"` を処理し、pack などの要件を満たすと `df2.load()` を呼びます。条件を満たさない場合は DFlash2 を起動せず、通常は MTP drafter に fallback します。
-- CUDA/HIP 実装では `alloc()` が pinned host staging を確保した後に設定を読みます。SYCL 実装も `alloc()` 中、device buffer 割り当て後に設定を読みます。
-- 設定が未設定または先頭が `0` 以外でも、ログ用 staging の割り当てに失敗するとログは無効になります。機能自体の起動失敗にはせず、stderr に警告を出して従来のリング動作に戻ります。
+- DFlash2 がビルドに含まれ、実行時に DFlash2 drafter がロード・allocation されること。CUDA/HIP serve 側の request 処理は `STRATA_HAVE_DFLASH2` の compile guard 内です（`engine/src/program/generate.cpp:20170-20185`）。SYCL serve も `use_df2` の場合に request 開始時に `begin_request()` を呼びます（`engine/sycl/src/program/generate.cpp:11105-11118`）。DFlash2 を使わない CLI／モデルでは、この変数を読む DFlash2 allocation がなく、効果はありません。
+- CUDA/HIP では `STRATA_DF2_RING_LOG` が先頭 `0` でなく、かつ pinned staging の `h_logq_` と `h_logd_` の両方を確保できること。確保に失敗すると `log_on_` が false になり、ring log は使われません（`engine/src/core/dflash2.cpp:822-834`）。
+- SYCL では値の先頭が `0` でなく、host staging の両領域を確保できること。確保失敗時は部分確保を解放して ring log を無効化します（`engine/sycl/src/core/dflash2.cpp:215-225`）。
+- ログの効果が現れるのは、記録済みの会話履歴を DFlash2 が再利用し、request の window に ring 上で欠けた行がある場合です。ログにない行は再構築できず、cold 扱いになります（CUDA/HIP: `engine/src/core/dflash2.cpp:954-977,1007-1034`、SYCL: `engine/sycl/src/core/dflash2.cpp:633-712`）。
+- CUDA split bridge では環境未設定時に限り `0` を設定します。明示的な環境値がある場合はその値が DFlash2 allocation に渡ります（`engine/src/split/src/df2_bridge.cpp:49-61`）。
 
 ## 実行時の詳細
 
-設定は各 drafter の allocation 時に読み、結果を `log_on_` に保持します。通常の drafter は `load()` から `alloc()` に進みます。CUDA/HIP の batch slot drafter も `clone_alloc()` から `alloc()` に進むため、各 slot の割り当て時にも環境を読みます。既存 drafter は allocation 後に環境値を変更しても再評価しません。
+CUDA/HIP の `init_ring_log()` は drafter allocation 中に呼ばれます。先頭 `0` を見つけるとその場で戻り、pinned staging の割当てと有効化を行いません。その他の値では、activation codes と scales の staging を確保し、両方 non-null のときだけ `log_on_` を true にします。SYCL も `alloc()` 中に一度読み、同様に値を判定して staging を用意します。環境をプロセス実行中に変更しても既存 drafter の状態は変わりません。後から allocation される clone などは、その allocation 時点で環境を読みます（CUDA/HIP: `engine/src/core/dflash2.cpp:305-345,658-667,822-834`、SYCL: `engine/sycl/src/core/dflash2.cpp:168-225`）。
 
-ログが有効なら、context 更新や draft 更新で書き込む量子化 activation codes と block scales を host staging に移し、同期後に lineage のログへ格納します。`begin_request()` は resume 位置より先に必要な窓の行を確認し、リングにないがログにある行を再構築します。ログにない行は欠損として数え、再構築 scratch の確保など再構築自体が失敗した場合は stderr に理由を出し、その request ではリングを開始し直します。ログ無効時は過去の lineage を stash から復元せず、resume prefix とリングの整合性が崩れていればリングを開始し直します。
+ログ有効時、context 処理は更新行の位置を記録し、GPU 処理後の量子化 codes と scales を lineage ごとのホストログへコピーします。serve の `begin_request()` は、履歴 token prefix が一致する live lineage または退避 lineage を探し、必要な ring 行をログから再構築します。無効時はこの探索・再構築経路を通らず、既存 history と resume prefix の共通部分を比較します。ring に古い行が残る stale 条件（ring の上端が共通 prefix を越え、共通 prefix が resume より短い場合）では epoch と ring 上端をリセットし、`cold` を返します（CUDA/HIP: `engine/src/core/dflash2.cpp:871-889,954-977`、SYCL: `engine/sycl/src/core/dflash2.cpp:558-579,633-655`）。
 
-ログ staging 確保に失敗した場合の実装ログは、CUDA/HIP では `strata dflash2: the ring log's staging does not fit in pinned memory: the log is off`、SYCL では `strata dflash2: the ring log's staging does not fit in host memory: the log is off` です。ログ有効時、`serve` が再開要求で行を再構築すると `strata serve: DFlash2: ... context rows of the window rebuilt from the drafter's log ...` を stderr に出します。`STRATA_DF2_RING_LOG` 自体の値を報告するログや、値が無効なことによる終了経路はありません。
+ログ有効時でも必要行がログにない場合は再構築されず、欠損行として扱われます。rebuild 処理自体が失敗すると stderr に `strata dflash2: <error>: the ring starts over for this request` を出して ring を invalid 化し、その window の行を欠損扱いにします（CUDA/HIP: `engine/src/core/dflash2.cpp:1007-1017`、SYCL: `engine/sycl/src/core/dflash2.cpp:685-695`）。別環境変数 `STRATA_DF2_LOG_MIB` は、設定され空でなければ allocation 時に `atoi` で読み込まれ、stash の MiB 上限を決めます。ring log の有効／無効判定を上書きしません（CUDA/HIP: `engine/src/core/dflash2.cpp:825-830`、SYCL: `engine/sycl/src/core/dflash2.cpp:215-220`）。
+
+## ログと測定値
+
+- CUDA/HIP で pinned staging の確保に失敗すると stderr に `strata dflash2: the ring log's staging does not fit in pinned memory: the log is off` を出します。SYCL では host staging の確保失敗時に `strata dflash2: the ring log's staging does not fit in host memory: the log is off` を出します（`engine/src/core/dflash2.cpp:828-834`、`engine/sycl/src/core/dflash2.cpp:217-225`）。
+- serve は再構築行があれば `strata serve: DFlash2: ... context rows of the window rebuilt from the drafter's log ...` を stderr に出します。cold で欠損行が64以上の場合は、会話のログがないため最初の rounds は draft 品質が低くなる旨も出します。出力 token は同じと実装メッセージに記載されています（CUDA/HIP: `engine/src/program/generate.cpp:20174-20182`、SYCL: `engine/sycl/src/program/generate.cpp:11108-11116`）。
+- `STRATA_DF2_RING_STATS` が設定されている場合、欠損位置や request ごとの再構築状況を追加で stderr に出します。未設定時はこれらの追加統計ログを抑制します（CUDA/HIP: `engine/src/core/dflash2.cpp:899,1018-1022`、SYCL: `engine/sycl/src/core/dflash2.cpp:593,696-700`）。
+- `docs/DETAILS.md` の確認範囲に、この変数の値規則や性能測定値は見つかりませんでした。測定値は記載していません。
 
 ## 根拠
 
-- `src/core/dflash2.cpp:245-285,582-591,746-759`: CUDA/HIP 系の allocation、slot clone 経路、先頭文字判定、既定動作と pinned staging 失敗時の警告。
-- `include/strata/core/dflash2.hpp:94-120,240-267`: 機能の目的、リング復元の説明、初期値と helper 宣言。
-- `sycl/src/core/dflash2.cpp:167-232`: SYCL の先頭文字判定、既定有効、host staging 確保と失敗時の警告。
-- `sycl/include/strata/core/dflash2.hpp:44-63,161-177`: SYCL 実装の機能説明と状態。
-- `src/core/dflash2.cpp:795-813,815-875,878-959,968-1010,1039-1058`: 行の記録・再構築、再開時のログ参照、ログ無効時の従来経路、context/draft 更新との接続。
-- `sycl/src/core/dflash2.cpp:538-611,613-692,714-759`: SYCL の行記録・再構築・再開・更新経路。
-- `src/program/generate.cpp:6765-6774,6811-6818,6820-6831,16032-16042`: DFlash2 の起動条件、fallback、batch slot の作成、serve 継続要求での `begin_request()` と再構築ログ。
+- `engine/src/core/dflash2.cpp:305-345,658-667,820-889,891-952,954-1034`
+- `engine/include/strata/core/dflash2.hpp:94-128,245-270`
+- `engine/sycl/src/core/dflash2.cpp:168-235,483-579,585-712`
+- `engine/sycl/include/strata/core/dflash2.hpp:54-67,154-181`
+- `engine/src/split/src/df2_bridge.cpp:44-61`
+- `engine/src/program/generate.cpp:20170-20185`
+- `engine/sycl/src/program/generate.cpp:11105-11118`

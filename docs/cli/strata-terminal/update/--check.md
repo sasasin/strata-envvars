@@ -1,6 +1,6 @@
-# `--check`
+# `strata update --check`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,54 +8,61 @@
 | コマンド | `strata update` |
 | オプション | `--check` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。省略時 `false`、指定時 `true` |
+| 値 | 値を取らないフラグ（`store_true`、既定値 `false`） |
 
 ## 役割
 
-署名付き update feed を読み、この PC の engine、Control、desktop app に何が適用されるかを表示します。通常の更新処理へ進まず、パッケージはダウンロードしません。ただし feed とその署名の読み込み、および確認結果のローカル状態保存は行います。
+署名済み更新 feed を読み、現在の PC に対する Engine・Control・アプリの更新候補や、稼働中モデルの有無を報告します。更新処理の実行、Engine/Control/アプリのパッケージ取得、切り替えは行いません。ただし feed 本体と署名ファイルの読み込み、および確認状態・feed 内モデル一覧キャッシュの更新は行います。
 
 ## 使い方
 
 ```sh
+# 既定の更新 feed を確認する
 strata update --check
+
+# 指定した feed を確認する
+strata update --check --feed https://example.invalid/strata-feed.json
+
+# 機械処理向け JSON で結果を得る
+strata update --check --output json
 ```
 
-JSON 形式で結果を得る場合は、同じ parser 群に `strata_cli/cli.py` が追加する `--json` を併用できます。
-
-```sh
-strata update --check --json
-```
+`--feed` には URL またはローカルのファイル／フォルダーを指定できます。省略時は `STRATA_UPDATE_FEED`、前回記録された HTTPS feed、プラットフォームに応じたプロジェクト既定 feed の順で選ばれます（`terminal/strata_cli/update_cmd.py:33-44,142-158`）。
 
 ## 値と既定値
 
-- `argparse` の `store_true` フラグであり、値は指定しません。既定値は `false` です。`--check` を指定すると `a.check` が真になります（`strata_cli/update_cmd.py:42-47`）。
-- `--check=true` のような値付き指定はこの parser の構文ではありません。重ねて指定しても真偽値を切り替える機能はなく、効果は変わりません。
-- 同じ共有 parser 定義が `strata components update` にも `--check` を登録します。こちらのオプション文書は [`strata components update --check`](../components/update/--check.md) です（`strata_cli/update_cmd.py:50-53`）。
+`--check` は `argparse` の `store_true` であり、値を受け取りません。省略時は通常の更新経路に進み、指定時は feed 確認経路に分岐します（`terminal/strata_cli/update_cmd.py:59-69,361-367`）。同じコマンドの複数回指定について個別の拒否処理はなく、いずれも真として扱われます。`--check=false` のような値付き指定はフラグ構文ではないため parser が受理しません。
 
 ## 実行時の動作
 
-1. `strata update` は `update_cmd.add_parsers()` から parser 登録され、実行時には `update_cmd.run()` に委譲されます（`strata_cli/cli.py:139-140,2135-2137`）。
-2. CLI は hardware を検出し、`--backend` があれば選択値で上書きして確認用 context を作ります。確認はその platform/backend 条件に合う engine を選ぶため、`--backend` は表示される engine 判定に影響します（`strata_cli/update_cmd.py:174-184`、`strata_control/updater.py:522-524,566-590`）。
-3. feed の参照先は `--feed`、環境変数 `STRATA_UPDATE_FEED`、components state に記録された前回の feed、既定の GitHub Release feed の順で決まります（`strata_cli/update_cmd.py:87-95`）。feed と署名を読み、署名・期限・sequence などを検証したうえで結果を組み立てます（`strata_control/updater.py:355-366`、`strata_control/feed.py:342-360`）。ネットワーク feed の場合は feed JSON と署名の読み込みを行います（`strata_control/feed.py:342-360`、`strata_control/transfer.py:159-187`）。
-4. engine、Control、app の状態、稼働中 engine の情報、hardware を含む report を作成します。成功時の終了コードは `0` で、人間向け表示では engine の候補・状態や Control/app の状態を表示します（`strata_control/updater.py:624-632`、`strata_cli/update_cmd.py:132-160,203-209`）。
+コマンド実行時に `--components-dir` 等からコンポーネント保存先を決め、`--backend` があればその指定を使ってハードウェア情報を組み立てます。次に取得禁止ポリシーを確認し、信頼鍵を読み込んで feed の場所を決めます。その後 `updater.check()` を呼び、対象コンポーネントフォルダー単位のロックを取り、署名付き feed とその署名ファイルを読みます。署名・feed 形式・channel・有効期限・既に受理した sequence より古くないことを検証したうえで、ローカル状態とハードウェアに照らして Engine、Control、アプリの差分を計算します（`terminal/strata_cli/update_cmd.py:307-367`; `terminal/strata_control/updater.py:451-470,628-630,778-789`; `terminal/strata_control/feed.py:650-677,691-717`）。
+
+Engine の判定は PC の platform/backend/GPU 等に合う feed 項目を選び、未導入・更新可能・現行・この PC 向け候補なし等を報告します。Control とアプリもインストール済み／実行環境のバージョン情報と feed のバージョンを比較します。ここでの選択は結果表示用で、インストールや切り替えはしません（`terminal/strata_control/updater.py:628-630,672-740,1886-1899,2002-2015`）。
+
+`--output human`（既定）は候補と状態を行ごとに表示します。`json` はレポートを JSON で出力し、`jsonl` は進捗イベントと結果を JSON Lines で出力します。出力形式の許容値は `human`、`json`、`jsonl` です（`terminal/strata_cli/update_cmd.py:47-56,117-139,217-254,361-367`）。
 
 ## 適用条件と副作用
 
-- `--check` 分岐は通常更新処理より前に return するため、この経路では `run_update()` による engine/Control/app のインストール、engine の test start、`--wait` による待機は実行されません（`strata_cli/update_cmd.py:203-213`）。`--no-engine`、`--no-control`、`--app` が指定されても、check report 自体は engine・Control・app を対象に作られます。
-- `--force` は context に渡され、失敗済みまたは rollback 済みの候補を `failed-before` / `skipped` として保留する判定に影響します（`strata_cli/update_cmd.py:182-184`、`strata_control/updater.py:603-614`）。
-- 確認は読み取り専用ではありません。components directory 内の `.updates/update.lock` を取得し、feed 情報と確認結果を `.updates/state.json` に保存します。`last_check` には時刻、候補 engine/app、確認対象時点の Control/engine version が記録されます（`strata_control/updater.py:134-162,624-640`）。
-- 通常の既定 feed は `https://github.com/Niko1221/Strata/releases/latest/download/strata-feed.json` です。ローカル feed の場合、ソースは feed と署名ファイルの読み込みを行います。個別 feed の URL 制約・署名鍵の設定はこのオプションだけでは変更しません（`strata_cli/update_cmd.py:23-28,87-95`、`strata_control/feed.py:342-360`）。
+- `STRATA_NO_ACQUIRE` 等で取得が禁止されているプロセスでは、feed を読む前に拒否されます（`terminal/strata_cli/update_cmd.py:355-358,387-388`; `terminal/strata_control/updater.py:438-440,451-457`）。
+- ネットワーク feed の場合、feed と署名ファイルを取得します。ローカルパス／URL feed も指定できます。HTTP(S) 読み込みは `read_small` のサイズ上限（8 MiB）と通信ポリシーの対象です（`terminal/strata_control/feed.py:691-717`; `terminal/strata_control/transfer.py:109,298-334`）。Engine、Control、アプリ本体のアーカイブはこの分岐ではダウンロードされません（`terminal/strata_cli/update_cmd.py:361-377`; `terminal/strata_control/updater.py:778-789`）。
+- 確認は完全な読み取り専用ではありません。成功時は `<components>/.updates/state.json` に受理した feed 情報と `last_check` を保存します。また、署名済み feed にモデル一覧があれば `.updates/feed-models.json` を保存し、一覧がなければ既存キャッシュを削除します。モデルキャッシュの更新失敗は警告ログに留まり、確認処理自体を失敗させません（`terminal/strata_control/updater.py:227-267,451-470,778-789`; `terminal/strata_control/feed_models.py:55-84`）。
+- 同じコンポーネント保存先で別の updater がロック中なら確認も失敗します（`terminal/strata_control/updater.py:195-224,778-782`）。
+- 共通オプション `--feed`、`--components-dir`、`--backend`、`--output` は確認処理にも影響します。`--app`、`--no-engine`、`--no-control`、`--yes`、`--stop-model`、`--start-again` 等は `--check` 分岐より後の更新処理で参照されるため、この経路ではダウンロード対象やモデル停止を変更しません（`terminal/strata_cli/update_cmd.py:47-69,361-377`）。
 
 ## 出力とエラー
 
-- 既定の human 出力は feed sequence/channel/署名鍵、engine の更新候補と選択 package、Control/app の状態、および稼働中 engine の有無を表示します（`strata_cli/update_cmd.py:132-160`）。`--json` は `--output json` の alias として parser に追加され、成功時は report を含む JSON を stdout に出します（`strata_cli/cli.py:508-515`、`strata_cli/update_cmd.py:203-209`）。
-- feed を読めない場合は feed error（通常は終了コード `6`）、署名検証エラーまたは取得禁止の場合は終了コード `5` などで失敗します。human mode は `strata: ...` を stderr に出し、machine mode はエラー情報を JSON で出力します（`strata_control/feed.py:342-360`、`strata_cli/update_cmd.py:167-172,225-232`）。
-- 同じ components directory で別の update が lock を保持している場合は終了コード `7` で拒否されます（`strata_control/updater.py:134-152`）。
+成功時の終了コードは `0` です。人向け出力では feed sequence/channel/署名鍵、Engine の選択と不採用理由、Control・アプリの状態、稼働中モデルの情報などを表示します。`json`／`jsonl` では成功レポートを出力します（`terminal/strata_cli/update_cmd.py:217-254,361-367`）。
+
+取得禁止は終了コード `5`、feed に到達できない場合は `6` です。署名・信頼鍵・feed 検証エラーは `FeedError` の終了コード（既定 `5`）、受理済み feed より古い sequence は拒否されます。人向けエラーは標準エラーへ `strata:` 接頭辞付きで出力し、機械向け形式ではエラー情報を JSON にします（`terminal/strata_cli/update_cmd.py:311-316,378-390`; `terminal/strata_control/feed.py:50-66,650-677,691-717`）。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:42-47` — `strata update` の parser と `--check` 宣言。
-- `strata_cli/update_cmd.py:87-95,163-209,225-234` — feed の優先順位、check 分岐、成功出力・失敗処理。
-- `strata_cli/cli.py:139-140,508-515,2135-2137` — parser 登録、共有 `--json` / `--quiet`、実行委譲。
-- `strata_control/updater.py:134-162,355-366,522-524,566-614,624-640` — lock/state、feed 更新、engine 判定、check report と保存。
-- `strata_control/feed.py:342-360`、`strata_control/transfer.py:159-187` — feed・署名の読み込み経路。
+- `terminal/strata_cli/update_cmd.py:47-69` — 共通 parser と `strata update --check` の宣言、他の update 専用オプション。
+- `terminal/strata_cli/update_cmd.py:142-158,307-367` — feed 優先順位、実行コンテキストの構築、取得許可確認、`--check` 分岐、結果出力。
+- `terminal/strata_control/updater.py:451-470,628-630,672-740,778-789` — feed 読み込み・状態記録、Engine 判定、確認処理のロックとレポート生成。
+- `terminal/strata_control/feed.py:650-677,691-717` — 署名・形式・channel・期限・sequence の検証と feed／署名読み込み。
+- `terminal/strata_control/updater.py:227-267` — updater 状態ファイルの読み書き。
+- `terminal/strata_control/feed_models.py:55-84` — モデル一覧キャッシュの保存・削除と失敗時の扱い。
+- `terminal/strata_control/transfer.py:109,298-334` — 小さな feed ファイルの上限と読み込み・通信エラー。
+
+索引には `strata components update --check` も別のコマンド階層で掲載されています（`docs/cli/README.md` の `strata components update` 節）。parser も同じ `--check` を別コマンドに登録していますが、本書の対象は `strata-terminal/update` のみです（`terminal/strata_cli/update_cmd.py:70-79`）。

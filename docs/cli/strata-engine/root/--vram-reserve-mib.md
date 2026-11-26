@@ -1,60 +1,64 @@
-# `strata generate --vram-reserve-mib`
+# `--vram-reserve-mib`
 
-調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（エンジン引数） |
+| コマンド | `strata`（エンジン root 引数） |
 | オプション | `--vram-reserve-mib` |
 | 別名 | なし |
-| 値 | MiB 単位の整数。引数なしの既定値は 700 MiB |
+| 値 | MiB 単位の整数。未指定時は `700`。 |
 
 ## 役割
 
-GPU 上でモデルを実行するとき、ExpertCache などの割り当てに使わず空けておく VRAM 量を指定します。特に `--expert-cache auto` の容量計算では、重み・セッション等を読み込んだ後の空き容量から予約量と他の見積もり分を差し引き、残りをキャッシュ容量にします。予約を増やすとキャッシュに使える量が減り、予約を減らすと増えます。予約量は VRAM 全体の制限ではなく、エンジンが他の処理用に確保する空きの目安です（`engine/src/program/generate.cpp:958-961, 9001-9005, 9130-9155`）。
+エンジンが VRAM 上の expert cache を見積もる際、他の GPU 利用や起動後の処理に残す領域を MiB で指定します。指定値が大きいほど cache に割り当てられる枠は小さくなります。予約分を別途確保・固定するオプションではなく、空き VRAM と cache・各種バッファの見積もりに使われます。既定値 `700` は `Options` の初期値です（`engine/src/program/generate.cpp:962-963`）。
 
 ## 使い方
 
 ```sh
-# 例: pack のモデルを使い、ExpertCache などに割り当てない VRAM を 1200 MiB として実行する
-strata generate --pack ./pack --tokens "1,2,3" --vram-reserve-mib 1200
+# モデルを serve し、cache の自動サイズ計算で 1024 MiB を空けておく
+strata --native /models/model.gguf --serve --expert-cache auto --vram-reserve-mib 1024
 ```
 
-これはエンジンの実行例です。`--pack` と `--tokens` を含む呼び出し形式は `engine/src/program/generate.cpp:1206-1212` にあります。
+このオプションは `strata-engine` の root parser に登録されています。`--vram-reserve-later-mib` を指定した layer split では、後段 GPU 用 reserve を別に指定できます。
 
 ## 値と既定値
 
-- 値は `std::atoi` で `int` に変換され、初期値は 700 です。範囲・非負条件を検査する validation はこの parser にありません。数値でない文字列は `atoi` により 0 になり、複数回指定時は引数走査で後に指定した値がフィールドに残ります（`engine/src/program/generate.cpp:960-961, 3837-3842, 3992`）。
-- 値を省略すると parser の既定値 700 MiB が使われます。オプション名の後に値そのものがない場合は stderr に `<option> needs a value` を出して終了コード 2 で終了します（`engine/src/program/generate.cpp:3839-3842`）。
-- 負数を含む不正・極端な値の安全な意味はソースから確認できません。VRAM 計算で MiB 値をバイト換算・符号なし型へ変換する箇所があるため、非負の整数を指定してください（例: `engine/src/program/generate.cpp:9130, 9378-9380`）。
+- 値は次の argv 要素から `std::atoi` で整数として読み取られ、明示指定フラグも立ちます。短縮別名はありません（`engine/src/program/generate.cpp:3997`）。
+- 値を省略すると parser の `next()` が stderr に `--vram-reserve-mib needs a value` を出して終了コード `2` で終了します（`engine/src/program/generate.cpp:3843-3846`）。
+- この parser 箇所に範囲検証や形式検証はありません。値の拒否を保証する validation は確認できませんでした。数値以外を渡した場合の変換は `std::atoi` に委ねられます。負数や極端な値を指定した場合の有効性はソース上で保証されていないため、使用値として案内しません。
 
 ## 実行時の動作
 
-- `--expert-cache auto` では、空き VRAM から予約量、prompt 用バッファ、draft head、pipeline window などの見積もり分を差し引いて ExpertCache の slot 数を決めます。起動後の実割り当てで空きが不足すると、自動 cache は縮小を試み、ログに縮小内容を出します（`engine/src/program/generate.cpp:8988-9005, 9130-9155, 9612-9632`、共通計算 `engine/include/strata/core/auto_cache.hpp:30-44`）。
-- 明示値は `vram_reserve_given` に記録されます。これにより通常の自動 reserve 調整から区別されます。たとえば低 VRAM の離散 GPU で既定 reserve を 480/550 MiB に下げる自動規則は、明示指定または既定値以外の reserve には適用されません（`engine/src/program/generate.cpp:3992, 9102-9115`、`engine/include/strata/core/low_vram_rules.hpp:84-91`）。
-- `--expert-cache auto` で作業可能な最小 cache を確保できない場合、明示指定がない構成では reserve を下げる調整があり、別の不足時処理では prompt chunk を小さくするなどして起動可能性を探ります。明示値があると一部の自動調整は抑止され、VRAM が足りない場合に cache 不足の診断が出ます（`engine/src/program/generate.cpp:9220-9241, 9243-9271, 9325-9345`）。
-- 明示した ExpertCache 容量も reserve と空き量に影響されます。たとえば layer split では、指定 slot 数が予約量などを残した容量を超えると警告を出し、slot 数を収まる値に切り詰めます（`engine/src/program/generate.cpp:9347-9363`）。
+`--expert-cache auto` では、重みなどを読み込んだ後の空き VRAM から、この reserve、prefill 用バッファ、drafter の head、pipeline の window などを差し引いて cache slot 数を算出します。空き領域があれば、通常は reserve に加えて後続割当て分も見込んで cache を小さくします（`engine/src/program/generate.cpp:9192-9202,9220-9249`; `engine/include/strata/core/auto_cache.hpp:30-44`）。
 
-## 適用条件と副作用
+自動 cache は slot を実際に書き込んだ後にも空き VRAM を読み直します。必要量を下回ると cache を縮めて開き直し、reserve と後続割当て分を満たすまで調整します。cache の確保に失敗した場合、自動 cache は縮小を試み、再試行上限後も確保できなければエラーを stderr に出して終了コード `1` になります（`engine/src/program/generate.cpp:9683-9710`）。
 
-- 予約量を使う cache の算定は GPU の空き容量を取得する実行経路で行われます。OS、GPU backend、cache の指定方法、モデル構成に応じて見積もりや補正の分岐が異なります。SYCL 実装にも同じ parser と 700 MiB の既定値があり、自動 cache の容量から reserve を差し引きます（`engine/sycl/src/program/generate.cpp:626-629, 2015, 4875-4882`）。
-- Windows の WDDM 離散 GPU では、CUDA/HIP 側の実装がデバイス容量などに応じて安全余裕を引き上げる場合があります。Windows の HIP 自動 cache では、条件に合う未指定の reserve を 2560 MiB に引き上げます。Windows WDDM の規則は `STRATA_WDDM_VRAM_FLOOR=0` で無効化できます。これらは自動 cache の経路に限った処理で、OS・GPU の判定条件を満たさない場合は適用されません（`engine/src/program/generate.cpp:9014-9043, 9083-9100`、`engine/include/strata/core/low_vram_rules.hpp:37-73`）。
-- 予約を増やすと ExpertCache に保持できる expert が減り、RAM/SSD 側から読む量が増える構成では実行が遅くなることがあります。ソースは不足時に cache を小さくして起動を続ける経路を示していますが、性能への具体的な変化量はここでは測定していません（`engine/src/program/generate.cpp:9220-9269`）。
+明示的な `--expert-cache N` では、すべての経路が自動 cache と同じ post-write 残量確認をするわけではありません。たとえば native pack の layer split で cache が reserve・prefill buffer と両立しない場合は slot 数を減らす警告が出ます。また、profile に基づく native cache の slot 計算でも reserve を空き枠から差し引きます（`engine/src/program/generate.cpp:9420-9434,9471-9484`）。したがって指定値は最終的な空き容量を常に保証するものではありません。
+
+## 適用条件と相互作用
+
+- layer split の先頭 GPU はこの値を使います。後段 GPU は `--vram-reserve-later-mib` が `0` 以上ならそちらを使い、未指定（内部値 `-1`）ならこの値を引き継ぎます（`engine/src/program/generate.cpp:5870-5890,6084`）。
+- reserve を省略した場合の自動調整があります。Windows WDDM の discrete GPU では、自動 cache の安全床まで引き上げる場合があります。明示値は通常維持されますが、`--vision` と既定値 `700` の組み合わせは旧設定との互換経路として例外的に床まで引き上げられます。`STRATA_WDDM_VRAM_FLOOR=0` はこの床を無効化します（`engine/src/program/generate.cpp:9098-9108`; `engine/include/strata/core/low_vram_rules.hpp:58-79`）。
+- Windows HIP の自動 cache は、15 GiB 以上の discrete GPU で、明示 reserve がない場合に `2560 MiB` を使います。Linux/TCC の discrete GPU では `--vision` なし、かつ未指定の既定値 `700` の場合に、総 VRAM が 8.5 GiB 以下なら `480 MiB`、12.5 GiB 以下なら `550 MiB` に下げます（`engine/src/program/generate.cpp:9155-9184`; `engine/include/strata/core/uma_cache.hpp:39-43`; `engine/include/strata/core/low_vram_rules.hpp:90-97`）。
+- 小容量 GPU で自動 cache が動作に必要な最小 slot 数を満たせないとき、reserve が未指定なら `300 MiB` 以上の範囲で自動的に下げる場合があります。明示指定時はこの縮小経路を通らず、cache 枠不足の診断が出ることがあります（`engine/src/program/generate.cpp:9298-9314,9398-9418`）。
+- `--vision --vram-elastic --serve` と resident RAM mode を同時に使う場合、cache を実行中に伸縮できないため、指定値が `2048 MiB` 未満なら reader 用の領域を reserve に含めるよう引き上げます（`engine/src/program/generate.cpp:8975-8984`; `engine/include/strata/core/reader_room.hpp:16-23`）。
 
 ## 出力とエラー
 
-- 自動 reserve の変更、見積もり結果、割り当て後の不足と cache 縮小は `strata generate:` で stderr に出力されます（例: `engine/src/program/generate.cpp:9031-9036, 9107-9111, 9173-9176, 9628-9632`）。
-- 最小の ExpertCache を確保できない場合は、必要 slot 数や不足量、容量を空ける案内を stderr に出します（`engine/src/program/generate.cpp:9338-9345`）。cache の割り当て自体に失敗し、自動縮小でも回復しない場合はエラーを stderr に出して終了コード 1 で戻ります（`engine/src/program/generate.cpp:9582-9610`）。
-- parser が値の範囲を検証しないため、範囲外値に対する専用エラーは確認できません。上記の負数・極端な値について、定義されない変換や後続の算定結果は記述していません。
+自動調整が行われる場合、変更後の reserve と理由を stderr に表示します。自動 cache では計算した空き容量・reserve・slot 数も stderr に出します（`engine/src/program/generate.cpp:9103-9108,9166-9170,9180-9184,9246-9249`）。自動 cache の確保後に空きが不足すれば、実測値と必要量を表示して cache を縮小します（`engine/src/program/generate.cpp:9690-9710`）。
+
+予約量を確保した後に残る VRAM が少ない場合も、serve 起動時に空き容量や「LOW」の警告が出ることがあります。実際の空きは後続割当てや他プロセスにも左右されます（`engine/src/program/generate.cpp:16104-16121`）。
 
 ## 根拠
 
-- `engine/src/program/generate.cpp:958-961` — reserve の説明、既定値、明示指定フラグ。
-- `engine/src/program/generate.cpp:3837-3842, 3992-3994` — 引数走査、必須値の扱い、parser の数値変換。
-- `engine/src/program/generate.cpp:9001-9050, 9070-9116, 9130-9155` — CUDA/HIP/Metal 共通ソースの空き VRAM 見積もりと OS/GPU 条件別の調整。
-- `engine/src/program/generate.cpp:9220-9363, 9373-9410` — cache 不足時の再調整、layer split と明示 cache の容量計算。
-- `engine/src/program/generate.cpp:9582-9637` — cache 割り当ての失敗・再試行・stderr 出力。
-- `engine/sycl/src/program/generate.cpp:626-629, 2015, 4875-4909, 5002-5024` — SYCL の parser、予約量を使う自動容量計算、および不足時の調整。
-- `engine/include/strata/core/auto_cache.hpp:30-44` — 自動 cache slot 数の計算式。
-- `engine/include/strata/core/low_vram_rules.hpp:37-73, 84-91` — WDDM と低 VRAM GPU の自動 reserve 規則。
+- `engine/src/program/generate.cpp:962-963` — reserve の既定値と明示指定フラグ。
+- `engine/src/program/generate.cpp:3843-3846,3997` — 引数値の取得、parser 登録、欠値時の終了。
+- `engine/src/program/generate.cpp:5870-5890,6084` — layer split 各 GPU で使う reserve。
+- `engine/src/program/generate.cpp:8975-8984` — vision reader と resident RAM mode の補正。
+- `engine/src/program/generate.cpp:9098-9108,9155-9184` — Windows WDDM/HIP と low-VRAM の条件分岐および診断。
+- `engine/src/program/generate.cpp:9192-9202,9220-9249,9298-9314,9398-9434,9471-9484,9683-9710` — 自動・明示 cache の見積もり、reserve 補正、確保後の縮小・失敗経路。
+- `engine/include/strata/core/auto_cache.hpp:30-44`, `engine/include/strata/core/low_vram_rules.hpp:58-97`, `engine/include/strata/core/reader_room.hpp:16-23`, `engine/include/strata/core/uma_cache.hpp:39-43` — cache 計算と reserve 補正 helper。
+
+索引の `strata-engine` root にある `--vram-reserve-mib` と parser のスコープは一致しています。対象 checkout の built CLI help は実行していません。ソースの `usage()` はこのオプションを列挙していないため、この文書は parser と使用箇所を根拠にしています。

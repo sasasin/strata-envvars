@@ -1,68 +1,49 @@
 # `STRATA_ARENA_MMAP`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリ・driver の環境変数としての意味は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`ArenaExpertSource` の expert arena を、RAM 上の pinned（登録済み）コピーとして読み込む代わりに、pack の `experts.bin` を read-only の mmap として使う。GPU の VRAM で大部分の expert を保持し、RAM が足りない PC 向けの opt-in 機能。
-
-読み取り箇所は次の 3 系統で、いずれも Strata 自身のソースにある。
-
-- arena のバックエンド選択: `src/core/expert_source.cpp:4451-4483`（SYCL 版は `sycl/src/core/expert_source.cpp:3356-3388`）
-- 適応 swap のコピー元 page lock: `src/program/generate.cpp:163-172` の `pin_blobs_on()`（SYCL 版 `sycl/src/program/generate.cpp:185-192`）
-- 起動時に別の環境変数への設定: `src/program/generate.cpp:1742-1750`（SYCL 版 `sycl/src/program/generate.cpp:1632-1640`）
-
-`serve/`、`setup.py`、`tools/` にはこの名前の読み取りがない。CLI オプションでの等価設定もない（`--mmap-experts` は別クラス `FileExpertSource` の機能で、この変数とは別）。
+非 Windows の `ArenaExpertSource` で、native pack の expert arena を通常の pinned RAM コピーではなく、pack の `experts.bin` から read-only mmap する経路を選ぶ。すでに arena 形式で末尾に最大 blob 分の padding を持つ `experts.bin` がある場合はそれを直接 map する。ファイルが無く GGUF shard から読み込む場合は、まず通常の arena に読み込み、空き容量が条件を満たせば `experts.bin` を生成して次回起動から map する。Windows では arena mmap 判定が常に false で、この変数による map・生成は行わない。`--mmap-experts` の file-tier 経路ではなく、`ArenaExpertSource` の選択経路で作用する（`engine/src/core/expert_source.cpp:6445-6460,6484-6523,6865-6887`; SYCL 複製実装 `engine/sycl/src/core/expert_source.cpp:3311-3326,3350-3388,3513-3536`）。
 
 ## 値と判定
 
-3 箇所すべて、文字列全体を parse せず、`getenv()` の結果の**先頭文字だけ**を `'1'` と比較する。
+判定は文字列全体の parse ではなく、値が存在し、先頭 byte が文字 `'1'` かどうかだけを見る。空文字は無効。`"1"`、`"10"`、`"1anything"` は有効で、`"0"`、`"true"`、`" 1"`、未設定は無効。大文字小文字、数値としての妥当性、末尾文字は検査しない。Windows の arena 判定は値にかかわらず無効。
 
-| 状態 | 判定 |
-|---|---|
-| unset | 無効 |
-| 空文字 | 無効（先頭文字は `\0`） |
-| 先頭文字が `1` | 有効。例: `1`、`10`、`1anything` |
-| それ以外（`0`、`true`、`on` など） | 無効 |
+| ビルド / 経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 非 Windows `ArenaExpertSource`（CUDA / SYCL 共通実装） | 無効 | 先頭が `1`（例: `1`, `10`, `1xyz`） | 先頭が `1` 以外（例: 空文字、`0`, `true`, ` 1`） |
+| Windows `ArenaExpertSource` | 無効 | なし | すべて |
+| HIP / HIP GFX906 の非 Windows 補助処理 | 無効 | 先頭が `1` | 空文字、先頭が `1` 以外 |
 
-`atoi`/`strtol` ではなく `e[0] == '1'` の比較なので、`1` 以外の数字、負値、大文字小文字、空白は検査されない。同じ名前の `getenv` は各箇所で二回呼ばれる（null チェックと先頭文字比較）。
-
-## 既定値と優先順位
-
-- 既定は無効。`docs/DETAILS.md:199-204` の "Without the variable nothing changes." は、この parse 結果と一致する（未設定・空文字・`1` 以外の値はすべて無効）。
-- 有効でも、arena が mmap にならない経路がある。ファイルが存在しない、またはサイズが `want + blob`（arena layout の pad 分）でない場合は、そのまま通常の pinned arena の読み込み経路に落ちる（`src/core/expert_source.cpp:4457-4482`）。サイズチェックは `4430-4442` で、`want` と `want + blob` の両方を受け入れるが、mmap は `have == file_bytes`（pad 込み）のときだけ行う。
-- 優先順位として、mmap 分岐は RAM 量チェック（`#633` の cgroup/available 判定、`4485-4514`）と共有 arena（`--shared-expert-arena`）の処理より**前**にある。mmap が成功すると `open()` は `return true` で抜けるため、`ram_warning_` は出ず、共有 arena の pack hash 検査も通らない。
-- 起動時の `GPU_PINNED_MIN_XFER_SIZE` 設定は `setenv(..., "1000000", 0)` で、flag 0 により**既に設定されている値は上さない**（`src/program/generate.cpp:1749`）。Strata が行うのはこの設定だけであり、値の解釈は ROCclr 側にある。
+arena 判定は `ArenaExpertSource::open` 内の関数ローカル `static const bool` に保存され、最初の `open` 時に一度評価する。HIP の `pin_blobs_on()` も独自の関数ローカル static を初回呼び出し時に保存する（`engine/src/core/expert_source.cpp:6490-6494`; `engine/sycl/src/core/expert_source.cpp:3356-3360`; `engine/src/program/generate.cpp:595-601`; `engine/sycl/src/program/generate.cpp:217-224`）。
 
 ## 有効になる条件
 
-- **OS**: Linux（POSIX `mmap`/`madvise`）。Windows は `src/core/expert_source.cpp:4451-4452` で `arena_mmap = false` に固定（SYCL 版も `3356-3357` で同じ）。
-- **backend/build macro**: 上記の mmap 選択自体は backend macro で分岐していない（CUDA/HIP/SYCL の Linux ビルドで効く）。一方 `pin_blobs_on()` と `GPU_PINNED_MIN_XFER_SIZE` の設定は `(defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)` のときだけ。したがって Linux の CUDA ビルドでは、mmap は有効になるが page lock 系統と driver 変数設定は動かない。
-- **pack 状態**: native pack で `experts.bin` が存在し、arena layout の pad 込みサイズであること。`native_experts.txt` から GGUF を読む pack（`from_gguf`）では、最初の起動は mmap できず、pinned arena として読み込んだ後に `experts.bin` を書く（`4604-4627`）。書く条件は、そのドライブの空きが `want + blob + 2 GiB` 以上（`4609`）。足りなければ "NOT writing ... this start keeps the arena in RAM" として RAM 側で動く。
-- **`--pcie-frac 0` が要られる**: mapped mode では `pinned_bytes_ = 0`、`dev_slice_.clear()`（`4470-4472`）なので `device_alias()` は常に `nullptr`、`pcie_layer()` は false（`4707-4720`、`include/strata/core/expert_source.hpp:198`）。prefill 側は `pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(...)` が false になり、その layer の PCIe share のコピー数は 0 になる（`src/core/expert_source.cpp:3714-3715`）。`docs/DETAILS.md:203` の "Run it with `--pcie-frac 0`" はこのコード状態と一致する。
-- **相互作用**: `STRATA_ARENA_RELEASE=0` は VRAM が保持している expert の page を返さない設定で、`release()` は `map_ != nullptr`（mapped mode）のときだけ意味を持つ（`6127`、`src/core/expert_source.cpp:4692-4705`）。`STRATA_HIP_ADAPT_KERNEL_COPY=1` は「source が mapped であること」を前提にする（`src/program/generate.cpp:176-177`）。`STRATA_ADAPT_OVERLAP` は `pin_blobs_on()` が true のとき "not with page-locked swap sources" として off になる（`8283`）。
+- `ArenaExpertSource` を使う実行経路であること。通常の CUDA 側では `arena_src.open(...)` が呼ばれる分岐で作用する。SYCL 側では `--stream-experts` が有効かつ `--mmap-experts` が無効だと `GgufExpertSource` を選ぶため、その経路では arena mmap 判定に入らない（`engine/src/program/generate.cpp:8745-8748,8871-8872`; `engine/sycl/src/program/generate.cpp:4711-4720,4759-4778`）。
+- Windows では無効。非 Windows 実装だけが `getenv` を評価して POSIX `open` / `mmap` を呼ぶ（`engine/src/core/expert_source.cpp:6490-6505`; `engine/sycl/src/core/expert_source.cpp:3356-3371`）。
+- 既存 `experts.bin` を mmap するには、そのサイズが `want + blob`（arena 全体と最大 blob 1 個分の padding）に一致する必要がある。通常サイズ `want` の既存ファイルは mmap 条件を満たさず、通常の RAM arena 読み込みに進む。サイズがどちらとも一致しない場合は arena 読み込み前のサイズ検査で拒否される（`engine/src/core/expert_source.cpp:6456-6481,6495-6521`; SYCL: `engine/sycl/src/core/expert_source.cpp:3322-3347,3361-3387`）。
+- `experts.bin` が無いときに GGUF から読み込んで生成するには `lay.native`、native GGUF shard 情報があり、GGUF 検査を通ることが必要。生成には pack directory に `want + blob + 2 GiB` 以上の空きが必要。空きが足りない、または空き容量検査が失敗した場合は現在の起動では RAM arena を使い続け、ファイルを生成しない（`engine/src/core/expert_source.cpp:6459-6467,6865-6875`; SYCL: `engine/sycl/src/core/expert_source.cpp:3325-3333,3513-3523`）。
+- map 成功時は device alias を空にして `pinned_bytes_` を 0 にする。実装コメントはこの mapped arena では `--pcie-frac 0` で実行するよう案内しているが、ここで CLI 値を強制設定する処理はない（`engine/src/core/expert_source.cpp:6501-6519`; SYCL: `engine/sycl/src/core/expert_source.cpp:3367-3385`）。
+- HIP または `STRATA_HIP_GFX906` の非 Windows build では、同じ先頭文字判定が起動時に `GPU_PINNED_MIN_XFER_SIZE=1000000` を `setenv(..., 0)` で設定する。既存値を上書きしない。さらに適応的 swap の pin 処理は `pin_blobs_on()` が true の場合だけ span を収集して `pin_blobs` に渡す（`engine/src/program/generate.cpp:3741-3749,8917-8925`; SYCL: `engine/sycl/src/program/generate.cpp:1858-1866,217-224,8917-8925`）。この文書は Strata による環境値の読み取り・設定だけを記し、外部 runtime の挙動は扱わない。
+- map 後の VRAM resident expert のページ解放を `STRATA_ARENA_RELEASE=0` で止められる。未設定または先頭が `0` 以外なら mapped source の resident experts を `release()` し、その後 nonresident experts に `prefetch()` hint を出す（`engine/src/program/generate.cpp:11022-11045`）。
 
 ## 実行時の詳細
 
-- **読み取り時期**: `pin_blobs_on()` と `arena_mmap` は関数内 `static const bool` に一度だけ格納され、以後の環境変更は反映されない。`main()` の分岐は GPU を触る前、プロセス起動時に一度読む。
-- **mmap 成功時**: `open()` はファイル読込・load loop・PinnedArena 確保をすべて飛ばして `return true` する。`note_` は `mapped read-only from <path> (STRATA_ARENA_MMAP: not locked, not pinned)` となり、起動ログは `strata generate: expert arena: <note>` として出される（`src/program/generate.cpp:4723`）。この経路では `gib_per_s_`・load 時間が 0 に設定されるので、直後の `loaded %.2f GiB at %.2f GiB/s` 行は 0 を表示する（`4724-4726`）。
-- **expert 読み**: `blob()` は `base_ + blob_offset()` を返すだけ（`4722-4731`）。page fault による読みは OS の page cache が担い、dropped page はファイルから再読される。
-- **page の返却と先読み**: `prefetch()` は blob の page 範囲を `MADV_WILLNEED`、`release()` は blob に**完全に含まれる** page だけを `MADV_DONTNEED`（隣と共有する page は残す）。呼び出しは startup の residency release（`src/program/generate.cpp:6122-6137`）と、decode/serve の swap 後（`8448`、`12946`）。`MADV_DONTNEED` はこのプロセスから外すだけで、clean page として cache に残るという説明が `4686-4691` にある。
-- **page lock**: `pin_blobs_on()` が true のとき、swap 元 span を 4 KB に揃え、重複/隣接 span を merge し、`cudaHostRegister(ReadOnly | Portable)` を span ごとに一度行う。登録に失敗した span は pageable のまま（コピーは driver の staging 経由で成功する）で、`failed` 数を返す（`src/program/generate.cpp:197-222`）。コピーが到着した後 `unpin_blobs()` で解除する（`8326`、`11348`、`12856`）。呼び出側は `blob_stable()` の pointer を使う（`8384-8391`、`12914-12921`）。
-- **close**: `munmap(map_, map_bytes_)`（`4658-4661`）。
+`ArenaExpertSource::open` は既存 `experts.bin` の有無と arena geometry を先に検査する。mmap が有効で、既存ファイルのサイズが `want + blob` なら read-only / shared mapping を行い、`base_` を map に向け、pinned/device alias を無効にして成功する。mmap が失敗した場合は `ArenaExpertSource: mmap of <path> failed` をエラーとして返し、通常 RAM への fallback はしない。ファイルが無い場合は GGUF から通常の arena に読み込み、十分なディスク空きがあれば `.tmp` に arena bytes とゼロ padding を書き、rename で `experts.bin` にする。書き込み失敗は一時ファイルを削除してログに出し、現在の起動は RAM arena のまま継続する。次回の `open` が正確な padded size のファイルを見つければ mmap する（`engine/src/core/expert_source.cpp:6468-6481,6494-6521,6837-6858,6865-6887`; SYCL: `engine/sycl/src/core/expert_source.cpp:3334-3347,3360-3387,3489-3506,3513-3536`）。
 
-## 資料にある測定
+この変数の `arena_mmap` は初回 `open` 時の値をプロセス内で cache するため、その後の環境変更は反映されない。mapped source では `blob()` が map 内の expert pointer を返し、resident page の `release()` はページ境界に揃えた範囲へ `madvise(MADV_DONTNEED)`、`prefetch()` は `madvise(MADV_WILLNEED)` を呼ぶ（`engine/src/core/expert_source.cpp:6962-6971,6980-6992,7036-7044`; SYCL: `engine/sycl/src/core/expert_source.cpp:3588-3598,3600-3618,3636-3645`）。HIP 補助の環境読み取りも static cache であり、起動時の `GPU_PINNED_MIN_XFER_SIZE` 設定は明示的な既存値を保持する。
 
-- `docs/DETAILS.md:199-204`: 2x 16 GB GPU + 32 GB RAM で、serve 中に利用可能 RAM が約 1 GB から 25 GB。PR #640、0.1.39、Linux、opt-in。
-- `docs/AMD_HIP.md:508-516`: 2x Instinct MI50 16 GB（85 W）、PCIe 3.0 x16、Xeon E5-2666 v3、32 GB DDR4、SATA SSD、Coder IQ1_M（`--native`）、131,072-token context、`--pcie-frac 0`、`STRATA_ARENA_MMAP=1` の構成。
-- `docs/AMD_HIP.md:248-250`: RX 6800 gfx1030、ROCm 7.2.4、31 GiB RAM、IQ3_XXS で `--mmap-experts` の各 run が stall し、`GPU_PINNED_MIN_XFER_SIZE=1048576` を加えてから stall しなくなったという報告。エンジンはこの値を 1000000 として設定する（単位は MiB とコメントされている）。
-- `bench/results/2026-10-03-community-2x-mi50/README.md:52-53`: 起動時に 23.4 GiB が OS へ返されたというコミュニティ計測（`--pcie-frac 0` を "required with STRATA_ARENA_MMAP=1" としている）。これは記録であり、コードから独立に確認した事実ではない。
+## ログと測定値
+
+- mmap が成功すると source note は `mapped read-only from <path> (STRATA_ARENA_MMAP: not locked, not pinned)` となり、呼び出し側が `strata generate: expert arena: <note>` と stderr に出す（`engine/src/core/expert_source.cpp:6516`; `engine/src/program/generate.cpp:8871-8883`; SYCL: `engine/sycl/src/core/expert_source.cpp:3381`; `engine/sycl/src/program/generate.cpp:4775-4785`）。
+- mmap 呼び出しの失敗は `ArenaExpertSource::open` が false を返し、呼び出し側が `strata generate: <error>` を stderr に出して終了コード 1 で終了する（`engine/src/core/expert_source.cpp:6502-6505`; `engine/src/program/generate.cpp:8871-8883`; SYCL: `engine/sycl/src/core/expert_source.cpp:3368-3371`; `engine/sycl/src/program/generate.cpp:4775-4779`）。
+- 初回生成に必要な空き容量が無ければ `strata generate: STRATA_ARENA_MMAP: NOT writing ...`、書き込み試行後は `strata generate: STRATA_ARENA_MMAP: wrote ...` または `could NOT write ...` を stderr に出す（`engine/src/core/expert_source.cpp:6871-6887`; SYCL: `engine/sycl/src/core/expert_source.cpp:3519-3535`）。
+- Strata の資料には性能値の記載があるが、この文書ではコード上の動作説明に必要でないため転記しない。
 
 ## 根拠
 
-- `src/core/expert_source.cpp:4430-4443`（サイズ判定）、`4451-4483`（Linux 限定の parse と mmap）、`4604-4627`（初回起動のファイル書き出しとメッセージ）、`4658-4705`（munmap、prefetch、release）、`4707-4731`（pinned/device_alias/blob）
-- `src/program/generate.cpp:163-172`（`pin_blobs_on` の HIP/Linux 条件）、`197-227`（register/unregister）、`1742-1750`（`GPU_PINNED_MIN_XFER_SIZE` 設定）、`6122-6137`（startup の release と `STRATA_ARENA_RELEASE`）、`8283`（`STRATA_ADAPT_OVERLAP` との相互作用）、`8384-8391`・`12914-12921`（swap span の lock）、`4700-4726`（arena 経路の選択とログ）
-- SYCL 版の対応箇所: `sycl/src/core/expert_source.cpp:3338`、`3356-3388`、`3516-3535`、`3572-3636`、`sycl/src/program/generate.cpp:185-192`、`1632-1640`
-- `docs/DETAILS.md:199-204`、`docs/AMD_HIP.md:248-250`、`508-516`
-
-確認できていない点: mmap 分岐は backend macro で守られていないため、Linux の CUDA ビルドでも arena の mmap は選択される。この場合 driver 変数設定と page lock は動かない（上記の条件分岐）。この組合せの性能・安定性はソースから判断できない。テストコード・ベンチ記録は候補値の根拠にはしていない。
+- CUDA 実装の arena判定、read-only mmap、補助処理とログ: `engine/src/core/expert_source.cpp:6445-6523,6865-6887`。
+- CUDA 側の起動時設定・pin 条件・mapped page の release / prefetch: `engine/src/program/generate.cpp:595-601,3741-3749,8871-8883,11022-11045`。
+- SYCL 複製実装の arena 判定、read-only mmap、生成ログ: `engine/sycl/src/core/expert_source.cpp:3311-3388,3513-3536`。
+- SYCL 起動時設定・pin 条件・arena 呼び出し: `engine/sycl/src/program/generate.cpp:217-224,1858-1866,4711-4779,8917-8925`。

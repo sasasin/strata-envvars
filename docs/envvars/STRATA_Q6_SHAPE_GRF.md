@@ -1,51 +1,45 @@
 # `STRATA_Q6_SHAPE_GRF`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL の native Q6_K wide matvec で、限定された射影形状に 256-register large-GRF kernel を選ぶ opt-in フラグです。通常の Q6_K wide 経路に対して対象形状だけ `grf_size<256>` を要求します。Battlemage のみが対象で、他 GPU ではこの変数を有効にしても bounded dispatch は起動しません。
+SYCL の Q6_K wide MMVQ で、Battlemage 上の限定した行列形状について 256 GRF の A2 kernel を選ぶための opt-in 変数です。条件を満たすときだけ `grf_size<256>` property を付けた kernel へ切り替わります。通常の 128 GRF kernel と計算コードは同じ `native_mmvq_q6k_wide_kernel` の A2 版です（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1648-1685`）。このソースは CUDA engine と分離された SYCL engine の移植コードです（`engine/sycl/CMakeLists.txt:1-7`）。
 
 ## 値と判定
 
-変数名は呼び出し側から共通 helper に文字列で渡され、helper が `std::getenv(name)` で読みます。値を数値として parse せず、設定されていて空でなければ先頭文字だけを判定します。空文字と未設定はいずれも helper の既定値 `false` になります。
+読み取りは `strata::bm_default_on("STRATA_Q6_SHAPE_GRF", device, false)` です。helper は環境値が非空なら先頭文字だけを見て、`'0'` なら false、それ以外なら true を返します。文字列全体の parse、大文字小文字、空白、数値としての妥当性は検査しません。未設定または空文字では `bm_default=false` により GPU 世代にかかわらず false です（`engine/sycl/include/strata/sycl_queue.hpp:196-200`; 呼び出し箇所 `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1656`）。
 
-| 値 | helper の結果 | 対象 dispatch |
-|---|---:|---|
-| 未設定 | `false` | 無効 |
-| 空文字 | `false` | 無効 |
-| `0` または `0` で始まる文字列 | `false` | 無効 |
-| `1`、`true`、`false`、空白で始まる文字列など、空でなく先頭が `0` 以外 | `true` | 条件を満たす場合に有効 |
+| 条件 | 未設定 | 設定時に有効 | 設定時に無効 |
+|---|---|---|---|
+| SYCL Q6_K A2 wide、複数列の各 `NCOLS` specialization | false（空文字も同じ） | 空でなく先頭文字が `0` 以外。例: `1`, `true`, `false`, ` 1` | 先頭文字が `0`。例: `0`, `0anything` |
 
-文字列全体の比較、大文字小文字の変換、数値変換、範囲検査はありません。したがって文字列 `false` も helper 上は true です。設定値は `launch_q6k_wide<NCOLS>` の関数テンプレート特殊化ごとに `static const bool` として最初の評価時に保持され、そのプロセス内では後から環境を変えても再評価されません。
+したがって文字列 `false` は有効、`0anything` は無効です。これは値判定の結果であり、後述の GPU・形状・他設定の条件を満たさない場合は kernel 切替に使われません。
 
 ## 有効になる条件
 
-この経路が選ばれるには、native Q6_K の呼び出しで packed / planar 専用経路が先に処理を終えず、wide 経路のゲート（`STRATA_MMVQ_WIDE`、column 数、`n_in`、`n_out`）を通る必要があります。さらに `STRATA_MMVQ_A2` が有効、wide kernel の rows-per-warp が 1、column 数が 1 より大きいことが必要です。
-
-対象形状は以下のいずれかです。
-
-- `n_in == 6144`、`n_out == 2560`（column 数は 2 以上）
-- `n_in == 2560`、`n_out == 512` または `640`（column 数は 2 以上）
-- column 数 3 以上、`n_in == 2560`、`n_out == 6144`
-- column 数 4 以上、`n_in == 2560`、`n_out == 10240` または `12288`
-
-上記に加え、対象デバイスが Battlemage で、`STRATA_MMVQ_LARGE_GRF` が未設定でなければなりません。`STRATA_MMVQ_LARGE_GRF` が設定済みなら、その値が `0` であっても bounded dispatch は抑止され、large-GRF の選択は同変数自身の別ロジックに委ねられます。したがってこの変数は通常の large-GRF 強制指定の代替ではありません。
+- Strata の SYCL backend で Q6_K の `native_q6_k_mmvq` 経路を通る必要があります。packed Q6_K 行列、または planar registry に登録済みの行列は先に処理されるため、この shape guard には進みません（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2876-2899,3007-3022,3935-3939`）。
+- wide kernel が有効で、列数・行列寸法の wide gate を通る必要があります。`STRATA_MMVQ_WIDE` の `atoi` 結果が 0 なら `g_q6k_wide` が false、列数が `STRATA_MMVQ_WIDE_MAXC` を超える、`n_in` が 256 の倍数でない、または `n_out < wide_min` の場合は対象外です。wide の既定上限は A2 有効時 8 列、A2 無効時 4 列です（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1545-1547,2185,3943-3955`）。
+- `STRATA_MMVQ_WIDE_RPW` の値が 1 で、`STRATA_MMVQ_A2` が有効である必要があります。RPW の既定値は 1、A2 は未設定時に有効です。A2 を無効にするか RPW を 2/4 などにすると別の launch 分岐になり、この変数は判定されません（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1545-1547,1631-1633,1652-1653,1688-1707`）。
+- 列数は 2 以上です。shape 条件は `n_in=6144, n_out=2560`、`n_in=2560, n_out=512 または 640`、`NCOLS>=3` かつ `n_in=2560, n_out=6144`、または `NCOLS>=4` かつ `n_in=2560, n_out=10240 または 12288` です（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1655-1660`）。
+- GPU 世代判定が Battlemage である必要があります。`STRATA_INTEL_GEN` が `battlemage` / `alchemist` / `unknown` のいずれかなら検出結果をその値で置き換えます（未設定・空文字なら自動判定）。そのため実機が Battlemage でも `STRATA_INTEL_GEN=alchemist` または `unknown` なら guard は成立しません。Alchemist やその他の世代でも、明示値で helper の `shape_grf` が true になっただけでは成立しません（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1661-1663`; override と世代判定 `engine/sycl/include/strata/sycl_queue.hpp:139-191`）。不正な `STRATA_INTEL_GEN` 値は override helper が警告を出して自動判定へ戻ります（同 `:141-150`）。
+- `STRATA_MMVQ_LARGE_GRF` が未設定である必要があります。値が空文字でも `getenv` は非 null なので shape guard を抑止します。明示値があれば本変数の guard ではなく、`mmvq_large_grf` がその値を `atoi` で判定します（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1640-1646,1661-1663`）。
 
 ## 実行時の詳細
 
-`native_mmvq()` は GGML type 14 を Q6_K handler に渡します。Q6_K handler は packed / planar 経路を試した後、wide が有効で column 数等の条件を満たす場合に `launch_q6k_wide<NCOLS>()` を呼びます。wide launcher は A2 と `NCOLS > 1` の場合にこの変数を読み、形状・環境・デバイス条件を組み合わせます。
+Q6_K MMVQ はまず packed、次に登録済み planar 行列を試し、いずれも処理しない場合に wide gate を評価します。wide launch の `rpw == 1 && q6k_a2()` 分岐に入り、列数が 2 以上なら `shape_grf` を評価します。`shape_grf` は関数 template `launch_q6k_wide<NCOLS>` 内の `static const bool` なので、各列数 specialization で初めてこの分岐に入った時の値と device 判定を cache します。その後の環境変数変更は、同じ specialization では反映されません（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1648-1663,3935-3955`）。
 
-条件が成立すると stderr に一度 `strata: shape-guarded Q6_K large-GRF dispatch enabled` を出し、`grf_size<256>` property 付きで `native_mmvq_q6k_wide_kernel` を起動します。bounded 条件が成立しない場合は別途 `STRATA_MMVQ_LARGE_GRF` の判定に進み、そちらも false なら通常の A2 Q6_K wide kernel を使います。対象変数に起因する警告、エラー、終了経路はありません。
+`bounded_grf` が true なら 256 GRF property 付きの A2 wide kernel を起動し、それ以外では同じ A2 wide kernel の GRF property なし variant を起動します。明示された `STRATA_MMVQ_LARGE_GRF` が真なら、その変数自身の判定で 256 GRF kernel が選ばれ得ますが、その場合は本変数による bounded guard ではありません（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1640-1646,1661-1685`）。
 
-この変数は CLI 引数や設定ファイルから上書きされません。Q6_K wide 自体が無効、または packed / planar 経路など別経路が先に成立する場合は、この変数は実質的に評価・適用されません。
+## ログと測定値
+
+shape guard が成立した場合、該当 `launch_q6k_wide<NCOLS>` specialization で初めて分岐したとき stderr に `strata: shape-guarded Q6_K large-GRF dispatch enabled` を出します。これは kernel dispatch のログです。成立しない場合に、本変数専用の無効値警告・fallback 理由・エラーを出すコードはありません（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1661-1678`）。
+
+ソースコメントには large-GRF の A770 測定値がありますが、それは Alchemist の wide kernel 全般に関する記述で、本変数の Battlemage shape guard の測定値ではありません。ここでは本変数の性能値として扱いません（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1635-1639`）。
 
 ## 根拠
 
-- `sycl/include/strata/sycl_queue.hpp:159-166` — `bm_default_on()` は環境変数を動的な名前で取得し、空でない値の先頭文字が `0` かどうかを判定します。既定値 false ではデバイス世代に関係なく未設定時 off です。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1550-1553` — `STRATA_MMVQ_A2` の既定値と判定。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1725-1731` — `STRATA_MMVQ_LARGE_GRF` の別の判定・デバイス既定。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1734-1787` — wide launcher、対象形状、Battlemage / 明示 large-GRF との条件、通知ログ、256-GRF と通常 kernel の選択。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:3853-3875` — Q6_K packed / planar 経路の先行判定と wide dispatch 条件。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:4113-4130` — native matvec の type 14 が Q6_K handler に渡ること。
-- `docs/INTEL.md:544-549` — 文書側もこの変数を既定 off の bounded Q6_K large-GRF 制御として掲載し、測定上の理由で opt-in とする旨を記載しています。ここでは測定値を独自に確認していません。
+- `engine/sycl/include/strata/sycl_queue.hpp:196-200` — helper の空文字・先頭文字・既定値判定。
+- `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1640-1685` — large-GRF helper、shape 条件、Battlemage 条件、ログ、256 GRF / 通常 kernel の選択。
+- `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3935-3959` — packed / planar の先行処理、wide gate、Q6_K wide 呼び出し条件。
+- `engine/sycl/CMakeLists.txt:1-7` — 対象ファイルが CUDA engine と分離された SYCL engine の移植ソースであること。

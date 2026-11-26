@@ -1,6 +1,6 @@
 # `--boot-timeout`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。調査時の作業ツリーは `main` で未変更。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,55 +8,53 @@
 | コマンド | `strata presets recheck` |
 | オプション | `--boot-timeout` |
 | 別名 | なし |
-| 値 | 秒数。`float` として解析される値 |
+| 値 | 秒数。Python の `float` として解釈される |
 
 ## 役割
 
-再チェックの測定用 worker を起動した後、ローカルの `/health` が応答するまで待つ時間を指定します。測定リクエスト自体の待ち時間や、コマンド全体の実行時間を制限するオプションではありません。
+再確認で設定を測定する worker を起動した後、`/health` が ready を返すまで待つ時間を指定する。これは `strata presets recheck` 全体の制限時間ではなく、再確認中の worker 起動ごとの ready 待ち時間である。プロンプト速度の再測定や、条件に応じた標準設定の測定で worker を起動し直す場合、それぞれに適用される。
 
 ## 使い方
 
 ```sh
-strata presets recheck PRESET PROFILE --boot-timeout 1200
+strata presets recheck <preset> <profile-or-config.json> --boot-timeout 1200
 ```
 
-`PRESET` は再チェックする保存済み preset、`PROFILE` はその preset が属する profile 名または run configuration です。
+`<preset>` は再確認する保存済み preset、`<profile-or-config.json>` はその preset の対象 profile または run configuration で、ここでは起動待ちを 1200 秒にする例。
 
 ## 値と既定値
 
-- parser は `type=float`、既定値 `900.0` 秒（15 分）です。非数値の文字列は `argparse` の引数解析で拒否されます。
-- 独自の正値・範囲検証はありません。0 以下も数値として受理されますが、worker 起動後の readiness 待ちループに入らず、`TIMEOUT` 扱いになります。
-- 小数値は deadline の計算にそのまま使われます。エラー文に表示する秒数は `int()` で整数化されます。
+- 値は秒単位の浮動小数点数。省略時は `900.0` 秒（15 分）。
+- `argparse` の `type=float` による変換のみで、正数・有限値かどうかの個別 validation はない。数値に変換できない文字列は引数解析エラーになる。
+- 0 または負の値では ready 待ちループに入らず、worker 起動失敗（`TIMEOUT`）として扱われる。正の小数はその秒数で待つが、タイムアウト理由の表示は秒数を整数化する。
+- `NaN` や無限大を拒否する明示的な検査はない。`NaN` は期限判定を通らず、失敗理由を整数化する段階で `ValueError` となり、CLI の一般エラー経路に入る。正の無限大は有限の期限を設けないため、worker が終了するか ready になるまで待ち得る。
 
 ## 実行時の動作
 
-`strata presets recheck` の parser が受け取った値は、`_recheck()` から `WorkerSession(boot_timeout_s=...)` に渡されます。各 worker 起動では、GPU lock と起動前処理を終え、起動用ファイルを準備した後、プロセス起動直前に deadline の基準時刻を記録します。プロセス開始後は deadline まで、認証付きで `http://127.0.0.1:<port>/health` を最大 2 秒の要求として確認し、失敗時は 0.5 秒間隔で再試行します。HTTP 200 が返れば起動完了です。
+parser はこのオプションを `strata presets recheck` に登録し、値を `WorkerSession` の `boot_timeout_s` に渡す。worker 起動後は期限まで 127.0.0.1 の `/health` を確認し、HTTP 200 で ready とする。期限までに ready にならなければ `StartFailed("TIMEOUT", ...)` を発生させる。
 
-この timeout は各 worker 起動ごとに適用されます。通常は preset 設定での起動に使われ、保存時より prompt 測定が遅い場合の再測定、および engine の `tuning_epoch` が変わっている場合の標準設定との比較にも、それぞれ起動があれば適用されます。コマンド全体の経過時間には上限を設けません。
-
-再チェック開始前に preset と現在の PC の状態を照合し、状態が `hard` の場合は worker を起動せず終了します。soft stale を含むそれ以外の状態では測定に進みます。timeout 到達は `StartFailed("TIMEOUT", ...)` となり、再チェック結果は `retune` として記録されます。これは再調整の提案であり、保存済み設定を自動で差し替えません。
+再確認処理は worker の起動失敗を測定結果として受け取り、保存済み設定を起動できなかった場合は verdict を `retune` にする。その結果は preset の `recheck.last_result` に記録され、JSON 出力では verdict・reason・result・preset、通常出力では「Not as fast as before…」と再調整案内が返る。オプション自体は preset の設定値や engine に渡す引数を変更しない。
 
 ## 適用条件と副作用
 
-- worker は `serve.server` の子プロセスとして起動し、loopback の host と空き port を使います。起動用 JSON、worker log、engine log を `--work-dir`（省略時は `strata-recheck-` 接頭辞の一時ディレクトリ）に作成します。
-- 起動後は再チェック要求を測定します。終了時には worker を terminate し、60 秒以内に終了しなければ kill を試みます。GPU メモリーの解放待ちとして終了処理後に 3 秒待ちます。
-- 完了した結果は preset に保存されます。`keep` の場合は最終成功時刻と identity を更新し、測定値が既存の decode 速度を 3% 超えた場合は測定値も更新します。その他の verdict も `last_result` として保存されます。
-- `--output json` は `presets` parser 共通の出力指定です。`--gpu-lock` が使う lock、`--serve-dir`、`--work-dir`、`--status-file` は worker の排他・場所・進捗出力に関係しますが、boot timeout の値を変更しません。
+- `strata tune auto` にも同名のオプションがあるが、別コマンドの parser スコープであり、この文書の対象外。`presets recheck` 側の既定値も独立して定義されている。
+- `--work-dir` を指定しない場合、再確認用の一時作業ディレクトリが作られ、プロセス終了時に削除される。指定した場合はそのディレクトリが再確認ログ等の保存場所として残る。タイムアウトは worker のログを失敗扱いにするが、再確認コマンドの通常フローでは preset の `last_result` を更新する。
+- worker は測定のたびに起動され、ready 待ちの後に測定処理へ進む。起動に失敗した worker は終了処理される。
 
 ## 出力とエラー
 
-- worker が deadline までに `/health` で応答しない場合、失敗理由は `the engine was not ready within N s` となります。再チェック関数はこれを測定失敗として扱い、`retune` verdict を返し、preset に記録した後、human 出力では再調整を案内します。JSON 出力では verdict と理由を含む結果を stdout に出します。
-- worker が先に終了した場合は log と return code から起動失敗種別を判定します。プロセス自体を開始できない場合は `FAIL_BOOT` です。これらも測定失敗として扱われます。
-- preset が hard stale の場合は「この PC は変わりすぎている」と stderr（human）または JSON（`--output json`）に出し、終了コード 5 で終了します。これは boot timeout による失敗ではありません。
-- その他の `PresetError` は終了コード 5、`OSError` / `ValueError` は例外の `exit_code`（なければ 2）で `_fail()` に渡されます。human 形式の失敗は `strata: ...` として stderr に出力します。
+- タイムアウト時、worker session は `TIMEOUT` と「engine was not ready within … s」を含む `StartFailed` を返す。再確認処理はこれを捕捉して `retune` 判定に変換するため、単独のタイムアウトだけでは CLI の終了エラー経路にせず、結果を preset に記録する。
+- 数値変換できない値は `argparse` の引数エラー（終了コード 2）。`NaN` の整数化など、再確認中に発生する `ValueError` は `presets_command` がエラーコード 2 として処理し、通常出力では stderr に `strata: ...`、JSON モードでは `ok: false` の JSON を出力する。
 
 ## 根拠
 
-- `strata_cli/tune_commands.py:49-55,82-90` — `presets recheck` の parser 階層、共通 `--output`、`--boot-timeout` の型・既定値。
-- `strata_cli/cli.py:486-488,2151-2152` — parser 登録と `presets_command()` への dispatch。
-- `strata_cli/tune_commands.py:103-108,126-136,149-157,289-348,411-448` — 出力・失敗形式、worker 設定、hard-stale 判定、timeout の引き渡し、結果の保存。
-- `strata_control/tune_session.py:420-435,443-489,491-522` — `boot_timeout_s`、GPU lock 順序、worker 起動、deadline・health 確認、失敗時の worker 終了処理。
-- `strata_control/autotune.py:885-955` — preset 設定を適用した測定、再測定・baseline 起動条件、起動失敗の `retune` 化。
-- `strata_control/presets.py:412-429` — 再チェック結果の保存と `keep` 時の更新。
-
-調査範囲は上記 checkout の parser と Python 実装です。Release artifact や実機ごとの worker 起動時間は調査・測定していません。
+- `terminal/strata_cli/tune_commands.py:88-96` — `presets recheck` parser と positional 引数、`--boot-timeout` の型・既定値。
+- `terminal/strata_cli/tune_commands.py:615-644` — 再確認処理で値を `WorkerSession(boot_timeout_s=...)` へ渡す箇所。
+- `terminal/strata_control/tune_session.py:527-572` — worker ごとの作業ファイル・プロセス起動。
+- `terminal/strata_control/tune_session.py:574-597` — ready 待ち期限、timeout の `StartFailed` 化、失敗ログ保持。
+- `terminal/strata_control/tune_session.py:598-610` — 起動済み worker の終了処理。
+- `terminal/strata_control/autotune.py:959-975` — 起動失敗の捕捉と `retune` 判定。
+- `terminal/strata_cli/tune_commands.py:652-661` — 再確認結果の保存後に返す出力。
+- `terminal/strata_control/presets.py:441-458` — `last_result` 等を preset に記録する処理。
+- `terminal/strata_cli/tune_commands.py:101-110, 472-530` — human/JSON 出力と `ValueError` のエラー処理。
+- `terminal/strata_cli/tune_commands.py:34-52, 55-96` — `strata tune auto` 側の同名 option は異なる parser scope であること。

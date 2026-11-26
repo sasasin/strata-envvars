@@ -1,40 +1,48 @@
 # `STRATA_DF2_WAITCOMMIT`
 
-調査対象: Strata `main` の HEAD `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。外部ライブラリの動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-DFlash2 drafter が次の候補を作る前に、直前の verifier commit の完了を待つための測定用切替です。未設定なら DFlash2 の draft と、別 stream 上で進行中の非同期 commit が重なる場合があります。設定すると `Verifier::wait_commit()` を呼んでから DFlash2 の `draft()` を実行します。環境変数の値そのものは読まず、設定の有無だけを見ます。
+CLI の speculative decode で DFlash2 が次の draft を作る前に、直前の verify window の非同期 commit を待つための測定用スイッチです。未設定なら commit と DFlash2 draft の重なりを許し、設定されていれば draft の開始前に commit 完了を待ちます。変数の値は parse せず、設定の有無だけを使います。読み取り箇所は `engine/src/program/generate.cpp` の `draft_next` lambda です（`generate.cpp:24949-24963`）。
+
+この分岐は DFlash2 対応コード内にあり、CUDA/HIP の共通 GPU engine が `STRATA_HAVE_DFLASH2` を定義します（`engine/src/program/generate.cpp:24950-24951`、`engine/cmake/strata_gpu_engine.cmake:6-13`）。サーバー側には別の `draft_df2` lambda があり、この変数を読まず `wait_commit` も呼びません（`engine/src/program/generate.cpp:22637-22643`）。
+
+全参照のもう一つは `terminal/data/settings-register.json:6953-6983` のカタログ項目です。そこには読み取り元として同じ `generate.cpp:24959` が記録されていますが、実行時の読み取りは上記 C++ の `std::getenv` です。
 
 ## 値と判定
 
-| 状態 | 判定 |
-|---|---|
-| 未設定 | 待たない |
-| 設定あり | 待つ。空文字列、`0`、`false` を含むすべての値が同じ扱い |
+`std::getenv(...) != nullptr` の結果を関数内 `static const bool` に保存します。文字列の数値・真偽値変換や範囲検査はありません（`engine/src/program/generate.cpp:24959-24960`）。
 
-判定は `std::getenv(...) != nullptr` です。文字列比較、数値変換、大文字小文字の判定はありません。判定結果は `draft_next` 内の `static const bool` に保存され、最初に DFlash2 の経路で評価された後はプロセス内で再評価されません。
+| 条件 | 未設定 | 設定ありの値 | 無効になる値 |
+|---|---|---|---|
+| DFlash2 対応の CLI 生成経路で `draft_next` が DFlash2 分岐に入る | 待たない（`false`） | 空文字、`0`、`1`、`true`、`false`、`0anything` を含む、環境に存在する任意の文字列で待つ（`true`） | なし。値内容を検査しない |
+
+境界値はありません。大文字小文字、空白、数値としての妥当性も判定しません。CLI 引数や別の環境変数による値の上書きは実装されていません。CLI 引数は DFlash2 がその経路で使われるかどうかを決めますが、この変数の真偽は環境変数の存在だけで決まります（`engine/src/program/generate.cpp:8266-8275`、`24959-24960`）。
 
 ## 有効になる条件
 
-- `STRATA_HAVE_DFLASH2` が定義されたビルドで、CLI の speculative generation 経路を使うこと。
-- DFlash2 が実際に有効であること。起動時の選択には `--draft dflash2`、MTP fallback と `--spec 2` 以上、native pack、draft model pack が必要です。複数 GPU、batch、serve、layer split の経路では DFlash2 の選択が拒否されます。
-- 後続の検証処理で tap を利用でき、DFlash2 の bind と prepare が成功して `use_df2` が維持されること。利用できない場合は MTP が使われ、この変数による待機は起きません。
-- commit が実際に非同期で保留されていること。初期化では `set_commit_async(!multi_gpu)` が呼ばれ、Verifier は `STRATA_COMMIT_SYNC` が未設定の場合だけ非同期 commit を有効にします。`STRATA_COMMIT_SYNC` が設定されている場合、または commit が保留されていない場合、`wait_commit()` による追加待ちはありません。
+- `STRATA_HAVE_DFLASH2` を定義したビルドであること。共有 GPU engine は CUDA/HIP ビルドでこの macro を定義します（`engine/cmake/strata_gpu_engine.cmake:6-13`）。
+- CLI の speculative decode ループで DFlash2 が実際に使われ、次の draft が必要なこと。初期化時に `--draft dflash2` が選ばれ、native pack、`--draft-model`、`--spec 2` 以上などの条件を満たして DFlash2 が開始できた場合に `use_df2` が有効になります。条件不足や初期化失敗で MTP に fallback した場合、この待機分岐には入りません（`engine/src/program/generate.cpp:8266-8326`、`24512-24532`、`24837-24845`、`24949-24963`）。
+- DFlash2 の suffix lookup が長い一致により draft を次の round へ延期した場合、その時点では待たず、延期先で実際に DFlash2 draft を行うときに判定します（`engine/src/program/generate.cpp:24952-24960`、`24998-25012`）。
+- サーバーの request loop は別経路で、この変数を読みません。サーバーで DFlash2 を使う設定でもこの待機制御は適用されません（`engine/src/program/generate.cpp:22637-22643`）。
 
 ## 実行時の詳細
 
-speculative loop は verifier の window を commit した後、次の draft を作ります。DFlash2 経路では `STRATA_DF2_WAITCOMMIT` が設定されていれば `ver.wait_commit(err)` を呼び、その成功後に `df2.draft(...)` を実行します。未設定ならこの明示的な待機を飛ばして DFlash2 の draft を呼びます。
+各 speculative window は `ver.commit(a + 1, err)` で commit を開始した後、次の draft を `draft_next` から作ります（`engine/src/program/generate.cpp:25193-25199`、`25218-25225`）。変数が設定されている場合、DFlash2 の `df2.draft(...)` より先に `ver.wait_commit(err)` を呼ぶため、その commit と次の draft が重ならない順序になります。未設定ならこの追加待機を行わず、既定の重なりを許します（`engine/src/program/generate.cpp:24959-24964`）。
 
-CUDA verifier の非同期 commit は commit graph を stream に投入し、完了 event を記録して戻ります。`wait_commit()` は保留中の event を同期し、複数 stage の verifier がある場合は次の verifier にも待機を伝えます。このCLI経路は単一 GPU 条件のため通常は1つの verifier です。待機に失敗すると draft callback は失敗し、呼び出し元が `strata generate: <エラー>` を stderr に出して終了コード 1 を返します。正常時にこの環境変数専用のログはありません。
+値は `static` ローカルに一度だけ評価・保存されます。初回の DFlash2 draft 分岐に到達した時点で読み、同じプロセスで後から環境を変えても再評価されません。DFlash2 分岐に到達しない実行では読み取りません（`engine/src/program/generate.cpp:24949-24960`）。生成ループ終了後の最後の commit は、この変数に関係なく `wait_commit` で待ちます（`engine/src/program/generate.cpp:25250-25253`）。
 
-この切替は commit と DFlash2 draft の重なりをなくすため、測定時に重なりの影響を除く用途です。コードとコメントから待機の順序は確認できますが、この調査では速度や生成結果の測定はしていません。
+`wait_commit` は pending commit があれば完了イベントを同期し、同期エラー時は `verify: commit: <CUDA error>` を `err` に設定して失敗を返します。`draft_next` の失敗は呼び出し元が `strata generate: <err>` を stderr に出して `1` で終了します（`engine/src/core/verify.cpp:4597-4608`、`engine/src/program/generate.cpp:24959-24960`、`25220-25225`）。
+
+## ログと測定値
+
+この変数を設定したこと自体を示すログはありません。読み取り行のコメントは「async commit と重ねない測定」としていますが、同じコード位置や `docs/DETAILS.md` に本変数の条件付き測定値は確認できません。待機が失敗した場合は前節の `strata generate: <err>` が出ます（`engine/src/program/generate.cpp:24959-24960`、`25220-25225`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:16494-16503` — 環境変数の存在判定、commit 待機、DFlash2 draft 呼び出し。
-- `src/program/generate.cpp:4237` — multi-GPU でない場合の非同期 commit 設定。
-- `src/program/generate.cpp:5474-5517,16148-16165` — DFlash2 の選択条件と、tap/bind/prepare 失敗時の MTP fallback。
-- `src/program/generate.cpp:16668-16699` — window commit 後の draft 呼び出しと失敗処理。
-- `src/core/verify.cpp:3379-3380,3416-3429,3441-3452` — `STRATA_COMMIT_SYNC` による非同期 commit の抑止、event の記録と待機。
-- `include/strata/core/verify.hpp:254-261` — 非同期 commit と `wait_commit()` の契約。
+- `engine/src/program/generate.cpp:24949-24964` — CLI の DFlash2 draft 分岐、環境変数の存在判定、待機後の draft 呼び出し。
+- `engine/src/program/generate.cpp:25193-25199,25218-25225,25250-25253` — commit の開始、draft の呼び出しと失敗時の終了、最後の commit の無条件待機。
+- `engine/src/core/verify.cpp:4597-4608` — commit 完了待ちとエラー処理。
+- `engine/cmake/strata_gpu_engine.cmake:6-13` — `STRATA_HAVE_DFLASH2` の CUDA/HIP 共通 engine での定義。
+- `engine/src/program/generate.cpp:22637-22643` — サーバー側の別 DFlash2 draft 経路。

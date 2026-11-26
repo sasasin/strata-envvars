@@ -1,41 +1,47 @@
 # `XDG_DATA_DIRS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリがこの変数を読む動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Strata は `XDG_DATA_DIRS` をアプリのデータ検索設定として使わず、外部プログラムに渡す環境を整える際に path-list の一つとして扱います。Linux AppImage 内で Strata が起動した場合、AppImage 内のディレクトリをこのリストから除いて、フォルダー選択ダイアログ、`xdg-open`、通知、ファイルを開くアプリ、エージェントの shell/tool に渡します。AppImage 外では、この helper は通常値を変更しません。処理本体は `apps/host/server/external-env.mjs:25-26,43-58,63-71` にあります。
+Strata がこの値を読む実装は二つある。
+
+- Linux デスクトップのウィンドウ子プロセスでは、COLRv1 カラー絵文字フォントの有無を調べる検索先に各ディレクトリの `fonts` を追加する。これは WebKitGTK のウィンドウだけに適用するフォント回避策であり、シェル、App Host、engine、agent のフォント設定は変更しない（`app/desktop/src-tauri/src/main.rs:929-942,1295-1314`、`app/desktop/src-tauri/src/fontguard.rs:36-58`）。
+- AppImage の host は、Strata 外のプログラムに渡す環境を作るとき、AppImage 内のパスをこの値から除くか、AppImage 起動前に記録された元の値を戻す。対象には folder chooser、portal 用 `gdbus`、`xdg-open`、agent の shell 等がある（`app/host/server/external-env.mjs:25-26,43-57,63-71`、呼び出し例: `app/host/server/folder-dialog.mjs:117-136,153-164`、`app/host/server/artifacts.mjs:5-6`、`app/host/server/agent/harness-runtime.mjs:25-36`）。
 
 ## 値と判定
 
-`XDG_DATA_DIRS` 自体を `process.env.XDG_DATA_DIRS` のように個別参照したり、内容を環境変数専用の形式として検証したりする箇所はありません。`withoutAppImage()` が `PATH_LISTS` の各名前で環境オブジェクトを動的に参照するため、この変数も対象になります（`apps/host/server/external-env.mjs:25-26,51-55`）。
+| 経路 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| Linux ウィンドウのフォント探索 | `env("XDG_DATA_DIRS")` が `None` なら追加ディレクトリなし | `"/usr/share:/opt/share"` は二つの要素を読み、それぞれに `/fonts` を付けて追加 | 有効/無効値の検証はない。空文字は `Some("")` だが、空要素を除外するため追加なし。`":"` も追加なし |
+| AppImage 外部プログラム向け環境 | 元環境に未設定なら未設定のまま。起動前環境の記録があればその記録に従う | 元環境の値をそのまま復元する。記録なしで `APPDIR` がある場合は、AppImage 配下でない非空の `:` 区切り要素を残す | 記録なしで `APPDIR` がある場合、値が空または全要素が AppImage 配下なら、出力環境からキー自体を削除 |
 
-| 状況 | Strata の処理 |
-|---|---|
-| AppImage 外で `APPIMAGE` / `APPDIR` も `STRATA_ORIGINAL_ENV` もない | `externalEnvironment()` は入力環境をコピーして返すだけです。unset は unset のまま、空文字・その他の値も変更しません（`apps/host/server/external-env.mjs:60-70`）。 |
-| `STRATA_ORIGINAL_ENV` に復元可能な記録がある | 記録された起動元環境を返します。そこに `XDG_DATA_DIRS` があればその値が使われ、現在の AppImage 側の値からの再加工はありません（`apps/host/server/external-env.mjs:28-41,67-71`）。 |
-| AppImage 環境で記録がない、または記録を復元できない。かつ `APPDIR` が空でない | 値を `:` で分割し、空要素と、`APPDIR` と一致するかその配下で始まる要素を取り除きます。残った要素は元の順序・重複のまま `:` で結合します。要素が残らなければ変数自体を削除します（`apps/host/server/external-env.mjs:43-57`）。 |
-| 同上だが `APPDIR` が空または未設定 | path-list の加工は行いません。`withoutAppImage()` が `APPDIR` を空文字として扱うため、元の値（空文字を含む）はそのまま残ります（`apps/host/server/external-env.mjs:44-55`）。 |
+Linux フォント探索では、値を `:` で分割し、空要素だけを除外する。空白の trim、絶対パス確認、ディレクトリの存在確認、パス文字列の妥当性検査はしない。各非空要素 `d` を `PathBuf::from(d).join("fonts")` に変換する。変換後は既定の `/usr/share/fonts`、`/usr/local/share/fonts` 等と合わせて `Vec::dedup` するため、重複が隣り合う場合だけ一つにまとまる（`app/desktop/src-tauri/src/fontguard.rs:36-57`）。値は全体比較や数値変換を受けない。
 
-`inside()` の照合は大文字小文字を変換せず、パスの正規化も行わず、文字列一致または `${APPDIR}/` / `${APPDIR}//` で始まるかで判定します。`PATH_LISTS` の処理では空要素は常に除かれます。復元可能な記録がある場合は、記録中の値をこの分割・除去処理に通しません。`extra` 引数に同名キーがあれば最後に上書きします（`apps/host/server/external-env.mjs:25-26,43-57,63-71`）。
+AppImage の経路では `PATH_LISTS` の一要素として名前を動的に参照する。記録なしで `APPDIR` が空でない場合に限り、`:` 分割し、空要素および `APPDIR` と一致するかその配下 (`APPDIR/…` または `APPDIR//…`) の要素を除く。残りを `:` で連結し、残りがなければキーを削除する。`APPIMAGE` だけが設定され `APPDIR` がないケースでは、この helper は path list を掃除しない。起動時に記録された環境を復元する経路では分割・掃除をせず、値を記録どおりに戻す（`app/host/server/external-env.mjs:25-26,43-57,60-71`）。
 
 ## 有効になる条件
 
-`externalEnvironment()` の特別処理は、`APPIMAGE` または `APPDIR` が truthy であるか、`STRATA_ORIGINAL_ENV` が truthy の場合に行われます。それ以外ではコピーのみです。`APPDIR` がない場合でも、特別処理に入ると AppImage 専用名を削除しますが、`XDG_DATA_DIRS` を含む path-list の項目除去は `APPDIR` がある場合だけです（`apps/host/server/external-env.mjs:17-26,43-70`）。`STRATA_ORIGINAL_ENV` は Base64 の NUL 区切り `NAME=value` 記録として復号され、復元後に少なくとも一つの項目が得られた場合に復元環境として採用されます（同:28-41）。
-
-Linux AppImage の再梱包スクリプトは AppImage の `AppRun` に、hook より前の起動環境を `env -0 | base64 -w0` で `STRATA_ORIGINAL_ENV` に保存する行を挿入します（`apps/desktop/scripts/repack-appimage.sh:52-58`）。その記録が有効なら `XDG_DATA_DIRS` は起動元の値に戻ります。記録がない旧形式などでは `APPDIR` を含む要素の除去に fallback します。
+- フォント探索の読み取りは `#[cfg(target_os = "linux")]` の `run_window_process` だけで行われる。Linux の通常起動では supervisor がウィンドウ子プロセスを動かし、子プロセス起動後、WebKitGTK を開始する前に一度探索する（`app/desktop/src-tauri/src/main.rs:929-942,1295-1314`）。Windows/macOS の埋め込み経路ではこのフォント探索を呼ばない。
+- フォント探索の結果が設定に影響するには、`FONTCONFIG_FILE` が設定されておらず、`STRATA_FONT_CONFIG` が `off` でも既存ファイルパスでもなく、探索先に COLRv1 フォントがあり、システム設定 `/etc/fonts/fonts.conf` が存在し、設定ファイルを書ける必要がある。前二者のいずれかに該当すれば `XDG_DATA_DIRS` を読んだ後でも設定を変更しない。フォントがない場合や設定ファイルを用意できない場合も `FONTCONFIG_FILE` は設定されない（`app/desktop/src-tauri/src/fontguard.rs:117-156`、`app/desktop/src-tauri/src/main.rs:1307-1314`）。
+- `colrv1_font_present` は各探索先を深さ 5 まで走査し、最初の一致で止まる。走査対象ディレクトリがない・読めない場合はその場所を無視する（`app/desktop/src-tauri/src/fontguard.rs:60-89`）。
+- 外部プログラム向けの処理は `externalEnvironment` を呼ぶ経路に限る。AppImage 外で `APPIMAGE` と `APPDIR` がなく、`STRATA_ORIGINAL_ENV` の記録もなければ環境を変更しない。AppImage 起動時の記録がある場合は復元した環境を使い、記録がない場合は `APPDIR` が存在するときに限り現在の環境から AppImage 配下の path list 要素を掃除する（`app/host/server/external-env.mjs:43-57,60-71`）。
 
 ## 実行時の詳細
 
-この helper は結果を cache せず、呼び出しのたびに環境オブジェクトをコピー・加工します。環境値が変わった後の呼び出しにはその時点の `process.env` が渡ります。Strata は `XDG_DATA_DIRS` に既定値を設定せず、CLI 引数や他の環境変数との値の優先順位も定義しません。相互作用する値は `APPDIR`、`APPIMAGE`、`STRATA_ORIGINAL_ENV` と、呼び出し側が渡す `extra` です（`apps/host/server/external-env.mjs:25-26,60-71`）。
+フォント探索では `run_window_process` 内の `env` closure が呼ばれるたびに `std::env::var(k).ok()` を評価するが、`font_dirs` の呼び出し自体はウィンドウ子プロセス起動時の一回であり、その `dirs` を `config_for` とフォント走査に渡す。実行中に環境変数を変更しても、この探索先リストは再構築されない。Strata は `XDG_DATA_DIRS` を設定・上書きせず、この経路で設定するのは条件を満たした場合の `FONTCONFIG_FILE` である（`app/desktop/src-tauri/src/main.rs:1307-1314`、`app/desktop/src-tauri/src/fontguard.rs:37-58,147-156`）。
 
-加工済み環境は、Linux フォルダー選択で `zenity` / `kdialog` / `gdbus` に渡され（`apps/host/server/folder-dialog.mjs:105-120,128-157`）、ファイルやフォルダーを開く `xdg-open` など（`apps/host/server/chat-files.mjs:85-94`、`apps/host/server/artifacts.mjs:5-6,27-30`）、アプリ起動・通知（`apps/host/server/app-ui.mjs:34-58`）にも渡されます。エージェント shell/tool 用には `externalEnvironment(base)` の結果をフィルターし、`XDG_` で始まる名前を許可しているため、残った `XDG_DATA_DIRS` は環境に含まれます（`apps/host/server/agent/harness-runtime.mjs:20-36`）。これらの外部プログラムやライブラリが変数をどう解釈するかは、この調査の対象外です。
+外部プログラム向け helper は呼び出しごとに渡された環境（既定では `process.env`）から戻り値を作り、呼び出し側が `extra` を指定した場合はその値を最後に重ねる。起動前環境を AppImage launcher が `STRATA_ORIGINAL_ENV` に記録する処理は `app/desktop/scripts/repack-appimage.sh:79-85` にある。フォルダ選択では同じ環境を `zenity`、`kdialog`、`gdbus` に渡し、artifact を開く処理では `xdg-open` に渡す。agent 環境ではさらに許可名フィルターを通るが、`XDG_.*` は許可対象なのでこの変数名はフィルターで落ちない（`app/host/server/folder-dialog.mjs:117-136,153-164`、`app/host/server/artifacts.mjs:5-6,17-20,39-42`、`app/host/server/agent/harness-runtime.mjs:20-36`）。
 
-この helper 自体はログを出さず、変数固有の終了・失敗経路もありません。呼び出し先で失敗した場合、フォルダー選択は chooser の失敗理由を結果として返し（`apps/host/server/folder-dialog.mjs:121-139`）、ブラウザー opener は候補を順に試して全て失敗すると `false` を返します（`apps/host/server/app-ui.mjs:38-52`）。その結果を `XDG_DATA_DIRS` の特定値に結び付ける Strata のコードはありません。
+## ログと測定値
+
+`XDG_DATA_DIRS` の分割、除去、復元そのものに関する Strata のログはない。フォント設定を作れない場合も、この処理はエラーを記録せず環境をそのままにする（`app/desktop/src-tauri/src/fontguard.rs:117-156`）。外部プログラムの起動失敗や chooser の失敗表示は個々の呼び出し側が扱うもので、環境 helper は理由ログを出さない（例: `app/host/server/folder-dialog.mjs:124-145`）。この変数に関する測定値は該当なし。
 
 ## 根拠
 
-- 候補一覧: `docs/envvars/000_envvers.md:1711-1715`。
-- path-list 登録、AppImage 条件、値の加工・復元・上書き: `apps/host/server/external-env.mjs:15-71`。
-- 起動元環境を記録する AppImage hook: `apps/desktop/scripts/repack-appimage.sh:52-58`。
-- 整形環境の主な渡し先: `apps/host/server/folder-dialog.mjs:105-157`、`apps/host/server/chat-files.mjs:85-94`、`apps/host/server/app-ui.mjs:34-58`、`apps/host/server/artifacts.mjs:5-6`、`apps/host/server/agent/harness-runtime.mjs:20-36`。
+- `app/desktop/src-tauri/src/fontguard.rs:36-58` — フォント探索先への `XDG_DATA_DIRS` の変換。
+- `app/desktop/src-tauri/src/fontguard.rs:60-89,117-156` — COLRv1 の検出、設定生成の条件と失敗時の扱い。
+- `app/desktop/src-tauri/src/main.rs:929-942,1295-1314` — Linux のウィンドウ子プロセス起動時の読み取り。
+- `app/host/server/external-env.mjs:25-26,43-57,60-71` — path list としての動的参照、AppImage 環境の復元・除去規則。
+- `app/desktop/scripts/repack-appimage.sh:79-85` — AppImage 起動前環境の記録。
+- `app/host/server/folder-dialog.mjs:117-145,153-164`、`app/host/server/artifacts.mjs:5-6,17-20,39-42`、`app/host/server/agent/harness-runtime.mjs:20-36` — helper が環境を渡す呼び出し例。

@@ -1,48 +1,46 @@
 # `STRATA_PORT_NOTICE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-デスクトップアプリが希望した待受ポートを確保できず、別の空きポートで起動した場合に、App Host から UI へ「希望ポートと実際に使うポート」を渡す通知値です。Host は値を `/api/shell` の応答に含め、UI は警告トーストを一度表示します。
-
-通常の desktop 起動ではシェルが子 Host に設定します。Host を直接起動する場合も `process.env` から読むため、外部から渡された値が同じ形式なら通知になります。
+desktop shell が、希望した loopback port を使えず別 port で App Host を起動した事実を host と UI に伝えるプロセス間通知です。Rust shell が port を選んだ後に host 子プロセスへ値を渡し、host は `/api/shell` の応答に解析結果を含めます。UI は通常の競合と `strata launch` の model server による競合を別の警告トーストで表示します。この変数自体は port 選択・bind・モデル動作を制御しません（`app/desktop/src-tauri/src/main.rs:299-314,522-545`、`app/host/server/index.mjs:153-163,2216-2218`、`app/host/src/lib/store.ts:641-647`）。
 
 ## 値と判定
 
-Host の `parsePortNotice()` は `String(value ?? '')` に対して次の正規表現を適用します。
+host の `parsePortNotice` は `process.env.STRATA_PORT_NOTICE` を文字列として正規表現 `^busy:(\d{1,5}):(\d{1,5})(:terminal)?$` に照合します。完全一致が必要で、trim・大小文字変換・port 範囲検査はしません。数字部分は `Number` に変換されます（`app/host/server/shell-prefs.mjs:59-64`）。
 
-```text
-/^busy:(\d{1,5}):(\d{1,5})$/
-```
+| host が受け取る値 | 判定と結果 |
+|---|---|
+| 未設定または空文字 | `null`。通知なし。未設定は `String(value ?? '')` により空文字として照合されます。 |
+| `busy:<1〜5桁>:<1〜5桁>` | 受理。`wanted` と `used` を数値にした通知オブジェクトを返します。例: `busy:47831:51234`。 |
+| `busy:<1〜5桁>:<1〜5桁>:terminal` | 受理。上記に `terminal: true` が加わります。例: `busy:8080:51234:terminal`。 |
+| その他 | `null`。例: `busy:47831:`、` busy:47831:51234`、`BUSY:47831:51234`、`busy:123456:2`、`busy:1:2:other`。 |
 
-一致すれば2つの部分を `Number()` で数値化し、`{ wanted, used }` を返します。一致しなければ `null` です。文字列全体との完全一致であり、前後の空白、符号、空の項目、6桁以上、末尾の改行や追加文字は受け付けません。数字は1〜5桁ですが、ポートとしての範囲検証はしません。そのため、たとえば `busy:0:99999` も構文上は受け付けられます。未設定および `null` は空文字列に変換されて `null` になります。空文字も同様です。
-
-デスクトップシェルが生成する値は `busy:<wanted>:<used>` です。`wanted` は設定ファイルで選んだポート、または既定の `47831`、`used` は空きポート選択で取得したポートです。いずれも `u16` の待受ポートとして作られます。
-
-根拠: `apps/host/server/shell-prefs.mjs:59-62`, `apps/desktop/src-tauri/src/main.rs:250-274`, `apps/desktop/src-tauri/src/shell.rs:55-63`。
+正規表現上は `busy:00000:99999` も受理されます。host 側では値域を検証しません。desktop shell が生成する値は `u16` port から作られ、希望 port は設定ファイルで `0`（既定 port を使う）または `1024..65535` に制限されます（`app/desktop/src-tauri/src/main.rs:299-314`、`app/desktop/src-tauri/src/shell.rs:55-63`、`app/desktop/src-tauri/src/identity.rs:53-56`）。
 
 ## 有効になる条件
 
-- デスクトップシェルのポート事前確認で希望ポートへの bind が失敗し、その後 `pick_port()` が空きポートを取得できた場合にシェルが通知値を作ります。bind の失敗理由はコード上で個別分類せず、すべてこの fallback 経路に入ります。
-- 希望ポートは `shell-prefs.json` の有効な設定（1024〜65535）があればそれを使い、設定が `0`、欠落、範囲外、または読み込み不能なら既定値 `47831` を使います。CLI 引数や別環境変数による上書きはこの経路にありません。
-- `pick_stable_port()` とその Host 起動経路には `#[cfg(not(target_os = "linux"))]` が付いています。したがって、このシェル側の自動生成は Linux ではコンパイル対象になりません。
-- Host 側の読み取り自体は OS や desktop フラグでガードされていません。値がある場合、`/api/shell` の `portNotice` として返します。
+- desktop shell の起動経路で port を選び、希望 port が bind できなかった場合に shell が通知を生成します。通常は設定済み port、未指定なら `47831` が希望 port です。空いていれば通知は生成されず、希望 port を使います（`app/desktop/src-tauri/src/main.rs:289-314`、`app/desktop/src-tauri/src/shell.rs:55-63`）。
+- 競合先への health 確認が `ModelServer` と判定された場合だけ末尾に `:terminal` が付き、それ以外の競合は通常形式です（`app/desktop/src-tauri/src/main.rs:308-313`）。
+- Linux supervisor と非 Linux desktop のどちらも `pick_stable_port` と `host_command` を通ります（`app/desktop/src-tauri/src/supervisor.rs:503-527`、`app/desktop/src-tauri/src/main.rs:554-564`）。backend、build macro、モデルのロード状態による追加条件は、この通知の読み取り・表示経路にはありません。
+- Strata の CLI や engine がこの変数を設定として読む箇所はありません。host を desktop shell の外から直接起動する場合、shell が通知を渡す経路はありません。host に値が届かなければ通知は `null` です（`app/desktop/src-tauri/src/main.rs:543-545`、`app/host/server/index.mjs:162`）。
+- host 起動元の環境に同名変数があれば、shell が検出した通知を `cmd.env` で設定する分岐があるのは通知ありの場合だけです。通知なし時にこの名前を明示的に削除する処理はありません（`app/desktop/src-tauri/src/main.rs:522-545`）。そのため有効な値が別経路から host に渡れば、host は同じ形式で解釈して表示できます。
 
 ## 実行時の詳細
 
-シェルは起動時に希望ポートへ loopback bind を試し、成功すればポート通知を消去します。失敗した場合は一時ポートを選び、`PORT_NOTICE` に書いた文字列を子 Host 起動時に `cmd.env("STRATA_PORT_NOTICE", notice)` で渡します。この設定を行わないときは `Command` の既定動作により親プロセスの環境が継承されるため、親に同名変数が設定済みなら Host に残ります。設定する場合は継承値をシェル生成値で上書きします。
+起動ごとに `pick_stable_port` が shell 設定の希望 port を bind し、失敗時は空き loopback port を選びます。競合相手が Strata model server かを調べて通知文字列を `PORT_NOTICE` に保存し、`host_command` が値を設定して Node host を起動します（`app/desktop/src-tauri/src/main.rs:299-314,522-545`、`app/desktop/src-tauri/src/shell.rs:55-63`、`app/desktop/src-tauri/src/identity.rs:53-56`）。
 
-Host は `shellState()` の呼び出しごとに `process.env.STRATA_PORT_NOTICE` を読み、解析結果を `/api/shell` の JSON の `portNotice` フィールドに入れます。値を別の場所へ保存する処理や、Host 内でのキャッシュはありません。アプリ UI は初回の live 接続後に `/api/shell` を取得し、`portNotice` が非 null なら `warn` トーストを一度出します。表示文は「使用中のポート」「今回起動したポート」、および希望ポートで保存したチャットと設定が Strata がそのポートを再び使えるまで表示されないことを知らせます。ブラウザーまたは古い Host で API 呼び出しが失敗した場合は例外を無視します。
+host は `/api/shell` の GET ごとに `shellState()` を作り、その中で `process.env.STRATA_PORT_NOTICE` を解析します。POST `/api/shell/prefs` の応答でも同じ `shellState()` が呼ばれます。環境変数の解析結果を cache する処理はありません（`app/host/server/index.mjs:153-163,2216-2222`）。UI は接続状態を初期化した際に `announcePortNotice()` を一度呼び、通常の競合なら「Strata could not use its port」、Terminal の model server なら「A model is already running from the Terminal」の警告トーストを出します。通知が `null` のときはトーストを出しません。host 起動後の環境変更をアプリが行う経路は確認できません（`app/host/src/lib/store.ts:637-647,1091`）。
 
-この変数自体がログ、終了コード、プロセス失敗を発生させる処理はありません。希望ポート確保後、Host が実際に bind する前に競合が起きる race はシェル側コメントに記されていますが、その Host 起動エラーはこの通知値の解析とは別経路です。
+## ログと測定値
 
-根拠: `apps/desktop/src-tauri/src/main.rs:240-274,442-492,495-537`, `apps/host/server/index.mjs:133-143,1950-1956`, `apps/host/src/lib/store.ts:509-518,757-790`。
+この変数の処理は host の API 応答と UI の警告トーストに現れ、通知文字列を出力する stdout/stderr ログはありません。host が取得した数値は、通常の競合ではポート使用中の説明と再起動案内に、`:terminal` 付きでは `strata launch` の停止案内に使われます（`app/host/src/lib/store.ts:641-647`）。該当する測定値はありません。
 
 ## 根拠
 
-- 環境変数を実際に読む箇所は `apps/host/server/index.mjs:142` の `process.env.STRATA_PORT_NOTICE` です。
-- シェルが子プロセスへ渡す箇所は `apps/desktop/src-tauri/src/main.rs:484-486`、通知値を組み立てる箇所は `apps/desktop/src-tauri/src/shell.rs:60-63` です。
-- 形式と解析規則は `apps/host/server/shell-prefs.mjs:55-62`、UI の警告表示は `apps/host/src/lib/store.ts:512-518` です。
-- `apps/host/tests/gh-app-features.test.mjs:99-101,205-217` に parser と API 応答のテスト例がありますが、本調査ではテストや build を実行していません。
-- `docs/release-notes-0.2.7.md:25` は busy port 時の警告と、別ポートで起動することを記載しています。上記の実装経路と一致します。
+- `app/desktop/src-tauri/src/main.rs:289-314,522-545` — 希望 port の選択、競合時の通知生成、host 子プロセスへの設定。
+- `app/desktop/src-tauri/src/shell.rs:55-63`、`app/desktop/src-tauri/src/identity.rs:53-56` — port の既定選択と通知文字列の形式。
+- `app/host/server/shell-prefs.mjs:59-64`、`app/host/server/index.mjs:153-163,2216-2222` — 環境値の parse と API への引き渡し。
+- `app/host/src/lib/store.ts:637-647,1091` — 起動時の一度の取得と警告トースト。
+- `app/desktop/src-tauri/src/supervisor.rs:503-527` — Linux supervisor の起動経路。

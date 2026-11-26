@@ -1,46 +1,44 @@
 # `STRATA_NO_NORM_ROPE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-ネイティブ GPU の RMSNorm と RoPE を一つのカーネルに融合する経路を無効にします。値が無効化条件に当たる場合でも、`--native-rope` 自体や通常のネイティブ RoPE は無効になりません。融合を見送った呼び出し元は、RMSNorm と RoPE を別々に実行します。また、in-place のネイティブ RoPE カーネルでは融合可能性に合わせた 32-thread 起動を使わず、128-thread 起動を選びます。
+この変数は、native RoPE 経路で QSA の重み付き RMSNorm と RoPE を一つのカーネルにまとめる処理を止める。また、入力と出力が同じバッファである native RoPE の起動幅 32 スレッド最適化も止める。変数自体は `native_rope_enabled()` を有効にせず、通常の RoPE を native RoPE に切り替えない。CUDA/HIP と SYCL の各 `native_norm_rope_usable()` が値を読み、利用可否を返す（`engine/src/kernels/cuda/native_rope.cu:180-192,213-214`; `engine/sycl/src/kernels/cuda/native_rope.dp.cpp:230-242,262-265`）。
 
 ## 値と判定
 
-環境変数の文字列全体や数値としての値は解析せず、最初の文字だけを検査します。空文字は設定済みでも無効化条件にはなりません。
+両実装とも `std::getenv()` の結果を関数内 `static const bool` に一度だけ保存する。変数が設定され、かつ先頭文字が NUL でも `'0'` でもないとき、この変数は fused 処理を無効にする。文字列の数値変換や全体比較はしない。大文字小文字は判定せず、先頭の空白は `'0'` ではないため無効化側に入る。`0anything` や `0.5` は先頭が `'0'` なので無効化しない（同 `native_rope.cu:181-190`; 同 `native_rope.dp.cpp:231-240`）。
 
-| `STRATA_NO_NORM_ROPE` | 判定 |
-|---|---|
-| 未設定、空文字、先頭文字が `0` | この変数による無効化なし |
-| それ以外（例: `1`, `true`, `false`, 空白で始まる値） | 融合不可 |
+| ビルド条件 | unset | `STRATA_NO_NORM_ROPE` が無効化しない値 | 同変数が無効化する値 |
+|---|---|---|---|
+| `__HIPCC__` 以外 | fused 可 | 空文字、`0`、`0anything`、`0.5` | `1`、`true`、`false`、` 0`、`00` など先頭が `'0'` 以外の非空値 |
+| `__HIPCC__` 定義あり | `STRATA_NORM_ROPE` が unset / 空 / 先頭 `0` なら fused 不可 | 同左条件を満たす値 | 左欄にかかわらず、先頭が `'0'` 以外の非空値 |
 
-判定結果は `native_norm_rope_usable()` 内の `static const bool` に保存されます。したがって最初の呼び出し後にプロセス内で環境を変更しても再評価されません。HIP ビルドでは、この変数が無効化しなかった場合に限り、別の `STRATA_NORM_ROPE` が未設定・空・先頭 `0` なら融合不可となります。`STRATA_NO_NORM_ROPE` が無効化側に当たれば、`STRATA_NORM_ROPE` の値にかかわらず無効です。
+HIP ビルドでは、対象変数が無効化しない場合に限り `STRATA_NORM_ROPE` も同じ先頭文字規則で調べ、非空で先頭が `'0'` 以外の値が設定されているときだけ利用可にする。HIP 以外のプリプロセッサ分岐では `STRATA_NORM_ROPE` を読まず利用可とする（`engine/src/kernels/cuda/native_rope.cu:181-190`; SYCL 側実装も同じ分岐: `engine/sycl/src/kernels/cuda/native_rope.dp.cpp:231-240`）。
 
 ## 有効になる条件
 
-この変数は融合を止める方向にだけ働きます。`STRATA_NO_NORM_ROPE=0` は融合を明示的に有効化する設定ではありません。
-
-- CUDA コンパイル（`__HIPCC__` ではない）では、変数による無効化がなければ融合可能性フラグは既定で ON です。
-- HIP コンパイルでは、無効化されていないことに加え、別変数 `STRATA_NORM_ROPE` の先頭文字が空でも `0` でもない必要があります。
-- いずれのビルドでも、`head_dim` が 128 または 256、`n_rot` が 64 の場合だけ `native_norm_rope_usable()` は true になります。
-- 実際の推論経路で融合を使うにはネイティブ RoPE が有効であることが必要です。通常は CLI の `--native-rope`（または、それを有効化する `--native` プリセット）が必要です。QSA の verify 経路ではネイティブ QSA も必要です。
+- `native_norm_rope_usable()` が true になるのは、`head_dim` が 128 または 256 で、`n_rot == 64` の場合だけ（`engine/src/kernels/cuda/native_rope.cu:191`; `engine/sycl/src/kernels/cuda/native_rope.dp.cpp:241`）。
+- 通常の QSA forward / verify の融合には native QSA と native RoPE の両方が有効である必要がある。初期値では native RoPE は無効で、CLI の `--native-rope` または `--native` preset がそれぞれ有効化する（`engine/src/program/generate.cpp:802,3922,3926,5160-5164,6123`; SYCL 側 `engine/sycl/src/program/generate.cpp:486,1961,2592-2596,3238`; 判定箇所 `engine/src/core/verify.cpp:2037-2044`）。
+- MTP の K / Q 融合経路も native RoPE と上記の利用可判定を必要とする。K は `T == 1` の場合だけ fused カーネルに進み、複数 token では RMSNorm と RoPE を別々に行う（`engine/src/core/mtp.cpp:1259-1269,2406-2418`; Q 経路 `engine/src/core/mtp.cpp:1324-1339,2457-2477`。SYCL 側の K と Q: `engine/sycl/src/core/mtp.cpp:963-973,1028-1048`）。
+- HIP ビルドは `STRATA_NO_NORM_ROPE` が無効化しなくても `STRATA_NORM_ROPE` による明示的な opt-in が必要。対象ソースは `__HIPCC__` で分岐する（`engine/src/kernels/cuda/native_rope.cu:184-189`）。
+- `native_rope_apply()` の通常の RoPE 計算はこの変数だけでは停止しない。`x == out`、回転幅 64、利用可能判定 true の場合に選ぶ 32 スレッド起動を抑え、128 スレッド起動にする。`x != out` などではこの利用判定は起動幅に影響しない（`engine/src/kernels/cuda/native_rope.cu:213-220`; SYCL 側 `engine/sycl/src/kernels/cuda/native_rope.dp.cpp:262-265`）。
 
 ## 実行時の詳細
 
-CUDA 実装 `src/kernels/cuda/native_rope.cu` と SYCL 向けの対応実装 `sycl/src/kernels/cuda/native_rope.dp.cpp` は、同じ先頭文字判定と `__HIPCC__` 分岐を持ちます。API コメントは CUDA では既定有効、HIP では AMD 側の parity check が通るまで既定無効で、`STRATA_NORM_ROPE` による opt-in と説明しています。
+環境値は `native_norm_rope_usable()` の初回呼び出し時に関数ローカル static として評価・キャッシュされる。したがって、プロセス起動後に環境を書き換えても再評価されない。static 初期化後は呼び出しごとに引数の head dimension と回転幅を確認する（`engine/src/kernels/cuda/native_rope.cu:180-192`; `engine/sycl/src/kernels/cuda/native_rope.dp.cpp:230-242`）。
 
-融合が利用可能な場合、QSA verify は Q/K の RMSNorm と RoPE を `native_qsa_rms_norm_rope()` 一回で処理します。無効な場合は RMSNorm の後にネイティブ RoPE（またはネイティブ経路が無効なら通常の RoPE）を呼びます。MTP の K append と Q projection にも同じ fused kernel の分岐があり、無効時は個別処理へ進みます。特に K append は `T == 1` の場合にだけ融合分岐を使います。これらの分岐は `STRATA_NO_NORM_ROPE` の値を直接読むのではなく、キャッシュ済みの `native_norm_rope_usable()` の結果を使います。
+利用可なら QSA 経路は `native_qsa_rms_norm_rope()` を呼び、不可なら RMSNorm の後に native RoPE（native RoPE が有効な場合）または `rope_neox_apply()` を呼ぶ。つまり対象変数による fallback は二つの演算を個別に実行すること。環境値から出力の差や性能差はこのコードだけでは断定しない（`engine/src/core/verify.cpp:2028-2044`; MTP K `engine/src/core/mtp.cpp:1259-1269`; SYCL verify `engine/sycl/src/core/verify.cpp:1328-1338`）。
 
-無効化専用のログや警告は見つかりません。変わるのはカーネル選択と起動形状です。`docs/DETAILS.md` にはこの変数や融合経路の説明・測定値を確認できませんでした。性能差や出力一致をこの調査で実測したものではありません。API コメントには parity check 6 で fused kernel が分離した2処理と bit-identical とありますが、ここではコメントの記述としてのみ扱います。
+## ログと測定値
+
+この変数の値や fused 可否を報告するログ、または無効値時のエラー処理は、確認した読み取り・呼び出し経路にはない。無効化した場合の動作は上記の個別演算への分岐である。条件付きの測定値を示す Strata 資料は確認できなかった。
 
 ## 根拠
 
-- `src/kernels/cuda/native_rope.cu:175-186` — 環境変数、HIP opt-in、対応する head dimension と回転幅の判定。
-- `sycl/src/kernels/cuda/native_rope.dp.cpp:229-240` — SYCL 向け実装の同等の判定。
-- `src/kernels/cuda/native_rope.cu:208-209` — in-place RoPE の 32-thread / 128-thread 起動選択。
-- `include/strata/kernels/native_rope.hpp:21-30` — fused API と CUDA/HIP の既定動作に関するコメント。
-- `src/core/verify.cpp:1196-1212,1331-1362`、`sycl/src/core/verify.cpp:1078-1094` — QSA verify の融合呼び出しと分離処理への fallback。
-- `src/core/mtp.cpp:740-752,806-820`、`sycl/src/core/mtp.cpp:866-878,933-955` — MTP の K append / Q projection の融合条件と fallback。
-- `src/program/generate.cpp:371,1868-1873,2501-2505,3055-3057` — `--native-rope` と `--native` プリセット、実行時フラグ設定。
-- `docs/DETAILS.md` — `STRATA_NO_NORM_ROPE` の説明や測定値は確認できず。
+- `engine/src/kernels/cuda/native_rope.cu:180-192,213-220` — CUDA/HIP の値判定、HIP 分岐、利用条件と native RoPE 起動幅。
+- `engine/sycl/src/kernels/cuda/native_rope.dp.cpp:230-242,262-265` — SYCL 実装の同等判定と起動幅。
+- `engine/src/core/verify.cpp:2028-2044`、`engine/sycl/src/core/verify.cpp:1328-1338` — QSA forward/verify の fused と fallback 経路。
+- `engine/src/core/mtp.cpp:1256-1269,1324-1339,2406-2418,2457-2477`、`engine/sycl/src/core/mtp.cpp:960-973,1028-1048` — MTP における K/Q 処理と条件。
+- `engine/src/program/generate.cpp:802,3922,3926,5160-5164,6123`、`engine/sycl/src/program/generate.cpp:486,1961,2592-2596,3238` — native RoPE の CLI 設定とカーネルへの有効状態設定。

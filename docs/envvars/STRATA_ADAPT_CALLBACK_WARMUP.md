@@ -1,41 +1,46 @@
 # `STRATA_ADAPT_CALLBACK_WARMUP`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの内部動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux の `strata generate` 経路で、CPU の `ExpertPool` を作る前に GPU host callback を一度だけ no-op で実行・同期します。後続の CPU pool 初期化より前に callback の実行経路を通しておくためのウォームアップです。既存の swap 選択、検証 window ごとの callback、residency 更新をこの環境変数が直接変更する処理はありません。
+Linux での `strata` 起動時に、CPU expert pool が現在のホストスレッドを pin する前に、空の GPU host callback を登録して同期するかを制御する。既定では有効で、Strata は `cudaLaunchHostFunc(nullptr, ...)` と `cudaStreamSynchronize(nullptr)` を呼び、成功・失敗を stderr に出す。コメントでは、後から作られる callback thread が pin 後の CPU mask を引き継いでホストの spin-wait と競合する状況を避ける意図としている。環境変数は callback の処理内容、expert の選択、生成結果を直接設定するものではない。`engine/src/program/generate.cpp:8985-9000`。
 
 ## 値と判定
 
-実装は `std::getenv()` の有無と値の先頭文字だけを調べます。文字列全体の parse、数値変換、大文字小文字変換はしません。
+このコードは `std::getenv` の戻り値を数値・真偽値として parse せず、先頭 1 byte が文字 `0` かだけを比較する。したがって空文字列は設定されていても有効側であり、`0` で始まる文字列だけが無効側になる。空白除去、大文字小文字変換、文字列全体の検査はない。`engine/src/program/generate.cpp:8990`。
 
-| 値 | ウォームアップ |
-|---|---|
-| 未設定 | 有効 |
-| 空文字 | 有効（設定ありだが `e[0] == '\0'`） |
-| 先頭文字が `0` | 無効。例: `0`, `0anything` |
-| それ以外の文字列 | 有効。例: `1`, `false`, ` true`, `anything` |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `__linux__` が定義されたビルド | 有効（warm-up を行う） | 空文字、`1`、`true`、`false`、`off`、` 0` など先頭 byte が `0` 以外の値 | `0`、`0anything`、`01`、`0 `、`0.0`（先頭 byte が `0`） |
+| `__linux__` が未定義 | この箇所で読まれず、warm-up を行わない | 該当なし | 該当なし |
 
-値の判定は pool 初期化直前の `generate` 経路で行われ、結果を保存する `static` キャッシュはありません。したがって同一プロセス内でこの経路に再度入れば、その時点の環境値を読み直します。CLI オプションや設定ファイルによる上書きはこの分岐にはありません。
-
-根拠: `src/program/generate.cpp:5853-5867`。
+「有効」はこの分岐に入るという意味であり、GPU API 呼び出しが成功する保証ではない。Linux の判定は `#if defined(__linux__)` で囲まれ、変数を無視する別の値 parse や CLI 引数による上書きはこの処理にはない。`engine/src/program/generate.cpp:8985-9000`。
 
 ## 有効になる条件
 
-- `#if defined(__linux__)` の範囲内でのみコンパイルされるため、非 Linux ではこの読み取りも処理もありません。
-- `strata generate` の当該初期化経路を通る必要があります。
-- Linux 上で GPU runtime API を利用するビルドが対象です。環境変数が有効でも、その API 呼び出し自体の成否は別に判定されます。
-- この処理は `ExpertPool` を `pin=true` で構築する直前にあります。pool の worker/host thread の配置や pinning 設定を変えるものではありません。
+- このコードがコンパイルされた `strata` の Linux 実行であること。OS 条件は `__linux__` のみで、当該分岐に GPU backend 用の追加 `#if` はない。ビルド構成として通常の GPU engine は `generate.cpp` を `strata` 実行ファイルに含める（`engine/cmake/strata_gpu_engine.cmake:548-551`）。
+- CLI の通常実行または `--serve` など、共通の起動処理がこの位置まで到達すること。`--version` は main の早期 return 経路があるため対象外（`engine/src/program/generate.cpp:3670-3705`）。
+- 変数が unset、または値の先頭 byte が `0` 以外であること。
+- callback 登録と既定 stream の同期が成功すること。どちらかが失敗した場合は警告を出して続行する。pool の作成自体を取りやめる条件ではない（`engine/src/program/generate.cpp:8991-8998`）。
 
 ## 実行時の詳細
 
-値が有効なら、Strata は null/default stream に no-op callback を enqueue し、その stream を同期します。両 API 呼び出しが成功した場合、stderr に `strata generate: GPU host-callback thread started before host-core pinning` を出します。どちらかが失敗した場合は `cudaGetLastError()` を呼び、`strata generate: could not warm up the GPU host-callback thread (continuing)` と出して続行します。失敗しても generate はこの箇所で終了せず、その後の pool 構築へ進みます。
+共通の `main` 内でモデル・arena の準備後、`ExpertPool` の構築直前に環境値を直接 1 回読み取る。分岐が有効なら空 callback を既定 stream に登録し、同期を試みる。pool はその後 `pin=true` で構築される。この箇所に static cache やリクエストごとの再読取はないため、同一プロセス内で後から環境を変えても、この起動時の分岐には反映されない。serve の各 request でも読み直さない（`engine/src/program/generate.cpp:8975-9005`）。
 
-直後に `ExpertPool(..., pin=true, ...)` を構築します。pool 実装は Linux で pool 配置を決める際に呼び出し元 thread の許可 CPU を読み、スレッド affinity を設定する helper を持ちます。ソースコメントでは、host thread を pin した後に callback 実行 thread が初めて作られると、同じ CPU mask を引き継いで host の spin-wait と競合しうることを理由として挙げています。この環境変数が制御するのは、その前段にある no-op callback の warm-up と同期、および成否ログです。
+API 呼び出しが失敗したときは `cudaGetLastError()` も呼ばれるが、その戻り値は使わず警告後も起動を続ける。この変数に結び付いた終了・timeout 経路はない（`engine/src/program/generate.cpp:8991-8998`）。
 
-根拠: `src/program/generate.cpp:5854-5873`, `src/kernels/cpu/pool.cpp:580-590,644-665,743-748`, `src/kernels/cpu/pool_affinity_linux.hpp:51-65`。
+## ログと測定値
 
-## 文書・測定との照合
+warm-up 成功時の stderr は `strata generate: GPU host-callback thread started before host-core pinning`。どちらかの API 呼び出しが失敗した場合は `strata generate: could not warm up the GPU host-callback thread (continuing)` を出す。変数の値が先頭 `0` のとき、または非 Linux ビルドでは、この箇所からログは出ない（`engine/src/program/generate.cpp:8991-8998`）。
 
-`docs/DETAILS.md:2023-2028` も Linux で既定有効、`=0` で無効と記し、swap selection / per-layer callback / residency update は変わらないとしています。同資料は RTX 5090 と Ryzen 9 9950X の paired 4K three-prompt test について平均 142.82 → 207.75 tok/s と記載しています。これは資料に記された単一構成の測定結果であり、他の GPU・driver での性能を示すものではありません。コード上では測定や性能保証は行いません。
+Strata の資料には過去の測定がある。`docs/bench-results/2026-10-11-rtx-5090-callback-affinity/README.md:3-12,44-69` は v0.1.43（記載 source SHA `7695859aa13afb248bdb4d36f9b2e95707db079d`）での RTX 5090 / Ryzen 9 9950X、Fedora Silverblue 上の Ubuntu 26.04 NVIDIA distrobox、NVIDIA 610.57.04 / CUDA 13.3.33、Qwen3.8-Flash-Next GSQ-RCO IQ3_S の比較として、4K の三 prompt で通常 callback 142.82 TPS に対し早期 warm-up 207.75 TPS（各設定 12 requests）、100K の code prompt で 232.96 対 252.19 TPS（各設定 4 requests）を記載する。4 回の起動を normal/warm-up/warm-up/normal の順で行った結果で、現行 HEAD の再測定ではない。報告書は token-array の全一致を主張していない。
+
+`docs/DETAILS.md:1213,1674` にも Linux の既定 ON・`=0` の off switch と 4K 三 prompt の測定要約がある。コード上の値判定は `=0` 全体との比較ではなく先頭 byte 判定である。
+
+## 根拠
+
+- 実読取、Linux guard、API 呼び出し、pool 構築順序、成功・失敗ログ: `engine/src/program/generate.cpp:8985-9005`
+- `main` と `--version` 早期終了: `engine/src/program/generate.cpp:3670-3705`
+- GPU engine における executable 構成: `engine/cmake/strata_gpu_engine.cmake:548-551`
+- 過去の測定条件と制限: `docs/bench-results/2026-10-11-rtx-5090-callback-affinity/README.md:3-12,44-82`; 要約: `docs/DETAILS.md:1213,1674`

@@ -1,48 +1,44 @@
 # `FNX_PF_DMA_CHECK`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。Strata の作業ツリーは `## main...origin/main` で、未コミット変更はありません。調査対象は Strata 所有ソースです。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`strata-split` の prompt prefill にある multi-GPU host-memory ring で、host buffer から device buffer への DMA copy 後に、copy 先と元 host buffer の値を比較する診断 kernel を有効にします。計算経路や DMA の選択自体を切り替える変数ではありません。`strata-split` は通常のビルドでは無効で、Qwen3.8-Flash-Next の全層を Linux 上の 2〜4 枚の NVIDIA または AMD GPU に分割する別エンジンです（`CMakeLists.txt:2945-2949`, `src/split/CMakeLists.txt:1-7,92-115`）。
+split engine の prompt 処理で、copy engine がホスト上の ring slot から device buffer へ DMA した値を、直後の device kernel がホスト側の現在値と比較する診断用スイッチです。値が非 0 なら `PfRing::dma_check` が有効になります。生成計算や ring の転送方式自体を選ぶ設定ではなく、比較は `FNX_PF_DMA` で DMA が有効な場合に限って一部の受信・gather 経路で追加されます。読み取りと状態設定は `Engine::prefill_alloc()` 内です（`engine/src/split/src/prefill.cu:301-314,1169-1223`）。
 
 ## 値と判定
 
-`src/split/src/prefill.cu:898` は `fnx::env_int("FNX_PF_DMA_CHECK", 0) != 0` を使います。`env_int` は未設定なら既定値を返し、設定済みなら符号付き 10 進整数全体を `strtoll` で読みます（`src/split/src/env.hpp:15-21,33-40`）。
+`fnx::env_int("FNX_PF_DMA_CHECK", 0)` が共通 helper 経由で読みます。helper は `getenv` で未設定を判定し、設定値全体を符号付き base-10 `long long` として厳密に parse します。未設定は `0`、parse 後の値が `0` なら無効、それ以外（負値を含む）は有効です。範囲外の整数、空文字、空白、`true`、`0anything` など全体が整数でない値は `std::runtime_error` になります。`+1` や `-1` は有効な整数で、値の clamp はありません（`engine/src/split/src/env.hpp:15-22,33-40,51-52`; 呼び出し `engine/src/split/src/prefill.cu:1216`）。
 
-| 状態 | 結果 |
-|---|---|
-| 未設定 | `0`。比較を無効にする |
-| 空文字 | 整数として不正。例外 `FNX_PF_DMA_CHECK: '' is not a whole number` |
-| 整数 `0`（例 `0`, `+0`, `-0`, `00`） | 無効 |
-| 0 以外の整数（正負どちらも可） | 有効 |
-| 整数でない文字列、前後の空白、数字の後ろに文字がある値 | 不正値として例外 |
-| `long long` の範囲外 | `strtoll` の範囲エラーで不正値として例外 |
-
-文字列全体が符号と数字だけであることを要求します。小数、基数接頭辞、空白、末尾文字は受け付けません。値域の追加制限や clamp はなく、0 との比較だけです。例外は `std::runtime_error` で、設定値を読む CLI 引数による上書きはありません。
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| split engine の prompt ring 設定 | `0`（無効） | parse 可能な非 0 整数。例: `1`, `-1`, `+2` | `0`, `-0`, `00`。空文字・`true`・`0anything`・空白つきの値・整数範囲外は無効扱いに落ちず、helper の例外になる |
 
 ## 有効になる条件
 
-- `STRATA_BUILD_SPLIT=ON` でビルドした `strata-split` または同じ engine を使う `split_fnx_run` の経路が対象です。通常の Strata engine でこの変数を読む箇所は確認できません（`CMakeLists.txt:2945-2949`, `src/split/CMakeLists.txt:92-115,153-164`）。
-- `FNX_PF_DMA_CHECK` が非 0 でも、prompt の ring が host-memory copy-engine 経路を使い、該当する DMA copy が発行される必要があります。`FNX_PF_DMA=0` では receive/gather を host-memory kernel 読み取り経路にするため、比較 kernel は起動されません。`FNX_PF_DMA` の既定値は CUDA で 1、HIP で 0 です（`src/split/src/prefill.cu:891-898`; copy 条件は `src/split/src/pf_common.cuh:219-227,241-259,274-288`）。
-- `FNX_PF_RING_SM` が非 0 なら GPU-thread ring の `ring_sum` が使われ、copy-engine ring を通らないため、この比較は使われません（`src/split/src/prefill.cu:738-740,1241-1246,1299-1306`）。
-- HIP で RCCL による prompt sum が有効な場合、`pf_ring` は RCCL all-reduce の後に戻るため、ring checker を通しません（`src/split/src/prefill.cu:512-533`）。
-- `FNX_PF_OVERLAP` は比較を無効にしません。overlap 経路も `pf_ring` を呼びます（`src/split/src/prefill.cu:821-830,1151-1159`）。CLI オプション、モデル設定ファイル、他の値による `FNX_PF_DMA_CHECK` 自体の優先上書きはありません。
+- CUDA/HIP 共通の split engine prompt 実装で読みます。調査した checkout では名前の実読み取りは `prefill.cu` の一箇所のみで、Metal/SYCL 等に同名の読み取りはありません（`engine/src/split/src/prefill.cu:1211-1216`）。
+- `FNX_PF_DMA` が非 0 で ring が DMA 経路を使う必要があります。`FNX_PF_DMA` 未設定時は HIP build で `0`、HIP 以外で `1` です。DMA が無効なら `dma_check` が true でも比較 kernel は起動しません（`engine/src/split/src/prefill.cu:1209-1216`; 判定箇所 `engine/src/split/src/pf_common.cuh:328-335,354-360,383-396`）。
+- prompt の加算が copy-engine ring (`pf_ring_run`) を通る必要があります。`FNX_PF_RING_SM` による SM ring は呼び出し側で別経路です（`engine/src/split/src/prefill.cu:1694-1699,1762-1769`）。HIP で RCCL を使う場合は `pf_ring()` が RCCL の all-reduce 経路から先に return し、また `FNX_PF_A2A_ROWS` の範囲内の小 chunk は all-to-all 経路から return するため、いずれもこの checker を通りません（`engine/src/split/src/prefill.cu:723-755,1000-1009`）。
+- 比較はすべての copy に適用されるわけではありません。`pf_ring_run()` の通常 `ADD`/`GADD` 受信 DMA と `OUT` gather DMA の後で実行されます。`SEND`/`PASS` 転送および `own_out` reduce-scatter 分岐内の DMA には検査呼び出しがありません（`engine/src/split/src/pf_common.cuh:298-317,325-397`）。
+- CLI 引数や設定ファイルによる優先順位はなく、`FNX_PF_DMA_CHECK` の値だけで `dma_check` を決めます。DMA の有効・無効は別変数 `FNX_PF_DMA` が決めます（`engine/src/split/src/prefill.cu:1209-1216`）。
 
 ## 実行時の詳細
 
-`Engine` のコンストラクターは `prefill_alloc()` を呼び、その中でカードごとに ring の DMA 設定と `FNX_PF_DMA_CHECK` を読み取って `PfRing::dma_check` に保存します（`src/split/src/engine.cu:31,272-275`; `src/split/src/prefill.cu:625-634,883-905`）。エンジン生成時の読み取りであり、既存エンジンの実行中にプロセス環境を書き換えても保存済み設定は更新されません。別の Engine を作れば再び読み取ります。
+`Engine::prefill_alloc()` のカードごとの初期化ループで各カードの `PfRing` に対して読みます。読み取り値を `r.dma_check` に保持し、その後の各 prompt ring 呼び出しがその状態を参照します。関数内 `static` やリクエストごとの再読込ではありません。engine の prompt buffer を作成した後に環境を変更しても、既存 `PfRing` の値は変わりません。split engine の構築時に prompt buffer を割り当てる呼び出しは `engine.cu` にあります（`engine/src/split/src/prefill.cu:854-856,1169-1216`; `engine/src/split/src/engine.cu:317-318`）。
 
-ring の receive copy（`ring in`）と gather 出力 copy（`ring out`）では、DMA copy の後に同じ stream 上で `k_pfr_cmp` を起動します。kernel は device 側の `uint4` と、比較時点の host 側の 4 word を比較します。HIP は system scope atomic load、CUDA は uncached load を使います。不一致があれば、receive は error bit 64、gather は bit 128 を `err` に立てます（`src/split/src/pf_common.cuh:139-153,219-225,245-251,274-286`）。比較 kernel 自身は差分の内容を出力しません。
+checker kernel は転送先 `dev` の各 `uint4` と、転送元 host slot を読み直した 4 個の `unsigned` を比較します。不一致を見つけた block は error word に receive 用 `64` または gather 用 `128` を `atomicOr` します（`engine/src/split/src/pf_common.cuh:222-238`）。prompt pass 後に engine は error word を回収し、非 0 なら `prefill: ring error <数値>` という例外を投げます（`engine/src/split/src/prefill.cu:1786-1803`）。このエラー word には他の ring 検査の bit も入り得るため、数値が 64/128 だけとは限りません。
 
-prefill は各カードの ring error を回収し、非 0 なら `prefill: ring error <値>` 例外を投げます（`src/split/src/prefill.cu:1319-1335`）。同じ error word には他の ring エラーも含まれ得るため、この数値だけでは DMA check 起因と断定できません。`sfnx` では最終的に `ERR ...` を標準出力、`sfnx: failed: ...` を標準エラーに出して終了コード 1 で終了します（`src/split/tools/sfnx.cpp:1027-1035,1085-1092`）。`split_fnx_run` では `fnx_run: ...` を標準エラーに出し終了コード 1 です（`src/split/tools/fnx_run.cpp:1364-1373`）。不正値を読む段階で例外となった場合、`sfnx` の Engine 初期化 catch は上記の `fail` 経路を通ります（`src/split/tools/sfnx.cpp:1055-1062`）。
+## ログと測定値
+
+checker 自身は不一致の詳細やカード番号を出力せず、error bit を立てます（kernel の `card` と `rows0` 引数は未使用: `engine/src/split/src/pf_common.cuh:224-238`）。このため観測できる結果は pass 後の `prefill: ring error <数値>` 例外です。`fnx_run` は stderr に `fnx_run: <例外内容>` を出して終了コード 1 になります（`engine/src/split/tools/fnx_run.cpp:1364-1373`）。`sfnx` では初期化・実行時例外を `fail()` が `ERR <理由>` の応答行と `sfnx: failed: <理由>` の stderr に出し、終了コード 1 で終了します（`engine/src/split/tools/sfnx.cpp:1094-1102,1123-1136,1160-1166`）。
+
+`docs/SPLIT_ENGINE.md` は prompt 用 copy-engine ring の概要を説明していますが、この環境変数の比較結果に関する測定条件・数値は記載していません（`docs/SPLIT_ENGINE.md:90`）。現行ソースにも測定値はありません。
 
 ## 根拠
 
-- 候補名の全参照を `rg` で確認したところ、Strata ソースでの実値読み取りは `src/split/src/prefill.cu:898` の一箇所でした。他の参照は `src/split/src/prefill.cu:307,892` と `src/split/src/pf_common.cuh:137-138` のコメントです。読み取り箇所があるため、候補一覧との食い違いではありません。
-- 環境値の parse: `src/split/src/env.hpp:15-21,33-40`。
-- split エンジンの対象・build 条件: `CMakeLists.txt:2945-2949`, `src/split/CMakeLists.txt:1-7,92-115,153-164`。
-- 設定値の保持、backend ごとの `FNX_PF_DMA` 既定値: `src/split/src/prefill.cu:883-905`。
-- checker と各 copy 経路: `src/split/src/pf_common.cuh:139-153,219-227,241-259,274-288`。
-- error 集約と失敗通知: `src/split/src/prefill.cu:1319-1335`, `src/split/tools/sfnx.cpp:1027-1035,1055-1062,1085-1092`, `src/split/tools/fnx_run.cpp:1364-1373`。
-- Strata の実装コメントは、HIP gfx1201 の DMA 読み取りで flag 時点に host stores が見えない場合を調べる用途としてこの変数を挙げています。ただし、ここではそのコメントを独立に再現・測定した結果とは扱いません（`src/split/src/prefill.cu:891-892`）。
+- `engine/src/split/src/env.hpp:15-22,33-40,51-52` — 整数の全体 parse、未設定時 fallback、非 0 判定。
+- `engine/src/split/src/prefill.cu:301-314,1169-1223` — ring 状態、DMA の backend 別既定値、対象変数の読み取りと初期化。
+- `engine/src/split/src/prefill.cu:723-755,1519-1526,1694-1699,1762-1769` — copy-engine ring 呼び出し、RCCL / HIP all-to-all の早期 return、prompt 経路。
+- `engine/src/split/src/pf_common.cuh:222-238,298-399` — 比較内容、error bit、checker を実行する DMA 箇所と迂回箇所。
+- `engine/src/split/src/prefill.cu:1786-1803` — pass 同期後の error word 回収と例外。
+- `engine/src/split/tools/fnx_run.cpp:1364-1373`; `engine/src/split/tools/sfnx.cpp:1094-1102,1123-1136,1160-1166` — CLI / server 側で確認できる失敗表示。

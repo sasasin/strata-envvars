@@ -1,45 +1,44 @@
 # `FNX_PF_RING_SM`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-all-cards split engine の prompt prefill で、カード間の chunk sum に使う ring を選びます。既定では page-locked host memory 上の copy-engine ring を使います。`FNX_PF_RING_SM` が非 0 のときは別の ring を割り当て、各カードの GPU thread が読み書きする旧経路を選びます。この設定は decode ring ではなく prompt prefill の経路に作用します。
+`strata-split` の prompt prefill で、各 layer の attention / FFN chunk sum に使う方式を選ぶ。未設定または 0 なら copy-engine ring 側（`ring_async` または `pf_ring`）、非 0 なら GPU-thread ring の `ring_sum` を使う。通常の `strata` engine の設定ではなく、`STRATA_BUILD_SPLIT` が有効な場合に追加される sFNX engine 用である。`FNX_PF_RING_SM` の直接読み取りは `Engine::prefill_alloc` 内の一箇所である（`engine/src/split/src/prefill.cu:854-856,967-975`）。
 
 ## 値と判定
 
-`env_int("FNX_PF_RING_SM", 0) != 0` で判定します。`env_int` は環境値全体を base 10 の `long long` として解析し、未設定なら既定値を返します。符号（`+` / `-`）は許可され、値が 0 以外なら有効です。
+`env_int` は環境変数全体を base 10 の `long long` として parse する。先頭は `+`、`-` または数字でなければならず、後続は数字のみ、末尾まで消費され、`long long` の範囲内である必要がある。空白、空文字、末尾の文字、範囲外の値は無効で、`<名前>: '<値>' is not a whole number` の例外になる。parse 後は `!= 0` のみを判定し、範囲制限はない（`engine/src/split/src/env.hpp:15-21,33-40`; 読み取り箇所 `engine/src/split/src/prefill.cu:967`）。
 
-| 環境値 | 判定・結果 |
-|---|---|
-| 未設定 | 既定値 `0`。copy-engine ring を使う |
-| `0`, `+0`, `-0` | 無効。copy-engine ring を使う |
-| `1`, `-1`, `2` など範囲内の非 0 整数 | 有効。GPU-thread ring を使う |
-| 空文字、空白を含む値、整数以外、末尾に余分な文字がある値、`long long` 範囲外 | `runtime_error`。設定を無視して続行する fallback はない |
-
-先頭・末尾の空白や小数表記は受け付けません。たとえば ` 1`、`1 `、`1.0`、`1x` は無効です。値域として 0/1 だけに制限する検査はないため、範囲内の任意の非 0 整数が有効です。
+| 条件 | unset | 有効になる値（例） | 無効・OFF になる値（例） |
+|---|---|---|---|
+| split engine の prefill buffer 初期化 | 既定値 `0` で OFF | `1`, `-1`, `+2` など、parse できる任意の非 0 整数 | `0`, `-0` は parse 成功して OFF。`true`, `0anything`, 空文字、前後の空白、整数範囲外は無効値として例外 |
 
 ## 有効になる条件
 
-この変数を読むのは `src/split/src/prefill.cu` の all-cards split engine のみです。Strata の通常エンジン全般に適用される設定ではありません。split engine 自体は CMake の `STRATA_BUILD_SPLIT` が既定 OFF で、Linux の CUDA または HIP 向けの別実行ファイル `strata-split-N` としてビルドされます。実行時にも Strata がその split engine を選択して起動した場合に限り、この変数が使われます。
-
-選択される方式は値に加えて、prefill が実行され、その buffer の初期化が完了することを前提にします。別の環境変数 `FNX_PF_OVERLAP` は `ring_sm` が false のときだけ overlap を有効化できます。`FNX_PF_RING_SM` を非 0 にした経路では `p->overlap` は false となり、overlap 用 ring stream / event を作成しません。CLI 引数や設定値によるこの環境変数の上書きは見つかりません。
+- `STRATA_BUILD_SPLIT=ON` で sFNX engine がビルドされ、Engine の prompt prefill buffer 初期化まで到達する必要がある。split は opt-in で、2–4 枚用の CUDA/HIP target として定義されている（`engine/CMakeLists.txt:922-927`; `engine/src/split/CMakeLists.txt:1-5,116-146`）。
+- 影響するのは prompt prefill の chunk sums だけで、decode の ring 設定 `FNX_RING_F32` を切り替えるものではない（`engine/src/split/src/prefill.cu:340-347,967-975`; `engine/src/split/src/engine.cu:978-980,1032`）。
+- 非 0 のとき `p->overlap` は `false` になるため、`FNX_PF_OVERLAP` が非 0 でも copy-engine ring の overlap は使わない。NVIDIA では `hcs` も `false` になり、`FNX_PF_HCSPLIT` が非 0 でも HCSPLIT は有効にならない（`engine/src/split/src/prefill.cu:1064-1094`）。
+- HIP で RCCL が設定されていても、この分岐では `pf_ring` ではなく `ring_sum` が呼ばれるため、chunk sum は RCCL 分岐を通らない（`engine/src/split/src/prefill.cu:1014-1020,1693-1699,1762-1769`; RCCL 呼び出しは `engine/src/split/src/prefill.cu:723-740`）。
+- `FNX_PF_ROWS` など CLI 引数との優先順位・上書きはなく、この変数は環境から直接読み取られる（`engine/src/split/src/prefill.cu:967`; 関連する初期化条件 `1064-1094`）。
 
 ## 実行時の詳細
 
-`Engine::prefill_alloc()` の中でカードごとの prefill state `Pf` を作る際に値を読み、`ring_sm` に保存します。非 0 の場合は既存の decode ring 設定を引き継いだうえで、prompt 用に `f32=false`、行数 `pf_c_` とし、`in`・`ag`・`flags` の buffer を割り当てます。値の判定結果は `Pf` に保持されるため、この初期化後に環境値を変えても、すでに作られた prefill state の方式は切り替わりません。`static` cache はありません。
+`Engine` の構築中に `prefill_alloc()` が呼ばれ、カードごとの `Pf` を作る際に値を読み込む。`static` cache はなく、この初期化時の値がその `Pf` の `ring_sm` に保持されるため、同じ Engine の実行中に環境を変えても再読込されない（`engine/src/split/src/engine.cu:317-318`; `engine/src/split/src/prefill.cu:854-867,967`）。通常の sfnx 起動では Engine を作ってから server を開始する（`engine/src/split/tools/sfnx.cpp:1122-1139`）。
 
-prefill の attention 側の和と FFN 側の和で `ring_sm` が true なら `ring_sum(...)` を呼びます。false なら `FNX_PF_OVERLAP` が有効な場合は非同期経路、そうでなければ通常の `pf_ring(...)` 経路です。`src/split/src/prefill.cu` の実装コメントは既定 copy-engine path と `FNX_PF_RING_SM=1` の GPU-thread ring を区別しています。`docs/SPLIT_ENGINE.md` は両方式の回答比較として 61 件中 39 件が同一だったと記していますが、これは同資料の対象条件に限る記述で、ここでは独立に再測定していません。
+非 0 の場合、既存の ring 設定を基に prompt 用 ring を設定し直し、fp16 sum、`pf_c_` 行容量の ring buffers を `hpalloc` で確保する。その後 attention sum は `ring_sum(..., p.bo_a, ...)`、FFN sum は `ring_sum(..., p.bo_f, ..., m)` に渡される。0 / unset の場合はこれらの呼び出しを通らず、overlap が有効なら `ring_async`、無効なら `pf_ring` を使う（`engine/src/split/src/prefill.cu:967-975,1693-1699,1762-1769`）。`ring_sum` は chunk サイズと ring 設定に応じて GPU kernel を選ぶ（`engine/src/split/src/kernels.cu:1582-1614`）。
 
-不正な値では `parse_whole` の失敗により `FNX_PF_RING_SM: '<値>' is not a whole number` という例外になります。`sfnx` 実行ファイルでは最上位の例外処理が stderr に `sfnx: <例外内容>` を出して終了コード 1 を返します。Strata launcher の通常の fallback 規則は split engine 起動失敗時に通常の layer split で起動することですが、この不正値が起動時検査で先に報告されるか、選択後に子プロセスで発生するかは経路によります。少なくとも不正値を 0 として扱う実装ではありません。
+## ログと測定値
+
+この変数自体の ON/OFF を示す成功ログは実装にない。整数でない値などを指定すると helper が例外を投げ、sfnx の Engine 構築失敗経路では stdout に `ERR <例外文言>`、stderr に `sfnx: failed: <例外文言>` を出し、終了コード 1 で終了する（`engine/src/split/src/env.hpp:33-40`; `engine/src/split/tools/sfnx.cpp:1097-1103,1122-1135`）。
+
+`docs/SPLIT_ENGINE.md:89-90` は copy-engine ring と `FNX_PF_RING_SM=1` の GPU-thread ring で末尾 bit の算術が異なり、同資料の suite では 61 件中 39 件の回答が一致したと記している。これは資料に記載された結果であり、本調査で測定・再実行した値ではない。
 
 ## 根拠
 
-- `src/split/src/env.hpp:15-22,33-40`: 符号付き十進整数の全体 parse、空・不正文字列・範囲外時の例外、未設定時の default。
-- `src/split/src/prefill.cu:335-339,625-638,738-745`: `Pf` の `ring_sm`、カードごとの初期化時の読み取り、非 0 時の prompt ring 設定と buffer 割り当て。
-- `src/split/src/prefill.cu:821-830,1241-1247,1299-1306`: overlap 条件と attention / FFN sum の ring 分岐。
-- `src/split/src/engine.cu:274-276`: engine 初期化から `prefill_alloc()` を呼ぶ位置。
-- `src/split/tools/sfnx.cpp:1040-1048`: `sfnx` の stderr 例外報告。
-- `strata_cli/launch/runner.py:693-697,1630-1649`: split engine 選択経路と、明示 env dict がない場合に launcher 環境を子プロセスへ渡す箇所。
-- `CMakeLists.txt:2945-2949`, `src/split/CMakeLists.txt:92-123`: split engine が opt-in build で CUDA/HIP 個別ターゲットとなること。
-- `docs/SPLIT_ENGINE.md:3-5,37-48,77`: all-cards split の用途、開始条件、起動失敗時の fallback、GPU-thread ring との比較記載。
+- `engine/src/split/src/env.hpp:15-21,33-40` — 整数 parse と無効値例外。
+- `engine/src/split/src/prefill.cu:854-867,967-975` — 読み取り時期、値判定、prompt ring buffer の設定。
+- `engine/src/split/src/prefill.cu:1064-1094,1693-1699,1762-1769` — overlap / HCSPLIT の条件と chunk sum 呼び出し。
+- `engine/src/split/src/kernels.cu:1582-1614` — `ring_sum` の分岐と kernel dispatch。
+- `engine/src/split/tools/sfnx.cpp:1097-1103,1122-1135` — 初期化エラーの観測方法。
+- `engine/src/split/CMakeLists.txt:1-5,116-146`; `engine/CMakeLists.txt:922-927` — split engine の build 条件。

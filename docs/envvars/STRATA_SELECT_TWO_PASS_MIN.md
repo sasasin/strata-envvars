@@ -1,50 +1,52 @@
 # `STRATA_SELECT_TWO_PASS_MIN`
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の chunked prompt prefill で使う QSA two-pass block scorer の適用下限を、最後の query が持つ block 数で指定します。値は `STRATA_SELECT_TWO_PASS=1` で scorer が要求され、かつ対応する CUDA カード・選択経路などの条件を満たす場合にだけ効果があります。既定値は 4096 blocks（header のコメントでは 16,384 cells 相当）です。
-
-two-pass scorer はまず各 block を single-pass TF32 で採点し、top-k cutoff の誤差境界にかかる block を 3xTF32 で再採点します。閾値はこの scorer を試す prompt 呼び出しの大きさだけを変えます。選択された cells の結果を変える設定ではありません（`src/prefill/prefill.cpp:4399-4412,4423-4436`; scorer の説明: `include/strata/kernels/qsa_two_pass.hpp:1-10`）。
+CUDA の QSA prompt prefill で、二段階 block-score 経路を試す最小 block 数を指定する。既定値は 4096 blocks。`STRATA_SELECT_TWO_PASS=1` で二段階経路を要求した場合に限り、この値以上の batch を候補にする。値を 0 にすると block 数による足切りをなくすが、二段階経路自体を有効化する設定ではない。該当コードは `qsa_two_pass_min_blocks()` と prefill の選択処理にある（`engine/src/kernels/cuda/qsa_select.cu:3911-3917`, `engine/src/prefill/prefill.cpp:5354-5385`）。
 
 ## 値と判定
 
-CUDA 実装は環境変数を `std::atoll` で変換し、変換後の負値を 0 にします。変換・範囲エラーの検査や上限 clamp はありません。
+CUDA 実装は `std::getenv` の戻り値を `std::atoll` に渡す。未設定なら `kMinBlocksDefault`（4096）、設定済みなら先頭の整数部分を使い、負数は 0 に clamp する。空文字や整数で始まらない文字列は `atoll` により 0 になる。先頭空白と符号は整数変換で扱われ、数字の後ろの文字列は検査されない。正の値に上限 clamp はない。したがって、この設定は真偽値や数値文字列全体の厳密な検証ではない（`engine/src/kernels/cuda/qsa_select.cu:3911-3917`）。
 
-| 環境変数の状態・値 | 閾値 |
-|---|---:|
-| 未設定 | 4096 |
-| 空文字、数字で始まらない文字列 | `atoll` が 0 を返すため 0 |
-| 先頭の空白・符号の後に数値がある文字列 | 先頭の整数部分を変換。例: `"  +12tail"` は 12 |
-| 負の数 | 変換後に 0 |
-| 0 または負数以外の整数 | その整数 |
+| 実装 | unset | 例: 閾値 | 例: 0 になる値 |
+|---|---:|---|---|
+| CUDA | 4096 | `4096`, `+12`, `12xyz` → 4096 / 12 / 12 | 空文字、`abc`, `0anything`, `-1`（負数 clamp）→ 0 |
+| HIP | 4096 | この変数を読まず、固定の既定値 | 値は判定に使われない |
 
-文字列全体の妥当性は検査されず、整数の後ろの文字は無視されます。したがって `12tail` は 12、`1.5` は 1 です。数値として解釈できない文字列は無効値としてエラーにならず、0 になります。`atoll` の表現範囲を超える入力はコードで検出・処理していないため、その結果はこの実装から保証できません。根拠: `src/kernels/cuda/qsa_select.cu:3800-3806`。
+`true` は整数として始まらないため 0、` 12` は 12、大文字小文字の区別は文字列判定としては行わない。CLI 引数や設定ファイルによる上書きはこの読み取り経路にはなく、CUDA では環境値が閾値の唯一の入力である。HIP 実装は `qsa_two_pass_min_blocks()` を既定値で返す（`engine/src/kernels/cuda/qsa_select.cu:3911-3917,4008-4018`）。
 
 ## 有効になる条件
 
-- `STRATA_SELECT_TWO_PASS` が文字列全体で厳密に `1` であること。未設定、空文字、`true`、`01` などでは scorer は要求されません（`include/strata/kernels/qsa_two_pass_status.hpp:12-19`; CUDA での読み取り: `src/kernels/cuda/qsa_select.cu:3785-3791`）。この変数が未設定または無効なら、閾値に関係なく two-pass は使われません。
-- CUDA prompt の chunked 選択経路であること。各 chunk の最後の query の `n_bid + 1` が閾値以上なら、その chunk の key 準備を試みます。さらに各 selection batch の `active` blocks も閾値以上である必要があります（`src/prefill/prefill.cpp:4404-4412,4414-4428`）。0 を指定するとこれらのサイズ条件は常に通りますが、ほかの scorer 条件を無効にはしません。
-- scorer が当該 GPU と geometry で実行でき、scratch が足りること。CUDA scorer のサポート判定は sm_80 以上で、`STRATA_QSA_WARP=1` または `select` の経路では対象外です。two-pass 呼び出しは `STRATA_SELECT_OLD` が設定されている場合にも飛ばされます。失敗・非対応時は通常の tensor-core scorer、または fallback scorer に進みます（`src/kernels/cuda/qsa_select.cu:3764-3781,3810-3815,3823-3832`; `src/prefill/prefill.cpp:4422-4434`）。
-- layer-major prompt path では two-pass scorer 自体が使われません。CUDA では `STRATA_SELECT_TWO_PASS=1` が設定されていると、その経路では未使用で選択結果は変わらない旨を一度 stderr に出します（`src/prefill/prefill.cpp:7969-7975`; 文言: `include/strata/kernels/qsa_two_pass_status.hpp:21-33`）。
-- HIP の実装は `qsa_two_pass_min_blocks()` が環境を読まず常に 4096 を返します。また scorer は false を返すため、当変数は HIP では適用されません（`src/kernels/cuda/qsa_select.cu:3897-3907`）。Metal は呼び出し側の two-pass selection 部分が `STRATA_GPU_METAL` 条件で除かれています（`src/prefill/prefill.cpp:4397-4413,4423-4429`）。
+- CUDA build の QSA prompt prefill がこの選択処理を通ること。Metal は呼び出し側で二段階経路のコードを除外する（`engine/src/prefill/prefill.cpp:5355-5370,5381-5386`）。
+- `STRATA_SELECT_TWO_PASS` の値が文字列として厳密に `1` で、二段階経路が要求されること。未設定、空文字、`01`、`1x` などは要求にならず、閾値に達していても利用されない（`engine/include/strata/kernels/qsa_two_pass_status.hpp:12-18`, `engine/src/kernels/cuda/qsa_select.cu:3896-3902`）。
+- 対象 batch の末尾 query の `n_bid + 1` が閾値以上であること。さらに各 selection batch の `active` block 数も閾値以上であること（`engine/src/prefill/prefill.cpp:5365-5369,5371-5385`）。
+- 二段階 scorer が利用可能な CUDA device と query geometry、scratch 条件を満たすこと。device 判定は compute capability 8 以上と kernel shared-memory 属性設定の成功を要求し、`STRATA_QSA_WARP=1` または `select` の場合は無効になる（`engine/src/kernels/cuda/qsa_select.cu:3873-3892,3921-3943`）。
+- `STRATA_SELECT_OLD` が設定されていないこと。設定されていると二段階経路を呼ばず、従来 scorer へ進む（`engine/src/prefill/prefill.cpp:5377-5389`）。
+- chunked CUDA prompt path であること。layer-major prompt path では二段階 scorer は走らない（`engine/include/strata/kernels/qsa_two_pass_status.hpp:2-6`）。
 
-CLI 引数や別の設定値がこの閾値を上書きする処理は見つかりませんでした。`STRATA_SELECT_TWO_PASS` は閾値と独立した必須スイッチであり、`STRATA_SELECT_OLD` は二段階 scorer の呼び出しを抑止します（`src/prefill/prefill.cpp:4404-4412,4422-4434`）。
+条件を満たさない場合は通常の tensor-core scorer、またはそれが使えないときの block scorer に fallback し、その後の `qsa_block_topk` を実行する。閾値自体は選択結果を変更する条件ではなく、二段階 scorer を試す対象範囲を変える（`engine/src/prefill/prefill.cpp:5387-5393`）。
 
 ## 実行時の詳細
 
-CUDA の `qsa_two_pass_min_blocks()` は関数内の `static const int64_t` に値を保存します。初回呼び出し時に一度だけ読み、同プロセスで後から環境を変更しても再評価されません。呼び出し側も `Prefill::run` 内の static 値として閾値を保持します（`src/kernels/cuda/qsa_select.cu:3800-3806`; `src/prefill/prefill.cpp:4404-4412`）。
+CUDA では値を `qsa_two_pass_min_blocks()` 内の function-local `static const` に保存し、prefill 側も `tp_min` を `static const` として保持する。初回評価後のプロセス環境変更は反映されない（`engine/src/kernels/cuda/qsa_select.cu:3911-3917`, `engine/src/prefill/prefill.cpp:5361-5369`）。
 
-chunk 内の最後の query が閾値に達しない場合、`qsa_two_pass_keys` は呼ばれず、通常の scorer が使われます。達していても batch ごとの `active` が閾値未満ならその batch は two-pass になりません。two-pass の実行が始まると stderr に `qsa select: two-pass scores on ...` が一度出て、設定された閾値が表示されます。prompt の最後には実行時の call 数・再採点 block 数などの要約が、カウンターがあれば stderr に出ます（`src/prefill/prefill.cpp:4410-4434`; `src/kernels/cuda/qsa_select.cu:3841-3845`; `src/prefill/prefill.cpp:6398-6421`）。閾値による通常経路への切替自体に警告・エラーはありません。
+prefill chunk の QSA indexer append 完了後、末尾 query の block 数で key preparation を判定する。各 selection batch では末尾 query の active block 数が閾値以上で、二段階 key preparation が成功し、`STRATA_SELECT_OLD` が未設定の場合に二段階 scorer を呼ぶ。二段階 scorer が false を返した場合も既存 scorer に戻る。選択 ids はいずれの場合も `qsa_block_topk` が作る（`engine/src/prefill/prefill.cpp:5323-5342,5361-5393`）。
 
-CUDA kernel の起動エラーは `qsa two-pass keys: ...` または `qsa two-pass scores: ...` と stderr に出して `exit(1)` します。これは閾値の値判定ではなく、two-pass kernel 実行時の失敗経路です（`src/kernels/cuda/qsa_select.cu:3817-3820,3856-3861`）。
+HIP 用実装は `STRATA_SELECT_TWO_PASS_MIN` を読み取らず 4096 を返し、二段階 scorer の stub は常に false を返す。そのためこの変数で HIP の閾値は変更されず、二段階 scorer は実行されない（`engine/src/kernels/cuda/qsa_select.cu:4008-4018`）。
+
+## ログと測定値
+
+二段階 score 経路が実際に呼ばれたとき、最初の呼び出しで stderr に `qsa select: two-pass scores on (STRATA_SELECT_TWO_PASS=1): ...` を一度出し、`qsa_two_pass_min_blocks()` の値を表示する（`engine/src/kernels/cuda/qsa_select.cu:3951-3956`）。閾値に達しない場合、この score-on ログはその理由だけでは出ない。機能要求が device/backend 条件で使えない場合、`STRATA_SELECT_TWO_PASS=1` が設定されていれば stderr に `strata: STRATA_SELECT_TWO_PASS=1 is not used on ...` と一度出る（`engine/include/strata/kernels/qsa_two_pass_status.hpp:21-34`, `engine/src/kernels/cuda/qsa_select.cu:3896-3902,4008-4011`）。
+
+`docs/DETAILS.md` は既定 4096 blocks（16K cells）と RTX 3090 での prompt 測定を記載するが、その測定は同資料が示す `STRATA_SELECT_TWO_PASS` の説明であり、この閾値単独の性能測定ではない（`docs/DETAILS.md:1310-1320`）。
 
 ## 根拠
 
-- 実読み取り、既定値、変換、負値 clamp、static cache: `src/kernels/cuda/qsa_select.cu:3800-3806`。
-- 閾値の宣言と単位（blocks）、既定値: `include/strata/kernels/qsa_select.hpp:106-109`; `include/strata/kernels/qsa_two_pass.hpp:60-62`。
-- 閾値を使う chunk / batch 判定と通常 scorer への fallback: `src/prefill/prefill.cpp:4397-4436`。
-- CUDA device 条件と scorer の実行前提: `src/kernels/cuda/qsa_select.cu:3764-3781,3810-3832`。
-- HIP stub: `src/kernels/cuda/qsa_select.cu:3897-3907`。
-- 補足資料 `docs/DETAILS.md:1124-1134` は、two-pass が opt-in であること、閾値の既定値 4096、対象外経路を説明しています。閾値の値変換は資料に詳述されていないため、上記は実装を根拠としました。
+- `engine/src/kernels/cuda/qsa_select.cu:3911-3917` — CUDA での環境読み取り、既定値、変換、負値 clamp、cache。
+- `engine/src/prefill/prefill.cpp:5354-5393` — prefill 内の閾値判定、他条件、fallback、top-k 呼び出し。
+- `engine/src/kernels/cuda/qsa_select.cu:3873-3892,3921-3943,4008-4018` — CUDA device 条件、二段階 scorer の guard、HIP stub。
+- `engine/include/strata/kernels/qsa_two_pass_status.hpp:12-34` — opt-in switch の厳密な値判定と非対応経路での警告。
+- `engine/include/strata/kernels/qsa_two_pass.hpp:60-62` — 既定値 4096 の定義と単位。
+- `docs/DETAILS.md:1310-1320` — 二段階選択の設計説明と資料記載の測定条件。

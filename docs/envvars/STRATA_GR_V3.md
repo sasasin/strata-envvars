@@ -1,56 +1,59 @@
 # `STRATA_GR_V3`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-CUDA/HIP の fused hyper-connection（GR）多 token read で、既定の multi read の代わりに v3 の down/up 2 カーネル経路を選ぶ実験用スイッチです。v3 は down projection を row group・stream・必要なら列半分に分割し、各部分の値と二乗和を作ってから up カーネルで合成します。計算の加算順が既定経路と異なるため、結果は bitwise 同一とは限りません。
+ハイパーコネクション read の down/up 投影を、通常の multi read からストリーム分割版（`gr_down_v3_kernel` と `gr_up_v3_kernel` の 2 kernel）へ切り替える。加算順が異なるため浮動小数点の丸め結果も異なり、出力が常に bitwise 一致する設定ではない。値は `fused_gr_read_multi_slice` の v3 分岐で使われる（`engine/src/kernels/cuda/fused_gr.cu:4090-4098, 4304-4355`）。
 
-通常の生成経路では Verifier が fused GR を選んだ場合に `fused_gr_read_multi()` を呼びます。関数の API は最大8 tokenをまとめる read で、fused GR 対応形状は `n_embd=2560, hc=4, hc_lr=320` です。環境変数の実処理は CUDA/HIP 実装と SYCL port にあります。CPU の `gr_parity` 実行ファイルにも同名の読み取りがありますが、これは比較テストの許容差を選ぶためのもので、CPU 本番演算を切り替える設定ではありません。
+この切替は fused multi hyper-connection read 経路でのみ評価される。通常の単独 `fused_gr_read` にはこの環境変数の read がない（同 `:4470-4485`; `engine/src/core/verify.cpp:1816-1818`）。生成時に layer の fused read を使うかは別設定・条件にも依存し、`--no-fused-gr`、GPU stages、layer/half dump、stage timing ではその layer 経路が無効になる（`engine/src/program/generate.cpp:6104-6114`; `engine/src/core/layer.cpp:1500-1502`）。
 
 ## 値と判定
 
-製品経路では `std::getenv()` の文字列を `std::atoi(v) != 0` で判定します（`v == nullptr` は無効）。文字列全体の厳密な数値 parse ではなく、`atoi` が数値として読める先頭部分を変換します。
+CUDA と SYCL の実装はいずれも環境値を `std::getenv` で取得し、`std::atoi(value) != 0` で判定する。文字列全体の数値検証はしない。未設定と明示設定は区別される。空文字、`0`、`0anything`、`true`、`false`、数値に変換できない文字列は `atoi` が 0 を返すため OFF。`1`、`1anything`、`-1`、`2` は 0 以外となり ON。先頭空白と符号は `atoi` の規則で処理される（`" 1"` は ON）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効（既定の read） |
-| 空文字 | 無効（`atoi("") == 0`） |
-| `0`、`00`、`0junk`、数値に変換できない文字列 | 無効 |
-| `1`、`2`、`-1`、` 1tail` など、`atoi` の結果が0以外 | 有効 |
+| 実装・条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA `fused_gr_read_multi_slice` | GPU ごとの既定判定 | `1`, `1tail`, `-1`, `2` | 空文字, `0`, `0tail`, `true`, `false` |
+| SYCL `fused_gr_read_multi_slice` | OFF | `1`, `1tail`, `-1`, `2` | 空文字, `0`, `0tail`, `true`, `false` |
 
-大文字小文字による解釈や範囲 clamp はありません。CUDA/HIP と SYCL の製品関数では判定結果を関数内の `static const bool` に保存するため、各プロセスで最初に `fused_gr_read_multi()` がこの判定に到達した後の環境変更は反映されません。Q8 専用経路はこの判定より前に実行して戻るため、そこでは本変数を読みません。
+CUDA で未設定の場合、`STRATA_DEFAULTS=026` でなければ、離散 compute capability 12.0 かつメモリが 13 GiB 超の GPU で既定 ON。ただし `STRATA_SM120_PERF=0` は sm_120 系の既定値を無効にする。sm_121 系では `kGb10GrV3`（現行値は `false`）、`STRATA_SM121_PERF`（未設定または `atoi != 0`）、`sm121_series()` が成立する場合に既定 ON。`STRATA_DEFAULTS=026` はこの自動既定値を OFF にするが、明示した `STRATA_GR_V3` が優先する（`engine/src/kernels/cuda/fused_gr.cu:4099-4113`; `engine/include/strata/core/sm120_series.hpp:60-79, 91-101, 139-144`; `engine/include/strata/core/defaults_026.hpp:1-12, 26-29`）。それ以外、統合 GPU、GPU 情報取得失敗、device index が既定配列の範囲外の場合は既定 OFF。SYCL 実装は GPU 世代に基づく既定値を使わず、未設定は常に OFF（`engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3168-3202`）。
 
 ## 有効になる条件
 
-値が有効でも、次の条件を満たす場合だけ v3 が実行されます。
-
-- fused GR の multi read 経路に入り、Q8 down/up の専用経路に入らないこと。
-- 使用デバイスの共有メモリ条件を満たすこと。
-- CUDA/HIP 実装ではデバイス ID が `0..63` の範囲にあること。
-
-CUDA/HIP 実装はデバイスごとに分割方式を一度決め、最大 token 数で必要な共有メモリ（`8 * 2560 * sizeof(float)`、80 KiB）を確保でき、必要な kernel attribute 設定も成功した場合だけ `split=1` を選びます。必要量の半分（40 KiB）以上だが80 KiB経路を使えないカードでは `stderr` に `strata: STRATA_GR_V3=1 needs the two-half split on this card, which fails its checks (#375): the default read is used` と出し、既定経路に戻ります。半分未満、またはデバイス ID が範囲外なら、同じく既定経路ですがこの警告は出しません。コードには `split=2` 用の launch もありますが、現在の CUDA/HIP の選択分岐は `split=2` を設定しません。
-
-SYCL port ではデバイスの local memory size を上限として調べます。値が0以下なら判定上の上限を48 KiBにします。80 KiB以上なら `split=1`、40 KiB以上80 KiB未満なら前述の二分割チェック警告を出して既定経路、それ未満なら警告なしで既定経路です。SYCL port の選択分岐も `split=2` を設定しません。デバイス index が `0..63` 外の場合も v3 を選びません。
-
-したがって有効値を設定しても全 GPU で v3 が実行されるわけではありません。条件に合わない場合は通常の `launch_multi()` 系経路へ進みます。別環境変数 `STRATA_GR_SPLIT` は gfx906 向けの別経路であり、`STRATA_GR_V3` の値判定を置き換えません。
+- 対象プロセスにこの変数を読む CUDA または SYCL の fused multi read 実装が組み込まれ、その read が呼ばれること。
+- CUDA では、まず Q8 projection weights がある場合は Q8 read を実行して戻る。また `rdna_gr_enabled()` が true なら RDNA read に戻るため、その呼び出しでは `STRATA_GR_V3` を評価しない（`engine/src/kernels/cuda/fused_gr.cu:4286-4305`; RDNA 判定は `engine/src/kernels/cuda/rdna_gr.cu:555-571`）。このため AMD の RDNA 経路で同変数が使われるかは `STRATA_GR_RDNA`、`STRATA_HIP_FAST_DEC`、GPU arch によって変わる。
+- CUDA で v3 が選ばれても、device index が `0..63` の範囲内で、対象 read の `s_down` と `s_up` が null であることが必要。範囲外または scale pointer がある場合は通常 read に進む（`engine/src/kernels/cuda/fused_gr.cu:4306-4312, 4351-4355`）。Q8 weights 自体はその前の分岐で除外される（同 `:4286-4294`）。
+- v3 の down kernel に必要な共有メモリが確保できること。CUDA は必要量 `need1` が device の opt-in 上限（取得失敗時は 48 KiB）以内で、必要な kernel attribute 設定が成功すれば split 1 を選ぶ。SYCL は device local memory が `need1` 以上なら split 1 を選ぶ（`engine/src/kernels/cuda/fused_gr.cu:4311-4348`; `engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3173-3199`）。
+- 生成の通常 layer 経路では fused read の選択条件が先に適用される。`gr_native_mmvf` が有効で、`--no-fused-gr`、GPU-stage、dump、stage-timing の各除外条件に該当せず、さらに model geometry が `fused_gr_supported` を満たす必要がある（`engine/src/program/generate.cpp:6104-6114`; `engine/src/core/layer.cpp:1500-1502`）。Verifier の multi read 経路は `fused_gr_read_persist` が read を処理した場合には呼ばれない（`engine/src/core/verify.cpp:1816-1818`）。
 
 ## 実行時の詳細
 
-`src/core/verify.cpp` は fused GR 対応レイヤーの read 用引数を作り、`fused_gr_read_multi()` を呼びます。CUDA/HIP 実装はまず引数を検査し、Q8 専用経路の対象でなければ `STRATA_GR_V3` を判定します。v3 が選ばれると、down カーネルが部分結果と stream ごとの二乗和を scratch に書き、続く up カーネルがそれらを使って残りの read を計算します。CUDA/HIP では launch error があれば `stderr` に `fused_gr_read_multi v3: <CUDA error>` を出して `exit(1)` します。SYCL 実装にも down/up の二つの kernel submission があります。
+CUDA では Q8/RDNA の早期 return を通過した最初の `fused_gr_read_multi_slice` 呼び出しで `static const int v3_env` が初期化され、以降プロセス内でキャッシュされる。未設定なら GPU 既定を問い合わせる。通常は verifier 初期化時に `fused_gr_check()` が各 card の read を確認する（`engine/src/core/verify.cpp:966-969`）。SYCL も v3 判定を関数内 `static const bool` に保持し、最初の対象 read で一度だけ読む。プロセス中の環境変更は再評価されない（`engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3168-3174`）。
 
-既定経路と summation order が異なるため、精度上の差はコードコメント上も明記されています。`src/kernels/gr_parity.cpp` と `sycl/src/kernels/gr_parity.cpp` の比較テストは、本変数が有効だと既定経路の中間 workspace `lo` の比較を外し、他の出力を相対許容差 `2e-6` で比較します。このテスト側の読み取りも一度だけ評価されます。
+CUDA は共有メモリに `need1` が収まらず、半分の `need2` は収まる場合、既知の S=2 split の検査不一致を理由に stderr へ警告し、その card の split を `-1` にして通常 read を使う。必要量が半分も収まらない場合や device index が範囲外の場合も v3 kernel を使わず通常 readへ進むが、この分岐で専用警告は出さない。SYCL も `need1` 不足で `need2` は収まる場合に同じ警告を出すが、両方とも収まらなければ警告なしで通常 read を使う（CUDA: `engine/src/kernels/cuda/fused_gr.cu:4311-4352`; SYCL: `engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3173-3202`）。
 
-## 文書との照合
+v3 経路は down kernel の部分和と平方和用 scratch を作り、続けて up kernel を起動する。CUDA では launch error を `fused_gr_read_multi v3: %s` と stderr に出して `exit(1)` する（`engine/src/kernels/cuda/fused_gr.cu:4352-4397`）。SYCL は同 read で q8_1 出力を書かず `false` を返す（`engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3289-3296`）。
 
-`docs/INTEL.md` は B70 上の測定として `STRATA_GR_V3=1` の decode 値が既定 port より4〜6%低かったと記し、同設定を opt-in のままにしています。記載された比較条件（Coder 19 / 2,184-token prompts、IQ2_XS 19）に限る報告であり、他の機種・モデルでの性能を示すものではありません。`docs/DETAILS.md` には本変数の説明は見つかりませんでした。
+## ログと測定値
+
+共有メモリ不足時の実装上の警告は次のとおり。
+
+```text
+strata: STRATA_GR_V3=1 needs the two-half split on this card, which fails its checks (#375): the default read is used
+```
+
+CUDA v3 kernel launch error は `fused_gr_read_multi v3: <CUDA error string>` を出してプロセスを終了する。v3 を選んだこと自体を知らせる通常ログはこの分岐にはない（`engine/src/kernels/cuda/fused_gr.cu:4342-4347, 4392-4397`; SYCL の警告は `engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3188-3192`）。
+
+コードコメントと `docs/DETAILS.md` は RTX PRO 5000 72 GB で decode +1.2%（245.1→248.1 tok/s、同一 token）、story prompt +6.4%（token が変化したため速度の主張ではない）、held-out document prompt +4.3%、5 pairs と記載する。また 2x RTX A4000 sm_86 では decode/prompt が -3.0%/-5.9%、RTX 3060 sm_86 では +1.0%/-3.4% とされる。これは資料・コメントにある測定値であり、この調査で再測定していない（`engine/src/kernels/cuda/fused_gr.cu:4091-4097`; `docs/DETAILS.md:1303`）。
 
 ## 根拠
 
-- `include/strata/kernels/fused_gr.hpp:50-60` — fused GR の対応 API、multi read の token 上限と引数。
-- `src/core/verify.cpp:1053-1073` — Verifier が引数を作って multi read を呼ぶ箇所。
-- `src/kernels/cuda/fused_gr.cu:456-464,468-520` — CUDA/HIP v3 kernel の方式と共有メモリ要件。
-- `src/kernels/cuda/fused_gr.cu:1830-1962` — 値の判定、Q8 経路の先行、デバイス別選択、警告、fallback、kernel launch。
-- `sycl/src/kernels/cuda/fused_gr.dp.cpp:1607-1669,1718-1735` — SYCL port の判定、local memory 条件、fallback と kernel submission。
-- `src/kernels/gr_parity.cpp:340-360`、`sycl/src/kernels/gr_parity.cpp:485-505` — parity 比較専用の同名参照と許容差。
-- `docs/INTEL.md:542-544` — B70 の限定された decode 比較と opt-in の記述。
+- `engine/src/kernels/cuda/fused_gr.cu:4090-4113` — 役割と CUDA 未設定時の既定値。
+- `engine/src/kernels/cuda/fused_gr.cu:4252-4309` — 引数・Q8/RDNA 先行経路と環境値の判定。
+- `engine/src/kernels/cuda/fused_gr.cu:4311-4397` — split 判定、警告、v3 kernel 実行と失敗処理。
+- `engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3168-3202, 3289-3296` — SYCL の判定、資源条件と戻り値。
+- `engine/include/strata/core/sm120_series.hpp:139-144`; `engine/include/strata/core/defaults_026.hpp:1-12, 26-29` — GPU 既定ルールと `STRATA_DEFAULTS` との関係。
+- `engine/src/program/generate.cpp:6104-6114`; `engine/src/core/layer.cpp:1500-1502`; `engine/src/core/verify.cpp:966-969, 1816-1818` — production call path の選択条件。
+- `engine/src/kernels/cuda/rdna_gr.cu:555-571` — RDNA read が先に選ばれる条件。
+- `docs/DETAILS.md:1303` — 資料記載の測定値。

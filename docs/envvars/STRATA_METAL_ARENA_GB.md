@@ -1,51 +1,47 @@
 # `STRATA_METAL_ARENA_GB`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal の SSD streaming 経路で、ルーティングされる expert を置く arena の目標サイズを GB 単位で指定します。未設定なら GPU の working set、macOS が圧縮・swap せずに渡せるメモリ、プロセスの footprint 上限などから自動計算します。設定値は自動計算の上限を上書きします。
-
-この変数を読む箇所は `metal/src/engine/window.cpp` の `Window::stream_arena()` です。`stream_` が有効で arena がまだ ready でない場合に呼ばれるため、通常の resident model 経路では使われません（`window.cpp:1016, 2021, 2115`）。
+macOS の Metal 実装で expert を SSD から読むストリーミング経路に入ったとき、expert arena の予算を GB 単位で指定する。これは arena の正確な確保量を保証する設定ではなく、予算に収まる範囲で profile 順の expert slot を選ぶための上限として使われる。各サイズ区分の最低 slot 数は別に確保されるため、実際の arena サイズと一致しない場合がある。`Window::stream_arena` が読み取り、`arena_budget` と `ExpertStream::make_arena` に渡す（`engine/metal/src/engine/window.cpp:1726-1768`, `engine/metal/src/engine/stream.cpp:374-415`）。
 
 ## 値と判定
 
-`std::atof()` で値を `double` に変換します。文字列全体の妥当性は検査せず、変換できる数値の後ろにある文字列は無視されます。
+値は `std::getenv` で取得し、設定されていれば `std::atof` で `double` に変換する。文字列全体の妥当性検査はなく、`atof` が変換できる先頭部分を使う。未変換文字列、空文字、`true` は 0 になる。たとえば `10junk` は 10、` 2.5 GB` は 2.5 として扱われる。大文字小文字の判定はない（`window.cpp:1763-1765`）。
 
-| 入力 | arena の目標サイズ |
-|---|---|
-| unset | 自動計算。最低1 GB |
-| 数値が負 | 自動計算。`arena_gb < 0` として扱われる |
-| 0、空文字、数値で始まらない文字列 | `atof()` の結果は0。明示値として扱われ、後段で最低1 GBに補正 |
-| 0以上の数値 | その数値を10進GB（`1 GB = 1e9 bytes`）に換算 |
-| 数値の後ろに文字がある | 数値部分を変換。例: `2junk` は2 GB相当 |
+| 条件 | unset | 設定時に明示予算となる値 | 自動計算へ戻る値 |
+|---|---|---|---|
+| Metal streaming arena の初期化 | `arena_gb` は -1。GPU working set、利用可能 RAM、footprint cap から計算し、最低 1 GB | 変換結果が 0 以上。値に `1e9` を掛けて byte へ変換 | 変換結果が負数。例: `-1` |
 
-`atof()` が NaN を返す表記は `arena_gb >= 0` の比較を通らず、自動計算になります。正の無限大や、後段の `uint64_t` に収まらない巨大値に対する範囲検査はありません。そのような値の変換結果はこの実装で保証されません。
-
-arena 予算が2 GB未満の場合は stderr に `strata metal stream: only ... GB left for the expert arena ...: expect a low hit rate` を出し、予算を最低1 GBにします。この閾値は警告と下限補正に使われ、2 GB未満の値を一律2 GBにはしません。したがって空文字や `0` は1 GBになります。
+空文字・`abc`・`true`・`0anything` は変換結果が 0 なので明示値として扱われます。計算された予算が 2 GB 未満の場合、stderr に低予算の注意を出し、arena 予算を最低 1 GB に引き上げます。負数は `arena_gb < 0` と判定され、自動計算に戻ります。`nan` も比較が成立せず自動計算側です。数値の上限・下限検査や clamp はなく、正の値はそのまま予算にします。ただし最低 slot 数や Metal buffer 数の制約で指定値どおりに確保できないことがあります（`engine/metal/src/engine/arena_budget.h:111-117`, `engine/metal/src/engine/window.cpp:1763-1773`, `engine/metal/src/engine/stream.cpp:404-415`, `engine/metal/src/engine/stream.cpp:423-450`）。
 
 ## 有効になる条件
 
-- Metal の expert streaming が有効で、`Window::stream_arena()` に到達することが必要です。変数自体に OS/backend の別分岐はありませんが、この実装は Strata の Metal engine に属します。
-- 自動計算では、GPU working set・現在利用可能なメモリ・プロセス footprint と macOS 用の空き・PLE（n-gram table）用 reserve を考慮します。基本の footprint cap は `min(working_set, RAM - leave)` で、64 GB以上の Mac では `leave` に RAM の40%などの条件も使います（`arena_budget.h:80-89, 109-117`）。
-- 0以上の明示値は自動計算を迂回します。計画 footprint が cap を超える場合も値を維持し、stderr の計画ログに `STRATA_METAL_ARENA_GB is above the cap: kept as set (your choice), but a Mac that runs short of memory can freeze ...` を付けます。cap は強制上限ではありません。
-- 明示値は、arena を作る直前のメモリ再確認による縮小も受けず、段階的な fill の空きメモリ判定も通過します。未設定または負値の自動計算時だけ、再確認で小さくなり、段階 fill が macOS に残すメモリを下回りそうなら fill を止めます（`arena_budget.h:144-157`, `window.cpp:1197-1201`）。
-- 計画サイズが大きすぎて4個を超える Metal buffer を必要とする場合、arena 作成は `metal stream: the arena needs more than 4 buffers (lower STRATA_METAL_ARENA_GB)` で失敗します。匿名メモリの map に失敗した場合も作成に失敗します（`stream.cpp:417-427, 433-457`）。
+- Metal の `Window` を使い、expert streaming が有効なときだけ arena 予算に影響する。`STRATA_METAL_STREAM=1` は streaming を強制し、`=0` は無効化する。それ以外または未設定では、`ExpertStream::wanted` が model tensor の合計と Metal working set などから自動判定する（`engine/metal/src/engine/stream.cpp:34-49`; `engine/metal/src/engine/window.cpp:736-744`）。
+- `STRATA_METAL_STREAM=0`、または自動判定で resident 経路になった場合は arena を作らず、この変数は読まれない（`engine/metal/src/engine/window.cpp:738-745`, `engine/metal/src/engine/window.cpp:1726-1729`）。
+- `STRATA_METAL_KEEP_FREE_GB` と `STRATA_METAL_LEAVE_SHARE` は自動予算と表示用 footprint cap に使われる。明示予算は `arena_budget` の自動計算を置き換えるが、cap 自体を変更しない。指定値が cap を超える場合も切り詰めず、そのまま使う（`engine/metal/src/engine/window.cpp:1763-1768`, `engine/metal/src/engine/arena_budget.h:80-89`, `engine/metal/src/engine/arena_budget.h:111-117`）。
+- この変数より優先する CLI 引数や設定ファイルの上書きは、調査対象コードでは確認できない。streaming を選ぶ別条件は `STRATA_METAL_STREAM` である。
 
 ## 実行時の詳細
 
-`Window::stream_arena()` は関数に入るたび `getenv()` を評価し、読み取り結果を static cache しません。値は `ArenaMem::arena_gb` に入ります。arena サイズ決定では0以上ならその値を bytes に換算し、それ以外なら GPU、RAM、footprint の各予算の最小値を使います。自動計算の式は最低1 GBを保証します（`window.cpp:1164-1169`, `arena_budget.h:111-117`）。
+Metal window 初期化時に `ExpertStream::wanted` が streaming の要否を決め、streaming なら SSD stream を開く。環境変数自体は `Window::stream_arena` の実行時、GPU/RAM の状態を収集した後に読み込まれ、arena 予算と footprint 計画を計算する。この関数は最初の decode window または prompt GEMM 初期化から呼ばれるため、プロセス起動直後ではなく arena 初期化時の値が使われる。確保成功後は stream が ready となり、以降この arena に対して再読込しない。初期化が失敗して後で再試行される場合は再度読み込まれる（`engine/metal/src/engine/window.cpp:736-744`, `engine/metal/src/engine/window.cpp:1726-1768`, `engine/metal/src/engine/window.cpp:1795-1807`, `engine/metal/src/engine/window.cpp:3037-3040`, `engine/metal/src/engine/window.cpp:1558-1560`）。
 
-計画時には arena、既存 Metal allocation とプロセス footprint の大きい方、PLE reserve の合計を計算し、`planned resident footprint ...; cap ...` として stderr に出します。PLE table が mmap モードなら table の行数から予約量を見積もり、それ以外は0.5 GBを予約します（`window.cpp:1154-1189`, `arena_budget.h:99-132`）。
+明示予算が 0 以上なら `arena_shrink` は空きメモリ再確認の結果で予定量を減らさず、`arena_grow` も段階ごとの空きメモリ条件で充填を止めない。負値や未設定なら自動予算が適用され、メモリが計画後に減った場合は縮小を再試行し、充填中に macOS の予約分を保てなくなれば未使用 slot を残して停止する（`engine/metal/src/engine/arena_budget.h:144-158`, `engine/metal/src/engine/window.cpp:1797-1806`, `engine/metal/src/engine/stream.cpp:451-458`, `engine/metal/src/engine/stream.cpp:520-539`）。
 
-続いて arena は expert profile の順位を使ってスロットを配置し、最大4 bufferに分けて作成します。明示値があっても、プロファイル内でそのサイズに収まるexpertだけを arena に置きます。fill 後には実際の arena サイズ・slot 数をログに出します。未設定時にメモリ不足で fill が止まると、未使用slotは残し、停止したサイズを stderr に記録します（`stream.cpp:368-444, 479-541`）。
+arena は profile 順に expert slot を埋め、残りの expert は必要時に SSD から読み込まれる。大きな明示予算でも 4 個を超える Metal buffer が必要になると初期化に失敗する。arena 確保や prompt 領域の用意に失敗した場合はエラー文字列を呼び出し元へ返し、推論処理は失敗する（`engine/metal/src/engine/stream.cpp:404-415`, `engine/metal/src/engine/stream.cpp:423-463`, `engine/metal/src/engine/window.cpp:1799-1808`, `engine/metal/src/engine/window.cpp:3037-3040`, `engine/metal/src/engine/window.cpp:3120-3123`）。小さい arena では expert slot 不足時に `strata metal stream: no free slot (layer %d)` を stderr に出して終了コード 6 で終了する経路もある（`engine/metal/src/engine/stream.cpp:676`）。
 
-`docs/MAC.md` は `STRATA_METAL_ARENA_GB=N` を streaming arena のサイズ指定として一覧に挙げ、上限超過時は指定値を維持して警告する旨を記載しています。測定値をこの変数の一般的な性能効果として示す資料は確認していません。関連する MAC のメモリ上限説明は `docs/MAC.md:108`、環境変数一覧は `docs/MAC.md:196` です。
+## ログと測定値
+
+- 予算が 2 GB 未満なら stderr に `strata metal stream: only %.1f GB left for the expert arena (the GPU working set %.1f GB, RAM %.1f GB, %.1f GB allocated): expect a low hit rate` を出す（`engine/metal/src/engine/window.cpp:1769-1774`）。
+- 計画 arena が footprint cap を超えており、かつ変換値が 0 以上なら、計画 footprint の行に `STRATA_METAL_ARENA_GB is above the cap: kept as set (your choice), but a Mac that runs short of memory can freeze (watchdog panics seen at 90+ GB resident of 128)` を追記する。値を cap に丸める処理はない（`engine/metal/src/engine/window.cpp:1781-1791`）。
+- 成功時は計画 footprint、実際に埋まった arena サイズ、充填停止の有無などを stderr に出す（`engine/metal/src/engine/window.cpp:1778-1815`, `engine/metal/src/engine/stream.cpp:536-547`）。
+- `docs/MAC.md:60-67, 276` も streaming 時の arena 指定と cap 超過警告を説明しており、現行コードと整合する。ここに新しい性能測定値は加えていない。
 
 ## 根拠
 
-- 読み取り、単位換算前の取り込み、警告、計画ログ、arena 呼び出し: `metal/src/engine/window.cpp:1123-1127, 1164-1207`。
-- 自動予算、明示値時の縮小・fill 判定、footprint 計算: `metal/src/engine/arena_budget.h:80-117, 120-132, 144-157`。
-- slot 配置、最大4 buffer制限、メモリ確保、fill 結果: `metal/src/engine/stream.cpp:368-457, 479-541`。
-- streaming 経路での呼び出し: `metal/src/engine/window.cpp:1016, 2021, 2115`。
-- 文書との照合: `docs/MAC.md:108, 196`。
+- 直接の読み取り・予算計算・ログ: `engine/metal/src/engine/window.cpp:1726-1806`
+- 予算の明示値と自動計算、cap・縮小・充填の違い: `engine/metal/src/engine/arena_budget.h:80-117`, `engine/metal/src/engine/arena_budget.h:144-158`
+- streaming の選択条件: `engine/metal/src/engine/stream.cpp:34-49`
+- arena の slot 選択、buffer 制限、失敗と成功ログ: `engine/metal/src/engine/stream.cpp:374-475`, `engine/metal/src/engine/stream.cpp:520-574`
+- 初期化と最初の実行からの呼び出し: `engine/metal/src/engine/window.cpp:714-744`, `engine/metal/src/engine/window.cpp:1558-1560`, `engine/metal/src/engine/window.cpp:3037-3040`

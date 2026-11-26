@@ -1,46 +1,51 @@
 # `STRATA_Q36_NO_MMQ`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリ自身が読む環境変数の意味は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Qwen3.6-35B-A3B 用の `strata-q36` エンジンで、prompt 中の routed expert 計算に使う MMQ 経路を無効にします。未設定で、ビルドに MMQ があり、モデル内の全対象 expert weight が対応・適合するときは MMQ 経路を選びます。変数が設定されていれば、MMQ が利用可能でも native grouped kernels を選びます。
+Qwen3.6 エンジンの prompt expert 経路選択で、MMQ を各レイヤーの候補から外す開発・調整用スイッチ。`strata-q36` と、Qwen3.6 (`qwen35moe`) の GGUF を `strata` から実行する専用エンジン `engine/src/qwen35/q36_engine.cu` の `Engine::init()` が参照する。MMQ をビルドしていない場合や、fused 経路が先に選ばれるレイヤーには効果がない（`engine/cmake/strata_gpu_engine.cmake:565-583`; `engine/src/program/generate.cpp:3804-3818`; `engine/src/qwen35/q36_engine.cu:1962-1968,1996-2029`）。
 
-この変数は環境変数を読み取る同じ `q36_engine.cu` を使う `strata-q36` と、Qwen3.5 系モデルでそのエンジンへ切り替わる `strata` に適用されます。CMake では `strata_qwen35` を両 executable にリンクしています（`CMakeLists.txt:631-645`）。
+この変数が無効にするのは Qwen3.6 の prompt expert 用 MMQ 候補である。decode 経路全般や他モデルの MMQ 設定を変える読み取りは、この名前については見つからない。MMQ を候補から外したレイヤーは、条件に応じて Strata の int8 expert kernels または native grouped kernels に回る（`engine/include/strata/kernels/q36_prompt_route.hpp:3-9,23-29`）。
 
 ## 値と判定
 
-| 状態 | 判定 |
-|---|---|
-| 未設定 | MMQ が build に含まれ、後述の type・device 条件を満たせば MMQ を使用可能 |
-| 任意の設定値 | MMQ を無効化。`1` だけでなく、`0`、`false`、空文字列も同じ |
+`std::getenv(...) == nullptr` だけを調べる。文字列を parse せず、値の内容、数値としての妥当性、大文字小文字、空白を検査しない。そのため、**未設定だけ**が MMQ を許可し、空文字を含む設定済みの値は何であっても MMQ を候補から外す（`engine/src/qwen35/q36_engine.cu:1996`）。
 
-実装は `std::getenv(...) == nullptr` を判定するだけで、値の parse や文字列比較はしません。したがって空文字も「設定あり」です。値を `static` に保存するのではなく `Engine::init()` で `use_mmq` に一度取り込み、その Engine の処理中は保存済みの真偽値を使います。初期化後にプロセス環境を変更しても、その Engine の選択は変わりません。
+| 条件 | unset | MMQ を候補にする値 | MMQ を候補から外す値 |
+| --- | --- | --- | --- |
+| MMQ 対応 build | MMQ は他の条件も満たせば候補 | `STRATA_Q36_NO_MMQ` 未設定 | 空文字、`0`、`1`、`false`、`0anything`、その他すべての設定値 |
+| MMQ 非対応 build | 候補なし | なし | 設定有無による追加の変化なし |
+
+ここでいう「候補」は実際の選択を保証しない。MMQ がビルド済みでも、レイヤーの gate/up と down の型が MMQ に対応し、各行数が `MMQ::fits()` を満たす場合にだけ MMQ 候補になる（`engine/src/qwen35/q36_engine.cu:1997-1999,2024-2025`; `engine/include/strata/prefill/moe_mmq.hpp:15-24`）。
 
 ## 有効になる条件
 
-環境変数が未設定でも、次のいずれかなら `use_mmq` は false です。
-
-- MMQ が build に含まれていない。
-- main model の各 layer、または存在する MTP block の gate/up と down の weight type が MMQ の対応 type でない。
-- いずれかの weight type と行数の組み合わせが `MMQ::fits()` を満たさない。
-
-これらの条件は `MMQ::built()`、各 layer/MTP に対する `MMQ::supported()` と `MMQ::fits()` の結果を全て累積して判定します。いずれかで失敗すると native grouped kernels に fallback します。変数を設定した場合は、これらの条件に関係なく MMQ を無効にします。
+- Qwen3.6 専用 engine が組み込まれた CUDA または HIP build で、Qwen3.6 (`qwen35moe`) をその engine で初期化すること。HIP gfx906 build ではこの engine target 自体を作らない（`engine/cmake/strata_gpu_engine.cmake:565-583`）。
+- `MMQ::built()` が true であること。false の場合は `mmq_avail` が false なので、この変数を設定しても MMQ の有無は変化しない（`engine/src/qwen35/q36_engine.cu:1996,2014-2015`）。
+- 少なくとも対象レイヤーで fused 経路が先に選ばれず、gate/up と down の型が `MMQ::supported()` に該当し、`MMQ::fits()` が両方の寸法を受け入れること（`engine/src/qwen35/q36_engine.cu:1997-2011,2024-2025`）。
+- `STRATA_EXPERT_I8=1` で対応 int8 経路が使えるレイヤーでは、その経路が MMQ より先に選ばれるため、この変数を未設定にしても当該レイヤーは MMQ に行かない。MMQ が候補から外れた後も、`STRATA_EXPERT_I8` の状態と int8 kernel の対応可否により int8 または grouped が選ばれる（`engine/include/strata/kernels/q36_prompt_route.hpp:5-9,23-29`; `engine/include/strata/kernels/i8_expert_rule.hpp:29-37`）。
+- 1 レイヤーでも最終経路が grouped のみになると、エンジン全体で `use_pf` を false にし、全レイヤーを native grouped 経路に戻す。したがって、MMQ を外した結果 int8 の対応外レイヤーが残る場合、ほかのレイヤーが MMQ / int8 対応でも prompt path 全体が切り替わる（`engine/include/strata/kernels/q36_prompt_route.hpp:32-34`; `engine/src/qwen35/q36_engine.cu:2022-2041`）。
 
 ## 実行時の詳細
 
-MMQ が有効なとき、`Engine::init()` は MMQ context と routing・量子化用バッファを確保し、stderr に `strata-q36: prompt experts on MMQ (int8)` と出します。無効なときは MMQ 用バッファを作らず、`strata-q36: prompt experts on the native grouped kernels` と出します。環境変数そのものについての警告やエラーはありません（`src/qwen35/q36_engine.cu:1168-1191`）。
+`Engine::init()` の初期化時に一度読み、`mmq_avail` に値を保持してレイヤーごとの `mmq_takes` 判定に渡す。request ごと・prompt chunk ごとの再読み取りや、この変数名を保存する static cache はない。選択済み engine の初期化後に環境を変更しても、この `mmq_avail` の判定は変わらない（`engine/src/qwen35/q36_engine.cu:1962-1968,1996-2029`）。
 
-expert 計算で `T > 8`（prompt chunk）の場合、MMQ 経路は routed entry を expert ごとにまとめ、MMQ で gate/up と down の積を実行します。無効時や条件不成立時は `k_group` の後に `K::native_expert_grouped()` を呼びます。`T <= 8` の decode/小 batch はどちらの場合も native grouped 経路を通るため、この変数による routed expert kernel の差はありません（`src/qwen35/q36_engine.cu:1312-1314,1440-1489`）。
+レイヤーごとの順序は fused → `STRATA_EXPERT_I8=1` で対応する int8 → MMQ → switch が 0 でない状態で対応する int8 → native grouped。MMQ を禁止した場合、最後の2つのどちらかへ進む。MMQ または int8 の経路を使う場合はそれらの prompt 用バッファを初期化する。全レイヤーに grouped 以外の経路があれば hybrid prompt path を使い、そうでなければ全 prompt chunk を grouped kernels に送る（`engine/include/strata/kernels/q36_prompt_route.hpp:23-34`; `engine/src/qwen35/q36_engine.cu:2022-2075`）。
 
-expert が VRAM に収まらない hybrid mode では選択差が追加で現れます。MMQ が有効なら大きな prompt chunk で host/slot experts を staging buffer に stream して MMQ に渡す経路を利用します。無効なら `hybrid_t` を `tmax` にし、staging buffer を確保しません。streamed prompt path はなくなり、expert batch は slots と CPU pool の hybrid rows 経路に入ります（`src/qwen35/q36_engine.cu:1079-1082,1450-1489,1514-1518,2031-2035`）。expert placement や decode の一般設定を直接切り替える変数ではありません。
+このコードから確認できる対象は prompt expert の kernel 経路であり、token 選択や出力が同一であるという保証や、性能差の測定は示されていない。`docs/QWEN36.md` は専用 engine の利用経路と prompt chunk を説明するが、このスイッチの測定値は記載していない（`docs/QWEN36.md:7-24`; `engine/src/qwen35/q36_engine.cu:1996-2041`）。
 
-## 文書との照合と根拠
+## ログと測定値
 
-`docs/DETAILS.md` と関連する設計資料を検索しましたが、この変数固有の動作説明や測定値は見つかりませんでした。上記の説明は調査対象 HEAD の実装に基づき、性能差や出力同一性は断定していません。
+初期化時に選ばれた経路の集計が stderr に出る。int8 経路が1層以上なら `strata-q36: prompt experts: %zu of %zu layers on the fused int8 kernels, %zu on our int8 kernels, %zu on MMQ (int8)`、全層 fused なら `strata-q36: prompt experts on the fused int8 kernels`、fused と MMQ の混在なら `strata-q36: prompt experts on the fused int8 kernels (%zu of %zu layers), the rest on MMQ (int8)`、その他は `strata-q36: prompt experts on %s`（`MMQ (int8)` または `the native grouped kernels`）となる。これらは最終経路を示すもので、変数の設定値自体を表示するログではない（`engine/src/qwen35/q36_engine.cu:2077-2086`）。
 
-- `src/qwen35/q36_engine.cu:1168-1191` — 設定有無、build/type/fit 条件、MMQ context 初期化、stderr の選択ログ。
-- `src/qwen35/q36_engine.cu:1312-1321,1440-1489` — chunk 閾値と MMQ/native grouped expert 経路。
-- `src/qwen35/q36_engine.cu:1511-1518,2031-2035` — streamed prompt と hybrid mode の条件・staging buffer。
-- `include/strata/prefill/moe_mmq.hpp:1-32` — MMQ helper の build・対応 type・fit 条件の説明。
-- `CMakeLists.txt:631-645` — `strata_qwen35` のリンク先。
+この変数による性能・精度の測定値は、対象ソースおよび関連する `docs/QWEN36.md` / `docs/DETAILS.md` から確認できなかった。エラー時に限らない、変数専用の警告や終了経路もない。
+
+## 根拠
+
+- `engine/src/qwen35/q36_engine.cu:1962-1968,1996-2029` — 初期化時の設定有無判定、MMQ と int8 のレイヤー別ルート選択。
+- `engine/include/strata/kernels/q36_prompt_route.hpp:3-9,19-34` — ルートの優先順位と prompt path 全体の条件。
+- `engine/src/qwen35/q36_engine.cu:2033-2042,2058-2075` — grouped 経路による prompt path の fallback と MMQ 用リソース初期化。
+- `engine/src/qwen35/q36_engine.cu:2077-2086` — stderr の経路ログ。
+- `engine/cmake/strata_gpu_engine.cmake:565-583` — Qwen3.6 engine の build target と gfx906 除外。
+- `engine/include/strata/kernels/i8_expert_rule.hpp:29-37` — 相互作用する `STRATA_EXPERT_I8` の parse と MMQ 非対応 build での既定値。

@@ -1,43 +1,45 @@
 # `TRANSFORMERS_OFFLINE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Strata は `TRANSFORMERS_OFFLINE` を自プロセスの設定として読み取らず、値の parse や有効・無効の判定もしません。サーバーの `--offline` が有効なとき、Strata エンジンなどの子プロセスへ渡す環境に `TRANSFORMERS_OFFLINE=1` を設定します。`--offline` が無効なときは、親環境または設定の `env` にこの名前があれば、その値を子プロセスへ引き継ぎます。
+Strata 自身はこの名前を環境から読み取らず、`strata serve --offline` の子プロセス環境へ文字列 `"1"` を設定する。Python サーバーから engine へ渡すオフライン方針の一項目であり、通常の `serve` はこの値を設定しない。設定先の外部ランタイムがこの値をどう解釈するかは Strata の挙動として扱わない。設定処理は `terminal/serve/server.py` の `child_env` と `terminal/strata_control/offline.py` の `OFFLINE_ENV` にある（`terminal/serve/server.py:4007-4049`, `terminal/strata_control/offline.py:42-59`）。
+
+`--offline` は画像 URL の取得拒否や MCP / `before_load` の起動拒否も有効にするが、これらは `TRANSFORMERS_OFFLINE` の値を読む処理ではなく、サーバー内の別の分岐である（`terminal/serve/server.py:9189-9190,9373-9384,9497`; `docs/TERMINAL.md:245`）。
 
 ## 値と判定
 
-| サーバーの状態 | 子プロセスに渡す値 |
-|---|---|
-| `--offline` なし | `os.environ` を複製し、設定の `env` が同名キーを含めばその文字列値で上書きした結果。Strata は内容を解釈しない。親・設定のいずれにもなければ未設定。 |
-| `--offline` あり、通常経路 | `strata_control.offline.OFFLINE_ENV` に定義された文字列 `"1"`。親環境や設定 `env` の値より優先する。 |
-| `--offline` あり、ポリシーモジュールの import に失敗 | fallback として文字列 `"1"` を設定する。 |
+Strata による `TRANSFORMERS_OFFLINE` 自体の読み取り・文字列 parse はない。`child_env` は親環境をコピーし、config の `env` を文字列化して重ね、`offline=True` の場合に最後にオフライン環境一式を上書きする。したがって Strata にとって `0`、`true`、空文字、その他の値に有効・無効の解釈はなく、strict offline 時に限り設定値が必ず `"1"` になる（`terminal/serve/server.py:4010,4027-4028,4037-4049`）。
 
-空文字、`0`、その他の文字列に対する Strata 独自の変換・拒否・fallback はありません。通常経路では値を比較せず辞書にコピーし、offline 経路では既存値を定数 `"1"` で置き換えます。
+| `child_env` の条件 | 親の値が未設定 | 親または config の値が `""` / `"0"` / `"true"` / その他 |
+|---|---|---|
+| `offline=True` | `"1"` を設定 | 元の値を `"1"` で上書き |
+| `offline=False` | 親環境由来の値は未設定のまま（ただし config の `env` に指定があればその値を設定） | 親環境または config の値をそのまま引き継ぐ。真偽値判定・正規化なし |
 
 ## 有効になる条件
 
-- `serve/server.py` の Strata エンジン起動経路で `--offline` を指定したときに適用されます。CLI の `--offline` はフラグ引数です（`serve/server.py:9000-9001`）。
-- `--offline` 指定時に MCP サーバーまたは `before_load` コマンドがあると起動前に拒否し、オフライン非対応の profile 条件もポリシー判定後に拒否します。これらの拒否は `TRANSFORMERS_OFFLINE` の値ではなく `--offline` によります（`serve/server.py:9172-9184`）。
-- 単一エンジン、replica、split の各 Strata エンジン起動で `offline` 状態を `child_env` に渡します（`serve/server.py:8710,8777,9193,9274-9279`）。backend、OS、GPU、build macro による `TRANSFORMERS_OFFLINE` 固有の分岐はありません。
-- サーバーが `--offline` なしで起動した場合、この名前を `--offline` の代わりに使うことはありません。子プロセスへの値の引き継ぎだけが行われます。
+- 有効化の根拠は `TRANSFORMERS_OFFLINE` の設定有無や内容ではなく、サーバーの `offline` 引数である。直接の server CLI では `--offline` が指定された場合に true になる（`terminal/serve/server.py:9189-9190`）。
+- Strata CLI はコマンドライン指定、保存済み profile、run config、既定値 `false` の順で `offline` を決め、true の場合に server 引数へ `--offline` を追加する。CLI で省略された `false` は未指定扱いとなり、保存済み profile や run config の値を使う（`terminal/strata_cli/cli.py:783-803,835-843`）。
+- `--offline` で MCP server または `before_load` コマンドを構成している場合、起動前に parser error で拒否する。offline policy が remote image source を検出した場合も拒否する（`terminal/serve/server.py:9373-9384`; `terminal/strata_control/offline.py:137-164`）。
+- 実際の `child_env` 適用先は `--engine strata` の engine 起動で、単一 engine、replica、split、split fallback の各経路が `offline` 状態を渡す。`--engine mock` はこの Strata engine 子プロセス経路を使わない（`terminal/serve/server.py:8820,8850-8852,8918-8919,9386-9394,9472-9477`）。
+- 画像 encoder は通常 engine 環境を引き継ぐが、`vision.env` はその後に重ねられるため、ここで同名のキーを指定すれば encoder 向け値は上書きされる。これは engine の `child_env` で設定した値には影響しない（`terminal/serve/server.py:4134-4156,9422-9423`）。
 
 ## 実行時の詳細
 
-`child_env()` は呼び出し時の `os.environ` を複製し、profile の `env` を文字列化して反映します。その後 `offline=True` ならポリシー辞書を最後に適用するため、profile が `TRANSFORMERS_OFFLINE` を空文字や `0` に指定していても、子プロセスへは `1` が渡ります。ポリシーモジュールを import できない場合も `1` を直接設定します（`serve/server.py:3747-3777`, `strata_control/offline.py:47-60`）。
+`child_env` 呼び出しごとに親プロセスの `os.environ` をコピーして環境辞書を作る。設定を static cache する処理はなく、サーバー起動時に作られた辞書が engine 起動へ渡る。`offline=True` では profile の `env` 指定より後に `OFFLINE_ENV` を適用するため、profile が `TRANSFORMERS_OFFLINE` を別値にしても engine 向け値は `"1"` になる（`terminal/serve/server.py:4007-4028,4037-4049`）。
 
-通常の Strata エンジン起動では、その辞書を `StrataEngine` に渡し、`popen()` の `env` として子プロセスに渡します（`serve/server.py:9191-9194,9278-9279,1017-1019,1076-1079`）。vision encoder も `vision_env(cfg, env)` を通じて同じ環境辞書を受け取り、`Vision` の `popen()` に渡します（`serve/server.py:3921-3946,9202-9224,2844-2850`）。replica / split 経路も各エンジンの起動時に `child_env(..., offline=offline)` を使います（`serve/server.py:8704-8710,8768-8777`）。エンジン再起動用には起動時の環境辞書が `self.spawn` に保存されるため、同じサーバープロセス内で親環境を書き換えても、その既存エンジンの再起動環境は更新されません（`serve/server.py:1017-1019`）。値を読む static cache はありません。
+この値は server 自身の `TRANSFORMERS_OFFLINE` を切り替えず、起動した子の環境だけに設定される。通常起動で親が設定済みの場合は、config の top-level `env` に上書きがなければ値が子へそのまま継承される。実行中に親環境が変わることを再読する箇所はない（`terminal/serve/server.py:4010,4027-4049`）。
 
-`strata_control.offline.child_environment()` にも同じポリシー辞書を適用する処理がありますが、調査対象 commit の本番コードからの呼び出しは見つかりませんでした（定義 `strata_control/offline.py:122-136`、参照は `tests/tuning/test_offline.py` のテスト）。サーバーの実経路は `serve/server.py:3747-3790` の `child_env()` です。
+## ログと測定値
 
-この変数についての Strata 固有ログ、警告、終了・失敗経路はありません。offline profile の拒否時には `argparse` のエラーとして `--offline requires MCP servers and before_load commands to be disabled in this profile`、または `--offline cannot be strict for this profile: ...` が出ますが、これも変数の値を評価した結果ではありません（`serve/server.py:9173-9184`）。子プロセス側や外部ライブラリが `TRANSFORMERS_OFFLINE` をどう解釈するかは、本調査の対象外です。
+`TRANSFORMERS_OFFLINE` の設定・上書きだけを示すログはない。offline preflight が構成を拒否する場合、`argparse` の parser error として `--offline requires MCP servers and before_load commands to be disabled in this profile` または `--offline cannot be strict for this profile: ...` を出す（`terminal/serve/server.py:9373-9384`）。画像要求に HTTP(S) URL が含まれる場合は `offline mode cannot download an image URL` または `offline mode cannot download an image URL; send a data: image instead` の拒否経路がある（`terminal/serve/server.py:5501-5502,5562-5573`）。これらのログ・拒否は同名環境変数の値を parse した結果ではない。
 
 ## 根拠
 
-- 変数名・値の定義: `strata_control/offline.py:44-60`
-- 子環境の作成、profile 値の後勝ち適用、import fallback: `serve/server.py:3747-3790`
-- `--offline` 引数、profile preflight、通常エンジン / vision encoder への env 受け渡し: `serve/server.py:9000-9001,9172-9194,9202-9224,9273-9279`
-- replica / split の各子プロセスへの env 受け渡し: `serve/server.py:8688-8710,8757-8777`
-- エンジン起動と再起動用状態への環境保存、`popen` への受け渡し: `serve/server.py:1017-1019,1076-1079`
-- 本番で呼び出されない共通 helper: `strata_control/offline.py:122-136`（呼び出し検索ではテストのみ）
+- `terminal/serve/server.py:4007-4049` — 子環境の構築、config 環境値の適用順、strict offline 時の上書きと ImportError fallback。
+- `terminal/strata_control/offline.py:42-59,120-134` — `OFFLINE_ENV` の値と helper の環境辞書処理。
+- `terminal/serve/server.py:9189-9190,9373-9394,9472-9497` — `--offline`、preflight、engine 起動経路と Service への状態設定。
+- `terminal/strata_cli/cli.py:783-843` — CLI / saved profile / run config / default の優先順位と server 引数への変換。
+- `terminal/serve/server.py:4134-4156,9422-9423` — vision encoder が engine 環境を継承し、専用 `vision.env` を後から重ねる処理。
+- `terminal/serve/server.py:5501-5502,5562-5573`; `docs/TERMINAL.md:245` — offline 時のリモート画像 URL 拒否。

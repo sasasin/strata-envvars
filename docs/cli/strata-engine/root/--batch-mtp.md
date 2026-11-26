@@ -1,67 +1,61 @@
 # `--batch-mtp`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数 parser） |
+| コマンド | `strata`（推論エンジン、root 引数） |
 | オプション | `--batch-mtp` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。既定は無効 |
+| 値 | 値を取らないフラグ |
 
 ## 役割
 
-`--serve --batch` の各有効 slot で、通常の次 token に加えて MTP（multi-token prediction）draft を1 token 提案し、同じ verify window で検証します。提案 token が target 側の出力と一致し、終了条件や出力上限に抵触しなければ採用します。既定では無効です（`src/program/generate.cpp:670`, `910-915`, `11601-11612`）。
+`--serve` と `--batch` による複数リクエスト処理で、各 batch slot に MTP drafter を持たせ、各 slot の次 token と MTP 提案 token を同じ検証 window で検証します。提案が target の予測と一致すれば、上限や停止条件に反しない範囲で追加 token として採用します。既定では無効です。
 
 ## 使い方
 
 ```sh
-strata --pack ./model --serve --batch 4 --mtp ./draft --spec 4 --batch-mtp
+# MTP runtime と speculative window を指定し、4 slot の server を起動する
+strata --native MODEL.gguf --mtp DRAFT_RUNTIME --spec 4 --batch 4 --batch-mtp --serve
 ```
 
-`--batch` は2以上、`--mtp` は MTP draft のパス、`--spec` は2以上を指定します。オプション自体は値を受け取りません。エンジンの help も `--serve` の `--batch` に付随する opt-in と説明しています（`src/program/generate.cpp:910-915`）。
+モデル・draft runtime のパスは利用環境に合わせてください。server は起動後、標準入力の要求を処理します。
 
 ## 値と既定値
 
-- parser は `--batch-mtp` を見つけると真偽値を `true` にします。値を消費せず、`Options::batch_mtp` の初期値は `false` です。繰り返し指定しても有効化されるだけで、個別の重複エラーはありません（`src/program/generate.cpp:670`, `2618`）。
-- 同じ機能は `STRATA_BATCH_MTP` でも有効化できます。環境変数が存在し、空でなく、先頭文字が `0` でない場合に有効です。CLI flag と環境変数の論理和で判定します。したがって `STRATA_BATCH_MTP=0` と空文字は無効、`00` も先頭が `0` のため無効です（`src/program/generate.cpp:5299-5300`）。関連する環境変数の説明は [`STRATA_BATCH_MTP`](../../../STRATA_BATCH_MTP.md) を参照してください。
-- 値なしフラグのため、数値範囲 validation はありません。必要条件を満たさない場合は起動エラーにせず、警告して batch MTP を無効化します（`src/program/generate.cpp:5301-5321`）。
+- 引数値は取りません。parser は `--batch-mtp` を受けると boolean を true にします。複数回指定しても同じ true のままです（`engine/src/program/generate.cpp:4050`）。
+- 既定値は off です（`engine/src/program/generate.cpp:1027`）。
+- 環境変数 `STRATA_BATCH_MTP` でも有効化できます。未設定・空文字列・先頭文字が `0` の値は off、それ以外の非空値は on です。従って値を `false` としても off にはなりません（`engine/src/program/generate.cpp:7841-7842`）。
 
 ## 実行時の動作
 
-有効時、各 slot 用の `MtpDrafter` を `--batch` 個ロードし、それぞれの draft 数を1にします。draft の重みは solo drafter と共有しますが、slot ごとに private K/V state と buffer を確保します。layer split 時は drafter を最終 stage の GPU に置きます。起動時に slot 数、GPU、slot ごとの private state/buffer の MiB、空き VRAM を stderr に表示します（`src/program/generate.cpp:5520-5543`）。
+- 有効化条件は `--batch 2` 以上、`--serve`、`--spec` 2 以上、および `--mtp` の指定です。条件を満たさない場合は標準エラーに warning を出して batch MTP を無効にし、可能なら通常の batch serving を続けます（`engine/src/program/generate.cpp:7843-7857`, `7870-7873`）。
+- 起動時に slot ごとの `MtpDrafter` を作成し、MTP runtime を読み込んで各 drafter を準備します。slot drafter は solo drafter の重みを共有しますが、slot ごとの K/V state と buffer を確保します。GPU メモリを追加で消費し、確保または bind に失敗するとエンジン起動は失敗します（`engine/src/program/generate.cpp:8351-8379`, `13641-13660`）。
+- 各 decode window では slot ごとに通常 token の行と提案行を verifier に渡します。提案を採用するのは target がその token を選び、停止 token・stop 条件・生成上限・context 上限に抵触しない場合です。採用行を commit し、slot ごとの提案数と採用数を記録します（`engine/src/program/generate.cpp:17119-17123`, `17175-17199`, `17260-17289`）。
+- batch MTP の window は `kVerifyNarrowT` 行までです。各 slot が 2 行を使うため、上限を超える slot は window ごとに順番に処理されます。plain batching で使う広い window と異なるため、batch slot 数が多い場合も一度に全 slot を検証するわけではありません（`engine/src/program/generate.cpp:17119-17123`, `17175-17199`）。
+- verifier の batch graph cache は上限 64 に設定されます（`engine/src/program/generate.cpp:13408-13413`, `13489-13497`）。
 
-各 MTP slot は verify window 内で現在 token と提案 token の2 row を使います。window は最大8 row なので、通常の slot を1 rowずつ処理する場合より一度に処理できる slot 数が少なくなり、必要に応じて slot をローテーションします（`src/program/generate.cpp:910-915`, `11525-11549`）。target 出力が提案 token と一致し、EOS・stop 条件がなく、2 token 分の生成上限と context 上限を超えない場合だけ提案を採用します。不一致時は通常 token のみを commit します（`src/program/generate.cpp:11601-11612`）。
+## 適用条件と相互作用
 
-## 適用条件と副作用
-
-有効化には以下が必要です。条件を満たさないと stderr に `WARNING: --batch-mtp is off: ...` と理由を出し、通常の batch 処理を続けます（`src/program/generate.cpp:5301-5321`）。
-
-- `--serve` と `--batch 2` 以上。
-- `--mtp` の指定と `--spec T`（`T >= 2`）。
-- layer split を使う場合、各 stage が別 GPU 上にあること。`--split-device 0` のように同一 GPU 上へ置く構成は対象外。
-- layer split で helper expert cache または `--remote-expert-opt` を使わないこと。
-- layer split の複数 slot group pipeline と併用しないこと。`--batch-groups G` が1より大きく解決される場合は無効になります。
-
-layer split で `--batch-groups` を省略した場合、自動 group selection が pipeline を選ぶことがあります。その既定は `--batch-mtp` を落とす動作です。明示的な `--batch-groups auto` も pipeline を要求するため、複数 group なら `--batch-mtp` と併用できません。serial window を使うには `--batch-groups 1` を指定できます。また、`STRATA_BATCH_MTP_SERIAL` が有効で、`--batch-groups` を指定していない場合も、自動既定を1 groupにします。詳細は [`STRATA_BATCH_MTP_SERIAL`](../../../STRATA_BATCH_MTP_SERIAL.md) と `include/strata/program/batch_groups.hpp:50-65` を参照してください。
-
-有効時は GPU 上に slot ごとの draft state/buffer が増えるため、VRAM を消費します。verifier は slot rotation による多様な row layout に備え、captured batch graph の保持数を64に制限します（`src/program/generate.cpp:9166-9169`; 上限 API: `include/strata/core/verify.hpp:225-226`）。
+- layer split では各 stage が別 GPU にある構成が必要です。同じ GPU を共有する stage では無効になります。また、helper expert cache を使う layer split では無効になります（`engine/src/program/generate.cpp:7845-7848`, `7866-7869`）。
+- Metal build では batch window が request ごとに 1 行を使い、提案行を検証できないため、この機能は無効になります。通常の batch は続行します（`engine/src/program/generate.cpp:7849-7856`）。
+- layer split の pipelined `--batch-groups` は通常 batch MTP と両立せず、該当時は warning を出して slot drafts を実行しません。`STRATA_PIPED_MTP` を opt-in すると pipelined group でも提案を扱う別経路があります。serial window を選ぶには `--batch-groups 1` または `STRATA_BATCH_MTP_SERIAL=1` が使われます（`engine/src/program/generate.cpp:7812`, `7857-7865`, `7875-7884`, `17529-17547`）。
+- Qwen3.6 family は共通 parser の後段ではなく family 専用 parser に振り分けられます（`engine/src/program/generate.cpp:3804-3818`）。索引上も同じ `--batch-mtp` は `strata-engine/qwen36/` の別 scope にあります。その parser では `--batch N` と `--mtp N` の要件・動作を個別に定義しているため、この文書の条件を適用しません（`engine/src/qwen35/q36_engine.cu:5383`, `5559-5560`、[索引](../../README.md)）。
 
 ## 出力とエラー
 
-- 条件不成立は警告のみで、`--batch-mtp` をオフにして続行します（`src/program/generate.cpp:5318-5321`）。
-- slot drafter の load または bind、slot residual buffer の GPU allocation に失敗すると、理由を stderr に出し、engine は終了コード `1` で戻ります（`src/program/generate.cpp:5525-5530`, `9182-9196`）。
-- 実行中、生成 token は server の stdout protocol `BT <slot> <token>`、slot 完了は `BDONE ...` で出力されます。window 終了時の verifier/commit 失敗や draft 失敗は `ERR ...` を stdout に出して batch 処理を失敗させます（`src/program/generate.cpp:11610-11612`, `11640-11673`）。
-- batch summary が出るとき、受理された MTP proposal 数と総提案数を stderr に表示します（`src/program/generate.cpp:11730-11733`）。
-- layer split の pipeline が残った場合は、slot drafter の VRAM は確保されたまま draft が実行されない旨を stderr に警告します（`src/program/generate.cpp:11739-11747`）。通常は事前の group gate で無効化されます。
+- 条件不成立時や pipelined group で提案を使えない場合、stderr に warning を出し、batch MTP を外して処理を続ける経路があります（`engine/src/program/generate.cpp:7870-7873`, `17543-17547`）。
+- 起動時の slot drafter の load/bind や residual buffer 確保に失敗すると stderr に slot と理由を出し、終了コード 1 で終了します（`engine/src/program/generate.cpp:8362-8366`, `13645-13660`）。decode 中の drafter/commit 失敗は `ERR` 行を stdout に出し、batch 処理を失敗させます（`engine/src/program/generate.cpp:17274-17276`, `17377-17394`）。
+- server の batch 統計出力では MTP 提案の採用数を stderr に出します（`engine/src/program/generate.cpp:17520-17523`）。
 
 ## 根拠
 
-- parser・既定値・help: `src/program/generate.cpp:670`, `910-915`, `2618`
-- `STRATA_BATCH_MTP` の判定、条件 validation と警告: `src/program/generate.cpp:5299-5321`
-- slot drafter の生成・配置と起動時表示: `src/program/generate.cpp:5520-5543`
-- verifier graph 上限と初期化: `src/program/generate.cpp:9166-9173`; `include/strata/core/verify.hpp:225-226`
-- proposal row、採否、commit、server 出力: `src/program/generate.cpp:11525-11549`, `11601-11612`, `11640-11673`
-- batch summary と pipeline 警告: `src/program/generate.cpp:11730-11747`
-- group の自動解決: `include/strata/program/batch_groups.hpp:50-65`
+- `engine/src/program/generate.cpp:1027` — boolean の既定値。
+- `engine/src/program/generate.cpp:1317-1323` — CLI help に記載された `--batch` / `--batch-mtp` の用途と概要。
+- `engine/src/program/generate.cpp:4040-4056` — root parser での引数処理と関連する `--batch`、`--spec`、`--mtp`。
+- `engine/src/program/generate.cpp:7841-7878` — 環境変数、有効化条件、無効化条件、pipelined MTP の選択。
+- `engine/src/program/generate.cpp:8351-8379`, `13641-13660` — slot drafter の load/bind と VRAM 確保。
+- `engine/src/program/generate.cpp:17119-17289`, `17377-17394` — decode window の行構成、提案採用、commit、失敗経路。
+- `engine/src/program/generate.cpp:3804-3818`; `engine/src/qwen35/q36_engine.cu:5383`, `5559-5560` — Qwen3.6 family の別 parser への振り分けと別条件。

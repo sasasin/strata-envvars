@@ -1,56 +1,48 @@
 # `STRATA_SPLIT_COVER_B`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部依存の環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--serve --layer-split auto` の複数 GPU 配置探索で、expert profile の順位から各 expert の予測 routed mass を作る coverage curve の指数 `b` を指定します。探索はこの mass を使って各候補配置の expert cache hit 率と予測 decode window 時間を比較し、layer 境界を決めます。CUDA と SYCL に実装があります。
-
-`STRATA_SPLIT_COVER_B` が設定されていると、2 GPU・3 GPU でも従来の順位べき乗則ではなく coverage curve を使うため、指数値だけでなく探索モデルそのものも切り替えます。4 GPU 以上では変数が未設定でも coverage curve が使われます。
+`--serve --layer-split auto` の配置探索で、GPU キャッシュに入る expert profile の各順位に割り当てる「ルーティング質量」を決めるカバレッジ曲線の指数 `b` を上書きする。CUDA 実装は `engine/src/program/generate.cpp`、SYCL 実装は `engine/sycl/src/program/generate.cpp` にあり、探索スコアのキャッシュ miss 費用を変えて自動 split 境界に影響する。モデル実行時のルーティングや生成 token を直接変更する値ではない（CUDA: `engine/src/program/generate.cpp:7038-7055,7085-7108,7510-7515`、SYCL: `engine/sycl/src/program/generate.cpp:3970-3987,4007-4023,4173-4178`）。
 
 ## 値と判定
 
-| 状態 | `b` | coverage curve の選択 |
+両実装とも `std::getenv` で設定の有無を調べ、設定されていれば `std::atof` で `double` に変換する。文字列全体の検証、範囲検査、clamp、変換失敗時のエラーはない。`atof` が数値として読める先頭部分を変換するため、先頭の空白や符号は許容され、後続文字は無視される。変換できない文字列や空文字は `0.0` になる。したがって `0`、`0anything`、`true`、空文字はいずれも指数 0 として扱われる一方、変数が設定されているためカバレッジ曲線自体は有効になる。`3abc` は 3 として扱われる。未設定だけが「変数なし」である（CUDA: `engine/src/program/generate.cpp:7041,7047-7055`、SYCL: `engine/sycl/src/program/generate.cpp:3973,3979-3987`）。
+
+| GPU 数（`ns`）と設定 | `b` | 使用する順位質量 |
 |---|---:|---|
-| 未設定 | `3.0` | 2・3 GPU では旧式の `(r+1)^-1.2`。4 GPU 以上では coverage curve |
-| 設定あり | `std::atof()` の結果 | GPU 数にかかわらず coverage curve |
+| 2 または 3 GPU、未設定 | 3.0（ただし曲線式には使わない） | 旧式 `(r+1)^-1.2` |
+| 4 GPU 以上、未設定 | 3.0 | `(1-r/n)^b - (1-(r+1)/n)^b` |
+| 任意の GPU 数、設定あり | `atof` の結果 | 同じカバレッジ曲線式 |
 
-設定値は文字列全体の検証なしに `std::atof()` で `double` に変換されます。したがって、`2.5` は `2.5`、`2.5tail` は先頭の数値部分 `2.5`、空文字や数値に変換できない文字列は `0` になります。空文字でも環境変数自体は設定済みなので、2・3 GPU で curve を選ぶ条件が成立します。値の範囲検査や clamp はありません。負値、ゼロ、非常に大きな値、`atof()` が受理する非有限値を設定した場合もそのまま式へ渡され、意図した coverage になる保証はコードにありません。
-
-curve は profile 件数を `N`、順位を `r`（0 始まり）として、各順位の mass を
-
-`(1 - r/N)^b - (1 - (r+1)/N)^b`
-
-で求めます。これは prefix の held fraction `f` に対して `H(f)=1-(1-f)^b` とする配分です。4 GPU 以上で未設定なら `b=3.0` が使われます。2・3 GPU で未設定の旧式では順位ごとに `(r+1)^-1.2` を使います。
-
-根拠: CUDA `src/program/generate.cpp:3754-3769`、SYCL `sycl/src/program/generate.cpp:3588-3603`。
+ここで `r` は profile 順位、`n` は profile 件数。`b=3` が既定値で、明示値に対する有効範囲は設けられていない。0、負値、非有限値、NaN 等も拒否されず、そのまま `pow` と後続計算へ渡るため、そうした入力で探索値がどうなるかは入力文字列から単純な有効/無効判定にできず、正常な配置探索結果も保証されない。CUDA: `engine/src/program/generate.cpp:7040-7055`、SYCL: `engine/sycl/src/program/generate.cpp:3972-3987`。
 
 ## 有効になる条件
 
-- `--serve` で `--layer-split auto` を指定し、複数 GPU の split が成立している必要があります。1 GPU しか見えない場合、コードは `--layer-split auto` を解除します。
-- 配置探索へ入る条件は `multi_gpu && split_auto` です。固定境界の `--layer-split K[,K2...]` では、この読み取り箇所による効果はありません。
-- auto split の探索内で expert profile の順位表が mass の入力になります。profile が空なら順位ごとの mass は作られず、この変数が profile を生成したり実測 routing 頻度を読み込んだりする処理もありません。
-- その他の探索条件（VRAM 容量、各 stage の layer range、profile 順位、miss cost など）は独立して残り、環境変数はその評価を使う配置探索の予測 mass を変えるものです。
-
-根拠: CUDA `src/program/generate.cpp:2299-2348,3692-3695`、SYCL `sycl/src/program/generate.cpp:3537-3541`。
+- 対象経路は server モードの `--layer-split auto`。層 split の指定は `o.serve` が真であることを要求し、1 GPU しか見えない場合は「no split」として自動指定を解除する（CUDA: `engine/src/program/generate.cpp:4803-4808,4836-4839,4848-4853`）。
+- split が複数 GPU で実行されること。`--split-skip-if-fits` などで `multi_gpu` が解除されると自動配置探索に入らない（CUDA: `engine/src/program/generate.cpp:4856,6450-6480,6959-6961`）。
+- 複数 GPU の layer split には `--expert-profile` が必要。profile の読み込みに失敗すればエラー終了し、未指定なら「a layer split across GPUs needs --expert-profile」で終了する（CUDA: `engine/src/program/generate.cpp:4895-4899,6746-6751`、SYCL: `engine/sycl/src/program/generate.cpp:2354-2357,3781-3784`）。
+- 2 または 3 GPU では未設定時に旧式の質量式を使うが、空文字を含め何か設定すると新しい曲線を選ぶ。4 GPU 以上では未設定でも新しい曲線になる（CUDA: `engine/src/program/generate.cpp:7044-7055`、SYCL: `engine/sycl/src/program/generate.cpp:3976-3987`）。
+- `--layer-split K[,K2...]` の手動境界ではこの auto 探索ブロックを通らない。CLI に `b` を指定する引数はなく、環境変数が指数の唯一の上書き手段。
+- CUDA と SYCL の双方に実装がある。OS 固有条件や追加 build macro 条件はこの分岐にない。その他の backend に同じ名前の読み取りは見つからなかった。
 
 ## 実行時の詳細
 
-CUDA/SYCL それぞれの `generate.cpp` で、auto split の探索に入った後に `getenv()` で値を取得します。プロセス起動時に一度だけ保存する `static` 変数ではなく、その探索処理で読みます。コードにリクエストごとの再読込はなく、ここで決めた mass 配列がその配置探索の候補評価に使われます。
+設定値を読むのは `multi_gpu && split_auto` の自動配置探索に入ったときで、各プロセスの初期化中にその探索用の `cover_b` と `coverage_curve` を算出する。関数 `static` に保存する cache はなく、リクエストごとの読み取りでもない。このコード内で起動後に環境変数を書き換える処理は見つからず、通常は次回プロセス起動時に反映される（CUDA: `engine/src/program/generate.cpp:6959-6961,7040-7048`、SYCL: `engine/sycl/src/program/generate.cpp:3921-3924,3972-3979`）。
 
-候補配置では、profile の各 rank を担当 stage に割り当て、各 stage の cache 容量に入る expert の mass を合計します。未 cache の mass は `STRATA_SPLIT_MISS_MS` および stage ごとの link scale と組み合わされ、layer 処理時間と合わせた予測時間になります。最終的な選択結果は `layer split auto: K=... - predicted ... ms per decode window; the caches ...` の stderr 行に出ます。このログは予測値であり、実測性能を示すものではありません。
+カバレッジ曲線は各順位 `r` の質量差を作り、配置候補ごとに profile 順の expert を各 stage の容量へ入れて、保持質量と miss 費用を見積もる。CUDA では各 stage の未保持質量に `STRATA_SPLIT_MISS_MS` と stage ごとの link scale を掛け、層処理時間と足して候補を比較する（`engine/src/program/generate.cpp:7085-7108`）。SYCL では `miss_ms * (1 - held_mass)` と層処理時間を合算する（`engine/sycl/src/program/generate.cpp:4007-4023`）。そのため同じ `b` でも profile 順、profile 件数、空き VRAM、GPU 速度などで選択境界は変わり得る。CLI が `--layer-split auto` を指定しても、探索が startable な配置を見つけられない場合は gate を外して速度だけで選び直し、候補もなければ `--layer-split auto: no valid split ...` を出して終了コード 2 となる（CUDA: `engine/src/program/generate.cpp:7487-7504`）。
 
-CUDA と SYCL の該当する値変換、curve 選択、順位式は同じです。CUDA の探索評価は `generate.cpp:3797-3815`、選択ログは `generate.cpp:4165-4167` にあります。SYCL では profile mass を評価する箇所が `sycl/src/program/generate.cpp:3623-3639` です。
+## ログと測定値
 
-## 文書・測定との照合
+この変数専用の有効/無効ログや値のエラー文言はない。正常に配置が決まると、CUDA と SYCL は選ばれた `K`、予測 decode window 時間、キャッシュが保持すると推定した profiled pair 数・ルーティング質量、候補数を stderr に出す（CUDA: `engine/src/program/generate.cpp:7510-7515`、SYCL: `engine/sycl/src/program/generate.cpp:4173-4178`）。出力は変数の値そのものを表示しない。
 
-`docs/DETAILS.md` を確認しましたが、この変数の利用者向け説明や、この指数を変更した場合の測定結果は見つかりませんでした。`generate.cpp` 内の設計コメントは、既定 `b=3` の選択理由や過去の複数環境での hit-rate 比較を記していますが、その記述だけから任意のモデルやハードウェアでの効果を一般化することはできません。ここでは測定値を主張しません。
+ソースコメントは `b=3` の例として 20,000 held（`f=0.8138`）で 99.35%、`f=0.59` で 93.2% と記し、別の実測値と比較している（CUDA: `engine/src/program/generate.cpp:7032-7036`、SYCL: `engine/sycl/src/program/generate.cpp:3964-3968`）。これはコメント中の特定 rig / traffic に関する記述であり、`STRATA_SPLIT_COVER_B` の任意値に対する性能や正確性の保証ではない。`docs/DETAILS.md` にこの変数の説明は見つからなかった。
 
 ## 根拠
 
-- CUDA 側の `b` の既定値、変換、coverage curve の選択と式: `src/program/generate.cpp:3752-3769`
-- CUDA 側の held mass / 予測時間への反映: `src/program/generate.cpp:3797-3815`
-- CUDA 側の探索条件と結果ログ: `src/program/generate.cpp:3692-3695,4165-4167`
-- CUDA 側の `--serve`、`--layer-split auto`、GPU 数による split 条件: `src/program/generate.cpp:2299-2348`
-- SYCL 側の同じ `b` 判定・coverage curve の式: `sycl/src/program/generate.cpp:3586-3603`
-- SYCL 側の mass による候補予測: `sycl/src/program/generate.cpp:3623-3639`
+- CUDA の読み取り・既定値・式: `engine/src/program/generate.cpp:7038-7055`
+- CUDA の探索スコアと最終ログ・失敗: `engine/src/program/generate.cpp:7085-7108,7487-7515`
+- CUDA の serve / auto 条件と profile 必須条件: `engine/src/program/generate.cpp:4803-4853,4895-4899,6746-6751`
+- SYCL の読み取り・既定値・式と探索スコア: `engine/sycl/src/program/generate.cpp:3970-3987,4007-4023`
+- SYCL の auto 探索・出力・profile 必須条件: `engine/sycl/src/program/generate.cpp:3921-3924,3781-3784,4173-4178`

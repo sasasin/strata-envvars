@@ -1,60 +1,61 @@
-# `--keep-canonical`
+# `strata` `--keep-canonical`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout の状態は `main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` エンジン引数（`strata generate`） |
+| コマンド | `strata`（エンジン引数、root scope） |
 | オプション | `--keep-canonical` |
 | 別名 | なし |
-| 値 | なし（真偽フラグ） |
+| 値 | 値を取らない boolean フラグ |
 
 ## 役割
 
-ネイティブ形式で提供されるテンソルについても、pack 内の canonical copy をロードする A/B 用フラグです。通常は native 経路が担当する canonical copy を省き、その分を VRAM の節約に回します。フラグを指定すると native 側の重みと canonical copy の両方が保持され、使用 VRAM が増えます（`src/program/generate.cpp:602, 889, 3774-3777`）。
+`--native`、`--native-dense-gguf`、`--native-head-gguf` などで native 形式から提供するテンソルについて、canonical pack 側のコピーもロード対象に残します。native 側と canonical 側の両方を保持するため、native 版だけを使う通常経路より VRAM を多く使います。A/B 比較用として案内されているフラグです。
 
 ## 使い方
 
 ```sh
-strata generate --pack /path/to/pack --tokens '1,2,3' \
-  --native /path/to/model-00001-of-00002.gguf --keep-canonical
+# 通常の pack に加え、native GGUF と PLE テーブルを指定した起動例
+strata --pack /path/to/pack --tokens 1 \
+  --native /path/to/model-00001-of-0000N.gguf \
+  --ple-gguf /path/to/ple.gguf --keep-canonical
 ```
 
-`--native` はネイティブモデル経路の例です。通常の pack で canonical copy を省略する条件は、対応する native GGUF を指定してネイティブ供給対象があることです。例のパスは形式を示すもので、実在するモデル構成を保証しません（`src/program/generate.cpp:808-817, 3232-3272`）。
+`--native` を使う場合、ソース上は PLE テーブルを `--ple-gguf` で指定する必要があります。上記は構文例であり、パスは実際の pack と GGUF に置き換えます。
 
 ## 値と既定値
 
-値を取らないフラグです。parser は `--keep-canonical` を見つけると `true` に設定し、既定値は `false` です。同じ指定を複数回しても同じ真偽値のままです（`src/program/generate.cpp:602, 2780`）。
+値は不要です。`Options::keep_canonical` の初期値は `false` で、指定すると `true` になります。数値や文字列を続けて値として渡す形式ではなく、同じフラグを複数回指定した場合も同じ `true` の代入が繰り返されます。独立した範囲 validation はありません。
 
 ## 実行時の動作
 
-フラグがない場合、エンジンは `skip` 集合を作り、`--native-dense-gguf` の GGUF にある native 対応・2 次元テンソル名を集合へ追加します。`--native-head-gguf` を指定していれば `output.weight` も追加します。PLE key は `--native-ple-key` による対象条件と pack 内の量子化状態に応じて例外処理され、native pack では token embedding も省略対象に加わります（`src/program/generate.cpp:3776-3795`; 対応名の判定は `src/core/native_dense.cpp:154-165, 178-192`）。
+CUDA/HIP 系と SYCL 系の parser は、どちらもこの引数を `o.keep_canonical = true` に設定します（`engine/src/program/generate.cpp:953,4261`、`engine/sycl/src/program/generate.cpp:619,2207`）。
 
-この集合は pack の arena サイズ計算とロードの両方に渡され、対象行は arena に bytes を割り当てず、データポインタを持たない参照として登録されます。その後 native dense のロードが行われるため、native 経路に任せるテンソルの canonical copy が通常構成では省略されます（`src/core/weights.cpp:93-122, 224-235, 274-300`; `src/program/generate.cpp:3896-3919`）。
+native pack 用の条件分岐を通過した後、フラグが false のときだけ `skip` 集合を native dense の提供テンソル名や native head の `output.weight` で作ります。true のときはこの集合への追加処理全体を通らず、その集合を使って pack の `WeightTable` を読み込みます。`WeightTable::load` は skip 対象の行を arena に配置せず、対象外の行を詰めて配置するため、このフラグは native 版と重複する canonical テンソルを pack からもロードさせます（CUDA/HIP: `engine/src/program/generate.cpp:5804-5826,6044-6057`、SYCL: `engine/sycl/src/program/generate.cpp:3067-3085,3198-3205`、共通実装: `engine/src/core/weights.cpp:224-239`）。native dense のロード処理はその後も実行されるため、両方のコピーが存在します（CUDA/HIP: `engine/src/program/generate.cpp:6060-6067`、SYCL: `engine/sycl/src/program/generate.cpp:3208-3215`）。
 
-`--keep-canonical` を指定すると、この省略集合を作るブロック自体を通らず `skip` は空のままです。そのため arena のサイズ計算・pack ロードにはスキップ集合が渡らず、canonical copy がロードされます。後続の native dense/head のロードは別に行われるため、同じ役割の native 重みも併存します（`src/program/generate.cpp:3776-3795, 3896-3919, 5256-5263, 5552-5564`; `src/core/weights.cpp:109-122`）。
+フラグがない場合、native dense の提供テンソル名の取得に失敗するとエラーを stderr に出して終了コード 1 で戻ります。フラグがある場合はその `served_names` 呼び出し自体を行いません。pack の読み込みに失敗した場合は、フラグの有無にかかわらずエラーを stderr に出して終了コード 1 です（`engine/src/program/generate.cpp:5807-5812,6044-6047`、SYCL: `engine/sycl/src/program/generate.cpp:3070-3075,3198-3201`）。
 
 ## 適用条件と副作用
 
-- 主な効果は `--native-dense-gguf` または `--native-head-gguf` などで native 供給するテンソルがある場合に現れます。canonical copy を必要とする対象がなければ、保持する追加 copy もありません（`src/program/generate.cpp:3776-3795`）。
-- `--native` による native (IQ) pack では併用できません。`native_pack` の条件判定で `o.keep_canonical` が拒否条件となり、標準エラーに「native (IQ) pack」についての案内を出して終了コード 2 で終了します。この経路ではメッセージに `--keep-canonical` 固有の拒否理由は含まれず、ほかの要件不足と同じ案内になります（`src/program/generate.cpp:3753-3765`）。
-- pack の arena は VRAM に `cudaMalloc` されます。canonical copy の追加で必要量が増え、割当失敗時は標準エラーに arena の確保失敗と空き VRAM を出して終了コード 1 となります（`src/program/generate.cpp:3852-3886`）。使用量の増分はモデル・pack・native tensor 構成で異なるため、一定値とは断定できません。ソースの help は「more VRAM」と記載しています（`src/program/generate.cpp:889`）。
-- `serve` の会話キャッシュ構成 fingerprint にも `keep_canonical` が記録されます（`src/program/generate.cpp:9449-9462`）。
+- 主な効果があるのは、native dense/head 経路など、native 提供テンソルがある起動です。該当する native 指定がなければ、このフラグによる native 重複コピーの抑制解除は実質的にありません。
+- 追加ロード分の VRAM を消費します。help 表示も「more VRAM」と案内し、起動時には pack から読み込んだ容量と「canonical tensors skipped」の件数を stderr に出します（`engine/src/program/generate.cpp:1291,6055-6057`、SYCL: `engine/sycl/src/program/generate.cpp:879,3203-3205`）。他の機能が skip 集合を追加する場合もあるので、件数が必ず 0 になるとは限りません。
+- native IQ pack の実行では `o.keep_canonical` が validation 条件に含まれ、該当すると終了コード 2 で拒否されます。表示されるエラー文は `--native`、`--spec`、`--prefill` の要件を列挙しますが、このフラグが条件に含まれることまでは説明しません（CUDA/HIP: `engine/src/program/generate.cpp:5781-5787`、SYCL: `engine/sycl/src/program/generate.cpp:3046-3052`）。
+- layer split など、このフラグとは別の処理も `skip` 集合を使うため、`--keep-canonical` が全ての理由による canonical 重みの除外を無効にするわけではありません（CUDA/HIP: `engine/src/program/generate.cpp:5827-5831,5979`、SYCL: `engine/sycl/src/program/generate.cpp:3086-3090`）。
 
 ## 出力とエラー
 
-通常の起動では、このフラグ単独による専用メッセージやファイル出力は確認できません。ロード後の標準エラーに、pack からロードした重みの MiB 数と「canonical tensors skipped: served natively」の件数が表示されます。フラグ指定時は対象の省略をしないため、表示される skipped 件数もその分変わります（`src/program/generate.cpp:3907-3910`）。
-
-native dense の GGUF が読み込めないなど `served_names` の処理が失敗すると、エラーを標準エラーに出し終了コード 1 で終了します。pack の `pool_bytes` 計算や `WeightTable::load` が失敗した場合も同様に終了コード 1 です（`src/program/generate.cpp:3778-3781, 3852-3855, 3896-3900`; `src/core/native_dense.cpp:178-192`）。未知の引数は標準エラーに `unknown argument` と usage を出して終了コード 2 ですが、このフラグは現行 parser に登録されています（`src/program/generate.cpp:2780, 2787-2793`）。
+フラグ専用の成功メッセージや警告は確認できません。pack 読み込み後の stderr ログは、ロード容量と canonical tensors の skip 件数を出力します。native pack との組み合わせは終了コード 2、pack または native dense のロード失敗は終了コード 1 になります（上記「実行時の動作」「適用条件と副作用」参照）。
 
 ## 根拠
 
-- `src/program/generate.cpp:602, 889, 2780` — 既定値、help 表示、parser 登録。
-- `src/program/generate.cpp:3753-3795` — native pack の拒否、native 供給名から `skip` を作る条件と対象。
-- `src/core/native_dense.cpp:154-192` — native dense 対象テンソルの名前・形式判定。
-- `src/core/weights.cpp:93-122, 224-300` — skip 時の arena サイズ計算、canonical weight のロード省略。
-- `src/program/generate.cpp:3852-3919, 5256-5263, 5552-5564` — arena 確保、pack load、native dense/head load とログ。
-- `src/program/generate.cpp:9449-9462` — serve 構成 fingerprint への記録。
+- `engine/src/program/generate.cpp:953,4261` — CUDA/HIP 系 `Options` の既定値と parser 登録。
+- `engine/sycl/src/program/generate.cpp:619,2207` — SYCL 系 `Options` の既定値と parser 登録。
+- `engine/src/program/generate.cpp:1291`、`engine/sycl/src/program/generate.cpp:879` — help にある A/B 用途と追加 VRAM の説明。
+- `engine/src/program/generate.cpp:5804-5826,6044-6067`、`engine/sycl/src/program/generate.cpp:3067-3085,3198-3215` — skip 集合の作成条件、canonical pack のロードと native dense ロード。
+- `engine/src/core/weights.cpp:224-239` — skip 対象を除いて重み arena に配置する処理。
+- `engine/src/program/generate.cpp:5781-5787`、`engine/sycl/src/program/generate.cpp:3046-3052` — native pack とフラグの併用を拒否する条件。
+- `engine/src/program/generate.cpp:5807-5812,6044-6047`、`engine/sycl/src/program/generate.cpp:3070-3075,3198-3205` — skip 名取得・pack 読み込みの失敗経路と起動ログ。
 
-調査は指定されたソース checkout の parser と呼び出し経路に限定しました。既存バイナリの `--help`、GPU 上の実行、VRAM 増分の実測、および各モデル固有の実際のテンソル構成は確認していません。
+調査範囲は上記 revision の Strata 所有ソースに限ります。`--help` は実行せず、同じ revision のソース内 help 文字列を parser 定義と照合しました。

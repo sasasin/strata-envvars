@@ -1,41 +1,45 @@
 # `STRATA_PW_WITH_BATCH`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--batch` / `--slots` を指定したときに `--pipeline-windows` を一律に抑止する条件を外します。環境変数だけでは pipeline windows を有効にしません。pipeline windows が使える場合、サーバー内で単独処理になるリクエストの通常の solo path は windows の重なりを保ち、複数 slot をまとめる batch windows はその pipeline を使いません。変数の判定値は `batch_blocks_pw` を通じて自動設定・明示設定の両方の抑止判定に使われます。
+`--batch` の request slot と `--pipeline-windows` の併用時に、パイプラインを無効化する既定の制約を解除する opt-in 変数。これ自体は `--pipeline-windows` を有効化せず、値が有効でも batch slot の window をパイプライン化しない。solo path の window はパイプラインを使えるようになり、batch windows は使わない。読み取りと判定は `engine/src/program/generate.cpp` の起動時セットアップにある（6547-6559 行）。
 
 ## 値と判定
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（値は存在するが `e[0]` は `\0`） |
-| 先頭文字が `1` の文字列 | 有効。`1`, `10`, `1anything` などを区別しない |
-| その他 | 無効。`0`, `true`, ` 1` など |
+`std::getenv` の結果が null でなく、かつ先頭 byte が文字 `'1'` なら真。それ以外は偽。文字列全体の parse・比較はせず、空白除去、大文字小文字変換、数値妥当性検査もない（`engine/src/program/generate.cpp:6555-6559`）。
 
-文字列全体の比較や数値変換はせず、`getenv()` が非 null で先頭文字が `'1'` かだけを調べます。したがって値の範囲、後続文字、空白、大文字小文字の検査はありません。読み取りは generate の起動設定時に行い、ローカル `const bool` に保持します。この値はその generate 実行中に再読込されません。
-
-根拠: `src/program/generate.cpp:5380-5384`。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 全 build | 偽（batch が pipeline を塞ぐ） | `1`, `10`, `1anything` | 空文字, `0`, `true`, ` 1`, `01` |
 
 ## 有効になる条件
 
-- `--pipeline-windows N`（`N` は 1 または 2）を指定するか、自動設定が pipeline windows を選ぶ必要があります。この変数単独では pipeline を有効化しません。CLI 値は `atoi` 後 0..2 に clamp され、未指定は内部値 `-1` です（`src/program/generate.cpp:959,3548`）。
-- 実行経路は `--serve` の layer split です。各 stage が別 GPU にあり、少なくとも 2 stage が必要です。MTP drafter と `--spec >= 2` も必要です。明示設定では複数 GPU、stage 数、MTP、`--peer-device`、helper cache なども検査され、条件を満たさなければ stderr に `strata generate: --pipeline-windows ... is off: ...` を出して値を 0 にします（`src/program/generate.cpp:5409-5426`）。
-- 自動設定（`--pipeline-windows` 未指定）は HIP だけで有効化候補になります。gfx12 の layer split では stage 数などを検査し、`STRATA_PIPELINE_AUTO=0`、MTP/spec 不足、batch 抑止、peer/helper cache、`--adapt-async` 等があれば無効です。CUDA 側のこの自動設定分岐は `on = false` です（`src/program/generate.cpp:5385-5407`）。
-- `--batch` と別名 `--slots` は同じ `o.batch` を設定します。`o.batch != 0` なら既定で pipeline windows を抑止しますが、この環境変数が有効なら抑止されません（`src/program/generate.cpp:3486-3487,5384,5420`）。
-
-この変数は Strata の `src/program/generate.cpp` にのみ実装されています。別実装 `sycl/src/program/generate.cpp` には名前の参照がなく、このコード経路による効果は確認できません。
+- `--batch N`（または同義の `--slots N`）が指定され、`N != 0` であること。この場合に限り、この変数の真偽が `batch_blocks_pw` に反映される。`--batch` がない場合、値を読み取っても pipeline の可否には影響しない（`engine/src/program/generate.cpp:4041-4042,6555-6559`）。
+- `--pipeline-windows` が実際に有効になること。この変数だけでは有効化されない。`--pipeline-windows 0` は無効のまま。明示値が正なら、`--serve`、GPU ごとに stage を分けた layer split、MTP drafter と `--spec >= 2` が必要で、その他の非対応条件でも無効化される（`engine/src/program/generate.cpp:4119,6584-6601`）。
+- `--pipeline-windows` の自動選択（未指定時）では、HIP build でのみ自動候補になり、`--serve`、multi-GPU layer split、stage 数の条件を満たし、`STRATA_PIPELINE_AUTO=0` で止められず、さらに MTP、`--spec >= 2`、`--peer-device` なし、helper cache なし、`--adapt-async` なし等が必要。CUDA build ではこの自動経路をコードが明示的に off にする。この変数が batch による除外を外しても、他の条件は変えない（`engine/src/program/generate.cpp:6560-6579`）。
+- 明示的な正の `--pipeline-windows` では、`--batch` があるとき `STRATA_PW_WITH_BATCH` が未設定または無効なら pipeline は off にされる。有効なら batch による拒否条件を通過するが、上記の他の検査は残る（`engine/src/program/generate.cpp:6584-6604`）。
+- 変数の読み取り箇所自体には OS / GPU backend の条件付きコンパイルはない。自動選択の HIP 限定は別途 `STRATA_USE_HIP` の compile-time 分岐による（`engine/src/program/generate.cpp:6567-6572`）。
 
 ## 実行時の詳細
 
-設定判定は CLI 引数の読取後、stage や verifier のリソースを割り当てる前に行われます。環境変数は CLI の `--pipeline-windows` 値を上書きせず、`--batch` が pipeline を止めるかどうかだけに影響します。`--batch 1` や負数のように非ゼロの値も、この判定時点では `batch_blocks_pw` を立てます。batch 自体の検証は後で行われ、`--batch 1` は `--serve` の有効条件を満たさないため警告後に 0 へ戻されます。この順序のため、環境変数が無効なら、後から batch が無効化されても pipeline windows の抑止は戻りません（`src/program/generate.cpp:5384,6550-6556`）。
+`generate.cpp` のセットアップ時に即時 lambda で一度読み、`pw_with_batch` と `batch_blocks_pw` の bool に保持する。リクエストごとの再読込や、この値の static cache はないため、プロセス開始後に環境を変更してもこの判定は変わらない（`engine/src/program/generate.cpp:6555-6560`）。
 
-pipeline windows が成立した場合、実行側は stage ごとに二つの verifier を用意し、window の偶奇で使い分けて stage 間を重ねます。値 1 は prompt の verify windows、値 2 は decode windows も対象です。batch slot 側は別の batch window 処理を持ち、環境変数が有効でも batch windows に second verifier を使う処理にはなりません。`--batch` と共存して solo request の pipeline を保つ意図、および batch windows が pipeline を使わないことは実装コメントにも明記されています（`src/program/generate.cpp:5372-5379,10864-10890,14223-14239`）。
+優先関係は、`--batch` の有無が変数を意味のあるものにし、`--pipeline-windows` が pipeline の要求または自動選択を決める形。変数を `1` にしても pipeline は強制されず、`--pipeline-windows 0` や非対応条件を覆さない。通過した場合、コードは `--pipeline-windows` 用の二つの verifier / window 処理を残し、batch windows はその second verifier を使用しない。solo request が batch slot ではなく solo path を使う場面でもパイプラインを使える、という設計上の経路がコメントに記されている（`engine/src/program/generate.cpp:6547-6554,6602-6604,13756-13764`）。
 
-有効時は stderr に `strata generate: --pipeline-windows N stays on for the solo path beside M batch slots (STRATA_PW_WITH_BATCH=1); batch windows run without it` が出ます。無効時に batch が pipeline を止めた場合は `... is off: not with --batch slots (STRATA_PW_WITH_BATCH=1 keeps it for the solo path)` が出ます。pipeline 起動時は `strata serve: --pipeline-windows N: two verifiers per stage...` が出ます。stream 作成失敗はエラーを出して終了コード 1 で戻り、値 2 の decode 用 GDN snapshot を確保できない場合は stderr に理由を出し decode を serial にします（`src/program/generate.cpp:5420-5429,10877-10884,11297-11303,11318-11322`）。
+## ログと測定値
 
-## 根拠・資料との照合
+- 明示した正の `--pipeline-windows` が batch 条件で止められた場合、stderr に `strata generate: --pipeline-windows %d is off: not with --batch slots (STRATA_PW_WITH_BATCH=1 keeps it for the solo path)` が出る（`engine/src/program/generate.cpp:6595-6601`）。
+- batch 条件を通過した場合、stderr に `strata generate: --pipeline-windows %d stays on for the solo path beside %d batch slots (STRATA_PW_WITH_BATCH=1); batch windows run without it` が出る（`engine/src/program/generate.cpp:6602-6604`）。実際に pipeline が構成された経路では、後段で `strata serve: --pipeline-windows %d: two verifiers per stage, %d stages overlap across windows...` も出る（`engine/src/program/generate.cpp:13756-13760`）。
+- 自動選択が条件不足で off になる場合、この変数固有の警告はない。変数の無効値によるエラー終了も実装されていない。
+- `docs/DETAILS.md:1279` は「2x RTX A6000 IQ3_S」で、solo request の測定値を code +14%、file rewrite +9%、long decode +3%、同時二 request は遅くならず、second verifier が first card の約270 MiBを使うと報告している。これは資料の記載であり、本調査で再測定していない。同資料は他条件（量子化以外のモデル・OS、試行数など）を当該行に示していない。ソースコメントには別の旧測定として 2x RX 6900 XT / IQ3_S / 0.1.45 / 32K / `parallel: 2` の 75 → 66.5 tok/s があるが、これはこの opt-in がない場合の単独 request に関する比較である（`engine/src/program/generate.cpp:6553-6554`）。
 
-候補名の全参照は `src/program/generate.cpp` の環境読取、判定利用とログ、および `docs/DETAILS.md` の表です。実際の読取は `std::getenv("STRATA_PW_WITH_BATCH")` の1箇所です。`docs/DETAILS.md:1088` は CUDA/HIP layer split、`--pipeline-windows 2` と batch slots の組合せとして説明し、2x RTX A6000 / IQ3_S の測定として solo request の code +14%、file rewrite +9%、long decode +3%、同時2 requestは遅くならず、2枚目の verifier が先頭 GPU に約270 MiBを使うと記載しています。これらは資料記載の測定値であり、他の条件での性能を示すものではありません。
+## 根拠
+
+- `engine/src/program/generate.cpp:4041-4042` — `--batch` / `--slots` の値設定。
+- `engine/src/program/generate.cpp:4119` — `--pipeline-windows` の CLI 値処理。
+- `engine/src/program/generate.cpp:6547-6559` — batch と solo path の関係、環境変数の読み取り、値判定。
+- `engine/src/program/generate.cpp:6560-6604` — 自動選択、適用条件、fallback とログ。
+- `engine/src/program/generate.cpp:13756-13764` — pipeline の実行準備ログと verifier 構成。
+- `docs/DETAILS.md:1279` — 資料にある測定値。

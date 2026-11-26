@@ -1,55 +1,48 @@
 # `STRATA_Q36_NO_MTP_CPU`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Qwen3.6-35B-A3B (`qwen35moe`) の専用 engine が、VRAM に全 routed expert を置けない場合に使う MTP 専用配置を抑止します。unset なら、条件が揃うと通常の main layer は全 expert を VRAM に置き、MTP block の expert だけを slot と CPU pool に分けます。設定するとこの配置を選ばず、main layer と MTP block の両方を対象にする通常の hybrid 配置判定へ進みます。
+この変数を設定すると、Qwen3.6 CUDA エンジンが自動選択する「主層の routed experts はすべて VRAM、MTP 層の experts だけ CPU pool に置く」配置 (`mtp_only`) を抑止します。必要な場合は通常の hybrid 配置になり、CPU pool は MTP 層だけでなく全層の routed experts を扱います。変数名に `=1` と書いた説明コメントがありますが、実装は値を読まず設定有無だけを判定します（`engine/src/qwen35/q36_engine.cu:4273-4307,4344-4350`）。
 
-環境変数は `place_experts()` で参照されます。汎用 `strata` は GGUF の architecture が `qwen35moe` のとき専用 engine に切り替わり、単体の `strata-q36` も同じ engine を使います。他の model family ではこの変数を読む経路はありません。
+Strata の `--model` / `--native` で GGUF の architecture が `qwen35moe` の場合に Qwen3.6 エンジンへ切り替わり、単体 `strata-q36` も同じ `run()` を使います（`engine/src/program/generate.cpp:3804-3818`、`engine/src/qwen35/q36_main.cpp:1-5`）。
 
 ## 値と判定
 
-値の parse はありません。`std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr` で設定有無だけを確認します。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| Qwen3.6 `place_experts()` | MTP 専用 CPU 配置の条件判定を通せる | 値は問わず、存在すれば専用配置を抑止。空文字、`0`、`1`、`true`、任意文字列すべて同じ | なし（値の変換・検証をしない） |
 
-| 状態 | 判定 |
-|---|---|
-| unset | MTP 専用配置を選ぶ候補になる。ほかの条件も満たす必要がある |
-| `1`、`0`、`false`、任意の文字列 | 設定済みとして MTP 専用配置を抑止 |
-| 空文字 | 設定済みとして MTP 専用配置を抑止 |
-
-大文字小文字、数値変換、先頭文字、値の範囲は調べません。環境変数は expert 配置を行う `place_experts()` の実行中に参照されます。そこで配置が決まった後にプロセス環境を書き換えても、配置はやり直されません。
+実装は `std::getenv(...) == nullptr` の比較です。したがって未設定だけが「許可」、空文字を含む設定済みの値はすべて「禁止」です。数値変換、前後空白の処理、大文字小文字の比較はありません。設定値の既定値は配置処理に入った時点では unset 相当です（`engine/src/qwen35/q36_engine.cu:4276-4279,4300-4307`）。
 
 ## 有効になる条件
 
-unset 時でも MTP 専用配置 (`mtp_only`) が成立するのは、次をすべて満たす場合です。
-
-- モデルに MTP block がある。
-- `--expert-slots` が正値でない（既定値は 0）。
-- `--expert-vram` が負値（既定値は -1.0）で、空きVRAMから予備量を引く自動 budget を使う。
-- main と MTP を合わせた expert が現行 budget を超える。
-- main layer の expert と attention buffer 64 MiB 分が budget 内に入る。最初の判定に入らない場合は attention score buffer を縮め、予備量を 768 MiB から 256 MiB にした余地も判定する。
-
-この条件を満たさなければ、unset でも通常の全層 hybrid 判定または全 expert VRAM 配置になります。特に `--expert-vram` を明示する場合、または `--expert-slots` を正値にする場合は `mtp_only` 判定に入りません。
+- 値が未設定で、GGUF のメタデータに MTP ブロックがあり、全層の experts 合計が VRAM 予算を超えている必要があります。MTP の有無は `m.has_mtp`（`g.n_mtp_layers > 0`）で決まり、`--mtp 0` でも MTP ブロックと experts はロード・配置の対象に含まれます（`engine/src/qwen35/q36_engine.cu:1455-1461,1518-1524`）。
+- MTP 専用配置は `--expert-slots` が未指定相当（`slots <= 0`）かつ `--expert-vram` が未指定相当（`vram_gib < 0`）の自動配置でのみ試されます。これらを指定した場合は当該配置分岐を通りません（`engine/src/qwen35/q36_engine.cu:4301-4316`）。
+- 主層の experts と追加 64 MiB が現在の予算に収まる場合に `mtp_only` が立ちます。収まらない場合、通常の全層 hybrid 配置へ進みます（`engine/src/qwen35/q36_engine.cu:4302-4316`）。
+- MTP 専用配置にせず、なお全層 experts が予算と実空き容量に収まる場合は、通常の「全 experts を VRAM に置く」分岐が先に成功します。この変数は全 VRAM 配置を抑止しません（`engine/src/qwen35/q36_engine.cu:4318-4335`）。
+- `STRATA_Q36_KEEP_PACKED` が設定されていると、先行する packed Q8_0 コピー解放が抑止され、その解放を前提とした予算判定にも影響します。`STRATA_Q36_NO_MTP_CPU` はその解放判定にも使われ、設定時は MTP 専用配置を見込んだ主層予算の条件を使いません（`engine/src/qwen35/q36_engine.cu:4271-4292`）。
+- CPU expert pool を含まない build では hybrid 配置が使えず、全 experts が VRAM に収まらない場合は失敗します。該当時のエラーは `the routed experts (...) do not fit in VRAM, and this build has no CPU expert pool (STRATA_NATIVE_EXPERTS=OFF)` です（`engine/src/qwen35/q36_engine.cu:4337-4342`）。
 
 ## 実行時の詳細
 
-unset かつ MTP 専用配置が成立すると、`place_experts()` は main layer の全 expert を VRAM に置き、MTP block の slot 数を残り budget から算出します。MTP block の expert はすべて host memory に保持され、slot にない expert の decode batch 分は CPU pool が処理します。ログには `every main layer's routed experts in VRAM ...; the MTP block's: ... in VRAM, the rest on the CPU pool (its drafts only)` と出ます。MTP block 以外の host expert 領域は確保しません。
+変数はモデルロードと `Engine::init()` の後、`place_experts()` が VRAM 状況を測って配置を決める際に読みます（呼び出し: `engine/src/qwen35/q36_engine.cu:5522-5527`）。関数内で2回 `getenv` します。1回目は packed Q8_0 コピー解放の見積もり条件、2回目は MTP 専用配置を試す条件です。static cache はなく、この配置処理後に環境を変更しても、既に決まった `mtp_only` や配置は変わりません（`engine/src/qwen35/q36_engine.cu:4276-4307`）。
 
-変数が設定されている場合は `mtp_only` が立たないため、VRAM が不足すると通常の hybrid 分岐へ進みます。この分岐では各 layer の host expert を確保し、GPU slot と CPU pool を全 layer に適用します。ログは `hybrid experts: ... per layer in VRAM ...` 形式です。全 expert がVRAMに収まれば環境変数の状態にかかわらず全VRAM配置が先に選ばれ、この変数による配置差はありません。
+未設定で専用配置が選ばれた場合、全主層の experts を GPU メモリへコピーし、MTP 層は CPU 側 host arena に保持して GPU slot と CPU pool を使う構成になります。主層がすべて VRAM にあるため、decode graph は維持されます（`engine/src/qwen35/q36_engine.cu:4344-4349,4397-4446`）。この変数を設定して `mtp_only` が偽なら `E.main_hybrid` が真になり、主層も含めて hybrid 配置され、host 側に全層分の experts を確保します（`engine/src/qwen35/q36_engine.cu:4344-4350,4397-4446`）。
 
-`STRATA_Q36_NO_MTP_CPU` は、packed Q8_0 decode copy を解放する判定にも関係します。通常の「全 expert が解放分を含めれば収まる」条件はこの変数に関係なく有効です。一方、MTP 専用配置を見込んで main expert だけが余裕内に収まるかを見る追加条件は、変数 unset かつ MTP block がある場合に限られます。解放時は stderr に `the packed Q8_0 decode copies ... given back so that every routed expert fits in VRAM` と出ます。`STRATA_Q36_KEEP_PACKED` が設定されていると、この解放処理自体が抑止されます。
+通常の hybrid 配置が VRAM に収まらない場合、`place_experts()` は `false` を返し、呼び出し元が理由を stderr に出して終了コード 1 で終了します（`engine/src/qwen35/q36_engine.cu:4380-4385,5523-5526`）。
 
-ハイブリッド配置のコードは `STRATA_Q36_CPU_POOL` がビルド時に有効な場合だけ利用できます。無効の build では、全 expert がVRAMに収まらないと `the routed experts ... do not fit in VRAM, and this build has no CPU expert pool (STRATA_NATIVE_EXPERTS=OFF)` で失敗します。この場合、この環境変数は配置失敗を解消しません。CMake は `STRATA_NATIVE_EXPERTS` が有効な場合に `STRATA_Q36_CPU_POOL=1` を定義します。
+## ログと測定値
+
+専用配置が成立した場合は stderr に `strata-q36: every main layer's routed experts in VRAM (... GiB); the MTP block's: ... in VRAM, the rest on the CPU pool (its drafts only)` と出ます。通常の hybrid 配置では `strata-q36: hybrid experts: ... per layer in VRAM ... all ... host memory ...` の行が出ます（`engine/src/qwen35/q36_engine.cu:4530-4539`）。この変数自体の値を表示するログはありません。
+
+`docs/DETAILS.md` は Qwen3.6 エンジンが独自の `--pool-workers` と既定配置を持つことを記載していますが、この変数の動作や比較測定値は記載していません（`docs/DETAILS.md:1425-1431`）。本調査では性能値を追加していません。
 
 ## 根拠
 
-- `src/program/generate.cpp:1866-1879` — `qwen35moe` model を Qwen3.6 専用 engine に切り替える。
-- `src/qwen35/q36_engine.cu:1934-1951` — `place_experts()`、対象 layer 群、VRAM budget。
-- `src/qwen35/q36_engine.cu:1952-1977` — packed-copy 解放条件。MTP専用配置向けの追加条件だけが本変数に依存する。
-- `src/qwen35/q36_engine.cu:1978-2001` — MTP専用配置の条件、attention buffer と予備量を縮める fallback。
-- `src/qwen35/q36_engine.cu:2003-2017` — 全 expert がVRAMに収まる場合の先行 return。
-- `src/qwen35/q36_engine.cu:2019-2045,2057-2128` — CPU pool build 条件、slot/host 配置、MTP専用配置時の差とログ。
-- `src/qwen35/q36_engine.cu:2346-2387,2443-2446` — CLI の既定値・`--expert-vram` / `--expert-slots` parsing、および配置関数の呼び出し。
-- `CMakeLists.txt:637-640` — `STRATA_NATIVE_EXPERTS` 有効時に Q36 CPU pool を compile definition する。
-- `docs/DETAILS.md` には、この環境変数の動作を説明する記述は確認できませんでした。
+- `engine/src/qwen35/q36_engine.cu:4247-4316` — 全 experts の計上、環境変数の2つの有無判定、MTP 専用配置の条件。
+- `engine/src/qwen35/q36_engine.cu:4318-4350,4397-4446,4530-4539` — 全 VRAM 配置 / hybrid 配置とログ。
+- `engine/src/qwen35/q36_engine.cu:1455-1461,1518-1524` — `--mtp` と独立した MTP ブロックのロード。
+- `engine/src/qwen35/q36_engine.cu:5522-5527` — 配置処理の呼び出しと失敗時の終了。
+- `engine/src/program/generate.cpp:3804-3818`、`engine/src/qwen35/q36_main.cpp:1-5` — Qwen3.6 エンジンへの入口。

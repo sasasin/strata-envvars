@@ -1,57 +1,64 @@
-# `--key`
+# `strata connect --key`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
-| コマンド | `strata connect <harness>` |
-| オプション | `--key KEY` |
+| コマンド | `strata connect <app>` |
+| オプション | `--key` |
 | 別名 | なし |
-| 値 | API key を表す文字列。parser 上の形式・長さ検証なし |
+| 値 | `KEY` を1つ取る文字列。parser 上の型・選択肢・形式検証はない |
 
 ## 役割
 
-接続先アプリ用に表示・生成する設定へ渡す API key を指定します。これは `strata connect` のオプションであり、サーバーの key 自体を設定・変更するものではありません。
+接続先アプリ用の設定を表示、検査、または書き出すときに、Strata サーバーの API key を明示します。値は `--key-env`、`--preset` から得た起動情報、既定の空値より優先され、アプリ設定の認証値および `--check` のリクエストに使われます。
 
 ## 使い方
 
 ```sh
+# 環境変数にある鍵で OpenCode 用設定を表示（鍵は通常マスクされる）
 strata connect opencode --key "$STRATA_API_KEY"
-```
 
-例では key をシェルの環境変数から渡しています。実際の key をコマンド履歴に直接書かない方法を選んでください。
+# 環境変数名を渡して、同じく OpenCode 用設定を表示
+strata connect opencode --key-env STRATA_API_KEY
+
+# 明示した鍵でサーバー接続を確認
+strata connect opencode --key-env STRATA_API_KEY --check
+```
 
 ## 値と既定値
 
-- `argparse` の通常の文字列引数で、必須ではありません。省略時の値は `None` です。空文字列、形式、長さに対する `--key` 固有の validation はありません（`strata_cli/launch/cmd.py:148-165`）。
-- 有効値は `--key`、`--key-env NAME` が指定されていればその環境変数、選択された実行中 launch または preset から得た key、空文字列の順で選ばれます（`strata_cli/launch/cmd.py:864-868`）。この選択は truthy 判定なので、`--key ""` や空の環境変数値は値として採用されず、次の候補へ進みます。
-- 同じ `--key` を複数回指定した場合は `argparse` の通常の `store` 動作で最後の値が使われます（宣言は `strata_cli/launch/cmd.py:155`）。
-- 選択後も key が空なら、接続先設定の生成時に placeholder `strata-local` が使われます（`strata_cli/launch/harness.py:22,259-260`）。
+- `--key KEY` は通常の文字列引数です。parser に型変換、空でないことの検査、形式検証はありません。値を省略すると argparse の引数エラーになります。`--key` を複数回指定した場合は、通常の `store` 動作で最後の値が残ります（登録箇所: `terminal/strata_cli/launch/cmd.py:170`）。
+- 実行時は値の truthiness で選ぶため、空文字は明示値として採用されず、後順位へ進みます。明示値、`--key-env` で指定した環境変数の値、起動中の launch または `--preset` の鍵、空文字の順です。環境変数が未設定または空でもエラーにはせず、後順位に進みます（`terminal/strata_cli/launch/cmd.py:1074-1079`）。
+- 最終的な鍵が空なら、アプリ設定生成用の `Target` では `strata-local` に置き換えられます。これは Strata のテスト済み設定で、サーバーに鍵が設定されていない場合の placeholder です（`terminal/strata_cli/launch/harness.py:21`, `339-340`）。
+- `--key` 自体に鍵の長さ・文字種・サーバーとの一致を検証する処理はありません。
 
 ## 実行時の動作
 
-`strata connect` は、指定されたアプリ名に対応する harness を探し、URL・key・model・context から設定ファイルや環境変数の内容を組み立てます。`--key` の値はこの `Target` に渡され、各 harness の設定生成関数が app 固有の key 欄または credential 環境変数へ埋め込みます（`strata_cli/launch/cmd.py:857-870`; `strata_cli/launch/harness.py:259-267,209-234`）。
+`strata connect` の parser は `--key KEY` を登録し、`run_connect` が上記の優先順位で鍵を決めて harness の `Target` に渡します。harness ごとのレンダラーはこの値を設定ファイルや環境設定へ埋め込みます。たとえば OpenCode の `providers.strata.settings.apiKey` と Cline の `openAiApiKey` に入り、Codex 用設定では環境変数名 `STRATA_API_KEY` が指定されます（`terminal/strata_cli/launch/cmd.py:163-182, 1074-1080`; `terminal/strata_cli/launch/harness.py:119-125, 144-155, 286-297`）。
 
-通常の人向け出力では、key は既定でマスクされます。`--show-key` を加えると表示中の設定・環境値に実値を表示します。`--output json` では key を含む文字列をマスクして出力し、`--show-key` でも JSON 出力のマスクは解除されません（`strata_cli/launch/cmd.py:871-910`）。
+鍵は既定で人間向け表示からマスクされます。`--show-key` を付けると人間向けの設定表示では実値が出ます。JSON 出力では値がマスクされ、`--show-key` でも解除されません（`terminal/strata_cli/launch/cmd.py:1081-1086, 1120-1136`）。
 
-`--check` を併用すると、選ばれた key を Bearer と `x-api-key` の両 HTTP header に設定し、対象 server へ prompt と tool-call の要求を送ります（`strata_cli/launch/cmd.py:880-896,921-929`; `strata_cli/launch/check.py:36-43,111-143`）。成功時は終了コード 0、いずれかの確認失敗時は 1 です。認証拒否、URL 不在、接続不能などは確認結果の説明へ変換されます（`strata_cli/launch/check.py:146-155`）。
+`--check` を併用すると、同じ鍵でアプリ形式の prompt と tool call をサーバーへ送り、認証を含む接続設定を確認します。`--write` と併用した場合、check が失敗すると書き込みは行われず終了コード 1 です。`--write` 単独の確認・バックアップ・ファイル更新条件は同コマンドの別オプションによります（`terminal/strata_cli/launch/cmd.py:1087-1107, 1147-1157`; `terminal/strata_cli/launch/check.py:1-7, 36-43`）。
 
 ## 適用条件と副作用
 
-- `--key` は `<harness>` を指定した接続設定の生成経路で参照されます。`strata connect` の harness 省略時はアプリ一覧を出力して終了するため、key は使用されません（`strata_cli/launch/cmd.py:842-856`）。
-- `--preset NAME` があると `launch_info(NAME)` が候補を解決します。key の選択では、明示した `--key`、`--key-env`、launch/preset の key の順になります（`strata_cli/launch/cmd.py:864-868`; launch/preset 情報の読み出しは `strata_cli/launch/cmd.py:605-627`）。
-- `--write` を付けると生成設定をユーザーの app 設定パスへ書き込み、既存ファイルはまず時刻付き backup にコピーします。生成設定に実 key が含まれることがあり、書き込み後は mode `0600` の設定を試みます。端末での確認を省くには `--yes` が必要です（`strata_cli/launch/cmd.py:930-947`; `strata_cli/launch/harness.py:275-298`）。
-- key 自体に対する拒否・サニタイズ・ネットワーク検証は `--key` の選択時にはありません。実サーバーとの疎通・認証確認は `--check` を指定した場合にのみ行われます（`strata_cli/launch/cmd.py:864-896`）。
+- `<app>` を指定した場合に適用されます。アプリ名が認識されない場合は候補を含むエラーを stderr に出し、終了コード 2 で終了します。アプリ名を省略した一覧モードでは鍵を使いません（`terminal/strata_cli/launch/cmd.py:1052-1073`）。
+- 鍵は生成設定の表示内容に含まれるため、人間向け出力で `--show-key` を付けると秘密値が端末出力へ露出します。通常はマスクされます。JSON でも鍵はマスクされます（`terminal/strata_cli/launch/cmd.py:1081-1086, 1120-1136`）。
+- `--write` を使うと、確認後にファイルを作成または更新します。既存ファイルは先にタイムスタンプ付き `.strata-bak-...` へコピーされ、書き込みファイルは可能なら mode `0600` に設定されます。これは鍵を含み得る設定ファイルへの副作用であり、`--dry-run` では書き込みません（`terminal/strata_cli/launch/cmd.py:1019-1050`; `terminal/strata_cli/launch/harness.py:355-399`）。
 
 ## 出力とエラー
 
-このオプション値について独自の parser validation エラーはありません。未知の harness は stderr に候補付きのエラーを出し、終了コード 2 で終了します（`strata_cli/launch/cmd.py:857-863`）。通常の接続設定表示は key をマスクし、`--show-key` は人向け表示に実値を出します（`strata_cli/launch/cmd.py:871-910`）。`--write` の確認・キャンセル・書き込み処理は `strata_cli/launch/cmd.py:930-947` にあります。
+- 解析対象外のオプションは `strata connect` の案内付きで stderr に出て、終了コード 2 になります（`terminal/strata_cli/cli.py:2325-2334`; `terminal/strata_cli/launch/cmd.py:186-201`）。
+- `--check` の疎通または prompt/tool call が失敗した場合は終了コード 1 です。`--write` も指定していた場合、check 失敗時点でファイルは書き込まれません（`terminal/strata_cli/launch/cmd.py:1087-1107, 1147-1155`）。
+- `--write` は対話端末で確認を求めます。非対話環境で `--yes` も `--dry-run` もない場合はエラーと終了コード 2、確認への否定応答では書かずに終了コード 0 です。書き込み中の `OSError` は人間向け出力または JSON に失敗内容を記録し、終了コード 1 になります（`terminal/strata_cli/launch/cmd.py:1019-1050`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:148-165` — `connect` parser と `--key` / `--key-env` / `--preset` / `--show-key` の宣言。
-- `strata_cli/launch/cmd.py:605-627,842-910` — launch/preset 情報、値の優先順位、harness への受け渡し、出力・mask 処理。
-- `strata_cli/launch/cmd.py:921-947` — `--check` と `--write` の分岐。
-- `strata_cli/launch/harness.py:22,259-267,275-298,310-311` — key placeholder、Target、設定の描画、ファイル保存・backup・permission 試行、mask。
-- `strata_cli/launch/check.py:36-43,111-155` — key 付き要求と check の結果・失敗説明。
+- `terminal/strata_cli/launch/cmd.py:163-182` — `connect` parser と `--key`、鍵関連オプションの登録。
+- `terminal/strata_cli/launch/cmd.py:703-725, 1052-1086` — 起動情報・preset の取得、URL等と鍵の優先順位、harness への渡し、表示時のマスク。
+- `terminal/strata_cli/launch/harness.py:21, 119-125, 144-155, 286-347` — placeholder、各アプリ設定への鍵の埋め込み、対象の構築。
+- `terminal/strata_cli/launch/cmd.py:1019-1050, 1087-1107, 1120-1157` — 確認・書き込み・check の失敗経路と出力。
+- `terminal/strata_cli/launch/harness.py:355-399` — 設定ファイルの dry-run、バックアップ、書き込み、権限設定。
+- `terminal/strata_cli/launch/check.py:1-7, 36-43` — check が鍵を Authorization と `x-api-key` header に付ける処理。

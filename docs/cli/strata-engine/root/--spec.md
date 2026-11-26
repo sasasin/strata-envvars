@@ -1,62 +1,69 @@
-# `--spec`
+# `strata --spec`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | CMake 生成の通常推論エンジン `strata`（引数 parser の root） |
+| コマンド | `strata`（推論エンジンの root 引数） |
 | オプション | `--spec` |
 | 別名 | なし |
-| 値 | 整数 `N`（`atoi` で変換）。推論検証窓の幅を指定 |
+| 値 | 整数 `N`。推論検証窓のトークン数。ビルドの検証窓上限以下であること |
 
 ## 役割
 
-推論時に一度に検証する speculative decoding の窓幅を指定します。窓は直前の確定 token と draft token を含む `N` token で、`N=0` は通常の一 token ずつの decode です。MTP draft layer を使う場合、`--mtp` と `--spec 2` 以上を指定すると MTP が窓用の候補を生成します。MTP を指定しない場合も、正の値は speculative loop を有効にし、既定で有効な suffix prompt lookup が条件に合う繰り返し候補を供給できます（`src/program/generate.cpp:650-657, 16091-16102, 16408-16429`）。
+生成開始後の通常 decode に代えて speculative decoding を有効にし、1 回の検証で扱う窓幅を指定します。窓には直前の確定 token と最大 `N-1` 個の draft token が入り、検証後は一致した draft と次の token を確定します。draft が不要な通常 decode は `--spec 0`（または省略時の非 Metal 既定値）です。MTP draft layer や DFlash2 を使う場合も、この値が窓幅の基準になります。
 
 ## 使い方
 
 ```sh
-strata --pack /path/to/pack --tokens-file prompt.txt --mtp /path/to/mtp/runtime --spec 4
+# モデル・token 入力など通常の必須引数に加えて、4 token の検証窓を指定
+strata --pack MODEL --tokens-file PROMPT.txt --spec 4 --expert-profile PROFILE --expert-cache 4
 ```
 
-これは通常 engine parser の引数例です。`--pack`、入力 token、MTP runtime の指定は実際の利用環境に合わせてください（`src/program/generate.cpp:2423-2444, 2607-2624`）。
+`--expert-profile`、`--expert-cache`、token graph に対応する residency table がない状態で speculative loop に入ると起動処理がエラーになります。パスや cache 値は使用環境に合わせてください。
 
 ## 値と既定値
 
-- parser は `--spec` の次の argv を `std::atoi` で整数化し、`Options::spec` に代入します。数値形式や範囲を検証する分岐はこの parser にありません。省略時は Metal build で `2`、それ以外で `0` です（`src/program/generate.cpp:650-657, 2607-2609`）。
-- `0` は通常 decode です。MTP を指定しても `N < 2` なら MTP 指定は無視され、その旨を stderr に出します。native (IQ) pack は `N >= 2` を必要条件とし、満たさない場合は診断して終了コード `2` で終了します（`src/program/generate.cpp:3753-3760, 5455-5459`）。
-- 窓の verifier が扱う定数上限は 8 です（`include/strata/kernels/verify_kernels.hpp:21`）。parser は `--spec` の値そのものを 8 以下へ一般的に制限しません。値が大きい場合の処理は組み合わせや後続初期化に依存するため、8 以下を指定してください。
-- ヘルプ文は setup が設定値 `4` を書くことに触れていますが、これは parser の既定値ではありません（`src/program/generate.cpp:938-941`）。
-- 同じ引数列で複数回指定すると parser loop が各値を順に代入するため、最後に読まれた値が残ります（`src/program/generate.cpp:2416-2421, 2607-2609`）。
+- parser は次の引数を `std::atoi` で整数化して `Options::spec` に代入します。省略時は Metal build で `2`、それ以外の build で `0` です（`engine/src/program/generate.cpp:1010-1017,4040`）。
+- parser 自体に値の下限・形式の厳密な検査はありません。したがって非数値文字列は `atoi` の変換結果 `0` として扱われます。重複指定は同じ変数への逐次代入なので最後の値が残ります（同 `:4040`）。
+- 起動時に prompt lookup などによる自動調整を適用した後、現在の build の検証窓上限を超えていれば `2..上限` の範囲を示す診断を stderr に出して終了コード `1` で終了します（同 `:5091-5098`）。明示値に固定の上限があるのではなく、通常は `kVerifyNarrowT`、suffix lookup 窓が有効な場合は `kVerifyLongT` が上限です。
+- `0` は plain decode です。負数についても parser に拒否処理はなく、通常の spec loop 起動条件（`spec > 0`）を満たしません。ただし負数を明示する利用は文書化されておらず、他 option の組合せについて同等性を保証するものではありません（同 `:1010-1017,24455-24466`）。
 
 ## 実行時の動作
 
-- prompt の最後から通常の token loop を切り替える条件は `N > 0` です。speculative loop では窓幅分の buffer と `DraftPolicy` を用意し、検証窓の一致した draft を確定します（`src/program/generate.cpp:16080-16102, 16381-16429`）。
-- `--suffix-draft` は既定で `3` です。`N >= 2`、suffix draft が有効、かつ `--mtp-max-t` が未指定（0）のとき、元の `N` を MTP の上限に保存したうえで verifier の窓を最大 `N+2`、上限 8 まで拡張します。`--mtp-max-t` を指定するとこの自動拡張分岐は行われません（`src/program/generate.cpp:776-779, 3205-3210`）。
-- `--lookup-chain K` が正で `N >= 2` のとき、MTP 窓の後ろに lookup 候補を足せるよう verifier 窓を拡張し、最大 8 に抑えます。suffix draft による拡張が先に行われる場合は、その後の幅を基準に計算します（`src/program/generate.cpp:780-783, 3212-3219`）。
-- `--mtp` を指定して `N < 2` の場合、MTP はクリアされて読み込まれません。`N >= 2` なら MTP runtime を読み込み、窓幅（pipeline windows が 2 以上なら固定上限幅）を使って draft を生成します（`src/program/generate.cpp:5455-5473`）。
-- `--draft dflash2` が利用可能で、対象 GPU に応じた cap が実際の `N` より小さい場合、engine は警告を出して `N` をその cap に変更します。`--draft-cap` の指定は cap の選択に関与します（`src/program/generate.cpp:5474-5503`）。
-- native pack は `N >= 2` を要求します。serve の pipeline windows と batch MTP は MTP と `N >= 2` を条件にし、pipeline windows は条件不成立なら理由を出して off にします。一方、serve の prefill-window 経路自体は `N >= 2` と `--prefill CHUNK` を要求しますが、MTP は任意で、候補がなければ suffix lookup または通常 decode に fallback します（`src/program/generate.cpp:3753-3760, 4246-4288, 5301-5306, 8354-8366`）。
+値は `Options` に格納され、通常生成ループは prompt の最終位置以降で `spec > 0` の場合に speculative loop へ移行します。loop は verifier を `o.spec` 幅で初期化し、draft 候補を含む窓を検証します。spec loop に入ったとき residency table がなければ「`--expert-profile`、`--expert-cache` と token graph が必要」と stderr に出し、終了コード `2` で終了します（`engine/src/program/generate.cpp:24455-24466,24484-24505`）。
+
+窓幅に関係する主な相互作用は次のとおりです。
+
+- `--suffix-draft` が有効（既定値 3）で `--spec >= 2`、かつ `--mtp-max-t` が未指定なら、現在の値を MTP の上限として保存し、`--spec` を最大 8 まで 2 増やします。lookup が通常の MTP draft より長い窓を使えるようにする調整です（同 `:1158-1162,5033-5039`）。
+- `--lookup-max-t` と suffix draft が有効なら、`--spec` は lookup の窓幅に応じて `kVerifyLongT` まで引き上げられることがあります。`--lookup-chain` が有効なら chained lookup を含む窓を最大 8 に広げます（同 `:5079-5089`）。
+- `--mtp-max-t` が正数なら MTP 自身の最大窓を `min(--mtp-max-t, --spec)` に制限します。これにより長い窓幅を suffix/lookup 側に残せます（同 `:1512-1523,24835-24837`）。
+- `--draft dflash2` では窓幅がカードクラス別 cap（または `--draft-cap`）を上回る場合、stderr に cap 診断を出して `--spec` を cap に下げます。DFlash2 起動失敗時に MTP fallback を選び、`--draft-mtp-spec` を指定していた場合は MTP 用の幅へ下げる経路もあります（同 `:8298-8303,8325-8326`）。
+- MTP を指定していて `--spec < 2` の場合、MTP は「`--spec T (T >= 2)` なしでは無視」と stderr に出され、MTP 指定がクリアされます。`--spec` 自体は plain decode として残ります（同 `:8243-8248`）。
+
+speculative loop は各 round の検証結果に従って出力 token を確定します。正常終了時は stdout に `speculation` の round 数・窓幅・draft acceptance 集計を出し、条件により窓サイズ等の集計も表示します（同 `:25250-25274`）。
 
 ## 適用条件と副作用
 
-- 窓幅を広げると verifier や draft 用 buffer のサイズ・処理幅が変わります。server の batch MTP では `N` に応じた residual buffer を各 slot に GPU allocate し、確保失敗時はエラーを出して終了コード `1` になります（`src/program/generate.cpp:9182-9195`）。
-- Qwen3.6 family model は通常 parser に入る前に family 用 `run` へ委譲されます。この文書は通常 `src/program/generate.cpp` parser の scope であり、family 専用 parser の同名フラグの意味を含みません（`src/program/generate.cpp:2393-2407`）。索引では別 scope の [`qwen36` option 文書](../../qwen36/README.md)を案内しています。
-- parser は数値の変換・範囲を検査しないため、無効な文字列は `atoi` の結果 `0` として扱われ得ます。負値も parser では拒否されません。値の妥当性を caller が期待する前提で使わず、整数 `0`〜`8` の範囲を指定してください（`src/program/generate.cpp:2607-2609`, `include/strata/kernels/verify_kernels.hpp:21`）。
+- 共通 engine parser の root option です。Qwen3.6 family に振り分けられた後の専用 parser は索引で別 scope (`strata-engine/qwen36`) とされているため、この文書の対象外です（`docs/cli/000_cli_tools.md:7-11`、`docs/cli/README.md:1036-1041,1240-1248`）。
+- speculative decoding は通常生成の prompt 読み込み完了後に始まり、prefill 自体を speculative 化するものではありません（`engine/src/program/generate.cpp:24440-24466`）。
+- `--spec` の拡張・縮小は起動時の option 調整と drafter 準備時に行われます。GPU 上では verifier/drafter の window buffers や graph 等を用います。実際に割り当てる資源量は build、backend、モデル、ほかの option に依存し、この調査だけでは一定値を示せません。
+- 既定値 `2` は Metal build 固有です。`--spec` に明示値を渡すとその既定値より優先されます（同 `:1013-1017`）。
 
 ## 出力とエラー
 
-- `--spec` の値が欠けている場合、共通の値取得処理が `--spec needs a value` を stderr に出し、終了コード `2` で終了します（`src/program/generate.cpp:2416-2421, 2607-2609`）。
-- MTP が `N < 2` で無視される場合は stderr に `--mtp is ignored without --spec T (T >= 2)` を出します。native pack の必要条件に違反した場合は `strata generate: ... needs --spec T (T >= 2)` を出して `2` を返します（`src/program/generate.cpp:3755-3760, 5455-5459`）。
-- MTP runtime のロード失敗はエラー文字列を stderr に出して `1` を返します（`src/program/generate.cpp:5470-5473`）。その他の backend／値での失敗条件を網羅する実行確認は行っていません。
+- 検証窓が build 上限を超える場合: `strata generate: --spec N: a speculative window holds 2..K tokens` を stderr に出し、終了コード `1`（`engine/src/program/generate.cpp:5096-5098`）。
+- spec loop の residency table がない場合: 必須条件を示す診断を stderr に出し、終了コード `2`（同 `:24484-24488`）。
+- MTP 指定が `--spec < 2` の場合: MTP を無視する診断を stderr に出し、MTP を外して続行（同 `:8243-8248`）。
+- DFlash2 でカード cap に達した場合: stderr に cap の診断を出し、自動補正後の窓幅で続行（同 `:8298-8303`）。
 
 ## 根拠
 
-- parser 既定値と型: `src/program/generate.cpp:650-657`
-- parser の値取得・代入・不足値経路: `src/program/generate.cpp:2416-2421, 2607-2609`
-- ヘルプ上の説明: `src/program/generate.cpp:935-941`
-- suffix / lookup による窓幅変更: `src/program/generate.cpp:3205-3219`
-- speculative loop と draft policy: `src/program/generate.cpp:16091-16102, 16408-16429`
-- MTP／native pack／serve の適用条件: `src/program/generate.cpp:3753-3760, 5455-5473, 8355-8365`
-- verifier の窓上限: `include/strata/kernels/verify_kernels.hpp:21`
+- `engine/src/program/generate.cpp:1010-1017` — `Options::spec` の意味と Metal / 非 Metal の既定値。
+- `engine/src/program/generate.cpp:1349-1352` — engine help にある option 説明（補助情報。既定の setup 値に関する記載は一般 parser の既定値と同義ではない）。
+- `engine/src/program/generate.cpp:4040` — `--spec` を `atoi` で読み込む parser 分岐。
+- `engine/src/program/generate.cpp:5033-5039,5079-5098` — suffix/lookup/chain による窓幅調整と build 上限検査。
+- `engine/src/program/generate.cpp:8243-8248,8298-8303,8325-8326` — MTP の minimum 条件、DFlash2 cap と fallback 時の調整。
+- `engine/src/program/generate.cpp:24455-24505,25250-25274` — speculative loop の開始、residency 前提、verifier 起動と終了時出力。
+- `docs/cli/000_cli_tools.md:7-11`、`docs/cli/README.md:1036-1041,1204-1207,1240-1248` — tool ID、root scope、索引上のリンクと Qwen3.6 別 scope。

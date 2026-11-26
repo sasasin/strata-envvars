@@ -1,48 +1,47 @@
 # `STRATA_DRAFT_KEEP`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-`--draft auto` で DFlash2 と MTP を切り替えて使うサーバー経路において、現在のリクエストで使っていない側の drafter を、確定した decode window の内容で非同期に追いつかせる処理を止める診断用スイッチです。通常は `STRATA_DRAFT_KEEP` が未設定なら追いつかせる処理を行い、環境変数を設定して `atoi` の結果が 0 になるとその処理を省略します。変数は drafter の選択そのものや、現在のリクエストの draft window を決めません。
+`--draft auto` で DFlash2 がロードされている serve loop において、現在のリクエストで使っていない drafter の状態を、window の commit ごとに追いつかせる処理を止める診断用スイッチです。`STRATA_DRAFT_KEEP` 自体はドラフト方式の選択や token の採否を直接分岐しません。未設定または `atoi` の結果が 0 以外なら idle drafter の upkeep を行い、設定されていて結果が 0 なら省きます（`engine/src/program/generate.cpp:16416-16419, 18982-19005, 23087-23103`）。
 
 ## 値と判定
 
-コードは `std::getenv()` で取得した文字列を `std::atoi()` に渡し、その結果が 0 かで判定します。文字列全体の妥当性検査はありません。
+serve loop の `static const bool` として `getenv(...) != nullptr && atoi(getenv(...)) == 0` を一度評価します。値全体の妥当性検査や範囲制限はありません。設定の有無を先に調べるため、unset は upkeep を有効にします。設定値は C の `atoi` で整数変換され、変換結果が 0 なら upkeep を無効にします（`engine/src/program/generate.cpp:16417`）。
 
-| 環境値 | `draft_keep_off` | 判定 |
-|---|---:|---|
-| 未設定 | `false` | idle drafter の upkeep を許可 |
-| 空文字 | `true` | `atoi("")` が 0 のため upkeep を省略 |
-| `0`、`-0`、`0tail` | `true` | 変換結果が 0 のため upkeep を省略 |
-| `1`、`-1`、`12tail` | `false` | 変換結果が非 0 のため upkeep を許可 |
-| 数字で始まらない文字列（例: `true`, `junk`） | `true` | `atoi` の変換結果が 0 のため upkeep を省略 |
+| 条件 | unset | upkeep を有効にする値（例） | upkeep を無効にする値（例） |
+|---|---|---|---|
+| `STRATA_HAVE_DFLASH2` がある build の `--draft auto` serve loop | 有効 | `1`, `-1`, `1xyz`（変換結果が非 0） | 空文字, `0`, `00`, `0anything`, `true`, `false`, `abc`（変換結果が 0） |
+| macro がない build、または DFlash2 が使われない経路 | upkeep 分岐自体が実行されない | なし | なし |
 
-`atoi` は先頭の空白と符号を許し、先頭の十進数字列を変換します。したがって ` 1x` は非 0、`0.5` は 0 と判定されます。値域の検証や clamp はありません。読み取り式では未設定時だけ明示的に `false` とし、設定時の変換結果が 0 なら `draft_keep_off=true` です（`src/program/generate.cpp:13404-13407`）。
+`atoi` は先頭の空白と符号を許し、数字列を変換して後続の非数字を読み飛ばします。したがって ` 0x` は 0、` 1x` は 1 です。数値文字列の完全一致・大文字小文字・真偽値語の検査はしません。`atoi` で `int` に収まらない値の結果は規定できないため、巨大な値の挙動は保証されません（`engine/src/program/generate.cpp:16417`）。
 
 ## 有効になる条件
 
-値が upkeep を止めるのは、次の条件を満たすときです。
-
-- `STRATA_HAVE_DFLASH2` が有効な build である。upkeep の分岐はこの compile-time guard の内側にあります。
-- DFlash2 が実際に利用可能な状態で `use_df2` が真であり、`--draft auto` が指定されている。
-- decode window が merged window ではない。
-
-この条件下では、その request が使わない drafter の追いつき処理を省略します。現在の request が MTP を使う場合は DFlash2 の `context_async()`、DFlash2 を使い MTP もロード済みの場合は `mtp.prefill()` が通常の upkeep です。`--draft auto` の request ごとの drafter 選択は request の `draft` 指定または `--draft-rule` によって決まり、この環境変数はその選択より後の upkeep 分岐だけに作用します（`src/program/generate.cpp:15190-15235,18535-18549`）。
+- `STRATA_HAVE_DFLASH2` が定義された build である必要があります。CUDA/HIP 共通 engine ではこの macro を定義し、macro がない場合 `use_df2` は常に `false` です（`engine/cmake/strata_gpu_engine.cmake:6-13`, `engine/src/program/generate.cpp:8151-8159`）。
+- serve loop で DFlash2 が実際に有効で、さらに `o.draft_auto` が真である必要があります。DFlash2 が起動時に設定できず MTP に fallback した場合は `use_df2` が false に戻るため、この upkeep は行われません（`engine/src/program/generate.cpp:13584-13615`）。
+- `--draft auto` では CUDA/HIP 共通 engine の初期化が multi-GPU layer split と batch slots を許可しない旨を出し、その条件では DFlash2 を有効にしません。通常の `--draft dflash2`、MTP のみ、DFlash2 を使わない build でも変数による upkeep はありません（`engine/src/program/generate.cpp:8266-8276`）。
+- リクエスト単位で `--draft auto` の選択が行われ、選択 drafterが DFlash2 ならアイドル MTP を `prefill` し、MTP ならアイドル DFlash2 に verifier tap を渡して `context_async` します。選択自体は request の `draft` または `--draft-rule` によって決まり、この環境変数は選択を上書きしません（`engine/src/program/generate.cpp:18982-19005, 23089-23103`）。
+- upkeep は merged window では実行されません（`engine/src/program/generate.cpp:23091-23093`）。
 
 ## 実行時の詳細
 
-環境変数の判定は `static const bool` の初期化時に一度だけ行われ、同じプロセス内では結果が保持されます。したがって、初回評価後にプロセス環境を書き換えても再判定されません（`src/program/generate.cpp:13404-13407`）。CLI 引数や他の環境変数でこの値を上書きする処理は見つかりません。
+設定値は serve loop の初期化で初めて該当行に到達したときに読み、`static const` に保持します。以降のリクエストでは再読込しないため、プロセス実行中に環境を変更しても反映されません。CLI 引数や他の環境変数からこの bool を上書きする処理はありません（`engine/src/program/generate.cpp:16397-16419`）。
 
-upkeep を許可した場合、idle drafter の処理はその drafter 自身の stream にキューされ、decode window の処理と重なります。`keep_pending` が立つと次の window に進む前に `keep_sync()` が待ち、request の終了時にも同じ待機をします。環境変数によって upkeep を省略した場合は、これらの upkeep 処理と対応する待機が発生しません（`src/program/generate.cpp:17421-17430,18283-18288,18537-18549,18664-18665`）。コード上の目的は、後続の request が利用できるよう idle drafter の context / K/V を確定 window に追いつかせることです。省略時に後続 request がどう再構築・回復するかを、この分岐だけからは断定できません。
+upkeep が有効なら、各非 merged window の commit 後に、使われていない側の drafter の状態を更新します。DFlash2 側は非同期 `context_async` で tap rows と位置を記録して context を進め、MTP 側は `prefill` します。次の window が verifier の tap / residual rows を書き換える前に `keep_sync()` が保留中の DFlash2 stream と MTP stream を待ちます。またリクエスト終了時にも保留を待ちます（`engine/src/program/generate.cpp:21756-21765, 22803-22808, 23087-23103, 23223-23227`; `engine/src/core/dflash2.cpp:1145-1167`）。`STRATA_DRAFT_KEEP` を設定して変換値が 0 の場合、この upkeep 呼び出しとその wait は登録されません。次にアイドルだった drafter を選ぶリクエストでの再同期・再初期化の結果は、このスイッチの分岐だけからは保証できません。
 
-この変数専用のログ、警告、終了経路はありません。upkeep を有効にしたとき、非同期 DFlash2 context 更新の投入失敗は `ERR <err>` を stdout に出して request loop を終了し、同期時の失敗も `keep_sync()` の偽を受けて `ERR <err>` を出し終了します。MTP stream の同期失敗時には `err` が `the MTP upkeep failed` に設定されます。upkeep を省略すると、その upkeep 自体に起因するこれらの経路は通りません（`src/program/generate.cpp:17423-17430,18541-18546,18287,18664`）。
+## ログと測定値
+
+この変数専用のログや警告はありません。upkeep を実行して `context_async` または MTP `prefill` が失敗すると、その場で stdout に `ERR <err>` を出して request 処理から `return 1` します。upkeep を待つ `keep_sync()` の失敗も同じ形式で `ERR <err>` を出します。DFlash2 の `context_async` は行数が範囲外なら `dflash2: context_async rows out of range` を返し、stream 同期失敗時は CUDA error を含む文字列を返します（`engine/src/program/generate.cpp:23095-23100, 22808, 23226`; `engine/src/core/dflash2.cpp:1145-1167`）。
+
+`STRATA_DRAFT_LOG` が設定され、DFlash2 が有効なら stderr に request ごとの `strata draft: ... keep_ms=...` 行を出します。これは別変数によるログで、`STRATA_DRAFT_KEEP` の値や理由は表示しません。upkeep を止めた場合、当該 upkeep に計上される `keep_ms` は 0 のままです（`engine/src/program/generate.cpp:16416-16417, 23236-23239`）。この変数に関する測定値は確認できません。
 
 ## 根拠
 
-- 候補名の全参照検索では、実際の環境読み取りは `src/program/generate.cpp:13405` の 1 箇所です。値の利用箇所は `src/program/generate.cpp:18538` で、同名の別実装、helper 経由の読み取り、動的な名前の受け渡しは確認されませんでした。
-- `src/program/generate.cpp:13404-13407` — `getenv` / `atoi` による判定と static cache。
-- `src/program/generate.cpp:15190-15235` — `--draft auto` の request 単位の drafter 選択。
-- `src/program/generate.cpp:17421-17430,18283-18288,18664-18665` — upkeep 同期の条件とエラー返却。
-- `src/program/generate.cpp:18535-18549` — `STRATA_HAVE_DFLASH2` 下の upkeep と `STRATA_DRAFT_KEEP` による抑止。
-- `docs/DETAILS.md` には DFlash2 や draft の説明がありますが、`STRATA_DRAFT_KEEP` の参照はなく、この診断用スイッチについて追加の挙動や測定値は確認できませんでした。
+- 候補名の実読み取りと値の判定: `engine/src/program/generate.cpp:16417`
+- build macro と DFlash2 初期化・fallback: `engine/cmake/strata_gpu_engine.cmake:6-13`, `engine/src/program/generate.cpp:8151-8159, 13584-13615`
+- auto の drafter 選択: `engine/src/program/generate.cpp:18982-19005`
+- commit 後の idle drafter upkeep と待機: `engine/src/program/generate.cpp:21756-21765, 22803-22808, 23087-23103, 23223-23227`
+- DFlash2 の非同期 context 登録と待機: `engine/src/core/dflash2.cpp:1145-1167`
+- upkeep の失敗表示と別変数による request log: `engine/src/program/generate.cpp:16416-16417, 23095-23100, 23226, 23236-23239`

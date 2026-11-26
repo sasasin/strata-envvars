@@ -1,60 +1,50 @@
 # `STRATA_MIRROR_MIB`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL 版 `strata generate` の `--stream-experts` 経路で、VRAM の expert cache に入らない expert を pinned host memory（SYCL USM host allocation）へ先読みする量の上限を MiB 単位で指定します。mirror address は device-built verify plan に渡され、`STRATA_VERIFY_DEVICE_PLAN` が有効で、その plan が device 計画する miss を処理するとき GPU が PCIe 経由で読めます。プロンプト経路も、mirror にある expert は SSD から毎回読む代わりに mirror から DMA できます。
-
-CUDA/HIP の通常経路にこの変数の読み取りはありません。これは一般的な host arena のサイズ設定ではなく、native pack の expert をストリームする場合の SYCL mirror 上限です。
+SYCL の `--stream-experts` 経路で、VRAM の expert cache に入らない expert を pinned host memory にミラーする量の上限を MiB で指定する。値は `generate.cpp` のミラー準備時に byte の cap に変換され、GGUF expert source の `mirror` に渡る。ミラーできた expert は device 側のアドレス表に登録される。これはミラー対象の上限であり、expert cache の容量 (`--expert-cache`) や PCIe 経由で GPU が処理する miss の割合 (`--pcie-frac`) は別設定である（`engine/sycl/src/program/generate.cpp:5426-5429,5475-5505`）。
 
 ## 値と判定
 
-| 値 | cap の扱い |
-|---|---|
-| 未設定 | `/proc/meminfo` の `MemAvailable` から 4 GiB を引いた値。`MemAvailable` が 4 GiB 以下、または読み取りに失敗した場合は 0。 |
-| 設定あり | `std::atoll(value)` の結果を `uint64_t` に変換し、20 bit 左シフトする（MiB 換算）。 |
-| 空文字・数値に変換できない文字列 | `atoll` が 0 を返すため cap は 0。mirror しない。 |
-| 数字の後ろに文字が続く値 | 数字の prefix だけが `atoll` で変換される。例: `512junk` は 512 MiB。文字列全体の検証はない。 |
-| 負数 | 符号付き `atoll` の結果を unsigned に変換してからシフトするため、0 にはならず非常に大きな cap になる。負数を無効化手段として扱わない。 |
+実行時に `std::getenv` で読み、`std::atoll` の結果を使う。文字列全体の数値妥当性、末尾文字、範囲は検証されない。`atoll` が 0 を返す文字列（未設定時以外の空文字、非数値文字列、先頭が `0` の文字列など）は cap 0 になる。したがって `0`, `0anything`, `true`, `false`, 空文字はいずれも 0 として扱われ、ミラーを開始しない。`12`, `12MiB`, ` 12` は先頭の数値部分が 12 となり 12 MiB の上限になる。符号は受け付けられ、負値を拒否する検査はない。通常の範囲内の整数について、上限値自体はミラー対象が尽きるか cap に達するまで使われる（`engine/sycl/src/program/generate.cpp:5475-5488`; `engine/sycl/src/core/gguf_expert_source.cpp:123-135`）。
 
-先頭空白と符号は `atoll` の変換規則に従います。値の読み取りは mirror 構築時の一度だけで、static cache ではありませんが、同じ起動処理で後から環境を変えて再評価する経路はありません。
+| 条件 | 未設定 | 有効になる値（例） | ミラーしない値（例） |
+|---|---|---|---|
+| ミラー上限の計算 | Linux の `/proc/meminfo` から得た `MemAvailable` が 4 GiB を超えればその差、そうでなければ 0。UMA では後述の既定値に置き換わる | `1`, `12`, `12MiB`（数値接頭部を MiB として使う） | `0`, `0anything`, `true`, `false`, 空文字（`atoll` が 0） |
+| UMA (`device_unified_memory()`) 上での既定値 | `--expert-cache auto` なら 0。明示 cache なら `uma_free_bytes(0)` から `--vram-reserve-mib` 分を引いた量（下限 0） | 明示した非ゼロ値はその値を cap とする | 明示した 0 相当値は cap 0 |
 
-cap は割り当てる上限であり、要求した MiB 数を必ず確保する指定ではありません。expert ごとのサイズを 256 byte 境界に丸め、候補の順に追加し、次の expert 全体が cap を超える時点で打ち切ります。expert の一部だけを mirror することはありません。
+負値は入力検証されず、`atoll` 結果を unsigned に変換してから 20 bit 左シフトするため、負の数を「0」や負の cap と解釈する保証はない。`atoll` の範囲外入力も Strata 側で検査されない。これらの値は指定しないこと（`engine/sycl/src/program/generate.cpp:5475-5485`）。
 
 ## 有効になる条件
 
-この変数が参照されるのは、すべての条件を満たす場合だけです。
-
-- `--stream-experts` が指定されている。
-- expert source が GGUF source で、`--expert-cache` が正数。
-- `--stream-experts` の source 初期化では native (IQ) pack と `--native SHARD1` が必要。満たさない場合、起動時にエラーを出して終了する。
-- 候補 expert があり、計算された cap が正数。
-
-`--stream-experts` なし、または expert cache が 0 の場合、この環境変数の値は読み取られません。layer split では mirror 候補を最初の GPU の layer（`split_at[0]` まで）に限ります。残りの GPU の layer の miss はこの mirror には含みません。
-
-候補の順番は、まず profile に載った非 resident expert（profile 順）、次に profile にない非 resident expert、最後に条件を満たした prompt loan 用の cache tail の expert です。従って cap が足りないと、通常の miss を優先し、loan 用の追加分が先に省かれます。loan 用候補は `--no-prefill-borrow` がなく、`--prefill-chunk > 0` で、単一 GPU の場合に追加されます。`STRATA_LEND_MIRROR` は追加する tail slot 数を変えます。
+- SYCL の `strata generate` 実行で `--stream-experts` が有効、expert source が GGUF (`srcp == &gguf_src`)、かつ `--expert-cache` の解決後の値が正であること。`--stream-experts` はネイティブ (IQ) pack と `--native SHARD1` も要求する（`engine/sycl/src/program/generate.cpp:2002-2005,4711-4725,5431-5432`）。
+- その cache に入らなかった expert があること。multi-GPU layer split ではミラー候補は最初の GPU が担当する layer までに限られる（`engine/sycl/src/program/generate.cpp:5435-5446`）。
+- cap が正であること。cap 0 なら `mirror` は呼ばれず、正でも上限に入らない候補はミラーされない（`engine/sycl/src/program/generate.cpp:5486-5488`; `engine/sycl/src/core/gguf_expert_source.cpp:128-136`）。
+- UMA の `--expert-cache auto` では、変数が未設定の場合の既定 cap は 0。明示した `--expert-cache` なら、未設定時の cap は UMA pool の残りから `--vram-reserve-mib` を引いた値になる。環境変数が設定されていれば、どちらも `atoll` 由来の明示 cap が使われる（`engine/sycl/src/program/generate.cpp:5477-5485`）。
+- UMA、auto cache、単一 GPU、`--stream-experts`、GGUF、`STRATA_VERIFY_NO_HOST` が非空かつ `0` 以外、cache が全 expert を保持しない条件では、非ゼロの変数値が起動前の拒否判定を通す条件の一つになる。ここで 0 相当値は「明示的なミラーあり」とは数えられない（`engine/sycl/src/program/generate.cpp:5210-5226`）。
+- `STRATA_VERIFY_NO_HOST` が非空かつ `0` 以外で、ミラー後も miss が残ると終了コード 2 で拒否する。UMA の場合は RAM と headroom の数値を含む `REFUSED` を出し、他の場合は「neither in VRAM nor mirrored」とする `REFUSED` を出す（`engine/sycl/src/program/generate.cpp:5508-5532`）。
+- prefill borrow が許可され `--prefill-chunk > 0`、単一 GPU の場合、`STRATA_LEND_MIRROR` に従って cache tail の expert も miss の後ろにミラー候補として追加される。追加候補は通常の未 cache expert より cap を先に消費しないよう後ろに置かれる。UMA ではこの変数が未設定なら default 0、非 UMA では cache slot の 10%（最大 1200）が既定である。`STRATA_MIRROR_MIB` はこれらを含む全候補の cap となる（`engine/sycl/src/program/generate.cpp:5447-5467`）。
 
 ## 実行時の詳細
 
-起動時に `/proc/meminfo` を開き、`MemAvailable:` の kB 値を byte に換算します。未設定時の既定 cap は空きメモリ全量ではなく、その値から 4 GiB を差し引いたものです。明示値は `atoll` 後に MiB から byte へ換算されます。
+変数は起動時設定として `generate.cpp` 内で2回読み取られ、static cache には保存されない。1回目は UMA auto-cache の事前拒否判定向けで、`std::atoll(...) != 0` だけを確認する。2回目はミラー準備時に cap を計算する。後者では未設定時の cap を `/proc/meminfo` の `MemAvailable - 4 GiB`（最低 0）から始め、UMA かつ未設定なら pool の空き容量に応じた値に置き換える。明示値は MiB を byte に変換し、UMA でも同じ cap として扱う。CLI にこの cap を直接上書きする引数はなく、`--expert-cache` は候補となる cache miss を変える別の設定である（`engine/sycl/src/program/generate.cpp:5210-5214,5468-5485,2002-2005`）。
 
-`GgufExpertSource::mirror()` は候補を cap 内で選び、最大 2 GiB 単位の pinned host chunk を割り当てます。expert blob は 8 thread で GGUF から読み込まれます。割り当てまたは読み取りに失敗すると負値を返し、呼び出し側は `mirroring the experts missing from VRAM: ... (they stay on the SSD)` を stderr に出して処理を続けます。成功時は mirror した個数・容量・所要時間を stderr に出し、device-readable address の表を作って verify plan に設定します。
+ミラー候補は profile 順に未 cache expert を集め、profile にない expert を追加する。layer split では最初の GPU の範囲のみを対象にする。`GgufExpertSource::mirror` は候補を順に追加し、各 blob の 256-byte 丸めサイズを cap 内に収め、次の blob が入らなくなった時点で打ち切る。確保・GGUF 読み取り失敗時にはエラー文字列を返し、呼び出し側は `mirroring the experts missing from VRAM: ... (they stay on the SSD)` を stderr に出して処理を続ける。成功時はミラー数・容量・所要時間を stderr に出して device 用アドレス表を作る（`engine/sycl/src/core/gguf_expert_source.cpp:123-135,153-205`; `engine/sycl/src/program/generate.cpp:5486-5505`）。
 
-mirror に入らなかった expert は引き続き SSD 側に残ります。`STRATA_VERIFY_NO_HOST` は空でなく、文字列全体が `0` と異なる場合に有効です。これが有効で未 mirror の miss がある場合は、呼び出し側が `REFUSED: ... raise STRATA_MIRROR_MIB or the free RAM, or lower --max-context` を stderr に出し、終了コード 2 で生成を拒否します。未 mirror miss がない場合や `STRATA_VERIFY_NO_HOST` が有効でない場合はこの拒否分岐に入りません。有効値の扱いは `sycl/src/program/generate.cpp:4836-4843` を参照してください。
+ミラーできなかった expert があり、`STRATA_VERIFY_NO_HOST` が有効なら拒否経路に入り、終了コード 2 となる。通常の host fallback を許す場合、ミラーされない expert はこの処理では SSD 上に残る（`engine/sycl/src/program/generate.cpp:5488-5492,5508-5532`）。この変数は CUDA/HIP 経路では読まれず、生成実行以外のサーバー要求ごとに再評価する処理もない（候補名の実装参照は `engine/sycl/src/program/generate.cpp:5211,5475` のみ）。
 
-`docs/INTEL.md` は、mirror が VRAM 外 expert の GPU 読み取りに使われる構成例と、A750 で大きな単一 host allocation が失敗した測定例を記載しています。現行実装は最大 2 GiB ごとに chunk 化しています。資料の測定値は特定の Arc A750 環境での報告であり、他機種の確保可能量を示すものではありません。
+## ログと測定値
+
+- ミラー確保または GGUF 読み取りの失敗: `strata generate: mirroring the experts missing from VRAM: <error> (they stay on the SSD)`（`engine/sycl/src/program/generate.cpp:5488-5492`）。
+- 成功: `strata generate: <n> of <total> experts missing from VRAM (+ <n> in the prompt loan's slots) mirrored in pinned host memory (<GiB> GiB, <seconds> s); the GPU reads them over PCIe`（`engine/sycl/src/program/generate.cpp:5493-5497`）。
+- `STRATA_VERIFY_NO_HOST` 有効時に未ミラー miss が残る場合は、該当する `REFUSED` を stderr に出して終了コード 2（`engine/sycl/src/program/generate.cpp:5511-5532`）。
+- ソースにこの変数の性能測定値はない。設計資料の測定記録は本調査では挙動の根拠に用いていない。
 
 ## 根拠
 
-- `sycl/src/program/generate.cpp:4767-4776` — mirror の目的、デフォルト cap の説明、起動時の適用範囲と layer split の上限。
-- `sycl/src/program/generate.cpp:4777-4803` — 候補の並び、非 resident expert と prompt loan slot の選定条件。
-- `sycl/src/program/generate.cpp:4805-4816` — `MemAvailable` 読み取り、4 GiB 差し引き、`atoll` と MiB 換算、mirror 呼び出し。
-- `sycl/src/program/generate.cpp:4817-4852` — 失敗・成功ログ、device address 表、`STRATA_VERIFY_NO_HOST` 時の拒否と adaptive swap の停止。
-- `sycl/src/program/generate.cpp:4153-4167` — `--stream-experts` 時の GGUF source 条件。
-- `sycl/src/core/gguf_expert_source.cpp:118-201` — cap 内での候補選択、256 byte 丸め、chunk allocation、並列読み込み、mirror 表への登録。
-- `sycl/src/core/gguf_expert_source.cpp:204-216` — mirror 登録状態と device alias の取得。
-- `sycl/include/strata/core/gguf_expert_source.hpp:46-57` — mirror API と device-readable alias の説明。
-- `sycl/src/program/generate.cpp:6957-6961,12056-12065` — mirror table を verify plan に設定する箇所。
-- `sycl/src/core/verify.cpp:723-729` — 非 resident layer の device plan が `STRATA_VERIFY_DEVICE_PLAN` の `atoi` 結果で有効になる条件。
-- `docs/INTEL.md:432-437,693-699` — 構成説明と A750 固有の測定例。測定条件は Arc A750 8 GB、64 GB RAM、Ryzen 5 5600X の記載を参照。
+- `engine/sycl/src/program/generate.cpp:5210-5226` — UMA auto-cache と `STRATA_VERIFY_NO_HOST` の事前拒否判定。
+- `engine/sycl/src/program/generate.cpp:5431-5488` — SYCL stream 条件、miss 候補、既定値と cap の計算。
+- `engine/sycl/src/program/generate.cpp:5488-5532` — mirror 呼び出し、ログ、未ミラー miss の拒否。
+- `engine/sycl/src/core/gguf_expert_source.cpp:123-205` — cap による候補選択、pinned host allocation、ミラー記録。

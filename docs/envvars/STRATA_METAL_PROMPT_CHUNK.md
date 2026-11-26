@@ -1,45 +1,55 @@
 # `STRATA_METAL_PROMPT_CHUNK`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal エンジンの高速 prompt 経路で、一度に処理する入力 token 行数（chunk size）を指定します。prompt の全体長ではなく、chunk ごとに繰り返す処理の行数です。SSD から expert をストリーミングする場合と、モデルが常駐している場合で読み取り箇所・既定値・上限が異なります。
+Metal engine の高速 prompt 経路が一度に処理する token 行数を指定する。通常の decode window 経路とは別の prompt chunk 経路で使われ、モデル重みの常駐時と SSD から expert を stream する時で値の上限と既定値が異なる。直接の読み取りは `Window::prompt` と `Window::prompt_gemm_init` にある（`engine/metal/src/engine/window.cpp:3037-3053`, `583-589`）。
+
+この変数は Metal engine 内でだけ参照される。Metal 以外の backend や CLI 側で値を解釈する処理は見つからなかった。prompt の高速経路自体が選ばれない場合、この変数は chunk 処理に使われない。
 
 ## 値と判定
 
-どちらの経路も `std::atoi` で先頭の整数部分を読みます。文字列全体の検証はしません。したがって空文字や数値で始まらない値は 0、`512tail` は 512、負数は後述の下限値になります。値は行数として使われます。
+どちらの経路も `std::getenv` の文字列を `std::atoi` に渡し、数値全体の妥当性検査や無効値警告はしない。未設定と設定済みの空文字は異なり、空文字は `atoi("") == 0` として最小値へ丸められる。数値の先頭部分だけが変換されるため、たとえば `128tail` は 128、`junk` や `0anything` は 0 として扱われる。最終的な chunk は 64 行単位になる。
 
-| 経路 | 未設定時 | 設定時の変換・制限 |
-|---|---|---|
-| 常駐モデルの prompt GEMM | 2048 | `max(64, min(8192, atoi(value)))`。範囲は64〜8192。64の倍数への丸めはしない |
-| SSD ストリーミングの prompt GEMM | 物理メモリが96 GiB以上なら4096、それ未満なら1024 | `max(64, atoi(value))` の後、64の倍数へ切り下げる。明示値に8192の上限はない |
+| 実行経路 | unset | 設定値の変換と範囲 | 例 |
+|---|---|---|---|
+| resident（expert stream なし） | 2048 | `atoi` の結果を 64〜8192 に clamp し、その後 64 の倍数へ切り下げる | `0`、負値、`junk`、空文字、`63` → 64。`127` → 64。`128` → 128。`8193` → 8192。 |
+| SSD streaming | `hw.memsize` が 96 GiB 以上なら 4096、それ未満なら 1024 | `atoi` の結果に最低値 64 を適用し、64 の倍数へ切り下げる。ソース上の明示的な上限 clamp はない | `0`、負値、`junk`、空文字、`63` → 64。`127` → 64。`128` → 128。8192 より大きい値も切り下げ後の値で使う。 |
 
-例として `0`、空文字、`abc`、負数はいずれも64行になります。常駐経路で `500` は500行、ストリーミング経路では448行です。ストリーミング経路で64未満も64行、常駐経路で8192超も8192行です。数値変換の範囲外入力の動作は文書化できる安全な範囲として扱わず、指定しません。
+この変数の値について `true` / `false` の文字列比較はなく、数値として解釈できない文字列は 0 相当になる。`atoi` の整数範囲外の入力に対する検査や保証は実装にない（`engine/metal/src/engine/window.cpp:3040-3049`, `583-589`）。
 
 ## 有効になる条件
 
-- 対象は Metal エンジンです。
-- `STRATA_METAL_PROMPT=window` なら prompt は decode window 経路へ固定され、この chunk 設定を使う GEMM 経路には入りません。
-- 非ストリーミング時は、`STRATA_METAL_PROMPT_GEMM` が文字列全体として `0` でなく、prompt 長が `STRATA_METAL_PROMPT_GEMM_MIN` 以上で、GEMM 用状態が初期化できた場合に使われます。同じ値判定は常駐経路内にもあり、既定の最小長は64です。
-- ストリーミング時も `STRATA_METAL_PROMPT=window` は GEMM prompt を無効にします。また `STRATA_METAL_PROMPT_GEMM=0` または prompt 長が `STRATA_METAL_PROMPT_GEMM_MIN` 未満なら従来の window 経路になります。既定の最小長は64です。
-- `STRATA_METAL_PROMPT_GEMM` はストリーミング arena 初期化時にも参照されます。値が未設定または `0` 以外なら、arena の slot 数引数を576にして prompt GEMM 用領域を見込んだ後、chunk 値を読みます。`0` の場合は slot 数引数が64になり、prompt 実行時の分岐も window 経路になります。
+- Metal engine の prompt 読み込み経路であること。`Window::init` は `ExpertStream::wanted` の結果で resident / streaming を分ける（`engine/metal/src/engine/window.cpp:714-744`）。
+- resident 経路では `STRATA_METAL_PROMPT=window` で window 経路を強制しておらず、prompt 長が `STRATA_METAL_PROMPT_MIN`（既定 32）以上であること。この条件を満たさない場合は `STRATA_METAL_PROMPT_CHUNK` を使う `Window::prompt` に進まない（`engine/metal/src/engine/window.cpp:3743-3748`）。
+- streaming 経路では `STRATA_METAL_PROMPT=window` でなく、`STRATA_METAL_PROMPT_GEMM` が文字列 `0` ではなく、prompt 長が `STRATA_METAL_PROMPT_GEMM_MIN`（既定 64）以上であること。満たさない場合は decode window の経路へ進む（`engine/metal/src/engine/window.cpp:3749-3768`）。
+- resident の chunk 値は `Window::prompt` の関数内 static に保存される。streaming の値は prompt GEMM 用バッファを初期化する `Window::prompt_gemm_init` で読み、その初期化後は `pg_` があるため再読込しない。したがって、該当経路の初期化後にプロセス環境を変更しても反映されない（`engine/metal/src/engine/window.cpp:3037-3041`, `583-589`）。
+- CLI 引数や設定ファイルによるこの環境変数の上書きは、Strata 所有コード内では見つからなかった。
 
 ## 実行時の詳細
 
-常駐経路では、最初の `Window::prompt()` 呼び出し時に chunk 行数を `static const` として計算し、以後そのプロセス内では再評価しません。各 chunk について prompt chain を実行し、次の行群へ進みます。chunk の最終部分だけは指定行数より短くなります。
+resident 経路では、初回 `Window::prompt` 呼び出しで chunk 数 `C` を決め、`pc_setup` に最大 prompt 長と 64 行の下限を渡す。その後 prompt 全体を `C` 行以下に分け、各 chunk を `pc_chunk` で処理する。最後の chunk は残り行数だけを処理する（`engine/metal/src/engine/prompt_chain.inc:583-607`）。
 
-ストリーミング経路では `prompt_gemm_init()` で値を読み、`PromptGemm` の `MT` として保持します。ストリーミング arena の初期化中に作られるのが通常で、prompt 実行時に遅延初期化される場合も、一度 `pg_` が作られると再初期化しません。各 chunk で token を整数配列へコピーし、`prompt_chunk()` と任意の `on_chunk` 処理を順に実行します。prompt GEMM 用 arena 領域を確保できない場合は `metal prompt: no arena region for the prompt buffers` で失敗します。
+streaming 経路では `prompt_gemm_init` が `PromptGemm::MT` を chunk 数 `C` として設定し、必要なバッファを作る。96 GiB 以上の物理 RAM で未設定なら 4096、それ未満なら 1024 が基準値になる。実行時は prompt を `C` 行以下に分割し、各 chunk を `prompt_chunk` に渡す（`engine/metal/src/engine/window.cpp:3037-3053`, `3749-3765`）。
 
-初期化に成功すると stderr に `strata metal: prompts on the matrix units in chunks of %d ...` が出て、選択された行数、expert/QSA variant、layout、buffer size が表示されます。常駐経路では必要な Metal buffer を確保し、ストリーミング経路では prompt 実行中に expert arena 内の領域を使います。
+chunk 数が大きいとバッファ需要も増える。streaming ではバッファ用の arena region を確保できない場合に初期化が失敗する。resident の `pc_setup` 失敗、または chunk が context 範囲を越える場合も prompt 処理は失敗を返す（`engine/metal/src/engine/window.cpp:3116-3127`, `3131-3139`; `engine/metal/src/engine/prompt_chain.inc:588-597`）。
 
-`docs/MAC.md` は表で既定値を2048と記しますが、ソース上のストリーミング既定値は物理メモリによって1024または4096です。同ドキュメント本文には大容量ストリーミング Mac の4096と、小容量機の1024の説明もあります。本文にある M5 Max / UD-Q5 の測定値（4K promptで1024行=700、2048行=920、4096行=1100 tok/s、32Kでも同じ）は文書記載値であり、ここでは再測定していません。
+## ログと測定値
+
+prompt GEMM の初期化が成功すると stderr に `strata metal: prompts on the matrix units in chunks of %d ...` が出て、採用された行数とバッファ量を示す。streaming で arena region を用いるときは末尾に `, in the expert arena while a prompt runs` が付く（`engine/metal/src/engine/window.cpp:3123-3126`）。resident では `STRATA_METAL_TRACE` が設定されている場合、各 chunk の位置・行数・時間を `strata metal: prompt chunk pos ...` として出す（`engine/metal/src/engine/window.cpp:3455-3467`）。
+
+エラー文字列には `metal prompt: setup failed`、`metal prompt: no arena region for the prompt buffers`、`metal prompt: chunk size out of range`、および context 超過の理由がある（`engine/metal/src/engine/prompt_chain.inc:588-597`; `engine/metal/src/engine/window.cpp:3118-3121`, `3131-3139`）。呼び出し側ではこれらの失敗で prompt 処理を中断して false を返す。ここでは変数値ごとの速度や品質の測定値は記載しない。
+
+`docs/MAC.md` は streaming の既定値（96 GB 以上で 4096、それ未満で 1024）と resident の既定値 2048 を説明しており、ソースと整合する（`docs/MAC.md:74-75`, `269`; `engine/metal/src/engine/window.cpp:3045-3049`, `583-589`）。ただし、同文書は `atoi` の扱い、丸め、resident の上限 8192、streaming で上限 clamp がない点を説明していない。
 
 ## 根拠
 
-- `metal/src/engine/prompt_chain.inc:394-415` — 常駐 prompt chain の `atoi`、64〜8192の clamp、chunk loop。
-- `metal/src/engine/window.cpp:2019-2034` — ストリーミングを含む prompt GEMM 初期化、96 GiB 判定、既定行数、64行単位への切り下げ。
-- `metal/src/engine/window.cpp:2093-2105` — streaming arena region の確保と stderr の初期化ログ。
-- `metal/src/engine/window.cpp:1194-1209` — streaming arena 初期化前の `STRATA_METAL_PROMPT_GEMM` 判定と prompt GEMM 初期化。
-- `metal/src/engine/window.cpp:2545-2587` — `STRATA_METAL_PROMPT=window`、prompt 長と prompt GEMM 設定に基づく経路選択、および window fallback。
-- `docs/MAC.md:110,183-190` — ストリーミング時の既定値・測定値と環境変数表。
+- `engine/metal/src/engine/window.cpp:714-744` — Metal window 初期化と resident / streaming 判定。
+- `engine/metal/src/engine/window.cpp:3037-3053` — streaming 含む prompt GEMM 初期化、既定値と chunk 数。
+- `engine/metal/src/engine/window.cpp:3116-3127` — arena region の失敗と初期化ログ。
+- `engine/metal/src/engine/window.cpp:3131-3139` — chunk/context の失敗条件。
+- `engine/metal/src/engine/window.cpp:3455-3467` — trace ログ。
+- `engine/metal/src/engine/window.cpp:3743-3777` — 経路選択、条件、prompt 分割と fallback。
+- `engine/metal/src/engine/prompt_chain.inc:583-612` — resident chunk 数の取得、chunk loop、setup/context error、prompt trace。
+- `docs/MAC.md:74-75`, `269` — 利用者向けの既定値説明。

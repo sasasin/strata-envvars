@@ -1,64 +1,58 @@
 # `--draft-conf`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査時の checkout は `main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（ネイティブ推論エンジン） |
+| コマンド | `strata`（エンジン引数） |
 | オプション | `--draft-conf P` |
 | 別名 | なし |
-| 値 | 数値 `P`。parser は `std::atof` で読み、`0.0`〜`1.0` に clamp する |
+| 値 | 数値。parser は `atof` で読み、`0.0`〜`1.0` に clamp する |
 
 ## 役割
 
-`--draft dflash2` を使うとき、DFlash2 の selector が出す各 draft の確率を先頭から掛け合わせ、その積が指定値を下回る位置で検証 window を終えるための下限値です。`--draft-conf` が正値なら `--spec-min-p` の各 draft 単独の確率による window 判定に代わります。既定値の `0` はこの累積確率判定を無効にし、DFlash2 の window 判定では `--spec-min-p` を使います（`src/program/generate.cpp:795,951,16540-16549`）。
+`--draft dflash2` で DFlash2 が提案した候補を検証する窓幅を、候補ごとの selector 確率の累積積で制限します。累積積が `P` 未満になる候補の手前で窓を止めます。`P=0` は通常の窓幅選択に委ねます。
 
 ## 使い方
 
-通常の `strata` エンジンで、DFlash2 を明示的に選び、draft モデルと MTP fallback を指定する例です。モデルと pack のパスは手元の環境に合わせてください。
-
 ```sh
-strata generate --pack ./target.pack --tokens "1,2,3" --spec 4 --mtp ./mtp --draft dflash2 --draft-model ./draft.pack --draft-conf 0.25
+# DFlash2 の検証窓で、累積確率が 0.4 を下回る位置で窓を止める
+strata --pack target.gguf --mtp draft-dir --draft dflash2 \
+  --draft-model draft.pack --spec 8 --draft-conf 0.4
 ```
-
-エンジンの usage は `strata generate --pack DIR --tokens ...` 形式を示しています。`--draft-conf` 自体は `generate.cpp` の共通引数 parser にあり、この usage 形式の起動でも同じ値を受け取ります（`src/program/generate.cpp:944-952,2694-2701`）。
 
 ## 値と既定値
 
-- 省略時は `0.0` です。正の値だけが累積積の判定を有効にします。
-- `std::clamp` により、負の値は `0.0`、`1.0` を超える値は `1.0` になります。範囲外であることを示す専用エラーはありません（`src/program/generate.cpp:2700`）。
-- 数値変換は `std::atof` で、独自の書式・変換失敗検査はありません。同じオプションを複数回指定した場合は、parser が順に代入するため最後の値が残ります（`src/program/generate.cpp:2416-2421,2700`）。
-- 値を省略すると `next()` が `--draft-conf needs a value` を stderr に出して終了コード `2` で終了します（`src/program/generate.cpp:2418-2420`）。
+- 値は省略できません。値がない場合は `--draft-conf needs a value` を stderr に出して終了コード 2 で終了します（`engine/src/program/generate.cpp:3844-3846`）。
+- `atof` の結果を `[0.0, 1.0]` に clamp します。したがって範囲外の負数は `0`、`1` より大きい数は `1` になり、数値として読めない文字列は `atof` の結果 `0` として扱われます（`engine/src/program/generate.cpp:4162`、`engine/sycl/src/program/generate.cpp:2126`）。
+- 同じ指定を複数回書くと、引数を順に走査して同じフィールドへ代入するため最後の値が残ります（`engine/src/program/generate.cpp:3842-3847,4162`）。
+- CUDA/HIP など `engine/src/program/generate.cpp` の parser では既定値 `0.0` です。SYCL parser では既定値 `0.6` です（`engine/src/program/generate.cpp:1191`、`engine/sycl/src/program/generate.cpp:789`）。
 
 ## 実行時の動作
 
-DFlash2 の draft から得た確率 `dprob` を順に累積乗算し、積が `P` 以上である間だけ window 長 `T` を増やします。積が `P` 未満になった draft の位置で止まるので、確率の個別値ではなく、連続する draft がすべて妥当である確率の積を基準にします。初回 window は後段で `T = 1` に設定されます（`src/program/generate.cpp:16544-16551`）。
+window rule は DFlash2 がそのラウンドの候補元であり、`P > 0` で、確率配列がある場合にこの設定を適用します。窓幅 `T` を 1 から始め、候補確率 `dprob[0]`、`dprob[1]`…を順に掛け、累積積が `P` 以上の間だけ `T` を広げます。上限はその drafter の `cap` です（`engine/include/strata/spec/window_rule.hpp:16-27,57-70`）。実行ループは parser の値と DFlash2 の確率列をこの共通 rule に渡します（`engine/src/program/generate.cpp:25032-25038`、`engine/sycl/src/program/generate.cpp:14052-14058`）。
 
-この条件は `--draft dflash2` が実際に有効な場合に限り適用されます。DFlash2 は `--mtp`、`--spec 2` 以上、native pack、`--draft-model` を必要とし、`--serve`、`--batch`、複数 GPU / layer split では使えません。GPU build で pack load に失敗した場合も MTP に戻ります。DFlash2 が build に含まれない場合もこの専用分岐はコンパイルされません（`src/program/generate.cpp:5447-5452,5474-5514`; `CMakeLists.txt:334-341`）。
+この条件は `--draft mtp` の候補には適用されません。`P > 0` の DFlash2 では `--spec-min-p` による個別確率の窓幅決定後に累積積ルールが窓幅を再設定するため、DFlash2 の窓幅は `--draft-conf` 側で決まります。`P=0` ならこの累積積ルールは無効で、通常の窓幅規則（`--spec-min-p` を含む）が使われます（`engine/include/strata/spec/window_rule.hpp:57-70`）。
 
-`--draft-conf` が `0` 以下なら、DFlash2 の window 判定は `--spec-min-p` の単独確率判定に戻ります。DFlash2 が fallback されて MTP が draft する場合も、`--draft-conf` はその window 判定に使われず、MTP 側は `--spec-min-p` を使います（`src/program/generate.cpp:16511-16512,16529,16540-16549`）。なお、`--spec` は window の幅の元となり、DFlash2 の初期化ではカード別上限または `--draft-cap` に応じて `o.spec` が小さくなることがあります。その後の window cycle や suffix draft の処理も判定後に実行されるため、`--draft-conf` の計算だけで最終 window が決まるとは限りません（`src/program/generate.cpp:5498-5503,16531-16555`）。
-
-Qwen3.6 family は共通 parser より前に専用 parser へ振り分けられ、専用 parser のオプション一覧に `--draft-conf` はありません。その family の起動にこのオプションを渡す用途は対象外です（`src/program/generate.cpp:2390-2408`; `src/qwen35/q36_engine.cu:3743-3790`）。
+CUDA/HIP 系の batch serve では別の窓制御もあります。`STRATA_BATCH_DF2_CONF` が空でない場合はその値が優先され、未設定または空の場合は `--draft-conf` が正ならその値、そうでなければ `0.35` が使われます。これは `--draft-conf 0` だけでは batch serve の累積積制御を無効にできないことを意味します。環境変数の値はここでは `atof` で読み、CLI parser のような clamp はしていません（`engine/src/program/generate.cpp:16802-16808,17140-17143`）。この batch serve 経路と共通 window rule は、同じ設定値を使いますが別の処理です。
 
 ## 適用条件と副作用
 
-このオプション自体は閾値を設定するだけで、ファイルの作成やネットワークアクセスを行いません。DFlash2 を使うときは DFlash2 drafter の追加 VRAM 使用があり、初期化・bind・prepare に失敗すると stderr に理由を出して MTP に fallback します（`src/program/generate.cpp:5474-5514,16148-16165`）。
+- DFlash2 が有効な build・実行経路でのみ意味があります。通常の engine parser では DFlash2 の選択と model pack が別途必要で、help は `--draft dflash2` を Flash-Next 向け CUDA/HIP の機能として説明しています（`engine/src/program/generate.cpp:1361-1366`）。SYCL の help も DFlash2 用として記載していますが、既定値は `0.6` です（`engine/sycl/src/program/generate.cpp:927-930`）。
+- `P` は候補窓幅を変えます。CLI の通常生成では完了時、窓幅統計に `draft-conf` の値も表示します（`engine/src/program/generate.cpp:25264-25268`）。SYCL でも `P>0` なら窓幅統計行が出ますが、その行の表示項目は `min draft probability` と `--spec-min-p` の値であり、`--draft-conf` 自体は表示されません（`engine/sycl/src/program/generate.cpp:14246-14250`）。
+- この値専用のファイル書き込みやネットワーク処理は確認できません。通常の DFlash2 推論が失敗した場合のエラー経路は `--draft-conf` 固有ではなく、drafter の呼び出し側が返すエラーを出力して終了します（例: `engine/src/program/generate.cpp:24961-24964`）。
 
 ## 出力とエラー
 
-`--draft-conf` の値を clamp したことや、閾値で window が短くなったことを示す専用メッセージは確認できません。DFlash2 が有効なら起動時に drafter 有効化のメッセージ、終了時に DFlash2 の平均 draft 時間・round 数・VRAM 使用量が出ます。利用できない条件や初期化失敗時は MTP へ戻す理由が stderr に表示されます（`src/program/generate.cpp:5474-5514,16149-16165,16831-16834`）。
-
-値の欠落は終了コード `2` です。未知のオプションも `unknown argument` と usage を stderr に出して `2` で終了します（`src/program/generate.cpp:2418-2420,2784-2794`）。
+値の欠落は前述のとおり終了コード 2 です。値の数値形式や範囲について個別の拒否エラーはなく、parser で数値変換・clamp されます。生成が正常完了したときの窓幅統計は上記のとおりです（`engine/src/program/generate.cpp:3844-3846,4162,25264-25268`、`engine/sycl/src/program/generate.cpp:2126,14246-14250`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:792-796,949-952` — DFlash2 関連設定、既定値と usage 説明。
-- `src/program/generate.cpp:2416-2421,2694-2701` — 値取得、`--draft` の選択肢、`--draft-conf` の変換・範囲補正。
-- `src/program/generate.cpp:5447-5514,16148-16165` — DFlash2 の適用条件、カード別 window 上限、MTP fallback。
-- `src/program/generate.cpp:16494-16529,16531-16555` — 累積確率・`--spec-min-p` による判定と後続 window 調整。
-- `src/program/generate.cpp:16831-16834` — 終了時の DFlash2 統計。
-- `src/qwen35/q36_engine.cu:3743-3790` — Qwen3.6 専用 parser が受け付ける引数。
-- `CMakeLists.txt:334-341` — DFlash2 実装を CUDA/HIP build に含める条件。
+- `engine/src/program/generate.cpp:1191,1361-1366,4162` — CUDA/HIP 系の値の既定値、help、parser。
+- `engine/sycl/src/program/generate.cpp:789,927-930,2126` — SYCL 系の既定値、help、parser。
+- `engine/include/strata/spec/window_rule.hpp:16-27,57-70` — 適用条件、累積積による窓幅選択、`--spec-min-p` との順序。
+- `engine/src/program/generate.cpp:25032-25038,25264-25268`、`engine/sycl/src/program/generate.cpp:14052-14058,14246-14250` — rule への値の受け渡しと完了時の統計出力。
+- `engine/src/program/generate.cpp:16802-16808,17140-17143` — batch serve の `STRATA_BATCH_DF2_CONF` 優先順位と実際の累積確率判定。
 
-本調査では既存 CLI の help を別途実行しておらず、Release artifact の挙動も確認していません。記述は上記 checkout のソースに基づきます。
+値の浮動小数点境界（NaN 等）や、すべての build 構成での DFlash2 利用可否は、この調査では網羅的に確認していません。

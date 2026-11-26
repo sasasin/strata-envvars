@@ -1,53 +1,53 @@
-# STRATA_EXIT_WITH_PARENT
+# `STRATA_EXIT_WITH_PARENT`
 
-調査対象: Strata main の HEAD 73d4f4196c25a65e02f6b9ef25d354826ce55105（2026-11-23 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-26 時点）。
 
 ## 役割
 
-親プロセスが終了したとき、App Host や長時間動く Control / 準備ツールを終了させるための内部引き継ぎ値。モデル計算や GPU backend の設定ではない。App Host は値が文字列 1 のとき親を監視し、親がなくなると通常の shutdown() を呼ぶ。Python 側の Control / ツールは 1 または PID を受け取り、親の終了を検出すると終了コード 1 で自身を止める。デスクトップ起動処理、Control の取得処理、準備ツール起動処理が子へ値を渡す（app/desktop/src-tauri/src/main.rs:522-540、app/host/server/control-runtime.mjs:88-107,140-146、terminal/setup.py:1131-1150）。
+親プロセスが終了したときに App Host、Control CLI、または準備ツールを停止させるためのプロセス間引き継ぎ値。モデル計算や GPU backend は制御しない。App Host は値が厳密に `1` の場合に親を監視し、消失後は通常の `shutdown()` に入る。Python Control は `1` で直接の親を監視し、準備ツールは `1` または PID を監視対象にする。`setup.run()` は準備ツールの子プロセスに setup 自身の PID を設定して渡す（`app/host/server/index.mjs:2594-2603`、`terminal/strata.py:38-42`、`terminal/strata_control/parentwatch.py:15-23`、`terminal/tools/exit_with_parent.py:12-25`、`terminal/setup.py:1131-1150`）。
 
 ## 値と判定
 
-読み取り側ごとに判定規則が異なり、共通の数値変換はない。
+読み取り側ごとに規則が異なる。共通の boolean parser は使われていない。
 
-| 読み取り箇所 | 未設定 | 有効になる値 | 無効になる値・扱い |
+| 読み取り側 | 未設定・空文字 | 有効になる値 | 無効値・境界の扱い |
 |---|---|---|---|
-| App Host (app/host/server/index.mjs) | 監視しない | 値が厳密に文字列 1 | 空文字、0、true、前後に空白のある 1 などは監視しない。trim や数値変換なし (app/host/server/index.mjs:2590-2597)。 |
-| Control CLI (terminal/strata_control/parentwatch.py) | 監視しない | 前後空白を除いて 1 | 空文字、0、PID 数値、true などは監視しない。値全体が 1 と一致する必要がある (terminal/strata_control/parentwatch.py:15-23)。 |
-| tools/exit_with_parent.py と tools/mtp_fetch.py | 監視しない | 前後空白を除いた 1、または isdigit() が真の文字列で表した PID | true、+123、-123、空文字などは監視しない。1 は実親 PID として扱い、他の数値文字列は int() で PID にする (terminal/tools/exit_with_parent.py:12-25、terminal/tools/mtp_fetch.py:240-256)。 |
-| 準備子プロセスへ渡す値 (setup.run) | setup 自身の PID を設定して渡す | 既存値が空白除去後に数字のみで 1 以外なら、その値を保持 | 1、未設定、空文字、数字以外は setup 自身の PID に置換する。0 は setup では保持されるが、子側は PID 0 のため監視しない (terminal/setup.py:1141-1150、terminal/tools/exit_with_parent.py:16-25)。 |
+| App Host | 監視しない | 文字列全体が厳密に `1` | `0`、`true`、` 1`、`1 `、空文字などは無効。trim・数値変換なし。大文字小文字の問題はない（`app/host/server/index.mjs:2596`）。 |
+| Control CLI (`parentwatch.exit_with_parent`) | 監視しない | 前後空白を `strip()` した結果が `1` | `0`、PID、`true`、空文字などは無効。値全体で比較する（`terminal/strata_control/parentwatch.py:15-23`）。 |
+| `tools/exit_with_parent.py`、`tools/mtp_fetch.py` | 監視しない | `strip()` 後が `1`、または `isdigit()` が真で `int()` に変換できる PID 文字列 | `true`、`+123`、`-123` などは無効。`1` は PID 1 ではなく直接の親を意味する。変換後 PID が `1` 以下または自身の PID なら監視しない。PID の上限 clamp はない（`terminal/tools/exit_with_parent.py:15-24`、`terminal/tools/mtp_fetch.py:247-255`）。 |
+| `setup.run()` の子向け環境 | 未設定なら setup 自身の PID を設定 | `strip()` 後が数字のみで `1` 以外なら既存値を保持 | `1`、空文字、数字以外は setup 自身の PID に置換。`0` は保持されるが、上記ツール watcher は PID `0` を監視しない（`terminal/setup.py:1142-1149`、`terminal/tools/exit_with_parent.py:16-24`）。 |
 
-PID を受け付ける Python 実装は、変換後の PID が 1 以下または自身の PIDなら監視しない。parentwatch.py も実親 PID が 1 以下なら監視しない。PID の上限 clamp はない (terminal/strata_control/parentwatch.py:19-23、terminal/tools/exit_with_parent.py:16-25、terminal/tools/mtp_fetch.py:247-256)。
+Python 側は `strip()` するため前後空白を許すが、App Host は厳密一致で空白を許さない。Python の PID watcher は正の PID を数値変換し、文字列の全体を `isdigit()` で検査する。CLI 引数による上書きや別環境変数との優先順位はなく、各読み取り箇所は環境値だけを判定する。
 
 ## 有効になる条件
 
-- App Host の親監視は、起動時の process.env.STRATA_EXIT_WITH_PARENT === '1' の場合だけ有効。デスクトップ shell は Node 起動コマンドに 1 を設定する (app/desktop/src-tauri/src/main.rs:522-540)。
-- controlEnvironment() は acquire: true の呼び出しだけ STRATA_EXIT_WITH_PARENT=1 を設定する。該当するのは update check/update、drafting fetch、pictures fetch などの取得経路。通常の Control 呼び出しは同関数から値を新規設定しない (app/host/server/control-runtime.mjs:88-107,140-146,277-305,401-429)。
-- setup.run() は値を子へ渡すが、子が監視関数を呼ぶ場合だけ効果がある。iq_pack.py と mtp_fetch.py は処理本体の前に監視関数を呼ぶ (terminal/tools/iq_pack.py:612-616、terminal/tools/mtp_fetch.py:526-535)。
-- Control の strata.py は起動時に parentwatch.exit_with_parent() を呼ぶ。import / 呼び出し時の例外は握りつぶされ、コマンド起動を失敗させない (terminal/strata.py:35-45)。
-- Host がこの値なしで起動すると親を監視しない。Python watcher は親 PID が 1 以下、Windows で対象プロセスを開けない場合などに監視を開始しない (app/host/server/index.mjs:2588-2597、terminal/strata_control/parentwatch.py:21-34、terminal/tools/exit_with_parent.py:23-35)。
+- App Host の watcher は、Node プロセス起動時に `process.env.STRATA_EXIT_WITH_PARENT === '1'` の場合に限り設定される。デスクトップ shell は Host 起動コマンドに `1` を明示設定する（`app/desktop/src-tauri/src/main.rs:522-540`、`app/host/server/index.mjs:2594-2603`）。
+- `controlEnvironment()` は通常、親環境の複製を返すため、入力環境にこの変数があれば非 acquire 呼び出しでもその値を保持する。`acquire: true` のときは必ず `1` を設定し、同時に `STRATA_NO_ACQUIRE` を削除する。これを使う更新確認・更新・drafting fetch・pictures fetch の呼び出しで明示的に設定される（`app/host/server/control-runtime.mjs:88-107,140-146,284-300,402-405,424-429`）。
+- Python Control 側では `strata.py` の起動直後に watcher 関数が呼ばれる。監視対象が直接の親なので、親が Host でなく別プロセスの場合も、その親の終了が条件になる。import や watcher 起動時の例外は握りつぶされ、CLI コマンド自体はこの理由で失敗しない（`terminal/strata.py:35-45`）。
+- 準備ツールは watcher 関数を呼ぶ必要がある。`iq_pack.py` は処理本体の前、`mtp_fetch.py` は `verify` 以外の処理の前に呼ぶ。環境変数があっても関数を呼ばないツールには watcher は追加されない（`terminal/tools/iq_pack.py:612-620`、`terminal/tools/mtp_fetch.py:526-535`）。
+- Windows では Python watcher が `OpenProcess(SYNCHRONIZE)` に失敗すると監視を開始しない。Python の非 Windows 実装は親 PID の変化を監視し、準備ツールは加えて対象 PID の生存を確認する（`terminal/strata_control/parentwatch.py:21-34`、`terminal/tools/exit_with_parent.py:25-44`、`terminal/tools/mtp_fetch.py:256-275`）。
+- 親 PID が `1` 以下、または準備ツールで指定 PID が自身の PID と同じなら監視しない。App Host にはこの PID 条件はなく、現在の `process.ppid` を監視対象にする（`terminal/strata_control/parentwatch.py:21-23`、`terminal/tools/exit_with_parent.py:23-24`、`terminal/tools/mtp_fetch.py:254-255`、`app/host/server/index.mjs:2596-2602`）。
 
 ## 実行時の詳細
 
-Node の App Host はモジュール初期化時に値を一度判定し、有効なら 1 秒ごとに親の状態を確認する。親 PID が変わるか process.kill(parent, 0) が ESRCH を返すと shutdown() を呼ぶ。通常の signal 停止と同じ経路でサーバーを閉じ、進行中の保存を drain し、共有・native・agent 機能を停止して終了する。値の実行中再読み込みはない (app/host/server/index.mjs:2572-2597)。
+App Host はモジュール初期化時に値を一度判定する。有効なら、その時点の `process.ppid` を保存し、1 秒ごとの interval で親を確認する。親 PID が変化した場合、または `process.kill(parent, 0)` が `ESRCH` を返した場合に `shutdown()` を呼ぶ。shutdown は task timer と task queue を閉じ、HTTP server を閉じ、チャット保存を drain し、共有・native・agent 機能を停止して終了する。変数は実行中に再読されない（`app/host/server/index.mjs:2578-2603`）。
 
-Python watcher は関数呼び出し時に値を読み、その時点で監視スレッドを作る。開始済み watcher はプロセス起動後の環境変更を再読しない。parentwatch.py は Windows で親プロセスの同期ハンドルを開いて終了を待ち、他 OS では getppid() の変化を調べる。tools/exit_with_parent.py と mtp_fetch.py は Windows では PID の同期ハンドル、他 OS では直接の親 PID の変化または指定 PID の生存確認を使う。Python watcher は通常 1.5 秒間隔で確認し、対象終了時に stderr への通知を試みて os._exit(1) する。強制終了のため出力バッファは flush されない (terminal/strata_control/parentwatch.py:15-45、terminal/tools/exit_with_parent.py:12-54、terminal/tools/mtp_fetch.py:240-282)。
+Python watcher は関数呼び出し時に環境値と親 PID を読み、daemon thread を起動する。Control の標準間隔は 1.5 秒。準備ツールも既定の poll 間隔 1.5 秒で、`tools/exit_with_parent.py` は Windows で同期ハンドルの終了を待ち、他 OS では直接の親変更を確認するほか、指定 PID の生存も調べる。`mtp_fetch.py` も同じ OS 分岐を持つ。開始後に環境を変更しても watcher の対象は変わらない（`terminal/strata_control/parentwatch.py:15-44`、`terminal/tools/exit_with_parent.py:12-54`、`terminal/tools/mtp_fetch.py:240-282`）。
 
-setup.run() は env 引数または現在の環境を複製して値を整え、subprocess.run(..., env=env) で子へ渡す。既存の数字 PID (1 以外) は呼び出し元が指定した値として保持され、それ以外は setup 自身の PID に置換する。check=True で子の非ゼロ終了が返ると command failed (exit N): ... を表示して失敗扱いにする (terminal/setup.py:1131-1157)。
+親が終わると Python watcher は stderr への通知を試みた後 `os._exit(1)` で即時終了するため、通常の Python cleanup や出力 flush は行われない。`setup.run()` は子環境を複製・調整し、`subprocess.run(..., env=env)` で渡す。`check=True` で子が非ゼロ終了すると setup は `command failed (exit N): <コマンド名>` として失敗を報告する（`terminal/tools/exit_with_parent.py:36-54`、`terminal/tools/mtp_fetch.py:277-282`、`terminal/setup.py:1150-1156`）。
 
 ## ログと測定値
 
-- Node Host の親消失時は shutdown() に進むが、この分岐固有のログ文字列はない (app/host/server/index.mjs:2574-2597)。
-- Control watcher は終了時に the program that started this one has ended: stopping を stderr に書こうとする。準備ツール watcher は the process that started this step has ended: stopping、MTP fetch watcher は the process that started this download has ended: stopping を stderr に出して終了コード 1 になる (terminal/strata_control/parentwatch.py:36-44、terminal/tools/exit_with_parent.py:46-54、terminal/tools/mtp_fetch.py:277-282)。
-- setup.run() の check=True 経路では子の非ゼロ終了を command failed (exit N): <コマンド名> として報告する (terminal/setup.py:1153-1156)。
+- App Host の親消失分岐には専用ログ出力がなく、`shutdown()` に進む（`app/host/server/index.mjs:2594-2603`）。
+- Control watcher は `the program that started this one has ended: stopping` を stderr に書こうとし、準備ツール watcher は `the process that started this step has ended: stopping` を stderr に書こうとする。MTP fetch は `the process that started this download has ended: stopping` を stderr に flush してから終了する（`terminal/strata_control/parentwatch.py:36-43`、`terminal/tools/exit_with_parent.py:46-53`、`terminal/tools/mtp_fetch.py:277-282`）。
+- Control と `exit_with_parent.py` は stderr 書き込み失敗を無視する。Host による終了にもこの値専用の文言はない。
 - 性能・精度の測定値は該当しない。
 
 ## 根拠
 
-- Host 起動時の環境設定: app/desktop/src-tauri/src/main.rs:522-540
-- Host 自身の判定と shutdown: app/host/server/index.mjs:2572-2597
-- Control 子プロセスの環境と取得呼び出し: app/host/server/control-runtime.mjs:88-107,140-146,277-305,401-429
-- CLI 起動時 watcher: terminal/strata.py:35-45、terminal/strata_control/parentwatch.py:15-45
-- setup による子向け PID の引き継ぎ: terminal/setup.py:1131-1157
-- 準備ツール / MTP watcher: terminal/tools/exit_with_parent.py:12-54、terminal/tools/iq_pack.py:612-616、terminal/tools/mtp_fetch.py:240-282,526-535
-
+- デスクトップから App Host への値設定: `app/desktop/src-tauri/src/main.rs:522-540`
+- App Host の判定、監視、shutdown: `app/host/server/index.mjs:2578-2603`
+- Control 子プロセス環境の組み立てと acquire 呼び出し: `app/host/server/control-runtime.mjs:88-107,140-146,284-300,402-405,424-429`
+- Control CLI 起動時の watcher: `terminal/strata.py:35-45`、`terminal/strata_control/parentwatch.py:15-45`
+- setup による子向け値の調整と終了報告: `terminal/setup.py:1131-1156`
+- 準備ツール watcher と呼び出し箇所: `terminal/tools/exit_with_parent.py:12-54`、`terminal/tools/iq_pack.py:612-620`、`terminal/tools/mtp_fetch.py:240-282,526-535`

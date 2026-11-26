@@ -1,53 +1,53 @@
 # `STRATA_PARTIAL_PIN_GIB`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL 実装の resident RAM mode で、通常の `sycl::malloc_host` による host allocation が失敗した後、`STRATA_PARTIAL_PIN=1` が有効な場合に GPU 用 alias として扱う RAM 領域の上限を GiB で指定します。対象領域は cache complement の先頭（profile rank の高い expert から配置された範囲）です。上限より後ろは working set に lock を試み、残りは resident RAM として CPU 側の expert 処理に使います。
+RAM 上に作る expert cache complement のうち、GPU 用に部分登録する先頭範囲の上限を GiB 単位で指定する。CUDA の通常経路では `STRATA_PARTIAL_PIN=1` も必要で、この変数だけでは部分登録を有効化しない。どちらも `FileExpertSource::pin_cache_complement` の pageable fallback 内で読み取られる（`engine/src/core/expert_source.cpp:4431-4449`）。
 
-ただし、現在の SYCL ソースでは既存メモリを GPU に登録する `cudaHostRegister` 相当の処理が DPCT 変換コメント付きの no-op に置き換わっています。その後 `arena` のアドレスを device alias に設定しているため、この経路が実際に物理 pin / GPU 可視登録を行うとはソースから確認できません。ログ上の「registered」表現は実処理の保証として扱えません。
+補完全体を割り当てる `--resident-budget-gib` 等の RAM 予算とは別の上限であり、登録されない残りも RAM に保持される。CUDA では残りを resident lock の対象にする（`engine/src/core/expert_source.cpp:4560-4566`）。
 
 ## 値と判定
 
-変換は `std::atof` で行い、文字列全体の妥当性検査はありません。`atof(v) > 0` の場合だけその数値を使い、それ以外は既定値 24 GiB です。結果を `1073741824.0` 倍して `uint64_t` に変換します。
+`std::atof` の結果が正なら、その値に `1073741824.0` を掛けて `uint64_t` に変換する。文字列全体の数値検証、丸め、上限値の制限はない。未設定、空文字、0 以下、数値に変換できない文字列では既定の 24 GiB になる。`atof` は数値の先頭部分を読むため、たとえば `2abc` は 2 GiB として扱われる（`engine/src/core/expert_source.cpp:4446-4449`、SYCL: `engine/sycl/src/core/expert_source.cpp:1953-1956`）。
 
-| 値 | `pin_cap` |
+| 入力例 | `pin_cap` |
 |---|---:|
-| 未設定 | 24 GiB |
-| 空文字、数値に変換できない文字列、`0`、負数 | 24 GiB |
-| 正の数 | その数値 GiB（小数可） |
-| 数値の後ろに文字が続く値 | `atof` が読む先頭の数値部分。例: `8junk` は 8 GiB |
+| 未設定、空文字、`0`、`-1`、`abc`、`0anything` | 24 GiB |
+| `2`、`2.5`、` 2 `、`2abc` | 2 GiB、2.5 GiB、2 GiB、2 GiB |
+| 正の値が 2 GiB 未満 | 指定値。ただし通常の部分登録ループは 2 GiB 以上から試すため、登録範囲は 0 になり得る |
+| 正の値が complement より大きい | 通常経路では complement のサイズを上限として使う |
 
-先頭の空白や `atof` が認識する指数表記も変換に従います。値は正のときに有効ですが、実際の部分 alias 範囲は `min(cache complement の byte 数, pin_cap)` 以下です。2 GiB 未満の上限ではループ条件を満たさず、部分範囲を作りません。expert blob の途中で切らないよう、上限が blob 内に入る場合はその blob の開始 offset まで範囲を下げます。
-
-`nan` は `> 0` 判定に失敗して既定値になります。`inf` や非常に大きな正数は bytes 換算後に `uint64_t` の範囲を超え得ますが、範囲検査はありません。
+通常経路では候補範囲を 2 GiB ずつ小さくし、expert blob の途中で終わらない境界に切り下げる。したがって実際の登録量は指定値と一致するとは限らない（`engine/src/core/expert_source.cpp:4528-4558`、SYCL: `engine/sycl/src/core/expert_source.cpp:1957-2018`）。
 
 ## 有効になる条件
 
-- Strata の SYCL 実装で resident CPU expert 経路を使い、`pin_cache_complement()` が呼ばれること。呼び出し元は `o.resident_cpu_experts` の場合です。
-- `pin` 引数が true であること。`--resident-experts` と `--resident-budget-gib N` は pin を有効にしますが、両方とも `STRATA_RESIDENT_PIN=0` で無効にできます。
-- `sycl::malloc_host(bytes, queue)` が失敗し、通常の `std::malloc(bytes)` に fallback すること。host allocation が成功した場合はこの環境変数を読みません。
-- `STRATA_PARTIAL_PIN` が `std::atoi(value) != 0` であること。未設定・空文字・`0`・数値変換が 0 になる文字列は無効、`1` や `-1` は有効です。`atoi` は先頭の数値部分を変換します。
-- `budget_bytes > 0` であること。明示した `--resident-budget-gib` のほか、`--resident-experts` の soft retry が `kResidentWhatFits`（`~0ull`）を渡す場合も条件を満たします。予算 0 の初回試行では部分範囲を作りません。
-
-`STRATA_PARTIAL_PIN_GIB` 単独では機能を有効にしません。実際に有効とする別スイッチは `STRATA_PARTIAL_PIN` です。
+- 補完領域 `bytes` が正で、`pin_cache_complement` が呼ばれること。generate 経路では GPU expert cache を開いた後にこの関数へ `o.resident_pin` と `o.resident_budget` を渡す（`engine/src/program/generate.cpp:12077-12080`、SYCL: `engine/sycl/src/program/generate.cpp:7097-7099`）。
+- `pin` が真であること。初回の page-locked allocation に成功すると通常はこの cap を使わず、割り当てに失敗して pageable memory fallback に入ったときだけ以下の判定へ進む（`engine/src/core/expert_source.cpp:4374-4397,4431-4449`、SYCL: `engine/sycl/src/core/expert_source.cpp:1871-1929,1938-1956`）。
+- CUDA の通常経路では、さらに `budget_bytes > 0` と `STRATA_PARTIAL_PIN` の `std::atoi` 結果が 0 以外であること。`STRATA_PARTIAL_PIN_GIB` 自体は opt-in ではない。`STRATA_PARTIAL_PIN` が未設定・空・`true`・`0anything` なら無効、`1`・`-1`・`1x` なら有効（`engine/src/core/expert_source.cpp:4440-4449,4528-4558`）。
+- CUDA の Linux paced 経路（`STRATA_PIN_GUARD=2` または NUMA placement）では、段階的に得た resident 領域から GPU 登録を試すが、ループは `got` を基にし `pin_cap` を使わない。したがってこの環境変数はその経路の登録上限にならない（`engine/src/core/expert_source.cpp:4328-4354,4450-4527`）。
+- SYCL 経路では `budget_bytes > 0` と `STRATA_PARTIAL_PIN` の `atoi != 0` が必要で、`pin_cap` が候補サイズの上限に使われる（`engine/sycl/src/core/expert_source.cpp:1947-1959`）。ただしこのファイルでは既存 host memory の CUDA 登録呼び出しが移植時に `0 == 0` の分岐へ置き換えられており、実際の登録 API は呼ばれない。Strata は alias と `partial_pin` の範囲を設定し、残りを `lock_resident` に渡す（`engine/sycl/src/core/expert_source.cpp:1969-2018`）。
 
 ## 実行時の詳細
 
-両環境変数は `pin_cache_complement()` 内の `static` 初期化で読み取られます。初期化は `bytes > 0` の allocation で `pin` が true、かつ `sycl::malloc_host` が失敗して fallback に入ったときに初めて評価されます。その後はプロセス内で値を再評価しません。
+この変数に CLI 引数による上書きはない。`--resident-budget-gib` などで予算が正であることは通常の CUDA/SYCL 部分登録の別条件だが、予算値がこの cap を置き換えることはない（`engine/src/program/generate.cpp:12077-12080`、SYCL: `engine/sycl/src/program/generate.cpp:7097-7099`）。CUDA の paced 経路は `STRATA_PARTIAL_PIN` と `budget_bytes` による通常経路の条件分岐より先に処理される。
 
-`STRATA_PARTIAL_PIN` が有効で予算が正なら、実装は `min(bytes, pin_cap)` から 2 GiB 単位の候補を作り、expert 境界に合わせた先頭範囲を device alias として設定します。残りの範囲は `lock_resident()` に渡されます。部分範囲ができた場合、`pinned()` はその範囲内に完全に収まる expert だけを pinned と判定し、`device_alias()` はその expert の address を返します。GPU の PCIe share を実際に使うには、別途 `--pcie-frac` の share が正で、実行計画に対象 miss が入る必要があります。
+値は関数内 `static const uint64_t` の初期化で初回到達時に一度読み、その後の同一プロセス内の関数呼び出しでは再読込しない。実行中に環境を変更しても反映されない。CUDA/SYCL それぞれ独立した実装である（CUDA: `engine/src/core/expert_source.cpp:4446-4449`、SYCL: `engine/sycl/src/core/expert_source.cpp:1953-1956`）。
 
-ただし、この partial path の `cudaHostRegister` 相当箇所はコメントで「SYCL currently does not support registering of existing host memory」と説明された上で `(void)0` に置換されています。直後の `if (0 == 0)` は常に通り、非 null の `arena` を alias にして `partial_pin` に候補 byte 数を格納します。よって現行ソースはこの byte 範囲を内部的に device-readable / pinned と扱いますが、ドライバーへの登録自体は行っていません。GPU が pageable `malloc` 領域を安全に直接読めることもこのコードからは確認できず、機能の実効性にはこの制限があります。
+CUDA の通常経路は cap から 2 GiB ごとに候補を下げて登録を試み、成功した先頭範囲を GPU alias として記録する。残りの範囲は `lock_resident` に渡される。登録がすべて失敗しても、部分登録量 0 のまま残りを lock し、補完の準備処理を続ける。paced 経路では利用可能 RAM と reserve を見ながら 1 GiB 単位で領域を触り、その後 `got` から expert 境界に合わせて登録を試す（`engine/src/core/expert_source.cpp:4450-4566`）。
 
-alias 範囲が設定されると stderr の resident ready ログに pinned byte 数が出て、部分 alias の説明文も付加されます。例外的に alias pointer が null ならその候補では部分範囲が設定されません。`docs/UNSLOTH_Q4.md` は上限の既定値を 24 GiB と記し、RTX 5070 での測定を載せていますが、その数値は資料の記載であり、本調査で再測定していません。
+## ログと測定値
+
+CUDA 通常経路では最終的な補完準備ログ `FileExpertSource: ... cache complement ready: resident ... GiB, pinned ... GiB in ... s...` に実際の pinned 量と note が出る。部分登録の note は `X.XX GiB of it registered for the GPU (the hottest)`。paced 経路で一部しか page-lock できない場合は `WARNING: only ... could be page-locked (...); the rest is resident but pageable, so its copies to the GPU go through the CPU (#1250)` を stderr に出す（`engine/src/core/expert_source.cpp:4513-4523,4734-4738`）。SYCL は `cache complement ready` の pinned 量と note に記録する（`engine/sycl/src/core/expert_source.cpp:2009-2018,2141-2157`）。
+
+ソースコメントは RTX 5070 / WDDM で 40 GiB の arena に 30 GiB を登録した後、prompt path の小さなバッファを page-lock できなかった事例を挙げている。また RTX 5070 PC では 40 GiB 予算時、24 / 16 GiB 登録の 7.30 / 7.44 tok/s と未登録の 7.05–7.74 tok/s を記録し、部分登録を opt-in としている。これはコメントに記された条件での値である（`engine/src/core/expert_source.cpp:4437-4445`）。
 
 ## 根拠
 
-- `sycl/src/core/expert_source.cpp:1650-1654,1855-1928` — resident complement の入口、pin 指定、`sycl::malloc_host` と pageable fallback。
-- `sycl/src/core/expert_source.cpp:1927-2007` — 部分範囲の有効条件、`STRATA_PARTIAL_PIN` と本変数の parse、2 GiB 刻み、blob 境界調整、登録 no-op、残余領域の lock。
-- `sycl/src/core/expert_source.cpp:2130-2146,2391-2412` — alias byte 数の保存、ログ、部分範囲内だけを pinned 判定する処理。
-- `sycl/src/program/generate.cpp:1931-1950,6357-6381` — CLI / `STRATA_RESIDENT_PIN` による pin 設定と resident complement の呼び出し。`--resident-experts` の soft retry は `include/strata/core/expert_source.hpp:565-568` の `kResidentWhatFits` を使います。
-- `sycl/src/core/expert_source.cpp:2608-2635,2657-2670` — `--pcie-frac` から計算された miss share と pinned expert の PCIe 計画。
-- `docs/UNSLOTH_Q4.md:228-235` — 本変数の既定値・目的・測定についての資料記述。
+- `engine/src/core/expert_source.cpp:3985-3995` — CUDA `FileExpertSource::pin_cache_complement` の開始位置。
+- `engine/src/core/expert_source.cpp:4374-4402,4431-4566` — pinned allocation fallback、値の読み取り、登録経路、残りの resident lock。
+- `engine/src/core/expert_source.cpp:4719-4738` — 補完状態の確定と完了ログ。
+- `engine/src/program/generate.cpp:12077-12080` — generate からの呼び出し。
+- `engine/sycl/src/core/expert_source.cpp:1661-1675,1871-2018,2141-2157` — SYCL 側の呼び出し先、条件、移植された登録経路、完了ログ。
+- `engine/sycl/src/program/generate.cpp:7097-7099` — SYCL generate からの呼び出し。

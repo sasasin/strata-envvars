@@ -1,52 +1,50 @@
 # `STRATA_PREBUILT_URL`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の Strata 作業ツリーは `## main...origin/main` で、未コミット変更はありません。外部ライブラリの環境変数は対象外です。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-セットアップが取得する ready-made Strata エンジン ZIP の配布元フォルダーを指定します。値はエンジンの実行時設定ではなく、Strata の `setup.py` がエンジンを取得・更新するときに使います。既定の配布元は `https://github.com/Niko1221/Strata/releases/latest/download/` です。既定値のままなら、まずこの checkout のバージョンの release を試し、見つからないとき latest release に進みます。既定値と異なる URL / パスを指定すると、その一箇所だけを使います（`setup.py:225-235,5275-5284`）。
-
-候補名の参照をリポジトリ全体で検索すると、コメント2箇所と環境から値を読む箇所2箇所が `setup.py` にあります。他に同名の読み取りや共通 env helper への動的な引き渡しは見つかりませんでした（`setup.py:227,5277,7635,9167`）。
+セットアップが CUDA エンジン、または Windows の HIP エンジンの既成 zip を探す URL 基底（末尾の `/` は任意）またはローカルフォルダーを指定する。通常の `terminal/setup.py` 経路では `--prebuilt` の既定値として使われ、明示した `--prebuilt` が優先する。指定した基底に既成エンジンがないときは、バージョン別 URL や標準の latest URL へは切り替えず、更新 feed を試すか、呼び出し元のセットアップがソースビルドへ進む。対応 GPU 用のエンジンがすでにインストール済みなら URL を参照しない場合がある。`terminal/setup.py:273-284, 6193-6202, 6295-6318`。
 
 ## 値と判定
 
-文字列の parse、正規化、範囲検査はありません。パス末尾に `/` または `\` がなければ `prebuilt_bases()` が `/` を付けます。大文字小文字や値の内容の妥当性は、URL / ローカルパスとして処理できるかで決まります（`setup.py:5275-5284`）。
+この変数の値は文字列として取得され、boolean・数値・URL の形式検証はない。通常経路の `argparse` は `os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL)` をデフォルトにするため、未設定時は `https://github.com/Niko1221/Strata/releases/latest/download/`、設定値が空文字なら空文字のままになる。`--prebuilt VALUE` を指定すると、通常経路ではその値が環境変数由来の既定値に優先する。`terminal/setup.py:278, 11550-11551`。
 
-| 入力 | Strata の扱い |
-| --- | --- |
-| 未設定 | `os.environ.get(..., PREBUILT_URL)` が既定 URL を返します。通常セットアップと更新では `--prebuilt` の既定値になります。既存モデルを CUDA 12 に移す専用経路でも同じ既定 URL になります。 |
-| 空文字 | 通常は CLI 既定値として空文字のまま保持されます。`get_prebuilt()` / Windows HIP の `get_prebuilt_hip()` は空値なら `None` を返し、ready-made engine を探しません。CUDA 12 への移行では空文字が `url_base` として渡り、ready-made engine を探さずローカルビルドに進みます（`setup.py:4594-4612,5364-5397,7606-7614,9167`）。 |
-| `--prebuilt DIR` または同名環境変数のローカルパス | アセット名を連結したパスをコピー元として扱います。ファイルがなければ `not found: ...` で失敗します。`file://` パスもコピー元になります（`setup.py:3008-3022,5400-5419`）。 |
-| HTTP(S) の URL フォルダー | アセット名を連結して HEAD で確認し、取得可能ならダウンロードします。末尾スラッシュは補われます（`setup.py:5396-5419`）。 |
-| その他の非空文字列 | Strata は URL 構文として事前検証せず、HTTP(S) 以外ならローカルパスとしてコピーを試します。パスが存在しなければ `fail()` 経由で終了します。 |
+| 条件 | unset | 有効になる値の例 | 無効・特別扱いになる値の例 |
+|---|---|---|---|
+| 通常の CUDA / Windows HIP セットアップまたは更新 | `PREBUILT_URL` を使用 | `https://host/path/`、`https://host/path`、既存のローカルフォルダー | 空文字は既成 zip の取得をスキップ。存在しないローカルパスは `not found: ...` で失敗。形式・大文字小文字・空白の検査はない |
+| CUDA 12 エンジンへの自動切替 | `PREBUILT_URL` を使用 | 環境変数の文字列を同じ基底として使用 | 空文字は既成エンジン取得をスキップし、CUDA 12 をローカルビルド |
 
-通常の `argparse` 定義では `--prebuilt` の明示値が環境変数由来の default を上書きします。明示 `--prebuilt ""` も空値として扱われます（`setup.py:9167-9168`）。ただし後述の CUDA 12 移行経路は parser の `a.prebuilt` を使わず、環境変数を直接読みます。
+`prebuilt_bases()` は末尾に `/` または `\\` がなければ `/` を追加する。基底が `PREBUILT_URL` と同じ場合だけ、ソースのバージョンが読めればそのバージョンのリリース URL を先に試し、失敗時に latest を試す。`source_version()` が `"0"` の場合は latest のみ。環境変数または `--prebuilt` で異なる基底を指定した場合、その基底だけを URL 候補とし、HEAD 失敗時には呼び出し側が更新 feed を試す。`terminal/setup.py:6193-6202, 8059-8067, 6331-6350`。
+
+`STRATA_PREBUILT_URL` の読み取り時に空文字を無効値として置き換える処理はない。ただし取得関数の `if not url_base` で空文字は `None` 相当の「既成エンジンなし」として扱われる。通常 CUDA セットアップではローカルビルドへ進み、Windows HIP では既成 AMD エンジンが得られず `no ready-made AMD engine for this Strata version` で終了する。`terminal/setup.py:5430-5432, 6327-6329, 9606-9625`。
 
 ## 有効になる条件
 
-- **通常の NVIDIA セットアップ**: `engine_step()` が `--build` でなく、HIP でもない場合に `get_prebuilt(a.prebuilt, ...)` へ渡します。アーキテクチャ不一致、必要な vision encoder の欠如、古すぎるエンジンなどでは ready-made engine を使わずビルドに移る経路があります（`setup.py:7772-7798,5364-5385,5433-5453`）。
-- **CUDA 12 の選択**: `--cuda 12` を含むセットアップでは通常 `a.prebuilt` が使用されます。別経路として、CUDA 13 の既存モデルを起動するとき、追加 GPU に CUDA 13 非対応の Pascal / Volta（compute capability が `CUDA13_MIN_ARCH` 未満）が含まれると `ensure_engine_for()` がモデルを CUDA 12 エンジンへ移します。この移行は `os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL)` を直接使い、同じ起動の `--prebuilt` 引数は参照しません（`setup.py:7575-7585,7623-7644`）。
-- **Windows HIP**: `engine_step()` は `get_prebuilt_hip(a.prebuilt, gpu)` に渡します。**Linux HIP** は既製エンジンをこの変数から取得せず `build_engine_hip()` に進みます（`setup.py:7779-7798`）。
-- **更新**: `--update` は `update_installed_engine(a.prebuilt)` を呼びます。エンジンが既に必要なバージョン以上なら URL の取得処理は行われません。更新対象で取得・更新が失敗した場合は、既存エンジンを維持して起動する経路があります（`setup.py:7023-7038,5519-5528,5571-5607`）。
-- **対象外経路**: Mac の `CONTROL` エンジンコンポーネント経路は `engine_step()` を迂回し、`--backend sycl` は SYCL セットアップへ早期 return します。これらでは本変数による ready-made engine URL 選択をしません（`setup.py:7772-7777,9220-9225`）。
-
-取得済み ready-made engine が `BUILD.json` にあり、実行ファイルも存在し、要求 GPU の arch を満たし、バージョンが `MIN_ENGINE` 以上なら、指定 URL を見に行かずその既存エンジンを返します。したがって、値を設定しただけでインストール済みエンジンが置き換わるわけではありません（`setup.py:5371-5386`）。
+- 通常の `--prebuilt` 既定値経由では、`terminal/setup.py` の引数解析を通り、エンジン取得関数へ進むセットアップまたは更新で参照される。`--build` 指定時は新規セットアップの既成エンジン取得を行わず、ソースビルドする。`--update --build` は再ビルドする。`terminal/setup.py:11535, 9606-9625, 6452-6458`。
+- セットアップで互換性のある既成エンジンがすでに存在する場合はそれを返すため、指定 URL からダウンロードしない。更新でも、既成エンジンが必要バージョン以上なら更新関数は URL を使わず戻る。`terminal/setup.py:6303-6318, 6515-6516`。
+- 通常セットアップの CUDA 取得は `--build` と HIP の Linux 経路では行わず、Windows HIP 取得は Windows の HIP 分岐だけで使う。CUDA 取得の結果が `None` ならソースビルドへ進む。`terminal/setup.py:9606-9625`。
+- Pascal / Volta GPU を検出して CUDA 12 エンジンへ移す経路は `use_cuda12()` が環境変数を直接読み直す。この経路では CLI の `--prebuilt` 値ではなく環境変数値（未設定なら `PREBUILT_URL`）が使われる。`terminal/setup.py:9192-9200, 9209-9229`。
+- Mac のモデル別セットアップ、shape engine、`CONTROL` / コンポーネント経路は通常の `get_prebuilt(a.prebuilt, ...)` に到達しないため、この変数による既成エンジン URL 指定の対象外。`terminal/setup.py:9600-9604, 11628-11638, 9492-9508`。
+- 適合する既成エンジンがないと URL が HTTP(S) なら asset に HEAD を送り、候補切れ後に feed を試す。ローカルパスまたは `file://` は `download()` でコピーする。ローカルファイルが存在しなければ `not found: ...` を出して失敗する。`terminal/setup.py:3513-3544, 6331-6352`。
 
 ## 実行時の詳細
 
-通常経路では `setup.py` の引数 parser 構築時に環境変数を `--prebuilt` の default として読み、そのプロセス内で引数値をエンジン選択・更新処理へ渡します。起動後の環境変更を再読込する cache はありません。CUDA 12 移行経路だけは移行処理時に環境変数を直接読みます（`setup.py:7635-7636,9167-9168`）。
+通常経路の値は `main()` が `parse_args()` を呼ぶ時点で `--prebuilt` のデフォルトとして読み込まれ、取得処理では `a.prebuilt` として渡される。引数解析後にプロセス環境を変えても、この値は更新されない。一方、CUDA 12 への自動切替経路は `use_cuda12()` の呼び出し時に `os.environ.get()` を直接評価するため、引数解析時の `a.prebuilt` と別の読み取り箇所である。環境変数をキャッシュする共通 helper や永続設定への保存はない。`terminal/setup.py:9209-9222, 11550, 11606`。
 
-`get_prebuilt()` は値が空なら `None` を返します。非空値ではエンジンの ZIP 名を付け、HTTP(S) なら HEAD を試します。既定 URL では checkout の版の release を先に探し、失敗時に latest を試します。その checkout 版も latest も HTTP で得られない場合、CUDA 13 では update feed から取れるか試し、取れなければ警告して `None` を返し、通常セットアップはローカルビルドへ進みます。CUDA 12 でも `get_cuda12_engine()` が `None` の場合にビルドします（`setup.py:5275-5284,5396-5417,7606-7614`）。
+この変数を使って子プロセス用の環境を個別設定するコードはない。通常の環境継承を使う `subprocess` 呼び出しでは親の環境に値が残っていれば継承されるが、調査した Strata のエンジン取得経路はその継承値をエンジン設定として扱わず、Python 側で取得先を決める。`terminal/setup.py:1131-1151, 5192-5204, 6295-6301`。
 
-ダウンロード ZIP は展開前に release API の size / SHA-256 と照合します。ローカルフォルダーまたは GitHub release 以外のミラーなど、照合する公開 digest が得られない場合は警告して続行します。サイズまたは SHA-256 が不一致ならダウンロードを削除して拒否し、初回セットアップでは失敗を報告します。更新では既存エンジンを保持します（`setup.py:5194-5213,5229-5255,5258-5272,5418-5424`）。
+既定の URL 基底では、通常セットアップはソースのバージョンに対応する配布先を先に調べ、失敗した場合に latest を試す。独自の基底ではその URL のみを試す。取得できない場合は更新 feed へフォールバックし、それも得られなければ CUDA の新規セットアップは「コンパイルする」と警告してビルドへ進む。更新時は既存エンジンを保持してセットアップを続ける経路がある。`terminal/setup.py:6193-6202, 6335-6350, 6452-6458, 6537-6549`。
 
-観測できる結果には `Downloading the ready-made Strata engine ...`、`no ready-made engine at ...`、ローカルビルドへの案内、SHA-256 の未検証警告があります。存在しないローカルパスは `not found: ...`、HTTP ダウンロードが最後まで到達不能なら `cannot reach ...` を `fail()` が出して `SystemExit(1)` で終了します。更新経路では取得例外を捕捉し、`could not update the engine` / `could not update the AMD engine` 等の警告を出して既存エンジンで続けます（`setup.py:887-907,3015-3022,3050-3059,5418-5424,5542-5548,5593-5607`）。
+## ログと測定値
+
+CUDA エンジンの取得では `Downloading the ready-made Strata engine ...`、Windows HIP では `Downloading the ready-made Strata engine for AMD GPUs (with the ROCm libraries it uses) ...` を出す。標準 URL のソースバージョン別候補が HTTP 404 の場合はその候補について何も表示せず latest へ進み、それ以外の失敗では `The ready-made engine for v... could not be reached (...): trying the latest release` を出す。独自 URL の最終候補が失敗し feed にもエンジンがない場合は、CUDA 経路で `no ready-made engine at ... (...): compiling instead`、HIP 経路で `no ready-made AMD engine at ... (...)` を警告する。更新処理で取得できない場合は `could not update the engine: starting the installed ...` として既存エンジンを使う。`terminal/setup.py:6184-6190, 5439-5450, 6335-6350, 6543-6549`。
 
 ## 根拠
 
-- 候補名のコメント、既定 URL、既定版→latest の選択: `setup.py:225-235,5275-5284,6813-6821`
-- 環境変数の読み取り、CLI default、CLI による上書き、早期 return: `setup.py:7633-7636,9167-9168,9212-9225`
-- NVIDIA / CUDA 12 / HIP の利用経路: `setup.py:4594-4629,5364-5453,7575-7644,7772-7804`
-- update の適用条件と既存エンジン維持: `setup.py:5519-5607,7023-7057`
-- ローカルコピー、ダウンロード、digest 確認と失敗経路: `setup.py:3008-3022,5194-5272,5396-5424`
-- CUDA 12 のモデル単位の選択と移行条件の設計資料: `docs/OLDER_GPUS.md:62-94`
+- 変数の全参照（コメント2か所、実読み取り2か所）と通常既定値: `terminal/setup.py:273-284, 9221-9222, 11550-11551`。
+- URL 正規化・候補順: `terminal/setup.py:6193-6202, 8059-8067`。
+- CUDA / HIP 取得、既存エンジンの再利用、フォールバック: `terminal/setup.py:5414-5455, 6295-6357, 9606-9625`。
+- 更新時の条件と失敗時の扱い: `terminal/setup.py:6452-6549`。
+- URL / ローカルファイルのダウンロード挙動: `terminal/setup.py:3513-3544`。
+- CUDA 12 自動切替: `terminal/setup.py:9192-9229`。

@@ -1,49 +1,45 @@
 # `STRATA_DF2_GEMM`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-DFlash2 drafter の Q8_0 GEMM が使う CUDA/HIP カーネル variant の選択を切り替えます。既定値は行列の出力行数に応じた variant 選択で、値 `0` は従来の 8 rows-a-warp 系 variant を選びます。Q4_0 重みの GEMM は別分岐なので、この変数の影響を受けません。
-
-この環境変数を読む実装は `src/kernels/cuda/dflash2.cu` の `df2_gemm()` に 1 か所あります。DFlash2 自体は CUDA と HIP のビルドに含まれ、Metal と SYCL のビルドには含まれません（`CMakeLists.txt:431-436,520`）。通常の実行では `Dflash2Drafter::gemm()` から同カーネルを呼び、DFlash2 の context 記録と drafter block の複数の射影 GEMM に使います（`src/core/dflash2.cpp:404-415,438-450,463-505`）。
+CUDA/HIP 版 DFlash2 drafter の Q8 行列 GEMM で、行列の出力行数 `rows` に応じて選ぶ GEMM カーネル variant の既定方式を切り替える。未設定または `atoi` の結果が 0 以外ならサイズ別の選択、0 なら従来の「8 rows a warp」系 variant 1 / 2 を使う。Q4 行列側の分岐にはこの変数は使われない。読み取りと選択は `strata::kernels::df2_gemm` にある（`engine/src/kernels/cuda/dflash2.cu:1787-1795,1859-1861,1908-1941`）。
 
 ## 値と判定
 
-値は `std::atoi()` で 10 進整数に変換され、`df2_gemm()` が最初に Q8 GEMM 分岐へ入ったときに `static const int` として一度だけ読み取られます（`src/kernels/cuda/dflash2.cu:1080-1086`）。
+Q8 側の分岐まで到達したとき、関数内 `static const int` 初期化子で `std::getenv` を一度呼び、未設定なら `1`、設定済みなら `std::atoi` の戻り値を保持する。文字列全体の検証はなく、`atoi` が先頭から変換できた整数だけを使う。したがって空文字や数字で始まらない文字列は 0、`0anything` も 0、`1anything` は 1、先頭空白や符号は `atoi` の変換規則に従う。`true` も 0 となる。0 以外の値に個別の意味や範囲検査はなく、負数を含めすべてサイズ別方式を選ぶ。
 
-| 環境値 | `atoi` の結果と選択 |
-|---|---|
-| 未設定 | `1`。行数に応じた既定の variant 選択 |
-| 空文字 | `0`。従来 variant 選択 |
-| `0`、または先頭から整数として `0` に変換される値 | `0`。従来 variant 選択 |
-| 整数として非ゼロに変換される値 | 行数に応じた既定の variant 選択。`1` 以外の値を variant 番号としては使わない |
-| 数字で始まらない文字列 | `0`。従来 variant 選択 |
+| 条件 | unset | 有効になる値（サイズ別選択） | 0 になる値（従来 variant） |
+|---|---:|---|---|
+| CUDA/HIP の DFlash2 Q8 GEMM がこの読み取り箇所まで到達 | `1` | 変換後の値が 0 以外。例: `1`, `-1`, `1abc` | 変換後の値が 0。例: `0`, `0anything`, 空文字, `true`, `abc` |
 
-`atoi` は整数部分の後ろを検査しません。したがって `2tail` は `2`、`  +1tail` は `1`、`-1` は `-1` として扱われます。先頭の空白と符号は変換規則に従い、大文字小文字の比較はありません。範囲外整数の `atoi` 結果は C/C++ の仕様上保証できないため、文書化された有効値として扱いません。コードに clamp や無効文字列用の fallback はなく、変換結果がゼロかどうかだけで分岐します（同 `:1080-1086`）。
-
-従来 variant は、合計出力行数 `rows` が 32 の倍数なら variant 1、そうでなければ variant 2 です。既定 variant は `rows <= 1024` なら 20、`rows <= 3072` なら 13、`rows >= 15000` なら 10、それ以外は同じく 32 の倍数判定で 1 または 2 を選びます（同 `:1081-1086`）。
+`atoi` の変換結果が 0 かどうかだけを `tune == 0` で判定する（`engine/src/kernels/cuda/dflash2.cu:1908-1914`）。
 
 ## 有効になる条件
 
-- 実行物が DFlash2 カーネルを含む CUDA または HIP build である必要があります。CMake は `STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP` のとき DFlash2 を含め、Metal / SYCL は対象外としています（`CMakeLists.txt:431-436,520`）。
-- GEMM が Q8_0 重みの分岐に入った場合に限り有効です。`mats[0].q4` が真なら `STRATA_DF2_GEMM4` を使う別分岐から return し、この変数は読まれません（`src/kernels/cuda/dflash2.cu:1031-1033,1077-1080`）。DFlash2 GEMM 呼び出し側は重み tensor の `q4_0` dtype から `q4` を設定します（`src/core/dflash2.cpp:404-414`）。
-- 通常の CLI では DFlash2 を使う実行経路が必要です。`--draft dflash2` の開始条件には draft pack、native pack、draft vocabulary / MTP 条件などがあり、条件を満たさない場合は MTP へ fallback するか、`--draft-fallback none` なら開始エラーになります（`src/program/generate.cpp:5330-5334,6765-6818`）。変数自体は CLI 引数を上書きせず、DFlash2 の Q8 GEMM カーネル選択だけに作用します。
-- 起動後に環境値を変更しても反映されません。static 初期化後は同じプロセス内の以後の Q8 GEMM 呼び出しでキャッシュ値が使われます（`src/kernels/cuda/dflash2.cu:1080`）。
+- `STRATA_ENABLE_CUDA` または `STRATA_ENABLE_HIP` の GPU engine がビルドされ、DFlash2 の `dflash2.cu` 実装を使うこと。Metal と SYCL の build には DFlash2 drafter が含まれない（`engine/cmake/strata_gpu_engine.cmake:6-13,97`）。
+- DFlash2 drafter が `df2_gemm` を呼び、対象行列群が Q8 形式であること。重み tensor の型が `q4_0` なら `q4` フラグが立ち、Q4 分岐で戻るためこの変数は参照されない（`engine/src/core/dflash2.cpp:480-490`; `engine/src/kernels/cuda/dflash2.cu:1859-1908`）。
+- 呼び出しが形状検査を通ること（`n` は 1〜3、`n_in` は 512 の倍数、`ncols >= 1`、各行列の `n_out` は 16 の倍数、同一 launch 内で weight format が一致）。不適合時は `std::invalid_argument` となり、環境変数の読み取りには到達しない（`engine/src/kernels/cuda/dflash2.cu:1787-1795`）。
+- CUDA では、`STRATA_DF2_GEMM_TC` が有効で Tensor Core GEMM の条件（`ncols >= 2`, `rows >= 1024`, `rows` が 16 の倍数、compute capability major >= 8）を満たすと、Tensor Core kernel を実行して先に戻るため、この変数による variant 選択は行わない。HIP では当該 Tensor Core 分岐がコンパイル対象外（`engine/src/kernels/cuda/dflash2.cu:1836-1858`）。
+- CUDA で `ncols > 8` のとき、compute capability major >= 8 かつ `rows` が 16 の倍数なら batch Tensor Core kernel が先に選択されて戻り、この変数を読まない。それ以外は列を最大 8 列ずつに分割して再帰呼び出しする（`engine/src/kernels/cuda/dflash2.cu:1801-1834`）。
+- ベンチ用 API `df2_gemm_variant(v)` が 0 以外を設定している場合は、その `g_gemm_variant` が環境変数から計算した variant より優先する。通常の DFlash2 計算経路にはなく、ヘッダーでも bench 用 API として宣言されている（`engine/src/kernels/cuda/dflash2.cu:26,1762,1908-1914`; `engine/include/strata/kernels/dflash2.hpp:61-63`）。
 
 ## 実行時の詳細
 
-通常値（未設定または `atoi` 結果が非ゼロ）では GEMM の合計出力行数に基づいて variant を選びます。`STRATA_DF2_GEMM=0` は、32 の倍数なら variant 1、そうでなければ variant 2 を使います。switch は variant 1 を含む標準経路と 2 から 23 の専用カーネルを起動し、該当 case 以外は既定の GEMM カーネルに進みます（`src/kernels/cuda/dflash2.cu:1081-1113`）。この環境変数の分岐は GEMM カーネルの形状選択であり、DFlash2 の drafter 選択、speculative window 幅、別環境変数の優先順位を変更する処理はありません。
+通常の DFlash2 経路では `Dflash2Drafter::gemm` が pack 内 tensor の型を `Df2Mat::q4` に写し、kernel の `df2_gemm` を呼ぶ。Q8 の GEMM は DFlash2 の context 更新と drafter block 内の projection（例: fc、q/k/v、o、gate/up/down、selector projection）で使われる（`engine/src/core/dflash2.cpp:480-490,514-525,549-581,608-610`）。
 
-ベンチマーク用 API `df2_gemm_variant()` が非ゼロ値を設定した場合は、その値が環境変数による選択より優先されます。実装コメントと API 宣言はこの setter を bench only とし、通常の DFlash2 呼び出し側からの設定は確認できません（`src/kernels/cuda/dflash2.cu:21,995`; `include/strata/kernels/dflash2.hpp:53-60`; 呼び出しは `src/core/dflash2_gemm_bench.cpp:54`）。
+環境値はプロセス起動時に必ず読むのではなく、プロセス内で最初に Q8 分岐がこの初期化行へ到達したときに読む。C++ の関数ローカル `static` に保存されるため、その後の環境変更はこの実行中のプロセスでは反映されない。Q4 専用実行、先行する Tensor Core 経路、または形状エラーだけで終わる場合は読み取りが起きない（`engine/src/kernels/cuda/dflash2.cu:1787-1909`）。
 
-この変数を理由とするログや警告はありません。GEMM 入力形状が不正なら `df2_gemm: unsupported shape` または `df2_gemm: n_out must be a multiple of 16` 等の例外になり、CUDA kernel launch error は `dflash2 kernel gemm8: <CUDA error>` を stderr に出して例外を投げます。これらは環境値の検証ではなく GEMM の形状・起動結果に対する処理です（`src/kernels/cuda/dflash2.cu:24-29,1017-1023,1113`）。
+`tune == 0` の場合は `rows % 32 == 0` なら variant 1、それ以外は variant 2。0 以外の場合は `rows <= 1024` で variant 20、`1025..3072` で variant 13、`rows >= 15000` で variant 10、それらの間は 32 の倍数なら variant 1、そうでなければ variant 2 を選ぶ。いずれも `gemm_rows_kernel` の variant switch に渡される（`engine/src/kernels/cuda/dflash2.cu:1909-1940`）。
+
+## ログと測定値
+
+この変数の読み取り値や選択 variant を出すログはない。kernel launch が失敗すると `check("gemm8")` が stderr に `dflash2 kernel gemm8: <CUDA/HIP error text>` を出し、同じ内容の `std::runtime_error` を投げる（`engine/src/kernels/cuda/dflash2.cu:29-34,1941`）。性能値はこの文書では記載しない。
 
 ## 根拠
 
-- `src/kernels/cuda/dflash2.cu:1017-1029` — GEMM の形状制約、重み形式の判定と合計出力行数。
-- `src/kernels/cuda/dflash2.cu:1031-1078` — Q4_0 分岐が別環境変数を使い、Q8 分岐へ戻らないこと。
-- `src/kernels/cuda/dflash2.cu:1080-1113` — 対象変数の読み取り、既定値、variant 判定、カーネル起動。
-- `src/core/dflash2.cpp:404-415,438-450,463-505` — DFlash2 の実処理から GEMM への呼び出し。
-- `CMakeLists.txt:431-436,520` — DFlash2 の build backend 範囲。
-- `src/program/generate.cpp:5330-5334,6765-6818` — CLI 上の DFlash2 条件と起動失敗 / fallback。
+- `engine/src/kernels/cuda/dflash2.cu:1787-1795,1801-1834,1836-1861,1908-1941` — 入力形状・backend 条件・環境値の読み取り・variant 選択・kernel launch。
+- `engine/src/core/dflash2.cpp:480-490,514-525,549-581,608-610` — DFlash2 drafter からの呼び出しと Q8/Q4 flag の設定。
+- `engine/cmake/strata_gpu_engine.cmake:6-13,97` — DFlash2 実装を含む CUDA/HIP build 条件。
+- `engine/include/strata/kernels/dflash2.hpp:61-68` — variant API と GEMM interface。

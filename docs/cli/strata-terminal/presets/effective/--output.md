@@ -1,6 +1,6 @@
-# `--output`
+# `strata presets effective --output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,47 +12,47 @@
 
 ## 役割
 
-`strata presets effective` の結果を人向けの短い表示か、機械処理向け JSON に切り替えます。保存済み tuning を現在の設定に重ねた場合の effective 値を調べるコマンドです。`--output` は出力形式を選ぶもので、ファイル出力先を指定しません。
+指定した設定で起動するときの実効値を確認するコマンドの出力形式を選びます。`json` は後続処理しやすい JSON、`human` は適用中のプリセットと各設定値の由来を説明するテキストです。
 
 ## 使い方
 
 ```sh
-strata presets effective <profile-name> --output json
+# プロファイルまたは run configuration の実効値を人間向けに表示
+strata presets effective my-profile
+
+# 同じ情報を JSON で取得
+strata presets effective my-profile --output json
 ```
 
-`<profile-name>` の代わりに run configuration（JSON）のパスも指定できます。`target` は必須です。
+位置引数 `target` には保存済みプロファイル名、run configuration の JSON パス、または一意に特定できるインストール済みモデル名を指定できます（`terminal/strata_cli/tune_commands.py:84-85,117-140`）。
 
 ## 値と既定値
 
-- 省略時は `human`。
-- 指定できる値は `human` と `json` のみ。`argparse` の `choices` による検証で、別の値は受け付けません。
-- `--output` に短縮別名はありません。`--json` alias もこの parser には定義されていません。
-- `presets` 配下の共通 parser helper がこの指定を各 presets サブコマンドへ追加します。effective では `target` とともに使います。
+- `--output` は `human` / `json` の二択で、省略時は `human` です。`presets` 配下の各コマンドで共通 parser helper がこの設定を登録します（`terminal/strata_cli/tune_commands.py:55-61,84-85`）。
+- それ以外の値は parser の `choices` により受け付けられず、コマンド処理に入りません。
+- このサブコマンドには `--json` 別名は登録されていません。
 
 ## 実行時の動作
 
-`human` は成功時に `Using your tuning '<名前>'` または `No saved tuning is applied; the standard settings run.` を標準出力へ出します。`json` は `schema_version: 1` と `ok: true` を含む JSON を標準出力へ出します。effective の JSON payload には適用有無、preset/state/reasons、`args`・`env`・`sampling`・`per_request` と、元設定から変わった引数の `changed` 一覧が含まれます。
+`strata presets effective` は `presets_command` から `_effective` を呼び出します（`terminal/strata_cli/cli.py:2229-2230`、`terminal/strata_cli/tune_commands.py:472-488`）。`_effective` は対象設定を読み、保存中の有効な調整プリセットを設定に重ねた結果と元設定を比較します。JSON 出力では `schema_version: 1` と `ok: true` を含むオブジェクトに、適用状態、プリセット、理由・警告、実効 `args` / `env` / `sampling`、変更箇所、設定元を含めます。人間向け出力では、プリセットが適用されているかと、明示された設定の由来を表示します（`terminal/strata_cli/tune_commands.py:544-567,101-106`）。
 
-この出力選択後、コマンドは target の run configuration を読み、現在の選択に対応する active preset の overlay を計算します。preset が適用可能なら引数・環境変数・sampling の値を in-memory の設定に重ねて表示します。設定を書き戻したり、tuning の計測や preset の保存を行う処理はこの経路から呼ばれません。preset がない場合、または identity が hard stale／設定が安全規則に合わない場合は適用せず、effective の標準設定を返します。store の読み出し等で overlay 内に例外が起きた場合も、overlay は元設定を返し `info.error` を記録します（現行 payload はこの `error` を出力項目に含めません）。
+この処理は実効設定の確認であり、マージした設定をその場でファイルへ保存したり、エンジンを起動したりしません。プリセット overlay はストアを読み、適用条件を判定して設定辞書を組み立てます。プリセットストアを読めない場合も overlay は例外を外へ出さず元設定を返す実装です（`terminal/strata_control/presets.py:488-546`）。
 
 ## 適用条件と副作用
 
-このオプションは表示形式だけを変え、preset の適用可否や effective 値の計算方法は変えません。`--output` 自体はファイルを作成・上書きしません。処理は target の解決・設定読み込みと preset store／identity の参照を伴います。store が存在しない、active preset がない場合は適用なしの結果になります。
+値の選択は出力形式だけに作用し、プリセット適用の可否は設定の選択肢と現在のマシン・モデル等の識別情報に基づく overlay 側の判定で決まります。適合しないプリセットは適用されず、JSON には `why_not` や状態・理由が含まれます。設定の読込とプリセット状態の参照は行いますが、このコマンドの処理経路にファイル書込やエンジン起動はありません（`terminal/strata_cli/tune_commands.py:548-567`、`terminal/strata_control/presets.py:488-546`）。
 
 ## 出力とエラー
 
-- 正常終了は終了コード `0`。JSON モードでは成功 JSON を標準出力に出します。
-- target の解決・読み込み等が `PresetError`、`OSError`、`ValueError` になると、JSON モードは `schema_version: 1`、`ok: false`、`error`（code/message）を標準出力へ出し、human モードは `strata: <message>` を標準エラーへ出します。`PresetError` の終了コードは `5`、その他は例外の `exit_code` 属性（なければ `2`）です。
-- `--output` に未対応の値を指定すると parser の選択肢検証で拒否され、argparse の usage/error 経路になります（終了コード `2`）。
+- `human` は標準出力に説明文を出します。プリセットが適用されない場合、理由があれば説明に追加されます（`terminal/strata_cli/tune_commands.py:563-567,101-106`）。
+- `json` は標準出力に `schema_version: 1` / `ok: true` を含む JSON を1件出します（`terminal/strata_cli/tune_commands.py:101-104,559-562`）。
+- 対象が解決できないなどのエラーは、人間向けでは `strata: ...` を標準エラーへ、JSON 指定時は `ok: false` とエラー情報を標準出力へ出します。失敗時の終了コードは例外の `exit_code` があればそれを使い、なければ `2` です（`terminal/strata_cli/tune_commands.py:109-114,527-530`、`terminal/strata_cli/cli.py:2248-2255`）。
+- overlay 内で発生した読み取り・評価エラーは overlay が捕捉して元設定を返します。`_effective` の payload は `info.error` を含めないため、その失敗が独立したエラーとして表示されるかはこのコマンドの当該実装から確認できません（`terminal/strata_control/presets.py:544-546`、`terminal/strata_cli/tune_commands.py:559-567`）。
 
 ## 根拠
 
-- `strata_cli/tune_commands.py:53-55` — presets 共通 parser が `--output {human,json}`、既定値 `human` を定義。
-- `strata_cli/tune_commands.py:78-79` — `effective` parser と必須位置引数 `target`。
-- `strata_cli/cli.py:487`, `strata_cli/cli.py:2151-2152` — presets parser 登録と `presets_command` への dispatch。
-- `strata_cli/tune_commands.py:95-108` — human/JSON 成功出力、エラー出力と終了コード。
-- `strata_cli/tune_commands.py:289-304`, `strata_cli/tune_commands.py:361-378` — `--output` による形式選択、effective payload と表示文。
-- `strata_cli/tune_commands.py:344-347` — presets 経路で捕捉する例外と終了コード。
-- `strata_control/presets.py:441-482` — preset overlay、stale/安全規則による適用条件、元設定への fallback。
-
-調査範囲は上記 checkout の Terminal CLI ソースです。CLI の実行や `--help` 表示、Release artifact の照合は行っていません。
+- `terminal/strata_cli/tune_commands.py:55-61,84-85` — 共通 `--output` parser 定義、選択肢・既定値、および `effective` の位置引数。
+- `terminal/strata_cli/cli.py:514-515,2229-2230` — parser 登録と `presets_command` へのディスパッチ。
+- `terminal/strata_cli/tune_commands.py:544-567` — 対象の解決後に overlay を呼び、出力 payload と人間向け説明を生成。
+- `terminal/strata_cli/tune_commands.py:101-114,472-531` — 成功・失敗時の標準出力/標準エラーとプリセットコマンドの例外処理。
+- `terminal/strata_control/presets.py:488-546` — overlay の適用条件、設定の組み立て、ストア読取エラー時の fallback。

@@ -1,45 +1,43 @@
 # `STRATA_QSA_DUMP_LAYER`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA/HIP 側の prompt prefill にある QSA 選択結果の診断ダンプで、記録する QSA layer を絞ります。この変数だけではダンプを開始しません。`STRATA_QSA_DUMP` にファイルパスが設定されているときにだけ判定され、負の値なら全 QSA layer、0 以上ならその番号の layer だけを対象にします。通常の QSA 選択や attention の計算方法は切り替えず、診断データの出力範囲だけを変えます。
+QSA の選択セルを `STRATA_QSA_DUMP` のファイルへ追記する診断用処理で、記録対象を QSA layer の番号で絞ります。通常の推論処理や選択結果を変える分岐ではなく、該当する QSA layer の選択 ID をホストへコピーしてダンプに記録するかどうかだけを変えます。読み取り箇所は CUDA/HIP 用 prefill 実装の `engine/src/prefill/prefill.cpp` です（同ファイル:5512-5523）。
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換され、文字列全体の検証はありません。未設定時の既定値は `-1` です。
+この値は `std::getenv` が返す文字列を `std::atoi` で `int` に変換します。文字列全体の妥当性検査、clamp、エラー処理はありません。unset は `-1` となり、`only < 0` の条件で全 QSA layer を対象にします。設定値が 0 以上なら、その番号と現在の QSA ordinal が一致する layer だけを対象にします（同ファイル:5515-5516）。
 
-| 設定値 | 判定と対象 |
-|---|---|
-| 未設定 | `-1`。全 QSA layer を対象にする |
-| 負の整数 | 全 QSA layer を対象にする |
-| `0` 以上の整数 | 変換後の番号と一致する QSA layer だけを対象にする。番号は 0 始まり |
-| 空文字・数値に変換できない文字列 | `atoi` の結果は `0` となり、QSA layer 0 だけを対象にする |
-| 数字の後ろに文字が続く値 | 数字として読める先頭部分が使われる。例: `2abc` は layer 2、`-1x` は全 layer |
+| 条件 | unset | 選択対象になる値の例 | 全 layer になる値の例 | 指定 layer に一致しない値の例 |
+|---|---|---|---|
+| CUDA/HIP prefill で `STRATA_QSA_DUMP` が設定されている | `-1` に相当し、全 QSA layer | `0`, `1`, `12`（対応する ordinal のみ） | `-1`, `-2`（負数はすべて全 layer） | `5`（ordinal 5 以外） |
 
-先頭の空白や符号も `atoi` の整数変換規則に従います。範囲外整数に対する `atoi` の結果はこの実装で保証されません。
+空文字、数字以外で始まる文字列、空白だけの文字列は `atoi` により `0` になります。したがって、たとえば `""`、`true`、`0anything` は ordinal 0 を指定します。前後の空白や符号は `atoi` の整数変換規則に従い、数値の後ろにある文字列は検証されません。`+2tail` は 2、`-2tail` は負数として全 layer です。int の範囲を超える文字列は有効な入力として扱えず、変換結果は保証されません。なお `STRATA_QSA_DUMP` が unset ならこの変換自体が行われません（同ファイル:5512-5516）。
 
 ## 有効になる条件
 
-- `STRATA_QSA_DUMP` が未設定でないこと。空文字も「設定あり」としてダンプ処理に入り、ファイルを開こうとしますが、空パスへの `fopen` は失敗します。
-- QSA を含むモデルの prompt prefill が実行され、QSA 選択処理まで到達すること。
-- 現在の chunk がダンプ範囲内であること。別変数 `STRATA_QSA_DUMP_LAST` による条件 `p0 + T > pos0 + n - last` も満たす必要があります。同変数の既定値は 4096 です。
-- `STRATA_QSA_DUMP` で指定したファイルを追記モードで開けること。開けなかった場合、この処理はエラーや警告を出さず、レコードを書きません。
-
-この環境変数の読み取り箇所は `src/prefill/prefill.cpp` の一つです。CMake では同ファイルが `strata_prefill` に含まれています。SYCL 移植版の `sycl/src/prefill/prefill.cpp` にある同種の QSA ダンプは layer 番号による絞り込みを行わないため、同版でこの変数を設定しても効果はありません。
+- CUDA または HIP backend の GPU engine が必要です。CMake は CUDA/HIP の GPU engine 内で `src/prefill/prefill.cpp` を `strata_prefill` に含めます（`engine/cmake/strata_gpu_engine.cmake:6-9,478-488`）。
+- `STRATA_QSA_DUMP` が設定されていなければ、layer filter を含む記録ブロックに入りません。空文字でも `getenv` は非 null なのでブロックに入りますが、その値でファイルを開けるとは限りません（`engine/src/prefill/prefill.cpp:5512,5520`）。
+- プロンプト処理が QSA layer の該当箇所まで進み、`p0 + T > pos0 + n - last` を満たす必要があります。`last` は別変数 `STRATA_QSA_DUMP_LAST`（未設定時 4096）で決まり、この条件を満たさないチャンクは記録しません（同ファイル:5513-5516）。
+- layer 番号はモデル全体の layer 番号でなく QSA layer の ordinal です。チャンク開始前にそれまでの QSA layer 数を数え、各 QSA layer の処理後に ordinal を増やしています（同ファイル:4594-4595, 5222-5225, 5575）。
+- SYCL 用 `engine/sycl/src/prefill/prefill.cpp` にも `STRATA_QSA_DUMP` の記録処理がありますが、そこでは `STRATA_QSA_DUMP_LAYER` を読まず、layer による絞り込みもありません（`engine/sycl/src/prefill/prefill.cpp:3820-3843`）。この変数は SYCL 経路では効果がありません。
+- この読み取り箇所に CLI 引数や設定ファイルとの優先順位処理はありません。
 
 ## 実行時の詳細
 
-ダンプブロック内で `STRATA_QSA_DUMP` のファイルポインターと `STRATA_QSA_DUMP_LAYER` の整数値を block-scope `static` として保持します。初回評価はダンプブロックに初めて到達したときに行われ、`STRATA_QSA_DUMP` が null ならその null が保持されます。その後の prefill 呼び出しでも値は再評価されないため、最初の通過時に `STRATA_QSA_DUMP` が unset だった場合、後から設定してもこのプロセスではダンプが始まりません。また `STRATA_QSA_DUMP_LAYER` も初回評価後に変更しても layer 選択は更新されません。
+`STRATA_QSA_DUMP`、`STRATA_QSA_DUMP_LAST`、`STRATA_QSA_DUMP_LAYER` はブロック内 `static` として保持されます。各値は最初に該当箇所へ到達したときに評価され、その後プロセス内では再読込されません。初回に `STRATA_QSA_DUMP` が unset なら `dump` は null のままなので、実行中に環境を変更しても記録処理は有効になりません。初回に dump path が設定されていた場合も、layer 値を含む各値はキャッシュされ、後からの変更は反映されません（`engine/src/prefill/prefill.cpp:5512-5516`）。
 
-`qsa_index` は QSA layer ごとに 0 から始まり、処理後に 1 増えます。フィルターを通った chunk では `m.sel_ids` をホストへコピーして stream を同期し、ファイルを `ab` で開いて、`int32` 4個のヘッダー `{qsa layer, p0, T, cap}` と `T * cap` 個の選択 cell ID を追記します。`STRATA_QSA_DUMP_STEPS` も設定されていれば、後続に step 情報も追記します。選択範囲は `STRATA_QSA_DUMP_LAST` によって制限されます。
+条件に一致すると選択 ID をホストへコピーして stream を同期し、ファイルを append モードで開きます。開けた場合は `{qsa ordinal, p0, T, cap}` の 4 個の int32 header と `T * cap` 個の選択 ID を書き込みます。別変数 `STRATA_QSA_DUMP_STEPS` が設定されていれば、その後に step record も追記します（同ファイル:5516-5529）。この環境変数はこの記録対象の選択だけを変え、QSA の選択計算や後続 attention 計算の分岐には使われません。
 
-通常利用者向けの推論設定ではなく、QSA 選択結果をファイルに記録する調査用フックです。選択 chunk では device-to-host コピーと stream 同期が追加されます。実装は `fopen` 失敗を報告しません。
+## ログと測定値
+
+この変数専用のログや測定値はありません。ファイルを開けなかった場合は `fopen` の失敗を検査せず、記録を飛ばします。`fwrite`、CUDA copy、stream 同期の戻り値もこのブロックでは検査せず、明示的な警告・エラー出力やエラー返却はありません（`engine/src/prefill/prefill.cpp:5517-5529`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:2640-2641,3041-3044,3231-3255,3278` — QSA index の初期化・増分、dump の条件、整数変換、ファイル追記。
-- `CMakeLists.txt:675-685` — `src/prefill/prefill.cpp` が `strata_prefill` に含まれること。
-- `sycl/src/prefill/prefill.cpp:3128-3154` — SYCL 側の対応 dump は layer filter を含まない。
-
+- 読み取り、整数変換、ordinal filter、ダンプ処理: `engine/src/prefill/prefill.cpp:5512-5529`
+- ordinal の開始値と QSA layer 判定: `engine/src/prefill/prefill.cpp:4594-4595,5222-5225,5575`; `engine/include/strata/core/geometry.hpp:88-90`
+- CUDA/HIP 用 prefill target: `engine/cmake/strata_gpu_engine.cmake:6-9,478-488`
+- SYCL 側に layer filter がないダンプ実装: `engine/sycl/src/prefill/prefill.cpp:3820-3843`

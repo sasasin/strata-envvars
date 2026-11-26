@@ -1,57 +1,56 @@
 # `STRATA_BATCH_GROUPS_NV_SERIAL`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-`--batch-groups` を省略したとき、2 GPU の layer split における複数 slot の自動グループ数を 1 にする既定動作を選びます。通常の自動設定は GPU stage 数以下のグループに slot を分け、stage 間で pipeline 実行します。この変数が有効な条件では、2 GPU の自動設定を serial window（1 group）にします。GPU が NVIDIA であることを狙った設定として実装されていますが、コード上のコンパイル条件は `STRATA_USE_HIP` が未定義であることです（後述）。
+`--batch-groups` を指定しない layer split の batch で、2 NVIDIA GPU 向けの自動 group 数を 1 にする opt-in です。通常の自動選択は batch slot 数を割り切る GPU stage 数までの group を選びます。この変数が有効な場合、ちょうど 2 stage の layer split ではその自動選択を 1 group に変更し、slot window を各 stage で順番に処理する経路にします。明示的な `--batch-groups auto` は pipeline を要求するため、この変数より優先されます。実読込は `engine/src/program/generate.cpp` の `batch_groups_for`、値の解釈と group 解決は `engine/include/strata/program/batch_groups.hpp` の `nv_serial_wanted` / `resolve` です（`generate.cpp:7803-7820`, `batch_groups.hpp:103-110,122-137`）。
 
 ## 値と判定
 
-`src/program/generate.cpp` で `std::getenv()` の結果を読み、値の先頭文字だけで判定します。文字列の数値変換や全体比較はしません。
+Strata は `std::getenv` の結果を `nv_serial_wanted` に渡します。helper は文字列全体の parse や大文字小文字変換をせず、未設定 (`nullptr`) または空文字なら `STRATA_DEFAULTS=026` の判定に委ねます。空でない値は先頭文字だけを見て、`'0'` なら無効、それ以外なら有効です。したがって `0`, `0anything` は無効、`1`, `yes`, `true`, `false`, ` 1` は有効です。末尾や数値としての妥当性は検査せず、境界値・負値の数値解釈もありません (`batch_groups.hpp:103-110`)。
 
-| 環境変数の状態 | `nv_serial_faster` |
-|---|---:|
-| 未設定 | true |
-| 空文字 | true（先頭は終端文字 `\0` であり `'0'` ではない） |
-| 先頭文字が `0` | false（例: `0`, `0abc`） |
-| それ以外 | true（例: `1`, `false`, `abc`, 空白で始まる文字列） |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `STRATA_DEFAULTS=026` が off | pipeline 側の自動選択 | `1`, `yes`, `false`, ` 1` | 空文字, `0`, `0anything` |
+| `STRATA_DEFAULTS=026` が on | 旧来の 1 group | `1`, `yes`, `false`, ` 1` | 空文字は既定値に従い 1 group、`0`, `0anything` は明示 override で pipeline 側 |
 
-`'0'` 以外の先頭文字はすべて同じ扱いです。大文字小文字、後続文字、数値としての妥当性は検査しません。未設定時は有効扱いなので、この既定を無効にするには `STRATA_BATCH_GROUPS_NV_SERIAL=0` のように先頭文字を `0` にします。
+ここで `STRATA_DEFAULTS=026` が on なのは、`STRATA_DEFAULTS` が完全一致で `026`, `0.2.6`, `v0.2.6` のいずれかの場合です。それ以外（未設定、空、`0`, `027` など）は off です。この master switch は初回呼出し時の値を関数内 `static` に cache します (`engine/include/strata/core/defaults_026.hpp:21-30`)。一方、この対象変数自体には cache がなく、`batch_groups_for` の各呼出しで `getenv` されます (`generate.cpp:7803-7817`)。
 
 ## 有効になる条件
 
-この値が true でも、次の条件がすべて揃った場合に限り、自動グループ数を 1 にします。
+- `generate` が非 HIP build であること。対象の `std::getenv` と代入は `#if !defined(STRATA_USE_HIP)` 内です (`engine/src/program/generate.cpp:7813-7818`)。
+- `--serve` と `--batch` 2 以上が有効で、各 layer split stage が別 GPU に置かれること。batch はこれらの条件を満たさないと停止されます (`generate.cpp:7954-7968`)。
+- 2 GPU の layer split（`later_stages == 1`）で、slot 数を 2 で割り切れて自動選択が複数 group になること。通常の自動 group 数は slot 数を割り切る stage 数までの最大値です (`batch_groups.hpp:113-119,126-137`)。
+- `--batch-groups` を指定しないこと。数値指定も `auto` 指定も明示指定として扱われ、serial への既定変更は適用されません。特に `--batch-groups auto` は pipeline を選びます (`generate.cpp:4044-4049`, `batch_groups.hpp:126-137`)。
+- `--batch-mtp` が有効でないこと、および `--adapt-async 1` でないこと。どちらも対象変数の two-card 分岐を通らず、既定 auto は別の理由で 1 group になる場合があります。`--batch-mtp` と `STRATA_BATCH_MTP_SERIAL` の組合せには先行する serial 選択があります (`generate.cpp:7810-7817`, `batch_groups.hpp:131-136`)。
+- `STRATA_DEFAULTS=026` が有効でも、対象変数に空でない値を明示すれば対象変数が優先します。先頭が `0` なら master switch を打ち消し、先頭がそれ以外なら serial を要求します (`batch_groups.hpp:105-110`)。
 
-- `--batch-groups` がコマンドラインで指定されていない。
-- `--batch` が 2 slot 以上で、layer split がある。
-- 自動計算したグループ数が 1 より大きい（slot 数を分割できる stage 数がある）。
-- `later_stages == 1`、すなわち CUDA stage が2つ。
-- `--batch-mtp` が有効でない。
-- `--adapt-async 1` が指定されていない。
-- `src/program/generate.cpp` が `STRATA_USE_HIP` 未定義でコンパイルされている。
-
-明示した `--batch-groups 1` はその値のままです。明示した `--batch-groups auto` または数値指定もこの変数による既定変更の対象外です。`--batch-mtp` と `STRATA_BATCH_MTP_SERIAL` の組み合わせが先に判定され、`--adapt-async 1` は後に判定されます。これらが serial group を要求するときは、その理由で 1 group になります。条件を満たさない場合、通常の `auto` が選ぶ pipeline グループ数を使います。
-
-コードの guard は `#if !defined(STRATA_USE_HIP)` であり、`STRATA_HIP_GFX906` を明示的に除外していません。その互換ビルドで当該ファイルがこの guard の条件でコンパイルされる場合も読み取り対象になります。したがって「NVIDIA だけ」というコメント上の説明より、実際の適用境界はこの macro と上記の実行条件で判断できます。
+条件に合わない build / GPU 構成 / batch では、この値自体が有効でも group 解決に反映されません。明示 group 数が layer split を使わない、または batch を割り切らない場合は `WARNING: --batch-groups ... needs a layer split and to divide --batch ...; one group` が出て 1 group に fallback します (`generate.cpp:7994-7999`)。
 
 ## 実行時の詳細
 
-環境変数は `batch_groups_for()` が入力を組み立てるたびに読みます。結果は `resolve()` に渡され、未指定の既定 auto のときに限り、通常なら複数 group となる結果を `TwoCardsSerialFaster` として 1 group に上書きします。初期 batch slot 数の解決時と、VRAM に収まった slot 数への調整後に再解決されます。static cache はなく、サーバーの各リクエストで読み直すのではなく、generate 実行の batch 設定時に評価されます。
+`batch_groups_for` は CLI の group 指定、batch 数、stage 数、MTP / async 状態と環境値を `Input` に詰め、`resolve` が group 数を返します。既定自動選択は `--batch-groups` 未指定、layer split あり、batch が 1 より大きい場合に働きます。自動候補が複数 group で、対象変数が有効かつ `later_stages == 1`、MTP off、async off の場合だけ `resolve` は group 数を 1 にします (`generate.cpp:7803-7820`, `batch_groups.hpp:122-137`)。
 
-この既定変更が適用されると stderr に次の形式の案内が出ます（`G` は通常の auto が選んだ group 数）。
+値は batch setup 中の解決時に読み取られ、解決した `o.batch_groups` が実際の batch loop で使われます。環境変数をリクエストごとに読み直す処理はありません。1 group なら `piped` は false となり、batch window は全 slot をまとめて処理します。複数 group の場合は `GS = o.batch / o.batch_groups` で各 group の slot 数を決め、stage 間で group を pipeline します (`generate.cpp:7975-7999,17529-17538`)。
+
+## ログと測定値
+
+対象の serial 選択で自動 group 数が 1 になると、stderr に次の形式で理由を表示します（`%d` は batch slot 数と pipeline の候補 group 数）。
 
 ```text
-strata generate: --batch-groups auto: 1 group of N slots - serial windows (measured faster than pipelined groups on two NVIDIA cards; STRATA_BATCH_GROUPS_NV_SERIAL=0 keeps the pipeline); --batch-groups G asks for the pipelined groups
+strata generate: --batch-groups auto: 1 group of N slots - serial windows (STRATA_BATCH_GROUPS_NV_SERIAL=1 or STRATA_DEFAULTS=026 asked for them on two NVIDIA cards; --batch-groups auto pipelines); --batch-groups G asks for the pipelined groups
 ```
 
-`STRATA_BATCH_GROUPS_NV_SERIAL=0` なら、この案内の理由による 1 group 化は行われず、自動 pipeline が選ばれます。ただし他の理由（batch MTP、adapt async など）が serial group を要求する場合は別です。
+出力箇所は `generate.cpp:7982-7985`、理由文字列は `engine/include/strata/program/batch_groups.hpp:148-150` です。この変数単独の警告や終了経路はありません。明示 `--batch-groups auto` では上記の serial 理由ログは出ず、選ばれた group 数の通常ログになります (`generate.cpp:7977-7992`)。
+
+Strata の `docs/BATCHING.md:474-480` も、0.2.7 以降の二枚 NVIDIA GPU の既定は pipeline、対象変数または `STRATA_DEFAULTS=026` で serial に戻る、と記載しておりソースと整合します。同資料には機種・モデル・設定つきの性能測定がありますが、本調査では再測定していません。速度差を一般化した実測値としては扱いません。
 
 ## 根拠
 
-- 変数の読み取りと HIP compile guard: `src/program/generate.cpp:5235-5248`。
-- `--batch-groups` の CLI 指定状態と `auto` / 数値の解析: `src/program/generate.cpp:2595-2600`。
-- 通常の auto group 数、環境値による 1 group 化、理由の優先順位: `include/strata/program/batch_groups.hpp:41-67`。
-- 適用時の stderr 案内と再解決箇所: `src/program/generate.cpp:5313-5329,5378-5387`。
-- group 数が複数の場合の pipeline 経路: `src/program/generate.cpp:11584-11612`。
-- `docs/BATCHING.md:92` と `docs/release-notes-0.2.1.md:43` はこの既定動作を説明し、2x RTX A4000 での測定値を記載しています。これらの値は当該資料の条件で報告されたもので、別の機材・モデルでの性能を示すものではありません。
+- `engine/src/program/generate.cpp:4044-4049` — `--batch-groups` を明示指定として記録。
+- `engine/src/program/generate.cpp:7803-7820` — batch group 入力の構成、対象変数の読込、非 HIP build guard。
+- `engine/include/strata/program/batch_groups.hpp:103-119` — 対象値の判定と自動 group 数。
+- `engine/include/strata/program/batch_groups.hpp:122-150` — 既定値への適用条件、優先順位とログ理由。
+- `engine/include/strata/core/defaults_026.hpp:21-30` — `STRATA_DEFAULTS` の完全一致判定と cache。
+- `engine/src/program/generate.cpp:7954-7999,17529-17538` — batch の有効条件、解決ログ、fallback と実行時 group 数。

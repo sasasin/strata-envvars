@@ -1,66 +1,55 @@
-# `--port`
+# `quick-benchmark --port`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `quick-benchmark` |
-| コマンド | `bench.sh` / `BENCH.bat`（委譲先: `python tools/strata_bench.py`） |
+| コマンド | `bench.sh`（Linux） / `BENCH.bat`（Windows）。どちらも `terminal/tools/strata_bench.py` に引数を渡す |
 | オプション | `--port` |
 | 別名 | なし |
-| 値 | 整数。quick benchmark 側ではポート範囲の検証なし |
+| 値 | 整数ポート番号 |
 
 ## 役割
 
-quick benchmark が既存のモデル設定から Strata サーバーを起動するときに、接続先のポートを指定します。サーバーがすでに動いていて検出された場合はそれを再利用し、`--url` を指定した場合は URL の接続先を使います。
+ベンチマークが設定ファイルのモデルを起動するときに使う待受ポートを指定します。省略すると選択した設定の `port` を使います。既にそのアドレスで Strata サーバーが動いていれば、そのサーバーを利用します。`--url` で接続先を明示した実行では、このオプションは接続先に使われません。
 
 ## 使い方
 
 ```sh
-./bench.sh --port 8081
+# Linux: quick benchmark を設定ポート 8095 で起動（設定ファイルの指定は任意）
+./tools/bench.sh --port 8095
+
+# Windows: 同じ実装へポートを渡す
+BENCH.bat --port 8095
 ```
-
-またはセットアップ済みの Windows 環境で:
-
-```bat
-BENCH.bat --port 8081
-```
-
-ラッパーは引数を `tools/strata_bench.py` に渡します（`bench.sh:6-10`、`BENCH.bat:8-16`）。
 
 ## 値と既定値
 
-- `argparse` の `type=int` で整数に変換します。値を省略すると quick benchmark 側の値は `None` です（`tools/strata_bench.py:932-948`）。整数でない値は `argparse` が拒否し、通常の usage エラーで終了します。
-- `--url` を指定せず起動先を選ぶ場合、ポートは `--port` の値、設定 JSON の `port`、設定に値がなければ `8080` の順で決まります（`tools/strata_bench.py:957-979`）。
-- 明示した `--port 0` は `a.port or ...` の評価で偽と扱われ、設定 JSON の `port`（なければ `8080`）に置き換わります。したがって quick benchmark から OS の空きポート自動割当を要求する用途には使えません（`tools/strata_bench.py:978-979`）。
-- quick benchmark 自身には `1..65535` などの範囲検証がありません。負数などの整数も parser を通りますが、実際に bind できるかはサーバー起動時に決まります（`tools/strata_bench.py:936`、`serve/server.py:8156`、`serve/server.py:7718-7723`）。
+`strata_bench.py` は `--port` を `type=int` で受け取り、parser 上の既定値はありません。起動先のポートは `a.port or int(cfg.get("port", 8080))` で決まるため、未指定時は設定の `port`、設定にも値がなければ `8080` です。明示値 `0` も偽値として扱われ、設定のポート（または `8080`）に置き換わります。ベンチマーク側にポート範囲の追加検証はありません。整数でない引数は `argparse` の型変換で拒否されます。
 
 ## 実行時の動作
 
-- `--url` が指定されていれば、末尾の `/` を取り除いた URL を接続先に使い、`--port` の値は使用しません（`tools/strata_bench.py:975-979`）。この経路では既存サーバーの `/health` を確認し、Strata サーバーでなければ「No Strata server answers」として終了コード `2` になります（`tools/strata_bench.py:983-987`）。
-- URL を指定しない場合、選ばれた port と設定の host から接続 URL を作ります。host が省略されると `127.0.0.1`、ワイルドカード `0.0.0.0` / `::` は疎通確認用に loopback アドレスへ置き換えられます（`tools/strata_bench.py:922-929`）。
-- その URL に Strata の `/health` 応答があれば既存サーバーを利用し、新しいサーバーは起動しません。Strata ではない応答がポート上にある場合は、`--port N` を変えるよう stderr に表示し、終了コード `2` で終了します（`tools/strata_bench.py:983-991`）。
-- 接続先に Strata がいなければ、ベンチマークは `serve/server.py --engine strata --config ... --port N` を子プロセスとして起動します（`tools/strata_bench.py:688-705`）。そのサーバーは指定 host/port で HTTP listener を作成します（`serve/server.py:7718-7723`）。
+`--url` がない場合、選ばれた設定ファイルの `host` と `--port`（または設定値）からローカル確認用 URL を組み立て、`/health` を調べます。指定ポートで Strata が応答すれば既存サーバーをそのまま使い、ベンチマークは停止しません。別の HTTP 応答があれば「別のものがポートを使用中」として終了します。応答がなければ、設定ファイルと選んだポートを `serve/server.py --engine strata --config ... --port ...` に渡してサーバープロセスを起動し、準備完了を待ちます。サーバーを起動した場合はベンチマーク終了時に停止処理を行います。
+
+`--url` を指定するとその URL を接続先に使い、サーバー起動は行いません。そのため `--port` が同時に指定されても URL のポートを変更しません。`--config` も併記した場合は設定を読みますが、接続先は `--url` です。
 
 ## 適用条件と副作用
 
-- `--port` はサーバーを新規起動する経路に適用されます。`--url` 指定時は無視され、Strata サーバーがすでに選択ポートで稼働している場合もそのサーバーを再利用します（`tools/strata_bench.py:975-995`）。
-- Strata サーバーとして識別されず、かつ指定ポートの `/health` が JSON を返す場合は、ベンチマークは別ポートを指定するよう案内します（`tools/strata_bench.py:983-991`）。
-- 起動したサーバーの stdout/stderr は一時ディレクトリ内のログへまとめられます。起動後、指定時間内に ready にならない場合はログ末尾を stderr に出して終了コード `1`、ベンチマーク終了時には自分で起動したサーバーを停止します（`tools/strata_bench.py:704-705`、`tools/strata_bench.py:708-720`、`tools/strata_bench.py:992-999`、`tools/strata_bench.py:1035-1037`）。
-- 実際の bind が失敗した場合、サーバーは「ポート使用中」や OS の理由を含む listen エラーを作ります（`serve/server.py:144-160`）。このサーバーログはベンチマーク起動ログに書かれ、ready 待ちの失敗経路でログ末尾が表示されます（`tools/strata_bench.py:704-705`、`tools/strata_bench.py:996-999`）。
+`--port` は設定ファイルからサーバーを起動する経路に適用されます。設定ファイルなしで `--url` もない場合、ポートを指定していてもモデル設定が見つからず終了します。指定値に対する範囲チェックはベンチマーク側にはなく、実際の bind 可否は子サーバーに委ねられます。ポートを使用できずサーバーが準備完了にならない場合、ベンチマークは失敗としてサーバーログ末尾を表示します。
 
 ## 出力とエラー
 
-- 起動経路では選択した設定名とポートを標準出力に表示してからサーバーを開始します（`tools/strata_bench.py:992-995`）。
-- ポート上に Strata 以外の HTTP health 応答がある場合は stderr に案内を出して終了コード `2`、サーバーが ready にならない場合はログ末尾を stderr に出して終了コード `1` です（`tools/strata_bench.py:989-999`）。
-- このオプション専用の数値範囲エラーや、ポートを結果 JSON のパラメータとして保存する処理は確認できません。結果の `params` には `started_server` などが記録されますが、port は含まれていません（`tools/strata_bench.py:1011-1016`）。
+- 設定ポートが Strata 以外の HTTP サービスに使われていると判定した場合、stderr にポート使用中の案内を出して終了コード `2` を返します。
+- `--url` の接続先で Strata が応答しない場合も、stderr に案内を出して終了コード `2` を返します。
+- 起動したサーバーが準備完了にならない場合、stderr にサーバーログの末尾（最大15行）を表示して終了コード `1` を返します。ポート bind 失敗はこの起動失敗経路に含まれます。
 
 ## 根拠
 
-- quick benchmark の parser と起動 URL の選択: `tools/strata_bench.py:932-979`
-- 既存サーバーの判定、port 競合、子プロセス起動、ready 待ちと終了処理: `tools/strata_bench.py:983-999`、`tools/strata_bench.py:1035-1037`
-- `bench.sh` / `BENCH.bat` からの引数委譲: `bench.sh:6-10`、`BENCH.bat:8-16`
-- 委譲先サーバーの `--port` parser、bind、listen エラー: `serve/server.py:144-160`、`serve/server.py:7718-7723`、`serve/server.py:8156`
-- 索引上の所属とリンク: `docs/cli/README.md:1522-1545`
-
-この調査では同一 revision の quick benchmark を起動していません。無効な整数以外の境界値について、実際の OS・ポート状態ごとの bind 結果は確認していません。
+- `terminal/tools/strata_bench.py:1080-1095` — `argparse` の `--port` 宣言、整数型、既定値なし。
+- `terminal/tools/strata_bench.py:1121-1126` — `--url` 使用時の接続先と、未指定・明示ポートからの選択規則。
+- `terminal/tools/strata_bench.py:1128-1146` — 既存 Strata / 別 HTTP サービスの判定、サーバー起動、準備失敗時の終了コードとログ出力。
+- `terminal/tools/strata_bench.py:812-829` — 設定ファイルを読み、選択ポートを子サーバーの `--port` に渡す処理。
+- `terminal/tools/strata_bench.py:1181-1184` — ベンチマーク終了時、今回起動したサーバーだけを停止。
+- `terminal/serve/server.py:8779-8785`, `9174`, `9721-9729` — サーバー側の整数ポート parser、bind、実際の待受ポートを使った ready 表示。ベンチマークはポート値の範囲を追加検証せず、この server に引き渡す。
+- `tools/bench.sh:6-10`, `tools/BENCH.bat:8-18` — Linux / Windows のラッパーが引数を `terminal/tools/strata_bench.py` に渡す。

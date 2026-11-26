@@ -1,53 +1,59 @@
 # `STRATA_UMA_HEADROOM_GIB`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-02 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-26 時点）。
 
 ## 役割
 
-Linux の統合 GPU で、エンジンが使える GPU メモリ量を見積もる際に、`/proc/meminfo` の `MemAvailable` から差し引くシステム用 headroom（GiB）を指定します。CUDA/HIP 互換実装と SYCL 実装の `device_free_bytes()` がこの値を読みます。離散 GPU、Windows、macOS ではこの読み取り経路に入りません。
-
-この見積もりは `--expert-cache auto` の slot 数計算に使われます。また、明示した `--expert-cache N` のサイズを実際のキャッシュ確保前に照合する検査にも使われます。変数自体が CLI 値を上書きしたり、明示サイズを自動で縮めたりはしません。
+Linux の統合 GPU（CPU と GPU がシステム RAM を共有するデバイス）について、Strata がモデル用メモリを見積もる際にシステム用として差し引く GiB 数を指定する。既定値は 6 GiB。GPU の空き容量を元に expert cache などを計画する値であり、割り当てをこの量に固定する設定ではない。通常のデバイス空き容量見積もりは CUDA runtime 系（CUDA/HIP 互換実装を含む）では `device_free_bytes()`、SYCL では `uma_free_bytes()` が行う（`engine/src/core/expert_cache.cpp:99-100,115-150`; `engine/sycl/src/core/expert_cache.cpp:120-148`）。
 
 ## 値と判定
 
-値は `std::strtol(h, &end, 10)` で基数10の `long` に変換し、変換が1文字以上進み、終端まで消費され、`0 <= v <= 1024` の場合だけ採用します。未設定時は 6 GiB です。設定値が無効なら 6 GiB に戻し、stderr に次の警告を一度出します。
+両実装とも `std::getenv` で取得し、`std::strtol(..., 10)` で 10 進整数に変換する。変換後に少なくとも 1 文字を消費し、文字列末尾まで読み切り、値が `0..1024` の場合だけ採用する。したがって先頭・末尾の空白は `strtol` の規則上、先頭空白は許されても末尾空白は不許可。`+` 符号と先頭ゼロは許され、`-0` は数値 0 として許される。負の値、1024 を超える値、空文字、数字の後ろに文字がある値（例 `0anything`）、数値として読み取れない値は無効。桁あふれも範囲判定により無効になる。無効値では 6 GiB に戻し、stderr に警告する（`engine/src/core/expert_cache.cpp:137-146`; `engine/sycl/src/core/expert_cache.cpp:88-100`）。
+
+| 条件 | 未設定 | 有効値の例 | 無効値の例 |
+| --- | --- | --- | --- |
+| 両実装で読み取りに到達 | 6 GiB、警告なし | `0`, `+6`, `001`, `1024` | ``, `-1`, `1025`, `0anything`, `6 ` |
+
+空文字は「設定あり」だけでは有効にならず、変換に失敗して既定値になります。無効値の警告は `strata: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6`。読み取り箇所で `static` に保存されるため、最初の評価後にプロセス環境を変更しても反映されない。CUDA/HIP 系は Linux 上で統合デバイスと判定され、`/proc/meminfo` を開けたときに初めて評価する。SYCL 系は Linux 上で統合デバイスのメモリ見積もりが呼ばれ、`/proc/meminfo` を読めたときに評価する（同上）。
+
+## 有効になる条件
+
+- Linux であること。通常の CUDA/HIP 系実装は `__linux__` 条件内にあり、`STRATA_HIP_GFX906` では統合判定部分を除外する（`engine/src/core/expert_cache.cpp:115-152`）。
+- CUDA/HIP 系では現在選択中のデバイスが `cudaDevAttrIntegrated` により統合 GPU と判定されること。そこでは `/proc/meminfo` の `MemAvailable` から headroom を差し引き、結果が `cudaMemGetInfo` の空き値より大きい場合だけその値を採用する（`engine/src/core/expert_cache.cpp:115-150`）。この経路は `STRATA_UMA` による上書きを参照しない。
+- SYCL 系では `device_unified_memory()` が統合 GPU と判定すること。`STRATA_UMA=1` はこの判定を強制でき、`STRATA_UMA=0` はカード扱いにする。未設定または空の `STRATA_UMA` はデバイス判定に委ねる（`engine/sycl/src/core/expert_cache.cpp:67-85`; `engine/sycl/include/strata/core/uma.hpp:28-29`）。
+- 統合 GPU の値見積もりには `/proc/meminfo` の `MemAvailable` が必要。SYCL は読めない場合に `uma_free_bytes()` から 0 を返し、headroom 値の読み取り・ログも行わない（`engine/sycl/src/core/expert_cache.cpp:107-117,124-128`）。CUDA/HIP 系は読めない場合に `MemAvailable` に基づく差し替えをせず、先に得た `cudaMemGetInfo` 値を返す（`engine/src/core/expert_cache.cpp:130-150`）。
+- `--expert-cache auto` の容量計画では空き値が slot 数の算出に使われる。明示した `--expert-cache N` も ExpertCache の割り当て前チェックが `device_free_bytes()` を比較に使うため、統合 GPU では見積もりに影響する（CUDA/HIP: `engine/src/program/generate.cpp:9077-9085,9224-9249`; SYCL: `engine/sycl/src/program/generate.cpp:4823-4853`; `engine/src/core/expert_cache.cpp:617-638`; `engine/sycl/src/core/expert_cache.cpp:653-680`）。CLI 引数が環境変数の数値を上書きする処理はない。
+- SYCL では `--expert-cache auto`、単一 GPU、`--stream-experts`、GGUF source、`STRATA_VERIFY_NO_HOST` 有効、明示的な非ゼロ `STRATA_MIRROR_MIB` なし、かつ cache が全 expert を保持できない場合、起動を refusal する。診断に headroom の値も表示される（`engine/sycl/src/program/generate.cpp:5205-5226`）。
+
+## 実行時の詳細
+
+CUDA/HIP 系は `device_free_bytes()` の呼び出しごとに現在の `MemAvailable` を読む。headroom の数値だけは最初の該当呼び出しで `static const long` にキャッシュする。空き値は通常 `cudaMemGetInfo` の値だが、統合 GPU かつ `/proc/meminfo` 読み取り成功時は `max(cudaMemGetInfo free, MemAvailable - headroom)` となる。ただし `MemAvailable <= headroom` の場合は RAM 側の値を作らない（`engine/src/core/expert_cache.cpp:99-150`）。この値を `--expert-cache auto` は reserve 等を差し引く slot 数計算に使い、profile があると profile 内の数を上限にする（`engine/src/program/generate.cpp:9077-9085,9202-9249`）。
+
+SYCL は `uma_free_bytes(total_b)` ごとに `/proc/meminfo` の `MemAvailable` と `GPUReclaim` を読み、`max(available + pooled - headroom, 0)` を計算し、デバイスの global memory を上限にする。headroom の数値は最初の `uma_free_bytes()` 到達時に static cache される（`engine/sycl/src/core/expert_cache.cpp:88-100,107-138`）。この空き量は `device_free_bytes()` および ExpertCache の容量チェックに渡る（`engine/sycl/src/core/expert_cache.cpp:144-148,653-680`）。
+
+いずれも環境変数は Strata のプロセス内で読み、子プロセスへ転送する実装はこの変数について見つからない。headroom を下げると見積もり上のモデル用余地が増え、上げると減る。これは cache 容量計画・割り当て可否の入力を変えるもので、メモリが実際に確保できることを保証しない。SYCL の `--expert-cache auto` で共有メモリにモデル全体が収まらず、上記 refusal 条件を満たす場合は終了コード 2 で refusal する（`engine/sycl/src/program/generate.cpp:5213-5226`）。
+
+## ログと測定値
+
+無効値を初めて評価したとき、両実装は次を stderr に出して既定の 6 GiB を使う（`engine/src/core/expert_cache.cpp:142-145`; `engine/sycl/src/core/expert_cache.cpp:94-98`）。
 
 ```text
 strata: STRATA_UMA_HEADROOM_GIB=<値> is not a whole number of GiB (0-1024): using 6
 ```
 
-| 入力 | 判定 |
-|---|---|
-| 未設定 | 6 GiB。警告なし |
-| `0` ～ `1024` の整数表記 | その GiB 数を採用。`0` は差し引きなし |
-| 空文字、範囲外、整数として最後まで読めない文字列 | 6 GiBへ fallback し、警告 |
+SYCL は `uma_free_bytes()` の最初の呼び出し時、メモリ見積もり成功時に次の形式で stderr に一度表示する。値は実行時の RAM / GPUReclaim 見積もりであり、性能測定値ではない（`engine/sycl/src/core/expert_cache.cpp:124-138`）。
 
-変換は `strtol` のため先頭空白と符号は受け付けます（例: ` +2`）。数値の後ろに空白や文字が残る値（例: `2 `、`2GiB`）は無効です。小数、部分変換、値の丸めや clamp はありません。
+```text
+strata: integrated GPU, one pool of memory with the system: ... GiB of RAM available..., ... GiB kept free for the system (STRATA_UMA_HEADROOM_GIB) -> ... GiB for the model
+```
 
-## 有効になる条件
-
-- Linux であること。
-- 現在の GPU が統合 GPU と判定されること（CUDA/HIP 互換側は `cudaDevAttrIntegrated`、SYCL 側は DPCT の `get_integrated()` を使用）。CUDA/HIP 互換実装では `STRATA_HIP_GFX906` ビルドを除きます。
-- `/proc/meminfo` を開けること。このファイルを開けない場合、環境変数も読みません。
-
-GPU が統合 GPU でも、`/proc/meminfo` から得た `MemAvailable - headroom` が GPU API の空き量以下なら、返す空き量は変わりません。反対に、残量が GPU API の値を超える場合にだけ、見積もりをその残量まで引き上げます。つまり headroom を大きくすると見積もりを増やすのではなく、OS に残す分を増やして見積もりを抑えます。
-
-Linux HIP の `--expert-cache auto` では、後段で `STRATA_UMA_RESERVE_GIB` に基づく host RAM の上限も適用されます。そちらの上限がこの変数による GPU 空き見積もりより小さければ、auto sizing ではその上限が使われます。SYCL の auto sizing にはこの HIP 固有の後段処理はありません。
-
-## 実行時の詳細
-
-`device_free_bytes()` は GPU API の空き量を読み、Linux で統合 GPU の場合に `/proc/meminfo` の `MemAvailable` を kB 単位で読みます。変数値を GiB から byte に直し、`MemAvailable` が headroom を上回り、差し引き後の量が GPU API の値を上回る場合に、その値で free bytes を更新します。これはカーネル側のメモリ制限を設定する処理ではなく、Strata のメモリ見積もりです。
-
-読み取り値は関数内の `static const long` に保存されます。プロセス内で最初に統合 GPU 分岐から `/proc/meminfo` を読んだ時点で一度だけ評価され、その後に環境を変更しても再読込されません。統合 GPU 分岐に入らない実行では初期化されません。
-
-CUDA/HIP 互換実装では `--expert-cache auto` がこの free bytes から予約領域などを引き、キャッシュ slot 数を計算します。Linux HIP の追加 RAM 制限を含む流れと auto のログは `src/program/generate.cpp:6870-6901,6942-6973` にあります。SYCL も `--expert-cache auto` の計算に同じ関数を使います（`sycl/src/program/generate.cpp:4611-4632`）。キャッシュを明示した場合は auto sizing されませんが、確保前の `ExpertCache::open()` が同じ free bytes と要求 byte 数を比較し、足りなければ `ExpertCache: ... Lower --expert-cache.` を返して生成側の開始を失敗させます（CUDA/HIP: `src/core/expert_cache.cpp:560-594`、SYCL: `sycl/src/core/expert_cache.cpp:610-646`）。
-
-auto sizing で slot が0になる場合、生成側は `no VRAM is left for the expert cache` を stderr に出します（CUDA/HIP: `src/program/generate.cpp:6994-7003`、SYCL: `sycl/src/program/generate.cpp:4661-4681`）。通常の auto sizing ログは `expert cache auto: ... GiB free ... -> ... slots` で、headroom を適用した後の値を表示します。
+CUDA/HIP 系には headroom の通常値を示す専用ログはない。SYCL の上記 refusal 条件では `STRATA_UMA_HEADROOM_GIB` を含む診断が stderr に出て終了コード 2 となる（`engine/sycl/src/program/generate.cpp:5213-5226`）。
 
 ## 根拠
 
-- `src/core/expert_cache.cpp:98-138`: CUDA/HIP 互換実装の GPU 統合判定、Linux 条件、`/proc/meminfo` 読み取り、値の parse、headroom 適用。
-- `sycl/src/core/expert_cache.cpp:69-145`: SYCL 実装の同等処理。
-- `src/core/expert_cache.cpp:560-594`, `sycl/src/core/expert_cache.cpp:610-646`: 実際のキャッシュ確保前に free bytes を使って要求量を検査する経路。
-- `src/program/generate.cpp:6870-6901,6942-6973`, `sycl/src/program/generate.cpp:4611-4632`: auto cache sizing とログ。Linux HIP の追加 RAM 上限は `include/strata/core/uma_cache.hpp:16-31` と `src/program/generate.cpp:6877-6901`。
-- `include/strata/core/expert_cache.hpp:75-81` と `docs/STRIX_HALO.md:101-103` は統合 GPU での空きメモリ見積もりと既定 6 GiB を説明しています。
+- `engine/src/core/expert_cache.cpp:99-152` — CUDA/HIP 系の空き値計算、Linux / 統合デバイス条件、parse と fallback。
+- `engine/sycl/src/core/expert_cache.cpp:67-100,107-148` — SYCL の統合判定、parse、RAM 見積もりとログ。
+- `engine/sycl/include/strata/core/uma.hpp:28-43` — `STRATA_UMA` 判定と共有メモリ余地の clamp。
+- `engine/src/core/expert_cache.cpp:617-638`、`engine/sycl/src/core/expert_cache.cpp:653-680` — ExpertCache 割り当て前の容量確認。
+- `engine/src/program/generate.cpp:9077-9085,9224-9249`、`engine/sycl/src/program/generate.cpp:4823-4853` — 自動 expert cache の free-memory 取得と slot 数計画。
+- `engine/sycl/src/program/generate.cpp:5205-5226` — 統合 GPU でのモデル容量不足 refusal と観測可能な終了経路。

@@ -1,54 +1,51 @@
 # `STRATA_BATCH_DF2`
 
-調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`strata generate --serve` の `--batch` スロットでも、各スロットに DFlash2 drafter を割り当てるかを制御します。明示的な `--draft dflash2` と `--batch N`（`N >= 2`）を指定した場合、既定では適用条件を満たす構成でスロットの DFlash2 draft が有効になります。この変数はその既定選択を止めるか、通常は適用されない構成でも要求するためのスイッチです。単独の `--draft dflash2` や `--draft auto` の選択を変える変数ではありません。判定と `--batch-mtp` の共通ゲートは `src/program/generate.cpp:6766-6809` にあります。
+`--serve` で DFlash2 を使う batch slot に、slot ごとの DFlash2 drafter を割り当てるかを制御する。通常の既定は、明示的に `--draft dflash2` と `--batch N`（`N >= 2`）を指定し、他の条件も満たす場合に slot drafts を有効にすること。`STRATA_BATCH_DF2=0` は無効化し、空でない別の値は通常の既定条件を一部強制する。これは DFlash2 自体を選択・ロードする設定ではなく、DFlash2 が起動した後に各 slot 用 drafter を追加する設定である（`engine/src/program/generate.cpp:7822-7842,8328-8348`）。
+
+各 slot は DFlash2 の pack 等を共有し、専用の K/V ring と buffers を持つ。slot の batch window で余分な行が使える場合にだけ drafter が提案を作り、余分な行がない場合は drafter の計算をせず tap を保留して後で追いつく。この変数が制御するのは slot ごとの draft 処理であり、`--batch` の slot 数そのものではない（`engine/src/program/generate.cpp:8151-8159,17148-17171,17343-17374`）。
+
+Terminal の `slot_drafts_run` と `slot_drafts_by_default` もこの変数を読み、drafting の判定・表示や Auto の drafter 選択に使う（`terminal/strata_control/drafting.py:964-970,1146-1164,1732-1743`）。これら Python 関数は文字列全体がちょうど `"0"` かを判定する一方、エンジンは先頭文字を見るため、`0anything` のような値では Python の表示・選択判定とエンジンの実判定が一致しない。
 
 ## 値と判定
 
-文字列を数値や真偽値として parse せず、先頭文字だけを見ます。
+エンジンは起動時の server 初期化中に `std::getenv` で一度読み、文字列全体を parse せず先頭文字で分類する。`e[0] == '0'` なら off、値が空でなく先頭が `0` 以外なら forced、未設定または空文字なら通常の既定条件に従う（`engine/src/program/generate.cpp:7828-7840`）。
 
-| 値 | `batch_df2_wanted` の判定 |
-|---|---|
-| 未設定 | 通常の適用条件による自動判定 |
-| 空文字 | 未設定と同じ自動判定 |
-| 先頭が `0`（例: `0`, `0anything`） | OFF |
-| 非空で先頭が `0` 以外（例: `1`, `true`, `false`, `2`, `anything`） | 強制要求 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| エンジンの DFlash2 slot 判定 | 通常の既定条件を使う | `1`, `true`, `false`, ` 1`, `2abc` は非空かつ先頭が `0` 以外なので条件を強制 | `0`, `0anything`, `00` は先頭が `0` なので off。空文字は unset と同じ通常の既定条件 |
+| Terminal Python 判定 | 通常の既定条件を使う | `1`, `true`, `false`, `0anything` は `"0"` と完全一致しないため抑止しない | `0` だけが slot drafts を抑止 |
 
-空白も含め、数値妥当性・文字列全体・大文字小文字は検査されません。したがって `false` も強制要求です。Metal ビルドでは値にかかわらず判定結果を `false` にします。根拠: `src/program/generate.cpp:6772-6783`。
+大文字小文字、空白、数値としての妥当性は検査されない。エンジンで `0anything` は off だが Terminal 側では off と扱われず、Terminal の `Drafting:` 表示や Auto の選択と起動したエンジンの実動作が食い違う可能性がある（`terminal/strata_control/drafting.py:964-970,1155-1164`）。
 
 ## 有効になる条件
 
-有効値の判定だけでは slot drafter は起動しません。次の基本条件を満たす必要があります。
-
-- `--draft dflash2` が明示され、`--draft auto` ではない。
-- `--batch` が 2 以上で、`--serve` を使う。
-- 同一 GPU に重なる layer split（`split_same`）ではない。
-- `--spec` が 2 以上である。
-- DFlash2 を使えるビルドとモデル・pack があり、solo DFlash2 drafter が起動すること。
-
-このうち `--batch`、`--serve`、`--spec`、layer split の制約は batch MTP 共通ゲートで検査され、満たさない場合は警告を出して batch draft を無効にします。layer split では helper GPU expert cache がある構成も共通ゲートで除外されます。根拠: `src/program/generate.cpp:6785-6809`。
-
-値が未設定または空文字のとき、単一 GPU では上記の基本条件を満たせば既定で有効です。layer split では、スロットが一つの group で実行される場合だけ既定で有効になります。非空の値（先頭 `0` 以外）で強制要求すると、この group 数による自動判定を通過しますが、共通ゲートが別途適用されます。pipelined group のスロットは DFlash2 draft を持たない設計であり、group 構成により共通ゲートが batch drafting を無効にする場合もあります。根拠: `src/program/generate.cpp:6779-6783,6793-6809`。
-
-DFlash2 drafter 自体は `--pipeline-windows` と併用できず、DFlash2 が起動しなければ batch DFlash2 も使えません。Metal は per-slot drafter の clone に対応しないため常に無効です。CMake では DFlash2 実装を CUDA/HIP ビルドで有効にし、Metal/SYCL ビルドでは含めないとしています。根拠: `src/program/generate.cpp:6987-6995,7102-7108,7157-7179`、`CMakeLists.txt:434-441`。
+- 実行経路が server の batch slot 処理であること。エンジン条件に `o.serve` と `o.batch >= 2` が含まれる（`engine/src/program/generate.cpp:7835`）。
+- `--draft dflash2` が明示され、`--draft auto` ではなく、同じ GPU 上に分割された layer split (`split_same`) でもないこと（`engine/src/program/generate.cpp:7835`）。
+- Metal build では常に無効。さらに DFlash2 実装の `STRATA_HAVE_DFLASH2` は CUDA/HIP GPU engine に定義され、Metal と SYCL build は DFlash2 なしで compile される（`engine/src/program/generate.cpp:7832-7835,8151-8159`; `engine/cmake/strata_gpu_engine.cmake:6-13`）。
+- 通常値（unset、空文字を含む）では、layer split の batch groups が 1 以下の場合に限り有効。batch groups が複数になる既定の pipelining では既定で slot drafts を使わない（`engine/src/program/generate.cpp:7835-7839`）。
+- 非空かつ先頭が `0` 以外の値は上記 group 数の既定条件を bypass して slot drafts を要求する。ただし、後続の `--batch-mtp` gate が `--spec < 2`、`split_same`、非 server、layer split の group 構成や helper-GPU expert cache などで失敗すると `batch_mtp` は off になり、slot drafter は作られない（`engine/src/program/generate.cpp:7841-7873,8328-8348`）。
+- DFlash2 本体が `--draft-model` から正常にロードされること。DFlash2 の起動条件には fallback/MTP 状態、native pack、`--pipeline-windows` の不使用があり、失敗時は通常 MTP に fallback する（`engine/src/program/generate.cpp:8266-8275,8310-8326`）。
+- 別の `STRATA_BATCH_MTP` が有効でも、DFlash2 が選択・起動していなければこの変数は DFlash2 slot drafts を有効にしない。DFlash2 slot drafts が要求されると `batch_df2_wanted` 自体が `batch_mtp` を立てる（`engine/src/program/generate.cpp:7841-7848`）。
 
 ## 実行時の詳細
 
-環境変数は `generate.cpp` の serve/batch 初期化中、`batch_df2_wanted` を作るときに一度 `std::getenv` で読みます。static cache はありませんが、この結果は `const bool` として後続の初期化で使われるため、起動後に環境を変更しても再判定されません。通常は共通 gate を通過し、solo DFlash2 の load が成功すると、各 batch slot 用に pack を共有する drafter clone を確保し、それぞれに個別の K/V ring と buffer を持たせます。確保失敗は slot 番号と理由を stderr に出して起動を失敗させます。根拠: `src/program/generate.cpp:6772-6784,7157-7173`。
+エンジンは batch setup 時に `STRATA_BATCH_DF2` を一度読み、`batch_df2_wanted` として保持する。環境を実行中に変更してもこの起動の判定には反映されない。条件を通り、solo DFlash2 が起動していれば、`o.batch` 個の `Dflash2Drafter` を `clone_alloc` し、失敗時は stderr に slot 番号とエラーを書いて終了コード `1` で起動を中止する。成功すると各 slot が solo drafter の head/embedding を bind し、専用 landing を prepare する。bind/prepare 失敗も stderr に記録して `1` で終了する（`engine/src/program/generate.cpp:8328-8348,13623-13634`）。
 
-batch window では各 active slot にまず token の行を割り当て、余った行を DFlash2 draft に分配します。余剰行がない round は drafter を回さず、後で必要になった時点で遅延分を追いつかせます。draft 行数は `STRATA_BATCH_DF2_MAXX`、信頼度しきい値は `STRATA_BATCH_DF2_CONF`（未設定・空なら `--draft-conf` が正、さもなくば 0.35）でも制限されます。`STRATA_BATCH_DF2_DEFER=0` は余剰行がない round も毎回 draft を行う動作を選びます。これらは本変数とは別の調整値です。根拠: `src/program/generate.cpp:13990-13996,14273-14300,14475-14504`。
+solo DFlash2 が起動していなければ `strata generate: WARNING: STRATA_BATCH_DF2 is off: DFlash2 is not running` を出し、batch drafting を無効にする。slot drafting が有効な場合は `strata generate: STRATA_BATCH_DF2: ... slot drafters on CUDA...` と、各 slot の private K/V ring/buffers の量などを stderr に出し、bind 後に `strata serve: STRATA_BATCH_DF2: ... slot drafters ready ...` を出す（`engine/src/program/generate.cpp:8340-8348,13623-13634`）。
 
-`--batch-mtp` または `STRATA_BATCH_MTP` は batch draft 共通ゲートを別途要求しますが、`STRATA_BATCH_DF2=0` は DFlash2 slot drafter のみを止めます。DFlash2 が OFF でも MTP fallback があれば batch MTP が動く経路があります。逆に DFlash2 を要求したのに solo DFlash2 が起動しなければ `STRATA_BATCH_DF2 is off: DFlash2 is not running` の警告を出し、slot draft を無効にします。根拠: `src/program/generate.cpp:6785-6809,7157-7177`。
-
-実行中の主な観測結果は、初期化成功時の `STRATA_BATCH_DF2: N slot drafters on CUDA…` と serve 準備完了時の `STRATA_BATCH_DF2: N slot drafters ready ...` です。solo DFlash2 が失敗して fallback する場合や gate 条件を満たさない場合は stderr に警告が出ます。slot drafter の `clone_bind` / `prepare` が失敗すると `strata serve: STRATA_BATCH_DF2: slot N: ...` を出して serve 初期化を終了します。batch window 内の DFlash2 処理失敗は `ERR batch DFlash2 slot N: ...` を出して処理を失敗させます。根拠: `src/program/generate.cpp:6806-6809,7171-7176,11576-11588,14475-14504`。
+batch 処理では slot が余分な window row を得た場合に draft を更新する。余分な行がない slot は tap を host 側に defer し、次に draft が必要になった時点で catch-up する。catch-up に失敗した slot はその round の drafts を行わず、理由を `strata batch: DFlash2 slot ... catch-up failed (...): no drafts for it this round` と stderr に出す（`engine/src/program/generate.cpp:17148-17171,17343-17374`）。batch 集計を出す経路では defer/catch-up 行数も記録する（`engine/src/program/generate.cpp:17511-17518`）。
 
 ## 根拠
 
-- 判定値・適用条件: `src/program/generate.cpp:6772-6809`
-- DFlash2 compile 条件・ロードと per-slot clone の確保: `CMakeLists.txt:434-441`, `src/program/generate.cpp:6987-6995,7102-7108,7157-7179`
-- slot drafter の bind/prepare と serve 起動失敗: `src/program/generate.cpp:11576-11588`
-- batch window の draft 行割当・遅延処理・失敗経路: `src/program/generate.cpp:14273-14315,14475-14504`
-- 調査対象 checkout には本変数の batch DFlash2 挙動を説明する設計資料は見つかりませんでした。`docs/DETAILS.md` 等の DFlash2 一般説明や他用途の測定値は、本変数の効果の根拠として転記していません。
+- `engine/src/program/generate.cpp:7822-7842` — 環境変数の読み取り、値の判定、既定 group 条件、batch MTP との結合。
+- `engine/src/program/generate.cpp:7843-7873` — batch drafting gate と理由付き警告。
+- `engine/src/program/generate.cpp:8151-8159,8266-8275,8328-8348` — build macro 下の drafter 状態、DFlash2 起動、slot drafter 割り当て。
+- `engine/src/program/generate.cpp:13623-13634,17148-17171,17343-17374,17511-17518` — bind/prepare、slot window の draft/defer/catch-up、集計ログ。
+- `engine/cmake/strata_gpu_engine.cmake:6-13` — DFlash2 macro が CUDA/HIP GPU engine に定義される箇所。
+- `terminal/strata_control/drafting.py:964-970,1146-1164,1732-1743` — Python 側の exact-string 判定と drafting 決定への利用。
+- `terminal/serve/server.py:3690-3705` — server 起動時の drafting decision 利用。
+- `docs/BATCHING.md:498-515` — batch pipelining と MTP draft の説明。現行実装の `STRATA_BATCH_DF2` 固有の値判定や slot DFlash2 条件を記載した資料は確認できなかった。

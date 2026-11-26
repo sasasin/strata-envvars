@@ -1,74 +1,56 @@
-# `--vision`
+# `strata` / `strata-q36` `--vision`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（Qwen3.6 family 用 parser）または `strata-q36` |
+| コマンド | `strata --model`（Qwen3.6-35B-A3B 選択時）または `strata-q36` |
 | オプション | `--vision` |
 | 別名 | なし |
-| 値 | 取らない boolean flag |
+| 値 | 値を取らないフラグ |
 
 ## 役割
 
-Qwen3.6 エンジンで画像入力経路を有効にします。サーバーモードでは画像を含む `GENI` リクエストを許可し、単発生成では `--tokens` の画像 token 列と `--emb` の `strata-vision` 埋め込みファイルを組み合わせて処理します。画像のエンコードをこの flag 自身が行うわけではなく、エンコーダーの出力をエンジンへ渡します。
+Qwen3.6 エンジンで画像を含む入力を処理できるようにする。`--vision` 自体は画像をエンコードせず、画像エンコーダーが出力した `strata-vision` 埋め込みを、プロンプト内の `<|image_pad|>` token に対応づけて推論する機能を有効にする。エンジン起動時に画像位置テーブル等の領域を用意し、画像を含む要求で埋め込み行と M-RoPE 位置情報を利用する（`engine/src/qwen35/q36_engine.cu:2213-2217,3637-3657,3670-3708`）。
 
 ## 使い方
 
-サーバーとして起動する例:
-
 ```sh
-strata --model /models/qwen36.gguf --serve --vision
+# サーバーモード。画像要求は strata-vision の埋め込みファイルを使う GENI/BGENI プロトコルで送る
+strata --model Qwen3.6-35B-A3B.gguf --serve --vision
+
+# 事前に用意した token 列と strata-vision 埋め込みファイルで単発推論
+strata --model Qwen3.6-35B-A3B.gguf --vision --tokens '1,248056,2' --emb /path/to/image.sve --n 64
 ```
 
-単発で、画像用 token を含む prompt と埋め込みファイルを使う例:
-
-```sh
-strata-q36 --model /models/qwen36.gguf --tokens '248045,248056,248056,248045' --emb /tmp/image.sve --vision --n 64
-```
-
-2例目の token ID は構文例であり、画像 token の個数は埋め込みファイルの画像行数に一致させる必要があります。
+`strata` はモデルの GGUF architecture が `qwen35moe` の場合に Qwen3.6 専用 parser へ引数を渡す。`--vision` はこの専用 parser で値なしとして認識される（`engine/src/program/generate.cpp:3804-3818`, `engine/src/qwen35/q36_engine.cu:5348-5382`）。
 
 ## 値と既定値
 
-`--vision` は値を取りません。指定すると parser が `vision = true` にし、省略時は `false` です。`--vision on` のように値を続ける構文ではありません。flag 自体に数値範囲や追加の parser validation はありません。
+値を取りません。省略時は `false`、指定時は `true` です。重複指定を拒否する分岐はなく、繰り返し指定しても同じ真偽値のままです。値を消費しないため、直後に別の位置引数を置くとその引数は未対応として usage を出して終了コード 2 になります（`engine/src/qwen35/q36_engine.cu:5346-5353,5381,5405-5417`）。
 
 ## 実行時の動作
 
-`strata` は `--model` / `--native` で指定された GGUF の architecture が `qwen35moe` なら、引数全体を Qwen3.6 用 `strata::qwen35::run` に渡します。単独 executable `strata-q36` も同じ実装を呼び出します。その parser で `--vision` を受け、値を取らず boolean を有効にします（`src/program/generate.cpp:2393-2406`、`src/qwen35/q36_main.cpp:1-5`、`src/qwen35/q36_engine.cu:3735-3742,3774-3776`）。
-
-有効時、エンジン初期化に flag が渡され、コンテキスト長に応じた M-RoPE 位置テーブル、prompt chunk に応じた cell-to-image-row map、および host 側 map バッファを確保します（`src/qwen35/q36_engine.cu:1339-1346,1497-1501,3863`）。そのため画像を含まない利用でも、起動時に画像経路用メモリを追加で必要とします。具体的なバイト数や VRAM 使用量はモデル形状・コンテキスト・chunk に依存します。
-
-サーバーでは `GENI` リクエストが画像埋め込みファイルを伴います。`--vision` なしでその要求を送ると `ERR this engine was started without --vision` が返り、その要求は処理されません。flag の有無だけで encoder helper の起動、画像ファイルのダウンロード、ネットワークアクセスは発生しません（`src/qwen35/q36_engine.cu:3485-3504`）。
-
-単発生成では `--emb` の指定も必要です。ファイルの各画像 record は `SVE1` magic、行数 `n`、格子幅 `nx`、高さ `ny`、埋め込み幅 `n_embd`、続いて `n × n_embd` 個の float です。`--tokens` 内の `<|image_pad|>` に対応する ID は `248056` で、record の行は prompt 内の連続した画像 token に割り当てられます。画像位置は M-RoPE の `(t,h,w)` に設定され、画像後のテキスト位置は格子の `max(nx, ny)` 分だけ進みます（`src/qwen35/q36_engine.cu:3083-3097,3127-3156,3916-3929`）。
-
-`--serve` と `--emb` / `--tokens` は別の利用経路です。`--serve` では request ごとに `GENI` を用い、単発経路では起動引数の `--emb` ファイルを読みます。
+- `--vision` が真なら `Engine::init` が画像位置テーブルとセル対応 map を確保する。画像埋め込み本体の GPU バッファは、画像要求で `set_images` が呼ばれた際に必要量を確保・転送する（`engine/src/qwen35/q36_engine.cu:2213-2217,3641-3656`）。
+- 単発推論では `--emb FILE` も必要で、`--tokens` の ID 列中の `<|image_pad|>` token 群とファイル内の画像レコードを対応づける。`build_images` は `SVE1` ヘッダー、行数・画像グリッド、モデル埋め込み幅を確認し、画像 token の埋め込み行と M-RoPE 座標を組み立てる（`engine/src/qwen35/q36_engine.cu:4621,4638-4702,5364-5368,5601-5608`）。エンジンは対応する prompt cell の埋め込みを画像行で置き換え、画像位置テーブルを prompt の forward に使う（`engine/src/qwen35/q36_engine.cu:3637-3640,3666-3708`）。
+- `--serve` ではクライアントが `GENI`（batch 時は `BGENI`）要求に埋め込みファイルを指定する。通常の `GEN` / `BGEN` は画像入力要求ではない。Qwen3.6 engine は `--vision` を起動時に保持し、画像要求を受け付ける（`engine/src/qwen35/q36_engine.cu:4720-4723,5004-5009,5073-5090,5130-5131`）。このオプションは画像エンコーダーを起動せず、画像ファイルを直接読み込むオプションでもない。
 
 ## 適用条件と副作用
 
-- Qwen3.6 (`qwen35moe`) parser に限る設定です。同じ `--vision` でも通常 engine や他の engine family では別スコープ・別実装です（索引の [`strata-engine/root/--vision.md`](../root/--vision.md) を参照）。
-- ビルドに Qwen3.6 engine が含まれる必要があります。CMake は `strata-q36` を作り、`strata` に同じ engine library をリンクします（`CMakeLists.txt:782-792`）。
-- `--vision` の指定単体には、モデルが vision をサポートするかの事前検証はありません。画像を処理する場合は、幅がモデルの `n_embd` と一致する有効な `strata-vision` record が必要です。
-- 単発実行で `--emb` を使い `--vision` を省略すると stderr に `strata-q36: --emb needs --vision` を出して終了コード 2 になります（`src/qwen35/q36_engine.cu:3922-3926`）。
-- 埋め込みファイルが開けない、record header が不正、float データが不足、prompt の画像 token が足りない、または prompt に余分な画像 token / 末尾画像 token がある場合、入力検証エラーで単発経路は終了コード 2 になります（`src/qwen35/q36_engine.cu:3096-3118,3129-3155,3924-3926`）。サーバー経路では対応する `GENI` request に `ERR ...` を出して要求を拒否します（`src/qwen35/q36_engine.cu:3505-3516`）。
+Qwen3.6 専用 parser のスコープです。`strata` では `--model` / `--native` で指定した GGUF の architecture が `qwen35moe` のときに専用 parser に振り分けられます。別 architecture では通常のエンジン parser が使われます（`engine/src/program/generate.cpp:3804-3819`）。
+
+`--vision` だけでは画像入力は行いません。単発モードで `--emb` を指定したのに `--vision` がなければエラーになります。画像を使わない起動でも指定すれば、初期化時に画像位置情報用の device / host 領域を追加で確保します（`engine/src/qwen35/q36_engine.cu:2213-2217,5601-5605`）。
 
 ## 出力とエラー
 
-- サーバーの画像 request に対して flag が無効なら stdout に `ERR this engine was started without --vision` を出します（`src/qwen35/q36_engine.cu:3500-3504`）。
-- 単発経路で `--emb` と flag の組み合わせが不正、または埋め込みファイルの形式・prompt との対応が不正なら stderr に `strata-q36: ...` を出し、終了コード 2 です（`src/qwen35/q36_engine.cu:3922-3926`）。
-- 単発経路で画像を正しく読み込むと、stderr に画像数・埋め込み行数・画像後テキストの位置差分を出します（`src/qwen35/q36_engine.cu:3927-3929`）。
-- 画像位置テーブルなどの GPU 確保は CUDA helper `CK` を通ります。個別の割り当て失敗メッセージや終了コードはこの箇所で明示されず、今回の調査では実行確認していません（`src/qwen35/q36_engine.cu:1497-1501`）。
+- 単発モードで `--emb` を `--vision` なしに指定すると、stderr に `strata-q36: --emb needs --vision` を出し、終了コード 2 で終了する（`engine/src/qwen35/q36_engine.cu:5601-5603`）。
+- 埋め込みファイルを開けない、ヘッダーやモデル幅が不正、データが不足、画像レコード数と `<|image_pad|>` 群が合わない、または prompt が画像 token で終わる場合、単発モードは理由を stderr に出して終了コード 2 となる（`engine/src/qwen35/q36_engine.cu:4642-4664,4673-4702,5603-5605`）。
+- server が `--vision` なしで `GENI` / `BGENI` を受けた場合は stdout に `ERR this engine was started without --vision` を返して要求を拒否する。要求形式・context 長・token ID・埋め込みの不整合も stdout の `ERR` 応答で拒否する（`engine/src/qwen35/q36_engine.cu:5067-5089`）。
 
 ## 根拠
 
-- parser の既定値と `--vision` の flag 処理: `src/qwen35/q36_engine.cu:3735-3742,3774-3776`
-- `strata` から Qwen3.6 parser への振り分け、および別 executable: `src/program/generate.cpp:2393-2406`、`src/qwen35/q36_main.cpp:1-5`
-- engine 初期化と画像用 GPU / host buffer: `src/qwen35/q36_engine.cu:1339-1346,1497-1501,3863`
-- server request の gate と入力検証: `src/qwen35/q36_engine.cu:3485-3516`
-- 埋め込み file format と prompt への割り当て: `src/qwen35/q36_engine.cu:3083-3156`
-- 単発経路の `--emb` 必須条件・エラー: `src/qwen35/q36_engine.cu:3916-3929`
-- executable / library の build 定義: `CMakeLists.txt:782-792`
-
-調査時点の Strata checkout は `main...origin/main` で、`git status --short --branch` に未コミット変更はありませんでした。CLI の help は実行せず、parser と使用箇所をソースで確認しました。
+- `engine/src/program/generate.cpp:3804-3819` — `qwen35moe` architecture を Qwen3.6 parser に振り分ける箇所。
+- `engine/src/qwen35/q36_engine.cu:5346-5417` — `--vision` の値なし parser、serve 時の未知 option 処理と usage/error 経路。
+- `engine/src/qwen35/q36_engine.cu:2213-2217,3637-3708` — vision 用領域の確保、埋め込み行・M-RoPE の適用。
+- `engine/src/qwen35/q36_engine.cu:4621-4702,5004-5090,5130-5131,5601-5608` — 埋め込みファイル形式、GENI/BGENI と単発推論での適用・拒否経路。

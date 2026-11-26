@@ -1,6 +1,6 @@
-# `--profile`
+# `strata ops result --profile`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,53 +8,57 @@
 | コマンド | `strata ops result` |
 | オプション | `--profile` |
 | 別名 | なし |
-| 値 | 保存済みプロファイル名。小文字英字で始まり、小文字英字・数字・`_`・`-` を使う1〜64文字 |
+| 値 | 保存済みプロファイル名（文字列）。必須。 |
 
 ## 役割
 
-結果を取得する operation ID と組み合わせ、どの保存済みプロファイルに属する operation journal を検索するか指定します。parser で必須の値として定義され、既定値はありません（`strata_cli/cli.py:262-267`）。
+`--profile` は操作記録を探すプロファイルを選ぶ。`strata ops result` は、同じ呼び出しの位置引数 `operation_id` と組み合わせて、そのプロファイルの操作 journal から該当記録を読み、標準出力に返す。プロファイル名はパスではなく、保存済みプロファイルの ID である。
 
 ## 使い方
 
 ```sh
-strata ops result 0123456789abcdef0123456789abcdef --profile work
-```
+# local プロファイルに属する操作記録を表示
+strata ops result 0123456789abcdef0123456789abcdef --profile local
 
-`operation_id` は32桁の小文字16進数です。これは位置引数で、journal のファイル名として使われます（`strata_cli/cli.py:262-267`、`strata_control/journal.py:60-63`）。
+# 同じ記録を機械処理向け JSON envelope で表示
+strata ops result 0123456789abcdef0123456789abcdef --profile local --output json
+```
 
 ## 値と既定値
 
-- `--profile` は省略できません。値は保存済みプロファイルの ID として検証されます。形式は `^[a-z][a-z0-9_-]{0,63}$` です（`strata_cli/cli.py:266-267`、`strata_control/profiles.py:25,48-55`）。
-- 指定したプロファイルの JSON が存在しない場合は失敗します。`--profile` 自体に既定値や空値の特別な解釈はありません（`strata_control/profiles.py:150-166`）。
-- 保存プロファイルの場所は `STRATA_PROFILE_DIR` が設定されていればそのディレクトリ、未設定時は OS ごとの既定ディレクトリです。POSIX では `XDG_CONFIG_HOME` または `~/.config/strata/profiles`、Windows では `%APPDATA%/Strata/profiles`（APPDATA がなければユーザープロファイル配下）です（`strata_control/profiles.py:38-45`）。
+- `--profile` は `ops` 配下の全アクションに共通して登録され、`required=True` のため省略できない。alias や default は設定されていない（`terminal/strata_cli/cli.py:283-295`）。
+- 保存済みプロファイル名は小文字英字で始まり、小文字英字・数字・`_`・`-` を使う最大64文字の ID。大文字、パス、空文字は受理されない（`terminal/strata_control/profiles.py:48-55`）。プロファイル自体が存在しない場合も失敗する（`terminal/strata_control/profiles.py:153-173`）。
+- このコマンドで参照する操作 ID は小文字16進数32文字でなければならない（`terminal/strata_control/journal.py:25-27,60-63`）。
+- プロファイルの保存先は `STRATA_PROFILE_DIR` があればその値、なければ OS ごとの既定ディレクトリ。`--profile` の値を直接ファイルパスとしては使わない（`terminal/strata_control/profiles.py:38-55`）。
 
 ## 実行時の動作
 
-`strata ops result` は `--profile` と `operation_id` を `journal.load(profile, operation_id)` に渡し、読み込んだ record を `record` フィールドにして出力します（`strata_cli/cli.py:1409-1411`）。journal は `<profile_dir>/.ops/<profile>/.runs/<operation_id>.json` を参照します。profile の運用ディレクトリは `recipes._directory()` が保存済み profile を読み込んでから決定し、journal 側はその下の `.runs` を使います（`strata_control/recipes.py:38-42`、`strata_control/journal.py:47-63`）。別 profile に同じ operation ID の記録があっても、指定した profile の配下だけが検索対象です。
+1. parser は `ops result` に `operation_id` を位置引数として登録し、全 `ops` アクションに `--profile` を必須文字列として登録する（`terminal/strata_cli/cli.py:283-295`）。
+2. dispatch は `a.profile` と `a.operation_id` を `journal.load` に渡し、戻った record を `_success` で出力する（`terminal/strata_cli/cli.py:1479-1481`）。journal の保存先は選択したプロファイル配下の `.ops/<profile>/.runs/<operation_id>.json`（`terminal/strata_control/recipes.py:38-42`、`terminal/strata_control/journal.py:47-63`）。
+3. 記録が `running` 状態なら、結果に `completion_unverified: true` を付加する。これは呼び出し元の終了後も処理完了を確認できない状態を示す（`terminal/strata_control/journal.py:252-256`）。
+4. 既定の human 出力でも record を整形 JSON として表示する。`--output json` の場合は `schema_version` と `ok` を含む envelope に `record` を格納する（`terminal/strata_cli/cli.py:566-573`、`1479-1481`）。
 
-`--output` は同じ parser scope の別オプションです。省略時の `human` でもこの結果表示は整形 JSON（`{"record": ...}`）で、`--output json` では `schema_version: 1` と `ok: true` を含む機械向け envelope（`{"schema_version":1,"ok":true,"record":...}`）になります（`strata_cli/cli.py:266-267,535-542,1410-1411`）。
-
-operation の状態が `running` の場合、record はそのまま返され、さらに `completion_unverified: true` が付加されます。これは完了状態を確認できていない印であり、journal 実装の説明では caller の停止後に remote work が継続している可能性を示すもので、worker が現在も動いている証明ではありません（`strata_control/journal.py:1-5,247-251`）。
+この値自体は検索先の選択に使われ、操作を実行・変更しない。ただしプロファイルを読む際、アクセス拒否時に `read_bytes_repairing` がアクセス修復を試みて再読込する実装がある（`terminal/strata_control/profiles.py:153-160`、`terminal/strata_control/private_files.py:479-487`）。OS ごとの修復内容はこの調査では追跡していない。
 
 ## 適用条件と副作用
 
-- 対象の保存 profile が存在し、profile JSON が有効である必要があります。profile を読み込む際、権限状態によっては `private_files.read_bytes_repairing()` が profile ファイルを一度その場で修復します。したがって結果の照会自体は journal を書き換えませんが、profile 読み込みにはこの権限修復の副作用があり得ます（`strata_control/recipes.py:38-40`、`strata_control/profiles.py:150-166`）。
-- `--profile` が違うと別の `.runs` ディレクトリを検索します。実行時の設定や operation の再実行・変更を指示するオプションではありません（`strata_cli/cli.py:1409-1411`、`strata_control/journal.py:47-63,247-251`）。
-- journal ディレクトリがシンボリックリンクまたは通常ディレクトリでない場合、また POSIX で owner-only の権限条件を満たさない場合は拒否されます（`strata_control/journal.py:47-57`）。
+- 指定したプロファイルが必要で、journal record の `profile` も指定 ID と一致する必要がある（`terminal/strata_control/profiles.py:153-173`、`terminal/strata_control/journal.py:204-210`）。別プロファイルの記録をこの指定で読むことはできない。
+- 通常の成功経路はプロファイルと journal の読み込みおよび標準出力への表示。`--profile` によるモデル起動、ネットワーク接続、journal の書き換えはない。
+- `--profile` は他の `ops` アクションと共有された parser 定義だが、この文書の対象は `ops result` における作用である（`terminal/strata_cli/cli.py:283-295`）。
 
 ## 出力とエラー
 
-- operation ID が32桁の小文字16進数でない場合は `ProfileError` になります（`strata_control/journal.py:60-63`）。
-- 指定 ID の記録がない場合は「operation record was not found」、記録が64 KiBを超える・通常ファイルでない・JSONや schema/intent/events が不正な場合は読み込みエラーになります（`strata_control/journal.py:185-244`）。profile 未保存・不正も失敗します（`strata_control/profiles.py:48-55,150-166`）。
-- これらの `ProfileError` は `ValueError` 経路で処理され、通常出力では `strata: <message>` を stderr に出します。終了コードはエラーに設定された値を使い、未指定なら2、profile 未保存や不正な record など明示的に5とされたケースでは5です（`strata_cli/cli.py:527-532,2166-2173`、`strata_control/profiles.py:30-35,160-165`、`strata_control/journal.py:185-217`）。`--output json` の場合は `ok: false` と `error.code` / `error.message` を含む JSON error を stdout に出します（`strata_cli/cli.py:527-532,2172-2173`）。
+- 成功時は終了コード `0`。human 出力は `record` の整形 JSON、`--output json` は `{"schema_version":1,"ok":true,"record":...}` の JSON（`terminal/strata_cli/cli.py:566-573,1479-1481`）。
+- profile 不正・未保存、operation ID の形式不正、記録の欠落・破損・指定 profile との不一致は失敗する。通常は stderr に `strata: <理由>` を出し、JSON 出力では error envelope を返す。`ProfileError` は既定終了コード `2`、record 不在や不正レコードはコード `5`（`terminal/strata_control/profiles.py:30-35,153-173`、`terminal/strata_control/journal.py:60-63,190-210`、`terminal/strata_cli/cli.py:558-563,2194-2255`）。
+- `operation_id` の省略など parser 段階の引数エラーは argparse が usage とエラーを表示して終了する（位置引数の登録: `terminal/strata_cli/cli.py:290-295`）。
 
 ## 根拠
 
-- parser 定義と必須性: `strata_cli/cli.py:260-267`
-- profile の形式、探索先、読み込み: `strata_control/profiles.py:25,38-55,150-166`
-- operation journal の格納場所と ID 検証: `strata_control/recipes.py:38-42`、`strata_control/journal.py:47-63`
-- result の取得と出力: `strata_cli/cli.py:535-542,1391-1411`
-- journal の record 検証、実行中 record の補足: `strata_control/journal.py:185-251`
-- エラー表示と終了コードの伝播: `strata_cli/cli.py:527-532,2166-2173`
+- `terminal/strata_cli/cli.py:283-295` — `ops` のサブコマンド群、`operation_id`、必須 `--profile` と `--output` の parser 定義。
+- `terminal/strata_cli/cli.py:1479-1481` — `--profile` と ID による読み込み、および `record` の返却。
+- `terminal/strata_control/journal.py:47-63,190-210,252-256` — journal の配置、ID 形式、record 検証、実行中記録の扱い。
+- `terminal/strata_control/profiles.py:38-55,153-173` — profile ディレクトリ、名前規則、保存済み profile の読み込み。
+- `terminal/strata_control/private_files.py:479-487` — profile 読み込み時にアクセス拒否があった場合の修復再試行。
+- `terminal/strata_cli/cli.py:558-573,2194-2255` — 成功出力形式と `ValueError` / `OSError` の失敗出力・終了コード処理。
 
-調査は上記 commit の checkout 内の parser と実処理を対象としました。CLI の `--help` は実行せず、別 revision の help や Release 配布物は根拠に含めていません。
+調査範囲は上記 commit の Terminal CLI parser と、その `ops result` 呼び出し経路および profile/journal 読み込み処理。実行時の OS 固有アクセス修復の詳細は調査していない。

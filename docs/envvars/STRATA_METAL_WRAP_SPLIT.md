@@ -1,42 +1,48 @@
 # `STRATA_METAL_WRAP_SPLIT`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-Metal の `Context::wrap(ptr, bytes, max_span)` が、デバイスの `maxBufferLength` を超える領域を複数の重なり合う `MTLBuffer` に分割して包む動作を止めるための変数です。主な利用箇所は、Metal window engine がメモリマップしたモデル shard 全体を包む経路です。
+Metal backend がモデルの mmap 領域全体を1個の Metal buffer にできない大きさで包むとき、領域を重複する複数の buffer に分ける処理を使うか制御する。`STRATA_METAL_WRAP_SPLIT=0` の場合は分割せず、1個の buffer として包む。未設定を含むそれ以外の値では分割を許可する。分割許可は、実際に `bytes > maxBufferLength` のときだけ結果を変える（`engine/metal/src/mtl_rt.mm:321-353`）。
+
+通常の `Window::init` では、Metal の resident-model 経路で GGUF 全体を包む際にこの設定が参照される。expert streaming 経路では全モデルを包む呼び出しを通らない（`engine/metal/src/engine/window.cpp:736-744, 765-785`）。
 
 ## 値と判定
 
-`Context::wrap` の呼び出しごとに `std::getenv` で値を読み、設定値全体を `std::string` として `"0"` と比較します。数値変換や真偽値 parse はありません。
+値は数値や真偽値に parse せず、`getenv` が非 null かつ文字列全体が厳密に `"0"` かを比較する。`bytes <= maxlen` なら環境変数判定に関わらず単一 buffer の経路を使う。ここで `maxlen` は GPU の `maxBufferLength` を 16,384 byte 単位で切り下げた値（`engine/metal/src/mtl_rt.mm:321-324`）。
 
-| 値 | `bytes <= maxlen` | `bytes > maxlen` |
-|---|---|---|
-| 未設定 | 通常の単一 buffer wrap | 重なりのある複数 buffer に分割 |
-| 空文字 | 通常の単一 buffer wrap | 重なりのある複数 buffer に分割 |
-| 正確に `0` | 通常の単一 buffer wrap | 分割せず、通常の単一 buffer wrap を試す |
-| その他（例: `1`, `00`, `false`, `0 `） | 通常の単一 buffer wrap | 重なりのある複数 buffer に分割 |
+| 条件 | unset | 有効になる値（分割を許可） | 無効になる値（分割を抑止） |
+|---|---|---|---|
+| `bytes <= maxlen` | 単一 buffer | どの値でも単一 buffer | どの値でも単一 buffer |
+| `bytes > maxlen` | 重複 buffer に分割 | 空文字、`1`、`true`、`false`、`0anything`、その他 `"0"` 以外の文字列 | `0` のみ。単一 buffer として試行 |
 
-大文字小文字や空白は正規化されません。値は static cache されず、各呼び出しで確認されます。ただし、通常の Metal window 初期化では当該 wrap を一度呼ぶため、その呼び出し後に環境を変更しても既に作成した buffer には反映されません。
+大文字小文字や前後の空白は正規化せず、数値としての妥当性も検査しない。したがって `FALSE`、` 0`、`0 ` も分割を許可する。無効文字列用の警告や fallback はない（`engine/metal/src/mtl_rt.mm:323-324`）。
 
 ## 有効になる条件
 
-- Metal backend の実装が対象です。
-- `bytes <= floor(maxBufferLength / 16384) * 16384` の領域は常に単一 buffer 経路となり、この変数による差はありません。
-- 主な本番呼び出し元は `metal/src/engine/window.cpp` のモデル shard wrap です。SSD streaming が選択された場合は、この shard 全体を包む分岐ではなく `ExpertStream` を開くため、この呼び出しの変数判定には到達しません。
-- 分割時は最大 buffer 長を 16 KiB 境界に切り下げ、`max_span` を 16 KiB 単位に切り上げます。分割幅は `maxlen - span` です。`span >= maxlen / 2` のときは `mtl: wrap ...: a tensor ... does not fit the chunks` を stderr に出して終了コード 4 で終了します。
-- `STRATA_METAL_WRAP_SPLIT=0` で上限超過を単一 buffer として包もうとした際に `newBufferWithBytesNoCopy` が失敗すると、`mtl: wrap %zu failed` を stderr に出して終了コード 4 で終了します。Metal API 側の制約や失敗理由の詳細はここでは説明しません。
+- Metal backend を含む macOS 実行であること。実装は Metal device の `maxBufferLength` と `MTLBuffer` を使う Objective-C++ ランタイム内にある（`engine/metal/src/mtl_rt.mm:321-340`）。
+- `Context::wrap(p, bytes, max_span)` が呼ばれること。通常のモデル読込では `Window::init` の resident 経路で、`ExpertStream::wanted` が false の場合に限り呼ばれる。streaming が有効な経路は別の処理へ進む（`engine/metal/src/engine/stream.cpp:34-49`; `engine/metal/src/engine/window.cpp:736-744, 784`）。
+- 3引数の `wrap` に渡る `bytes` が `maxlen` より大きいこと。小さい場合は設定値を見ても分岐結果は変わらない（`engine/metal/src/mtl_rt.mm:321-324`）。
+- Gyro/PLE を含むモデルでは、`STRATA_METAL_WRAP_PLE` 等によって `Window::init` が `wrap_ranges` を選ぶと、この設定を読む3引数 `wrap` を通らない。PLE を除く範囲が `maxlen` を超えて範囲分割できない場合など、全体を包む分岐へ進んだときには対象設定が適用される（`engine/metal/src/engine/window.cpp:748-785`）。
 
 ## 実行時の詳細
 
-Metal window engine は streaming を使わない場合、モデル shard の tensor 最大サイズと、各層の routed expert の連続範囲を走査し、その最大値を `max_span` として求めます。その後 shard 全体を `Context::wrap` に渡します。shard が `maxBufferLength` を超えていて分割が許可されると、各 chunk の開始間隔を `maxlen - span` として、chunk 境界をまたぐ最大 `span` のアクセス範囲が少なくとも一つの buffer に収まるよう、重複部分を設けます。成功時は分割した総バイト数、buffer 数、上限、重複幅を stderr に記録します。
+モデルの全体 wrap 時、`maxlen` を超え、かつ値が厳密な `"0"` でなければ `max_span` を 16,384 byte 単位に切り上げ、`maxlen - span` ごとに最大 `maxlen` の範囲を作る。これらの範囲は隣同士で重なり、各 chunk に最大の tensor または同時に bind する routed-expert 範囲が収まるように呼び出し元が `span` を計算する。成功後は chunk 数、最大 buffer 長、overlap を stderr に出す（`engine/metal/src/mtl_rt.mm:325-353`; `engine/metal/src/engine/window.cpp:768-784`）。
 
-この環境変数は engine 起動時に子プロセスへ転送される設定ではなく、Metal runtime 内で直接読み取られます。CLI や設定ファイルによる上書き処理は見つかりません。
+この環境変数は `Context::wrap` の呼び出しごとにその場で `getenv` され、static cache はない。設定変更が後の呼び出しに反映されるかはプロセス環境の変更方法に依存する。通常の `Window::init` ではモデル読込時に wrap が行われるため、推論の各 token や request ごとの切替ではない（`engine/metal/src/mtl_rt.mm:321-324`; `engine/metal/src/engine/window.cpp:714-785`）。CLI 引数や設定ファイルがこの値を上書きする実装は見つからなかった。
+
+分割経路で `span >= maxlen / 2` なら `mtl_rt.mm:327` のエラーを stderr に出して終了コード 4 で停止する。chunk 作成が失敗した場合も詳細を stderr に出して終了コード 4 で停止する。分割を抑止した単一 wrap が失敗した場合は `mtl: wrap %zu failed` を出し、終了コード 4 となる。これは Metal buffer 作成の成否に対する Strata の処理であり、GPU driver 内部の挙動はここでは規定しない（`engine/metal/src/mtl_rt.mm:327-340, 383-390`）。
+
+## ログと測定値
+
+分割が成功した場合の stderr は `mtl: wrapped %.2f GB as %zu overlapping buffers (maxBufferLength %.2f GB, overlap %.2f GB)`。範囲が大きすぎる場合は `mtl: wrap %zu: a tensor of %zu bytes does not fit the chunks`、chunk 作成失敗時は `mtl: wrap chunk %zu+%zu failed` を出して終了コード 4 で停止する。単一 wrap が失敗すると `mtl: wrap %zu failed` を出して同じ終了コードで停止する。分割されない正常経路や環境変数の無効値に対するログはない（`engine/metal/src/mtl_rt.mm:327-353, 383-390`）。
+
+この変数による性能・正確性の測定値は、対象 commit の実装および関連する `docs/MAC.md` / `docs/DETAILS.md` に見つからなかったため記載しない。
 
 ## 根拠
 
-- `metal/src/mtl_rt.mm:193-223` — 判定、16 KiB 境界の丸め、単一 buffer / 分割経路、分割条件、ログと失敗時処理。
-- `metal/src/mtl_rt.mm:225-237` — 通常の単一 buffer wrap と失敗時のログ・終了。
-- `metal/src/engine/window.cpp:433-456` — streaming でない場合の shard 範囲計算と `Context::wrap` 呼び出し。
-- `metal/src/engine/stream.cpp:417-459` — streaming arena は上限内の複数領域を作り、2 引数版の wrap を使うこと。
-- `metal/src/mtl_rt.h:18-25,94-98` — Buffer の chunk 情報と wrap API の説明。
+- `engine/metal/src/mtl_rt.mm:321-353, 383-390` — 値判定、分割方式、ログ、失敗時の終了。
+- `engine/metal/src/engine/window.cpp:714-785` — モデル読込、resident / streaming / PLE の分岐と `max_span` の計算。
+- `engine/metal/src/engine/stream.cpp:34-49` — streaming を選ぶ条件。
+- `engine/metal/src/mtl_rt.h:18-27, 105-112` — `Buffer` の chunk 表現と `wrap` の役割。

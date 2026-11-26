@@ -1,52 +1,51 @@
 # `FNX_PREFETCH_PROBE`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Flash-Next split engine の診断用 probe を有効にします。各層の FFN 入力に次層の router を適用して expert の上位候補を推定し、次層で実際に選ばれた expert と照合して集計します。変数名に `PREFETCH` とありますが、ここで確認できる処理は予測精度や expert cache slot との重なりの計測であり、probe 自体が予測 expert を先読み・コピーする処理ではありません。
+この変数は sFNX split engine の診断用 probe を有効にする。各層の FFN 入力 `b.mixed` に対して次層の router を別途計算し、各行の上位 `TOPK` expert（現行コードでは top 10）を予測として保存する。実際に次層で選ばれた expert と予測の重なり、RAM 上の expert slot にない expert の重なりを GPU 上で数える。推論の出力 token の選択条件をこの予測で置き換える処理ではない。一方、probe 有効時は router 内で行っていた expert-cache の計画を無効にし、probe 集計後に `moe_cache` 側で計画するため、診断計算と cache 計画の順序が変わる（`engine/src/split/src/engine.cu:230-234, 951-970`、`engine/src/split/src/kernels.cu:1750-1800`）。
+
+環境変数を読むのは sFNX の split `Engine` 初期化時である。対象 engine は `strata-split` で、ビルドは既定で無効の opt-in 機能であり、CUDA または HIP で同じ split engine ソースを使う（`engine/src/split/CMakeLists.txt:1-7, 76-92, 120-140`）。
 
 ## 値と判定
 
-`env_flag()` は `env_int(name, 0) != 0` を使います。値は `parse_whole()` で符号付き base-10 の `long long` 全体として解析されます。
+`env_flag` は `env_int(name, 0) != 0` を使う。`env_int` は未設定時に 0 を返し、設定時は符号付き base-10 整数全体を `strtoll` で読み、後続文字がある値や整数範囲外を例外にする（`engine/src/split/src/env.hpp:15-21, 33-39, 51-52`）。
 
-| 設定 | 判定 |
-|---|---|
-| 未設定 | 既定値 `0` のため無効 |
-| `0`, `+0`, `-0` | 無効 |
-| 0 以外の有効な整数（例: `1`, `-1`, `+2`, `02`） | 有効 |
-| 空文字、前後の空白、数字以外を含む文字列、`long long` の範囲外 | `std::runtime_error`。値を無効扱いにして続行する fallback はない |
+| 条件 | unset | 有効になる値 | 無効になる値・エラー |
+|---|---|---|---|
+| sFNX split の `Engine` 初期化 | 0 として無効 | `1`、`-1`、`+2` など、整数として parse でき 0 でない値 | `0`、`-0`、`+0` は無効。空文字、`true`、`1x`、前後の空白を含む値、`long long` 範囲外は無効値として例外 |
 
-先頭の `+` / `-` は受け付けますが、数字の後ろに文字があれば不正です。小数・真偽値の単語は受け付けません。大文字小文字の判定はありません。`FNX_PREFETCH_PROBE=0` は無効です。
+`getenv` が返す設定有無と数値判定を分けているため、空文字は「設定ありで有効」ではなく parse error になる。`1anything` のように数値の後ろを許容せず、大文字小文字を問わず `true`/`false` を認識する処理もない。CLI 引数や別環境変数による上書き・優先順位はない（`engine/src/split/src/env.hpp:15-21, 33-39, 51-52`）。
 
 ## 有効になる条件
 
-- `fnx::Engine` が作られる実行経路で参照されます。参照箇所は Flash-Next split engine の `src/split/src/engine.cu` にあり、この環境変数を読む他の箇所は見つかりませんでした。
-- Engine の card 初期化ループ内で `c == 0` の場合だけ値を読みます。複数カードでも probe 用バッファは card 0 にのみ作られます。
-- 対象の `Engine` で `enqueue()` の FFN 層処理が走ると probe が使われます。層 `l` の入力 `b.mixed` から層 `l + 1` の router logits と上位 `TOPK` 候補を計算し、層 `l + 1` の実際の選択と照合します。最終層には次層がないため予測しません。
-- GPU backend のビルド差による値の判定分岐はこの箇所にはありません。ビルド・CLI によって split Engine 自体が使われない場合、この変数の効果もありません。
-- RAM expert cache が稼働している場合、`probe_cnt` があると `router_route()` に cache 計画先を渡さず、その後 `moe_cache()` に計画を回します。従ってこの場合は集計だけでなく、cache 計画の実行箇所も変わります。cache が稼働していない場合はこの計画差はありません。
-- CLI 引数による上書きは見つかりませんでした。
+- `STRATA_BUILD_SPLIT=ON` でビルドした sFNX split 実行ファイルであること。split は通常の既定ビルドでは無効（`engine/src/split/CMakeLists.txt:1-7`）。
+- engine の card 0 初期化で環境変数が非ゼロ整数として parse されること。カードごとの初期化ループでも `c == 0` の短絡条件内でのみ読み取り・probe buffer 確保を行うため、probe 用 buffer と集計は card 0 に限られる（`engine/src/split/src/engine.cu:156-160, 230-234`）。
+- 少なくとも 1 層 window が処理されること。集計カウンタはゼロ初期化され、層ごとの実測と予測の処理が走ると増える。層 0 には前層の予測がないため score せず、最終層には次層予測を作らない（`engine/src/split/src/engine_parts.hpp:50-68`、`engine/src/split/src/engine.cu:960-967`）。
+- `cache_live()` が true の場合、probe 有効化によって router 内の cache 計画を使わず、probe score の後 `moe_cache` で計画する。expert slot がない層では `slot_of` を渡さず、picked/guessed の全体集計のみを行う（`engine/src/split/src/engine.cu:951-970`）。
 
 ## 実行時の詳細
 
-値は `Engine` の生成時、card 0 のバッファ初期化で都度評価されます。関数内 `static` などのキャッシュはなく、同じプロセスで後から別の `Engine` を生成すればその生成時の環境値が読まれます。既に生成された Engine のバッファ有無は変わらないため、生成後に環境を変更してもその Engine には反映されません。子プロセスへの転送・上書き処理はこの変数について確認できませんでした。
+`Engine` の card buffer 作成中、card 0 で `env_flag("FNX_PREFETCH_PROBE")` を評価し、真なら `[MAXT][NEXP]` の probe logits、`[NL][MAXT][TOPK]` の予測 expert、7 個の `unsigned long long` 集計値をデバイス確保する。`dalloc` は確保領域をゼロ初期化する（`engine/src/split/src/engine.cu:156-160, 230-234`、`engine/src/split/src/engine_parts.hpp:50-68`）。
 
-有効時には card 0 に logits、予測 index、7 個のカウンタ用 device buffer を確保します。これらの buffer は `dalloc()` によりゼロ初期化されます。各 FFN 層で probe は次層 router を `b.mixed` に適用し、各行について router logits の上位 `TOPK` expert を推定します。次層では選択済み expert と推定値を重複なしで数え、RAM slot 情報があれば slot にない選択・推定も集計します。
+各 FFN window では、実 router が選んだ `topi` を score し、次層があれば同じ `b.mixed` と次層 router weight で `gemv_f32` を行い、`k_probe_guess` が各行の上位 10 index を求める。同点では小さい index を選ぶ。score は window 単位で distinct な expert 数を集計する。指標は `cnt[0..6]` に picked、guessed、両方、layer-window 数、slot 外 picked、slot 外で guessed された数、picked でなく slot 外にある guessed（コメント上の無駄な copy 候補）を記録する（`engine/src/split/src/engine.cu:960-970`、`engine/src/split/src/kernels.cu:1750-1800`）。
 
-7 カウンタは順に、layer-window ごとの実選択 expert 数、推定 expert 数、両方に含まれる数、layer-window 数、slot にない実選択数、slot にない実選択のうち推定にも含まれる数、slot にない推定のうち実選択には含まれない数です。実選択数は router の上位 `TOPK` 全件ではなく、同一 window 内の distinct expert 数です。
+設定は engine の初期化時に読み、その時に probe buffer の有無へ固定される。関数内 static cache ではない。既存 engine の実行中に環境を変更しても反映されず、新しい engine を作るときはその時点の環境値が評価される（`engine/src/split/src/engine.cu:156-160, 230-234`）。
 
-`Engine::probe_counts()` は集計値を host にコピーします。`fnx_run` は計測結果の出力時に layer-window 数が 1 以上の場合、stdout に `prefetch probe: ...` を出力します。RAM slot 関連の値がある場合は `prefetch probe, experts in RAM: ...` も出力します。probe が無効なら空の結果となり、この表示は行われません。Engine 初期化時の専用ログはありません。
+## ログと測定値
 
-不正値は whole-number parser の例外、device buffer 確保失敗は `cudaMalloc of ...` を含む `std::runtime_error` になります。有効値で probe の kernel 起動や集計コピーに失敗した場合も、通常の CUDA error check 経由で失敗します。
+`fnx_run` の `mtp` 実行では、最後に `probe_counts()` が値を取得し、layer-window 数が正なら stdout に `prefetch probe: ...` を出す。slot 外 picked の件数が正なら `prefetch probe, experts in RAM: ...` も出す（`engine/src/split/src/engine.cu:697-703`、`engine/src/split/tools/fnx_run.cpp:1136-1144`）。sFNX server の実行経路には `probe_counts()` を表示する呼び出しがなく、ここで挙げた probe 集計の stdout 出力は確認できない（`engine/src/split/tools/sfnx.cpp:1122-1139`）。
+
+整数として parse できない設定値は例外になる。`fnx_run` は stderr に `fnx_run: <理由>` を出して終了コード 1、sFNX は stderr に `sfnx: <理由>` を出し終了コード 1 で初期化失敗を終了する。parse error の理由は `FNX_PREFETCH_PROBE: '<値>' is not a whole number`（`engine/src/split/src/env.hpp:33-39`、`engine/src/split/tools/fnx_run.cpp:1364-1373`、`engine/src/split/tools/sfnx.cpp:1122-1136`）。性能・精度の測定値はソースから確認できないため記載しない。
 
 ## 根拠
 
-- 値の読取と card 0 限定のバッファ確保: `src/split/src/engine.cu:188-192`。
-- 整数全体の parse、unset 時の既定値、flag の判定、不正値の例外: `src/split/src/env.hpp:15-21,33-40,51-52`。
-- device buffer のゼロ初期化と確保失敗: `src/split/src/engine_parts.hpp:50-68`。
-- 次層 router の予測、実選択との採点、および probe 有効時の cache 計画経路: `src/split/src/engine.cu:905-925`。
-- 予測値の集計内容: `src/split/src/kernels.cu:1755-1784`。
-- host への集計値取得: `src/split/src/engine.cu:654-660`。
-- `fnx_run` の stdout 表示条件と文言: `src/split/tools/fnx_run.cpp:1136-1143`。
-- 候補一覧には `FNX_PREFETCH_PROBE` が載っています（`docs/envvars/000_envvers.md:590`）。Strata ソースでは上記の `env_flag()` 呼び出しで実際の環境値読取を確認しました。
+- 読み取りと buffer 作成: `engine/src/split/src/engine.cu:156-160, 230-234`
+- 値の parse と flag 判定: `engine/src/split/src/env.hpp:15-21, 33-39, 51-52`
+- probe 計算・cache 計画との順序: `engine/src/split/src/engine.cu:951-970`
+- top-10 の同点規則と score 集計: `engine/src/split/src/kernels.cu:1750-1800`
+- buffer のゼロ初期化: `engine/src/split/src/engine_parts.hpp:50-68`
+- 実行対象の範囲: `engine/src/split/CMakeLists.txt:1-7, 76-92, 120-140`
+- `fnx_run` の集計表示と例外経路: `engine/src/split/tools/fnx_run.cpp:1136-1144, 1364-1373`
+- sFNX の engine 初期化と例外経路: `engine/src/split/tools/sfnx.cpp:1122-1136`

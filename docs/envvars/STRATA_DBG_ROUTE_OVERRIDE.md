@@ -1,45 +1,49 @@
 # `STRATA_DBG_ROUTE_OVERRIDE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-MoE の prompt prefill で通常の router が選んだ expert ID と重みを、指定ファイル内のレコードに一致する layer・token chunk の値で置き換えます。コードコメントでは `141-research` の opt-in research hook と明記されています。decode 用の router を切り替える設定ではありません。
+CUDA/HIP 系の prefill `run_impl` にある研究用フックで、MoE router が選んだ expert ID と routing weight を、指定ファイル中に対応レコードがあれば差し替える。通常の routing の後に実行され、差し替えられた `m.ids` と `m.w` は後続の expert 処理へ渡る。コメントも「opt-in, never on by default」と位置づけている。Metal の `run()` は `metal_engine::prompt_run` に分岐して戻るため、この `run_impl` の置換処理は通らない（`engine/src/prefill/prefill.cpp:5585-5587, 5588-5594, 5641-5645, 9629-9650`）。
 
 ## 値と判定
 
-値はファイルパスとして扱われ、真偽値や数値への parse はありません。`getenv()` が非 null かどうかでフックを有効にします。
+値は文字列として解釈・数値変換されず、`std::getenv` の null 判定だけに使われる。未設定ならこの変数による route override は無効。空文字を含む設定済み値は有効扱いで、そのままファイルパスとして `fopen(path, "rb")` に渡される。したがって `1`、`0`、`true`、`false`、空白を含む文字列は真偽値ではなく、各文字列どおりのパスである。空文字や開けないパスはファイルを読めず、override レコードは空になる（`engine/src/prefill/prefill.cpp:5592-5594, 5606-5610`）。
 
-| 環境変数の状態 | 動作 |
-|---|---|
-| unset | `STRATA_DBG_FEAT` も unset なら、このフックの同期・ファイル読込・上書き処理に入らない。 |
-| 空文字 | 設定済みとしてフックに入るが、空パスを `fopen(..., "rb")` で開けず override map は空。MoE chunk ごとの同期は行われる。 |
-| 開けるパス | 起動後の最初のフック実行時にファイルを読み、レコードを map にする。 |
-| 開けないパス | map は空のまま戻り、override は起きない。明示的なエラー表示はない。 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP の `run_impl` が MoE 層を処理 | override なし | 開けるファイルパス。数値・真偽値としての書式検査なし | ファイルを開けないパスではレコードなし。空文字もこのケース |
+| layer-major prefill の適用判定 | この変数だけでは拒否しない | 空文字を含め、環境変数が存在すれば layer-major を拒否 | なし（値内容を検査しない） |
 
-ファイルはレコードを連結したバイナリとして読みます。各レコードは native 表現の `int32_t` 3 個（layer、position、T）に続けて、`T * 10` 個の `int32_t` expert ID、その後 `T * 10` 個の `float` weight です。読み込み側は expert 数を 10 と固定し、モデル geometry の `ss.k == 10` を別途要求します。レコードキーは `(layer, position)` で、重複キーは後に読んだレコードが map 内の値を置き換えます。形式の version、endianness、weight 値域、header の T に対する明示的な妥当性検査はありません。完全でない header または配列を読んだ時点で読み込みを止め、それまでに読み込めたレコードを使います。
+この変数に対応する CLI 引数や設定ファイル経由の値は見つからず、別の設定値による優先・fallback もない。ファイル形式の行数フィールドは `int32` から `size_t` に変換して領域を確保するが、負値・過大値を含む上限チェックはないため、コード上で安全な値域は定義されていない（`engine/src/prefill/prefill.cpp:5611-5615`）。
+
+ファイルは繰り返しレコードとして読み込まれる。各レコードは `int32` 3 個（layer、position、行数）に続き、`行数 * K` 個の `int32` expert ID、その後 `行数 * K` 個の `float` weight からなる。`K` はビルド対象 geometry の `n_expert_used`。読み込み時にレコードの layer・position・行数や ID・weight の妥当性を検査するコードはなく、実行時には当該チャンクの `T * K` 個と一致するかだけを確認する（`engine/src/prefill/prefill.cpp:310-312, 5605-5617, 5641-5645`）。
 
 ## 有効になる条件
 
-- `src/prefill/prefill.cpp` の GPU prompt prefill が実行され、MoE 層の router 計算まで到達する必要があります。通常の router 結果を作った後に override を探します。
-- `STRATA_DBG_FEAT` が設定されている場合も同じフックに入ります。これは別の dump 機能ですが、route override が unset なら override map は空です。逆に route override だけが設定されているとき、feature dump 用ファイルは開きません。
-- レコードの layer と position が現在の chunk に一致し、保存された ID 数が現在の `T * K`（`K=10`）と一致した場合だけ上書きします。レコードがない、または T が一致しない場合は router の出力を維持します。
-- 置き換え後の ID は後続処理で `0 <= id < n_expert` を検査し、範囲外なら `prefill: routed id out of range` で prefill を失敗させます。weight に同様の範囲検査はこのフックにはありません。
+- CUDA/HIP 系の prefill が `run_impl` を実行し、MoE 層の router 処理まで到達すること。通常の router 投影と `route(...)` は先に実行される（`engine/src/prefill/prefill.cpp:5585-5587`）。
+- 対象レコードのキーが、その呼び出しで計算された `(layer, position)` と一致し、レコードの ID 要素数が `T * K` と一致すること。一致しないレコードは置換されず、元の routing が残る（`engine/src/prefill/prefill.cpp:5611-5617, 5622-5623, 5641-5645`）。
+- layer-major prefill が有効候補になっている場合、この変数が設定されていると `lm_prepare` は「routing or row debug dump」として layer-major を辞退し、通常の `run_impl` 経路へ進ませる。layer-major 自体が選ばれていない場合、この拒否判定は影響しない（`engine/src/prefill/prefill.cpp:8205-8209, 9657-9705`）。
+- `STRATA_DBG_FEAT` が同時に設定されていれば同じフックブロックで feature dump も行われるが、route override との値の優先順位はない。override は読み込まれた対象レコードがあるときだけ router 結果に上書きされる（`engine/src/prefill/prefill.cpp:5592-5595, 5625-5645`）。
 
 ## 実行時の詳細
 
-環境変数と override map はフック内の function-local `static` として初期化されます。最初にこのブロックへ到達した時の環境・ファイル内容がプロセス内で再利用されるため、実行中に環境変数やファイルを書き換えても再読込されません。最初の到達時に両変数が unset なら後で設定しても有効になりません。
+`run_impl` の各 MoE 層で router を計算した後、関数内 static の `ovr_path` が初回に環境を読みます。変数が未設定でなければ、同じく関数内 static の map 初期化で環境を再取得してファイルを一度だけ `rb` で開き、レコードを map に保持します。以降のリクエストやチャンクではファイルを再読込せず、プロセス実行中に環境変数やファイル内容を変更してもこの path/map の初期化結果は更新されません（`engine/src/prefill/prefill.cpp:5591-5594, 5606-5621`）。
 
-position は layer ごとの `posl[64]` カウンタから得て、chunk の `T` を加算します。したがって照合値は prompt 内でその layer が処理した token の chunk 開始位置です。map を作成できた場合は stderr に `route override: %zu records` と読み込んだレコード数を出します。ファイルを開けなかった場合、このログも出ません。
+各層の position キーは絶対 token position `pos0` からではなく、関数内 static の `posl[l & 63]` を読み、その値を当該チャンクの `T` だけ進めて作られる。カウンターはプロセス内で保持され、セッションやリクエストの開始時にリセットする処理はここにはない。ファイル中のキーとチャンクの行数が合致した場合、ID 配列と weight 配列を GPU 側の `m.ids` / `m.w` へコピーする（`engine/src/prefill/prefill.cpp:5604, 5622-5624, 5641-5645`）。
 
-フックは現在の CUDA stream を同期してから host 上で router 出力を必要に応じて差し替えます。空文字や不正パスでも環境変数が設定済みなら、map が空でもこの同期経路に入ります。
+ファイルが開けない場合は空 map のまま進み、明示的なエラーや警告は出さない。開けたファイルでは読み込んだレコード数を stderr に `route override: %zu records` の形式で出す。途中で header または配列の読み取りが不完全になると読み込みループを抜け、完全に読めなかった当該レコードは map に加えない。対象キーまたは `T * K` 要素数が合わないときも、エラーにせず元の routing を使う（`engine/src/prefill/prefill.cpp:5609-5620, 5611-5617, 5641-5645`）。
+
+layer-major 候補時の辞退ログは `strata prefill: layer-major off for this prompt: a routing or row debug dump`。同じ理由のログは `said` static により繰り返し抑制される。短い prompt などで layer-major 候補がそもそも有効でない場合、この変数を理由とするログは出ない（`engine/src/prefill/prefill.cpp:8205-8209, 9657-9703`）。
+
+## ログと測定値
+
+route override ファイルを開けた場合に `stderr` へ `route override: %zu records` を出す。ファイルを開けない場合、キー不一致、チャンク行数不一致について専用ログはない。layer-major の辞退時には上記の理由ログが出る。ソースと関連する `docs/DETAILS.md` に、この変数についての性能測定値は見当たらない。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:2867-2869` — router 実行後にフックへ進む。
-- `src/prefill/prefill.cpp:2870-2903` — research hook の位置づけ、環境変数の取得、バイナリレコード読込、map 作成とログ。
-- `src/prefill/prefill.cpp:2904-2906` — layer ごとの chunk position と stream 同期。
-- `src/prefill/prefill.cpp:2923-2927` — layer・position・要素数が一致した場合の ID / weight 差し替え。
-- `src/prefill/prefill.cpp:102` — `K=10`。
-- `src/prefill/prefill.cpp:3170-3173` — 後続の routed ID 範囲検査。
-- `docs/DETAILS.md` にこの変数の説明や測定値は見つからなかった。
+- `engine/src/prefill/prefill.cpp:5585-5595` — router 実行後の研究用 hook と環境値の存在判定。
+- `engine/src/prefill/prefill.cpp:5604-5624` — static cache、ファイルレコードの読み込み、position カウンター。
+- `engine/src/prefill/prefill.cpp:5641-5645` — キー・サイズ一致時の GPU routing ID / weight 差し替え。
+- `engine/src/prefill/prefill.cpp:8205-8209, 9657-9705` — layer-major prefill の辞退条件と通常経路への続行。
+- `engine/src/prefill/prefill.cpp:310-312` — `K` のビルド geometry 上の定義。

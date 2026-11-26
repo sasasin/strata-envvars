@@ -1,64 +1,56 @@
 # `--stats`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンのトップレベル引数） |
+| コマンド | `strata`（推論エンジンの引数） |
 | オプション | `--stats` |
 | 別名 | なし |
-| 値 | 取らない真偽フラグ |
+| 値 | 値を取らないフラグ |
 
 ## 役割
 
-通常の生成・serve 実行が計測サマリーまで到達したとき、トークン時間、CPU expert pool、expert 読み込み数などの統計を標準出力に追加します。フラグ自体は `Options::stats` を有効にし、計測値の表示を切り替えます。
+通常の `strata` 生成実行が完了したとき、標準出力に token あたりの時間内訳や CPU expert pool、PLE、expert cache などの実行統計を追加します。help の説明は「per-stage breakdown」ですが、実際の出力はステージ別時間だけでなく複数の計数・条件付き統計も含みます。`--stats` 自体が生成方式や設定値を切り替える処理は確認できず、出力ブロックを有効にするフラグです。
 
 ## 使い方
 
 ```sh
-strata --pack pack/full --tokens "1,2,3" --stats
+strata generate --pack ./pack --tokens "1,2,3" --stats
 ```
 
-これはエンジンの引数形式の例です。実際に使う pack と token ID は実行環境に合わせてください。ソースの usage 表記は `strata generate --pack DIR --tokens ... [options]` です。
+`--pack` と `--tokens` は例示用の入力です。usage はこの形式を示し、`--tokens` がない場合は tokenizer がない旨を出して status 2 で終了します（`engine/src/program/generate.cpp:1210-1214, 5002-5006`）。
 
 ## 値と既定値
 
-- 値は不要で、指定すると `o.stats = true` になります。既定値は `false` です。
-- 重複指定は同じ真偽値を再設定するだけです。
-- `--stats=true` のような値付き形式は定義されていません。通常の parser では未知引数として扱われ、usage を表示して終了コード `2` になります。
-- `--tokens` など別の必須条件や他オプションの validation は独立して適用されます。`--stats` 自体に個別の値 validation はありません。
+- 値・別名はありません。`Options::stats` の初期値は `false` で、parser は引数が正確に `--stats` のとき `true` にします（`engine/src/program/generate.cpp:951, 4259`）。SYCL 版も同じ既定値・解析です（`engine/sycl/src/program/generate.cpp:617, 2205`）。
+- `--stats` を省略すると、終端の追加統計ブロックを出力しません。複数回指定した場合も bool を `true` にするだけで、追加の効果はありません。
+- 数値などを後置する構文はありません。`--stats=1` など別表記はこの分岐に一致せず、unknown argument として usage を伴って拒否されます（`engine/src/program/generate.cpp:4259, 4268-4275`）。
 
 ## 実行時の動作
 
-`--stats` が有効で最終レポートに到達すると、標準出力に次の項目を表示します。
+通常生成の最終レポートで `o.stats` が真の場合、`printf` により標準出力へ統計を追加します。wall-clock の decode ms/token、PLE・embedding・各 layer・head・readback・sampling の時間内訳、PLE I/O 報告（存在時）、CPU expert pool とその phase、読み込んだ expert blob 数などを出します。remote expert cache、expert-cache hit、elastic K/V、token graph、captured graph などの項目は、それぞれの機能が有効または計数が存在するときだけ追加されます（`engine/src/program/generate.cpp:25462-25528`）。
 
-- 実時間ベースの ms/token と、計測できている場合は PLE・embedding・layers・head・readback・sampling の内訳
-- CPU expert pool の時間と dispatch 数、pool 内の wait/drain/re-park 内訳
-- expert blob 読み込み数
-- 条件に応じて remote expert、expert cache、elastic K/V、token graph、captured graph/ring の統計
+phase 時間は生成ループ内で各区間を計測し、処理した位置数で割って表示します。位置数が正の場合に限り phase 内訳が出ます（`engine/src/program/generate.cpp:11088-11093, 13465-13489, 13539-13543, 13620-13629, 13680-13690, 25468-25475`）。したがって、最初の wall-clock decode 値は生成 token の平均である一方、各 phase の平均には prompt 処理位置も含みます。コメントでも prefill 分を含めて位置数を分母にする設計を説明しています（同 `generate.cpp:25477-25485`）。
 
-値はそのプロセス内の実行で集計されたカウンターに基づきます。表示ブロックは `o.stats` で囲まれています。`--stats` の参照はこの最終表示条件だけで、ファイル出力や別プロセス起動を行いません。出力される内容の一部は、利用中の機能が有効である場合に限られます。
+標準 CUDA/HIP 系の parser と SYCL 系 parser の双方に同じフラグと出力ブロックがあります。SYCL 版の登録は `engine/sycl/src/program/generate.cpp:617, 952, 2205`、出力は `14446-14469` にあります。索引が示す主 parser（`engine/src/program/generate.cpp`）の実装と比べ、確認した統計項目と分岐は一致しています。
 
 ## 適用条件と副作用
 
-- 通常のエンジン経路では、`--stats` は生成処理の計算設定を変更せず、サマリー行を stdout に追加します。`stdout` は main の冒頭で unbuffered に設定されています。
-- `--gpu-stages`、`--graph-only`、`--gpu-only-full` はそれぞれ統計レポートの位置より前に独自結果を出して `return 0` するため、これらの計測専用経路では `--stats` の最終サマリーは出ません。
-- Qwen3.6 の GGUF は parser より前に `src/qwen35/q36_engine.cu` の別実装へ振り分けられます。この実装では通常モードの未知オプションとして `--stats` が usage 表示・終了コード `2` になります。引数列で `--serve` より後に置かれた場合は未知オプションを警告して読み飛ばすため、統計表示は有効になりません。`--serve` より前に置かれた場合は通常モードの未知オプションとしてエラーになります。
-- `--stats` 固有のファイル書き込み、ネットワーク通信、GPU 操作はありません。エンジン本来の生成・serve の副作用はこのオプションの作用ではありません。
+- 値の validation、backend・model 条件による `--stats` 自体の拒否、設定ファイルや環境変数との優先順位はありません。フラグが使われる箇所は終了時の `if (o.stats)` 出力ブロックです（`engine/src/program/generate.cpp:25462`）。
+- この文書の確認範囲では追加のファイル書き込みや外部プロセス起動はありません。出力先は標準出力です。計測用 accumulator は生成ループで更新され、フラグによって抑止される処理ではありません（`engine/src/program/generate.cpp:11092-11093, 13465-13489, 13539-13543, 13620-13629, 13680-13690`）。
+- serve の各 request ごとにこの表を出す動作は確認できません。`o.stats` の利用箇所は通常生成の終端レポートに限られ、serve 用の request protocol の出力とは別です（同 `generate.cpp:25462-25528`）。
 
 ## 出力とエラー
 
-通常経路のレポートは `std::printf` による stdout 出力です。実行が途中でエラー終了し、レポート位置まで到達しない場合は統計サマリーも出ません。`--stats` 自体に独立したエラー経路や終了コードの変更はありません。未知引数となる別実装・値付き形式のエラーは stderr に出力され、終了コード `2` です。
+統計本体は `printf` による標準出力です。`--stats` 専用のエラー経路は見つかりませんでした。未知の引数として拒否される場合は、`unknown argument: ...` を標準エラーに出し、usage を表示して status 2 を返します（`engine/src/program/generate.cpp:4268-4275`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:418-600` — `Options` のメンバー。`stats` の既定値は `false`。
-- `src/program/generate.cpp:806-810,972-980` — usage の呼び出し構文と `--stats` の help 説明。
-- `src/program/generate.cpp:2413-2424,2778-2793` — 引数 loop、値を取らない parser 分岐、未知引数時の stderr・usage・終了コード `2`。
-- `src/program/generate.cpp:7137-7148,7285-7312,7325-7355` — `--gpu-stages`、`--graph-only`、`--gpu-only-full` の独立出力・早期終了経路。
-- `src/program/generate.cpp:16926-17027` — `o.stats` によるレポート出力、条件付き内訳、後続の終了処理。
-- `src/program/generate.cpp:2393-2407` — 対象モデルを Qwen3.6 実装へ振り分ける経路。
-- `src/qwen35/q36_engine.cu:3735-3795` — Qwen3.6 側の parser。通常モードの未知引数拒否と serve モードの未知 `--` オプション無視。
-
-調査時点の Strata checkout は `main...origin/main` で未コミット変更なしでした。ビルド済み CLI の `--help` は実行していません。
+- `engine/src/program/generate.cpp:951, 1395, 4259` — 標準 parser 系の bool 初期値、help 表示、フラグ登録。
+- `engine/src/program/generate.cpp:4268-4275` — 未知引数のエラー、usage、status 2。
+- `engine/src/program/generate.cpp:11088-11093, 13465-13489, 13539-13543, 13620-13629, 13680-13690` — phase timer の定義・更新。
+- `engine/src/program/generate.cpp:25462-25528` — 標準出力の統計と条件付き項目。
+- `engine/sycl/src/program/generate.cpp:617, 952, 2205, 14446-14469` — SYCL parser/help と対応する統計出力。
+- `engine/src/program/generate.cpp:1210-1214, 5002-5006` — usage の入力形式と `--tokens` 必須条件。

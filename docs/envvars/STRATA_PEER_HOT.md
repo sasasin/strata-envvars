@@ -1,46 +1,58 @@
 # `STRATA_PEER_HOT`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--peer-device N` で使う peer GPU の expert cache に、頻度 profile 上位の expert をどの程度優先して回すかを調整します。値 `f` は上位候補のうち peer 側へ回す割合として使われ、profile の順番を並べ替えます。expert を直接選択・転送する処理は `PeerExperts::open()` が行い、この変数自体が cache 容量や peer device を設定するわけではありません。
+`--peer-device` 用に読み込んだ expert profile の先頭順位から、指定割合の組を primary GPU の cache 順の後ろへ移し、peer GPU が primary に入りきらなかった場合に先に選べるようにする割合 `f` です。値は profile の順位変更だけを行い、`--peer-device` 自体や cache を有効化しません。CUDA と HIP の共通 GPU engine `engine/src/program/generate.cpp`、および SYCL 移植 `engine/sycl/src/program/generate.cpp` に同じ順位変更処理があります（共通処理: `engine/src/program/generate.cpp:6757-6785`、SYCL: `engine/sycl/src/program/generate.cpp:3791-3819`）。共通 engine は CUDA / HIP のどちらかが有効な構成で組み込まれます（`engine/CMakeLists.txt:20-22,712-714`、`engine/cmake/strata_gpu_engine.cmake:1-8`）。
+
+実際に peer cache を使うには `--peer-device N`、読み込み可能な `--expert-profile`、有効な expert cache が必要です。共通 GPU engine では peer cache が primary cache に未収容の組を順位順に選びます（`engine/src/program/generate.cpp:10211-10227`、`engine/src/core/peer_experts.cpp:264-282`）。したがって移動対象の順位は primary cache から後ろへ回り、peer の候補順位が上がります。`--peer-device` がない場合はこの環境変数を読みません。SYCL は peer tier を stub として実装しています。
 
 ## 値と判定
 
-profile を読み込んだ直後、`o.peer_device >= 1` のときだけ `std::getenv()` で読みます。`STRATA_PEER_HOT` が未設定なら `f = 0.45`、設定されていれば `std::atof()` の結果です。文字列全体の検証はなく、数値として読める先頭部分を使います（例: `0.3junk` は `0.3`、`junk` と空文字は `0`）。判定は厳密な `f > 0.0 && f < 1.0` なので、0 以下、1 以上、NaN は並べ替えません。
+profile が空でない場合に限り、peer device が `1` 以上なら `std::getenv` で読みます。未設定時は `0.45` です。設定時は `std::atof` で浮動小数点数へ変換し、`0.0 < f && f < 1.0` のときだけ並べ替えます。文字列全体の消費確認、errno、有限値確認はありません。`atof` が数値として読めない文字列は通常 `0` 相当となり、条件を満たさず無効です。先頭空白を含む数値や数値の後ろに文字がある値も、数値 prefix が変換対象です。大文字小文字の比較はありません。
 
-| `STRATA_PEER_HOT` | 結果 |
-|---|---|
-| 未設定 | `f = 0.45` で並べ替えを試みる |
-| `0`、空文字、数値で始まらない文字列 | `f = 0` となり並べ替えなし |
-| `0 < f < 1` として読める値 | 並べ替えを実行 |
-| `1`、負値、NaN、無限大など | 範囲条件を満たさず並べ替えなし |
+| 条件 | 未設定 | 有効になる値の例 | 並べ替えない値の例 |
+|---|---|---|---|
+| `--peer-device N`（N >= 1）、profile 非空 | `0.45` | `0.3`, `0.45`, `0.999`, `0.3tail` | 空文字、`0`, `1`, `-0.1`, `true`, `nan`, `inf` |
+| peer device 未指定、または profile 空 | 読み取りなし | 該当なし | 変数が設定されていてもこの処理では参照されない |
 
-どこまでの順位を候補にするかは別変数 `STRATA_PEER_HOT_AT` で決まります。未設定時は 8700、設定時は `std::atoll()` の結果を `size_t` に変換した後、profile の件数で上限を取ります。したがって空文字・数値で始まらない文字列・`0` は 0 件となって処理を無効にします。負値は符号なし変換で大きな値になり、profile 全件まで上限処理されます。`at` が 0 件なら、`f` が範囲内でも何も変更しません。
+有効値でも移動件数は `STRATA_PEER_HOT_AT` による先頭範囲と、profile の長さに依存します。`STRATA_PEER_HOT_AT` は未設定なら `8700`、設定時は `atoll` 後に profile 長で上限を取ります。空文字や数値 prefix を持たない文字列は `0` となり移動を止めます。負値は `size_t` に変換された後に profile 長で制限されるため、実質 profile 全体が対象です。実際の各 rank `r` の移動判定は `floor((r+1)f) > floor(rf)` に相当する整数 cast の比較です（共通 engine: `engine/src/program/generate.cpp:6763-6785`、SYCL: `engine/sycl/src/program/generate.cpp:3796-3819`）。`STRATA_PEER_HOT_AT` は同じブロックで同時に読み取られる関連変数です。
 
 ## 有効になる条件
 
-- `--peer-device` が 1 以上であること。既定の peer device は無効（負値）です。
-- `--expert-profile` から profile を読み込めること。読み込み失敗時はエラーで終了し、変数の評価には到達しません。
-- `f` が 0 より大きく 1 より小さいこと、および `at > 0` であること。
-- profile の並べ替え後、peer cache は主 GPU が保持していない順に空き VRAM（reserve を差し引いた分）へ候補を格納します。主 GPU が候補をすべて保持する場合、この変数で並べ替えた候補が peer に入るとは限りません。
-
-`--peer-device` は `--layer-split` および `--expert-cache-device1..3` と併用できず、併用時は起動時検証で終了します（`src/program/generate.cpp:2607-2614`）。peer cache の初期化には profile、主 GPU の expert cache、expert source も必要です（同: `5450-5459`）。
+- `--expert-profile` が空でなく、profile の読み込みに成功する必要があります。読み込み失敗時は `strata generate: <error>` を stderr に出して終了コード `1` で戻り、環境変数処理には到達しません（`engine/src/program/generate.cpp:6747-6751`、SYCL: `engine/sycl/src/program/generate.cpp:3780-3785`）。
+- profile 読み込み後、`--peer-device N` が `N >= 1` のときだけ変数を評価します。未設定時の `0.45` もこの条件の下だけ適用されます（`engine/src/program/generate.cpp:6762-6767`、SYCL: `engine/sycl/src/program/generate.cpp:3796-3801`）。
+- profile がある場合、`--expert-cache 0` はこの処理で `-1`（自動設定）に置き換えられます。peer 起動時点で cache が正数でない場合は上記の不足エラーになります。CLI は peer tier を有効化しますが、割合 `f` はこの環境変数（または未設定時の既定値）で決まります（`engine/src/program/generate.cpp:6753-6756,10213-10217`、SYCL: `engine/sycl/src/program/generate.cpp:3787-3790,5750-5754`）。
+- peer device 使用時は profile、expert source、正数の cache が必要です。不足時は `strata generate: --peer-device needs --expert-profile and the expert cache` を stderr に出し、終了コード `1` で戻ります（`engine/src/program/generate.cpp:10213-10217`、SYCL: `engine/sycl/src/program/generate.cpp:5750-5754`）。
+- `--peer-device` は `--layer-split` と `--expert-cache-device1..3` と併用できず、該当時は `strata generate: --peer-device cannot be combined with ...` を stderr に出して終了コード `2` で戻ります（`engine/src/program/generate.cpp:5284-5291`、SYCL: `engine/sycl/src/program/generate.cpp:2698-2705`）。
+- CUDA / HIP 共通の peer 実装は `engine/src/core/peer_experts.cpp` にあります。SYCL は環境変数を使った順位変更とログの後、peer を開く段階で `--peer-device: the second-GPU expert tier is not ported to SYCL yet` を返して失敗します（`engine/sycl/src/core/peer_experts.cpp:19-23`）。この場合、並べ替えによる実行時の peer cache 効果はありません。
 
 ## 実行時の詳細
 
-並べ替えでは profile 内の順位 `r`（0 始まり）について、`int64((r+1)*f) > int64(r*f)` となる要素を `moved` に、その他を `keep` に分けます。候補範囲は `at = min(profile.size(), STRATA_PEER_HOT_AT)` です。出力順は `keep`、範囲外の順位 `at` から `fill-1`、`moved`、残りの順位で、`fill = min(profile.size(), at + moved件数)` です。つまり `f` は厳密な cache 割合指定ではなく、この規則で順位を再配置する入力です。実際に peer が受け取る expert 数は主 GPU の cache 内容と peer の空き容量・`--peer-slots` にも左右されます。
+読み取りは `generate` の起動処理で profile をロードした直後です。両実装とも関数内 static cache ではなく、その箇所で一度 `getenv` / `atof` を実行します。並べ替えた `profile` はその後の primary cache の fill に使われ（`engine/src/program/generate.cpp:9749-9766`）、peer cache は primary が保持しない組を同じ順位順に走査して収容します（`engine/src/core/peer_experts.cpp:264-282`）。環境変数を読むのは起動時の一回なので、実行中にプロセス環境を変更してもその起動済み profile の順序には反映されません。serve もこの engine 初期化経路を通るため、リクエストごとの読み直しではありません。
 
-処理は起動時の profile 読み込み箇所で直接評価され、値を static cache したり、リクエストごとに読み直したりしません。プロセス起動後の環境変更はこの選択に反映されません。有効な並べ替えでは stderr に `strata generate: STRATA_PEER_HOT %.2f: %zu of the first %zu ranked pairs moved behind rank %zu (the peer's)` が出ます。無効値ではこのログも並べ替えもありません。
+並べ替えは、先頭 `at` 個を `keep` と `moved` に分け、元の順位 `at` 以降から `moved.size()` 個を primary の追加枠として先に取り、その後ろに `moved` を置きます。`at` は profile 長以下に clamp され、primary 側の追加位置 `fill` も profile 長以下です。よって peer に回す意図の組を primary が引き続き保持できる容量の場合もあり、最終的に peer が選ぶのは primary cache に入らなかった組だけです（`engine/src/program/generate.cpp:6767-6782`、`engine/src/core/peer_experts.cpp:272-280`）。
 
-同じ処理が `sycl/src/program/generate.cpp` にもありますが、SYCL の `PeerExperts::open()` は `--peer-device: the second-GPU expert tier is not ported to SYCL yet` を返します。そのため SYCL で peer device を指定した場合、profile 並べ替えログが出ることはあっても peer tier の初期化は失敗します（`sycl/src/core/peer_experts.cpp:19-22`）。
+## ログと測定値
+
+有効な `f` と `at > 0` なら、並べ替え直後に stderr へ次の形式で出ます（値と件数は実行時値）。
+
+```text
+strata generate: STRATA_PEER_HOT %.2f: %zu of the first %zu ranked pairs moved behind rank %zu (the peer's)
+```
+
+`f` が範囲外、`at == 0`、peer device なし、または profile が空の場合、この環境変数に関するログは出ません。CUDA / HIP で peer 初期化に成功すると続けて `peer GPU ...` の resident 数ログが出ます。peer 初期化が失敗すればそのエラーを stderr に出して終了コード `1` です（`engine/src/program/generate.cpp:6783-6785,10219-10227`）。SYCL では有効な割合なら移動ログが出た後、上記の未 port エラーを `strata generate: ...` 形式で出して終了コード `1` になります（`engine/sycl/src/program/generate.cpp:3817-3819`、`engine/sycl/src/core/peer_experts.cpp:19-23`）。
+
+この環境変数の効果を定量化する測定値は、調査対象コードと関連資料から確認できませんでした。コードコメント中の測定に関する記述は測定条件を示していないため、ここでは結果として記載しません。
 
 ## 根拠
 
-- 読み取り、既定値、範囲、並べ替え、stderr ログ: `src/program/generate.cpp:3500-3531`。同等の SYCL 実装: `sycl/src/program/generate.cpp:3372-3403`。
-- profile 読み込みの前提と失敗時の終了: `src/program/generate.cpp:3489-3495`。
-- peer cache が主 cache にない候補を順に選び、空き容量・reserve・slot 上限で止める処理: `src/core/peer_experts.cpp:135-153`。宣言上の説明: `include/strata/core/peer_experts.hpp:42-46`。
-- peer device の CLI 既定値と profile 引数: `src/program/generate.cpp:2099-2106`。併用禁止: 同 `2607-2614`。
-- `docs/SECOND_GPU.md` の Peer tier 節は、peer が profile 順のうち primary が保持しない候補を取る仕組みを説明していますが、`STRATA_PEER_HOT` の設定値や順位変更規則は記載していません。上記の具体的な値判定・動作はソースコードに基づきます。
-- 実装コメントには既定 `0.45` と「`0.3–0.6` は `0` より良かった」という測定に関する記述があります（`src/program/generate.cpp:3505`）。条件や測定結果を示す資料を確認できなかったため、性能向上の事実としては採用していません。
+- `engine/src/program/generate.cpp:6747-6789` — profile 読み込み、既定値、値の変換・範囲判定・順位変更。
+- `engine/sycl/src/program/generate.cpp:3780-3823` — SYCL 側の対応処理。
+- `engine/src/program/generate.cpp:9749-9766,10211-10227` — primary profile fill と peer 起動条件、ログ。
+- `engine/src/core/peer_experts.cpp:192-213,264-312` — CUDA / HIP 共通 peer tier の初期化と、primary 未収容組を順位順に選ぶ処理。
+- `engine/sycl/src/core/peer_experts.cpp:19-23` — SYCL peer tier が未 port のため失敗する処理。
+- `engine/src/program/generate.cpp:5284-5291`, `engine/sycl/src/program/generate.cpp:2698-2705` — peer と layer split / helper cache の併用制限。
+- `engine/CMakeLists.txt:20-22,712-714`, `engine/cmake/strata_gpu_engine.cmake:1-8` — 共通 GPU engine が CUDA / HIP build に含まれる条件。
+- `docs/INTEL.md:415-419` — SYCL peer tier が stub である旨。実際の値判定・処理は上記ソースコードを根拠とした。

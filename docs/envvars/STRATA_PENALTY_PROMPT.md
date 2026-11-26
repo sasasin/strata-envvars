@@ -1,45 +1,45 @@
 # `STRATA_PENALTY_PROMPT`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-繰り返し・頻度・存在ペナルティの履歴窓に、プロンプトを含めるかを切り替えます。既定では現在の返答側だけを数えます。値が有効なら従来の方式に戻り、プロンプトと返答を合わせた直近 `penalty_last_n` トークンを数えます。この変数自体はペナルティを有効化せず、係数や履歴長も設定しません。
-
-Strata 所有ソースで値を読む箇所は、CUDA 系の通常生成 `src/program/generate.cpp`、SYCL 生成 `sycl/src/program/generate.cpp`、Qwen 3.6-35B-A3B 用 CUDA エンジン `src/qwen35/q36_engine.cu` です。候補名のその他の出現はコメント、文書、テスト、または helper 宣言です。
+repeat / frequency / presence penalty が参照する token 履歴の開始位置を選びます。既定では現在の応答の履歴だけを対象にし、環境変数の値が有効なら prompt の履歴も含む従来の窓に戻します。prompt が含まれる場合も、実際に penalty が参照する長さは要求の `penalty_last_n` などの設定で決まります。通常の `strata` 生成経路、SYCL 生成経路、Qwen3.6 系 engine に読み取りがあります（`engine/include/strata/kernels/sampler.hpp:94-103`、`engine/src/program/generate.cpp:21448-21457,21768-21772`、`engine/sycl/src/program/generate.cpp:11585-11592,11725-11731`、`engine/src/qwen35/q36_engine.cu:5170-5174`）。
 
 ## 値と判定
 
-共通 helper は環境変数文字列の先頭文字だけを検査します。`'1'` で始まる値だけが有効で、文字列全体の parse はありません。
+各読み取り箇所は `std::getenv` の結果を `penalty_counts_prompt` に渡します。helper は環境変数が設定されており、値の先頭 byte が文字 `'1'` の場合だけ `true` を返します。文字列全体の parse や数値変換はしません（`engine/include/strata/kernels/sampler.hpp:99`、SYCL 側の同じ helper は `engine/sycl/include/strata/kernels/sampler.hpp:74`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効（既定の reply-only 窓） |
-| 空文字 | 無効 |
-| `1`, `10`, `1anything` | 有効 |
-| `0`, `true`, ` 1`, その他 `'1'` で始まらない値 | 無効 |
+| 条件 | unset | 有効になる値の例 | 無効になる値の例 |
+|---|---|---|---|
+| 通常・SYCL・Qwen3.6 系の読み取り | `false`（prompt を窓に含めない） | `1`, `10`, `1anything` | 空文字, `0`, `0anything`, `true`, ` 1`, `anything` |
 
-大文字小文字、空白、数値としての妥当性は検査されません。無効値への警告や fallback エラーはありません。根拠: `include/strata/kernels/sampler.hpp:94-104`、`sycl/include/strata/kernels/sampler.hpp:69-79`。
+空文字は設定済みでも先頭 byte が `'1'` ではないため無効です。大文字小文字や後続文字の検証はありません。CLI / request の sampling 値でこの判定が上書きされる分岐はありません。request の `penalty_last_n`、`penalty_repeat`、`penalty_freq`、`penalty_present` は penalty 自体の使用と長さを決め、環境変数は履歴に prompt を含めるかだけを決めます（`engine/src/program/generate.cpp:18824-18832,18917-18920,18951-18965`、Qwen3.6 系の protocol parse は `engine/src/qwen35/q36_engine.cu:5025-5044`）。
 
 ## 有効になる条件
 
-- プロセスに組み込まれた上記生成経路で、repeat / frequency / presence のいずれかのペナルティと正の `penalty_last_n` が使われると、変更された履歴窓が効果を持ちます。ペナルティ係数が既定の無効値である、または履歴長が 0 の場合、この変数だけを設定してもペナルティ処理は始まりません。通常生成ではリクエスト値を `req_sp` に設定し、`penalty_last_n` は 0 未満を 0 にしてから履歴長上限で制限します（`src/program/generate.cpp:17138-17150,17180-17189`、SYCL は `sycl/src/program/generate.cpp:11068-11090`）。
-- Qwen 3.6-35B-A3B 経路では、リクエストの `penalty_last_n`、`penalty_repeat`、`penalty_freq`、`penalty_present` が別途サンプリング設定です（`src/qwen35/q36_engine.cu:3453-3462`）。履歴長 0 または全係数が無効なら環境変数による履歴範囲変更は実際のペナルティを生じさせません (`include/strata/qwen35/sampling.hpp:13-17,24-35`)。
-- 通常生成の継続リクエストでは、既定の reply-only 窓は `pen_from` で元の返答開始位置まで戻されることがあります。プロンプトを数えるモードではその調整をしません（`src/program/generate.cpp:17432-17437,18932-18936`; SYCL は `sycl/src/program/generate.cpp:11228-11232,12497-12501`）。
-- 読み取り箇所に OS や backend 固有の値判定分岐はありません。各バイナリに該当生成ソースが含まれるかはビルド経路によります。
+- 対応する Strata engine の生成経路が使われる必要があります。通常 engine は `engine/src/program/generate.cpp`、SYCL engine は別実装の `engine/sycl/src/program/generate.cpp` を使います。読み取り箇所には OS 固有の分岐はありません。Qwen3.6 系では `strata` に組み込まれた Qwen35 engine、または `strata-q36` が対象です。Qwen35 の組み込みは `STRATA_HAVE_QWEN35` の compile definition がある build に限られます（`engine/cmake/strata_gpu_engine.cmake:548-551,565-583`）。
+- sampling request で penalty 履歴が使われる必要があります。通常経路では `penalty_last_n` を 0 以上にし、repeat 値が 1 以外、または frequency / presence 値が 0 以外の場合に batch slot の penalty 状態を作ります（`engine/src/program/generate.cpp:18951-18965,19459-19464`）。Qwen3.6 系も `last_n != 0` かつ少なくとも一つの penalty 値が既定値と異なる場合だけ penalty を適用します（`engine/include/strata/qwen35/sampling.hpp:24-35`）。
+- 通常・SYCL 経路では `penalty_last_n` が正数なら履歴長は `kPenaltyWindowCap` までに制限されます。Qwen3.6 系の `last_n < 0` は履歴全体を使い、正数は末尾から指定数を使います（`engine/src/program/generate.cpp:21448,18961`、`engine/sycl/src/program/generate.cpp:11585`、`engine/include/strata/qwen35/sampling.hpp:24-28`）。
+- penalty が未指定・無効で有効な penalty 値もない場合、この変数が有効値でも token 選択に作用する penalty はありません。CLI / request 設定は penalty の有無・長さを制御しますが、prompt を含めるかどうかの環境変数判定は別です。
 
 ## 実行時の詳細
 
-通常生成は最初にこの設定を必要とするリクエストに到達した時点で読み、関数内の `static const bool` に保持します。同じプロセスの後続リクエストや batch slot もこの判定を共有し、実行中に環境値を変更しても再評価しません（`src/program/generate.cpp:17180-17189`; SYCL の対応箇所: `sycl/src/program/generate.cpp:11084-11091`）。Qwen エンジンも生成処理で同じ形式の static 値として保持します（`src/qwen35/q36_engine.cu:3570-3575`）。
+通常経路と SYCL 経路では、prompt の末尾 token を最初の decode step が取り込むため、既定の窓はその token から始まり、その後の応答 token を含みます。環境変数が有効なら窓の起点を token 0 にし、prompt と応答を合わせた履歴を penalty の候補にします。通常経路では `penalty_window_from` が起点を選び、その範囲から各 decode window 用の履歴行を組み立てます（`engine/include/strata/kernels/sampler.hpp:100-104`、`engine/src/program/generate.cpp:21768-21772,22964-22973`）。SYCL も同じ helper を使い、各行の履歴を構築します（`engine/sycl/include/strata/kernels/sampler.hpp:75-79`、`engine/sycl/src/program/generate.cpp:11725-11731,12748-12759`）。
 
-通常生成では helper が返す値に応じて、履歴の開始位置を prompt 全体の先頭（旧方式）または decode 開始時の prompt 末尾（既定方式）にします。その履歴と各 verify row の token を `penalty_rows` で行ごとに組み立て、sampler に渡します（`include/strata/kernels/sampler.hpp:100-124`; `src/program/generate.cpp:17433-17437,18442-18451`; SYCL は `sycl/src/program/generate.cpp:11228-11232,12103-12114`）。履歴が変わることで、設定済みの penalty が適用される token が変わります。CUDA sampler は履歴中にある token の logit に repeat / frequency / presence の補正を行います（`src/kernels/cuda/sampler.cu:87-99,308-316`）。
+Qwen3.6 系は既定で prompt の末尾 token だけから履歴を開始し、有効値なら prompt 全体を初期履歴として保持します。その後の penalty 適用は `penalty_last_n` と penalty 値に従います（`engine/include/strata/qwen35/sampling.hpp:20-35,38-45`、`engine/src/qwen35/q36_engine.cu:5170-5174,4571-4576`）。
 
-Qwen 3.6-35B-A3B では有効時にプロンプト全体を初期履歴にし、既定時には空でないプロンプトの最終 token だけを初期履歴にします。その後、生成した token を履歴に追加して sampling します（`include/strata/qwen35/sampling.hpp:24-45`; `src/qwen35/q36_engine.cu:3570-3574,3618-3633`）。
+読み取り結果は各読み取り箇所の関数ローカル `static const bool` に保存されます。通常経路では solo decode と batch slot admission に別々の static があり、SYCL も通常 decode 用の static です。Qwen3.6 系にも別の static があります。各値はその箇所が最初に実行された時に確定し、同じプロセス内で環境を後から変更してもその箇所の判定は更新されません（`engine/src/program/generate.cpp:19459-19464,21448-21457`、`engine/sycl/src/program/generate.cpp:11585-11592`、`engine/src/qwen35/q36_engine.cu:5172-5174`）。
 
-この環境変数に由来するログ、警告、終了・失敗経路は実装されていません。値の不正形式も無効判定になるだけです。通常生成では penalty が有効なのに sampler に履歴が渡らない場合は別途 stderr に `sample_tokens: penalty_last_n ... needs a history ...` を出して終了しますが、環境値がその失敗を直接起こす分岐はありません（`src/kernels/cuda/sampler.cu:1260-1268`）。
+## ログと測定値
+
+この変数の値や判定を出力するログ、専用の警告・エラー・終了経路はありません。これは履歴範囲を切り替える処理であり、コードから生成 token の同一性は保証されません。
 
 ## 根拠
 
-- 環境値の直接読み取り: `src/program/generate.cpp:17187`, `sycl/src/program/generate.cpp:11089`, `src/qwen35/q36_engine.cu:3573`。
-- 共通の先頭文字判定と履歴開始位置: `include/strata/kernels/sampler.hpp:94-104`, `sycl/include/strata/kernels/sampler.hpp:69-79`。
-- Strata の説明との照合: `docs/DETAILS.md:560-566` は既定の reply-only 窓と `STRATA_PENALTY_PROMPT=1` による旧窓を説明しています。ここでは測定値を記載していません。
+- `engine/include/strata/kernels/sampler.hpp:94-104` — 通常 engine の helper と履歴窓起点。
+- `engine/sycl/include/strata/kernels/sampler.hpp:69-79` — SYCL engine の同じ判定。
+- `engine/src/program/generate.cpp:19459-19464,21448-21457,21768-21772,22964-22973` — batch admission、sampling request、通常 decode の窓と履歴行。
+- `engine/sycl/src/program/generate.cpp:11585-11592,11725-11731,12748-12759` — SYCL 側の読み取りと履歴行。
+- `engine/include/strata/qwen35/sampling.hpp:20-45`、`engine/src/qwen35/q36_engine.cu:4571-4576,5170-5174` — Qwen3.6 系の penalty と初期履歴。
+- `engine/cmake/strata_gpu_engine.cmake:548-551,565-583` — engine 実行ファイルと Qwen35 engine の組み込み条件。

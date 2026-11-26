@@ -1,6 +1,6 @@
-# `--stop`
+# `strata launch --stop`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,52 +8,54 @@
 | コマンド | `strata launch` |
 | オプション | `--stop` |
 | 別名 | なし |
-| 値 | 取らないフラグ（`store_true`）。 |
+| 値 | 値を取らないフラグ（`store_true`） |
 
 ## 役割
 
-`strata launch` が管理するサーバーを停止します。`--preset NAME` を同時に指定すると、その preset 名に対応する launch profile だけを対象にします。指定しない場合は `launch-` で始まる全 profile を対象にします。
+`strata launch` が管理する実行中・起動中のサーバーを停止します。`--preset NAME` を併記すると、その名前から作られる profile だけを対象にし、省略すると保存済みの `launch-` profile 全体を走査します。Cloudflare tunnel を使った launch については、対応する記録済み tunnel の停止も試みます。
 
 ## 使い方
 
 ```sh
-# strata launch が管理するサーバーを停止
+# すべての strata launch 管理サーバーを停止
 strata launch --stop
 
 # Office preset に対応するサーバーだけを停止
-strata launch --stop --preset "Office"
+strata launch --stop --preset Office
 ```
 
 ## 値と既定値
 
-`--stop` 自体は値を取りません。省略時は停止処理に入りません。`--preset` は通常の文字列引数で、停止分岐では `strata_cli.launch.settings.slug()` により小文字化・安全な文字への置換・最大48文字への切り詰めを行い、profile ID `launch-<slug>` を対象にします。名前の存在確認や preset ファイルの読み込みはこの分岐では行わないため、未登録名でも停止対象を照会し、該当する実行中状態がなければ「実行中のものはない」と表示します（`strata_cli/launch/cmd.py:141-146,661-663`、`strata_cli/launch/settings.py:310-315`）。
+`--stop` は引数を取りません。指定しない場合は停止モードになりません。`--preset` は任意で、指定値を `S.slug()` で profile ID 用の文字列に変換してから `launch-` を付けます。slug 化では小文字化し、英小文字・数字・`-`・`_` 以外をハイフンに置換し、連続ハイフンをまとめ、先頭が英字でなければ `l` を付けます（最大 48 文字）。
 
 ## 実行時の動作
 
-- `--stop` は preset 一覧・削除の分岐の後、通常の起動設定処理より前に処理されます。そのためモデルのカタログ取得やサーバー起動には進みません（`strata_cli/launch/cmd.py:643-663`）。
-- `--preset` がない場合は profile 一覧から ID が `launch-` で始まるものを集めます。指定がある場合は、その名前から作った `launch-<slug>` のみを対象にします（`strata_cli/launch/cmd.py:460-466`）。preset と profile は共有ストアに対応し、launch profile は `launch-<slug>` という名前で作られます（`strata_cli/launch/store.py:1-7`）。
-- 各対象の runtime 状態が `ready`、`starting`、`failed`、`stale` の場合、runtime の停止処理を180秒の timeout で呼びます。それ以外の状態ではサーバー停止を呼びません（`strata_cli/launch/cmd.py:467-470`）。runtime は通常、管理ホストへ停止要求を送り、ホストが失われている状態では記録されたプロセスを照合して残存プロセスの終了・状態回復を試みます（`strata_control/runtime.py:614-640,643-667`）。
-- 対象ごとに Cloudflare tunnel の停止処理も行います。記録済みプロセスの PID・token・コマンドが Strata が開始したものと一致するときだけ終了を試み、tunnel 状態ファイルを削除します（`strata_cli/launch/cmd.py:460-472`、`strata_cli/launch/access.py:437-449`）。
+parser は `--stop` を boolean として受理します。`run_launch()` は preset 一覧・削除処理の後、状態表示や通常の起動処理より先に `--stop` 分岐へ進みます。この分岐では他の起動用オプションは処理されず、`--output json` を併記しても停止処理の表示は JSON 化されません。
+
+停止対象は次の通りです。
+
+- `--preset` なし: `profiles.list_profiles()` の結果から ID が `launch-` で始まるものを集めます。
+- `--preset NAME` あり: `launch-` + slug 化した名前の profile だけを対象にします。
+
+各対象について runtime の状態を読み、`ready`、`starting`、`failed`、`stale` の場合に `runtime.stop(profile, timeout=180)` を呼びます。それ以外の状態では runtime stop を呼びません。stop の結果が成功なら `Stopped NAME.`、失敗なら `Could not stop NAME: ERROR.` を出します。どちらの場合も対象 profile に紐づく tunnel の停止処理を試みます。runtime stop の詳細なプロセス制御は `strata_control.runtime.stop()` に委譲され、管理 host が失われた場合の残存プロセス回収も同関数内で扱われます。
 
 ## 適用条件と副作用
 
-- 対象は `strata launch` の launch profile です。`--stop` は全 profile や任意の推論プロセスを停止する指定ではありません。profile ID の接頭辞による選別は `strata_cli/launch/cmd.py:460-466` にあります。
-- 既定（preset 省略）では停止可能状態の全 launch profile を順に処理します。`--preset` 指定時は一つだけです。停止できると、その profile が管理するサーバーと、存在すれば対応する tunnel が終了します。
-- runtime 状態が `stopped` など停止対象状態以外でも tunnel の後始末関数は呼ばれます。記録された tunnel 状態ファイルは削除対象です（`strata_cli/launch/cmd.py:467-472`、`strata_cli/launch/access.py:437-449`）。
-- `--output json` と併用しても、`--stop` 分岐は `_stop_all()` の通常テキスト表示を使います。JSON 出力の生成処理は `--stop` より後の `--status` 分岐にはありますが、`--stop` 側にはありません（`strata_cli/launch/cmd.py:634-641,661-670`）。
+既定では全 `launch-` profile を対象にするため、複数 preset のサーバーが動作中ならそれぞれ停止を試みます。`--preset` 指定時の名前は保存済み preset の存在確認には使われず、slug 化した profile ID を直接指定します。
+
+runtime stop が成功すれば Strata が管理するサーバーを停止します。runtime が停止対象を完了できなかった場合は失敗として数えます。tunnel cleanup は、Strata がその launch 用に記録したプロセスが今も同一プロセスと確認できる場合にのみ終了を試み、tunnel 状態ファイルの削除も試みます。tunnel cleanup の戻り値は CLI の成功・失敗カウントには反映されません。
 
 ## 出力とエラー
 
-成功した停止は標準出力に `Stopped <name>.`、停止失敗は `Could not stop <name>: <error-or-state>.` と表示します。処理対象がなく停止数も0の場合は `Nothing from \`strata launch\` is running.` を表示します（`strata_cli/launch/cmd.py:469-477`）。
-
-停止結果が失敗でも `_stop_all()` はエラーメッセージを表示した後に続行し、通常は終了コード `0` を返します。runtime の停止処理自体が例外を送出した場合は `run_launch()` 内の `ValueError` 捕捉で `--output` に応じたエラー表示とコード `2` になります（`strata_cli/launch/cmd.py:460-477,832-835`）。
+停止対象がなく、または各対象が停止対象状態でなかった場合は `Nothing from \`strata launch\` is running.` を stdout に出し、終了コード 0 です。停止に成功した対象ごとに `Stopped NAME.` を stdout に出します。失敗した対象ごとに `Could not stop NAME: ERROR.` を出し、1 件でも失敗があれば、他の対象が成功していても終了コード 1 になります。失敗があった場合は「何も実行中でない」という表示は追加しません。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:141-146` — `--stop` と `--preset` の parser 定義。
-- `strata_cli/launch/cmd.py:460-477,643-663` — 対象の選択、状態判定、runtime/tunnel 停止、通常起動に先行する分岐と表示。
-- `strata_cli/launch/settings.py:310-315` — preset 名から profile slug への変換。
-- `strata_cli/launch/store.py:1-7` — preset/profile の対応関係。
-- `strata_cli/launch/access.py:437-449` — tunnel の終了条件と状態ファイル削除。
-- `strata_control/runtime.py:444-455,614-667` — runtime 状態と停止・残存プロセス回収の処理。
-- `strata_cli/cli.py:2153-2155,2166-2173` — `strata launch` への委譲と共通エラー経路。
+- `terminal/strata_cli/launch/cmd.py:155-160` — `strata launch` の管理オプショングループと `--stop` parser 定義（値なし boolean、`--preset` との関係）。
+- `terminal/strata_cli/launch/cmd.py:753-763, 783-788` — 管理分岐の優先順、stop 分岐で `_stop_all()` を呼ぶこと。失敗時の一般処理が human mode では stderr に出す仕様に対し、stop helper は独自に stdout 表示する。
+- `terminal/strata_cli/launch/cmd.py:540-556` — 対象 profile の選択、対象状態、180 秒 timeout、メッセージ、トンネル cleanup、終了コード。
+- `terminal/strata_cli/launch/settings.py:462-468` — preset 名の slug 化。
+- `terminal/strata_control/profiles.py:187-200` — profile 一覧の取得と profile ID の扱い。
+- `terminal/strata_control/runtime.py:801-827, 830-854` — runtime stop の timeout validation、stop RPC と owner 終了待ち、owner がない場合の残存プロセス回収。
+- `terminal/strata_cli/launch/access.py:499-511` — 記録された同一 tunnel process の終了確認と状態ファイル cleanup。
+- `terminal/strata_cli/launch/cmd.py:495-498` — `_say()` が stdout に行を出力すること。

@@ -1,53 +1,50 @@
 # `STRATA_PF_WMMA2`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の grouped prefill expert GEMM で、IQ2_S の gate/up と IQ4_NL の down に、別実装の FP16 WMMA カーネルを選べるようにします。環境変数だけで単独に経路を有効化するものではありません。呼び出し側の `STRATA_PF_WMMA` による FP16 grouped-WMMA 経路が選ばれた後、型・形状・配置が合う GEMM ごとにこのカーネルを選びます。条件に合わない GEMM は既存の grouped-WMMA 実装へ進みます。
+CUDA の prompt expert 計算で使う FP16 WMMA 経路に、IQ2_S の gate/up と IQ4_NL の down projection 用の第 2 grouped GEMM kernel を選ばせる opt-in です。変数自体が prompt 経路を有効化するわけではありません。専用 kernel に切り替わるのは `gemm_iq_f16_grouped()` が呼ばれ、型・寸法・アラインメント等の条件も満たした場合です。条件を満たさなければ同関数の既存 kernel 選択へ進みます（`engine/src/kernels/cuda/iq_kernels.cu:7915-7947`）。
+
+prompt 側でこの関数を使う `wmma_l` 経路は、別の `STRATA_PF_WMMA=1` による `pf_wmma()`、MMQ の使用、fused layer でないこと等を必要とします。したがって `STRATA_PF_WMMA2=1` だけでは有効になりません（`engine/src/prefill/prefill.cpp:1970-1986,6322-6326,6851-6859,7361-7373`）。
 
 ## 値と判定
 
-`src/kernels/cuda/iq_kernels.cu:5617-5619` で `std::getenv("STRATA_PF_WMMA2")` を読み、値が設定され、先頭文字が `'1'` のときだけ有効とします。文字列全体や数値としての妥当性は調べません。
+CUDA kernel ファイル内の `w2_on()` が `std::getenv("STRATA_PF_WMMA2")` を読み、値が存在し、かつ先頭文字が `'1'` なら true とします。文字列全体の parse や数値変換はしません。空文字は設定済みでも false、`1` と `1anything` は true、`10` も先頭が `1` なので true です。`0`、`true`、` 1`（先頭が空白）、未設定は false です。大文字小文字や後続文字は判定に影響しません（`engine/src/kernels/cuda/iq_kernels.cu:7915-7918`）。
 
-| 値 | 判定 |
-| --- | --- |
-| 未設定 | 無効 |
-| 空文字 | 無効（先頭文字が `\0`） |
-| `1`, `10`, `1anything` | 有効（先頭文字が `1`） |
-| `0`, `true`, ` 1` など | 無効 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `w2_on()` が評価される CUDA 実装 | false | `1`, `1anything` | 空文字、`0`, `true`, ` 1` |
+| HIP / Metal / その他の非 CUDA 実装 | この変数を読む専用 kernel 経路なし | 該当なし | 該当なし |
 
-この判定は関数内の `static const bool` に保存されます。初回に `w2_on()` が呼ばれた後の環境変更は再評価されません。`w2_on()` は `gemm_iq_f16_grouped()` の基本引数チェックと現在 GPU の compute capability チェックを通過した後に参照されます。
+`w2_on()` の結果は関数内 `static const bool` に保存され、初回評価後はプロセス内で再読込されません。実行中に環境を書き換えても反映されません。専用 kernel のこの判定について CLI 引数による上書きはありません（`engine/src/kernels/cuda/iq_kernels.cu:7915-7918`）。
 
 ## 有効になる条件
 
-呼び出し側では、MMQ が使われ、`pf_wmma()` が有効で、fused layer ではなく、peer 経路がなく、native expert pack で、down 型が Q2_0 または IQ4_NL、さらに gate/up の行サイズを計算できる layer に限って grouped-WMMA 経路へ入ります。`pf_wmma()` は別変数 `STRATA_PF_WMMA` の先頭文字が `1` であることと、見えているすべての CUDA GPU の compute capability major が 7 以上であることを要求します。したがって `STRATA_PF_WMMA2=1` だけではこの呼び出し経路は開始されません。根拠: `src/prefill/prefill.cpp:1153-1169,4016-4022`。
-
-その後 `gemm_iq_f16_grouped()` は、現在 GPU の major が 7 以上であることを確認します。WMMA2 カーネルを選ぶには、さらに次の条件をすべて満たす必要があります (`src/kernels/cuda/iq_kernels.cu:5623-5645`)。
-
-- WMMA2 の環境判定が有効。
-- 出力行数 `n_out` が128の倍数、`ldx` と `ldy` が8の倍数。
-- X のアドレスが16バイト、Y が32バイト、W と expert stride が4バイト境界。
-- IQ2_S (`ty == 22`) なら K が512の倍数、IQ4_NL (`ty == 20`) なら K が128の倍数。
-- IQ row byte 数が4の倍数で、`n_experts * ceil(max_rows / 64) <= 65535`。
-
-このうち一つでも満たさなければ WMMA2 専用カーネルは起動せず、通常の grouped-WMMA 経路の型・K チェックとカーネル選択に続きます。HIP ではこの CUDA 実装の環境判定は使われず、非 CUDA コンパイル側の `gemm_iq_f16_grouped()` は `false` を返します (`src/kernels/cuda/iq_kernels.cu:5678-5683`)。
+- CUDA 版の `gemm_iq_f16_grouped()` が呼ばれること。同関数の kernel 定義は `!__HIPCC__` 側にあり、非 CUDA build の同名 stub は常に `false` を返します（`engine/src/kernels/cuda/iq_kernels.cu:7572-7578,7975-7981`）。
+- prompt 側では `wmma_l` 経路であること。これは `use_mmq && pf_wmma() && !fused_l`、peer 実行なら P2P・compact buffer・Hadamard fold なし、native layout、down 型が Q2_0 (42) または IQ4_NL (20)、tail なし、gate/up の IQ row bytes が有効、という条件です。`pf_wmma()` は別変数 `STRATA_PF_WMMA` の先頭文字が `'1'` で、CUDA device が 1 台以上あり、可視 CUDA device がすべて compute capability major 7 以上の場合に有効です（`engine/src/prefill/prefill.cpp:1970-1986,6322-6326`）。
+- `gemm_iq_f16_grouped()` 内で、device の取得と compute capability 判定に成功し、major が 7 以上であること。失敗時は `false` を返します（`engine/src/kernels/cuda/iq_kernels.cu:7923-7929`）。
+- 専用経路では、出力行数 `n_out` が 128 の倍数、`ldx` と `ldy` が 8 の倍数、`X` が 16 byte、`Y` が 32 byte、`W` と `expert_bytes` が 4 byte 境界に整列し、型と `K` の組合せが IQ2_S (type 22) かつ `K % 512 == 0`、または IQ4_NL (type 20) かつ `K % 128 == 0` であることが必要です。さらに `iq_row_bytes(ty,K) % 4 == 0`、`n_experts * ceil(max_rows/64) <= 65535` が必要です（`engine/src/kernels/cuda/iq_kernels.cu:7930-7942`）。
+- prompt の gate/up 呼び出しと down 呼び出しはそれぞれ実際の weight type を渡します。専用 kernel の分岐が受けるのは上記の type 22 と 20 です（`engine/src/prefill/prefill.cpp:6853-6859,7363-7372`; `engine/src/kernels/cuda/iq_kernels.cu:7938-7941`）。
 
 ## 実行時の詳細
 
-条件を満たした場合、IQ2_S または IQ4_NL 用 `gemm_iq_f16_w2_kernel` を CUDA stream 上で起動し、起動直後の `cudaGetLastError() == cudaSuccess` を成功として返します。実装は W の量子化重みをブロック内で FP16 に展開し、FP16 入力との WMMA 積を FP32 accumulator に加算します (`src/kernels/cuda/iq_kernels.cu:5418-5424,5502-5615,5635-5644`)。
+`wmma_l` 経路では、gate/up の入力を FP16 に gather して `gemm_iq_f16_grouped()` を呼び、出力に SwiGLU を適用して FP16 にし、続いて down projection を同関数で計算します（`engine/src/prefill/prefill.cpp:6851-6859,7361-7373`）。関数内で専用条件が成立すれば IQ2_S または IQ4_NL の `gemm_iq_f16_w2_kernel` を起動し、直後の `cudaGetLastError()` が成功なら `true` を返します（`engine/src/kernels/cuda/iq_kernels.cu:7800-7812,7930-7943`）。
 
-prefill 呼び出し側は gate/up と down の両方について戻り値を確認します。いずれかが失敗すると prefill を止め、`prefill: the WMMA expert tiles could not launch` をエラーとして返します (`src/prefill/prefill.cpp:4556-4569`)。WMMA2 の形状条件に合わない場合に通常経路へ進むことと、選択したカーネルの起動失敗でエラーになることは別です。
+専用条件が成立しない場合は、同関数内の既存 grouped WMMA kernel の型・K 判定へ進みます。そこも受け付けない場合は `false` です（`engine/src/kernels/cuda/iq_kernels.cu:7944-7974`）。専用 kernel の launch error では `false` を返し、内部で別 kernel を再試行しません。prompt 呼び出し元は gate/up または down のどちらかが false なら処理を失敗させます。peer path では `prefill: the peer WMMA expert tiles could not launch`、通常 path では `prefill: the WMMA expert tiles could not launch` をエラー文字列に設定して `false` を返します（`engine/src/prefill/prefill.cpp:6857-6864,7370-7374`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/NVIDIA_V100.md:93-101` は `STRATA_PF_WMMA2=1` を opt-in の二つ目の prompt-expert kernel と記載し、IQ2_S gate/up と IQ4_NL down を対象に挙げています。+2.5〜4.3% の prompt speed という数値は同資料が contributor の V100 測定として示す値で、今回のソース調査で再測定・独立検証した値ではありません。ソース上も既定 OFF であり、対象型と呼び出し条件に限って選択されます。
+`w2_on()` と `gemm_iq_f16_grouped()` の専用分岐自体には有効化ログや条件不成立の警告はありません。prompt 呼び出し元で kernel launch 等が失敗した場合は、上記のエラー文字列が設定されます（`engine/src/kernels/cuda/iq_kernels.cu:7915-7918,7930-7943`; `engine/src/prefill/prefill.cpp:6860-6864,7373-7374`）。
+
+`docs/NVIDIA_V100.md:134` は V100 で `STRATA_PF_WMMA2=1` の prompt が `+2.5-4.3%` と記載しますが、その表の行にはモデル、量子化、prompt 条件、比較対象、測定方法がありません。この調査ではソースから性能値を確認できないため、一般化できる性能値としては扱いません。
+
+`docs/SETTINGS.md:231` は適用 GPU を “NVIDIA and AMD” としていますが、現行の環境変数読み取りと `gemm_iq_f16_grouped()` 実装は CUDA 側にあります。したがってこの変数について AMD/HIP 動作を裏付ける実装は確認できません（`engine/src/kernels/cuda/iq_kernels.cu:7575-7578,7915-7918,7975-7981`）。
 
 ## 根拠
 
-- 値の読み取りとキャッシュ: `src/kernels/cuda/iq_kernels.cu:5617-5619`
-- WMMA2 用 kernel dispatch、形状条件、通常経路への継続: `src/kernels/cuda/iq_kernels.cu:5623-5675`
-- 非 CUDA 実装: `src/kernels/cuda/iq_kernels.cu:5678-5683`
-- `STRATA_PF_WMMA` と visible GPU 条件: `src/prefill/prefill.cpp:1153-1169`
-- grouped-WMMA 呼び出し条件と呼び出し元: `src/prefill/prefill.cpp:4016-4022,4556-4569`
-- 既存資料の説明と測定値: `docs/NVIDIA_V100.md:93-101`
+- 値の読み取り・static cache: `engine/src/kernels/cuda/iq_kernels.cu:7915-7918`
+- 専用 kernel、適用条件、既存経路への継続: `engine/src/kernels/cuda/iq_kernels.cu:7800-7812,7921-7974`
+- CUDA 以外の stub: `engine/src/kernels/cuda/iq_kernels.cu:7975-7981`
+- `STRATA_PF_WMMA` の判定、prompt 側の使用条件と効果: `engine/src/prefill/prefill.cpp:1970-1986,6322-6329,6851-6864,7361-7374`
+- 関連する Strata 資料: `docs/SETTINGS.md:231`, `docs/NVIDIA_V100.md:74,134`

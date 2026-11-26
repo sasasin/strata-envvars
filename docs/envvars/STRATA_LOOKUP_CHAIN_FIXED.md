@@ -1,42 +1,42 @@
 # `STRATA_LOOKUP_CHAIN_FIXED`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--lookup-chain` が見つけた追加 draft を、オンラインの `DraftPolicy` に選別させず、そのまま検証 window に追加します。通常は、その機械で測った window 時間と、MTP draft の確率・lookup chain の過去の受理率から、追加する token 数を `policy.chain()` が選びます。この変数を設定するとその選別を飛ばし、見つかった chain proposal をすべて候補に残します。これは検証前の draft window 長を変える設定であり、変数を設定しただけで lookup chain 自体を有効にはしません。
+lookup-chain が prompt lookup から追加した候補を `DraftPolicy::chain` で選別するかを切り替える。未設定なら、MTP draft の確率と lookup の match 長、窓幅ごとの推定コストから追加候補数を決める。設定されていればその選別を通さず、見つかった候補数を後続の上限処理まで保持する。候補生成を有効にするスイッチではなく、生成 token の採否を直接変えるものでもない。CUDA/HIP の生成処理と SYCL の生成処理に実装がある（`engine/src/program/generate.cpp:21751,22771-22782,25067-25080`、`engine/sycl/src/program/generate.cpp:11722,12715-12729,14077-14090`）。
 
 ## 値と判定
 
-コードは値を parse せず、`std::getenv("STRATA_LOOKUP_CHAIN_FIXED") != nullptr`（または同等の `== nullptr` 判定）だけを見ます。したがって値が未設定なら通常の適応選別を行い、値が設定されていれば空文字を含む任意の文字列で選別を無効にします。`0`、`false` も設定済みなので有効化側です。数値範囲、大文字小文字、文字列全体の検証はありません。
+数値や文字列の内容は parse せず、`std::getenv(...) != nullptr` で設定有無だけを見る。従って空文字 `""` も設定扱いとなり、`0`、`1`、`true`、`false`、空白を含む文字列など、環境変数が存在すればすべて同じ分岐になる。境界値や無効値の概念はなく、大小文字も比較しない。未設定時が通常のコスト選別あり、設定時は選別を飛ばす（同 `generate.cpp:21751,22778-22782,25073-25076`、SYCL 同 `generate.cpp:11722,12722-12726,14083-14086`）。
 
-| 状態 | chain proposal がある場合の処理 |
-|---|---|
-| 未設定 | `policy.chain(T, p_mtp, chain_n, cm)` で追加数を選ぶ |
-| 設定あり（空文字を含む） | `policy.chain()` を呼ばず、`propose_from_sources()` の戻り値 `chain_n` を維持する |
+| 実装経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP server と SYCL server | policy による候補数選別あり | 空文字を含む、存在するすべての値 | なし。値の内容は検査しない |
+| CUDA/HIP と SYCL の通常生成ループ | policy による候補数選別あり | 空文字を含む、存在するすべての値 | なし。値の内容は検査しない |
 
 ## 有効になる条件
 
-- `--lookup-chain K` が正の値で指定されていること。CLI parser は `atoi` の結果を `0..7` に clamp し、既定値は `0` です。`--lookup-chain` が無効なら、この環境変数に効果はありません。
-- lookup-chain を追加できるだけの window の余地があり、初回 window ではなく、suffix draft が採用されていないこと。
-- サーバーの逐次 decode 経路では、lookup chain が提案 (`chain_n > 0`) されたときに限り、未設定時だけ `DraftPolicy::chain()` による選別を実行します。単発 `strata generate` の MTP 経路でも同じ条件で選別を飛ばします。
-- サーバー経路の提案元は過去の context と MTP draft をつないだ tail を使い、`--lookup-chain-min` 以上の一致から最大 K 個を探します。`--lookup-chain-min` の既定値は 3 で、parser は下限 3 に clamp します。
-
-CLI の `--lookup-chain` は MTP がない場合にも prompt lookup chain を使う経路があります。MTP がないと `T` は 1 で始まるため、その提案の後段に同じ環境変数の判定があります。最大 window は `--lookup-chain` と現在の verify 上限で制限されます。なお、この環境変数が作用するのは chain proposal の選別箇所であり、suffix-draft の `policy.choose()` には作用しません。
+- 実際に lookup-chain 候補を作る条件が満たされる必要がある。`--lookup-chain K` が 0 より大きく、初回 window でなく、suffix lookup をその window で採用しておらず、既存 window に余地がある場合に候補を検索する。server の CUDA/HIP 経路ではさらに `draft_on`、SYCL の MTP 経路では `use_mtp` が必要（`engine/src/program/generate.cpp:22771-22776,25067-25072`、`engine/sycl/src/program/generate.cpp:12715-12720,14077-14082`）。
+- `--lookup-chain` の K が候補数の上限であり、`--lookup-chain-min` が候補を継ぐための最低 match 長を決める。CLI parser は K を 0–7 に clamp し、最低 match 長を 3 以上にする（CUDA/HIP: `engine/src/program/generate.cpp:4125-4126`、SYCL: `engine/sycl/src/program/generate.cpp:2099-2100`）。環境変数はこれらの引数を上書きせず、K=0 なら環境変数が設定されていても候補生成は起きない。
+- backend / build macro ごとの値の parse 差はない。名前を読むのは CUDA/HIP 側の `engine/src/program/generate.cpp` と SYCL 側の独立した `engine/sycl/src/program/generate.cpp`。それぞれの server / 通常生成経路に判定がある。
+- policy 選別を飛ばしても、候補数は先に空き window と K で制限される。CUDA/HIP server では `--lookup-max-t` による graph fit が追加で候補を減らすことがある（`engine/src/program/generate.cpp:22783-22787`）。
 
 ## 実行時の詳細
 
-CUDA と SYCL の双方に同等の実装があります。サーバー decode では `chain_fixed` を関数内の `static const bool` として初期化するため、プロセス内でその関数が最初に通った際の環境状態を保持します。その後のリクエスト中やリクエスト間で環境を書き換えても再判定されません。単発 `strata generate` の別経路は chain proposal ごとに `getenv()` を直接呼ぶため、その箇所では毎回判定します。
+server 経路では `chain_fixed` を関数内 `static const bool` として初期化するため、プロセス内の最初の初期化時に一度だけ読み取る。初期化後に同一プロセス内で環境を変更しても反映されない。CUDA/HIP server はこの値を各対象 window で使い、候補が 1 件以上なら未設定時だけ `policy.chain(T, p_mtp, chain_n, cm)` を呼ぶ（`engine/src/program/generate.cpp:21746-21752,22771-22782`）。SYCL server も同じ構造である（`engine/sycl/src/program/generate.cpp:11717-11723,12715-12726`）。
 
-採用された `chain_n` は MTP window の後ろに連結され、検証 window のサイズ `T` に加算されます。サーバーは各要求の `strata serve: lookup chain: ...` 行に chain を使った window 数と、chain draft の受理数を表示します。単発生成は最終統計の `lookup chain` 行に window 数と受理数を表示します。設定値を読み取っただけの専用ログはありません。
+通常生成ループ側は `chain_n > 0` の分岐で `getenv` を直接呼び、各 eligible window で設定有無を調べる。未設定なら MTP draft の確率積 `p_mtp` と match 長 `cm` を policy に渡す。設定時は policy を呼ばず、lookup が返した `chain_n` をそのまま後続へ渡す（CUDA/HIP: `engine/src/program/generate.cpp:25065-25080`、SYCL: `engine/sycl/src/program/generate.cpp:14075-14090`）。`DraftPolicy::chain` は候補数、最大窓幅、match による推定受理率、測定済み窓コストと margin を使って追加数を 0 から選ぶ（`engine/src/spec/draft_policy.cpp:1002-1032`）。
+
+選ばれた lookup token は MTP 等の draft の後ろに検証 window として並べられ、通常の verifier が検証する（CUDA/HIP: `engine/src/program/generate.cpp:22797-22807`、SYCL: `engine/sycl/src/program/generate.cpp:14089-14104`）。この環境変数は候補の採否を強制せず、Verifier の受理処理を迂回しない。server の追加候補は `DONE` の lookup-chain counters に含まれ、最後に stderr に集計行が出る。環境変数固有の警告・終了経路はない（CUDA/HIP: `engine/src/program/generate.cpp:23551-23564,23926-23928`、SYCL: `engine/sycl/src/program/generate.cpp:13114-13132,13264-13266`）。
+
+## ログと測定値
+
+Server では lookup-chain が有効（`--lookup-chain > 0`）なら、stderr に `strata serve: lookup chain: %lld of %lld windows, %lld of %lld chained drafts accepted` と出る。通常生成では stdout に `lookup chain` として windows 数・受理候補数を表示する。これらは実際に採用・受理された数の集計で、環境変数の設定値や policy bypass の有無は表示しない（`engine/src/program/generate.cpp:23926-23928`、`engine/sycl/src/program/generate.cpp:14254-14256`）。本変数の設定有無を比較した測定値は記載しない。
 
 ## 根拠
 
-- `src/program/generate.cpp:660-665, 809-812, 2040-2041`: CLI option の既定値、help、`--lookup-chain` / `--lookup-chain-min` の parse と範囲。
-- `src/program/generate.cpp:2474-2478`: lookup chain 有効時の verify window 上限拡張。
-- `src/program/generate.cpp:11128, 11830-11846`: サーバー経路の静的 env 判定、proposal、policy gate と window 延長。
-- `src/program/generate.cpp:13030-13045`: 単発 generate の proposal、都度の env 判定、window 延長。
-- `sycl/src/program/generate.cpp:10386, 11122-11138, 12328-12344`: SYCL サーバー／単発経路の対応実装。
-- `include/strata/spec/draft_policy.hpp:38-44`: `chain()` が候補数を適応選択し、chain 結果を観測する API。
-- `src/program/generate.cpp:12369-12371, 13180-13185`: サーバーと単発生成の lookup-chain 集計表示。
-- `docs/DETAILS.md:275-277`: CLI の `--lookup-chain-min` の説明はあるが、この環境変数の記載はありません。
+- `engine/src/program/generate.cpp:21746-21752,22769-22787,23551-23564,23926-23928,25065-25080`
+- `engine/sycl/src/program/generate.cpp:11717-11723,12713-12729,13114-13132,13264-13266,14075-14090,14254-14256`
+- `engine/src/spec/draft_policy.cpp:1002-1032`
+- `engine/src/program/generate.cpp:4125-4126`; `engine/sycl/src/program/generate.cpp:2099-2100`

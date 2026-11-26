@@ -1,6 +1,6 @@
-# `--profile`
+# `strata runtime verify --profile`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,60 +8,65 @@
 | コマンド | `strata runtime verify` |
 | オプション | `--profile` |
 | 別名 | なし |
-| 値 | 必須。保存済みプロファイル名（1〜64文字、小文字英字で始まり、小文字英字・数字・`_`・`-` を使用） |
+| 値 | 保存済み profile 名。必須。小文字 `a-z` で始まり、その後は `a-z`、`0-9`、`_`、`-` を使用でき、全体で最大 64 文字。 |
 
 ## 役割
 
-検証対象となる、Strata が管理するローカル runtime instance のプロファイルを選びます。`runtime verify` はその instance の API と起動情報を再確認し、モデルがロード済みなら1トークン生成も行います（`strata_cli/cli.py:197-201,216-225`、`strata_control/readiness.py:1-5,84-86`）。
+検証対象となる、Strata が起動・管理しているローカル runtime を profile 名で指定する。指定した profile の revision を operation journal に記録し、その profile に結び付いた ready instance に対して検証を依頼する。run config のパスを指定するオプションではない。
 
 ## 使い方
 
 ```sh
-strata runtime verify --profile my-model
-```
+# 保存済み profile `local` の runtime を検証する
+strata runtime verify --profile local
 
-計画表示では `--plan` を付けます。計画で表示された owner/instance を実行時にも要求する場合は、両方の ID を指定します。
+# profile の runtime 状態と検証時の効果を表示する（検証要求は送らない）
+strata runtime verify --profile local --plan
 
-```sh
-strata runtime verify --profile my-model --plan
-strata runtime verify --profile my-model --if-owner-id <OWNER_ID> --if-instance-id <INSTANCE_ID>
+# 未ロードの場合にモデルをロードしてから生成確認を行う
+strata runtime verify --profile local --load
 ```
 
 ## 値と既定値
 
-- `--profile` は `required=True` の文字列引数で、既定値はありません。alias や `choices` は定義されていません（`strata_cli/cli.py:216-225`）。
-- runtime 側はプロファイル名を `[a-z][a-z0-9_-]{0,63}` で検証します。保存済みプロファイル名でなければならず、JSON 設定ファイルのパスは受け付けません（`strata_control/profiles.py:25`、`strata_control/runtime.py:95-98`）。名前が保存されていない場合、通常実行は「未保存」エラーになります（`strata_control/profiles.py:150-166`）。
-- 同じ `--profile` を複数回指定した場合の専用検証はありません。特殊な action ではない通常の `argparse` 引数です（`strata_cli/cli.py:216-225`）。
+`--profile` は必須引数で、parser 上の既定値はない。profile 名は runtime 操作の入口で検査され、`[a-z][a-z0-9_-]{0,63}` に一致しない値は拒否される。絶対パス、`/` または `\` を含む値、`.json` ファイル名は profile 名として受け付けない。通常の検証実行では profile が保存されていないとエラーになる。`--plan` 経路は profile ファイルを読まず runtime 状態を参照する。parser に重複指定時の独自処理はない。
+
+profile の保存場所は `STRATA_PROFILE_DIR` があればその値、Windows では `%APPDATA%/Strata/profiles`（未設定時はユーザーホーム配下）、その他の環境では `$XDG_CONFIG_HOME/strata/profiles`（未設定時は `~/.config/strata/profiles`）である。これは `--profile` の値の解釈を変えるものではなく、profile を検索するディレクトリを選ぶ。
 
 ## 実行時の動作
 
-CLI は `--profile` の値と `--wait`（既定300秒）、`--load`、`--plan`、ID 前提条件を `management.runtime_action()` に渡します（`strata_cli/cli.py:216-225,1345-1356`）。このアクションはプロファイル名を検証し、通常実行では保存済みプロファイルの revision を読み、検証操作を journal に記録してから runtime owner へ要求します（`strata_control/management.py:235-270`、`strata_control/runtime.py:687-699`、`strata_control/journal.py:376-393`）。
+parser は `--profile` を必須文字列として受け取り、`_runtime` から `management.runtime_action` に渡す。そこで保存済み profile 名として検査した後、通常実行では profile の revision を読み、`runtime.verify` の operation として journal に記録してから owner runtime に要求する。したがって、実際の検証にはその profile で起動済みの、ready な管理対象 instance が必要。
 
-通常実行では owner host が対象 instance の ready 状態、ready file の PID/instance 一致を確認してから、loopback 等の設定済み endpoint に `GET /v1/telemetry` を送り、応答の instance ID、launch attestation、model ID を照合します（`strata_control/runtime.py:1189-1199`、`strata_control/readiness.py:89-117`）。モデルがロード済みなら `POST /v1/chat/completions` に `max_tokens: 1` の probe を送り、生成応答と completion token 数を検査します。生成レスポンス本文は保存しない実装です（`strata_control/readiness.py:1-5,121-143`）。
+検証は owner runtime が ready record と実プロセスの対応を確認し、API の telemetry から instance ID、launch attestation、model ID を照合する。その後、モデルがロード済みなら chat completions API に `max_tokens: 1` の生成 probe を送り、応答に少なくとも 1 completion token があるか確認する。モデルが未ロードで `--load` を指定していない場合は生成要求をせず、API identity と launch attestation の確認結果を返して `readiness_state: unloaded` とする。`--load` は未ロードモデルをロードして生成確認を行う指定である。
 
-- `--load` がない場合、model が未ロードなら API identity と launch attestation の確認まで行い、生成確認はせず `readiness_state: unloaded` を返します。`--load` を付けると未ロード時にも generation probe を進め、検証中にモデルロードを促します（`strata_cli/cli.py:218-220`、`strata_control/readiness.py:113-125`）。
-- `--plan` は状態を照会し、`would_load` と `would_verify: false` を含む計画を返します。実際の API/generation probe は実行しません。計画と同時に `--if-owner-id` / `--if-instance-id` は指定できません（`strata_control/management.py:239-254`）。
-- `--if-owner-id` と `--if-instance-id` は対で指定します。現在の owner と instance が一致しない場合、実行を拒否します（`strata_control/management.py:255-270`、`strata_control/runtime.py:1176-1188`）。
+`--plan` を付けると、ready 状態と owner/instance ID、model state、および `--load` ならロードを試みるかを表示する。計画経路では owner runtime の status を参照するが、明示的な `runtime.verify` 要求や generation probe は実行しない。計画で表示した ID を実行時に固定したい場合は `--if-owner-id` と `--if-instance-id` を両方指定する。片方だけの指定は拒否され、plan と同時に指定することもできない。
+
+profile の読込処理は通常のユーザー権限では読み取りを行う。昇格実行でアクセス保護が崩れた profile は、権限修復のため一度そのファイルを書き換える場合がある。通常実行ではさらに journal に operation の開始・完了結果が保存される。検証自体は server の起動・停止や profile 設定の変更を行わないが、`--load` によるモデルロードと generation probe は runtime/API に処理を発生させる。
 
 ## 適用条件と副作用
 
-- 対象は保存済みプロファイルに紐づく、managed runtime の owner が制御する ready instance です。未起動・停止中など ready でない場合は `runtime_not_ready` で検証できません（`strata_control/runtime.py:1189-1190`）。管理 transport は Windows または POSIX の Unix domain socket 対応環境を対象にし、それ以外では拒否されます（`strata_control/runtime.py:81-92`）。
-- 操作結果は `runtime.verify` として操作 journal に記録されます。API への telemetry 要求とチャット completion 要求が発生し、`--load` の場合は未ロードモデルのロードも起こり得ます（`strata_control/management.py:264-270`、`strata_control/journal.py:376-405`、`strata_control/readiness.py:101-143`）。
-- API key は run config または `STRATA_API_KEY` から取得され、HTTP Authorization header に使われます。これは `--profile` 固有の値ではありません（`strata_control/readiness.py:42-53,61-65`）。
+- 値は保存済み profile の名前に限られる。通常の検証では profile 名から run config と revision を読み、指定 profile の owner-controlled runtime を対象にする。`--plan` は profile ファイルを読まず、指定名の runtime 状態を確認する。
+- `--plan` は実行前の状態確認用で、通常の検証や probe を行わない。実行時には runtime が ready でなければ失敗する。
+- `--load` なしでは、未ロードモデルをロードしない。`--load` がある場合は検証中にモデルをロードし、生成要求を行う。
+- `--wait` は既定 300 秒で、実行経路では有限秒数の 1〜600 秒に制限される。`--wait` は別オプションであり、`--profile` の値には影響しない。
+- `--if-owner-id` と `--if-instance-id` は計画後の owner/instance 入替を検出するための対であり、profile 名そのものの validation とは別の実行前提条件。
 
 ## 出力とエラー
 
-- 成功時は human 出力にプロファイル名、状態、instance ID、API URL、起動構成確認、generation/unloaded 状態を表示します。JSON 出力では runtime 結果を含む JSON を出力します。計画成功時は plan のみを出力し、成功は終了コード `0`、失敗は結果の `exit_code`（通常は `6`）を返します（`strata_cli/cli.py:1357-1373`）。
-- endpoint・instance・attestation・model の不一致、HTTP/transport 異常、無効な probe 応答、生成 token 不在などは検証失敗になります。失敗コードを含む結果を出し、human 出力では runtime start/restart/verify の失敗時に取得可能な engine log のヒントを stderr に追記します（`strata_control/readiness.py:67-79,98-143`、`strata_control/runtime.py:1191-1208`、`strata_cli/cli.py:1369-1373,1376-1388`）。
-- `--profile` の省略は parser が必須引数エラーとして拒否します。形式不正は `ProfileError`（既定終了コード2）、未保存プロファイルは終了コード5です（`strata_cli/cli.py:216-217`、`strata_control/profiles.py:30-35,150-166`）。
+通常の human 出力では profile 名、runtime state、instance/API URL、launch 確認、generation readiness を表示する。`--output json` では結果を JSON で出力する。失敗した `start` / `restart` / `verify` では、取得できる場合に engine log の場所と末尾も stderr に表示する。
+
+引数欠落や parser の不正引数は argparse の usage error（終了コード 2）。不正な profile 名は `ProfileError` として通常は終了コード 2、未保存 profile はコード 5、管理 runtime がない／停止中はコード 3、runtime が ready でない・ID が計画後に変化した・検証に失敗した場合は主にコード 6 となる。owner runtime との待機期限切れはコード 8 で、結果が不明な場合がある。
 
 ## 根拠
 
-- parser 定義と runtime コマンドの説明: `strata_cli/cli.py:197-225`
-- profile 名の形式・検証: `strata_control/profiles.py:25,150-166`、`strata_control/runtime.py:95-98`
-- CLI から管理処理への引き渡しと出力・終了コード: `strata_cli/cli.py:1345-1373`
-- plan と通常実行の分岐、ID 前提条件、journal 記録: `strata_control/management.py:235-270`、`strata_control/journal.py:376-405`
-- owner 側の readiness 条件・照合: `strata_control/runtime.py:1172-1208`
-- API probe、未ロード時の扱い、1-token generation: `strata_control/readiness.py:84-143`
+- `terminal/strata_cli/cli.py:244-253` — `runtime verify` parser、`--profile` 必須、`--wait` の既定値、`--load`、`--plan`、owner/instance 前提条件。
+- `terminal/strata_cli/cli.py:1401-1443` — parser 値を runtime action に渡し、plan / human / JSON の結果と終了コードを処理する。
+- `terminal/strata_control/management.py:193-205,243-278` — profile 名検証、plan 時の状態確認、通常実行時の revision 読込・journal 記録・runtime 呼出し。
+- `terminal/strata_control/runtime.py:122-125,880-892,1390-1426` — profile 名形式、verify の範囲検証と owner RPC、ready instance と ID の検査。
+- `terminal/strata_control/profiles.py:25-50,153-173,400-406` — profile 名の正規表現、profile 読込・未保存エラー、名前と JSON パスの解決境界。
+- `terminal/strata_control/profiles.py:38-45,153-173` — profile 保存ディレクトリの選択と読込時のファイルアクセス。
+- `terminal/strata_control/readiness.py:96-156` — API identity / launch attestation / model の照合、未ロード時の扱い、1 token generation probe。
+- `terminal/strata_control/journal.py:381-398,407-410` — 直接 operation の開始・完了記録と verify 結果の保存。
+- `terminal/strata_control/runtime.py:448-484` — owner runtime がない場合、接続失敗、待機 timeout、制御応答のエラー処理。
 
-調査は上記 checkout のソースに限定しました。CLI `--help` の実行や Release 配布物の照合は行っていません。
+調査範囲は上記 checkout の CLI parser と Strata 所有の Python 実装。外部 API/server の内部挙動や、各モデルでのロード・生成時間は確認しておらず、ここでは断定しない。

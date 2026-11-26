@@ -1,54 +1,49 @@
 # `STRATA_NO_AVXVNNI`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-AVX2 用にビルドされた Strata の CPU expert row kernel が、AVX-VNNI 命令を使う派生実装を選ぶかどうかを抑制します。対象は i-quant row、IQ4_NL の down row、Q2_0 row です。変数は AVX-VNNI 実装そのものをビルドから取り除かず、実行時の CPU 判定を false にして AVX2 の通常実装へ回します。AVX-512 の実装や ggml-cpu の dot を無効にする設定ではありません。
+x86 CPU の AVX2 expert row dispatch で、AVX-VNNI 形式を選ばないための抑止スイッチです。Strata の `cpu_avxvnni_ok()` が環境変数を数値変換し、非 0 なら `false` を返します。その結果、Q2_0 と i-quant 系の一部 AVX2 row 処理は VNNI 実装でなく AVX2 の通常実装を通ります。環境変数自体が生成 token やモデル設定を変更する処理はありません。`expert_layout.cpp` の関数内 `static` 判定を通じ、Q2_0 と i-quant の dispatch がこの可否を使います（`engine/src/kernels/cpu/expert_layout.cpp:361-374`、`engine/src/kernels/cpu/q2_avx2.cpp:155-164`、`engine/src/kernels/cpu/iq_avx2.cpp:384,491-498`）。
 
 ## 値と判定
 
-`src/kernels/cpu/expert_layout.cpp` の `cpu_avxvnni_ok()` が `std::getenv()` で値を読み、`std::atoi(v) != 0` なら AVX-VNNI を使わない判定を返します。文字列全体を真偽値として比較する処理ではありません。
+読み取りは x86 用 `cpu_avxvnni_ok()` の初回評価時に `std::getenv` で行い、設定されていて `std::atoi(v) != 0` の場合に AVX-VNNI を無効にします。文字列全体の妥当性検査はありません。`atoi` が先頭の空白と符号付き 10 進数を変換し、数字の後ろの文字を無視するため、`1`、`-1`、`1junk`、` 1` は抑止し、`0`、`0junk`、`true`、`false`、空文字、未設定はこの条件では抑止しません。数値として変換できない文字列は 0 として扱われます。範囲外の数値文字列については `atoi` の規則に委ねられます（Strata 側に追加の検証や clamp はありません）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | この変数による抑制なし。ビルドと CPU の機能条件を満たせば AVX-VNNI を使える |
-| 空文字 | `atoi("")` は 0 なので抑制しない |
-| 整数として 0 になる文字列（例 `0`, `0abc`, `abc`） | 抑制しない |
-| 整数として 0 以外になる文字列（例 `1`, `-1`, `2`, `1abc`, ` 1`） | 抑制する |
+| 条件 | unset | 抑止する値の例 | 抑止しない値の例 |
+| --- | --- | --- | --- |
+| x86/x64 の通常 build で、AVX-VNNI kernel が build に含まれ、CPU 条件も満たす場合 | 抑止しない | `1`, `-1`, `1junk`, ` 1` | 空文字, `0`, `0junk`, `true`, `false`, `junk` |
+| 非 x86 build | 関数の stub が常に `false` を返すため変数を読み取らない | 該当なし | 該当なし |
+| AVX-VNNI kernel が build に含まれない場合 | VNNI kernel は選択されない | 実効上の差なし | 実効上の差なし |
 
-`atoi` は先頭の空白と符号を許し、整数として読める先頭部分を変換します。したがって `true` は抑制せず、`false` も抑制しません。整数変換の範囲外入力に対する値はこのコードで定義されていないため、依存しないでください。
+根拠: `engine/src/kernels/cpu/expert_layout.cpp:42-51,361-374`。`std::atoi` の結果が 0 かどうかだけを使い、空文字専用の扱いや文字列比較はありません。
 
 ## 有効になる条件
 
-変数が未設定、空、または `atoi` 結果が 0 でも、次の条件が必要です。
-
-- コンパイラが AVX-VNNI intrinsic を利用でき、CMake が AVX-VNNI の派生 row 実装をビルドしていること。利用不可なら通常の AVX2 実装だけがビルドされます。
-- CPU 機能判定が AVX2 を利用可能とし、CPUID leaf 7 subleaf 1 の EAX bit 4 が立っていること。
-- `STRATA_FORCE_ISA` が ISA 上限を level 3 未満にしておらず、`STRATA_ISA_FLOOR` による旧 CPU 向け build でないこと。`STRATA_FORCE_ISA=avx2` も AVX-VNNI 判定を無効にします。
-- 呼び出し側が該当する Strata CPU kernel 経路を選ぶこと。たとえば IQ4_NL down row は AVX2 対応、token 数が `STRATA_IQ_MT_MIN` 以上、かつ `STRATA_NO_IQ4NL` 未設定の場合に Strata の AVX2 kernel に入ります。i-quant row も native expert の形式対応と token 数条件を満たす必要があります。
-
-AVX-512 対応形式は native expert の dispatch が AVX-512 row kernel を選べるため、この変数の AVX-VNNI 判定を経由しない場合があります。Q2_0 も AVX-512 が利用可能なら AVX-512 kernel が優先されます。CPU が AVX2 を使えない場合は下位 ISA または ggml-cpu の経路になり、この AVX-VNNI 切り替えは使われません。
+- 値が `atoi` で非 0 になり、x86/x64 の probe 実装が使われること。
+- 変数が 0 または未設定で AVX-VNNI を使うには、`STRATA_ISA_FLOOR` build が空（通常 build）、`cpu_isa_cap() >= 3`、AVX2 と OS の YMM 状態対応、および CPUID leaf 7 subleaf 1 の AVX-VNNI bit が必要です（`engine/src/kernels/cpu/expert_layout.cpp:361-371,206-238,286-294`）。
+- AVX-VNNI row kernel がコンパイラで利用可能として build されている必要があります。CPU backend と SYCL の CMake は intrinsic の compile check 結果から `STRATA_AVXVNNI=1` または `0` を設定し、Q2_0 と i-quant の各ソースへ渡します。非対応コンパイラの build では VNNI row のコピー自体がありません（`engine/cmake/backends/cpu.cmake:271-298,350-358`、`engine/sycl/CMakeLists.txt:180-200,228-248`、`engine/src/kernels/cpu/iq_avx2.cpp:37-45`、`engine/src/kernels/cpu/q2_avx2.cpp:18-25`）。
+- `STRATA_FORCE_ISA=avx2`, `avx`, `sse`, `sse4.2`, `none` は ISA cap を 3 未満にし、AVX-VNNI 判定を通さないため、この変数を unset/0 にしても VNNI は選ばれません。`STRATA_FORCE_ISA` に他の非空文字列を指定した場合は warning を出して cap 3 として扱います。`STRATA_FORCE_AVX2` は AVX-512 側などで使う probe 制限ですが、`cpu_avxvnni_ok()` はその判定を呼ばないため、この AVX-VNNI probe を直接は抑止しません（`engine/src/kernels/cpu/expert_layout.cpp:26-39,75-78,361-374`）。
+- これらの row dispatch 以外、GPU backend のカーネルや AVX-512 probe を本変数が制御する読み取り箇所は見つかりません。モデル形式や server/CLI モードによる別の判定も、この変数の読み取り箇所にはありません。
 
 ## 実行時の詳細
 
-実行時エンジンで環境変数を判定する箇所は `cpu_avxvnni_ok()` です。結果は関数内の `static const bool` に保存されるため、最初にこの判定が呼ばれた時点で固定されます。プロセス起動後に環境を変更しても再評価されません。別に、診断プログラム `iq_avx2_parity` が値を取得して表示しますが、その表示はエンジンの dispatch には関与しません。
+`cpu_avxvnni_ok()` は関数ローカル `static const bool` を初回呼び出し時に初期化します。その初期化で環境変数を読み、結果をプロセス内で cache するため、初回評価後にプロセス環境を変更しても再評価されません（`engine/src/kernels/cpu/expert_layout.cpp:361-374`）。
 
-- `iq_avx2.cpp` は `vnni_on()` からこの判定を使い、i-quant の gate/up と row dot、および IQ4_NL down row に AVX-VNNI variant を渡します。判定が false なら `plain` 名前空間の AVX2 実装を呼びます。
-- `q2_avx2.cpp` は `q2_0_gguf_rows_multi_avx2_legacy()` から判定を使います。AVX-VNNI variant が選ばれなければ同じ処理の AVX2 row 実装に進みます。Q2_0 の bit-plane 経路が条件を満たす場合はそちらを使い、VNNI 選択は legacy row 経路内で行われます。
-- ソースは、この環境変数を理由にしたログ、警告、エラーを出しません。
-- `iq_avx2_parity` は値を `-`（未設定）または環境変数の文字列として標準出力に表示します (`src/kernels/cpu/iq_avx2_parity.cpp:528-534`)。
+Q2_0 の AVX2 row dispatcher は `STRATA_AVXVNNI && cpu_avxvnni_ok()` を渡し、true なら VNNI rows、false なら通常 AVX2 rows を呼びます（`engine/src/kernels/cpu/q2_avx2.cpp:155-164,167-178`）。i-quant dispatcher は `vnni_on()` から同じ判定を使って VNNI variant を含めるか決め、含まれない場合に通常 rows を選びます（`engine/src/kernels/cpu/iq_avx2.cpp:370-384,491-498,500-525,540-552`）。したがってこの変数は AVX-VNNI がある CPU の一部 CPU row 計算経路を AVX2 実装へ戻すもので、AVX-VNNI 対応条件を満たさない場合や VNNI kernel が build されていない場合には追加の効果はありません。
 
-`docs/DETAILS.md` は `STRATA_NO_AVXVNNI=1` で i-quant、IQ4_NL、Q2_0 row の AVX-VNNI forms を止めると記載しています。実装では値が文字列全体の `1` 比較ではなく `atoi` の非ゼロ判定です。同資料の「AVX2 forms と同じ bits」「4–25% faster rows」という説明は資料上の主張として確認しましたが、この調査では測定を実施していません。
+## ログと測定値
+
+本番の読み取り・dispatch 判定から、この変数の値や切替理由を出力するログ、警告、終了経路は確認できません。別の診断実行ファイル `iq_avx2_parity` は環境値を文字列のまま標準出力に表示します（未設定は `-`）。その表示は値の診断であり、そこでは値を数値判定していません（`engine/src/kernels/cpu/iq_avx2_parity.cpp:562-566`）。
+
+`docs/DETAILS.md` は `STRATA_NO_AVXVNNI=1` を AVX-VNNI row forms を止める診断用設定と記載しています。速度や一致性の数値は本調査では測定しておらず、同資料の数値を現行環境で再確認した結果としては扱いません（`docs/DETAILS.md:1273`）。
 
 ## 根拠
 
-- 値の読み取り、`atoi` 判定、ISA 条件、CPUID 条件、static cache: `src/kernels/cpu/expert_layout.cpp:260-273`。
-- AVX2 と AVX-VNNI の feature/build 条件と旧 CPU floor 判定の宣言: `include/strata/kernels/cpu/expert_layout.hpp:57-77`。
-- AVX2 実行可否の ISA 上限、OSXSAVE/AVX 状態、CPUID 判定: `src/kernels/cpu/expert_layout.cpp:110-143`。
-- AVX-VNNI intrinsic の build probe と `STRATA_AVXVNNI` 定義: `CMakeLists.txt:1227-1254,1317-1354`、SYCL build: `sycl/CMakeLists.txt:121-149,183-198`。
-- i-quant / IQ4_NL の variant 選択と通常 AVX2 への fallback: `src/kernels/cpu/iq_avx2.cpp:369-383,456-500,503-520`、row 実装: `src/kernels/cpu/iq_avx2_rows.inl:1-28`。
-- Q2_0 の variant 選択と通常 AVX2 への fallback: `src/kernels/cpu/q2_avx2.cpp:51-63,155-180`、row 実装: `src/kernels/cpu/q2_avx2_rows.inl:1-13`。
-- native expert が i-quant AVX-512 / AVX2 経路を選ぶ条件、IQ4_NL down 経路: `src/kernels/cpu/native_expert.cpp:176-192,233-255`。
-- Q2_0 の AVX-512 → AVX2 → AVX1 dispatch: `src/kernels/cpu/expert_layout.cpp:356-368`。
-- 文書説明と記載測定: `docs/DETAILS.md:287-289`。
+- `engine/src/kernels/cpu/expert_layout.cpp:361-374` — 環境値の読み取り、数値判定、cache、および AVX2/CPUID 条件。
+- `engine/src/kernels/cpu/expert_layout.cpp:42-51` — 非 x86 stub。
+- `engine/src/kernels/cpu/q2_avx2.cpp:155-178` — Q2_0 row dispatch。
+- `engine/src/kernels/cpu/iq_avx2.cpp:370-384,491-525,540-552` — i-quant の VNNI variant と row dispatch。
+- `engine/cmake/backends/cpu.cmake:271-298,350-358`、`engine/sycl/CMakeLists.txt:180-200,228-248` — build 時の AVX-VNNI intrinsic 判定と各 kernel への macro 設定。
+- `engine/src/kernels/cpu/iq_avx2_parity.cpp:562-566` — 診断プログラムによる値の表示。
+- `docs/DETAILS.md:1273`、`docs/SETTINGS.md:188` — Strata 資料上の位置づけと CPU 設定一覧。

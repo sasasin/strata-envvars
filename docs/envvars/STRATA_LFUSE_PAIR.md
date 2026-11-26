@@ -1,45 +1,44 @@
 # `STRATA_LFUSE_PAIR`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-常駐 expert を使う verifier の shared expert 計算で、gate 行列と up 行列の積を一つの multi-matrix kernel launch にまとめる経路を許可します。単独では有効化されず、`STRATA_LFUSE` が有効で、verifier の resident 条件なども満たしたときだけ参照されます。CUDA/HIP 実装と SYCL 実装の両方に同じ制御があります。
+shared expert の gate / up 射影を `native_mmvq_pair` で一度に発行する経路を許可するフラグ。無効にしても gate と up の計算は省かれず、通常の `native_mmvq` を各々呼ぶ。CUDA/HIP と SYCL の verifier から共通の `shared_expert_multi` にフラグが渡される（`engine/src/core/verify.cpp:2746-2751`、`engine/sycl/src/core/verify.cpp:1667-1672`）。
 
 ## 値と判定
 
-値全体を parse せず、環境変数の先頭文字だけを見ます。値が未設定なら有効、設定値の先頭文字が `0` なら無効、それ以外なら有効です。空文字も設定済みで先頭文字が `\0` のため有効です。たとえば `0`, `0abc` は無効、`1`, `true`, `false`, `2`, 空文字は有効です。空白や大文字小文字、数値としての妥当性は検査しません。
+両 verifier の `g_lfuse_pair()` は `std::getenv` の結果を関数内 `static const bool` に保存し、未設定なら on、設定されていれば先頭文字が `'0'` 以外なら on とする。文字列全体の parse、数値判定、大文字小文字変換はしない（`engine/src/core/verify.cpp:189`、`engine/sycl/src/core/verify.cpp:132`）。
 
-判定結果は関数内の `static const bool` に保存されます。最初にこの判定へ到達した後でプロセス環境を変更しても反映されません。コード上、判定関数が呼ばれるのは `lfuse_on(n)` が真のときに限られるため、実際の初回評価は対象となる verifier window 内です。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 共通 verifier（CUDA/HIP。Metal build もこのソースを含む）、SYCL verifier | on | 空文字、`1`、`true`、`false`、`anything`、先頭が空白の ` 0` | `0`、`0anything`、`00`（先頭文字が `0`） |
+
+この値だけでペア kernel の実行が保証されるわけではない。pair flag が渡されても、`native_mmvq_pair` が対応条件を満たさない場合は gate と up に通常の `native_mmvq` を個別に呼ぶ（`engine/src/kernels/cuda/shared_expert.cu:239-244`、`engine/sycl/src/kernels/cuda/shared_expert.dp.cpp:328-332`）。
 
 ## 有効になる条件
 
-`STRATA_LFUSE_PAIR` が有効でも、次の条件をすべて満たす場合にだけ pair launch が試されます。
-
-- verifier の `ar_on()` が真、すなわち対象 stage の全 expert が VRAM resident で、resident-only 経路が停止されていない。
-- `STRATA_LFUSE` が先頭文字 `1` で有効。
-- native MoE combine が有効で、`STRATA_DEC_BATCH` が未設定または `atoi` の結果が 0 以外。
-- verifier の window 行数 `n` が 2〜8。
-- shared expert の native BF16 backend が有効。
-
-さらに kernel 側の `native_mmvq_pair()` が対象を Q8_0（ggml type 8）、2〜8列、正の行列寸法、32要素境界の入力、未 packed の重みなどに限定しています。これらの条件を満たさない場合、同関数は `false` を返し、呼び出し元が gate と up の `native_mmvq()` を別々に実行します。従って環境変数が有効でも、全モデル形式・量子化で pair launch が使われるわけではありません。
+- 上位の融合経路 `lfuse_on(n)` が真であること。これは `STRATA_LFUSE` が先頭文字 `'1'`、all-resident (`ar_on()`)、native MoE combine 有効、`STRATA_DEC_BATCH` が有効、対象 window が 2〜8 token、native BF16 shared-expert 経路有効、を要求する（`engine/src/core/verify.cpp:1521-1525`、`engine/sycl/src/core/verify.cpp:1059-1063`）。`STRATA_LFUSE_PAIR` はこの上位条件を代替しない。
+- shared-expert の重みが存在し native 形式へ変換でき、`shared_expert_multi` に到達すること（`engine/src/core/verify.cpp:2725-2734`、`engine/sycl/src/core/verify.cpp:1647-1655`）。
+- pair kernel 自体は両重み型が同じで、型 ID が 8 (Q8_0)、multi exact が有効、token 数 2〜8、正の寸法、入力寸法が 32 の倍数などを要求する。Q8 packed registry に登録された重みも pair kernel の対象外。いずれかを満たさなければ関数は `false` を返し、個別射影に fallback する（`engine/src/kernels/cuda/native_mmvq.cu:3673-3682`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:4112-4121`）。
+- `engine/src/core/verify.cpp` は Metal build にも含まれるため、上位条件が成立すれば Metal でも getter 自体は評価され得る。しかし Metal の `shared_expert_multi` は `missing("strata::kernels::shared_expert_multi")` を呼ぶ stub で、pair flag を使う実装はない（`engine/metal/CMakeLists.txt:135-146`、`engine/metal/src/engine/stubs.cpp:324`）。
 
 ## 実行時の詳細
 
-CUDA/HIP と SYCL の `Verifier::record_window()` は `lfuse_on(n) && g_lfuse_pair()` の結果を `shared_expert_multi()` に bit 1 として渡します。`shared_expert_multi()` はその bit を `pair` として解釈し、両重みの型が等しい場合に `native_mmvq_pair()` を試します。pair kernel は一つの launch 内で gate と up の各出力行を計算します。対応条件を満たさなければ二つの `native_mmvq()` 呼び出しにフォールバックします。
+値はプロセス起動時に必ず読むのではなく、`g_lfuse_pair()` が初めて呼ばれた時に読み、static に保持する。呼び出し箇所は `lfuse_on(n)` の短絡条件の右側なので、上位の融合条件が成立しなければ読み取りも起きない。最初の読み取り後にプロセス環境を変えても、このキャッシュ値は変わらない（`engine/src/core/verify.cpp:189,2750`、`engine/sycl/src/core/verify.cpp:132,1671`）。
 
-この変数が無効でも shared expert 自体は引き続き計算され、gate/up の積が個別 launch になります。pair 経路の失敗は通常 fallback で処理され、環境変数専用のログはありません。pair kernel の起動後に backend エラーが発生した場合は、shared expert のエラーとして verifier のエラー文字列に伝播します。
+有効時、shared expert の gate と up の型が一致し pair kernel の条件も満たせば、それらを一つの `native_mmvq_pair` 呼び出しへまとめる。条件不成立または pair 不対応なら 2 回の `native_mmvq` 呼び出しへ戻る。無効時も同じ個別呼び出しとなる。後続の SwiGLU、down 射影、および shared gate の扱いはこのフラグが直接選び分けず、別の `lfuse` bit や verifier の分岐で決まる（`engine/src/kernels/cuda/shared_expert.cu:239-258`、`engine/sycl/src/kernels/cuda/shared_expert.dp.cpp:328-355`、`engine/src/core/verify.cpp:2747-2751,2944-2959`）。
 
-この変数を読む本番実装は verifier と shared expert の CUDA/HIP/SYCL ソースです。通常の単一 token 経路や、resident 条件を満たさない経路にはこのスイッチの分岐はありません。`docs/DETAILS.md` に `STRATA_LFUSE_PAIR` 固有の説明や性能測定値は見つからなかったため、効果量は記載しません。
+## ログと測定値
+
+この変数の値や pair kernel の採用可否を直接示すログは見当たらない。CUDA/HIP verifier の `combine layer: kind ...` は combine の種類を記録するが、pair flag の値は区別しない（`engine/src/core/verify.cpp:2944-2949`）。対象変数について条件付き測定値を記した Strata 資料は確認できなかった。
 
 ## 根拠
 
-- `src/core/verify.cpp:133-134` — 値判定と static cache。
-- `sycl/src/core/verify.cpp:71-73` — SYCL 側にも同じ判定。
-- `include/strata/core/verify.hpp:389-395` — `ar_on()` は all-resident かつ `!ar_off_`。
-- `src/core/verify.cpp:845,851-855,1531-1535` — batch 条件、pair 適用条件、shared expert へのフラグ伝達。
-- `sycl/src/core/verify.cpp:825,836-840,1391-1395` — SYCL 側の同等条件とフラグ伝達。
-- `src/kernels/cuda/shared_expert.cu:214-232` — bit の解釈、pair 試行、二つの積への fallback。
-- `sycl/src/kernels/cuda/shared_expert.dp.cpp:313-330` — SYCL 側の同等処理。
-- `src/kernels/cuda/native_mmvq.cu:2417-2441` — CUDA/HIP pair kernel の対象条件と dispatch。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:3602-3625` — SYCL 側の同等条件と dispatch。
+- `engine/src/core/verify.cpp:189,1521-1525,2725-2754,2944-2959`
+- `engine/sycl/src/core/verify.cpp:132,1059-1063,1647-1675,1810-1818`
+- `engine/src/kernels/cuda/shared_expert.cu:216-244,258-283`
+- `engine/sycl/src/kernels/cuda/shared_expert.dp.cpp:315-355`
+- `engine/src/kernels/cuda/native_mmvq.cu:3673-3696`
+- `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:4112-4135`
+- `engine/metal/src/engine/stubs.cpp:324`

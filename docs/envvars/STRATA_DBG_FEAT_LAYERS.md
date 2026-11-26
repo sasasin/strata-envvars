@@ -1,49 +1,46 @@
 # `STRATA_DBG_FEAT_LAYERS`
 
-調査対象: Strata main の HEAD 7695859aa13afb248bdb4d36f9b2e95707db079d（2026-10-12 時点）。対象リポジトリは調査開始時に main で、作業ツリーに変更はなかった。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-研究用フック STRATA_DBG_FEAT=<file> が MoE 層・prompt chunk ごとのルーティング ID と重みを出力するとき、追加で router 入力 hidden state（bf16）を記録する層番号を選ぶ。STRATA_DBG_FEAT_LAYERS 自体はダンプを開始しない。STRATA_DBG_FEAT が必要で、これがなければ層リストを使った hidden state の出力も行われない。
+MoE prefill の研究用 feature dump で、router 入力 hidden state（bf16）も記録する層を選びます。対象層の routed ids と weights は `STRATA_DBG_FEAT` の dump 対象なら引き続き記録されますが、この変数はその dump のヘッダーにある feature flag と hidden-state の追加書き込みだけを選び、routing や生成結果を変更しません。実装は `Prefill::run_impl` の MoE 処理です（`engine/src/prefill/prefill.cpp:5577-5589, 5625-5639`）。
 
-このフックは strata_prefill の prompt prefill 経路にあり、decode や別の推論経路に対する設定ではない。値は通常の利用者向け設定ではなく、ソースコメントに RESEARCH HOOK と記された診断・研究用の機能である。
+この変数だけでは hook は動きません。`STRATA_DBG_FEAT` または `STRATA_DBG_ROUTE_OVERRIDE` が設定されて hook のブロックに入ったときに初めて読み取られます。hidden state をファイルへ書くには加えて `STRATA_DBG_FEAT` のファイルを開ける必要があります。`STRATA_DBG_ROUTE_OVERRIDE` だけの場合は layer 選択の値を初期化しますが、feature file はなく hidden state も書きません（同 `5588-5603, 5625-5639`）。
 
 ## 値と判定
 
-値全体の妥当性検査はせず、カンマで分割した各要素を std::atoi に渡す。要素の数値変換結果が 0 以上 63 以下なら、その添字のフラグを true にする。重複指定は同じフラグを再度 true にするだけで、範囲外の値は無視される。
+値全体を検証する parser ではなく、カンマで分けた各部分文字列を `std::atoi` で整数化し、結果が `0..63` の範囲ならその番号を選択します（`engine/src/prefill/prefill.cpp:5596-5603`）。
 
-| 状態・要素 | 動作 |
-|---|---|
-| 変数 unset | 3,4,15,16,27,28,39,40 を使う |
-| 空文字 | 空のリストとなり、hidden state を記録する層はない |
-| カンマ区切りの整数 | 変換値が 0〜63 ならその層を選ぶ |
-| 空要素・数値で始まらない要素 | atoi の結果が 0 となり、層 0 を選ぶ（例: 1,,2 や abc） |
-| 数字の後ろに文字がある要素 | 数字として読める先頭部分で変換する（例: 12x は 12） |
-| 先頭空白・符号 | atoi の変換規則に従う（例: -1 は範囲外、+2 は 2） |
-| 変換値が負、または 64 以上 | 無視する |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `engine/src/prefill/prefill.cpp` の hook に到達し、`STRATA_DBG_FEAT` または `STRATA_DBG_ROUTE_OVERRIDE` が設定済み | `3,4,15,16,27,28,39,40` を選択 | カンマ区切りの各項目が `atoi` で `0..63` になればその層を選択。例: `0`, `63`, `3,4`, `3tail`（数値 prefix の `3`） | 空文字列は項目がなく何も選択しない。`64`, `-1`, `true`, `false` は `atoi` の結果が範囲外または 0 となる（`true` / `false` や空項目は `atoi` が 0 にするため、実際には層 `0` を選択）。 |
 
-文字列を真偽値や単一の層番号として解釈するものではない。パーサーは固定長 64 要素の bool 配列を作り、実際の layer l に対して featl[l & 63] を参照する。このため layer 番号が 64 以上のモデルでは 64 周期で同じ選択が適用される。
+各項目で文字列全体の数値妥当性、大文字小文字、空白の除去、エラーは検査しません。`atoi` が認識する先頭の符号・空白と数字 prefix が使われ、変換できない項目は 0 になります。したがって `1,garbage,63` は 1、0、63 を選択し、`,2` や `2,,4` も空項目由来の 0 を選択します。空文字列全体は `while (i < s.size())` のループに入らないため何も選択しません。各変換後の整数を `0 <= v && v < 64` で範囲確認します。整数変換のオーバーフロー時の値はこのコードで別途定義・検査されていません（同 `5598-5602`）。
 
 ## 有効になる条件
 
-- MoE 層で router の計算後に実行されるフックに到達する必要がある。
-- STRATA_DBG_FEAT または STRATA_DBG_ROUTE_OVERRIDE のどちらかが設定されている場合にだけ、STRATA_DBG_FEAT_LAYERS を parse する。
-- hidden state のファイル出力には STRATA_DBG_FEAT が設定され、かつそのパスを fopen(path, "wb") で開ける必要がある。STRATA_DBG_ROUTE_OVERRIDE だけの場合は layer リストが初期化されても、それを使ったファイル出力はしない。
-- STRATA_DBG_FEAT と STRATA_DBG_ROUTE_OVERRIDE のどちらも unset ならフックの同期・転送・ファイル処理に入らない。
+- hook は MoE 層を処理する `run_impl` 経路にあり、`STRATA_DBG_FEAT` または `STRATA_DBG_ROUTE_OVERRIDE` のいずれかが設定されていないと対象変数を読みません。対象変数単独では有効化されません（`engine/src/prefill/prefill.cpp:5577-5598`）。
+- hidden state の dump には `STRATA_DBG_FEAT` が必要で、さらにそのパスを `fopen(..., "wb")` で開ける必要があります。開けなければ `ff == nullptr` となり、ids / weights と hidden state の書き込みブロックは実行されません。失敗理由のログはこの箇所にありません（同 `5592-5595, 5625-5639`）。空文字でも `STRATA_DBG_FEAT` は設定済みとして hook に入りますが、空のパスを開けない場合は dump されません（同 `5592-5595`）。
+- `STRATA_DBG_ROUTE_OVERRIDE` だけを設定した場合も hook と対象変数の初期化には到達しますが、`ff` は null なので feature dump は行われません。routing override の読み込み・適用は別変数の動作です（同 `5593-5594, 5606-5621, 5625-5645`）。
+- layer-major prefill が選ばれ、`lm_prepare_chain` が成功すると `run_layer_major` が使われます。この walk は routing debug hook を持たず、対象変数だけでは layer-major を止めません。そのため対象変数単独設定時にこの経路が使われれば値は読まれません。一方 `STRATA_DBG_FEAT` または `STRATA_DBG_ROUTE_OVERRIDE` が設定されると `lm_prepare` が layer-major を断り、`run_impl` に進みます（同 `8205-8209, 9657-9705`）。
+- Metal の `Prefill::run` はこの共通 `run_impl` へ進む前に Metal prompt 実装を呼んで return します。この変数の読み取り箇所は `engine/src/prefill/prefill.cpp` のみで、`engine/sycl` 側に同名参照はありません。したがって Metal / SYCL 経路にこの hook があるとは確認できません（同 `9633-9650`。リポジトリ全体の同名参照検索では `engine/src/prefill/prefill.cpp` の実読み取り 1 箇所とそのコメント、設定レジストリ項目のみ）。
 
 ## 実行時の詳細
 
-STRATA_DBG_FEAT、STRATA_DBG_ROUTE_OVERRIDE はフックの初回実行時に関数内 static として読み取られる。両方が unset ならその時点で処理を抜ける。いずれかが設定されている場合、同じ初回実行で STRATA_DBG_FEAT_LAYERS を一度だけ読み、unset なら既定リストに置き換える。以後の prompt 層・chunk で環境を変更しても再評価されない。
+対象変数は debug block 内の function-local `static` vector `featl` の初期化 lambda から読み取られます。最初にその宣言へ到達したときに unset なら既定リストを、設定済みならその時点の文字列を parse し、その後の prefill / chunk では vector を再利用します。同じ block の `feat_path`、`ovr_path`、`ff`、routing override map も static です。実行中に環境を変更しても、対象変数やこれらの cached 値は再評価されません。宣言自体は `STRATA_DBG_FEAT` または `STRATA_DBG_ROUTE_OVERRIDE` の guard 内なので、その guard に一度も入らないプロセスでは対象変数の読み取りも初期化もされません（`engine/src/prefill/prefill.cpp:5591-5609, 5641`）。
 
-フックが動くたびに CUDA stream を同期する。STRATA_DBG_FEAT のファイルが開けた場合、記録にはまず {layer, position, T, flag} の4個の int32 header、続いて chunk の routed ID と重みを uint16 で書き込む。position は実際の prompt 位置ではなく、l & 63 ごとの static カウンターで、フックを通るたびに T ずつ増える。flag は featl[layer & 63] であり、1 の場合だけ router 入力 m.mixed_bf の T × N 個の bf16 値を追加する。したがって環境変数が決めるのは追加 hidden state を含める層で、routing ID・重みの記録範囲そのものではない。出力ファイルは wb で開くため既存ファイルは切り詰められる。ファイルを開けない場合は ff == nullptr となり、特徴量ダンプは行われない。
+選択判定は `featl[l & 63]` です。モデルの層番号を 64 で折り返した位置で判定し、dump header には実際の層 `l`、chunk 内の開始位置 `pos`、行数 `T`、feature flag を記録します。`STRATA_DBG_FEAT` の file が開けている場合、各 MoE layer/chunk の ids と bf16 weights を出力し、flag が 1 の層だけ router 入力 `m.mixed_bf` の bf16 値も続けて出力します。これは既存の routing 後の値を記録する処理で、対象変数による routing 上書きはありません（同 `5622-5639`）。
 
-実装は fwrite の戻り値を検査せず、書き込み失敗を示す専用ログもない。ソース中の関連 Docs 説明は見つからなかったため、性能や出力の完全性についての測定値は記載しない。
+対象変数自身に CLI 引数、設定ファイル、別変数との値優先順位はありません。値を読むかどうかは `STRATA_DBG_FEAT` / `STRATA_DBG_ROUTE_OVERRIDE` の設定有無で決まり、file dump の有無は `STRATA_DBG_FEAT` と `fopen` の結果で決まります。layer-major の選択は `STRATA_PREFILL_LAYER_MAJOR` 等によりますが、debug dump 変数が設定されると `lm_prepare` はその walk を断ります（同 `8205-8209, 9657-9705`）。
+
+## ログと測定値
+
+対象変数の parse、選択層、feature flag に関する stdout / stderr ログはありません。hook は `fwrite` の戻り値を検査せず、ファイルを開けなかったときの警告も出しません（`engine/src/prefill/prefill.cpp:5595, 5625-5639`）。この変数に関する測定値は該当しません。
 
 ## 根拠
 
-- CMakeLists.txt:586-603 — src/prefill/prefill.cpp を含む strata_prefill ライブラリと strata 実行ファイルの構成。
-- src/program/generate.cpp:12460-12489 — prefill の初期化と prompt 入力に対する prefill.run() 呼び出し。
-- src/prefill/prefill.cpp:2860-2872 — MoE router の計算後にある研究用フックの説明。
-- src/prefill/prefill.cpp:2873-2885 — 関連する2変数の static 読み取り、条件判定、既定リスト、カンマ分割と atoi による選択。
-- src/prefill/prefill.cpp:2904-2921 — chunk ごとの同期、header・ID・重み・選択層の hidden state の出力。
-- src/prefill/prefill.cpp:2923-2927 — 同じブロック内で行うルーティング上書き。STRATA_DBG_ROUTE_OVERRIDE はこのフックを有効にするもう一つの条件である。
+- `engine/src/prefill/prefill.cpp:5577-5603` — MoE の router 処理後にある debug hook、設定有無の guard、対象変数の直接読み取り、既定値、comma split・`atoi`・範囲判定。
+- `engine/src/prefill/prefill.cpp:5622-5639` — 層番号の `& 63` 判定、dump header、ids / weights と選択層の router-input hidden state の書き込み。
+- `engine/src/prefill/prefill.cpp:8205-8209, 9657-9705` — debug dump 設定時の layer-major 不適用と、通常 `run_impl` への経路。
+- `engine/src/prefill/prefill.cpp:9633-9650` — Metal prefill が共通 `run_impl` の分岐より前に return する経路。

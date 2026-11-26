@@ -1,43 +1,50 @@
 # `STRATA_DF2_GEMM4`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。Strata checkout は `## main...origin/main` で、未コミット変更はありません。外部ライブラリの環境変数は対象外です。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-DFlash2 drafter が Q4_0 重みの GEMM を実行するときに、行の分割方法などが異なる GEMM kernel variant を選びます。CUDA/HIP では既定の自動選択または従来型の kernel を選べ、10 以上を指定すると該当 variant ID を選びます。SYCL では既定 variant を使うか、対応する variant ID を直接選びます。Q8 重みの CUDA/HIP GEMM にはこの変数は使われません。`src/kernels/cuda/dflash2.cu:1031-1034,1079-1086`、`sycl/src/kernels/cuda/dflash2.dp.cpp:702-718`。
+DFlash2 drafter の Q4_0 重み GEMM で使う CUDA/HIP または SYCL のカーネル variant を選ぶ、診断・調整用の環境変数です。通常値 0 は backend ごとの自動 variant を選び、非ゼロ値は固定 variant を選ぶための値として読み取られます。CUDA/HIP では 1〜9 相当の非ゼロ値は variant 1 にまとめられ、10 以上は値を variant ID として渡します。SYCL では非ゼロ値をそのまま switch に渡します。対象は Q4_0 GEMM のカーネル選択で、DFlash2 の他の計算・生成制御を直接変更する読み取りはありません（`engine/src/kernels/cuda/dflash2.cu:1859-1861`、`engine/sycl/src/kernels/cuda/dflash2.dp.cpp:702-718`）。
+
+DFlash2 自体は `--draft dflash2` と Q4_0 の draft pack を使う経路です（SYCL generate の説明: `engine/sycl/src/program/generate.cpp:785-788,927-929`）。CUDA/HIP 実装は Q4_0 分岐のときだけこの変数を参照し、Q8_0 は後続の別分岐です（`engine/src/kernels/cuda/dflash2.cu:1859-1908`）。
 
 ## 値と判定
 
-両実装とも `std::getenv()` の結果を `std::atoi()` に渡し、未設定なら整数 `0` にします。文字列全体の妥当性検査はありません。`atoi` のため、先頭の空白と符号の後の数値部分が変換され、数値の後ろに文字があっても数値部分が使われます。空文字や数値として読めない文字列は `0` になります。したがって、たとえば `12junk` は `12`、`junk` は `0` として扱われます。`src/kernels/cuda/dflash2.cu:1032`、`sycl/src/kernels/cuda/dflash2.dp.cpp:716`。
+両実装とも `std::getenv` の戻り値が null なら 0、それ以外は `std::atoi` に渡します。空文字も `atoi("") == 0` となり自動選択です。数値全体の妥当性検査、値域検査、clamp はありません。`atoi` は先頭の空白と符号を許し、数字の後ろの文字列を検査しないため、`" 10tail"` は 10、`"0anything"` は 0、`"true"` は 0 として扱われます。大文字小文字は文字列比較に使われません。数値として読めない接頭部も 0 になります。数値範囲外の入力に対する安全な fallback は実装されていません（`engine/src/kernels/cuda/dflash2.cu:1860-1861`、`engine/sycl/src/kernels/cuda/dflash2.dp.cpp:716-717`）。
 
-| ビルド | unset / 0 | 非ゼロの指定値 |
-|---|---|---|
-| CUDA/HIP | 自動選択（`DF2_Q4_AUTO(rows)`） | 1〜9 および負値はすべて variant 1 相当。10 以上は整数値を variant ID として使う。実装にない ID は switch の既定経路へ進む。 |
-| SYCL | 自動選択（既定 macro は rows が 1024 以下なら 40、超えるなら 41） | 整数値を variant ID として使う。対応 ID は 10, 11, 12, 17, 24, 25, 28, 34, 40, 41, 42, 43。それ以外は variant 28 の kernel を使う。 |
+| backend / 条件 | unset・空文字・atoi 結果 0 | 有効になる値の例 | その他の値の扱い |
+|---|---|---|---|
+| CUDA/HIP、Q4_0、固定 variant が未指定 | 自動選択。CUDA は 17。HIP の RDNA3/RDNA4 (Wave32) は rows ≤ 640 なら 31、それ以外は 26 | `1`、`2`、`9`、`-1` はいずれも `v4=1`。10〜45 の実装済み ID はその variant | 10 以上で実装されていない ID は switch の default kernel。`STRATA_DF2_GEMM_TC` 条件を満たす CUDA 経路ではこの変数の分岐に到達しない |
+| SYCL、Q4_0、固定 variant が未指定 | 自動選択。rows ≤ 1024 は 40、それ以外は 41 | 実装済み ID: 10, 11, 12, 17, 24, 25, 28, 34, 40, 41, 42, 43 | その他の非ゼロ ID（例: 1、2、13、44、-1）は default の `gemm4_nc<1,1,2>` に進む（コメント上の ID 28） |
 
-CUDA/HIP の環境値が 0 以外で 10 未満なら `v4=1` になりますが、switch に `case 1` はありません。そのためこの経路では switch の `default` が実行され、rows が 32 の倍数なら `gemm4_kernel<4>`、そうでなければ `gemm4_kernel<2>` を起動します（従来型）。10〜45 はそれぞれ `gemm4_rows_kernel<W,R,U>` の variant に対応します。10〜45 の範囲外の値も同じ switch の既定経路に落ちます。`src/kernels/cuda/dflash2.cu:1032-1078`。
-
-SYCL は switch に列挙した variant ID だけを専用 kernel に対応させています。未対応値は `gemm4_nc<1,1,2>`、すなわち variant 28 相当の kernel に進みます。環境値 0 の自動選択は `DF2_Q4_AUTO(rows)` で、ソース既定では rows が 1024 以下なら 40、それ以外は 41 です。`src/kernels/cuda/dflash2.dp.cpp:698-700,716-732`。
-
-CUDA/HIP の環境値 0 の自動選択は、ソース既定で HIP の gfx12 なら rows 640 以下で 31、超える場合は 26、それ以外の CUDA/HIP GPU では 17 です。`DF2_Q4_AUTO` が外部のコンパイル定義で上書きされていない場合の規則です。`src/kernels/cuda/dflash2.cu:998-1016`。
+CUDA/HIP の自動 variant は `df2_q4_auto` で選び、通常は 17、HIP の対象 RDNA 世代だけ行数に応じて 31/26 です。SYCL の既定は 40/41 です（`engine/src/kernels/cuda/dflash2.cu:1769-1785`、`engine/sycl/src/kernels/cuda/dflash2.dp.cpp:698-700,717-731`）。
 
 ## 有効になる条件
 
-- CUDA/HIP の DFlash2 kernel は CUDA または HIP build の `strata_kernels` に含まれます。SYCL build は別の `sycl/src/kernels/cuda/dflash2.dp.cpp` を含みます。Metal build には DFlash2 kernel がありません。`CMakeLists.txt:431-436,485-525`、`sycl/CMakeLists.txt:245-259`。
-- 変数を読む GEMM 分岐は Q4_0 重みの場合だけです。CUDA/HIP では `mats[0].q4` が true の分岐内で読みます。SYCL は Q4_0 専用で、非 Q4 入力は `df2_gemm` の検査で例外になります。`src/kernels/cuda/dflash2.cu:1017-1033`、`sycl/src/kernels/cuda/dflash2.dp.cpp:702-717`。
-- GEMM は 1〜3 個の行列、`n_in` が 512 の倍数、`ncols` が 1〜8、各行列の `n_out` が 16 の倍数である形状を受け付けます。CUDA/HIP では同一呼び出し内で量子化形式を揃える必要があります。これらを満たさない形状は環境変数の値によらず `std::invalid_argument` になります。`src/kernels/cuda/dflash2.cu:1017-1025`、`sycl/src/kernels/cuda/dflash2.dp.cpp:702-710`。
-- 通常のアプリ経路では DFlash2 drafter の GEMM 呼び出し時に使われます。DFlash2 自体は `--draft dflash2` と draft model pack などを要する機能です。ベンチ用の `df2_gemm_variant(v)` が非 0 の値を設定している場合は、環境変数よりその明示値が優先されます。`src/core/dflash2.cpp:404-415`、`sycl/src/core/dflash2.cpp:319-330`、`src/kernels/cuda/dflash2.cu:21,995,1032-1034`、`sycl/src/kernels/cuda/dflash2.dp.cpp:37,716-718`、`src/program/generate.cpp:1157-1165`。
+- DFlash2 の GEMM 呼び出しで Q4_0 の重みが使われている必要があります。CUDA/HIP では `mats[0].q4` が true の分岐でのみ読み取ります。Q8_0 GEMM では `STRATA_DF2_GEMM` 側の分岐です（`engine/src/kernels/cuda/dflash2.cu:1859-1908`）。
+- SYCL 実装は Q4_0 pack 専用で、Q8_0 の行列は `df2_gemm` が `df2_gemm: the SYCL drafter runs the Q4_0 pack only` を投げます（`engine/sycl/src/kernels/cuda/dflash2.dp.cpp:702-710`）。
+- ベンチ用 setter `df2_gemm_variant(v)` が非ゼロ値を設定している場合、その値が環境変数より優先されます。実装のグローバル値は初期値 0 で、setter はベンチ用途と記されています（`engine/src/kernels/cuda/dflash2.cu:26,1762`、`engine/sycl/src/kernels/cuda/dflash2.dp.cpp:37,735`、宣言: `engine/include/strata/kernels/dflash2.hpp:61-66`）。通常の CLI / server 設定からこの setter を呼ぶ参照は見つかりませんでした。
+- CUDA（HIP コンパイルを除く）では、`STRATA_DF2_GEMM_TC` が設定され、空文字でなく先頭文字が `0` でもなく、GPU compute capability major ≥ 8、`g_gemm_variant == 0`、`ncols >= 2`、rows ≥ 1024 かつ rows が 16 の倍数なら Tensor Core GEMM が先に実行され、この環境変数は評価されません（`engine/src/kernels/cuda/dflash2.cu:1836-1857`）。
+- CUDA で `ncols > 8` の場合、先に batch Tensor Core GEMM が成立すればそこで終了します。成立しない場合は列を最大 8 ずつに分けて再帰呼び出しするため、再帰先で Q4_0 の環境変数分岐に到達することがあります（`engine/src/kernels/cuda/dflash2.cu:1801-1834`）。SYCL は `ncols` が 1〜8 の範囲外なら unsupported shape 例外です（`engine/sycl/src/kernels/cuda/dflash2.dp.cpp:702-703`）。
 
 ## 実行時の詳細
 
-環境変数は GEMM 関数内の関数ローカル `static const int` に保存されます。CUDA/HIP では Q4 GEMM 分岐に初めて入った時、SYCL では `df2_gemm` の初回呼び出し時に読み取ります。以後プロセス内で環境を変更しても再評価されません。CUDA/HIP で先に Q8 GEMM を呼んでも、この変数の読み取りは起きません。`src/kernels/cuda/dflash2.cu:1031-1033`、`sycl/src/kernels/cuda/dflash2.dp.cpp:716-718`。
+値は `df2_gemm` 内の関数ローカル `static` 初期化子で最初にその Q4_0 分岐を通った時に一度だけ読み取られます。同じプロセス内の後続 GEMM 呼び出しはキャッシュ値を使うため、初回読み取り後に環境を変更しても反映されません。CUDA/HIP と SYCL は別々の実装・別々の static 値です（`engine/src/kernels/cuda/dflash2.cu:1859-1861`、`engine/sycl/src/kernels/cuda/dflash2.dp.cpp:714-718`）。
 
-値は GEMM の kernel 選択だけに使われ、変数値や選択 variant を出力する専用ログ、無効値の警告、値の clamp はありません。形状検査に失敗すれば `df2_gemm: unsupported shape` などの例外になります。CUDA 実装では kernel 起動直後の `check("gemm4")` が launch error を検出すると、`dflash2 kernel gemm4: <CUDA error>` を stderr に出して `std::runtime_error` を投げます。環境変数の値自体がそのエラーを発生させるかどうかは、GPU 上で実行しない調査では確認していません。`src/kernels/cuda/dflash2.cu:24-29,1017-1025,1077`、`sycl/src/kernels/cuda/dflash2.dp.cpp:702-710`。
+CUDA/HIP は 10〜45 の variant ID に対して `gemm4_rows_kernel` の template 配置を起動し、ID 2 は旧 `gemm4_kernel<2>`、未知の ID は行数の 32 倍数条件で `gemm4_kernel<4>` または `<2>` に fallback します。環境変数の 1〜9 は `v4=1` となって switch default に入り、同じ基本 GEMM kernel を選びます（`engine/src/kernels/cuda/dflash2.cu:1862-1905`）。
+
+SYCL は switch によって列挙された variant を専用 GEMM template に割り当て、それ以外は `gemm4_nc<1,1,2>` を実行します。環境変数値が不正でも警告やエラーにはせず、switch の default に進みます（`engine/sycl/src/kernels/cuda/dflash2.dp.cpp:718-732`）。
+
+## ログと測定値
+
+variant の選択や環境変数値を表示する専用ログはありません。CUDA/HIP の GEMM launch 後は `check("gemm4")` が CUDA エラーを調べ、失敗時は stderr に `dflash2 kernel gemm4: <CUDA error text>` を出して例外を投げます（`engine/src/kernels/cuda/dflash2.cu:29-34,1904-1905`）。Tensor Core 経路のエラー識別子は `gemm4_tc` または `gemm4_batch_tc` です（`engine/src/kernels/cuda/dflash2.cu:1814-1817,1848-1852`）。SYCL 側にはこの環境変数専用のログはありません（`engine/sycl/src/kernels/cuda/dflash2.dp.cpp:716-732`）。
+
+この変数の値ごとの性能測定値は記載しません。CUDA ソースの近傍コメントには特定 GPU・行列サイズでのベンチ結果がありますが、環境変数の各値との対応を一般利用条件として裏付ける資料ではありません（`engine/src/kernels/cuda/dflash2.cu:1765-1768`）。
 
 ## 根拠
 
-- 候補名の Strata ソース全体検索では、値の読み取りは `src/kernels/cuda/dflash2.cu:1032` と `sycl/src/kernels/cuda/dflash2.dp.cpp:716` の 2 箇所です。どちらも直接 `getenv` / `atoi` を使い、環境名を渡す helper はありません。
-- CUDA/HIP の選択と起動: `src/kernels/cuda/dflash2.cu:998-1016,1017-1078`。
-- SYCL の選択と起動: `sycl/src/kernels/cuda/dflash2.dp.cpp:698-732`。
-- DFlash2 実行経路から GEMM への呼び出し: `src/core/dflash2.cpp:404-415`、`sycl/src/core/dflash2.cpp:319-330`。
-- build 条件: `CMakeLists.txt:431-436,485-525`、`sycl/CMakeLists.txt:245-259`。
+- `engine/src/kernels/cuda/dflash2.cu:1787-1908` — CUDA/HIP GEMM の入力制約、Q4_0 判定、Tensor Core 優先経路、`STRATA_DF2_GEMM4` 読み取りと variant dispatch。
+- `engine/src/kernels/cuda/dflash2.cu:26,29-34,1762,1769-1785` — setter の初期値・用途、エラー出力、自動選択。
+- `engine/sycl/src/kernels/cuda/dflash2.dp.cpp:698-735` — SYCL Q4_0 GEMM の入力制約、読み取り、既定 variant、dispatch。
+- `engine/include/strata/kernels/dflash2.hpp:61-68` — variant setter と GEMM interface、Q4_0 データ形式。
+- `engine/sycl/src/program/generate.cpp:785-788,925-929` — SYCL generate の DFlash2 起動条件の説明。

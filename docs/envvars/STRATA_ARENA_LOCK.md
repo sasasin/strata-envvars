@@ -1,89 +1,56 @@
 # `STRATA_ARENA_LOCK`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-expert arena（ホスト側の RAM に置いた expert 重み）を、GPU に page-lock できなかった部分について、OS 側で resident に保つかどうかを決める。Strata は `cudaHostRegister`（HIP では `hipHostRegister`）で arena を page-lock しようとし、それが失敗するか上限で切られた場合、残りの領域を `strata::platform::lock_resident()` で lock する（Windows: プロセスの minimum working set を上げて `VirtualLock`、Linux: `mlock`）。
+GPU 用 expert arena のうち、GPU driver に登録されず pageable のまま残る host RAM を、プロセスの resident memory としてロックするかを選ぶ。CUDA/HIP 実装では、UMA モードで arena 全体が未登録になる場合、通常登録の一部が拒否された場合、または by-need 登録の穴がある場合に関係する。通常の全域登録が完了した arena の登録範囲には作用しない。ロックは `lock_resident` / `lock_resident_ranges` による Windows の working-set minimum + `VirtualLock`、または Windows 以外の `mlock` で行われる（`engine/src/core/pinned.cu:1056-1085,1134-1143,1160-1173,1213-1271`, `engine/src/platform/memory.cpp:25-59,62-102,164-183`）。
 
-この lock は DMA を可能にするものではない。GPU が直接読めるのは `registered_bytes`（登録できた prefix）だけで、lock された領域は CPU 側の expert pool が読む分として物理 RAM に留まる。実装注釈は、lock しないと Windows が memory pressure の下で arena を trim し、CPU pool の速度が OS 依存になる、と説明している（`src/core/pinned.cu:439-441`、`include/strata/platform/memory.hpp:3-6`）。
-
-読み取り箇所は `src/core/pinned.cu` の 3 箇所と、その SYCL 移行コピー `sycl/src/core/pinned.dp.cpp` の対応 3 箇所のみ。Python サーバー・setup・同梱ツールはこの名前を読まない。
+CUDA/HIP と SYCL に読み取り箇所があるが、コード上の適用条件は同じではない。SYCL は `engine/sycl/src/core/pinned.dp.cpp` の arena 実装を使い、CUDA/HIP の UMA 未登録分岐は持たない（`engine/sycl/src/core/pinned.dp.cpp:366-402,459-468,500-510,557-566`）。
 
 ## 値と判定
 
-`std::getenv("STRATA_ARENA_LOCK")` の結果を、`nullptr` か、文字列全体が `"0"` と等しいかで判定する。`atoi`、先頭文字比較、大小文字の正規化はない。
+数値・真偽値として parse せず、文字列全体が厳密に `0` と一致するかで判定する。大文字小文字、空白、数値としての妥当性は検査しない。したがって空文字列、`00`、`0anything`、`false`、`true`、` 0` はすべて「ロックする」側である。文字列比較は CUDA/HIP の通常経路で `std::string(env) != "0"`、Linux HIP の KFD NOREG 経路では `arena_lock_wanted` が同じ完全一致規則を使う（`engine/src/core/pinned.cu:1076-1082,1135-1143,1163-1172,1253-1269`, `engine/include/strata/core/kfd_quiet.hpp:118-123`）。
 
-| 状態 | 判定 |
-|---|---|
-| 未設定（`nullptr`） | lock を実行（既定） |
-| `"0"` | lock をスキップ |
-| 空文字 `""` | lock を実行（`std::string("") != "0"`） |
-| `"1"`, `"true"`, `"false"`, `"00"`, `"0x"`, `" 0"`, `"0anything"` | lock を実行（`"0"` と完全一致しない） |
+| 経路 | unset | ロックする値の例 | ロックしない値の例 |
+|---|---|---|---|
+| CUDA/HIP: 未登録の arena、部分登録の残り、by-need 登録の穴 | 通常はロック。Linux HIP の KFD NOREG が有効な未登録 arena だけはロックしない | 空文字、`1`、`true`、`00`、`0anything`、` 0` | 厳密に `0` |
+| SYCL: pin cap による登録の残り | ロック | 空文字、`1`、`true`、`00`、`0anything`、` 0` | 厳密に `0` |
+| SYCL: cap なしの全域経路 | この変数を参照せず、分岐に入らない | 該当なし | 該当なし |
 
-判定式は `env == nullptr || std::string(env) != "0"`（`src/core/pinned.cu:417,445,488`）。したがって「`0` だけが無効」で、他のあらゆる文字列は有効（lock 実行）側になる。
-
-値が `"0"` でも、lock 自体が走らない条件（下の「有効になる条件」）がある。
+Linux HIP の KFD NOREG の既定では、未設定は「ロックしない」、明示した値は `0` のときだけ「ロックしない」。それ以外の CUDA/HIP 対象経路では未設定は「ロックする」。大きなページ (`PageBacking::LargePages`) の場合は値にかかわらずロック処理を飛ばす（`engine/src/core/pinned.cu:1059-1083,1135-1143,1163-1173,1253-1271`, `engine/include/strata/core/kfd_quiet.hpp:120-123`, `engine/sycl/src/core/pinned.dp.cpp:459-468,500-510,557-566`）。
 
 ## 有効になる条件
 
-この変数は、arena の登録が不完全だったときだけ参照される。
-
-- `cudaHostRegister` が成功して arena 全体が登録された場合（`registered_bytes == bytes`）、lock 分岐には入らない。変数は読まれない。
-- `backing == PageBacking::LargePages` の場合、値に関係なく lock は実行されない。large pages は paging されないため、という注釈がある（`src/core/pinned.cu:415-416,443-444,486-487`）。Linux では `MAP_HUGETLB` が成功したとき、Windows では `MEM_LARGE_PAGES` が成功したときこの backing になる。
-- `STRATA_ARENA_MMAP=1`（Linux）で選ばれる file mapping の arena は `PinnedArena` を使わない。その note は "not locked, not pinned" と言い、この変数は効かない（`src/core/expert_source.cpp:4454-4476`）。
-
-読み取り箇所は 3 経路に分かれる。
-
-1. 全体登録の失敗、または cap による sliced fallback の remainder（`src/core/pinned.cu:413-423`）。cap は `max_pinned_bytes`（multi-GPU under WDDM、remote experts）か `STRATA_ARENA_PIN_GIB`（`arena_pin_cap_gib()`、`src/core/pinned.cu:299-305`）。Windows で `STRATA_ARENA_PIN_GIB=auto` の場合、`sliced_pin_limit()` が limit を決める（`src/core/pinned.cu:314-336`）。
-2. `bounds.size() < 2` の場合（登録失敗時の "the arena is NOT pinned, so copies will be slow" 分岐、`src/core/pinned.cu:424-452`）。エンジンの arena は layer ごとに bounds を持つので `n_layers >= 1` で常に size >= 2（`src/core/expert_source.cpp:4522-4528`）。この分岐は bounds なしで arena を作る同梱ツール（`strata-load`、`strata-overlap`、`strata-concurrent`）の経路で到達する。
-3. `register_slices()` の deferred registration（`src/core/pinned.cu:484-493`）。Windows で `STRATA_DEFERRED_REGISTER` が有効なときだけこの経路が使われる（`src/core/expert_source.cpp:4535-4542`）。
-
-「arena lock disabled (STRATA_ARENA_LOCK=0)」という note が出るのは 2 の分岐だけ。1 と 3 は無効時に note を何も追加しない（lock の結果文字列だけが付く）。
-
-同じ名前の判定は SYCL 移行コピーにもあるが、そのファイルでは `cudaHostRegister` が DPCT により `0 != 0` に置換され、常に「成功」扱いになる。そのため SYCL ビルドで lock 分岐に到達するのは capped 経路（`STRATA_ARENA_PIN_GIB=N` など）のときだけである（`sycl/src/core/pinned.dp.cpp:384-396,418-426,453-463,550-559`）。CUDA/HIP は `src/core/pinned.cu` をそのまま使う（`CMakeLists.txt:293`、`cmake/hip_backend.cmake:114-121`）。
+- **CUDA/HIP で arena を使うこと。** `--mmap-experts` はファイルから expert を読む経路、`--stream-experts` は host arena を持たない経路なので、この arena lock の読み取り経路には入らない（CUDA/HIP: `engine/src/program/generate.cpp:8621-8635,8871-8900`; SYCL: `engine/sycl/src/program/generate.cpp:4711-4758`）。
+- **ロック対象の未登録メモリが残ること。** CUDA/HIP で全域登録が成功すれば、`STRATA_ARENA_LOCK` の値に関係なく登録範囲を lock しない。driver 登録の拒否・上限による部分登録後は残りを lock するが、厳密な `0` なら行わない（`engine/src/core/pinned.cu:1096-1143,1145-1173`）。by-need 登録では登録穴を lock 対象とする（`engine/src/core/pinned.cu:1213-1271`）。
+- **UMA の未登録モード。** CUDA/HIP では `arena_no_register()` が true のとき全 arena が未登録となり、この変数の通常の全体 lock 判定に入る。明示された `STRATA_ARENA_PIN_GIB` は engine の既定フラグより優先し、`none` は未登録、空でない他の値（`0` を含む）は登録側になる（`engine/src/core/pinned.cu:611-620`, `engine/include/strata/core/kfd_quiet.hpp:111-115`）。engine が未登録を既定選択するのは統合 GPU の Windows gfx1151、または設定が有効な Linux gfx1103 である（`engine/src/core/arch_defaults.cpp:140-149`）。
+- **Linux HIP の Radeon 780M 系 NOREG 既定。** KFD quiet の NOREG が有効な場合にのみ、このクラスの未登録 arena は未設定で lock を省く。`STRATA_KFD_QUIET` / `STRATA_KFD_QUIET_NOREG` のスイッチや `STRATA_UMA_REGISTER=1` が既定を変え、`STRATA_ARENA_PIN_GIB` の明示値も arena の登録モードを決める（`engine/src/program/generate.cpp:4337-4354`, `engine/include/strata/core/kfd_quiet.hpp:104-123`）。`STRATA_ARENA_LOCK` に `0` 以外を明示すると、NOREG 既定でも lock を要求する。
+- **SYCL の適用は狭い。** pin cap により通常登録の残りを扱う分岐でのみ値を読む。cap なしの分岐は `e = 0` として全 bytes を登録済みと扱い、変数を参照しない。Windows の deferred registration では、登録に失敗して残りが生じた場合だけ `register_slices()` が値を読む（`engine/sycl/src/core/pinned.dp.cpp:380-402,459-468,500-510,530-566`）。
+- `STRATA_DEFERRED_REGISTER` が Windows の deferred 経路を選ぶ場合、値の読み取りは arena 構築時ではなく、`register_slices()` が未登録の末尾を処理するときになる。同経路は cap なし・共有 arena なし等の条件にも制約される（`engine/src/core/expert_source.cpp:3434-3449,6742-6759`; `engine/src/core/pinned.cu:1295-1322`; `engine/sycl/src/core/expert_source.cpp:3434-3449`; `engine/sycl/src/core/pinned.dp.cpp:530-567`）。
+- 上記の標準的な arena lock 呼び出しは大きなページを使うと省略される（CUDA/HIP: `engine/src/core/pinned.cu:1064-1067,1135-1140,1163-1167,1253-1257`; SYCL: `engine/sycl/src/core/pinned.dp.cpp:461-468,501-505,558-566`）。
 
 ## 実行時の詳細
 
-読み取りは arena の構築時（モデルロード時）に各箇所で `std::getenv` を呼ぶ。`static` cache はなく、arena ごとに判定される。Python サーバーは `dict(os.environ)` を engine 子プロセスへ渡すので、サーバーの環境に設定した値は engine に届く（`serve/server.py:2557,671-672`）。
+通常の CUDA/HIP 経路では `PinnedArena` の構築中に arena が確保された後、登録方式に応じて `getenv` し、未登録全体・部分登録末尾・by-need の穴をロックするか決める。Windows の deferred 経路では、予約だけ行う構築時には読まず、後で `register_slices()` が登録できなかった末尾をロックするときに読む。SYCL の非 deferred 経路も構築中に cap 残部を扱うときだけ読む（`engine/src/core/pinned.cu:1030-1085,1134-1173,1177-1271,1274-1322`; `engine/sycl/src/core/pinned.dp.cpp:366-402,459-510,519-567`）。
 
-`lock_resident()` の実装:
+`STRATA_ARENA_LOCK` 自体を `static` に保存する箇所はなく、各対象分岐で `getenv` の結果を使う。よってプロセス起動後でも、該当分岐が実行される前の環境変更は反映され得る。分岐を通過した後の変更は、既に行ったロックを遡って切り替えない。通常の arena 構築はモデル読込中に進み、Windows deferred では登録スレッドで後から評価される（`engine/src/core/pinned.cu:1059,1135,1163,1253,1312`; `engine/sycl/src/core/pinned.dp.cpp:460,500,557`; `engine/src/core/expert_source.cpp:3434-3449`）。
 
-- Windows（`src/platform/memory.cpp:23-60`）: `GetProcessWorkingSetSizeEx` で現在の min/max を取り、minimum を `bytes + 512 MiB` に上げて `SetProcessWorkingSetSizeEx`（hard limit flags は DISABLE）。その後 1 GiB chunk で `VirtualLock`。途中で失敗した場合は `locked_bytes` は要求より少ない（partial success を隠さず報告）。`p == nullptr || bytes == 0` は "nothing to lock"。
-- Linux（`src/platform/memory.cpp:121-129`）: `mlock(p, bytes)`。失敗時は `locked_bytes = 0`、note は "mlock failed (raise ulimit -l)"。成功時は要求どおり全部。
-- 解放は arena destructor で `unlock_resident()`（`src/core/pinned.cu:498-511`）。Windows の `unlock_resident` は `VirtualUnlock` だけで、working set minimum は元に戻さない（`src/platform/memory.cpp:62-67`）。
+lock helper が失敗しても、それ自体は例外や engine 終了にせず `LockResult.note` と `locked_bytes` を返す。Linux/macOS 等の POSIX 経路では `mlock` 失敗時に `mlock failed (raise ulimit -l)`、Windows では working-set API または `VirtualLock` の失敗位置を note にする（`engine/src/platform/memory.cpp:25-59,62-102,164-183`）。
 
-lock された領域は `PinnedArena::locked_bytes` に記録され、`note` の先頭に lock の結果文字列が前置される（`note = lr.note + "; " + note`）。この note はエンジンの起動時 print に出る: `strata generate: expert arena: <note>`（`src/program/generate.cpp:4723`、`note_ = a->note` は `src/core/expert_source.cpp:4649`）。同梱ツール `strata-load` は `backing: <note>` として出す（`src/core/load_main.cpp:57`）。
+## ログと測定値
 
-この変数は他の lock 使用箇所には影響しない。file tier の complement arena の lock（`src/core/expert_source.cpp:3016-3018`）と PLE table の lock（`src/kernels/ngram.cpp:342-343`）は `lock_resident()` を無条件で呼ぶ。
+通常の generate 経路は arena の note を stderr に `strata generate: expert arena: %s\n` と出す。note には `mlock` / `locked ... via working-set minimum + VirtualLock`、lock 失敗の文言、または無効化時の `arena lock disabled (STRATA_ARENA_LOCK=0); ` が含まれることがある。全域登録が成功した場合はこの変数の値を示す専用ログはない（CUDA/HIP: `engine/src/program/generate.cpp:8934-8937`; SYCL: `engine/sycl/src/program/generate.cpp:4780-4785`; note 生成: `engine/src/core/pinned.cu:1064-1084,1071,1081,1253-1269`; `engine/sycl/src/core/pinned.dp.cpp:500-510`）。
 
-## 観測できる結果
+Linux HIP NOREG の未設定時は lock も無効化 note も出さない。`STRATA_TRACE` が設定されていて NOREG を選んだときは、別途 `strata trace: kfd quiet: expert arena not registered with the driver, no mlock (%s)\n` が stderr に出る（`engine/src/core/pinned.cu:1060-1072`; `engine/src/program/generate.cpp:4352-4354`）。
 
-note に現れる文字列（実装上の文言）。
-
-- lock 実行時（Windows 成功）: `locked <N> MiB via working-set minimum + VirtualLock`
-- lock 実行時（Linux 成功）: `mlock`
-- lock 失敗（Linux）: `mlock failed (raise ulimit -l)`
-- lock 失敗（Windows）: `GetProcessWorkingSetSizeEx failed (error <n>)`、`SetProcessWorkingSetSizeEx(<n> MiB) failed (error <n>)`、`VirtualLock stopped at <x> of <y> MiB (error <n>)`、`nothing to lock`
-- 無効（`"0"`）: `arena lock disabled (STRATA_ARENA_LOCK=0); ` — bounds なし経路のみ
-- large pages: `large pages are resident without a lock; ` — 値によらずこの文言
-
-エラーや終了は発生しない。判定結果は起動時の arena note として見えるだけで、lock 失敗も警告ではなく note の一部である。
-
-## docs との照合
-
-`docs/` に `STRATA_ARENA_LOCK` の記載はない（リポジトリ全体でこの名前は `src/core/pinned.cu` と `sycl/src/core/pinned.dp.cpp` にしか出現しない）。設計意図はコード注釈にある: plan v0.3 P0.1 の "A/B arm" として `STRATA_ARENA_LOCK=0` が挙げられ、`include/strata/platform/memory.hpp:3-6` に「Windows が 31.6 GiB の arena を register を拒否し、lock していない arena は memory pressure で trim され、CPU pool が run ごとに 2x 振れた」とある。これはヘッダの注釈であり、測定環境（機種・OS・モデル・回数）は示されていない。
+Strata の資料・ソースコメントに、この変数単独の再現可能な測定値は見つからなかったため、速度やメモリ量の効果は記載しない。
 
 ## 根拠
 
-- 読み取り: `src/core/pinned.cu:414,442,485`、`sycl/src/core/pinned.dp.cpp:454,494,551`
-- 判定式と note 文言: `src/core/pinned.cu:417,445,488`、`src/core/pinned.cu:450`、`src/core/pinned.cu:416,444,487`
-- lock の実装（Windows/Linux）: `src/platform/memory.cpp:23-60,121-129`、解放 `src/platform/memory.cpp:62-67,131-133`
-- `LockResult` と `locked_bytes` の意味: `include/strata/platform/memory.hpp:14-24`、`include/strata/core/pinned.hpp:36`
-- 経路 2 がツール専用になる理由: `src/core/expert_source.cpp:4522-4528`、`src/core/load_main.cpp:52-57`、`src/core/overlap_main.cpp:69`、`src/core/concurrent_main.cpp:82`
-- 経路 3 の条件: `src/core/expert_source.cpp:4535-4542,4571-4577`
-- cap と `STRATA_ARENA_PIN_GIB` の関係: `src/core/pinned.cu:299-305,314-336,367-375`
-- large pages の backing: `src/core/pinned.cu:89-113`（Windows）、`src/core/pinned.cu:205-234`（Linux）
-- 起動時 print: `src/program/generate.cpp:4723`、`src/core/expert_source.cpp:4649`
-- 影響しない lock 使用箇所: `src/core/expert_source.cpp:3016-3018`、`src/kernels/ngram.cpp:342-343`
-- 設計注釈: `src/core/pinned.cu:439-441`、`include/strata/platform/memory.hpp:3-6`
+- 全ての実装読み取り箇所: `engine/src/core/pinned.cu:1059,1135,1163,1253,1312`; `engine/sycl/src/core/pinned.dp.cpp:460,500,557`。名前だけのコメント・設定 registry・テスト参照は実装の読み取りとは区別した。
+- 値判定と Linux HIP NOREG 既定: `engine/include/strata/core/kfd_quiet.hpp:118-123`; `engine/src/core/pinned.cu:1059-1083`。
+- arena 登録状態の決定: `engine/src/core/pinned.cu:611-629`; `engine/src/core/arch_defaults.cpp:140-149`; `engine/src/program/generate.cpp:4326-4354`。
+- lock と失敗時 note: `engine/src/platform/memory.cpp:25-59,62-102,164-183`。
+- SYCL 固有の cap 経路: `engine/sycl/src/core/pinned.dp.cpp:366-402,459-510,530-567`。
+- CLI による arena 非使用経路と起動ログ: `engine/src/program/generate.cpp:8621-8635,8871-8900,8934-8937`; `engine/sycl/src/program/generate.cpp:4711-4758,4776-4785`。

@@ -1,43 +1,48 @@
 # `STRATA_SH_FORK_LATE`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Verifier の MoE layer で、shared expert の計算を別 GPU stream/queue に開始するタイミングを切り替えます。既定動作（有効）では router と expert plan の計算、および通常経路の doorbell 公開の後に fork します。無効にすると、shared expert 側 stream/queue を layer の先頭で main 側へ依存させ、router などの前から実行可能にします。これは shared expert と GPU 側の初期処理が競合する時間をずらす制御で、router の選択式や計算自体を切り替える設定ではありません。
+shared expert の処理を専用 CUDA stream / SYCL queue に fork する機能そのものではなく、fork を開始するタイミングを選ぶ。既定（unset）では router と doorbell の処理後に開始する。値の先頭が `0` なら、router の前に開始する。該当する実装は CUDA/HIP 共通の `Verifier::record_window` と SYCL の同名処理である。`engine/src/core/verify.cpp:2615-2627`、`engine/sycl/src/core/verify.cpp:1560-1575`。
 
 ## 値と判定
 
-CUDA/HIP 共通 verifier と SYCL verifier の両方で、`record_window()` 内の関数ローカル `static const bool` として読みます。値全体を parse せず、`getenv()` の結果の先頭文字だけを見ます。
+両実装とも `std::getenv` の戻り値を関数ローカル `static const bool` に保存し、値全体の parse や数値検査はしない。unset なら `sh_fork_late_env=true`。設定されていれば `e[0] != '0'` の結果を使うので、空文字も true になり、先頭文字が文字 `'0'` の場合だけ false になる。比較は大文字小文字の影響を受けないが、空白を読み飛ばさない。`engine/src/core/verify.cpp:2617-2620`、`engine/sycl/src/core/verify.cpp:1563-1566`。
 
-| 環境変数の状態 | late fork 判定 |
-|---|---|
-| unset | 有効 |
-| 空文字 | 有効（先頭文字は `\0` で `'0'` ではない） |
-| 先頭文字が `0` | 無効（例: `0`, `0abc`） |
-| それ以外の先頭文字 | 有効（例: `1`, `true`, `false`, 空白、任意の文字列） |
+| 条件 | unset | 遅延 fork になる例 | 早い fork になる例 |
+|---|---|---|---|
+| CUDA/HIP 共通、SYCL 共通 | true（遅延） | 空文字、`1`、`true`、`false`、` 0` など先頭が `0` でない文字列 | `0`、`00`、`0anything` など先頭が `0` の文字列 |
 
-大文字小文字、数値としての妥当性、後続文字は検査されません。プロセス内で最初にこの static が評価された後は値が固定され、環境を書き換えても反映されません。CUDA/HIP と SYCL はそれぞれ別の verifier 実装に同じ判定があります。
+これは環境から直接読む設定で、対象名を読む CLI 引数や別の環境変数による上書き処理はこの実装にはない。`STRATA_SH_STREAM` は別途 fork 自体を有効にする設定であり、この変数の値判定には使われない。`engine/src/core/verify.cpp:415-424,2617-2627`、`engine/sycl/src/core/verify.cpp:253-263,1563-1575`。
 
 ## 有効になる条件
 
-late fork が実際に選ばれるには、`sh_fork` 自体が有効で、さらに `ar_on()` が false である必要があります。
-
-- `sh_fork` は `STRATA_SH_STREAM` が有効で、profiler が無効であり、shared stream と fork/join event が利用できる場合に成立します。SYCL では加えて `STRATA_VERIFY_STEPPED` が無効で、shared queue が in-order queue とは別であることが必要です。
-- `STRATA_SH_STREAM` が unset の場合、CUDA/SYCL 側の `sh_stream_on()` は有効、HIP 側は無効です。同変数を設定すると、先頭文字が `0` なら無効、それ以外は有効です。したがって HIP では通常、`STRATA_SH_STREAM` を有効にしない限り本変数の分岐は実行されません。
-- 全 expert が resident の `ar_on()` 経路では late fork は使われず、`sh_fork` が有効なら layer 先頭で fork する側になります。
-- 条件が揃わず `sh_fork` が false の場合、`STRATA_SH_FORK_LATE` による stream/queue の順序変更は起きません。
+- `sh_fork` が true であること。CUDA/HIP 共通実装では `STRATA_SH_STREAM` が有効で、profiler が無効、`sh_cs_` と fork/join event が存在することが必要。SYCL ではさらに stepped mode でないこと、`sh_cs_` が既定 in-order queue でないことが必要。`engine/src/core/verify.cpp:2621-2623`、`engine/sycl/src/core/verify.cpp:1567-1571`。
+- `STRATA_SH_STREAM` が無効なら shared expert は `cs` 上で実行され、fork のタイミング設定は実動作に影響しない。`STRATA_SH_STREAM` の値は unset 以外では先頭文字が `0` かどうかで判定され、未設定時の backend 既定は HIP で off、それ以外で on。アーキテクチャ既定がこの変数を設定する経路もある。`engine/src/core/verify.cpp:415-424`、`engine/sycl/src/core/verify.cpp:253-263`、`engine/src/core/arch_defaults.cpp:89-98`、`engine/src/core/nv_defaults.cpp:140-153`。
+- 値が遅延を選んでも `ar_on()` のときは `sh_fork_late` が false となり、早い fork に戻る。`ar_on()` は `all_resident_ && !ar_off_`。この経路は device-only / zero-doorbell graph で doorbell publish を行わないため、遅延位置を選べない。`engine/src/core/verify.cpp:2621-2627,2686-2715`、`engine/include/strata/core/verify.hpp:602`、`engine/sycl/src/core/verify.cpp:1567-1575,1612-1641`、`engine/sycl/include/strata/core/verify.hpp:370`。
+- CUDA/HIP 共通実装と SYCL 実装で判定式は同じ。サーバーモードやモデル種別に応じてこの変数自体を別解釈するコードは見つからなかった。
 
 ## 実行時の詳細
 
-値が有効で通常の非 all-resident 経路の場合、router による expert 選択と plan/doorbell 公開の後で main stream/queue の event/barrier を記録し、shared expert 用 stream/queue がそれを待つようにします。その後 `shared_expert_multi()` を shared stream/queue に投入し、join event/barrier を記録します。後続の combine 前には main stream/queue が join を待つため、shared expert の出力を使う処理より先に完了する順序を保ちます。
+値は `record_window` 内の最初の該当処理で評価される。その時点で `getenv` の値を static に保存し、以後の window / layer で再読込しないため、プロセス起動後でも初回評価後の環境変更は反映されない。読み取り時に別プロセスへ転送する処理もない。`engine/src/core/verify.cpp:2617-2622`、`engine/sycl/src/core/verify.cpp:1563-1570`。
 
-値が無効の場合（または all-resident 経路）は、layer の router より前に fork event/barrier を設定します。shared expert とその後の router/plan 処理が並行して進められる可能性があります。どちらの設定でも fork 自体が有効なら join は combine 前に行います。CUDA/HIP 共通実装では event を使い、SYCL 実装では DPCT event と queue barrier を使います。対象変数について独立したログ出力はありません。
+遅延 fork が選ばれると、GPU 側の router と doorbell publish の後に fork event を記録し、shared-expert stream/queue がその event を待つ。CUDA/HIP 共通実装は `cudaEventRecord` / `cudaStreamWaitEvent`、SYCL は queue barrier を使う。早い fork では同じ待ち合わせを router より前に置く。どちらの場合も shared expert の計算は同じ `shared_expert_multi(...)` に渡され、その後の join event/barrier を combine 側が待つ。`engine/src/core/verify.cpp:2624-2628,2708-2720,2746-2759,2939-2943`、`engine/sycl/src/core/verify.cpp:1572-1575,1622-1642,1667-1677,1803-1809`。
+
+この値が直接変更するのは stream/queue 間の順序と重なり方であり、router の選択値や `shared_expert_multi` の引数を選ぶものではない。別 stream が有効でないときは計算先もタイミングも変えない。`engine/src/core/verify.cpp:2621-2627,2731-2750`、`engine/sycl/src/core/verify.cpp:1567-1575,1653-1671`。
+
+## ログと測定値
+
+この変数の値や「早い/遅い fork」を直接表示するログは見つからなかった。CUDA/HIP 共通経路には `win ... sh_stream=%ld ...` の診断表示があるが、示すのは stream fork が有効かどうかであり、fork 位置ではない。`engine/src/core/verify.cpp:1545-1548`。shared expert の処理で例外が起きた場合は通常の verify エラー経路として `verify shared expert: <例外内容>` を `err` に設定して false を返すが、この環境変数に固有の失敗処理ではない。`engine/src/core/verify.cpp:2746-2755`、`engine/sycl/src/core/verify.cpp:1667-1676`。
+
+`docs/AMD_HIP.md:276-282` は doorbell 後に shared expert を fork する目的と stream fork 全体の測定例を記載するが、`STRATA_SH_FORK_LATE` の値ごとの比較ではないため、この変数の性能差としては記載しない。
 
 ## 根拠
 
-- 値の読み取りと late fork 条件: `src/core/verify.cpp:1418-1429`, `sycl/src/core/verify.cpp:1286-1301`。
-- router/plan/doorbell 後の late fork と shared expert 計算: `src/core/verify.cpp:1477-1507,1517-1541`, `sycl/src/core/verify.cpp:1335-1365,1370-1400`。
-- combine 前の join wait: `src/core/verify.cpp:1647-1651`, `sycl/src/core/verify.cpp:1495-1501`。
-- shared stream の既定と profiler に関する条件: `src/core/verify.cpp:184-202`, `sycl/src/core/verify.cpp:154-172`。
-- `docs/DETAILS.md` には `STRATA_SH_STREAM` への関連記述がありますが、`STRATA_SH_FORK_LATE` の挙動や効果を個別に説明する記述は確認できませんでした。
+- `engine/src/core/verify.cpp:2615-2627` — 値の読み取り、parse、fork 条件と早い fork の event。
+- `engine/src/core/verify.cpp:2708-2720` — doorbell publish 後の遅延 fork。
+- `engine/src/core/verify.cpp:2731-2759,2939-2943` — shared expert 実行と join。
+- `engine/sycl/src/core/verify.cpp:1560-1575,1622-1642` — SYCL 側の読み取りと fork event/barrier の配置。
+- `engine/sycl/src/core/verify.cpp:1644-1677,1803-1809` — shared expert 実行と join barrier。
+- `engine/include/strata/core/verify.hpp:602`、`engine/sycl/include/strata/core/verify.hpp:370` — `ar_on()` の定義。
+- `engine/src/core/verify.cpp:415-424`、`engine/sycl/src/core/verify.cpp:253-263` — `STRATA_SH_STREAM` の既定と判定。

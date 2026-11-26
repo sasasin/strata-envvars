@@ -1,48 +1,46 @@
 # `STRATA_SELECT_GEMM_MIN`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL の native prefill で QSA indexer の block score を計算するとき、oneMKL FP32 GEMM を自動選択する最小 block 数を指定します。単位は block（4 cells）です。この値だけでは GEMM を有効化せず、関連変数 `STRATA_SELECT_GEMM` が自動判定モードで、かつ GPU が Battlemage のときにだけしきい値として参照されます。
+SYCL の QSA prefill でブロックスコア計算に oneMKL GEMM を選ぶ自動判定の下限を、ブロック数で指定する。既定値は 2,048。閾値だけでは GEMM は有効にならず、自動モードでは GPU 世代が Battlemage であることも必要となる。GEMM が選ばれて実行できた場合はブロックスコアの計算方法が変わり、その後の top-k 選択へ渡されるスコアを変え得る。選択結果や生成内容が同一になる保証は、このコードからは確認できない。実装は `Prefill::run_impl` 内の QSA 選択処理にある（`engine/sycl/src/prefill/prefill.cpp:3645-3688`）。
 
 ## 値と判定
 
-`std::atoll` で符号付き整数に変換します。文字列全体の妥当性は検査しないため、先頭の空白と符号、数値の後ろの文字は `atoll` の規則に従い、数値に変換できない文字列や空文字は 0 になります。
+`std::getenv` が返す文字列を `std::atoll` で `int64_t` に変換する。環境変数が未設定なら 2,048。設定済みの空文字や数値に変換できない文字列は、変換結果 0 として扱われる。数値全体の妥当性検査、後続文字の検査、範囲 clamp はない。したがって、例えば `"12tail"` は数値接頭部 12、`" 12"` は 12、`"true"` は 0 として扱われる。数値部分のない値は 0 となる。`atoll` の表現範囲を超える入力について Strata は独自の検査やエラー処理をしていないため、その結果はここでは規定しない。閾値は `active >= sel_gemm_min` と比較される（`engine/sycl/src/prefill/prefill.cpp:3686-3688`）。
 
-| 値 | 判定結果 |
-| --- | --- |
-| 未設定 | 2048 blocks |
-| `2048` など整数として変換できる値 | 変換結果をしきい値にする |
-| 空文字、数値で始まらない文字列 | 0 blocks |
-| `0` または負数 | しきい値比較を満たしやすくする（`active` は 0 以上）。ただし自動モードと Battlemage 条件は別途必要 |
+| 判定状態 | `STRATA_SELECT_GEMM_MIN` が未設定 | 設定値の例 | 閾値条件 |
+|---|---:|---|---|
+| `STRATA_SELECT_GEMM` が未設定、または負数に変換される値（自動モード） | 2,048 | `2048` は 2,048 以上、`0`・空文字・`true` は 0 以上、`-1` は -1 以上で条件を満たす | `active` が変換後の閾値以上なら真 |
+| `STRATA_SELECT_GEMM` が 0 に変換される値 | 2,048 | `0`、空文字、`true` | この変数の閾値は使われず、自動選択は無効 |
+| `STRATA_SELECT_GEMM` が正数に変換される値 | 2,048 | `1`、`2` | この変数の閾値を問わず GEMM 選択フラグは真 |
 
-たとえば `2048tail` は 2048、`junk` は 0 として扱われます。桁あふれ時の結果には依存できません。値は関数内の `static const` に保存され、最初に QSA block selection のコードへ到達した時点で一度読み取られます。その後に同一プロセス内で環境を変更しても再評価されません。
+上表の `STRATA_SELECT_GEMM` は同じコード箇所で `std::atoi` により読み取られ、未設定時は -1 となる。設定済みで数値に変換できない文字列は 0 となり、自動ではなく GEMM 無効の分岐になる。つまり、この文書の変数が閾値として働くのは `STRATA_SELECT_GEMM` の変換結果が負数のときだけである（`engine/sycl/src/prefill/prefill.cpp:3685-3688`）。
 
 ## 有効になる条件
 
-この変数がしきい値として働くには、以下が必要です。
-
-- SYCL の `Prefill::run_impl()` で QSA layer の prefill selection を実行する。
-- `STRATA_SELECT_GEMM` が未設定、または `std::atoi` の結果が負である（自動判定モード）。
-- 対象 GPU が `IntelGpuGen::Battlemage` と判定される。
-- 現在の selection batch における `active` block 数が、この変数の値以上である。
-
-`STRATA_SELECT_GEMM` が正の値なら block 数や GPU 世代にかかわらず GEMM を選択し、0（未設定時以外）なら GEMM を選択しません。これは `atoi` 判定なので、例として `STRATA_SELECT_GEMM=invalid` も 0 になります。従って、`STRATA_SELECT_GEMM_MIN` を設定しても、`STRATA_SELECT_GEMM=0` の選択を覆しません。
-
-しきい値を満たして GEMM 選択になっても、`STRATA_SELECT_OLD` が設定されている場合、attention scratch がない場合、indexer の形状が `idx_dim == 128` かつ `idx_n_head == 4` でない場合、または計算された GEMM tile が 256 未満の場合は GEMM 経路を実行しません。tile は最大 8192 で、attention scratch の量と batch 幅から計算されます。
+- この読み取りと分岐は `engine/sycl/src/prefill/prefill.cpp` の SYCL 実装にある。CUDA、HIP、Metal の実装からこの変数を読む参照はなく、同じ動作をそれらの backend へ一般化できない（`engine/sycl/src/prefill/prefill.cpp:3685-3688`）。
+- 値が閾値条件を満たしても、自動モード（`STRATA_SELECT_GEMM` が未設定または負数）では `strata::intel_gpu_gen(...) == Battlemage` が必要。その他の世代では自動判定が偽となる（`engine/sycl/src/prefill/prefill.cpp:3687-3688`）。
+- `STRATA_SELECT_GEMM` が 0 に変換されると GEMM を選ばず、正数なら閾値に関係なく選択フラグを真にする（`engine/sycl/src/prefill/prefill.cpp:3685-3688`）。
+- `STRATA_SELECT_OLD` が設定されていると、空文字を含め `old_sel` が真になり、GEMM 実行条件 `!old_sel` を満たさない（`engine/sycl/src/prefill/prefill.cpp:3674-3675,3692`）。
+- GEMM の実行にはさらに attention scratch が存在すること、QSA の `idx_dim == 128` と `idx_n_head == 4`、計算された `sel_tile >= 256` が必要。条件を満たさない場合は GEMM を実行せず後続のスコア計算へ進む（`engine/sycl/src/prefill/prefill.cpp:3689-3693,3713-3717`）。
+- 判定位置は prefill 内の QSA 層のブロックスコア選択ループである。QSA 層がなくこの位置に到達しないモデルや、SYCL prefill を通らない経路では、この値による選択は行われない（`engine/sycl/src/prefill/prefill.cpp:3645-3668`）。CLI とサーバーモードでこの環境変数を別途優先・上書きする処理は、候補名の全参照からは確認できない。
 
 ## 実行時の詳細
 
-各 QSA selection batch で、最後の query の `n_bid + 1` を `active` として取得し、`active >= STRATA_SELECT_GEMM_MIN` を評価します。GEMM 経路では、pooled indexer keys と batch の queries の FP32 GEMM を tile ごとに実行し、その結果から `qsa_block_scores_reduce()` で block scores を作ります。その後の top-k 選択は GEMM の有無にかかわらず同じ `qsa_block_topk()` に進みます。
+閾値は `run_impl` のローカル static として初回評価時に読み込まれ、以後そのプロセス内ではキャッシュされる。したがって、最初の評価後に環境を書き換えても再読み込みされない。評価まで値を読まない実装であり、プロセス起動時の一括読み取りではない（`engine/sycl/src/prefill/prefill.cpp:2693-2695,3686`）。
 
-GEMM が利用できない場合や条件を満たさない場合は、`STRATA_SELECT_OLD` が設定されていれば warp scorer を使います。そうでなければ先に `qsa_block_scores_tc()` を試し、それが使えない場合に `qsa_block_scores()` へ fallback します。GEMM の実行中に `std::exception` が発生した場合は `stderr` に `prefill: the GEMM block scores failed (%s); the warp kernel instead` を一度だけ出し、`sel_done` を未完了のまま後続 scorer の fallback 判定へ進みます。このログ文言には “warp kernel” とありますが、実際の分岐では `STRATA_SELECT_OLD` が無効なら warp scorer の前に `qsa_block_scores_tc()` を試します。
+各 QSA prefill バッチについて、コードはバッチ末尾 query の step table にある `n_bid` に 1 を足して `active` とし、自動モードでは `active >= sel_gemm_min` と Battlemage 判定を組み合わせて GEMM の選択フラグを決める。閾値の単位はコードコメント上「blocks (4 cells each)」。選択フラグが真でも、上記の scratch・形状・tile 条件を満たす場合に限り、`active` 範囲を `sel_tile` ごとに分けて oneMKL FP32 GEMM と `qsa_block_scores_reduce` でスコアを計算する。top-k はその後に同じループで実行される（`engine/sycl/src/prefill/prefill.cpp:3666-3673,3686-3705,3718-3719`）。
 
-ソースコメントは GEMM scorer が warp scorer と bitwise 同一ではなく選択結果が変わり得ると記しています。ここではこの実装コメントと分岐のみを確認しており、速度・品質の独立した測定結果は示しません。確認した `docs/DETAILS.md` にこの変数の追加説明はありません。
+GEMM 実行中に例外が起きると、stderr に `prefill: the GEMM block scores failed (%s); the warp kernel instead` を一度だけ出し、そのバッチは後続のスコア計算へ進む。GEMM が完了しなかった場合は tensor-core スコア計算を試し、それが選ばれない／使えない場合は `qsa_block_scores` の warp 経路に進む。環境変数の値自体が無効だという警告やエラー、プロセス終了はこの読み取り箇所にはない（`engine/sycl/src/prefill/prefill.cpp:3706-3717`）。
+
+## ログと測定値
+
+閾値の読み取りや GEMM の選択だけを知らせるログはない。GEMM 実行時の例外では、上記の stderr メッセージを出して fallback する（`engine/sycl/src/prefill/prefill.cpp:3707-3710`）。近傍コメントには特定 GPU での閾値や性能・スコア差の記述があるが、再現に必要な測定条件一式はこの箇所に揃っていないため、一般的な測定値としては記載しない（`engine/sycl/src/prefill/prefill.cpp:3676-3684`）。`docs/DETAILS.md` および関連する説明文書には、この変数固有の説明を確認できなかった。
 
 ## 根拠
 
-- `sycl/src/prefill/prefill.cpp:2421-2430` — SYCL prefill の `run_impl()` と model/session 状態の取得。
-- `sycl/src/prefill/prefill.cpp:3350-3355` — selection batch と `active` block 数の算出。
-- `sycl/src/prefill/prefill.cpp:3356-3375` — 旧 scorer、関連変数の parse、既定値、Battlemage としきい値の分岐、GEMM の追加条件。
-- `sycl/src/prefill/prefill.cpp:3376-3401` — tiled GEMM、score reduction、例外ログ、TC/warp scorer と top-k への fallback。
+- `engine/sycl/src/prefill/prefill.cpp:2693-2695` — `Prefill::run_impl` の実装。
+- `engine/sycl/src/prefill/prefill.cpp:3645-3673` — QSA 層でのスコア選択位置、`active` の算出。
+- `engine/sycl/src/prefill/prefill.cpp:3674-3719` — 関連環境変数、閾値、GEMM 条件、例外ログおよび fallback。

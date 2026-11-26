@@ -1,45 +1,48 @@
 # `STRATA_PIPELINE_THETA`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--pipeline-windows 2` の decode で、次の verify window を推測で先行実行する確率しきい値です。直前 window が丸ごと受理される見込み `B.p_on` がこの値以上なら、次 window `B` を stage 0 で speculative に起動します。低い値ほど起動条件を満たしやすく、高い値ほど満たしにくくなります。`STRATA_PIPELINE_DEBUG` が有効でない場合、この環境変数は無視され、しきい値は既定値になります。
+パイプライン化された prompt/decode windows で、MTP の chain が予測する次 window の採用確率 `p_on` に対する投機実行ゲートを指定する testing 用の値。値が 0 以上なら `p_on >= theta` のとき次 window を投機的に進める。通常の生成 token の選択規則を直接変える値ではなく、パイプラインが使われない経路では効果がない。CUDA/HIP 共通コードと SYCL 実装に読み取り箇所がある（`engine/src/program/generate.cpp:20263-20266,21867-21870`、`engine/sycl/src/program/generate.cpp:11155-11158,12241-12243,12314-12318,12336-12338`）。
 
 ## 値と判定
 
-| 状態 | しきい値 |
-|---|---:|
-| `STRATA_PIPELINE_DEBUG` が無効 | `0.2`（`STRATA_PIPELINE_THETA` は参照しない） |
-| debug 有効、`STRATA_PIPELINE_THETA` 未設定 | `0.2` |
-| debug 有効、設定あり | `(float) std::atof(value)` |
+どちらの実装も `pipe_dbg_env("STRATA_PIPELINE_THETA")` を通じ、値が得られた場合は C/C++ の `std::atof` で `float` に変換する。文字列全体の妥当性検証、clamp、範囲チェックはない。空文字や数値で始まらない文字列は `atof` の変換結果 0 になり、数値の後ろに文字がある場合は数値部分が使われる。したがって `0.5junk` は 0.5、`true` や `abc`、空文字は 0 として扱われる。空白・大文字小文字は環境変数名以外で検査されない。負値も拒否されず、backend ごとの別経路に入る。
 
-値全体の検証や範囲 clamp はありません。空文字や数値に変換できない文字列は `atof` により 0 になります。数値の後ろに文字があれば数値部分を変換します（例: `0.4tail` は 0.4）。負数もそのまま使われ、NaN は比較 `B.p_on >= theta` を成立させません。したがって負値は通常の有限 `B.p_on` に対してゲートを通しやすく、1 を超える値は `B.p_on` が通常取り得る確率範囲ではゲートを通しません。
+| 実装 | unset（または debug 無効） | 設定値の扱い |
+|---|---|---|
+| CUDA/HIP (`engine/src/program/generate.cpp`) | debug gate が有効で THETA が unset、かつ `STRATA_PIPELINE_HIT_MIN` が未設定または変換値 `< 0` なら `theta=0.2`。HIT_MIN の変換値が `>= 0` なら `theta=-1` とし、hit-rate gate に切り替える。debug gate が無効なら THETA は unset として扱う。 | 空文字・`abc`・`0` は theta 0。`1` は `p_on >= 1` を要求し、範囲外を含む正値も clamp しない。負値は `theta < 0` の hit-rate gate に切り替える。 |
+| SYCL (`engine/sycl/src/program/generate.cpp`) | `theta=0.2`。debug gate が無効なら THETA は unset として扱う。 | 空文字・`abc`・`0` は theta 0。`1` は `p_on >= 1` を要求し、範囲外を含む正値も clamp しない。負値は `p_on >= theta` 比較を通りやすくし、CUDA/HIP の hit-rate gate には切り替えない。 |
+
+共通 helper は `STRATA_PIPELINE_DEBUG` が未設定、空、または先頭文字が `'0'` の場合に対象名を読まず、設定されていて先頭文字が `'0'` 以外なら読む。従って `STRATA_PIPELINE_DEBUG=0anything` は無効、`true`、`01`、` 0` は有効。debug 判定は helper 内の関数 static で初回呼び出し時に一度だけ評価される（`engine/src/program/generate.cpp:681-687`、`engine/sycl/src/program/generate.cpp:325-340`）。
+
+CUDA/HIP では通常、`STRATA_PIPELINE_HIT_MIN` の空文字は明示的に無効値として `-1` に変換され、非空なら `atof` される（`engine/src/program/generate.cpp:20259-20266`）。値が `>= 0` なら THETA が unset のとき hit-rate gate が選ばれる。THETA が明示されて `>= 0` なら数値ゲートを使い、`< 0` なら hit-rate gate を使う。hit-rate gate は `p_on` の区分ごとの履歴比率と `hit_min` を比べる実装である（`engine/src/program/generate.cpp:21860-21870`）。
 
 ## 有効になる条件
 
-- `pipe_dbg_env()` が `STRATA_PIPELINE_DEBUG` を有効と判定すること。判定は未設定・空文字・先頭文字 `0` で無効、それ以外の先頭文字で有効です。文字列全体の真偽値 parse はしません。
-- パイプライン decode が選択されること。CUDA/HIP 実装では `pipe && pl_pw >= 2 && pl_snap_ok`、SYCL 実装では `pipe && pl_pw >= 2 && pl_snap2[0] != nullptr` が必要です。
-- 当該 request がキャンセルされておらず、生成上限に達していないこと。また、repetition penalty が設定されている request と coupled draft sampling の request は、パイプライン decode でなく serial decode に回ります。
-
-パイプライン自体は `--serve` と layer split、MTP drafter などを必要とします。NVIDIA 側は `--pipeline-windows 2` の指定が必要です。AMD gfx12 および対応する Intel Arc B-series には条件付き既定有効経路がありますが、条件を満たさない構成ではこのしきい値を設定してもパイプラインは起動しません。詳細なパイプライン条件は `docs/MULTI_GPU.md:181-197` と `src/program/generate.cpp:4970-5020` にあります。
+- `STRATA_PIPELINE_DEBUG` が helper の初回評価時に有効であること。無効なら THETA は読まれず、上表の unset 時の既定経路になる（`engine/src/program/generate.cpp:684-686`、`engine/sycl/src/program/generate.cpp:337-339`）。
+- `--pipeline-windows` のパイプライン経路に入ること。これはサーバーの layer split と MTP (`--mtp`, `--spec >= 2`) を使う経路であり、条件を満たさない場合は pipeline が無効化される（CUDA/HIP: `engine/src/program/generate.cpp:6584-6601`; SYCL: `engine/sycl/src/program/generate.cpp:3590-3634`）。
+- 自動有効化の条件は backend で異なる。HIP 共通コードは `STRATA_PIPELINE_AUTO`、stage 数、モデル/ドラフト、batch 等を条件にする一方、SYCL は2枚の Arc B-series GPU で既定有効化する。明示的な `--pipeline-windows` と、各実装が後段で検証する条件はそれぞれの上記行にある（`engine/src/program/generate.cpp:6560-6582`、`engine/sycl/src/program/generate.cpp:3590-3618`）。
+- CUDA/HIP 実装では `STRATA_PIPELINE_HIT_MIN` が未設定・負値なら通常の未設定既定値 0.2 を選ぶ。非負値なら THETA 未設定時に count-based gate に切り替わる（`engine/src/program/generate.cpp:20259-20266,21867-21870`）。
+- `STRATA_PIPELINE_SWITCH=<file>` が debug gate 経由で設定され、pipeline が有効でファイルを開ける場合、リクエストごとにファイルを読み、`theta=<f>` があれば環境変数由来の値を上書きする。CUDA/HIP では `hit=<f>` があり `theta=` がない場合、`theta=-1` として hit-rate gate を選ぶ。SYCL switch は `theta=` を上書きするが `hit=` は処理しない（CUDA/HIP: `engine/src/program/generate.cpp:20284-20294`; SYCL: `engine/sycl/src/program/generate.cpp:11163-11172`）。
 
 ## 実行時の詳細
 
-CUDA/HIP と SYCL の `generate.cpp` は同じ判定を実装しています。`pipe_dbg_env(name)` は `STRATA_PIPELINE_DEBUG` の判定を関数内 `static const bool` に一度だけ cache し、有効時だけ `getenv(name)` を返します。従ってプロセス開始後に `STRATA_PIPELINE_DEBUG` を変えても判定は変わりません。一方、`pl_theta` は request の処理箇所で初期化されるたびに helper 経由で環境値を読み、`std::atof` で float に変換します。
+CUDA/HIP 実装は各リクエストの prompt 読み取り準備中に `pl_theta` を設定し、SYCL 実装も各リクエストの同じ段階で設定する。THETA の getenv/変換結果自体は関数 static に保存されないため、後続リクエストで環境が変更されていれば読み直される。ただし `STRATA_PIPELINE_DEBUG` の有効/無効だけは helper の関数 static にキャッシュされ、プロセス中には再評価されない（CUDA/HIP: `engine/src/program/generate.cpp:20259-20266`; SYCL: `engine/sycl/src/program/generate.cpp:11151-11161`）。
 
-`STRATA_PIPELINE_SWITCH` が debug 有効時に設定され、ファイルを開けた場合、そのファイル内に `theta=` があれば `std::atof` の値で `pl_theta` を上書きします。したがって切替ファイルの `theta=` が環境変数の値より優先します。ファイルパスの環境値ポインタは static 初期化で一度取得されますが、ファイル本文は各 request で開き直されます。CLI に独立した theta 引数はありません。
+CUDA/HIP の投機 window は `theta >= 0` なら `p_on >= theta`、負値なら `pl_cal` の hit-rate 条件で可否を決める（`engine/src/program/generate.cpp:21850-21870,21967-21983,22095-22101`）。SYCL は chain の各段階で `pa < theta` による投機候補の打ち切りを行い、次 window の stage 0 投機実行は `B.p_on >= theta` のときに限る。したがって負の値は確率が 0 以上の候補を通しやすくする。その他の一致条件、window 長、context 上限、pipeline の状態判定は別途残る（`engine/sycl/src/program/generate.cpp:12216-12248,12328-12338`）。
 
-しきい値は CUDA/HIP の speculative window 起動判定（`B.p_on >= theta`）に加え、debug の `STRATA_PIPELINE_PRESTAGE` が有効な場合の prestage 判定にも使われます。ゲートを下回ると `B.ready` を false にし、below-gate カウンタを増やしてその speculative window を起動しません。SYCL でも speculative 起動条件に同じ比較を使います。
+## ログと測定値
 
-この変数専用の警告・終了経路はありません。`STRATA_PIPELINE_SWITCH` ファイルを開けて値を読めた場合は stderr に `strata pipeline switch: ... theta=...` が出ます。`STRATA_DECODE_TIMING` が有効なら decode の統計行に `below the gate` の件数と `theta` が表示されます。通常の pipeline setup / 実行失敗は `STRATA_PIPELINE_THETA` の値に固有ではありません。
+THETA を環境から読み取ったこと自体を示す専用ログはない。CUDA/HIP では `dec_timing` が有効な場合に pipeline 集計ログへ `theta %.2f` または `hit %.2f` とゲート種別を出す（`engine/src/program/generate.cpp:22584-22594`）。switch ファイルが正常に開けた場合は `strata pipeline switch: ... theta=...` を stderr に出す（`engine/src/program/generate.cpp:20284-20301`、SYCL: `engine/sycl/src/program/generate.cpp:11163-11174`）。
+
+`docs/DETAILS.md` にこの変数の挙動や条件付き測定値の記載は見当たらない。ここではソースコメント中の過去の測定値を一般的な性能値として転記していない。
 
 ## 根拠
 
-- 候補名の全参照（本番コード）は `src/program/generate.cpp:14782` と `sycl/src/program/generate.cpp:10433`。両箇所とも `pipe_dbg_env` を経由し、他の参照はありません。
-- helper の debug 判定、cache と値の取得: `src/program/generate.cpp:461-467`, `sycl/src/program/generate.cpp:298-303`。
-- 既定値 `0.2`、`atof` 変換、force miss の隣接設定、switch-file による上書きとログ: `src/program/generate.cpp:14777-14801`, `sycl/src/program/generate.cpp:10428-10452`。
-- パイプライン decode の起動条件と request 単位の除外: `src/program/generate.cpp:16079-16100`, `sycl/src/program/generate.cpp:11029-11053`。
-- CUDA/HIP の確率ゲート、prestage、ゲート不成立時の処理: `src/program/generate.cpp:16496-16499,16522-16560`。SYCL の speculative 起動ゲート: `sycl/src/program/generate.cpp:11526-11532`。
-- decode timing の `theta` と below-gate 件数の出力: `src/program/generate.cpp:16713-16718`。
-- パイプライン tuning/test 変数が `STRATA_PIPELINE_DEBUG=1` のときだけ読まれること、および対応条件: `docs/MULTI_GPU.md:181-197`。
+- CUDA/HIP の debug gate、THETA と HIT_MIN の既定・優先順位: `engine/src/program/generate.cpp:681-687,20259-20266`
+- CUDA/HIP の pipeline 条件: `engine/src/program/generate.cpp:6532-6537,6560-6601`
+- CUDA/HIP のゲート判定、switch の上書きと観測ログ: `engine/src/program/generate.cpp:20245-20301,21850-21870,22584-22594`
+- SYCL の debug gate、THETA 読み取りと switch の上書き: `engine/sycl/src/program/generate.cpp:325-340,11151-11174`
+- SYCL の自動有効化・無効化条件とゲート結果: `engine/sycl/src/program/generate.cpp:3590-3634,12216-12248,12328-12338`

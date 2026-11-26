@@ -1,43 +1,46 @@
 # `STRATA_Q36_BLAS_F32`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Qwen3.6-35B-A3B 用エンジンの FP32 行列積で、プロンプトのバッチ計算に使う実装を選びます。設定すると hipBLAS / cuBLAS の SGEMM を使います。未設定時は、入力幅 `n_in` が4の倍数なら Strata の split-K CUDA/HIP カーネルを優先し、4の倍数でなければ SGEMM を使います。
+Qwen3.6 (`qwen35moe`) エンジンで、8 行を超えるバッチの F32 行列積を計算するとき、入力幅 `n_in` が 4 の倍数でも、Strata の分割 K GPU kernel ではなく `cublasSgemm` を選ばせる設定です。対象は GDN の alpha / beta、expert router、shared-expert gate の F32 積です。未設定時も `n_in` が 4 の倍数でなければ同じ SGEMM 経路を使います。短いバッチ (`T <= 8`) の計算方法は変わりません。`engine/src/qwen35/q36_engine.cu:2361-2394, 2726-2732, 2895-2901, 3013-3018`
 
-対象は `src/qwen35/q36_engine.cu` の `f32mm()` です。通常の Qwen3.8 engine ではなく、モデルヘッダーが `qwen35moe` のとき `strata` から切り替わる Qwen3.6 経路と、同じエンジンを呼ぶ `strata-q36` に適用されます。
+このエンジンは CUDA / HIP 用にビルドされ、`strata` が `qwen35moe` モデルを選んだ経路と、同じエンジンを包む `strata-q36` で使われます。HIP gfx906 では Qwen3.6 エンジン自体をビルドしません。SYCL の経路にはこの実装がありません。`engine/cmake/strata_gpu_engine.cmake:565-583`, `engine/src/program/generate.cpp:3804-3818`
 
 ## 値と判定
 
-| 環境変数 | 判定 | `T > 8` かつ `n_in % 4 == 0` の場合 |
-|---|---|---|
-| unset | `getenv()` が null | Strata の split-K カーネルを使う |
-| 任意の設定値 | `getenv()` が non-null | hipBLAS / cuBLAS SGEMM を使う |
+値の内容は parse されません。`std::getenv(...) != nullptr` の有無だけを一度判定し、設定されていれば有効です。したがって空文字、`0`、`false`、大文字小文字違い、空白や任意の文字列もすべて「設定あり」です。未設定だけが「設定なし」です。`engine/src/qwen35/q36_engine.cu:2368-2369`
 
-値の文字列や数値は parse しません。`1` 以外の値、空文字、`0` も「設定あり」として有効です。`n_in` が4の倍数でない場合は、未設定でも SGEMM に進むため、この変数による選択差はありません。`T <= 8` の呼び出しは `f32mm()` の先頭で別カーネルへ戻るため、この変数の判定・適用対象外です。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| Qwen3.6 CUDA / HIP エンジンで `T > 8` | `n_in % 4 == 0` なら分割 K kernel、それ以外は SGEMM | 空文字、`0`、`false`、`1`、その他の任意の値 | なし（値の妥当性検査なし） |
+| 同エンジンで `T <= 8` | `k_gemv_f32` | なし。この条件では環境変数を読む分岐に入らない | なし |
 
-根拠: `src/qwen35/q36_engine.cu:1276-1310,1314`。
+`T > 8` で変数が未設定かつ `n_in % 4 == 0` の場合、`n_out` と `T` から分割数を決め、`k_sgemm_nt` と必要に応じ `k_sum_splits` を使います。変数が設定されている場合、または `n_in` が 4 の倍数でない場合は `cublasSgemm` に進みます。`engine/src/qwen35/q36_engine.cu:2368-2389`
 
 ## 有効になる条件
 
-- Qwen3.6-35B-A3B（GGUF architecture `qwen35moe`）のエンジン経路を実行していること。`strata` はモデルメタデータから family を判定して `strata::qwen35::run()` に切り替えます。`strata-q36` も同じ `run()` を呼びます。
-- FP32 の `f32mm()` が `T > 8` で呼ばれること。実際の呼び出しは、プロンプトなど複数行の GDN alpha / beta、router、shared-expert gate の積です。decode の1 token router は `T == 1` なので対象外です。
-- `n_in % 4 == 0` のときだけ、未設定時の split-K カーネルと設定時の SGEMM の選択差が生じます。
-
-モデル切り替えの根拠: `src/program/generate.cpp:1866-1880`。`f32mm()` の呼び出しと行数条件: `src/qwen35/q36_engine.cu:1353-1359,1440-1444,1490-1501`。
+- `qwen35moe` 用エンジンがビルドされていること。`strata` では `STRATA_HAVE_QWEN35` が定義されたビルドでモデルの architecture によりエンジンへ分岐し、`strata-q36` は同じエンジンライブラリをリンクします。`engine/cmake/strata_gpu_engine.cmake:570-583`, `engine/src/program/generate.cpp:3804-3818`
+- HIP gfx906 は対象外です。CMake がそのビルドでは `strata_qwen35` を追加しません。`engine/cmake/strata_gpu_engine.cmake:567-571`
+- 実際の `f32mm` 呼び出しで `T > 8` であること。8 以下の行数では `k_gemv_f32` で戻るため、変数の値は使いません。プロンプトは `process` が `tmax` ごとのチャンクに分けて `forward` を呼びます。`--chunk` / `--prefill` と `STRATA_Q36_CHUNK` はチャンク幅を決める別設定であり、このフラグを直接上書きしません。`engine/src/qwen35/q36_engine.cu:2363-2369, 2392-2397, 5363, 5517-5522, 3720-3728`
+- CLI 引数による `STRATA_Q36_BLAS_F32` の上書きや、子プロセスへの転送処理はこのエンジンの参照箇所にはありません。`rg` による名前の全参照では、実行時の読み取りは `engine/src/qwen35/q36_engine.cu:2368` のみです。
 
 ## 実行時の詳細
 
-`f32mm()` は `T <= 8` なら `k_gemv_f32` を起動して戻ります。`T > 8` では関数内の `static const bool` が初めて評価され、その時点の `getenv("STRATA_Q36_BLAS_F32") != nullptr` の結果をプロセス内に保持します。したがって、初回の `T > 8` 呼び出し以降に環境を書き換えても選択は変わりません。
+`f32mm` は `T <= 8` なら即座に `k_gemv_f32` を投入します。`T > 8` になった呼び出しで初めて関数内 `static const` が評価され、環境変数の設定有無をキャッシュします。そのためプロセス起動後に環境を変更しても、最初の該当呼び出し後は反映されません。該当呼び出しが一度もなければ、この変数は読まれません。`engine/src/qwen35/q36_engine.cu:2363-2369`
 
-変数が未設定で `n_in` が4の倍数なら、Strata は `n_out` と `T` から tile / split 数を決めて `k_sgemm_nt` を起動し、複数 split の場合は固定順で部分和を加算します。それ以外の `T > 8` 経路では SGEMM に進みます。SGEMM が成功以外を返すと stderr に `strata-q36: cublasSgemm failed` を出してプロセスを `exit(1)` で終了します。別のエラー経路では初期化時に cuBLAS handle / stream の設定が失敗すると `strata-q36: cuBLAS handle failed` を出して終了します。
+SGEMM 経路は `cublasSgemm` を呼び、戻り値が `CUBLAS_STATUS_SUCCESS` 以外なら stderr に `strata-q36: cublasSgemm failed` を出して `exit(1)` します。`engine/src/qwen35/q36_engine.cu:2384-2389`。分割 K 経路では `k_sgemm_nt` を起動し、複数 split の場合は部分結果を `k_sum_splits` で合算します。`engine/src/qwen35/q36_engine.cu:2369-2382`
 
-根拠: `src/qwen35/q36_engine.cu:1158-1161,1283-1309`。
+コードから確認できるのはこの計算経路の切り替えまでです。経路ごとの性能差や出力の一致性を示す測定値は、対象変数について `docs/DETAILS.md` および `docs/QWEN36.md` に見つかりませんでした。
+
+## ログと測定値
+
+成功時にこの環境変数専用のログはありません。SGEMM が失敗した場合は `strata-q36: cublasSgemm failed` を stderr に出し、終了コード 1 で終了します。上記の通り、対象変数について記載可能な Strata の測定値は確認できませんでした。`engine/src/qwen35/q36_engine.cu:2384-2389`
 
 ## 根拠
 
-- `src/qwen35/q36_engine.cu:1281-1314` — FP32 行列積、8行以下の早期 return、環境変数判定、split-K と SGEMM の分岐、SGEMM エラー処理。
-- `src/qwen35/q36_engine.cu:1353-1359,1440-1444,1490-1501` — GDN alpha / beta、router、shared-expert gate からの呼び出し。
-- `src/program/generate.cpp:1866-1880`、`src/qwen35/q36_main.cpp:1-5` — `strata` の family switch と standalone engine entry point。
-- `docs/DETAILS.md` には `STRATA_Q36_BLAS_F32` の記載は見つかりませんでした。
+- `engine/src/qwen35/q36_engine.cu:2361-2394` — F32 行列積の分岐、設定有無判定、分割 K kernel、SGEMM と失敗経路、8 行の境界。
+- `engine/src/qwen35/q36_engine.cu:2726-2732, 2895-2901, 3013-3018` — この関数を呼ぶ GDN alpha / beta、router、shared-expert gate。
+- `engine/src/qwen35/q36_engine.cu:3720-3728, 5363, 5517-5522` — prompt chunk 処理と別の chunk 設定。
+- `engine/cmake/strata_gpu_engine.cmake:565-583`, `engine/src/program/generate.cpp:3804-3818` — CUDA / HIP エンジンの組み込み、gfx906 除外、Qwen3.6 family switch。

@@ -1,64 +1,59 @@
-# `--expert-profile-save`
+# `strata --expert-profile-save`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout は `main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数 parser） |
+| コマンド | `strata`（エンジン引数） |
 | オプション | `--expert-profile-save` |
 | 別名 | なし |
-| 値 | 保存先ファイルのパス（文字列） |
+| 値 | 保存先ファイルのパス `P` |
 
 ## 役割
 
-`--serve` 実行中に adaptive tier が学習した expert の順位を、次回起動時に `--expert-profile` で読み込めるプロファイルとして保存します。保存順は現在 VRAM に resident な expert を先頭に置き、その後は実行開始から数えた routing の頻度を基準にします（`src/program/generate.cpp:988-993`、`include/strata/core/expert_cache.hpp:57-71`）。
+`--serve` で動く適応型 expert tier が実行中に数えた routing と現在の VRAM 常駐状態から、全 `(layer, expert)` の順位を profile ファイルに保存します。次回起動時に `--expert-profile` へこのファイルを渡すと、その順位を初期 profile として利用できます。オプションを省略した場合は routing の集計も保存も行われません（`engine/src/program/generate.cpp:933-937, 1407-1410`）。
 
 ## 使い方
 
 ```sh
-engine/strata --serve --pack /path/to/model-pack \
-  --expert-profile /path/to/base-profile.bin \
+./strata --serve --pack /path/to/pack --native /path/to/model.gguf \
+  --expert-profile /path/to/initial-profile.bin \
   --expert-profile-save /path/to/learned-profile.bin
 ```
 
-これはエンジンのネイティブ引数例です。`--expert-profile-save` 自体は parser で受理されますが、保存処理は `--serve` の実行経路内にあります（`src/program/generate.cpp:2416-2425, 2748-2753`、保存処理は `src/program/generate.cpp:10888-10906, 15685`）。
+`--serve`、モデル・pack の指定に加え、適応型 tier が使う `--expert-profile` を指定する例です。`/path/to/learned-profile.bin` はエンジンが書き込む保存先です。
 
 ## 値と既定値
 
-- 値は次の argv 要素をそのまま保存先パスとして受け取ります。値を省略すると stderr に `<option> needs a value` を出して終了コード 2 で終了します（`src/program/generate.cpp:2418-2421, 2750`）。空文字列は parser では拒否されず、保存機能を無効にする値として扱われます（`src/program/generate.cpp:588-592, 10070-10078`）。
-- 指定しない場合の値は空文字列で、profile の heat 計数・ファイル書き込みを行いません（`src/program/generate.cpp:588-592, 10890-10892`）。
-- このオプションについて、パスの事前検証、拡張子検証、重複指定検証はありません。複数回指定した場合は parser が同じ文字列フィールドへ順に代入するため、最後の値が残ります（`src/program/generate.cpp:2416-2421, 2750`）。
-- 相対パスはプロセスの作業ディレクトリを基準にファイル API へ渡されます。エンジン設定を介して起動する `serve` 側では、相対パスを config の `cwd` 基準に解決する実装です（`src/core/expert_cache.cpp:193-205`、`serve/server.py:3197-3216`）。
+- `P` は `next()` で次の argv 要素から文字列として受け取り、`expert_profile_save` に格納します。省略時は空文字列で、保存は無効です。オプション自体のパス存在確認や親ディレクトリ検証は parser にありません（`engine/src/program/generate.cpp:935-937, 3842-3847, 4211-4216`）。
+- 値を省略して argv の末尾に置くと、`--expert-profile-save needs a value` を stderr に出して終了コード 2 で終了します（`engine/src/program/generate.cpp:3844-3846`）。
+- 同じオプションを複数回指定した場合は parser が同じ文字列メンバーへ順に代入するため、最後の値が残ります（`engine/src/program/generate.cpp:3842-3847, 4212`）。
+- 保存間隔は別オプション `--expert-profile-save-every MIN` で、既定値は 10 分です。0 以下では定期保存の条件を満たさなくなりますが、終了時保存は引き続き行われます（`engine/src/program/generate.cpp:937, 1407-1410, 4215-4216, 18503-18507, 23958`）。
 
 ## 実行時の動作
 
-保存は `--serve` 経路の起動時に、`--expert-profile-save` が空でなく、全 expert が resident ではない場合に準備されます。routing usage または host residency table が使えない場合、stderr に adaptive tier（`--adapt-every` と `--adapt-swaps` が正値）および `--expert-profile` が必要で保存されない旨を警告します。両方が有効なら、routing の累積用 `heat` を初期化します（`src/program/generate.cpp:10070-10080`）。全 expert が resident の場合はこの保存機能の heat を初期化しません。
-
-各 adaptive round では routing usage を heat に足し、通常の adaptive tier と同様に usage を decay します（`src/program/generate.cpp:10446-10460, 10735-10745`）。現在の residency と heat から全 `(layer, expert)` ペアを順位付けし、開始時に読み込まれた profile を同率時の prior として使います。優先順位は resident、heat の降順、prior の順位、最後に index です。したがって、この出力を次回の `--expert-profile` に使うと、実行終了時点の cache residency が先頭に反映されます（`src/program/generate.cpp:4455-4461, 10890-10900`、`src/core/expert_cache.cpp:143-169`）。
+- 実際の保存処理は serve ループにあり、終了時（`QUIT` または stdin の終了）に `save_profile("exit")` を呼びます。定期保存は、次の要求を処理する前に、前回保存から設定時間が経過していて、その行が `QUIT` ではない場合に行われます（`engine/src/program/generate.cpp:18503-18507, 23958`）。
+- 保存用の集計 `heat` は、`--expert-profile-save` が指定され、全 expert が常駐しておらず、適応型 tier の usage と host residency が利用可能なときに初期化されます。適応型 tier が無効、または residency 情報がないときは `--adapt-every` と `--adapt-swaps` が 0 より大きいこと、および `--expert-profile` が必要だと stderr に出します。その場合、エンジンは処理を継続しますが保存用集計は作られず、ファイルも保存されません。全 expert が常駐している場合もこの保存用集計の初期化条件から外れます（`engine/src/program/generate.cpp:14932-14933, 15091-15101`）。
+- 適応型 tier の各 routing 集計時に `drive.d.usage` を `heat` へ加算します（`engine/src/program/generate.cpp:15800-15808`）。保存順位は、まず現在 resident の expert、次に累積 routing 数の降順、同数なら起動時 profile の順位、最後に pair の index 順です。保存ファイルには全 `(layer, expert)` pair が順位付けされます（`engine/src/program/generate.cpp:15955-15967`; `engine/src/core/expert_cache.cpp:246-272`; `engine/include/strata/core/expert_cache.hpp:57-66`）。
+- profile の読み込み用データは、起動時の `--expert-profile` から読み込んだ順位を保存処理の prior として保持します。GPU layer split 時も split 後の `profile` ではなく、読み込み時の全順位を保持するために保存用コピーを取ります（`engine/src/program/generate.cpp:6790-6793`）。
 
 ## 適用条件と副作用
 
-- 意図された用途は `--serve` です。更新間隔の既定値は関連オプション `--expert-profile-save-every` が設定する10分で、経過後、次のリクエストを処理する前に保存します。`0` 以下なら定期保存条件を満たさず、終了時保存だけになります。更新間隔の parser は `std::atof` で、明示値の範囲検証は確認できません（`src/program/generate.cpp:591-592, 2750-2753, 12016-12020`）。
-- QUIT または標準入力終了で server loop を抜けた後にも保存を試みます（`src/program/generate.cpp:15685`）。通常の非-serving生成経路にはこの保存呼び出しがありません。
-- 出力は `STRP` 形式の version 1 で、モデルの layer/expert 数、ranked pair 群、rank table を含みます。`<path>.tmp` に書き、完了後 rename で最終パスへ置き換えるため、既存の保存先ファイルは更新時に置換されます（`include/strata/core/expert_cache.hpp:68-71`、`src/core/expert_cache.cpp:172-211`）。保存先と `.tmp` を同時に他の処理で使わないでください。
-- 既存の `--expert-profile` と同じパスを保存先にすると、起動時に読んだ内容を開始時の prior として保持したうえで、保存時にそのファイルを置換します。これは実装上可能ですが、バックアップは作られません（`src/program/generate.cpp:4458-4461`、`src/core/expert_cache.cpp:193-205`）。
-- Engine が直接受け取った `--expert-profile-save-every` の負値は定期保存を無効化します。config 経由では `serve/server.py` が `expert_profile_save_every` を数値かつ非負の場合だけ engine 引数に追加します（`src/program/generate.cpp:12016-12020`、`serve/server.py:3207-3209`）。
+- help の説明と保存処理は `--serve` 用です。通常の非 serve 実行経路でこの値が使われる保存箇所は確認できません（`engine/src/program/generate.cpp:933-935, 1407-1410, 15091-15101, 23958`）。
+- 保存先には `<P>.tmp` を作成し、内容を書き終えた後に `<P>` へ rename します。rename は既存の `<P>` を置き換えます。途中のファイルを読み手に見せないための書き込み方式です（`engine/src/core/expert_cache.cpp:294-314`; `engine/include/strata/core/expert_cache.hpp:68-71`）。
+- 親ディレクトリが存在しない、書き込み権限がない、または書き込み・rename に失敗する場合は保存できません。失敗時は `.tmp` を削除し、stderr に理由を出します（`engine/src/core/expert_cache.cpp:296-312`; `engine/src/program/generate.cpp:15967-15972`）。
+- CLI 値の相対パスをどの作業ディレクトリ基準で解決するかは、エンジン側のこの parser・書き込み処理からは確認できません。保存間隔と config の相対パス処理を行う Terminal のラッパー経路はこの CLI 文書の対象外です。
 
 ## 出力とエラー
 
-- 保存成功時は stderr に `strata serve: expert profile saved to <path> (periodic|exit)` を出します。失敗時は `strata serve: the expert profile was not saved: <理由>` を出します（`src/program/generate.cpp:10898-10905`）。
-- 親ディレクトリがない、権限がない、または一時ファイル・最終ファイルへの書き込み/rename ができない場合は保存関数が失敗し、可能なら `.tmp` を削除します（`src/core/expert_cache.cpp:193-209`）。この失敗は `save_profile` からエラー表示されますが、当該関数は戻り値を返さず、ここで終了コードを失敗に変更しません（`src/program/generate.cpp:10890-10906, 15685-15693`）。
-- モデルの layout が形式の範囲（layer/expert 数が1〜65535）に収まらない場合や順位に範囲外 pair がある場合も保存関数が失敗します（`src/core/expert_cache.cpp:172-188`）。
-- `--expert-profile-save` が指定されたものの adaptive tier の準備条件を満たさない場合、起動時警告を出し、`heat` が空のままなので周期・終了時どちらの保存も行いません（`src/program/generate.cpp:10073-10078, 10890-10892`）。
+- 保存に成功すると stderr に `strata serve: expert profile saved to <P> (periodic|exit)` と出ます。書き込みに失敗すると `strata serve: the expert profile was not saved: <理由>` と出ます（`engine/src/program/generate.cpp:15967-15972`）。
+- 適応型 tier の利用条件を満たさない場合は stderr に `--expert-profile-save needs the adaptive tier (--adapt-every and --adapt-swaps above 0) and --expert-profile: nothing will be saved` と出ます（`engine/src/program/generate.cpp:15094-15099`）。
+- 書き込み失敗はこの処理ではログ出力に留まり、保存関数の失敗を終了コードへ変換する処理はありません（`engine/src/program/generate.cpp:15967-15972`）。parser の値不足は前述の通り終了コード 2 です。
 
 ## 根拠
 
-- 索引上の位置と scope: `docs/cli/README.md:1128-1134, 1178-1180`（strata-envvars 側）。
-- parser、値欠落時の扱い、既定値: `src/program/generate.cpp:588-592, 2416-2421, 2748-2753`。
-- serving 時の適用条件と routing 計数: `src/program/generate.cpp:10070-10080, 10446-10460, 10735-10745`。
-- 順位付けと書き込み形式・失敗経路: `include/strata/core/expert_cache.hpp:57-73`, `src/core/expert_cache.cpp:143-211`。
-- 保存タイミング、ログ、終了時呼び出し: `src/program/generate.cpp:10888-10906, 12016-12020, 15685-15693`。
-- config 経由の引数補完と相対パス解決: `serve/server.py:3197-3216`。
-
-調査では同一 revision の既存 CLI `--help`、Release artifact、GPU 実行は利用していません。記述は上記 checkout の parser と処理経路に基づきます。
+- `engine/src/program/generate.cpp:933-937, 1407-1410, 4211-4216` — 値の格納、保存間隔の既定値、help 上の serve 限定説明。
+- `engine/src/program/generate.cpp:3842-3847` — 値不足時の stderr と終了コード。
+- `engine/src/program/generate.cpp:6790-6793, 14932-14933, 15091-15101, 15800-15808, 15955-15972, 18503-18507, 23958` — prior の保持、適用条件、routing 集計、保存・定期実行・終了時実行。
+- `engine/include/strata/core/expert_cache.hpp:57-72`、`engine/src/core/expert_cache.cpp:246-314` — 順位規則、ファイル形式、`.tmp` 経由の書き込みと失敗処理。

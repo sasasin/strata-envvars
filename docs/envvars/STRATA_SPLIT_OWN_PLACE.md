@@ -1,54 +1,45 @@
 # `STRATA_SPLIT_OWN_PLACE`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。作業ツリーは `main`、HEAD と `origin/main` は一致し、調査時に未コミット変更はありませんでした。外部ライブラリの環境変数は対象外です。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`STRATA_SPLIT_OWN` の自動判定によって layer split の各 GPU が独自の prompt buffer を持つ場合に、`--layer-split auto` の配置探索でその buffer 用 VRAM を予約量として差し引くかを切り替えます。値が `reserve` なら探索時にも予約を差し引き、未設定または別の値なら探索は予約なしで配置を選びます。探索後の各 GPU の expert cache の容量決定では、独自 buffer 分の予約はどちらの設定でも差し引かれます。
-
-したがって、この変数は独自 buffer を有効にする設定ではなく、独自 buffer が選ばれた場合の自動分割位置に影響する調整用設定です。独自 buffer を使うかどうかは `STRATA_SPLIT_OWN` が決めます。
+複数 GPU の `--layer-split auto` が配置候補を評価するとき、各段の空き容量から自前 prompt buffer 用の reserve も差し引くかを切り替える。値が厳密に `reserve` の場合、探索時にも reserve を数える。それ以外では、`STRATA_SPLIT_OWN` によって自前 buffer を選んだ場合に限り、探索時の prompt buffer reserve を 0 として配置を評価する。実際の buffer 所有方式を選ぶ変数ではなく、reserve 分だけ探索時の容量と選ばれる split 境界が変わり得る。CUDA 実装は `engine/src/program/generate.cpp`、SYCL 実装は `engine/sycl/src/program/generate.cpp` にある（各実装の読み取りと容量計算: `engine/src/program/generate.cpp:6897-6922`、`engine/sycl/src/program/generate.cpp:3892-3913`）。
 
 ## 値と判定
 
-`std::getenv()` で値を読み、文字列全体を `"reserve"` と比較します。数値変換や前後空白の除去、大文字小文字変換はありません。
+両実装とも関数内 `static const bool` の初期化ラムダで `std::getenv` の結果を読み、値全体を `std::string(v) == "reserve"` で比較する。大文字小文字を区別し、空白除去・数値変換・部分一致はしない。
 
-| 値 | `place_with_reserve` | `split_own_auto=true` のときの探索時の扱い |
-|---|---:|---|
-| 未設定 | false | 独自 prompt buffer の予約を探索容量から差し引かない |
-| 空文字 | false | 同上 |
-| `reserve` | true | `split_pf_mib` を予約量に含める |
-| `RESERVE`、`1`、`true`、` reserve` など | false | 同上 |
+| 条件（backend） | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| CUDA (`engine/src/program/generate.cpp`) | `false`。自前 buffer が有効な auto 配置探索では buffer reserve を探索容量から除く | `reserve` のみ。探索容量から `split_pf_mib` を差し引く | 空文字、`0`、`1`、`Reserve`、`reserve ` など。unset と同じ扱い |
+| SYCL (`engine/sycl/src/program/generate.cpp`) | `false`。自前 buffer が有効な auto 配置探索では buffer reserve を探索容量から除く | `reserve` のみ。探索容量から `split_pf_mib` を差し引く | 空文字、`0`、`1`、`Reserve`、`reserve ` など。unset と同じ扱い |
 
-値は関数内の `static const bool` として初回到達時に評価・保存されます。プロセス実行中に環境を変更しても、その後の呼び出しで再評価されません。
-
-根拠: `src/program/generate.cpp:3797-3800`、SYCL 実装 `sycl/src/program/generate.cpp:3546-3549`。
+`reserve` 以外の設定値をエラーにしたり警告したりする処理はない。設定値は各 backend のプロセス内で、宣言に初めて到達したときに一度だけ評価される static 値であり、その後の環境変更は反映されない（同上）。
 
 ## 有効になる条件
 
-この値が配置に影響するには、次の条件が必要です。
-
-- 複数 GPU の layer split である。
-- `--layer-split auto` が使われている。
-- `STRATA_SPLIT_OWN` により独自 prompt buffer が自動選択され、内部フラグ `split_own_auto` が true になっている。
-
-`split_own_auto` は、`--no-prefill-borrow` が指定されておらず、`--split-skip-if-fits` も指定されていない状態で、`STRATA_SPLIT_OWN` が `0` で始まらない値に設定されている場合にだけ検討されます。値が `auto` なら全 split GPU の VRAM 容量を調べ、prompt buffer の推定量が各 GPU の総 VRAM の 12% 以下の場合に独自 buffer を選びます。`1` で始まる値なら明示的に選びます。`STRATA_SPLIT_OWN` の未設定または先頭文字 `0` はこの選択を行いません。独自 buffer が選ばれない場合、`STRATA_SPLIT_OWN_PLACE` の値に関係なく探索時に差し引く `split_pf_mib` は配置に影響しません。
-
-また、`--layer-split` に明示的な境界を渡した場合は配置探索をしないため、この変数の探索時効果はありません。`--split-skip-if-fits` によって単一 GPU 実行へ戻る場合も `split_own_auto` は立ちません。
-
-根拠: `src/program/generate.cpp:2407-2408,2449-2485,3814-3815`。独自 buffer と `STRATA_SPLIT_OWN` の利用者向け説明は `docs/MULTI_GPU.md:76-83` にあります。
+- `--layer-split auto` による複数 GPU の配置探索が実行されること。手動の `--layer-split K[,K2..]` では候補探索をせず、この変数による切り替えは使われない。`--layer-split` は `--serve` が必要で、利用 GPU 数などの検証を通る必要がある（CUDA: `engine/src/program/generate.cpp:4785-4856`、SYCL: `engine/sycl/src/program/generate.cpp:2265-2334`）。
+- `STRATA_SPLIT_OWN` が自前 prompt buffer を有効にしていること。コード上は `--no-prefill-borrow` が既に指定されておらず、`--split-skip-if-fits` も指定されず、`STRATA_SPLIT_OWN` が設定済みかつ先頭文字が `0` でない場合にその設定を判定する。`STRATA_SPLIT_OWN=auto` は GPU ごとの VRAM に対する 12% 条件を満たすと自前 buffer を選び、明示値は先頭文字 `1` で始まる場合に選ぶ（CUDA: `engine/src/program/generate.cpp:4916-4952`、SYCL: `engine/sycl/src/program/generate.cpp:2375-2419`）。この変数単独では自前 buffer を有効にしない。
+- 自前 buffer が有効でも、`STRATA_SPLIT_OWN_PLACE` が `reserve` 以外なら、auto 探索時だけ `pf` を 0 にする。`reserve` なら `split_pf_mib` を探索容量に含める。`split_pf_mib` は `--prefill` chunk に基づく値（`160 + chunk * 680 / 1024` MiB に、該当時の split ring 分を加算）であり、prefill chunk が 0 以下なら基本分は 0（CUDA: `engine/src/program/generate.cpp:6821-6832,6907-6917`、SYCL: `engine/sycl/src/program/generate.cpp:3850-3860,3908-3912`）。
+- `--vram-reserve-mib` および、後段 GPU 用の `--vram-reserve-later-mib` は別の reserve として探索容量に残る。これらを本変数が無効化することはない（CUDA: `engine/src/program/generate.cpp:6911-6922`、SYCL: `engine/sycl/src/program/generate.cpp:3908-3913`）。
+- `--layer-split auto` の探索が一 GPU だけと判定され split を解除した場合や、容量不足などで探索に入らない場合は本変数の配置効果はない（CUDA: `engine/src/program/generate.cpp:4836-4847,6959-6971`、SYCL: `engine/sycl/src/program/generate.cpp:2313-2325,3921-3929`）。
 
 ## 実行時の詳細
 
-独自 prompt buffer の予約量 `split_pf_mib` は、`--prefill` の chunk が正の場合、`160 + (chunk * 680) / 1024 + split_ring_mib` MiB です。独自 buffer が有効な split で chunk が 1024 以上なら、96 個の expert blob 用 split ring のサイズも加算されます。chunk が 1024 未満、または split でない場合、ring 加算は 0 です。`--prefill` が自動の場合の chunk は、独自 buffer 判定時には 2048 として見積もられます。根拠: `src/program/generate.cpp:2458-2460,3731-3741`。
+CUDA は `place_with_reserve`、SYCL は同名の static 値を読み取る。auto 探索で各 GPU の `stage_room(..., search=true)` を呼ぶと、`split_own_auto` が真で、かつ本変数が `reserve` でない場合に `pf=0` とし、それ以外は `split_pf_mib` を `pf` にする。ここから VRAM reserve、段の window、drafter などを差し引いて探索用容量を作り、各候補の session 分なども差し引いて cache に残せる量を予測する。そのため `reserve` は prompt buffer 分だけ各候補の容量を小さくし、最良と判定される境界を変えることがある（CUDA: `engine/src/program/generate.cpp:6901-6922,6963-6971`、SYCL: `engine/sycl/src/program/generate.cpp:3896-3913,3921-3929`）。
 
-`stage_room()` は探索中 (`search=true`) かつ `split_own_auto=true` で、さらに `STRATA_SPLIT_OWN_PLACE` が `reserve` でない場合、探索用容量から差し引く prompt buffer 予約 `pf` を 0 にします。`reserve` の場合は `split_pf_mib` を含めて各 stage の使用可能 VRAM を見積もります。`split_own_auto=false` の場合はこの環境変数による切り替えはなく、通常どおり `split_pf_mib` を使います。いずれも `--vram-reserve-mib`（後続 GPU 用の指定があれば `--vram-reserve-later-mib`）、verify window、pipeline window、drafter/head の予約は別途差し引かれます。
+この値は配置探索専用で、探索後に実行段の容量を計算する `stage_room` 呼び出しでは `search` が既定値 `false`。その場合はこの値や `split_own_auto` に関係なく `split_pf_mib` が計上される。従って、この変数は実行時の buffer 割当量を直接切り替えず、自前 buffer の選択自体にも影響しない（CUDA: `engine/src/program/generate.cpp:6901-6908,9893-9911`、SYCL: `engine/sycl/src/program/generate.cpp:3896-3908,5562-5573`）。子プロセスへの転送処理はこの名前の参照からは確認できない。
 
-探索が終わって cache を実際に確保する際は `search=false` で `stage_room()` が呼ばれるため、`STRATA_SPLIT_OWN_PLACE` の値にかかわらず `split_pf_mib` が差し引かれます。このため、既定の探索は独自 buffer の予約を無視して境界を選び、その後の cache が小さくなる場合があります。`reserve` は探索モデルにも実際の予算を反映させ、選ばれる layer 境界や予測値を変えることがあります。どの境界が選ばれるかは GPU の空き VRAM、各 stage の session サイズ、profile、リンク速度などにも依存します。
+## ログと測定値
 
-CUDA と SYCL の `generate.cpp` に同じ値比較と `stage_room()` の予約条件があります。実装上、環境変数専用のログはありません。`--layer-split auto` の通常の起動ログには、選ばれた `K`、予測 decode window 時間、profile 上の cache 保持量が出ます。
+この変数の値だけを示すログや、無効値の警告はない。自動配置の経過として各 GPU の容量・性能を出力し、成功時には選んだ `K`、予測 decode 時間、cache が保持する expert 数などを stderr に出す（CUDA: `engine/src/program/generate.cpp:6971-6988,7510-7515`、SYCL: `engine/sycl/src/program/generate.cpp:3921-3945`）。有効な split が見つからない場合は `strata generate: --layer-split auto: no valid split for ...` を出して `return 2` するが、この変数に固有の失敗ではない（CUDA: `engine/src/program/generate.cpp:7501-7505`）。
 
-根拠: `src/program/generate.cpp:3797-3812,3814-3826,4287-4292,5552-5563`、`sycl/src/program/generate.cpp:3546-3567`。
+## 根拠
 
-## 文書・測定との照合
-
-`docs/MULTI_GPU.md:76-83` は `STRATA_SPLIT_OWN=1` と `auto` の独自 prompt buffer 選択条件を説明していますが、`STRATA_SPLIT_OWN_PLACE` の説明はありません。ソースコメント (`src/program/generate.cpp:3761-3765`) には、予約込みの探索で境界が `K=28` から `K=32` に変わり、decode が 54.8 tok/s になった比較として、R9700 + RX 9070 XT の測定値が記録されています。ただし、これはソースコメントの記録であり、モデルや測定条件の詳細が揃っていないため、この文書では一般的な性能効果として扱いません。
+- CUDA の読み取りと予約判定: `engine/src/program/generate.cpp:6897-6908`
+- CUDA の自前 buffer 条件と reserve 算定: `engine/src/program/generate.cpp:4916-4952,6821-6832`
+- CUDA の探索容量・配置候補への適用: `engine/src/program/generate.cpp:6911-6922,6963-6971`
+- SYCL の読み取りと予約判定: `engine/sycl/src/program/generate.cpp:3892-3908`
+- SYCL の自前 buffer 条件と reserve 算定: `engine/sycl/src/program/generate.cpp:2375-2419,3850-3860`
+- SYCL の探索容量・配置候補への適用: `engine/sycl/src/program/generate.cpp:3908-3913,3921-3929`

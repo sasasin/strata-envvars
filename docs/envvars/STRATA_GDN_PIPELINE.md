@@ -1,56 +1,42 @@
 # `STRATA_GDN_PIPELINE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。開始時の作業ツリーは `main...origin/main` で、Strata リポジトリには本調査と無関係な未追跡のベンチマーク結果ディレクトリがあった。調査対象は Strata 所有ソース。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-GDN（gated delta network）の prompt prefill における再帰計算で、token ごとの入力を先読みする software-pipelined 列分割カーネルを使うか、先読みしない列分割カーネルを使うかを切り替える。これはカーネル実装を選ぶ設定で、`STRATA_GDN_PIPELINE` 自体は GDN 計算値を変換しない。
-
-通常の GDN layer の prefill は射影・gate・畳み込みの後に `gdn_recurrence()` を呼ぶ。この関数は `gdn_recurrence_variant()` に処理を渡し、後者の条件を通った場合に環境変数を読み、再帰カーネルを選ぶ。CUDA/HIP の通常経路では、ON は先読み版 `gdn_rec_cols_pipe_kernel`、OFF は `gdn_rec_cols_kernel` を実行する。CUDA の一部デバイスでは別の key-head カーネルが選ばれることもある（後述）。
+GDN recurrence の列分割カーネルで、次 token の入力を先読みする software-pipelined 版を選ぶかを制御する。未設定時はパイプライン版が選ばれる。値を `0` として判定すると、fallback dispatch で `gdn_rec_cols_kernel` を使う。パイプライン版は `gdn_rec_cols_kernel` と同じ演算順序・bit pattern とソースコメントに記されている（測定値の記載ではない）。CUDA、HIP、SYCL の各 recurrence 実装に読み取り箇所がある。`engine/src/prefill/kernels.cu` の `gdn_recurrence_impl` と `engine/sycl/src/prefill/kernels.dp.cpp` の `gdn_recurrence_variant` が実際の選択を行う。 ( `engine/src/prefill/kernels.cu:700-703,3183-3189,3253-3277`; `engine/sycl/src/prefill/kernels.dp.cpp:876-885,2887-2952` )
 
 ## 値と判定
 
-`std::getenv()` の値を `std::atoi()` に渡し、未設定なら ON、設定済みなら変換結果が 0 以外のとき ON とする。文字列全体の数値検査はしない。
+CUDA/HIP と SYCL の読み取りは同じ式で、`getenv` の結果を初回評価時に `static const bool` へ保存する。未設定（null）の場合だけ `true`。設定済みなら `std::atoi(v) != 0` であり、空文字や数値として先頭を変換できない文字列は 0 となる。文字列全体の妥当性、大文字小文字、真偽語は検査しない。先頭の空白と符号は `atoi` の変換規則に従う。値の範囲を Strata 側で検査・clamp するコードはない。
 
-| 環境値 | 判定 |
-|---|---|
-| unset | ON |
-| `0`、`00`, `0tail`、空文字、数値に変換できない文字列 | OFF（`atoi` が 0） |
-| `1`、`-1`、`2tail`、先頭空白の後に非ゼロ整数がある文字列 | ON（`atoi` が非 0） |
+| 条件 | unset | パイプラインを選ぶ例 | 列カーネルを選ぶ例 |
+|---|---|---|---|
+| CUDA/HIP または SYCL の読み取りに到達 | `pipe=true` | `1`, `-1`, `2`, ` 1`, `1xyz` (`atoi` が非 0) | `0`, `00`, `0xyz`, `true`, 空文字, `xyz` (`atoi` が 0) |
 
-したがって `true` / `false` はどちらも `atoi` が 0 を返すため OFF。先頭の空白や符号は `atoi` の通常の変換に従い、数値の後ろの文字列は判定に影響しない。オーバーフロー時の `atoi` の結果には依存できないため、値として使うべきではない。
-
-判定値は関数内の `static const bool` に一度保存される。実際にこの分岐へ初めて到達した後、プロセス内で環境を書き換えても再評価されない。読み取りは未設定を ON と扱う。
+( `engine/src/prefill/kernels.cu:3188`; `engine/sycl/src/prefill/kernels.dp.cpp:2888` )
 
 ## 有効になる条件
 
-環境変数を読んで分岐するのは、`STRATA_GDN_REC_HEADS` が未設定で、`T > 0` かつ `variant != 2` の場合だけ。`STRATA_GDN_REC_HEADS` は値の内容でなく設定有無で判定され、空文字を含め設定されていると一ブロック/一 head の再帰カーネルへ進み、この設定は評価されない。`T <= 0` と `variant == 2` も通常再帰カーネルへ進み、この設定を評価しない。
-
-AMD/HIP build では `STRATA_GDN_HEAD` により `variant == 1` に選ばれると、quad recurrence の分岐が `STRATA_GDN_PIPELINE` の分岐より先に return する。gfx1151 と gfx12 では起動時の architecture defaults が、ユーザーが未設定なら `STRATA_GDN_HEAD=1` を環境に設定する。そのため既定設定ではこの設定は評価されず、`STRATA_GDN_HEAD=0` を明示するか、architecture defaults 全体を無効にして `variant == 0` にするなど、通常再帰経路に入った場合に使われる。`STRATA_GDN_REC_HEADS` が設定されている場合は `variant == 0` でも一ブロック/一 head 経路へ進むため、やはり評価されない。CUDA build ではこの AMD 専用 `variant == 1` 分岐はない。
-
-追加の経路差:
-
-- CUDA では `STRATA_GDN_CHUNKED` が `atoi != 0` で、`T >= kGdnChunkedMin` かつ chunked scratch/launch が成功すると、chunked recurrence が選択され、pipeline の値にかかわらず後続の pipeline 分岐を通らない。chunked が不適用または失敗した場合は下記の選択へ進む。
-- CUDA では pipeline が ON のときだけ `gdn_keyhead_ok()` を検査する。この helper は `STRATA_GDN_KEYHEAD=0` で明示的に止められておらず、GPU が compute capability 8.0 以上で occupancy 条件を満たすと、`gdn_rec_kh_kernel` が選ばれる。その条件を満たさない場合は software-pipelined 列分割版へ進む。pipeline が OFF の場合は key-head kernel を検査せず、通常の列分割版を使う。
-- HIP の通常再帰経路では CUDA 専用の chunked recurrence と key-head 選択がコンパイル対象外で、pipeline の ON/OFF がそれぞれ pipe/plain の列分割版を選ぶ。
-- 通常の GDN prefill 呼び出し元はモデルの layer 種別で GDN を処理し、計算対象の token 数 `T` を再帰関数へ渡す。これは decode loop 全般の設定ではない。
-- AMD/HIP の `strata generate` は engine が環境スイッチを読む前に `apply_arch_defaults()` を呼ぶ。gfx1151 と gfx12 の defaults は `STRATA_GDN_HEAD=1` を含み、ユーザーが既に設定した値は保持する。`STRATA_GFX1151_DEFAULTS=0` または `STRATA_GFX12_DEFAULTS=0` は各 architecture の defaults 適用を止める。
+- 対応 backend の GDN recurrence がこの環境変数の読み取り箇所まで到達すること。未設定を含む最初の読み取り結果は関数内 `static` に保存される。
+- CUDA の通常 dispatch では、別経路が先に選ばれないこと。`STRATA_GDN_TC` / `STRATA_GDN_CHUNKED` による適用可能な経路が成功すれば、その経路が優先され、fallback の pipeline/columns 選択には到達しない。fallback では `pipe=true` かつ `gdn_keyhead_ok()` なら key-head kernel、そうでなければ pipe kernel が選ばれる。`pipe=false` なら key-head 判定を通さず columns kernel を選ぶ。テスト用 probe が強制 path を指定した場合、その path が優先され、`STRATA_GDN_PIPELINE` は選択に関与しない。 ( `engine/src/prefill/kernels.cu:3211-3265` )
+- HIP では `gdn_rec_wmma` が chunked 経路を実行して戻る場合、または診断用 variant が早期 return する場合には読み取り・選択に到達しない。それ以外の通常 fallback は `pipe` に応じて pipe / columns kernel を選ぶ。 ( `engine/src/prefill/kernels.cu:3088-3100,3101-3144,3270-3275` )
+- SYCL では `STRATA_GDN_REC_HEADS` が設定されている場合、`T <= 0`、または `variant == 2` のとき読み取り前の分岐で通常 recurrence kernel を選ぶ。`variant == 6` の Xe 経路では読み取りは行われるが、その後 `xe` 分岐が優先するため、この変数は選択に影響しない。その他の経路では `pipe=true` が pipeline 分岐へ進み、`gdn_keyhead_ok()` なら key-head kernel、そうでなければ pipe kernel（SYCL の追加条件により paired/local variant を含む）を選ぶ。`pipe=false` は columns kernel を選ぶ。 ( `engine/sycl/src/prefill/kernels.dp.cpp:2864-2893,2909-2952` )
+- この変数を読む箇所には CLI 引数や設定ファイルから値を上書きする処理がない。したがってこの分岐の値源はプロセス環境であり、プロセス内で後から環境を変更しても、関数内 static が初期化済みなら反映されない。
 
 ## 実行時の詳細
 
-ON 時の `gdn_rec_cols_pipe_kernel` は token `t` の計算中に `t+1` の q/k/v/gate/beta を register に先読みしてから次の反復に使う。OFF 時の `gdn_rec_cols_kernel` は各反復でその token の q/k を共有メモリへ読み、同じ列分割の再帰と出力を処理する。両カーネルのソースコメントは、同じ演算順・同じ bit 結果と説明している。これは実装コメントにある性質であり、本調査で GPU を実行して独立検証した結果ではない。
+CUDA/HIP の `gdn_recurrence_impl` は一部の早期経路を除き、fallback dispatch 内で `pipe` を初期化し、同じ `state`, `h`, `gate`, `beta`, `y`, `T` を受ける二つの recurrence kernel のいずれかを launch する。通常の出力付き処理では、その後 `with_out` かつ選択 kernel が出力正規化を融合していない場合に `gdn_out_norm_kernel` も launch する。環境変数は token ごとや呼び出しごとに読み直さない。CUDA probe による強制選択はこの設定を迂回できる。 ( `engine/src/prefill/kernels.cu:3083-3087,3183-3189,3253-3279` )
 
-設定によるログ出力、警告、終了動作は確認できない。`docs/DETAILS.md` は `STRATA_GDN_CHUNKED` の条件付き測定を記載しているが、`STRATA_GDN_PIPELINE` の値や性能測定は記載していない。そのため pipeline の速度向上や性能差はここでは主張しない。
+SYCL でも初回到達時の値を static 保存し、pipeline 分岐か columns 分岐を選ぶ。どちらの分岐も recurrence kernel を投入し、通常経路では続けて出力正規化 kernel を投入する。SYCL の `STRATA_SYCL_GDN_PREFILL_REG_QK` は pipeline 分岐内の別最適化を選ぶが、`STRATA_GDN_PIPELINE` の値判定を置き換えない。 ( `engine/sycl/src/prefill/kernels.dp.cpp:2887-2952,2953-2970` )
 
-SYCL にも `sycl/src/prefill/kernels.dp.cpp` に対応する環境読み取りとカーネル分岐がある。しかし同ファイルは CUDA ソースの DPCT 移行コードであり、調査手順の「生成済みコードを根拠にしない」に従って、上記の挙動説明の根拠には使っていない。SYCL でのビルド成果物に対する独立確認は行っていない。
+## ログと測定値
+
+本番 recurrence のこの分岐自体は値や選択 kernel のログを出さない。GDN harness は環境変数が設定済みの場合に限り `env STRATA_GDN_PIPELINE=<値>` を stdout に表示するが、これは harness の診断表示で、本番 engine のログではない。 ( `engine/src/prefill/gdn_harness.cu:448-452` )
 
 ## 根拠
 
-- `src/prefill/kernels.cu:1974-1994` — serial / `T` / variant の早期分岐、`STRATA_GDN_PIPELINE` の `getenv`・`atoi` 判定、CUDA chunked/key-head/pipeline/plain カーネルの選択と最終チェック。
-- `src/prefill/kernels.cu:495-553` — 先読み版の処理と、同じ演算順に関する実装コメント。
-- `src/prefill/kernels.cu:696-712` — CUDA の key-head カーネル有効条件と `STRATA_GDN_KEYHEAD` の判定。
-- `src/prefill/kernels.cu:1931-1973,1996-2003` — HIP の variant 分岐、`STRATA_GDN_HEAD` による dispatch、recurrence 呼び出し。
-- `src/core/arch_defaults.cpp:12-34,61-81` と `src/program/generate.cpp:2152-2158` — gfx1151/gfx12 で `STRATA_GDN_HEAD=1` を既定設定し、ユーザー値を保つ起動時処理。
-- `src/prefill/prefill.cpp:2603-2626` — GDN prefill の処理から `gdn_recurrence()` を呼ぶ位置。
-- `CMakeLists.txt:586-589` — CUDA/HIP build の `strata_prefill` に `src/prefill/kernels.cu` を含める。
-- `docs/DETAILS.md:1668-1679` — GDN chunked の性能記載。pipeline 自体の記載・測定根拠ではない。
+- `engine/src/prefill/kernels.cu:700-703,3081-3087,3145-3164,3183-3189,3211-3279` — CUDA/HIP の候補 kernel、評価、dispatch と出力正規化。
+- `engine/sycl/src/prefill/kernels.dp.cpp:876-885,2800-2815,2864-2893,2909-2970` — SYCL の評価、Xe / key-head / pipeline / columns dispatch。
+- `engine/src/prefill/gdn_harness.cu:448-452` — harness の環境値表示。
+- `docs/GDN_CONTRACT.md:62-72` — dispatch 説明との照合。これはソース実装の根拠ではなく、条件確認の補助として参照。

@@ -1,55 +1,61 @@
-# `--output`
+# `strata components install-file --output`
 
-調査対象: Strata commit `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
 | コマンド | `strata components install-file` |
 | オプション | `--output` |
-| 別名 | なし（`--json` は共通の別 option で、`--output json` にする） |
+| 別名 | なし |
 | 値 | `human`、`json`、`jsonl` |
 
 ## 役割
 
-ローカルにある engine package を導入する処理の表示形式を選びます。ファイルの検証や engine の導入方法を指定する option ではありません。
+結果の表示形式を選びます。エンジンのアーカイブを署名検証してインストールする処理自体はどの形式でも同じですが、機械可読形式では進捗イベントの扱いと、実行中エンジンがある場合の対話確認が変わります。
 
 ## 使い方
 
 ```sh
-strata components install-file --output json ./strata-engine.tar.gz
-```
+# 人向けの通常表示
+strata components install-file ./strata-engine.tar.gz --output human
 
-`file` 位置引数には、事前に取得した engine package のパスを指定します。`install-file` は feed を使わず、package の署名を検査して導入する経路です（`strata_cli/update_cmd.py:59-61,208-216`、`strata_control/updater.py:1088-1091`）。
+# 成功結果またはエラーを JSON として取得
+strata components install-file ./strata-engine.tar.gz --output json
+
+# 処理フェーズを JSONL イベントとして受け取り、最後に結果オブジェクトを取得
+strata components install-file ./strata-engine.tar.gz --output jsonl
+```
 
 ## 値と既定値
 
-- parser は `choices=("human", "json", "jsonl")`、既定値 `human` で定義されています。値を省略すると人間向け表示です（`strata_cli/update_cmd.py:30-39`）。
-- `--json` は one-shot command に後から追加される別 option で、指定すると `--output json` と同じ状態になります（`strata_cli/cli.py:508-515,2232-2235`）。
-- 選択肢以外の値は argparse が拒否し、usage とエラーを stderr に出して終了コード 2 になります。空値も選択肢に含まれないため受理されません。複数回指定した場合は argparse の通常の scalar option として最後の値が残ります（定義: `strata_cli/update_cmd.py:39`）。
+省略時は `human` です。parser は `human`、`json`、`jsonl` のいずれかに限定し、他の値を `argparse` の選択肢エラーとして拒否します。値は `--output` の次に1つ指定します。別名は定義されていません（`terminal/strata_cli/update_cmd.py:47-56,92-94`）。
 
 ## 実行時の動作
 
-- `human` は通常の進捗・結果を stdout に出します。TTY ではダウンロード進捗を同じ行に更新し、非 TTY では概ね 10% ごとに表示します（`strata_cli/update_cmd.py:65-87`）。
-- `json` は進捗イベントを抑え、成功時に `schema_version: 1` と `ok: true`、導入結果を含む JSON object を stdout に出します（`strata_cli/update_cmd.py:65-74,208-216`）。
-- `jsonl` は処理中の phase/progress/waiting event を1行ずつ JSON で出し、成功時には最後に導入結果の JSON object も出します。install-file では `Context.say()` が phase event を生成し、検証・test-start・切替の段階で呼ばれます（`strata_cli/update_cmd.py:69-87,208-216`、`strata_control/updater.py:344-345,1109-1115,1002-1005,1038,1074`）。完了 object も JSONL として扱う場合は、各行が独立した JSON として読めます。
-- `--json` と `--output jsonl` を同時に指定すると、共通処理が `--json` を one-shot 専用として扱い、JSONL と併用できない旨のエラー経路に入ります（`strata_cli/cli.py:2232-2235`）。JSONL を使うときは `--output jsonl` のみを指定します。
-- `--quiet` は共通 option です。人間向け出力では stdout を一時捕捉し、成功時は表示せず、失敗時は捕捉した内容を stderr に戻します。`json` / `jsonl` は machine output として捕捉を迂回します（`strata_cli/cli.py:512-515,2236-2248`）。
+- `human` は通常の説明文を表示します。インストール処理が送るフェーズ情報は標準出力へ表示され、完了時は結果の注記、またはエンジンの状態を整形した行を表示します（`terminal/strata_cli/update_cmd.py:117-139,345-354`）。
+- `json` は進捗・フェーズイベントを表示せず、完了時に `schema_version: 1` と `ok: true` を含む結果オブジェクトを標準出力へ出します。処理エラーは `ok: false` と `error.code`、`error.message` を含む JSON です（`terminal/strata_cli/update_cmd.py:117-126,309-315,345-354,378-388`）。
+- `jsonl` はフェーズイベントごとに `schema_version: 1` を付けた JSON 行を出し、完了時には `schema_version: 1` と `ok: true` を含む最終結果の JSON 行も出します。イベント行は `flush=True` で逐次出力されます。失敗時はイベント行に続いて、`json` と同じ形のエラー JSON 行を出します（`terminal/strata_cli/update_cmd.py:117-139,309-315,345-354,378-388`）。
+
+このコマンドは指定アーカイブを展開し、マニフェストと署名・全ファイルを検証して、この PC に適合するか確認した後、エンジンをテスト起動して切り替えます。`--output` はこの処理を変更しません。入力アーカイブは残されます（`terminal/strata_control/updater.py:1660-1717`, `1560-1564,1641-1649`）。
 
 ## 適用条件と副作用
 
-この option は出力経路だけを切り替えます。package の読み取り、署名・全ファイル検証、対象 PC との適合判定、test-start、engine の切替などは `--output` の値によらず実行されます（`strata_cli/update_cmd.py:208-216`、`strata_control/updater.py:1088-1145,994-1077`）。導入に成功すると component state や履歴が更新されます。選択した元 package ファイルは削除されません（`strata_control/updater.py:1089-1091,1066-1074,1142-1145`）。
+`json` と `jsonl` は内部で機械出力として扱われます。稼働中エンジンがある場合、人向け対話確認を行わず、`--wait` がなければ待機せずに `Busy` エラー（終了コード 7）となります。`human` で端末入出力が可能なら待機するか質問し、肯定時は最大6時間待ちます。`--wait` を指定するとこの質問を省き、指定秒数の待機経路を使います（`terminal/strata_cli/update_cmd.py:504-519,345-349`; `terminal/strata_control/updater.py:383-393,72-83`）。
+
+ファイルが存在しない、形式が `.tar.gz` / `.tgz` / `.tar.xz` / `.zip` でない、読み込み・展開・署名・ハッシュ検証に失敗する、または PC に適合しない場合は、インストールを拒否する経路があります。既により新しいエンジンがあり `--force` がない場合は、成功応答として「変更なし」の結果を返します。これらは `--output` の形式によって変わりません（`terminal/strata_control/updater.py:1652-1717`）。
 
 ## 出力とエラー
 
-- 失敗時、`json` / `jsonl` は `schema_version: 1`、`ok: false`、エラーコードとメッセージを含む JSON object を出します。`human` は `strata: ...` を stderr に出します（`strata_cli/update_cmd.py:174-183,246-255`）。この failure object は JSONL の event としてはラップされません。
-- package が見つからない、形式・署名・内容が不正、またはこの PC に適合しない場合は installer が `UpdateError` を返し、署名検証失敗等は通常 exit code 5 になります。実行中の engine があり待機しない場合や test-start 等の失敗は別の code になり得ます。I/O error は CLI 共通処理で code 6 のエラーとして扱われます（`strata_control/updater.py:1088-1132,994-1024`、`strata_cli/update_cmd.py:246-255`、`strata_cli/cli.py:2176-2183`）。
-- 出力先ファイルを作成する機能はありません。出力は stdout/stderr です（`strata_cli/update_cmd.py:69-87,178-183,212-216`）。
+インストール経路の `UpdateError` と署名エラーは `human` では `strata: ...` を標準エラーへ出し、JSON/JSONL ではエラー JSON を標準出力へ出します。返される終了コードは各エラーのコードを使います。未知の値など parser 段階の拒否は `argparse` による usage/error 出力です（`terminal/strata_cli/update_cmd.py:311-316,378-388`; parser: `terminal/strata_cli/update_cmd.py:56,92-94`）。
 
 ## 根拠
 
-- parser 定義と共通 option: `strata_cli/update_cmd.py:30-39,59-62`
-- `--json` / `--quiet` の共通追加、実行時処理: `strata_cli/cli.py:508-515,2223-2248`
-- install-file の出力分岐と失敗経路: `strata_cli/update_cmd.py:65-87,174-217,246-255`
-- ローカル package の検証・適合判定・導入: `strata_control/updater.py:1088-1148,994-1077`
+- `terminal/strata_cli/update_cmd.py:47-56,92-94` — 共通 parser への登録、値の選択肢、既定値、および `install-file` への適用。
+- `terminal/strata_cli/update_cmd.py:117-139` — 人向け、JSON、JSONL のイベント出力。
+- `terminal/strata_cli/update_cmd.py:309-354,378-390` — 成功・失敗時の出力と終了コード処理。
+- `terminal/strata_cli/update_cmd.py:504-519` — 人向けと機械出力で異なる稼働中エンジンへの対応。
+- `terminal/strata_control/updater.py:1652-1717` — 入力ファイル、形式、検証、適合確認、既存版との比較、およびインストール呼び出し。
+- `terminal/strata_control/updater.py:1560-1649` — テスト起動、切り替え、状態保存、選択した元アーカイブを削除しない処理。
 
+調査範囲は上記 Strata checkout の parser と処理実装です。`--help` の実行やビルドは行っていません。

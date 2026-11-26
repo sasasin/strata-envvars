@@ -1,43 +1,45 @@
 # `TERM_PROGRAM`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査時の作業ツリーは `main...origin/main` で、`git status --short --branch` に未コミット変更の表示はなかった。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Strata の Python CLI が端末環境を推定するために参照する。`strata launch` では、通常の対話画面を表示できない実行でも人が入力できる可能性を判定し、質問を伴うプレーンな起動経路を選ぶ材料になる。Windows のクラシックコンソール判定では、Windows Terminal や VS Code など別の端末であることを示す条件の一つとなり、古いコンソール向け描画を避ける。
-
-この変数を読む本番コードは `strata_cli/launch/cmd.py` と `strata_cli/consoleinfo.py` の2か所。候補一覧に名前があることに加え、どちらも実際に `os.environ` から値を参照している。`tests/terminal/test_monitor_classic.py:75` にもテスト用環境辞書から除外する参照があるが、挙動の根拠にはしていない。候補一覧の記載は `docs/envvars/000_envvers.md:1670`。
+Strata 同梱の Python CLI で、ターミナル種別の目印として設定有無を参照する。Windows のクラシックコンソール向け表示を選ぶ判定と、`strata launch` が画面を開けない端末でも質問を続けられるかの判定に使う。値の内容からアプリ名を判別する処理ではない。実行時の読み取りは `terminal/strata_cli/consoleinfo.py:24-35` と `terminal/strata_cli/launch/cmd.py:570-584`。
 
 ## 値と判定
 
-どちらの読み取り箇所も値を parse せず、文字列の truthiness（空でないか）だけを使う。値が `1` か、端末名が何か、大文字小文字がどうかは検査しない。
+両方の実行箇所とも `os.environ.get("TERM_PROGRAM")` の返り値を Python の真偽値として使う。未設定なら `None`、空文字なら偽、空でない文字列なら真として扱う。文字列の比較、大小文字変換、空白除去、値の妥当性検査はしないため、例えば `vscode` 以外の任意の非空値や空白だけの値も「設定あり」になる。数値変換や数値境界はない。`terminal/strata_cli/consoleinfo.py:33-35`、`terminal/strata_cli/launch/cmd.py:580,583`。
 
-| 値 | `strata launch` の `_can_ask()` | `legacy_console()`（Windows のみ） |
-|---|---|---|
-| 未設定 | この条件では false | この条件では false（よって他の拒否条件がなければクラシックコンソール扱い） |
-| 空文字 | false | false（他の拒否条件がなければクラシックコンソール扱い） |
-| 任意の非空文字列（例: `vscode`, `Apple_Terminal`, `0`, `false`） | true | true（クラシックコンソールではないと判定） |
+| 実行箇所・条件 | unset / 空文字 | 非空値 | 優先・併用条件 |
+|---|---|---|---|
+| `consoleinfo.legacy_console()`（Windows 判定まで到達） | この変数ではクラシック判定を妨げない | クラシックコンソールではないと判定 | 先に `STRATA_GLYPHS=ascii|legacy|solid` ならクラシックを強制し、`STRATA_GLYPHS=unicode` ならクラシックでないと強制する。これら以外は Windows 以外で常にクラシックでない。Windows では `WT_SESSION`、`ConEmuANSI`、`ANSICON`、指定接頭辞で始まる `TERM` もクラシック判定を妨げる。 |
+| `launch.cmd._can_ask()` | この変数単独では端末の目印にならない | 端末の目印の一つになる | `MSYSTEM`、`TERM`、`WT_SESSION` のいずれかが非空でも同じ判定になる。先に標準入力・`CI`・`STRATA_NO_PROMPT` を検査し、利用可能な `strata_cli.noinput` がある場合はキーボード不在も検査する。 |
 
-`_can_ask()` では `CI` または `STRATA_NO_PROMPT` が非空なら先に false を返し、`TERM_PROGRAM` は `MSYSTEM`, `TERM`, `WT_SESSION` と並ぶ OR 条件の一つである。ほかのいずれかが非空なら `TERM_PROGRAM` の値を個別に区別しない。標準入力が `None` または閉じている場合も先に false になる（`strata_cli/launch/cmd.py:511-518`）。
+根拠: `terminal/strata_cli/consoleinfo.py:26-35`、`terminal/strata_cli/launch/cmd.py:570-584`。
 
 ## 有効になる条件
 
-- **`strata launch`**: 標準入力が開いており、`CI` と `STRATA_NO_PROMPT` が空または未設定であることが必要。さらに実際に `_can_ask()` の結果が使われるのは、選択肢の指定がなく、対話画面も使えない場合である。`--output json` 等の machine 実行、`--no-tui`、カタログ不在はこのフォールバックより優先して失敗経路になる。通常の TTY 上で選択肢がある場合の TUI 選択を `TERM_PROGRAM` は変えない（`strata_cli/launch/cmd.py:753-778`）。
-- **Windows の描画判定**: `legacy_console()` は `STRATA_GLYPHS` が `ascii` / `legacy` / `solid` なら先にクラシック描画を強制し、`unicode` なら先にクラシック描画を無効化する。どちらにも該当しない場合、Windows 以外では直ちに false を返す。Windows では `WT_SESSION`, `TERM_PROGRAM`, `ConEmuANSI`, `ANSICON` のいずれかが非空、または `TERM` が `xterm` / `screen` / `tmux` / `vt` のいずれかで始まる場合にクラシックコンソールではないと判定する（`strata_cli/consoleinfo.py:24-35`）。したがって `STRATA_GLYPHS` の明示値が `TERM_PROGRAM` より優先する。
-- 描画判定の結果はモニターの glyph 選択と classic style 適用、起動画面の glyph 選択に使われる（`strata_cli/monitor.py:26-45,138-143`; `strata_cli/launch/widgets.py:43-57`）。`classic_style()` は最初の計算結果をモジュール内 `_cached` に保持するため、その後 `TERM_PROGRAM` を変更してもこの style 結果は再計算されない。一方 `legacy_console()` 自体は環境を呼び出しごとに参照する（`strata_cli/consoleinfo.py:158-178`）。
+- 表示判定では Windows（`os.name == "nt"` または `sys.platform == "win32"`）で、かつ `STRATA_GLYPHS` による早期の強制指定がない場合だけ `TERM_PROGRAM` が `legacy_console()` の結果に影響する。非 Windows ではこの関数は `False` を返す。`terminal/strata_cli/consoleinfo.py:24-35`。
+- `legacy_console()` が偽になると、CLI モニターはクラシックコンソール専用のスタイル情報を使わず、通常の Unicode 描画選択を行う。ウィジェットもクラシック向けフォント条件で Unicode を抑制しない。`terminal/strata_cli/monitor.py:26-45,141-144`、`terminal/strata_cli/launch/widgets.py:43-57`。
+- 質問可否の判定では `strata launch` に開始選択がなく、対話 TUI を使えない状態で、`--plan` でもない場合に `_can_ask()` が呼ばれる。`--no-tui`、`--output json`、カタログ不在は環境変数に関係なく質問経路を止める。`CI` または `STRATA_NO_PROMPT` が非空、標準入力がない／閉じている、もしくは利用可能な `strata_cli.noinput.stdin_is_no_keyboard()` が真の場合も `_can_ask()` は偽になる。`terminal/strata_cli/launch/cmd.py:570-584,849-866`。
+- stdin と stdout がともに TTY で `--no-tui`、JSON 出力、plan 実行でない場合は通常の対話経路になるため、この変数による `_can_ask()` 判定は使われない。開始選択（例: `--model` / `--preset`）を明示した場合も、開始選択がない場合の質問可否分岐の対象外。`terminal/strata_cli/launch/cmd.py:849-862`。
 
 ## 実行時の詳細
 
-`strata launch` が選択肢なしで TUI も使えないとき、`_can_ask()` が true なら `plain_questions` 経路に入り、「This window cannot show Strata's screens ... Going on with plain questions.」を表示する（画面用パッケージがない場合はその説明を優先）。続けるかを標準入力で尋ね、空入力、`y`、`yes` は続行、それ以外は「Nothing was changed.」を出して終了コード 0 になる。EOF は `fail(...)` により「There is nobody to answer. ...」を表示して終了コード 2。`TERM_PROGRAM` 単独では質問を開始せず、上記の他条件と CLI 状態も満たす必要がある（`strata_cli/launch/cmd.py:765-778,842-849`）。
+`consoleinfo.legacy_console()` は呼び出すたびに環境を読み直し、`TERM_PROGRAM` 自体をキャッシュしない。一方 `classic_style()` は最初の呼び出しで得た `legacy_console()` の結果を含むスタイル辞書をモジュール変数 `_cached` に保存し、その後は返り値を再利用する。したがって、プロセス内で環境を変更した場合でも、`legacy_console()` の直接結果には反映されるが、既に `classic_style()` が初期化されていればそのスタイル結果は更新されない。`terminal/strata_cli/consoleinfo.py:24-35,158-178`。
 
-Windows の自動描画判定では、非空の `TERM_PROGRAM` によって `legacy_console()` が false になり、`classic_style()` は `{"mode": "none", ...}` を返す。モニターはクラシック専用の glyph/style を使わず、起動画面の `unicode_ok()` もクラシックコンソール専用の制限を適用しない。ただし文字コードや `TERM=dumb` など別条件は独立して評価される。`STRATA_GLYPHS` の強制設定がある場合はその分岐が先に適用される（`strata_cli/consoleinfo.py:24-35,143-178`; `strata_cli/monitor.py:26-45`; `strata_cli/launch/widgets.py:43-57`）。
+`launch.cmd._can_ask()` は対象分岐で都度呼ばれ、その呼び出し時点の `os.environ` を参照する。プロセス起動後に値を変えた場合も、呼び出し前なら判定に反映される。子プロセスへの設定転送・書換えはこの読み取り箇所にはない。環境変数は通常の TTY 対話経路、明示的な開始選択、`--plan` には適用されない。`terminal/strata_cli/launch/cmd.py:570-584,849-866`。
 
-この変数を理由にした専用の警告・ログ・終了経路はない。起動時に値を保存する共通 cache はなく、`_can_ask()` と `legacy_console()` は呼ばれた時点で環境を読む。例外は前述の `classic_style()` の計算結果 cache である。Strata の資料でこの環境変数固有の追加挙動や測定値は確認できなかった。
+## ログと測定値
+
+`TERM_PROGRAM` の値そのものを出力するログはない。表示判定は描画スタイルに反映される。`strata launch` で開始選択がなく質問可能な非 TTY 端末と判定されると、画面パッケージがないケースを除き `no_screens_words()` の案内を表示して通常行で続行し、`Start it now? Models can be tens of GB to download. [Y/n] ` を尋ねる。質問可の判定に失敗すると stderr に ``strata: `strata launch` with no choices opens screens, and this is not a terminal (or --no-tui was given). Name what to start: --preset NAME, or --model NAME (strata launch --help has examples; --plan shows what would happen without changing anything).`` を出し、終了コード `2` を返す。`--output json` では同じ失敗を JSON の `error` として stdout に出す。回答入力で EOF になった場合は別メッセージを返して終了コード `2` となる。`terminal/strata_cli/launch/cmd.py:759-764,854-866,937-944`。
+
+性能測定値は該当しない。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:511-518` — 開いた標準入力、`CI` / `STRATA_NO_PROMPT` の拒否、`TERM_PROGRAM` を含む端末環境の truthiness 判定。
-- `strata_cli/launch/cmd.py:753-778,842-849` — CLI/TUI 条件、plain question 経路、入力結果と観測できる出力・終了コード。
-- `strata_cli/consoleinfo.py:24-35` — `STRATA_GLYPHS` と OS 判定の優先順、`TERM_PROGRAM` を含むクラシックコンソール判定。
-- `strata_cli/consoleinfo.py:143-178` — 描画 style の結果と `classic_style()` の cache。
-- `strata_cli/monitor.py:26-45,138-143`; `strata_cli/launch/widgets.py:43-57` — 判定結果が反映される描画経路。
+- `terminal/strata_cli/consoleinfo.py:24-35` — Windows のクラシックコンソール判定と環境変数の優先条件。
+- `terminal/strata_cli/consoleinfo.py:158-178` — クラシックスタイルの初回計算とキャッシュ。
+- `terminal/strata_cli/monitor.py:26-45,141-144`、`terminal/strata_cli/launch/widgets.py:43-57` — 端末判定後の描画選択。
+- `terminal/strata_cli/launch/cmd.py:570-584,849-866,937-944` — 質問可能な環境の判定、通常行での確認、および失敗時の分岐。
+- `terminal/tests/terminal/conftest.py:11-16` と `terminal/tests/terminal/test_monitor_classic.py:71-83`、`terminal/tests/terminal/test_monitor_classic.py:75-79` — テスト環境の表示モード調整と端末判定テスト用に環境を組み替える箇所。本番動作の根拠にはしていない。

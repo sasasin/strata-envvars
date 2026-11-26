@@ -1,57 +1,55 @@
 # `STRATA_ADAPT_FETCH`
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-適応 tier が動作している CUDA の `serve` / `generate` で、PCIe share が GPU に送る expert miss を VRAM cache に直接取り込み、同じ layer の未使用 resident expert の slot と入れ替えます。RAM tier から別途 swap するのではなく、PCIe share が元々転送する blob を cache slot に書き、host residency table を更新します。`=1` は適応 tier 自身の swap も通常どおり行い、`=2` は PCIe share がフェッチした layer では、そのフェッチ可能な expert を tier 自身の次回 swap 候補から外します。
+CUDA の `strata generate` と `strata serve` で、PCIe share が GPU キャッシュにコピーする expert miss を、キャッシュへの admission にも使う制御値です。通常は PCIe share で取得した expert を staging してその window の計算に使います。有効時は、条件を満たす取得 expert を既存の resident expert の slot に直接コピーし、residency table を更新します。`1` は tier 自身の次回 swap を残し、`2` は PCIe admission があった layer について tier 自身の swap をその round で行わないようにします。CPU/GPU のどちらで expert を計算するかやキャッシュの置換先が変わり得るため、出力が bit-for-bit 同一とは限りません。`adapt_fetch()` と `ExpertDispatch::fetch_can()` が設定と実行条件を扱います（`engine/src/program/generate.cpp:2342-2347,15067-15089,24580-24603`; `engine/src/core/expert_source.cpp:5271-5275,5637-5676`; `engine/src/program/generate.cpp:15355-15366`）。
 
 ## 値と判定
 
-`adapt_fetch()` は `std::getenv` の結果に `std::atoi` を適用し、`std::max(0, std::min(2, ...))` で 0〜2 に clamp します。未設定は 0 です。空文字や数値として始まらない文字列は `atoi` により 0 となり、先頭の空白や符号を含む数値文字列、数値の後ろに文字が付く文字列は `atoi` が変換できる先頭部分で判定します。たとえば `2tail` は 2、`-1` は 0、`9` は 2 です。文字列全体の妥当性検査はありません。
+`adapt_fetch()` は `std::getenv` で値を取得し、未設定なら `0`、設定済みなら `std::atoi` の結果を `0` から `2` に clamp します。文字列全体の妥当性検査はありません。空文字・数値で始まらない文字列は `atoi` が `0` にし、数値の後ろの文字は無視されます。符号や先頭空白も `atoi` の変換規則に従います（`engine/src/program/generate.cpp:2345-2347`）。
 
-| 入力例 | 判定値 | 結果 |
-| --- | ---: | --- |
-| unset、空文字、`abc`、`0`、`-1` | 0 | 無効（既定） |
-| `1`、`1tail` | 1 | admission 有効、tier 自身の swap も継続 |
-| `2`、`2tail`、`9` | 2 | admission 有効、該当 layer の一部の tier swap を抑止 |
+| 条件 | unset | 有効になる値 | 無効になる値・境界外入力 |
+|---|---|---|---|
+| 通常の読み取り | `0` | clamp 後の `1` または `2`。例: `1`, `2`, `2tail`, `3`（`3` は `2` に clamp） | 無効化される例: 空文字、`true`、`0anything`, `-1`（`-1` は `0` に clamp）。`0` は無効。負数は `0`、`2` より大きい数は `2` に clamp |
+| CUDA の NVIDIA 既定値適用時 | 条件を満たすカードでは未設定の値を `2` にする。それ以外は `0` | 上記に加え、明示値が優先 | 対象変数が空文字を含め設定済みなら自動既定値を注入しない。明示 `0` は無効のまま |
 
-値は `adapt_fetch()` が初めて呼ばれたときの `static const` に保存されます。プロセス中に環境を変更しても再評価されません。CLI に同等の値を指定する引数はありません。
+`apply_nv_defaults()` は対象変数の設定有無だけを調べます。従って空文字や `0` もユーザー設定として扱い、既定値で上書きしません（`engine/src/core/nv_defaults.cpp:222-239`）。自動既定値は `STRATA_DEFAULTS=026` が有効なら適用されず、カード種別ごとの perf default が無効な場合も適用されません（sm_86: `STRATA_SM86_PERF=0`、sm_89: `STRATA_SM89_PERF=0`、sm_120: `STRATA_SM120_PERF=0`; `engine/src/core/nv_defaults.cpp:41-43,73,75-83,104-106,130-135`）。
 
 ## 有効になる条件
 
-値が 1 または 2 でも、次の条件を満たさなければ `fetch_admit` は設定されず機能は動作しません。
-
-- 適応 tier が有効で、`--adapt-every` と `--adapt-swaps` による routing usage table がある。
-- residency table と GPU plan があり、PCIe share の数が 0 より大きい。share は `--pcie-frac` などから `drive.d.pcie_num` に設定されます。
-- 単一 GPU の serial window 経路である。`serve` では layer split、`--peer-device`、helper GPU、`--adapt-async`、`--pipeline-windows`、`--batch` を拒否し、`generate` では `--spec-split`、layer split、peer tier、helper GPU を拒否します。
-- `--pcie-mode` が `dma` / `direct` ではない。実際の `fetch_can()` も plan の `pcie_mode == 2` と `dst2` の存在を要求します。
-- `src.complement_ready()` の resident RAM mode ではなく、Foresight swap-space (`fs`) もないこと。また、対象 layer の source が PCIe から読み出せること。
-- `serve` では `STRATA_ADAPT_OVERLAP` が有効でないこと。`serve` は `adapt_overlap()` が true の場合に FETCH を停止します。`generate` の同じ条件判定には overlap の確認がありません。
-
-無効となる条件は stderr に `strata serve: STRATA_ADAPT_FETCH is off (...)` または `strata generate: STRATA_ADAPT_FETCH is off (...)` と理由付きで出ます。条件を通った場合は値と閾値を示す初期化ログが stderr に出ます。`=1` / `=2` という有効値だけでは admission が保証されず、実際の window に PCIe miss があり、tier の routing counts と resident slot の比較条件を満たす必要があります。
+- 有効値は `1` または `2` ですが、実際に admission を行うには adaptive tier、residency table、expert cache、GPU plan、PCIe share が必要です。`--adapt-every` と `--adapt-swaps` が有効であることも必要です（`engine/src/program/generate.cpp:15067-15084,24570-24598`）。
+- `generate` と `serve` の開始時判定は、residency table がない、cache slot が 0、`--spec-split`、layer split / peer tier / helper GPU、`--adapt-async`、`--pipeline-windows`、`--batch`、`STRATA_ADAPT_OVERLAP=1`、`--pcie-mode dma` / `direct`、GPU plan がない、PCIe share が 0、resident RAM mode などを無効理由として扱います。理由は各開始ログに出ます（`engine/src/program/generate.cpp:15055-15077,24571-24589`）。
+- 実際の dispatch 側でも、`fetch_can()` は `pcie_mode == 2`、staging destination が存在すること、peer/helper/swap-space がないこと、PCIe share が正であること、対象 layer が PCIe から供給可能なことを要求します（`engine/src/core/expert_source.cpp:5271-5275`）。
+- `fetch_on` はその window に PCIe share で処理する miss 数 `m` が 1 以上のときだけ成立します。tail skip された miss、resident expert、peer/helper が持つ expert、pinned でない blob は admission 対象になりません（`engine/src/core/expert_source.cpp:5491-5500,5555-5571,5563-5568`）。
+- CUDA build の既定値は、全可視 CUDA device の compute capability が同一のときだけ適用されます。既定 `2` の対象は compute capability 12.x かつ main card の VRAM が 16 GiB 以下、または sm_86 / sm_89 かつ 13 GiB 以下です。main card は `STRATA_PRIMARY_DEVICE`（未設定なら device 0）から選び、範囲外の device 番号は 0 に戻します。混在 compute capability ではこの既定値適用経路を通りません（`engine/src/program/generate.cpp:4421-4449`; `engine/src/core/nv_defaults.cpp:21-27,73,102,134`）。
+- `STRATA_ADAPT_ASYNC` による adaptive-async 自動選択でも値を参照し、値が正なら async tier の自動選択を抑止します。明示 `--adapt-async` の選択は別経路です（`engine/src/program/generate.cpp:11777-11795`; `engine/include/strata/core/adapt_async_default.hpp:41-60`）。
 
 ## 実行時の詳細
 
-値の読み取りと有効条件判定は `serve` / `generate` の起動時に行われます。機能が有効な場合のみ、`STRATA_ADAPT_FETCH_MIN` と `STRATA_ADAPT_FETCH_MARGIN` を `std::atof` で読み、未設定なら `fetch_min=1.0`、`fetch_margin=0.5` を使います。これらは全体文字列の検証や clamp をせず、設定値が変換できなければ `atof` の結果（通常 0）を採用します。
+`adapt_fetch()` の値は関数内 `static const` に一度だけ保持され、最初の呼び出し時点のプロセス環境を使います。後から環境を変更しても再読込されません。CUDA では GPU 情報を確認して `apply_nv_defaults()` が未設定値を補ってから engine の switch を読むため、その自動設定値も cache されます（`engine/src/program/generate.cpp:2345-2347,4421-4449`）。
 
-各 window で PCIe share の miss 数が正なら、pool dispatcher は未 resident かつ pinned の routed miss から、その layer の usage が高いものを share 枠数まで選びます。さらに、対象 expert の usage が `fetch_min` 以上で、コピー中でなく、window が使わない resident expert のうち usage が低い候補に対し、`incoming_usage >= resident_usage + fetch_margin` なら既存 VRAM slot を割り当てます。コピー先を staging からその cache slot に切り替え、host residency table では退場 expert を nonresident、新 expert をその slot に設定します。差分は verifier の次回 launch 前に device residency table へ反映されます。候補や閾値を満たさないとき、通常の PCIe staging のままです。
+開始時の条件を通ると、`drive.d.fetch_admit` に値を設定します。`STRATA_ADAPT_FETCH_MIN` と `STRATA_ADAPT_FETCH_MARGIN` が設定されていれば `atof` で読み、未設定時はそれぞれ `1.0` と `0.5` です。各 layer-window で usage の多い PCIe miss を share の候補にし、tier が退ける最小 usage の resident expert と比較します。miss usage が `fetch_min` 以上で in-flight でなく、resident victim より `fetch_margin` 以上大きければ、その victim の slot にコピーして host residency table を更新します（`engine/include/strata/core/expert_source.hpp:674-691`; `engine/src/core/expert_source.cpp:5640-5676`）。
 
-`=2` では PCIe fetch が発生した layer の `fetch_avail` を適応 tier の次回 swap 判定に渡し、pinned な fetch 候補を tier 側の候補から除外します。`=1` はこの抑止を行いません。`STRATA_ADAPT_FETCH_VERIFY` は `generate` だけで設定有無を確認し、空文字を含む設定時に各 admission slot を後から読み戻します。不一致時は `strata: FETCH VERIFY layer ...`、周期ログには `strata: fetch verify: ... admitted slots read back, ... differ` が出ます。`serve` ではこの検査変数を読みません。
+`1` の場合、tier は次の adapt round で通常の候補選択を続けます。`2` では PCIe admission が発生した layer の取得済み・pinned expert を tier の候補から外し、同 layer では tier 自身の swap を休ませます。PCIe share がなかった layer や admission されなかった expert は通常の tier 対象です（`engine/src/program/generate.cpp:15355-15366`）。
 
-観測できる結果は、初期化時の有効 / 無効ログ、`generate` 終了時の stdout `fetch admission ... experts admitted from the PCIe share` 集計です。device residency table の patch に失敗した場合は verifier pre-launch hook が `the residency table update failed: ...` をエラーにし、呼び出し元の window 処理が失敗します。
+## ログと測定値
 
-## 文書・測定値との照合
+有効値が実行条件に合わない場合、stderr に無効理由を示す `strata serve: STRATA_ADAPT_FETCH is off (%s)` または `strata generate: STRATA_ADAPT_FETCH is off (%s)` が出ます。自動既定値を注入した値が未使用なら `STRATA_ADAPT_FETCH=2 (the default for this card) is not used in this run (%s)` と出ます。有効時は閾値を含む `STRATA_ADAPT_FETCH=%d: the PCIe share takes each layer's most-routed misses and admits those routed >= ...` の開始行が出て、値が `2` なら tier 自身のコピーが無効である旨も付加されます（`engine/src/program/generate.cpp:15073-15088,24586-24602`）。
 
-`docs/DETAILS.md:1076` は CUDA の適用条件に `STRATA_ADAPT_OVERLAP=1` を記していますが、現行の `serve` コードは `adapt_overlap()` が true なら FETCH を無効化します（`src/program/generate.cpp:12772-12784`）。このため、適用条件の説明はソースコードと食い違います。同表に記載された RTX PRO 5000 などの性能・token forcing の数値は資料に記された測定結果であり、この調査では再測定・独立検証していません。
+`strata generate` で `STRATA_ADAPT_FETCH_VERIFY` が設定されている場合（値の内容は問わず）、admission された slot を read-back 検証します。不一致時は `strata: FETCH VERIFY layer ...`、周期的な集計は `strata: fetch verify: ... admitted slots read back, ... differ` です。最後の標準出力には admission 数と round あたり平均が出ます。検証 API の失敗そのものは上記の不一致ログに記録されます（`engine/src/program/generate.cpp:24596-24599,25104-25123,25317-25319`）。
+
+性能・出力に関する資料値は `docs/DETAILS.md:1262` に記載されています。そこでは IQ3_S / RTX PRO 5000 / 3,896-slot cache / `--pcie-frac 0.25` の4 roundで decode `=2` +10.2%、`=1` +5.0%、および別条件の2x RTX 5060 Ti 16 GB / UD-Q4_K_XL の3 paired roundsで decode medians 1.087–1.325、hit rate 54.4%から62.0%、KL ratio 0.948 [0.830, 1.063] とされています。これらは資料記載の特定条件での結果です。
 
 ## 根拠
 
-- `src/program/generate.cpp:2005-2011` — `atoi`、0〜2 clamp、unset の既定値、初回評価時の static cache。
-- `src/program/generate.cpp:12772-12795,12956-12959,12979-12999` — `serve` の無効条件、ログ、閾値の読み取り、mode 2 の条件、residency table 更新失敗。
-- `src/program/generate.cpp:20441-20473,20501-20525` — `generate` の PCIe mode / share、無効条件、閾値・検証変数、residency table 更新。
-- `src/core/expert_source.cpp:4734-4738,5013-5029` — pool 側の実効条件と miss 選択。
-- `src/core/expert_source.cpp:5095-5137` — staging / cache slot の選択、threshold 比較、residency table 更新と検証記録。
-- `src/program/generate.cpp:13054-13065,20592-20603` — `=2` で tier 自身の候補から fetch 可能 expert を外す処理。
-- `src/program/generate.cpp:20976-20995,21183-21188` — 読み戻し検証ログと admission 集計。
-- `src/core/verify.cpp:2411-2416`, `include/strata/kernels/verify_kernels.hpp:145-152` — CUDA verify 経路で `dst2` を渡す実装経路。
+- `engine/src/program/generate.cpp:2342-2347` — parse、clamp、関数内 cache。
+- `engine/src/program/generate.cpp:4421-4449` — CUDA での既定値適用前後と main card 選択。
+- `engine/src/core/nv_defaults.cpp:21-27,37-43,73,102,130-135,222-239` — GPU / VRAM 条件、世代別 default、明示設定優先。
+- `engine/src/program/generate.cpp:15055-15089,24570-24603` — serve / generate の有効条件、理由ログ、補助 threshold 読み取り。
+- `engine/src/core/expert_source.cpp:5271-5275,5555-5571,5637-5679` — dispatch 条件、PCIe miss 選別、slot admission。
+- `engine/src/program/generate.cpp:15355-15366` — 値 `2` と tier 自身の swap の関係。
+- `engine/src/program/generate.cpp:11777-11795`; `engine/include/strata/core/adapt_async_default.hpp:41-60` — async 自動選択との関係。
+- `engine/src/program/generate.cpp:25104-25123,25317-25319` — verify と集計出力。
+- `docs/DETAILS.md:1262` — 条件付きの測定記載。

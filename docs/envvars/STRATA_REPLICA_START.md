@@ -1,40 +1,42 @@
 # `STRATA_REPLICA_START`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata サーバーのデータ並列 replica を初期化するとき、各 engine の開始を逐次行うか、スレッドで同時に行うかを選びます。`serve/server.py` がこの変数を読む唯一の箇所です。これは replica の有効化や数を決めず、すでに replica group が選ばれて `start_replicas()` に入った場合の開始方法だけを変えます。
+Strata の serving サーバーが複数 replica engine を起動するとき、起動処理を順番に行うか、スレッドを使って並行して行うかを選ぶ。`terminal/serve/server.py` の `start_replicas` が環境から直接値を読み、完全一致する値 `serial` のときだけ順次起動する。それ以外は replica ごとのスレッドを起動して全て join する（`terminal/serve/server.py:8829-8865`）。
+
+これはレプリカ数や GPU 割当てを設定する変数ではない。レプリカ構成は別途 config の `replicas` または `--replicas` から作られ、少なくとも 2 グループがあるとき `start_replicas` に入る（`terminal/serve/server.py:9230-9233, 9314-9315, 9460-9475`; `terminal/serve/replicas.py:55-84`）。
 
 ## 値と判定
 
-| 値 | 動作 |
-|---|---|
-| 未設定 | 並列開始 |
-| `serial` と完全一致 | 逐次開始 |
-| 空文字、`Serial`、`serial `、その他すべて | 並列開始 |
+Python の `os.environ.get("STRATA_REPLICA_START", "") == "serial"` で環境値全体を文字列比較する。未設定時の既定値は `""` であり、未設定と空文字はいずれも順次起動を選ばない。大文字小文字を区別し、空白除去・数値変換・真偽値変換はしない（`terminal/serve/server.py:8857-8865`）。
 
-実装は `os.environ.get("STRATA_REPLICA_START", "") == "serial"` の完全一致です。空白除去、大小文字変換、真偽値・数値への変換はありません。範囲や無効値エラーもありません。未設定時と未一致時の既定動作は、各 engine の開始関数をスレッド群で動かす方式です。
+| ビルド・起動条件 | unset | 設定時に順次起動となる値 | 設定時に順次起動とならない値 |
+|---|---|---|---|
+| serving の Strata engine 経路で複数 replica を構成 | `""` 相当。replica 起動スレッドを使う | `serial`（完全一致） | 空文字、`SERIAL`、`Serial`、` serial`、`serial `、`1`、`0`、`true`、`false`、その他すべて |
 
 ## 有効になる条件
 
-- Strata サーバーモードで、設定または `--replicas` により複数の GPU group が構成され、`gpu_groups()` が空でない場合に限り参照されます。`--replicas` は設定の `replicas` を上書きします。replica 設定がない場合や group が一つ以下なら通常の単一 engine 経路となり、この変数は使われません。
-- `--engine mock` や `start_split()` 経路では `start_replicas()` に入らないため影響しません。
-- CLI 引数や設定項目から開始順を指定する経路はありません。この環境変数の判定は replica 設定・GPU group の決定後に行われます。
-- lazy 起動では `StrataEngine` の初期化が子プロセスを起動せずに戻るため、この分岐が順序づけるのは engine オブジェクトの作成です。通常起動では各 `StrataEngine` の初期化が子 engine の `READY` を待ってから戻るため、逐次モードでは次の replica の開始は前の初期化完了後になります。
+- サーバーが `--engine strata` で起動し、config が必要であり（`terminal/serve/server.py:9386-9394`）、`rp.gpu_groups(cfg)` が 2 つ以上のグループを返す必要がある。`replicas` が未設定または `false`、数値 1 以下、あるいは指定グループが 1 個なら `start_replicas` に進まず、この変数は起動順に影響しない（`terminal/serve/replicas.py:55-84`; `terminal/serve/server.py:9460-9477`）。
+- ソース上、この環境値判定に OS・GPU backend・ビルド macro の追加条件はない。CPU affinity の利用可否などは個別 engine の起動条件だが、この変数の分岐条件ではない（`terminal/serve/server.py:8857-8865`; `terminal/serve/replicas.py:270-280`）。
+- `--lazy` または `lazy_load: true` の場合、各 `StrataEngine` の初期化は `lazy` を受けてプロセスを開始せずに戻る。そのため `serial` が順番にするのは初期化呼び出しであり、後で lazy engine が実際に起動する順序をこの分岐が直列化するわけではない（`terminal/serve/server.py:798-800, 8850-8865, 9399`）。
+- 各子 engine の環境は `child_env` が親の `os.environ` をコピーして作り、replica config の `env` を後から反映する。このため変数は通常子プロセスにも引き継がれるが、replica config の `env` に同じキーがあればその値で上書きされる。調査した checkout では、この名前を読む Strata 所有コードはサーバーの上記箇所だけで、engine 側の読み取りは見つからなかった（`terminal/serve/server.py:4007-4028, 8850-8852`; `terminal/serve/replicas.py:252-267`）。
 
 ## 実行時の詳細
 
-`serial` の場合、`start_replicas()` は replica index 順に `one(i)` を呼びます。それ以外は全 replica 用の thread を作成・開始し、すべて join します。`one(i)` は replica ごとの設定・環境を用意して `StrataEngine` を作り、例外は収集して次の replica の開始を続けます。したがって `serial` は失敗した replica の時点で即座に中断する設定ではありません。
+判定は `start_replicas` を呼ぶたびに一度行われ、関数内で cache されない。`serial` の場合は replica index の昇順で `one(i)` を呼び、通常の非 lazy 起動では `StrataEngine` の初期化が子 engine の `READY` を待って戻るため、次の replica の開始呼び出しはその後になる（`terminal/serve/server.py:843-860, 8845-8865`）。各起動で例外が起きても `one` はそれを記録して戻るので、残りの replica も順に試し、全起動処理後に共有 arena の再試行または失敗処理を行う（`terminal/serve/server.py:8845-8854, 8866-8889`）。
 
-各 child の環境は `child_env()` が親の `os.environ` をコピーして作ります。候補名の全参照検索では、Strata が child 起動後に `STRATA_REPLICA_START` を読む箇所は見つかりませんでした。よって確認できる効果はサーバー側の初期開始順です。設定値に対応した専用ログはありません。起動時には replica group の案内が出て、開始失敗時には `[strata] replica ... did not start ...`、共有 arena の条件によっては再試行案内または全 replica の個別 arena への fallback が出ます。
+値が `serial` 以外なら、全 replica 用スレッドを作成して開始し、その全てを join する（`terminal/serve/server.py:8860-8865`）。環境変数をサーバー稼働中に変更しても、すでに実行済みの判定やその起動には反映されない。通常の後続 engine restart は保存済み spawn 引数を使い `start_replicas` を再度通らないため、この値を再読しない（`terminal/serve/server.py:767, 1206-1222`）。ただし共有 arena を使った起動失敗時に arena 無しへ切り替えて `start_replicas` 自体を再帰呼び出しする経路では、再度判定される（`terminal/serve/server.py:8885-8889`）。
 
-値は `start_replicas()` が呼ばれるたびにその場で参照され、static cache はありません。通常の server 起動では一度評価されます。共有 arena で失敗して再帰的に `start_replicas()` を呼び直す経路では再評価されます。子 engine の後続 restart は保存済み起動情報を使い、replica の初期化順を再選択しません。
+## ログと測定値
+
+この変数の値や順次起動の選択を示す専用ログはない。replica 起動時の共通表示は `[strata] {n} replicas on the cards ...: requests go to the least busy one, a conversation back to its own` で、serial / 並行のどちらでも同じである（`terminal/serve/server.py:8835-8838`）。起動失敗時は arena 条件に応じて再試行案内を出すか、`[strata] replica {i} did not start: {e}` で終了するが、これは起動結果によるもので変数専用の失敗経路ではない（`terminal/serve/server.py:8866-8889`）。この変数による性能測定値は該当資料に見当たらない。
 
 ## 根拠
 
-- 全候補名の完全一致検索で該当する読み取りは `serve/server.py:8715` の一箇所です。比較条件と逐次・並列の分岐は `serve/server.py:8715-8723`。
-- replica の構成は `--replicas` の設定反映 `serve/server.py:9117-9118`、group 判定と `start_replicas()` / split / 単一 engine の選択は `serve/server.py:9261-9279`。group の数値指定・リスト指定の条件は `serve/replicas.py:55-84`。
-- 各 replica の engine 作成、失敗収集、arena による再試行、最終失敗は `serve/server.py:8704-8747`。初期案内は `serve/server.py:8695-8702`。
-- child 環境が親環境のコピーであることは `serve/server.py:3747-3760`。engine が lazy 時に初期化を返る箇所は `serve/server.py:1017-1045`。通常時の子プロセス起動と `READY` 待機は `serve/server.py:1074-1110`。
-- `STRATA_REPLICA_PROFILE` は `setup.py:10348-10358` で replica profile の自動設定に使われますが、名前が異なり、本変数の値判定とは別です。
+- `terminal/serve/server.py:8829-8865` — replica 起動関数、環境値の判定、順次起動とスレッド起動。
+- `terminal/serve/server.py:4007-4028` — 子 engine 環境の複製と config 環境値の反映。
+- `terminal/serve/server.py:767, 798-800, 843-860, 1206-1222` — spawn 設定、lazy 初期化、READY 待ち、後続 restart。
+- `terminal/serve/server.py:9230-9233, 9314-9315, 9386-9400, 9460-9477` — CLI/config とサーバーモードから replica 起動に至る条件。
+- `terminal/serve/replicas.py:55-84, 252-267, 270-280` — replica group の条件、replica config、CPU affinity の条件。

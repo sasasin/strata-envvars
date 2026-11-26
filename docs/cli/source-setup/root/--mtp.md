@@ -1,63 +1,65 @@
-# `--mtp`
+# `setup.py --mtp`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` からも引数を転送） |
+| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` からも委譲） |
 | オプション | `--mtp` |
 | 別名 | なし |
-| 値 | `on` または `off` |
+| 値 | `on` または `off`（必須） |
 
 ## 役割
 
-モデル自身の draft layer（MTP）を使うかを選びます。`off` は起動時にMTPを無効にし、`on` は有効にします。これは setup の設定用オプションです。生成されるエンジン引数の `--mtp <path>` とは別で、後者は draft layer の実行ファイル群の場所を示します（`setup.py:9418-9421`）。
+モデルの実行設定で MTP draft layer を有効または無効にします。`off` は層の重みを実行時に使わない設定として保存し、利用可能な VRAM と RAM を増やす代わりに生成速度を下げます。`on` は明示的に有効へ戻します。これは推論エンジンに渡す `--mtp <dir>` のパス指定とは別の、セットアップ側の切替です（`terminal/setup.py:11578-11581`、`terminal/strata_control/setup_config.py:539-549`）。
 
 ## 使い方
 
-Linux のソース checkout で、MTPを使わずにモデルを設定し、設定だけ書いて終了する例です。
+Strata checkout のルートで実行します。次の例はセットアップ処理を行い、最後のモデル起動だけを省きます。
 
-```sh
-./setup.sh --mtp off --yes --no-start
+```bash
+# MTP を無効にした設定でセットアップする
+python terminal/setup.py --mtp off --no-start
+
+# MTP を再び有効にした設定でセットアップする
+python terminal/setup.py --mtp on --no-start
 ```
 
-`setup.sh` と `START-HERE.bat` は受け取った引数を `setup.py` に渡します（`setup.sh:17-18, 77`、`START-HERE.bat:30-31, 36-37`）。
+`setup.sh` は checkout 内の `setup.py` に引数を渡します（`setup.sh:8-17`, `setup.sh:81`）。`--no-start` は最後の起動を省くだけで、モデル等の取得・準備や run config の書き込みを省略しません（`terminal/setup.py:12525-12527`, `terminal/setup.py:12555-12562`）。
 
 ## 値と既定値
 
-- 受理値は `on` と `off` のみです。別の値や値なしは、Linux / Windows の `setup.py` parser で argparse の引数エラーになります（`setup.py:8534-8537`）。
-- 省略時は `None` です。新規設定では既定でMTPを使い、既存設定の更新では過去の `"mtp": false` を維持します（`setup.py:8534`、`setup.py:6177-6183, 6205-6209`）。
-- `on` は `"mtp": true` を明示して、以前保存された `false` を上書きします。`off` は `"mtp": false` を保存します（`setup.py:9677-9685`）。
+- 値は小文字の `on` / `off` のみです。`argparse` の `choices` に合わない値や値の省略は parser のエラーになります（`terminal/setup.py:11578`）。
+- オプションの省略時は引数値が `None` です。その場合このフラグによる設定変更は行わず、既存 config の `mtp` 選択は carry-over されます。新規設定時の通常選択や drafter の自動選択は別のセットアップ規則に従います（`terminal/strata_control/setup_config.py:539-549`; `terminal/setup.py:7715-7737`, `terminal/setup.py:9047-9060`）。
+- 同じフラグを複数回指定した場合は `argparse` の通常の単一値引数として最後の値が残ります（`terminal/setup.py:11578`）。
 
 ## 実行時の動作
 
-- `off` でMTP runtime がまだない場合、通常のモデル設定経路では約5.2 GBのMTP取得を見積もりから外し、MTPの取得・変換を行わずに進みます（`setup.py:9238-9247, 9384-9393`）。
-- `on`（または省略時の既定）で必要なMTPファイルがなければ、元チェックポイントから約5 GBのテンソルを取得し、`mtp_pack.py` と `mtp_rt.py` でエンジン用データを作ります（`setup.py:9384-9393`）。ダウンロード先は既存のデータ領域内の `mtp` です。
-- `off` は既にあるMTPファイルを削除しません。設定生成時に `"mtp": false` を保存し、`draft_layer.apply` が `--mtp`、`--spec-min-p`、`--batch-mtp` をエンジン引数から取り除きます。`--spec` は残るため、MTP draft layer がなくても prompt lookup による推測は残ります（`setup.py:9677-9682`、`strata_control/draft_layer.py:25-56`）。
-- 設定更新で `--mtp` を省略しても保存済みの `false` は維持されます。サーバー起動時にも `"mtp": false` を再適用してMTP引数を除外するため、setup が引数を再生成しても有効には戻りません（`setup.py:6177-6183, 6205-6209`、`serve/server.py:3097-3102`）。
-- `off` は低RAM経路のVRAM見積もりでもMTP分の余裕を差し引かない設定にします（`setup.py:9143-9149`）。setup は設定を保存し、通常はモデル起動へ進みます。`--no-start` を付けた場合は起動を省略します（`setup.py:9729-9738`）。
+- `--mtp off` は run config に `"mtp": false` を書きます。既存 config から MTP を有効化する engine 引数が引き継がれる場合も、`draft_layer.apply` が `--mtp`、`--spec-min-p`、`--batch-mtp` を除去します（`terminal/strata_control/setup_config.py:539-546`; `terminal/strata_control/draft_layer.py:25-26`, `:51-56`）。設定は同じモデルの次回 setup にも保持されます（`terminal/setup.py:7715-7737`）。
+- Windows/Linux の通常セットアップでは、`off` で MTP ファイルがまだない場合に約 5 GB の取得を見送り、既存の MTP ファイルは削除しません。`on` または指定なしで MTP が必要と判定され、ファイルがなければ取得後に `mtp_pack.py` と `mtp_rt.py` で準備します（`terminal/setup.py:12474-12495`）。
+- `--mtp on` は run config に `"mtp": true` を書き、以前の `false` が carry-over で復活するのを防ぎます（`terminal/strata_control/setup_config.py:547-549`）。
+- 明示的な `--mtp on` / `off` は、MTP 指定がない場合だけ働く自動 drafter 選択を止めます。省略時は、環境・モデル等に基づく Auto が DFlash2 を選ぶことがあり、その場合 MTP 層が未取得なら MTP の約 5 GB の取得を省いて DFlash2 を用意します（`terminal/setup.py:9047-9060`, `:12332-12339`, `:12481-12495`）。
+- 低 RAM 向けモデルの配置見積もりでも、`off` は MTP が使う約 1 GB を VRAM expert cache の計算から除外します（`terminal/setup.py:12242-12247`）。
 
 ## 適用条件と副作用
 
-- `--mtp off` の効果は、MTP draft layer を使うモデルの設定に対するものです。MTPデータが未取得なら取得を省きますが、既存ファイルは残します。既存runtimeの破損が検出された場合は修復分岐が優先され、`off` でも再取得・再生成することがあります（`setup.py:9377-9393`）。
-- `--mtp on` はダウンロードや変換を発生させる場合があります。また、以前の `off` 設定を解除し、エンジン設定へMTP runtime のパスを戻します（`setup.py:9384-9393, 9418-9421, 9677-9685`）。
-- MTPを使うと約1 GBのGPUメモリと追加RAMを使い、専門家キャッシュに割り当てられるVRAMが減ります。無効化するとその分を節約する代わりに、単語生成速度が低下します（`setup.py:8534-8537, 9680-9685`）。
-- macOS は `setup.py` から別の `metal/setup_mac.py` へ処理を渡します。macOS側のparserに `--mtp` はなく、未知引数として `not used on a Mac` の警告が出るだけで、on/offの切替には使われません（`setup.py:8418-8419`、`metal/setup_mac.py:327-358`）。
-- Qwen3.6 などエンジン側で `--mtp` が draft 数値を表す構成は、setup option の `on|off` と同じ意味ではありません。ソースには `own_path_config` がその違いを区別する処理があります（`setup.py:6383-6385`）。
+- `--mtp off` は既存の重みファイルを消しません。セットアップが書く run config を無効にし、次回以降もその設定を維持します（`terminal/strata_control/setup_config.py:539-546`; `terminal/setup.py:7715-7747`）。
+- MTP が必要でファイルがない場合、Windows/Linux 経路は `tools/mtp_fetch.py` を最大 3 回実行して取得を再試行し、取得後に pack / runtime ファイルを生成します。オフラインを示す終了コード 5 なら MTP なしで続行し、終了コード 4 なら停止、その他の失敗は再試行後に setup のエラーとして終了します（`terminal/setup.py:1160-1189`）。
+- Apple Silicon の通常 source setup は parser を読む前に `engine/metal/setup_mac.py` へ引数をそのまま渡します。その経路の `--mtp` 受理・効果はこの `terminal/setup.py` の parser では規定できません。ここで説明する parser の設定動作を macOS 通常 setup に適用しないでください（`terminal/setup.py:9290-9294`, `:11434-11437`）。
+- `--drafter dflash2` は別の選択肢です。MTP 層がまだない場合は MTP 重みの取得を省く経路があり、`--mtp` の有効・無効切替と同じ指定ではありません（`terminal/setup.py:11578-11585`, `:12483-12495`）。
 
 ## 出力とエラー
 
-- 設定時に `off` / `on` の状態を `[OK]` メッセージで表示します。`off` では使用メモリが減り生成が遅くなる旨も表示されます（`setup.py:9680-9685`）。MTPが未取得で `off` の場合は約5 GBの取得を省く旨を表示します（`setup.py:9384-9385`）。
-- Linux / Windows で `on` / `off` 以外を指定すると argparse がusageとエラーを出して終了します。独自の `--mtp` 終了コードは定義されていません（`setup.py:8534-8537`）。macOSでは未知引数警告となり、切替は行われません（`metal/setup_mac.py:356-358`）。
-- MTPの取得・変換に失敗した場合の具体的な表示や終了経路は、それぞれの子プロセス処理に従います。この調査では安全な同一revisionのCLI `--help` や実機実行は行っていません。
+- 不正値は `argparse` が usage とエラーを表示し、通常の parser エラー終了となります（`terminal/setup.py:11578`, `:11606`）。
+- `off` / `on` の設定時は `[ok]` メッセージが出ます（`terminal/strata_control/setup_config.py:545-549`）。MTP の取得がオフラインなら層なしでセットアップを続けます。取得先に応答がない場合は停止し、他の取得失敗は最大 3 回まで再試行してから停止します（`terminal/setup.py:1170-1189`）。
+- `setup.py` の `fail` 経路は `[X]` と説明を出し、終了コード 1 で終了します（`terminal/setup.py:1049-1056`）。
 
 ## 根拠
 
-- parser の値制約と説明: `setup.py:8534-8537`
-- 低RAM見積もり、空き容量見積もり、MTPの取得・生成: `setup.py:9143-9149, 9238-9247, 9377-9397`
-- エンジン引数へのパス設定とon/offの設定保存: `setup.py:9418-9421, 9677-9685`
-- 再設定時の選択維持と既存設定のバックアップ・書き込み: `setup.py:6177-6209, 6312-6340`
-- 無効化時に取り除くフラグと、起動時の再適用: `strata_control/draft_layer.py:25-56`、`serve/server.py:3077-3102`
-- macOSでの委譲と未知引数の扱い: `setup.py:8418-8419`、`metal/setup_mac.py:327-358`
-- 調査対象 revision と状態: commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`、調査日 `2026-10-25`。開始時のstatusは `## main...origin/main` で未コミット変更表示なし。
+- Parser と許容値: `terminal/setup.py:11578-11581`。
+- config 値の保存と無効化時の引数除去: `terminal/strata_control/setup_config.py:539-549`; `terminal/strata_control/draft_layer.py:25-26`, `:51-56`。
+- 既存設定の引き継ぎ・バックアップ: `terminal/setup.py:7715-7747`。
+- 自動 drafter 選択と容量見積もり: `terminal/setup.py:9047-9060`, `:12332-12343`。
+- MTP 取得・生成と失敗分岐: `terminal/setup.py:1160-1189`, `:12474-12501`。
+- macOS 委譲: `terminal/setup.py:9290-9294`, `:11434-11437`。
