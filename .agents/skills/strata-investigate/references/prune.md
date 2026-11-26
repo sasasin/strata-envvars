@@ -96,9 +96,9 @@ Strata 側で消えたように見えても、読み取り箇所が別ファイ�
 陳腐化した可能性のある文書をまとめて探す場合は、この節の手動運用ではなく `references/staleness.md`（
 `find-stale.py` → `mark-stale.py`）を使う。削除→再作成の流れは同じ。
 
-## 5. 実装済み: 内容の陳腐化検出
+## 5. 内容の陳腐化検出
 
-「Strata 側で挙動が変わったため既存文書が陳腐化した」検出は `references/staleness.md` に実装した
+「Strata 側で挙動が変わったため既存文書が陳腐化した」検出は `references/staleness.md` を使う
 （`scripts/evidence-index.py` / `scripts/find-stale.py` / `scripts/mark-stale.py` / `scripts/cli-grammar.py`）。
 逆引きは envvars 文書の `## 根拠` にある `path:line` を機械抽出した台帳（`.strata-evidence.json`）が担い、
 削除は上記 §4 と同じ流れ（本文を消して試行記録から entry を消す）で再作成に繋がる。

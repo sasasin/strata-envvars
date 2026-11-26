@@ -21,8 +21,7 @@ CLI_INDEX = REPO_ROOT / "docs" / "cli" / "README.md"
 
 LONG_OPTION_RE = r"-{1,2}[A-Za-z][A-Za-z0-9_-]*"
 EXCLUDES = [
-    # staleness_lib.GREP_EXCLUDES と同じ方針。末尾一致で書き、Strata の top-level 移動に追随させる
-    # （0.2.16 で third_party/ → engine/third_party/、data/ と ref/ → terminal/、docs/ は top-level のまま）。
+    # staleness_lib.GREP_EXCLUDES と同じ方針。末尾一致で書き、Strata の top-level 移動に追随させる。
     ":(exclude,glob)**/docs/**",
     ":(exclude,glob)**/bench/results/**",
     ":(exclude,glob)**/data/**",

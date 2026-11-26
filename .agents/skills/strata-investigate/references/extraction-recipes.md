@@ -3,9 +3,8 @@
 Strata checkout を読むときの検索語と機械抽出。索引更新（`index-refresh.md`）と 1 件調査（D/E モード）で使う。
 Strata 側の絶対パスは `STRATA=$HOME/src/github.com/Niko1221/Strata` として書く。
 
-**どの節でも Strata の top-level 階層名を書き置かない。** 階層は Release で作り替わる
-（0.2.16 でコミット `4058aa782` が top-level を総入れ替え）。対象を決めるときは必ず
-`git -C "$STRATA" ls-files` から現在の入口階層を導いてから読む。
+**どの節でも Strata の top-level 階層名を書き置かない。** 階層は Release で作り替わる。
+対象を決めるときは必ず `git -C "$STRATA" ls-files` から現在の入口階層を導いてから読む。
 
 ```bash
 git -C "$STRATA" ls-files | cut -d/ -f1 | sort | uniq -c | sort -rn   # 現在の入口階層
@@ -27,9 +26,8 @@ rg -n --hidden \
 ```
 
 除外は末尾一致（`!**/third_party/**`）で掛ける。checkout 全体を引くようにしておけば、top-level が
-どの階層に組み替わっても対象が変わらない。0.2.15 までのように `"$STRATA"/src` などで名指しすると、
-消えた 14 本のパスを rg がエラーだけ出して続行し、同じ検索語で 78 件しか拾えない
-（現行 checkout 全体では除外後も約 4,900 件）。
+どの階層に組み替わっても対象が変わらない。`"$STRATA"/src` のように階層を名指しすると、
+消えたパスを rg はエラーだけ出して続行し、対象が大幅に減ったまま進行する。
 
 helper が見つかったら、その helper の**全呼び出し箇所**も追う（定義だけで判断しない）。
 CMake / Docker / CI 側は `$ENV{NAME}`、`ENV NAME=`、`environment:` のキー、`${NAME}`、`${{ env.NAME }}`。
@@ -55,13 +53,6 @@ git -C "$STRATA" ls-files | grep -E '\.(sh|bash|bat|cmd|ps1|py|js|mjs|c|cc|cpp)$
 git -C "$STRATA" diff --name-status --diff-filter=R -M <prev>..HEAD \
   | awk -F'\t' '$2 != $3 {print $3}' | cut -d/ -f1 | sort | uniq -c | sort -rn
 ```
-
-参考: 0.2.15 → 0.2.16（コミット `4058aa782`「Layout move for 0.2.16」）は約 7,100 件の rename で、
-`src/ include/ cmake/ metal/ sycl/ spark/ tests/ bench/` → `engine/`、
-`setup.py bin/ serve/ data/ ref/ integrations/ crates/` → `terminal/`、`apps/` → `app/`、
-`packaging/ docker/ research/` → `tools/`、`SETUP.bat` `UPDATE.bat` `update.sh` は削除だった。
-`<prev>` がこれを跨ぐと 8,000 行超の diff になるが、異常ではない。
-
 
 ## 3. CLI grammar を機械抽出する（索引の網羅性照合）
 
@@ -89,9 +80,8 @@ PY
 同一 revision の CLI を import して `parser()` を呼び、`_actions` と `_SubParsersAction.choices` を再帰 walk して
 最終 grammar を出すのが確実（索引との diff 取りに使う）。
 
-C/C++ エンジンと単体 CLI（例: `engine/src/program/generate.cpp`、`engine/src/qwen35/q36_engine.cu`、
-`engine/src/plan/plan_main.cpp`、`engine/src/hy4flash/run/hy4_main.hip.cpp`。例は 0.2.22 時点の実在パスで、
-あてにせず `rg -l 'argv\[i\]' "$STRATA"` 等で所在を毎回探す）:
+C/C++ エンジンと単体 CLI（parser の所在は `rg -l 'argv\[i\]|std::strcmp\(argv\[' "$STRATA"` や
+`add_executable` を持つファイルから毎回導く。この節に階層名を書き置かない）:
 
 ```bash
 rg -n --hidden -g '!.git/**' -g '!**/third_party/**' -g '!**/docs/**' '"--[a-z0-9-]+"' "$STRATA"
@@ -142,12 +132,14 @@ git -C "$STRATA" grep -l 'add_executable' -- '*CMakeLists.txt' | grep -v 'third_
 
 対象外: 追跡ファイルのうち、パスのどこかに `docs/` `bench/results/` `data/` `ref/` `third_party/` を含む場所。
 除外は**末尾一致で書く**（`rg -g '!**/third_party/**'`、`git grep -- ':(exclude,glob)**/third_party/**'`）。
-top-level 固定の名前だと 0.2.16 の移動（`third_party/` → `engine/third_party/`、`data/` → `terminal/data/`、
-`ref/` → `terminal/ref/`）に追随せず、ベンダーコピーが候補に混入する。
+top-level 固定の名前だと階層の移動に追随せず、ベンダーコピーが候補に混入する。
 見る場所: `git -C "$STRATA" ls-files` の追跡ファイル全部（上の対象外を除く）。索引再生成のたびに
-`git -C "$STRATA" ls-files | cut -d/ -f1 | sort -u` で入口階層を導き、直下のスクリプト入口
-（2026-11・0.2.22 時点は `setup.sh` `START-HERE.bat` `UPDATE.bat`。`setup.py` は `terminal/`、
-`BENCH.bat` は `tools/` に移動した）も併せて読む。
+入口階層と直下のスクリプト入口を Strata から導いて読む。
+
+```bash
+git -C "$STRATA" ls-files | cut -d/ -f1 | sort -u   # 入口階層
+git -C "$STRATA" ls-files | awk -F/ 'NF == 1'       # 直下ファイル
+```
 検索する拡張子: `.c .cc .cpp .cxx .h .hpp .hxx .cu .cuh .metal .rs .mm .m .inc .cppm .tpp .nsi .py .js .mjs .cjs .ts .tsx .jsx .sh .bash .zsh .bat .cmd .ps1 .psm1 .yml .yaml .cmake .txt`。
 
 綴りは Strata が実際に読む形のまま載せる（`Path` `SystemDrive` `VCToolsRedistDir` など）。例外として

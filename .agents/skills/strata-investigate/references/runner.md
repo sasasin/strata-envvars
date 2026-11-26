@@ -24,8 +24,7 @@ uv run ./create-cli-docs.py -p 12 -l 100
   - `--stale-report PATH` … `find-stale.py` の報告（既定 `.strata-stale.json`）。陳腐化で削除した変数の
     調査対象 SHA・触れたコミット・差分の抜書を codex への依頼文に添える。報告の revision が Strata HEAD と
     違う場合は自動で無視する（`create-cli-docs.py` にも同じオプションがある）。
-    2026-11-02 の一巡では 13 件全てに付与でき、全件が文書化した（`unknown-sha` には「索引 SHA と N 文字差」の
-    候補も添えられる）
+    `unknown-sha` には「索引 SHA と N 文字差」の候補も添えられる
 - 試行記録は `.create-envvars-docs.state.json`（`{変数名: {attempts, status, updated_at}}`）。
   `status` は `created` / `no-doc`（Strata が実際には読まない候補。`001_investigation.md` の手順どおり
   「索引との食い違い」として報告され、文書は作られない）/ `error`。
@@ -94,19 +93,13 @@ pi --provider ollama-cloud --model deepseek-v4.1-flash:1017 --thinking high \
 - 各セッションの last message に「索引との食い違い」報告が出ることがある。`no-doc` の理由として
   後から読めるようにログを残す（リポジトリには置かない）。
 
-## 並列数と時間の実測メモ（2026-11 時点）
+## 並列数の目安
 
-- Codex（GPT-6 Luna xhigh）で envvars 737 件の作成を走らせ、5 時間制限を 1.6 回使った。
-  並列数と制限消費のバランスは見ながら調整する。
-- 手元 PC（Radeon R9700 1 枚、OpenCode + Strata Qwen3.8 Flash Next IQ2_XXS、reasoning effort=high）では
-  1 変数に 5〜15 分かかった。全件（1600 件超）をこのペースで回すのは現実的でない。
-- CLI 側は 1 件が軽いので `-p 12` 程度まで張った実績がある。envvars 側は `-p 5` 前後。
-- `-r pi`（ollama-cloud / deepseek-v4.1-flash:1017 / thinking=high）の 1 件あたり実測（2026-11-23、1 並列）:
-  envvars 2 件が各約 2 分（両方 `no-doc`。`git grep -w` で読み取り箇所 0 件の索引偽陽性だった）、
-  CLI 1 件が約 4 分。契約上の同時実行数は 3 までなので `-p 3` 以下で使う。
-  Pi 版の CLI 文書は 16.8 KB で、既存 906 件の中央値 6.0 KB（p90 7.5 KB）より大きかった。
-  見出し構成は `docs/cli/001_investigation.md` どおりで `path:line` の裏付けもあるが、
-  分量を揃えたいなら依頼文側で絞る（ランナー中立の文なので codex にも効く）。
+- Codex: envvars は `-p 5` 前後、CLI は 1 件が軽いので `-p 12` 程度まで張れる。
+- `-r pi`（ollama-cloud）: 契約上の同時実行数が 3 までなので `-p 3` 以下で使う。
+- ローカルモデルで回すと 1 変数に数十分かかる。全件をローカルで回すのは現実的でない。
+- Pi 版の文書は codex 版より長くなりがち。見出し構成は `docs/cli/001_investigation.md` に従い
+  `path:line` の裏付けも出るが、分量を揃えたいなら依頼文側で絞る（ランナー中立の文なので codex にも効く）。
 
 ## 実行後の確認
 
