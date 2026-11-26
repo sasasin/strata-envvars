@@ -90,11 +90,8 @@ python3 .agents/skills/strata-investigate/scripts/check-docs.py
 option 文字列そのものが出るか」（Stage 2）で候補を絞ること。判定の意味と確度、安全弁は
 `references/staleness.md`。削除した項目は索引に残したまま試行記録から消すと、既存の C（一括作成）がそのまま拾う。
 
-2026-11-02 の一巡実測: 全走査（Stage 1/2/3）は約 3 秒。envvars の候補 13 件（`token-in-diff` 12 と
-`unknown-sha` 1）を削除して再作成するのに 4 分 27 秒（5 並列、全件 created）。CLI は 115 件のうち
-`--help` の 97 件を後回しにし、18 件を 2 分 42 秒で回した。この結果を受けて 2026-11-17 に
-`--help` の文書自体を廃止した（索引に載せず作らない。`references/index-refresh.md` §3）ので、
-現在は CLI の候補に `--help` は出ない。`moved` 判定の項目は削除しない（引用座標だけが古い）。
+`moved` 判定の項目は削除しない（引用座標だけが古い）。`--help` は索引に載せず文書も作らないので
+CLI の候補には出ない（`references/index-refresh.md` §3）。
 
 ## B. 削除（prune）
 

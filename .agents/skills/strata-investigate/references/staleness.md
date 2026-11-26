@@ -36,9 +36,6 @@ python3 .agents/skills/strata-investigate/scripts/evidence-index.py
   このリポジトリ自身の参照（`docs/envvars/000_envvers.md` 等）は除外、ファイル名だけ
   （`harness.py`）は Strata 内で一意なら解決し、複数候補は全候補を調べる。
 
-2026-11-02 実測: envvars 1627 文書すべてに座標があり、座標 17,283 件のうち Strata 実パス 15,985、
-this-repo 参照 1,298、ファイル名のみ 134、実在せず 1。
-
 ## Stage 1 — 根拠座標が差分で動いたか
 
 ```bash
@@ -48,21 +45,19 @@ python3 .agents/skills/strata-investigate/scripts/find-stale.py
 文書ごとの `doc_sha..基準 revision` で `git diff -M -U0` を引き、引用行範囲が hunk と交差するかを見る。
 
 **diff は pathspec なしで全ツリーを引く**（`staleness_lib.hunk_data()`）。引用ファイルだけに絞ると、
-大きなレイアウト移動（Strata 0.2.16 の `src/` → `engine/src/` 等、コミット `4058aa782`）で old パスが
-diff に入らず rename 検出が壊れて「全文追加」の巨大 hunk になり、token-in-diff が本文の 9 割超まで
-量産された（2026-11-23 実測: 候補 2731 件のうち 1136 件が移動由来の誤検知）。`-M` を効かせれば
-純粋な移動 (R100) は hunk を出さず、内容が動いた箇所だけが候補になる。
+大きなレイアウト移動で old パスが diff に入らず rename 検出が壊れて「全文追加」の巨大 hunk になり、
+token-in-diff の誤検知を量産する。`-M` を効かせれば純粋な移動 (R100) は hunk を出さず、
+内容が動いた箇所だけが候補になる。
 
 **hunk ごとに「既知トークン -> 抜粋行」の写像を 1 回作る**（`WORD_RE` で語を切り出して
-`known_tokens` と突き合わせる）。文書側の照合は写像参照の O(1)。旧実装は
-文書×座標×hunk×行で境界正規表現の `re.search` を 2.5 億回走らせ、これが所要時間の 6 割だった。
-語全体で一致させるので `STRATA_PF_FUSED` の語に `STRATA_PF_FUSED_SM75` は入らず、
-旧実装の境界正規表現と同義になる。
+`known_tokens` と突き合わせる）。文書側の照合は写像参照の O(1)。語全体で一致させるので
+`STRATA_PF_FUSED` の語に `STRATA_PF_FUSED_SM75` は入らない。
 
 **並列化**: doc_sha 単位の全ツリー diff、候補ごとの `git log`（changed_commits）、
 name index の git grep、`--with-symbols` の git grep は `--parallel N`（既定 `min(8, CPU コア数)`）
 で `concurrent.futures.ThreadPoolExecutor` による並列。envvars と cli で同じ doc_sha の diff を
-共有する（旧実装は scope ごとに再構築し、12 sha × 2 回引いていた）。
+共有する。doc_sha 個の全ツリー diff が走査時間の大部分を占めるので、
+`check-docs.py --stale` の commit 別分布で doc_sha が溜まっていないかを見る。
 
 | 判定 | 意味 | 処置 |
 | --- | --- | --- |
@@ -75,35 +70,26 @@ name index の git grep、`--with-symbols` の git grep は `--parallel N`（既
 | `no-meta` | 調査対象行が無い | 本文修正 |
 
 名前の突き合わせは境界付き正規表現（`(?<![A-Za-z0-9_-])NAME(?![A-Za-z0-9_-])`）。
-`STRATA_PF_FUSED` の差分に `STRATA_PF_FUSED_SM75` が出て誤検地になった実例があるため、
-部分一致は使わない。
+部分一致だと `STRATA_PF_FUSED` の差分に `STRATA_PF_FUSED_SM75` が混入するので使わない。
 
 ## Stage 2 — 主題トークン交差
 
-Stage 1 の `token-in-diff` がこれ。2026-11-02 実測:
-
-- envvars: `same-revision` 742 / `file-only` 684 / `hunk-intact` 182 / **`token-in-diff` 12** / `moved` 6 / `unknown-sha` 1（初回実行、S-a を変数ごと grep していた頃）
-- cli: `file-only` 652 / `hunk-intact` 315 / **`token-in-diff` 115** / `same-revision` 43
-
-索引より古い commit で書かれた 885 文書（envvars）のうち 701 件が hunk と交するが、
-名前の出ている差分に絞ると 12 件になる。ここが消すに値する範囲。
+Stage 1 の `token-in-diff` がこれ。索引より古い commit で書かれた文書のうち、hunk と交差する
+件数は多いが、主題トークンそのものが出ている差分に絞ると大幅に減る。ここが消すに値する範囲。
 
 ## Stage 3 — 補助判定（`--stage3`）
 
 - **envvars S-a 所在移動**: 名前の所在は `build_name_index()` が作る「名前 → 出現ファイル」表で引く
   （git grep は 3 回だけ: 大文字のクォート名、`$NAME` / `${NAME:-…}`、bat の `%NAME%`）。
-  変数ごとに grep していた実装では 12 分かかっていたのが、約 3 秒になった。
+  変数ごとに grep を走らせると走査が重くなる。
   - 表に無い → `name-gone`（候補。索引更新で消えるはずなので、索引に残っているなら索引側を疑う）
   - 見付かったが引用ファイルに無い → `moved`（**削除しない**。引用座標だけが古い）
-    2026-11-02 実測 4 件はすべて実移動だった: `HIPK_CFG` / `HIPK_DBG` / `STRATA_DS4_HIPK` は
-    `src/dsv41/ds4_iq.cu` が `ds4_iq_hip.inc` へ分割、`STRATA_PIN_RESERVE_GIB` は
-    `src/core/pinned.cu` から `src/core/expert_source.cpp` へ移っている。
   - 引用ファイルに在る → `file-only` のまま（差分は出たが引用箇所は無傷）
-  - `GPUS`・`HOME` のように一般名は、shell 参照まで拾わないと所在移動の誤判定になる
-    （`docker/entrypoint.sh` の `${GPUS:-…}` を読む行が拾えず moved に出ていた例がある）
+  - `GPUS`・`HOME` のように一般名は、shell 参照（`${GPUS:-…}` のような展開）まで拾わないと
+    所在移動を誤判定する
 - **envvars S-b 引用シンボル**（`--with-symbols --symbol-limit N`）: 文書が挙げる helper・修飾名が
   現行に存在するか。シンボルは name index に載らないので、この判定だけ変数あたり git grep が走る。
-  費用対効果が小さいので既定の上限は 200 件。2026-11-02 実測では 300 件検査して候補は 1 件増。
+  費用対効果が小さいので既定の上限は 200 件。
 - **cli S-c option inventory**: `cli-grammar.py` が Strata 全体から `"--xxx"` 文字列を拾い、
   索引の option identity と突合する。索引更新時に必ず再生成する。
   - 索引の option が inventory に無い → `option-absent-in-grammar`（候補）
@@ -123,9 +109,7 @@ python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
   `name-gone` と `cited-file-gone` は索引更新・所在確認が要るので既定外。
 - `--exclude-token=OPTION`（繰り返し可）で主題トークンを除外する。共通 option（`--json`、`--quiet`、
   `--version` など）を先に除外して、動作の意味が変わる option（`--backend`、`--preset`、`--show-key` など）から消す。
-  かつては `--help` が CLI 候補の大半を占めた（2026-11-02 実測 115 件中 97 件）。usage 文言の変更に
-  引っかかるだけで文書の骨格は変わらなかったため、2026-11-17 に `--help` の文書自体を廃止した
-  （索引に載せず作らない。`index-refresh.md` §3）。
+  `--help` は索引に載せず文書も作らない（`index-refresh.md` §3）ので候補に出ない。
   索引の option inventory との突合 (S-c) で `option-absent-in-grammar` 側に出たものは除外不要。
   ```bash
   python3 .agents/skills/strata-investigate/scripts/mark-stale.py --scope cli \
@@ -150,32 +134,7 @@ uv run ./create-cli-docs.py -p 12 -l 40
 `--stale-report` で「旧文書の SHA、触れたコミット、差分行、現在の所在候補、消えた識別子」が
 codex への依頼文に添えられる。報告の revision が Strata HEAD と違う場合は自動的に無視される。
 
-## 実測メモ（2026-11-23、Strata `73d4f4196` 基準、索引 SHA から 1378 コミット乖離）
+## 再作成後の確認
 
-- 全走査（Stage 1/2/3、name index 含む）: 旧実装 4 分 37 秒 → 新実装 **1 分 13 秒**（8 並列、24 コア）。
-  内訳は全ツリー diff 12 sha × 約 2 秒（並列で 71 秒）+ 判定ループ約 10 秒 + commits_touching 約 5 秒。
-- 判定結果は書き換え前後で候補 1316 件・verdict 分布・touched_files が完全一致（回帰テスト済み）。
-- 2026-11-02 実測の「全走査 約 3 秒」は pathspec 版（移動で壊れる前の小差分）での値。
-
-## 実測メモ（2026-11-02、Strata `c62d5e3a` 基準）
-
-- 全走査（Stage 1/2/3、S-a 含む）で約 3 秒。`--with-symbols` 300 件追加で約 3 分。
-- 索引 SHA と同じ commit で書かれた文書（envvars 755 / cli 43）は差分ゼロで intact。
-  envvars の 872 件・cli の 1,083 件は索引より古い commit で書かれており、この手順の主な対象になる。
-- 一巡の実例: envvars の `token-in-diff` 12 件と `unknown-sha` 1 件を `mark-stale.py --apply --limit 20`
-  で削除（数秒）→ `create-envvars-docs.py -p 5 -l 13` で再作成（4 分 27 秒、全件 created）→
-  `find-stale.py --stage3` 再実行で envvars の候補は 0 件（`token-in-diff` 0、`unknown-sha` 0、
-  `moved` 4、`file-only` 686、`hunk-intact` 182、`same-revision` 755）。
-  再作成文書には backend 別の判定表や `STRATA_GFX12_DEFAULTS` との相互作用まで書けており、
-  旧文書になかった変化が拾えていた（`STRATA_HC_Q8`）。旧 SHA 誤記の `STRATA_MOVE_ALWAYS_COPY` も
-  現行 SHA の文書に置き換わった。
-- CLI の `token-in-diff` 115 件のうち `--exclude-token=--help` で 97 件を除外し、18 件を一巡させた
-  （削除→ `create-cli-docs.py -p 12 -l 30` で 2 分 42 秒、全件作成）。対象は `--backend` 3、`--preset` 2、
-  `--show-key` 2、`--force`、`--model`、`--batch-groups`、`--expert-cache-device1`、`--kv-grow`、`--mtp-q4`、
-  `--experts`、`--vram-experts`、`--gpu`、`--gpus`、`--vision`。
-  残った `--help` 97 件はそのまま候補として置く運用にしたが、2026-11-17 に `--help` の文書と索引行を
-  すべて削除した（文書を作らない方針に変更）。
-- 見付かった実例: `STRATA_ATTN_LANECELL` は既定値テーブル `t.push_back({"STRATA_ATTN_LANECELL", "1"})` が
-  `src/core/arch_defaults.cpp` に加わり、`STRATA_HC_Q8` は `getenv` 呼び出しがコメント化されている。
-- 再作成後は `find-stale.py` をもう一度走らせて候補が減っていることを確認する（同じ commit 基準に
+- `find-stale.py` をもう一度走らせて候補が減っていることを確認する（同じ commit 基準に
   揃うので `token-in-diff` は 0 になる）。`check-docs.py --stale` の commit 別分布でも追える。

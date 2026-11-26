@@ -1,7 +1,7 @@
 # codex / pi に投げる依頼文
 
-`README.md` に置いてあったプロンプト集の最新版。パスは実体（`docs/envvars/…`、`docs/cli/…`）に直してある。
-索引の中身に関する指示は `references/index-refresh.md` を参照する形に統一した（索引ファイル側に手順は置かない）。
+codex / pi に投げる依頼文の雛形。パスは実体（`docs/envvars/…`、`docs/cli/…`）を書く。
+索引の中身に関する指示は `references/index-refresh.md` を参照する形に統一する（索引ファイル側に手順を置かない）。
 ファイル名は `000_envvers.md`（綴りは envvars ではない）が実在名なので、そのまま使う。
 
 ## 環境変数一覧の再生成

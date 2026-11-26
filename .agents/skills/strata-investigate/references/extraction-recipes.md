@@ -3,6 +3,13 @@
 Strata checkout を読むときの検索語と機械抽出。索引更新（`index-refresh.md`）と 1 件調査（D/E モード）で使う。
 Strata 側の絶対パスは `STRATA=$HOME/src/github.com/Niko1221/Strata` として書く。
 
+**どの節でも Strata の top-level 階層名を書き置かない。** 階層は Release で作り替わる。
+対象を決めるときは必ず `git -C "$STRATA" ls-files` から現在の入口階層を導いてから読む。
+
+```bash
+git -C "$STRATA" ls-files | cut -d/ -f1 | sort | uniq -c | sort -rn   # 現在の入口階層
+```
+
 ## 1. 環境変数の全参照を出す
 
 ```bash
@@ -12,13 +19,15 @@ rg -n --hidden --glob '!.git/**' 'NAME' "$STRATA"
 名前の完全一致だけでは helper 経由と動的な名前を落としやすい。読み取り API 側も併せて引く。
 
 ```bash
-rg -n --hidden --glob '!.git/**' \
+rg -n --hidden \
+  -g '!.git/**' -g '!**/docs/**' -g '!**/bench/results/**' -g '!**/data/**' -g '!**/ref/**' -g '!**/third_party/**' \
   'std::getenv|getenv\(|_wgetenv|setenv|putenv|_putenv_s|unsetenv|env::var|os\.environ|os\.getenv|process\.env|Deno\.env|env_on|_timeout_env' \
-  "$STRATA"/src "$STRATA"/include "$STRATA"/sycl "$STRATA"/metal "$STRATA"/serve \
-  "$STRATA"/strata_cli "$STRATA"/strata_control "$STRATA"/tools "$STRATA"/apps \
-  "$STRATA"/packaging "$STRATA"/docker "$STRATA"/spark "$STRATA"/bin "$STRATA"/cmake "$STRATA"/.github \
-  "$STRATA"/setup.py "$STRATA"/setup.sh "$STRATA"/CMakeLists.txt "$STRATA"/Dockerfile
+  "$STRATA"
 ```
+
+除外は末尾一致（`!**/third_party/**`）で掛ける。checkout 全体を引くようにしておけば、top-level が
+どの階層に組み替わっても対象が変わらない。`"$STRATA"/src` のように階層を名指しすると、
+消えたパスを rg はエラーだけ出して続行し、対象が大幅に減ったまま進行する。
 
 helper が見つかったら、その helper の**全呼び出し箇所**も追う（定義だけで判断しない）。
 CMake / Docker / CI 側は `$ENV{NAME}`、`ENV NAME=`、`environment:` のキー、`${NAME}`、`${{ env.NAME }}`。
@@ -29,17 +38,25 @@ CMake / Docker / CI 側は `$ENV{NAME}`、`ENV NAME=`、`environment:` のキー
 
 ## 2. 変更範囲だけを拾う（索引更新）
 
-前回索引に書いた commit SHA を `<prev>` として、入口と packaging まわりだけを眺める。
+前回索引に書いた commit SHA を `<prev>` として、入口まわりだけを眺める。`<prev>` の時点と HEAD で
+top-level が違うことがあるので、**パス名を書かず diff の絞り込み方で見る**。
 
 ```bash
-git -C "$STRATA" diff --name-status <prev>..HEAD -- packaging/ bin/ docker/ spark/ apps/desktop/ docs/ .
+git -C "$STRATA" diff --name-status --diff-filter=AMD -M <prev>..HEAD   # 増えた / 消えた / 書かれたもの
 git -C "$STRATA" ls-files | grep -E '\.(sh|bash|bat|cmd|ps1|py|js|mjs|c|cc|cpp)$'
 ```
 
+`R` が大量に出たら top-level の作り替え。移動先階層の件数だけ数えて、§1・§3・§5 で読む場所を現行に
+切り替える（索引更新で見るのは入口の増減なので、rename の全行を流し読まない）。
+
+```bash
+git -C "$STRATA" diff --name-status --diff-filter=R -M <prev>..HEAD \
+  | awk -F'\t' '$2 != $3 {print $3}' | cut -d/ -f1 | sort | uniq -c | sort -rn
+```
 
 ## 3. CLI grammar を機械抽出する（索引の網羅性照合）
 
-Python argparse（Terminal CLI、`setup.py`、`tools/strata_bench.py`）:
+Python argparse（Terminal CLI、`terminal/setup.py`、`terminal/tools/strata_bench.py`）:
 
 ```bash
 python3 - <<'PY'
@@ -59,21 +76,25 @@ PY
 ```
 
 `help=argparse.SUPPRESS` で `--help` に出ない option もこれで拾える。
-`strata_cli/cli.py` は登録済みの module parser に後から共通 option（`--json` / `--quiet` など）を足すため、
+`terminal/strata_cli/cli.py` は登録済みの module parser に後から共通 option（`--json` / `--quiet` など）を足すため、
 同一 revision の CLI を import して `parser()` を呼び、`_actions` と `_SubParsersAction.choices` を再帰 walk して
 最終 grammar を出すのが確実（索引との diff 取りに使う）。
 
-C/C++ エンジンと単体 CLI（`src/program/generate.cpp`、`src/qwen35/q36_engine.cu`、`src/dsv41/ds4_main.cpp`、
-`src/plan/plan_main.cpp` など）:
+C/C++ エンジンと単体 CLI（parser の所在は `rg -l 'argv\[i\]|std::strcmp\(argv\[' "$STRATA"` や
+`add_executable` を持つファイルから毎回導く。この節に階層名を書き置かない）:
 
 ```bash
-rg -n --hidden '"--[a-z0-9-]+"' "$STRATA"/src "$STRATA"/sycl "$STRATA"/metal "$STRATA"/tools
-rg -n 'std::strcmp\(argv\[|a == "--|argv\[i\] == "--' "$STRATA"/src
+rg -n --hidden -g '!.git/**' -g '!**/third_party/**' -g '!**/docs/**' '"--[a-z0-9-]+"' "$STRATA"
+rg -n --hidden -g '!.git/**' -g '!**/third_party/**' 'std::strcmp\(argv\[|a == "--|argv\[i\] == "--' "$STRATA"
 ```
 
 alias（`|| a == "-h"`）と、`--version` / `-V` / `--families` / `--gpu` のような早期処理フラグを見落とさない。
-CMake 生成対象は `add_executable` の場所と条件ブロック（`option(...)`、backend guard、`NOT STRATA_HIP_GFX906` など）を
-`CMakeLists.txt`、`sycl/CMakeLists.txt`、`metal/CMakeLists.txt`、`tools/vision/CMakeLists.txt` から読む。
+CMake 生成対象は `add_executable` の場所と条件ブロック（`option(...)`、backend guard、`NOT STRATA_HIP_GFX906` など）から読む。
+`CMakeLists.txt` の所在も名指しせず列挙して決める（`third_party` を含むパスはベンダーコピーなので落とす）。
+
+```bash
+git -C "$STRATA" grep -l 'add_executable' -- '*CMakeLists.txt' | grep -v 'third_party/'
+```
 
 索引更新のたびに、この抽出結果の要として option 文字列 inventory を保存する（`scripts/cli-grammar.py` →
 `.cli-grammar.json`）。`find-stale.py` の S-c（既存 CLI 文書の option が現行 parser から消えたか）がこれを使う。
@@ -109,10 +130,16 @@ CMake 生成対象は `add_executable` の場所と条件ブロック（`option(
 コマンドライン引数名・量子化形式名・ファイルヘッダの magic 文字列・shell 内蔵変数（`PWD` `RANDOM` `PIPESTATUS`
 `ERRORLEVEL` `BASH_SOURCE` `BASH_REMATCH`）・スクリプトが自分で代入するだけの内部変数・テスト内のダミー文字列。
 
-対象外のディレクトリ: `bench/results/`、`docs/`、`data/`、`ref/`、`third_party/`。
-見る場所: `src/` `include/` `sycl/` `metal/` `serve/` `strata_cli/` `strata_control/` `tools/` `apps/` `integrations/`
-`tests/` `bench/` `packaging/` `docker/` `spark/` `bin/` `cmake/` `.github/` と、直下の `setup.py` `setup.sh`
-`update.sh` `CMakeLists.txt` `Dockerfile` `START-HERE.bat` `SETUP.bat` `UPDATE.bat` `BENCH.bat`（新しい入口が増えていれば足す）。
+対象外: 追跡ファイルのうち、パスのどこかに `docs/` `bench/results/` `data/` `ref/` `third_party/` を含む場所。
+除外は**末尾一致で書く**（`rg -g '!**/third_party/**'`、`git grep -- ':(exclude,glob)**/third_party/**'`）。
+top-level 固定の名前だと階層の移動に追随せず、ベンダーコピーが候補に混入する。
+見る場所: `git -C "$STRATA" ls-files` の追跡ファイル全部（上の対象外を除く）。索引再生成のたびに
+入口階層と直下のスクリプト入口を Strata から導いて読む。
+
+```bash
+git -C "$STRATA" ls-files | cut -d/ -f1 | sort -u   # 入口階層
+git -C "$STRATA" ls-files | awk -F/ 'NF == 1'       # 直下ファイル
+```
 検索する拡張子: `.c .cc .cpp .cxx .h .hpp .hxx .cu .cuh .metal .rs .mm .m .inc .cppm .tpp .nsi .py .js .mjs .cjs .ts .tsx .jsx .sh .bash .zsh .bat .cmd .ps1 .psm1 .yml .yaml .cmake .txt`。
 
 綴りは Strata が実際に読む形のまま載せる（`Path` `SystemDrive` `VCToolsRedistDir` など）。例外として

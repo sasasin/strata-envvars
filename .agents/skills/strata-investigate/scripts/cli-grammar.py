@@ -21,11 +21,12 @@ CLI_INDEX = REPO_ROOT / "docs" / "cli" / "README.md"
 
 LONG_OPTION_RE = r"-{1,2}[A-Za-z][A-Za-z0-9_-]*"
 EXCLUDES = [
-    ":(exclude)docs/**",
-    ":(exclude)bench/results/**",
-    ":(exclude)data/**",
-    ":(exclude)ref/**",
-    ":(exclude)third_party/**",
+    # staleness_lib.GREP_EXCLUDES と同じ方針。末尾一致で書き、Strata の top-level 移動に追随させる。
+    ":(exclude,glob)**/docs/**",
+    ":(exclude,glob)**/bench/results/**",
+    ":(exclude,glob)**/data/**",
+    ":(exclude,glob)**/ref/**",
+    ":(exclude,glob)**/third_party/**",
     ":(exclude)*.md",
 ]
 LINE_RE = re.compile(r"^(?P<file>[^:]+):(?P<line>\d+):(?P<text>.*)$")

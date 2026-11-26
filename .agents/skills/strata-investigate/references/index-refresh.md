@@ -38,7 +38,7 @@
 - `docs/cli/<tool-id>/` を切る単位の一覧。envvars の `000_envvers.md` に相当し、`docs/cli/001_investigation.md` が tool-id の起点として読む。
 - 中身は次に限る: 見出し、`調査対象:` 行（HEAD の完全な commit SHA と日付）、`## tool-id` 表（tool-id / 入口 / parser の所在 / scope）、`## 対象外`（入口と一行の理由）。
 - 書かないもの: 設置先・配布経路・Release asset の名前・サイズ・digest、feed の中身、Docker の flavor、`add_executable` の件数、前回からの変化、調べたソース一覧、更新手順・依頼文。
-- 更新時は Strata ルート・`bin/`・`packaging/`・`tools/`・`strata_cli/`・`src/`・各 `CMakeLists.txt` を見て、tool-id の追加・削除・改名と parser の所在を確かめる（`extraction-recipes.md` §2・§3）。名前だけで分類せず、呼び出し先と parser を読む。
+- 更新時はまず `git -C "$STRATA" ls-files | cut -d/ -f1 | sort -u` で**現在の入口階層を Strata から導く**。top-level は Release で作り替わるので、階層名を索引や手順に書き置かない。導いた階層と、`add_executable` を持つ `CMakeLists.txt`（`extraction-recipes.md` §3 の列挙）を見て、tool-id の追加・削除・改名と parser の所在を確かめる。名前だけで分類せず、呼び出し先と parser を読む。
 - tool-id は現行 checkout に parser があるものだけ。ソースから parser が消えた CLI は、過去の Release に配布物が残っていても一覧から外す（Release は調べない）。
 - `*_test` / `*_parity` / `*_bench`、probe・harness、配布物を作る helper、CLI 引数を持たない installer は対象外に置く。対象外から tool-id に昇格させる場合は利用者・build target・parser を確認する。
 

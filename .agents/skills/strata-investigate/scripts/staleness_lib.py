@@ -65,11 +65,13 @@ GREP_PATTERNS = [
     r"(process\.env|env|environ)\.[A-Za-z0-9_]+_[A-Za-z0-9_]+",
 ]
 GREP_EXCLUDES = [
-    ":(exclude)docs/**",
-    ":(exclude)bench/results/**",
-    ":(exclude)data/**",
-    ":(exclude)ref/**",
-    ":(exclude)third_party/**",
+    # 除外は末尾一致 (:(exclude,glob)**/...) で書く。Strata の top-level は Release で作り替わるので、
+    # top-level 固定の pathspec では移動したベンダーコピーが Stage 3 の候補に混入する。
+    ":(exclude,glob)**/docs/**",
+    ":(exclude,glob)**/bench/results/**",
+    ":(exclude,glob)**/data/**",
+    ":(exclude,glob)**/ref/**",
+    ":(exclude,glob)**/third_party/**",
 ]
 
 # hunk の差分行から切り出す語: 識別子と option 文字列（境界付き）。
@@ -204,17 +206,15 @@ class StrataTree:
     ) -> dict[str, list[tuple[int, int, int, int, dict[str, list[str]] | None]]]:
         """`since..HEAD` の hunk を行範囲と「トークン -> 抜粋行」の写像で集める（1 回の diff、全ツリー）。
 
-        pathspec は使わない。引用ファイル（新パス）だけに絞ると、大きなレイアウト移動
-        （例: Strata 0.2.16 の src/ → engine/src/）では old パスが diff に入らず
-        rename 検出が壊れて「全文追加」の巨大 hunk になり、token-in-diff が量産される
-        （2026-11-23 実測: 候補 2731 件のうち 1136 件が移動由来の誤検知）。
-        全ツリーの diff にすれば -M が効き、純粋な移動 (R100) は hunk を出さない。
+        pathspec は使わない。引用ファイル（新パス）だけに絞ると、大きなレイアウト移動では
+        old パスが diff に入らず rename 検出が壊れて「全文追加」の巨大 hunk になり、
+        token-in-diff の誤検知を量産する。全ツリーの diff にすれば -M が効き、
+        純粋な移動 (R100) は hunk を出さない。
 
         差分行は全部は保持しない。hunk ごとに WORD_RE で語を 1 回切り出し、
         known_tokens に在るものだけを {トークン: 抜粋行 最大 6 本} にまとめる。
         文書側の照合は「交差した hunk の写像に自分のトークンが在るか」の O(1) で、
-        報告に添える行もそのトークン自身の行になる（旧実装は 文書×座標×hunk×行 で
-        re.search を 2.5 億回走らせ、それが find-stale.py の所要時間の 6 割だった）。
+        報告に添える行もそのトークン自身の行になる。
         """
         per: dict[str, list[tuple[int, int, int, int, dict[str, list[str]] | None]]] = collections.defaultdict(list)
         cur_path: str | None = None

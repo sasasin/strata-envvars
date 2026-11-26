@@ -6,9 +6,9 @@
 | --- | --- |
 | ツール ID | `<tool-id>` |
 | コマンド | `<strata launch>` |
-| POSIX の入口 | `<bin/strata>` |
-| Windows の入口 | `<bin\strata.cmd / strata.ps1>` |
-| 主な実装 | `<strata_cli/launch/cmd.py>` |
+| POSIX の入口 | `<terminal/bin/strata>` |
+| Windows の入口 | `<terminal/bin/strata.cmd / strata-direct.ps1>` |
+| 主な実装 | `<terminal/strata_cli/launch/cmd.py>` |
 
 ## 役割
 
