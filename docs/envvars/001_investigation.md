@@ -33,7 +33,7 @@ Strata の `main` にある環境変数を一つずつ調査し、本書の「�
 ## 手法
 
 1. `git rev-parse HEAD` と `git status --short --branch` で調査対象の revision と作業ツリーを確認する。文書には `main` の HEAD SHA を記録する。
-2. `rg -n --hidden --glob '!.git/**'` で環境変数名と env 読み取り API を検索する。例: `rg -n 'NAME|std::getenv|getenv|os\.environ|env_on|pipe_dbg_env|_timeout_env' src include sycl serve setup.py tools`。候補名の完全一致検索に加え、汎用 helper と動的な名前の渡し先を調べる。
+2. `rg -n --hidden --glob '!.git/**'` で環境変数名と env 読み取り API を検索する。対象は checkout 全体にし、除外は末尾一致で掛ける。例: `rg -n --hidden -g '!.git/**' -g '!**/third_party/**' -g '!**/docs/**' 'NAME|std::getenv|getenv|os\.environ|env_on|pipe_dbg_env|_timeout_env' "$STRATA"`。Strata の top-level 階層は Release で作り替わるので `src include sycl serve setup.py tools` のように階層名を並べた検索はしない（0.2.16 で `src/` → `engine/src/`、`bin/`・`serve/` → `terminal/`。extraction-recipes.md §1・§5）。候補名の完全一致検索に加え、汎用 helper と動的な名前の渡し先を調べる。
 3. `000_envvers.md` の候補一つにつき、候補名を直接参照する全箇所を開く。`nl -ba <file> | sed -n '<start>,<end>p'` 等で実装と行番号を確認し、読み取り元から効果を及ぼすコードまで追跡する。関連する helper の定義だけで止めず、その helper の全呼び出し箇所も調べる。
 4. 同じ名前が複数 backend やコピーされた CUDA/SYCL 実装にある場合は、各実装を比較して条件差があるか確認する。ビルド macro の分岐、platform guard、起動ラッパーから engine へ渡す環境も追う。
 5. ソースの記述を既存 docs と照合する。食い違いがあればコード上の現状と docs の説明を分け、測定の不足や確認できない点を明記する。ソースにない値域や挙動を推測で埋めない。

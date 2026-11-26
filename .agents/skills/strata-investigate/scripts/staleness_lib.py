@@ -65,11 +65,15 @@ GREP_PATTERNS = [
     r"(process\.env|env|environ)\.[A-Za-z0-9_]+_[A-Za-z0-9_]+",
 ]
 GREP_EXCLUDES = [
-    ":(exclude)docs/**",
-    ":(exclude)bench/results/**",
-    ":(exclude)data/**",
-    ":(exclude)ref/**",
-    ":(exclude)third_party/**",
+    # 除外は末尾一致 (:(exclude,glob)**/...) で書く。Strata の top-level は Release で作り替わる
+    # （0.2.16 で third_party/ → engine/third_party/、data/ → terminal/data/、ref/ → terminal/ref/、
+    # bench/ → engine/bench/ と terminal/bench/）。top-level 固定の pathspec では移動したベンダー
+    # コピーが Stage 3 の候補に混入する。
+    ":(exclude,glob)**/docs/**",
+    ":(exclude,glob)**/bench/results/**",
+    ":(exclude,glob)**/data/**",
+    ":(exclude,glob)**/ref/**",
+    ":(exclude,glob)**/third_party/**",
 ]
 
 # hunk の差分行から切り出す語: 識別子と option 文字列（境界付き）。
