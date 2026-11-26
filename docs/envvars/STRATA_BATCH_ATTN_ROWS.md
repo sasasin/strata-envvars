@@ -1,48 +1,50 @@
 # `STRATA_BATCH_ATTN_ROWS`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。対象は Strata 所有ソースです。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-バッチ検証 window の QSA 層で、各シーケンスの行ごとに実行していた block score、top-k、decode attention を複数行まとめて処理する opt-in です。各行はそれぞれ自分の indexer key と K/V pool を使い、出力先も行ごとに分かれます。環境変数を有効にしても、通常の単一シーケンス経路や QSA を持たない層には適用されません。
+QSA attention を含む verifier のバッチ窓で、各行ごとに実行していた block score・top-k・decode attention を、窓内の複数行をまとめるカーネル呼び出しに切り替える。各行は引き続き自身の indexer と K/V pool を使う。通常の単独窓では `batch_rec_` が false のため、この設定だけでは経路は切り替わらない。CUDA/HIP 共通実装と SYCL 実装に読み取りがある（`engine/src/core/verify.cpp:2194-2199`, `engine/sycl/src/core/verify.cpp:1485-1494`）。
 
 ## 値と判定
 
-値は `std::atoi(v) != 0` で判定され、文字列全体の厳密比較ではありません。
+両実装とも `std::getenv` の結果を `std::atoi` に渡し、結果が 0 以外なら有効とする。文字列全体の数値妥当性検査はなく、`atoi` が先頭から変換できた整数部分で判定する。未設定と空文字は 0。例では `1`, `-1`, `2` が有効、`0`, `0anything`, `true`, `false`, 空文字は無効。先頭空白や符号の後に数値がある場合は `atoi` の変換結果に従い、数値の後ろの文字列は無視される。大文字小文字の概念はない（`engine/src/core/verify.cpp:375-377,391`; `engine/sycl/src/core/verify.cpp:1488-1491`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字、`0`、`+0`、`-0`、数値で始まらない文字列（例: `true`） | 無効（`atoi` が 0 を返す） |
-| 0 以外の整数として読める値（例: `1`, `-1`, `+2`） | 有効 |
-| 数字の後ろに文字が続く値（例: `1extra`） | 数字部分が 0 以外なら有効。後続部分は `atoi` の判定に使われない |
-| 数字の前に空白や符号がある値（例: ` 1`, `+1`） | `atoi` が 0 以外を返す場合は有効 |
+| 実装・起動条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP verifier。Linux CUDA の `--batch` slot 数が 2 以上なら、未設定時に起動処理が `1` を補う | 通常は OFF。Linux CUDA で slot 数 2 以上の場合は起動時の既定値により ON | `atoi(value) != 0`（例: `1`, `-1`, `2`） | `atoi(value) == 0`（例: `0`, `0anything`, `true`, `false`, 空文字） |
+| HIP の gfx11 parallel defaults 条件が成立する起動 | 条件成立時は起動処理が `1` を補う。それ以外は OFF | 同上 | 同上 |
+| SYCL verifier | OFF | 同上 | 同上 |
 
-ソースでは無効値をエラーにせず、通常の処理経路を使います。変数の値は `record_window()` 内の関数ローカル `static const bool` に保存されるため、初回評価後のプロセス環境の変更は反映されません。評価箇所は同関数の QSA 層ループ内です（`src/core/verify.cpp:1684-1687`）。
+HIP では起動時の既定値設定が環境変数の「設定有無」を先に調べるため、明示した空文字も既定値で上書きされず OFF になる。既定値が適用されない経路でも判定自体は同じである（`engine/src/core/arch_defaults.cpp:218-223,302-309,346-350`; `engine/src/program/generate.cpp:4287-4320`; `engine/sycl/src/program/generate.cpp:2223-2228`）。
 
 ## 有効になる条件
 
-- `record_window()` がバッチ window を記録していること（`batch_rec_` が true）。バッチ graph の capture 中にこのフラグが設定されます（`src/core/verify.cpp:3258-3271`）。
-- 処理中の層が QSA 層であり、対象 window の行数 `te - tb` が `kAttnRowsMax` 以下（現在 8）であること（`src/core/verify.cpp:1688`, `include/strata/kernels/qsa_decode_attn.hpp:34-38`）。
-- 対象行の QSA state のいずれも KV streaming mode (`kv_mode == 1`) でないこと。1行でも該当すれば、この分岐を使いません（`src/core/verify.cpp:1688-1690`）。
-
-条件を満たさない場合は別のバッチ slot 経路、または各行を個別に処理する経路へ進みます（`src/core/verify.cpp:1708-1753`）。環境変数が有効でも、1回の処理行数が8を超える範囲はこの rows 経路の対象外です。
+- verifier がバッチ窓を記録していること（CUDA/HIP は `capture_batch` 中に `batch_rec_` を true にして `record_window` を呼ぶ: `engine/src/core/verify.cpp:4677-4691`）。
+- 対象層が QSA 層であること。QSA の窓内行数が最大 8 以下であること。超える場合は行ごとの経路を使う（`engine/src/core/verify.cpp:2198-2199`; `engine/sycl/src/core/verify.cpp:1492-1494`; 最大値は `engine/include/strata/kernels/qsa_decode_attn.hpp:36` と `engine/sycl/include/strata/kernels/qsa_decode_attn.hpp:36`）。
+- 窓内の対象 QSA 状態に KV streaming (`kv_mode == 1`) がないこと。1 つでも該当するとこのまとめ処理を使わず、行ごとの選択・resolve・attention 経路に戻る（CUDA/HIP: `engine/src/core/verify.cpp:2191-2199,2232-2264,2450-2470`; SYCL: `engine/sycl/src/core/verify.cpp:1492-1513`）。CUDA/HIP では QSA stream opt 経路 (`stream_opt_ok`) が選ばれた場合も `!stream_opt_ok` 条件により、この変数による分岐は適用されない（同 `verify.cpp:2192-2199`）。
+- 既定値の自動投入は別条件に限られる。Linux CUDA は `o.batch >= 2` で parallel stack を投入する（ユーザーが設定済みなら値を保持。`engine/src/core/arch_defaults.cpp:226-260`; 呼び出しは `engine/src/program/generate.cpp:4410-4414`）。HIP は RDNA3 discrete (`gfx1100/1101/1102`) または Windows `gfx1151` の parallel defaults が対象で、batch slots が 2 以上、かつ `STRATA_GFX11_DEFAULTS=0` や `STRATA_GFX1151_DEFAULTS=0` など該当 defaults 無効条件がない場合に候補となる。各スイッチはユーザーが設定済みなら `=0` を含め保持される（`engine/include/strata/core/gfx11_extra.hpp:27-30,116-132`; `engine/src/core/arch_defaults.cpp:240-245,312-357,423-440`; HIP 呼び出し `engine/src/program/generate.cpp:4287-4320`）。この自動投入に該当しない HIP 構成と SYCL は、ここでの既定値投入は確認できず、未設定なら OFF。
 
 ## 実行時の詳細
 
-有効条件を満たすと、各行について `QsaScoreRows` と `QsaAttnPoolsRows` を組み立て、`qsa_block_scores_rows()`、`qsa_block_topk()`、`qsa_decode_attn_batch_rows()` を呼び出します（`src/core/verify.cpp:1691-1707`）。score と attention は各行の別々の indexer key / K/V pool を参照します。top-k は行ごとの score・step buffer をまとめて渡します。
+CUDA/HIP では `batch_attn_rows_on()` 内の関数ローカル `static const bool` に初回評価結果を保存する。通常は最初に verifier の batch log または batch window の経路から評価され、以後の環境変更は反映されない。SYCL も `record_window` 内の関数ローカル `static const bool` で同様に初回評価時の値を保持する。HIP/CUDA のアーキテクチャ既定値は、生成処理で環境を設定した後に verifier が初回評価する順序になっている（`engine/src/core/verify.cpp:373-377,391`; `engine/sycl/src/core/verify.cpp:1488-1491`; `engine/src/program/generate.cpp:4287-4320,4410-4414`）。
 
-このフラグ自体の読み取りや有効化を知らせるログはありません。kernel launch が失敗した場合には通常の kernel error が stderr に出て終了します。attention の row kernel は `STRATA_ATTN_LANECELL=1`、ビルド時の pre-sm_75 経路、または HIP gfx906 では内部で各行の `qsa_decode_attn_batch()` に戻します。そのため、外側の rows 分岐が選ばれても、decode attention まで常に単一 launch になるとは限りません（`src/kernels/cuda/qsa_decode_attn.cu:1136-1151`）。
+有効な場合、QSA 各層・各窓について行ごとの indexer keys と pool 群を配列化し、全行の block scores、top-k、decode attention をそれぞれまとめて発行する。CUDA/HIP は `qsa_block_scores_rows` と `qsa_decode_attn_batch_rows` を使い、SYCL も対応する rows API を呼ぶ（`engine/src/core/verify.cpp:2218-2230,2450-2468`; `engine/sycl/src/core/verify.cpp:1494-1511`）。生成 token や選択結果が同一になることは、この分岐だけからは断定しない。
 
-既存の `docs/BATCHING.md` は `=1` の opt-in、最大8行、KV streaming で per-row launch を保つ点を説明しています（`docs/BATCHING.md:476-489`）。実装の判定は `=1` との完全一致ではなく `atoi(v) != 0` です。同資料は温度0で4 concurrent prompts、`--batch 4` と `--batch 8` のとき切替前後で同じ bytes だったと記載しています。また RTX PRO 6000 Blackwell (96 GB)、IQ3_S、int8 KV、262144 context、MTP/spec 4、HTTP server などの条件で、両スイッチを有効にした場合の測定表を掲載しています。これは資料に記載された条件での結果であり、この調査で再測定した値ではありません（`docs/BATCHING.md:488-505`）。
+## ログと測定値
+
+CUDA/HIP では batch verifier の初期化時に、`STRATA_BATCH_ATTN_ROWS` または `STRATA_BATCH_GDN_GROUPS` のどちらかが有効な場合、stderr に次の形式を出す。KV streaming があれば末尾の説明も付く。対象変数が OFF で他方も OFF の場合、この行は出ない（`engine/src/core/verify.cpp:4661-4673`）。
+
+```text
+strata verify: batch rows in one launch: attention on (STRATA_BATCH_ATTN_ROWS), GDN off (STRATA_BATCH_GDN_GROUPS)
+```
+
+SYCL 側ではこの変数の値を示すログは見つからなかった。`docs/BATCHING.md:704-723` は従来「両方 off by default」と記すが、現行コードでは上記の Linux CUDA と条件付き HIP parallel defaults が未設定値を `1` に設定するため、同資料の既定値説明はすべての現行経路には当てはまらない。資料記載の測定値は本調査で再測定していない。
 
 ## 根拠
 
-- `src/core/verify.cpp:1680-1707` — 環境変数の読み取り、適用条件、rows 用の各 kernel 呼び出し。
-- `src/core/verify.cpp:1708-1753` — 条件不成立時の batched-slot / per-row fallback。
-- `src/core/verify.cpp:3258-3271` — バッチ window の graph capture と `batch_rec_` の設定。
-- `include/strata/kernels/qsa_decode_attn.hpp:34-38,78-81` — rows 構造体の最大行数と attention API。
-- `include/strata/kernels/qsa_select.hpp:26-36,62-69` — score rows と top-k API。
-- `src/kernels/cuda/qsa_select.cu:1810-1821` — 複数行の block score kernel 呼び出し。
-- `src/kernels/cuda/qsa_decode_attn.cu:1117-1166` — attention rows の検査、variant 条件での per-row fallback、kernel launch。
-- `docs/BATCHING.md:476-505` — 用途説明と記載済みの測定条件。
+- 読み取りと数値判定: `engine/src/core/verify.cpp:373-377,391`; `engine/sycl/src/core/verify.cpp:1488-1491`
+- バッチ窓の開始とログ: `engine/src/core/verify.cpp:4661-4673,4677-4691`
+- CUDA/HIP の適用分岐: `engine/src/core/verify.cpp:2191-2199,2218-2230,2450-2468`
+- SYCL の適用分岐: `engine/sycl/src/core/verify.cpp:1492-1513`
+- 自動既定値: `engine/src/core/arch_defaults.cpp:226-260,302-357,423-440`; `engine/include/strata/core/gfx11_extra.hpp:27-30,116-132`; 呼び出し `engine/src/program/generate.cpp:4287-4320,4410-4414`

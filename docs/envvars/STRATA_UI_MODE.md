@@ -1,44 +1,49 @@
 # `STRATA_UI_MODE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-App Host に、ページを表示する主体がデスクトップアプリのウィンドウか通常のブラウザーかを伝えます。値に応じて `/api/app/mode` の状態、ブラウザーモードの「Quit Strata」操作、デスクトップアプリ本体の更新可否が変わります。
+App Host がページをアプリ内 window で表示しているか、通常のブラウザーで表示しているかを UI と host 間で共有する内部モード値。`app-ui.mjs` は `window` / `browser` のときにだけモードを認識し、`/api/app/mode` が返す `mode`、`canQuit`、`appUpdate` などに反映する。モデル推論の選択や実行条件はこの変数では変えない。読み取りは `app/host/server/app-ui.mjs:64-86`、API は `app/host/server/index.mjs:1443-1449`。
 
-Linux デスクトップアプリは host 子プロセスを起動するときにこの変数を `window` または `browser` に設定します。ユーザーが起動方法を選ぶ入力は別名の `STRATA_UI=browser` または `--browser` です。`STRATA_UI_MODE` はその選択結果を App Host に渡す変数です（`apps/desktop/src-tauri/src/supervisor.rs:353-364`、`apps/desktop/src-tauri/src/main.rs:865-873`）。
+デスクトップアプリ起動時は Rust shell が host の子プロセスにこの値を設定する。Windows/macOS は常に `window`、Linux は `--browser` または別変数 `STRATA_UI=browser` で選ばれた起動モードを設定する。したがって packaged desktop 起動では、呼び出し元の `STRATA_UI_MODE` は子 host 向けの値で上書きされる。Linux の `STRATA_UI` と CLI 判定は `app/desktop/src-tauri/src/main.rs:929-944`、`app/desktop/src-tauri/src/supervisor.rs:29-55`、host への設定は `supervisor.rs:503-526`、Windows/macOS の設定は `app/desktop/src-tauri/src/main.rs:554-568`。
 
 ## 値と判定
 
-App Host は `process.env` から起動時に値を取り、`window` と `browser` のいずれかに文字列が完全一致する場合だけモードとして採用します。大文字小文字変換、空白除去、真偽値・数値への変換はありません（`apps/host/server/app-ui.mjs:28-29,63-65`）。
+host 起動時に `process.env.STRATA_UI_MODE` を文字列として一度読み、`Set.has` による完全一致で判定する。文字列変換、trim、大文字小文字の正規化はしない。`window` と `browser` だけが有効。未設定、空文字、`WINDOW`、` Browser `、`0`、その他の値はすべて `null` 相当となり、拒否ログや fallback 選択ログはこの判定箇所からは出ない（`app/host/server/app-ui.mjs:29-30,64-68`）。
 
-| 値 | 判定と初期状態 |
-|---|---|
-| `window` | window モード。`reason` は `null`、`canQuit` は `false`、`appUpdate` は `available`。 |
-| `browser` | browser モード。`STRATA_UI_REASON` が truthy ならその値、そうでなければ `chosen` が `reason`。`canQuit` は `true`、`appUpdate` は `unavailable`。 |
-| 未設定、空文字、その他（例: `Window`, ` browser `, `0`） | モードは `null`。`reason` は `null`、`canQuit` は `false`、`appUpdate` は `unavailable`。 |
+| 条件 | unset / 空文字 | 有効になる値 | 無効な値の例 |
+|---|---|---|---|
+| App Host が環境から直接起動 | `null` | `window`, `browser` | `WINDOW`, ` Browser `, `0`, `true` |
+| Linux desktop shell が host を起動 | shell が値を `window` または `browser` で上書き | `--browser` または `STRATA_UI=browser` なら `browser`、それ以外は `window` | 呼び出し元の `STRATA_UI_MODE` は判定に使われず上書きされる |
+| Windows/macOS desktop app が host を起動 | shell が `window` で上書き | `window` | 呼び出し元の `STRATA_UI_MODE` は判定に使われず上書きされる |
 
-`STRATA_UI_REASON` は `STRATA_UI_MODE=browser` のときだけ初期 reason に使われます。空文字は `|| 'chosen'` により `chosen` に置き換わります。Linux supervisor は起動時に `--browser` / `STRATA_UI=browser` が選ばれた場合 `STRATA_UI_REASON=chosen` も host に設定します（`apps/host/server/app-ui.mjs:64-65`、`apps/desktop/src-tauri/src/supervisor.rs:361-364`）。
+Linux shell の browser 選択は `STRATA_UI` を trim し ASCII 小文字化して `browser` と比較し、その後 `--browser` が指定されれば browser を有効化する。`STRATA_UI_MODE` 自体は desktop CLI の入力として parse されない（`app/desktop/src-tauri/src/supervisor.rs:43-55`、`app/desktop/src-tauri/src/main.rs:929-944`）。
 
 ## 有効になる条件
 
-- Linux デスクトップアプリの supervisor は host 起動時、親プロセス環境を継承する `Command` に対して `STRATA_UI_MODE` を毎回明示設定します。通常起動は `window`、`--browser` または `STRATA_UI=browser` なら `browser` です。したがって、デスクトップアプリの親環境に同名変数を設定しても host にはその値が引き継がれず、supervisor の選択結果で上書きされます（`apps/desktop/src-tauri/src/supervisor.rs:43-55,341-365`）。
-- Linux 以外の desktop 実行経路は `run_embedded()` に進み、Linux supervisor の host 子プロセス設定は通りません（`apps/desktop/src-tauri/src/main.rs:875-876`）。
-- App Host を単独起動する場合は `process.env.STRATA_UI_MODE` の値が直接判定されます。unset や認識されない値は `null` となり、ページ側にデスクトップウィンドウの終了・更新機能を示しません（`apps/host/server/app-ui.mjs:63-85`）。
-- Linux の通常ウィンドウ起動でも、ウィンドウプロセスが起動失敗または正常終了以外で終了すると shell は host を維持し、host のモードを browser に切り替えます。したがって初期値 `window` は実行中に `browser` へ変わることがあります（`apps/desktop/src-tauri/src/supervisor.rs:303-314,385-431`）。
+- 値が App Host のプロセス環境に届き、host の `createAppUi` 初期化時に読まれること。アプリ起動中に環境を書き換えても初期 mode には反映されない。`app/host/server/index.mjs:147-151`、`app/host/server/app-ui.mjs:64-68`。
+- desktop 起動では shell が値を明示設定するため、親環境から `STRATA_UI_MODE` を指定しても選択を変えない。Linux で browser 起動を選ぶ入力は `--browser` または `STRATA_UI=browser`（trim と小文字化を適用）であり、`--browser` は browser を有効にするだけで解除オプションはない（`app/desktop/src-tauri/src/supervisor.rs:43-55,515-526`）。
+- `window` の mode が `appUpdate: 'available'` を示しても、更新操作に使う shell bridge が必ず利用可能とは限らない。bridge がまだ登録されず、初期 bridge もない場合、更新操作は `APP_UPDATER_NOT_READY` で失敗する。`browser` では updater を unavailable として扱い、browser mode 用の説明を返す（`app/host/server/app-ui.mjs:67-79,86,91-95`）。
+- shell が window 起動失敗後に `/api/control/ui` で browser へ切り替えた場合、初期値が `window` でも runtime mode が `browser` に変わる。この更新 API は shutdown token による認証を要求する（`app/host/server/index.mjs:1438-1460`、`app/host/server/app-ui.mjs:99-110`）。
 
 ## 実行時の詳細
 
-Host の `server/index.mjs` は起動時に `createAppUi()` を呼び、そこで環境を一度読み取ります。環境変数をプロセス起動後に変更しても再読込しません。モードの変更は shell から認証済み `POST /api/control/ui` を受けて `switchToBrowser()` が状態を更新する別経路です（`apps/host/server/index.mjs:127-131,1305-1328`、`apps/host/server/app-ui.mjs:63-67,81-99`）。
+`createAppUi` の初期化時に mode を変数へ保持し、`state()` が現在値を返す。ページ側の `loadAppMode()` は `/api/app/mode` をページロードにつき一度取得し、失敗時や旧 host の 404 は `mode: null` 等の `NONE` 状態にする（`app/host/server/app-ui.mjs:64-86`、`app/host/server/index.mjs:1443-1444`、`app/host/src/lib/app-mode.ts:12-27`）。そのため host 内では切替後の状態が返るが、すでに読み込んだページ側の mode は自動再取得されない。
 
-- `GET /api/app/mode` は `{ mode, reason, canQuit, appUpdate }` を返します。ブラウザーモードのページにだけ Quit メニューが表示されます（`apps/host/server/index.mjs:1311-1312`、`apps/host/server/app-ui.mjs:81-85`、`apps/host/src/app/Sidebar.tsx:193`）。
-- `POST /api/app/quit` は browser モードなら 202 を返し、次の immediate callback で host の shutdown を呼びます。window / `null` モードでは 409 と `Close the Strata window to quit.` を返します。ルートには `x-strata-client` ヘッダーの検査もあります（`apps/host/server/index.mjs:1313-1317`、`apps/host/server/app-ui.mjs:101-106`）。
-- browser モードでは App Host にウィンドウプロセスがなく、アプリ本体の Tauri updater は利用できません。updater の `unavailable` は `The Strata app itself can't be updated in browser mode. Start Strata from its icon, without --browser, to update it.` です。エンジンと Strata Control の更新は別に扱われます（`apps/host/server/app-ui.mjs:26-27,69-79`、`apps/host/server/updates.mjs:73-96`）。`window` モードの updater はウィンドウプロセスが bridge を登録するまで待ち、未登録なら `The app updater is not ready yet. Try again in a moment.` のエラーになります（`apps/host/server/app-ui.mjs:67-79,86-90`）。
-- Linux supervisor が明示 browser 起動を選ぶと、host の起動・health check 後に端末へ URL と「タブを閉じても Strata は停止しない」旨を出し、ブラウザーを開くよう host に依頼します（`apps/desktop/src-tauri/src/supervisor.rs:372-388,75-80,182-200`）。ブラウザーを開けなかった場合は `No browser could be opened. Open http://127.0.0.1:<port>/ in your browser.` を stderr に出します（同 `supervisor.rs:82-84,195-200`）。
-- window の起動・実行失敗時は supervisor がクラッシュ理由と browser への切替をログに出し、host に `mode: browser` と `reason: window-failed` を通知します。host はモードを更新してページを開き、通知を要求します。`switchToBrowser()` は通知処理の結果を待たず、起動したブラウザーの成否を `opened` として返します（`apps/desktop/src-tauri/src/supervisor.rs:303-314,398-431`、`apps/host/server/index.mjs:1319-1328`、`apps/host/server/app-ui.mjs:94-99`）。
+`browser` は `canQuit: true` となり、ページに「Quit Strata」が出る。`POST /api/app/quit` は `x-strata-client` がないと 403、window mode なら 409 と `Close the Strata window to quit.` を返し、browser mode なら 202 を返して shutdown を予約する。window mode の終了はウィンドウを閉じる経路に委ねられる（`app/host/server/app-ui.mjs:86,106-110`、`app/host/server/index.mjs:1445-1449`、`app/host/src/components/QuitStrata.tsx:12-27`）。
+
+Linux shell は通常起動時に host を `window` として開始する。`--browser` / `STRATA_UI=browser` の場合は `browser` として起動し、session に mode を記録する。window の起動失敗または異常終了時は host に browser mode への切替を依頼してブラウザーを開き、通知と crash log を出す。browser を開けなければ URL を手動で開くよう stderr に案内する。これらは `STRATA_UI_MODE` の文字列 parse による出力ではなく、shell の起動・切替経路の出力（`app/desktop/src-tauri/src/supervisor.rs:27,184-203,465-475,503-563,581-594`）。
+
+## ログと測定値
+
+`STRATA_UI_MODE` の未設定・無効値を理由にしたログはない。Linux shell は意図的な browser 起動時に URL と `Quit Strata` / `--quit` の案内を出し、window の開始失敗時は `Strata opened in your browser because the app window couldn't start on this computer.` を記録する。browser を開けない場合の stderr 文言は `No browser could be opened. Open http://127.0.0.1:<port>/ in your browser.`（`app/desktop/src-tauri/src/supervisor.rs:27,75-83,184-203,466-475,548-550`）。この環境変数についての測定値は資料にない。
 
 ## 根拠
 
-- 候補一覧には `STRATA_UI_MODE` がありますが、実際の環境値の読取箇所は `apps/host/server/app-ui.mjs:63-65` です。完全一致の判定結果がモード状態、API、Quit 動作、updater の可否に使われるため、Strata の App Host が読む環境変数です。
-- Strata ソース内の完全一致参照は、本番コードでは App Host の読取と Linux supervisor の子プロセスへの設定です。`apps/host/tests/app-ui.test.mjs` にも名前がありますが、値や挙動の根拠は本番コードに基づいています。
-- `docs/DETAILS.md` にこの変数の仕様説明は見つかりませんでした。ここでは調査対象 commit の実装を根拠としています。
+- `app/host/server/app-ui.mjs:29-30,64-110` — 値の完全一致、初期状態、API state に使うフラグ、browser 切替と quit。
+- `app/host/server/index.mjs:1438-1465` — mode API、shell 認証付き更新、quit の HTTP status。
+- `app/desktop/src-tauri/src/supervisor.rs:29-55,503-563,581-594` — Linux CLI / `STRATA_UI` 判定、host 子プロセスへの設定、browser 起動と window 失敗時の切替。
+- `app/desktop/src-tauri/src/main.rs:554-568,929-944` — Windows/macOS host の `window` 設定、Linux supervisor 起動。
+- `app/host/src/lib/app-mode.ts:12-27` — ページ側の取得回数、エラー時の fallback。
+- `app/host/src/components/QuitStrata.tsx:5-27` — browser mode の終了 UI。

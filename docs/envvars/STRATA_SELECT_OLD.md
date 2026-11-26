@@ -1,41 +1,44 @@
 # `STRATA_SELECT_OLD`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリ、生成済みコード、テスト専用コードは挙動の根拠に含めていない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-QSA の batched prompt prefill で、各 query の block score を計算するカーネルを選びます。設定されていると、`qsa_block_scores_tc()` による Tensor Core / 対応する別 scorer の試行を飛ばし、warp scorer の `qsa_block_scores()` を呼びます。設定されていない場合は別 scorer を試し、その関数が `false` を返したとき warp scorer に fallback します。Top-k による cell 選択はどちらの場合もその後に実行されます。
+QSA prefill のブロックスコア計算で、通常の tensor-core / GEMM scorer を使わず、従来の warp scorer `qsa_block_scores` を選びます。スコア計算後の top-k 選択 `qsa_block_topk` は同じ呼び出しのままです。設定値の内容ではなく、変数が存在するかだけで切り替わります。CUDA/HIP 系 prefill の通常経路と layer-major 経路、SYCL prefill 経路に読み取りがあります（`engine/src/prefill/prefill.cpp:5377-5392, 9450-9457`; `engine/sycl/src/prefill/prefill.cpp:3674-3675, 3713-3719`）。
 
 ## 値と判定
 
-値の parse はせず、`std::getenv("STRATA_SELECT_OLD") != nullptr` だけを見ます。
+3 箇所の判定はいずれも `std::getenv("STRATA_SELECT_OLD") != nullptr` で、各関数内 `static const bool` に保存されます。値の parse、数値範囲・文字列形式の検証、無効値の fallback はありません。
 
-| 環境変数 | 判定 | 動作 |
-|---|---|---|
-| 未設定 | false | `qsa_block_scores_tc()` を試す。利用できなければ warp scorer に fallback |
-| 設定あり | true | `qsa_block_scores_tc()` を呼ばず warp scorer を使う |
+| 条件（build / 経路） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP 系 prefill の通常経路および layer-major 経路 | `old_sel == false`。新 scorer を試す | 任意の設定値。`1`、`0`、`false`、空文字も `old_sel == true` | なし（値が存在すれば有効） |
+| SYCL prefill | `old_sel == false`。他の条件に応じて GEMM / tensor-core scorer を試す | 任意の設定値。`1`、`0`、`false`、空文字も `old_sel == true` | なし（値が存在すれば有効） |
 
-空文字、`0`、`false` なども「設定あり」です。文字列の内容、大文字小文字、数値としての妥当性は確認しません。値に応じた警告や専用ログはこの分岐にはありません。
-
-判定結果は `prefill.cpp` 内の関数ローカル `static const bool` に保存されます。最初にこの選択処理へ到達した後、プロセス内で環境変数を変更しても再評価されません。
+大文字小文字、前後の空白、数値としての妥当性は判定しません。`docs/SETTINGS.md` の「on / off」表記とは異なり、実装は `0` や `false` を無効値として扱いません（`engine/src/prefill/prefill.cpp:5379, 9450`; `engine/sycl/src/prefill/prefill.cpp:3675`; `docs/SETTINGS.md:463`）。
 
 ## 有効になる条件
 
-- 実行経路が QSA を含む prompt prefill で、複数 query の block score を計算する箇所に到達する場合に参照されます。通常の decode、QSA 以外のモデル経路、この score 選択を通らない経路には影響しません。
-- CUDA では、unset 時に `qsa_block_scores_tc()` が利用できる GPU・形状なら、その scorer が使われます。CUDA sm_80 以上では TF32 Tensor Core scorer を試し、sm_80 未満では `STRATA_SELECT_SIMT=1` が有効な場合に限り tiled FP32 scorer を試します。sm_80 未満でその条件を満たさない場合や、geometry/device 判定などで別 scorer が使えない場合は warp scorer になります。`STRATA_SELECT_OLD` を設定するとこれらの試行を抑止します。
-- HIP では、unset 時に `STRATA_SELECT_WMMA` と gfx12 device 条件を満たせば WMMA scorer を試し、それ以外は warp scorer に fallback します。`STRATA_SELECT_OLD` の設定は WMMA の試行を抑止します。
-- SYCL の prefill 呼び出し側にも同じ環境変数判定と scorer 呼び出し条件があります。ただし scorer の DPCT 生成実装はこの調査の根拠対象外としたため、SYCL で unset 時に別 scorer が実際に使われるかはここでは断定しません。
+- QSA の selection を行う Strata の prefill 経路に到達すること。読み取りは selection バッチ内にあり、別の処理経路や QSA selection を行わない実行では、この変数による選択は発生しません（`engine/src/prefill/prefill.cpp:5371-5379, 9444-9451`; `engine/sycl/src/prefill/prefill.cpp:3665-3675`）。
+- 値の設定は scorer の選択に作用します。CUDA/HIP 系通常経路では `old_sel` が true だと two-pass scorer 呼び出し条件を満たさず、続いて tensor-core scorer を短絡して warp scorer に進みます（`engine/src/prefill/prefill.cpp:5380-5392`）。layer-major 経路も tensor-core scorer を短絡して warp scorer を呼びます（同 `9450-9457`）。
+- SYCL では GEMM scorer に必要な `sel_gemm && !old_sel` が false になるためその GEMM 経路を使わず、tensor-core scorer も短絡して warp scorer に進みます（`engine/sycl/src/prefill/prefill.cpp:3687-3693, 3713-3719`）。
+- 変数専用の CLI 引数、モデル状態、GPU 世代による値判定はありません。新 scorer が未対応条件で `false` を返す場合にもコードは warp scorer に fallback するため、その場合は変数の有無で実行 scorer が変わらないことがあります（`engine/include/strata/kernels/qsa_select.hpp:71-76`; `engine/src/prefill/prefill.cpp:5387-5391`; `engine/sycl/src/prefill/prefill.cpp:3713-3717`）。
 
 ## 実行時の詳細
 
-QSA prefill は indexer の batch append 後、selection batch ごとに `old_sel || !qsa_block_scores_tc(...)` を評価します。左辺が true なら短絡評価により `qsa_block_scores_tc()` 自体を呼びません。右辺を呼んで `false` なら warp scorer に進み、`true` なら追加の scorer 呼び出しをせず `qsa_block_topk()` に進みます。
+環境値は各読み取り箇所の `static const bool` が初めて実行される時に評価され、その後はプロセス内でキャッシュされます。該当する静的変数はソース上 3 箇所に別々にあるため、それぞれの経路で初回到達時に評価されます。初回評価後に環境を変更しても、その箇所の判定には反映されません（`engine/src/prefill/prefill.cpp:5379, 9450`; `engine/sycl/src/prefill/prefill.cpp:3675`）。
 
-ソースの API コメントでは Tensor Core scorer は FP32-level accuracy だが和の順序が異なり bitwise ではないと説明されています。したがって、この変数が scorer を切り替えることは確認できますが、選択結果や後続出力が常に同一であるとは断定できません。文書・資料から `STRATA_SELECT_OLD` 固有の測定値は確認できませんでした。
+選ばれた scorer は各 query の QSA block scores を計算し、その結果を既存の `qsa_block_topk` に渡します。従って変数が直接切り替えるのはスコア計算経路であり、top-k の呼び出し自体ではありません。実装資料では tensor-core scorer を 3xTF32 の近似精度（bitwise 一致ではない）とし、warp scorer と区別しています。選択 ID やモデル出力が常に同一とは、このコードからは断定できません（`engine/include/strata/kernels/qsa_select.hpp:8-15, 71-76`; `engine/src/prefill/prefill.cpp:5387-5393, 9451-9457`; `engine/sycl/src/prefill/prefill.cpp:3713-3719`）。
+
+SYCL で変数が未設定かつ GEMM 条件を満たす場合、GEMM の実行が例外になると stderr に `prefill: the GEMM block scores failed (%s); the warp kernel instead\n` を初回のみ出して warp scorer に fallback します。`STRATA_SELECT_OLD` を設定して GEMM 経路自体を選ばない場合、この GEMM 例外ログはその理由では発生しません（`engine/sycl/src/prefill/prefill.cpp:3691-3717`）。
+
+## ログと測定値
+
+この変数の設定・未設定そのものを通知するログは見つかりませんでした。SYCL の GEMM 例外時のログは上記のとおりです。比較測定値は現行ソースの根拠として確認できなかったため記載しません。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:2760-2775` — CUDA/HIP prefill の batch score 選択、環境変数の有無判定、warp fallback、後続 top-k。
-- `sycl/src/prefill/prefill.cpp:3018-3032` — SYCL prefill 側の同じ呼び出し側分岐。
-- `src/kernels/cuda/qsa_select.cu:1118-1173` — CUDA/HIP での別 scorer の条件と利用不可時の `false` fallback。sm 条件、`STRATA_SELECT_SIMT`、`STRATA_SELECT_WMMA` を確認。
-- `include/strata/kernels/qsa_select.hpp:32-37` — scorer の精度・和の順序に関する API 説明。
-- `docs/OLDER_GPUS.md:111-122` — `STRATA_SELECT_SIMT` の pre-sm_80 条件に関する説明。`STRATA_SELECT_OLD` 自体の説明や測定は見つかりませんでした。
+- `engine/src/prefill/prefill.cpp:5371-5393` — 通常 prefill での値の読み取り、two-pass / tensor-core scorer の抑止、warp scorer と top-k の呼び出し。
+- `engine/src/prefill/prefill.cpp:9444-9457` — layer-major prefill の読み取りと scorer 分岐。
+- `engine/sycl/src/prefill/prefill.cpp:3674-3719` — SYCL の読み取り、GEMM 条件、tensor-core scorer と warp fallback。
+- `engine/include/strata/kernels/qsa_select.hpp:71-76` — tensor-core scorer の対応条件と warp scorer との精度特性。

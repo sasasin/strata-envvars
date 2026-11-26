@@ -1,43 +1,49 @@
 # `STRATA_VERIFY_COHERENT`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありません。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-HIP build の verifier が使う mapped host buffer を、通常の guarded mapped allocation ではなく `hipHostMallocCoherent` を含む明示的な coherent allocation で確保する opt-in です。対象は verifier の handshake words / rows と、同じ `mapped()` helper を通る staging・plan 等の host buffer です。CUDA build では `g_coherent` 自体が定義されず、この名前を読みません。
+HIP ビルドの verifier が使う mapped host memory を、通常の pinned allocation ではなく `hipHostMallocCoherent` を含む allocation で確保する切り替えです。CPU/GPU 間の handshake word や verifier の staging / plan buffer など、`mapped()` 経由で確保する領域が対象です。生成内容や token 選択を変える分岐ではありません。`STRATA_USE_HIP` が定義された `engine/src/core/verify.cpp` だけがこの allocation 分岐を持ちます（`engine/src/core/verify.cpp:336-343,569-582`）。
 
 ## 値と判定
 
-`env_on()` は `std::getenv()` の結果が null でなく、空文字でもなく、先頭文字が `'0'` でもない場合に true を返します。文字列全体の parse や数値変換はしません。
+`env_on()` は `getenv()` の戻り値が null でなく、先頭バイトが NUL でも `'0'` でもない場合に true を返します。文字列全体の parse や数値変換はしません。大文字小文字・空白・後続文字も検査しません（`engine/src/core/verify.cpp:336-343`）。
 
-| 値 | 判定 |
-| --- | --- |
-| 未設定 | OFF |
-| 空文字 | OFF |
-| 先頭文字が `0`（例: `0`, `0anything`） | OFF |
-| それ以外の非空文字列（例: `1`, `true`, `false`, `-1`, `2abc`） | ON |
+| ビルド・経路 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `STRATA_USE_HIP` 定義あり（HIP backend） | 無効 | `1`、`true`、`false`、` 0`、先頭文字が `0` 以外の値 | 空文字、`0`、`00`、`0anything` |
+| CUDA、gfx906 HIP compatibility、Metal、および通常の SYCL target | この変数を読む allocation 分岐なし | 該当なし | 該当なし |
 
-大文字小文字、空白、後続文字は検査しません。CLI 引数や他の環境変数による上書き・優先順位は実装にありません。値は `src/core/verify.cpp` の namespace scope `const bool` 初期化時に一度読み取られます。したがって実行中の環境変更で再評価されません。
+`0anything` は先頭が `'0'` なので無効です。逆に `false` は文字列としては false でも先頭が `'f'` のため有効です。通常の HIP build は `strata_hip_runtime` が `STRATA_USE_HIP=1` を定義し、gfx906 compatibility build は別の `STRATA_HIP_GFX906` 経路です（`engine/cmake/hip_backend.cmake:105-119`、`engine/CMakeLists.txt:91-103,233-241`）。
+
+SYCL verifier にも同名の `env_on()` 呼び出しがありますが、`g_coherent` の宣言と参照は `STRATA_USE_HIP` 条件下にあり、SYCL の `mapped()` は `window_host_uncached()` に応じて別の host allocation を行います（`engine/sycl/src/core/verify.cpp:151-154,187-190,320-338,806-814`）。Intel target はこの macro を定義せず、同梱の B65 調査記録もその点を確認しています（`engine/sycl/CMakeLists.txt:290-301`、`docs/bench-results/2026-10-05-community-arc-b65/README.md:217-221`）。このため通常の SYCL target では環境変数を読みません。
 
 ## 有効になる条件
 
-- `STRATA_USE_HIP` を定義した HIP build でのみ `g_coherent` を定義し、`mapped()` 内の HIP 分岐で参照します。CUDA build はこの環境変数を読みません (`src/core/verify.cpp:296-306,495-508`)。
-- 実際の効果が出るのは verifier の初期化で `mapped()` が呼ばれる場合です。通常の verifier staging / plan allocation がそこで行われます (`src/core/verify.cpp:851-869,918-927`)。Verifier は verify-window 経路で使われ、generate 側にも verifier instance が置かれています (`src/program/generate.cpp:7893-7900,9970-10006`)。
-- SYCL verifier (`sycl/src/core/verify.cpp`) にも同じ名前の参照がありますが、`g_coherent` は `STRATA_USE_HIP` 時だけ定義され、SYCL の `mapped()` は `window_host_uncached()` に応じた SYCL host allocation を行います。この helper は `g_coherent` を参照しません。通常の非-HIP SYCL build ではこの名前を読みません。HIP macro を伴う SYCL build でも、確認できる SYCL `mapped()` の allocation 分岐にはこの値による切り替えがありません (`sycl/src/core/verify.cpp:91-100,220-243`)。
+- `STRATA_USE_HIP` を定義した通常の HIP backend であること。CUDA、gfx906 compatibility、Metal ではこの変数による allocation 分岐はありません（`engine/src/core/verify.cpp:340-343,569-582`、`engine/CMakeLists.txt:91-103,233-241`）。
+- verifier の `init()` が mapped staging を確保する段階まで進むこと。そこでは window size、expert cache、layer compatibility、artifact geometry などの前提を先に検査します（`engine/src/core/verify.cpp:956-1030`）。
+- CLI 引数や別の環境変数による上書きはありません。`STRATA_VERIFY_TRACE` は診断表示の条件ですが、allocation 方法の条件ではありません（`engine/src/core/verify.cpp:341,344,1245-1260`）。
 
 ## 実行時の詳細
 
-HIP で値が ON のとき、`mapped(bytes, h, d)` は `hipHostMallocMapped | hipHostMallocCoherent`（`peer_portable()` が true なら `hipHostMallocPortable` も追加）を指定します。確保後に host buffer をゼロ初期化し、`cudaHostGetDevicePointer()` で device pointer を取得します。OFF の場合は既定の `host_alloc_guarded()` に mapped flag（必要なら portable flag）を渡す経路です (`src/core/verify.cpp:495-508`)。
+`g_coherent` は namespace scope の `const bool` として初期化されるため、HIP verifier の翻訳単位の初期化時に一度読み取られます。プロセス起動後に環境を変更しても、この値には反映されません（`engine/src/core/verify.cpp:336-343`）。
 
-明示 coherent allocation または device pointer 取得に失敗した場合、`mapped()` は false を返し、coherent 指定から既定 allocator への再試行はありません。通常の staging allocation 失敗は `verify: mapped staging allocation failed ...`、plan allocation 失敗は `verify: mapped plan allocation failed ...` として verifier 初期化を失敗させます (`src/core/verify.cpp:851-869,918-927`)。trace buffer の allocation は別扱いで、失敗すると trace buffer を無効化します (`src/core/verify.cpp:1005-1011`)。
+HIP で有効な場合、`mapped()` は `hipHostMallocMapped | hipHostMallocCoherent` に、peer portability が必要な場合だけ `hipHostMallocPortable` を加えて確保し、領域をゼロ初期化した後 `cudaHostGetDevicePointer()` で device pointer を得ます。無効の場合は `host_alloc_guarded()` と `cudaHostAllocMapped` を使う経路です。coherent allocation または device pointer 取得が失敗すると `mapped()` は false を返し、通常 allocation への再試行はありません（`engine/src/core/verify.cpp:569-582`）。
 
-`STRATA_VERIFY_TRACE` が有効で trace buffer の初期化箇所を通ると、HIP build は stderr に `strata verify trace (#649): on; coherent words explicit` または `... default` と出します。このログの `explicit/default` は `g_coherent` の判定表示です。同じ行に `HIP_HOST_COHERENT`、`HSA_ENABLE_SDMA`、`GPU_MAX_HW_QUEUES` の値も表示しますが、このコードではそれらをこの変数の判定や優先順位には使いません (`src/core/verify.cpp:1005-1019`)。`STRATA_VERIFY_TRACE` が無効なら、この coherent 状態を知らせる専用ログは確認できません。
+この関数は verifier の mapped staging / handshake word 群、plan、条件付きの balance stamp、hand-off word、trace buffer などの確保に呼ばれます（`engine/src/core/verify.cpp:1041-1060,1142-1163,1238-1251`）。初期 staging が失敗した場合 `Verifier::init()` は `verify: mapped staging allocation failed ...` をエラー文字列にして false を返し、plan や hand-off の確保失敗にも個別のエラー文字列があります（同:1060,1161-1163,1238-1244）。環境変数専用の警告はありません。
+
+## ログと測定値
+
+`STRATA_VERIFY_TRACE` が有効で trace buffer の確保処理に進むと、HIP では stderr に `strata verify trace (#649): on; coherent words explicit, doorbell ...`（無効なら `coherent words default`）を出します。通常の mapped allocation 成功だけではこの値を示すログは出ません（`engine/src/core/verify.cpp:344,1245-1260`）。
+
+`docs/DETAILS.md` に本変数の説明・測定値は見つかりませんでした。同梱の B65 調査記録は SYCL target で `STRATA_USE_HIP` が未定義であることと、このスイッチの速度効果を主張しないことを記しています（`docs/bench-results/2026-10-05-community-arc-b65/README.md:217-221`）。
 
 ## 根拠
 
-- 判定 helper、HIP 限定の値保持: `src/core/verify.cpp:296-306`。
-- coherent / default の allocator 分岐: `src/core/verify.cpp:495-508`。
-- verifier staging・plan allocation と失敗文言: `src/core/verify.cpp:851-869,918-927`。
-- trace の任意 buffer と HIP 状態ログ: `src/core/verify.cpp:1005-1019`。
-- SYCL 側の参照・allocation 経路: `sycl/src/core/verify.cpp:91-100,220-243`。
-- `docs/DETAILS.md` と関連設計資料には、この変数の値判定や効果を説明する記述を確認できませんでした。上記は調査対象 commit の実装に基づきます。
+- `engine/src/core/verify.cpp:336-343` — env 判定 helper、HIP macro guard、namespace scope cache。
+- `engine/src/core/verify.cpp:569-582` — HIP coherent allocation と既定 allocation。
+- `engine/src/core/verify.cpp:956-1060,1142-1163,1238-1260` — verifier 初期化、mapped buffer の呼び出し、失敗文字列、trace log。
+- `engine/cmake/hip_backend.cmake:105-119`、`engine/CMakeLists.txt:91-103,233-241` — 通常 HIP と gfx906 compatibility の build macro。
+- `engine/sycl/src/core/verify.cpp:151-154,187-190,320-338,806-814`、`engine/sycl/CMakeLists.txt:290-301` — SYCL 側の guarded read / mapped allocation と target 構成。
+- `docs/bench-results/2026-10-05-community-arc-b65/README.md:217-221` — B65 調査記録。速度効果の主張なし。

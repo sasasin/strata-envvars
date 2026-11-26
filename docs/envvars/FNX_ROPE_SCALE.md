@@ -1,47 +1,51 @@
 # `FNX_ROPE_SCALE`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-sFNX の Flash-Next engine で Rotary Position Embedding (RoPE) に YaRN scaling を指定します。設定値 `S > 1` はモデルの訓練済み長を基準に回転周波数を YaRN で補間し、対応可能な context 上限を拡張します。`1` は環境変数が設定された profile を残したまま scaling を無効にする値です。
-
-対象は `src/split` の sFNX engine（Flash-Next）で、通常の Strata engine 全般に適用される設定ではありません。sFNX は CUDA または HIP でビルドされ、候補一覧にある読み取りはこの engine と CUDA 用 `split_fnx_run` にあります（`src/split/CMakeLists.txt:65-80,92-120,153-165`）。
+Flash-Next（sFNX）エンジンで、GGUF の学習済み context 長を基準に YaRN RoPE scaling を指定する。scale `S > 1` なら rotary の位置計算を YaRN で変え、エンジンが受け付ける context 上限を原則 `max(学習済み長, floor(基準長 × S))` にする。これは位置表現自体を変えるので、要求 context が学習済み長以内でもスケールは適用される。値が未設定ならこの変数による scaling はなく、モデル自身の YaRN metadata があればそちらを使う。実装は `fnx::rope_scale()` と `fnx::Engine` の初期化処理にある（`engine/src/split/src/engine_common.cu:1025-1032`、`engine/src/split/src/engine.cu:40-64`、`engine/src/split/src/rope.hpp:82-113`）。
 
 ## 値と判定
 
-| 状態 | 判定 |
-|---|---|
-| 未設定 | engine では `FNX_ROPE_SCALE` 由来の scaling は指定しない。モデル自身の GGUF YaRN 設定があればそちらを使う。モデルにも YaRN がなければ unscaled。 |
-| 空文字 | 無効。数値として parse できず、`FNX_ROPE_SCALE: '' is not a number` の例外になる。 |
-| 数値として `1` | scaling off。`1`, `1.0`, `1e0` など、parse 後に double として厳密に `1.0` となる表記が該当。 |
-| 数値として `1` より大きい有限値 | YaRN scale として受理。上限 clamp はない。 |
-| その他 | 拒否。数値でない値は `... is not a number`、数値でも `1` 以下なら `FNX_ROPE_SCALE: want 1 (off) or a scale above 1, got ...` になる。 |
+`env_num` は設定有無を `getenv` で見てから、有限の十進数として文字列全体を parse する。符号、数字、小数点、指数表記は受理されるが、先頭空白、末尾の余分な文字、空文字、hex float、`inf` / `nan`、範囲外や underflow は数値 parse エラーになる。parse 後は `1` だけが scaling 無効として扱われ、`1` より大きい値が有効。0、負数、`1` 未満は scale 値エラーになる。上限値はコードで定めていない（`engine/src/split/src/env.hpp:24-30,42-48`、`engine/src/split/src/engine_common.cu:1025-1032`）。
 
-`env_num()` は全体を `strtod` で parse し、有限値であること、変換範囲外でないこと、末尾まで消費したことを確認します。先頭・末尾の空白、空文字、`inf` / `nan`、16進表記（`x` / `X` を含む）は受け付けません。符号、少数、指数表記は条件を満たせば parse されます。負値・ゼロ・`1` 未満は parse 自体に成功しても範囲判定で拒否されます（`src/split/src/env.hpp:24-30,42-49`, `src/split/src/engine_common.cu:1001-1008`）。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `rope_scale()` の判定 | `0.0`（この変数による scaling なし） | `2`, `1.5`, `1e1` | 空文字・`true`・` 2`・`2x` は数値 parse エラー。`0`, `-1`, `0.5` は「want 1 (off) or a scale above 1」エラー。 |
+| `sfnx --rope-scale S` | オプション省略時は環境の値を使う | 引数文字列を `FNX_ROPE_SCALE` に設定。環境値が未設定か、引数と文字列が完全一致なら受理 | 環境値が設定済みで引数文字列が異なれば不一致エラー。文字列比較なので、数値として同じでも表記が違えば不一致。 |
+
+設定値 `1`（例: `1`, `1.0`, `1e0`）は parse 後に正確に `1.0` と等しい場合に限り無効扱い。入力の前後空白は許容されず、大文字小文字を使う真偽値形式はない。環境変数が空文字で設定されている場合は未設定扱いにならず、parse エラーとなる（`engine/src/split/src/env.hpp:15-30,33-48`; `engine/src/split/src/engine_common.cu:1025-1032`; `engine/src/split/tools/sfnx.cpp:94-102`）。
 
 ## 有効になる条件
 
-- `FNX_ROPE_SCALE` が未設定で、GGUF に YaRN factor `> 1` がある場合は、モデル自身の scaling が採用されます。環境変数を unset せず `1` を指定するとモデルの YaRN と不一致になるため拒否されます。
-- GGUF に YaRN factor `> 1` がある状態で環境値を設定する場合、その数値はモデル factor と一致しなければ拒否されます。環境値でモデル設定を上書きする優先順位ではありません。
-- GGUF にモデル YaRN がない場合、unset または `1` は unscaled、`> 1` は環境指定の YaRN です。モデルの訓練済み長 `context_length` は必須で、scale が有効な場合でも最大 context は `max(context_length, original_context_length × S)` です。`--max-context`（既定 `262144`）がこの上限を越えると起動時に拒否されます。
-- 別環境変数 `FNX_YARN_ORIG_CTX` は scale の基準長に関係します。scale が無効なのにこれを設定すると拒否されます。モデルが `original_context_length` を持つ場合はその値と一致が必要です。モデルに値がなければ、指定値は訓練済み長以下である必要があります（`src/split/src/engine.cu:41-53`, `src/split/src/rope.hpp:82-113`, `src/split/tools/sfnx.cpp:65-68,85-95`）。
-- CLI `--rope-scale S` は同じ設定を指定する alias です。既に環境変数があれば引数文字列と環境値を文字列として比較し、異なる場合は拒否します（数値として等価な `2` と `2.0` も不一致）。未設定なら `setenv()` で環境に設定した後、通常の値検査を行います（`src/split/tools/sfnx.cpp:91-104`）。
+- 対象は `engine/src/split` の Flash-Next sFNX Engine 経路。通常の Strata engine の `--rope-scale` と同じ実装であるとは、このコードからはいえない。
+- `sfnx` の `--rope-scale` は引数 parse 中に環境へ設定される。環境変数が未設定なら任意の引数文字列を設定した後、scale として検証する。環境変数が既にあれば引数文字列との完全一致が必要（`engine/src/split/tools/sfnx.cpp:73-117`）。
+- GGUF の `context_length` が正で `INT32_MAX` 以下であることがモデル読み込み条件。scale の基準長 `orig` はモデルに `original_context_length` があればそれ、なければ `context_length`（`engine/src/split/src/model.cpp:1338-1348`; `engine/src/split/src/rope.hpp:99-112`）。
+- モデル自身の YaRN factor が `1` より大きい場合、環境変数が未設定ならそのモデル factor を使う。変数が設定されている場合は、値がモデル factor と数値として一致しないと拒否される。したがって `FNX_ROPE_SCALE=1` でモデル自身の YaRN を無効化することもできない（`engine/src/split/src/rope.hpp:82-93`）。
+- `FNX_YARN_ORIG_CTX` はこの設定の基準長に関係する。設定時は整数 `1..INT32_MAX` が必要。モデルに `original_context_length` があれば一致が必要で、なければ学習済み `context_length` を超えられない。scale がモデルにも環境にもなく無効なら、`FNX_YARN_ORIG_CTX` のみの指定は拒否される（`engine/src/split/src/engine.cu:44-51`; `engine/src/split/src/rope.hpp:94-110`）。
+- 設定した scale に対し `--max-context`（既定 `262144`）が RoPE の適用上限を超えると Engine の初期化に失敗する。上限は `max(ctx_train, (long long)(orig × S))`。逆に、scale が有効でも context 要求が学習済み長以内なら、上限だけが必要になるわけではないが、YaRN は適用され、stderr に注記が出る（`engine/src/split/tools/sfnx.cpp:65-69,88,116`; `engine/src/split/src/rope.hpp:111-113`; `engine/src/split/src/engine.cu:52-63`）。
 
 ## 実行時の詳細
 
-`sfnx` は引数解析時に `rope_scale()` を呼び、モデル読込前に値の形式と `>1` / `1` の条件を検査します。Engine の構築時にも環境値を読み、GGUF の `context_length` と YaRN metadata を合わせて scaling と context 上限を決めます。YaRN が選ばれると `yarn_rope()` が回転周波数の補間帯、逆 scale、`mscale` を計算し、Engine の rotary 定数に設定します。これは graph capture より前であり、リクエストごとではありません。Engine 構築後にプロセス環境を変更しても、その Engine の rotary 設定や context 上限は変わりません。`rope_scale()` 自体は static cache を持たず、呼ぶたびに `getenv()` を評価します（`src/split/tools/sfnx.cpp:103-104,1055-1059`, `src/split/src/engine.cu:37-60`, `src/split/src/engine_common.cu:1001-1008`, `src/split/src/rope.hpp:41-66`）。
+`sfnx` は `parse_args()` で `--rope-scale` を `setenv` / `_putenv_s` に反映し、モデルのロード前に `fnx::rope_scale()` を呼んで不正値を検査する。モデル読み込み後、`Engine` constructor が再度環境変数の設定有無と数値を読み、モデルの YaRN metadata と `FNX_YARN_ORIG_CTX` を `choose_rope()` に渡す。環境値は関数内 static に cache されず、Engine を作るたびに読み直される。Engine 作成後にプロセス環境を書き換えても、既存 Engine の `rope_` と `max_ctx_` は再計算されない（`engine/src/split/tools/sfnx.cpp:94-117,1122-1135`; `engine/src/split/src/engine.cu:34-64`; `engine/src/split/src/engine_common.cu:1025-1032`）。
 
-有効な scale では stderr に `fnx: rope scaling YaRN x...` が出ます。環境指定による scaling で `--max-context` が訓練済み長以内でも、全 position の rotary が変わるという note が出ます。無効値は引数解析時に `sfnx: ...` を stderr に出して exit status 2。モデルとの不一致や context 超過など Engine 構築時の失敗は stdout の `ERR ...` と stderr の `sfnx: failed: ...` を出し、status 1 で終了します（`src/split/src/engine.cu:49-60`, `src/split/tools/sfnx.cpp:1030-1035,1040-1062`）。
+`fnx_run` の exactness/lab 経路も `rope_scale()` を呼んで run identity の build 行に有効 scale を記録し、scale 使用時には比較用 llama.cpp reference の案内に `FNX_ROPE_SCALE` と任意の `FNX_YARN_ORIG_CTX` を組み立てる。この文字列は案内・参照ファイル選択用で、ここで子プロセスに変数を注入する処理ではない（`engine/src/split/tools/fnx_run.cpp:388-418,831-871`）。
 
-同梱の CUDA 用 `split_fnx_run` は `rope_scale()` の値を run identity に含め、設定値がある場合は scale 別の参照ファイル名を選びます。参照ファイルがないときは、生成例として表示するコマンド文字列に `FNX_ROPE_SCALE` と `FNX_YARN_ORIG_CTX` の代入を付けます（このツール自身がそのコマンドを実行したり、子プロセスへ値を渡したりする処理ではありません）。Strata 側で確認できるのは診断用の記録と表示までで、外部参照実装の挙動はここでは扱いません（`src/split/tools/fnx_run.cpp:398-418,831-871`）。
+## ログと測定値
+
+- `sfnx` の引数処理で値 parse または `rope_scale()` 判定が失敗すると、stderr に `sfnx: <理由>` を出して終了コード `2`。数値でない値の理由は `FNX_ROPE_SCALE: '<値>' is not a number`、数値だが `1` でも `>1` でもない値の理由は `FNX_ROPE_SCALE: want 1 (off) or a scale above 1, got <値>`（`engine/src/split/src/env.hpp:42-48`; `engine/src/split/src/engine_common.cu:1029-1032`; `engine/src/split/tools/sfnx.cpp:1110-1115`）。
+- Engine 初期化でモデル factor との不一致や context 上限超過などが起きると、stdout に `ERR <理由>`、stderr に `sfnx: failed: <理由>` を出し、終了コード `1` で終了する（`engine/src/split/tools/sfnx.cpp:1094-1103,1122-1135`）。
+- scale が有効なら stderr に `fnx: rope scaling YaRN x%.4f%s: n_ctx_orig %lld, pairs %.0f..%.0f of %d blended, mscale %.4f` が出る。モデル factor 由来の場合 `%s` は ` (the model's own)`、環境指定由来なら空文字。環境指定由来で要求 context が学習済み長以内なら続けて `fnx: note: context %d is within the trained %d: the scaling changes every position's rotary and no length needs it` が出る。scale が無効ならこの scale ログは出ない（`engine/src/split/src/engine.cu:57-64`）。
+- この調査では性能測定を行っていない。`FNX_ROPE_SCALE` の動作を定量化する測定値は記載しない。
 
 ## 根拠
 
-- 数値変換と unset fallback: `src/split/src/env.hpp:24-49`。
-- `FNX_ROPE_SCALE` 固有の unset / `1` / `>1` 判定と例外: `src/split/src/engine_common.cu:1001-1008`。
-- Engine 初期化、モデル metadata との選択、context 上限と成功ログ: `src/split/src/engine.cu:37-60`。
-- モデル YaRN と環境値の優先・一致規則、original length と context limit: `src/split/src/rope.hpp:69-113`。
-- YaRN 周波数・band・mscale の計算: `src/split/src/rope.hpp:41-66`。
-- CLI alias、早期検査、Engine 構築と失敗出力: `src/split/tools/sfnx.cpp:91-104,1030-1062`。
-- 診断ツールでの読み取り・記録・参照生成 command 組み立て: `src/split/tools/fnx_run.cpp:398-418,831-871`。
+- 数値 parse / 空文字等の判定: `engine/src/split/src/env.hpp:15-30,33-48`
+- scale の既定値と境界: `engine/src/split/src/engine_common.cu:1025-1032`
+- CLI からの設定、早期検証: `engine/src/split/tools/sfnx.cpp:73-117`
+- YaRN の選択、model factor・original context との整合、適用上限: `engine/src/split/src/rope.hpp:82-113`
+- Engine 初期化、context 拒否、実行時ログ: `engine/src/split/src/engine.cu:34-64`
+- GGUF の学習済み長とモデル YaRN metadata: `engine/src/split/src/model.cpp:1338-1348`
+- sFNX の起動時エラー出力: `engine/src/split/tools/sfnx.cpp:1094-1103,1107-1135`
+- exactness/lab 用の読み取り・identity・reference 案内: `engine/src/split/tools/fnx_run.cpp:388-418,831-871`

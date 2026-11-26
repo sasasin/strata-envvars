@@ -1,39 +1,55 @@
 # `STRATA_FS_SLOTS`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-expert cache に入っていない expert のコピーを一時的に置く、layer ごとの VRAM swap slot 数を指定します。通常なら CPU へ割り当てられる expert のうち、コピーが完了済みのものを GPU group として計画できます。slot は expert cache とは別に確保されるため、その分だけ cache に使える VRAM が減ります。
+正数を指定すると Foresight swap space を作り、expert cache にない expert の GGUF blob を各レイヤー・各 GPU に割り当てた追加 VRAM slots へ非同期コピーします。ルータの実際の選択は変えず、該当 expert のコピーが完了しているときだけ、その slot のアドレスを通常の GPU group として計算に使います。コピー未完了、slot がない、または交換中の expert は従来どおり CPU 側の miss になります（`engine/src/core/expert_source.cpp:5583-5606`, `engine/include/strata/core/foresight_swap.hpp:2-14`）。
 
-実装は `src/core/expert_source.cpp` の `ForesightSwap` と `src/program/generate.cpp` の expert 計画処理にあります。環境変数を読む主経路は CUDA runtime を使う C++ generate/serve 経路です。SYCL 側の `sycl/src` にはこの変数の参照がなく、この機能の実装は確認できませんでした。
+この制御は `engine/src/program/generate.cpp` から `foresight_swap_from_env` を呼ぶ生成・serve の CUDA runtime 経路にあります。未設定または正数でない値では swap space を作らず、look-ahead 予測を Foresight slots へ送る経路も有効になりません。ファイル tier 向けの look-ahead は別条件で動く場合があります（`engine/src/program/generate.cpp:10296-10303,14887-14899`, `engine/src/core/expert_source.cpp:7294-7298`）。`--batch` のパイプライン並行読込を止める判定にも参照されます（「有効になる条件」参照）。
 
 ## 値と判定
 
-値は `std::atoi` で変換され、変換結果が 1 以上の場合だけ swap space を作ります。未設定は 0、空文字や数値で始まらない文字列も 0 となり、無効です。`atoi` は文字列全体の厳密な数値検証をしないため、先頭の空白と符号の後に数字があればその数値を読み、数字の後ろに文字があっても読み取った数値を使います（例: `" 3x"` は 3、`"-2"` は無効）。
+主制御部は `std::getenv` の結果を `std::atoi` で `int` に変換し、0 以下なら無効、正数なら有効とします。`atoi` は文字列全体の妥当性を検証しません。したがって、空文字・数字で始まらない文字列・`0anything` は 0、`3tail` は 3、先頭空白と符号は変換規則に従い、大小文字の概念はありません。`atoi` で表せない範囲の値の扱いはこのコードで定義されていません。設定の有無だけで有効にする判定ではありません（`engine/src/core/expert_source.cpp:7296-7298`）。
 
-slot 数として実際に使う値は `min(変換値, 64)` です。したがって 65 以上を指定しても各 layer につき最大64 slotです。設定値に 1 以上の数字が含まれていても、変換結果が 0 以下なら無効です。
+| 判定箇所 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| swap space 作成・router look-ahead (`atoi(v) > 0`) | 無効 | `1`, `4`, `3tail` | 空文字, `0`, `0anything`, `-1`, `true` |
+| `STRATA_PIPED_CONCURRENT` の競合判定 (`atoi(v) != 0`) | 競合なし | `1`, `-1`, `3tail` | 空文字, `0`, `0anything`, `true` |
+| `STRATA_EXPERT_NIBBLE` の競合判定（値が空でない場合に `atoi(v) > 0`） | 競合なし | `1`, `3tail` | 空文字, `0`, `-1`, `true` |
+
+swap space は指定値を最大 64 slots に丸めます。1 slot は各レイヤーの expert blob 1 個分で、割当量はレイヤー配置と blob サイズに依存します（`engine/src/core/expert_source.cpp:7064-7080,7296-7313`）。
 
 ## 有効になる条件
 
-- `STRATA_VERIFY_DEVICE_PLAN` が設定され、`atoi` の結果が 0 以外の場合は初期化を拒否します。stderr に `strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN (the device would plan resident layers without the host)` と出ます。
-- 初期化には CUDA device memory、layer ごとの expert blob サイズに応じた slot 領域、copy stream と event の確保が必要です。VRAM 確保または stream 作成に失敗した場合は `cannot allocate ... MiB on CUDA... (raise --vram-reserve-mib by about that much)`、event 作成失敗時は `cannot create the copy events` を出して機能を無効にします。
-- 実際に slot へ expert をコピーするには、その expert が cache に存在せず、peer GPU にもなく、remote helper にも割り当てられておらず、`d.src` がその expert の pinned host blob を持つ必要があります。slot が未到着、空きなし、または当該 window の copy 上限に達した場合も、その場では swap slot を使わず通常の処理に戻ります。
-- Router look-ahead からの先行コピーは別条件です。`STRATA_FS_SLOTS` の正の値に加え、source が存在し、`STRATA_FS_AHEAD` が未設定または `atoi` 結果が 0 以外で、`STRATA_LOOKAHEAD` も未設定または `atoi` 結果が 0 以外である必要があります。予測機能が利用可能な場合は look-ahead が次 layer 向けの候補を `predict()` に渡します。これは slot 数の有効化そのものとは別の動作です。
+- CUDA runtime の生成・serve 経路で初期化されます。`docs/DETAILS.md` はこの switch の適用先を CUDA と記載しています（`engine/src/program/generate.cpp:14887-14899`, `docs/DETAILS.md:1266`）。
+- 起動時の device plan 検証で `STRATA_VERIFY_DEVICE_PLAN` または `STRATA_VERIFY_DEVICE_HITS` が設定され、かつ `atoi` が 0 以外なら swap space を作りません。stderr に `strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN/HITS (the device would plan resident layers without the host)` を出します。これらの値は空文字や `0` ならこの拒否条件になりません（`engine/src/core/expert_source.cpp:7299-7305`）。
+- VRAM の確保、非同期 copy stream、各 slot の CUDA event 作成に成功する必要があります。確保または stream 作成の失敗では swap space を無効にし、理由と `- swap space off` を stderr に出します。後続 slot event の作成失敗も `cannot create the copy events` として同じ失敗経路になります（`engine/src/core/expert_source.cpp:7082-7109,7313-7316`）。
+- 選択された expert の source blob が利用でき、source が pin 済みの領域を提供し、同レイヤーで再利用可能な slot があり、当該カードの copy budget を超えていない場合にだけコピーを予約します。これらの条件を満たさない miss は引き続き CPU 側で処理されます（`engine/src/core/expert_source.cpp:7229-7278`）。
+- look-ahead 予測から slot を埋める経路は、expert source があること、`STRATA_FS_SLOTS` が正数、`STRATA_FS_AHEAD` が未設定または `atoi` 非ゼロ、`STRATA_LOOKAHEAD` が未設定または `atoi` 非ゼロであることが必要です。router 重みが所定の BF16 形式でない場合などは look-ahead を開始せず、stderr に理由を出します。`STRATA_FS_AHEAD=0` は予測投入を止めますが、通常の miss からの swap copy は別経路です（`engine/src/program/generate.cpp:10292-10338`）。
+- `STRATA_PIPED_CONCURRENT` の条件判定が初期化されるとき、`STRATA_FS_SLOTS` の `atoi` 結果が 0 以外なら `--batch` の concurrent prompt read を止めます。`strata batch: STRATA_PIPED_CONCURRENT is off beside STRATA_FS_SLOTS` と出ます。この gate は `static const` で初回評価結果を保持します（`engine/src/program/generate.cpp:21024-21046`, `engine/include/strata/program/batch_read.hpp:30-53`）。
+- `STRATA_EXPERT_NIBBLE` の 4-bit slots が有効な CUDA build では、この変数が正数なら相互排他として拒否理由に使われます（`engine/include/strata/core/expert_nibble.hpp:277-299`, `engine/src/program/generate.cpp:3405-3441`）。
 
 ## 実行時の詳細
 
-generate/serve の expert 計画を構築するときに `foresight_swap_from_env()` が値を読み、slot pool を初期化します。この箇所には `static` cache がないため、各構築時に環境を読みます。初期化後の slot 数はその pool の寿命中固定です。初期化成功時は stderr に slot 数、カード数、カード/window ごとの copy 上限（既定32）、miss admission（既定1）、slot 再利用までの window 数（既定4）を出します。これらの別設定はそれぞれ `STRATA_FS_BUDGET`、`STRATA_FS_ADMIT`、`STRATA_FS_DEPTH` で、最低値は順に1、1、2です。
+`foresight_swap_from_env` は生成処理の setup で `STRATA_FS_SLOTS` を読みます。正数なら `STRATA_FS_BUDGET`（既定 32、下限 1）、`STRATA_FS_ADMIT`（既定 1、下限 1）、`STRATA_FS_DEPTH`（既定 4、下限 2）、`STRATA_FS_VERIFY`（既定 0）も同時に読みます。slots 数だけは上限 64、他の3つは指定整数を下限へ clamp します。明示的な空文字や数値でない文字列は `atoi` により 0 となり、各設定の既定値または下限値になります（`engine/src/core/expert_source.cpp:7294-7321`）。CLI option による slots 数の上書きはこの読取箇所にはありません。
 
-miss または look-ahead prediction がコピーを要求すると、filler thread が pinned host blob から専用 copy stream へ非同期コピーし、event を記録します。dispatch 側は event が完了した slot だけを GPU group として採用し、まだ完了していなければ pending miss として通常経路に戻します。slot は参照された window の完了数を記録し、`STRATA_FS_DEPTH` 分の window が経過してから再利用できます。copy failure が起きた場合は `strata serve: foresight swap: a copy failed - swap space off` を出し、その slot は使用しません。要求があっても使用できた回数、copy 数、未到着、空きなし、予算超過などは処理末尾の `foresight swap:` report に記録されます。
+各カードにレイヤーごとの slot 領域を確保し、copy 用スレッドを開始します。miss は `note_miss`、look-ahead の次レイヤー予測は `predict` を通り、適格な blob を queue に積みます。コピーはカードごとの stream で行われ、event が完了するまでは利用しません。完了した slot は `take` が device pointer を返し、GPU 側 plan の kind 0 として処理されます。slot の再利用は、最後に参照した window から `STRATA_FS_DEPTH` 個以上の window が完了してからです（`engine/src/core/expert_source.cpp:7134-7158,7161-7195,7229-7278`, `engine/src/program/generate.cpp:14896-14907,22410,23125`）。
+
+`STRATA_FS_SLOTS` と `fs_ahead` は swap space / 生成セットアップ単位で評価され、その instance の実行中は再読込しません。concurrent-read gate は別途、その gate に初めて到達したときの値を `static const` に保持します（`engine/src/program/generate.cpp:10296-10303,21024-21046`）。
+
+## ログと測定値
+
+初期化成功時は stderr に slots 数、カード数、カード・window あたりのコピー予算、admit miss 数、再利用までの window 数を表示します。実行中に非同期 copy が失敗すると `strata serve: foresight swap: a copy failed - swap space off` を出し、その後の新しい copy 要求は抑止されます。生成の report 箇所では swap から使った expert 数、copy 数、look-ahead 由来数、未完了数、空き slot 不足数、budget 超過数などを出します（`engine/src/core/expert_source.cpp:7134-7158,7281-7321`, `engine/src/program/generate.cpp:23392`）。
+
+`docs/DETAILS.md:1266` は小さい cache が測定した全機種で返却 slot より高くついたため既定では off と記載しています。同文書の履歴表は 4 slots・6 pairs の比較として、RTX 3060、Tesla P100、RTX 5070、2x RTX 3090 の測定比を掲載しています（`docs/DETAILS.md:1712-1718`）。これらは資料中の報告値であり、この調査で再測定した値ではありません。
 
 ## 根拠
 
-- `src/core/expert_source.cpp:4951-4976` — `getenv` と `atoi`、0以下での無効化、`STRATA_VERIFY_DEVICE_PLAN` による拒否、64 slot 上限、初期化ログ。
-- `src/core/expert_source.cpp:4740-4792,4824-4836` — layer/card ごとの VRAM 割り当て、stream/event 作成、filler thread の非同期 copy。
-- `src/core/expert_source.cpp:4839-4865,4890-4936` — 到着済み slot のみ利用、miss 条件、pinned source、slot 再利用・copy 上限。
-- `src/program/generate.cpp:5487-5516,8181-8199` — look-ahead の条件と swap pool の生成、予測器への接続。
-- `src/core/expert_source.cpp:3730-3751` — cache、peer、remote helper を優先し、その後 swap slot を GPU group として使う経路。
-- `src/program/generate.cpp:11665-11666,11967-11968,12055` — 完了 window の計数と report 出力。
-- `include/strata/core/foresight_swap.hpp:2-21` — 機能の設計概要と関連設定。
-- `docs/DETAILS.md:1680-1688` — slot の目的と RTX 3060、Tesla P100、RTX 5070 等での測定記録。これらは同資料に記載された条件での結果で、コードから一般的な性能向上は確認できません。資料は当該測定で cache 縮小の損失が slot の効果を上回ったとして、既定を off と説明しています。
+- `engine/src/core/expert_source.cpp:7059-7113,7134-7195,7218-7278,7294-7321`
+- `engine/src/program/generate.cpp:10292-10338,14887-14907,21024-21046,23392`
+- `engine/src/core/expert_source.cpp:5583-5606`
+- `engine/include/strata/core/foresight_swap.hpp:2-21`
+- `engine/include/strata/program/batch_read.hpp:30-53`
+- `engine/include/strata/core/expert_nibble.hpp:277-299`; `engine/src/program/generate.cpp:3405-3441`
+- `docs/DETAILS.md:1266,1712-1718`

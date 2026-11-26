@@ -1,41 +1,42 @@
 # `PKGVER`
 
-調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux 向け HIP または ARM64 CUDA の engine package を作る Strata packaging script が、package version を決めるために読む値です。Strata の実行時エンジンやモデル動作を変える環境変数ではありません。HIP script は stage の `BUILD.json` と package manifest に、CUDA script は package directory 名と manifest に値を渡します（`tools/packaging/build_hip_linux.sh:30,88-90,134-135`; `tools/packaging/build_cuda_linux_aarch64.sh:25,37,40-41`; `tools/packaging/package_engine.py:196,214-217`）。
+`PKGVER` は Strata の実行時設定ではなく、同梱の Linux engine パッケージ作成スクリプトがパッケージ版を指定するための環境変数。CUDA aarch64 用では package の `--version` と出力ディレクトリ名に、HIP Linux 用では中間 `BUILD.json` の `version` と package の `--version` に使われる。エンジンの実行時動作やビルド機能を切り替える参照は見つからなかった（`tools/packaging/build_cuda_linux_aarch64.sh:25,40`; `tools/packaging/build_hip_linux.sh:30,89,134`）。
 
 ## 値と判定
 
-どちらの script も `${PKGVER:-...}` を使うため、未設定と空文字は既定値に置き換わります。空白だけの値は空ではないのでそのまま採用されます。値の形式・大文字小文字・数値性の検証や変換は各 shell script にありません。値は引用して `BUILD.json` または `package_engine.py --version` に渡されます。package_engine は `--version` を文字列 option として受け、未指定 (`None`) のみを必須エラーにします。空文字や version 形式自体は検査せず、出力ディレクトリ名と manifest の `version` に使います（`tools/packaging/package_engine.py:196,214-217,300-305,357-359`）。
+どちらのスクリプトもシェルの `${PKGVER:-既定値}` を使う。この展開は変数が未設定または空文字のとき既定値に置き換え、非空の値は文字列のまま採用する。真偽値判定、数値変換、前後空白の除去、バージョン形式の検査、文字大小の変換はスクリプトにない（`tools/packaging/build_cuda_linux_aarch64.sh:25`; `tools/packaging/build_hip_linux.sh:30`）。
 
-| 実行経路 | unset / 空文字 | 非空の設定値 | 変換・検証 |
+| スクリプト・条件 | unset / 空文字 | 非空値の扱い | 例 |
 |---|---|---|---|
-| Linux HIP package (`build_hip_linux.sh`) | `0.1.66` | その文字列を採用 | shell による値変換なし。`BUILD.json` 内では JSON string に直接埋め込まれ、package_engine にも `--version` として渡る（`:30,88-90,134-135`） |
-| Linux ARM64 CUDA package (`build_cuda_linux_aarch64.sh`) | `engine/CMakeLists.txt` の最初の `project(... VERSION 数字とドット)` に一致した値 | その文字列を採用 | `sed` の正規表現に一致する数字・ドット部分を既定値として抽出。設定値には形式検証なし（`:25,40-41`） |
+| Linux aarch64 CUDA。OS/architecture 判定を通過した後に評価 | `engine/CMakeLists.txt` の最初の `project(... VERSION ...)` から `sed` で数字とドットの連続部分を取る。現行ソースでは `0.1.67`（`tools/packaging/build_cuda_linux_aarch64.sh:20-25`; `engine/CMakeLists.txt:13`） | そのまま `ver` に設定し、`package_engine.py --version` に渡す | `0.2.0` はその文字列のまま。`0anything` も拒否・変換されずそのまま渡る |
+| Linux HIP | `0.1.67`（`tools/packaging/build_hip_linux.sh:30`） | そのまま `PKGVER` に設定し、後段の `BUILD.json` と `package_engine.py --version` に使う | `0.2.0` はその文字列のまま。`0anything` も拒否・変換されずそのまま渡る |
 
-HIP の `${PKGVER:-0.1.66}` と CUDA の `${PKGVER:-$(...)}` は shell parameter expansion です。従って未設定だけでなく明示的な空文字も fallback します。例えば `0`, `1`, `true`, `false`, `0anything`, 空白を含む文字列は、非空なら区別なくそのまま選択されます（`tools/packaging/build_hip_linux.sh:30`; `tools/packaging/build_cuda_linux_aarch64.sh:25`）。
+`0`、`true`、`false` も特別な意味を持たず、非空文字列として扱われる。空文字は明示しても unset と同じ既定値になる。読み取った文字列を `package_engine.py` が出力ディレクトリ名と package manifest の `version` に記録する（`tools/packaging/package_engine.py:196,214-217`）。manifest 読み込み側は `version` が空でない文字列かだけを検査し、バージョン形式は検査しない（`terminal/strata_control/engine_component.py:304-306`）。HIP スクリプトは同じ値を JSON 文字列へシェル展開するため、JSON の引用符や制御文字を含む値はエスケープされず、不正な JSON になり得る（`tools/packaging/build_hip_linux.sh:88-90`）。
 
 ## 有効になる条件
 
-- HIP 経路では `tools/packaging/build_hip_linux.sh` を実行し、`VISION_ONLY` が空でなく早期終了する経路を通らず、stage 作成まで到達する必要があります。`NO_PACKAGE` が空でない場合は `BUILD.json` に値を記録した後、package_engine 呼び出し前に終了します（`tools/packaging/build_hip_linux.sh:60,85-90,127-135`）。
-- ARM64 CUDA 経路では Linux arm64/aarch64 で `tools/packaging/build_cuda_linux_aarch64.sh` を実行する必要があります。それ以外の OS/architecture は PKGVER を使う前に終了します（`tools/packaging/build_cuda_linux_aarch64.sh:20-25`）。
-- 両経路とも、ビルド・stage 処理と package_engine 呼び出しが成功したとき package manifest に反映されます。値によるビルド backend や生成バイナリの選択はありません（HIP: `tools/packaging/build_hip_linux.sh:63-69,131-136`; CUDA: `tools/packaging/build_cuda_linux_aarch64.sh:34-42`）。
-- script 実行中に環境を変更しても、冒頭で shell 変数 `PKGVER` / `ver` に取り込んだ後の値は再読込されません。後段では `--version` 引数として明示的に渡され、package_engine 側の PKGVER 環境読取はありません（`tools/packaging/build_hip_linux.sh:30,134`; `tools/packaging/build_cuda_linux_aarch64.sh:25,40`）。
+- **CUDA:** `tools/packaging/build_cuda_linux_aarch64.sh` のみ。`uname -s` と `uname -m` が `Linux-aarch64` または `Linux-arm64` の場合に続行し、それ以外は `PKGVER` の展開より前に終了コード 2 で終了する（`tools/packaging/build_cuda_linux_aarch64.sh:20-25`）。
+- **HIP:** `tools/packaging/build_hip_linux.sh` のみ。スクリプトが必要とする `VARIANT` 相当の `V` と ROCm root `HP` などの前提を満たして処理が進み、engine package 作成まで到達した場合に package 版として使われる（`tools/packaging/build_hip_linux.sh:21-32,60-70,85-89,131-136`）。`VISION_ONLY` は package 作成前に終了し、`NO_PACKAGE` は stage 作成後に package 化を省略するため、その実行では `PKGVER` は package に反映されない（同 `:85,131`）。
+- CUDA aarch64 と HIP Linux 以外のビルドスクリプトでは、`PKGVER` の参照は見つからなかった。CLI 引数や別の環境変数による `PKGVER` の上書き・優先順位もこの二つの読み取り経路にはない。
 
 ## 実行時の詳細
 
-これは build/package script の開始時に一度評価されます。HIP では起動後すぐ既定値 `0.1.66` を代入し、stage の `BUILD.json` の `version` と `package_engine.py --version` の両方へ渡します。CUDA では OS/architecture guard と `cd` の後に評価し、未設定または空なら `engine/CMakeLists.txt` から値を抽出します。その値は build ID にも含められ、最終的に package_engine の `--version` に渡されます（`tools/packaging/build_hip_linux.sh:21-32,88-90,134-135`; `tools/packaging/build_cuda_linux_aarch64.sh:20-28,37,40-41`）。
+これはビルド／パッケージ作成スクリプトの実行時にシェルが一度展開する値であり、Strata engine の起動時には読み直されない。プロセス内 cache や実行中の再読込もない。CUDA スクリプトは `ver` をコマンド引数 `--version "$ver"` として package 作成ツールへ渡す。HIP スクリプトは `PKGVER` を stage の `BUILD.json` に書き、さらに `--version "$PKGVER"` として渡す。したがって後段 Python プロセスは `PKGVER` を自ら環境から読むのではなく、値をファイルまたは明示的な CLI 引数で受け取る（`tools/packaging/build_cuda_linux_aarch64.sh:25,40`; `tools/packaging/build_hip_linux.sh:30,88-90,134`）。
 
-package_engine は version を出力 folder 名 `<version>-<platform>-<backend>[-<variant>]` と manifest の `version` に設定します。既に同名 folder があると `SystemExit` で拒否します（`tools/packaging/package_engine.py:196-198,214-217`）。CUDA 側で CMake から既定値が抽出できず `ver` が空になった場合、script 自身の値検査はなく空文字が渡ります。package_engine の必須判定は `None` のみなので、version は空文字のまま folder 名と manifest に使われ得ます（`tools/packaging/build_cuda_linux_aarch64.sh:25,40`; `tools/packaging/package_engine.py:304,357-359,196,214-217`）。
+package 化では `package_engine.py` が `version` をディレクトリ名に使い、manifest の `version` フィールドへ保存する（`tools/packaging/package_engine.py:196,214-217`）。HIP の `VISION_ONLY` / `NO_PACKAGE` 経路は前節の通り package 化しない。CUDA 側は `set -eu` のため、パッケージ作成コマンドが失敗すると後続の検証処理へ進まずスクリプトが終了する（`tools/packaging/build_cuda_linux_aarch64.sh:15,40-47`）。HIP 側は package 作成コマンドの出力を `$OUT/package.log` に記録し、失敗時は `chk` が `$OUT/build.status` に失敗と `ABORT packaged failed (rc=...)` を記録して終了する（`tools/packaging/build_hip_linux.sh:45-47,134-140`）。
 
 ## ログと測定値
 
-PKGVER 専用の有効化ログや警告はありません。HIP では package_engine の出力を `$OUT/package.log` にリダイレクトし、終了コードを `build.status` に `packaged rc=...`、失敗時は `ABORT packaged failed (rc=...)` と記録します（`tools/packaging/build_hip_linux.sh:46-47,134-137`）。CUDA は package_engine を直接実行するため、その診断が script の標準出力・標準エラーに出ます。同名 folder が存在する場合のエラーは `... already exists; remove it first (packages are immutable)` です（`tools/packaging/build_cuda_linux_aarch64.sh:40-46`; `tools/packaging/package_engine.py:196-198`）。測定値は該当しません。
+`PKGVER` の既定値選択や値の形式について、専用ログや警告を出す処理はない。CUDA の非対応 OS/architecture では `build_cuda_linux_aarch64.sh:22` のエラー文を stderr に出して終了するが、この判定は `PKGVER` を展開する前に行われる。HIP の package 作成失敗は `$OUT/package.log` と `$OUT/build.status` に記録される（`tools/packaging/build_cuda_linux_aarch64.sh:20-27`; `tools/packaging/build_hip_linux.sh:45-47,134-140`）。性能測定値は該当しない。
 
 ## 根拠
 
-- `tools/packaging/build_hip_linux.sh:30,88-90,131-137` — HIP 経路の既定値、manifest 記録、package 呼び出しと失敗記録。
-- `tools/packaging/build_cuda_linux_aarch64.sh:20-27,37-42` — Linux arm64 条件、既定値抽出、build ID と package への引き渡し。
-- `tools/packaging/package_engine.py:196-198,214-217,300-305,357-359` — version を使う出力先・manifest と CLI 引数の必須判定。
+- `tools/packaging/build_cuda_linux_aarch64.sh:12-14,20-28,37-47` — 対象・既定値の選択・package version の引き渡し・失敗時の制御。
+- `engine/CMakeLists.txt:13` — CUDA aarch64 スクリプトが既定値抽出に使う現行 project version。
+- `tools/packaging/build_hip_linux.sh:21-32,45-50,60-90,127-140` — HIP の既定値、前提条件、stage の `BUILD.json`、省略経路、package version の引き渡しと失敗記録。
+- `tools/packaging/package_engine.py:166-217,299-375` — `--version` を受け取り、出力フォルダー名と manifest に保存する処理。
+- `terminal/strata_control/engine_component.py:304-306` — manifest の `version` フィールドの型と空値チェック。

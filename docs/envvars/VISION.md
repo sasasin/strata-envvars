@@ -1,51 +1,44 @@
 # `VISION`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-`VISION` は Strata Docker イメージの標準起動時に、画像を扱う設定を `strata launch --vision` に渡すための環境変数です。Strata の engine や server がこの名前を直接読む箇所は確認できません。読み取りは `docker/entrypoint.sh` にあり、値は起動 CLI 引数に変換されます。
+Strata Docker イメージの通常起動で、写真入力の設定を選びます。entrypoint はこの値を `strata launch --vision` の引数へ変換します。`VISION` 自体は Strata の Python 起動処理やエンジンで直接読み直されず、モデル設定を通じて起動設定へ反映されます（`tools/docker/entrypoint.sh:184-225`、`terminal/strata_cli/launch/cmd.py:93-96,215-220,250-251`）。
 
-Docker Compose の NVIDIA / AMD / Intel 各定義は `${VISION:-off}` を環境に設定するため、未指定または空の Compose 値は `off` になります。一方、直接 `docker run` して変数を unset または空にすると entrypoint は `--vision` を追加せず、保存済み preset または `strata launch` のモデル・engine 既定に従います。Compose と直接起動ではこの既定の経路が異なります。
+Compose の NVIDIA / AMD / Intel 定義では `${VISION:-off}` をコンテナに渡すため、ホスト側の値が未設定または空なら `off` です。一方、Compose を使わずコンテナへ `VISION` を渡さない場合は entrypoint が `--vision` を付けず、写真設定は既存 preset の値、またはモデル・エンジンに応じた Strata の既定判定になります（`tools/docker/compose/docker-compose.nvidia.yml:16-23`、`tools/docker/compose/docker-compose.amd.yml:16-22`、`tools/docker/compose/docker-compose.intel.yml:15-22`、`tools/docker/entrypoint.sh:219-225,268-275`、`terminal/strata_cli/launch/settings.py:135`）。
 
 ## 値と判定
 
-entrypoint は値を ASCII 大文字から小文字へ変換してから、全体一致の `case` で判定します。数値変換や前後空白の trim はしません。
+Docker entrypoint は値が空でない場合だけ処理します。`tr 'A-Z' 'a-z'` で ASCII 大文字を小文字にし、前後の空白は除去せず、変換後の文字列全体を `case` で照合します（`tools/docker/entrypoint.sh:219-224`）。
 
-| `VISION` の値（大文字小文字不問） | `--vision` に渡す値 |
-|---|---|
-| `off`, `no`, `false`, `0` | `off` |
-| `on`, `yes`, `true`, `1` | `on` |
-| `gpu` | `gpu` |
-| `cpu` | `cpu` |
-| unset または空文字 | 引数を追加しない |
-| 上記以外（例: `maybe`, ` on`, `2`） | stderr に `VISION=<値> is not one of off, on, gpu, cpu.` を出し、終了コード 2 で停止 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| Compose の各 backend 定義 | ホスト側が unset または空なら `off` がコンテナに設定される | `off`, `no`, `false`, `0` → `off`; `on`, `yes`, `true`, `1` → `on`; `gpu` → `gpu`; `cpu` → `cpu` | 上記以外は entrypoint がエラー終了 |
+| Compose を介さない Docker 通常起動 | unset または空文字なら `--vision` を渡さず、既存 preset の設定を保つ。初回など preset に値がなければ Strata がモデル・エンジンから既定値を決める | 大文字小文字を問わず上記と同じ。大文字は小文字化される | ` ON `、`0anything`、`false ` など空白を含む値・追加文字列は一致せずエラー |
 
-エイリアスは `docker/entrypoint.sh` だけで正規名へ変換されます。変換後の値は `strata_cli/launch/settings.py` の `VISION_MODES`（`off`, `on`, `gpu`, `cpu`）と `strata launch --vision` の選択肢に一致します。
+Compose 定義がない起動経路で環境変数を直接読んだときの `VISION` による数値変換はありません。たとえば `VISION=0` は文字列一致で `off`、`VISION=0anything` は無効です。entrypoint のエラー文は `[X] VISION=<入力値> is not one of off, on, gpu, cpu.` で、終了コードは `2` です（`tools/docker/entrypoint.sh:54,219-224`）。
 
 ## 有効になる条件
 
-- 通常のコンテナ server 起動経路であること。entrypoint にコマンド引数を渡すと、`strata` コマンドはそのまま実行され、他のコマンドも直接 `exec` されます。この分岐では `VISION` の検証・変換を通りません。
-- 変数が unset / 空でないこと。値があるときは正規化した `--vision` 引数が追加され、launch のプリセット指定より今回の起動に渡す CLI 選択として適用されます。設定があるため、entrypoint は preset がすでに存在すれば `--save-preset` も付け、選択を保存します。
-- `on` は画像対応モデルと reader が利用可能なときに画像を有効にする指定です。モデルが画像非対応なら launch は警告を出して `off` にします。reader がない場合も、画像を使えない旨の警告経路があります。
-- `on` は reader の実行方式を固定しません。Strata setup は GPU メモリに応じて CPU / GPU reader を選びます（NVIDIA / own-path 実装では 23.5 GiB 未満は CPU、それ以外は GPU。HIP は `vision_reader` の選択処理を通ります）。`cpu` / `gpu` は方式の明示指定です。GPU reader がビルド済みか、モデルが画像対応かなどの状態によって実際に画像を読めるかは別途制約されます。
+- この読み取りは Docker entrypoint の通常起動経路に限られます。`docker run image strata ...` や `docker run image sh` のように別コマンドを指定すると、entrypoint は設定処理より先にコマンドを `exec` するため `VISION` を変換しません（`tools/docker/entrypoint.sh:5-7,68-70`）。
+- 値が空でない通常起動では `--vision` が設定され、CLI は preset を読み込んだ後に指定フラグの値で `s.vision` を上書きします。従って環境変数からの設定は保存済み preset の写真設定より優先されます（`tools/docker/entrypoint.sh:219-225,268-275`、`terminal/strata_cli/launch/cmd.py:215-220,250-251`）。
+- Compose は既定の `off` も明示的に渡すので、通常の Compose 起動では preset に写真設定があっても `off` が上書き値になります。Compose 外で `VISION` を unset / 空にした場合は上書きフラグがなく、preset があればその設定が残ります（`tools/docker/compose/docker-compose.nvidia.yml:22`、`tools/docker/entrypoint.sh:219-225,268-275`）。
+- 選択モデルが画像入力を扱えないと Strata launch は警告 `"<モデル名> cannot read pictures yet, so pictures are off."` を追加し、実効設定を `off` にします（`terminal/strata_cli/launch/cmd.py:368-400`）。モデルやエンジンに写真リーダーがない場合、設定未指定時の既定判定は `off` になり、その一部では `The engine installed here has no picture reader, so pictures are off.` と理由を通知します（`terminal/strata_cli/launch/cmd.py:396-400`、`terminal/strata_cli/launch/catalog.py:662-692`）。
+- `on` は Strata launch 内で setup に渡す `yes` へ変換されます。`gpu` / `cpu` は選択を保持して渡されます。実際の読取方式は Strata の reader/model 判定と setup に委ねられ、環境変数が単独で GPU backend や reader の有無を変更するわけではありません（`terminal/strata_cli/launch/runner.py:1313-1331,1351-1363`）。
 
 ## 実行時の詳細
 
-entrypoint は起動時に一度だけシェル環境を調べます。unset と空文字は `[ -n "${VISION:-}" ]` により同じ扱いです。値がある場合は小文字化・検証し、`set -- "$@" --vision "$v"` で CLI 引数へ追加します。続けて標準起動では `strata launch` を実行します。プロセス稼働中に環境変数を変えても再評価されません。
+entrypoint はコンテナ起動ごとに現在の `VISION` を評価し、値があれば launch 引数を構築します。環境変数値を `VISION` 用に static cache する処理はなく、起動後の環境変更を再読するループもありません（`tools/docker/entrypoint.sh:219-225,297-310`）。Compose はホスト側からコンテナ環境へ値を設定します（`tools/docker/compose/docker-compose.nvidia.yml:16-23`ほか）。
 
-launch の `--vision` は保存済み preset に対する今回の選択として `settings.vision` に反映されます。launch runner は `on` を setup の `yes` に、`off` を `no` に写して setup を呼び、選択を preset に保存します。`gpu` / `cpu` はそのまま setup に渡されます。設定が未指定なら、preset とモデル・reader の既定判定に委ねられます。
+設定値があると `have=1` となり、preset が存在すれば `--preset <名前> --save-preset <名前>`、なければ `--save-preset <名前>` が起動引数に加わります。よって `VISION` 由来の選択はその起動で使われ、通常起動では同じ名前の preset に保存されます（`tools/docker/entrypoint.sh:219-225,268-275`）。launch のモデル設定では画像非対応モデルに対する前述の警告・`off` 化が行われます。setup 用引数では `off` は `no`、`on` は `yes` に変換されます（`terminal/strata_cli/launch/cmd.py:393-400`、`terminal/strata_cli/launch/runner.py:1322-1331,1351-1363`）。
 
-Docker Compose の NVIDIA / AMD / Intel 定義はいずれも `VISION: ${VISION:-off}` です。そのため Compose からは `VISION` が空でも `off` が渡り、標準起動で画像を無効にする明示指定になります。Compose を介さない起動では、この補完はありません。
+## ログと測定値
 
-無効値のときは Strata launch の起動前に stderr の `die` メッセージを出して exit 2 になります。標準起動の launch 自体が非ゼロで終わった場合、entrypoint は `strata launch stopped with code ...` を出してそのコードで container を終了します。値が有効でもモデル非対応や reader 不在なら launch の警告を観測できます。
+無効な値では entrypoint が stderr に `[X] VISION=<入力値> is not one of off, on, gpu, cpu.` を出してコード `2` で終了します（`tools/docker/entrypoint.sh:54,219-224`）。対応しないモデルで写真を要求した場合の警告と設定変更は「有効になる条件」に記したとおりです（`terminal/strata_cli/launch/cmd.py:393-400`）。この変数による測定値は該当なしです。
 
 ## 根拠
 
-- `docker/entrypoint.sh:16,190-202` — 変数の説明、unset / 空判定、大小文字変換、受理値、エラー文と exit code、CLI 引数への変換。
-- `docker/entrypoint.sh:53-56,242-250,273-290` — 任意コマンド時の分岐、preset 選択と保存、launch 起動および失敗時の終了経路。
-- `docker/compose/docker-compose.nvidia.yml:16-22`、`docker/compose/docker-compose.amd.yml:16-21`、`docker/compose/docker-compose.intel.yml:16-21` — Compose が未指定値を `off` に補完してコンテナへ設定する箇所。
-- `strata_cli/launch/settings.py:26-28`、`strata_cli/launch/cmd.py:96-99,232-238` — canonical 値と CLI 引数による設定。
-- `strata_cli/launch/cmd.py:344-351`、`strata_cli/launch/runner.py:894-898` — モデル非対応・reader 不在時の警告経路。
-- `strata_cli/launch/runner.py:868-883,900-913`、`setup.py:3384-3401,4842-4848` — `on` / `off` の setup 向け変換と reader 選択。GPU / CPU の実際の可用性は setup と engine 配布物に依存します。
-- `docs/DOCKER.md:110-123,265-275` — Docker 用変数の説明と旧イメージからの対応。現行動作の根拠は上記ソースです。
+- 候補一覧の `VISION` は Docker 起動処理で実読取される環境変数です。全参照のうち、Compose 定義は値の転送、entrypoint の行 16 は説明コメント、行 219-224 が読み取り・検証・CLI 引数化です（`tools/docker/compose/docker-compose.*.yml:21-22`、`tools/docker/entrypoint.sh:16,219-225`）。
+- CLI の有効値、preset 読み込み後の上書き、モデル非対応時の警告と fallback（`terminal/strata_cli/launch/cmd.py:93-96,215-220,250-251,393-400`）。
+- 画像設定の未指定状態、setup 引数への変換、モデルおよび reader 状態を使う既定値（`terminal/strata_cli/launch/settings.py:135`、`terminal/strata_cli/launch/runner.py:1313-1363`、`terminal/strata_cli/launch/catalog.py:662-692`）。

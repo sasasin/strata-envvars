@@ -1,47 +1,52 @@
 # `STRATA_FORCE_AVX2`
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。外部ライブラリ・vendor コピーの内部挙動は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。調査開始時の Strata checkout は `## main...origin/main` で、`git status --short --branch` に未コミット変更は表示されなかった。
 
 ## 役割
 
-Strata の x86 CPU ISA probe に AVX-512 を利用不可と答えさせるテスト用フックです。実 CPU が AVX-512 対応でも、Strata の `cpu_avx512_ok()` / `cpu_avx512bw_ok()` 系の判定を下げ、対応する CPU カーネル選択を AVX2 などへ進ませます。AVX2 対応そのものを偽装する変数ではありません。
+x86 CPU の実行時 ISA 判定で AVX-512 系の probe を不成立にし、AVX-512 カーネルの代わりに下位 ISA の経路を選ばせる開発・診断用 override です。`expert_layout.cpp` の `cpu_isa_free()` はこの変数が指定条件に合うと false を返し、AVX-512 機能の判定と VNNI 判定が AVX-512 を利用しない結果になります。`cpu_avx512bw_ok()` も同じ値条件で直接 false を返します（`engine/src/kernels/cpu/expert_layout.cpp:75-78,80-82,114-117,188-202`）。
+
+これは「AVX2 を強制的に使えるようにする」変数ではありません。AVX2 probe の可否は CPU 機能と `STRATA_FORCE_ISA` の cap で別に決まり、この変数は `cpu_avx2_ok()` を変更しません（`engine/src/kernels/cpu/expert_layout.cpp:206-238`）。たとえば native expert の i-quant は AVX-512 が使えなければ AVX2、さらに AVX2 も使えなければ AVX1 または ggml-cpu の経路へ進みます（`engine/src/kernels/cpu/native_expert.cpp:568-584,696-704`）。CPU expert kernel は GPU backend の有無だけでなく CPU で expert を処理する経路にも関係します。
+
+非 x86 ではこのファイルの x86 probe 実装ではなく、AVX 機能関数が false を返す別実装が使われます。この変数を読みません（`engine/src/kernels/cpu/expert_layout.cpp:42-50,74-78`）。
 
 ## 値と判定
 
-Strata は文字列全体を parse せず、環境変数が存在し、先頭文字が `'1'` かだけを見ます。
+両方の直接読み取り箇所は `std::getenv` の null 判定と `f[0] == '1'` を使います。文字列全体の比較や数値変換はしません。空文字は設定済みでも無効です。先頭文字が ASCII `1` なら後続文字を問わず有効です（`engine/src/kernels/cpu/expert_layout.cpp:75-77,114-117`）。
 
-| 値 | x86 の判定 |
-|---|---|
-| 未設定 | この変数による抑止なし。ISA 上限・CPU 機能・OS の状態を通常どおり調べる |
-| 空文字 | 設定済みだが先頭文字は NUL のため抑止しない |
-| `1`、`10`、`1anything` など | AVX-512 判定を false にする |
-| `0`、`true`、` 1` など | この変数による抑止なし。通常の検査へ進む |
+| 条件（build など） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| x86 (`__x86_64__`, `__i386__`, `_M_X64`, `_M_IX86`) の runtime CPU probe | AVX-512 probe は通常の CPU/OS 機能判定へ進む | `1`, `10`, `1anything` | 空文字, `0`, `true`, ` 1`, `avx2` |
+| 非 x86 | AVX-512 probe は元から false | 該当なし（読まれない） | 該当なし |
 
-数値変換、空白除去、大文字小文字の変換、無効値警告はありません。値が `1` で始まっても AVX2 probe は別実装のままなので、AVX2 がない CPU に AVX2 を使わせることはありません。根拠: `src/kernels/cpu/expert_layout.cpp:75-78,114-117,206-238`。
+大文字小文字や空白を解釈する parser はありません。`'1'` 以外で始まる値は無効です。無効値について警告や fallback の専用処理はありません。
 
 ## 有効になる条件
 
-- x86 (`__x86_64__`, `__i386__`, `_M_X64`, `_M_IX86`) 用の probe と、その probe を呼ぶ Strata CPU カーネル経路で参照されます。非 x86 ビルドは同ファイルの非 x86 分岐で AVX-512 probe が常に false を返し、この環境変数を読みません（`src/kernels/cpu/expert_layout.cpp:42-50,74-80`）。
-- Strata の x86 CPU カーネルがビルドに含まれる必要があります。`strata_kernels_cpu` は x86 と portable でソース構成を分け、AVX-512 命令を含む translation unit と baseline の probe を別々にコンパイルします（`CMakeLists.txt:2059-2076,2184-2194`）。
-- AVX-512 を元々持たない CPU では、通常の CPUID / OS 状態検査も false になるため、この変数による選択差はありません。
-- `STRATA_FORCE_ISA` の ISA 上限も AVX-512 利用条件です。`cpu_isa_free()` が `cpu_isa_cap() >= 3` を要求するため、そちらで上限を下げた場合も AVX-512 は無効です（`src/kernels/cpu/expert_layout.cpp:26-39,75-78`）。`STRATA_VNNI_TIER` は VNNI tier の一部条件を opt-in しますが、`STRATA_FORCE_AVX2` で `cpu_isa_free()` が false なら `cpu_vnni_ok()` 自体が false となり、tier を有効化しません（同:188-203）。
-- canonical Q2_0 pack の起動要件確認 `cpu_features()` / `cpu_require_expert_support()` はこの環境変数を参照しません。したがって、この変数は AVX-512 を必要とする pack を AVX2 CPU で実行可能にする設定ではありません（同:424-448,451-463、`src/program/generate.cpp:4781-4802`）。
+- Strata の x86 CPU ISA probe を使うビルド・実行経路であること。この値は AVX-512 カーネルがコンパイル済みかどうかを変えず、runtime probe を通じて利用可否を決めます（`engine/src/kernels/cpu/expert_layout.cpp:42-50,74-117`）。
+- `STRATA_FORCE_ISA` がある場合、`cpu_avx512_ok()` / `cpu_vnni_ok()` の dispatch 判定は `cpu_isa_cap() >= 3` も必要です。従って `STRATA_FORCE_ISA=avx2` / `avx` / `sse` は単独でも AVX-512 を抑止し、この変数との組み合わせでも AVX-512 は有効になりません。`STRATA_FORCE_ISA` の unset または空文字は cap 3 です（`engine/src/kernels/cpu/expert_layout.cpp:26-39,75-82`）。
+- `STRATA_VNNI_TIER=1` は AVX-512 対応だが VBMI を持たない CPU で VNNI 経路を opt-in しますが、`STRATA_FORCE_AVX2` が有効なら `cpu_isa_free()` が先に false となるためこの VNNI 判定も false です（`engine/src/kernels/cpu/expert_layout.cpp:188-202`）。`docs/DETAILS.md:1274` も両変数を dispatch の cap と記しています。
+- AVX2 自体が CPU/OS で利用可能であることは別途必要です。この変数で AVX2 非対応 CPU に AVX2 カーネルを実行させることはありません（`engine/src/kernels/cpu/expert_layout.cpp:206-238`）。
+- Q2_0 canonical pack には専用の AVX-512 要件チェックがありますが、そのチェック `cpu_features()` はこの環境変数を読みません。したがってこの変数だけで canonical pack のサポート判定や拒否条件が変わるわけではありません（`engine/src/kernels/cpu/expert_layout.cpp:424-449,451-463`; `engine/src/program/generate.cpp:5598-5618`）。
 
 ## 実行時の詳細
 
-`cpu_avx512_ok()`、`cpu_avx512bw_ok()`、`cpu_vbmi_ok()`、`cpu_vnni_ok()` は各関数内の `static const` 判定を保持します。環境値は各 probe が初めて評価されるときに読み込まれ、結果はその probe ごとに cache されます。初回評価後にプロセス環境を変えても、その probe の結果は変わりません。`cpu_isa_free()` 自体は cache しませんが、呼び出し元の static 判定から一度だけ呼ばれます（`src/kernels/cpu/expert_layout.cpp:75-78,80-112,114-146,176-203`）。
+直接の環境読み取りは `expert_layout.cpp` にある 2 箇所です。`cpu_isa_free()` は呼び出しごとに `getenv` しますが、主要な各 probe (`cpu_avx512_ok()`、`cpu_avx512bw_ok()`、`cpu_vnni_ok()`) は結果を関数内 `static const` に保存します。従って値は各 probe の初回評価時に実質固定され、同じプロセスで環境を変更しても評価済み probe の結果には反映されません。probe 間の初回評価時刻は同一とは限りません（`engine/src/kernels/cpu/expert_layout.cpp:75-82,80-112,114-146,188-204`）。
 
-値が有効（先頭が `1`）なら、対象 CPU が AVX-512 に対応している場合でも Strata の probe は AVX-512 を選びません。例えば native expert の i-quant gate/up は AVX-512 条件を落とし、形式・token 数・他設定が許せば AVX2 kernel を選択します。AVX2 kernel の無効化や CPU 非対応など条件に合わない場合は ggml-cpu 側の dot 経路へ進みます（`src/kernels/cpu/native_expert.cpp:454-471,489-505`）。Q2 行計算と activation quantizer の `*_any` dispatch も、AVX-512 条件が false なら AVX2、さらに未対応なら AVX1 の枝を選びます（`src/kernels/cpu/expert_layout.cpp:465-485`）。Trellis の dispatcher も AVX-512 probe を通して kernel tier を判定します（`src/kernels/cpu/tq_cpu.cpp:155-169`）。
+`cpu_avx512_ok()` が false になると、native expert の i-quant は `STRATA_NO_IQ512` が未設定でも AVX-512 kernel を選ばず、AVX2 対応かつ `STRATA_NO_IQ256` 未設定なら AVX2 に進みます。NVFP4 の 512-bit 経路も AVX2 対応なら 256-bit 経路へ進み、Q2_0 の行 kernel は VNNI-512 が使えないとき AVX2、さらに AVX2 がなければ AVX1 を選びます（`engine/src/kernels/cpu/native_expert.cpp:568-576,696-704,720-732`; `engine/src/kernels/cpu/expert_layout.cpp:465-485`）。`STRATA_NO_IQ256=1` など該当 kernel を止める別変数が設定されれば、その経路はさらに fallback します。
 
-この変数を直接表示するログ、警告、独自の終了経路はありません。native pack では probe 結果に応じて `strata generate: CPU expert kernels: AVX-2` などの stderr 表示があり得ます（`src/program/generate.cpp:4802-4808`）。canonical Q2_0 pack の AVX-512 必須チェックは別であり、非対応なら通常どおり診断を出して終了コード 1 となります（`src/kernels/cpu/expert_layout.cpp:451-463`）。AVX-512 と AVX2 では演算経路が変わります。実装コメントにも i-quant の丸め差に関する条件があるため、この設定による出力同一性や速度は一律には断定できません（`src/kernels/cpu/native_expert.cpp:480-485`）。`docs/DETAILS.md` にこの変数固有の仕様・測定値は見つかりませんでした。
+変数自体に CLI 引数・設定ファイルによる上書きはありません。実行エンジンのプロセス環境に設定して、関連 probe の初回評価より前に読ませる必要があります。サーバー専用の別読み取りやリクエスト単位の再評価は見つかりません。
 
-全参照を検索した結果、実装上の読み取りは `src/kernels/cpu/expert_layout.cpp:76,116` のほか `src/dsv41/vendor/exl3_cpu.cpp:1030-1032` にあります。後者は vendor コピー内の読み取りとして調査範囲から除外し、その内部の tier 挙動は本書では Strata の一般的な挙動として説明しません。ほかにヘッダー・コメント・CMake の診断テスト用設定があり、`CMakeLists.txt:2882,2889` はテストプロセスに `STRATA_FORCE_AVX2=1` を渡しています。
+## ログと測定値
+
+この変数の有効・無効を直接知らせるログはありません。値が `1` で CPU が AVX2 対応なら、`generate.cpp` の native pack 起動時に `strata generate: CPU expert kernels: AVX-2` と出る経路があります。この表示は `cpu_vnni_ok()` が false のときに出し、AVX2 判定などで表示名を選びます（`engine/src/program/generate.cpp:5619-5634`）。canonical Q2_0 pack の実機 CPU 機能が不足すると別の AVX-512 要件案内を stderr に出して終了コード 1 となりますが、この拒否は `cpu_features()` の実機 probe によるもので、この変数がその probe を抑止するためではありません（`engine/src/program/generate.cpp:5598-5618`; `engine/src/kernels/cpu/expert_layout.cpp:424-449`）。
+
+`docs/DETAILS.md:1274` は `STRATA_VNNI_TIER=1` の説明内で、この変数と `STRATA_FORCE_ISA` が dispatch を抑えると記載しています。ソース上も同じ関係です。同資料にこの変数単体の測定値はありません。
 
 ## 根拠
 
-- `src/kernels/cpu/expert_layout.cpp:42-50,75-78,80-146,176-203,206-238`: 対象 platform、値判定、AVX-512 probe の cache、AVX2 判定との独立性、他の ISA 条件。
-- `src/kernels/cpu/expert_layout.cpp:424-463`: canonical pack の CPU 機能確認と失敗時の stderr / 終了。
-- `src/kernels/cpu/native_expert.cpp:454-505`, `src/kernels/cpu/expert_layout.cpp:465-485`, `src/kernels/cpu/tq_cpu.cpp:155-169`: probe 結果を使う CPU kernel dispatch。
-- `src/program/generate.cpp:4781-4808`: pack 種別ごとの起動確認と native pack の CPU kernel 表示。
-- `CMakeLists.txt:2059-2076,2184-2194,2882,2889`: probe / kernel の build 構成と test からの値設定。
-- `src/dsv41/vendor/exl3_cpu.cpp:1030-1032`: vendor コピー内の追加読み取り（挙動説明の根拠には不使用）。
+- `engine/src/kernels/cpu/expert_layout.cpp:26-39,42-50,75-146,188-238,424-463` — ISA cap、非 x86 実装、環境値判定、AVX-512/VNNI/AVX2 probe、canonical pack の CPU 機能判定。
+- `engine/src/kernels/cpu/native_expert.cpp:568-584,696-704,720-732` — native expert kernel の優先順位と fallback。
+- `engine/src/kernels/cpu/expert_layout.cpp:465-485` — Q2_0 行 kernel と activation quantizer の ISA fallback。
+- `engine/src/program/generate.cpp:5598-5634` — canonical pack の要件案内、native pack の CPU kernel 起動表示。
+- `docs/DETAILS.md:1274` — 関連する dispatch cap の記述。

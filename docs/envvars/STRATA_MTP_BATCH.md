@@ -1,49 +1,50 @@
 # `STRATA_MTP_BATCH`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-MTP（draft layer）を使うとき、プロンプト読み込み中に draft layer の K/V cache を `Prefill::draft_kv` のバッチ計算で埋める経路を抑止する。未設定時はこの経路を試し、値の先頭文字が `0` のときだけ試さない。抑止または適用条件を満たさない場合、呼び出し元は drafter 自身の `MtpDrafter::prefill` にフォールバックする。
+MTP drafter があるとき、プロンプト読み込み中に draft layer の K/V を prompt path の `Prefill::draft_kv` でまとめて計算する経路を止める。値が無効化条件に当たると、この関数は理由 `STRATA_MTP_BATCH=0` で decline し、呼び出し元は drafter 自身の `MtpDrafter::prefill` を実行する。MTP 自体や decode 時の `--batch-mtp` を無効化する設定ではない。CUDA/HIP と SYCL の両実装に読み取り箇所がある。`engine/include/strata/prefill/prefill.hpp:60-67`、`engine/src/prefill/prefill.cpp:2991-3013`、`engine/sycl/src/prefill/prefill.cpp:1857-1873`。
 
 ## 値と判定
 
-| 環境変数の状態・値 | `Prefill::draft_kv` の判定 |
-|---|---|
-| 未設定 | 有効（抑止しない） |
-| 空文字 | 有効（`v[0]` は NUL であり `'0'` ではない） |
-| 先頭文字が `0`（例: `0`, `0abc`） | 無効。`false` を返し、理由は `STRATA_MTP_BATCH=0` |
-| その他（例: `1`, `true`, ` 0`, `false`） | 有効（抑止しない） |
+両 backend とも `std::getenv` の結果を関数内 `static const bool off` に初回呼び出し時だけ保存し、値が非 null かつ `v[0] == '0'` のときだけ batched 経路を止める。文字列全体や数値としての妥当性は検査しない。したがって、unset・空文字・`1`・`true`・`false`・先頭が空白の ` 0` は止めず、`0`、`0anything`、`00`、`0.5` は止める。大文字小文字は関係しない。プロセス中に環境を変更しても、この static 値は再評価されない。CUDA/HIP: `engine/src/prefill/prefill.cpp:2999-3008`。SYCL: `engine/sycl/src/prefill/prefill.cpp:1857-1869`。
 
-数値変換や文字列全体の比較はなく、先頭1文字だけを大文字小文字の区別なく（数字なので該当なし）比較する。したがって `STRATA_MTP_BATCH=0anything` も無効化する一方、`STRATA_MTP_BATCH= 0` は無効化しない。この変数はバッチを強制的に成功させる設定ではなく、コードがバッチを試すのを止めるための設定である。
+| 条件 | unset | batched 経路を止める値 | 止めない値 |
+|---|---|---|---|
+| CUDA/HIP `Prefill::draft_kv` | 有効（`off == false`） | 先頭文字が `0`（例: `0`, `0abc`） | 空文字、`1`, `true`, `false`, ` 0` |
+| SYCL `Prefill::draft_kv` | 有効（`off == false`） | 先頭文字が `0`（例: `0`, `0abc`） | 空文字、`1`, `true`, `false`, ` 0` |
+| Metal の CUDA/HIP 側実装 | この関数では判定前に decline | 適用なし | 適用なし |
+
+数値変換、境界値、無効文字列時の fallback はない。条件は先頭 1 文字の比較だけである。Metal は `STRATA_GPU_METAL` 分岐で先に戻るため、この読み取りに到達しない（`engine/src/prefill/prefill.cpp:2994-3001`）。
 
 ## 有効になる条件
 
-- MTP が有効な経路でプロンプトの chunk が処理されること。MTP が無効なら `draft_kv` は呼ばれない。
-- レイヤー分割（multi-GPU）では CUDA 側のサーバー経路が別の `STRATA_SPLIT_MTP_BATCH` によってバッチ経路を opt-in する。`STRATA_MTP_BATCH` はその経路でも追加の抑止条件になる。SYCL のサーバー経路は `!multi_gpu` のときだけ `draft_kv` を試す。
-- `draft_kv` 内で prompt scratch と対象データが利用可能で、drafter の K/V が paged（`kv_mode == 0`）であること。ring（`kv_mode == 2`）は `STRATA_MTP_BATCH_RING` が未設定、または先頭文字が `0` 以外の場合に限り対象となる。その他の K/V mode、hybrid K/V、異なるデバイスは対象外。
-- 必須 drafter tensor が揃い、token embedding がこの経路で gather 可能であり、 scratch が少なくとも64行分確保できること。満たさない場合は通常の drafter pass に戻る。
+- `--mtp` 等で MTP drafter が有効になり、prompt chunk の callback が `draft_kv` を呼ぶ必要がある。単一 GPU の generate では `o.mtp` が空でないとき callback が登録される（`engine/src/program/generate.cpp:24137-24149`、SYCL: `engine/sycl/src/program/generate.cpp:13360-13371`）。serve 側も `use_mtp` のとき batched 経路を試す（`engine/src/program/generate.cpp:14777-14798`、SYCL: `engine/sycl/src/program/generate.cpp:8622-8628`）。
+- 1 GPU では MTP 使用時に prompt path が batched 経路を試す。CUDA/HIP の multi-GPU 層分割では `STRATA_SPLIT_MTP_BATCH` が有効で、drafter が先頭 stage ではなく (`!mtp_first`)、かつ split の最終 stage に native embedding がある場合に限って試す。split 用の変数は `split_env_on` が `atoi(value) != 0` で判定する別設定であり、この文書の変数とは独立している（`engine/include/strata/program/draft_kv_plan.hpp:16-42`、呼び出し: `engine/src/program/generate.cpp:14779-14785`）。SYCL の serve は `multi_gpu` の場合 batched 経路を呼ばない（`engine/sycl/src/program/generate.cpp:8622-8627`）。
+- `STRATA_MTP_BATCH` が停止値でないことに加え、draft K/V が paged (`kv_mode == 0`) か、ring (`kv_mode == 2`) かつ `STRATA_MTP_BATCH_RING` が停止値でない必要がある。hybrid K/V は対象外。同じ device 上であること、prompt scratch region があることも必要（CUDA/HIP: `engine/src/prefill/prefill.cpp:3007-3013`、SYCL: `engine/sycl/src/prefill/prefill.cpp:1867-1873`）。
+- MTP の必要 tensor と gather 可能な token embedding があり、scratch が 64 行分以上必要。満たさない場合も batched 計算は decline して drafter 自身の経路に戻る（CUDA/HIP: `engine/src/prefill/prefill.cpp:3018-3052`、SYCL: `engine/sycl/src/prefill/prefill.cpp:1878-1913`）。
+
+`--batch-mtp` は batch decode の別機能であり、この設定の有効条件ではない（CLI の説明: `engine/src/program/generate.cpp:1318-1321`）。
 
 ## 実行時の詳細
 
-CUDA の `src/prefill/prefill.cpp` と SYCL の `sycl/src/prefill/prefill.cpp` の両方に同じ `static const bool off` 判定がある。値は `draft_kv` の最初の呼び出し時に一度だけ読み取られて static local に保持されるため、そのプロセス内で後から環境を変更しても判定は更新されない。
+CUDA/HIP の通常の単一 GPU generate は各 prompt chunk で `draft_kv` を呼び、成功すれば batched pass でその chunk の draft K/V を計算する。false かつ error が空なら `mtp.prefill` にフォールバックする（`engine/src/program/generate.cpp:24142-24149`）。SYCL generate も同じく `draft_kv` の false 後に `mtp.prefill` を呼ぶ（`engine/sycl/src/program/generate.cpp:13365-13371`）。serve の単一 GPU 経路も false なら drafter の prefill を実行する（CUDA/HIP: `engine/src/program/generate.cpp:14797-14798`、SYCL: `engine/sycl/src/program/generate.cpp:8626-8628`）。
 
-抑止された場合、`draft_kv` は `false` を返すがエラー文字列は設定しない。通常の単一 GPU の generate/serve 呼び出し元はこの戻り値を見て `mtp.prefill(...)` を呼ぶ。CUDA のレイヤー分割経路も、試行が不成立でエラーがなければ同じ drafter pass に戻す。実際にバッチ処理が成功すると、各 chunk の次トークン埋め込みと prompt の最終 residual 行から drafter の K/V を計算して cache に append する。GPU 処理のエラーは `err` に記録され、通常の fallback ではなく呼び出し元へ伝わる。
+したがって停止値は prompt path の batched K/V 計算を選ばなくするが、MTP drafter 自身の prompt K/V 計算は残る。source comment は batched pass と drafter 自身の pass で draft 値が bit-identical とは限らず、target の token logits は変わらないと記す（`engine/include/strata/prefill/prefill.hpp:60-65`）。別の CLI 優先順位やこの設定値による終了経路はない。fallback 自体が error を返せば chunk callback は失敗し、そのエラーを呼び出し元へ返す。
 
-この分岐は通常ログを出さない。`STRATA_DRAFT_TIMING` が設定されている場合、成功した CUDA または SYCL バッチ処理は標準エラーに `strata draft kv: ...` の timing 行を出す。サーバー側の `STRATA_SNAPSHOT_VERIFY` 診断は `DRAFT_PREFILL path=batched` または `path=token` を出し、経路を区別できる。
+設定の読み取りは `draft_kv` の最初の呼び出し時であり、起動時ではない。CUDA/HIP と SYCL のそれぞれで関数内 static に cache されるため、同一プロセス内の後続 prompt や要求で環境変数を変更しても反映されない（`engine/src/prefill/prefill.cpp:3001`、`engine/sycl/src/prefill/prefill.cpp:1861`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/MULTI_GPU.md` はレイヤー分割での `STRATA_SPLIT_MTP_BATCH` と `STRATA_MTP_BATCH_RING` を説明しているが、`STRATA_MTP_BATCH` 自体の既定動作や値判定は説明していない。現行実装では単一 GPU の経路でバッチ試行が既定で有効であり、この変数の先頭が `0` のとき無効になる。
+通常の単一 GPU decline は `why` に理由を返すだけで、通常経路ではその理由を表示しない。serve の CUDA/HIP multi-GPU 層分割では、`STRATA_SPLIT_MTP_BATCH` により試行が有効になったうえで decline した場合、プロセスにつき一度 `strata serve: STRATA_SPLIT_MTP_BATCH=1 declined, the drafter's own pass runs: %s` を stderr に出す。停止値の場合の理由文字列は `STRATA_MTP_BATCH=0`（`engine/src/program/generate.cpp:14781-14795`、設定理由: `engine/src/prefill/prefill.cpp:3007-3009`）。`STRATA_SNAPSHOT_VERIFY` が設定されている serve は、fallback 後に `DRAFT_PREFILL path=token` を出す（CUDA/HIP: `engine/src/program/generate.cpp:14806-14808`、SYCL: `engine/sycl/src/program/generate.cpp:8633-8635`）。
+
+`docs/DETAILS.md` にこの変数固有の説明や測定値は見当たらない。`docs/SETTINGS.md` には関連する `STRATA_MTP_BATCH_F16` と `STRATA_MTP_BATCH_RING` は載るが、この変数自体の行はない（`docs/SETTINGS.md:421-422`）。リポジトリ内の `terminal/tools/conversation_cache_growth.py:98-103` と `terminal/tools/conversation_cache_disabled.py:128-133` は子プロセス環境に `STRATA_MTP_BATCH=1` を設定している。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:1341-1358` — CUDA 側の読み取り、値判定、無効化理由、K/V mode・hybrid・device 条件。
-- `sycl/src/prefill/prefill.cpp:1301-1317` — SYCL 側の同じ判定と適用条件。
-- `src/prefill/prefill.cpp:1373-1394`、`sycl/src/prefill/prefill.cpp:1332-1357` — tensor / embedding 条件と64行単位の scratch 条件。
-- `src/prefill/prefill.cpp:1485-1509`、`sycl/src/prefill/prefill.cpp:1467-1503` — K/V の計算、cache append、エラーと任意の timing 出力。
-- `src/program/generate.cpp:8092-8123` — CUDA サーバーでのレイヤー分割 opt-in、fallback、診断出力。
-- `src/program/generate.cpp:12469-12480`、`sycl/src/program/generate.cpp:11679-11689` — generate 経路でのバッチ試行と drafter pass fallback。
-- `sycl/src/program/generate.cpp:7665-7673` — SYCL サーバーでの単一 GPU 条件、fallback、診断出力。
-- `include/strata/program/draft_kv_plan.hpp:21-42` — CUDA サーバー側で multi-GPU 時に使う別の `STRATA_SPLIT_MTP_BATCH` 計画条件。
-- `docs/MULTI_GPU.md:103-110` — 関連するレイヤー分割経路についての説明。
+- CUDA/HIP の値判定・decline: `engine/src/prefill/prefill.cpp:2991-3013`
+- SYCL の値判定・decline: `engine/sycl/src/prefill/prefill.cpp:1857-1873`
+- 呼び出しと fallback: `engine/src/program/generate.cpp:14777-14798`、`engine/src/program/generate.cpp:24137-24149`、`engine/sycl/src/program/generate.cpp:8622-8628`、`engine/sycl/src/program/generate.cpp:13360-13371`
+- split 経路の gate: `engine/include/strata/program/draft_kv_plan.hpp:16-42`
+- 実装差と対象出力に関する source comment: `engine/include/strata/prefill/prefill.hpp:60-67`

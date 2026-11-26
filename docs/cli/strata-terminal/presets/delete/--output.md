@@ -1,6 +1,6 @@
-# `--output`
+# `strata presets delete --output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,48 +12,57 @@
 
 ## 役割
 
-プリセット削除の結果を、人向けの短いメッセージか JSON で表示します。出力形式だけを選び、削除対象や削除処理は変えません。
+削除結果の表示形式を選びます。`delete` は指定した保存済みチューニング preset を削除する操作で、`--output json` は成功・失敗を機械可読な JSON にします。
 
 ## 使い方
 
 ```sh
-strata presets delete my-preset --output json
-```
+# preset 名または ID を指定して、人向けの結果を表示
+strata presets delete "My preset"
 
-`my-preset` にはプリセット名、完全な ID、または4文字以上の一意な ID 接頭辞を指定できます。名前の照合は大文字・小文字を区別しません（`strata_control/presets.py:218-231`）。
+# 同じ削除を JSON 結果で受け取る
+strata presets delete 01234567 --output json
+```
 
 ## 値と既定値
 
-- `human`: 人向けの削除完了メッセージを標準出力に表示します。省略時の既定値です。
-- `json`: `{"schema_version":1,"ok":true,"deleted":"<preset-id>"}` を標準出力に表示します。
-- その他の値は parser の `choices` により拒否されます。`--output` は `presets` の各サブコマンドに個別に定義されており、`delete` でも位置引数 `preset` とともに指定します。短縮別名はありません（`strata_cli/tune_commands.py:49-55,68-69`）。
+- `human`: 既定値です。成功時は削除した preset 名を標準出力へ表示し、失敗時は `strata: <理由>` を標準エラーへ表示します。
+- `json`: 成功時は `schema_version: 1`、`ok: true`、削除した preset の完全な ID を含む `deleted` を標準出力へ出します。失敗時は `schema_version: 1`、`ok: false`、`error.code` と `error.message` を含む JSON を標準出力へ出します。
+- それ以外の値は parser の `choices` により受理されません。値を省略すると `human` です。
 
 ## 実行時の動作
 
-`--output json` のときだけ JSON モードになり、削除対象を検索してから削除処理を呼び出します。成功時、人向け出力は `Deleted '<name>'.`、JSON はプリセット名ではなく ID を `deleted` に格納します。どちらも終了コードは `0` です（`strata_cli/tune_commands.py:95-100,289-293,317-320`）。
+`--output` は `presets` の各サブコマンドに共通登録されますが、この文書の対象スコープは `presets delete` です。削除処理はまず指定値から preset を解決し、その ID を結果用に保持してから削除関数を呼び出します。指定値には完全 ID、4 文字以上の ID prefix、または大文字小文字を区別しない完全な名前を使えます。名前が複数に一致する場合や見つからない場合は削除しません。
 
-削除処理はプリセットの保存先にある `active.json` の全スロットを調べ、削除 ID を履歴から除きます。削除対象が現役なら履歴の最後の ID を現役に戻し、履歴が空なら現役を `None` にします。その後 index を保存し、プリセット個別の JSON ファイルを削除します（`strata_control/presets.py:374-387`）。保存先は `STRATA_PRESET_DIR` が設定されていればその値、そうでなければプロファイルディレクトリの隣にある `presets` です（`strata_control/presets.py:45-50`）。
+削除関数は `active.json` の履歴から対象 ID を取り除きます。削除対象が現在有効なら、履歴の直前の preset を有効に戻し、履歴がなければ active を `null` にします。その後、対象 preset の JSON ファイルを削除します。preset ファイルの unlink で `OSError` が起きても関数内で握りつぶすため、索引更新が済んでいればコマンドは成功結果を返す場合があります。`--output` は削除操作自体や削除対象を変更しません。
 
-このコマンドはプリセット store のファイルと index を更新します。削除処理自体はエンジンを起動せず、モデルファイルやチューニング測定値を変更する処理は呼び出しません（`strata_control/presets.py:1-17,374-387`）。
+```sh
+strata presets delete "My preset" --output json
+```
+
+成功時の JSON には、短縮形ではなく完全な preset ID が入ります。チューニング対象モデルの設定ファイルやモデルファイルを直接削除する処理は確認できません。
 
 ## 適用条件と副作用
 
-このオプションは `strata presets delete` における表示形式の指定です。削除対象が active だった場合、直前の履歴が active に戻るため、以後の起動時に適用されるプリセットが変わる場合があります。履歴からも削除 ID を除去します（`strata_control/presets.py:374-387`。active preset の起動時適用については同ファイル `:11-17,441-475`）。
-
-個別ファイルの削除で `OSError` が起きても例外は握りつぶされます。その場合も index 保存が成功していれば呼び出し側は成功出力を返すため、ファイルが残る可能性があります。対して index の保存で失敗した場合は、削除処理から `OSError` が伝播してエラー経路になります（`strata_control/presets.py:207-208,374-387`）。
+- 実行時に preset store を参照します。`STRATA_PRESET_DIR` が設定されていればそのディレクトリ、そうでなければ profile ディレクトリの隣にある `presets/` が store です。
+- 削除対象が active または undo 履歴にある場合、`active.json` を更新して active 状態・履歴を調整します。対象 preset の JSON ファイルも削除しようとします。
+- preset ファイルの削除失敗は無視されます。一方、索引の保存など他の `OSError` は失敗経路になります。
+- preset は Terminal と Desktop app で共有される保存領域にあります。削除により、その preset を共有する側からも参照できなくなります。
 
 ## 出力とエラー
 
-- 存在しない名前・ID、曖昧な名前または ID 接頭辞の場合、`PresetError` を捕捉して終了コード `5` を返します。人向けモードでは `strata: <message>` を標準エラーへ、JSON モードでは `{"schema_version":1,"ok":false,"error":{"code":5,"message":"..."}}` を標準出力へ出します（検索エラー: `strata_control/presets.py:218-231`、エラー整形: `strata_cli/tune_commands.py:103-108,344-347`）。
-- index 保存などの `OSError` は、通常は人向けモードで標準エラー、JSON モードで JSON エラーとして返り、終了コードは例外の `exit_code` 属性がなければ `2` です（`strata_cli/tune_commands.py:344-347`）。
-- `--output` に `human` / `json` 以外を渡した場合は argparse が値を拒否し、通常の parser エラー（終了コード `2`）になります（定義: `strata_cli/tune_commands.py:53-55`、CLI の parser 呼び出し: `strata_cli/cli.py:2217-2231`）。
+- 成功: 終了コード `0`。`human` は `Deleted '<名前>'.`、`json` は `{"schema_version": 1, "ok": true, "deleted": "<完全なID>"}` 相当を標準出力へ出します。
+- preset がない、または指定が曖昧: `PresetError` を `error.code: 5`（人向け出力時は終了コード `5`）として返します。
+- 索引保存などで `OSError` が発生: 終了コード `2` で失敗応答を返します。人向けでは標準エラー、JSON では標準出力です。
+- `--output` に `human` / `json` 以外を指定した場合は argparse の引数エラーとなり、コマンド処理には入りません。
 
 ## 根拠
 
-- `strata_cli/tune_commands.py:49-55,68-69` — `presets delete` parser と `--output` の値・既定値。
-- `strata_cli/tune_commands.py:95-108,289-293,317-320,344-348` — 出力形式、削除の呼び出し、成功・失敗時の出力と終了コード。
-- `strata_control/presets.py:45-50,218-231,374-387` — 保存先、対象の検索規則、active 履歴の更新とファイル削除。
-- `strata_control/presets.py:11-17,441-475` — active preset の起動時適用についての説明と実装。
-- `strata_cli/cli.py:2217-2231` — parser の実行と引数エラー経路。
-
-調査時点で Strata checkout は `main`（`origin/main` と同期）で、`git status --short --branch` に未コミット変更はありませんでした。CLI の `--help` は補助資料として実行していません。記述は上記 commit の parser と実装を根拠にしています。
+- `terminal/strata_cli/tune_commands.py:55-75`: `presets` の下に `delete` を登録し、共通 `--output` を `human` / `json`、既定値 `human` で定義。`delete` は位置引数 `preset` を取ります。
+- `terminal/strata_cli/tune_commands.py:101-114`: 成功・失敗の JSON / 人向け出力形式と終了コード。
+- `terminal/strata_cli/tune_commands.py:472-503`: `presets_command` の dispatch、対象の解決、削除呼び出し、成功 payload。
+- `terminal/strata_cli/tune_commands.py:527-530`: preset エラーを終了コード `5`、その他の `OSError` / `ValueError` を既定終了コード `2` で返します。
+- `terminal/strata_control/presets.py:45-50`: preset store の場所と `STRATA_PRESET_DIR` の適用。
+- `terminal/strata_control/presets.py:243-256`: ID・prefix・名前による検索と、不在・曖昧時の失敗。
+- `terminal/strata_control/presets.py:401-414`: active index と履歴の更新、preset ファイル削除、および unlink 失敗の握りつぶし。
+- `terminal/strata_cli/cli.py:514-515,2229-2230`: parser 登録とトップレベル dispatcher から `presets_command` への接続。

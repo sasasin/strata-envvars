@@ -1,58 +1,50 @@
 # `STRATA_GDN_CHUNK`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の実験ビルドで、prompt の Gated DeltaNet（GDN / DeltaNet）再帰計算に、従来の token ごとの recurrence の代わりに 64-token 単位の chunked recurrence を選びます。通常の recurrence は前 token の state に依存して token を順番に処理します。chunked 経路は chunk 内の処理を cumsum・行列計算・forward の段階に分け、chunk 間では state を順に引き継ぎます。演算順序が変わるため、同じ recurrence の計算ですが bit-exact ではありません。
+実験的 CUDA build の GDN（gated DeltaNet）再帰を、通常の token 単位 recurrence から 64-token 単位の chunk recurrence に切り替える。`STRATA_GDN_CHUNK` を正の整数として読める値にすると、再帰の state 更新と中間出力 `y` を `gdn_chunk_recurrence` に渡す。64-token に満たない末尾は通常の pipelined recurrence に残し、通常出力経路ではその後に出力 norm を行う。chunk recurrence は同じ recurrence の別の演算順序であり、ソースは通常経路との bit-exact 性を保証していない（`engine/src/prefill/kernels.cu:3145-3172`、`engine/include/strata/prefill/gdn_chunk.hpp:8-12,64-76`）。
 
-環境変数は `gdn_recurrence_variant()` が呼ばれるたびに読みます。これは prompt の GDN 層を処理する `gdn_recurrence()` から呼び出されます。通常の decode recurrence ではなく、prefill の prompt 経路にある切替です。
+通常 build、HIP、Metal、SYCL ではこの変数による分岐はコンパイルされない。CUDA では `STRATA_EXPERIMENTAL_SM60` が定義された build に分岐があり、この CMake option は既定で OFF（`engine/cmake/backends/cuda.cmake:28,76-80`、`engine/src/prefill/kernels.cu:3145`）。通常の GDN prompt 処理は `prefill.cpp` から `gdn_recurrence` を呼び、KVA state-only 処理は `gdn_recurrence_state_only` を通る。どちらも同じ dispatch 実装を使う（`engine/src/prefill/prefill.cpp:5203-5210`、`engine/src/prefill/kernels.cu:3286-3293,3309-3314`）。
 
 ## 値と判定
 
-値は空でない場合に `std::atoi()` で整数へ変換されます。文字列全体の妥当性検査はありません。数値の prefix が変換され、変換できない文字列は 0 になります。
+dispatch は `getenv` の結果が未設定または空文字なら `-1`、それ以外は `atoi` で整数化する。文字列全体の妥当性検査はなく、`atoi` が読む先頭の数値部分で判定される（`engine/src/prefill/kernels.cu:3150-3153`）。
 
-| 値 | `gdn_recurrence_variant()` の動作 |
-|---|---|
-| 未設定、空文字 | `chunk_env = -1`。chunked 経路を選ばない |
-| `0`、または `atoi()` 結果が 0 | chunked 経路を選ばない |
-| `1` など `atoi()` 結果が 1 以上 | `serial` でなく `T > 0` なら chunked を要求する |
-| 負の整数（例: `-1`） | `chunk_env >= 0` が偽なので chunked 経路を選ばない |
+| 条件 | 未設定 | chunk dispatch になる値の例 | chunk dispatch にならない値の例 |
+|---|---|---|---|
+| `STRATA_EXPERIMENTAL_SM60` を定義した CUDA build、`STRATA_GDN_REC_HEADS` 未設定、`T > 0` | 無効（`chunk_env = -1`） | `1`, `2`, `3`, `1tail`, ` 1` | 空文字、`0`, `0tail`, `true`, `-1`, `-2` |
+| 上記以外の build | この環境変数を読む chunk 分岐なし | 該当なし | 該当なし |
 
-したがって `1tail` は 1 として有効、`2tail` は 2 として有効、`true` や空白だけの値は 0 として無効です。先頭空白や符号は `atoi()` の変換規則に従います。数値として `2` 以上を指定しても、再帰経路を有効にする判定自体は `0` 以外の非負値かどうかです。
+この表の値判定は `atoi` の結果が 0 でない非負数かどうかによる。したがって `1tail` は 1、`0tail` と `true` は 0、負数は非負条件を満たさない。明示的な空文字は未設定と同じく chunk を選ばない。整数範囲を超える文字列の `atoi` 結果は規定できない。CLI 引数や設定ファイルからこの環境変数を上書きする処理は見つからなかった。
+
+chunk recurrence 内でも同名変数を再度 `getenv` / `atoi` で読む。値が `2` のときは FP32 FMA scan を選び、`2` 以外ではデバイスが cc 7.0 で共有メモリ属性設定に成功した場合に WMMA scan、それ以外は FMA scan を選ぶ（`engine/src/prefill/gdn_chunk.cu:544-548,555-581,603-621`）。この内部判定は外側の dispatch が chunk recurrence を選んだ場合だけ実行される。
 
 ## 有効になる条件
 
-- `STRATA_EXPERIMENTAL_SM60=ON` で構成した CUDA ビルドであること。通常の CUDA ビルドにはこの chunked Volta recurrence が組み込まれません。HIP ビルドではこの切替経路を使いません。
-- `STRATA_GDN_REC_HEADS` が設定されていないこと。値が空でも設定されていれば `serial` が true となり、chunked dispatch は無効です。
-- GDN recurrence の token 数 `T` が 64 以上であること。`T` が 1〜63 の場合は環境変数が有効値でも従来経路になります。
-- `T > 0` であること。
-
-`STRATA_GDN_CHUNK` の正値で chunked dispatch を要求した場合、64-token 境界までを chunked recurrence に渡し、残り 1〜63 token は従来の `gdn_rec_cols_pipe_kernel` で処理します。出力 norm は全 `T` token に対して実行されます。
-
-コード上、chunked dispatch の条件には GPU compute capability の判定はありません。WMMA 実装を使えるかは別に判定されます。デバイスが cc 7.0 で WMMA の shared-memory 属性設定にも成功した場合に WMMA を選び、それ以外は FMA 実装へ進みます。つまり、実験ビルドで値を有効にしても、その GPU で WMMA が選べるとは限りません。
+- CUDA と `STRATA_EXPERIMENTAL_SM60` を有効にした build であること。既定 build ではこの分岐は含まれない（`engine/cmake/backends/cuda.cmake:28,76-80`、`engine/src/prefill/kernels.cu:3145`）。
+- 初回 dispatch 時点で `STRATA_GDN_REC_HEADS` が未設定であること。同変数は空文字でも「設定あり」として関数内 static に cache され、設定ありなら chunk dispatch を抑止する（`engine/src/prefill/kernels.cu:3083-3088,3153-3154`）。
+- GDN recurrence の token 数 `T` が 64 以上であること。`T < 64` では通常経路に進む（`engine/src/prefill/kernels.cu:3153-3169`）。
+- `STRATA_GDN_CHUNK` の dispatch 判定は runtime compute capability を条件にしていない。`gdn_chunk_available()` の cc 7.0 判定は隣接する `STRATA_GDN_REC_WARP` 経路には使われるが、chunk dispatch の式には含まれない（`engine/src/prefill/kernels.cu:3152-3164`）。非 cc 7.0 ではチャンク関数内の WMMA 条件が false となり FMA scan 側に進む（`engine/src/prefill/gdn_chunk.cu:554-581`）。その build/device で kernel launch が成立しない場合は通常 recurrence への自動 fallback ではなく、エラー経路になる。
+- 正の値で chunk dispatch されると `STRATA_GDN_REC_WARP` の recurrence 選択には進まない。値が 0、負数、無効文字列の場合は通常 recurrence に戻り、Volta で `STRATA_GDN_REC_WARP` が有効ならその経路が選ばれる（`engine/src/prefill/kernels.cu:3161-3184`）。
 
 ## 実行時の詳細
 
-`gdn_recurrence_variant()` は未設定・空文字を `-1`、それ以外を `atoi()` の結果として扱います。`STRATA_GDN_REC_HEADS` が未設定で、`T > 0`、かつ変換値が 0 以上なら、0 以外の値で chunked を選びます。`T >= 64` のとき `T - T % 64` token を `gdn_chunk_recurrence()` に渡し、残りがあれば pipelined recurrence に渡します。
+`STRATA_GDN_CHUNK` は GDN recurrence の呼び出しごとに読み直され、static cache されない。プロセス起動後に同一プロセス内で環境値を変更した場合も、次の recurrence 呼び出しの dispatch 判定に反映される。対して `STRATA_GDN_REC_HEADS` の有無は初回 recurrence で static cache される（`engine/src/prefill/kernels.cu:3087,3150-3153`）。chunk 関数内でも対象変数を再読し、`=2` なら FMA scan を強制する。`=1` など他の非ゼロ値は、WMMA が利用可能なら WMMA、そうでなければ FMA scan となる（`engine/src/prefill/gdn_chunk.cu:547-548,581,603-621`）。
 
-`gdn_chunk_recurrence()` も呼び出しごとに同じ変数を読みます。ここでは値がちょうど `2` の場合だけ WMMA を避け、FP32-only FMA scan を選びます。それ以外の chunked 有効値は、cc 7.0 で必要な CUDA 属性設定に成功していれば WMMA、それ以外なら FMA です。そのため `STRATA_GDN_CHUNK=1` は cc 7.0 で WMMA を試し、`=2` は FMA を強制します。
+dispatch された場合、`T` から 64 の倍数部分 `T64` を取り出して chunk recurrence に渡し、残り 63 token 以下を `gdn_rec_cols_pipe_kernel` で処理する。通常出力経路では全 `T` token 分の norm kernel を実行する。state-only KVA 経路では `with_out` が false のため norm は実行しない（`engine/src/prefill/kernels.cu:3164-3172,3286-3293,3309-3314`）。chunk 関数は `T64` を 64-token chunk の segment に分け、各 segment で cumsum と WMMA または FMA scan を実行する（`engine/src/prefill/gdn_chunk.cu:31,540-548,590-621`）。
 
-値は `static` にキャッシュされず、各 recurrence 呼び出し時に再評価されます。呼び出しの合間にプロセス環境が変更された場合、後続の呼び出しでは反映されます。chunk kernel は 64-token ごとの chunk を順番に処理し、scratch workspace を呼び出し間で再利用します。
+chunk recurrence の kernel error は `gdn_chunk` の段階名と CUDA error を stderr に出して `exit(1)` する。属性設定の失敗自体はその場で終了せず、後続 launch の `check` で失敗が検出される場合にこの経路へ進む（`engine/src/prefill/gdn_chunk.cu:41-46,559-581,594-621`）。`STRATA_GDN_CHUNK` の値を示すログはない。別変数 `STRATA_GDN_CHUNK_PROF` が設定されていれば `gdn_chunk prof T=...` の各段階計時を stdout に出すが、これは当該変数の制御ではない（`engine/src/prefill/gdn_chunk.cu:585-589,629-633`）。
 
-## 関連資料と測定値
+## ログと測定値
 
-`docs/DETAILS.md` の `STRATA_GDN_CHUNKED` の説明は別の環境変数です。これは CUDA の別の GDN chunked recurrence と HIP gfx11 の経路を含み、`STRATA_GDN_CHUNK` の仕様や測定結果として扱えません。
-
-Strata の `bench/results/2026-10-02-gdn-chunk/RESULTS.md` は、V100-SXM2-16GB（2 枚中 1 枚を使用）、CUDA 12.8、driver 570.x、`STRATA_EXPERIMENTAL_SM60=ON`、`CMAKE_CUDA_ARCHITECTURES=70` の build で、`bench/gdn_chunk_bench` を 5〜20 iteration 実行した結果を記録しています。そこでは chunked 経路は従来 recurrence より 4〜6 倍遅く、opt-in とされています。同資料の計測値であり、他の GPU・設定での性能を示すものではありません。
+この変数自身による選択ログはない。リポジトリ内の `docs/GDN_CONTRACT.md` は `STRATA_GDN_CHUNK` が cc 7.0 の実機でのみ作用すると記載するが、現行 `gdn_recurrence_impl` の chunk 条件は cc 判定を含まず、`gdn_chunk_available()` の結果は `STRATA_GDN_REC_WARP` の判定にのみ使われる。ここでは現行分岐を根拠として記録した（`docs/GDN_CONTRACT.md:71-72`、`engine/src/prefill/kernels.cu:3152-3164`）。性能値は今回のソース読み取りで再測定していない。
 
 ## 根拠
 
-- `CMakeLists.txt:181-219,714-718` — 実験ビルドの設定と chunk source の CUDA 限定組み込み。
-- `src/prefill/prefill.cpp:3235-3243` — prompt GDN 処理から `gdn_recurrence()` を呼ぶ経路。
-- `src/prefill/kernels.cu:2609-2674` — `STRATA_GDN_CHUNK` の parse、serial / `T` 条件、および chunked dispatch 条件。
-- `src/prefill/kernels.cu:2685-2692` — 64-token prefix と tail の処理、out norm。
-- `src/prefill/gdn_chunk.cu:523-528,531-579,601-620` — HIP・compute capability の判定、`=2` による FMA 選択、WMMA / FMA の起動。
-- `include/strata/prefill/gdn_chunk.hpp:8-12,50-53` — chunked recurrence の性質と数値演算順序。
-- `docs/NVIDIA_V100.md:97-105` — V100 の opt-in switch 一覧。
-- `bench/results/2026-10-02-gdn-chunk/RESULTS.md:1-26` — 計測条件と結果（実装の根拠ではなく測定記録）。
+- `engine/src/prefill/kernels.cu:3083-3088,3145-3172,3286-3293,3309-3314` — dispatch 条件、値の変換、通常／state-only の呼び出し。
+- `engine/src/prefill/gdn_chunk.cu:525-548,554-581,590-633` — GPU capability helper、再読み取り、WMMA/FMA 選択、エラーと計時ログ。
+- `engine/cmake/backends/cuda.cmake:28,76-80` — `STRATA_EXPERIMENTAL_SM60` の既定値と compile definition。
+- `engine/src/prefill/prefill.cpp:5203-5210` — 通常 GDN prefill の呼び出し。
+- `docs/GDN_CONTRACT.md:71-72` — 現行 dispatch と記載が食い違う既存資料。

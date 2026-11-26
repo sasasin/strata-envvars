@@ -1,45 +1,46 @@
 # `STRATA_EMB_REUSE_ACCOUNT`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-プロンプト処理用バッファの必要量を見積もる planner に、実際には別バッファと領域を共有する `bo` の分を数えないよう指示します。対象は `Prefill::bytes_needed_impl()` の見積もりです。値を有効にしても GPU バッファの割り当て方式自体は変わらず、主に自動 chunk 選択や expert cache から借りる枠数の判断が変わります。
+prompt 用 device buffer の必要量を見積もる `Prefill::bytes_needed_impl` で、実際の `carve` では embedding buffer `emb` と同じアドレスを使う half-output buffer `bo` の分を見積もりから差し引くかを切り替える。未設定時は `bo` 分を余分に数える互換動作で、`STRATA_EMB_REUSE_ACCOUNT=1` ならその重複分を数えない。実 buffer の配置を変える設定ではなく、実際の配置では `bo` は常に `emb` を指す。見積もりを使う chunk 選択や expert-cache loan 計算が変わり得るため、結果として prompt chunk や prompt path に借りる cache slot 数が変わることがある。`engine/src/prefill/prefill.cpp:825-831, 3729-3747, 2776-2779`。
+
+変数名を読む Strata 所有ソースは `engine/src/prefill/prefill.cpp` の `emb_reuse_account()` だけで、同関数の戻り値は `bytes_needed_impl` から参照される。`generate.cpp` は変数を直接読まず、`Prefill::bytes_needed` の値を slot 換算や chunk が収まるかの判定に使う（例: `engine/src/program/generate.cpp:11133-11156, 11373-11397`）。
 
 ## 値と判定
 
-環境変数の文字列全体や数値としての妥当性は調べず、最初の1文字だけを判定します。
+`std::getenv` が返す値の先頭 1 文字だけを検査し、先頭が文字 `1` なら有効。それ以外は無効。数値 parse、文字列全体の比較、空白除去、大文字小文字変換はしない。`bytes_needed_impl` を最初に呼んだ時点で関数内 `static const bool` に保存され、同じプロセスで環境を後から変更しても再評価されない。`engine/src/prefill/prefill.cpp:829-831`。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（値は設定済みだが先頭文字が `\0`） |
-| 先頭文字が `1` | 有効。`1`, `10`, `1anything` など |
-| それ以外 | 無効。`0`, `true`, ` 1` など |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| `emb_reuse_account()` の評価 | `bo` 分を見積もりに加算 | `1`, `1anything`, `11`, `1 `（先頭が `1`） | 空文字、`0`, `true`, `TRUE`, ` 1`, `01` |
 
-`emb_reuse_account()` の結果は関数内の `static const bool` にキャッシュされます。初回評価後にプロセス環境を変更しても再評価されません。実装にログ出力はありません。
+したがって境界は数値の 1 ではなく先頭文字である。`11` は有効、`-1` は無効。無効値専用の警告や fallback はなく、未設定と同じ見積もりになる。値の判定は `engine/src/prefill/prefill.cpp:829-831`。
 
 ## 有効になる条件
 
-`src/prefill/prefill.cpp` を含む prompt prefill 実装（CUDA/HIP および SYCL port）で、`Prefill::bytes_needed()` または `Prefill::bytes_needed_owned()` を使う見積もり経路に入ったときに判定が使われます。通常の生成経路では、この見積もり値は prompt chunk の cache 枠の計算や利用可能メモリとの比較に使われます（例: `src/program/generate.cpp` の `lend_slots`、`part_slots`、および CUDA 空き容量との比較）。自動 chunk や借用枠がこの差分で変わらなければ、見える実行結果に差はありません。
-
-実際の `Prefill::carve()` は `bo` に `emb` と同じポインターを割り当てます。環境変数が無効でも実割り当てで二重に領域を取るわけではなく、planner が従来互換のため `bo` 相当の `T * N` floats を余分に見積もります。有効時はその見積もりだけを省きます。よって、planner がより大きな chunk や追加の borrowed cache slots を選ぶことがあり、prompt の計算分割や丸めが変わり得ます。
+- engine が `Prefill::bytes_needed_impl` を呼び、その返す必要量を使う場合にだけ見積もりへ反映される。`bytes_needed` と `bytes_needed_owned` はどちらも同じ実装へ進む（`engine/src/prefill/prefill.cpp:3707-3729`）。
+- 通常の `--prefill auto` では、VRAM に収まる chunk と cache loan を走査する計算にこの見積もりが使われる。例えば serve の slot 換算は `bytes_needed` を受け、chunk scan はその値から ring/cache に必要な slot 数を判定する（`engine/src/program/generate.cpp:11133-11156, 11373-11397`）。別経路でも `bytes_needed` / `bytes_needed_owned` が使われるため、自動 chunk 選択に限った設定ではない。
+- `--prefill N` など明示 chunk の値そのものをこの環境変数が上書きする処理はない。ただし、その chunk の buffer fit、loan、cache 予算を `bytes_needed` で調べる経路では見積もりに影響し得る（例: `engine/src/program/generate.cpp:12779-12789`）。他の条件や予算が上限なら、見積もりを減らしても選択結果が変わらない場合がある。
+- `bytes_needed_impl` のこの分岐自体には OS/backend の `#if` ガードがない。prompt buffer を CUDA 系 allocator で確保する共通 prefill 経路で使われる。`Prefill::init` が Metal 用に早期 return する分岐もあるため、Metal でこの見積もりが呼ばれる経路への適用は、この分岐だけからは断定できない（`engine/src/prefill/prefill.cpp:2443-2456, 3718-3747`）。
 
 ## 実行時の詳細
 
-`Prefill::bytes_needed_impl()` は `bo` の共有を除くバッファ群を順に `Alloc::take()` で数え、環境変数が無効なら追加で `f(T * N)` を数えます。ここで `T` は chunk token 数、`N` はモデル側の幅です。実割り当て側では embedding rows が hyper-connection broadcast 後に不要になるため、`Prefill::carve()` が `m.bo = m.emb` としています。
+`Prefill::bytes_needed` は chunk サイズ `T` ごとに scratch、prompt 中間 buffer、各種表、ring などの byte 数を `Alloc` の count-only モードで積算する。`bo` は carve 時に `m.bo = m.emb` と alias されるが、見積もりは既定で `f(T * N)` をもう一度加算する。環境変数が有効ならその加算を省く。このため byte 見積もりは最大で当該 chunk の `T * N * sizeof(float)` 相当だけ小さくなり、256-token 単位の chunk 候補や借りる cache slot 数を変え得る。実 allocation は引き続き `carve` の既存レイアウトで行われる（`engine/src/prefill/prefill.cpp:2776-2779, 3718-3747`）。
 
-この変更は planner の必要量に限られ、プロンプト演算そのものを直接切り替える分岐ではありません。ただし見積もりが減ることで選択 chunk や借用 cache 枠が変わると、資料によれば prompt residual の丸めが変わり、既定値と bitwise 同一ではなくなることがあります。
+値は `bytes_needed_impl` の最初の呼び出しで初期化される関数内 static にキャッシュされる。main 起動時に必ず読むわけではなく、最初に見積もりが必要になった時に読み、プロセス中の変更は反映されない（`engine/src/prefill/prefill.cpp:829-831`）。
 
-## 文書との照合
+これはメモリ見積もりの設定で、生成 token の計算式を直接切り替えない。一方、見積もりから選ばれた chunk が変われば prompt の分割・丸めが変わり得る。Strata の資料は RTX 3060 / IQ3_XXS の例として chunk 6400→6656、借用 slot 1652→1670、prompt 約 +3.9% と記しているが、測定値はこの構成の資料上の値であり、他環境での効果を保証しない。また資料自身が KL 測定なしとしている（`docs/DETAILS.md:1269, 1723`）。
 
-`docs/DETAILS.md` は RTX 3060 の IQ3_XXS で、記載条件のもと chunk が 6400 から 6656 tokens、借用枠が 1652 から 1670 へ変わり、prompt が約 3.9%向上した例を記載しています。同資料は prompt residual が既定値と byte-identical ではなく、同資料内の実行では greedy output が一致したとしています。これは資料に記載された測定例であり、他の構成での性能や出力一致を保証するものではありません。
+この変数専用のログ、警告はない。serve の自動 chunk ログ（`strata serve: prompt chunk auto: ...`）や借用 slot のログは、選ばれた値を間接的に観測できる（`engine/src/program/generate.cpp:12747-12764, 12924-12932`）。見積もりが実 allocation を保証するものではなく、実際に chunk buffer の carve が失敗すれば `Prefill::init` が error 文字列 `prefill: device buffers for a chunk of ... tokens do not fit (...)` を設定して `false` を返す。serve はこの種の失敗時に小さい chunk で再試行し、再試行できない場合は stderr に `strata serve: <error>` を出して終了コード 1 を返す（`engine/src/prefill/prefill.cpp:2738-2746`, `engine/src/program/generate.cpp:13039-13041, 13102-13140`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:258-265`: `bo` と `emb` の共有に関する注記、環境変数の先頭文字判定と static cache。
-- `src/prefill/prefill.cpp:1205-1223`: 実バッファの carving と `m.bo = m.emb`。
-- `src/prefill/prefill.cpp:1819-1859`: 見積もり関数、および無効時だけ `T * N` を加算する箇所。
-- `src/program/generate.cpp:6252-6253,6948-6950,7123-7128`: 見積もり値を cache 枠や空き容量の判断に使う例。
-- `CMakeLists.txt:586`、`sycl/CMakeLists.txt:233-236`: CUDA/HIP と SYCL port の prefill target が `src/prefill/prefill.cpp` を含むこと。
-- `docs/DETAILS.md:1941-1943`: 設計説明と、上記の測定例・出力差に関する説明。
+- `engine/src/prefill/prefill.cpp:825-831` — 設計コメントと getenv / static cache。
+- `engine/src/prefill/prefill.cpp:2776-2779` — `bo` が `emb` を alias。
+- `engine/src/prefill/prefill.cpp:3707-3747` — 見積もり API と `bo` 分の加算条件。
+- `engine/src/program/generate.cpp:11133-11156, 11373-11397` — byte 見積もりから slot 数・chunk scan を計算。
+- `engine/src/program/generate.cpp:12747-12764, 12924-12932` — serve の間接観測ログ。
+- `engine/src/prefill/prefill.cpp:2738-2746`, `engine/src/program/generate.cpp:13039-13041, 13102-13140` — buffer carve 失敗時の error、serve の再試行・stderr・終了経路。
+- `docs/DETAILS.md:1269, 1723` — 条件付きの既存測定記録（コードから測定を再現・検証したものではない）。

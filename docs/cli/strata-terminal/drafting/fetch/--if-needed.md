@@ -1,6 +1,6 @@
 # `--if-needed`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査開始時の checkout は `main...origin/main` で、`git status --short --branch` に未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,48 +8,49 @@
 | コマンド | `strata drafting fetch` |
 | オプション | `--if-needed` |
 | 別名 | なし |
-| 値 | 値を取らない真偽フラグ。省略時は `False` |
+| 値 | 値を取らないフラグ。指定すると真になる（`store_true`）。 |
 
 ## 役割
 
-DFlash2 drafter の取得・pack 作成を、現在のモデル設定がその drafter を使う見込みで、かつ pack がまだ存在しない場合に限って実行します。条件に合わなければ成功扱いで何も取得しません。parser は `fetch` にだけこのフラグを登録し、`plan` には登録しません（`strata_cli/drafting_cmd.py:17-29`）。
+現在のモデル・drafting の選択・ローカルファイル状態から DFlash2 drafter が必要と判定された場合だけ取得処理へ進みます。不要なら fetch をスキップして成功扱いで終了します。`fetch` の既定動作は明示的な取得であり、このフラグを付けない場合は必要性判定にかかわらず取得処理を呼びます（`terminal/strata_cli/drafting_cmd.py:34-38,240-272`）。
 
 ## 使い方
 
 ```sh
-strata drafting fetch --config /path/to/run-config.json --if-needed
+strata drafting fetch --config ./run-config.json --if-needed
 ```
-
-アプリ側もモデルの run config と任意の `--mode` を渡し、`--if-needed --output jsonl` で取得を呼び出します（`apps/host/server/control-runtime.mjs:256-261`）。
 
 ## 値と既定値
 
-値や alias はありません。指定すると `action="store_true"` で有効になり、省略時は無効です（`strata_cli/drafting_cmd.py:27-29`）。このため、省略時は必要性判定を使わず `ensure()` に進みます。すでに有効な pack があれば `ensure()` 自身が既存 pack を保持して返します（`strata_cli/drafting_cmd.py:74-88`, `strata_control/drafting_fetch.py:54-62`）。
-
-必要性は `drafting.needs_pack()` が判定します。選択モードが DFlash2 になり、対象モデル・family が対応し、当該 revision でエンジンが DFlash2 を serve でき、かつ pack が未準備の場合だけ真です（`strata_control/drafting.py:179-183`）。pack は `<data-dir>/dflash2/qwen3.8-flash-next-dflash2.q8.pack` にあり、ファイルが存在してサイズが 1 MiB を超える場合に準備済みとみなされます（`strata_control/drafting.py:88-100,114-122`）。
+- 引数値はありません。parser は `action="store_true"` で登録し、未指定なら偽です。`fetch` にだけ登録され、`plan` では受け付けません（`terminal/strata_cli/drafting_cmd.py:19-38`）。
+- 値を後ろに置く形式ではありません。重複指定を特別に拒否する処理はなく、同じ真偽値を指定するだけです（同:34-38）。
+- このオプション固有の値検証はありません。`--mode` は別途 `auto`、`mtp`、`dflash2`、`off` のいずれかに制限されます（同:29-35、`terminal/strata_control/drafting.py:37`）。
 
 ## 実行時の動作
 
-モードは明示された `--mode` が最優先で、なければ `--config` の `drafting` 値を使います。`--mode` の受理値は `auto`、`mtp`、`dflash2`、`off` です（`strata_cli/drafting_cmd.py:24-28,40-54`; `strata_control/drafting.py:23-25`）。run config の読み込みに失敗した場合は空設定として扱われます（`strata_cli/drafting_cmd.py:40-46`）。
-
-データディレクトリは明示した `--data-dir`、run config の engine 引数にある `--pack` / `--mtp` から得た場所、Strata の既定カタログの順で決まります。モデル名は config の `model_name`、family は `--family` から判定材料に渡されます。GPU class の取得に失敗した場合は `other` として扱います（`strata_cli/drafting_cmd.py:32-54`; `strata_control/drafting.py:67-73,107-122,203-212`）。
-
-必要と判定されなければ、human 出力は `Nothing to download.`、`json` / `jsonl` 出力は `{"schema_version":1,"ok":true,"event":"result","pack":null,"skipped":true}` 相当を出し、終了コード 0 で戻ります（`strata_cli/drafting_cmd.py:57-79`）。必要な場合は `ensure()` が pinned URL からファイルを取得し、サイズと SHA-256 を確認して engine 用 pack を作成します。進捗は `jsonl` では progress JSON 行、human では進捗表示になります。`--output` は `human`（既定）、`json`、`jsonl` のいずれかです（`strata_cli/drafting_cmd.py:29,81-98`; `strata_control/drafting_fetch.py:29-39,54-102`; `strata_control/drafting.py:88-100`）。
+1. fetch は config などから mode、モデル、data directory、backend・hardware 情報を組み立てます。明示した `--mode` は config の drafting 選択より優先されます。config の読み込みで OS または JSON エラーが起きると、この処理は空 config として続行します（`terminal/strata_cli/drafting_cmd.py:101-137,139-149`）。
+2. `needed` は `needs_pack` または `needs_tuned` のどちらかが真かで決まります。前者は選択が DFlash2 で、対応 drafter が未準備の場合、後者は選択が DFlash2 で、該当モデル向け tuned drafter が適用され、そのファイルが未準備の場合に真です（`terminal/strata_cli/drafting_cmd.py:240-244`; `terminal/strata_control/drafting.py:1611-1622`）。選択はモデル、family、mode、backend、GPU 系統などから `choice_of` が決定します（`terminal/strata_control/drafting.py:1521-1545,1527-1545`）。
+3. `--if-needed` があり `needed` が偽なら、取得処理は呼ばれません。人向け出力は `Nothing to download.`、JSON/JSONL は `{"schema_version":1,"ok":true,"event":"result","pack":null,"skipped":true}` を出し、終了コード 0 です（`terminal/strata_cli/drafting_cmd.py:267-272`）。
+4. 必要と判定されると `drafting_fetch.ensure_for()` を呼びます。該当モデルで tuned drafter が使える場合はそれを試し、取得できない場合は既存 stock pack を使うか stock drafter の取得へ進みます。対象によりネットワーク取得、pack 作成、draft vocabulary の配置や selector の変換が行われます（`terminal/strata_cli/drafting_cmd.py:281-283`; `terminal/strata_control/drafting_fetch.py:349-373,376-443`）。
 
 ## 適用条件と副作用
 
-この commit では `ENGINE_SERVES_DFLASH2 = False` です。そのため `needs_pack()` はこの revision では常に false となり、`--if-needed` を指定した呼び出しは設定や pack の状態に関係なく skip します。これは DFlash2 がこのリリースの engine serve 経路では使えないため、不要な 1.2 GB download を避ける設定です（`strata_control/drafting.py:141-146,179-183`）。将来この定数が変わった場合の条件付き動作も `needs_pack()` によって決まります。
-
-skip されず `ensure()` に進むと、ネットワーク取得を行い、`<data-dir>/dflash2/src/` を作成して取得元ファイルを一時保存し、pack を生成します。成功後は元の safetensors / config ファイルを削除し、pack を残します。既存の pack が準備済みなら取得・pack し直しません（`strata_control/drafting_fetch.py:54-102`）。このオプション自体は取得を禁止しません。取得抑止環境 `STRATA_NO_ACQUIRE` 等で取得が拒否される場合は失敗経路になります（`strata_control/acquisition.py:26,53-54,70-74`; `strata_control/drafting_fetch.py:63-64`）。
+- 必要性は「この選択で drafter を使うか」と「対応ファイルがあるか」に依存します。選択が MTP または off なら `needs_pack` / `needs_tuned` は偽となり、フラグ指定時は取得を省略します（`terminal/strata_control/drafting.py:1611-1622,1527-1545`）。
+- Hy4-Flash と Inkling-2-Mini は drafter がモデルファイルに内蔵されている専用分岐があり、`--if-needed` の判定より前に「別途取得不要」として成功終了します（`terminal/strata_cli/drafting_cmd.py:152-208,214-233`）。
+- 複数のインストール済み DFlash2 config が見つかると、必要性判定より前にモデル選択エラーとなります（`terminal/strata_cli/drafting_cmd.py:234-239`）。
+- 必要と判定されて取得へ進んだ場合は、通信および data directory 内の drafter 関連ファイルの作成・置換・一時ファイル削除が起こり得ます。準備済み stock pack は維持され、tuned 版が適用される条件では tuned 版の取得も試みます（`terminal/strata_control/drafting_fetch.py:349-373,376-443`）。
 
 ## 出力とエラー
 
-取得・検証・pack 作成時に `DraftingError` または `AcquisitionRefused` が発生すると、終了コード 5 を返します。machine output は `ok:false` と `drafting_failed` エラーを出し、human output は stderr に `strata: ...` を出します（`strata_cli/drafting_cmd.py:87-94`）。SHA-256 不一致時は不正な partial file を削除して再試行を案内し、転送中断時は `.part` を残して再開可能と伝えます。pack 生成失敗時は一時 `.tmp` を消して MTP 継続を案内します（`strata_control/drafting_fetch.py:75-94`; `strata_control/transfer.py:198-221`）。
+- 必要性判定による skip は成功（終了コード 0）です。JSON/JSONL では `skipped: true` の result event、人向けでは `Nothing to download.` を出します（`terminal/strata_cli/drafting_cmd.py:267-272`）。
+- fetch 対象が複数 config により特定できない場合は、JSON/JSONL に `which_model` エラー、人向けでは stderr に `strata: ...` を出し、終了コード 2 です（同:234-239）。
+- 取得時の `DraftingError` または acquisition 拒否は、機械出力で `drafting_failed`、人向けでは stderr にエラーを出し、終了コード 5 です（同:295-301）。取得成功時は JSON/JSONL に pack のパス、人向けに ready メッセージを出し、終了コード 0 です（同:302-306）。
 
 ## 根拠
 
-- parser、値・既定値、実行分岐、出力・終了コード: `strata_cli/drafting_cmd.py:17-29,40-98`
-- 必要性・対応モデル・現在の engine 条件・pack 判定: `strata_control/drafting.py:88-100,107-122,141-183`
-- 取得、再開、検証、pack 作成と後片付け: `strata_control/drafting_fetch.py:54-102`; `strata_control/transfer.py:198-221`
-- 取得拒否条件: `strata_control/acquisition.py:26,53-74`
-- 呼び出し例（アプリの利用経路）: `apps/host/server/control-runtime.mjs:256-261`
+- `terminal/strata_cli/drafting_cmd.py:19-38` — `drafting fetch` parser と `--if-needed` の定義、値なし・fetch 限定。
+- `terminal/strata_cli/drafting_cmd.py:101-137,139-149` — config 等から必要性判定に使う入力の構成。
+- `terminal/strata_cli/drafting_cmd.py:211-272` — 特殊モデル分岐、必要性判定、skip の出力と終了。
+- `terminal/strata_cli/drafting_cmd.py:281-306` — 取得呼び出し、進捗、失敗・成功出力。
+- `terminal/strata_control/drafting.py:1521-1545,1611-1622` — 選択と stock / tuned drafter の必要性条件。
+- `terminal/strata_control/drafting_fetch.py:349-443` — tuned / stock の取得、pack 作成とファイル処理。

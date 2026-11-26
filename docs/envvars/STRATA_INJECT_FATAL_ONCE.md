@@ -1,39 +1,45 @@
 # `STRATA_INJECT_FATAL_ONCE`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。作業開始時の Strata status は `## main...origin/main`。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`STRATA_INJECT_FATAL` によるテスト用 fatal GPU error 注入を、ファイルで一度だけに制限します。値は marker file のパスです。この変数だけを設定しても注入は起きず、`STRATA_INJECT_FATAL` の正数指定と、その値に達する fatal-check 呼び出しが必要です。実装は `src/program/generate.cpp` の `exit_if_gpu_fatal()` にあります。
+この変数は fatal GPU error の**テスト用注入**を複数の engine 起動にまたがって一度だけ発生させるためのマーカーファイル名です。この変数だけでは注入は起きません。`STRATA_INJECT_FATAL` が指定する decode-window 回数に達したとき、ここで指定されたファイルを開き、既に読み取り可能なら注入を抑止し、まだ開けなければ作成を試みたうえで fatal error を注入します。通常の GPU エラー判定や生成設定を変更する変数ではありません。読み取りと分岐は `engine/src/program/generate.cpp:3634-3648` にあります。
 
 ## 値と判定
 
-この変数は文字列として読み、数値変換やトリミングはしません。
+値は数値や真偽値として parse されず、`fopen` に渡すパス文字列です。未設定 (`getenv` が null) または空文字列 (`*once == '\0'`) ならファイル確認をせず、注入条件に達した際は抑止されません。`0`、`1`、`true`、`false`、`0anything` も特別扱いされず、そのままファイル名として扱われます。大文字小文字・空白・数値妥当性の検査やパス正規化はこの箇所にありません。パスが実際に開けるかは `fopen` の結果で決まります（`engine/src/program/generate.cpp:3638-3645`）。
 
-| 値 | 判定と動作 |
-|---|---|
-| 未設定 | ファイル判定をせず、注入を発火する。 |
-| 空文字 | `getenv()` は非 null ですが `*once` が false のため、ファイル判定をせず発火する。 |
-| 空でない文字列 | その文字列をパスとして `fopen(path, "rb")` で開く。開けた場合は閉じて `fire=false` とし、注入を抑止する。開けなかった場合は `fopen(path, "wb")` を試み、作成できれば閉じるが、いずれの場合も `fire` は true のままなので今回の注入は発火する。 |
+| 条件 | unset | 設定時に抑止する条件 | 注入を抑止しない例 |
+|---|---|---|---|
+| `STRATA_INJECT_FATAL` による注入条件が成立 | マーカーを確認せず注入 | 空でない値を `rb` で開ける（ファイル内容は読まない） | 空文字、存在しないパス、読み取りで開けないパス。`wb` 作成が失敗しても注入は続く |
+| 注入条件が不成立 | 変数を読まない | なし | `STRATA_INJECT_FATAL` 未設定・0以下、または N 回目の確認に未到達 |
 
-範囲・数値境界・大文字小文字の判定はありません。相対パスの基準はこのプロセスの作業ディレクトリです（`fopen` にパスをそのまま渡します）。ファイル作成に失敗しても注入を抑止する分岐はありません。
+`rb` で既存ファイルを開けると `fire=false` になり、内容・長さ・中身の値に関係なく注入を止めます。開けない場合は `wb` で作成を試しますが、作成成功の有無にかかわらず `fire` は true のままです。従って、無効なパスや書き込み不能な場所では一度限りの保証はありません。マーカー作成は fatal 終了より前なので、同じパスが次の engine 起動から読み取り可能なら、その起動以降は注入を抑止します。コードがマーカーを削除する処理はありません（`engine/src/program/generate.cpp:3641-3645`）。
 
 ## 有効になる条件
 
-- `STRATA_INJECT_FATAL` が未設定でないだけでは足りず、同変数を `std::atol` で変換した値が 0 より大きい必要があります。未設定は 0、変換できない文字列も `atol` の結果が 0 となり、注入分岐に入りません。正数の場合、プロセス内の `windows` カウンターが一致するチェックでこの変数が参照されます。
-- その一致時に marker file が `"rb"` で開けると注入だけがスキップされ、その後通常の sticky GPU error 判定へ進みます。
-- 実装は `src/program/generate.cpp` のデコード経路にあり、別の CLI 引数による上書きや、他環境変数による marker 判定の変更はありません。`STRATA_INJECT_FATAL` の値は最初のチェック時に `static const` としてキャッシュされますが、`STRATA_INJECT_FATAL_ONCE` は一致時ごとに `getenv()` されます。
+- `STRATA_INJECT_FATAL` が正の数として `std::atol` で変換され、engine 内で数える確認回数がその数に一致する必要があります。`STRATA_INJECT_FATAL` は関数内 `static` に一度だけ読み込まれます。未設定は 0、先頭が数値でない文字列は `atol` により 0、数値の後ろに文字があれば数値部分を使います。`STRATA_INJECT_FATAL_ONCE` の値だけでは有効化されません（`engine/src/program/generate.cpp:3634-3645`）。
+- カウント対象は `exit_if_gpu_fatal` の呼び出しで、decode window の前に行う呼び出しが明示的に「test hook counts windows」とされています。別の warm-up failure、verify/commit failure、commit wait failure の呼び出しも同じ関数を通ります。従って N は単純な全リクエストの token 数ではなく、この engine プロセスでの該当確認呼び出し数です（`engine/src/program/generate.cpp:16383-16387`, `22981-22993`, `23066-23070`, `23346-23350`）。
+- 読み取り箇所は CUDA/HIP engine の `engine/src/program/generate.cpp` にあります。候補名の全参照検索では SYCL と Metal の実装に読み取り箇所はありません。CUDA/HIP ターゲットがこのファイルから `strata` を作ることは `engine/cmake/strata_gpu_engine.cmake:548-551` にあります。SYCL と Metal はそれぞれ別の `generate.cpp` をビルドしています（`engine/sycl/CMakeLists.txt:34-41`, `engine/metal/CMakeLists.txt:176-177`）。
+- CLI 引数や他の設定による `STRATA_INJECT_FATAL_ONCE` の上書きはこの実装にありません。サーバーから engine に値を渡す処理もこの変数については見つかりませんでした。プロセス環境に設定された値を engine が参照する箇所だけを確認しています。
 
 ## 実行時の詳細
 
-通常の decode loop では、各 window の `ver.run()` 前に `exit_if_gpu_fatal("")` が呼ばれ、ここでテスト hook のカウントが進みます。検証・commit の失敗経路でも同じ関数が呼び出されます。指定回数に一致して marker file がまだ開けなければ、`exit_gpu_fatal()` が `injected (STRATA_INJECT_FATAL): an illegal memory access was encountered` を理由にエンジンプロセスを終了コード 3 で即時終了します。`STRATA_INJECT_FATAL_ONCE` が空または未設定の場合も同じ注入です。
+`exit_if_gpu_fatal` の最初に `STRATA_INJECT_FATAL` の数値と `windows` カウンターを関数内 `static` として保持します。各呼び出しでカウンターを進め、指定回目にだけ `STRATA_INJECT_FATAL_ONCE` を `getenv` します。対象変数自体は static cache されず、その判定時点の engine プロセス環境を読みます。親プロセス側で engine 起動後に環境を変えても子プロセスへは伝わりません。同じ engine プロセス内で環境が変更されれば、注入判定時に読まれる値には反映されます。同一プロセスで注入条件が成立するのは一度だけです（`engine/src/program/generate.cpp:3634-3645`）。
 
-発火時には stderr に `strata serve: fatal GPU error (...)`、stdout に `ERR fatal GPU error: ...` が出ます。Strata server はこの `ERR` を fatal GPU error として認識し、実行中の request を engine death として扱います（503）。次の request で engine を再起動し、同じ marker path が残っていて再び `"rb"` で開ければ、そのプロセスでは以降の該当注入を抑止します。これは Strata がファイルを確認・作成する動作の説明であり、GPU runtime の挙動については述べていません。
+マーカーが読めず注入する場合、`exit_gpu_fatal` は stderr に `strata serve: fatal GPU error (injected (STRATA_INJECT_FATAL): an illegal memory access was encountered): the engine ends so that the server can start it again`、stdout に `ERR fatal GPU error: injected (STRATA_INJECT_FATAL): an illegal memory access was encountered` を出して flush し、終了コード 3 で `_Exit` します。通常の fatal GPU error も同じ終了関数を使います（`engine/src/program/generate.cpp:3627-3632`, `3645`）。
+
+サーバーはこの `ERR fatal GPU error` 行を受けると処理中の要求を engine death として失敗させます。サーバー側の説明では要求は 503 となり再送可能で、次の要求で engine を再起動します。fatal GPU error による engine 終了が 10 分間に 3 回になると、サーバーは再起動を止め、10 分経過後の要求で再試行します（`terminal/serve/server.py:1660-1669`, `4798-4824`, `4960-4971`）。
+
+## ログと測定値
+
+測定値はありません。このフックが発火すると、上記の stderr/stdout の fatal error 行と終了コード 3 が観測されます。ファイルが `rb` で開けた場合はこのフック由来のログを出さず、通常の sticky GPU error 判定へ進みます。サーバーが fatal error を認識した際は stdout に `[strata] the GPU reported a fatal error (...)` で始まる行を出します（`terminal/serve/server.py:4817-4819`）。
 
 ## 根拠
 
-- 候補名の全参照は `src/program/generate.cpp:3157-3164` のコメントと直接読み取りだけです。helper 経由・動的な名前の渡し先はありません。
-- `STRATA_INJECT_FATAL` の `atol`、プロセス内カウンター、ONCE marker の読み書き、注入理由は `src/program/generate.cpp:3153-3165`。
-- `exit_gpu_fatal()` の stderr/stdout 文言と終了コード 3 は `src/program/generate.cpp:3146-3151`。window 前のチェックと失敗時・commit 後の呼び出しは `src/program/generate.cpp:18467-18470,18512-18516,18678-18681`。
-- server が fatal 行を検出し engine death にする処理は `serve/server.py:1782-1791`、request の 503 は `serve/server.py:7986-7988`、engine 再起動時に同じ command を使う処理は `serve/server.py:1450-1467`。
-- `docs/DETAILS.md` にこの変数の記載は見つかりませんでした。
+- `engine/src/program/generate.cpp:3622-3632` — fatal GPU error 時の stderr/stdout と即時終了。
+- `engine/src/program/generate.cpp:3634-3648` — `STRATA_INJECT_FATAL` の parse、対象変数の読み取り、マーカー判定と注入条件。
+- `engine/src/program/generate.cpp:16383-16387`, `22988-22993`, `23066-23070`, `23346-23350` — 同じ判定関数を呼ぶ warm-up、decode window、commit、commit wait の経路。
+- `terminal/serve/server.py:1660-1669`, `4798-4824`, `4960-4971` — サーバー側の要求失敗、fatal 終了の回数制限、再起動。
+- `engine/cmake/strata_gpu_engine.cmake:548-551`, `engine/sycl/CMakeLists.txt:34-41`, `engine/metal/CMakeLists.txt:176-177` — backend ごとの engine ソース。

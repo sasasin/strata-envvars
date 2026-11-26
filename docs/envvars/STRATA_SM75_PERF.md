@@ -1,56 +1,52 @@
 # `STRATA_SM75_PERF`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA compute capability 7.5（Turing / RTX 20 系）向けに用意された、ビット単位で同じ結果になるとされる複数のカーネル実装を、各機能の既定経路として選ぶための共通 opt-in です。個々のカーネルを直接一つ選ぶ変数ではなく、この変数が有効で、GPU が 7.5 と判定され、かつ個別スイッチが未設定の場合に、その機能の Turing 実装を選びます。
+CUDA engine の Turing（実効 compute capability 7.5）向けに、同じ結果になるとされる複数の代替カーネルを既定で選ぶための opt-in です。`sm75_series()` が値を読み、`sm75_default()` が値と対象 GPU の世代を組み合わせます。環境変数だけで全カーネルを無条件に強制するものではなく、個別スイッチ、データ形状、モデル状態などがさらに選択を制限します。`STRATA_EMULATE_CC=75` で実効 compute capability が 7.5 になっている場合も対象です。[`sm75_series.hpp:24-37`](../../../../Niko1221/Strata/engine/include/strata/core/sm75_series.hpp)、[`emulate.hpp:58-75`](../../../../Niko1221/Strata/engine/include/strata/core/emulate.hpp)
 
-該当する機能には、interleaved small-batch matvec、expert layout mode 4、hyper-connection の read/up/down、QSA の selection/top-k、decode attention、Q2_0 matvec、decode 層の wait 統合、BF16 dequant の vector store、prompt attention v1 prefetch があります。各実装の具体的なゲート名と範囲は `docs/DETAILS.md:2244-2261` に列挙されています。
+主な適用先は fused GR の up/down、QSA attention・score・top-k、Q2_0 MMVQ、IQ expert layout、Q8_1 interleaved quantize、BF16 dequant の各 CUDA 経路です。各経路では Turing 用カーネルやレイアウトの既定選択を変えます。たとえば Q2_0 MMVQ は列数が 1〜4（複数列では exact layout のとき）に限って warp-row kernel を選び、QSA top-k は decode/prefill 状態と reach/capacity などの条件に合うときだけ split/sample 経路を使います。[`native_mmvq.cu:3428-3445`](../../../../Niko1221/Strata/engine/src/kernels/cuda/native_mmvq.cu)、[`qsa_select.cu:3032-3040,3082-3098`](../../../../Niko1221/Strata/engine/src/kernels/cuda/qsa_select.cu)、[`verify.cpp:1832-1846`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
+
+`docs/DETAILS.md` はこれらを bitwise-equivalent な Turing kernels と記述し、SM 7.5 実機での確認がないため既定では無効としていると説明しています。回答を変える数値経路はこのスイッチの対象外として別の opt-in に分けられています。[`DETAILS.md:1336-1346`](../../../../Niko1221/Strata/docs/DETAILS.md)
 
 ## 値と判定
 
-共通 helper は `std::getenv("STRATA_SM75_PERF")` の結果を `std::atoi(e) != 0` で判定し、結果を関数内の `static const bool` に保存します（`include/strata/core/sm75_series.hpp:24-31`）。文字列全体の妥当性は検査しません。
+`sm75_series()` は `std::getenv("STRATA_SM75_PERF")` を呼び、値が存在し、かつ `std::atoi(value) != 0` の場合だけ true にします。文字列全体の検証やエラー報告はありません。`atoi` は先頭の空白と符号を許容し、先頭の10進整数部分を変換するため、数値部分の後ろは判定されません。[`sm75_series.hpp:25-30`](../../../../Niko1221/Strata/engine/include/strata/core/sm75_series.hpp)
 
-| 値 | helper の結果 |
-|---|---|
-| 未設定 | `false` |
-| 空文字 | `false`（`atoi("")` は 0） |
-| 数値として 0 に変換される文字列（例 `0`, `junk`, `0x1`） | `false` |
-| 数値として 0 以外に変換される文字列（例 `1`, `-1`, `2`, `1junk`） | `true` |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `atoi(value) != 0` | 無効 | `1`, `2`, `-1`, `01`, `1tail`, ` 1` | 空文字, `0`, `0anything`, `true`, `false`, `nonnumeric` |
 
-`atoi` は先頭の空白と符号を許容し、先頭の数値部分を変換します。したがって `" 1x"` は有効、`"x1"` は無効です。値の判定はプロセス内で `sm75_series()` が最初に呼ばれた時に一度だけ行われ、その後の環境変更では更新されません。
+値の数値範囲を別途検証・clamp する処理はありません。既定値は unset 相当の false です。CLI 引数・設定ファイルによるこの値の上書きは見つかりません。なお、各カーネルには個別スイッチがあり、それが明示されるとシリーズ既定値を上書きするものがあります（次節）。[`sm75_series.hpp:25-30,36-43`](../../../../Niko1221/Strata/engine/include/strata/core/sm75_series.hpp)
 
 ## 有効になる条件
 
-- helper の GPU 判定が compute capability 7.5 であること。判定は `is_sm75()` から `cc_major_of()` / `cc_minor_of()` を通り、通常は GPU 属性を使います。`STRATA_EMULATE_CC=75` を設定したテスト経路では、実 GPU が別世代でも 7.5 として判定され得ます（`include/strata/core/sm75_series.hpp:33-37`, `include/strata/core/emulate.hpp:14-24`）。
-- CUDA の該当実装がビルドされ、その機能を使う実行経路に入ること。HIP ではこの Turing 系列は選択されず、たとえば `src/core/verify.cpp:276-280` の `device_is_sm75()` は HIP ビルドで常に `false` を返します。
-- 対応する個別スイッチが未設定であること。個別スイッチは系列の既定を上書きします。たとえば `STRATA_SM75_IL=0` は matvec table を無効化し、`STRATA_SM75_IL=1` は有効化します（`src/kernels/cuda/native_mmvq.cu:3056-3064`）。`STRATA_SM75_EXP` も同様に expert layout を個別制御します（`src/kernels/cuda/iq_kernels.cu:4182-4187`）。
-
-個別スイッチの形式は統一されていません。`sm75_switch()` を使うものは、対象 GPU が 7.5 である場合に限り、個別変数が設定されていれば `atoi(value) != 0`、未設定なら本変数の値を使います（`include/strata/core/sm75_series.hpp:39-44`）。一方、個別関数が本変数の既定値を参照する機能もあります。たとえば QSA の `STRATA_TOPK_SPLIT` は `=1` なら GPU 世代に関係なく有効、未設定時は本変数と 7.5 判定の両方が成立する場合だけ有効です（`src/kernels/cuda/qsa_select.cu:2246-2258`）。個別変数の条件があるため、本変数だけで全 GPU に一律のカーネル選択を強制するものではありません。
-
-数値の和順を変えるなど結果の数値に影響するオプションは、この系列スイッチに含まれず、それぞれ明示 opt-in のままです。例は `STRATA_SELECT_SIMT`、`STRATA_PA_V2T`、`STRATA_PF_FUSED_SM75`、`STRATA_BF16_TC` です（`include/strata/core/sm75_series.hpp:13-15`, `docs/DETAILS.md:2259-2261`）。
+- 対象は Strata の CUDA engine 経路です。調査した読み取りは `engine/include/strata/core/sm75_series.hpp` の helper に集約され、HIP の fused GR / verify 経路は明示的に false を返すか CUDA 用分岐から外れます。[`fused_gr.cu:1560-1565`](../../../../Niko1221/Strata/engine/src/kernels/cuda/fused_gr.cu)、[`verify.cpp:473-489,1835-1845`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
+- GPU の実効 compute capability が 7.5 であることが `sm75_default()` の条件です。`STRATA_EMULATE_CC=75` は実効値を 75 にし、CUDA 13 Volta compatibility proxy による 7.5→7.0 の remap も判定に反映されます。[`sm75_series.hpp:33-37`](../../../../Niko1221/Strata/engine/include/strata/core/sm75_series.hpp)、[`emulate.hpp:58-75`](../../../../Niko1221/Strata/engine/include/strata/core/emulate.hpp)
+- 対応カーネルがその実行経路で呼ばれ、対象の形状・量子化・モデル状態を満たす必要があります。例として GR up は `LR == 320` かつ token 数 3 以上、QSA decode attention v3 は `kv_mode == 1`、Q2_0 warp-row は `ncols <= 4` かつ複数列時に `g_multi_exact` を要求します。[`fused_gr.cu:1560-1562,1911-1919`](../../../../Niko1221/Strata/engine/src/kernels/cuda/fused_gr.cu)、[`qsa_decode_attn.cu:1093-1100,1331-1337`](../../../../Niko1221/Strata/engine/src/kernels/cuda/qsa_decode_attn.cu)、[`native_mmvq.cu:3428-3445`](../../../../Niko1221/Strata/engine/src/kernels/cuda/native_mmvq.cu)
+- 個別スイッチはシリーズ既定を上書きします。`STRATA_SM75_IL`、`STRATA_SM75_EXP`、`STRATA_TC_SM75` は unset ならシリーズ値を使い、set なら `atoi(value) != 0` で on/off を決めます。これらは SM 7.5 以外では helper が先に false を返します。[`sm75_series.hpp:39-44`](../../../../Niko1221/Strata/engine/include/strata/core/sm75_series.hpp)、[`tc_sm75.hpp:19-23`](../../../../Niko1221/Strata/engine/include/strata/core/tc_sm75.hpp)、[`native_mmvq.cu:4191-4214`](../../../../Niko1221/Strata/engine/src/kernels/cuda/native_mmvq.cu)、[`iq_kernels.cu:6795-6802`](../../../../Niko1221/Strata/engine/src/kernels/cuda/iq_kernels.cu)
+- `STRATA_GR_UP75` / `STRATA_GR_DOWN_TG`、`STRATA_SCORES_HALVE`、`STRATA_TOPK_SPLIT` / `STRATA_TOPK_SAMPLE`、`STRATA_ATTN_V3`、`STRATA_Q2_WARP`、`STRATA_FUSE_WAIT`、`STRATA_QIL`、`STRATA_PA_V1_PREFETCH`、`STRATA_SCORES_THREAD` も個別制御です。unset の場合にシリーズ既定を使う経路がありますが、明示値は各スイッチの規則に従います。すべてが SM 7.5 限定ではなく、たとえば `STRATA_SCORES_THREAD=1` は任意の CUDA card で有効にできるとコード資料に記載されています。[`DETAILS.md:1340-1346`](../../../../Niko1221/Strata/docs/DETAILS.md)、[`qsa_select.cu:2152-2176`](../../../../Niko1221/Strata/engine/src/kernels/cuda/qsa_select.cu)、[`fused_gr.cu:1558-1608`](../../../../Niko1221/Strata/engine/src/kernels/cuda/fused_gr.cu)
+- `STRATA_SELECT_SIMT`、`STRATA_PA_V2T`、`STRATA_PF_FUSED` と `STRATA_PF_FUSED_SM75`、`STRATA_PF_FUSED_Q2N`、`STRATA_BF16_TC` と `STRATA_XN_F16` は回答を変える別 opt-in であり、この変数だけでは有効になりません。[`DETAILS.md:1344-1346`](../../../../Niko1221/Strata/docs/DETAILS.md)
 
 ## 実行時の詳細
 
-この変数の読み取り自体は共通 header の helper に集約されています。`sm75_default()` は 7.5 判定と系列スイッチを組み合わせ、個別ゲートが未設定の場合の既定値を返します。呼び出し側の多くは GPU ごとに属性確認結果を cache します。別の呼び出し箇所では `sm75_switch()` を通じて、個別スイッチを優先し、未設定時だけ系列スイッチへ fallback します。
+環境値は `sm75_series()` が最初に呼ばれた時点で関数内 `static const bool` に保存され、以後の呼び出しでは再読込しません。したがって、プロセス起動後に環境値を変更してもこのプロセスのシリーズ判定には反映されません。GPU ごとの適用可否も複数の呼び出し側で device ordinal ごとに cache されます。個別スイッチの読み取り時期は各スイッチの実装に依存します。[`sm75_series.hpp:24-37`](../../../../Niko1221/Strata/engine/include/strata/core/sm75_series.hpp)、[`qsa_decode_attn.cu:475-488`](../../../../Niko1221/Strata/engine/src/kernels/cuda/qsa_decode_attn.cu)、[`verify.cpp:477-487`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
 
-コード上の適用箇所は次の通りです。
+シリーズ判定はカーネル選択条件として使われます。たとえば GR up は専用スイッチが unset の場合にシリーズ判定を参照し、条件成立時に `gr_up75_kernel` 群へ分岐します。QSA top-k の split kernel は対象 GPU 判定に加えて old-kernel 無効、decode 状態、minimum `max_blocks`、capacity と selection-width の条件が必要です。[`fused_gr.cu:1560-1578,1911-1920`](../../../../Niko1221/Strata/engine/src/kernels/cuda/fused_gr.cu)、[`qsa_select.cu:2761-2774,3032-3040`](../../../../Niko1221/Strata/engine/src/kernels/cuda/qsa_select.cu)
 
-- `src/core/verify.cpp:275-290`: CUDA の Turing 判定を cache し、decode wait 融合の既定条件に使います。
-- `src/kernels/cuda/fused_gr.cu:1190-1206,1208-1230`: hyper-connection up カーネルと、条件を満たす token 数（4 または 6）の staged down カーネルを選びます。
-- `src/kernels/cuda/native_mmvq.cu:2476-2490,3056-3088`: Q2_0 warp rows と interleaved matvec table の既定選択に使います。
-- `src/kernels/cuda/qsa_select.cu:1676-1707,2246-2258,2476-2492`: QSA scorer、decode selection、prompt top-k の個別選択既定に使います。
-- `src/kernels/cuda/qsa_decode_attn.cu:437-450`: decode attention v3 を選びます。
-- `src/kernels/cuda/qsa_prompt_attn.cu:2324-2332`: Turing の prompt attention v1 経路で prefetch 版を選ぶ既定に使います。
-- `src/kernels/cuda/iq_kernels.cu:4182-4204`: Turing expert layout mode 4 を選びます。大きい group 数の down projection では CUDA layout に戻します。
-- `include/strata/core/tc_sm75.hpp:19-23` と `src/kernels/cuda/dequant_bf16.cu:378-389`: BF16 dequant の vector-store 版を個別スイッチ `STRATA_TC_SM75` の既定として選ぶ経路があります。出力アラインメントと row stride の条件も満たす必要があります。
+CLI やサーバーの起動引数からこの値を読み直す処理、子プロセス向けに値を加工・転送する処理は、候補名の全参照検索では確認できません。Strata が値を読んだ箇所に、この変数専用のログ、警告、終了処理はありません。別のカーネル起動失敗処理はありますが、この環境変数の無効値をエラーにするものではありません。[`sm75_series.hpp:24-44`](../../../../Niko1221/Strata/engine/include/strata/core/sm75_series.hpp)
 
-環境変数に関する stdout/stderr ログや、無効値の警告はこれらの読み取り経路にはありません。各機能の実際の起動条件（形状、アラインメント、個別フラグなど）を満たさなければ、変数が有効でも Turing 版は呼ばれません。
+## ログと測定値
+
+この変数自体について値の採用・無効値・fallback を表示するログはありません。`docs/DETAILS.md` は Turing 向け kernels が置換前と bitwise equal であると説明し、SM 7.5 実機で未確認のため opt-in としています。新しい性能測定は行っていません。[`DETAILS.md:1336-1346`](../../../../Niko1221/Strata/docs/DETAILS.md)
 
 ## 根拠
 
-- 共通の読み取り、`atoi` 判定、static cache、デバイス世代の絞り込み: `include/strata/core/sm75_series.hpp:24-44`。
-- 世代エミュレーション: `include/strata/core/emulate.hpp:14-24`。
-- Turing 系列の対象機能と、数値変更オプションの除外: `docs/DETAILS.md:2244-2261`。同資料は RTX 2080 Ti で測定された性能として decode +5〜6%、prompt 最大 +30% を記していますが、この文書ではコードから測定を再確認していません。
-- 上記の実装箇所: `src/core/verify.cpp:275-290`, `src/kernels/cuda/fused_gr.cu:1190-1230`, `src/kernels/cuda/native_mmvq.cu:2476-2490,3056-3088`, `src/kernels/cuda/qsa_select.cu:1676-1707,2246-2258,2476-2492`, `src/kernels/cuda/qsa_decode_attn.cu:437-450`, `src/kernels/cuda/qsa_prompt_attn.cu:2324-2332`, `src/kernels/cuda/iq_kernels.cu:4182-4204`, `include/strata/core/tc_sm75.hpp:19-23`, `src/kernels/cuda/dequant_bf16.cu:378-389`。
+- 読み取り・変換・cache・GPU 判定: `engine/include/strata/core/sm75_series.hpp:24-44`
+- 実効 compute capability と emulation: `engine/include/strata/core/emulate.hpp:58-75`
+- fused GR: `engine/src/kernels/cuda/fused_gr.cu:1558-1608,1839-1847,1911-1920`
+- QSA attention と selection: `engine/src/kernels/cuda/qsa_decode_attn.cu:475-488,1093-1100,1331-1337`; `engine/src/kernels/cuda/qsa_select.cu:2152-2192,2202-2214,2261-2271,2761-2774,2997-3013,3032-3040,3082-3098`
+- MMVQ / expert layout / BF16 dequant: `engine/src/kernels/cuda/native_mmvq.cu:3403-3416,3428-3445,4191-4214`; `engine/src/kernels/cuda/iq_kernels.cu:6795-6816`; `engine/include/strata/core/tc_sm75.hpp:19-23`; `engine/src/kernels/cuda/dequant_bf16.cu:441-452`
+- verify quantization: `engine/src/core/verify.cpp:472-489,1832-1846`
+- 設計資料との照合: `docs/DETAILS.md:1336-1346`

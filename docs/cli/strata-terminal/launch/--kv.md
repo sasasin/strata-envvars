@@ -1,6 +1,6 @@
-# `strata launch --kv`
+# `--kv`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,53 +8,70 @@
 | コマンド | `strata launch` |
 | オプション | `--kv FORMAT` |
 | 別名 | なし |
-| Launch parser の値 | `int8`、`q4_0`、`k8v4`、`fp16`（大文字小文字を区別しない） |
+| 値 | `int8`、`q4_0`、`k8v4`、`fp16`、`fp8`、`k8v8` |
 
 ## 役割
 
-会話履歴を保持する KV cache の形式を起動設定に指定します。選んだ値は対応する非 macOS 経路でセットアップへ渡され、生成される engine 引数に反映されます。エンジン側では `fp16`、`int8`、Hadamard 回転後の `q4_0`、INT8 K と Q4_0 V の混合形式 `k8v4` を切り替えます。
+会話履歴を保持する K/V cache の形式を指定する。設定は選択したモデル family の setup 処理またはエンジン引数へ渡るため、同じ値でも適用可能な形式、未指定時の形式、利用メモリは family と backend によって異なる。
 
 ## 使い方
 
 ```sh
-strata launch --model iq3_xxs --context 128k --kv q4_0 --no-tui
+strata launch --model iq3_xxs --context 128k --kv q4_0
 ```
 
-`--kv` は `strata launch` のモデル起動設定です。ネイティブ engine のトップレベル `--kv` とは別の parser スコープですが、選択値は engine 用設定へ渡されます。
+モデルを指定せず preset の設定を上書きする場合:
+
+```sh
+strata launch --preset "IQ3_XXS 128K" --kv q4_0
+```
 
 ## 値と既定値
 
-- Launch parser は `int8`、`q4_0`、`k8v4`、`fp16` を受け付けます。値は前後の空白を除去して小文字化してから照合します。ほかの値は argparse の型変換エラーとなり、候補一覧（該当時は近い値の提案も）を含む usage エラーになります。
-- ただし、非 macOS のセットアップ parser が `--kv` に許可する値は `int8`、`q4_0`、`k8v4` のみです。Launch が受理する `fp16` を明示すると、通常の setup 経路では値が委譲された後に `setup.py` が拒否します。既定の `fp16` は `--kv` を省略して選ぶためこの不一致を通りません。
-- `--kv` を省略した場合、LaunchSettings では未指定（`None`）のまま扱われます。Launch の設定表示・比較とセットアップ側の規則では、context が 8,192 token 以下なら `fp16`、それを超える場合は `int8` が選ばれます。したがって Launch オプションの help にある `int8 (default)` は全 context に一律の既定値を意味しません。
-- この境界と選択値は `setup.py` にも実装されています。8,192 以下は `fp16`、それを超える場合は `--kv` 指定値または `int8` です。
+`--kv` は値を1つ取る。値は前後の空白を除去して小文字化した後に検証されるため、大文字小文字は区別されない。値を省略した場合は `LaunchSettings.kv` が `None` のままになり、選択した family の既定処理に委ねられる。`strata launch` 自体で一律の既定形式を固定してはいない。
+
+| 値 | 受理と適用 |
+| --- | --- |
+| `int8`、`q4_0`、`k8v4`、`fp16`、`fp8`、`k8v8` | `strata launch` parser が受理する値。実際に使われる形式は下記の family/backend 条件に従う。 |
+| 未指定 | preset に同じ設定があればその値を使い、なければ family の既定処理に委ねる。 |
+| その他の値 | parser が拒否し、選択可能な値を示す引数エラーになる。 |
 
 ## 実行時の動作
 
-- parser が受け取った値は `settings_from_args` で起動設定 `s.kv` に設定されます。既存 preset にほかの起動フラグを重ねる場合も、この指定が今回の起動設定に反映されます。
-- 非 macOS の通常セットアップでは、値がある場合 `Runner.setup_args()` が `setup.py` に `--kv VALUE` を渡します。`setup.py` は context と値から engine の `--kv` を組み立てます。既存設定との比較・表示では、明示した形式も考慮されます。
-- `--save-preset` も指定した場合、起動設定一式が preset として保存されるため、選択した `kv` も保存対象です。preset 起動に一時的な起動フラグを追加しただけなら、明示的な保存をしない限り preset 自体は更新されません。
-- macOS では Launch runner が setup に渡す引数を絞り込む際 `--kv` を除外します。したがって、macOS のこの経路では CLI が値を受理しても setup には反映されず、指定値が有効だとは確認できません。
-- ネイティブ engine は `--kv` を読み取り、`fp16` / `int8` / `q4_0` / `k8v4` に応じて QSA KV の各モード設定を切り替えます。`q4` は engine 側では `q4_0` に正規化されますが、Launch parser は `q4` を受理しません。
+`--preset` を指定すると保存済み設定を読み込み、明示した `--kv` があればその値で上書きする。値は起動設定に入り、モデルに応じて setup 用引数、または生成するエンジン設定へ反映される。通常の Flash-Next 系 setup は、context が 8K を超える場合は `int8`、それ以外は `fp16` を基本とし、明示値があればそれを優先する。setup は低 VRAM 条件でも `int8` を選ぶ。`strata launch` から setup を呼ぶ経路では `--yes` が渡るため、setup の対話式 KV 選択は行わない。（`terminal/strata_cli/launch/cmd.py:215-250`、`terminal/strata_cli/launch/settings.py:122-135`、`terminal/strata_cli/launch/runner.py:323-354,1358-1374`、`terminal/setup.py:12189-12203`）
+
+転送後の扱いは family によって異なる。
+
+| モデル / backend | 適用される動作 |
+| --- | --- |
+| Flash-Next 系 | setup の `--kv` が受け取る形式は同じ6種類。未指定時は context と GPU 条件に基づく既定値を使う。8K 超で対話 setup を直接実行する場合は選択画面があるが、`strata launch` の setup 呼び出しは `--yes` を付ける。 |
+| Qwen3.6 | setup は `fp32`、`fp16`、`fp8`、`fp4` を使う。Terminal parser が受理するうち `fp16` と `fp8` は転送される。`int8`、`q4_0`、`k8v4`、`k8v8` は Flash-Next 用形式として警告され、Qwen3.6 の既定 `fp32` に戻る。 |
+| Hy4-Flash | `strata launch` は native `.strata` family への setup 引数として `--kv` を渡さず、設定プレビューでも native engine 分岐で K/V 値を追加しない。したがって、このコマンド経由では指定値は適用されない。setup.py を直接呼ぶ場合は Flash-Next 用設定として無視する旨の警告が出る。 |
+| Inkling-2-Mini / CUDA | `fp16`、`fp8`、`k8v8`、`k8v4` をエンジンへ渡す。`int8` と `q4_0` は Inkling の形式ではないため、警告して engine の既定動作に委ねる。 |
+| Inkling-2-Mini / HIP・Metal・SYCL | `fp16`、`fp8` を渡す。`k8v4` と `k8v8` は backend がサポートしないため、警告して `fp8` に置き換える。`int8` と `q4_0` は Inkling の形式ではないため、警告して engine の既定動作に委ねる。 |
+
+Inkling engine は K/V dtype を自動選択する設定が既定で、`--parallel` が16以上なら、形式を明示していない場合に `fp8` を選ぶ。明示した対応形式は自動選択を無効にする。K/V 形式は slot ごとの cache 割り当てに影響し、Inkling engine は要求された slot 数について K/V cache を割り当てる。（`terminal/strata_cli/launch/settings.py:38-73`、`terminal/strata_cli/launch/runner.py:329-347,760-785,1363-1374,2219-2223`、`engine/src/inkling2/ink_backend.h:33-34`、`engine/src/inkling2/ink_main.cpp:882-892,1021-1024`、`engine/src/inkling2/ink_batch.h:16-20,33-36`、`engine/src/inkling2/ink_serve.h:541-546`）
 
 ## 適用条件と副作用
 
-- 実際に起動するモデル・engine が対象形式を使うかはモデルや engine 実装に依存します。今回確認した Launch 側は値をセットアップへ渡し、ネイティブ engine は QSA KV mode を切り替えるところまでです。全モデル・全 backend で各形式が使用されることは、この調査では網羅していません。
-- セットアップでモデル用設定を生成または更新する起動に作用します。別環境向けに生成済みの設定を単にそのまま使う経路、または macOS の引数フィルター経路での具体的な反映は同一ではありません。
-- 明示した形式は context の自動選択より優先します。`setup.py` には、小さいカード向け調整時に context や KV 形式を変更し得る計画処理がありますが、明示した `--kv` を固定条件として渡しています。実機での適合性や性能・品質への影響は測定していません。
+K/V 形式によって cache のメモリ量が変わる。Inkling の実装上、1 token あたりの Global K/V cache は `fp16` が32 KiB、`fp8` が16 KiB、`k8v8` が16.5 KiB、`k8v4` が12.75 KiB。これらの割り当てはモデル起動時に発生する。数値は Inkling engine の実装値であり、他 family にそのまま当てはまるとは限らない。（`engine/src/inkling2/ink_batch.h:16-20,147-149`）
+
+`--kv` 自体がファイルを作成・削除する処理は確認できない。起動時には launch の実行設定が private config として保存されるため、その設定に選択値が含まれる。`--save-preset` を併用した場合は起動成功後に設定を preset として保存する。（`terminal/strata_cli/launch/runner.py:2234-2238`、`terminal/strata_cli/launch/cmd.py:952-964`）
 
 ## 出力とエラー
 
-- Launch 側で許可されない値を指定すると、`argparse.ArgumentTypeError` により使用法と不正値の説明を出して失敗します（通常の argparse 終了コードは 2）。
-- Launch parser を通った `--kv fp16` も、非 macOS で setup.py を実行する経路では setup 側の `choices` に含まれず、setup の usage error（終了コード 2）になります。Launch は setup の失敗を起動失敗として扱います。
-- engine に不正な `--kv` が届いた場合は stderr に `strata generate: --kv must be fp16, int8, q4_0 or k8v4` を出して終了コード 2 を返します。Launch が許可する4値は、この engine の検証値と一致します。
+- 6種類以外の値は parser の型変換で拒否され、選択可能な値を含むエラーになる。未登録のオプション名は `strata launch` の未知オプションとして標準エラーに表示され、終了コード `2` で終了する。（`terminal/strata_cli/launch/cmd.py:35-43,186-201`、`terminal/strata_cli/cli.py:2325-2334`）
+- Inkling でサポートされない形式や backend 非対応形式を指定すると、launch の設定処理が標準の警告として通知する。前者は engine の既定動作を使い、後者は `fp8` へ置換する。（`terminal/strata_cli/launch/settings.py:61-74`、`terminal/strata_cli/launch/runner.py:2219-2223`）
+- Inkling engine 自身に渡る不正な `--kv` 値は標準エラーへ許容値を表示し、終了コード `2` で終了する。ただし Terminal の `strata launch` parser が受理する6値のうち Inkling 非対応の値は、Terminal が事前に除外して警告するため、この engine エラー経路には渡らない。（`engine/src/inkling2/ink_main.cpp:882-892`）
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:37-45,95,224-227` — 選択値の正規化・検証、parser 定義、CLI 値から設定への反映。
-- `strata_cli/launch/settings.py:31,78-91,272-288` — 選択肢、未指定値、設定表示における値の扱い。
-- `strata_cli/launch/runner.py:223-230,264-293` — 既存 config と設定値の比較、KV 値の設定反映。
-- `strata_cli/launch/runner.py:727-736,760-774,948-959,997-1012` — setup 起動時の引数転送、macOS での除外、setup.py の呼び出しと非ゼロ終了時の失敗処理。
-- `setup.py:8436-8438,9096-9107,9418-9425` — setup parser の許容値（Launch が受け付ける `fp16` は含まない）、context 別既定値、engine 引数生成。
-- `src/program/generate.cpp:486-487,2478-2483,3186-3204` — engine の既定値、parser、値検証、KV mode の設定。
-- `strata_cli/launch/store.py:75-85`、`strata_cli/launch/cmd.py:788-793` — preset 保存と起動時の明示的な保存処理。
+- `terminal/strata_cli/launch/cmd.py:35-43,73-93` — `--kv` の parser、値変換、選択肢。
+- `terminal/strata_cli/launch/cmd.py:215-250` — preset 読み込みと CLI 値の上書き。
+- `terminal/strata_cli/launch/settings.py:38-73,122-135` — 共通値、Inkling backend ごとの対応値、未指定状態と警告文。
+- `terminal/strata_cli/launch/runner.py:323-354,760-785,1358-1374,2219-2238` — family 別の反映、Inkling の警告、設定ファイル保存。
+- `terminal/setup.py:9911-9913,10328-10329,12189-12203` — Qwen3.6 / Hy4 の扱い、Flash-Next 系の既定値と対話選択。
+- `engine/src/inkling2/ink_main.cpp:882-892,1021-1024` — Inkling engine の受理形式と `--parallel` に応じた自動選択。
+- `engine/src/inkling2/ink_batch.h:16-20,33-36,147-149`、`engine/src/inkling2/ink_serve.h:541-546` — Inkling の各形式の cache サイズ、backend 対応範囲、slot 割り当て。
+
+調査範囲は上記の Terminal parser、launch の設定・転送経路、参照される setup と Inkling engine の処理。各 GPU driver の実際の割り当て量や実行性能は測定していない。

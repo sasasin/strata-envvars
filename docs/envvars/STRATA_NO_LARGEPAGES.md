@@ -1,46 +1,51 @@
 # `STRATA_NO_LARGEPAGES`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリ・ドライバーの動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`PinnedArena` の確保時に、大ページ用の割り当てを試さず通常の匿名メモリへ進ませるための切替です。Windows では `VirtualAlloc(MEM_LARGE_PAGES)`、Linux では `mmap(MAP_HUGETLB | MAP_HUGE_2MB)` を飛ばします。Linux では通常ページへのフォールバック時に Strata が呼ぶ `madvise(MADV_HUGEPAGE)` も抑止します。
+expert arena の確保時に、大ページの利用を試さないためのスイッチ。値の内容ではなく環境変数が設定されているかを見ている。Windows では `MEM_LARGE_PAGES` の `VirtualAlloc` を省略し、通常ページの `VirtualAlloc` に進む。Linux では `MAP_HUGETLB | MAP_HUGE_2MB` の `mmap` を省略し、通常の匿名 mapping に進む。また Linux では通常 mapping への明示的な `MADV_HUGEPAGE` も要求しない。expert arena の内容やサイズを切り替える設定ではない（`engine/src/core/pinned.cu:284-316,458-471,486-553`、SYCL 実装 `engine/sycl/src/core/pinned.dp.cpp:92-117,207-277`）。
 
-通常の `strata generate` では `--mmap-experts` を使わず `ArenaExpertSource` を開く経路が対象です。CUDA 実装では `PinnedArena` の予約後に GPU 用 host registration を試みますが、この変数はその登録の有無や登録量を直接変更するものではありません。SYCL 実装では既存メモリの登録箇所が変換時の no-op になっています。確保状況の注記は `strata generate: expert arena: ...` として stderr に出力されます。
+CUDA/HIP 系の `pinned.cu` 内 `reserve` と SYCL 系の同名処理で参照される。Linux の `ArenaExpertSource::open` は、RAM 不足時に hugetlb pool 全体を見込んで続行できるかの判定でもこの変数を参照する（`engine/src/core/expert_source.cpp:6621-6635`）。
 
 ## 値と判定
 
-数値や文字列の parse はせず、`std::getenv("STRATA_NO_LARGEPAGES") != nullptr` かどうかだけで判定します。従って `1` だけでなく、空文字、`0`、`false` を含む、設定されているすべての値が大ページ経路を無効にします。
+文字列の parse、数値変換、空白除去、大文字小文字変換はない。各箇所は `std::getenv(...) != nullptr` で設定の有無を判定する。そのため空文字を含む任意の値が設定済み扱いになる。未設定なら通常の大ページ試行経路に進むが、実際に大ページになるかは OS の確保結果などに依存する（`engine/src/core/pinned.cu:290,309,462,525,534,547`、`engine/sycl/src/core/pinned.dp.cpp:93,110,209,264,271`）。
 
-| 値 | 動作 |
-|---|---|
-| 未設定 | OS ごとの大ページ割り当てを試す。失敗時は通常メモリへ fallback する。 |
-| 空文字を含む任意の設定値 | 大ページ割り当てを試さず、通常メモリへ進む。 |
+| 条件 | unset | 設定ありの例（大ページ試行を抑制） | 値の内容にかかわらず同じ扱いの例 |
+|---|---|---|---|
+| Windows、CUDA/HIP または SYCL の pinned arena | 大ページ最小値があれば `MEM_LARGE_PAGES` を試す | `1` | 空文字、`0`、`true`、`false`、`0anything` |
+| Linux、CUDA/HIP または SYCL の pinned arena | `MAP_HUGETLB` を試し、通常 mapping では条件を満たせば `MADV_HUGEPAGE` を要求 | `1` | 空文字、`0`、`true`、`false`、`0anything` |
 
-判定は `reserve()` の呼び出し中に行われ、static cache されません。したがって後から環境を変更した場合、その後に行われる予約では新しい設定が参照されます。既に確保済みの領域は変更されません。
+CLI 引数や別環境変数がこの値を書き換える処理はない。`STRATA_ARENA_THP` が設定されていても、`STRATA_NO_LARGEPAGES` が設定済みなら Linux の `MADV_HUGEPAGE` 分岐には入らない（`engine/src/core/pinned.cu:522-552`、`engine/sycl/src/core/pinned.dp.cpp:260-276`）。
 
 ## 有効になる条件
 
-- `PinnedArena` が匿名メモリを予約する経路で有効です。Windows では共有ファイル backing は未実装です。Linux では `shared_file` が指定されると `MAP_SHARED` の処理が先に return するため、この変数はその予約に影響しません。
-- `strata generate --mmap-experts` は `ArenaExpertSource` ではなくファイル tier を使うため、この大ページ切替の対象となる expert arena を作りません。
-- Linux で別変数 `STRATA_NO_ARENA_THP` だけを設定した場合、hugetlb の試行は残り、失敗後の `MADV_HUGEPAGE` 要求だけが抑止されます。`STRATA_NO_LARGEPAGES` が設定されている場合は、両方の処理が抑止されます。
-- Linux のシステム設定が THP を `always` にしている場合、カーネルは `MADV_HUGEPAGE` の明示要求なしでも通常の匿名 mapping を透過的大ページで backing する可能性があります。この環境変数はシステム全体の THP 設定を変更しません。
+- Strata が expert arena を process-private な pinned arena として確保する経路で有効。環境変数を確認するのは arena 確保時で、プロセス起動時に値を static cache する実装ではない。reserve 中も複数回 `getenv` を呼ぶ（`engine/src/core/pinned.cu:159-161,290-316,458-553`、`engine/sycl/src/core/pinned.dp.cpp:63-65,93-117,207-277`）。
+- Windows では `GetLargePageMinimum()` が 0 なら、未設定でも大ページ試行は行われない。変数が設定されていれば最小値が正でも大ページを飛ばす（`engine/src/core/pinned.cu:283-315`、`engine/sycl/src/core/pinned.dp.cpp:91-117`）。
+- Linux では変数が未設定のときに hugetlb mapping を試す。試行失敗時は通常 anonymous mapping に進み、通常 mapping ができた後の `MADV_HUGEPAGE` は `STRATA_NO_ARENA_THP`、THP の `always` 状態、空き huge block の確認などにも左右される（`engine/src/core/pinned.cu:466-553`、`engine/sycl/src/core/pinned.dp.cpp:212-277`）。
+- Linux の `STRATA_NUMA_ARENA` による配置が利用可能な場合は、通常 mapping に `MADV_NOHUGEPAGE` を適用する経路がある。この分岐は `STRATA_NO_LARGEPAGES` の設定とは独立している（`engine/src/core/pinned.cu:461-502`）。Windows の配置可能な NUMA arena も通常ページを使う（`engine/src/core/pinned.cu:289-310`）。
+- shared arena file を使う場合、`reserve` は大ページ選択より先に shared-file mapping を処理するため、この変数による大ページ判定を通らない。Linux の `STRATA_ARENA_MMAP=1` で既存 `experts.bin` を read-only mapping する経路も、`PinnedArena` を作らず先に return する（`engine/src/core/pinned.cu:318-320,444-455`、`engine/sycl/src/core/pinned.dp.cpp:119-121,193-204`、`engine/src/core/expert_source.cpp:6490-6521,6755-6759`）。
+- Linux の RAM 不足判定では、設定済みなら hugetlb pool の空き量を 0 として扱う。これは大ページ試行をしないことを RAM 判定にも反映するためで、arena の backing を直接変更する分岐とは別の読み取りである（`engine/src/core/expert_source.cpp:6621-6635`）。
 
 ## 実行時の詳細
 
-Windows では、変数の判定前に `SeLockMemoryPrivilege` を process token で有効化しようとします。その後、未設定かつ `GetLargePageMinimum() > 0` のときに限り、サイズを大ページ単位へ切り上げて `VirtualAlloc(..., MEM_LARGE_PAGES, ...)` を試します。変数が設定されていればその割り当て試行を飛ばし、注記を `large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages` として通常の `VirtualAlloc` を使います。未設定でも大ページ割り当てに失敗した場合は、失敗サイズと Windows エラー番号を注記して通常ページへ fallback します。
+CUDA/HIP 系では `PinnedArena` の通常、ByNeed、Deferred constructor が `reserve` を呼ぶ。SYCL 系では Deferred constructor が同じ役割の `reserve` を呼ぶ。どちらも値を parse せず、各 `reserve` 呼び出し内で設定有無を確認する。通常の pinned arena 経路では未設定ならまず OS の大ページ確保を試し、失敗すれば 4 KB pages と記した note を作って通常ページで確保する。設定済みなら大ページ確保を試さず通常ページ確保へ進む。設定は arena の backing 選択に関するもので、確保失敗時には通常の arena 予約失敗経路が残る（`engine/src/core/pinned.cu:290-316,458-492,1030-1035,1177-1191,1274-1292`、`engine/sycl/src/core/pinned.dp.cpp:92-117,207-245,519-527`）。
 
-Linux では変数が未設定なら、まず `MAP_HUGETLB | MAP_HUGE_2MB` による anonymous mapping を試します。成功すれば 2 MiB hugetlb pages を使います。失敗時、または変数が設定済みの場合は、2 MiB 境界に揃えた通常の anonymous mapping へ進みます。変数が未設定なら、THP の現在設定と `STRATA_NO_ARENA_THP` を調べて必要に応じて `MADV_HUGEPAGE` を呼びます。変数が設定済みならこの要求も呼びません。変数設定時の注記は `large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages` です。ただし THP `always` の場合、この注記はカーネルが実際に使う backing page size を保証しません。
+Linux では大ページ試行が失敗して通常 mapping へ進んだ場合、変数が unset なら条件に応じて `MADV_HUGEPAGE` を要求する。設定済みならその要求分岐もスキップする。ただし `STRATA_NUMA_ARENA` の適用経路では `MADV_NOHUGEPAGE` が実行される。ここで記述しているのは Strata が行う system call の選択であり、その後の OS のページ backing の状態を保証するものではない（`engine/src/core/pinned.cu:486-553`、`engine/sycl/src/core/pinned.dp.cpp:232-277`）。
 
-確保に成功した後は、通常の `PinnedArena` 初期化が CUDA の host registration などへ進みます。`STRATA_NO_LARGEPAGES` 自体はログ以外の診断出力、終了、性能保証を行いません。`docs/DETAILS.md` は Windows で大ページに `SeLockMemoryPrivilege` が必要なことを説明していますが、この変数による性能値の比較や保証は記載していません。
+Linux の RAM 判定で `STRATA_NO_LARGEPAGES` が設定済みだと hugetlb pool を空として扱うため、hugetlb pool を根拠にした file-cache arena の続行判定には使われない。この判定を含む別条件が成立して警告になる場合は、`generate` が `strata generate: WARNING: ...` と stderr に出す。arena note は `strata generate: expert arena: ...` と stderr に出力される（`engine/src/core/expert_source.cpp:6621-6645`、`engine/src/program/generate.cpp:8934-8936`）。通常ページ確保自体が失敗した場合、呼び出し側は note を付けて arena 予約失敗を返す（`engine/src/core/expert_source.cpp:6755-6766`）。
+
+## ログと測定値
+
+大ページをスキップした場合、arena note は `large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages` になる。Windows では `STRATA_NUMA_ARENA` が配置を選んだ場合はその理由が優先され、`large pages skipped (STRATA_NUMA_ARENA=1); using 4 KB pages` となる。Linux ではこの note が `strata generate: expert arena: ...` として stderr に出る。Windows/SYCL の note 文字列も `reserve` で設定されるが、一般の note 出力箇所は `generate.cpp` にある（`engine/src/core/pinned.cu:307-312,462-465`、`engine/sycl/src/core/pinned.dp.cpp:110-113,209-211`、`engine/src/program/generate.cpp:8934-8936`）。
+
+未設定時に Windows の大ページ確保が失敗すると、`large pages refused for ...; using 4 KB pages` の note になる。Linux で hugetlb 確保が失敗すると、必要な 2 MiB page 数と `vm.nr_hugepages` を含む `MAP_HUGETLB unavailable (...); using 4 KB pages` の note になる（`engine/src/core/pinned.cu:302-306,473-484`、`engine/sycl/src/core/pinned.dp.cpp:105-109,219-230`）。`docs/DETAILS.md:168-179` は Windows の large pages に権限が必要なことと起動ログで拒否を確認する手順を説明するが、`STRATA_NO_LARGEPAGES` 自体の説明や同変数を使った性能測定値は記載していない。
 
 ## 根拠
 
-- `src/core/pinned.cu:59-113`: Windows の token privilege 処理、大ページ判定、設定時の skip、通常ページ fallback。
-- `src/core/pinned.cu:114-201`: Linux shared-file mapping が環境変数の判定より先に return する経路。
-- `src/core/pinned.cu:203-270`: Linux hugetlb 試行、通常 mapping、THP 要求と `STRATA_NO_ARENA_THP` の相互作用。
-- `sycl/src/core/pinned.dp.cpp:60-113,114-202,204-271`: SYCL 実装にある対応する分岐。
-- `src/core/pinned.cu:354-379`: arena 予約後の CUDA host registration。`sycl/src/core/pinned.dp.cpp:360-390,524-548` は同じ予約後の SYCL 実装と、登録箇所が no-op であることを示す。
-- `src/core/expert_source.cpp:3446-3450`: `FileExpertSource` が通常または deferred の `PinnedArena` を作成する箇所。
-- `src/program/generate.cpp:4620-4637,4700-4726`: `--mmap-experts` の file tier と通常の `ArenaExpertSource` 経路、および arena 注記の stderr 出力。
-- `docs/DETAILS.md:515-524`: Windows の起動条件と大ページ権限についての説明。`STRATA_NO_LARGEPAGES` の固有説明や比較測定はない。
+- 候補一覧の名前だけでなく、実際の読み取り箇所を全参照検索で確認。CUDA/HIP 系と Linux RAM 判定: `engine/src/core/pinned.cu:290,309,462,525,534,547`、`engine/src/core/expert_source.cpp:6634`。
+- SYCL 系の Windows/Linux 分岐と THP request 抑制: `engine/sycl/src/core/pinned.dp.cpp:93,110,209,264,271`。
+- arena 確保からの呼び出しと失敗経路: `engine/src/core/expert_source.cpp:6755-6766`。
+- note の stderr 出力: `engine/src/program/generate.cpp:8934-8936`。
+- 設計資料との照合: `docs/DETAILS.md:168-179`。

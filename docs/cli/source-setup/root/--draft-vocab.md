@@ -1,75 +1,65 @@
 # `--draft-vocab`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、更新 wrapper からも委譲） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat`（root） |
 | オプション | `--draft-vocab` |
 | 別名 | なし |
-| 値 | `cjk`、`en`、`cyrillic`、`fr` のいずれか |
+| 値 | `cjk`、`en`、`cyrillic`、`fr`、`latin`、`arabic` のいずれか |
 
 ## 役割
 
-MTP draft layer が参照する語彙部分集合を選びます。選択値に対応する同梱ファイルを MTP runtime の `draft_vocab.bin` として配置し、通常の setup 経路ではモデル設定 `draft_vocab` に保存します。これは draft head が提案できる token の集合を選ぶ設定で、メインモデルの tokenizer を変更するオプションではありません。エンジンは MTP の draft head を bind するときにこのファイルを読みます（`src/core/mtp.cpp:692-706`、`include/strata/core/mtp.hpp:220-221`）。
+MTP draft layer と DFlash2 が使う draft vocabulary の subset を選びます。setup は選択値をモデル設定に記録し、取得済みの MTP または DFlash2 の vocab ファイルを選択に合わせて配置・更新します（`terminal/setup.py:8711-8712, 12496-12502`、`terminal/strata_control/setup_config.py:535-536`）。
 
 ## 使い方
 
-Linux の例:
+Linux の Strata checkout で、例えば次のようにモデル設定時に指定します。`--no-start` は設定後のモデル起動を抑止します。
 
 ```sh
-./setup.sh --draft-vocab en
+./setup.sh --model IQ3_S --draft-vocab en --no-start
 ```
 
-Windows では `START-HERE.bat --draft-vocab cyrillic` のように指定できます。既存モデルを起動する際にも `./setup.sh --draft-vocab fr` の形で渡すと、そのモデルの設定に選択を保存してから起動します。各 wrapper は引数を `setup.py` に渡します（`setup.sh:9-12,76`、`START-HERE.bat:44-54`）。
+`setup.sh` は `terminal/setup.py` を起動する入口です。Windows では同じ root parser の入口として `START-HERE.bat` があります（`terminal/setup.py:4-5`）。
 
 ## 値と既定値
 
-- `cjk`: 中国語・日本語・韓国語を含む部分集合。対応元ファイルは `data/draft_vocab.bin`。
-- `en`: 英語とコード向け。対応元ファイルは `data/draft_vocab_en.bin`。
-- `cyrillic`: 英語・コードとキリル文字を含む部分集合。対応元ファイルは `data/draft_vocab_cyrillic.bin`。
-- `fr`: 英語・コードとフランス語向け token を含む部分集合。対応元ファイルは `data/draft_vocab_fr.bin`。
+parser は `choices=list(DRAFT_VOCABS)` で6つの値を許可し、オプション自体の既定値は指定していません（`None`）。選択値と対応ファイルは `terminal/setup.py:8711-8712, 11555-11563` に定義されています。`cjk` は `draft_vocab.bin`、それ以外は各名前に対応する `draft_vocab_<name>.bin` です。
 
-parser は `choices=list(DRAFT_VOCABS)` を指定し、明示的な `default` は設定していません。そのため引数値は未指定時 `None` です。通常の Qwen setup 経路では未指定なら同モデルの既存設定値を読み、設定がなければ実効値 `cjk` を使います（`setup.py:6885-6896,8518-8522,9394-9398`）。初回インストールの `cjk` はこの実効 fallback です。
+この parser の help 文は `cjk`、`en`、`cyrillic`、`fr`、`latin` の説明を記しますが、`arabic` は文面に列挙していません。それでも `DRAFT_VOCABS` に含まれるため parser は受理します（`terminal/setup.py:8711-8712, 11555-11563`）。ファイル内容自体の token 一覧はこの調査では検査していません。
 
-値の検査は `argparse` の choices によります。列挙外の値は parser で拒否されます。空文字も有効な choice ではありません。重複指定時の特別処理はなく、通常の `argparse` の格納動作に従い最後に parse された値が使われます（parser 定義: `setup.py:8518-8522`）。
-
-同 revision の `python3 setup.py --help` でも4値を確認しました。help の性能・VRAM目安（例: `en` は約110 MiB少ない等）は CLI の説明にある値であり、本調査では測定・検証していません。
+未指定で再 setup する場合、保存済みモデル設定に有効な `draft_vocab` があればそれを引き継ぎ、なければ setup がファイルを更新する箇所では `cjk` を使います（`terminal/setup.py:8715-8722, 12496-12502`）。
 
 ## 実行時の動作
 
-通常のモデル setup では、MTP runtime に `experts.bin` がある場合に選択に対応する `data/` のファイルを `rt/draft_vocab.bin` へ反映します。`refresh_draft_vocab()` は同梱 subset または旧版の既知 SHA-256 と一致する既存ファイルなら選択値に応じて置換し、選択済みファイルと同じ hash なら何もしません。既知の同梱ファイルでない、手作業のファイルは保持します。選択ファイルが checkout にない場合、または runtime directory がない場合も関数は何もせず戻ります（`setup.py:6881-6886,7149-7168,9394-9398`）。
+値は `argparse` で検証され、setup の設定生成に渡されます。明示値がある場合はモデル設定の `draft_vocab` として保存されます（`terminal/setup.py:11444, 11555-11563, 11606`、`terminal/strata_control/setup_config.py:120, 535-536`）。setup を再実行すると、明示値を優先し、なければ設定ファイルに以前保存された有効値を選びます（`terminal/setup.py:8715-8722, 12496-12497`）。
 
-通常の Qwen setup は選択値（未指定なら既存設定、なければ `cjk`）を `cfg["draft_vocab"]` に記録します。既存モデルの通常起動では、明示値を `keep` として受け取り、変更があれば JSON 設定へ保存し、MTP runtime が有効で own-path config でなければ runtime の subset も更新します（`setup.py:6745-6774,8674-8691,9673-9675`）。したがって設定はそのモデルに記憶されます。
+すでに設定済みモデルを通常起動する場合にもこの parser option は使えます。明示した値は `start()` に渡され、モデル設定へ保存されて、その設定が指す MTP / DFlash2 vocab ファイルが更新されます（`terminal/setup.py:11761-11775, 8558-8601`）。
 
-`--update` を付けた場合、`update_install()` はオプションの `a.draft_vocab` を参照せず、各モデル設定に保存済みの値（未設定時 `cjk`）で runtime subset を更新します。よって `setup.py --update --draft-vocab en` は `en` への変更指定としては使われません（`setup.py:6682-6708,7171-7187`）。更新 wrapper は引数を渡しますが、オプションの意味は委譲先のこの分岐に従います（`update.sh:2-6`、`UPDATE.bat:2-6`）。
+MTP draft layer が存在する場合、選択 subset のファイルをその runtime ディレクトリの `draft_vocab.bin` に反映します。選んだ配布 subset が見つからない場合、runtime ディレクトリがない場合はコピーを行いません。既存ファイルがある場合、Strata 配布 subset と確認できる内容なら選択値に更新し、手動作成など配布元と一致しない内容は保持します（`terminal/setup.py:9110-9132, 12498-12500`）。DFlash2 用の既存コピーも、コピー先が存在する場合に選択値に合わせて更新されます（`terminal/setup.py:9100-9107, 12501`）。
+
+MTP が無く DFlash2 を選んでいる経路では、setup は選択値、保存済み値、いずれもなければ `cjk` を渡して vocab を pack の隣に供給します（`terminal/setup.py:9092-9097, 12483-12488`）。DFlash2 起動側では、設定に保存した利用者の値が優先されます。未指定時に言語 signal から自動選択する処理もありますが、engine が file-by-name 形式で受け取り、選ばれた配布ファイルがモデルの vocab に適合すると確認できる場合に限られ、その決定は設定へ保存されません（`terminal/strata_control/drafting.py:1425-1445`）。
 
 ## 適用条件と副作用
 
-- 主な効果は MTP draft runtime が存在して同機能を使うときに現れます。MTP runtime がなくても setup の通常経路では明示した値がモデル設定に保存される場合がありますが、runtime ファイルがなければコピーされません（`setup.py:9394-9398,9673-9675`）。
-- setup は `shutil.copyfile()` で `rt/draft_vocab.bin` を作成または置換します。選択値に応じた subset file の内容を、既知の Strata 配布ファイルと認識できる既存ファイルに限って上書きします。独自ファイルは保持します（`setup.py:7155-7168`）。
-- `mac_control_setup()` では MTP を使うとき `a.draft_vocab or "cjk"` で更新し、設定キーは値を明示した場合にのみ記録します。setup を再実行して値を省略した場合に以前の選択を保持する処理は、この分岐には見当たりません（`setup.py:8376-8393`）。
-- SYCL の setup は小容量カード条件で明示値がない場合に `en` を argv に追加し、同じ setup の処理へ戻します。利用者が値を明示した場合はその値を保ちます（`sycl/setup_intel.py:541-554`）。
-- MTP が無効、またはエンジンが別の語彙ファイルを明示指定する経路など、実際に runtime の標準 `draft_vocab.bin` を読む条件を満たさない場合、このファイル選択はその実行で使われないことがあります。エンジンの標準 path は `<mtp>/draft_vocab.bin` です（`include/strata/core/mtp.hpp:220-221`）。
+このオプションは setup によるモデル設定と draft vocab ファイルに作用します。GPU/VRAM の状況によって setup は小さい subset を提案する場合がありますが、提案は設定を変更しません。14 GB 未満の VRAM で、明示選択も保存済み選択もない場合に提案されます（`terminal/setup.py:8750-8766, 12502`）。
+
+root scope の通常 parser は Apple Silicon の通常経路では使われず、`setup.py` から `engine/metal/setup_mac.py` へ引数ごと委譲されます。macOS の個別 option 文書は索引の `source-setup/mac/--draft-vocab.md` です（`terminal/setup.py:11435-11437`）。
 
 ## 出力とエラー
 
-コピー先ファイルの更新時、ファイルが既存で置換対象と判定されると subset の説明を `ok()` で表示してからコピーします。既存ファイルが要求値と同じ、独自ファイル、元ファイルまたは runtime directory がない場合は、この helper からは通知されずに戻ります（`setup.py:7155-7168`）。
+許可されていない値は `argparse` の choices 検証で拒否されます。`setup.py` は `parse_args()` を使います（`terminal/setup.py:11555-11563, 11606`）。
 
-choice 外の値は `argparse` の parser error になります（`setup.py:8518-8522,8553`）。コピー時の I/O 例外を `refresh_draft_vocab()` 内で捕捉する処理はありません（同 `setup.py:7155-7168`）。この調査では各種ファイルシステム障害時の wrapper ごとの表示・終了コードまでは確認していません。
+DFlash2 用の必要な draft vocabulary ファイルを Strata checkout 内で供給できない場合、setup は「ファイルがないため DFlash2 を起動できない」と警告し、Strata の更新を案内します（`terminal/setup.py:9092-9097`）。
 
 ## 根拠
 
-- parser、受理値: `setup.py:8518-8522`。同 revision の `python3 setup.py --help` と照合。
-- subset の対応表、既存設定読み込み: `setup.py:6881-6896`。
-- 選択ファイルの runtime 反映、上書き条件: `setup.py:7149-7168`。
-- 通常 setup の fallback、保存、推奨表示: `setup.py:9394-9400,9673-9675`。
-- 既存モデル起動時の保存と runtime 更新: `setup.py:6745-6774,8674-8691`。
-- 更新時に設定値から subset を選ぶ処理: `setup.py:6682-6708,7171-7187`。
-- macOS の setup 分岐: `setup.py:8376-8393`。
-- SYCL の小容量カード向け自動値: `sycl/setup_intel.py:541-554`。
-- wrapper の引数委譲: `setup.sh:9-12,76`、`START-HERE.bat:44-54`、`update.sh:2-6`、`UPDATE.bat:2-6`。
-- エンジンが標準 runtime subset を読む箇所: `include/strata/core/mtp.hpp:220-221`、`src/core/mtp.cpp:692-706`。
-
-調査時の Strata 作業ツリーは `## main...origin/main` で、status に未コミット変更は表示されませんでした。Release archive や別 platform の配布物は比較していません。
+- 索引上の tool ID、入口、parser、scope: `docs/cli/000_cli_tools.md:15`（strata-envvars）。
+- オプションの索引リンクと配置: `docs/cli/README.md:1659-1674`（strata-envvars）。
+- parser、値検証、通常 parser 呼び出し: `terminal/setup.py:11555-11563, 11606`。
+- 値とファイルの対応、保存済み値の読込: `terminal/setup.py:8711-8722`。
+- MTP / DFlash2 用ファイル更新および設定反映: `terminal/setup.py:9092-9132, 12483-12502`、`terminal/strata_control/setup_config.py:535-536`。
+- DFlash2 起動時の明示選択と未指定時の言語判定: `terminal/strata_control/drafting.py:1299-1313, 1425-1445`。
+- macOS の委譲経路: `terminal/setup.py:11435-11437`。

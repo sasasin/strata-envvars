@@ -1,49 +1,50 @@
 # `STRATA_SPLIT_LINK_ABS`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--layer-split auto` の配置コストに使う、GPU stage ごとの expert miss cost のリンク帯域補正を切り替えます。未設定時の現行方式は最速リンクとの相対比較です。この変数を有効にすると、各 stage の実測 H2D 帯域を旧来の 20 GB/s 基準で個別に補正する方式に戻ります。配置計算の補正であり、実際のリンク速度や転送自体は変更しません。
+複数 GPU の `--layer-split auto` が配置を探索するとき、GPU ごとのリンク帯域に応じて expert cache miss の推定コストを補正する係数を、帯域の絶対値から計算します。値が有効だと各 stage の係数は `20 GB/s ÷ その stage の測定帯域` を 1〜64 に clamp した値になり、測定帯域が正でない場合は 1 です。これは自動配置の予測コストと選ばれる layer 境界に作用します。実行時の通信方式や実測性能を直接変更する処理ではありません（`engine/src/program/generate.cpp:6990-7013,7099-7108`）。
+
+対象コードは CUDA の GPU 情報・デバイス切替 API を使う `generate.cpp` の自動分割処理です。設定は layer split の自動探索にだけ参照され、手動境界指定には使われません（`engine/src/program/generate.cpp:4783-4809,6959-6961`）。候補名の他のソース参照はなく、`terminal/data/settings-register.json:46091` にも名前がありますが、そこは設定レジストリの記載であり、環境から値を読む実装ではありません。
 
 ## 値と判定
 
-実装は文字列を数値 parse せず、環境変数が設定されているかと先頭文字だけを見ます。
+`std::getenv` の結果について、先頭 1 文字が `'1'` かだけを判定し、その結果を関数内 `static const bool` に保存します。文字列全体の parse、数値検証、trim、大文字小文字変換はありません（`engine/src/program/generate.cpp:7003`）。
 
-| 環境変数 | `link_abs` |
-|---|---|
-| unset | `false`（現行の相対方式） |
-| 空文字 | `false` |
-| 先頭文字が `1` の文字列（`1`, `10`, `1abc` など） | `true` |
-| その他の設定値（`0`, `true`, `false`, 空白で始まる値など） | `false` |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 自動 layer split 探索の最初の評価 | `false`（相対帯域差に基づく既定係数） | `1`、`10`、`1anything`、`1.0`（先頭が `1`） | 空文字、`0`、`true`、` 1`、`2`（先頭が `1` でない） |
 
-大文字小文字や後続文字、数値としての妥当性は検査されません。判定結果は `static const bool` に保存され、プロセス内でこのコード経路に初めて到達した後に環境を変更しても再評価されません。
+未設定・空文字・無効値は同じく絶対帯域式を選びません。無効値の警告や fallback ログはありません。最初にこの分岐へ到達した時の値がプロセス内に cache されるため、その後の環境変更は反映されません。
 
 ## 有効になる条件
 
-- `multi_gpu && split_auto`、すなわち複数 GPU の `--layer-split auto` の配置検索に入る必要があります。明示的な layer split や単一 GPU の実行では、この判定箇所を通りません。
-- リンク帯域を実測するのは `native_pack` の場合です。それ以外では各帯域値が `-1.0` となり、どちらの方式でも補正係数は `1.0` になります。
-- `ns` は stage 数（GPU 数）です。2 または3 stage の配置検索では補正後の係数が配置予測に使われます。4 stage の全配置列挙は別の目的関数を使い、miss cost を単一係数で計算するため、この環境変数による係数は配置順位に反映されません。4 stage でもリンク係数自体は計算・ログ出力されます。5 stage 以上は比例配分へ進み、配置検索の目的関数による選択をしません。
+- `--layer-split` が `auto` であること。layer split 自体は serve モードでのみ受け付けられます（`engine/src/program/generate.cpp:4775-4780,4803-4805`）。
+- 自動分割が無効化されず、CUDA0 に加えて少なくとも 1 枚の GPU が split stage として残り、複数 GPU の配置探索に到達すること。追加 GPU がない場合は `--layer-split auto: one GPU visible, so no split` と出して自動分割を解除します（`engine/src/program/generate.cpp:4836-4840,6959`）。
+- `STRATA_SPLIT_UNIFORM` が先頭 `'1'` で有効の場合、この変数より優先されます。係数を全 stage で `1.0` に固定するため、`STRATA_SPLIT_LINK_ABS` は実質無視されます（`engine/src/program/generate.cpp:7004,7008-7011`）。
+- 正のリンク帯域が必要です。native pack では各 stage の H2D 帯域を測定し、正値なら絶対式が使われます。native pack 以外ではこの探索コードが帯域を `-1.0` とし、式の fallback により係数は `1.0` になります（`engine/src/program/generate.cpp:6992-6997,7011`）。
+- `STRATA_SPLIT_LINK_MIN` は通常の相対帯域係数を決めますが、この変数が有効ならその係数を絶対式で置き換えます（`engine/src/program/generate.cpp:7005-7011`）。`STRATA_SPLIT_MISS_MS` は係数適用後の miss コスト全体を変えます（同 `:7015,7099-7103`）。
 
 ## 実行時の詳細
 
-各 GPU stage について `probe_pcie_h2d_gbps()` で取得した H2D 帯域 `bw` から `link_scale` を作ります。デフォルトの `link_miss_scale()` は、最速 stage の帯域を基準に比率を取り、4倍以上遅い stage にのみ最大64倍まで係数を付けます。リンクが同程度なら係数は `1.0` です。
+serve の layer split 初期化中、`multi_gpu && split_auto` の配置探索に入ると各 stage の H2D 帯域を得て、通常は最速 stage との比率に基づく係数を作ります。`STRATA_SPLIT_LINK_ABS` が有効で、かつ `STRATA_SPLIT_UNIFORM` が無効なら、各係数を `clamp(20.0 / bw, 1.0, 64.0)`（`bw > 0` の場合）で上書きします。リンク帯域が 20 GB/s 以上なら係数 1、20 GB/s 未満では帯域に反比例して最大 64 です（`engine/src/program/generate.cpp:6990-7013`）。
 
-`STRATA_SPLIT_LINK_ABS` の先頭が `1` のときは、各 stage の係数を `bw > 0` なら `clamp(20.0 / bw, 1.0, 64.0)` に置き換えます。たとえば帯域が20 GB/sなら `1.0`、10 GB/sなら `2.0`、1 GB/sなら上限の `64.0` です。`bw <= 0`（未測定・無効な測定値）の場合は `1.0` です。この方式では各リンクを個別に20 GB/s基準と比較するため、対称なリンクでも全リンクが20 GB/s未満なら各 stage の miss cost が増えます。
+探索の各配置では、各 stage に割り当てられた routed mass のうち cache に入らない分へ `miss_ms × link_scale[stage]` を掛け、layer 実行時間と足して予測時間を比較します。したがって係数は自動配置の選択に影響し得ますが、最終的な境界が必ず変わるとは限りません（`engine/src/program/generate.cpp:7099-7108,7110-7112,7510-7515`）。この変数に対応する CLI 引数はありません。`--layer-split auto` は処理経路を選びますが、係数値の優先設定は前述の `STRATA_SPLIT_UNIFORM` です。
 
-2・3 stage の予測では、stage ごとに「全 routed mass に占める、その stage の cache に入らなかった routed mass」に `STRATA_SPLIT_MISS_MS` の値と `link_scale` を掛け、各 stage の layer 時間を加算します。この予測コストで layer 境界候補を比較し、自動配置を選びます。`STRATA_SPLIT_MISS_MS` は別変数で、既定値は190.0です。4 stage の列挙では miss cost が `miss_ms * (1 - held_mass / total_mass)` で計算され、stage 別 `link_scale` を使いません。
+読み取りは初回の自動探索時で、値は関数内 static に cache されます。同一プロセス内で複数回探索する場合も初回評価値が使われます。リクエストごとの読み直しではありません（`engine/src/program/generate.cpp:7003`）。
 
-各 stage の帯域と最終係数は stderr の `strata generate: layer split auto: CUDA%d link %.1f GB/s -> miss cost x%.2f` に表示されます。自動選択した境界と予測時間は `layer split auto: K=...` の行に表示されます。後者は予測値で、実測性能の保証ではありません。
+## ログと測定値
+
+各 stage について `strata generate: layer split auto: CUDA%d link %.1f GB/s -> miss cost x%.2f` を stderr に出し、探索後に予測時間と選ばれた `K` を出します。係数ログには最終的に適用された値が出るため、`STRATA_SPLIT_UNIFORM` が優先した場合もその結果を確認できます。無効値・帯域測定失敗に対する専用警告はありません（`engine/src/program/generate.cpp:7008-7013,7513-7515`）。
+
+この文書では性能向上を示す測定値は記載しません。ソースコメントの「20 GB/s rule」は旧式の係数を説明する記述であり、この環境変数を設定した場合の一般的な性能保証ではありません（`engine/src/program/generate.cpp:6999-7002`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:3814-3815`: 複数 GPU かつ auto split の場合に配置検索へ入る条件。
-- `src/program/generate.cpp:3837-3849`: native pack の場合だけ帯域を測り、既定係数を作る。
-- `src/program/generate.cpp:3846-3854`: 先頭文字 `1` の判定、絶対帯域式への置換、stage 別ログ。
-- `include/strata/program/split_rules.hpp:77-97`: 現行の相対係数（最速との比率、4倍の閾値、64倍上限）。
-- `src/program/generate.cpp:3937-3947`: 2・3 stage 等で使う予測コストに stage 別係数を適用。
-- `src/program/generate.cpp:4131-4185`: 4 stage の専用列挙は link scale を使わず、miss cost を評価。
-- `src/program/generate.cpp:4214-4218`: 5 stage 以上は比例配分。
-- `src/program/generate.cpp:4287-4292`: 選択境界と予測コストのログ。
-
-`include/strata/program/split_rules.hpp:77-82` は、旧方式が各 stage の miss 項を `20 GB/s / 実測帯域`（1〜64に制限）で補正していたことと、現行方式を最速リンクとの相対比較にした設計理由を説明しています。`docs/DETAILS.md` にはこの環境変数固有の説明や測定値は見つかりませんでした。
+- `engine/src/program/generate.cpp:4783-4809` — layer split の serve 条件、`auto` 判定。
+- `engine/src/program/generate.cpp:4836-4840,6959-6961` — GPU がない場合の解除と自動配置探索の条件。
+- `engine/src/program/generate.cpp:6990-7015` — 帯域測定、対象変数の読み取りと係数の優先順位。
+- `engine/src/program/generate.cpp:7099-7108,7510-7515` — miss コストへの反映と探索結果ログ。
+- `engine/include/strata/program/split_rules.hpp:141-171` — 通常時の相対帯域式。
+- `terminal/data/settings-register.json:46091` — 名前のレジストリ記載（実行時読み取りではない）。

@@ -1,49 +1,51 @@
 # `STRATA_BATCH_MTP_SERIAL`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-レイヤー分割と `--batch` を使う際、環境変数が有効で、`--batch-mtp` も有効なら、明示的な `--batch-groups` がないときのグループ自動選択を1グループにします。これによりスロット群を GPU ステージ間でパイプライン処理せず、各スロットの MTP 提案を含む直列ウィンドウで実行できるようにします。`--batch-mtp` 自体を有効にする変数ではありません。
+`--batch-mtp` が有効で、layer split の batch slot を自動で複数 group に分ける条件では、この変数を有効にすると group 数を 1 にし、各 GPU stage を順に通る serial window で slot ごとの MTP proposal を検証する。MTP 自体を有効化する変数ではなく、通常の batch drafting の有無も変えない。実際の MTP 有効化は `--batch-mtp` または `STRATA_BATCH_MTP` などで決まり、その後にこの変数を使って group を解決する（`engine/src/program/generate.cpp:7803-7820, 7841-7865`; `engine/include/strata/program/batch_groups.hpp:122-145`）。
+
+効くのは `--batch-groups` を指定せず、layer split があり、slot 数が 2 以上で、自動算出した group 数が 1 より大きく、かつ `--batch-mtp` が有効な場合に限る。自動 group 数を 1 にすると MTP は serial batch window で動く。変数を有効にしない場合は、通常は自動 pipeline が選ばれ、`STRATA_PIPED_MTP` が無効なら `--batch-mtp` は無効化される（`engine/include/strata/program/batch_groups.hpp:126-145`; `engine/src/program/generate.cpp:7857-7865`）。
+
+Terminal 側の `batch_mtp_dropped` も環境を読み、drafting 状態の説明を組み立てる。ただし、これは engine の group 設定を行わず、起動前の判定結果を返す補助処理である（`terminal/strata_control/drafting.py:940-961, 1739-1743`; `terminal/strata_cli/drafting_cmd.py:131-136`; `terminal/strata_cli/launch/runner.py:2087-2092`）。
 
 ## 値と判定
 
-CUDA側 `src/program/generate.cpp` は、処理時に `getenv` した文字列の先頭文字を判定します。
+Engine は `std::getenv` で値を読み、未設定でなく、空文字でなく、先頭文字が `0` でない場合を true とする。文字列全体の parse・trim・大文字小文字変換はしない。従って `1`, `true`, `yes`, ` 0` は有効、`0`, `00`, `0anything`, 空文字、未設定は無効（先頭が `0` なら後続文字にかかわらず無効）。末尾の文字は判定に影響しない場合がある（`engine/src/program/generate.cpp:7812`; `engine/include/strata/program/batch_groups.hpp:132`）。
 
-| 環境変数の状態 | `mtp_serial` |
-| --- | --- |
-| 未設定 | false |
-| 空文字 | false |
-| 先頭文字が `0` | false（後続文字は判定しない） |
-| それ以外の文字列 | true |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| Engine の `batch_groups_for` | false | `1`, `true`, `yes`, ` 0` | 空文字, `0`, `00`, `0anything` |
+| Terminal の `batch_mtp_dropped` 表示判定 | `os.environ.get(..., "0")` が `"0"` | `1`, `true`, ` 0`, `00`, `0anything` | 空文字, `0` |
 
-したがって `1` に限らず、例えば `true` や `2` も有効です。数値変換や文字列全体の比較は行いません。値は `static` に保存されず、グループ判定用 lambda が呼ばれるたびに読み直されます。
+Terminal は値全体を `""` または `"0"` と比較するため、`0anything` などでは Engine と判定が異なる（`terminal/strata_control/drafting.py:959-960`）。
 
 ## 有効になる条件
 
-- `--batch-mtp`（または `STRATA_BATCH_MTP`）が有効であること。`--batch-mtp` は `--batch` が2以上、`--mtp` が指定済み、`--spec T` が `T >= 2`、サーバーモード (`--serve`) であることを要します。レイヤー分割時は各ステージが別々の GPU にあり、helper expert cache や `--remote-expert-opt` を使わないこともゲート条件です。条件を満たさなければ `--batch-mtp` は警告付きで無効化されます。
-- レイヤー分割があり、2以上の `--batch` に対して `--batch-groups` を指定していないこと。この場合に限って、通常の暗黙の `auto` グループ数より本変数が優先されます。レイヤー分割なしでは暗黙の自動グループ化は起こらず、この変数による変更もありません。
-- `--batch-groups 1`, `--batch-groups N`, または明示的な `--batch-groups auto` がある場合は、その指定が優先され、本変数では直列化しません。明示的な `auto` が複数グループを選び、MTPと両立できない場合は、後段のゲートが `--batch-mtp` を無効にします。
-- `--batch-mtp` が無効なら本変数はグループ数に作用しません。暗黙の自動グループ数を直列化する別条件として `--adapt-async 1` がありますが、MTPと両方が有効で本変数も有効なら MTP側の理由が選ばれます。
+- `--batch-groups` を省略すること。明示した `--batch-groups auto` も「指定あり」なので pipeline を要求し、この変数は serial に戻さない。明示した `--batch-groups 1` はこの変数とは独立して serial になる（`engine/src/program/generate.cpp:4044-4049`; `engine/include/strata/program/batch_groups.hpp:126-143`）。
+- layer split であること（`later_stages > 0`）、batch slot が 2 以上であること、自動算出 group 数が 2 以上であること。自動 group 数は GPU stage 数を上限に、slot 数を割り切る最大の group 数（少なくとも 1）である（`engine/include/strata/program/batch_groups.hpp:113-120, 126-135`）。slot 調整後にも group 解決をやり直す（`engine/src/program/generate.cpp:8110-8112`）。
+- `--batch-mtp` が実際に有効であること。この指定単独では有効化されない。engine は `--batch-mtp` または `STRATA_BATCH_MTP` 等から有効化を決め、その成立後に group 解決へ渡す（`engine/src/program/generate.cpp:7841-7848, 7803-7812`）。
+- MTP 有効化には少なくとも `--batch >= 2`、`--mtp`（または slot DFlash2）、`--spec T`（`T >= 2`）、`--serve` が必要で、layer split の各 stage が別 GPU にある必要がある。Metal build では batch window が draft row を扱えないため、他の条件を満たしても slot drafts は無効化される（`engine/src/program/generate.cpp:7843-7855`）。helper expert cache を使う layer split でも無効化される（`engine/src/program/generate.cpp:7866-7872`）。
+- `STRATA_PIPED_MTP` は pipelined group 内の drafts を許可する別スイッチ。明示された group 数が複数でも有効なら pipeline 上で MTP drafts を行う経路があり、この変数の用途（自動 group を serial にする）とは異なる（`engine/src/program/generate.cpp:7819-7820, 7857-7865`; `engine/include/strata/program/batch_groups.hpp:139-145`）。
+- `--adapt-async 1` も未指定 group の自動値を 1 にするが、この場合は `--batch-mtp` の有無にかかわらない。`STRATA_BATCH_MTP_SERIAL` の分岐が優先される条件では MTP 用の serial 理由になる（`engine/include/strata/program/batch_groups.hpp:131-135`）。
 
 ## 実行時の詳細
 
-CUDAの `generate` は、バッチ用セッションを作る前に `batch_groups_for` を用いて自動グループ数を解決します。暗黙の自動選択では、GPUステージ数とバッチスロット数を上限に、スロット数を割り切れる最大のグループ数を選びます。`--batch-mtp` と本変数がともに有効なら `resolve` がその自動結果を1に置き換えます。例えば自動なら2グループになる構成で、本変数が有効なら1グループとなり、MTP提案付き直列ウィンドウを維持します。
+Engine は `batch_groups_for` lambda の呼び出しごとに `getenv` し、値を static cache しない。初期 group 解決に加え、実際に確保できた slot 数が確定した後にも解決するため、設定は起動処理中に評価される（`engine/src/program/generate.cpp:7803-7820, 7975-7994, 8110-8112`）。通常のプロセス環境は起動時に定まるため、その環境で起動した Engine に対する実用上の設定時点はプロセス起動前である。Terminal の補助判定は `batch_mtp_dropped` が呼ばれるたび `os.environ` を読む（`terminal/strata_control/drafting.py:940-960`）。
 
-暗黙のパイプラインが選ばれた場合は `--batch-mtp` を無効にし、`strata generate: WARNING: --batch-mtp is off: ...` を stderr に出します。自動選択の結果、直列化された場合は stderr に `strata generate: --batch-groups auto: 1 group ... - --batch-mtp does not run in pipelined groups; --batch-groups N would pipeline them and turn it off` の形式で理由と、パイプライン時のグループ数を表示します。明示的な `--batch-groups auto` が複数グループを選ぶ場合はパイプライン側となり、MTPが無効になります。
+group 数が 1 になった場合、slot window は GPU stage を順番に通る serial path となり、batch MTP slot drafter は slot ごとに最大 1 proposal を設定される。slot drafter は solo drafter の重みを共有し、個別 K/V state と buffer を持つ（`engine/src/program/generate.cpp:8368-8378, 17529-17542`）。この変数は proposal の採否規則や token の選択を直接変更する処理ではなく、group 解決とそれに続く serial/pipelined 実行経路を選ぶ。
 
-直接の読み取りは `src/program/generate.cpp` の CUDA側実装1か所です。`sycl/src/program/generate.cpp` にこの環境変数の読み取りや同等の自動グループ解決処理はありません。そのため、この調査で確認した変数の効果はCUDA側の `generate` 経路に限られます。
+## ログと測定値
 
-## 文書との照合
-
-`docs/BATCHING.md` は、レイヤー分割で `--batch-mtp` と `--batch-groups` が未指定の場合、既定のパイプラインがMTPを無効にすること、`STRATA_BATCH_MTP_SERIAL=1` で直列ウィンドウを保てることを説明しています。これは現行ソースの分岐と一致します。資料には RTX 3080 2枚、Xeon E5-2696 v4、UD-Q4_K_XL、`--parallel 2 --spec 4` などの条件を記した測定表がありますが、その値は資料内の測定結果としてのみ扱い、本調査では再計測していません。
+自動 group が本来 2 以上で、この変数により MTP serial へ切り替わる場合、stderr に `strata generate: --batch-groups auto: 1 group of ... - --batch-mtp does not run in pipelined groups; --batch-groups ... would pipeline them and turn it off` の形式で理由を出す（`engine/src/program/generate.cpp:7982-7989`）。有効化条件を満たさない `--batch-mtp` は別の理由つき `WARNING` で off になる。MTP drafter が割り当てられれば `strata generate: --batch-mtp: ... slot drafters on CUDA...` を出す（`engine/src/program/generate.cpp:7843-7872, 8373-8378`）。この変数単独の速度向上を示す現行測定値は記載しない。`docs/BATCHING.md:44-54, 97` には serial と pipeline の選択理由および別条件の測定説明があるが、特定の hardware・モデル・負荷に結びついた値であり一般化できない。
 
 ## 根拠
 
-- `src/program/generate.cpp:4350-4367` — 暗黙の自動選択の説明、入力の組み立て、環境変数の値判定、`STRATA_BATCH_MTP` との組み合わせ。
-- `src/program/generate.cpp:4368-4389` — MTP利用条件と、パイプライン選択時の無効化・警告。
-- `src/program/generate.cpp:4404-4423` — 解決結果をオプションに適用し、自動選択を stderr に通知。
-- `include/strata/program/batch_groups.hpp:40-64` — 自動グループ数と、暗黙の既定値におけるMTP直列化の優先規則。
-- `src/program/generate.cpp:9656-9664` — パイプライン実行経路とMTPドラフトが動かない場合の警告。
-- `sycl/src/program/generate.cpp:3896-3905` — SYCL側は `STRATA_BATCH_MTP` を読み取るが `STRATA_BATCH_MTP_SERIAL` は参照しない。
-- `docs/BATCHING.md:22-39, 41-64, 85-90` — 利用条件、測定記録、環境変数と明示的な `--batch-groups` の説明。
+- 候補名の実装参照: `engine/src/program/generate.cpp:7812`; `terminal/strata_control/drafting.py:959`。
+- Engine の読み取り・group 解決への入力: `engine/src/program/generate.cpp:7803-7820`。
+- 値が group 数を変える条件・優先順位: `engine/include/strata/program/batch_groups.hpp:122-145`。
+- MTP 条件と fallback warning: `engine/src/program/generate.cpp:7841-7872`。
+- 起動ログ、slot drafter、実行経路: `engine/src/program/generate.cpp:7975-7994, 8368-8378, 17529-17547`。
+- Terminal 側の判定と利用箇所: `terminal/strata_control/drafting.py:940-961, 1739-1743`; `terminal/strata_cli/drafting_cmd.py:131-136`; `terminal/strata_cli/launch/runner.py:2087-2092`。
+- 関連資料: `docs/BATCHING.md:44-54, 96-97`。

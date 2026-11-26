@@ -1,74 +1,51 @@
 # `--no-kv-grow`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（エンジン引数。実行は `strata generate`） |
+| コマンド | `strata`（エンジン引数、root scope） |
 | オプション | `--no-kv-grow` |
 | 別名 | なし |
-| 値 | なし（フラグ） |
+| 値 | 取らないフラグ |
 
 ## 役割
 
-K/V cache を要求の到達セル数に応じて拡張する elastic K/V 機能を、CLI から無効にするフラグです。parser は `Options::kv_grow` を `false` にします。初期値も `false` なので、環境変数による上書きがなければ省略時も無効です（`src/program/generate.cpp:488,2482-2483`）。
+QSA の K/V プールをコンテキストの使用量に応じて拡張する elastic K/V を無効にします。CUDA/HIP 系と SYCL 系の両 parser がこのフラグを受理します。
 
 ## 使い方
 
 ```sh
-strata generate --pack pack/full --tokens "1,2,3" --no-kv-grow
+strata --no-kv-grow --model model.gguf --tokens-file prompt.txt
 ```
-
-`--no-kv-grow` 自体に値は付けません。`--tokens` はこの例で必要な入力を示しています。
 
 ## 値と既定値
 
-- parser は値を読み取らず、出現時に `o.kv_grow = false` とします。数値・真偽値の validation はありません（`src/program/generate.cpp:2482-2483`）。
-- `--kv-grow` と併用した場合、引数列を順に処理して同じ boolean を設定するため、後に現れた方が parser 上の値になります（同:2482-2483）。
-- ただし、非空の `STRATA_KV_GROW` が設定されていると環境変数が CLI の設定より優先します。値の先頭文字が `0` なら無効、それ以外なら有効です。したがって `STRATA_KV_GROW=1` や `STRATA_KV_GROW=false` は `--no-kv-grow` より優先して有効化し、`STRATA_KV_GROW=0` は無効化します。空文字または未設定なら CLI flag の値を使います（同:5199-5203）。
+値は不要です。`Options::kv_grow` の初期値は `false` なので、他の指定がなければ elastic K/V は要求されません（`engine/src/program/generate.cpp:826`、`engine/sycl/src/program/generate.cpp:510`）。parser は `--no-kv-grow` を受けると同じ値を `false` に設定します（`engine/src/program/generate.cpp:3908-3909`、`engine/sycl/src/program/generate.cpp:1947-1948`）。
+
+同じコマンドラインで `--kv-grow` と併用した場合は、parser が順に引数を処理するため後に現れた方が `kv_grow` の値になります。フラグ自体に値検証はありません。値を取らないので、続けて書かれた余分な引数は別引数として解析され、未知の引数なら stderr に `unknown argument: ...` と usage を出して終了コード 2 になります（`engine/src/program/generate.cpp:3842-3849, 3908-3909, 4268-4273`）。
+
+ただし、実行時の `STRATA_KV_GROW` が空でない場合は環境変数がコマンドライン設定に優先します。先頭文字が `0` なら無効、それ以外なら有効として扱われるため、`STRATA_KV_GROW=1` の環境では `--no-kv-grow` を指定しても有効要求になります。未設定または空文字の場合に限り、コマンドラインの値が使われます（`engine/src/program/generate.cpp:7718-7726`、`engine/sycl/src/program/generate.cpp:4285-4293`）。
 
 ## 実行時の動作
 
-エンジン起動時、elastic K/V を有効にする条件を判定し、`qsa_set_kv_elastic(on, ...)` と `ExpertCache::set_vmm(on)` に結果を渡します。`--no-kv-grow` により要求値が無効なら、elastic K/V 用 VMM pool と ExpertCache の連携を有効にしません（`src/program/generate.cpp:5196-5213`、`src/core/layer.cpp:680-684,813-835`）。
+elastic K/V は、単一 GPU、非ストリーミング（`--kv-resident` が 0 以下）、expert profile の指定、CPU 側 expert 配置の無効、expert cache が有効、remote expert cache がない、VMM が利用可能、`--batch` が 0、`--vram-elastic` が無効、`--peer-device` が未指定という条件でのみ有効になります。条件を満たさない場合は elastic K/V を無効にします（`engine/src/program/generate.cpp:7718-7729`、`engine/sycl/src/program/generate.cpp:4285-4296`）。
 
-無効時は K/V を要求に応じて拡張する elastic 経路に入りません。elastic pool は `g_kv_elastic && p.mode == 0` のときだけ作られ、それ以外では通常の K/V allocation 経路に進みます（`src/core/layer.cpp:813-835`）。`--kv-resident` が 0（既定）の通常配置では、help は `--max-context` 全体を起動時に確保すると説明しています（`src/program/generate.cpp:833-839`）。`--kv-resident` を正数にした streaming 配置は別経路であり、elastic K/V の有効条件から除外されます（同:5202-5207）。
+`--no-kv-grow` が有効に働き、かつ K/V streaming も使わない場合、QSA の K/V プールは elastic 用の別 VMM range ではなく通常の session state 側に含まれます。通常の K/V 配列のサイズ計上と初期化は `engine/src/core/layer.cpp:788-804, 807-864` および `engine/sycl/src/core/layer.cpp:758-775, 777-835` にあります。従って、K/V の割当方式は起動時に決まり、このフラグは elastic K/V の初期化より前に評価されます。
 
-CLI で無効を指定しても `STRATA_KV_GROW` が非空なら、その環境変数の判定結果が使われます。また環境変数で有効を要求していても、以下の条件を満たさない場合は機能が無効になります（`src/program/generate.cpp:5202-5210`）。
-
-- GPU が1台である。
-- `--kv-resident` が 0 以下で、K/V streaming を使わない。
-- `--expert-profile` が指定され、resident CPU expert mode ではない。
-- expert cache が無効値 `0` ではなく、remote expert cache を使わない。
-- VMM が利用可能である。
-- `--batch` が 0、`--vram-elastic` が未指定、`--peer-device` が未指定である。
-
-さらに実際の拡張管理は、VMM cache range、device residency table、host residency、source profile があり、cache slot 数が floor より大きい場合に開始されます（`src/program/generate.cpp:7869-7883`）。無効時にはこの管理経路の grow/trim が行われません。
+環境変数による上書きがなく、他条件を満たして `--kv-grow` が要求された場合でも、適用条件を満たさなければ stderr に `strata generate: --kv-grow is off (...)` と警告を出して無効化します。条件を満たす場合は初期化時に elastic K/V と expert cache の VMM を有効化します（`engine/src/program/generate.cpp:7727-7732`、`engine/sycl/src/program/generate.cpp:4294-4299`）。無効時に特有の警告やエラーはありません。
 
 ## 適用条件と副作用
 
-このフラグ自体に OS や backend 固有の validation はありません。VMM 機能が無効、または上記の構成条件を満たさない場合、elastic K/V は有効になりません。要求が有効だったのに条件を満たせなかった場合は stderr に `--kv-grow is off (...)` の警告を出します。要求自体が無効なら、この警告は出しません（`src/program/generate.cpp:5202-5210`）。
+`STRATA_KV_GROW=1` などの環境変数が明示されると、このフラグ単独では無効化を保証できません。逆に `STRATA_KV_GROW=0` は `--kv-grow` の要求を無効にします。さらに、長い context の事前メモリ計画には `o.kv_grow` を直接参照する分岐があり、`STRATA_KV_GROW` による上書き後の実効値とは別の判定になります（`engine/src/program/generate.cpp:4240-4242, 7718-7726`）。
 
-`--kv-resident` が 0 の通常配置で elastic K/V を無効にすると、K/V は `--max-context` 全体を起動時に保持します。elastic 時に K/V が利用要求に応じて占有する VRAM を増やす動作はなくなります。`--kv-resident` による streaming 配置ではこの起動時全量 VRAM allocation の説明は当てはまりません。一方、起動時 allocation が失敗すると、session state allocation または session initialization のエラーを stderr に出して終了コード 1 で終了します（`src/program/generate.cpp:5215-5221`）。
-
-## 出力とエラー
-
-- `--no-kv-grow` の値に関する専用エラー経路はありません。
-- オプション名自体が parser に認識されなければ、`unknown argument: ...` を stderr に出し、usage を表示して終了コード 2 になります（`src/program/generate.cpp:2787-2792`）。
-- elastic K/V が要求されたが適用条件を満たさない場合の警告は、上記のとおり stderr に出ます。`--no-kv-grow` を単独で使う場合は要求値が無効なので、この警告条件には該当しません（同:5208-5210）。
-- 通常 K/V の起動時確保が失敗したときは `session state allocation failed` または `session_init failed` を stderr に出し、終了コード 1 になります（同:5215-5221）。
-
-## help と索引の差異
-
-この revision の `strata generate --help` usage には `--kv-grow` と既定動作の説明がありますが、`--no-kv-grow` は掲載されていません（`src/program/generate.cpp:836-839`）。一方、parser には `--no-kv-grow` が実装されています（同:2482-2483）。索引では `strata-engine` の `strata`（エンジン引数）スコープに本書へのリンクがあり、指定された `strata-engine/root` の配置と一致します（`docs/cli/README.md:1128-1134,1231`）。索引は変更していません。
+起動時の session state 割当に失敗すると `strata generate: session state allocation failed` を stderr に出し、終了コード 1 で終了します（`engine/src/program/generate.cpp:7734-7736`）。この失敗経路はフラグ固有の validation ではなく、割当処理の結果です。VMM の確保や GPU backend 固有の詳細な失敗挙動は、ここでは CLI フラグの影響として一般化しません。
 
 ## 根拠
 
-- parser と option 初期値: `src/program/generate.cpp:488,2482-2483`
-- 組み込み help の掲載内容: `src/program/generate.cpp:836-839`
-- 環境変数優先順位、適用条件、警告: `src/program/generate.cpp:5196-5213`
-- 起動時 allocation error: `src/program/generate.cpp:5215-5221`
-- elastic K/V pool の条件と初期 allocation: `src/core/layer.cpp:680-684,813-835`
-- elastic K/V の grow 管理開始条件: `src/program/generate.cpp:7869-7883`
-- unknown argument の失敗経路: `src/program/generate.cpp:2787-2792`
-- 利用者向け説明（ソース parser との照合用）: `docs/DETAILS.md:366-372`
+- `engine/src/program/generate.cpp:826, 3908-3909` — CUDA/HIP 系 `Options` の既定値と parser 定義。
+- `engine/sycl/src/program/generate.cpp:510, 1947-1948` — SYCL 系の既定値と parser 定義。
+- `engine/src/program/generate.cpp:7718-7736`、`engine/sycl/src/program/generate.cpp:4285-4305` — 環境変数の優先、適用条件、警告、elastic 設定、session state 割当。
+- `engine/src/core/layer.cpp:788-804, 807-864`、`engine/sycl/src/core/layer.cpp:758-775, 777-835` — elastic 無効時の通常 K/V 配列計上と、elastic 有効時の VMM pool 初期化。
+- `engine/src/program/generate.cpp:4240-4242` — `o.kv_grow` を使う長い context のメモリ計画分岐。

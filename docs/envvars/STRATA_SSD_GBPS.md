@@ -1,50 +1,42 @@
 # `STRATA_SSD_GBPS`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-prompt planner がファイル tier から expert ファイルを読む速度として仮定する値を、GB/s 単位で指定します。planner は候補 chunk/ring ごとの予測 prompt 時間を比較するため、この値は候補選択に使われます。実測速度を変更したり、I/O 自体を制限したりする変数ではありません。
+モデルファイルがあるドライブの読み取り速度を GB/s で指定し、host-aware prompt planner が各 chunk/ring 候補の予測時間を計算するときに使う。値は `drive_read_gbps()` が `pp::Host::ssd_gbps` に設定され、planner は予測 file-read bytes をこの速度で割って候補を比較する。chunk/ring の選択が変わることはあるが、重み・expert の内容や生成 token を直接変更する設定ではない（`engine/src/program/generate.cpp:1889-1905,11449-11518`; `engine/include/strata/program/prefill_plan.hpp:81-99,109-127`）。
 
 ## 値と判定
 
-`drive_read_gbps()` は `std::getenv()` で変数を読み、`std::atof(e) > 0.0` の場合だけ採用します。条件を満たすと `why` に `STRATA_SSD_GBPS` を設定し、`atof()` の結果を返します。文字列全体の妥当性検査はありません。
+`std::getenv` で設定有無を調べ、設定されていれば `std::atof(e) > 0.0` のときだけ採用する。正数として変換できない値はエラーにせず既定値へ進む。`atof` は文字列全体の妥当性を検証しないため、先頭の数値部分が正なら後続文字列があっても採用される。空白や数値の後ろの文字を独自に検査せず、上限 clamp もない。`NaN` は `> 0.0` を満たさず fallback し、正の無限大は条件を満たすため採用される（`engine/src/program/generate.cpp:1891-1905`）。
 
-| 値 | 扱い |
-|---|---|
-| 未設定 | 自動推定値を使う |
-| 空文字、`0`、負数、数値に変換できない文字列 | `atof()` が正数にならないため自動推定値を使う |
-| 正数（例 `0.45`, `2.5`） | その数値を GB/s として採用 |
-| 数値の後ろに文字がある場合（例 `2.5junk`） | `atof()` が先頭の数値部分を変換し、正数なら採用 |
+| 条件 | unset | 有効になる値（例） | 無効になり既定値へ戻る値（例） |
+|---|---|---|---|
+| 全 platform | platform/drive 判定値 | `0.1`, `1`, `2.5`, ` 1.2`, `1.2junk`, `inf` | 空文字、`0`, `-1`, `true`, `junk`, `NaN` |
 
-空白や指数表記などの変換規則も `atof()` に従います。上限 clamp はありません。正の無限大を返す入力も `> 0.0` を満たして採用され得ます。`why` は planner の入力ログに表示される出所ラベルです。
+未設定時、または変換結果が 0 以下の場合、Linux ではモデルファイルのあるデバイスを `/sys` で調べ、回転ディスクなら `0.15`、NVMe なら `2.5`、その他の非回転ディスクなら SATA-class として `0.45` GB/s を使う。デバイスを判別できない場合は `1.5` GB/s。Windows はデバイス判別を行わず `1.5` GB/s を使う（`engine/src/program/generate.cpp:1840-1858,1889-1905`）。
 
 ## 有効になる条件
 
-この値が使われるのは `host_plan_chunk()` が呼び出され、planner が早期 return しない場合だけです。少なくとも次の条件が必要です。
-
-- `--prefill-auto` が有効で、chunk が正。
-- `srcp == &src` である。
-- `STRATA_PREFILL_HOST_PLAN` が `0` で始まる値ではない（未設定を含む）。
-- prefill ring bytes が有効。
-- GPU cache に全 expert が収まらず、host memory のサンプルが得られる。
-
-この helper は Linux と Windows の両方の実行経路から呼ばれます。ただし Windows は file tier を unbuffered で読むため page cache が 0 として扱われ、`docs/DETAILS.md` は planner が既存 chunk を維持すると説明しています。`STRATA_SSD_GBPS` を指定してもその経路で chunk を変える保証はありません。
+- Host-aware planner が呼ばれること。通常の単発 `generate` 経路では `--prefill auto`、借用可能な expert cache、`d_res`、`k > 0`、prompt segment が 1024 token より長いことが呼び出し条件（`engine/src/program/generate.cpp:23990-24010`）。
+- planner 内で `o.prefill_auto` が真、chunk が正、`srcp == &src`、`STRATA_PREFILL_HOST_PLAN` が `0` で無効化されておらず、`Prefill::ring_bytes_enabled()` が真であること。さらに expert 総量が 0 でなく GPU cache が全 expert を保持していないこと、host memory sampling が成功すること（`engine/src/program/generate.cpp:11432-11447`; `engine/src/prefill/prefill.cpp:833-835,3911-3913`）。
+- `--prefill N` のような固定 chunk では `o.prefill_auto` が偽となり、planner は使われない。`STRATA_PREFILL_HOST_PLAN` は先頭文字が `0` のとき無効化する（`generate.cpp:4000-4008,11438-11441`）。`STRATA_RING_BYTES=0` も planner の条件を満たさなくする。`STRATA_PREFILL_RING` は planner が選ぶ ring の実際の解決値に優先するが、`STRATA_SSD_GBPS` の速度値は上書きしない（`engine/src/prefill/prefill.cpp:833-835,843-875`; `engine/include/strata/prefill/prefill.hpp:204-211`）。
+- この値を指定する CLI 引数はなく、planner が使われる場合は本変数の正の数値が drive の自動判定値に優先する。
 
 ## 実行時の詳細
 
-値は `drive_read_gbps()` が呼ばれるたびに評価され、static cache されません。helper は GPU prefill 側と resident host 側の prompt 処理から呼ばれます。各呼び出しでは `o.native_preset` が空なら `o.pack`、そうでなければ `o.native_preset` を drive 判定の path として渡します。
+値は `drive_read_gbps()` の呼び出しごとに環境から読み直され、static cache には保存されない。同関数は host-aware planner の実行条件を通過したときだけ呼ばれる。単発 generate では prompt の chunk 設定中に呼ばれ、`n_batched > 1024` かつ loan が可能な場合に評価される。serve 経路では cache/borrow の初期化中に auto chunk planner から呼ばれる（`engine/src/program/generate.cpp:11432-11453,12449-12459,12629-12657,23990-24010`）。このため serve 中に環境を変更しても、初期化済みの prompt plan は再計算されない。値が効いても planner が元の chunk/ring を維持することがあり、変更は必ず発生するわけではない。planner は候補予測時間が少なくとも 5% かつ 2 秒改善するときだけ変更を採用し、それ未満の差なら既存選択を保つ（`engine/include/strata/program/prefill_plan.hpp:106-127`）。
 
-正の override がない場合、Linux では path の device 情報を sysfs から調べ、rotational disk は `0.15`、NVMe は `2.5`、その他の非回転 disk は SATA-class と仮定して `0.45` GB/s を使います。device を判定できない場合と Windows では `1.5` GB/s を使います。これらは planner の仮定値です。
+## ログと測定値
 
-planner は予測時間の読み込み項を `read_bytes / (ssd_gbps * 1e9)` として計算し、最小予測時間の候補を選びます。出力には `drive %.2f GB/s (%s)` として採用値と出所が stderr に表示されます。変数自体の値を読み取ったときに専用の警告やエラーを出す処理はありません。
+Planner が実行されると stderr に `strata: prefill plan inputs: ... drive %.2f GB/s (%s); ...` を出し、ここに採用速度と理由を表示する。設定値が採用された場合の理由文字列は `STRATA_SSD_GBPS`。planner の選択結果は `strata: prefill plan: ...` として出力され、選択変更時には chunk/ring と予測 read 量・時間、変更なしの場合には `kept` と予測値を表示する。条件未達で planner が早期 return した場合、これらの planner log は出ない（`engine/src/program/generate.cpp:1892-1894,11504-11518`）。この環境変数自体に紐づけて条件を示す実測値は、対象ソースと `docs/DETAILS.md` には記載がない。`DETAILS.md` は drive speed が host-aware plan に用いられ、`STRATA_SSD_GBPS` がその値を override すると説明している（`docs/DETAILS.md:346-351`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:1365-1380` — override の `getenv` / `atof` 判定、Linux の device 推定値と fallback。
-- `src/program/generate.cpp:1316-1334` — Linux で path の device と rotational 属性を調べる処理。
-- `src/program/generate.cpp:7651-7670` — planner の早期 return 条件、drive 速度の設定、別変数 `STRATA_PREFILL_PLAN_TOKS` の読み取り。
-- `src/program/generate.cpp:7719-7727` — 候補選択と planner 入力の stderr 表示。
-- `src/program/generate.cpp:8475-8494,15555-15571` — GPU prefill および resident host 経路からの呼び出し。
-- `include/strata/program/prefill_plan.hpp:81-98` — SSD 速度を含む予測時間の計算。
-- `docs/DETAILS.md:1943-1958` — planner の適用範囲、Windows の unbuffered 経路、関連変数についての説明。
+- `engine/src/program/generate.cpp:1840-1858,1889-1905` — drive 判別、速度の既定値、環境変数の parse。
+- `engine/src/program/generate.cpp:11432-11518` — planner 条件、host inputs、ログ、chunk/ring 選択。
+- `engine/src/program/generate.cpp:12449-12459,12629-12657` — serve 側の呼び出し条件。
+- `engine/src/program/generate.cpp:23990-24025` — generate 側の呼び出し条件。
+- `engine/include/strata/program/prefill_plan.hpp:81-99,106-127,152-173` — 予測時間、変更採用条件、ログ文言。
+- `engine/src/prefill/prefill.cpp:833-835,843-875,3911-3913` — ring-byte 条件と ring override。
+- `docs/DETAILS.md:346-351` — prompt host plan と drive speed override の説明。

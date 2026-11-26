@@ -1,60 +1,55 @@
 # `STRATA_CACHE_MESSAGE_BOUNDARY`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--serve` の会話 prompt cache に、直近のユーザー入力より前にあるメッセージ境界の checkpoint を追加します。長い会話で最後の短いメッセージだけが変わった場合、通常の定期 checkpoint より先の状態から prompt を読み直せるようにするための opt-in です。
+`--serve` の prompt cache に、最終ターンより前のメッセージ境界の checkpoint を追加する opt-in 変数。長い会話で最後の質問だけが変更されたとき、通常の checkpoint より先の履歴状態を再利用できる場合がある。既存の token / image の一致確認による再利用判定は残り、この変数は checkpoint を追加するだけである（`engine/src/program/generate.cpp:21491-21498`、`engine/sycl/src/program/generate.cpp:11627-11637`）。
 
-この変数は cache の再利用判定そのものを変えません。Strata は選んだ位置まで prompt を処理し、通常の会話 checkpoint と同じ状態 snapshot を保存します。次の request でも既存の token/image prefix 検査が再利用可否を決めます。
+同じ読み取りと分岐が CUDA/HIP 系の `engine/src/program/generate.cpp` と SYCL の `engine/sycl/src/program/generate.cpp` にある。名前への実コード参照はこの二箇所で、Python server 側の参照は候補位置を選ぶコメントである（`terminal/serve/server.py:2498,2542-2544`）。
 
 ## 値と判定
 
-CUDA と SYCL の server 実装は、どちらも `std::atoi(e) != 0` で判定します。文字列全体の比較ではなく、先頭の整数として変換できた値が 0 かどうかを見ます。
+両 engine は最初にこの処理へ到達したとき、関数内 `static const bool` の初期化で `std::getenv` を一度呼び、値が存在し、かつ `std::atoi(e) != 0` なら有効にする（`engine/src/program/generate.cpp:21491-21494`、`engine/sycl/src/program/generate.cpp:11627-11630`）。
 
-| 値 | 判定 |
+| 環境値 | 判定 |
 |---|---|
-| 未設定 | OFF |
-| 空文字、`true`、`abc`、`0`、`0suffix` | OFF（`atoi` の結果が 0） |
-| `1`、`-1`、`2`、`1suffix`、` 1` | ON（`atoi` の結果が非 0） |
+| 未設定 | 無効（`getenv` が null） |
+| 空文字 `""` | 無効（`atoi` は 0） |
+| `0`、`0anything`、`true`、数字で始まらない文字列 | 無効（先頭の整数変換結果が 0） |
+| `1`、`2`、`1anything`、`-1` | 有効（先頭の整数変換結果が非ゼロ） |
 
-したがって、値が文字列 `1` と完全一致する必要はありません。符号と先頭空白を含む整数の後ろに文字があっても、整数部分が非 0 なら ON です。値を一度読むと関数ローカルの `static const bool` に保存されます。最初の該当 request で初期化され、その後プロセス内で環境変数を書き換えても再評価されません。
-
-根拠: `src/program/generate.cpp:11003-11006`, `sycl/src/program/generate.cpp:10292-10295`。
+`atoi` は文字列全体の妥当性を検査せず、先頭の空白と符号の後にある10進数字列を整数化するため、大文字小文字や後続文字列は判定条件にならない。数値として変換できない先頭なら 0 になる。範囲外の値に対する `atoi` の結果は保証されず、Strata 独自のエラー処理・範囲制限もない。環境値を読んだ結果を CLI 引数で上書きする処理はない。機能側は別途 `--prompt-cache`、有効な `--turn-token` と単一 GPU 条件を要求する（同上; `engine/include/strata/program/message_boundary.hpp:9-17`）。
 
 ## 有効になる条件
 
-変数が ON でも、次の条件を満たすときだけ境界候補を作ります。
+- engine が `--serve` の prompt 読み取り処理を実行していること。通常実行のプロンプト読み取りにはこの分岐はない（`engine/src/program/generate.cpp:21459-21466`、`engine/sycl/src/program/generate.cpp:11593-11603`）。
+- `--prompt-cache` が正であること。既定値は 6 で、0 以下では message boundary を選ばない（`engine/src/program/generate.cpp:1086-1090,1293-1295,21497-21498`、SYCL 側 `engine/sycl/src/program/generate.cpp:11635-11637`）。
+- 実効 `multi_gpu` が false であること。層分割で複数 GPU を使う経路では変数が有効値でも無視される（同上）。
+- `--turn-token` が負でなく、今回の prompt で `resume` より後に最終ターン境界が見つかること。リクエストの `ckpt=0` は最終 turn checkpoint を無効にし、結果としてこの境界 checkpoint も選ばれない（`engine/src/program/generate.cpp:21464-21467,21482-21498,18841-18845`、`engine/include/strata/program/message_boundary.hpp:9-12`）。
+- helper は最終 turn より前へ遡り、最初に見つけた `turn_token` の位置が 8,192 以上、かつ最終 turn から 16,384 token 以内の場合だけ位置を返す。対象 turn token が prompt 内にない、または条件を満たす過去の境界がなければ checkpoint は追加されない（`engine/include/strata/program/message_boundary.hpp:9-17`、呼び出し側 `engine/src/program/generate.cpp:21495-21498`）。
 
-- server request の checkpoint が有効（request の `ckpt` が 0 でない）。`ckpt=0` では `turn_at` が `-1` にされ、この候補は作られません。
-- `--prompt-cache` が正の値。既定値は 6、`--prompt-cache 0` なら無効です。
-- layer split ではない（実装上の `multi_gpu` が false）。helper-expert GPU の利用だけでこの条件が false になるわけではありません。
-- `--turn-token` が有効で、prompt 内に現在の turn boundary と、その直前にある別の turn token が見つかる。
-- 直前の turn boundary の token index が 8,192 以上で、現在の boundary から 1,024 token 以内にある。
-
-最後の二つの数値は `message_checkpoint_boundary()` の既定引数です。関数は現在の `turn_at` から後ろ向きに検索し、最初に見つかった前の turn token を候補にします。その token が `resume` より後でなければならず、prefix が 8,192 token 未満、または tail が 1,024 token を超える場合は候補を返しません。現在の turn token が無効、範囲外、または prompt 内の token と一致しない場合も候補はありません。
-
-`--tail-role-token` によって最後の短い reasoning-effort turn を checkpoint から除外する設定では、`turn_at` がその直前の boundary に調整されます。`--turn-token` は既定で `248045`、`--tail-role-token` は既定で無効です。
-
-根拠: `include/strata/program/message_boundary.hpp:9-17`, `src/program/generate.cpp:635-642,10977-11009`, `sycl/src/program/generate.cpp:10265-10298`。
+コード上、この判定に OS 固有の条件はない。利用可能性は実際に起動する CUDA/HIP または SYCL engine の build に依存する。
 
 ## 実行時の詳細
 
-有効な候補 index は prompt 読み込みの `cuts` に追加されます。Strata はそこまでの token を通常の prompt read path で処理し、境界に着いたら `checkpoint_at()` を呼び、会話状態の snapshot を `checks` に保存します。同じ長さの checkpoint が既にあれば新しい snapshot は作らず、その既存 checkpoint の使用 stamp を更新します。message-boundary 位置が turn/root/pin の位置と異なる場合は tail checkpoint として扱われ、checkpoint 数が `--prompt-cache` の上限を超えたとき、最新の checkpoint を除く tail checkpoint が通常 checkpoint より先に eviction 対象になります。
+環境値はプロセス起動直後ではなく、serve の prompt 処理がこの関数内 static 初期化へ初めて到達した時に一度だけ評価される。以降のリクエストでは同じ値が使われ、プロセス実行中に環境を変更しても再評価されない（`engine/src/program/generate.cpp:21491-21494`、`engine/sycl/src/program/generate.cpp:11627-11630`）。
 
-この追加位置は既存の prompt read を分割する場合があります。そのため checkpoint の保存・分割コストが生じ、短い prompt では余分な処理になる可能性があります。trace が有効な場合、保存時に stderr へ `strata serve: message boundary checkpoint: %lld tokens, %lld tail` を出します。trace が無効なら、この候補が採用されたことを示す専用ログはありません。
+選ばれた位置 `message_at` は prompt の読み取り区切り一覧に追加され、エンジンはそこまで読み進めた後に checkpoint を保存してから先を読み続ける（`engine/src/program/generate.cpp:21522-21527,21609-21623`、`engine/sycl/src/program/generate.cpp:11638-11652,11673-11685`）。保存状態は既存の会話 checkpoint cache に入り、`--prompt-cache N` の上限と既存の eviction の対象になる。message-boundary 用として保持される tail checkpoint は一つで、新しい tail の保存時に前の tail を削除する（`engine/src/program/generate.cpp:14710-14728`）。
 
-根拠: `src/program/generate.cpp:8026-8090,11033-11090`, `sycl/src/program/generate.cpp:10297-10300,10343-10350`, `include/strata/program/conv_cache.hpp:43-55`。
+設定が無効、条件が不足、または適切な境界がない場合、追加区切りは `-1` となり通常の読み取り区切りだけを使う。checkpoint の保存に失敗した場合、継続可能な失敗では stderr に `strata serve: checkpoint at ... skipped: its state could not be copied out (see above); the request goes on without it` と出して続行する。継続不能な失敗では stdout に `ERR saving a conversation checkpoint failed...` を出してリクエスト処理を `return 1` で終える（CUDA: `engine/src/program/generate.cpp:21610-21617`; SYCL: `engine/sycl/src/program/generate.cpp:11674-11681`）。
 
-## 文書との照合
+通常は有効化しただけでは専用ログを出さない。`STRATA_TRACE` が設定されている場合（空文字でも設定あり）、選択した区切りに到達すると stderr に `strata serve: message boundary checkpoint: %lld tokens, %lld tail` を出す（CUDA: `engine/src/program/generate.cpp:16069-16077,21621-21623`; SYCL: `engine/sycl/src/program/generate.cpp:11683-11685`）。
 
-`docs/MESSAGE_BOUNDARY_CACHE.md:13-19` も既定 OFF、prompt cache が必要、8,192 token 以上の prefix、1,024 token 以下の tail、layer-split 除外を説明しており、現行コードと一致します。同文書の性能表は境界方式と chunk size を同時に変えた過去の比較であり、この環境変数単独の効果を測った値ではありません。そのため本調査では性能向上率をこの変数の効果として記載しません。
+## ログと測定値
+
+この変数の現行 commit に対する測定値は確認できないため記載しない。Strata の `docs/MESSAGE_BOUNDARY_CACHE.md:15-19` は tail の上限を 1,024 token と記述しているが、現行の CUDA/HIP と SYCL の呼び出しは helper に `max_tail=16384` を渡している（`engine/src/program/generate.cpp:21497-21498`、`engine/sycl/src/program/generate.cpp:11635-11637`）。この文書ではソースの値を採用した。その他の専用ログは `STRATA_TRACE` 設定時の到達ログと、上記の checkpoint 失敗時ログである。
 
 ## 根拠
 
-- 読み取りと有効条件: `src/program/generate.cpp:11003-11009`, `sycl/src/program/generate.cpp:10292-10298`
-- 境界選択の条件: `include/strata/program/message_boundary.hpp:9-17`
-- request の turn boundary と prompt cache 設定: `src/program/generate.cpp:615,635-642,10977-11009`
-- checkpoint の作成と cache 上限: `src/program/generate.cpp:8026-8090,11033-11090`
-- tail checkpoint の eviction 規則: `include/strata/program/conv_cache.hpp:43-55`
-- 機能説明と測定値の制約: `docs/MESSAGE_BOUNDARY_CACHE.md:13-19,30-50`
+- `engine/src/program/generate.cpp:21491-21498,21522-21527,21609-21623`
+- `engine/sycl/src/program/generate.cpp:11627-11637,11638-11652,11673-11685`
+- `engine/include/strata/program/message_boundary.hpp:9-17`
+- `engine/src/program/generate.cpp:1086-1090,1293-1295,14710-14728,16069-16077,18841-18845`
+- `terminal/serve/server.py:2498,2542-2544`
+- `docs/MESSAGE_BOUNDARY_CACHE.md:15-19`（ソースとの記述差の確認のみ）

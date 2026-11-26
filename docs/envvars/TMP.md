@@ -1,51 +1,48 @@
 # `TMP`
 
-調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。外部ライブラリや OS が独自に読む場合の動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-`TMP` は `strata-vision` がテキストモデルの GGUF ヘッダーだけを複製する一時ファイルの保存先候補です。優先順位は `TMPDIR`、`TEMP`、`TMP`、`/tmp` で、`TMP` が選ばれるのは先行する二つが未設定または空文字のときです。通常の engine が直接読む設定ではありません。
+Strata が実際に `TMP` を判定して値を変える製品経路は、`terminal/serve/server.py` の `child_env()` が AMD/HIP backend 用に呼ぶ `hip_env_guard()` である。環境またはプロファイルの `env` にある一時ディレクトリ変数 `TMP` が空でなく、Strata がそのディレクトリへ一時ファイルを作れないと判定した場合、serve は書き込み可能な代替ディレクトリが見つかれば `TMP` をそこへ置き換えてエンジン子プロセスへ渡す。見つからなければ値は変更せず理由を stderr に出す。これは AMD/HIP 用の起動前補正で、他 backend ではこの検査・補正をしない（`terminal/serve/server.py:4007-4010, 4027-4028, 4054-4056, 4065-4095`）。
 
-Strata serve の HIP 起動経路では、子プロセスへ渡す `TMP` のディレクトリが書き込み可能かも確認します。使えない場合は、書き込み可能な代替ディレクトリへ環境値を差し替えます。
-
-Desktop の agent 起動処理は `TMP` を継承対象の環境変数に含め、成果物追跡では `TMP` が指すパスを除外対象に加えます。
+アプリ側では、Strata は `TMP` をエージェント子プロセスへ渡す標準環境変数の一つとして保持し、成果物追跡の除外パスにも追加する。これらは値を変更しない（`app/host/server/agent/harness-runtime.mjs:20-36, 75-83`; `app/host/server/agent/agent-bridge.mjs:181-190, 534`）。Windows インストーラーは既存インストール場所が `TMP` の下にあるかを調べ、その場合は保存場所の復元を行わない（`app/desktop/src-tauri/nsis/installer.nsi:1040-1067`）。
 
 ## 値と判定
 
-| 状態 | `strata-vision` の一時ディレクトリ選択 |
-|---|---|
-| `TMPDIR` が非空 | `TMP` は参照しない。`TMPDIR` を使う |
-| `TMPDIR` が未設定または空、`TEMP` が非空 | `TMP` は参照しない。`TEMP` を使う |
-| `TMPDIR` と `TEMP` が未設定または空、`TMP` が非空 | `TMP` の文字列をそのまま使う |
-| 三つとも未設定または空 | `/tmp` を使う |
+serve は `TMP` を文字列として parse せず、他の二つの名前とともに `env.get(k)` で存在・空でないことを確認し、値をディレクトリパスとして `_dir_writable()` に渡す。後者はそのディレクトリ内に `TemporaryFile` を作れるかを試し、`OSError` なら書き込み不可とする（`terminal/serve/server.py:4078`; `terminal/serve/server_parts/engines.py:1083-1088`）。
 
-値の trim、存在確認、書き込み確認、パス正規化はこの C++ 関数では行いません。選ばれたディレクトリ文字列の末尾に `/strata-vision-meta-<PID>.gguf` を連結します。したがって `TMP` が非空でも、ディレクトリが存在しない・書けない場合には一時ヘッダーの作成に失敗し得ます。
+| 条件 | unset | 有効になる値 | 無効になる値・扱い |
+|---|---|---|---|
+| serve の AMD/HIP backend | `TMP` が無ければ候補にならない | 空でない値のディレクトリに一時ファイルを作成できる場合、その値をそのまま維持 | 空文字は `env.get(k)` が偽なので検査されず、そのまま維持。空白、`0`、`1`、`true` なども真偽文字列として解釈せず、文字列どおりのパスとして検査する。作成できない場合は後述の代替先を探す |
+| serve の CUDA / SYCL / その他 backend | 環境値を継承 | 値にかかわらず `TMP` 固有の Strata 検査はしない | `TMP` による補正・警告なし |
+| デスクトップのエージェント起動 | 元の環境に無ければ追加されない | 名前が大文字小文字を問わず許可リストに一致すれば値を保持して渡す | `TMP` の値自体を判定・parse・補正しない。明示的な `extra` が同名値を持てば元環境の値を上書き |
+
+serve の `child_env()` はまず `os.environ` のコピーを作り、次にプロファイルの `cfg["env"]` の各キーを文字列化して上書きするため、同じ名前ならプロファイル値が検査対象になる。CLI 引数から `TMP` を直接設定する処理は確認できない（`terminal/serve/server.py:4007-4010, 4027-4028`）。
 
 ## 有効になる条件
 
-- `tools/vision/strata_vision` が、画像のモデル読み込みで `strata_open_text_model()` を呼ぶ経路でのみ読み取ります。vision encoder をビルドしていない場合や、画像 encoder を起動しない場合にはこの読み取りはありません。
-- `TMP` の候補順位は `TMPDIR` と `TEMP` より低く、これらが非空なら `TMP` の値は無視されます。比較は空文字かどうかだけで、大文字小文字や内容の形式は検査しません。
-- Strata serve は起動環境をコピーし、設定の `env` を重ねた後に vision encoder へ渡します。vision 固有の環境処理は GPU 可視デバイス変数を扱うもので、通常 `TMP` はそのまま継承されます。
-- serve の `hip_env_guard()` は backend が `hip` のときだけ呼ばれます。`TMP` を含む `TEMP`・`TMPDIR` の値が非空で、指す場所が書き込み不可なら、ログの親ディレクトリ配下の `tmp`、次に serve の `ROOT/tmp` を作成して書き込み確認し、最初に使えた場所で該当する環境値を置換します。どちらも使えなければ値は置換されず、警告を stderr に出します。値が空の場合、このチェックの対象にはなりません。
-- Desktop agent の `agentEnvironment()` は起動元環境から許可リストに一致するキーを選び、`TMP` を Harness 子プロセスへ渡します。追加環境 (`extra`) に同名キーがあればそちらが優先します。agent bridge の `trackerFolders()` は truthy な `env.TMP` を成果物追跡の除外パスに加えます。この処理は追跡対象を定めるもので、agent の一時ファイル置き場を `TMP` に変更するものではありません。
+- 値の検査・補正が実行されるのは `cfg.get("backend") == "hip"` の場合だけ。OS 条件はこの分岐にない（`terminal/serve/server.py:4054-4056`）。
+- `TMP` が未設定または空文字なら `bad` に含まれず、他の一時ディレクトリ変数も不正でなければ既定どおり変更されない（`terminal/serve/server.py:4078`）。
+- `TEMP` / `TMPDIR` も同時に検査する。`TMP` が不正でも、他の変数が正常でも `TMP` は補正対象になる。不正な変数が複数あるときは、見つかった一つの代替ディレクトリをそれらすべてに設定する（`terminal/serve/server.py:4078-4089`）。
+- 代替先は `cfg["log"]`、なければ `cfg["cwd"]`、なければ Strata の `ROOT` を基準にした親ディレクトリの `tmp`、続いて `ROOT/tmp`。ディレクトリを作成でき、`_dir_writable()` が成功した最初の場所を使う（`terminal/serve/server.py:4080-4089`）。どちらも使えない場合、`TMP` は不正な元の値のまま残る（`terminal/serve/server.py:4090-4094`）。
+- 通常起動では `child_env()` の環境がエンジンの `Popen` に渡る。レプリカ・分割起動および split-engine fallback も `child_env()` を通るため、HIP backend の各子エンジン用に同じ補正が行われる（`terminal/serve/server.py:833-835, 8820-8824, 8850-8852, 8912-8919, 9391-9394`）。
 
 ## 実行時の詳細
 
-`strata_open_text_model()` は `TMPDIR`、`TEMP`、`TMP` の順に `std::getenv()` し、未設定または空文字なら次候補へ進みます。選んだ場所に PID を含む名前で GGUF ヘッダーの一時コピーを作り、作成できた場合はそのファイルを vocab-only モデルとして読み込みます。コピーに失敗した場合は元のモデルファイルを直接読み込む経路を試します。コピー経路の後は一時ファイルを `std::remove()` します。`TMP` を選んだ後に自動でディレクトリを作成する処理はありません。
+`hip_env_guard()` は起動環境を作る `child_env()` の中で呼ばれ、子エンジンの生成より前に一度チェックする。プロセス起動後に環境を変えても、既に作成された子プロセスへは反映されない。関数内・モジュール内のキャッシュはなく、別の子エンジン環境を構築するたびに検査する（`terminal/serve/server.py:4007-4010, 4054-4056, 4078-4095`; `terminal/serve/server.py:833-835`）。
 
-HIP serve の環境ガードが値を差し替える場合、stderr の文言は `TMP=<値> is not writable: using <代替先>` です。代替先が見つからない場合は `TMP` などの該当変数名を列挙して `not writable (AMD's runtime needs a writable temporary folder)` と出力します。このガードは書き込みテストに `tempfile.TemporaryFile(dir=p)` を使います。
+書き込み不可の判定は、ディレクトリの存在確認だけでなく、実際に一時ファイルを作る試行に基づく。代替ディレクトリ作成で `OSError` が起きた場合は次の候補へ進む。正常な値は維持し、代替先がない場合も起動を拒否せず、元値を残して警告を出す（`terminal/serve/server_parts/engines.py:1083-1088`; `terminal/serve/server.py:4080-4095`）。
 
-画像ツールの一時ディレクトリ選択は関数呼び出しごとで、値をキャッシュしません。HIP guard はサーバー起動時に作る engine 子環境だけを変更し、サーバープロセス自身の環境は変更しません。Desktop agent の `TMP` 引き継ぎと追跡除外は、それぞれ Harness 起動時と成果物追跡時に使われます。
+## ログと測定値
 
-## 文書との照合
-
-`docs/DETAILS.md` の vision 設定説明に `TMP` の選択規則は記載されていません。上記はソース上で確認できた適用範囲です。serve 側の HIP ガードの説明は Python の実装コメントと実処理を根拠にし、HIP runtime 内部の挙動そのものは説明していません。
+`TMP` を含む不正値を代替先へ差し替えたとき、stderr に `strata serve: AMD: TMP=<元の値> is not writable: using <代替先>` を出す。代替先が見つからないとき、問題の変数名一覧に応じて `strata serve: AMD: TMP not writable (AMD's runtime needs a writable temporary folder)`（複数なら名前をカンマ区切り）を出す。正常値、未設定、空文字ではこの補正ログは出ない。これは Strata の診断文言であり、外部 AMD runtime の挙動を示す記述ではない（`terminal/serve/server.py:4086-4095`）。測定値は該当なし。
 
 ## 根拠
 
-- `tools/vision/gguf_meta.h:135-155` — `TMPDIR` → `TEMP` → `TMP` → `/tmp` の選択、一時 GGUF 名、読み込みと削除、直接ロードへの fallback。
-- `tools/vision/strata_vision.cpp:208-212` — 画像 encoder の起動時に `strata_open_text_model()` を呼ぶ。
-- `serve/server.py:3500-3537, 3540-3578, 8344-8352` — serve の子環境構築、HIP guard の条件と処理、Strata engine 起動時の呼び出し。
-- `serve/server.py:3540-3578` — HIP backend 向けの一時ディレクトリ書き込み確認、環境値の置換と stderr 出力。
-- `apps/host/server/agent/harness-runtime.mjs:20-36,75-83` — `TMP` を許可リストから Harness 子プロセスへ渡す処理。
-- `apps/host/server/agent/agent-bridge.mjs:126-135,355` — `TMP` を成果物追跡の除外パスに加え、tracker に渡す処理。
+- `terminal/serve/server.py:4007-4010, 4027-4028, 4054-4056, 4065-4095` — serve 環境の構築、HIP 条件、判定、差し替え、ログ。
+- `terminal/serve/server_parts/engines.py:1083-1088` — 一時ファイル作成による書き込み可能性判定。
+- `terminal/serve/server.py:833-835, 8820-8824, 8850-8852, 8912-8919, 9391-9394` — 子エンジンへの環境受け渡し。
+- `app/host/server/agent/harness-runtime.mjs:20-36, 75-83`; `app/host/server/agent/agent-bridge.mjs:181-190, 534` — エージェント環境の許可リスト転送と成果物追跡の除外指定。
+- `app/desktop/src-tauri/nsis/installer.nsi:1040-1067` — インストール先復元時の `TMP` 下判定。
+- `terminal/tools/vision/gguf_meta.h:136-155` は `TMP` を含む一時パス選択を行うが、呼び出し側は `gguf_meta_test.cpp` のみで、`terminal/tools/vision/CMakeLists.txt:124-142` ではテスト oracle 専用・`EXCLUDE_FROM_ALL` とされ、配布する `strata-vision` はリンクしない。そのため製品動作としては扱っていない。

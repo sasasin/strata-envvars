@@ -1,52 +1,52 @@
-# `--no-spec-split`
+# `strata --no-spec-split`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（エンジン引数、root） |
+| コマンド | `strata`（エンジン引数） |
 | オプション | `--no-spec-split` |
 | 別名 | なし |
 | 値 | 値を取らないフラグ |
 
 ## 役割
 
-投機的検証ウィンドウの split を無効にします。split は有効な場合、2個以上の token を含む検証ウィンドウを2グループに分けて処理する設定です。通常の CUDA/HIP engine では split は既定で無効なので、このオプション単独では既定状態を変えません。`--spec-split` を同時に使う場合に、引数順に応じて split を無効へ戻せます。parser は `src/program/generate.cpp`、SYCL 側 parser は `sycl/src/program/generate.cpp` にあります（それぞれ 709, 2632–2634, 2734 行および 1929–1932, 2011 行）。
+推測デコードの verifier が複数 token の検証窓を二群に分ける設定を無効にします。エンジン設定の既定値も無効なので、主に `--spec-split` を指定した同じ引数列で後から無効へ戻す用途です。推測デコード自体や候補 token 数を無効化するフラグではありません。
 
 ## 使い方
 
-エンジンの通常の root 引数として指定します。
-
 ```sh
-strata --pack ./pack --tokens "1,2,3" --spec 4 --no-spec-split
+# --spec-split を先に指定していても、後続の --no-spec-split で無効にする
+strata --model MODEL.gguf --tokens 1,2,3 --spec 4 --spec-split --no-spec-split --max-new 16
 ```
-
-上例では `--spec-split` を指定していないため、`--no-spec-split` は既定の無効状態を明示するだけです。split を有効化する指定と併用する場合は、後に書いた値が残ります。
 
 ## 値と既定値
 
-値は不要です。`Options::spec_split` は初期値 `false` です。parser は `--spec-split` で `true`、`--no-spec-split` で `false` を設定し、出現ごとに上書きするため、両方を指定した場合は最後の方が有効です。同じフラグを繰り返しても同じ値を再設定するだけです。独自の値 validation はありません（`src/program/generate.cpp:709, 2632, 2734`、SYCL parser: `sycl/src/program/generate.cpp:1929, 2011`）。
+値を取りません。設定構造体の `spec_split` は初期値 `false` で、parser はこのフラグを読むと `false` を代入します（`engine/src/program/generate.cpp:1069,4196`）。同じ parser は `--spec-split` で `true` を代入するため、両方を指定した場合は後に現れた方が有効です（同 `:4064,4196`）。範囲検証や数値変換はありません。
 
 ## 実行時の動作
 
-エンジンは `spec_split` を verifier の `set_split` に渡します（layer split の stage verifier、pipeline 側 verifier、および通常 verifier: `src/program/generate.cpp:9212-9231, 16168-16170`）。CUDA verifier は split が有効で、検証対象 token 数 `T` が2以上、かつ batch recurrence でない場合に `G=2` とし、token 範囲を `(T + 1) / 2` の境界で二つに分けます。それ以外は `G=1` です（`include/strata/core/verify.hpp:338`、`src/core/verify.cpp:1122, 1141`）。SYCL verifier にも同じ `G` 判定があります（`sycl/src/core/verify.hpp:250`、`sycl/src/core/verify.cpp:831`）。
+CUDA/HIP 系の通常エンジンでは、設定値を verifier の `set_split` に渡します。`engine/include/strata/core/verify.hpp:424-426,770` では、この設定は検証窓を二つの token 群に分け、一方の CPU expert 処理と他方の GPU 処理を重ねるためのものとされています。`engine/src/core/verify.cpp:1484-1486` では、設定が有効で `T >= 2`、かつ batch-recording 中でない場合に窓を 2 群 (`G = 2`) にし、それ以外は 1 群にします。`T > kVerifyMaxT` の窓はこのフラグが無効でも 2 群に分割されます。
 
-したがって、`--spec-split --no-spec-split` の順では無効、`--no-spec-split --spec-split` の順では有効になります。検証ウィンドウが実行されない場合、`T < 2` の場合、または batch recurrence の場合には、この設定による二分は行われません。
+通常の生成経路は verifier に設定値を渡し（`engine/src/program/generate.cpp:24538-24547`）、serve の multi-GPU stage と pipelined verifier にも同じ値を設定します（同 `:13682-13707`）。したがってこのフラグは複数 GPU の layer split 自体を無効にするものではなく、その verifier の窓分割設定を無効にします。SYCL parser にも同じ代入があり（`engine/sycl/src/program/generate.cpp:706,2057,2160`）、値の初期値・代入が確認できます。
 
 ## 適用条件と副作用
 
-この設定が使われるのは verifier の検証ウィンドウです。CPU/GPU の split 検証グループを作らない設定となります。parser と verifier のソース上、このフラグ自体がファイル、環境変数、ネットワーク、子プロセスを変更する処理は確認できません。分割による実行時間への効果は hardware、model、window に依存するため、ここでは一般化しません。
+このフラグ単独ではファイル、ネットワーク、子プロセスを操作せず、GPU 呼び出しも直接行いません。効果は parser が設定した値を verifier が使う場合に限られます。上記の通り、長さが `kVerifyMaxT` を超える窓や batch-recording 経路では、`--no-spec-split` だけで必ず一群になるとは限りません。
+
+`strata-engine` の通常 parser とは別に、`--model` または `--native` の GGUF family を判定して Qwen3.6-35B 用 `engine/src/qwen35` parser に振り分ける経路があります（`engine/src/program/generate.cpp:3804-3818`）。その専用 parser では `--no-spec-split` の定義・使用箇所を確認できなかったため、そのモデル経路での受理動作はここでは断定できません。
 
 ## 出力とエラー
 
-このフラグ自体に専用の stdout/stderr 出力や validation error はありません。値を要求しないため単独で末尾に置けます。別の未知引数がある場合は parser が `unknown argument: ...` を stderr に出し、usage を表示して status 2 を返します（`src/program/generate.cpp:2418-2420, 2787-2792`）。
+通常 parser ではこのフラグ専用の出力や validation error はありません。通常 parser に認識されない引数は `unknown argument: <引数>` を stderr に出し、usage を表示して終了コード `2` を返します（`engine/src/program/generate.cpp:4268-4273`）。Qwen3.6-35B 専用 parser については上記のとおり未確認です。
 
 ## 根拠
 
-- parser の既定値と split/no-split 設定: `src/program/generate.cpp:709, 2632, 2734`。
-- verifier への値の設定と適用条件: `include/strata/core/verify.hpp:336-338`、`src/program/generate.cpp:9212-9231, 16168-16170`、`src/core/verify.cpp:1122, 1141`。
-- SYCL parser と適用条件: `sycl/src/program/generate.cpp:1929, 2011`、`sycl/include/strata/core/verify.hpp:250`、`sycl/src/core/verify.cpp:831`。
-- 索引上の配置: `docs/cli/README.md:1128-1135, 1237`。索引は `strata-engine` の root parser 群に本オプションを掲載しています。
-
-この調査では checkout 内の CUDA/HIP および SYCL ソースを確認しました。ビルド済み CLI の `--help`、Release artifact、実機上での性能差は確認していません。
+- `engine/src/program/generate.cpp:1069,4196` — `spec_split` の初期値と `--no-spec-split` parser。
+- `engine/src/program/generate.cpp:4064` — 対になる `--spec-split` の設定。parser は引数を順に処理する。
+- `engine/include/strata/core/verify.hpp:424-426,770` — verifier の二群分割設定の説明と保存先。
+- `engine/src/core/verify.cpp:1484-1486` — `T`、`split_`、batch-recording に応じた群数。
+- `engine/src/program/generate.cpp:13682-13707,24538-24547` — serve の stage/pipeline および通常生成経路で verifier に値を渡す箇所。
+- `engine/sycl/src/program/generate.cpp:706,2057,2160` — SYCL 側の既定値、対向フラグ、無効化 parser。
+- `engine/src/program/generate.cpp:3804-3818,4268-4273` — Qwen3.6-35B parser への振り分けと通常 parser の未知引数エラー。

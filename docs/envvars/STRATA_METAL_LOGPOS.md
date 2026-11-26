@@ -1,40 +1,42 @@
 # `STRATA_METAL_LOGPOS`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal engine の decode window が得た logits から、次の連続した window の先頭 token の対数確率と、その時点の top 64 token の対数確率をファイルに追記する診断・テスト用フックです。ソースコメントでは KL harness の行形式に合わせた test tooling とされています。通常の生成設定を選ぶための変数ではありません。
+Metal の decode window が保持する logits から、次に入力された token の log-probability と上位 64 token を指定ファイルへ追記する、テスト・調査用フックです。通常のモデル計算や token 選択を設定値で変更する処理ではありません。`Window::finish` から呼ばれる `Window::logpos` がファイル出力を行います（`engine/metal/src/engine/window.cpp:570-580,1822-1853,2066-2107`）。
 
 ## 値と判定
 
-| 値 | 動作 |
-|---|---|
-| 未設定 | 出力しない。 |
-| 設定済みの任意の文字列 | 文字列をパスとして使用する。数値や特定文字列の parse はしない。空文字も「設定済み」だが、空パスへの `fopen` が失敗するため出力されない。 |
+| 条件 | 未設定 | 値の扱い | 例 |
+|---|---|---|---|
+| Metal decode window | 読み取った `path` が null のため出力しない | 文字列を変換せず `std::fopen(path, "ab")` に渡す | `0`、`1`、`true` はフラグではなく、それぞれその名前のパス。空文字も設定済みだが空パスでの open を試みる |
 
-`std::getenv` の結果を `Window::logpos` 内の `static const char*` に初回呼び出し時に保存します。そのため、その読み取り後に環境を変更してもパスは再取得されません。各 `Window` は最初の出力対象呼び出し時に `fopen(path, "ab")` し、同じファイルを追記モードで使います。ファイルを開けなかった場合は何も出力せず、エラーもログしません。
+数値 parse、真偽値 parse、空白除去、大文字小文字比較、値域検査、既定パスへの fallback はありません。`fopen` が失敗した場合は出力せず、Strata は警告やエラーを出しません（`engine/metal/src/engine/window.cpp:1822-1826`）。CLI 引数や設定ファイルからこの値を上書きする処理も見つかりません。
 
 ## 有効になる条件
 
-- Metal backend の `Window::finish` から呼ばれる `Window::logpos` が実行されること。
-- `STRATA_METAL_LOGPOS` が設定されていること。
-- その window の `head` が true であること。`STRATA_METAL_LOGPOS` 自体は `head` を有効にしません。Metal の `window_run` は別変数 `STRATA_LOGPOS` が設定されていれば全 window で `head` を強制します（ここでも値の内容ではなく設定の有無を見ます）。
-- ログ対象として保存する logits は `Tn == 1` の window に限られます。head が true でも複数 token の window は logits 行を保存しません。
-
-このため、`STRATA_METAL_LOGPOS` だけを設定しても、呼び出し元が `head=false` の経路では出力されません。prompt の複数 token window もこの変数では記録対象になりません。
+- `engine/metal` の Strata Metal engine をビルドし、decode window の `window_run` 経路を使うこと。Metal build は macOS 専用で、`STRATA_METAL_ENGINE` が有効な場合に engine を構成します（`engine/metal/CMakeLists.txt:1-2,18-20,103-111`）。他 backend にこの変数の読み取り箇所はありません。
+- 値が null でなく、指定したパスを `"ab"` モードで開けること（`engine/metal/src/engine/window.cpp:1823-1826`）。
+- `logpos` が `head == true` で呼ばれること。`STRATA_LOGPOS` が設定されている場合、`window_run` は通常の `head` 引数にかかわらず Metal window に `head=true` を渡します。これは別変数による条件であり、本変数自身は head を有効化しません（`engine/metal/src/engine/window.cpp:3650-3656`）。
+- 行データを作るには `Tn == 1` の head window が必要です。位置が連続する後続 head window が来ると、前回の logits と今回の `tokens[0]` から行を書きます（`engine/metal/src/engine/window.cpp:1827-1853`）。
 
 ## 実行時の詳細
 
-1-token かつ head 有効の window で、`lm_` の語彙全体の logits をコピーし、log-sum-exp、argmax、logit 上位64件を保存して次回出力用に保留します。次の head 有効 window があり、その `pos0` が保留中の位置のちょうど1つ後なら、次 window の `tokens[0]` を target として1行を書きます。行はタブ区切りで、位置（最初に記録した位置からの相対値）、target token ID、target の log probability、argmax ID、固定の4個のゼロ、続いて上位64件の `token_id:log_probability` です。対数確率は logits から計算し、小数点以下6桁で出力します。各行の後に改行と `fflush` を行います。
+`Window::logpos` 内の関数ローカル `static const char*` が、最初に関数へ入ったとき `std::getenv` を一度実行して値を保持します。そのため、それ以降にプロセス環境を変えても読み直しません。ファイルは head window の呼び出し時に遅延して `"ab"` で開かれ、成功した `FILE*` は当該 `Window` が存続する間再利用されます。window の破棄時に close します（`engine/metal/src/engine/window.cpp:1822-1826,2041-2045`）。
 
-次の head window が連続位置でない場合、保留中の logits 行は出力されず、新しい保留値に置き換えられます。最後の window の保留値は、後続 window が来ない限り出力されません。ファイルは `Window` の破棄時に閉じられます。
+`Tn == 1` の head window ごとに `lm_` の語彙全体をコピーし、log-sum-exp を計算して argmax と上位 64 件を保持します。次の head window の `pos0` が保存済み位置 `lp_pos_ + 1` と一致すると、次の入力 token `tokens[0]` を対象として行を出力します。行はタブ区切りで、位置（最初に処理した位置からの差）、target token ID、その log-probability、argmax ID、固定の `0` を4列、続けて `id:log-probability` の上位64件です。各 log-probability は logits から正規化して出し、行ごとに改行と `fflush` を行います（`engine/metal/src/engine/window.cpp:1827-1853`）。
+
+対象位置の直後に head window が来なければ、その保留行は出ません。後続 window が複数 token なら直前行を出力した後、その window 自体の logits は記録せず、位置が飛んだ場合も保留行を破棄します。最後の保留行を flush する destructor 処理もありません（`engine/metal/src/engine/window.cpp:1827-1836,2041-2045`）。このログ処理は `finish` の出力 token を書き換えず、行列計算や sampler の選択を変更する分岐もありません（`engine/metal/src/engine/window.cpp:2104-2123`）。
+
+## ログと測定値
+
+本変数のための stderr/stdout メッセージ、open 失敗の警告、終了コード変更はありません。観測結果は指定先に追記される TSV 行です。Strata の `docs/QUANTS.md` は別の `STRATA_LOGPOS` による品質測定形式を説明していますが、`STRATA_METAL_LOGPOS` 固有の測定結果や通常利用向け仕様は記載していません（`docs/QUANTS.md:54-65`）。
 
 ## 根拠
 
-- `metal/src/engine/window.cpp:304-314`: test tooling と出力内容の意図、保持状態とメソッド宣言。
-- `metal/src/engine/window.cpp:1223-1255`: 環境変数の読み取り、追記 open、連続位置判定、1-token 条件、logits からの log-probability/top 64 計算、行出力と flush。
-- `metal/src/engine/window.cpp:1302-1304,1319-1330`: window 破棄時のファイル close と finish からの呼び出し。
-- `metal/src/engine/window.cpp:2491-2495`: `STRATA_LOGPOS` の設定有無で head を強制する処理。
-
-対象ソース中にこの変数を説明する別の設計資料は見つかりませんでした。用途と形式の説明は実装コメントおよびコードに基づきます。
+- `engine/metal/src/engine/window.cpp:570-580` — ログ状態と用途コメント。
+- `engine/metal/src/engine/window.cpp:1822-1853` — 値読み取り、open、行の作成・出力。
+- `engine/metal/src/engine/window.cpp:2041-2045,2066-2123` — close、呼び出し位置、通常の出力 token との関係。
+- `engine/metal/src/engine/window.cpp:3650-3656` — 別変数 `STRATA_LOGPOS` が head 条件を変える経路。
+- `engine/metal/CMakeLists.txt:1-2,18-20,103-111` — Metal backend の build 範囲。

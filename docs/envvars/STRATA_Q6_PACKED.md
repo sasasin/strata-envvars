@@ -1,58 +1,56 @@
 # `STRATA_Q6_PACKED`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。対象は Strata 所有ソース。外部ライブラリの動作と測定記録は根拠にしていない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-Q6_K の出力 head（通常の `output.weight` と、条件を満たす MTP draft head）をロード時に別の平面配置へコピーします。登録された head に対する native MMVQ の呼び出しは、そのコピーを読む packed kernel に切り替わります。量子化値を変換する機能ではなく、各ブロックの `ql`、`qh`、`scales`、`d` のバイトを分けて並べた追加コピーです。
-
-対象はこの native head 経路です。ソース上では Q6_K の全行列を一律にパックせず、`NativeHead::load()` と、MTP が head から token subset を作る経路だけが登録を試みます。
+CUDA/HIP 系および SYCL のネイティブ Q6_K 行列ベクトル積で、ネイティブ出力ヘッドと MTP draft head の重みを、通常の GGUF ブロック配置から planes 配置へ追加コピーし、その登録済みコピーを使う経路を有効にする。設定値だけでは全 Q6_K 行列が対象になるわけではなく、実際に pack されるのは type 14 の出力ヘッドと、そこから切り出す MTP draft head。一般のモデル重みを一括変換する設定ではない（`engine/src/core/native_head.cpp:262-264`、`engine/src/core/mtp.cpp:988-995`、`engine/sycl/src/core/native_head.cpp:91-96`、`engine/sycl/src/core/mtp.cpp:855-872`）。
 
 ## 値と判定
 
-カーネル側の `native_q6_k_packed_enabled()` は `getenv("STRATA_Q6_PACKED")` の結果が文字列全体でちょうど `1` の場合だけ有効とします。先頭文字だけの比較ではなく、数値変換もしません。
+CUDA/HIP 実装・SYCL 実装とも `native_q6_k_packed_enabled()` が初回呼び出し時に `std::getenv` の値を読み、文字列全体がちょうど `"1"` の場合に限り有効とする。空文字、`"0"`、`"true"`、`"1x"`、`" 1"`、`"01"` は無効。数値変換や trim、大文字小文字変換はしない。未設定も無効（`engine/src/kernels/cuda/native_mmvq.cu:3145-3151`、SYCL は `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3091-3097`）。
 
-| 環境変数の状態 | 判定 |
-|---|---|
-| 未設定 | 通常は無効。後述の gfx1151 HIP 既定値が適用された場合は `1` が設定される |
-| 空文字 | 無効。設定済みなので gfx1151 の自動既定値も抑止する |
-| `1` | 有効 |
-| `01`, `10`, `1x`, `true`, `0` など | 無効 |
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| CUDA/HIP または SYCL のネイティブ Q6_K 実装 | 無効。ただし後述の AMD アーキテクチャ既定値が未設定時に `1` を注入する場合がある | `1` のみ | 空文字、`0`、`true`、`1anything`、空白付きの値など、`1` と完全一致しない値 |
 
-判定結果は関数内の `static const bool` に保存され、プロセス内の初回呼び出し時に一度だけ読み取られます。その後に環境を書き換えても再判定しません。gfx1151 の既定値設定は、生成処理が engine の設定を読む前に行われます。
+設定有無と値判定は異なる箇所もある。AMD 既定値注入は `getenv(...) != nullptr` で設定の有無を見ており、空文字を含む明示値があれば既定値を注入しない。その後の機能判定では空文字は無効になる（`engine/src/core/arch_defaults.cpp:307-310,318-323`）。`generate.cpp` の DFlash2 head 共有見積もりも `getenv(...) == nullptr` を条件に使うため、空文字でも共有見積もりを抑止する（`engine/src/program/generate.cpp:8406-8410`）。
 
 ## 有効になる条件
 
-環境変数の判定が true でも、パック対象の Q6_K 行列が次を満たす必要があります。
-
-- 重みポインターが null でない。
-- `n_in > 0` かつ `n_in` が 256 の倍数。
-- `n_in / 256 >= WARPS * WARP / 32`。
-- `n_out >= 2048`。
-
-形状が対象外、コピーや割り当てに失敗、または registry に対象ポインターがなければ、パック版は使われず通常の Q6_K MMVQ に進みます。multi-column 呼び出しでは `g_multi_exact` が false の場合も packed dispatch が辞退します。登録済みでも、解除後は同じく通常経路です。
-
-HIP の `STRATA_USE_HIP` build では、`generate` が gfx1151 と判定したときにアーキテクチャ既定値表が `STRATA_Q6_PACKED=1` を追加します。ただし、利用者が変数を何らかの値（空文字を含む）に設定済みなら、その値が優先されます。また `STRATA_GFX1151_DEFAULTS` の先頭文字が `0` なら既定値表全体が無効になり、この変数も自動設定されません。gfx1200/gfx1201 用の既定値表にはこの変数がなく、CUDA build ではこの gfx1151 既定値設定ブロック自体が実行されません。したがって、それらの環境で使うには明示的に `STRATA_Q6_PACKED=1` を設定します。
+- 有効値であることに加え、ネイティブヘッドがロードされ、その GGUF type が Q6_K（type `14`）であること。CLI の `--native-head-gguf PATH` は `--stream-token` が必要で、複数 GPU 経路ではこの指定による native head load を行わない（`engine/src/program/generate.cpp:1262,3927,5380,8391-8399`）。MTP draft head についても、MTP の bind で Q6_K draft head が作られる必要がある（`engine/src/core/mtp.cpp:988-995`）。
+- pack は `weights != nullptr`、`n_in > 0`、`n_in % 256 == 0`、`n_in / 256 >= WARPS * WARP / 32`、`n_out >= 2048` の全条件を満たす場合だけ試行される。既に registry にある重みなら再 pack せず成功扱いにする（`engine/src/kernels/cuda/native_mmvq.cu:3153-3157`、SYCL は `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3191-3197`）。
+- CUDA/HIP の AMD アーキテクチャ既定値は、gfx1151 では `STRATA_GFX1151_DEFAULTS` が先頭文字 `0` でなく、`STRATA_DEFAULTS=026` の旧テーブル選択でない場合に既定表へ `STRATA_Q6_PACKED=1` を含む（`engine/src/core/arch_defaults.cpp:28-29,64-66,79-81`）。gfx1100/1101/1102 の discrete RDNA3 は `STRATA_GFX11_DEFAULTS=0` 等で無効化されず、明示値が未設定なら既定値表から注入する（`engine/include/strata/core/gfx11_extra.hpp:41-58`、`engine/src/core/arch_defaults.cpp:312-323`）。この注入は HIP ビルドの起動処理から呼ばれる（`engine/src/program/generate.cpp:4287-4291,4320`）。
+- gfx1103（Linux のみ）および gfx1150 は、experimental opt-in が有効な setup 経路で `terminal/strata_control/setup_config.py` が `env` 設定へ `"1"` を書く。既定では opt-in は有効で、setup の環境変数 `STRATA_EXPERIMENTAL_GFX1103=0` / `STRATA_EXPERIMENTAL_GFX1150=0` で無効化される（`terminal/setup.py:4454-4459,4472-4485`、`terminal/strata_control/setup_config.py:452-465`）。これらのカードは engine の arch-default 表ではなく setup の config が既定値を供給する。
+- gfx12 の arch-default 表にはこの変数がなく、NVIDIA の arch-default 表にもこの変数の既定値注入はない。明示的に `1` を渡した場合の機能判定とは別に、ここで挙げた AMD の自動既定値が他世代へ広がるわけではない（`engine/src/core/arch_defaults.cpp:30-63,64-90`）。
+- AMD の arch-default 注入は既存環境値を尊重する。`setenv(..., overwrite=0)`（Windows は `_putenv_s`）を用い、表の値は `getenv` が null の場合だけ設定する（`engine/src/core/arch_defaults.cpp:218-223,307-323`）。一方、terminal server は親プロセス環境を複製した後、run config の `env` を上書き適用して engine を起動するため、config にこのキーがある場合は親環境の同名値より config 値が優先される（`terminal/serve/server.py:4010,4027-4028`）。対象変数用の CLI 引数による別の優先規則は確認できない。
 
 ## 実行時の詳細
 
-`NativeHead::load()` は GGUF の出力重みを device に読み込んで型を記録した後、型 ID が 14（Q6_K）で、環境判定が有効なら `native_q6_k_pack()` を呼びます。MTP の subset head も、subset 作成後の型が Q6_K であれば同じ登録を試みます。pack 関数の戻り値は呼び出し側で処理分岐に使わず、登録に失敗した場合も head のロード自体を失敗扱いにはしません。
+`native_q6_k_packed_enabled()` は関数内 `static const bool` で値を一度だけキャッシュする。プロセス中に環境値が変わっても、最初の評価結果は更新されない（`engine/src/kernels/cuda/native_mmvq.cu:3145-3151`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3091-3097`）。
 
-pack 関数は GGUF 配置の device 重みを host に読み戻し、Q6_K block ごとの 128 byte `ql`、64 byte `qh`、16 byte `scales`、2 byte `d` を、それぞれ 256 byte 境界にそろえた平面へコピーします。その平面一式を別の device allocation に転送し、元の重みポインターをキーに registry へ登録します。追加 VRAM はほぼ元の重みサイズ分です（平面境界の padding を含みます）。成功時は stderr に `strata: STRATA_Q6_PACKED=1 packed the %s (%d x %d, +%.1f MiB)` を出します。対象外や失敗時にはこの成功ログは出ません。
+有効で対象形状なら、pack 関数は Q6_K blocks を host 上で ql/qh/scales/d の planes に並べ、device memory にコピーして元 weights pointer と packed planes の対応を registry に登録する。`native_q6_k_mmvq()` は registry に対象 pointer と次元があり、かつ複数列の場合は `native_mmvq_multi_exact` が有効なときに packed kernel を使う。それ以外は packed 経路を断り、既存の Q6_K MMVQ 処理へ続く（`engine/src/kernels/cuda/native_mmvq.cu:2944-2979,3153-3182,3600-3610`、SYCL は `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3935-3945`）。
 
-`native_q6_k_mmvq()` の入口では registry を調べ、登録があり、shape が一致し、バイパス中でなく、column 条件を満たせば packed kernel を起動します。それ以外は従来の Q6_K kernel に進みます。実装コメントと API 宣言は packed 配置を同じ元バイトの再配置とし、出力が元 kernel と bitwise equal と説明しています。`STRATA_Q6P_SELFTEST` はロード時の比較・タイミング診断を追加する別変数で、`STRATA_Q6_PACKED` の有効値判定ではありません。
+pack 条件不成立や device への確保・コピー失敗では pack 関数が `false` を返し、呼び出し側はその戻り値で失敗扱いにせず通常の Q6_K 経路を継続する。これらの失敗分岐にこの変数専用の警告ログはない（`engine/src/kernels/cuda/native_mmvq.cu:3153-3176`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3191-3241`）。CUDA/HIP native head では packed Q6_K は pinned host memory への head spill と peer-head split の候補から除外される。また、Q6_K bit-plane head の生成も抑止される（`engine/src/core/native_head.cpp:130-136,225-227,262-271,297-300`）。
 
-NativeHead の破棄時、および所有する MTP subset head の破棄時に registry 登録を解除し、packed allocation を解放します。共有 MTP head の所有権は共有元に残ります。
+MTP draft head も pack 対象になり、`dhead_plain_` を false にする（CUDA/HIP: `engine/src/core/mtp.cpp:988-995`）。ただし `generate.cpp` の DFlash2 head 共有見積もりでは、環境変数が未設定の場合だけ共有可能と見積もるため、`STRATA_Q6_PACKED` が存在すれば空文字や無効値でもその見積もりから外れる（`engine/src/program/generate.cpp:8404-8410`）。
 
-## 文書と測定値
+## ログと測定値
 
-`docs/STRIX_HALO.md` はこの変数を Q6_K packed decode layout の一つとして列挙していますが、この調査時点で参照した `docs/DETAILS.md` には `STRATA_Q6_PACKED` の個別説明や性能測定値を確認できませんでした。したがって、速度向上率は記載しません。
+pack 成功時、CUDA/HIP と SYCL の実装は stderr に次の形式で出力する（`engine/src/kernels/cuda/native_mmvq.cu:3182-3183`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3251-3252`）。
+
+```text
+strata: STRATA_Q6_PACKED=1 packed the <what> (<n_out> x <n_in>, +<MiB> MiB)
+```
+
+`<what>` は `output head` または `MTP draft head`。shape 条件を満たさない場合や pack の転送・確保が失敗した場合、この成功ログは出ず、専用の失敗警告も出ない。`docs/DETAILS.md` に本変数の説明や測定値は見つからず、ここでは性能値を記載しない。
 
 ## 根拠
 
-- 読み取り、完全一致判定、形状条件、平面コピー、registry、成功ログ、dispatch、通常 kernel への fallback: `src/kernels/cuda/native_mmvq.cu:1810-1826,1898-1942,1980-2018,2345-2369`。
-- native head のロード時登録と破棄時解除: `src/core/native_head.cpp:15-18,61-69`。
-- MTP subset head の登録・MMVQ 呼び出し・解放: `src/core/mtp.cpp:130-157,655-680,995-998`。
-- gfx1151 既定値、明示設定優先、gfx12 では Q6 packed 既定値なし: `src/core/arch_defaults.cpp:12-58,61-80`。
-- 既定値適用の build 条件と engine の初回読み取りより前に適用する順序: `src/program/generate.cpp:2190-2196`; HIP build の定義: `cmake/hip_backend.cmake:85-90`。
-- Strix Halo 文書の一覧: `docs/STRIX_HALO.md:95`。
+- 値判定・cache: `engine/src/kernels/cuda/native_mmvq.cu:3145-3151`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3091-3097`
+- pack shape・allocation・成功ログ: `engine/src/kernels/cuda/native_mmvq.cu:3153-3183`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3191-3252`
+- packed kernel 選択と fallback: `engine/src/kernels/cuda/native_mmvq.cu:2944-2979,3600-3610`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3935-3945`
+- native head と MTP 適用箇所: `engine/src/core/native_head.cpp:225-288`、`engine/src/core/mtp.cpp:988-995`、`engine/sycl/src/core/native_head.cpp:91-96`、`engine/sycl/src/core/mtp.cpp:855-872`
+- AMD arch defaults と setup の既定値: `engine/src/core/arch_defaults.cpp:28-90,218-223,302-323`、`engine/include/strata/core/gfx11_extra.hpp:41-58`、`engine/src/program/generate.cpp:4287-4320`、`terminal/setup.py:4454-4485,7544-7547`、`terminal/strata_control/setup_config.py:452-465`
+- run config の環境優先: `terminal/serve/server.py:4010-4028`
+- DFlash2 共有見積もり: `engine/src/program/generate.cpp:8404-8410`

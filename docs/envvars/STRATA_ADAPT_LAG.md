@@ -1,49 +1,48 @@
 # `STRATA_ADAPT_LAG`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-適応層（adaptive tier）が選んだ expert の入れ替えについて、次の decode window がその入れ替えを適用する前に何 window 待つかを指定します。既定値 `1` は次の window でコピー完了を待ってから適用します。`2` なら pending の入れ替えをもう 1 window 保留し、2 window 目にコピーを待って適用します。値を大きくすると、その間は従来の residency table に基づいて window を実行します。
+適応 VRAM expert tier が入れ替えた expert のコピーを、通常の逐次 verify 経路で何 window 待ってから反映するかを指定する。値 `1` では次の window でコピー完了を待ってから residency 表へ反映し、`2` なら pending のコピーを二つ目の window まで保留してから待つ。適応 tier の候補選択や swap 数を直接変える設定ではない。CUDA/HIP 系と SYCL の `generate.cpp` に同じ読み取りと適用がある（`engine/src/program/generate.cpp:2248-2250, 22835, 25102-25103`; `engine/sycl/src/program/generate.cpp:1388-1390, 12742-12743, 14112-14113`）。
 
-環境変数は `adapt_lag()` の `static const int` に一度だけ読み込まれます。値を初めて評価した後、プロセス実行中に環境を変更しても反映されません。読み取り関数は CUDA 系と SYCL 系の `generate.cpp` にそれぞれあります。
+`STRATA_ADAPT_NOWAIT` が `1` の場合、window は待たずに完了状態を問い合わせるため、この lag による待機規則は使われない。コピーが未完了なら pending のまま次へ進む（`engine/src/program/generate.cpp:22818-22835, 24670-24680`; SYCL 側も `engine/sycl/src/program/generate.cpp:13822-13837`）。
 
 ## 値と判定
 
-| 環境変数の状態・値 | 判定結果 |
-|---|---|
-| 未設定 | `1` |
-| 空文字 | `atoi("")` が `0` となり、下限 clamp により `1` |
-| 数値文字列 | `atoi` で整数変換し、`1` 未満なら `1` |
-| 数字で始まらない文字列 | `atoi` が `0` を返すため `1` |
-| 先頭に空白・符号がある文字列 | `atoi` の規則で先頭の空白と符号を読み、その後の数字列を変換。数字列の後ろの文字は無視される |
-| `0`、負数 | `1` |
-| `2` 以上 | 変換された整数値 |
+`adapt_lag()` は `std::getenv` の結果を `std::atoi` に渡し、`std::max(1, ...)` で最低値を 1 にする。関数内 `static const` なので、プロセスで最初に呼ばれた時の値を保存し、その後の環境変更は反映しない。整数の全体一致検査や上限 clamp はない（`engine/src/program/generate.cpp:2248-2250`; SYCL: `engine/sycl/src/program/generate.cpp:1388-1390`）。
 
-コードは `std::max(1, std::atoi(e))` を使い、文字列全体の妥当性確認はしません。たとえば `2junk` は `2`、`+3` は `3`、`-2` は `1` と判定されます。数値変換可能範囲を超える文字列の結果は文書化しません。
+| 条件 | unset | 有効になる値（例） | 無効・1 に丸められる値（例） |
+|---|---|---|---|
+| 読み取り時に環境変数をそのまま評価 | `1` | `2`, `3`, `2tail`, ` 2` は `atoi` の結果を最低 1 に clamp した値 | 空文字、`text`, `0`, `-1`, `0anything` は結果が 1 |
+| CUDA 起動時に対象 NVIDIA 世代の既定値を適用 | ユーザーが未設定なら一部世代で `2` が設定される（下記） | 明示した値はそのまま判定される | 明示した空文字も「設定済み」扱いで既定値注入を止め、後で `1` に判定される |
+
+`atoi` のため、先頭の空白と数値接頭辞の後ろの文字列は無視される。数値として読めない文字列は `0` 相当となり `1` になる。コード上の正の上限はない。`atoi` の `int` 範囲を超える文字列の結果はこの実装で検査・制限されない。CLI 引数による上書きはなく、他の環境変数が `adapt_lag()` の値自体を変更することもない。
+
+CUDA 側では、全可視 GPU が同じ compute capability の場合に `apply_nv_defaults()` が起動時に呼ばれる。cc 8.6、8.9、6.0 の既定テーブルに `STRATA_ADAPT_LAG=2` がある。cc 8.6 と 6.0 は対応する `STRATA_SM86_PERF` / `STRATA_SM60_PERF` の値が `0` で始まるとテーブルが除外され、cc 8.9 は `STRATA_SM89_PERF` の値が `0` で始まる場合、または `STRATA_DEFAULTS` が完全一致で `026` / `0.2.6` / `v0.2.6` の場合に除外される。いずれもユーザーが変数を設定済みなら値にかかわらず保持するため、空文字も既定値で置換されず、後で `1` に判定される。混在 compute capability の複数 GPU ではこの一括テーブルを適用しない（`engine/src/core/nv_defaults.cpp:14-23, 37-42, 51, 75-85, 164-170`; `engine/src/core/nv_defaults.cpp:222-233`; `engine/include/strata/core/defaults_026.hpp:21-29`; 呼び出し条件 `engine/src/program/generate.cpp:4425-4449`）。SYCL ソースにはこの NVIDIA 既定値適用呼び出しがなく、上記テーブルは適用されない。
 
 ## 有効になる条件
 
-- 適応層が有効で、pending の expert 入れ替えがある decode 経路で使われます。適応層が無効なら待つ入れ替えがないため、この値による動作差はありません。
-- 通常の逐次 decode 経路で window ごとに pending age を進め、値に達したときコピー完了を待って入れ替えを反映します。pending が空ならその window で適用待ちを行いません。
-- `STRATA_ADAPT_NOWAIT` が有効な経路は `apply_pending(false)` を呼び、lag の待機条件を通りません。
-- `STRATA_ADAPT_OVERLAP` の有効化条件は `adapt_lag() == 1` です。値が `1` 以外の場合、overlap は無効になり、明示的に `STRATA_ADAPT_OVERLAP` を設定していると「not with STRATA_ADAPT_LAG / STRATA_ADAPT_NOWAIT」の理由が stderr に出ます。
-- ソースコメントでは batch paths と `--pipeline-windows` は lag の対象外とされています。peer tier は独立の pending なら `pending.empty()` の分岐から毎 window 適用されます。一方 CUDA 系の共通 `apply_pending(wait)` は peer にも同じ `wait` を渡すため、通常の adaptive tier にも pending がある場合は peer 側の pending も同じ呼び出しまで待つことがあります。
+- 適応 tier が有効であること。実行時コードは `drive.d.usage` が空でないことを tier 有効の判定に使う。適応頻度・swap 数などで tier が無効なら、この値による pending swap の反映待ちは発生しない（`engine/src/program/generate.cpp:15135, 15249-15252`; SYCL 側の同じ `adapt_lag()` 使用箇所は `engine/sycl/src/program/generate.cpp:12742-12744, 14112-14114`）。
+- 逐次 verify window が前回の適応コピーを適用する経路で効く。コードコメントは batch paths、`--pipeline-windows`、peer tier を lag 対象外としている（`engine/src/program/generate.cpp:2243-2247`）。
+- `STRATA_ADAPT_NOWAIT=1` のときは各 window で非待機 query を使い、`STRATA_ADAPT_LAG` の閾値で待つ分岐を通らない（`engine/src/program/generate.cpp:22818-22835, 25102-25103`）。
+- CUDA の `STRATA_ADAPT_OVERLAP=1` は `adapt_lag() != 1` または `STRATA_ADAPT_NOWAIT` が有効だと起動条件を満たさず、理由を `not with STRATA_ADAPT_LAG / STRATA_ADAPT_NOWAIT` として扱う（`engine/src/program/generate.cpp:15122-15136`）。
 
 ## 実行時の詳細
 
-CUDA 系および SYCL 系の逐次 decode loop は `pending_age` を `0` で初期化します。通常経路では window ごとに pending があれば `++pending_age >= adapt_lag()` を評価し、しきい値に達したとき `apply_pending(true)` を呼びます。CUDA 系では pending のコピー event を同期し、resident table を更新して pending を空にし、`pending_age` を `0` に戻します。したがって `N` はコピーを適用するまでの window 数であり、`N=1` が既定、`N=2` 以降は opt-in の遅延です。CUDA 系の `apply_pending` は最初に `peer.apply_pending(wait)` を呼ぶため、通常 tier と peer tier の両方に pending がある場合は peer の適用もこの待機回に揃います。通常 tier が空なら `pending.empty()` が true となり `apply_pending(true)` が呼ばれるので、peer 単独の pending は lag されません。
+適応 round がコピーを開始すると swap は `pending` に保持され、`pending_age` は 0 に戻る。各逐次 window の前に、`STRATA_ADAPT_NOWAIT` が無効なら pending が空でない場合に age を増やし、`pending_age >= adapt_lag()` でコピー完了を待つ。待機後は RAM 側の交換を commit し、コピー済み expert を host residency 表へ登録し、必要なら device residency 表も更新して pending と age を消去する。したがって lag は「コピー開始後に何回の window を経て表へ反映するか」の閾値で、コピー完了を保証する時間上限ではない。閾値時点で未完了なら event 同期が完了まで待つ（`engine/src/program/generate.cpp:15197-15234, 22818-22835, 24670-24700`; SYCL: `engine/sycl/src/program/generate.cpp:8807-8833, 13822-13848`）。
 
-実装は CUDA と SYCL の両方にあり、それぞれ speculative decode と通常の generate 経路に読み取り関数と window 判定があります。GPU/backend ごとに値の parse 規則は異なりません。適用中のログや警告をこの変数自身が出す箇所は確認できません。
+値は最初の `adapt_lag()` 呼び出しで static cache される。CUDA 起動時の NVIDIA 既定値注入は engine のスイッチ読み取り前に行われるため、既定表の対象世代では初回評価から `2` が見える。ユーザーが設定した変数は既定値注入より優先される。実行中に環境を書き換えても cache 済みの値は変わらない（`engine/src/program/generate.cpp:4425-4449, 2248-2250`; `engine/src/core/nv_defaults.cpp:222-233`）。
 
-## 文書・測定値
+CUDA の単独 `strata generate` 経路と serve の verify loop、および SYCL の generate 経路に閾値分岐がある。`strata generate` では `STRATA_TRACE_ADAPT` が設定されていると、非待機適用でコピーが未完了の場合 `strata: PENDING not landed, %zu stay non-resident this window`、完了時には `strata: PENDING landed, %zu experts become resident` を stderr に出す。この診断は `STRATA_ADAPT_LAG` 自体が出すログではない（`engine/src/program/generate.cpp:24670-24683`; SYCL: `engine/sycl/src/program/generate.cpp:13822-13837`）。コピー失敗時は serve 側で `strata serve: adaptive swap copy failed ...`、generate 側で適応 refill 失敗を報告する経路があるが、これらは lag 値の検証エラーではない（`engine/src/program/generate.cpp:15458-15464, 15489-15493`; SYCL: `engine/sycl/src/program/generate.cpp:12744-12746`）。
 
-`docs/DETAILS.md` も既定値 `1`（0.1.39 相当）と `STRATA_ADAPT_LAG=2` の opt-in を説明しています。同資料の測定では Tesla P100（PCIe 3.0 x16）で 6 組中 6 組が速く、RTX 5070 は +0.2%（4/6 組）、RTX 3060 は -1.3%（0/6 組）だったため既定 off ではなく値 `1` を維持したと記載されています。これらは資料に記載された条件の結果であり、他の機器やモデルでの性能を保証しません。別の `docs/MULTI_GPU.md` の表には、特定構成で `STRATA_ADAPT_LAG=2` の結果（decode 142.8 tok/s、prefill 1800 tok/s）が記載されていますが、同資料の表注記にある構成・測定回数の範囲に限られます。
+## ログと測定値
+
+`STRATA_ADAPT_LAG` の値を単独で表示する有効化ログは確認できなかった。`docs/DETAILS.md` は `=2` の測定として Tesla P100 (PCIe 3.0 x16) で 6 組中 6 組 +3.5%、RTX 5070 で 4/6 +0.2%、RTX 3060 で 0/6 -1.3%、また Xeon E5-2673 v3 / DDR3 と RTX 4060 Ti / PCIe 3.0 x8 で 1 window あたり 160 swaps の測定 +7.9% を記載する。これは資料中の測定値であり、ここで再測定した結果ではない（`docs/DETAILS.md:1719`）。同資料は `=2` を CUDA と記載し、sm_86・sm_60 の NVIDIA 既定値を記載するが、現行 `nv_defaults.cpp` には cc 8.9 の既定値もある（`docs/DETAILS.md:1261, 1486-1489`; `engine/src/core/nv_defaults.cpp:75-85`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:1320-1327`, `sycl/src/program/generate.cpp:1275-1279`: `atoi`、既定値、下限 clamp、static cache。
-- `src/program/generate.cpp:8266-8269,8315-8336,11856-11876,13065-13069`, `sycl/src/program/generate.cpp:7761,7805,11148-11153,12115,12362-12367`, `src/core/peer_experts.cpp:321-330`: pending age の初期化・適用・リセット、decode loop の判定、peer pending の適用。
-- `src/program/generate.cpp:8285-8286,8303-8304`: overlap が lag 値 `1` を要求する条件と、明示設定時の stderr 理由。
-- `docs/DETAILS.md:268-269,1697-1698`: 既定値と測定値。
-- `docs/MULTI_GPU.md:318-328`: 記載された multi-GPU 構成と `STRATA_ADAPT_LAG=2` の表値。
+- 値の読み取りと cache: `engine/src/program/generate.cpp:2248-2250`; `engine/sycl/src/program/generate.cpp:1388-1390`
+- pending コピー適用: `engine/src/program/generate.cpp:15197-15234, 22818-22835, 24670-24700`; `engine/sycl/src/program/generate.cpp:8807-8833, 12742-12744, 13822-13848, 14112-14114`
+- NVIDIA 既定値と適用条件: `engine/src/core/nv_defaults.cpp:37-42, 51, 75-85, 164-170, 222-233`; `engine/src/program/generate.cpp:4425-4449`
+- 他設定との適用条件・測定記録: `engine/src/program/generate.cpp:15122-15136, 15249-15252`; `docs/DETAILS.md:1261, 1486-1493, 1719`

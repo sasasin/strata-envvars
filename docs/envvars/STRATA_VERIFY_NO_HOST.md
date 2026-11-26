@@ -1,56 +1,59 @@
 # `STRATA_VERIFY_NO_HOST`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-SYCL verifier の device-plan 経路で、ホストが各 layer の doorbell / flag handshake に応答しない前提を選びます。設定が有効だと、ホスト側の層ごとの応答ループを省略し、SYCL の verify window 全体をまとめて待つ経路になります。`STRATA_VERIFY_DEVICE_PLAN` による device plan 自体を有効にする変数ではありません。device plan は別途有効である必要があります。
+SYCL verifier の窓内処理で、GPU の各レイヤー doorbell をホストが処理するかを切り替える。真と判定されると、通常のレイヤーごとの host service loop を通さず、window 全体の完了を待つ。部分常駐モデルでは GPU 側で expert を計画する `device_plan_` と組み合わせる必要があり、対象は Intel Arc の SYCL engine 経路である。CUDA/HIP engine にこの名前を読む実装はない。`engine/sycl/src/core/verify.cpp:2615-2638`、`engine/sycl/src/core/verify.cpp:151-154`。
 
-主な実装は `sycl/src/core/verify.cpp` の window 記録・完了処理と、`sycl/src/program/generate.cpp` の起動時の安全確認です。CUDA/HIP実装に同名の実動作参照は確認できませんでした。
+`device_plan_` が有効な場合は expert の計画と grouped expert 実行を device 側に置く。さらに `STRATA_VERIFY_LEAN` が有効で後述の除外条件に当たらなければ、solo window の graph から doorbell publish/wait、plan copy、PCIe-share 等の node を省く。ソースは VRAM/mirror groups、combine、answers が同じ kernels/data を使うと記す。lean graph の有効条件は `engine/sycl/src/core/verify.cpp:1022-1031`、device plan 判定は `engine/sycl/src/core/verify.cpp:919-925`。
 
 ## 値と判定
 
-実装は `getenv()` の値を空文字かどうか確認し、その後文字列全体を `"0"` と比較します。数値変換はしません。
+この変数は数値 parse をしない。実装箇所ごとに判定が少し異なる。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | OFF |
-| 空文字 | OFF |
-| 文字列がちょうど `0` | OFF |
-| 上記以外の非空文字列 | ON。例: `1`, `00`, `false`, `0abc`, 前後に空白のある値 |
+| 読み取り経路 | unset / 空文字 | 設定値の判定 | 例 |
+|---|---|---|---|
+| `env_on()`（expert staging 分岐） | off | 先頭文字が `0` 以外なら on | `1`, `true`, ` 1` は on。`0`, `0anything` は off |
+| `no_host_wants_device_plan()` / `arena_refuses_no_host()` と `static` 判定（window/serve） | off | 値全体が文字列 `"0"` と異なれば on | `1`, `true`, `false`, ` 0`, `00`, `0anything` は on。厳密な `0` だけ off |
+| `B60 single layout` の制約確認 | 条件不成立 | 値全体が厳密に `"1"` であることを要求 | `1` のみ通過。`true` や `01` は不成立 |
 
-そのため `00` や `false` は数値的に偽らしく見えてもONです。大文字小文字や数値としての妥当性は検査されません。verify.cpp 内の判定結果は `static const bool` にキャッシュされるため、その判定が初めて実行された後に同一プロセスの環境を書き換えても反映されません。起動処理中の安全確認は `generate.cpp` で別途評価されます。
+`env_on()` は `getenv` の値が存在し空でなく、先頭 byte が `'0'` でないかを返すため、文字列全体・数値としての妥当性・大文字小文字・空白は検査しない（`engine/sycl/src/core/verify.cpp:151-154`）。他の主な判定は `strcmp(value, "0") != 0` で、文字列全体を比較する（`engine/sycl/include/strata/core/verify_env.hpp:16-18,26-29`; `engine/sycl/src/core/verify.cpp:1027,2620`; `engine/sycl/src/program/generate.cpp:5210,5510,5641`）。従って `0anything` は経路により off/on が分かれる。無効文字列を拒否する処理はない。
 
-根拠: `sycl/src/core/verify.cpp:800-801,2183-2184`; `sycl/src/program/generate.cpp:4961-4962,5061-5063`。
+SYCL serve wrapper は `STRATA_VERIFY_NO_HOST=1` を既定値にし、環境変数があれば既定値を上書きする。空文字は container に渡さず未設定扱いにし、`0` は値のまま渡す（`engine/sycl/serve/strata-sycl.sh:13-16,31-43`）。setup の Alchemist/i915 経路は `0` を config に設定し、layer split で VRAM 不足が予想されユーザー config にこのキーがない場合も `0` を補う（`engine/sycl/setup_intel.py:414-425,546-559`）。
 
 ## 有効になる条件
 
-- `STRATA_VERIFY_DEVICE_PLAN` 等により device plan が有効であること。`STRATA_VERIFY_NO_HOST` はそれを有効化しません。
-- device-plan が必要とする expert がVRAMにあるか、device planから参照できるホストミラーにあること。初段のVRAM不足分がミラーされず `unmirrored_misses > 0` の場合、起動時に生成を拒否して終了コード2にします。
-- 複数GPUのlayer splitでは、後段のstageのexpert cacheに不足があれば、後段をカバーするホストミラーがないため起動を拒否します。設定を `0` にするとホスト応答経路を許可し、不足expertをホスト側で処理できます。
-- device-plan とこの変数が有効な場合、適応的なexpert swap (`--adapt-every` と `--adapt-swaps` が正) は、移動したexpertをVRAMにもミラーにも置けなくなる危険があるため無効化されます。
-- `record_window()` の `STRATA_VERIFY_LEAN` 経路はさらに、step hook、remote-opt、常時publish、stepped mode がなく、device plan が有効であることを条件にします。この場合、ホストが応答しない doorbell / flag wait、plan copy、PCIe-share group とstaging kernelなど不要なgraph nodeを省略します。
+- Strata の SYCL engine 経路で読む。該当名の実装参照は `engine/sycl` 配下にあり、CUDA/HIP engine の読み取りはない。
+- `STRATA_VERIFY_DEVICE_PLAN` が未設定のとき、起動時判定 `no_host_wants_device_plan()` がこの変数を on とみなせば、engine は `STRATA_VERIFY_DEVICE_PLAN=1` を設定して理由を stderr に出す。`STRATA_VERIFY_DEVICE_PLAN` が `0` でも設定済みなら保持され、自動設定しない。後段の `device_plan_` は `atoi(value) != 0` で決まるため、例えば明示値 `0` や `false` は off（`engine/sycl/src/program/generate.cpp:1850-1856`; `engine/sycl/src/core/verify.cpp:919-925`）。
+- すべての expert が VRAM 常駐の場合、`device_plan_` は `!all_resident_` 条件で off になる。NO_HOST が on でもこのケースでは欠落 expert の host fallback は不要で、全 window の完了待ち経路が使われる（`engine/sycl/src/core/verify.cpp:897-925,2615-2638`）。
+- NO_HOST と device plan が on でも、`--stream-experts` を使わず host expert arena を使い、VRAM cache に全 expert が入らない場合は起動時に拒否される。`--stream-experts` の pinned mirror 経路または全 expert の VRAM 常駐が必要（`engine/sycl/src/program/generate.cpp:5193-5203`; helper 条件は `engine/sycl/include/strata/core/verify_env.hpp:21-29`）。
+- stream/mirror 経路でも VRAM 外かつ mirror にない expert があると拒否される。integrated GPU の UMA pool では専用の「model does not fit」拒否が先行する。複数 GPU の layer split では後続 stage の欠落 expert を拒否する。いずれもホストが代わりに応答しないため（`engine/sycl/src/program/generate.cpp:5508-5532,5636-5653`）。
+- 欠落 expert がある状態で adaptive swaps が指定され、SYCL mirror adaptive cache が使われない場合、swap 対象が VRAM/mirror のどちらにもなくなるのを避けるため `--adapt-every` の実行時値を 0 にし、stderr に理由を出す（`engine/sycl/src/program/generate.cpp:5534-5541`）。
+- `STRATA_SYCL_MIRROR_ADAPT` が `1` で始まる値（例: `1`, `10`, `1abc`）の場合も `device_plan_` と NO_HOST 判定の両方が必要。不成立なら verifier 初期化時に `mirror adaptive expert usage requires NoHost device planning` の例外を投げる（別変数の読み取りは `engine/sycl/src/core/verify.cpp:75-80`、条件と例外は同:977-983）。
+- `STRATA_VERIFY_LEAN` による node 省略は、未設定・空文字・先頭文字が `0` 以外の値で同変数が有効で、NO_HOST・device plan も有効、かつ batch window、step hooks、remote optimization、always-publish、stepped mode のいずれでもない場合に限る。`STRATA_VERIFY_LEAN=0` または `0anything` で無効になり、batch は doorbell node を保持する（`engine/sycl/src/core/verify.cpp:1022-1031`）。
+- staged native expert 経路は加えて `STRATA_SYCL_EXPERT_STAGE` が `env_on()` 判定で on（未設定・空・`0` 始まり以外）、`gy == 0`、Battlemage layout ではないことが条件（`engine/sycl/src/core/verify.cpp:1732-1749`）。
+- B60 single layout は serve、native pack、single device 等の複数条件に加え、この変数と `STRATA_VERIFY_DEVICE_PLAN` の両方を厳密に `1` にする必要がある（`engine/sycl/src/program/generate.cpp:4591-4597`）。
 
 ## 実行時の詳細
 
-通常のverify window完了処理は、device planでresident expertを処理する状況などを除いて、layerごとにGPUのsequence値を待ち、ホスト側のplanを公開します。`STRATA_VERIFY_NO_HOST` が有効ならこの層ごとのループ条件が成立せず、ホスト側は各layerのdoorbellに応答しません。SYCL側のコメントでは、xe driverではgraph実行中のhost-mapped memoryへのkernel書き込みが安定して見えず、per-layer waitが失敗するため、NO_HOST時はwindow全体を待つと説明されています。ホストに処理させるexpertがある構成ではこの前提を満たせません。
+通常の SYCL serve は wrapper の既定 `STRATA_VERIFY_NO_HOST=1` と `STRATA_VERIFY_DEVICE_PLAN=1` を engine に渡す。config/env などから外部環境に同名の値が渡れば wrapper の既定値を上書きする。`setup_intel.py` は i915 用 config に `0` を設定し、layer split で不足が予測される場合にも未指定時だけ `0` を補う。CLI 引数そのものがこの変数を上書きする実装は見つからなかった（`engine/sycl/serve/strata-sycl.sh:31-43`; `engine/sycl/setup_intel.py:414-430,546-559`）。
 
-起動時に初段のVRAM外expertについて、ミラーされなかった数を調べます。NO_HOSTが有効で不足が残ると、stderrに `strata generate: REFUSED: ...` を出して終了コード2にします。layer splitでも後段stageの不足を調べ、同様に拒否します。不足がなくても `--adapt-every` と `--adapt-swaps` が有効なら、stderrに `strata generate: adaptive swaps off: ...` を出し、`o.adapt_every` を0にします。
+engine 起動時に NO_HOST が on で `STRATA_VERIFY_DEVICE_PLAN` 未設定なら、後者を `1` に設定する。明示された `STRATA_VERIFY_DEVICE_PLAN=0` は尊重されるので、NO_HOST を on にしたまま device plan を無効にできる。この組合せでは欠落 expert の device plan は用意されない。plan の実際の有効化は verifier 初期化で環境値を `atoi` して決まる（`engine/sycl/src/program/generate.cpp:1850-1856`; `engine/sycl/src/core/verify.cpp:919-925`）。
 
-`sycl/serve/strata-sycl.sh` は `STRATA_VERIFY_DEVICE_PLAN=1`、`STRATA_VERIFY_NO_HOST=1`、`STRATA_STAGER_THREADS=12` を既定で渡します。スクリプト環境の値はこの既定値を上書きしますが、値が `0` または空文字ならコンテナへ渡しません。その場合、実行ファイル内では未設定としてOFFになります。サーバー設定の `env` ブロックも環境として渡される設計です。`sycl/setup_intel.py` はAlchemist/i915構成で `STRATA_VERIFY_NO_HOST=0` を設定し、layer splitでexpertが収まりそうにない場合も、設定で明示されていなければ `0` を設定します。
+window record と window wait はそれぞれ関数内 `static const` に NO_HOST 判定を保存するため、その関数が初めて評価された値を以降の呼び出しで使う。`env_on("STRATA_VERIFY_NO_HOST")` の expert staging 判定は helper を呼ぶたび環境を読む。通常の実行では起動後に環境を書き換える運用は想定されておらず、static 判定は変更を反映しない（`engine/sycl/src/core/verify.cpp:1026-1031,1736-1738,2620,2636-2638`）。
 
-## ログと資料
+NO_HOST の window wait 経路では per-layer doorbell loop を飛ばし、全 window graph の完了を待つ。NO_HOST が off の経路ではレイヤーごとに GPU の ring を待ち、host が payload を処理する。staged native expert 実行は別条件で有効化でき、batch/device-plan/window の制約に従う（`engine/sycl/src/core/verify.cpp:2613-2645,1736-1749`）。
 
-拒否時の文言は `sycl/src/program/generate.cpp:4963-4965` および `5069-5074`、適応swap停止の文言は `4971-4974` です。SYCLラッパーの既定値と `0` の扱いは `sycl/serve/strata-sycl.sh:10-13,22-36` にあります。
+## ログと測定値
 
-`docs/INTEL.md:246-247` はNO_HOSTを「全window graphを待つ」設定と説明し、expertがすべてresidentの場合に限ると記しています。同資料の `:700-703` は値 `0` または空文字をOFFとして扱い、`strata-sycl.sh` がそれらを転送しない点を説明しています。コード上ではミラーに全missがある構成もdevice planが利用できるため、「全expertがVRAM resident」は一律の必須条件ではなく、各expertがVRAMまたはdevice planが参照可能なmirrorにあることが必要です。外部driverの内部動作や資料中の測定値は本調査の確認事実として扱っていません。
+- device plan を自動設定したとき: `strata: STRATA_VERIFY_NO_HOST=1 needs the device-built plan for experts outside VRAM: STRATA_VERIFY_DEVICE_PLAN=1 is set too (STRATA_VERIFY_DEVICE_PLAN=0 keeps it off)`（`engine/sycl/src/program/generate.cpp:1850-1856`）。
+- host arena に不足 expert があると `strata generate: REFUSED: STRATA_VERIFY_NO_HOST=1 with the host expert arena (no --stream-experts): the VRAM cache holds %lld of %lld experts and nothing answers for the rest, so replies come out as garbage ('!' x N, #4698) or the window hangs. Use --stream-experts (its pinned mirror is read by the device plan), or set STRATA_VERIFY_NO_HOST=0 where the card runs the arena (an i915 card)` を stderr に出し、`refuse_exit(2)` で終了する（`engine/sycl/src/program/generate.cpp:5195-5203`; `refuse_exit` は指定 code で `_Exit`、同:1803-1812）。
+- mirror 不足では `strata generate: REFUSED: %lld experts are neither in VRAM nor mirrored; with STRATA_VERIFY_NO_HOST the device plan cannot run them and generation would lack a safe host fallback - raise STRATA_MIRROR_MIB or the free RAM, or lower --max-context`、layer split の後続 stage 不足では `strata generate: REFUSED: %lld experts of the later layer-split stages are neither in VRAM nor mirrored (the host mirror covers the first stage only); with STRATA_VERIFY_NO_HOST the device plan cannot run them and the card is lost at the first verify window - set STRATA_STAGE_TRIM=1 (with --layer-split N) to free each card's duplicate dense weights, lower --max-context or --vram-reserve-mib, or unset STRATA_VERIFY_NO_HOST` を出し、同じく code 2 で終了する（`engine/sycl/src/program/generate.cpp:5528-5532,5647-5653,1803-1812`）。UMA pool 不足にも個別の `REFUSED` がある（同:5511-5526）。
+- adaptive swap を無効化した場合は `strata generate: adaptive swaps off: with STRATA_VERIFY_NO_HOST an expert they move out of VRAM would be neither there nor mirrored` と出る（`engine/sycl/src/program/generate.cpp:5537-5541`）。
+- `docs/INTEL.md:45` は値 `0` が wrapper から渡されないと説明するが、現行 wrapper は空文字だけを除外し `0` を渡し、engine の判定も値を検査する。ソース実装を現行挙動の根拠とした。測定値は記載しない。
 
 ## 根拠
 
-- `sycl/src/core/verify.cpp:795-801`: NO_HOST時のlean graph node省略条件。
-- `sycl/src/core/verify.cpp:2178-2201`: SYCL window完了時のNO_HOST判定、層ごとのホスト待ち。
-- `sycl/src/program/generate.cpp:4959-4975`: ミラーされないexpertの起動拒否とadaptive swap停止。
-- `sycl/src/program/generate.cpp:5057-5078`: multi-GPU layer split後段の不足確認・拒否。
-- `sycl/serve/strata-sycl.sh:10-13,22-36`: コンテナへの環境引き継ぎ、既定値および `0` / 空文字の除外。
-- `sycl/setup_intel.py:207-216,308-321`: i915時の明示OFF、layer split時の不足予測に基づくOFF。
-- `docs/INTEL.md:236-249,680-703,769-772`: SYCL利用方法、条件、値の扱いに関する説明。
+主要な読み取りと処理: `engine/sycl/src/core/verify.cpp:75-80,151-154,977-983,1022-1031,1732-1749,2613-2638`; `engine/sycl/include/strata/core/verify_env.hpp:16-29`; `engine/sycl/src/program/generate.cpp:1850-1856,5193-5203,5210-5214,5508-5541,5636-5653`; wrapper/setup の既定・転送: `engine/sycl/serve/strata-sycl.sh:13-16,31-43`, `engine/sycl/setup_intel.py:414-430,546-559`。
+

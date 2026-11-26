@@ -1,37 +1,45 @@
 # `VISION_ARCHS`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Windows CUDA パッケージ用の `strata-vision.exe` をビルドするとき、対象 GPU architecture の一覧を variant の既定値から上書きします。これは `packaging/build_vision_windows.bat` が参照するビルド用の環境変数で、通常の Strata 実行時に読み込まれる設定ではありません。値は Vision reader の CUDA architecture 指定と、stage の `BUILD.json` に記録する `vision_archs` の両方に使われます（`packaging/build_vision_windows.bat:16-19,26-33,57-64`）。
+Windows CUDA パッケージ作成用の `tools/packaging/build_vision_windows.bat` が、画像 reader `strata-vision.exe` をビルドする CUDA architecture のリストを上書きする。エンジン本体の architecture を直接変える設定ではない。reader のビルドと `BUILD.json` の記録に使われ、最終パッケージ作成時には記録された reader architecture がパッケージの `sm_NN` をすべて含むか検査される（`tools/packaging/build_vision_windows.bat:26-33,48-60`、`tools/packaging/package_engine.py:103-120`）。
+
+通常の `build_cuda_windows.py` 経由では、この変数は呼び出し元の値をそのまま使う設定ではない。同スクリプトがエンジン用 `ARCHS`（または variant の既定値）から値を作り、子プロセス環境の `VISION_ARCHS` を上書きしてバッチに渡す（`tools/packaging/build_cuda_windows.py:151-160,186-197`）。このため、呼び出し元が設定した `VISION_ARCHS` がその経路でエンジンと reader の architecture を独立にずらすことはない。
 
 ## 値と判定
 
-| 状態 | `ARCHS` の値 |
-|---|---|
-| `VISION_ARCHS` が未定義 | `cuda12` は `60;61;70;75;80;86;89`、`cuda13` は `75;86;89;120` |
-| `VISION_ARCHS` が定義済み | その値を `ARCHS` に代入し、variant の既定値を上書き |
+| 実行経路 | 未設定・空文字 | 設定時に使われる値 | 無効値・境界 |
+|---|---|---|---|
+| `build_vision_windows.bat` を直接起動 | `if defined VISION_ARCHS` が偽なら variant 既定値を使う。空文字の特別処理や数値 parse はスクリプト内にない（`tools/packaging/build_vision_windows.bat:26-33`）。 | 値を `ARCHS` にそのまま代入する。想定形式はセミコロン区切りの CUDA architecture 番号（例: `75;86;89;120`）。番号ごとに `-real` を付け、最後の番号には `-virtual` も渡す（同 `:48-57`）。 | `VISION_ARCHS` 固有の形式・数値・範囲検証はない。`true`、`0`、`0anything` や不正な番号もコード上は拒否せず、置換後の値を CMake に渡す。受理可否は後続コマンドの結果による。 |
+| `build_cuda_windows.py` から起動 | 通常は空にならない。variant 既定値か `ARCHS` から得た architecture 列を渡す（`tools/packaging/build_cuda_windows.py:158-160,189-190`）。 | 親環境の `VISION_ARCHS` ではなく、`archs` タプルを `;` で連結した値が必ず渡される（同 `:189-190`）。親の `ARCHS` は `;`・`,`・空白で分割して整数化され、空リストや整数変換失敗は `build_cuda_windows.py:57-65` の `fail` で終了する。 | `VISION_ARCHS` 自体の境界値検証はない。`ARCHS` 経由で負値・範囲外整数が整数として通っても、その数値範囲を検査するコードはこの parser にない。 |
 
-バッチは値を数値として parse したり、一覧を事前検証したりせず、`;` を区切りとして `-real` の列に変換し、最後の要素を `-virtual` として CMake に渡します（`packaging/build_vision_windows.bat:51-60`）。同じ元の値を `package_engine.py --vision-archs` にも渡します。記録処理は数字の architecture（`sm_` / `compute_` 接頭辞や `-real` / `-virtual` 等を含む表記も可）を拾い、数字を一つも認識できない場合は引数エラーになります（`packaging/package_engine.py:68-77,312-313,335-339`）。部分的に認識できる値では、認識できた番号だけが `BUILD.json` に記録されます（`packaging/package_engine.py:125-134`）。
-
-バッチの判定は `if defined VISION_ARCHS` です。空文字専用の処理や空白除去はなく、空文字がこの分岐でどう扱われるかは環境ブロックの状態に依存します。少なくとも空文字を明示的に検証・拒否するコードはありません（`packaging/build_vision_windows.bat:33`）。
+直接起動時の variant 既定値は `cuda12` が `60;61;70;75;80;86;120;89`、`cuda13` が `75;86;89;120`。値の大文字小文字比較や前後空白の trim は行わない（`tools/packaging/build_vision_windows.bat:26-33,48-57`）。ラッパー経由では Python の `ARCHS` parser が `text.strip()` と `;`, `,`, whitespace 分割、各要素の `int` 変換を行う。値が空または数値でなければ `build_cuda_windows.py:57-65` のエラーになる。
 
 ## 有効になる条件
 
-- `packaging/build_vision_windows.bat cuda12 <stage>` または `... cuda13 <stage>` の Windows バッチ経路でのみ参照されます。variant と stage の引数がない場合、または variant がこの二つ以外の場合は usage を出して終了コード 2 になります（`packaging/build_vision_windows.bat:21-32,67-69`）。
-- 環境変数は variant が設定する既定 `ARCHS` より優先されます。これは engine 本体の architecture を再ビルド・変更する指定ではなく、Vision reader のビルド値と reader 用メタデータを設定します（`packaging/build_vision_windows.bat:26-33,57-64`）。
-- CUDA toolkit、`nvcc.exe`、llama.cpp の `tools/mtmd`、MSVC `cl.exe` などの前提が満たされなければ後続処理へ進みません。architecture 指定を上書きしてもこれらの検査は省略されません（`packaging/build_vision_windows.bat:34-49`）。
-- パッケージ化時には `package_engine.py` が `BUILD.json` の `vision_archs` を engine の `archs` と照合し、reader がカバーしない CUDA architecture があると通常は拒否します（`packaging/package_engine.py:80-88,105-119`）。したがって独自の値で reader をビルドする場合も、パッケージの対象 architecture をカバーする値にする必要があります。
+- 直接指定が有効なのは、Windows の CUDA reader build バッチを実行する場合。バッチは `cuda12` または `cuda13` と stage folder を引数に要求する（`tools/packaging/build_vision_windows.bat:21-33,64-66`）。
+- `build_cuda_windows.py` 経由なら Windows であること、variant が `cuda12` / `cuda13` であることが必要。同スクリプトは Windows 以外では失敗し、variant 以外の起動引数では usage を表示して終了コード 2 を返す（`tools/packaging/build_cuda_windows.py:151-160`）。
+- CUDA toolkit、`nvcc.exe`、MSVC `cl.exe`、CMake、Ninja が必要。欠落時はバッチがメッセージを出して終了コード 1 になる（`tools/packaging/build_vision_windows.bat:34-46`）。
+- 親スクリプトで `ARCHS` を設定した場合、その解析結果がエンジンと reader の両方に使われるため、子バッチに渡される `VISION_ARCHS` は同じリストになる（`tools/packaging/build_cuda_windows.py:158-160,174,189-190`）。
+- 直接バッチ起動で variant と異なるリストを指定すると reader と engine の対象 architecture がずれる可能性がある。後続の `package_engine.py` は reader 付き CUDA package の `BUILD.json` の `vision_archs` を見て package の全 `sm_NN` を検査し、不足があれば `--allow-stale-vision` がない限り packaging を拒否する（`tools/packaging/package_engine.py:103-120,367-371`）。
+- サーバー、通常の Strata CLI 実行、モデル読み込み時にこの変数を読むコードは見つからない。実行時のモデル挙動を制御する変数ではない。
 
 ## 実行時の詳細
 
-環境変数はバッチ実行中、variant の既定値を作った直後に一度だけ参照されます。`setlocal` の範囲内で `ARCHS` にコピーされ、その後は子プロセスへの明示的な引数として CMake の `CMAKE_CUDA_ARCHITECTURES` と `package_engine.py --vision-archs` に渡されます（`packaging/build_vision_windows.bat:20,26-33,57-63`）。バッチは常駐プロセスではないため、Strata の起動後やモデル実行中にこの環境変数を読んだり再評価したりする経路はありません。候補名の全参照検索でも、読み取り箇所はこのバッチの `if defined` と代入だけでした。
+バッチの実行時に環境値を参照し、設定されていればローカル変数 `ARCHS` に移す。続いて `;` を空白に置き換えた `for` ループで各項目を列挙し、全項目を `-real`、最後の項目を `-virtual` として CMake の `CMAKE_CUDA_ARCHITECTURES` に渡す。reader の build 成功後、`strata-vision.exe` を stage にコピーし、同じ `ARCHS` を `package_engine.py --stamp-vision --vision-archs` に渡して `BUILD.json` に記録する（`tools/packaging/build_vision_windows.bat:48-61`）。
 
-CMake configure、compile、成果物 copy、または `BUILD.json` の stamp が失敗すると、バッチはその箇所で終了コード 1 を返します。architecture 指定の形式をこのバッチ自身が事前に検証するわけではなく、configure/build の出力は各コマンド側から出ます。stamp 段階では有効な architecture 番号が一つも認識されない場合に `argparse` がエラーを出します（`packaging/build_vision_windows.bat:57-63`; `packaging/package_engine.py:335-339`）。成功時は stage に reader をコピーして `BUILD.json` を更新し、architecture 一覧を含む `built:` 行を表示します（`packaging/build_vision_windows.bat:62-65`; `packaging/package_engine.py:125-134,338-339`）。
+`VISION_ARCHS` はバッチ実行時に読み取られ、プロセス内で後から再評価する cache やリクエスト単位の読み取りはない。`build_cuda_windows.py` の場合は起動時に `ARCHS` を解析し、その値を子プロセス用環境へ設定して `cmd` を起動する（`tools/packaging/build_cuda_windows.py:151-160,189-190`）。実行中に親プロセスの環境を変えても、すでに作られた子プロセス環境には反映されない。
+
+## ログと測定値
+
+測定値に関する記載はない。成功時、バッチは `built: <stage>\strata-vision.exe  (<variant>, archs <ARCHS>)` を表示する（`tools/packaging/build_vision_windows.bat:61`）。CUDA toolkit、`nvcc.exe`、`cl.exe` がない場合のメッセージは同ファイル `:34-46`。CMake configure/build、コピー、metadata stamp のいずれかが失敗するとバッチは終了コード 1 を返す（同 `:54-60`）。形式不正に対する `VISION_ARCHS` 専用の診断はなく、後段コマンドの失敗として現れる。
+
+reader architecture の stamp は、`--vision-archs` から認識した数値をソートして `BUILD.json` の `vision_archs` に書く。認識できる値が一つもない場合は `--stamp-vision needs --vision-archs, for example '60;61;70;75;80;86;89'` と argparse error になる（`tools/packaging/package_engine.py:66-75,123-132,351-355`）。
 
 ## 根拠
 
-- `packaging/build_vision_windows.bat:16-19,26-33`: 対象変数の説明、variant ごとの既定値、上書き判定。
-- `packaging/build_vision_windows.bat:34-49,51-64,67-69`: ビルド前提、architecture の引き渡し、失敗終了、成功ログ、usage。
-- `packaging/package_engine.py:68-77,80-88,105-119,125-134,312-339`: architecture 番号の認識、パッケージとの照合、`BUILD.json` 記録と stamp 時のエラー。
+- `tools/packaging/build_vision_windows.bat:16-19,26-61` — 変数の説明、variant 既定値、上書き、CMake 引数、reader build・stamp。
+- `tools/packaging/build_cuda_windows.py:57-65,151-197` — Windows/variant 条件、親側 `ARCHS` parse、子環境での `VISION_ARCHS` 上書きと呼び出し。
+- `tools/packaging/package_engine.py:66-75,103-120,123-132,325-355,367-371` — stamp の値変換と、CUDA reader の architecture coverage 検査。

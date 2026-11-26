@@ -1,50 +1,41 @@
 # `STRATA_QSA_EARLY_EXIT`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-QSA の block score 計算で使う複数クエリ用 CUDA カーネルにおいて、処理対象 block が batch 内の最大 `n_bid` より先にある CTA を、query データの shared memory へのロード前に return させます。無効にすると従来の順序で、全 CTA が先に query をロードしてから不要な CTA も終了します。スコアの計算式や選択方式を切り替える変数ではありません。
+QSA の block-score 多重カーネルで、各 CTA がクエリを共有メモリへ読み込む前に、自分の担当範囲が全クエリの有効 block 範囲外かを判定して早期 return するかを切り替える。ON では `top`（全クエリの `n_bid` の最大値）を求め、CTA の先頭 block `blockIdx.x * SCORE_WARPS` が `top` を超える CTA はクエリを読み込まず終了する。OFF では全 CTA が先にクエリを読み込み、その後に担当範囲を走査する。スコア計算式とその後の top-k 選択はこのスイッチで切り替わらない。CUDA/HIP 側の `block_scores_multi_body` と SYCL 側の同等カーネルに実装がある（`engine/src/kernels/cuda/qsa_select.cu:979-1003`, `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1128-1169`）。
+
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 各読み取り箇所（CUDA/HIP または SYCL） | ON | `1`, `2`, `-1`, `1abc` | 空文字, `0`, `-0`, `true`, `false`, `0anything` |
 
 ## 値と判定
 
-値は文字列比較ではなく C の `std::atoi` で整数に変換し、変換結果が 0 かどうかで判定します。
-
-| 環境変数の状態・値 | `early` |
-|---|---:|
-| 未設定 | 有効（既定値 `true`） |
-| 空文字 | 無効（`atoi("") == 0`） |
-| `0`、`00`、`junk`、`0junk` | 無効（変換結果が 0） |
-| `1`、`-1`、`2`、`1junk` | 有効（変換結果が非 0） |
-
-`atoi` が整数変換を始められない文字列は 0 として扱われ、変換後の値だけを見るため、数値の後ろに文字があっても先頭の整数が非 0 なら有効です。空白や符号も `atoi` の整数変換規則に従います。コードは範囲外入力を別途検査していません。
-
-読み取り結果は関数内の `static const bool` に保存されます。該当経路で初めて評価された後は、同じプロセスで環境値を変更しても再評価されません。
+読み取りは `getenv` の null 判定後、`std::atoi(v) != 0`。未設定は ON。設定済みなら空文字を含め `atoi` の結果が 0 のとき OFF、それ以外は ON となる。`atoi` による整数変換で、文字列全体の妥当性や大文字小文字を検査しない。先頭の空白と符号は変換規則に従い、数値の後ろの文字列は判定に使われない（例: `1abc` は ON、`0anything` は OFF）。`true` / `false` は数値として始まらないため 0 扱い。値の clamp、別設定値への fallback はない。CUDA/HIP の通常・slot 系経路は `scores_early_exit()` の static 値を共有し、CUDA と SYCL の rows 経路および SYCL の通常経路にはそれぞれ関数内 static がある（`engine/src/kernels/cuda/qsa_select.cu:1607-1615,1997-2014,2295-2306`; `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1574-1592,1632-1637`）。
 
 ## 有効になる条件
 
-`qsa_block_scores()` が次をすべて満たす場合にだけ、この変数の判定が行われ、設定がカーネルへ渡ります。
-
-- `STRATA_SCORES_MULTI` が有効である。こちらも未設定なら既定有効で、設定時は `atoi(value) != 0`。
-- クエリ数 `nq` が `MQ` 以下。`MQ` は 8。
-- `active_blocks <= 0` である（通常の decode / pooled16 経路など、呼び出し側が active-block 数を指定していない経路）。
-
-いずれかを満たさない場合は通常の `block_scores_kernel` が選ばれ、この変数の値はその呼び出しには作用しません。たとえば prefill の通常選択は active block 数を渡すため対象外です。decode の QSA 呼び出しや `STRATA_IDX_FP16_CHECK` の pooled16 再計算は active count なしで呼ばれ、`nq <= 8` なら対象の分岐に入ります。
+- CUDA/HIP の通常 `qsa_block_scores` は、`nq <= 8`、`active_blocks <= 0`、かつ `STRATA_SCORES_MULTI` が未設定または `atoi` で非ゼロの場合に、多重スコア経路の候補になる。Turing/Volta では `scores_halve_on()` が true なら別カーネルへ進み、この変数は通常経路では使われない（`STRATA_SCORES_HALVE` による上書きあり）。`STRATA_QSA_ROWS` が厳密に文字列 `1` で `nq <= 4` の場合も別の rows kernel に進み、通常経路のこの変数は使わない（`engine/src/kernels/cuda/qsa_select.cu:1607-1609,2179-2191,2194-2229`）。
+- CUDA/HIP の slot / slot-group scorer は `STRATA_SCORES_MULTI` が有効で、query 数・group 数・各 group のサイズなどの上限を満たす場合に多重カーネルを使う。条件不足や `STRATA_SCORES_MULTI=0` では呼び出し側の個別 scorer に fallback する。slot-group で `STRATA_QSA_ROWS=1` かつ最大 group が 4 query 以下なら別の rows kernel に進み、この変数は使わない（`engine/src/kernels/cuda/qsa_select.cu:1997-2052`）。
+- CUDA/HIP の `QsaScoreRows` overload は verify の batch rows 経路から呼ばれる。CUDA では `STRATA_BATCH_ATTN_ROWS` が有効で、batch/recurrent 条件を満たし、行数上限内で、各行が KV streaming でない場合にこの経路になる（`engine/src/core/verify.cpp:2191-2200,2218-2230`）。この overload は `STRATA_SCORES_MULTI` とは別に対象変数を読み取る（`engine/src/kernels/cuda/qsa_select.cu:2295-2306`）。
+- SYCL の通常経路では `STRATA_SCORES_MULTI` が未設定または `atoi` で非ゼロ、`nq <= 8`、`active_blocks <= 0` が必要。満たさない場合は通常の block-score kernel へ進み、対象変数は使われない。SYCL の `QsaScoreRows` 経路でも対象変数を読む（`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1574-1592,1625-1675`）。
+- verify の `sel_long_` 経路は `qsa_block_scores_long` を使うため、この変数の対象外（`engine/src/core/verify.cpp:2266-2274`）。CLI やサーバー引数がこの環境変数の値を上書きする処理は、確認した読み取り・呼び出し経路にはない。
 
 ## 実行時の詳細
 
-複数クエリ用カーネルは固定 256 CTA で起動します。各 CTA はまず query ごとの `n_kv` / `n_bid` を shared memory に読み、同期後に batch 内最大 `n_bid`（`top`）を求めます。有効時は `blockIdx.x * SCORE_WARPS > top` の CTA が return します。この条件は CTA 内で一様なので、return しない CTA ではその後 query 配列を shared memory にロードして同期し、score 計算へ進みます。無効時は query 配列のロードと同期を先に行い、その後 `top` を求めます。
+読み取り値は各関数内 `static` に初回評価時に保存される。したがって同じ読み取り箇所について、初回評価後にプロセス環境を変更しても反映されない。別々の static を持つ rows / 通常経路は独立に初回評価される。CUDA/HIP では `scores_early_exit()` を使う多重カーネルへ bool を渡し、SYCL もカーネル投入時に bool をコピーして渡す。
 
-カーネル内のコメントは、早期 return で固定 grid のうち仕事のない CTA が query staging を避けられること、また両経路の score は同じ bit になることを記しています。これは実装コメント上の説明であり、この調査では実行や性能測定による独立検証はしていません。環境変数によるログ出力はありません。カーネル起動直後に CUDA の起動エラーを検出した場合は、既存コードが `qsa_block_scores multi: ...` を stderr に出し `exit(1)` しますが、このエラー処理は同変数固有ではありません。
+ON の場合、CUDA/HIP は query ごとの `n_bid` を共有メモリに置き、CTA ごとの先頭 block が batch の最大 `n_bid` より大きければ return し、残った CTA だけがクエリを staging する。OFF では全 CTA が staging を済ませてから有効範囲を調べる。SYCL も同じ順で判定・return・staging を行う。ループ内では各 query の `n_bid` を超える block のスコアを書かず、対象変数はその範囲判定やスコア値を変更しない（`engine/src/kernels/cuda/qsa_select.cu:985-1032`; `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1142-1169,1171-1187`）。CUDA ソースコメントは `=0` で従来の staging に戻し、スコアは同じ bit と記しており、実装も staging の順序と CTA return 以外のスコア演算を共用する（`engine/src/kernels/cuda/qsa_select.cu:1611-1615,979-1032`）。
 
-SYCL ディレクトリ内の DPCT 生成ファイルにも同じ env 判定と分岐が含まれています。ただし調査手順の対象外である生成済みコードは根拠として扱わず、上記の詳細は Strata の CUDA ソースに基づいています。`docs/DETAILS.md` は QSA decode 選択の cluster 切替などを記載していますが、この変数の説明や性能測定値は掲載していません。
+## ログと測定値
+
+この変数の値や ON/OFF を知らせる専用ログはない。通常のカーネル起動エラーは CUDA/HIP 側で `qsa_block_scores multi: %s`、slot 系で `qsa_block_scores_slots: %s` / `qsa_block_scores_slot_groups: %s`、rows 側で `qsa_block_scores_rows: %s` を stderr に出して `exit(1)` する。rows の形状不一致は `qsa_block_scores_rows: unsupported geometry` を出して終了するが、これらは環境変数の値に固有の警告ではない（`engine/src/kernels/cuda/qsa_select.cu:2011-2014,2046-2052,2225-2229,2298-2306`）。SYCL の形状不一致も同じ unsupported geometry 文言で終了する（`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1574-1582`）。`docs/DETAILS.md` にこの変数の条件付き測定値や専用説明は見つからなかったため、性能値は記載しない。
 
 ## 根拠
 
-- `src/kernels/cuda/qsa_select.cu:810-866`: 複数クエリ用カーネル、query staging の順序、`top` を超える CTA の早期 return。
-- `src/kernels/cuda/qsa_select.cu:1092-1115`: Strata 所有の非生成実装における唯一の読み取り箇所、値の判定、分岐条件、カーネルへの引き渡し、起動エラー処理。
-- `include/strata/kernels/qsa_select.hpp:26-30`: `active_blocks` の API 契約。
-- `src/core/verify.cpp:1367-1384`, `src/core/layer.cpp:1122-1129`: decode 側の呼び出し。
-- `src/prefill/prefill.cpp:2760-2775`: 通常 prefill の呼び出しが active block 数を指定すること。
-- `src/prefill/prefill.cpp:2797-2822`: pooled16 の検査経路が active block 数なしで呼ぶこと。
-- `docs/DETAILS.md:24-29`: QSA decode 選択の概要。`STRATA_QSA_EARLY_EXIT` 自体の説明はありません。
+- `engine/src/kernels/cuda/qsa_select.cu:979-1042` — 多重スコア kernel の staging / early return とスコア演算。
+- `engine/src/kernels/cuda/qsa_select.cu:1607-1615,1997-2052,2194-2306` — 値の読み取り、cache、CUDA/HIP 呼び出し条件。
+- `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1128-1190,1574-1592,1625-1690` — SYCL 実装と呼び出し条件。
+- `engine/src/core/verify.cpp:2191-2230,2266-2276`; `engine/sycl/src/core/verify.cpp:1484-1522` — verify の rows / long-context 呼び出し条件。
+- `engine/cmake/strata_gpu_engine.cmake:80-96` — CUDA engine に `qsa_select.cu` を含める。

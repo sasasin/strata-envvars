@@ -1,42 +1,50 @@
 # `STRATA_UC_PROBE`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-SYCL エンジン内で診断用の小規模 GPU カーネル計測を有効にします。モデルの計算設定を選ぶ変数ではなく、engine の in-order queue に計測用バッファを確保し、量子化 + MMVQ、FMA、短い加算カーネル、空 launch を実行して stderr に時間を出すテスト用フックです。`uc_probe()` は engine 起動、モデル準備、serve の準備完了やリクエスト処理など複数地点から呼ばれます（`sycl/src/program/generate.cpp:1800,3083,3095,3691,4455,5244,5784,9143,12475,12643,12764,13313,13724`）。
+SYCL 版 `strata` の実行中に、同じ SYCL queue で小さな計測用 kernel 群を実行し、タグごとの時間と device allocation 数を stderr に出す診断スイッチです。通常の生成機能の設定値ではなく、コードコメントでも test-only とされています。プローブは空の device buffer を確保して独自 kernel を反復実行するため、設定時は生成処理に計測用の実行・待ち時間と追加メモリ確保が加わります。生成 token の選択やモデル設定を変える分岐はこの変数にはありません（`engine/sycl/include/strata/uc_probe.hpp:1-10,77-150`）。
 
 ## 値と判定
 
-helper は `std::getenv("STRATA_UC_PROBE")` の値を数値変換せず、先頭文字だけで判定します。値の全体、大文字小文字、空白、数値としての妥当性は検査しません。
+`std::getenv` の結果を `on()` 内の関数ローカル `static const bool` に一度保存し、値の先頭 byte が存在して `\0` でも `'0'` でもないとき有効にします。文字列全体の parse、数値検証、trim、大文字小文字変換はしません（`engine/sycl/include/strata/uc_probe.hpp:26,77-79`）。
 
-| 環境値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| 先頭文字が `0` | 無効（例: `0`, `0abc`） |
-| それ以外の非空文字列 | 有効（例: `1`, `true`, `false`, `2`, `x`） |
+| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| SYCL `strata` | 無効 | `1`、`true`、`false`、` 0`、`00` など先頭 byte が `'0'` 以外の非空文字列 | 空文字、`0`、`0anything`、`01` など先頭 byte が `'0'` の文字列 |
 
-判定結果は `ucprobe::on()` 内の `static const bool` に初回呼び出し時に保存されます。engine 起動後に値を変更しても再評価されません。別の環境変数 `STRATA_UC_POISON` は、この probe の最初の実行後に追加のテストカーネルを行うための独立した設定であり、`STRATA_UC_PROBE` 自体の値判定には使われません（`sycl/include/strata/uc_probe.hpp:26,77-80,151-154`）。
+前後空白は除去されません。したがって空白だけの値は有効、` 0` も先頭が空白なので有効です。`false` も文字列比較をしないため有効です。SYCL 以外の実行ファイルでは、この読み取り箇所は確認できません（`engine/sycl/CMakeLists.txt:375-377`）。
 
 ## 有効になる条件
 
-この読み取りと `uc_probe()` 呼び出しは SYCL engine にあります。SYCL の CMake 定義は `sycl/src/program/generate.cpp` を `strata` 実行ファイルに含めます（`sycl/CMakeLists.txt:284-286`）。CUDA/HIP の engine でこの変数を読む実装は、この調査対象 commit の Strata 所有ソースでは見つかりませんでした。
-
-通常の起動では `main()` の引数解析前に `uc_probe("start")` が呼ばれるため、変数が有効なら `--help` を含む通常起動で probe が先に動きます。`--version` / `-V` はその前に戻るため probe を実行しません（`sycl/src/program/generate.cpp:1772-1801`）。probe はモデルや CLI の機能フラグで有効化を制限されず、`uc_probe()` に到達した時点で有効です。serve 経路では準備完了前の `ready`、各リクエスト完了後の `after-request` などでも実行されます（同: `9143-9145,12473-12475`）。
+- `engine/sycl` の `strata` 実行ファイルを使う必要があります。ここでは `generate.cpp` が `strata` ターゲットの main としてリンクされ、同ファイルが `uc_probe.hpp` を include します（`engine/sycl/CMakeLists.txt:375-377`; `engine/sycl/src/program/generate.cpp:26-34`）。
+- 最初の `strata::uc_probe` 呼び出し時に値が有効である必要があります。最初の呼び出しは `main` 内の `Options` 初期化と CLI 引数走査より前の `start` タグです。CLI 引数や別の環境変数による `STRATA_UC_PROBE` の上書き処理はありません（`engine/sycl/src/program/generate.cpp:1877-1889`）。
+- 機種を Arc Alchemist に限定する実行時チェックはありません。SYCL queue と当該実行ファイルの計測コードが動く経路で呼び出されます。コメントは Arc Alchemist 上の uncached host memory の影響調査を目的として記していますが、条件分岐はありません（`engine/sycl/include/strata/uc_probe.hpp:1-10,77-82`）。
+- server / stdin command 経路では `ready` や request 後にも呼び出します。通常の CLI 経路では起動、weights / native-dense 後、profile / head / fill / cache の後、prefill 前後、終了前などに呼びます。`captured` は別の `STRATA_WARM_GRAPHS` 判定が真のときだけ呼ばれます（`engine/sycl/src/program/generate.cpp:3206,3218,3821,4589,5419,6002,9573,13134,13304,13425,13961-13974,14388`）。
 
 ## 実行時の詳細
 
-有効時、各 `uc_probe(tag)` 呼び出しは SYCL queue 用の device buffer 群を作り初期化してから、4 種類のカーネル計測を 3 回行い、各値について最小時間を採用します。計測は各反復前後に queue を wait するため同期的です。さらに profiling event が利用できる場合は FMA と短いカーネルの GPU 時間を計測し、空 kernel launch 200 回から host submit 時間を測ります。最後に登録済み device allocation 量と計測値を `UCPROBE <tag>` の行として stderr に出します。計測用バッファはスコープ終了時に queue を待って解放します（`sycl/include/strata/uc_probe.hpp:28-50,77-150`）。したがって有効化すると、通常処理に入る前や各 probe 地点で待ち時間と GPU 作業が追加されます。
+`on()` が最初に呼ばれた時点で環境値をキャッシュし、以後の各 probe 呼び出しはその値を再利用します。プロセス稼働中に環境値を変えても有効状態は変わりません。`uc_probe` は有効時、`dpct::get_in_order_queue()` を使い、device buffer を確保して初期化した後、Q8_1 量子化と Q8_0 / Q6_K MMVQ、FMA、短い加算 kernel の時間を測ります。各計測は warm-up 後に反復し、3 回中の最小値を表示します。また FMA / tiny の device event 計測と空 kernel 提出の host 時間、Strata の登録済み device allocation 数・総量も表示します（`engine/sycl/include/strata/uc_probe.hpp:28-50,77-150`）。
 
-profiling event の取得部分は例外を握りつぶし、その場合 `gpu-stamps` 行の FMA / tiny 値は初期値 `-1` のままです。ほかの probe 処理中に SYCL 例外が発生すると、`main()` の例外 handler が stderr にエラーを書いて終了コード 1 で終了します。device memory allocation 失敗時は「this card does not have the memory for this start」のメッセージを出して終了します（`sycl/include/strata/uc_probe.hpp:112-149`; `sycl/src/program/generate.cpp:13885-13895`）。
+起動時の `start` が最初の有効な probe であるため、同時に `STRATA_UC_POISON` が非空で設定されていれば、その最初の probe 後に `poison()` を呼び、追加の `after-poison` 計測を行います。kernel を実行する値は `fp64`、`uc_read`、`uc_write`、`cached_read`、`shared_write` です。その他の非空値では poison kernel の分岐に入らず、`UCPROBE poisoned with <値>` の出力と追加 probe は行われます。これは別変数による診断用分岐で、`STRATA_UC_PROBE` が無効なら到達しません（`engine/sycl/include/strata/uc_probe.hpp:9-10,52-74,151-155`; `engine/sycl/src/program/generate.cpp:1877`）。
 
-有効な probe の最初の実行後だけ、`STRATA_UC_POISON` が設定されていて空でなければ、その値に応じて追加の診断 kernel を実行し、`UCPROBE poisoned with ...` を出して `after-poison` probe を再帰的に呼びます。poison の入力規則やカーネル分岐は `uc_probe.hpp:52-74,151-154` にあり、この文書では `STRATA_UC_PROBE` の外部効果との混同を避けるため概要に留めます。
+queue 操作・device allocation・kernel 実行に対する `uc_probe` 固有のエラー文字列や明示的な fallback はありません。GPU event profiling 部分だけは例外を握りつぶし、取得失敗時の `gpu-stamps` 欄は初期値 `-1.0` のままです。それ以外の SYCL 操作の失敗処理は呼び出し元に追加されていません（`engine/sycl/include/strata/uc_probe.hpp:34-40,114-149`）。
+
+## ログと測定値
+
+有効時は stderr に次の形式で計測行を出します（`tag` には呼び出し地点名が入ります）。
+
+- `UCPROBE <tag>   registered device allocations: <件数> (<GiB> GiB)`
+- `UCPROBE <tag>   gpu-stamps: fma <us>  tiny <us>   host cost of an empty launch <us>`
+- `UCPROBE <tag> head <us>  q6k <us>  fma <us>  tiny <us>`
+- poison が実行された場合: `UCPROBE poisoned with <値>`
+
+無効時は `uc_probe` が直ちに戻るため、これらの行は出ません。調査対象の `docs` にこの probe の実測結果は見つからず、ここでは計測値を記載しません（`engine/sycl/include/strata/uc_probe.hpp:77-79,146-153`）。
 
 ## 根拠
 
-- 実読み取り、空文字・先頭文字判定、cache: `sycl/include/strata/uc_probe.hpp:26`
-- 計測バッファ、同期計測、stderr 出力、probe 後の poison 分岐: `sycl/include/strata/uc_probe.hpp:28-50,77-155`
-- 起動時の最初の呼び出しと `--version` の早期 return: `sycl/src/program/generate.cpp:1772-1801`
-- serve の準備完了・リクエスト後の呼び出し: `sycl/src/program/generate.cpp:9143-9145,12473-12475`
-- SYCL 実行ファイルへの組み込み: `sycl/CMakeLists.txt:284-286`
+- `engine/sycl/include/strata/uc_probe.hpp:1-26` — 用途コメント、追加の診断変数、判定と cache。
+- `engine/sycl/include/strata/uc_probe.hpp:28-74,77-155` — buffer、kernel 計測、stderr 出力、例外捕捉、poison 呼び出し。
+- `engine/sycl/src/program/generate.cpp:26-34,1877-1889,3206,3218,3821,4589,5419,6002,9573,13134,13304,13425,13961-13974,14388` — include、最初の呼び出しと CLI 前後、実行中の呼び出し位置。
+- `engine/sycl/CMakeLists.txt:375-377` — SYCL `strata` 実行ファイルの main ソースとリンク先。

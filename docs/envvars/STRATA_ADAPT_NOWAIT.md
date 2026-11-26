@@ -1,53 +1,50 @@
 # `STRATA_ADAPT_NOWAIT`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-適応層（adaptive tier）が入れ替える expert のコピーについて、次の decode window の開始時に完了を待つかを切り替えます。有効時は、前の入れ替えコピーが未完了でも完了イベントを非同期に確認し、window の実行へ進みます。コピーが完了した時点で保留中の入れ替えを反映します。適応層自体の有効化は別設定 `--adapt-every` と `--adapt-swaps` が担います。
+適応 expert tier が前の refill で入れ替えた expert のコピーを待たずに、次の verify window を進めるかを切り替える。`1` のとき pending コピーの完了確認を非ブロッキングで行い、完了していなければその window では pending の適用を保留する。unset または `1` 以外では、`STRATA_ADAPT_LAG` の window 数に達した時点でコピー完了を待つ。CUDA/HIP 共通生成経路と SYCL 生成経路に実装がある（`engine/src/program/generate.cpp:2237-2241,22812-22835`、`engine/sycl/src/program/generate.cpp:1377-1381,12739-12743`）。
 
-値の判定は CUDA と SYCL の `adapt_nowait()` にあり、結果は関数内の `static const bool` に一度だけ保存されます。実行中に環境を変更しても反映されません。CUDA の SM 6.0 / SM 8.6 では、後述のアーキテクチャ既定値によって起動時に値が設定される場合があります。
+これは adaptive tier のコピー完了待ち方を変える設定であり、adaptive tier 自体を有効化する設定ではない。adaptive tier が無効なら待機対象となる refill がなく、`STRATA_ADAPT_NOWAIT` の分岐による効果もない（`engine/src/program/generate.cpp:15001-15002,15251-15252`）。
 
 ## 値と判定
 
-環境変数の文字列全体や数値としての妥当性は調べず、先頭文字が `'1'` かだけを判定します。
+両実装とも `std::getenv` の結果を関数内 `static const bool` に保存し、値の先頭 1 文字が文字 `'1'` かだけを判定する。文字列全体の parse や真偽値変換はしない（`engine/src/program/generate.cpp:2238-2240`、`engine/sycl/src/program/generate.cpp:1378-1380`）。
 
-| 状態 | `adapt_nowait()` の値 |
-|---|---|
-| 未設定 | `false`（ただし CUDA の SM 6.0 / 8.6 では既定値注入の可能性あり） |
-| 空文字 | `false` |
-| 先頭文字が `1`（例: `1`, `10`, `1abc`） | `true` |
-| それ以外（例: `0`, `true`, ` 1`） | `false` |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| CUDA/HIP 共通生成経路、SYCL 生成経路 | `adapt_nowait()` は `false` | `1`, `10`, `1anything`（先頭が `1`） | 空文字、`0`, `true`, `01`, ` 1`、その他先頭が `1` でない値 |
+| CUDA sm_60 の起動時既定値適用後 | 通常は unset のままなら既定表が `1` を設定。ただし `STRATA_SM60_PERF` が `0` で始まる場合は表を適用しない | 利用者が事前設定していないとき、単一 compute capability sm_60 の既定表が設定する `1` | 明示した空文字を含む利用者設定は既定値適用を止める。`STRATA_SM60_PERF=0...` も既定表を止める |
 
-大文字小文字、空白の trim、後続文字の検査、数値変換はありません。CUDA SM 6.0 / SM 8.6 の既定値処理では、環境変数が何らかの値（空文字を含む）で既に存在する場合はユーザー設定として保持されるため、空文字や `0` で既定の `1` を抑止できます。
+CUDA の `apply_nv_defaults` は env が既に存在するかだけで既定値の適用を判断するため、空文字も利用者設定として優先される。sm_60 の表は `STRATA_SM60_PERF` が先頭 `'0'` の場合に適用されず、その表に `STRATA_ADAPT_NOWAIT=1` が含まれる（`engine/src/core/nv_defaults.cpp:15-18,164-175,222-234`）。
 
 ## 有効になる条件
 
-- 通常の適応層の入れ替えがある経路で使われます。適応層が無効、または保留中の入れ替えがなければ、非同期確認の対象はありません。
-- `STRATA_ADAPT_LAG` とは選択関係です。有効時は `adapt_lag()` の値にかかわらず、window 前の処理で `apply_pending(false)` を呼びます。無効時は保留が空でない場合に経過 window 数を数え、`adapt_lag()` に達した時点で `apply_pending(true)` を呼びます。`STRATA_ADAPT_LAG` の既定は 1、値は `max(1, atoi(value))` です。
-- `STRATA_ADAPT_OVERLAP` は `STRATA_ADAPT_NOWAIT` が有効、または `STRATA_ADAPT_LAG != 1` の場合に併用できず、CUDA の serve 経路では `not with STRATA_ADAPT_LAG / STRATA_ADAPT_NOWAIT` の理由で overlap を止めます。
-- CUDA では非同期入れ替えに伴う residency table の同期が別途条件付きで設定されます。通常の serial window と適応層が有効な場合、`adapt_nowait()` または `STRATA_ADAPT_LAG > 1` なら `drive.d.evict_sync` が `adapt_evict_sync()` に従って設定されます。これにより、コピー中の evicted expert をデバイス側が resident と誤認しないよう、verifier の起動前に変更済み table entry を反映します。関連する `STRATA_ADAPT_EVICT_SYNC` は未設定なら有効、設定時は `atoi(value) != 0` の場合に有効です。したがって `0`、空文字、数値変換結果が 0 になる文字列は同期を無効化します。
-- CUDA の `--batch-groups` と layer split の組み合わせでは同期アップロードによる待ち合わせを避けるため、verifier に全 activation を publish させる経路があります。`--pipeline-windows` は verifier が常時 publish し、tier が window を fence する経路として扱われます。
+- adaptive tier が動作すること。少なくとも生成経路では `--adapt-every` と `--adapt-swaps` が正で、expert cache に空き枠があり全 expert resident ではない場合に usage が初期化される。条件を満たさない場合、この設定が変える pending refill はない（`engine/src/program/generate.cpp:15001-15002,24563-24570`）。
+- コピー待ちの pending swap があること。空のとき `apply_pending` は pending copy を同期しない。`1` の場合は CUDA event の query が未完了なら pending の適用を返し、完了済みなら続行する（`engine/src/program/generate.cpp:15197-15215`）。
+- 適応 tier の window を進める CUDA/HIP または SYCL の生成経路であること。値の分岐は `generate.cpp` のそれぞれの経路に置かれている（`engine/src/program/generate.cpp:22808-22835,25101-25103`、`engine/sycl/src/program/generate.cpp:12739-12743,14109-14114`）。
+- `STRATA_ADAPT_LAG` との相互作用: `STRATA_ADAPT_NOWAIT` が有効なら、通常の次の window で `apply_pending(false)` を呼び、`adapt_lag()` による wait 分岐は選ばれない。無効なら `pending_age` が `adapt_lag()` に達するまで待機を遅らせる（`engine/src/program/generate.cpp:2248-2250,22818-22835`）。
+- CUDA sm_60 の既定値設定は CUDA build に限られる。起動時に全可視 NVIDIA device が同じ compute capability であるとき `apply_nv_defaults` が呼ばれ、sm_60 表は `STRATA_SM60_PERF` が `'0'` で始まらない場合に適用される。SYCL/Metal はこの `nv_defaults.cpp` による既定値設定対象ではない（`engine/src/program/generate.cpp:4421-4449`、`engine/src/core/nv_defaults.cpp:164-175`、`engine/include/strata/core/nv_defaults.hpp:48-52`）。
 
 ## 実行時の詳細
 
-通常の decode window の直前に `apply_pending(false)` が呼ばれます。`wait == false` の場合、保留したコピーの CUDA event が未完了なら関数は待たずに戻ります。完了済みなら pin した領域を解放し、resident RAM mode の commit、host residency table の更新、必要な device table の upload を行い、保留状態を消去します。したがって `NOWAIT` はコピーを取り消したり、完了前に新しい residency table を確定したりする設定ではありません。
+`adapt_nowait()` の最初の呼び出し時に環境を読み、その後は同一プロセス内の呼び出しで cache 済み bool を返す。実行中に環境を変更しても反映されない（`engine/src/program/generate.cpp:2238-2240`、`engine/sycl/src/program/generate.cpp:1378-1380`）。CUDA の sm_60 既定値は `apply_nv_defaults` が各生成 switch の読み取り前に設定する。利用者が先に設定した値は内容にかかわらず保持する（`engine/src/program/generate.cpp:4425-4449`、`engine/src/core/nv_defaults.cpp:227-234`）。
 
-この窓の前処理は CUDA の通常 decode と serve の逐次 decode にあり、SYCL にも同じ値判定と通常 decode 前の非同期確認があります。CUDA batch serve の slot-row 経路は各 window 前に `apply_pending(false)` を無条件で呼ぶため、この変数による分岐はありません。`--adapt-async` の job step や pipeline の同期・fence もそれぞれ別の処理です。
+CUDA/HIP の serve 生成ループと通常の speculative decode ループでは、nowait が有効だと各 window の前に `apply_pending(false)` を呼ぶ。未完了の適応コピーがあれば event query が成功するまで pending を適用せずに戻り、window は続行する。無効時は pending がないか、待ち window 数 `adapt_lag()` に達したとき `apply_pending(true)` を呼び、adapt event と必要な stage event を同期してから table と residency state を更新する（`engine/src/program/generate.cpp:15197-15235,22808-22835,25101-25103`）。
 
-CUDA では、適応層が evicted expert を host 側で非 resident にした直後、コピー完了まで device table の更新を遅らせると stale な residency 情報が問題になります。通常の serial windows では pre-launch hook が dirty entry を verifier stream 上の patch kernel で反映します。`STRATA_ADAPT_CHECKRES` が設定されている場合は、table の照合経路も構成されます。必要な device table 更新が失敗した場合は `the residency table update failed: ...` を返し、呼び出し側が window を失敗として扱います。
+適応 tier がコピーを待たずに eviction を進める組み合わせでは、device residency table の更新を次の window の前に反映するため `evict_sync` を設定し、必要に応じて変更 entry を patch する経路がある。同期済みの適応 tierではこの条件に入らない（`engine/src/program/generate.cpp:15236-15257,24615-24630`; `engine/include/strata/core/expert_source.hpp:662-669`）。SYCL でも speculative generation と通常 generation の window 前に同じ nowait / lag 分岐がある（`engine/sycl/src/program/generate.cpp:12739-12743,14109-14114`）。
 
-## CUDA のアーキテクチャ既定値
+## ログと測定値
 
-CUDA 起動時、可視 GPU の compute capability がすべて同一なら `apply_nv_defaults()` が実行されます。SM 8.6（RTX 30 系 / RTX A2000-A6000）と SM 6.0（Tesla P100）では、この変数と `STRATA_ADAPT_LAG=2` を含む switch set が既定で設定されます。`STRATA_SM86_PERF=0` または `STRATA_SM60_PERF=0` で該当 set を無効にできます（判定は先頭文字が `0`）。既に `STRATA_ADAPT_NOWAIT` が設定されていれば値を上書きせず、設定した名前を stderr の `strata: sm_86 (Ampere): ... exact speed switches on by default ...` または `strata: sm_60 (Pascal): ...` ログに含めます。従って同じ環境変数でも、CUDA の通常の未設定時とこれらの構成での未設定時は異なります。SYCL/HIP のこの関数には、この CUDA 既定値適用はありません。
+この変数専用の有効・無効ログや失敗メッセージは、確認した読み取り・分岐箇所にはない。CUDA の sm_60 既定表が1つ以上の環境変数を設定した場合は、`apply_nv_defaults` が stderr に `strata: sm_60 (Pascal): ... speed switches on by default ...` の行を出し、設定した名前を列挙する。利用者がこの変数を設定済みなら既定適用リストに入らず、この行で当変数は列挙されない（`engine/src/core/nv_defaults.cpp:222-255`）。
+
+`docs/DETAILS.md` の現行表には sm_86 既定値として本変数が載っているが、現在の `nv_default_env` の sm_86 表は `STRATA_ADAPT_LAG=2` などを設定し、本変数を含めない。一方、現行コードの sm_60 表は本変数を `1` に設定する。文書の当該表と実装に差があるため、既定条件はソースコードに基づいて記載した（`docs/DETAILS.md:1478-1493`、`engine/src/core/nv_defaults.cpp:41-58,164-175`）。
 
 ## 根拠
 
-- 値の parse と static cache、`STRATA_ADAPT_LAG` の parse: `src/program/generate.cpp:1506-1519`, `sycl/src/program/generate.cpp:1304-1317`。
-- `STRATA_ADAPT_EVICT_SYNC` の既定と parse: `src/program/generate.cpp:1541-1545`。
-- CUDA 起動時の既定値適用条件: `src/program/generate.cpp:2800-2815`。
-- SM 8.6 / SM 6.0 の既定値、既存値の保持と `setenv` / `_putenv_s`: `src/core/nv_defaults.cpp:12-15,18-49,52-68`。
-- serve の overlap が NOWAIT / LAG と併用不可である判定: `src/program/generate.cpp:9952-9969`。
-- pending swap 完了時の更新、および lagged / nowait residency update の説明・条件: `src/program/generate.cpp:10024-10052,10054-10088,10105-10110,16000-16015`。
-- window 直前の分岐: CUDA serve `src/program/generate.cpp:14773-14794`、CUDA generate `src/program/generate.cpp:16310-16316`、SYCL serve `sycl/src/program/generate.cpp:11487-11492`、SYCL generate `sycl/src/program/generate.cpp:12710-12715`。CUDA batch の無条件 nonblocking poll: `src/program/generate.cpp:11396-11403`。
-- Strata の設計説明と測定条件: `docs/DETAILS.md:2006-2008,2425-2441`。SM 8.6 / 6.0 の測定は IQ3_XXS、RTX 3060 / RTX A4000 / Tesla P100、fresh engine、8 interleaved pairs と記載されています。ここでは性能値を一般化せず、コード上の挙動を説明しています。
+- 値の読み取り・cache: `engine/src/program/generate.cpp:2237-2250`; `engine/sycl/src/program/generate.cpp:1377-1390`
+- pending swap 適用と wait/query: `engine/src/program/generate.cpp:15197-15235,22808-22835,25101-25103`; `engine/sycl/src/program/generate.cpp:12739-12747,14109-14124`
+- 適応 tier 有効条件と eviction 同期: `engine/src/program/generate.cpp:15001-15002,15236-15257,24563-24570,24615-24630`; `engine/include/strata/core/expert_source.hpp:659-669`
+- CUDA の既定値適用条件と優先順位: `engine/src/program/generate.cpp:4421-4449`; `engine/src/core/nv_defaults.cpp:15-18,164-175,222-255`; `engine/include/strata/core/nv_defaults.hpp:48-52`
+- 既定値資料との比較: `docs/DETAILS.md:1478-1493`

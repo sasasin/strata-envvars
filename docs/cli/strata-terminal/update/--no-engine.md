@@ -1,6 +1,6 @@
-# `--no-engine`
+# `strata update --no-engine`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout の `git status --short --branch` は `## main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,59 +8,49 @@
 | コマンド | `strata update` |
 | オプション | `--no-engine` |
 | 別名 | なし |
-| 値 | 値なしのフラグ。既定値は `false` |
+| 値 | 値を取らないフラグ。指定時は真になる |
 
 ## 役割
 
-通常の `strata update` 実行で engine の更新工程を省略します。Control の更新は別の `--no-control`、デスクトップアプリ installer のダウンロードは `--app` で独立して指定します（`strata_cli/update_cmd.py:42-49,213`）。
+署名済み feed を使う `strata update` の更新対象からエンジンを外す。通常の更新経路でエンジンを更新せず、Control は既定どおり更新対象に残る。`--app` も指定した場合はアプリのインストーラー取得・検証も別途行われる。エンジンを更新せず Control だけを更新したいときなどに使う。
 
 ## 使い方
 
 ```sh
+# エンジンを除外して、Control の更新を行う
 strata update --no-engine
-```
 
-Control とアプリ installer だけを対象にする場合は、たとえば次のように指定します。
-
-```sh
-strata update --no-engine --app
+# エンジンを除外したときの更新候補を確認する（この場合も --no-engine は候補表示を絞らない）
+strata update --no-engine --check
 ```
 
 ## 値と既定値
 
-- parser は `action="store_true"` で定義され、引数値を取りません。省略時は `false`、指定時は `true` です（`strata_cli/update_cmd.py:42-49`）。
-- 値の範囲や値の validation はありません。値を続けて渡す構文ではなく、同じフラグを複数回指定しても真偽値を立てる動作です（`strata_cli/update_cmd.py:48`）。
+`argparse` の `store_true` フラグで、値は不要。省略時は偽でエンジンを含む通常の更新経路になり、指定時は真になる。同じフラグを複数回指定しても真のままで、値の変換や追加の範囲 validation はない（`terminal/strata_cli/update_cmd.py:59-66`）。
 
 ## 実行時の動作
 
-- `strata update` はトップレベル `update` parser を登録し、CLI dispatcher から `update_cmd.run(a)` を呼びます（`strata_cli/update_cmd.py:42-49`; `strata_cli/cli.py:139-140,2135-2137`）。
-- 通常実行では `run()` が `updater.run_update()` に `engine=not a.no_engine` を渡します。`--no-engine` 指定時、更新処理は feed の読込・状態保存を行ったうえで engine step を作らず、Control は `--no-control` がなければ、app は `--app` があれば処理します（`strata_cli/update_cmd.py:210-224`; `strata_control/updater.py:1274-1285`）。
-- engine step を省略するため、この経路では engine package の選択・ダウンロード・検証・test-start・切替を行う `update_engine()` に進みません（`strata_control/updater.py:926-960,1279-1285`）。
-- `--check` を指定した場合は、`--no-engine` の値を `run_update()` に渡す行より前に `updater.check()` を呼びます。そのため `--no-engine` は check レポートの engine 項目を除外せず、check は engine・Control・app の状態を判定します。また check は feed 以外をダウンロードしませんが、`last_check` を state に保存します（`strata_cli/update_cmd.py:203-209,213`; `strata_control/updater.py:624-640`）。
-- `--no-engine` は feed 読込、署名鍵の読込、取得禁止 (`STRATA_NO_ACQUIRE`) の確認を省きません。通常実行時にも `run_update()` は取得禁止を確認し、更新 lock 内で feed を開いて state を保存します（`strata_cli/update_cmd.py:197-200`; `strata_control/updater.py:1274-1282`）。
+`strata update` の実行分岐は `a.no_engine` を反転して更新処理へ渡す（`terminal/strata_cli/update_cmd.py:370-372`）。更新処理ではエンジン更新ステップを作らず、モデル形状別エンジンの更新ステップも作らない。一方、Control は `--no-control` がない限り更新ステップに残り、`--app` があればアプリ更新も行う（`terminal/strata_control/updater.py:2099-2106,2109-2122`）。そのため、このオプション単独では「更新全体を無効化」したり「Control も除外」したりしない。
+
+更新前の稼働モデル確認は、選択された更新対象の候補がある場合に行われる。エンジンを除外すると、エンジンのみが候補だった場合はそのエンジン更新を理由にモデル停止を求めないが、Control など他の選択対象に更新があれば確認経路は残る（`terminal/strata_control/updater.py:2066-2079,2082-2096`）。
+
+`--check` は通常更新処理より先に分岐し、`updater.check(ctx)` の全コンポーネントの判定を表示する。この経路では `a.no_engine` を参照しないため、`strata update --no-engine --check` でもエンジン候補自体は表示対象である（`terminal/strata_cli/update_cmd.py:361-367`、`terminal/strata_control/updater.py:778-789`）。通常更新では feed を読み、状態を保存してから、選択された更新ステップを順に実行する（`terminal/strata_control/updater.py:2112-2122`）。
 
 ## 適用条件と副作用
 
-- この文書は `strata update` のスコープです。同じ `--no-engine` は `strata components update` にも別 parser で定義されていますが、そちらは索引上の別文書です（`strata_cli/update_cmd.py:50-56`; [`components update の文書`](../components/update/--no-engine.md)）。
-- 通常実行では `_maybe_wait()` が `run_update()` より先に呼ばれ、engine が稼働中で `--wait` が未指定の場合、対話端末で待機確認を表示することがあります。これは `--no-engine` でも発生し得ます。ただし engine step を省略した後は、engine 更新処理内の serving 待機には進みません（`strata_cli/update_cmd.py:210,237-252`; `strata_control/updater.py:945-946,1279-1285`）。
-- `--no-control` も付けて `--app` を省略した場合、実行対象 step は空になりますが、共通の取得確認・lock・feed 読込・state 保存は `run_update()` 内で行われます（`strata_cli/update_cmd.py:197,213`; `strata_control/updater.py:1274-1285`）。
+- 通常更新では feed の読み込みと更新状態の保存が行われ、Control はこのフラグだけでは除外されない。ネットワーク取得は `strata update` の明示的な更新処理による（`terminal/strata_control/updater.py:2112-2122`）。
+- 更新完了時の `last_check` 再計算では、エンジンの候補も引き続き調べて状態に保存する。したがって、更新ステップを省いてもエンジン更新候補の記録まで消すわけではない（`terminal/strata_control/updater.py:2130-2137,792-800`）。
+- `--check` と併用した場合は更新を行わず、feed に基づく全コンポーネントの確認結果を返す。確認処理も `last_check` を状態へ保存する（`terminal/strata_cli/update_cmd.py:361-367`、`terminal/strata_control/updater.py:778-789`）。
 
 ## 出力とエラー
 
-- 通常の human 出力では feed の署名情報と実行された各 component の結果を表示します。engine step を省略した場合、結果一覧に engine の行はありません。JSON/JSONL 出力でも `run_update()` の結果が使われ、engine step は含まれません（`strata_cli/update_cmd.py:211-224`; `strata_control/updater.py:1283-1297`）。
-- feed、署名、取得許可などの共通処理が失敗すれば、このフラグを指定していてもエラーになります。`UpdateError` / `FeedError` は human 出力で stderr、JSON/JSONL ではエラー JSON として報告され、各例外の終了コードを返します。署名エラーと取得拒否はコード `5`、中断はコード `130` です（`strata_cli/update_cmd.py:167-172,225-234`）。
-- 省略しなかった Control または app の処理が失敗しても、残りの step を試行し、全体は最初の `UpdateError` の終了コードを返します（`strata_control/updater.py:1286-1297`）。
+通常の人向け出力では更新開始時に feed の出所を表示し、完了後に実行されたコンポーネントの結果を表示する。`--output json` / `jsonl` はこのオプションと独立しており、JSON 系では結果を機械可読形式で出力する（`terminal/strata_cli/update_cmd.py:368-377`、`terminal/strata_cli/update_cmd.py:117-139`）。エンジン処理が省かれるため、その実行結果項目は作られない。Control など実行対象の失敗は通常の更新失敗として結果に記録され、最初の失敗の終了コードが返る（`terminal/strata_control/updater.py:2123-2138`）。
+
+feed、署名、取得禁止、割り込みなどの失敗は共通の更新エラー経路で報告される。`STRATA_NO_ACQUIRE` による拒否は終了コード 5、割り込みは 130 として扱われる（`terminal/strata_cli/update_cmd.py:355-390`）。これらは `--no-engine` 固有の validation ではない。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:42-49` — `strata update` parser と `--no-engine` の宣言。
-- `strata_cli/cli.py:139-140,2135-2137` — parser 登録と `update_cmd.run()` への dispatch。
-- `strata_cli/update_cmd.py:163-234` — 共通準備、取得可否、`--check` 分岐、通常実行への引き渡し、出力と失敗処理。
-- `strata_cli/update_cmd.py:237-252` — 通常更新前の稼働確認・対話待機。
-- `strata_control/updater.py:624-640` — check が各 component を判定し `last_check` を保存する処理。
-- `strata_control/updater.py:926-960` — engine 更新工程。
-- `strata_control/updater.py:1274-1297` — engine / Control / app step の選択、失敗集約と終了コード。
-
-## 調査範囲
-
-この記述は指定 checkout の Python CLI と updater 実装を対象にしています。別の checkout、Release binary の実行結果、各 OS での対話表示差は実行して確認していません。
+- `terminal/strata_cli/update_cmd.py:59-79` — `strata update` と `strata components update` の parser。両方に同じ `store_true` オプションが登録されている。本文書は索引上の `strata update` スコープを扱う。
+- `terminal/strata_cli/update_cmd.py:361-377` — `--check` の先行分岐と、通常更新へ `engine=not a.no_engine` を渡す箇所。
+- `terminal/strata_control/updater.py:2066-2096,2099-2122` — 選択対象によるモデル確認、エンジン・形状別エンジン・Control・アプリの更新ステップ構成。
+- `terminal/strata_control/updater.py:778-789,2130-2138` — 確認時と更新後の feed 判定・状態保存。

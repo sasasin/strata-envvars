@@ -1,6 +1,6 @@
-# `--status`
+# `strata launch --status`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,52 +8,45 @@
 | コマンド | `strata launch` |
 | オプション | `--status` |
 | 別名 | なし |
-| 値 | 取らない。`argparse` の `store_true` フラグ |
+| 値 | 取らない。`store_true` のフラグ |
 
 ## 役割
 
-`strata launch` が管理する稼働中の server 状態を照会し、名前・状態・接続 URL を表示します。`launch-` で始まる profile だけを調べ、状態が `ready` または `starting` のものを結果に含めます。preset の一覧・server 停止とは別の管理操作です。
+`strata launch` が起動したサーバーのうち、現在 `ready` または `starting` 状態のものを列挙します。preset の保存内容やモデル一覧を調べるものではなく、launch 用 runtime の状態を読み取ります。
 
 ## 使い方
 
 ```sh
 strata launch --status
-```
-
-JSON で結果を受け取る場合:
-
-```sh
 strata launch --status --output json
 ```
 
 ## 値と既定値
 
-`--status` 自体は値を取りません。省略時は `False` で、通常の起動経路に進みます。複数回指定しても真偽フラグのままです。表示形式は別 option `--output` が決め、`human` が既定、受理値は `human` と `json` です（`strata_cli/launch/cmd.py:140-145`）。
+値や引数は不要です。省略時は `False` で、通常の `strata launch` の起動経路へ進みます。`--status` に値を付ける構文はありません。`--preset` を併記しても、status 分岐ではその preset 名は参照されず、全 launch を調べます（parser は `--preset` を別に定義し、status 分岐は `a.preset` を使わず `running_launches()` を呼びます）。
 
 ## 実行時の動作
 
-`run_launch` は preset 操作・停止処理の後、起動や設定構築より前に status 分岐へ入ります。そのため、通常の status 照会ではモデル選択・起動・preset 保存には進みません。`running_launches()` は profile 一覧から `launch-` prefix の ID を選び、`strata_control.runtime.status()` を呼びます。状態が `ready` / `starting` であれば、profile の `overrides.port`（なければ既定 port）を使って `http://127.0.0.1:<port>` を表示用 URL として組み立てます（`strata_cli/launch/cmd.py:567-592,661-671`）。
+`running_launches()` は保存済み profile を列挙し、ID が `launch-` で始まるものに対して `runtime.status()` を呼びます。応答状態が `ready` または `starting` の profile について、profile の上書き設定から port と host を読み、表示用 URL を組み立てます。破損した profile を読めない場合は空の設定として既定 port と loopback host を使います。profile 一覧の取得や個別の runtime 状態確認で例外が起きた場合、その一覧・profile は結果から除外されます（`terminal/strata_cli/launch/cmd.py:663-690`）。
 
-人間向け出力では稼働中の各項目を `<名前>: <状態> at <URL>` と表示します。該当項目がない場合は `Nothing from \`strata launch\` is running.` と表示します。`--output json` の場合は `{"schema_version":1,"ok":true,"running":[...]}` 形式を stdout に出します。通常の完了コードは `0` です（`strata_cli/launch/cmd.py:663-671`）。
+`runtime.status()` は runtime state を読み、state がなければ `stopped`、host lease が見つからなければ `stopped`、lease が有効でなければ `stale` を返し、それ以外は owner に status RPC を問い合わせます。`running_launches()` は `stale` を表示対象に含めません（`terminal/strata_control/runtime.py:490-501`、`terminal/strata_cli/launch/cmd.py:676-680`）。
+
+`--output json` を指定すると `schema_version: 1`、`ok: true`、`running` 配列を含む JSON を出力します。preset 管理や停止と同時に指定した場合は、処理順で先に判定される `--list-presets`、`--delete-preset`、`--stop` が status より優先されます（`terminal/strata_cli/launch/cmd.py:753-797`）。
 
 ## 適用条件と副作用
 
-照会対象は Strata の profile のうち ID が `launch-` で始まるものに限られます。runtime の状態が `stopped`、`stale`、または `ready` / `starting` 以外の場合は一覧から除外します。`runtime.status()` は state と host lease を読み、lease が有効なら runtime の status RPC を呼びます。profile 一覧が存在しない場合、照会結果は空になります（`strata_control/runtime.py:444-455`、`strata_control/profiles.py:169-182`）。
-
-この経路に起動・停止・設定保存の呼び出しはありません。ソース上で確認できる副作用は状態照会と標準出力への表示です。`--preset` を同時指定しても status の検索対象はその preset に限定されません。なお、同時に `--stop` を指定すると、parser 後の分岐順で `--stop` が先に処理され、status 表示には進みません（`strata_cli/launch/cmd.py:661-671`）。
+このオプションは status 読み取り経路に入り、モデル起動・停止や preset 更新は行いません。runtime 状態の読み取りと、応答可能な owner への status RPC は行われます（`terminal/strata_cli/launch/cmd.py:789-797`、`terminal/strata_control/runtime.py:490-501`）。
 
 ## 出力とエラー
 
-- 人間向け出力は stdout、未知の引数に対するエラーは parser の後処理から stderr に出て終了コード `2` になります（`strata_cli/cli.py:2223-2231`）。
-- profile 一覧取得時の例外は `running_launches()` 内で空の一覧として扱われ、status コマンド自体は「稼働なし」として `0` を返します。個別の `runtime.status()` の例外もその profile を飛ばして続行します（`strata_cli/launch/cmd.py:571-584,663-671`）。
-- runtime の `stale` 状態は失敗として表示せず、稼働一覧から除外します（`strata_control/runtime.py:448-455`、`strata_cli/launch/cmd.py:578-584`）。
-- profile 読み込みで例外が起きた場合、`running_launches()` は `ov` を空にしますが、その後 `prof.get("source_config")` も参照します。該当 profile の runtime が `ready` / `starting` を返す条件で `prof` が未定義なら例外になり得ます。この異常経路の表示形式・終了コードは、当該ソースでは個別に処理されていません（`strata_cli/launch/cmd.py:582-592`）。
+人間向け出力では、該当する launch ごとに `<名前>: <状態> at <URL>` を表示します。対象がなければ「Nothing from `strata launch` is running.」を表示します。status 分岐の終了値は対象の有無にかかわらず `0` です（`terminal/strata_cli/launch/cmd.py:789-797`）。
+
+JSON モードでは JSON オブジェクトに加え、対象が1件以上あると同じ launch の人間向け行も続けて stdout に書かれます。これは JSON Lines ではなく、標準出力全体を単一 JSON として読む利用側では解析を妨げる形式です（`terminal/strata_cli/launch/cmd.py:790-797`）。一覧取得・runtime 確認の例外は `running_launches()` 内で握りつぶされるため、status の出力だけから個々の失敗を識別できない場合があります（`terminal/strata_cli/launch/cmd.py:668-680`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:140-145` — `--output` と管理 option の parser 定義。`--status` は値なしの `store_true`。
-- `strata_cli/launch/cmd.py:567-592` — launch profile の絞り込み、runtime 状態照会、表示用 URL の組み立て。
-- `strata_cli/launch/cmd.py:630-641,661-671` — status 分岐、human / JSON 出力、完了コード。
-- `strata_control/runtime.py:444-455` — runtime の state / lease 確認と status RPC。
-- `strata_control/profiles.py:169-182` — profile 一覧の読み込みと不正 profile の扱い。
-- `strata_cli/cli.py:2223-2231` — 未知引数を stderr に出して `2` を返す処理。
+- `terminal/strata_cli/launch/cmd.py:155-160` — `--status` は値を取らない `store_true` として `strata launch` の manage 引数群に登録。
+- `terminal/strata_cli/launch/cmd.py:663-690` — launch profile の抽出、状態フィルター、URL 構築、profile/runtime 読み取り失敗の扱い。
+- `terminal/strata_cli/launch/cmd.py:753-797` — status 分岐の優先順、human/JSON 出力と終了値。
+- `terminal/strata_control/runtime.py:490-501` — runtime status の state・lease 判定と owner RPC。
+- `terminal/strata_cli/cli.py:516-517, 2235-2237` — `launch` parser の登録と `run_launch()` へのディスパッチ。

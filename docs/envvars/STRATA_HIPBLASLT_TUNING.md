@@ -1,41 +1,54 @@
 # `STRATA_HIPBLASLT_TUNING`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP 対応の prefill GEMM で使う hipBLASLt チューニング表のパスです。表には GPU アーキテクチャと hipBLASLt バージョンに対応する解法 ID が記録され、表を読み込めると BF16/FP16 の dense GEMM で該当 ID の解法を試します。変数自体は値を数値や真偽値として解釈しません。CUDA 専用ビルドではこの変数を読むコードは有効になりません。
+HIP の prefill GEMM で使う hipBLASLt tuning table のファイルパスを指定する。値が空でなければそのパスの表をロードし、表の shape ごとの solution を実際の GEMM に適用する。値が未設定または空文字なら、HIP エンジンは `STRATA_HIPBLASLT_TABLE` と実行ファイル隣の `tuning/` を使う経路を判定する。どちらの経路も使わない場合や、表・solution が使えない場合は hipBLASEx に戻る。表は入力 dtype と行列 shape に対する選択を変えるもので、すべての GEMM を一律に置き換えるものではない（`engine/src/prefill/gemm.cu:284-300,392-399,488-538,793-799,854-888`）。
+
+Strata 所有コードでは HIP の通常エンジン実装（`engine/src/prefill/gemm.cu`）と SYCL ツリーの実装（`engine/sycl/src/prefill/gemm.dp.cpp`）が値を直接読み取る。後者も HIPBLASLT build macro が有効な箇所で state を作り、BF16/F16 GEMM から試行する。候補名の登録・文書・テストでの参照だけでなく、製品コードに読み取り箇所がある（`engine/sycl/src/prefill/gemm.dp.cpp:196-230,428-431,497-499,890-895,968-973`）。
 
 ## 値と判定
 
-| 環境変数の状態 | 動作 |
-|---|---|
-| 未設定 | hipBLASLt state を作らず、既存の hipBLAS GEMM 経路を使う |
-| 空文字 | 未設定と同様に state を作らない |
-| 非空文字列 | 文字列全体をファイルパスとして開き、表を読み込む |
-| 開けない・形式不正・対象外 | stderr に理由と `using hipBLASEx` を出し、state を作らず通常経路へ戻る |
+| 実行経路 | 未設定 | 空文字 | 設定時に有効になる値 | 無効値・不適合時 |
+|---|---|---|---|---|
+| HIP (`engine/src/prefill/gemm.cu`) | `STRATA_HIPBLASLT_TABLE` を見て同梱表の選択を判定 | 未設定と同じ | 空でない文字列をそのままファイルパスとして読む。値の真偽・数値・大文字小文字の parse はしない。空白の trim もない | `0`、`false`、`on` も特別扱いされずファイル名。存在しない、読めない、形式・GPU arch・hipBLASLt version が合わない表は load 失敗して hipBLASEx を使う |
+| SYCL ツリーの HIPBLASLT 対応箇所 | state を作らない | state を作らない | 空でない文字列をファイルパスとして読む | 読込・検証失敗時は理由を出して hipBLASEx を使う |
 
-数値変換、先頭文字判定、空白除去、相対パスの特別扱いはありません。パスはプロセスの作業ディレクトリを基準にした通常のファイルオープンに渡されます。表は空行と `#` で始まる行を無視します。先頭の有効行は `STRATA_HIPBLASLT_TUNING_V1 <arch> <version>` 形式で余分な項目を許さず、後続行は `f16|bf16 N K ldy T_bucket solution_id` の6項目を要求します。N/K/T_bucket は正、`ldy >= N`、solution ID は非負で、重複する shape key は拒否されます。header だけの表はロード自体は成功しますが、形状に一致する行がないため GEMM ごとにfallbackします。
+HIP 実装では `std::getenv` の戻り値が null か、先頭文字が NUL かだけを判定する（`engine/src/prefill/gemm.cu:284-300`）。従って例として `unset` と `STRATA_HIPBLASLT_TUNING=''` は同じく自動選択側へ進み、`/path/table.txt` はパス、`0` や `false` はその名前の相対パス、空白だけの値も空でないパスとなる。`0anything` も同様にファイルパスである。相対パスはエンジンの current working directory 基準で開かれる。SYCL 側も null / 空文字だけを除外し、同じく値を path として `TuningTable::load` に渡す（`engine/sycl/src/prefill/gemm.dp.cpp:196-198,223-230`）。
+
+HIP 経路で指定された表は、ヘッダーが `STRATA_HIPBLASLT_TUNING_V1` または `..._V2` であること、architecture が実行 GPU と一致するか許可された同一世代 family であること、version が一致すること（V2 は双方 `100500` 以上なら version 差を許す）を検証する。各行は dtype `f16` / `bf16`、正の `n`,`k`,`t_bucket`、`ldy >= n`、非負 solution ID を要求し、重複 key や余分な列も拒否する。失敗時はエラー理由と `using hipBLASEx` を stderr に出す（`engine/src/prefill/hipblaslt_tuning.hpp:27-121`）。
+
+CLI 引数でこのパスを直接指定する処理は確認できなかった。Server の run config は `env` 辞書で値を渡す。engine 起動環境は親環境のコピーを作った後に `cfg.env` を反映するため、同名の `cfg.env` があれば子エンジンでは親環境の値を上書きする（`terminal/serve/server.py:4007-4028`）。Server の表選択ログ用 `user_choice` は親環境を先に見てから config の `env` を見て空白を trim するが、engine にセットする `child_env` の値にはその trim は適用しない（`terminal/strata_control/hipblaslt_tuning.py:187-194,220-228`; `terminal/serve/server.py:4027-4028`）。
 
 ## 有効になる条件
 
-- `__HIPCC__` と `STRATA_HIPBLASLT_AVAILABLE` が定義されたビルドでのみ state 作成・呼び出しがコンパイルされます。通常の CUDA では利用されません。SYCL ソースにも同じ HIP 条件付き実装があります。
-- 表の header の hipBLASLt version は実行時に取得したバージョンと一致する必要があります。architecture は完全一致のほか、gfx1200/gfx1201 同士、gfx1100/gfx1101/gfx1102 同士を同一 family として受け入れます。
-- header が一致しても、呼び出し形状（dtype、N、K、ldy）に表の行が必要です。T は最も近い `T_bucket` を使い、距離が同じなら小さい bucket を選びます。解法 ID の取得・実形状でのサポート確認・workspace 量の確認にも通らなければその GEMM は hipBLASLt を使いません。
-- `STRATA_WMMA_GEMM` など別の GEMM 経路が先に処理した場合や、HIP の FP16 prompt 入力経路が BF16 GEMM を変換して処理した場合、この表を使う hipBLASLt 呼び出しには到達しません。
+- HIP エンジンが build に含む `STRATA_HIPBLASLT_AVAILABLE` の機能が必要。HIP 以外の CUDA 等ではこの経路を使わない（`engine/src/prefill/gemm.cu:757-759,793-799,873-878`）。SYCL ソースでは `__HIPCC__` と `STRATA_HIPBLASLT_AVAILABLE` の条件下で同じ state を初期化・呼び出す箇所がある（`engine/sycl/src/prefill/gemm.dp.cpp:428-431,497-499,890-895,968-973`）。
+- GPU/runtime の問い合わせと hipBLASLt handle/version の取得に成功し、表がその GPU architecture と hipBLASLt version に適合する必要がある。これらに失敗すると hipBLASEx へ進む（`engine/src/prefill/gemm.cu:307-325,392-399`; 表の照合は `engine/src/prefill/hipblaslt_tuning.hpp:49-79`）。
+- 表に dtype と `n`,`k`,`ldy` が一致する行が必要。`T` は表の bucket のうち距離が最小のものを選び、同距離なら小さい bucket を選ぶ。該当行がないときはその GEMM だけ hipBLASEx に fallback する（`engine/src/prefill/hipblaslt_tuning.hpp:124-136`; `engine/src/prefill/gemm.cu:411-420,488-500`）。
+- 既定の HIP 経路では `STRATA_HIPBLASLT_TUNING` が空の場合に限り `STRATA_HIPBLASLT_TABLE` を評価する。`off`, `0`, `no`, `false`, `none`, `disable`, `disabled`（前後空白除去後、小文字化）は同梱表を使わない。`on`, `1`, `yes`, `true`, `force`, `enable`, `enabled` は architecture 対応の同梱表を強制する。それ以外・未設定・`auto` は auto 扱いで、gfx11 WMMA 対応 arch（ただし `STRATA_GFX11_DEFAULTS` の先頭文字が `0` なら除外）または gfx1151 は自動対象、その他は明示的な on が必要。gfx1103 は Linux で CWSR が有効と判明した場合 auto では skip し、on なら強制する（`engine/src/prefill/gemm.cu:288-300,327-355`）。
+- この自動選択経路では、同梱の `tuning/<arch>-hipblaslt-<version>.txt` が必要。完全一致版がなければ hipBLASLt `100500` 以上に限り、該当 arch の V2 表から version `>=100500` のうち大きい版を探す。見つからない場合は hipBLASLt state を作らない（`engine/src/prefill/gemm.cu:357-385`）。ただしこの探索条件は明示パスの値には適用されず、明示パスを直接 load する。
+- HIP prefill の BF16/F16 GEMM から呼ばれる。呼び出し前に WMMA などの別経路が処理を終えた shape ではこの表を使わない（例: `engine/src/prefill/gemm.cu:854-874,890-896,947-975`）。
 
 ## 実行時の詳細
 
-環境変数は `Gemm::init()` または `Gemm::init_external()` が呼ぶ `create_hipblaslt_state()` ごとに読みます。値の判定結果をプロセス全体の static cache には保存しませんが、作成済みの GEMM state は環境変数を再読せず、表の行と shape ごとの解法判定を保持します。したがって既存の state の後で環境変数を変更しても、その state には反映されません。新しい state の初期化時には再読されます。
+HIP では `Gemm::init` / `Gemm::init_external` 時に `create_hipblaslt_state` が実行され、その時点で環境値を読み、handle・device・version を照会して表をロードする。state は `Gemm` インスタンスに保持され、後続 GEMM ごとに環境変数を読み直さない。algorithm 解決結果は `(dtype,T,N,K,ldy,beta)` key で state 内 cache に保存する。したがってプロセス起動後の環境変更は既存 `Gemm` の table/state に反映されない（`engine/src/prefill/gemm.cu:284-300,392-400,402-420,757-799,854-878`）。SYCL 側も `Gemm` 初期化で state を作る（`engine/sycl/src/prefill/gemm.dp.cpp:196-230,404-431,456-499`）。
 
-表の読込に成功すると stderr に `prefill gemm: hipBLASLt tuning enabled (<行数> rows, <arch>, version <version>)` と出ます。BF16/FP16 GEMM は対応する候補を確認し、対応・workspace 条件を満たせば hipBLASLt を呼びます。形状行や利用可能な解法がない場合、通常は hipBLASEx 経路へ戻ります。`STRATA_HIPBLASLT_VERBOSE` が設定されている場合は fallback 詳細も出力します。hipBLASLt の起動自体が失敗した場合、beta が 0 ならその shape を無効化してfallbackしますが、beta が 0 以外なら終了します。
+GEMM 呼び出し時、table row の solution が hipBLASLt に存在しない、kernel name が V2 の期待値と異なる、実 shape をサポートしない、または必要 workspace が確保量を超える場合、その呼び出しは hipBLASEx へ戻る。該当 shape / solution の解決結果は cache される。hipBLASLt の起動失敗は stderr に status と shape を出し shape を外して fallback する。ただし `beta != 0` かつ prelaunch failure と判定されない失敗では `refusing a fallback...` を出して `exit(1)` する（`engine/src/prefill/gemm.cu:428-474,488-538`; V2 kernel name 判定は `engine/src/prefill/gemm.cu:440-452`）。
 
-setup.py は、現在のカード architecture とインストール済み hipBLASLt version の両方に合う `tools/hip/<arch>-hipblaslt-<version>.txt` がある場合、生成する実行設定の `env` にこのパスを設定します。合う表がなければ setup は警告し、実行設定に追加しません。serve は実行設定の env を親プロセス環境へ上書きしてエンジン子プロセスに渡します。
+## ログと測定値
+
+表の load 成功時は stderr に `prefill gemm: hipBLASLt tuning enabled (%zu rows, %s, version %d)` を出す。失敗時は `prefill gemm: <理由>; using hipBLASEx`。gfx1103 の CWSR 条件による skip / 警告はコード中の `prefill gemm: gfx1103 hipBLASLt tuning table skipped...` または `prefill gemm: WARNING: loading...` の文言で出る（`engine/src/prefill/gemm.cu:352-355,388-399`）。
+
+`STRATA_HIPBLASLT_VERBOSE` が設定されている場合（空文字を含む）は、shape に行がない、solution が使えない、workspace 不足等の fallback 理由や、選ばれた solution・shape・workspace を stderr に追加する。未設定ならこれらの詳細行は抑制される（`engine/src/prefill/gemm.cu:411-420,428-474,502-509`）。
+
+Strata のソースコメント・設計資料に記載された性能値は、対象環境・条件の範囲をこの文書で一般化できる十分な測定条件が揃わないため記載しない。
 
 ## 根拠
 
-- 読み取り、空値判定、runtime device/version の照会、表ロードと成功ログ: `src/prefill/gemm.cu:186-220`。同等の HIP 条件付き実装: `sycl/src/prefill/gemm.dp.cpp:193-227`。
-- 表の header/row validation、architecture family と version の照合、最近傍 bucket 選択: `src/prefill/hipblaslt_tuning.hpp:24-123`。
-- GEMM state 作成箇所と、解法・workspace の検査、fallback、hipBLASLt 呼び出し: `src/prefill/gemm.cu:394-450,223-282,293-351,571-607,675-705`。通常経路への復帰箇所は `src/prefill/gemm.cu:667-672` および `src/prefill/gemm.cu:848-869`。
-- setup の表選択と実行設定への追加: `setup.py:2613-2629,5690-5700`。実行設定 env の子プロセスへの適用: `serve/server.py:2554-2571`。
-- 文書との照合: `docs/AMD_HIP.md:42-45,530-541` も、カード architecture と hipBLASLt version の一致した表のみ使用し、それ以外は通常 hipBLAS 経路を使うと説明しています。ソース実装と整合します。
+- `engine/src/prefill/gemm.cu:284-399` — HIP 実装の変数読取、同梱表選択、表 load と初期化ログ。
+- `engine/src/prefill/gemm.cu:402-538` — solution の解決/cache、GEMM への適用、fallback と終了経路。
+- `engine/src/prefill/hipblaslt_tuning.hpp:27-136` — 表形式・arch/version/key 検証と row 選択。
+- `engine/sycl/src/prefill/gemm.dp.cpp:196-230,428-431,497-499,890-895,968-973` — SYCL ツリーの読取、初期化と呼出し。
+- `terminal/strata_control/hipblaslt_tuning.py:160-194,220-290` — Server 側の別スイッチ、明示指定の判定、同梱表選択。
+- `terminal/serve/server.py:4007-4028` — Server 子 engine の環境構築と config `env` の反映。

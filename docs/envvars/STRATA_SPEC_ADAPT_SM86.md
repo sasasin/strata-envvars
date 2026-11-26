@@ -1,41 +1,45 @@
 # `STRATA_SPEC_ADAPT_SM86`
 
-調査対象: Strata `main` の HEAD `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA compute capability 8.6（sm_86）で speculative decoding 時の適応 expert tier の開始時設定を opt-in で変更します。有効になると、利用者が別途設定していない場合に `STRATA_SPEC_ADAPT_EVERY=2` と `STRATA_SPEC_ADAPT_WARM=200` をプロセス環境へ設定します。これは speculative round の最初の warm-up 区間で expert 入れ替え間隔を短くするための値です。通常の sm_86 exact speed switches の既定有効化とは別の設定です。
+CUDA の compute capability 8.6（sm_86）で、投機生成中の expert tier 適応を起動直後だけ速めるための opt-in です。この変数自体は `STRATA_SPEC_ADAPT_EVERY=2` と `STRATA_SPEC_ADAPT_WARM=200` を、まだ設定されていない場合にプロセス環境へ補います。実際に生成設定へ取り込まれるのは `--spec >= 2` の実行であり、最初の 200 verify rounds は 2 rounds ごと、その後は通常の適応間隔になります。適応処理は使用頻度に応じて VRAM 上の expert を入れ替える機能です（`engine/src/core/nv_defaults.cpp:328-347`、`engine/src/program/generate.cpp:1045-1051,5100-5109,22055-22059`）。
 
 ## 値と判定
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（設定ありでも先頭文字は `\0`） |
-| 先頭文字が `1` | 有効。`1`, `10`, `1anything` を含む |
-| その他 | 無効。`0`, `true`, ` 1` など |
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| `apply_spec_adapt_default` が呼ばれる CUDA 起動経路 | 既定で無効。追加設定をしない | 値の先頭バイトが文字 `'1'`（例: `1`, `10`, `1anything`） | 空文字、`0`, `true`, ` 1`, `-1` など、先頭が `'1'` でない値 |
+| `STRATA_SM86_PERF`（有効値判定後の追加条件） | 無効化しない | 先頭バイトが `'0'` でない場合は続行 | 先頭バイトが `'0'`（例: `0`, `0anything`）なら追加設定しない |
 
-文字列全体や数値としての妥当性、大文字小文字は検査しません。先頭文字だけを比較します。
+対象変数は `getenv` で取得し、文字列全体の比較や数値変換をせず、先頭文字だけを検査します。大文字小文字や後続文字は判定に関与しません。未設定と空文字はいずれも無効です。`STRATA_SM86_PERF` も共通 helper `off` が先頭文字 `'0'` のみを見ます（`engine/src/core/nv_defaults.cpp:15-18,328-339`）。
+
+補助変数の既定値はそれぞれ `2` と `200` です。既に環境に存在すれば、値が空や不正でも書き換えません。その後の生成側は `STRATA_SPEC_ADAPT_EVERY` を `atoi`、`STRATA_SPEC_ADAPT_WARM` を `atoll` で読みます。warm-up 間隔 `n` が正で現在の `o.adapt_every` より小さく、round 数 `wr` が正のときだけ採用します。従って補助変数が空・非数値なら変換結果は 0 となり採用されず、`2tail` は 2、`200tail` は 200 として扱われます。`--adapt-every` が明示された場合はこの環境変数読み取りブロック自体を通りません（`engine/src/program/generate.cpp:1047-1051,4058,5104-5109`）。
 
 ## 有効になる条件
 
-- CUDA の初期化経路で、可視な全 GPU の compute capability が同一であること。GPU がない、属性取得に失敗する、または capability が混在する場合はこの設定関数が呼ばれません。
-- その capability が 8.6 であること。他の世代では無効です。
-- `STRATA_SM86_PERF` の先頭文字が `0` ではないこと。未設定・空文字を含むそれ以外の値は通過します。先頭文字 `0` ならこの opt-in を止めます。
-
-ビルドが HIP または Metal の場合、この CUDA 専用処理はコンパイル対象外です。
+- 起動時に CUDA デバイスが 1 台以上見つかり、全ての可視 CUDA デバイスの compute capability が同じで、その値が 8.6 であること。混在 compute capability の複数 GPU では適用関数が呼ばれません（`engine/src/program/generate.cpp:4421-4450`）。
+- HIP と Metal ではこの NVIDIA 設定処理を含むコンパイル経路に入りません（`engine/src/program/generate.cpp:4421-4426`）。
+- `STRATA_SM86_PERF` の値が `'0'` で始まらないこと。`STRATA_SM86_PERF=0` などの場合は本変数が有効値でも補助変数を設定しません（`engine/src/core/nv_defaults.cpp:337-345`）。
+- 通常の CLI 生成処理で `--spec >= 2` かつ `--adapt-every` 未指定であること。`--spec` が 0 または 1 なら生成側の warm-up 読み取りを通りません。`--adapt-every` の明示値は優先されます（`engine/src/program/generate.cpp:4040,4058,5104-5109`）。
+- 適応機能を実行するには、expert が全て GPU cache に常駐しておらず、GPU cache slot があり、`o.adapt_every > 0` かつ `o.adapt_swaps > 0` であることが必要です。これを満たさなければ使用量追跡や入れ替え処理は開始されません（`engine/src/program/generate.cpp:14948-15002`）。
+- `STRATA_ADAPT_MID` を含む coverage ベースの adaptive defaults が適用される構成では、CLI 未指定の `o.adapt_every` が後段で 2 に変更されることがあります。その場合、設定された warm-up 間隔も 2 なので warm-up の間隔による差はなくなります（`engine/src/program/generate.cpp:14943-14964,24558-24568`）。
+- `STRATA_SPEC_ADAPT_EVERY` または `STRATA_SPEC_ADAPT_WARM` が既に設定済みなら、その値を本変数による既定値は上書きしません。空文字も「設定済み」です（`engine/src/core/nv_defaults.cpp:339-346`）。
 
 ## 実行時の詳細
 
-CUDA デバイス情報を集める初期化時に `apply_spec_adapt_default()` が一度呼ばれ、そこで環境を読みます。変数が有効でも、デフォルトは設定しません。条件を満たした場合に、`STRATA_SPEC_ADAPT_EVERY` または `STRATA_SPEC_ADAPT_WARM` が未設定のものだけ、それぞれ `2` と `200` に設定します。値が空文字でも「設定済み」として保持されます。値の設定に関するログはこの関数にはありません。
+起動時、CUDA のデバイス情報を確認した後、同一 compute capability の場合に `apply_spec_adapt_default` が呼ばれます。そこで対象環境変数を一度読み、条件に合えば不足している補助変数だけを `_putenv_s`（Windows）または `setenv(..., 0)`（その他）で設定します。環境を変更する処理は成功時もログを出しません（`engine/src/program/generate.cpp:4427-4449`、`engine/src/core/nv_defaults.cpp:328-347`）。
 
-後続の speculative decoding 設定では `--spec >= 2` かつ `--adapt-every` が明示されていない場合に限り、両変数を `atoi` / `atoll` で読みます。`EVERY` が正で通常の `adapt_every` より小さく、`WARM` が正なら、最初の `WARM` rounds に限り interval を `EVERY` にします。いずれかの数値条件を満たさない場合は warm-up interval を設定しません。`--adapt-every` が明示された場合はこの経路を使いません。従って、この環境変数単体では speculative decoding の適応や interval を有効化せず、他の指定や通常の `adapt_every` が必要です。
+生成引数の処理後、`--adapt-every` が未指定で `--spec >= 2` なら補助変数を読みます。`o.adapt_iv(rounds)` は round が `adapt_warm_rounds` 未満の間 `adapt_warm_every`、それ以降は `adapt_every` を返し、適応判定で verify round ごとに使われます（`engine/src/program/generate.cpp:1047-1051,5104-5109,22055-22059`）。対象変数は static cache されず、プロセス起動時に一度判定されます。補助変数は起動時に設定され、引数処理時に一度読み込まれます。
 
-ユーザーが `STRATA_SPEC_ADAPT_EVERY` / `STRATA_SPEC_ADAPT_WARM` を空文字や不正値で設定していた場合も、初期化は上書きしません。後段の整数変換結果が正でなければ warm-up 設定は適用されません。
+## ログと測定値
+
+対象変数の有効・無効や補助変数の設定を直接示すログはありません。適応 tier が実際に動く場合はモードに応じて `strata serve: adaptive tier: blocking, ...` または `strata serve: adaptive tier asynchronous (--adapt-async 1): ...` の行が出ますが、この行だけでは本変数が有効だったことは判別できません（`engine/src/program/generate.cpp:15600-15613`）。本変数による終了・エラー経路は確認できません。ソースコメントには過去の A/B 言及がありますが、実装上の効果の保証や一般化可能な測定値としては記載しません。
 
 ## 根拠
 
-- `src/program/generate.cpp:2838-2853`: CUDA ビルドで可視 GPU の capability 一致を確認後に初期化関数を呼び出す。
-- `src/core/nv_defaults.cpp:73-92`: sm_86 判定、環境変数の先頭文字判定、`STRATA_SM86_PERF` による抑止、および未設定の warm-up 変数への既定値設定。
-- `src/program/generate.cpp:3220-3230`: speculative decoding の条件、CLI 指定の優先、数値変換、warm-up interval の適用。
-- `include/strata/core/nv_defaults.hpp:34-38`: この設定が sm_86 向け opt-in である旨。
+- `engine/src/core/nv_defaults.cpp:15-18,328-347` — off 判定、sm_86 条件、対象変数の読み取り、補助環境変数の既定値と上書き規則。
+- `engine/src/program/generate.cpp:4421-4450` — CUDA 起動時の同一 compute capability 判定と適用関数の呼び出し。
+- `engine/src/program/generate.cpp:1045-1051,4040-4058,5100-5109,22055-22059` — CLI 優先、補助値の変換、warm-up 間隔と適応判定。
+- `engine/src/program/generate.cpp:14948-15002,15600-15613` — expert cache 状態による適応処理の条件と観測可能なログ。

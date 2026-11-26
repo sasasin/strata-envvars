@@ -1,40 +1,48 @@
 # `STRATA_CKPT_REREAD`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（`2026-10-12` 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-サーバーの会話キャッシュにあるチェックポイントを復元する代わりに、そのチェックポイントが表すトークン列を先頭からもう一度読み込み、チェックポイントの状態と再計算した状態を照合するための診断用フック。ソースコメントは、専門家（expert）の VRAM 配置を固定する `--adapt-swaps 0` の条件で、復元時の結果と再読込時の結果がトークン単位で一致することを検証する用途を示している。通常の会話キャッシュの利用経路にあるが、主な用途はチェックポイントの検査である。
+サーバーが保存済み会話 checkpoint から再開するとき、checkpoint の状態を復元する代わりに、checkpoint までの prompt token を位置 0 からもう一度読む診断用スイッチです。CUDA/HIP 系と SYCL 系の `generate.cpp` に実装されています。checkpoint がない新規 prompt や live session の継続自体を常に再読する設定ではありません。再読区間では checkpoint を復元せず、K/V の状態を作り直します（`engine/src/program/generate.cpp:20086-20120, 20187-20214`; `engine/sycl/src/program/generate.cpp:11065-11096, 11119-11126`）。
 
 ## 値と判定
 
-| 環境変数の状態 | 判定・挙動 |
-|---|---|
-| 未設定 | `std::getenv(...) == nullptr` となり、このフックによる再読込はしない。通常のチェックポイント復元を行う。短い prompt 区間を verify window で読む既存条件も維持する。 |
-| 設定あり（空文字を含む） | 値の内容は読まず、設定の有無だけで有効になる。文字列 `0` も無効化しない。該当チェックポイントがあれば先頭から再読込する。短い prompt 区間も verify window 経路を使わず batched read にする。 |
+両 backend の生成処理と会話 snapshot 交換処理は `std::getenv(...) != nullptr` 相当の有無判定をします。値を数値や文字列として parse しません。
 
-数値変換、値域、大小文字の扱いはない。両実装とも関数内 `static const bool` として初回評価結果を保持するため、実行中に環境変数を変更しても再評価されない。
+| 条件 | unset | 設定時に有効になる値 | 無効になる値 |
+|---|---|---|---|
+| CUDA/HIP 系・SYCL 系の serve 経路 | reread 無効。checkpoint を通常どおり復元 | 空文字、`0`、`1`、`true`、その他どの文字列でも有効 | なし。無効にする値表現はない |
+
+したがって `0` や `false` も無効化値ではなく「設定あり」です。大文字小文字、空白、数値妥当性、境界値の検査はありません。CLI 引数や設定ファイルによる値の上書きもありません（`engine/src/program/generate.cpp:20095, 20230`; `engine/sycl/src/program/generate.cpp:11069, 11142`; `engine/src/core/conversation_state.cpp:787-790`）。
 
 ## 有効になる条件
 
-- Strata のサーバー処理で、要求が既存セッションの live state ではなくチェックポイントから再開し、`resume` と同じトークン数のチェックポイントが見つかった場合に、復元を再読込へ置き換える。チェックポイントがなければ通常の復元失敗処理に進む（再読込はしない）。
-- `resume == 0` の新規読み込みや、live session からの継続では、チェックポイントの置換処理は行われない。ただし、短い区間を verify window にするかを判定する `no_short` にも同じ変数を使うため、設定されていればサーバー内の prompt 読み込みで短い区間も batched read になる。
-- CUDA 実装と SYCL 実装の双方に同じ判定と処理がある。GPU 世代などによるこの変数固有の条件分岐はない。
-- コメント上、復元結果と再読込結果の厳密な比較には `--adapt-swaps 0` が前提。変数自身がこの CLI オプションを設定・強制するコードはない。
+- サーバーの会話処理で、既存の live session ではなく checkpoint から再開する分岐に入ること（`resume > 0` かつ `from_live == false`）。新規 prompt (`resume == 0`) は session をゼロ化する通常経路です（`engine/src/program/generate.cpp:20077-20086`; `engine/sycl/src/program/generate.cpp:11055-11065`）。
+- `resume` と一致する checkpoint が見つかること。設定されていても checkpoint が見つからなければ復元失敗経路に入り、stdout に `ERR restoring a conversation checkpoint failed` を出してリクエスト処理を `return 1` します（`engine/src/program/generate.cpp:20087-20120`; `engine/sycl/src/program/generate.cpp:11066-11096`）。
+- 値はプロセス全体で有効です。会話 K/V snapshot の交換候補が `conversation_snapshot_swap_prepare` に到達した場合、この変数が設定されているだけで交換準備を拒否します。他の条件でその交換候補にならなければ、この抑止分岐は呼ばれません（`engine/src/program/generate.cpp:19759-19774`; `engine/src/core/conversation_state.cpp:779-796`）。
+- CUDA/HIP 系では、再読 checkpoint が `--prefill-pipe` の計画 chunk 内にある場合、元の計画が位置 0 から始まっていれば元の chunking を使って `[0, resume)` を読み直します。chunk が位置 0 以外から始まっていた場合はその旨を stderr に出し、この特別な計画は適用しません（`engine/src/program/generate.cpp:20138-20158`）。SYCL 側にはこの chunk 計画の分岐がありません。
+- `STRATA_KVA` などの別設定が併用されても、本変数自体は再読を行います。Strata の `docs/KVA.md` は KVA 有効時に復元と再読で状態が異なり得ると説明していますが、これはこのスイッチが checkpoint と同じ状態を保証するという意味ではありません（資料: `docs/KVA.md:90-93`）。
 
 ## 実行時の詳細
 
-チェックポイントからの再開時に変数が設定され、対象チェックポイントが見つかると、Strata はメインセッションと各 stage のセッションをゼロ化して同期し、stderr に `strata serve: STRATA_CKPT_REREAD: reading <N> tokens again instead of restoring` と出す。`read_from` を 0 にし、元チェックポイントのトークン列を prompt の batched read 経路で読み直す。通常の MTP draft K/V 復元も、この再読込ケースではスキップする。
+checkpoint 再開分岐で `reread` を関数内 `static const bool` として初回評価し、値が設定済みで checkpoint があれば、CUDA/HIP 系では main session と各 stage をゼロ化して stream を同期し、SYCL 系では同様にゼロ化して stream を wait します。その後 `reread_to = resume` とし、stderr に `strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of restoring` を出します（`engine/src/program/generate.cpp:20095-20111`; `engine/sycl/src/program/generate.cpp:11069-11085`）。
 
-再読込中は次の定期チェックポイント位置を無効値にし、tail checkpoint も保存済み扱いにするため、その再読込の途中や末尾で新しいチェックポイントを作らない。読み込み後の `RESUME <N>` は既存の再利用トークン数を表示するが、実際の読み込み開始位置は 0 である。短い区間については `no_short` が真となり、`--short-read` の長さにかかわらず `windows_ok` が false になる。
+再読時は読み始めを 0 にし、`[0, resume)` を再読区間として後続の prompt 区間から分けます。MTP の K/V restore は行わず、CUDA/HIP 系で有効な MTP cell floor は 0 にします。また DFlash2 の request 開始位置も 0 にします。再読中は周期 checkpoint と tail checkpoint の保存を止めます（`engine/src/program/generate.cpp:20162-20174, 20187-20214`; `engine/sycl/src/program/generate.cpp:11100-11126`）。
 
-この変数による再読込・短区間の変更はログ、読み込み開始位置、チェックポイント復元／保存の経路に現れる。性能向上を目的とする設定ではなく、再読込は通常のキャッシュ復元より prompt を再計算する分だけ処理が増える。資料 `docs/DETAILS.md` は会話キャッシュが live session または一致するチェックポイントから再利用される一般動作を説明しているが、この変数固有の診断動作や測定結果は記載していない。
+別の `static const bool no_short` も同じ有無判定で初回評価されます。設定されていると `windows_ok` が常に false になり、短い prompt 区間も verify-window 経路にせず batched read にします。この判定は checkpoint 再読が実際に起きたかどうかとは独立しており、当該 serve 処理の prompt 読み取りに適用されます（`engine/src/program/generate.cpp:20229-20243`; `engine/sycl/src/program/generate.cpp:11141-11149`）。両方とも `static` 初期化後にプロセス環境を変更しても再評価されません。
+
+## ログと測定値
+
+checkpoint を再読する場合の stderr ログは `strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of restoring` です。CUDA/HIP 系で checkpoint が位置 0 以外から始まる planned segment 内にある場合は、`strata serve: STRATA_CKPT_REREAD: the checkpoint is inside a segment that started at %lld, so a read from 0 has other chunks` も出ます（`engine/src/program/generate.cpp:20110-20111, 20154-20156`）。通常の checkpoint restore が失敗した場合は前節記載の stdout エラーになります。設定値が存在することだけを知らせる起動ログは確認できません。
+
+Strata の設計資料は再読と復元が KVA 有効時に異なり得ると記していますが、この変数による性能値や一般的な正確性保証は記載しません（`docs/KVA.md:90-93`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:10450-10491`: 再開位置に対応する checkpoint の検索、環境変数の有無による分岐、セッション初期化、stderr ログ、通常の checkpoint restore への fallback。
-- `src/program/generate.cpp:10493-10506`: MTP K/V 復元のスキップ、再読込時の読み始め位置、チェックポイント保存の抑止。
-- `src/program/generate.cpp:10521-10529`: 環境変数の設定有無を static cache し、短い verify-window 読み込みを抑止。
-- `src/program/generate.cpp:11033-11054`: `reread_to` から 0 までの再読込区間と batched read の選択。
-- `sycl/src/program/generate.cpp:9766-9807`, `9811-9821`, `9836-9844`: SYCL 側の同等処理。
-- `docs/DETAILS.md:920-930`: 会話キャッシュと一致する checkpoint の一般説明。`STRATA_CKPT_REREAD` の説明はない。
+- `engine/src/program/generate.cpp:20076-20120` — CUDA/HIP 系の checkpoint 選択、再読、復元失敗。
+- `engine/src/program/generate.cpp:20138-20158, 20162-20214, 20229-20243` — planned segment、再読位置・補助状態、checkpoint 保存抑止、短区間の batched 化。
+- `engine/sycl/src/program/generate.cpp:11055-11126, 11141-11149` — SYCL 系の同等経路。
+- `engine/src/core/conversation_state.cpp:779-796` — snapshot K/V 交換を拒否する条件。
+- `engine/src/program/generate.cpp:19759-19774` — snapshot 交換準備の呼び出し条件。
+- `docs/KVA.md:90-93` — 再読と復元の差に関する Strata 資料。

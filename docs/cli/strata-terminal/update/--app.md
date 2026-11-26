@@ -1,6 +1,6 @@
 # `--app`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout は `main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,58 +8,53 @@
 | コマンド | `strata update` |
 | オプション | `--app` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。省略時 `false`、指定時 `true`。 |
+| 値 | 値を取らないフラグ（`store_true`）。省略時 `false` |
 
 ## 役割
 
-既定のエンジンと Control の更新処理に加え、Desktop アプリ用インストーラーもフィードからダウンロードして検証します。Terminal はインストーラーを実行・適用せず、検証済みファイルを保存します。
+`strata update` が行うエンジンと Control の更新に、デスクトップアプリ installer のダウンロードと検証を追加します。取得物はコンポーネントディレクトリの `.updates/app/` に置かれ、CLI はアプリをインストールしません。installer を実行して更新を完了するのは利用者です。
 
 ## 使い方
 
 ```sh
+# 通常のエンジン／Control 更新に加えて、この PC 向けのアプリ installer を取得・検証する
 strata update --app
 ```
 
-アプリ用インストーラーだけを取得する場合は、エンジンと Control を抑止できます。
-
-```sh
-strata update --app --no-engine --no-control
-```
-
-`--check` と同時に指定した場合はフィードの確認だけが行われ、インストーラーはダウンロードされません。
+インストーラーの取得先 feed、コンポーネントディレクトリ、インストール済みアプリの版はそれぞれ `--feed`、`--components-dir`、`--app-version` で指定できます。`--check` を付けた場合は feed の確認だけで、`--app` があっても installer はダウンロードされません。
 
 ## 値と既定値
 
-`argparse` の `store_true` で定義され、値は不要です。既定値は `false` で、複数回指定しても有効状態は変わりません。`--app=true` のような値付き指定は parser に受理されません。
-
-アプリのインストール済みバージョンは別オプション `--app-version`、または環境変数 `STRATA_APP_VERSION` から取得します。CLI 値が空でなければ CLI 値を優先し、未指定または空文字なら環境変数へフォールバックします。両方とも未設定ならインストール済み版は不明として扱い、対象プラットフォームのアプリ配布がフィードにあれば取得を試みます。比較時に不正なバージョン表記が渡ると feed error になります。
+- 値を受け取らない真偽値フラグです。明示すると `a.app` が真になり、指定しない場合は偽です。値の形式や範囲の検証はありません（`terminal/strata_cli/update_cmd.py:60-65`）。
+- `--app-version` が指定されればその値、指定がなければ `STRATA_APP_VERSION` の値を、インストール済み版として判定に使います。どちらもなければ版は不明として扱います（`terminal/strata_cli/update_cmd.py:64`, `terminal/strata_cli/update_cmd.py:323-325`）。
+- `--app` を付けても、feed にアプリ項目がない場合、または feed がこの PC のプラットフォーム向け installer を持たない場合は取得しません。インストール済み版が feed の版以上の場合も取得しません。版が不明の場合は、対象プラットフォームの feed エントリーがあれば取得対象になります（`terminal/strata_control/updater.py:2002-2015`, `terminal/strata_control/feed.py:76-82`）。
 
 ## 実行時の動作
 
-`strata update` は通常エンジン、Control の順で処理し、`--app` があると最後にアプリ用インストーラーを処理します。`--no-engine` と `--no-control` はそれぞれ前二つの処理だけを止め、アプリ取得は独立して実行されます。`--check` は更新処理の代わりにフィード確認を行い、その報告にはアプリの状態も含みます。
+parser は `strata update` に `--app` を登録し、通常更新の実行時にその真偽値を `app` 引数として更新処理へ渡します（`terminal/strata_cli/update_cmd.py:59-65`, `terminal/strata_cli/update_cmd.py:368-377`）。更新処理は署名済み feed を読み、エンジン、導入済み形状エンジン、Control の各処理に続けて、`--app` が有効な場合だけアプリ installer の処理を追加します（`terminal/strata_control/updater.py:2109-2129`）。
 
-フィードにアプリ項目がない、または現在のプラットフォーム向け配布物がない場合、アプリ処理はダウンロードせず終了します。インストール済みバージョンが分かる場合、フィード版がそれより新しいときだけ取得し、同じか古ければ `current` としてスキップします。比較対象のインストール済み版には `0.2.0-beta` のようなプレリリース表記も許容され、同じ数値版の正式版より低く比較されます。
-
-取得時は署名済みフィードに記載されたサイズと SHA-256 を使ってダウンロードし、さらにアプリ用 Minisign 公開鍵で署名を検証します。公開鍵は `STRATA_APP_UPDATE_PUBKEY` があればそれを使い、なければビルトイン鍵ファイルの `app_minisign_public` を使います。検証後のファイルはコンポーネントディレクトリ配下の `.updates/app/` に保存され、成功結果にバージョンとパスが含まれます。同じ配布 URL のファイル名が既にある場合は atomic replace で置換されます。
+アプリ処理は feed のプラットフォーム別エントリーを選び、ディスク空き容量を確認してダウンロードします。feed 記載の SHA-256 はダウンロード処理で照合され、さらに feed の署名とは別の minisign 署名をアプリ更新公開鍵で検証します。成功すると installer を `.updates/app/` に移動して `downloaded` と報告します。自動実行・インストール・既存アプリの置換はこの処理にはありません（`terminal/strata_control/updater.py:2018-2049`, `terminal/strata_control/updater.py:574-599`）。
 
 ## 適用条件と副作用
 
-- `--app` は明示的な更新処理の一部で、ネットワークからファイルを取得し、コンポーネント領域に `.updates/` とその状態・一時ファイルを作成します。`STRATA_NO_ACQUIRE` によって取得を禁止されたプロセスでは更新全体が拒否されます。
-- フィード中のアプリ項目と、この PC のプラットフォーム向け配布物が必要です。
-- アプリ用公開鍵が見つからない場合、検証不能のためインストーラーをダウンロードせず失敗します。署名検証に失敗したアーカイブは削除されます。
-- このオプションだけでは Desktop アプリのインストールや置換は行いません。保存後に利用者がインストーラーを実行する必要があります。
-- 同一コマンドでエンジンまたは Control の更新が成功してからアプリ処理が失敗する場合があります。成功済み処理は巻き戻されず、最終終了コードは最初に発生した更新エラーのコードになります。
+- installer は現在のハードウェア情報に含まれるプラットフォーム用のエントリーから選ばれます（`terminal/strata_control/updater.py:2002-2009`, `terminal/strata_control/updater.py:2026`）。
+- アプリ更新鍵は `STRATA_APP_UPDATE_PUBKEY` があればそれを使い、なければ同梱 `update_keys.json` の `app_minisign_public` を使います。鍵が得られないと、アプリ installer のダウンロードを始めず終了コード `5` のエラーになります（`terminal/strata_control/updater.py:1989-1999`, `terminal/strata_control/updater.py:2026-2031`）。
+- ダウンロードは `.updates/partial/` の一時ファイルを使い、キャンセル時の部分ファイルは次回再開用に残ります。署名不一致時は取得アーカイブを削除します。空き容量不足は終了コード `6`、SHA-256 不一致は `5`、転送エラーは `6` になります（`terminal/strata_control/updater.py:574-599`, `terminal/strata_control/updater.py:552-571`, `terminal/strata_control/updater.py:2037-2041`）。
+- アプリ更新処理で失敗しても、すでに成功したエンジンや Control の変更は巻き戻されません。各ステップの失敗を結果に記録して後続ステップを続け、最終的に最初の更新エラーの終了コードを返します（`terminal/strata_control/updater.py:2123-2129`, `terminal/strata_control/updater.py:2138-2139`）。
+- `--check` は `updater.check()` に分岐して結果を表示して戻るため、`--app` の有無によらず installer を取得しません。check 結果にはアプリの版・提供状況が含まれます（`terminal/strata_cli/update_cmd.py:361-367`, `terminal/strata_control/updater.py:778-789`）。
+- 同じ `--app` は `strata components update` にも別途登録されていますが、この文書は索引で指定された `strata update` のスコープです（`terminal/strata_cli/update_cmd.py:70-79`; 索引: `docs/cli/README.md:257-266`）。
 
 ## 出力とエラー
 
-人向け出力では各コンポーネントの結果が表示され、アプリ成功時は `downloaded and verified` と保存先、続けてインストーラーを実行する案内が出ます。`--output json` / `--json` は結果を JSON で出し、`--output jsonl` は進捗イベントを JSON Lines で出します。アプリの公開鍵欠落または署名不一致は終了コード `5`、ダウンロード転送失敗は `6`、キャンセルは `130` です。`--quiet` は成功時の人向け出力を抑え、失敗時に抑止した出力があれば stderr に出します。
+- 成功時は更新結果に `component: app`, `status: downloaded`, バージョン、保存先、installer を実行して完了する旨の note が含まれます。`--output json` では最終結果を JSON で出力します。`jsonl` では進捗イベントが JSON Lines で出力されます（`terminal/strata_control/updater.py:2042-2049`, `terminal/strata_cli/update_cmd.py:117-139`, `terminal/strata_cli/update_cmd.py:373-377`）。
+- 通常出力で鍵不在や署名不一致などの更新エラーは `strata: ...` として stderr に出力され、対応する終了コードが返ります。機械可読出力ではエラーオブジェクトが JSON で出力されます（`terminal/strata_cli/update_cmd.py:307-316`, `terminal/strata_cli/update_cmd.py:378-390`）。
+- feed のアプリ項目の形式不正は feed 読み込みエラーです。アプリ項目はオブジェクト、版、空でないプラットフォーム一覧を要求し、既知のターゲットについて URL、署名、SHA-256、サイズを読み取ります（`terminal/strata_control/feed.py:548-589`）。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:42-59` — `strata update` と `strata components update` の parser 定義。両方に `--app` があるが、本書は索引で指定された `strata update` スコープ。
-- `strata_cli/cli.py:139-140,508-515,2135-2137` — parser 登録、one-shot parser への `--json` / `--quiet` 追加、`update_cmd.run` へのディスパッチ。
-- `strata_cli/update_cmd.py:27,46-49,174-184,203-224` — フラグ既定、アプリ版の CLI / 環境変数選択、`--check` 分岐、更新処理呼び出しと終了コード返却。
-- `strata_control/updater.py:1210-1223,1226-1257` — プラットフォームと版の判定、ダウンロード、SHA-256 を使った取得、署名検証、保存先、失敗時の削除。
-- `strata_control/updater.py:1274-1297` — エンジン・Control・アプリの処理順、独立した失敗結果と終了コード。
-- `strata_control/feed.py:66-72,243-263` — インストール済みアプリ版の比較規則とフィード内アプリ項目・プラットフォーム配布データの解析。
-- `strata_control/updater.py:1197-1207,470-494` — 公開鍵の選択、転送・checksum・キャンセル時のエラー変換。
+- `terminal/strata_cli/update_cmd.py:59-65` — `strata update` parser の登録、型、既定値、関連版引数。
+- `terminal/strata_cli/update_cmd.py:318-325`, `terminal/strata_cli/update_cmd.py:355-377` — コンテキストへの版設定、`--check` 分岐、`app` の転送と出力。
+- `terminal/strata_control/updater.py:1989-2049` — アプリ公開鍵の選択、版・プラットフォーム判定、installer の取得・署名検証・配置。
+- `terminal/strata_control/updater.py:574-599`, `terminal/strata_control/updater.py:2109-2139` — ダウンロードの失敗経路、更新ステップの順序とエラー集約。
+- `terminal/strata_control/feed.py:76-82`, `terminal/strata_control/feed.py:548-589` — アプリ版と feed エントリーの検証。
+- `docs/cli/README.md:257-266` — `strata update` 階層と指定文書への索引リンク。

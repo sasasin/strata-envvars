@@ -1,70 +1,68 @@
 # `--session-save-reclaim`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン） |
+| コマンド | `strata`（エンジン引数。`--serve` の SAVE 処理で使用） |
 | オプション | `--session-save-reclaim` |
 | 別名 | なし |
-| 値 | なし（真偽フラグ） |
+| 値 | 取らないフラグ |
 
 ## 役割
 
-`--serve` の対話プロトコルで `SAVE <path>` を処理する際、セッション保存に必要な RAM が足りない場合に、保存前の再構築可能なホスト側キャッシュを解放する動作を有効にします。既定では無効です。`--serve` 自体や SAVE を有効にするオプションではありません。`src/program/generate.cpp:746` `src/program/generate.cpp:906` `src/program/generate.cpp:12117-12146`
+`--serve` のセッション SAVE で、RAM の事前判定を通すために必要なら再構築可能な host cache を解放します。既定では無効です。SAVE が必要とする RAM の見積もりと `--conversation-cache-min-free-mib` の空き容量下限を使い、再利用 cache、parked conversation、保存対象外の checkpoint の順に解放を試みます。RESTORE には作用しません。
 
 ## 使い方
 
 ```sh
-strata --serve --session-save-reclaim --pack MODEL-PACK
+strata --serve --pack ./model --prompt-cache 1 --session-save-reclaim
 ```
 
-起動後、エンジンとの serve プロトコルへ `SAVE /path/to/session` を送ると、現在の会話を保存します。session file はリクエスト間で扱われ、`--prompt-cache > 0` などの条件も必要です。`src/program/generate.cpp:12054-12066` `src/program/generate.cpp:12094-12099`
+エンジンを serve モードで起動する引数例です。実際に SAVE を行うとき、RAM 判定に余裕があれば cache 解放は発生しません。`--prompt-cache` はセッションファイルの前提条件です。
 
 ## 値と既定値
 
-- 値を取りません。parser はフラグを見つけると `session_save_reclaim = true` にします。初期値は `false` です。`src/program/generate.cpp:746` `src/program/generate.cpp:2639`
-- 同じフラグを複数回指定しても true のままで、追加の効果はありません。引数位置に値を置く構文ではなく、その値は別の引数として処理されます（既知の別オプションの値でなければ未知引数エラーになります）。`src/program/generate.cpp:2416-2422` `src/program/generate.cpp:2639` `src/program/generate.cpp:2787-2792`
-- 値の範囲検証はありません。フラグがない場合はキャッシュ解放を行わず、通常の SAVE 用 RAM 判定に進みます。`src/program/generate.cpp:12143-12146` `include/strata/core/session_save_reclaim.hpp:17-26`
+- 値を取りません。parser はこの引数を見つけると内部フラグを `true` にします。明示値を付ける形式ではありません。
+- 既定値は `false` です。同じフラグを複数回指定しても、真偽値を立てる処理が繰り返されるだけです。
+- オプション固有の数値 validation はありません。未知の引数は usage を表示して終了コード 2 になります。
 
 ## 実行時の動作
 
-処理は `SAVE` の場合だけ実行され、`RESTORE` 側にはこのフラグを参照する分岐がありません。まず保存用のピーク RAM 必要量を見積もり、会話キャッシュに通常使う RAM の最低空き床（`--conversation-cache-min-free-mib`）を維持できるか確認します。既に条件を満たしていれば何も解放しません。`src/program/generate.cpp:12117-12146` `include/strata/core/session_save_reclaim.hpp:18-26`
+SAVE の開始時に、エンジンは live 状態と最深 checkpoint からピーク RAM を見積もり、`--conversation-cache-min-free-mib` の下限と合わせて host RAM の空き容量を判定します。判定前に park pool の idle memory は返却されます。このオプションが有効なら、事前判定に足りないとき `session_save_reclaim` を呼び出します。必要量を満たした時点で停止し、その後通常の SAVE 判定へ進みます。
 
-不足している場合は次の順に処理します。
+解放順は、まず保持している再利用 cache、次に古い parked conversation、最後に SAVE で選択されない checkpoint です。parked conversation の明示 pin と、SAVE が選ぶ checkpoint は削除対象から除外されます。checkpoint の削除で cache の状態も変わるため、対象 tail checkpoint がなくなった場合は tail の記録も無効化されます。実際に何か解放した場合、stderr に解放した checkpoint 数・parked 数・host bytes と再判定の旨を出力します。
 
-1. 会話キャッシュが再利用用に保持している K/V バッファを解放します。
-2. pinned（固定）されていない退避済み会話を古いものから一件ずつ eviction し、各解放後に RAM 条件を再確認します。固定会話は残ります。
-3. なお不足する場合、保存ファイルに選ばれる最深チェックポイントと pinned checkpoint を残し、それ以外を後ろから削除して各削除後に再確認します。
+空き RAM の計測値または必要 RAM の見積もりが不明な場合、reclaim helper は解放を始めず、通常の admission 判定に進みます。解放後も不足、見積もりが不明、または SAVE の他の条件を満たさない場合は成功を保証しません。エンジンは `SERR memory` を返し、診断を stderr に出します。通常の SAVE 成功時は `SAVED` を stdout に出します。
 
-最深 checkpoint の選択とその格納領域は保持され、コピーを増やさない実装です。必要量や利用可能 RAM が不明な場合、または推定値がオーバーフローして必要量不明になる場合は、キャッシュ解放の根拠にしません。`include/strata/core/session_save_reclaim.hpp:13-50`
-
-設定値との関係:
-
-- 解放判定で維持する空き RAM 床は `--conversation-cache-min-free-mib`（既定 2560 MiB）です。`--session-min-free-mib`（既定 4096 MiB）はセッションファイルを書き込むディスク側の空き容量条件で、RAM の解放量を決めません。`src/program/generate.cpp:731` `src/program/generate.cpp:744-746` `src/program/generate.cpp:905-906` `src/program/generate.cpp:12143-12146` `src/program/generate.cpp:12185-12190`
-- キャッシュを解放しても SAVE の RAM 事前判定が通らない場合は保存を拒否します。このオプションはメモリ確保の保証や上記 RAM 床の引き下げをしません。`src/program/generate.cpp:12157-12171`
-- `--serve` を付けずに指定した場合、フラグ自体は parser に受理されますが、この分岐は `SAVE` 処理内にしかなく、解放処理は実行されません。`src/program/generate.cpp:2637-2639` `src/program/generate.cpp:12117-12146`
+serve 側ではこのフラグ付きの SAVE に限り、RAM 事前判定による未公開の memory refusal で、診断から必要量を読み取れ、同じ engine process が稼働し続けている場合に待機・再試行を行います。RAM 計測が不明なら再試行せず、待機上限は30秒、再試行は最大3回です。待機開始は `[strata] SAVE waiting for RAM after cache reclaim ...` として出力されます。RESTORE、公開済み失敗、その他のエラーはこの再試行経路の対象外です。
 
 ## 適用条件と副作用
 
-- SAVE/RESTORE の共通前提として、path が空でないこと、layer split / peer device / batch を使っていないこと、`--prompt-cache > 0` であることが確認されます。違反時は session 操作が拒否されます。`src/program/generate.cpp:12094-12099`
-- このオプションによって、再利用 K/V バッファ、未固定の退避会話、未選択の非 pinned checkpoint が失われることがあります。これらは再構築可能として扱われます。固定された会話・checkpoint と保存対象の最深 checkpoint は対象外です。`include/strata/core/session_save_reclaim.hpp:27-50`
-- 解放が一件以上あれば標準エラーに、解放した checkpoint 数・退避会話数・ホストバイト数と「RAM を再確認する」旨が出ます。checkpoint の削除により、削除済み tail の長さが記録されていた場合は tail 記録も無効化されます。`src/program/generate.cpp:12147-12155`
-- 索引では Qwen3.6 専用 parser を別スコープとしているため、この文書は通常の `src/program/generate.cpp` parser のオプションを扱います。Qwen3.6 専用 parser の挙動はここでは対象外です。`docs/cli/README.md:1130-1134` `docs/cli/README.md:1318-1322`
+- `--session-save-reclaim` は `--serve` の SAVE admission にのみ使われ、RESTORE の経路には渡されません。
+- セッションファイルの処理では、空でないパス、`--prompt-cache > 0` が必要です。また `--layer-split`、複数 GPU、`--peer-device`、`--batch` は session files と併用できず、SAVE/RESTORE は拒否されます。
+- オプションが有効で不足が見込まれると、明示 pin のない parked conversation や、SAVE が使わない checkpoint が失われます。これは host cache の解放であり、live device state の解放・モデルの unload・他プロセスの trim はこの処理では行いません。
+- ディスク空き容量の判定は別の SAVE 書き込み処理です。このフラグはディスク容量を増やさず、RAM 解放後にもファイル書き込みや flush が失敗する場合があります。
 
 ## 出力とエラー
 
-- reclaim が何も解放しない場合、このオプション固有のログは出ません。解放があれば標準エラーに `strata serve: save reclaimed ...; checking RAM again` が出ます。`src/program/generate.cpp:12147-12155`
-- 解放後も必要 RAM と空き床を満たさなければ、`session_save_checkpoints` が失敗理由を返し、SAVE は `SERR memory ...` を標準出力へ、`strata serve: session save <path>: ...` を標準エラーへ出してサーバーループを続けます。`src/program/generate.cpp:12069-12078` `src/program/generate.cpp:12157-12171`
-- 保存成功時は標準エラーに保存概要、標準出力に `SAVED <tokens> <bytes> <ms>` が出ます。ディレクトリ flush 非対応時は、ファイル名が flush されない旨の警告が標準エラーに追加されます。`src/program/generate.cpp:12190-12204`
-- オプション自体に値が欠けるケースはありません。未知の引数は usage と `unknown argument` を標準エラーへ出し、engine parser は終了コード2を返します。`src/program/generate.cpp:2787-2792`
+- reclaim が実行された場合、エンジンは解放量を stderr に記録します。
+- RAM 判定に失敗した場合、エンジンは診断を stderr に出し、`SERR <kind> <published> <message>` を stdout に返します。`--session-save-reclaim` を付けても、解放不能・空き RAM 不足などの SAVE 失敗は残ります。
+- serve 側の再試行中は待機メッセージが出ます。再試行条件を満たさない、RAM 情報を取得できない、プロセスが終了した、または上限に達した場合は最後の refusal を返します。
 
 ## 根拠
 
-- 既定値・help 表示・parser: `src/program/generate.cpp:746` `src/program/generate.cpp:905-906` `src/program/generate.cpp:2637-2640`
-- SAVE/RESTORE の前提、RAM 事前判定、出力: `src/program/generate.cpp:12054-12099` `src/program/generate.cpp:12117-12204`
-- 解放順、固定対象の扱い、RAM 再確認: `include/strata/core/session_save_reclaim.hpp:13-50`
-- 文書の tool/command scope と予定リンク: `docs/cli/README.md:1128-1134` `docs/cli/README.md:1277-1280`。配置規約・調査基準: `docs/cli/001_investigation.md:13-35` `docs/cli/001_investigation.md:71-114`
+- `engine/src/program/generate.cpp:1123` — 内部フラグの既定値は `false`。
+- `engine/src/program/generate.cpp:1312-1313` — help における serve 専用・opt-in の説明。
+- `engine/src/program/generate.cpp:4071` — parser が値なしのフラグとして受理し、真に設定。
+- `engine/src/program/generate.cpp:4268-4273` — 未知引数は stderr に表示し、usage の後に終了コード 2。
+- `engine/src/program/generate.cpp:18613-18617` — session path、serve session の非対応構成、`--prompt-cache` の前提条件。
+- `engine/src/program/generate.cpp:18662-18690` — SAVE の RAM floor、reclaim 呼び出し、解放ログ、再 admission と memory refusal。
+- `engine/include/strata/core/session_save_reclaim.hpp:18-52` — 空き容量判定、解放順、pin と選択 checkpoint の保持、反復計測。
+- `engine/src/core/conversation_file.cpp:1195-1212` — SAVE のピーク RAM 見積もりと、保存する checkpoint を最深の一つに絞る処理。
+- `engine/src/program/generate.cpp:18583-18591, 18717-18724` — refusal の stderr/stdout プロトコルと成功時の出力。
+- `terminal/serve/server.py:772, 4490-4515` — 引数からフラグを認識し、SAVE のみ専用経路に分岐。RESTORE は通常のエンジン呼び出し。
+- `terminal/serve/session_save_retry.py:12-21, 35-83` — 再試行条件、30秒・最大3回の待機、計測不明時の中止。
 
-調査時点の Strata checkout は commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`、`git status --short --branch` は `## main...origin/main` で未コミット変更なしでした。同一 revision の既存 CLI `--help` と Release 配布物は確認していません。ソース parser と実装を根拠に記載しています。
+調査対象 Strata checkout の状態は `## main...origin/main` で、未コミット変更はありませんでした。

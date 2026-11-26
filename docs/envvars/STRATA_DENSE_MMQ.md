@@ -1,59 +1,47 @@
 # `STRATA_DENSE_MMQ`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。対象は Strata 所有ソース。外部ライブラリ内部の動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP ビルドで prompt の dense GGUF projection を処理する際、通常の「GGUF block を FP16 に dequantize して GEMM」する経路の代わりに、GGML の int8 MMQ を使う opt-in スイッチです。`Gemm::native()` の beta が `0.0f` の積に適用されます。CUDA の実行経路ではこの環境変数を読みません。
+HIP コンパイラで `STRATA_PREFILL_MMQ` を定義してビルドした場合に、prompt の native GGUF block を使う dense GEMM を MMQ 経路へ切り替える opt-in です。通常の経路は重みを FP16 scratch に dequantize して GEMM を行います。設定が有効でも、MMQ のビルド状態・形式と行数の適合性・行列の K 寸法・scratch 容量・一時バッファ確保が条件を満たさない積は通常経路へ戻ります。`Gemm::native()` から呼ばれる分岐であり、同じ設定名は MMQ prompt kernels のない own-only build でも起動時通知に使われます（`engine/src/prefill/gemm.cu:1390-1406,1489-1538`、`engine/src/prefill/prefill.cpp:2124-2130`）。
 
 ## 値と判定
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（先頭文字が `\0`） |
-| 先頭文字が `1` | 有効。`1`, `10`, `1anything` などを受け付ける |
-| その他 | 無効。`0`, `true`, 空白、負数など、先頭文字が `1` でない値 |
+MMQ がある HIP 経路では `std::getenv()` の結果を関数内 `static` に一度保存し、先頭文字が `'1'` かだけを判定します。未設定・空文字・先頭が `1` 以外なら無効です。文字列全体の数値変換、空白除去、大文字小文字変換はしません（`engine/src/prefill/gemm.cu:1395-1399`。SYCL 配置ソースにも同じコードがありますが、同じ `STRATA_PREFILL_MMQ` / `__HIPCC__` の compile guard 内です。Intel Arc build でこの変数が読まれる根拠とはしません: `engine/sycl/src/prefill/gemm.dp.cpp:988-997`）。
 
-数値変換や文字列全体の比較はせず、`e[0] == '1'` だけを見ます。判定は関数内の `static const bool` に保存されるため、最初の `native_mmq()` 呼び出し後にプロセスの環境を書き換えても再評価されません。
+MMQ がない own-only build の通知は別の判定です。`dense_mmq_notice()` は未設定、空文字、文字列全体がちょうど `0` のとき通知せず、それ以外は「効果なし」と stderr に出す文字列を返します（`engine/include/strata/prefill/dense_mmq_notice.hpp:10-15`）。
 
-根拠: `src/prefill/gemm.cu:730-739`。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `STRATA_PREFILL_MMQ` 定義、`__HIPCC__` 定義の GEMM | 無効 | 先頭が `1`（例: `1`, `10`, `1anything`） | 空文字、`0`, `0anything`, `true`, ` 1`, `01` |
+| `STRATA_PF_OWN_ONLY` の build における通知 | 通知なし | ― | 通知上は空文字と文字列全体が `0` のみ無通知。`0anything`, `false`, ` 0` などは「効果なし」の通知対象 |
 
 ## 有効になる条件
 
-環境変数を有効にしても、次の条件をすべて満たす積だけが MMQ 経路を使います。
-
-- HIP backend で、ビルド時に `STRATA_PREFILL_MMQ=ON` を指定して MMQ prefill を組み込んでいること。この CMake option は既定 OFF で、HIP 以外で有効にすると configure error になります。
-- `Gemm::native()` の `beta == 0.0f` かつ `ldx == 0 || ldx == K`。加算積（beta が 0 以外）や padded activation は対象外です。
-- 対象 quant type と出力行数について、MMQ が全認識 GPU の shared memory に収まる tile を持つこと。行数が 128 の倍数でないと fallback 用 configuration を選びます。
-- `K <= 8192` かつ `K % 256 == 0`。
-- scratch から計算される一度に処理可能な row 数 `R = scratch_elems_ / (2 * K)` が 1 以上であること。
-- 一時 device buffer の確保に失敗しておらず、当該 `Gemm` instance で `mmq_failed_` が立っていないこと。
-
-ソースの型対応は Q2_0、IQ2_XXS/XS/S、IQ3_XXS/S、IQ4_NL/XS、Q8_0。`STRATA_MMQ_KQUANTS` を含むビルドでは Q4_K、Q5_K、Q5_1 も追加され、HIP では Q6_K も追加されます。別の build option `STRATA_ORCA_Q4KS_MMQ` は Q5_0 を追加します。未対応型の場合、このスイッチだけでは MMQ は使われません。
-
-条件を外れた場合、`native()` は通常の dequantize + `f16()` 経路へ進みます。GPU に適合する MMQ tile がない場合は、その型について一度 `strata: prompt kernels: llama.cpp's MMQ has no tile ... that product takes the non-MMQ path (#420)` と stderr に出します。MMQ workspace の `cudaMalloc` 失敗時は CUDA error をクリアして MMQ を無効化し、この積を通常経路へ fallback します。
-
-根拠: `CMakeLists.txt:71-86,1416-1460`, `src/prefill/gemm.cu:819-870`, `src/prefill/moe_mmq.cu:119-168`。
+- MMQ を使う実行経路は、ソース上 `STRATA_PREFILL_MMQ` と `__HIPCC__` の両方が定義された build に限られます。また、呼び出し側で `beta == 0.0f` かつ入力 row stride が未指定または K と同じ場合にだけ `native_mmq()` を試します（`engine/src/prefill/gemm.cu:1390-1399,1536-1538`）。一方、現行 top-level CMake は llama.cpp の MMQ prompt kernels が tree にないと記しています。したがって macro 条件付き実装の存在だけから、通常の現行 build でこの切替が使えるとは判断できません（`engine/CMakeLists.txt:104-106`）。
+- `native_mmq()` 内で MMQ が build 済みであり、対象 GGML type と N が `mmq::fits()` を満たし、K が 8192 以下かつ 256 の倍数で、scratch から算出する chunk row 数 R が 1 以上である必要があります。満たさなければ `false` を返し `Gemm::native()` の通常処理へ進みます（`engine/src/prefill/gemm.cu:1399-1411,1536-1538`）。
+- MMQ 用 device buffer の初回確保に失敗した場合は `mmq_failed_` を立ててこの積を fallback し、同じ Gemm インスタンスでは後続も MMQ を試しません。割当失敗時に Strata 固有のエラー終了や警告文字列を出す分岐は確認できません（`engine/src/prefill/gemm.cu:1420-1425`）。
+- `STRATA_PF_OWN_ONLY` build は MMQ kernels なしで、Dense MMQ の実行分岐とは別です。prompt expert layout に layer があるときの `mmq_plan()` 初期化中に設定値を読み、「効果なし」の通知を最大一度出します。該当する build でも layer 数が 0 以下ならこの通知ブロックには入りません（`engine/src/prefill/prefill.cpp:2026-2039,2099-2130`）。
+- CLI 引数、設定ファイル、他の環境変数による優先順位や上書きはこの名前の読み取り経路にありません。`STRATA_DENSE_MMQ` は `STRATA_PREFILL_MMQ` とは別の変数です。
 
 ## 実行時の詳細
 
-呼び出し元の `native_proj()` は native GGUF block が存在する重みを `Gemm::native(..., beta=0.0f, ...)` に渡します。`Gemm::native()` は、padded X の処理を先に試し、その後、条件が合えば `native_mmq()` を呼びます。MMQ 経路では activation を FP32 に変換し、MMQ 用に量子化したうえで、行を最大 1024 行ずつ処理します。`K` が 256 の倍数でない積は weight 行を越えて読む危険があるため、この経路を使いません。
+MMQ 対応経路では、最初に `Gemm::native_mmq()` に入った際に `enabled` を static 初期化します。その後、MMQ 適合条件を通った積の FP16 activation を FP32 に変換し、量子化して MMQ product を実行します。T 行は R 行以下の chunk に分けられます。最初の MMQ buffer 確保成功時に有効ログを一度出します。環境変数をプロセス起動後に変更しても、static 初期化済みの `enabled` には反映されません（`engine/src/prefill/gemm.cu:1395-1411,1420-1457`）。
 
-MMQ buffer を初めて確保したときに stderr へ `prefill gemm: dense MMQ on (STRATA_DENSE_MMQ=1)` と出ます。これは buffer 初期化時のログであり、各 projection の利用ログではありません。MMQ が使われない積について個別ログが常に出るわけではありません。
+MMQ がない own-only build では、`mmq_plan()` の static 初期化経路で通知判定が一度行われます。環境変数の変更を再読するリクエスト単位の処理ではありません（`engine/src/prefill/prefill.cpp:2026-2037,2124-2130`）。
 
-根拠: `src/prefill/prefill.cpp:1936-1940`, `src/prefill/gemm.cu:730-793,819-870`。
+## ログと測定値
 
-## 文書との照合
-
-`docs/AMD_HIP.md:206-211` はこのスイッチを既定 OFF の HIP opt-in とし、RX 6900 XT で 4K prompt が 436 から 757 tok/s になった記録と、q8_1 activation rounding により greedy text が数十 token 後から既定経路と異なるという注意を記しています。測定条件は同節に記された内容に限られ、他の GPU やモデルでの性能・出力を保証するものではありません。`docs/DETAILS.md:278` も AMD HIP の設定として `AMD_HIP.md` に案内しています。
+- 有効な MMQ buffer を初めて確保したときの stderr: `prefill gemm: dense MMQ on (STRATA_DENSE_MMQ=1)`（`engine/src/prefill/gemm.cu:1420-1428`）。
+- own-only build で値が未設定・空・ちょうど `0` 以外の場合の stderr: `strata: STRATA_DENSE_MMQ has no effect in this engine (it has no MMQ kernels): the dense projections of a prompt run on the FP16 path.`（`engine/include/strata/prefill/dense_mmq_notice.hpp:12-15`、出力箇所 `engine/src/prefill/prefill.cpp:2124-2128`）。
+- 指定値を設定した結果として Strata が必ず終了するエラー経路はありません。MMQ 固有の適合条件や確保失敗で false が返ると通常経路が続きます（`engine/src/prefill/gemm.cu:1399-1410,1420-1425,1536-1538`）。
+- 性能測定値は記載しません。リポジトリの `docs/AMD_HIP.md:273` は「0.2.16 以降 MMQ kernels がないため効果なし」と記載していますが、現行ソースには MMQ 有効時の `native_mmq()` 分岐と、MMQ 無し build で効果なしと通知する別経路があります。適用は当該 compile macro 条件に限定されるため、文書の旧記述を全 build に一般化しません（compile 条件 `engine/src/prefill/gemm.cu:1390-1391,1536-1538`）。
 
 ## 根拠
 
-- `src/prefill/gemm.cu:730-739`: HIP MMQ 関数と環境変数の判定。
-- `src/prefill/gemm.cu:740-793`: shape 条件、buffer 確保、MMQ 実行と有効ログ。
-- `src/prefill/gemm.cu:819-870`: `native()` からの呼び出し条件と通常 GEMM への fallback。
-- `src/prefill/moe_mmq.cu:121-168`: 対応 quant type、device tile/shared-memory 適合判定と警告。
-- `CMakeLists.txt:71-86,1416-1460`: HIP 限定の build 条件と MMQ compile option。
-- `src/prefill/prefill.cpp:1936-1940`: native projection からの呼び出し。
-- `docs/AMD_HIP.md:206-211`, `docs/DETAILS.md:278`: 設定説明と記載された測定結果。
+- `engine/src/prefill/gemm.cu:1390-1457` — MMQ build guard、値の読み取り、適合判定、buffer 確保、MMQ product と有効ログ。
+- `engine/src/prefill/gemm.cu:1489-1538` — `Gemm::native()` の stride / beta 条件と fallback 呼び出し。
+- `engine/sycl/src/prefill/gemm.dp.cpp:988-1052` — 同じ macro 条件下にある SYCL 配置ソースの MMQ GEMM 実装。
+- `engine/include/strata/prefill/dense_mmq_notice.hpp:10-15` — MMQ 無し build の通知値判定と文言。
+- `engine/src/prefill/prefill.cpp:2026-2039,2099-2130` — `mmq_plan()` 初期化、own-only 条件、通知の一度だけの出力。

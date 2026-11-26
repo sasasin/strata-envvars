@@ -1,49 +1,44 @@
 # `STRATA_DECODE_TIMING`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-serve の各リクエストで decode window の時間内訳を stderr に出す診断用スイッチです。通常の逐次 decode では verify、commit/emit、draft の平均時間と、CPU expert pool、VRAM hit、PCIe などの集計を `strata decode timing:` 行に出します。`--pipeline-windows` 経路では pipeline の追加内訳も出ます。
-
-この変数は timing/profile の出力を切り替えます。decode の計算経路や値を選びません。CUDA/HIP 系実装と SYCL 実装の両方にあります。
+`--serve` の要求ごとの decode timing 診断ログを有効にする。値を見ているのはエンジンの serve 要求処理中で、decode の計測値を `stderr` に出す条件になる。変数自体は decode の計算や出力 token を選択・変更する分岐には使われていない。CUDA/HIP 系の `engine/src/program/generate.cpp` と SYCL 系の `engine/sycl/src/program/generate.cpp` に同じ設定有無判定がある（それぞれ `:21779`、`:11737`）。
 
 ## 値と判定
 
-値の内容は parse されず、`std::getenv("STRATA_DECODE_TIMING") != nullptr` で設定有無だけを見ます。
+値の内容は parse せず、`std::getenv(...) != nullptr` だけを判定する。したがって未設定だけが OFF で、空文字を含む設定済みの値はすべて ON。`1`、`0`、`true`、`false`、`0anything`、空文字、空白だけの値はいずれも同じ扱いであり、大小文字・数値妥当性・文字列全体は検査しない（CUDA/HIP: `engine/src/program/generate.cpp:21777-21779`、SYCL: `engine/sycl/src/program/generate.cpp:11735-11737`）。
 
-| 状態 | 判定 | 結果 |
-|---|---|---|
-| 未設定 | false | decode timing 行と pipeline 経路の追加 timing 行を出さない |
-| 任意の値を設定 | true | 対象出力を有効にする。`1` 以外や空文字、`0` も有効 |
-
-判定結果は関数内の `static const bool` に保存されます。サーバープロセスでは最初にこの箇所が実行された時に一度だけ読み、後から環境を書き換えても再評価されません。
-
-根拠: `src/program/generate.cpp:11135-11138`, `sycl/src/program/generate.cpp:10393-10396`。
+| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP | OFF | 値を問わず設定済み。例: `1`, `0`, `true`, 空文字 | なし |
+| SYCL | OFF | 値を問わず設定済み。例: `1`, `0`, `true`, 空文字 | なし |
 
 ## 有効になる条件
 
-- 対象は `--serve` のリクエスト処理です。通常の decode 経路では、処理した decode window が1つ以上あるリクエストで、最後の commit 待ちが成功した後に `strata decode timing:` 行を出します。window がない場合は出力しません。
-- `--pipeline-windows` の経路では `STRATA_DECODE_TIMING` により `strata pipeline:` と `strata pipeline classes:` の行も有効になります。
-- GPU の各 stage の時間を含む `strata decode GPU stages ...` 行は、独立した `STRATA_VERIFY_PROFILE` が設定されて verifier の計測が有効で、報告可能な window がある場合に出ます。`STRATA_DECODE_TIMING` だけでは GPU stage の計測を有効にしません。
-- 各 stage の profile report が空なら、その stage の行は出ません。
-
-`STRATA_VERIFY_PROFILE` も設定有無で判定され、GPU profile 用メモリの確保に失敗すると profile は無効になります。これは `STRATA_DECODE_TIMING` 自体の条件ではなく、GPU stage の内訳に関する条件です。
-
-根拠: `src/program/generate.cpp:12027-12053,11788-11800`, `src/core/verify.cpp:711-715,1801-1803`; SYCL 側は `sycl/src/program/generate.cpp:11277-11300,11080-11092`, `sycl/src/core/verify.cpp:636-646,1642-1644`。
+- serve 要求処理の decode 経路に入る必要がある。設定の読み取りとログ出力は両方のエンジン実装で serve の要求処理内にあるため、通常の非 serve CLI 生成ではこの設定を読み取らない（CUDA/HIP: `engine/src/program/generate.cpp:21767-21780`、SYCL: `engine/sycl/src/program/generate.cpp:11732-11738`）。
+- その要求で decode window が 1 つ以上処理される必要がある。0 window の要求では `dec_timing && dec_windows > 0` が成立せず、decode timing の行は出ない（CUDA/HIP: `engine/src/program/generate.cpp:23352-23354`、SYCL: `engine/sycl/src/program/generate.cpp:12957-12960`）。
+- GPU 段階の内訳行も必要なら、別変数 `STRATA_VERIFY_PROFILE` を設定して GPU プロファイル計測を有効にする必要がある。Verifier は同変数の設定有無で計測を開始するが、計測領域の確保に失敗するとプロファイルを無効化する。また `profile_report()` は計測が無効、または window がない場合は空文字を返し、decode timing 側は空のレポートを出力しない（CUDA/HIP: `engine/src/core/verify.cpp:1262-1275,3208-3210`、SYCL: `engine/sycl/src/core/verify.cpp:816-825,2006-2008`、serve 側: `engine/src/program/generate.cpp:23385-23390`、SYCL: `engine/sycl/src/program/generate.cpp:12969-12974`）。
+- `--pipeline-windows` の処理では decode timing 行に加え、パイプライン関連の診断行もこの設定で出力される（CUDA/HIP: `engine/src/program/generate.cpp:22584-22616`、SYCL: `engine/sycl/src/program/generate.cpp:12627-12646`）。
 
 ## 実行時の詳細
 
-通常の serve request ごとに、decode 開始時の verifier/drive counters を記録し、window ごとに時間を集計します。リクエストの commit が完了した後、平均時間や window 数、tokens/window、CPU experts と VRAM hits、PCIe などを stderr に出力します。適応 overlap が有効な場合は `strata decode adapt overlap:` 行も同じ出力ブロックに現れます。CUDA/HIP 実装と SYCL 実装でこの処理の大枠は共通です。
+`dec_timing` は要求処理内の関数ローカル `static const bool` であり、そのプロセスで当該行に初めて到達したときに環境を一度だけ読み込む。起動後でも初回評価より前の環境変更は反映されるが、初回評価後の変更は後続要求に反映されない。子プロセスへの転送や、この変数と CLI 引数の優先順位を扱うコードは読み取り箇所にない（CUDA/HIP: `engine/src/program/generate.cpp:21777-21779`、SYCL: `engine/sycl/src/program/generate.cpp:11735-11737`）。
 
-`--pipeline-windows` が使われた場合も同じフラグで pipeline 全体と class 別の時間情報を出します。pipeline が使われていない経路ではこれらの追加行は出ません。
-
-GPU stage profile を併用する場合は、verify の stage stamps を集計し、`profile_report()` が `GDN layers`、`QSA layers` などの内訳を返します。CUDA/HIP と SYCL では一部 stage 名が異なります。`docs/DETAILS.md` は `STRATA_DECODE_TIMING=1` と `STRATA_VERIFY_PROFILE=1` の併用を案内し、GPU profile は decode を少し遅くするため速度計測ではなく内訳の比較に使うよう記しています。
-
-根拠: `src/program/generate.cpp:11135-11157,11973-11980,12027-12053`; pipeline 内訳は `src/program/generate.cpp:11788-11800`; SYCL 対応箇所は `sycl/src/program/generate.cpp:10393-10413,11249-11255,11277-11300,11080-11092`; profile 集計は `src/core/verify.cpp:1801-1824`, `sycl/src/core/verify.cpp:1642-1665`; `docs/DETAILS.md:299-306`。
+設定が ON でも計測値の出力ゲートを通るだけで、既存の window 数・時間・キャッシュ等のカウンターを使って診断行を作る。通常経路では `adapt wait + verify + commit/emit + draft + adapt join + other` の要求平均を含む `strata decode timing:` 行を `stderr` に出す。`--pipeline-windows` の経路では同じ見出しの行を pipeline 用の内訳で出力する。各経路で値が未設定、または decode window がなければ行は出ない（CUDA/HIP: `engine/src/program/generate.cpp:23352-23380`、SYCL: `engine/sycl/src/program/generate.cpp:12957-12968`）。
 
 ## ログと測定値
 
-出力は stderr です。主な行の接頭辞は `strata decode timing:`、GPU 内訳は `strata decode GPU stages (ms/window):`（追加 stage は `strata decode GPU stages, stage N (ms/window):`）、pipeline 内訳は `strata pipeline:` と `strata pipeline classes:` です。単独の `STRATA_DECODE_TIMING` で速度向上などの測定値が得られるわけではありません。本書では性能値を示しません。
+ログは `stderr`。通常の要求では `strata decode timing: ...`、pipeline 経路では同じ接頭辞に続き `verify ... + commit/emit ... + draft ...` の形式で出る。GPU プロファイルが有効でレポートがある場合は `strata decode GPU stages (ms/window):...`、複数 stage では `strata decode GPU stages, stage N (ms/window):...` も出る（CUDA/HIP: `engine/src/program/generate.cpp:23352-23390`、SYCL: `engine/sycl/src/program/generate.cpp:12957-12974`）。
 
-資料: `docs/DETAILS.md:299-306`。
+`docs/DETAILS.md:364-374` は `STRATA_DECODE_TIMING=1` と `STRATA_VERIFY_PROFILE=1` の組み合わせ、および serial/pipelined の表示内容を説明している。実装では `STRATA_DECODE_TIMING` は値が `1` かを判定せず、設定有無だけを見ている。資料は GPU profiling が decode を少し遅くすると記すが、ここでは独自の性能測定は行っていない。
+
+## 根拠
+
+- CUDA/HIP 系の読み取り・static cache: `engine/src/program/generate.cpp:21777-21779`
+- SYCL 系の読み取り・static cache: `engine/sycl/src/program/generate.cpp:11735-11737`
+- CUDA/HIP 系の要求ログ・GPU stage 行: `engine/src/program/generate.cpp:23352-23390`
+- SYCL 系の要求ログ・GPU stage 行: `engine/sycl/src/program/generate.cpp:12957-12974`
+- GPU プロファイルの有効化と空レポート条件: `engine/src/core/verify.cpp:1262-1275,3208-3210`、`engine/sycl/src/core/verify.cpp:816-825,2006-2008`
+- 付属資料との照合: `docs/DETAILS.md:364-374`

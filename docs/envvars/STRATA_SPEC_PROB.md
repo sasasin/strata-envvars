@@ -1,45 +1,45 @@
 # `STRATA_SPEC_PROB`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-サンプリング中の MTP speculative decoding で、draft head が出した token を常に完全一致で判定する代わりに、draft head の分布 `q` から token を引き、主モデルの分布 `p` に対する棄却サンプリングで採否を決めます。採択確率は `min(1, p(d)/q(d))`、棄却時は `max(0, p-q)` の残差分布から replacement を選びます。draft に分布がない suffix / prompt lookup の token は point mass として扱い、既存の完全一致判定を使います。
+このスイッチは MTP（multi-token prediction）draft head の確率分布 `q` から draft token をサンプルし、verify 側で target 分布 `p` による確率的棄却サンプリングを使う。MTP の通常の draft は argmax だが、このモードでは確率的 draft と `q` のリストを用意する。`p` は target の sampler chain 適用後の分布で、draft は `min(1, p(d)/q(d))` の確率で受理され、棄却時は `max(0, p-q)` の残差から置換 token を選ぶ。MTP 以外の候補は点質量として既存の exact-match 判定に残る。実装は `engine/include/strata/core/coupled_draft.hpp`、MTP 側は `engine/src/core/mtp.cpp`、verify 側は `engine/src/core/verify.cpp` にある（`engine/include/strata/core/spec_prob.hpp:3-21,126-157`, `engine/src/core/mtp.cpp:1521-1531`, `engine/src/core/verify.cpp:4198-4229`）。
 
 ## 値と判定
 
-`spec_prob_env()` は `getenv()` の結果が null でなく、空文字列でもなく、文字列全体が正確に `"0"` でない場合に有効です。大文字小文字や数値としての parse はありません。
+`spec_prob_env()` は `std::getenv` の結果を関数内 `static const bool` に一度保存する。変数が未設定、空文字、または値が文字列全体でちょうど `"0"` なら false。それ以外の非空文字列は true であり、数値・真偽値としての parse はしない。したがって `1`, `true`, `false`, `00`, `0anything`, 前後に空白のある `0` は有効扱い、大文字小文字も区別しない値変換はない（文字列 `"0"` との完全一致のみ）。根拠: `engine/include/strata/core/coupled_draft.hpp:67-73`。
 
-| 値 | 判定 |
-|---|---|
-| unset | 無効 |
-| 空文字列 | 無効 |
-| `0` | 無効 |
-| `1`、`true`、`false`、`00`、`0abc`、その他の非空文字列 | 有効 |
-
-判定結果は `spec_prob_env()` 内の function-local `static const bool` に初回評価時から保存されます。プロセス内で環境を後から変更しても再評価されません。`STRATA_SPEC_COUPLED` も有効なら、両方の設定が共同 sampler を有効にしますが、確保された `h_q_` があると draft では確率的 sampling が選ばれます。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 全経路 | 機能を要求しない | `1`, `true`, `false`, `00`, `0anything` | 空文字, `0` |
 
 ## 有効になる条件
 
-- MTP が有効で、対象の生成リクエストが greedy ではなく `temperature > 0` である必要があります。greedy / temperature 0 では `coupled_active_` が false になり、この方式は使われません。
-- 実装は `src/kernels/cuda/sampler.cu` の CUDA sampler と `src/core/mtp.cpp` の MTP 経路にあります。対応する本番実装を確認できたのはこの CUDA 経路です。
-- draft logits の語彙幅が coupled sampler の上限を超え scratch サイズが 0 になる場合、setup は警告を出し argmax drafts に戻ります。その経路では分布 buffer `h_q_` を確保しないため、確率的判定も有効になりません。
-- MTP の分布 buffer を mapped memory として確保できない場合、setup は `mtp: the draft distributions' buffer does not fit` で失敗します。
-- verifier が `sample_tokens_spec()` を実行できない場合（split sampler 以外の sampler path、語彙 block / window の上限超過、stream capture 中、scratch 確保失敗など）は false を返し、通常の `sample_tokens()` に fallback します。MTP 分布のない行や suffix draft も point mass / 完全一致の扱いです。
+- MTP drafter が利用される必要がある。スイッチは MTP の `coupled_draft_env()` を有効にし、bind 時に coupled sampler の setup を行うが、MTP が使われない実行には効果がない（`engine/include/strata/core/coupled_draft.hpp:75-79`, `engine/src/core/mtp.cpp:1014-1015`）。
+- 実際の確率的 draft は greedy でなく、temperature が `0` より大きく、かつ `STRATA_SPEC_MIN_TEMP` の値以上の request に限る。`STRATA_SPEC_MIN_TEMP` は未設定なら `0`、設定値は `atof` で変換され、draft temperature が閾値未満なら通常 draft のままになる（`engine/src/core/mtp.cpp:855-860`, `engine/include/strata/core/spec_prob.hpp:64-73`）。
+- MTP setup が sampler parameter・penalty ring・scratch と `STRATA_SPEC_PROB` 用の `q` buffer を確保できる必要がある。確保に失敗すると setup は false を返し、呼び出し元へ `mtp: the coupled draft sampler's buffers do not fit` または `mtp: the draft distributions' buffer does not fit` を渡す（`engine/src/core/mtp.cpp:802-821`, `engine/src/core/mtp.cpp:1014-1015`）。
+- `--spec-min-p` が 0 より大きい場合の標準 pick gate は、serial decode・単一 device・pipeline windows 1 未満・batch 無効・stage 1・remote device なし・`--lookup-chain 0`・`--adapt-swaps 0`・PCIe sharing なし・独自 window rule なし・window 8 行以下・finite な `--spec-min-p` が揃わないと gated rule を使わない。その場合は一度だけ `strata: STRATA_SPEC_PROB=1 keeps the older acceptance rule in this run (%s). That rule's output distribution is off when the confidence gate fails; STRATA_SPEC_PROB_GATE=top is exact here.` と警告し、旧受理規則に戻る。`STRATA_SPEC_PROB_GATE=top` はこの gated rule を選ばない（`engine/src/program/generate.cpp:3543-3563`, `engine/src/program/generate.cpp:21426-21430`）。
+- first window、suffix draft、lookup-chain の候補など、MTP が `q` から引いた draft でない行には MTP の `q` を適用しない（`engine/src/program/generate.cpp:22983-22988`, `engine/include/strata/spec/window_rule.hpp:35`）。
 
 ## 実行時の詳細
 
-`coupled_draft_env()` はこの変数または `STRATA_SPEC_COUPLED` が有効なら MTP の共同 sampler setup を要求します。`STRATA_SPEC_PROB` が有効な setup では、MTP が各 sampled draft の `q` を最大 64 token の ID・確率列として mapped buffer に書きます。draft の乱数 stream は verifier の draw と別の Philox counter 空間を使います。主モデル側の `p` は penalties、top_k、top_p、min_p、temperature を適用した後の sampler 分布です。
+`coupled_draft_env()` は `STRATA_SPEC_COUPLED` またはこのスイッチのいずれかが true なら coupled sampler 用 setup を要求する。`STRATA_SPEC_PROB` の値を `spec_prob_env()` が初めて評価した時点で読み、`static` に保持するため、同一プロセス内で後から環境を書き換えても判定は更新されない（`engine/include/strata/core/coupled_draft.hpp:57-79`）。setup 成功時に `q` buffer を確保し、stderr に有効ログを出す（`engine/src/core/mtp.cpp:818-820,842-849`）。
 
-生成側は MTP drafts に対応する `q` 列を verifier に渡します。CUDA verifier は各 draft 行で採択判定をし、棄却時は residual 分布から token を選び、最後の行は通常の `p` から sample します。ホスト側の既存の accepted-prefix 判定はそのままです。実装は `strata mtp: probabilistic draft acceptance on (STRATA_SPEC_PROB): ...` を stderr に出します。MTP 未使用、greedy request、または fallback 経路ではこのログがあっても個々の行で rejection sampling が走らない場合があります。
+request ごとに `set_draft_sampling()` が greedy / temperature 条件を判定する。条件を満たすと sampler parameter と penalty history を次の draft round 用に設定する。MTP draft は draft head の distribution `q` から独自 stream でサンプルし、`q` の疎な token/probability list を verify に渡す（`engine/src/core/mtp.cpp:855-865,1521-1531`, `engine/include/strata/core/mtp.hpp:192-196`）。Verify は sampled request で `q` list がある window に rejection sampling を使い、`q` がない場合は point-mass draft として処理する（`engine/src/core/verify.cpp:4192-4229`, `engine/include/strata/core/spec_prob.hpp:126-157`）。
 
-`docs/DETAILS.md` は RTX 3060、IQ3_XXS、200-token の story/code 各回答、10 組の interleaved run で rejection sampling が 0.3 / 0.7 / 1.0 temperature 時に 41.0 / 42.6 / 42.6 tok/s と記載し、default の 42.4 / 43.2 / 43.3 tok/s を上回らず、繰り返し間の差は最大 5% としています。これは同資料の測定条件での記録です。`docs/MULTI_GPU.md` にも `STRATA_SPEC_PROB=1` の行（137.2 tok/s、1788 MiB）が載っていますが、そこでの表はその値単独の測定条件を説明していません。
+`STRATA_SPEC_PROB_GATE` と `STRATA_SPEC_PROB_DT` は確率的処理の詳細を変える別変数である。gate の既定は drawn-token の `pick` gateで、値がちょうど `top` のときだけ top-probability gate になる。`STRATA_SPEC_PROB_DT` は drafter の temperature scale で、未設定なら `1`; `atof` の結果が正でなければ `1` に戻る（`engine/include/strata/core/spec_prob.hpp:42-61`）。
+
+## ログと測定値
+
+MTP setup 成功時、`STRATA_SPEC_PROB` 有効なら stderr に `strata mtp: probabilistic draft acceptance on (STRATA_SPEC_PROB): sampled requests draft by sampling the draft head's distribution over %lld tokens; ...` を出す。後半は gate により `pick gate: masked mu offers, min(1, p/mu) acceptance and (p-mu)+ rejection/NULL residuals` または `top gate (compatibility): q offers, min(1, p/q) acceptance and (p-q)+ rejection residuals` となる（`engine/src/core/mtp.cpp:842-849`）。生成終了時は q list で判定された window があった場合に stdout へ `probabilistic accept` と window 数を出す（`engine/src/program/generate.cpp:25269-25271`）。
+
+`docs/DETAILS.md` は受理方式、confidence gate の条件、CPU native (IQ) pack の算術経路を説明している（`docs/DETAILS.md:644-660`）。ここではソースから確認できる処理のみを記し、速度・正確性の測定値は追加していない。
 
 ## 根拠
 
-- 値判定、共同 sampler との関係: `include/strata/core/coupled_draft.hpp:65-79`。
-- setup、幅上限時の argmax fallback、分布 buffer、stderr ログ、request sampling 条件: `src/core/mtp.cpp:520-573,576-580,682`、`include/strata/core/mtp.hpp:116-120`。
-- MTP が `q` を出力し、分布列を verifier に渡す箇所: `src/core/mtp.cpp:999-1009`、`src/program/generate.cpp:12046-12049,13216-13217`。
-- draft distribution の計算・記録と CUDA verifier の採択、残差 sampling: `src/kernels/cuda/sampler.cu:937-1003,1005-1099`。
-- verifier の fallback 条件と plain sampling への切替: `src/kernels/cuda/sampler.cu:1347-1369`、呼び出し側 `src/core/verify.cpp:2309-2336`。
-- 測定記録: `docs/DETAILS.md:1260`、補助記録 `docs/MULTI_GPU.md:332-334`。
+- `engine/include/strata/core/coupled_draft.hpp:67-79` — 値の判定、cache、coupled setup との接続。
+- `engine/src/core/mtp.cpp:802-852,855-865,1521-1531` — buffer 確保、失敗経路、ログ、request 条件、q sampling。
+- `engine/include/strata/core/spec_prob.hpp:3-21,42-73,126-157` — rejection sampling と関連環境設定。
+- `engine/src/program/generate.cpp:3543-3563,21418-21430,22983-22992,25269-25271` — gated fallback、verify への q 渡し、結果表示。
+- `engine/src/core/verify.cpp:4192-4229` — q list を用いた verify と fallback sampling。

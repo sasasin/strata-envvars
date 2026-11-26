@@ -1,45 +1,46 @@
 # `FNX_RING_F32`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-複数カードに分割した sFNX engine の decode 中にカード間で部分和を受け渡す ring の値形式を選びます。既定は fp16 のペアで、`1` を指定すると fp32 の値を受け渡します。参照されるのは `src/split` の `strata-split` 実行系で、`sfnx` サーバーと `fnx_run` の engine が対象です。通常の Strata 実行全般を切り替える変数ではありません（`src/split/src/engine_common.cu:1011-1018`, `src/split/src/engine.cu:31-36,237-242`, `src/split/CMakeLists.txt:92-117`）。
+split engine の decode でカード間の部分和を運ぶ ring の要素形式を選びます。未設定または `0` では fp16 2 要素を 1 語に詰め、各 hop で fp16 に丸めます。`1` では要素ごとに fp32 を送受信し、カード間の部分和を fp32 のまま加算します。engine の各カードバッファにこの設定を保持し、層の attention 出力や MoE 出力などを `ring_sum` で合算します。生成や logits が同一になる保証はコードにありません。`FNX_RING_F32` は decode ring 用で、prompt の copy-engine ring は fp16 です（`engine/src/split/src/engine.cu:279-284, 976-980`; `engine/src/split/src/kernels.cu:882-941, 1582-1614`; `engine/src/split/src/prefill.cu:967-990`）。
 
 ## 値と判定
 
-`env_int("FNX_RING_F32", 0)` が値を整数として読み、結果が `0` か `1` かを検査します。未設定なら既定値 `0`、すなわち fp16 ペアです。設定値は符号付き十進整数として文字列全体を読むため、`1` と `+1` は fp32、`0`、`-0` は fp16 です。空文字、前後の空白、`1x`、`0x1`、小数、整数範囲外は整数変換エラーになります。整数として読めても `-1`、`2` など `0`/`1` 以外は許可されません。CLI 引数や別環境変数による上書きはありません。
+`ring_f32()` は `env_int("FNX_RING_F32", 0)` を呼び、未設定なら `0` を使います。`env_int` は `getenv` 後、符号付き base-10 整数として文字列全体を `strtoll` で解析します。空文字・空白・数値以外の文字・整数範囲外は `FNX_RING_F32: '<値>' is not a whole number` の例外です。解析後は `0` と `1` だけを受け入れ、それ以外は `FNX_RING_F32: 0 or 1, got <数値>` で例外にします（`engine/src/split/src/env.hpp:15-21, 33-40`; `engine/src/split/src/engine_common.cu:1035-1042`）。
 
-| 状態 | 結果 |
-| --- | --- |
-| 未設定 | `0` として fp16 ペア |
-| `0`（または `-0`） | fp16 ペア |
-| `1`（または `+1`） | fp32 |
-| 空文字、整数以外、整数範囲外 | `FNX_RING_F32: '<値>' is not a whole number` 例外 |
-| 整数だが `0`/`1` 以外 | `FNX_RING_F32: 0 or 1, got <整数>` 例外 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| split engine の `ring_f32()` | `0` として fp16 pairs | `1`, `+1`, `01` → fp32 | `0` は fp16 pairs。`2`, `-1` は範囲外。空文字、`true`、`0anything`、`1.0`、前後の空白、整数範囲外は整数解析エラー |
 
-変換規則は `src/split/src/env.hpp:15-22,33-40`、対象変数の既定値・値域検査は `src/split/src/engine_common.cu:1011-1018` にあります。
+符号と先頭ゼロは整数解析で許されます（したがって `-0` は `0` 扱いです）。大文字小文字の比較はなく、`true` / `false` は整数ではないため受け付けません。明示的な空文字は未設定扱いではありません。既定値を変える CLI 引数や設定ファイルの読み取りはこの設定にありません（`engine/src/split/src/env.hpp:15-21, 33-40`; `engine/src/split/src/engine_common.cu:1039-1041`）。
 
 ## 有効になる条件
 
-- CMake の sFNX split engine（CUDA または HIP）に限られます。確認した CMake 設定ではカード数 2、3、4 の実行ファイルが対象です（`src/split/CMakeLists.txt:92-117`）。
-- Engine の構築時に各カードの ring 設定へ値が入ります。window の各 layer で行うカード間 `ring_sum` に適用されます（`src/split/src/engine.cu:237-242,951-988,1073-1076`; FFN の和は `935`）。
-- `FNX_ONEHOP` が既定値のまま有効でも、fp32 ring では one-hop 経路を選びません。`NCARD > 2` かつ `FNX_ONEHOP != 0` の場合は stderr に `fnx: FNX_RING_F32: the one-hop sum carries fp16 words only, the rings stay` と出し、通常の ring 経路を使います。`FNX_ONEHOP=0` ならこの警告は出ません。2 カードでは `FNX_ONEHOP` が有効でも警告条件に該当しません（`src/split/src/engine.cu:266-273`）。
-- prompt prefill の和にはこの指定は適用されません。prefill の copy-engine ring は別の `PfRing` 経路で、GPU-thread ring を選ぶ `FNX_PF_RING_SM` 経路でも `p->ring.f32 = false` に戻します（`src/split/src/prefill.cu:738-745,1299-1306`）。
+- `fnx::Engine` が使われる Strata split engine の decode ring で有効です。値を読む関数自体にカード数条件はありません。ソースには CUDA/HIP の split engine があり、この判定に `FNX_HIP` など backend 別の値分岐はありません（`engine/src/split/src/engine.cu:279-284`; `docs/SPLIT_ENGINE.md:67-71`）。
+- prompt 経路の ring はこの値で fp32 になりません。`FNX_PF_RING_SM=1` の GPU-thread prompt ring でも、engine の ring 設定をコピーした後に `f32=false` に戻します。copy-engine ring の送受信バッファも `__half` です（`engine/src/split/src/prefill.cu:967-990`）。
+- decode ring の one-hop 経路は `!ring.f32` を条件に含むため、値が `1` なら `FNX_ONEHOP` や peer 状態にかかわらず使われず、通常の ring kernel に進みます。3 枚以上で `FNX_ONEHOP` が非 0 の場合は、`fnx: FNX_RING_F32: the one-hop sum carries fp16 words only, the rings stay` を stderr に出します。`FNX_ONEHOP=0` ならこの警告条件を満たしません（`engine/src/split/src/engine.cu:308-316`; `engine/src/split/src/kernels.cu:1602-1614`）。
+- sFNX server や `fnx_run` の lab 実行の engine 作成時に読み取られます。CLI 引数による上書き条件はありません（`engine/src/split/tools/sfnx.cpp:1123-1135`; `engine/src/split/tools/fnx_run.cpp:978-989`）。
 
 ## 実行時の詳細
 
-`ring_f32()` は static cache を持たず、呼ばれるたびに環境を読み直します。Engine はカードごとの初期化ループでこの関数を呼ぶため、構築時にカードごとに評価されます（`src/split/src/engine_common.cu:1011-1018`, `src/split/src/engine.cu:237-242`）。通常、プロセス起動後に環境を変更しても OS の環境変数は自動では変わりませんが、コード上の値の cache はありません。sfnx は Engine 構築後にも起動ログの形式表示で `ring_f32()` を呼びます（`src/split/tools/sfnx.cpp:1055-1076`）。`fnx_run` の exact/lab identity も build 行を記録する際に同関数を呼びます（`src/split/tools/fnx_run.cpp:398-418`）。別の参照 `fnx_run.cpp:781` は、identity に build 行がない旧記録について保存済み `env` 行に `FNX_RING_F32=1` が含まれるかを調べる文字列比較で、現在のプロセス環境を読む箇所ではありません（`src/split/tools/fnx_run.cpp:776-782`）。
+値の解析は `ring_f32()` の呼び出しごとで、関数内 static cache はありません。`Engine` のカードバッファ作成ループで各カードの `Ring::f32` に結果を保存するため、その engine の動作は作成時に決まります（`engine/src/split/src/engine.hpp:35-37`; `engine/src/split/src/engine.cu:279-284`）。同じ関数は sFNX の起動ログと `fnx_run` の lab identity 作成でも再度呼ばれます。そのため、その後にプロセス環境が変更された場合にログや identity の判定値が engine の保存値と異なり得ますが、通常の engine 処理は保存済みの `Ring::f32` を使います（`engine/src/split/tools/sfnx.cpp:1139-1151`; `engine/src/split/tools/fnx_run.cpp:386-418`）。
 
-fp32 ring は各 float のビット列をタグ付き 64-bit word で送り、受信側で fp32 に戻して加算し、結果を `x` に書き戻します。fp16 経路は各ペアを `__half2` に変換して送受信します（`src/split/src/kernels.cu:832-868,886-945`）。dispatch は `r.f32` で `k_ring<true>` と `k_ring<false>` を選びます。`r.onehop` または HIP peer push が選ばれる場合の経路は別 dispatch ですが、Engine 初期化時に fp32 なら `onehop` を無効にしています（`src/split/src/kernels.cu:1566-1598`; `src/split/src/engine.cu:266-270`）。
+`ring_sum` は fp32 設定の場合 `k_ring<true>` を起動し、2 要素を別々の fp32 語で運びます。fp16 設定は `k_ring<false>` で、各 hop の書き込み時に fp16 pair へ丸めます。`ring_sum` は attention の出力合算、FFN/MoE の合算などから呼ばれます（`engine/src/split/src/kernels.cu:833-864, 882-941, 1612-1614`; `engine/src/split/src/engine.cu:972-981, 1029-1033, 1115-1120`）。`fnx_run` は lab identity に `ring fp32` または `ring fp16-pairs` を記録し、古い identity に build 行がない場合は記録済みの環境行に `FNX_RING_F32=1` があるかを使って ring 設定を復元します（`engine/src/split/tools/fnx_run.cpp:386-418, 776-788`）。
 
-読み取り値が不正なら Engine 構築中に例外になります。`sfnx` は `ERR <理由>` を stdout に出し、stderr に `sfnx: failed: <理由>` を出して終了コード 1 で終了します（`src/split/tools/sfnx.cpp:1030-1035,1055-1062`）。`fnx_run` は stderr に `fnx_run: <理由>` を出して終了コード 1 になります（`src/split/tools/fnx_run.cpp:1364-1373`）。有効時の sfnx 起動ログはカード間和を `fp32`、既定時は `fp16` と表示します（`src/split/tools/sfnx.cpp:1068-1076`）。
+## ログと測定値
+
+- sFNX の起動成功ログ `sfnx: loaded in ...; ... sums between them fp32; ...` は選択された値を表示します（`engine/src/split/tools/sfnx.cpp:1142-1151`）。
+- 3 枚以上で `FNX_ONEHOP` が非 0 なら、one-hop が fp16 words 専用のため ring を使うという上記 stderr 警告が出ます（`engine/src/split/src/engine.cu:315-316`）。
+- sFNX の Engine 作成時に値が不正だと例外を捕捉し、標準出力へ `ERR FNX_RING_F32: ...`、stderr へ `sfnx: failed: FNX_RING_F32: ...` を出して終了コード 1 で終了します。`fnx_run` では `fnx_run: FNX_RING_F32: ...` を stderr に出し終了コード 1 です（`engine/src/split/tools/sfnx.cpp:1097-1103, 1131-1136`; `engine/src/split/tools/fnx_run.cpp:1364-1373`）。
+- `engine_common.cu` のコメントには fp32 の decode 負荷と KL の比較値がありますが、再現に必要な機種・モデル・量子化・測定条件が揃っていないため、ここでは測定結果として一般化しません（`engine/src/split/src/engine_common.cu:1035-1040`）。
 
 ## 根拠
 
-- 読み取り、値の検査、bool 化: `src/split/src/engine_common.cu:1011-1018`。
-- 環境値の完全な整数変換と未設定時 fallback: `src/split/src/env.hpp:15-22,33-40`。
-- Engine のリングへの設定、one-hop の抑止と条件付き警告: `src/split/src/engine.cu:237-273`。
-- fp32/fp16 の送受信・加算および実行経路の選択: `src/split/src/kernels.cu:832-868,886-945,1566-1598`。
-- prefill が別経路であること: `src/split/src/prefill.cu:738-745,1299-1306`。
-- 環境変数を読む tool の実行時ログ・identity 記録: `src/split/tools/sfnx.cpp:1055-1076`, `src/split/tools/fnx_run.cpp:398-418`。
+- 読み取り・整数判定: `engine/src/split/src/env.hpp:15-21, 33-40`; `engine/src/split/src/engine_common.cu:1035-1042`
+- Engine 設定、one-hop 条件と警告: `engine/src/split/src/engine.cu:279-316`
+- decode ring の fp32 / fp16 実装と dispatch: `engine/src/split/src/kernels.cu:833-864, 882-941, 1582-1614`
+- prompt ring の扱い: `engine/src/split/src/prefill.cu:967-990`
+- server 表示と例外処理: `engine/src/split/tools/sfnx.cpp:1097-1103, 1123-1151`
+- lab identity: `engine/src/split/tools/fnx_run.cpp:386-418, 776-788, 1364-1373`

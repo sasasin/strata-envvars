@@ -1,43 +1,55 @@
 # `STRATA_Q8_SM60`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の native MMVQ 経路で、Q8_0 重み行列の decode GEMV に Pascal GP100 向けカーネル `q8sm60::kernel` を opt-in します。対象の重みをロード時に `qs` と fp16 scale の平面へコピーし、Q8_0 の dense projection と native output head の decode でコピーを使います。元の GGUF 配置も保持され、prompt 経路は引き続き元データを使います。通常の CUDA decode 経路は `small_mmvq` です（`src/kernels/cuda/native_mmvq.cu:1930-1947,2866-2870`; `src/core/native_dense.cpp:363-382`; `src/core/native_head.cpp:54-78`）。
+CUDA native MMVQ の Q8_0 decode で、通常 kernel の代わりに Pascal compute capability 6.0 向けの `q8sm60::kernel` を選ぶ opt-in です。主な対象は native dense の Q8_0 行列と native output head です。変数が有効でも、存在する Q8_0 tensor がない場合は演算に使われません。読み取りと有効判定は `engine/src/kernels/cuda/native_mmvq.cu` の `q8_sm60_on()`、kernel 起動は同ファイルの `q8_packed_mmvq()` と `engine/src/kernels/cuda/q8_sm60.cuh` にあります（`native_mmvq.cu:2625-2636, 2767-2805, 2983-2995`、`q8_sm60.cuh:53-105`）。
+
+この経路は通常の exact kernel と積算順序が異なるため、結果は bitwise 一致しません。整数 dot は正確ですが、float の加算順序が異なるとソースに記載されています（`q8_sm60.cuh:17-18, 81-104`）。Q8_0 以外の型や prompt GEMM をこの変数が切り替える処理はありません。通常の out-of-place packed 経路では native dense の GGUF 重みを prompt path 用に残し、decode 用コピーを追加します。`STRATA_Q8_INPLACE=1` の別経路では重みを packed layout で格納します（`native_dense.cpp:469-483, 498-516`）。
 
 ## 値と判定
 
-値は文字列全体で厳密に比較され、`"1"` だけが有効です。数値変換や前後空白の除去はありません。
+kernel を有効化する判定は `getenv` の値全体が厳密に文字列 `1` と一致する場合だけ true です。数値変換や大文字小文字変換はせず、`static const bool` に初回評価結果を保存します（`native_mmvq.cu:2625-2635`）。
 
-| 値 | 結果 |
-|---|---|
-| 未設定、空文字 | 無効 |
-| `1` | 有効 |
-| `0`, `01`, `true`, ` 1`, `1 ` など | 無効 |
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| CUDA kernel の有効判定 | false | `1` | 空文字、`0`、`true`、`01`、`10`、`1 `、` 1` など、文字列 `1` 以外すべて |
+| head の一部補助判定 | head load 時に設定なし扱い | 値の内容を問わず、環境変数が存在すれば設定あり | unset のみ。空文字も設定あり |
 
-判定は `q8_sm60_on()` 内の `static const bool` に一度だけ保存されます。そのプロセスで最初にこの関数が評価された後に環境を変更しても反映されません。有効と判定された最初の呼び出しでは stderr に `strata q8 sm60: Q8_0 decode GEMVs on the Pascal kernel (STRATA_Q8_SM60=1)` を出します（`src/kernels/cuda/native_mmvq.cu:1932-1943`）。
+head の補助判定は kernel の有効判定とは別です。値が空または不正でも、Q8_0 head の peer split を抑止し（`native_head.cpp:131-136`）、manifest に `repacked (STRATA_Q8_SM60)` と付記し（同 `:281-288`）、`to_host()` による pinned host memory への移動を抑止します（同 `:297-300`）。このため無効値でも head 配置に副作用があります。
 
 ## 有効になる条件
 
-- CUDA ビルドであること。HIP ビルドではコンパイル時分岐により常に無効です。Metal の stub も pack 関数で `false` を返します（`src/kernels/cuda/native_mmvq.cu:1932-1947,2252-2283`; `metal/src/engine/stubs_0145.cpp:147-149`）。
-- 対象行列が Q8_0 で、`n_in >= 128`、`n_in` が 32 の倍数、`n_out > 0` であること。native dense のロードでは `blk.1.ple_key.weight` を除外します（`src/kernels/cuda/native_mmvq.cu:2240-2243,2257-2258`; `src/core/native_dense.cpp:363-382`）。
-- カーネル起動時は `ncols` が 1〜8、`n_in` が 32 の倍数かつ 128 以上、動的 shared memory が 48 KiB 以下であること。shape がカーネルに拒否された場合、通常の packed exact kernel の対象 shape ならそちらに fallback し、それ以外は packed registry の経路を抜けて元の GGUF 配置を使う exact kernel に進みます（`src/kernels/cuda/q8_sm60.cuh:21-22,118-148`; `src/kernels/cuda/native_mmvq.cu:2048-2072,2240-2243`）。
-
-コード上に compute capability の実行時チェックはありません。機能の説明と測定対象は Pascal GP100 ですが、環境変数の分岐自体は CUDA デバイスを調べずに有効になります。どの GPU で性能上有利かはこの分岐からは判断できません（`src/kernels/cuda/native_mmvq.cu:1932-1943`）。
-
-`STRATA_Q8_PACKED=1` も native dense の Q8_0 行列を pack する別の理由になります。`native_q8_0_packed_enabled()` はどちらか一方が有効なら true を返すため、両方を設定した場合は SM60 カーネルが選択可能な packed registry も作られます（`src/kernels/cuda/native_mmvq.cu:2232-2238`; `src/core/native_dense.cpp:363-382`）。
+- CUDA native MMVQ 経路であること。`__HIPCC__` build では `q8_sm60_on()` が常に false を返し、pack 関数も false を返します。Metal の stub も pack を行わず false を返します（`native_mmvq.cu:2625-2628, 3045-3050`、`engine/metal/src/engine/stubs_0145.cpp:149-154`）。
+- 値が厳密に `1` で、該当する重みが Q8_0 であること。dense の通常の packed eligibility は `n_in >= 128`、`n_in % 32 == 0`、`n_out > 0` です（`native_mmvq.cu:2991-2995`）。native head は Q8_0 の場合に pack を試みます（`native_head.cpp:261-265`）。
+- shape が kernel の shared-memory / launch 条件を満たすこと。CUDA kernel が起動できない場合は、packed exact kernel または通常の GGUF-layout kernel へ戻る経路があります（`native_mmvq.cu:2767-2800, 2991-2995`）。
+- `STRATA_Q8_PACKED=1` も native Q8 packed layout を有効にしますが、この変数単独でも `q8_sm60_on()` が true なら packed copy が登録され、Pascal kernel を優先します（`native_mmvq.cu:2983-2995, 2770-2796`）。
+- `STRATA_Q8_INPLACE=1` と併用すると dense load が eligible tensor を in-place packed にする経路があります。`STRATA_Q8_SM60` が有効な場合、in-place eligibility も Q8 shape 条件を使います（`native_dense.cpp:469-483, 498-516`、`native_mmvq.cu:2991-3012, 3111-3142`）。
+- `STRATA_Q8_SM60_BPS` は同 kernel の blocks-per-SM を上書きする別変数です。`atoi` の結果が正ならその値、そうでなければ GPU に応じた既定値を使います（`q8_sm60.cuh:108-136`）。
 
 ## 実行時の詳細
 
-native dense の準備時に適格な Q8_0 行列を host 上で pack して追加の CUDA allocation に転送し、元の GGUF 配置のデータとともに registry に登録します。Qwen 3.6 専用 engine の行列 loader も同じ enabled / eligible 判定、pack、registry 登録を行います（`src/qwen35/q36_engine.cu:1011-1023`）。output head は `type_ == 8` の場合に別途 pack を試みます。head の pack は追加 VRAM が確保できない場合や同期中の pack が失敗した場合に stderr へ理由を出して失敗し、通常配置のまま継続します。成功時は対象名・行列サイズ・追加 VRAM 量を stderr に出します（`src/core/native_dense.cpp:363-382,473-492`; `src/core/native_head.cpp:68-79`; `src/kernels/cuda/native_mmvq.cu:2252-2281`）。
+`q8_sm60_on()` は最初に呼ばれた時点で値を一度読み、以後は cache した bool を返します。process 中に環境を書き換えてもこの判定は更新されません。成功時は stderr に一度 `strata q8 sm60: Q8_0 decode GEMVs on the Pascal kernel (STRATA_Q8_SM60=1)` と出します（`native_mmvq.cu:2629-2635`）。
 
-decode の Q8_0 MMVQ 呼び出しは registry 内に一致する packed 行列があると SM60 kernel の起動を試します。kernel は Q8_1 activation を workgroup ごとに shared memory に移し、出力行の積和を計算します。通常カーネルと加算順が異なるため、出力が bitwise 一致する保証はありません。入力 shape を kernel が受け付けない場合には前節の fallback が適用されます（`src/kernels/cuda/native_mmvq.cu:2053-2072,2866-2870`; `src/kernels/cuda/q8_sm60.cuh:21-22,38-91,118-148`）。
+native dense の load は、Q8_0 tensor（`blk.1.ple_key.weight` を除く）について enabled と eligibility を確認し、通常は元の GGUF weight を保持したまま同サイズの packed plane copy を作ります。head load も Q8_0 の output head を pack します（`native_dense.cpp:498-516`、`native_head.cpp:261-265`）。pack copy の割当または変換に失敗した場合は `strata q8 sm60: no VRAM for the packed ...; it keeps the GGUF layout` または `strata q8 sm60: packing the ... failed; it keeps the GGUF layout` を出し、その tensor は GGUF layout に残ります（`native_mmvq.cu:3050-3075`）。成功時のログは `strata q8 sm60: packed <what> (<n_out> x <n_in>, <MiB> MiB more VRAM)` です。native dense 側の追加 packed upload 失敗は `native dense packed upload <tensor>: <CUDA error>` として load を失敗させます（`native_dense.cpp:507-515`）。
 
-なお `src/kernels/cuda/q8_sm60.cuh` 内の `STRATA_Q8_SM60_BPS` は別環境変数で、SM あたりの起動 block 数を `atoi` で読み、正数でなければ既定値 4 を使います。この文書の対象変数の値判定とは独立です（`src/kernels/cuda/q8_sm60.cuh:85-95`）。
+decode の `native_q8_0_mmvq()` は登録済み重みを `q8_packed_mmvq()` に渡します。sm60 kernel が適用できない shape では packed exact layout または通常 kernel に fallback します。in-place packed tensor が sm60 kernel により拒否された場合は stderr に `strata q8 inplace: q8sm60 declined in-place tensor (...)` を出して abort します（`native_mmvq.cu:2767-2800, 3699-3704`）。
 
-## 根拠と資料との照合
+Q36 engine も `native_q8_0_packed_enabled()` と eligibility を使って packed Q8_0 planes を登録するため、同じ CUDA build ではこの opt-in の影響を受けます（`engine/src/qwen35/q36_engine.cu:1438-1450`）。別途 `STRATA_MTP_Q8_SM60` が有効な MTP drafter の行列を sm60 kernel に載せる経路もありますが、これは別設定による opt-in です（`engine/src/core/mtp.cpp:106-115, 490-508, 996-1004`）。
 
-`docs/OLDER_GPUS.md:110-128` は機能を GP100 向けとして説明し、Q8_0 dense 行列と head の追加 copy、通常 kernel との加算順の違い、shape による fallback、必要な Q8_0 dense model の作成手順を記載しています。ソースでは厳密な `"1"` 判定と CUDA/HIP の差、pack の失敗ログ、kernel が拒否する shape の fallback を確認しました。
+## ログと測定値
 
-性能値を新たに検証していません。同資料は PH402 SKU 200、4 GP100 dies、Windows 11、CUDA 12.9、Flash-Next IQ3_XXS などを条件として、`STRATA_Q8_SM60=1` の decode 平均 38.9 tok/s と GPU verify-window 時間を報告しています（`docs/OLDER_GPUS.md:144-156`）。これらは資料中の測定報告であり、他の環境での性能を示すものではありません。
+有効判定時と pack の成功・失敗時に上記 stderr ログが出ます。成功ログは `quiet` pack では抑止されます（`native_mmvq.cu:2629-2635, 3045-3075`）。Strata の `docs/OLDER_GPUS.md` は PH402（4 GP100 dies）、Windows 11、driver 581.80、CUDA 12.9、engine 0.1.40.2、Flash-Next IQ3_XXS、32K、greedy 256 tokens、2–3 回の interleaved starts で、Q8_0 dense shard の decode 平均を 28.3 から 38.9 tok/s と報告しています。これは同資料に記載された条件下の測定値です（`docs/OLDER_GPUS.md:341-352`）。
+
+## 根拠
+
+- `engine/src/kernels/cuda/native_mmvq.cu:2625-2635` — exact 値判定、cache、有効ログ。
+- `engine/src/kernels/cuda/native_mmvq.cu:2767-2800, 2983-3012, 3045-3075, 3111-3142, 3699-3704` — eligibility、pack、decode 分岐、fallback と失敗経路。
+- `engine/src/core/native_dense.cpp:469-483, 498-516` — dense tensor の in-place / packed copy。
+- `engine/src/core/native_head.cpp:131-136, 261-288, 297-300` — head load、presence 判定の副作用と配置。
+- `engine/src/kernels/cuda/q8_sm60.cuh:17-18, 53-105, 108-136` — 演算の差と起動 kernel の処理。
+- `engine/src/qwen35/q36_engine.cu:1438-1450` — Q36 の packed registration。
+- `engine/metal/src/engine/stubs_0145.cpp:149-154` — Metal pack stub。
+- `engine/src/core/mtp.cpp:106-115, 490-508, 996-1004` — MTP の別 opt-in。
+- `docs/OLDER_GPUS.md:341-352` — 条件付き測定値。

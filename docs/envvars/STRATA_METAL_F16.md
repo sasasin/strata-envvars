@@ -1,47 +1,49 @@
 # `STRATA_METAL_F16`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-Metal engine の decode window で、一部の量子化行列積と Q2_0 routed expert を fp16 経路で実行する opt-in 設定です。engine 自体の既定値は OFF です。Mac のセットアップは resident（SSD streaming ではない）IQ3_S / Q2_0 pack の config に `STRATA_METAL_F16=1` を記載しますが、これは engine の環境既定値ではありません。`metal_f16()` の結果を使って Metal kernel library のコンパイル定義、activation buffer の大きさ、dispatch を切り替えます（`metal/src/engine/window.cpp:119-124,691-741`）。
+Metal engine の decode window で、一部の量子化重みの GEMV と Q2_0 routed expert 計算を fp16 経路にするかを選ぶ。fp16 経路では重みを half に decode し、window の activation に half plane を追加して計算する。適用中も出力 logits 自体は float バッファに書かれるが、fp32 経路と同じ数値になる保証はソースにない。設定値は `metal_f16()` で選び、Metal library のコンパイル・activation buffer の確保と、各 decode window の `f16_enc_` 判定に使われる（`engine/metal/src/engine/window.cpp:167-170, 793, 834-841, 1046-1057, 1563-1565`）。
+
+この読み取りは Strata の Metal engine にだけある。候補名の他の出現はコメント、設定登録データ、資料、またはテストであり、別の本番読み取り箇所は見つからなかった。通常の Mac setup は `STRATA_METAL_F16` を config に書かず、engine の既定判定に任せる（`engine/metal/setup_mac.py:593-598`）。
 
 ## 値と判定
 
-| 環境値 | 判定 |
-|---|---|
-| 未設定 | OFF |
-| 空文字 | OFF |
-| 文字列が正確に `1` | ON |
-| `0`、`true`、`01`、`1x`、空白を含む値など | OFF |
+engine 内の `metal_f16()` は最初の呼び出しで `std::getenv` を一度評価し、関数内 `static` の `mode` に保存する。未設定または空文字なら自動判定モード（`-1`）、文字列全体が厳密に `"1"` なら強制 ON、それ以外の非空文字列はすべて明示的 OFF（`0`）となる。数値変換はせず、空白除去・大文字小文字変換・前方一致もしない。したがって `1` だけが明示的 ON、`0`・`true`・`01`・`1x`・` 1` は OFF である。unset と空文字はいずれも自動判定を使う（`engine/metal/src/engine/window.cpp:167-170`）。
 
-数値変換や trim はせず、`std::string(e) == "1"` の完全一致です。判定は関数内の `static const bool` に初回評価結果を保存するため、engine プロセス内で環境を書き換えても再評価されません（`metal/src/engine/window.cpp:122-124`）。CLI 引数による同じ設定の上書きはこの実装にはありません。
+| 条件 | unset / 空文字 | 設定時に有効 | 設定時に無効 |
+|---|---|---|---|
+| Metal engine | resident pack の basename に `-IQ3_S-` または `-Q2_0-` があれば自動 ON。それ以外、および streaming pack は OFF | 値が文字列全体で `1` | 空文字以外で `1` と異なるすべての文字列。例: `0`, `true`, `01`, `1x`, ` 1` |
+
+自動判定はモデル path の basename だけを大文字化して部分文字列検索する。そのため pack 名に小文字で書かれていても一致するが、`-IQ3_S-` / `-Q2_0-` のハイフンを含む形が必要。自動判定では `streaming` が true ならファイル名を調べる前に OFF を返す（`engine/metal/src/engine/window.cpp:171-176`）。
 
 ## 有効になる条件
 
-環境値が `1` でも、fp16 window encoding は `head && !stream_ && !rows_` の場合だけ有効です。つまり head を含む resident decode window が対象で、SSD から expert を読む streaming 経路、head のない window（例: MTP draft 側）、および rows/batch-window 経路では使われません（`metal/src/engine/window.cpp:1413-1418`）。
-
-この条件を満たす window でも、型や tile が対象外なら通常 GEMV に戻ります。dense GEMV の fp16 対象は Q2_0、Q3_K〜Q6_K、IQ4_XS で、さらに選ばれた tile が `gemv16_tile()` の登録 tile と一致する必要があります（`metal/src/engine/window.cpp:126-139,903-918`）。routed expert の `moe_gu16` / `moe_down16` は gate/up と down の両方が Q2_0 で、Hadamard の expert 入出力変換がない場合に限られます。streaming 中はこの条件も満たしません（`metal/src/engine/window.cpp:1188-1199,1229-1263`）。
-
-Mac セットアップの `strata_control.mac_fit.engine_env()` は model 名（大文字小文字を無視）が IQ3_S または Q2_0 で、かつ `stream` が false の場合だけ `{"STRATA_METAL_F16": "1"}` を返します（`strata_control/mac_fit.py:59-66`）。セットアップはその値を `cfg["env"]` に書きます（`metal/setup_mac.py:548-553`）。サーバーの `child_env()` は親プロセス環境をコピーした後 config の `env` を反映するため、config にこのキーがあれば config 値が継承環境より優先します。config にキーがない場合は親環境の値が残ります（`serve/server.py:4054-4067`）。したがって、通常のセットアップ config では、外側の shell で `STRATA_METAL_F16=0` を設定するだけでは config の `1` を打ち消しません。config の値を `0` にすれば OFF になります。
+- engine が Metal backend の実装を使うこと。環境変数読み取り箇所は `engine/metal/src/engine/window.cpp` 内にある。
+- 対象の window が `head` を持ち、streaming ではなく、batch-slot の `rows_` 経路でもないこと。これらを満たしたときだけ `f16_enc_` が true になる。prompt 側・streaming・batch-slot の window は fp16 decode window にしない（`engine/metal/src/engine/window.cpp:1563-1565`）。
+- fp16 GEMV は `x16_kind()` が対応する量子化型（IQ4_XS、Q8_0、IQ3_XXS、IQ3_S、NVFP4、Q2_0、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K）で、さらに tile が `gemv16_tile()` の列挙に一致する場合に限る。対象外型や未対応 tile は通常の `gemv_` を選ぶ（`engine/metal/src/engine/window.cpp:178-191, 1046-1057`）。
+- routed expert の fp16 分岐はさらに限定され、resident window で、gate/up と down の両方の tensor が Q2_0、かつその layer に Hadamard の gate/up・down 処理がない場合だけ選択される。この場合 `moe_gu16_` と `moe_down16_` pipeline を使い、half activation と half の中間値を渡す（`engine/metal/src/engine/window.cpp:1353-1354, 1372-1391, 1403-1406`）。
+- `STRATA_METAL_F16=1` は `metal_f16()` の選択を pack 名に関係なく true にするが、streaming または `head` なし / `rows_` の window では上記の実行条件が成立せず、fp16 decode window は使われない。unset / 空文字の自動 ON は resident IQ3_S / Q2_0 pack 名に限る（`engine/metal/src/engine/window.cpp:167-176, 739-740, 1563-1565`）。
 
 ## 実行時の詳細
 
-Metal engine は `metal_f16()` が ON のとき `STRATA_METAL_F16` 定義つきで `quant.metal`、`units.metal`、`moe.metal`、`gemv.metal` などをコンパイルし、activation 用 buffer に half plane の領域を確保します（`metal/src/engine/window.cpp:691-699,734-741`）。window の head 有無、streaming、rows モードを評価して fp16 encoding を選び、対応する dense GEMV では `gemv16_...` kernel を dispatch します（`metal/src/engine/window.cpp:903-918,1413-1418`）。この経路の Metal kernel は重みと activation の一部を half で扱い、累積結果を float にします（`metal/kernels/gemv.metal:162-200`; 説明と演算は `metal/kernels/units.metal:324-328`）。
+`Window::init()` は model file を開き、`ExpertStream::wanted()` で streaming 状態を決めた後に `g_f16_auto` を basename と streaming 状態から更新する。その後 `metal_f16()` を使って decode 用 Metal library の prelude に `#define STRATA_METAL_F16 1` を含めるか決め、fp16 用 buffer も必要に応じて確保する（`engine/metal/src/engine/window.cpp:736-740, 791-798, 834-841`; `engine/metal/src/engine/msl_libs.h:25-29`）。
 
-対象の Q2_0 routed expert では `moe_gu16_...` / `moe_down16_...` を選び、gate/up の half 出力を down kernel に渡します（`metal/src/engine/window.cpp:1229-1263`）。それ以外の条件では通常の `gemv_...` / `moe_gu_...` / `moe_down_...` 経路を使います。
+環境変数そのものは `metal_f16()` の最初の呼び出し時に読み、以後プロセス内で cache される。window の自動判定は model open 後の init ごとに設定される。通常の単一 model 起動では engine 初期化中の評価であり、プロセス実行中に環境を書き換えても `mode` は再読込されない。CLI 引数による上書きはこの値の読み取り経路にはなく、同名の他の Strata 本番読み取り箇所も見つからなかった。
 
-この変数について、Strata は個別の有効・無効ログや無効値警告を出しません。window 初期化時の一般ログは device、モデルファイル、streaming/wrapped 状態、cell 数、PLE 状態を表示しますが、fp16 設定値は含みません（`metal/src/engine/window.cpp:870-872`）。対象外の型・window は通常経路へ進み、変数だけを理由とする終了・失敗処理は確認できません。
+各 window では `f16_enc_ = metal_f16() && head && !stream_ && !rows_` とし、dense GEMV の型・tile 条件を満たせば `gemv16_...` pipeline と half activation plane を使う。routed expert では前節の Q2_0 条件を満たす場合に fp16 分岐を選ぶ。それ以外の計算は fp32 経路を使う（`engine/metal/src/engine/window.cpp:1046-1057, 1353-1354, 1563-1565`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/MAC.md:267` は resident window の dense GEMV 型と Q2_0 routed expert、setup が resident IQ3_S / Q2_0 に ON を書くこと、config の `=0` で無効化できることを説明しています。実装では engine の直接既定値は OFF で、setup が該当 config に `1` を記載します。コードで確認できる fp16 dispatch の条件は上記の通りです。性能値や品質比較は同文書記載の測定報告であり、この調査では再測定していません。
+この変数の値や選択結果を出す専用ログ、警告、終了経路は読み取り実装とその利用箇所に見つからなかった。`window.cpp` のコメントには M5 Max 上の decode 速度・top-1 agreement・mean KL と 61-task suite の結果が記されているが、対象モデル、OS、測定回数などの条件一式はそこにないため、一般化できる測定値としては記載しない（`engine/metal/src/engine/window.cpp:159-165`）。
+
+`docs/MAC.md:281` は setup が resident IQ3_S / Q2_0 pack で ON にすると記述している。現行コード上は setup が `STRATA_METAL_F16` を書くのではなく、engine が未設定時に pack 名から自動選択する。setup が config の `env` に入れるのは `STRATA_METAL_STREAM` である（`engine/metal/setup_mac.py:593-598`）。
 
 ## 根拠
 
-- `metal/src/engine/window.cpp:119-143,691-699,734-741` — 値判定、cache、Metal library 定義、half buffer。
-- `metal/src/engine/window.cpp:903-918,1188-1199,1229-1263,1413-1418` — 対象型、tile、expert 条件、window の有効条件と dispatch。
-- `metal/kernels/gemv.metal:162-223`, `metal/kernels/units.metal:324-328` — fp16 GEMV kernel と演算経路。
-- `strata_control/mac_fit.py:59-66`, `metal/setup_mac.py:548-553` — setup が値を生成し config に書く条件。
-- `serve/server.py:4054-4067` — 親環境の継承と config env による上書き。
-- `docs/MAC.md:267` — Strata の説明資料との照合。
+- `engine/metal/src/engine/window.cpp:159-195` — fp16 経路、環境値の parse/cache、自動判定、入力形式と function constant。
+- `engine/metal/src/engine/window.cpp:714-740, 791-798, 834-841` — model open、stream 判定後の自動選択、Metal library と buffer の初期化。
+- `engine/metal/src/engine/window.cpp:1046-1057, 1353-1354, 1560-1565` — GEMV・expert の適用条件と decode window の制限。
+- `engine/metal/src/engine/msl_libs.h:25-29` — fp16 選択時の Metal library prelude。
+- `engine/metal/setup_mac.py:593-598` — setup が config に書く環境変数。

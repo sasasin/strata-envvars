@@ -1,42 +1,44 @@
 # `STRATA_NO_BATCH_KV_STEP`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Verifier と MTP drafter が、複数 token 分の K/V cache および QSA indexer の追記をまとめて行う経路を止め、token ごとの追記に戻します。Verifier では `STRATA_DEC_BATCH` による他の計算のバッチ化までは無効にしません。`src/core/verify.cpp` と `sycl/src/core/verify.cpp` の注釈は、この切替を #783 PR-d の per-token K/V と indexer append と説明しています。
+複数 token の K/V cache append と QSA indexer append を一括実行する経路を抑え、token ごとの append に切り替える診断用スイッチです。CUDA/HIP の verifier、SYCL verifier、および各 backend の MTP drafter が読みます。K/V の形式や生成設定を選ぶ変数ではなく、append の実行単位を変えます。`engine/src/core/verify.cpp:348-349`、`engine/sycl/src/core/verify.cpp:242-243`、`engine/src/core/mtp.cpp:1251-1255`、`engine/sycl/src/core/mtp.cpp:954-959`。
 
 ## 値と判定
 
-この変数は数値として parse せず、文字列の設定有無、空文字、先頭文字だけを調べます。未設定が既定です。
+各実装は値全体を parse せず、未設定でなく、空文字でなく、先頭文字が `0` でない場合に ON とします。verifier の `env_on` helper と MTP 内の判定はこの点で一致します（`engine/src/core/verify.cpp:336-339,349`、`engine/sycl/src/core/verify.cpp:151-154,243`、`engine/src/core/mtp.cpp:1252-1255`、`engine/sycl/src/core/mtp.cpp:956-959`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効。バッチ追記を許可する |
-| 空文字 | 無効。`env_on` が空文字を除外する |
-| 先頭文字が `0` | 無効。例: `0`, `0abc` |
-| 空でなく先頭文字が `0` 以外 | 有効。例: `1`, `2`, `true`, `false`, ` 0` |
+| 条件 | unset | append の一括処理を抑止する値 | 抑止しない値 |
+|---|---|---|---|
+| CUDA/HIP verifier、SYCL verifier、CUDA/HIP/SYCL MTP drafter | OFF | 空文字以外で先頭が `0` 以外。例: `1`、`2`、`true`、`off`、` 0` | 空文字、または先頭が `0`。例: `0`、`00`、`0anything` |
 
-大文字小文字や末尾文字列は検査しません。`false` も有効であり、`atoi` の 0/非 0 判定ではありません。CUDA/HIP の Verifier では `env_on()` が、SYCL の Verifier にも同じ判定が実装されています。MTP は独立した同等の判定を使います（`src/core/verify.cpp:172-182`, `sycl/src/core/verify.cpp:92-103,151-152`, `src/core/mtp.cpp:735-739`, `sycl/src/core/mtp.cpp:860-864`）。
+大文字小文字、空白、数値としての妥当性、文字列全体は検査しません。したがって `false` や `off` も ON で、先頭に空白がある ` 0` も ON です。未設定と空文字はともに OFF です。数値変換・境界値・無効値時の fallback はありません。
 
 ## 有効になる条件
 
-- Verifier の K/V と indexer の窓単位追記は、`dec_batch` が有効で、`batch_rec_` ではないときだけ通常のまとめ追記を使います。`STRATA_NO_BATCH_KV_STEP` を有効にすると、その条件でも token ごとの追記に切り替わります。`dec_batch` が無効、または `batch_rec_` のときは元から token / row ごとの経路です。複数 row の batch-rec は row ごとに異なる state を扱うため、環境変数の値にかかわらず row ごとに追記します（`src/core/verify.cpp:1263-1322`, `sycl/src/core/verify.cpp:1121-1175`）。
-- Verifier で無効にするのは K/V cache と indexer の追記単位です。たとえば `qb` による投影・norm/RoPE の複数 row 処理は別の条件で決まり、この変数だけでは無効になりません（`src/core/verify.cpp:1215-1248,1263-1322`）。
-- MTP drafter では、`record_front()` の複数 row の K/V cache 追記に使います。Q4 または INT8 cache なら、無効時に `kv_append_q4_steps` / `kv_append_q8_steps` を呼び、有効時には token ごとの `kv_append_q4_step` / `kv_append_q8_step` に進みます。その他の cache 形式はどちらの設定でも既に token ごとの `kv_append_step` です（`src/core/mtp.cpp:677,730-775`, `sycl/src/core/mtp.cpp:801,855-901`）。
-- MTP のこの分岐は、MTP drafter が実行されて `record_front()` に到達した場合に限り関係します。この cache append 経路を通らない処理には影響しません。
+- verifier では、複数行の decode window を処理し、QSA layer の K/V または indexer append がある場合に、一括 append の分岐を外します。`STRATA_DEC_BATCH=0` などで `dec_batch` が無効なら、もともと一括経路に入らず、この変数の効果はありません（`engine/src/core/verify.cpp:1488-1496,2105-2125,2350-2411`）。
+- 複数 slot の `batch_rec_` 経路では各 slot の状態を個別に扱うため、通常の K/V append は行ごとの経路です。この変数が ON の場合、`STRATA_BATCH_SLOT_RUNS` が有効でも、indexer append の同一 slot 内まとめ処理も抑止されます（`engine/src/core/verify.cpp:1494-1496,2105-2125,2376-2410`）。SYCL verifier も複数 slot 経路では K/V と indexer を行ごとに処理します（`engine/sycl/src/core/verify.cpp:1360-1421`）。
+- MTP drafter では複数行 `T` の K/V を append する時に効きます。単一行では一括処理と per-token 処理の差がありません。MTP の full layer は `T == 1` を要求しますが、K/V のみを処理する呼び出しは複数行を受け取ります（`engine/src/core/mtp.cpp:1177-1183,1246-1292`、`engine/sycl/src/core/mtp.cpp:884-892,950-996`）。
+- MTP の K/V 状態が Q4 または INT8 の場合、OFF では `kv_append_q4_steps` / `kv_append_q8_steps`、ON では token ごとの `kv_append_q4_step` / `kv_append_q8_step` に分岐します。通常 pool 形式はどちらの値でも token ごとの `kv_append_step` です（`engine/src/core/mtp.cpp:1275-1292`、`engine/sycl/src/core/mtp.cpp:979-996`）。
+- verifier で変わるのは QSA の K/V と indexer append のまとめ方です。GDN の状態処理や GR の複数行処理を無効にする変数ではありません（例: `engine/src/core/verify.cpp:2350-2411` の K/V/indexer 分岐と `engine/src/core/verify.cpp:2986` の GR 分岐）。
 
 ## 実行時の詳細
 
-CUDA/HIP と SYCL の Verifier では、`g_no_batch_kv` がファイルスコープの `const bool` として初期化されます。そのため設定は該当翻訳単位の静的初期化時に読み取られ、同じプロセスで後から環境を書き換えても再評価されません。MTP 側の `no_batch_kv` は `record_front()` 内の関数ローカル `static` で、最初にこの関数へ到達した時に読み取り、その後キャッシュされます。設定値を CLI や別の環境変数で上書きする処理はこれらの箇所にはありません。
+verifier 側は namespace scope の `const bool g_no_batch_kv` として初期化されるため、プロセス起動時に一度読み取ります。MTP 側は `record_front` 内の block-scope `static const bool` で、最初に該当処理へ入った時に一度読み、その後の変更は反映されません。CUDA/HIP と SYCL で値の判定は同じです（`engine/src/core/verify.cpp:336-349`、`engine/sycl/src/core/verify.cpp:151-154,242-243`、`engine/src/core/mtp.cpp:1246-1255`、`engine/sycl/src/core/mtp.cpp:950-959`）。
 
-バッチ追記が選ばれると、Verifier は K/V pool ごとに `kv_append_*_steps`、indexer に `native_qsa_indexer_append_steps` を呼びます。個別追記では各 row の step とデータを使って `kv_append_*_step` および `native_qsa_indexer_append` をループします。commit 時の indexer tail 更新も、無効時は step 追記、有効時は各 token の追記です（`src/core/verify.cpp:1265-1322,2008-2021`, `sycl/src/core/verify.cpp:1123-1175,1875-1887`）。
+MTP では K projection・V projection、K norm/RoPE、および必要な K/V rotation は T 行をまとめて計算するままで、変数が切り替えるのは cache append です。Q4/INT8 cache の append を T 行一括から各行の append に変えます（`engine/src/core/mtp.cpp:1246-1292`、`engine/sycl/src/core/mtp.cpp:950-996`）。
 
-環境変数に対する専用ログやエラー出力は確認できませんでした。`docs/DETAILS.md` にこの変数を直接説明する記述は見当たらず、動作の根拠は上記ソースです。
+verifier では ON にすると、decode window 用 K/V cache append の一括 branch と QSA indexer append の一括 branchを使わず、各 token の append に進みます。OFF では `dec_batch` が有効かつ `batch_rec_` でない window で一括 branch を利用できます。slot ごとの行をまとめる経路も、この変数が ON なら一行ずつになります（`engine/src/core/verify.cpp:2105-2125,2350-2411`、`engine/sycl/src/core/verify.cpp:1367-1421`）。
+
+## ログと測定値
+
+この変数の値や分岐を知らせる専用ログは見つかりませんでした。MTP append 処理中に例外が発生した場合は `record_front` の catch が `mtp: ` を先頭につけたエラー文字列を返しますが、変数固有の失敗経路ではありません（`engine/src/core/mtp.cpp:1293-1298`、`engine/sycl/src/core/mtp.cpp:997-1001`）。`docs/DETAILS.md` と `docs/BATCHING.md` にこの変数の説明はなく、`docs/bench-results/2026-10-04-community-4090-32gb-ram-512k/README.md:137-150` の PR #783 比較も PR 全体の測定で、この変数単独の効果を分けていません。そのため測定値は記載していません。
 
 ## 根拠
 
-- 値判定と Verifier のキャッシュ: `src/core/verify.cpp:172-182`, `sycl/src/core/verify.cpp:92-103,151-152`
-- Verifier の K/V と indexer append: `src/core/verify.cpp:1263-1322,2008-2021`, `sycl/src/core/verify.cpp:1121-1175,1875-1887`
-- MTP の判定と K/V append: `src/core/mtp.cpp:677,730-775`, `sycl/src/core/mtp.cpp:801,855-901`
-- バッチ計算の別条件: `src/core/verify.cpp:845,1215-1248`
+- 候補名のソース参照全件: `engine/src/core/verify.cpp:349,2106,2114,2352,2381,3473,3528`、`engine/sycl/src/core/verify.cpp:243,1369,1409,2251`、`engine/src/core/mtp.cpp:1251-1254`、`engine/sycl/src/core/mtp.cpp:955-958`。コメントにだけ現れる MTP 行を除き、各 backend の verify と MTP の実装が値を読みます。
+- 判定 helper: `engine/src/core/verify.cpp:336-339`、`engine/sycl/src/core/verify.cpp:151-154`。
+- verifier の QSA K/V・indexer append 分岐: `engine/src/core/verify.cpp:2105-2125,2350-2411,3471-3537`、`engine/sycl/src/core/verify.cpp:1367-1421,2245-2259`。
+- MTP drafter の読み取り・append 分岐: `engine/src/core/mtp.cpp:1177-1183,1246-1298`、`engine/sycl/src/core/mtp.cpp:884-892,950-1001`。

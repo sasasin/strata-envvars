@@ -1,6 +1,6 @@
 # `--mtp-window`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,49 +8,52 @@
 | コマンド | `strata`（エンジン引数） |
 | オプション | `--mtp-window` |
 | 別名 | なし |
-| 値 | 整数。MTP draft layer が参照する過去セル数の上限 |
+| 値 | 64 bit 整数。正の値がモデルの最大 context セル数未満の場合に限り、そのセル数を attention 窓にする |
 
 ## 役割
 
-MTP draft layer の attention が参照する過去セルの範囲を制限します。値は通常の推論エンジン parser で `int64_t` に変換され、MTP drafter のロード処理へ渡されます。既定値は `32768` です（`src/program/generate.cpp:681,2624`）。
+MTP draft layer が注意を向ける過去セル数を指定します。既定値は 32768 セルです。値は MTP drafter の読み込みへ渡され、attention の対象範囲と drafter 用 K/V 状態のリング容量に反映されます。これは生成対象モデル本体の context 長を設定する引数ではありません。
 
 ## 使い方
 
 ```sh
-strata --native model.gguf --mtp ./mtp-runtime --spec 4 --mtp-window 16384
+# MTP runtime を使い、draft layer の過去セル窓を 8192 にする
+strata --pack model.gguf --tokens 1,2 --mtp /path/to/mtp-runtime --spec 4 --mtp-window 8192
 ```
 
-MTP drafter を使う実行では `--mtp` と `--spec 2` 以上を指定します。`--mtp-window` 単独では drafter はロードされず、この値による MTP 動作もありません（`src/program/generate.cpp:5455-5472`）。
+`--pack`、`--tokens`、`--mtp` には実際のモデル、入力 token、MTP runtime のパスを指定してください。
 
 ## 値と既定値
 
-- 未指定時は `32768` です（`src/program/generate.cpp:681`）。
-- parser は次の引数を `std::atoll` で変換します。明示的な範囲検証や変換失敗検査はありません。したがって数値として変換できない文字列は `0` として扱われます（`src/program/generate.cpp:2418-2421,2624`）。
-- 値 `0` は window 制限を無効にし、全セルを対象にします。負数も実装上は同じく window 制限なしとして扱われます。正数が session の `max_cells` 以上の場合も制限は設定されず、全セルが対象です（`src/core/mtp.cpp:341-345,372-374`）。
-- 同じ option を複数回指定した場合、引数ループ内で値を順に代入するため最後の指定が残ります（`src/program/generate.cpp:2416-2421,2624`）。
-- 値を省略すると `next()` が `--mtp-window needs a value` を stderr に出し、終了コード `2` で終了します（`src/program/generate.cpp:2418-2420`）。
+- 値は `std::atoll` で整数化されます。parser に数値の範囲検証や変換エラー検査はありません。オプションの値が欠けている場合は `--mtp-window needs a value` を stderr に出し、終了コード 2 で終了します（`engine/src/program/generate.cpp:3842-3846,4055-4057`）。
+- 省略時は `32768` です（`engine/src/program/generate.cpp:1036-1038`、SYCL parser も `engine/sycl/src/program/generate.cpp:683-685`）。
+- loader は `0 < 値 < 最大 context セル数` の場合だけその値を採用します。0、負数、最大 context セル数以上は拒否エラーにはならず、内部値 0（全セルを対象）にします（`engine/src/core/mtp.cpp:511-517,543-547`、SYCL は `engine/sycl/src/core/mtp.cpp:483-486`）。
+- 同じ引数を複数回指定すると parser の反復中に同じ変数へ再代入されるため、最後の指定値が残ります（`engine/src/program/generate.cpp:3842-3843,4055-4057`）。
 
 ## 実行時の動作
 
-CUDA/HIP の `MtpDrafter::load()` は、`0 < window < max_cells` のときだけ `window_` に値を設定します。draft attention の各ステップではこの `window_` から window ID を生成し、その ID を使う attention 経路へ渡します。値が `0` 以下、または `max_cells` 以上なら window ID による制限を行いません（`src/core/mtp.cpp:341-345,371-374,1029-1034`; `src/kernels/cuda/verify_kernels.cu:1014-1017`）。
+CUDA/HIP と SYCL の parser は値を `Options::mtp_window` に格納し、MTP drafter の `load` に渡します。drafter は有効な正値なら `window_` に設定し、attention 用のセル ID をその幅で構成します。0 に正規化された場合は窓による絞り込みを行わず、全セルを対象にします（`engine/src/program/generate.cpp:4055-4057,8262-8265`、`engine/src/core/mtp.cpp:543-547,1342-1349`、`engine/sycl/src/program/generate.cpp:2049-2051,4539-4542`、`engine/sycl/src/core/mtp.cpp:483-486,1052-1059`）。
 
-KV streaming が有効なとき、正の window が `max_cells` 未満なら draft layer の K/V ring は `window + 4 * max_t + 64` セル分として初期化されます。制限を使わない場合の ring 引数は `0` です。window に応じて attention scratch の容量も決まり、正の window は 64 セル単位に切り上げられます（`src/core/mtp.cpp:341-345,352-364,371-374`）。ネイティブ側の割り当てが失敗した場合、`MTP` の K/V state が収まらない旨を `err` に設定し、呼び出し元はメッセージを stderr に出して終了コード `1` で終了します。pinned RAM が不足する場合は警告を出し、全 K/V を VRAM に置く fallback を試します（`src/core/mtp.cpp:352-363`; `src/program/generate.cpp:5472`）。
+窓が正値で有効な場合、CUDA/HIP loader は drafter 用 K/V を `window + 4 * max_t + 64` セルのリングとして確保しようとします。リング用 pinned RAM が足りず状態初期化に失敗した場合は警告を stderr に出し、全体を VRAM に置く状態へフォールバックします（`engine/src/core/mtp.cpp:511-535`）。SYCL loader でも同じ値を `window_` と attention 容量の計算に使います（`engine/sycl/src/core/mtp.cpp:455-485`）。
+
+通常の単体 MTP drafter と batch MTP の各 slot drafter の両方に同じ値が渡されます（CUDA/HIP: `engine/src/program/generate.cpp:8262-8265,8351-8367`、SYCL: `engine/sycl/src/program/generate.cpp:4539-4547`）。CUDA/HIP の会話設定 fingerprint にも MTP runtime が指定されている場合の値として記録されます（未指定時は `-1`、`engine/src/program/generate.cpp:14000-14011`）。
 
 ## 適用条件と副作用
 
-- `--mtp` が指定されていても `--spec < 2` なら、エンジンは `--mtp is ignored without --spec T (T >= 2)` を stderr に出して `--mtp` を無効化します。その場合 `--mtp-window` も実質的に使われません（`src/program/generate.cpp:5455-5459`）。
-- `--batch-mtp` の slot drafter も同じ `o.mtp_window` を `load()` に渡します（`src/program/generate.cpp:5520-5529`）。
-- Metal ビルドの `MtpDrafter::load()` は `window` を明示的に未使用として Metal engine の `mtp_load()` を呼びます。このソースでは Metal 側に `--mtp-window` が反映されることを確認できません（`src/core/mtp.cpp:251-258`）。
-- Qwen3.6 はモデル family switch で別 parser に移ります。Qwen3.6 の通常実行 parser に `--mtp-window` はなく、未対応引数として usage を出し終了コード `2` になります。Qwen3.6 の `--serve` 経路では未対応 option を警告付きで無視し、値らしい次引数も読み飛ばします。この別 family の MTP は `--mtp N` 形式です（`src/program/generate.cpp:2393-2406`; `src/qwen35/q36_engine.cu:3767-3773,3782-3795`）。
-- 組み込み usage/help には `--mtp-window` の項目がありません。parser には存在するため、help 出力だけではこの option を確認できません（`src/program/generate.cpp:935-948,2623-2625`）。
+- 実際に MTP runtime を読み込むには `--mtp` と `--spec` が必要です。`--mtp` を指定していても `--spec` が 2 未満なら `--mtp` は無視され、runtime はクリアされます。その経路では `--mtp-window` も drafter に適用されません（`engine/src/program/generate.cpp:8243-8248`、SYCL は `engine/sycl/src/program/generate.cpp:4525-4530`）。
+- Metal build の `MtpDrafter::load` は `window` 引数を明示的に未使用として扱い、`mtp_load` に渡しません。この build では `--mtp-window` による窓指定は適用されません（`engine/src/core/mtp.cpp:345-354`）。
+- 有効な窓は drafter の attention 対象と K/V 状態メモリの形状に影響します。具体的なメモリ量や性能差はモデル・backend・実行条件に依存し、この調査では測定していません。
 
 ## 出力とエラー
 
-parser で値が欠落した場合は終了コード `2`、未知の引数は `unknown argument: ...` と usage を stderr に出して終了コード `2` です（`src/program/generate.cpp:2418-2420,2787-2792`）。MTP の load に失敗した場合は `strata generate: <理由>` を stderr に出し、終了コード `1` です（`src/program/generate.cpp:5472`）。値の範囲だけを理由に拒否する validation は確認できません。
+- 値が欠けていると parser が stderr にエラーを出し、終了コード 2 で終了します（`engine/src/program/generate.cpp:3842-3846`）。
+- `--mtp` のロードに失敗した場合は `strata generate: <理由>` を stderr に出して終了コード 1 を返します。batch MTP slot のロード失敗も slot 番号と理由を stderr に出して終了コード 1 になります（`engine/src/program/generate.cpp:8264-8265,8362-8367`）。この引数自体に数値範囲エラーはなく、範囲外値は loader で全セル扱いに正規化されます。
 
 ## 根拠
 
-- parser・既定値・help: `src/program/generate.cpp:681,935-948,2416-2421,2623-2625`
-- MTP の適用条件と load 呼び出し: `src/program/generate.cpp:5455-5473,5520-5529`
-- window、ring、scratch の設定と attention での使用: `src/core/mtp.cpp:341-374,1029-1034,1424-1426`; `src/kernels/cuda/verify_kernels.cu:1014-1017`
-- Qwen3.6 の別 parser: `src/program/generate.cpp:2393-2406`; `src/qwen35/q36_engine.cu:3767-3795`
+- `engine/src/program/generate.cpp:1036-1038,3842-3846,4055-4057`: 既定値、引数値の取得、型変換。
+- `engine/src/program/generate.cpp:8243-8248,8262-8265,8351-8367`: MTP の有効条件と単体・batch drafter への値の転送、ロード失敗経路。
+- `engine/src/core/mtp.cpp:511-535,543-547,1342-1349`: CUDA/HIP のリング容量、RAM 不足時の fallback、窓設定と attention。
+- `engine/sycl/src/program/generate.cpp:683-685,2049-2051,4525-4547` および `engine/sycl/src/core/mtp.cpp:455-485,1052-1059`: SYCL の既定値、parser、drafter への転送と窓設定。
+- `engine/src/core/mtp.cpp:345-354`: Metal build で `window` が使用されない経路。
+- `engine/src/program/generate.cpp:14000-14011`: CUDA/HIP の会話設定 fingerprint における値の記録。

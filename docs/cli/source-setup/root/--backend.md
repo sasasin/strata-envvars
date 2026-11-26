@@ -1,70 +1,64 @@
-# `--backend`
+# `setup.py --backend`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat` 等からも同じ parser を使用） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat`（トップレベル） |
 | オプション | `--backend` |
 | 別名 | なし |
-| 値 | `cuda`、`hip`、`sycl` のいずれか。省略時は `None` |
+| 値 | `cuda`、`hip`、`sycl` のいずれか。省略時は自動選択 |
 
 ## 役割
 
-モデルの setup 時に使う GPU backend を選びます。`cuda` は NVIDIA、`hip` は AMD、`sycl` は Intel Arc の実験的な経路です。GPU 選択後は、選んだ backend に応じて GPU 検出・モデル適合判定・engine の取得またはビルドが行われます（`setup.py:8548-8551`、`setup.py:8697-8710`、`setup.py:9263-9275`）。
+利用する GPU backend を指定します。`cuda` は NVIDIA、`hip` は AMD、`sycl` は Intel Arc を選びます。`cuda` / `hip` は PC の GPU 検出結果とエンジンの取得・ビルド経路に反映されます。`sycl` は通常の CUDA/HIP セットアップを通らず、checkout では SYCL セットアップスクリプトへ委譲します（`terminal/setup.py:11601-11604`, `11635-11638`, `11781-11818`, `9597-9631`）。
 
 ## 使い方
 
-Linux で AMD 経路を明示して setup する例です。
-
 ```sh
+# Linux: AMD GPU を明示してセットアップ
 ./setup.sh --setup --backend hip
+
+# Windows: Intel Arc 用セットアップ（Linux 専用のため Windows では停止する）
+START-HERE.bat --setup --backend sycl
 ```
 
-`setup.sh` は引数を `setup.py` に渡します。Windows の `START-HERE.bat` も同じく引数を渡し、`SETUP.bat` は `--setup` を付けて委譲します（`setup.sh:6-13,76`、`START-HERE.bat:48-54`、`SETUP.bat:1-3`）。
+通常の checkout での `sycl` は Linux で実行します。たとえば `./setup.sh --setup --backend sycl --family qwen --model Q2_0` のように指定できます。`sycl` の Windows 対応はなく、Intel Arc の setup は実験的とコードに記されています（`terminal/setup.py:9297-9320`, `11635-11638`）。
 
 ## 値と既定値
 
-parser は `choices=["cuda", "hip", "sycl"]` として宣言し、既定値は明示せず `None` です。値の省略は許可されますが、値の欠落やそれ以外の文字列は `argparse` の parser error になります。短縮別名はありません（`setup.py:8548-8553`）。
-
-- `cuda`: NVIDIA 経路を選びます。省略時に NVIDIA と利用可能な AMD GPU の両方が見つかった場合に出る vendor 選択質問を通らず、NVIDIA 側へ進みます。
-- `hip`: AMD 経路を選びます。省略時も、利用可能な NVIDIA GPU がなく利用可能な AMD GPU があれば AMD が自動選択されます。
-- `sycl`: SYCL 専用 setup に引数を転送します。
-
-選択値は一つです。`argparse` の通常の単一値 action なので、同じオプションを繰り返した場合は最後の値が残ります。
+- parser は `choices=["cuda", "hip", "sycl"]` で値を制限し、既定値は指定していません（値なしは `None`）。（`terminal/setup.py:11601-11606`）
+- 未指定時は、利用可能な NVIDIA GPU がなければ利用可能な AMD GPU を選びます。両方に利用可能な GPU があれば選択を尋ね、`--yes` または `--check` のときは質問の既定値（NVIDIA）を使います。（`terminal/setup.py:11783-11815`）
+- 値の省略や `cuda` / `hip` / `sycl` 以外の値は `argparse` の parser で拒否されます。`terminal/setup.py` に独自の backend 値補正処理はありません（`terminal/setup.py:11444`, `11601-11606`）。
 
 ## 実行時の動作
 
-`hip` の場合、setup は AMD GPU を調べ、対応 GPU がなければ「no AMD GPU Strata can use」として終了します。複数カード指定 `--gpus` は Windows では拒否されます。利用可能なカードがあれば、選択カードの architecture を集め、HIP engine の既製品取得（Windows）またはソースビルド（Linux）に進みます（`setup.py:8708-8709,8731-8776`、`setup.py:9263-9275`、`setup.py:4510-4553`）。HIP 選択時はモデルの画像 reader も HIP 用の判定経路を使い、保存する run config に `backend: hip` を記録します（`setup.py:9112-9115,9597-9605`）。一部 NVIDIA 専用扱いのモデルは AMD では警告・確認を経て続行する実装です（`setup.py:8996-9003`）。
-
-`cuda` または backend 省略で NVIDIA 経路に入る場合、NVIDIA GPU が検出されなければ失敗します。`cuda` は CUDA toolkit の版を指定する値ではなく、toolkit の選択は別オプション `--cuda` が扱います（`setup.py:8787-8812`、`setup.py:8804-8806`）。backend 省略で利用可能な NVIDIA と AMD の両方がある場合は質問を表示し、`--yes` または `--check` の場合は既定の NVIDIA 選択になります（`setup.py:8710-8729`）。
-
-`sycl` は通常の CUDA/HIP の setup に入る前に `sycl/setup_intel.py` へ引数を転送します。転送時には `--backend` とその値（または `--backend=sycl`）を取り除き、それ以外の引数を残します。Windows では未対応として失敗し、スクリプトが checkout に存在しない場合も失敗します（`setup.py:8561-8564,7321-7344`）。
+- **`cuda`**: AMD への自動切り替えを抑止し、NVIDIA の GPU 検出・選択・CUDA toolkit 判定に進みます。Strata が使える NVIDIA GPU が見つからなければ停止します。`--cuda` は別オプションで、選択した GPU に対する CUDA toolkit の選択を制御します（`terminal/setup.py:11787-11795`, `11876-11898`, `11646-11649`）。
+- **`hip`**: AMD GPU の検出・選択へ進みます。NVIDIA GPU も搭載されていても AMD を選び、Strata が使える AMD GPU がなければ停止します。複数 GPU 指定時は選択した AMD GPU の architecture 群を用いてエンジンを用意します（`terminal/setup.py:11795`, `11817-11818`, `11838-11860`）。Linux ではエンジンをローカルでビルドし、Windows では用意済み HIP エンジンを取得します。Linux のビルドは `engine/` と `build-hip/` を使い、`engine/BUILD.json` に `backend: hip` 等のメタデータを書きます（`terminal/setup.py:5656-5708`, `9597-9631`）。
+- **`sycl`**: 通常の CUDA/HIP GPU 選択へ進む前に分岐します。checkout では `--backend` の値を引数列から取り除き、残りの引数を `engine/sycl/setup_intel.py` に渡します。同スクリプトがない checkout では案内を出して終了します（`terminal/setup.py:11635-11638`, `9297-9320`）。アプリ内の CONTROL モードでは Intel Arc 向けセットアップに分岐し、既存のモデルファイルを前提に pack と run 設定を準備します（`terminal/setup.py:9351-9356`, `9383-9420`）。
+- `hip` / `cuda` の選択は、モデル設定に記録される backend とも連動します。HIP または SYCL の経路では生成する run config に `backend` を設定します（`terminal/setup.py:10386-10391`, `10925-10930`）。
 
 ## 適用条件と副作用
 
-- `--backend hip` は AMD GPU の選択を固定します。対応 GPU がない場合に NVIDIA へ fallback せず失敗します。逆に `--backend cuda` で NVIDIA が見つからない場合も AMD へ fallback しません（`setup.py:8731-8750,8787-8791`）。
-- AMD の engine は Linux ではローカルで CMake build され、Windows では ready-made HIP engine を使う経路です。明示的な `--build` がなくても AMD/Linux の初回 engine 準備でビルドに進むコードがあります（`setup.py:4510-4553`、`setup.py:4320-4355`）。
-- `--backend sycl` は実験的な Intel Arc 経路で、専用スクリプトを起動します。コードの説明では Linux で oneAPI を使ってソースから構築するとされています（`setup.py:7321-7332`）。
-- `--update` と併用した場合、`sycl` は先に SYCL 専用 setup へ分岐します。一方 `cuda` / `hip` は `update_install(have, a)` に入った後、`a.backend` の参照がなく、更新処理に backend を選ばせる効果は確認できません（`setup.py:8563-8564,8617-8619`、`setup.py:6682`）。
-- macOS の `CONTROL` 経路では、backend の `sycl` 分岐より先に `mac_control_setup(a)` へ戻ります。同関数内に `a.backend` の参照はなく、Metal engine component を使うモデル準備経路なので、この条件下では `--backend` は GPU backend の選択に使われません（`setup.py:8561-8564,8236-8241`）。
-
-選択により GPU 検出、既製 engine の取得、engine のビルド、モデル/設定ファイルの準備へ進む場合があります。setup 全体の実行にはダウンロードやローカルファイル作成等も伴い得ますが、このオプション単独の影響範囲として特定できるのは backend 分岐です（`setup.py:8697-8776,9263-9275`）。
+- `hip` は AMD GPU が検出されても Strata が利用可能と判定した GPU がなければ失敗します（`terminal/setup.py:11827-11839`）。Linux では AMD エンジンのビルドに C++ compiler、git、ROCm が必要です。Windows では用意済み engine が見つからないと停止し、Windows 上でのビルドは案内されません（`terminal/setup.py:5678-5699`, `9606-9612`）。
+- `sycl` の checkout 経路は Windows で未対応として停止し、Linux で oneAPI（`icpx` と oneMKL）を使う別スクリプトへ委譲します。CONTROL モードも Linux のみです（`terminal/setup.py:9297-9308`, `9359-9362`）。Intel 経路のサポート範囲はコード上で実験的とされ、記載の動作確認対象は Arc Pro B70 と Arc A750 です（`terminal/setup.py:9301-9308`）。
+- `sycl` は macOS の CONTROL 処理より後に判定されます。通常の macOS 起動では `terminal/setup.py` が parser を構築する前に `engine/metal/setup_mac.py` に委譲し、その parser に `--backend` は定義されていません。このため本書の parser による値の説明は通常の macOS 経路には適用できません（`terminal/setup.py:11436-11437`, `engine/metal/setup_mac.py:372-402`）。
+- `--backend` は GPU の種類を選ぶもので、異なる vendor の GPU を同じモデルに混在させる指定ではありません（自動選択時の案内: `terminal/setup.py:11806-11807`）。
 
 ## 出力とエラー
 
-利用可能な NVIDIA と AMD の両方があり backend を省略したときは GPU vendor 選択を表示します。明示した backend に対応する GPU がないと `fail()` が案内文を表示して終了コード 1 で止めます。`fail()` は `[X]` メッセージと「Setup stopped」案内を出力します（`setup.py:825-830,8710-8729,8749-8750,8787-8791`）。
-
-`--backend sycl` は `subprocess.call()` の終了コードを返します。Windows 非対応、専用 setup ファイル欠落は `fail()` による終了コード 1 です（`setup.py:7328-7344`）。不正な選択肢や値の欠落では `argparse` が usage と parser error を出します（`setup.py:8548-8553`）。
+- 不正値または値なしは `argparse` の使用法エラーになります。独自の backend 固有エラー表示処理はありません（parser: `terminal/setup.py:11444`, `11601-11606`）。
+- `hip` 選択後に利用可能な AMD GPU がない場合、`fail()` が理由と案内を表示し、終了コード 1 で終了します（`terminal/setup.py:11838-11839`, `1049-1056`）。
+- Windows の `sycl` は未対応メッセージと Linux での案内を表示し、同じく `fail()` 経由で終了コード 1 になります（`terminal/setup.py:9304-9308`, `1049-1056`）。
 
 ## 根拠
 
-- parser 定義・choices・既定値: `setup.py:8548-8553`
-- 早期分岐、update 経路、backend 自動選択と GPU 条件: `setup.py:8561-8564,8617-8619,8697-8791`
-- AMD engine の構築と実行設定: `setup.py:4510-4564,9263-9275,9597-9614`
-- AMD model/vision の条件: `setup.py:8996-9003,9112-9115`
-- Intel Arc の委譲と失敗条件: `setup.py:7321-7344`
-- wrapper の引数委譲: `setup.sh:6-13,76`、`START-HERE.bat:48-54`、`SETUP.bat:1-3`
-
-この調査では checkout 内のソースと文書索引を確認しました。同一 revision の `--help` は実行しておらず、Release 配布物も照合していません。
+- `terminal/setup.py:11601-11606` — `--backend` の parser 定義、値の choices、既定値なし。
+- `terminal/setup.py:11635-11638` — `sycl` の早期分岐と CONTROL / checkout の振り分け。
+- `terminal/setup.py:11781-11818` — GPU 検出、未指定時の選択、HIP 経路の決定。
+- `terminal/setup.py:11838-11898` — AMD GPU 不在時の停止と NVIDIA 経路。
+- `terminal/setup.py:5656-5708`, `9597-9631` — HIP engine のビルド・取得経路と生成物。
+- `terminal/setup.py:9297-9320`, `9351-9362`, `9383-9420` — SYCL の委譲、Windows / OS 条件、CONTROL モードの処理。
+- `terminal/setup.py:10386-10391`, `10925-10930` — 生成 run config への backend 設定。
+- `engine/metal/setup_mac.py:372-402` — macOS 側 parser の引数定義（`--backend` は含まない）。

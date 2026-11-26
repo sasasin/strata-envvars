@@ -1,43 +1,56 @@
 # `STRATA_ADAPT_JOB_CPU`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-非同期 adaptive tier のバックグラウンド `JobThread` を、指定した論理 CPU に配置する。スレッドが実行するのは adaptive tier のコピーやメモリーコピー処理で、変数は tier の有効化や swap の選択自体を変えない。`--adapt-async 1` が有効で、非同期 tier の `JobThread` が実際に作られた場合にだけ読まれる。
+`--serve` の adaptive tier を非同期実行するときに作られるコピー用バックグラウンドスレッド `JobThread` の配置先論理 CPU を指定する。値が 0 以上なら `strata::kernels::cpu::pin_current_thread(cpu)` に渡す。これは adaptive tier の有効化や交換動作自体を切り替える設定ではなく、スレッドの CPU 配置だけを変える（`engine/src/program/generate.cpp:2454-2458,2503-2512,15598-15612`、SYCL 版は `engine/sycl/src/program/generate.cpp:1393-1398,1442-1448`）。
+
+CUDA 系と SYCL 系の生成コードに読み取り箇所が一つずつある。CUDA 系では `--adapt-async`（または自動選択）が非同期 tier を選び、利用可能な適応対象がある場合に `JobThread` を生成する。CUDA 側の arena 経路も対象になる。SYCL 版は `--serve` と resident RAM mode などの条件を満たし、適応対象の使用量・交換領域がある場合に生成する（`engine/src/program/generate.cpp:11774-11811,15598-15612`、`engine/sycl/src/program/generate.cpp:7063-7081,9072-9080`）。
 
 ## 値と判定
 
-| 環境変数の状態・値 | `atoi` の結果と処理 |
-|---|---|
-| 未設定 | Windows では `smt_spare_cpu()` が選ぶ CPU を使う。Linux では同関数が `-1` を返し、CUDA/HIP 系では `--aux-cpus` のスレッド配置へ委ねる。SYCL 系ではこの箇所で追加の pin をしない。 |
-| `-1` など負数 | `cpu < 0` となり、明示的な CPU pin をしない。CUDA/HIP 系では明示設定ありとして補助 CPU の対象外にする。SYCL 系では対象外登録もない。 |
-| `0` 以上の整数 | その番号を論理 CPU として `pin_current_thread(cpu)` に渡す。CUDA/HIP 系では明示設定ありとして補助 CPU の対象外にする。 |
-| 空文字、数字で始まらない文字列 | `atoi` が `0` を返すため、CPU 0 への pin を試みる。 |
-| 数字の後ろに文字が続く値 | 数字の先頭部分が変換される。たとえば `12junk` は `12`。空白と符号も `atoi` の規則で処理される。 |
+両実装ともスレッドの `loop()` 開始時に `std::getenv` で値を読み、設定されていれば `std::atoi`、未設定なら OS 別の既定候補を使う。文字列全体の検査、変換失敗の検出、範囲検証はない。`atoi` の変換により、先頭空白と符号付き整数の後ろにある文字は無視される。空文字や整数として始まらない文字列は 0 相当になり、したがって CPU 0 を指定する。負値は pin 呼び出しをしない。
 
-コードは文字列全体の検証、範囲制限、無効値の fallback をしていない。したがって、CPU 番号が実行環境で有効かは pin の成否による。CPU 配置 helper が失敗した場合、以前の配置を保ち、OS 別の `strata cpu pool: ... affinity ... failed ...; previous ... kept` 警告を stderr に出す。`atoi` で `int` に表現できない値の結果はここでは規定しない。
+| 実装・条件 | unset | 設定時に有効になる値 | 設定時に pin しない値 |
+|---|---|---|---|
+| CUDA 系、Windows | `smt_spare_cpu()` が返す候補。複数論理 CPU を持つ物理 core のうち最後に見つかった core の2番目の論理 CPU。候補なしなら `-1` | `atoi` 結果が `0` 以上（例: `3`, `+3`, `3tail`, ` 3`） | `atoi` 結果が負（例: `-1`, `-2x`） |
+| CUDA 系、Windows 以外 | 既定候補 `-1`。`--aux-cpus` が有効なら後述の補助 CPU 配置へ回る | 同上 | 同上 |
+| SYCL、Windows | CUDA 系と同じ Windows 候補 | `atoi` 結果が `0` 以上 | `atoi` 結果が負 |
+| SYCL、Windows 以外 | 既定候補 `-1`。このコードでは補助 CPU への代替 pin は行わない | `atoi` 結果が `0` 以上 | `atoi` 結果が負 |
+
+空文字、`true`、`false`、`x`、`0anything` は `atoi` 結果が 0 となり、CPU 0 を要求する。`-1` と `-1tail` は pin しない。数値部分の桁あふれを含め、入力を安全な範囲か検査する処理はこの読み取り箇所にない（`engine/src/program/generate.cpp:2480-2501,2508-2512`、`engine/sycl/src/program/generate.cpp:1419-1440,1445-1448`）。
+
+`--adapt-async` や `STRATA_ADAPT_ASYNC` は非同期 tier の選択に関係し、本変数の値を上書きしない。適応 tier を非同期にしない指定・条件では `JobThread` 自体が作られず、本変数は読まれない。`--aux-cpus` / `STRATA_AUX_CPUS` は CUDA 系で未設定時の補助配置に関係するが、明示した本変数の CPU 番号より優先しない（`engine/src/program/generate.cpp:4715-4725,2508-2512,15598-15612`）。
 
 ## 有効になる条件
 
-- native CUDA/HIP 系では `--adapt-async 1` が要求され、`--serve`、adaptive tier の `--adapt-every` / swap 数、resident RAM mode (`--resident-experts`) などの条件を満たす必要がある。batch group、peer device、remote expert 経路などでは非同期 tier が blocking tier に切り替わる。環境変数自体はこれらの条件を上書きしない。
-- `JobThread` の生成時には、usage 情報があり、resident complement が準備済みで、exchange buffer 容量が必要量以上であることも確認する。
-- `smt_spare_cpu()` の自動選択は Windows のみ。二つ以上の論理 CPU がある物理 core のうち、host/pool の割当を避ける最後の spare SMT sibling を返す実装で、取得に失敗すると `-1`。他 OS では常に `-1`。
-- Linux の native CUDA/HIP 系は、CPU を自動選択できないとき `STRATA_AUX_CPUS` / `--aux-cpus` が有効なら、その補助 CPU set へ移動する。変数が明示設定されている場合は `note_owned_thread()` に登録し、後続の aux thread sweep がこのスレッドを移動しない。SYCL 側の同じ `JobThread` にはこの登録・補助 CPU fallback がない。
+- 値を読むには、非同期 adaptive tier 用 `JobThread` が生成される必要がある。CUDA 系では `--serve`、適応周期と swap 数が有効、resident RAM mode または arena などの条件を満たし、実際に適応対象があり、必要な交換容量があることが関係する。CUDA 系の制約には peer device / remote expert optimization、複数 GPU arena などの除外がある（`engine/src/program/generate.cpp:11774-11811,15598-15612`）。
+- SYCL 版では非同期 tier は resident RAM mode が必要で、`--batch`、pipeline windows、peer device、remote expert optimization などでは停止される。実際の `JobThread` 生成には適応対象と交換容量も必要（`engine/sycl/src/program/generate.cpp:7063-7081,9072-9080`）。
+- 値は job thread の起動時に一度読む。以後の request ごとに再読込せず、スレッド稼働中にプロセス環境を変更してもそのスレッドには反映されない（`engine/src/program/generate.cpp:2458,2503-2512`、`engine/sycl/src/program/generate.cpp:1397,1442-1448`）。
+- pin の失敗は機能全体を止める条件ではない。`pin_current_thread` は失敗を stderr に出して以前の配置を保ち、呼び出し側は戻り値を無視して job loop を続ける（`engine/src/kernels/cpu/pool.cpp:699-722`）。
+- CUDA 系で変数が設定されていれば、CPU 値が負または pin に失敗した場合も `note_owned_thread()` を呼び、補助 CPU 管理にその thread を委ねない。変数が未設定で候補が負なら `strata::aux_cpus::pin_current_thread()` に委ねる。SYCL 系にはこの分岐がなく、設定値が負なら追加 pin をしない（`engine/src/program/generate.cpp:2508-2512`、`engine/sycl/src/program/generate.cpp:1445-1448`）。
 
 ## 実行時の詳細
 
-環境値は `JobThread` のワーカースレッドが起動し、`loop()` に入ったときに一度だけ読み取る。コンストラクタがスレッドを作った後、ループ開始時に `getenv` を呼び、設定値なら `atoi`、未設定なら Windows の自動選択を行う。その後はジョブ待機ループに入るため、スレッド作成後に環境を変更しても配置は再評価されない。子プロセスへの転送や書き換えはない。
+`JobThread` のコンストラクターが `std::thread` を開始し、そのスレッドが `loop()` に入ると thread 名を設定（CUDA 系のみ）してから環境変数を読み取る。値が 0 以上なら `pin_current_thread` を呼び、その後は条件変数で job を待ち、受け取ったコピー処理を逐次実行する。この設定が変えるのはそのスレッドの CPU 配置であり、コード上、adaptive tier の選択結果やコピー内容を変更する処理ではない（`engine/src/program/generate.cpp:2456-2458,2503-2524`、`engine/sycl/src/program/generate.cpp:1395-1398,1442-1459`）。
 
-native CUDA/HIP 系の `loop()` は、CPU 番号が非負なら `strata::kernels::cpu::pin_current_thread()` を呼ぶ（失敗結果は呼び出し側で無視するが、helper は警告を出す）。設定値が存在する場合は、その数値が負でも `note_owned_thread()` を呼び、Linux の aux sweep に移動されないようにする。未設定かつ自動選択不能なら `strata::aux_cpus::pin_current_thread()` を呼ぶ。補助 CPU 機能が無効ならこの呼び出しは何もしない。
+読み取り箇所では CPU 番号の範囲や利用可否を検証しない。番号の変換後にプラットフォーム helper が配置を試み、そこで設定に失敗すると以前の配置を維持して、スレッドは job 処理を続ける。macOS を含め、OS ごとの pin 実装差は `pin_current_thread` に委譲される（`engine/src/kernels/cpu/pool.cpp:699-722`）。
 
-SYCL 系の `JobThread` も環境値を同じ `getenv` / `atoi` で読み、非負値を CPU pin helper に渡す。未設定時の Windows 自動選択処理は native 版と共通だが、SYCL 版のループには `note_owned_thread()` と `aux_cpus::pin_current_thread()` の分岐がない。
+## ログと測定値
+
+本変数を読み取ったことや設定値そのものを知らせるログはない。pin に失敗した場合は `engine/src/kernels/cpu/pool.cpp:706-708,717-718` の helper が次の形式を stderr に出す。失敗しても呼び出し元は処理を続ける。
+
+- Windows: `strata cpu pool: host CPU Set selection for processor %d failed: %lu; previous placement kept`
+- その他の pin 対応実装: `strata cpu pool: host affinity for CPU %d failed: %d; previous affinity kept`
+
+この環境変数に関する測定値は、参照した Strata 資料に記載がない。
 
 ## 根拠
 
-- native CUDA/HIP 系の値読み取り、配置、aux CPU 登録: `src/program/generate.cpp:1411-1444`。ワーカースレッドの生成条件: `src/program/generate.cpp:8642-8649`。
-- `--adapt-async` が blocking tier に戻る条件: `src/program/generate.cpp:6676-6700`。通常の適用条件の説明: `docs/DETAILS.md:168-179`。
-- SYCL 系の値読み取り・配置と、`JobThread` の生成: `sycl/src/program/generate.cpp:1334-1365`, `sycl/src/program/generate.cpp:8072-8079`。
-- CPU affinity helper の失敗時ログと既存配置の維持: `src/kernels/cpu/pool.cpp:363-386`。
-- Linux aux thread の登録と未登録 thread の移動: `include/strata/platform/aux_cpus.hpp:234-260`。他 OS では aux helper が空実装: `include/strata/platform/aux_cpus.hpp:344-357`。
-- Strata の thread-placement 文書も、明示した `STRATA_ADAPT_JOB_CPU` が adaptive tier の job thread に優先すると説明する: `docs/DETAILS.md:1744-1763`。文書には文字列変換の細則はないため、上表はソースの `atoi` 呼び出しに基づく。
+- `engine/src/program/generate.cpp:2480-2512` — Windows 既定候補、変数読み取り、pin と CUDA 系の補助 CPU 管理分岐。
+- `engine/sycl/src/program/generate.cpp:1419-1448` — SYCL 版の既定候補と変数読み取り・pin。
+- `engine/src/program/generate.cpp:11774-11811,15598-15612` — CUDA 系の非同期 tier 適用条件と JobThread 生成。
+- `engine/sycl/src/program/generate.cpp:7063-7081,9072-9080` — SYCL 版の適用条件と JobThread 生成。
+- `engine/src/kernels/cpu/pool.cpp:699-722` — pin 失敗時のログと以前の配置の維持。
+- `docs/DETAILS.md:1435-1444` — 補助 CPU 配置との関係を確認する設計資料。挙動の根拠は上記ソースコード。

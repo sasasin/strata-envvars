@@ -1,57 +1,59 @@
 # `STRATA_DENSE_F32`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。作業開始時の Strata は `main`、作業ツリーは clean。外部ライブラリ自身の環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-実験用 CUDA ビルドの FP16 入力 GEMM のうち、限定された大きな dense projection を FP32 へ変換した入力で `cublasSgemm` に計算させます。対象外の形状では従来の FP16 入力 `cublasGemmEx` に進みます。Strata が環境変数を読むのはこの切り替え判定であり、cuBLAS 内部の動作は説明対象にしません。
+CUDA の実験的 `STRATA_EXPERIMENTAL_SM60` ビルドで、条件に合う大きな FP16 dense prefill GEMM を、FP16 入力のまま行う `cublasGemmEx` から、FP16 operand を FP32 に変換して行う `cublasSgemm` に切り替える opt-in 変数です。Strata が環境変数を読むのは `engine/src/prefill/gemm.cu` の `dense_f32_on()` です。重み・活性値は FP16 のまま保持され、対象 GEMM の前に FP32 の scratch へ変換されます。通常の decode や条件に合わない GEMM を切り替える設定ではありません。`Gemm::f16` が prefill の gate/up・down projection 等から呼ばれます（`engine/src/prefill/prefill.cpp:7465-7480, 8903-8910`、切替本体は `engine/src/prefill/gemm.cu:1329-1356`）。
 
 ## 値と判定
 
-`std::atoi(v) != 0` で判定し、文字列全体の妥当性は検査しません。未設定・空文字・数値変換結果が 0 の値は無効です。先頭の空白や符号を含む整数を `atoi` が変換でき、数値の後ろに文字があっても数値部分で判定します（例: `01`、`1anything`、`-1` は有効、`0anything`、`false`、`anything`、空文字は無効）。大文字小文字の比較はありません。
+環境変数は `std::getenv` で取得し、未設定かどうかを調べたうえで `std::atoi(v) != 0` とします。文字列全体の妥当性検査や `1` との等値比較はありません。`atoi` が先頭の空白後に整数として読める接頭辞を変換するため、`1abc` は有効、`0anything` は無効、`true` や空文字は 0 になります。負数を含む非ゼロ整数は有効です。数値への変換ができない文字列も 0 です。数値範囲の検証・clamp はありません（`engine/src/prefill/gemm.cu:995-1004`）。
 
-| 条件 | 結果 |
-|---|---|
-| 変数 unset | 無効 |
-| 空文字、`0`、数値で始まらない文字列 | 無効（`atoi` の結果が 0） |
-| `atoi` の結果が 0 以外 | 候補として有効。さらに下記の GPU・形状条件を満たす必要がある |
+| 条件（build / device） | unset | 有効になる値の例 | 無効になる値の例 |
+|---|---|---|---|
+| CUDA、`STRATA_EXPERIMENTAL_SM60` 定義あり、実行 device が compute capability 6.x | off | `1`, `2`, `-1`, `1abc` | 空文字, `0`, `0anything`, `true`, `false`, `abc` |
+| 上記 build だが device が 6.x 以外 | off | `atoi` が非ゼロでも切替経路では off | どの値でも切替なし |
+| `STRATA_EXPERIMENTAL_SM60` なし、または HIP build | この読み取り・切替コードがコンパイルされない | 該当なし | 該当なし |
 
-環境値の判定結果は関数内 `static const bool` に一度保存されます。初回の適格な呼び出しで評価された後は、同じプロセス内で環境を変更しても再評価されません。ソース内の `gemm_set_dense_f32()` は parity 用の上書き口で、通常の `strata` 実行経路から呼び出されていません。
+既定は off です。CLI 引数や設定ファイルによる上書きはこの実装にはありません。`gemm_set_dense_f32()` は parity 用の API で、通常の Strata 実行経路からの呼び出しは見つかりません。`gemm_f32_parity` は比較のため `0` / `1` を強制し、最後に `-1` で環境変数判定に戻します（`engine/src/prefill/gemm.cu:1020-1024`、`engine/src/prefill/gemm_f32_parity.cu:89-92, 108-126`）。
 
 ## 有効になる条件
 
-すべて満たす必要があります。
+- CMake の CUDA build で `STRATA_EXPERIMENTAL_SM60=ON` が指定されている必要があります。このオプションは Pascal / Volta 向けの実験的 build で、CUDA 12.x toolkit が必要とされています（`engine/cmake/backends/cuda.cmake:28, 47-57, 76-80`）。HIP は対象外です（`engine/src/prefill/gemm.cu:1020-1024, 1329-1329`）。
+- `dense_f32_on()` が使う現在 device の compute capability が 6.0 以上 7.0 未満である必要があります。よって Volta 7.x では、この環境変数が非ゼロでも通常経路になります。compute capability の取得結果は device ごとに cache されます（`engine/src/prefill/gemm.cu:928-945, 1003-1005`）。
+- `Gemm::f16` が呼ばれ、`beta == 0.0f` である必要があります（`engine/src/prefill/gemm.cu:1329-1332`）。
+- GEMM の `(N, K)` が次のいずれかで、`T` が下限以上である必要があります（`engine/src/prefill/gemm.cu:1006-1016, 1331-1332`）。
 
-- CUDA でビルドされ、`STRATA_EXPERIMENTAL_SM60` がコンパイル時に定義されている。通常の ready-made engine ではこの実験コードは含まれません。CMake の実験オプションは CUDA 12.x を要する Pascal / Volta 向けビルドとして説明されています。
-- 実行中の現在デバイスの compute capability が `60` 以上 `70` 未満（6.x）。したがって Volta の 7.0 は CMake の実験ビルド対象でも、この環境変数による FP32 GEMM 経路の対象外です。デバイス属性取得に失敗した場合は 0 として扱われ、経路は無効です。
-- `Gemm::f16()` に渡される `beta` が `0.0f`。
-- `(N,K)` とトークン数 `T` が次のいずれか。
+  | N | K | 最小 T |
+  |---:|---:|---:|
+  | 10240 または 12288 | 2560 | 256 |
+  | 6144 | 2560 | 512 |
+  | 2560 | 6144 または 4096 | 4096 |
 
-| `N` | `K` | 最小 `T` |
-|---:|---:|---:|
-| 10240 または 12288 | 2560 | 256 |
-| 6144 | 2560 | 512 |
-| 2560 | 6144 または 4096 | 4096 |
-
-同じ `K` を持つ行スライスなどでも、表にない `(N,K)` は対象になりません。`beta` が 0 以外、`T` がしきい値未満、または GPU・ビルド条件が不足する場合はこの経路を使いません。HIP 側にはこの環境変数の判定・切り替えはありません。
+- shape が条件を満たしても、FP32 変換用 CUDA buffer の確保に失敗すれば FP16 `cublasGemmEx` に進みます（`engine/src/prefill/gemm.cu:960-967, 1332-1356`）。
+- 他の環境変数による上書き条件はありません。`STRATA_DENSE_F32` の読み取り箇所はこの CUDA 実装だけです。
 
 ## 実行時の詳細
 
-`Gemm::native()` は重みを FP16 scratch に dequantize した後、`Gemm::f16()` を呼びます。`Gemm::f16()` は対象条件を満たすと重みと入力を FP32 コピーへ変換し、`cublasSgemm` を実行して通常の FP16 `cublasGemmEx` 経路を飛ばします。重みは全体、入力は最大 64 MiB 相当の FP32 スライスに分けます。切り替え時に stderr へ一度だけ `prefill gemm: the dense projections' FP16 GEMMs run as cublasSgemm on FP32 copies (STRATA_DENSE_F32=1; gemm_f32_parity checks the bits against this cuBLAS)` を出します。
+環境値は `dense_f32_on()` 内の関数ローカル `static const bool` で初回評価時に一度だけ読みます。通常実行では、最初に対象 shape の `Gemm::f16` が判定に達した時点が初回評価です。その後プロセス内で環境を変更しても反映されません。parity 用 setter は環境値より優先しますが、通常の production 呼び出し経路で setter は使われていません（`engine/src/prefill/gemm.cu:995-1005, 1020-1024`）。
 
-変換用 GPU バッファが不足して拡張に失敗した場合は CUDA の直近エラーをクリアして、この FP32 経路を諦め、後続の FP16 `cublasGemmEx` に進みます。GPU メモリ不足によるこの分岐では、上記の切り替えログは出ません。
+切替経路では FP16 の重み全体と、最大 16M 要素単位の活性値 slice を FP32 scratch に変換し、slice ごとに `cublasSgemm` を呼びます。成功すれば通常の FP16 GEMM 呼び出しを返し、確保できなければ FP16 `cublasGemmEx` に fallback します。切替経路に入って最初に buffer 確保が成功したとき、stderr に次の文言を一度出します（`engine/src/prefill/gemm.cu:969, 1332-1356`）。
 
-## 文書・測定値との照合
+```text
+prefill gemm: the dense projections' FP16 GEMMs run as cublasSgemm on FP32 copies (STRATA_DENSE_F32=1; gemm_f32_parity checks the bits against this cuBLAS)
+```
 
-`docs/OLDER_GPUS.md` は、P40 と cuBLAS 12.4.5.8 での測定として、対象 GEMM の `cublasSgemm` 化、`gemm_f32_parity` による 5,201 チャンクサイズの bitwise 一致、7K prompt の測定結果を記載しています。同文書は一致が cuBLAS ビルドに依存すると説明し、利用する toolkit のライブラリで parity を実行してから有効化するよう案内しています。これは資料に記載された P40 / cuBLAS 12.4.5.8 の結果であり、他の GPU・cuBLAS ビルドでの一致や性能を保証するものではありません。調査では GPU 実行や性能測定を行っていません。
+このログが出るのは該当経路が実際に選ばれて buffer 確保も成功した場合だけです。切替した `cublasSgemm` が失敗すると `ck()` が stderr に `prefill gemm: cublasSgemm (FP16 operands, STRATA_DENSE_F32): cuBLAS status <番号>` を出し、終了コード 1 でプロセスを終了します（`engine/src/prefill/gemm.cu:160-165, 1349-1352`）。
+
+## ログと測定値
+
+`gemm.cu` のコメントは Tesla P40（sm_61）と cuBLAS 12.4.5.8 での測定として、指定した projection shape / chunk size では FP32 route と FP16 call の出力が bitwise 一致したと記しています。また、T が小さい一部 shape では cuBLAS が別 kernel family に切り替わり bit が異なるため、この変数の経路を適用しない、と説明しています。これは当該測定条件についてのソースコメントであり、別 GPU・別 cuBLAS build での一致保証ではありません（`engine/src/prefill/gemm.cu:972-986, 1006-1015`）。性能値はここでは一般化しません。
 
 ## 根拠
 
-- `src/prefill/gemm.cu:543-577` — コンパイル条件、環境変数の `atoi` 判定、compute capability 条件。
-- `src/prefill/gemm.cu:578-588` — 対象形状と最小チャンク長。
-- `src/prefill/gemm.cu:728-782` — `Gemm::f16()` の条件、変換・分割・`cublasSgemm` 呼び出し、失敗時の fallback とログ。
-- `src/prefill/gemm.cu:901-953` — `Gemm::native()` が重みを FP16 に dequantize して `f16()` を呼ぶ経路。
-- `src/prefill/gemm.cu:500-517` — compute capability の取得とデバイスごとの cache。
-- `CMakeLists.txt:148-198,607-624` — 実験ビルドの条件と `strata_prefill` への実装組み込み。
-- `include/strata/prefill/gemm.hpp:92-96` — setter の既定値と parity 用途。
-- `docs/OLDER_GPUS.md:122-126,128-134` — 文書化された測定条件、結果と適用上の注意。
+- 値の読み取り・cache・device 判定・shape 閾値: `engine/src/prefill/gemm.cu:995-1017`
+- CUDA build 条件: `engine/cmake/backends/cuda.cmake:28-80`
+- FP32 変換、切替、fallback、ログ、cuBLAS エラー: `engine/src/prefill/gemm.cu:960-967, 1329-1356, 160-165`
+- 通常 prefill からの `Gemm::f16` 呼び出し例: `engine/src/prefill/prefill.cpp:7465-7480, 8903-8910`
+- parity 用 setter: `engine/src/prefill/gemm.cu:1020-1024`、`engine/src/prefill/gemm_f32_parity.cu:89-127`

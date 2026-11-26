@@ -1,39 +1,49 @@
 # `STRATA_RSS_TRACE`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`strata generate` / `strata serve` の初期化中に、プロセスの `/proc/self/status` から `RssFile` を読み、stderr に GiB 表示する診断用スイッチです。CUDA 版と SYCL 版の `generate.cpp` に同じ実装があります。環境変数は計測処理を有効にするだけで、モデル読み込み、arena 解放、prefetch、GPU 実行の選択は変えません。
+`rss_probe()` が呼ばれた時点で `/proc/self/status` の `RssFile` 行を読み、`strata rss:` の診断行を stderr に出すためのスイッチです。CUDA/HIP 系と SYCL 系の `engine/.../program/generate.cpp` に同じ実装があります。値は設定有無だけに使われ、モデル処理、arena の release、prefetch の条件や内容はこの変数では変わりません（`engine/src/program/generate.cpp:659-672,11022-11045`、`engine/sycl/src/program/generate.cpp:303-316,6505-6528`）。
 
 ## 値と判定
 
-| 状態 | 動作 |
-|---|---|
-| 未設定 | 計測しない |
-| 空文字を含む何らかの値が設定済み | 計測する |
+両 backend とも `std::getenv("STRATA_RSS_TRACE") != nullptr` だけで判定します。未設定なら無効、環境に存在すれば値の文字列を調べず有効です。したがって空文字、`0`、`1`、`true`、`false`、`0anything` のいずれも有効です。数値変換、文字列比較、大文字小文字変換、空白除去、値域検査、無効値警告はありません（`engine/src/program/generate.cpp:660-662`、`engine/sycl/src/program/generate.cpp:304-306`）。
 
-値の文字列、数値、大文字小文字は parse しません。`std::getenv(...) != nullptr` の設定有無だけで判定します。その判定は `rss_probe()` の最初の呼び出し時に `static const bool` として保存され、以後同じプロセス内では再評価されません。最初の呼び出し後に環境を書き換えても動作は変わりません。
+| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP 系 | 無効 | 空文字を含む任意の値 | なし（設定済みなら有効） |
+| SYCL 系 | 無効 | 空文字を含む任意の値 | なし（設定済みなら有効） |
+
+CPU-only build にはこの `rss_probe()` 実装がありません。
 
 ## 有効になる条件
 
-`rss_probe()` は CUDA と SYCL の生成コードにあります。Linux の `/proc/self/status` を開く実装で、ファイルを開けない環境では何も出力しません。したがって環境変数を設定しても `/proc` が利用できなければ観測結果はありません。
-
-呼び出し箇所は、expert arena の解放前・解放後・prefetch hint 後、serve の prompt path 初期化後、および serve 起動時に VRAM 空きが 256 MiB 以上と報告された場合の `serving` 記録です。各パスに到達しない場合、その地点の記録も出ません。
+- CUDA/HIP 系または SYCL 系の `generate.cpp` を含むエンジンであること。SYCL は別 backend のビルド経路です（`engine/CMakeLists.txt:20-32`）。
+- `rss_probe()` の呼び出し地点まで実行が到達すること。arena release 前後と prefetch hints 後の3回は `graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr` の経路内です（CUDA/HIP: `engine/src/program/generate.cpp:10997-11000,11022-11045`; SYCL: `engine/sycl/src/program/generate.cpp:6483-6485,6505-6528`）。prompt path の初期化後にも呼ばれます（CUDA/HIP: `engine/src/program/generate.cpp:12995`; SYCL: `engine/sycl/src/program/generate.cpp:7478`）。
+- `serving` の記録は、起動後の VRAM 空き量が `free_mib >= 256` の分岐でのみ呼ばれます。低い場合の警告・案内分岐では呼ばれません（CUDA/HIP: `engine/src/program/generate.cpp:16089-16120`; SYCL: `engine/sycl/src/program/generate.cpp:9480-9494`）。
+- 実装は `/proc/self/status` を開こうとします。ファイルを開けない環境（たとえば `/proc` を提供しない OS や実行環境）では、設定値があっても `rss_probe()` はログなしで戻ります（CUDA/HIP: `engine/src/program/generate.cpp:663-664`; SYCL: `engine/sycl/src/program/generate.cpp:307-308`）。
+- CLI 引数、モデル形式、サーバー設定、別の環境変数による値の上書きはありません。呼び出し条件を満たさない実行ではこの変数は観測可能な効果を持ちません。
 
 ## 実行時の詳細
 
-計測時は `/proc/self/status` を読み、`RssFile:` で始まる行を探します。行が見つかるとコロン以降を `atoll` で数値化し、KiB 値を `1024 * 1024` で割って GiB として、次の形式で stderr に出力して flush します。
+設定有無は `rss_probe()` 内の関数ローカル `static const bool` に保存され、プロセス内で最初にこの関数が呼ばれた時に一度だけ評価されます。その後の環境変更は反映されません。初回呼び出しより前に環境が変更されていた場合は、その時点の状態で評価されます。各呼び出しでは有効時に `/proc/self/status` を開き、先頭から `RssFile:` で始まる行を探し、続く数値を `std::atoll` で kB として読みます。arena の release 前後や prompt path 設定後など、呼び出し地点ごとに同じ読み取りを行います（CUDA/HIP: `engine/src/program/generate.cpp:660-670`; SYCL: `engine/sycl/src/program/generate.cpp:304-314`）。
+
+ファイルを開けなければその呼び出しは何も出力せず終了します。ファイルは開けたが `RssFile:` 行がなければ初期値 `-1` のまま GiB 換算され、通常の出力処理へ進みます。arena 操作の成否や後続処理をこの probe の読み取り結果で分岐させるコードはありません（CUDA/HIP: `engine/src/program/generate.cpp:663-672`; SYCL: `engine/sycl/src/program/generate.cpp:307-316`）。
+
+## ログと測定値
+
+`/proc/self/status` を開けた場合、stderr に次の形式で出力し、直後に flush します（CUDA/HIP: `engine/src/program/generate.cpp:670-671`; SYCL: `engine/sycl/src/program/generate.cpp:314-315`）。
 
 ```text
-strata rss: <地点>: RssFile <値> GiB
+strata rss: <呼び出し地点>: RssFile <GiBを小数点以下2桁で表示> GiB
 ```
 
-これはプロセス全体の file-backed resident memory の値です。arena だけを識別して測る実装ではありません。`RssFile:` 行が見つからない場合は初期値 `-1` のまま表示され得ます。`/proc/self/status` を開けなかった場合は静かに return します。この関数は測定値に基づく分岐やエラー終了を行いません。
+呼び出し地点の文字列は `before the release`、`after the release`、`after the prefetch hints`、`the prompt path set up`、`serving` です。Strata の測定条件付き性能値はこの変数の実装箇所にありません。このログは `RssFile` の観測値であり、変数を設定したこと自体によるメモリ量や性能の変化を示すものではありません。
 
 ## 根拠
 
-- `src/program/generate.cpp:229-242` と `sycl/src/program/generate.cpp:271-284`: 設定有無の判定、`/proc/self/status` の読み取り、単位変換、stderr 出力。
-- `src/program/generate.cpp:6193-6212` と `sycl/src/program/generate.cpp:5842-5861`: arena 解放・prefetch の前後での呼び出し。
-- `src/program/generate.cpp:7259,9035` と `sycl/src/program/generate.cpp:6811,8440`: prompt path 初期化後と serve 起動時の呼び出し。`serving` の呼び出しは GPU 空き容量が 256 MiB 以上の分岐内。
-- `docs/DETAILS.md` と関連ドキュメントには `STRATA_RSS_TRACE` の説明は見つかりませんでした。上記は対象 HEAD のコードに基づく記述です。
+- 値の読み取り、static cache、`/proc/self/status` の走査と出力: `engine/src/program/generate.cpp:659-672`、`engine/sycl/src/program/generate.cpp:303-316`。
+- arena release/prefetch 経路: `engine/src/program/generate.cpp:10997-11045`、`engine/sycl/src/program/generate.cpp:6483-6528`。
+- prompt path と serving の呼び出し: `engine/src/program/generate.cpp:12995,16089-16120`、`engine/sycl/src/program/generate.cpp:7478,9480-9494`。
+- SYCL が別 backend として選択される build 経路: `engine/CMakeLists.txt:20-32`。

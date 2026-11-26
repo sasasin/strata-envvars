@@ -1,47 +1,48 @@
 # `STRATA_REQUIRE_SIGNED_COMPONENTS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata Control が engine component の manifest 署名検証で、署名なし・検証不能の package を許すかを制御します。主にインストール済み engine component の解決時に、署名なしを許さず `IntegrityProblem` にするための設定です。GPU engine 自身が読む変数ではありません。
-
-更新でダウンロードした package、ユーザーが選んだ package、および DeepSeek engine package の導入では、呼び出し側がこの値を `"1"` に上書きして `verify_signature()` に渡すため、プロセス環境での設定値にかかわらず署名が必須です。
+Terminal 側のコンポーネント検査で、署名のないパッケージと、署名付きでもこのビルドで検証できないパッケージを受け入れるかを制御する。対象は `terminal/strata_control/engine_component.py` の `verify_signature()` で、Strata エンジンとモデル形状用エンジンのコンポーネント選択・起動検査に使われる。署名が存在し検証器が利用可能な場合は、変数の値にかかわらず署名を検証し、不正な署名を拒否する。`terminal/strata_control/updater.py` の取得・オフライン導入ではこの環境値をそのまま採用せず、検証時に必ず `"1"` を渡すため、未署名・検証不能パッケージは常に拒否される（`terminal/strata_control/engine_component.py:386-413,1265-1267`, `terminal/strata_control/updater.py:842-851,1687-1696`）。
 
 ## 値と判定
 
-`strata_control/engine_component.py` の `verify_signature()` は、明示された `environ` がなければ呼び出し時点の `os.environ` を使い、値に `.strip().lower()` を適用して文字列全体を `("1", "true", "yes", "on")` と照合します（`strata_control/engine_component.py:348-356`）。
+`verify_signature(component, environ=None)` は、`environ` が省略された場合 `os.environ` を使い、キーがなければ空文字を既定値として取得する。値の前後の空白を除去してから小文字化し、結果が `1`、`true`、`yes`、`on` のいずれかと完全一致するときだけ署名必須とする。数値変換ではなく文字列比較であり、大文字小文字は区別しない。設定後に環境値を読み直すたびに判定し、値を関数内に保存する cache はない（`terminal/strata_control/engine_component.py:386-390`）。
 
-| 入力値 | 署名必須 | 判定 |
-|---|---:|---|
-| 未設定 | いいえ | 空文字列を既定値にして判定 |
-| 空文字列または空白だけ | いいえ | `.strip()` 後に空文字列 |
-| `1`, `true`, `yes`, `on` | はい | 大文字小文字を問わず、前後の空白を除いた全体一致 |
-| 上記以外（例: `0`, `false`, `2`, `true-more`） | いいえ | truthy/falsy 変換や数値変換はしない |
+| 条件 | 未設定 | 有効になる値の例 | 無効になる値の例 |
+| --- | --- | --- | --- |
+| 通常のコンポーネント検査（`environ` 省略） | 空文字扱い、署名必須ではない | `1`, ` TRUE `, `yes`, `On` | 空文字, `0`, `false`, `0anything`, `truex`, `y`, `2` |
+| updater の取得・導入検査 | この環境変数の値によらず署名必須 | updater が渡す `"1"` | 該当なし（呼び出し時に値を上書き） |
+| `tools/docker/fetch-engines.py` のパッケージ確認 | この環境変数の値によらず署名必須 | 呼び出し側が渡す `"1"` | 該当なし（呼び出し時に値を上書き） |
 
-したがって、値が無効な文字列でもエラーにはならず、署名を必須にしない側へ進みます。パッケージに署名があれば、必須設定の有無にかかわらず、登録済み verifier がある場合は検証されます（同 `:353-375`）。
+値が有効な場合、署名なしなら `the package is not signed and this PC requires signed components`、署名付きだが検証器が得られない場合は `the package is signed but this build cannot check signatures yet` という `IntegrityProblem` を送出する。署名付きで検証器があれば通常どおり検証し、検証失敗は値が無効でも拒否する（`terminal/strata_control/engine_component.py:391-412`）。
 
 ## 有効になる条件
 
-- 通常の component 解決では、`resolve()` が対象 PC に適合する package を検査するとき `verify_signature(item)` を呼び、既定の `os.environ` を使用します。バックエンド、platform、GPU architecture、driver、runtime の条件で package をその検査より前に除外する場合は、その package について署名判定に進みません（`strata_control/engine_component.py:909-963`）。
-- `strata update` の取得 package とローカル package 導入は `ctx.environ` をコピーした辞書に `STRATA_REQUIRE_SIGNED_COMPONENTS: "1"` を設定して検証します（`strata_control/updater.py:688-695,1189-1196`）。
-- DeepSeek engine の手動導入も `os.environ` のコピーに `"1"` を設定し（`strata_control/dsv41_engine.py:113-120`）、`docker/fetch-engines.py` はこの変数だけを含む辞書で `"1"` を渡します（`docker/fetch-engines.py:86-95`）。
-
-この判定に OS、GPU backend、build macro、CLI 引数による追加条件はありません。通常解決時の設定は呼び出しごとに評価され、環境値をプロセス内でキャッシュするコードはありません。明示的な `environ` が渡されたときはその辞書だけを参照します（`strata_control/engine_component.py:348-352`）。
+- `engine_component.resolve()` が環境を明示して `verify_signature()` を呼ばない場合に、現在のプロセス環境が使われる。適合するインストール済みパッケージの署名を確認し、設定が有効なら未署名・検証不能をその候補の失敗理由にする（`terminal/strata_control/engine_component.py:1209-1215,1235-1269`）。
+- 起動時に run config が `component:` 参照を指定すると `expand()` がコンポーネントを解決する。通常エンジンとモデル形状用エンジンの双方がこの resolver を使う（`terminal/strata_control/engine_component.py:1319-1337`）。実行開始前の preflight も同じ参照を展開し、`EngineMissing` を起動エラーにする（`terminal/strata_control/runtime.py:511-527`）。
+- `strata components add-build` が登録するローカルビルドには署名がなく、登録時はファイル整合性を確認するだけで署名検査を呼ばない。そのビルドはこの設定が有効な状態で後から選択・起動しようとすると拒否される（`terminal/strata_control/local_engine.py:127-173`, `terminal/strata_control/engine_component.py:1265-1276`）。
+- この判定に OS、GPU backend、build macro、サーバーモード、CLI オプション、モデル状態による分岐はない。これらは resolver が候補コンポーネントを選ぶ条件にはなり得るが、署名必須の値規則は変えない。
+- updater のダウンロード後の導入確認とローカルアーカイブ導入では、`ctx.environ` の内容をコピーした辞書に対象キーを `"1"` で上書きして渡す。したがって `"0"` や未設定を含む利用者環境の値で弱められない（`terminal/strata_control/updater.py:842-851,1687-1696`）。Docker 用 `fetch-engines.py` も明示的に `{ec.ENV_REQUIRE_SIGNED: "1"}` を渡す（`tools/docker/fetch-engines.py:109-118`）。
+- CLI 引数や設定ファイルからこの値を上書きする処理は、確認した読み取り・呼び出し経路にはない。更新時の上書きは updater 内の固定値である。
 
 ## 実行時の詳細
 
-署名がない package で必須判定が真なら、`IntegrityProblem("the package is not signed and this PC requires signed components")` を送出します。署名付きでも verifier が用意できず、信頼鍵の読み込み後も verifier がない場合は、必須時に `IntegrityProblem("the package is signed but this build cannot check signatures yet")` となります。信頼鍵を読めない場合や署名不一致も別の `IntegrityProblem` です（`strata_control/engine_component.py:353-375`）。
+環境値は `verify_signature()` の呼び出しごとに読み、変数自体の値は cache しない。署名検証器 `_verifier` は別のプロセス内状態で、署名付きコンポーネントに対して未登録なら `signing.ensure_component_verifier()` を呼ぶ。署名がなく署名必須でもない場合は検証器の確保を行わず `"unsigned"` を返す。署名付きで verifier がない場合、署名必須なら拒否し、そうでなければ `"unverified"` を返す。verifier があれば署名を検査し `"verified"` を返す（`terminal/strata_control/engine_component.py:391-413`）。
 
-通常の `resolve()` はこの問題を package ごとの理由に加え、適合する package がすべて integrity check に失敗した場合は `EngineIntegrityError` として送出します。例外メッセージは「The engine package failed its integrity check, so it was not started: ...」で始まり、その engine は起動されません（`strata_control/engine_component.py:91-107,961-972`）。
+起動時の resolver は、OS・backend・runtime・GPU 世代・driver に適合する候補に対して署名確認とファイル検査を行う。不適合候補は署名検査まで進まず、候補の確認に失敗した場合は理由に加える。適合候補がすべて integrity check に失敗すると `EngineIntegrityError` になり、そのパッケージを起動しない（`terminal/strata_control/engine_component.py:1235-1277`）。`EngineIntegrityError` は exit code 5 の `EngineMissing` 系であり、エラー文には `The engine package failed its integrity check, so it was not started:` と修復案が含まれる（`terminal/strata_control/engine_component.py:70-105`）。
 
-更新経路では `UpdateError` に包まれ、取得 package は `the package failed its check: ...`、ローカル package は `this file did not pass the security check, so it was not used (...)` として拒否されます（`strata_control/updater.py:692-695,1193-1196`）。DeepSeek engine の手動導入は理由を `emit()` に出し、導入せず `None` を返します（`strata_control/dsv41_engine.py:116-120`）。Docker fetch は `SystemExit` にして `fetch-engines: <folder> failed its check: ...` を表示します（`docker/fetch-engines.py:89-92`）。
+## ログと測定値
+
+この変数単独で出す警告ログは確認できない。拒否時は上記の `IntegrityProblem` の理由が resolver のエラーに含まれ、起動 preflight では `ProfileError` に変換されて exit code 5 で起動を止める（`terminal/strata_control/engine_component.py:1265-1277`, `terminal/strata_control/runtime.py:524-527`）。updater の取得検査では `the package failed its check: ...` を含む `UpdateError`（exit code 5）、オフライン導入では `this file did not pass the security check, so it was not used (...)` を含む `UpdateError`（exit code 5）になる（`terminal/strata_control/updater.py:846-849,1691-1694`）。測定値は該当しない。
 
 ## 根拠
 
-- `strata_control/engine_component.py:61,348-375` — 名前定数、環境値の取得・parse、未署名／未検証／署名不一致の処理。
-- `strata_control/engine_component.py:909-986` — 通常の engine 解決時の署名検査と失敗の集約。
-- `strata_control/updater.py:663-702,1162-1198` — 更新 package とローカル archive の検査で値を `"1"` に固定し、失敗時に拒否。
-- `strata_control/dsv41_engine.py:74-122` — DeepSeek engine 手動導入で `"1"` を設定し、失敗時は導入しない。
-- `docker/fetch-engines.py:74-95` — 同梱 fetch tool の検査で `"1"` を渡し、失敗時に終了。
-- `packaging/ENGINE-COMPONENT.md:24-34` — package 検査の説明。ここでは `=1` と略記されていますが、実装は `1/true/yes/on`（前後空白除去・大文字小文字無視）を受け付けます。
+- `terminal/strata_control/engine_component.py:55-62,386-413` — 変数名、値の取得・判定、署名の分岐。
+- `terminal/strata_control/engine_component.py:1209-1215,1235-1290,1319-1337` — 候補解決と起動参照での適用、拒否の伝播。
+- `terminal/strata_control/engine_component.py:70-105` — integrity error の文言と exit code。
+- `terminal/strata_control/runtime.py:511-527` — 起動前 preflight とエラー変換。
+- `terminal/strata_control/updater.py:816-851,1660-1696` — ダウンロード・オフライン導入での署名必須の上書きと失敗。
+- `tools/docker/fetch-engines.py:109-118` — Docker 用取得ツールでの固定値。
+- `terminal/strata_control/engine_library.py:231-254,296-312` — エンジン切替時にも通常環境で署名検査する経路。

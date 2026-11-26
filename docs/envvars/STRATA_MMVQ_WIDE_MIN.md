@@ -1,50 +1,43 @@
 # `STRATA_MMVQ_WIDE_MIN`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL backend のネイティブ Q6_K 行列ベクトル・行列行列積（MMVQ）で、wide Q6_K kernel を選ぶための `n_out` の下限を指定します。対象の読み取り箇所は `sycl/src/kernels/cuda/native_mmvq.dp.cpp` の1か所です。このソースは SYCL の `_kernel_cu` 群に含まれる `native_mmvq` の実装です（`sycl/CMakeLists.txt:205-213`）。
+SYCL エンジンの Q6_K MMVQ で wide カーネルを選ぶ最小出力行数 `n_out` を指定する。条件を満たすと 16-byte-load の Q6_K wide カーネルを起動し、満たさない場合は rowwarp または通常の Q6_K MMVQ に進む。CUDA/HIP など他 backend の実装ではこの変数を読まない。`native_mmvq` は GGML type 14 を `native_q6_k_mmvq` に渡す（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3935-3956,4204-4217`）。
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換されます。文字列全体の妥当性検査はありません。先頭の空白と符号の後にある10進数字列が変換され、数字列の後ろは無視されます。数字が始まらない値（空文字を含む）は `0` になります。負数もそのまま閾値として使われ、通常の正の `n_out` はすべて `n_out >= wide_min` を満たします。変換後に値域チェックや clamp はありません。
+最初に通常の Q6_K MMVQ 判定まで到達したとき、関数内 `static const int` として一度だけ読み取る。設定されていれば `std::atoi` の結果を閾値にし、設定値の全体検証、範囲検査、clamp はしない。`atoi` は数値の接頭部分を変換するため、空文字や数字で始まらない値は `0`、`4096tail` は `4096` になる。符号や先行空白も `atoi` の変換規則に従う。数値変換できない文字列をエラーにはしない（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3943-3945`）。
 
-| 環境変数の状態 | `wide_min` |
-|---|---:|
-| 未設定 | `STRATA_MMVQ_A2` が有効なら `0`、無効なら `4096` |
-| 設定あり（空文字を含む） | `atoi` の結果。空文字・数字で始まらない値は `0` |
-| 数字の後ろに文字が続く | 数字部分の値（例: `2048xyz` は `2048`） |
+| 条件 | 未設定 | 設定時に有効になる値 | 設定時に閾値が `0` になる例 |
+|---|---:|---|---|
+| `STRATA_MMVQ_A2` が未設定、または `atoi` 結果が非ゼロ | `0` | `n_out >= atoi(値)`。例: `4096` は 4096 行以上 | `0`, `0tail`, 空文字, `true`, `abc` |
+| `STRATA_MMVQ_A2` が設定され、`atoi` 結果が `0` | `4096` | 同上。例: `4096` は 4096 行以上 | 同上 |
 
-`STRATA_MMVQ_A2` 自体は別の関数内で、未設定なら有効、設定時は `atoi(value) != 0` で判定されます。したがって `STRATA_MMVQ_A2=0` では wide kernel の既定下限が `4096` になります。`STRATA_MMVQ_WIDE_MIN` に明示値があれば、その値がこの既定値に優先します。
+`STRATA_MMVQ_A2` は unset なら有効、設定時は `atoi` の結果が非ゼロの場合だけ有効であり、同じく関数内 static に cache される。したがって `STRATA_MMVQ_WIDE_MIN` が未設定の場合の既定値は A2 の状態で変わる。WIDE_MIN を明示した場合はその変換値が優先される。`n_out` が閾値と等しい場合も条件を満たし、負の閾値も拒否・補正されない（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1545-1548,3943-3945`）。
 
 ## 有効になる条件
 
-`wide_min` の判定だけでは wide kernel の起動は決まりません。Q6_K の呼び出しで、先行する packed-weight 経路が処理を終えず、次の条件も満たす必要があります。
-
-- `STRATA_MMVQ_WIDE` による wide 経路が有効。未設定なら有効、設定時は `atoi(value) != 0`。
-- `1 <= ncols <= wide_maxc`。`wide_maxc` は `STRATA_MMVQ_WIDE_MAXC` の明示値、または `STRATA_MMVQ_A2` が有効なら `8`、無効なら `4`。
-- `n_in` が `256` の倍数。
-- `n_out >= wide_min`。
-
-従って、この変数は出力行数のゲートだけを変えます。たとえば閾値を `0` にしても、wide 経路が無効、列数が上限外、または入力幅が256の倍数でなければ wide kernel には進みません。条件に合わない場合、実装は後続の row-warp 経路または通常の Q6_K MMVQ 経路に進みます。なお `n_out <= 0` の検査は wide 分岐より後にあります。通常の正の形状では問題になりませんが、異常な `n_out` と負の閾値を同時に渡すと wide 分岐の条件式を通る可能性があり、通常の不正形状検査に先行します。
+- `engine/sycl/CMakeLists.txt` が `native_mmvq.cu` の移行済みソースとしてビルドする SYCL エンジン実装でのみ有効（同ファイル `:273-286`）。OS ごとの条件はない。
+- Q6_K の `native_q6_k_mmvq` に到達し、先行する packed Q6_K または planar Q6_K の経路が行列を処理しないこと。これらは登録済み重みを見つけると wide 閾値判定より先に return する（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2876-2900,3007-3034,3935-3939`）。
+- `STRATA_MMVQ_WIDE` が有効であること。未設定なら有効、設定時は `atoi` の結果が非ゼロで有効。さらに `ncols` が `1..wide_maxc`、`n_in` が 256 の倍数、`n_out >= wide_min` であること。`STRATA_MMVQ_WIDE_MAXC` 未設定時の上限は A2 有効時 `8`、無効時 `4`。どれかを満たさない場合 wide カーネルは選ばれない（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2185,3943-3959`）。
+- 閾値条件を満たさず wide を選ばない場合も、`ncols <= 4`、`STRATA_MMVQ_WIDE_RPW` の値が正、`n_in` が 256 の倍数なら rowwarp 経路が先に試される。それ以外は検証後、複数列なら multi kernel、1 列なら通常 kernel に進む（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1631-1634,3958-4023`）。
+- `STRATA_MMVQ_WIDE_MIN` を指定する CLI 引数や、別設定からの上書きはこの判定にはない。
 
 ## 実行時の詳細
 
-`native_q6_k_mmvq()` は最初に `q6_packed_mmvq()` を試し、登録済み packed weight が一致するなどの条件を満たせば、その経路から戻ります。この場合 `STRATA_MMVQ_WIDE_MIN` の値は参照されません。packed 経路が処理しなかった場合に限り、`wide_min` と `wide_maxc` の関数内 `static const` が初回評価されます。値はそのプロセスでキャッシュされ、後から環境を変更しても再評価されません。
+`native_q6_k_mmvq` はまず packed / planar 行列経路を試し、そのいずれも処理しなかった場合に `wide_min` と `wide_maxc` を初期化する。`wide_min` は最初の到達時に環境を読み、そのプロセス内では再読込しない。起動後に環境を変更しても反映されない。閾値を満たし、wide 全体の条件も通ると `ncols` に応じた `launch_q6k_wide<1..8>` を起動して戻る。wide 以外の経路では、上記 rowwarp の条件を試した後、入力形状を検証し通常 Q6_K カーネルを選ぶ（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3935-4023`）。
 
-条件を満たしたときは `ncols` に応じて `launch_q6k_wide<1..8>()` を選びます。wide kernel 内では別設定 `STRATA_MMVQ_WIDE_RPW` が行あたりの処理行数を選び、`STRATA_MMVQ_PF` が正の値なら先読み用kernel経路に分岐します。これらは `wide_min` の条件を置き換えません。
+出力行数の閾値以外に、モデル種別やサーバーモードによる専用条件はない。実際に Q6_K MMVQ が呼ばれる場面に適用され、SYCL の dense native MMVQ では GGML type 14 がこの関数へ dispatch される（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:4169-4223`）。
 
-変数の読み取りや閾値選択について、専用ログ・警告・エラー出力は見つかりませんでした。コード上、値は kernel 選択にだけ使われます。`native_mmvq()` は GGML type `14` を `native_q6_k_mmvq()` に渡し、モデル層からは `sycl/src/core/layer.cpp:147-161` でネイティブ MMVQ が呼ばれます。
+## ログと測定値
+
+この変数の値や閾値判定を出力するログはない。Strata の `docs/DETAILS.md` にこの変数の既定値や測定値の記載はなく、数値性能は本調査では主張しない。
 
 ## 根拠
 
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1534-1537`: `STRATA_MMVQ_A2` の未設定時既定値と `atoi != 0` 判定。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1989`: `STRATA_MMVQ_WIDE` の未設定時既定値と設定値の判定。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:2699-2722`: packed Q6_K 経路が成立する条件と成功時の早期 return。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:3426-3458`: packed 経路の後の `wide_min` 読み取り、wide kernel 選択条件、後続経路。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1689-1695,1701-1735`: wide Q6_K kernel 内の `STRATA_MMVQ_PF` / `STRATA_MMVQ_WIDE_RPW` の分岐。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:3685-3702`: GGML type `14` の Q6_K dispatch。
-- `sycl/CMakeLists.txt:88-106,205-214`, `sycl/src/core/layer.cpp:147-161`: `.cu` 指定から migrated `.dp.cpp` へのソース解決、SYCL kernel 群への `native_mmvq` 登録、層処理からの呼び出し。
-
-`docs/DETAILS.md` と `docs/INTEL.md` を確認しましたが、`STRATA_MMVQ_WIDE_MIN` の直接説明は見つかりませんでした。性能値はこの変数の資料には記載していません。
+- 読み取り、A2 による既定値、wide の dispatch 条件と後続 fallback: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1545-1548,3935-4023`
+- Q6_K 型からの dispatch: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:4169-4223`
+- SYCL build における移行済みソースの選択と登録: `engine/sycl/CMakeLists.txt:273-286`
+- packed / planar 登録行列が先に処理される条件: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2876-2900,3007-3034`

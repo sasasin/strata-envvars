@@ -1,48 +1,46 @@
 # `STRATA_MMQ_DIRECT`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の prompt 用 MoE MMQ で、常駐 expert の重みを一時的な group buffer に gather せず、expert cache slot 内のデータを直接 MMQ に渡す機能を選びます。対象は native pack のうち pointer-table MMQ が対応する形式・layer です。ストリームから届いた expert、peer GPU 上の expert、pointer-table 非対応形式などは引き続き gather されます。
+この checkout で環境から値を読む箇所は、`STRATA_EXPERT_NIBBLE=1` の起動可否を調べる `nib::env_conflicts()` にある。値が非ゼロなら、4-bit expert slot を GGUF block として読む prompt MMQ と競合すると判定し、`STRATA_EXPERT_NIBBLE` をその起動に限って無効にする。通常の生成をこの変数が直接切り替える読み取り箇所は確認できない。`engine/include/strata/prefill/moe_mmq.hpp` などには MMQ の in-place 読み取りを説明する記述があるが、現行ソース全体で `STRATA_MMQ_DIRECT` を `getenv` や env helper に渡す MMQ 制御の呼び出しは見つからなかった。実際に確認できる読み取りと分岐は `engine/include/strata/core/expert_nibble.hpp:277-298` である。
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換され、結果が `1` または `2` の場合だけ候補モードになります。文字列全体の検証はしません。したがって `1tail` や先頭空白付きの ` 1` は 1、`2xyz` は 2、空文字・数値で始まらない文字列・`0`・負値は 0 として扱われます。未設定時も 0 です。判定結果は `direct_mode()` 内の `static const int` に保存されるため、最初の呼び出し後に環境を変更しても再評価されません。
+`env_conflicts()` 内の `set` helper は `std::getenv(n)` を呼び、未設定または空文字列なら `nullptr` として扱う。`STRATA_MMQ_DIRECT` の値が非空の場合だけ `std::atoi(v) != 0` を調べ、真なら競合理由を返す（`engine/include/strata/core/expert_nibble.hpp:277-284`）。文字列全体の数値検証はせず、`atoi` の整数接頭辞変換に従う。したがって、例として `1`, `2`, `-1`, ` 1x` は非ゼロ、`0`, `0anything`, `true`, 空文字列、未設定はこの条件を満たさない。大文字小文字の比較や範囲 clamp はない。
 
-| 判定値 | 動作 |
-|---|---|
-| 0（未設定、無効値を含む） | 従来の gather 経路。slot guard も追加しない |
-| 1 | guard を確保し、条件を満たす常駐 expert を slot 内から直接読む |
-| 2 | guard を確保するが、従来どおり gather する。A/B 比較用 |
-
-有効な 1 または 2 でも pointer-table MMQ がビルドに含まれない場合は 0 に戻り、stderr に `strata: STRATA_MMQ_DIRECT=%d is ignored: this build has no pointer-table MMQ (CUDA with STRATA_MMQ_TAB only)` と出します。無効値はこの警告を出しません。
+| 条件 | unset | 競合になる値 | 競合にならない値 |
+|---|---|---|---|
+| `STRATA_EXPERT_NIBBLE` の起動判定で helper が呼ばれる場合 | 競合なし | `atoi` が非ゼロを返す非空文字列（例 `1`, `-1`, ` 1x`） | 空文字列、`atoi` が 0 を返す文字列（例 `0`, `0anything`, `true`） |
+| `STRATA_EXPERT_NIBBLE` を要求しない場合 | 読み取りなし | 該当なし | 該当なし |
 
 ## 有効になる条件
 
-- CUDA の pointer-table MMQ がビルドされている必要があります。CMake option `STRATA_MMQ_TAB` は既定 OFF で、CUDA のみが対象です。設定 ON でも、CMake が検査する llama.cpp `mmq.cuh` の scheduler fingerprint が対応済みでない場合は feature を OFF にして configure 時に理由を表示します（`CMakeLists.txt:1606-1645`）。
-- 実際の prompt 経路で MMQ が使われる必要があります。`STRATA_PREFILL_MMQ` が無効な場合、MMQ plan が有効にならず直接読み取りは行いません。ただし `STRATA_MMQ_DIRECT` が 1/2 なら、native pack では `slot_guard_bytes()` が 256 bytes を返し、cache 作成時に guard を要求します。そのため直接読み取りがない場合も cache slot の room に影響することがあります。
-- mode 1 は native expert layout のみを走査し、各 layer の gate/up と down の両方が pointer-table MMQ の形式・shape 条件を満たすこと、gate/up の over-read がないこと、down の over-read が 256-byte slot guard 内であること、blob の各 weight offset/size が MMQ matrix の配置と一致することを確認します。合わない layer は gather のままです。pointer-table は native pack の Q2_0、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_NL、IQ4_XS、Q8_0 向けで、Q5_0 と K-quants は対象外です。
-- slot に guard の余裕がない場合や expert blob のアラインメント条件を満たさない場合も、その expert は gather に fallback します。常駐かつ slot 内に必要な余裕があるときだけ直接読みます。
-- HIP、gfx906、SYCL、および pointer-table MMQ を含まない build では有効になりません。非 CUDA 側の stub は `direct_mode()` を常に 0 にします。
+- `STRATA_EXPERT_NIBBLE` が設定値 `1` で要求されていること。設定の判定は `config()` に一度だけ保存され、空文字列と文字列 `0` は off、文字列 `1` は on、それ以外の非空値は設定エラーになる（`engine/include/strata/core/expert_nibble.hpp:238-268`）。`nib::env_conflicts()` は `nibble_refusal()` の中から呼ばれるため、nibble を要求しない通常起動ではこの変数も読まれない（`engine/src/program/generate.cpp:3408-3413, 3430, 5474-5478`）。
+- ビルドが nibble 対応でない場合や、CUDA デバイスがない／全 CUDA デバイスが compute capability 6.0 でない場合、`nibble_refusal()` は環境競合 helper より先に理由を返す。その場合、この呼び出しでは `STRATA_MMQ_DIRECT` の値を調べない（`engine/src/program/generate.cpp:3411-3430`）。
+- helper が実行され、`STRATA_MMQ_DIRECT` が非空かつ `atoi` 非ゼロなら、`nib::env_conflicts()` は他の環境変数判定より先にこの競合理由を返す。後続には `STRATA_PREFILL_MMQ`、`STRATA_PF_FUSED`、`STRATA_FS_SLOTS`、`STRATA_EXPERT_V2`、`STRATA_KV_GROW`、`STRATA_EXP_MODE` の判定がある。CLI の `--peer-device`、remote expert cache、`--kv-grow`、`--vram-elastic` の判定はこの helper の後に行われる（`engine/include/strata/core/expert_nibble.hpp:282-298`; `engine/src/program/generate.cpp:3430-3440`）。
+- この変数単独で expert cache の容量、prompt の MMQ 経路、生成 token の選択を変える動作は確認できない。`direct_mode()` の呼び出しはあるが、リポジトリ内で見つかった実装定義は MMQ 非搭載時の stub で、いずれも `0` を返す。MMQ 搭載時の実装を含む `STRATA_MMQ_DIRECT` の直接読取箇所は現行ソースから確認できない（`engine/src/prefill/prefill.cpp:144-178`; `engine/src/prefill/mmq_absent.cpp:38-45`）。
 
 ## 実行時の詳細
 
-`direct_mode()` は `src/prefill/moe_mmq.cu` から呼ばれ、mode 1/2 なら `kSlotGuard`（256 bytes）を返します。generate は native pack の cache slot を作る際にこの guard 要求を渡します。mode 1 では `mmq_plan()` が layer ごとの適用可否を一度計算し、適用できる layer 数と合計を stderr に表示します。prompt の各 MMQ group では、cache slot に blob 末尾から必要な guard bytes までの room があり、アドレスも 16-byte 条件を満たす常駐 expert の pointer を table に設定します。down product が読む可能性のある slot tail は group 処理前に zero-fill します。その他の expert は元の group buffer へ gather します。
+`nib::env_conflicts()` はキャッシュしない helper で、呼ばれるたびに環境を読み直す。ただし確認した呼び出し元 `nibble_refusal()` は `generate.cpp` の起動処理で `STRATA_EXPERT_NIBBLE` が要求された場合に一度呼ばれるため、生成中の環境変更を反映する経路はない。非ゼロ値が競合理由になった場合、呼び出し元は nibble layer 設定を消し、起動を拒否せず GGUF block の expert slot のまま処理を続ける（`engine/src/program/generate.cpp:5474-5489`）。
 
-generate の prompt 完了ログでは、直接読んだ expert があれば `prompt MMQ read ... of the ... resident experts in their slots (STRATA_MMQ_DIRECT)` と出ます。任意の `STRATA_MMQ_DIRECT_LOG` は mode 1 の場合にだけステージ別累計を追加表示します。これは別変数のため、本書ではその値の parse 詳細は扱いません。
+変数名を含む他の参照は、cache の slot guard、MMQ pointer table、prompt の統計や設定登録に関するコメント・宣言・ログ文字列である。これらの記述や `direct_mode()` の利用箇所だけから、`STRATA_MMQ_DIRECT` が in-place MMQ 読み取りを有効にすると断定できる環境読取実装は確認できない。特に `direct_mode()` の具体的な定義として追えたものは MMQ がない場合の stub のみであり、この checkout ではその制御の値判定や有効条件を裏付けられない（`engine/include/strata/prefill/moe_mmq.hpp:146-172`; `engine/src/prefill/prefill.cpp:149-177`; `engine/src/prefill/mmq_absent.cpp:38-45`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/DETAILS.md` は mode 2 を guard layout を使う gather 基準経路と説明し、mode 1 と同じ計算結果になること、4x RTX 3090 の UD-IQ4_XS 条件での prompt 時間比較を記載しています。測定条件は `--trim-stage-weights --batch 16`、全 expert 常駐、engine を直接駆動、各条件の中央値 8 回です。記載値は 170-token prompt で 331→251 ms と 369→290 ms の2系列、1,217-token prompt で 773→634 ms と 838→675 ms の2系列です。これは同資料に記録された結果であり、今回の調査で性能を再測定したものではありません。
+非ゼロ値が nibble の起動判定で競合した場合、stderr に次の警告を出し、この起動では nibble を off にして続行する。
+
+```text
+strata generate: WARNING: STRATA_EXPERT_NIBBLE is off for this start: STRATA_MMQ_DIRECT (the prompt MMQ would read a converted slot in place as GGUF blocks); the expert slots stay GGUF blocks
+```
+
+実装の書式文字列は `engine/src/program/generate.cpp:5485-5489`、理由文字列は `engine/include/strata/core/expert_nibble.hpp:282-284`。この変数による直接 MMQ 動作や性能測定値を記述した、現行ソースと条件を照合できる Strata 資料は確認できなかったため、測定値は記載しない。
 
 ## 根拠
 
-- `src/prefill/moe_mmq.cu:541-556` — 環境変数の parse、対応値、build 不対応時の警告、guard サイズ。
-- `include/strata/prefill/moe_mmq.hpp:139-160` — pointer-table 条件、対応形式、mode の仕様と既定値。
-- `CMakeLists.txt:88-96,1606-1645` — option の既定値、fingerprint による無効化、compile definition。
-- `src/prefill/prefill.cpp:1129-1174` — prompt MMQ plan、native layer の判定、適用数ログ。
-- `src/prefill/prefill.cpp:4203-4279` — 常駐 expert の slot 直接読み、slot tail 条件、gather fallback と group 処理。
-- `src/program/generate.cpp:3258-3262,5908-5915,6172-6175,15014-15023` — cache slot guard の受け渡しと prompt 後のログ。
-- `src/core/expert_cache.cpp:570`、`include/strata/core/expert_cache.hpp:227-233` — sized slot の guard と末尾アドレス取得。
-- `docs/DETAILS.md:1925-1954` — 設計説明、記録済みの測定と exactness 条件。
+- `engine/include/strata/core/expert_nibble.hpp:277-298` — `getenv` を呼ぶ helper、空文字の除外、`atoi` 判定、理由文字列と他環境変数との判定順。
+- `engine/src/program/generate.cpp:3408-3440, 5474-5489` — 起動時の呼び出し条件、先行条件、警告後に nibble を無効にして続行する処理。
+- `engine/src/prefill/prefill.cpp:149-178`; `engine/src/prefill/mmq_absent.cpp:38-45` — 確認できた MMQ fallback stub の定義。
+- `engine/include/strata/prefill/moe_mmq.hpp:146-172`; `engine/src/prefill/prefill.cpp:2142-2161, 7111-7113` — MMQ direct 機能に関する宣言・利用側の参照。ただし環境値の直接読取実装を示す箇所ではない。

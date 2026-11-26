@@ -1,62 +1,55 @@
 # `--cpu-threads`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` の Qwen3.6 専用 parser（単独 executable は `strata-q36`） |
+| コマンド | `strata` / `strata-q36`（Qwen3.6 専用 parser） |
 | オプション | `--cpu-threads` |
-| 別名 | `--pool-workers`（parser 内で同じ CPU pool 数変数へ代入） |
-| 値 | 整数。明示的な範囲検証なし |
+| 別名 | なし。`--pool-workers` も同じ変数を設定する別オプション |
+| 値 | 整数。CPU expert pool の worker 数として渡される |
 
 ## 役割
 
-Qwen3.6 の routed experts が VRAM に収まらず hybrid 配置になるとき、CPU 側で expert 計算を行う worker 数を指定します。モデルが Qwen3.6 family と判定されると `strata` は専用実装へ引き渡し、同じ parser は `strata-q36` からも呼ばれます（`src/program/generate.cpp:2393-2407`、`CMakeLists.txt:776-794`）。
+Qwen3.6 エンジンが routed expert を VRAM に全て置けず、hybrid 配置で CPU expert pool を使うときの worker 数を指定します。全 expert が VRAM に収まる経路では pool を作らないため、この値は worker 数に反映されません。
 
 ## 使い方
 
 ```sh
-strata --model /models/qwen36.gguf --cpu-threads 8 --tokens 1,2,3
+# Qwen3.6 モデルを読み込み、CPU pool が必要な場合の worker 数を 6 に指定
+strata-q36 --model ./model.gguf --cpu-threads 6 --tokens "1 2 3" --n 1
 ```
 
-`--tokens` は実行に必要な他の引数の例です。Qwen3.6 専用 parser では `--cpu-threads` と `--pool-workers` のどちらも `cpu_threads` に整数として読み込まれ、後から指定した値が使われます（`src/qwen35/q36_engine.cu:3735-3741, 3778-3780`）。
+`strata --model ...` で Qwen3.6 family に振り分けられた場合も、Qwen3.6 parser が同じ引数を処理します。
 
 ## 値と既定値
 
-- 省略時の値は `0` です（`src/qwen35/q36_engine.cu:3737`）。
-- `std::atoi` で変換されます。parser に数値範囲や形式の検証はありません。値の欠落時は `strata-q36: --cpu-threads needs a value` を stderr に出して終了コード `2` で終了します（`src/qwen35/q36_engine.cu:3742-3746, 3779`）。
-- 正の値は CPU pool の worker 数として指定されます。`0` と負数は worker 数の明示指定として扱われず、CPU topology 等から pool が数を選びます。pool は `n_workers > 0` の場合だけ指定値を採用し、選択結果が 1 未満なら 1 に補正します（`src/kernels/cpu/pool.cpp:801-817, 847`）。
-- 同じオプションを複数回指定した場合、parser が順に変数へ代入するため最後の値が placement に渡ります（`src/qwen35/q36_engine.cu:3742-3747, 3779`）。
+- 値は次の argv 要素から `std::atoi` で整数化されます。`--cpu-threads` 単独では値不足として stderr に `strata-q36: --cpu-threads needs a value` を出し、終了コード 2 で終了します（`engine/src/qwen35/q36_engine.cu:5348-5352,5385`）。
+- parser に正数範囲の検証はありません。整数化後の値が正数なら明示 worker 数として使われ、0 以下なら自動選択に回ります。自動選択では CPU topology や pool の配置計画から worker 数を決めます（`engine/src/kernels/cpu/pool.cpp:865-881`）。
+- 省略時の初期値は 0 なので自動選択です（`engine/src/qwen35/q36_engine.cu:5342`）。
+- 同じオプションを複数回指定した場合、parser は順に変数へ代入するため最後の値が残ります。`--pool-workers N` も同じ `cpu_threads` 変数に代入するので、両方を指定した場合も最後に現れた方が適用されます（`engine/src/qwen35/q36_engine.cu:5358,5385`）。
+- `--cpu-threads=N` の等号形式は parser に定義されていません。通常の非 serve 引数解析では未認識引数となり、usage を stderr に表示して終了コード 2 になります（`engine/src/qwen35/q36_engine.cu:5412-5417`）。
 
 ## 実行時の動作
 
-parser の値は `place_experts` に渡され、hybrid 配置で `ExpertPool(threads)` を作る際に使われます（`src/qwen35/q36_engine.cu:3863-3866, 2995`）。正の値は worker 数です。pool の既定 `host_works=true` により、pool を呼び出す host thread も job を処理します。そのためログの CPU thread 数は workers に host thread を加えた数です（`include/strata/kernels/cpu/pool.hpp:196-200`、`src/qwen35/q36_engine.cu:3002-3006`）。
-
-この CPU pool は、VRAM slot にない expert の計算に使われます。decode 等の hybrid 経路では CPU 側 job を pool に送り、結果を GPU に転送して GPU 側の expert 結果と merge します（`src/qwen35/q36_engine.cu:2236-2289`）。プロンプト chunk の一部は別途 staging buffer 経由で GPU に stream されます（`src/qwen35/q36_engine.cu:2792-2795, 2893-2897, 3002-3006`）。
+parser は値を `cpu_threads` に格納し、初期化後に expert 配置関数 `place_experts` へ渡します。hybrid 経路では `ExpertPool(threads)` を生成し、正数指定は worker 数として採用されます。0 以下の場合は、明示 core 指定があればその数、hybrid CPU なら P-core 数など、CPU topology と配置計画に基づき選びます（`engine/src/qwen35/q36_engine.cu:5522-5523,4528`; `engine/src/kernels/cpu/pool.cpp:865-881`）。
 
 ## 適用条件と副作用
 
-- 全 routed experts が VRAM に収まり、`place_experts` が通常配置で成功する場合、同関数は pool を作らず戻ります。この経路では `--cpu-threads` は使われません（`src/qwen35/q36_engine.cu:2865-2879`）。
-- hybrid 配置が必要でも `STRATA_NATIVE_EXPERTS` を無効にして CPU pool なしで build した場合、CPU pool は作られず、配置関数は「experts が VRAM に収まらない」旨のエラーで失敗します（`CMakeLists.txt:785-789`、`src/qwen35/q36_engine.cu:2881-2886`）。
-- hybrid 経路は GPU 上の expert slot、host memory 上の expert 全体、CPU pool 用の出力・staging buffer を確保します。pinned host allocation が失敗した場合は通常の `malloc` に fallback します（`src/qwen35/q36_engine.cu:2920-2933, 2951-2958, 2975-2995`）。このオプションは GPU slot 数や host allocation の方式を制御せず、CPU pool の並列度を指定します。
-- pool が生成される際の worker 配置・自動数選択には CPU topology と pool 関連環境設定が関係します。個々の環境で実際に何 thread が選ばれるかは実行機の topology に依存し、この調査では特定環境の値を確認していません（`src/kernels/cpu/pool.cpp:743-817`）。
+- この値が worker 数に効くのは CPU expert pool が使われる場合です。`place_experts` は全 routed expert が VRAM に収まると配置を完了して pool を作らずに戻ります（`engine/src/qwen35/q36_engine.cu:4318-4335,4528`）。
+- hybrid CPU pool のコードは `STRATA_NATIVE_EXPERTS` が有効な build で組み込まれます（`engine/cmake/strata_gpu_engine.cmake:571-579`）。その機能がない build では、expert が VRAM に収まらないと配置関数が失敗し、「CPU expert pool がない」旨を返します。呼び出し元はエラーを stderr に出して終了コード 1 を返します（`engine/src/qwen35/q36_engine.cu:4337-4342,5523-5526`）。
+- 明示した正数が CPU に適した数を超える場合も値を強制的に変更せず、pool 実装は警告を stderr に出すだけです（`engine/src/kernels/cpu/pool.cpp:980-988`）。worker thread は pool 作成時に起動します（同 `:991-1002`）。
 
 ## 出力とエラー
 
-- hybrid 配置が成功すると stderr に `hybrid experts` と CPU thread 数などが出力されます。MTP block だけを CPU 側に置く経路では、その旨と VRAM/CPU の expert 数が出力されます（`src/qwen35/q36_engine.cu:2997-3006`）。
-- pool を含まない build で VRAM 配置できない場合は、placement error を `strata-q36: ...` として stderr に出し、`run` は `1` を返します（`src/qwen35/q36_engine.cu:3863-3866`）。
-- 値自体の範囲エラーや clamp はありません。負数を含む 0 以下は pool constructor の自動 worker 選択へ渡ります（`src/kernels/cpu/pool.cpp:801-817`）。
+- hybrid 経路の起動ログには、batch の CPU 処理に使う worker 数が表示されます（`engine/src/qwen35/q36_engine.cu:4535-4539`）。
+- worker 数の不足・過剰などを理由に `--cpu-threads` 自体を拒否する parser validation は確認できません。値の不正形式を `atoi` がどう変換するかは C ランタイム側の仕様に依存するため、Strata 側の独自エラー動作としては断定しません。
 
 ## 根拠
 
-- parser と値の既定値: `src/qwen35/q36_engine.cu:3735-3780`
-- family 判定と専用 parser への委譲: `src/program/generate.cpp:2393-2407`
-- placement の分岐、pool 作成、成功ログ: `src/qwen35/q36_engine.cu:2792-3007`
-- CPU expert job の pool 実行と GPU への結果転送: `src/qwen35/q36_engine.cu:2236-2289`
-- `ExpertPool` の既定値と worker 数選択: `include/strata/kernels/cpu/pool.hpp:196-200`、`src/kernels/cpu/pool.cpp:801-817, 847`
-- Qwen3.6 engine の build 条件と CPU pool の有効化: `CMakeLists.txt:776-794`
-
-## 調査範囲
-
-ソース checkout の同一 revision を読み取り専用で確認しました。build、実行、性能測定、テストは行っていません。索引 [`README.md`](../../README.md) は `--pool-workers` も別の予定リンクとして掲載していますが、現行 parser では `--pool-workers` と `--cpu-threads` が同じ `cpu_threads` 変数へ代入されます（`src/qwen35/q36_engine.cu:3752, 3779`）。索引は依頼どおり変更していません。
+- `engine/src/qwen35/q36_engine.cu:5342,5348-5352,5385` — 初期値、値取得、および `atoi` による parser 定義。
+- `engine/src/qwen35/q36_engine.cu:5358,5522-5523` — `--pool-workers` との同一変数の共有と expert 配置関数への引き渡し。
+- `engine/src/qwen35/q36_engine.cu:4318-4335,4337-4342,4528,4535-4539` — VRAM 配置で pool を省略する分岐、pool 不在 build の失敗、hybrid pool 生成と起動ログ。
+- `engine/src/kernels/cpu/pool.cpp:865-881,980-1002` — 正数指定・自動 worker 選択、過剰値の警告、および worker thread の起動。
+- `engine/cmake/strata_gpu_engine.cmake:571-579` — `STRATA_NATIVE_EXPERTS` と Qwen3.6 CPU pool の build 条件。

@@ -1,42 +1,47 @@
 # `STRATA_PA_FAST`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP の量子化 KV 向けプロンプト注意カーネルで、query と attention probability を表す行列積入力を FP16 の高低2成分で持つ既定経路から、単一 FP16 成分を使う高速経路へ切り替えます。単一 FP16 化で丸めが変わります。この変数だけでは行列コア経路を有効にせず、通常は `STRATA_HIP_WMMA=1` も必要です。
+AMD HIP の行列コア prompt attention（WMMA）で、query `q` と softmax weight `p` を FP16 の high/low 2 部分で計算する既定経路から、それぞれ単一の FP16 値で計算する経路へ切り替える。単一 FP16 経路は行列演算を半分にする一方、コメントでは「rounding-level」とされている。通常の2分割経路と同じ結果になる保証はない。CUDA の NVIDIA tensor-core attention を選ぶスイッチではない。実装は `engine/src/kernels/cuda/qsa_prompt_attn.cu` とその SYCL 側コピー `engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp` にある（前者 `:1956-1961`、後者 `:1713-1715`）。
 
 ## 値と判定
 
-| 状態 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| 先頭文字が `1`（例: `1`, `10`, `1abc`） | 有効 |
-| それ以外（例: `0`, `true`, ` 1`） | 無効 |
+両実装とも `launch_wmma` 内の関数ローカル `static const bool` で `std::getenv` の結果を読み、環境変数が存在し、かつ最初の文字が `'1'` のときだけ true とする（CUDA/HIP: `engine/src/kernels/cuda/qsa_prompt_attn.cu:2348`、SYCL 側: `engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp:1951`）。文字列全体や数値としての妥当性は検査しない。
 
-実装は文字列全体を parse せず、`getenv()` の結果が非 null かつ `e[0] == '1'` かだけを見ます。判定は `launch_wmma()` の関数内 static 変数に保存されるため、初回評価後にプロセス環境を変更しても再評価されません。隣接する `STRATA_PF_SWITCH_MIN_T` は `atoll()` で読み、未設定時は `0`、設定値が `n_q` 以下のときだけ高速カーネルを選びます。値が空文字や数値でない文字列なら `atoll()` の結果は `0` です。
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| HIP WMMA の両実装 | `fast=false`。ただし起動時のアーキテクチャ別既定値が先に `1` を設定する場合がある | 先頭が `1` の文字列（`1`, `1anything`） | 空文字、`0`, `true`, ` 1`, `2`, `01`。これらは先頭文字が `1` でないため無効 |
+
+設定値があっても `fast` は WMMA 経路でだけ参照される。別途、同じ関数内で `STRATA_PF_SWITCH_MIN_T` を `std::atoll` で一度読み、未設定なら `0` とし、`n_q >= min_t` のときに限り `SPLIT=false` にする（CUDA/HIP: `engine/src/kernels/cuda/qsa_prompt_attn.cu:2348-2364`、SYCL 側: `engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp:1951-1960`）。空文字や数値で始まらない文字列は `atoll` により `0` となり、数値以降は判定されない。
 
 ## 有効になる条件
 
-- HIP ビルドであること。HIP の prompt attention 実装は `STRATA_HIP_WMMA=1` と対応 GPU を確認して `launch_wmma()` を呼びます。対応 GPU は `gfx11` 系の実装対象（`gfx1100/1101/1102/1150/1151`）または `gfx12`（`gfx1200/1201`）です。それ以外ではこの WMMA 経路を使いません。
-- 対象となる KV pool が int8 K/V で、Q4 pool ではなく、head dimension・head 数の関係、ページ表などの引数が WMMA 経路の条件を満たすこと。
-- prompt 呼び出し元が `STRATA_PROMPT_ATTN_OLD` を設定していないこと。設定されていれば新しい prompt attention kernel を呼ばず、decode attention のバッチ経路へ進みます。
-- `n_q >= STRATA_PF_SWITCH_MIN_T` であること。閾値を上げると短い query batch は既定の高低2成分経路に残ります。
-
-通常の CUDA ビルドでは `qsa_prompt_attn_batch()` の CUDA 経路が `launch_wmma()` に進まず、この変数による切り替えはありません。HIP でも `STRATA_HIP_WMMA` が無効、デバイス非対応、pool 条件不一致の場合は適用されません。
+- `STRATA_PA_FAST` の実読み取りは HIP コンパイル条件内の WMMA prompt-attention 実装にある。カーネル内の `STRATA_PA_WMMA` は gfx1200/1201、gfx1100/1101/1102/1103、gfx1150/1151 のビルドで有効になり、それ以外では無効である（`engine/src/kernels/cuda/qsa_prompt_attn.cu:1886-1907`、SYCL 側 `engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp:1648-1669`）。
+- 呼び出し側が WMMA attention を選ぶ必要がある。HIP では `STRATA_HIP_WMMA`、GPU 世代、WMMA が失敗済みかどうかで選択が決まり、gfx11 は明示的な WMMA 要求が必要。gfx12 は既定選択もある（`engine/src/kernels/cuda/qsa_prompt_attn.cu:2242-2296`）。
+- WMMA 呼び出しには正の `n_q`、int8 K/V と scale の各 pool、Q4 pool がないこと、コンパイル済み head geometry との一致、正の `cap`、ID・step・page table が必要。条件を満たさない場合はこの WMMA 関数が false を返し、呼び出し元の別経路に委ねる（HIP: `engine/src/kernels/cuda/qsa_prompt_attn.cu:2456-2468,2471-2518`、SYCL 側 `engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp:1973-2028`）。
+- engine 起動時にアーキテクチャ別既定値が `STRATA_PA_FAST=1` を追加する場合がある。統合 GPU では Linux gfx1103、Windows gfx1151 が `STRATA_IGPU_PROMPT_SET` の既定ルールにより対象となり、`STRATA_IGPU_PROMPT_SET=1` は対応する統合 gfx1103/1150/1151 に適用できる。`STRATA_IGPU_DEFAULTS=0` はこの統合 GPU 既定値を無効にする。統合 GPU 条件、対応アーキテクチャ、switch-set の組み立ては `engine/src/core/arch_defaults.cpp:119-138,172-199`、既定値を適用する HIP engine 起動箇所は `engine/src/program/generate.cpp:4287-4320` にある。既定値適用は変数が未設定の場合だけで、空文字を含む明示設定は保持される（`engine/src/core/arch_defaults.cpp:218-223,406-410`）。
+- 離散 RDNA3 gfx1100/1101/1102 でも WMMA 既定セットに含まれる。`STRATA_GFX11_DEFAULTS=0`、`STRATA_GFX11_WMMA_DEFAULTS=0`、または `STRATA_DEFAULTS=026` によってそのセットを外せる（`engine/include/strata/core/gfx11_extra.hpp:8-12,33-37,87-109`; 適用: `engine/src/core/arch_defaults.cpp:312-344`）。
+- `STRATA_PF_SWITCH_MIN_T` が設定されていれば `n_q` の閾値を変える。未設定時の閾値は 0 なので、fast が true なら正の `n_q` で単一 FP16 経路になる。閾値未満では `STRATA_PA_FAST=1` でも2分割経路を使う（CUDA/HIP: `engine/src/kernels/cuda/qsa_prompt_attn.cu:2348-2364`、SYCL 側: `engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp:1951-1960`）。
 
 ## 実行時の詳細
 
-`src/prefill/prefill.cpp` の prompt attention 部は `qsa_prompt_attn_batch()` を呼びます。HIP 側で `hip_wmma_usable()` が有効と判定され、int8 KV 等の条件が揃うと `launch_wmma()` が各 query tile について `STRATA_PA_FAST` と `STRATA_PF_SWITCH_MIN_T` を評価し、`prompt_attn_wmma_kernel<false>`（単一 FP16 成分）または `<true>`（高低2成分）を起動します。変数はカーネル選択に使われ、選んだ経路内で追加ログを出す処理はありません。カーネル起動失敗時は `qsa_prompt_attn_batch (wmma): <CUDA/HIP runtime error>` を stderr に出し、プロセスを終了します。
+読み取り値 `fast` と閾値 `min_t` はそれぞれ初回の `launch_wmma` 呼び出し時に初期化され、以後プロセス内で cache される。起動後に環境変数を変更しても、この関数の判定には反映されない（`engine/src/kernels/cuda/qsa_prompt_attn.cu:2346-2364`、SYCL 側 `engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp:1946-1960`）。
 
-`docs/STRIX_HALO.md` は、`STRATA_PA_FAST` を丸め方が異なる opt-in の高速設定として記載し、同ガイドの設定例では `STRATA_PF_SWITCH_MIN_T=4096` と組み合わせています。ガイドの節ではこれらのスイッチが既定と異なる丸めになること、および maintainers が KL で評価すると説明していますが、`STRATA_PA_FAST` 単独の測定値や KL 値は示していません。したがって、この文書では速度や品質の定量的効果を断定しません。
+各 query chunk について `fast && n_q >= min_t` なら `prompt_attn_wmma_kernel<false>`（CUDA/HIP では gate 付き経路も `pa_launch<false, ...>`）を起動し、それ以外は `<true>` を起動する。`SPLIT=true` は `q` と `p` の FP16 high/low をそれぞれ使う二回の WMMA、false は単一 FP16 image を使う。出力は同じ qsa prompt attention の `attn`、または gate 付きの FP16 出力先に書かれる（`engine/src/kernels/cuda/qsa_prompt_attn.cu:1956-1961,2100-2104,2155-2169,2211-2218,2354-2364`、SYCL 側 `engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp:1713-1721,1951-1960`）。
+
+## ログと測定値
+
+この変数を読み取ったり fast 分岐に入ったりしたこと自体を示す専用ログはない。アーキテクチャ別既定値が実際に追加された場合は、stderr に `strata: integrated GPU (%s): the matrix-core prompt set is on ...` と環境変数名の一覧が出る。明示設定済みの場合は `STRATA_PA_FAST` は追加・一覧表示されない（`engine/src/core/arch_defaults.cpp:406-420`）。
+
+カーネルのソースコメントには「32K context, 2,048 queries, gfx1151, STRATA_PA_FAST=1: 12.49 -> 11.27 ms」とある（`engine/src/kernels/cuda/qsa_prompt_attn.cu:2182-2184`）。このコメントには backend、モデル、KV 量子化、反復数などの条件が記載されていないため、ここでは条件を補ったり一般的な速度差として扱ったりしない。
+
+HIP WMMA 起動エラー時は `qsa_prompt_attn_batch (wmma): %s; the FP32 prompt attention runs from here on` を stderr に出して WMMA を失敗状態にし、false を返す（`engine/src/kernels/cuda/qsa_prompt_attn.cu:2366-2372`）。SYCL 側コピーのエラー処理は `qsa_prompt_attn_batch (wmma): %s` を出して `exit(1)` する（`engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp:1962-1967`）。いずれも `STRATA_PA_FAST` の値を理由とする警告ではない。
 
 ## 根拠
 
-- `src/kernels/cuda/qsa_prompt_attn.cu:1128-1149` — HIP ビルドと gfx 世代ごとの WMMA 実装範囲。
-- `src/kernels/cuda/qsa_prompt_attn.cu:1193-1201` — `<true>` / `<false>` の算術経路の違いと丸めに関する実装コメント。
-- `src/kernels/cuda/qsa_prompt_attn.cu:1426-1448` — 値の読み取り、閾値との比較、kernel 選択、起動エラー処理。
-- `src/kernels/cuda/qsa_prompt_attn.cu:1483-1491` — HIP 側での WMMA 呼び出し条件。
-- `src/prefill/prefill.cpp:2836-2851` — prompt 呼び出し元と `STRATA_PROMPT_ATTN_OLD` による fallback。
-- `docs/STRIX_HALO.md:100-116` — 丸めが変わる opt-in 群、設定例と query 長閾値の説明。
+- 読み取り、閾値、起動選択: `engine/src/kernels/cuda/qsa_prompt_attn.cu:2345-2364`、`engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp:1946-1960`
+- 2分割／単一 FP16 の計算差: `engine/src/kernels/cuda/qsa_prompt_attn.cu:1956-1961,2100-2104,2155-2169`
+- WMMA の build macro と対応 architecture: `engine/src/kernels/cuda/qsa_prompt_attn.cu:1886-1907`、`engine/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp:1648-1669`
+- GPU 条件、default injection と既存値優先: `engine/src/core/arch_defaults.cpp:124-138,172-223,302-344,406-420`、`engine/src/program/generate.cpp:4287-4320`、`engine/include/strata/core/gfx11_extra.hpp:87-109`

@@ -1,51 +1,49 @@
 # `STRATA_IO_PF_GATE_LO`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux の file tier I/O prefetch に付属する decode gate が、開いている状態から閉じるかどうかを決める下限しきい値です。判定対象は、ページキャッシュに使えるメモリ量を file tier の expert データ総量で割った比率です。初期値は `0.55` です。
-
-この値は io prefetch の起動可否を直接決めません。起動時の既定有効判定には、`experts.bin` ではない file tier について `cache_room_ratio() >= 0.55` という独立した固定値があります。`STRATA_IO_PF_GATE_LO` は、prefetch が起動して gate が有効な場合の、その後の decode 中の gate 判定に使われます。
+Linux の `FileExpertSource` が I/O prefetch とともに使う decode gate の下側しきい値を設定する。gate が開いているとき、専門家ファイル tier に対する decode の cache-room 比率がこの値を下回ると gate を閉じる。閉じると decode 中の未キャッシュ blob の `pread` と router lookahead の先読みを抑え、mapped file からの通常読み込みに戻る。gate 自体は既定で有効だが、環境変数で I/O prefetch が有効にならなければ、この値は読まれない（`engine/src/core/expert_source.cpp:1261-1267, 1299-1303`、`engine/src/program/generate.cpp:8693-8703`）。
 
 ## 値と判定
 
-| 入力 | `gate_lo_` への値 |
-|---|---:|
-| 未設定 | `0.55` |
-| 空文字 | `0.0` |
-| 数値文字列 | `std::atof` で変換し、`[0.0, 1.0]` に clamp |
-| 数値に変換できない文字列 | `0.0`（`atof` の変換結果） |
-| 負数 / 0 未満 | `0.0` |
-| 1 より大きい数 | `1.0` |
+`set_io_prefetch(true, ...)` のたびに `std::getenv` で取得し、設定されていれば `std::atof` の結果を `[0.0, 1.0]` に `std::clamp` する。未設定ならメンバー初期値 `0.55` のまま。空文字は設定済みとして読み取られ、`atof("") == 0` なので `0.0` になる。`atof` は文字列全体の厳密な数値検証をしないため、数値として読める接頭部の後ろは無視され、変換できない文字列は `0.0` になる。例えば `0.7tail` は `0.7`、`0anything` は `0`、`true` / `false` はともに `0`。大文字小文字の比較はない。有限値は範囲外なら clamp される。`nan` のように `atof` が NaN を返す入力は `std::clamp` でも有限値に正規化されず、後段の比較は通常の数値比較どおりには成立しない。
 
-文字列全体の厳密な数値検証はしません。`atof` が認識する先頭の数値部分が使われるため、たとえば `0.7tail` は `0.7` として扱われます。空白を含む数値も `atof` の規則で変換されます。
+| 条件 | 未設定 | 設定時に使われる値 | 例 |
+|---|---:|---|---|
+| `STRATA_IO_PREFETCH` が有効で Linux mapped file tier を使う場合 | `0.55` | `atof` の結果を `[0, 1]` に clamp | `0.55` → `0.55`、`-1` → `0`、`2` → `1`、空文字・`junk`・`true` → `0` |
+| I/O prefetch を有効化しない場合、または Linux 以外 | 読み取りなし | 適用なし | この変数だけでは I/O prefetch は有効にならない |
 
-相互作用する `STRATA_IO_PF_GATE_HI` も設定されていれば、後から読み取られ、`gate_hi_` は `[gate_lo_, 1.0]` に clamp されます。したがって `HI` が未設定の既定値 `0.65` より `LO` が大きければ、実際の再開しきい値は `LO` まで引き上げられます。
+下限は「gate が開いているとき」に `ratio >= gate_lo_` なら room 条件を満たす、`ratio < gate_lo_` なら満たさない、という境界である。capacity 不足で閉じた gate は、再開時には別変数 `STRATA_IO_PF_GATE_HI` の上側しきい値を使い、`ratio > gate_hi_` で開く。`STRATA_IO_PF_GATE_HI` の値も `[gate_lo_, 1.0]` に clamp されるため、下限を上げると上限の許容最小値も上がる（`engine/src/core/expert_source.cpp:1301-1303, 2342-2358`）。
 
 ## 有効になる条件
 
-- この読み取りと gate の実装は Linux 向け `FileExpertSource::set_io_prefetch()` にあります。
-- `set_io_prefetch(true, ...)` が実際に初期化を完了しなければ値は読み取られません。`STRATA_IO_PREFETCH=0` などで prefetch が無効な場合や、file の open に失敗するなど初期化が途中で戻る場合、この変数は効果を持ちません。
-- io prefetch の初期化時に gate は既定で有効です。別変数 `STRATA_IO_PF_GATE` が空でない値として設定されている場合は `atoi(value) != 0` で上書きされます。`STRATA_IO_PF_GATE=0` なら gate は無効になり、`STRATA_IO_PF_GATE_LO` は使われません。
-- gate は decode window の処理に適用されます。ソースは新しい window ごとに容量判定関数を呼びますが、容量比の再計算は16 windowごとです。prompt 経路はこの decode gate の対象外です。
+- `strata generate` の Linux file tier で `STRATA_IO_PREFETCH` が unset / 空文字のときは、ソース種別・cache room に応じて Linux 既定が選ばれた場合に読み取られる。明示値が空でなければ `atoi(value) != 0` のときだけ有効化されるため、`STRATA_IO_PREFETCH=0` は既定有効化を抑止する（`engine/src/program/generate.cpp:8693-8703`）。
+- Linux 以外では `set_io_prefetch` の実装が no-op。Linux でも `on == false`、mapped base がない、パスが空、または unbuffered reader の場合は早期 return し、しきい値を読み込まない（`engine/src/core/expert_source.cpp:1261-1267, 1310-1312`）。
+- `STRATA_IO_PF_GATE` が非空で設定されると、`atoi(value) != 0` が gate の有効状態を上書きする。したがって `STRATA_IO_PF_GATE=0` なら本変数を読んでも gate は使われず、非ゼロなら使われる。未設定または空文字なら、I/O prefetch とともに gate が有効になる（`engine/src/core/expert_source.cpp:1299-1302`）。
+- このしきい値を直接上書きする CLI 引数はなく、`STRATA_COLD_OVERLAP` は別の cold-read / zero-copy 経路の設定で、本変数や gate の有効化を上書きしない（`engine/src/core/expert_source.cpp:1299-1303`; `engine/src/program/generate.cpp:5461-5468`）。
+- decode gate の更新は、staged source で decode thread として印を付けられた処理に限られる。新しい decode window ごとに room を確認し、prompt 経路は gate 対象外（`engine/src/core/expert_source.cpp:2250-2254, 3818-3819`; `engine/src/program/generate.cpp:5460-5470`）。
+- GPU cache が全 expert を保持し `STRATA_FILE_TIER_IDLE` が未設定または `atoi != 0` の場合、Linux 既定で有効になった I/O prefetch は一時停止される。この既定経路では gate も止まり、再開時に `set_io_prefetch(true, ...)` が設定を読み直す。明示的な `STRATA_IO_PREFETCH=1` はこの idle policy による停止対象外（`engine/src/program/generate.cpp:10251-10258, 10275-10285, 10341-10368`）。
 
 ## 実行時の詳細
 
-初期化時に `getenv` で値を読み、`std::atof` と `std::clamp` の結果を `FileExpertSource` インスタンスの `gate_lo_` に保存します。以後、環境変数を変更しても、そのインスタンスのしきい値は更新されません。
+環境変数はプロセス起動時の一度だけではなく、I/O prefetch を開始するたびに読み込む。通常は generate 初期化時、また serve の GPU cache 状態に応じた file-tier 再開時にも `set_io_prefetch(true, ...)` で評価される。読み取り値は `FileExpertSource` のメンバーに保持され、各 decode window で環境を再取得する処理はない。外部から環境を変える操作や子プロセスへの転送はこの設定経路にはない（`engine/src/core/expert_source.cpp:1261-1267, 1299-1303`; `engine/src/program/generate.cpp:10363-10368`）。
 
-gate 容量判定では、cgroup v2 の制限が取得できる場合は cgroup と祖先のうち最も小さい空き量を使い、そうでない場合は `/proc/meminfo` の `MemAvailable` を使います。これを expert データ総量で割り `gate_ratio_` とします。値が不明（総量または空き量が0）の場合は gate 状態を変えません。
+既定値は `gate_lo_ = 0.55`。gate open 中、16 decode window ごとに cgroup v2 の制限（祖先を含む）から非 file 使用量を差し引いた room、または `MemAvailable` を expert bytes で割った比率を再評価する。値が未取得・0 の場合は状態を維持する。gate は初期状態で open。room が下限未満なら閉じ、capacity により閉じた gate は `STRATA_IO_PF_GATE_HI` を超えるまで閉じたままになる。room 条件を満たしていても、read-ahead が 16-window 区間で 128 MiB 未満、またはその有用率が `STRATA_IO_PF_GATE_USEFUL` 未満なら別理由で閉じ、256 window ごとの probe を行う（`engine/include/strata/core/expert_source.hpp:1105-1117`; `engine/src/core/expert_source.cpp:2324-2358`）。
 
-開いている gate は `gate_ratio_ >= gate_lo_` の間開いたままになり、下回ると閉じます。閉じている gate は `gate_ratio_ > gate_hi_` になって再開します。閉じた状態では decode の pread/read-ahead を抑え、look-ahead の深さも1にします。ほかに、open 状態で16 window内の read-ahead が128 MiB未満、または有用率が `STRATA_IO_PF_GATE_USEFUL` の下限を下回った場合にも gate は閉じます。この理由で閉じた場合は、容量条件を満たしていても256 windowごとの probe まで再開しません。
+閉じている間、decode 中の未キャッシュ blob の `pread` を行わず mapping からコピーし、通常の page fault 読み込みに委ねる。lookahead は読み先 depth を 1 に縮める。開いている場合は読み込み worker に先読みをキューイングできる。これらは読み込み方法・先読み量を変える処理で、コード上、生成 token や router の選択結果を変更する制御ではない（`engine/src/core/expert_source.cpp:1896-1920, 3483-3501, 3698-3702, 1228-1259`）。
 
-gate が有効な場合、生成側の診断出力には cache room 比、read-ahead 使用率、decode read の page-cache hit EWMA、open/closed 状態、閉じた window 数と切替回数が出ます。`STRATA_IO_PF_GATE_LO` 固有のログはありません。
+## ログと測定値
+
+この変数専用の警告や終了経路はない。Linux 既定で I/O prefetch が開始されると stderr に `strata generate: file tier (Linux defaults, ...)` が出て、gate が有効かを `the decode's read-ahead only while the page cache has room for it and it pays (STRATA_IO_PF_GATE=1)` 相当の文言で示す。serve の request I/O ログでは gate が有効な場合に `decode gate: cache room ...`、状態 `open` / `closed`、閉じた window 数と flips を表示する。これらの値は `src.io_prefetch()` / `src.gate_on()` が真で I/O sampling が有効な場合のログである（`engine/src/program/generate.cpp:8705-8718, 23836-23863`）。
+
+`docs/DETAILS.md:310` は gate を `STRATA_IO_PF_GATE=1` と `STRATA_IO_PF_GATE_LO` / `_HI` の閾値で説明しており、実装の既定有効・下限値の使い方と整合する。ただし現行コードでは `STRATA_IO_PF_GATE` 未設定でも I/O prefetch とともに gate が有効になる（`engine/src/core/expert_source.cpp:1299-1303`）。同資料にある性能値は測定条件付きの資料上の記述であり、この調査では再測定していない。
 
 ## 根拠
 
-- `src/core/expert_source.cpp:1114-1155` — Linux I/O prefetch 初期化、gate の既定有効化、`STRATA_IO_PF_GATE` と本変数の読み取り、および数値変換・clamp。
-- `src/program/generate.cpp:5655-5670` — 起動時の io prefetch 判定と `set_io_prefetch()` の呼び出し。
-- `include/strata/core/expert_source.hpp:995-1026,1034-1043` — gate の役割、初期値、Linux 既定起動条件。
-- `src/core/expert_source.cpp:1903-1917,1920-1979,1980-2004,3290-3292` — decode window の計測、空き容量比、しきい値比較と再評価周期。
-- `src/core/expert_source.cpp:1081-1083,1750-1757,2974-2983,3175-3178` — gate 状態による read-ahead、decode demand pread、look-ahead 深度への反映。
-- `src/program/generate.cpp:15424-15429` — gate 状態の診断ログ。
-- `docs/DETAILS.md:282-298` — Linux file tier gate の説明と測定記録。記載測定は gate しきい値 `0.55` / `0.65` を含む file-tier 機能全体の比較であり、`STRATA_IO_PF_GATE_LO` 単独の性能差を測ったものではありません。
+- `engine/src/core/expert_source.cpp:1261-1312` — Linux 制限、設定読み取り、既定値の上書き。
+- `engine/src/core/expert_source.cpp:2324-2358` — cache-room 比率、下限・上限と更新規則。
+- `engine/src/core/expert_source.cpp:1896-1920, 3483-3501` — gate 閉鎖時の読み込み経路。
+- `engine/src/program/generate.cpp:8693-8724, 10275-10285, 10341-10377` — prefetch 起動条件、既定経路の停止・再開。
+- `engine/src/program/generate.cpp:23836-23863` — 観測可能な request I/O ログ。

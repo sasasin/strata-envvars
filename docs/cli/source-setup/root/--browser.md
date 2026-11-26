@@ -1,61 +1,55 @@
 # `--browser`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。調査対象 checkout の状態は `main`、未コミット変更なし。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-24 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` などから起動） |
+| コマンド | `setup.py`（トップレベル） |
 | オプション | `--browser` |
-| 別名・対になる指定 | `--no-browser`（同じ `browser` 引数を反転して設定） |
-| 値 | 値を取らないフラグ |
+| 別名 | なし |
+| 値 | 値を取らない真偽スイッチ |
 
 ## 役割
 
-モデルの起動準備ができたとき、ローカルのチャットページをブラウザで開く設定を有効にします。通常は既定で開くため、主に以前 `--no-browser` で保存した設定を再び有効にするときに使います。parser は両フラグを同じ `browser` 宛てに登録し、`--no-browser` は `False`（未指定時 `None`）、`--browser` は `True` を設定します（`setup.py:8476-8480`）。
+モデルの起動準備または既存モデルの起動時に、準備完了後チャットページをブラウザーで開く設定を明示的に有効にします。対になる `--no-browser` で保存した設定を解除する用途があります。一般的な Linux / Windows の `setup.py` 経路で有効です。通常の macOS 経路は別の parser に引数を渡し、そこで未知引数として警告されるため、このオプションは適用されません。
 
 ## 使い方
 
-既にモデルを設定済みの checkout で起動時に有効化する例:
-
 ```sh
+# Strata の checkout 内で、モデルを通常起動し、チャットページを開く
 ./setup.sh --browser
-```
 
-Windows では同じ引数を `START-HERE.bat --browser` に渡せます。`setup.sh` は引数を `setup.py` に転送し（`setup.sh:76`）、`START-HERE.bat` も選択した Python で `setup.py %*` を実行します（`START-HERE.bat:44-54`）。
+# Windows で同じ設定を明示する
+START-HERE.bat --browser
+```
 
 ## 値と既定値
 
-値は不要です。`--browser` と `--no-browser` を両方指定した場合、parser は同一の宛先を引数順に更新するため、後に現れた方の値になります（定義: `setup.py:8476-8480`）。値を付けて呼ぶ構文ではありません。
-
-引数を省略すると `browser` は未指定のままです。既存モデルの通常起動では未指定値では保存済み設定を書き換えず、設定が `open_browser=false` でなければブラウザを開きます。新規・再構成時も、明示値がない場合は既存の `open_browser` 設定が引き継がれ、設定キーがない新規構成ではブラウザを開く側に動きます（`setup.py:6177-6188, 6326-6340, 9675-9676, 6844-6846`）。
+値は不要です。parser は `store_true` として登録され、`--no-browser` も同じ `browser` 属性を使って `store_false` に設定されます。どちらも指定しない場合の属性値は `None` で、既存の `open_browser` 設定を変えません。設定に `open_browser: false` がなければ起動側の既定ではブラウザーを開きます。両方を指定した場合は、引数列で後に現れたスイッチの値が使われます (`terminal/setup.py:11505-11509`, `terminal/setup.py:11606`)。
 
 ## 実行時の動作
 
-既存モデルの起動経路では `--browser` が明示された場合、その値を `start()` の `keep` に渡します（`setup.py:8674-8692`）。`_start()` は既存の JSON 設定を読み、値が変わると `open_browser` を更新して設定ファイルへ保存します（`setup.py:6745-6771`）。その後、起動コマンドに `serve/server.py` を組み立て、ブラウザを開く条件を満たすと `--open` を追加します（`setup.py:6775-6776, 6844-6846`）。
-
-インストール・再設定経路では明示値をモデルの設定 JSON に書き、`write_run_script()` が生成する `run-<model>.sh` / `.bat` にも `--open` を含めます（例: `setup.py:7689-7690, 7717-7719, 7260-7272`）。`--no-start` でセットアップだけを行う場合は、その場ではモデルを起動しません（`setup.py:9759-9766`）。次回以降の起動設定には値が残ります。再セットアップで明示指定しない場合も `open_browser` は setup が書き換えないキーとして引き継がれます（`setup.py:6162-6167, 6177-6188`）。
-
-server は `--open` があり、かつ設定 JSON の `open_browser` が `false` でない場合に限り、準備完了後に `webbrowser.open()` を daemon thread で呼び出します。URL は localhost 側のモデルページで、起動関数の戻り値は確認していません（`serve/server.py:8639-8644`）。従って保存設定の `false` は、古い起動スクリプトが `--open` を含んでいても優先されます。
+- 既存モデルを起動する経路では、明示された値だけを `keep` に渡します。`start()` は `None` を除外し、保存済み値と異なる場合は設定 JSON の `open_browser` を更新して保存します。値が変わったときは「the browser opens」などの保存通知が出ます (`terminal/setup.py:11761-11766`, `terminal/setup.py:8577-8595`)。
+- セットアップ経路では、明示値をモデル設定の `open_browser` に入れて設定を書きます。これは Linux / Windows の複数モデル導入経路と Intel Arc、macOS の一部モデル経路にもあります (`terminal/setup.py:9445-9448`, `terminal/setup.py:10012-10018`, `terminal/setup.py:10404-10412`, `terminal/setup.py:10943-10951`, `terminal/setup.py:11341-11361`)。
+- 起動時に `open_browser` が false でなければ `setup.py` はサーバー起動引数へ `--open` を加えます。サーバーはモデルの準備完了後、ローカルページの URL を `webbrowser.open` に渡す daemon thread を開始します (`terminal/setup.py:8670-8672`, `terminal/serve/server.py:9746-9751`)。
+- セットアップで生成する `run-<model>.sh` / `.bat` も保存設定に応じて `--open` を含めます (`terminal/setup.py:9233-9246`)。
 
 ## 適用条件と副作用
 
-- この option は `setup.py` の共通 parser が使われる Windows / Linux および Control mode の構成経路で有効です。Apple Silicon の standalone 経路は `setup.py` から `metal/setup_mac.py` に parser 前に委譲されます（`setup.py:8412-8420`）。その parser には `--no-browser` はありますが `--browser` はなく、未知引数は警告付きで無視されるため、standalone Mac ではこの文書の `--browser` は有効化指定になりません（`metal/setup_mac.py:327-359`）。
-- Intel SYCL 経路では共通 parser の後に `sycl_setup()` が別スクリプトを呼びます。委譲側で `--browser` をどう扱うかはこの調査では確認できず、SYCL での保存・起動効果は断定しません（`setup.py:8561-8564, 7321-7344`）。
-- 設定変更時はモデル別 JSON が書き換わります。既存ファイルとの差分がある再セットアップでは `.bak` を作ろうとします（`setup.py:6333-6340`）。生成される起動スクリプトも更新されます（`setup.py:7260-7272`）。
-- ブラウザ起動はモデルの server 起動後、準備完了の経路で非同期に試みます。ブラウザが利用できない場合の具体的な挙動や OS ごとの launcher 差は、このソース確認だけでは確定できません。`webbrowser.open()` の戻り値を Strata は検査していません（`serve/server.py:8639-8644`）。
+- 通常の Linux / Windows の root parser では利用できます。起動時に明示すると、そのモデルの設定 JSON を更新することがあります。セットアップ時は生成・更新されるモデル設定へ記録され、起動スクリプトにも反映されます (`terminal/setup.py:8590-8595`, `terminal/setup.py:9445-9448`, `terminal/setup.py:9233-9246`)。
+- `setup.py` は通常の macOS では独自 parser を実行する前に `engine/metal/setup_mac.py` へ引数を委譲します。同 parser は `--no-browser` を登録しますが `--browser` は登録せず、未知引数を「not used on a Mac」と警告して処理を続けます (`terminal/setup.py:11434-11437`, `terminal/setup.py:9290-9294`, `engine/metal/setup_mac.py:375-405`)。ただし Control モード、Hy4-Flash、Inkling-2-Mini などは通常の委譲条件から外れ root parser 側を通る場合があります (`terminal/setup.py:11434-11437`)。
+- ブラウザー起動を要求するだけで、ブラウザー自体の起動成功は保証しません。起動先サーバーの `open_browser: false` は `--open` を受け取っても優先して開きません (`terminal/serve/server.py:9746-9751`)。
 
 ## 出力とエラー
 
-このオプション専用の値検証やエラー処理はありません。値を要しない boolean flag として定義されています（`setup.py:8476-8480`）。セットアップ時の設定保存や backup 作成に失敗した場合は共通の書き込み・警告経路に従い、ブラウザ launcher の成否は待機・終了コードへ反映されません（`setup.py:6333-6340, 6872-6878`; `serve/server.py:8639-8644`）。
+このオプション固有の値検証やエラー分岐はありません。値を取らないため、値を後置する形式は parser の引数解釈対象外です。通常の起動時、設定値が変更された場合は保存通知が出ますが、同じ値ならその変更通知は出ません (`terminal/setup.py:8590-8595`)。macOS の委譲経路では `--browser` は未知引数として警告され、無視されます (`engine/metal/setup_mac.py:403-405`)。
 
 ## 根拠
 
-- parser と説明文: `setup.py:8476-8480`
-- 既存モデル起動時の明示値保存と起動コマンド生成: `setup.py:6745-6776, 6844-6846, 8674-8692`
-- モデル設定の引き継ぎ・保存・backup: `setup.py:6162-6188, 6312-6340, 9675-9676`
-- セットアップ後の起動スクリプトと `--no-start`: `setup.py:7260-7272, 7689-7719, 9759-9766`
-- server でのブラウザ起動: `serve/server.py:8175-8177, 8639-8644`
-- wrapper の引数転送: `setup.sh:76`, `START-HERE.bat:44-54`
-- standalone Mac の別 parser: `setup.py:8412-8420`, `metal/setup_mac.py:327-359`
-- SYCL 委譲: `setup.py:7321-7344, 8561-8564`
+- `terminal/setup.py:11505-11509` — `--no-browser` / `--browser` の parser 定義、同一 dest、既定値と説明。
+- `terminal/setup.py:8577-8595`, `terminal/setup.py:11758-11766` — 起動時に明示値を設定へ反映して保存する処理。
+- `terminal/strata_control/setup_config.py:531-538`, `terminal/setup.py:9445-9448`, `terminal/setup.py:10012-10018`, `terminal/setup.py:10404-10412`, `terminal/setup.py:10943-10951`, `terminal/setup.py:11341-11361` — セットアップ時の設定反映。
+- `terminal/setup.py:8670-8672`, `terminal/serve/server.py:9746-9751` — `--open` の転送とサーバー側のブラウザー起動。
+- `terminal/setup.py:9233-9246` — 保存設定を使った起動スクリプトの生成。
+- `terminal/setup.py:11434-11437`, `terminal/setup.py:9290-9294`, `engine/metal/setup_mac.py:375-405` — 通常の macOS 経路の委譲と未知引数の扱い。

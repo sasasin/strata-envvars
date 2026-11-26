@@ -1,45 +1,47 @@
 # `STRATA_USAGE_DUMP`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。対象はStrata所有ソース。外部ライブラリ・ドライバーの動作は含めない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-SYCLエンジンの speculative decode で、device plan が処理したexpert routingをカウントし、終了時に指定ファイルへトレースとして書き出します。カウンターはexpert profile作成ツールが読む形式で、各routing entryを `k=1`、weight `0` のレコードとして出します。通常の利用者向け推論設定ではなく、profile用トレースを作る診断・データ収集フックです。
-
-この名前をソースで読む箇所は `sycl/src/program/generate.cpp` の1箇所です。CUDA/HIP実装では読み取りを確認できません。
+SYCL エンジンの `strata generate` で speculative verify のデバイスプランが数えた routed expert 数を、指定パスへバイナリ trace として書き出す計測用フック。通常の生成計算やトークン選択を切り替える設定ではなく、カウント用デバイス配列の確保・初期化と終了時のファイル出力を追加する。読み取りは `generate.cpp` の speculative decoding 経路だけにあり、サーバー経路では `STRATA_USAGE_DUMP` を読まない。CUDA/HIP 側の読み取りもない。`terminal/tools/collect_profile_traces.py` は既定の `--mode usage` でこの変数を子エンジンに設定し、SYCL の routed trace を収集する。 (`engine/sycl/src/program/generate.cpp:13747-13753,14277-14293`; `terminal/tools/collect_profile_traces.py:7-12,77-86`)
 
 ## 値と判定
 
-| 値 | 動作 |
-|---|---|
-| 未設定 | カウンターを割り当てず、usage traceを出力しない |
-| 空文字 | 未設定と同様。`getenv` は非NULLでも `*usage_dump` がfalseなので無効 |
-| 非空文字列 | その文字列を出力パスとして保持する。数値変換や内容の検証はしない |
+SYCL の speculative 経路に入った時点で `std::getenv` の返す文字列を読み、そのポインターを後の書き出しに使う。数値や真偽値への変換、空白除去、大文字小文字の判定はない。未設定または空文字列なら無効、空でない任意の文字列はパスとして有効になる。`0`、`false`、`true`、`0anything` も、空でなければその文字列のファイル名として扱われる。CLI 引数や別環境変数による値の上書きはない。 (`engine/sycl/src/program/generate.cpp:13747-13753,14280`)
 
-値は speculative decode の経路に入った後、一度 `getenv("STRATA_USAGE_DUMP")` で読み取られます。この実行中に環境を書き換えても再評価されません。`fopen(path, "wb")` はdecode完了後に行い、既存ファイルがあれば上書きします。ファイルを開けない場合、usage出力箇所では警告やエラーを出さず、`usage dumped` の表示も出しません。`fwrite` と `fclose` の戻り値は検査されないため、この表示だけでは全データの書き込み完了を保証しません。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `mirror_table_d` が存在する SYCL speculative `generate` 経路 | カウント配列を確保せず、usage trace を出さない | 空でないパス。例: `trace.bin`, `0`, `false`, `0anything` | 空文字列。例: `STRATA_USAGE_DUMP=` |
+| `mirror_table_d` がない経路（またはサーバー） | trace なし | 該当なし。値を読んでも配列確保に進まない／サーバーは変数を読まない | 該当なし |
+
+パスの存在・書き込み可否は事前検証されない。出力時に `fopen(path, "wb")` が成功するとファイルを新規作成または切り詰める。 (`engine/sycl/src/program/generate.cpp:13749-13753,14280-14291`)
 
 ## 有効になる条件
 
-環境変数が非空でも、次の条件を満たす必要があります。
-
-- SYCLエンジンの speculative decode 経路を通ること。この読み取りと出力は speculative decode ブロック内にあります。
-- `mirror_table_d` が作成されていること。これは `--stream-experts`、GGUF由来のexpert source、`--expert-cache > 0` などの条件下で、VRAM外expertのミラーに成功した経路で設定されます。
-
-したがって、非空パスを指定しただけでは出力は保証されません。mirror table がない場合はdevice counterを割り当てず、ファイルも開きません。`STRATA_VERIFY_NO_HOST` 使用時にもdevice-side counterで記録できる、と同梱ツールの説明にありますが、この環境変数自体が `STRATA_VERIFY_NO_HOST` を有効化するわけではありません。
+- SYCL ビルドの `strata generate` で speculative decoding 経路に到達すること。`--spec` の設定などにより speculative verify が実行されない場合、環境変数の読み取り箇所まで進まない。読み取りと初期化は speculative 経路の中にある。 (`engine/sycl/src/program/generate.cpp:13712-13720,13747-13760`)
+- その経路で `thits.d_res` が必要になる（コードは未設定なら `--spec needs the device residency table...` を stderr に出して終了コード 2）。さらに `mirror_table_d` が必要で、これは `--stream-experts`、GGUF source、`--expert-cache > 0` の条件下で、VRAM にない experts の pinned mirror が作られ device-readable table が確保・設定された場合に立つ。mirror の候補がなく作成されない場合や mirror 作成に失敗した場合は usage 配列を確保しない。 (`engine/sycl/src/program/generate.cpp:5431-5435,5486-5506,13738-13753`)
+- `STRATA_VERIFY_NO_HOST` は変数自体の判定条件ではない。ただし collector の説明では、このデバイスカウント経路は `STRATA_VERIFY_NO_HOST` と併用できる。mirror 不足時に同変数が有効なら別の起動拒否経路がある。 (`terminal/tools/collect_profile_traces.py:9-12`; `engine/sycl/src/program/generate.cpp:5510-5532`)
+- `terminal/tools/collect_profile_traces.py` から使う場合、`--mode usage`（既定）が `env["STRATA_USAGE_DUMP"]` を trace パスに設定する。`--mode routing` は環境変数を設定せず `--dump-routing PATH` を付ける。ツールは設定ファイルの `--serve` と `--batch` を引数から除いて子エンジンを起動する。 (`terminal/tools/collect_profile_traces.py:49-56,63-66,77-86`)
 
 ## 実行時の詳細
 
-`g.n_layers * g.n_expert` 個の `int32_t` counterをdevice memoryに確保し、ゼロ初期化してからresident planへ渡します。resident plan kernelは、各layerのrouting IDごとに、有効なexpert IDのcounterをdevice-side atomic incrementします。そのため、これは異なるexpert数ではなくrouting entryの出現回数です。記録対象はこのdevice planが処理するverify windowのroutingで、prompt prefillのrouting記録ではありません。
+変数は speculative 経路の初期化時に一度読み、`usage_dump` ポインターと `usage_dev` をその実行経路内で保持する。関数内 `static` cache ではないが、カウント配列の確保判定を後から再評価しない。プロセス稼働中に環境値を変更した場合の追随は実装されていない。 (`engine/sycl/src/program/generate.cpp:13747-13753`)
 
-decode完了時にcounterをhostへコピーし、layer、expertの昇順で、counterの回数だけレコードを出します。各レコードは16 byteで、`int32 layer, int32 k=1, int32 expert_id, float weight=0` です。weightを使った頻度ではなく、profileツールが出現回数を集計できるよう、ゼロweightのレコードを繰り返します。ファイルを開けた場合、stdoutに `usage dumped <path> (<count> routed entries counted on the device)` を表示します。
+`mirror_table_d && usage_dump && *usage_dump` のとき、層数×expert 数の `int32_t` デバイス配列をゼロ初期化し、`resident_plan_set_mirror` に渡す。SYCL の resident plan は有効な expert ID ごとに対応カウンターを device-scope relaxed atomic で 1 増やす。 (`engine/sycl/src/program/generate.cpp:13749-13753`; `engine/sycl/src/kernels/cuda/verify_kernels.dp.cpp:2521-2531,2796-2809`)
 
-この形式は `tools/make_profile_mix.py` が `--dump-routing` と同じ形式として受け取り、`tools/make_profile.py` のtrace readerがlayer、expertの出現頻度を数えます。`tools/collect_profile_traces.py` は既定の `usage` モードで子engineの環境にこの変数を設定し、promptごとのtraceを集めます。
+生成終了時にカウンターを host へコピーし、layer/expert ごとの回数 `c` に対して 16-byte record を `c` 個書く。各 record は `int32 layer, int32 1, int32 expert_id, float 0`（実装上は 3 個の int32 と `wgt[0]`）で、routing weight は保存しない。初期 prompt 経路および speculative ではない通常 token 経路の routing trace ではなく、この device plan を通る speculative verify のカウントである。書き込み順は layer、expert ID 順で、元の routing の時系列順ではない。形式は `make_profile.py` の trace reader が読む `(layer, k, k expert IDs, k weights)` record と一致する。 (`engine/sycl/src/program/generate.cpp:14277-14292`; `engine/sycl/src/kernels/cuda/verify_kernels.dp.cpp:2521-2531`; `terminal/tools/make_profile.py:47-58`)
+
+## ログと測定値
+
+ファイルを開けた場合のみ stdout に `usage dumped             <path> (<N> routed entries counted on the device)` 相当の行を出す。`fopen` が失敗した場合、同ブロックには警告・エラー出力がなく、usage trace の成功行も出ない。`fwrite` と `fclose` の戻り値も検査しないため、書き込み途中の失敗をこの処理が報告する経路はない。 (`engine/sycl/src/program/generate.cpp:14280-14293`)
+
+この変数による性能測定値は資料にない。`docs/DETAILS.md` は一般の profile 用 trace 作成手段として `--dump-routing` を案内しており、本変数固有の挙動は記載していない。 (`docs/DETAILS.md:84-87`)
 
 ## 根拠
 
-- `sycl/src/program/generate.cpp:12024-12025,12059-12065` — speculative decode内の読み取り、mirror table条件、counterの確保・初期化・resident planへの登録。
-- `sycl/src/kernels/cuda/verify_kernels.dp.cpp:2081-2114,2363-2394` — plan kernelへのcounter引き渡しとrouting IDごとのatomic count。
-- `sycl/src/program/generate.cpp:12512-12528` — counterのreadback、`wb` での出力、レコードの値、成功時の表示。
-- `tools/collect_profile_traces.py:9-18,63-85` — `usage` モードが子engineへ環境変数を渡すこと、およびtrace収集の説明。
-- `tools/make_profile_mix.py:9-12`、`tools/make_profile.py:47-58` — trace形式と集計方法。
-- `docs/INTEL.md:824-829` — SYCL device-side routing countを使ったprofile作成の説明と、資料記載の測定結果。測定値はこの調査で再計測していない。
+- `engine/sycl/src/program/generate.cpp:13712-13760,14277-14293` — speculative 経路、環境読み取り、カウント配列初期化、出力。
+- `engine/sycl/src/program/generate.cpp:5431-5506` — mirror table が作られる条件。
+- `engine/sycl/src/kernels/cuda/verify_kernels.dp.cpp:2521-2531,2796-2809` — expert ID の device-side カウントと resident plan への接続。
+- `terminal/tools/collect_profile_traces.py:7-12,49-56,63-86` — collector の mode と環境引き渡し。
+- `terminal/tools/make_profile.py:47-58`; `docs/DETAILS.md:84-87` — trace record の読み取りと既存資料。

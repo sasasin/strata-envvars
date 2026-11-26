@@ -1,6 +1,6 @@
 # `strata tune auto --leave-ram`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,53 +8,52 @@
 | コマンド | `strata tune auto` |
 | オプション | `--leave-ram` |
 | 別名 | なし |
-| 値 | 整数の割合 `PERCENT`。0〜50 |
+| 値 | 整数 `PERCENT`、0〜50 |
 
 ## 役割
 
-自動 tuning の目標をメモリに余裕を残す `room` として扱い、候補設定が現在の設定よりシステムメモリを大きく消費する場合に候補から外すための指定です。値が0以外なら、`--goal` の省略値 `speed` は `room` に切り替わります（`strata_cli/tune_commands.py:29-32,184-196`）。
+自動 tuning に「システム RAM を空けておく」希望を渡します。0 以外を指定し、目標が既定の `speed` の場合は目標を `room` に切り替えます。tuner は基準構成と候補の測定中の空き RAM を比較し、空き RAM を大きく減らす候補を除外します。
 
 ## 使い方
 
 ```sh
-strata tune auto my-profile --leave-ram 20
+strata tune auto IQ3_S --leave-ram 20
 ```
 
-`my-profile` は tuning 対象の保存済み profile 名、または run configuration の JSON パスです。`--goal speed` を併記しても、`--leave-ram` が0以外なら実行時の目標は `room` になります（`strata_cli/tune_commands.py:26,178-188`）。
+`IQ3_S` はインストール済みモデル名の例です。対象としてモデル、保存済み profile 名、または run configuration（JSON）を指定できます（`terminal/strata_cli/tune_commands.py:27`）。
 
 ## 値と既定値
 
-- `argparse` は整数として読み取り、省略時は `0` です。parser 上に `choices` はありませんが、処理時に0〜50の範囲を検証します（`strata_cli/tune_commands.py:31,184-185`）。
-- 負数、51以上はエラーです。小数は整数変換に失敗して parser エラーになります。0は RAM の希望を追加せず、単独では `speed` から `room` へ切り替えません（`strata_cli/tune_commands.py:31,184-187`）。
-- 同じオプションを複数回指定した場合は `argparse` の通常の `store` 動作で最後の値が使われます（`strata_cli/tune_commands.py:31`）。
+- 省略時は `0`。型は Python `int`、parser 上の metavar は `PERCENT` です（`terminal/strata_cli/tune_commands.py:33`）。
+- 実行時に `0 <= 値 <= 50` を検証します。範囲外は終了コード `2` で失敗します（同 `:328-329`）。
+- 整数に変換できない値は argparse の型変換で拒否されます（同 `:33`）。このオプションに重複指定専用の検証はありません。
 
 ## 実行時の動作
 
-検証後、0以外の値を `autotune.Options.ram_wish_pct` に渡します。`goal` が `speed` のときは `room` に変更し、明示的に `room` または `room:MiB` を指定した場合も RAM の希望を併用します（`strata_cli/tune_commands.py:139-147,184-196`; `strata_control/autotune.py:50-68`）。
+`auto` は値を `autotune.Options.ram_wish_pct` に渡します。`--leave-ram` が 0 以外で、解決後の goal が `speed` なら `room` に変更します。明示的な `--goal room` や `--goal room:MiB` と併用した場合も `room` のままで、`room:MiB` の VRAM reserve は別の値として保持されます（`terminal/strata_cli/tune_commands.py:31-33,192-199,328-344`）。
 
-`room` では各候補の測定後に、候補が基準設定より RSS peak を `5% + 512 MiB` 超えて増やしていないか、最小空き RAM が基準より `max(512 MiB, 総 RAM の3%)` を超えて減っていないかなどを確認します。違反した候補は失敗扱いとなり、探索対象から外れます（`strata_control/autotune.py:493-500,691-703`）。
+候補の判定では、goal が `room` で、割合が非ゼロ、総 RAM と両測定の最小空き RAM が取得できる場合に、候補の最小空き RAM が基準構成より `max(512 MiB, 総 RAM の 3%)` を超えて減ると候補を除外します。測定値は tuning worker 実行中に記録されます（`terminal/strata_control/autotune.py:721-724`; `terminal/strata_control/tune_session.py:344-347,470`）。
 
-指定値そのものを総 RAM に掛けて「必ずその割合を空ける」閾値にする処理は確認できませんでした。割合の数値は `ram_wish_pct` に渡されますが、上記の候補比較では非0かどうかだけが分岐条件で、比較幅には使われません。一方、0以外なら preset の `choices.leave_ram_pct` に値が記録されます（`strata_cli/tune_commands.py:194-196,236-239`; `strata_control/autotune.py:700-703`）。
+なお、実装は指定割合から「総 RAM の何％を必ず空けるか」という絶対的な空き容量を計算していません。値が 1〜50 のどれでも、この比較条件の有効・無効は非ゼロかどうかで決まり、比較幅は総 RAM の 3%（または 512 MiB）です。従って、指定割合の空き RAM が保証されるわけではありません。コード上、OS にメモリ上限を設定したり、エンジン引数として割合を渡したりもしません（`terminal/strata_cli/tune_commands.py:342-345`; `terminal/strata_control/autotune.py:721-724`）。
 
-この希望とは別に、測定開始時は利用可能メモリを読み、最低3,584 MiBと測定に必要な追加量を確保できない場合は待機または候補の skip が起きます。空きメモリを読めない場合、この tuner 側のガードは判定を通し、エンジン自身のガードに委ねます（`strata_control/autotune.py:35,268-301`）。
+成功結果が `improved` または `default_confirmed` で `--no-save` が指定されていない場合、preset を作成・有効化します。非ゼロ値は preset の `choices.leave_ram_pct` に記録されます（`terminal/strata_cli/tune_commands.py:396-410`; `terminal/strata_control/presets.py:293-295,308-313`）。
 
 ## 適用条件と副作用
 
-- メモリ比較による候補制約は `goal == "room"` のときに適用されます。`--leave-ram` が0以外なら `speed` から自動的にこの目標へ切り替わります（`strata_cli/tune_commands.py:184-196`; `strata_control/autotune.py:695-703`）。
-- このオプションは対象 profile / run configuration 自体のメモリ量を変更しません。自動 tuning は engine worker を使って測定し、試行履歴を記録します。測定結果が `improved` または `default_confirmed` で `--no-save` がなければ preset を作成し、その選択情報に非0の値を保存します（`strata_cli/tune_commands.py:217-230,236-249`）。
-- `--output json` でなければ進捗は標準エラーへ出ます。`--work-dir` 未指定時は一時ディレクトリを作り、`--status-file` 指定時は進捗 JSON を更新します（`strata_cli/tune_commands.py:205-219,209-215`）。
+- 値の検証は対象設定を読み込み、Hy4 / Inkling の tuning 対象外判定をした後に行われます（`terminal/strata_cli/tune_commands.py:314-329`）。
+- メモリ比較は `room` 目標でのみ有効です。`--leave-ram 0` では割合による比較をしません（`terminal/strata_control/autotune.py:721-724`）。
+- 実際の tuning ではモデル engine を起動して測定します。`--plan` を併用すると候補計画を表示して終了し、tuner の測定には進みません（`terminal/strata_cli/tune_commands.py:349-353,371-387`）。
+- 保存条件を満たすと preset の作成・有効化に加え、試行履歴と tuning report の保存処理が行われます。`--no-save` は preset 保存を抑止しますが、試行履歴・report の保存経路とは別です（同 `:396-425`）。
 
 ## 出力とエラー
 
-- 0〜50の範囲外は終了コード `2`。人向け出力では `strata: --leave-ram is a percentage from 0 to 50` を標準エラーへ出します。`--output json` の場合は `ok: false` と `error.code`, `error.message` を含む JSON を標準出力へ出します（`strata_cli/tune_commands.py:95-108,184-185`）。
-- 正常な tuning の終了コード・結果表示は測定結果によって決まります。測定前の対象解決や engine 不在などでも別のエラー経路があり、このオプション固有の成功終了コードはありません（`strata_cli/tune_commands.py:178-190,230-261`）。
-- 値を省略した場合や整数でない値を渡した場合は `argparse` の usage/error 経路です。余分な引数も parser error に送られます（`strata_cli/tune_commands.py:31`; `strata_cli/cli.py:2223-2231`）。
+範囲外の値は `--output human` では `stderr` に `strata: --leave-ram is a percentage from 0 to 50` を出し、終了コード `2` です。`--output json` では同じエラーを `ok: false` の JSON として標準出力に出します（`terminal/strata_cli/tune_commands.py:50,109-114,328-329`）。
 
 ## 根拠
 
-- `strata_cli/tune_commands.py:20-46` — `strata tune auto` parser、型、既定値、同階層の `--goal`。
-- `strata_cli/tune_commands.py:139-147,174-196` — goal の解釈、値の検証、goal 切り替え、tuner option への引き渡し。
-- `strata_cli/tune_commands.py:205-261` — 進捗、work directory、status file、試行記録、preset 保存、出力と終了コード。
-- `strata_control/autotune.py:35,50-68,268-301` — tuner の RAM 既定ガードと測定前の待機・skip 条件。
-- `strata_control/autotune.py:437-500,691-711` — 候補測定と room goal における基準設定とのメモリ比較。
-- `strata_cli/cli.py:2217-2231` — `argparse` の余分な引数処理。
+- `terminal/strata_cli/cli.py:514,1722-1723` — `tune auto` parser の登録と実行先。
+- `terminal/strata_cli/tune_commands.py:21-50` — parser、型、既定値、関連オプション。
+- `terminal/strata_cli/tune_commands.py:314-353` — 対象適用条件、範囲検証、goal 切替、tuner options への受け渡し、計画表示。
+- `terminal/strata_control/autotune.py:54-67,713-732` — RAM 希望値と候補のメモリ超過判定。
+- `terminal/strata_control/tune_session.py:344-347,462-470` — tuning 実行中の空き RAM 測定と結果への記録。
+- `terminal/strata_cli/tune_commands.py:396-425`; `terminal/strata_control/presets.py:293-313` — preset 作成条件と割合の保存。

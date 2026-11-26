@@ -1,53 +1,52 @@
 # `STRATA_SPEC_COST`
 
-調査対象: Strata `main` の HEAD `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-MTP（multi-token prediction）を使う speculative decoding で、次の検証 window に含める draft 数を、draft の受理見込みと window の実測コストから選びます。従来の `--spec-min-p` による各 draft の確率しきい値で連鎖を止める代わりに、DraftPolicy が「各幅で期待できる確定 token 数 ÷ 検証コスト」を比較して、続けるかを逐次決めます。選ぶのは検証する draft の幅であり、この変数自体が draft token や verifier の判定を変更する処理はありません。
+MTP drafter が提案する draft の個数、つまり target model が検証する window 幅を、draft の確率から推定した受理率と実測 window コストに基づいて決めます。既定の `--spec-min-p` 方式ではなく MTP の chain を一段ずつ伸ばし、期待 token 数/ms が最良になる幅を選びます。検証器に渡す候補幅を選ぶ制御であり、通常 generate の出力 token は target 側で検証・commit されます（`engine/src/program/generate.cpp:24825-24827,25032-25040`; `engine/include/strata/spec/window_rule.hpp:30-33,57-70`; `engine/src/spec/draft_policy.cpp:975-1000`）。
 
-実装は server の生成ループと通常の `generate` ループにあります。server では engine の生成ループ初期化時、通常の generate では生成ループ初期化時に値を読みます。どちらもリクエストごとの再読込ではありません。server の DraftPolicy は複数リクエストをまたいで受理率とコストを学習します。
+実装は通常 generate と `--serve` の両ループにあります。`use_mtp` が偽なら chain callback は登録されず、MTP の window 選択には作用しません。DFlash2 がその round の候補を作る場合も cost rule は適用されず、MTP fallback が候補を作った round に限って適用されます（`engine/src/program/generate.cpp:12309-12314,16419-16428`; `engine/include/strata/spec/window_rule.hpp:16-33`; `engine/src/program/generate.cpp:22702-22709,25032-25039`）。
 
 ## 値と判定
 
-両方の読み取り箇所とも `getenv()` の結果が存在し、先頭文字が `'1'` なら有効です。文字列全体の比較や数値 parse はしません。
+両経路とも `std::getenv` の結果が null でなく、かつ `v[0] == '1'` の場合だけ有効とします。文字列全体の parse・数値変換・大文字小文字変換はありません。空文字は無効、`1`, `1abc`, `10` は有効、`0`, `true`, ` 1`, `01` は無効です（`engine/src/program/generate.cpp:16419,24827`）。
 
-| 値 | 判定 |
-|---|---|
-| unset | 無効 |
-| 空文字 | 無効（値は存在するが先頭文字が `\0`） |
-| `1`, `10`, `1anything` | 有効 |
-| `0`, `true`, ` 1` など、先頭が `1` でない文字列 | 無効 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 一般の読み取り | `getenv` が null なら無効 | 先頭文字が `1` | 空文字、`0`, `true`, ` 1` |
+| CUDA の均一 sm_121 (GB10) 起動時既定 | `STRATA_SM121_PERF=0` または `STRATA_DEFAULTS=026` でなければ、未設定時に `1` を注入 | 上記既定、または利用者が設定した値の先頭が `1` | 利用者が設定した空文字や `0...` は既定注入を抑止し、無効 |
 
-大文字小文字、空白除去、数値としての妥当性確認はありません。起動後に環境を書き換えても、既に初期化された生成ループの判定には反映されません。
+明示的に設定された値は「何であっても」既定値より優先されます。既定注入は CUDA build で、可視 CUDA GPU がすべて同一 compute capability のときに行われます。表に `STRATA_SPEC_COST=1` があるのは sm_121 のみです。sm_121 の表自体は `STRATA_SM121_PERF=0` または `STRATA_DEFAULTS=026` で省かれます。HIP/Metal/SYCL や混在 compute capability の CUDA ではこの表から値は注入されません（`engine/src/program/generate.cpp:4421-4449`; `engine/src/core/nv_defaults.cpp:176-180,202-205,222-234`）。
 
 ## 有効になる条件
 
-- MTP が利用されるとき、生成ループに MTP の chain rule を登録し、各 draft の確率を受け取って次の draft を計算するか決めます。MTP を使わない場合はこの chain rule は登録されず、MTP window の選択にも使われません。ただし `DraftPolicy` の robust cost mode 自体は有効になるため、suffix draft (`--lookup`) がある場合はその窓選択にも影響し得ます。
-- `--spec-min-p` が設定されていても、MTP の draft chain では登録済み chain rule がしきい値判定より優先されます。また、次の window 幅の決定も `STRATA_SPEC_COST` の `chain_rows` が優先されます。
-- `--mtp-max-t` があれば上限は `min(--mtp-max-t, --spec)`、なければ `--spec` です。初回 window は専用の初回処理を行い、コストに基づく通常の幅選択は初回の後からです。残り context や VRAM による window 上限も適用されます。
-- server の pipeline window 経路は独自の chain launch 処理を持ちます。ここで説明する逐次の chain rule/window 選択は、server の通常の逐次 decode loop に入った場合の挙動です。
-- `STRATA_SPEC_COST_TABLE` が設定されていれば、`STRATA_SPEC_COST` が有効な場合に限り、起動時の初期コスト表として読み込みます。実測値で更新される初期値です。
+- MTP drafter がロードされ、その MTP chain が当該 round の候補を生成すること。`--draft auto` では request ごとに選ばれた drafterが MTP である場合に限ります（`engine/src/program/generate.cpp:16402-16413,16423-16428`）。
+- 初回 window では cost rule を使いません。serve では初回 window に prompt merge がある場合も caller が幅を設定します（`engine/include/strata/spec/window_rule.hpp:30-33`; `engine/src/program/generate.cpp:22702-22711,25038-25040`）。
+- DFlash2 候補の round では使われません。`--draft-fallback` 等で MTP がロード済みでも、DFlash2 が実際の候補源なら cost window は適用されません（`engine/include/strata/spec/window_rule.hpp:16-33`; `engine/src/program/generate.cpp:22703-22709,25032-25039`）。
+- `--spec-min-p` と同時に有効なとき、MTP 候補の幅は cost rule が選びます（`choose_window` の分岐順）。ただし後段の suffix lookup が policy により幅を差し替えることがあります。CLI の `STRATA_SPEC_T_CYCLE` はさらに後で幅を上書きします（`engine/include/strata/spec/window_rule.hpp:57-70`; `engine/src/program/generate.cpp:25032-25053,25042`）。
+- `STRATA_SPEC_PROB=1` の gated proposal は、`own_window_rule` にこの変数が含まれるため利用不可となり、一度 stderr に理由を出して古い acceptance rule を維持します（`engine/src/program/generate.cpp:3543-3562,24842-24845`）。
 
 ## 実行時の詳細
 
-1. `DraftPolicy` は `--spec` による最大幅で作られ、robust cost mode を有効にします。MTP がある場合は `MtpDrafter::set_chain_rule()` にコールバックを登録します。
-2. draft ごとに、その draft の確率を受け取ります。Policy は確率 bucket ごとの実測受理率を用いて chain の期待確定 token 数を更新し、window 幅ごとの期待値をコストで割って比較します。次の幅が現在の最良幅を所定の margin だけ上回る見込みがある間、または未測定幅を試す条件を満たす間は chain を続けます。chain の上限に達した場合も最後の draft を Policy に通知します。
-3. chain が終わると、記録した `chain_rows` を次の verify window の幅に使います。MTP の受理率は各 timed MTP round の結果から更新され、window コストも round 計測から更新されます。したがって、この状態は process 内で学習され、server ではリクエストをまたいで保持されます。
-4. robust mode では、未測定幅の最初の graph capture round を通常のコスト標本として採用せず、他の幅から推定したコストを使います。幅に既知コストがある場合、極端に遅い標本は既知値の 2 倍を上限にして学習します。これは一時的な遅延や初回 capture によって幅が恒久的に選ばれなくなるのを避けるための Policy 内処理です。
+値は serve loop への入り口と通常 generate の speculative loop 初期化時にそれぞれ一度読みます。読み取り値はその serve プロセスまたは generate 実行の間保持され、後から環境を書き換えても反映しません。policy の cost・受理率・文脈 bucket は各 round の観測に応じて更新されますが、これは環境変数の再読ではありません（`engine/src/program/generate.cpp:16419-16428,24825-24830`; `engine/src/spec/draft_policy.cpp:966-1000`）。
 
-有効時、通常の `generate` は終了時に `spec cost table` 行を stdout に出力します。serve の逐次 decode は同じ Policy を使いますが、この終了時出力は通常の generate loop のものです。
+有効時、MTP drafter は各 draft step の後で callback を呼び、現在の幅を伸ばすか決めます。policy は draft 確率から受理率を推定し、現在の文脈位置 (<6K, <24K, それ以上) の測定コストに対する期待 token 数/ms を比較します。未測定幅は一定条件で探索されます。round 終了後に実測値と受理結果を policy に反映し、次の選択に使います（`engine/src/core/mtp.cpp:2001-2024`; `engine/src/spec/draft_policy.cpp:530-550,966-1000`; `engine/src/program/generate.cpp:22667-22668,23208-23214,25018-25019,25243-25245`）。
 
-## 関連する `STRATA_SPEC_COST_TABLE`
+`STRATA_SPEC_COST_TABLE` が設定され、空でなく、この変数が有効な場合は起動時に初期コスト表として読みます。値は最大 3 bucket の `;` 区切り、それぞれ数値を `,` 区切りする形式で `atof` に渡されます。cost policy は実測 round cost も更新に使います（`engine/src/program/generate.cpp:24874-24890`; `engine/src/spec/draft_policy.cpp:521-528,668-679`）。
 
-この別変数はコスト-aware モードが有効な場合だけ参照され、空でない値を「コンテキスト長 `<6K`, `<24K`, `>=24K` の3群」に対応するセミコロン区切りリストとして読みます。各リストは窓幅1からのカンマ区切りミリ秒値です。実装は各要素を `atof` で変換し、正の値だけを空のコスト枠へ重み6で seed します。文字列全体の厳密な検証はなく、8幅を超える値と3群を超えるリストは採用されません。以後、実測コストが表を更新します。
+## ログと測定値
+
+通常の generate は終了時に `window sizes` と `spec cost table` の行を stdout に出します。前者には幅ごとの回数と `cost rule 1`、後者には bucket ごとの `Tn:cost(n=...)` が表示されます（`engine/src/program/generate.cpp:25257-25278`; 表示は通常 generate loop）。serve では `STRATA_DRAFT_LOG` が設定されていれば request ごとの診断行が出ますが、cost rule 固有の必須ログではありません（`engine/src/program/generate.cpp:16416-16419`）。値が無効な場合にこの変数固有の警告やエラーはありません。
+
+`docs/DGX_SPARK_LINUX.md:117,128-134` は GB10 上の `STRATA_SPEC_COST=1` で decode +4.7% と記録し、コスト対応窓は試行する draft を変えるだけと説明しています。これは同資料の測定記録であり、他機種や設定での性能保証ではありません。`engine/src/core/nv_defaults.cpp:202-205` にも IQ3_S の測定値 1.047x と 24/24 greedy answers 同一との記録があります。文書記録と一般的な出力同一性を混同せず、ソースで確認できるのは window 幅の選択・候補の検証経路までです。
 
 ## 根拠
 
-- 値の読み取り、Policy 初期化、chain rule 登録: `src/program/generate.cpp:11177-11188`（serve）、`src/program/generate.cpp:16428-16453`（generate）。
-- window 幅の適用と `--spec-min-p` との優先: `src/program/generate.cpp:14880-14889`（serve）、`src/program/generate.cpp:16531-16553`（generate）。
-- chain rule と `min_p` 判定の選択、上限に達した場合の最終通知: `src/core/mtp.cpp:1685-1708`。
-- コスト表の読み込み形式と seed 条件: `src/program/generate.cpp:16432-16447`、`src/spec/draft_policy.cpp:67-74`。
-- robust mode の初回標本・外れ値処理、確率較正、幅選択の基準: `src/spec/draft_policy.cpp:55-65,154-173,182-223`。
-- 通常 generate の終了時コスト表出力: `src/program/generate.cpp:16713-16715,16745`。
-- `docs/DETAILS.md` と関連設計資料には、この環境変数によるコスト-aware MTP window の使用条件や測定値の説明を確認できませんでした。ここではソースコードで確認できる処理だけを記載しています。
+- `engine/src/program/generate.cpp:16419-16428` — serve 経路での読み取り、robust policy 設定、MTP callback。
+- `engine/src/program/generate.cpp:24825-24830,24842-24845,24874-24890` — 通常 generate での読み取り、gated proposal 条件、コスト表。
+- `engine/include/strata/spec/window_rule.hpp:30-33,57-70` — 初回/DFlash2 条件と `--spec-min-p` との選択順。
+- `engine/src/spec/draft_policy.cpp:530-550,966-1000` — context bucket、確率受理率、幅の選択。
+- `engine/src/core/mtp.cpp:2001-2024` — draft ごとの callback 実行。
+- `engine/src/program/generate.cpp:4421-4449`; `engine/src/core/nv_defaults.cpp:176-180,202-205,222-234` — CUDA の既定注入と利用者設定の優先。
+- `engine/src/program/generate.cpp:3543-3562` — `STRATA_SPEC_PROB` との競合時の警告・fallback。

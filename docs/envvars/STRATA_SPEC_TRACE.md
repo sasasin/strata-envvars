@@ -1,51 +1,45 @@
 # `STRATA_SPEC_TRACE`
 
-調査対象: Strata `main` の HEAD `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。調査時の Strata checkout は `main` で未コミット変更なし。
 
 ## 役割
 
-CLI の speculative generation ループで、検証ウィンドウごとの値を指定ファイルへ記録するベンチマーク・診断用フックです。生成方針やモデル計算を切り替えず、ラウンドの計測値と draft probability を後から調べるためのテキスト記録を出します。通常の逐次生成や serve のリクエスト処理にこの記録処理はありません。
+投機デコードの各ラウンドをファイルへ記録する計測用スイッチ。生成方法や採用する token を指定する設定ではなく、Strata が計測情報を出力するだけで、通常の生成結果を選ぶロジックには使われない。`engine/src/program/generate.cpp` の `--serve` 経路と `strata generate` 経路に読み取り箇所がある（21658-21660、24823-24830）。
 
 ## 値と判定
 
-| 環境変数の状態 | 動作 |
-|---|---|
-| 未設定 | 記録しない |
-| 空文字 | 記録しない |
-| 空でない文字列 | その文字列をファイル名として `fopen(path, "w")` を試みる |
+どちらの経路も `std::getenv` で取得し、未設定または空文字ならファイルを開かない。空でない文字列は値全体をファイル名としてそのまま `std::fopen` に渡す。真偽値・数値・大文字小文字・前後空白の検査や値域の制限はない。したがって `0`、`1`、`true`、`false`、`0anything` はいずれも空でないため有効なパスとして扱われる。実際に開けるかどうかは `fopen` の結果による（21659、24830）。
 
-値の数値変換、真偽値判定、空白除去、パスの加工はありません。相対パスはプロセスの作業ディレクトリ基準です。`"w"` で開くため、同名ファイルがあれば内容を上書きします。ファイルを開けなかった場合は記録先が null のままになり、警告やエラーを出さずに通常の生成を続けます。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `--serve` 経路 | 記録しない | `trace.txt`、`0`、`true` | 空文字。パスを開けない場合も記録できない |
+| `strata generate` 経路 | 記録しない | `trace.txt`、`0`、`true` | 空文字。パスを開けない場合も記録できない |
+
+CLI 引数や設定ファイルによる上書き・優先順位はなく、この変数は出力先だけを指定する。投機デコード自体が動くかは各経路の通常の実行条件に従う。
 
 ## 有効になる条件
 
-- `src/program/generate.cpp` の speculative generation ループに入り、`strata::spec::spec_loop_runs(...)` が true であることが必要です。CLI の `--spec` 等で speculative ループを使わない実行では、この環境変数を読みません。
-- `timed_round` は `!first_window` で決まります。native pack で最初の window を loop 内で処理する場合はその window が除外されます。通常の経路では speculative loop に入る前に最初の token を処理済みなので、loop 内の最初の window から出力対象です。いずれも正常に計測処理を完了した timed round が対象です。
-- 値を読むのはループ初期化時の一度だけです。ファイルの open に失敗しても再試行せず、実行中に環境を書き換えても記録先は変わりません。
+- `--serve` ではリクエストの投機デコード処理に入り、計測対象ラウンドが発生すること。ファイルは追記モード `"a"` で開く（21658-21660）。
+- `strata generate` では投機ループが実行されること。ファイルは書き込みモード `"w"` で開くため、既存ファイルは開いた時点で切り詰められる（24823-24830、24459-24467）。
+- 両経路とも先頭ウィンドウは `timed_round = !first_window` により記録対象外。以降もファイルが正常に開けているラウンドだけ書き込む（serve: 22799、23195-23205、CLI: 25081、25234-25237）。
+- `fopen` が失敗するとポインターが null のままになり、記録処理は行われない。対象箇所に失敗を知らせるログや終了処理はない（21659、23195、24830、25234）。
+- `STRATA_SPEC_TRACE_NOPICK` は別の環境変数で、serve 側の lookup draft の採否に影響する。`STRATA_SPEC_TRACE` 自体はその分岐に使われない（21660、22730-22742）。
 
 ## 実行時の詳細
 
-ファイルは speculative loop の初期化時に開かれます。各 timed round の計測後、1行に次の空白区切りフィールドを書きます。
+serve 経路では関数内 `static` 初期化で最初にこの宣言へ到達した時に一度だけ環境を読み、`"a"` で開いた `FILE*` をプロセス内で共有する。同じプロセス中の後続リクエストでも同じストリームを使うため、起動後に環境変数を変更しても出力先は変わらない。リクエスト開始時には prompt 長、DFlash2 の使用有無、spec の幅を `# request prompt ...` 行に出し、以降の計測対象ラウンドについて `R`、位置、窓幅、受理数、suffix 有無、経過ミリ秒、probability、draft token、lookup token、commit token を記録する（21659、22664、23195-23205）。この `static` ストリームを明示的に閉じる処理は同ファイルにない。
 
-```text
-T a sfx ms p1 p2 ...
-```
+`strata generate` 経路では投機ループに入ったとき環境を読み、`"w"` で開く。計測対象ラウンドごとに窓幅、受理 draft 数、lookup 窓かどうか、経過時間、MTP draft probability を1行に書く。正常終了時は `fclose` する（24823-24830、25081、25234-25237、25250-25256）。いずれの経路も書き込みエラーを検査せず、出力ファイルの内容を生成処理へ読み戻さない。
 
-- `T`: 実際に verifier に渡したウィンドウ行数。suffix lookup や lookup chain、context 上限による調整後の値。
-- `a`: verifier の出力と draft が一致して受理された draft 数。
-- `sfx`: このウィンドウが suffix lookup 由来なら `1`、それ以外は `0`。
-- `ms`: ラウンド開始から次の draft 作成までの経過時間（ミリ秒）、小数第3位まで。生成ループはこの測定値を集計にも使います。
-- `p1 ...`: ラウンドの window 選択に使われた draft probability 配列 `dwin` の先頭 `o.spec - 1` 要素、小数第4位まで。ウィンドウ幅にかかわらず列数は `--spec` に基づき一定です。
+## ログと測定値
 
-最後の行には改行を付け、生成ループ終了後にファイルを閉じます。EOS を受理した round はループ内で計測・出力処理に進む前に抜けるため、その round の行は出力されません。生成途中のエラーで関数が早期 return した場合も、通常の終了時 close 処理には到達しません。
-
-この変数自体による stdout/stderr のログや生成結果の変更はありません。ファイル出力の `fprintf` / `fclose` の戻り値も検査していないため、open 後の書き込み失敗はコード上で報告されません。
+この変数による stderr/stdout の有効・無効ログはない。出力先ファイルの open 失敗も通知されない。serve の記録行は `R ... | ...` 形式、CLI の記録行は `T a sfx ms p1 p2 ...` 形式で、列の出力は `engine/src/program/generate.cpp:23195-23205` および `:25234-25237` にある。Strata の `docs/DETAILS.md` に本変数固有の測定値や仕様の説明は見当たらない。
 
 ## 根拠
 
-- `src/program/generate.cpp:16095-16103` — speculative generation ループへの条件付き進入。
-- `src/program/generate.cpp:16398-16407` — ベンチ用途の説明、環境変数の読み取り、空値判定、`"w"` での open。
-- `src/program/generate.cpp:16583-16586,16646-16649` — 最初の window と timed round の区別、および受理 draft 数。
-- `src/program/generate.cpp:16693-16715` — EOS 判定後の計測、行の書き出し、フィールド形式と値の精度。
-- `src/program/generate.cpp:16720-16726` — ループ正常終了時の commit 待ちとファイル close。
-
-`docs/DETAILS.md` と関連資料に `STRATA_SPEC_TRACE` の追加仕様や測定結果は見つかりませんでした。上記は調査対象 commit の実装から確認できる範囲です。
+- 候補一覧への掲載: `docs/envvars/000_envvers.md:2101`。
+- serve の読み取り、追記 open、計測行: `engine/src/program/generate.cpp:21658-21660`、`:22664`、`:23195-23205`。
+- serve の初回ラウンド除外: `engine/src/program/generate.cpp:22799`。
+- `STRATA_SPEC_TRACE_NOPICK` との別個の分岐: `engine/src/program/generate.cpp:21660`、`:22730-22742`。
+- CLI 経路の読み取り、上書き open、計測行、正常終了時の close: `engine/src/program/generate.cpp:24823-24830`、`:25081`、`:25234-25237`、`:25250-25256`。
+- CLI 投機ループの開始条件: `engine/src/program/generate.cpp:24459-24467`。

@@ -1,55 +1,55 @@
 # `STRATA_SM70_TABLE`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の Volta（compute capability 7.0、sm_70）で、3つの最適化経路を opt-in で有効にします。
-
-- hyper-connection（HC）の multi-token read に、Volta 向け latency-hidden norm/up カーネルを選びます。
-- grouped native expert の expert mode 8（SwiGLU と q8_1 quantize を含む fused gate/up 経路）を選びます。
-- interleaved native MMVQ の対応判定で Volta 向け rows table を許可します。
+CUDA の Volta（compute capability 7.0、sm_70）で、グループ化された native expert の mode 8、interleaved MMVQ、hyper-connection の fast norm/up を選べるようにする数値スイッチです。3つの機能は別々の条件で判定されます。Strata は同じ変数を CUDA カーネル実装内で読みます。起動時に CUDA デバイスの条件が合えば未設定の変数を `1` に補いますが、この既定注入がなくても、各機能は変数を直接読みます（`engine/src/core/nv_defaults.cpp:136-163,222-257`、`engine/src/program/generate.cpp:4421-4449`、`engine/src/kernels/cuda/iq_kernels.cu:6763-6802`、`engine/src/kernels/cuda/native_mmvq.cu:4189-4228`、`engine/src/kernels/cuda/fused_gr.cu:4073-4084`）。
 
 ## 値と判定
 
-3つの読み取り箇所はいずれも `std::atoi` の結果が 0 以外かで判定します。文字列全体の数値 parse や `1` との比較ではありません。
+各カーネルの直接判定は `std::getenv` した文字列を `std::atoi` に渡し、変換結果が 0 でないかを見ます。数値全体の検証や範囲制限はありません。`atoi` は先頭の空白と符号を許し、先頭の数値部分を変換して後続文字を無視します。したがって `1`、`-1`、`+2`、` 1tail` は有効、`0`、`0tail`、空文字、`true`、`tail1` は無効です。数値として読める先頭部分がない文字列は 0 になります。`atoi` の範囲外入力の結果はコードで扱っていません（`engine/src/kernels/cuda/iq_kernels.cu:6782,6800`、`engine/src/kernels/cuda/native_mmvq.cu:4193`、`engine/src/kernels/cuda/fused_gr.cu:4082`）。
 
-| 値 | 各経路での判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字、数値に変換できない文字列（例: `true`） | `atoi` が 0 を返すため無効 |
-| `0`、`0abc`、`0.5` | 先頭の整数変換が 0 のため無効 |
-| `1`、`2`、`-1`、`1abc`、` 1` | `atoi` が 0 以外を返すため有効 |
+| 判定箇所 | unset（直接判定時） | 設定時に有効 | 設定時に無効 |
+|---|---|---|---|
+| mode 8（CUDA sm_70） | 無効。通常起動で既定注入の条件を満たすと `1` が設定される | `atoi(value) != 0`。例: `1`, `-1`, `2tail` | 空文字、`0`, `0tail`, `true`, 数字で始まらない文字列 |
+| interleaved MMVQ（CUDA sm_70） | 無効 | `atoi(value) != 0` | 空文字、`0`, `0tail`, `true`, 数字で始まらない文字列 |
+| fast norm/up（CUDA、Voltaのみ） | `STRATA_GR_FAST` も未設定なら無効 | `atoi(value) != 0` かつ現在デバイスが sm_70 | `atoi(value) == 0` または現在デバイスが sm_70 でない |
 
-したがって、`STRATA_SM70_TABLE=1` が一般的な指定ですが、コード上は正の `1` に限定されません。空白や後続文字の扱いも `atoi` の変換に従います。
+起動時の既定注入は CUDA ビルドで、可視デバイスが1台以上あり全台の compute capability が同じときに行われます。全台が sm_70 で、`STRATA_SM70_PERF` の先頭文字が `0` でなく、`STRATA_DEFAULTS` が `026`・`0.2.6`・`v0.2.6` のいずれでもなく、かつ `STRATA_SM70_TABLE` が未設定なら、Strata はプロセス環境へ `STRATA_SM70_TABLE=1` を設定します。既に設定されていれば空文字を含め値を保持します。混在 compute capability ではこの表を適用せず、`STRATA_SM70_PERF=0` または `STRATA_DEFAULTS=026` でも既定注入しません（`engine/src/program/generate.cpp:4421-4450`、`engine/src/core/nv_defaults.cpp:15-18,136-163,222-237`、`engine/include/strata/core/defaults_026.hpp:21-29`）。
+
+対象変数を直接指定する CLI 引数は確認できません。`--gpu` は可視デバイスを変えるため、同一 compute capability かどうかを含む既定注入条件には間接的に影響します（`engine/src/program/generate.cpp:3781-3801,4421-4449`）。
+
+既定注入を抑えるマスタースイッチがあっても、`STRATA_SM70_TABLE` を明示設定すればその値は保持され、カーネル側の直接判定が使われます。`STRATA_SM70_PERF` の抑止は先頭文字が `0` かどうかで見ますが、対象変数自身は `atoi` 判定です（`engine/src/core/nv_defaults.cpp:15-18,139-143,222-233`）。
 
 ## 有効になる条件
 
-- **HC norm/up:** CUDA ビルドで、現在の GPU が sm_70 であることが必要です。`STRATA_GR_FAST` が `atoi` で 0 以外なら、この変数より優先して fast path を選び、`STRATA_GR_FAST=0` ならこの変数が有効でも fast path を使いません。HIP GFX906 ビルドでは別の既定経路が使われ、この変数は参照されません。
-- **expert mode 8:** CUDA ビルドの grouped native expert 経路で、現在の GPU が sm_70 であることが必要です。`STRATA_EXP_MODE` の `atoi` 結果が 0 以上なら、その値が自動選択より優先されます（例: `STRATA_EXP_MODE=0` は CUDA layout）。CUDA の grouped expert 呼び出しで `grid_groups > 0 && grid_groups < cap_groups` の場合は mode 0 を使うため、この変数による mode 8 選択はその呼び出しでは適用されません。mode 8 でも、実際の fused gate/up カーネルには expert weight type と `n_ff % 32 == 0` の条件があります。
-- **interleaved MMVQ rows table:** CUDA のみの機能です。GPU が sm_70 であり、`STRATA_MMVQ_IL` が有効で、対応する type・shape に非ゼロの rows 数がある場合に限って使われます。`STRATA_MMVQ_IL` は未設定なら有効、先頭文字が `0` なら無効です。対応する `native_mmvq_il` の type は 23、12、13、14、11 で、列数は 1〜4です。Volta の table に登録がない type や shape は通常の `native_mmvq` に fallback します。`STRATA_MMVQ_IL_ROWS` のユーザー指定行設定が一致する場合は、architecture table より先にその値が使われます。
-- Pascal sm_60、他の GPU 世代、および HIP の interleaved MMVQ stub をこの変数で有効化することはありません。
+- **mode 8:** CUDA の sm_70 で、`STRATA_EXP_MODE` が mode 8 を上書きしていないことが必要です。`g_exp_mode` または `STRATA_EXP_MODE` の `atoi` 結果が 0 以上なら、そちらが優先されます。両方とも自動選択のままでも、部分グループの呼び出し（`grid_groups > 0 && grid_groups < cap_groups`）では CUDA layout の mode 0 を使います。mode 8 の fused gate/up はさらに対象量子化型、埋め込み幅、`n_ff % 32 == 0` などの条件を満たす場合に限られます（`engine/src/kernels/cuda/iq_kernels.cu:6763-6802,7196-7215`）。
+- **interleaved MMVQ:** CUDA で compute capability 7.0、device ordinal が0〜15、`g_multi_exact` が有効、列数が1〜8、量子化型がコードの対象5種（23, 12, 13, 14, 11）であり、その型・列数・出力幅に対する Volta table の行数が0でない必要があります。条件を満たさない場合は通常の `native_mmvq` にフォールバックします。主な grouped-expert 呼び出しでは `q8_1_il` scratch があり、2 token 以上の場合に gate/up の interleaved 経路を検討し、down 側も同様に条件判定します（`engine/src/kernels/cuda/native_mmvq.cu:4202-4228,4230-4252`、`engine/src/kernels/cuda/shared_expert.cu:229-257`）。
+- `STRATA_MMVQ_IL_PF=1` は別の任意設定で、sm_70 の interleaved MMVQ を有効化する `STRATA_SM70_TABLE` の代わりにはなりません。これも使うと該当する Volta 型・形状で追加の prefetch table を選びます（`engine/src/kernels/cuda/native_mmvq.cu:2350-2365,3964-3970`）。
+- **hyper-connection fast norm/up:** `STRATA_GR_FAST` が設定済みなら、その `atoi` 結果が優先され、`STRATA_SM70_TABLE` による既定判定は使われません。未設定時は CUDA の現在デバイスが sm_70 で、対象変数の `atoi` 結果が非0なら fast 経路を選びます。実際の分岐は `STRATA_GR_FAST_BUILD` が有効なビルドの `launch_multi` にあり、通常の multi-read 分岐が対象です。Q8 hyper-connection read、RDNA 経路、または先行する v3 経路では別の処理が先に選ばれます（`engine/src/kernels/cuda/fused_gr.cu:48-53,1782-1795,4073-4084,4286-4320`）。
+- 対象名を直接読む実装は CUDA カーネル側にあります。HIP の `native_mmvq_il_supported` 実装は常に false を返し、HIP の `cur_dev_volta()` も false です。CPU・Metal・サーバー側がこの値を独自に解釈するコードは確認できません（`engine/src/kernels/cuda/native_mmvq.cu:4255-4265`、`engine/src/kernels/cuda/fused_gr.cu:1404-1419`）。
 
 ## 実行時の詳細
 
-HC の `gr_fast()` は、ベンチ用 setter `fused_gr_set_fast()` の値を最優先し、続いて `STRATA_GR_FAST` を関数内 static 値として一度 parse します。そのどちらも指定されていない CUDA の場合に、この変数を読みます。sm_70 判定は device ordinal ごとに static cache されますが、`STRATA_SM70_TABLE` 自体は HC の呼び出し時に再度 `getenv` / `atoi` されます。
+通常の CUDA 起動では、引数解析後に visible GPU を調べ、全台が同じ compute capability の場合に `apply_nv_defaults` が各既定値を環境へ追加します。`setenv(..., 0)` を使うため既存値は上書きせず、変数を設定した場合は stderr に sm_70 の既定スイッチ一覧を出します（`engine/src/program/generate.cpp:4421-4449`、`engine/src/core/nv_defaults.cpp:222-257`）。
 
-Expert mode は `STRATA_EXP_MODE` をプロセス内 static 値として一度読みます。環境指定とベンチ setter `native_expert_set_mode()` のいずれも mode を指定しない場合に、現在の CUDA device の能力を調べ、`STRATA_SM70_TABLE` を読んだ結果を device ordinal ごとの mode cache に保存します。mode 8 は shared memory 上で grid とグループ activation を扱い、条件に合う形式では SwiGLU / q8_1 quantize と gate/up を fused kernel で処理します。
+カーネル側の読み取り時期は経路ごとに異なります。
 
-Interleaved MMVQ は verifier が `native_mmvq_il_supported()` を確認して選びます。sm_70 の opt-in を含む architecture 判定結果は device ordinal ごとに cache されるため、その device で最初に判定した後の環境変更は再評価されません。対応しない場合、呼び出し側は標準 `native_mmvq` に進みます。HIP では interleaved support 関数が常に false を返します。
+- mode 8 は `exp_mode()` の初回自動選択時にデバイスごとの `per_dev` 配列へ保存されます。`STRATA_EXP_MODE` 自体も関数内 `static` に一度だけ読みます。選択後にプロセス環境を書き換えても、そのデバイスの自動選択は更新されません（`engine/src/kernels/cuda/iq_kernels.cu:6763-6802`）。
+- interleaved MMVQ は `il_arch_ok()` の初回判定をデバイスごとの `static ok[16]` に保存します。そこで対象変数を一度読み、以後の変更は再評価しません（`engine/src/kernels/cuda/native_mmvq.cu:4193,4202-4215`）。
+- fast norm/up は対象変数を `gr_fast()` の呼び出しごとに読みます。ただし `STRATA_GR_FAST` の有無と値は関数内 `static` に保存され、sm_70 判定の `cur_dev_volta()` はデバイスごとにキャッシュされます（`engine/src/kernels/cuda/fused_gr.cu:1404-1419,4073-4084`）。
 
-これらの環境値判定自体による専用ログや警告はありません。GPU 属性取得失敗などで選択条件が成立しないときは、その経路の fallback が使われます。
+## ログと測定値
 
-## 資料との照合
+対象変数をカーネルが有効化・無効化したことだけを示す専用ログや、値の不正を理由とする終了経路はありません。起動時に Volta の既定スイッチを1つ以上追加した場合は、`strata: sm_70 (Volta): %zu exact speed switches on by default (STRATA_SM70_PERF=0 turns them off, as does STRATA_DEFAULTS=026; a switch you set is kept): ` に設定したスイッチ名の一覧を続けて stderr に出します。明示値だけで使う場合や既定スイッチを追加しない場合、この行は出ません（`engine/src/core/nv_defaults.cpp:240-255`）。
 
-`docs/NVIDIA_V100.md` は、この3経路を sm_70 向け opt-in として説明し、`STRATA_EXP_MODE`、`STRATA_MMVQ_IL`、`STRATA_GR_FAST` が個別に引き続き適用されると記しています（`docs/NVIDIA_V100.md:38-44,85-91`）。同資料の 22.8 ms→21.2 ms は V100-SXM2 上の verify window GPU work についての資料中の測定値であり、他の環境での性能を示すものではありません。
-
-HEAD 内のコミュニティ測定記録は、Tesla V100-SXM2-32GB 1台、UD-IQ4_XS native-experts pack、262144 context、int8 KV、同一条件で変数だけを切り替えた2組の順序入れ替え run を報告しています。decode は 28.16/28.64→30.92/32.94 tok/s（+9.8%/+15.0%）、生成 token は4 run間で bit-identical と記録されています。これは同記録の測定結果で、異なるモデル・GPU・設定の性能を保証しません（`bench/results/2026-10-08-community-v100-sm70-table/README.md:1-16,35-42,55-60`; 集約は `docs/COMMUNITY_BENCHMARKS.md:30-37`）。
+ソースコメントは V100-SXM2 の hyper-connection read を T=1 で `50.9 -> 46.7 us`、bitwise と記録していますが、同コメントには測定回数や他の測定条件がありません。再現可能な一般性能値としては扱えません（`engine/src/kernels/cuda/fused_gr.cu:4082`）。`docs/DETAILS.md` の sm_70 行はこの変数を含む21個の既定スイッチ群と `STRATA_SM70_PERF=0` / `STRATA_DEFAULTS=026` の解除条件を記載しており、起動時の既定注入コードと整合します（`docs/DETAILS.md:1487`）。一方、`docs/SETTINGS.md` は対応 backend を「NVIDIA and AMD」としていますが、実装箇所は CUDA 側で、HIP 側の interleaved MMVQ は `false` を返し、Volta 判定も `false` です。コード上、AMD/HIP でこの変数が有効になる経路は確認できません（`docs/SETTINGS.md:314`、`engine/src/kernels/cuda/native_mmvq.cu:4255-4265`、`engine/src/kernels/cuda/fused_gr.cu:1404-1419`）。
 
 ## 根拠
 
-- `src/kernels/cuda/fused_gr.cu:28-33,882-898,1813-1828,1030-1045`: ビルド条件、sm_70 判定、優先順位、実際に選ぶ norm/up kernel。
-- `src/kernels/cuda/iq_kernels.cu:2816-2832,3406-3431,3492-3538`: CUDA/HIP layout 条件、mode 優先順位と cache、grouped call の mode 0 条件、mode 8 kernel の条件。
-- `src/kernels/cuda/native_mmvq.cu:2518-2526,2560-2567,2640-2709,2711-2747`: CUDA 専用実装、Volta rows table、architecture cache、shape/type gate と fallback。
-- `src/core/verify.cpp:136-139,1085-1095`: `STRATA_MMVQ_IL` の既定値と interleaved path の呼び出し。
-- `docs/NVIDIA_V100.md:38-44,85-91`, `bench/results/2026-10-08-community-v100-sm70-table/README.md:1-16,35-42,55-60`, `docs/COMMUNITY_BENCHMARKS.md:30-37`: 設計説明と測定記録。
+- 既定値・抑止・起動時適用・ログ: `engine/src/core/nv_defaults.cpp:15-18,136-163,222-257`、`engine/src/program/generate.cpp:4421-4449`、`engine/include/strata/core/defaults_026.hpp:21-29`
+- mode 8 の判定・キャッシュ・呼び出し条件: `engine/src/kernels/cuda/iq_kernels.cu:6763-6802,7196-7215`
+- interleaved MMVQ の判定・キャッシュ・fallback: `engine/src/kernels/cuda/native_mmvq.cu:4193-4228,4230-4252`、`engine/src/kernels/cuda/shared_expert.cu:229-257`
+- hyper-connection の判定・キャッシュ・dispatch: `engine/src/kernels/cuda/fused_gr.cu:48-53,1404-1419,1782-1795,4073-4084,4286-4320`
+- 設定一覧との照合: `docs/DETAILS.md:1487`

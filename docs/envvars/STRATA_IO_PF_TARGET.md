@@ -1,48 +1,51 @@
 # `STRATA_IO_PF_TARGET`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux の mapped file tier I/O prefetch で、先読みした byte 数のうち実際に demand された割合を適応的に調整する目標値です。先読み使用率の EWMA がこの値を下回る window では、自動計算する window byte 予算を縮め、目標以上なら回復させます。読み込み worker や先読みそのものを直接 ON/OFF する設定ではありません。
+Linux の `FileExpertSource` が行う scheduled I/O prefetch の適応予算で、読み出し先の page cache から後で実際に使われた read-ahead bytes の比率をどの値以上に保つかを指定します。既定値は `0.5` です。比率が目標を下回ると、次の decode window の予測読み込み予算を縮め、目標以上なら回復させます。この値は予測 read-ahead の予算に作用し、需要読み込みやモデルの routing 値を変更するものではありません。値の読み込みは `FileExpertSource::set_io_prefetch`、フィードバックは `FileExpertSource::io_window_tick` です（`engine/src/core/expert_source.cpp:1202-1222,1261-1267,1292-1304`）。
 
 ## 値と判定
 
-`FileExpertSource::set_io_prefetch()` が環境変数を読み、`std::atof()` で変換した値を `[0.0, 1.0]` に clamp します。未設定ならメンバーの初期値 `0.5` を使います。空文字や数値として読めない文字列は `atof()` により `0` となり、フィードバックを止めます。数値の後ろに文字があっても `atof()` が読める先頭部分が使われます。
+環境変数が未設定ならメンバー初期値 `0.5` を使います。設定されていれば `std::atof` で数値変換し、`std::clamp(..., 0.0, 1.0)` を適用します。文字列全体の数値妥当性は検査せず、`atof` が認識する先頭の数値部分が使われます。したがって空文字や数値で始まらない文字列は `0` になり、`0anything` も `0` です。先頭空白は `atof` の変換規則に従います（`engine/include/strata/core/expert_source.hpp:1248`; `engine/src/core/expert_source.cpp:1292-1299`）。
 
-| 入力例 | 読み取られる目標値 |
-|---|---:|
-| unset | `0.5` |
-| `0`, 空文字, `abc`, `-1` | `0` |
-| `0.7`, `0.7tail` | `0.7` |
-| `2` | `1` |
+| 条件 | 未設定 | 設定時に有効になる値 | 設定時に無効・境界となる値 |
+|---|---|---|---|
+| `FileExpertSource::set_io_prefetch(true, ...)` が Linux で実行され、mapped file tier を使用 | `0.5` | 数値として変換された値を `[0,1]` に clamp。例: `0.25`, `1`, `0.7suffix` → `0.25`, `1`, `0.7` | 空文字、`true`、`garbage`、`0anything` → `0`; 負値は `0`、`1` 超は `1` に clamp。`atof` が認識する `nan` は比較で clamp されず、後続の `io_target_ > 0.0` を満たさないためフィードバックを行わない |
+| Linux 以外、prefetch を開始しない場合、または mapped file tier でない場合 | 初期値は `0.5` のまま | この呼び出しでは読み取られない | この環境変数による実行時の効果はない |
 
-目標値が `0` 以下なら、window ごとのフィードバック更新条件を満たさず、`io_scale_` は変化しません。`atof()` の数値接頭辞変換なので、文字列全体の厳密な数値検証はありません。
+`0` は feedback を止める指定です。非ゼロ値でも feedback 自体が動くとは限らず、次節の条件が必要です（`engine/src/core/expert_source.cpp:1218-1222,1261-1267,1298-1304`）。
 
 ## 有効になる条件
 
-- `strata generate --mmap-experts` の mapped file tier で、`STRATA_IO_PREFETCH` により I/O prefetch が開始されること。Linux では既定有効となる経路がありますが、既定条件はファイル tier と page cache 状態で異なります。
-- `STRATA_IO_PF_SCHED` が設定され、`atoi()` の結果が 0 以外であること。未設定、空文字、`atoi()` が 0 を返す値では scheduler が無効で、この目標値は使われません。
-- Linux 以外、unbuffered reads、mapped source が開けない場合などで `set_io_prefetch()` が有効にならなければ、値は実処理に影響しません。
-- scheduler の固定予算 `STRATA_IO_PF_BUDGET_MB` が正の値を与える場合、`io_budget_now()` は固定予算を返すため、`io_scale_` の更新は予算を変えません。固定予算がない場合に限り、feedback scale が自動予算へ掛けられます。
+- `FileExpertSource::set_io_prefetch(true, ...)` が実際に Linux で有効化される必要があります。`on` が false、`base_` が null、`paths_` が空、または unbuffered (`direct_` が空でない) なら早期 return します。非 Linux の実装は引数を使わず、環境変数を読みません（`engine/src/core/expert_source.cpp:1261-1267,1310-1312`）。
+- 通常の `strata generate` 経路では `STRATA_IO_PREFETCH` が未設定または空で Linux file-tier default が成立するか、設定値の `atoi` が非ゼロであることが prefetch 開始条件です。明示的な `STRATA_IO_PREFETCH=0` は default を上書きして無効にします。default は Linux の GGUF mapped file tier では有効、`experts.bin` では page-cache room ratio が `0.55` 以上の場合に有効です。unbuffered read や利用可能な mapped file tier がない経路では setter が有効化できません（`engine/src/program/generate.cpp:8688-8704`; `engine/include/strata/core/expert_source.hpp:1081-1094`; `engine/src/core/expert_source.cpp:1264-1277`）。
+- 適応処理には `STRATA_IO_PF_SCHED` の `atoi` 結果が非ゼロであることが必要です。未設定・空文字・数値で始まらない値・`0` は scheduler を無効にし、`STRATA_IO_PF_TARGET` が読み込まれていても使用しません（`engine/src/core/expert_source.cpp:1292-1298,3818`; `engine/include/strata/core/expert_source.hpp:998-999`）。
+- scheduler が有効でも、`io_window_tick` は新しい decode window の開始時（layer が前回より小さくなった時）に呼ばれ、その window で予測 read-ahead bytes `dpf` が増えていなければ比率を計算しません（`engine/src/core/expert_source.cpp:1202-1222,3804-3819`）。
+- `STRATA_IO_PF_BUDGET_MB` が正の値に変換されて固定予算が設定されると、その固定予算が優先され、feedback の `io_scale_` は `io_budget_now()` の予算計算に使われません。自動予算では、計測済み read rate と window 時間、`STRATA_IO_PF_BUDGET_FRAC`、`io_scale_` を使います（`engine/src/core/expert_source.cpp:1192-1200,1295-1298`）。
+- scheduler の候補投入にはさらに read-ahead が有効 (`STRATA_IO_PF_AHEAD` が未設定または `atoi` 非ゼロ)、decode gate が開いていることなどが必要です。これらを満たさない `warm_scored` 呼び出しは通常の `warm` に fallback します（`engine/src/core/expert_source.cpp:1228-1230,1284,1299-1303`）。
 
 ## 実行時の詳細
 
-値は `set_io_prefetch()` の呼び出し時に `FileExpertSource` インスタンスへ読み込まれます。生成処理では `--mmap-experts` の経路から prefetch を開始し、成功すると worker thread を起動します。設定をプロセス内で後から変えても、このインスタンスに保存された目標値は再読込されません。
+値は `set_io_prefetch` の有効化時に `getenv` で読み、`FileExpertSource` の `io_target_` メンバーに保存します。`io_window_tick` は、read-ahead 総 bytes と後で使われた bytes の前回値との差から `u = min(1, du/dpf)` を計算し、window 間の EWMA（初回は `u`、以降は `0.8 * 前回 + 0.2 * u`）を更新します。EWMA が target 未満なら `io_scale_` を `0.7` 倍（下限 `0.05`）、target 以上なら `1.1` 倍（上限 `1.0`）にします。`target=0` ではこの更新条件を満たさず、初期 scale `1.0` のままです（`engine/src/core/expert_source.cpp:1202-1222`; `engine/include/strata/core/expert_source.hpp:1245-1249`）。
 
-decode が layer 0 に戻る新しい window ごとに `begin_layer()` から `io_window_tick()` が呼ばれます。先読み総 byte 数 `dpf` と、そのうち demand された byte 数 `du` の window 差分から `u = min(1, du / dpf)` を計算します。`dpf` が 0 の window は更新しません。最初の有効 sample はそのまま `io_useful_` となり、次からは `0.8 * 前回値 + 0.2 * u` の EWMA です。
+自動予算の場合、scale は計測された worker read rate × worker 数 × window 時間 × `STRATA_IO_PF_BUDGET_FRAC` に乗じられ、予算は最低 16 MiB です。rate または window 時間が未計測なら暫定 256 MiB です。read-ahead の予測は layer/expert ごとの confidence と残り予算で admission されます。worker は decode が到達した deadline の job を破棄するため、target は読み込みの完了を保証しません（`engine/src/core/expert_source.cpp:1192-1200,1228-1258,1355-1389`）。
 
-EWMA が目標を下回ると `io_scale_ *= 0.7`（下限 `0.05`）、目標以上では `io_scale_ *= 1.1`（上限 `1.0`）です。これは `STRATA_IO_PF_BUDGET_MB` による固定 budget がない場合に、自動予算 `io_bw_ * worker数 * window時間 * STRATA_IO_PF_BUDGET_FRAC * io_scale_` を変えます。先読み job の採否はこの window budget 等で決まり、通常の demand read はこの予算で制限されません。
+値はリクエストごとではなく prefetch の有効化時に読みます。server 内で GPU cache の全 expert residency により Linux default prefetch を一時停止し、その後再開する経路では `set_io_prefetch` が再び呼ばれます（`engine/src/program/generate.cpp:10275-10285,10341-10369`）。各呼び出し時点の環境値が設定されていれば読み直します。未設定ならメンバーを初期化値に戻す代入はありません。通常のプロセス環境を実行中に変更する仕組みや、値を子プロセスへ転送する処理はこの読み取り経路にはありません。
 
-この変数専用のログ出力はありません。prefetch の診断出力には先読み byte 数、使用 byte 数、遅延・不採用数、window budget が含まれますが、設定された目標値自体は表示されません。
+## ログと測定値
+
+対象値を表示する専用ログ、警告、無効値エラーはありません。prefetch が有効で scheduler も有効な場合、`strata generate: io prefetch scheduling ON (STRATA_IO_PF_SCHED=1): a deadline per read, confidence admission (STRATA_IO_PF_MINCONF), a per-window byte budget (STRATA_IO_PF_BUDGET_MB / _FRAC)` が stderr に出ます。このログは target の実値や feedback の結果を出しません（`engine/src/program/generate.cpp:8715-8724`）。
+
+対象変数固有の性能測定値は確認できません。`docs/DETAILS.md` の Linux file-tier 節は prefetch、gate と関連値を記載していますが、この target の値や効果測定は記載していません（`docs/DETAILS.md:302-318`）。
 
 ## 根拠
 
-- `include/strata/core/expert_source.hpp:924-928, 1146-1166` — scored prefetch の条件、初期値 `io_target_ = 0.5`、scale/usefulness の初期状態。
-- `src/core/expert_source.cpp:1045-1053` — 固定予算優先と自動予算への scale の適用。
-- `src/core/expert_source.cpp:1055-1075` — window 時間・byte 差分、使用率 EWMA、scale の減衰・回復。
-- `src/core/expert_source.cpp:1114-1161` — Linux 限定処理、mapped file 条件、各環境変数の読み取りと worker 起動。
-- `src/core/expert_source.cpp:3276-3291` — layer 0 への window 切替と feedback 呼び出し。
-- `src/core/expert_source.cpp:1814-1818, 2094-2110` — 先読み済み blob が demand されたときの使用 byte 計上。
-- `src/program/generate.cpp:5610-5624, 5655-5690, 15430-15438` — `--mmap-experts` の起動経路と実行時 I/O 診断表示。
-- `docs/DETAILS.md:297-307` — file tier I/O prefetch の適用条件と動作の概要。`STRATA_IO_PF_TARGET` の具体的な値や性能比較は記載されていない。
+- `engine/include/strata/core/expert_source.hpp:1245-1249` — feedback 状態と target の初期値。
+- `engine/src/core/expert_source.cpp:1192-1222` — 自動予算、window feedback と scale 更新。
+- `engine/src/core/expert_source.cpp:1261-1312` — Linux file-tier の有効条件、全 env 値の読み込みと非 Linux 分岐。
+- `engine/src/core/expert_source.cpp:1228-1258,1355-1389` — confidence/予算による候補 admission と worker deadline。
+- `engine/src/core/expert_source.cpp:3804-3819` — decode window 境界での feedback 呼び出し。
+- `engine/src/program/generate.cpp:8688-8724,10275-10285,10341-10376` — prefetch の起動条件、観測ログ、server 内の停止・再開。
+- `docs/DETAILS.md:302-318` — 関連する Linux file-tier の説明との照合。

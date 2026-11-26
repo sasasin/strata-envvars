@@ -1,56 +1,56 @@
 # `STRATA_IO_PF_MINCONF`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux の file-tier I/O prefetch で、router が次の層向けに予測した expert を先読みキューへ採用するための最低 confidence を設定します。環境変数単独では作用せず、I/O prefetch とスケジューラが有効な場合に限り候補採否に使われます。通常の需要読み込みや expert の選択結果は変更しません。
+Linux の `FileExpertSource` におけるスケジュール済み I/O read-ahead で、ルーター予測の expert を先読みキューへ採用する confidence の基準値を指定する。未設定時は `0.5`。キューの使用量が予算に対して増えると、実際の採用閾値はこの値から `1.0` へ線形に上がる。値は通常の expert 選択やモデル出力を変えるものではなく、予測 expert の先読み採否だけに作用する（`engine/include/strata/core/expert_source.hpp:1233-1244`、`engine/src/core/expert_source.cpp:1225-1258`）。
+
+設定値を読み取る箇所は `FileExpertSource::set_io_prefetch` のみ。`STRATA_IO_PF_SCHED` が有効なら予測ごとの confidence を使い、無効なら `warm_scored` は通常の `warm` にフォールバックする（`engine/src/core/expert_source.cpp:1228-1230, 1261-1304`）。
 
 ## 値と判定
 
-値は `std::atof` で `double` に変換し、`std::clamp(..., 0.0, 1.0)` で 0〜1 に制限した後、`float` に保存します。文字列全体の厳密な数値検証はありません。
+`std::getenv` が null でないとき `std::atof` で文字列を数値変換し、`std::clamp(..., 0.0, 1.0)` で範囲に収める。文字列全体の妥当性検証はない。`atof` が数値として読めない先頭なら `0` となり、数値の後ろに文字が続いても数値部分が使われる。未設定だけが既定値 `0.5` を保つ。空文字は設定済みなので `atof("") == 0` 相当となり `0`。負値は `0`、1 より大きい値は `1` に clamp される（`engine/include/strata/core/expert_source.hpp:1236`、`engine/src/core/expert_source.cpp:1292-1298`）。
 
-| 設定 | `io_minconf_` |
-|---|---:|
-| 未設定 | 既定値 `0.5` のまま |
-| 空文字 | `atof("")` の結果 0 により `0` |
-| 数値が 0 未満 | `0` に clamp |
-| 数値が 0〜1 | 変換した値 |
-| 数値が 1 より大きい | `1` に clamp |
-| 数値として読めない文字列 | `atof` の結果 0 |
+| 条件 | unset | 有効になる値（例） | 無効・境界の値（例） |
+|---|---|---|---|
+| Linux で `set_io_prefetch(true, ...)` が初期化を完了 | `0.5` | `0`、`0.25`、`0.5`、`1`。値域は `[0,1]` | 空文字、`abc`、`0anything` は変換値 `0`。`-1` は `0`、`2` は `1` に clamp。`0.5tail` は `0.5` として扱われる |
+| 上記以外（非 Linux、prefetch を有効化しない、または初期化が途中で戻る） | 読み取りなし | 該当なし | 該当なし |
 
-`atof` は先頭から数値として読める部分を変換するため、たとえば `0.7tail` は `0.7` になります。値の読み取りは `FileExpertSource::set_io_prefetch()` が Linux で prefetch を開始するときに行われます。設定の実行中変更を再読するコードはありません。
+「無効・境界」は環境変数自体の拒否を意味しない。`atof` の変換値が採用され、範囲外だけ clamp される。大文字小文字や真偽値の比較はせず、`true` 等は数値として読めないため `0` になる（`engine/src/core/expert_source.cpp:1261-1298`）。
 
 ## 有効になる条件
 
-- Linux ビルドであること。非 Linux では `set_io_prefetch()` の処理本体がありません。
-- `STRATA_IO_PREFETCH` が有効、または Linux の file-tier 既定条件で prefetch が開始されること。
-- `FileExpertSource` に mmap base とファイル path があり、unbuffered (`direct_`) 読み込みではないこと。
-- `STRATA_IO_PF_SCHED` が設定され、`atoi` の結果が 0 以外であること。未設定・空文字・数値変換できない文字列はスケジューラ OFF です。
-- 予測先読み側でも、ahead 読み込みが有効で decode gate が開いていること。閉じている場合や `STRATA_IO_PF_AHEAD=0` の場合は、`warm_scored()` は通常の `warm()` に fallback します。
-
-`STRATA_IO_PF_MINCONF` が設定されても scheduler が OFF なら confidence 閾値として使われません。Linux 以外、unbuffered 読み込み、または file mapping 条件を満たさず prefetch 自体が起動しない場合も適用されません。
+- OS が Linux であること。`set_io_prefetch` の本体は `__linux__` 内にあり、それ以外の OS では引数を使わず何もしない（`engine/src/core/expert_source.cpp:1261-1312`）。
+- I/O prefetch が要求され、file tier の `base_` とファイルが存在し、unbuffered 経路でないこと。条件を満たさなければ設定読み取りより前に戻る（`engine/src/core/expert_source.cpp:1261-1277`）。
+- 先読みスケジューラーを使うには `STRATA_IO_PF_SCHED` が `atoi` で 0 以外になること。さらに本変数が変える採否は、`io_sched_`、`io_pf_`、`direct_` が空、`io_ahead_`、decode gate がすべて先読み経路を許す場合に限る。それ以外は通常の `warm` にフォールバックする（`engine/src/core/expert_source.cpp:1228-1230, 1292-1295`）。
+- 予測 confidence を渡す routing-aware look-ahead が動く必要がある。予測器はルーター重みが BF16 の形式であることなどを検証し、開始できない場合は `routing-aware prefetch off (...)` を出す（`engine/src/program/generate.cpp:10302-10337`）。予測の confidence は、予測対象が次層から遠いほど半減し、token 内の rank が下がるほど小さく計算される（`engine/src/core/expert_source.cpp:3749-3759`）。
+- `STRATA_IO_PF_MINCONF` 自体を無視・上書きする CLI 引数は確認できない。`STRATA_IO_PF_SCHED` が無効でも値の読み取りは行われるが、scheduler が採否に使わない。
 
 ## 実行時の詳細
 
-Router lookahead は token ごとの router logits から上位 `k_` expert を予測します。0 始まりの順位 `j` に対する候補 confidence は `(k_ - j) / k_` で、1 層より先の候補では層の距離 `dj` に応じてさらに `0.5^dj` 倍します。同じ expert が複数 token から候補になった場合は最大 confidence を渡します。
+`set_io_prefetch(true, ...)` の呼び出しで環境変数を読み、`io_minconf_` に保存する。プロセス起動時に固定で読むのではなく、I/O prefetch の初期化ごとに読む。通常は一度の初期化中に一度読み、実行中に環境を変更しても現在の `io_minconf_` は更新されない。`strata serve` が GPU cache 状態に応じて Linux の既定 prefetch を止め、後で再開する経路では `set_io_prefetch` を再度呼ぶため、その再初期化時には環境値を読み直す（`engine/src/core/expert_source.cpp:1261-1304`、`engine/src/program/generate.cpp:10275-10285, 10343-10368`）。
 
-スケジューラが有効な `warm_scored()` は、候補ごとに次の閾値を計算します。
+`warm_scored` は候補ごとに `pressure = min(1, io_q_bytes / max(1, budget))`、`bar = io_minconf + (1 - io_minconf) * pressure` を計算する。confidence が `bar` 未満なら候補を拒否し、そうでなければ当該 decode window の byte budget 超過も確認して採用する。したがって `0` はキューに空きがあると confidence の低い予測も通す一方、キュー圧力が上がるほど閾値は上がる。`1` は常に閾値 1 であり、confidence が 1 未満の予測を通さない。各 window の byte budget は別の予算制御であり、本変数がその上限を変えるわけではない（`engine/src/core/expert_source.cpp:1192-1200, 1228-1258`）。
 
-`bar = io_minconf_ + (1 - io_minconf_) * min(1, io_q_bytes_ / max(1, budget))`
+予算超過で拒否された候補や期限に間に合わなかった job は別カウンターで扱われる。採用・拒否は先読み I/O だけに関係し、需要時の読み込み経路そのものを無効化する設定ではない（`engine/src/core/expert_source.cpp:1243-1258, 1355-1378`）。
 
-キューの未開始 job が予算に対して少ないときは設定値が閾値になり、キューが予算まで詰まると閾値は 1 まで上がります。候補 confidence が `bar` 未満なら採用せず、confidence が閾値以上でも、その decode window の先読み byte budget を超える候補は別途拒否されます。resident RAM copy に存在する expert、重複 job、範囲外 ID も先読み候補から除かれます。未開始 job は layer clock による deadline を持ち、期限までに始まらなければ worker が落とします。
+## ログと測定値
 
-スケジューラが有効な場合は起動時に stderr に `strata generate: io prefetch scheduling ON (STRATA_IO_PF_SCHED=1): a deadline per read, confidence admission (STRATA_IO_PF_MINCONF), a per-window byte budget (STRATA_IO_PF_BUDGET_MB / _FRAC)` と出ます。このログは設定値そのものや個々の confidence を表示しません。拒否数の内部カウンターはありますが、この環境変数専用のログは確認できません。
+スケジューラーが有効で prefetch が実際に有効なとき、stderr に次の行が出る。設定した `MINCONF` の数値そのものは表示しない。
 
-## 文書との照合
+```text
+strata generate: io prefetch scheduling ON (STRATA_IO_PF_SCHED=1): a deadline per read, confidence admission (STRATA_IO_PF_MINCONF), a per-window byte budget (STRATA_IO_PF_BUDGET_MB / _FRAC)
+```
 
-`docs/DETAILS.md` は Linux file-tier prefetch が router 予測 expert を I/O thread で先読みする経路や、page-cache 条件、性能測定条件を説明していますが、`STRATA_IO_PF_MINCONF` の既定値や具体的な値域は記載していません。本書の閾値・clamp の説明は対象 HEAD のソースを根拠とする静的調査です。性能効果はこの変数単独では測定していません。
+I/O 統計の出力経路では、window 集計として `not admitted (confidence)` の件数を表示する。これは confidence 閾値未満で拒否した候補数であり、実際の閾値値は表示されない（`engine/src/program/generate.cpp:8719-8721, 23864-23872`）。この変数固有の性能測定値は `docs/DETAILS.md` に見当たらず、ここでは測定値を記載しない。
 
 ## 根拠
 
-- `include/strata/core/expert_source.hpp:280-286, 928, 1148-1150` — score 付き warm の API、score 要求条件、既定値。
-- `src/core/expert_source.cpp:1045-1053, 1078-1112, 1144-1155` — budget、confidence 閾値と候補採用、環境変数の parse/clamp。
-- `src/core/expert_source.cpp:3153-3182, 3216-3231, 3261-3262` — router 予測の confidence 生成と `warm_scored()` 呼び出し。
-- `src/program/generate.cpp:5655-5690` — Linux file-tier prefetch の開始条件とスケジューラ有効ログ。
-- `docs/DETAILS.md:300-307` — Linux file-tier I/O prefetch の概要。
+- `engine/include/strata/core/expert_source.hpp:1233-1253` — scheduler 状態、既定 confidence、採否用カウンター。
+- `engine/src/core/expert_source.cpp:1225-1258` — confidence 閾値、キュー圧力、候補採用と予算判定。
+- `engine/src/core/expert_source.cpp:1261-1312` — Linux 条件、環境変数の読み取り・変換・clamp、scheduler 初期化。
+- `engine/src/core/expert_source.cpp:3749-3759, 3789` — 予測 confidence の生成と `warm_scored` 呼び出し。
+- `engine/src/program/generate.cpp:10302-10337` — look-ahead の開始条件と起動失敗ログ。
+- `engine/src/program/generate.cpp:8719-8721, 23864-23872` — 有効ログと統計の出力。
+- `docs/DETAILS.md:302-317` — Linux file tier と io prefetch の関連説明。`STRATA_IO_PF_MINCONF` の個別値規則や測定値は記載されていない。

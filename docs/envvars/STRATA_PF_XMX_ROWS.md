@@ -1,48 +1,46 @@
 # `STRATA_PF_XMX_ROWS`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL の prompt prefill で `STRATA_PF_XMX=2` の fused grouped XMX 経路を使うか、各 expert の重みを FP16 に dequantize して oneMKL GEMM を実行するかを切り替える、平均 routed rows のしきい値です。グループ内 expert あたりの平均 rows がこの値より小さいと fused grouped XMX を使います。等しい場合は FP16 dequant + GEMM 側です。
-
-この変数単独では XMX を有効にしません。対象の grouped 経路には `STRATA_PF_XMX=2` が必要です。
+SYCL の prompt prefill で `STRATA_PF_XMX=2` の fused grouped XMX を使うとき、fused XMX と、各 expert を FP16 に dequantize して oneMKL GEMM に渡す経路との切り替え境界（expert あたり平均行数）を指定する。値は prefill の計算経路を選ぶだけで、CLI 引数や生成 token の選択を直接変える処理はない。実装は `engine/sycl/src/prefill/prefill.cpp` の `xflush` lambda にある（5031-5066 行）。
 
 ## 値と判定
 
-値は C/C++ の `std::atoi` で整数化され、文字列全体の検証はありません。未設定時は `200` です。空文字や数値に変換できない文字列は `atoi` の結果が `0` になり、先頭の空白や符号、数値の後ろの文字は `atoi` の変換規則に従います（例: `" 200rows"` は `200`、`"-1"` は `-1`）。
+`xflush` が fused XMX 分岐に到達した最初の時点で `std::getenv` し、未設定なら `200`、設定されていれば `std::atoi` の結果を関数内 `static const int` に保存する。文字列全体の妥当性検査はなく、先頭から `atoi` が読める整数部分を使う。先頭空白と符号は `atoi` の規則で処理され、整数に変換できない文字列や空文字は `0` になる。したがって `200rows` は `200`、`0anything`・`true`・空文字は `0` として扱われる。整数として表現できない大きさの入力の結果は C ライブラリの `atoi` の範囲外であり、Strata 側で検証・規定していない。
 
-| 設定例 | しきい値 | 効果（`STRATA_PF_XMX=2` の対象経路） |
-|---|---:|---|
-| unset | 200 | 平均 rows が200未満なら fused grouped XMX |
-| `200` | 200 | 同上 |
-| `0`、空文字、`abc` | 0 | routed rows が非負の通常ケースでは条件を満たさず、FP16 dequant + oneMKL GEMM |
-| `-1` | -1 | 同上 |
-| `300junk` | 300 | 平均 rows が300未満なら fused grouped XMX |
+| 条件 | unset | 有効になる値の例 | 無効値・境界の例 |
+|---|---|---|---|
+| fused grouped XMX 分岐に到達 | 既定 `200` | `201`、`200`、`1`、`-1`（整数としてそのまま比較） | 空文字、`0`、`0anything`、`true` は `0`。変換後 `0` 以下なら fused 側の条件を満たさない |
 
-比較は `nr / xg_n < xg_max` です。`nr` は現在のグループの routed rows 合計、`xg_n` はそのグループの expert 数で、整数除算です。そのため端数は切り捨てられます。しきい値と同じ平均値は fused 経路になりません。グループは最大サイズに達した時、またはその layer の expert 順が終わった時に処理されます。
+実際の比較は整数除算した `nr / xg_n < xg_max`。`nr` は group 内の routed row 合計、`xg_n` は group 内 expert 数であり、ここでは `xg_n > 0`。平均値が閾値より**小さい**と fused kernel を選び、等しい場合と大きい場合は dequantize + oneMKL 経路を選ぶ（`engine/sycl/src/prefill/prefill.cpp:4858-4861,5037-5066`）。
 
 ## 有効になる条件
 
-- SYCL の prompt prefill が `STRATA_PF_XMX=2` を選んでいること。
-- MMQ を使っていないこと（`!use_mmq`）。
-- layer が native pack であり、gate/up 型が `18, 21, 22, 23` のいずれか、down 型が `20, 42` のいずれかであること。
-
-条件を満たさない layer では `STRATA_PF_XMX_ROWS` は参照されず、このしきい値による切替はありません。`STRATA_PF_XMX=2` が設定されていて対象外なら、プロセス内の最初の該当時に stderr へ `strata: STRATA_PF_XMX=2 not taken at layer ...` と理由の値が出ます。
-
-ビルドにも XMX kernel の制約があります。`STRATA_NO_DG2_XMX` が定義されたビルドでは `STRATA_PF_XMX` 自体が無視されます。AOT Battlemage を sub-group 8 でビルドした場合も `STRATA_PF_XMX` は無視され、Battlemage 用 AOT build が必要です（`STRATA_XMX_SG16`）。これらは `STRATA_PF_XMX_ROWS` の独立した条件ではなく、親の XMX mode が有効になる前提です。
+- SYCL engine の prefill 経路であること。通常の CUDA/HIP 経路にはこの読み取り箇所がない。SYCL は独立した backend として構成される（`engine/CMakeLists.txt:23-33`）。
+- `STRATA_PF_XMX` が `2` に解釈され、layer が `!use_mmq`、native expert pack、対応形式などの条件を満たして `xmx2_only` になること。形式・寸法判定は `engine/sycl/src/prefill/prefill.cpp:4754-4772` にある。
+- XMX build/device 条件を通過して XMX mode が無効化されていないこと。Arc Alchemist は `STRATA_PF_XMX` 未設定時に mode 2 が既定、Battlemage は既定 0。非対応 AOT build や、sub-group 8 用 build で Battlemage を使う場合は mode を 0 にし、警告を出す（`engine/sycl/src/prefill/xmx_moe.dp.cpp:149-173`）。build 時の XMX kernel 切替は `engine/sycl/CMakeLists.txt:73-77`。
+- `STRATA_PF_XMX=1` の dequantize + grouped XMX 経路、mode 0 の通常 FP16 経路、MMQ 経路、または条件を満たさず `xmx2_only` にならない layer では、この閾値を使う fused 分岐に入りません。
+- 別の CLI 引数によるこの閾値の上書きは実装されていない。`STRATA_PF_XMX` は別変数で、XMX mode 自体を選ぶ。
 
 ## 実行時の詳細
 
-`xflush` が最初に呼ばれた時に `STRATA_PF_XMX_ROWS` を読み、その結果を関数内 `static const int` に保存します。したがって、プロセス実行中に環境変数を変えても再評価されません。環境変数が読まれるのは `STRATA_PF_XMX=2` かつ上記 layer 条件に合うグループが実際に flush される場合です。
+`xflush` は group の行数 `nr` を集計してから fused XMX 分岐を実行する。そこで初めて `STRATA_PF_XMX_ROWS` を読むため、変数の変更はプロセスの最初の該当 group より前に反映されるが、`xg_max` の初期化後は同じプロセス内で再読込されない。unset の 200 も同じく cache される（`engine/sycl/src/prefill/prefill.cpp:4850-4861,5031-5041`）。
 
-平均 rows がしきい値未満の場合、gate/up と down の積をそれぞれ `iq_xmx_grouped` で処理し、間に SwiGLU を実行します。しきい値以上では、各 expert の gate/up と down の量子化重みを FP16 に dequantize し、oneMKL の FP16 GEMM を expert ごとに実行します。どちらの分岐も同じ prefill の中間出力 `GU` / `Dm` を作る経路です。XMX 経路が選ばれると、最初の flush で stderr に `strata: prompt experts on the fused grouped XMX (STRATA_PF_XMX=2)` が出ます。しきい値自体や選択結果ごとの追加ログはありません。
+条件が真なら gate/up と down の両方に `iq_xmx_grouped` を呼び、間に SwiGLU を実行する。偽なら expert ごとに重みを FP16 へ dequantize し、gate/up と down を `m.gemm.f16` で処理する（`engine/sycl/src/prefill/prefill.cpp:5041-5066`）。どちらも同じ group の routed rows に対する expert 計算経路の切替である。kernel 側は group 数・寸法・量子化形式の不正を stderr に出して `exit(1)` するが、通常この呼び出しに渡す group と寸法は同じ prefill 側のデータから作られる（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:8168-8174`）。
+
+## ログと測定値
+
+fused XMX 分岐に到達したときは stderr に `strata: prompt experts on the fused grouped XMX (STRATA_PF_XMX=2)` を一度出す。閾値の実値や、group ごとにどちらの枝を選んだかを示すログはない（`engine/sycl/src/prefill/prefill.cpp:5031-5034`）。
+
+隣接するソースコメントには「16 experts」の `xmx_group_parity` 測定で約 200 rows/expert 未満では fused launch が勝り、320 では dequantize + oneMKL の gate/up が fused より 0.67-0.76 倍、と記されている（`engine/sycl/src/prefill/prefill.cpp:5035-5036`）。コメントには測定機種、OS、回数が示されていないため、一般的な性能値とは扱えない。`docs/INTEL.md:278-280` には `STRATA_PF_XMX` の mode 説明があるが、この rows 閾値の詳細・測定条件は記載されていない。
 
 ## 根拠
 
-- `sycl/src/prefill/prefill.cpp:3945-3959`: native pack と量子化型、MMQ 条件、mode 2 の対象外ログ。
-- `sycl/src/prefill/prefill.cpp:3968-4014`: グループの routed rows 集計、既定値200、厳密な比較、二つの計算経路、最初の有効ログ。
-- `sycl/src/prefill/xmx_moe.dp.cpp:148-170`: `STRATA_PF_XMX` の parse、ビルド/device による拒否。
-- `include/strata/prefill/xmx_moe.hpp:8-14`: XMX mode 1/2 の概要。
-- `sycl/CMakeLists.txt:39-44`: AOT device による XMX sub-group 定義。
-- `docs/INTEL.md:831-833`: Battlemage で grouped XMX mode 1/2 を試した記載はあるが、`STRATA_PF_XMX_ROWS` の値ごとの測定結果や意味は記載されていない。コメントの測定説明（`sycl/src/prefill/prefill.cpp:3977-3978`）も 16 experts の比較についての注記であり、一般的な性能保証ではない。
+- `engine/sycl/src/prefill/prefill.cpp:5031-5066` — fused XMX 分岐、環境変数読み取り、閾値比較と代替経路。
+- `engine/sycl/src/prefill/prefill.cpp:4754-4772` — mode 2 の native pack / format eligibility。
+- `engine/sycl/src/prefill/xmx_moe.dp.cpp:149-173` — `STRATA_PF_XMX` の既定値、build/device 条件と警告。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:8168-8174` — grouped kernel の引数検査と失敗時の終了。
+- `engine/CMakeLists.txt:23-33`、`engine/sycl/CMakeLists.txt:73-77` — SYCL backend と XMX build 条件。
+- `docs/INTEL.md:278-280` — Strata 資料の XMX mode 説明。

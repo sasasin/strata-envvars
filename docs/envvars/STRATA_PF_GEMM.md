@@ -1,43 +1,59 @@
 # `STRATA_PF_GEMM`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-主な役割は AMD HIP のプリフィルで、FP16 入力・FP32 出力の dense projection GEMM を Strata 独自の gfx11 WMMA カーネルに切り替える opt-in 変数です。量子化重みを FP16 に dequantize した後の projection と、もともと FP16 の重みを使う projection の両方に関係します。専用カーネルを呼ぶ分岐は HIP 条件下だけですが、`STRATA_PF_PAD` と組み合わせた padding 判定は共通のプリフィルコードでもこの変数を読みます。
+HIP ビルドの prompt 中に行う FP16 入力・FP32 出力の GEMM で、Strata の WMMA GEMM を先に試すスイッチです。`Gemm::f16` では成功すれば通常の HIP GEMM に進まず、非対応 shape やデバイスで WMMA 関数が `false` を返すと既存経路へフォールバックします。`Gemm::native` では主に `STRATA_PF_PAD` と併用した padded stride の GEMM を選ぶ条件になります。CUDA-only ビルドではこの読み取り・分岐はコンパイルされません（`engine/src/prefill/gemm.cu:1303-1317,1489-1508`）。
+
+明示設定が無い場合、HIP 起動時のアーキテクチャ既定値がこの変数を設定する機種があります。従って常に opt-in とは限りません。既定値も含めて、このスイッチが有効でも生成 token や GEMM の結果が通常経路と同一になる保証はコード上ありません。設計資料は丸め順序が異なり、回答の最下位 bit が変わる場合があると説明しています（`docs/STRIX_HALO.md:125-144`; 自動既定値の設定元は `engine/src/core/arch_defaults.cpp:183-189,193-200`）。
 
 ## 値と判定
 
-各読み取り箇所は値を数値として parse せず、先頭文字が `'1'` かどうかだけを判定します。したがって未設定・空文字・`0`・`true`・`2` は無効、`1`・`10`・`1anything` は有効です。大文字小文字や後続文字は検査しません。
+GEMM の読み取り箇所では `getenv` の値の先頭 1 文字だけを `'1'` と比較します。文字列全体の parse、大文字小文字変換、空白除去、数値範囲検査はしません。`1`, `10`, `1anything` は真、未設定、空文字、`0`, `true`, ` 1` は偽です（`engine/src/prefill/gemm.cu:1310,1496`; SYCL 側の HIP 分岐 `engine/sycl/src/prefill/gemm.dp.cpp:952-957`）。
 
-判定は呼び出し元関数内の `static const bool` に保存されます。`Gemm::f16` と `Gemm::native` は別々に値をキャッシュし、プリフィルの activation padding 判定 `pf_pad()` も独立にキャッシュします。各判定後にプロセス環境を変更しても、その判定には反映されません。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| HIP の `Gemm::f16` / `Gemm::native` と、SYCL ソース内の `STRATA_USE_HIP` 分岐 | 明示値としては無効。後述の起動時既定値が適用される場合がある | 先頭文字が `1`（`1`, `10`, `1junk`） | 空文字、`0`, `true`, ` 1` |
+| CUDA-only など `STRATA_USE_HIP` がないビルド | 当該ソースで読み取られない | 該当なし | 該当なし |
+
+起動時に `apply_arch_defaults` は既存の環境値が**何であっても**上書きせず、未設定のときだけ `setenv(..., overwrite=0)`（Windows は `_putenv_s`）で既定値を書きます。したがって空文字や `0` も明示値として既定値より優先し、判定は偽になります。CLI 引数による上書き経路は確認できません（`engine/src/core/arch_defaults.cpp:218-224,302-310,334-343,407-410`）。
 
 ## 有効になる条件
 
-- 専用 WMMA GEMM の読み取り・切り替えは HIP ビルド（`STRATA_USE_HIP`）に限られます。共通の `pf_pad()` は CUDA ビルドでも `STRATA_PF_GEMM` と `STRATA_PF_PAD` を読みますが、専用 GEMM への切り替えはしません。CUDA で両方を有効にすると padded activation stride が渡され、HIP 専用処理のない `Gemm::native` は対応できない stride として stderr に出して終了する経路があります。
-- 呼び出し先の実カーネルがビルドに含まれ、現在の GPU が gfx1100、gfx1101、gfx1102、gfx1150、gfx1151 のいずれかであること。その他の GPU ではカーネル関数が `false` を返し、通常の GEMM 経路へ進みます。
-- `strata_pf_gemm_f16[_ld]` の形状条件を満たすこと。最低 `T >= 64`, `N >= 512`, `K >= 32` かつ `K` が32の倍数、`beta` が0または1、leading dimension と各次元が許容範囲内である必要があります。
-- `STRATA_PF_SWITCH_MIN_T` が設定されている場合、`T >=` その値であること。これは `std::atoll` で読み、未設定なら0です。値の全体検証や clamp はありません。たとえば非数値文字列は通常0、数字で始まる文字列は数値部分までが使われ、負数もそのまま比較に使われます。
+- `Gemm::f16` のスイッチ読み取りと呼び出しは `STRATA_USE_HIP` のときだけです。`T <= 0` または `N <= 0` なら早期 return し、WMMA 呼び出しまで進みません（`engine/src/prefill/gemm.cu:1303-1317`）。SYCL 実装も同じ HIP compile guard 内です（`engine/sycl/src/prefill/gemm.dp.cpp:947-962`）。
+- `STRATA_PF_SWITCH_MIN_T` も `atoll` で読み、未設定なら `0`、設定時は `T >= 値` が必要です。変換不能文字列は `atoll` の結果 `0`、負値も clamp されず、そのまま比較されます。これは `STRATA_PF_GEMM` 自体の値判定とは別です（`engine/src/prefill/gemm.cu:1310-1312,1495-1501`）。
+- `Gemm::f16` は WMMA 関数が受理する shape・device・引数のときだけその GEMM を実行します。組み込み gfx11 WMMA は少なくとも `T >= 64`, `N >= 512`, `K` が 32 の倍数、`beta` が 0 または 1、各ポインターや stride が有効であることを要求します。gfx11 WMMA の device 判定に失敗した場合、HIP の対応ビルドでは Unsloth WMMA を試します。どちらも拒否・起動失敗なら後続の WMMA 設定または通常の HIP BLAS 経路へ進みます（`engine/src/prefill/wmma_gemm.cu:703-735`; `engine/src/kernels/hip/hip_unsloth_wmma.cu:317-345,751-755`; `engine/src/prefill/gemm.cu:1312-1327`）。
+- `Gemm::native` の padded 経路は、さらに `STRATA_PF_PAD` の先頭文字も `1`、`T >= max(STRATA_PF_SWITCH_MIN_T, 64)`, `N >= 512`, `K % 32 == 0`, scratch 容量内であり、現在の device が padded WMMA product に対応することを要求します。満たさない場合は通常経路または既存の padded-X 処理へ進みます（`engine/src/prefill/gemm.cu:1492-1507`; `engine/src/prefill/prefill.cpp:1037-1049,5195-5210,5541-5544`; `engine/src/prefill/wmma_gemm.cu:62-68,758-764`）。
+- 起動時既定値は HIP ビルドで `apply_arch_defaults` が呼ばれた場合に限ります。離散 gfx1100/1101/1102 では `gfx11_discrete_wmma_env` が既定で `1` を含みますが、`STRATA_GFX11_WMMA_DEFAULTS=0`、`STRATA_GFX11_DEFAULTS=0`、または `STRATA_DEFAULTS=026` でその組を止められます（`engine/include/strata/core/gfx11_extra.hpp:27-36,87-109`; 適用 `engine/src/core/arch_defaults.cpp:334-343`）。
+- 統合 GPU では `igpu_default_env` による組の既定化があります。Linux の gfx1103 は既定で有効、Windows の gfx1151 も既定で有効です。gfx1150 と Linux gfx1150/gfx1151 は `STRATA_IGPU_PROMPT_SET=1` で有効化できます。`STRATA_IGPU_PROMPT_SET=0` または `STRATA_IGPU_DEFAULTS=0` は既定化を止めます。全ての可視 GPU が統合 GPU かつ同一 arch であることも `all_igpu` 判定の条件です（`engine/src/core/arch_defaults.cpp:119-138,172-200`; `engine/src/program/generate.cpp:4287-4320`）。
+- `STRATA_PF_PAD` が有効でも padded product を使えない device では activation を pad しません。通常の `STRATA_PF_GEMM` 経路自体は padded product に限らず、非 padded GEMM にも適用されます（`engine/src/prefill/prefill.cpp:1037-1049`; `engine/src/prefill/gemm.cu:1303-1317`）。
 
 ## 実行時の詳細
 
-`Gemm::f16` では、閾値を満たすと専用 WMMA GEMM を先に試し、成功すればその結果を使います。失敗した場合は、HIP WMMA の別経路（`STRATA_WMMA_GEMM` が有効な場合）、FP16 出力経路、hipBLASLt、hipBLAS の順で利用可能な既存経路に進みます。つまり `STRATA_PF_GEMM=1` は対象形状の実行を保証せず、対象 GPU・形状・beta 等の条件を満たす必要があります。
+HIP の `Gemm::f16` と `Gemm::native` は、それぞれ関数内 `static const` lambda で値を初回評価し、プロセス内に cache します。SYCL 側の HIP 分岐も同様です。アーキテクチャ既定値は `generate.cpp` の起動処理で、engine のスイッチ初回読み取りより前に設定されます。従って実行中に環境変数を変えても、既に評価した読み取り箇所には反映されません（`engine/src/prefill/gemm.cu:1310,1496`; `engine/sycl/src/prefill/gemm.dp.cpp:955`; `engine/src/program/generate.cpp:4287-4320`）。
 
-量子化重み側の `Gemm::native` は、さらに `STRATA_PF_PAD=1`、`T >= 64`、`N >= 512`、`K % 32 == 0`、パディングした重みが scratch に収まる条件を満たすと、重みを行 stride `K+64` で FP16 dequantize して専用 GEMM を試します。この padded 経路を使わない場合、`ldx == K` なら通常の dequantize + GEMM に進みます。padded activation stride (`ldx != K`) が渡されている場合は別途、非 padded 重みを使った strided 専用経路を試します。それが失敗すると stderr に `prefill gemm: a padded X ... needs STRATA_PF_PAD's path` を出して終了します。
+`Gemm::f16` でスイッチが真かつ token 数しきい値を満たすと `strata_pf_gemm_f16` を呼びます。実装は gfx11 WMMA の場合に受理可能な形状からカーネルを選び、HIP ビルドの対応外アーキテクチャでは Unsloth の Wave32 WMMA を試します。`false` を返した場合、`Gemm::f16` は `STRATA_WMMA_GEMM` の別経路、HIP の `f16_io_` 経路、hipBLASLt などへ順に進みます（`engine/src/prefill/gemm.cu:1307-1327`; `engine/src/prefill/wmma_gemm.cu:703-735,740-765`; `engine/src/kernels/hip/hip_unsloth_wmma.cu:317-345`）。
 
-`STRATA_PF_PAD` は gfx1151 のアーキテクチャ既定値として Strata が設定することがありますが、`STRATA_PF_GEMM` 自体はその既定値一覧に含まれず、引き続きユーザー opt-in です。既定値適用時に環境変数が既に存在すれば値を問わずユーザー設定を保持します。`STRATA_PF_PAD` と `STRATA_PF_GEMM` の両方が先頭 `1` の場合、プリフィル側は padded activation を準備します。
+このスイッチは prompt の各 FP16 GEMM 呼び出しで分岐に使われ、CLI の専用引数やリクエスト単位の値はありません。`STRATA_PF_PAD` を有効にした場合、prefill の GDN/QSA activation buffer の行 stride と確保量が変わります。`Gemm::native` はその stride の X と必要なとき padded weight を WMMA に渡し、padded 経路が使えない場合には通常 stride での処理を試します（`engine/src/prefill/prefill.cpp:1895-1908,5195-5210,5541-5544`; `engine/src/prefill/gemm.cu:1492-1534`）。
 
-## ログと数値差
+## ログと測定値
 
-専用 GEMM が有効になったことを `STRATA_PF_GEMM` 固有のログで知らせる実装は確認できません。`STRATA_PF_GEMM=1` だけでは `STRATA_PF_SWITCH_MIN_T=4096` にはなりません。資料は長い prompt 向け構成例として両方を設定しています。
+自動既定値が新しい値を設定したとき、gfx11 離散 GPU は `strata: gfx11 (RDNA3): %zu matrix-core prompt & MoE switches on by default (STRATA_GFX11_WMMA_DEFAULTS=0 or STRATA_GFX11_DEFAULTS=0 turns them off; NAME=0 turns one off): ` に続けて switch 名を出力します。統合 GPU は `strata: integrated GPU (%s): the matrix-core prompt set is on (1.6x to 2x faster prompts on a Radeon 780M, the answers differ in the last bits): ` を出力してから設定名を列挙し、`.  Turn one off with NAME=0 (for example STRATA_HC_UPMIX=0), all of them with STRATA_IGPU_PROMPT_SET=0` を続けます（Windows ではさらに `.  Not yet tested on Windows`）。ユーザーが変数をあらかじめ設定していた場合、その変数は自動設定ログの一覧に出ません（`engine/src/core/arch_defaults.cpp:334-343,406-421`）。
 
-`docs/STRIX_HALO.md` はこの経路を gfx1151 の FP16 projection 用 128×256 WMMA GEMM と説明し、hipBLASLt とは加算順序が異なり丸め結果が変わるため opt-in としています。`docs/AMD_HIP.md` には RX 7900 XTX の報告者測定として複数の opt-in をまとめた速度値がありますが、これはこの変数単独の効果を示す測定ではありません。
+この変数が通常の GEMM 経路を選んだことを示す専用ログはありません。`STRATA_PF_PAD=1` も有効で、device に padded product がない場合は `prefill gemm: STRATA_PF_PAD needs the padded gfx11 product, which this card does not run; not padding` と stderr に出します（`engine/src/prefill/prefill.cpp:1041-1047`）。padded X に対応する経路もなく unpadded copy 用 device memory を確保できない場合、`Gemm::native` はエラー文を stderr に出して `exit(1)` します（`engine/src/prefill/gemm.cu:1523-1534`）。これは `STRATA_PF_GEMM` 単独の失敗通知ではありません。
+
+`docs/AMD_HIP.md:309` はこのスイッチを gfx11 のみと記していますが、調査対象 commit の WMMA 実装は非 gfx11 compilation fallback から Unsloth WMMA を呼び、同梱 API は gfx11 と gfx12 を対応範囲として記載しています（`engine/src/prefill/wmma_gemm.cu:738-765`; `engine/include/strata/kernels/hip_unsloth_wmma.hpp:252-264`）。従って当該表の backend 範囲は現行コードと一致しません。資料中の測定値は現行 commit で再測定していません。
 
 ## 根拠
 
-- `src/prefill/gemm.cu:675-689`: HIP 条件下の値判定、閾値、専用 GEMM と後続経路。
-- `src/prefill/gemm.cu:819-870`: 量子化重みの padded dequantize 経路、条件不成立時の通常経路、padded activation の失敗時ログ。
-- `src/prefill/wmma_gemm.cu:37-56,681-708`, `include/strata/kernels/gfx_arch.hpp:22-26`: ビルド条件、GPU 対象、形状検査と WMMA kernel dispatch。
-- `src/prefill/prefill.cpp:318-321,350-359,2648-2653,2880-2883`: 閾値の既定値、`STRATA_PF_PAD` との組み合わせ、および GDN/QSA の padded activation 使用箇所。
-- `src/core/arch_defaults.cpp:32-45,61-79`: gfx1151 での `STRATA_PF_PAD` 既定設定とユーザー値の保持。
-- `docs/STRIX_HALO.md:100-116`, `docs/AMD_HIP.md:227-242`: 推奨 opt-in 構成と報告測定。測定値は上記のとおり複数設定を含む。
+- `engine/src/prefill/gemm.cu:1303-1327,1489-1534`
+- `engine/src/prefill/prefill.cpp:1034-1052,1895-1908,5195-5210,5541-5544`
+- `engine/src/prefill/wmma_gemm.cu:44-69,698-765`
+- `engine/src/kernels/hip/hip_unsloth_wmma.cu:317-345,710-755`
+- `engine/src/core/arch_defaults.cpp:119-138,172-224,302-343,406-421`
+- `engine/include/strata/core/gfx11_extra.hpp:27-36,87-109`
+- `engine/src/program/generate.cpp:4287-4320`
+- `engine/sycl/src/prefill/gemm.dp.cpp:947-975`
+- `engine/include/strata/kernels/hip_unsloth_wmma.hpp:252-264`
+- `docs/STRIX_HALO.md:125-150`; `docs/AMD_HIP.md:300-310,445-463`

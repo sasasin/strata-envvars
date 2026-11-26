@@ -1,42 +1,54 @@
 # `STRATA_PCIE_START`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-自動調整される PCIe expert share の起動時初期値を選びます。新方式は CPU pool の worker 数を見込んだ値から始め、旧方式は直前に決まった link 基準の share を保ちます。以降の decode window で `PcieAuto` が share を調整する経路では、この変数は初期値を変えるだけです。
+PCIe の CPU/GPU expert miss share を自動調整する経路で、最初に使う share を選ぶ。`generate.cpp` は `o.pcie_frac_auto` が真かつリンク帯域の probe 値が正の場合だけこの変数を読み、新しい初期値を選んだ場合は stderr に開始 share を出して `o.pcie_frac` を更新する。`old` を選ぶ場合は、直前に決めた link ベースの初期 share を維持する。これは後続の自動調整を有効化するスイッチではなく、後続の自動調整が使う開始値の選択である（`engine/src/program/generate.cpp:14908-14931`）。
+
+新しい初期値は pool worker 数から仮定する expert-byte rate と probe したリンク帯域で計算される。`r = min(65, 4 * workers)`、`link / (link + pcie_pool_k(r) * r)` を 0.05 刻みに丸め、下限 0.10 と `pcie_share_max()` の上限を適用する。上限および係数は `STRATA_PCIE_SHARE_MAX`、`STRATA_PCIE_K_RULE` と GPU/defaults 条件の影響を受ける（`engine/src/program/generate.cpp:3101-3107,14923-14928`）。
 
 ## 値と判定
 
-この変数は `std::getenv` で読み、文字列全体を `std::strcmp` で比較します。空文字、大小文字違い、余分な文字は特別扱いされず、表の「その他」に入ります。
+`std::getenv` の結果を `std::strcmp` で文字列全体と比較する。数値変換、空白除去、部分一致、大文字小文字の変換はしない。未知の文字列を警告する処理もない（`engine/src/program/generate.cpp:14913-14922`）。
 
-| ビルド | unset | 値が完全一致する場合 | その他の設定値（空文字を含む） |
+| build 条件 | 未設定 | 新しい初期値になる値 | link ベースの初期値を維持する値 |
 |---|---|---|---|
-| HIP (`STRATA_USE_HIP`) | 旧方式 | `new` で新方式 | 旧方式 |
-| HIP 以外（この実装の CUDA 経路） | 新方式 | `old` で旧方式 | 新方式 |
+| `STRATA_USE_HIP` 定義あり（HIP） | 維持 | 完全一致の `new` | `old`、空文字、`0`、`true`、`NEW` など、それ以外すべて |
+| `STRATA_USE_HIP` 定義なし（非 HIP 分岐。通常の CUDA build） | 新しい初期値 | `old` 以外すべて（`new`、空文字、`0`、`true`、`OLD` など） | 完全一致の `old` |
 
-たとえば HIP では `new ` や `NEW` は旧方式、CUDA では `old ` や `OLD` は新方式です。数値変換や無効値エラーはありません。
-
-新方式の初期 share は、`R = min(65, 4 × pool.workers())`、`f0 = link / (link + 1.85 × R)` を 0.05 刻みに丸め、0.10〜0.60 に制限した値です。旧方式では、この環境変数による代入を行わず、先に設定された `o.pcie_frac` が残ります。
+値の有効・無効にかかわらず、この判定自体に fallback エラーや警告はない。`STRATA_PCIE_START` の取得はこの初期化経路で一度行われ、値を static cache するコードはない。後からプロセス環境を書き換えても、すでに計算した `o.pcie_frac` には反映されない（`engine/src/program/generate.cpp:14913-14928`）。
 
 ## 有効になる条件
 
-値判定に進むには、`o.pcie_frac_auto` が true かつ PCIe probe の `o.pcie_probe_gbps` が正である必要があります。`--pcie-frac` が指定されると `o.pcie_frac` は非負になり、自動 share 初期化ブロックに入らないため、この変数は効果を持ちません。
-
-自動化の設定は backend・モデル・probe によって異なります。native pack では probe 成功後、`STRATA_PCIE_FRAC_DEFAULT=old` でなく、`decode_defaults_arch_ok()` または `pcie_auto_fork_arch_ok()` が成立し、layer split なら `pcie_auto_split_ok()` も成立する場合に `pcie_frac_auto` が有効になります。CUDA の canonical pack は `STRATA_PCIE_FRAC_DEFAULT=old` でなく probe に成功した場合に自動調整対象になります。Windows CUDA ではさらに `STRATA_PCIE_AUTO_CANON=1` が必要です。layer split ではいずれも同じ split 条件を適用します。HIP の canonical pack は自動調整対象外です。probe 失敗時は既定 share を使い、対象変数による初期値変更はありません。
+- `--pcie-frac` を指定せず、既定 share の決定処理に入る必要がある。`--pcie-frac` の値が `o.pcie_frac >= 0` なら既定値決定ブロック全体を飛ばすため、この環境変数も読まれない。CLI 引数が優先する（`engine/src/program/generate.cpp:1041-1043,4057,4780-4782,5535`）。
+- 既定値決定で自動 share が選ばれ、PCIe probe が成功して `o.pcie_frac_auto == true`、`o.pcie_probe_gbps > 0` となる必要がある。probe 不成立時は既定 share に戻り、`pcie_frac_auto` がセットされないため、この変数の読み取り箇所には到達しない（`engine/src/program/generate.cpp:5535-5580,14913-14914`）。
+- 自動 share の適用可否は pack、build、GPU 世代、layer split に依存する。canonical pack は HIP では自動 refinement を設定せず、CUDA では probe 成功かつ layer split なしのときに設定する。Windows CUDA の canonical pack は `STRATA_PCIE_AUTO_CANON=1` が probe 条件に関わる。native pack は CUDA で自動 refinement が設定され、HIP では gfx12 世代や `pcie_auto_fork_arch_ok()` の判定に加えて `STRATA_PCIE_FRAC_DEFAULT` 等の条件が関わる。layer split では `STRATA_PCIE_AUTO_SPLIT` の判定も関わる（`engine/src/program/generate.cpp:2833-2844,2849-2912,5535-5579`）。
+- native pack で `STRATA_VERIFY_DEVICE_HITS` が非ゼロ、`STRATA_PCIE_FRAC_DEFAULT=old` ではなく、layer split なし・batch 無効・peer device なしの場合、後続処理が share を `0.00` にし、自動 refinement を無効化する。この条件では起動時の `pcie_frac_auto` が false になり、この変数は読まれない（`engine/src/program/generate.cpp:5581-5588`）。
+- 初期 share の更新後に実際の `PcieAuto` refinement が開始する条件はさらに狭い。全 experts が GPU resident でないこと、`batch == 0`、peer device なし、かつ単一 stage または layer split の自動 refinement 許可が必要。これらの条件を満たさなくても、直前の初期値ブロックに到達していれば `STRATA_PCIE_START` による開始 share の変更自体は行われる（`engine/src/program/generate.cpp:14931-14933,15003-15010`）。
 
 ## 実行時の詳細
 
-Strata は server 側で `o.pcie_frac_auto` と正の probe 値を確認した後に環境を読みます。値は static cache されず、この初期化ブロックを通るたびに取得されます。新方式を選ぶと stderr に `strata serve: PCIe share: start ...` の行を出し、算出した `f0` を `o.pcie_frac` に設定します。旧方式または条件不成立ではこの起動ログと代入はありません。
+まず probe と既定 share の処理が `o.pcie_frac_auto` と `o.pcie_probe_gbps` を設定する。その後、decode/serve 用 drive の初期化中にこの変数を読み、新しい初期値を選ぶ場合は `o.pcie_frac` と `drive.d.pcie_num` に反映する。`pcie_num` は share を 256 分割に丸めた値で、後続の verifier/drive の PCIe share 設定に使われる（`engine/src/program/generate.cpp:5535-5579,14913-14931`）。
 
-後続の `PcieAuto` が稼働する場合、decode window の測定から share を再計算し、変更時に `strata serve: PCIe share: ... -> pcie_frac ...` を stderr に出します。これは起動初期値とは別の調整です。`--pcie-frac` が明示されている場合はこの自動 share 経路も設定されません。コード上、この変数の値が無効であることを理由とした警告・終了・fallback はありません。
+`PcieAuto` が有効なら後続の decode window で CPU pool の miss 処理時間を計測し、条件がそろうと share を再計算する。最初の判定は 12 window 後、それ以降は 48 window ごとで、miss が 300 件未満なら計測を続け、2000 window に達すると停止する。更新は最大 3 回で、変更値は stderr に記録される。これは別の実行時処理であり、`STRATA_PCIE_START` の値を各 request/window で読み直すものではない（`engine/src/program/generate.cpp:3110-3150,15003-15041`）。
 
-コメントには性能および token 再現性に関する測定メモがありますが、本書ではコードで確認できる分岐と計算のみを記載し、測定結果を一般化しません。
+明示的な serve request の `pcie_frac=` 指定は request 内の share として別途反映される。`STRATA_PCIE_START` はプロセス起動時の初期 share の選択であり、その request 値を上書きする処理ではない（`engine/src/program/generate.cpp:18859-18870,18922,21441-21446`）。
+
+## ログと測定値
+
+新しい初期値が選ばれたとき、stderr に次の形式で出る。旧初期値を維持した場合、この分岐からのログは出ない（`engine/src/program/generate.cpp:14923-14928`）。
+
+```text
+strata serve: PCIe share: start %.2f from %d pool workers (assumed %.0f GB/s of expert bytes) and the %.1f GB/s link (was %.2f)
+```
+
+同じソースのコメントには、RTX PRO 5000 mimic・32 workers で初回回答が `+4..+12%`、8 workers と R9700 では `+-1%` と記録されている。また HIP の R9700 について、初期約 50 windows の near-tie token が変わることがあり、旧開始値での比較は `21/45` 対 `45/45` identical answers と記されている。これらは実装コメントの記録であり、測定条件の全容は当該箇所にないため、一般的な性能・出力保証とは扱えない（`engine/src/program/generate.cpp:14908-14918`）。`docs/DETAILS.md` に本変数の追加の測定記述は見つからなかった。
 
 ## 根拠
 
-- 候補名の唯一の完全一致参照と値判定、式、起動ログ、share 上書き: `src/program/generate.cpp:12142-12165`。
-- `--pcie-frac` の既定値と自動化フラグの意味: `src/program/generate.cpp:869-871`。
-- 明示 `--pcie-frac` の判定: `src/program/generate.cpp:3502,3901-3903`。
-- probe・モデル・backend・既定環境変数に応じた `pcie_frac_auto` 設定: `src/program/generate.cpp:4567-4610`。
-- `PcieAuto` の係数、計算、および後続 window 更新ログ: `src/program/generate.cpp:2638-2670,12227-12255`。
+- 読み取り、backend 別の完全一致判定、開始 share の計算・反映: `engine/src/program/generate.cpp:14908-14931`
+- CLI の `--pcie-frac` と既定 share / probe / auto 判定: `engine/src/program/generate.cpp:4057,4780-4782,5535-5588`
+- auto share の platform/backend 条件と補助環境変数: `engine/src/program/generate.cpp:2833-2912,3101-3107`
+- 後続の refinement と条件: `engine/src/program/generate.cpp:3110-3150,15003-15041`
+- request ごとの share の適用: `engine/src/program/generate.cpp:18859-18870,18922,21441-21446`

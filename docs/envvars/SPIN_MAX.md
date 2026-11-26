@@ -1,41 +1,48 @@
 # `SPIN_MAX`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`SPIN_MAX` は、同梱ビルドスクリプト `sycl/tools/build.sh` が SYCL エンジンを構成するときに読むシェル環境変数です。値は CMake キャッシュ変数 `STRATA_SYCL_SPIN_MAX` に渡され、指定されると SYCL device kernel の host flag spin 上限をビルド時に固定します。Strata 実行ファイルが直接読む実行時環境変数は別名の `STRATA_SPIN_MAX` です。
+`SPIN_MAX` は `engine/sycl/tools/build.sh` が読む SYCL エンジンの**ビルド時**環境変数で、値を CMake キャッシュ変数 `STRATA_SYCL_SPIN_MAX` に渡す。CMake は空でない値をコンパイル定義 `STRATA_SYCL_SPIN_MAX=<値>u` にし、SYCL のホスト・デバイス間 doorbell wait に渡す spin read 上限を全デバイスで固定する。エンジン実行時に `SPIN_MAX` を読む箇所はなく、実行時上書き用の別の名前は `STRATA_SPIN_MAX` である（`engine/sycl/tools/build.sh:38-44`、`engine/sycl/CMakeLists.txt:59-70`、`engine/sycl/include/strata/sycl_doorbell.hpp:153-172`）。
 
 ## 値と判定
 
-| `SPIN_MAX` の状態 | ビルドスクリプトの処理 | 結果 |
-|---|---|---|
-| 未設定または空文字 | `${SPIN_MAX:-}` が空に展開される | `STRATA_SYCL_SPIN_MAX` を空で CMake に渡し、CMake は固定値の compile definition を追加しない。実行時にデバイス別の既定値を選ぶ |
-| 非空文字列 | 文字列をそのまま `-DSTRATA_SYCL_SPIN_MAX="..."` に渡す | CMake は値が truthy の場合に限り `STRATA_SYCL_SPIN_MAX=<値>u` を compile definition として追加する |
+`build.sh` は `${SPIN_MAX:-}` をそのまま `-DSTRATA_SYCL_SPIN_MAX=...` に渡し、値を数値変換しない。CMake の `if(STRATA_SYCL_SPIN_MAX)` が真の場合に末尾 `u` を付けたコンパイル定義を生成する。`0`、`OFF`、`NO`、`FALSE`、`N`、`IGNORE`、`NOTFOUND`（および `-NOTFOUND` で終わる値）は偽として扱われ、それ以外の非空値は真として扱われる。真偽判定は大文字小文字を区別しない（`engine/sycl/tools/build.sh:40-41`、`engine/sycl/CMakeLists.txt:62,69-70`）。
 
-ビルドスクリプトや CMake に数値としての検証・clamp・警告はありません。したがって、この変数には C++ の整数 compile definition として使える正の値を指定する必要があります。非数値文字列や不適切な値を指定した場合の成否・診断はコンパイラ側に委ねられています。`sycl/tools/build.sh:40-41`、`sycl/CMakeLists.txt:43-45`。
+| `build.sh` 実行時の値 | CMake / コンパイル定義 | 結果 |
+|---|---|---|
+| 未設定または空文字 | 空。定義なし | ビルド時固定値を使わず、SYCL 実行時のデバイス別選択へ進む。 |
+| `0`、`false`、`OFF` など CMake の偽定数 | CMake の条件が偽。定義なし | 同じくデバイス別選択へ進む。偽定数の判定は大文字小文字を区別しない。 |
+| `1`、`2000000`、`true` など | 値をそのままキャッシュし、`STRATA_SYCL_SPIN_MAX=<値>u` を定義 | CMake はこれらを真とするが、コンパイル定義が C++ 整数定数でなければ build は通らない。 |
+| `0anything`、`abc` など | 値をそのままコンパイル定義へ渡す | `SPIN_MAX` を数値として検証・変換しない。`0anythingu` / `abcu` のような定義を Strata が拒否・fallback する処理はなく、コンパイル可否は値の構文による。 |
+
+`build.sh` の build directory に `build.ninja` が既にあると、同スクリプトは CMake の初期構成を飛ばし、`SPIN_MAX` を再設定しない（`I8_ESIMD` だけは別途再設定する）。したがって、既存 build directory で環境変数だけを変更しても、その値は CMake に渡らず、保存済み cache の値が使われる（`engine/sycl/tools/build.sh:38-44`）。
+
+実行時の別変数 `STRATA_SPIN_MAX` は `std::atol` で変換され、正の数ならビルド時固定値より優先する。未設定・空文字・数値変換結果が 0 以下の場合は override されず、ビルド時固定値（定義されていれば）またはデバイス別値が選ばれる。これは `SPIN_MAX` 自身の実行時判定ではない（`engine/sycl/include/strata/sycl_doorbell.hpp:153-162,169-172`）。
 
 ## 有効になる条件
 
-- SYCL ビルドを `sycl/tools/build.sh` で構成し、ビルドディレクトリに `build.ninja` がまだない場合、現在の `SPIN_MAX` が初回 CMake 構成へ渡されます。
-- すでに `build.ninja` がある場合、スクリプトは通常の実行では CMake を再構成しません。既存の CMake cache に保存された `STRATA_SYCL_SPIN_MAX` が使われ、今回の `SPIN_MAX` は反映されません。スクリプト内で明示的に再構成するのは `I8_ESIMD` の場合だけです（`sycl/tools/build.sh:40-43`）。
-- CMake の `STRATA_SYCL_SPIN_MAX` が空なら、`SPIN_MAX` による固定値はビルドへ入りません。実行時に `STRATA_SPIN_MAX` が正の数として読めればそれが優先されます。そうでなければ、ビルド macro が定義されている場合は macro 値が使われます（`sycl/CMakeLists.txt:43-45`、`sycl/include/strata/sycl_doorbell.hpp:142-145`）。
-- `STRATA_SYCL_SPIN_MAX` の macro も実行時 override もない場合、xe driver は 20,000、driver 名が空で Battlemage の場合は通常 20,000（`spin_drafts_need_long_bound(true)` 済みなら 2,000,000）、その他は 2,000,000 を使います（`sycl/include/strata/sycl_doorbell.hpp:146-149`）。
+- `engine/sycl/tools/build.sh` 経由で SYCL build を構成するときに使われる。通常の実行時環境に `SPIN_MAX` を設定するだけでは、既にビルドされたエンジンの値は変わらない（`engine/sycl/tools/build.sh:38-44`）。
+- 初回構成時に値が空でなければ CMake cache に保存される。既存の `build.ninja` がある build directory では、スクリプトは値を渡し直さない（同上）。
+- CMake が `STRATA_SYCL_SPIN_MAX` を compile definition として生成できる SYCL build が対象。CUDA/HIP や別の build 経路について、この変数の参照は確認できない（`engine/sycl/CMakeLists.txt:59-70`）。
+- 固定値を埋め込んだ後も、実行時に `STRATA_SPIN_MAX` が正の数へ変換されるとその値が優先される（`engine/sycl/include/strata/sycl_doorbell.hpp:153-162`）。
+- 固定値を使わない場合の既定値は SYCL 実行時に選ばれる。driver が `xe` の場合は host wait の有無で 20,000 / 1,000,000 reads、driver 名がなく Battlemage の場合は `--spec` の長ドラフト状態で 20,000 / 2,000,000 reads、それ以外は 2,000,000 reads（`engine/sycl/include/strata/sycl_doorbell.hpp:153-162`）。
 
 ## 実行時の詳細
 
-`sycl/tools/build.sh` は未設定・空文字を同じ空値として CMake に渡します。非空値は `STRATA_SYCL_SPIN_MAX` の cache string となり、CMake が空でない場合にだけ `<値>u` を定義します。CMake の説明文字列にも、空なら実行時にデバイスごとに選択するとあります（`sycl/tools/build.sh:40-43`、`sycl/CMakeLists.txt:40-45`）。
+`SPIN_MAX` 自体は build script の起動時に shell 展開され、CMake の初期構成時にキャッシュされる。実行時にはコンパイル定義が `spin_bound_for` の分岐に入り、正の `STRATA_SPIN_MAX` override がなければ全デバイスに同じ固定 bound を返す。固定定義がない場合は driver、Battlemage 判定、host wait、long-drafts flag から bound を選ぶ（`engine/sycl/tools/build.sh:40-44`、`engine/sycl/CMakeLists.txt:62-70`、`engine/sycl/include/strata/sycl_doorbell.hpp:153-172`）。
 
-実行ファイル内の `spin_max(queue)` は各 `sycl::device` について最初の呼び出しで上限を決め、device ごとの `unordered_map` に cache します。実行中に環境を変更しても、すでに決定済みの device の上限は再評価されません。`STRATA_SPIN_MAX` は `std::atol` で変換し、結果が `> 0` の場合だけ採用します。従って未設定、空文字、先頭が数値でない文字列、ゼロ、負値では実行時 override にならず、ビルド macro またはデバイス別既定値へ進みます。数値の後ろに文字が続く場合も `atol` が変換する数値接頭部が正なら採用されます。採用値は `uint32_t` に変換されます（`sycl/include/strata/sycl_doorbell.hpp:134-152`）。
+各 `spin_max(queue)` 呼び出しは実行時の `STRATA_SPIN_MAX` を読み直して bound を計算する。デバイス別 map は最後に使った値をログ抑制用に記録するもので、bound の値を固定する cache ではない。選ばれた bound は SYCL の elementwise / verify kernel launchers に渡される（`engine/sycl/include/strata/sycl_doorbell.hpp:164-179`、`engine/sycl/src/kernels/cuda/elementwise.dp.cpp:409`、`engine/sycl/src/kernels/cuda/verify_kernels.dp.cpp:2833,2895`）。
 
-device 上で使う複数の kernel launcher は `spin_max(queue)` の結果を `spin_max` 引数として渡します（例: `sycl/src/kernels/cuda/verify_kernels.dp.cpp:2488,2547`、`sycl/src/kernels/cuda/elementwise.dp.cpp:400`）。この値は spin の反復上限です。ここでの `SPIN_MAX` / `STRATA_SPIN_MAX` の説明は Strata がビルド値を転送し、実行時に上限を選択・渡す処理に限ります。
+## ログと測定値
 
-ビルド中の失敗は `cmake` / `cmake --build` の出力を build log に記録し、スクリプトは `BUILD EXIT <status>` を表示します（`sycl/tools/build.sh:44-46`）。`SPIN_MAX` 固有の警告や値の fallback ログは実装にありません。
+通常、デバイスの初回 bound 選択時はログを出さない。`STRATA_SPIN_LOG` が設定されている場合は初回にも、また同じデバイスの bound が変わった場合にも stderr に `strata: GPU wait bound %u reads on a device%s` を出す（`engine/sycl/include/strata/sycl_doorbell.hpp:173-177`）。`SPIN_MAX` 固有の警告やエラー文言は確認できない。CMake / コンパイラの失敗は build script の一般的な build 出力経路を通る（`engine/sycl/tools/build.sh:40-50`）。
 
 ## 根拠
 
-- `sycl/tools/build.sh:40-43` — 初回 CMake 構成への `SPIN_MAX` の転送と、既存 build directory の扱い。
-- `sycl/CMakeLists.txt:40-45` — `STRATA_SYCL_SPIN_MAX` の空時の意味と compile definition。
-- `sycl/include/strata/sycl_doorbell.hpp:114-152` — device spin の目的、実行時値の変換・優先順位、デバイス別既定値、device 単位の cache。
-- `sycl/src/kernels/cuda/verify_kernels.dp.cpp:2488,2547`、`sycl/src/kernels/cuda/elementwise.dp.cpp:400` — 上限を launcher から渡す例。
-- `docs/INTEL.md:85-90,149-151` — SYCL build script の `SPIN_MAX` 入力と bounded spin に関する利用者向け記載。
+- `engine/sycl/tools/build.sh:38-44` — `SPIN_MAX` の展開、CMake 初期構成の条件、既存 build directory での再設定有無。
+- `engine/sycl/CMakeLists.txt:59-70` — 固定 bound の CMake cache と compile definition。
+- `engine/sycl/include/strata/sycl_doorbell.hpp:115-162` — bound の役割、実行時 override とデバイス別条件。
+- `engine/sycl/include/strata/sycl_doorbell.hpp:164-179` — 実行時読み取り、ログ用 map、stderr 文言。
+- `engine/sycl/src/kernels/cuda/elementwise.dp.cpp:409`、`engine/sycl/src/kernels/cuda/verify_kernels.dp.cpp:2833,2895` — bound を kernel launcher から取得。

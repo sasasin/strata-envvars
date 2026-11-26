@@ -1,58 +1,67 @@
 # `--cvec-mode`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数 parser） |
+| コマンド | `strata`（推論エンジンの引数） |
 | オプション | `--cvec-mode` |
 | 別名 | なし |
-| 値 | `add` または `project`（大文字小文字を区別） |
+| 値 | `add` または `project` |
 
 ## 役割
 
-`--control-vector` または `--control-vector-scaled` で読み込む制御ベクトルを、モデルの residual stream にどう適用するかを選びます。`add` はベクトルを加算し、`project` は residual stream からそのベクトル方向の成分を取り除きます。`src/program/generate.cpp:953-957`
+ロードした control vector を各対象層の残差ストリームにどう適用するかを選ぶ。`add` は方向ベクトルを加算し、`project` は残差から方向ベクトルへの射影成分を差し引く。control vector を指定していない場合、このモードによる処理は行われない。
 
 ## 使い方
 
 ```sh
-engine/strata --pack /path/to/pack --tokens "1,2,3" \
-  --control-vector-scaled /path/to/control-vector.gguf:1.0 \
-  --cvec-mode project
+# control vector をロードして、射影成分を除去するモードで生成
+strata generate --pack ./pack --tokens "1,2,3" \
+  --control-vector-scaled ./vector.gguf:1.0 \
+  --control-vector-layer-range 4 44 --cvec-mode project
 ```
-
-この例では control-vector GGUF を読み込み、`project` モードで適用します。`--cvec-mode` 自体は制御ベクトルを読み込みません。
 
 ## 値と既定値
 
-- 既定値は `add` です。内部値 `1` が `add`、`0` が `project` に対応します。`src/program/generate.cpp:797-803`
-- `add` と `project` 以外は受け付けません。値は完全一致で判定されます。`src/program/generate.cpp:2722-2726`
-- 値を省略すると共通 parser が stderr に `<option> needs a value` を出し、終了コード `2` で終了します。`src/program/generate.cpp:2416-2420`
-- オプションを複数回指定した場合、parser は指定ごとに同じ設定値を更新するため、最後に解析した値が残ります。`src/program/generate.cpp:2722-2726`
+- `add`: 既定値。各残差ストリーム `h` にスケール済み方向 `d` を加える（`h += d`）。
+- `project`: 各層の方向を単位ベクトル `v` に正規化し、`h` から `s (h·v) v` を引く。`s` はスケール済み方向のノルム。
+- 値は大文字小文字を含めて `add` または `project` と一致する必要がある。ほかの値は `--cvec-mode: add or project, got '…'` を stderr に出し、終了コード 2 で引数処理を中止する。値を省略すると「needs a value」を stderr に出して終了コード 2。
+- 同じ引数を複数回指定した場合、parser は該当値をその都度代入するため、最後に指定した値が残る。
 
 ## 実行時の動作
 
-- `add` では、指定した control-vector ファイルの各 `direction.<layer>` を指定 scale で合成し、その値を各対象層で residual stream に加えます。カーネルは `h += v` を行い、合成と scale の適用はロード時に済ませます。`src/program/generate.cpp:1863-1866`、`src/program/generate.cpp:1872-1897`、`src/kernels/cuda/cvec.cu:87-94`
-- `project` では、合成した層ベクトルを単位長に正規化し、そのノルムを scale として保持します。カーネルは `h -= s (h · v) v` を行うため、各対象層の residual stream からベクトル方向の射影成分を除きます。`src/program/generate.cpp:1912-1927`、`src/kernels/cuda/cvec.cu:67-85`
-- モードは `--control-vector-layer-range` の対象範囲（両端を含む）内の層に適用されます。範囲の既定値は層 `1` から最終層までです。`--cvec-dir single:L` は `project` のときだけ層 `L` の方向を対象層全体で使い、`add` では per-layer 扱いになります。`src/program/generate.cpp:801-803`、`src/program/generate.cpp:1903-1925`
-- 制御ベクトルが指定されている場合にだけロード処理が実行されます。したがって `--cvec-mode` 単独ではベクトル適用は起きません。`src/program/generate.cpp:3960-3968`
-- `--serve` ではロード済みベクトルをリクエストごとに `cvec=0|1` で無効・有効にできます。値がない場合は有効です。切替時、エンジンはそのベクトル状態で作成した live session と checkpoint を無効化し、カーネルの有効フラグを更新します。`src/program/generate.cpp:12304-12308`、`src/program/generate.cpp:12335-12339`、`src/program/generate.cpp:12520`、`src/program/generate.cpp:12922-12927`
-- ロードした mode、範囲、方向・scale のテーブルはセッション識別 digest に含まれます。標準エラーには mode、方向方式、層範囲、適用層数の要約が出ます。`src/program/generate.cpp:1930-1946`
+parser は `project` を内部値 0、`add` を 1 に設定する。control vector のファイルが指定されているとき、GGUF の `direction.<layer>` テンソルを読み、指定ファイルの方向とスケールを合算する。`project` では合算方向のノルムを層ごとの係数として保存し、カーネルが `h - s(h·v)v` を計算する。`add` では合算方向をそのまま保存し、カーネルが `h + d` を計算する。適用は層の FFN 書き込み後で、control vector が存在する層に限られる。
+
+このオプション単独では vector をロードしない。`--control-vector` または `--control-vector-scaled` で少なくとも1つ指定した場合にロード処理が走り、そのモードが使われる。未指定なら vector はロードされず、モード値は推論に作用しない。ロードした vector とモードはセッション識別情報に含まれる。
+
+`--control-vector-layer-range` は適用層の両端を指定し、省略時のロード処理は層 1 から最終層までを対象にする。`--cvec-dir single:L` は `project` のときだけ、全対象層で層 `L` の方向を使う。`add` のときは per-layer 扱いとなり、`single:L` の指定は方向選択に反映されない。
+
+`--serve` では、ロード済み vector をリクエストごとに有効・無効にできる。リクエストの `cvec=0` は無効、`cvec=1` またはキー省略は有効で、モード自体は起動時に指定した値のまま。切替時には会話キャッシュの live 状態を無効化し、vector を保持するデバイスの同期と有効フラグ更新を行う。
 
 ## 適用条件と副作用
 
-- control-vector GGUF の `general.architecture` が `controlvector` であること、少なくとも1つの `direction.<layer>` tensor があることが必要です。該当 tensor は対象モデルの embedding 幅と一致する f32 でなければロードに失敗します。layer 0 とモデルの層数以上の tensor は無視されます。`src/program/generate.cpp:1872-1897`
-- `project` で指定した `single:L` にベクトルがない場合、対象範囲に有効な方向が一つもない場合、または GPU 側のテーブル確保・upload に失敗した場合はロードに失敗します。`src/program/generate.cpp:1905-1930`、`src/kernels/cuda/cvec.cu:26-38`
-- `controlvector.model_hint` が存在して値が `qwen4exp` 以外の場合は stderr に警告しますが、この箇所ではロードを中止しません。`src/program/generate.cpp:1880-1883`
-- `--serve` で制御ベクトルを切り替える際は、各デバイス上の有効フラグ更新前にデバイスを同期します。また切替前のベクトル状態で保存した session/checkpoint は再利用されません。`src/kernels/cuda/cvec.cu:137-149`、`src/program/generate.cpp:12922-12927`
+- vector の GGUF は `general.architecture` が `controlvector` である必要がある。該当テンソルがない、テンソルが埋め込み幅の f32 でない、ペイロードが切れている、対象層に方向がない場合などはロードに失敗する。
+- `project` で指定した `single:L` に方向がない場合もロード失敗となる。`single:L` の整数部分は `atoi` で読み取られ、文字列全体の数値形式検証は parser では行われない。
+- mode とロードした方向データはカーネル用テーブルとしてデバイスへアップロードされる。アップロードに失敗した場合はロード失敗となる。
+- これらのロード失敗は `strata generate: control vector: …` を stderr に出して終了コード 2。ファイルの形式・テンソル検証と失敗位置は `load_control_vectors` の実装に基づく。
 
 ## 出力とエラー
 
-- 不正な mode 値では stderr に `--cvec-mode: add or project, got '<値>'` を出し、終了コード `2` を返します。`src/program/generate.cpp:2722-2726`
-- 制御ベクトルのロード失敗では stderr に `strata generate: control vector: <理由>` を出し、終了コード `2` を返します。`src/program/generate.cpp:3963-3968`
-- 成功時は stderr に `strata generate: control vector mode = ...` の要約を出します。`src/program/generate.cpp:1942-1946`
+vector のロード成功時は stderr にモード、方向選択、層範囲、実際に方向がある層数を出力する（例: `control vector mode = project, dir = per-layer, layers 4..44 (...)`）。起動時の server 情報行には `cvec=<mode>:<first>-<last>` の要約が含まれる。`--cvec-mode` 自体に固有のファイル書き込みやネットワーク副作用は確認できなかった。
 
 ## 根拠
 
-調査対象は指定 SHA の checkout にあるネイティブ engine parser `src/program/generate.cpp` と CUDA control-vector kernel `src/kernels/cuda/cvec.cu` です。checkout の `git status --short --branch` は `## main...origin/main` で、未コミット変更はありません。別 backend の実装差、Release 配布物、実行時の実測性能はこの調査では確認していません。
+- `engine/src/program/generate.cpp:1202-1205` — vector ファイル一覧、既定モード `add`、内部値、方向選択状態。
+- `engine/src/program/generate.cpp:1370-1374` — help の値説明と control vector 関連オプション。
+- `engine/src/program/generate.cpp:3842-3846,4184-4188` — 値の取得、欠落値の終了、許容値と不正値の処理。
+- `engine/src/program/generate.cpp:2743-2830` — GGUF の検証、層ごとの方向と係数、mode 別テーブル構築、アップロード、識別情報および stderr 要約。
+- `engine/src/program/generate.cpp:6143-6150` — vector 指定時だけのロードと失敗時の終了コード 2。
+- `engine/include/strata/kernels/cvec.hpp:5-16,25-36` — 適用式、層範囲、vector がない場合の状態。
+- `engine/src/kernels/cuda/cvec.cu:45-92` — kernel が `project` / `add` を計算する実装。
+- `engine/src/core/layer.cpp:1638-1649` — FFN 書き込み後に対象層へ適用する経路。
+- `engine/src/program/generate.cpp:18835,18882-18889,19149-19150,20048-20053` — serve リクエストの `cvec` 値、既定有効、状態切替え。
+- `engine/src/program/generate.cpp:2815-2823,14013-14016` — mode を含む vector digest をセッション識別情報に設定。
+
+調査対象 checkout は `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`、作業状態は `## main...origin/main`（未コミット変更なし）。GPU 実行・build は行っていないため、実行時のデバイス別成否や数値上の効果は測定していない。

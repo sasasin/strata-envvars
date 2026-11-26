@@ -1,53 +1,45 @@
 # `STRATA_NO_NVFP4_512`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。Strata 所有ソースを対象とし、外部ライブラリ内部の動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-NVFP4 native expert の CPU 行計算で、Strata の AVX-512 kernel を無効化する診断・fallback 用スイッチです。対象は native expert CPU pool の gate/up 行と down 行です。無効化後は、条件を満たせば Strata の AVX2 kernel が選ばれ、それも使えなければ ggml-cpu の `vec_dot` に進みます。GPU 上の NVFP4 計算を無効にする変数ではありません。
-
-native expert は `STRATA_NATIVE_EXPERTS` build option が有効な構成でビルドされ、CPU pool が native expert の行を処理する経路です。CMake の既定は `STRATA_NATIVE_EXPERTS=ON` です。
+Strata の native CPU expert 行計算で、NVFP4 用の AVX-512 実装を選ばないための設定です。gate/up と down の双方でこの変数が未設定、CPU の AVX-512 条件が成立し、行幅がカーネルの対応範囲なら `nvfp4_avx512` の実装を使います。変数が設定されている場合はこの分岐を飛ばし、後続の NVFP4 AVX2 実装（条件を満たす場合）または既定の dot 実装へ進みます。CPU の NVFP4 行 dispatch のみを制御し、GPU の経路を設定する読み取りは見つかりませんでした。`engine/src/kernels/cpu/native_expert.cpp:720-740,847-863`。
 
 ## 値と判定
 
-変数の値は parse されず、`std::getenv(...) == nullptr` かどうかだけを見ます。
+値の内容は parse されません。gate/up と down のそれぞれで `std::getenv(...) == nullptr` を判定するため、未設定だけが AVX-512 許可です。空文字を含め、何らかの値が設定されていると無効化されます。`1`、`0`、`true`、`false`、大文字小文字、前後の空白、数値としての妥当性は区別されません。`engine/src/kernels/cpu/native_expert.cpp:722-723,849-850`。
 
-| 設定 | AVX-512 kernel の許可判定 |
-|---|---|
-| 未設定 | CPU probe が AVX-512対応と判定すれば許可 |
-| `1` など任意の設定値 | 無効 |
-| `0` | 無効 |
-| 空文字 | 無効（環境変数が存在するため） |
+| 条件 | 未設定 | AVX-512 を許可する値 | AVX-512 を止める値 |
+| --- | --- | --- | --- |
+| native CPU expert の gate/up または down 行 | AVX-512 条件と行幅条件を満たせば候補になる | なし（未設定時のみ） | 空文字、`0`、`1`、`false`、任意の文字列 |
 
-文字列、数値としての妥当性、大文字小文字は判定しません。値を設定するだけで無効になるので、`STRATA_NO_NVFP4_512=0` も無効化指定と同じです。
+この変数自体に数値変換・範囲・境界値はありません。無効値として reject する値もありません。設定の有無だけで判定します。`engine/src/kernels/cpu/native_expert.cpp:722-724,849-852`。
 
 ## 有効になる条件
 
-変数が未設定でも、次の条件が必要です。
-
-- native expert CPU kernel がビルドに含まれる。
-- 対象 projection の型が NVFP4 (`kNvfp4Type`) である。
-- `cpu_avx512_ok()` が true を返す。CPU/OS の probe は AVX-512F、BW、VL、VNNI、VBMI の feature bits と OSXSAVE、XCR0 の AVX-512 state 保存を確認する。
-- 行幅 `n` が64値単位の整数個のブロックで、AVX-512 kernel の上限64ブロック以下である（`n % 64 == 0` かつ `n / 64 <= 64`）。
-
-CPU probe はさらに `STRATA_FORCE_AVX2` が先頭文字 `1` の場合、または `STRATA_FORCE_ISA` が `avx2` / `avx` / `sse` / `sse4.2` / `none` の場合、AVX-512を許可しません。`STRATA_FORCE_ISA` は文字列全体を比較し、空文字は既定の上限値にします。無効な非空値は stderr に `strata: STRATA_FORCE_ISA=%s is not avx2, avx or sse; ignored` を出して既定に戻ります。
+- native expert の CPU 行 dispatcher が呼ばれ、対象の gate/up type または down type が NVFP4 であること。gate/up と down は別々の分岐で判定されます。`engine/src/kernels/cpu/native_expert.cpp:723-725,850-852,898-915`。
+- AVX-512 カーネルのビルド対象である x86 CPU build であること。CMake は native expert dispatcher を加え、`STRATA_CPU_X86` の場合に限り NVFP4 AVX-512 ソースをコンパイルします。x86 以外では `cpu_avx512_ok()` は false を返します。`engine/cmake/backends/cpu.cmake:303-317`、`engine/src/kernels/cpu/expert_layout.cpp:42-49`。
+- 実行 CPU と OS が `cpu_avx512_ok()` の条件を満たすこと。同関数は `STRATA_FORCE_AVX2` 等の ISA 制限、OSXSAVE、XCR0 の AVX-512 状態保存、および CPUID の機能ビットを確認します。`engine/src/kernels/cpu/expert_layout.cpp:74-112`。
+- NVFP4 の行幅 `n` が `nvfp4_512_fits(n)` を満たすこと。これは `n % QK_NVFP4 == 0` かつ block 数が `kMaxBlocks` 以下である条件です。満たさない場合はこの AVX-512 実装を選びません。`engine/src/kernels/cpu/native_expert.cpp:723-725,850-852`、`engine/src/kernels/cpu/nvfp4_avx512.cpp:152`。
+- この変数が設定され AVX-512 分岐を止めた後に AVX2 へ進むには、`STRATA_NO_NVFP4_256` も未設定で、CPU が `cpu_avx2_ok()` を満たし、AVX2 の行幅条件も成立する必要があります。したがってこの変数単独では NVFP4 の最適化全体を止めません。`engine/src/kernels/cpu/native_expert.cpp:727-740,854-863`。
 
 ## 実行時の詳細
 
-`native_gu_rows()` と `native_down_rows()` はそれぞれ関数内の `static const bool` として AVX-512可否を初回評価します。プロセス実行中に環境を書き換えても、各関数で評価済みの判定は変わりません。環境変数は最初の native expert 行計算より前に設定する必要があります。CPU feature probe 自体も static cache されます。
+この変数はプロセス起動時ではなく、native CPU expert の gate/up または down 行実装が初めて評価されたときに読み取られます。読み取り結果は関数内 `static const bool` に保存されます。gate/up と down、および `NativeArithmetic` の各テンプレート特殊化にはそれぞれ static があるため、各経路で最初に呼ばれた時点の環境値が使われ、その後の環境変更はその経路の判定に反映されません。公開 row 関数は同じ実装テンプレートへ渡し、pool の処理から呼び出されます。`engine/src/kernels/cpu/native_expert.cpp:560-561,722-725,793-794,849-852,898-915`、`engine/src/kernels/cpu/pool.cpp:1290-1309,1423-1453`。
 
-未設定かつ CPU probe と行幅条件を満たす gate/up 行では `nvfp4_512_gu_rows()`、down 行では `nvfp4_512_rows()` を呼びます。AVX-512 kernel は64値ブロックを複数 token に適用し、gate/up では blob tail の gate/up scale、down では down scale を使います。1回の呼び出しで token 数が7を超える場合は、kernel 内で最大7 token の slice に分けます。
+AVX-512 分岐を使わない NVFP4 行は、まず別設定 `STRATA_NO_NVFP4_256` と CPU / 行幅条件を使って AVX2 実装を試します。その条件も満たさなければ `traits(f.gu_type)` または `traits(f.d_type)` から dot を取得する既定経路へ進みます。`STRATA_OWN_CPU_QUANT` が有効な build では既定 dot は Strata quant layer の traits、無効な build では `pool_quant.hpp` の ggml-cpu traits 側です。いずれの場合も、この変数が直接選択するのは AVX-512 分岐の可否です。`engine/src/kernels/cpu/native_expert.cpp:727-740,854-863`、`engine/cmake/backends/cpu.cmake:364-374`。
 
-変数を設定するか、CPU・幅条件が合わない場合、実装は続けて `STRATA_NO_NVFP4_256` が未設定で CPU AVX2 対応かつ幅条件を満たすか確認します。該当すれば AVX2 kernel を実行します。それ以外は各 row/token について ggml-cpu の `vec_dot` を呼び、down 行ではその結果に down scale を乗じます。`STRATA_NO_NVFP4_256` も設定されている場合、AVX2への fallback は行いません。
+## ログと測定値
 
-この変数自体によるログ出力はありません。`docs/NVFP4.md` は AVX-512経路を ggml-cpu fallback と比較した測定として、cache-resident な1 expert の gate+up（2560値、1280行）で1 token時1.76倍、4 token時3.29倍、7 token時3.66倍と記載しています。これは同資料の測定条件での値で、一般的な CPU pool の速度保証ではありません。
+この設定を読んだこと、AVX-512 を無効にしたこと、または AVX2 / dot に fallback したことを示すログ・警告・終了処理は該当分岐にありません。分岐は計算カーネルの選択を変えます。ソースコメントは AVX-512 経路の測定値として gate/up が 1 token で 1.8x、7 tokens で 3.7x と記していますが、文書 `docs/NVFP4.md` によると測定は cache-resident な 1 expert の gate+up（1280/2560 rows）、AVX-512 CPU 上で、Strata version と機種は記録されていません。この条件を超えた性能差はここでは主張しません。`engine/src/kernels/cpu/native_expert.cpp:720-721`、`docs/NVFP4.md:130-149`。
 
 ## 根拠
 
-- 読み取り、gate/up の dispatch、AVX2 / ggml-cpu fallback: `src/kernels/cpu/native_expert.cpp:194-229`。
-- down 行の dispatch、scale適用と fallback: `src/kernels/cpu/native_expert.cpp:257-277`。
-- pool が native gate/up・down 行処理を呼ぶ箇所: `src/kernels/cpu/pool.cpp:705-719`。
-- NVFP4 AVX-512幅条件と複数token slice: `src/kernels/cpu/nvfp4_avx512.cpp:152-180,183-198`; 上限の説明: `include/strata/kernels/cpu/nvfp4_avx512.hpp:14-15`。
-- CPU/OS feature probe と `STRATA_FORCE_ISA` / `STRATA_FORCE_AVX2` の影響: `src/kernels/cpu/expert_layout.cpp:25-38,41-73`。
-- native expert option とAVX-512 sourceのビルド設定: `CMakeLists.txt:107,1270-1277,1317-1323,1337-1342,1360-1361`。
-- 測定条件と fallback 説明: `docs/NVFP4.md:166-180`。
+- 直接読み取りと AVX-512 / AVX2 / dot の gate/up 分岐: `engine/src/kernels/cpu/native_expert.cpp:720-740`
+- down 行の同じ分岐: `engine/src/kernels/cpu/native_expert.cpp:847-863`
+- AVX-512 CPU 判定と OS / ISA 条件: `engine/src/kernels/cpu/expert_layout.cpp:42-49,74-112`
+- NVFP4 AVX-512 build 条件: `engine/cmake/backends/cpu.cmake:303-317`
+- NVFP4 AVX-512 行幅条件: `engine/src/kernels/cpu/nvfp4_avx512.cpp:152`
+- pool から row dispatcher を呼ぶ箇所: `engine/src/kernels/cpu/pool.cpp:1290-1309,1423-1453`
+- 性能値の条件と記載: `docs/NVFP4.md:130-149`

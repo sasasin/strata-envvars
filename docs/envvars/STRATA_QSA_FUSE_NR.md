@@ -1,42 +1,57 @@
 # `STRATA_QSA_FUSE_NR`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-QSA 層の prefill で、K・attention query・indexer query の RMS normalization と rotary embedding を一つの `rms_rope_rows` kernel にまとめるかを選びます。query の fused 経路では Q の split も同じ処理に含まれます。OFF のときは、query を split してから RMS normalization と rotary を別々に実行します。設定値による分岐は `src/prefill/prefill.cpp` にあり、`src/prefill/kernels.cu` が CUDA/HIP の fused kernel を実装します（`src/prefill/prefill.cpp:554-565,4158-4163,4224-4237,7416-7421,7467-7480`; `src/prefill/kernels.cu:2416-2465,3375-3398`）。
+CUDA/HIP の QSA prompt 処理で、K・query・indexer query の RMS norm と rotary embedding（RoPE）をそれぞれ一つの `rms_rope_rows` kernel に融合するかを選ぶ。既定は融合 ON。OFF にすると K と indexer query は `rms_rows` の後に `rope`、query はさらに先行する `split_q` を含む別々の kernel に戻る。融合 kernel のコメントは置き換える処理と同じ算術・結果ビットを意図すると説明しているが、この文書では実行測定や全モデルでの同一性を独自に確認していない（`engine/src/prefill/prefill.cpp:1017-1018,5242-5247,5309-5321`; `engine/src/prefill/kernels.cu:2531-2539`).
+
+この分岐は QSA の K 投影後、Q 投影後、および indexer Q 投影後に適用される。QSA を含まない層や、この prompt 経路を実行しない処理では、この設定による分岐は起きない（`engine/src/prefill/prefill.cpp:5222-5247,5309-5321,9346-9367,9414-9426`）。
 
 ## 値と判定
 
-設定文字列全体や数値としての妥当性は検査せず、`getenv()` の結果の先頭文字だけを見ます。
+`qsa_fuse_nr()` は初回呼び出し時に `std::getenv` で値を読み、値が未設定でない場合に先頭文字 `e[0]` が `'0'` かどうかだけを判定する。文字列全体の parse、数値変換、空白除去、大文字小文字変換はしない（`engine/src/prefill/prefill.cpp:1026-1028`）。
 
-| 値 | 判定 |
-|---|---|
-| unset | ON |
-| 空文字 | ON（設定済みだが先頭文字は `\0`） |
-| 先頭文字が `0` | OFF（例: `0`, `0anything`） |
-| その他の先頭文字 | ON（例: `1`, `true`, `false`, 空白、負号） |
+| 条件 | 判定 | 例 |
+|---|---|---|
+| 未設定 | ON | unset |
+| 空文字 | ON（値は設定済みだが `e[0]` は終端文字 `\0`） | `STRATA_QSA_FUSE_NR=''` |
+| 先頭文字が `0` | OFF | `0`, `00`, `0anything`, `0 ` |
+| 先頭文字が `0` 以外 | ON | `1`, `true`, `false`, `True`, ` 0`, ` 1`, `anything` |
 
-大文字小文字、後続文字、空白、数値変換、範囲 clamp はありません。したがって `false` も ON です。CLI 引数や設定ファイルとの優先順位、無効値時の fallback はなく、明示値のうち先頭が `0` の場合のみ旧 kernel 列へ切り替えます。根拠: `src/prefill/prefill.cpp:563-565`。
+したがって `false` や先頭空白付きの `0` も OFF にはならない。OFF を指定する条件は値の先頭が文字 `0` であることだけ。別の環境変数や CLI 引数による優先・上書きはこの判定にはない（同 `qsa_fuse_nr()` 定義）。
 
 ## 有効になる条件
 
-- `strata_prefill` を使う CUDA/HIP engine の QSA prefill 経路で値が参照されます。通常の QSA 層処理と別の batched prefill 経路の双方で同じ判定関数を使います（`src/prefill/prefill.cpp:4138-4159,7399-7417`）。
-- QSA 層を処理しないモデル・経路ではこの設定は kernel 選択に影響しません。値が ON なら K、Q、indexer query の各入力を fused 経路へ送り、OFF なら既存の複数 kernel に分岐します（`src/prefill/prefill.cpp:4158-4163,4224-4237,7416-7421,7467-7480`）。
-- `src/prefill/kernels.cu` の fused 実装は CUDA/HIP kernel です。Metal host も `prefill.cpp` を含みますが、Metal 側の `rms_rope_rows` は未実装 entry point の stub で、到達すると `strata::metal_engine::missing` を呼びます。既定の stub は stderr に `strata metal: strata::prefill::rms_rope_rows has no Metal implementation yet` を出して exit code 86 で終了します（`metal/CMakeLists.txt:95-119`; `metal/src/engine/stubs_0291.cpp:15-19`; `metal/src/engine/missing.cpp:14-22`）。この環境変数は Metal kernel を実装・有効化しません。
-- fused kernel wrapper は `T <= 0` なら何もせず戻り、`dim` が 64..256 の範囲外なら stderr に `prefill rms_rope_rows: dim ... is outside 64..256` を出して終了コード 1 で終了します。RoPE scaling が無効な場合も stderr に `prefill rope: invalid rope scaling: ...` を出して終了します。通常の呼び出しは `dim` 128 または 256 です（`src/prefill/kernels.cu:3375-3385`; 呼び出し寸法は `src/prefill/prefill.cpp:4159,4225,4233`）。
+- 読み取り箇所は CUDA/HIP 共有 GPU engine の `engine/src/prefill/prefill.cpp`。CMake では `STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP` の場合にこの GPU engine が定義され、その prefill library に `prefill.cpp` と `kernels.cu` が含まれる（`engine/cmake/strata_gpu_engine.cmake:6-8,482-488`）。
+- 実行中の層が QSA であること。コードは QSA 層の K/Q/indexer-Q 投影の後でこの設定を参照する（`engine/src/prefill/prefill.cpp:5222-5247,5309-5321,9346-9367,9414-9426`）。モデルに QSA 層がなければ参照されない。
+- 同じ関数は通常の chunked prompt 処理と `run_impl` 側の QSA prompt 処理の双方で使われる。どちらも同じ設定判定で融合または分割経路を選ぶ（`engine/src/prefill/prefill.cpp:5242-5247,5309-5321,9363-9367,9414-9426`）。
+- Metal 実装はこの環境変数を読まない。Metal 側の `rms_rope_rows` stub は呼ばれた場合 `missing("strata::prefill::rms_rope_rows")` に渡す（`engine/metal/src/engine/stubs_0291.cpp:21-25`）。
+- ソース上、この設定のための OS、GPU 世代、モデル状態、CLI オプションによる追加条件や fallback は確認できない。QSA prompt 経路へ到達しない場合は単に判定箇所を通らない。
 
 ## 実行時の詳細
 
-判定は `qsa_fuse_nr()` の最初の呼び出し時に一度行い、関数内の `static const bool` にキャッシュします。通常処理では K の後、Q と indexer query の前処理ごとに分岐を使い、同じ関数が別の batched prefill 経路からも呼ばれます。プロセス実行中に環境を変更しても、その後の判定には反映されません（`src/prefill/prefill.cpp:563-565,4158-4163,4224-4237,7416-7421,7467-7480`）。
+`qsa_fuse_nr()` 内の関数ローカル `static const bool` が最初の呼び出しで初期化されるため、プロセス環境の変更はその初回評価後に反映されない。起動時に無条件で読むのではなく、最初に該当する QSA prompt 前処理が呼ばれた時点で読み取る。キャッシュ値はその後の同プロセス内の各 QSA 層・各呼び出しに使われる（`engine/src/prefill/prefill.cpp:1026-1028,5242-5247,5309-5321`）。
 
-通常処理の QSA prefill では、最初の該当層で stderr に `strata prefill: QSA layers: norm + rope in one pass on, attention gate in the attention epilogue ...`（ON 時）または `... off, ...`（OFF 時）を出します。この行は norm/rope と別機能である attention gate の状態も併記し、`told` により一度だけ出力されます。別の batched prefill 経路にはこの診断行がありません（`src/prefill/prefill.cpp:4392-4398,7514-7529`）。
+融合 ON では K の行（2 heads、dim 256）、Q の行（query と gate を含む投影出力から query 部分を直接読み、24 heads、dim 256）、indexer Q の行（4 heads、dim 128）ごとに `rms_rope_rows` を呼ぶ。query は融合時に `split_q` を別途呼ばず、関数の入力 stride で query 部分を読む。OFF では K/indexer Q は norm と RoPE の二段、Q は `split_q`・norm・RoPE の三段になる（`engine/src/prefill/prefill.cpp:5242-5247,5309-5321`; kernel の stride／行処理は `engine/src/prefill/kernels.cu:2538-2545,2549-2580`）。後続の K/V append や query の利用は両方の分岐の後に続く（`engine/src/prefill/prefill.cpp:5248-5308,5316-5325`）。
 
-既定 ON では、QSA の K・Q・indexer query の前処理を fused kernel に渡します。OFF では K と indexer query は `rms_rows` の後に `rope`、Q は `split_q`、`rms_rows`、`rope` の順に処理します。ここでの値判定による別環境変数との相互作用、値の転送、警告は確認できません（`src/prefill/prefill.cpp:563-565,4158-4163,4224-4237`）。
+融合 kernel の API は `T <= 0` なら何もせず戻り、`dim` が 64..256 の範囲外なら stderr に `prefill rms_rope_rows: dim %lld is outside 64..256` を出して `exit(1)` する。RoPE scaling が無効なら `prefill rope: invalid rope scaling: %s` を出して `exit(1)` する。通常の QSA 呼び出しで渡す dim は 256 または 128（query の head size は `kHeadDim`）である（`engine/src/prefill/kernels.cu:3555-3566`; 呼び出し側 `engine/src/prefill/prefill.cpp:5243,5310,5318`）。kernel launch 後は `check("rms_rope_rows")` を呼ぶ（`engine/src/prefill/kernels.cu:3567-3578`）。
+
+## ログと測定値
+
+QSA prompt 処理の最初の該当箇所で、一度だけ stderr に次の形式を出す。第一の `on/off` がこの変数による norm + RoPE の判定で、第二の値は別設定による attention gate の状態である。
+
+```text
+strata prefill: QSA layers: norm + rope in one pass on, attention gate in the attention epilogue off
+```
+
+`on` / `off` の部分は実行時状態で置換される。ログは環境変数自体を独立に検査するものではなく、初回実行時にキャッシュ済みの `qsa_fuse_nr()` の結果を表示する（`engine/src/prefill/prefill.cpp:5545-5551`）。Strata の `docs/DETAILS.md` と `docs/QSAROWS.md` にこの設定の測定値は見つからず、ソースコメントにも条件付きの数値測定値はない。設定一覧には NVIDIA/AMD 向け「on / off」として掲載されている（`docs/SETTINGS.md:456`）。
 
 ## 根拠
 
-- 名前の全参照を調べたところ、環境から値を読むのは `src/prefill/prefill.cpp:564` のみです。同ファイルの `553-565` は fused norm/rotary 選択 helper、他の名前一致はコメント・kernel 宣言・parity 用ソース・Metal stub・診断用ツール・CMake の parity target です。`docs/envvars/000_envvers.md:1801` は候補名を掲載しています。
-- `docs/DETAILS.md` を含む Strata の `docs/` には、この環境変数名や `rms_rope_rows` に関する記載が見つからず、照合できる説明・測定値はありません。
-- CUDA/HIP 側の `strata_prefill` は `src/prefill/gemm.cu`、`src/prefill/kernels.cu`、`src/prefill/prefill.cpp` から構成されます（`CMakeLists.txt:838-844`）。
-- 本文で述べた kernel 選択と診断文字列の根拠は `src/prefill/prefill.cpp:554-565,4158-4163,4224-4237,4392-4398,7416-7421,7467-7480`、fused kernel とその入力条件・失敗経路は `src/prefill/kernels.cu:2416-2465,3375-3398` です。
+- 値の読み取りと cache: `engine/src/prefill/prefill.cpp:1026-1028`
+- 融合と分割の実行経路: `engine/src/prefill/prefill.cpp:5242-5247,5309-5321,9363-9367,9414-9426`
+- 融合 kernel の動作・制限・失敗経路: `engine/src/prefill/kernels.cu:2531-2580,3555-3578`
+- CUDA/HIP build 範囲: `engine/cmake/strata_gpu_engine.cmake:6-8,482-488`
+- Metal stub: `engine/metal/src/engine/stubs_0291.cpp:1-4,21-25`
+- 設定一覧: `docs/SETTINGS.md:456`

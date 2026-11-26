@@ -1,46 +1,47 @@
 # `FNX_PF_SEQ_START`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`strata-split` の prompt path が複数カード間で使う ring と attention exchange の sequence counter の初期値を指定します。これはテスト用フックで、通常の `strata` エンジン向け設定ではありません。対象コードは opt-in の split engine（`-DSTRATA_BUILD_SPLIT=ON`）に含まれ、Linux CUDA または HIP ビルドの `strata-split-<カード数>` サーバー実行ファイルに組み込まれます。CUDA では同じ engine を使う `split_fnx_run` テストドライバーもあります（`src/split/CMakeLists.txt:1-7,20-30,64-79,92-105,153-160`）。
+sFNX の CUDA/HIP split engine が prompt ring と attention exchange で使う sequence counter の初期値を指定する、テスト用フックです。`prefill_alloc()` の最後で全カードの `p.seq` と `p.att_seq[0..1]` をこの値に設定します。各 ring sum / attention exchange は counter を増やした値を同期 flag の番号として使います。通常は 0 から始まります。値を変えると同期番号の開始位置だけが変わり、prompt の計算内容を選ぶ設定ではありません（`engine/src/split/src/prefill.cu:724-725`, `775-776`, `832-852`, `1226-1229`; `engine/src/split/src/engine.hpp:258-263`）。
+
+この読み取りは `strata-split-*` の CUDA/HIP build が含む `prefill.cu` にあります。CMake は同じ engine source を CUDA または HIP として各 split target に組み込みます（`engine/src/split/CMakeLists.txt:76-92`, `120-143`）。コードコメントも「(a test)」と位置付けています（`engine/src/split/src/engine.hpp:258-263`）。
 
 ## 値と判定
 
-`env_int()` が環境変数全体を符号付き base-10 整数として読みます。unset の既定値は `0` です。設定値は省略可能な `+` または `-` と10進数字だけを受け付け、先頭・末尾の空白、空文字、数字の後ろの文字、他の形式は受け付けません。`strtoll` が `long long` の範囲を超える値も整数 parse error になります。parse 後は `0..4294967295`（`UINT32_MAX`）に制限されます。
+`env_int("FNX_PF_SEQ_START", 0)` が環境変数を読みます。`env_int` は unset の場合だけ既定値を返し、設定時は符号付き十進整数全体を `strtoll` で読みます。未設定なら `0`、空文字や整数でない文字列なら `FNX_PF_SEQ_START: '<値>' is not a whole number` の例外です。任意の `+` / `-` と数字のみを許し、先頭・末尾の空白、数字の後ろの文字（例 `0anything`）、空文字、`+` / `-` 単独は拒否します。`long long` に収まらない値も parse エラーです（`engine/src/split/src/env.hpp:15-21`, `33-40`）。
 
-| 入力 | 結果 |
-|---|---|
-| unset | `0` を使う |
-| 空文字または整数でない文字列（例: `1x`, ` 1`） | `FNX_PF_SEQ_START: '<値>' is not a whole number` で初期化失敗 |
-| 整数として parse できるが `0` 未満または `4294967295` 超 | `FNX_PF_SEQ_START: want 0..4294967295, got <値>` で初期化失敗 |
-| `0..4294967295` | unsigned counter の初期値にする |
+| 条件 | unset | 有効値 | 無効値 |
+|---|---:|---|---|
+| split engine の CUDA/HIP build | `0` | `0..4294967295`（両端を含む整数。例: `0`, `+1`, `4294967295`） | parse できない値は上記の整数エラー。parse できても負値または `4294967296` 以上は `FNX_PF_SEQ_START: want 0..4294967295, got <値>` の範囲エラー（`engine/src/split/src/prefill.cu:1226-1229`） |
 
-`+1`、`-0` も整数として受理され、それぞれ `1`、`0` になります。CLI 引数や別の設定値による上書きはこのコードにはありません（`src/split/src/env.hpp:15-21,33-40`; `src/split/src/prefill.cu:908-911`）。
+数値は全体を検査し、基数は 10、大文字小文字の区別はありません。`true` / `false` は整数ではないため無効です。範囲検査後に `unsigned` に変換します（`engine/src/split/src/env.hpp:15-21`, `engine/src/split/src/prefill.cu:1226-1229`）。
 
 ## 有効になる条件
 
-対象は `src/split` の split engine のみです。CMake は split engine を opt-in とし、Linux CUDA または HIP 以外では構成をスキップします。CUDA/HIP のどちらにも同じ `prefill.cu` の読み取りが使われ、変数固有の backend 分岐はありません（`src/split/CMakeLists.txt:1-7,20-30,64-79,92-105`）。
-
-値が範囲内でも、初回 prompt read の開始時に counter が `2^31` 以上なら、指定値はそこで使われず `0` に reset されます。したがって初回 read に持ち越されるのは `0..2^31-1` の範囲です。後続の通常 reset も `0` に戻します（`src/split/src/engine.hpp:235-240`; `src/split/src/prefill.cu:982-988`）。
+- sFNX split engine の `Engine` が構築され、prompt path の `prefill_alloc()` に到達すること。engine constructor はこの関数を呼びます（`engine/src/split/src/engine.cu:317-318`）。
+- 値が範囲内であること。範囲外や整数として不正な設定は初期化を例外で中断します（`engine/src/split/src/prefill.cu:1226-1229`）。
+- 対象コードでは CUDA/HIP のどちらにも読み取りがあります。サーバーか CLI か、モデルの状態、カード数による別の値判定はありません（`engine/src/split/CMakeLists.txt:76-92`, `120-143`; `engine/src/split/src/prefill.cu:1226-1229`）。別の CLI 引数や環境変数による上書きもこの読み取り経路にはありません。
+- `0x80000000` 以上も設定値としての範囲内ですが、次の `prefill()` 冒頭で counter が `PF_SEQ_RESET` 以上と判定されると、フラグをクリアして counter を 0 に戻します。その経路では指定値からの開始は最初の prompt read 前にリセットされます（`engine/src/split/src/engine.hpp:258-263`; `engine/src/split/src/prefill.cu:1300-1306`）。
 
 ## 実行時の詳細
 
-`Engine` の構築中に `prefill_alloc()` が呼ばれ、その prompt path 初期化の最後でこの変数を読みます。読み取った値は全カードについて ring flags と attention flags をゼロ化した後、各カードの `p.seq`、`p.att_seq[0]`、`p.att_seq[1]` に設定されます。ring sum と attention exchange は `++p.seq` で次の sequence 番号を作るため、counter に設定した値自体ではなく、その次の番号から使います。sequence 番号は flag の待ち合わせにも使われます（`src/split/src/engine.cu:274-275`; `src/split/src/prefill.cu:611-623,908-911,512-534,541-560`; `src/split/src/engine.hpp:235-240`）。
+値は `Engine` ごとに `prefill_alloc()` の実行中に一度読み取られ、全カードの ring sum counter `p.seq` と attention counter `p.att_seq[0]`, `p.att_seq[1]` の初期値になります。ring sum と attention exchange はそれぞれ `++p.seq` を同期 flag の sequence として使います（`engine/src/split/src/prefill.cu:724-725`, `775-776`, `832-852`, `1226-1229`）。環境変数を Engine 作成後に変更しても、その Engine の counter には反映されません。新しい Engine の作成時にはその時点の環境を読みます。
 
-読み取りは `Engine` 構築ごとに一度で、リクエストごとではありません。構築後にプロセス環境を変えても、その `Engine` の counter には反映されません。`prefill()` の開始時に counter が `1u << 31` 以上なら、stderr に `fnx: prompt ring sequence numbers at %u: flags zeroed, numbers from 0 again` を出し、flags と counter を `0` に戻します（`src/split/src/prefill.cu:908-911,982-988`）。
+初期化時には各カードを同期し、ring flags と attention flags をゼロにしてから全カードの counter を設定します（HIP では small-chunk sum flags もクリアします）。`prefill()` は各呼び出しの冒頭で `p.seq >= 1u << 31` を確認し、該当時は stderr にリセット理由を出して `pf_seq_reset(0)` を行います（`engine/src/split/src/prefill.cu:832-852`, `1300-1306`）。このため高い開始値は有効値として受理されても、最初の prompt read で通常の 0 開始に戻る場合があります。
 
-範囲外または不正な値は prompt 処理開始前の `Engine` 初期化を失敗させます。`sfnx` は stdout に `ERR <理由>`、stderr に `sfnx: failed: <理由>` を出して終了コード 1 で終了します。`fnx_run` は stderr に `fnx_run: <理由>` を出して終了コード 1 になります（`src/split/tools/sfnx.cpp:1051-1062,1027-1035`; `src/split/tools/fnx_run.cpp:1365-1373`）。
+## ログと測定値
+
+正常な初期化値を設定しただけでは、この変数専用の成功ログはありません。整数 parse エラーと範囲エラーは例外文言を持ちます（`engine/src/split/src/env.hpp:33-40`; `engine/src/split/src/prefill.cu:1226-1229`）。prompt counter が `1u << 31` 以上になった後の `prefill()` では stderr に `fnx: prompt ring sequence numbers at %u: flags zeroed, numbers from 0 again` と出して 0 にリセットします（`engine/src/split/src/prefill.cu:1300-1306`）。
+
+`sfnx` の Engine 初期化中に例外が起きた場合、stdout に `ERR <例外文言>`、stderr に `sfnx: failed: <例外文言>` を出して終了コード 1 で終了します（`engine/src/split/tools/sfnx.cpp:1097-1102`, `1123-1136`）。
 
 ## 根拠
 
-- 読み取り、既定値、明示範囲、初期 reset: `src/split/src/prefill.cu:908-911`。
-- 整数 parse（符号、全体一致、空文字・不正文字・overflow の拒否）: `src/split/src/env.hpp:15-21,33-40`。
-- counter と flags の reset: `src/split/src/prefill.cu:611-623`。
-- sequence counter の increment と ring / attention exchange への利用: `src/split/src/prefill.cu:512-534,541-560`。
-- prompt ごとの threshold reset とログ: `src/split/src/prefill.cu:982-988`。
-- 初期化時の呼び出し元: `src/split/src/engine.cu:274-275`。
-- flag sequence の用途と reset threshold の注記: `src/split/src/engine.hpp:235-240`。
-- split engine の build 条件: `src/split/CMakeLists.txt:1-7,20-30,64-79,92-105`。
-- 起動失敗の観測経路: `src/split/tools/sfnx.cpp:1027-1035,1051-1062`; `src/split/tools/fnx_run.cpp:1365-1373`。
+- 候補名の唯一の実コード読み取り、範囲判定、counter 初期化: `engine/src/split/src/prefill.cu:1226-1229`
+- 整数 parse と unset / 空文字処理: `engine/src/split/src/env.hpp:15-21`, `33-40`
+- flags のクリアと counter 設定: `engine/src/split/src/prefill.cu:832-852`
+- ring / attention exchange の sequence 使用と overflow reset: `engine/src/split/src/prefill.cu:724-725`, `775-776`, `1300-1306`
+- prompt path の初期化時期と build 対象: `engine/src/split/src/engine.cu:317-318`; `engine/src/split/CMakeLists.txt:76-92`, `120-143`
+- `sfnx` の例外表示と終了経路: `engine/src/split/tools/sfnx.cpp:1097-1102`, `1123-1136`

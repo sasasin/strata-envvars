@@ -1,6 +1,6 @@
-# `--output`
+# `strata components use --output`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,52 +8,51 @@
 | コマンド | `strata components use` |
 | オプション | `--output` |
 | 別名 | なし |
-| 値 | `human`、`json`、`jsonl` のいずれか。値を1つ取る |
+| 値 | `human`、`json`、`jsonl` のいずれか |
 
 ## 役割
 
-エンジン切替の結果・エラーを人向けまたは機械向けに出力します。切替対象は位置引数 `engine`、同じ版番号のファミリー指定は `--family` で決まります。このオプションは選択や切替動作を変えません（`strata_cli/update_cmd.py:56,84-87,378-394`）。
+エンジン切替の結果を人向けの文章、JSON オブジェクト、または JSON Lines で標準出力へ出します。出力形式は切替対象や切替の意味を変えません。機械出力では対話プロンプトを出さず、エラーも機械可読な形になります。
 
 ## 使い方
 
 ```sh
-strata components use 0.1.54 --output json
-```
+# 人向けの標準出力（既定）
+strata components use newest
 
-この例は、導入済みエンジンを指定して切り替え結果を JSON で出力します。`engine` には版番号、エンジンのフォルダー名、または `newest` を指定できます（`strata_cli/update_cmd.py:84-87`、`strata_control/engine_library.py:198-211`）。
+# 結果を JSON オブジェクトとして受け取る
+strata components use 0.1.54 --output json
+
+# 稼働中エンジンの終了を最大 60 秒待ち、待機イベントと結果を JSON Lines で受け取る
+strata components use 0.1.54 --wait 60 --output jsonl
+```
 
 ## 値と既定値
 
-- 省略時は `human` です（`strata_cli/update_cmd.py:56`）。
-- `human` は通常の説明文を標準出力へ表示します。
-- `json` は結果を `schema_version: 1` と `ok: true` を含む JSON オブジェクトとして1件出力します。失敗時は `ok: false` と `error.code` / `error.message` を含む JSON オブジェクトです（`strata_cli/update_cmd.py:98-107,237-242,383-394`）。
-- `jsonl` はイベントを1行ずつ出し、最後に切替結果の JSON オブジェクトを出力します。待機イベントが発生しなければ、通常は結果の1行だけです（`strata_cli/update_cmd.py:102-105,383-385`、`strata_control/updater.py:311-322`）。
-- 選択肢は `argparse` の `choices` で制限されます。別の値や値なしは parser エラーになります。明示的な型変換や空文字の特別扱いは定義されていません（`strata_cli/update_cmd.py:56`）。
+`--output` は `human`、`json`、`jsonl` のみを受け付け、省略時は `human` です。値は `argparse` の `choices` で検証されるため、他の値はコマンド処理に入る前に usage とエラーを標準エラーへ出して終了コード 2 になります。`strata components use` の parser は `--json` を登録していません（`--output json` を指定してください）。共通の登録箇所は `terminal/strata_cli/update_cmd.py:47-56`、`use` への適用は同ファイル `:84-87` です。
 
 ## 実行時の動作
 
-`strata_cli/cli.py` は `strata components use` を `update_cmd.run()` へ送り、`--output json` または `jsonl` を機械出力モードとして扱います（`strata_cli/cli.py:2136-2138`、`strata_cli/update_cmd.py:233-242`）。切替前に実行中エンジンを確認し、対象が実行可能なら `engine_library.use_engine()` に渡します。成功時の JSON/JSONL 結果は `schema_version: 1`、`ok: true` とライブラリーが返す情報を含みます（`strata_cli/update_cmd.py:358-394`）。
+`human` では切替の成否や状態を文章で標準出力へ出します。`json` は成功時に `schema_version: 1`、`ok: true` と切替結果を含む JSON オブジェクトを出し、失敗時は `schema_version`、`ok: false`、`error.code`、`error.message` を含む JSON を出します。`jsonl` も機械出力として扱われ、待機中に発生したイベントを1行ずつ（各行に `schema_version: 1`）出した後、成功または失敗の JSON オブジェクトを出します。通常の切替でイベントがなければ、結果の1行だけです。出力先はいずれも標準出力です（`terminal/strata_cli/update_cmd.py:117-139, 309-315, 449-477`）。
 
-JSON/JSONL では通常の人向け進捗表示は抑制されます。JSONL のイベント出力関数はイベントを各行で出力し、JSON ではイベントを出しません（`strata_cli/update_cmd.py:98-120`）。切替前にモデルが実行中で、`--wait` が指定されていない場合、機械出力モードでは対話確認をせず待機もしません。切替処理が busy エラー（終了コード7）を返します。`--wait SECONDS` を併用するとその秒数の間待機し、JSONL では待機イベントが出ます（`strata_cli/update_cmd.py:403-418`、`strata_control/engine_library.py:225-239`、`strata_control/updater.py:311-322`）。
+機械出力では対話を無効にします。`--wait` を指定せずエンジンが稼働中の場合、人向けの対話実行では待つか尋ねますが、`json` / `jsonl` または非対話端末では尋ねず、待機時間 0 のまま busy エラーになります。`--wait SECONDS` を指定した場合はその時間まで待ち、待機イベントは `jsonl` に出ます（`terminal/strata_cli/update_cmd.py:504-520`、`terminal/strata_control/updater.py:383-394`）。
 
-`--json` は one-shot コマンドで `--output json` にする alias です。`--json` と `--output jsonl` を同時に指定すると one-shot 専用のエラー経路になります（`strata_cli/cli.py:508-515,2249-2252`）。`--quiet` は機械出力時には出力を抑止しません（同 `:2253-2254`）。
+出力形式にかかわらず、選択されたエンジンがこの PC で動作可能かを確認してから切替を行います。通常の Qwen エンジンでは状態に pin / active / previous 等を記録し、最新版を選ぶ場合は最新版追従に戻します。別形状のエンジンは形状固有の状態へ記録します。既に有効なエンジンを選んだ場合は変更なしです。切替でエンジンをダウンロードまたは削除することはありません（`terminal/strata_cli/update_cmd.py:470-495`、`terminal/strata_control/engine_library.py:211-228, 231-274, 296-313`、`terminal/strata_control/updater.py:1723-1773`）。
 
 ## 適用条件と副作用
 
-このオプション自体は表示形式のみを変更します。エンジン切替は既存の導入済みパッケージに対して行われ、ダウンロードや削除はありません。切替時には選択エンジンのピン、更新状態、履歴などの状態ファイルが更新され、保存済み tuning preset が再確認対象としてマークされる場合があります。最新版を選ぶ場合はピンを外して更新追従状態に戻します（`strata_control/engine_library.py:225-289`、`strata_control/updater.py:1303-1352`）。
+- 引数の選択・エンジンの解決に失敗すると終了コード 2、エンジンがこの PC に適合しない場合や再検証・切替後の解決確認に失敗すると終了コード 5 です。稼働中のモデルがあり待機時間内に停止しない場合は、切替せず終了コード 7 になります（`terminal/strata_control/engine_library.py:184-197, 202-213, 221-228, 239-269`、`terminal/strata_cli/update_cmd.py:471-475`）。
+- 切替にはローカルのコンポーネント状態ファイルへの記録が伴います。`--output` 自体はファイルを作成・変更せず、ネットワーク取得も行いません（状態更新は `terminal/strata_control/updater.py:1723-1773`、`use` の呼び出しは `terminal/strata_cli/update_cmd.py:470-477`）。
+- 同じバージョンのエンジンが複数ある場合は `--family` で対象を絞れます。`--family` がないまま曖昧な指定をすると終了コード 2 になります（`terminal/strata_cli/update_cmd.py:84-87`、`terminal/strata_control/engine_library.py:184-197`）。
 
 ## 出力とエラー
 
-- 指定エンジンが見つからない、または版番号が複数ファミリーに一致して `--family` なしでは一意に決まらない場合、エラーコード2です（`strata_control/engine_library.py:198-211`）。
-- 選択エンジンがこの PC で実行できない場合、エラーコード5です（`strata_cli/update_cmd.py:378-383`）。ファミリー別検証で署名・完全性検査または DeepSeek の試験起動に失敗した場合も、エラーコード5で拒否されます（`strata_control/engine_library.py:246-260,265-279`）。
-- 実行中モデルを待機せずに切り替えようとした場合、何も切り替えずエラーコード7です（`strata_control/engine_library.py:216-222,232-239`）。
-- 上記の実行時エラーは `json` / `jsonl` では `ok: false` の JSON、`human` では `strata: ...` を標準エラーへ出します（`strata_cli/update_cmd.py:237-242,307-317`）。無効な `--output` 値など parser 段階のエラーは `argparse` が usage とエラーを標準エラーに出し、終了コード2で終了します（`strata_cli/update_cmd.py:56`、`strata_cli/cli.py:2240-2248`）。
+無効な `--output` 値は parser が標準エラーへ usage/error を出し、終了コード 2 で終了します。実行後の既知の失敗は `human` なら `strata: ...` を標準エラーへ、`json` / `jsonl` ならエラーオブジェクトを標準出力へ出します。返却コードは各失敗コードを維持します（`terminal/strata_cli/update_cmd.py:311-316, 378-388`）。成功時は `human` が説明文、機械出力が JSON です（同ファイル `:476-495`）。
 
 ## 根拠
 
-- parser 定義と既定値・選択値: `strata_cli/update_cmd.py:47-56,84-87`
-- 出力モード、切替処理、成功・失敗出力: `strata_cli/update_cmd.py:98-120,233-242,358-394`
-- Terminal CLI の実行振分けと `--json` / `--quiet` の適用: `strata_cli/cli.py:508-515,2136-2138,2240-2265`
-- エンジン選択、busy 条件、切替の状態変更: `strata_control/engine_library.py:198-289`、`strata_control/updater.py:311-322,1303-1352`
-
-調査範囲は上記 commit の checkout 内の Terminal CLI と `strata_control` 実装です。CLI の実行やリリース配布物との照合は行っていません。
+- `terminal/strata_cli/update_cmd.py:47-56, 84-87` — 共通 `--output` parser の値・既定値と、`use` コマンドへの登録。
+- `terminal/strata_cli/update_cmd.py:117-139, 309-315, 449-495` — 人向け表示、JSONL イベント、機械出力判定、`use` の成功・失敗出力。
+- `terminal/strata_cli/update_cmd.py:504-520`、`terminal/strata_control/updater.py:383-394` — 対話を行わない条件、待機とイベント通知。
+- `terminal/strata_control/engine_library.py:184-228, 231-274, 296-313` — 対象エンジンの解決、稼働中の拒否、Qwen / 形状別切替。
+- `terminal/strata_control/updater.py:1723-1773` — 状態ファイルへの切替記録と最新版追従の扱い。

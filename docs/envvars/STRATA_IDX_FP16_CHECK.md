@@ -1,48 +1,57 @@
 # `STRATA_IDX_FP16_CHECK`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-QSA の prompt prefill で、pooled indexer key と現在の query tail (`dead`) を FP16 に丸めた場合に、選択セルが通常の選択とどの程度一致するかを測る診断用フックです。通常の選択結果を差し替える設定ではありません。CUDA/HIP 側の `src/prefill/prefill.cpp` と SYCL 側の `sycl/src/prefill/prefill.cpp` に同じ診断があります。
+QSA prefill の診断用スイッチ。設定すると、通常の FP32 pooled indexer keys と `dead` で行った cell 選択に加え、それらを FP16 に丸めて FP32 に戻した値でも選択を再計算し、両方の選択がどれだけ一致するかを stderr に累積表示する。元の選択 `m.sel_ids` は置き換えず、後続 attention は元の選択を使うため、これは KV/indexer の保存形式や生成結果を FP16 に切り替える設定ではない。CUDA/HIP 側は `engine/src/prefill/prefill.cpp`、SYCL 側は `engine/sycl/src/prefill/prefill.cpp` の QSA chunk prefill に実装されている。比較用の FP16 丸めは FP16 へ変換して FP32 に戻す処理である（CUDA/HIP: `engine/src/prefill/kernels.cu:2649-2652`、SYCL: `engine/sycl/src/prefill/kernels.dp.cpp:2180-2192`）。
 
 ## 値と判定
 
-値は parse されず、`std::getenv("STRATA_IDX_FP16_CHECK") != nullptr` だけで有効になります。未設定なら無効、設定されていれば空文字・`0`・`false` を含むどの文字列でも有効です。最初に診断箇所へ到達したとき `static const bool` に保存されるため、そのプロセスでは以後の環境変更は反映されません。
+両実装とも `static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr` で設定有無だけを判定し、数値・文字列の parse はしない（CUDA/HIP: `engine/src/prefill/prefill.cpp:5464`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3753`）。
 
-| 状態 | 動作 |
-|---|---|
-| unset | 診断を実行しない |
-| 設定あり（空文字を含む） | FP16 丸め後の再選択と比較を実行 |
+| 条件（build / backend） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP QSA chunk prefill | 診断を実行しない | 空文字列、`0`、`1`、`true`、`false`、空白や任意の文字列を含む、設定済みのすべての値 | なし（環境変数が存在する限り有効） |
+| SYCL QSA prefill | 診断を実行しない | 空文字列、`0`、`1`、`true`、`false`、空白や任意の文字列を含む、設定済みのすべての値 | なし（環境変数が存在する限り有効） |
+| Metal / CPU の経路 | この診断コードを通らない | なし | 値にかかわらずこの実装では動かない |
 
-根拠: `src/prefill/prefill.cpp:2771-2776`, `sycl/src/prefill/prefill.cpp:3061-3066`。
+`0`、`false`、空文字列も「設定済み」なので有効であり、無効文字列や範囲外値という概念はない。CLI 引数、設定ファイル、他の環境変数による値の上書き・優先順位は実装されていない（同上）。
 
 ## 有効になる条件
 
-設定が有効でも、QSA indexer の prompt prefill 選択ループを実行する場合に限って動きます。QSA を使わないモデルや、この prefill 経路に入らない処理では診断箇所に到達しません。ソース上では別の CLI 設定や環境変数による追加の有効条件はありません。
+- QSA 層を含むモデルの prefill が実行され、この診断ブロックを含む QSA chunk 処理まで到達する必要がある。ブロックは `st.idx_pooled` と `st.idx_dead` を使って通常選択を行った直後に置かれている（CUDA/HIP: `engine/src/prefill/prefill.cpp:5325-5348,5387-5392,5460-5465`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3647-3660,3713-3719,3749-3753`）。
+- CUDA/HIP では `Prefill::run` が layer-major 経路を選ぶと `run_layer_major` を呼んで戻るため、この `run_impl` 内の診断を通らない（`engine/src/prefill/prefill.cpp:9657-9692`）。同ファイルの multi-prompt layer-major 処理にも診断ブロックはない（`engine/src/prefill/prefill.cpp:8413-8432,8435`）。
+- Metal は `Prefill::run` から `strata::metal_engine::prompt_run` に委譲して戻るため、この診断ブロックを通らない（`engine/src/prefill/prefill.cpp:9633-9650`）。この環境変数を読む箇所は CPU 実装には見つからなかった。
+- SYCL は `Prefill::run` から `run_impl` を呼ぶ構成であり、QSA prefill で条件に到達すれば診断を実行する（`engine/sycl/src/prefill/prefill.cpp:5959-5972`）。
+- このスイッチを有効化するための GPU 世代、モデル量子化、CLI 引数、別の環境変数の条件分岐は診断ブロックにない。実行には該当 backend の prefill 実装が build に含まれている必要がある。
 
 ## 実行時の詳細
 
-各 prefill chunk の通常選択後、`st.idx_pooled` の全行と `st.idx_dead` を FP16 の round-to-nearest-even で丸め、float に戻した診断用バッファへ書きます。そのバッファで `qsa_block_scores` と `qsa_block_topk` を再実行し、通常の `m.sel_ids` と診断用 `ids16` をホストへコピーして比較します。したがって、FP16 の実ストレージや KV streaming を有効化するものではなく、メモリ確保・追加カーネル・デバイスからホストへの転送と同期を伴う診断です。
+`f16chk` は関数内 `static` で、プロセス内で最初にこの宣言へ到達したとき一度だけ環境を読み、その後は値を cache する。したがって起動後に環境を変更しても、この判定は変わらない。unset のまま最初に到達すれば、そのプロセスでは以後も無効である（CUDA/HIP: `engine/src/prefill/prefill.cpp:5464`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3753`）。
 
-通常経路は利用可能な場合に `qsa_block_scores_tc` を使い、診断の再選択は `qsa_block_scores` を使います（通常経路が旧選択指定、または TC 経路を使えない場合も `qsa_block_scores`）。よって出力は実際の通常選択との一致を示しますが、FP16 丸め以外にスコア計算経路の差が影響する場合があります。
+有効時は、最初の診断実行で pooled keys、`dead`、再選択 ID 用の device buffer を確保する。確保失敗時は `err` に `STRATA_IDX_FP16_CHECK: no room for its buffers` を設定して `false` を返す（CUDA/HIP: `engine/src/prefill/prefill.cpp:5465-5475`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3754-3773`）。これらのポインターと集計カウンターも `static` であり、後続の chunk で共有・再利用される。コードは buffer を再確保・拡張せず、プロセス中に解放する処理もこのブロックにはない（同上）。
 
-各 query について、幅 `w` の二つの ID 配列を二つの index で走査して共通 ID 数 `c` を数え、`c == w` なら同一選択として全 query 数 (`queries`) とともに累積します。また `p0 + t + 1 > m.cap` の query について、共通セル数と選択セル数を別途累積し、セル共有率を出します。QSA の最後の層を処理した chunk ごとに stderr へ次の形式で表示します。
+各 QSA 層で pooled keys と `dead` を FP16 丸めしてから FP32 に戻し、同じ indexer query、step、score/top-k 処理で別の ID 配列を作る。通常選択と再選択の ID を host にコピーして stream/queue を同期し、各 query の選択幅 `w` に対する共通 ID 数 `c` を二ポインター走査で数える。`c == w` の query 数と全 query 数は累積し、`p0 + t + 1 > m.cap` の query だけについて共有 cell 数と選択 cell 数も累積する。現在の chunk の最終 QSA 層で累積値を出力する（CUDA/HIP: `engine/src/prefill/prefill.cpp:5477-5505`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3775-3818`）。
+
+## ログと測定値
+
+有効時、各 chunk の最終 QSA 層で stderr に次の書式を出す。値はプロセス内でリセットされない累積値である。
 
 ```text
-strata prefill: FP16 indexer keys: <same> of <queries> selections identical; where the selection is sparse, <percent>% of cells shared (<queries> queries)
+strata prefill: FP16 indexer keys: %lld of %lld selections identical; where the selection is sparse, %.4f%% of cells shared (%lld queries)
 ```
 
-カウンターは関数内 static 変数なので、同じプロセス内の後続 chunk / 呼び出しにも累積します。診断バッファは初回実行時に確保します。確保に失敗すると `STRATA_IDX_FP16_CHECK: no room for its buffers` を `err` に設定し、prefill は `false` を返します。CUDA は `cudaMalloc`、SYCL は `sycl::malloc_device` で確保します。
+「selections identical」は query ごとに共通 ID 数がその選択幅 `w` と等しい件数。「where the selection is sparse」の割合は `p0 + t + 1 > m.cap` の query 群における、共通 ID 数の合計 / 選択 cell 数の合計である。該当する query の選択 cell が一つもなければ表示上は `100.0000%` になる（CUDA/HIP: `engine/src/prefill/prefill.cpp:5491-5505`、SYCL: `engine/sycl/src/prefill/prefill.cpp:3803-3818`）。
 
-根拠: `src/prefill/prefill.cpp:2740-2749,2771-2816`, `sycl/src/prefill/prefill.cpp:3024-3032,3061-3129`; CUDA の丸めは `src/prefill/kernels.cu:1712-1715,1824-1827`、SYCL は `sycl/src/prefill/kernels.dp.cpp:2066-2078,2237-2255`。
-
-## 文書との照合
-
-`docs/DETAILS.md` を検索した範囲では、この環境変数の診断結果や測定値を説明する記載は見つかりませんでした。したがって、一致率や性能・精度の評価はここでは示しません。コードが出力する比較値は観測値であり、特定のモデルや環境での実測結果ではありません。
+CUDA/HIP は比較の host copy 後に `cudaStreamSynchronize`、SYCL は copy 後に queue の `wait` を呼ぶため、診断有効時は各 QSA 層の比較で同期が入る（`engine/src/prefill/prefill.cpp:5487-5490`、`engine/sycl/src/prefill/prefill.cpp:3793-3802`）。この文書化された出力は診断統計であり、性能測定値や通常選択を変更した結果ではない。明示的な buffer 確保エラーは `err` 経由で返り、`Prefill::run` は `run_impl` の失敗を `false` として返す（CUDA/HIP: `engine/src/prefill/prefill.cpp:9705-9713`、SYCL: `engine/sycl/src/prefill/prefill.cpp:5962-5972`）。診断箇所自体はこのエラーを stderr に印字しない。
 
 ## 根拠
 
-- CUDA/HIP prompt prefill の通常選択と診断: `src/prefill/prefill.cpp:2738-2816`
-- SYCL prompt prefill の通常選択と診断: `sycl/src/prefill/prefill.cpp:3021-3129`
-- FP16 round-to-nearest-even を float へ戻す処理: `src/prefill/kernels.cu:1712-1715`, `sycl/src/prefill/kernels.dp.cpp:2066-2078`
+- 候補名の実参照は上記 CUDA/HIP および SYCL の `std::getenv` 2 箇所。リポジトリ全体の完全一致検索では、その他のソース参照はコメントと `terminal/data/settings-register.json` の設定登録だけで、別の env helper 経由の読み取りは確認されなかった。
+- CUDA/HIP の値判定・比較・統計: `engine/src/prefill/prefill.cpp:5460-5505`。
+- SYCL の値判定・比較・統計: `engine/sycl/src/prefill/prefill.cpp:3749-3818`。
+- FP16 丸め: `engine/src/prefill/kernels.cu:2649-2652`、`engine/sycl/src/prefill/kernels.dp.cpp:2180-2192`。
+- CUDA/HIP の経路選択と失敗伝播: `engine/src/prefill/prefill.cpp:9633-9650,9657-9692,9705-9713`。
+- SYCL の呼び出しと失敗伝播: `engine/sycl/src/prefill/prefill.cpp:5959-5972`。
+- 関連資料 `docs/DETAILS.md:253` は `--kv-streaming` を説明しているが、この診断スイッチや FP16 indexer 比較の結果・測定値は記載していない。

@@ -1,45 +1,39 @@
 # `STRATA_INDEXER_PER_TOKEN`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-QSA（sparse-attention）を使うモデルの prompt prefill における indexer key の append 方法を切り替える A/B 用フックです。既定では chunk 内の `T` 個を `native_qsa_indexer_append_batch()` で一括追記します。変数が設定されていると、同じ chunk の各 token について `native_qsa_indexer_append()` を順番に呼ぶ旧経路になります。どちらの経路でも、chunk 内すべての append を終えてから QSA の selection 処理へ進みます。
-
-これは prefill 内の QSA indexer append を選ぶもので、decode や verifier の append 経路を切り替えるものではありません。実装には CUDA/HIP 側の `src/prefill/prefill.cpp` と SYCL 側の `sycl/src/prefill/prefill.cpp` に同じ判定があります。
+QSA の prompt prefill で indexer state を更新する粒度を切り替える内部スイッチです。未設定なら chunk の indexer append を batch API でまとめて行い、設定されていれば chunk 内の各 token に対して単一 append API を順に呼びます。CUDA/HIP 系の prefill と SYCL prefill に読み取り箇所があります。いずれも通常の prompt 経路で選択・attention に進む前に indexer state を更新します（`engine/src/prefill/prefill.cpp:5323-5342`, `engine/src/prefill/prefill.cpp:9428-9443`, `engine/sycl/src/prefill/prefill.cpp:3645-3664`）。
 
 ## 値と判定
 
-| 環境の状態 | 判定 | 動作 |
-|---|---|---|
-| 未設定 | 無効 | chunk 単位の batch append |
-| 空文字を含め、何らかの値が設定済み | 有効 | token ごとの append |
+| ビルド / 経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP 系 prefill（通常・layer-major）および SYCL prefill | batch append | `getenv` が非 null になる値すべて。例: `1`, `0`, `true`, `false`, `0anything`, 空文字 | なし。値の内容は判定しない |
 
-コードは `std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr` を使い、値を数値や文字列として parse しません。したがって `1` だけでなく `0`、`false`、空文字も設定されていれば有効です。大文字小文字や値の後続文字も判定に関係しません。CLI 引数・設定ファイルとの優先順位や別環境変数による上書きはありません。
-
-判定は関数内の `static const bool` に保存され、プロセスで最初にこの QSA prefill 分岐へ到達したときに一度だけ評価されます。その後に環境を書き換えても再評価されません。
+コードは `std::getenv(...) != nullptr` で有無だけを見ており、文字列比較・数値変換・trim・大文字小文字の判定はありません。したがって `STRATA_INDEXER_PER_TOKEN=0` も token ごとの経路を選び、空文字も設定済みとして扱います（`engine/src/prefill/prefill.cpp:5330-5337`, `engine/src/prefill/prefill.cpp:9431-9438`, `engine/sycl/src/prefill/prefill.cpp:3652-3659`）。
 
 ## 有効になる条件
 
-- prompt prefill が `Prefill::run_impl()` の QSA layer 処理まで進むこと。QSA layer がないモデルでは、この判定も append も実行されません。
-- CUDA/HIP ビルドでは `src/prefill/prefill.cpp`、SYCL ビルドでは `sycl/src/prefill/prefill.cpp` の該当実装を通ること。
-- 値が設定済みであること。値が未設定なら、batch 経路のままです。
-
-この分岐は indexer の append の後に行う QSA selection の kernel や batch size を選ぶものではありません。selection は append loop の完了後、同じ `T` 件について従来どおり処理されます。
+- QSA indexer append を実行する prompt prefill 経路に入ることが必要です。変数名の読み取りは CUDA/HIP 系の通常 prefill と layer-major prefill、および SYCL prefill にあります。QSA indexer append を通らない処理には効果がありません（`engine/src/prefill/prefill.cpp:5323-5342`, `engine/src/prefill/prefill.cpp:9428-9443`, `engine/sycl/src/prefill/prefill.cpp:3645-3664`）。
+- 対象の prompt chunk 長は `T` です。設定時は `t = 0..T-1` のループで append し、未設定時は `T` 件を一度に batch append します。`T <= 0` なら設定時の loop は呼び出しません。batch API も `n <= 0` で直ちに戻ります（`engine/src/prefill/prefill.cpp:5332-5341`, `engine/src/prefill/prefill.cpp:9433-9442`, `engine/sycl/src/prefill/prefill.cpp:3654-3663`, `engine/src/kernels/cuda/native_qsa_indexer.cu:341-345`, `engine/sycl/src/kernels/cuda/native_qsa_indexer.dp.cpp:476-480`）。
+- CLI 引数や他の環境変数によるこの値の上書きは、対象名の全参照では見つかりません。`terminal/data/settings-register.json` に名前の登録がありますが、これは値の読み取り箇所ではありません。
 
 ## 実行時の詳細
 
-QSA layer ごとに、prefill は indexer key projection の結果 `m.idx_raw` と chunk の token 数 `T` を用意します。既定経路では `native_qsa_indexer_append_batch(m.idx_raw, T, p0, ...)` を一度呼びます。有効時は `t = 0..T-1` の順に、`m.idx_raw + t * 128` とその token の step position を渡して単一 append を呼びます。両経路ともその後に `qsa_block_scores` と `qsa_block_topk` を実行します。
+それぞれの prefill 関数内で `static const bool` として初回評価時に保存されます。通常 prefill と layer-major prefill は別々の static 変数で、SYCL 側にも独立した static があります。各 static の初期化後に同一プロセス内で環境を変更しても、その経路の選択には反映されません。値を読むのは prompt indexer append に到達した時であり、読み取り時点より前に実行中の環境を変更した場合の反映は、各 static の初期化前かどうかに依存します（`engine/src/prefill/prefill.cpp:5330`, `engine/src/prefill/prefill.cpp:9431`, `engine/sycl/src/prefill/prefill.cpp:3652`）。
 
-append 呼び出しが例外を投げると、prefill は `prefill indexer: ` を付けたエラー文字列を設定して失敗を返します。環境変数自体についてのログ出力はありません。
+未設定時の batch API は chunk の appends をまとめて処理します。設定時は `m.idx_raw` の token ごとの 128 要素領域と対応する device position を使い、同じ chunk を順番に single append します。共通 header は batch append の結果が同じ順序の single append `n` 回と同じ buffer state になると記載し、prompt path では chunk append の後に query が indexer state を読むとしています。そのためこのスイッチが切り替えるのは append の実行粒度であり、selection 用 state の最終内容を切り替える意図ではありません（`engine/include/strata/kernels/native_qsa_indexer.hpp:34-39`, `engine/src/prefill/prefill.cpp:5323-5341`, `engine/sycl/src/prefill/prefill.cpp:3645-3663`）。
 
-実装コメントは batch 経路を「一 token ごとの旧実装に対し chunk の append を三つの kernel launch にする」最適化として説明しています。共通 header は batch append が単一 append を順に呼んだ場合と同じ buffer state を作ると説明し、`docs/AMD_HIP_PERFORMANCE.md` も C-2 の batched QSA indexer append を各 backend で bit-exact と記しています。この環境変数に関する独立した性能測定値は、参照した資料にはありません。
+## ログと測定値
+
+正常にどちらの経路を選んだかを示す専用ログはありません。append 中に `std::exception` が発生すると、呼び出し側は `prefill indexer: ` を付けて `err` に格納し、その prefill 関数から `false` を返します（SYCL も同じ接頭辞です）。この環境変数による速度差の測定値は、調査対象ソースおよび `docs/DETAILS.md` で確認できません（`engine/src/prefill/prefill.cpp:5342`, `engine/src/prefill/prefill.cpp:9443`, `engine/sycl/src/prefill/prefill.cpp:3664`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:2713-2732` — CUDA/HIP 系の環境判定、batch と token 単位の分岐、selection 前の例外処理。
-- `sycl/src/prefill/prefill.cpp:2997-3016` — SYCL 系の同じ分岐。
-- `include/strata/kernels/native_qsa_indexer.hpp:34-44` — batch API と単一 append API の契約。
-- `src/kernels/cuda/native_qsa_indexer.cu:268-307` — CUDA/HIP 側の単一 append と batch append の実装。
-- `sycl/src/kernels/cuda/native_qsa_indexer.dp.cpp:467-568` — SYCL 側の単一 append と batch append 実装。
-- `docs/AMD_HIP_PERFORMANCE.md:135-140` — C-2 の batched append が全 backend で bit-exact との資料記述。ここに記された性能測定は当該変数の比較測定ではありません。
+- `engine/src/prefill/prefill.cpp:5323-5342` — 通常 prefill の batch / token 単位分岐とエラー処理。
+- `engine/src/prefill/prefill.cpp:9428-9443` — layer-major prefill の同じ分岐とエラー処理。
+- `engine/sycl/src/prefill/prefill.cpp:3645-3664` — SYCL prefill の同じ分岐とエラー処理。
+- `engine/include/strata/kernels/native_qsa_indexer.hpp:34-39` — batch append の位置範囲と single append 順次実行時と同じ buffer state という API 契約。
+- `engine/src/kernels/cuda/native_qsa_indexer.cu:341-380`、`engine/sycl/src/kernels/cuda/native_qsa_indexer.dp.cpp:476-525` — backend ごとの batch API 実装。

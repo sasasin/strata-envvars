@@ -1,45 +1,46 @@
 # `STRATA_KV_RING_OFF`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--kv-resident` による K/V ストリーミングが有効な場合に、MTP ドラフター用 K/V のリング化を止め、ドラフターの K/V を全コンテキスト分 GPU VRAM に置く A/B 用スイッチです。コメントも「A/B only」と明記しています。通常セッション（メイン層）の K/V 配置は、この変数ではなく `STRATA_KV_MAIN_OFF` の分岐で決まります。
+MTP drafter の K/V を、通常のウィンドウ分だけ保持する ring 方式でなく全 context 分 VRAM に保持する A/B 用スイッチ。CUDA/HIP 共用実装と SYCL 実装の `kv_plan()` が設定有無を判定し、ring state の `mode` と slots 数を決める。main layers の K/V 計画は `STRATA_KV_MAIN_OFF` 側で判定され、この変数では切り替わらない（`engine/src/core/layer.cpp:738-755`、`engine/sycl/src/core/layer.cpp:722-739`）。
 
 ## 値と判定
 
-文字列や数値として parse せず、`std::getenv("STRATA_KV_RING_OFF") != nullptr` のみを判定します。
+値の文字列や数値は parse せず、`std::getenv(...) != nullptr` だけを見る。したがって未設定は無効、空文字を含む設定済みの値はすべて有効で、`0`、`false`、空白だけの値も ring を無効化する。大文字小文字、数値としての妥当性、文字列末尾は検査しない。判定結果は関数内 `static const bool` に保存される（`engine/src/core/layer.cpp:738-747`、`engine/sycl/src/core/layer.cpp:722-731`）。
 
-| 環境変数の状態 | 判定 |
-|---|---|
-| 未設定 | リング化を許可 |
-| `""` を含む任意の設定値 | リング化を止める |
+| `kv_plan()` に入った状態 | unset | 設定済み（例: `1`, `0`, `false`, 空文字） |
+|---|---|---|
+| `g_kv_resident <= 0` または `ring_cells < 0` | 先に返るため判定しない | 先に返るため判定しない |
+| `g_kv_resident > 0`, `ring_cells > 0`（drafter ring） | 通常の ring 計画。ページ数を丸め、必要なら `mode=2` と ring slots を使う | drafter ring を無効化し、全ページ分の slots を使う `mode=0` のまま返る |
+| `g_kv_resident > 0`, `ring_cells == 0`（main state 等） | main 用の判定へ進む | この変数は分岐に使われず、main 用の判定へ進む |
 
-`1` である必要はなく、`0`、`false`、空文字も設定されていれば有効です。大文字小文字、空白、数値としての妥当性は検査されません。ソースには CLI 引数や設定ファイルによる上書きはありません。
+通常の ring 計画でも、丸めた ring slots が全ページ数以上なら `mode=2` にはならず、この変数による実質的な差はない（`engine/src/core/layer.cpp:748-754`、`engine/sycl/src/core/layer.cpp:732-738`）。
 
 ## 有効になる条件
 
-- `--kv-resident` に対応する `g_kv_resident` が正の値であること。0 以下なら `kv_plan()` はこの変数を調べる前に通常の全常駐計画を返します。
-- MTP ドラフター状態の `ring_cells` が正であること。通常これは `--mtp-window` の値が正で `max_cells` 未満の場合に作られます（リング容量は `window + 4 * max_t + 64`）。`--mtp-window` が 0、またはコンテキスト以上ならリング計画にならず、この変数はドラフター配置を変えません。
-- リング容量を丸めたページ数 `r` が全ページ数 `p.pages` 未満であること。`r >= p.pages` なら変数が未設定でも `kv_plan()` は `mode = 0` の全常駐計画を返します。
-- MTP 状態を初期化する実行経路であること。MTP を使わない実行ではドラフターのリング計画がありません。
-
-`ring_cells < 0` は pinned RAM が足りない場合などの全常駐 fallback を表し、この値より前に全常駐計画として返ります。したがってこの変数は fallback の可否を切り替えません。
+- K/V resident 数 `g_kv_resident` が正であること。`--kv-resident N` は parser で読み、値を `qsa_set_kv_resident()` に渡す。負数は `strata generate: --kv-resident must be >= 0` を stderr に出して終了コード 2 で拒否される。0 はこの分岐を有効にしないが、CUDA/HIP の層分割 spill walk が window を下げる経路や、SYCL の自動選択で正の resident 数が設定される場合は有効条件を満たし得る（`engine/src/program/generate.cpp:3906-3908,5028-5032,7466-7484`、SYCL: `engine/sycl/src/program/generate.cpp:1946,2542-2546,4249-4277`）。
+- MTP drafter の K/V state が `ring_cells > 0` で作られること。MTP は `window > 0 && window < max_cells` の場合に限り `ring = window + 4 * max_t + 64` を渡し、それ以外は `ring=0` を渡す。よって drafter/window がない場合、window が 0 以下または context 以上の場合にはこのスイッチは drafter state を変えない（`engine/src/core/mtp.cpp:511-526`、SYCL: `engine/sycl/src/core/mtp.cpp:442-460`）。
+- `STRATA_KV_MAIN_OFF` は別の静的判定であり、`ring_cells == 0` の main state にはそちらが使われる。この変数は main state の K/V residency を変更しない（`engine/src/core/layer.cpp:744-753`、`engine/sycl/src/core/layer.cpp:728-737`）。
+- ソース内の直接読み取りは CUDA/HIP 共用 `engine/src/core/layer.cpp` と SYCL `engine/sycl/src/core/layer.cpp`。Metal の MTP `bind()` は早期 return する実装だが、同じ backend でこの `layer.cpp` が別経路から使われるかはこの読み取り箇所だけでは断定しない（`engine/src/core/mtp.cpp:908-913`）。
 
 ## 実行時の詳細
 
-CUDA/HIP 系の `src/core/layer.cpp` と SYCL 系の `sycl/src/core/layer.cpp` の `kv_plan()` に同じ判定があります。`ring_cells > 0` かつこの変数が設定済みなら、リング用ページ数 `r` と `mode = 2` を設定する分岐を飛ばし、初期値の `mode = 0` と全ページ分の `slots = pages` を返します。この計画は `qsa_state_bytes()` と `qsa_state_init()` の両方で使われ、K/V の全ページ分を見積もって確保し、identity page table を初期化します。設定されておらず `r < p.pages` の場合は、リング容量に必要なページ数だけ GPU 側の slot を使う `mode = 2` になり、K/V のホストコピーを用いるリング状態になります。
+`kv_plan()` は最初に全 context 分のページ数を slots に設定する。streaming が有効で ring が正、かつ本変数が未設定なら、`ring_cells` をページ単位に切り上げ、ring が全ページ未満の場合に `mode=2`、ring slots、`pooled_rows=2` を設定する。本変数が設定済みならその ring 分岐を飛ばし、全ページ slots と `mode=0` を保つ。これにより MTP drafter の K/V を全 context 分の VRAM state として計画する（`engine/src/core/layer.cpp:738-755,788-804`、SYCL: `engine/sycl/src/core/layer.cpp:722-739,758-774`）。MTP の ring は drafter が読む末尾 window と一回の処理で先行して書く分から作られる（`engine/src/core/mtp.cpp:514-519`、SYCL: `engine/sycl/src/core/mtp.cpp:445-450`）。
 
-環境変数の値は `kv_plan()` 内の `static const bool` に保存されます。`g_kv_resident > 0` かつ `ring_cells >= 0` の呼び出しで初めて評価され、その後プロセス内で環境を変更しても再評価されません。起動時から設定しておく必要があります。
+読み取りは `kv_plan()` 内の関数ローカル static で、最初に `g_kv_resident > 0` かつ `ring_cells >= 0` の呼び出しで評価・cache される。その後の環境変更は同じプロセスでは反映されない。通常は QSA state のサイズを計算する `session_bytes()` が `qsa_state_bytes()` を呼ぶ時点で先に評価され、MTP state のサイズ計算・初期化にも同じ cache が使われる（`engine/src/core/session.cpp:62-65,103-114`、`engine/sycl/src/core/session.cpp:69-72,110-121`）。値に対する CLI 上書きや別環境変数との優先順位はなく、すでに決まった `g_kv_resident` と `ring_cells` が有効条件を決める。
 
-ドラフターの全常駐状態を `cudaMalloc` できない場合、MTP 初期化は `mtp: the K/V state does not fit` を返します。リングを使う通常経路で pinned RAM 確保に失敗した場合は `strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM` を出して全常駐へ再試行しますが、この変数で最初から全常駐計画にした経路は、同じ初期化失敗時に全常駐としてエラー終了します。
+リングを使う通常経路では pinned RAM に drafter K/V copy を置く。初期化に失敗して ring state が非ゼロ mode の場合、MTP は `strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM` を stderr に出し、ring を `-1` にして fully resident で再試行する。本変数が有効な経路は最初から `mode=0` のため、この pinned-copy fallback には入らない。MTP K/V state の device allocation 自体に失敗した場合は `mtp: the K/V state does not fit`、mode 0 の state 初期化が 0 を返した場合は `mtp: state init failed` がエラーになる（`engine/src/core/mtp.cpp:524-535`、SYCL: `engine/sycl/src/core/mtp.cpp:455-475`）。
+
+## ログと測定値
+
+この変数専用の有効・無効ログはない。上記の pinned RAM fallback と MTP state allocation / initialization error は、該当する場合に出る実装上の文言であり、環境変数が設定されたこと自体を示すログではない（`engine/src/core/mtp.cpp:525-535`、`engine/sycl/src/core/mtp.cpp:456-475`）。`docs/DETAILS.md` にこの変数の挙動や条件付き測定値の記載は見つからなかった。
 
 ## 根拠
 
-- `src/core/layer.cpp:634-651` — `kv_plan()` の既定値、早期 return、環境変数の存在判定、リング時のページ数・mode。
-- `sycl/src/core/layer.cpp:724-741` — SYCL 実装の同じ計画。
-- `src/core/layer.cpp:670-705, 805-813, 848-858` — 計画をサイズ見積りと状態初期化に使い、常駐時は identity table、リング時は ring table を設定する処理。pinned K/V 確保失敗時の戻り値。
-- `src/core/mtp.cpp:325-349` — `--mtp-window` からリング容量を決め、状態を確保し、pinned RAM 不足時に `ring = -1` で全常駐を再試行する経路。
-- `sycl/src/core/mtp.cpp:322-350` — SYCL の同じドラフター状態計画と fallback。
-- `include/strata/core/layer.hpp:279-284, 326-327` — `ring_cells` を K/V 状態の計画・初期化へ渡す API。
-- `docs/DETAILS.md:80-94` — `--kv-resident` による K/V ストリーミングの一般説明。この環境変数の説明や測定値は見つかりませんでした。
+- `engine/src/core/layer.cpp:738-755,788-804` — CUDA/HIP 共用の設定有無判定、K/V plan、state サイズ。
+- `engine/sycl/src/core/layer.cpp:722-739,758-774` — SYCL の同等処理。
+- `engine/src/core/mtp.cpp:511-535`、`engine/sycl/src/core/mtp.cpp:442-475` — drafter ring の条件、初期化、fallback と失敗経路。
+- `engine/src/core/session.cpp:62-65,103-114`、`engine/sycl/src/core/session.cpp:69-72,110-121` — main session state のサイズ計算と初期化。
+- `engine/src/program/generate.cpp:3906-3908,5028-5032,7466-7484`、`engine/sycl/src/program/generate.cpp:1946,2542-2546,4249-4277` — `--kv-resident` の読み取り・設定・負数拒否と自動/調整経路。

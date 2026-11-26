@@ -1,43 +1,49 @@
 # `IQ_DECODE_FAST`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-これは Strata の実行時設定ではなく、SYCL 版をビルドするときに使うシェル環境変数です。`sycl/tools/build.sh` と `packaging/build_sycl_linux.sh` が値を CMake の `STRATA_SYCL_IQ_DECODE_FAST` オプションへ渡します。CMake の既定値は ON で、ON の構成では Q2、IQ4、IQ3_S の decode helper 向けコンパイル定義を有効にします。実行中の Strata プロセスが `IQ_DECODE_FAST` を読む箇所はありません（全参照の内訳は後述）。
+これは Strata 実行時の環境変数ではなく、SYCL エンジンを構成する二つのビルド用シェルスクリプトが読む環境変数である。値は CMake の `STRATA_SYCL_IQ_DECODE_FAST` に渡され、ON の場合は Q2 の packed decode、IQ4 lookup、IQ3_S sign 処理に使う six compile definitions を有効にする。OFF ではそれらの定義を追加せず、各ソースにある従来 helper の分岐が残る（`engine/sycl/tools/build.sh:38-44`、`tools/packaging/build_sycl_linux.sh:48-51`、`engine/sycl/CMakeLists.txt:51-58`）。
+
+Strata の実行ファイルがこの名前を読んだり、起動時・リクエストごとに切り替えたりする実装は見つからなかった。実行時にこの変数を設定しても、すでに作られたバイナリの処理は変わらない。影響範囲は `engine/sycl` の SYCL build に限られ、CUDA/HIP/Metal や CLI・サーバー設定のスイッチではない（候補名の全参照を確認。実装箇所は上記二つの build script と CMake 設定のみ）。
 
 ## 値と判定
 
-| 環境変数 | スクリプトから渡される値 | 結果 |
-|---|---|---|
-| 未設定 | `ON` | CMake オプションの既定と同じく fast helper を有効化 |
-| 空文字 | `ON` | `${IQ_DECODE_FAST:-ON}` の既定値を使う |
-| `OFF` | `OFF` | CMake オプションを無効化し、以前の helper を使う |
-| その他の非空値 | 文字列をそのまま CMake に渡す | このシェルスクリプトでは値を検査・変換しない。受理と真偽判定は CMake のオプション処理による |
+| 読み取り経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `engine/sycl/tools/build.sh` | unset または空文字は `${IQ_DECODE_FAST:-ON}` により `ON` | `ON`、`1`、`true` など CMake が真と判定する値 | `OFF`、`0`、`false` など CMake が偽と判定する値 |
+| `tools/packaging/build_sycl_linux.sh` | unset または空文字は `${IQ_DECODE_FAST:-ON}` により `ON` | 同上 | 同上 |
+| `cmake -S engine/sycl` を直接実行 | `STRATA_SYCL_IQ_DECODE_FAST` の CMake option 既定値は `ON` | `-DSTRATA_SYCL_IQ_DECODE_FAST=<値>` が真なら有効 | 同値が偽なら無効 |
 
-`sycl/tools/build.sh` は `build.ninja` が既にあると CMake の初回 configure を省略するため、その build directory では後から指定した `IQ_DECODE_FAST` は読み直されません。同スクリプトはこの変数を使った既存 build cache の更新も行いません。対して `packaging/build_sycl_linux.sh` は毎回 CMake configure に変数を渡します。どちらもビルド時の評価であり、プロセス起動後の変更や CLI 引数との優先順位はありません。根拠: `sycl/tools/build.sh:38-45`, `packaging/build_sycl_linux.sh:39-46`。
+シェル側は未設定と空文字を区別せず `ON` に置き換える。非空値は文字列比較・数値 parse せず `-DSTRATA_SYCL_IQ_DECODE_FAST=<値>` として渡すため、`0anything` も Strata スクリプトが無効値として弾くことはない。その値を真偽として解釈するのは CMake の `option` / `if` であり、Strata 独自の入力検証、警告、fallback はない（`engine/sycl/tools/build.sh:40-41`、`tools/packaging/build_sycl_linux.sh:49-50`、`engine/sycl/CMakeLists.txt:54-58`）。
 
 ## 有効になる条件
 
-- 対象は `sycl/` の CMake プロジェクトを通る SYCL build です。CUDA/HIP や既にビルド済みの実行ファイルを実行するだけでは、この環境変数は参照されません（`sycl/CMakeLists.txt:21,34-39`）。
-- CMake オプションが ON のとき、`STRATA_Q2_WORD_FAST`, `STRATA_IQ4NL_LUT_SWAR`, `STRATA_IQ4XS_LUT_SWAR`, `STRATA_IQ4_LUT_SWAR`, `STRATA_IQ3S_SIGN_FAST`, `STRATA_IQ3S_SIGN_APPLY_FAST` を定義します。OFF のときはこれらの定義を追加せず、各カーネルの `#ifndef` 既定値 0 により旧 helper 側になります（`sycl/CMakeLists.txt:35-39`; `sycl/src/kernels/cuda/iq_kernels.dp.cpp:105-122,169-190,416-433,488-506`; `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1894-1910`）。
-- 実際に異なる helper を使うのは、それらの条件付き実装を含む SYCL カーネルです。ソースには runtime の環境変数チェックやモデル単位の追加 gate はありません。個々の量子化形式を使うかどうかはカーネル呼び出し側の処理経路によります。
+- `engine/sycl` の CMake build に限る。SYCL 以外の engine build にはこの option の定義がない（`engine/sycl/CMakeLists.txt:1-11, 50-58`）。
+- option が真で configure されると six macros が追加される。CMake のこの分岐には GPU 世代、AOT/JIT、モデル形式、サーバーモードによる条件分けはない（`engine/sycl/CMakeLists.txt:51-58`）。
+- `engine/sycl/tools/build.sh` は `$b/build.ninja` がない場合にだけ、この変数を含む初回 configure を行う。既存の `build.ninja` がある build directory では、このスクリプトは `IQ_DECODE_FAST` を再 configure しないため、後から環境値を変えてもその build directory の設定は切り替わらない（同 `:38-44`）。
+- Linux package script は毎回 CMake configure にこの値を渡す（`tools/packaging/build_sycl_linux.sh:18-19, 40-51`）。`STRATA_CMAKE_EXTRA` も同じ configure に渡されるため、同じ CMake option を追加指定した場合の最終値は CMake の引数・cache の解決に従う（同 `:46-50`）。
+- `--` などの CLI 引数、別の実行時環境変数、モデルのロード状態による優先順位・上書きはない。SYCL CMake option を直接指定した場合は、候補環境変数の値ではなく CMake option の値が compile definitions を決める（`engine/sycl/CMakeLists.txt:54-58`）。
 
 ## 実行時の詳細
 
-`sycl/tools/build.sh` は環境変数を `-DSTRATA_SYCL_IQ_DECODE_FAST=...` として configure に渡し、CMake が ON のときだけコンパイル定義を追加します。Q2 decode は `q2_decode8()` の packed integer 経路、IQ3_S は sign mask/apply の整数式、IQ4_NL と IQ4_XS は SWAR lookup 経路へ切り替わります。native MMVQ の IQ4 lookup にも対応する条件分岐があります。OFF ではそれぞれ従来の実装へコンパイル時に切り替わります。根拠: `sycl/CMakeLists.txt:35-39`; `sycl/src/kernels/cuda/iq_kernels.dp.cpp:108-122,175-190,419-432,494-506`; `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1897-1910`。
+読み取りは build script 実行中のシェル展開時であり、実行ファイルの起動時ではない。`engine/sycl/tools/build.sh` では新規 configure 時に限り、option の真偽が compile definition へ変換される。ON のとき `STRATA_Q2_WORD_FAST`、`STRATA_IQ4NL_LUT_SWAR`、`STRATA_IQ4XS_LUT_SWAR`、`STRATA_IQ4_LUT_SWAR`、`STRATA_IQ3S_SIGN_FAST`、`STRATA_IQ3S_SIGN_APPLY_FAST` を定義する（`engine/sycl/CMakeLists.txt:54-58`）。
 
-Strata の SYCL 開発・配布手順では既定 ON と `IQ_DECODE_FAST=OFF` による旧 helper への切替を案内しています。`docs/INTEL.md:518-526` は2枚の Arc Pro B65、Qwen3.8-Flash-Next GSQ-RCO IQ3_S、全 expert resident、layer split、`--spec 2 --pipeline-windows 2`、int8 KV、AOT bmg-g31 の測定条件で、該当 build option を含む一連の変更について decode の差を記載しています。この測定は option 単独の効果を示すものではなく、ここでは環境変数の動作根拠として扱っていません。
+これらはコンパイル時の分岐で使われる。たとえば `STRATA_Q2_WORD_FAST` は `q2_decode8` の packed integer arithmetic と従来の `dpct::byte_level_permute` 実装を選び分け（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:135-153`）、IQ3_S sign helper は fast macro の有無で処理を選ぶ（同 `:199-219`）。IQ4_NL の lookup も SWAR helper と従来 lookup の分岐を持つ（同 `:444-464`）。OFF で従来側が選ばれる例は同 `:135-153, 444-464, 520-540` と `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1785-1805` にある。
 
-この変数専用の実行時ログ、警告、失敗処理はありません。CMake configure や build 自体の出力・終了状態は各スクリプトのビルド処理によるもので、Strata 実行時にこの変数の値が出力されるコードは見つかりませんでした。
+したがって、実行プロセスでの再読込・static cache・子プロセスへの転送は該当しない。値を変更して効かせるには、対象の SYCL build を再 configure / rebuild する必要がある。特に前述の `build.sh` の既存 Ninja build directory は、この変数だけでは再 configure されない。
+
+## ログと測定値
+
+変数値に応じた Strata 固有の起動ログ、警告、終了コード分岐は見つからなかった。build script は通常の CMake/build 出力を扱い、`engine/sycl/tools/build.sh` は `BUILD EXIT <rc>` など一般的な build 結果を出す（同 `:44-50`）。
+
+`docs/INTEL.md:584-590` は、2 枚の Arc Pro B65、Qwen3.8-Flash-Next GSQ-RCO IQ3_S（全 experts resident、layer split、`--spec 2 --pipeline-windows 2`、int8 KV、AOT `bmg-g31`）で、build option と14個の decode control の組合せが decode を4K prompt で +9.7%、free-form answer で +11.1% と記載し、この build option 単独の寄与を +5.9% としている。これは同資料に記載された測定値であり、本調査で再測定した値ではない。
 
 ## 根拠
 
-- `sycl/tools/build.sh:4,38-45`: 変数の案内、unset/empty 時の `ON` fallback、CMake への転送、既存 `build.ninja` 時に configure を省く条件。
-- `packaging/build_sycl_linux.sh:39-46`: configure ごとの `ON` fallback と CMake への転送、続く build。
-- `sycl/CMakeLists.txt:31-39`: CMake option の既定値と、ON 時に付加する6つのコンパイル定義。
-- `sycl/src/kernels/cuda/iq_kernels.dp.cpp:105-122,169-190,416-433,488-506`: Q2 decode、IQ3_S sign、IQ4_NL/IQ4_XS lookup の compile-time 分岐。
-- `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1894-1910`: native MMVQ の IQ4 lookup 分岐。
-- `docs/INTEL.md:518-526`: build option の説明と測定条件（補足資料。実装の根拠ではない）。
-
-`000_envvers.md` にある候補名の全参照を調べた結果、実コードでの参照は上記2つの SYCL build script に限られ、実行時の `getenv` / `os.environ` 読み取りはありませんでした。`sycl/tools/build.sh` のコメント (`:4`) と `docs/INTEL.md` (`:525`) にも記載がありますが、実際の転送は script の CMake 引数で確認しました。
+- `engine/sycl/tools/build.sh:3-4, 38-44` — 変数の説明、unset/empty の既定値、初回 configure 条件。
+- `tools/packaging/build_sycl_linux.sh:18-19, 40-51` — Linux package build における値の展開と CMake configure。
+- `engine/sycl/CMakeLists.txt:50-58` — option の既定値、compile definitions。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:135-153, 199-219, 444-464, 520-540`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1785-1805` — compile-time 分岐の実装。
+- `docs/INTEL.md:582-590` — 測定条件と資料記載値。

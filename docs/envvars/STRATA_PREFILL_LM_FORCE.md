@@ -1,46 +1,41 @@
 # `STRATA_PREFILL_LM_FORCE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。開始時の作業ツリーは `main...origin/main` で未コミット変更なし。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-layer-major prefill がすでに選択されている場合に、短いプロンプトでもその経路を準備できるよう、最小 super-chunk 長の判定を緩めます。`STRATA_PREFILL_LM_FORCE` 単独では layer-major prefill を有効にしません。通常の1プロンプト経路では、既定の最小長を2チャンクから1にします。layer-major の計算方式そのものや通常の chunk-major 経路は、この変数では切り替えません。
-
-実装コメントはこの変数を research 用とし、「2 chunk 未満の prompt でも layer-major walk を行う」用途を示しています。複数 prompt の `run_multi()` は別途内部フラグ `lm_force_` を立てて最小長を緩めるため、その経路でこの環境変数は必要ありません。
+layer-major prefill がすでに選択されているとき、その経路を使う最小プロンプト長の判定を緩めます。通常は入力長 `n` が `2 * m.T` 未満だと `lm_prepare` が `"a short prompt"` で layer-major を断りますが、この変数が有効なら最小値を 1 token にします。layer-major 自体を ON にするスイッチではありません。通常の CUDA prompt 処理では、主スイッチ `STRATA_PREFILL_LAYER_MAJOR` が有効で `Prefill::run` の条件を通った後に効きます（`engine/src/prefill/prefill.cpp:8088-8090, 8235-8238, 9657-9662`）。
 
 ## 値と判定
 
-| 環境値 | 判定 | 最小長への効果 |
-|---|---|---|
-| 未設定 | 無効 | `STRATA_PREFILL_LM_TOKENS` が正なら1 chunk、それ以外は2 chunks |
-| 空文字 | 無効 | 未設定時と同じ |
-| 先頭文字が `1`（例 `1`, `10`, `1abc`） | 有効 | 最小長を1 token相当に下げる（後続の chunk rounding は残る） |
-| その他（例 `0`, `true`, ` 1`） | 無効 | 未設定時と同じ |
+`std::getenv` の結果について、未設定でなく、かつ先頭文字が文字 `'1'` の場合だけ true です。文字列全体の parse や数値妥当性検査はありません。空文字は false、空白を挟んだ `" 1"` も false、`"1"`・`"10"`・`"1anything"` は true、`"0"`・`"true"`・`"2"` は false です。大文字小文字の概念はなく、先頭の1文字だけを比較します（`engine/src/prefill/prefill.cpp:8088-8090`）。
 
-文字列全体の数値変換はせず、`getenv()` が非 null かつ先頭文字が `'1'` かを検査します。したがって `1` 以外の数字、空白始まり、`true` は有効にならず、`1` で始まる不正な文字列も有効です。数値範囲や負値の扱いはありません（`atoi` 等を使わないため）。値は `static const bool` に保存され、最初に `lm_force_env()` が実際に評価された後は同一プロセス内で再読込されません。`run_multi()` 中は `lm_force_` が先に真となり `||` の短絡で環境変数判定を呼ばないため、その呼び出しだけではこの cache は初期化されません。
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| `lm_prepare` に到達する実行経路 | false | 先頭文字が `1` (`1`, `10`, `1x`) | 空文字、`0`, `2`, `true`, ` 1` |
 
 ## 有効になる条件
 
-この変数は `Prefill::run()` が layer-major を選んだ後の `lm_prepare()` でのみ判定されます。選択自体は別の `STRATA_PREFILL_LAYER_MAJOR` と既定規則に従います。
-
-- `STRATA_PREFILL_LAYER_MAJOR` に空でない値があれば、`atoi` が0以外となる値で layer-major を選び、0相当は選びません。明示値は既定規則や `STRATA_DEFAULTS=026` より優先します。未設定または空文字なら既定規則を使います。
-- CUDA の既定は prompt path の stage 数が2以上で、かつ `STRATA_DEFAULTS=026` でない場合に ON。単一 GPU と HIP の既定は OFF。単一 GPU で使うには `STRATA_PREFILL_LAYER_MAJOR` の明示 opt-in が必要です。
-- HIP build は `STRATA_LM_HIP` の先頭文字が `1` でない限り `lm_prepare()` が layer-major を拒否します。この変数が `1` でも、それ自体では HIP の拒否を解除しません。Metal build は `Prefill::run()` 冒頭の別経路から戻るため、この判定に到達しません。
-- さらに、layer split の hand-off / peer GPU、画像 prompt、DFlash2 prompt taps、KVA、chunk 境界で yield する batch read、`--prefill-pipe` 計画、指定 expert format/layout、routing/row debug dump、必要バッファや VRAM/pinned RAM の不足などでは layer-major 準備が拒否されます。したがって、この変数はこれらの制約を上書きしません。
-- CLI 引数にこの変数と同じ機能を直接指定する経路は見つかりません。`--prefill-pipe` はむしろ layer-major を拒否する条件です。
+- `Prefill::run` が layer-major 分岐へ入る必要があります。現行の `prefill_layer_major_default` は false で、通常は `STRATA_PREFILL_LAYER_MAJOR` の明示的な有効値が必要です。single-card small-cache の自動選択は条件に合うと同変数を設定します。`STRATA_PREFILL_LM_FORCE=1` 単独では layer-major を開始しません（`engine/include/strata/core/sm120_series.hpp:180-192, 211-219`; `engine/src/program/generate.cpp:12562-12590`; `engine/src/prefill/prefill.cpp:9657-9662`）。
+- Metal の `Prefill::run` は Metal prompt 経路を実行して return するため、この変数を参照する layer-major 分岐には入りません（`engine/src/prefill/prefill.cpp:9633-9650`）。
+- HIP build は、追加で `STRATA_LM_HIP` の先頭文字が `1` である必要があります。満たさない場合 `lm_prepare` は `"layer-major prefill has only been run on NVIDIA CUDA"` で decline します（`engine/src/prefill/prefill.cpp:8166-8179`）。
+- CUDA/HIP の layer-major 経路でも、モデル未初期化、prompt hand-off / peer GPU、対象条件を満たさない layer split と PLE、画像 prompt、制約に合わない DFlash2 prompt taps、`STRATA_KVA`、chunk 境界で yield する batch read、`--prefill-pipe` の chunk plan、build 時の expert nibble が有効な場合、routing/row debug dump (`STRATA_DBG_FEAT`, `STRATA_DBG_ROUTE_OVERRIDE`, `STRATA_PREFILL_DUMP_R_ALL`)、必要な expert plan / buffer がない場合、WMMA 専用・APR/Hadamard・NVFP4 の未対応 layer、fused expert layout などでは `lm_prepare` が decline し、通常の chunk-major 経路に戻ります（`engine/src/prefill/prefill.cpp:8166-8234`）。
+- 強制しても、GPU メモリに super-chunk が収まらない場合や layer split の各 stage が共通サイズを見つけられない場合は実行されません（`engine/src/prefill/prefill.cpp:8245-8285, 8342-8393`）。
 
 ## 実行時の詳細
 
-通常の `Prefill::run()` では、layer-major の値解決が真で、`lm_prepare_chain()` が成功した場合に `run_layer_major()` に進みます。各 stage の `lm_prepare()` はモデル・バッファ等の適格性を確認した後、`min_s` を計算します。`STRATA_PREFILL_LM_FORCE` が有効なら `min_s=1`、無効なら `STRATA_PREFILL_LM_TOKENS` が正のとき `m.T`（chunk 1個）、それ以外は `2*m.T`（chunk 2個）です。明示的な `STRATA_PREFILL_LM_TOKENS` は target の super-chunk 長 `want` にも使われますが、force 有効時の `min_s=1` を上書きしません。最終 super-chunk 長は chunk 単位に丸められ、prompt 長や GPU の空き容量にも制限されます。このため force は準備可能な最小 prompt 長だけを緩和し、割り当て不足などを解決するものではありません。
+値は `lm_force_env()` 内の関数ローカル `static const bool` 初期化子で一度だけ読み取られ、最初に `lm_prepare` が最小長判定まで到達したときの環境値がそのプロセス内で cache されます。その後に環境を変更しても反映されません。server request ごとの再読み取りや、子プロセスへの転送はこの変数の実装にはありません（`engine/src/prefill/prefill.cpp:8088-8090, 8235-8238`）。
 
-force が無効で短い prompt なら `lm_prepare()` は `a short prompt` で拒否し、通常経路へ戻ります。layer-major を既定で有効にしている場合、この短さだけを理由とするログは抑制されます。それ以外の拒否理由は stderr に `strata prefill: layer-major off for this prompt: ...` と出ます。準備成功時は stderr に `strata prefill: layer-major ...` として token 数、super-chunk 数と長さ、残差行の配置、VRAM 空き量などを記録します。
+最小長の優先順位は、内部 `lm_force_` またはこの環境変数が true なら `1`、そうでなく `STRATA_PREFILL_LM_TOKENS` の `atoll` 結果が正なら `m.T`、それ以外は `2 * m.T` です。`STRATA_PREFILL_LM_TOKENS` は最小長だけでなく super-chunk の目標サイズにも使われます。force は目標サイズ、入力長に基づく上限、GPU メモリ fit、stage 間の制約を解除しません。`lm_force_` は複数 prompt 用 `run_multi` が内部で立てる別の状態で、この環境変数とは独立です（`engine/src/prefill/prefill.cpp:8098-8100, 8235-8244, 8413-8424`）。
 
-layer-major 経路自体では、各 layer の attention/router/shared-expert 処理を sub-chunk ごとに行い、その layer の routed experts を super-chunk 全体について実行します。ソースコメントによると routed expert の加算順と MMQ の row grouping が chunk-major と異なります。実行中の CUDA 同期・コピー等が失敗した場合、layer-major 関数はエラー文字列を返し、`Prefill::run()` は失敗を呼び出し元へ伝えます。環境変数固有の終了コードや警告は定義されていません。
+## ログと測定値
+
+この変数専用の有効ログ、警告、終了経路はありません。layer-major が他の条件で decline した場合、非既定の明示選択では `strata prefill: layer-major off for this prompt: <理由>` が stderr に出ます。短い prompt の decline は `"a short prompt"` として理由ログの対象となり、unset 時の既定選択ではその行を抑制します。16 回続けて長い prompt が decline した場合は `strata prefill: layer-major still off, ...` の行も出ます。成功時には layer-major 処理を行い、prompt 単位の force 専用ログは出しません（`engine/src/prefill/prefill.cpp:9673-9703`）。
 
 ## 根拠
 
-- 環境変数の唯一の実コード読み取り、先頭文字判定と static cache: `src/prefill/prefill.cpp:5900-5903`。調査時点の `rg -n --hidden --glob '!.git/**' 'STRATA_PREFILL_LM_FORCE' .` では他の読み取り箇所はありません。`tools/par/co_bt.sh` や `tools/par/variants/*.txt` は比較実験で値を設定する記述、`tools/batch_test.py` は実験条件の説明であり、エンジン実装の別読み取り箇所ではありません。
-- layer-major の値解決、既定値・明示値の優先順位、および実行/拒否ログ: `src/prefill/prefill.cpp:5894-5898,7222-7271`; `include/strata/core/sm120_series.hpp:107-120`; `include/strata/core/defaults_026.hpp:26-28`。
-- backend / model / CLI 等の拒否条件と最小長、容量準備: `src/prefill/prefill.cpp:5955-6029,6031-6088`。HIP opt-in 判定は `src/prefill/prefill.cpp:5958-5968`。
-- 複数 prompt の内部 force と `lm_force_` の適用、環境判定との短絡関係: `src/prefill/prefill.cpp:6188-6206,6025`。`run_multi()` は空の入力をエラーにし、準備失敗時に `prefill: multi-prompt read declined: ...` を返します。
-- layer-major 実行ログおよびエラー伝播: `src/prefill/prefill.cpp:7150-7180,7254-7279`。layer-major の処理概要・加算順序: `src/prefill/prefill.cpp:5875-5892`。
+- 環境値の読み取りと先頭文字判定: `engine/src/prefill/prefill.cpp:8088-8090`
+- 最小 prompt 長と `STRATA_PREFILL_LM_TOKENS` の判定: `engine/src/prefill/prefill.cpp:8235-8244`
+- layer-major の選択、HIP 条件、fallback/log: `engine/src/prefill/prefill.cpp:8166-8234, 9652-9705`
+- unset 時の主スイッチ既定と小さい cache の自動選択: `engine/include/strata/core/sm120_series.hpp:180-219`; `engine/src/program/generate.cpp:12562-12612`
+- Metal 経路の早期 return: `engine/src/prefill/prefill.cpp:9633-9650`

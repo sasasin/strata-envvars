@@ -1,18 +1,18 @@
 # `strata components remove --output`
 
-調査対象: Strata commit `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
 | コマンド | `strata components remove` |
 | オプション | `--output` |
-| 別名 | なし（`--json` は別の alias option） |
+| 別名 | なし |
 | 値 | `human`、`json`、`jsonl` |
 
 ## 役割
 
-削除結果とエラーを人向けテキストまたは機械処理向け JSON で出力します。エンジンを削除するかどうか、削除対象、削除処理そのものは変えません。`remove` は `strata components remove <engine>` として登録され、`engine` には版番号またはインストール先 folder 名を指定します。
+削除結果の表示形式を選ぶ。`json` と `jsonl` はこのサブコマンドではどちらも機械可読出力として扱われ、削除成功時に JSON オブジェクトを stdout に1つ出力する。エンジンの選択・削除対象・削除可否はこの値では変わらない。
 
 ## 使い方
 
@@ -20,39 +20,39 @@
 strata components remove 0.1.54 --output json
 ```
 
+指定した版のエンジンを削除し、結果を JSON で受け取る。対象の版が複数のフォルダーに一致する場合はフォルダー名を指定する。
+
 ## 値と既定値
 
-- 省略時は `human` です。
-- `human`、`json`、`jsonl` 以外は parser の `choices` 検証で拒否されます。値を省略した場合も parser error になります。
-- `json` と `jsonl` はどちらもこの一回限りの削除結果を JSON オブジェクト 1 行で出します。`jsonl` を指定しても進捗イベント列にはなりません。
+- 省略時は `human`。
+- `human`、`json`、`jsonl` のいずれかを1つ指定する。別の値は argparse の選択肢検証で拒否され、usage とエラーになり、終了コードは2。
+- オプションを複数回指定したときの扱いは、argparse の通常の単一値引数に従い、最後に指定した値が使われる。
 
 ## 実行時の動作
 
-`--output` は `strata_cli/update_cmd.py` の共通 parser で追加され、`remove` にも適用されます。`update_cmd.run()` は値が `json` または `jsonl` なら machine mode とし、削除成功時は `schema_version: 1`、`ok: true` と削除結果を含む JSON オブジェクトを stdout に出します。`human` では削除した engine の版と解放容量を表示します。
+parser は `components remove` に共通オプションを登録する。実行時に `json` / `jsonl` を `machine=True` と判定し、インストール済みエンジン一覧から位置引数の版またはフォルダー名と、任意の `--family` に一致する対象を検索して削除する。`human` では削除した版と解放容量を文章で stdout に表示し、機械出力では `schema_version: 1`、`ok: true` と削除結果のフィールドを含む JSON オブジェクトを stdout に出す。
 
-この option は削除可否の条件を変えません。対象解決後、`engine_library.delete_engine()` が実際の削除を行います。`--json` は共通 one-shot option として登録されており、単独なら `--output json` と同じ扱いです。`--json` と `--output jsonl` を同時指定すると、one-shot command に `--json` は使えないというエラーになり、処理を開始しません。`--quiet` は human mode の情報出力を抑えますが、JSON / JSONL 出力には適用されません。
+このコマンドでは `jsonl` も `json` と同じ成功出力経路を通り、行ごとの進捗イベントは出さない。`--output` は削除処理の対象や副作用に影響しない。
 
 ## 適用条件と副作用
 
-削除対象は、一覧から `--family`（`qwen` または `deepseek`）で絞った上で、版番号または folder 名に一致する導入済み engine です。該当なし、または同じ版番号が複数 family にあるなど対象を一意に決められない場合は削除せず失敗します。
+削除対象は `strata components remove` の位置引数 `engine` で指定する。`--family` には `qwen` またはインストール済みモデル形状に対応する `shape:<shape>` を指定できる。省略時は全 family から検索され、同名・同版が複数あればフォルダー名の指定が必要になる。
 
-現在使用中の engine、または稼働中プロセスが使用している engine は削除できません。削除時は対象 folder を `.deleting-<乱数>` に rename してから中身を消します。rename に失敗した場合は何も変更しなかった旨を示して失敗します。成功後、Qwen engine では該当 folder を指す previous / pinned 状態や、同版が他に残っていない場合の failed 記録を更新し、履歴を保存します。DeepSeek engine では stale pin があれば解除します。モデルと設定は削除対象外です。
+削除対象が現行エンジン、実行中プロセスが使用中のエンジン、または未インストールのエンジンなら削除されない。実際の削除では更新ロックを取り、対象フォルダーを `.deleting-*` に rename してから削除を試みる。モデルと設定は削除対象外。`--output` の変更自体はファイルやプロセスに副作用を起こさない。
 
 ## 出力とエラー
 
-- 成功時の `human` 出力は `Engine <version> deleted (<容量> freed). Models and settings were not touched.` です。`json` / `jsonl` は削除結果を含む JSON オブジェクトを stdout に出します。終了コードは 0 です。
-- `json` / `jsonl` で `UpdateError` が起きた場合は `ok: false`、`error.code`、`error.message` を持つ JSON を stdout に出し、その code を終了コードにします。`human` では `strata: <message>` を stderr に出します。
-- 対象なし・曖昧・使用中など削除不可は code 2、削除先を rename できない場合は code 6 です。CLI 全体の parser error（不正な `--output` 値など）は argparse の usage / error 表示となり、実行処理には入りません。
+- `human` の成功時は `Engine <版> deleted (<容量> freed). Models and settings were not touched.` を stdout に出す。
+- `json` / `jsonl` の成功時は成功結果を JSON オブジェクト1件として stdout に出す。
+- 処理中に捕捉された `UpdateError` は、`human` では `strata: <メッセージ>` を stderr に、機械出力では `schema_version: 1`、`ok: false`、エラーコードとメッセージを含む JSON を stdout に出す。対象がない、曖昧、削除禁止の対象などは終了コード2。rename に失敗した場合は「何も変更していない」旨を含むエラーと終了コード6。
+- 引数の値が選択肢外の場合は削除処理に入らず、argparse が終了コード2で拒否する。
 
 ## 根拠
 
-- 索引上の scope と掲載位置: `docs/cli/README.md:309-325`。
-- parser の `--output` 値と既定値、`remove` への適用: `strata_cli/update_cmd.py:47-57,88-91`。
-- `remove` の処理分岐、machine mode と成功時の出力: `strata_cli/update_cmd.py:98-108,233-242,272-273,358-400`。
-- JSON エラーと `UpdateError` の code 伝達: `strata_cli/update_cmd.py:233-242,307-319`。
-- 対象の照合と曖昧・未導入エラー: `strata_control/engine_library.py:198-211`。
-- 使用中 / 稼働中 engine の削除禁止: `strata_control/engine_library.py:167-177,294-309`。
-- folder rename・削除・状態更新・rename 失敗: `strata_control/engine_library.py:310-334`。
-- `--json` / `--quiet` の共通追加、および alias の変換と quiet の適用条件: `strata_cli/cli.py:508-515,2249-2265`。
-
-調査範囲はこの commit のソースです。同一 revision の CLI `--help`、Release 配布物、および OS ごとの filesystem 挙動は確認していません。
+- `terminal/strata_cli/update_cmd.py:47-57` — 共通 parser における値の選択肢と `human` 既定値。
+- `terminal/strata_cli/update_cmd.py:88-91` — `remove` サブコマンド、位置引数、`--family`、共通オプションの登録。
+- `terminal/strata_cli/update_cmd.py:307-318` — `json` / `jsonl` を機械出力扱いにする判定とエラー出力。
+- `terminal/strata_cli/update_cmd.py:341-342`、`449-470` — `remove` の実行経路と対象エンジンの検索。
+- `terminal/strata_cli/update_cmd.py:496-501` — 削除呼び出し後の human / JSON 成功出力。
+- `terminal/strata_control/engine_library.py:184-197` — 版・フォルダー名の検索、未一致・曖昧時のエラー。
+- `terminal/strata_control/engine_library.py:317-366` — 削除条件、rename と削除、状態記録、削除結果。

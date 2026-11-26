@@ -1,41 +1,51 @@
 # `STRATA_VERIFY_ARENA`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-expert arena をロードした後、その読み込み内容の FNV-1a 64-bit checksum を stderr に表示する診断用フックです。値を検証したり読み込みを拒否したりはせず、checksum と arena サイズを出力するだけです。コメント上も checksum を比較するテスト用とされています。
+アリーナへの expert データ読み込みが成功した後、読み込んだ `want` バイト全体の FNV-1a 64-bit checksum とサイズを stderr に出す診断用スイッチ。checksum は `fnv1a64(a->data(), want)` で計算され、seed は `1469598103934665603`、各 byte を XOR してから `1099511628211` を乗算する。値は表示だけに使われ、読み込み内容の照合、修復、生成結果の選択には使われない（`engine/src/core/expert_source.cpp:6853-6864`、`engine/sycl/src/core/expert_source.cpp:3504-3512`、`engine/src/core/pinned.cu:583-589`）。
+
+実装は CUDA/HIP 系と SYCL 系それぞれの `strata::core::ArenaExpertSource::open` にある。通常のアリーナ読み込み経路で働く診断フックであり、環境値の内容は設定値として解釈されない。`terminal/data/settings-register.json:50933-50946` にも backend ごとの読み取り位置が登録されているが、実際の挙動の根拠は C++ 実装である。
 
 ## 値と判定
 
-値の内容は parse されず、`std::getenv("STRATA_VERIFY_ARENA") != nullptr` だけで判定します。
+両 backend とも `std::getenv(...) != nullptr` のみを判定する。文字列変換、数値 parse、trim、大文字小文字判定はない。したがって未設定だけが無効で、空文字を含む設定済みの値はすべて有効。`0`、`false`、`true`、任意の文字列も区別されない（`engine/src/core/expert_source.cpp:6861-6864`、`engine/sycl/src/core/expert_source.cpp:3509-3512`）。
 
-| 環境変数の状態 | 動作 |
-|---|---|
-| 未設定 | checksum を出さない |
-| 設定済み（空文字を含む） | checksum を出す |
-
-`0`、`false` なども、空文字も、設定されていれば同じ扱いです。数値変換、大小文字比較、値域制限はありません。
+| 条件（backend） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP、SYCL の `ArenaExpertSource::open` が通常の読み込み完了まで進む | checksum ログなし | 空文字、`0`、`1`、`false`、`true`、その他の設定値 | なし（値が設定されている限り有効） |
 
 ## 有効になる条件
 
-CUDA/HIP では `--mmap-experts` を使わず、`ArenaExpertSource::open()` で arena を読み込む経路で有効です。`--mmap-experts` の経路は `FileExpertSource` を使うため、この環境変数による checksum は出ません。SYCL でも `--mmap-experts` の経路と、`--stream-experts` かつ `--mmap-experts` なしで GGUF から直接 stream する経路では arena を開かないため対象外です。
-
-対象の arena 読み込みは、pack の `experts.bin` から、または native pack でそのファイルがなく GGUF shard から行われます。レイアウト不一致、入力ファイルのサイズ不一致、arena の確保失敗、読み込み失敗、読み込み byte 数の不一致がある場合は `open()` がそこで失敗するため checksum 出力まで到達しません。CUDA/HIP、SYCL の両実装に同じ設定有無判定があります。
+- 実行経路が `ArenaExpertSource::open` を呼ぶこと。CUDA/HIP の生成処理は `o.mmap_experts` 分岐を通らない場合に arena を開き（`engine/src/program/generate.cpp:8621-8622, 8745-8748, 8870-8872`）、SYCL は `--stream-experts` の直接 GGUF 読み込みでも `o.mmap_experts` のファイル tier でもない場合に arena を開く（`engine/sycl/src/program/generate.cpp:4711-4726, 4759-4776`）。
+- `open` がアリーナの確保とデータ読み込みを完了し、`st.ok` かつ読み込み byte 数が `want` と一致すること。失敗または byte 数不一致なら、その前に `open` は失敗を返すため checksum は出ない（CUDA/HIP: `engine/src/core/expert_source.cpp:6848-6860`、SYCL: `engine/sycl/src/core/expert_source.cpp:3499-3509`）。
+- `STRATA_ARENA_MMAP` で既存の padded `experts.bin` を直接 map する経路では、`open` が checksum 判定より前に成功を返すため、この変数が設定されていてもログは出ない（CUDA/HIP: `engine/src/core/expert_source.cpp:6490-6521`、SYCL: `engine/sycl/src/core/expert_source.cpp:3356-3385`）。
+- OS、build macro、モデル、CLI 引数による値の parse 差はない。上記の backend 固有の実装がビルドされ、その通常のアリーナ読み込み経路に入ることが前提。
 
 ## 実行時の詳細
 
-`ArenaExpertSource::open()` は読み込み処理の後に環境変数を参照し、成功した読み込み byte 数が期待値 `want` と一致した場合だけ checksum を計算します。arena の `want` byte 全体を FNV-1a 64-bit（初期値 `1469598103934665603`、乗数 `1099511628211`）で走査します。ログ形式は次のとおりです。
+`ArenaExpertSource::open` が読み込みを終えた都度、成功判定の直後に現在の環境を読み、設定されていればアリーナの `want` バイトを走査して checksum を出力する。関数内 `static` への保存や cache はなく、プロセス起動時やリクエストごとではなく、アリーナを開くたびの読み取りである（`engine/src/core/expert_source.cpp:6445-6449, 6846-6864`、`engine/sycl/src/core/expert_source.cpp:3311-3315, 3496-3512`）。
+
+CLI 引数や他の環境変数による値の上書き・優先順位はない。checksum の有無は読み込み済みデータ、arena の登録状態、以後の読み出し・生成処理を変更しない。失敗経路を成功扱いにしたり、checksum 不一致を検出して終了したりする処理もない。通常の CUDA/HIP 生成経路と SYCL の arena 経路では CLI/serve のどちらから呼ばれる場合も同じ条件でログを出すが、上記の mmap / streaming 経路は対象外。
+
+## ログと測定値
+
+有効で読み込みが成功した場合、stderr に次の形式で出る（値は実行時に計算される）。
 
 ```text
 strata generate: expert arena checksum %016llx (%.2f GiB)
 ```
 
-checksum は16桁の16進表記、サイズは GiB 単位の小数2桁です。値は読み込みデータの出力後にだけ計算され、arena の内容、pinning、I/O 経路、モデル実行を変えません。判定結果を static cache せず `open()` ごとに環境を読みます。Strata 内の他の箇所からこの名前を読むコードは確認できません。
+`%016llx` は FNV-1a 64-bit checksum、`%.2f GiB` は `want / 2^30`。変数未設定時、読み込み失敗時、既存 padded arena の直接 map 成功時にはこの行は出ない。`docs/DETAILS.md` にこの変数や checksum の測定結果の記載はなく、性能・正確性の測定値は確認できない。
 
 ## 根拠
 
-- CUDA/HIP: `src/core/expert_source.cpp:4713-4721`（byte 数確認、環境判定、ログ）、`src/program/generate.cpp:4821-4838,4901-4902`（arena 経路と mmap 経路の選択）。
-- SYCL: `sycl/src/core/expert_source.cpp:3504-3512`（byte 数確認、環境判定、ログ）、`sycl/src/program/generate.cpp:4273-4291,4323-4344`（stream/mmap/arena 経路の選択）。
-- checksum: `include/strata/core/pinned.hpp:171`（初期値）、`src/core/pinned.cu:332-339`（FNV-1a 64-bit の処理）。SYCL 実装も `sycl/src/core/pinned.dp.cpp:287-294` にあります。
-- `docs/DETAILS.md` と README 類に、この環境変数の利用者向け説明は見つかりませんでした。
+- `engine/src/core/expert_source.cpp:6445-6457, 6846-6864` — CUDA/HIP の arena 開始、読み込み成功後の設定有無判定と出力。
+- `engine/sycl/src/core/expert_source.cpp:3311-3323, 3496-3512` — SYCL の同じ判定と出力。
+- `engine/src/core/pinned.cu:583-589` — CUDA/HIP 側 checksum 関数。
+- `engine/include/strata/core/pinned.hpp:209` — checksum 関数宣言と既定 seed。
+- `engine/src/program/generate.cpp:8621-8622, 8745-8748, 8870-8872` — CUDA/HIP 生成経路での arena 選択と呼び出し。
+- `engine/sycl/src/program/generate.cpp:4711-4726, 4759-4777` — SYCL の streaming / file tier 分岐と arena 呼び出し。
+- `engine/src/core/expert_source.cpp:6490-6521`、`engine/sycl/src/core/expert_source.cpp:3356-3385` — mmap 直返し経路。
+- `terminal/data/settings-register.json:50933-50946` — 設定レジストリの backend と読み取り箇所の登録。

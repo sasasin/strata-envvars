@@ -1,61 +1,49 @@
 # `STRATA_PIPED_CONCURRENT_MIN`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`STRATA_PIPED_CONCURRENT=1` で opt-in するパイプライン並列 prompt read に、token 数の下限を設けます。値は並列読み取り自体を有効にせず、対象の prompt read 区間が下限未満なら通常の読み取り経路へ進ませます。下限が 0 なら、並列読み取りの他の条件を満たすすべての区間が対象です。
-
-この分岐は、`--batch` が正で、`--batch-groups` が 1 より大きく、layer split の stage が複数ある pipelined batch path にあります。Strata の BATCHING 文書は、この親機能を実験的な opt-in とし、CUDA/HIP でビルドされ SYCL では利用できないと説明しています（`docs/BATCHING.md:225-259`）。
+`STRATA_PIPED_CONCURRENT=1` で有効にする実験的な prompt 読み取り並行処理について、並行読み取りに切り替える最小 token 数を指定する。指定値以上の長さの読み取り区間だけ、読み取り専用 thread と pipelined slot group の実行を並行させる。しきい値未満は通常の `run()` 経路で読み、値だけでは並行処理を有効にしない（`engine/src/program/generate.cpp:21024-21054`）。
 
 ## 値と判定
 
-実装は `std::atoll` で符号付き整数に変換し、その結果と 0 の大きい方を `int64_t` として使います。文字列全体の妥当性検査やエラー報告はありません。
+`std::getenv` で値を読み、設定されていれば `std::atoll` で整数変換した後、`std::max(0LL, ...)` で負値を 0 にする。文字列全体の妥当性検査やエラー処理はなく、`atoll` が読む数値部分が使われる。したがって空文字・数値で始まらない文字列は 0、`4096tail` は 4096、`-1` は 0 になる。先頭空白や符号は `atoll` の変換規則に従う。範囲外の数値に対する明示的な処理はない（`engine/src/program/generate.cpp:21050-21053`）。
 
-| 環境変数の値 | 閾値として使われる値 |
-|---|---:|
-| 未設定 | 0 |
-| 空文字 | 0（`atoll` の変換結果 0） |
-| 10 進数の非負整数（例 `4096`） | 変換された整数 |
-| 負の整数（例 `-5`） | 0（負値を clamp） |
-| 数字で始まらない文字列 | 0（変換結果 0） |
-| 数字の後に別の文字が続く文字列（例 `12tail`） | 数字の接頭部分 12 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA / HIP の pipelined groups 読み取り | 0（全 piece がしきい値を満たす） | 正の整数 `N`。piece の長さが `N` 以上なら並行経路 | 空文字、数値で始まらない値、`0`、負値は変換後 0 となり、しきい値としては全 piece を通す。`4096tail` のように数値の後ろに文字があっても数値部分を使う |
 
-したがって `0`、負値、空文字、非数値文字列は、いずれも全区間を許す 0 の閾値になります。`atoll` の変換範囲を超える入力について、Strata 独自の検査・fallback はありません。
-
-実際の条件は `(b0 - a0) >= pr_conc_min` です。等しい場合も条件を満たし、1 token でも下回ればこの並列経路を通りません。ここで比較するのは `read_part` に渡された区間長で、必ずしもキャッシュ再利用後の元 prompt 全長ではありません（`src/program/generate.cpp:15133-15171,15406-15413`）。
+「全 piece を通す」は、この変数が長さ条件を制限しないという意味であり、他の有効条件を無視して並行処理を強制する意味ではない。`0` は無効化値ではなく、既定どおりの長さ下限なしを表す（`engine/src/program/generate.cpp:21047-21054`）。
 
 ## 有効になる条件
 
-次の条件をすべて満たす必要があります。
-
-- pipelined batch path である（`--batch > 0`、`--batch-groups > 1`、かつ `n_pipe > 1`）。`n_pipe` は layer split の stage 数に 1 を足した数です（`src/program/generate.cpp:13012-13016`）。
-- `STRATA_PIPED_CONCURRENT` が設定され、`atoi` の結果が 0 ではない。未設定・空文字・`0` や非数値文字列では親機能が無効で、MIN を設定しても有効化されません（`src/program/generate.cpp:15383-15405`）。
-- `STRATA_PREFILL_HELP`、`STRATA_SPLIT_MTP_BATCH`、`STRATA_FS_SLOTS` が `atoi` で非 0 ではなく、`--pcie-mode dma` でもない。
-- helper cache を使っておらず、GGUF source が blob を stage する状態でもなく、GGUF source と arena source 以外の expert source でもない。これらの条件に当たると親機能は無効になり、stderr に `strata batch: STRATA_PIPED_CONCURRENT is off beside ...` が出ます（`src/program/generate.cpp:15386-15402`; 判定内容は `include/strata/program/batch_read.hpp:30-53`）。
-- request に画像がない。
-- 対象区間の token 数が閾値以上である。
-
-CLI 引数・設定ファイル・他の環境変数が MIN の値を上書きする経路はありません。`STRATA_PIPED_CONCURRENT` は独立した必須 opt-in です。親機能が有効で区間が閾値未満、または画像付きの場合は、この専用並列読み取りブロックを通らず、その後の通常の piped read 処理へ進みます（`src/program/generate.cpp:15413-15414,15637-15706`）。
+- `STRATA_PIPED_CONCURRENT` が `std::atoi` で 0 以外になる必要がある。未設定・空文字・`0`・数値で始まらない文字列はオフ、数値で始まり 0 以外に変換される文字列はオンとして扱う（`engine/src/program/generate.cpp:21024-21029`）。
+- `--batch` が正、`--batch-groups` が 1 より大きく、layer split の stage が存在して `n_pipe > 1` である pipelined 経路が必要（`engine/src/program/generate.cpp:17529-17533`）。また、`STRATA_PIPED_READ_PIECE` が正で、piece 読み取りループに入る必要がある。未設定または 0 では pipelined の `piece_now()` が 0 となり `run(a0, b0)` に進むため、この並行経路は呼ばれない（`engine/src/program/generate.cpp:21279-21300`, `21343-21349`）。Strata の `docs/BATCHING.md` もこの機能を layer split と `--batch-groups` > 1 の経路として説明し、CUDA/HIP 向け、SYCL 非対応と記載している（`docs/BATCHING.md:247-256`, `279-281`）。
+- 並行読み取りの設定が次のいずれかに該当すると `concurrent_read_off()` が最初の理由を返し、`STRATA_PIPED_CONCURRENT` はオフ扱いになる。`STRATA_PREFILL_HELP`、`STRATA_SPLIT_MTP_BATCH`、`STRATA_FS_SLOTS` は `atoi != 0` で判定される。ほかに `--pcie-mode dma`、helper cache（`--expert-cache-device1..3`。`--remote-expert-opt` は helper cache を経由するとき）、blob を stage する source（GGUF in place / unbuffered / `STRATA_IO_PREFETCH`）、GGUF source と arena source 以外の expert source が条件になる（`engine/src/program/generate.cpp:21027-21043`; `engine/include/strata/program/batch_read.hpp:30-53`）。オフ理由は stderr に一度 `strata batch: STRATA_PIPED_CONCURRENT is off beside <理由>` と出る。
+- 画像を含む prompt（`req_imgs` が空でない場合）はこの並行読み取り分岐を通らない（`engine/src/program/generate.cpp:21054`）。しきい値以上でも以上の条件が満たされなければ機能は動かない。
 
 ## 実行時の詳細
 
-`pr_conc_min` は関数内の `static const int64_t` です。最初にこの宣言まで実行が到達した時に環境を読み、その後の同一プロセスでは値を再評価しません。起動後に環境を書き換えても反映されません（`src/program/generate.cpp:15409-15412`）。親 opt-in の `pr_conc` も同じく static cache です（同:15383-15405）。
+この値は `run_conc` lambda 内の関数ローカル `static const int64_t` で、同 lambda が最初に呼ばれたときに一度だけ読む。その後の request や piece では process 内の値を再利用するため、初回評価後の環境変更は反映されない。CLI 引数や設定ファイルでこの値を上書きする経路はない（`engine/src/program/generate.cpp:20902-20905`, `21047-21054`）。
 
-閾値以上の区間では、Strata は prompt の upload buffer を事前確保し、prompt を専用 reader thread で読みながら、別 thread で pipelined slot groups の window doorbell を処理して pump を続けます。読み取り終了後に pipeline を drain します（`src/program/generate.cpp:15413-15421,15472-15534,15535-15607`）。この動作自体は `STRATA_PIPED_CONCURRENT` の説明にある機能で、MIN が変えるのはこの経路へ入る区間の長さの条件です。
+比較対象は全 prompt 長ではなく、その呼び出しの `[a0, b0)` に対応する読み取り区間の長さ `b0 - a0`。`run_conc(q, r)` は piped read piece ごとに呼ばれ、piece のサイズは `STRATA_PIPED_READ_PIECE` を chunk 単位に丸めた値に基づく。そのため piece がしきい値未満なら、その piece は `run(q, r)` で逐次的に読み、以上なら prompt を reader thread で読みながら slot group を pump する（`engine/src/program/generate.cpp:21054`, `21284-21286`, `21343-21349`）。
 
-- 並列読み取りが完了すると stderr に `strata batch: read N tokens on a thread of its own ... (concurrent, ...)` の行が出ます（`src/program/generate.cpp:15621-15627`）。
-- prompt read が失敗した場合は `read_err` を呼び出し元へ返し、この処理は `false` になります（同:15549-15560,15628-15630）。要求処理側は stderr に `strata serve: <error>`、stdout に `ERR <error>` を出し、通常は終了コード 1 で要求処理を終えます（同:15932-15965）。
-- pipelined window の実行または drain が失敗すると `batch_fatal` を設定し、`a pipelined batch window failed` をエラーとして返します（同:15604-15607）。この場合も上記の要求処理側のエラー出力・終了経路を通ります。
-- 閾値未満を理由とする専用ログや警告はありません。`STRATA_PIPED_CONCURRENT` 自体が他条件で無効になった場合は、前述の `off beside ...` ログが出ます。
+並行経路では reader thread の終了を待って join し、pipeline を drain する。読み取り中に待機 request が `BYIELD` を要求した場合は次の chunk 境界で読み取りを止め、通常の give-way 処理へ渡す。しきい値未満の piece はこの変数によって従来の piped piece 処理へ戻るだけで、prompt の値や token の生成方法を直接変更する処理ではない（`engine/src/program/generate.cpp:21176-21216`, `21243-21275`）。
 
-`docs/BATCHING.md:231-259` は親機能の適用条件・挙動・ログを説明していますが、`STRATA_PIPED_CONCURRENT_MIN` の閾値と変換規則は記載していません。`tools/par/variants/p2_conc.txt:2-4` 等には `4096` と `12000` の実験設定がありますが、これらの設定行だけから性能効果は判断できません。
+reader thread で prompt read が失敗すると、そのエラー文字列を `read_err` に渡し、`run_conc` は失敗として返す。request 側は yield/cancel でない失敗について `strata serve: <理由>` を stderr、`ERR <理由>` を stdout に出し、通常は終了コード 1 で戻る。CUDA error が残っている場合は flush 後に `_Exit(1)` する（`engine/src/program/generate.cpp:21191-21202`, `21270-21272`, `21593-21604`）。
+
+## ログと測定値
+
+並行経路では stderr に `strata batch: read N tokens on a thread of its own in X ms (concurrent, to Q of T); the slots decoded R rows meanwhile (S rows/s; stage k: W windows, H ms host each)` の形式で出力する。しきい値未満の場合に `STRATA_PIPED_CONCURRENT_MIN` 固有のログはなく、通常の piped piece のログが出る。無効化条件に該当した場合の理由ログは「有効になる条件」を参照（`engine/src/program/generate.cpp:21263-21269`, `21373-21387`）。
+
+`docs/BATCHING.md:283-303` には `STRATA_PIPED_CONCURRENT=1` の測定があるが、`STRATA_PIPED_CONCURRENT_MIN` のしきい値比較を評価した測定ではないため、この変数の性能効果としては記載しない。
 
 ## 根拠
 
-- 参照候補の全検索では、実装上の環境読み取りは `src/program/generate.cpp:15409-15412` の `std::getenv("STRATA_PIPED_CONCURRENT_MIN")` のみでした。その他の完全一致は `tools/par/variants/*.txt` の実験設定です。コメントは同ファイル `15406-15408` にあります。
-- 閾値との比較と適用条件: `src/program/generate.cpp:15413-15414`。
-- pipelined path の定義: `src/program/generate.cpp:13012-13016`。
-- 親 opt-in の変換、除外条件、警告: `src/program/generate.cpp:15383-15405`; `include/strata/program/batch_read.hpp:30-53`。
-- 並列 reader / window 処理、ログ・失敗経路: `src/program/generate.cpp:15413-15421,15472-15534,15535-15630,15932-15965`。
-- 既存の親機能の説明: `docs/BATCHING.md:225-259`。
+- `engine/src/program/generate.cpp:21024-21054` — 並行処理の環境値、無効理由、最小 token 数の parse と判定。
+- `engine/src/program/generate.cpp:17529-17533`, `21279-21300`, `21343-21349` — piped 条件、piece 読み取り設定、piece ごとの呼び出し。
+- `engine/include/strata/program/batch_read.hpp:30-53` — 並行処理を無効にする構成と理由。
+- `engine/src/program/generate.cpp:21176-21275`, `21263-21269` — thread 実行、give-way、ログ。
+- `engine/src/program/generate.cpp:21191-21202`, `21593-21604` — 読み取り失敗の通知と request の出力・終了処理。
+- `docs/BATCHING.md:247-281` — 機能の利用条件と対応 backend の説明。

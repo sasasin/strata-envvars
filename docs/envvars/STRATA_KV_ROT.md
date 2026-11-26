@@ -1,51 +1,57 @@
 # `STRATA_KV_ROT`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数の動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--kv int8` で保存する Key / Value に Hadamard 回転を適用する opt-in の設定です。回転後の K/V を保存し、attention で使う query にも回転を適用して内積を保ちます。attention 出力は逆変換（Hadamard 変換は自己逆）して後続計算へ渡します。INT8 K/V 以外では、この変数で実際の回転は有効になりません。
+`--kv int8` の K/V キャッシュに Hadamard 回転を適用する opt-in です。生成開始時に値を読み、INT8 K/V 回転フラグを設定します。フラグが有効な状態では、K/V をキャッシュに格納する前に回転し、attention に使う query 側も回転、attention 出力を逆回転（Hadamard 変換は自己逆）します。回転を使うかは生成時に選ばれた K/V 形式にも依存します。CUDA/HIP 実装と SYCL 実装に読み取りがあります（`engine/src/program/generate.cpp:5014-5027`、`engine/sycl/src/program/generate.cpp:2528-2541`）。
+
+この変数は K/V 形式そのものを選びません。`--kv int8` と組み合わせて初めて INT8 キャッシュの回転を有効にします。`--kv q4_0` は変数に関係なく回転し、`--kv fp16` と `--kv k8v4` ではこの INT8 回転フラグは K/V の回転条件になりません（`engine/src/core/layer.cpp:807-823`）。
 
 ## 値と判定
 
-CUDA/HIP 用 `src/program/generate.cpp` と SYCL 用 `sycl/src/program/generate.cpp` は同じ判定です。環境変数の文字列全体や数値としての妥当性は調べず、値が存在し、先頭文字が `'1'` かだけを確認します。
+両方の生成実装で `getenv` の結果が非 null で、先頭文字が ASCII `1` かどうかだけを判定します。文字列全体の比較や数値変換はしません。したがって未設定・空文字は無効、`1`・`10`・`1anything` は有効、`0`・`true`・`01`・` 1` は無効です。大文字小文字、後続文字、数値としての妥当性は検査しません（`engine/src/program/generate.cpp:5023-5026`、`engine/sycl/src/program/generate.cpp:2537-2540`）。
 
-| 値 | 回転フラグ |
-|---|---|
-| 未設定 | OFF |
-| 空文字 | OFF |
-| 先頭が `1`（例: `1`, `10`, `1abc`） | ON |
-| その他（例: `0`, `true`, ` 1`） | OFF |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP または SYCL の生成実装 | INT8 回転フラグは false | 先頭文字が `1`（例: `1`, `10`, `1x`） | 先頭文字が `1` 以外（例: 空文字、`0`, `true`, `01`, ` 1`） |
+
+`--kv` は別に検証され、`q4` は `q4_0` に正規化されます。許容値は `fp16`, `int8`, `q4_0`, `k8v4` です。変数に `1` があっても `--kv` が `int8` でなければ INT8 回転にはなりません（`engine/src/program/generate.cpp:5014-5027`）。
 
 ## 有効になる条件
 
-- 実際に K/V の保存と attention が回転するのは `--kv int8` の場合です。状態初期化では `kv_rot = kv_q4 || (kv_int8 && g_kv_int8_rot)` と設定されます。
-- `--kv q4_0` は Hadamard 回転を常時使う形式なので、この環境変数には依存しません。
-- `--kv fp16` では環境変数が ON でも `kv_rot` は立ちません。
-- `--kv k8v4` の main-layer state は hybrid として初期化され、`kv_int8` が false になります。この main-layer の K8V4 固有の経路（K は INT8、V は回転 Q4_0）は `STRATA_KV_ROT` で切り替わりません。一方、MTP drafter を使う場合、その draft state は K8V4 ではなく INT8 で作られるため、この環境変数が ON なら draft K/V の回転には適用されます。
+- `STRATA_KV_ROT` の先頭文字が `1` であること。
+- INT8 キャッシュの回転には、CLI で `--kv int8` が選択されていること。これにより `st.kv_int8` が true となり、設定された回転フラグと合わせて `st.kv_rot` が true になります（`engine/src/core/layer.cpp:807-823`）。
+- 生成実装が CUDA/HIP (`engine/src/program/generate.cpp`) または SYCL (`engine/sycl/src/program/generate.cpp`) であること。これらに変数の読み取りがあります。現行ソースで Metal 実装からの読み取りは見つかりませんでした。
+- `--kv q4_0` では `st.kv_rot` が K/V 形式自体から true になります。環境変数の設定は Q4_0 の回転を切り替えません。`--kv fp16` では INT8 条件が成立せず、`--kv k8v4` は hybrid の別経路で K は未回転、V は Q4_0 形式側の回転です（`engine/src/core/layer.cpp:813-823, 1235-1262`）。
+
+`--kv` と環境変数の優先順位を比較する上書き処理はありません。`--kv` がキャッシュ形式を選び、この変数は INT8 時の回転フラグを追加します。
 
 ## 実行時の詳細
 
-生成引数の検証後、`--kv` を内部形式に正規化してから `STRATA_KV_ROT` を読み、回転フラグをグローバル設定します。値が ON かつ `--kv int8` の場合だけ、stderr に次の行を出します（それ以外はこの変数によるログはありません）。
+通常の `strata generate` と serve 用生成エンジンの初期化経路で、`--kv` の検証後に環境変数を読み、`qsa_set_kv_int8_rotate` に結果を渡します。設定値は `engine/src/core/layer.cpp:204-210` のプロセス内フラグに保持され、QSA state 初期化時に K/V 形式と組み合わせて `st.kv_rot` に確定します（`engine/src/core/layer.cpp:807-823`）。SYCL 側も同じ setter を使います（`engine/sycl/src/program/generate.cpp:2533-2541`）。この読み取りは生成初期化時で、リクエストごとの再読込やこの変数用の static cache はありません。通常の外部環境変更は既に起動したプロセスの環境を変えないため、起動済みエンジンの回転設定は変わりません。
+
+`st.kv_rot` が true の場合、decode では K/V をキャッシュへ追加する前に回転し、query を回転して attention を行い、attention 出力を戻します（`engine/src/core/layer.cpp:1244-1262, 1284-1316`）。prefill と speculative verification にも同じ state flag による K/V・query・出力の回転分岐があります（`engine/src/prefill/prefill.cpp:5291-5316, 5565-5574`、`engine/src/core/verify.cpp:2340-2347, 2578-2594`）。SYCL の decode 実装にも同じ state flag の分岐があります（`engine/sycl/src/core/layer.cpp:1256-1262, 1306-1343`）。
+
+サーバーのセッション保存・復元では、設定 fingerprint を初めて必要とした時点でこの環境変数をもう一度読み、先頭文字が `1` かを `kv_rot` として記録します。その fingerprint はプロセス内でキャッシュされます（`engine/src/program/generate.cpp:13960-14029`、SYCL: `engine/sycl/src/program/generate.cpp:8178-8208`）。この fingerprint は `--kv` などとともに保存状態の互換性判定に使われます（`engine/src/core/conversation_file.cpp:878-899, 1267`）。そのため、`--kv` が INT8 でなくても、保存時と復元時でこの値の判定が異なれば設定 fingerprint が合わず復元は拒否されます。Strata の `docs/DETAILS.md:935-939` もセッションファイルが `STRATA_KV_ROT` を含む設定に束縛されると記載しています。
+
+## ログと測定値
+
+先頭文字が `1` で、かつ `--kv int8` の場合に限り、stderr に次の行を出します。
 
 ```text
 strata generate: STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation (opt-in)
 ```
 
-状態初期化で INT8 K/V かつ回転 ON なら、prompt prefill では K/V を回転してから保存し、query にも回転をかけます。decode / verify でも K/V を回転して保存し、attention query を回転してから参照します。attention の出力は回転を戻してから後続処理に渡します。これらは CUDA/HIP 実装と SYCL 実装にあります。
+このログは設定値と `--kv` の組み合わせを示します。`--kv q4_0` だけで回転する場合にはこの環境変数由来のログは出ません（`engine/src/program/generate.cpp:5023-5026`、`engine/sycl/src/program/generate.cpp:2537-2540`）。
 
-会話セッションを保存・復元する経路では、この環境変数を `SessionConfig.kv_rot` に再度読み込んで設定指紋に含めます。そのため `STRATA_KV_ROT` の ON/OFF を変えると、他の設定が同じでも保存済み会話の設定指紋が変わります。回転 INT8 と非回転 INT8 では保存された K/V の意味が異なるため、snapshot の形式識別値にも回転用の差分が付きます。
-
-フラグ設定は `--kv` の初期処理時に読み取られ、各状態の `kv_rot` は状態初期化時に決まります。設定指紋の生成では環境をもう一度読み取ります。したがって通常の起動方法では起動前に値を設定してください。プロセス中に環境を変更した場合の再初期化や同期は実装されていません。
-
-実装コメントは NVFP4 pack での first-token KL が `0.0066 -> 0.0051`、IQ2_XS で `0.0022 -> 0.0054` だったと記していますが、同コメントに比較条件・測定方法の詳細はありません。この値から品質や速度の一般的な効果は結論できません。
+ソースコメントには特定の2パックでの first-token KL 値が記されていますが、測定環境・実行条件が記載されていないため、ここでは一般的な品質・性能の測定値として扱いません（`engine/src/program/generate.cpp:5021-5022`）。値の無効化による専用の警告・終了経路は、該当箇所では見つかりませんでした。
 
 ## 根拠
 
-- 値の読み取り、`--kv` 正規化、回転設定、条件付きログ: `src/program/generate.cpp:2448-2461`。SYCL 側も同じ: `sycl/src/program/generate.cpp:2249-2262`。
-- フラグの格納と状態への適用条件、K8V4 の除外: `src/core/layer.cpp:178-184,689-705`。
-- decode で query 回転・K/V format 別 gather・attention 出力の逆回転: `src/core/layer.cpp:1133-1164`。
-- prefill での K/V 保存前および query の回転: `src/prefill/prefill.cpp:2690-2710`。SYCL/CUDA 共通の device verify と MTP でも `kv_rot` に基づく処理がある: `src/core/verify.cpp:1245-1253`, `src/core/mtp.cpp:332-352,755-758,822-826`。
-- 会話設定での再読込と fingerprint への格納: `src/program/generate.cpp:7783-7789`, `src/core/conversation_file.cpp:878-887`。設定指紋の対象に `STRATA_KV_ROT` を含める説明: `docs/DETAILS.md:1162-1175`。
-- snapshot の回転識別: `src/core/conversation_snapshot.cpp:48-53`。
-- `--kv q4_0` の回転と INT8 rotation の opt-in 注記、およびコメント中の KL 値: `include/strata/core/layer.hpp:309-318`, `src/program/generate.cpp:2453-2460`。
+- `engine/src/program/generate.cpp:5014-5027` — `--kv` の値、環境変数の読み取り・判定、INT8 回転設定、ログ。
+- `engine/sycl/src/program/generate.cpp:2528-2541` — SYCL 生成実装の同じ判定とログ。
+- `engine/src/core/layer.cpp:204-210, 807-823` — 回転フラグの保持と K/V 形式との合成。
+- `engine/src/core/layer.cpp:1244-1262, 1284-1316`、`engine/src/prefill/prefill.cpp:5291-5316, 5565-5574`、`engine/src/core/verify.cpp:2340-2347, 2578-2594` — decode / prefill / verify における回転処理。
+- `engine/src/program/generate.cpp:13960-14029`、`engine/src/core/conversation_file.cpp:878-899, 1267` — 保存・復元設定 fingerprint への反映。
+- `docs/DETAILS.md:935-939` — 設定 fingerprint に関する説明との照合。

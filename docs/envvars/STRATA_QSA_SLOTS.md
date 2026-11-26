@@ -1,44 +1,56 @@
 # `STRATA_QSA_SLOTS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-QSA（query selection and attention）を含むバッチ窓で、各 slot の block scores、top-k 選択、attention を行ごとに呼び出す代わりに、最大 8 行ずつまとめた launcher を使う opt-in です。各行はそれぞれの slot の indexer keys と K/V を読み、行ごとの出力領域に書きます。これは処理のスケジュールを変える設定で、値から QSA の計算対象や slot 数を指定するものではありません（`src/core/verify.cpp:316-320,1948-1979`; `include/strata/kernels/qsa_decode_attn.hpp:54`）。
+batch window の QSA decode で、別 slot の行をまとめて処理する slot launcher を選ぶスイッチ。ON の経路では、各行が自分の slot の indexer keys と K/V pool を読み、block scores・top-k・attention を最大 8 行ずつまとめて投入する。OFF または適用外の経路は従来の per-row / per-slot 呼び出しを使う。ソースコメントは各行で同じ arithmetic と説明しているが、この調査では実行による同一性確認はしていない（`engine/src/core/verify.cpp:359-364,2470-2532`）。
 
 ## 値と判定
 
-`src/core/verify.cpp:299-302` の `env_on()` が `getenv()` の戻り値を確認し、`STRATA_QSA_SLOTS` の結果を namespace-scope の `const bool g_qsa_slots` に保存します（同:320）。数値変換や文字列全体の比較は行いません。
+engine の `env_on` は `getenv` の結果が存在し、空文字でなく、先頭文字が `0` でない場合に true を返す。文字列全体の数値変換・比較はせず、大文字小文字や後続文字を検証しない（`engine/src/core/verify.cpp:336-339,363`）。
 
-| 環境値 | 判定 |
-|---|---|
-| 未設定 | OFF |
-| 空文字 | OFF |
-| 先頭文字が `0`（例: `0`, `0abc`） | OFF |
-| 先頭文字が `0` 以外（例: `1`, `2`, `true`, `false`, `off`, 空白で始まる文字列） | ON |
+| engine 起動前の値 | 判定 | 補足 |
+|---|---|---|
+| 未設定 | 通常は OFF | ただし下記の platform default / setup profile が未設定の場合に `1` を補う |
+| 空文字 | OFF | `getenv` は非 null だが `e[0] == 0` |
+| `0`, `0anything`, `00` | OFF | 先頭文字が `0` なら後ろを問わず false |
+| `1`, `true`, `false`, `yes`, `abc`, ` 0` | ON | 空でなく先頭文字が `0` 以外なら true。数値妥当性、空白除去、大小文字変換なし |
 
-大文字小文字、後続文字、数値としての妥当性は判定されません。したがって `false` や `off` も ON です。環境値を読むのはこのグローバル初期化時の一度であり、engine 起動後に環境を変更してもこの値は更新されません（`src/core/verify.cpp:299-302,320`）。既定値は OFF です。
+platform default は値の parse より先に環境へ設定する。default 適用時は `getenv(name) != nullptr` だけで「利用者が設定済み」と判定するため、空文字や `0` も保持されて既定値 `1` で上書きされない（`engine/src/core/arch_defaults.cpp:218-223,253-260,346-350`）。
 
 ## 有効になる条件
 
-- **バッチ窓であること**: `record_window()` 内の `batch_rec_` が true の経路だけが対象です。通常の単一系列窓ではこの環境変数による grouped launcher は使われません。バッチ窓の capture 中に `batch_rec_` が true にされ、記録後に false に戻ります（`src/core/verify.cpp:3744-3757`）。
-- **QSA layer が処理されること**: QSA layer ごとに block scores/top-k/attention の処理を分岐します（同:1658-1660,1916-1993）。QSA layer を持たないモデルには効果がありません。
-- **streamed KV でないこと**: 有効値かつバッチ窓の場合、いずれかの行の `kv_mode == 1` なら `streamed` となり、slot launcher の分岐を通りません。代わりに行ごとに block scores、top-k、`qsa_kv_resolve`、attention を行います。コメントは、streamed cache では同じ slot の前の行が選んだ block を後の行の resolve が退避させる可能性があるため順序を保つと説明しています（同:1916-1918,1981-1993）。
-- **他の行まとめ launcher との関係**: `STRATA_BATCH_ATTN_ROWS` による `rows_ok` が true の場合、その分岐が `STRATA_QSA_SLOTS` 分岐より先に選ばれます。この経路も scores/top-k/attention を行まとめで処理します（同:1923-1948）。
-- **backend / server**: server の `parallel_stack_env()` は、Linux、2 slot 以上の batch、DeepSeek 以外、HIP/SYCL/Metal/Vulkan 以外の設定で QSA を含む parallel stack を `setdefault` で追加します。HIP はこの自動設定の対象外です（`serve/server.py:3670-3712`）。ここで明示されているのは server が環境値を渡す条件であり、変数そのものの engine 側判定は `verify.cpp` の条件に従います。server による自動設定以外に、環境値を有効化する OS 判定や build macro は `g_qsa_slots` の読み取り箇所にはありません。Metal の Verifier は `window_run()` に委譲され、Metal stub の slot launchers は `false` を返す実装です（`src/core/verify.cpp:3056-3061`; `metal/src/engine/stubs_144.cpp:57-64`）。
+- 値が ON で、QSA 層を処理する verifier の `batch_rec_` 経路に入ること。`batch_rec_` でない通常経路は対象外。一行だけの batch window でも分岐は可能だが、複数 slot をまとめる効果はない（`engine/src/core/verify.cpp:2470-2473`）。
+- この変数を直接設定する engine CLI 引数はない。`--batch` / `--slots` は上記 platform default の条件となるが、すでに環境変数が設定されていればその値（空文字や `0` を含む）が優先される（`engine/src/core/arch_defaults.cpp:248-260,346-350`; `engine/src/program/generate.cpp:4410-4414`）。
+- `STRATA_BATCH_QSA_STREAM_OPT` の適用経路が先に選ばれず、`STRATA_BATCH_ATTN_ROWS` による `rows_ok` 経路にも入らないこと。後者は batch recording、stream optimization 無効、row 数上限内、全行が resident KV の場合に先行する（`engine/src/core/verify.cpp:2191-2200,2449-2470`）。
+- streamed KV（`kv_mode == 1`）で、より先行する stream optimization が成立しない場合は `streamed` が立ち、このスイッチの slot 分岐は使わず per-slot の resolve・attention 経路に進む。コメントも streamed KV では row ごとの resolve-then-attend 順序を保つとしている（`engine/src/core/verify.cpp:2191-2193,2470-2473,2534-2562`）。
+- platform default は以下の条件に限られる。いずれも対象変数が未設定のときだけ設定する。
+  - Linux CUDA build（`STRATA_USE_HIP`、`STRATA_HIP_GFX906`、`STRATA_GPU_METAL`、`_WIN32` のいずれも定義されない）かつ `o.batch >= 2`: engine が並列 stack の一部として `STRATA_QSA_SLOTS=1` を設定する（`engine/src/program/generate.cpp:4410-4414`, `engine/src/core/arch_defaults.cpp:226-260`）。
+  - discrete RDNA3 `gfx1100/1101/1102` かつ `batch_slots >= 2`、GPU が integrated 扱いでなく、`STRATA_GFX11_DEFAULTS=0` でも `STRATA_DEFAULTS=026` でもない場合: `apply_arch_defaults` が `1` を設定する（`engine/include/strata/core/gfx11_extra.hpp:4-12,116-136`, `engine/src/core/arch_defaults.cpp:312-358`）。
+  - Windows `gfx1151` かつ `batch_slots >= 2`、`STRATA_GFX1151_DEFAULTS` の先頭が `0` でない場合: parallel stack の一部として `1` を設定する。CUDA/HIP のいずれかの GPU engine で arch defaults が呼ばれる経路（`engine/src/core/arch_defaults.cpp:240-246,433-443`; 呼び出し例 `engine/src/program/generate.cpp:4320`）。
+- Terminal setup の profile も engine 用 config の `env` に `1` を補う。四枚の AMD Radeon AI PRO R9700 / HIP / Qwen3.8 IQ3_S の profile は、`amd_four_card.applies` の条件に合い profile が無効化されていない場合に追加し、プロセス環境に利用者自身の値があれば保持する（`terminal/strata_control/amd_four_card.py:27,34-61,82-91`; 適用呼び出し `terminal/strata_control/setup_config.py:501-508`）。opt-in replica profile も、対象モデル・カード・RAM 等の条件を満たして適用されたとき、同じく利用者環境に名前がなければ config env に `1` を補う（`terminal/strata_control/replica_profile.py:37-39,77-99,118-122`; 呼び出し `terminal/strata_control/setup_config.py:487-500`）。
+- Metal の slot launcher は false を返す実装なので、環境値が ON でも verifier は per-row 呼び出しへ戻る。slot kernel のない Metal ではこの変数だけで一括 kernel が利用可能にはならない（`engine/metal/src/engine/stubs_144.cpp:57-63`; fallback `engine/src/core/verify.cpp:2515-2532`）。
 
 ## 実行時の詳細
 
-engine は `serve/server.py:child_env()` で親環境を複製し、config の `env` をその上に設定してから `parallel_stack_env()` を呼びます。その helper は `env.setdefault()` を使うため、親環境または config が `STRATA_QSA_SLOTS` を明示していれば server の parallel stack は上書きしません。server の自動設定において `--batch` / `--slots` または `parallel` が 2 以上かどうかは適用条件を決めますが、それらの CLI 値自体が engine 内の `g_qsa_slots` を ON にするわけではありません（`serve/server.py:3747-3764,3684-3712`）。
+`qsa_slots_on()` は関数内 `static const bool` に最初の呼び出し時点の判定を保存し、`g_qsa_slots` はそれを参照する。したがって process start 時に固定されるのではなく、最初にこの関数へ到達するまでに platform default が設定されていればその値を読み、以後の環境変更は反映されない。Linux CUDA の `apply_parallel_defaults_cuda` は `generate.cpp` から engine の switch 読み取り前に呼ばれる旨が記されている（`engine/src/core/verify.cpp:355-364`, `engine/src/program/generate.cpp:4410-4414`, `engine/include/strata/core/arch_defaults.hpp:126-134`）。
 
-有効なバッチ窓では、`g_qsa_slots` が true かつ `streamed` でなければ、行を最大 8 個ずつに区切って launcher を実行します。slot scores launcher が対応しない場合は block scores を行ごとに fallback し、attention launcher が対応しない場合は attention も行ごとに fallback します。top-k は `m` 行まとめて呼ばれます（`src/core/verify.cpp:1948-1979`; launcher の最大行数は `include/strata/kernels/qsa_decode_attn.hpp:54`）。CUDA の実装場所は `src/kernels/cuda/qsa_select.cu:1937` と `src/kernels/cuda/qsa_decode_attn.cu:1072` です。
+対象の batch 分岐では、window の行を `kQsaAttnMaxSlots`（8）単位に分割し、各 chunk について slot ごとの indexer buffers と attention pools を渡す。scores slot launcher が `false` を返すと各行の `qsa_block_scores` に戻し、top-k はまとめて実行する。attention slot launcher が `false` を返した場合も各行の `qsa_decode_attn_batch` に戻る。QSA の score/attention 計算と出力先は各行ごとに保たれる（`engine/src/core/verify.cpp:2232-2250,2485-2532`）。
 
-この変数を直接名指しする実行時ログ、警告、専用終了・失敗分岐は見つかりませんでした。launcher が使われない場合も、コード上は別の per-row 経路または launcher 内の fallback に移ります。batch capture 自体の失敗は `verify: begin batch capture failed`、`verify: end batch capture: ...` など一般的な verifier エラー経路を返しますが、これは環境変数専用の診断ではありません（`src/core/verify.cpp:3744-3766`）。
+score launcher は `STRATA_SCORES_MULTI` を `atoi` し、未設定なら ON、変換値が `0` なら multi scorer 無効として `false` を返す。さらに行数が上限を超えた場合も辞退する（`engine/src/kernels/cuda/qsa_select.cu:1607-1610,1997-2015`）。attention launcher は slot 数超過、KV mode の不一致、build に pre-sm_75 kernel がありその経路を使うとき `STRATA_ATTN_PRE75_SLOTS` が `atoi` で 0 となる場合、または HIP gfx906 の query-swizzle / streamed KV 条件などで `false` を返す場合がある（`engine/src/kernels/cuda/qsa_decode_attn.cu:978-985,1150-1179`）。通常の decline は上記の per-row fallback で処理される。未対応 geometry や必要 buffer/page table の欠落、CUDA launch error は同関数が stderr に `qsa_block_scores_slots: unsupported indexer geometry`, `qsa_block_scores_slots: %s`, `qsa_decode_attn_slots: unsupported geometry or missing buffers`, `qsa_decode_attn_slots: missing page table`, `qsa_decode_attn_slots: %s` を出して `exit(1)` する経路であり、環境値の無効値エラーではない（`engine/src/kernels/cuda/qsa_select.cu:2001-2015`, `engine/src/kernels/cuda/qsa_decode_attn.cu:1154-1162,1221-1223`）。
+
+## ログと測定値
+
+RDNA3 / Windows gfx1151 の platform default がこの名前を補った場合、並列 switch 一覧の起動ログに `QSA_SLOTS`（`STRATA_` を除いた名前）が含まれる。Linux CUDA の parallel defaults は無言で適用される。既に環境変数があれば RDNA3 / gfx1151 の default 設定ログには含まれず、QSA の runtime 分岐自体は有効・無効を示すログを出さない（`engine/src/core/arch_defaults.cpp:253-260,346-356,438-442`; `engine/include/strata/core/arch_defaults.hpp:126-134`）。launcher decline 時もこの変数名を含む runtime log はなく、per-row fallback へ進む。
+
+`docs/BATCHING.md:115-128` は batch switch を「none is on by default」とし、同書の `:598-608` は four-R9700 profile でこの変数を含む 3 switch の組み合わせについて aggregate throughput を記す。現行ソースには上記の engine platform defaults があるため、「既定で ON/OFF」は構成依存である。また同測定は 3 switch 一括の比較で、QSA_SLOTS 単独の寄与を分離していないため、本書では単独の性能値として扱わない。
 
 ## 根拠
 
-- 候補名の全参照を検索し、engine における実読取は `src/core/verify.cpp:320` の `env_on("STRATA_QSA_SLOTS")` のみと確認しました。ほかの参照は server の環境設定、プロファイル / ツールの env 値、文書、テスト、コメントです。
-- 実装の説明と適用条件: `src/core/verify.cpp:299-320,1916-1979`。
-- batch capture の状態設定: `src/core/verify.cpp:3744-3766`。
-- server の環境優先順位と自動設定: `serve/server.py:3670-3712,3747-3764`。
-- 文書照合: `docs/BATCHING.md:110-127` は一般的な opt-in スイッチとして動作を記載し、`docs/BATCHING.md:576-592` は四枚の R9700 profile が値を設定する構成を記載しています。現行 server には Linux CUDA の batch slot 向けに複数スイッチを `setdefault` で追加する経路もあります（`serve/server.py:3670-3712`）。
+- 読み取り・値判定・cache: `engine/src/core/verify.cpp:336-339,359-364`
+- batch 分岐・streaming / rows との優先関係・fallback: `engine/src/core/verify.cpp:2191-2200,2232-2250,2449-2534`
+- platform defaults: `engine/src/core/arch_defaults.cpp:218-260,312-358,433-443`; `engine/include/strata/core/gfx11_extra.hpp:116-136`; `engine/src/program/generate.cpp:4320,4410-4414`
+- kernel decline / error paths: `engine/src/kernels/cuda/qsa_select.cu:1997-2015`; `engine/src/kernels/cuda/qsa_decode_attn.cu:1150-1179,1221-1223`; Metal stubs `engine/metal/src/engine/stubs_144.cpp:57-63`
+- setup profiles: `terminal/strata_control/amd_four_card.py:27,34-61,82-91`; `terminal/strata_control/replica_profile.py:37-39,77-99,118-122`; `terminal/strata_control/setup_config.py:487-508`
+- 関連資料（測定の独立性を確認）: `docs/BATCHING.md:115-128,598-608`

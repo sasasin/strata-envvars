@@ -1,53 +1,53 @@
 # `STRATA_ARENA_FALLBACK_RESIDENT`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-expert arena の読み込みが RAM 不足でできず、ファイル読み込みへ切り替わるとき、静的 expert profile があれば、profile 上位の expert を可能な範囲で RAM に保持する resident RAM mode へ自動で切り替えます。この変数を `0` で始める値にすると、その自動切り替えを止め、通常の file source のままにします。`src/program/generate.cpp:7321-7343`。
+expert arena の RAM 不足時に、通常のファイル読み込みへ切り替える fallback を、静的 expert profile がある場合に限り「profile 上位の experts を RAM にコピーし、残りをモデルファイルから読む」resident RAM mode にするかを制御する。`0` でこの自動切り替えを止め、plain file source を使う。変数は `generate` の arena 判定でだけ読まれる（`engine/src/program/generate.cpp:8595-8605,8876-8909`）。
 
-この変数は arena 不足時の自動選択だけを制御します。値を読んだ時点で RAM を確保したり、arena 不足そのものを回避したりはしません。
+有効な自動切り替えでは、GPU cache が保持しない experts のうち profile 順のものを、利用可能 RAM から headroom を除いた範囲でコピーする。残りはモデルファイルから読み込む。これは配置と回答を変える設定ではなく、arena 不足時の expert source を変える設定である。ソースコメントは plain file source と resident copy の回答が同じと説明する（`engine/src/program/generate.cpp:8892-8908`; `engine/src/core/expert_source.cpp:4044-4046,4134-4151`）。
 
 ## 値と判定
 
-値全体の parse はせず、`getenv()` の結果が存在し、先頭文字が `0` かだけを判定します。空文字は設定済みですが先頭文字が `\0` なので、自動切り替えを止めません。`0`, `0anything` は止め、`1`, `false`, `anything`, 空文字、未設定は止めません。`src/program/generate.cpp:7075`。
+`std::getenv` の戻り値が null でないことに加え、先頭バイト `v[0]` が文字 `'0'` かを一度だけ調べる。先頭が `'0'` なら自動 resident fallback を無効にし、それ以外は有効にする。全体の parse、数値妥当性、空白除去、大文字小文字変換はしない（`engine/src/program/generate.cpp:8604-8605`）。
 
-| 値 | 自動 resident fallback の判定 |
-|---|---|
-| 未設定 | 有効（他の適用条件を満たす場合） |
-| 空文字 | 有効 |
-| 先頭文字が `0` | 無効 |
-| それ以外 | 有効 |
+| 条件 | unset | 自動 resident fallback を有効にする値 | 無効にする値 |
+|---|---|---|---|
+| 全実行経路 | 有効（既定） | `1`, `true`, `false`, 空文字, ` 0`, `x` など先頭が `0` でない値 | `0`, `0anything`, `00` など先頭が `0` の値 |
 
-`atoi`、数値範囲検査、大文字小文字変換はありません。判定結果は起動処理中に一度ローカル変数へ格納され、同じ起動処理の arena/file 再試行ループで使われます。プロセス起動後に環境を書き換えた場合の再評価はありません。`src/program/generate.cpp:7074-7075,7089`。
+`0anything` も数値変換エラーにはならず、先頭文字が `0` なので無効になる。一方、` 0` は先頭が空白なので有効扱いとなる。環境変数自体が設定されていて空文字でも有効扱いである。大文字小文字は判定に関係しない。CLI にこの値を上書きする引数はない（`engine/src/program/generate.cpp:8605,4211-4257`）。
 
 ## 有効になる条件
 
-次の条件が揃ったときだけ、この判定が使われます。
+- Arena source を使う実行で、arena の RAM 判定後も不足し `ram_short()` になり、`generate` が `--mmap-experts` 相当の file source へ移ること（`engine/src/program/generate.cpp:8871-8891`）。既に `--mmap-experts` を選んだ実行ではこの arena 不足 fallback 分岐に入らない。
+- その fallback 自体が許可されていること。`STRATA_ARENA_RAM_FALLBACK` が `0` なら無効で、手動指定の `--ple-io ram` または `--shared-expert-arena` がある場合も無効（`engine/src/program/generate.cpp:8600-8603`; `engine/include/strata/core/ple_residency.hpp:67-74`）。
+- `--expert-profile` で静的 profile が指定されていること。profile の読み込みに失敗した場合はこの環境変数の fallback 以前にエラー終了する（`engine/src/program/generate.cpp:6746-6751,8898`）。
+- 他の設定で既に `o.resident_cpu_experts` が true になっていないこと。`--resident-experts` や正の `--resident-budget-gib` 等による明示的 resident mode がある場合、環境変数による自動設定は上書きしない（`engine/src/program/generate.cpp:4218-4257,8898`）。
+- `STRATA_ARENA_FALLBACK_RESIDENT` の先頭文字が `0` でないこと（`engine/src/program/generate.cpp:8605,8898`）。
 
-- arena source を選び、arena の open が RAM 不足で失敗する。ほかの open エラーではこの fallback 分岐に入りません。`src/program/generate.cpp:7316-7327,7345-7348`。
-- `STRATA_ARENA_RAM_FALLBACK` による file source への切り替えが許可されている。既定では許可されますが、手動指定の `--ple-io ram` または `--shared-expert-arena` があると禁止されます。変数が空でない場合は `atoi(value) != 0` で判定されます。`src/program/generate.cpp:7072-7073`; `include/strata/core/ple_residency.hpp:65-72`。
-- `--expert-profile` による profile があり、すでに `o.resident_cpu_experts` が有効ではなく、この環境変数の先頭文字が `0` ではない。`src/program/generate.cpp:7333-7340`。
-
-したがって未設定は自動切り替えを許しますが、静的 profile がなければ切り替えは行われません。`0` を指定した場合でも arena の RAM fallback 自体は止めず、file source による起動を続けます。既に `--mmap-experts` と resident RAM mode を指定した実行は arena 不足からの自動選択経路ではなく、この変数の対象外です。`src/program/generate.cpp:3644-3669,7091-7101,7333-7343`。
-
-読み取りと分岐に OS/backend/build macro の条件はありません。一方、fallback 後の headroom は Windows では既定 8 GiB、その他では 4 GiB で、`STRATA_RESIDENT_HEADROOM_GIB` や `--ram-keep-gib` が関係します。RAM copy の予算は利用可能 RAM から headroom を引いて決まり、headroom を超える余裕が 1 GiB 以下なら予算は 0 です。`src/program/generate.cpp:7076-7087,7334-7339`; `include/strata/core/ple_residency.hpp:91,108-117`。
+条件を満たさない場合、arena 不足時は通常の file source に切り替わる。arena fallback の許可条件自体を満たさない場合はこの環境変数では変化せず、arena 判定側の従来処理が続く。
 
 ## 実行時の詳細
 
-arena が RAM 不足で開けないと、stderr に `strata generate: not enough RAM for the expert arena (...)` と出し、`--mmap-experts` と同等の file source を試します。自動 resident fallback が選ばれた場合は `o.resident_cpu_experts`、`o.resident_pin`、`o.resident_soft` を有効にし、残す headroom と RAM budget を設定します。`src/program/generate.cpp:7321-7343`。
+値は CLI 引数の処理後、arena source を用意する直前に `const bool` として一度読み込まれ、その後の arena fallback 分岐で参照される。リクエストごとの再読込や子プロセスへの転送はこの箇所にはなく、実行中に環境値を変えても判定は変わらない（`engine/src/program/generate.cpp:3838-3842,8595-8605`）。
 
-その後、source はモデルファイルを開き、GPU cache にない expert の RAM copy を `pin_cache_complement()` で構築します。profile 順で保持を試し、全体が入らなくても可能な範囲の保持を試す soft mode です。実際に保持できた場合は `strata generate: resident RAM mode: ...` が出ます。全体も部分的な resident copy も確保できない場合は `strata generate: WARNING: the resident RAM mode does not fit (...)` が出て、GPU cache にない expert は `--mmap-experts` と同様にモデルフォルダーから読みます。`src/program/generate.cpp:9903-9921,9964-9984`。
+arena が RAM 不足で開けず、`ram_short()` が true の場合、stderr に理由付きの「not enough RAM for the expert arena」行を出し、file source に切り替えて再試行する。`--serve` では同じ行を stdout にも出す（`engine/src/program/generate.cpp:8876-8891`）。変数が有効で profile があり、既存の resident mode がなければ、`STRATA_RESIDENT_PIN` を helper に渡して resident mode を設定し、ホストメモリをサンプルできた場合は `available - headroom` を予算として使う。headroom は `STRATA_RESIDENT_HEADROOM_GIB` が有効値ならそれ、そうでなければ `max(--ram-keep-gib, safety headroom)` であり、安全 headroom は Windows 8 GiB、それ以外 4 GiB（`engine/src/program/generate.cpp:8606-8617,8898-8908`; `engine/include/strata/core/ple_residency.hpp:174-182`）。
 
-file source 自体を開けない場合、起動処理は resident fallback の状態を戻して arena を従来どおり再試行します。そのとき `strata generate: the experts cannot be read from the file either (...): loading the expert arena as before, short of RAM` を出します。`src/program/generate.cpp:7101-7113`。
+resident copy は GPU cache にない expert を profile 順で保持し、予算に収まらないものはファイル側に残す。ホストメモリをサンプルできた場合の自動予算は `available - headroom`（ただし headroom + 1 GiB 以下なら 0）である。予算が 0 の場合、呼び出し先は全 complement を保持する通常経路を試し、失敗して `resident_soft` が有効なら使用可能な分だけ保持する再試行を行う。正の予算で profile 上位が 1 件も入らない場合のように再試行も失敗すれば file source で続ける（`engine/src/program/generate.cpp:8904-8908,12077-12106`; `engine/include/strata/core/ple_residency.hpp:180-182`; `engine/src/core/expert_source.cpp:4044-4046,4145-4147`）。resident mode が作れた場合は `resident RAM mode: ...`、予算が使えない場合は warning が stderr に出る（`engine/src/program/generate.cpp:12196-12216`）。file source 自体を開けない場合は arena を旧方式で再試行し、その経路では自動 resident 状態を解除する（`engine/src/program/generate.cpp:8631-8640`）。
 
-`STRATA_ARENA_FALLBACK_RESIDENT` の完全一致検索では、実行時の読み取りは `src/program/generate.cpp:7075` のみでした。`src/program/generate.cpp:7331` はコメント、`docs/DETAILS.md:764` は説明文です。`sycl/src/program/generate.cpp` にこの変数の読み取りはなく、SYCL 実装で同じ制御が働くとは確認できません。`src/program/generate.cpp:7075,7331`; `docs/DETAILS.md:764`。
+## ログと測定値
+
+arena 不足時のログは `strata generate: not enough RAM for the expert arena (%s): this run reads the experts from the file, like --mmap-experts (slower; the answers are the same). To get the arena back, free that RAM and start again`。`--serve` 時は stderr と stdout の両方に出る（`engine/src/program/generate.cpp:8876-8888`）。resident allocation が成功した場合は `strata generate: resident RAM mode: ...`、予算 mode が成立しない場合は `WARNING: the RAM budget ... cannot be kept ...` などが stderr に出る（`engine/src/program/generate.cpp:12196-12216`）。この環境変数自体の値を表示するログはない。
+
+`docs/DETAILS.md:878-896` は、12 GB GPU・63 GB PC・44.6 GiB available の条件で IQ3_S、128K 時に 9.4 tok/s から 25–28 tok/s になった測定を記載する。同節は arena 不足時の RAM copy fallback の説明に続けてこの測定を載せている。ソースコメントにも RTX 5070、63.1 GB RAM、44.6 GiB available、46.84 GiB arena の例として plain file source 9–10 tok/s と RAM copy 27–28 tok/s があるが、これはコメント中の一例であり、他環境の性能を示すものではない（`engine/src/program/generate.cpp:8892-8895`）。
 
 ## 根拠
 
-- 値の判定と評価位置: `src/program/generate.cpp:7072-7089`。
-- RAM 不足時の file fallback と resident 切り替え条件: `src/program/generate.cpp:7316-7348`。
-- file source が開けない場合の arena 再試行: `src/program/generate.cpp:7101-7113`。
-- resident copy の構築、部分保持、ログと非致命的 fallback: `src/program/generate.cpp:9903-9921,9964-9984`。
-- fallback の可否、headroom と budget の計算: `include/strata/core/ple_residency.hpp:65-72,91,108-117`。
-- 関連説明との照合: `docs/DETAILS.md:749-764` は、profile がある場合に上位 expert を RAM に保持し、`STRATA_ARENA_FALLBACK_RESIDENT=0` で通常の file source を維持すると説明しており、現行分岐と一致します。
+- `engine/src/program/generate.cpp:8595-8617` — arena fallback 用状態、対象変数の読み取り、headroom の準備。
+- `engine/src/program/generate.cpp:8871-8911` — RAM 不足時のログ、file source への切り替え、自動 resident mode の設定。
+- `engine/src/program/generate.cpp:12077-12106,12196-12216` — profile 順の RAM copy、soft fallback、結果ログ。
+- `engine/include/strata/core/ple_residency.hpp:67-74,174-182` — arena fallback の許可条件と自動予算計算。
+- `engine/include/strata/core/resident_ram_copy.hpp:17-23` — 自動 resident mode のフラグ設定と `STRATA_RESIDENT_PIN` 判定。
+- `engine/src/core/expert_source.cpp:4044-4046,4134-4151` — RAM 予算内で profile 順にコピーし、残りをファイル読み込みにする処理。
+- `docs/DETAILS.md:878-896` — fallback の説明と条件付き性能測定。

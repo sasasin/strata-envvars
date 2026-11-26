@@ -1,43 +1,40 @@
 # `FNX_PF_DRAFT8`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`strata-split-N` の prompt prefill で、MTP draft layer の prompt 状態を準備する順序を切り替えます。既定（unset / 0）では各 chunk の main layer 計算に続けて `prefill_draft()` を呼び、draft layer の K/V と QSA key を作ります。有効時（非ゼロ整数）はこの処理を main prefill pass の同期後まで遅らせ、main layer の残差行と次 token を `draft_rows()` に渡して MAXT 行ずつ処理します。これは draft layer を有効にするスイッチではなく、MTP が接続されている場合の prompt 経路の切り替えです。
-
-対象コードは sFNX split engine です。ビルド設定上、この実行ファイルは opt-in の `STRATA_BUILD_SPLIT=ON` で作られ、Linux CUDA または Linux HIP のみを対象にします。通常の Strata engine や他の split 外 backend でこの変数を読む箇所は見つかりません（`src/split/CMakeLists.txt:1-7,20-30,64-80,92-103`）。
+Strata split engine の prompt prefill で MTP draft layer の状態を作るタイミングとまとめ方を切り替える。off（既定）では main model の各 prompt chunk を処理する途中で `prefill_draft` を呼ぶ。on ではこの呼び出しを省き、main prefill の stream 完了後に各 chunk の最終 residual を使って MTP draft rows をまとめて処理する。対象は `Engine::prefill_pass` の経路であり、MTP が attach されていない場合は値にかかわらず分岐結果に影響しない。`prefill_draft` と `draft_rows` は draft layer の prompt K/V・QSA state を作る処理で、通常の prompt token の結果をこの分岐で選び直す処理ではない（`engine/src/split/src/prefill.cu:1262-1297,1773-1817`）。
 
 ## 値と判定
 
-`env_flag()` は `env_int(name, 0) != 0` です。値が設定されているかではなく、符号付き十進整数として全体を parse した結果で判定します。
+`env_flag` は `env_int(name, 0) != 0` で判定する。`env_int` は unset のときだけ既定値を返し、設定値は符号任意の base-10 整数全体として `strtoll` で解析する。空文字、空白、末尾の文字、範囲外の整数は受け付けず、`<name>: '<value>' is not a whole number` の `std::runtime_error` を投げる。整数として解析できた値は 0 のみ off、非ゼロは on（負数も on）であり、真偽値文字列としての解析や clamp はない（`engine/src/split/src/env.hpp:15-21,33-39,51-52`）。
 
-| 環境値 | 結果 |
-|---|---|
-| unset | 0（無効） |
-| `0`, `+0`, `-0` | 無効 |
-| 任意の非ゼロ整数（負数を含む） | 有効 |
-| 空文字、空白、`true` / `false`、数字の後ろに文字がある値、小数、整数範囲外 | `std::runtime_error`。切替は行われない |
-
-整数 parser は任意符号と数字のみを許し、`strtoll` で `long long` に変換し、文字列末尾まで消費したことと overflow がないことを検査します。空文字は整数として不正です（`src/split/src/env.hpp:15-22,33-52`）。CLI 引数、設定ファイル、他の環境変数による上書きや優先順位はありません。
+| ビルド・経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| split engine の prefill | `0`（off） | `1`、`-1`、`2` など、整数として解析できる非ゼロ値 | `0`、`-0`（off）。空文字、`true`、`1x`、前後に空白のある値、整数範囲外は無効値として扱われ、例外になる |
 
 ## 有効になる条件
 
-- 読み取り箇所は `Engine::prefill_pass()` 内で、CUDA/HIP 共通の `src/split/src/prefill.cu` にあります。CMake は同じソースを CUDA または HIP 言語として split engine に含めます（`src/split/src/prefill.cu:1310`; `src/split/CMakeLists.txt:64-80,92-103`）。
-- 値が非ゼロでも、実際の draft 処理は `mtp_` が接続されている場合だけです。`mtp_` が null なら両方の `if (mtp_ && ...)` を通らず、この変数による処理差はありません（`src/split/src/prefill.cu:1311-1316,1337-1349`; MTP の設定は `src/split/src/engine.cu:1175-1178`）。
-- 変数に対応する追加の OS、GPU 世代、build macro、CLI フラグ条件はありません。ビルドそのものが split engine の Linux CUDA/HIP 条件を満たす必要があります。
+- split engine の `Engine::prefill_pass` が実行されること。対象コードは `engine/src/split/src/prefill.cu` にある（`engine/src/split/src/prefill.cu:1391-1397,1773`）。
+- `Engine::mtp_attach` によって MTP draft layer が engine に attach されていること。未 attach なら `mtp_` が null で、両方の draft 分岐を通らない（`engine/src/split/src/engine.cu:1251-1254`; 条件分岐は `engine/src/split/src/prefill.cu:1774,1782,1805`）。
+- DFlash2 だけを attach した経路では `mtp_` を設定しないため、このフラグの draft-layer 分岐は動かない（`engine/src/split/src/engine.cu:1251-1254`; `engine/src/split/tools/sfnx.cpp:1124-1133`）。CLI の `--mtp` 等は MTP attach の有無を決めるが、この環境変数自体を上書きする処理は確認できない。
 
 ## 実行時の詳細
 
-各 chunk では main layer の最終 residual `p.R` を作り、次 token を組み合わせて draft 状態を準備します。既定経路の `prefill_draft()` は draft layer の embedding / hidden 処理、QSA index、K/V append までを実行し、prompt 上の draft layer 出力は参照しないと実装コメントにあります（`src/split/src/prefill.cu:944-978,1311-1316`）。
+値は `Engine::prefill_pass` 内の関数ローカル `static const bool` として最初にこの関数が通った時に読み取られ、その後の呼び出しでは同じプロセス内で再読込されない。したがって、その後に環境を変更しても反映されない。明示的な子プロセスへの転送・上書きはこの変数について確認できない（`engine/src/split/src/prefill.cu:1773`; `engine/src/split/src/env.hpp:33-39,51-52`）。
 
-非ゼロ経路は main prefill stream が完了し ring error がないことを確認した後、各 chunk を MAXT 以下の行群に分けます。各行群について、入力 token の次 token 列（chunk 内の次 token と末尾の `after` を含む）と `p.R` の行を渡し、`draft_rows()` で draft graph を実行します（`src/split/src/prefill.cu:1317-1349`）。`draft_rows()` は MTP を必要とし、文脈範囲と行数を検査し、draft embedding を作って graph を起動して stream を同期します。したがってこの経路では prompt 状態の準備だけでなく、`draft_rows()` が実装する draft 推論処理も呼ばれます（`src/split/src/engine_common.cu:1381-1392,1412-1438,1456-1467`）。
+off かつ MTP attach 済みの場合、各 chunk で main layers の処理に続いて `prefill_draft(C, set)` を実行する。on の場合はこの per-chunk 呼び出しを飛ばす。Hyper-connection split が有効なら draft rows の前に各 card の stream event を待ち、全 card の prefill stream を同期して ring error を確認した後、各 chunk の main residual `p.R` を source に `draft_rows` を実行する。chunk 内を `MAXT` 行以下に区切り、各行に対応する次 token（chunk 内の次 token、または chunk の終端 token）を渡す。`MAXT` は 16。`draft_rows` は MTP が必要なこと、行数が `1..MAXT` で各行に token が一つあること、context 範囲内であることを検査し、draft layer を実行する。prompt prefill 側はその返り値を使わない（`engine/src/split/src/prefill.cu:1774-1817`; `engine/src/split/src/model.hpp:43`; `engine/src/split/src/engine_common.cu:1405-1414`）。
 
-環境値は関数内の `static const bool` に初回評価結果が保存されるため、プロセスの最初の `prefill_pass()` で読み、一度確定すると同一プロセス内で後から環境を変更しても再評価されません（`src/split/src/prefill.cu:1038,1310`）。unset の既定は無効です。特別なログはありません。`FNX_PF_TIMING` も有効なら pass の `draft layer` 所要時間が stderr に出ますが、この値単独では出力されません（`src/split/src/prefill.cu:1353-1364`）。
+## ログと測定値
 
-不正値は `env_int()` の例外として prefill 呼び出し元へ伝播します。sFNX server の `srv.run()` 中に捕捉された例外は `ERR <理由>` を出力し、stderr に `sfnx: failed: <理由>` を記録して終了コード 1 で終了します（`src/split/tools/sfnx.cpp:1030-1035,1086-1089`）。エラー文は helper 由来の `FNX_PF_DRAFT8: '<値>' is not a whole number` です（`src/split/src/env.hpp:33-39`）。
+この変数専用の有効・無効ログはない。整数として不正な値は `env_int` の例外になり、`sfnx` の実行中エラー経路では `ERR <例外文>` を stdout、`sfnx: failed: <例外文>` を stderr に出して status 1 で終了する。`fnx_run` では stderr に `fnx_run: <例外文>` を出して status 1 で終了する（`engine/src/split/src/env.hpp:33-39`; `engine/src/split/tools/sfnx.cpp:1097-1102,1137-1140`; `engine/src/split/tools/fnx_run.cpp:1364-1373`）。Strata の `docs/DETAILS.md` の Draft layer 節にはこのフラグの説明や比較測定値は見当たらず、性能差は記載しない。
 
 ## 根拠
 
-- 名前の全参照検索では実装参照は `src/split/src/prefill.cu:1310` のみでした。候補一覧 `docs/envvars/000_envvers.md:562` には掲載されています。
-- `docs/DETAILS.md` と `docs/SPLIT_SERVE.md` にこの変数固有の説明は見当たらず、性能差や生成結果への影響はこの調査では確認していません。
+- `engine/src/split/src/prefill.cu:1262-1297,1773-1817` — MTP prompt state 処理、フラグ読取、分岐、同期、まとめた draft rows。
+- `engine/src/split/src/env.hpp:15-21,33-39,51-52` — 整数全体の parse、unset の既定、非ゼロ判定、無効値の例外。
+- `engine/src/split/src/model.hpp:43` — `MAXT = 16`。
+- `engine/src/split/src/engine.cu:1251-1254`、`engine/src/split/src/engine_common.cu:1405-1414` — MTP attach と `draft_rows` の前提・処理。
+- `engine/src/split/tools/sfnx.cpp:1097-1102,1137-1140`、`engine/src/split/tools/fnx_run.cpp:1364-1373` — 実行時例外の観測経路。
+- `docs/DETAILS.md:376-383` — draft layer の資料との照合（このフラグの記載・測定値なし）。

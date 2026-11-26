@@ -1,6 +1,6 @@
 # `--port`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,47 +8,58 @@
 | コマンド | `strata launch` |
 | オプション | `--port` |
 | 別名 | なし |
-| 値 | `N`（1〜65535 の整数） |
+| 値 | `N`。1〜65535 の整数 |
 
 ## 役割
 
-`strata launch` が起動するサーバーの待受ポートを指定します。`--access` が `local`、`lan`、`cloudflare`、`tailscale` のどれでも、このポート番号が run config、接続 URL、既存 launch とのポート競合判定に使われます。
+`strata launch` が起動するモデルサーバーの待受ポートを指定します。ポート番号は生成する実行設定と launch プロファイルに反映され、起動中のサーバーの識別、接続 URL、Cloudflare tunnel の接続先にも使われます。待受アドレスや共有範囲は別の `--access` / `--listen` が決めます。
 
 ## 使い方
 
 ```sh
-strata launch --model iq3_xxs --port 8081 --no-tui
+# 起動計画だけを表示し、サーバーは起動しない
+strata launch --model q2_0 --port 8081 --plan
+
+# モデルを選び、8081 番ポートでサーバーを起動して監視画面を使う
+strata launch --model q2_0 --port 8081
+
+# 画面や質問を使わず起動し、接続先を表示して終了する
+strata launch --model q2_0 --port 8081 --yes --no-tui
 ```
 
 ## 値と既定値
 
-- 値は整数で、`1`〜`65535` が受理されます。`--port` の省略時は `8080` です。parser は `_port` を型変換関数として登録し、既定値は `LaunchSettings.port` に設定されています（`strata_cli/launch/cmd.py:55-62,119-123`、`strata_cli/launch/settings.py:32,77-99`）。
-- 数字に変換できない値は「port number ではない」、範囲外は「port does not exist」とする `argparse.ArgumentTypeError` になります。空文字列も整数変換に失敗します（`strata_cli/launch/cmd.py:55-62`）。
-- 1〜1023 は範囲内として受理されますが、実行環境によって管理者権限が必要になる旨の警告を出します（`strata_cli/launch/settings.py:155-165`）。
-- `--port` を複数回指定した場合は `argparse` の通常の `store` 動作となり、最後に指定した値が残ります。独自の重複指定処理はありません（`strata_cli/launch/cmd.py:122`）。
+- `N` は `int()` で整数に変換でき、1〜65535 の範囲に入る必要があります。範囲外や整数でない値は parser が拒否します。`0` は自動割当てを意味せず、無効です（`terminal/strata_cli/launch/cmd.py:53-60`）。
+- 指定しない場合は `8080` です。新規設定の既定値は `terminal/strata_cli/launch/settings.py:75,143-145` にあります。保存済み preset を読み込む場合はその設定から始まり、CLI の `--port` を指定すると値を置き換えます（`terminal/strata_cli/launch/cmd.py:215-221,286-287`）。
+- 1〜1023 は受理されますが、多くの環境で管理者権限が必要になるという警告になります（`terminal/strata_cli/launch/settings.py:228-238`）。
+- 同じ `--port` を複数回指定した場合の専用処理は parser にありません。`argparse` の通常の単一値オプションとして扱われます。
 
 ## 実行時の動作
 
-- `--preset NAME` と併用した場合、保存 preset を読み込んだ後に CLI の値を上書きするため、指定したポートがその起動の設定になります（`strata_cli/launch/cmd.py:197-203,252-255`）。`--save-preset NAME` を付けなければ、preset 起動時の変更は保存されず、既存 preset の使用記録のみ更新されます（`strata_cli/launch/cmd.py:788-792`）。
-- 起動設定から作る private run config の `port` と、launch profile の `port` override に値を反映します（`strata_cli/launch/runner.py:371-376,1235-1244,1246-1263`）。
-- 成功時の URL はこのポートを含みます。LAN ではローカルアドレス、Tailscale では tailnet のアドレスにも同じポートが付加され、Cloudflare tunnel の起動にもポートを渡します（`strata_cli/launch/access.py:285-296`、`strata_cli/launch/runner.py:1674-1694`）。
-- 同じポートを使う別の `strata launch` サーバーがある場合は競合対象です。異なるポートなら並行起動できますが、GPU メモリー不足で新しい起動に失敗する可能性を通知します。同一ポートで設定が異なり `--restart` がなければ起動を拒否し、`--restart` があれば先行する Strata launch サーバーを止めてから起動します。同じ設定・ポートで既に稼働中なら再起動せず、そのサーバーを再利用します（`strata_cli/launch/runner.py:1505-1538,1546-1557`）。
+`--port` は `LaunchSettings.port` に入り、モデルの実行設定の `port` として保存されます。また、launch プロファイルの `host` / `port` override にも設定されます（`terminal/strata_cli/launch/cmd.py:286-287`、`terminal/strata_cli/launch/runner.py:724-734,2323-2346`）。結果 URL はこのポートを使い、`--access address` では指定アドレス、その他ではローカル URL を組み立てます。LAN や Tailscale の URL にも同じポートが使われ、Cloudflare tunnel の開始にも渡されます（`terminal/strata_cli/launch/access.py:62-74,342-355`、`terminal/strata_cli/launch/runner.py:2884-2904`）。
+
+起動前に、別の `strata launch` プロファイルが同じポートで動いていないかを確認します。同じ設定が既に同じプロファイル・ポートで動いていれば再利用します。別の launch が同じポートを使っている場合や、同じ launch の設定が異なる場合は、対話画面では再起動確認を行い、確認できない実行では `--restart` がなければ終了します。異なるポートの launch は並行して続行できますが、GPU メモリが足りず新しい起動に失敗する可能性がある旨を通知します（`terminal/strata_cli/launch/runner.py:2554-2585`）。`--restart` で競合する launch を止める場合、そのサーバーは停止します（`terminal/strata_cli/launch/runner.py:2632-2643`）。
+
+`--port` 単独は「起動する選択肢」として数えられません。対話端末では選択肢なしの画面経路に進み、非対話実行ではモデルまたは preset を指定するようエラーになります。したがって、起動時は `--model` / `--preset` などと組み合わせてください。`--plan` はこの選択肢チェックを通り、ポートを含む設定を計画に載せますが、サーバー起動経路には進みません（`terminal/strata_cli/launch/cmd.py:844-871,897-905`）。
 
 ## 適用条件と副作用
 
-- 起動前に `127.0.0.1:N` へ接続を試み、接続できると「別プログラムが使用中」として起動を拒否します。この検査で使用中と判定されなければサーバー起動へ進みます（`strata_cli/launch/runner.py:1560-1574,1632-1646`）。
-- ポートが空いていてもサーバー自体が起動できない場合があります。起動失敗時は当該 launch の runtime を停止・cleanup し、失敗を返します（`strata_cli/launch/runner.py:1596-1603,1648-1658`）。
-- `--access` は待受 host と公開範囲も決めます。したがって `--port` は番号を選びますが、ポートだけで LAN やインターネットからの到達可否は決まりません（`strata_cli/launch/runner.py:371-380`）。共有アクセスで API key を使わない場合の警告は `check_access` が別途生成します（`strata_cli/launch/settings.py:173-191`）。
+- 起動前の空き確認は、ローカルモードでは `127.0.0.1`、`--access address` とアドレス指定がある場合はそのアドレスへの TCP 接続を試します。接続できた場合は「使用中」として起動を拒否し、終了コード 6 の `LaunchError` になります（`terminal/strata_cli/launch/runner.py:2815-2829,2661`）。この確認は bind 試行ではなく TCP 接続による判定です。
+- 同じポートを別プロセスが使っている場合、エラーにはポート番号と別ポートの例が示されます。空き確認後に実際の起動が失敗した場合も、起動失敗として報告され、今回の runtime を停止・cleanup します（`terminal/strata_cli/launch/runner.py:2828-2829,2686-2696,2831-2841`）。
+- ポート値はネットワーク待受先を変えます。LAN・指定アドレス・Tailscale などの共有方式と組み合わせる場合、クライアントが接続する URL のポートも変わります。API key の有無やアクセス範囲そのものはこのオプションでは変更しません。
+- `--port` のみを指定した対話起動は parser で値を読み取りますが、コマンド側の `have_choices` 判定には含まれず、選択肢なしの TUI 経路へ進みます。その経路には `LaunchSettings` が渡されません。単独指定でポート変更を意図せず、モデルまたは preset と併用してください（`terminal/strata_cli/launch/cmd.py:849-871`）。
 
 ## 出力とエラー
 
-- 不正な整数や範囲外の値は parser の型変換段階で拒否されます。実行時設定の検証エラーは human 出力では `stderr` に `strata: ...` と表示され、JSON 出力では `ok: false` とエラー情報を JSON で出力します。どちらも CLI が終了コード `2` を返す経路です（`strata_cli/launch/cmd.py:55-62,630-641,721-725`）。
-- 1024 未満の値に関する注意は警告として設定検査結果に含まれます（`strata_cli/launch/settings.py:155-165`）。
-- 別プログラムがポートを使用中と事前検査で判定された場合、`LaunchError` と終了コード `6` になります。起動中にサーバー側でポート使用中エラーが出た場合も、ログからポート競合を説明する経路があります（`strata_cli/launch/runner.py:1632-1646,2130-2138`）。
+- 不正な形式または 1〜65535 外の値は、parser の引数エラーとして拒否されます。1〜1023 はエラーではなく権限に関する警告です（`terminal/strata_cli/launch/cmd.py:53-60`、`terminal/strata_cli/launch/settings.py:228-238`）。
+- 起動前の接続確認で使用中と判定されると、`Port N is already in use by another program.` と別ポートを試す案内が出て終了コード 6 になります（`terminal/strata_cli/launch/runner.py:2815-2829`）。
+- `--plan` は計画を表示します。通常の起動では完了後に選択された URL が結果として表示されます（`terminal/strata_cli/launch/cmd.py:897-905,980-985`、`terminal/strata_cli/launch/runner.py:3337-3343`）。出力形式は同じコマンドの `--output` により human / JSON を選べますが、`--port` 自体は出力形式を変えません。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:55-62,119-123,197-203,252-255` — parser、範囲検査、preset と CLI 値の適用。
-- `strata_cli/launch/settings.py:32,77-99,155-191` — 既定値、port の再検査と低番号の警告、access との組み合わせ。
-- `strata_cli/launch/runner.py:371-380,1235-1263,1505-1557,1560-1646,1674-1694,2130-2138` — run config・profile への反映、稼働中 server の判定、起動前検査・失敗処理、Cloudflare tunnel と起動エラー。
-- `strata_cli/launch/access.py:285-296` — 接続 URL への port の反映。
+- `terminal/strata_cli/launch/cmd.py:53-60,130-138` — parser の scope、型変換、範囲検査。
+- `terminal/strata_cli/launch/settings.py:75,143-145,228-238` — 既定値と設定時の port validation / 低番ポート警告。
+- `terminal/strata_cli/launch/cmd.py:215-221,278-287,401-416,844-871,897-905` — preset との合成、CLI 値の適用、アクセス検査、ポート単独指定時と plan の分岐。
+- `terminal/strata_cli/launch/runner.py:724-734,2323-2346` — 実行設定と launch プロファイルへの反映。
+- `terminal/strata_cli/launch/runner.py:2554-2585,2632-2643,2661,2815-2829,2686-2696,2831-2841` — 起動中 launch の競合、空き確認、失敗時の後始末。
+- `terminal/strata_cli/launch/access.py:62-74,342-355`、`terminal/strata_cli/launch/runner.py:2884-2904,3337-3343` — URL、tunnel、起動後の接続先。

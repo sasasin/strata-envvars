@@ -1,49 +1,46 @@
 # `STRATA_LOGPOS_TOPK`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`STRATA_LOGPOS` の verify-window 測定出力に、logit が大きい上位 token の ID と、その token の log-probability を追加します。位置ごとのタブ区切り行に `id:logprob` 列が K 個増え、別エンジンとの top-k 比較に使えます。サンプリングや生成 token を変える処理ではありません。
+`Verifier::window_logprobs` が出力する各ログ確率行の末尾に、上位 K 個の token ID と、その行の全語彙 logits に対する log-probability を `id:logprob` 形式で追加します。CUDA/HIP 共通実装と SYCL 実装に読み取りがあります。生成・サンプリングで選ぶ token はこの値で変更されず、追加対象はログファイルの列です。[`engine/src/core/verify.cpp:4501-4518`](../../../Niko1221/Strata/engine/src/core/verify.cpp#L4501) [`engine/sycl/src/core/verify.cpp:3135-3152`](../../../Niko1221/Strata/engine/sycl/src/core/verify.cpp#L3135)
+
+この変数だけではログ出力を開始しません。prompt の verify-window 行は `STRATA_LOGPOS` のファイルが開けた場合に、decode の forced continuation 行は `STRATA_FOLLOW` と `STRATA_FOLLOW_LOGPOS` が有効な場合に `window_logprobs` が呼ばれ、そのとき本変数の列が使われます。[`engine/src/program/generate.cpp:20453-20467`](../../../Niko1221/Strata/engine/src/program/generate.cpp#L20453) [`engine/src/program/generate.cpp:21681-21707`](../../../Niko1221/Strata/engine/src/program/generate.cpp#L21681) [`engine/src/program/generate.cpp:23031-23040`](../../../Niko1221/Strata/engine/src/program/generate.cpp#L23031)
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換し、その結果を `max(0, min(256, value))` で制限します。文字列全体の検証はありません。
+両 backend とも `std::getenv` の戻り値が null なら 0、設定されていれば `std::atoi` で変換し、結果を 0～256 に clamp します。文字列全体の数値検証はありません。`atoi` が読む先頭の整数部分が使われ、後続文字は無視されます（例: `12xyz` は 12、`xyz` と空文字は 0）。先頭空白や符号は `atoi` の変換規則に従います。変換値が負なら 0、256 より大きければ 256 です。数値として `int` に表せない入力に対する `atoi` の結果は規定できません。[`engine/src/core/verify.cpp:4506-4509`](../../../Niko1221/Strata/engine/src/core/verify.cpp#L4506) [`engine/sycl/src/core/verify.cpp:3140-3143`](../../../Niko1221/Strata/engine/sycl/src/core/verify.cpp#L3140)
 
-| 環境変数の状態・値 | K と出力 |
-|---|---|
-| 未設定 | 0。追加列なし |
-| 空文字、数字で始まらない文字列 | `atoi` が 0 を返し、追加列なし |
-| 整数として 0 以下 | 0。追加列なし |
-| 正の整数 1〜256 | その数だけ追加列を出力 |
-| 256 より大きい正の整数 | 256 に clamp |
-| 数字の後ろに文字が続く | `atoi` が読める先頭部分だけを使う。例: `20tail` は K=20 |
+| 条件（build/backend） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP (`engine/src/core/verify.cpp`)、SYCL (`engine/sycl/src/core/verify.cpp`) | 0（追加列なし） | `1`～`256`、`12xyz`（12 列）、`999`（256 列に clamp） | 空文字、`0`、`0anything`、`-1`、`junk`（いずれも追加列なし） |
 
-先頭空白や符号は `atoi` の変換規則に従います。整数として表現できないほど大きな文字列について、コードは変換エラーを検査していません。K は 256 までに制限されますが、語彙数 `n_vocab_` に対する制限はコード上ありません。
+`K > 0` なら logits の降順で上位 K token を `std::partial_sort` し、各値を `row[token] - lse` として小数点以下 6 桁で書きます。K は最大 256 に制限されますが、語彙数に合わせた追加 clamp はありません。実装は `order.begin() + K` を使うため、語彙数が K 未満のモデルに対する保護はこの箇所にありません。[`engine/src/core/verify.cpp:4482-4503,4510-4518`](../../../Niko1221/Strata/engine/src/core/verify.cpp#L4482) [`engine/sycl/src/core/verify.cpp:3116-3137,3144-3152`](../../../Niko1221/Strata/engine/sycl/src/core/verify.cpp#L3116)
 
 ## 有効になる条件
 
-この変数だけではファイル出力を開始しません。`--serve` のプロンプト処理が verify-window の `read_windows` 経路を通り、`STRATA_LOGPOS` で指定したファイルを `fopen(..., "ab")` できた場合に `Verifier::window_logprobs()` が呼ばれ、その行に追加列が出ます。`STRATA_LOGPOS` が未設定、空または開けないパスの場合、上位 token 列を含む出力はありません。パスを開けなかった場合の専用警告はこの処理にありません。
-
-`STRATA_LOGPOS` が設定されていると、条件が合えば使われる pipelined prompt-read 経路を避けて serial verify-window loop に進みます。CUDA 側の分岐条件は `pipe && n_stages == 2 && pl_pw >= 1`、SYCL 側は `pipe && pl_pw >= 1` です。これは `STRATA_LOGPOS` 側の経路選択であり、`STRATA_LOGPOS_TOPK` 自体による条件ではありません。
+- `window_logprobs` が呼び出される必要があります。prompt の採点経路では `STRATA_LOGPOS` が設定され、追記用ファイルを `fopen(..., "ab")` で開けた場合に呼ばれます。空文字も設定済みとして `fopen` に渡されますが、開けず null なら記録処理は行われません。[`engine/src/program/generate.cpp:20457-20466`](../../../Niko1221/Strata/engine/src/program/generate.cpp#L20457) [`engine/sycl/src/program/generate.cpp:11307-11315`](../../../Niko1221/Strata/engine/sycl/src/program/generate.cpp#L11307)
+- decode の forced continuation では `STRATA_FOLLOW_LOGPOS` の出力ファイルが開け、さらに `STRATA_FOLLOW` から forced continuation が読み込まれている必要があります。CUDA/HIP は有効な行がある窓について出力し、SYCL は forced token の vector が空でない場合に出力します。[`engine/src/program/generate.cpp:21684-21707,23031-23040`](../../../Niko1221/Strata/engine/src/program/generate.cpp#L21684) [`engine/sycl/src/program/generate.cpp:11750-11766,12780-12792`](../../../Niko1221/Strata/engine/sycl/src/program/generate.cpp#L11750)
+- 実装箇所の設定登録は backends を `cuda-hip` と `sycl` としています。登録情報と `docs/SETTINGS.md` は利用対象を NVIDIA/AMD、Intel Arc と記載しています。[`terminal/data/settings-register.json:21399-21416`](../../../Niko1221/Strata/terminal/data/settings-register.json#L21399) [`docs/SETTINGS.md:158`](../../../Niko1221/Strata/docs/SETTINGS.md#L158)
+- `STRATA_LOGPOS_TOPK` は `window_logprobs` 内の関数ローカル `static` で初回に一度だけ読みます。prompt 経路では最初の呼び出し時、forced decode 経路では最初の対象呼び出し時に値が固定され、そのプロセス内の後続呼び出しには環境変更が反映されません。[`engine/src/core/verify.cpp:4506-4509`](../../../Niko1221/Strata/engine/src/core/verify.cpp#L4506) [`engine/sycl/src/core/verify.cpp:3140-3143`](../../../Niko1221/Strata/engine/sycl/src/core/verify.cpp#L3140)
+- CLI 引数による上書きはありません。`STRATA_LOGPOS_TOPK` はファイル出力先を選ばず、出力先や採点経路は別変数 `STRATA_LOGPOS` / `STRATA_FOLLOW_LOGPOS` が決めます。
 
 ## 実行時の詳細
 
-値は `Verifier::window_logprobs()` 内の関数ローカル `static const int topk` として初回評価時に一度だけ読みます。したがって同一プロセスで初回評価後に環境を書き換えても K は変わりません。関数は `STRATA_LOGPOS` のファイルが開いている場合に呼ばれるため、通常は最初の該当 prompt verify window で評価されます。CUDA/HIP と SYCL はそれぞれの実装内に同じ初回読み取りがあります。
+prompt の `read_windows` は、各 verify window の実行後、window 内 token を commit する前に `STRATA_LOGPOS` の出力先が開いていれば `window_logprobs` を呼びます。出力は各窓の行ごとで、既存の列（位置、正解 token、正解 token の log-probability、argmax 等）の後ろに K 個の `id:logprob` 列がタブ区切りで続き、ファイルへ追記して flush されます。`STRATA_LOGPOS` が設定されていると、二段 pipeline の prompt read を並列経路にせず serial の窓経路にします。[`engine/src/program/generate.cpp:20414-20425,20445-20467,20479-20485`](../../../Niko1221/Strata/engine/src/program/generate.cpp#L20414) [`engine/src/core/verify.cpp:4501-4521`](../../../Niko1221/Strata/engine/src/core/verify.cpp#L4501)
 
-各出力行では語彙 ID 全体を index 配列に並べ、logit の降順で `partial_sort` して先頭 K 件を出力します。列は `id:logprob` 形式で、log-probability は全語彙に対して計算した `lse` を用いる `row[id] - lse`、小数 6 桁です。既存列の後ろにタブ区切りで追加されます。出力先は `STRATA_LOGPOS` のファイルで、各 window の処理後に flush されます。値の不正を知らせる専用ログや fallback はありません。
+forced decode の `STRATA_FOLLOW_LOGPOS` 経路も同じ verifier 関数を使うため、K 列が適用されます。SYCL 側の呼び出しには prompt 採点の `STRATA_LOGPOS` 条件がなく、forced decode のログ出力は独立しています。[`engine/src/program/generate.cpp:23031-23040`](../../../Niko1221/Strata/engine/src/program/generate.cpp#L23031) [`engine/sycl/src/program/generate.cpp:12780-12792`](../../../Niko1221/Strata/engine/sycl/src/program/generate.cpp#L12780)
 
-K が `n_vocab_` より大きい場合に K を語彙数へ clamp する処理は見当たりません。したがってその条件の扱いはソースで安全性を保証していません。
+## ログと測定値
 
-## 文書との照合
-
-`docs/UNSLOTH_Q4.md` は同じ token 列を使った Strata と llama.cpp の分布比較で `STRATA_LOGPOS_TOPK=20` を指定しており、再現方法にも `STRATA_LOGPOS=<file>` と本変数の併用を記載しています。そこにある一致率・KL 等は同文書記載の測定条件で得られた値であり、本変数単独の性能・正確性を保証するものではありません（`docs/UNSLOTH_Q4.md:190-226`）。
+本変数自体に関する有効・無効ログや値エラーのログはありません。上位 K 列はログファイルへの出力です。prompt 採点で logits が使えない場合や head logits のコピーに失敗した場合、verifier は `window_logprobs: no head logits for this window` または `window_logprobs: the head logits copy failed` を返します。prompt の呼び出し元はその失敗を伝播し、read を失敗させます。CUDA/HIP の forced decode 呼び出し元は stderr に `strata serve: STRATA_FOLLOW_LOGPOS: <理由>` を出し、SYCL は `ERR <理由>` を stdout に出して終了コード 1 で戻ります。[`engine/src/core/verify.cpp:4435-4465`](../../../Niko1221/Strata/engine/src/core/verify.cpp#L4435) [`engine/sycl/src/core/verify.cpp:3105-3111,3156-3159`](../../../Niko1221/Strata/engine/sycl/src/core/verify.cpp#L3105) [`engine/src/program/generate.cpp:23038-23040`](../../../Niko1221/Strata/engine/src/program/generate.cpp#L23038) [`engine/sycl/src/program/generate.cpp:12790-12792`](../../../Niko1221/Strata/engine/sycl/src/program/generate.cpp#L12790)
 
 ## 根拠
 
-- `src/core/verify.cpp:2438-2447,2471-2490`: `window_logprobs()` の入力確認、基本列、変数の変換/clamp、top-k 選択・出力、flush。
-- `sycl/src/core/verify.cpp:2558-2568,2588-2607`: SYCL 側の同等処理。
-- `src/program/generate.cpp:10647-10650,10679-10693`: `STRATA_LOGPOS` による経路分岐、ファイル open、`window_logprobs()` 呼び出し。
-- `sycl/src/program/generate.cpp:9964-9966,9989-10003`: SYCL 側の同等呼び出し経路。
-- `src/program/generate.cpp:6859,11053`: `--serve` の request 処理内と `read_windows` の呼び出し。
-- `docs/UNSLOTH_Q4.md:192-198,224-226`: 測定の説明と `STRATA_LOGPOS_TOPK=20` を使う再現手順。
+- CUDA/HIP の値読み取り、順位付け、列出力: `engine/src/core/verify.cpp:4482-4518`
+- SYCL の値読み取り、順位付け、列出力: `engine/sycl/src/core/verify.cpp:3116-3152`
+- prompt 採点の出力開始と呼び出し: `engine/src/program/generate.cpp:20414-20467`; `engine/sycl/src/program/generate.cpp:11277-11317`
+- forced decode の出力条件とエラー経路: `engine/src/program/generate.cpp:21681-21707,23031-23040`; `engine/sycl/src/program/generate.cpp:11750-11766,12780-12792`
+- backend 登録と設定一覧: `terminal/data/settings-register.json:21399-21416`; `docs/SETTINGS.md:158`
+- 使用例: `docs/QUANTS.md:60`; `docs/UNSLOTH_Q4.md:199,224`

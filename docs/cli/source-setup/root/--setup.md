@@ -1,66 +1,71 @@
 # `--setup`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-24 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` 経由を含む） |
+| コマンド | `setup.py`（Linux は `./setup.sh`、Windows は `START-HERE.bat` から起動） |
 | オプション | `--setup` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。省略時 `False` |
+| 値 | 取らないフラグ |
 
 ## 役割
 
-既にモデル設定がある環境で通常のモデル起動へ進まず、モデルの追加または設定変更を行う setup 経路を選びます。`setup.py` の help は「install another model or change settings」と説明しています。
+通常起動時に保存済みモデルをそのまま起動する経路から抜け、モデルの追加や設定変更を行うセットアップ経路を選びます。`setup.py` の説明でも「別のモデルをインストールする／設定を変える」用途として定義されています（`terminal/setup.py:23-28,11525`）。
 
 ## 使い方
 
+Linux:
+
 ```sh
-# Linux: セットアップ画面・質問に従ってモデルを追加または設定変更
 ./setup.sh --setup
-
-# Windows: 同じ setup.py オプションを渡す
-START-HERE.bat --setup
-
-# 設定を行い、最後にモデルを起動しない
-./setup.sh --setup --no-start
 ```
 
-モデルなどの値を明示する場合は、たとえば `./setup.sh --setup --model IQ3_XXS` のように他の `setup.py` オプションと組み合わせます。
+Windows:
+
+```bat
+START-HERE.bat --setup
+```
+
+モデルや設定を明示して再設定する例:
+
+```sh
+./setup.sh --setup --family qwen --model IQ3_S --context 32768
+```
+
+Linux と Windows のラッパーは引数を `setup.py` に渡します（`setup.sh:6-17`、`START-HERE.bat:49-65`）。
 
 ## 値と既定値
 
-`argparse` の `store_true` action で、引数なしで指定します。省略時は `False`、指定時は `True` です。同じフラグを複数回指定しても真偽値のままです。値を付ける形式は定義されていません。
+値は不要です。parser は `action="store_true"` で宣言しており、省略時は偽、指定時は真です。別名、値の範囲、値に対する個別 validation はありません（`terminal/setup.py:11525`）。値を後置する構文は定義されておらず、未知の引数など argparse が受理しない構文は parser のエラーになります（`terminal/setup.py:11444-11445,11606`）。
 
 ## 実行時の動作
 
-既存の設定がある場合、`--setup` は「既存モデルをそのまま起動する」条件を外し、PC の確認から setup の処理へ進ませます。モデル・family を指定しなければ、その後の選択は対話式です。`--yes` を加えると推奨回答を受け入れ、質問を省く動作になります。
+`--setup` が真だと `plain_start` が偽になり、既存モデルをそのまま起動する分岐の条件も満たさなくなるため、PC の確認とセットアップの選択処理へ進みます。既存モデルがある場合に `--setup` を省略すると通常起動へ進み、複数モデルがある場合も標準の選択肢に「別モデルのインストール／設定変更」があります（`terminal/setup.py:11681-11688,11761-11779,11781-11783`）。
 
-通常はセットアップ完了後に作成・更新した run config のモデルを起動します。`--no-start` も指定した場合は設定完了後に終了し、モデルを起動しません。複数の既存モデルがある場合でも、通常起動時の「どのモデルを起動するか」選択分岐は `--setup` により迂回され、setup 処理へ進みます。
+セットアップ経路では選んだモデルや設定に応じて、Python パッケージやエンジンの準備、モデルファイルの取得・準備、起動用スクリプトと run config の作成を行います（`terminal/setup.py:11-21,12353-12360,12380-12390,12505-12527`）。run config は保存され、同じモデルの既存 config が変更される場合は `.bak` にコピーされます（`terminal/setup.py:7715-7747`）。
 
-各 wrapper は引数を `setup.py` に渡します。`SETUP.bat` は `START-HERE.bat --setup` の別名です。更新 wrapper は別の動作で、`update.sh` は `setup.sh --update` を実行し、`UPDATE.bat` も `--update` を付加します。`setup.py` は `--update` を通常 setup 分岐より先に処理するため、更新 wrapper に追加引数として `--setup` を渡しても更新処理が優先されます。
+正常終了時は `--no-start` がなければ最後にモデルを起動します。したがって `--setup` 単独は「セットアップして終了」ではありません。セットアップだけで終える場合は `--no-start` を併用します（`terminal/setup.py:11525-11526,12534-12562`）。
 
 ## 適用条件と副作用
 
-- 未指定時の通常起動は、既存モデルがあれば保存済み設定から直接起動します。`--setup` を付けるとセットアップ用のデータフォルダー解決を使い、PC 確認、モデル・設定の選択、必要なファイル取得や設定生成へ進みます。
-- 成功したセットアップは run config を書き込み、run script を作成します。既存 config が更新され内容が変わる場合、旧 config を `.bak` として保存しようとします。バックアップ作成に失敗した場合は警告を出して続行します。
-- `--setup` 自体はダウンロードや設定値を決めません。実際の取得・変更内容は選んだモデル、ほかのオプション、既存ファイルや環境に依存します。
-- macOS の通常 setup では parser 作成前に `metal/setup_mac.py` へ引数全体を委譲し、Intel SYCL backend 指定時も `sycl/setup_intel.py` へ委譲します。このフラグの個別効果は委譲先実装を含めて確認していません。
+- `--setup` と `--model` / `--family` を組み合わせると、選択対象を指定したセットアップになります。これらは `explicit` に含まれ、初回の既存設定引き継ぎ判定にも影響します（`terminal/setup.py:11698-11723`）。
+- `--yes` は推奨選択を採用して質問を抑えます。`--setup` 自体は確認を省略しません（`terminal/setup.py:11524-11525`）。
+- `--update` を同時に指定すると update 分岐が先に実行され、`--setup` の通常セットアップ経路には進みません（`terminal/setup.py:11692-11698`）。
+- `--check` も同時に指定した場合は PC の適合確認を行ってそこで終了し、モデルのセットアップには進みません（`terminal/setup.py:11960-11979`）。`--calibrate` は `--setup` と併用しても校正を行わず、その旨の警告を出します（`terminal/setup.py:11730-11733`）。
+- セットアップでファイルのダウンロード、パッケージやエンジンの準備、run config と起動スクリプトの書き込みが起こり得ます。個々の処理は既存状態や他の引数によって異なります（`terminal/setup.py:12353-12360,12380-12400,12505-12527`）。
+- Apple Silicon の macOS で Control モードではなく、Hy4-Flash / Inkling-2-Mini の専用経路でもない場合は、parser の実行前に `engine/metal/setup_mac.py` へ引数ごと委譲されます。macOS 側にも別 parser の `--setup` がありますが、これは索引上の `source-setup/mac/--setup.md` のスコープです（`terminal/setup.py:11434-11437,9290-9294,11628-11634`）。
 
 ## 出力とエラー
 
-`--setup` 単独に固有のエラー経路はありません。ほかの引数の形式エラーは `argparse` が usage とエラーを表示して終了し、モデル選択・ファイル取得・設定書き込みなど後続 setup の失敗は各処理のエラー経路に従います。成功時は setup の進捗・完了メッセージを表示し、`--no-start` がなければサーバーを起動します。
+`--setup` 固有の成功メッセージや終了コードはありません。セットアップ中の進行・警告・失敗は各段階から出力されます。通常のセットアップ失敗ではエラーと再実行案内を表示して終了コード 1 で停止し、割り込みは「stopped.」を表示して終了コード 1 になります（`terminal/setup.py:1049-1056,12565-12579`）。
 
 ## 根拠
 
-- `setup.py:8420-8427,8493-8505` — parser の生成、`--setup` の boolean 定義、および `--yes`、`--no-start`、`--update` との定義上の関係。
-- `setup.py:8602-8620` — 既存設定の検出、通常起動判定、`--update` の先行処理、setup 経路を選ぶ条件。
-- `setup.py:8677-8696` — 既存モデルの通常起動・選択分岐と、setup に進む場合のデータフォルダー再解決。
-- `setup.py:6234-6265,6312-6346` — 明示された引数の保持、既存 config の引継ぎ、変更時の `.bak` 作成と失敗時警告。
-- `setup.py:9729-9760` — config・run script の作成、完了表示、`--no-start` 時の終了と通常時の起動。
-- `setup.sh:6-12,68-76`、`START-HERE.bat:8-12,44-55` — POSIX/Windows wrapper の Python 選択と引数委譲。
-- `SETUP.bat:1-3` — `START-HERE.bat --setup` への委譲。
-- `update.sh:1-7,62`、`UPDATE.bat:1-6,79` — update wrapper が `--update` を追加すること。
-
-調査対象は指定 revision のソース checkout です。実機での CLI 実行、Release 配布物、各 OS/backend の setup 実行結果は確認していません。
+- parser と既定値: `terminal/setup.py:11444-11445,11524-11530,11606`
+- 通常起動とセットアップ経路の分岐: `terminal/setup.py:11681-11698,11761-11783`
+- config 保存とバックアップ: `terminal/setup.py:7715-7747,12521-12527`
+- セットアップ後の起動・`--no-start`: `terminal/setup.py:12534-12562`
+- Linux / Windows の引数転送: `setup.sh:6-17`、`START-HERE.bat:49-65`
+- macOS の委譲先: `terminal/setup.py:11436-11437,9290-9294`、別 parser `engine/metal/setup_mac.py:395-398`

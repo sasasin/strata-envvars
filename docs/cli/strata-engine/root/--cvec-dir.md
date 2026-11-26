@@ -1,62 +1,60 @@
-# `--cvec-dir`
+# `strata --cvec-dir`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。対象 checkout は `main` で、確認時点で未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（エンジン引数 parser） |
+| コマンド | `strata`（エンジンの root 引数） |
 | オプション | `--cvec-dir` |
 | 別名 | なし |
-| 値 | `per-layer` または `single:L` |
+| 値 | `per-layer` または `single:L`。`L` は制御ベクトルの層番号 |
 
 ## 役割
 
-制御ベクトルの方向を、適用対象の各 layer 自身から取るか（`per-layer`）、指定 layer `L` から共通に取るか（`single:L`）を選びます。`single:L` は `--cvec-mode project` のときだけ参照されます。制御ベクトル自体を読み込む `--control-vector` または `--control-vector-scaled` と併用し、mode の既定値 `add` ではこのオプションによる方向選択は反映されません。parser が設定する初期値は per-layer です（`src/program/generate.cpp:797-803`）。
+制御ベクトルを `--cvec-mode project` で使うとき、各適用層にその層自身の方向を使うか（`per-layer`）、指定層 `L` の方向を適用層すべてで共用するか（`single:L`）を選びます。制御ベクトルファイルを指定しない場合、または `--cvec-mode add` の場合、この指定は方向選択に反映されません。
 
 ## 使い方
 
 ```sh
-strata generate --pack ./pack --tokens "1,2,3" \
-  --control-vector-scaled ./vectors/style.gguf:1.0 \
-  --control-vector-layer-range 4 44 --cvec-mode project --cvec-dir single:12
+# 層 4 の方向を、指定した層範囲に共通して使う（CVEC.gguf と PACK は手元の入力に置き換える）
+strata --pack PACK --tokens "1,2,3" \
+  --control-vector-scaled CVEC.gguf:1.0 --control-vector-layer-range 4 44 \
+  --cvec-mode project --cvec-dir single:4
 ```
-
-`L` はモデル内の layer 番号です。実際に使用するには、指定した制御ベクトル GGUF に `direction.L` が含まれている必要があります。
 
 ## 値と既定値
 
-- 省略時および `per-layer` 指定時は、適用対象 layer ごとにその layer の方向を使います。
-- `single:L` は `single:` の後ろを `atoi` で整数化します。数値として厳密な書式かどうかは parser で検証されず、たとえば数値で始まらない suffix は `0` として解釈され得ます（`src/program/generate.cpp:2728-2732`）。
-- 未指定時は `cvec_single = -1` で、per-layer です。`single:L` を指定しても mode が `add` の場合、実行時に `single` は `-1` に置き換えられ、方向選択には使われません（`src/program/generate.cpp:801-803,1903-1905`）。
-- parser が認める値は `per-layer` と `single:` 接頭辞の値です。それ以外では stderr に `--cvec-dir: per-layer or single:L, got '…'` を出し、終了コード 2 で引数処理を終了します（`src/program/generate.cpp:2728-2732`）。
+- `per-layer` は内部値を `-1` にし、project モードで適用先の各層自身の方向を使います。既定値も内部値 `-1`（per-layer 相当）です。`--cvec-dir` の複数回指定は、引数処理中の最後の値が残ります（`engine/src/program/generate.cpp:1205,4190-4194`）。
+- `single:L` は `single:` の後ろを `atoi` で整数変換します。パーサー段階では数値全体の形式や符号・範囲を厳密には検査せず、`single:` という接頭辞だけを確認します。したがって数値でない接尾辞は `0` として扱われ、数値の後ろに余分な文字があっても `atoi` が読める先頭部分が使われます（`engine/src/program/generate.cpp:4190-4194`）。
+- ベクトル読込時、project モードの `single:L` はベクトルにその層の方向が存在する必要があります。層 0 の方向は読込対象外のため指定できません。モデルの層数を超える番号や、該当方向のない番号も読込エラーになります（`engine/src/program/generate.cpp:2760-2764,2788-2791`）。
+- `single:` の後ろが負数なら内部値が負になり、project モードでも per-layer と同じ分岐になります。これは専用の拒否ではなく、実装上 `single >= 0` の場合だけ単一層として扱うためです（`engine/src/program/generate.cpp:2788-2797`）。
 
 ## 実行時の動作
 
-制御ベクトルファイルの読み込み処理は、少なくとも1つの `--control-vector` / `--control-vector-scaled` がある場合に呼ばれます。したがって `--cvec-dir` 単独ではファイルを開かず、実行時の方向選択も行いません（`src/program/generate.cpp:3961-3969`）。
+`--cvec-dir` は方向選択を `Options::cvec_single` に保存します。制御ベクトルファイルが一つ以上指定されたときだけ読込処理が呼ばれ、`--cvec-mode project` なら `single:L` の層を全適用層の参照元にし、`per-layer` なら適用層ごとに同番号の方向を参照します。選ばれた方向から層ごとの方向・スケール表を作り、GPU 用の制御ベクトル表としてアップロードします（`engine/src/program/generate.cpp:2788-2813,6143-6150`）。
 
-読み込み時、project mode で `single:L` が有効なら、`L` がモデル範囲内で、読み込んだファイル群にその layer の direction が存在することを確認します。条件を満たさない場合は `--cvec-dir single:L: the vector has no direction for that layer` を含むエラーを出し、初期化を終了コード 2 で中断します（`src/program/generate.cpp:1903-1908,3963-3968`）。有効なら、適用対象の各 layer `l` について方向元 `src` を `L` とし、方向ベクトルを読みます。per-layer では `src=l` です。適用対象範囲は `--control-vector-layer-range` によって決まります（`src/program/generate.cpp:1903-1916`）。
-
-この文書の値選択は方向元を決めるもので、vector の演算方式は `--cvec-mode` が決めます。アップロードした vector は通常の layer 実行時と batched prefill の該当箇所で適用されます（`src/core/layer.cpp:1615-1625`; `src/prefill/prefill.cpp:4817-4822,4842-4845,4863-4875`）。`--serve` ではロード済み vector の有効・無効を request ごとの `cvec=0|1` に応じて切り替えます（`src/program/generate.cpp:12922-12928`）。
+`--cvec-mode add` では `cvec_single` を使わず、`per-layer` と同じく各層の方向を使います。そのため `--cvec-dir single:L` を指定しても add モードの方向は切り替わりません（`engine/src/program/generate.cpp:2788-2809`）。GPU 側では層ごとの表を参照して residual stream にベクトルを適用します（`engine/src/kernels/cuda/cvec.cu:52-56,86-93,162-171`）。
 
 ## 適用条件と副作用
 
-- `single:L` の選択が実際に効くのは project mode かつ制御ベクトルがロードされる場合だけです。add mode では per-layer 扱いになります。
-- 指定 layer の direction がない場合は起動時に拒否されます。指定番号が範囲外の場合も同じエラー経路です。負数は整数化後に single 選択として有効にならず、per-layer 扱いとなります（`src/program/generate.cpp:1903-1908`）。
-- 単独ではファイルやネットワークへの副作用はありません。制御ベクトルをロードした場合は GPU 向けの vector table がアップロードされ、その内容がセッション識別 digest に含まれます（`src/program/generate.cpp:1930-1940`）。
-- エンジンの CUDA/HIP 等の全 backend・build 構成で同じ経路が利用できるかは、このソース調査だけでは確認していません。
+- `--cvec-dir` の値はベクトルが未指定でも `per-layer` / `single:` の形式検査を受けますが、層の存在確認は制御ベクトル読込処理内でしか行われません。ファイル未指定ではその処理が呼ばれないため、認識された値でも実行上は効果がありません（`engine/src/program/generate.cpp:4190-4194,6143-6150`）。
+- `--cvec-mode project` 以外では `single:L` を単一方向として解釈しません。`--cvec-mode` が省略された場合の mode は add（内部値 `1`）です（`engine/src/program/generate.cpp:1204-1205,2788`）。
+- 値の指定による出力ファイルの生成や書換えは確認できません。ベクトル読込後は GPU テーブルへのアップロードが行われます（`engine/src/program/generate.cpp:2813`）。
+- この調査では `engine/src/program/generate.cpp` の parser とその CUDA 側の利用を追跡しました。SYCL 用ソースにも同じ値の parser とベクトル選択処理がありますが、バックエンドごとの実行環境差・GPU 上の結果は実行して確認していません（`engine/sycl/src/program/generate.cpp:1577-1604,2148-2158`）。
 
 ## 出力とエラー
 
-方向元の検査失敗は `load_control_vectors` のエラーとして `strata generate: control vector: …` を stderr に出し、終了コード 2 で終了します（`src/program/generate.cpp:1906-1908,3963-3968`）。正常なロードでは mode、`dir` の種別、layer 範囲、実際に steer された layer 数を stderr に記録します。`single:L` が使われた場合は summary にも `singleL` が含まれます（`src/program/generate.cpp:1942-1947`）。
+- 値が欠けていると `--cvec-dir needs a value` を stderr に出し、終了コード `2` で終了します。`per-layer` / `single:` 以外は `--cvec-dir: per-layer or single:L, got '…'` を stderr に出し、終了コード `2` で終了します（`engine/src/program/generate.cpp:3844-3846,4190-4194`）。
+- ベクトルを読み込む project モードで `single:L` に該当方向がない場合は、`strata generate: control vector: --cvec-dir single:L: the vector has no direction for that layer` を stderr に出して終了コード `2` になります（`engine/src/program/generate.cpp:2788-2791,6145-6150`）。
+- 指定層の合成方向がゼロで適用層が一つも steer されない場合も、読込処理は「control vector has no direction in layers …」として失敗し、呼び出し元が stderr に出して終了コード `2` を返します。アップロード失敗も同じ呼び出し元経由でエラー表示・終了コード `2` になります（`engine/src/program/generate.cpp:2800-2813,6145-6150`）。
+- 読込に成功すると stderr に mode、`dir` の選択種別、適用層範囲、方向を適用した層数を出力します（`engine/src/program/generate.cpp:2825-2829`）。
+- ソースの `usage()` 表示は `strata generate ...` と記しますが、root parser は引数を直接処理し、`generate` を未知引数として拒否します。例では parser に沿って `strata --pack ...` の形を示しました（`engine/src/program/generate.cpp:1208-1211,3842-3850,4268-4274`）。
 
 ## 根拠
 
-- parser 初期値とオプション説明: `src/program/generate.cpp:797-803,953-957`
-- parser の値判定と `atoi` 処理: `src/program/generate.cpp:2728-2732`
-- vector 読み込み、layer 検査、方向選択とアップロード: `src/program/generate.cpp:1867-1930`
-- 初期化時の読込条件と失敗出力: `src/program/generate.cpp:3961-3969`
-- layer 実行・prefill での適用箇所: `src/core/layer.cpp:1615-1625`; `src/prefill/prefill.cpp:4817-4822,4842-4845,4863-4875`
-- `--serve` の request 単位切り替え: `src/program/generate.cpp:12922-12928`
-
-調査範囲は指定 commit のソースと索引です。同一 revision の既存バイナリによる `--help` 表示や Release 配布物は確認していません。
+- `engine/src/program/generate.cpp:1199-1205,1370-1374` — 制御ベクトル設定の既定値と help 表示上の値形式。
+- `engine/src/program/generate.cpp:3842-3846,4184-4195,4268-4274` — root 引数 parser、値取得、形式判定、未知引数の失敗。
+- `engine/src/program/generate.cpp:2739-2744,2760-2784,2786-2813,2825-2829,6143-6150` — ベクトル層の選択・検証、GPU 表アップロード、診断出力、失敗終了。
+- `engine/src/kernels/cuda/cvec.cu:46-56,86-93,162-171` — 層ごとの方向表の参照と residual stream への適用。
+- `engine/sycl/src/program/generate.cpp:1577-1604,2148-2158` — SYCL 用 parser と層選択処理の対応箇所。

@@ -1,6 +1,6 @@
-# `strata update --app-version`
+# `--app-version`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,54 +8,47 @@
 | コマンド | `strata update` |
 | オプション | `--app-version` |
 | 別名 | なし |
-| 値 | インストール済み Strata Desktop の version 文字列 |
+| 値 | インストール済みデスクトップアプリの版を表す文字列 |
 
 ## 役割
 
-`strata update` が把握している Strata Desktop のインストール済み version を渡します。署名付き update feed の Desktop version と比較し、`--check` の結果や `--app` による installer 取得の要否を決めるために使われます。Terminal CLI や Control の version を指定するオプションではありません（`strata_cli/update_cmd.py:47,163-184`、`strata_control/updater.py:1210-1223`）。
+更新フィードにアプリ版がある場合、フィードの版と比較する「インストール済み版」を Strata に伝えます。比較結果はアプリ更新の確認表示と、`--app` で installer を取得するかの判定に使われます。この値を指定してもアプリ更新は有効にならず、installer の取得には別途 `--app` が必要です（`terminal/strata_cli/update_cmd.py:62-64,323-325,361-372`、`terminal/strata_control/updater.py:2002-2015,2018-2025`）。
 
 ## 使い方
 
 ```sh
-# Desktop の更新状況だけを確認する（feed の取得は行う）
+# フィードを確認し、インストール済みアプリ版との比較結果を表示する（installer は取得しない）
 strata update --check --app-version 0.2.0
 
-# エンジンと Control に加え、Desktop installer も取得・検証する
+# アプリ installer も取得・検証する（インストール自体は行わない）
 strata update --app --app-version 0.2.0
 ```
 
 ## 値と既定値
 
-- parser は文字列を受け取り、既定値は `None` です。parser 自体では形式検証しません（`strata_cli/update_cmd.py:42-48`）。
-- オプションを省略した場合は環境変数 `STRATA_APP_VERSION` を使います。明示値が空文字列の場合も Python の `or` によって環境変数へフォールバックします。明示した空でない値は環境変数より優先されます（`strata_cli/update_cmd.py:27,182-184`）。
-- 比較時の version は `0.2.0`、`0.2.0.1` のように数字3要素と任意の第4要素を持つ形式です。インストール済み version には `0.2.0-beta` のような prerelease suffix も許され、同じ数値部分の通常 version より低く並びます。suffix 内の文字列による大小順までは比較しません（`strata_control/feed.py:40,59-72`）。
-- 指定値の空白除去や補正はありません。形式が不正な値は、Desktop の feed entry と当該 platform 用 entry がある場合に比較時点で `FeedError` になります（`strata_control/updater.py:1210-1223`、`strata_control/feed.py:59-72`）。
+`--app-version` は値を1つ取ります。parser には型変換や選択肢の制限がなく、既定値は `None` です（`terminal/strata_cli/update_cmd.py:59-65`）。実行時は truthy な CLI 値を優先し、それが未指定または空文字なら環境変数 `STRATA_APP_VERSION` を使います。両方とも未設定なら `None` です（`terminal/strata_cli/update_cmd.py:323-325`）。環境変数の詳しい仕様は [`STRATA_APP_VERSION`](../../../envvars/STRATA_APP_VERSION.md) を参照してください。
+
+アプリ版の比較に使われる値は、数字3区分または4区分の版（例 `0.2.0`、`0.2.0.1`）に、任意で `-` と英数字・ドットからなる prerelease suffix を付けた形式です（例 `0.2.0-beta`）。基底版は `\d+\.\d+\.\d+(?:\.\d+)?` に一致する必要があります。比較では各版を最大4区分にゼロ埋めし、同じ基底版なら prerelease 付きが通常版より小さいものとして扱います（`terminal/strata_control/feed.py:45,69-82`）。`+build` 形式はこの比較関数では受理されません。
+
+値の検査は parser 時ではなく、アプリ版比較に到達したときに行われます。フィードにアプリがない場合、または実行 platform 用 installer がない場合は比較されません。空文字は CLI から渡しても環境変数へ fallback するため、空文字そのものを「インストール済み版」として渡せません（`terminal/strata_control/updater.py:2002-2015`、`terminal/strata_cli/update_cmd.py:323-325`）。
 
 ## 実行時の動作
 
-`strata update --check` は feed を読み、エンジン・Control・Desktop の更新状況を常に報告します。Desktop の現行 version が不明なら status は `unknown-installed`、feed の version が現行値より新しければ `available`、それ以外は `current` です。`--check` は `--app` の有無にかかわらず Desktop を報告します。feed の取得後には check 結果の一部を状態ファイルへ保存します（`strata_control/updater.py:624-640,1210-1223`）。
+`strata update --check` は署名付きフィードを読み、アプリ版が指定されていれば offered 版との比較結果をレポートします。これは installer をダウンロードしませんが、確認結果を `last_check` として状態に保存します（`terminal/strata_cli/update_cmd.py:361-367`、`terminal/strata_control/updater.py:778-789`）。
 
-通常の更新では `--app` を付けたときだけ Desktop installer の取得処理が加わります。`--app-version` は `--app` の代わりにはならず、このフラグだけで installer を取得しません。比較結果が `current`、feed に Desktop がない、または当該 platform 向け entry がない場合、installer は取得されません。`available` または version 不明の場合は installer をダウンロードして SHA-256 と minisign signature を検証し、components directory の `.updates/app` に保存します。CLI は installer を実行しません（`strata_control/updater.py:1226-1257,1274-1288`）。
-
-同じ `--app-version` は `strata components update` の parser にも登録されていますが、この文書の対象 scope は索引に従い `strata update` です（`strata_cli/update_cmd.py:42-59`、[`CLI 索引`](../../README.md)）。
+通常更新では `--app` がある場合に限りアプリ installer の処理が追加されます。指定版がフィード版より古ければ `available`、同じか新しければ `current` となり、`current` なら取得を行いません。インストール済み版が未知なら `unknown-installed` として取得対象になります（`terminal/strata_control/updater.py:2002-2015,2018-2025,2119-2122`）。取得した installer は SHA-256 と minisign 署名を検証して `.updates/app` 配下へ置きますが、Terminal はアプリをインストールしません（`terminal/strata_control/updater.py:2018-2021,2026-2049`）。
 
 ## 適用条件と副作用
 
-- Desktop の version 比較は feed に Desktop entry があり、かつ現在の PC に対応する platform entry がある場合にだけ行われます。該当 entry がなければ `--app-version` の値はその判定で使われません（`strata_control/updater.py:1210-1223`）。
-- version 不明の状態で `--app` を指定すると、更新済みかどうか判定できないため取得・検証処理へ進みます。version が `current` なら取得を省略します（`strata_control/updater.py:1230-1234`）。
-- `--check` は feed 以外をダウンロードしませんが、最後の check 情報を update state に保存します。通常の update では feed と選択された component を取得します（`strata_control/updater.py:624-640,1274-1285`）。
-- `strata update` と `strata components update` は、更新がエンジンを利用中の場合に待機・拒否となることがあり、取得処理は `STRATA_NO_ACQUIRE` により拒否されることがあります。これらは `--app-version` 固有の副作用ではありません（`strata_cli/update_cmd.py:9-11,197-210,237-252`）。
+この値がアプリ更新判定に影響するのは、フィードにアプリ項目があり、現在の platform に対応する installer がある場合です。エンジンや Control の版比較には使われません（`terminal/strata_control/updater.py:2002-2015`）。`--app-version` だけでは installer を取得せず、`--app` と組み合わせた場合のみ取得処理が実行されます。アプリ版が未知のときは `--app` により最新版候補を取得しますが、取得したファイルのインストールは別操作です（`terminal/strata_cli/update_cmd.py:63-64,371-372`、`terminal/strata_control/updater.py:2022-2049`）。
 
 ## 出力とエラー
 
-- `--check` の人向け出力では Desktop のインストール済み version と提示 version、status が表示されます。JSON/JSONL 出力では同じ Desktop 判定が `app` レポートに含まれます（`strata_cli/update_cmd.py:132-160,163-209`、`strata_control/updater.py:1210-1223`）。
-- 不正な version 文字列や feed エラーは `FeedError` として処理され、既定の終了コードは 5 です。人向け出力は stderr の `strata: ...`、JSON/JSONL 指定時はエラー object を stdout に出します（`strata_control/feed.py:44-49,59-72`、`strata_cli/update_cmd.py:163-172,225-234`）。
-- `--app` で公開鍵がなく installer を検証できない場合や signature 検証に失敗した場合も、終了コード 5 で失敗します。signature 不一致の installer archive は削除されます（`strata_control/updater.py:1235-1249`）。
+`--check` の人間向け出力では、既知のアプリ版を `installed -> offered` と状態付きで示します。版が不明なら、Terminal はインストール済みアプリ版を判定できない旨を示します（`terminal/strata_cli/update_cmd.py:217-247`）。不正な版が比較対象になった場合は `FeedError` となり、既定の終了コード `5` で失敗します。人間向け出力は stderr の `strata: <エラー>`、JSON/JSONL 出力ではエラーオブジェクトになります（`terminal/strata_control/feed.py:50-55,69-82`、`terminal/strata_cli/update_cmd.py:307-316,378-384`）。
 
 ## 根拠
 
-- `strata_cli/update_cmd.py:42-59` — `strata update` と `strata components update` の parser 定義。
-- `strata_cli/update_cmd.py:163-184,197-234` — 環境変数との優先関係、check/update 分岐、エラー・終了コード処理。
-- `strata_control/updater.py:624-640,1210-1257,1274-1296` — Desktop version 判定、check state 保存、installer 取得条件と副作用。
-- `strata_control/feed.py:40,59-72,243-260` — version 形式・比較方法と feed 内 Desktop version の検証。
-- 索引: [`docs/cli/README.md`](../../README.md) の `strata update` scope。
+- `terminal/strata_cli/update_cmd.py:59-75`: `strata update` と `strata components update` の parser 定義。後者にも同名オプションがあるが、本書のスコープは索引上の `strata update`。
+- `terminal/strata_cli/update_cmd.py:307-325,361-377`: 環境変数 fallback、Context への設定、確認と更新の分岐。
+- `terminal/strata_control/feed.py:45,69-82`: 比較対象の版形式・比較キー。
+- `terminal/strata_control/updater.py:778-789,1987-2049,2109-2139`: 確認レポート、アプリ版判定、installer の取得・検証、実行順。

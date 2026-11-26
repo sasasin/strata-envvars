@@ -1,66 +1,56 @@
 # `STRATA_PARK_VRAM_MIB`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-会話を park するとき、保存する K/V のコピーを通常のホスト側バッファに加えて CUDA VRAM にも残すための MiB 予算です。park 後に同じ会話を復元するとき、該当する K/V が slot に残っていれば VRAM から VRAM へコピーします。通常のホストバッファへの保存も続くため、slot が使えない場合や解放された場合はそちらから復元できます。
+会話を park するときに K/V のコピーを保持する CUDA device memory slot の合計予算を MiB 単位で指定する。正の値を指定しても、この変数だけでは機能は動かず、`STRATA_PARK_ASYNC` が有効で、park 対象の device-resident K/V がある場合に slot の取得を試みる。slot を取得した場合、該当する K/V 部分を device-to-device で slot に複製し、復帰時はそこから復元する。slot を使わない場合も通常の park/restore は続き、非同期 stage または host buffer の経路に戻る（`engine/src/core/conversation_snapshot.cpp:165-197, 466-494, 664-699, 1077-1141`）。
 
-この機能は `STRATA_PARK_ASYNC` が有効な park に付加されます。`STRATA_PARK_ASYNC` が無効なら VRAM slot は作られません。予算値の取得は slot の取得経路のほか、VRAM 解放 helper と `STRATA_PARK_TRACE` 有効時の復元 trace からも呼ばれるため、まれに slot を作らない経路で環境値だけ読むことがあります。実装の非同期 park は HIP、gfx906 互換、Metal ではコンパイル時に無効です。
+コード上、この変数の環境読み取りは `park_vram_budget()` だけにある。CLI 引数、設定ファイル、別の環境変数から予算値を上書きする経路はない（同 `:143-149`）。
 
 ## 値と判定
 
-値は `std::atoll` で先頭から整数へ変換されます。変換結果が正数なら MiB 単位の予算として `size_t` に変換し、20 bit 左シフトして bytes にします。0 以下なら予算 0、すなわち slot 無効です。文字列全体の検査や追加の clamp はありません。
+`std::getenv` の結果を `std::atoll` に渡し、変換結果が正の場合だけ MiB を byte に換算する。未設定は `0`、空文字や数字で始まらない文字列も `atoll` の結果が `0` になり無効。負数とゼロも無効。先頭の空白と符号は `atoll` の整数変換規則に従い、数字以降の文字列全体を検証しない。例えば `"  +64MiB"` は `64` として扱われ、`"0anything"` は `0`、`"true"` は `0` になる。正値に上限 clamp はなく、MiB から byte への左シフトも上限検査なしで行われる（`engine/src/core/conversation_snapshot.cpp:143-149`）。
 
-| 値 | 判定 |
-|---|---|
-| unset | 0 MiB、無効 |
-| 空文字、数字で始まらない文字列 | `atoll` が 0 を返すため無効 |
-| `0`、負数 | 0 以下のため無効 |
-| 正の整数 | その MiB 数を予算にする。先頭の空白や符号は `atoll` の変換に従い、整数の後ろの文字列は検査されない（例: `64tail` は 64） |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `STRATA_PARK_ASYNC` が有効な CUDA 経路 | 予算 0 byte（slot なし） | `64`, `+64`, ` 64MiB`（`atoll` が正値を返す） | 空文字、`0`, `0anything`, `-1`, `true` |
+| HIP、gfx906 shim、Metal のビルド | 予算値にかかわらず park async が無効 | なし | すべて（この機能経路では使用されない） |
 
-数値の後ろに単位を書く形式には対応しません。`atoll` の整数変換範囲外となる値について、実装はエラー検査や fallback を定義していません。変換結果が正でも slot の確保が保証されるわけではありません。
-
-既定値は 0 MiB です。CLI 引数や設定ファイルによる上書きはこの読み取り経路にはなく、他の変数との優先順位もありません。`STRATA_PARK_ASYNC` は slot 機能の前提条件です。
-
-根拠: `src/core/conversation_snapshot.cpp:137-144,159-182,231-237,595-617`。
+`atoll` の戻り値が正かどうかだけを判定し、数値文字列全体の妥当性、単位、小数、末尾文字は検証しない。巨大な値に対する明示的な範囲検査もない（同 `:143-149`）。
 
 ## 有効になる条件
 
-slot の取得には次の条件が必要です。
-
-- ビルドが `STRATA_USE_HIP`、`STRATA_HIP_GFX906`、`STRATA_GPU_METAL` のいずれでもなく、CUDA 系の実装経路を通る。
-- `STRATA_PARK_ASYNC` が設定され、その先頭文字が `1`。値全体は検査されないため `1anything` も有効、空文字や `true` は無効。
-- park する K/V の必要 byte 数が 0 ではない。
-- 対象 device の slot について予算内の容量が確保でき、必要に応じて新規確保時に VRAM 条件も満たす。
-
-環境変数値から得た予算内に slot 容量を収めます。新規 slot の容量は必要量を 64 MiB 単位に切り上げます。容量の合計が予算を超える場合はその取得を断ります。さらに新規割り当てでは、必要容量に加えて 1.5 GiB の空き VRAM を要求します。既存の十分な空き slot を再利用する場合は、この新規割り当て時の空き VRAM 検査を通りません。
-
-予算が 0、予算超過、空き VRAM 不足、`cudaMalloc` 失敗のいずれかで slot が取れないと、非同期 park 自体が有効なら通常の非同期 stage を試します。stage も使えない場合は K/V を同期コピーします。したがって、この変数は park を必ず成功させる設定ではなく、同期コピーを禁止する設定でもありません。
-
-根拠: `src/core/conversation_snapshot.cpp:159-190,231-237,595-659`。
+- `STRATA_PARK_ASYNC` が設定され、その値の**先頭文字**が `'1'` であること。`"1"`, `"10"`, `"1anything"` は on、未設定・空文字・`"true"`・`" 1"` は off。判定結果も関数内 `static` に保存される（`engine/src/core/conversation_snapshot.cpp:237-244`）。
+- HIP (`STRATA_USE_HIP`)、gfx906 shim (`STRATA_HIP_GFX906`)、Metal (`STRATA_GPU_METAL`) では上記の値にかかわらず `park_async_on()` が `false` を返す（同 `:237-244`）。
+- park 開始時に必要量 `need` が 0 でないこと。必要量は通常 K/V 全体から計算されるが、streamed K/V (`kv_mode != 0`) では host 側にある K/V 部分を除き、device-resident の pooled 部分だけを見積もる（`engine/src/core/conversation_state.cpp:623-636`）。
+- 取得できる slot は同じ device の空き slot を再利用するか、新しい slot を 64 MiB 単位に切り上げて確保する。新規確保時は予算内であり、確保後にも 1.5 GiB 以上の空き VRAM が残る必要がある。条件不足や CUDA allocation 失敗時は slot を使わず、async stage を試す（`engine/src/core/conversation_snapshot.cpp:165-197, 179-188, 1086-1141`）。
+- slot 容量に収まらない部分や device memory として扱えない部分は、その部分だけ通常の transfer で保存する。したがって値が正でも、全 K/V が slot に入るとは限らない（同 `:466-494`）。
 
 ## 実行時の詳細
 
-`park_vram_budget()` は初回呼び出し時に `getenv` と変換を行い、その結果を関数内 `static const size_t` に保存します。呼び出しは非同期 park の slot 選択、VRAM 解放 helper、`STRATA_PARK_TRACE` 有効時の restore trace にあります。最初にどの経路が呼ぶかで cache が初期化され、その後プロセス環境が変わっても予算は再評価されません。`STRATA_PARK_ASYNC` 自体も関連する各関数内の static 値として読み取られます。
+予算は `park_vram_budget()` の関数内 `static const` として初回評価時にキャッシュされる。値は各 park ごとには再読込されず、初回評価後の環境変更は反映されない。`STRATA_PARK_ASYNC` も別の関数内 `static const` で同様に初回評価時の値を保持する（`engine/src/core/conversation_snapshot.cpp:143-149, 237-244`）。
 
-park の開始時、Strata は同じ device の空き slot のうち必要量以上で最小のものを再利用します。該当する slot がなければ、未使用 slot を解放してから容量予算と空き VRAM を確認し、新しい slot を確保します。slot を取った場合、各 K/V 部分を device-to-device copy で slot に写し、通常の保存バッファにも背景コピー用の項目を記録します。slot の容量に収まらない部分や device memory と判定されない部分は同期転送します。保存完了後、背景コピーが slot を読み終えるまで slot を保持します。
+park の save 処理は K/V の必要量を計算して `conversation_park_async_begin()` を呼ぶ。予算が 0、予算超過、空き VRAM 不足、または slot の `cudaMalloc` 失敗で slot を得られない場合は slot 経路を使わず、通常の async stage 確保を試す。stage も使えないときは `conversation_kv_save()` が同期 transfer にフォールバックするため、予算不足そのものは park の失敗を意味しない（`engine/src/core/conversation_state.cpp:623-638`; `engine/src/core/conversation_snapshot.cpp:165-197, 1086-1141, 496-518`）。
 
-restore は画像の tag に対応する slot に必要な各部分が揃っていれば slot から K/V を転送し、揃わない場合は背景コピーを join して通常のホストバッファから復元します。prefix restore も同様に slot を利用します。slot は画像または K/V 層の保持 token が解放されると再利用可能になり、K/V の拡張で再割当てが必要になった場合には park 済み slot をまとめて解放して再試行します。
+slot に保存できたデータは復帰時に slot から device-to-device で復元される。画像の全 layer が slot にあれば背景コピーの join を待たずに済む。slot が見つからない、または必要な各 part が揃わない場合は join して image の host buffer から復元する（`engine/src/core/conversation_snapshot.cpp:664-699, 702-735`; `engine/src/core/conversation_state.cpp:899-912, 1244-1250`）。
 
-予算が正で `STRATA_PARK_TRACE` が設定されていると、stderr の `strata parktrace:` に slot の取得容量と tag、または取得できなかった理由（`budget`、`vram`、`cudaMalloc` など）が出ます。予算が 0 のときは slot の理由ログを出しません。K/V の背景コピー失敗時には join で `strata: STRATA_PARK_ASYNC: a parked K/V copy failed (...)` が stderr に出ます。slot copy 自体のエラーは snapshot のエラーとして返り、呼び出し元の会話キャッシュ処理が park を見送る経路があります。slot 取得失敗だけでは警告や終了にならず、上記の stage / 同期経路に移ります。
+slot は park image と K/V layer の生存期間に紐づき、対応する token が解放されると再利用可能になる。K/V の成長で確保に失敗した場合は、Strata は park slot と stage を解放して一度だけ再試行する。バッチで復元する場合も、park slot 解放後に K/V の成長を再試行し、なお失敗すれば `ERR the K/V cannot grow to the parked conversation: no VRAM is left` を表示して終了コード 1 を返す（`engine/src/core/conversation_snapshot.cpp:1213-1241`; `engine/src/program/generate.cpp:11656-11674, 19952-19958`）。
 
-`docs/DETAILS.md` は、作者による CMP 170HX 測定として2回目以降の restore が 33–51 ms から 7–13 ms になったと記載し、初回は速くならなかったとしています。同じ節は測定が変更作者によるもので、Strata 作者側には sm_80 カードがなく独自測定していないと明記しています。この値はその記載条件の報告値です。
+## ログと測定値
 
-根拠: `src/core/conversation_snapshot.cpp:137-190,292-349,455-506,581-617,662-759`; `src/core/conversation_state.cpp:551-619,696-708`; `src/program/generate.cpp:8917-8922`; `docs/DETAILS.md:1504-1518`。
+`STRATA_PARK_TRACE` が設定されている場合、かつ予算が正なら、slot 取得成功時に `strata parktrace: kv slot %zu MB tag %llu`、失敗時に `strata parktrace: kv slot: none (%s)` を stderr に出す。失敗理由は `budget`、`vram`、`cudaMalloc` など。予算が 0 の場合、この slot 結果ログは出ない。`STRATA_PARK_TRACE` 自体は値の内容でなく設定有無を見ており、空文字でも有効になる（`engine/src/core/conversation_snapshot.cpp:151, 259-262, 1091-1099`）。
+
+通常の slot 取得失敗に専用の警告や終了はなく、上述の stage / 同期保存へ移る。CUDA のコピー失敗は `conversation snapshot slot copy: ...` 等のエラー文字列として保存処理へ返り、async 背景コピーの失敗は `strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)` を stderr に記録する（同 `:477-479, 1061-1068`）。
+
+`docs/DETAILS.md:1797` は、64 MiB 単位、最大 N MiB、空き 1.5 GB 条件、2 回目以降の restore が 33–51 ms から 7–13 ms になった測定を記載している。これは資料記載の値であり、この調査では再測定していない。ソース実装では `N` を byte に換算して 64 MiB 単位で確保する一方、streamed K/V では device-resident 分だけを slot 対象にし、slot 取得失敗時には fallback するため、資料の「whole K/V」は全経路に当てはまる説明ではない（`engine/src/core/conversation_snapshot.cpp:143-149, 165-197, 466-494`; `engine/src/core/conversation_state.cpp:623-636`）。
 
 ## 根拠
 
-- 読み取りと byte 予算化: `src/core/conversation_snapshot.cpp:137-144`。
-- 予算判定、slot の再利用・新規確保、境界条件: `src/core/conversation_snapshot.cpp:159-190`。
-- 非同期機能の backend 条件と `STRATA_PARK_ASYNC` 判定: `src/core/conversation_snapshot.cpp:231-237`。
-- snapshot 保存・復元時の slot copy と fallback: `src/core/conversation_snapshot.cpp:292-349,455-506`。
-- park の開始・slot 取得失敗時の stage fallback: `src/core/conversation_snapshot.cpp:595-659`。
-- 非同期 copy の失敗ログ、slot の解放: `src/core/conversation_snapshot.cpp:581-588,662-759`。
-- serve loop の K/V 拡張時に slot を解放して再試行: `src/program/generate.cpp:8917-8922`。
-- 文書に記載された測定の範囲: `docs/DETAILS.md:1504-1518`。
+- `engine/src/core/conversation_snapshot.cpp:143-149` — 予算値の読み取り、`atoll` 変換、static cache。
+- `engine/src/core/conversation_snapshot.cpp:165-197, 237-244` — 予算・slot 確保条件、async の build guard と判定。
+- `engine/src/core/conversation_snapshot.cpp:466-494, 664-699, 1077-1141` — park save / restore、fallback、slot と stage の取得。
+- `engine/src/core/conversation_state.cpp:623-636, 682-699, 899-912` — 必要量算定、非同期 park の呼び出し・lifetime token、restore 呼び出し。
+- `engine/src/core/conversation_snapshot.cpp:1061-1068, 1213-1250` — 背景コピー失敗ログ、slot 解放と restore join。
+- `engine/src/program/generate.cpp:11656-11674, 19952-19958` — VRAM 不足時の解放・再試行と失敗時の出力。
+- `docs/DETAILS.md:1797` — Strata 資料に記載された測定値（本調査での再測定なし）。

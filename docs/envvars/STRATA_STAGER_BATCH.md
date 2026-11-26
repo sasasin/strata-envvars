@@ -1,46 +1,43 @@
 # `STRATA_STAGER_BATCH`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-prompt prefill の host-side stager が、1つの worker claim で処理する連続 expert copy job 数を指定します。job は layer の expert 順に並び、stager worker は claim した各 job の host buffer へのコピーを済ませてから ready にします。GGUF shard を直接読む `FileExpertSource` では、この複数 job が `copy_blobs()` にまとめて渡され、連続した読み取り要求をまとめる経路になります。変数は GPU の expert 選択数や stager ring の深さを直接設定するものではありません。
+CUDA/HIP 系の prompt prefill に使う stager worker が、一度に claim する連続 expert copy job 数を調整する。file-backed source の unpinned expert を扱う場合は、worker が複数 blob を `ExpertSource::copy_blobs` にまとめて渡せる。値は job の grouping を変えるもので、ルーティングが選んだ expert や job の並びをこの分岐自体が変えるわけではない（`engine/src/prefill/prefill.cpp:1207-1211,1233-1247,1253-1261,2547-2555`）。
 
 ## 値と判定
 
-値は `std::atoi()` で変換し、まず `1..32` に clamp します。文字列全体の妥当性は検査しません。未設定時は `files` の状態に応じて初期値が異なります。
+`Prefill::init` が stager を初めて作るときに `std::getenv` で読み、設定されていれば `std::atoi` の結果を 1〜32 に clamp する。文字列全体の数値検証はせず、`atoi` が読める先頭の整数部分を使う。したがって空文字、数値に変換できない先頭、`0`、負数は 1 になり、`1anything` は 1、`8tail` は 8、` 4` は 4 になる。`32` 以上は 32、`true` は 1 になる（`atoi` が 0 を返すため）。大文字小文字は意味を持たず、値を真偽値として比較しない。数値範囲外の文字列に対する `atoi` の結果は C/C++ の変換仕様上保証できないため、文書化できる範囲外である（`engine/src/prefill/prefill.cpp:2550-2552`）。
 
-| 状態 | `want` の値 | clamp 後 |
-|---|---:|---:|
-| 未設定、transient source profile (`files == true`) | 8 | 8 |
-| 未設定、それ以外 | 1 | 1 |
-| 設定あり | `atoi(value)` | `1..32` |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---:|---|---|
+| file-backed expert source がない（`files == false`） | 1 | `atoi` 結果を 1〜32 に clamp。例: `2`, `8tail`, `32`, `99`（32） | 個別の無効値はなく、空文字・`true`・`0`・`-4` はいずれも 1 に clamp |
+| file-backed expert source がある（`files == true`） | 8 | 同じく `atoi` 結果を 1〜32 に clamp。例: `1`, `8`, `32` | 個別の無効値はなく、空文字・`true`・`0`・`-4` はいずれも 1 に clamp |
 
-`atoi()` のため、空文字や数字に変換できない文字列は通常 `0` となり、最終的に `1` です。`"5tail"` は通常 `5`、負値は `1`、32 より大きい値は `32` になります。数値変換後にはさらに `min(batch, kRing)` が適用されます。したがって ring が 4 なら、設定値が 8 や 32 でも実効 batch は 4 です。数値変換の `int` 範囲外入力の結果は保証されません。
+設定が存在すれば、file-backed かどうかにかかわらずその値が未設定時の既定値に優先する。実際の batch は clamp 後に ring 深さ `kRing` 以下へさらに制限されるため、最終値は `min(clamp(atoi(value), 1, 32), kRing)`。`kRing` は既定 16 で、`STRATA_STAGER_RING` の設定があれば `atoi` 値を 2〜256 に clamp する。file-backed の場合は `STRATA_STAGER_RING` が未設定なら `4 * threads` が ring 深さになり、`STRATA_STAGER_THREADS` が未設定の既定 32 thread と組み合わさる場合でも batch 上限は 32 のままである（`engine/src/prefill/prefill.cpp:1127-1132,1156-1158,2545-2555`）。
 
 ## 有効になる条件
 
-- stager が使われる CUDA/HIP 系の prompt prefill 経路で有効です。通常の stager は、各 layer で pinned source ではない expert を host staging buffer にコピーしてから GPU へ転送します（`src/prefill/prefill.cpp:3691-3731`）。
-- 未設定時に 8 が選ばれる `files` profile は、source のどれかが `transient()` と答えた場合に候補になります。ただし `STRATA_STAGER_THREADS` が未設定なら、`STRATA_STAGER_SSD` または `cached_share(256)` の判定で RAM profile に切り替わることがあります。したがって「GGUF なら常に 8」ではありません（`src/prefill/prefill.cpp:1101-1129`）。
-- 明示設定値はこの profile 判定による batch の既定値を上書きします。`STRATA_STAGER_THREADS` は threads 数と profile 判定に関係しますが、明示された `STRATA_STAGER_BATCH` の値を別途上書きしません。
-- `src/prefill/prefill.cpp` に実装があり、通常の CMake 構成では `strata_prefill` に含まれます。SYCL 側の `sycl/src/prefill/prefill.cpp` にはこの変数の読み取りがありません。
+- `Prefill::init` の Metal build 分岐は Metal window setup を呼んで先に return するため、この stager setting path には到達しない。対象コードは CUDA/HIP 系実装内の prompt prefill path である（`engine/src/prefill/prefill.cpp:2443-2455,2518-2555`）。
+- stager が作成されるには `Prefill::init` が実行される必要がある。source の expert が unpinned で staging 対象になった場合に job が作られ、batch 設定が copy work に関係する。pinned または host cache 上の resident expert は job から外される経路がある（`engine/src/prefill/prefill.cpp:2523-2555,4692-4717,7020-7033`）。
+- file-backed の自動判定は source が `transient(l,e)` を一つでも返すかで決まる。`STRATA_STAGER_THREADS` が設定済みなら `STRATA_STAGER_SSD` による profile 選択分岐を通らない。これらは batch の明示設定を無効にしないが、unset 時の既定値 8/1 と ring 深さに影響する（`engine/src/prefill/prefill.cpp:2526-2546`）。
+- `STRATA_STAGER_RING` で ring が batch より浅くなれば、batch は ring 深さまで下がる。`STRATA_STAGER_BATCH` の値で ring 自体は変更されない（`engine/src/prefill/prefill.cpp:1156-1158,2550-2555`）。
 
 ## 実行時の詳細
 
-環境変数は `Prefill::init()` 内で `m.stager` を初めて作るときに読み、stager の `batch` メンバーに保存します。同じ `Prefill` instance の後続 init/chunk では stager を再作成しないため、環境を後から変更しても batch は更新されません（`src/prefill/prefill.cpp:1096-1133`）。
+読み取りは `m.stager` がまだないときだけ行われ、作られた stager に `batch` を保存する。既存 stager が再利用される `Prefill::init` では再読込されないため、読み取り後の環境変更はその stager に反映されない（`engine/src/prefill/prefill.cpp:2523-2555`）。
 
-worker は `claim(seen, batch, k)` で最大 `batch` 個の連続 job を一括 claim します。job のコピー先 ring buffer が前の DMA に使われている場合は、その DMA の発行と完了を待ってから次のコピーに進みます。claim 内の source-backed jobs はまとめて `ExpertSource::copy_blobs()` に渡され、stable pointer の jobs は worker が各 buffer に `memcpy()` します。完了後、claim した各 job を ready にします（`src/prefill/prefill.cpp:483-523,526-535`）。
+worker は `claim(seen, batch, k)` で最大 `batch` 件の隣接 job をまとめて claim し、各 job の ring buffer 利用可否を待つ。source 指定の job は `copy_blobs` にまとめて渡す。通常の `ExpertSource` 実装は各 blob を順に `copy_blob` する。file source でも direct-read が有効でない場合、または batch が 1 件以下なら同じ逐次 fallback を使う。`FileExpertSource` の direct-read が有効な場合は一括 read 経路があり、batch 件数はまとめられる要求数に関係する。source を介さない job は buffer へ blob を個別に `memcpy` するため、複数 claim しても複数 read 要求にはならない（`engine/src/prefill/prefill.cpp:1207-1248,1253-1261`; `engine/src/core/expert_source.cpp:1793-1797,3885-3915`）。
 
-標準 `ExpertSource::copy_blobs()` は各 blob を順にコピーします（`src/core/expert_source.cpp:1094-1098`）。`FileExpertSource` の direct-read 経路では、複数 blob が一回の `read_direct()` に渡されます。そこで失敗した場合は個別の `copy_from_files()` に fallback します（`src/core/expert_source.cpp:2497-2527`）。この batch の設定による専用ログはありません。source がコピーに失敗すると stager は `prefill: the expert source could not copy experts %d.. of layer %d` を stderr に出して abort します（`src/prefill/prefill.cpp:517-519`）。
+## ログと測定値
 
-`docs/DETAILS.md` は `STRATA_STAGER_THREADS` / `STRATA_STAGER_SSD` の profile と測定条件を記載していますが、`STRATA_STAGER_BATCH` 固有の性能測定値や既定値の説明は見つかりませんでした。そのため、この変数による速度向上の大きさは記載できません。
+この変数を読んだり batch 値を選んだりする際に専用のログは出ない。source の一括コピーが失敗した場合は stderr に `prefill: the expert source could not copy experts %d.. of layer %d` を出して `std::abort()` する（`engine/src/prefill/prefill.cpp:1244-1246`）。Strata の設計資料 `docs/DETAILS.md` にこの変数の記載はなく、batch の性能測定値もこの変数について確認できないため、効果の大きさは記載しない。
 
 ## 根拠
 
-- 読み取り、既定値、clamp、profile 条件: `src/prefill/prefill.cpp:1101-1133`
-- worker claim、コピー、ready 通知: `src/prefill/prefill.cpp:483-523,526-535`
-- prompt prefill の job 作成と stager 利用: `src/prefill/prefill.cpp:2343-2387,3691-3731`
-- file source の複数 blob 処理と fallback: `src/core/expert_source.cpp:2497-2527`
-- 標準 `copy_blobs()` の逐次処理: `src/core/expert_source.cpp:1094-1098`
-- build への組み込み: `CMakeLists.txt:589-595`
-- 関連する profile 説明と測定条件: `docs/DETAILS.md:1562`
+- `engine/src/prefill/prefill.cpp:1126-1132,1156-1158` — stager の ring / batch 上限と ring 設定。
+- `engine/src/prefill/prefill.cpp:1207-1248,1253-1261` — claim 単位、copy grouping、copy failure。
+- `engine/src/prefill/prefill.cpp:2443-2455,2518-2555` — backend 分岐、source 判定、thread/ring/batch 初期化。
+- `engine/src/prefill/prefill.cpp:4692-4717,7020-7033,8583-8602` — streamed / staged / layer-major での job 登録。
+- `engine/src/core/expert_source.cpp:1793-1797,3885-3915` — 基本の `copy_blobs` と file source の一括処理。

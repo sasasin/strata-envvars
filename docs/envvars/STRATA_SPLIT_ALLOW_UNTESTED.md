@@ -1,45 +1,42 @@
 # `STRATA_SPLIT_ALLOW_UNTESTED`
 
-調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata の all-cards split engine を選ぶとき、通常は実行実績がないカード数・カード architecture・context を理由に拒否する判定を通過させます。変数は「未テスト」判定だけを許可し、split engine を必ず起動するスイッチではありません。CLI の `strata split-engine apply` と Terminal の launch で読み取られます。
+Terminal の all-cards split engine 判定で、通常は実行実績が条件に足りず拒否されるカード数、GPU アーキテクチャ、context 上限を通過させる。`strata launch` と `strata split-engine apply` が環境値を文字列 `"1"` と比較し、その真偽値を判定関数へ渡す。これは split engine を有効化するスイッチではなく、他の適合条件も緩和しない（`terminal/strata_cli/launch/runner.py:2241-2266`、`terminal/strata_cli/split_cmd.py:41-43`、`terminal/strata_control/split_engine.py:191-235`）。
 
 ## 値と判定
 
-3つの読み取り箇所すべてで、環境変数の文字列全体が `"1"` と等しい場合だけ `allow_untested=True` になります。数値変換や trim はありません。
+| 実行経路 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| `strata launch` の事前判定と起動時判定、`strata split-engine apply` | `os.environ.get(...)` は `None` となり `False` | 文字列全体が厳密に `1` | 空文字、`0`、`true` / `TRUE`、`01`、`1 `、` 1` など。数値変換・trim・大文字小文字変換はしない |
 
-| 環境値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| `1` | 有効 |
-| `0`、`true`、`01`、`1 `、その他 | 無効 |
-
-CLI 引数や設定ファイルの値がこの値を上書きする仕組みはありません。`--split-engine` / run config の `split_engine` と `STRATA_SPLIT_ENGINE` は起動モードを別に選び、`STRATA_SPLIT_ENGINE` が空でないときは設定値より優先されます。この文書の変数はそのモードを変更しません。
+Python の `os.environ.get("STRATA_SPLIT_ALLOW_UNTESTED") == "1"` の結果だけを使うため、未設定と空文字はともに許可しない。値が `"1"` でも、判定が有効になっている経路でのみ影響する（`terminal/strata_cli/launch/runner.py:2060,2266`、`terminal/strata_cli/split_cmd.py:43`）。
 
 ## 有効になる条件
 
-通常は、カード数が記録済みの実行数でない、カード architecture がテスト済みでない、または context が 131072 を超えると、判定を拒否します。この変数が正確に `1` なら、該当条件を拒否理由にせず、成功時の決定に未テスト項目を記録します。複数の未テスト条件があれば各項目が記録されます。
-
-許可されない条件は引き続き拒否されます。たとえば Linux 以外、カードが2～4枚でない、ベンダーやカード型が混在、AMD のビルド対象外 architecture、未対応の expert/model shape や tensor type、VRAM/RAM 不足、engine binary・draft layer・vocabulary file の不足、または他の起動条件不成立は、この変数では解消されません。Terminal の Auto mode にある追加ゲートも残ります。AMD の未実行 architecture は `--split-engine on` のときに別途許可されますが、この変数だけで同じ扱いにはなりません。
+- split engine のモードが `off` でないこと。モードは `STRATA_SPLIT_ENGINE` が run config の `split_engine` より優先し、CLI の `--split-engine` は run config を設定する。`off` なら対象変数を判定に使わず、`auto` / `on` で適合判定に進む（`terminal/strata_control/split_engine.py:435-448,522-526`）。
+- 実行環境は Linux、または Windows 上の AMD HIP であること。カードは2枚以上かつ上限以下で、同一 vendor・同一モデル名・同一 VRAM 容量などの条件を満たす必要がある。古い NVIDIA 世代やビルド対象外の AMD アーキテクチャも許可されない（`terminal/strata_control/split_engine.py:199-215`）。
+- `"1"` は、実績のないカード数、実績一覧にないアーキテクチャ、テスト済み上限を超えた context について拒否理由を `untested` の注記に変える。モデルの専門家テンソル形式・形状、VRAM/RAM の必要量など別の不適合理由は残る（`terminal/strata_control/split_engine.py:216-264`）。
+- `auto` には追加ゲートがある。AMD は gfx1201・4枚・許可された expert type の組み合わせだけが自動対象で、NVIDIA は drafting が Auto の場合 compute capability 8.6 または 12.0 のカードだけが対象。この環境変数はこれらの自動選択条件を広げない（`terminal/strata_control/split_engine.py:50-60,456-469`）。
+- `--split-engine on` の AMD 判定は `allow_untested` を内部で真にするため、同じ未テスト条件の許可にこの環境変数は不要。ただし AMD のビルド対象アーキテクチャ条件など、別のゲートは残る（`terminal/strata_control/split_engine.py:602-604`）。
+- 許可された構成でも all-cards engine の実行ファイルが見つからない、draft layer / `draft_vocab_en.bin` がない、または他のモデル条件に合わない場合は起動しない（`terminal/strata_control/split_engine.py:607-635`、`terminal/strata_cli/launch/runner.py:2250-2259`）。
 
 ## 実行時の詳細
 
-環境値は各呼び出し時に Python の `os.environ.get` から読みます。プロセス中に環境を書き換えた場合、まだ呼ばれていない読み取りには新しい値が使われます。Terminal runner の `split_expected()` は結果を runner インスタンス内に cache するため、その事前判定を再利用する箇所では後の環境変更は反映されません。一方、設定を適用する `apply_split_engine()` は別途その時点の値を読みます。プロセス起動時に一度だけ固定する cache はありません。
+`strata launch` は `split_expected()` で Auto の drafting 計画にも判定結果を使い、初回の結果を Launcher インスタンスの `_split_expected` に保存する。ここで環境変数を読むのは cache miss 時の一度で、その後同じ Launcher 内での環境変更はこの事前判定に反映されない。一方、起動設定を書き立てる `apply_split_engine()` は別に環境値を読み直して `apply_to_config()` に渡す（`terminal/strata_cli/launch/runner.py:2016-2018,2033-2064,2070-2075,2241-2266`）。
 
-- CLI の `strata split-engine apply --config ...` は判定を行い、split を選べた場合だけ `--out` に変換後の config を書きます。human 出力では判定行を表示し、通常の拒否は `Using the normal layer split: ...` の形式です。判定自体が通常の拒否を返してもこのサブコマンドは終了コード 0 です。
-- Terminal launch は、判定に成功すると all-cards split 用 config に切り替え、`Using the all-cards split engine on N cards (...: not tested).` のように未テスト項目を含む行を通知します。Auto で拒否された場合は通常その理由を黙って通常の layer split にします。明示的な `on` では拒否理由を一行で通知します。
-- `apply_to_config()` は判定を通ると config を split 用に書き換えます。例外時は元の config に戻し、launch は通常の layer split を使います。
+判定では許可された未テスト条件を `Decision.untested` に記録する。条件を満たせば run config を all-cards split engine 用に書き換え、起動時に別の環境変数として転送する処理は確認できない（`terminal/strata_control/split_engine.py:123-140,267-290,635-639`）。Auto で拒否なら通常の layer split に静かに戻り、`on` なら理由の行を出す。起動時の例外も launch 自体を止めず通常の layer split に戻す（`terminal/strata_control/split_engine.py:516-530`、`terminal/strata_cli/launch/runner.py:2267-2281`）。
+
+`strata split-engine apply` はコマンド実行時に環境値を読み、コピーした config に判定を適用する。成功時は `--out` 指定があれば変換後 config を書き、human 出力または JSON に `split`、`line`、`warn`、`reasons` などを返す。config の読み取り失敗は stderr（または JSON）のエラーで終了コード 5 になる（`terminal/strata_cli/split_cmd.py:25-58`）。
+
+## ログと測定値
+
+未テスト条件を通過して split が選ばれると、判定行は例えば `Using the all-cards split engine on 3 cards (3 cards: not tested).` の形で未テスト理由を含む。Terminal launch はこの行に ` Turn it off with: strata launch --split-engine off.` を追加する。通常の拒否は Auto では無言、`on` では通常 layer split にする理由を表示する（`terminal/strata_control/split_engine.py:135-140,527-528`、`terminal/strata_cli/launch/runner.py:2277-2281`）。この変数単独の性能測定値は Strata の資料に見当たらない。
 
 ## 根拠
 
-- 全参照と完全一致判定: `strata_cli/split_cmd.py:43`, `strata_cli/launch/runner.py:1569-1572,1721`。
-- CLI の config 出力・表示・終了コード: `strata_cli/split_cmd.py:25-33,41-59`。
-- runner の事前判定 cache と適用時の読み直し: `strata_cli/launch/runner.py:1544-1575,1696-1736`。
-- 判定引数の伝播と例外時の復元: `strata_control/split_engine.py:476-489,492-565,631-656`。
-- 未テスト項目だけを許可し、成功 Decision に記録する箇所: `strata_control/split_engine.py:190-261`。
-- モードの既定値と `STRATA_SPLIT_ENGINE` / run config の優先順位: `strata_control/split_engine.py:395-409`。
-- 対象条件、Linux 限定と他の拒否条件: `strata_control/split_engine.py:190-261,497-565`。
-- 通常時と明示 `on` 時の適用・拒否ログの扱い: `strata_control/split_engine.py:476-489,631-656`; Terminal 側通知: `strata_cli/launch/runner.py:1722-1736`。
+- 全参照と環境値の受け渡し: `terminal/strata_cli/split_cmd.py:41-43`、`terminal/strata_cli/launch/runner.py:2033-2064,2241-2266`
+- 未テスト判定と他の条件: `terminal/strata_control/split_engine.py:191-264,602-614`
+- モード・config 書き換え・表示: `terminal/strata_control/split_engine.py:435-448,516-530,635-639`、`terminal/strata_cli/launch/runner.py:2267-2281`

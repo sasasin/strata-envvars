@@ -1,67 +1,59 @@
 # `--memory-limit-mib`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数 parser） |
+| コマンド | `strata`（推論エンジン） |
 | オプション | `--memory-limit-mib` |
 | 別名 | なし |
-| 値 | MiB 単位の 0 以上の整数。最大値は `INT64_MAX / 1,048,576`（8,796,093,022,207 MiB） |
+| 値 | 非負の10進整数。MiB 単位。最大 `INT64_MAX / 1,048,576` |
 
 ## 役割
 
-コンテナや cgroup の実際の RAM 上限をプロセスから検出できない場合に、エンジンが RAM ガードで用いる総量上限を指定します。RAM ガードは `--serve` の会話キャッシュ退避（parking）と session の保存・復元で、処理後にも残す空き RAM の判定に使われます。モデル本体や通常の生成用メモリをこの値で予約・制限する設定ではありません。parser は `--serve` なしでも値を受け取りますが、会話キャッシュと session 操作は serve 経路です。
+コンテナや cgroup の実メモリ上限をエンジンから検出できない場合に、その総 RAM 上限を MiB で指定します。値は起動時に RAM ガードへ登録され、`--serve` の会話 park と session の保存・復元で、割り当て可能な空き RAM を見積もる際に使われます。プロセス全体の割り当てを強制的に制限する機能ではありません（`engine/src/program/generate.cpp:1107-1109, 4730-4743`）。
 
 ## 使い方
 
 ```sh
-strata --serve --memory-limit-mib 102400
+strata --pack ./model.strata --serve --memory-limit-mib 102400
 ```
 
-環境変数 `STRATA_MEMORY_LIMIT_MIB` でも同じ上限を指定できます。環境変数の詳細は [`STRATA_MEMORY_LIMIT_MIB`](../../../../docs/STRATA_MEMORY_LIMIT_MIB.md) を参照してください。
+例では、エンジンから見えないコンテナ上限を 100 GiB（102400 MiB）として RAM ガードに知らせます。`--memory-limit-mib` 自体は `--serve` の有無にかかわらず parser が受理されますが、主な利用先は serve の会話 park と session 操作です（`engine/src/program/generate.cpp:1299-1302, 4084-4107`）。
 
 ## 値と既定値
 
-- 値は符号なしの十進整数として読み取られます。負数、空値、数字以外を含む値、整数変換の overflow、上限超過は拒否されます。0 は上限なしを意味します。
-- CLI で省略したときは `STRATA_MEMORY_LIMIT_MIB` を読みます。環境変数も未設定または空なら上限なし（0）です。CLI の値は環境変数より優先し、CLI に `0` を渡した場合も環境変数を無効化します。
-- 同じ CLI オプションを複数回指定した場合、parser のループで後から読んだ値が設定を置き換えます。
-- 上限の最大値は `INT64_MAX / (1024 * 1024)` MiB で、MiB から byte への変換が符号付き整数の範囲を超えない値です。
+- 省略時は `STRATA_MEMORY_LIMIT_MIB` を読みます。環境変数も未設定または空なら、オペレーター指定上限はありません（値 `0`）。フラグに値を指定した場合は環境変数より優先されます（`engine/src/program/generate.cpp:1107-1109, 4729-4742`）。
+- 明示した `0` は上限なしを意味し、環境変数の値も使いません。OS から取得する MemAvailable や cgroup の制限は引き続きガードに使われます（`engine/src/program/generate.cpp:4730-4742`; `engine/src/core/conversation_memory.cpp:311-325, 411-437`）。
+- CLI 値は `std::from_chars` で10進整数として全体を解析し、負数・小数・不正な文字列・範囲超過は拒否します。`--memory-limit-mib` の後に値がなければ parser の共通処理がエラーにします。同じフラグを複数回指定した場合は、引数を順に解析して後の有効値が設定を置き換えます（`engine/src/program/generate.cpp:3842-3847, 4084-4107`）。
+- 環境変数も非負の10進整数で同じ上限まで許容されます。不正値では診断を stderr に出し、終了コード 2 で起動を中止します（`engine/src/program/generate.cpp:4731-4739`）。
 
 ## 実行時の動作
 
-エンジンは起動時に上限を byte に変換して RAM サンプラーへ一度設定します。空き RAM の見積りは `MemAvailable`、認識できる cgroup の `memory.max` / `memory.high`（v2）または `memory.limit_in_bytes`（v1）の各残量、および明示した上限から計算した残量のうち最小値です。明示上限の残量は、トップ可視 cgroup の使用量（または cgroup が使えない場合は `MemTotal - MemAvailable`）から、再利用可能と判定された clean inactive file cache を差し引いて求めます。設定値は予約ではなく、サンプル後に他プロセスが RAM を使う可能性があります。
+起動時に MiB 値をバイトへ変換して RAM ガードのプロセス内設定に保存します。ガードが算出する使用可能量は、MemAvailable（Windows では物理メモリの利用可能量など）、可視範囲の cgroup 制限内の余裕、そしてこのオプションで指定した上限から現在使用量を引いた余裕のうち、最も小さい値です。オペレーター上限の現在使用量は、見えるトップ cgroup の値を使い、cgroup 情報が得られない場合は MemTotal と MemAvailable の差から見積もります（`engine/include/strata/core/conversation_memory.hpp:11-20`; `engine/src/core/conversation_memory.cpp:289-326, 378-408, 411-437`）。
 
-この空き RAM に対して `--conversation-cache-min-free-mib` の床を残せるか判定します（既定 2560 MiB）。会話スナップショットが床込みで収まらないとき、serve は古い退避済み会話を順に追い出して再確認し、それでも不足なら新しい parking を見送ります。session の保存・復元でも同じ RAM サンプルと床を使い、必要量を加えて不足する場合は操作を拒否します。session 保存で `--session-save-reclaim` を指定すると、RAM 再確認前に保持キャッシュ等を解放する処理があります。
+会話の park、session の保存、session の読み込みでは、必要 RAM を上記の利用可能量から確保したうえで、`--conversation-cache-min-free-mib` の空き RAM フロアを残せるか確認します。足りない、または RAM 情報が不明なら該当の park/save/restore は拒否されます。park では条件により park pool や空き heap の回収、保存済み会話の eviction を試みます（`engine/src/program/generate.cpp:14387-14425, 18662-18690, 18734-18757`; `engine/include/strata/core/conversation_memory.hpp:143-146`）。
 
 ## 適用条件と副作用
 
-- `--serve` 起動時は RAM ガードの診断を stderr に出します。serve 以外では、正の上限を指定した場合に診断を出します。上限 0 かつ serve 以外では初期サンプルの診断は出ません。
-- Windows は `GlobalMemoryStatusEx` から物理 RAM と page file の空きの小さい方を使い、明示上限を重ねます。Linux は `/proc/meminfo` と可視 cgroup 階層を参照します。cgroup の使用量・上限情報が読み取れず、明示上限がある場合、見積りは不明扱いとなり RAM ガードは fail-closed になります。上限なしの場合は cgroup 条件を捨てて `MemAvailable` にフォールバックし、一度 stderr に警告します。
-- それ以外の OS ではこのサンプラーは値を返さない実装です。そこでの RAM ガード成功は確認できません。
-- 明示上限が実環境の制限より大きい場合も、実 cgroup 制限と `MemAvailable` の方が小さければそちらが判定を支配します。逆に実上限が見えず指定値が過大なら、見積りも実際より大きくなり得るため、運用者がコンテナの上限を正しく指定する必要があります。
+- `--serve` の起動時は、指定値が 0 または未指定でも RAM ガードの状態を診断表示します。正の上限を指定した場合は `--serve` 以外の実行でも起動時診断を表示します。診断には推定上限・現在量・利用可能量・空きフロアなどが含まれます（`engine/src/program/generate.cpp:4742-4758`）。
+- RAM 情報を読めない場合、起動時に park と session save/restore を拒否する旨を stderr に出します。これはこの箇所では起動自体を中止しません。操作時には RAM admission が失敗し、park はスキップ、session 操作は拒否されます（`engine/src/program/generate.cpp:4745-4748, 14387-14425, 18677-18690, 18734-18757`）。
+- cgroup のメモリ情報が読めない場合、オペレーター上限が設定されていなければ MemAvailable へフォールバックして一度警告します。オペレーター上限があるのに使用量を判定できない場合は RAM サンプルを不明として扱います（`engine/src/core/conversation_memory.cpp:389-397`）。
+- この値はメモリ予約やプロセスのハード制限ではありません。サンプル後に他プロセスが RAM を使う可能性もあり、ガードは park/save/restore の可否判定に利用可能量と空きフロアを照合します（`engine/include/strata/core/conversation_memory.hpp:31-34, 143-146`）。
 
 ## 出力とエラー
 
-- CLI の値がない場合は `--memory-limit-mib needs a value` を stderr に出し、終了コード 2 で終了します。
-- CLI 値が負数・不正形式・範囲外の場合は `--memory-limit-mib needs a nonnegative integer within range` を stderr に出し、終了コード 2 で終了します。
-- CLI を省略し、環境変数が不正なら `STRATA_MEMORY_LIMIT_MIB needs a nonnegative integer within range ...` を stderr に出し、終了コード 2 で終了します。ただし CLI の値がある場合は環境変数を検証せず、CLI 値が優先されます。
-- serve 起動時に RAM 情報を読めないと `parking and session save/restore are refused` と stderr に表示します。個々の parking は見送りとなり、session 保存・復元は不足理由を伴って拒否されます。診断出力自体は起動時サンプルの失敗表示であり、serve プロセス全体をその場で終了させる分岐ではありません。
+- CLI 値が欠落した場合は `<option> needs a value`、形式・負数・範囲が不正なら `--memory-limit-mib needs a nonnegative integer within range` を stderr に出して終了コード 2 になります（`engine/src/program/generate.cpp:3844-3846, 4091-4097`）。
+- 環境変数が不正な場合は `STRATA_MEMORY_LIMIT_MIB needs a nonnegative integer within range` と値を stderr に出し、終了コード 2 で終了します（`engine/src/program/generate.cpp:4731-4739`）。
+- serve または正の上限指定時、RAM 情報が得られれば `strata generate: memory guard: limit ...` の診断を stderr に出します。取得できない場合の警告も stderr です（`engine/src/program/generate.cpp:4743-4758`）。
 
 ## 根拠
 
-- 索引上の階層と option scope: `docs/cli/README.md:1128-1135,1201`（調査対象 checkout 側の相対位置）。
-- parser 値型・既定値: `src/program/generate.cpp:741-745`。
-- help の serve 適用説明: `src/program/generate.cpp:895-900`。
-- 値の取得、整数形式・範囲検証、CLI 値への格納: `src/program/generate.cpp:2418-2421,2641-2661`。
-- 環境変数の fallback、CLI 優先、byte 変換、初期診断と不明時メッセージ: `src/program/generate.cpp:2924-2953`。
-- 空き RAM 推定、cgroup と明示上限の合成、fail-closed/fallback、Windows/Linux の取得方法: `include/strata/core/conversation_memory.hpp:10-30,55-65`、`src/core/conversation_memory.cpp:203-238,258-291`。
-- 自動会話キャッシュ予算での RAM サンプル利用: `src/program/generate.cpp:9373-9389`、予算計算は `include/strata/core/conversation_memory.hpp:67-77`。
-- parking の再試行、古い会話の eviction、見送り出力: `src/program/generate.cpp:9570-9599,9615-9620`。
-- session 保存・復元の RAM gate とエラー理由: `src/program/generate.cpp:12122-12170,12209-12222`。
-- 環境変数文書: `docs/STRATA_MEMORY_LIMIT_MIB.md`（環境変数の仕様参照用。上記の CLI 効果は parser と使用箇所から確認）。
+- parser 値の既定値・CLI help 表記: `engine/src/program/generate.cpp:1107-1109, 1299-1302`。
+- 値の解析・validation・代入: `engine/src/program/generate.cpp:3842-3847, 4084-4107`。
+- 環境変数の優先順位・登録・起動時診断: `engine/src/program/generate.cpp:4729-4758`。
+- 利用可能 RAM の定義とオペレーター上限の合成: `engine/include/strata/core/conversation_memory.hpp:11-20`; `engine/src/core/conversation_memory.cpp:289-326, 378-408, 411-437`。
+- park/save/restore の admission と拒否経路: `engine/src/program/generate.cpp:14387-14425, 18662-18690, 18734-18757`; `engine/include/strata/core/conversation_memory.hpp:143-146`。
 
-## 調査範囲
-
-調査対象 checkout は commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5` で、`git status --short --branch` は `## main...origin/main` でした。対象 parser、RAM sampler、parking と session の使用箇所をソースで確認しました。既存バイナリの `--help`、Release 配布物、全 OS/backend の実機動作は確認していません。
+調査範囲は上記 revision の Strata ソースです。同一 revision の CLI help バイナリは実行しておらず、help 表記はソース内の usage 定義と照合しました。

@@ -1,60 +1,61 @@
-# `--expert-cache-per-layer`
+# `strata generate --expert-cache-per-layer`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（ネイティブ推論エンジン。Terminal CLI とは別プログラム） |
+| コマンド | `strata generate` |
 | オプション | `--expert-cache-per-layer` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ |
+| 値 | 値を取らない真偽フラグ |
 
 ## 役割
 
-expert cache の空き slot を全 layer 共有の到着順で割り当てる代わりに、layer ごとの固定範囲から割り当てます。これにより一部の layer が先に cache 全体を使い切ることを避けます。既定では無効です（`src/program/generate.cpp:564-569`; `include/strata/core/expert_cache.hpp:167-183`）。
+GPU expert cache の空きスロットを全層で共有せず、層ごとの範囲に分けて割り当てます。既定の共有方式では、実行中に先に到着した層・expert の組がキャッシュを占めることがあります。このフラグを付けると各層が自分の範囲からだけスロットを取得するため、ある層が他層のスロットを使い切らなくなります。キャッシュの退去（eviction）は追加されず、各層の枠が埋まった後の未常駐 expert はキャッシュに入りません（`engine/src/core/expert_cache.cpp:785-803`、`engine/include/strata/core/expert_cache.hpp:181-185`）。
 
 ## 使い方
 
 ```sh
-strata generate --pack /path/to/model.pack --tokens "1,2,3" \
-  --expert-cache 256 --expert-cache-per-layer
+# pack の expert cache を要求し、層別に割り当てて生成する
+strata generate --pack ./model-pack --tokens "1,2,3" --expert-cache 256 --expert-cache-per-layer
 ```
 
-`--expert-cache-per-layer` は値なしで指定します。`--expert-cache` は cache 容量を有効化する別オプションです。エンジンの usage は `strata generate --pack DIR --tokens ...` 形式です（`src/program/generate.cpp:806-812`）。
+`strata generate` は `--pack DIR` と `--tokens LIST`（または `--tokens-file`）を受け付けます（`engine/src/program/generate.cpp:1208-1214`）。このフラグ自体には値を続けません。
 
 ## 値と既定値
 
-parser はフラグを受け取ると内部値を `true` にします。省略時の初期値は `false` で、個別の値検査はありません。同じフラグを複数回指定しても `true` のままです（`src/program/generate.cpp:569,2742`）。値を続けて指定する構文はなく、後続の値は別引数として処理されます。
-
-このフラグだけでは cache を有効にしません。`expert_cache` が正のときだけ cache 初期化後に per-layer admission が設定されます（`src/program/generate.cpp:6415-6419`）。
+オプションは値なしで `expert_cache_per_layer` を `true` にします。指定しなければ `false` です（`engine/src/program/generate.cpp:909-914,4203-4205`）。このフラグ自体に数値範囲の検証はありません。重ねて指定しても同じ真偽値を設定するだけです。別の値を続けるとその値は独立した引数として扱われ、認識されなければ usage を stderr に出して終了コード `2` で失敗します（`engine/src/program/generate.cpp:4268-4274`）。
 
 ## 実行時の動作
 
-cache の slot 数を `S`、model の layer 数を `L` とすると、各 layer の基本 quota は `q = floor(S/L)` です。layer `l` は `[l*q, (l+1)*q)` の範囲を使い、余りは最後の layer が受け取ります。layer 内で未登録 expert が初めて要求されたとき、その layer の次の空き slot に登録します。同じ expert の再要求は既存 slot を返します。範囲が満杯なら、その layer から新たな expert は cache に入らず、eviction も行われません（`src/core/expert_cache.cpp:627-660`; `include/strata/core/expert_cache.hpp:178-183`）。
+この設定だけではキャッシュ容量を作りません。キャッシュのスロット数が正のときに cache が開かれ、設定が `ExpertCache` に渡されます（CUDA/HIP系: `engine/src/program/generate.cpp:9717-9722`、SYCL: `engine/sycl/src/program/generate.cpp:5228-5230`）。`--expert-cache` の既定値は `0`（無効）です（`engine/src/program/generate.cpp:895-904`）。ただし `--expert-profile` を指定して `--expert-cache` を `0` のままにした場合は、自動サイズ指定 `-1` に変換されるため、プロファイルとともにこのフラグが効くことがあります（`engine/src/program/generate.cpp:6746-6756`）。
 
-expert profile がある場合は profile 順に事前充填します。per-layer 時は profile 全体を走査し、満杯の layer の項目を飛ばして他 layer の quota も満たす処理です（`src/program/generate.cpp:6441-6454`）。
+キャッシュが有効なとき、層 `l` のスロット範囲は `[l*q, (l+1)*q)`（最後の層は余りも使用）です。`q` は総スロット数を層数で割った整数です。総スロット数が層数より少ないと `q=0` となり、最後の層だけが余りのスロットを使います。プロファイルなしの実行では、expert が初めて要求された時に、その層の枠に空きがあれば expert を読み込んで GPU で計算し、枠が満杯なら CPU 側の miss として扱います。通常の共有方式と同様、キャッシュからの退去はありません（`engine/src/core/expert_cache.cpp:769-778,785-803`、`engine/src/core/expert_source.cpp:5990-6019`）。
 
-native pack では slot のサイズが layer ごとに異なるため、`--expert-cache N` の予算は引き続き最大 blob `N` 個分を基準にします。per-layer 指定時は GPU 空き容量と `--vram-reserve-mib` を差し引いた予算内で全 layer に同数の slot が入る quota を計算し、各 layer 自身の blob サイズで slot を構成します。従って実 slot 数は `N` と異なり、空き VRAM や layer 数により要求より小さくなります（`src/program/generate.cpp:6222-6253`）。native pack 以外ではこの native 専用のサイズ再計算分岐は通らず、cache の既存 slot 数を layer 範囲に分けます。
+`--expert-profile` を併用した場合は、プロファイルの順位に従って起動時に各層の枠を埋めます。層別モードではプロファイル全体を走査し、枠が埋まった層の項目だけを飛ばして別の層への充填を続けます（`engine/src/program/generate.cpp:9758-9766,9786-9805`）。
+
+native pack で `--expert-cache N` が正数の場合は、層ごとの blob サイズに合わせたスロット列も組み立てます。要求予算は N 個の最大 blob 相当で、VRAM の空きから reserve を引いた容量との小さい方を上限とし、全層に同じ個数 `q` を割り当てられる範囲でスロット数を再計算します。`q` が正なら実際のスロット数は `q × 層数`（`q` は expert 数を上限とする）になります。この調整内容は stderr に出力されます。`q=0` の場合は層別サイズのスロット列を作らず、共通の uniform slot 経路に進みます（CUDA/HIP系: `engine/src/program/generate.cpp:9438-9469,9655-9657`、SYCL: `engine/sycl/src/program/generate.cpp:4987-5025`）。この経路に入らない pack では、層別 admission は適用されますが、この native pack 向けのサイズ再計算は行われません。
+
+GPU cache hit 経路は expert pool と組み合わせて初期化され、`--no-pool` の場合は hit callback が無効になります。その場合、このフラグによる層別 admission を生成時の GPU hit に利用する経路はありません（`engine/src/program/generate.cpp:10389-10428,10479-10484`）。
 
 ## 適用条件と副作用
 
-- 効果があるのは GPU expert cache が実際に有効なときです。`--expert-cache` が省略され、profile もなく初期値 `0` のままの場合は cache が作られず、このフラグによる admission 設定・表示は行われません。profile があると `--expert-cache 0` は自動サイズ扱いになり得るため、最終的に cache が正の slot 数で有効になった場合に適用されます（初期値: `src/program/generate.cpp:550-558`; cache 有効条件: `src/program/generate.cpp:6415-6419`）。
-- slot の割当範囲を分割するため、均等割り切れない場合でも最後の layer が余りを保持します。特定 layer の需要が quota を超えた場合、他 layer に空きがあってもその空きを使えず、超過 expert は cache に入りません（`src/core/expert_cache.cpp:629-655`）。
-- eviction は追加されません。profile がない場合は実行中に到着した expert で各 layer の枠が埋まります。profile がある場合は profile で選ばれた expert が優先的に事前登録されます（`src/program/generate.cpp:6435-6451`; `src/core/expert_cache.cpp:647-660`）。
-- cache 内の expert は GPU で計算されるため、CPU 計算とは浮動小数点の丸め順序が異なり、出力がわずかに異なる場合があるとエンジンは stderr に案内します。この注意は per-layer フラグ固有ではなく、cache を有効にした場合のものです（`src/program/generate.cpp:6420-6429`）。
+- 少なくとも一つの GPU expert cache スロットが作られる経路で効果があります。スロット数が `0` なら cache は開かれず、このフラグだけでは GPU cache hit は有効になりません（`engine/src/program/generate.cpp:895-904,9717-9722,10479-10484`）。
+- 空きスロットを層別に固定するため、ある層の未使用枠を別の層が借りることはありません。最後の層には割り算の余りが割り当てられます（`engine/src/core/expert_cache.cpp:771-778`）。
+- GPU cache の確保・初期化は VRAM を使用します。cache open が失敗し、自動サイズ縮小でも開けない場合はエラーを stderr に出して終了コード `1` で終了します（`engine/src/program/generate.cpp:9649-9683`）。
+- CUDA/HIP系とSYCLの parser・cache 設定箇所は確認しました。特定のGPU、driver、buildで利用可能かはそれらの実行環境に依存し、このソース調査だけでは判定できません。
 
 ## 出力とエラー
 
-cache が有効なら stderr に cache の slot 数・VRAM 使用量を出力し、このフラグが有効な場合は per-layer policy と layer 0 の slot 範囲も表示します（`src/program/generate.cpp:6415-6434`）。このフラグ固有の validation error はありません。未知の引数は `unknown argument` と usage を stderr に出して終了コード `2` になります（`src/program/generate.cpp:2787-2792`）。cache の確保に失敗した場合の診断・縮小処理は一般の expert-cache 初期化経路に属し、本オプション単独の検証エラーではありません（`src/program/generate.cpp:6367-6413`）。
+キャッシュが開かれると、stderr にスロット数・VRAM使用量と admission policy が表示され、フラグ指定時は層別スロット範囲の情報も表示されます（`engine/src/program/generate.cpp:9717-9741`、SYCL: `engine/sycl/src/program/generate.cpp:5236-5248`）。cache の確保失敗はエラー文字列を stderr に出し、終了コード `1` になります。フラグ固有の値エラーはありません（`engine/src/program/generate.cpp:9659-9683`）。
 
 ## 根拠
 
-- 索引との照合（文書リポジトリ）: `docs/cli/README.md:1128-1178`
-- 値なし parser と既定値: `src/program/generate.cpp:564-569,2742`
-- per-layer slot 範囲、quota、eviction なしの admission: `include/strata/core/expert_cache.hpp:178-186`; `src/core/expert_cache.cpp:627-660`
-- native pack の予算・layer 別 blob サイズによる再計算: `src/program/generate.cpp:6222-6253`
-- cache 有効時の設定、警告、policy 表示、profile 事前充填: `src/program/generate.cpp:6415-6454`
-- unknown argument の失敗経路: `src/program/generate.cpp:2787-2792`
-
-調査範囲は上記 commit の checkout 内ソースです。Release 配布バイナリや実機上の backend ごとの挙動は確認していません。性能値は本調査では測定していません。
+- `engine/src/program/generate.cpp:909-914,4203-4205` — フラグの既定値と parser 登録。
+- `engine/src/program/generate.cpp:1208-1214,4268-4274` — コマンド構文と未知引数の失敗経路。
+- `engine/src/program/generate.cpp:6746-6756,9438-9469,9717-9741,9758-9805` — profile 時の既定 cache sizing、native pack の層別サイズ調整、cache 設定・ログ、profile 充填。
+- `engine/sycl/src/program/generate.cpp:2166-2169,4987-5025,5228-5248` — SYCL parser、native pack の層別サイズ調整、cache 設定・ログ。
+- `engine/src/core/expert_cache.cpp:769-803`、`engine/include/strata/core/expert_cache.hpp:181-188` — 層ごとのスロット範囲と admission 規則。
+- `engine/src/core/expert_source.cpp:5990-6019`、`engine/src/program/generate.cpp:10389-10428,10479-10484` — cache miss の admission・fill と GPU hit 経路の有効条件。
+- `engine/src/program/generate.cpp:9649-9683` — cache open の失敗・縮小再試行・終了経路。

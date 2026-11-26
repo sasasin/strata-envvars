@@ -1,46 +1,47 @@
 # `STRATA_TOPK_CAPACITY_GUARD`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-CUDA の QSA block top-k 選択で、prefill の active block 数を使う dispatch を無効にし、capacity（`max_blocks`）を使う既存の dispatch に戻します。主な影響先は Turing（compute capability 7.5）上の prefill です。選択 kernel の dispatch 条件を変えるフックであり、スコアや top-k の計算式を直接変えるコードではありません。
+CUDA と SYCL の `qsa_block_topk` で、prompt など呼び出し側が渡す実 active-block 数を使った top-k dispatch を抑え、容量 (`max_blocks`) に基づく dispatch に戻すための切り替えです。環境変数を設定すると、active-block 数をもとにした `counted` 判定が必ず false になり、`reach` は `max_blocks` になります。したがって、入力上限に合わせて選ばれる register / wide / reference kernel の分岐が変わることがあります。`qsa_block_topk` は選択 ID を書き出す関数で、この変数はその kernel 選択に作用します（CUDA: `engine/src/kernels/cuda/qsa_select.cu:3016-3021, 3042-3059, 3071-3105`; SYCL: `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2012-2017, 2028-2045, 2051-2103`）。
+
+CUDA では active 数を使う最適化は Turing (sm_75) と、`STRATA_TOPK_ACTIVE_ANY` が先頭文字 `1` の場合に許されます。SYCL 側も同じ `counted` 判定を持ちますが、デバイス判定は major/minor が 7.5 の場合だけです。HIP では `__HIPCC__` 分岐によりこの環境変数を読まず、`active_blocks > 0` だけで `counted` を決めます（CUDA: `engine/src/kernels/cuda/qsa_select.cu:2461-2477, 3044-3057`; SYCL: `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1878-1905, 2030-2042`）。
 
 ## 値と判定
 
-| 環境変数の状態 | `capacity_guard` |
-|---|---:|
-| 未設定 | `false` |
-| 任意の値を設定 | `true` |
-| 空文字を設定 | `true` |
+両方の読み取り箇所は `std::getenv(...) != nullptr` の有無だけを見ます。未設定なら false、何らかの値が設定されていれば true です。空文字、`0`、`false`、不正な数値、前後の空白、大文字小文字の違いを解析・検証しません。境界値や clamp はありません。CLI 引数・設定ファイルによる値の上書きもこの判定箇所にはありません（CUDA: `engine/src/kernels/cuda/qsa_select.cu:3051-3056`; SYCL: `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2037-2042`）。
 
-実装は `std::getenv(...) != nullptr` のみを評価し、文字列の内容、数値、大文字小文字は読みません。したがって `=0` でも guard は有効です。
-
-判定結果は `qsa_block_topk()` 内の関数ローカル `static const bool` に保存されます。CUDA cluster kernel が成功して先に return する呼び出しではこの宣言に到達しません。宣言に初めて到達した時点で値が確定し、その後の環境変更は反映されません。
+| ビルド / 経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA (`__HIPCC__` なし) | `capacity_guard=false`。他条件が揃えば active 数を `reach` と `fit` に使用 | 空文字、`0`、`false`、`1`、任意の文字列。設定有無だけで guard が true | なし。値の内容は無視 |
+| SYCL (`__HIPCC__` なし) | CUDA と同じ有無判定 | CUDA と同じ | なし。値の内容は無視 |
+| HIP (`__HIPCC__` 定義) | この変数を参照しない | 該当なし | 該当なし。`counted` は `active_blocks > 0` で決まる |
 
 ## 有効になる条件
 
-- `src/kernels/cuda/qsa_select.cu` の CUDA 実装が対象です。HIP コンパイルでは `#if !defined(__HIPCC__)` の外にあり、この環境変数は参照されません。
-- guard が無効でも、active-count dispatch が使われるには `active_blocks > 0`、`active_blocks <= max_blocks`、かつ Turing デバイスであることが必要です。`STRATA_TOPK_ACTIVE_ANY=1` はテスト用にデバイス条件を迂回しますが、`capacity_guard` が有効なら active-count dispatch は引き続き無効です。
-- 通常のprefillは選択 batch の最終 query の `n_bid + 1` を `active_blocks` として渡します。decode の呼び出しは active count を渡さず、captured graph / verify の呼び出しもこの値を省略しています。その場合、guard の有無で active-count dispatch は変わりません。
-- CUDA cluster kernel が適用できて先に成功した呼び出しでは、その cluster dispatch が優先され、この guard の値は参照されません。
+- CUDA / SYCL の該当ビルドで `qsa_block_topk` が `nq > 0` となり、関数内の guard 判定まで到達する必要があります。`nq <= 0` はその前に return します（CUDA: `engine/src/kernels/cuda/qsa_select.cu:3016-3022`; SYCL: `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2012-2018`）。
+- guard 判定より前に cluster または split kernel が成功して return した場合、この変数による dispatch 変更はありません。CUDA は cluster を先に試し、続いて条件を満たす split kernel を試します。SYCL の cluster 関数は現行コードで `false` を返し、selector はその後 guard 判定へ進みます（CUDA: `engine/src/kernels/cuda/qsa_select.cu:3022-3041`; SYCL: `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1907-1913, 2018-2027`）。
+- CUDA で guard が未設定のとき `counted` が true になるには、`active_blocks > 0`、`active_blocks <= max_blocks`、および Turing デバイスか `STRATA_TOPK_ACTIVE_ANY` の先頭文字が `1` であることが必要です。デバイス判定は呼び出しスレッドごとに現在 device を cache し、sm_75 または `sm70_default_on(...)` を受理します（`engine/src/kernels/cuda/qsa_select.cu:2461-2477, 3052-3056`）。
+- SYCL では `counted` の数値条件は同じで、通常のデバイス判定は major/minor `7.5` のみです。`STRATA_TOPK_ACTIVE_ANY` が先頭文字 `1` ならデバイス判定を迂回します（`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1878-1905, 2038-2042`）。
+- `active_blocks <= 0`、`active_blocks > max_blocks`、またはデバイス条件が満たされない場合は `counted=false` となり、guard の設定有無で `reach` は変わりません。
+- `STRATA_TOPK_OLD` が設定されると後段で reference kernel を選ぶため、guard による後続 kernel 選択差は現れません（CUDA: `engine/src/kernels/cuda/qsa_select.cu:3019-3021, 3069-3075`; SYCL: `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2015-2017, 2046-2056`）。
+- HIP はこの変数の設定に関係なく HIP 用分岐で active 数のみを使います。CUDA/SYCL 用のデバイス判定や `STRATA_TOPK_ACTIVE_ANY` を含む `#else` 分岐には入りません（CUDA: `engine/src/kernels/cuda/qsa_select.cu:3044-3057`; SYCL: `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2030-2042`）。
+- 読み取り箇所にモデル状態、サーバーモード、CLI オプションによる追加条件はありません。実際に active 数を渡す prompt 経路の例では、prefill が batch の最後の query の `n_bid + 1` を算出して `qsa_block_topk` に渡します（`engine/src/prefill/prefill.cpp:5371-5393`）。
 
 ## 実行時の詳細
 
-prefill は `active_blocks` を `qsa_block_topk()` に渡します。guard が無効で値が正かつ容量以下、さらに（`STRATA_TOPK_ACTIVE_ANY` によるテスト指定がなければ）GPU が Turing のとき、`counted` が真になり、選択の到達範囲 `reach` は `min(active_blocks, max_blocks)` になります。guard が有効なら `counted` は偽となり、`reach` は `max_blocks` です。ここで `max_blocks` は状態の容量です。
+環境変数は `qsa_block_topk` 内の関数ローカル `static const bool` として初めて該当行に到達した時に読み、以降そのプロセス内で再読み込みしません。したがって、プロセス起動後でも最初に判定へ到達する前の変更は反映されますが、その後の変更は反映されません。CUDA と SYCL は別の実装・別の static 変数です（CUDA: `engine/src/kernels/cuda/qsa_select.cu:3016-3022, 3051`; SYCL: `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2012-2018, 2037`）。
 
-この `reach` は後続の kernel 選択に使われます。範囲が register kernel の `fit` を超えると CUDA は wide kernel を選び、そうでなければ register kernel のいずれかを使います。active-count の有無により小規模ケースの reference kernel への fallback 条件も評価されます。従って guard は単に active count の読み取りを止めるのではなく、capacity 基準に戻すことで kernel dispatch を変えることがあります。
+guard が false なら、条件を満たす CUDA/SYCL 経路で `counted=true` となり、`reach=min(active_blocks, max_blocks)` と `fit=TK_T * TK_PER_MAX` が使われます。guard が true、または他の条件で counted でない場合は `reach=max_blocks`、`fit=TK_T * TK_PER` です。その値を用いて reference / wide / register kernel の分岐が行われます。CUDA/SYCL では `STRATA_TOPK_STREAM` も wide kernel の分岐条件に関係します。HIP は独自の `kRegMinBlocks` 条件を使い、capacity guard の値は関与しません（CUDA: `engine/src/kernels/cuda/qsa_select.cu:3055-3103`; SYCL: `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2041-2103`）。
 
-コードコメントは Turing prefill が capacity 上限ではなく active block 上限を使う設計、および `STRATA_TOPK_STREAM` と連動する wide kernel の分岐を説明しています。`STRATA_TOPK_CAPACITY_GUARD` 自体について、専用ログや警告を出す実装は見つかりませんでした。既存資料 `docs/DETAILS.md` の環境変数一覧には `STRATA_TOPK_STREAM` の記載がありますが、この guard の説明は確認できませんでした。
+## ログと測定値
 
-SYCL 側の `sycl/src/kernels/cuda/qsa_select.dp.cpp` にも同名のコードがありますが、ファイル先頭に CUDA ソースからのDPCT変換物である旨が示されています。本調査では生成・変換済みコードを実装根拠にせず、CUDAネイティブ実装を根拠としました。
+この変数を読んだことや guard が有効になったことを示す専用ログはありません。後続の共通失敗経路として、geometry / cap が未対応なら `qsa_block_topk: unsupported geometry or cap` を stderr に出して終了し、CUDA kernel launch エラーなら `qsa_block_topk: <CUDA error>` を出して終了します（CUDA: `engine/src/kernels/cuda/qsa_select.cu:3078-3105`; SYCL: `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2058-2059`）。この変数固有の性能測定値は確認できません。`docs/DETAILS.md` にもこの名前や当該 guard の説明は見つからず、ここではソース上の dispatch だけを記述しています。
 
 ## 根拠
 
-- `src/kernels/cuda/qsa_select.cu:1211-1226` — HIPを除くTuring判定。device property の major/minor が 7.5 であることを確認し、calling thread ごとにdevice判定をcache。
-- `src/kernels/cuda/qsa_select.cu:1295-1327` — cluster経路、環境変数の存在判定、active count による `counted` / `reach` の決定。
-- `src/kernels/cuda/qsa_select.cu:1330-1362` — reference、wide、register kernel のdispatchと実行エラー時のstderr出力。
-- `src/prefill/prefill.cpp:2760-2775` — prefill batch の最終 query から `active_blocks` を求め、top-k関数へ渡す箇所。
-- `src/core/layer.cpp:1122-1131` — decode 側は `qsa_block_topk()` に active count を渡していない。
-- `src/core/verify.cpp:1370-1384` — verify側のtop-k呼び出しも active count を省略。
-- `docs/DETAILS.md:278-280` — 関連する `STRATA_TOPK_STREAM` の記載。guard の説明は掲載されていない。
+- `engine/src/kernels/cuda/qsa_select.cu:2461-2477, 3016-3105` — CUDA/HIP の device gate、値の読み取り、kernel dispatch と共通エラー経路。
+- `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1878-1905, 2012-2103` — SYCL の device gate、値の読み取り、kernel dispatch と共通エラー経路。
+- `engine/src/prefill/prefill.cpp:5371-5393` — prefill 側で active-block 数を算出して selector に渡す経路。
+- `engine/sycl/CMakeLists.txt:1-6` — SYCL build で CUDA 側ソースに対応する `.dp.cpp` の移植版を使う説明。

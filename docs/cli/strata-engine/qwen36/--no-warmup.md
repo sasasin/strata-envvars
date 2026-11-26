@@ -1,60 +1,56 @@
 # `--no-warmup`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` の Qwen3.6 family parser、または `strata-q36` |
+| コマンド | `strata` / `strata-q36`（Qwen3.6 engine） |
 | オプション | `--no-warmup` |
 | 別名 | なし |
-| 値 | 取らないフラグ |
+| 値 | 値を取らないフラグ |
 
 ## 役割
 
-Qwen3.6 engine 起動時に通常実行される GPU warmup を省略します。`strata` は `--model` / `--native` で指定された GGUF の family が `qwen35moe` の場合に Qwen3.6 専用実装へ引き渡します。CMake では同じ実装を `strata-q36` executable としても生成します（`src/program/generate.cpp:2393-2407`、`CMakeLists.txt:782-792`、`src/qwen35/q36_main.cpp:1-5`）。
+Qwen3.6 engine がモデルのロードと expert 配置を終えた後、通常は実リクエスト前に行う明示的な GPU warmup を省略する。serve、benchmark、単発生成の各実行モードに共通して、モードの処理へ入る前の warmup 呼び出しを制御する。
 
 ## 使い方
 
-通常の token generation の例です。`IDS` は実際の入力 token ID をカンマ区切りで指定します。
-
 ```sh
-strata --model ./model.gguf --tokens IDS --no-warmup
+# Qwen3.6 モデルを serve モードで起動し、明示的 warmup を省く
+strata-q36 --model /models/qwen36.gguf --no-warmup --serve
+
+# 同じ Qwen3.6 engine を strata のモデル選択経路から起動する例
+strata --model /models/qwen36.gguf --no-warmup --tokens "1 2 3" --n 16
 ```
 
-同じフラグは `--serve` と `--bench-pp` / `--bench-tg` の起動にも適用されます。専用 executable では `strata-q36 --model ./model.gguf ... --no-warmup` と指定します。`--no-warmup` は parser が引数全体を走査する間に受理され、後続の実行モード分岐より前に反映されます（`src/qwen35/q36_engine.cu:3735-3779,3882-3890`）。
+`strata` の場合は、`--model` / `--native` が指す GGUF の architecture が `qwen35moe` のとき Qwen3.6 専用 engine に切り替わる。別 architecture はこの専用 parser の対象ではない（`engine/src/program/generate.cpp:3804-3818`）。
 
 ## 値と既定値
 
-- 値を取りません。parser はこの引数を見つけると `warm = false` にします（`src/qwen35/q36_engine.cu:3739-3742,3765-3767`）。
-- 省略時は `warm = true` のままなので warmup が実行されます（`src/qwen35/q36_engine.cu:3739,3888`）。
-- 数値範囲などの validation はありません。複数回指定しても同じ `false` を設定するだけです（`src/qwen35/q36_engine.cu:3742-3795`）。
-- `--no-warmup` の次に値らしい引数を置いても、その値をこのフラグが消費することはありません。通常の generation / benchmark 経路では未知引数として usage を stderr に出し終了コード 2 になります。`--serve` 経路では未知の `--...` 引数を警告して無視する別処理があります（`src/qwen35/q36_engine.cu:3782-3795`）。
+値を取りません。省略時は `warm` が `true` で、`--no-warmup` を指定すると `false` になる。複数回指定しても同じ boolean を `false` に設定するだけである。値を続けて書く形式は parser にない。未知の引数・余分な位置引数は通常の直接実行では usage を stderr に出して終了コード 2 となる（`engine/src/qwen35/q36_engine.cu:5342-5353,5372,5412-5418`）。
 
 ## 実行時の動作
 
-model load、`Engine::init`、expert placement、初期 `E.reset()` を終えた後、`warm` が真の場合に限り `E.warmup()` を呼びます。したがってこのフラグはモデル読込や engine 初期化、最初の reset を省略しません。warmup 呼び出し後に server、benchmark、または token generation の処理へ進みます（`src/qwen35/q36_engine.cu:3811-3817,3863-3866,3882-3890`）。
+指定しない場合、`E.warmup()` は model load、engine 初期化、expert 配置、`E.reset()` と MTP 設定の後、serve / benchmark / 単発生成への分岐より前に実行される（`engine/src/qwen35/q36_engine.cu:5522-5526,5555-5562`）。warmup は合成 token の prompt chunk を処理し、条件が合えば最小 GEMM chunk、decode 1 step、MTP draft が有効なら speculative step も処理する。その後 stream を同期し、hybrid routing 等の計数をクリアして engine state を reset する。完了時は所要秒数を stderr に出す（`engine/src/qwen35/q36_engine.cu:4022-4053`）。
 
-省略される warmup は、token ID 198 の filler を使った `tmax` token の prompt、必要な場合は最小 GEMM chunk の追加 prompt、1 token decode を実行し、`--mtp N` の有効な draft 数がある場合は speculative step も実行します。最後に stream を同期し、hybrid routing score とカウンターをクリアして engine state を reset します。通常は stderr に所要時間を含む `strata-q36: warmed up in ...` を出力します（`src/qwen35/q36_engine.cu:2752-2778`）。
-
-warmup 中は `warming` フラグにより hybrid expert rebalance が無効になります。warmup の routing score は最後に消去されるため、この処理が warmup 中の routing を使って expert slot を再配置することはありません（`src/qwen35/q36_engine.cu:2756-2777,2296-2301`）。
+このフラグを指定すると `if (warm)` の呼び出し全体がスキップされ、warmup 用の処理、reset、および `strata-q36: warmed up ...` の stderr 出力がありません（`engine/src/qwen35/q36_engine.cu:5561`）。この分岐より前に行うモデルロード、engine 初期化、expert 配置は引き続き実行され、失敗すればそれぞれのエラー経路に進む（`engine/src/qwen35/q36_engine.cu:5458-5465,5522-5526`）。
 
 ## 適用条件と副作用
 
-このフラグは Qwen3.6 専用 parser の動作です。`strata` では GGUF header の model family が `qwen35moe` と判定されたときだけこの parser が使われます（`src/program/generate.cpp:2393-2407`）。通常 engine の別 parser に同じ意味で適用されるとは確認できません。
-
-指定すると起動時の追加 GPU forward 実行、warmup 後の reset、および warmup 完了時間の stderr 表示を飛ばします。一方、engine 初期化時の CUDA/GPU memory setup や model load は引き続き行われます（`src/qwen35/q36_engine.cu:1348-1365,1502-1509,3811-3817,3882-3889`）。実装コメントは warmup を初回 prompt で使う GPU code object、BLAS kernel、decode graph の初回生成を先に行うための処理と説明しています。そのため省略時には初回 request / benchmark の最初の測定にそれらの初回実行コストが含まれる可能性がありますが、この文書では性能差を測定していません（`src/qwen35/q36_engine.cu:2752-2755`）。
+- `strata-q36` を直接実行する場合、および `strata` が `qwen35moe` architecture を検出して Qwen3.6 engine に切り替えた場合に適用される（`engine/src/qwen35/q36_main.cpp:1-5`、`engine/src/program/generate.cpp:3804-3818`）。
+- warmup は prompt・decode・（有効な場合の）speculative 計算を先行実行するため、その起動時の GPU 計算と時間を省く。一方、engine のコメントは warmup が初回 prompt の初回利用コストを前払いする意図だと説明しているため、省略時にはその初回利用時の処理が残る（`engine/src/qwen35/q36_engine.cu:4022-4025`）。性能差の大きさはこのソース調査では測定していない。
+- parser には `--no-warmup` に対する値の validation や別 option との条件分岐はない（`engine/src/qwen35/q36_engine.cu:5348-5418`）。
+- ここでスキップするのは `E.warmup()` の呼び出しである。GPU/backend や依存コードに存在する他の初期化・lazy warmup まで無効にする仕様は確認できない。
 
 ## 出力とエラー
 
-このフラグ自体の成功・失敗メッセージはありません。warmup を実施する場合の stderr 完了行は省略されます。model load、GPU 初期化、後続 generation / serve / benchmark の失敗条件はこのフラグによって取り除かれません（`src/qwen35/q36_engine.cu:3811-3817,3882-3890`）。
+フラグ自体は出力やエラーを追加しない。省略時の warmup 完了メッセージは `--no-warmup` 指定時には出ない（`engine/src/qwen35/q36_engine.cu:4052-4053,5561`）。不足値の概念はなく、モデル未指定は stderr に `--model is required` を出して終了コード 2、モデル読込失敗は stderr に理由を出して終了コード 1 となる。これらは warmup の有無にかかわらず warmup 判定より前の経路である（`engine/src/qwen35/q36_engine.cu:5420,5458-5465`）。
 
 ## 根拠
 
-- `src/qwen35/q36_engine.cu:3735-3795` — parser の既定値、値なしフラグ、未知引数と usage / 終了コード。
-- `src/qwen35/q36_engine.cu:2752-2778` — warmup の目的、実行内容、状態 reset、stderr 出力。
-- `src/qwen35/q36_engine.cu:2296-2301` — warmup 中の hybrid expert rebalance 抑止。
-- `src/qwen35/q36_engine.cu:3811-3817,3863-3866,3882-3890` — model load・初期化・placement の後で warmup を条件実行し、各実行モードへ進む順序。
-- `src/program/generate.cpp:2393-2407`、`src/qwen35/q36_main.cpp:1-5`、`CMakeLists.txt:782-792` — family dispatch と専用 executable。
-
-調査は指定 revision の checkout 内の parser と呼び出し経路を対象としました。同 revision の CLI `--help` および Release 配布物は照合していません。
+- `engine/src/qwen35/q36_engine.cu:5342-5353,5372` — 既定値 `warm = true`、引数走査、および値なしフラグの parser。
+- `engine/src/qwen35/q36_engine.cu:5412-5420` — 不明引数時の usage / 終了コードと、モデル必須条件。
+- `engine/src/qwen35/q36_engine.cu:4022-4053` — warmup の内容、state・計数の reset、完了出力。
+- `engine/src/qwen35/q36_engine.cu:5522-5526,5555-5562` — 初期化後、各実行モードの前に warmup を呼ぶ順序。
+- `engine/src/program/generate.cpp:3804-3818`、`engine/src/qwen35/q36_main.cpp:1-5` — `strata` の architecture による engine 切替と専用 executable の入口。

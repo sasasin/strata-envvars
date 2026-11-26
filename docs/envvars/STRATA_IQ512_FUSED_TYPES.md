@@ -1,50 +1,48 @@
 # `STRATA_IQ512_FUSED_TYPES`
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-AVX-512 native expert CPU 経路で、複数 token の IQ expert の gate/up 行を融合して計算する対象の ggml type 番号を選びます。この変数だけでは機能は有効になりません。別変数 `STRATA_IQ512_FUSED_MAX` が 2 以上の token 数を許可し、native expert の gate/up 計算が該当条件を通った場合にだけ、この type リストが参照されます。
-
-読み取りは `src/kernels/cpu/native_expert.cpp:530-544`、native expert の実行時呼び出しは `src/kernels/cpu/pool.cpp:1231-1237` です。この名前の参照はソース全体でこの箇所だけです。
+CPU の native expert 経路で、IQ 形式の gate/up 行を AVX-512 の fused kernel に渡す型 ID を選ぶ。既定は `18,21,22`（IQ3_XXS、IQ3_S、IQ2_S）で、値を指定すれば `16` と `17` も候補にできる。ただし型 ID を選ぶだけでは有効にならず、`STRATA_IQ512_FUSED_MAX`、CPU 機能、型ごとの実行時照合も通る必要がある。対象は CPU の gate/up 計算であり、down 行や GPU backend の設定ではない。`native_gu_rows_impl` が環境変数を読み、条件成立時に `iq512_fused_gu_rows` を呼ぶ（`engine/src/kernels/cpu/native_expert.cpp:629-652, 898-901`）。
 
 ## 値と判定
 
-| 環境値 | 判定 |
-|---|---|
-| 未設定 | 既定リスト `18,21,22` を使用する。 |
-| 空文字 | 未設定と同様に `18,21,22` を使用する。 |
-| 空でない文字列 | カンマで区切った各項目の先頭を `std::atoi` で整数変換し、`1..31` の値を bitset に加える。 |
+環境変数はカンマで区切った10進整数の型 ID 群として読み取られ、各要素を `std::atoi` に渡す。未設定または空文字なら文字列 `18,21,22` が使われる。`atoi` の結果が `1..31` の場合に限り、その ID のビットを選択マスクへ追加する。空要素、0、負数、32 以上、数値に変換できない要素は追加されない。重複 ID は同じビットになる。
 
-文字列全体の厳密な parse やエラー検査はありません。`atoi` が読む各項目は、先頭の空白と符号を許し、数字の後ろにある文字を無視します。そのため `"18junk, +21, 22x"` は 18, 21, 22 を選びます。数値に変換できない項目、0、負数、32 以上は無視されます。連続カンマや末尾カンマもエラーにはなりません。たとえば `"18,abc,22,"` は 18 と 22 を選び、`"garbage"` は空の選択になります。大文字小文字は関係ありません。
+`atoi` は文字列全体の厳密な検証ではないため、先頭の空白や符号を許し、数値の後ろの文字列を無視する。たとえば `" 18,+21x"` は 18 と 21 を選び、`"18x,0,-1,32,word"` は 18 だけを選ぶ。大文字小文字の判定はなく、名前ではなく数値 ID を指定する。最終的に使えるのは `iq512f_supported` が列挙する 16、17、18、21、22 のみ（`engine/src/kernels/cpu/native_expert.cpp:635-648`; `engine/src/kernels/cpu/iq_avx512.cpp:759-769`）。
 
-パーサー上は 1..31 を保持できますが、融合カーネルが対応するのは type 16, 17, 18, 21, 22 だけです。さらに現在の `iq512f_supported()` は AVX512 VPOPCNTDQ がある CPU でのみ true になり、この5 type のうち選択された type が実行候補になります（`src/kernels/cpu/iq_avx512.cpp:653-665,759-769`）。既定値の 18, 21, 22 は IQ3_XXS, IQ3_S, IQ2_S に対応します（同ファイル `:9-10`）。
+| 条件 | unset | 選択マスクに入る値 | 選択マスクに入らない値 |
+|---|---|---|---|
+| fused 分岐に到達したとき | `18,21,22` | 各カンマ要素の `atoi` 結果が `1..31`。実際に fused kernel が対応する ID は `16,17,18,21,22` | 空要素、`0`、負数、`32` 以上、数値変換できない要素 |
+| 空文字 | `18,21,22` と同じ | 既定の 18、21、22 | — |
 
 ## 有効になる条件
 
-以下をすべて満たす必要があります。
+- `native_gu_rows` / `native_gu_rows_invariant` を通る CPU native expert の gate/up 計算であること。通常の pool は gate/up 行の処理から `native_gu_rows` を呼ぶ（`engine/src/kernels/cpu/pool.cpp:1290-1296, 1423-1429`）。
+- `STRATA_IQ512_FUSED_MAX` が `atoi` で 2 以上になり、トークン数 `nt` が `2..STRATA_IQ512_FUSED_MAX` に入ること。同変数は未設定時 0 で fused 分岐を無効にする。空文字は 0（`engine/src/kernels/cpu/native_expert.cpp:629-634`）。
+- `cpu_vnni_ok()` が真で、`STRATA_NO_IQ512` が未設定であること。ここでいう未設定判定は値の内容ではなく `getenv(...) == nullptr` であり、`STRATA_NO_IQ512` が空文字でも AVX-512 経路を止める（`engine/src/kernels/cpu/native_expert.cpp:568`）。
+- gate/up 型 ID が選択マスクに含まれ、`iq512f_supported` が要求する VPOPCNT 機能と型 ID（16、17、18、21、22）を満たすこと（`engine/src/kernels/cpu/native_expert.cpp:649`; `engine/src/kernels/cpu/iq_avx512.cpp:653-669, 759`）。
+- `f.tail_off == 0` であること。また `iq512f_ok` がその型の fused 計算をこのビルドの dot と照合して一致と判定すること（`engine/src/kernels/cpu/native_expert.cpp:634, 649`; 照合処理と失敗時ログは `engine/src/kernels/cpu/native_expert.cpp:161-201`）。
 
-- `STRATA_NATIVE_EXPERTS` を有効にしてビルドされている。無効時は native expert 実装がコンパイル対象にならず、native expert load も拒否されます（`CMakeLists.txt:176,2121-2122,2182-2186,2239`; `src/kernels/cpu/expert_layout.cpp:488-499`）。
-- x86 CPU build で AVX-512 kernel が組み込まれている。非 x86 build は `portable.cpp` の stub が `iq512f_supported()` を常に false にします（`CMakeLists.txt:62-67,2059-2065,2184-2194`; `src/kernels/cpu/portable.cpp:127,132-134`）。
-- 呼び出しが native expert pool の mode 5 に入り、`native_gu_rows()` が実行される（`src/kernels/cpu/pool.cpp:1219-1237`）。
-- `STRATA_IQ512_FUSED_MAX` の parse 結果が 2 以上で、実際の token 数 `nt` が 2 以上かつその値以下。上限は `std::atoi` で読み、未設定時は 0、空文字や数値として読めない値も 0 です（`src/kernels/cpu/native_expert.cpp:528-529`）。この対象変数はこの上限を設定しません。
-- CPU probe により `avx512` が true。これは `cpu_vnni_ok()` が true で、かつ `STRATA_NO_IQ512` が unset の場合です（同ファイル `:463`）。VNNI probe は AVX-512 F/DQ/BW/VL と VNNI を要求し、VBMI がない CPU では `STRATA_VNNI_TIER` の先頭文字が `1` の場合に限り許可します（`src/kernels/cpu/expert_layout.cpp:188-203`）。
-- `f.tail_off == 0`、gate/up type が 1..31 の範囲で、かつその type が環境値の bitset に含まれる（`src/kernels/cpu/native_expert.cpp:529-544`）。
-- `iq512f_supported(type)` と `iq512f_ok(type)` が true。後者は linked ggml-cpu の Q8_K activation quantizer / dot が使えることを確認し、3 token・24 row の合成データで融合結果と ggml-cpu の gate/up + SwiGLU 結果を bit 単位で比較します（同ファイル `:153-193`）。
-
-条件を満たさない場合、この変数による融合は行われず、関数は後続の通常 native row dispatch に進みます（`src/kernels/cpu/native_expert.cpp:548-596`）。この経路に CLI 引数や別の型リスト設定による上書きはありません。`STRATA_IQ512_FUSED_MAX` は独立した有効化・token 上限条件であり、`STRATA_NO_IQ512` と `STRATA_VNNI_TIER` は AVX-512 利用可否に関係します。
+どれかを満たさない場合、この設定による fused kernel 呼び出しは行われず、同関数の後続 CPU kernel / 通常 dot の dispatch に進む（`engine/src/kernels/cpu/native_expert.cpp:649-706, 710-735`）。
 
 ## 実行時の詳細
 
-`native_gu_rows_impl()` は `STRATA_IQ512_FUSED_MAX` を関数の初回実行時に `static const int` として読み、以後プロセス内で cache します。対象の `STRATA_IQ512_FUSED_TYPES` はその後の条件ブロック内にある `static const unsigned` で、初めて上限・CPU・token 数・tail・type 範囲の条件を満たした時に読み、以後 cache します。したがって、対象変数は起動時に必ず読むわけではなく、該当する最初の native expert group までに設定されていなければなりません。その初回評価後の環境変更は反映されません（`src/kernels/cpu/native_expert.cpp:528-544`）。
+型リストは `native_gu_rows_impl` 内の関数ローカル `static const unsigned` で一度だけ解析される。初期化は、`STRATA_IQ512_FUSED_MAX` と CPU・トークン数・tail 条件を満たして fused 分岐に初めて入った時点まで遅延する。`fused_max` も関数ローカル static で、同関数がその宣言箇所に初めて到達した時に一度だけ `getenv` / `atoi` される。そのためプロセス起動後に環境を変更しても、すでに初期化済みの値は更新されない。`fused_max` が 2 未満のまま初期化された場合、型リストの static は初期化されない（`engine/src/kernels/cpu/native_expert.cpp:633-648`）。
 
-選択された場合、`iq512_fused_gu_rows()` が gate と up の行を融合計算し、token ごとの SwiGLU 結果を `ff` に書き込み、その場で戻ります（`src/kernels/cpu/native_expert.cpp:544-546`; `src/kernels/cpu/iq_avx512.cpp:761-770`）。Strata はこの環境変数の parse エラーに対する警告を出しません。型が非対応、または fused の結果が現在の ggml-cpu と bitwise 一致しない場合は fused kernel を使わず、後続の通常 dispatch に進みます。不一致時に限り stderr に `strata: the fused 512-bit gate/up rows of type %d differ from this ggml-cpu's dot: not used` を出します（`src/kernels/cpu/native_expert.cpp:189-193,544-549`）。対象変数そのものを示す起動ログ、成功ログ、無効値エラー、プロセス終了経路はありません。
+選択された型かつ照合成功時は、gate と up の行を `iq512_fused_gu_rows` に渡して処理し、戻る。これは各トークンについて gate の sigmoid を up に掛けた gate/up 出力を作る経路である（`engine/src/kernels/cpu/native_expert.cpp:649-652`; `engine/src/kernels/cpu/iq_avx512.cpp:761-769`）。型リストはモデルの量子化形式を変えず、指定型の gate/up 計算がこの kernel を使えるかだけを絞る。
+
+## ログと測定値
+
+この環境変数を設定したことや型を選択したことを知らせるログはない。型ごとの実行時照合が失敗した場合は、stderr に `strata: the fused 512-bit gate/up rows of type %d differ from this ggml-cpu's dot: not used` を出し、その型では fused kernel を使わない（`engine/src/kernels/cpu/native_expert.cpp:197-201`）。
+
+実装コメントは fused 行が既定の行より Zen 4 で 2〜3 tokens 時に 1.27〜1.34 倍、1 token 時には遅く、そのため 1 token は ggml の dot を使うと記している。これはコードコメントに記載された測定であり、機種の詳細、モデル、量子化、反復回数などの条件は同コメントにはない（`engine/src/kernels/cpu/native_expert.cpp:629-634`）。
 
 ## 根拠
 
-- 環境値読み取り、既定値、区切り、数値化、bitset 化: `src/kernels/cpu/native_expert.cpp:530-543`。
-- 上限、実行条件、fallback: `src/kernels/cpu/native_expert.cpp:528-549`。
-- VNNI/AVX-512 と VPOPCNTDQ 条件: `src/kernels/cpu/native_expert.cpp:463`; `src/kernels/cpu/expert_layout.cpp:188-203`; `src/kernels/cpu/iq_avx512.cpp:653-665,759-769`。
-- fused parity guard と観測される不一致ログ: `src/kernels/cpu/native_expert.cpp:153-193,544-549`。
-- pool の native CPU dispatch: `src/kernels/cpu/pool.cpp:1219-1237`。
-- Strata の調査資料 `docs/DETAILS.md` には、この環境変数固有の追加仕様・測定条件は見つかりませんでした。
+- `engine/src/kernels/cpu/native_expert.cpp:629-652` — 最大トークン数の条件、環境変数の既定値と解析、型マスク、実行条件と fused 呼び出し。
+- `engine/src/kernels/cpu/native_expert.cpp:161-201` — fused kernel の型別照合と失敗ログ。
+- `engine/src/kernels/cpu/native_expert.cpp:568, 898-910` — AVX-512 の環境条件と native gate/up dispatch の入口。
+- `engine/src/kernels/cpu/iq_avx512.cpp:653-669, 759-769` — VPOPCNT 判定、サポート型、型別 fused kernel dispatch。
+- `engine/src/kernels/cpu/pool.cpp:1290-1296, 1423-1429` — native expert pool から gate/up dispatch を呼ぶ箇所。

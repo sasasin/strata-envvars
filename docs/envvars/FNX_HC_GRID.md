@@ -1,43 +1,49 @@
 # `FNX_HC_GRID`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP 版の任意エンジン `strata-split` が hyper-connection read (`hc_read`) に使う CUDA/HIP grid の block 数を指定します。既定では各カードの multiprocessor 数（SM 数）と上限 80 の小さい方を使います。変数に正数を指定すると SM 数基準の値を置き換え、最大 80 blocks にします。Strata の通常エンジンにはこの設定経路はありません。
+HIP 版 split engine のハイパーコネクション read kernel で、同時に起動する grid block 数を指定する内部調整値です。通常は `hc_prepare` が GPU の SM 数を基準に grid を決めますが、この値が正数なら `H_BLOCKS` 以下の指定値で置き換えます。`hc_read` は保存された grid を使って kernel を起動し、grid が `H_BLOCKS` より小さい場合は各 block が複数の仕事を順に処理する `WALK` 版を選びます（`engine/src/split/src/kernels.cu:1173-1190,1205-1227`; `engine/src/split/src/hc.cuh:113-115,130-134,382-392`）。
+
+この読み取りを含む `hc_prepare` は `FNX_KPART == 3` の kernel 分割にコンパイルされ、その中の環境読み取りはさらに `FNX_HIP` 条件内です。split の CMake は kernel を 0..8 の部分に分け、HIP target に `FNX_HIP=1` を定義するため、HIP split engine では有効ですが、非 HIP build では環境値を読みません（`engine/src/split/src/kernels.cu:1139-1140,1173-1185`; `engine/src/split/CMakeLists.txt:93-102,120-127`）。通常の CLI 引数や別の環境変数による `FNX_HC_GRID` の上書きは、この実装にはありません。
 
 ## 値と判定
 
-| 環境値 | 結果 |
-|---|---|
-| 未設定 | `env_int` の既定値 0。SM 数と 80 の小さい方を使用 |
-| 整数 0 または負数 | override しない。SM 数と 80 の小さい方を使用 |
-| 正の整数 `n` | grid を `min(n, 80)` にする。実 SM 数を超える指定も clamp されずに採用される（ただし 80 が上限） |
-| 空文字、整数でない文字列、`long long` の範囲外 | `env_int` が例外を送出し、engine の初期化に失敗 |
+`fnx::env_int("FNX_HC_GRID", 0)` が `std::getenv` で値を取り、符号付き base-10 の `long long` として文字列全体を解析します。未設定なら既定値 `0`、設定済みの空文字は数値として不正です。先頭には `+` または `-` を付けられますが、先頭・末尾の空白や数字以外の後続文字は受け付けません。`long long` の範囲外も不正です（`engine/src/split/src/env.hpp:15-21,33-40`）。
 
-値は `parse_whole` により、符号は任意、10 進数字のみの整数として文字列全体を変換します。先頭・末尾の空白、数字の後ろの文字、小数表記は受け付けません。`+2` や `002` は整数として有効です。`std::strtoll` の `ERANGE` も不正値扱いになります。`H_BLOCKS` は `H_NS * H_RG` で、この実装では 80 です。`hc_prepare` の `cap` は engine から既定の 0 で呼ばれるため、正数指定時の上限は `H_BLOCKS` です。
+| 条件 | unset | 有効になる値（例） | grid 変更なし / 無効になる値（例） |
+| --- | --- | --- | --- |
+| HIP split engine の `hc_prepare` | `0` と同じ。通常の `min(SM 数, H_BLOCKS)` を使う | 正数。`H_BLOCKS` を超える値は `H_BLOCKS` に制限 | `0`、負数（例 `-1`）は通常 grid のまま。空文字、`true`、`1x`、空白付き数値、整数範囲外は parse error |
+| 非 HIP build | このコード箇所で環境値を読まない | なし | 値にかかわらずこの設定の効果なし |
+
+正数 `g` は `min(g, cap ? cap : H_BLOCKS)` で grid に設定されます。Engine の呼び出しは `hc_prepare(b->hcs)` と cap を省略し、既定 cap `0` を使うため、ここでは `min(g, H_BLOCKS)` です。上限は SM 数ではないので、`g` が SM 数より大きくても `H_BLOCKS` 以下ならその値がそのまま使われます（`engine/src/split/src/kernels.hpp:64-67`; `engine/src/split/src/engine.cu:174-184`; `engine/src/split/src/kernels.cu:1173-1185`）。
+
+不正な設定値は fallback せず、`std::runtime_error`（`FNX_HC_GRID: '<値>' is not a whole number`）になります。空文字もこの経路です（`engine/src/split/src/env.hpp:15-21,33-40`）。
 
 ## 有効になる条件
 
-- `STRATA_BUILD_SPLIT=ON` で構成され、Linux HIP build として `FNX_HIP=1` を定義した `strata-split-N` を実行すること。CMake は split engine を既定で build せず、CUDA build では `FNX_HIP` 分岐が無効です。
-- engine が各カードの `hc_prepare` を実行すること。読み取りは `hc_prepare` の `#if FNX_HIP` 内に限られます。
-
-値の override 自体に CLI 引数や他の環境変数との優先順位はありません。GPU の SM 数を使う既定値を、正数の環境値が置き換えます。
+- split の kernel 分割 `FNX_KPART == 3` に `hc_prepare` がコンパイルされていること。CMake は `kernels.cu` を 0..8 の部分に分けます（`engine/src/split/src/kernels.cu:1139-1140`; `engine/src/split/CMakeLists.txt:93-102`）。
+- HIP 版の split engine であること。HIP build は `FNX_HIP=1` を定義し、環境変数の読み取り箇所自体も `#if FNX_HIP` 内にあります。非 HIP build では読み取りません（`engine/src/split/src/kernels.cu:1181-1185`; `engine/src/split/CMakeLists.txt:120-127`）。
+- split Engine が GPU card ごとの buffer 初期化まで進み、`hc_prepare` が呼ばれること。ここで scratch を確保した後、各 card の device を選んで grid を準備します（`engine/src/split/src/engine.cu:156-183`）。
+- 値が正数であること。未設定、0、負数では環境変数による上書きが起きず、GPU の SM 数を基準にした既定 grid になります（`engine/src/split/src/kernels.cu:1173-1185`）。
 
 ## 実行時の詳細
 
-`Engine` の構築時にカードごとの scratch buffer を作成し、`hc_prepare` を呼びます。同関数はまずデバイスの SM 数を取得し、環境値を読み、カードごとの `hc_grid_` に決定した grid を保存します。この関数で読み取った値を static cache には保存せず、カードごとの `hc_prepare` 呼び出しで評価します。設定値をプロセス稼働中に変更する運用はコード上保証されません。
+Engine の初期化時に各 card で `hc_prepare` が呼ばれ、環境値はその都度読み取られます。読み取った結果は `hc_grid_[dev]` に card ごとに格納され、以後の `hc_read` はその grid を使います。環境変数自体を static cache する処理はありませんが、既に初期化した Engine の grid は実行中の環境変更では更新されません。Engine を新たに初期化すれば、その初期化時点の環境値で再設定されます（`engine/src/split/src/engine.cu:156-183`; `engine/src/split/src/kernels.cu:1155-1170,1173-1190,1205-1208`）。
 
-`hc_read` は保存された grid を取得し、その block 数で各 token 行数に対応する kernel を launch します。決定値が 80 未満なら stderr に `fnx: card ...: <grid> SMs: the hc read runs its 80 blocks of work on <grid>` 形式の行が出ます。このログは `hc_prepare` の戻り値を SM 数と実行 block 数の両方に表示します。決定値が 80 の場合、この条件による行は出ません。
+既定値では grid は `min(SM 数, H_BLOCKS)` です。正数指定時は `min(指定値, H_BLOCKS)` となり、`grid < H_BLOCKS` なら `hc_launch` が `WALK=true` の kernel を起動します。その kernel は `blockIdx.x + k * gridDim.x` の順に担当 block を進め、grid block 数が `H_BLOCKS` に足りない場合も全仕事を処理する構造です（`engine/src/split/src/kernels.cu:1173-1185`; `engine/src/split/src/hc.cuh:113-115,130-134,379-392`）。
 
-不正値は `env_int` が `FNX_HC_GRID: '<値>' is not a whole number` の例外を送出します。これは `Engine` 構築中に発生し、`sfnx.cpp` の初期化失敗処理が stdout に `ERR ...`、stderr に `sfnx: failed: ...` を出して終了コード 1 で終了します。GPU 属性取得や grid barrier counter の初期化にも失敗経路がありますが、それらは `FNX_HC_GRID` の値判定とは別です。
+## ログと測定値
+
+`hc_prepare` の返した grid が `H_BLOCKS` 未満なら、Engine は stderr に `fnx: card %d: %d SMs: the hc read runs its %d blocks of work on %d\n` を出します。表示上の `%d SMs` に渡される値は実際には有効 grid 数です。このログは `H_BLOCKS` と等しい場合には出ません。未設定でも SM 数が `H_BLOCKS` 未満なら同じログ条件になります（`engine/src/split/src/engine.cu:181-184`; `engine/src/split/src/kernels.cu:1173-1190`）。
+
+不正値では `env_int` が例外を投げるため、grid 設定や上記ログに進みません。この箇所自身は例外を別のログへ変換したり、終了コードを設定したりしません（`engine/src/split/src/env.hpp:33-40`; `engine/src/split/src/engine.cu:181-184`）。ソースコメントには R9700 で 32 block を使った「screen」の記述がありますが、条件を備えた測定結果ではないため性能値としては扱いません（`engine/src/split/src/kernels.cu:1182-1184`）。
 
 ## 根拠
 
-- 候補一覧の掲載: `docs/envvars/000_envvers.md:541`。
-- 任意 split engine と build 条件: `CMakeLists.txt:2945-2949`, `src/split/CMakeLists.txt:20-27,97-106`。
-- 整数全体の parse、未設定時の fallback、不正値例外: `src/split/src/env.hpp:15-21,33-40`。
-- 読み取りの HIP 条件、SM 数基準値、正数 override と 80 上限、grid の保存: `src/split/src/kernels.cu:1170-1193`; `H_BLOCKS=80` の定義: `src/split/src/hc.cuh:18-24`。
-- engine 構築からの呼び出しと grid 値のログ: `src/split/src/engine.cu:139-142`。
-- kernel launch が保存済み grid を使う箇所: `src/split/src/kernels.cu:1205-1229`。
-- 初期化例外の表示と終了: `src/split/tools/sfnx.cpp:1051-1062,1027-1035`。
+- `engine/src/split/src/env.hpp:15-21,33-40` — 整数全体の parse、未設定時の既定、無効値の例外。
+- `engine/src/split/src/kernels.cu:1155-1190,1193-1228` — card ごとの grid 保存、HIP 条件下の読み取り、上限と read kernel への適用。
+- `engine/src/split/src/engine.cu:156-184,931-936` — card 初期化時の準備、stderr ログ、実行時の hyper-connection read。
+- `engine/src/split/src/hc.cuh:11-14,113-135,379-392` — grid 不足時の複数仕事の処理と kernel variant の選択。
+- `engine/src/split/CMakeLists.txt:93-102,120-127` — kernel 分割と HIP split target の `FNX_HIP=1` 定義。

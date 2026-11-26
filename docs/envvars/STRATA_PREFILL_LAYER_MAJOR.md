@@ -1,63 +1,53 @@
 # `STRATA_PREFILL_LAYER_MAJOR`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-長い prompt を従来の chunk-major 方式で全 layer に通す代わりに、複数 chunk 分の super-chunk を layer ごとに処理する layer-major prefill を選びます。各 layer の routed expert を super-chunk ごとにまとめて処理するため、expert の読み込み回数が減ります。routed expert の加算順序と MMQ の row grouping は従来経路と異なるため、出力は bitwise 同一ではありません。
+CUDA の prompt prefill を chunk-major から layer-major の super-chunk 処理に切り替える要求スイッチ。layer-major は super-chunk 内の各 sub-chunk について各 layer の attention 側を進めてから、その layer の routed experts をまとめて実行する。従来の chunk-major と expert の加算順序・MMQ の行グループが異なるため、出力は bitwise 同一とは限らない。処理可能な条件を満たさない prompt では、値が ON でも従来経路へ戻る（`engine/src/prefill/prefill.cpp:8064-8080,9657-9705`）。
 
-環境変数は `Prefill::run()` の経路選択に使われます。ソース内の `std::getenv("STRATA_PREFILL_LAYER_MAJOR")` は `lm_env_text()` の一箇所です。ほかの一致箇所は説明コメントや kernel/build の注釈で、追加の読み取りではありません。
+通常の未設定時は OFF。例外として、生成器が単一 CUDA GPU の小さい expert cache 向け自動調整を選んだとき、条件を満たし、利用者がこの変数を空でない値にしていなければ、Strata 自身が実行環境へ `1` を設定する（`engine/src/program/generate.cpp:12561-12612`）。
 
 ## 値と判定
 
-`lm_env_text()` は最初に呼ばれた時点で `getenv()` の返したポインタを static に保持します。値は `prefill_layer_major_resolve()` に渡され、空でない文字列は `std::atoi()` で変換し、結果が 0 なら OFF、0 以外なら ON です。文字列全体の検証はありません。
+prefill 実行時に `lm_env_text()` が `std::getenv` で値を取得し、そのポインタを関数内 `static` に保存する。空文字列は `lm_env_explicit()` で未指定として扱われる。空でない値は `prefill_layer_major_resolve()` に渡され、`std::atoi(env) != 0` なら ON、それ以外は OFF（`engine/src/prefill/prefill.cpp:8082-8086,9657-9662`; `engine/include/strata/core/sm120_series.hpp:186-192`）。
 
-| 環境変数の値 | 判定 |
-|---|---|
-| 未設定 | backend・stage 数・`STRATA_DEFAULTS` に応じた既定値 |
-| 空文字 | 未設定と同じ既定値 |
-| `1`, `2`, `-1`, `1tail`, ` 1` | `atoi()` が 0 以外を返すため ON |
-| `0`, `00`, `0tail`, `off`, `  ` | `atoi()` が 0 を返すため OFF |
+`atoi` のため文字列全体の妥当性検査はなく、先頭の空白や符号を含む数値として読み取れる部分が変換される。たとえば `1`, `2`, `-1`, `+1`, `1abc` は ON、`0`, `0anything`, `off`, 数値として読めない文字列は OFF。空文字は resolver の既定値に進む。範囲 clamp や警告はない（同上）。
 
-数値の範囲、後続文字、大文字小文字は別途検証しません。非空の明示値は既定値と `STRATA_DEFAULTS=026` より優先します。したがって `STRATA_PREFILL_LAYER_MAJOR=1` は `STRATA_DEFAULTS=026` の下でも選択を許可し、`=0` は既定 ON を止めます。CLI option による値の上書きはありません。
+| 状況 | unset / 空文字 | 設定時に ON | 設定時に OFF |
+|---|---|---|---|
+| 通常の resolver（CUDA / HIP） | OFF | `atoi` の結果が 0 以外 | `atoi` の結果が 0 |
+| 単一 CUDA GPU の small-card 自動設定 | 条件を満たせば Strata が `1` を設定 | 空でない値があれば自動設定しない。実行時は上記 resolver で判定 | 空でない値があれば自動設定しない。実行時は上記 resolver で判定 |
+
+`STRATA_DEFAULTS=026` を含め、現在の `prefill_layer_major_default()` は常に false を返す。したがって未設定・空文字の既定は全 backend / stage 数で OFF。明示値は `STRATA_DEFAULTS=026` より優先する（`engine/include/strata/core/sm120_series.hpp:176-192`）。
 
 ## 有効になる条件
 
-値判定で ON になっても、layer-major の実行準備が成功しなければ実行されません。
-
-- 未設定または空文字の場合、既定 ON は CUDA build で stage 数が 2 以上、かつ `STRATA_DEFAULTS=026` でない場合だけです。単一 GPU、HIP build、`STRATA_DEFAULTS=026` では既定 OFF です。
-- 非空の値が ON なら、単一 GPU でも選択を試みます。ただし HIP build は `STRATA_LM_HIP=1` も必要です。この別変数が未設定または先頭文字が `1` 以外なら準備を断り、従来経路になります。`STRATA_LM_HIP` は先頭文字だけを確認します。
-- Metal の `Prefill::run()` はこの判定より前に Metal prompt 経路へ return するため、この変数を使いません。
-- 引き継ぎ中の chunk hand-off、peer GPU/helper、画像 prompt、DFlash2 prompt taps、`STRATA_KVA` が有効、chunk 境界で yield する batch read、`--prefill-pipe` が chunk を固定する場合は適用できません。
-- `STRATA_EXPERT_NIBBLE` の nibble slot が有効、routing/row debug dump が設定されている場合、必要な expert/MMQ/FP16/MoE buffer や対応 expert plan がない場合、WMMA 専用 layer、APR/Hadamard-folded layer、NVFP4 layer、fused expert layout でも準備を断ります。
-- prompt が短すぎる場合も従来経路になります。通常は少なくとも `2 * m.T` tokens、`STRATA_PREFILL_LM_TOKENS` が正数なら `m.T` tokens が必要です。`STRATA_PREFILL_LM_FORCE=1` は最小長を 1 にします。
-- super-chunk 用の VRAM が足りない、routing table または residual rows 用 pinned RAM が確保できない、device buffer / copy event を作れない場合も準備失敗です。layer split では各 stage が共通の super-chunk サイズを確保できることも必要です。
-
-ここに挙げた `STRATA_PREFILL_LM_*`、`STRATA_LM_HIP` などは、layer-major 経路の準備条件・サイズ決定に使う関連変数です。個別の値仕様はそれぞれの実装に従います。
+- 変数を非ゼロ値にしても要求を受理するだけで、Metal 実装では `Prefill::run()` が Metal 経路へ先に分岐するため、この変数を参照しない（`engine/src/prefill/prefill.cpp:9629-9651`）。
+- HIP build では `STRATA_LM_HIP` の先頭文字が `1` でなければ layer-major 準備処理が「layer-major prefill has only been run on NVIDIA CUDA」として辞退する。HIP でのオプトイン後も、以下の共通条件を満たす必要がある（`engine/src/prefill/prefill.cpp:8170-8179`）。
+- `hand_in_` がなく、実体 `impl_` があり、prompt に image embedding がなく、layer split の peer GPU / helper 経路でなく、split 時に PLE layer が先頭 stage に含まれること（`engine/src/prefill/prefill.cpp:9657-9662,8180-8194`）。
+- `STRATA_KVA` が有効でなく、chunk 境界で yield する batch read でなく、`--prefill-pipe` による固定 chunk 計画でなく、4-bit expert slot の対象でもないこと（`engine/src/prefill/prefill.cpp:8195-8204`）。
+- `STRATA_DBG_FEAT`、`STRATA_DBG_ROUTE_OVERRIDE`、`STRATA_PREFILL_DUMP_R_ALL` による routing / row debug dump がなく、expert plan と MMQ / FP16 / MoE buffers が揃っていること。WMMA 専用 layer、未対応の APR / NVFP4 形式、fused expert layout なども辞退条件になる（`engine/src/prefill/prefill.cpp:8205-8234`）。
+- 通常の単一 prompt では少なくとも 2 chunks 分の prompt が必要。`STRATA_PREFILL_LM_TOKENS` を正数に設定すると chunk 1 個分まで下がる。さらに super-chunk の VRAM / pinned RAM 確保と layer split 各 stage の共通サイズ確保に成功すること。容量不足や stage 間不一致なら chunk-major に戻る（`engine/src/prefill/prefill.cpp:8235-8243,8254-8285,8343-8393`）。
+- 複数 prompt の `run_multi()` はこの環境変数とは別に layer-major を強制して準備する経路があるため、この変数の値が複数 prompt 経路の唯一の有効化条件ではない（`engine/src/prefill/prefill.cpp:8409-8432`）。
+- 小さい expert cache 向けの自動設定は、`chunk > 0`、自動 `--prefill`、単一 GPU、空の `stages`、`STRATA_PF_SMALL` が未設定または空でなくても先頭文字が `0` でないこと、native pack、`STRATA_DEFAULTS=026` でないこと、既存の `STRATA_PF_FUSED` が利用者指定でないこと、対象 chunk が `1..8191` であることが条件。既存の `STRATA_PREFILL_LAYER_MAJOR` が空でない場合は値にかかわらず自動設定を抑止する。`--prefill` を明示した場合は自動 chunk sizing ではないためこの自動設定経路に入らない（`engine/include/strata/core/sm120_series.hpp:195-219`; `engine/src/program/generate.cpp:12538-12578`）。
 
 ## 実行時の詳細
 
-`Prefill::run()` が `hand_in_ == nullptr` かつ実装状態が初期化済みの場合、環境値を解決して `lm_prepare_chain()` を試します。既定で有効になった場合は process 内で一度だけ、stderr に `strata prefill: layer-major prefill is on for this layer split ...` を出します。準備に成功すると layer-major 実行後に pipeline を drain し、buffer を解放して結果を返します。
+通常の `Prefill::run()` は prompt ごとに `lm_env_text()` のキャッシュ済みテキストを resolver で評価し、ON の場合に `lm_prepare_chain()` で容量・対応条件を調べる。準備が通れば `run_layer_major()` と `lm_run()` を実行してから pipeline を drain し、失敗時はエラーを返す。準備が通らない場合は理由を出して通常の `run_impl()` に進む。環境変数自体の読み取りは初回 `lm_env_text()` 呼び出し時の static cache なので、その後の外部からの環境変更は通常反映されない（`engine/src/prefill/prefill.cpp:8082-8086,9657-9705`）。
 
-super-chunk の目標は既定 ON のとき 32,768 tokens、明示 ON または既定 OFF 条件下での opt-in では 8,192 tokens です。正数の `STRATA_PREFILL_LM_TOKENS` はこの目標を置き換えます。実際のサイズは chunk 単位に丸められ、prompt 長・stage 間の共通サイズ・利用可能な VRAM に合わせて縮小されることがあります。
-
-準備が失敗した場合は理由別の stderr `strata prefill: layer-major off for this prompt: <理由>` を出し、通常の `run_impl()`（chunk-major）に進みます。同じ理由のログは繰り返しません。未設定時の既定 ON で短い prompt の場合は、この OFF ログを抑制します。したがって、明示 ON でも prompt/model/resource 条件を満たさなければ自動的に従来方式へ戻ります。
-
-`lm_env_text()` と `STRATA_DEFAULTS` の判定は static cache されます。`Prefill::run()` ごとに resolver は呼ばれますが、初回評価後にプロセス環境を変更しても値は再読み込みされません。適用可否や必要メモリは prompt ごとに準備時に確認されます。
-
-準備成功後の layer-major 実行または pipeline drain が失敗すると `Prefill::run()` は false を返します。通常の generate 呼び出し元は stderr に `strata generate: <error>` を出して終了コード 1 を返します。
+small-card 経路はモデルの prompt chunk を決めるときに環境を直接読み、条件を通った場合、Windows では `_putenv_s`、その他では `setenv(..., 0)` で `STRATA_PREFILL_LAYER_MAJOR=1` を設定する。新しいレイアウトの chunk sizing が失敗すれば環境変数を空 / unset に戻して既定 chunk を再計算する。この処理はプロセス内の環境を変更し、子プロセスへの転送処理ではない（`engine/src/program/generate.cpp:12561-12604`）。
 
 ## ログと測定値
 
-release note は、2 枚の RTX A4000 (各 16 GB)、Qwen IQ3_XXS、RAM から多くの expert を stream する条件の 5 paired runs について、32K prompt の first word が 141.8 秒から 27.7 秒、20K が 98.8 秒から 17.5 秒、8K が 41.8 秒から 15.2 秒になったと報告しています。同資料は decode 38.6 対 38.4 tok/s、needle 12/12、quick suite 18/19、first-token probability の KL 差 0.0007〜0.009（各確認で top choice は同じ）も記載し、layer-major は加算順序が異なるため文面が変わり得るとしています。これらは同資料に記載された条件での結果です。
+- 未設定時の既定が変わり layer-major が `by_default` として選ばれた場合、プロセス内一度だけ `strata prefill: layer-major prefill is on for this layer split (each layer's experts are read once per super-chunk of up to ... tokens, not once per chunk; STRATA_PREFILL_LAYER_MAJOR=0 or STRATA_DEFAULTS=026 turns it off)` を stderr に出す（`engine/src/prefill/prefill.cpp:9661-9671`）。現行既定は OFF で、small-card 経路が設定する値は明示値扱いになるため、この枝には通常入りません。
+- 準備失敗時は、短い prompt を除き、理由が直前と異なる場合 `strata prefill: layer-major off for this prompt: <理由>` を stderr に出す。同じ理由の抑制があり、長い prompt で失敗が続く場合は 16 回ごとに `strata prefill: layer-major still off, ...` も出す。短い prompt は自動既定時には理由ログを抑制する（`engine/src/prefill/prefill.cpp:9693-9703`）。
+- small-card の自動設定を採用した場合は `strata serve: small expert cache: ...`、新レイアウトの chunk 確保にも失敗した場合は `strata serve: small expert cache: the unfused prompt path does not fit here; the default path stays ...` を stderr に出す（`engine/src/program/generate.cpp:12595-12612`）。
+- Strata の `docs/SETTINGS.md:262` は対象 backend を NVIDIA / AMD と記載し、`docs/release-notes-0.2.7.md:20,33` は layer-major が二枚の CUDA GPU で既定 ON と記述する。一方、調査対象 commit では unset の既定は OFF で、HIP は `STRATA_LM_HIP=1` がなければ辞退し、Metal 経路はこの変数を参照しない。現行ソースを優先し、同 release note の速度測定値は現行既定の根拠として扱わない。現行コードコメント中の別環境での測定値も、本書では独自に検証していないため挙げない（`engine/include/strata/core/sm120_series.hpp:176-184`; `engine/src/prefill/prefill.cpp:8170-8179,9629-9651`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:5894-5898` — 環境値の読み取りと static cache、空文字判定。
-- `include/strata/core/sm120_series.hpp:107-120` — 既定値と `atoi()` による明示値判定。
-- `src/prefill/prefill.cpp:2499-2503,7222-7271` — stage 数、Metal 早期 return、選択、既定 ON/OFF ログ、準備失敗後の fallback。
-- `src/prefill/prefill.cpp:5955-6114,6117-6168` — backend 条件、適用不可条件、短い prompt、super-chunk の目標と確保、stage 間の調整。
-- `src/prefill/prefill.cpp:5880-5892,6176-6182` — layer-major の処理概要と実行開始。
-- `src/program/generate.cpp:17794-17798` — prefill 失敗時の stderr と終了。
-- `include/strata/core/defaults_026.hpp:21-29` — `STRATA_DEFAULTS=026` の認識方法と static cache。
-- `docs/release-notes-0.2.7.md:20` — 上記測定・適用条件のリリース資料。
+- 値の取得・変換・既定値: `engine/src/prefill/prefill.cpp:8082-8086`; `engine/include/strata/core/sm120_series.hpp:176-192`。
+- small-card 条件とプロセス環境の変更: `engine/include/strata/core/sm120_series.hpp:195-219`; `engine/src/program/generate.cpp:12561-12612`。
+- 実行・辞退・容量条件: `engine/src/prefill/prefill.cpp:8170-8239,8254-8285,8343-8407,9629-9705`。
+- Strata 資料との照合: `docs/SETTINGS.md:262`; `docs/release-notes-0.2.7.md:20,33,66`。

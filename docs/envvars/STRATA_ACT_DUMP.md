@@ -1,50 +1,59 @@
 # `STRATA_ACT_DUMP`
 
-調査対象: Strata `main` の HEAD `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。調査開始時の checkout は `## main...origin/main` で、`git status --short --branch` に未コミット変更はありませんでした。
 
 ## 役割
 
-CPU native expert 用に量子化する前の活性ベクトルから、成分ごとの二次モーメント `sum(x[i]^2)` を集計してファイルに書きます。ゲート・アップ入力（token の hidden state）を `_gu.bin`、down 入力（CPU が計算する routed expert の SwiGLU 出力）を `_dn.bin` に記録します。Hadamard-folded 層では、各入力をその層の回転後の基底で記録します。
+CPU native expert の活性化を集計し、指定 prefix を付けたバイナリファイルへ書き出す研究・較正用の環境変数です。変数値自体は有効化フラグではなくファイル名の prefix です。ダンプを有効にするには、この変数に空でない prefix を設定し、さらに `STRATA_ACT_DUMP_LAYERS` で少なくとも一つの layer を指定します。収集対象は CPU native expert の gate/up 入力と down 入力であり、GPU で処理される expert の入力をこのコードが記録するものではありません（`engine/src/kernels/cpu/native_expert.cpp:432-436,449-465,488-505`、`engine/src/core/expert_source.cpp:5747-5757,5878-5892`）。
 
-これは研究・キャリブレーション用の計測フックです。通常の推論設定を変えるものではなく、記録が有効でも CPU native expert の量子化・計算は続行します。ビルドで `STRATA_NATIVE_EXPERTS` が有効なときにコンパイルされる `src/kernels/cpu/native_expert.cpp` に実装されています。
+各 layer・入力種別について、ベクトル要素ごとの二乗和 `sum(x[i]^2)` と記録数を累積します。gate/up 側は token ごとの入力、down 側は CPU routed expert の SwiGLU 出力です。層の expert が Hadamard-folded なら、量子化前に回転したベクトルを記録します。したがって記録値は回転後の CPU expert 用 basis であり、平均二乗や中心化共分散をその場で出力するものではありません（`engine/src/kernels/cpu/native_expert.cpp:432-436,514-537`）。
+
+この機能は CPU native expert の `native_quant_act` / `native_quant_h` に置かれています。通常の生成結果や expert の選択を変更せず、同じ関数内で記録した後に従来の活性化量子化を続けます（`engine/src/kernels/cpu/native_expert.cpp:514-537`）。
+
+候補名の全参照を検索した結果、実際に `STRATA_ACT_DUMP` の値を `getenv` で読むのは上記 `ActDump` constructor だけでした。設定登録 JSON の名前はメタデータであり、Trellis の `build_swap.py` / `merge_dumps.py` などは生成済み dump ファイルを読む側です。`run_parts.py` は `--dump-dir` 指定時に `STRATA_ACT_DUMP=<prefix>` を runner 引数へ追加して渡しますが、そこで値を解析・読み取りはしません（`terminal/data/settings-register.json:27-56`、`terminal/tools/trellis/run_parts.py:58-65`、`terminal/tools/trellis/build_swap.py:56-74`、`terminal/tools/trellis/merge_dumps.py:11-31`）。
 
 ## 値と判定
 
-| 変数 | 判定 |
-|---|---|
-| `STRATA_ACT_DUMP` | unset または空文字なら無効。空でない値全体をファイル名 prefix として使う。数値や真偽値としては parse しない。 |
-| `STRATA_ACT_DUMP_LAYERS` | カンマ区切りで `atoi` に渡した整数を層番号として選ぶ。unset または空文字なら層リストが空になり、記録は無効。`atoi` のため、先頭の整数部分だけが使われ、整数で始まらない要素は `0` になる（例: `10x` は 10、`abc` は 0）。大文字小文字の規則は関係しない。 |
-| `STRATA_ACT_DUMP_COV` | prefix が有効な場合に読み取る。unset、空文字、`atoi` の結果が 0 なら共分散なし。整数変換結果が 0 以外なら共分散を追加する。たとえば `1`, `-1`, `2x` は有効、`0`, `false`, 空文字は無効。 |
+`STRATA_ACT_DUMP` は `std::getenv` で読み、未設定または空文字列なら constructor がそこで終了します。空でない文字列はそのまま prefix に使い、真偽値や数値として parse しません。空白除去、パス検証、ディレクトリ作成、値の範囲検査もありません（`engine/src/kernels/cpu/native_expert.cpp:449-453`）。
 
-層番号の空白や符号は `atoi` の規則に従います。実在する `NativeFmt::layer` と一致しない番号は記録されません。層番号は native expert layout の読み込み時に `0` から設定されます。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| すべての build | `STRATA_ACT_DUMP` が unset または `""` なら prefix がなく無効 | 空でない任意の文字列（例: `act`、`/tmp/cal/act`、`0`、`true`）。ただし layer 指定も必要 | 値だけで無効となる非空文字列はない。相対/絶対パスの妥当性は検査されない |
+
+実際の記録可否は `STRATA_ACT_DUMP_LAYERS` にも依存します。未設定または空文字列では layer リストが空なので機能は無効です。値はカンマ区切りで走査され、各要素を `std::atoi` で整数化します。全体の妥当性検査や空白 trim はせず、数値の後ろの文字は `atoi` が変換できる先頭部分までしか影響しません。例えば `2,4` は layer 2 と 4、`2junk` は 2、`abc` は 0 を指定します。`2,,4` の空要素も `atoi("")` により 0 になり、負数など範囲外の値もリストには入りますが、実在 layer と一致しなければ記録されません（`engine/src/kernels/cpu/native_expert.cpp:454-464,488-490`）。
+
+`STRATA_ACT_DUMP_COV` は prefix が空でない場合に読み取られ、設定されていて `std::atoi(value) != 0` のときだけ共分散行列も累積します。よって unset・空文字・`0`・`0anything`・`true` は無効、`1`・`-1`・`2tail` は有効です。数値としての全体妥当性、大文字小文字、空白の検査はありません（`engine/src/kernels/cpu/native_expert.cpp:451-454,496-504`）。
 
 ## 有効になる条件
 
-- `STRATA_ACT_DUMP` に空でない prefix があり、`STRATA_ACT_DUMP_LAYERS` から少なくとも1要素が parse される必要があります。prefix だけ設定しても記録は始まりません。
-- 該当層の CPU native expert 経路が `native_quant_act()` または `native_quant_h()` を呼ぶ必要があります。通常の decode では CPU が native expert を計算する場合が対象です。Q2 native kernels を使う層はこれらの関数を通らず、対象になりません。prefill でも CPU native expert の活性を量子化する経路で呼ばれます。
-- `native_quant_act()` / `native_quant_h()` を呼ぶ計測・テスト経路もサンプルを加えます。したがって、設定したプロセスでそれらの関数に合成入力を渡す処理が実行されれば、その入力も集計対象です。
-- `STRATA_ACT_DUMP_COV` は prefix が空でないときだけ読み取られます。共分散は入力幅 `n` ごとに `n*n` 個の `double` を保持するため、選択層・記録種別ごとのメモリ量が大きくなります。
+- 出力 prefix が空でなく、`STRATA_ACT_DUMP_LAYERS` が空でないこと。prefix だけ、あるいは layer 指定だけでは記録しません（`engine/src/kernels/cpu/native_expert.cpp:449-465`）。
+- `STRATA_NATIVE_EXPERTS` を有効にしたビルドであること。CMake の option は既定 `ON` ですが、無効 build には native expert 実装がなく、native expert pack の読み込みは `this pack has native (IQ) experts but the engine was built without STRATA_NATIVE_EXPERTS` で拒否されます（`engine/CMakeLists.txt:178`、`engine/cmake/backends/cpu.cmake:370`、`engine/src/kernels/cpu/expert_layout.cpp:488-515`）。
+- 実行経路で対象 layer の CPU native expert 活性化量子化関数が呼ばれること。通常 pack は `act_quant_q8_1` を通り、native pack でも Q2_0 用の分岐は `act_quant_any` を使うため、このダンプ関数を通りません（`engine/src/core/expert_source.cpp:5747-5757`、`engine/src/kernels/cpu/pool.cpp:1589-1594`）。GPU 側で処理されるだけの token/expert の入力も CPU 関数では記録されません（`engine/src/core/expert_source.cpp:5747-5757,5827-5837`）。
+- 指定 layer が `expert_layout_load` で割り当てられた layer と一致すること。値は layer 範囲を検査せず、合致しなければその layer の記録は発生しません（`engine/src/kernels/cpu/expert_layout.cpp:501-520,619-620`、`engine/src/kernels/cpu/native_expert.cpp:488-490`）。
+
+ほかの Strata CLI 引数や設定ファイルが prefix を上書きする処理は見つかりませんでした。`--pack` の native expert 配置と、実行時に CPU に割り当てられた expert の処理経路が前提であり、OS や GPU backend による値の再解釈はコードにありません（`engine/src/program/generate.cpp:5378-5391`、`engine/src/core/expert_source.cpp:5747-5757`）。
 
 ## 実行時の詳細
 
-環境変数は `ActDump` の初回生成時に読み取られ、プロセス内の static インスタンスに保存されます。生成は `native_quant_act()` / `native_quant_h()` から `act_dump()` が初めて呼ばれたときです。以降にプロセス環境を変更しても、prefix・層・共分散設定は再評価されません。
+`ActDump` は `act_dump()` 内の関数ローカル static ポインタから初回アクセス時に一度だけ生成されます。最初の `native_quant_act` または `native_quant_h` で環境を読み、以後の呼び出しは prefix・layer・共分散設定をキャッシュした同じ状態を使います。プロセス実行中に環境値を変えても反映されません。prefix が未設定/空なら constructor は layer や共分散の環境変数を読まずに終了します（`engine/src/kernels/cpu/native_expert.cpp:449-471,514-537`）。
 
-記録対象のベクトルごとに、各成分の二乗を `double` に加算し、`count` を1増やします。共分散を有効にした場合は、加えて行優先で `sum(x[i] * x[j])` を蓄積します。サンプルごとの記録は mutex で保護されます。記録数はプロセス全体で数えられ、共分散なしでは2,000件ごと、共分散ありでは400,000件ごとに flush を試み、正常終了時にも `atexit` から flush します。
+有効時、`native_quant_act` は Hadamard 回転を適用した後、`native_quant_h` も同様に回転した後で、それぞれのベクトルを記録し、その後に通常の量子化を行います。gate/up 入力は CPU expert を含む token の CPU activation quantize 経路で作られ、down 入力は CPU expert job ごとの SwiGLU 結果を量子化する際に作られます。`act_dump_record` は指定 layer のみを記録し、二乗和・任意の外積和・件数を mutex 下で更新します（`engine/src/core/expert_source.cpp:5747-5757,5878-5892`、`engine/src/kernels/cpu/pool.cpp:1438-1453,1589-1594`、`engine/src/kernels/cpu/native_expert.cpp:488-505,514-537`）。
 
-出力名は `<prefix>_L<layer>_gu.bin` と `<prefix>_L<layer>_dn.bin` です。各ファイルはバイナリで、先頭に `int64 n`、続いて `int64 count`、`n` 個の `double sum(x[i]^2)`、共分散有効時はさらに `n*n` 個の `double sum(x[i]*x[j])` を書きます。flush は `<path>.tmp` を `wb` で開いて書いた後、最終名へ rename します。親ディレクトリは作成しません。ファイルを開けない場合はそのファイルを黙って skip し、書き込み・rename の失敗もログに出しません。
+出力名は `<prefix>_L<layer>_gu.bin` と `<prefix>_L<layer>_dn.bin` です。ファイル内容は順に 8 byte の `int64 n`、8 byte の `int64 count`、`n` 個の 8 byte `double` 二乗和、そして共分散有効時だけ `n*n` 個の 8 byte `double` 外積和です。値は C++ の `fwrite` でそのホストの表現のまま書かれます（`engine/src/kernels/cpu/native_expert.cpp:473-486,492-505`）。
 
-`tools/trellis/run_parts.py` は `--dump-dir` が指定されたとき、runner に `STRATA_ACT_DUMP=<part-dir>/act` を渡します。層選択や共分散はこのスクリプトでは追加設定しません。
+出力は `.tmp` に書いてから最終名へ `rename` します。累積 record 数が共分散なしなら 2000 件ごと、共分散ありなら 400000 件ごとに flush し、さらに有効化時に登録した `atexit` handler から終了時にも flush します。コードコメントには一律「every 2000 records」とありますが、実際の条件式は共分散ありで 400000 件です（`engine/src/kernels/cpu/native_expert.cpp:432-436,465,473-486,506-509`）。データが一件もない layer/kind のファイルは作られません（`engine/src/kernels/cpu/native_expert.cpp:473-486,492-505`）。
+
+## ログと測定値
+
+この収集処理自身は有効・無効のログを出しません。`.tmp` の `fopen` が失敗した場合はその出力を飛ばして続行し、`fwrite` と `rename` の戻り値も検査しないため、書き込み失敗をこの処理がログや終了コードで通知する経路はありません（`engine/src/kernels/cpu/native_expert.cpp:473-486`）。親ディレクトリも作成しません。
+
+Strata の `docs/DETAILS.md` にこの環境変数の説明や測定値は見つかりませんでした。コードコメントと実装に測定条件付きの性能値はなく、ここでは性能・精度の測定値を記載しません。
 
 ## 根拠
 
-- `CMakeLists.txt:128,1656-1761` — `STRATA_NATIVE_EXPERTS` のビルドオプションと native expert 実装の追加。
-- `src/kernels/cpu/native_expert.cpp:135-168` — 変数の読み取り、既定値、層 parse、遅延初期化と終了時 flush 登録。
-- `src/kernels/cpu/native_expert.cpp:176-213` — ファイル形式、flush、二次モーメント・共分散の集計と flush 間隔。
-- `src/kernels/cpu/native_expert.cpp:217-240` — Hadamard 回転後の gate/up・down 入力を記録し、その後に量子化する処理。
-- `src/kernels/cpu/expert_layout.cpp:506-516` — native layout の層番号と Hadamard 層設定。
-- `src/core/expert_source.cpp:5005-5016` — decode で CPU 計算対象がある場合の活性量子化。Q2 経路は `native_quant_act()` を迂回する。
-- `src/kernels/cpu/pool.cpp:1359-1380` — CPU native expert の SwiGLU 出力を down 入力として量子化する経路。
-- `src/prefill/prefill.cpp:4016-4048` — prefill の CPU native expert で gate/up 活性を量子化する経路。
-- `tools/trellis/run_parts.py:58-65` — trellis の分割 runner から prefix を渡す処理。
+- `engine/src/kernels/cpu/native_expert.cpp:432-537` — dump 状態、環境変数の parse、記録/flush、2 種の入力の記録位置。
+- `engine/src/kernels/cpu/expert_layout.cpp:488-520,619-620` — `STRATA_NATIVE_EXPERTS` のない build と layer の形式設定。
+- `engine/src/core/expert_source.cpp:5747-5757,5827-5837,5878-5892` — CPU/GPU 経路の分岐と native CPU expert job の実行。
+- `engine/src/kernels/cpu/pool.cpp:1438-1453,1589-1594` — gate/up 出力後の down 入力量子化と Q2_0 分岐。
+- `engine/CMakeLists.txt:178`、`engine/cmake/backends/cpu.cmake:370` — native expert build option と compile definition。
 
-`docs/DETAILS.md` にこの変数の記述は見つかりませんでした。性能・正確性の測定値は確認できる資料がないため記載していません。

@@ -1,6 +1,6 @@
 # `--family`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,51 +8,43 @@
 | コマンド | `strata launch` |
 | オプション | `--family` |
 | 別名 | なし |
-| 値 | family ID を表す文字列（`NAME`）。parser では候補を制限しない |
+| 値 | モデルファミリー ID（`NAME`）。文字列として受け取る |
 
 ## 役割
 
-同じモデルサイズを複数のモデル family が提供するとき、`--model` が指すサイズをどの family のものとして扱うか指定します。省略時はカタログが選び、複数候補に `qwen` が含まれる場合は `qwen`、それ以外は最初の候補が選ばれます。
+同じモデルサイズ名を複数のファミリーが提供するとき、`--model` と組み合わせてファミリーを指定します。ファミリーとサイズの組み合わせはモデルカタログで解決され、保存済み preset の選択値を上書きできます。
 
 ## 使い方
 
 ```sh
-strata launch --model iq3_xxs --family qwen --plan
+strata launch --family qwen --model q2_0 --plan
 ```
-
-ここでは `iq3_xxs` と `qwen` が現在のカタログで組み合わせ可能な例として、起動計画を表示します。実際に使える family とモデルの組み合わせは、実行する Strata のカタログに従います。
 
 ## 値と既定値
 
-- 値は必須です。`argparse` の `metavar` は `NAME` で、別名は定義されていません（`strata_cli/launch/cmd.py:83-90`）。省略時は `None` です。
-- `--model` と併用すると、モデル名は大文字・小文字を区別せず解決しますが、family ID はカタログのキーと大文字・小文字を区別して照合されます（`strata_cli/launch/catalog.py:350-374`）。family 名は固定の CLI 列挙値ではなく、同リビジョンのモデルカタログから取得されます。
-- family が存在しない場合は候補 family の一覧を含むエラーになります。family が存在しても指定モデルを提供していない場合は、その family が提供するサイズ一覧を含むエラーになります（`strata_cli/launch/catalog.py:362-370`）。
-- オプション単独では、モデルサイズの適合性検査は行われません。プリセットにモデルがあるときはその family を上書きします。プリセットなしで `--model` もない場合は、family は設定に反映されず、通常のモデル選択経路に進みます（`strata_cli/launch/cmd.py:201-218,688-706`）。
+`--family` は `NAME` を1つ取ります。parser では `choices`、型変換、既定値を指定していないため、未指定時は `None` です。ファミリー名の有効性と、指定モデルをそのファミリーが提供するかは、`--model` がある場合にモデルカタログで検証されます。照合はファミリー ID の完全一致で、大文字小文字を正規化しません。一方、モデルサイズ名は大文字小文字を区別せず照合され、カタログ上の表記が選択値として返ります（`terminal/strata_cli/launch/cmd.py:81-86`、`terminal/strata_cli/launch/catalog.py:550-572`）。
 
 ## 実行時の動作
 
-- `--model` と併用した場合、カタログは指定サイズを提供する family を調べ、指定 family とモデルの組を起動設定 `s.family` / `s.model` に格納します。family を省いたときは、候補のうち `qwen` を優先し、なければ先頭を選択します（`strata_cli/launch/cmd.py:210-217`、`strata_cli/launch/catalog.py:350-374`）。
-- その family はモデル一覧の行、インストール済み設定の識別タグ、モデルファイルの準備などに使われます。起動処理は選択した family と model を `setup.py` に `--family` / `--model` として渡します（`strata_cli/launch/catalog.py:376-378`、`strata_cli/launch/runner.py:729-762,841-861`）。したがって、同じサイズ名でも family の選択で参照・準備するモデルが変わります。
-- `--preset NAME` を指定すると preset が先に読み込まれます。`--model` を指定すれば、そのモデルと family の組で preset のモデル選択を置き換えます。`--model` を省いて `--family` だけ指定した場合は preset の `s.model` を残して `s.family` を直接置き換えます。この経路では `Catalog.resolve()` による family の存在・サイズ適合検証を通りません（`strata_cli/launch/cmd.py:197-218`）。無効な組み合わせの後続挙動は実行時の利用箇所に依存するため、ここでは受理される値として推奨しません。
-- `--model-path` と `--model` を併用した場合も family/model の組を解決します。ファイルのヘッダーから別のモデルと判定されても、明示した family/model の選択はここでは拒否されず、警告を出して指定モデルのファイルを探す処理へ進みます（`strata_cli/launch/cmd.py:206-216`、`strata_cli/launch/runner.py:1156-1188`）。`--model-path` だけなら既存ファイルから family と model を判定するため、`--family` は使われません（`strata_cli/launch/cmd.py:206-210`、`strata_cli/launch/runner.py:1189-1198`）。
-- `--plan` と併用すれば family を反映した起動計画を表示して終了します。通常起動では選択した family に基づくファイル確認・準備とサーバー起動へ続きます（`strata_cli/launch/cmd.py:733-760,784-787`）。
+- `--model` とともに指定すると、`Catalog.resolve(model, family)` がモデル名を検索します。存在しないモデル、未知のファミリー、またはそのファミリーにないサイズは `ValueError` になります。値が合えば `(family, model)` が起動設定に入り、`setup.py` に `--family` と `--model` として渡されます。またファミリー ID はモデル保存先の解決にも使われます（`terminal/strata_cli/launch/cmd.py:232-239`、`terminal/strata_cli/launch/catalog.py:550-572, 581-604`、`terminal/strata_cli/launch/runner.py:1351-1358`）。
+- `--family` を省略してモデルだけを指定した場合は、該当モデルを提供するファミリーから `qwen` を優先し、それ以外は最初の候補が選ばれます（`terminal/strata_cli/launch/catalog.py:564-572`）。
+- カタログのファミリー集合は通常のファミリー表に、Strata が認識する独自パス、Hy4、Inkling のファミリーをマージしたものです（`terminal/strata_cli/launch/catalog.py:24-38`）。
+- `--preset NAME` と併用して `--model` を省略すると、preset のモデルを保ったまま `--family` の値を設定します。この分岐では `Catalog.resolve` を通らず、ここでファミリー名と preset のモデルの整合性は検証されません（`terminal/strata_cli/launch/cmd.py:215-240`）。その後の実行処理の結果は preset の内容やカタログに依存します。
+- preset なしで `--family` だけを指定してもモデルは確定しません。対話画面では画面操作に進みます。非対話で `--plan` を付けた場合は推奨モデルの選択に進みますが、通常の非対話実行では `--family` は選択済みの入力として数えられず、モデル名または preset を指定するようエラーになります。ほかの選択入力がある場合も、モデル未指定かつ `--model-path` もなければ、推奨モデルを選ぶ処理に進むため、指定したファミリーだけでモデルを絞り込む動作ではありません（`terminal/strata_cli/launch/cmd.py:349-356, 849-873`）。
+- `--model-path` と `--family` を指定し、`--model` を省略した場合、引数処理は preset の有無にかかわらず `family` と `model` を `None` に戻すため、この分岐では `--family` は残りません。パス内ファイルの識別・検査は後段の別処理です。`--model` も指定した場合はモデルをカタログで解決してからモデルパスを保持します（`terminal/strata_cli/launch/cmd.py:222-239, 879-882`）。
 
 ## 適用条件と副作用
 
-- 通常の `--model` 解決には Terminal にモデルカタログが必要です。カタログを持たない配布形態でモデルまたはモデルパスを指定すると、実行処理より前にエラーになります（`strata_cli/launch/cmd.py:679-685`）。
-- family 選択自体は設定値を決めるもので、単独でファイルを変更しません。計画表示では「変更なし」で終了します。通常起動では選ばれた family/model に応じて不足モデルの準備などが行われ得ます（`strata_cli/launch/cmd.py:733-760`、`strata_cli/launch/runner.py:729-762,912-917`）。
-- 一部 family は専用の実行制約を持ちます。たとえば `multi_family` と判定される family では、同時リクエスト数や画像機能の設定が通常と異なる扱いになります（`strata_cli/launch/cmd.py:315-340`）。この条件は `--family` 自体の一般的な制約ではなく、選択後の family に対する起動処理です。
+このオプション自体によるファイル変更やダウンロードはありません。解決されたモデル選択は起動設定に使われ、通常の `strata launch` は以降の起動フローへ進みます。`--plan` を併用すると起動予定を表示して終了し、モデル等の変更は行いません（`terminal/strata_cli/launch/cmd.py:897-925`）。
 
 ## 出力とエラー
 
-- `--model` と指定 family の不整合、未知の family、未知のモデルは `ValueError` となり、通常出力では `strata: ...` を標準エラーへ出して終了コード 2 になります。JSON 出力モードでは同じ失敗を JSON の `ok: false` / `error` として出します（`strata_cli/launch/catalog.py:357-374`、`strata_cli/launch/cmd.py:636-641,834-835`）。
-- `--model-path` 併用時にファイル内容から別 family/model が推定されると、起動処理はその不一致を通知に記録します。指定モデル用ファイルが見つからないなどの失敗は後続の準備処理で発生し得ます（`strata_cli/launch/runner.py:1167-1188`）。
+`--model` と組み合わせた不正値はカタログ解決時のエラーになります。未知ファミリーでは近い候補と利用可能なファミリーを含む文面、モデル不在では近いモデル候補、ファミリーにサイズがない場合はそのファミリーが提供するサイズが作られます。`strata launch` はこれらの `ValueError` を通常出力では標準エラーに `strata: ...` と表示し終了コード `2` で返します。`--output json` では `ok:false` の JSON を標準出力に出します（`terminal/strata_cli/launch/catalog.py:556-568`、`terminal/strata_cli/launch/cmd.py:759-764, 1009-1012`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:83-90` — `strata launch` parser の `--family NAME` 宣言。
-- `strata_cli/launch/cmd.py:197-218` — preset 読み込み、`--model` に伴う catalog 解決、family 単独上書きの分岐。
-- `strata_cli/launch/catalog.py:350-378` — モデル・family の検証、既定 family の選択、family/model から識別タグへの変換。
-- `strata_cli/launch/runner.py:729-762,841-861` — family と model を setup に渡し、インストール済み設定・モデル状態を参照する処理。
-- `strata_cli/launch/runner.py:1116-1147,1156-1198` — `--model-path` と family/model の相互作用、ファイル判定と不一致通知。
-- `strata_cli/launch/cmd.py:636-641,679-685,733-760,784-835` — カタログ未搭載時、計画表示、通常起動とエラー出力。
+- `terminal/strata_cli/launch/cmd.py:81-86` — `strata launch` parser の登録。値は `NAME`、別名・choices・default の指定なし。
+- `terminal/strata_cli/launch/cmd.py:215-240` — preset 読み込み、`--model` との組み合わせ、`--model-path` との分岐。
+- `terminal/strata_cli/launch/catalog.py:24-38` — 解決対象ファミリー表の統合。
+- `terminal/strata_cli/launch/catalog.py:550-572` — モデル名・ファミリー・サイズの照合と既定ファミリー選択。
+- `terminal/strata_cli/launch/cmd.py:349-356, 759-764, 882-925, 1009-1012` — モデル未指定時の推奨選択、失敗出力、plan の終了処理。

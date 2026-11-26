@@ -1,58 +1,53 @@
 # `STRATA_IO_PREFETCH`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数の動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux の mapped file tier で、expert の読み出しをページフォールトに任せる経路から、ファイル全体を `pread` する I/O worker 経路へ切り替える opt-in 変数です。対象は `--mmap-experts` の `FileExpertSource` です。値を省略した既定状態では無効です。
-
-有効時、未キャッシュの expert を worker が読みます。router lookahead が使える経路では、予測した後続 layer の expert も I/O worker に先読み要求します。`experts.bin` では既定で読み込んだページを page cache に入れ、kernel は従来どおり mapping を参照します。`STRATA_IO_PF_STAGE` が非ゼロなら未キャッシュの blob を stage buffer に読み、必要な layer はその読み込みを待ちます。GGUF shard の in-place 経路では stage buffer を使う設定になります。
+`--mmap-experts` で使う `FileExpertSource` の Linux file tier で、uncached expert の読み取りと router が予測した後続 layer の読み取りを I/O worker の `pread` に切り替える。`experts.bin` では uncached blob を worker が page cache に読み込み、既に cache にある blob は mapping から渡す。GGUF を in-place で読む場合は expert の file range を staging buffer に読む。設定だけで通常の resident arena の読み方は変わらない。`generate.cpp` は `--mmap-experts` 側でのみこの設定を評価し、同じ処理は `--serve` のリクエスト経路でも使われる（`engine/src/program/generate.cpp:8621-8647, 8688-8725, 10251-10258`、`engine/src/core/expert_source.cpp:1896-1922, 5215-5221`）。
 
 ## 値と判定
 
-`src/program/generate.cpp` で `getenv` の結果を `std::atoi(v) != 0` として判定します。値全体の検証や許可値一覧はありません。
+`std::getenv` で取得し、未設定または空文字列なら既定値に任せる。それ以外は `std::atoi` の結果が 0 以外なら要求 ON、0 なら要求 OFF。文字列全体の検証や大文字小文字の扱いはなく、`atoi` が先頭の空白・符号・数字列を変換し、その後の文字は無視する。したがって `1`, `-1`, `1junk`, ` 1` は ON、`0`, `0anything`, `true`, `false`, `junk` は OFF。空文字は `atoi` 判定に入らず unset と同じ扱いになる（`engine/src/program/generate.cpp:8693-8701, 10288-10290`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字、数字に変換できない文字列、先頭の数値部分が `0` | 無効（`atoi` が 0 を返す） |
-| 先頭の空白・符号の後に非ゼロ整数がある値 | 有効。`1abc` のように整数の後ろに文字があっても、数値部分が非ゼロなら有効 |
-| 負の非ゼロ整数 | 有効 |
+| 条件 | unset / 空文字 | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| Linux の GGUF in-place file tier | 既定で ON（`linux_file_defaults()` が true） | `atoi(value) != 0` で ON | `atoi(value) == 0` で OFF |
+| Linux の `experts.bin` file tier | 起動時の cache room が expert 全体の 55% 以上なら既定で ON。未満なら OFF | `atoi(value) != 0` で ON | `atoi(value) == 0` で OFF |
+| 非 Linux | 既定 OFF | ON を要求するが setter は何もしない | OFF |
 
-`atoi` を用いるため、完全な数値文字列かどうかは検査しません。範囲外整数の変換結果は C/C++ の `atoi` の制約に従い、コード上で追加の範囲処理はありません。
+`experts.bin` の既定判定は `cache_room_ratio() >= 0.55`。cache room は `gate_cache_room()` を expert 総 byte 数で割った比率で、起動時にこの判定を行う。明示値による ON 要求は、この既定判定を上書きするが unbuffered reader では有効にならない。実装は `engine/include/strata/core/expert_source.hpp:1081-1093`、`engine/src/core/expert_source.cpp:2324-2327`、`engine/src/program/generate.cpp:8693-8701` にある。
 
 ## 有効になる条件
 
-環境変数を読むのは `o.mmap_experts` が真で、`FileExpertSource::open()` が成功し、unbuffered 設定を処理した後だけです。通常の arena source 経路ではこの変数を読みません。
-
-変数が非ゼロでも、次の条件を満たさないと `src.io_prefetch()` は有効になりません。
-
-- Linux ビルドである。
-- mapped source の `base_` が有効で、ファイル `paths_` が空でない。
-- `direct_` が空である（unbuffered file reader ではない）。
-- source が各ファイルを `O_RDONLY | O_CLOEXEC` で開ける。いずれかの open に失敗すると、それまでに開いた fd を閉じて無効のまま戻る。
-
-非 Linux では setter は何もせず、unbuffered 経路でも無効です。要求値が非ゼロなのに有効化されなかった場合、stderr に `STRATA_IO_PREFETCH=1 is not available here (Linux mapped file tier only, not with unbuffered reads); the file tier reads as before` を出します。Linux で有効化できた場合は有効ログが出ます。HIP の AMD iGPU で adaptive tier も有効な場合、Radeon 780M のメモリー圧迫時に GPU reset が見られたという警告を出しますが、処理は要求どおり続けます。
+- `--mmap-experts` または RAM 不足時に file source へ切り替わり、`src` が `FileExpertSource` として開かれていること。resident arena 経路ではこの値を適用しない（`engine/src/program/generate.cpp:8621-8647, 8745-8747`）。
+- Linux build であること。非 Linux では `set_io_prefetch` の Linux 部分がコンパイルされず、ON 要求も機能を有効にしない（`engine/src/core/expert_source.cpp:1261-1266, 1310-1312`）。
+- file source が unbuffered reader ではないこと。`set_io_prefetch` は `direct_` が空でない場合に return する。`--resident-budget-gib` / `--ssd-experts` により unbuffered read になった場合は有効化されない（`engine/src/core/expert_source.cpp:1264-1267`、`engine/src/program/generate.cpp:8654-8658`）。
+- I/O file descriptor を開けること。対象 file の `open` が失敗すると setter は途中で return し、有効化しない（`engine/src/core/expert_source.cpp:1267-1277`）。
+- 起動時に全 expert が GPU cache にある場合、既定動作で有効化された prefetch は `STRATA_FILE_TIER_IDLE` が unset または `atoi != 0` なら停止される。明示 ON で有効化した場合はこの既定停止の対象外。後で GPU cache から expert が減ると停止した既定 prefetch を再開する（`engine/src/program/generate.cpp:10258-10285, 10341-10377`）。
+- `STRATA_IO_PF_GATE` は有効時の decode prefetch をさらにゲートする。unset / 空文字なら gate は ON、非空値は `atoi != 0` で判定するため `0` は OFF。gate が閉じている間は decode の uncached range を `pread` せず mapping copy に進む。prompt 経路はこの gate の対象外（`engine/src/core/expert_source.cpp:1299-1303, 1904-1920`; gate の説明 `engine/include/strata/core/expert_source.hpp:1066-1079`）。
+- `STRATA_IO_PREFETCH` が空でなく非ゼロの場合、`STRATA_LOOKAHEAD` が unset または `atoi != 0` で、router の BF16 条件を満たすと routing-aware prefetch も開始対象になる。`STRATA_LOOKAHEAD=0` はそれを止める。これは I/O prefetch 自体の有効条件とは別である（`engine/src/program/generate.cpp:10288-10339`）。
 
 ## 実行時の詳細
 
-`FileExpertSource::set_io_prefetch()` は初期化時に worker thread 数を設定します。関連する `STRATA_IO_PF_THREADS` が正の整数ならその値、未設定・0・負値なら既定 8 です（この変数の個別仕様は対象外）。同じ初期化時に `STRATA_IO_PF_AHEAD` と `STRATA_IO_PF_STAGE` も読みます。`STRATA_IO_PF_AHEAD=0` は予測先読み queue を止めますが、要求 layer の demand read 自体は無効にしません。
+値と Linux default 判定は `--mmap-experts` source の open 後、初回 I/O に先立って評価される。ON なら `STRATA_IO_PF_THREADS` を `atoi` で読み、正数を worker 数にする。未設定・0・負値は setter 内の既定 8 thread になる。setter は file handle と staging 領域を準備して worker を起動し、gate を既定 ON にする。gate の境界値などは別変数 `STRATA_IO_PF_GATE_LO` / `_HI` が調整する（`engine/src/program/generate.cpp:8621-8647, 8693-8704`; `engine/src/core/expert_source.cpp:1261-1309`）。
 
-`STRATA_IO_PREFETCH` の判定は source 初期化時の一回です。実行中に環境を書き換えても再評価しません。`set_io_prefetch()` は Linux でファイル descriptor と worker pool を準備し、`io_pf_` と `io_stats_` を有効にします。各 layer では `prefetch()` が未キャッシュの要求 expert を worker に渡し、router lookahead が予測した expert も、read-ahead が有効なら queue に入れます。`experts.bin` の通常設定では worker が `pread` でページ cache を満たし、kernel 側は mapping を参照します。stage 設定では未キャッシュ expert の blob を buffer に読み、blob 要求側は worker の読み込み完了を待つ場合があります。
+file tier の demand read は page cache 状態を見て uncached ranges を `pread` で読む。読み取りに失敗した range はそのまま mapping から `memcpy` される。`experts.bin` で cache 済みの blob は mapping から渡され、未 cache blob は worker が cache に読み込み、kernel に渡す。router 先読み分は I/O worker が layer 計算中に読む。これらの経路は `engine/src/core/expert_source.cpp:1896-1922, 2450-2460, 2500-2530, 5215-5221` にある。
 
-有効化に失敗した場合の処理は従来の mapped file tier の読み方に戻ります。`STRATA_IO_STATS` は prefetch が OFF のときだけ別途読まれて統計を有効にします。prefetch が ON の場合は setter が統計も有効にし、request ごとの I/O ログと最後の集計に page-cache hit/miss、pread、先読みの used/unused/dropped 件数、decode 中の fetch wait を表示します。
+起動時の `STRATA_IO_PREFETCH` 判定は保存されるが、lookahead の `la_asked` 計算では同じ環境変数をもう一度読み取る。プロセス実行中に環境を変更する運用については、コード上の読み取りタイミングが異なるため、I/O prefetch の起動済み状態に遡って反映されない（`engine/src/program/generate.cpp:8693-8704, 10288-10290`）。自動停止・再開時に読む `STRATA_IO_PF_THREADS` はその時点の環境値を使う（`engine/src/program/generate.cpp:10352-10368`）。
 
-## 文書と測定値
+## ログと測定値
 
-`docs/DETAILS.md` はこの経路を Linux の opt-in とし、既定設定と `STRATA_IO_PF_STAGE=1` の A/B 測定を報告しています。記載条件は各条件 10 組の interleaved run、200-token greedy median、各 run 前に page cache を drop、cgroup でメモリー制限です。RTX 3060 32 GB / IQ3_XXS では既定 -3.4%、stage +25.7%、RTX 3060 16 GB / IQ3_XXS では既定 -1.8%、stage -32.6%、Radeon 780M iGPU 16 GB / Q2_0（adaptive tier off）では既定 -0.7%、stage -19% と記載されています。これらは文書にある条件での結果です。資料はまた、warm page cache では改善余地がなく、既定 OFF と説明しています。
-
-同資料には、greedy IQ3_XXS と Q2_0 で prefetch OFF/ON の hash が一致したとの記録があります。これは資料に記載されたモデル・実行条件の照合結果であり、ここで別途測定・再検証したものではありません。ソースのコメントも blob の bytes が同じだと説明しています。
+- file tier の Linux 既定が有効なら `strata generate: file tier (Linux defaults, ...): ...`、明示設定で有効なら `strata generate: file tier io prefetch ON (STRATA_IO_PREFETCH=1): ...` を stderr に出す（`engine/src/program/generate.cpp:8705-8718`）。
+- `experts.bin` で既定 OFF の場合、cache room 比率と「it helps from 55%」を含む理由を stderr に出し、`STRATA_IO_PREFETCH=1 turns it on anyway` と案内する（`engine/src/program/generate.cpp:8696-8699`）。
+- ON 要求が使えない場合は `strata generate: STRATA_IO_PREFETCH=1 is not available here (Linux mapped file tier only, not with unbuffered reads); the file tier reads as before` を stderr に出す。ただし Linux 既定が ON と判定されたケースで setter が失敗した場合、この unavailable 分岐には入らず、明示的な失敗ログもない（`engine/src/program/generate.cpp:8701-8724`; setter の失敗経路 `engine/src/core/expert_source.cpp:1264-1277`）。
+- `--serve` の request log では `io prefetch: ... read ahead ... used ... unused ... dropped; decode waited ...` 等を stderr に出すのは prefetch が実際に ON の場合だけ（`engine/src/program/generate.cpp:23837-23873`）。
+- `docs/DETAILS.md:302-318` には Linux GGUF / `experts.bin` の既定条件、gate と測定の説明がある。本書では測定値を独立に確認した事実としては扱わず、挙動は上記ソースの実装に基づいて記述した。
 
 ## 根拠
 
-- `src/program/generate.cpp:4620-4637,4644-4648,4667-4698` — `--mmap-experts` の source 初期化、unbuffered 判定後の環境変数読み取り、ログ、AMD iGPU 警告、および `STRATA_IO_STATS` との分岐。
-- `src/core/expert_source.cpp:636-669` — Linux 条件、mapped source / unbuffered 条件、fd open、thread 数、関連設定の読み取りと worker 起動。open 失敗時は `io_pf_` を有効化しない。
-- `src/core/expert_source.cpp:702-803,1426-1455,2116-2155,3406-3435` — read-ahead worker、demand prefetch、lookahead warm、mapped/staged blob の受け渡しと統計。
-- `include/strata/core/expert_source.hpp:717-742,824-849` — 機能の Linux file-tier スコープ、関連設定と統計項目。
-- `src/program/generate.cpp:5498-5524,12308-12339,13213-13239` — lookahead の有効化・深さ設定、および request/最終 I/O 統計ログ。
-- `docs/DETAILS.md:225-245` — opt-in の説明、A/B 測定条件・値、hash 一致と AMD iGPU 上の caveat。
+- 読み取り、既定値、起動ログ: `engine/src/program/generate.cpp:8621-8647, 8688-8745`
+- file tier への適用条件: `engine/src/program/generate.cpp:8654-8658`; `engine/src/core/expert_source.cpp:1261-1312`
+- page cache 判定と読み取り処理: `engine/include/strata/core/expert_source.hpp:1012-1023, 1081-1097`; `engine/src/core/expert_source.cpp:1886-1940, 2324-2327, 2418-2460, 5215-5238`
+- 全 expert が GPU cache にある場合の停止・再開: `engine/src/program/generate.cpp:10251-10377`
+- 観測ログ: `engine/src/program/generate.cpp:8705-8737, 23837-23873`

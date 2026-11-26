@@ -1,48 +1,49 @@
 # `STRATA_NV_CHUNK`
 
-調査対象: Strata `main` の HEAD `9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e`（2026-11-06 時点）。Strata リポジトリの作業ツリーは `main...origin/main` で未変更。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA 版 Strata の裸の `--prefill auto` が NVIDIA GPU で使う prompt chunk の上限を、既定の 8192 から 16384 または 32768 に引き上げる機能を調整します。prefill は入力 prompt を複数の token chunk に分けて処理します。この変数が指定するのは上限であり、実際の chunk は context 長、GPU cache から借りられる buffer、RAM guard によってさらに小さくなる場合があります。
+CUDA/NVIDIA の裸の `--prefill auto` が使える prompt chunk 上限を、通常の 8192 token から引き上げる設定。GPU の expert cache が貸せる量や RAM guard が許す量まで実際の chunk は小さくなり得る。設定値は `nv_chunk_ceiling_for_vram` を通じて `generate.cpp` の `prefill_auto_max`、`prefill_chunk` に反映される。明示的な `--prefill N`、`--prefill auto:N`、`STRATA_PREFILL_AUTO_MAX` を使う経路はこの NVIDIA 補正対象ではない。`engine/src/program/generate.cpp:4494-4525, 4000-4019`、`engine/include/strata/core/nv_chunk.hpp:21-38`。
 
 ## 値と判定
 
-エンジンは `std::getenv` の値を `nv_chunk_ceiling()` に渡し、次の規則で上限を決めます。整数 parse は行わず、大文字小文字や空白も変換しません。
+engine は `std::getenv` で値を取得し、`nv_chunk_ceiling` では文字列全体が厳密に `"16"` かを `strcmp` で調べた後、それ以外は先頭文字が `'0'` かだけを調べる。数値変換、空白除去、大文字小文字変換はしない。`STRATA_DEFAULTS=026` 相当が有効なら、この値判定より先に上限 0 を返す。`0` は NVIDIA 固有上限を加えず、engine の裸 auto 既定値 8192 を保つ意味である。`engine/include/strata/core/nv_chunk.hpp:21-29`、`engine/src/program/generate.cpp:4519-4523`。
 
-| `STRATA_NV_CHUNK` | 選ばれる ceiling | 意味 |
-|---|---:|---|
-| 未設定 | 32768 | 新しい既定上限 |
-| 完全一致 `16` | 16384 | 中間の上限 |
-| 先頭文字が `0`（例: `0`, `0abc`, `016`） | 0 | NVIDIA の引き上げを行わず、通常の 8192 上限を維持 |
-| その他（例: 空文字、`1`, `16x`, `true`, `-1`, 空白） | 32768 | 新しい既定上限 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効・別扱いになる値 |
+|---|---|---|---|
+| CUDA/NVIDIA の裸 `--prefill auto`、`STRATA_DEFAULTS` が 0.2.6 でない | 通常は 32768。最小可視 GPU VRAM が 0 より大きく 16.5 GiB 以下なら 0（実効既定 8192） | `"16"` は 16384。先頭が `0` の文字列（`"0"`、`"0anything"`、`"016"` など）は 0。その他（`"1"`、`"16x"`、空文字、`" 0"` など）は 32768 | 0/16 以外を無効値として弾く処理はなく、すべて 32768 扱い |
+| `STRATA_DEFAULTS` が `"026"`、`"0.2.6"`、`"v0.2.6"` | 0（8192 を維持） | なし。この master switch が設定値に優先 | `STRATA_NV_CHUNK` の内容にかかわらず旧既定動作 |
 
-`STRATA_DEFAULTS` が `026`, `0.2.6`, `v0.2.6` のいずれかなら、この変数の値にかかわらず ceiling は 0 となり、通常の 8192 に戻ります。`STRATA_DEFAULTS` の判定結果は `qwen_defaults_026()` が初回呼び出し時に static cache します。
+VRAM 条件は最小の可視 NVIDIA GPU の総 VRAM で決まり、閾値は `(16 GiB + 512 MiB)` 以下。VRAM を取得できず値が 0 の場合、この特例は適用されない。`engine/include/strata/core/nv_chunk.hpp:23-39`、`engine/src/program/generate.cpp:4503-4519`。なお `terminal/setup.py` のベンチ tip は `STRATA_NV_CHUNK` の先頭が `0` または `16` なら 32768 ではないと扱う簡易判定だが、engine 本体の厳密な parse とは異なる（例: `16x` は setup tip 上は抑制、engine 上は 32768）。これは推奨文の表示判定であり engine 設定ではない。`terminal/setup.py:8968-8986, 8998-9004`。
 
 ## 有効になる条件
 
-- 対象は `!STRATA_USE_HIP && !STRATA_GPU_METAL` の CUDA 系ビルドです。NVIDIA の device count を取得でき、表示されている GPU が 1 台以上必要です。
-- 裸の `--prefill auto`（`:N` なし）で、かつ `STRATA_PREFILL_AUTO_MAX` が設定されていない場合だけ候補になります。`--prefill auto:16384`、`auto:32768`、数値指定、および `STRATA_PREFILL_AUTO_MAX` による上限はこの規則の対象外です。`STRATA_PREFILL_AUTO_MAX` が空文字でも設定済みなら裸 auto 扱いにはならず、既存の `atoll("")` により通常上限側になります。
-- 全 GPU の compute capability major の最小値が 8 以上の場合だけ上限が引き上げられます。major が 8 未満、または capability の取得に失敗した場合は通常の 8192 のままです。
-- 複数 GPU／layer split では、引き上げられた上限が通常 8192 に戻されます。`STRATA_SPLIT_CHUNK16K` を `atoi` で変換して非 0 になる値にした場合は、この clamp が行われません。
-- Context 長と cache の fit scan も実際に選べる chunk を制限します。さらに RAM が `resident experts` 分、追加 loan 分、6 GiB の合計を下回る場合、RAM guard は上限を 32768 → 16384 → 8192 と下げます。ただし `STRATA_NV_CHUNK` が文字列として完全に `1` の場合、この guard による引き下げを抑止します。`16` は 16384 の ceiling を選びますが、RAM guard を無効にはしません。
+- NVIDIA/CUDA 相当のビルドで、`STRATA_USE_HIP` と `STRATA_GPU_METAL` が未定義であること。判定コードはこの compile guard 内にある。`engine/src/program/generate.cpp:4494-4496`。
+- `--prefill auto` が裸指定であること。`--prefill auto:N`、数値指定、または `STRATA_PREFILL_AUTO_MAX` が設定された auto は `prefill_auto_bare` にならず、この処理で引き上げない。`engine/src/program/generate.cpp:4000-4019, 4495`。
+- 可視 GPU 群の最小 compute capability が 8.0 以上、または 7.0（Volta）であること。混在構成では最小 capability が判定に使われる。Turing 7.5 や Pascal 6.x は上限を引き上げない。`engine/include/strata/core/nv_chunk.hpp:41-43`、`engine/src/program/generate.cpp:4506-4521`。
+- `STRATA_DEFAULTS` が 0.2.6 token でないこと。該当値は `STRATA_NV_CHUNK` より優先して旧上限に戻す。認識する token は完全一致の `026`、`0.2.6`、`v0.2.6` である。`engine/include/strata/core/defaults_026.hpp:21-30`、`engine/include/strata/core/nv_chunk.hpp:23-25`。
+- bare auto の host cap が 0 であること。Windows HIP など別 platform policy の cap が正なら NVIDIA 判定ブロックには入らない。`engine/src/program/generate.cpp:4016-4019, 4495`。
+- 複数 GPU (`multi_gpu`) の layer split では、`STRATA_SPLIT_CHUNK16K` が `atoi` で非 0 にならない限り上限を 8192 に戻す。空文字・非数値・`0` は 0 扱い、`1` や `-1` は非 0 扱い。`engine/src/program/generate.cpp:11248-11258`。
+- 32768/16384 の候補は expert cache の fit scan と RAM guard の対象になる。RAM が不足すれば 32768→16384→8192 と段階的に下がる。ただし `STRATA_NV_CHUNK` が文字列として厳密に `"1"` の場合は、この RAM step-down 条件を無効にする。`"01"` 等は ceiling 判定では 0 扱いでも、この guard override には該当しない。`engine/src/program/generate.cpp:11267-11301`。
 
 ## 実行時の詳細
 
-`--prefill` の引数処理が bare-auto 状態を決めた後、CUDA の NVIDIA 判定箇所で `STRATA_NV_CHUNK` を読みます。値が 0 の場合や対応 GPU がない場合は prefill 設定を引き上げず、初期値の 8192 が使われます。有効な場合は `prefill_auto_max` と `prefill_chunk` に ceiling を設定し、stderr に `strata generate: NVIDIA: --prefill auto may take chunks up to ...` を出します。その後、複数 GPU clamp、RAM guard、context 上限、cache fit scan により chunk の実値が決まります。
+裸の `--prefill auto` は引数解析時に `prefill_auto_bare` と host cap を決める。GPU 情報を取得した後、起動時の NVIDIA 判定で `STRATA_NV_CHUNK` を読み、可視 GPU の最小 capability と最小 VRAM を調べる。値が正の上限となり GPU 条件も満たすと `prefill_auto_max` と `prefill_chunk` を更新する。`engine/src/program/generate.cpp:4000-4019, 4494-4525`。
 
-ceiling を選ぶ直接読み取りは generate の引数処理中に行われ、そこで `STRATA_NV_CHUNK` を static cache しません。RAM guard は後段で同じ変数を動的な名前で読む `static const char*` を初回評価時に cache します。NVIDIA 経路では名前が `STRATA_NV_CHUNK`、gfx12 経路では `STRATA_GFX12_CHUNK` となる共通コードで、NVIDIA の場合に値が文字列として完全に `1` のときだけ guard による引き下げを無効にします。
+値の読み取りは NVIDIA 判定時の getenv と、後段 RAM guard 内の動的な名前による getenv の 2 箇所。関数内 static cache ではない。後段の再読み取りは、`prefill_raise_who == "NVIDIA"` のとき `STRATA_NV_CHUNK` を選び、値が厳密に `"1"` かを確認する。環境を起動後に変更した場合の同期や反映を保証する処理は見当たらない。なお、`STRATA_DEFAULTS` は `qwen_defaults_026()` の関数内 static で初回評価結果を cache する。`engine/src/program/generate.cpp:4503, 11267-11288`、`engine/include/strata/core/defaults_026.hpp:26-30`。
 
-`setup.py` の `bare_auto_is_32768()` もこの変数を読む箇所がありますが、これは setup の bench tip を表示するための判定です。設定ファイル側の `env` が当該キーを持てばその値を使い、なければ setup プロセスの `os.environ` を参照します。この判定は実行 engine の設定を変更しません。また、setup は `0` または `16` で始まる値を抑止値とみなすため、エンジン本体の完全一致 `16`／先頭 `0` 判定とは一部異なります。たとえば `16x` は setup の tip 判定では抑止されますが、エンジンでは 32768 を選ぶ値です。
+候補上限を設定しても、それがそのまま各 prompt の chunk になるとは限らない。RAM guard が上限を段階的に下げ、後続の fit scan が cache 等に収まる chunk を選ぶ。auto の実 chunk は `strata generate: prompt chunk auto: %lld tokens` と stderr に出る。`engine/src/program/generate.cpp:11267-11301, 11304-11317, 24055-24064`。
+
+## ログと測定値
+
+上限を引き上げると `strata generate: NVIDIA: --prefill auto may take chunks up to ...` を stderr に出す。小容量 VRAM（16.5 GiB 以下）で、対応 capability、変数 unset、`STRATA_DEFAULTS` 無効の場合は、8192 に据え置く理由を `strata generate: NVIDIA (%.1f GiB): --prefill auto stays at 8192 ...` と出す。明示的な `STRATA_NV_CHUNK=0` や `STRATA_DEFAULTS=026` ではこの unset 専用理由ログは出ない。RAM guard が候補を下げた場合は、現在の上限・必要な追加 cache slots/RAM・利用可能 RAM と reserve を示す stderr 行を出す。`engine/src/program/generate.cpp:4520-4532, 11288-11297`。
 
 ## 根拠
 
-- `include/strata/core/nv_chunk.hpp:15-23`: 未設定、完全一致 `16`、先頭 `0` の値規則。
-- `include/strata/core/nv_chunk.hpp:25-29`: 最小 compute capability major が 8 以上である条件と RAM guard の段階値。
-- `include/strata/core/defaults_026.hpp:21-29`: `STRATA_DEFAULTS` の許容値と初回読み取り後の cache。
-- `src/program/generate.cpp:807-829`: prefill auto の既定値と bare-auto フラグ。
-- `src/program/generate.cpp:3526-3548`: CLI `--prefill`、`STRATA_PREFILL_AUTO_MAX`、bare-auto の設定。
-- `src/program/generate.cpp:3873-3898`: CUDA の NVIDIA GPU 条件、変数読み取り、上限設定、stderr ログ。
-- `src/program/generate.cpp:9655-9709`: context ceiling、multi-GPU clamp、動的な guard 読み取り、RAM guard と `STRATA_NV_CHUNK=1` の例外。
-- `setup.py:7918-7931`: setup の情報表示用判定と設定 env／プロセス環境の優先関係。
-- `docs/DETAILS.md:1309-1315`: bare auto の上限、RAM guard、layer split と明示指定の説明。コードの現行挙動を優先して記載。
+- `engine/include/strata/core/nv_chunk.hpp:21-46` — 値の解釈、VRAM 特例、対応 compute capability。
+- `engine/include/strata/core/defaults_026.hpp:21-30` — `STRATA_DEFAULTS` の認識 token と static cache。
+- `engine/src/program/generate.cpp:4000-4019, 4494-4535` — CLI 条件、compile guard、GPU 条件、設定値反映と理由ログ。
+- `engine/src/program/generate.cpp:11248-11301, 24055-24064` — layer split、動的 env 名での RAM guard override、chunk fit/選択ログ。
+- `terminal/setup.py:8968-9004` — セットアップ画面の助言専用判定。
+- `docs/DETAILS.md:1513-1519` — ソースの上限・RAM guard に関する記述との照合。現行挙動の根拠は上記ソース。

@@ -1,42 +1,42 @@
 # `STRATA_METAL_PROMPT_QSA`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal の streaming prompt 用行列ユニット経路で、QSA attention を `flash` 実装にするか、旧 `v1` の attention と merge にするかを選びます。この変数は prompt 経路そのものを有効化する設定ではありません。prompt の経路選択は `STRATA_METAL_PROMPT`、入力長、streaming の有無などで決まり、その経路が `prompt_chunk()` を使う場合にだけこの設定が使われます。
+Metal の streaming prompt GEMM 経路で、QSA prompt attention を `flash` と `v1` のどちらで dispatch するか選ぶ。未設定時は `coop_k4()` が判定した matmul2d layout (`p.k4`) に合わせ、K4 なら flash、そうでなければ v1 になる。設定されている場合は値が `flash` と完全一致したときだけ flash を選ぶ。選択結果は初期化ログにも出る。`prompt_chain.inc` の通常 prompt 経路にはこの環境変数の参照がなく、同経路の `b.k4` による処理とは別である。根拠: `engine/metal/src/engine/window.cpp:3061-3066,3124-3126,3287-3308`; `engine/metal/src/engine/prompt_chain.inc:26-46,49-60`。
 
 ## 値と判定
 
-`Window::prompt_gemm_init()` が `std::getenv()` で値を取得し、設定されていれば文字列全体を大文字小文字区別で `"flash"` と比較します。数値 parse や先頭文字判定ではありません。
+値は `std::getenv` で取得し、未設定かどうかを見た後、設定値全体を `std::string(eq) == "flash"` で比較する。大文字小文字を区別し、空白除去や数値・真偽値への変換はしない。空文字、`v1`、`FLASH`、`flash `、`1`、`0`、その他の値はいずれも v1 を選ぶ。無効値の警告や fallback ログはなく、値の受理範囲の検証もない。未設定時の結果のみ `p.k4` に依存する。根拠: `engine/metal/src/engine/window.cpp:3061-3066`。
 
-| 値 | 選択される QSA 経路 |
-|---|---|
-| 未設定 | `COOP_K4` の判定結果 `p.k4` が true なら `flash`、false なら `v1` |
-| `flash` | `flash` |
-| 空文字、`v1`、`FLASH`、その他の設定値 | `v1` |
+| 条件 | unset | 設定時に flash になる値 | 設定時に v1 になる値 |
+|---|---|---|---|
+| Metal streaming prompt GEMM の初期化 | `p.k4 == true` なら flash、それ以外は v1 | 完全一致の `flash` | 空文字を含む `flash` 以外すべて（例: `v1`, `FLASH`, `flash `, `1`, `0`） |
 
-設定値が空文字でも「未設定」扱いにはなりません。値が `flash` 以外なら常に `v1` です。`p.k4` は `COOP_K4` が設定されていればその `atoi()` 結果が非ゼロかで決まり、未設定なら Metal 上で協調 tensor のレイアウトを調べる probe の結果です（`metal/src/engine/prompt_chain.inc:26-46`）。したがって未設定時の既定は単純な固定値ではなく、そのレイアウト判定に依存します。
+`p.k4` は `coop_k4()` の結果で、`COOP_K4` が設定されていれば `atoi(e) != 0`、未設定なら Metal の協調レイアウトを実行して判定する。このため `COOP_K4` が設定されている場合はその変換結果が未設定時の既定選択に影響する。根拠: `engine/metal/src/engine/window.cpp:3061`; `engine/metal/src/engine/prompt_chain.inc:26-46`。
 
 ## 有効になる条件
 
-- `STRATA_METAL_PROMPT=window` が設定されていると prompt は decode window 経路になります。この場合、`STRATA_METAL_PROMPT_QSA` は参照されません。`STRATA_METAL_PROMPT` の判定は文字列全体の完全一致です。
-- 非 streaming で prompt 長が `STRATA_METAL_PROMPT_MIN`（既定 32）以上の場合は `Window::prompt()` の prompt-chain 実装になります。この経路も本変数を参照しません。
-- streaming では、`STRATA_METAL_PROMPT_GEMM` が文字列 `"0"` でなく、prompt 長が `STRATA_METAL_PROMPT_GEMM_MIN`（既定 64）以上なら `prompt_chunk()` を使います。このとき `STRATA_METAL_PROMPT_QSA` が適用されます。`STRATA_METAL_PROMPT_GEMM` は未設定なら有効で、`"0"` との完全一致だけが無効です。
-- streaming arena の作成時にも、`STRATA_METAL_PROMPT_GEMM` が `"0"` でなければ prompt GEMM を初期化します。QSA の値はその初期化時に読み取られます。
+- Metal backend の `Window::prompt_gemm_init` が走る streaming prompt GEMM 経路で読む。`STRATA_METAL_PROMPT_GEMM=0` は streaming arena の初期化時の GEMM setup を無効にし、prompt 実行時の streaming GEMM 分岐も通さない。未設定または文字列 `0` 以外なら有効候補になる。根拠: `engine/metal/src/engine/window.cpp:1793-1808,3749-3765`。
+- streaming prompt では `STRATA_METAL_PROMPT=window` の指定がなく、かつ token 数が `STRATA_METAL_PROMPT_GEMM_MIN`（未設定時 64）以上である必要がある。満たさない場合は decode window 経路に進み、この変数による選択は使われない。根拠: `engine/metal/src/engine/window.cpp:3746-3775`。
+- 非 streaming の長い prompt は `Window::prompt` を呼び、`prompt_chain.inc` の実装を使う。この変数はその経路では読み取られず、設定しても選択に影響しない。`STRATA_METAL_PROMPT=window` の場合も `prompt_run_rows` は prompt GEMM 経路を迂回する。根拠: `engine/metal/src/engine/window.cpp:3743-3775`; `engine/metal/src/engine/prompt_chain.inc:49-60`。
+- `COOP_K4` は値が未設定のときの既定選択 (`p.k4`) にだけ関係する。`STRATA_METAL_PROMPT_QSA` が設定されていれば、その値の `flash` 判定が QSA variant を決める。ただし flash kernel の dispatch には `p.k4` も function constant として渡される。根拠: `engine/metal/src/engine/window.cpp:3061-3066,3290-3293`。
 
 ## 実行時の詳細
 
-`prompt_gemm_init()` は既に `pg_` が作成済みならそのまま成功するため、QSA の variant は `PromptGemm` の初期化時に一度決まり、その window の後続 chunk では再読込されません。初期化ログは stderr に `strata metal: prompts on the matrix units in chunks of ... (experts ..., QSA flash|v1, matmul2d layout ..., ... GB of buffers...)` の形式で出ます。
+streaming arena を作る際、`STRATA_METAL_PROMPT_GEMM` が無効でなければ `prompt_gemm_init` が初期化される。streaming prompt 実行時にも同じ初期化関数を呼ぶが、すでに `pg_` がある場合は直ちに成功して戻る。その初回初期化で環境変数を読み、`p.flash` に保存し、以後はその値で scratch buffer サイズと QSA dispatch を決める。したがって初期化後にプロセス環境を変更しても既存の `PromptGemm` には反映されない。根拠: `engine/metal/src/engine/window.cpp:1808,3037-3039,3065-3066,3096,3123-3126,3753-3755`。
 
-`flash` 経路は QSA query を FP16 に変換して `qsa_flash` を dispatch し、カーネル内で cooperative `matmul2d` と online softmax を使って attention と出力投影用のゲートを計算します。`v1` 経路は chunk を `QS` 行ずつに分け、`qsa_attn` と `qsa_merge` を dispatch してから出力を FP16 化します。どちらも QSA の選択・top-k の後に attention を計算します。`qsa_flash` は query を half で読み、dequantize した key/value を half の cooperative tensor に変換して演算する一方、`qsa_attn` は float query と float partials を使います（`metal/kernels/qsa_prompt.metal:203-210,227-268`; `metal/kernels/qsa.metal:274-288`）。演算経路が異なるため、出力が常にビット一致するとはソースからは言えません。
+flash では `p.part` に小さい固定領域を確保し、QSA を `qsa_q_f16` と `qsa_flash` で処理する。v1 では `p.QS` と QSA geometry に応じた partial buffer を確保し、`qsa_attn` を `p.QS` 行単位で実行して `qsa_merge` で結合し、出力を fp16 化する。どちらも後続の出力 projection に進む。コード上、この変数が直接変えるのはこの QSA prompt attention の kernel variant と scratch buffer であり、モデル選択や CLI 引数の値を変更する処理はない。根拠: `engine/metal/src/engine/window.cpp:3096,3287-3308`。
+
+## ログと測定値
+
+初期化が成功すると stderr に `strata metal: prompts on the matrix units in chunks of ... (experts ..., QSA flash|v1, matmul2d layout K4|other; ... GB of buffers...)` の形式で選択結果を出す。明示値が無効でも警告は出ず、`flash` 以外はログ上 `QSA v1` となる。stream arena の確保に失敗した場合は `metal prompt: no arena region for the prompt buffers` をエラー文字列に設定して初期化失敗するが、これはこの変数の値の検証エラーではない。ソース資料から当該変数を使った性能測定値は確認できない。根拠: `engine/metal/src/engine/window.cpp:3117-3127`。
 
 ## 根拠
 
-- 値の取得、既定値、`p.flash` による scratch buffer の選択とログ: `metal/src/engine/window.cpp:2019-2045,2074,2101-2103`。
-- `flash` と `v1` の dispatch 差: `metal/src/engine/window.cpp:2263-2283`。
-- streaming prompt が `prompt_chunk()` を使う条件、`STRATA_METAL_PROMPT=window` の分岐、閾値の既定値: `metal/src/engine/window.cpp:2555-2585`。
-- streaming arena の初期化時に prompt GEMM を準備する条件: `metal/src/engine/window.cpp:1194-1209`。
-- `COOP_K4` の値判定と未設定時の layout probe: `metal/src/engine/prompt_chain.inc:26-46`。
-- `qsa_flash` の algorithm と half query / cooperative tensor 実装: `metal/kernels/qsa_prompt.metal:203-268`。`qsa_attn` の float query と float partials: `metal/kernels/qsa.metal:274-288`。
-- `docs/DETAILS.md` および Metal 関連資料を確認したが、この環境変数の説明や比較測定値は見つからなかった。性能差・精度差の大きさは、この調査では確認していない。
+- `engine/metal/src/engine/window.cpp:3061-3066` — matmul2d layout 判定と対象変数の取得・比較。
+- `engine/metal/src/engine/window.cpp:3096,3123-3127` — variant 別バッファ、初期化完了ログ。
+- `engine/metal/src/engine/window.cpp:3287-3308` — flash / v1 の QSA kernel dispatch。
+- `engine/metal/src/engine/window.cpp:1793-1808,3743-3775` — streaming 設定と prompt 経路の条件。
+- `engine/metal/src/engine/prompt_chain.inc:26-46,49-60` — `COOP_K4` による `p.k4` 判定と別 prompt 実装。

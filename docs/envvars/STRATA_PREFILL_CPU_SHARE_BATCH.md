@@ -1,44 +1,56 @@
 # `STRATA_PREFILL_CPU_SHARE_BATCH`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-serve の `--batch` 実行で、prompt の prefill に decode 用 CPU expert pool を渡せるようにする opt-in です。batch slot が decode 中の read では pool の share を止め、decode 中の slot がない read では利用を許可します。変数自体は share 量や CPU share の有効化を指定しません。実際に expert を CPU に割り当てるかは `STRATA_PREFILL_CPU_SHARE`、chunk、pool の有無などにも依存します。
+`--serve --batch N` の prompt 処理にも CPU expert pool を渡す opt-in です。batch slots が decode 中は prompt 側の CPU share を止め、decode 中でない prompt read では使えるようにします。batch slot の decode と prompt read が同時に同じ pool を使うことを避ける制御です。この変数は batch 時に pool を prompt path へ渡し、通常 batch では対象外の default-share 判定にも入れるため、条件を満たせば default share が有効になります。`STRATA_PREFILL_CPU_SHARE` の明示値は default 判定より優先されます（`engine/src/program/generate.cpp:11868-11883,12374-12385`、`engine/src/prefill/prefill.cpp:4630-4639`）。
 
 ## 値と判定
 
-値全体を parse せず、`getenv()` が返す文字列の先頭文字だけを `'1'` と比較します（`src/program/generate.cpp:10123,16483-16484`）。
+値全体の parse や数値変換はせず、`getenv` が非 null で先頭 byte が文字 `'1'` かを判定します。未設定、空文字、先頭が `1` 以外なら false。従って `1`、`10`、`1anything` は true、`0`、`01`、`2`、`true`、` 1`、空文字は false です。大文字小文字・後続文字・数値妥当性の検査はありません（`engine/src/program/generate.cpp:11868-11871,20757-20767`）。
 
-| 値 | 判定 |
-| --- | --- |
-| 未設定 | 無効 |
-| 空文字 | 無効（値は設定済みでも先頭文字が `\0`） |
-| `1`, `10`, `1abc` | 有効 |
-| `0`, `true`, `false`, ` 1` など | 無効 |
-
-無効値に対するエラーや警告、数値変換、範囲 clamp はありません。2か所の判定はそれぞれ関数内 static に保存され、各箇所の初回評価後に環境を書き換えても再評価されません。CLI 引数がこの値を上書きする処理はありません。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 全 build（対象変数の判定） | false | 先頭 byte が `1`（例: `1`, `10`, `1anything`） | 空文字、`0`, `01`, `2`, `true`, ` 1` など先頭 byte が `1` でない値 |
 
 ## 有効になる条件
 
-- 対象は `strata serve` の経路です。serve 起動時に `--batch` が 1 以上で、この変数が有効、かつ `--no-pool` が指定されていない場合に `share_pool` が true になり、prompt 用 `Prefill` に CPU pool が設定されます（`src/program/generate.cpp:10124-10127,10629-10637`）。通常の batch なし serve では既に pool が対象で、この変数による追加効果はありません。
-- 複数 GPU／layer split では未設定時の既定 share は arm されませんが、明示的な `STRATA_PREFILL_CPU_SHARE` は pool がある stage で有効になり得ます。serve は `by_default` を `stages.empty()` かつ `!multi_gpu` に限定して `arm_cpu_share` を呼びます。一方、`applies` は `share_pool` なので、明示値の share は複数 stage にも適用可能です。layer split では stage が pool を同時取得しないよう制御されます（`src/program/generate.cpp:10134-10135,10629-10637`; `src/prefill/prefill.cpp:2844-2872,3571-3581`）。
-- prompt read ごとに batch slot の `active` 数を数え、1つ以上なら share を blocked にします。slot が decode 中でなければ解除します。各 run の前に更新されるため、slot の状態に応じて read の run ごとに判定し直します（`src/program/generate.cpp:16477-16487,16596-16605,16908-16915`）。独立した `STRATA_BATCH_CONCURRENT_READ` の経路では並行 decode 中の read を blocked にします（`src/program/generate.cpp:16613-16630`）。
-- pool があっても、CPU share の実動作には別途 `STRATA_PREFILL_CPU_SHARE` が有効で、対象 chunk が `stream_all_min()` より小さく、pipe chunk ではなく、share が blocked でないことが必要です。`STRATA_PREFILL_CPU_SHARE` は未設定時の既定、完全一致の `auto`、または `atof` を clamp した 0〜1 の値で判定されます。pool の同時取得にも成功する必要があります（`src/prefill/prefill.cpp:257-260,262-290,3570-3581`）。このため、本変数だけを設定しても CPU share は有効になりません。
-- CPU share は native expert layout など実装上の適格条件も確認します。native layout、非 null source、CPU share が停止されていないことなどを満たさなければ CPU 側へ expert を割り当てません（`src/prefill/prefill.cpp:4667-4677`）。backend ごとの「既定 share」の扱いは `arm_cpu_share` に別条件があります。CUDA 系では適格経路で未設定時の既定を arm し、HIP は gfx12 判定時のみ既定を arm します（`src/prefill/prefill.cpp:2845-2872`）。ただし `STRATA_PREFILL_CPU_SHARE_BATCH` はそれ自体を backend 制限で判定しません。
+- 実際の対象経路は `--serve` の batch prompt read です。`--batch` が 0 以下なら prompt path は元から pool を受け取るため、この変数による batch 向けの追加効果はありません（`engine/src/program/generate.cpp:11872,12302,12374-12380`）。
+- `--batch` が正でも `--no-pool` を指定すると `serve_share_pool` は false になり、prompt path に pool は渡されません（`engine/src/program/generate.cpp:846,1384,3931,11872,13024-13032`）。
+- CPU share を使うには `STRATA_PREFILL_CPU_SHARE` の判定も通る必要があります。batch 時にこの対象変数が true なら、CUDA の 1 GPU layout（または CUDA の 2-card layer split で `STRATA_SPLIT_CPU_SHARE` が unset / on）かつ GPU cache に未常駐 expert がある場合、`STRATA_PREFILL_CPU_SHARE` 未設定時でも default share が arm されます。default share は host-memory gate によって disarm されることがあります。HIP build は `arm_cpu_share` の default が gfx12 / discrete gfx11 に限定され、SYCL build はこの default-arm 分岐を持ちません。`STRATA_PREFILL_CPU_SHARE=0` は off、明示的な非ゼロ値または `auto` は layout / work の default 条件を越えて share を有効にし得ます（値の parse は同変数の実装に従います）（`engine/src/program/generate.cpp:11872-11883,12386-12392`、`engine/include/strata/prefill/share_rules.hpp:102-118`、`engine/src/prefill/prefill.cpp:691-704,3812-3868`）。
+- prompt `Prefill` が pool を受け取り、対象 chunk が `stream_all` でも `pipe_chunked` でもない場合に share の候補になります（`engine/src/program/generate.cpp:13024-13032`、`engine/src/prefill/prefill.cpp:4630-4639`）。
+- batch slots が 1 つ以上 active なら share gate が blocked になります。`STRATA_BATCH_CONCURRENT_READ` の concurrent-read 経路は slot decode と read を重ねるため、別途常に blocked にします（`engine/src/program/generate.cpp:20757-20767,20893-20910`）。
+- 対象変数の読み取り自体に OS / backend / build macro の条件分岐はありません。CPU share の backend・GPU・モデル等の適用条件は別の機能側に属し、この調査では対象変数だけから有効範囲を追加推定しません。
 
 ## 実行時の詳細
 
-serve 初期化時に `share_batch` を読み、batch ありで有効なら stderr に `strata serve: STRATA_PREFILL_CPU_SHARE_BATCH=1: the prompt path may use the CPU pool beside the %lld batch slots, for a read with no slot decoding` という書式で出します（`src/program/generate.cpp:10121-10127`）。このログは利用可能性を示すもので、CPU share が各 read で実際に使われる保証ではありません。
+serve 初期化で `share_batch_env` を関数内 `static const bool` として一度読み、`--batch` が正の場合に限り `serve_share_pool` を通じて pool の割当条件を変えます。batch read の `share_gate` 内にも別の `static const bool on` 読み取りがあり、初回 gate 時に cache して診断ログの出力だけに使います。通常のプロセス実行では起動後の環境変更は想定されず、pool 割当判定は再評価されません。batch read の `share_gate` は各 `run` の直前に active slot 数を数え、`Prefill::set_share_blocked(busy > 0)` を呼びます。batch のパイプライン read でも reader 起動前に同 gate を設定します（`engine/src/program/generate.cpp:11868-11883,20757-20767,20776-20786,20877-20885,21184-21195`）。
 
-batch prompt の各 read run 前に `share_gate` が slot の稼働数を調べ、`Prefill::set_share_blocked(busy > 0)` に渡します。有効設定時は最大4回、`strata batch: CPU share for this read: %s (%d slot(s) decoding)\n` の書式で stderr に出します（`src/program/generate.cpp:16477-16487,16596-16605`）。Prefill 側は chunk ごとに pool を取れるか確認し、条件を満たす場合に CPU pool へ非 resident expert の一部を割り当てます（`src/prefill/prefill.cpp:3571-3581,4667-4695,4804-4805`）。
+`Prefill` 側は pool があり、CPU share が on で、chunk が `stream_all` / `pipe_chunked` ではなく、share gate が blocked でないときに pool を取ろうとします。blocked の間は prompt chunk が CPU share を取らず、slot window が pool を使える状態を保ちます（`engine/src/prefill/prefill.cpp:4630-4639`）。CPU share は CPU 側の activation format を使うため GPU の結果と bit-identical ではない旨が実装コメントにあります（`engine/include/strata/prefill/prefill.hpp:301-308`）。
 
-share 用 pinned buffer を確保できない場合は、Strata はその engine の CPU share を停止して `prefill: the CPU share is off for this run: the host could not give %s (RAM is short); the GPU streams every expert\n` の書式で stderr に出します（`src/prefill/prefill.cpp:4669-4677`）。prefill のその他の失敗は通常の `Prefill::run` の失敗として呼び出し元へ返されます。本環境変数固有の終了・失敗経路はありません。
+## ログと測定値
+
+`STRATA_PREFILL_CPU_SHARE_BATCH` の先頭が `1` で、`--batch` が正かつ `--no-pool` でないと、serve 初期化時に次の stderr 行を出します（`engine/src/program/generate.cpp:12376-12380`）。
+
+```text
+strata serve: STRATA_PREFILL_CPU_SHARE_BATCH=1: the prompt path may use the CPU pool beside the %lld batch slots, for a read with no slot decoding
+```
+
+share gate が有効値を認識した場合は、最初の 4 回まで次の stderr 行も出します。`%s` は `off` または `on`、`%d` は active slot 数です（`engine/src/program/generate.cpp:20762-20767`）。
+
+```text
+strata batch: CPU share for this read: %s (%d slot(s) decoding)
+```
+
+この環境変数に固有の性能測定値は、参照したソース資料に条件付きで記載されていません。最初の serve ログは pool を prompt path に渡す条件を示すだけです。default share が host-memory gate によって disarm される場合や、`STRATA_PREFILL_CPU_SHARE=0` の場合もあり、この行だけで CPU share の実行は判断できません。
 
 ## 根拠
 
-- 環境値の読み取り、pool の有効条件、起動ログ: `src/program/generate.cpp:10121-10135`。
-- serve の Prefill への pool 設定: `src/program/generate.cpp:10629-10637`。
-- batch slot 状態に応じた gate とログ: `src/program/generate.cpp:16477-16487,16596-16605,16908-16915`。
-- pool と share の arm、backend の既定条件: `src/prefill/prefill.cpp:262-290,2844-2875`。
-- chunk ごとの CPU share gate と適格条件・メモリ不足時の fallback: `src/prefill/prefill.cpp:3570-3581,4667-4695,4804-4805`。
+- `engine/src/program/generate.cpp:11868-11883` — 1 回目の値判定、batch の pool 条件、share arm 条件。
+- `engine/src/program/generate.cpp:12374-12392` — serve の告知ログと cache / host-memory gate。
+- `engine/src/program/generate.cpp:13024-13032` — CPU pool を prompt path に渡す箇所。
+- `engine/src/program/generate.cpp:20757-20767,20877-20885,20893-20910,21184-21195` — 2 回目の値判定、slot 状態による gate と read 経路。
+- `engine/src/prefill/prefill.cpp:691-704,3812-3815,3868,3907,4630-4639` — CPU share の判定、blocked flag、chunk 実行条件。
+- `engine/include/strata/prefill/prefill.hpp:301-324` — CPU share と batch gate の API / 動作コメント。
+- `engine/include/strata/prefill/share_rules.hpp:102-118` — default share が対象となる cache 条件と GPU layout。

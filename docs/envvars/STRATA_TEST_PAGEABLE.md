@@ -1,43 +1,47 @@
 # `STRATA_TEST_PAGEABLE`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリや driver 自身が読む環境変数の動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-ページロック（pinned）ホストメモリを使う一部のアップロード／prefill 用バッファを意図的に避け、コードに用意された pageable メモリの経路を通す診断用フックです。CUDA/HIP 共通側の `PinnedRing`、CUDA/HIP 側と SYCL 側それぞれの `Prefill` に読み取り箇所があります。一般的な設定というより、pinned allocation が失敗した場合の fallback 経路を試す用途です。
+開発・診断用の切替で、CUDA/HIP と SYCL の prefill が pageable host memory へ fallback する一部の pinned host buffer を、pinned allocation を試さずに pageable 側へ回します。通常時に pinned allocation が失敗した場合の fallback 経路を、pin 可能な環境でも通す用途です。名前と実装コメントが示すとおり、通常利用者向けのモデル設定ではなく、ASan / `MALLOC_CHECK_=3` などで fallback 経路を試す開発・診断用フックです。CUDA/HIP の `PinnedRing` でも pinned slot の使用を抑止し、caller の memory から転送して stream を待つ経路になります。`engine/src/prefill/prefill.cpp:359-363,1156-1168,1454-1479,2576-2602`、`engine/sycl/src/prefill/prefill.cpp:201-208,502-535,1508-1565`、`engine/include/strata/core/pinned_ring.hpp:36-43,48-53,95-113,120-149,172-175`。
 
 ## 値と判定
 
-3か所の読み取りはいずれも `getenv()` の戻り値が非 null で、かつ先頭文字が `'1'` のときだけ有効とします。文字列全体の parse、数値変換、大文字小文字の処理はありません。
+各 reader は `getenv` の結果が null でないことに加えて `e[0] == '1'` を判定します。文字列全体の parse や数値変換はせず、空文字は無効、先頭文字が `1` なら残りの文字列に関係なく有効です。先頭文字の比較は大文字小文字を区別し、空白を読み飛ばしません。各 reader の関数内 `static const bool` に最初の評価結果が保存されます。
 
-| 環境値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（値は設定済みだが先頭文字は `\0`） |
-| `1`, `10`, `1anything` | 有効 |
-| `0`, `true`, その他先頭文字が `1` でない文字列 | 無効 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP `Prefill::init` と `PinnedRing` | 無効（通常の pinned allocation / slot 利用を試行） | `1`, `10`, `1anything` | 空文字、`0`, `true`, `True`, ` 1`, `01` |
+| SYCL `Prefill::init` | 無効（通常の pinned host allocation を試行） | `1`, `10`, `1anything` | 空文字、`0`, `true`, `True`, ` 1`, `01` |
 
-各読み取り関数は結果を `static const bool` に保存します。判定はその関数が初めて呼ばれた時点で行われ、以後の環境変更では再評価されません。CUDA/HIP側には `PinnedRing::pageable_forced()` と `Prefill` 内の `force_pageable()` の別々のキャッシュがあり、SYCL側にも独立した `force_pageable()` があります。
-
-根拠: `include/strata/core/pinned_ring.hpp:137-140`、`src/prefill/prefill.cpp:120-125`、`sycl/src/prefill/prefill.cpp:108-113`。
+根拠: `engine/src/prefill/prefill.cpp:361-364`、`engine/sycl/src/prefill/prefill.cpp:206-209`、`engine/include/strata/core/pinned_ring.hpp:172-175`。
 
 ## 有効になる条件
 
-該当する実行ファイルに各実装が組み込まれ、その関数が呼ばれることが条件です。値が有効でも、該当する `PinnedRing` の転送や `Prefill::init` の対象バッファ確保がなければ影響しません。コマンドライン引数や設定ファイルによる上書きはこの変数の読み取り箇所にはありません。
-
-この変数が抑止するのは、コードが明示的に `force_pageable()`／`pageable_forced()` を確認する pinned allocation です。ホストメモリ割り当て全体を pageable にするものではありません。たとえば SYCL の `Stager::init` は `done_seq` と `src_seq` を環境変数判定なしで `sycl::malloc_host` から確保します（`sycl/src/prefill/prefill.cpp:388-393`）。
+- Strata の CUDA/HIP または SYCL engine で、該当する prefill buffer 初期化・転送経路が使われる必要があります。Metal の `Prefill::init` は早期に Metal 実装へ委譲し、これらの CUDA/HIP・SYCL fallback 分岐は通りません（`engine/src/prefill/prefill.cpp:2443-2454`）。
+- CUDA/HIP の `PinnedRing` による pageable host upload/download にも適用されます。SYCL にはこの `PinnedRing` 実装は使われず、SYCL prefill 内の各 fallback 分岐が対象です（`engine/include/strata/core/pinned_ring.hpp:27-43,95-113`）。
+- 値が有効でも、各 buffer の初期化または転送が実行されなければ効果はありません。特に SYCL の mapped routing table は `STRATA_GROUP_COPY=0` のときだけ mapped allocation を検討するため、既定の copy 経路ではこの変数による差はありません（`engine/sycl/src/prefill/prefill.cpp:1508-1546`）。CUDA/HIP の mapped routing table は `STRATA_GROUP_COPY` が先頭 `1` でない場合に allocation を試み、変数が有効なら mapped pinned allocation を飛ばして通常の copy 経路へ進みます（`engine/src/prefill/prefill.cpp:2576-2593`）。
+- 他の CLI 引数や環境変数による値の上書きはありません。`STRATA_GROUP_COPY` は routing table の経路選択に別途関わりますが、`STRATA_TEST_PAGEABLE` の値自体を変更しません。
+- このフックは、Strata 内の全 pinned allocation を無条件に失敗させるものではありません。たとえば CUDA/HIP の layer split hand-off buffer は別の `cudaHostAlloc` を直接呼び、SYCL staging の `done_seq` / `src_seq` もこの判定より前に `sycl::malloc_host` します（`engine/src/prefill/prefill.cpp:2488-2491`、`engine/sycl/src/prefill/prefill.cpp:508-513`）。
 
 ## 実行時の詳細
 
-- `PinnedRing` は強制時に `acquire()` から pinned slot を返さず、`h2d()` は `direct()` に進みます。これは caller のメモリから `cudaMemcpyAsync` を行った後に stream を同期し、呼び出し元の source が戻り時に再利用できるようにします。`d2h_sync()` も pinned staging slot を使わず、caller の宛先へ転送して stream を同期します。`PinnedRing` は prefill の pageable upload と MTP の prompt records 転送で使われます。根拠: `include/strata/core/pinned_ring.hpp:36-43,48-50,95-113`、`src/prefill/prefill.cpp:661,862`、`include/strata/core/mtp.hpp:231`、`src/core/mtp.cpp:1216`。
-- CUDA/HIP の `Prefill` では、Stager の各 blob 用 pinned allocation を省略し、代わりに `std::vector` の pageable buffer を使います。mapped group-copy buffer を確保しない場合は従来のコピー経路へ進み、PLE embedding buffer も pageable vector に切り替わります。`PinnedUpload` は pinned buffer を確保せず、upload 時に `cudaMemcpyAsync` の通常分岐へ進みます。根拠: `src/prefill/prefill.cpp:435-447,704-730,1138-1164`。
-- SYCL の `Prefill` では Stager blob 用 `sycl::malloc_host` を省略して pageable vector を使います。mapped group-copy buffer は作らず、PLE embedding buffer は pageable vector を使います。根拠: `sycl/src/prefill/prefill.cpp:382-415,1021-1053,1056-1073`。
+CUDA/HIP と SYCL の prefill では、`Prefill::init` が stager ring buffer を初期化する際、通常は pinned host allocation を試します。変数が有効ならその試行を飛ばし、`std::vector` の pageable buffer を使います。CUDA/HIP ではさらに、`PinnedUpload::init` が pin buffer の割当てをスキップして upload 時に caller の memory から転送し、routing table の mapped buffer を作らず通常の copy に回し、PLE embedding host buffer を pageable vector にします。SYCL でも mapped routing allocation と PLE embedding の pinned host allocation を同様に抑止します（`engine/src/prefill/prefill.cpp:1156-1168,1454-1479,2576-2602`、`engine/sycl/src/prefill/prefill.cpp:502-535,1508-1565`）。
 
-この変数自体によるログ出力は、確認した読み取り・分岐箇所にはありません。割り当て失敗時と同じ fallback を選ぶコードであり、変数の設定だけでエラーや終了を起こす処理は見当たりません。`PinnedRing` の転送では同期が明示されますが、`PinnedUpload::upload()` の pinned buffer がない分岐は `cudaMemcpyAsync` を呼び出して戻るため、両経路の同期挙動を一律には扱えません。
+CUDA/HIP の `PinnedRing::acquire` は `nullptr` を返し、`h2d` は `direct` に移ります。`direct` は caller の memory から `cudaMemcpyAsync` を行って stream を同期します。`d2h_sync` も slot なしで転送後に同期します。`reserve` は有効時に成功を返しますが、slot を確保しません（`engine/include/strata/core/pinned_ring.hpp:36-43,48-53,95-113,120-149`）。
+
+各判定は関数内 static に保存され、プロセス中に環境を変更してもその判定をすでに評価した reader には反映されません。CUDA/HIP prefill、SYCL prefill、CUDA/HIP `PinnedRing` はそれぞれの reader で評価されます。CLI の優先順位や子プロセスへの転送処理はこの実装にはありません。
+
+## ログと測定値
+
+この変数を有効にしたことを知らせる専用ログはありません。該当分岐は pinned allocation を飛ばすか pageable fallback を選ぶだけです。通常の転送失敗時には `PinnedRing` が `strata: pinned upload of %zu bytes failed: %s\n`、`strata: upload of %zu bytes failed: %s\n`、または `strata: download of %zu bytes failed: %s\n` を stderr に出します。画像 embedding upload が失敗した場合は prefill のエラー `prefill: the image embedding upload failed` に伝播し、`generate` 呼び出し元が `strata generate: %s\n` として stderr に出して終了コード 1 を返します。環境変数の有効化そのものは失敗や終了を起こしません（`engine/include/strata/core/pinned_ring.hpp:82-113`、`engine/src/prefill/prefill.cpp:4511-4517,24118-24123`、`engine/sycl/src/program/generate.cpp:13354-13358`）。この変数について条件付き測定値を記載した Strata 資料は確認できません。
 
 ## 根拠
 
-- 読み取りと `PinnedRing` の分岐: `include/strata/core/pinned_ring.hpp:36-43,48-50,95-113,137-140`。
-- CUDA/HIP prefill の読み取り、Stager、PinnedUpload、group-copy、PLE fallback: `src/prefill/prefill.cpp:120-125,435-447,704-730,1138-1164`。
-- SYCL prefill の読み取りと fallback: `sycl/src/prefill/prefill.cpp:108-113,382-415,1021-1073`。
-- `docs/DETAILS.md` などの文書には pageable fallback に関する説明はありますが、`STRATA_TEST_PAGEABLE` の記載は見つかりませんでした。性能値はこの変数について資料で条件付き測定が確認できないため記載していません。
+- 値判定と cache: `engine/src/prefill/prefill.cpp:361-364`、`engine/sycl/src/prefill/prefill.cpp:206-209`、`engine/include/strata/core/pinned_ring.hpp:172-175`
+- CUDA/HIP prefill の staging、upload、routing table、PLE fallback: `engine/src/prefill/prefill.cpp:1156-1168,1454-1479,2576-2602`
+- SYCL prefill の staging、routing table、PLE fallback: `engine/sycl/src/prefill/prefill.cpp:502-535,1508-1565`
+- CUDA/HIP pinned ring の fallback と同期: `engine/include/strata/core/pinned_ring.hpp:36-43,48-53,79-113,120-149`
+- CUDA/HIP Metal 早期分岐、prefill 起動と初期化失敗の伝播: `engine/src/prefill/prefill.cpp:2443-2454`、`engine/src/program/generate.cpp:24115-24123`
+- SYCL prefill 起動と初期化失敗の伝播: `engine/sycl/src/program/generate.cpp:13352-13358`

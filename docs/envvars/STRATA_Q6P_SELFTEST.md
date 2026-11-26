@@ -1,47 +1,45 @@
 # `STRATA_Q6P_SELFTEST`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Q6_K 出力 head の packed kernel を登録した直後に、通常の GGUF 配置カーネルとの出力比較と実行時間の比較を行う診断用フックです。値が `2` で始まる場合は packed kernel の grid size も複数試します。通常の推論ごとに比較する設定ではありません。
-
-この処理は CUDA 実装と SYCL 実装にあります。対象は `STRATA_Q6_PACKED` が有効で、ロードした head が Q6_K（tensor type 14）であり、packed 化の形状条件も満たす場合に限られます。CUDA/HIP の一般的な実行設定として候補一覧にありますが、確認できた読み取りは CUDA と SYCL の Q6_K kernel ソース内です。
+Q6_K head を packed 形式に登録した直後、GGUF 配置カーネルと packed カーネルを合成入力で比較し、実行時間を測る開発・診断用スイッチです。`1` 相当では 1～4 列の出力一致確認と 1/2/4 列の paired timing を行い、`2` 相当ではそれに加えて packed カーネルの grid sweep を行います。通常の生成結果を設定する変数ではなく、この確認・測定処理を head のロード時に追加します（CUDA: `engine/src/kernels/cuda/native_mmvq.cu:3182-3187,3203-3235`、SYCL: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3251-3260,3282-3324`）。
 
 ## 値と判定
 
-環境変数の文字列全体や数値としての妥当性は検査せず、`getenv()` が返す文字列の先頭文字だけを調べます。未設定、空文字、先頭が `1` または `2` 以外の値では何もしません。
+CUDA 実装と SYCL 実装はどちらも `std::getenv` の戻り値が非 null で、先頭 byte が文字 `'1'` または `'2'` なら有効とします。文字列全体の比較や数値変換はしません。したがって空文字は無効、`1anything` と `2anything` は有効、`10` も `'1'` で始まるため有効です。`0`、`0anything`、`true`、` 1`、`A` は無効です。大小文字の変換や空白除去もありません（CUDA: `engine/src/kernels/cuda/native_mmvq.cu:3184-3185`、SYCL: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3253-3254`）。
 
-| 値の状態 | 処理 |
-|---|---|
-| unset または空文字 | self-test を行わない |
-| 先頭文字が `1` | 出力比較と基本の時間比較を行う |
-| 先頭文字が `2` | 上記に加え grid sweep を行う |
-| その他（例: `0`, `true`, `3`） | self-test を行わない |
-
-したがって `10` も `1` と同じ、`2extra` も `2` と同じ扱いです。大文字小文字、前後の空白、後続文字は関係しません。読み取りは `native_q6_k_pack()` の呼び出しごとに行われ、プロセス起動時に値を static cache する処理ではありません。ただし呼び出しは head の初期化時だけで、実行中の環境変更をリクエストごとに反映するものではありません。
+| 実装 | 未設定 | 自己診断を実行する値 | 実行しない値 |
+|---|---|---|---|
+| CUDA / SYCL | 無効 | 先頭文字が `1` または `2`（例: `1`, `2`, `10`, `2debug`） | 空文字、`0`, `0anything`, `true`, ` 1` など |
 
 ## 有効になる条件
 
-- head のロード処理で `type_ == 14`（Q6_K）となり、`native_q6_k_packed_enabled()` が true であること。同関数は別変数 `STRATA_Q6_PACKED` が文字列全体で厳密に `"1"` の場合だけ true を返します。
-- packed 化対象の重みが非 null、入力次元が正で 256 の倍数、出力行数が 2048 以上など、`native_q6_k_pack()` の形状条件を満たすこと。CUDA/SYCL 共に条件外なら pack 関数は false を返し、self-test に到達しません。
-- packed 用メモリの確保とコピー、registry 登録が成功していること。
-
-CUDA では `NativeHead` のロード、および MTP draft head の準備時に pack 関数が呼ばれます。SYCL にも同じ呼び出し条件があります。通常実行で値を有効にしても、Q6_K head がなければこの環境変数を読む処理は実行されません。
+- 対象コードが CUDA 実装 (`engine/src/kernels/cuda/native_mmvq.cu`) または SYCL 実装 (`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp`) としてビルドされ、その実装の native head 経路が使われること。別 backend の実装はこの変数を読んでいません。
+- 別変数 `STRATA_Q6_PACKED` が実装側で有効であり、Q6_K 型 (`type_ == 14`) の出力 head または MTP draft head の packed 化が呼び出されること。`STRATA_Q6_PACKED` は値全体が文字列 `1` の場合だけ有効です（CUDA: `engine/src/kernels/cuda/native_mmvq.cu:3145-3150`、`engine/src/core/native_head.cpp:261-264,988-995`。SYCL: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3091-3097`、`engine/sycl/src/core/native_head.cpp:92-96`、`engine/sycl/src/core/mtp.cpp:857,866-868`）。
+- packed 化対象が形状条件を満たすこと: 重みポインターが非 null、`n_in > 0`、`n_in` が 256 の倍数、`n_in / 256 >= WARPS * WARP / 32`、`n_out >= 2048`。条件外では pack 関数が自己診断より前に `false` を返します（CUDA: `engine/src/kernels/cuda/native_mmvq.cu:3153-3155`、SYCL: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3191-3193`）。
+- 設定値は CLI 引数や設定ファイルから選ばれるものではなく、コード上でそれらとの優先順位はありません。`STRATA_Q6_PACKED` が無効、Q6_K head がない、または pack が成功しなければ、この変数の分岐には到達しません。
 
 ## 実行時の詳細
 
-自己テストは固定 seed `12345` から生成した Q8_1 入力で、1〜4 列について GGUF 配置の経路と packed 経路の出力を `memcmp` で比較します。その後、1・2・4 列について各 kernel を5回ずつ実行する11組の交互測定を行い、stderr に中央値と最小〜最大の時間を出します。比較結果は `outputs BITWISE EQUAL` または `outputs DIFFER` と表示します。これは初期化時の診断であり、各推論結果を継続的に検証するものではありません。
+自己診断用 `getenv` は `native_q6_k_pack` が packed 領域を registry に登録し、その成功ログを出した後に評価されます。関数を呼ぶたびに値を読み、`static` cache はありません。通常はモデルの出力 head または MTP draft head を準備して packed 登録するロード経路で実行されます。よってプロセス開始時に固定されるとは限らず、後続の pack 呼び出しより前に環境値が変われば、その呼び出しでの判定に反映されます（CUDA: `engine/src/kernels/cuda/native_mmvq.cu:3177-3185`、SYCL: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3242-3254`）。
 
-先頭文字が `2` の場合、さらに grid `160, 320, 640, 1280, 2560, 5120, 20480` を試します。各 grid で1・2・4列を各5回実行する7組の時間を測り、`Q6_K packed grid sweep ...` を stderr に出します。この sweep は `STRATA_Q6P_GRID` の値を一時的に上書きして実行し、終了後は上書きを解除します。
+自己診断は seed `12345` の線形更新で Q8_1 入力を作り、各列数 1～4 について GGUF 配置と packed 配置の結果を `memcmp` で比較します。続けて列数 1、2、4 ごとに各方式を 5 回ずつ実行する測定を 11 組行い、中央値と範囲を出します（CUDA: `engine/src/kernels/cuda/native_mmvq.cu:3187-3235`、SYCL: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3255-3324`）。
 
-比較で出力が一致しなくても、このコードはエラー終了や例外にはせず、`native_q6_k_unpack()` で packed copy を登録解除して `native_q6_k_pack()` から false を返します。通常の Q6_K 実行経路は packed kernel が使えない場合に通常の kernel へ進むため、以後は packed 経路を選びません。時間測定値は実行時に出力されますが、環境変数の有効・無効を変えたり、性能改善を保証したりする値ではありません。
+値の先頭が `2` の場合はさらに grid 数 `160, 320, 640, 1280, 2560, 5120, 20480` をそれぞれ指定し、列数 1、2、4 ごとに 5 回実行を 7 標本測ります。測定中だけ `g_q6p_grid_override` を設定し、終了後 `0` に戻します（CUDA: `engine/src/kernels/cuda/native_mmvq.cu:3236-3255`、SYCL: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3325-3349`）。grid sweep を指定しない場合の packed kernel grid は別変数 `STRATA_Q6P_GRID` を `q6p_grid()` 初回呼出し時に読み、正値ならその数、未設定または `atoi` 後に正値でなければ 640 です。したがって通常の paired timing はこの別変数の影響を受けますが、`2` の sweep は固定 grid を override します（CUDA: `engine/src/kernels/cuda/native_mmvq.cu:2845-2852,2933-2941`、SYCL: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2709-2716,2830-2873`）。
+
+出力一致しない場合は `DIFFER` を記録して packed registry を解除し、pack 関数は `false` を返します。呼び出し元は戻り値を無視しているため、この分岐自体はモデルロードを失敗扱いにしません（CUDA: `engine/src/kernels/cuda/native_mmvq.cu:3259-3261`、`engine/src/core/native_head.cpp:262-264`。SYCL: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3356-3358`、`engine/sycl/src/core/native_head.cpp:93-96`）。SYCL 実装で `sycl::exception` が投げられた場合は catch 節が例外文と位置を stderr に出し `exit(1)` します（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3360-3364`）。CUDA 実装の自己診断内の CUDA API 呼び出しには個々の戻り値を検査する処理がなく、失敗時の専用ログや復旧分岐は確認できません。
+
+## ログと測定値
+
+有効条件を満たして packed 登録に成功すると、両実装とも stderr に `strata: STRATA_Q6_PACKED=1 packed the ...` を出した後、診断結果を出します。測定ログの文言は `strata: Q6_K packed self-test %s ncols %d: GGUF ...`、比較ログは `strata: Q6_K packed self-test %s: outputs BITWISE EQUAL (1-4 columns)` または `... DIFFER ...` です。値 `2` の場合は `strata: Q6_K packed grid sweep %s grid %d ncols %d: ...` も出力します（CUDA: `engine/src/kernels/cuda/native_mmvq.cu:3182,3231-3235,3250-3251`、SYCL: `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3251,3320-3324,3345-3346`）。
+
+ソースにはこの自己診断の実行結果を示す固定性能値はありません。上記ログ値は実行環境で生成される測定結果であり、ここでは新たな性能・正確性の実測はしていません。
 
 ## 根拠
 
-- 値判定、比較、測定、grid sweep、不一致時の unpack: `src/kernels/cuda/native_mmvq.cu:2019-2096`、`sycl/src/kernels/cuda/native_mmvq.dp.cpp:2833-2938`。
-- packed kernel の grid 既定値 640 と sweep 時の override: `src/kernels/cuda/native_mmvq.cu:1818-1826,1907-1915`、`sycl/src/kernels/cuda/native_mmvq.dp.cpp:2531-2539,2653-2697`。
-- Q6_K head の pack 条件と呼び出し: `src/core/native_head.cpp:64-69,76-80`、`src/core/mtp.cpp:675-679`、SYCL では `sycl/src/core/native_head.cpp:89-94` と `sycl/src/core/mtp.cpp:775-779`。
-- pack の形状条件と packed kernel が使えない場合の通常経路: `src/kernels/cuda/native_mmvq.cu:1918-1924,1988-1990,2347`、`sycl/src/kernels/cuda/native_mmvq.dp.cpp:2699-2705,2771-2774,3428`。
-- `STRATA_Q6_PACKED` の完全一致判定: `src/kernels/cuda/native_mmvq.cu:1980-1985`、`sycl/src/kernels/cuda/native_mmvq.dp.cpp:2763-2768`。
-- Strata の文書では packed Q6_K を decode kernel/layout の一要素として列挙していますが、この self-test の判定値や測定結果の説明は確認できませんでした（`docs/STRIX_HALO.md:95`）。
+- 環境変数の全参照と判定: `engine/src/kernels/cuda/native_mmvq.cu:3184-3185`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3253-3254`。他の出現はコメントと設定レジストリ (`engine/include/strata/kernels/native_mmvq.hpp:134`、`engine/sycl/include/strata/kernels/native_mmvq.hpp:113`、`terminal/data/settings-register.json:39594`) で、追加の読み取り箇所ではありません。
+- pack の前提と診断の登録位置: `engine/src/kernels/cuda/native_mmvq.cu:3153-3185`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3191-3254`。
+- head / MTP 呼び出し条件: `engine/src/core/native_head.cpp:261-264,988-995`、`engine/src/core/mtp.cpp:988-995`、`engine/sycl/src/core/native_head.cpp:92-96`、`engine/sycl/src/core/mtp.cpp:857,866-868`。
+- 比較、測定、追加 sweep、結果の扱い: `engine/src/kernels/cuda/native_mmvq.cu:3187-3261`、`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3255-3364`。

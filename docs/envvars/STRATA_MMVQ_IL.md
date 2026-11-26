@@ -1,49 +1,52 @@
 # `STRATA_MMVQ_IL`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Verifier が複数 token の window を処理するとき、対象となる dense projection と loaded output head で、CUDA の interleaved small-batch matvec (`native_mmvq_il`) を選べるようにします。値が無効、または実装側の対応条件を満たさない場合は `native_mmvq` に進みます。
+CUDA verifier の一部の量子化行列ベクトル計算で、interleaved small-batch MMVQ (`native_mmvq_il`) を選べるようにする master switch。未設定では有効、値の先頭が `0` の場合だけ無効になる。無効時は対象計算を通常の `native_mmvq` に送る。生成器全体や通常の単一 token 推論の一律な切替ではなく、verifier 内でこの経路を使う箇所に作用する。読み取りと利用箇所は `engine/src/core/verify.cpp:193-194,1831-1857,1910-1919,2281-2288,2731-2737,3101-3119`。
+
+対象は、verifier の GDN/QSA 投影、shared-expert 計算に渡す interleaved scratch の有無、およびロード済み LM head の計算。実際に interleaved kernel が呼ばれるかは別途 `native_mmvq_il_supported` の条件にもよる。行列の量子化型や行数テーブルをこの変数自体が指定するわけではない。CUDA 実装は対応型・形状・GPU でのみ有効化し、対象外なら通常 kernel へ fallback する（`engine/src/kernels/cuda/native_mmvq.cu:4218-4227,4230-4234`）。
 
 ## 値と判定
 
-`src/core/verify.cpp` の `g_mmvq_il()` は値全体を parse せず、環境変数の有無と先頭文字だけを判定します。判定結果は関数内の `static const bool` に保存されるため、最初に呼ばれた後のプロセス内変更は反映されません。
+`std::getenv("STRATA_MMVQ_IL")` の結果を関数内 `static const bool` に一度だけ保存する。未設定 (`nullptr`) は有効。設定されている場合は先頭 1 文字だけを見て、`'0'` なら無効、それ以外なら有効とする。空文字は先頭文字が NUL なので有効。文字列全体の parse、数値検査、大文字小文字変換、空白除去はしない（`engine/src/core/verify.cpp:194`）。
 
-| 設定 | `g_mmvq_il()` の結果 |
-|---|---|
-| 未設定 | 有効 |
-| 空文字 | 有効（設定値の先頭は終端文字 `\0`） |
-| 先頭文字が `0` | 無効（例: `0`, `0anything`） |
-| それ以外 | 有効（例: `1`, `true`, `false`, `2`） |
+| 条件 | unset | 有効になる値の例 | 無効になる値の例 |
+|---|---|---|---|
+| 全 build | 有効 | 空文字、`1`、`true`、`false`、` 0`、`00`、`0anything` 以外で先頭が `0` でない文字列 | `0`、`00`、`0anything`（先頭が `0` なら後続を問わない） |
 
-大文字小文字、空白、数値としての妥当性、後続文字は検査しません。従って `false` も有効です。
+ここでの「有効」は master switch が通る意味であり、GPU・型・形状などが未対応なら interleaved kernel は使われない。
 
 ## 有効になる条件
 
-値判定が有効でも、実際に interleaved kernel が選ばれるのは `native_mmvq_il_supported()` が true を返す場合だけです。
-
-- CUDA であり、compute capability が sm_80 以上、sm_70、または sm_60 であること。sm_70 は `STRATA_SM70_TABLE` が `atoi` で非 0、sm_60 は `STRATA_SM60_TABLE` が未設定または `atoi` で非 0 の場合に限ります。他の古い世代や capability を取得できない場合は無効です。
-- `ncols` が 1〜4 であること。
-- native MMVQ の複数列出力が exact として有効であること（この実装の初期値は true）。
-- 対象型が IQ4_XS (23)、Q4_K (12)、Q5_K (13)、Q6_K (14)、Q3_K (11) のいずれかで、architecture / 型 / 列数 / 出力行数に対応する table の行数が 0 でないこと。
-
-標準 table は主に 2〜4 列用です。1 列では別の table があり、現状は sm_86 の Q3_K の項目だけが定義されています。`STRATA_MMVQ_IL_T1=0` はこの 1 列経路を止め、`STRATA_MMVQ_IL_Q3K=0` は Q3_K の複数列経路を止めます。`STRATA_MMVQ_IL_ROWS` が該当 shape の行を上書きする場合は table 判定に使われます。
-
-HIP には interleaved 実装がなく、対応関数は supported 判定を常に false とし、通常の `native_mmvq` を呼びます。したがって HIP ではこの変数を有効にしても kernel 選択は変わりません。
+- 読み取り値が有効で、対象処理が verifier の該当経路を通ること。読み取りは初めて `g_mmvq_il()` が呼ばれた時点で行い、その後はプロセス内の static 値を再利用する。実行中に環境を変更しても再評価されない（`engine/src/core/verify.cpp:194`）。
+- interleaved MMVQ の CUDA 実装では列数が 1..8、`g_multi_exact` が有効、GPU architecture が対応していることが必要。対応型は ggml type 23 / 12 / 13 / 14 / 11。さらに `il_rows(...)` または `g_tune_rows` が 0 でないこと（`engine/src/kernels/cuda/native_mmvq.cu:4218-4227`）。
+- CUDA architecture 条件は sm_80 以上、sm_70 は `STRATA_SM70_TABLE` が有効、sm_75 は `STRATA_SM75_IL` 等の switch 条件、sm_60 / sm_61 は各 `STRATA_SM60_TABLE` / `STRATA_SM61_TABLE` の条件。device ordinal 0..15 ごとに対応可否を cache する（`engine/src/kernels/cuda/native_mmvq.cu:4190-4214`）。
+- 対象形状が `dense_i8_tc_mmvq` によって処理される条件（`g_tune_rows == 0`、`n_out >= 1024`、列数がその最小数以上、型対応、`dense_i8_tc_decode_enabled()`）では `native_mmvq_il_supported` は false になり、通常の `native_mmvq` 側へ進む（`engine/src/kernels/cuda/native_mmvq.cu:4220-4225`）。
+- HIP では interleaved path の stub が常に unsupported を返し、`native_mmvq_il` も通常 `native_mmvq` を呼ぶ。この変数が有効でも HIP で interleaved kernel は選ばれない（`engine/src/kernels/cuda/native_mmvq.cu:4255-4268`）。
+- Q8_1 の通常 quantize と interleaved copy を一つの呼出しで作る `STRATA_QIL` 経路は、HIP 以外で、`STRATA_QIL` の値または sm_75 の既定、列数 2..4、および本変数が有効な場合に限る。本変数が無効なら通常 quantize に戻る（`engine/src/core/verify.cpp:1835-1846`）。
+- shared-expert では fork stream を使わない場合にだけ scratch (`xil_`) を渡す。本変数が無効、または fork stream の場合は null を渡すため shared-expert の interleaved gate/up/down 分岐は成立しない。さらに shared-expert 実装側で token 数 2 以上と各行列の対応が必要（`engine/src/core/verify.cpp:2731-2737`, `engine/src/kernels/cuda/shared_expert.cu:229-256`）。
+- LM head が split の場合は `run_verify_split` に本変数の判定が渡され、各 device 側で対応判定を通った場合だけ interleaved MMVQ を使う。split でない head も対応判定が必要（`engine/src/core/verify.cpp:3101-3119`, `engine/src/core/native_head.cpp:436-477`）。
+- GDN/QSA の各投影でも `side_proj` 等の経路条件や型・列数・出力行数によって通常 MMVQ が選ばれる場合がある。たとえば QSA の追加 projection では `side_proj` が false なら `q_il` 自体が false（`engine/src/core/verify.cpp:2281-2288`）。
 
 ## 実行時の詳細
 
-Verifier の dense projection helper は、環境判定と `native_mmvq_il_supported()` の両方が true の場合、必要なら q8_1 activation の interleaved copy を作り、その後 `native_mmvq_il()` を呼びます。条件を満たさない場合は同じ入力・shape で `native_mmvq()` を呼びます。Verifier の loaded output head も同じ条件で分岐します。したがってこの変数は通常の単一列 decode 全般を切り替えるものではなく、これら verifier 内の対象呼び出しに作用します。
+verifier は `g_mmvq_il()` を条件に、対応した投影で `native_mmvq_il` を選択する。必要な interleaved copy がまだないときは `native_q8_1_interleave` を先に呼び、既存の通常 MMVQ 入力 `xq_` と追加の `xil_` を渡す。`STRATA_QIL` 経路では量子化と copy の作成をまとめる（`engine/src/core/verify.cpp:1831-1857`）。LM head でも非 split 経路は interleave 作成後に同 kernel を呼び、split 経路は各側で別々に対応可否を確認する（`engine/src/core/verify.cpp:3101-3119`, `engine/src/core/native_head.cpp:449-477`）。
 
-CUDA の interleaved kernel は対象 shape について通常 kernel と bitwise 同じ出力を意図した実装です。`docs/MMVQ_IL_TABLE.md` も、table は速度選択のみで出力値は同一と説明しています。ここでは測定値を独自に再検証していません。
+対応判定に失敗した場合、呼び出し側は通常 `native_mmvq` を選ぶ。`native_mmvq_il` 自体に到達した場合でも、内部の対応判定が false なら `native_mmvq` に fallback する（`engine/src/core/verify.cpp:1848-1857`, `engine/src/kernels/cuda/native_mmvq.cu:4230-4234`）。
+
+この変数はプロセスへ起動時設定を転送したり、モデルを変更したりしない。読み取りは verifier が最初に条件を評価するまで遅延し、以後 cache される。対象 kernel の launch check や CUDA エラーが発生した場合の上位処理は通常の verifier / kernel エラー経路に従う。split head では例外を `verify head: ` の prefix 付き `err` に変換して false を返す（`engine/src/core/verify.cpp:3121-3124`）。
+
+## ログと測定値
+
+本変数の値や interleaved 経路の選択を報告する専用ログは、確認した読み取り・分岐にない。測定値は本変数の実装根拠として記載しない。fallback はログではなく対応判定後の通常 MMVQ 呼出しとして行われる（`engine/src/core/verify.cpp:1848-1857`, `engine/src/kernels/cuda/native_mmvq.cu:4218-4234`）。
 
 ## 根拠
 
-- `src/core/verify.cpp:136-139`: 環境値の判定と static cache。
-- `src/core/verify.cpp:1084-1095`: verifier 内の dense projection と activation interleave / fallback。
-- `src/core/verify.cpp:1769-1779`: loaded output head の分岐。
-- `src/kernels/cuda/native_mmvq.cu:2642-2662,2682-2708`: shape table、architecture 条件、対応型と supported 判定。
-- `src/kernels/cuda/native_mmvq.cu:2705-2747`: CUDA 呼び出しの fallback と HIP stub。
-- `include/strata/kernels/native_mmvq.hpp:142-150`: interleaved copy / kernel API と fallback 契約。
-- `docs/MMVQ_IL_TABLE.md:1-11`: docs における用途、出力同一性、table の説明。
+- `engine/src/core/verify.cpp:193-194` — master switch の値判定と static cache。
+- `engine/src/core/verify.cpp:1831-1857` — Q8_1 入力の作成、投影 dispatch と fallback。
+- `engine/src/core/verify.cpp:1910-1919,2281-2288` — GDN/QSA の追加 projection 条件。
+- `engine/src/core/verify.cpp:2731-2748` と `engine/src/kernels/cuda/shared_expert.cu:229-256` — shared-expert scratch と消費側の条件。
+- `engine/src/core/verify.cpp:3101-3124` と `engine/src/core/native_head.cpp:436-477` — LM head の通常・split 経路。
+- `engine/src/kernels/cuda/native_mmvq.cu:4190-4271` — architecture 条件、型・形状条件、dense i8 fallback と HIP stub。

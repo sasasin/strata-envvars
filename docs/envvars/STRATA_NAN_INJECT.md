@@ -1,52 +1,58 @@
 # `STRATA_NAN_INJECT`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA verifier の非有限 logits ガードを試験するデバッグ用フックです。指定したウィンドウ番号で、実際に logits が有限でも row 0 を非有限として記録します。これにより、serve / batch 側のエラー処理経路を人工的に起動できます。実際の logits やサンプリング結果を書き換える処理ではありません。
+Verifier の非有限 logits 検出結果を、指定した window 番号でテスト用に合成する診断用フックです。実際の logits や sampler の出力値を書き換える処理ではなく、検出 mask に row 0 を立てて `nonfinite_row()` / `nonfinite_pos()` が異常を報告する状態にします。`note_nonfinite` が通常の検出結果を先に集め、既に非有限 row があれば注入では上書きしません。[`engine/src/core/verify.cpp:5821-5848`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
+
+この状態を要求の終了に結びつける実装は `--serve` の要求処理です。該当 window の token は出力せず要求を `nonfinite` で終了し、次の要求開始時に live session、checkpoint、parked conversation 等を破棄して prompt を token 0 から読み直します。batch 経路では該当 slot を `BDONE ... nonfinite` で終了します。[`engine/src/program/generate.cpp:14547-14560`](../../../../Niko1221/Strata/engine/src/program/generate.cpp)、[`engine/src/program/generate.cpp:17309-17321`](../../../../Niko1221/Strata/engine/src/program/generate.cpp)、[`engine/src/program/generate.cpp:19242-19279`](../../../../Niko1221/Strata/engine/src/program/generate.cpp)
 
 ## 値と判定
 
-値は最初に `Verifier::note_nonfinite()` がガード有効・head stage で呼ばれたときに一度読み取られ、`static const std::vector` に保存されます。以降の環境変更は反映されません。
+`std::getenv` で文字列を取得し、`std::strtoll(q, &end, 10)` で位置ごとに整数を読み取ります。文字列全体の厳密な検証はありません。`strtoll` が読めた数値のうち正数だけをリストに加え、直後の文字がカンマならカンマを越えて次を読みます。カンマ以外で数値変換が止まった場合はその位置から再度変換を試み、変換できなければそこで残りを無視します。そのためカンマは必須区切りではなく、例えば `1 2` も 1 と 2 を読みます。一方、数値の後ろの `x` や `.` は次の変換開始に使えないため、その位置で残りを無視します。通常の `n[,n...]` 形式では正の十進整数だけが有効です。`strtoll` が受け付ける先頭空白と符号は許され、負数・0 は読み取られても捨てられます。範囲外の `errno` は検査していません。[`engine/src/core/verify.cpp:5801-5817`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
 
-| 設定 | 動作 |
-|---|---|
-| unset / 空文字 | 対象番号なし。注入カウンターは進まない |
-| 正の10進整数（例: `1`） | その番号のウィンドウを注入対象にする |
-| カンマ区切りの正整数（例: `1,60`） | 複数のウィンドウを対象にする |
-| 0または負数 | 数値として読み取られるが、対象リストには入らない |
-| 数値として読めない文字列の先頭 | 解析をそこで終了し、それ以降は無視 |
+| 条件 | 未設定 | 注入リストに入る値の例 | リストに入らない / 読み取りが止まる例 |
+|---|---|---|---|
+| `STRATA_NAN_INJECT` の初回読み取り | 空リスト（注入なし） | `1`、`1,3`、`+2`、` 2` | 空文字、`0`、`-1`、`true`、`,2` |
 
-各項目は `strtoll(..., 10)` で読みます。先頭の空白や符号は `strtoll` の規則で許容され、変換後に `n > 0` のものだけを採用します。数値の後がカンマなら次の項目へ進み、それ以外なら同じ位置から次の変換を試みます。したがって `1x,2` は `x` で次の変換に失敗して終了し、`2` は採用されません。オーバーフロー時の `errno` は確認していません。重複番号は許容されます。
+`1x` は `1` を読み取った後 `x` で停止し、`1,abc,3` は `1` の後で変換できず残りを読みません。`1,,3` も 2 個目の変換で停止するため `3` は読みません。大文字小文字の比較はありません。値が空リストになればカウンターも進まず、非有限結果は合成されません。[`engine/src/core/verify.cpp:5803-5815`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
+
+注入を行うには別変数 `STRATA_NAN_GUARD` の guard が有効である必要があります。この変数は unset なら有効、設定時は `atoi(value) != 0` で判定されます。空文字・`0`・`false`・`true` は無効で、`1` や `2tail` は有効です。`STRATA_NAN_INJECT` を有効化する CLI 引数や、それを上書きする引数はこの実装にありません。[`engine/src/core/verify.cpp:5792-5799`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
 
 ## 有効になる条件
 
-- `STRATA_NAN_GUARD` が有効であること。ガードは未設定なら有効で、`std::atoi(value) != 0` で判定されます。従って `STRATA_NAN_GUARD=0` や空文字では無効です。
-- `note_nonfinite()` が呼ばれること、mapped flag 領域 `h_nf_` が存在すること、Verifier が head を持つ最終 stage であること。
-- まだリストに指定番号が残っていること。
-
-`STRATA_NAN_GUARD=0` の場合、または head stage 以外・flag 領域なしの経路ではカウンターは進みません。実測フラグが既に非有限を示すウィンドウでは、注入で row 0 を追加設定せず、注入ログも出しません。実装根拠は CUDA verifier (`src/core/verify.cpp`) です。SYCL 実装にこの変数の読み取りは見つかりませんでした。
+- `Verifier::note_nonfinite` が呼ばれ、`STRATA_NAN_GUARD` が有効であること。guard が無効なら関数は注入リストを参照する前に戻ります。[`engine/src/core/verify.cpp:5821-5830`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
+- head を持つ最終 stage の window であること。CUDA/HIP 側ではさらに `h_nf_ != nullptr` が必要です。Metal はこの buffer 条件を使わず、window の logits を host 側で scan します。[`engine/src/core/verify.cpp:5825-5837`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)、[`engine/src/core/verify.cpp:3745-3763`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
+- 注入リストに正の番号が 1 個以上あり、プロセス全体で数えた対象 window 番号がリストと一致すること。リストの番号は昇順でなくても構いません。[`engine/src/core/verify.cpp:5818-5819`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)、[`engine/src/core/verify.cpp:5838-5845`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
+- `--serve` では verifier の結果を検査する要求経路が注入状態を外部に示します。単発 CLI の各経路が同じ結果処理を行う根拠はこの変数の読み取り箇所からは確認できません。`docs/DETAILS.md:661-668` も one-shot command line と Intel (SYCL) port は check しないと記載しています。環境変数自体の読み取りは `engine/src/core/verify.cpp` のみです。
 
 ## 実行時の詳細
 
-カウンターは `src/core/verify.cpp` 内のプロセス共有 atomic で、1から始まります。番号は verifier の呼び出し回数ではなく、ガードが実際に確認した各ウィンドウに割り当てられます。呼び出し元には通常の verify、batch slot、pipelined window があり、プロンプト末尾・decode・batch のウィンドウが同じカウントに含まれます。候補番号に達し、実際の非有限フラグがなければ、`nf_mask_` の bit 0 を立て、stderr に次の形式で出します。
+注入リストは関数内 `static const` であり、guard を通過して最初に `nan_inject_list()` に到達した時点の環境を一度読み取ります。未設定・空・無効な値をその時に読んだ場合も空リストとして保持され、以後の環境変更は反映されません。正の数を読んだ場合、注入対象 counter はプロセス共有の `std::atomic<long long>` で、リストが空でない各対象 window で 1 増えます。したがって起動時からの全 window 数ではなく、guard と stage 条件を通過し、非空リストを使う処理に到達した window の通し番号です。[`engine/src/core/verify.cpp:5803-5819`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)、[`engine/src/core/verify.cpp:5821-5845`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
+
+番号が一致し、通常の非有限 mask がまだ空の場合、row 0 の bit を立てて `nf_row_` を 0 にします。position は `pos_b[0]`、または `last_pos0_ + 0` です。返すのは検出 metadata であり、この箇所で logits 配列は変更しません。既に実際の非有限 row があればその mask を維持し、注入専用ログも出しません。[`engine/src/core/verify.cpp:5832-5848`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)、[`engine/include/strata/core/verify.hpp:130-142`](../../../../Niko1221/Strata/engine/include/strata/core/verify.hpp)
+
+`STRATA_NAN_GUARD` 自体も関数内 `static` で初回呼び出し時に評価されます。注入リストの読み取りは guard を通過した後なので、guard が最初に無効と判定された場合、注入リストはまだ読み取られません。[`engine/src/core/verify.cpp:5792-5799`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)、[`engine/src/core/verify.cpp:5821-5838`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
+
+## ログと測定値
+
+番号が一致して synthetic flag が立つ場合、stderr に次の行を出します（`k` はプロセス内の対象 window 番号）。実際の非有限 logits が同じ window に既にあれば、この注入ログは出ません。[`engine/src/core/verify.cpp:5838-5844`](../../../../Niko1221/Strata/engine/src/core/verify.cpp)
 
 ```text
-strata verify: STRATA_NAN_INJECT: window <番号> reported as non-finite
+strata verify: STRATA_NAN_INJECT: window <k> reported as non-finite
 ```
 
-その後は通常のガード結果と同じ `nonfinite_row()` / `nonfinite_in()` 経路を使います。serve の通常リクエストでは当該ウィンドウの token を出力せず `DONE ... nonfinite` とし、batch では該当 slot を終了して `BDONE ... nonfinite` を出します。ログと結果の根拠は `src/program/generate.cpp` にあります。
+`--serve` が flag を検出した場合は stderr に `strata serve: non-finite logits (#879) in a <prompt|first decode|decode> window at position <position> (row <row>): its tokens are not emitted, the request ends (DONE nonfinite) and the next request reads its prompt from token 0` を出します。batch 処理では `strata batch: non-finite logits (#879) ...` を stderr、`BDONE <slot> <generated> nonfinite ...` を stdout に出します。[`engine/src/program/generate.cpp:14550-14560`](../../../../Niko1221/Strata/engine/src/program/generate.cpp)、[`engine/src/program/generate.cpp:17309-17321`](../../../../Niko1221/Strata/engine/src/program/generate.cpp)
 
-## 資料との照合
-
-`docs/DETAILS.md` は `STRATA_NAN_INJECT=<n>[,<n>...]` を、プロンプト末尾・decode・batch を通した engine process 内のウィンドウ番号を非有限として報告させる debug switch と説明し、`=1,60` の試験例を記載しています。本調査で確認した実装のカウント条件は上記のとおりで、ガードを無効にした場合や head stage でない場合は番号に含まれません。性能・正確性の測定値はこの変数について記載しません。
+Strata の資料にこの変数による性能測定値はありません。
 
 ## 根拠
 
-- 値の読み取り、`strtoll` による解析、リストの static cache、process-wide カウンター、注入条件と stderr: `src/core/verify.cpp:3115-3154`。
-- ガードの既定と `STRATA_NAN_GUARD` の判定、GPU 側チェックの記録: `src/core/verify.cpp:1794-1795,3106-3113`。
-- 非有限状態を公開する API と対象ウィンドウの説明: `include/strata/core/verify.hpp:100-112`。
-- verifier の各呼び出し元: `src/core/verify.cpp:2343,2877,2941,3098,3416`。
-- serve / batch で非有限結果を処理する箇所: `src/program/generate.cpp:7991-8000,9438-9445,11668-11678,11942-11949`。
-- 文書上の debug switch と試験例: `docs/DETAILS.md:767-771`。
+- 実読み取り、リスト変換、cache、カウンター、注入条件: `engine/src/core/verify.cpp:5801-5848`
+- guard の既定値と cache: `engine/src/core/verify.cpp:5792-5799`
+- CUDA/HIP と Metal の非有限検査条件: `engine/src/core/verify.cpp:3745-3763`, `engine/src/core/verify.cpp:5825-5837`
+- verifier の非有限 row/position の公開: `engine/include/strata/core/verify.hpp:130-144`
+- serve の要求終了と cache flush: `engine/src/program/generate.cpp:14547-14560`, `engine/src/program/generate.cpp:19242-19279`
+- batch slot の終了: `engine/src/program/generate.cpp:17309-17321`
+- 補足資料との照合: `docs/DETAILS.md:661-668`

@@ -1,6 +1,6 @@
 # `--output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout の `git status --short --branch` は `## main...origin/main` で、未コミット変更は表示されませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,49 +12,52 @@
 
 ## 役割
 
-取得した tuning preset 全体を表示する形式を選びます。`--output` は `strata presets` の各サブコマンドに共通して登録されていますが、この文書では索引上のスコープである `strata presets show` の動作を説明します。
+保存済みチューニング preset 1件の表示形式を選びます。`human` は preset 全体を整形した JSON として表示し、`json` は機械処理向けの `schema_version` / `ok` を含む JSON エンベロープで表示します。
 
 ## 使い方
 
 ```sh
-strata presets show <preset名またはID> --output json
+# preset 名または ID を指定し、人向けの表示を得る（既定）
+strata presets show "My preset"
+
+# 同じ preset を機械処理向けの JSON エンベロープで表示する
+strata presets show --output json 1a2b
 ```
 
-`<preset名またはID>` は `show` の位置引数です。`--output` を省略すると `human` です。
+`preset` には完全な ID、4文字以上の ID prefix、または大文字小文字を区別しない完全一致名を指定できます。
 
 ## 値と既定値
 
-- `human`、`json` のいずれかを指定します。大文字小文字を変えた値や他の文字列は `argparse` の `choices` 検証で拒否されます。
-- 既定値は `human` です。空文字列も選択肢にないため受理されません。
-- 同じオプションを複数回指定した場合の個別処理は実装されていません。通常の `argparse` の単一値引数として解析され、後に現れる指定値が残ります。
+- parser は `choices=("human", "json")` を指定し、既定値を `human` としています。短縮別名はありません。
+- `show` の引数 `preset` は必須です。
+- `--output` に他の値を渡すと `argparse` の選択肢検証で拒否されます。処理本体に進む前の parser エラーです。
 
 ## 実行時の動作
 
-`human` と `json` の違いは JSON 表現の包み方です。`human` では preset の全データを整形した JSON（インデント付き）で stdout に出します。`json` では `schema_version: 1` と `ok: true` を含む一行 JSON オブジェクトの `preset` フィールドに同じデータを入れます。いずれも preset を検索して表示するだけで、設定の適用や保存は行いません。
-
-検索は preset の完全な ID、4 文字以上の ID 接頭辞、または大文字小文字を区別しない完全一致の名前で行います。複数一致する名前・接頭辞は曖昧としてエラーになります。preset ディレクトリが存在しない場合、または保存ファイルが不正・別 schema の場合は一覧に含まれず、検索できません。
-
-表示するレコードは保存された preset 全体です。内容には tuning 設定、計測結果、ユーザーが選んだ条件、ハードウェア・engine・model の識別情報などが含まれ得ます。JSON をログや他者と共有する場合は、含まれる情報を確認してください。
+- `human` の場合、`presets.find()` が見つけた preset の辞書を、インデント付き JSON として stdout に出します。
+- `json` の場合、stdout に `{"schema_version":1,"ok":true,"preset":...}` 形式の JSON を1行出します。`preset` は一覧用の要約ではなく保存データ全体です。
+- preset の解決では完全 ID が最初に照合され、続いて ID prefix（4文字以上）と大文字小文字を区別しない完全一致名が調べられます。同名が複数ある場合は名前一致を優先し、該当候補が複数なら失敗します。
+- `find()` は preset ディレクトリ内の JSON を読み込み、`active.json` の active ID を参照して返却データに `active` を付与します。保存先は `STRATA_PRESET_DIR` が設定されていればその値、未設定なら profiles ディレクトリの隣の `presets` です。
+- このコマンド経路は表示のために保存データを読むだけで、preset の書き換え、モデル起動、ネットワーク処理は行いません。
 
 ## 適用条件と副作用
 
-このオプションは `strata presets show` の出力形式に適用されます。コマンドは preset store と active index を読み、一覧化時に保存レコードへ `active` 状態を付加します。ソース上、`show` の成功経路でファイルを書き換える処理、engine 起動、ネットワーク通信は確認できませんでした。
+出力形式の違いは標準出力だけです。preset ディレクトリと active index を読み取ります。ディレクトリが存在しない、または読み込める preset がない場合、指定した ID・名前は見つからずエラーになります。不正 JSON や現行 schema と異なる preset ファイルは一覧対象から除外されます。
 
 ## 出力とエラー
 
-- 成功時は終了コード `0` です。`human` は整形 JSON、`json` は機械処理向けの一行 JSON を stdout に出力します。
-- preset が見つからない、または参照が複数 preset に一致する場合、`human` は `strata: <説明>` を stderr に出して終了コード `5`、`json` は `schema_version: 1`、`ok: false`、`error.code: 5` とメッセージを含む JSON を stdout に出して終了コード `5` です。
-- 検索で `PresetError` 以外の `OSError` / `ValueError` が処理まで伝播した場合は、`presets_command` の例外処理で失敗出力に変換されます。通常の `OSError` は終了コード `2`（例外に `exit_code` があればその値）です。一方、保存 JSON の読み込み helper は `OSError` と JSON decode error を捕捉して既定値を返すため、読めない・壊れた preset ファイルは通常検索結果から除外され、preset 未検出のエラーになります。
-- 値が `human` / `json` 以外ならコマンド本体より前の parser 検証に失敗し、argparse の usage/error 表示と終了コード `2` になります。
+- 成功時の出力先は stdout です。`human` も JSON 文字列を整形表示するため、両形式とも内容自体は JSON です。
+- preset が見つからない場合は終了コード `5`。`human` では `strata: ...` を stderr に出し、`json` では `{"schema_version":1,"ok":false,"error":{"code":5,"message":"..."}}` を stdout に出します。
+- 名前または prefix が複数 preset に一致する場合も終了コード `5` となり、ID を使うよう促すエラーになります。
+- preset ディレクトリ等の I/O エラーは、捕捉された `OSError` として終了コード `2` で報告されます。`json` ではエラーエンベロープ、`human` では stderr へのメッセージです。
+- 無効な `--output` 値など parser エラーは `presets_command()` のエラーハンドラより前に発生します。
 
 ## 根拠
 
-- `strata_cli/tune_commands.py:49-62` — `presets show` parser と `--output` の選択肢・既定値、preset 位置引数。
-- `strata_cli/tune_commands.py:95-108` — 成功・失敗時の human / JSON 出力と終了コード。
-- `strata_cli/tune_commands.py:289-309,344-348` — `--output` の分岐、`show` が `presets.find()` を呼び全レコードを表示する経路、例外処理。
-- `strata_control/presets.py:202-215,218-231` — active index と保存レコードの読み込み、ID・接頭辞・名前の検索、未検出・曖昧時のエラー。
-- `strata_control/presets.py:71-75,234-252` — JSON 読み込み失敗時の既定値、schema が一致する保存レコードの列挙、active 状態の付与。
-- `strata_control/presets.py:1-17` — preset に格納される情報の種類と、この store が変更する範囲。
-- `strata_cli/cli.py:487,2151-2152` — parser 登録と `presets_command` への dispatch。
-
-調査範囲は上記 revision のソース checkout です。同一 revision の実行 CLI help や Release 配布物は補助資料として確認していません。
+- `terminal/strata_cli/tune_commands.py:55-68` — `presets show` の階層、共通 `--output` 登録、値の選択肢と既定値、必須の `preset` 引数。
+- `terminal/strata_cli/tune_commands.py:101-114` — 成功時の human / JSON 出力と失敗時の stderr / JSON エンベロープ。
+- `terminal/strata_cli/tune_commands.py:472-493` — `show` の分岐、preset 検索、全データ表示、出力形式の選択。
+- `terminal/strata_cli/tune_commands.py:527-530` — `PresetError` の終了コード `5` と I/O・値エラーの終了コード処理。
+- `terminal/strata_cli/cli.py:515`、`terminal/strata_cli/cli.py:2229-2230` — parser への presets 登録とコマンド処理へのディスパッチ。
+- `terminal/strata_control/presets.py:45-50` — preset ディレクトリの決定方法。
+- `terminal/strata_control/presets.py:71-75`、`terminal/strata_control/presets.py:236-256`、`terminal/strata_control/presets.py:259-277` — JSON 読み込み、ID/name 解決、無効 schema の除外、active 状態の付与。

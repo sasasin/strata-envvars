@@ -1,49 +1,46 @@
 # `STRATA_DUMMY_NODES`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-検証ウィンドウの GPU 処理に、layer/group ごとに空の GPU kernel node を追加する計測用フックです。ソースのコメントは「window 内で node 1 個にかかるコスト」を測る目的としています。モデル計算の結果を変える処理ではなく、追加した kernel は何も読み書きしません。
+CUDA/HIP エンジンの verifier が verify window の GPU 処理を記録するとき、値 `k` に応じて空の kernel launch を追加する計測用スイッチです。通常値は 0 で追加 launch はありません。正の値では、各層・各 group の layer 前処理に `k` 個ずつ追加します。空 kernel はデータを読み書きせず、推論計算や出力 token の選択を変更しません。読み取りと追加箇所は `Verifier::record_window` の `pre` lambda 内です（`engine/src/core/verify.cpp:1681-1683,1820-1824`）。
 
-環境変数を読むのは `Verifier::record_window()` のみです。通常のウィンドウ graph と batch ウィンドウ graph の記録はいずれもこの関数を呼びます。Verifier を使わない実行経路では、この変数は参照されません。
+`gpu_noop` の CUDA 実装は空の kernel を 1 block・32 thread で同じ stream に launch します（`engine/src/kernels/cuda/verify_kernels.cu:2025-2028`）。ヘッダーのコメントは「one-thread kernel」と記していますが、実装の block size は 32 です（`engine/include/strata/kernels/verify_kernels.hpp:123-127`）。この環境変数を読む箇所は CUDA/HIP 側の `engine/src/core/verify.cpp` だけで、別実装の SYCL verifier には名前の参照がありません。Metal の `gpu_noop` は未実装関数へ委譲する stub です（`engine/metal/src/engine/stubs.cpp:216`）。したがって、このスイッチが追加 kernel を動かすのは CUDA/HIP の verifier 経路です。
 
 ## 値と判定
 
-値は `std::atoi` で `int` に変換され、変換結果を `dummy` として `for (int d = 0; d < dummy; ++d)` の反復回数にします。文字列全体の検証、範囲チェック、clamp はありません。
+`std::getenv` が null なら 0、設定されていれば `std::atoi` の結果を関数内 `static const int` に保存します。文字列全体の検証はなく、`atoi` が先頭から変換できた整数が使われます。未設定・空文字・整数に変換できない先頭文字は 0 です。先頭空白と符号は `atoi` の変換規則に従い、整数の後ろの文字列は検査されません。コードに範囲検査や clamp はありません（`engine/src/core/verify.cpp:1821-1823`）。
 
-| 環境変数の状態・値 | 動作 |
-|---|---|
-| 未設定 | `dummy = 0`。追加しない |
-| 空文字 | `atoi` の結果は `0`。追加しない |
-| `0`、数値で始まらない文字列 | 結果は `0`。追加しない |
-| 正の整数 `k` | 各 layer に `k` 個追加 |
-| 負の整数 | 反復条件 `d < dummy` が最初から偽となり、追加しない |
-| 数字の後ろに文字が続く値（例: `3x`） | `atoi` が先頭の数値部分を変換し、結果が正ならその数だけ追加 |
+| 条件 | unset | 追加 launch あり | launch なし |
+|---|---:|---|---|
+| CUDA/HIP verifier がこの箇所を実行 | 0 | 変換結果が正（例: `1`, `+2tail`, ` 3x`） | 空文字、`0`, `-1`, `true`, `false`, `0anything`, `x1` |
+| SYCL / Metal 経路 | この変数を読まない | 該当なし | この変数による追加なし |
 
-`atoi` のため、空白や符号を含む入力も C の整数変換規則に従います。整数型 `int` で表現できない値について、実装はエラー処理をしていないため、その結果は利用できる設定値として保証されません。
+ループ条件は `d < dummy` なので、0 以下では launch しません。`1anything` は 1、`0anything` は 0 として扱われます。`atoi` の戻り値が `int` の表現範囲を超える入力について、コードは範囲を検査せず、その挙動を定めていません。
 
 ## 有効になる条件
 
-- CUDA/HIP verifier の window graph 記録で `record_window()` が実行されること。通常の `capture()` と `capture_batch()` の両方から呼ばれます。
-- 変換後の値 `dummy` が正であること。
-
-GPU kernel の実装は `src/kernels/cuda/verify_kernels.cu` にあります。`noop_kernel` は空の kernel body で、1 block・32 thread で launch されます。追加 kernel を持つ graph 以外の経路、たとえば verifier を使わない通常 decode にはこの挿入箇所はありません。
+- CUDA/HIP エンジンの verifier が `record_window` を記録し、`pre` の該当箇所まで実行する必要があります。通常 window と batch window の双方が `record_window` を呼びます（`engine/src/core/verify.cpp:3279,4689`）。
+- 追加数は verifier が処理する層範囲と group 数に依存します。`record_window` は `pre` を初期層から各 group について呼び、後続層も group ごとに呼びます（`engine/src/core/verify.cpp:1482-1486,2996-3002`）。split 等で `G` が 2 なら各層に 2 group 分の追加があり、通常の `G == 1` なら 1 group 分です。
+- 値が正でも、SYCL の別 `record_window` 実装では環境変数を読まないため有効になりません。Metal にも読み取り箇所はありません。
+- CLI 引数、別環境変数、モデル状態による上書きや値の優先順位は、この読み取り箇所にはありません。
 
 ## 実行時の詳細
 
-環境変数の読み取りは関数内 `static const int` の初期化 lambda にあります。このため、値を読むのはプロセス起動時ではなく、最初に `record_window()` が該当箇所へ到達したときです。最初の読み取り後は値がプロセス内でキャッシュされ、環境を変更しても同じプロセスでは再評価されません。最初の graph 記録より前に環境を設定すればその値が使われます。
+読み取りは `pre` lambda 内の block-local `static` の初期化時に一度行われ、結果はプロセス内でキャッシュされます。したがって、最初の到達後にプロセス環境を変更しても値は更新されません。CUDA 側では `record_window` が stream capture 中に呼ばれるため、追加された各 `gpu_noop` launch は window の graph に含まれます（`engine/src/core/verify.cpp:3270-3281`）。再利用される graph は記録済みの node 数を再実行し、環境を読み直しません。
 
-各 `pre(l, grp)` 呼び出しで、最初の grouped GR read の後に同じ CUDA stream `cs` へ空 kernel を `dummy` 回 enqueue します。制御フローは各 layer について group 数 `G` 回 `pre` を呼ぶため、捕捉された graph に入る追加 node 数は、記録対象の layer 数を `L` とすると `L × G × max(dummy, 0)` です。空 kernel 自体がモデルの tensor や状態を更新することはありませんが、graph の node 数と GPU の実行時間を増やす目的の挿入です。
+各層の `pre` では fused read の後、入力待ち処理・次の stamp より前に no-op launch を enqueue します（`engine/src/core/verify.cpp:1816-1829`）。これは計測用に kernel launch/node の負荷を加えるもので、値の数だけ同じ stream 上に空 kernel の graph node を増やします。
 
-この変数専用のログや警告はありません。通常の graph capture が失敗した場合には既存の `verify: end capture: ...` または `verify: end batch capture: ...` エラー経路になります。調査した `docs/DETAILS.md` にはこの変数の説明を確認できませんでした。計測値や性能効果を裏付ける文書も見つからなかったため、定量的な効果は記載しません。
+## ログと測定値
+
+この環境変数の値や有効化を示す専用ログは読み取り・分岐箇所にありません。ソースコメントは「measurement only」と用途を記しますが、`docs/DETAILS.md` にこの変数の測定値や測定条件の記載は見つかりません。kernel launch に起因する失敗が起きた場合の一般的な capture / graph 経路はありますが、この変数専用のエラー文言はありません（`engine/src/core/verify.cpp:3270-3285`）。
 
 ## 根拠
 
-- `src/core/verify.cpp:826-835`: `record_window()` の定義。
-- `src/core/verify.cpp:1074-1078`: `STRATA_DUMMY_NODES` の唯一の読み取り、`atoi` による変換、layer ごとの launch。
-- `src/core/verify.cpp:1846-1863`: 通常 window の graph capture が `record_window()` を呼ぶ。
-- `src/core/verify.cpp:2582-2598`: batch window の graph capture が `record_window()` を呼ぶ。
-- `src/core/verify.cpp:1688-1694`: 各 layer の `pre(l, grp)` が group ごとに呼ばれる。
-- `src/kernels/cuda/verify_kernels.cu:1340-1343`: 空の `noop_kernel` と 1 block・32 thread の launch。
-- `include/strata/kernels/verify_kernels.hpp:57-58`: `gpu_noop` の宣言と計測意図のコメント。
+- `engine/src/core/verify.cpp:1681-1683,1816-1829` — `pre` と環境変数の読み取り、no-op の配置。
+- `engine/src/core/verify.cpp:1482-1486,2996-3002` — 対象層範囲、group ごとの呼び出し。
+- `engine/src/core/verify.cpp:3270-3285,4680-4696` — 通常・batch window の capture と graph 記録。
+- `engine/src/kernels/cuda/verify_kernels.cu:2025-2028` — 空 kernel と CUDA/HIP stream launch 実装。
+- `engine/include/strata/kernels/verify_kernels.hpp:123-127` — kernel API とコメント。
+- `engine/metal/src/engine/stubs.cpp:216` — Metal stub。

@@ -1,66 +1,70 @@
 # `STRATA_PF_FUSED_Q50`
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP のネイティブ fused prompt-expert 経路において、Q5_0 の down projection を fused kernel で処理できるようにします。対象は gfx12 (RDNA4) の int8 `native_w11_kernel` と、gfx1151 (Strix Halo) の F16 `native_f16_kernel` です。どちらも Q5_0 down 専用の選択で、ほかの形式や CUDA ビルドには作用しません (`src/prefill/moe_fused_iq.cu:1936-1967,2137-2144,2180-2189`)。
+MoE prompt prefill の Q5_0 down projection を、対応 GPU で Strata の fused native kernel に載せる opt-in / platform default スイッチ。CUDA は Q5_0 down kernel を device ごとの setup に加え、HIP は gfx12 で int8 native kernel、gfx11 で F16 matrix-core kernel を選ぶ判定に使う。主な実装は `engine/src/prefill/moe_fused_iq.cu` の `q50_cuda_requested`、`q50_on`、`d_covered_on`、`native_supported`、`dev_info`、`experts_native`。
 
-この変数だけでは fused prompt 経路全体を有効にしません。native pack の fused 経路を選ぶ `STRATA_PF_FUSED=1` が必要です。モデルの層形式、デバイス、MMQ の対応状況などにより native fused 経路が選ばれない場合も、この変数の指定だけでは経路は切り替わりません (`src/prefill/moe_fused_iq.cu:2041-2085`; `src/prefill/prefill.cpp:1534-1555`)。
+対象モデルがこの形式を持つ場合でも、値だけで全層が必ず切り替わるわけではない。gate/up の型、GPU・kernel setup、fused prompt 全体の有効状態、backend 固有の条件が揃った Q5_0 down 層だけが対象になる。CUDA の対象層は従来の gather + FP16 dequantize/GEMM 経路から Q5_0 native kernel に移る（同ファイル `2951-2956`, `3500-3505`, `3930-3935`）。HIP gfx12 は native int8 kernel、gfx11 は `STRATA_PF_F16` の F16 kernel を使う（`3112-3116`, `3204-3208`, `3740-3749`）。
+
+環境変数を直接読むのは CUDA と HIP の実装だけ。`STRATA_PF_FUSED_Q50` を読む CLI 引数・設定ファイルの参照は見つからなかった。ビルドに MMQ prompt kernels がない場合は別途起動前の helper が unset 変数を `1` に設定する（`engine/src/prefill/prefill.cpp:223-255`, `engine/include/strata/prefill/own_only_switches.hpp:18-24,48-56`）。
 
 ## 値と判定
 
-`q50_on()` は `std::getenv()` の結果を文字列全体として parse せず、未設定・空文字かどうかと、設定値の先頭文字だけを判定します。判定値は関数内の `static const int` に保存されます (`src/prefill/moe_fused_iq.cu:1943-1958`)。
+値は数値や真偽値として parse されず、先頭文字だけで判定される。前後空白の除去、文字列全体の比較、大文字小文字変換はない。
 
-| 値 | `q50_on()` の結果 |
-|---|---|
-| 未設定 | デバイスと OS の既定値に従う |
-| 空文字 | 未設定と同じ。明示的な OFF にはならない |
-| 空でなく先頭が `1` | ON。`1`, `10`, `1anything` など。以降の文字は見ない |
-| それ以外の空でない値 | OFF。`0`, `0anything`, `true`, ` 1` など |
+| 経路 | unset | 空文字 | 有効になる値 | 無効になる値 |
+|---|---|---|---|---|
+| CUDA (`q50_cuda_requested`) | 無効 | 無効 | 先頭文字が `1`（例: `1`, `1abc`, `10`） | 先頭文字が `1` 以外（例: `0`, `true`, ` 1`） |
+| HIP gfx12 / gfx11 (`q50_on`) | backend / OS の既定値 | unset と同じ既定値 | 先頭文字が `1`（例: `1`, `1abc`, `10`） | 空でない値の先頭文字が `1` 以外（例: `0`, `true`, ` 1`） |
 
-大文字小文字や数値としての妥当性は検査しません。たとえば `true` は ON ではなく OFF です。空文字を除く `1` 以外の値は一律 OFF です。
+CUDA は `getenv` が非 null かつ `v[0] == '1'` のときだけ要求を on とし、`static const bool` に初回評価結果を保存する（`engine/src/prefill/moe_fused_iq.cu:2715-2719`）。HIP は unset または空文字を `-1`（既定値を使う）にし、非空文字列は先頭が `1` のとき `1`、それ以外を `0` として `static const int` に保存する（同 `3118-3122`）。従って、明示的な空文字は CUDA では off、HIP では unset と同じ扱い。
 
-未設定・空文字の場合の既定値は次のとおりです。
+unset / 空文字時の Q50 判定は次のとおり。HIP の既定値は `q50_on` の platform/device 判定に基づく（同 `3123-3133`）。
 
-| HIP 実行デバイス | OS / 他の条件 | 既定値 |
+| Backend / device | unset または空文字 | 既定を無効にする関連変数 |
 |---|---|---|
-| gfx12 (RDNA4) | OS を問わない | OFF |
-| gfx1151 (Strix Halo) | Windows、かつ `STRATA_GFX1151_DEFAULTS` の先頭が `0` でない | ON |
-| gfx1151 (Strix Halo) | Linux、または `STRATA_GFX1151_DEFAULTS` の先頭が `0` | OFF |
-| 上記以外 | OS を問わない | OFF |
+| CUDA | off | 該当なし（明示的に先頭 `1` が必要） |
+| HIP gfx12 (RDNA4) | Linux on、Windows off（`kGfx12PromptDefaultsOn`） | 既定値は `STRATA_PF_FUSED_Q50=0` 等の明示値で置換 |
+| HIP gfx11 discrete RDNA3 (`d.g11`) | on | `STRATA_GFX11_DEFAULTS` の先頭文字が `0` なら off |
+| HIP gfx1151 | Windows on、その他の OS は off | Windows では `STRATA_GFX1151_DEFAULTS` の先頭文字が `0` なら off |
+| HIP のその他 device | off | 該当なし |
 
-`STRATA_GFX1151_DEFAULTS` は、この変数が未設定または空文字で gfx1151 の既定値を決める場合にだけ参照されます。先頭文字が `0` なら既定値を OFF にし、それ以外の設定値は既定値を OFF にしません。`STRATA_PF_FUSED_Q50` 自体に有効な非空値がある場合はその判定が先に返るため、明示値が優先します (`src/prefill/moe_fused_iq.cu:1946-1954`)。
+gfx12 の OS 判定は `engine/include/strata/core/gfx12_platform_defaults.hpp:1-15`、gfx11 / gfx1151 の判定は `engine/src/prefill/moe_fused_iq.cu:3123-3133`。`STRATA_GFX11_DEFAULTS` と `STRATA_GFX1151_DEFAULTS` も先頭文字が `0` かだけを見ており、`0abc` も default off にする。
+
+MMQ prompt kernel を含まない `STRATA_PREFILL_FUSED && !STRATA_PREFILL_MMQ` build では、起動時 initializer がこの名前を含む opt-in 一覧を処理し、変数が unset のとき `setenv` / `_putenv_s` で `1` を設定する。ユーザーが空文字を含む値をすでに設定していれば保持する。そのため、この build の unset は各 backend の通常の unset 規則ではなく、実装が補った `1` として読まれる（`engine/src/prefill/prefill.cpp:223-255`; `engine/include/strata/prefill/own_only_switches.hpp:18-24,48-56`）。
 
 ## 有効になる条件
 
-実際に Q5_0 fused down kernel が対象層で使われるには、少なくとも次の条件が必要です。
-
-- HIP ビルドであること。`q50_on()` の CUDA 側は常に `false` を返します (`src/prefill/moe_fused_iq.cu:1943-1958`)。
-- デバイスが gfx12 WMMA または gfx1151 と認識され、native kernel が利用可能 (`DevInfo::ok`) であること。その他の gfx11 / gfx12 デバイス、HIP の gfx906、対応 kernel が build にない場合は対象外です (`src/prefill/moe_fused_iq.cu:1688-1699,1794-1823`)。
-- native pack の gate/up 形式が `gu_covered()` の対象であること。具体的には IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS で、HIP では追加で gfx12 の Q2_0、または `kq_on()` が有効な場合の Q4_K / Q5_K です (`src/prefill/moe_fused_iq.cu:1901-1910`)。
-- `STRATA_PF_FUSED=1` により native pack の fused prompt 経路が要求されていること。native pack の `native_supported()` は HIP でこの変数が未設定なら gfx12 の一部既定経路だけを認め、Q5_0 down は `q50_on()` が既定 OFF なので対象になりません。gfx1151 の Q5_0 down も `STRATA_PF_FUSED=1` がないと選択されません (`src/prefill/moe_fused_iq.cu:2041-2085`)。
-- gfx1151 の場合は `STRATA_PF_F16` が先頭文字 `1` であること。未設定、空文字、`0`、`true` などは F16 経路を無効にし、Q5_0 down は native coverage 外になります。gfx12 はこの F16 条件を使わず int8 kernel を使います (`src/prefill/moe_f16_common.cuh:53-60`; `src/prefill/moe_fused_iq.cu:1960-1967,2137-2144`)。
-- fused 経路を使う対象層・prompt であること。prefill の計画では MMQ の両 projection が対応している層は MMQ に割り当てられ、MMQ が対応しない native 層などで `native_supported()` が真なら native fused に割り当てます。したがって、変数を ON にしてもすべての Q5_0 層が必ず fused になるわけではありません (`src/prefill/prefill.cpp:1534-1555`)。
-
-上記条件を満たさなければ、この環境変数に関する専用の警告や fallback ログはありません。上位の計画が native fused を選ばなければ既存の MMQ または dequantize + FP16 GEMM 経路になります (`src/prefill/prefill.cpp:1548-1555`)。native kernel 内部の coverage 検査に到達したにもかかわらず型が対象外なら、stderr に `prefill fused experts (native): types %d / %d are not covered here`（wide batch では `prefill fused experts (native, NT = 256): types %d / %d are not covered here`）を出し `exit(1)` します (`src/prefill/moe_fused_iq.cu:2100-2108,2227-2235`)。
+- **CUDA:** Compute Capability 8.0 以上で、Q5_0 down kernel の `setup_one<T_Q5_0, false>` が成功すること。`dev_info()` は 8.0 未満を通常の native setup 前に返し、Q5_0 は Turing の setup 対象にも含めない（`engine/src/prefill/moe_fused_iq.cu:2899-2903,2951-2956`）。
+- **CUDA:** `STRATA_PF_FUSED=0` または fused prompt override が `0` なら Q50 の要求にかかわらず `native_supported` は false（同 `3415-3432`）。Q50 自体は `STRATA_PF_FUSED=1` を必須にせず、CUDA の Q5_0 専用判定は通常の GPU 世代別 default gate-format 判定より前に行われる（同 `3500-3505,3517-3532`）。
+- **HIP gfx12:** device が gfx12 WMMA kernel 対応として認識され、`dev_info().ok` であること。Q5_0 down は `q50_on` を満たす gfx12 native int8 kernel の対象（同 `2858-2885,3204-3208`）。
+- **HIP gfx11:** device が gfx1151 または対象の discrete RDNA3 と認識され、`q50_on` に加えて `STRATA_PF_F16` が `1` または `2` であること。gfx11 の Q5_0 down に fused int8 kernel はなく、F16 prompt kernel が必要（同 `3118-3137,3204-3208`; `engine/src/prefill/moe_f16_common.cuh:55-62`）。
+- **HIP gfx11:** さらに fused native prompt を有効にする必要がある。通常は `STRATA_PF_FUSED=1`（または small-card prompt の internal override）であり、`STRATA_PF_FUSED` が unset のときの `native_supported` の default return は gfx12 に限られるため、gfx11 では Q50 が on でも対象にならない。MMQ なし build が unset の `STRATA_PF_FUSED` を `1` に補う場合も条件を満たす（`engine/src/prefill/moe_fused_iq.cu:3425-3432,3581-3586`; `engine/src/prefill/moe_fused.cu:723-729`; `engine/src/prefill/prefill.cpp:223-255`）。
+- **HIP gfx12:** `STRATA_PF_FUSED=0` は全 fused native 経路を止める。unset 時は Linux の gfx12 default が有効になり得る。Windows では Q50 の既定は off だが、明示的な `STRATA_PF_FUSED_Q50=1` で Q5_0 を要求できる（`engine/src/prefill/moe_fused_iq.cu:3425-3432,3581-3586`; `engine/include/strata/core/gfx12_platform_defaults.hpp:7-15`）。
+- モデル側では down 型が Q5_0、gate/up 型が `gu_covered` の対応型で、現在の device の `native_supported` がその pair を受理すること。`gu_covered` の型一覧は同 `3061-3079`、down 判定は同 `3204-3220,3415-3432`。
+- CUDA では `STRATA_PF_FUSED_NT=256` または `STRATA_PF_FUSED_F16=1` により NT=256 kernel が有効、または `STRATA_PF_FUSED_WS=1` により warp-specialized kernel が有効な場合、Q5_0 pair はその kernel にないため `native_supported` が拒否する（同 `2783-2789,3500-3505`）。
 
 ## 実行時の詳細
 
-環境値は `q50_on()` が最初に呼ばれた際に一度読み取られ、プロセス内で cache されます。その後に環境を変更しても `STRATA_PF_FUSED_Q50` の判定は更新されません。gfx1151 の既定値を決める `STRATA_GFX1151_DEFAULTS` は、Q50 の値が未設定扱いの場合に `q50_on()` 内で参照されます。`STRATA_PF_F16` も別の関数内で static cache されます (`src/prefill/moe_fused_iq.cu:1943-1954`; `src/prefill/moe_f16_common.cuh:53-60`)。
+CUDA は `q50_cuda_requested()` の初回呼び出し時に環境を static cache する。device 情報と Q5_0 kernel setup 結果は `dev_info()` の device ごとの `DevInfo` に保存され、二度目以降は再 setup しない（`engine/src/prefill/moe_fused_iq.cu:2717-2719,2847-2853,2951-2956`）。実行中に `STRATA_PF_FUSED_Q50` を変更してもこの要求値には反映されない。
 
-Q5_0 down の coverage 判定は、gfx12 なら `q50_on()` の結果、gfx1151 なら同結果と `f16::requested()` の両方を要求します。native fused を選んだ gfx12 は `native_w11_kernel<T_Q5_0, false>` を起動し、gfx1151 は F16 分岐から `native_f16_kernel<T_Q5_0, false>` を起動します (`src/prefill/moe_fused_iq.cu:1960-1967,2137-2144,2180-2189`)。
+HIP は `q50_on()` の初回評価時に Q50 の unset/明示値判定を static cache する。device 情報も `dev_info()` で cache される一方、unset 時に参照する `STRATA_GFX11_DEFAULTS` / `STRATA_GFX1151_DEFAULTS` は該当する `q50_on()` 呼び出し時に読む（同 `3118-3133,2847-2853`）。MMQ なし build の環境補完は static initializer で `main()` より前に行われる（`engine/src/prefill/prefill.cpp:223-255`）。
 
-候補一覧 `docs/envvars/000_envvers.md` に名前はあります。Strata 全体を対象名で検索した結果、実装上の環境読み取りは `src/prefill/moe_fused_iq.cu:1946` のみでした。他の一致は同ファイルの説明コメントと `tests/cuda/prefill_fused_iq_test.cpp:660,698` のテスト専用コードです。名前を動的に渡して読む helper は見つかりませんでした。テストの設定例は、本番動作の根拠には用いていません。
+選択後、CUDA は Q5_0 down 用に個別計算した occupancy を使って `launch<T_Q5_0, false>` を呼び、他形式の occupancy とは分ける（`engine/src/prefill/moe_fused_iq.cu:2951-2956,3930-3935`）。HIP gfx12 は native WMMA kernel、gfx11 は `f16 && f16_d(g.d_type)` の条件で F16 kernel の Q5_0 down dispatch に進む（同 `3830-3849`）。対象外の層・device では Q50 kernel へは進まず、通常の対象形式経路（MMQ が使える構成なら MMQ、該当コメントが示す Q5_0 down 経路では gather + FP16 dequantize/GEMM）に残る（同 `2951-2955,3112-3116`）。
+
+## ログと測定値
+
+Q50 が unset / off、または CUDA Q5_0 setup が成功しなかった場合に限った専用ログは見つからなかった。CUDA の setup 失敗は `d.q50` を立てず、Q5_0 pair の native 対応判定を通さない（`engine/src/prefill/moe_fused_iq.cu:2951-2956,3500-3505`）。選択された kernel launch 後の CUDA/HIP 共通エラーチェックは失敗時に `stderr` へ `prefill fused experts (native): experts_native: <CUDA error>` の形式で出し、`exit(1)` する（同 `68-73,3948-3949`）。
+
+`docs/SETTINGS.md:433` はこの変数を NVIDIA / AMD 共通の `on / off` として一覧化しているが、現行ソースでは CUDA の明示 on 判定、gfx12 の Linux/Windows 差、gfx11 の F16 条件と platform default が異なる。`docs/DETAILS.md` にこの GPU Q50 スイッチの追加説明や測定値は見当たらないため、ここでは性能値を記載しない。
 
 ## 根拠
 
-- 読み取り・値判定・既定値: `src/prefill/moe_fused_iq.cu:1936-1958`
-- 対応する GPU と HIP build 条件: `src/prefill/moe_fused_iq.cu:1688-1699,1794-1823,1943-1958`
-- gate/up と down の coverage 判定: `src/prefill/moe_fused_iq.cu:1901-1918,1960-1967`
-- native pack の fused 要求と条件: `src/prefill/moe_fused_iq.cu:2041-2085`
-- gfx1151 F16 選択・Q5_0 kernel 起動: `src/prefill/moe_f16_common.cuh:53-60`; `src/prefill/moe_fused_iq.cu:2137-2189`
-- prefill の層別選択と通常 fallback: `src/prefill/prefill.cpp:1534-1555`
-- 実行時の coverage 失敗と終了: `src/prefill/moe_fused_iq.cu:2100-2108,2227-2235`
-
-実装とコメントの差: `src/prefill/moe_fused_iq.cu:1939-1942` のコメントは `STRATA_GFX1151_DEFAULTS=0` が機能を OFF にするとしていますが、実際の `q50_on()` は明示された非空 `STRATA_PF_FUSED_Q50` を先に処理して返します。そのため `STRATA_PF_FUSED_Q50=1` があれば `STRATA_GFX1151_DEFAULTS=0` はそれを無効化しません。これはコメントと現行コードの差として記録しています。
+- 読み取り、判定、device defaults: `engine/src/prefill/moe_fused_iq.cu:2715-2719,3118-3137`
+- HIP OS default: `engine/include/strata/core/gfx12_platform_defaults.hpp:7-15`
+- MMQ なし build による unset 補完: `engine/src/prefill/prefill.cpp:223-255`, `engine/include/strata/prefill/own_only_switches.hpp:18-24,48-56`
+- setup、条件、pair 判定、dispatch: `engine/src/prefill/moe_fused_iq.cu:2847-2903,2951-2956,3061-3079,3204-3220,3415-3432,3500-3505,3581-3586,3930-3949`
+- F16 kernel 要件と Q5_0 dispatch: `engine/src/prefill/moe_f16_common.cuh:55-62`, `engine/src/prefill/moe_fused_iq.cu:3781-3787,3830-3849`
+- 設定一覧との照合: `docs/SETTINGS.md:433`; `docs/DETAILS.md` に対象スイッチの説明なし。

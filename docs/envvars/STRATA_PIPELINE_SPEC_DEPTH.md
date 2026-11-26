@@ -1,54 +1,49 @@
 # `STRATA_PIPELINE_SPEC_DEPTH`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--pipeline-windows 2` の pipelined decode で、推測 window B を先行実行する front stage 数の上限を指定します。深さ `k` の場合、B は先頭から最大 `k` 個の front stage まで speculative に進みます。最後の stage は front stage ではなく、この値の対象外です。
+`--pipeline-windows 2` のデコードで、次のウィンドウ B を先行して投機実行する前段（最後の段を除く）の数を制限します。未設定時の既定値は実質全前段です。設定値を `k` とすると B は先頭 `k` 段まで進み、それより先の前段では A の進捗を待ちます。B の予測が外れた際の復元・再実行や、最後の段で A を検証する経路そのものはこの値では変更しません。読み取りは `engine/src/program/generate.cpp` の `pipe_dbg_env` を経由するデコードループ内です（同ファイル:681-687, 21802-21821, 22321-22330）。
 
-これはデバッグ用の調整値です。Strata は `STRATA_PIPELINE_DEBUG` が有効な場合に限り値を読みます。既定値は十分大きい `1 << 20` で、実際の stage 数によって上限が決まります。
+この調整値はデバッグ用ゲート `STRATA_PIPELINE_DEBUG` が有効な場合に限り読み取られます。ゲートが無効なら、設定しても値は未設定として扱われます（同ファイル:681-687）。
 
 ## 値と判定
 
-`pipe_dbg_env()` が返した文字列を `std::atoi` で変換し、`std::max(1, ...)` を適用します。文字列全体の検証はせず、`atoi` が変換できる先頭の整数部分を使います。
+`pipe_dbg_env("STRATA_PIPELINE_SPEC_DEPTH")` が返す文字列を `std::atoi` で整数化し、`std::max(1, ...)` で 1 未満を 1 にします。整数文字列全体の検証はありません。`atoi` の変換規則により、先頭の空白と符号は認められ、数字の後ろの文字は変換結果に影響しません。数字で始まらない文字列と空文字は 0 となり 1 に丸められます（同ファイル:22323-22327）。
 
-| 状態 | `pl_spec_depth` |
-|---|---:|
-| `STRATA_PIPELINE_DEBUG` が無効 | 既定値 `1 << 20`（対象変数は helper が `nullptr` を返すため、実質読み取られない） |
-| debug 有効、対象変数が未設定 | `1 << 20` |
-| debug 有効、値が `3`、`3tail`、`+3` | `3` |
-| debug 有効、値が `0`、負数、空文字、数値に変換できない文字列 | `1` |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効・丸められる値 |
+|---|---|---|---|
+| `STRATA_PIPELINE_DEBUG` が有効 | `1 << 20`（1,048,576。実際の前段数を超えるため全前段で投機可能） | `1` 以上の整数。例: `1`, `2`, `3`, `2tail` はそれぞれ 1, 2, 3, 2 | `0`, `-2`, 空文字, `true`, `0anything` はいずれも `atoi` の結果を 1 以上に丸め、深さ 1 |
+| `STRATA_PIPELINE_DEBUG` が未設定、空文字、または先頭文字が `0` | `1 << 20`（ゲートが閉じていても helper は対象値を未設定として返す） | 対象変数は読まれず、設定値は効果なし | 同左 |
 
-深さ 0 や負数で speculative 実行を完全に止めることはできません。最低 1 に丸められます。正の値に明示的な上限はありませんが、条件式 `B.fr < pl_nf` によって front stage 数以上には進みません。CLI 引数や `STRATA_PIPELINE_SWITCH` の値でこの深さを上書きする処理はありません。
-
-`STRATA_PIPELINE_DEBUG` は未設定、空文字、先頭が `0` の文字列で無効です。それ以外の設定値（例: `1`, `true`, `false`）で有効です。debug 判定は `pipe_dbg_env()` の static 値として初回呼び出し時に cache されます。
+デバッグゲートは `STRATA_PIPELINE_DEBUG` の空でない値で先頭文字が `0` 以外なら有効です。したがって `1`, `true`, `2anything` は有効、空文字・`0`・`0anything` は無効です。大文字小文字の判定や全体の真偽値 parse はありません（同ファイル:684-686）。
 
 ## 有効になる条件
 
-対象値が有効に読み取られても、次を満たさなければ decode の speculative 深度には影響しません。
-
-- `--serve` の複数 GPU layer split で各 stage が別 GPU にあり、`pipe` が成立する。
-- `--pipeline-windows 2` が有効である。`--pipeline-windows 1` は decode loop を pipelined にせず、この変数の分岐も使わない。
-- MTP drafter と `--spec` 2 以上が設定され、`--batch`, `--peer-device`, helper cache など pipeline を無効にする条件に当たらない。
-- GDN snapshot の確保に成功し、要求中の decode が repetition penalties (`penalty_last_n`) や coupled draft sampling により serial 実行へ切り替えられない。
-- request がキャンセル済みでなく、生成上限に達していない。
-
-CLI から pipeline を要求した場合の非対応条件は `--pipeline-windows ... is off: ...` と stderr に出し、その設定を 0 にします。`generate.cpp` の自動選択は `STRATA_USE_HIP` build でのみ有効で、server、GPU split、stage 数、MTP、batch、peer/helper cache 等の条件で決まります。NVIDIA builds は自動ではなく opt-in とする説明があります。深さの値自体がこれらの条件を変えることはありません。
-
-2 stage split では front stage は 1 個なので、深さ 1 以上の値は同じ実効範囲です。3 stage 以上では、深さを小さくすると B の speculative 実行が早い front stage で止まり、A の通常の進行は全 stage を通ります。
+- `STRATA_PIPELINE_DEBUG` が空でなく、先頭文字が `0` 以外であること。これを満たさない場合、対象変数は helper から `nullptr` として返り、既定深さになります（`engine/src/program/generate.cpp:684-686, 22323-22327`）。
+- パイプラインデコードが選択され、実行されること。対象ループは `pl_want = pipe && pl_pw >= 2 && pl_snap_ok` の場合に進みます。キャンセル中または出力上限到達時も実行しません（同ファイル:21810-21822）。
+- `--pipeline-windows 2` の利用には `--serve`、GPU ごとに段を置くレイヤー分割、MTP ドラフターと `--spec` 2 以上が必要です。明示指定時はこれらの条件で検査され、自動選択時はさらに HIP build の `decode_defaults_arch_ok()` が必要です。自動選択の最小段数は既定で 3（ドラフト層を先頭 GPU に置く既定構成なら 2）で、`STRATA_PIPELINE_AUTO_MIN_STAGES` は `atoi` 後に最低 2 へ丸めて変更できます。`STRATA_PIPELINE_AUTO=0` は自動選択を止めます。`STRATA_MTP_FULL_HEAD=1` はドラフト層を先頭 GPU に置く条件を無効にし、`STRATA_MTP_STAGE0` は明示指定時の配置を決めます。非対応理由は `strata generate: --pipeline-windows ... is off: ...` と stderr に出てオプションが無効化されます（同ファイル:6540-6546, 6560-6582, 6584-6616）。
+- `--batch` は既定でパイプラインを止めます。`STRATA_PW_WITH_BATCH=1` はソロ経路だけに維持し、バッチ窓自体では使いません。`--peer-device`、helper cache、複数段での `--adapt-async`、一部の DFlash2 構成も適用を妨げます（同ファイル:6555-6559, 6577-6579, 6584-6598）。
+- `--pipeline-windows 1` は深さ設定に関係なくデコードの投機ループを実行しません。深さが有効になるのは `pl_pw >= 2` の経路です（同ファイル:21810-21821）。
+- 同じ名前の読み取りは CUDA/HIP 共通エンジンの `engine/src/program/generate.cpp` に 1 箇所です。`engine/sycl/src/program/generate.cpp` と Metal 実装にこの名前の読み取りはなく、そこでは本設定による効果を確認できません。
 
 ## 実行時の詳細
 
-`pipe_dbg_env()` は初回に `STRATA_PIPELINE_DEBUG` を調べ、debug が有効な場合だけ引数名を `std::getenv()` に渡します。対象環境変数の直接参照はこの helper 呼び出しだけです。`pl_spec_depth` は pipelined decode branch 内の `static const int` で、一度だけ対象値を変換します。したがって、debug 判定後に環境を変更しても helper 判定は変わらず、深さを初回評価後に変更しても実行中の値には反映されません。
+デバッグ用の pipeline 環境変数は `pipe_dbg_env` で一括ゲートされます。ゲート判定は関数内 `static const bool` で初回呼び出し時に一度だけ行われ、深さもデコードループ内の `static const int` で初回到達時に一度だけ読み取られます。そのため、いずれかの読み取り後にプロセス環境を変更しても、このプロセスの判定には反映されません（`engine/src/program/generate.cpp:684-686, 22324-22327`）。
 
-各 loop で B を次の front stage に進める条件に `B.fr < pl_spec_depth` が含まれます。この条件を満たす間は、A の commit、B 用 snapshot、B の speculative launch を行います。深さに達した後はこの launch 分岐を通らず、B はそれ以上の front stage で speculative launch されません。通常の verify・commit の結果に応じて B は採用または破棄されます。
+実行中は前段番号 `B.fr` が `pl_spec_depth` 未満で、A がその段を通過済みの場合に限り、その段で A を commit した後に B を launch します。条件を満たさなくなると B はそこで進まず、既存ループの検証・確定を待ちます。未設定の大きな既定値は `B.fr < pl_nf`（`pl_nf` は最後以外の段数）の条件で実際の前段数に制限されます（同ファイル:13722-13725, 22328-22355）。
 
-この変数固有のログ、警告、終了コードはありません。pipeline decode の診断ログは `STRATA_DECODE_TIMING` 等で出る一般統計であり、この深さの設定値は表示されません。pipeline の準備や verify が失敗した場合は別の一般エラー経路があり、たとえば `pl_prepare()` 失敗時に `ERR` を出して `1` を返す処理がありますが、深さ値がその失敗を直接起こす判定はありません。
+## ログと測定値
+
+対象変数の値を表示するログ、無効値の警告、専用の終了経路はありません。パイプラインの一般的な非対応理由は `strata generate: --pipeline-windows %d is off: %s` と stderr に出ます（`engine/src/program/generate.cpp:6599-6601`）。投機ループ内で GDN snapshot や GPU 処理が失敗した場合は共通の `die` 経路に入り、`strata serve: pipelined decode: %s` を stderr に出し、`ERR %s` を stdout に出して 1 を返します。これは深さ値自体の検証エラーではありません（同ファイル:21917-21928, 22315-22316, 22336-22347）。
+
+`docs/DETAILS.md` に本変数の説明や測定値は見つかりませんでした。この設定の効果を比較した測定値も、調査対象ソースからは確認できません。
 
 ## 根拠
 
-- 対象名の全一致検索では `src/program/generate.cpp:16524-16527` のコメントと helper 呼び出しだけが見つかる。実際の判定条件と B の処理は `src/program/generate.cpp:16522-16559`。
-- helper の debug gate、値の有無に応じた読み取り: `src/program/generate.cpp:461-467`。全 pipeline debug/tuning 変数を debug 有効時だけ読む旨も同所にある。
-- `pipe` の成立条件と front stage 数: `src/program/generate.cpp:10000-10005,10279-10284`。pipelined decode の実行条件、serial fallback の request 条件: `src/program/generate.cpp:16079-16103`。
-- CLI の `--pipeline-windows` 値域と pipeline の対応条件、自動選択の backend 条件: `src/program/generate.cpp:3258,4985-5003,5005-5020`。pipeline の stage 数に関する概要、debug gate の説明: `docs/MULTI_GPU.md:174-197`。
-- pipeline 準備失敗時の `ERR` と終了: `src/program/generate.cpp:16098-16103`。深さ専用のログやエラーはない。
+- `engine/src/program/generate.cpp:681-687` — pipeline debug 環境変数に共通のゲート。
+- `engine/src/program/generate.cpp:6532-6601` — `--pipeline-windows` の自動選択、前提条件、無効化ログ。
+- `engine/src/program/generate.cpp:13722-13727` — 前段数とパイプライン準備。
+- `engine/src/program/generate.cpp:21802-21822` — 投機デコードループの開始条件。
+- `engine/src/program/generate.cpp:22321-22355` — 深さの読み取りと各段での B 投機実行。

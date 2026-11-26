@@ -1,53 +1,62 @@
 # `STRATA_RAM_ADAPT`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--serve` の decode 中、常駐 RAM コピーに保持する expert の一部を、会話中の routing 実績に合わせて入れ替えます。GPU に載っていない expert のうち、今後よく使われる候補をファイルから RAM へ読み、同じ層の RAM 常駐 expert のうち使われていないものの場所に置きます。これにより、後続 window がその expert を参照するときのファイル読み出しを避けられる場合があります。
+`--serve` の decode 中、VRAM に載らない MoE expert のうち、会話中に使われる expert を resident RAM copy に移し、あまり使われない expert の RAM 上の場所と入れ替える opt-in 上限値です。expert の routing、重み、VRAM tier の選択規則そのものは変えません。環境値は `generate.cpp` の serve decode loop が初めてこの処理に到達したときに一度読みます。(`engine/src/program/generate.cpp:12302-12303,22836-22846`)
 
-これは RAM コピー内の入れ替え数の上限です。GPU の residency、routing、重み、GPU 側 adaptive tier の選択規則は変更しません。常駐 RAM モードでない場合は効果がありません。
+同じ `STRATA_RAM_ADAPT` 値でも、`STRATA_RAM_ADAPT2` が無効なら従来の同期置換、有効なら I/O thread に読み込みを先行させる staged 置換になります。後者では `STRATA_RAM_ADAPT` は 1 window あたりの staged promotion 数の上限です。(`engine/src/program/generate.cpp:12333-12349,22847-22922`)
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換し、結果を `max(0, 値)` で下限 0 に制限します。文字列全体の厳密な数値検証はありません。
+`std::getenv` で取得し、未設定なら `0`、設定されていれば `std::atoi` の結果を `std::max(0, ...)` で負値から `0` にします。文字列全体の妥当性検査はなく、`atoi` が読む先頭の整数部分が使われます。空文字、`true`、`false`、`0anything` はいずれも `0` となり、`3x` は `3`、`+2` は `2` になります。先頭空白は `atoi` の変換規則に従います。整数変換範囲外の値に対する検査や fallback はありません。(`engine/src/program/generate.cpp:22843-22846`)
 
-| 環境変数 | 結果 |
-|---|---|
-| 未設定 | 0（無効） |
-| 空文字、数字で始まらない値 | `atoi` の結果 0（無効） |
-| 正の整数 | その数を候補入れ替え数の上限として使用 |
-| `0`、負数 | 0（無効） |
-| 数字の後ろに文字が続く値 | `atoi` が読めた先頭の整数を使用（例: `3abc` は 3） |
+| 条件 | unset | 有効値の例 | 無効値の例 |
+| --- | --- | --- | --- |
+| `STRATA_RAM_ADAPT2` が未設定、空、または `atoi` 結果 0 | 0 | 正の整数。例: `1`, `4`, `3x` | 空文字、`0`, `0anything`, `-1`, `true` |
+| `STRATA_RAM_ADAPT2` の `atoi` 結果が非 0 | 0 | 正の整数。例: `1`, `4` | 空文字、`0`, `0anything`, `-1`, `true` |
 
-先頭の空白と符号は `atoi` の変換規則に従います。値は関数内の `static const int` に保存され、プロセスで初めてこの decode 経路に到達したときに評価されます。その後の環境変更は反映されません（`src/program/generate.cpp:14275-14278`）。
+負数は両方の経路で 0 に clamp されます。上限の clamp はありません。`STRATA_RAM_ADAPT2` は serve 初期化時に `atoi(v) != 0` で別に判定されます。(`engine/src/program/generate.cpp:12333-12349,22843-22849`)
+
+CLI 引数がこの環境値を上書きする処理はありません。`--adapt-every` と `--adapt-swaps` は RAM 適応の別の前提であり、指定値が有効でも適応 tier が無効なら RAM 置換は行われません。serve 経路ではこの二つが正で、全 expert が VRAM に resident ではなく、VRAM cache slot がある場合に usage 表が確保されます。(`engine/src/program/generate.cpp:15001-15002`)
 
 ## 有効になる条件
 
-値が正でも、各条件を満たす decode window の直前に限り候補選定が行われます。
-
-- 初回 window ではない。
-- adaptive tier の利用実績 (`drive.d.usage`) がある。
-- 未適用の GPU 側 adaptive swap がない。
-- 非同期 adaptive round が動作中でない（非同期機能を使っていないか、状態が idle）。
-- 常駐 RAM コピーが準備済み (`src.complement_ready()`)。
-- 複数 GPU、peer GPU、remote expert opt-in を使っていない。
-- `--batch` が無効（`o.batch == 0`）。
-
-コード上の条件は `src/program/generate.cpp:14279-14281` にあります。層 split、peer/helper GPU、batch では選定ブロックに入りません。`STRATA_EXCHANGE_ROTATE` が有効な場合、`replace_resident()` は失敗を返して変更しないため、この変数による RAM 入れ替えは起きません（`include/strata/core/expert_source.hpp:752-757`, `src/core/expert_source.cpp:3457-3460`）。
+- `--serve` 経路であること。非 serve の generate loop にはこの環境値を読むコードがありません。(`engine/src/program/generate.cpp:12302-12303,22843-22849`)
+- `STRATA_RAM_ADAPT` が正の数に変換されること。
+- adaptive tier が有効で usage 表があること。serve では `--adapt-every > 0`、`--adapt-swaps > 0`、全 expert が resident ではないこと、VRAM cache slot があることが usage 表の確保条件です。(`engine/src/program/generate.cpp:15001-15002`)
+- resident RAM copy が利用可能で `src.complement_ready()` が真であること。置換 API も ready な copy、妥当な layer/expert、対象 expert が copy にない/あることなどを再確認し、条件外なら変更しません。(`engine/src/program/generate.cpp:22847-22849,22920-22922`; `engine/src/core/expert_source.cpp:4934-4945,4956-4966`)
+- 最初の window の後で、usage 表が空でなく、adaptive round が pending でないこと。`--adapt-async` を使う場合は job state が `Idle` である必要があります。(`engine/src/program/generate.cpp:22847-22849,22920-22922`)
+- multi-GPU、peer tier、remote helper、および `--batch` はこの RAM adaptation branch を無効にします。(`engine/src/program/generate.cpp:22847-22849,22920-22922`)
+- OS や GPU 世代による追加判定はこの処理にありません。実行可否は `generate.cpp` と `FileExpertSource` を含む build、および上記 runtime 条件に依存します。(`engine/src/program/generate.cpp:22843-22849`; `engine/src/core/expert_source.cpp:4934-4953`)
 
 ## 実行時の詳細
 
-各対象 window の前に層ごとに候補を探します。GPU に載っていない expert (`host_res[e] < 0`) に限り、RAM にない expert の中から decayed usage が 2.0 以上の最大値を `in` として選び、RAM にある expert の中から usage が最小の `out` を探します。`out` の usage が 0.5 未満の場合だけ、その層の入れ替え候補になります。候補の優先度は `usage[in] - usage[out]` で、大きい順に並べ、全層から最大 `n` 件を残します（`src/program/generate.cpp:14282-14299`）。同値の候補は `std::sort` の比較関数で同順位です。
+値は decode loop の関数内 `static const int` に保持され、最初に RAM 適応の判定へ到達した時点で初期化されます。以後の request/window では再読込しないため、同一プロセス実行中の環境変更は反映されません。(`engine/src/program/generate.cpp:22843-22846`)
 
-各候補は `FileExpertSource::replace_resident()` に渡されます。妥当性、resident slot、競合する override などを確認した後、対象 expert の blob を一時バッファへファイルから読み、常駐 RAM コピーの `out` の場所へコピーして、resident offset の対応を交換します。読み出しに失敗した場合は置換前の RAM コピーを保ち、その候補は成功扱いになりません。成功数は `ram_adapts_` に累積されます（`src/core/expert_source.cpp:3457-3483`）。呼び出し側は戻り値を使わず、候補ごとの失敗を個別ログには出しません。
+`STRATA_RAM_ADAPT2` が 0 の場合、各 layer について VRAM 外の候補から usage が 2 以上の incoming expert と、resident RAM にあり usage が 0.5 未満の outgoing expert をそれぞれ最大 4 件選び、差が大きい組から置換します。incoming expert の blob が直前の demand read の stage buffer に残っていればそこからコピーし、ファイル読み取りは行いません。そうでなければ `n` は `replace_resident` の file-read 経路を試す呼び出し数を制限します。staged buffer からの置換はこの上限を消費しません。RAM copy の大きさは変わりません。(`engine/src/program/generate.cpp:22920-22956`; `engine/src/core/expert_source.cpp:4934-4953,4956-4980`)
 
-この処理は window の間ではなく、その直前に呼び出し元スレッド上で同期実行されます。prompt の初回 window は対象外なので prompt routing から置換候補は作られません。一方、後続の prompt/request は同一プロセスの更新済み RAM コピーを利用し得ます。request の統計出力では成功数が正の場合に `strata serve: resident RAM: %lld experts moved in from the file in place of unused ones (STRATA_RAM_ADAPT)` と表示されます（`src/program/generate.cpp:14766-14768`）。
+`STRATA_RAM_ADAPT2` が非 0 の場合、同じ「`n > 0`」が staged promotion の総数上限となり、読み込みは source の I/O thread に queue されます。window 境界で読み込み済み promotion を install し、次の候補を stage します。こちらの候補条件と順位付けは異なり、`STRATA_RAM_ADAPT_PROMPT_W > 0` の場合は usage に prompt routing seed を加え、page-cache の tier cost も考慮します。関連する `STRATA_RAM_ADAPT_PROMPT_W`（既定 0.25）、`STRATA_RAM_ADAPT_CACHED_W`（既定 0.15）、`STRATA_RAM_ADAPT_PER_LAYER`（既定 2）、`STRATA_RAM_ADAPT_SKIP_TOP`（既定 2）がこの枝の候補計算を調整します。(`engine/src/program/generate.cpp:12334-12348,22847-22918`)
+
+RAM 置換 API の戻り値は caller でエラー終了に使われません。legacy 枝で `replace_resident_staged` が false の場合は file-read 経路を試し、その読み取りに失敗した場合や置換条件が合わない場合は resident copy を変更せず処理を続けます。ADAPT2 枝で `ram_stage` が false を返した候補も上限数に数えず、fatal error にはなりません。adaptive tier 自体の refill failure は別経路で `ERR an adaptive refill failed` を stdout に出し、serve loop が `1` を返します。(`engine/src/program/generate.cpp:22950-22960`; `engine/src/core/expert_source.cpp:4934-4953,4956-4980`)
+
+## ログと測定値
+
+request 終了時、resident RAM adaptation の累積移動数が 1 件以上なら stderr に次の形式で出ます。2つ目の数は stage buffer から移動した件数です。移動がなければこの行は出ません。(`engine/src/program/generate.cpp:23806-23809`)
+
+```text
+strata serve: resident RAM: <n> experts moved in in place of unused ones, <n> of them out of a stage buffer (STRATA_RAM_ADAPT)
+```
+
+`docs/DETAILS.md:1670-1671` には旧版・特定構成での測定記録がありますが、この checkout の測定ではありません。現行 HEAD の性能値としては扱いません。`docs/DETAILS.md:277-282` の説明は従来の置換枝に対応し、現行コードにある `STRATA_RAM_ADAPT2` staged 枝とその異なる `n` 上限は説明していません。
 
 ## 根拠
 
-- 値の読み取り、候補条件・順位付け、置換呼び出し: `src/program/generate.cpp:14268-14302`
-- RAM resident コピーの検査、ファイル読み込み、コピー先更新、成功カウント: `src/core/expert_source.cpp:3457-3483`
-- 回転ストレージでの非対応条件と API 契約: `include/strata/core/expert_source.hpp:752-758`
-- ログ: `src/program/generate.cpp:14759-14768`
-- `docs/DETAILS.md:162-190` も `--serve`・一 GPU の opt-in と条件を説明し、RTX 3060 12 GB / 32 GB RAM / IQ2_XS の記載試行で decode 43.26→50.40 tok/s としています。この値は同資料に記載された単一環境・単一量子化の測定結果であり、一般的な性能保証ではありません。
+- `engine/src/program/generate.cpp:12302-12303` — serve 経路。
+- `engine/src/program/generate.cpp:12333-12349` — 関連する `STRATA_RAM_ADAPT2` と tuning 値の読み取り。
+- `engine/src/program/generate.cpp:15001-15002` — adaptive usage 表の有効条件。
+- `engine/src/program/generate.cpp:22836-22960` — 対象値の読み取り、両置換経路、適用条件、adaptive refill failure。
+- `engine/src/program/generate.cpp:23806-23809` — 累積移動ログ。
+- `engine/src/core/expert_source.cpp:4934-5004` — file-read / stage-buffer の resident copy 置換、失敗時処理。
+- `docs/DETAILS.md:277-282,1670-1671` — 現行実装との照合対象および旧版測定記録。

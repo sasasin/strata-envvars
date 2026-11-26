@@ -1,40 +1,42 @@
 # `STRATA_REFILL_BLOCKING`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-prefill 用に一時的に借りた expert cache slot を、prefill 後に元の expert データで埋め戻すときのコピー方法を切り替えます。設定時は slot ごとに blocking の `fill_slot_blocking()`、未設定時は queued の `fill_slot_queued()` を呼びます。対象は `src/program/generate.cpp` と `sycl/src/program/generate.cpp` の batched prefill の refill 経路です。通常の expert load や remote expert の初期ロードにはこの環境変数の分岐はありません。
+プロンプト処理のため一時的に借りた expert-cache slot を返す際に使う refill API を切り替える。CUDA/HIP 実装では unset 時に queued copy、設定時に blocking copy を選ぶ。SYCL 実装でも `fill_slot_queued` と `fill_slot_blocking` の選択を切り替えるが、現行の `fill_slot_queued` 自体も各 copy の `.wait()` を呼ぶ。設定値は数値や真偽値として解釈されない。`engine/src/program/generate.cpp:674-677,20502-20516,24184-24199`、`engine/sycl/src/program/generate.cpp:318-321,11345-11353,13394-13413`、`engine/sycl/src/core/expert_cache.cpp:914-987`。
 
 ## 値と判定
 
-値の内容は parse せず、`std::getenv(...) != nullptr` だけで判定します。空文字、`0`、`false` を含め、環境変数が存在すれば有効です。未設定なら無効です。
+両実装とも `std::getenv(...) != nullptr` だけを見ており、文字列を parse しない。変数が存在すれば値が空文字でも有効となり、値の文字・数値としての妥当性は判定しない。
 
-| 状態 | 判定 | 選ばれる処理 |
-|---|---|---|
-| 未設定 | false | `fill_slot_queued()` |
-| 任意の設定値（空文字を含む） | true | `fill_slot_blocking()` |
+| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP（`engine/src`）・SYCL（`engine/sycl/src`） | `false`。借用 slot の refill は queued 経路 | `1`、`true`、空文字を含む、環境変数が存在するすべての値 | なし。`0`、`false`、任意文字列も「設定あり」として有効 |
 
-判定結果は `refill_blocking()` 内の function-local `static const bool` に初回呼び出し時に保存されます。その後プロセス内で環境を書き換えても再評価されません。子プロセスの起動や環境継承をこのコードが行う箇所はありません。
-
-根拠: `src/program/generate.cpp:244-247`, `sycl/src/program/generate.cpp:286-289`。
+関数内 `static const bool` に初回評価結果を保存する。したがって最初の `refill_blocking()` 呼び出し後にプロセス環境を変更しても、そのプロセス内では反映されない。CLI 引数や設定ファイルによる上書き処理はこの変数の読み取り経路にはない。`engine/src/program/generate.cpp:674-677`、`engine/sycl/src/program/generate.cpp:318-321`。
 
 ## 有効になる条件
 
-この変数が影響するのは、batched prefill の実行後に返却すべき lent slot がある場合だけです。借用 slot が空なら refill loop 自体がなく、設定しても作用しません。複数 stage の layer split でも同じ分岐を使い、未設定かつ `STRATA_REFILL_SERIAL` が未設定の場合は各 stage のコピーを発行してから待ちます。設定時は `refill_issue()` の各 slot コピーで待つため、stage ごとの発行を他 stage と重ねる効果も失われます。`STRATA_REFILL_SERIAL` は refill stage の順序に関係する別変数です。
-
-根拠: `src/program/generate.cpp:10838-10886`, `sycl/src/program/generate.cpp:10082-10132`。
+- 環境変数が設定され、かつ prompt prefill が cache slot を借りて使用し、その slot を返すための refill が発生する必要がある。slot を借りない実行では切替箇所に到達しない。CUDA/HIP の単一 prompt 経路では `--no-prefill-borrow`、slot が不要・不足する場合、または Metal で `k` を 0 にする場合など、借用しない経路がある。`engine/src/program/generate.cpp:24055-24075,24184-24199`。
+- CUDA/HIP の段階分割 prompt 経路と単一 prompt 経路、ならびに SYCL の段階分割・単一 prompt 経路に分岐がある。`STRATA_REFILL_BLOCKING` はこれら refill の各 slot 転送を選ぶ。CUDA/HIP の段階分割経路で `STRATA_REFILL_PARTS` が有効でも、この変数が有効なら blob-parts の queued 転送を選ばず、通常 blob の blocking refill に進む。`engine/src/program/generate.cpp:20502-20516,24186-24195`、`engine/sycl/src/program/generate.cpp:11345-11353,13394-13409`。
+- `--no-prefill-borrow` などにより slot が借用されなければ、この変数単独では prompt buffer の割当方法を変更しない。`engine/src/program/generate.cpp:1001-1002,4035,24067-24075`。
 
 ## 実行時の詳細
 
-CUDA/HIP 実装では blocking 側は `cudaMemcpy` を使い、slot ごとにコピー完了を待ってから次の slot に進みます。未設定側は default stream への `cudaMemcpyAsync` を順に発行し、loop 後の `sync_queued()` で待ちます。したがって変数が主に変えるのは複数 slot 間のコピー発行と完了待ちの配置です。HIP の blocking 実装では staging buffer へ host copy してから device へコピーし、buffer のサイズ不足やコピー失敗は refill 失敗になります。
+未設定時は各 lent slot に `fill_slot_queued` を呼び、設定時は各 slot ごとに `fill_slot_blocking` を呼ぶ。CUDA/HIP の blocking 実装は `cudaMemcpy`、queued 実装は `cudaMemcpyAsync` を使い、段階分割経路では unset 時に複数 stage の queued copy を発行してから `sync_queued` する。SYCL 側では両 API が queue の `memcpy(...).wait()` を呼ぶため、変数 unset 時も copy ごとに wait する。SYCL の単一 prompt 経路は unset 時に最大256件ごとの追加 `sync_queued` も行い、設定時はその追加同期を省く。CUDA/HIP では blocking 時に async 読み込み通知 `note_async_read` を行わない。完了後の residency table 更新・slot の返却は同じ refill 処理に残る。`engine/src/core/expert_cache.cpp:864-897,900-919`、`engine/sycl/src/core/expert_cache.cpp:914-969,971-1000`、`engine/src/program/generate.cpp:20502-20529,20543-20565`、`engine/sycl/src/program/generate.cpp:11341-11371,11377-11398,13394-13413`。
 
-SYCL 実装では `fill_slot_queued()` も queue の `memcpy(...).wait()` を呼びます。よって、SYCL では名前に反して未設定側も各 slot ごとに wait し、両分岐とも loop 後に queue 全体の `sync_queued()` を実行します。この実装では変数による slot ごとの同期タイミングの差はありません。
+CUDA/HIP の単一 prompt 経路では、設定時に各 slot を `fill_slot_blocking` で戻し、未設定時に queued copy 後 `sync_queued` を呼ぶ。SYCL の単一経路では同じ設定により呼ぶ API が変わるが、unset 時の `fill_slot_queued` も各 copy で wait する。unset 時にだけ最大256件ごとの追加 `sync_queued` がある。`engine/src/program/generate.cpp:24184-24205`、`engine/sycl/src/program/generate.cpp:13391-13421`、`engine/sycl/src/core/expert_cache.cpp:971-1000`。
 
-refill が失敗すると呼び出し元はエラーを stderr に出して処理を失敗させます。通常の batched path では成功時に `strata generate: %zu lent slots refilled in %.1f ms` を stderr に出します。trace が有効な multi-stage path では `strata trace: refilled ...` も出ます。処理時間を短縮・保証する測定値は本調査では確認していません。
+## ログと測定値
 
-根拠: `src/core/expert_cache.cpp:692-746`, `sycl/src/core/expert_cache.cpp:866-985`, `src/program/generate.cpp:10838-10866,12639-12665`, `sycl/src/program/generate.cpp:10082-10112,11762-11795`。
+この変数専用の有効・無効ログはない。単一 prompt 経路では refill 成功時に `strata generate: %zu lent slots refilled in %.1f ms` を stderr に出す。転送失敗時は `strata generate: refilling a lent slot failed: %s`、queued 同期失敗時は `strata generate: refilling the lent slots failed: %s` を出して `return 1` する。SYCL の単一経路も同じ失敗文言で `return 1` する。段階分割経路は `STRATA_TRACE` が設定されている場合に限り、成功後 `strata trace: refilled %lld slots on %lld stage(s) in %.1f ms` を stderr に出す。`engine/src/program/generate.cpp:24189-24207,20561-20567`、`engine/sycl/src/program/generate.cpp:11391-11395,13397-13420`。
 
-## 文書との照合
+## 根拠
 
-`docs/DETAILS.md` および他の `docs` 内 Markdown に `STRATA_REFILL_BLOCKING` の説明は見つかりませんでした。このため、上記は実装箇所と `ExpertCache` のコピー関数から確認できる範囲に限ります。
+- 読み取りと static cache: `engine/src/program/generate.cpp:674-677`、`engine/sycl/src/program/generate.cpp:318-321`。
+- CUDA/HIP 段階分割 refill: `engine/src/program/generate.cpp:20502-20529`。
+- CUDA/HIP 単一 prompt refill と借用抑止条件: `engine/src/program/generate.cpp:24055-24075,24184-24207`。
+- SYCL 段階分割 refill: `engine/sycl/src/program/generate.cpp:11341-11371`。
+- SYCL 単一 prompt refill: `engine/sycl/src/program/generate.cpp:13391-13421`。
+- cache の blocking / queued 実装: `engine/src/core/expert_cache.cpp:864-919`、`engine/sycl/src/core/expert_cache.cpp:914-987`。

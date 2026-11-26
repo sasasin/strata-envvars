@@ -1,48 +1,57 @@
 # `STRATA_Q36_KEEP_PACKED`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。作業開始時の Strata 作業ツリーは clean。対象は Strata 所有ソースであり、外部ライブラリの挙動は含めない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Qwen 3.5 (`strata-q36`) の expert 配置時に、ロード済みの packed Q8_0 decode copy を VRAM から解放する自動判断を抑止する。packed copy を維持したぶん routed expert が VRAM に収まりにくくなり、expert 配置は hybrid 経路を選ぶ可能性がある。変数は packed copy を新たに作る設定ではなく、その解放判断だけに関与する。
+Qwen3.6 engine が routed expert の配置を決めるとき、条件を満たした場合に GPU 上の packed Q8_0 decode コピーを解放して全 expert を VRAM に置く最適化を抑止する。設定すると packed コピーを保持し、通常の slot + CPU pool を使う hybrid 配置へ進むためのフラグである。ただし、設定だけで必ず全層の hybrid 配置になるわけではなく、後続の配置判定が優先される。読み取りと解放処理は `place_experts` にある（`engine/src/qwen35/q36_engine.cu:4247-4289`）。
+
+この環境変数自体は値を数値化・真偽値 parse せず、存在確認に使う。コピー解放条件に入らなければ配置への影響はない（`engine/src/qwen35/q36_engine.cu:4271-4279`）。
 
 ## 値と判定
 
-値の parse は行わず、`std::getenv("STRATA_Q36_KEEP_PACKED") != nullptr` で設定有無を判定する。
+`std::getenv(...) == nullptr` かどうかだけを判定する。未設定なら解放最適化を許可し、何らかの値が設定されていれば最適化を抑止する。空文字列も「設定あり」と判定される。`1`、`0`、`true`、`false`、`0anything`、大文字小文字、前後の空白はいずれも文字列内容を検査されず、設定されていれば同じ扱いである。数値変換・値域・無効値 fallback はない（`engine/src/qwen35/q36_engine.cu:4277-4279`）。
 
-| 状態 | 解放判断への効果 |
-|---|---|
-| unset | 他の条件も満たす場合、packed copy を解放できる |
-| 設定あり（空文字を含む） | packed copy を解放しない。この判定では値の内容を問わない |
-
-したがって `1` は慣例的な設定例にすぎず、`0`、`false`、空文字も「設定あり」として解放を抑止する。大文字小文字、数値、前後の空白は検査されない。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `place_experts` のコピー解放判定 | 後述の配置条件を満たせばコピーを解放 | 空文字、`1`、`0`、`true`、`false`、任意の文字列。すべて解放判定を抑止 | なし。値の内容による無効値判定はない |
 
 ## 有効になる条件
 
-この判断が実行されるのは `place_experts()` 内で、すべての条件を満たす場合に限る。
+環境変数が設定されていても、次の条件がすべて成立する場合に限って解放を抑止する効果がある。条件式は `place_experts` にある（`engine/src/qwen35/q36_engine.cu:4262-4279`）。
 
-- `--expert-slots` が未指定相当（`slots <= 0`）。
-- `--expert-vram` が明示されていない（`vram_gib < 0`）。
-- routed expert 全体の必要量 `total` が、予約量を差し引いた現在の VRAM budget を超える。
-- 解放可能な packed copy が少なくとも一つある（`packed_bytes > 0`）。
-- packed copy を解放すると、expert 全体が budget 内に収まるか、MTP CPU 配置を許す条件下で main layers が budget と slack 内に収まる。
+- `--expert-slots` が 0 以下である。正の slot 数を強制した場合はコピー解放判定に入らない（CLI 値の読み取り: `engine/src/qwen35/q36_engine.cu:5384-5386`）。
+- `--expert-vram` が未指定相当の負値である。既定値は `-1.0`。0 以上の明示値ではこの判定に入らない（`engine/src/qwen35/q36_engine.cu:5343-5345,5384`）。
+- 初期の VRAM 空き容量から 768 MiB の reserve を引いた予算より、expert と MTP block を含む必要量 `total` が大きい。
+- model load 時に登録された packed Q8_0 コピーの合計 `packed_bytes` が 0 より大きい。登録対象は type 8 の tensor のうち `native_q8_0_packed_enabled()` と `native_q8_0_packed_eligible(...)` を満たすもの（`engine/src/qwen35/q36_engine.cu:1439-1449`）。
+- コピーを返せば収まる見込みがある。具体的には `total <= budget + packed_bytes`、または MTP block の CPU 配置が許され、`main_need <= budget + packed_bytes + slack`。後者の `mtp_cpu_ok` は `STRATA_Q36_NO_MTP_CPU` が未設定のときだけ真（`engine/src/qwen35/q36_engine.cu:4275-4279`）。
 
-これらの条件のいずれかを満たさなければ、この環境変数の有無による解放判断は行われない。環境変数が設定されていても VRAM に余裕がある場合の expert 配置を強制変更するものではない。
+この条件外では変数の有無にかかわらずコピー解放分岐は実行されない。例えば既に全 expert が予算内に収まる場合、packed コピーがない場合、slot 数や expert VRAM 予算を CLI で指定した場合はこの変数は配置を変えない。
 
 ## 実行時の詳細
 
-Qwen 3.5 の loader は、`STRATA_Q8_PACKED` が有効で、Q8_0 行列の形状が eligible の場合に Q8_0 decode 用の packed copy を VRAM に作り、元の GGUF weight pointer と対応づけて `m.packed` に記録する。`place_experts()` はこの copy 群の総バイト数を計算し、上記の VRAM 条件に当たるときだけ `STRATA_Q36_KEEP_PACKED` を確認する。
+Qwen3.6 model のロードと `Engine::init` の後、expert の配置を始めるときに `place_experts` がこの変数を読み取る。読み取りは関数内の直接呼び出しで、static cache やリクエストごとの再評価はない。main 経路では `place_experts` は一度呼び出されるため、判定後のプロセス環境変更ではその配置結果は変わらない（呼び出し位置: `engine/src/qwen35/q36_engine.cu:5522-5524`）。
 
-変数が unset なら、各 copy の registry 登録を解除して VRAM を解放し、`m.packed` を空にして decode graph を reset する。その後、解放後の空き VRAM を使って expert を配置し、成功すると stderr に `strata-q36: the packed Q8_0 decode copies (...) given back so that every routed expert fits in VRAM ...` のログを出す。変数が設定されている場合はこの解放処理とログを通らず、保持した copy を含む現在の VRAM 状態で配置を続ける。hybrid expert pool を含まない build で expert が収まらない場合は、後続の配置処理がエラーを返し、`strata-q36` は stderr に理由を出して終了コード 1 で戻る。
+変数が未設定で解放条件を満たすと、Strata は device synchronize の後、各 packed コピーを `native_q8_0_packed_unregister` で登録解除し、`cudaFree` し、`m.packed` を空にして graph を reset する。その後に空き VRAM を再取得し、更新された空き容量で配置を続ける（`engine/src/qwen35/q36_engine.cu:4280-4292`）。設定時はこのまとまりを飛ばし、packed コピーを保持したまま通常の配置判定へ進む。
 
-この環境変数は `place_experts()` が呼ばれるたびに評価され、static cache ではない。`strata::qwen35::run()` は model load 後、engine 初期化の後に配置関数を呼び出す。Q8_0 packed copy 自体の作成有無は別の `STRATA_Q8_PACKED` 判定に依存し、Q36 の CUDA ソースでは非 Windows 時にその変数を未設定なら `1` として設定する。copy がないと `packed_bytes > 0` 条件を満たさず、この変数の配置判断への作用はない。
+後続の判定では、全 expert が予算内なら全 expert を VRAM に配置する経路も残る（`engine/src/qwen35/q36_engine.cu:4318-4335`）。収まらなければ、`STRATA_Q36_CPU_POOL` が有効な build では hybrid 配置を計画し、main layer の CPU pool 参加、slot 数、prompt streaming / staging の可否を決める。MTP だけを CPU pool に置く経路もあり、`STRATA_Q36_NO_MTP_CPU` が設定されるとその経路は選ばれない（`engine/src/qwen35/q36_engine.cu:4301-4316,4343-4376`）。この変数は CLI の優先順位を上書きせず、上記の `--expert-slots` / `--expert-vram` 条件が成立しない場合には何もしない。
 
-ソースコメントは、packed copy を解放すると routed experts が収まる例として「32 GB の UD-Q6_K_XL」を挙げる。また解放後の decode は GGUF layout を読む経路で bitwise に同じ出力だが少し遅いと説明している。これは実装コメントに記された設計・性能上の説明であり、この調査で実行測定した結果ではない。関連する詳細資料にこの環境変数の追加説明は見つからなかった。
+## ログと測定値
+
+未設定でコピーを解放したとき、stderr に次のログが出る。コピーサイズは実際に合計した値である（`engine/src/qwen35/q36_engine.cu:4287-4290`）。
+
+```text
+strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back so that every routed expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)
+```
+
+このログは環境変数が設定されて分岐を抑止した場合には出ない。後続の hybrid 計画が VRAM に収まらなければ、例えば `not enough VRAM left for the hybrid experts' buffers and slots (...)` をエラー文字列として返し、呼び出し元が `strata-q36: ...` と stderr に出して終了コード 1 で終了する。CPU expert pool のない build では、expert が VRAM に収まらない場合に `the routed experts (...) do not fit in VRAM, and this build has no CPU expert pool (STRATA_NATIVE_EXPERTS=OFF)` を出して同じく配置失敗となる（`engine/src/qwen35/q36_engine.cu:4337-4342,4380-4385,5523-5526`）。
+
+Strata のソースコメントはコピー解放後の decode を「bitwise the same outputs, a little slower」と説明しているが、ここでは測定値を示すものではない（`engine/src/qwen35/q36_engine.cu:4267-4270`）。
 
 ## 根拠
 
-- `src/qwen35/q36_engine.cu:891-919` — 行列ロード時の Q8_0 packed copy 作成と `m.packed` 登録。
-- `src/qwen35/q36_engine.cu:1930-1977` — expert VRAM budget、解放条件、設定有無判定、unregister/free、graph reset とログ。
-- `src/qwen35/q36_engine.cu:2019-2024` — CPU expert pool を持たない build で収まらない場合のエラー。
-- `src/qwen35/q36_engine.cu:2404-2410,2414-2445` — `STRATA_Q8_PACKED` の非 Windows 未設定時の既定設定と、load 後に `place_experts()` を呼ぶ順序。
-- `src/kernels/cuda/native_mmvq.cu:1990-2001` — 関連変数 `STRATA_Q8_PACKED` の文字列全体比較と eligible shape 条件。
+- `engine/src/qwen35/q36_engine.cu:1439-1449` — packed Q8_0 コピーの作成・登録条件。
+- `engine/src/qwen35/q36_engine.cu:4247-4292` — 配置予算、対象環境変数の読み取り、packed コピー解放とログ。
+- `engine/src/qwen35/q36_engine.cu:4301-4349` — MTP only / 全 VRAM / CPU pool hybrid の後続経路と build 条件。
+- `engine/src/qwen35/q36_engine.cu:5343-5386,5522-5526` — CLI 既定値、引数、配置呼び出しと失敗終了。
+- `engine/cmake/strata_gpu_engine.cmake:565-583` — Qwen3.6 engine の build 登録、gfx906 除外、`STRATA_NATIVE_EXPERTS` による CPU pool macro。

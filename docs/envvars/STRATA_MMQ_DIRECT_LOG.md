@@ -1,46 +1,46 @@
 # `STRATA_MMQ_DIRECT_LOG`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`STRATA_MMQ_DIRECT=1` で prompt MMQ が cache slot 内の resident expert を直接読む経路について、prompt 処理後に stage ごとの expert 数を stderr へ出します。直接読み込みの有効・無効や計算方法は切り替えず、診断ログだけを制御します。
+`STRATA_MMQ_DIRECT=1` の direct MMQ 経路で、prompt 処理後に各 prefill stage の resident expert 読み取り数と streamed expert 数を stderr に出す診断用スイッチ。読み取り先は `Prefill::run` の成功経路末尾だけで、MMQ の選択・計算・出力はこの変数では変わらない。`mmq::direct_mode() == 1` のときに限り値を評価する（`engine/src/prefill/prefill.cpp:9715-9725`）。
 
 ## 値と判定
 
-`src/prefill/prefill.cpp` は、`Prefill::run()` が成功経路を通り、かつ `mmq::direct_mode() == 1` のときだけ、この変数を読みます。値は `std::atoi()` で変換し、結果が 0 以外ならログを有効にします。
+`std::getenv` で値を取得し、未設定なら false、設定されていれば `std::atoi(v) != 0` を判定する。文字列全体の検証、末尾文字の検査、エラー処理はない。`atoi` は先頭の空白と符号の後にある十進数字の接頭辞を変換し、数字以外に達したところで止まるため、例えば `1`、`-1`、`1tail` は有効、`0`、`0anything`、`true`、`false`、空文字は無効。先頭が数字（または空白・符号の後の数字）でない文字列も 0 として扱われる。数値の範囲制限や clamp はなく、`atoi` の変換可能範囲外の入力はコードで扱いを定めていない（`engine/src/prefill/prefill.cpp:9717-9719`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定、空文字 | `atoi` の結果が 0 となり無効 |
-| `1` など数値変換結果が 0 以外 | 有効（負数も有効） |
-| `0`、`0tail`、数値に変換できない文字列 | `atoi` の結果が 0 となり無効 |
-| 数字の後ろに文字が続く値 | `atoi` が先頭の数値部分を変換し、その値が 0 以外なら有効。例: `2tail` は有効 |
-
-空白と符号は `atoi` の変換規則に従います。文字列全体の妥当性検査や警告はありません。判定結果は関数内の `static const bool` に保存され、最初の該当 prompt で読み取られた後は同じプロセス内で環境値を変更しても再評価されません。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `mmq::direct_mode() == 1` かつログ判定箇所に到達 | ログなし | `atoi` の結果が非ゼロ（例: `1`, `-1`, `1tail`） | `atoi` の結果が 0（例: 空文字, `0`, `0anything`, `true`） |
+| `mmq::direct_mode() != 1` | この箇所では読み取らない | 該当なし | 該当なし |
 
 ## 有効になる条件
 
-- `STRATA_MMQ_DIRECT` の実効 mode が `1` であることが必要です。mode `0`（未設定を含む）と mode `2` では、このログ判定は実行されません。mode の値判定は `src/prefill/moe_mmq.cu` で `atoi` により行われます。
-- mode `1` を実行できるのは CUDA で `STRATA_MMQ_TAB` を含めてビルドした場合です。CMake の同オプションは既定 OFF で、llama.cpp の `mmq.cuh` が Strata 側 scheduler の検証対象と一致しない場合も configure 時に無効化されます。HIP や pointer-table MMQ なしの build では mode `1` は無効です。
-- prompt MMQ 自体が使われる条件も必要です。native pack で `STRATA_PREFILL_MMQ` が有効であり、対象 layer の形式・shape が MMQ の対応条件を満たす場合に直接読み込みが計画されます。対応しない layer や streamed / peer-GPU expert は直接読み込み数に含まれず、既存の gather 経路を使います。
-- `Prefill::run()` が `run_impl()` と pipeline drain の両方に成功した後にだけ出力します。prompt が失敗した場合はこのログ箇所に到達しません。
+- `mmq::direct_mode()` が `1` であること。ヘッダーの契約では `1` は guard layout と resident experts の in-place 読み取り、`0` は通常の gather であり、`!tab_built()` の場合は `0`。pointer-table MMQ のビルド条件は CUDA の `STRATA_MMQ_TAB` が有効な場合で、同ヘッダーは HIP、gfx906、SYCL、MMQ なしでは `tab_built()` が false と説明している（`engine/include/strata/prefill/moe_mmq.hpp:146-170`）。
+- `Prefill::run` が通常経路で `run_impl` と pipeline drain の両方を成功させ、末尾の診断箇所まで進むこと。`run_impl` または drain が失敗すると `false` で戻り、診断ログは出ない（`engine/src/prefill/prefill.cpp:9705-9725`）。
+- Metal 実装は `Prefill::run` 内で先に return する。また layer-major prefill が採用された場合も `run_layer_major` 後に先に return するため、これらの経路ではこの診断ログは出ない（`engine/src/prefill/prefill.cpp:9633-9650`, `9677-9692`）。
+- `STRATA_MMQ_DIRECT_LOG` は `STRATA_MMQ_DIRECT` の動作を有効化しない。direct mode 自体が有効でない場合、この変数だけ設定してもログは出ない（`engine/src/prefill/prefill.cpp:9717-9719`）。
 
 ## 実行時の詳細
 
-prompt ごとに各 prefill stage を走査し、次の形式で stderr に出します。
+`Prefill::run` の通常経路で prompt body と pipeline drain の成功を確認した後、`mmq::direct_mode() == 1` の条件内で関数ローカル `static const bool` を初期化する。したがって環境値はプロセス起動時ではなく、この条件に初めて入った時に一度だけ読み取られ、その後の呼び出しでは cache された真偽値を使う。初期化後に環境値を変更しても、このログ判定には反映されない。`log` が true なら `this` から `next_` の chain をたどり、各 stage について `stats_.experts_direct`、`stats_.experts_resident`、`stats_.experts_streamed` を出力する（`engine/src/prefill/prefill.cpp:9715-9725`）。
+
+生成経路では `generate` が `prefill.run(...)` を呼び、失敗時は `strata generate: %s` を stderr に出して終了コード `1` を返す。失敗経路では上記の stage 集計ログに到達しない（`engine/src/program/generate.cpp:24163-24167`）。この変数を子プロセスへ転送または上書きする処理は確認できなかった。
+
+## ログと測定値
+
+有効時、各 stage について stderr に次の書式で出力する（値は実行時の統計値）。
 
 ```text
-strata prefill: layers <開始>..<終了>: <直接読み込み数> of <resident expert 数> resident experts read in place, <streamed expert 数> streamed (STRATA_MMQ_DIRECT, totals)
+strata prefill: layers <開始層>..<終了層>: <in-placeで読んだresident experts数> of <resident experts数> resident experts read in place, <streamed experts数> streamed (STRATA_MMQ_DIRECT, totals)
 ```
 
-数値は `Prefill::stats_` の stage 累計です。直接読み込み数は `experts_direct`、resident expert の数は `experts_resident`、streamed expert の数は `experts_streamed` から取得します。ラベルの `totals` の通り、chunk ごとのログではなく prompt の `run()` が完了した時点の stage 別集計です。ログ変数はこれらのカウンタを変更しません。
+ログは `std::fprintf(stderr, ...)` によるもので、Strata の資料にこの診断変数に関する測定値はない（`engine/src/prefill/prefill.cpp:9719-9724`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:4813-4844` — `Prefill::run()` の成功・drain 後に mode を確認し、`STRATA_MMQ_DIRECT_LOG` を `atoi != 0` で一度だけ判定して stage 別 stderr ログを出す。
-- `include/strata/prefill/prefill.hpp:32-40` — stage 統計の `experts_direct`、`experts_resident`、`experts_streamed`。
-- `src/prefill/prefill.cpp:1129-1174,4203-4260` — MMQ plan の直接読み込み条件と、実際に slot を使って直接読み込む expert の計数。
-- `src/prefill/moe_mmq.cu:541-554` — `STRATA_MMQ_DIRECT` の parse、未対応 build での無効化。
-- `CMakeLists.txt:88-96,1606-1645` — `STRATA_MMQ_TAB` の既定値、CUDA-only 条件、llama.cpp scheduler の検査。
-- `docs/DETAILS.md:1928-1940` — `STRATA_MMQ_DIRECT` の設計資料と、このログが prompt ごとに stage の直接読み込み数を出すとの説明。資料中の測定値はこの変数自体の効果ではないため、本書では記載していない。
+- `engine/src/prefill/prefill.cpp:9715-9725` — direct mode 条件、`getenv` / `atoi` / static cache、stage ごとの stderr 集計ログ、成功経路。
+- `engine/src/prefill/prefill.cpp:9633-9650`, `9677-9692` — Metal と layer-major 経路の早期 return。
+- `engine/include/strata/prefill/moe_mmq.hpp:146-170` — pointer-table MMQ のビルド条件と `direct_mode()` の契約。
+- `engine/src/program/generate.cpp:24163-24167` — CLI 呼び出し元と prefill 失敗時の stderr・終了。

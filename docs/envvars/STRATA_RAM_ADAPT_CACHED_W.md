@@ -1,55 +1,44 @@
 # `STRATA_RAM_ADAPT_CACHED_W`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`strata serve` の resident RAM 用 adaptive promotion (`STRATA_RAM_ADAPT2`) が、Linux のファイル page cache に全 blob が載っている候補 expert の見込みコストを調整する重みです。RAM に置く候補の選定スコアに掛け、page cache にない候補（ファイルから読む候補）と比べるときに使います。OS の page cache や実際の読み込み方法は変更しません。
-
-この値だけでは機能は有効になりません。`STRATA_RAM_ADAPT2` と正数の `STRATA_RAM_ADAPT` を含む適用条件が必要です。詳しい選定フローは [`STRATA_RAM_ADAPT2.md`](STRATA_RAM_ADAPT2.md) を参照してください。
+`STRATA_RAM_ADAPT2` の resident RAM 適応処理で、候補 expert がファイル tier の page cache にある場合に、RAM へ昇格させる候補スコアへ掛ける重みを指定する。cold file tier の候補にはこの重みを掛けず、RAM や GPU の配置自体、ファイルキャッシュ、読み取り方法を直接変更する変数ではない。候補の順位や交換候補としての採否を変えうるが、モデルの routing や重みは変えない（`engine/src/program/generate.cpp:22862-22909`）。
 
 ## 値と判定
 
-`RamAdapt2` の初期値は `0.15f` です。serve の初期化中に環境変数が設定されていれば、`std::atof` で変換し、`std::clamp(..., 0.0, 1.0)` で範囲を制限します。文字列全体の妥当性確認はありません。
+`--serve` の初期化時、`RamAdapt2` の `cached_w` に既定値 `0.15f` を置き、環境変数が設定されていれば `std::atof` で先頭の数値部分を `double` に変換し、`[0.0, 1.0]` に `std::clamp` してから `float` にする。文字列全体の妥当性検査やエラー報告はない（`engine/src/program/generate.cpp:12332-12348`）。
 
-| 値 | 設定後の重み |
-|---|---:|
-| unset | `0.15` |
-| 空文字、数値に変換できない文字列 | `0` |
-| `0.4tail` | `0.4`（数値部分を変換） |
-| `-1` など 0 未満 | `0` |
-| `1.4` など 1 超 | `1` |
-| 通常の有限数値 0〜1 | その数値 |
+| 条件 | unset | 有効になる値の例 | 変換後の値・無効値の例 |
+| --- | --- | --- | --- |
+| serve 初期化時 | `0.15` | `0.4`, `1`, `0.4tail` | `0` は `0`; `2` は `1`; `-0.2` は `0`; `0.4tail` は先頭数値を使い `0.4` |
+| 空文字・数値に変換できない文字列 | — | — | `""` と `n/a` は `atof` が `0` を返すため `0` |
 
-`atof` の変換結果をそのまま clamp するため、`nan` のような非数値表記を有限の範囲値へ直す検証はありません。
+`atof` が認識する数値の後ろは検証されず、先頭空白も数値変換に従って扱われる。したがって、例えば `0.4tail` は拒否されず `0.4` になる。未設定だけが既定値を保ち、明示的な空文字は既定値ではなく `0` になる。範囲外の有限値は clamp される。数値変換結果が NaN となる文字列を与えた場合は有限値として検証されず、`std::clamp` の比較を通過して NaN が残る可能性がある（同 `generate.cpp:12346`）。
 
 ## 有効になる条件
 
-この重みが候補スコアへ反映されるには、少なくとも次が必要です。
-
-- `STRATA_RAM_ADAPT2` の `atoi` 結果が 0 以外。
-- `STRATA_RAM_ADAPT` が正数。
-- resident RAM copy が使える単一 GPU の serve で、最初の decode window 後、usage があり、adaptive swap が pending でなく、非同期 adaptive round が idle。
-- peer device、remote expert optimization、`--batch` を使っていない。
-
-これらの条件が満たされない場合、この重みは読み込まれても候補選定に使われません。Linux 以外では `tier_of()` は page-cache tier を返さないため、この重みを掛ける候補はありません。
+- `--serve` のコード経路で読み込まれる。値の読み取りだけなら関連する適応スイッチが OFF でも行うが、候補計算に使うには `STRATA_RAM_ADAPT2` が `atoi` で非 0、かつ `STRATA_RAM_ADAPT` が `atoi` 後に正である必要がある（`engine/src/program/generate.cpp:12302-12348`, `22843-22849`）。
+- 実際の処理には、先頭 decode window 以降、routing 使用量があり、適応 round が未処理で、非同期 job がないか idle、resident RAM copy が準備済み、単一 GPU、peer device なし、remote expert optimization なし、`--batch` なし、という条件も必要（`engine/src/program/generate.cpp:22847-22849`）。候補自体も GPU 外かつ RAM copy 外でなければならない（同 `generate.cpp:22868-22873`）。
+- `FileExpertSource::tier_of()` が page-cache tier (`1`) と判定した候補に限り重みを使う。これは Linux では cached pages の確認結果により `1` または cold file tier `2` を返し、Linux 以外では常に `2` を返す実装である（`engine/src/core/expert_source.cpp:5108-5119`）。よって Linux 以外ではこの変数の値による候補スコア調整は起きない。
+- `STRATA_RAM_ADAPT_PROMPT_W` は prompt routing の seed、`STRATA_RAM_ADAPT_PER_LAYER` は layer あたりの対数、`STRATA_RAM_ADAPT_SKIP_TOP` は候補除外数を別途決める（`engine/src/program/generate.cpp:12345-12348`, `16056-16067`, `22877-22891`）。`STRATA_RAM_ADAPT_QUEUE` は読み取り queue の上限となり、満杯なら `ram_stage()` が候補を queue に入れない（`engine/src/core/expert_source.cpp:5009-5030`）。これらを含め、`STRATA_RAM_ADAPT_CACHED_W` を CLI 引数が上書きする実装はない。
 
 ## 実行時の詳細
 
-環境値は `generate.cpp` の `RamAdapt2` を初期化する際に一度読み、状態へ保存します。`static` ではないためプロセス共通のキャッシュではありませんが、その serve 初期化後に環境を書き換えても、既に作られた状態には反映されません。
+変数は serve 経路の `RamAdapt2` 初期化ブロックで一度読み、値をその server 実行中の struct に保持する。リクエストごと・window ごとに環境から読み直す処理や、後から環境を変更した値を反映する処理はない（`engine/src/program/generate.cpp:12332-12348`）。
 
-対象候補は GPU cache 外かつ resident RAM copy にない expert です。そのスコアは decode usage と prompt routing seed の合計から作られます。候補 blob 全体が page cache にある場合 (`tier_of() == 1`) に限り、この値を `STRATA_RAM_ADAPT_CACHED_W` 倍します。Linux の `tier_of()` は `cached_bytes >= total_bytes` で page-cache tier と判定し、非 Linux では resident RAM 以外を tier 2 とします。重みを小さくすると page cache に載った候補の見込みコストが低くなり、RAM promotion の候補順位が下がります。重み 0 なら、その候補の選定スコアは 0 になります。
+適応処理は window 境界で完了済みの RAM 昇格を install し、各 layer の routing count と prompt seed から候補を作る。GPU 外・RAM 外の incoming 候補のうち、既に RAM queue にあるものは除外し、それ以外は `tier_of(...) == 1` の場合だけ `cached_w` をスコアに掛けて outgoing 候補との差を評価する。正の候補差が少なくとも `1.0` の組を gain 順に stage し、上限 `STRATA_RAM_ADAPT` 件まで読み取り queue へ送る（`engine/src/program/generate.cpp:22856-22917`）。Linux では page-cache にある候補を cold file read 候補より低く評価しうる重みであり、`0` ならその候補の incoming score を 0 にする。`1` ならその重み付けをしない。これは推定スコアに対する制御で、実際にキャッシュ hit することを保証しない。
 
-この重みは page-cache tier の候補だけに掛かり、RAM resident 候補の退避スコア、decode routing、GPU tier の選定規則には掛かりません。候補スコアから promotion 候補を組み合わせた後、利得が 1 未満の組み合わせは除外され、残ったものが `STRATA_RAM_ADAPT` の件数まで I/O thread に stage されます。
+## ログと測定値
 
-## 文書との照合
-
-`docs/DETAILS.md:172-181` は `STRATA_RAM_ADAPT` による同期読み込み方式を説明しています。`STRATA_RAM_ADAPT_CACHED_W` を使う `STRATA_RAM_ADAPT2` の page-cache 候補スコア補正は同資料の記述対象ではありません。同資料の `STRATA_RAM_ADAPT` の測定値を、この重みや新しい promotion 選定方式の効果として扱う根拠は確認できません。
+この変数専用の有効・無効・値表示ログや失敗メッセージはない。`STRATA_RAM_ADAPT2` が有効なら request の累積値として promotions read / installed / skipped を stderr に出すが、この表示に `cached_w` の値は含まれない（`engine/src/program/generate.cpp:23801-23805`）。資料にこの変数自体の測定値は見つからなかったため記載しない。
 
 ## 根拠
 
-- `src/program/generate.cpp:8266-8283` — `RamAdapt2` の既定値と環境値の `atof` / clamp。
-- `src/program/generate.cpp:14801-14813,14820-14829` — promotion の条件、候補の usage スコア。
-- `src/program/generate.cpp:14855-14867` — queued 候補の除外、page-cache tier のスコア補正、promotion 利得の判定。
-- `src/core/expert_source.cpp:4469-4479` — `tier_of()` が resident RAM、Linux page cache、その他を分類する規則。
-- `docs/DETAILS.md:172-181` — 既存資料の `STRATA_RAM_ADAPT` の説明範囲。
+- `engine/src/program/generate.cpp:12332-12348` — struct の既定値、環境変数の読み取りと変換。
+- `engine/src/program/generate.cpp:22843-22917` — RAM 適応の条件、候補選定・重み適用・stage。
+- `engine/src/core/expert_source.cpp:5009-5030` — queue 上限と stage 受付。
+- `engine/src/core/expert_source.cpp:5108-5119` — Linux page-cache tier の判定と他 OS の分岐。
+- `engine/src/program/generate.cpp:23801-23805` — 関連する累積ログ。
+- `docs/DETAILS.md:261-282` — resident RAM mode と既存 `STRATA_RAM_ADAPT` の概要。対象重みの具体的な説明や測定値はない。

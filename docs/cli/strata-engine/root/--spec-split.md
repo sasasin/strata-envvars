@@ -1,60 +1,57 @@
-# `--spec-split`
+# `strata --spec-split`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数 parser） |
+| コマンド | `strata`（推論エンジンのトップレベル引数） |
 | オプション | `--spec-split` |
-| 別名 | なし。無効化用の別オプションは `--no-spec-split` |
-| 値 | 取らない真偽フラグ |
+| 別名 | なし |
+| 値 | 値を取らない真偽フラグ |
 
 ## 役割
 
-投機的検証 window の token 行を2グループに分け、片方の CPU expert 計算ともう片方の GPU 処理を重ねるための opt-in 設定です。Verifier のコメントはこの方式を「exact but slower」と説明しています。既定値は無効で、性能向上を保証するものではありません（`src/program/generate.cpp:709`、`include/strata/core/verify.hpp:336-338`）。
+推測デコードの検証窓に2群の分割実行を opt-in します。検証窓の前半群の expert 計算中に、GPU が後半群の mixer/router を進められるよう処理順を重ねます。ソースコメントではトークンごとの算術は変えない設計と説明されていますが、オプション定義は分割あり・なしでビット単位に同一とは限らず、分割窓の batch shape が異なるとしています。
 
 ## 使い方
 
-通常 engine parser が扱うモデルファイルを指定して生成する例です。`model.gguf` は実際のモデルファイルに置き換えてください。
-
 ```sh
-strata --spec-split --native ./model.gguf --tokens 1
+# 推測デコードを有効にし、検証窓を分割する
+strata --model model.gguf --draft draft.gguf --spec 4 --spec-split
 ```
 
-この例はフラグの構文を示します。実際に分割を使うには、複数 token を含む投機的検証 window が実行される必要があります。Qwen3.5 に振り分けられるモデルにはこの例を適用できません（調査範囲の注記を参照）。
+`--spec-split` 自体は引数を消費しません。標準 parser では後続に `--no-spec-split` を置くと無効化できます。
 
 ## 値と既定値
 
-- `--spec-split` は値を受け取らず、parser 内の `spec_split` を `true` にします。
-- `Options::spec_split` の初期値は `false` です（`src/program/generate.cpp:709`, `2632`）。
-- `--no-spec-split` は同じ値を `false` に戻します（`src/program/generate.cpp:2734`）。両方指定したときは parser が引数を左から処理するため、後に現れた方が有効です。
-- このフラグ単体に対する値 validation や数値範囲はありません。
+- `Options::spec_split` の初期値は `false` です。`--spec-split` を読むと `true`、`--no-spec-split` を読むと `false` に設定します（`engine/src/program/generate.cpp:1069,4064,4196`）。
+- 数値や文字列の値を取らず、個別の値 validation はありません。指定順に parser が処理するため、両方を指定した場合は最後に現れた方が有効です（同 `engine/src/program/generate.cpp:3838-3847,4064,4196`）。
+- SYCL 実装にも同じ初期値、真偽フラグ、および解除フラグがあります（`engine/sycl/src/program/generate.cpp:706,2057,2160`）。
 
 ## 実行時の動作
 
-通常 parser は `spec_split` を Verifier に渡します。単一 GPU の生成経路では verifier 初期化後に `ver.set_split(o.spec_split)` を呼び、serve 経路では通常 verifier と layer split の stage verifier に設定します（`src/program/generate.cpp:9212-9232`, `16167-16175`）。SYCL 実装にも同じ parser 設定と Verifier への伝播があります（`sycl/src/program/generate.cpp:663`, `1929`, `2011`, `7435-7455`）。
+通常の生成経路と `--serve` 経路の両方で、parser の値を verifier の `set_split()` に渡します（`engine/src/program/generate.cpp:13702,24542`）。`record_window()` は `--spec-split` が有効で検証対象が2トークン以上なら、batch 再構成中でない検証窓を2群に分けます。群 A は `[0, ceil(T/2))`、群 B は残りです。各群は層ごとの mixer/router と expert 処理の順を交互に進め、CPU 側の expert 計算と GPU 側の処理を重ねられる構成です（`engine/src/core/verify.cpp:1460-1467,1484-1486,1520`）。
 
-実際にグループ数を2にする条件は `split_ == true`、検証 window の行数 `T >= 2`、かつ batch 記録中でないことのすべてです。それ以外は1グループのままです。分割時は先頭側のグループを `0..ceil(T/2)`、後半を残りの行に割り当てます。GPU 側のグループごとの処理・doorbell を Verifier が扱い、expert dispatch もグループ別の slot を使います（`src/core/verify.cpp:1122`, `1141`, `1148`, `2091-2104`, `2984-3004`, `3238-3253`）。
-
-この分割は `--spec` で作られる複数候補の検証 window に作用します。`T < 2` の window や batch window では指定していても動作上の分割はありません（`src/core/verify.cpp:1122`）。`--no-spec-split` は既定値を明示する用途にも使えます。
+batch 再構成中でない検証窓は、長さが `kVerifyMaxT` を超える場合、フラグがなくても2群になります。`batch_rec_` が有効な再構成窓では `--spec-split` による2群化条件は適用されません（`engine/src/core/verify.cpp:1484-1486`）。したがって、このフラグは通常の生成経路で実際に複数トークンを含む推測検証窓に効果を持ちます。
 
 ## 適用条件と副作用
 
-- 設定自体は GPU/backend を選ばず、CUDA verifier と SYCL verifier の両方に実装があります。ただし実際の window 分割条件は上記の通りです（`src/core/verify.cpp:1122`; `sycl/src/program/generate.cpp:7422-7455`）。
-- 2グループ時は各グループが GPU 計画・expert 処理の別領域を使い、Verifier がグループごとに layer を処理します（`src/core/verify.cpp:2091-2142`, `2984-3004`, `3250-3253`）。このため主な影響は検証時の CPU/GPU の実行スケジュールです。
-- このオプション自体がファイルを書き換えたり、ネットワーク要求を発生させたりする処理は確認できません。
-- `--no-spec-split` と同じく、処理は正確性を維持する意図で実装されていますが、実行性能は環境・モデルに依存します。ソースコメントは「slower」としています（`src/program/generate.cpp:709`, `include/strata/core/verify.hpp:336-338`）。
+- デフォルトは無効です。推測候補を検証する窓が1トークンだけなら `T >= 2` の条件を満たさず、このフラグによる分割は起きません（`engine/src/core/verify.cpp:1484-1488`）。
+- 同じ逐次窓の `STRATA_ADAPT_FETCH` による適応的 expert fetch とは併用されません。`fetch_off` の判定で `o.spec_split` が無効理由として選ばれ、`STRATA_ADAPT_FETCH` が有効な場合は stderr に不使用理由が出ます。判定は residency table、expert cache の slot 数の後に `--spec-split` を確認し、その後に layer split 等を確認します（`engine/src/program/generate.cpp:15055-15076,24571-24589`）。
+- ビルドや GPU 上の所要時間、特定モデルでの性能差はこの調査では実行していません。ソースコメントには overlap study で約7%遅いとの記載がありますが、測定条件をこの文書では独立に検証していません（`engine/src/program/generate.cpp:1069`）。
 
 ## 出力とエラー
 
-このフラグ専用の stdout/stderr 出力や値検証エラーはありません。引数列に未知の option があれば共通 parser が `unknown argument: ...` を stderr に出し、usage を表示して status 2 で終了します（`src/program/generate.cpp:2787-2792`）。フラグ自体は引数値を要求しないため、値不足エラーの対象ではありません。
+このフラグ固有の値 validation やエラー分岐はありません。認識されない引数は `unknown argument: ...` を stderr に出して parser が終了コード `2` を返します（`engine/src/program/generate.cpp:4268-4273`）。`STRATA_ADAPT_FETCH` が有効でこの設定により利用されない場合の stderr メッセージは前節のとおりです。
 
-## 根拠と調査範囲
+## 根拠
 
-- option の既定値と parser 定義: `src/program/generate.cpp:709`, `2632`, `2734`。
-- 設定先と分割条件: `src/program/generate.cpp:9212-9232`, `16167-16175`; `include/strata/core/verify.hpp:336-338`, `614`; `src/core/verify.cpp:1122`, `1141`, `2984-3004`。
-- SYCL 側の parser・設定伝播: `sycl/src/program/generate.cpp:663`, `1929`, `2011`, `7435-7455`。
-- 一般的な未知引数処理: `src/program/generate.cpp:2787-2792`。
+- `engine/src/program/generate.cpp:1069,4064,4196` — 既定値、parser 登録、解除フラグ。
+- `engine/src/program/generate.cpp:13702,24542` — `--serve` と通常生成の verifier への反映。
+- `engine/src/core/verify.cpp:1460-1467,1484-1488,1520` — 分割窓の意図、2群を選ぶ条件と群境界。
+- `engine/src/program/generate.cpp:15055-15076,24571-24589` — `STRATA_ADAPT_FETCH` が不使用になる条件と stderr 出力。
+- `engine/src/program/generate.cpp:4268-4273` — 未知引数の失敗経路。
+- `engine/sycl/src/program/generate.cpp:706,2057,2160,7963-7982` — SYCL parser と verifier への反映。
 
-通常 parser は `--model` / `--native` の model family が Qwen3.5 のとき別実装へ引数列を渡します（`src/program/generate.cpp:2397-2407`）。その parser は `--spec-split` を通常実行では未知引数として usage を出し status 2 で終了します。`--serve` を先に指定してからこの option を渡す場合は、値なしの未知 option を警告して無視します（`src/qwen35/q36_engine.cu:3742-3795`）。したがってこの option は通常 engine parser の scope で有効ですが、Qwen3.5 parser では有効な設定ではありません。SYCL parser は通常 engine と同様の option 設定・伝播を実装しています。Release 配布バイナリの実行確認や性能測定は行っていません。
+調査範囲は上記 checkout の Strata 所有ソースです。実行バイナリの help 表示、build、GPU 実行、性能測定は行っていません。

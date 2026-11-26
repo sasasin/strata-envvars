@@ -1,52 +1,50 @@
 # `STRATA_SPEC_COUPLED`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-MTP（multi-token prediction）draft 層が、通常の argmax ではなく、要求の sampler 設定と乱数を使って draft token をサンプルする機能を有効にします。draft の採用判定は引き続き verifier が行います。対象は `--mtp` で MTP drafter を使う実行経路です。CUDA/HIP 共通の実装と SYCL 実装に同じ環境変数判定があります。
+MTP drafter が通常の argmax ではなく、対象モデルと同じ sampling chain と Philox draw を使って draft token を選ぶ機能を有効にします。CUDA/HIP 実装では生成時の出力 token は verifier のサンプルとの完全一致で決まり、coupled draft はウィンドウ内で受理される draft 数に関わります。対象モデルの sampling 設定そのものを変更するスイッチではありません。MTP を使わない実行では効果はありません。実装は `engine/include/strata/core/coupled_draft.hpp`、`engine/src/core/mtp.cpp` と、SYCL 版の `engine/sycl/include/strata/core/coupled_draft.hpp`、`engine/sycl/src/core/mtp.cpp` にあります（`engine/include/strata/core/coupled_draft.hpp:57-83`、`engine/src/core/mtp.cpp:1518-1531`、`engine/sycl/include/strata/core/coupled_draft.hpp:55-70`、`engine/sycl/src/core/mtp.cpp:1227-1237`）。
 
 ## 値と判定
 
-`getenv()` で値を取得し、未設定、空文字列、または文字列全体がちょうど `"0"` のとき無効です。それ以外の非空文字列は有効です。数値変換や真偽値の文字列解釈はありません。
+`std::getenv` で取得し、未設定でないこと、空文字でないこと、文字列全体が正確に `"0"` ではないことを判定します。数値・真偽値としての parse はなく、大文字小文字や前後の空白も除去しません。
 
-| 環境変数値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字列 | 無効 |
-| `0` | 無効 |
-| `1`、`00`、`false`、` 0`、`0 ` など | 有効 |
+| 条件（build など） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP (`engine/include/strata/core/coupled_draft.hpp:57-61`) | 無効 | `1`、`true`、`false`、`00`、`0anything`、空白だけの文字列 | 空文字、正確に `0` |
+| SYCL (`engine/sycl/include/strata/core/coupled_draft.hpp:55-59`) | 無効 | `1`、`true`、`false`、`00`、`0anything`、空白だけの文字列 | 空文字、正確に `0` |
 
-判定結果は helper の関数内 `static bool` に初回呼び出し時に保存されます。通常は起動時のオプション初期化で読み取られ、その後は `--coupled-draft` / `--no-coupled-draft` の処理が同じ状態を上書きします。プロセス起動後に環境を書き換えても再読込されません。
-
-根拠: `include/strata/core/coupled_draft.hpp:57-63`, `sycl/include/strata/core/coupled_draft.hpp:55-61`; オプション初期値と CLI 上書きは `src/program/generate.cpp:437,1962-1963,2233`, `sycl/src/program/generate.cpp:507,1797-1798,2007`。
+最初に `coupled_draft_state()` が呼ばれたときに関数内 `static` へ一度だけ読み込みます。その後の環境変更は反映されません。ただし `generate` の CLI parser は環境由来の初期値を `--coupled-draft` または `--no-coupled-draft` で上書きし、引数に現れた順で最後の指定が残ります。parse 後に `set_coupled_draft()` がその値を state に書き戻します（CUDA/HIP: `engine/src/program/generate.cpp:873,3838,3978-3979,4614`、SYCL: `engine/sycl/src/program/generate.cpp:551,1878,1996-1997,2231`）。
 
 ## 有効になる条件
 
-- MTP drafter が選択されている必要があります。generate 経路では `o.mtp` が空でないとき `mtp.bind()` を呼び、server 経路も MTP を使う要求で drafter の sampler 設定を渡します。
-- 値が有効でも、greedy 要求や温度 0 では coupled sampling は実行されず、draft 層は通常経路を使います。CUDA/HIP ではさらに `STRATA_SPEC_MIN_TEMP` の閾値未満の温度も対象外です。SYCL 実装にはこの閾値判定がありません。
-- `--no-coupled-draft` は環境変数由来の有効状態を無効化できます。両方の CLI オプションを指定した場合は、引数列で後に処理された方が状態を決めます。
-- `src` 側（CUDA/HIP）は `STRATA_SPEC_PROB` が有効な場合にも coupled 用バッファを準備します。`STRATA_SPEC_PROB` 自体の判定・挙動とは別に、CUDA/HIP の `coupled_draft_env()` がこの環境変数を OR 条件に含めています。SYCL 側の helper は `STRATA_SPEC_COUPLED` だけを見ます。
-- draft logits の語彙幅に対して sampler scratch を確保できない場合、coupled setup は警告を出して成功扱いで戻り、argmax draft に fallback します。必要バッファの確保自体に失敗した場合は bind が失敗します。
-
-根拠: MTP 使用と sampler 設定は `src/program/generate.cpp:12952-12959,11095-11098`; 実行時の sampler 条件は `src/core/mtp.cpp:576-581`, `sycl/src/core/mtp.cpp:667-672`; CUDA/HIP の helper 合成は `include/strata/core/coupled_draft.hpp:65-79`; bind/setup と幅 fallback は `src/core/mtp.cpp:520-522,525-543,565-573,682`, `sycl/src/core/mtp.cpp:603-605,608-625,658-660,782`。
+- 実行経路がこの CUDA/HIP または SYCL `generate` engine で、MTP drafter が bind されること。MTP が指定・ロードされない場合、この変数だけでは drafting は始まりません（CUDA/HIP: `engine/src/program/generate.cpp:24507-24510`、SYCL: `engine/sycl/src/program/generate.cpp:13764-13767`）。
+- bind 時に coupled 用の scratch サイズがサポートされる範囲であり、必要な device / mapped buffers の割り当てに成功すること。scratch が 0 の場合は coupled 用 setup を行わず argmax draft に戻ります（CUDA/HIP: `engine/src/core/mtp.cpp:802-808`、SYCL: `engine/sycl/src/core/mtp.cpp:678-685`）。
+- request の sampling が greedy でなく、temperature が正であること。CUDA/HIP ではさらに `temperature >= STRATA_SPEC_MIN_TEMP` が必要です。SYCL の `set_draft_sampling` にはこの追加比較がありません（CUDA/HIP: `engine/src/core/mtp.cpp:855-860`、SYCL: `engine/sycl/src/core/mtp.cpp:737-742`）。条件を満たさない request は argmax draft のままです。
+- CUDA/HIP では `STRATA_SPEC_PROB` が有効な場合も同じ coupled buffers の setup を要求します（`engine/include/strata/core/coupled_draft.hpp:65-79`、`engine/src/core/mtp.cpp:784-785`）。この別経路は `--no-coupled-draft` で coupled state を無効にしても独立して setup を要求します。SYCL の `coupled_draft_env()` は `STRATA_SPEC_PROB` を参照しません（`engine/sycl/include/strata/core/coupled_draft.hpp:63-65`）。
 
 ## 実行時の詳細
 
-MTP bind 時、環境変数または CLI 状態により coupled 用 sampler parameter、penalty history ring、scratch などを準備します。CUDA/HIP では setup 成功時に stderr へ `strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the target's chain and Philox draw over ... tokens` を出します。SYCL も同じ趣旨のログを出します。server は要求ごとに sampler parameter を渡し、generate は CLI の sampler parameter を渡します。greedy でない場合、draft 層が target 側と同じ sampler chain と Philox draw を用いる経路に入り、verify window が draft を照合します。
+環境変数の state は最初の helper 呼び出しで初期化され、`Options` の初期値にも使われます。CLI 指定は parse 後に state を上書きします。MTP bind 時に機能が有効なら、draft logits の幅をもとに scratch と penalty history ring、SamplerParams 用領域などを確保し、coupled 用の状態 `coupled_ok_` を立てます。幅が大きすぎる場合は setup を省略し、失敗ではなく argmax draft に戻ります（CUDA/HIP: `engine/src/core/mtp.cpp:802-852`、SYCL: `engine/sycl/src/core/mtp.cpp:678-731`）。
 
-CUDA/HIP では `STRATA_SPEC_PROB` も有効なら setup ログと draft sampling 経路は probabilistic acceptance 用になります。coupled setup が語彙幅を扱えない場合の警告文字列は `strata mtp: STRATA_SPEC_COUPLED: %lld draft logits are too wide for the coupled sampler; argmax drafts` です。
+sampling 条件を満たすたびに `set_draft_sampling()` が request の SamplerParams を保存し、penalty history を初期化します。CUDA/HIP の serve 経路は request sampling を作るたびに呼び出し、通常の generate 経路も sampling parameters を設定した後に呼び出します（`engine/src/program/generate.cpp:21418-21426,24538-24542`）。SYCL も同じ箇所で呼び出します（`engine/sycl/src/program/generate.cpp:11562-11578,13781-13784`）。coupled 状態では MTP draft logits から token を sampling し、penalty history と対象側の chain / Philox draw を使います（CUDA/HIP: `engine/src/core/mtp.cpp:1518-1531,1595-1605`、SYCL: `engine/sycl/src/core/mtp.cpp:1227-1237,1330-1340`）。
 
-根拠: `src/core/mtp.cpp:525-573,576-581,999-1009,1068-1076`; `sycl/src/core/mtp.cpp:608-660,667-672,1129-1134,1228-1238`; request/CLI からの設定は `src/program/generate.cpp:11095-11098,12952-12959`。
+バッファ確保など coupled setup が失敗すると `bind()` が失敗を返します。通常の generate は `strata generate: <error>` を stderr に出して終了コード 1、serve は `print_start_refusal("strata serve", err)` を経由して起動を拒否します（CUDA/HIP: `engine/src/core/mtp.cpp:811-820`、`engine/src/program/generate.cpp:24507-24510`、`engine/src/program/generate.cpp:7884-7889`。SYCL: `engine/sycl/src/core/mtp.cpp:691-695`、`engine/sycl/src/program/generate.cpp:13764-13767`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/DETAILS.md:114-126` は、サンプリング要求で opt-in の coupled drafts として説明しています。また RTX 3060、IQ3_XXS、`--spec 4 --mtp`、温度 1.0 / top_p 0.95 / top_k 20 の記載条件で、採用 draft の割合が 62.1% から 66.9% になった一方、速度差は run-to-run spread を超えなかったと記しています。これは資料記載の測定結果であり、ここで再測定したものではありません。実装では greedy 要求は sampler 条件により対象外です。
+coupled setup が成功すると stderr に次の行を出します（語句は実装どおり）。
+
+- CUDA/HIP: `strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the target's chain and Philox draw over <語彙数> tokens`（`engine/src/core/mtp.cpp:850-851`）。
+- SYCL: 同じ形式の行（`engine/sycl/src/core/mtp.cpp:729-730`）。
+- draft logits が広すぎる場合は `strata mtp: STRATA_SPEC_COUPLED: <語彙数> draft logits are too wide for the coupled sampler; argmax drafts` を stderr に出します（CUDA/HIP: `engine/src/core/mtp.cpp:805-808`、SYCL: `engine/sycl/src/core/mtp.cpp:681-684`）。
+
+`STRATA_SPEC_PROB` が有効な CUDA/HIP 経路では、代わりに `strata mtp: probabilistic draft acceptance on (STRATA_SPEC_PROB): ...` のログを出します（`engine/src/core/mtp.cpp:843-848`）。測定値は本書では扱いません。`docs/DETAILS.md` には複数設定を組み合わせた測定表がありますが、この環境変数単独の効果を分離した結果ではありません（`docs/DETAILS.md:1724-1725`）。
 
 ## 根拠
 
-- 環境変数の parse/cache、CLI で変更する共有状態: `include/strata/core/coupled_draft.hpp:57-83`; `sycl/include/strata/core/coupled_draft.hpp:55-69`
-- CUDA/HIP setup、幅 fallback、ログ、要求 sampler 条件: `src/core/mtp.cpp:518-573,576-581,682`
-- SYCL setup、ログ、要求 sampler 条件: `sycl/src/core/mtp.cpp:601-660,667-672,782`
-- CLI と server/generate 呼び出し元: `src/program/generate.cpp:437,906-907,1962-1963,2233,11095-11098,12952-12959`
-- 設計説明・測定条件: `docs/DETAILS.md:114-126`
+- 環境変数の読み取り・CLI override: `engine/include/strata/core/coupled_draft.hpp:57-83`、`engine/src/program/generate.cpp:873,3838,3978-3979,4614`、`engine/sycl/include/strata/core/coupled_draft.hpp:55-70`、`engine/sycl/src/program/generate.cpp:551,1878,1996-1997,2231`
+- MTP bind、setup、fallback、sampling activation: `engine/src/core/mtp.cpp:802-860`、`engine/sycl/src/core/mtp.cpp:678-742`
+- request sampling と draft 処理: `engine/src/program/generate.cpp:21418-21426,24507-24510`、`engine/src/core/mtp.cpp:1518-1531,1595-1605`、`engine/sycl/src/program/generate.cpp:11562-11578,13764-13784`、`engine/sycl/src/core/mtp.cpp:1227-1237,1330-1340`
+- 関連する記載: `docs/SETTINGS.md:317`、`docs/DETAILS.md:625-628,1724-1725`

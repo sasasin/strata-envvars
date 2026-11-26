@@ -1,53 +1,52 @@
 # `STRATA_PARK_ASYNC`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の状態は `## main...origin/main` で、未コミット変更はありません。外部ライブラリの環境変数動作は対象外です。
+調査対象: Strata main の HEAD d46f5f268f8ed797e83a5c63a69bffbd7a581cf6（2026-11-25 時点）。
 
 ## 役割
 
-CUDA の会話キャッシュが会話を park するとき、K/V の退避を同期コピーから非同期コピーに切り替える opt-in です。K/V を GPU 上の段階バッファへコピーし、その後バックグラウンドスレッドが 4 MiB 単位で pinned host buffer に移して park 済み画像の host buffer を埋めます。park 後の次の処理と host へのコピーを重ねられる構造です。会話キャッシュを使わない通常の生成や、park が発生しないリクエストには作用しません。
+conversation cache が会話を park するとき、CUDA では GPU 上の K/V を device-to-device で一時領域へコピーし、その領域からホスト側の snapshot buffer へバックグラウンド転送する opt-in です。snapshot を作って次の prompt を始めるまでの K/V の host 転送を非同期化します。また serve 側では、park 後に捨てる turn checkpoint をコピーせず snapshot に移します。通常の同期コピー経路も残り、条件不成立や staging の確保失敗時はその経路になります。対象は会話 cache の park であり、各リクエストで常に動く設定ではありません。conversation_snapshot_save と conversation_park_async_begin が転送を組み立て、serve loop の park_async_env が checkpoint 選別に使います（engine/src/core/conversation_state.cpp:563-586,623-699、engine/src/program/generate.cpp:504-507,14202-14206）。
 
 ## 値と判定
 
-両方の読み取り箇所で `getenv()` の結果を一度だけ static cache し、文字列全体ではなく先頭 1 文字が `'1'` かを判定します。数値 parse、空白除去、大文字小文字変換はありません。
+| 条件（build など） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 通常の CUDA build | park_async_on() は false | 先頭文字が 1（1, 10, 1anything） | 空文字、0, true,  1, 01 |
+| HIP、gfx906 HIP compatibility、Metal | compile-time 分岐で常に false | なし | すべて（値を読み取らない） |
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（設定済みだが `v[0]` は `\0`） |
-| `1`, `10`, `1anything` | 有効 |
-| `0`, `true`, ` 1`, その他先頭文字が `1` でない値 | 無効 |
+CUDA build では std::getenv の結果が null でないことと v[0] == '1' だけを確認します。文字列全体の parse や数値変換、大文字小文字・後続文字の検査はありません。空文字は設定済みでも無効です。park_async_env() も同じ先頭文字判定をします。両関数は関数内 static const に保存するため、各関数の初回評価後にプロセス内で環境を変更しても反映されません（engine/src/core/conversation_snapshot.cpp:237-243、engine/src/program/generate.cpp:504-507）。
 
-CLI 引数による上書きはありません。`src/program/generate.cpp` と `src/core/conversation_snapshot.cpp` は別々に初回参照時の結果を cache します。実行中に環境値を変更しても、各 helper が一度評価された後は再評価されません。
-
-根拠: `src/program/generate.cpp:305-308`, `src/core/conversation_snapshot.cpp:231-237`。
+なお、conversation swap の別の最適化は値ではなく std::getenv("STRATA_PARK_ASYNC") の null 判定を使います。そのため変数が空文字や 0 でも設定されていれば swap prepare を見送ります（engine/src/core/conversation_state.cpp:783-790）。
 
 ## 有効になる条件
 
-- `strata serve` の会話キャッシュが有効で、park 対象となる非空の live conversation があること。serve の切り替え・復帰経路で park が必要になったときに `park_current()` が呼ばれます。会話キャッシュが無効、live state が空、または park を省く経路では K/V コピー処理に入りません。`--conversation-cache-min-tokens` 等による park skip や cache budget / RAM admission の拒否も別途あります。
-- K/V の非同期 stage は CUDA 実装でのみ有効です。`STRATA_USE_HIP`、`STRATA_HIP_GFX906`、`STRATA_GPU_METAL` の build では `park_async_on()` が常に false を返します。ただし HIP では `generate.cpp` 側の `park_async_env()` に backend guard がないため、単一段の main conversation を park する条件では、この値が K/V を非同期化せずに checkpoint の選別・移動を変えることがあります。SYCL 実装にはこの名前の環境読み取りがなく、`sycl/src/core/conversation_state.cpp` の snapshot 保存は同期経路です。
-- stage を確保するには、CUDA device を取得でき、2 個の 4 MiB pinned host buffer と stream の初期化が成功し、stage 用の丸め済み VRAM 容量に加えて 1.5 GiB 以上の空きがある必要があります。`STRATA_PARK_VRAM_MIB` が設定され、slot を確保できる場合は通常の stage の代わりに slot が使われます。
-- `STRATA_PARK_ASYNC` が有効で、単一段（layer split なし）の main conversation を park すると、park 対象外の checkpoint を park 画像へ移す選別も行われます。全 checkpoint を移すかどうかは incoming conversation / borrow / batch slot / cvec 変更などで決まります。これは K/V stage の可否とは別の処理です。
-
-根拠: `src/program/generate.cpp:10554-10576,10707-10720,10754-10761,14391-14403`; `src/core/conversation_snapshot.cpp:231-237,595-659`; `sycl/src/core/conversation_state.cpp:258-285`。
+- 非同期 K/V staging は CUDA build であることが必要です。HIP (STRATA_USE_HIP)、gfx906 compatibility (STRATA_HIP_GFX906)、Metal (STRATA_GPU_METAL) では park_async_on() が常に false です。docs/SETTINGS.md の候補表は NVIDIA と AMD を記載していますが、実装では HIP 系を無効化しています（engine/src/core/conversation_snapshot.cpp:237-243）。
+- serve の conversation cache が有効で、live conversation を park する経路に入る必要があります。--conversation-cache-mib 0 は cache を無効にします。serve loop は会話の切替などで park_current を呼び、cache 無効・live state 不成立・空会話なら park を省略します。この CLI option は cache を制御しますが、STRATA_PARK_ASYNC の値判定を上書きしません。各リクエストでの継続処理そのものを有効化する設定ではありません（engine/src/program/generate.cpp:1295,4084-4099,14519-14532,19836-19860）。
+- K/V の必要量が 0 なら staging は始まりません。CUDA device 取得、stream と pinned host buffer の作成、stage/slot の確保ができないと begin が false になり、K/V 保存は同期転送へ進みます（engine/src/core/conversation_state.cpp:623-638,641-682、engine/src/core/conversation_snapshot.cpp:1077-1142）。
+- 通常の VRAM stage は必要量を 64 MiB 単位に切り上げて確保し、確保後にも 1.5 GiB の空きを要求します。満たせない場合は staging を諦めます。STRATA_PARK_VRAM_MIB が正数なら予算・空き VRAM 条件を満たす slot を先に試し、slot の対象外部分は同期コピーに fallback します（engine/src/core/conversation_snapshot.cpp:143-198,1086-1141）。
+- checkpoint の移動最適化は serve loop の park_async_env() が true の場合だけ設定されます。layer split (n_st != 0) または main session の retained-K/V reuse がない場合には、この park 選別による checkpoint 移動は行いません。条件を満たす場合、incoming conversation・borrow・batch slot source がある、または cvec が変わると checkpoint を全て移し、それ以外は resume 位置より後ろ、または画像 prefix と一致しない checkpoint を移します（engine/src/program/generate.cpp:14202-14206,14457-14466,19742-19754）。
+- STRATA_PARK_VRAM_MIB は任意の併用設定です。正数でも budget 超過や VRAM 不足なら slot は使われず、通常 stage を試します。checkpoint pool (STRATA_CKPT_POOL) が有効なら、移動してきた checkpoint は pool 補充にも使われます（engine/src/core/conversation_snapshot.cpp:162-198、engine/src/program/generate.cpp:14447-14466）。
 
 ## 実行時の詳細
 
-serve 側では park 前に必要 K/V 容量を見積もり、`conversation_park_async_begin()` を呼んで stage を準備します。利用可能なら各 K/V 層の device-to-device コピーを stage に記録し、park capture 完了時に stream を同期してコピーの到着を確認してから、バックグラウンドスレッドを起動します。そのスレッドは二つの pinned buffer を交互に使って stage から host buffer へコピーします。park 画像には pending token が付き、画像を解放するときや K/V 読み取り側が必要なときに `conversation_park_join()` がコピーを待ちます。`STRATA_PARK_VRAM_MIB` の VRAM slot を使った場合は K/V 層にも pending token が付きます。
+snapshot 保存のたびに、まず前回 park のバックグラウンド転送を join し、snapshot 対象の K/V byte 数を計算して conversation_park_async_begin を呼びます。begin が成功すると、各 K/V buffer のうち保存対象部分を device-to-device で stage または VRAM slot に写します。stage の利用条件を満たさない K/V 部分は transfer による従来経路で保存されます。全レイヤーの保存後、launch は private stream の device-to-device コピー完了を待ち、その後 std::async の worker が 4 MiB 片を二つの pinned buffer で交互に host buffer へ転送します（engine/src/core/conversation_state.cpp:623-682、engine/src/core/conversation_snapshot.cpp:496-517,1155-1208）。
 
-未設定・無効値のほか、CUDA device 取得、stream / pinned buffer 初期化、VRAM 条件、stage allocation のいずれかが満たされない場合は `begin()` が false を返し、その park の K/V は `conversation_kv_save()` の通常の同期 `transfer()` 経路で保存されます。これらの初期化失敗はこの箇所では警告されず、同期コピーへの fallback です。stage への非同期 device copy または launch 時の同期に失敗すると snapshot 保存は失敗し、serve の park 呼び出し元は `ERR ...` を stdout に出して終了コード 1 を返す経路があります。一方、バックグラウンド host copy の完了エラーは stderr に `strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)` と出ますが、`conversation_park_join()` 自体はエラーを返さず、serve の終了には結び付けません。
+次の park や snapshot の読取・解放時は pending copy を join します。parked image には pending token が付けられ、画像の K/V を restore する前に完了を待ちます。通常の stage 経路では restore は host snapshot から行われます。VRAM slot が利用される場合は slot の寿命を image/K/V に結び付け、restore は slot の device データを使えます（engine/src/core/conversation_state.cpp:573-576,682-698,899-911、engine/src/core/conversation_snapshot.cpp:1061-1068）。
 
-park の通常ログは `strata serve: conversation cache: parked ... in ... ms` で、変数名や async の有効化を直接示すログではありません。`STRATA_PARK_TRACE` が設定されると `strata parktrace: ...` の timing log が stderr に出ます。
+stage/slot の開始前に stream・pinned buffer や GPU memory の確保が失敗すれば同期保存へ戻ります。stage launch の stream 同期失敗は conversation_snapshot_save の失敗として返り、serve loop は ERR <error> を出力します。非同期 worker の K/V copy が失敗した場合、join は結果をエラーとして返さず stderr へ strata: STRATA_PARK_ASYNC: a parked K/V copy failed (<CUDA error>) を出します。snapshot swap prepare は値が有効かどうかにかかわらず環境変数が設定されていれば拒否し、通常経路に戻ります（engine/src/core/conversation_snapshot.cpp:1061-1068,1155-1166、engine/src/core/conversation_state.cpp:682-699,783-790、engine/src/program/generate.cpp:19836-19860）。
 
-根拠: `src/core/conversation_state.cpp:571-617`; `src/core/conversation_snapshot.cpp:292-379,581-588,595-659,673-725`; `src/program/generate.cpp:10717-10721,10741-10750,14404-14429`。
+## ログと測定値
 
-## 資料の記載と測定値
+この変数自体の on/off を通知するログはありません。非同期 copy の失敗時は strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s) を stderr に出します。launch の失敗は serve loop が ERR %s として stdout に出します（engine/src/core/conversation_snapshot.cpp:1061-1068,1155-1166、engine/src/program/generate.cpp:19858-19861）。
 
-`docs/DETAILS.md:1504-1518` は本機能を CUDA opt-in とし、HIP / gfx906 / Metal では無効と説明しています。コードでも K/V 非同期 stage はこれらの backend で無効です。一方、HIP では上記の checkpoint 選別・移動が環境値で有効になり得るため、「変数が一切作用しない」という意味ではコードと一致しません。表にある park 時間（3.3K / 13K token の会話で 212-217 / 329-334 ms から 64-75 / 68 ms）は変更作者が CMP 170HX（GA100、sm_80）、PCIe Gen2 x4 で報告した測定値です。同じ節に一部の park 値は別の opt-in switch も設定したとあり、Strata 側で再測定した結果ではありません。一般的な速度向上としては扱えません。
+docs/DETAILS.md は、変更報告者が CMP 170HX (GA100, sm_80)、PCIe Gen2 x4 で測定した park 時間として、3.3K token で 212–217 ms から 64–75 ms、13K token で 329–334 ms から 68 ms と記載しています。同資料は手元に sm_80 card がなく、報告者の測定であることを明記しています。別の opt-in 設定を併用した測定もあるため、一般的な性能値とは扱えません（docs/DETAILS.md:1784-1795）。同資料は回答 bytes が同じと説明しますが、この調査では測定を再実行していません。
 
 ## 根拠
 
-- 値の読み取りと cache: `src/program/generate.cpp:305-308`, `src/core/conversation_snapshot.cpp:231-237`。
-- serve の park 条件、checkpoint 移動、snapshot 保存: `src/program/generate.cpp:10554-10576,10707-10720,10754-10761,14391-14429`。
-- K/V の staging、同期 fallback、background copy、待ち合わせと失敗ログ: `include/strata/core/conversation_snapshot.hpp:80-92`, `src/core/conversation_snapshot.cpp:351-379,581-588,595-659,673-725`。
-- CUDA / HIP compile 条件: `src/core/conversation_snapshot.cpp:231-237`, `cmake/hip_backend.cmake:94-98`。SYCL の同期保存箇所: `sycl/src/core/conversation_state.cpp:258-285`。
-- docs の説明と測定条件: `docs/DETAILS.md:1504-1518`。
+- 値判定・compile-time backend 条件: engine/src/core/conversation_snapshot.cpp:237-243
+- serve 側の値 cache と checkpoint 選別: engine/src/program/generate.cpp:504-507,14202-14206,14457-14466,19742-19754
+- park の呼出し条件: engine/src/program/generate.cpp:14519-14532,19836-19860
+- stage 開始から async launch、pending の設定: engine/src/core/conversation_state.cpp:563-586,623-699
+- K/V の device stage と background copy、join・失敗ログ: engine/src/core/conversation_snapshot.cpp:496-517,1061-1068,1077-1142,1155-1208
+- 設定有無による conversation swap prepare の抑止: engine/src/core/conversation_state.cpp:783-790
+- 併用する VRAM slot の予算・空き判定: engine/src/core/conversation_snapshot.cpp:143-198
+- 性能値の出典と条件: docs/DETAILS.md:1784-1795

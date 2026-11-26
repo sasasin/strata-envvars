@@ -1,45 +1,45 @@
 # `STRATA_ADAPT_OVERLAP_SLOW_US`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-適応層の expert swap と次の verify window を重ねる経路で、swap copy の前に人工的な待ち時間を挿入する診断用フックです。コメントも `test hook` と呼んでいます。実際のリンク速度を変更するものではなく、コピーが遅れて layer gate が待つ状況を作るため、各 layer の swap 群の前に GPU stream 上の host callback を入れます。
-
-この変数を読む箇所は `src/program/generate.cpp` の1箇所です。`docs/DETAILS.md` と他のソースに、この変数の説明や追加の読み取りは見つかりませんでした。
+適応キャッシュの overlap コピーに、各レイヤーの転送前に指定マイクロ秒数の host callback を挿入するテストフックです。遅い転送リンクを模擬し、次の verify window がコピー完了を待つ状態を作ります。適応 swap の選択や値そのものは変更せず、コピーの進行を遅らせます。実装は `engine/src/program/generate.cpp` の適応コピー処理です（`engine/src/program/generate.cpp:15431-15439`）。
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換され、変換結果が正の場合だけ遅延を入れます。文字列全体の妥当性検査や上限 clamp はありません。
+`std::getenv` の結果を `std::atoi` で `int` に変換します。未設定なら `0`、空文字や数値として読めない先頭なら `atoi` の結果は `0` です。変換後の値が `0` 以下なら callback を挿入しません。正の値なら、その値をマイクロ秒として sleep します。文字列全体の妥当性検査や範囲制限はありません。`atoi` は数値の後ろの文字を検査しないため、`25ms` は `25`、`0anything` は `0` になります。先頭空白と符号は `atoi` の変換規則に従い、大文字小文字の判定はありません。`int` の範囲外の文字列に対する変換結果はコードで規定していません（`engine/src/program/generate.cpp:15435-15438`）。
 
-| 値 | 結果 |
-|---|---|
-| 未設定 | `0`。遅延なし |
-| 空文字 | `atoi("")` は `0`。遅延なし |
-| 正数文字列（例: `5000`） | 変換結果の値だけ microseconds 待つ |
-| `0` または負数 | 遅延なし |
-| 数字で始まり後ろに文字が続く値（例: `5000ms`） | `atoi` が先頭の整数を変換するため、その値だけ待つ |
-| 整数として変換できない文字列 | `0` となり遅延なし |
-
-`atoi` のため、先頭の空白や符号も標準変換規則に従い、値の全体 parse・エラー報告はしません。`int` に収まらない値の結果は保証されません。
+| 条件 | 未設定 | 遅延が入る値 | 遅延が入らない値 |
+| --- | --- | --- | --- |
+| overlap の適応コピー経路 | `0` | `1`、`25ms`（`25` と変換） | 空文字、`0`、`0anything`、`-1`、`abc` |
 
 ## 有効になる条件
 
-値が正でも、適応 overlap が実際に有効で、かつ現在処理する swap 群がある場合だけ適用されます。overlap は `STRATA_ADAPT_OVERLAP=1` で要求しますが、単一 GPU、適応 tier が稼働中であることなどの条件を満たさなければ `aov` は有効になりません。対象経路では layer split、peer device、remote expert optimization、`--adapt-async`、`--pipeline-windows`、page-locked swap source、`STRATA_DMA_BATCH`、`STRATA_ADAPT_LAG` が既定の1以外、`STRATA_ADAPT_NOWAIT` 有効、device-planned layers などが overlap を妨げます。resident RAM mode では `STRATA_ADAPT_OVERLAP_RESIDENT=1` も必要です。
-
-従って、この変数だけを設定しても待ち時間は発生しません。overlap が無効、swap が空、またはその生成バイナリで該当する adaptive GPU 経路を使わない場合、この hook のコードには到達しません。
+- `strata generate` の適応キャッシュで swap が発生し、`aov` が有効なコピー処理に入る必要があります。`aov` は `STRATA_ADAPT_OVERLAP` が先頭文字 `'1'` で、以下の無効化条件がない場合に有効です（`engine/src/program/generate.cpp:2269-2288, 15122-15136`）。
+- overlap はレイヤー分割、`--remote-expert-opt`、`--adapt-async`、`--pipeline-windows`、ページロックされた swap source、`STRATA_DMA_BATCH`、`STRATA_ADAPT_LAG` が既定の 1 以外、`STRATA_ADAPT_NOWAIT` 有効時には動きません（`engine/src/program/generate.cpp:15122-15136`）。
+- resident RAM mode では通常無効です。`STRATA_ADAPT_OVERLAP_RESIDENT` が設定され、先頭文字が `'1'` の場合に限りこの条件を通ります。また適応 tier が無効なら動きません（同上）。
+- overlap gate の設定に失敗した場合や `STRATA_VERIFY_DEVICE_PLAN` が有効な場合も実行されません（`engine/src/program/generate.cpp:15137-15144`）。Windows の HIP build では `STRATA_ADAPT_OVERLAP=1` は別の安全判定を受け、拒否される場合があります（`engine/src/program/generate.cpp:2259-2285`）。
+- 値の読み取りは `aov` が真で、swap のレイヤー単位のコピー処理に到達した場合だけです。従って通常の生成、overlap 無効時、swap がない間はこの変数の値は使われません（`engine/src/program/generate.cpp:15431-15438`）。
 
 ## 実行時の詳細
 
-`aov` が真のとき、swap の列を layer 順に処理し、最初の swap または直前と異なる layer の最初の swap で値を一度読みます。値は関数内 `static const int` に保存されるため、プロセスが動作中に環境変数を変更しても再評価されません。初期化自体はこの条件に初めて到達した時点まで遅延します。
+`slow_us` はコピー処理内の関数ローカル `static const` です。最初に overlap 中の swap がレイヤー単位のコピー箇所まで進んだときに環境を読み、以後プロセス内で cache します。実行中に環境を書き換えても反映されません。callback 用の `slow_arg` も同じ値で初期化されます（`engine/src/program/generate.cpp:15433-15439`）。
 
-変換値が正なら、その layer の copy を enqueue する前に `cudaLaunchHostFunc` で host callback を `adapt_stream` に登録します。callback は `std::this_thread::sleep_for(std::chrono::microseconds(...))` を実行し、その後に同じ stream 上の swap copy が続きます。このため、待ち時間は swap を含む各 layer 群につき1回挿入されます。overlap verifier は swap のある layer についてコピー到着 gate が開くまで待つため、この遅延で待機が生じ得ます。hook 自体はログを出さず、callback 登録の戻り値もこの箇所では検査していません。
+swap はレイヤー順に並べられ、各レイヤーの最初の swap の直前に、遅延値が正なら `adapt_stream` へ `cudaLaunchHostFunc` を enqueue します。同じレイヤーの後続 swap ごとには追加しません。callback は `std::this_thread::sleep_for(std::chrono::microseconds(...))` を実行し、その後にそのレイヤーのコピーが enqueue されます（`engine/src/program/generate.cpp:15380-15386, 15431-15439`）。overlap gate はコピー完了をレイヤーごとに知らせ、次の window がそのレイヤーのコピーを待てるようにします（`engine/src/program/generate.cpp:15471-15482, 15137-15143`）。
 
-この変数はソースコメントで test hook とされますが、読み取り箇所に専用のテスト build guard はありません。そのため、当該コードを含む実行ファイルでは、上記条件を満たせば通常起動でも適用されます。
+## ログと測定値
+
+この変数専用のログはありません。overlap が有効なら起動時に `strata serve: adaptive overlap (STRATA_ADAPT_OVERLAP=0 turns it off): the adaptive tier's copies land while the next window runs (same tokens, a layer waits for its own copies)` が出ます。設定した overlap が条件不足で無効の場合は `strata serve: STRATA_ADAPT_OVERLAP=1 is off: ...` と理由が出ます（`engine/src/program/generate.cpp:15176-15186`）。
+
+`--decode-timing` の計測行に加え、overlap が有効で window が未完了 swap に遭遇した場合は `strata decode adapt overlap: ...` が出て、layer gate の累積待ち時間を表示します（`engine/src/program/generate.cpp:23352-23384`）。このテストフック自体の測定値は記載されていません。`docs/DETAILS.md:1260` は親の `STRATA_ADAPT_OVERLAP` の条件と測定を説明していますが、この変数を使った測定値はありません。
+
+コピー自体が失敗すると `strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s` を stderr に出して適応処理が `false` を返します（`engine/src/program/generate.cpp:15458-15465`）。遅延 callback の enqueue 戻り値は検査されず、この変数に固有の enqueue 失敗ログもありません（`engine/src/program/generate.cpp:15435-15439`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:8511-8519` — layer ごとの最初の swap 判定、`getenv` と `atoi`、static cache、正値時の stream callback と microsecond sleep。
-- `src/program/generate.cpp:8350-8379` — overlap 要求の取得、適用条件、gate の設定。
-- `src/program/generate.cpp:8546-8556` — swap copy と、layer のコピー到着を知らせる gate callback の順序。
-- `src/program/generate.cpp:12003-12020` — 次の window で pending swaps を反映し、overlap gate を有効化する流れ。
+- `engine/src/program/generate.cpp:15431-15439` — 変数の読み取り、`atoi`、正値のときのレイヤーごとの遅延 callback。
+- `engine/src/program/generate.cpp:15122-15186` — overlap の有効条件、gate の設定、起動時ログ。
+- `engine/src/program/generate.cpp:15380-15386, 15471-15482` — レイヤー順の swap とコピー完了 gate。
+- `engine/src/program/generate.cpp:23352-23384` — decode timing と overlap 待ち時間の表示。
+- `docs/DETAILS.md:1252-1262` — 親の overlap 機能の説明と測定値。対象変数自体の測定値ではない。

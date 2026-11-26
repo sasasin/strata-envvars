@@ -1,69 +1,63 @@
-# `--host`
+# `setup.py --host`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`SETUP.bat`、更新 wrapper から委譲） |
+| コマンド | `setup.py`（`./setup.sh`、Windows の `START-HERE.bat` などから起動） |
 | オプション | `--host` |
 | 別名 | なし |
-| 値 | サーバーが bind するホスト名または IP アドレス。文字列。省略時は既存設定、または `127.0.0.1` |
+| 値 | サーバーが bind するアドレス文字列。parser に型・選択肢の制約はない |
 
 ## 役割
 
-セットアップで作成するモデル別設定、または既存モデルの次回起動に使う設定に、HTTP サーバーの待受先を指定します。`127.0.0.1` はこの PC 内だけ、`0.0.0.0` はネットワークインターフェース全体で待ち受けます。後者では API キーが推奨されています（`setup.py:8473-8475`）。
+起動する Strata API サーバーの待受アドレスを指定する。既定の `127.0.0.1` はこの PC 内からのみ接続できる。`0.0.0.0` は全 IPv4 インターフェース、`::` は全 IPv6 インターフェースで待ち受ける。LAN 上の他の端末から接続させる場合に使う設定で、`--api-key` を併用することが推奨される。
 
 ## 使い方
 
 ```sh
-./setup.sh --host 0.0.0.0 --api-key SET-A-KEY
-```
+# この PC だけで使う場合（既定値。明示指定も可能）
+./setup.sh --host 127.0.0.1
 
-Windows では `START-HERE.bat --host 0.0.0.0 --api-key SET-A-KEY` と指定できます。`SETUP.bat` や `update.sh` / `UPDATE.bat` も引数を `setup.py` に渡します（`setup.sh:8-13,56`、`START-HERE.bat:27-34`、`SETUP.bat:1-2`、`update.sh:53-55`、`UPDATE.bat:56-58`）。
+# 全 IPv4 インターフェースで待ち受ける。ネットワーク公開時は API key も設定する
+./setup.sh --host 0.0.0.0 --api-key 'replace-with-a-private-key'
+
+# 全 IPv6 インターフェースで待ち受ける
+./setup.sh --host :: --api-key 'replace-with-a-private-key'
+```
 
 ## 値と既定値
 
-- parser は値を一つ受け取ります。`type`、`choices`、独自のホスト名 validation は指定されていません（`setup.py:8473-8475`）。
-- 新規設定で省略すると `host` は設定ファイルに書かれず、サーバー側の既定値 `127.0.0.1` が使われます（`serve/server.py:8288`、`serve/server.py:7718-7722`）。
-- 空文字列は parser で値として渡せますが、設定へコピーする処理は `if a.host` の場合だけなので、空文字列は上書き値になりません（`setup.py:7685-7688,8140-8143,8388-8391,9669-9672`）。
-- 値は指定したモデルの設定に保存されます。通常起動時に `--host` を付けると `_start` が設定を更新して書き戻すため、次回起動にも残ります。通常起動で省略した場合は保存済みの値が使われます（`setup.py:6745-6771,8677-8691`）。
-- `--setup` で既存モデルを再設定すると、`--host` を指定した値は新しい設定に入ります。省略時、`host` は setup が管理するキーとして扱われ、旧設定からの一般的な引き継ぎ対象ではありません（`setup.py:6162-6167,6177-6188,7685-7688,8129-8147`）。
+`setup.py` の `argparse` 定義に `type` や `choices` はなく、値は文字列として受け取る。省略時、サーバーは run config の `host`、それもなければ `127.0.0.1` を使う。新規セットアップ時に `--host` が指定されると、その値をモデルの run config に保存する。すでにモデルがある場合の通常起動でも指定値をそのモデルの設定へ保存し、以後の起動に引き継ぐ。空文字列は setup の `if a.host` 判定を通らないため設定を上書きしない。値をカンマ区切りなどで複数指定する処理や、host 固有の形式検証は setup parser にはない。
 
 ## 実行時の動作
 
-Linux / Windows の通常 parser で受けた値は、モデル別 JSON の `host` に格納されます。セットアップ後の起動は `serve/server.py` を `--config` 付きで起動し、server は明示的な server CLI 値、設定の `host`、`127.0.0.1` の順で bind 先を決めます（`setup.py:7675-7688,8129-8147,9669-9730`、`setup.py:6775-6776`、`serve/server.py:8288`）。
+新規モデルの設定生成では `setup.py` から `setup_config.config_for()` に渡された引数を使い、`a.host` が真なら `cfg["host"]` に格納する。特殊な Intel/Hy4/Inkling/Metal 経路でも同様に設定へ格納する箇所がある。run config は `write_setup_config()` が JSON として書き出す。`--no-start` を併用した場合は設定を書いた後に終了し、サーバーはこの実行では起動しない。
 
-通常起動に `--host` を付けた場合も、設定ファイルへ保存してからサーバーを起動します。起動時には指定アドレスでの bind が実行され、起動メッセージに URL が出ます（`setup.py:6766-6776`、`serve/server.py:7718-7724,8615-8638`）。`localhost`、IP アドレス、`0.0.0.0` などを渡せますが、Strata 側で値を正規化・解決する処理は確認できません。
-
-適用経路には次の差があります。
-
-- macOS の Metal setup は独自 parser でも `--host` を受け取り、設定に保存します（`setup.py:7314-7318,8418-8419`、`metal/setup_mac.py:327-358,530-550`）。
-- macOS の Control setup は `setup.py` の共通 parser 後に `mac_control_setup` へ進み、同じ値を設定に保存します（`setup.py:8561-8562`、`setup.py:8381-8405`）。
-- `--update` は更新処理を実行して終了し、`update_install` は `a.host` を参照・適用しません（`setup.py:8617-8619`、`setup.py:6682-6709`）。
-- `--check` や未対応 preview family の確認だけで早期終了する経路では、サーバー設定の作成まで進まず、値は待受先に反映されません（`setup.py:8179-8204,8559-8564,8697`）。
-- Intel SYCL は parser 後に別の setup へ引数を転送します。`sycl/setup_intel.py` に `--host` parser はなく、転送先での受理・適用は確認できません（`setup.py:7321-7344,8561-8564`）。
+既存モデルを通常起動する経路では `--host` を `start(..., keep=...)` に渡す。値が以前の設定と異なれば run config を更新してから、`serve/server.py --config <run-config>` を起動する。setup は host を server の command line に再指定せず、server が設定ファイルから読み取る。server 側で明示的な `--host` が指定された場合はその値が優先され、なければ設定の `host`、最後に `127.0.0.1` が選ばれる。
 
 ## 適用条件と副作用
 
-任意の値を受け取りますが、実際に bind できるかは起動時に OS の socket 処理で決まります。サーバーはモデル読み込み前に bind を試し、`OSError` の場合は listen error を argparse の usage error として報告します（`serve/server.py:8305-8308`）。
-
-`0.0.0.0` など loopback 以外で待ち受けると、server は他デバイス向け URL を表示します。API key が未設定でも起動を拒否せず、警告を表示します。LAN 接続可能性は Windows Firewall 等にも左右されます（`serve/server.py:8624-8638`）。`--host` 自体は API 認証を設定しません。認証には別オプション `--api-key` が必要です。
-
-設定・起動に伴う副作用として、setup 経路ではモデル別 JSON と起動スクリプトを書き、通常起動で明示した値は JSON を更新します（`setup.py:6312-6340,6766-6771,9729-9730`）。bind 失敗時のエラーは server 起動時に発生し、モデル読込前に終了します（`serve/server.py:8305-8308`）。
+- `0.0.0.0` と `::` はネットワーク上の他端末から接続可能な待受先になる。API key は推奨されるが必須ではない。LAN 待受で key がない場合、server は警告を出す。Windows ではファイアウォールによって接続が遮断される場合も案内する。
+- 不正なアドレス形式や、この PC に割り当てられていないアドレスは setup の parser では拒否されない。server 起動時、モデル読み込みの前に bind を試み、失敗すれば起動できない。指定値は bind 前に設定ファイルへ保存されるため、起動失敗だけでは値は取り消されない。
+- 通常起動時の `--host` はその場限りの値ではなくモデル設定に保存される。セットアップ経路では新しい run config に反映され、既存 config の書き換えは `.bak` の保存対象になる条件がある。
+- Apple Silicon の通常セットアップでは `setup.py` が `engine/metal/setup_mac.py` に処理を委譲する。このスコープの option 文書は `docs/cli/README.md` の `source-setup/mac/--host.md` を参照する。
 
 ## 出力とエラー
 
-- 新規 setup で非 loopback の値を指定すると、セットアップ完了メッセージに他デバイスからの利用案内が出ます。API key がない場合は未設定の旨も表示します（`setup.py:9740-9747`）。
-- 起動成功時は bind 先 URL と、loopback 以外なら LAN アドレスが表示されます。API key がなければ、誰でも到達可能な接続元が利用できる旨の警告も表示されます（`serve/server.py:8615-8638`）。
-- bind できない値や使用中ポートでは listen 問題を usage error として出し、server は status `2` で終了します（`serve/server.py:8305-8308`）。この場合、通常の setup 呼び出し元では起動プロセスの失敗として表面化します。
+server は bind に成功すると待受アドレスと port を含む `ready:` 行を出力する。非 loopback アドレスでは他端末向け URL も表示し、API key がなければ警告する。bind の `OSError` は `listen_problem()` で説明文に変換される。アドレスがこの PC にない場合は `host` 設定または `--host` の確認を案内し、ポート競合の場合は既存 server の終了か別 port を案内する。起動前の preflight で失敗すると server の argparse error 経路になり、終了コード 2 となる。
 
 ## 根拠
 
-- 共通 parser: `setup.py:8473-8475`
-- 設定への反映と通常起動時の永続化: `setup.py:6745-6776,7675-7688,8129-8147,8381-8405,9669-9730`
-- 設定キー・再セットアップの引き継ぎ規則: `setup.py:6162-6188,6312-6340`
-- server の優先順位、bind、listen error、待受 URL と警告: `serve/server.py:7718-7724,8288-8308,8615-8638`
-- wrapper の引数委譲: `setup.sh:8-13,56`、`START-HERE.bat:27-34`、`SETUP.bat:1-2`、`update.sh:53-55`、`UPDATE.bat:56-58`
-- macOS parser と設定経路: `setup.py:7314-7318,8418-8419`、`metal/setup_mac.py:327-358,530-550`
-- update / preview / SYCL の適用範囲: `setup.py:6682-6709,7321-7344,8179-8204,8561-8564,8617-8619`
+- `terminal/setup.py:11444-11503` — root parser と `--host` の値説明。型・choices を付けず、`--api-key` との併用を推奨。
+- `terminal/setup.py:11436-11437` — macOS の通常セットアップを Metal 専用 setup に委譲する条件。
+- `terminal/strata_control/setup_config.py:521-533` — 標準の新規 run config に `a.host` があれば保存。
+- `terminal/setup.py:9441-9448`, `10012-10018`, `10404-10411`, `10943-10950`, `11341-11360` — 特殊セットアップ経路で host を設定し、run config を書き出す箇所。
+- `terminal/setup.py:11761-11775`, `8558-8563`, `8566-8596` — 既存モデル起動時に `keep` で受け渡し、値の変更時に設定ファイルへ保存。
+- `terminal/setup.py:8601-8602` — server を `--config` 付きで起動。
+- `terminal/serve/server.py:9161-9163`, `9324-9344` — server 側の CLI override、config、既定値の優先順と bind preflight。
+- `terminal/serve/server.py:8779-8785`, `9721-9745` — bind 実行、ready/他端末向け表示、key 未設定時の警告。
+- `terminal/serve/server_parts/base.py:42-62` — bind 失敗理由の分類と利用者向け案内。
+- `terminal/setup.py:12538-12543` — setup 完了時に非 loopback host の他端末向け案内を出す条件。
+- `terminal/setup.py:7715-7754` — config 書き込み時の既存設定引き継ぎ、変更時の `.bak` 保存。

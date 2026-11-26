@@ -1,48 +1,47 @@
 # `STRATA_ROUTE_RESIDENT_RANKS`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata main の HEAD d46f5f268f8ed797e83a5c63a69bffbd7a581cf6（2026-11-25 時点）。
 
 ## 役割
 
-`STRATA_ROUTE_RESIDENT` が有効なとき、resident bias の候補となる top-10 の順位範囲を指定します。順位は 0 始まりです。既定値 `6-9` は top-10 の後ろ4枠を対象にします。この変数単独では routing を有効にしません。
-
-CUDA verifier の routing 後に、指定範囲内で非 resident expert を resident expert に置き換えます。MTP draft router でも、`STRATA_ROUTE_RESIDENT_MTP` が有効な場合に同じ順位範囲を使います。いずれも選択 expert と重みを変える可能性があります。
+MoE の router が選んだ top-10 のうち、どの順位の非 resident expert を resident expert と交換するかを指定する。順位は 0 始まりで、既定値 6-9 は下位4枠を対象にする。交換条件の margin は別の STRATA_ROUTE_RESIDENT が指定し、この変数単独では機能を有効にしない。交換が起きた場合、選択 expert と router weight が変わるため出力が変わり得る。CUDA の verifier 経路と、条件を満たす単一 GPU の MTP draft 経路で参照される（engine/src/core/verify.cpp:126-132,178-186,2671-2677、engine/src/kernels/cuda/native_router.cu:253-257、engine/src/program/generate.cpp:13229-13239）。
 
 ## 値と判定
 
-実装は `sscanf(value, "%d-%d", &lo, &hi)` を使い、変換できた整数を更新します。文字列全体の検証や値域の clamp はありません。各読み取り箇所の初期値は `lo=6`, `hi=9` です。
+両方の読み取り箇所で std::sscanf(v, "%d-%d", ...) を使い、戻り値を確認しない。文字列全体の厳密な検証はなく、先頭から整数、ハイフン、整数の順に読めるところまで代入され、後続文字は無視される。%d は符号付き整数を読むため、先頭空白や符号も許容される。Verifier の既定値は lo=6, hi=9、MTP 側もローカル変数を同じ値で初期化する。明示的な空文字や変換不能な先頭では値は変わらない。部分変換では読み取れた lo だけが更新され、hi は既定値のままになる（engine/src/core/verify.cpp:129-132,178-184、engine/src/program/generate.cpp:13234-13235）。
 
-| 値 | 結果 |
-|---|---|
-| unset、空文字、先頭が整数でない文字列 | 変換なしなら初期値 `6-9` のまま |
-| `2-5` | `lo=2`, `hi=5` |
-| `2-x` | 最初の整数だけ変換し、`lo=2`, `hi=9` |
-| `x-5` | 最初の変換に失敗するため `6-9` のまま |
-| `2-5junk` | `2-5` を読み取り、後続文字列は検査しない |
-| `-2-5` | `%d` の符号として読み、`lo=-2`, `hi=5` |
+| 条件 | unset | 有効になる値の例 | 無効・注意が必要な値の例 |
+|---|---|---|---|
+| Verifier / MTP 共通の rank parse | 6-9 | 2-5 は順位2〜5、6-9junk は 6-9 として読まれる | 空文字・abc は既定値のまま。3-x は lo=3, hi=9。9-6 はループ対象なし。10-12 も対象なし。 |
+| 範囲の安全性 | 6-9 は順位配列内 | 0-9 は全 top-10 順位を走査 | 負の lo は下限検査がないまま ids[lo] を参照し得る。lo > hi は交換なし。値域の検査・clamp はない。 |
 
-先頭の空白は `%d` の変換規則に従います。`%d-%d` が返す変換数は呼び出し元で検査されません。数値の大小関係や、負値、`hi >= 10` などの入力範囲も検証しません。
+カーネル側は r=lo から r<=hi && r<10 の間ループするが、r>=0 は確認しない。hi が9より大きい場合は9までで止まり、lo が10以上ならループしない。負の lo は ids の範囲外参照になり得るため設定しないこと。順位の入れ替えが起きない場合、元の router weights はそのまま残る（engine/src/kernels/cuda/native_router.cu:273-299,303-310）。
 
 ## 有効になる条件
 
-- verifier 経路では `STRATA_ROUTE_RESIDENT` を `atof` した margin が `0.0` より大きく、expert 数 `NE == 512`、top-k `K == 10`、resident table `hits_.d_res` が存在するときだけ適用されます。`STRATA_ROUTE_RESIDENT_RANKS` を設定しても、これらの条件を満たさなければ何も変わりません。
-- MTP 経路では `use_mtp` が真、layer stages が空（single-GPU 経路）、resident table が存在し、`STRATA_ROUTE_RESIDENT` が設定済みで、`STRATA_ROUTE_RESIDENT_MTP` の `atoi` 結果が非ゼロであることが必要です。さらに margin が正で、MTP 側も 512 experts / top-10 の場合に適用されます。
-- どちらの経路も `lo > hi` なら順位ループは実行されません。`hi` が 10 以上でも `r < 10` で止まります。負の `lo` は下限で除外されず、kernel 内の top-10 配列の範囲外順位を参照し得るため、有効な設定として扱えません。
+- Verifier 経路では、STRATA_ROUTE_RESIDENT の atof 結果が 0 より大きく、モデルの expert 数 NE が512、top-k K が10、resident table hits_.d_res が非 null であること。これらを満たすと router 処理後・plan 処理前に resident-aware swap を行う。STRATA_ROUTE_RESIDENT_RANKS が有効範囲でも、他の条件を満たさなければ使われない（engine/src/core/verify.cpp:181-182,2671-2677）。
+- Verifier の初期化自体も VRAM expert tier などを要求する。resident table が無い場合は Verifier::init が "verify: needs the profile-filled VRAM expert tier ..." を返すため、この swap に到達しない（engine/src/core/verify.cpp:1000-1005）。
+- MTP draft 経路では、use_mtp、stages.empty()（単一 GPU）、thits.d_res != nullptr、STRATA_ROUTE_RESIDENT の設定あり、STRATA_ROUTE_RESIDENT_MTP の設定ありかつ atoi が非0であることが必要。さらに STRATA_ROUTE_RESIDENT の atof 結果が正で、MTP router が512 experts / top-10である場合に設定される。設定表は最終 layer の resident row である（engine/src/program/generate.cpp:13229-13239、engine/include/strata/core/mtp.hpp:60-65、engine/src/core/mtp.cpp:1432-1435）。
+- 実装は CUDA native router の kernel にあり、Strata の設定資料もこの routing 変更を CUDA 向けとして記載する。HIP、SYCL、Metal で同じ挙動になる根拠は確認できなかった（engine/src/kernels/cuda/native_router.cu:265-328、engine/cmake/strata_gpu_engine.cmake:55-76、docs/DETAILS.md:1282）。
 
 ## 実行時の詳細
 
-verifier は `route_resident_cfg()` の関数内 static 初期化で、`STRATA_ROUTE_RESIDENT` とこの変数を一度読み取り、結果をプロセス内で保持します。初期化後に環境を書き換えても verifier の値は変わりません。設定値は、router が ids / weights を出した後、resident plan や doorbell 処理より前に native kernel へ渡されます。
+Verifier では route_resident_cfg() の関数内 static 設定が初回呼び出し時に STRATA_ROUTE_RESIDENT とこの変数を読み、以後プロセス内で再読込しない。初回呼び出しは Verifier::init の GPU counter setup から行われる。したがって、その後にプロセス環境を変更しても Verifier 設定には反映されない（engine/src/core/verify.cpp:178-186,956-968）。
 
-kernel は順位 `lo` から `hi`（ただし 9 以下）を順に調べます。その順位の選択 expert が非 resident なら、まだ選択されていない resident expert のうち logit が最大のものを探し、元の expert との logit 差が margin 以下のとき置換します。置換が一度でも起きると、選択後10件の logits から weights を再計算します。MTP 経路でも同じ native kernel と範囲を使います。
+各 verifier window で、router が作った top-10 と logits を使い、指定順位を小さい順に調べる。対象順位の expert が非 resident の場合、まだ選ばれていない resident expert のうち logits が最大のものを探す。同点なら expert index が小さい方を選ぶ。元 expert の logit から候補 logit を引いた値が STRATA_ROUTE_RESIDENT の margin 以下なら置換し、選択 logits から softmax weights を再計算する。置換がなければ weights は書き換えない。各置換後の選択集合を次の順位の探索にも使う（engine/src/kernels/cuda/native_router.cu:253-299,303-310）。
 
-MTP の設定読み取りは generation の初期化経路で行われ、ここでは `lo=6`, `hi=9` をローカル初期値として直接 `getenv` / `sscanf` します。条件を満たして適用すると stderr に `strata generate: STRATA_ROUTE_RESIDENT_MTP: ... ranks %d-%d; experimental` のログが出ます。verifier は終了時に統計を出し、ログにも `ranks=lo-hi` を含めます。
+MTP 経路は route_resident_cfg() の cache を使わず、この分岐の初期化時に環境値を別に読み、MtpDrafter に margin と ranks を設定する。Verifier側と異なり、MTPではこの環境変数を設定したかも条件に含まれる。実行途中の環境変更を継続監視する処理はない（engine/src/program/generate.cpp:13231-13239）。
+
+## ログと測定値
+
+Verifier は counter block を確保できない場合、stderr に route-resident: the counters could not be allocated on GPU %d; it runs without them と出し、counter なしで処理を続ける。counter が確保された GPU については終了時に prompt (windows T>8) と decode (windows T<=8) 別に、使用 ranks、tail entries、swap 数、前後の non-resident 数を route-resident... 行で出す。margin が0以下などで counter が作られない場合、この統計行は出ない（engine/src/core/verify.cpp:138-175,167-170）。
+
+MTP 条件が成立して margin が正の場合、stderr に strata generate: STRATA_ROUTE_RESIDENT_MTP: the MTP draft's router is biased toward layer ... (margin ..., ranks ...; experimental) と出す。MTP kernel 例外は mtp route-resident: を付けたエラー文字列になり、Verifier kernel 例外は verify route-resident: を付けて失敗を返す（engine/src/program/generate.cpp:13236-13239、engine/src/core/verify.cpp:2673-2677、engine/src/core/mtp.cpp:1432-1435）。
 
 ## 根拠
 
-- 既定値、verifier の static cache、値の変換: `src/core/verify.cpp:71-76,123-131`。
-- verifier の呼び出し時点と適用条件: `src/core/verify.cpp:1464-1475`。
-- verifier の終了時統計ログ: `src/core/verify.cpp:99-116`。
-- MTP 経路の条件、既定値、読み取り、ログ: `src/program/generate.cpp:7440-7454`。
-- MTP router での native kernel 呼び出し: `src/core/mtp.cpp:927-930`。
-- 順位ループ、resident expert の探索、置換判定、重み再計算: `src/kernels/cuda/native_router.cu:180-184,192-255`。
-- `docs/DETAILS.md:1663` は `STRATA_ROUTE_RESIDENT` を opt-in の関連機能として挙げていますが、`STRATA_ROUTE_RESIDENT_RANKS` の形式や挙動は説明していません。上記の値の規則は対象 HEAD の実装から確認しました。
+- engine/src/core/verify.cpp:126-186 — 設定構造体、既定値、環境読み取りと cache。
+- engine/src/core/verify.cpp:956-968,1000-1005,2671-2677 — verifier 初期化、resident table 条件、swap 呼び出しと失敗経路。
+- engine/src/kernels/cuda/native_router.cu:253-328 — rank の走査、resident candidate 選択、margin 判定、weights の再計算と counter。
+- engine/src/program/generate.cpp:13229-13239、engine/include/strata/core/mtp.hpp:60-65、engine/src/core/mtp.cpp:1432-1435 — MTP 経路の条件、ranks 設定、呼び出しと失敗経路。
+- engine/cmake/strata_gpu_engine.cmake:55-76、docs/DETAILS.md:1282 — CUDA kernel の build source と関連する設定資料。

@@ -1,46 +1,50 @@
 # `STRATA_Q2_BITPLANE`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-native pack の Q2_0 expert 行列を CPU で計算するとき、AVX2 用の従来 row kernel に代えて bit-plane row kernel を使います。bit-plane 形式の activation データも token ごとに前処理します。コードコメントと `docs/DETAILS.md` によると、整数演算部分は正確ですが浮動小数点の加算順序が変わるため、結果の最下位ビットが変わる場合があります。
-
-通常の native Q2_0 専用カーネル経路は、Q2_0 型（ggml type 42）かつ CPU が AVX2 対応の場合に限られます。AVX-512 対応 CPU では row 計算が AVX-512 カーネルへ dispatch され、この変数による AVX2 bit-plane 選択は行われません。AVX2 非対応 CPU では通常の native pack 経路が ggml-cpu に委ねられます。ソースには AVX1 版にも同じ変数判定と bit-plane 実装がありますが、通常の native Q2_0 専用カーネルの選択条件が AVX2 を要求するため、AVX1 版はその通常経路では選択されません。
+CPU の native Q2_0 GGUF 行計算で、AVX2 または AVX1 の通常カーネルの代わりに bit-plane カーネルを選ぶ開発・最適化用スイッチです。AVX2 では activation quantizer が bit-plane 用画像を作り、行カーネルがそれを使います。AVX1 にも別実装があります。選択されると浮動小数点の加算順序が変わり、Q2_0 行の最下位ビットが変わり得ます。環境変数は行カーネルの算術方式を選び、CLI 引数やモデルの内容そのものは変更しません（`engine/src/kernels/cpu/q2_avx2.cpp:65-85,172-190`, `engine/src/kernels/cpu/q2_avx1.cpp:137-143,252-271`）。
 
 ## 値と判定
 
-AVX2 版と AVX1 版それぞれで、`std::getenv()` の結果が null でなく、先頭文字が `'1'` なら有効です。文字列全体の parse や数値変換はしません。
+AVX2 と AVX1 の各翻訳単位で、ファイルスコープの `kBitplane` 初期化時に `std::getenv` し、値が存在して先頭文字が `'1'` の場合だけ true にします。文字列全体や数値としては解析しません。空文字、`0`、`true`、先頭が空白の ` 1` は false、`1`、`10`、`1anything` は true です。大文字小文字や後続文字は判定されません。未設定時は false で、明示的な無効値による警告や fallback はありません（`engine/src/kernels/cpu/q2_avx2.cpp:146-149`, `engine/src/kernels/cpu/q2_avx1.cpp:198-201`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効（既定） |
-| 空文字 | 無効 |
-| `1`、`10`、`1anything` | 有効（先頭文字だけを確認） |
-| `0`、`true`、` 1`、その他先頭文字が `1` でない値 | 無効 |
-
-大文字小文字、末尾、数値としての妥当性は判定しません。有効・無効の値を通知するログは、この判定箇所にはありません。
+| 実装経路 | unset / 空文字 | 有効になる値 | 無効になる例 |
+|---|---|---|---|
+| AVX2 | false | 先頭文字が `1`（例: `1`, `10`, `1abc`） | `0`, `true`, ` 1` |
+| AVX1 | false | 先頭文字が `1`（例: `1`, `10`, `1abc`） | `0`, `true`, ` 1` |
+| portable 実装 | bit-plane は無効 | なし | すべて（`q2_bitplane_enabled()` は常に false） |
 
 ## 有効になる条件
 
-- native pack の Q2_0 expert 行列を Strata の CPU Q2_0 カーネルで計算する経路であること。通常の native Q2_0 カーネル predicate は型 42 と AVX2 対応の両方を要求します。
-- AVX2 row 関数に到達すること。AVX-512 対応 CPU は `q2_rows_any()` で AVX-512 を優先し、AVX2 版は使いません。
-- activation 量子化器が bit-plane image を作成できる形状であり、全 activation の `bp_pairs` が行列の `nblocks / 2` と一致すること。条件が合わない場合は従来 row kernel に fallback します。
-- 行列の `nblocks` が偶数であること。activation image 側でも `nchunks % 4 == 0` が必要です。不成立なら image を持たず、row 関数は bit-plane を使いません。
+- 実行バイナリに x86 native-expert の AVX2 / AVX1 実装が含まれ、実行 CPU に対応 ISA が使えること。AVX2 カーネルは AVX2 経路、AVX1 カーネルは AVX があり AVX2 がない経路で選択されます（`engine/src/kernels/cpu/expert_layout.cpp:465-471`; `engine/include/strata/kernels/cpu/expert.hpp:184-203`）。
+- `q2_native_kernels(type)` が対象レイヤーを native Q2_0 と判定すること。これは型 `42`（Q2_0）かつ AVX2 または AVX1 が使える場合です。pool は native Q2_0 gate/up または down 行を処理するとき `q2_rows_any` に渡します（`engine/include/strata/kernels/cpu/expert_layout.hpp:89-99`, `engine/src/kernels/cpu/pool.cpp:1278-1302`）。
+- AVX2 / AVX1 の行カーネルに入り、`nblocks` が偶数で、対象 activation すべてに bit-plane 画像があること。条件を満たさなければ通常の legacy 行カーネルに戻ります（`engine/src/kernels/cpu/q2_avx2.cpp:172-180`, `engine/src/kernels/cpu/q2_avx1.cpp:252-260`）。画像生成側では `nchunks % 4 != 0` の場合に画像を作らず、`bp_pairs=0` とします（`engine/src/kernels/cpu/q2_avx2.cpp:197-199,229-268`, `engine/src/kernels/cpu/q2_avx1.cpp:205-207,274-311`）。
+- AVX-512 Q2_0 行経路が選ばれると、このスイッチは使われません。通常は `q2_rows_512_ok()` が AVX-512/VNNI 経路を選びます。`STRATA_CPU_YMM` が設定されていると AVX-512 側の `kZmm` が false になり、条件を満たせば AVX2 経路に進みます。AVX-512 非対応 CPU で VNNI tier が使われるかは `STRATA_VNNI_TIER=1` など別条件にも依存します（`engine/src/kernels/cpu/expert.cpp:152,378-380`, `engine/src/kernels/cpu/expert_layout.cpp:188-203,465-471`）。
+- `STRATA_FORCE_ISA=avx2` / `avx` は ISA dispatch の上限をそれぞれ AVX2 / AVX にし、`STRATA_FORCE_AVX2=1` も AVX-512 経路を無効にします。これらの条件では、CPU が AVX2 対応なら AVX2 経路が選択されます。`STRATA_FORCE_ISA` が未設定または空なら既定 cap は AVX-512 含む通常の自動判定で、認識されない値は警告して既定 cap に戻ります（`engine/src/kernels/cpu/expert_layout.cpp:26-38,75-77`; AVX-512 優先条件は `engine/src/kernels/cpu/expert_layout.cpp:465-471`）。
+- ARM の portable 実装では bit-plane kernel を使用せず、`q2_bitplane_enabled()` は false 固定です。CPU backend の portable スタブも native Q2_0 行カーネルを提供せず、実際の行計算はここへ入りません（`engine/src/kernels/cpu/portable.cpp:98-109`; x86 と ARM の実装選択は `engine/CMakeLists.txt:73-82`, `engine/cmake/backends/cpu.cmake:243-257`）。
 
 ## 実行時の詳細
 
-判定結果 `kBitplane` は AVX2/AVX1 の各翻訳単位にある名前空間スコープ `const bool` として初期化されます。各翻訳単位の初期化時に環境を読み、以降はその値を使います。プロセス起動後に環境を変更しても再判定されません。AVX2 と AVX1 は別々に同じ変数を読みます。
+値は AVX2 / AVX1 ソース内の静的 bool 初期化で一度読み、後続の quantize / 行計算でキャッシュ値を使います。プロセス実行中に環境を変更しても反映されません。CLI、設定ファイル、別の環境変数がこの値を上書きする読み取り箇所はありません（`engine/src/kernels/cpu/q2_avx2.cpp:146-149,172-190`, `engine/src/kernels/cpu/q2_avx1.cpp:198-201,252-271`）。
 
-AVX2 または AVX1 activation quantizer は、`kBitplane` が真の場合だけ Q8_1 activation から bit-plane image (`qp`, `psum`, `pscale`) を構築します。偽の場合は `bp_pairs` を 0 にします。Q2_0 row 関数は `kBitplane`、偶数 `nblocks`、全 token の image 形状一致を確認し、条件がそろえば bit-plane row kernel を呼びます。そうでなければ AVX2/AVX1 の従来 kernel を呼びます。対象外の型や CPU dispatch による別 backend の計算はこの設定で変わりません。
+AVX2 では `act_quant_q8_1_avx2` が通常の q8 activation を作った後、スイッチが true の場合だけ `bitplane_image` を作ります。AVX1 も同様に `act_quant_q8_1_avx1` から生成します。行カーネルは偶数個の 64 要素 Q2_0 ブロックを 2 ブロック単位の bit-plane 計算へ渡し、条件不一致なら legacy 実装へ戻ります（`engine/src/kernels/cpu/q2_avx2.cpp:197-225,229-268,172-190`, `engine/src/kernels/cpu/q2_avx1.cpp:205-233,274-311,252-271`）。
 
-`docs/DETAILS.md` は AVX2 かつ AVX-512 なしの CPU 向けの opt-in と記載し、最下位ビットが変わると説明しています。現行ソースには AVX1 実装もありますが、通常の native Q2_0 専用カーネル predicate は AVX2 を要求します。性能値は本調査では確認・測定していません。
+この経路は GPU backend やサーバーモード固有ではなく、native Q2_0 行処理を行う CPU 経路に属します。portable ビルドでは有効化されません。Strata の `DETAILS.md` は AVX2 かつ AVX-512 なしと記載していますが、現行コードには AVX1 実装もあります。また AVX-512 CPU でも dispatch が AVX2 に落ちれば条件付きで対象になります（`docs/DETAILS.md:1272`, `engine/src/kernels/cpu/q2_avx1.cpp:1-15,252-260`, `engine/src/kernels/cpu/expert_layout.cpp:465-471`）。
+
+## ログと測定値
+
+通常の native Q2_0 実行経路では、このスイッチの有効・無効を報告するログは見つかりません。テスト専用の `q2_bitplane_parity` 実行ファイルは環境変数が有効でない場合に `q2_bitplane_parity: STRATA_Q2_BITPLANE=1 is not set` を stdout に出して終了コード 1 を返し、AVX のない CPU では `q2_bitplane_parity: no AVX on this CPU, skipped` を出して 0 を返します。CMake のテスト登録はこのテストに `STRATA_Q2_BITPLANE=1` を設定します（`engine/src/kernels/cpu/q2_bitplane_parity.cpp:23-29`, `engine/cmake/backends/cpu.cmake:512-518`）。
+
+`expert_layout.hpp` のコメントには i7-3770 の単一 token Q2_0 ベンチとして legacy 0.52 ms、bit-plane 0.42 ms とあります。条件として `kq_cpu_bench --pairs q2_0/q2_0` が記載されていますが、測定回数などは示されていないため、この値はソースコメントにある報告としてのみ扱い、一般的な性能差とはしません（`engine/include/strata/kernels/cpu/expert_layout.hpp:89-93`）。
 
 ## 根拠
 
-- `src/kernels/cpu/q2_avx2.cpp:146-149,172-189,197-225,229-269` — 変数判定、AVX2 row-kernel の選択、image 生成条件。
-- `src/kernels/cpu/q2_avx1.cpp:178-181,185-212,232-252,254-292` — AVX1 版の判定、row-kernel、image 生成。
-- `src/kernels/cpu/expert_layout.cpp:356-374` — AVX-512 / AVX2 / AVX1 の dispatch と activation quantizer dispatch。
-- `include/strata/kernels/cpu/expert_layout.hpp:78-90` — native Q2_0 専用 kernel predicate が type 42 と AVX2 を要求すること。
-- `src/core/expert_source.cpp:3890-3900`, `src/kernels/cpu/pool.cpp:693-714,830-837` — CPU expert 用 activation 量子化と native Q2_0 row 計算の呼び出し。
-- `docs/DETAILS.md:287-289` — opt-in、対象 CPU の説明、最下位ビットに関する記載。
+- 環境変数の値判定・キャッシュ: `engine/src/kernels/cpu/q2_avx2.cpp:146-149`, `engine/src/kernels/cpu/q2_avx1.cpp:198-201`。
+- 適用対象と fallback: `engine/src/kernels/cpu/expert_layout.cpp:465-485`, `engine/src/kernels/cpu/q2_avx2.cpp:172-190`, `engine/src/kernels/cpu/q2_avx1.cpp:252-271`。
+- bit-plane 画像の生成条件: `engine/src/kernels/cpu/q2_avx2.cpp:197-225,229-268`, `engine/src/kernels/cpu/q2_avx1.cpp:205-233,274-311`。
+- AVX-512 dispatch: `engine/src/kernels/cpu/expert.cpp:152,378-380`, `engine/src/kernels/cpu/expert_layout.cpp:188-203,465-471`。
+- native Q2_0 の pool 経路: `engine/include/strata/kernels/cpu/expert_layout.hpp:89-99`, `engine/src/kernels/cpu/pool.cpp:1278-1302`。
+- portable 実装: `engine/src/kernels/cpu/portable.cpp:98-109`。
+- parity 専用テストと出力: `engine/src/kernels/cpu/q2_bitplane_parity.cpp:23-29`, `engine/cmake/backends/cpu.cmake:512-518`。

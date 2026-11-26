@@ -1,49 +1,47 @@
 # `STRATA_IQ3S_MT1`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。作業開始時の Strata リポジトリは `main` で、作業ツリーに変更はありませんでした。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CPU 上の native expert 実行で、IQ3_S の gate/up 行を1 tokenだけ処理するときにも Strata の AVX2 multi-token kernel を使うための opt-in です。通常の最小 token 数は2で、1 token の場合は ggml-cpu の dot product に進みます。この変数を有効にすると、対象条件下で IQ3_S の最小数を1にします。GPU kernel や native expert 以外の経路を切り替える変数ではありません。
+CPU の native expert 経路で、IQ3_S の gate/up 行が 1 token だけを処理するときにも AVX2 の multi-token 行 kernel を使うための opt-in です。対象の IQ3_S は `gu_type == 21` で識別されます。通常は `STRATA_IQ_MT_MIN` 未設定時に 2 token 以上で multi-token kernel を選び、1 token は ggml-cpu の dot に進みます。この変数が条件を満たすと IQ3_S の閾値だけを 1 にし、1 token も `iq256_gu_rows` に送ります。コメントはこの変更で単独 token の丸めが変わると説明しています。CPU native expert を通らない GPU 専用処理や Q2_0 専用行処理には作用しません。読み取りと閾値決定は `native_gu_mt_min()`、行 kernel の選択は `native_gu_rows_impl()` です（`engine/src/kernels/cpu/native_expert.cpp:540-556,654-704`）。
 
 ## 値と判定
 
-この変数は数値や文字列を parse せず、`std::getenv("STRATA_IQ3S_MT1") != nullptr`、つまり設定の有無だけで判定されます。
+この変数自身は `std::getenv(...) != nullptr` の有無判定だけで、値の文字列や数値を parse しません。unset だけが無効で、空文字、`0`、`1`、`true`、`false`、`0anything` を含む設定済み文字列はすべて opt-in 判定を通ります。ただし次の実行条件も必要です（`engine/src/kernels/cpu/native_expert.cpp:545-556`）。
 
-| 状態 | 判定 |
-|---|---|
-| 未設定 | この変数による変更なし。通常の最小数（既定2）を使う |
-| 空文字を含む任意の値 | 設定済みとして有効候補。`1` 以外でも値の内容は問わない |
-| `STRATA_IQ_MT_MIN` も設定済み | `STRATA_IQ3S_MT1` は無視される。`STRATA_IQ_MT_MIN` の `atoi` 結果が使われる |
+| 条件 | `STRATA_IQ3S_MT1` unset | 設定済み（例） | 機能が無効になる例 |
+|---|---|---|---|
+| `STRATA_IQ_MT_MIN` も unset、AVX2 対応、AVX-512 なし、gather 条件成立 | IQ3_S の閾値は既定の 2 | 空文字、`0`、`1`、`true` など値を問わず閾値 1 | この列の条件のどれかが不成立なら既定の閾値 2 |
+| `STRATA_IQ_MT_MIN` が設定済み | その変数の `atoi` 結果を閾値に使用 | 本変数を設定しても本変数による上書きはない | `STRATA_IQ_MT_MIN` の設定が優先（空文字や非数値なら `atoi` の結果は 0） |
 
-`STRATA_IQ_MT_MIN` は値が空文字・不正文字列でも「設定済み」なら `atoi` され、結果の `0` が使われます。これが設定されていれば `STRATA_IQ3S_MT1` の有無は見ません。どちらの環境変数の判定結果も helper 内の `static` に保存されるため、初回判定後にプロセス環境を変更しても反映されません。
+`STRATA_IQ_MT_MIN` の値は `atoi` で変換され、未設定なら 2 です。存在すれば値が何であっても `STRATA_IQ3S_MT1` 側の特例を止めます。gather 判定に使う `STRATA_IQ256_GATHER` は unset または空文字なら自動判定値 `-1`、それ以外は `atoi(v) != 0` により 1/0 になります。そのため非空の無効文字列も 0 となって gather 条件を満たしません（`engine/src/kernels/cpu/native_expert.cpp:545-556`; `engine/src/kernels/cpu/expert_layout.cpp:310-316`）。
 
 ## 有効になる条件
 
-`STRATA_IQ3S_MT1` が設定されていても、次の条件をすべて満たす場合に限り IQ3_S (`gu_type == 21`) の最小 token 数を1にします。
-
-- `STRATA_IQ_MT_MIN` が未設定。
-- 実行 CPU が `cpu_avx2_ok()` を満たす。
-- `STRATA_NO_IQ256` が未設定。
-- AVX-512 が使えない（`cpu_avx512_ok()` が false）。
-- `iq256_gather_setting() != 0` かつ `cpu_gather_fast()` が true。
-
-`cpu_gather_fast()` は AVX2 以上の ISA 判定に加え、Intel CPU の vendor ID、CPUID による AVX-VNNI、特定の E-core 専用 CPU 型でないことを確認します。`STRATA_IQ256_GATHER=0` なら gather 条件が不成立です。`STRATA_IQ256_GATHER` が未設定または空文字なら自動判定値 `-1` となり、`cpu_gather_fast()` の判定が使われます。
-
-CPU が AVX-512 対応の場合、この設定で最小数は下がりません。`STRATA_NO_IQ256` が設定されている場合も、値が `0` や空文字であっても設定有無によって対象外になります。CPU native expert 経路自体が使われなければ効果はありません。
+- Strata が native expert CPU kernel を含むビルドであること。x86 では `native_expert.cpp` と AVX2 IQ kernel が native-experts 構成に追加されます。native experts を含まない構成の stub は閾値 2 を返します（`engine/cmake/backends/cpu.cmake:303-317`; `engine/src/kernels/cpu/expert_layout.cpp:490-498`）。
+- `STRATA_IQ_MT_MIN` が未設定であること。本変数を設定すると IQ3_S 特例より優先されます（`engine/src/kernels/cpu/native_expert.cpp:545-556`）。
+- x86 CPU/OS が `cpu_avx2_ok()` を満たすこと（AVX2、FMA、AVX、F16C と OS の AVX 状態保存）かつ `STRATA_NO_IQ256` が未設定であること（`engine/src/kernels/cpu/expert_layout.cpp:206-238`; `engine/src/kernels/cpu/native_expert.cpp:554-555`）。
+- `cpu_avx512_ok()` が false であること。AVX-512 対応 CPU には本特例を適用しません（`engine/src/kernels/cpu/native_expert.cpp:554-555`）。
+- `STRATA_IQ256_GATHER` が `0` 相当でなく、`cpu_gather_fast()` が true であること。自動判定では ISA cap が AVX-512 tier 以上で、Intel CPU が AVX-VNNI を報告し、列挙された E-core-only 型番でないことを要求します。明示的に `STRATA_IQ256_GATHER` を非ゼロにしても `cpu_gather_fast()` 条件は省略されません（`engine/src/kernels/cpu/expert_layout.cpp:310-338`; `engine/src/kernels/cpu/native_expert.cpp:554-555`）。
+- 対象の native expert の gate/up 量子化型が IQ3_S（`gu_type == 21`）であること。閾値 1 に変えるのはこの型だけです（`engine/src/kernels/cpu/native_expert.cpp:554-556`）。
+- 対象の gate/up 呼び出しで `nt == 1` であることが今回の opt-in の差分です。複数 token の呼び出しでは既定の閾値 2 と同じく条件を満たし、multi-token kernel に進みます（`engine/src/kernels/cpu/native_expert.cpp:654-655,685-703`）。
 
 ## 実行時の詳細
 
-native expert CPU pool の gate/up 行処理から `native_gu_rows()` が呼ばれ、その関数が `native_gu_mt_min()` の返す閾値を使って multi-token kernel の分岐を選びます。条件成立時は `gu_type == 21` について閾値が1になり、1 token の IQ3_S も AVX2 IQ multi-token kernel に入ります。条件が外れる場合や対象外の format では元の閾値（通常2）で、1 token は ggml-cpu の `vec_dot` 経路になります。
+CPU pool の gate/up 行処理は `native_gu_rows()` または window-invariant 版から `native_gu_rows_impl()` に入り、`native_gu_mt_min(f.gu_type)` で閾値を取得します（`engine/src/kernels/cpu/pool.cpp:1290-1296`; `engine/src/kernels/cpu/native_expert.cpp:898-910`）。閾値が 1 になった IQ3_S は `nt >= mt_min` を満たし、AVX2 が有効なら `iq256_gu_rows()` に進みます。ここでは `STRATA_NO_IQ256` が未設定であることも dispatch 側で確認されます（`engine/src/kernels/cpu/native_expert.cpp:685-703`）。これは gate/up の行計算経路の選択です。down 行を同様に変更する分岐はありません。
 
-この設定によって1 token 時の IQ3_S 丸めが変わるため、結果の token 選択が変わる可能性があります。Strata の `docs/DETAILS.md` は、AVX-512 のない Alder Lake 以降で AVX2 kernel が IQ3_S grid を gather する場合にこの opt-in を案内しています。また同資料は `STRATA_IQ_MT_MIN=1` について、drafting への依存をなくす代わりに Ryzen 7600 (AVX-512) の IQ3_S decode が1〜3%遅くなった測定を記しています。この測定は別変数の設定に関するものであり、`STRATA_IQ3S_MT1` の速度値としては扱えません。`STRATA_IQ3S_MT1` 自体について、同資料には数値測定条件・結果はありません。
+`STRATA_IQ_MT_MIN`、この変数、CPU 判定値、gather 判定は関数内 static に保存されます。初回の `native_gu_mt_min()` 評価以降にプロセス環境を変更しても再評価されません（`engine/src/kernels/cpu/native_expert.cpp:545-555`; `engine/src/kernels/cpu/expert_layout.cpp:310-338`）。CLI 引数による上書きはこの関数にありません。IQ3_S の 1-token 丸めが変わる点はコメントと DETAILS に記されていますが、当該分岐に有効化ログ、警告、変数固有のエラーまたは終了経路はありません（`engine/src/kernels/cpu/native_expert.cpp:553-556`; `docs/DETAILS.md:1281`）。
 
-この変数について専用のログ出力は実装されていません。
+## ログと測定値
+
+この設定分岐はログを出しません。`docs/DETAILS.md` は `STRATA_IQ3S_MT1=1` を「AVX-512 なしの Alder Lake 以降で IQ3_S に 1 token 用 multi-token kernel を使う」と記載します。ソースの CPU probe は Intel AVX-VNNI と CPU 型などを判定するため、実際の適用条件は単なる世代名より上記の条件が優先です。ここでは変数固有の測定値を新たに記載しません（`docs/DETAILS.md:1281`; `engine/src/kernels/cpu/expert_layout.cpp:320-338`）。
 
 ## 根拠
 
-- `src/kernels/cpu/native_expert.cpp:124-141` — 既定閾値、`STRATA_IQ_MT_MIN` の優先、対象変数の presence 判定、IQ3_S の閾値上書き。
-- `src/kernels/cpu/native_expert.cpp:143-190` — AVX2/AVX-512 条件、閾値と形式による multi-token kernel 選択、ggml-cpu への fallback。
-- `src/kernels/cpu/pool.cpp:684-709` — native expert CPU pool の gate/up 行から `native_gu_rows()` を呼ぶ箇所。
-- `src/kernels/cpu/expert_layout.cpp:210-239` — `STRATA_IQ256_GATHER` の parse と `cpu_gather_fast()` の CPU 判定。
-- `docs/DETAILS.md:97-112` — 再現可能な greedy 出力に関する説明と `STRATA_IQ3S_MT1` の案内。測定値は `STRATA_IQ_MT_MIN` の説明に属する。
+- `engine/src/kernels/cpu/native_expert.cpp:540-556` — 閾値、優先順位、変数の設定有無、CPU・他変数条件。
+- `engine/src/kernels/cpu/native_expert.cpp:654-705` — token 数と量子化型による行 kernel dispatch。
+- `engine/src/kernels/cpu/pool.cpp:1290-1296` — CPU pool の gate/up 行処理から native kernel への呼び出し。
+- `engine/src/kernels/cpu/expert_layout.cpp:206-238,310-338,490-498` — CPU ISA 判定、gather 設定・自動判定、native-experts 無効時の stub。
+- `engine/cmake/backends/cpu.cmake:303-317` — native expert ソースと x86 ISA kernel の build 登録。
+- `docs/DETAILS.md:1281` — Strata の設定資料との照合。

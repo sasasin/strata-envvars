@@ -1,49 +1,44 @@
 # `STRATA_SPLIT_MISS_MS`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--layer-split auto` が複数 GPU に層を割り当てる候補を評価するとき、GPU の expert cache に入らないと予測した routed mass のコスト（ミリ秒）を指定します。設定値は実測の遅延を直接変更するものではなく、起動時の候補選択に使う予測値です。未設定時の基準値は `190.0` ms です。
+`--layer-split auto` の GPU 層分割探索で、キャッシュに収まらない profiled expert の routed mass を予測 decode 時間へ換算する係数（ms / mass unit）を指定する。値を変えると配置探索で評価するスコアと選ばれる層境界が変わり得る。キャッシュ容量や実際の expert 実行を直接変更する設定ではない。CUDA/HIP 実装と SYCL 実装の両方に読み取り箇所がある（`engine/src/program/generate.cpp:6959-6961,7015,7099-7108`、`engine/sycl/src/program/generate.cpp:3921-3924,3947,3993-4023`）。
 
 ## 値と判定
 
-CUDA 系と SYCL 系の実装は、環境変数が未設定なら `190.0`、設定されていれば `std::atof(getenv(...))` の結果を使います。文字列全体の妥当性検査、値域チェック、clamp はありません。
+各実装とも `getenv` が null なら `190.0`、設定されていれば `std::atof` の戻り値を使う。文字列全体の妥当性確認、clamp、エラー処理はない。空文字や先頭から数値に変換できない文字列（例 `""`、`abc`）は通常 `0` になり、数値の後ろの文字は無視される（例 `12ms` は `12`）。したがって `0` はミスコストを 0 にし、負数も拒否されずそのまま計算に入る。`1` や `190` はそれぞれその係数として使われる。空白は `atof` の数値変換規則に従う。大文字小文字による判定はない。
 
-| 環境の値 | コード上の扱い |
-|---|---|
-| 未設定 | `190.0` |
-| 空文字 | `atof("")` の結果 `0.0` |
-| 数値として読める値 | 先頭から `atof` が変換できる数値を使う。符号・小数を含められ、数値の後ろに変換対象外の文字があっても、その部分は判定されない（例: `12.5ms` は `12.5`）。 |
-| 数値に変換できない文字列 | `atof` の結果 `0.0` |
-| 負値 | そのまま使われる。負値を拒否したり 0 に丸めたりしない。 |
+| ビルド / 経路 | unset | 設定時に使われる値 | 検証・境界 |
+|---|---:|---|---|
+| CUDA/HIP `engine/src/program/generate.cpp` | `190.0` | `atof` が変換した double。例 `1` → 1、`12ms` → 12、空文字・`abc` → 0 | 範囲検証・clamp なし。負数もそのまま使う |
+| SYCL `engine/sycl/src/program/generate.cpp` | `190.0` | 同上 | 同上 |
 
-従って、`STRATA_SPLIT_MISS_MS=0`、空文字、または数値でない文字列は、予測上の cache miss コストを 0 にします。負値も受理され、候補の miss penalty を負にします。値の再読み込み用 static cache はありませんが、分割探索は起動時に一度行われるため、探索後にプロセス環境を書き換えても選択済みの分割は変わりません。
+根拠: `engine/src/program/generate.cpp:7015`、`engine/sycl/src/program/generate.cpp:3947`。
 
 ## 有効になる条件
 
-- `--layer-split auto` が指定され、`--serve` が有効であること。明示的な `--layer-split K[,K2...]` ではこの値を読みません。
-- 自動分割に複数 GPU が選ばれていること。可視 GPU が1台なら `auto` は分割なしに戻ります。
-- `--split-skip-if-fits` が指定され、CUDA 0 だけで profile 全体を保持できる場合は split 自体を取り消すため、この値を使う探索に入りません。
-- profile が空なら、予測される missed mass は実質 0 です。この値を変えても候補間の差にはなりません。profile の読み込みは `--expert-profile` が指定された場合に行われます。
-- `--layer-split auto` の予測は候補の層境界、各段の VRAM 残量、profile の順位、他のコスト値も使います。したがって、この値だけで最終境界が決まるわけではありません。
+- `strata generate` / `strata serve` のうちサーバーモードで `--layer-split auto` を指定し、複数 GPU にまたがる自動配置探索まで進む必要がある。`--layer-split` は `o.serve` が真でなければ受理されず、`split_auto` は値が文字列 `auto` の場合に設定される（`engine/src/program/generate.cpp:4785-4807,4848-4853`）。探索部の条件は `multi_gpu && split_auto`（`engine/src/program/generate.cpp:6959`、`engine/sycl/src/program/generate.cpp:3921`）。
+- `--layer-split K...` のような明示境界ではこの探索を通らず、この変数は読まれない。`--split-skip-if-fits` が有効で CUDA0 にプロファイル全体が収まると自動分割が解除され、同じく探索・読み取りをしない（CUDA/HIP: `engine/src/program/generate.cpp:6450-6483`、SYCL: `engine/sycl/src/program/generate.cpp:3522-3573`）。可視 GPU が 1 台の場合も auto は解除される（CUDA/HIP: `engine/src/program/generate.cpp:4836-4839`、SYCL: `engine/sycl/src/program/generate.cpp:2308-2318`）。
+- 探索スコアはモデルの層数・expert profile、各 stage の空き VRAMと session carve による held mass から計算される。miss 係数はその「保持できなかった mass」に掛かるため、モデル状態や配置の空き容量が結果に関わる。expert profile が空なら miss 項は全候補に共通（CUDA/HIP は 0、SYCL は `miss_ms`）となるため、係数は候補の相対順位を変えない（`engine/src/program/generate.cpp:7069-7108`、SYCL: `engine/sycl/src/program/generate.cpp:3993-4023`）。
+- CUDA/HIP では `STRATA_SPLIT_LINK_ABS`、`STRATA_SPLIT_UNIFORM`、`STRATA_SPLIT_LINK_MIN` による stage ごとの `link_scale` がこの係数に掛かる。`STRATA_SPLIT_COVER_B` は mass 曲線を選び、`STRATA_SPLIT_SPEED_SCALE` は CUDA/HIP の層時間側を調整する。SYCL の式は link scale を適用せず、総未保持 mass に係数を掛ける（`engine/src/program/generate.cpp:6990-7007,7040-7047,7099-7108`、`engine/sycl/src/program/generate.cpp:3970-3982,4017-4023`）。
+- CUDA/HIP で 2〜4 GPU の候補が複数ある場合は、係数が候補の順位に影響する。5 台以上ではコード上 proportional 配置だけを評価するため、値は予測値に入るが選択境界の候補比較には使われない（`engine/src/program/generate.cpp:7295-7385`）。SYCL も 2〜4 GPU で配置候補を列挙し、5 台以上は proportional 配置へ進む（`engine/sycl/src/program/generate.cpp:4076-4150`）。
 
 ## 実行時の詳細
 
-CUDA 系実装は `src/program/generate.cpp`、SYCL 実装は `sycl/src/program/generate.cpp` に同じ環境変数の読み取りがあります。どちらも探索処理の中で `getenv` と `atof` を行い、デフォルト値は `190.0` です。
+環境変数は自動分割探索の開始後、stage の layer/link 情報を準備した後に読み取られ、探索候補を採点する間はそのローカル値を使う。関数内 static cache ではなく、各探索呼び出しで評価されるため、プロセス起動前に設定した値がその探索に使われる。通常の実行中に環境を変更して再探索する経路は確認できない（`engine/src/program/generate.cpp:6959-7015,7100-7108`、`engine/sycl/src/program/generate.cpp:3921-3947,3993-4023`）。
 
-予測時間には「cache に保持できなかった routed mass × miss cost」と、段ごとの層数に応じた GPU 処理時間を加算します。CUDA 系の2段・3段分割では、miss cost に各段の PCIe link 推定による係数も掛けます（20 GB/s を基準に、コード上は係数を 1〜64 に制限）。4段分割の専用探索では全段の missed mass を集約した式を使い、段別 link 係数は掛けません。5段以上では比例配分の候補だけを評価するため、miss cost はその候補の予測値には入りますが、比較対象がなく、境界選択には影響しません。SYCL の予測式には CUDA 系の段別 link 係数はありません。
+CUDA/HIP は stage ごとに、未保持 routed mass を `miss_ms * link_scale[i]` で予測値へ加算する。SYCL は `miss_ms * (1 - held_mass)` を加算する。両方とも各 stage の層時間を加えた予測値で候補を選ぶ。この変数によって変わるのは探索コストモデルと auto が決める層境界であり、実行時に expert の読み込みを増減させたり、その時点の実測遅延を制御したりはしない（`engine/src/program/generate.cpp:7099-7108`、`engine/sycl/src/program/generate.cpp:4017-4023`）。
 
-値は探索結果を通じて選ばれる層境界に反映されます。stderr には選択した `K`、予測 ms、cache が保持すると見積もった profile 数・routed mass、および評価した候補数が `layer split auto` の行として出ます。環境変数の値そのものを表示するログは、この読み取り周辺にはありません。
+## ログと測定値
+
+成功した auto 探索は stderr に `strata generate: layer split auto: K=... - predicted ... ms per decode window; the caches hold ...` の形式で予測値・held profile 数・routed mass・配置候補数を出す（`engine/src/program/generate.cpp:7510-7515`、SYCL: `engine/sycl/src/program/generate.cpp:4173-4178`）。この変数専用の警告や無効値エラーはなく、変換できない値も `atof` の結果として探索に入る。ソースにある既定値 190 ms は予測モデルの係数であり、この調査では性能測定を実行していない。
 
 ## 根拠
 
-- `src/program/generate.cpp:2298-2348` — `--layer-split auto`、serve 条件、GPU 数、複数 GPU 分割の判定。
-- `src/program/generate.cpp:3344-3388` — `--split-skip-if-fits` が split を取り消す経路。
-- `src/program/generate.cpp:3534-3576` — `--expert-profile` による profile の読み込み。
-- `src/program/generate.cpp:3715-3729` — CUDA 系の link 係数準備と環境変数の読み取り、既定値。
-- `src/program/generate.cpp:3795-3820` — 段ごとの missed mass と予測コストの計算。
-- `src/program/generate.cpp:3959-3978,3995-4065` — 候補評価、2〜4段の探索と4段用の集約式。
-- `src/program/generate.cpp:4162-4167` — 選択した分割と予測値の stderr 出力。
-- `sycl/src/program/generate.cpp:3563-3564,3609-3639,3665-3735` — SYCL 側の読み取り、予測式、2〜4段探索。
-- `bench/results/2026-09-29-layer-split/README.md:70-78` — 190 ms が sweep の最良 K に合わせた値であり、環境変数で上書きできるという測定資料上の説明。ここに記載された測定値は同資料の rig・モデル条件に限られます。
+- `engine/src/program/generate.cpp:4785-4807,4836-4853` — CLI から `split_auto` を設定し、serve 要件・GPU 数を判定。
+- `engine/src/program/generate.cpp:6450-6483` — `--split-skip-if-fits` による auto 分割解除。
+- `engine/src/program/generate.cpp:6959-7015,7040-7047,7069-7108` — CUDA/HIP 探索条件、値の読み取り、mass 曲線、予測式。
+- `engine/src/program/generate.cpp:7295-7385,7510-7515` — 配置候補探索と結果ログ。
+- `engine/sycl/src/program/generate.cpp:3921-3947,3970-3982,3993-4023,4076-4150,4173-4178` — SYCL 探索条件、値の読み取り、予測式、候補探索とログ。

@@ -1,56 +1,57 @@
 # `STRATA_PIPED_CONCURRENT`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-`--batch-groups` で複数の slot group を layer split の pipeline に流している間、通常は全 slot が待つ prompt read を専用スレッドへ移し、slot group の decode と同時に実行します。対象は Strata の batch prompt read であり、単独の通常 prompt read 全般を並行化する設定ではありません。ソースのコメントはこの機能を experimental / opt-in としています。
+`--batch-groups > 1` の層分割パイプラインで、プロンプトの prefill を専用スレッドに移し、その間も slot の batch window を進める実験的な opt-in である。適用条件を満たすと、読込スレッドと slot window が GPU 上で並行し、通常のパイプライン読込のように slot がプロンプト読込の終了を待たない。主制御は `read_part` 内で行い、各 slot の doorbell を専用スレッドが処理する。プロンプト読込で失敗した場合や batch window が失敗した場合は、そのリクエスト処理が失敗する。`engine/src/program/generate.cpp:21009-21023,21054-21062,21113-21116,21138-21153,21243-21274`。
 
 ## 値と判定
 
-値は `std::atoi()` で整数変換され、その結果が 0 なら無効、0 以外なら有効です。文字列全体の検証はありません。
+主制御は `std::getenv` の結果を `std::atoi(v) != 0` で判定する。未設定は無効、空文字も `atoi` が 0 を返すため無効。文字列全体や真偽語は検証せず、`atoi` が読む数値接頭辞が 0 以外なら有効になる。従って `1`, `-1`, `01`, `1anything` は有効、`0`, `0anything`, `true`, `false`, 空文字、数値として読めない文字列は無効。先頭空白の後の数値も `atoi` の規則で変換される。範囲検証や clamp はない。数値範囲外の文字列に対する `atoi` の結果はこのコードで規定されていない。`engine/src/program/generate.cpp:21024-21030`。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字、`0`、`false`、数値に変換できない文字列 | 無効（`atoi` が 0 を返す） |
-| `1`、`-1`、`2` | 有効 |
-| `1abc`、` 1tail` | 有効（`atoi` が先頭の整数部分を変換） |
-| `0tail`、`00` | 無効 |
-
-`pr_conc` は `generate.cpp` 内の関数ローカル `static const bool` なので、初回評価後は同じプロセス内で環境を変更しても再評価されません。Verifier の stream 優先度にも同名変数が使われますが、こちらは別の static 判定です。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| `engine/src` の主制御（CUDA/HIP 向け実装） | 無効 | `1`, `-1`, `1tail` | 空文字, `0`, `0tail`, `true`, `x` |
+| CUDA stream 優先度判定（CUDA build のみ） | この変数が unset なら最高優先度を要求しない | 上記の主制御が有効で、`STRATA_PIPED_CONCURRENT_PRIO` も unset または `atoi` が非 0 | この変数が空文字/0相当、または `STRATA_PIPED_CONCURRENT_PRIO=0` 相当 |
 
 ## 有効になる条件
 
-値が有効でも、次の条件が必要です。
-
-- `--batch` が正数、`--batch-groups` が 1 より大きく、layer split の stage があること（`piped` 経路）。
-- prompt に画像が含まれないこと。
-- 読み取りスレッド内の確保・解放や CUDA 呼び出し、または単一スレッドで buffer を再利用する expert source との競合がないこと。コードは次の状態を検査し、最初に該当した理由を stderr に出して機能を無効にします。
-  - `STRATA_PREFILL_HELP` が `atoi` で非 0
-  - `STRATA_SPLIT_MTP_BATCH` が `atoi` で非 0
-  - `STRATA_FS_SLOTS` が `atoi` で非 0
+- `--batch` が正、`--batch-groups` が 1 より大きく、層分割 pipeline の stage があること（`piped` 条件）。`engine/src/program/generate.cpp:17529-17533`。
+- 画像を含まない prompt であること。prompt の現在の区間長 `b0 - a0` が `STRATA_PIPED_CONCURRENT_MIN` 以上であること。同 MIN は unset/0 なら全長を許し、`atoll` の後に負値を 0 へ clamp する。短い入力は通常の読み込み経路へ進む。`engine/src/program/generate.cpp:21047-21054`。
+- 次の競合条件が一つでもあると opt-in は無効になり、stderr に `strata batch: STRATA_PIPED_CONCURRENT is off beside <理由>` を出す。判定順で最初の理由だけを表示する。
+  - `STRATA_PREFILL_HELP` の `atoi` が非 0
+  - `STRATA_SPLIT_MTP_BATCH` の `atoi` が非 0
+  - `STRATA_FS_SLOTS` の `atoi` が非 0
   - `--pcie-mode dma`
-  - helper cache の利用（`--expert-cache-device1..3` など）
-  - source が blob を stage する場合、または GGUF source / arena 以外の expert source
+  - helper cache が使われる（`--expert-cache-device1..3`、または helper cache を伴う remote expert 経路）
+  - 通常の GGUF source が blob staging を使う（GGUF in-place、unbuffered、`STRATA_IO_PREFETCH` 経路）
+  - GGUF source と arena source 以外の expert source
 
-無効条件のログは `strata batch: STRATA_PIPED_CONCURRENT is off beside %s` です。環境変数が無効、pipeline 経路でない、または画像付きの場合に、この機能専用の警告が必ず出るわけではありません。
+  個々の設定値・source 状態から上記条件を組み立てる箇所は `engine/src/program/generate.cpp:21027-21045`、理由名と優先順は `engine/include/strata/program/batch_read.hpp:30-53`。
+- `engine/src/program/generate.cpp` にこの読み取り経路があり、同名の読み取りは `engine/sycl/src/program/generate.cpp` にない。CUDA/HIP 向けの当該実装の説明であり、SYCL 実装にこの機能があるとは確認できない。CUDA build では別途 window stream の優先度も変わり得る。HIP ではその優先度分岐を通らず既定の stream priority を使う。`engine/src/core/verify.cpp:1312-1334`。
 
 ## 実行時の詳細
 
-有効時、prompt は reader thread で読み、メインスレッドは slot group の pipeline を進めます。各 verifier の doorbell は別スレッドで処理され、read の終了時には thread を join して doorbell の外部処理を解除します。読み取り途中に短い要求が待っている場合、次の chunk で read を止めて slot に譲る経路があります。プロンプトの K/V は main sessions に、slot の K/V は各 slot に保持され、ソース資料は PLE table をロックすると説明しています。VRAM expert slot は read 前に貸し出し、read 後に補充するため、その間 slot windows は該当 expert を CPU で計算します。
+`pr_conc` は関数内 `static const bool` で、最初に `read_part` がこの初期化へ到達した時に一度だけ環境を読み、そのプロセス中は結果を cache する。unset と無効値はいずれも false で、CLI 引数による値の上書きはない。別の条件（piped、画像なし、最小 token 数、競合 source/設定）が成立しない場合は通常経路となる。プロセス起動後に環境値を変えても、初期化済みの主判定は変わらない。`verify.cpp` の CUDA 優先度判定も関数内 static で初回 `make_stream` 時に cache される。こちらは `read_part` の他条件が成立しなくても、window stream 作成時に最高優先度を要求し得る。`engine/src/program/generate.cpp:21024-21054`, `engine/src/core/verify.cpp:1312-1318`。
 
-CUDA build では `Verifier::make_stream()` もこの変数を `atoi` で判定します。非 0 かつ `STRATA_PIPED_CONCURRENT_PRIO` が未設定または `atoi` で非 0 の場合、window stream を device の最高優先度で作成しようとします。優先度範囲取得または優先度付き stream 作成に失敗した場合はエラーをクリアして通常の non-blocking stream 作成へ進みます。`STRATA_PIPED_CONCURRENT_PRIO=0` はこの優先度変更を止めますが、prompt read の並行化自体は止めません。
+有効経路では必要な MTP prefill buffer を先に reserve し、prompt upload slot も読込前に reserve する。upload slot の reserve に失敗しても警告を出して処理は続ける。読込 thread と doorbell thread を作り、後者が slot window の doorbell を処理する間、メイン側は window の pump と prompt 完了待ちを行う。slot が借りている expert slot は読込前に貸し出し、読込中は window がそれらの expert を CPU で計算し、読込後に補充する。読み込みと slot の別々の stream / memory を使い、prompt による slot 停止を避ける設計である。`engine/src/program/generate.cpp:21054-21062,21113-21175,21218-21226`。
 
-HIP では stream の最高優先度化をこの分岐で行いません。Strata の `docs/BATCHING.md` はこの機能を CUDA と HIP 向けとし、SYCL では利用できないと記載しています。
+このパスはリクエストごとに `read_part` から選択される一方、環境変数判定自体は static cache される。待機中に短いリクエストの `BYIELD` が届くと、次の chunk で読込を止めて slot に途中分を渡す。失敗した window は `a pipelined batch window failed` として処理失敗になり、prompt reader の例外は `the prompt read failed: ...` または `the prompt read failed` に変換される。`engine/src/program/generate.cpp:21176-21216,21227-21249,21270-21275`。
 
-並行読込が実行された場合、stderr に `strata batch: read ... (concurrent, to ...); the slots decoded ...` の形式で読込量、経過時間、読込中の decode 行数・速度、stage ごとの情報を出します。資料の測定例は 2x RTX 5090、Swift 1.5 IQ3_S、split 25、`--batch 6 --batch-groups 2` などの条件で、固定 stream prompt の読込中の stream 速度は無効時 2–3 tok/s、有効時 85–92 tok/s、同じ仕事全体の stream 完了時間は 5–8% 短縮（平均 6.4%）と報告されています。これは `docs/BATCHING.md` に記載された測定であり、他の環境の性能を示すものではありません。
+## ログと測定値
+
+- 不適合条件がある場合: `strata batch: STRATA_PIPED_CONCURRENT is off beside ...`。主判定が off の場合や、pipeline・画像・最小長条件に合わず通常経路へ進む場合、この理由ログは出ない。`engine/src/program/generate.cpp:21041-21045,21054`。
+- 有効経路の各 prompt read: `strata batch: read N tokens on a thread of its own in X ms (concurrent, to Q of T); the slots decoded R rows meanwhile (S rows/s; ...)`。予約失敗時は `strata batch: the prompt path's pinned upload slots could not be reserved (they grow at first use)`。`engine/src/program/generate.cpp:21060-21062,21263-21269`。
+- CUDA で主変数が有効、かつ `STRATA_PIPED_CONCURRENT_PRIO` が unset または非 0 の場合、window stream の最高優先度作成を試みる。取得または作成に失敗した場合は既定 stream 作成へ fallback し、専用ログはない。HIP / gfx906 系のこの分岐では主変数による優先度要求をしない。`engine/src/core/verify.cpp:1312-1334`。
+- Strata の `docs/BATCHING.md:247-281` は実験機能の説明と CUDA/HIP の差を記す。そこに続く性能表は 2x RTX 5090 等の特定構成・計測条件を付したもので、現行 HEAD で再測定した値ではないため、ここでは現行一般性能として扱わない。`docs/BATCHING.md:283-308`。
 
 ## 根拠
 
-- `src/program/generate.cpp:11092-11100`: pipeline 経路の定義。
-- `src/program/generate.cpp:12855-12893`: 主変数の `atoi` 判定、初回 static 評価、抑止条件とログ。
-- `src/program/generate.cpp:12967-12977,13015-13054,13058-13115`: doorbell の別スレッド処理、reader thread、終了時の join、完了ログ。
-- `src/core/verify.cpp:848-865`: CUDA の window stream 優先度と通常 stream への fallback。
-- `include/strata/program/batch_read.hpp:30-53`: concurrent read を無効化する条件と判定順。
-- `docs/BATCHING.md:191-225,227-245`: 機能説明、backend、ログ、測定条件と結果。
+- `engine/src/program/generate.cpp:17529-17533` — pipelined batch 条件。
+- `engine/src/program/generate.cpp:21024-21054` — 主変数の変換、競合判定、最小 prompt 長。
+- `engine/include/strata/program/batch_read.hpp:30-53` — 無効化条件と理由の順序。
+- `engine/src/program/generate.cpp:21054-21275` — thread、slot/prompt の並行処理、BYIELD、ログ、失敗経路。
+- `engine/src/core/verify.cpp:1310-1334` — CUDA window stream 優先度と fallback。
+- `engine/sycl/src/program/generate.cpp` — 対象名の読み取りなし。
+- `docs/BATCHING.md:247-308` — 設計説明と別条件の測定記録。

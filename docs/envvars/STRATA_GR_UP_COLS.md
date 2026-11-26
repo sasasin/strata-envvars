@@ -1,52 +1,47 @@
 # `STRATA_GR_UP_COLS`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-SYCL 版 fused GR の multi-token up projection kernel で、1 work-group が処理する列数 `COLS` を選びます。既定の 16 列から 4、8、32、64 列へ変更できます。`COLS` が小さいときは起動 work-group 数が増え、大きいときは減ります。コードコメントでは、各行の dot、butterfly reduction、列ごとの stream sum の順序と出力が同じになる設計とされています。これは実装コメントの説明であり、ここでは別途測定・検証していません。
+SYCL 版 fused GR read の up カーネルで、1 work-group が扱う列数を選ぶ。既定の 16 列から 4、8、32、64 列へ切り替えられる。列数に応じて `N / C` 個の work-group を起動するため、コンパイル済み形状の `N=2560` ではそれぞれ 640、320、80、40 個となる。列数別のテンプレート実体は同じ `gr_up_multi_kernel<C>` である。ソースコメントは 4 / 8 列について「同じ bits」と記しているが、32 / 64 列を含む全設定についての出力一致を確認した記述ではない（`engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:34-38,853-856,1200-1205,1212-1237`）。
 
-この名前を環境から読む実装は `sycl/src/kernels/cuda/fused_gr.dp.cpp` のみです。CUDA/HIP の `src/kernels/cuda/fused_gr.cu` には、この環境変数の読み取りはありません。したがって、変数が制御するのはこの SYCL port の経路です。
+読み取り箇所はこの SYCL ソースの `gr_up_cols()` 1 箇所。通常の CUDA 実装 `engine/src/kernels/cuda/fused_gr.cu` にはこの名前の読み取りがなく、SYCL ビルドで該当 up 経路が選ばれた場合の設定である（SYCL プロジェクトのビルド定義: `engine/sycl/CMakeLists.txt:1-10,21-25`）。
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換し、その結果が `4`, `8`, `32`, `64` のいずれかなら採用します。それ以外は既定の `UPM_COLS`（16）になります。文字列全体の数値検証はしません。
+`std::getenv` の結果を `std::atoi` に渡し、変換結果が `4`, `8`, `32`, `64` のいずれかの場合だけ採用する。それ以外は `UPM_COLS`（16）へ戻る。文字列全体の妥当性検証や範囲 clamp はない（`engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:853-856,1203-1206`）。
 
-| 設定 | 選択される列数 |
-|---|---:|
-| 未設定 | 16 |
-| `4`, `8`, `32`, `64` | 変換結果の値 |
-| `16` | 16（無効値からの fallback） |
-| 空文字、非数値、`0`、負値、その他の数値 | 16 |
-| `8abc`, ` 8`, `+8` など | `atoi` が返す整数が候補値なら採用（この例では 8） |
+| 条件 | unset | 有効になる値（例） | 無効値・既定値へ戻る例 |
+|---|---:|---|---|
+| SYCL の `gr_up_cols()` 経由 | 16 | `4`, `8`, `32`, `64` | 空文字、`0`, `1`, `16`, `-4`, `true`, `false`, `xyz` は 16 |
 
-たとえば `8.0` は `atoi` が先頭の整数部分 `8` を返すため 8 列です。先頭が数値でない文字列は通常 0 となり 16 列に fallback します。`atoi` が整数範囲外の値に対して返す値はC/C++仕様上保証されないため、その場合の選択は断定できません。
-
-根拠: `sycl/src/kernels/cuda/fused_gr.dp.cpp:670-673,840-843`。
+`atoi` は数値の先頭部分を読むので、たとえば `8junk` や先頭に空白を含む ` 8` は変換結果が 8 となり採用される。`4.0` は整数部の 4 が採用される。大文字小文字の比較はない。空文字や数値で始まらない文字列は 0 となり、許可値ではないため 16 になる。数値として変換された後の値に clamp はなく、許可リストとの完全一致だけで判定する（同上）。
 
 ## 有効になる条件
 
-- `fused_gr_read_multi()` が通常の multi-token fused GR up-kernel を起動する経路で有効です。`launch_gr_up_multi()` が値を読み、`COLS` ごとのテンプレート kernel を起動します。
-- `STRATA_GR_V3` による two-kernel 経路がデバイスの local memory 条件を満たす場合、関数は専用の `gr_up_v3_kernel` を起動して戻るため、この設定はその呼び出しでは参照されません。
-- `STRATA_GR_MORE_GROUPS` が有効な経路では `launch_gr_up_more()` が up kernel を起動し、固定の `UPM_COLS_MORE`（8）を使います。この場合も `STRATA_GR_UP_COLS` は無視されます。同変数が未設定の場合、Alchemist 世代では `STRATA_GR_MORE_GROUPS` が既定で有効なため、`STRATA_GR_UP_COLS` を適用したい場合は `STRATA_GR_MORE_GROUPS=0` が必要です。
-- `fused_gr_read()` が通常の単一 token kernel を直接使う経路ではこの値を読みません。一方、同関数が down-sliced / norm-split / down-direct 条件によって `fused_gr_read_multi(..., 1, ...)` に委譲する場合は、先述の multi-token 経路とその条件に従います。
-
-根拠: `sycl/src/kernels/cuda/fused_gr.dp.cpp:1770-1824,1881-1919,1956-1964,2038-2044,2061-2084`。
+- SYCL エンジンの `fused_gr.dp.cpp` を使うビルドであること。CUDA エンジンの同名 fused GR 実装ではこの環境変数を読まない。
+- `fused_gr_read_multi()` が最終的に `launch_gr_up_multi()` に到達すること。`STRATA_GR_V3` が対応デバイスで実行可能と判定されると同関数は先に return し、対象変数の up 列数選択を通らない（`engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3168-3202,3289-3297`）。
+- multi-read の up 側で B60 private Q8、GF の up/combo、cached norm、`lo_once`、`gr_more_groups()` の各分岐が選ばれた場合も `launch_gr_up_multi()` を通らず、この値はその up 起動に適用されない。通常分岐では `launch_gr_up_multi()` が呼ばれる（同 `:3465-3493`）。
+- 単一トークンの `fused_gr_read()` は、`kDownXnTooBig`、`gr_down_sliced()`、`gr_norm_split()`、`gr_down_direct()` のいずれかが真なら multi-read に委譲し、上記 multi-read の条件に従う。それらがすべて偽なら専用 `gr_up_kernel` を起動するため、この環境変数はその経路に効かない（同 `:3522-3559`）。
+- CLI 引数や別の環境変数が値を直接上書きする処理はない。ほかの経路切替変数は、上記のとおり対象の up 起動自体を迂回させることがある。
 
 ## 実行時の詳細
 
-`gr_up_cols()` 内の `static const int` 初期化で環境変数を読みます。したがって値はプロセス内で最初にこの関数が実行されたときに決まり、以後の環境変更は反映されません。値はキューやデバイスごとに保持されず、この関数の static 値として共有されます。
+`gr_up_cols()` 内の関数ローカル `static const int` 初期化で初回評価時に読み、結果を以後の呼び出しでキャッシュする。したがって初回評価後にプロセス環境を変えても再読込されない。選択された列数は `launch_gr_up_multi()` の switch に渡り、対応するテンプレート実体を起動する。各 work-group 数は `N / C`、work-group のサイズは `THREADS`（256）である（`engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:39-40,1203-1206,1212-1245`）。
 
-選ばれた列数 `C` に対し、up kernel の work-group 数は `N / C`（`N=2560`）です。4、8、16、32、64 列ではそれぞれ 640、320、160、80、40 work-group になります。kernel は `gr_up_multi_kernel<C>` として起動されます。`gr_large_grf()` が有効な起動では 256-register GRF の variant が選ばれ、通常は `STRATA_GR_UP_ILP=1` による ILP variant または通常 variant が選ばれます。いずれも `COLS` の選択自体は共通です。
+既定の 16 は `UPM_COLS` として定義されている。multi-read の通常 up 分岐でだけ環境値を使い、`gr_large_grf()` が真の場合は同じ列数のカーネルに large-GRF properties を付ける。`STRATA_GR_UP_ILP` は別の分岐で ILP 版を選ぶが、列数の判定自体は共通である（同 `:853-856,1208-1237,3485-3493`）。
 
-この環境変数専用のログ、警告、エラー出力は実装にありません。無効値は警告なしで 16 列になります。
+## ログと測定値
 
-根拠: `sycl/src/kernels/cuda/fused_gr.dp.cpp:840-874,1770-1790,2038-2044`。
+この変数の読み取り・fallback・採用を知らせるログはない。値が許可リスト外でも警告せず 16 を使う。カーネル起動時の SYCL エラー処理はキュー/ランタイム側に依存し、この環境変数専用のエラー経路は実装されていない（`engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:1203-1206,1239-1245,3492-3500`）。
+
+ソースコメントには Xe2 / B70 の latency-bound の観察と、列数 8 / 4 で 320 / 640 work-group になる旨が記されているが、測定条件一式や再現手順は同箇所に示されていないため、性能値としては記載しない（同 `:1200-1205`）。
 
 ## 根拠
 
-- `sycl/src/kernels/cuda/fused_gr.dp.cpp:840-843` — 環境変数の読み取り、`atoi`、許容値と fallback。
-- `sycl/src/kernels/cuda/fused_gr.dp.cpp:849-874` — 列幅ごとの kernel 起動と work-group 数。
-- `sycl/src/kernels/cuda/fused_gr.dp.cpp:1770-1824,1881-1919` — multi-token 経路、別の v3 経路による早期 return。
-- `sycl/src/kernels/cuda/fused_gr.dp.cpp:2038-2044` — `STRATA_GR_MORE_GROUPS` が有効な場合の別 kernel dispatch。
-- `sycl/src/kernels/cuda/fused_gr.dp.cpp:2061-2084` — 単一 token の直接経路と multi-token への委譲。
+- `engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:853-856,1200-1206` — 既定列数、変換、許可値、fallback。
+- `engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:1212-1245` — 列数別のカーネル起動。
+- `engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3168-3202,3289-3297,3465-3500` — multi-read の early return と up 側の分岐。
+- `engine/sycl/src/kernels/cuda/fused_gr.dp.cpp:3522-3559` — 単一 read から multi-read への委譲条件と専用経路。
+- `engine/sycl/CMakeLists.txt:1-10,21-25` — SYCL エンジンが独立したビルドであること。

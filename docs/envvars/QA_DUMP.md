@@ -1,48 +1,41 @@
 # `QA_DUMP`
 
-調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`qsa_prompt_attn_parity` 診断プログラムが、Strata エンジンの `STRATA_QSA_DUMP` 出力から QSA の選択セルを読み込むための入力ファイル名です。読み込んだ選択について、隣接 query 間で重複する KV cell 数を集計して標準出力に表示します。Strata エンジン本体は `QA_DUMP` を参照しません。
+`QA_DUMP` は、合成入力で prompt attention を比較・計測する `qsa_prompt_attn_parity` に、Strata の prefill が記録した QSA 選択セルを読み込ませる診断用フックです。ファイル中の選択 ID でベンチマーク側の合成選択を置き換え、隣接 query 間で重なるセル数を出力します。通常の `strata` エンジンやサーバーの選択処理を切り替える環境変数ではありません。CUDA、HIP、SYCL の parity 実装に読み取り箇所があります（`engine/src/kernels/qsa_prompt_attn_parity.cpp:151-182`, `engine/sycl/src/kernels/qsa_prompt_attn_parity.cpp:202-233`）。
 
 ## 値と判定
 
-| 状態 | 動作 |
-|---|---|
-| 未設定 | ファイルを開かず、この追加の overlap 集計を行わない。 |
-| 空文字を含む設定値 | `getenv()` は非 null なので `fopen("", "rb")` を試す。開けなければ stderr に `QA_DUMP: cannot open` を出して終了コード 2 で終了する。 |
-| パスが設定され、ファイルを開ける | バイナリ形式として走査し、実行引数から得た query 数・context 長・選択幅に合う選択記録を読み込む。 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA / HIP parity 実行ファイル、SYCL parity 実行ファイル | 読み込みを行わず、合成生成した選択 ID を使う | `getenv("QA_DUMP")` が非 `nullptr` なら値全体を `fopen(path, "rb")` のパスに渡す。`/tmp/qsa.bin` など、読み取り可能なファイルを開けるパス | 空文字も「設定あり」と判定されるが、空のパスを開けず `QA_DUMP: cannot open` で終了コード 2。存在しない・読めないパスも同じ。値を真偽値・数値・先頭文字として解析しない |
 
-値は文字列のまま `fopen` に渡されます。数値変換、空白除去、大小文字判定、既定パスはありません。相対パスはプロセスの作業ディレクトリ基準です。
-
-同じプログラムで、読み込む QSA layer は別変数 `QA_LAYER` で選びます。`QA_LAYER` が未設定なら 3、設定されていれば `atoi` の結果です。`atoi` のため、先頭の空白と符号は受け付け、数値として解釈できない先頭部分は 0 になり、数値以降の文字列は無視されます。空文字も 0 です。
+開いたファイルは、4 個の `int32`（layer, `pos0`, query 数 `T`, `cap`）と `T*cap` 個の `int32` 選択 ID が連なる形式として走査されます。`QA_LAYER` が未設定なら layer `3`、設定されていれば `std::atoi` の結果を使います。従って `QA_LAYER=""` や非数値文字列は `0`、`"3tail"` は `3` になり、文字列全体の妥当性検査はありません。ファイル内のレコードは layer、`T == nq`、`pos0 + T == ctx`、`cap` がすべて一致する必要があります。条件に合う複数レコードがあれば最後のものを選びます（`engine/src/kernels/qsa_prompt_attn_parity.cpp:153-167`, `engine/sycl/src/kernels/qsa_prompt_attn_parity.cpp:204-218`）。
 
 ## 有効になる条件
 
-- CUDA ビルドでは `STRATA_BUILD_TESTS` が有効、または `STRATA_PARITY_PROMPT_ATTN=ON` の場合に `qsa_prompt_attn_parity` がビルドされます。実行ファイルは合成入力で prompt attention を比較・計測する診断用で、通常の `strata` 実行経路ではありません。
-- SYCL 側にも同名ソース由来の parity 実行ファイルがあります。SYCL CMake では `STRATA_SYCL_PARITY=ON`（既定）の構成でビルドされますが、テストとしては登録されません。
-- CUDA と SYCL の両ソースで読み取り条件は同じです。GPU 世代などによる `QA_DUMP` の parse 差はありません。
-- エンジン側の `STRATA_QSA_DUMP` が記録した値を読む設計です。記録ヘッダーの layer、query 数 `T`、`pos0 + T` と context 長、selection capacity の各値が実行中の診断プログラムと一致する記録を探します。最後に見つかった一致記録の cell 配列を使います。
+- 対象の parity バイナリがビルドされ、実行される必要があります。CUDA ターゲットは `STRATA_ENABLE_CUDA` と `STRATA_BUILD_TESTS` または `STRATA_PARITY_PROMPT_ATTN` が条件です（`engine/cmake/strata_gpu_engine.cmake:137-143`）。SYCL は `qsa_prompt_attn_parity` ターゲットとして登録されます（`engine/sycl/CMakeLists.txt:583-588`）。HIP は HIP 構成中の `hip_prompt_attn_wmma` として登録されます（`engine/cmake/strata_gpu_engine.cmake:586-588,702-710`）。
+- CLI の `context` と `queries`（既定値 32768 / 2048）はそれぞれ `ctx` と `nq` となり、ファイルのレコード一致条件に使われます。`QA_DUMP` はこれらの CLI 値を変更しません。parity の各 `run()` 呼び出しで照合するため、複数の context/query 組を連続実行する呼び出しでは、それぞれに一致するレコードが必要です（`engine/src/kernels/qsa_prompt_attn_parity.cpp:474-492`）。
+- `QA_LAYER` で対象 layer を選べます。未設定時は 3 です。ファイルを開けても一致するレコードがなければ `QA_DUMP: no record for layer %d, T %lld, ctx %lld` を stderr に出して終了コード 2 になります。
+- `QA_SAME`（CUDA/HIP）や `QA_SAME` / `QA_BLOCK4`（SYCL）が先に合成選択 ID を作っても、ダンプ読み込みが成功すると ID 配列を読み込んだ値で上書きします。一方、query ごとの選択幅を持つ `steps` は合成入力から作られたままです（`engine/src/kernels/qsa_prompt_attn_parity.cpp:95-106,128-149,151-167`; `engine/sycl/src/kernels/qsa_prompt_attn_parity.cpp:129-145,179-200,202-218`）。
+- Strata の通常エンジンやサーバーモードが `QA_DUMP` を読む箇所はありません。エンジン側がファイルを作る設定名は別の `STRATA_QSA_DUMP` です（CUDA: `engine/src/prefill/prefill.cpp:5507-5529`; SYCL: `engine/sycl/src/prefill/prefill.cpp:3820-3843`）。
 
 ## 実行時の詳細
 
-`QA_DUMP` は `run()` の合成 selection を作った後に一度読み取られます。処理は次のとおりです。
+環境変数は関数内 static に保存されず、`run()` ごとに `getenv` されます。値の取得後、バイナリファイルを先頭から読み、各レコードの header を照合して payload を seek で飛ばします。一致レコードの選択 ID を `ids` に読み込み、GPU 計算へ渡す配列に反映します。query 幅の `steps`、query、K/V pool などは parity プログラムが生成したままで、ダンプが差し替えるのは選択 ID です（`engine/src/kernels/qsa_prompt_attn_parity.cpp:95-106,151-182,184-202`; SYCL: `engine/sycl/src/kernels/qsa_prompt_attn_parity.cpp:129-145,202-233,235-252`）。
 
-1. ファイルを `rb` で開き、4 個の `int32`（layer、開始位置 `pos0`、query 数 `T`、capacity）のヘッダーを順に読む。
-2. `QA_LAYER`（未設定時 3）、実行引数の query 数 `nq`、context `ctx`、selection capacity `cap` が一致し、さらに `pos0 + T == ctx` となる記録を候補にする。
-3. 記録の `T * cap` 個の `int32` cell ID を `ids` に読み込む。複数一致した場合、最後に走査された一致記録が使われる。
-4. 2、4、8、16 query のグループについて重複を集計し、`QA_DUMP overlap: ...` を stdout に表示する。
+未設定、ファイルを開けない場合、一致レコードがない場合の各回の扱いは上記の通りです。一致 header はあるが ID payload を所定数読めない場合も終了コード 2 ですが、この経路には専用のエラーメッセージがありません（CUDA: `engine/src/kernels/qsa_prompt_attn_parity.cpp:155-166`; SYCL: `engine/sycl/src/kernels/qsa_prompt_attn_parity.cpp:206-217`）。
 
-ファイルを開けない場合は `QA_DUMP: cannot open`、条件に合う記録がない場合は `QA_DUMP: no record for layer ...` を stderr に出して終了コード 2 になります。記録後半の cell 配列を完全に読めない場合もコード 2 で終了しますが、その経路には追加メッセージがありません。
+## ログと測定値
 
-記録形式はエンジン側で `STRATA_QSA_DUMP` が追記する `{layer, pos0, T, cap}` と `T*cap` 個の cell ID です。エンジン側で `STRATA_QSA_DUMP_STEPS` も有効にすると各記録に step 配列も続きますが、この parity reader はその配列分を読み飛ばさず、次のヘッダーとして解釈します。そのため、steps 付きの記録が続くファイルでは後続記録の走査が崩れます。単独の一致記録が先頭にある場合は、記録の cell ID を読む位置自体は一致します。
+開けない場合は stderr に `QA_DUMP: cannot open`、一致レコードがない場合は stderr に `QA_DUMP: no record for layer %d, T %lld, ctx %lld` を出し、どちらも `exit(2)` します。成功すると `grp` が 2、4、8、16 の各場合について、選択 ID の隣接 query グループで重複を除いたセル数を計算し、stdout に `QA_DUMP overlap: %d-query groups read %.2fx the cells of one query (%.1f%% of %d x)` を出します。これは parity プログラムが選択配列から計算する値です（CUDA: `engine/src/kernels/qsa_prompt_attn_parity.cpp:168-182`; SYCL: `engine/sycl/src/kernels/qsa_prompt_attn_parity.cpp:219-233`）。該当する Strata 資料に、この環境変数による性能測定値はありません。
 
 ## 根拠
 
-- `src/kernels/qsa_prompt_attn_parity.cpp:1-11,151-182` — 診断実行ファイルの目的、合成入力での実行、`QA_DUMP`/`QA_LAYER` の読み取り、ファイル走査、集計、エラー処理。
-- `sycl/src/kernels/qsa_prompt_attn_parity.cpp:176-207` — SYCL 版の同等処理。
-- `CMakeLists.txt:444-450` — CUDA parity 実行ファイルのビルド条件。
-- `sycl/CMakeLists.txt:278-281,376-380` — `STRATA_SYCL_PARITY` の有効範囲と、SYCL parity 実行ファイルの登録（ビルドされるがテスト登録はしない旨のコメント）。
-- `src/prefill/prefill.cpp:3472-3495` — エンジン側 `STRATA_QSA_DUMP` の追記形式と、任意の steps 配列。
-- `rg -n 'QA_DUMP'` による対象 HEAD の全体検索では、実装参照は CUDA/SYCL parity ソースのみです。
+- CUDA / HIP 読み取り、レコード選択、失敗経路、重複率出力: `engine/src/kernels/qsa_prompt_attn_parity.cpp:151-182`
+- SYCL 読み取り、レコード選択、失敗経路、重複率出力: `engine/sycl/src/kernels/qsa_prompt_attn_parity.cpp:202-233`
+- parity CLI の context/query と反復経路: `engine/src/kernels/qsa_prompt_attn_parity.cpp:474-492`; SYCL: `engine/sycl/src/kernels/qsa_prompt_attn_parity.cpp:474-493`
+- 入力 dump の header / selection payload を書く処理: `engine/src/prefill/prefill.cpp:5507-5529`; SYCL: `engine/sycl/src/prefill/prefill.cpp:3820-3843`
+- parity ターゲットのビルド条件: `engine/cmake/strata_gpu_engine.cmake:137-143,586-588,702-710`; SYCL: `engine/sycl/CMakeLists.txt:583-588`

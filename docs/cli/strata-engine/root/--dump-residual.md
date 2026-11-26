@@ -1,58 +1,55 @@
 # `--dump-residual`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（エンジン引数、root scope） |
+| コマンド | `strata`（推論エンジンの root 引数） |
 | オプション | `--dump-residual` |
 | 別名 | なし |
-| 値 | `PATH`。保存先ファイルのパス文字列 |
+| 値 | 必須の出力パス（`PATH`） |
 
 ## 役割
 
-生成処理の最後に保持している residual `R` をファイルに保存します。ヘッド処理と各層の値を比較して問題箇所を調べる用途です。通常の生成結果に加えて診断データを出力します。ヘルプには「final R (`hc x n_embd`, f32)」と記載されています（`src/program/generate.cpp:881-884`）。
+通常の生成実行の終了時に、GPU 上の最終 residual `R` をホストへ読み戻し、head と各層の計算を切り分ける調査用データとして保存する。CUDA/HIP 系 parser と SYCL 系 parser の両方に同じオプションがある。索引上は `strata-engine/root` のスコープである。
 
 ## 使い方
 
 ```sh
-strata --pack model.gguf --tokens 1,2,3 --dump-residual /tmp/residual.bin
+# トークン ID 1 個を入力し、実行後に residual を /tmp/final-r.bin へ保存
+strata --tokens 1 --dump-residual /tmp/final-r.bin
 ```
 
-`--pack` と `--tokens` は通常の生成に必要な入力の例です。保存先には、既存ファイルを誤って切り詰めない新しいパスを指定してください。
+`--tokens` は通常実行で必要な入力であり、`--dump-residual` 自身は出力パスを受け取る。ソースの usage 表示は `strata generate ...` と記す一方、確認した parser は `argv[1]` からオプションを読むため、ここでは parser が受理する root 引数の形を例示した。エンジンの呼び出しラッパーが `generate` を付加するかどうかは、この調査範囲では確認していない（`engine/src/program/generate.cpp:1208-1214,3842-3852`）。
 
 ## 値と既定値
 
-- `PATH` は次の argv 要素をそのまま受け取り、`std::string` に格納します。数値・拡張子・パスの存在確認といったオプション固有の検証はありません（`src/program/generate.cpp:2416-2420,2468`）。
-- 省略時は空文字列のままなので出力しません（`src/program/generate.cpp:489,16901`）。空文字列を明示した場合も同じです。
-- オプションを複数回指定すると、各値が同じ変数に代入され、最後の値が使われます（`src/program/generate.cpp:2468`）。
-- 値を省略すると `--dump-residual needs a value` を標準エラーに出して終了コード 2 で終了します。値の取得処理は次の argv 要素を無条件に消費するため、`--stats` などオプションらしい文字列も値として扱われます（`src/program/generate.cpp:2418-2420`）。
+- `PATH` は必須。省略すると共通の値取得処理が `--dump-residual needs a value` を標準エラーへ出して終了コード `2` で終了する（`engine/src/program/generate.cpp:3844-3846`）。
+- 既定値は空文字列で、指定しなければダンプしない（`engine/src/program/generate.cpp:827,25437-25438`）。空文字列を明示した場合も同じ条件で出力処理をスキップする。
+- パス文字列自体の形式検証はない。重複指定は拒否されず、parser の単純代入により最後の指定値が使われる（`engine/src/program/generate.cpp:3894`）。
 
 ## 実行時の動作
 
-通常の生成処理と出力統計の後、値が空でなければ `ss.R` を GPU からホストメモリへコピーし、保存します。これは位置ごとの履歴ではなく、その処理時点の `R` 一つです（`src/program/generate.cpp:16867-16915`）。
+生成処理の後、`ss.R` の `hc * n_embd` 個の `float` をデバイスからホストへコピーし、指定パスを `fopen(..., "wb")` で開く。ファイルには先頭に `int32_t` 2 個（`hc`, `n_embd`）を続けて書き、その後に residual の `float` 配列を続ける。コード上の形状は `hc x n_embd` で、データ長はヘッダー 8 バイトと `hc * n_embd` 個の float 分である。ファイルはバイナリモードで開かれ、同名ファイルがあれば切り詰めて上書きする（`engine/src/program/generate.cpp:25436-25451`）。
 
-ファイルはバイナリモード `wb` で開かれます。先頭に `int32_t` 2 個（`hc`, `n_embd`）を書き、その後に `hc * n_embd` 個の `float` を続けます。ヘッダーと float 配列は C++ の `fwrite` でそのまま書き出されるため、この実装は別のバイト順や数値表現への変換を行いません（`src/program/generate.cpp:16902-16915`）。
+この出力ブロックは通常生成経路の後処理にある。サーバー経路は要求処理ループ後に先に `return 0` するため、このオプションによるダンプはサーバー要求ごとには行われない（`engine/src/program/generate.cpp:23958-23972`）。
 
 ## 適用条件と副作用
 
-- 既存の通常エンジン引数 parser が対象です。Qwen3.6 系のモデルは、モデルヘッダー判定後に専用 `qwen35::run` へ振り分けられる場合があります。その経路は通常 parser を通りません（`src/program/generate.cpp:2393-2408`）。Qwen 専用 parser でこのオプションが利用できるかは、本書の root scope では確認していません。索引も Qwen 専用 parser を別 scope にしています（`docs/cli/README.md:1128-1134,1318-1322`）。
-- 指定先がすでに存在すれば、`fopen(..., "wb")` により内容を切り詰めて上書きします。親ディレクトリの作成は行いません（`src/program/generate.cpp:16907-16910`）。
-- オプションは生成後に GPU から `R` を読み戻してファイルへ書くため、生成処理に加えて readback とファイル I/O が発生します（`src/program/generate.cpp:16901-16915`）。
-- 索引上の対象は `src/program/generate.cpp` の通常エンジン parser です。実験的な SYCL build にも同名の parser と出力処理がありますが、別の実装です（`sycl/src/program/generate.cpp:472,810-813,1809,13005-13031`）。本書ではその build の実行確認はしていません。
+- CUDA/HIP 系では CUDA のデバイス間コピー、SYCL 系では SYCL の in-order queue でのコピーを待ってから書き出す。各実装の parser・出力処理はそれぞれ `engine/src/program/generate.cpp:1285,3894,25437-25459` と `engine/sycl/src/program/generate.cpp:873,1933,14417-14443` にある。
+- 出力先の既存ファイルは上書きされる。値にディレクトリだけを指定した場合など、開けないパスでは失敗する。
+- ファイル形式はソースが `int32_t` と `float` をそのまま書き込むところまで確認した。バイト順や float 表現を別環境間で交換するための規約は、このソース箇所からは確認できない。
 
 ## 出力とエラー
 
-- GPU から `R` を読み戻せない場合、標準エラーに `strata generate: reading R back failed` を出し、終了コード 1 で終了します（`src/program/generate.cpp:16902-16905`）。
-- ファイルを開けない場合、標準エラーに `strata generate: cannot write <PATH>` を出し、終了コード 1 で終了します（`src/program/generate.cpp:16907-16910`）。
-- 書き込み後は標準出力に保存先、行列寸法、nonfinite 数、`mean|.|`、`max|.|` を表示します（`src/program/generate.cpp:16916-16923`）。
-- `fwrite` と `fclose` の戻り値は検査されていません。そのため、ディスク不足などによる書き込み失敗があっても、この処理自身がエラーとして検出する保証はありません（`src/program/generate.cpp:16912-16915`）。
+- コピー失敗時は `strata generate: reading R back failed` を標準エラーに出して終了コード `1` を返す。出力先を開けない場合は `strata generate: cannot write <PATH>` を出して `1` を返す（CUDA/HIP: `engine/src/program/generate.cpp:25439-25446`、SYCL: `engine/sycl/src/program/generate.cpp:14420-14430`）。
+- 成功時は標準出力に出力パス、形状、非有限値数、平均絶対値、最大絶対値を表示する（CUDA/HIP: `engine/src/program/generate.cpp:25452-25459`、SYCL: `engine/sycl/src/program/generate.cpp:14436-14443`）。
+- `fwrite` と `fclose` の戻り値はこのブロックで検査されないため、書き込み後の遅延 I/O エラーを検出するかはソースから保証できない（同上）。
 
 ## 根拠
 
-- 索引の tool ID と root scope: `docs/cli/README.md:1128-1134,1162-1168`。
-- 標準 engine の値格納、ヘルプ、parser、値取得: `src/program/generate.cpp:489,881-884,2416-2420,2468`。
-- Qwen family の早期振り分け: `src/program/generate.cpp:2393-2408`。
-- `R` の読み戻し、ファイル形式、エラーと診断表示: `src/program/generate.cpp:16900-16923`。
-- 実験的 SYCL 実装での同名オプション: `sycl/src/program/generate.cpp:472,810-813,1809,13005-13031`。
+- `engine/src/program/generate.cpp:827,1285,3894` — CUDA/HIP 系の値保持、help 表示、parser。
+- `engine/src/program/generate.cpp:25436-25459` — residual の読み戻し、バイナリ形式、ファイル作成、成功表示。
+- `engine/src/program/generate.cpp:23958-23972` — サーバー経路の終了位置と通常生成後処理の開始。
+- `engine/sycl/src/program/generate.cpp:511,873,1933,14417-14443` — SYCL 系の値保持、help 表示、parser、読み戻しと書き出し。

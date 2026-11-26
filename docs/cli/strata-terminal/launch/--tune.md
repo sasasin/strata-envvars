@@ -1,6 +1,6 @@
 # `--tune`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout は `main...origin/main` で、`git status --short --branch` に未コミット変更は表示されませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,60 +12,58 @@
 
 ## 役割
 
-起動前にこの PC 上でエンジン設定を測定し、速い設定を選ぶモードを指定します。通常モデルでは `strata tune auto` を実行し、測定結果が改善または標準設定が最速と確認された場合、選択した構成に対応する tuning preset を保存します。DeepSeek-V4.1-Flash は専用 tuner を使います（`strata_cli/launch/runner.py:1265-1266,1282-1294,1325-1357`; `strata_cli/tune_commands.py:20-25,246-261`）。
+`strata launch` がモデルを準備して起動する前に、現在の PC でエンジン設定を測定して、より速い候補を探すモードを選びます。`quick` は短い探索、`thorough` は候補を広く測る探索、`skip` は測定を行いません。測定結果は Strata の tuning preset として保存され、適用可能な構成では後続の起動にも共有されます。`strata launch` 自体の通常のセットアップやサーバー起動を省略する指定ではありません。
 
 ## 使い方
 
 ```sh
-# 起動計画だけを表示する。測定・起動は実行しない
+# モデルを準備し、quick 測定の後にサーバーを起動して端末モニターを開く
+strata launch --model iq3_xxs --tune quick
+
+# thorough モードで測定してから起動する（時間は最大約2時間の見込み）
+strata launch --model iq3_xxs --tune thorough
+
+# 測定せずモデルを起動する（既定のモード）
+strata launch --model iq3_xxs --tune skip --no-tui
+
+# --plan と併用し、選択内容を確認する。測定も設定変更も行わない
 strata launch --model iq3_xxs --tune quick --plan
-
-# quick 測定後に起動する
-strata launch --model iq3_xxs --tune quick --no-tui
-
-# thorough で測定し、すでにある測定結果も再測定する
-strata launch --model iq3_xxs --tune thorough --retune --no-tui
 ```
 
 ## 値と既定値
 
-- 値は `quick`、`thorough`、`skip` のいずれかです。前後の空白を除いて小文字化してから照合するため、大文字表記も正規化されます。空値、値の欠落、候補外の値は `argparse` の usage error になります（`strata_cli/launch/cmd.py:37-45,111`; `strata_cli/launch/settings.py:26`）。
-- 新規 `LaunchSettings` の既定値は `skip` です。`--tune` を省略した場合、コマンドライン起動では測定しません。保存 preset を読み込んだ場合はその設定が基礎になり、明示した `--tune` が上書きします（`strata_cli/launch/settings.py:95`; `strata_cli/launch/cmd.py:197-203,248-250`）。
-- `quick` は通常 tuner の既定約20分、`thorough` は最長約2時間の測定モードです。これは tuner の時間予算であり、実際の所要時間を保証する値ではありません（`strata_cli/tune_commands.py:22-28`; `strata_control/autotune.py:50-76`）。
-- `--retune` を付けて `--tune` を省略した場合、`skip` は `quick` に補正されます。従って `--tune skip --retune` も実行時には quick になります（`strata_cli/launch/cmd.py:713-716`）。
+- 値は必須で、`quick`、`thorough`、`skip` のいずれかです。parser は前後の空白を除去して小文字化してから検証するため、大文字小文字は区別されません。無効な値は argparse の引数エラーとなり、選択肢を含むメッセージを出します（`terminal/strata_cli/launch/cmd.py:35-43,121`、選択肢は `terminal/strata_cli/launch/settings.py:29`）。
+- 省略時は `skip` です（`terminal/strata_cli/launch/settings.py:141`）。
+- `quick` は tuner の quick モード（約20分の予算）、`thorough` は thorough モード（最大約2時間、確認測定を含む）へ渡されます。これはソース上の予算・説明であり、実行時間の保証ではありません（`terminal/strata_cli/launch/runner.py:2395-2404`、`terminal/strata_cli/tune_commands.py:21-30`）。
+- `skip` は測定を行いません。`--retune` を併用して `--tune` を省略した場合だけ、launch parser 側で `quick` に切り替わります（[`--retune`](--retune.md)、`terminal/strata_cli/launch/cmd.py:874-877`）。
 
 ## 実行時の動作
 
-`strata launch` は設定・profile を準備した後、server 起動前に `Runner.tune()` を呼びます。`skip` は何もせず戻ります。通常のモデルでは `quick` / `thorough` を tuner の `--mode` に渡し、測定結果を JSON で受け取ります。`--tune-allow-small` が有効なら、追加で `--allow-small-differences` を渡します。これは通常 tuner で回答がわずかに変わる可能性のある候補設定も試す指定です（`strata_cli/launch/runner.py:1325-1361`; `strata_cli/tune_commands.py:27-35,193-197`）。
+指定値は `LaunchSettings.tune` に設定されます（`terminal/strata_cli/launch/cmd.py:274-275`）。`--plan` では選んだモードを計画表示に含めて終了し、測定に進みません（`terminal/strata_cli/launch/cmd.py:897-925`）。通常実行では、launch の engine・model・drafter の準備、実行設定の作成と保存を経てからチューニング段階に進みます（`terminal/strata_cli/launch/runner.py:3296-3338`）。
 
-測定に先立ち、同じ launch profile で自分が起動した server が稼働中なら停止し、測定後は選ばれた設定で起動し直します。別の実行を停止するものではないと Runner の説明にあります。通常 tuner は `improved` または `default_confirmed` の結果を保存対象とし、起動側は保存された preset ID と測定日を設定に反映します（`strata_cli/launch/runner.py:1350-1361,1390-1415`; `strata_cli/tune_commands.py:246-253`; `strata_cli/launch/runner.py:2034-2043`）。
+`quick` と `thorough` は `strata tune auto <launch-profile> --mode ... --output json` の子プロセスを起動します。`--tune-allow-small` が指定されているときは、さらに tuner の `--allow-small-differences` として渡されます。候補の探索・測定は tuner が担当し、成功した改善または既定設定が最速と確認された場合は結果を preset として保存します（`terminal/strata_cli/launch/runner.py:2395-2407`、`terminal/strata_cli/tune_commands.py:37-39,383-410`）。
 
-`--retune` がない場合、preset に既存の tuning preset が見つかる、標準設定が以前最速と確認済み、または同じモデル・選択肢・PC に対する保存済み tuning が見つかると、再測定を省略します。`--retune` はこれらの再利用を迂回します。同じ設定・port で既に serving 中なら通常は測定に入らず既存 server を再利用しますが、`--retune` はこの再利用判定も迂回します（`strata_cli/launch/runner.py:1332-1349,1505-1521`）。
-
-DeepSeek-V4.1-Flash の複数ファイル経路では専用 tuner が呼ばれ、`quick` / `thorough` を渡します。`--tune-allow-small` は通常 tuner へ渡すフラグであり、この専用 tuner 呼び出しには渡されません（`strata_cli/launch/runner.py:1265-1269,1282-1294,1325-1331,1356-1359`）。
+再測定を明示しない場合、同じ launch preset に有効な tuning 結果があると測定を省略します。preset の tuning ID が見つかる場合、または標準設定が最速と記録済みの場合はその旨を表示します。preset を使わず同じモデルと選択で測った結果も再利用対象です。`--retune` はこれらの再利用判定を越えて測定します（`terminal/strata_cli/launch/runner.py:2378-2394,2466-2479`）。チューニング preset は起動設定に対する共有ストアで管理され、preset 側では機器・モデルの識別が変わった場合の非適用も扱います（`terminal/strata_control/presets.py:488-506`）。
 
 ## 適用条件と副作用
 
-- `--plan` は `Runner.plan()` を呼んで表示した後に終了する分岐です。計画表示では測定を開始しません（`strata_cli/launch/cmd.py:733-760`）。
-- 通常 tuner はエンジンを複数回起動して設定を比較します。quick/thorough の実時間は PC、モデル、候補数等に依存します。測定中は他の重いプログラムを閉じるよう案内します（`strata_control/autotune.py:341-350,379-430`; `strata_cli/launch/runner.py:1360-1361`）。
-- 通常 tuner の進捗用 JSON は launch ディレクトリ内の `<launch名>.tune.json` です。起動側は tuner 開始前に同名ファイルの削除を試み、tuner は進捗ごとに書き換えます。加えて tuner は試行履歴を記録し、改善または標準設定確認時には tuning preset を作成します（`strata_cli/launch/runner.py:1351-1359`; `strata_cli/tune_commands.py:149-155,240-253`）。
-- `--tune-allow-small` 単独では `--tune` の `skip` を変更しないため、測定を開始しません（`strata_cli/launch/cmd.py:248-251`; `strata_cli/launch/settings.py:95-96`）。
-- preset に対する `--tune` を含む起動フラグは、その起動用設定に反映されます。`--save-preset NAME` を併用すれば起動後の選択を launch preset に保存します。既存 preset を指定しただけでは、起動時に加えた変更はその preset に保存されません（`strata_cli/launch/cmd.py:197-203,788-792`）。
+- `skip` または Hy4-Flash / Inkling-2-Mini の launch では、この段階の tuner を呼びません。これら2系統は launch runner がチューニング対象外として処理します（`terminal/strata_cli/launch/runner.py:2373-2377`）。
+- tuner の計測にはエンジン実行と PC の計算資源を使います。測定前に同じ launch profile の既存サーバーが動作中なら停止し、測定後は launch がサーバーを起動します。他の profile のサーバーを止める必要が生じる場合もあります。停止できない場合は launch error（終了コード 6）となり、停止を促す案内を出します（`terminal/strata_cli/launch/runner.py:2443-2464`）。
+- launch 用の tuning 進捗 JSON は launch ディレクトリに作成・更新されます。開始前に同名ファイルの削除を試み、tuner 子プロセスの終了後に読み取ります（`terminal/strata_cli/launch/runner.py:2396-2401,2415-2421`）。tuner は実行記録・レポートを保存し、改善または標準設定の確認時には preset も保存します（`terminal/strata_cli/tune_commands.py:371-374,402-424`）。
+- `--tune-allow-small` は測定候補に答えがわずかに変わる可能性のある設定を加える別オプションです。併用しない場合は tuner の該当フラグを渡しません（[`--tune-allow-small`](--tune-allow-small.md)、`terminal/strata_cli/launch/runner.py:2401-2404`）。
+- `--tune` 単独ではモデル・構成を選ばないため、例のように `--model`、`--model-path`、`--preset` など起動対象を指定してください。コマンド例と「選択があるか」の判定は `terminal/strata_cli/launch/cmd.py:14-25,849-862` にあります。
 
-## 出力と失敗
+## 出力とエラー
 
-- `--plan` は人間向けまたは JSON で計画を出力して正常終了します。チューナーの測定結果は含みません（`strata_cli/launch/cmd.py:733-760`）。
-- 通常 tuner の結果は `faster`、`already fastest`、`busy PC`、`stopped`、`failed` などに整理されます。測定不能・PC が混雑して判定不能・tuner の失敗では標準設定で起動を続ける旨を出します。キャンセル時は設定を変更しない結果になります（`strata_cli/launch/runner.py:198-214,1386-1394`; `strata_control/autotune.py:341-350`）。
-- 同一 profile の稼働 server を測定のため停止できない場合、`LaunchError` として起動を拒否し、`strata launch --stop` 後の再試行を案内します（終了コード 6、`strata_cli/launch/runner.py:1398-1415`）。
-- 不正値は parser が拒否します。通常 tuner の結果・測定失敗と、launch parser / 起動処理自体のエラーは異なる経路です（`strata_cli/launch/cmd.py:37-45,111,2217-2231`; `strata_cli/launch/runner.py:1386-1394`）。
+launch はチューニングの進捗と結果をモニターまたは通常出力へ渡します。tuner が改善を検出したとき、標準設定がすでに最速のとき、測定が混雑のため不確定なとき、失敗・中止したときで結果文言を分けます。tuner が結果を返さない、または測定に失敗した場合、標準設定で launch を続行する旨を表示します。測定結果がないこと自体は launch の即時エラーにはせず、その後のモデル起動で問題があれば別途起動エラーになります（`terminal/strata_cli/launch/runner.py:229-249,2423-2439,3333-3343`）。
+
+`tune auto` 自体の target 読み込み、未導入 engine、対象外モデルなどの失敗は JSON または stderr にエラーを出し、終了コードを返します。launch runner は子プロセスの終了コードと JSON 結果から結果表示を組み立て、通常は tuner が失敗しても標準設定で後続の起動へ進みます（`terminal/strata_cli/tune_commands.py:109-114,309-345,421-425`、`terminal/strata_cli/launch/runner.py:2423-2439`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:37-45,75-82,111-112` — parser、値変換、help。
-- `strata_cli/launch/settings.py:26,95-112` — 値候補、設定既定値、tuned 状態。
-- `strata_cli/launch/cmd.py:197-203,248-251,713-716,733-760,784-804` — preset と CLI 値の反映、`--retune` 補正、plan・起動分岐、preset 保存。
-- `strata_cli/launch/runner.py:1265-1269,1282-1323,1325-1415,1505-1521,2034-2043` — DeepSeek 専用経路、tuner 起動、再測定判定、server 停止・起動。
-- `strata_cli/tune_commands.py:20-46,174-197,217-261` — 通常 tuner の parser、測定設定、preset 保存、結果と終了コード。
-- `strata_control/autotune.py:50-76,341-350,379-430` — 測定モードの予算・反復数、tuner の実行。
-
-調査はこの checkout のソースと CLI parser に限定しました。実機での測定時間、各 PC 上で選ばれる設定、GPU ごとの実測性能は確認していません。
+- `terminal/strata_cli/launch/cmd.py:14-28,73-80,121-122` — `strata launch` の説明・例と parser 定義。
+- `terminal/strata_cli/launch/cmd.py:35-43,274-277,874-877` — 値の正規化・検証、設定への反映、`--retune` 時の既定変更。
+- `terminal/strata_cli/launch/settings.py:29,141-159` — 有効なモード、未指定時の値、tuning 済み状態。
+- `terminal/strata_cli/launch/runner.py:2373-2439,2443-2479` — 適用条件、既存結果の再利用、tuner 呼び出し、進捗・結果・停止処理。
+- `terminal/strata_cli/tune_commands.py:21-50,309-425` — tuner の mode parser、target/engine の検査、探索実行、preset・レポート保存、終了コード。
+- `terminal/strata_control/presets.py:488-506` — 保存済み tuning preset の構成への適用条件。

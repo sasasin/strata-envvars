@@ -1,46 +1,48 @@
 # `STRATA_AUX_STAGER`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-prefill の `Stager` が作るホスト側コピー用スレッドを、Linux の `--aux-cpus`（`STRATA_AUX_CPUS`）による補助 CPU 配置の対象にするかを選びます。`STRATA_AUX_STAGER` が `atoi` で 0 と判定されると、スレッドを補助 CPU 配置から除外します。それ以外の値または未設定では、通常の補助 CPU 配置処理に参加させます。
+GPU prefill の `Stager` が作る専門家データのコピー用スレッドを、`--aux-cpus` の補助 CPU 配置から除外するかを指定する。値の `atoi` 結果が 0 ならスレッドを `note_owned_thread()` に登録し、補助 CPU への移動対象にしない。それ以外なら `pin_current_thread()` を呼び、補助 CPU 配置が有効な場合に通常どおり配置する。スレッドの CPU 配置だけを変え、コピー内容や生成結果を変える処理はない（`engine/src/prefill/prefill.cpp:1121-1125,1173-1182`; `engine/include/strata/platform/aux_cpus.hpp:243-263`）。
 
-この変数は Stager のコピー処理やコピー対象を有効・無効にするものではなく、スレッド配置だけを変えます。Stager は prefill の初期化時に作られ、ストリーミング経路では主に pin できなかった expert のホスト側コピーを担当します。
+この環境変数は `STRATA_AUX_CPUS` / `--aux-cpus` の配置機能が対象のときに意味を持つ。Metal の `Prefill::init` 経路は Metal 実装へ戻り、この CUDA/HIP `Stager` を通らない（`engine/src/prefill/prefill.cpp:2448-2456`）。
 
 ## 値と判定
 
-スレッド開始時、lambda 内の `static const bool` 初期化で一度 `getenv()` し、`std::atoi(v) == 0` を判定します。`atoi` は文字列全体の厳密な検証をせず、先頭の空白と符号の後の10進数部分を読み、数字の後ろの文字を無視します。数字が始まらない文字列は 0 になります。
+コピー用スレッドの作成時に `std::getenv` で値を読み、`std::atoi(v) == 0` を判定する。未設定は `keep=false`。空文字や数値に変換できない文字列は `atoi` が 0 を返すため `keep=true` になる。文字列全体の妥当性検査はなく、数値の後ろの文字も検査しない（`engine/src/prefill/prefill.cpp:1178`）。
 
-| 値 | `keep` | Stager スレッドの処理 |
-|---|---:|---|
-| 未設定 | false | `pin_current_thread()` を呼ぶ |
-| `0`, `00`, `0tail` | true | `note_owned_thread()` を呼び、補助 CPU の sweep 対象から除外 |
-| 空文字、`abc`, `  ` | true | `atoi` が 0 を返すため、補助 CPU の sweep 対象から除外 |
-| `1`, `-1`, `2tail` | false | `pin_current_thread()` を呼ぶ |
+| 条件 | unset | 有効になる値（スレッドを補助 CPU 配置から除外） | 無効になる値（通常配置経路） |
+|---|---|---|---|
+| `Stager` がコピー用スレッドを作成 | `keep=false` | `0`, `00`, `-0`, 空文字, `abc`, `0anything`（`atoi` 結果が 0） | `1`, `-1`, `1abc`（`atoi` 結果が非 0） |
 
-数値として 0 以外に変換される値はすべて `keep=false` です。整数型の範囲を超える文字列については `atoi` の結果に依存するため、確定した判定値は示せません。
+空白や符号、数値の後続文字は `atoi` の変換規則に従い、文字列全体の検証や大文字小文字の扱いはない。整数の変換範囲外の入力については `atoi` の規定外動作となるため、コードから有効値として保証されない。値による警告や fallback はない（`engine/src/prefill/prefill.cpp:1178-1181`）。
 
 ## 有効になる条件
 
-- `src/prefill/prefill.cpp` の Stager が作られる GPU prefill 経路で評価されます。Stager のスレッドは `Stager::init()` 内で作られます。
-- Linux では `strata::aux_cpus` が実装されています。補助 CPU 配置が有効なとき、既定動作（未設定または非ゼロ値）は `pin_current_thread()` によりスレッドを補助 CPU 集合へ移します。補助 CPU 配置が無効ならこの関数は何もしません。
-- `STRATA_AUX_STAGER=0` 相当の場合は `note_owned_thread()` がスレッド ID を owned として記録します。後でリクエスト単位で補助 CPU 配置を有効にして sweep しても、そのスレッドは移動対象になりません。
-- Linux 以外では `aux_cpus.hpp` の同名関数が空実装なので、この環境変数を読んでもスレッド配置上の効果はありません。
+- CUDA/HIP prefill の `Stager` が初期化され、コピー用スレッドが作られる必要がある。Metal 経路ではこの `Stager` を使用しない（`engine/src/prefill/prefill.cpp:2448-2456,2518-2525,2554`）。
+- `STRATA_AUX_STAGER=0` 相当でそのスレッドが補助 CPU への移動対象から除外される効果は、Linux の `strata::aux_cpus` 実装で補助 CPU 配置が使われる場合に限られる。Linux 以外では関連関数が no-op（何もしない）実装（`engine/include/strata/platform/aux_cpus.hpp:151,243-263,407-424`）。
+- Linux でも `--aux-cpus` / `STRATA_AUX_CPUS` の配置が無効なら `pin_current_thread()` は何も移動しない。補助 CPU 計画が空の場合も配置は有効にならない（`engine/include/strata/platform/aux_cpus.hpp:243-263,375-404`）。
+- `STRATA_AUX_STAGER` は `--aux-cpus` の値を上書きしない。前者は stager コピー用スレッドの登録方法、後者は補助 CPU 配置自体の計画を決める（`engine/src/program/generate.cpp:4715-4724`; `engine/src/prefill/prefill.cpp:1175-1181`）。
 
 ## 実行時の詳細
 
-Stager の各スレッドは生成直後に `keep` を確認し、真なら `note_owned_thread()`、偽なら `pin_current_thread()` を呼んでから `work()` に入ります。`keep` は関数内 static として共有されるため、プロセス内で最初の Stager スレッドが評価した値が以降も使われます。実行中に環境変数を変更しても再評価されません。別プロセスではそれぞれ最初の評価時の環境値が使われます。
+環境変数を読むのは `Stager::init` が作るスレッドのラムダ内である。関数スコープの `static const bool keep` はプロセス内で一度だけ初期化され、最初に実行されたスレッドが読んだ結果を後続のスレッドも共有する。そのため、最初の stager スレッドがこの式を評価した後にプロセス環境を変えても反映されない（`engine/src/prefill/prefill.cpp:1173-1182`）。
 
-補助 CPU 配置の `auto` は、補助スレッド用 CPU 集合を計画し、pool worker と host thread の CPU を避けます。通常動作では Stager スレッドもこの配置に参加します。一方 `STRATA_AUX_STAGER=0` にすると owned として扱われ、補助 CPU へ移されず、作成時に継承した配置に残ります。`docs/DETAILS.md` は、1つの spare CPU に最大32個の Stager スレッドを置くと、長い prompt の読み込みを遅くする場合があると説明しています。これは文書中の注意であり、この調査で性能を測定したものではありません。
+`keep=true` のときは `note_owned_thread()` に登録する。Linux の補助 CPU `sweep()` は登録済みスレッドを除外するため、要求ごとに補助 CPU 配置を有効化する経路でも移動対象にならない。`keep=false` のときは `pin_current_thread()` を呼び、補助 CPU 配置が有効なら計画された CPU 群へ移す。有効化時の sweep はエンジンが所有しない既存スレッドにも適用される（`engine/include/strata/platform/aux_cpus.hpp:237-263,276-289`; `engine/src/program/generate.cpp:21431-21439`）。
 
-この変数が出す専用ログやエラーは見つかりませんでした。一般の補助 CPU 設定に関する起動ログは `aux_cpus.hpp` 側で生成されます。
+stager 自体は `Prefill::init` の一度きりの初期化ブロックで生成される。対象のコピー用スレッド数は別途 `STRATA_STAGER_THREADS` や入力ソース種別から決まるが、それらの値が `STRATA_AUX_STAGER` の判定を上書きすることはない（`engine/src/prefill/prefill.cpp:2518-2526,2537-2555`）。
+
+## ログと測定値
+
+この変数を読んだこと、有効/無効になったこと、または変換不能だったことを示す個別ログはない（`engine/src/prefill/prefill.cpp:1173-1182`）。補助 CPU 全体の配置状態は `strata aux cpus: ...` の起動行に出るが、その行は `STRATA_AUX_STAGER` の値や個々の stager スレッドの除外状態を報告しない（`engine/include/strata/platform/aux_cpus.hpp:378-404`）。
+
+`docs/DETAILS.md` は `STRATA_AUX_STAGER=0` が prefill copy threads を作成時の場所に残すと説明しており、実装の登録・配置分岐と一致する。同資料および関連ベンチマークにある中立という測定記録は特定構成での記録であり、この環境変数の一般的な性能効果を示すものとしては記載しない（`docs/DETAILS.md:1433-1447`; `docs/bench-results/2026-10-08-community-2x-rtx3080-20gb-ud-q4-k-xl-512k-pool/README.md:341`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:434-461`: Stager 初期化でスレッドを生成し、`STRATA_AUX_STAGER` を `std::atoi(v) == 0` で判定して配置関数を選択。
-- `src/prefill/prefill.cpp:1091-1128`: prefill 初期化時に Stager を作成・初期化。
-- `src/prefill/prefill.cpp:2316-2366,2375-2382`: ストリーミング時に Stager へ unpinned expert のコピー job を渡し、完了したホストバッファを GPU 転送に使う。
-- `include/strata/platform/aux_cpus.hpp:18-19,234-260,274-285,344-357`: Linux 限定の配置機能、owned 登録、pin の挙動、非 Linux の空実装。
-- `docs/DETAILS.md:1708-1726`: `--aux-cpus` の対象と `STRATA_AUX_STAGER=0` の説明、および多数の Stager スレッドが spare CPU を共有する場合の注意。
-- `CMakeLists.txt:582-603`: `src/prefill/prefill.cpp` を `strata_prefill` に含め、`strata` 実行ファイルにリンクする構成。
+- `engine/src/prefill/prefill.cpp:1121-1125,1173-1182` — Stager の役割、スレッド生成、値の読み取りと分岐。
+- `engine/src/prefill/prefill.cpp:2448-2456,2518-2526,2537-2555` — Metal 経路との差、stager の初期化とスレッド数。
+- `engine/include/strata/platform/aux_cpus.hpp:237-263,276-289,375-424` — 所有スレッド登録、配置、Linux 以外の no-op 実装。
+- `engine/src/program/generate.cpp:4715-4724,21431-21439` — `STRATA_AUX_CPUS` の起動時設定と要求単位の配置制御。
+- `docs/DETAILS.md:1433-1447` — 補助 CPU の説明。

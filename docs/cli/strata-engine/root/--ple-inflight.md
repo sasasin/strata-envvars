@@ -1,62 +1,63 @@
-# `--ple-inflight`
+# `strata --ple-inflight`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（`strata generate` 引数 parser） |
+| コマンド | `strata`（エンジン引数） |
 | オプション | `--ple-inflight` |
 | 別名 | なし |
-| 値 | 整数 `N`。有効範囲は 1〜1024 |
+| 値 | 整数 `N`、1〜1024 |
 
 ## 役割
 
-PLE n-gram テーブルを `direct` I/O で読むときに、同時に処理できる読み込み数を設定します。PLE 読み込みの I/O slot 数を制御し、未指定時は 256 です。`--ple-io mmap` または `--ple-io ram` では direct reader を開かないため、この値は読み込み処理に適用されません。
+PLE（per-layer token embedding）テーブルを direct I/O で読むとき、同時に保持できる SSD read の上限を指定します。PLE テーブルを使う推論で、テーブルの読み込み処理に渡されます。未指定時は256です。
 
 ## 使い方
 
 ```sh
-strata --pack ./pack --tokens "1,2,3" --ple-gguf ./model-00002-of-00002.gguf --ple-inflight 256
+strata --pack pack/full --tokens "1,2,3" --ple-gguf ple.gguf --ple-inflight 128
 ```
 
-`--ple-gguf` には PLE テーブルを含む GGUF shard を指定します。`--tokens` はこの例の生成実行に必要です。PLE テーブルを指定しない場合も option の値は解析・検証されますが、reader の設定には使われません。
+この例では PLE テーブルの direct 読み込み枠を128件にします。実際のモデル、トークン、PLE ファイルのパスに置き換えてください。
 
 ## 値と既定値
 
-- 既定値は `256` です（`Options::ple_inflight`）。parser は次の引数を `std::atoi` で整数化します。
-- 値は `1..1024` に限られます。0、負数、非数値文字列（`atoi` が 0 を返す場合を含む）は共通 validation で拒否されます。整数の後ろに変換できない文字が続く値は `atoi` の変換規則に従い、厳密な文字列全体の整数検証は行いません。
-- 同じ option を複数回指定した場合、parser は指定のたびに同じフィールドへ代入するため、最後に解析された値が残ります。
-- option 名だけで値が続かない場合、parser の `next` が `--ple-inflight needs a value` を stderr に出し、終了コード 2 で終了します。
+- `N` は `1..1024` の範囲で指定します。既定値は256です。
+- parser は `std::atoi` で整数に変換し、後段で範囲を検査します。数値として読めない値は0となり拒否されます。`atoi` は厳密な文字列全体の検証をしないため、数値の後ろに文字が続く値は数値部分として解釈されます。
+- 同じオプションを複数回指定すると、引数走査中に値が上書きされ、最後に指定した値が使われます。
+- 値を省略すると parser は `<option> needs a value` を stderr に出して終了コード2で終了します。
 
 ## 実行時の動作
 
-有効値は PLE table open 時に `PleIoOptions::max_inflight` へ渡されます。`PleTable::open` は `direct` モードの場合に `PleReader::open` を呼び、その値で slot 数を設定します。reader は slot ごとに `2 * PAGE` の aligned read buffer を確保し、free slot がある間だけ queued job を `DirectFile` に submit するため、同時に保持する読み込み slot 数の上限になります（`src/program/generate.cpp:4033-4040`、`src/kernels/ngram.cpp:340-354`、`src/ngram/ple_reader.cpp:148-177,336-356`）。
+`--ple-inflight` の値は `PleIoOptions.max_inflight` に設定され、PLE テーブルの読み込み時に reader へ渡されます。reader はこの数の read slot を作り、direct 読み込みで同時に実行できる read 数を制限します。1 slot あたり2ページ分の aligned buffer を確保します。値を大きくすると同時 read の上限と buffer 枠が増えますが、速度向上は保証されません。
 
-`--ple-io mmap` と `--ple-io ram` は mapped table を使う経路で、`PleReader::open` を通りません。このため `--ple-inflight` の検証自体は行われますが、値は mmap/ram の読み込み数を変えません（`src/program/generate.cpp:3181-3184,4033-4040`、`src/kernels/ngram.cpp:340-356`）。
+この値が設定されても、`--ple-gguf` が空ならテーブル初期化処理には入りません。`--ple-gguf` を指定した場合、`--ple-io direct`（既定）ではこの上限が direct reader に適用されます。`--ple-io mmap` または `--ple-io ram` では PLE テーブルを memory map するため、direct reader の同時 read 枠としては使われません。
 
 ## 適用条件と副作用
 
-- PLE reader が実際に開かれるのは `--ple-gguf` が空でない場合です。指定があると `ple_table.open` が実行され、open に失敗した場合はエラー文字列を stderr に出して終了コード 1 で終了します（`src/program/generate.cpp:4033-4055`）。
-- 通常経路では `--ple-gguf` が必須です。`--no-ple` は診断用の PLE 無効化ですが、`--no-ple` と `--ple-gguf` の併用は相互排他エラー（stderr、終了コード 2）になります。`--ple-inflight` 自体の範囲検証は、PLE を使わない設定でも parser 後に行われます（`src/program/generate.cpp:3181-3184,3290-3300`）。
-- `--ple-inflight` は PLE 関連の `--ple-io`、`--ple-row-cache`、`--ple-delay-us` と同じ validation 条件で検査されます。無効値では `strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us` を stderr に出して終了コード 2 になります（`src/program/generate.cpp:3181-3184`）。
-- ビルドに `STRATA_HAVE_QWEN35` があり、`--native` または `--model` で指定された GGUF が Qwen3.6 系として認識されると、通常 parser より前に `src/qwen35` の parser へ引き渡されます。この別実装の通常実行 parser は `--ple-inflight` をサポートしないため、未対応 option として usage を出し終了コード 2 になります。`--serve` 経路では未知の `--` option とその値を無視する実装です（`src/program/generate.cpp:2393-2407`、`src/qwen35/q36_engine.cu:3735-3795`）。
-- buffer 確保に失敗すると `PleReader::open` は `PleReader: cannot allocate read buffers` を返します。また、worker thread の起動に失敗する場合はエラーを返します。エンジン側ではこれらを含む open エラーを表示して終了します（`src/ngram/ple_reader.cpp:350-378`、`src/program/generate.cpp:4052-4055`）。
+- 通常の `strata` エンジン parser と SYCL 版 parser の双方にこの引数があります。`strata-engine` の `root/` scope です。Qwen3.6 専用 parser は別 scope です。
+- `--no-ple` と `--ple-gguf` は併用できず、PLE 無効時は PLE ファイルを開く処理も実行されません。
+- direct 読み込みでは reader の初期化時に `N × 2ページ` 分の aligned read buffer を確保します。確保に失敗すると reader 初期化が失敗し、推論開始前にエラーになります。
+- `--ple-io` が `mmap` または `ram` の場合はこの値で direct read buffer を確保しません。したがって同時 read 数を変える目的では影響しません。
 
 ## 出力とエラー
 
-通常の値指定は option 固有の出力を行いません。範囲外の値は上記の validation error（stderr、終了コード 2）となります。値欠落も stderr と終了コード 2 です。実際の reader open 失敗は stderr に原因を出し、終了コード 1 となります。
+- `N < 1` または `N > 1024` の場合、stderr に `strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us` を出し、終了コード2で終了します。
+- direct reader の buffer 確保に失敗した場合は、reader のエラー文字列を `strata generate: ...` として stderr に出し、終了コード1で終了します。
 
 ## 根拠
 
-- option の既定値: `src/program/generate.cpp:479-485`
-- help 表示: `src/program/generate.cpp:816-826`
-- parser と値変換: `src/program/generate.cpp:2416-2421,2473-2479`
-- validation: `src/program/generate.cpp:3181-3184`
-- PLE 必須条件と `--no-ple` との相互排他: `src/program/generate.cpp:3290-3300`
-- PLE 設定の受け渡し: `src/program/generate.cpp:4033-4055`
-- direct reader と mmap/ram 経路の違い: `src/kernels/ngram.cpp:340-356`
-- slot 上限・buffer 確保・submit 制御: `src/ngram/ple_reader.cpp:148-177,336-378`
-- `--native` の Qwen3.6 振り分け: `src/program/generate.cpp:2393-2407`
-- 振り分け先 parser の未知 option 処理: `src/qwen35/q36_engine.cu:3735-3795`
-
+- `engine/src/program/generate.cpp:821` — 既定値256。
+- `engine/src/program/generate.cpp:1218-1227` — PLE 関連オプションと help 表示上の既定値・用途。
+- `engine/src/program/generate.cpp:3842-3846` — 値の取得方法と値省略時の終了コード2。
+- `engine/src/program/generate.cpp:3901-3904` — `--ple-inflight` の parser と `atoi` 変換。
+- `engine/src/program/generate.cpp:5009-5012` — 1〜1024の validation とエラー出力。
+- `engine/src/program/generate.cpp:5205-5215` — `--no-ple` と `--ple-gguf` の条件、および PLE 必須条件。
+- `engine/src/program/generate.cpp:6269-6276` — PLE ファイルが指定された場合の I/O mode と `max_inflight` 設定。
+- `engine/include/strata/kernels/ngram.hpp:165-172` — Direct/Mmap のモードと `max_inflight` の説明。
+- `engine/src/kernels/ngram.cpp:449-462` — Direct mode でのみ `PleReader` を開く処理。
+- `engine/src/ngram/ple_reader.cpp:347-367` — reader 側の範囲確認、slot 数・read buffer の確保。
+- `engine/sycl/src/program/generate.cpp:505,814,1942,2517-2520,3350-3357` — SYCL 版の既定値、parser、validation、reader option 設定が同じであること。
+- `docs/cli/README.md:1036-1041,1169-1174` — `strata-engine` の `strata` root scope と本オプションの索引リンク。

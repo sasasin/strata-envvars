@@ -1,63 +1,62 @@
 # `--pool-cores`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン、トップレベル引数） |
+| コマンド | `strata`（ネイティブ推論エンジンの引数） |
 | オプション | `--pool-cores` |
 | 別名 | なし |
-| 値 | 論理プロセッサ番号のリスト。例: `0,2,4,6`、`2-14:2` |
+| 値 | 論理プロセッサ番号のリスト。番号、昇順範囲、任意の正の step を指定できる |
 
 ## 役割
 
-CPU expert pool の worker thread を割り当てる論理プロセッサと順序を明示します。実験的な設定で、指定しなければ従来の既定配置を使います。CPU の場所を変える設定であり、性能向上は保証されません。エンジンの help 文面も実験的・既定無効とし、thread の場所だけを動かすと説明しています（`src/program/generate.cpp:1039-1045`）。
+CPU expert pool の worker を割り当てる論理プロセッサと順序を指定する、実験的で既定では無効の設定です。指定がなければ従来の配置計画が使われます。worker thread の pinning にだけ作用し、推論結果を変更する設定ではありません。parser は共通エンジンと SYCL エンジンにあり、どちらも pool を作る前に値を設定します（`engine/src/program/generate.cpp:3955,4703-4713`、`engine/sycl/src/program/generate.cpp:1976,2238-2248`）。
 
 ## 使い方
 
 ```sh
-strata --native MODEL.gguf --pool-cores 2-14:2 --tokens IDS
+# 論理 CPU 2, 4, 6, 8 の順に pool worker を配置
+strata --pack MODEL --pool-cores 2,4,6,8
+
+# 2 から 14 まで 2 つおきの論理 CPU を指定
+strata --pack MODEL --pool-cores 2-14:2
 ```
 
-`--native` のモデルを使う例です。モデルファイルと `IDS` は実際の入力に置き換えてください。`--pool-cores` は値を1つ取ります。値の直後に別のオプションを書いても、parser は値として取り込み、その文字列がリスト検証で不正になります（`src/program/generate.cpp:2418-2420,2529`）。
+`--pack` はエンジンのモデル入力例です。実行ファイル名や起動方法は配布形態により異なります。
 
 ## 値と既定値
 
-- カンマ区切りの番号、昇順範囲 `開始-終了`、または `開始-終了:step` を組み合わせられます。範囲の step は省略時 `1` です。空白とタブは番号や区切りの周囲で読み飛ばします（`include/strata/kernels/cpu/pool_plan.hpp:180-212`）。
-- 各番号・範囲端・step は非負の10進数で、番号の上限は `100000`。逆順範囲、step `0`、空要素、負数、数字以外は不正です。重複番号は最初の出現だけ保持され、展開後の項目数が4096を超えるリストは拒否されます（同:188-224）。
-- 未指定時の既定値は空文字で、従来の worker 配置を使います（`src/program/generate.cpp:527-528,2900-2910`）。同じオプションを複数回指定すると parser は値を順番に代入するため、最後の値が残ります（同:2416-2421,2529）。
-- 値なしで指定すると `--pool-cores needs a value` を stderr に出して終了コード `2` で終了します（同:2418-2420）。
+- 値はカンマ区切りの非負整数、`first-last` 範囲、または `first-last:step` 範囲の組み合わせです。例: `0,2,4,6`、`2-14:2`。範囲は昇順で、step は正数である必要があります。前後や区切り周辺の空白は読み飛ばされます（`engine/include/strata/kernels/cpu/pool_plan.hpp:180-224`）。
+- 重複番号は最初の出現だけ保持されます。展開後の重複除去済みリストは最大 4096 件で、数値は 100000 を超えると拒否されます（同 `:188-217`）。
+- 既定は空リストで、標準の pool 配置を維持します。CLI 値が空の場合に限り `STRATA_POOL_CORES` が代わりに参照されます（`engine/src/program/generate.cpp:4705-4712`、SYCL は `engine/sycl/src/program/generate.cpp:2240-2247`）。
+- `--pool-cores` を複数回指定すると parser の文字列代入により最後の値が使われます（`engine/src/program/generate.cpp:3955`、`engine/sycl/src/program/generate.cpp:1976`）。値を省略すると共通 parser の `next` が stderr に不足を出して終了コード 2 で終了します（`engine/src/program/generate.cpp:3842-3847`）。
 
 ## 実行時の動作
 
-parser は値を文字列として保存します。CPU pool の構築前に、値が空なら `STRATA_POOL_CORES` を読み、選ばれた非空文字列を解析します。CLI に非空の値がある場合は環境変数を読みません。CLI 値が空文字の場合は環境変数へフォールバックします。解析に失敗しても処理を中断せず、stderr に `strata generate: --pool-cores: ...; the pool uses its default placement` を出して既定配置を使います（`src/program/generate.cpp:2900-2910`; 値解析は `include/strata/kernels/cpu/pool_plan.hpp:183-224`）。
+エンジンは値を `parse_pool_cores` で番号列に変換し、成功時に pool の配置設定へ保存します。形式不正・空の値は stderr に理由を出して無視し、既定配置で続行します（`engine/src/program/generate.cpp:4703-4713`、SYCL は `engine/sycl/src/program/generate.cpp:2238-2248`）。
 
-解析後、CPU pool は検出した論理プロセッサ配置と照合し、使用できない番号を除外します。除外した番号は stderr に警告します。同一物理 core の SMT sibling を複数指定した場合や host thread と同じ CPU / core を指定した場合は項目を残したまま警告します。すべての番号が使えない場合は既定配置へ戻ります（`include/strata/kernels/cpu/pool_plan.hpp:227-279`; `src/kernels/cpu/pool.cpp:765-779`）。
+pool 構築時、実在しプロセスが使用可能な論理 CPU だけが配置候補として残ります。使えない番号は警告付きで除外されます。SMT sibling を同じ core から複数選んだ場合や host thread の CPU（または同じ core）を選んだ場合は警告しますが、指定どおり保持します。順序は NUMA interleave による並べ替えより優先されます（`engine/include/strata/kernels/cpu/pool_plan.hpp:227-275`、`engine/src/kernels/cpu/pool.cpp:823-845`）。
 
-利用可能なリストの順序は維持されます。`--pool-workers` が正数で指定されていればその worker 数を使い、リストより多い worker はリストにない分だけ未 pin になります。`--pool-workers` を指定しない場合は、利用可能なリスト項目数が worker 数になります（`src/program/generate.cpp:1043-1044`; `src/kernels/cpu/pool.cpp:801-817,923-945`）。明示リストがあると NUMA 用の自動並べ替えも行われません（同:781-799）。
-
-実際の pin は worker thread ごとに行われます。Linux では `pthread_setaffinity_np` を呼び、失敗した場合は stderr に affinity エラーを出して以前の affinity を維持します。macOS では pin 関数が no-op で、スケジューラが thread の実行場所を決めます（`src/kernels/cpu/pool.cpp:923-934`; `src/kernels/cpu/pool_affinity_linux.hpp:60-66,69-85`）。
+有効な CPU が一つも残らない場合は警告して既定配置へ戻ります。通常は指定リストの長さが worker 数になります。`--pool-workers N` を併用すると件数はそちらが優先され、N がリストより大きい場合、余った worker は pin されず OS の配置に任されます（`engine/src/kernels/cpu/pool.cpp:831-839,865-881,1006-1013`）。`--no-pool` が有効な経路では CPU expert pool 自体の利用が抑止され、この配置指定の実用上の効果もありません（`engine/src/program/generate.cpp:846,10467-10484`）。
 
 ## 適用条件と副作用
 
-- CPU pool を利用する通常の `src/program/generate.cpp` / SYCL `sycl/src/program/generate.cpp` 経路で設定を読みます。SYCL 側にも同じ parser、環境変数フォールバック、pool 設定があります（`sycl/src/program/generate.cpp:506-507,936-938,1852,2089-2099`）。
-- `--no-pool` が指定された実行では pool worker の処理は使われず、起動ログでも `UNUSED: --no-pool` と表示されます（`src/program/generate.cpp:6928-6936`）。
-- Qwen3.6-35B-A3B はモデル family 判定で `strata::qwen35::run` に引き渡されます。この別 parser は `--pool-cores` を受理しません。serve mode では未対応オプションとして値とともに無視され、それ以外では usage を表示して終了コード `2` になります（`src/program/generate.cpp:2393-2407`; `src/qwen35/q36_engine.cu:3742-3747,3782-3794`）。
-- pool の worker thread 配置を変えます。ソース help は「thread を動かすだけで、結果は変えない」としていますが、配置別の性能差はこの調査では測定していません（`src/program/generate.cpp:1044`）。
+設定は起動時、pool 構築前に読み取られます。稼働中の pool を動的に再配置する経路は確認できません（`engine/src/program/generate.cpp:4703-4713`、`engine/src/kernels/cpu/pool.cpp:823-839,991-1002`）。副作用は worker thread の論理 CPU pinning と、配置に関する stderr 起動メッセージです。性能向上は保証されず、ソースも性能値を規定していません。
 
 ## 出力とエラー
 
-- リスト形式の不正値は stderr に説明を出し、終了せず既定配置で続行します（`src/program/generate.cpp:2905-2909`）。
-- pool 構築時の使用不可番号、SMT / host thread 共有、全番号使用不可は `strata cpu pool: --pool-cores: ...` 形式で stderr に通知します（`src/kernels/cpu/pool.cpp:765-774`; 警告文の生成は `include/strata/kernels/cpu/pool_plan.hpp:245-279`）。
-- worker の pin に失敗すると Linux では `strata cpu pool: affinity for worker ... failed: ...; previous affinity kept` を stderr に出します（`src/kernels/cpu/pool.cpp:580-590`）。
+- 値がない場合は parser が `--pool-cores needs a value` を stderr に出し、終了コード 2 で終了します（`engine/src/program/generate.cpp:3844-3846`）。
+- リストの構文エラーは stderr に `strata generate: --pool-cores: ...; the pool uses its default placement` と出力して続行します（`engine/src/program/generate.cpp:4708-4712`）。SYCL も同様です（`engine/sycl/src/program/generate.cpp:2243-2247`）。
+- 使用不能な CPU、同一 core の複数指定、host thread との競合、および利用可能な CPU がゼロの場合は pool 構築時に stderr へ警告します（`engine/src/kernels/cpu/pool.cpp:825-834`、詳細判定は `engine/include/strata/kernels/cpu/pool_plan.hpp:245-275`）。
 
 ## 根拠
 
-- 索引上のスコープ: [`docs/cli/README.md`](../../README.md) の `strata-engine` / `strata`（トップレベルエンジン引数）節。
-- parser の値格納、missing value の終了、help 記述、`STRATA_POOL_CORES` fallback: `src/program/generate.cpp:527-528,1039-1045,2416-2421,2529,2900-2910`。
-- リスト文法、重複除去、最大項目数、無効値: `include/strata/kernels/cpu/pool_plan.hpp:180-224`。
-- topology 照合、除外・共有警告: `include/strata/kernels/cpu/pool_plan.hpp:227-279`; pool への適用と fallback: `src/kernels/cpu/pool.cpp:763-779`。
-- worker 数、指定順維持、NUMA 並べ替え、未 pin worker: `src/kernels/cpu/pool.cpp:781-817,923-945`。
-- SYCL 側の対応実装: `sycl/src/program/generate.cpp:506-507,936-938,1852,2089-2099`。
-- Qwen3.6 専用経路: `src/program/generate.cpp:2393-2407`; 専用 parser: `src/qwen35/q36_engine.cu:3735-3794`。
+- `engine/src/program/generate.cpp:1436-1462` — help の値形式、実験的・既定 off、worker 数、警告と環境変数の説明。
+- `engine/src/program/generate.cpp:3842-3847,3955,4703-4713` — 引数値の取得、代入、環境変数 fallback、parse と失敗時の続行。
+- `engine/sycl/src/program/generate.cpp:1009-1011,1976,2238-2248` — SYCL 側の help、parser、適用。
+- `engine/include/strata/kernels/cpu/pool_plan.hpp:180-224,227-275` — 文法、重複排除、上限、不正値判定、および配置候補と警告の判定。
+- `engine/src/kernels/cpu/pool.cpp:823-845,865-881,991-1013` — pool への反映、worker 数の選択、指定順 pinning と余剰 worker の扱い。
+- `engine/src/program/generate.cpp:846,10467-10484` — `--no-pool` による pool 利用抑止。
+- 索引のスコープ確認: `docs/cli/README.md:1036-1041,1175-1178` — `strata-engine` の `strata`（エンジン引数）節に本オプションが登録されている。

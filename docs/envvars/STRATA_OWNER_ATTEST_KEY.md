@@ -1,46 +1,45 @@
 # `STRATA_OWNER_ATTEST_KEY`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。外部ライブラリの環境変数は対象外です。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-この変数は、`strata_control` が起動した所有サーバーの起動内容（設定ファイルのバイト列と argv）をサーバー自身に証明させ、管理側が照合するための一時秘密鍵です。通常の設定スイッチではありません。管理側は起動ごとに32バイトの乱数鍵を作り、その16進表現を子サーバーの環境へ設定すると同時に、同じ鍵で期待する attestation を計算します。サーバーは読んだ鍵で attestation を計算し、テレメトリーの instance 情報へ載せます。管理側は readiness 検証で値を比較します。
-
-根拠: `strata_control/runtime.py:854-862`, `serve/launch_identity.py:15-22`, `serve/server.py:9079-9085,9300-9304,7178-7182`, `strata_control/readiness.py:84-110`。
+管理 runtime がサーバー子プロセスへ起動ごとの秘密鍵を渡し、サーバーが読み込んだ run config のバイト列と起動引数に対する HMAC-SHA256 の attestation を生成するための内部受け渡し変数です。runtime は同じ鍵で期待値を計算しておき、サーバーの `/v1/telemetry` が返す attestation と比較します。これにより管理 runtime の readiness 検証で、起動時の config と引数を確認します。モデルの計算設定を直接変更する利用者向けスイッチではありません（`terminal/strata_control/runtime.py:1051-1074`, `terminal/serve/server.py:9276-9282`, `terminal/serve/launch_identity.py:15-21`, `terminal/strata_control/readiness.py:114-123`）。
 
 ## 値と判定
 
-| 状態 | サーバー側の判定 |
-|---|---|
-| 未設定 | `os.environ.pop(..., None)` は `None` を返す。`--owner-fd` が指定されていれば起動を拒否する。指定されていなければ attestation を作らない。 |
-| 空文字 | `--owner-fd` がある場合、形式検査に失敗して起動を拒否する。ない場合は読み捨てられ、無視される。 |
-| 有効な形式 | 小文字の16進数字 `[0-9a-f]` がちょうど64文字。`bytes.fromhex()` で32バイトに変換する。 |
-| 無効な形式 | 大文字、空白、`0x` 接頭辞、桁数違い、その他の文字を含む値は `--owner-fd` がある場合に拒否される。 |
+サーバーは `os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)` で一度読み、同時に自身の環境から削除します。管理 runtime は `secrets.token_bytes(32).hex()` を設定するので、通常渡される値は 32 バイトの秘密値を表す小文字 hexadecimal 64 文字です。CLI 引数や config による代替値・優先順位はありません（`terminal/strata_control/runtime.py:1054-1059`, `terminal/serve/server.py:9276-9282`）。
 
-値を真偽値や数値として parse したり、既定鍵へ fallback したりしません。`strata_control` は `os.environ.copy()` で親環境を複製した後、生成した鍵でこの名前を上書きしてサーバー子プロセスへ渡します。CLI 引数や設定ファイルから鍵を指定する経路はありません。
+| 起動条件 | 未設定 | 有効値 | 無効値 |
+|---|---|---|---|
+| `--owner-fd` あり（管理 runtime のサーバー） | 起動を拒否 | `[0-9a-f]` に一致する 64 文字。例: `0` を 64 個並べた値 | 空文字、`0` が 63 個の値、`A` が 64 個の値、`g` が 64 個の値、空白を含む値。いずれも起動を拒否 |
+| `--owner-fd` なし（通常のサーバー） | attestation なしで続行 | 値の内容にかかわらず使用しない | 値の内容にかかわらず使用しない |
 
-根拠: `strata_control/runtime.py:857-877`, `serve/server.py:9079-9085`。
+有効性は数値変換ではなく正規表現の全体一致で判定します。前後の空白を除去せず、大文字小文字を区別します。owner mode で判定を通った値だけ `bytes.fromhex` で鍵へ戻します。`--owner-fd` がない場合も `pop` 自体は実行されますが、その値は検証されません（`terminal/serve/server.py:9276-9282`）。
 
 ## 有効になる条件
 
-サーバー側で鍵を必須とする条件は、隠し CLI 引数 `--owner-fd` が指定されていることです。管理ランタイムはサーバー起動 argv に `--owner-fd` を加え（Windows は `0`、それ以外は継承 pipe の fd）、同時に鍵を子環境へ設定します。通常の直接起動で `--owner-fd` がなければ、変数が設定済みでもサーバーは値を取り除くだけで attestation を生成しません。
-
-OS による違いは鍵の形式や計算ではなく、管理側が owner pipe を渡す方法です。モデル/backend の状態は鍵生成・サーバー側計算の条件ではありません。readiness 検証では unloaded モデルでも attestation を照合します。
-
-根拠: `strata_control/runtime.py:852-877`, `serve/server.py:8985-8988,9067-9085`, `strata_control/readiness.py:113-120`。
+- 管理 runtime の `Host._launch` がサーバー子プロセス環境を作るときに値を設定します。既存の親環境に同名変数があっても、新しく生成した鍵で上書きします。この設定は Windows と POSIX の両方の起動分岐より前に行われます（`terminal/strata_control/runtime.py:1049-1074`）。
+- サーバー側では `--owner-fd` が指定されている場合だけ、鍵の存在と形式が必須です。欠落または不正値なら `ap.error("owned server needs a private launch attestation key")` で起動を拒否します（`terminal/serve/server.py:9278-9282`）。
+- 管理外の通常起動では鍵は attestation に使われず、環境から取り除かれます。OS、engine backend、build macro、モデルのロード状態による値の判定差はありません。attestation の生成後に runtime が照合する経路は管理 runtime の readiness 検証です（`terminal/serve/server.py:9276-9282`, `terminal/strata_control/runtime.py:1105-1118`, `terminal/strata_control/readiness.py:96-123`）。
 
 ## 実行時の詳細
 
-管理側は各 launch で `secrets.token_bytes(32)` を生成し、`launch_identity.attestation()` に鍵、読み込んだ設定バイト列、起動 argv を渡して期待値を計算します。子環境には鍵の小文字 hex 文字列を設定します。attestation は `strata-owned-launch-v1\0` の識別子、設定と argv の長さ・内容を連結したメッセージに対する HMAC-SHA256 の hex 表現です。サーバーは設定ファイル読込後に環境変数を一度 `pop` し、owner 起動時は形式を検査して attestation を計算します。値を cache する helper はなく、このサーバー起動中の再読込もありません。
+`Host._launch` は 32 バイトを暗号学的乱数で生成し、その hex 表現を子環境へ入れます。同じ鍵・source config の読み込み時バイト列・サーバー引数から、起動前に期待 attestation を計算して保存します。サーバーは引数と config を読み込んだ後に環境値を取り出し、検査に通れば同じ材料から attestation を計算します。`launch_identity.attestation` は config バイト列と JSON 化した引数を長さ付きで連結し、HMAC-SHA256 の lowercase hex digest を返します（`terminal/strata_control/runtime.py:987-991`, `terminal/strata_control/runtime.py:1040-1059`, `terminal/serve/server.py:9266-9282`, `terminal/serve/launch_identity.py:15-21`）。
 
-サーバーは計算結果を `Service.launch_attestation` に保持し、`/v1/telemetry` の instance 情報に追加します。管理側の readiness 検証は報告値が期待値と一致するかを定数時間比較します。不一致・欠落は `probe_launch_attestation_mismatch` となり、管理ランタイムの status は failed（制御側 `exit_code: 6`）になります。鍵が owner 起動時に未設定または不正なら `argparse` の `ap.error("owned server needs a private launch attestation key")` を通り、サーバー起動に失敗します。サーバー標準出力・標準エラーは管理側の profile server log にまとめられます。
+サーバーは鍵を `pop` した後に engine 用の環境を `child_env(cfg, ...)` から構成するため、この鍵を engine の環境へ引き継ぎません。attestation は `Service` に保持され、telemetry の `instance.launch_attestation` に含まれます。runtime は `/v1/telemetry` の `instance.id` と attestation を確認し、期待値と一致しなければ readiness を失敗にします（`terminal/serve/server.py:9276-9282`, `terminal/serve/server.py:9391-9394`, `terminal/serve/server.py:9492-9497`, `terminal/serve/server.py:7460-7463`, `terminal/strata_control/readiness.py:114-123`）。
 
-根拠: `strata_control/runtime.py:857-877,907-920,951-972`, `serve/launch_identity.py:15-22`, `serve/server.py:9074-9085,9300-9304,7178-7182`, `strata_control/readiness.py:84-110`。
+環境値の読み取りはサーバープロセスの起動時に一度です。関数内 static cache やリクエストごとの再読込はありません。起動後に外部から環境を変更しても、取り出し済みの鍵や生成済み attestation は変わりません。管理 runtime の起動ごとに鍵を新規生成し、子プロセス環境へ明示設定します（`terminal/serve/server.py:9276-9282`, `terminal/strata_control/runtime.py:1054-1074`）。
+
+## ログと測定値
+
+owner mode で鍵が未設定または不正形式の場合、サーバーは parser error `owned server needs a private launch attestation key` を出して起動を拒否します。runtime の telemetry に attestation がない、または期待値と一致しない場合、readiness は `probe_launch_attestation_mismatch` を返し、managed status は失敗状態としてこの error を報告します。通常サーバーで値を読み捨てたときや、attestation の照合成功時に、この変数専用のログはありません（`terminal/serve/server.py:9278-9282`, `terminal/strata_control/readiness.py:120-123`, `terminal/strata_control/runtime.py:1111-1118`, `terminal/strata_control/runtime.py:1164-1169`）。
 
 ## 根拠
 
-- 環境変数名の全参照: `strata_control/runtime.py:860`（子環境へ設定）、`serve/server.py:9079`（サーバーが取得して環境から除去）。
-- 管理起動時の生成・子プロセスへの引き渡し: `strata_control/runtime.py:852-877`。
-- サーバー側の必須条件・形式検査・attestation 計算: `serve/server.py:9074-9085`。
-- attestation のメッセージ構成と HMAC-SHA256: `serve/launch_identity.py:15-22`。
-- テレメトリーへの公開と管理側照合: `serve/server.py:7178-7182`, `strata_control/readiness.py:84-110`。
+- `terminal/strata_control/runtime.py:1040-1074` — 鍵生成、環境への設定、Windows/POSIX のサーバー起動。
+- `terminal/serve/server.py:9266-9282` — config と引数の取得、環境値の取り出し、owner mode の形式検査と attestation 生成。
+- `terminal/serve/launch_identity.py:15-21` — HMAC 入力と計算。
+- `terminal/serve/server.py:7460-7463, 9391-9394, 9492-9497` — telemetry への設定と、engine 環境を組み立てる位置。
+- `terminal/strata_control/readiness.py:96-123` — readiness 側の telemetry attestation 検証。
+- `terminal/strata_control/runtime.py:1105-1118, 1151-1172` — 検証結果を managed status に反映。

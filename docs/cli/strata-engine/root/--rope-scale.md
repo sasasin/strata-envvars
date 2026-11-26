@@ -1,72 +1,59 @@
-# `strata --rope-scale`
+# `--rope-scale`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数） |
+| コマンド | `strata`（推論エンジンの root） |
 | オプション | `--rope-scale F` |
 | 別名 | なし |
-| 値 | 浮動小数点数。0 は未指定、明示値は 1 以上 |
+| 値 | `double` に変換される拡張係数。有限値で `0`（未指定扱い）または `1` 以上 |
 
 ## 役割
 
-`linear` または `yarn` RoPE scaling の倍率を指定します。指定した倍率は、モデルの GGUF に倍率が記録されている場合も上書きします。倍率だけでは scaling type を有効にしません。type が `none` なら倍率などの scaling knob は適用されません。
+RoPE のコンテキスト拡張係数を指定します。これ単独では方式を選びません。実際に拡張を有効にするには、モデルの RoPE metadata で `linear` / `yarn` が選ばれているか、別途 `--rope-scaling linear` または `--rope-scaling yarn` を指定します。係数はモデルの `rope.scaling.factor` より優先されます。
 
 ## 使い方
 
 ```sh
-strata --native /path/to/supported-model.gguf --rope-scaling yarn --rope-scale 2 --max-context 524288
+# 例: YaRN で係数 2 の設定を使って token 列を処理する
+strata --pack MODEL.strata --tokens 1,2,3 --rope-scaling yarn --rope-scale 2
 ```
-
-この例は `yarn` を選び、倍率を 2 にして最大 context を 524288 に設定します。`--rope-scale` 自体が `--max-context` を変更することはありません。
 
 ## 値と既定値
 
-- parser は `F` を `std::atof` で読み取ります。引数を省略すると、その場で `--rope-scale needs a value` を stderr に出し、終了コード 2 で終了します。
-- 値 `0` は「フラグなし」の sentinel です。明示倍率としては `1` 以上が必要で、0 以外の 1 未満は起動時検査で拒否されます。有限でない値も拒否されます。
-- 既定倍率は、`--native` で読む GGUF に `rope.scaling.factor` があり、その値が 1 より大きければその値、それ以外は 1 です。正の CLI 値は GGUF の倍率より優先されます。
-- `1` は有効な明示値です。倍率を 1 にしても scaling type を `none` にする指定ではありません。
+- parser は `--rope-scale` の次の引数を `std::atof` で読み取ります。値の省略は stderr に `--rope-scale needs a value` を出して終了コード 2 になります。重複指定を拒否する処理はなく、後に指定した値が前の値を置き換えます（`engine/src/program/generate.cpp:3842-3846, 3872-3875`）。
+- 既定値は `0` で、これは明示的な係数ではなく「フラグなし」として扱われます。モデルに factor があればそれを使い、なければ係数 1（拡張なし）が初期値です（`engine/src/program/generate.cpp:791-795, 5641-5646, 5715-5716`）。
+- `0` は未指定扱いです。有限な負数と `0 < F < 1` は拒否され、係数は `F >= 1` でなければなりません。NaN / 無限大も拒否されます。`atof` が数値として読めない文字列を `0` に変換した場合は未指定扱いになります（parser と finite/range 検査: `engine/src/program/generate.cpp:3872-3875, 5243-5254`）。
+- 明示した `1` はモデルの factor を上書きする値です。拡張係数を 1 にしますが、RoPE type 自体を `none` にする指定ではありません。
 
 ## 実行時の動作
 
-エンジンは起動時に CLI とモデル metadata を合わせて RoPE 設定を解決し、`--rope-scale` が 0 より大きければその値を `RopeScaling::factor` に設定します。倍率が 0 のときは GGUF 値または既定値が使われます。type は別 option `--rope-scaling` が明示されていればそれを使い、なければモデル metadata（取得できる場合）を参照します。
+起動時、CLI 値とモデルの RoPE metadata を解決し、`F > 0` なら factor に採用します。`F == 0` の場合はモデル factor が 1 より大きければそれを採用し、それ以外は構造体の既定値 1 のままです。RoPE type は別途 `--rope-scaling` またはモデル metadata から決まり、未指定の `--rope-scale` はその type の選択に影響しません（`engine/src/program/generate.cpp:5701-5723`）。
 
-有効な scaling type のとき、倍率から導く角度縮小率は `--rope-freq-scale` が正ならその値、そうでなければ `1 / factor` です。解決した設定は起動時に一度だけ登録され、セッション初期化時の RoPE table と analytic RoPE kernel に使われます。RoPE 適用後の key が cache に保存されるため、実行途中に倍率を切り替える仕組みはありません。
+解決した設定は process 全体に一度設定され、session 初期化より前に固定されます。RoPE table を作る経路では係数が cos/sin table の計算に反映され、analytic kernel 経路では同じ設定値が kernel 引数として渡されます。実行中に切り替える CLI 機能はありません。K cache が RoPE 適用後の値を保持するためです（`engine/include/strata/kernels/rope_scaling.hpp:25-35, 186-190`; `engine/src/program/generate.cpp:5641-5646, 5759, 7738-7740`）。
 
-type が `none` の場合、エンジンは倍率・頻度縮小・YaRN knob を初期値に戻して scaling を適用しません。`--rope-scale` が 1 より大きいと stderr に「scaling is active none のため ... have no effect」という note が出ます。倍率 1 はこの note の条件には含まれません。
+`--rope-scaling none` またはモデル上の type が `none` なら、この係数を含む scaling knobs は設定から除かれ、RoPE scaling は行われません。`F > 1` など scaling 値を指定していた場合は stderr に「no rope scaling is active ... have no effect」という note が出ます（`engine/src/program/generate.cpp:5727-5739`）。一方、type が `linear` / `yarn` でも `--max-context` が学習時 context 以下なら位置拡張の必要がない旨の note が出ますが、係数に応じた設定は全角度に適用されます（同 `:5760-5771`）。
 
 ## 適用条件と副作用
 
-- `src/program/generate.cpp` の通常エンジン経路が対象です。Qwen3.6 family は parser より前に `strata::qwen35::run` へ振り分けられますが、その parser に `--rope-scale` はありません。通常経路では未対応 option として usage を表示し終了コード 2、`--serve` を先に処理した場合は未対応 option として警告し値を読み飛ばします。
-- `--rope-scaling` は `none`、`linear`、`yarn` のいずれかです。倍率指定だけでは `none` から `linear` / `yarn` へ切り替わりません。
-- `--max-context` が学習済み context 以下でも scaling type が有効なら設定は適用されます。その場合、エンジンは「学習済み範囲内だが scaling は全角度に適用される」という stderr note を出します。
-- 有効な scaling は角度と、設定によっては cos/sin の振幅にも作用します。特に YaRN の既定 ext factor は 1、他の type では 0 です。正確な振幅や補正範囲は併用する YaRN option にも依存します。
-- この option によるファイル書き込みやネットワーク通信は、確認した parser・設定経路にはありません。主な副作用は起動時の process-wide RoPE 設定と stderr の診断表示です。
+- 有効な type（`linear` / `yarn`）での係数は RoPE の角度・テーブルまたは analytic kernel に作用します。YaRN の場合は `--yarn-*`、角度縮小の明示値は `--rope-freq-scale` と組み合わさります。`--rope-freq-scale` が 0 のときは `1 / factor` が使われます（`engine/src/program/generate.cpp:5715-5726`; `engine/include/strata/kernels/rope_scaling.hpp:169-182`）。
+- 設定は起動時のみです。server/request 単位の変更はなく、同一プロセス内の session/cache が異なる scaling を混在させない設計です（`engine/src/program/generate.cpp:788-792`; `engine/include/strata/kernels/rope_scaling.hpp:30-35`）。
+- このオプション自体はファイルを書き換えず、係数はモデルファイルに保存されません。推論エンジンの起動時設定に限られます。
 
 ## 出力とエラー
 
-- 値なし: `--rope-scale needs a value` を stderr に出して終了コード 2。
-- 値が有限でない場合: `a rope scaling knob is not a finite number` を stderr に出して終了コード 2。
-- 0 以外で 1 未満の場合: `--rope-scale ... must be >= 1` を stderr に出して終了コード 2。
-- 解決後の設定が不正なら `invalid rope scaling configuration: ...` を stderr に出し終了コード 2。scaling が有効なら、起動時に type、factor、freq scale、base、context を stderr に表示します。
-
-## 調査範囲
-
-Strata checkout の `src/program/generate.cpp` と RoPE 設定ヘッダーを確認しました。CMake build、実行バイナリ、GPU、各 backend、Release 配布物での動作確認はしていません。したがって本書は下記 revision のソースに基づき、実行時確認や性能評価を示すものではありません。
+- parser で値が欠けていれば stderr に `--rope-scale needs a value` を出し、終了コード 2 です（`engine/src/program/generate.cpp:3844-3846`）。
+- 非有限値は stderr に `a rope scaling knob is not a finite number`、1 未満の非ゼロ値は `--rope-scale ... must be >= 1` を出して終了コード 2 です（同 `:5243-5254`）。
+- モデル metadata と他の scaling knobs を合わせた最終設定も検証されます。不正な組み合わせは stderr に `invalid rope scaling configuration: ...` を出して終了コード 2 です（`engine/src/program/generate.cpp:5749-5757`; `engine/include/strata/kernels/rope_scaling.hpp:169-183`）。
+- scaling が有効なら解決 type、factor、freq scale、base、mscale、最大 context と学習時 context を stderr に表示します（`engine/src/program/generate.cpp:5759-5778`）。session 初期化失敗は `session_init failed` を stderr に出して終了コード 1 ですが、特定の `--rope-scale` 値に結び付く失敗経路とはソース上で確認できません（同 `:7738-7740`）。
 
 ## 根拠
 
-- 調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`、調査日 `2026-10-25`。調査時の `git status --short --branch` は `## main...origin/main`（未コミット変更なし）。
-- `src/program/generate.cpp:450-463` — RoPE 設定 option の初期値と 0 の sentinel。
-- `src/program/generate.cpp:2393-2407` — Qwen3.6 family の parser 前 dispatch。
-- `src/program/generate.cpp:867-877` — エンジンの help に記載された type、倍率、既定値。
-- `src/program/generate.cpp:2418-2421,2444-2453` — 値の取得と `--rope-scale` の parser。
-- `src/program/generate.cpp:3315-3339` — scaling type の検査、有限値検査、倍率の下限検査。
-- `src/program/generate.cpp:3642-3729` — CLI と GGUF の優先順位、倍率の解決、`none` 時の無効化、resolved config の検査と失敗経路。
-- `src/program/generate.cpp:3731-3750` — 起動時登録、適用状況・context 内警告・振幅補正の stderr 表示。
-- `include/strata/kernels/rope_scaling.hpp:22-35,61-90,164-190` — table / analytic path、設定の起動時固定、倍率から頻度縮小率への変換、resolved config の validation。
-- `include/strata/kernels/qsa.hpp:121-125` — 既定周波数 base と実行時設定の説明。
-- `src/qwen35/q36_engine.cu:3735-3795` — Qwen3.6 側 parser、未対応 option の通常時エラーと `--serve` 時の警告・値読み飛ばし。
-- 索引 `docs/cli/README.md:1128-1135,1274` — `strata-engine` の parser scope とこの文書の配置先。
+- `engine/src/program/generate.cpp:791-795, 1268-1276` — option の説明、既定値と help 表示。
+- `engine/src/program/generate.cpp:3842-3846, 3872-3875` — root parser、値の変換、値省略時の失敗。
+- `engine/src/program/generate.cpp:5227-5254` — 有限性と係数範囲の検証。
+- `engine/src/program/generate.cpp:5641-5646, 5701-5759` — モデル metadata との優先順位、設定解決、`none` 時の無効化、最終検証と process 設定。
+- `engine/include/strata/kernels/rope_scaling.hpp:25-35, 169-190` — table / analytic 経路、検証規則、起動時固定の契約。
+- `engine/src/program/generate.cpp:7738-7740` — session 初期化呼び出しと失敗出力。

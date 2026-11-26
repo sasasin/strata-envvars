@@ -1,46 +1,49 @@
 # `STRATA_Q36_VERIFY`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Qwen3.6-35B-A3B 専用 engine の decode 用高速 CUDA/HIP kernel の一部について、新 kernel と従来 kernel を同じ実 activation で実行し、結果を bit 単位で比較する診断用スイッチです。モデル全体の出力や token 列を比較するものではなく、比較対象の kernel が実行された場合だけ働きます。通常の生成を高速化する設定ではありません。
+Qwen3.6 専用 engine の decode 用最適化 kernel と、従来 kernel の結果を実行時に比較する診断スイッチ。新しい kernel が実際の activation で旧 kernel と一致するかを調べる用途で、未設定なら比較を行わない。検査対象は `q8_small`、`add_rms`、`shared_gu`、router/grouping、`moe_out` など、コードに比較経路がある箇所に限られる（[q36_engine.cu:2405-2425](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2444-2454](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2505-2523](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2637-2645](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2671-2695](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
 
-`strata` は GGUF の model family が Qwen3.6 (`qwen35moe`) なら、この専用 engine に処理を渡します。engine は `Engine` の構築時に環境変数の有無を読み、`verify_k` に保持します。
+この変数は生成結果を比較・選択するものではない。新 kernel の出力は通常どおり後続計算に使われ、旧 kernel の出力は比較用 scratch に計算される。比較不一致は記録・stderr 出力されるが、この変数の分岐自体は不一致を理由に生成を中断したり旧出力へ切り替えたりしない（[q36_engine.cu:2411-2424](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2509-2523](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
 
 ## 値と判定
 
-値の内容は parse せず、`std::getenv(...) != nullptr` だけで判定します。
+`Engine` のメンバー初期化時に `std::getenv("STRATA_Q36_VERIFY") != nullptr` だけで判定する。文字列の変換・比較はしないため、環境変数が存在すれば値が空でも有効。未設定だけが無効であり、`0`、`false`、`off` も有効になる（[q36_engine.cu:2405-2408](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
 
-| 状態 | 動作 |
-|---|---|
-| 未設定 | 検証を無効化 |
-| 任意の値を設定 | 検証を有効化。`1` 以外や空文字も有効 |
-
-engine の構築時に一度評価され、その engine の実行中は保存された値を使います。構築後に環境を書き換えても、この判定は変わりません。
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| Qwen3.6 engine の全実行経路 | 比較しない | `1`、`true`、`false`、`0`、空文字など、設定されている値すべて | なし（値の内容は判定しない） |
 
 ## 有効になる条件
 
-- Qwen3.6 専用 engine がビルドに含まれ、Qwen3.6-35B-A3B のモデルが選択されていること。
-- 比較する独自 kernel の分岐が実際に選ばれること。たとえば `q8_small` は `fast_k` が有効で、重み型が Q8_0、列数が 1〜8、入力幅が32の倍数などの条件を満たすときだけ対象です。router/grouping、add+RMS、shared expert、MoE 出力にもそれぞれ形状や経路の条件があります。
-- `STRATA_Q36_OLD_KERNELS` が設定されていると `fast_k` が無効になり、新 kernel が選ばれないため、この変数を設定していても多くの比較箇所は通りません。
-
-既存の `docs/QWEN36.md` は `STRATA_Q36_VERIFY=1` と `--no-graph` を組み合わせた実行例を示しています。コード上、比較関数は CUDA stream を同期し、device 結果を host にコピーして比較します。検証時はこの例のように graph を無効にします。
+- GGUF の model family が `qwen35moe` と判定され、Qwen3.6 専用 `strata::qwen35::run` engine に入ること。他の model family はこの読み取り箇所を通らない（[generate.cpp:3804-3818](../../../../Niko1221/Strata/engine/src/program/generate.cpp)、[q36_engine.cu:1-3](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
+- 検査対象 kernel 経路が選ばれること。最適化 kernel の検査は `fast_k` が true の場合だけ行う。`STRATA_Q36_OLD_KERNELS` が設定されると `fast_k` が false になり、`q8_small`、`add_rms`、`shared_gu`、route/group、`moe_out` の新 kernel 比較経路は使われない（[q36_engine.cu:2405-2407](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2429-2431](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2508-2509](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2532-2535](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2626-2629](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2671-2675](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
+- `--no-graph` を指定して eager launch にすること。既定では graph が有効で、単一 token decode は graph capture 内で `forward` を呼ぶ。一方、比較関数は stream 同期と device-to-host copy を実行する。Qwen3.6 の説明資料も `STRATA_Q36_VERIFY=1` と `--no-graph` の組み合わせを指定している（[q36_engine.cu:5344-5347](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:3612-3634](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:3707-3710](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2411-2415](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[docs/QWEN36.md:115-119](../../../../Niko1221/Strata/docs/QWEN36.md)）。
+- `STRATA_Q36_VERIFY` による CLI 値や別環境変数との優先順位はない。CLI の `--no-graph` は比較を有効化せず、graph を切って比較経路を実行可能にする条件である（[q36_engine.cu:5346-5372](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
 
 ## 実行時の詳細
 
-検証対象の処理では、新 kernel の結果を scratch buffer に残し、従来 kernel も同じ入力から実行して比較します。`verify_cmp` は stream を同期して両方の結果を host にコピーし、float 配列は各要素の全ビットを `memcmp` で比較します。router の grouping は整数の group 数、pointer、start、destination、token 配列を比較します。
+値はモデルをロードした後に作られる `Engine E` のメンバー初期化で一度読み取られ、`verify_k` に保持される。比較条件ごとに同じ環境変数を再読込することはないため、engine の実行中に環境を変更しても反映されない（[q36_engine.cu:2405-2408](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:5458-5467](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
 
-不一致があると stderr に `strata-q36 VERIFY MISMATCH ...` を出します。通常の float 比較は比較種別ごとに最初の3件まで詳細を表示します。grouping の不一致は累計20件まで概要を表示します。engine 終了時には stderr に比較総数・不一致総数と、比較種別ごとの不一致数を出します。環境変数を設定しただけで比較対象が実行されなければ、集計は0件になり得ます。
+比較時は stream を同期し、新旧の device buffer を host vector にコピーし、`memcmp` で bit 単位に比較する。不一致時は最初に異なる要素の index、件数、new/old の数値と bit pattern を出力する。Router と grouping のように専用比較処理を使う箇所もある。検査は追加の kernel 実行、同期、host copy を伴うため、通常実行より診断処理が増える（[q36_engine.cu:2411-2424](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2586-2621](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
 
-関連する `STRATA_Q36_VDEBUG` が設定されていると、q8 比較で不一致が出た場合に限って、対象 block の診断も追加出力します。これは `STRATA_Q36_VERIFY` の有効条件ではありません。
+このスイッチが設定されると、短い batch の router 経路で router と shared-expert gate をまとめた `router_ext` projection を使う条件も外れる（`!verify_k` が必要）。したがって検査時にはその router 経路も通常時と異なる（[q36_engine.cu:2895-2901](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
+
+## ログと測定値
+
+不一致時は stderr に `strata-q36 VERIFY MISMATCH ...` を出す。一般的な比較では各比較名につき先頭 3 件まで不一致詳細を出し、終了時に `strata-q36 VERIFY: <comparisons> comparisons, <mismatches> mismatches` と比較名ごとの不一致数を出力する。grouping 比較は別経路で、全体の不一致が先頭 20 件まで `strata-q36 VERIFY MISMATCH group ...` と出る（[q36_engine.cu:2417-2423](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:2618-2621](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)、[q36_engine.cu:5528-5534](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
+
+比較処理の CUDA API 呼び出しは `CK` 経由であり、API エラー時はそのエラーハンドリング経路に入る。不一致自体については mismatch を数えるだけで、停止や旧 kernel への fallback はない（[q36_engine.cu:2411-2424](../../../../Niko1221/Strata/engine/src/qwen35/q36_engine.cu)）。
+
+Qwen3.6 の説明資料は、実 activation で旧 kernel と bitwise 比較する利用例を記載している。ここでは資料の性能測定値をこの診断変数の効果として扱わない（[docs/QWEN36.md:115-127](../../../../Niko1221/Strata/docs/QWEN36.md)）。
 
 ## 根拠
 
-- `src/program/generate.cpp:2252-2265` — Qwen3.6 model family を専用 engine に渡す分岐。
-- `src/qwen35/q36_engine.cu:1575-1580` — `STRATA_Q36_VERIFY` の有無による判定、旧 kernel との切替状態、集計値。
-- `src/qwen35/q36_engine.cu:1581-1594,1614-1624,1631-1638` — stream 同期、host コピー、bitwise 比較、不一致ログ、q8 検証と VDEBUG 条件。
-- `src/qwen35/q36_engine.cu:1672-1690,1695-1731,1752-1787,1792-1812,1836-1861` — add+RMS、shared expert、grouping/router、MoE 出力の比較経路と適用条件。
-- `src/qwen35/q36_engine.cu:2000-2005` — 検証中は fused router-ext 経路を選ばない条件。
-- `src/qwen35/q36_engine.cu:3865-3871` — engine 終了時の集計ログ。
-- `docs/QWEN36.md:130-134` — `--no-graph` での使用例と、同資料で報告された比較数・不一致数。これらは同資料の記録であり、本調査で再計測した値ではありません。
+- `engine/src/qwen35/q36_engine.cu:2405-2424` — 判定、比較処理、不一致ログ。
+- `engine/src/qwen35/q36_engine.cu:2444-2695` — 個別の kernel 比較経路。
+- `engine/src/qwen35/q36_engine.cu:2895-2901` — verify 有効時に変わる router 経路。
+- `engine/src/qwen35/q36_engine.cu:5344-5372,5458-5467,5528-5534` — CLI の graph 既定値、engine 初期化、終了時レポート。
+- `engine/src/program/generate.cpp:3804-3818` — model family による専用 engine 選択。
+- `docs/QWEN36.md:115-119` — 文書中の使用例と `--no-graph` 指定。

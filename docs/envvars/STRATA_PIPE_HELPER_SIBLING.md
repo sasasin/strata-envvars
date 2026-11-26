@@ -1,49 +1,46 @@
 # `STRATA_PIPE_HELPER_SIBLING`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-Linux の SYCL verifier が stepped mode で CPU expert pool 用の helper thread を起動するとき、その thread を host thread の SMT sibling CPU に配置します。host thread が単一 CPU に pin されている場合に限り、その CPU affinity mask から sibling 番号を探します。GPU の処理や pool の内容は変えず、helper thread の CPU affinity を指定する設定です。
+Linux の SYCL stepped verifier で、CPU expert の pool 処理を行う helper thread を、呼び出し元の host thread が使う CPU の SMT sibling に割り当てます。host thread が 1 CPU に pin されている場合に限る opt-in です。変数が未設定または無効なら、Strata は helper thread の affinity を変更しません。CPU 選択と affinity 設定は `engine/sycl/src/core/verify.cpp` の `pipe_helper_cpu()` と stepped serve 内で行います（同ファイル:151-154, 196-240, 2525-2543）。
 
 ## 値と判定
 
-変数は `env_on()` で判定します。未設定、空文字、先頭文字が `0` の値は無効です。それ以外は有効で、文字列全体の parse や数値変換はしません。
+Linux では `pipe_helper_cpu()` の初回呼び出し時に `env_on("STRATA_PIPE_HELPER_SIBLING")` が環境値を読みます。`env_on()` は値が未設定でなく、空文字でなく、先頭文字が `0` でない場合に true を返します。数値変換や文字列全体の比較はしません（`engine/sycl/src/core/verify.cpp:151-154, 200-203`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定、空文字 | 無効（既定） |
-| `0`、`0anything` | 無効 |
-| `1`、`true`、`false`、空白で始まる値、その他先頭が `0` でない値 | 有効 |
+| 条件 | unset | 有効になる値の例 | 無効になる値の例 |
+|---|---|---|---|
+| Linux の SYCL stepped verifier | helper thread の affinity を変更しない | `1`、`true`、`2`、` 1`（先頭文字が `0` 以外の非空値） | 空文字、`0`、`0anything` |
+| Linux 以外 | helper thread の affinity を変更しない | なし（この変数を読み取らない） | なし |
 
-有効でも host thread が単一 CPU に pin されていない、または sibling を特定できないと、helper thread は継承した affinity のままです。CLI 引数による同変数の上書きはありません。`STRATA_VERIFY_PIPE=0` は別の条件として helper thread 経路そのものを無効にします。
-
-根拠: `sycl/src/core/verify.cpp:94-97,111-120,2211-2224`。
+大文字小文字、空白、数値としての妥当性は検査されません。設定値の後続文字は判定に影響しません。Linux でも値が有効なだけでは CPU は変更されず、後述の affinity と SMT sibling の条件を満たす必要があります（同ファイル:200-240）。
 
 ## 有効になる条件
 
-- Linux 上で SYCL 版 Strata が動作していること。この読み取りと affinity 設定は `__linux__` の条件付きコード内にあり、Linux 以外では関数が `-1` を返すだけです。
-- `STRATA_VERIFY_STEPPED` が有効で、all-resident (`ar_on()`) ではなく、`STRATA_VERIFY_EAGER` が未設定で、capture された segment があること。これは stepped run の条件です。
-- stepped serve 中に pool 用 helper を使う分割点に到達すること。さらに `STRATA_VERIFY_PIPE` が無効でなく、次 segment が split segment である必要があります。`STRATA_VERIFY_PIPE` は未設定なら有効、値の先頭が `0` なら無効です。
-- host thread の affinity mask がちょうど 1 CPU であること。Linux sysfs の `/sys/devices/system/cpu/cpu<host>/topology/thread_siblings_list` から host CPU 以外の最初の番号を見つけたときだけ、その番号を helper に設定します。
-
-この変数単独では stepped mode や pipeline を有効にしません。条件を満たさない経路では helper の配置に影響しません。`STRATA_VERIFY_STEPPED` の初期判定も `STRATA_VERIFY_PIPE` の判定もそれぞれ初回評価値を static に保持します。
-
-根拠: `sycl/src/core/verify.cpp:102-105,111-152,1830-1837,2160-2164,2209-2235`。
+- 実行経路が SYCL verifier の stepped run であること。`STRATA_VERIFY_STEPPED` が有効で、`ar_on()` が false、`STRATA_VERIFY_EAGER` が未設定で、捕捉済み segment がある場合に stepped run へ入ります（`engine/sycl/src/core/verify.cpp:192-194, 2098-2105, 2476-2495`）。
+- `STRATA_VERIFY_PIPE` が `0` で始まる値で無効化されていないこと。未設定や空文字を含め、先頭文字が `0` でなければ pipe は有効です（同ファイル:2525-2528）。
+- 次の segment が split segment（`seg_kind_[T][nxt] == 0`）であること。この場合だけ pool を別 thread で実行します。その他の segment では `run_pool()` をその場で実行します（同ファイル:2525-2557）。segment の split は `STRATA_VERIFY_SPLIT` が `0` で始まらない場合に記録されます（同ファイル:2067-2077）。
+- 対象は Linux のみです。Linux では呼び出し元 host thread の affinity 取得が成功し、許可 CPU がちょうど 1 個である必要があります。そうでなければ sibling を選ばず、stderr に `strata verify: STRATA_PIPE_HELPER_SIBLING: host thread is not pinned to one CPU; unchanged` を出します（同ファイル:200-209）。
+- host CPU の `/sys/devices/system/cpu/cpu<番号>/topology/thread_siblings_list` から host CPU 以外の sibling 番号を読み取れる必要があります。見つからない場合も affinity は変わりません（同ファイル:210-240）。
+- stepped run では `--remote-expert-opt` が先に拒否されます。この変数でその経路を有効化することはできません（同ファイル:2492-2495）。
 
 ## 実行時の詳細
 
-`pipe_helper_cpu()` は `STRATA_VERIFY_PIPE` が有効で split segment を処理する時点で呼ばれます。Linux では関数内 static 値の初期化時に対象変数を読み、host affinity と sysfs topology を一度調べます。その後は同一プロセス中に環境値や affinity を変更しても再評価されません。変数が有効で host affinity が複数 CPU などの場合は stderr に `strata verify: STRATA_PIPE_HELPER_SIBLING: host thread is not pinned to one CPU; unchanged` を出して、配置を変えません。
+`pipe_helper_cpu()` は Linux でのみ環境値を参照し、選択 CPU を関数内 `static const int` に保存します。環境値・呼び出し元 thread の affinity・sysfs の sibling をプロセス内で最初の呼び出し時に判定し、その後の変更は再評価されません。Linux 以外では環境値を読まず `-1` を返します（`engine/sycl/src/core/verify.cpp:200-240`）。
 
-単一 CPU の場合、sysfs の sibling list はカンマ区切りと範囲（例 `0,8`、`0-1`）を走査し、host CPU と異なる最初の番号を選びます。sysfs を読めない場合や他の番号が見つからない場合は sibling を `-1` として、stderr に `strata verify: pipelined pool helper on CPU -1 (host thread CPU <番号>): no SMT sibling, unchanged` を出します。番号が見つかった場合も同じログ形式で選択 CPU を表示します。
+pipe 対象 segment では、Strata は `std::thread` を作って `run_pool()` を呼び出します。Linux で sibling CPU が選べた場合だけ、thread 内から `pthread_setaffinity_np()` でその CPU を設定します。戻り値は無視されるため、設定失敗時の専用 fallback やログはありません。`-1` の場合は thread affinity を設定せず、継承した mask のままです（同ファイル:2525-2543）。thread と verifier の処理は flag A を待って segment を投入し、thread を join します（同ファイル:2544-2552）。
 
-helper thread の開始時に `pthread_setaffinity_np()` でその CPU を指定しますが、戻り値は検査していません。そのためログは選択した CPU を示しますが、OS が affinity 変更を受理したことまでは確認しません。helper が投げた `std::exception` は `verify: pool: <例外内容>` として呼び出し側へ返り、thread 作成や join の例外は `verify: pipelined serve: <例外内容>` になります。これらの serve 失敗は stepped window を失敗させます。`STRATA_PIPE_HELPER_SIBLING` 自体の値が原因で終了や失敗になる分岐はありません。
+関数内 static のため値の読み取りは最初の pipe 対象 split segment まで遅延します。`STRATA_VERIFY_PIPE` の判定も `serve` 内の static で初回評価後に cache されます。CLI 引数によるこの CPU 選択の上書きはコード上確認できません（同ファイル:2525-2539）。
 
-根拠: `sycl/src/core/verify.cpp:111-151,2185-2240,2258-2270`。
+## ログと測定値
+
+host thread が 1 CPU に pin されていない場合の警告は上記のとおりです。CPU 選択処理まで進んだ場合は `strata verify: pipelined pool helper on CPU %d (host thread CPU %d)%s\n` を stderr に出し、sibling がないとき suffix に `: no SMT sibling, unchanged` を付けます（`engine/sycl/src/core/verify.cpp:206-234`）。この変数固有の終了・失敗経路はなく、thread affinity API の失敗も無視されます。コード・関連資料でこの変数による性能測定値は確認できません。
 
 ## 根拠
 
-- 環境値判定 helper: `sycl/src/core/verify.cpp:94-97`。
-- sibling CPU の探索、sysfs 読み取り、診断ログ、Linux 以外の no-op: `sycl/src/core/verify.cpp:107-152`。
-- stepped mode の条件と helper thread 起動・affinity 適用: `sycl/src/core/verify.cpp:2160-2164,2209-2240`。
-- stepped capture 条件: `sycl/src/core/verify.cpp:1830-1837`。
+- `engine/sycl/src/core/verify.cpp:151-154` — `env_on()` の値判定。
+- `engine/sycl/src/core/verify.cpp:196-240` — Linux 限定の遅延読み取り、CPU affinity 条件、SMT sibling 検出とログ。
+- `engine/sycl/src/core/verify.cpp:2067-2077, 2098-2105, 2476-2495` — stepped run と split segment の成立条件。
+- `engine/sycl/src/core/verify.cpp:2525-2557` — pipe 分岐、helper thread、CPU affinity 設定、join と通常実行への分岐。

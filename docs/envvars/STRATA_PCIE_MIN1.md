@@ -1,45 +1,42 @@
 # `STRATA_PCIE_MIN1`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-decode の verify-window で expert pool が GPU 実行計画を作るとき、PCIe 経由で GPU に送る miss 数の share が整数丸めで 0 になった場合に、条件を満たせば少なくとも 1 miss を PCIe 側へ割り当てます。通常の share は `nmiss * pcie_num / 256` の整数部です。この変数は share が 1 以上ある場合の割り当て数を増やさず、CPU 計算対象のすべてを PCIe に移す設定でもありません。
+共有 multi-token expert dispatch の PCIe 割当数 `m` が 0 になったとき、条件を満たす layer-window に限り `m` を 1 に引き上げます。これにより、非 resident で CPU 側へ回る expert のうち最大 1 件が、既存の PCIe 経路へ割り当てられる余地を作ります。環境変数だけで PCIe 経路を有効化するものではなく、router の選択・重み・モデル設定自体も変更しません。読み取りと割当の補正は `expert_pool_dispatch_multi` 内です（`engine/src/core/expert_source.cpp:5426-5429,5543-5550`）。
 
 ## 値と判定
 
-環境値は `std::atoi()` で整数に変換し、結果が 0 以外なら ON、0 なら OFF です。文字列全体の妥当性検査はありません。
+値は `std::getenv` で読み、`std::atoi(v) != 0` を真とします。厳密な文字列・数値検証はなく、`atoi` が先頭から変換できる整数部分で判定します（`engine/src/core/expert_source.cpp:5549`）。
 
-| 値 | 判定 |
-|---|---|
-| unset | OFF |
-| 空文字、数字で始まらない文字列、`0`、`0abc` | `atoi()` が 0 を返すため OFF |
-| `1`、`-1`、`2` | 0 以外のため ON |
-| `1abc`、` 1tail` | `atoi()` が先頭の整数部分を変換し 1 を返すため ON |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `expert_pool_dispatch_multi` が PCIe 計画分岐に入り、初めて変数を評価 | `false` | `1`、`-1`、`2tail`、` 1`（`atoi` が非 0） | 空文字、`0`、`0anything`、`true`、`false`、整数に変換できない文字列（`atoi` が 0） |
 
-先頭の空白や符号は `atoi()` の規則で扱われ、整数部分の後ろにある文字列は判定に使われません。数値として 0 に変換された値は OFF です。値は `expert_pool_dispatch_multi()` 内の `static const bool` に保存され、該当コード経路で最初に初期化された後はプロセス内で再読込されません。プロセス起動後に環境を書き換えても反映されません。既定値は OFF です。
+空文字は未設定とは異なり `getenv` 自体は非 null ですが、`atoi("")` が 0 なので無効です。`atoi` は先頭の空白と符号を許し、数字列の後ろは判定に使いません。読み取り値は関数内 `static const` に保存されるため、同一プロセス内で読み取り後に環境を変更しても反映されません（同上）。
 
 ## 有効になる条件
 
-変数が ON でも、次の条件を満たす verify-window の GPU 計画に限り、割当数の補正が行われます。
-
-- `expert_pool_dispatch_multi()` の plan 作成経路に入り、plan sink が存在して容量条件を満たす。
-- 対象 layer の `pcie_num` が正で、expert source の `pcie_layer(layer)` が true（`pcie_ok`）。従って `--pcie-frac` 相当の share が 0 の場合は補正されない。
-- その layer の distinct miss 数 `nmiss` が 2 以上。
-- 通常計算の割当 `m = (nmiss * pcie_num) >> 8` が 0。
-
-これらを満たすと `m` を 1 にします。`m >= 1` なら値を変えても割当数は変わりません。選ばれるのは routing order 上の後ろ側の miss です。ただし実際に PCIe 扱いになるには、その expert の blob が pinned である必要があります。pinned でない場合はその expert の `kind` は miss のままとなり、CPU 側で処理されます。PCIe fetch の staging 枠数（`staging_cap` と最大 64 枠）に達した場合も、実際の PCIe fetch は行われません。
+- `expert_pool_dispatch_multi` が `d.plan != nullptr` かつ `n <= kMaxWindowEntries` かつ `n <= d.plan->cap` の計画分岐に入り、その中で初めて環境値を読み取る必要があります。条件を満たさない呼び出しでは変数の評価・効果はありません（`engine/src/core/expert_source.cpp:5475-5479,5549`）。
+- `pcie_ok` が真である必要があります。これは `d.pcie_num > 0` または `d.pcie_model.on` のいずれかに加えて、現在 layer で `d.src->pcie_layer(d.layers)` が真である条件です。PCIe share がなく、balance model も off なら、この変数だけでは割当を作りません（`engine/src/core/expert_source.cpp:5543-5545`）。
+- 現在の window の miss 数 `nmiss` は 2 以上、既存の `d.pcie_model.pick(...)` の結果 `m` は 1 未満である必要があります。`nmiss` は distinct な routed expert のうち host cache、peer GPU、remote helper のいずれにもないものから数え、`STRATA_ROUTE_TAIL_SKIP` による除外後の数です（`engine/src/core/expert_source.cpp:5481-5500,5510-5526,5545-5550`）。
+- 選ばれた miss の blob が pin 済みでなければ PCIe transfer にはなりません。fetch 経路では候補選択時に pin 状態を確認し、それ以外の経路でも blob を得られたときだけ `kd = 1` として PCIe 用 fetch 配列に積みます。pin されていない miss は従来どおり CPU miss のままです（`engine/src/core/expert_source.cpp:5555-5571,5593-5606`）。
+- `--pcie-frac` は既存 share の入力で、`generate.cpp` が `d.pcie_num` に変換します。`STRATA_PCIE_MIN1` はその値を置き換えるのではなく、既存の計算後に `m` が 0 のときだけ補正します。自動 PCIe balance の場合は `STRATA_PCIE_BALANCE=1` が `pcie_model.on` を有効にし得ますが、これは native pack・単一 GPU・batch 無効・`--pcie-frac` 未指定の条件に限られます（`engine/src/program/generate.cpp:4057,5535-5543,5590-5597,14931`; `engine/src/core/expert_source.cpp:5543-5550`）。
 
 ## 実行時の詳細
 
-plan 作成時、コードはまず distinct routed expert のうち VRAM 常駐、peer/helper 保持分を除いて `nmiss` を数えます。`pcie_ok` と既定 share から `m` を計算し、環境変数が有効で `m < 1 && nmiss >= 2` の場合に 1 へ補正します。その後 routing order を走査し、後ろ側 `m` 件を PCIe 候補とします。候補が pinned なら blob pointer を取得し、GPU plan の PCIe group に加えて copy engine の fetch に渡します。GPU plan sink がない、またはその容量条件に入らない経路ではこの環境変数を使った補正はありません。
+各 multi-token window で、まず miss に対する固定 share `((nmiss * d.pcie_num) >> 8)` と、利用可能なら `PcieModel::pick` の結果を使って `m` を決めます。その後、環境値が真で PCIe 経路が使用可能、`m < 1`、`nmiss >= 2` の場合だけ `m = 1` にします（`engine/src/core/expert_source.cpp:5543-5550`）。
 
-環境変数自身によるログやエラー出力はありません。`docs/DETAILS.md` は `STRATA_PIN_BY_NEED` と組み合わせたケースを説明し、RTX 3090 + Ryzen 5 5600X の記録として、prompt read が 56K–117K tokens で +5–7%、`--adapt-async 1` と `--pcie-frac 0.6` の decode level が +2–3% と記しています。これは文書に記載された特定条件の測定値で、一般的な性能保証ではありません。
+fetch/admission 経路を使わない場合、miss を routing order で数え、最後の `m` 件を PCIe 候補とします。fetch 経路を使う場合は pin 済み候補を usage 順で選びます。どちらも `staging_cap`・64 件上限および実際の pin 状態に制約されます。PCIe 候補は `P.ptr2` / `P.start2` に計上され、plan publish 後に `P.fetch` を呼びます。満たせない場合、環境変数が真でも PCIe 件数は増えません（`engine/src/core/expert_source.cpp:5555-5571,5597-5606,5622-5635,5681-5695`）。
+
+## ログと測定値
+
+この変数専用の警告・エラー・ログはありません。生成時の集計では、`d.pcie_num > 0` の場合に stdout へ `pcie experts` として PCIe 経由で読んだ distinct expert 数の平均と share が表示されます。batch 集計では stderr の `strata batch: ... PCIe ...` に window 当たりの値が含まれます。これらは環境変数の有効化を直接表示するものではありません（`engine/src/program/generate.cpp:25356-25359,17495-17505`）。
 
 ## 根拠
 
-- `src/core/expert_source.cpp:3680-3681,3721-3722,3743-3745,3770-3776`: 関数、miss 数え上げ、PCIe 条件、通常 share と環境変数による補正。
-- `src/core/expert_source.cpp:3801-3815,3832-3853`: pinned blob の確認、staging 上限、PCIe plan 作成と fetch。
-- `src/core/expert_source.cpp:3502-3513,3525-3529`: file-backed source の pinned 判定と layer 単位の PCIe 可否。
-- `include/strata/core/expert_source.hpp:455-459,501-502`: `pcie_num` の意味と dispatch 宣言。
-- `docs/DETAILS.md:188-194`: pin-by-need との関係、および記載された測定条件・結果。
+- 候補名の実行コード上の読み取りは `engine/src/core/expert_source.cpp:5549` の1箇所。値の解釈と補正条件は同ファイル `:5543-5550`。
+- PCIe 経路の可否、pin 確認、plan への反映は `engine/src/core/expert_source.cpp:5240-5267,5555-5571,5593-5606,5622-5635,5681-5695`。
+- CLI share と自動 balance の関係は `engine/src/program/generate.cpp:4057,5535-5543,5590-5597,14931`。
+- 観測可能な集計出力は `engine/src/program/generate.cpp:17495-17505,25356-25364`。

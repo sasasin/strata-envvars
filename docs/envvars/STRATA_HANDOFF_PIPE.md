@@ -1,57 +1,48 @@
 # `STRATA_HANDOFF_PIPE`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。対象は Strata 所有ソース。作業開始時点の Strata リポジトリは `main` の同 SHA で、未追跡の `nohup.out` があった。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-26 時点）。
 
 ## 役割
 
-複数 GPU の prompt layer split で、ある段の出力 chunk を次段へ渡す host pinned buffer の転送を複数の行片に分ける設定です。既定の一括コピー経路では、出力の device-to-host コピー全体を待ってから次段を開始します。有効時は各片のコピー後に CUDA event を記録し、host は chunk の計算完了 event まで待って次段を起動します。次段は片ごとの event を GPU stream 上で待ってから host-to-device コピーを行うため、前段の残りの download と次段の upload を重ねられる構成です。転送先の値と行位置は同じです。
-
-この設定は `src/prefill/prefill.cpp` の prompt prefill 経路にあり、decode の設定ではありません。`strata_prefill` は CUDA/HIP の構成で同じ `prefill.cpp` をビルド対象にします（CUDA API 名は HIP 構成で互換層を通ります）。実際にイベントを作るのは `next_ != nullptr` の段だけです。
+CUDA/HIP 系の prompt prefill で layer split を使うとき、各 stage 間で渡す chunk の行を複数の部分に分けて転送する opt-in 設定です。既定の 1 回の host hand-off では、前段 stage が chunk 全体を pinned host buffer にコピーしてから次段を始めます。2 以上を指定すると、前段は chunk の計算完了 event と各部分の転送完了 event を記録し、後段は各部分の event を GPU stream 上で待って対応行を upload します。転送の分割だけを変更し、同じ行データを引き渡す実装です。値の読取りと分割数の決定は `handoff_pipe_pieces()`、イベントの準備は `Prefill::init()`、転送は `Prefill::run_impl()` にあります（`engine/src/prefill/prefill.cpp:899-920,2488-2501,4425-4448,7748-7820`）。
 
 ## 値と判定
 
-`std::getenv` で取得した値を `std::atoi` に渡し、結果 `p` が 2 以上なら `min(p, 16)` を使用します。それ以外は 0 として一括コピー経路を使います。文字列全体の妥当性検査はありません。
+最初の評価で `std::getenv` を呼び、設定値を `std::atoi` で整数化します。2 未満は 0（通常の 1 回 hand-off）、2 以上は `min(p, 16)` です。設定文字列全体の妥当性検査はありません。したがって未設定・空文字・数値に変換できない文字列は 0、`0`・`1`・負数も 0、`2`〜`16` はその値、`17` 以上は 16 になります。`atoi` の変換規則により、先頭空白や符号の後の数字は読まれ、数字の後ろの文字は判定されません（例: `"  +2tail"` は 2、`"0anything"` は 0）。`true` / `false` のような語は数値に変換できず 0 です。
 
-| 環境値 | 変換と動作 |
-|---|---|
-| 未設定 | `p=0`。一括コピー経路 |
-| 空文字、数字に変換できない文字列 | `atoi` の結果は 0。一括コピー経路 |
-| `0`, `1`, 負の数 | 2 未満なので一括コピー経路 |
-| `2`〜`16` | 指定した片数を使う |
-| `17` 以上 | 16 に clamp して使う |
-| 数字の後ろに文字がある値（例: `3x`） | `atoi` が先頭の数値部分を変換するため、3 片を使う |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 共通 prefill 実装 | 0（1 回 hand-off） | `2`〜`16`。`17` 以上は 16 に clamp | 空文字、非数値、`0`、`1`、負数（すべて 0 に変換、1 回 hand-off） |
 
-先頭の空白や符号も `atoi` の変換規則に従います。環境変数を読み込む関数内の `static const int` に結果を保存するため、最初に `handoff_pipe_pieces()` が呼ばれた後のプロセス内変更は反映されません。通常、この関数は `Prefill::init` 中、後続段がある場合に呼ばれます。
-
-根拠: `src/prefill/prefill.cpp:356-364,1257-1271`。
+値域変換は `engine/src/prefill/prefill.cpp:906-913`、行の分割は同ファイル `:915-920` です。`atoi` の表現範囲を超える入力に対する追加の検査はありません。
 
 ## 有効になる条件
 
-- prompt 経路が複数 GPU の layer split で、当該 `Prefill` に後続段があること。`generate.cpp` は各 GPU 段に次段を設定し、複数 GPU の先頭経路にも最初の段を設定します。
-- 変換結果が 2 以上であること。
-- 分割イベントを初期化できること。作成に失敗すると `Prefill::init` は失敗し、`prefill: the layer split's hand-off events (STRATA_HANDOFF_PIPE)` をエラーとして返します。一括コピーへ黙って fallback する処理はありません。
-
-単一 GPU または split の最終段には後続段がないため、この分割 hand-off は発生しません。ソース上、分割数が正でも各 hand-off chunk の一部が空 (`nr == 0`) なら、その片の memcpy は省き event のみを記録します。
+- `Prefill` が後続 stage (`next_ != nullptr`) を持つ layer split である必要があります。初期化時に後続 stage がある場合だけ pinned hand-off buffer を用意し、分割数が 2 以上ならイベントも作ります（`engine/src/prefill/prefill.cpp:2488-2501`）。単一 GPU など後続 stage がない経路では分割転送は行いません。
+- `STRATA_HANDOFF_PIPE` の分割転送は、`Prefill::run_impl()` の chunk-major hand-off 経路です。Metal は `Prefill::run()` から `metal_engine::prompt_run()` に直接進み、この共通 `run_impl()` 経路を通りません（`engine/src/prefill/prefill.cpp:9629-9651`）。
+- 通常の `--prefill-pipe` などが chunk の切り方を決め、この変数は stage 間の hand-off の分割数を決めます。環境変数を読むコードに CLI 値との優先順位や上書きはありません（`engine/src/prefill/prefill.cpp:899-913,4298-4301,7748-7820`）。
+- 分割 hand-off (`hp > 0`) では pinned host buffer と CUDA event を使います。通常の 1 回 hand-off (`hp == 0`) で条件を満たす場合に試みる peer-to-peer 経路は、分割 hand-off の場合には選択されません（`engine/src/prefill/prefill.cpp:7751-7770,7771-7795`）。
+- `STRATA_HANDOFF_PIPE_WORKER` は転送分割とは別に後段を実行する thread の方式を選びます。分割 hand-off が有効で同変数が未設定または `atoi` 結果が非 0 なら、stage 所有の worker thread を遅延作成して再利用します。`=0`、空文字、非数値など `atoi` が 0 を返す値では chunk ごとの `std::async` に戻ります。分割数が 0 のとき、この worker 設定は使われません（`engine/src/prefill/prefill.cpp:921-927,7821-7832`）。
+- GPU engine の共通 prefill ソースに実装があります。ビルド構成上、CUDA/HIP engine はこのファイルを含みます（`engine/cmake/strata_gpu_engine.cmake:482-488`）。実行時に必要な multi-GPU layer split が構成されていない場合、数値が有効でも転送分割は発生しません。
 
 ## 実行時の詳細
 
-各段は hand-off 用の pinned host buffer を2個用意し、片ごとの event と chunk 完了 event も buffer ごとに保持します。イベントは timing 無効で作成されます。前段は現在の stream で chunk 完了 event を記録し、続けて各片を device から pinned buffer に非同期コピーし、コピー後に片 event を記録します。host は chunk 完了 event だけを同期して、checkpoint 等の `on_stage_chunk` 処理と先行する次段 run の回収を行います。その後、次段の `run_impl` を起動します。
+`handoff_pipe_pieces()` の `static const int` は初回呼び出し時にだけ環境を読み、その後はプロセス内で値を保持します。初期化時、後続 stage がある場合に初めて評価されます。従って、その評価後にプロセス内で環境を変更しても反映されません。CLI 引数、設定ファイル、他の環境変数による同値の上書きはありません（`engine/src/prefill/prefill.cpp:907-913,2488-2501`）。
 
-次段は受け取った片 event ごとに自身の stream で `cudaStreamWaitEvent` を積み、chunk 全体が一度に処理される場合は対応する host buffer 範囲を片ごとに非同期 upload します。次段の chunk が受け取った全体より小さい場合は、片 event をすべて待ってから必要範囲を一括 upload します。API 呼び出しの失敗時は hand-off upload のエラーを返します。
+分割数が有効な場合、初期化で hand-off buffer ごとに chunk 完了 event と最大 16 個の部分完了 event を作成します。各 chunk では行範囲をほぼ均等な連続区間に分け、前段の copy stream に device-to-host copy と部分 event を順に記録します。host は chunk 完了 event を待ち、後段は部分 event を stream wait してから各部分を host-to-device copy します。後段側で受け取る chunk が前段の chunk 全体と一致しない場合は、全部分を待った後に通常の 1 回 upload を行います。2 個の pinned buffer を交互に使います（`engine/src/prefill/prefill.cpp:915-920,4427-4444,7748-7820`）。
 
-後続段の起動スレッドには `STRATA_HANDOFF_PIPE_WORKER` も関係します。この別変数は、片数が有効なとき既定で persistent worker を使い、`atoi` 結果が 0 のとき `std::async` による chunk ごとの thread 起動に戻します。`STRATA_HANDOFF_PIPE` 自体の片分割判定とは別の設定です。worker は遅延生成され、`Prefill::release()` で停止・join されます。
+## ログと測定値
 
-根拠: `src/prefill/prefill.cpp:371-417,1045-1059,2499-2527,4581-4629`; `include/strata/prefill/prefill.hpp:244-266`。
+有効・無効を知らせる通常の on/off ログはありません。イベント作成に失敗すると `Prefill::init()` は `prefill: the layer split's hand-off events (STRATA_HANDOFF_PIPE)` を `err` に設定して失敗します。実行中の部分転送・event 同期に失敗すると `prefill: the layer split's hand-off: <CUDA error>`、後段 upload が失敗すると `prefill: the layer split's hand-off upload failed (STRATA_HANDOFF_PIPE): <CUDA error>` を `err` に設定して失敗します（`engine/src/prefill/prefill.cpp:2493-2501,4445-4448,7771-7785`）。`strata generate` は init/run の失敗時に `strata generate: <err>` を stderr に出し、終了コード 1 を返します（`engine/src/program/generate.cpp:24118-24123,24163-24167`）。
 
-## 文書との照合
-
-`docs/BATCHING.md:124` は layer split で prompt chunk を 2〜16 片に分け、event で同期し persistent thread を使う設定と要約しています。ソース上では worker の有効/無効は `STRATA_HANDOFF_PIPE_WORKER` に分離されています。続く表は 4x R9700 32 GB / HIP、IQ3_S の expert 全常駐、layer split 12,25,37、3 回の interleaved rounds で、複数の「switches above」をまとめて使った場合を比較しています。基準は 0.1.44.1 の 8 slots、対照は同じ build の 16 slots（switch なし / 表記された全 switch 有効）です。この表から `STRATA_HANDOFF_PIPE` 単独の効果は分離できず、本調査では再測定していません。
+この変数単独の測定値は、参照したソースと関連資料から条件を特定できませんでした。
 
 ## 根拠
 
-- 値の取得、変換、上限: `src/prefill/prefill.cpp:356-364`。
-- 後続段の初期化条件と event 作成: `src/prefill/prefill.cpp:1257-1271`。
-- layer split の prompt path と `next_` 設定: `src/program/generate.cpp:8193-8221`; `include/strata/prefill/prefill.hpp:210-213`。
-- 片ごとの upload wait: `src/prefill/prefill.cpp:2499-2527`。
-- 前段の片ごとの download と次段起動: `src/prefill/prefill.cpp:4581-4629`。
-- build 対象: `CMakeLists.txt:679-685`。
+- `engine/src/prefill/prefill.cpp:899-920` — 設定値の変換、最大値、行区間の計算。
+- `engine/src/prefill/prefill.cpp:2488-2501` — layer split 用 pinned buffer とイベントの初期化。
+- `engine/src/prefill/prefill.cpp:4427-4448` — 後段で event を待ち、部分または全 chunk を upload する処理と失敗経路。
+- `engine/src/prefill/prefill.cpp:7748-7834` — 前段の download、イベント、後段起動、および worker thread。
+- `engine/src/prefill/prefill.cpp:9629-9651` — Metal 実行経路の分岐。
+- `engine/src/program/generate.cpp:24118-24123,24163-24167` — init/run 失敗の stderr 表示と終了コード。
+- `engine/cmake/strata_gpu_engine.cmake:482-488` — CUDA/HIP GPU engine での共通 prefill ソース組み込み。

@@ -1,45 +1,45 @@
 # `STRATA_DUMP_MOE_LAYER`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-prompt prefill の MoE 入力を診断用バイナリへ書き出すとき、対象の layer index を選びます。この変数だけでは出力されません。別変数 `STRATA_DUMP_MOE_INPUT` に出力先パスが設定されている必要があります。実装箇所は CUDA Runtime API を使う `src/prefill/prefill.cpp` の MoE prefill 経路一つです。
+`engine/src/prefill/prefill.cpp` の `Prefill::run_impl` にある GPU prefill の MoE 診断ダンプで、対象 layer を選ぶ。この共通ソースは CUDA/HIP 系と Metal host target に含まれる（`engine/metal/CMakeLists.txt:135-156`）。単一 layer 指定では、最初に一致した chunk の `m.mixed`（MoE 入力）と `ids_h`（routing expert ID）を `STRATA_DUMP_MOE_INPUT` が指すファイルへ書く。`all` 指定では、最初の chunk の各対象 layer について `<STRATA_DUMP_MOE_INPUT>.L<layer>` を作る。通常の MoE の選択・計算結果を切り替える設定ではなく、読み戻しとファイル出力を追加する診断用フックである。読み取りと書き込みは `engine/src/prefill/prefill.cpp:6180-6203`。
 
 ## 値と判定
 
-`STRATA_DUMP_MOE_LAYER` は `std::atoi` で整数に変換し、現在の layer index `l` と完全一致する場合に対象になります。文字列全体の数値検証はありません。
+`STRATA_DUMP_MOE_LAYER` を `all` と比較する `dump_all` は、この処理に初めて到達したときに一度だけ評価される。大文字小文字を区別した完全一致なので、`all` だけが複数 layer 指定になる。その他の値は単一 layer 指定として、layer ごとに `std::atoi` へ渡される。`atoi` の変換結果と `l` が一致するかだけを見ており、文字列全体の数値検証、範囲検査、clamp はない（`engine/src/prefill/prefill.cpp:6186-6189`）。
 
-| 設定 | 比較に使う値 |
-|---|---:|
-| 未設定 | `0` |
-| 空文字、数字で始まらない文字列 | `0` (`atoi` の変換結果) |
-| 整数または符号付き整数 | 変換された整数 |
-| 数字の後ろに文字が続く値（例: `2abc`） | 数字部分の `2` |
-| 先頭に空白がある値（例: ` 2`) | `2` |
+| 条件 | unset | 有効になる値 | 単一 layer 指定として扱われる値・結果 |
+|---|---|---|---|
+| `Prefill::run_impl` の MoE 診断箇所 | `dump_all=false`、単一指定の layer 番号は `atoi("0")` 相当で `0` | `all`（完全一致）で各連続 layer を順に選択。数値変換結果が実際の `l` と一致する値でその layer を選択 | 空文字、`0`、`+0`、` 0`、`0abc` は `atoi` 結果が `0`。`2x` は `2`。`ALL` や `all ` は `all` ではなく、`atoi` 結果は `0`。`-1` は通常の非負 layer 番号に一致しない。範囲外の番号も一致先がない |
 
-大文字小文字の比較はありません。layer index はコード内で 0 から扱われるため、未設定時は layer 0 が選ばれます。モデルにない index や負の値はどの layer とも一致しません。
+どの値でも `STRATA_DUMP_MOE_INPUT` が未設定ならダンプ条件が成立しない。これは別の関数内 static 値で、最初の到達時に取得される。設定済みの空文字は null ではないためダンプ条件には進むが、空のパスを開こうとして失敗する（`engine/src/prefill/prefill.cpp:6182-6189`, `6196-6198`）。
 
 ## 有効になる条件
 
-- `STRATA_DUMP_MOE_INPUT` が設定されていること。判定は `getenv(...) != nullptr` であり、空文字も「設定あり」です。ただし空パスは通常ファイルを開けず、結果ファイルは作られません。
-- `Prefill::run_impl` が MoE 入力を host 側で group する経路を実行し、指定 layer に到達すること。Metal は `Prefill::run` 内で別の `metal_engine::prompt_run` に分岐するため、この読み取り箇所を通りません。
-- 1プロセスで一度だけ書き出されます。`dumped_moe` が `static` で、layer match 後にファイルを開けたかどうかにかかわらず `true` になるため、後続の prompt/chunk では再試行しません。
+- GPU prefill の `Prefill::run_impl` が該当 MoE routing 処理まで進むこと。この共通ソースは Metal host target にも含まれるが、SYCL には別の prefill ソースがある（`engine/metal/CMakeLists.txt:135-156`, `engine/sycl/CMakeLists.txt:38`, `engine/sycl/CMakeLists.txt:297-305`）。
+- `STRATA_DUMP_MOE_INPUT` が null でないこと。出力先のパスはこの変数であり、layer 変数だけでは出力されない（`engine/src/prefill/prefill.cpp:6182`, `6188-6189`）。
+- 指定 layer がそのプロセスの `run_impl` の layer 走査で MoE 診断箇所まで到達すること。走査範囲は `LB` 以上 `LE` 未満であり、layer split や MoE を飛ばす経路などで対象箇所を通らなければ書かれない（`engine/src/prefill/prefill.cpp:4977-4996`, `5343-5353`, `6180-6189`）。
+- `all` は `dump_next` が `0` から始まり、選択のたびに1増える。したがって `l=0` から順に対象箇所を通ることが前提で、先頭 layer が走査範囲外または MoE 箇所を通らない場合、後続 layer は `dump_next` と一致せず選択されない（`engine/src/prefill/prefill.cpp:6184-6192`）。
+- 単一 layer モードではプロセス内の `dumped_moe` が未設定であること。一度一致するとファイルを開けたかどうかにかかわらずフラグが立ち、そのプロセスの後続 chunk/request では再試行しない（`engine/src/prefill/prefill.cpp:6183`, `6190-6192`）。
+
+この処理に関与する別の変数は `STRATA_DUMP_MOE_INPUT` である。CLI 引数やサーバーモードによる優先順位の分岐はこの読み取り箇所にはない。
 
 ## 実行時の詳細
 
-`STRATA_DUMP_MOE_INPUT` の値は、このコードブロックに最初に到達したときに `static const char*` として取得され、その後の環境変更では更新されません。パスが未設定のまま初回到達した場合、同じプロセス内で後から設定しても dump は有効になりません。一方、layer 値は `dump_moe` が有効で未出力の間、layer 判定のたびに `getenv` し直されます。
+`Prefill::run_impl` は prompt を chunk 単位に処理し、各 chunk で layer を `LB` から `LE` まで走査する（`engine/src/prefill/prefill.cpp:4214`, `4379-4385`, `4977`）。MoE の expert 数を数え、routing 表を準備した後の地点でダンプ条件を判定するため、出力される `ids_h` は当該 layer の routing 後の expert ID である。`m.mixed` を host vector に `cudaMemcpyAsync` し、stream を同期してから、3個の int64 header `{T, N, K}`、`T*N` 個の float、`T*K` 個の int32 expert ID の順にバイナリ書き込みする（`engine/src/prefill/prefill.cpp:6002-6007`, `6170-6203`）。
 
-指定 layer に達すると、実装は `m.mixed` の `T × N` float 値を device-to-host コピーし、CUDA stream を同期した後、`STRATA_DUMP_MOE_INPUT` のパスを `wb` で開きます。成功時は次の順で書き込みます。
+`STRATA_DUMP_MOE_INPUT` のパス、`dump_all` 判定、`dumped_moe`、`dump_next` は関数内 static でプロセスに共有される。パスと `all` 判定は最初の到達時にキャッシュされる。単一 layer モードの数値文字列は各 layer の判定時に `getenv` し直すため、プロセス内で環境を変更すれば番号判定には反映され得るが、既に立った `dumped_moe` は解除されず、`all` としての判定も再評価されない（`engine/src/prefill/prefill.cpp:6182-6189`）。
 
-1. `int64_t` 3個のヘッダー `{T, N, K}`
-2. `T × N` 個の `float`（MoE 入力）
-3. `T × K` 個の `int32_t`（router が選んだ expert ID）
+ファイルを開けない場合は書き込みを行わず、その結果を確認するログやエラー設定もない。`fwrite` / `fclose` の結果も検査されない。CUDA copy と stream 同期の戻り値もこの箇所では検査されない（`engine/src/prefill/prefill.cpp:6193-6203`）。
 
-同名ファイルがあれば上書きされます。`fopen` に失敗した場合や `fwrite` の戻り値が短い場合、専用のエラー・警告ログは出しません。layer 一致後に dump 済み状態になるので、失敗しても再試行はありません。コード上、この変数による処理の有効化ログもありません。
+## ログと測定値
+
+この診断ダンプ固有のログ出力はない。ファイル open / write の失敗を示す Strata の警告、終了、fallback もこの箇所にはない（`engine/src/prefill/prefill.cpp:6193-6203`）。関連資料にこの変数の性能測定値は見つからなかった。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:3361-3376`: 変数の読み取りと比較、static な一回限りの状態、device-to-host copy、バイナリ出力形式。
-- `src/prefill/prefill.cpp:4338-4349`: Metal backend では `metal_engine::prompt_run` を呼び、CUDA 側の `run_impl` へ進まない分岐。
-- `docs/NVFP4.md:157-157,196-196`: 実 prompt の MoE 入力を `STRATA_DUMP_MOE_INPUT` で採取して `mmq_nvfp4_parity --real` に渡す用途への言及。layer 選択値や既定値はこの資料では説明されていません。
+- `engine/src/prefill/prefill.cpp:4214-4223`, `4379-4385`, `4977-4996` — prefill の実行経路、chunk と layer の走査。
+- `engine/src/prefill/prefill.cpp:6002-6007`, `6170-6203` — routing 後の判定、環境変数の読み取り、値変換、データ形式、ファイル書き込み。
+- `engine/src/prefill/prefill.cpp:6182-6192` — path / `all` の cache と first-dump 状態。

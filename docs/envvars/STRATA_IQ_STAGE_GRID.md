@@ -1,42 +1,45 @@
 # `STRATA_IQ_STAGE_GRID`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-i-quant の一部の GPU kernel が使う codebook grid（64-bit の lookup table）を、kernel 実行中に shared/local memory へコピーして参照するかを切り替えます。無効にすると同じ grid を元のテーブルから直接読みます。CUDA と SYCL に実装があります。
+CUDA/HIP と SYCL の IQ kernel 実装で、対象の i-quant codebook/grid を shared/local memory に staging する経路を有効にする。未設定を含む既定は有効で、`0` で staging を止める。これは kernel 選択・メモリー配置の切替であり、環境変数を読むコードにはモデル出力や計算結果を別の値にする処理はない。CUDA/HIP 実装は `engine/src/kernels/cuda/iq_kernels.cu`、SYCL 実装は `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp` にある（後者は SYCL CMake target に登録されている）。[engine/src/kernels/cuda/iq_kernels.cu:995-995,3696-3707,3791-3804,4541-4571](../../../../Niko1221/Strata/engine/src/kernels/cuda/iq_kernels.cu) [engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:44](../../../../Niko1221/Strata/engine/sycl/CMakeLists.txt) [engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:1251,3954-3966,4219-4227,6053-6067](../../../../Niko1221/Strata/engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp)
+
+CUDA/HIP 側で compile-time の対象になる format は type 16, 17, 18, 21, 22, 29 と trellis type 144-146。SYCL 側は type 16, 17, 22, 29。対象外の format にはこの staging 分岐を適用しない。CUDA/HIP 側の grouped gate/up 経路では `STRATA_OLD_IQ_MMVQ` や format ごとの split 設定によって旧 kernel が選ばれる場合があり、SYCL grouped gate/up では `STRATA_EXPERT_SPLIT` が有効でない場合にこの staging 分岐へ進まない。単一 matrix-vector/matrix-matrix (MMVQ) 側は両実装とも、対象 format について別の `STRATA_IQ_STAGE_GRID_MMVQ=1` がなければ staging しない。[engine/src/kernels/cuda/iq_kernels.cu:990-995,3791-3804,4541-4567](../../../../Niko1221/Strata/engine/src/kernels/cuda/iq_kernels.cu) [engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:1251,3931-3938,4219-4227,6053-6067](../../../../Niko1221/Strata/engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp)
 
 ## 値と判定
 
-CUDA (`src/kernels/cuda/iq_kernels.cu`) と SYCL (`sycl/src/kernels/cuda/iq_kernels.dp.cpp`) は同じ判定です。値全体の parse や数値変換はせず、未設定か、先頭1文字だけを見ます。
+両 backend は `std::getenv` で読み、数値変換や文字列全体の比較はしない。未設定なら有効。設定済みの場合は先頭 byte が `'0'` なら無効、それ以外は有効。空文字も有効である。したがって `0`, `0anything`, `00` は無効、`1`, `true`, `false`, `anything`, ` 0` は有効。大文字小文字・空白・数値としての妥当性を検査しない。負数 `-1` も先頭が `'-'` のため有効。[engine/src/kernels/cuda/iq_kernels.cu:3696-3700](../../../../Niko1221/Strata/engine/src/kernels/cuda/iq_kernels.cu) [engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:3954-3959](../../../../Niko1221/Strata/engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp)
 
-| 値 | `g_stage_grid` |
-|---|---|
-| 未設定 | 有効（既定） |
-| 空文字 | 有効 |
-| 先頭文字が `0`（例: `0`, `0anything`） | 無効 |
-| それ以外（例: `1`, `false`, ` 0`） | 有効 |
-
-大文字小文字・空白・後続文字は検査しません。したがって `false` や先頭に空白のある ` 0` も有効です。環境値は翻訳単位のグローバル `bool` 初期化時に読み込まれ、その後の呼び出しではキャッシュ値を使います。プロセス実行中に環境を変更しても再評価されません。
-
-根拠: `src/kernels/cuda/iq_kernels.cu:1958-1962`, `sycl/src/kernels/cuda/iq_kernels.dp.cpp:2825-2829`。
+| 条件（build/backend） | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP `iq_kernels.cu` | 有効 | 空文字、`1`、`true`、`-1`、` 0` | `0`、`0anything` |
+| SYCL `iq_kernels.dp.cpp` | 有効 | 空文字、`1`、`true`、`-1`、` 0` | `0`、`0anything` |
 
 ## 有効になる条件
 
-- 切替対象は compile-time の `kStageIqGrid<TY>` が真の形式、すなわち型 ID `16`, `17`, `22`, `29`（IQ2_XXS、IQ2_XS、IQ2_S、IQ1_M）です。他の形式ではこの環境変数による staging の切替はありません。根拠: `src/kernels/cuda/iq_kernels.cu:664-666,715-716,741-742,835-836` と SYCL 側の同等箇所 `sycl/src/kernels/cuda/iq_kernels.dp.cpp:869-871`。
-- CUDA では、旧 kernel を `STRATA_OLD_IQ_MMVQ` で選んだ経路は新しい切替分岐を通りません。通常の新 kernel 経路では single-matrix MMVQ と grouped expert の gate/up kernel の staging を切り替えます。grouped expert の down kernel はこの変数を参照せず、別の activation staging を行います。根拠: `src/kernels/cuda/iq_kernels.cu:1988-2003,1361-1372,2666-2694`。
-- SYCL の MMVQ 経路は同様に `g_stage_grid` を使います。一方、SYCL の grouped expert は既定の lane kernel を使い、この変数の分岐には入りません。`STRATA_EXPERT_SPLIT` が有効で、旧 kernel でなく、split 形式が選ばれた場合に限り grouped multi kernel に進み、その経路でこの変数が staging を選びます。根拠: `sycl/src/kernels/cuda/iq_kernels.dp.cpp:2822-2829,3087-3095,4176-4194`。
-- 追加の `STRATA_IQ_STAGE_GRID_MMVQ` は MMVQ の staging をさらに opt-in に制限します。`STRATA_IQ_STAGE_GRID` が無効ならこちらが設定されていても MMVQ staging は有効になりません。CUDA/SYCL とも追加変数は未設定を無効とし、値の先頭文字が `1` の場合だけ有効です（`10` も有効）。grouped expert 側の staging 判定には使われません。根拠: `src/kernels/cuda/iq_kernels.cu:1963-1969,1994-2001`, `sycl/src/kernels/cuda/iq_kernels.dp.cpp:2830-2836,3087-3095`。
+- 対象 backend の IQ kernel 実装が build に含まれ、実行経路が対象 format の該当 kernel に到達する必要がある。これは CLI 専用設定ではなく kernel 内の process environment 設定である。[engine/sycl/CMakeLists.txt:44](../../../../Niko1221/Strata/engine/sycl/CMakeLists.txt)
+- CUDA/HIP の grouped gate/up では `launch_gu` が split IQ format の multi kernel を選ぶことが条件。旧 kernel が選択される場合は staging しない。type 18 と 21 の staging には別途 `STRATA_IQ_STAGE_TABLES` が必要で、trellis type 144-146 には `tq_stage_on()` / `tq_sub8_on()` の条件もある。[engine/src/kernels/cuda/iq_kernels.cu:3713-3744,3746-3761,4541-4571](../../../../Niko1221/Strata/engine/src/kernels/cuda/iq_kernels.cu)
+- SYCL の grouped gate/up は split multi 経路（`STRATA_EXPERT_SPLIT` が on で、旧 kernel が選ばれない経路）で対象 type の staging に分岐する。対象 format は IQ type 16, 17, 22, 29。[engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:1251,3933-3938,6053-6067](../../../../Niko1221/Strata/engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp)
+- CUDA/HIP と SYCL の MMVQ では `STRATA_IQ_STAGE_GRID_MMVQ` の先頭 byte が `'1'` の場合だけ、この変数が有効であることを前提に staged kernel を選ぶ。`STRATA_IQ_STAGE_GRID=0` のときはこの別設定も効かない。[engine/src/kernels/cuda/iq_kernels.cu:3701-3707,3791-3804](../../../../Niko1221/Strata/engine/src/kernels/cuda/iq_kernels.cu) [engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:3960-3966,4219-4227](../../../../Niko1221/Strata/engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp)
+- CUDA/HIP trellis staging は `tq_stage_on()` が HIP では false を返すため、`STRATA_IQ_STAGE_GRID` だけでは有効にならない。CUDA でも別の `STRATA_TQ_STAGE`、GPU compute capability などにより staging の有無が決まる。[engine/src/kernels/cuda/iq_kernels.cu:3726-3744,3746-3761](../../../../Niko1221/Strata/engine/src/kernels/cuda/iq_kernels.cu)
+- 検索した直接読み取り箇所は CUDA/HIP と SYCL の二つで、環境値の CLI 引数・設定ファイルによる上書き、起動ラッパーからの値の書き換えは見つからなかった。
 
 ## 実行時の詳細
 
-staging が有効な kernel では、対象 IQ codebook テーブルを thread block/work group の shared/local memory にコピーし、同期後に各 weight の decode でそのコピーを参照します。CUDA 実装は `stage_iq_grid()` で IQ2_XXS 2 KiB、IQ2_XS 4 KiB、IQ2_S と IQ1_M 各8 KiB相当をコピーします（`uint2` の要素数に8 byteを掛けた値）。staging が無効なら helper は `nullptr` を返し、各形式の `Split::load` が元の codebook table を参照します。SYCL も対応する local memory へのコピーと barrier を行います。根拠: `src/kernels/cuda/iq_kernels.cu:1120-1155,667-678,717-724`, `sycl/src/kernels/cuda/iq_kernels.dp.cpp:1461-1507,869-871`。
+各 translation unit の namespace-scope `bool` の dynamic initialization 時に一度読み、結果を `g_stage_grid` に保持する。`g_stage_grid_mmvq` もその値を使って同時に初期化される。関数ごとの再読込やリクエストごとの評価ではないので、プロセス内で後から環境を変更してもこの判定には反映されない。別プロセスとして起動した場合は、そのプロセスの環境から評価される。[engine/src/kernels/cuda/iq_kernels.cu:3696-3707](../../../../Niko1221/Strata/engine/src/kernels/cuda/iq_kernels.cu) [engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:3954-3966](../../../../Niko1221/Strata/engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp)
 
-この環境変数を読む箇所は CUDA と SYCL の各翻訳単位に1か所です。通常利用者向けの起動ログ、警告、エラーはこの判定コードからは出ません。`docs/DETAILS.md` にこの変数の説明は見つからず、`docs/INTEL.md:530-544` は SYCL の expert kernel と `STRATA_EXPERT_SPLIT` の条件を説明していますが、本変数の値判定は記述していません。性能値はここでは記載しません。
+既定有効のとき、CUDA/HIP の grouped gate/up launcher は対象 format で staged template を選ぶ。ただし IQ3_XXS / IQ3_S (type 18 / 21) は `stage_tables_on()` が別途 true でないと staging を行わず、trellis formats は `tq_stage_on()` 条件に従う。SYCL の grouped gate/up launcher も対象 type で `launch_gu_multi<TG, true>` を呼ぶ。MMVQ は別変数の opt-in がない限り、`STAGE_GRID=false` の multi kernel に進む。いずれも環境変数による kernel/staging 選択で、該当コードに値を変換する補正処理は見当たらない。[engine/src/kernels/cuda/iq_kernels.cu:3791-3804,4550-4567](../../../../Niko1221/Strata/engine/src/kernels/cuda/iq_kernels.cu) [engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4219-4227,6053-6067](../../../../Niko1221/Strata/engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp)
+
+## ログと測定値
+
+この変数を読み取る箇所や分岐には、値の有効・無効を示すログ、警告、エラー出力がない。資料では CUDA の Gyro trellis decode について RTX 3060 (12 GB) で Gyro-S 54.3→62.5 tokens/s (+15%)、Gyro-M 50.2→54.8 (+9%)、各 5 interleaved pairs と記載し、`STRATA_IQ_STAGE_GRID=0` で旧 lookup に戻るとしている。他世代のカードは未測定と明記されている。これは当該リリース資料の値であり、一般的な性能保証ではない。[docs/release-notes-0.2.2.md:9](../../../../Niko1221/Strata/docs/release-notes-0.2.2.md)
 
 ## 根拠
 
-- 値の読み取りと既定値: `src/kernels/cuda/iq_kernels.cu:1958-1969`, `sycl/src/kernels/cuda/iq_kernels.dp.cpp:2825-2836`。
-- staging 対象形式、shared/local memory へのコピー: `src/kernels/cuda/iq_kernels.cu:664,1120-1155`, `sycl/src/kernels/cuda/iq_kernels.dp.cpp:869,1461-1490`。
-- CUDA 呼び出し先での分岐: `src/kernels/cuda/iq_kernels.cu:1988-2003,2666-2684`。
-- SYCL 呼び出し先での分岐と適用条件: `sycl/src/kernels/cuda/iq_kernels.dp.cpp:3087-3095,4176-4194`。
+- `engine/src/kernels/cuda/iq_kernels.cu:995-995,3696-3707,3791-3804,4541-4571` — CUDA/HIP format 範囲、env parse、MMVQ と grouped gate/up 分岐。
+- `engine/src/kernels/cuda/iq_kernels.cu:3713-3761` — 他の stage env と HIP / CUDA trellis 条件。
+- `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:1251,3954-3966,4219-4227,6053-6067` — SYCL format 範囲、env parse、MMVQ と grouped gate/up 分岐。
+- `engine/sycl/CMakeLists.txt:44` — SYCL target への kernel source 登録。
+- `docs/release-notes-0.2.2.md:9` — 条件付きの Gyro 測定記録。

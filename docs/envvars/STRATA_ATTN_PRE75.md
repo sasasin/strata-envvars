@@ -1,44 +1,52 @@
 # `STRATA_ATTN_PRE75`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-QSA のバッチ attention で、PR #540 の attention kernel を選ぶ条件を調整する A/B 用スイッチ。対象コードがビルドに含まれる場合、既定では CUDA の compute capability 7.5 未満、および HIP の `gfx103x` でこの kernel を使う。`0` で選択を止める。通常の `qsa_decode_attn_step` ではなく、`qsa_decode_attn_batch` の kernel 選択に作用する。
+QSA attention の chunk 計算で、PR #540 の `attn_chunk_kernel_pre75` を選ぶかどうかを切り替える A/B 用環境変数。選ばれると chunk 部分和の計算 kernel が変わる。merge kernel や index/top-k の選択処理を分岐させる変数ではない。CUDA/HIP の `qsa_decode_attn_step` と `qsa_decode_attn_batch` の chunk 経路で参照される（`engine/src/kernels/cuda/qsa_decode_attn.cu:926-976,1038-1116,1309-1349`）。
+
+標準 CUDA build では `STRATA_ATTN_DAILY` の選択もこの分岐に関わる。HIP では `gfx103x` を既定対象にし、値 `1` で別の wave32 GPU にも拡張する。SYCL ファイルには読み取りを含む `pre75_attn()` があるものの、その関数は同ファイルで呼び出されず、現行 SYCL の decode kernel 選択にこの変数が使われる経路は確認できない（`engine/sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp:767-792,1001-1015,1307-1395`）。
 
 ## 値と判定
 
-CUDA/HIP 実装は環境変数の**先頭1文字だけ**を読み、文字列全体の比較や数値変換はしない。
+CUDA/HIP の `pre75_attn()` は最初の呼び出しで `std::getenv` の結果を関数内 `static` に保存する。未設定なら `-1`、値の先頭文字が `0` なら `0`、先頭文字が `1` なら `1`、それ以外なら `-1`。文字列全体の比較や数値変換はせず、空文字・空白・大文字小文字・後続文字の妥当性検査もない（`engine/src/kernels/cuda/qsa_decode_attn.cu:930-935`）。
 
-| 値 | CUDA（実験ビルド） | HIP（gfx906 wave64 以外のビルド） |
-| --- | --- | --- |
-| 未設定 | GPU 世代による既定選択 | `gfx103x` だけ選択 |
-| `0` で始まる値（`0`, `0abc` など） | 常に選択しない | 常に選択しない |
-| `1` で始まる値（`1`, `10` など） | GPU 世代による既定選択のまま。sm_75 以上を強制的に有効化しない | 全対象デバイスで選択 |
-| 空文字または `0`/`1` 以外で始まる値 | 未設定相当 | 未設定相当 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA experimental build (`STRATA_EXPERIMENTAL_SM60`) | `STRATA_ATTN_DAILY=1` なら on、それ以外は GPU compute capability が 7.5 未満なら選択 | `1`, `1anything` は明示の on 判定。ただし `STRATA_ATTN_DAILY` が on でない場合、実際の CUDA 判定は device capability `< 75` で、`1` だけでは新しい GPU に強制しない | `0`, `0anything` は off。`true`, 空文字, ` 1`, `2` は環境指定としては無効（unset 相当） |
+| 標準 CUDA build（`STRATA_EXPERIMENTAL_SM60` なし） | `STRATA_ATTN_DAILY` の判定に従う | `1`, `1anything` は `pre75_attn()` 内で認識されるが、標準 CUDA 分岐では `STRATA_ATTN_DAILY` の結果が使われるため強制 on にはならない | `0`, `0anything` は明示的に off。それ以外は `STRATA_ATTN_DAILY` の判定に従う |
+| HIP（`STRATA_HIP_GFX906` でない build） | `gfx103x` なら on、それ以外は off | `1`, `1anything` は全対象デバイスで on | `0`, `0anything` は off。空文字、`true`, ` 1`, `2` は unset 相当となり、`gfx103x` の既定判定を使う |
+| SYCL | 実行時に読み取られない | 該当なし | 該当なし |
 
-CUDA/HIP では初回 `pre75_attn()` 呼び出し時に値を static 初期化し、その後の環境変更は反映しない。SYCL 実装も初回呼び出し時に static 初期化するが、判定は異なり、先頭文字が `0` のときだけ無効化する。したがって SYCL では未設定・空文字・`1` 以外の値も無効化にはならない。
+CUDA/HIP の例外として、`STRATA_ATTN_PRE75=0` は先に off を返すため `STRATA_ATTN_DAILY=1` より優先する。標準 CUDA ではそれ以外の値は `daily_attn()` に委譲される。`daily_attn()` 自体は `STRATA_ATTN_DAILY` が文字列全体でちょうど `1` の場合だけ明示 on とし、それ以外（unset/空文字を含む）は device ごとの既定判定を使う（`engine/src/kernels/cuda/qsa_decode_attn.cu:902-923,935-940`）。
 
 ## 有効になる条件
 
-- **CUDA**: `STRATA_EXPERIMENTAL_SM60` を定義してビルドした場合だけ専用 kernel と分岐がコンパイルされる。環境変数が未設定、`1`、無効値なら、現在の GPU の compute capability が 7.5 未満の場合に選択する。7.5 以上では選択しない。実験ビルド自体は CMake で既定 OFF。
-- **HIP**: `STRATA_HIP_GFX906` を定義しない HIP ビルドに分岐が含まれる。未設定・空・無効値なら、現在のデバイス名が `gfx103` で始まる場合に選択する。`1` で始まる値なら、そのビルド内の他の wave32 デバイスにも選択する。gfx906 wave64 ビルドではこの環境変数による分岐自体がコンパイルされない。
-- **SYCL**: `STRATA_EXPERIMENTAL_SM60` 定義時だけ分岐がコンパイルされ、現在のデバイスの compute capability が 7.5 未満なら選択する。`0` で始まる値は GPU 世代による選択を無効化する。CUDA 実装のような強制有効化値はない。
-
-デバイス情報の取得に失敗した場合や、device ordinal が `0..63` の範囲外の場合は選択しない。CUDA/HIP はデバイス特性を ordinal ごとにキャッシュし、SYCL 変換コードも同じく ordinal ごとに compute capability をキャッシュする。レイヤー分割などで複数 GPU を使う場合も、現在のデバイスごとに条件を評価する。
+- **CUDA experimental build:** `STRATA_ATTN_PRE75_BUILT` は CUDA では定義される。`STRATA_EXPERIMENTAL_SM60` 有効時、`pre75_attn()` は現在 device の compute capability が 7.5 未満かを判定し、該当 device の chunk kernel 選択に使われる（`engine/src/kernels/cuda/qsa_decode_attn.cu:503-505,936-964`）。
+- **標準 CUDA build:** `STRATA_ATTN_PRE75=0` 以外の設定は `daily_attn()` の結果に従う。`STRATA_ATTN_DAILY=1` なら対象 kernel を使い、それ以外は `sm12x_default(...)` による device ごとの既定値に従う（`engine/src/kernels/cuda/qsa_decode_attn.cu:902-923,936-938`）。
+- **HIP:** `STRATA_HIP_GFX906` を定義しない HIP build でこの kernel が組み込まれる。既定では device 名が `gfx103` で始まると有効。先頭 `1` は他の対象 wave32 device にも有効化し、先頭 `0` は無効化する。`STRATA_HIP_GFX906` build では `STRATA_ATTN_PRE75_BUILT` が定義されず、この選択コードは組み込まれない（`engine/src/kernels/cuda/qsa_decode_attn.cu:503-505,945-963`）。
+- **別 kernel が先に選ばれる経路:** CUDA/HIP の batched chunk 処理では `STRATA_ATTN_LANECELL` が有効なら lane-cell kernel が先に使われる。CUDA の INT8 chunk-down 経路 (`attn_v3_on()`) も通常の pre75 chunk 選択を通らない（`engine/src/kernels/cuda/qsa_decode_attn.cu:1041-1042,1057-1064,1095-1116,1132-1142`）。
+- **複数 slot / row:** pre75 kernel が有効でも `STRATA_ATTN_PRE75_SLOTS` が off なら fused slot 呼び出しは `false` を返し、呼び出し側は各 query を通常の batch 関数へ fallback する。rows 経路も per-row 呼び出しへ切り替える。これは pre75 kernel 自体の無効化ではない。明示的な `STRATA_ATTN_PRE75_SLOTS` は `atoi(v) != 0`、未設定なら `STRATA_BATCH_QSA_STREAM_OPT` の `atoi` 結果で判定する（`engine/src/kernels/cuda/qsa_decode_attn.cu:978-990,1167-1172,1252-1270`; 呼び出し側 `engine/src/core/verify.cpp:2435-2447,2466-2468`）。
+- **SYCL:** `STRATA_EXPERIMENTAL_SM60` のときだけ `pre75_attn()` を定義するが、`rg` で確認できる同関数の参照は定義内と未展開の `STRATA_ATTN_CHUNK` マクロだけで、呼び出し箇所がない。SYCL の `qsa_decode_attn_batch` と `qsa_decode_attn_step` は通常の `attn_chunk_kernel` を直接起動する（`engine/sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp:767-792,1001-1015,1307-1395`）。
 
 ## 実行時の詳細
 
-この設定は QSA attention の計算式や入力値を変えるのではなく、`qsa_decode_attn_batch` が起動する chunk kernel を切り替える。`pre75_attn()` が真なら PR #540 の実装、偽なら標準実装を選ぶ。バッチ関数は prefill、verification、MTP などから呼ばれている。ソースコメントは PR #540 の kernel を同じ演算順の bit-exact な実装と説明しているが、この調査では独自の実行・測定は行っていない。
+CUDA/HIP の環境値は `pre75_attn()` の最初の実行時に一度読み取られ、プロセス内で cache される。後からプロセス環境を書き換えても再評価されない。GPU の compute capability / HIP arch 判定も `cc[64]` に device index ごとに cache される。CUDA の標準 build では `daily_attn()` の環境値も同様に一度 cache される（`engine/src/kernels/cuda/qsa_decode_attn.cu:902-923,930-964`）。
 
-この変数専用のログ出力はない。通常ビルドで該当コードがコンパイルされていない場合、設定しても効果はない。
+pre75 が選ばれると、各 K/V mode（FP16、INT8、Q4、INT8 K + Q4 V）について `attn_chunk_kernel_pre75` 系を起動し、既定分岐では `attn_chunk_kernel` 系を起動する。HIP の pre75 kernel は wave32 用のテンプレート引数で起動される。`qsa_decode_attn_step` は QSA decode の通常 attention 経路から呼ばれ、batch 経路も pre75 判定を chunk launch に渡す（`engine/src/core/layer.cpp:1287-1289`; `engine/src/kernels/cuda/qsa_decode_attn.cu:1038-1040,1101-1116,1132-1142,1309-1349`）。
+
+## ログと測定値
+
+この環境変数の値や選択 kernel を示す専用ログは確認できない。device の取得・属性問い合わせに失敗すると `pre75_attn()` は `false` を返し、CUDA runtime error state を消去する。kernel 起動後のエラーは `qsa_decode_attn_batch: %s` または `qsa_decode_attn: %s` を stderr に出して `exit(1)` する（`engine/src/kernels/cuda/qsa_decode_attn.cu:942-960,1143-1147,1350-1354`）。
+
+`docs/SETTINGS.md` はこの変数を「NVIDIA and AMD, Intel Arc」と記載しているが、SYCL decode 側の関数に呼び出しがなく、現在確認したソースから Intel Arc 上での実効性は裏付けられない。`docs/OLDER_GPUS.md` と `docs/NVIDIA_V100.md` の説明は一部の GPU 条件を示す資料として確認したが、現行の挙動は上記ソース分岐に基づく。資料上の性能値は本調査で再測定していない（`docs/SETTINGS.md:28`; `docs/OLDER_GPUS.md:143`; `docs/NVIDIA_V100.md:42`）。
 
 ## 根拠
 
-- `src/kernels/cuda/qsa_decode_attn.cu:282-290` — kernel の説明と CUDA/HIP でのコンパイル条件。
-- `src/kernels/cuda/qsa_decode_attn.cu:575-614` — 値の読み方、static 初期化、CUDA/HIP ごとのデバイス判定と kernel 選択マクロ。
-- `src/kernels/cuda/qsa_decode_attn.cu:618-620, 690-701` — バッチ関数と選択された kernel の起動箇所。
-- `sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp:308-312, 550-576` — SYCL 側のビルド条件、値の判定、compute capability による選択。
-- `CMakeLists.txt:154-154, 188-192` — CUDA の `STRATA_EXPERIMENTAL_SM60` は既定 OFF で、ON 時に compile definition を付ける。
-- `src/prefill/prefill.cpp:2848`, `src/core/verify.cpp:1376-1391`, `src/core/mtp.cpp:825` — CUDA/共通側の batch 関数の呼び出し例。SYCL 側にも対応する呼び出しがある。
-- `docs/OLDER_GPUS.md:26, 98-100`, `docs/NVIDIA_V100.md:33` — gfx103x の既定選択、`=0` による停止、CUDA sm_70 での位置づけに関する説明。これらはソース上の条件と照合した。`docs/DETAILS.md` にこの変数の記載は見つからなかった。
+- `engine/src/kernels/cuda/qsa_decode_attn.cu:492-505` — kernel の build 条件。
+- `engine/src/kernels/cuda/qsa_decode_attn.cu:902-923,926-990` — `STRATA_ATTN_DAILY`、対象変数、slot fallback の判定。
+- `engine/src/kernels/cuda/qsa_decode_attn.cu:1038-1116,1132-1147,1150-1224,1227-1301,1309-1354` — chunk/slot/rows/step の実際の kernel 選択とエラー経路。
+- `engine/src/core/layer.cpp:1287-1289`; `engine/src/core/verify.cpp:2435-2447,2466-2468` — decode および verify からの呼び出し。
+- `engine/sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp:767-792,1001-1015,1307-1395` — SYCL 側の未使用関数と通常 kernel の起動。
+- `docs/SETTINGS.md:28`; `docs/OLDER_GPUS.md:143`; `docs/NVIDIA_V100.md:42` — ソースと照合した説明資料。

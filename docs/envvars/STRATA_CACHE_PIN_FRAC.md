@@ -1,52 +1,64 @@
 # `STRATA_CACHE_PIN_FRAC`
 
-調査対象: Strata `main` の HEAD `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-`--serve` の適応 fetch が GPU expert cache の resident expert を入れ替えるとき、profile の上位 expert を何 slot 分 eviction 候補から除外するかを割合で指定する。値から pin 数を計算するだけでは保護処理は走らず、実際には `STRATA_ADAPT_FETCH` が有効な fetch 経路でのみこの pin 配列が参照される。通常の起動時 profile fill や適応 tier 自身の入れ替えをこの変数が直接変更するコードはない（`engine/src/program/generate.cpp:14883-14904`、`engine/src/core/expert_source.cpp:5637-5658`）。
+`--serve` の適応型 VRAM expert cache が入れ替え候補を選ぶとき、`--expert-profile` の上位から指定割合の常駐 expert を eviction 対象から外す。さらに PCIe fetch admission が有効な場合も、その expert を eviction 候補にしない。値は pinned expert 数を決める割合で、0 は pinning を無効にする。`--adapt-swaps` は入れ替え数を制御する別設定で、この pinning の有効化を上書きしない（`engine/src/program/generate.cpp:14976-15000,15349-15379`、`engine/src/core/expert_source.cpp:5640-5676`）。
+
+この環境変数を読むのは CUDA/HIP の `generate.cpp` server 経路である。profile が空でないこと、host residency 表があり、GPU cache に空き枠があり、全 experts が常駐していないことが読み取り前提になる（`engine/src/program/generate.cpp:14976-14980`）。
 
 ## 値と判定
 
-serve の cache/profile 条件を満たした初期化時に `std::getenv` で一度読み、共通 helper が `std::atof` で数値変換する。未設定または空文字なら、resident slot が全 expert の 25% 未満の場合だけ割合 `0.25`、それ以外は `0`。空でない値は先頭から `atof` が読める数値を使い、`0.0..0.75` に clamp する。文字列全体の妥当性検査、空白除去、エラー通知はない。
+`std::getenv` の結果を `low_vram_pin_slots` に渡し、非空文字列は `std::atof` で変換して `0.0..0.75` に clamp する。数値文字列全体の検証はなく、`atof` が読める先頭の数値部分が使われる。変換後の割合に常駐枠数を掛け、小数部を切り捨てた数を pin する（`engine/src/program/generate.cpp:14978-14980`、`engine/include/strata/core/low_vram_rules.hpp:120-129`）。
 
-| 条件 | unset | 有効になる値 | 無効・境界の例 |
-|---|---|---|---|
-| `--serve` の pin 数計算 | resident slot が全 expert の 25% 未満なら 0.25、それ以外は 0 | `0.25` なら resident slot 数の約 25%（端数切り捨て）を上限に profile 上位を pin | 空文字は unset と同じ。`0`、`0abc`、`-1`、`abc` は 0 slot。`1` は 0.75 に clamp。`0.5tail` は数値接頭辞 `0.5` として扱う |
+| 状態・入力 | 判定 |
+|---|---|
+| 未設定（`getenv` が null） | `STRATA_TINY_CACHE` が正確に `1` のときだけ helper を呼ぶ。cache が experts の 25% 未満なら既定割合 0.25、それ以外は 0。`STRATA_TINY_CACHE` が有効でなければ pin 数 0。 |
+| 空文字 | 未設定相当。`STRATA_TINY_CACHE=1` なら上記の条件付き既定値、それ以外は pin 数 0。 |
+| 数値 `0`（例: `0`, `0.0`） | 明示値として変換され 0 に clamp されるため無効。`STRATA_TINY_CACHE=1` の既定 pinning も抑止する。 |
+| 正の数（例: `0.25`, `1`） | 上限 0.75。たとえば `1` は 0.75 として扱う。割合×常駐枠数を切り捨てるため、結果が 1 未満なら pin は発生しない。 |
+| 負数（例: `-1`） | 0 に clamp され、pin しない。 |
+| 上限超過（例: `0.8`, `96`） | 0.75 に clamp される。 |
+| 数値で始まる文字列（例: `0.5junk`） | `atof` の数値 prefix が変換され、0.5 として扱う。先頭空白も `atof` の変換規則に従う。 |
+| 数値に変換できない文字列（例: `true`, `junk`） | `atof` は 0 を返し、pin しない。無効値の警告やエラー処理はない。 |
 
-算出数は `(int64_t)(resident_slots * frac)` で小数部を切り捨てる。したがって割合が正でも計算結果が 0 なら pin は作られず、ログも出ない。`atof` 後の clamp 以外に値域検証はなく、CLI 引数でこの割合を直接上書きする経路もない（`engine/include/strata/core/low_vram_rules.hpp:104-116`）。
+空でない値があれば `STRATA_TINY_CACHE` が未設定または `1` 以外でもこの値による pinning を試みる。`STRATA_TINY_CACHE` は未設定・空値かどうかではなく、文字列全体がちょうど `1` かで判定される（`engine/src/program/generate.cpp:14979-14980`、`engine/include/strata/core/low_vram_rules.hpp:106,120-129`）。
 
 ## 有効になる条件
 
-- `--serve` で、読み込んだ `--expert-profile` が空でなく、host residency table があり、GPU cache slot が 1 つ以上あり、全 expert が GPU 常駐ではないこと。これを満たさない場合は `STRATA_CACHE_PIN_FRAC` の読み取り自体が行われない（`engine/src/program/generate.cpp:14840-14857,14883-14885`）。
-- pin 対象は profile の先頭から走査し、host residency table 上で現在 GPU resident の expert を最大 `pin_n` 個選ぶ。 profile 外や非 resident の expert は pin されない。profile のロード失敗は `strata generate: <error>` を stderr に出して終了コード 1 で返る（`engine/src/program/generate.cpp:6718-6724,14889-14904`）。
-- pin が eviction 防止として効くには、さらに `STRATA_ADAPT_FETCH` が正の値で、適応 fetch が使える実行経路であること。serve 側では residency table/cache slot があることに加え、single GPU、非 peer・非 helper、非 split、非 `--spec-split`、非 `--adapt-async`、非 `--pipeline-windows`、非 batch、`STRATA_ADAPT_OVERLAP` が有効でないこと、PCIe share と GPU plan が使えることなどが gate される。`STRATA_ADAPT_OVERLAP` は値の先頭文字が `1` なら有効扱い（Windows HIP では `STRATA_WIN_HIP_RISKY` による拒否判定もある）。`--pcie-mode dma` / `direct`、resident RAM mode も対象外（`engine/src/program/generate.cpp:14960-14977,2264-2283`）。
-- 適応 fetch が off でも、上記 profile/cache 条件を満たせば pin 数の計算と pin 件数ログまでは行われる。しかし `fetch_pin` を参照するのは `fetch_on && fetches > 0` の fetch eviction 処理だけである（`engine/src/core/expert_source.cpp:5555-5558,5637-5658`）。
-- 同じ `generate.cpp` の通常 generate 経路では `fetch_pin` への設定が見つからず、この変数による pin 配列は設定されない（唯一の設定箇所: `engine/src/program/generate.cpp:14897`）。
-- 名前は `terminal/data/settings-register.json:3339` にも設定項目 metadata として載るが、Strata が実行時に環境値を読む箇所は serve 側の `std::getenv` だけである。索引 `000_envvers.md` の候補名だけでなく、この読み取りと helper の全参照を確認した。
+- `--serve` の適応型 cache 経路に入っていること。通常の非 server 生成経路にはこの環境変数の読み取りがない（読み取り箇所は `engine/src/program/generate.cpp:14978` のみ）。
+- `--expert-profile` からランキングが読み込まれ、`profile` と `host_res` が空でないこと。profile の読み込みに失敗すると `strata generate: <理由>` を stderr に出して終了コード 1 で戻る（`engine/src/program/generate.cpp:6746-6751,14976-14980`）。
+- GPU expert cache の合計 `live_gpu_slots` が正で、全 experts がすでに常駐していないこと。全 experts 常駐・0 枠・空 profile の場合、環境変数は読み取られない（`engine/src/program/generate.cpp:14932-14933,14948-14950,14976-14980`）。
+- pin 数が正で、profile の順に見た pair が `host_res` 上で resident であること。該当 pair が不足すれば、要求数より実際の pin 数が少なくなる（`engine/src/program/generate.cpp:14981-14998`）。
+- `STRATA_TINY_CACHE=1` は未設定または空の `STRATA_CACHE_PIN_FRAC` に 25% 未満 cache の既定 pinning を与える。明示した非空値は同変数の有無にかかわらず使われる（`engine/src/program/generate.cpp:14978-14980`）。
+- pin は adapt worker が動くときに resident expert の eviction 候補を除外する。PCIe fetch admission 経由の入れ替えにも `fetch_pin` が参照されるが、その経路自体には PCIe share と `STRATA_ADAPT_FETCH` の有効化など別条件がある（`engine/src/program/generate.cpp:15067-15088,15349-15379`、`engine/src/core/expert_source.cpp:5555-5558,5640-5659`）。
+- `--adapt-swaps 0` などで通常の適応型入れ替えが停止しても pin 数の計算自体は独立して行われる。ただし eviction がなければ pin の実効的な差はない。明示 `--adapt-swaps` が pin 数や割合を上書きする処理はない（`engine/src/program/generate.cpp:4202,14976-15002,15349-15379`）。
 
 ## 実行時の詳細
 
-profile と cache の準備後、serve の初期化で `live_gpu_slots` を primary と各 stage の cache slot 数から求め、`total_expert_pairs` を layer 数と expert 数の積として算出する。helper はこの2数と環境値から pin 数を計算する（`engine/src/program/generate.cpp:14855-14857,14883-14885`、`engine/include/strata/core/low_vram_rules.hpp:106-116`）。
+profile をロードして GPU cache と host residency を整えた後、serve 経路の初期化中に `std::getenv("STRATA_CACHE_PIN_FRAC")` を一度呼び、`pinned_pair` を構築する。関数 static ではないが、同じ初期化中に何度も読み直す処理でもないため、プロセス実行中に環境値を変えてもこの run の pinning 設定は更新されない（`engine/src/program/generate.cpp:14976-15000`）。
 
-pin 数が正の場合、profile 順に resident expert の bitmap を作り、その配列を `drive.d.fetch_pin` に渡す。fetch eviction は各 layer で resident かつ現在の window で使われていない候補を選ぶ際、pin bitmap が立っている expert を飛ばす。そのため保護されるのは適応 fetch が入れ替え先を選ぶ際の eviction 候補からであり、初期 cache 配置、cache 容量、route 選択を変える設定ではない（`engine/src/program/generate.cpp:14887-14898`、`engine/src/core/expert_source.cpp:5640-5671`）。
+pin 数は `profile` の先頭から順に `(layer, expert)` を調べ、`host_res` が resident を示す pair だけを最大 `pin_n` 個選ぶ。配列は `drive.d.fetch_pin` に渡され、通常の適応型入れ替えでは `pinned_pair` が立った resident pair を victim 候補 `vict` に入れない。fetch admission では `fetch_pin` の立った pair を victim 探索から飛ばす（`engine/src/program/generate.cpp:14981-14998,15354-15379`、`engine/src/core/expert_source.cpp:5653-5659`）。
 
-環境値そのものはこの初期化箇所で都度読み、static cache には保存しない。初期化を通過した後のプロセス内環境変更は、すでに作られた pin 配列には反映されない。なお `STRATA_ADAPT_FETCH` 自体は `adapt_fetch()` 内の関数 static に一度だけ読み込まれ、`atoi` の値を `0..2` に clamp する。実値 1 または 2 で fetch が有効になる（`engine/src/program/generate.cpp:2340-2343`）。
+影響は cache の eviction 選択であり、profile の順位や token 計算を直接変更する処理はここにはない。pin で除外した枠の代わりの victim が見つからなければ、その入れ替えは成立しない（`engine/src/program/generate.cpp:15364-15375`）。
 
 ## ログと測定値
 
-pin が1件以上作られた場合、stderr に次の形式で出る（`%lld` は実数値）。
+1 件以上 pin したときだけ stderr に次の行を出す。表示するのは実際に pin できた数と cache 枠数である。pin 数 0、適用条件不成立、profile 内の該当 resident 不足ではこのログは出ない。無効な文字列専用の警告・終了経路はない（`engine/src/program/generate.cpp:14981-14998`）。
 
 ```text
-strata serve: tiny expert cache: pinned top %lld of %lld profile experts against eviction (STRATA_CACHE_PIN_FRAC=0 turns it off)
+strata serve: tiny expert cache: pinned top <pinned_ct> of <live_gpu_slots> profile experts against eviction (STRATA_CACHE_PIN_FRAC=0 turns it off)
 ```
 
-表示される2数は順に実際に pin できた件数と `live_gpu_slots`。profile/cache gate を通らない、pin 数が 0、または resident profile expert が見つからない場合はこの行は出ない。`STRATA_ADAPT_FETCH` が無効でも pin 作成が行われればログは出るため、このログ単独では fetch eviction での効果を示さない。Strata の `docs/DETAILS.md` にこの環境変数名の記載は確認できなかったため、性能・正確性の測定値は記載しない（`engine/src/program/generate.cpp:14896-14904`）。
+`low_vram_rules.hpp` のコメントは、RTX 5080（sm_120、16 GB）、Qwen3.8-Flash-Next IQ2_XS、`--expert-cache 3000`（experts の 12.2%）、同一 binary、arms alternating、5 rounds の比較を記録する。0.1.65 比で tiny-cache rules 有効時の decode は code / chat / 8K document でそれぞれ -22% / -18% / -13%、`--adapt-swaps 96` 明示時は -10% / -10% / -3%、さらに pin 無効（`STRATA_CACHE_PIN_FRAC=0` と `96`）では -5.5% / -6.4% / -4.4% と記載されている。これは設定の組合せの比較であり、この環境変数単独の効果値とは読めない。同コメントは cache 7.6%（`--expert-cache 1800`）の途中 2 rounds についても、rules 有効時 -25% / -18% / -18%、96 swaps 時 -10% / -8% / -5% と記す（`engine/include/strata/core/low_vram_rules.hpp:100-105`）。`docs/DETAILS.md:147` は `STRATA_TINY_CACHE=1` と低 coverage の概要を記すが、この環境変数単独の動作説明はない。
 
 ## 根拠
 
-- `engine/src/program/generate.cpp:14855-14857,14883-14904` — slot 数、環境読み取り、profile 順の pin bitmap 作成、serve ログ。
-- `engine/include/strata/core/low_vram_rules.hpp:104-116` — default、`atof`、clamp、slot 数への変換。
-- `engine/src/core/expert_source.cpp:5271-5275,5555-5558,5637-5672` — fetch 条件と eviction 候補から pin 済み expert を除外する処理。
-- `engine/include/strata/core/expert_source.hpp:674-685` — `fetch_pin` の役割。
-- `engine/src/program/generate.cpp:6718-6724,14960-14994` — profile の読み込み失敗経路と serve 側適応 fetch gate。
+- 候補名の環境読み取りは `engine/src/program/generate.cpp:14978` の `std::getenv` 1 箇所。ほかの名前参照は `engine/include/strata/core/low_vram_rules.hpp:103,105,119` のコメントと `terminal/data/settings-register.json:3386-3396` の登録情報。
+- 割合変換、clamp、既定値、slot 数: `engine/include/strata/core/low_vram_rules.hpp:118-129`。
+- profile 読み込み: `engine/src/program/generate.cpp:6746-6751`。
+- pin bitmap の設定とログ: `engine/src/program/generate.cpp:14976-15000`。
+- 通常の適応型 eviction 候補からの除外: `engine/src/program/generate.cpp:15349-15379`。
+- fetch admission の eviction 候補からの除外: `engine/src/core/expert_source.cpp:5640-5676`。
+- CLI `--adapt-swaps` の parse と pin とは独立した処理: `engine/src/program/generate.cpp:4202,14976-15002`。

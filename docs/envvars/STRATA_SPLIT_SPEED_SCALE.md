@@ -1,47 +1,42 @@
 # `STRATA_SPLIT_SPEED_SCALE`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の layer split を `--layer-split auto` で自動配置するとき、各 GPU stage の推定処理速度に倍率を掛けます。この値は分割探索用の速度モデルだけに使われ、GPU の実クロックや実行速度は変更しません。未設定なら推定値に変更はありません。ソースコメントは「test seam」と呼びますが、本番コードにも読み取り処理があり、自動配置の候補評価に影響します。
+CUDA の `--layer-split auto` が各 GPU のレイヤー処理時間を見積もる際、GPU ごとの推定速度に倍率を掛ける開発・診断用の調整値である。たとえば `1,0.55` は CUDA0 の速度をそのままにし、次の stage の推定速度を 0.55 倍にする。コメント上も「test seam」とされている。実際の GPU クロックやカーネル実行速度は変更せず、自動分割の候補評価と選択に使う予測値だけを変える（`engine/src/program/generate.cpp:6976-6985,7101-7107`）。
 
 ## 値と判定
 
-環境変数は各 stage の推定速度を計算するときに読みます。未設定または空文字列なら倍率処理を行いません。非空ならカンマ区切りの要素を stage 番号に対応させ、対象要素を `std::atof()` で変換します。
+自動分割の速度表を作る stage ごとに `std::getenv` で読み、空でない場合は stage の 0 始まりの番号 `i` だけカンマをたどった位置から `std::atof` で倍率を読む。文字列全体の検証はせず、`atof` が解釈できる数値の接頭部分を使う。変換結果 `f` が `f > 0.0` の場合だけ適用し、適用後の速度は `max(1.0, 元の速度 * f)` で下限 1 に制限される。各 GPU の元の速度は SM 数 × クロック（GHz）で、クロック取得失敗または非正値の場合は 1.8 GHz を使う（`engine/src/program/generate.cpp:6968-6975,6979-6985`）。
 
-| 入力 | 動作 |
-|---|---|
-| `0.57,1` | stage 0 の推定速度を 0.57 倍、stage 1 を 1 倍する |
-| `1,0.55` | stage 0 を変更せず、stage 1 を 0.55 倍する |
-| `0.5` | stage 0 のみ 0.5 倍。後続 stage は要素がないため変更しない |
-| `,0.5` | stage 0 の空要素は 0 となり変更なし。stage 1 は 0.5 倍 |
-| `abc,0.5` | `abc` は 0 として stage 0 は変更なし。stage 1 は 0.5 倍 |
-| `-1,0.5`、`0,0.5` | 0 以下の倍率は無視し、stage 0 は変更なし。stage 1 は 0.5 倍 |
+| 条件 | 未設定 | 有効になる値の例 | 無効・適用されない値の例 |
+|---|---|---|---|
+| stage `i` | 倍率 1 相当（速度を変更しない） | `1`（CUDA0）、`1,0.55`（CUDA0 と次 stage）、`1,0.55,2`（3 stage 目まで） | 空文字、当該 stage の項目がない文字列、`0`、`-1`、`text`、`1,` の空項目 |
 
-要素の前後空白や数値の後ろに文字がある場合の厳密な受理規則は `atof()` に委ねられ、文字列全体の検証やエラー報告はありません。正の倍率を適用した後の推定速度は `max(1.0, speed * 倍率)` に制限されます。倍率が非常に小さい場合も速度は 1.0 を下回りません。カンマ以降の余分な要素は、実際の stage 数を超える分は参照されません。
-
-根拠: `src/program/generate.cpp:4330-4349`。
+`atof` のため、先頭空白や符号を含む数値接頭部分は変換され、後続の非数値文字は検査されない（例: `1junk` は 1、`1,0.55tail` の第 2 項目は 0.55）。正数であれば 1 未満も 1 超も受理され、上限クランプはない。`0`、負数、数値に変換できない項目は倍率を適用しない。カンマで分割した各項目は全体として検証されないため、余分な項目は stage がなければ参照されない（同 `generate.cpp:6979-6984`）。
 
 ## 有効になる条件
 
-- CUDA の複数 GPU layer split が選ばれ、`--layer-split auto` の配置探索に入る場合に読み取られます。手動の layer split や単一 GPU では、このコード経路に入りません。
-- 各 stage の倍率は、その stage の GPU の SM 数と CUDA-reported clock rate から作る `speed` に適用されます。倍率が適用された `layer_ms` は予測 decode window 時間に加算され、2〜4 GPU の配置探索の採点と、4 GPU 超の比例配置の layer 割当てに使われます。
-- 予測時間が同等の候補を比べる際の slowest-stage 時間にも `layer_ms` が使われます。別の容量・prompt 開始可能性の条件や、後段の小 stage 再探索があるため、倍率だけで境界が決まるわけではありません。
-- 変数に既定の補完値はありません。stage に対応する要素が欠ける場合やその要素が正数でない場合、その stage の倍率は 1 相当（変更なし）です。
-
-根拠: `src/program/generate.cpp:4321-4349,4463-4467,4481-4486,4630-4642,4744-4804`。
+- Strata の CUDA `generate` 経路で `--serve` と `--layer-split auto` が成立し、実際に複数 GPU の自動分割探索へ進むこと。コードは `o.serve` を要求し、探索箇所は `multi_gpu && split_auto` で囲まれる（`engine/src/program/generate.cpp:4803-4807,4856,6959`）。
+- `--layer-split auto` であっても、利用可能な後段 GPU がなく単一 GPU になる場合は自動分割が解除され、倍率を使う探索は行われない（`engine/src/program/generate.cpp:4836-4839`）。`--split-skip-if-fits` により CUDA0 単独へ切り替わる場合も同様（同 `generate.cpp:6446-6481`）。
+- 明示的な `--layer-split K[,K2..]` は自動配置探索ではないため、この倍率の対象外。自動分割自体が `--serve` なしでは有効にならない（同 `generate.cpp:4803-4807,4848-4853`）。
+- この変数と CLI 引数・別環境変数の優先順位や上書き処理はない。ほかの条件で自動分割経路が無効になる場合は値も参照されない。
 
 ## 実行時の詳細
 
-読み取りと配置探索は layer split 初期化中に行われます。`getenv()` の結果は `static` に保存されないため、stage ごとの速度計算で取得し直しますが、候補探索後に環境を変更しても既に選ばれた配置は再計算されません。各 stage の診断行 `strata generate: layer split auto: CUDA%d ... -> ... ms per layer` は倍率を反映した `layer_ms` を出しますが、表示する SM 数・GHz は元の GPU 属性値です。環境変数専用の警告や parse error はありません。
+自動分割探索の前に、CUDA0 と各後段 stage の SM 数・クロックから基準速度を作り、環境変数の該当項目が正数なら倍率を適用する。その速度から `layer_ms = 0.33 * (84 * 2.617) / speed` を計算し、stage のレイヤー数に応じた予測時間を候補のコストへ加える。2～4 GPU の探索では候補の予測時間や同点時の比較に使われ、5 GPU 以上などの比例配分経路では速度比からレイヤー境界を計算する。したがって倍率は自動で選ばれる境界に影響し得るが、実行時に各 stage が処理する実レイヤー数を直接指定するものではない（`engine/src/program/generate.cpp:6985,7101-7107,7121-7127,7273-7284,7382-7388`）。
 
-## 文書との照合
+値は関数内 `static` には保存されず、stage ごとの速度表を組み立てるときに読み取られる。以降の候補再探索は作成済みの `layer_ms` を再利用する。読み取り後に環境を変更しても、作成済みの速度表や選択済み境界には反映されない（`engine/src/program/generate.cpp:6968-6979,7388`）。
 
-`docs/MULTI_GPU.md:70-82` は、2x RTX A4000 を `STRATA_SPLIT_SPEED_SCALE=0.57` と `--vram-reserve-mib 4400` で不均等に評価した条件での自動配置比較を記録しています。同資料では旧ルール K=3 に対して新ルール K=20、prompt reading 945→1,441 tok/s、decode 50.2→65.9 tok/s としています。これは記載された 14.5K token prompt、IQ3_XXS、5 組の interleaved run の結果であり、速度倍率単独の効果や他環境での性能を示すものではありません。ソース上もこの変数は stage 速度推定値を調整し、自動配置探索で利用されています。
+## ログと測定値
+
+有効・無効値に関する専用の警告やエラーはなく、無効項目は倍率を適用せず進む。各 stage について `strata generate: layer split auto: CUDA%d %d SMs at %.2f GHz -> %.2f ms per layer, %.2f GiB free before its session carve` を stderr に出す。この行の `ms per layer` は倍率適用後の推定値だが、表示される SM 数と GHz は取得したハードウェア値である。選択後には `strata generate: layer split auto: K=... - predicted ... ms per decode window; ...` の行が出る（`engine/src/program/generate.cpp:6985-6988,7510-7515`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:4321-4349` — CUDA 自動分割時の GPU 属性取得、変数の読み取りと倍率適用、推定 layer 時間。
-- `src/program/generate.cpp:4463-4467,4481-4486,4630-4642,4705-4708` — 推定時間を用いた候補採点、slowest stage の tie-break、比例配置。
-- `docs/MULTI_GPU.md:70-82` — 自動配置の背景と特定環境での測定記録。
+- 候補一覧への掲載: `docs/envvars/000_envvers.md:2129`。
+- Strata 所有ソースでの実読み取りと倍率適用: `engine/src/program/generate.cpp:6976-6985`。
+- 自動分割の serve 条件と単一 GPU 時の解除: `engine/src/program/generate.cpp:4803-4807,4836-4839`。
+- 予測コスト・比例配分への使用: `engine/src/program/generate.cpp:7101-7107,7273-7284,7382-7388`。
+- stage と選択結果のログ: `engine/src/program/generate.cpp:6985-6988,7510-7515`。

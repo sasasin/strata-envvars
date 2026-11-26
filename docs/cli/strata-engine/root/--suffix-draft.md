@@ -1,63 +1,65 @@
 # `--suffix-draft`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン、トップレベル引数） |
+| コマンド | `strata`（エンジン引数。トップレベル） |
 | オプション | `--suffix-draft` |
 | 別名 | なし |
-| 値 | 整数 `N`。同じ文脈の過去の出現との最小一致長として使う。 |
+| 値 | 整数 `N`。照合する文脈の最小一致長を指定する。既定値は `3`。 |
 
 ## 役割
 
-プロンプトや確定済み出力にある文字列の繰り返しを探し、過去の一致箇所の続きから speculative decoding の候補 token を作ります。候補は検証窓に使われ、モデルの通常出力を置き換える直接出力ではありません。通常の推論経路では、MTP（multi-token prediction）の窓と比べて検証効率がよいとオンライン方針が判断した場合に suffix 候補を使います（`src/program/generate.cpp:773-777,14892-14902`、`src/spec/draft_policy.cpp:123-150`）。
+生成中の文脈末尾が、それ以前の文脈と一致したとき、以前の一致箇所に続く token を speculative verification 用の候補として提案します。コード編集や引用など、既出テキストの続きを生成する場面で候補になり得ます。候補を使うかは一致長だけでは決まらず、ドラフトの受理状況と検証窓の測定コストを使う `DraftPolicy` が選びます。
 
 ## 使い方
 
 ```sh
-strata generate --pack pack/full --tokens "1,2,3" --suffix-draft 3
+# prompt lookup を無効化し、MTP のドラフトだけで生成する
+strata --pack MODEL --suffix-draft 0
+
+# 既定値（3 token 以上の一致）で一度の生成を行う
+strata --pack MODEL --suffix-draft 3
+
+# server モードでも同じ設定を使う
+strata --pack MODEL --serve --suffix-draft 3
 ```
 
-これはエンジンの usage が示す必須引数 `--pack` と `--tokens` を含む例です。`--tokens` は token ID の例示であり、実際には利用するモデルに対応する prompt token を指定してください（`src/program/generate.cpp:806-812`）。
+`MODEL` は利用するモデル pack のパスに置き換えます。
 
 ## 値と既定値
 
-- 省略時は `3` です（`src/program/generate.cpp:773-777`）。
-- parser は `atoi` で整数化してから `max(0, 値)` を設定します。負数は `0` になり、`0` は suffix drafting を無効にします。非数値文字列は `atoi` の変換結果に従い、通常は `0` になります。数値の前置部分だけが変換される値も拒否されません（`src/program/generate.cpp:2672`）。
-- `N` が正なら drafter を有効にします。実装へ渡す最小一致長は `max(1, N)` ですが、`SuffixDrafter` の constructor がさらに最低 `3` に切り上げます。したがって `1` や `2` はエラーにならず、実効最小一致長は 3 token です（`src/program/generate.cpp:11177,16428`、`src/spec/suffix_drafter.cpp:14-16`）。
-- 同じオプションを複数回指定した場合は parser の走査順で後の値が前の値を置き換えます（`src/program/generate.cpp:2416-2420,2672`）。
-- 値を省略すると `--suffix-draft needs a value` を stderr に出して終了コード 2 で終了します（`src/program/generate.cpp:2418-2420`）。
+- 省略時は `3` です。parser は `std::atoi` で値を整数化し、`std::max(0, ...)` により負数を `0` にします。`0` は suffix drafting を無効にします。parser に正の上限値チェックはありません。`engine/src/program/generate.cpp:1156-1160,4121`。
+- parser は非数値の文字列を個別に拒否せず、`atoi` の結果を使います。先頭を数値として読めない値は `0` となり無効化と同じ扱いです。値を省略すると `next` が stderr に `--suffix-draft needs a value` を出し、終了コード `2` で終了します。`engine/src/program/generate.cpp:3844-3846,4121`。
+- 重複指定は parser が順に代入するため、最後に指定した値が残ります。`engine/src/program/generate.cpp:3842-3848,4121`。
+- 実際の matcher は最小一致長を少なくとも `3` にします。そのため `N=1` や `N=2` でも 1〜2 token の一致だけでは提案しません。構築時の `max_match` は `max(N, 64)` です。`engine/src/program/generate.cpp:16410`, `engine/src/spec/suffix_drafter.cpp:18-24,64-81`。
 
 ## 実行時の動作
 
-有効時、suffix drafter は token 履歴の trigram 索引を保持し、現在末尾の過去の一致候補を最大 64 token まで後方比較して最長一致を選びます。一致長がしきい値に届かなければ候補はありません。履歴は prompt と、検証後に確定した出力 token から構成されます。索引は固定容量の open-addressing table で、生成コードは容量を `max_context + 4096` token として初期化します（`include/strata/spec/suffix_drafter.hpp:7-10,23-31`、`src/spec/suffix_drafter.cpp:14-21,42-67`、`src/program/generate.cpp:11177,14175-14179,14739,15151-15157,16459-16463,16680-16685`）。
+`--suffix-draft` が正で、`--spec` が `2` 以上、かつ `--mtp-max-t` が `0` の場合、エンジンは MTP の窓を元の `--spec` に保ちつつ、検証窓の `--spec` を最大 2 token、上限 8 まで広げます。`--mtp-max-t` を明示した場合はこの自動設定を行いません。`--lookup-max-t` が有効なら、その値とビルドの上限に応じてさらに lookup 窓の上限を設定します。窓の実際の幅や利用可能な graph は build・実行条件に依存します。`engine/src/program/generate.cpp:5033-5039,5079-5098`。
 
-MTP を使う通常経路では、`N > 0`、`--spec >= 2`、かつ `--mtp-max-t` が 0 の場合に、元の `--spec` を MTP 窓上限 `--mtp-max-t` に保存し、検証窓の `--spec` を最大 8 まで 2 増やします。`--mtp-max-t` を明示した場合、または `--spec < 2` の場合、この自動拡張は行われません（`src/program/generate.cpp:3205-3210`）。
+生成時には prompt と、確定した生成 token を履歴へ追加します。履歴末尾と同じ trigram を持つ過去位置を候補にし、その位置から遡って最長一致を探します。一致長が `N` 以上なら、その直後の token 列を最大要求数まで提案します。候補がない、一致が短い、または提案長が 0 の場合は提案しません。`engine/src/spec/suffix_drafter.cpp:51-61,64-85`。
 
-各窓で suffix 候補の先頭が MTP の先頭予測と一致することを確認します（MTP を使わない場合を除く）。その後 `DraftPolicy::choose` が、観測した候補受理率と窓サイズごとの実測時間・推定時間から token/ms を比較し、MTP より margin 分よいと判断した候補窓を選びます。候補がない、先頭予測が一致しない、または方針が採用しない場合は suffix 窓を選びません。first window では suffix lookup を行いません（`src/program/generate.cpp:14889-14902,16551-16562`、`src/spec/draft_policy.cpp:123-150`）。
+提示した token 列はそのまま出力に確定するのではなく、通常の verifier の候補です。`DraftPolicy::choose` は lookup と MTP の期待受理 token 数を窓コストで割って比較し、lookup 側が margin を超えた場合などに lookup 窓を選びます。MTP の決定的な経路では先頭候補が MTP の先頭予測と一致することも条件です。確率的 MTP の経路にはその一致条件を課さず policy で選ぶ分岐があります。したがって `N` を下げても毎回 lookup が使われるわけではありません。`engine/src/spec/draft_policy.cpp:577-615`, `engine/src/program/generate.cpp:22712-22735`。
 
-`--lookup-chain` と併用した場合、両機能で suffix 履歴索引を共有します。ただし通常の窓では suffix 窓を選んだ round に chained lookup は追加されず、suffix が不採用で、chain の条件を満たすときに別途 chained 候補を検討します（`src/program/generate.cpp:14175-14183,14904-14911,16459-16467,16569-16576`）。
+`--suffix-draft 0` は suffix 候補の使用条件を無効にします。ただし `--lookup-chain` は別の opt-in 経路であり、suffix drafting を `0` にしても `--lookup-chain` 自体が無効になるとは限りません。`engine/src/program/generate.cpp:1163-1165,21665-21672,22073-22079`。
 
 ## 適用条件と副作用
 
-- `--suffix-draft 0` は suffix 窓を無効にします。ただし `--lookup-chain` が正なら、chain lookup 用に共通履歴の構築は続きます（`src/program/generate.cpp:14175-14183,16459-16467`）。
-- 履歴索引は prompt と確定出力 token をメモリ上に保持します。ソースには索引容量確保の失敗をこの option 固有のエラーに変換する処理は確認できません。ネットワークアクセスやファイル生成はありません（`src/spec/suffix_drafter.cpp:14-21,42-67`）。
-- `strata` が Qwen3.6 モデルを識別すると、通常 parser の前に `strata::qwen35::run` へ引数一式を渡します。この専用 parser は `--suffix-draft` を定義していません。通常モードでは未知 option として usage を出して終了コード 2 になり、`--serve` モードでは未対応の長い option として stderr に警告して値を読み飛ばします（`src/program/generate.cpp:2393-2407`、`src/qwen35/q36_engine.cu:3735-3747,3748-3789`）。
-- 索引のリンクは `strata-engine/root/--suffix-draft.md` で、エンジン引数の scope です。`docs/cli/README.md` は Qwen3.6 専用 parser を別 scope として掲示しています（索引 `docs/cli/README.md:1129-1138,1318-1321`）。
+この値はモデルやファイルを変更せず、生成中の token 履歴と検証窓に作用します。MTP／speculative generation が使われる経路で、最初の窓を過ぎてから suffix 候補を調べます。server では request の token history から候補を作ります。履歴の token index と固定サイズ hash table を保持するため、プロセス内で CPU 側のメモリを使います。`engine/src/program/generate.cpp:21665-21669,22714-22735,24903-24907`, `engine/src/spec/suffix_drafter.cpp:18-24,51-61`。
+
+候補の採用は verifier の窓サイズにも影響し、その窓用 graph が実行環境で利用できない場合は `--lookup-max-t` 経路で適合する幅を求めます。source ではビルド別の verify 上限を使って窓を制限し、`--spec` が範囲外なら `strata generate: --spec ...` を stderr に出して終了コード `1` で終了します。`engine/src/program/generate.cpp:5079-5098,22737-22741`。
 
 ## 出力とエラー
 
-通常経路では、suffix 窓の採用数や受理数は `--serve` で stderr に `suffix drafts: ...` として出力されます。通常の generate 経路では `--suffix-draft` が正のとき、終了時の統計に同様の件数を stdout へ出します（`src/program/generate.cpp:15650-15652,16739-16741`）。
-
-不足値は上記のとおり終了コード 2 です。通常 parser で認識されない option は `strata generate: unknown option ...` を stderr に出して終了コード 2 になります（`src/program/generate.cpp:2418-2420,2787-2790`）。Qwen3.6 専用 parser の扱いは「適用条件と副作用」を参照してください。
+`--suffix-draft` 専用の値範囲エラーはありません。値の欠落は parser で stderr と終了コード `2`、不正な数値表記は `atoi` による変換後の値（通常は `0`）として処理されます。正の値で実行した場合、生成終了時に suffix draft の窓数と受理数を表示します。通常生成では stdout、server では stderr です。server 起動時の `INFO` 行にも設定値を含めます。`engine/src/program/generate.cpp:3844-3846,4121,16200-16213,23924,25272-25274`。
 
 ## 根拠
 
-- parser、既定値、help 表示: `src/program/generate.cpp:773-777,935-936,2416-2420,2672`
-- 自動窓拡張、suffix 履歴構築、採用条件: `src/program/generate.cpp:3205-3210,14175-14179,14889-14902,16459-16463,16551-16562`
-- 索引と照合の実装: `include/strata/spec/suffix_drafter.hpp:7-10,23-31`、`src/spec/suffix_drafter.cpp:14-21,42-67`
-- 採用方針: `include/strata/spec/draft_policy.hpp:29-36`、`src/spec/draft_policy.cpp:123-150`
-- serve/generate の統計出力: `src/program/generate.cpp:15650-15652,16739-16741`
-- Qwen3.6 の分岐と専用 parser: `src/program/generate.cpp:2393-2407`、`src/qwen35/q36_engine.cu:3735-3747,3748-3789`
+- `engine/src/program/generate.cpp:1156-1162,1343-1345,4121` — 既定値、help 表示、parser と近接する MTP／lookup options。
+- `engine/src/program/generate.cpp:5033-5039,5079-5098` — 既定の窓拡張、`--lookup-max-t` との相互作用、窓上限と失敗経路。
+- `engine/src/program/generate.cpp:21665-21669,22073-22086,22712-22735,24903-24907,25272-25274` — server／単発生成での履歴登録、候補採用条件、統計出力。
+- `engine/src/spec/suffix_drafter.cpp:18-24,51-85` — matcher の下限、履歴 index、最長一致探索、提案 token の取得。
+- `engine/src/spec/draft_policy.cpp:577-615` — MTP と lookup の選択条件。

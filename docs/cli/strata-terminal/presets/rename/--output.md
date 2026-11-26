@@ -1,6 +1,6 @@
-# `--output`
+# `strata presets rename --output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,45 +8,47 @@
 | コマンド | `strata presets rename` |
 | オプション | `--output` |
 | 別名 | なし |
-| 値 | `human` または `json`。省略時は `human` |
+| 値 | `human` または `json` |
 
 ## 役割
 
-名前を変更したプリセットの成功結果を、人向けテキストまたは JSON で標準出力へ出します。rename の操作そのもの（対象の解決、名前の検証、保存方法）は出力形式で変わりません。
+プリセット名の変更結果を、人向けの短いメッセージか、機械処理向けの JSON で標準出力へ出します。名前を変更する処理自体はどちらの形式でも同じです。
 
 ## 使い方
 
 ```sh
-strata presets rename <プリセット名またはID> "新しい名前" --output json
-```
+# 人向けの出力（既定）
+strata presets rename "旧プリセット名" "新プリセット名"
 
-人向け出力が必要なら `--output` を省略するか、`--output human` を指定します。`rename` は `strata presets` の必須サブコマンドの一つで、位置引数 `preset` と `name` を取ります（`strata_cli/tune_commands.py:49-67`）。
+# JSON 出力
+strata presets rename 1a2b3c4d "新プリセット名" --output json
+```
 
 ## 値と既定値
 
-parser は `choices=("human", "json")`、`default="human"` で定義しています。別名や省略値の自動検出はありません（`strata_cli/tune_commands.py:53-55`）。`human` / `json` 以外の値は argparse が拒否します。トップレベルでは parser 実行時に引数を解析し、未知の引数もエラーにします（`strata_cli/cli.py:2223-2231`）。
+`--output` は `human` と `json` のみを受け付け、既定値は `human` です。別の値を指定すると argparse の選択肢検証で拒否されます。rename parser にこのオプションの別名はありません。オプションは `presets` の各サブコマンドに共通登録されていますが、この文書の対象は `rename` です。`strata presets rename` にはプリセット参照と新しい名前の二つの位置引数が必要です。
 
 ## 実行時の動作
 
-`presets_command` は `a.output == "json"` を機械可読モードとして扱い、`rename` 分岐で `presets.rename(a.preset, a.name)` を呼び出します（`strata_cli/tune_commands.py:289-293,314-316`）。
+`human` の場合、成功時は `Renamed to '<名前>'.` を標準出力へ出します。`json` の場合は `schema_version: 1`、`ok: true` と、変更後プリセットの要約を含む JSON オブジェクトを一行で標準出力へ出します。いずれも成功終了コードは `0` です。
 
-対象は完全な ID、4文字以上の ID prefix、または大文字小文字を区別しない完全一致の名前で指定できます。名前一致があれば prefix より優先されます。該当なし、または複数一致の場合は拒否します（`strata_control/presets.py:218-231`）。
-
-新しい名前は前後空白を除去してから検証され、空文字、80文字超、改行（CR/LF）または NUL を含む値は拒否されます。同じ名前（大文字小文字を無視）が別プリセットに使われている場合も拒否されます（`strata_control/presets.py:255-256,361-367`）。有効な場合、対象 ID の JSON ファイルに名前を保存し、更新後のプリセットを返します（`strata_control/presets.py:368-371`）。
-
-`--output json` の成功時は `schema_version: 1`、`ok: true`、`preset`（`id`、`name`、active 状態などを含む要約）を含む JSON オブジェクトを標準出力へ1行で出します。`human`（既定）の成功時は `Renamed to '<名前>'.` を出します（`strata_cli/tune_commands.py:95-100,314-316,351-358`）。
+rename はプリセット ID を維持したまま、そのプリセットの JSON ファイルに新しい名前を書き込みます。書き込みは一時ファイルを作成して置換する方式です。アクティブ状態の索引ファイルを更新する処理はこの経路にはありません。
 
 ## 適用条件と副作用
 
-名前変更は保存済みプリセットのメタデータだけを更新します。プリセットの設定を実行したり、有効化・解除したりはしません。データは `STRATA_PRESET_DIR` が設定されていればそのディレクトリ、未設定ならプロファイルディレクトリの親にある `presets/` に置かれます（`strata_control/presets.py:45-50`）。保存時は同じディレクトリに一時ファイルを書き、置換します（`strata_control/presets.py:53-68,361-371`）。
+プリセット参照には完全な ID、4 文字以上の ID prefix、または大文字小文字を区別しない完全一致の名前を使えます。該当なし、または複数のプリセットに一致する参照は拒否されます。
+
+新しい名前は前後の空白を除いてから検証され、空でないこと、80 文字以下であること、改行または NUL を含まないことが必要です。他のプリセットと大文字小文字を区別しない同名も拒否されます。有効な名前なら、保存済みプリセット JSON が書き換わります。
 
 ## 出力とエラー
 
-プリセット不存在・参照名の曖昧さ・新しい名前の不正・名前重複は `PresetError` となり、JSON モードでは `ok: false` とエラー情報を標準出力へ、人向けモードでは `strata: <理由>` を標準エラーへ出し、終了コード `5` を返します（`strata_cli/tune_commands.py:103-108,344-345`）。ファイル等の `OSError` は通常終了コード `2` で同様に報告します（`strata_cli/tune_commands.py:346-347`）。不正な `--output` 値は rename 処理に入る前に argparse が拒否します。
+名前の検証、参照解決、同名検査に失敗すると、`human` では `strata: <理由>` を標準エラーへ、`json` では `schema_version: 1`、`ok: false` とエラー情報を標準出力へ出し、終了コード `5` を返します。保存時の `OSError` は同じ出力形式で報告され、通常は終了コード `2` になります。`--output` 自体に無効な値を指定した場合は parser が処理関数の実行前に拒否します。
 
 ## 根拠
 
-- `strata_cli/tune_commands.py:49-67` — `presets` / `rename` の parser 階層、位置引数、子コマンド共通の `--output` 定義。
-- `strata_cli/tune_commands.py:95-108,289-316,344-347,351-358` — 出力形式、rename 呼び出し、成功応答、失敗応答と終了コード。
-- `strata_control/presets.py:45-68,218-231,255-256,361-371` — 保存先、参照方法、名前 validation、重複確認、JSON 更新。
-- `strata_cli/cli.py:487,2151-2152,2223-2231` — parser 登録、トップレベル dispatch、引数解析と未知引数の扱い。
+- `docs/cli/README.md:788-791` — `strata presets rename` のコマンド階層と `--output` の索引リンク。
+- `terminal/strata_cli/tune_commands.py:55-61,71-73` — `presets` の子 parser に共通の `--output` を登録し、rename の位置引数を定義。
+- `terminal/strata_cli/cli.py:514-515,2229-2230` — parser 登録と `presets_command` へのディスパッチ。
+- `terminal/strata_cli/tune_commands.py:101-114,472-499,527-531` — 人向け/JSON の成功・失敗出力と終了コード、rename 呼び出し。
+- `terminal/strata_control/presets.py:243-256,280-281,388-398` — 参照の解決規則、名前の検証と重複判定、プリセット JSON の更新。
+- `terminal/strata_control/presets.py:53-68` — JSON 保存時の一時ファイル書き込みと置換。

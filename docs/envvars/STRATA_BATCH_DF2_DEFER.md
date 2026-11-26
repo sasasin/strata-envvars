@@ -1,54 +1,47 @@
 # `STRATA_BATCH_DF2_DEFER`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--serve` のバッチ DFlash2 で、slot に draft row が割り当てられなかった window の後処理を切り替えます。既定ではその window の tap row を保留し、slot に draft row が戻るまで DFlash2 drafter の処理を遅らせます。値の先頭が `0` のときは保留せず、その window の committed row から DFlash2 の draft を作ります。
+`--serve` の `--batch` スロットで DFlash2 のスロット別ドラフトを使うとき、窓に空き行がないラウンドでも各スロットのドラフトを毎回計算するかを決める。既定ではその場合の計算を遅らせ、確定行の tap をホスト側に保留する。値を `0` で始めると毎ラウンド計算する。既に空き行が割り当てられているスロットのドラフト計算には、この変数による違いはない（`engine/src/program/generate.cpp:17123-17146,17343-17374`）。
 
-この設定はバッチ DFlash2 自体を有効にするものではなく、slot drafter の起動条件や verifier row 数も変えません。
+この変数は DFlash2 自体を有効化する設定ではなく、スロット別 DFlash2 が動作するときの遅延方針だけを変える。スロット別 DFlash2 は CUDA/HIP 共通 GPU エンジンに実装され、Metal ビルドでは無効化される（`engine/cmake/strata_gpu_engine.cmake:6-13`, `engine/src/program/generate.cpp:7828-7840`）。
 
 ## 値と判定
 
-環境変数は `main` のバッチ用状態を初期化するときに一度読みます。文字列全体や数値としての妥当性は検査せず、先頭文字だけを見ます。空文字は設定済みですが、先頭が `\0` なので保留が有効です。
+`std::getenv` の返す文字列の先頭 1 文字だけを調べる。値全体の数値変換や真偽値解析はせず、空白除去・大文字小文字変換・妥当性検査もない。未設定、空文字、先頭が `0` 以外なら defer が有効。先頭が `0` なら無効で、`0`, `00`, `0anything` はいずれも同じ扱い（`engine/src/program/generate.cpp:16803-16808`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 保留する（既定） |
-| 空文字 | 保留する |
-| 先頭文字が `0` | 保留しない。`0`, `0abc` など |
-| それ以外 | 保留する。`1`, `false`, `abc` など |
+| ビルド／値 | unset | defer が有効 | defer が無効 |
+|---|---|---|---|
+| CUDA/HIP でスロット別 DFlash2 が実行される経路 | 有効 | 空文字、`1`, `true`, `false`, ` 0`, `anything` | `0`, `00`, `0anything` |
+| Metal、またはスロット別 DFlash2 が実行されない経路 | 読み取り値は同じ判定だが挙動に影響しない | 同左 | 同左 |
 
-大文字小文字、空白、後続文字は判定に影響しません。`atoi` などの数値変換、無効値の fallback、clamp はありません。`--batch`、`--spec` などの CLI 引数がこの値判定を上書きする分岐もありません。
-
-根拠: `src/program/generate.cpp:13600-13605`。
+`false` や空白で始まる文字列も先頭が `0` ではないため defer 有効となる。評価は `generate.cpp` の `--batch` 状態を構成する処理中に一度行い、以後の環境変更は反映されない。CLI 引数や別環境変数がこの値を上書きする分岐はない（`engine/src/program/generate.cpp:16802-16808`）。
 
 ## 有効になる条件
 
-設定の効果が現れるには、DFlash2 機能を含むビルド（`STRATA_HAVE_DFLASH2`）で `batch_df2` が有効になり、batch window の処理が走る必要があります。通常の有効化経路は `--serve`、`--batch` 2 以上、`--draft dflash2`（`--draft auto` ではない）、同一 GPU 上の layer split ではないことです。`STRATA_BATCH_DF2` が先頭 `0` なら無効で、非空かつ先頭が `0` 以外なら強制有効を要求します。未設定または空文字では、層分割があり batch groups が 1 以下の場合に有効になります。さらに、`--spec` 2 以上、native pack と `--draft-model` が必要で、`--pipeline-windows` とは併用できません。層分割では slot を serial window にする条件もあり、既定では複数 group に pipelined される構成は batch DFlash2 の対象になりません。Metal では `batch_df2_wanted` を常に false にします。
-
-これらの条件を満たさない場合、この環境変数を設定しても DFlash2 の slot draft には影響しません。DFlash2 が起動せず fallback になった場合も batch DFlash2 は有効にならず、当該環境変数の分岐は実行されません。
-
-根拠: `src/program/generate.cpp:6464-6481,6765-6772,6820-6840,11185-11197`。
+- 実際の効果には `STRATA_HAVE_DFLASH2` を含む CUDA/HIP GPU エンジンが必要。CMake では CUDA または HIP の GPU エンジンにこの macro を定義し、Metal と SYCL のビルドは DFlash2 なしとしている（`engine/cmake/strata_gpu_engine.cmake:6-13`）。
+- `batch_df2` が有効である必要がある。通常は `--draft dflash2`（自動選択ではない）、`--batch` 2 以上、`--serve` が必要。1 GPU の経路、または layer split でも slot group が 1 以下になる経路で有効になり、複数 group の pipeline では通常使われない。Metal では常に対象外。`STRATA_BATCH_DF2=0` でも無効になる。その他、DFlash2 のロード・準備に失敗した場合はスロット別ドラフトも動かない（`engine/src/program/generate.cpp:7822-7840,8266-8275,8328-8348`）。
+- layer split でグループを複数にする経路や helper expert cache の条件では `batch_mtp` の適用判定で DFlash2 が止められることがある。無効化時は `strata generate: WARNING: ... is off: ...` が stderr に出る（`engine/src/program/generate.cpp:7841-7873`）。
+- 値の違いが現れるのは、アクティブスロット数が窓の行数上限以上で、各スロットに余分なドラフト行が割り当たらないラウンド。余分な行があるスロットは、値にかかわらずドラフトを続ける（`engine/src/program/generate.cpp:17121-17146,17351-17368`）。
 
 ## 実行時の詳細
 
-`batch_step` は active slot ごとの verifier row を組み立てます。DFlash2 の slot に与える余剰 row 数は、window 容量から active slot 数を引いて分配し、drafter の上限、残り生成長、最大 context、`STRATA_BATCH_DF2_MAXX`、`STRATA_BATCH_DF2_CONF` によってさらに制限します。そのため `nrow[t] == 1` は、その slot にこの window の draft row が割り当てられなかった状態です。これは active slot が多く余剰 row がない場合のほか、上記の上限や確信度条件で row 数が 0 になった場合も含みます。
+バッチ窓では各スロットに最低 1 行（現在の token）を割り当て、残りをアクティブスロット間でドラフト行として配る。既定の defer 有効時にスロットへドラフト行がないと、確定 tap 行を defer バッファへ集めて `draft_ready` を落とし、そのラウンドではドラフトを実行しない。後続ラウンドで空き行ができたとき、そのスロットの保留行を `catch_up` し、次 token の tap から最初のドラフトを作ってから窓を組む（`engine/src/program/generate.cpp:17127-17146,17148-17172`）。
 
-`STRATA_BATCH_DF2_DEFER` が保留を有効にしていると、window の実行・commit 後に、その slot の committed row の tap を host 側の deferred buffer に保存し、`draft_ready` を false にします。余剰 row が後続 window で割り当てられると、保留 tap を drafter に反映して slot の現在位置まで追いつかせ、最新 token から draft を作ってから verifier rows を組み立てます。保留が無効（値の先頭が `0`）なら、row が割り当てられなかった window でも直ちに catch-up、tap の gather、draft launch を行います。
+先頭 `0` の場合は、窓にドラフト行を持たないラウンドでも確定行の tap を drafter に渡して `draft_launch` を呼ぶ。前回以前の defer 行が残っていれば先に catch-up して保留を消す。行がある場合の draft rows の上限・選別は `STRATA_BATCH_DF2_MAXX`、`STRATA_BATCH_DF2_CONF` とスロットの残り生成数・コンテキストに従う。この変数は窓の行数や slot/token の commit 判定そのものを変更する分岐ではなく、余分な行がないときのドラフト起動タイミングを変える（`engine/src/program/generate.cpp:16804-16808,17132-17145,17343-17374`）。
 
-環境値は `const bool` としてこの batch 状態の初期化時に保存され、各 batch window やリクエストごとには再読込しません。コード上に実行中の再評価や子プロセスへの転送はありません。
+## ログと測定値
 
-保留時の pinned host buffer 確保に失敗すると `ERR batch DFlash2 slot ...` を stdout に出して batch 処理が失敗します。後続の catch-up が失敗した場合は stderr に `strata batch: DFlash2 slot ...: catch-up failed (...): no drafts for it this round` と出し、その round の draft を見送ります。通常の保留モードでは batch の集計 stderr 行に deferred row 数と catch-up 数・行数・時間が出ます。環境変数そのものの有効・無効を知らせるログはありません。
+この変数の値だけを示す起動ログはない。遅延行から初回ドラフトを作る際の catch-up に失敗すると stderr に `strata batch: DFlash2 slot %d: catch-up failed (%s): no drafts for it this round` と出し、そのスロットはそのラウンドのドラフトを行わない。通常の窓後の defer 行収集が失敗すると stdout に `ERR batch DFlash2 slot %d: %s` を出してバッチ処理を失敗させる。非 defer 側の catch-up、tap gather、draft launch/finish の失敗も stdout の同じ `ERR batch DFlash2 slot %d: %s` 経路に入る（`engine/src/program/generate.cpp:17160-17168,17351-17371,17400-17410`）。
 
-根拠: `src/program/generate.cpp:13884-13935,14084-14116,14205-14212`; `src/core/dflash2.cpp:620-663`。
+`docs/DETAILS.md` と `docs/BATCHING.md` にこの変数固有の測定値はなく、ソースコメントにもこの切替の性能値はないため、ここでは性能・生成結果への影響を定量化しない。
 
 ## 根拠
 
-- 読み取りと値判定: `src/program/generate.cpp:13600-13605`。
-- バッチ DFlash2 の有効条件と slot drafter の準備: `src/program/generate.cpp:6464-6481,6765-6772,6820-6840,11185-11197`。
-- spare row の算出と保留 tap の次 window での catch-up: `src/program/generate.cpp:13884-13935`。
-- row 不足時の保留／即時 draft、およびエラー経路: `src/program/generate.cpp:14084-14116`。
-- 保留行 buffer と catch-up の処理: `src/core/dflash2.cpp:620-663`。
-- 保留・catch-up 集計ログ: `src/program/generate.cpp:14205-14212`。
-
+- `engine/src/program/generate.cpp:16802-16808` — 値の読み取り、先頭文字判定、関連する DFlash2 の draft 設定。
+- `engine/src/program/generate.cpp:7822-7840,7841-7873` — スロット別 DFlash2 の適用条件と無効化ログ。
+- `engine/src/program/generate.cpp:17121-17172,17343-17375` — 余剰行の配分、保留、catch-up、ドラフト起動。
+- `engine/src/program/generate.cpp:17400-17410` — 起動したドラフトの完了と失敗出力。
+- `engine/cmake/strata_gpu_engine.cmake:6-13` — CUDA/HIP GPU エンジンでの DFlash2 macro。

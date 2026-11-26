@@ -1,50 +1,46 @@
 # `STRATA_DF2_HEAD_IL`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-DFlash2 drafter が draft head を計算するとき、通常の `native_mmvq` の代わりに interleaved `native_mmvq_il` を使うことを許可します。これは DFlash2 の head 計算だけを制御します。値が有効でも、GPU・重み型・行数などが interleaved kernel の対応条件を満たさなければ通常の `native_mmvq` に進みます。
+CUDA/HIP 共通の DFlash2 実装 `Dflash2Drafter::record_block` で、draft head の行列積に interleaved activation 用の経路を許可するスイッチです。値が有効で、さらに `native_mmvq_il_supported` が型・行数・GPU 等をサポートすると判定した場合、Q8_1 活性を interleave して `native_mmvq_il` を呼びます。それ以外は `native_mmvq` を使います。実装コメントは interleaved head の出力が通常経路と bitwise 同一で draft が同じになるとしています（`engine/src/core/dflash2.cpp:596-605`）。
 
-DFlash2 の実装は CUDA/HIP build に含まれ、Metal/SYCL build には含まれません（`CMakeLists.txt:429-436,703-709`）。HIP では interleaved 対応判定が常に false なので、この変数によって HIP の head kernel は切り替わりません（`src/kernels/cuda/native_mmvq.cu:3987-4000`）。
+これは通常のモデル head 全般ではなく、DFlash2 draft round 内の head 計算に限った選択です。対象名を読む実装は `engine/src/core/dflash2.cpp:598` の 1 箇所です。`terminal/data/settings-register.json:6266-6280` にも登録情報がありますが、これは実行時読み取りではありません。
 
 ## 値と判定
 
-Strata は文字列を数値や真偽値として parse せず、環境変数の先頭文字だけを検査します（`src/core/dflash2.cpp:520-527`）。
+`std::getenv` で取得し、値が存在していて先頭文字が `'0'` の場合だけ OFF、それ以外は ON とします。文字列全体の parse や数値変換はありません（`engine/src/core/dflash2.cpp:598`）。
 
-| 値 | `il_on` | 意味 |
-|---|---:|---|
-| 未設定 | true | interleaved kernel の利用を許可（既定） |
-| 空文字 | true | 設定済みだが先頭文字が `\0` のため許可 |
-| 先頭文字が `0` | false | どのような後続文字があっても利用しない |
-| その他すべて | true | 例: `1`, `true`, `false`, 空白で始まる値 |
+| 条件 | unset | ON になる値の例 | OFF になる値の例 |
+|---|---|---|---|
+| CUDA/HIP 共通の読み取り | ON | 空文字、`1`、`true`、`false`、` 0`、`00` 以外の通常文字列 | `0`、`0anything`、`00` |
 
-大文字小文字、空白、数値としての妥当性、文字列全体は判定しません。無効文字列をエラーにしたり、警告を出したりする処理もありません。
+空文字は設定済みですが `e[0]` が NUL なので ON です。先頭の空白は除去せず、空白で始まる ` 0` は ON。大文字小文字、残りの文字、整数としての妥当性は判定しません。したがって `false` も ON です。値そのものの優先順位を変える CLI 引数・別設定はありません。
 
 ## 有効になる条件
 
-次の条件がすべて成立したときだけ interleaved path が実行されます。
-
-- DFlash2 が実際に使用され、`record_block()` が `head` 部分を記録すること。`STRATA_DF2_SKIP` に `head` が含まれる場合はその部分を飛ばし、変数もこの時点では読まれません（`src/core/dflash2.cpp:82-85,520-527`）。
-- `STRATA_DF2_HEAD_IL` が無効値ではないこと。
-- `native_mmvq_il_supported(head_type_, ndraft_, n_dvocab_)` が true を返すこと。CUDA 実装は draft 行数が 1〜8、architecture が対応、対象の ggml weight type（`23/12/13/14/11`）、かつ該当する行数 table が非ゼロであることを要求します（`src/kernels/cuda/native_mmvq.cu:3940-3959`）。表の有効性は `STRATA_MMVQ_IL_*` 系設定や GPU 世代にも左右されます（同 `:3821-3849,3853-3882`）。
-- HIP は上記の対応判定が常に false のため不成立です（同 `:3987-4000`）。
-
-通常の DFlash2 起動では `ndraft_` は `--spec` と `--mtp-max-t` から設定され、1〜8 に clamp されます（`src/program/generate.cpp:19710`, `src/core/dflash2.cpp:665-674`）。`STRATA_MMVQ_IL` は DFlash2 のこの分岐では直接参照されません。DFlash2 固有の flag と kernel 対応判定が使われ、通常 verifier の `g_mmvq_il()` にある master switch とは別経路です（`src/core/verify.cpp:183-184`; DFlash2 側 `src/core/dflash2.cpp:522-527`）。
+- DFlash2 が選ばれ、draft round の `record_block` が呼ばれる必要があります。通常の DFlash2 launch は graph がまだない場合に capture し、その時 `record_block` を呼びます。profile 経路では各 draft round でも直接呼びます（`engine/src/core/dflash2.cpp:1174-1208`, `engine/src/core/dflash2.cpp:621-655`）。
+- `STRATA_DF2_SKIP` に `head` が含まれる場合は head 部分を省略するため、この変数の読み取り箇所まで到達しません（`engine/src/core/dflash2.cpp:142-146`, `engine/src/core/dflash2.cpp:596-599`）。
+- interleaved 経路は `native_mmvq_il_supported(head_type_, ndraft_, n_dvocab_)` が true の場合だけです。CUDA 実装では列数が 1〜8、multi-column exact が有効、対象 GPU architecture が許可され、行数テーブルが非ゼロで、型が IQ4_XS / Q4_K / Q5_K / Q6_K / Q3_K のいずれかであることが必要です。Q3_K は `STRATA_MMVQ_IL_Q3K` の判定で無効化できます。また dense INT8 Tensor Core decode がその形状をカバーする場合も interleave を選ばず通常経路になります（`engine/src/kernels/cuda/native_mmvq.cu:4056`, `engine/src/kernels/cuda/native_mmvq.cu:4190-4228`）。
+- 行数テーブルは GPU 世代・head の行数と `STRATA_MMVQ_IL_ROWS` 等で変わります。Ada の `STRATA_MMVQ_IL_89`、sm_80 の `STRATA_MMVQ_IL_SM80` / `STRATA_DEFAULTS=026`、sm_70 / sm_75 / sm_60 / sm_61 用の `STRATA_SM70_TABLE`、`STRATA_SM75_IL` / `STRATA_SM75_PERF`、`STRATA_SM60_TABLE`、`STRATA_SM61_TABLE` もサポート判定に影響します（`engine/src/kernels/cuda/native_mmvq.cu:3874-3878`, `engine/src/kernels/cuda/native_mmvq.cu:4056-4143`, `engine/src/kernels/cuda/native_mmvq.cu:4190-4227`）。
+- HIP ビルドでは `native_mmvq_il_supported` が常に false を返す実装なので、変数が ON でも interleaved 経路にはなりません（`engine/src/kernels/cuda/native_mmvq.cu:4255-4268`）。
 
 ## 実行時の詳細
 
-値は `record_block()` の関数内 `static const bool` に一度だけ保存されます。通常の graph 準備では `prepare()` が各 row 数の graph を capture し、その capture 中に初回評価されます。profile 経路では `prepare()` は graph を作らず、最初の draft の `record_block()` で評価されます（`src/core/dflash2.cpp:545-579,676-686,1017-1049`）。この static は drafter instance 間で共有されるため、初回評価後に環境を変更しても同一プロセス中には反映されません。
+値は `record_block` 内の関数ローカル `static const bool` で、head 部分を初めて実行する時に一度だけ評価されます。最初の評価は通常、初回 graph capture 時か profiling の最初の直接実行時です。`STRATA_DF2_SKIP` が head を飛ばす間は未評価です。一度評価された後の環境変更は反映されず、同じ実行ファイル内の drafter インスタンス間でも同じキャッシュ値を使います（`engine/src/core/dflash2.cpp:596-605`, `engine/src/core/dflash2.cpp:1174-1208`）。
 
-有効で kernel が対応する場合は、先に `native_q8_1_interleave()` で入力を変換し、続けて `native_mmvq_il()` で head logits を計算します。どちらかの条件を満たさない場合は直接 `native_mmvq()` を使います（`src/core/dflash2.cpp:522-529`）。kernel 関数自体にも対応判定があり、非対応時は `native_mmvq()` に fallback します（`src/kernels/cuda/native_mmvq.cu:3962-3966`）。
+ON かつ対応形状なら、`native_q8_1_interleave` で `xq_` から interleaved buffer `xil_` を作り、`native_mmvq_il` で `logits_` を計算します。サポートされない場合または変数が OFF の場合は `native_mmvq` にフォールバックします。後続の `df2_topk` と selector はどちらの経路でも同じ logits 出力先を使います（`engine/src/core/dflash2.cpp:587-613`）。
 
-この環境変数専用のログ、警告、終了経路はありません。`native_mmvq_il` の CUDA launch error は kernel 側の `launch_check()` を通り、`record_block()` の例外処理でエラー文字列にされます（`src/kernels/cuda/native_mmvq.cu:3977-3984`, `src/core/dflash2.cpp:538-542`）。DFlash2 の準備全体が失敗した場合は generate が診断を stderr に出して MTP drafter に fallback し、`--draft-fallback none` で MTP がない場合は終了します（`src/program/generate.cpp:19703-19722`）。これらはこの変数の値判定に固有の挙動ではありません。
+## ログと測定値
+
+この変数の値や選択経路を知らせる専用ログはありません。interleaved kernel 内で例外が起きた場合は `record_block` が例外文字列を `err` に入れて失敗を返します。通常の graph capture で失敗すれば `draft_launch` は false を返し、capture 自体の CUDA エラーは `dflash2: capture: ...` として `err` に入ります。通常の `strata generate` 呼び出し元は `strata generate: %s` を stderr に出して終了コード 1 を返します（`engine/src/core/dflash2.cpp:614-617`, `engine/src/core/dflash2.cpp:647-650`, `engine/src/core/dflash2.cpp:1203-1208`, `engine/src/program/generate.cpp:25008-25011`）。
+
+関連資料 `docs/DETAILS.md:1591-1595` は DFlash2 selector の Q4_0 表現に触れていますが、このスイッチや head interleave の性能測定値は示していません。コードコメント上の bitwise 同一性は上記の実装コメントの記載であり、この調査で再測定した結果ではありません。
 
 ## 根拠
 
-- 変数の唯一の直接参照、head 分岐、両 kernel 呼び出し: `src/core/dflash2.cpp:520-529`。
-- DFlash2 の build 条件: `CMakeLists.txt:429-436,703-709`。
-- interleaved kernel の対応条件と HIP fallback: `src/kernels/cuda/native_mmvq.cu:3940-4000`。
-- DFlash2 の準備・profile・graph capture と評価時期: `src/core/dflash2.cpp:545-579,676-686,1017-1049`。
-- generate 側の DFlash2 bind / prepare の失敗時の fallback: `src/program/generate.cpp:19698-19722`。
-- 関連資料 `docs/DETAILS.md` と interleaved kernel 資料を確認しましたが、`STRATA_DF2_HEAD_IL` 固有の測定値や説明は見当たりませんでした。測定値は記載していません。
+- `engine/src/core/dflash2.cpp:596-605` — 環境変数の読み取り、分岐、draft head kernel の選択。
+- `engine/src/core/dflash2.cpp:142-146`, `engine/src/core/dflash2.cpp:621-655`, `engine/src/core/dflash2.cpp:1174-1208` — skip 条件、capture / profiling、実行時の呼び出し。
+- `engine/src/kernels/cuda/native_mmvq.cu:4056-4143`, `engine/src/kernels/cuda/native_mmvq.cu:4190-4228`, `engine/src/kernels/cuda/native_mmvq.cu:4255-4268` — CUDA の対応条件と HIP の unsupported 実装。
+- `docs/DETAILS.md:1591-1595` — 関連する DFlash2 資料との照合。

@@ -1,46 +1,43 @@
 # `STRATA_NO_Q50_512`
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CPU の native expert 経路で、Q5_0 down projection に使う 512-bit Q5_0 カーネルを無効にします。設定すると Strata はそのカーネルを選ばず、各 token の行をリンク済み ggml-cpu の `vec_dot` で計算します。値が `1` かどうかは判定せず、環境変数の有無だけを判定します。
+CPU の native expert down projection が Q5_0（type 6）で、token 数が `STRATA_Q50_512_MIN`（未設定時 2）以上の場合に使う 512-bit Q5_0 カーネルを無効にする。未設定なら条件付きで `q50_512_down_rows` を選び、設定されていれば通常の `traits(...).dot` による token ごとの処理へ進む。閾値を 1 以下に設定すれば 1 token でも対象になる。対象は CPU native expert pool の down rows であり、GPU の Q5_0 カーネルを切り替える変数ではない（`engine/src/kernels/cpu/native_expert.cpp:820-826, 859-891`、呼び出し元 `engine/src/kernels/cpu/pool.cpp:1303-1309, 1445-1453`）。
 
 ## 値と判定
 
-| 環境の状態 | 判定 | 結果 |
-|---|---|---|
-| 未設定 | `getenv()` が null | 512-bit カーネルを選択可能 |
-| 空文字を設定 | `getenv()` が non-null | カーネルを無効化 |
-| 任意の非空文字列（`0`, `1`, `false` など） | `getenv()` が non-null | カーネルを無効化 |
+`std::getenv("STRATA_NO_Q50_512") == nullptr` かだけを判定する。文字列を parse しないため、unset のときだけ無効化されず、空文字を含む何らかの値が設定されていればカーネルを無効にする。大文字小文字、空白、数値としての妥当性は関係しない（`engine/src/kernels/cpu/native_expert.cpp:822`）。
 
-文字列変換、数値判定、大小文字判定、clamp はありません。無効値という別の扱いもなく、設定されていれば常に無効化です。C++ の `&&` の短絡評価により、`cpu_vnni_ok()` が false の場合は対象変数の `getenv()` 自体が呼ばれません。変数自体に CLI 引数や設定ファイルとの優先順位はありません。
+| 条件 | unset | 設定時に機能が無効になる例 |
+|---|---|---|
+| native expert CPU down rows | Q5_0 512-bit カーネルの候補になる | `1`、`0`、`true`、`false`、空文字、`0anything` など、値の内容を問わず無効 |
 
 ## 有効になる条件
 
-未設定の場合でも、次の条件がそろったときだけ 512-bit カーネルが実行されます。
-
-- Strata の native expert CPU 経路が使われ、down projection の型が Q5_0（ggml type `6`）である。
-- CPU probe が VNNI 対応を返す。x86 では CPU の機能に加え OS が AVX-512 状態を保存できることなどを確認します。VBMI のない VNNI 世代では `STRATA_VNNI_TIER` の opt-in も条件になります。
-- `STRATA_Q50_512_MIN` で決まる token 数以上である（既定値 2）。
-- native expert に scale tail がない。
-- 初回の合成データ照合で、このビルドの ggml-cpu `vec_dot` と 512-bit カーネルの出力 bit 列が一致する。
-
-条件に合わない場合は同じ関数内の ggml-cpu `vec_dot` ループに進みます。Q5_0 が down projection でない場合や native expert CPU 関数に到達しない経路には、この設定は作用しません。
+- `STRATA_NO_Q50_512` が未設定で、`cpu_vnni_ok()` が true であること。これは x86 の CPU 機能と OS の AVX-512 状態を調べる。CPU が VNNI を持たない、または OS が AVX-512 状態を保存しない場合は候補にならない（`engine/src/kernels/cpu/expert_layout.cpp:80-110, 188-204`）。非 x86 では `cpu_vnni_ok()` は常に false（同 `:42-51`）。
+- `STRATA_FORCE_AVX2` の値が `1` で始まる場合、または `STRATA_FORCE_ISA` が `avx2` / `avx` / `sse` / `sse4.2` / `none` の場合、ISA 判定が抑えられ `cpu_vnni_ok()` は false になる。`STRATA_VNNI_TIER` の値が `1` で始まることは、VNNI はあるが `cpu_avx512_ok()` が false の CPU で VNNI tier を許可する条件に関係する（`engine/src/kernels/cpu/expert_layout.cpp:26-39, 75-78, 188-202`）。
+- ビルドに native expert CPU 実装が含まれ、その pool がこの処理を呼ぶこと。標準 engine は `STRATA_NATIVE_EXPERTS` が有効なとき native expert 実装を組み込み、CPU pool から down rows を呼ぶ。CUDA / HIP / SYCL / Metal を使うプロセスでも、ここで対象にするのは CPU native expert pool の経路であり、GPU kernel の選択には作用しない（`engine/CMakeLists.txt:725-736`、`engine/cmake/backends/cpu.cmake:303-317, 370`、`engine/sycl/CMakeLists.txt:220-236`、`engine/metal/CMakeLists.txt:138-146`、`engine/src/kernels/cpu/pool.cpp:1303-1309, 1445-1453`）。
+- 下 row の型が Q5_0 (`f.d_type == 6`)、`f.tail_off == 0` であり、token 数 `nt` が `STRATA_Q50_512_MIN` 以上であること。`STRATA_Q50_512_MIN` は未設定なら 2、設定時は `atoi` の結果を使う。空文字や数字で始まらない文字列は 0、`2x` は 2、負値もそのまま比較に使われるため、通常の「N 以上」という範囲検証はない（`engine/src/kernels/cpu/native_expert.cpp:823-825`）。
+- 初回の適合性確認 `q50_512_ok()` が true であること。確認は現在のビルドの Q5_0 dot と 512-bit kernel を、合成データ（幅 96 / 640、16 rows、3 tokens）で比較し、全 float の bit 列が一致するかを見る。どれかが不一致なら専用 kernel を選ばない（`engine/src/kernels/cpu/native_expert.cpp:204-239`）。
+- CLI 引数、サーバーモード、モデル設定ファイルによるこの変数の上書き・優先順位はコード上にない。対象の down row が CPU pool で処理されなければ、この変数の分岐にも到達しない（読み取りと dispatch: `engine/src/kernels/cpu/native_expert.cpp:820-826`）。
 
 ## 実行時の詳細
 
-読み取りは `native_down_rows_impl` 内の `static const bool` 初期化で行われ、各テンプレート実体の最初の呼び出し時に一度だけ評価されます。その実体では以後の環境変更は再評価されません。CPU probe が false の場合はその値を false としてキャッシュし、対象変数は読みません。`STRATA_Q50_512_MIN` も同関数内の別の `static const int` で初回評価され、未設定なら `2`、設定時は `std::atoi` の結果です。
+`native_down_rows_impl` は通常経路と `WindowInvariant` 経路から呼ばれる。各 template specialization で `q50_512` と `q50_min` を初めて実行したときに `static` 値として読み取るため、その specialization の最初の呼び出し後にプロセス環境を変更しても再評価されない。CPU ISA 判定と適合性確認にも `static` cache がある（`engine/src/kernels/cpu/native_expert.cpp:792-825, 903-915`; `engine/src/kernels/cpu/expert_layout.cpp:80-111, 188-204`）。
 
-選択時は down projection の各行について、複数 token の結果を `q50_512_down_rows` が計算します。選択されない場合は各行・各 token ごとに ggml-cpu の `vec_dot` を呼びます。512-bit カーネルは合成ブロックで `vec_dot` と一致するか初回に検査され、不一致なら stderr に `strata: the 512-bit Q5_0 down rows differ from this ggml-cpu's dot: not used` と出して ggml-cpu 経路を使います。終了や例外にはせず、環境変数を設定したこと自体によるログもありません。
+専用 kernel が選ばれると、Q5_0 の down rows を `q50_512_down_rows` に渡し、重み block pair の decode を token 間で共有する。適合性確認に失敗した場合、または環境変数・CPU・型・tail・token 数などの条件が満たされない場合は、後続の一般処理で `traits(f.d_type).dot` を token ごとに実行して出力 row を計算する（`engine/src/kernels/cpu/iq_avx512.cpp:773-855`、fallback `engine/src/kernels/cpu/native_expert.cpp:859-891`）。子プロセスへの転送や環境変数の書き換えはこの箇所では行わない。
+
+## ログと測定値
+
+適合性確認で不一致が出た場合、stderr に `strata: the 512-bit Q5_0 down rows differ from this ggml-cpu's dot: not used` を出して専用 kernel を使わない（`engine/src/kernels/cpu/native_expert.cpp:229-239`）。環境変数で無効化した場合や、CPU / 型 / token 数などの条件を満たさず fallback した場合に、この変数専用のログはない。ここでは性能測定値を記載しない。
 
 ## 根拠
 
-- `src/kernels/cpu/native_expert.cpp:655-661` — 環境変数の存在判定、CPU・型・token 数・tail・照合の条件、および専用カーネルへの分岐。
-- `src/kernels/cpu/native_expert.cpp:196-231` — Q5_0 512-bit 結果を Q8_0 活性とリンク済み ggml-cpu の `vec_dot` に照合し、不一致を stderr に出す処理。
-- `src/kernels/cpu/native_expert.cpp:694-701` — 専用カーネルを使わない場合の ggml-cpu dot fallback。
-- `src/kernels/cpu/pool.cpp:1238-1250` — CPU expert pool が対象 down projection を `native_down_rows` または window-invariant 版へ渡す箇所。
-- `src/kernels/cpu/expert_layout.cpp:188-203` — VNNI probe と、VBMI を備えない CPU で `STRATA_VNNI_TIER` を要求する条件。
-- `CMakeLists.txt:2059-2066,2182-2194` — x86 と portable の CPU kernel 構成。非 x86 構成では `native_expert.cpp` と併せて portable kernel を使い、`cpu_vnni_ok()` は常に false（`src/kernels/cpu/expert_layout.cpp:40-52`）。
-
-`docs/DETAILS.md` にこの環境変数または当該 dispatch の説明・測定値は見当たりません。性能差や出力同一性はここでは測定していません。
+- `engine/src/kernels/cpu/native_expert.cpp:820-826` — 環境変数、token 数、型、tail、適合性確認による分岐。
+- `engine/src/kernels/cpu/native_expert.cpp:204-239` — Q5_0 512-bit kernel の一度限りの比較と不一致ログ。
+- `engine/src/kernels/cpu/native_expert.cpp:859-891` — fallback の dot と出力計算。
+- `engine/src/kernels/cpu/iq_avx512.cpp:773-855` — Q5_0 down row kernel。
+- `engine/src/kernels/cpu/expert_layout.cpp:26-39, 42-51, 75-110, 188-204` — ISA cap、非 x86 stub、VNNI tier 判定。
+- `engine/src/kernels/cpu/pool.cpp:1303-1309, 1445-1453` — CPU pool から down rows への呼び出し。

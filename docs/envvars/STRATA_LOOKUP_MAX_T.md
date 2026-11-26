@@ -1,50 +1,62 @@
 # `STRATA_LOOKUP_MAX_T`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-この変数は prompt-lookup の長い verify window を直接指定するものではなく、`--lookup-max-t` が省略されたときの既定値 12 を抑止するために使われます。値の先頭文字が `0` なら既定値候補を 0（無効）にします。それ以外の値で既定機能を有効化するわけではなく、有効条件を満たす場合に限り既定値 12 が選ばれます。根拠: `src/program/generate.cpp:4140-4155`、`include/strata/core/lookup_default.hpp:9-27`。
+この変数は lookup 窓の最大 token 数を数値で指定する設定ではなく、条件を満たす `strata serve` で自動選択される `--lookup-max-t 12` を抑止する off スイッチである。`STRATA_LOOKUP_MAX_T` の先頭文字が `0` なら、CLI で値が指定されていない場合の既定値を 0 にする。それ以外の値は既定値を有効化せず、既定値判定に影響しない。読み取りと既定値の適用は `engine/src/program/generate.cpp:5040-5055`、判定関数は `engine/include/strata/core/lookup_default.hpp:9-28`。
 
-機能が有効な serve 実行では、suffix drafter が過去の prompt の一致箇所から提案する window を MTP の `--spec` window より長くでき、上限は `--lookup-max-t`（既定値の場合 12）です。許可された各 window サイズは専用の CUDA graph として準備され、VRAM に収まらないサイズは候補から外して小さいサイズへ進みます。根拠: `src/program/generate.cpp:1300-1319,13417-13437,18233-18250`、`include/strata/kernels/verify_kernels.hpp:23-31`。
+lookup 窓が有効な場合、server は許可された幅を DraftPolicy に渡し、prompt の読み込みと decode の lookup 窓でその幅を使う。各幅の verifier graph を事前に準備し、VRAM 不足なら該当幅を候補から外して小さい幅を試す（`engine/src/program/generate.cpp:16429-16431,16512-16529,20431-20446,22737-22741`）。この変数自身が token 内容や最大幅を指定するものではない。
 
 ## 値と判定
 
-環境変数は `std::getenv()` で読み、文字列全体の parse はせず `lme[0] == '0'` だけを判定します。空白・大文字小文字・数値としての妥当性・後続文字は検査しません。
+環境変数は `std::getenv` で読み、未設定かどうかと `lme[0] == '0'` だけを判定する。数値変換、文字列全体の比較、空白除去、大小文字変換はしない（`engine/src/program/generate.cpp:5043-5046`）。
 
-| 環境値 | `env_off` | 既定値への影響 |
-|---|---:|---|
-| 未設定 | false | 他の条件を満たせば 12 |
-| 空文字 | false | 他の条件を満たせば 12 |
-| `0`, `00`, `0anything`, `0.5` | true | 自動既定値は 0（無効） |
-| ` 0`, `.5` | false | 先頭が `0` ではないため、他の条件を満たせば 12 |
-| `1`, `12`, `true`, `false`, その他 `0` 以外で始まる文字列 | false | 他の条件を満たせば 12。値自体は上限値として使われない |
+| 条件 | unset | 先頭が `0` の例 | その他の例 |
+|---|---|---|---|
+| CLI が `--lookup-max-t` を指定していない | 環境変数による抑止なし。下記の既定値条件で最大 12、その他は 0 | 既定値を 0 にする（`0`, `0anything`, `00`） | 抑止なし。空文字、`1`, `true`, `false`, ` 0`, `0.5` 以外の非ゼロ始まり文字列も同じ扱い |
+| CLI が `--lookup-max-t N` を指定 | 環境変数を読まず CLI 値を使用 | 同左 | 同左 |
 
-読み取りは `o.lookup_max_t < 0` の場合だけ行われます。`Options` の初期値は `-1` で、CLI の `--lookup-max-t N` は `std::atoi()` で変換して `std::max(0, ...)` した値を設定するため、明示した CLI 値が環境変数の判定より優先します。CLI に不正な数値文字列を渡すと `atoi()` の結果 0 となり、負値も 0 に clamp されます。根拠: `src/program/generate.cpp:972-977,3551,4143-4155`。
+CLI 値の初期値は `-1`。`--lookup-max-t` 指定時は `atoi` の結果を 0 以上にして保存するため、`--lookup-max-t 0` は明示的な off、負数や数値に変換できない文字列も 0 になる。CLI 値が `-1` 以外なら環境変数の読み取り分岐に入りません（`engine/src/program/generate.cpp:1173,4123,5043-5055`）。
+
+環境変数で抑止しない場合でも、既定値が 12 になるのは次の条件がすべて真の場合だけ。それ以外は 0（`engine/include/strata/core/lookup_default.hpp:9-28`）。
+
+- ビルドの `kVerifyMaxT` が `kVerifyNarrowT` と等しい（現在の共通定義では 8 行）。
+- Metal ビルドではない。
+- serve モードで、multi-GPU でも layer split でもない。
+- `--batch` が 1 以下、DFlash2 を使わず、`--lookup-chain` が 0。
+- suffix draft が有効で、`--spec` が 2 以上。
+
+`generate.cpp` を含む共通 GPU engine target は CUDA / HIP 用（`engine/CMakeLists.txt:22,714`, `engine/cmake/strata_gpu_engine.cmake:1,548`）。この build では `STRATA_WINDOW_MAX_T=auto` が CUDA で 8、HIP で 16 になる。したがって標準の CUDA 8 行 build は幅条件を満たし、標準の HIP 16 行 build は満たさない。明示的に 8 または 12 行を選んだ場合、`kVerifyMaxT == 8` の判定が真になるのは 8 行だけ（`engine/CMakeLists.txt:116-138`, `engine/include/strata/kernels/window_limits.hpp:14-25`, `engine/src/program/generate.cpp:5046-5054`）。
 
 ## 有効になる条件
 
-環境変数が未設定または先頭文字が `0` 以外でも、コード上の自動既定値が 12 になるのは次の条件をすべて満たす場合だけです。
-
-- build の verify 窓が narrow（`kVerifyMaxT == kVerifyNarrowT`。narrow は 8 行）。CUDA/HIP の窓上限はビルド設定から決まり、Metal/SYCL は共通 header の既定 8 行です。
-- `--serve` を使い、単一 GPU である。layer split、`--batch`（batch 数が 1 より大きい）、DFlash2 draft、`--lookup-chain` は使わない。
-- suffix draft が有効（`--suffix-draft > 0`）で、`--spec >= 2`。
-- Metal build ではない。
-
-これらの条件のいずれかを満たさない場合、自動既定値は 0 です。特に、非 serve の起動では環境変数で既定機能を有効にしません。`--lookup-max-t` を明示すれば、上記の環境変数による自動既定値判定を通らず、指定値が使われます（ただし後段の serve 経路や backend の制約は別に適用されます）。根拠: `include/strata/core/lookup_default.hpp:23-27`、`include/strata/kernels/window_limits.hpp:3-25`、`src/program/generate.cpp:4143-4158`。
+- `STRATA_LOOKUP_MAX_T` が自動既定値を抑止できるのは、`--lookup-max-t` が CLI で指定されていない場合だけ。CLI 指定は環境変数に優先する（`engine/src/program/generate.cpp:4123,5043-5055`）。
+- 環境変数が設定されても lookup を有効化はしない。lookup を有効にする自動条件は前節の全条件であり、`STRATA_LOOKUP_MAX_T` の unset または先頭文字が `0` 以外であることも必要（`engine/include/strata/core/lookup_default.hpp:23-28`）。
+- 自動既定値が 0 でも、CLI の `--lookup-max-t N` に正値を指定すれば別経路で有効にできる。指定値は `--spec` の上限検査や build の窓幅制約を受ける（`engine/src/program/generate.cpp:4123,5079-5098`）。
+- lookup が有効でも layer split では許可サイズを narrow 窓までに絞り、`--spec` も上限 8 に戻す。既定値判定は layer split を除外するが、CLI で明示的に有効化した場合にはこの制限経路が適用される（`engine/src/program/generate.cpp:13256-13261,16429-16431`）。
+- lookup 最大値が build の `kVerifyMaxT` を超え、`STRATA_GDN_SPLIT=1` のときは、その設定が既定由来なら Strata が環境から削除し、ユーザー設定なら lookup 幅を `kVerifyMaxT` に clamp する（`engine/src/program/generate.cpp:5056-5076`）。
 
 ## 実行時の詳細
 
-変数はオプション処理後の設定構築時に一度読み取られ、`LookupDefaultIn` に `env_off` と他の実行条件を渡して自動値を決めます。static cache はなく、serve の各要求で読み直す実装でもありません。プロセス起動後の環境変更は、既に決定された `o.lookup_max_t` に反映されません。Strata がこの変数を子プロセスへ転送・上書きする箇所は候補名の全参照検索では見つかりません。参照: `src/program/generate.cpp:4143-4155`。
+オプション初期値は `lookup_max_t = -1`。CLI 引数解析後、共通のオプション調整でこの値が負のときにだけ `std::getenv("STRATA_LOOKUP_MAX_T")` を呼び、既定値を決める（`engine/src/program/generate.cpp:1173,4123,5043-5055`）。static cache やリクエスト単位の再読ではなく、起動時の一度の判定であるため、プロセス起動後に環境を変更しても反映されない。Strata がこの値を子プロセスへ転送する実装は見つからなかった。
 
-値が正なら serve の draft policy に lookup window サイズを設定し、開始時に stderr へ `strata serve: --lookup-max-t ...` の設定ログを出します。サイズごとの graph 準備で VRAM が不足した場合、そのサイズを policy から除き stderr に `no VRAM for the ...-token window graph` と残りサイズを表示し、小さいサイズで試します。VRAM 不足以外の graph 準備失敗はこの fallback ではなく、呼び出し側のエラー経路に進みます。根拠: `src/program/generate.cpp:13417-13437,18237-18250`。
+lookup 最大値が正なら `lookup_size_mask` が DraftPolicy 用の候補サイズを作る。通常は MTP のサイズに加え、既定では MTP 最大値の次の 1・2 token と上限幅が候補になる。serve は起動時の window warm-up と各 prompt / decode の lookup 判定でその候補を使う（`engine/src/program/generate.cpp:1507-1528,16348-16373,16429,20431-20446,22712-22741`）。候補幅の graph に VRAM が足りない場合、その幅を policy から外して次に小さい幅へ進む。VRAM 以外の graph 準備失敗は `ERR` 経路に進む（`engine/src/program/generate.cpp:16515-16529,22737-22741`）。
 
-値の判定だけでは別の成功ログや警告は出ません。`STRATA_LOOKUP_MAX_T=0` などで自動既定値を抑止してもエラー終了にはならず、lookup の既定上限が 0 になります。`docs/DETAILS.md:1086` も一 GPU の 8-row CUDA serve engine で既定 12、`STRATA_LOOKUP_MAX_T=0` で停止と説明しています。測定値はここでは再掲していません。
+## ログと測定値
+
+`STRATA_LOOKUP_MAX_T` 自体の値を表示するログはない。lookup 最大値が正のとき、serve は `strata serve: --lookup-max-t %d: MTP windows up to %d tokens, window sizes %s` を stderr に出す（`engine/src/program/generate.cpp:16512-16514`）。この行が出ないことだけから環境変数が設定されたとは判定できない。既定値 0、CLI による off、条件外も同じく lookup 最大値が正にならない。
+
+VRAM 不足の候補幅は `strata serve: no VRAM for the %d-token window graph: that size is dropped, sizes left %s (a larger --vram-reserve-mib keeps it)` と stderr に記録される。graph 準備が VRAM 不足以外で失敗した場合、decode 側は `ERR %s` を stdout に出して return 1 する（`engine/src/program/generate.cpp:16518-16529,22737-22741`）。
+
+`docs/DETAILS.md:1277` は関連する CLI 機能について、file rewrite / agent edit turn で RTX A6000 IQ3_S の +11〜14%、Tesla P100 IQ3_XXS の +13〜18%、通常の prose / code は 12 幅で 1% 以内と記載している。これは同資料にある報告値であり、この調査で再測定した値ではない。同節では追加条件・反復回数・OS を示していないため、ここでは環境変数の効果として一般化しない。
 
 ## 根拠
 
-- 全リポジトリでの名前の完全一致検索では、実装の環境読み取りは `src/program/generate.cpp:4144-4145` のみでした。候補一覧の名前だけやコメントは実装根拠にしていません。
-- 値の既定値と条件: `src/program/generate.cpp:4143-4155`、`include/strata/core/lookup_default.hpp:9-27`。
-- CLI 値の初期値・優先: `src/program/generate.cpp:972-977,3551`。
-- window 上限と各サイズの graph fallback: `include/strata/kernels/window_limits.hpp:14-25`、`include/strata/kernels/verify_kernels.hpp:23-31`、`src/program/generate.cpp:13417-13437`。
-- 既存の説明との照合: `docs/DETAILS.md:1086`。
+- 変数読み取り、CLI 優先順位、既定値入力: `engine/src/program/generate.cpp:1173,4123,5040-5055`
+- 既定値の全条件: `engine/include/strata/core/lookup_default.hpp:9-28`
+- build ごとの最大窓と GPU engine target: `engine/CMakeLists.txt:22,116-138,714`, `engine/cmake/strata_gpu_engine.cmake:1,548`, `engine/include/strata/kernels/window_limits.hpp:14-25`
+- 候補サイズ、warm-up、serve のログと VRAM fallback: `engine/src/program/generate.cpp:1507-1528,16348-16389,16429-16431,16512-16529`
+- layer split / GDN split の制限: `engine/src/program/generate.cpp:5056-5076,13256-13261`
+- prompt と decode における使用箇所: `engine/src/program/generate.cpp:20431-20446,22712-22741`
+- 関連機能の資料値: `docs/DETAILS.md:1277`

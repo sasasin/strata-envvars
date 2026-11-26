@@ -1,63 +1,62 @@
 # `strata bench cancel --profile`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
 | コマンド | `strata bench cancel` |
-| 値 | 保存済み serving profile 名 |
-| 既定値 | なし（必須） |
+| オプション | `--profile` |
 | 別名 | なし |
+| 値 | 保存済み serving profile の ID（小文字英字で始まり、小文字英数字・`_`・`-` を続ける最大 64 文字） |
 
 ## 役割
 
-`--profile` はキャンセル要求を送る benchmark の profile を指定します。`strata bench cancel` はこの値と `--path` で特定した出力先に対応する、実行中の保存済み profile benchmark に停止を要求します。単に同じ profile 名で動いている別 run を止めるものではありません（`strata_cli/cli.py:335-338, 1175-1182`; `strata_control/benchmarking.py:105-135, 138-148`）。
+キャンセル対象のベンチマークを profile ID と実行ディレクトリの組で照合します。profile を読み込んだあと、指定 profile の lease が指定ディレクトリを指し、その実行が進行中の場合に限り `cancel.request` を作成します。単に profile を指定するだけで他の実行中ベンチマークや server を停止するものではありません（`terminal/strata_cli/cli.py:363-366, 1239-1246`、`terminal/strata_control/benchmarking.py:105-147`）。
 
 ## 使い方
 
 ```sh
-strata bench cancel --profile work --path /absolute/path/to/benchmark-run
+# work profile で実行中のベンチマークにキャンセルを要求する
+strata bench cancel --profile work --path /absolute/path/to/run-directory
+
+# 同じ要求を JSON で受け取る
+strata bench cancel --profile work --path /absolute/path/to/run-directory --output json
 ```
 
-`work` は保存済み profile 名の例です。`--path` は絶対パスで、run ディレクトリ、またはその run の `results.json` / `progress.json` を指定できます。後者の場合は親ディレクトリが run の対象になります（`strata_cli/cli.py:336-338, 1177-1180`; `strata_control/benchmarking.py:138-141`）。
+`--path` は必須で、CLI は絶対パスでなければ終了コード 2 で拒否します。parser の説明は run directory または `results.json` を指定する形ですが、処理本体は `progress.json` も親ディレクトリへ解決します（`terminal/strata_cli/cli.py:363-366, 1241-1244`、`terminal/strata_control/benchmarking.py:138-145`）。
 
 ## 値と既定値
 
-parser は `--profile` を `required=True` として定義し、値を文字列として受け取ります。option 自体に既定値や `choices` はありません（`strata_cli/cli.py:335-338`）。
+- `--profile` は値を取る必須オプションです。別名はありません。parser 自体には値の変換・選択肢指定はなく、実行時に profile ローダーが検証します（`terminal/strata_cli/cli.py:363-366, 1243-1244`）。
+- ID は `[a-z][a-z0-9_-]{0,63}` に一致する必要があります。profile は設定ディレクトリ内の `<ID>.json` として読み込まれ、保存済みでない ID はエラーになります。内容も schema version、ID、絶対パスの `source_config`、override を含む profile として検証されます（`terminal/strata_control/profiles.py:25-26, 48-55, 120-132, 153-173`）。
+- `--profile` に既定値はありません。省略すると argparse の必須引数エラーになります。`--output` の既定値は `human`、指定できる値は `human` と `json` です（`terminal/strata_cli/cli.py:363-366`）。
 
-実行時に `profiles.load(a.profile)` が呼ばれます。profile 名は小文字英字で始まり、続きは小文字英字・数字・`_`・`-`、最大64文字です。名前に対応する保存済み profile ファイルが必要で、読込後には profile 内容も検証されます（`strata_control/profiles.py:25, 48-55, 150-166`; 呼出箇所: `strata_cli/cli.py:1179`）。未保存 profile、形式不正の名前、壊れた profile は失敗します。
+## 実行時の動作
 
-## 実行時の動作と相互作用
+CLI はまず `--path` が絶対パスかを確認し、その後 `profiles.load()` で指定 profile を読みます。`request_cancel()` は `results.json` / `progress.json` が指定された場合はその親を実行ディレクトリとし、それ以外は値自体をディレクトリとして扱います。ディレクトリが owner-only であることを確認したうえで、profile の lease に記録されたパス digest がそのディレクトリと一致し、progress の state が `running` の場合だけキャンセル要求を受理します（`terminal/strata_cli/cli.py:1239-1245`、`terminal/strata_control/benchmarking.py:78-79, 105-135, 138-149`）。
 
-`--profile` は必須の `--path` と組み合わせて使われます。CLI はまず `--path` が絶対パスかを検査し、その後 profile を読み込み、`benchmarking.request_cancel(profile, path)` に渡します。相対パスは cancel 処理に入る前に終了コード 2 のエラーになります（`strata_cli/cli.py:336-338, 1175-1180`）。
-
-キャンセル要求側では、profile 名に対応する lease ファイルのロック状態と記録済み run path の SHA-256 を照合します。同じ profile でも別 run の lease なら対象になりません。さらに progress の状態が `running` であることを確認してから、run ディレクトリに排他的作成で `cancel.request` を置きます。既存の有効な marker があれば再要求として扱い、現在の progress が `cancelled` ならその状態を返します（`strata_control/benchmarking.py:78-79, 105-135, 138-168`）。
-
-実行中 benchmark は marker を検出して処理を中断し、最終 report と progress にキャンセル状態を記録します。キャンセル要求コマンド自身が benchmark 子プロセスを直接終了する処理は確認できません（`strata_cli/bench.py:848-888`; marker 読取: `strata_control/benchmarking.py:171-181`）。
+受理時には実行ディレクトリに `cancel.request` を排他的に新規作成し、`1` を書いて同期します。すでに存在する場合は通常ファイル・単一 hard link・1 byte で owner-only であることを検証します。実行中のベンチマークはこのファイルを約 0.1 秒間隔で監視し、検出すると自身が保持する HTTP stream socket を shutdown し、後続処理をキャンセル扱いにします。そのため CLI の成功は要求の受理を示し、最終結果の確認は保存されたレポートで行います（`terminal/strata_control/benchmarking.py:149-168`、`terminal/strata_cli/bench.py:57-82, 812-825, 843-887`）。
 
 ## 適用条件と副作用
 
-- `--profile` に対応する profile が保存されていることが必要です。`profiles.load()` は profile ファイルを読み、管理者実行により権限がロックされていた場合は読み取り時に一度修復します（`strata_control/profiles.py:150-166`）。
-- run 出力ディレクトリはディレクトリであり、POSIX では owner-only 権限である必要があります。profile lease が現在ロック中かつ同じ run path を指し、progress が `running` の場合に限り要求を作成します（`strata_control/benchmarking.py:138-148`）。
-- `cancel.request` は mode `0600` で排他的に作成され、内容 `1` を書いて `fsync` されます。既存 marker が通常ファイルでない、リンク数・サイズ・権限が要件を満たさない場合は拒否されます（`strata_control/benchmarking.py:149-163, 171-181`）。
-- 引数解析前の `main()` は `private_files.adopt_user_defaults()` を実行します。Windows では作成ファイルの既定 owner / ACL を設定し、Windows 以外では何もしません（`strata_cli/cli.py:2217-2224`; `strata_control/private_files.py:349-385`）。
+- 保存済み profile が必要です。profile 名が不正、profile が未保存、または profile 内容が不正な場合は実行されません。profile 読込時に PermissionError が起きると、Strata はアクセス権を一度修復して再読込する経路を持ちます（`terminal/strata_control/profiles.py:48-55, 153-173`、`terminal/strata_control/private_files.py:479-487`）。
+- 指定ディレクトリが owner-only でない場合は拒否されます。POSIX では現在ユーザー所有で mode bits だけが広すぎるファイル・ディレクトリは検査時に `0600` / `0700` へ戻されることがあります。他ユーザー所有など修復できない状態は拒否されます（`terminal/strata_control/benchmarking.py:141-144`、`terminal/strata_control/posix_owner.py:26-54`）。
+- 対象の lease がない、別 profile / 別 run の lease である、run がすでに終了している、または progress が `running` でない場合はキャンセルしません（`terminal/strata_control/benchmarking.py:105-135, 145-148`）。
+- 主な副作用は `cancel.request` の作成と、ベンチマークプロセス側が現在の request stream を閉じて run をキャンセル終了させることです。server 自体の停止や GPU の直接操作はこの処理にありません（`terminal/strata_control/benchmarking.py:149-163`、`terminal/strata_cli/bench.py:57-82, 843-887`）。
 
-## 出力と失敗
+## 出力とエラー
 
-要求を受け付けると、`--output human`（既定）では「Cancellation requested; check the saved report for the final outcome.」を表示します。`--output json` では `schema_version`、`ok`、結果の `path` と `state` を含む JSON を出力します。成功時の終了コードは 0 です（`strata_cli/cli.py:338, 535-542, 1180-1182`）。`state` は `cancel_requested` または、要求時点ですでに完了処理へ進んでいる場合の `cancelled` です（`strata_control/benchmarking.py:164-168`）。
-
-相対 `--path` は終了コード 2。profile が見つからない、profile が不正、run が owner-only でない、progress が読めない・不正、または marker が不正な場合は `ProfileError` を介して通常は終了コード 5。該当する profile/path の run が active でない、または最終 report がすでに保存されていれば終了コード 6 です。`--output json` の場合はエラーも JSON、それ以外は stderr に `strata:` 付きで出力されます（`strata_control/profiles.py:30-35, 150-166`; `strata_control/benchmarking.py:138-168`; `strata_cli/cli.py:527-532, 2166-2183`）。
+- 成功時の human 出力は `Cancellation requested; check the saved report for the final outcome.`、終了コードは 0 です。JSON 出力では `ok: true`、`path`（`results.json` の絶対パス）、state（`cancel_requested` またはすでに反映済みの場合の `cancelled`）を返します（`terminal/strata_cli/cli.py:566-573, 1244-1246`、`terminal/strata_control/benchmarking.py:164-168`）。
+- 相対 `--path` は終了コード 2 です。profile の形式不正は通常 2、未保存 profile や不正な保存内容、owner-only 検証・progress 読込の失敗は 5、対象 run が active でない・すでに最終レポート保存済みの場合は 6 です（`terminal/strata_cli/cli.py:1241-1244, 2248-2265`、`terminal/strata_control/profiles.py:30-35, 48-50, 153-172`、`terminal/strata_control/benchmarking.py:138-168`）。
+- human mode のエラーは `strata: <message>` を stderr に出し、JSON mode は `ok: false` と code/message を含む JSON を stdout に出します（`terminal/strata_cli/cli.py:558-563, 2248-2265`）。
 
 ## 根拠
 
-- 索引上のコマンド階層と文書リンク: `docs/cli/README.md:643-650`（文書配置・scope: `docs/cli/README.md` 冒頭）
-- parser 定義、必須値: `strata_cli/cli.py:335-338`
-- cancel 分岐、絶対パス検査、profile 読込、委譲: `strata_cli/cli.py:1175-1182`
-- profile 名の形式とファイル読込・検証: `strata_control/profiles.py:25, 48-55, 150-166`
-- run lease と指定 path の照合、marker 作成・返却: `strata_control/benchmarking.py:78-79, 105-168`
-- benchmark 側のキャンセル反映と最終 report 保存: `strata_cli/bench.py:848-888`
-- 成功/エラー出力、終了コード変換: `strata_cli/cli.py:527-542, 2166-2183`
-- 引数解析前の user defaults 処理: `strata_cli/cli.py:2217-2224`; `strata_control/private_files.py:349-385`
-
-調査範囲は指定 revision のソースコードです。同一 revision の CLI help 実行や Release 配布物との照合は行っていません。option の受理・必須性は parser 定義と照合しました。
+- `terminal/strata_cli/cli.py:363-366` — `bench cancel` parser、必須 `--profile` / `--path`、`--output` の値と既定値。
+- `terminal/strata_cli/cli.py:1239-1246` — 相対 path の拒否、profile 読込、キャンセル処理呼び出し、成功出力。
+- `terminal/strata_control/profiles.py:25-55, 120-132, 153-173` — profile ID の形式、保存先、保存済み profile の読込と検証。
+- `terminal/strata_control/benchmarking.py:78-79, 105-168` — lease と run path の照合、active / running 検査、キャンセル marker 作成、返却 state。
+- `terminal/strata_cli/bench.py:57-82, 695-741, 812-887` — marker の監視、progress state、stream socket の停止、最終 report / progress の保存。
+- `terminal/strata_control/posix_owner.py:26-54` — POSIX owner-only 検査と mode 修復。
+- `terminal/strata_cli/cli.py:558-573, 2248-2265` — human / JSON 成功・失敗出力と例外時の終了コード処理。

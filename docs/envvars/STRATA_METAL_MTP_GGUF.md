@@ -1,46 +1,46 @@
 # `STRATA_METAL_MTP_GGUF`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal backend で speculative decoding に使う MTP ドラフト層の GGUF ファイルパスを指定する。`--mtp <runtime-dir>` で MTP を読み込む経路に限り参照される。未設定なら `<runtime-dir>` の親ディレクトリにある `mtp-q2_0.gguf` を既定パスとして使う。
+Metal backend で `--mtp` が指す runtime (`rt`) ディレクトリに対応するドラフト GGUF のパスを上書きする。`--mtp` を使う経路では、未設定なら runtime ディレクトリの親にある `mtp-q2_0.gguf` を使うが、この変数が設定されていればその文字列をパスとして保存する。CUDA/HIP・SYCL では MTP のロード先を変更せず、サーバーの会話セッション fingerprint に渡す補助パスとしてのみ参照される。`--mtp` 自体が空、または Metal の値が空文字の場合、ドラフターを実際にロードしない経路がある。`engine/metal/src/engine/window.cpp:3705-3722`, `engine/src/core/mtp.cpp:345-354`, `engine/src/program/generate.cpp:13965-13997`, `engine/sycl/src/program/generate.cpp:8144-8176`。
 
 ## 値と判定
 
-| 環境変数の状態 | パスの選択と結果 |
-| --- | --- |
-| 未設定 | `rt_dir` の末尾にある `/` を取り除き、その親ディレクトリに `/mtp-q2_0.gguf` を連結する。`rt_dir` に `/` が含まれない場合は `./mtp-q2_0.gguf`。 |
-| 設定済みで非空 | 値全体をファイルパスとして使用する。数値変換や真偽値への変換はなく、パスの存在・形式もこの時点では検証しない。 |
-| 設定済みで空文字 | 空のパスを保存する。既定パスには戻らず、decode window 初期化時の MTP GGUF 読み込みをスキップする。ただし `MtpDrafter::load` と Metal の `mtp_load` 自体は成功を返すため、これは上位の `--mtp` 設定を解除する処理ではない。 |
+この変数は `getenv` の設定有無だけを見て、値の構文・ファイル存在・空白・大文字小文字を検証しない。Metal ローダーは値をそのままパスに代入するため、未設定と空文字は異なる。fingerprint 側では `getenv` が未設定または空文字なら helper に空文字を渡し、helper が既定の兄弟 GGUF パスを解決する。
 
-相対パスはそのまま保持され、Strata 側で絶対パス化や正規化は行わない。空白を含む文字列も加工されない。
+| 経路 | unset | 設定時に使われる値 | 無効・特殊な値 |
+|---|---|---|---|
+| Metal の MTP ロード | `<rt 親>/mtp-q2_0.gguf` | 空でない文字列をそのまま GGUF パスにする（例: `/models/draft.gguf`） | 空文字は `g_mtp_path` を空にし、後続のロードをスキップする。`0`、`true`、前後空白なども特別扱いせず、文字列どおりのパスとして扱う。存在しない・読めないパスはロード失敗になる。 |
+| CUDA/HIP・SYCL の session fingerprint | helper が `<--mtp の親>/mtp-q2_0.gguf` を解決 | 非空文字列を MTP GGUF の候補パスとして helper に渡す | 空文字は未設定と同じ既定パス扱い。MTP が無効なら helper はファイルを列挙しない。 |
+
+Metal の既定パス解決は末尾の `/` を除いて最後の `/` までを親として切り出す。Windows では `window.cpp` の実装にもかかわらず `\` を区切りとして処理する分岐はなく、既定解決は `/` 基準である。上書き値自体は正規化しない。`engine/metal/src/engine/window.cpp:3708-3722`。Fingerprint helper は Windows では `/` と `\` のうち後ろにある区切りを選ぶ。`engine/src/core/conversation_file.cpp:976-989`。
 
 ## 有効になる条件
 
-- `STRATA_GPU_METAL` でビルドされた Metal backend で有効。`src/core/mtp.cpp` はこのビルド条件で Metal engine の `mtp_load` に委譲する。
-- `generate` が `--mtp` を受け取り、`--spec T` の `T >= 2` を満たす必要がある。`--mtp` が指定されても `--spec` が2未満なら、`generate.cpp` は `--mtp is ignored without --spec T (T >= 2)` と stderr に出して `--mtp` の値を消し、MTP をロードしない。
-- MTP 読み込みが要求されても、GGUF の実ファイル読み込みは decode window 初期化時まで遅延される。環境変数の非空値で指定したファイルを開けない、または GGUF として読み込めない場合、window 初期化が失敗する。
-- CUDA/HIP など Metal 以外の `MtpDrafter::load` 実装はこの環境変数を参照しない。
+- **Metal で実際の GGUF ロードを変える場合:** Strata が Metal build であり、`--mtp` が残っていて `MtpDrafter::load` が呼ばれ、Metal window の初期化が行われること。Metal `MtpDrafter::load` は `mtp_load(rt_dir, ...)` に渡し、window 初期化時に保留パスをロードする。`engine/src/core/mtp.cpp:345-354`, `engine/metal/src/engine/window.cpp:3627-3638`。
+- **`--mtp` が無指定、または CLI の処理でクリアされた場合:** この変数はドラフターのロードを有効化しない。SYCL では `--mtp` があっても `--spec` が 2 未満なら `--mtp` を無視してクリアする。`engine/src/program/generate.cpp:8264`, `engine/sycl/src/program/generate.cpp:4524-4541`。
+- **CUDA/HIP・SYCL:** 実 MTP ローダーがこの値を読む箇所は確認できない。`session_identity` が必要になったとき、`--mtp` が空でなく、helper が MTP file list を作る条件に合えば fingerprint の対象パスに影響する。helper は `--mtp` が通常ファイルならそのファイルを採用し、dense/experts pack directory なら pack ファイルを採用して環境変数を使わず、その他の directory は環境変数または既定 sibling GGUF を候補にする。`engine/src/program/generate.cpp:13965-13997`, `engine/sycl/src/program/generate.cpp:8144-8176`, `engine/src/core/conversation_file.cpp:944-997`。
+- Metal で空文字を設定した場合、実ロードは空パスのためスキップされる一方、session fingerprint helper に渡る空文字は既定 sibling GGUF に解決される。したがって、fingerprint が表す MTP GGUF と実際にロードされた drafter の状態は一致しない場合がある。また、後続で MTP prefill / draft が呼ばれると `metal mtp: not loaded` で失敗する。`engine/metal/src/engine/window.cpp:3712-3729`, `engine/metal/src/engine/window.cpp:2880-2883`, `engine/metal/src/engine/window.cpp:2930-2933`, `engine/src/program/generate.cpp:13987-13991`, `engine/src/core/conversation_file.cpp:976-990`。
 
 ## 実行時の詳細
 
-`generate` は `--mtp` の値が残っている場合に `MtpDrafter::load` を呼ぶ。Metal 実装は受け取った runtime directory と `max_t` を engine に渡す。engine はこの時点で `getenv("STRATA_METAL_MTP_GGUF")` を一度評価し、選んだパスと `max_t` をプロセス内の `g_mtp_path` / `g_mtp_max_t` に保存して成功を返す。
+Metal の `mtp_load` は `getenv` を呼ぶたびに値を読み、環境変数が存在すればその値を `g_mtp_path` に保存する。ここでは GGUF をまだ開かず、`mtp_load_pending` が後の window 初期化で `g_mtp_path` を確認する。空パスなら成功扱いで `Window::mtp_load` を呼ばない。非空なら `Window::mtp_load` が GGUF を開き、Metal buffer として包んでドラフト層を初期化する。値を static cache する実装ではないが、`g_mtp_path` はロード予約時にプロセス内へコピーされるため、その後の環境変更はその予約に反映されない。`engine/metal/src/engine/window.cpp:3705-3729`, `engine/metal/src/engine/window.cpp:2498-2503`, `engine/metal/src/engine/window.cpp:3627-3638`。
 
-その後、decode window が初めて初期化される際に保存済みのパスを使う。空パスなら `mtp_load_pending` は成功を返して GGUF を開かず、非空なら `Window::mtp_load` がファイルを開いてメモリマップする。ファイルを開けない場合のエラー文字列は `cannot open <path>`、マップ失敗は `mmap failed: <path>`、GGUF magic/version が一致しない場合は `not a GGUF file` / `GGUF version is not 3`。window 初期化の失敗は呼び出し元へ伝播する。
+非空の不正パスで `fm_.open` が失敗するか、GGUF を Metal buffer に包めない場合は MTP load が失敗する。Metal `MtpDrafter::load` の失敗は `--mtp` の初期化呼び出し元に戻り、`strata generate: <error>` を stderr に出して終了コード 1 で終了する。`engine/metal/src/engine/window.cpp:2498-2503`, `engine/src/core/mtp.cpp:345-354`, `engine/src/program/generate.cpp:8264`。
 
-環境変数は MTP の `load` 呼び出し時にパスへコピーされるため、その後の環境変更だけでは保存済みパスは更新されない。MTP をロードしない実行経路では評価されない。空文字を指定して GGUF 読み込みを飛ばしても、上位層が `--mtp` を有効のまま扱う経路は残る。Metal window の `mtp_prefill` / `mtp_draft` は MTP が未ロードの場合 `metal mtp: not loaded` を返すため、空文字での利用は MTP の正常な無効化手段として扱えない。
+CUDA/HIP・SYCL の fingerprint 経路では値を呼び出し時に読み、`session_mtp_pack_files` に渡す。同 helper は `--mtp` が空なら即座に空リストを返す。fingerprint 自体は lazy に一度構築・キャッシュされるため、構築後に環境を変更しても既存 fingerprint は更新されない。`engine/src/program/generate.cpp:13965-13997`, `engine/sycl/src/program/generate.cpp:8144-8176`, `engine/src/core/conversation_file.cpp:944-997`。
 
-## 文書との照合
+## ログと測定値
 
-`docs/ORCA.md` は MTP GGUF を `tools/mtp_pack.py` で `<mtp-dir>/mtp-q2_0.gguf` に作成し、`tools/mtp_rt.py` で runtime directory を生成する手順を記載している（33–41行）。これはソースの既定配置 `<rt>/../mtp-q2_0.gguf` と整合する。一方、この文書では `STRATA_METAL_MTP_GGUF` の説明を確認できなかったため、環境変数の意味は実装から記述した。
+この変数専用の有効・無効ログはない。Metal の失敗時は上記のとおり呼び出し元が error string を stderr に出して終了する。セッション fingerprint がファイルを開けない場合、会話 spill の初期化または保存時にモデル fingerprint 不可の理由を出す経路があるが、環境変数固有の文言ではない。`engine/src/program/generate.cpp:14070-14080`, `engine/src/program/generate.cpp:14110-14118`, `engine/sycl/src/program/generate.cpp:8253-8263`, `engine/sycl/src/program/generate.cpp:8296-8305`。
 
 ## 根拠
 
-- `src/program/generate.cpp:4612-4616,4629`: `--mtp` と `--spec` の条件、および MTP load 呼び出し。
-- `src/core/mtp.cpp:249-257`: Metal ビルドで Metal engine に委譲する分岐。
-- `metal/src/engine/window.cpp:2521-2541`: 環境変数の読み取り、未設定時の既定パス、パスの保存、遅延ロードのスキップ条件。
-- `metal/src/engine/window.cpp:2474-2482`: decode window 初期化時に保留中の MTP を読み込む箇所。
-- `metal/src/engine/window.cpp:1489-1494,1859-1861,1906-1909`: GGUF を開く処理と、MTP 未ロード時の prefill / draft エラー。
-- `metal/src/gguf_lite.cpp:58-72`: open、mmap、GGUF magic/version のエラー処理。
-- `docs/ORCA.md:33-41`: MTP GGUF と runtime directory の作成手順。
+- Metal の環境値読み取り、既定 sibling path、ロード保留: `engine/metal/src/engine/window.cpp:3705-3729`
+- Metal window による GGUF open と失敗: `engine/metal/src/engine/window.cpp:2498-2503`, `engine/metal/src/engine/window.cpp:3627-3638`
+- Metal build での MTP load 接続: `engine/src/core/mtp.cpp:345-354`; CUDA/HIP・SYCL での MTP load 呼び出し条件: `engine/src/program/generate.cpp:8264`, `engine/sycl/src/program/generate.cpp:4524-4541`
+- CUDA/HIP session fingerprint での環境値読み取りと呼び出し: `engine/src/program/generate.cpp:13965-13997`
+- SYCL session fingerprint での環境値読み取りと呼び出し: `engine/sycl/src/program/generate.cpp:8144-8176`
+- MTP file list の条件と既定 path 解決: `engine/src/core/conversation_file.cpp:944-997`

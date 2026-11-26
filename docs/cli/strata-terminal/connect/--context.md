@@ -1,57 +1,55 @@
-# `--context`
+# `strata connect --context`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-terminal` |
-| コマンド | `strata connect <アプリ>` |
+| コマンド | `strata connect` |
 | オプション | `--context` |
 | 別名 | なし |
-| 値 | `SIZE`。トークン数、または `k` / `m` 単位付きサイズ |
+| 値 | 必須。トークン数、または `k` / `m` を付けたサイズ |
 
 ## 役割
 
-接続先アプリ向けに `strata connect` が表示または書き出す設定で、サーバーのコンテキスト長として使う値を指定します。このオプション自体は Strata サーバーを起動・再設定しません。接続設定の生成に使う `Target.context` を上書きします（`strata_cli/launch/cmd.py:148-165, 864-870`; `strata_cli/launch/harness.py:27-42, 259-267`）。
+接続先アプリの設定に書き込むコンテキスト長を指定します。サーバーを起動・再設定する値ではなく、`strata connect` が表示または生成する各アプリ用設定のモデル情報やコンテキスト管理値に反映されます。省略時は実行中 launch の設定を使い、それが取得できない場合は 32K です（`terminal/strata_cli/launch/cmd.py:1074-1079`）。
 
 ## 使い方
 
 ```sh
-strata connect opencode --context 128k
+# Codex 用の接続設定を 64K コンテキストとして表示する（書き込みはしない）
+strata connect codex --context 64k
 ```
 
-設定の表示だけなら `--write` は不要です。既定の接続情報ではなく別サーバーに接続する設定を作る場合は、同じ `connect` コマンドで `--url` なども指定します。
+表示内容をファイルへ反映する場合は `--write` を加えます。既定では確認を求め、無人実行では `--yes` が必要です（`terminal/strata_cli/launch/cmd.py:175-180`, `terminal/strata_cli/launch/cmd.py:1019-1050`）。
 
 ## 値と既定値
 
-`SIZE` は整数または小数の数値で、末尾に `k` / `m`（大文字小文字を区別しない）を付けられます。`k` は 1,024 トークン、`m` は 1,048,576 トークンとして整数へ変換されます。前後の空白は除去され、内部の空白・カンマ・アンダースコアも取り除いてから解釈されます。変換後に 1,024 未満となる値は拒否されます。1,024 以上の上限は parser に定義されていません（`strata_cli/launch/settings.py:47-57`）。
-
-省略時は、`--preset` で選んだ起動情報（実行中の同名 launch があればその設定）または既定で選ばれた実行中 launch の設定から `--max-context` の値を読み取ります。その値が得られない場合は 32,768 トークン（32k）です。明示した `--context` はこの値に優先します（`strata_cli/launch/cmd.py:595-627, 864-869`）。ヘルプの説明も「実行中 launch の値、なければ 32k」としています（同 `cmd.py:158`）。
+- 値は必須で、`--context` は `_context` 型変換を通じて `settings.parse_context` を呼びます（`terminal/strata_cli/launch/cmd.py:46-50`, `terminal/strata_cli/launch/cmd.py:173`）。
+- 整数のトークン数、または `k` / `m` 単位を受け付けます。大文字小文字は区別せず、前後空白、数値中の空白・`_`・`,` は除去されます。`k` は 1024、`m` は 1024² 倍として計算し、数値が小数なら最近接整数へ丸めます（`terminal/strata_cli/launch/settings.py:90-100`）。
+- 最小値は 1024 トークンです。より小さい値は拒否されます。上限値や特定モデルのコンテキスト長との照合は、この parser / 変換処理では行いません（同上）。
+- 省略時、`run_connect` は `--preset` で指定した実行中 launch、または通常は最初に検出された実行中 launch の設定を参照し、その context がなければ 32768 を使います。保存済み preset 単独から context は取得せず、`launch_info` が読み取るのは実行中 launch の設定ファイルです（`terminal/strata_cli/launch/cmd.py:703-725`, `terminal/strata_cli/launch/cmd.py:1074-1079`）。
 
 ## 実行時の動作
 
-値は共通変換関数 `_context` から `settings.parse_context` に渡され、トークン数の整数になります。選択したアプリの設定 renderer に同じ `Target.context` が渡され、アプリごとの設定値や補助値に反映されます。たとえば OpenCode の `limit.context`、Codex の `model_context_window`、Claude Code の `CLAUDE_CODE_MAX_CONTEXT_TOKENS`、Pi の `contextWindow`、Hermes の `context_length` に使われます。OpenCode の入力上限や設定内の compaction buffer/reserve、OpenClaw の `contextTokens` もこの値から算出されます（`strata_cli/launch/cmd.py:48-52, 868-870`; `strata_cli/launch/harness.py:40-42, 80-104, 124-139, 142-149`）。
+変換後の整数を `harness.target` に渡し、接続先ごとの設定をレンダリングします（`terminal/strata_cli/launch/cmd.py:1078-1080`, `terminal/strata_cli/launch/harness.py:339-347`）。生成先により、モデルの context window、コンテキスト上限、アプリ用環境変数、圧縮・要約設定などに反映されます。例えば Codex 用設定では `model_context_window`、Claude Code 用環境では `CLAUDE_CODE_MAX_CONTEXT_TOKENS`、Pi 用設定ではコンテキスト予約値に使われます（`terminal/strata_cli/launch/harness.py:144-149`, `terminal/strata_cli/launch/harness.py:158-163`, `terminal/strata_cli/launch/harness.py:199-202`）。
 
-`--check` を付けても、この値を使った設定表示・JSON生成は行われますが、チェックリクエスト自体には context を渡しません。チェック処理へ渡されるのはアプリ ID、URL、key、model です（`strata_cli/launch/cmd.py:880-896, 921-929`）。
-
-`--write` を付けると、生成設定をアプリの設定ファイルに書き込みます。既存ファイルは書き込み前にバックアップされ、JSON の merge 対象では既存キーを保って新しい値を適用します。非対話入力で `--yes` がなければ書き込み前に終了コード 2 で拒否されます。したがって、明示した context は書き込んだクライアント設定にも残ります（`strata_cli/launch/cmd.py:930-947`; `strata_cli/launch/harness.py:275-298`）。
+明示した値は実行中 launch から取得される context より優先されます。`--check` の通信確認には context は渡されず、確認処理には URL・key・model が渡されます（`terminal/strata_cli/launch/cmd.py:1074-1080`, `terminal/strata_cli/launch/cmd.py:1088-1093`）。`--write` を指定しない限り、設定ファイルは変更されません。`--write` 時の実ファイル書き込みは harness の各出力ファイルに対して順に行われます（`terminal/strata_cli/launch/cmd.py:1039-1049`, `terminal/strata_cli/launch/cmd.py:1156-1167`）。
 
 ## 適用条件と副作用
 
-`<アプリ>` を指定した場合に、そのアプリ用の設定生成へ適用されます。アプリ名を省略して一覧を出す経路はアプリ一覧だけを出力し、context は設定に反映されません（`strata_cli/launch/cmd.py:842-856`）。`deepseek-harness` は組み込みアプリとして登録され、独自の設定ファイル生成関数を持たないため、context を含む設定ファイル・環境変数は生成しません（`strata_cli/launch/harness.py:222-234, 263-268`）。
-
-無効な形式、または 1,024 トークン未満は parser の型変換時にエラーになります。`parse_context` の `ValueError` は `argparse.ArgumentTypeError` に変換されます（`strata_cli/launch/cmd.py:48-52`; `strata_cli/launch/settings.py:50-56`）。実行時に扱えるコンテキスト上限や、接続先サーバーの実際の上限との照合は、この parser / connect 処理では確認できません。
+- `--context` は接続先アプリの設定生成にだけ適用されます。`strata launch` がサーバーに渡すコンテキスト値を変更しません。実行中 launch から取得する値は `--max-context` の引数を設定ファイルから読み取ったものです（`terminal/strata_cli/launch/cmd.py:693-700`, `terminal/strata_cli/launch/cmd.py:1078-1080`）。
+- `--write` を付けなければ出力表示のみです。書き込み時は既存ファイルのバックアップを作る旨を案内し、`--if-unchanged` があれば生成内容と一致するファイルを変更せずに扱います（`terminal/strata_cli/launch/cmd.py:175-179`, `terminal/strata_cli/launch/cmd.py:1025-1049`, `terminal/strata_cli/launch/harness.py:355-380`）。
+- harness ごとに context の使い方が異なります。例えば OpenCode / Codex / Cline / Pi / Hermes / OpenClaw のモデル設定や、Claude Code 用環境変数へ出力されます（`terminal/strata_cli/launch/harness.py:120-141`, `terminal/strata_cli/launch/harness.py:144-163`, `terminal/strata_cli/launch/harness.py:191-215`）。利用先アプリ自身による値の上限適用・解釈は Strata ソースからは確認できません。
 
 ## 出力とエラー
 
-- context 値の形式エラーまたは最小値未満は引数エラーになります。対象 CLI のトップレベル parser は未知引数を `strata connect` 向けメッセージとして stderr に出し終了コード 2 を返します。型エラーも argparse による引数処理で拒否されます（`strata_cli/cli.py:2223-2231`; `strata_cli/launch/cmd.py:48-52`）。
-- 有効なアプリ名がない場合は、候補名を含むエラーを stderr に出して終了コード 2 を返します（`strata_cli/launch/cmd.py:857-863`）。
-- `--output json` では、context を含む生成設定を JSON に出力します。秘密鍵は通常マスクされ、`--show-key` の指定で表示されます（`strata_cli/launch/cmd.py:871-879, 897-910`）。
-- `--write` によるファイル変更、バックアップ、確認動作は上記「実行時の動作」のとおりです。書き込み対象のないアプリでは `Nothing to write for this app.` を表示して終了します（`strata_cli/launch/cmd.py:930-947`）。
+形式不正や 1024 未満の値は型変換時に拒否され、`argparse.ArgumentTypeError` になります（`terminal/strata_cli/launch/cmd.py:46-50`, `terminal/strata_cli/launch/settings.py:93-99`）。通常の parser エラー出力と終了コードは argparse の経路であり、この調査では CLI を実行して表示文言を確認していません。`--write` で確認が必要なのに stdin が端末でなく `--yes` もない場合は終了コード 2、書き込み失敗時は終了コード 1 となり、失敗したファイルと後続の未書き込みファイルが報告されます（`terminal/strata_cli/launch/cmd.py:1025-1049`）。
 
 ## 根拠
 
-- parser、値変換、既定値選択、生成処理: `strata_cli/launch/cmd.py:48-52, 148-165, 595-627, 842-947`
-- サイズ解析と最小値: `strata_cli/launch/settings.py:47-57`
-- 各アプリ向け設定への反映とファイル書き込み: `strata_cli/launch/harness.py:27-42, 80-149, 222-268, 275-298`
-- CLI の未知引数処理: `strata_cli/cli.py:2223-2231`
+- `terminal/strata_cli/launch/cmd.py:163-183` — `connect` parser と `--context` の登録、値型、既定値に関する help。
+- `terminal/strata_cli/launch/cmd.py:46-50`, `terminal/strata_cli/launch/settings.py:90-100` — 型変換、構文、単位、丸め、下限。
+- `terminal/strata_cli/launch/cmd.py:693-725`, `terminal/strata_cli/launch/cmd.py:1074-1080` — 実行中 launch / preset 情報の取得と context の優先順位。
+- `terminal/strata_cli/launch/harness.py:339-347` および `terminal/strata_cli/launch/harness.py:144-163`, `terminal/strata_cli/launch/harness.py:191-215` — 値を harness 設定へ適用する処理。
+- `terminal/strata_cli/launch/cmd.py:1088-1093`, `terminal/strata_cli/launch/cmd.py:1019-1049` — `--check` と `--write` の経路、確認・失敗処理。

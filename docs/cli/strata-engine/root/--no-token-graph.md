@@ -1,58 +1,60 @@
 # `--no-token-graph`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査日は 2026-10-25。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（索引上の `strata-engine/root` 引数） |
+| コマンド | `strata generate`（root のエンジン引数） |
 | オプション | `--no-token-graph` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ |
+| 値 | 取らないフラグ |
 
 ## 役割
 
-通常の capture 経路で、全 layer をひとつにまとめた token graph を作らないようにします。ソース内の説明では A/B 用の切り替えで、token graph の代わりに layer ごとの graph を使います。性能向上を保証する設定ではありません。
+通常は条件が整うと全層の処理を一つの CUDA graph に capture して token ごとに起動するところを、このフラグで無効にします。代わりに通常の layer loop が使われ、各層の `pre` graph と `post` graph をホストが順に起動します。help の説明では A/B 比較用です。性能改善を保証する設定ではありません。
 
 ## 使い方
 
 ```sh
-strata generate --pack pack/full --tokens "1,2,3" --no-token-graph
+# pack から token 推論し、token graph を使わない経路を選ぶ
+strata generate --pack /path/to/pack --tokens "1,2,3" --no-token-graph
 ```
-
-例では既定の pack directory とトークン列を指定しています。実行環境に合わせて pack と入力 token を用意してください。
 
 ## 値と既定値
 
-値は不要です。未指定時は `no_token_graph = false` で、他の条件が許せば token graph capture を試みます。指定時は真になります。同じフラグを複数回指定しても同じ真値を設定するだけです。個別の範囲 validation はありません。`src/program/generate.cpp:603` に既定値、`:2781` に parser の設定があります。
+値を取りません。未指定時の `Options::no_token_graph` は `false` で、指定すると parser が `true` にします。同じフラグを複数回指定しても同じ真偽値を設定するだけです。個別の値検証やこのオプション専用のエラー分岐はありません。parser が認識しない引数は stderr に `unknown argument` と usage を出して終了コード `2` で終了します。
 
 ## 実行時の動作
 
-通常の capture 経路では、`--no-token-graph` がない場合に token graph capture 条件を満たすと、`session_capture_token` が各 layer の pre/post 処理を一つの graph に記録します（`src/program/generate.cpp:7471-7478`、`src/core/session.cpp:853-905`）。この option を指定すると、その capture 条件から外れ、token 処理時に `session_loop` を呼ぶ経路になります（`src/program/generate.cpp:15932-15950`）。ソースの説明はこれを「layer ごとの二つの graph」と記載しています（`src/program/generate.cpp:7385-7387`）。
+`--no-capture` でなく native pack でもない場合、通常の層別 `SessionGraphs`（層ごとの `pre` と `post`）はこのオプションに関係なく capture されます。フラグを指定すると token graph capture 条件から外れ、decode loop は `session_run_token` ではなく `session_loop` を呼びます。`session_loop` は層ごとの `pre` を開始し、router の結果を CPU expert pool に渡し、その結果を転送して同じ層の `post` graph を起動します。
 
-これは `--no-capture` とは異なります。`--no-capture` を指定した場合、token loop は `session_token` に分岐して layer を直接実行するため、`--no-token-graph` が切り替える token graph 対 layer graph の選択は使われません（`src/program/generate.cpp:507`, `:15932-15950`）。
-
-`--no-token-graph` の有無にかかわらず、layer/half dump が有効な場合、native pack または multi-GPU の場合、token graph capture は行われません（`src/program/generate.cpp:7471-7478`）。expert-profile による graph hit 用の residency table 初期化も、`--no-token-graph` 指定時は行われません（同 `:7405-7407`）。これらの条件では、この option が token graph 選択に与える追加の効果はありません。
+プロファイル済み expert cache の hit 判定を token graph 内で行うための device residency table の構築も、このフラグ指定時には抑止されます。token graph 専用の設定を通らず、`session_loop` 側の host 層別経路が使われます。
 
 ## 適用条件と副作用
 
-- エンジンの引数 parser が受け付けるフラグです。Qwen3.6 専用 parser に同名 option もありますが、索引では `strata-engine/qwen36/` に分けられています。この文書は通常の `strata-engine/root/` parser の挙動を扱います（`docs/cli/README.md` の strata-engine scope および `src/program/generate.cpp:2781`）。
-- graph capture 自体を全て無効にするものではありません。token graph に代わり `session_loop` が使われる通常経路では、layer graph と host loop を実行します（`src/program/generate.cpp:15938-15950`、`src/core/session.cpp:592-620`）。
-- option 単独でファイルやネットワークに作用する処理は確認できません。graph 構築・実行経路が変わるほか、token graph 専用の診断出力や統計は token graph が実際に capture された場合に限られます（`src/program/generate.cpp:7478`, `:16986-16990`）。
+- token graph 自体が capture されないのは、`--no-capture` が指定されていないこと、`native_pack`（expert layout の native 形式）でないこと、layer dump / half dump を行わないこと、multi-GPU layer split でないことなど、通常の token graph 条件が満たされる場合の比較です。これらの条件により元から token graph を使わない実行では、このフラグによる経路変更はありません。
+- `--no-capture` を指定した場合は token graph capture 自体が行われず、token ごとに `session_token` が呼ばれます。この場合も `--no-token-graph` による追加の変更はありません。
+- flag 専用のファイル・ネットワーク操作は確認できません。通常 capture と layer loop に必要な GPU graph、CUDA stream、device buffer などの割当・起動・解放は実行されます。
+- 根拠にした `generate.cpp` は CUDA/HIP のエンジン実装です。別 backend の同名フラグの動作はこの調査では確認していません。
+- root parser とは別に、Qwen3.6 専用 parser にも同じ文字列があります。索引で scope が別文書に分かれているため、この文書は root `strata generate` の実装だけを記述します。
 
 ## 出力とエラー
 
-このフラグを認識するときの専用出力や専用エラーはありません。未知の引数は `unknown argument` を stderr に出し、usage を表示して終了コード 2 になります（`src/program/generate.cpp:2787-2792`）。
-
-token graph を有効にした経路で capture に失敗すると、エラーを `strata generate:` とともに stderr に出して終了コード 1 で戻ります（`src/program/generate.cpp:7473-7476`）。この option で token graph 経路を外した場合は、その capture 失敗経路には入りません。代わりの `session_loop` が失敗すると、`session_loop:` のエラーを stderr に出して終了コード 1 になります（`src/program/generate.cpp:15946-15949`）。
+このフラグを指定したこと自体を示す専用ログは確認できません。token graph を利用する経路では `token graph captured ...`、profile cache の token graph hit 経路では `token graph hit path ...` が stderr に出ますが、フラグ指定時は該当する capture / hit-table 準備条件から外れるため、これらのログは出ません。layer loop の graph launch、GPU query、pool 処理などが失敗すれば `session_loop` のエラーが `strata generate:` 付きで stderr に出て、呼び出し側は終了コード `1` を返します。
 
 ## 根拠
 
-- `src/program/generate.cpp:603` — option の既定値。
-- `src/program/generate.cpp:958` — built-in help の説明（A/B、layer ごとの graph と token graph の対比）。
-- `src/program/generate.cpp:2781-2792` — parser、未知引数の失敗処理。
-- `src/program/generate.cpp:7405-7407`, `:7471-7478` — graph hit 初期化と token graph capture の適用条件、capture 失敗・成功出力。
-- `src/program/generate.cpp:15932-15950`, `:16986-16990` — token 実行時の分岐と token graph 統計。
-- `src/core/session.cpp:592-620`, `:853-925` — layer loop の validation と token graph の capture 処理。
-
-調査範囲は上記 commit のソースと `docs/cli/README.md` の索引です。Strata の実行バイナリ、Release 配布物、各 GPU/backend での実測挙動は確認していません。索引の `strata-engine/root` scope に合わせ、Qwen3.6 専用 parser の同名 option は調査対象外です。
+- `engine/src/program/generate.cpp:954` — `no_token_graph` の既定値 `false` と A/B 用途のコメント。
+- `engine/src/program/generate.cpp:1375` — help の説明（層ごとに二つの graph を host 起動する A/B arm）。
+- `engine/src/program/generate.cpp:4262` — parser が値なしで bool を `true` にする定義。
+- `engine/src/program/generate.cpp:4268-4273` — 未知引数の stderr、usage、終了コード `2`。
+- `engine/src/program/generate.cpp:10977-10985` — token graph と層別経路の関係。
+- `engine/src/program/generate.cpp:10997-11015` — profile hit 用 residency table の準備が `!o.no_token_graph` 条件下でのみ行われることと割当失敗メッセージ。
+- `engine/src/program/generate.cpp:5445` — `native_pack` が expert layout に基づく条件であること。
+- `engine/src/program/generate.cpp:11069-11076` — token graph capture 条件、失敗時の stderr と通常終了コード `1`、成功時ログ。
+- `engine/src/program/generate.cpp:24296-24313` — decode loop が `session_run_token` と `session_loop` を切り替える箇所、および失敗時の戻り経路。
+- `engine/src/core/session.cpp:200-285` — `session_capture` が各層の `pre` / `post` graph を capture する実装。
+- `engine/src/core/session.cpp:681-753` — `session_loop` の層別 ring 待ち、pool 呼出し、`post` graph launch。
+- `engine/src/core/session.cpp:778-783` — 次層の `pre` graph launch と失敗メッセージ。
+- 同じ文字列は `engine/src/qwen35/q36_engine.cu:5357` にも存在し、別 parser では独自に `graph = false` とする。`docs/cli/README.md` の `strata-engine` 節は root と Qwen3.6 専用 parser を分けているため、本書の対象には含めない。

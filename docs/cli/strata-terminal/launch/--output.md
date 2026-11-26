@@ -1,6 +1,6 @@
-# `--output`
+# `strata launch --output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,51 +12,48 @@
 
 ## 役割
 
-起動・計画・一部の管理結果を、人向けのテキストか機械処理向けの JSON で出力します。値を指定しない場合は `human` です。`--output json` は起動内容を読み取り専用にする指定ではありません。変更せず計画だけを見る場合は `--plan` も指定します。
+`strata launch` の主な結果や失敗を、人向け表示または機械処理向け JSON で出力します。`--list-presets`、`--status`、`--plan`、通常起動の結果を JSON で受け取りたい自動化で使えます。`strata connect` にも同名の別スコープの parser 定義がありますが、この文書は `strata launch` のみを対象にします（`terminal/strata_cli/launch/cmd.py:73-80, 154-155, 163-183`）。
 
 ## 使い方
 
 ```sh
-# 計画を JSON で表示する（起動・変更はしない）
+strata launch --list-presets --output json
 strata launch --plan --model q2_0 --output json
-
-# 起動結果を JSON で受け取る
-strata launch --model q2_0 --no-tui --output json
 ```
+
+実際に `--model` などの選択肢を指定して `--plan` なしで実行すると、JSON モードでは対話画面を開かず、起動確認も自動的に承認扱いになります。エンジンやモデルの取得を含む実行をスクリプトから行う場合は、その副作用を前提にしてください（`terminal/strata_cli/launch/cmd.py:849-877`）。
 
 ## 値と既定値
 
-- parser は `choices=("human", "json")`、既定値 `human` として定義されています。別名はありません（`strata_cli/launch/cmd.py:140`）。
-- 値を省略すると人向けの出力です。`--output` の値を省略した場合や、`human` / `json` 以外を渡した場合は `argparse` の選択肢検証で拒否されます。
-- 同じ `--output` を複数回指定したときの個別仕様はソースで定義されていません。`argparse` の通常の単一値引数として最後に解析された値が Namespace に入ります。
+- 値は必須で、選択肢は `human` と `json`、省略時は `human` です（`terminal/strata_cli/launch/cmd.py:154`）。
+- `choices` にない値（空文字列を含む）は引数解析で拒否されます。値を複数回指定した場合は `argparse` の通常の `store` 動作となり、最後に指定した値が使われます。専用の変換関数や重複指定時の追加処理はありません（`terminal/strata_cli/launch/cmd.py:154`）。
 
 ## 実行時の動作
 
-- `run_launch` は `--output json` を machine mode として扱います。失敗は stdout に `schema_version`、`ok: false`、`error.code`、`error.message` を持つ JSON を出し、返したコードを終了コードにします。human mode の失敗は `strata: ...` を stderr に出します（`strata_cli/launch/cmd.py:630-641`）。
-- machine mode では計画結果を `{"schema_version":1,"ok":true,"plan":...}` として出力します。human mode では計画の要約を行ごとに表示します。どちらも `--plan` の経路であり、計画表示後に終了します（`strata_cli/launch/cmd.py:733-760`）。
-- 起動成功時は、稼働中の URL、profile、再利用の有無、API key の有無（キーそのものではなく `set`）、tuning 情報、通知を JSON で出します。エンジン起動に至らなかった場合も `serving: false`、原因情報、メッセージを含む成功形式の JSON を出します（`strata_cli/launch/cmd.py:785-805`）。
-- `--list-presets` は preset 一覧を JSON 化し、`--status` は稼働中 launch の一覧を JSON 化します（`strata_cli/launch/cmd.py:643-671`）。
-- `--output json` のとき対話式 TUI は選ばれません。質問可能な画面がなく、起動対象も指定していない場合はエラーになります（`strata_cli/launch/cmd.py:685-710`）。machine mode は自動確認扱いで runner に渡されます（`strata_cli/launch/cmd.py:715-716`）。
+- `human` 以外、すなわち `json` のとき `run_launch` は機械出力モードと判定します（`terminal/strata_cli/launch/cmd.py:753-764`）。このモードでは TUI を起動せず、モデル等の選択がない非 plan 実行はエラーになります（同 `:849-873`）。
+- Runner の進捗出力 callback は抑止され、`assume_yes` が真になります。したがって通常の対話確認を行わずに Runner の実行へ進みます。`--output json` 自体がファイルを変更するわけではありませんが、組み合わせた起動オプションに応じて Runner がエンジン／モデル取得やサーバー起動などを進める条件を変えます（同 `:876-877`、`terminal/strata_cli/launch/runner.py:980-993`）。
+- `--plan` と併用した場合は plan オブジェクトを `schema_version: 1`、`ok: true` とともに JSON 出力し、plan 分岐から終了します（`terminal/strata_cli/launch/cmd.py:897-903`）。
+- `--list-presets` は preset を `to_dict(with_key=False)` で JSON 化します。`--status` は稼働中 launch の一覧を JSON 化します（同 `:767-797`）。
+- 通常起動では、非 serving の結果に `serving: false`、`engine_problem`、`message` などを含め、serving 中の結果に profile、URL、再利用状態、API key の有無を示す `api_key`、tune 情報、通知を含めます。API key の値そのものは通常起動の結果 JSON には載せず、`set` または `null` です（同 `:967-979`）。
+- JSON モードの失敗経路では、`schema_version`、`ok: false`、エラーコードとメッセージを JSON 出力し、同じコードを終了コードとして返します（同 `:759-764, 1009-1014`）。
 
 ## 適用条件と副作用
 
-- `--output json` は起動処理自体を無効にしません。`--plan` がなければ通常の runner 実行に進み、必要に応じてモデル等の準備や server 起動を行います（`strata_cli/launch/cmd.py:733-760, 784-805`）。
-- `--output json` は `--data-dir` と併用しても既存モデルの移動を選ばず、新しいフォルダーを新規ダウンロード先として使う選択になります。移動するには明示的な `--move-data` が必要です（`strata_cli/launch/cmd.py:504-526`）。
-- machine mode では途中経過・警告の人向け表示を抑えます。runner に渡す出力 callback は `machine` を quiet として受け取り、通知の行表示も JSON 経路では省略されます（`strata_cli/launch/cmd.py:432-457, 761-771`）。
-- `--delete-preset` と `--stop` は `--output json` でもそれぞれ通常のテキストを出します。`--show-key` も成功時はキーをテキストで表示するため、JSON 出力を期待して機密情報を隠せると考えてはいけません。キーがない場合の失敗は machine mode の JSON エラーです（`strata_cli/launch/cmd.py:657-677`）。
-- 索引の `strata launch` scope に対応する parser は `strata_cli/launch/cmd.py:75-146` です。同ファイルの `strata connect` にも独立した同名オプションがありますが、そちらは別コマンドの出力仕様であり、この文書の対象外です（`strata_cli/launch/cmd.py:148-165`）。
+- `--output` は `strata launch` に作用します。同じ `add_parsers` 関数内にある `strata connect --output` は別 parser・別コマンドであり、本オプション文書の対象外です（`terminal/strata_cli/launch/cmd.py:73-80, 154-183`）。
+- JSON モードで `--show-key` を使うと、成功時に key は JSON オブジェクトではなく `_say` 経由の標準出力へそのまま書かれます。したがって JSON 一個だけが出ることを期待するパイプラインでは混在に注意してください（同 `:798-815`）。
+- 管理操作すべてが JSON 化されるわけではありません。特に `--delete-preset` は人向けの完了文を出し、`--stop` は専用処理へ委譲します（同 `:783-788`）。`--output json` だけで、それらの出力形式が JSON になるとはソース上確認できません。
+- JSON モードで起動選択を指定しない場合、非 plan 実行は「選択を指定する」旨のエラーになります（同 `:859-862`）。
 
 ## 出力とエラー
 
-- JSON 出力は stdout に1つの JSON object として書かれます。失敗時の終了コードはエラー経路ごとに設定され、例として parser / 引数起因は通常 `2`、カタログ利用不可等は `5`、中断は `130` です（`strata_cli/launch/cmd.py:636-641, 679-684, 832-837`）。
-- `--output` の未対応値など parser 段階の引数エラーは `run_launch` に入る前に発生します。launch/connect で認識されない引数は `strata: ... See: strata launch --help` を stderr に出して `2` を返します（`strata_cli/cli.py:2223-2231`）。
-- 機械可読化は `strata launch` の分岐で個別に実装されています。特に `--delete-preset`、`--stop`、`--show-key` の成功出力は JSON object ではありません（`strata_cli/launch/cmd.py:657-677`）。
+選択肢外の値は parser の `choices` により拒否されます。未知の追加引数については CLI の `main` が launch/connect 用のエラー文を標準エラーへ出し、終了コード `2` を返します（`terminal/strata_cli/launch/cmd.py:154, 186-200`、`terminal/strata_cli/cli.py:2325-2334`）。通常処理内で捕捉される preset error と `ValueError` は既定コード `2`、割り込みは `130` を返し、JSON モードでは前述のエラー形式を標準出力へ出します（`terminal/strata_cli/launch/cmd.py:759-764, 1009-1014`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:127-146` — launch parser の `--output` 宣言と launch 用管理オプション。
-- `strata_cli/launch/cmd.py:630-677` — machine mode、共通失敗出力、preset / status / delete / stop / key の分岐。
-- `strata_cli/launch/cmd.py:685-716` — TUI 選択、非対話エラー、自動確認としての runner 設定。
-- `strata_cli/launch/cmd.py:733-805` — plan、起動失敗・成功時の JSON / human 出力。
-- `strata_cli/launch/cmd.py:504-526` — JSON / yes / plan と `--data-dir` の移動選択規則。
-- `strata_cli/cli.py:2223-2237` — parser 呼び出し、launch の未知引数エラー、最上位の dispatch。
+- parser 定義と同スコープの connect parser: `terminal/strata_cli/launch/cmd.py:73-80, 141-183`
+- JSON モード判定と失敗形式: `terminal/strata_cli/launch/cmd.py:753-764`
+- preset 一覧・削除・停止・status・key 表示: `terminal/strata_cli/launch/cmd.py:767-815`
+- TUI 判定、JSON 時の確認抑止、Runner への出力 callback 転送: `terminal/strata_cli/launch/cmd.py:849-877`
+- plan／起動結果の JSON 形式: `terminal/strata_cli/launch/cmd.py:897-903, 967-979`
+- Runner の callback・確認フラグ保持: `terminal/strata_cli/launch/runner.py:980-993`
+- CLI での parser 登録と未知引数の終了経路: `terminal/strata_cli/cli.py:516-518, 2325-2334`

@@ -1,50 +1,49 @@
 # `STRATA_VERIFY_TRACE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の Strata 作業ツリーは `## main...origin/main` で、未コミット変更はありません。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Verifier の診断用 trace を有効にします。有効時、ホスト側では verifier の handshake event をリングバッファへ記録し、GPU 側では layer/token group ごとの profiler stamp（breadcrumb）を mapped memory に記録します。これは診断情報の記録・表示を切り替えるもので、生成や検証の計算結果を選ぶ設定ではありません。
-
-Strata 所有の本番コードでの読み取りは CUDA/HIP 共通の `src/core/verify.cpp` と SYCL 実装 `sycl/src/core/verify.cpp` に各1箇所あります。両方とも同じ `env_on()` 判定を使います。候補一覧にある名前は実際に読み取られており、誤検出ではありません。
+verifier の handshake イベントと各 GPU window の進捗 breadcrumb を記録し、失敗や watchdog 診断時に `stderr` へ出す診断用フックである。通常の推論結果や verifier の待ち時間・timeout 値を選ぶ設定ではない。trace 有効時は verifier の初期化で breadcrumb 用 mapped 領域を要求し、記録点を追加する。CUDA/HIP 共通の `engine/src/core/verify.cpp` と SYCL の `engine/sycl/src/core/verify.cpp` に実装があり、ほかの verifier 実装からこの名前を読む箇所は確認できなかった（それぞれ `:344`, `:191`）。
 
 ## 値と判定
 
-| 環境値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| 先頭文字が `0`（例: `0`, `0abc`） | 無効 |
-| それ以外の非空文字列（例: `1`, `true`, `false`, ` 0`） | 有効 |
+両実装の `env_on` は `std::getenv` の結果が null でなく、先頭文字が NUL でも `'0'` でもない場合に true を返す。文字列全体の parse、数値変換、空白除去、大文字小文字変換はしない（CUDA/HIP: `engine/src/core/verify.cpp:336-339`; SYCL: `engine/sycl/src/core/verify.cpp:151-154`）。
 
-文字列全体の比較や数値変換はしません。先頭文字だけを検査し、大文字小文字や後続文字は無視します。そのため `false` も有効です。既定は無効です。CLI 引数や別の環境変数による上書きはありません。値は各実装のファイルスコープ `const bool g_trace` の初期化時に一度判定されるため、その後にプロセス内で環境値を変えても反映されません。
+| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP verifier | off | 空でない文字列で先頭が `0` 以外。例: `1`, `true`, `false`, ` 0`, `0anything` 以外 | 空文字、`0`, `0anything`（先頭文字だけを見る） |
+| SYCL verifier | off | 同上 | 同上 |
 
-根拠: `src/core/verify.cpp:299-307`, `sycl/src/core/verify.cpp:94-102`。
+したがって `false` や `00` は有効、`0anything` は無効である。空白を含む値は trim されず、先頭が空白なら有効になる。CLI 引数、設定ファイル、別環境変数による上書きや優先順位はない。
 
 ## 有効になる条件
 
-Verifier のコードを含む実行ファイルで有効です。CUDA/HIP では `src/core/verify.cpp`、SYCL では同じ処理を移植した `sycl/src/core/verify.cpp` が使われます。OS、GPU 世代、サーバーモード、モデル形式による値判定の違いはありません。ただし診断情報が作られるのは Verifier が実際に初期化・実行される経路です。Verifier を使わない通常処理には trace 出力はありません。
-
-`Verifier::init()` は有効時に GPU breadcrumb 用 mapped memory の割り当てを試みます。割り当てに失敗すると breadcrumb 領域を null に戻しますが、trace の設定自体は無効化せず、初期化ログも出します。この場合もホスト event ring は `g_trace` により記録されますが、GPU breadcrumb の表示はできません。割り当て成功は trace を有効にする条件ではありません。
-
-根拠: `src/core/verify.cpp:1005-1020`, `sycl/src/core/verify.cpp:622-636`。
+- 実行バイナリに該当する CUDA/HIP verifier または SYCL verifier が含まれ、その verifier 経路が実行されること。名前の直接読み取りはこれら 2 実装のみである（`engine/src/core/verify.cpp:344`; `engine/sycl/src/core/verify.cpp:191`）。
+- 設定はプロセス内での初回評価ではなく、各実装の翻訳単位スコープにある `const bool g_trace` 初期化時に読み込まれるため、プロセス開始後の環境変更は反映されない（同上）。
+- GPU breadcrumb は verifier 初期化時に `mapped` が成功した場合だけ記録される。失敗時には pointer と長さを null/0 に戻すが、trace 全体を off には戻さない。この場合も host event ring と `strata verify trace (#649): on` の表示は残り得るが、dump には GPU breadcrumb が出ない（CUDA/HIP: `engine/src/core/verify.cpp:1245-1260`; SYCL: `engine/sycl/src/core/verify.cpp:800-814`）。
+- 追加の server-mode や CLI 条件はない。serve watchdog が verifier 診断を要求する経路でも dump を含められるが、通常の推論中に常時 dump する設定ではない。
 
 ## 実行時の詳細
 
-`trace_ev()` は有効時に event の時刻、Verifier、window/step/layer、補助値、handshake word を最大4096件のグローバル ring に記録します。window の開始、launch、GPU の応答、CPU serve、timeout、release などが記録対象です。dump はそのうち直近最大160件を出し、GPU breadcrumb 領域がある場合は GPU が到達した layer 付近の stamp も表示します。領域に stamp がなければ `strata verify trace: no GPU breadcrumb in this window (the GPU never started it)` と出します。
+有効時、全 verifier が共有する 4096 件の host-side ring に時刻、verifier、window、step、layer、イベント名、handshake word を記録する。dump はそのうち直近最大 160 件を出力する。GPU breadcrumb 領域は model layer 数と profiling stamp 数から大きさを決め、window ごとに zero clear し、GPU stamp 地点を mapped 領域へ書き込む（CUDA/HIP: `engine/src/core/verify.cpp:634-644`, `:699-723`, `:1245-1251`, `:1516-1519`, `:3720-3723`; SYCL: `engine/sycl/src/core/verify.cpp:379-389`, `:501-525`, `:800-805`, `:1052-1056`, `:2413-2414`）。
 
-有効化時、Verifier 初期化で stderr に `strata verify trace (#649): on` を出します。HIP ビルドでは同じ行に coherent words / doorbell の状態と `HIP_HOST_COHERENT`、`HSA_ENABLE_SDMA`、`GPU_MAX_HW_QUEUES` の値も表示します。後者3つはこの trace のログ表示に使われるだけで、`STRATA_VERIFY_TRACE` の判定条件ではありません。この文書はそれら外部側の意味を扱いません。
+trace は timeout の閾値を変更しない。層の doorbell timeout では診断と GPU wait 解放の前後に trace を出す（CUDA/HIP: `engine/src/core/verify.cpp:4031-4061`; SYCL: `engine/sycl/src/core/verify.cpp:2673-2684`）。stream/queue が完了したのに層が応答しない `NEVER-RANG` 経路や、adaptive copy gate timeout でも dump する（CUDA/HIP: `engine/src/core/verify.cpp:4023-4028`, `:3673-3689`; SYCL: `engine/sycl/src/core/verify.cpp:2654-2670`）。
 
-trace dump は通常の成功ごとに出るものではありません。たとえば CUDA/HIP と SYCL の通常 window では layer wait が timeout した際に、Verifier の状態と trace を stderr に出し、GPU wait を最大5秒 drain してから `verify: timed out at layer N` の失敗を返します。適応層 gate の20秒 timeout でも `GATE-TIMEOUT` event と dump を出し、tier のコピー未到着エラーを返します。layer が GPU から応答しない `NEVER-RANG` 経路も dump を試みますが、trace が無効なら `trace_dump()` は何も出しません。timeout の時間や失敗判定そのものをこの変数は変更しません。
+## ログと測定値
 
-サーバーの watchdog は engine log の直近256 KiBを読み、その中から issue #29 の行を探します。ソースコメントによれば trace dump は約30 KiBで、従来の4 KiB tail より前に watchdog 行を押し出すことがあるため、server は広い範囲を走査します。これは環境変数の判定ではなく、trace を含むログを扱うサーバー側の処理です。
+初期化時の stderr 表示は CUDA/SYCL では `strata verify trace (#649): on`。HIP では同じ接頭辞に加え、Strata が `STRATA_VERIFY_COHERENT` と `STRATA_DOORBELL_STORE` の判定、および `HIP_HOST_COHERENT`, `HSA_ENABLE_SDMA`, `GPU_MAX_HW_QUEUES` の現在値を表示する（CUDA/HIP: `engine/src/core/verify.cpp:1252-1260`; SYCL: `engine/sycl/src/core/verify.cpp:806-814`）。後者 3 変数の外部側の意味はこの文書の対象外。
 
-根拠: `src/core/verify.cpp:557-559,614-670,673-682,1005-1020,2976-2991,3213-3235`; `sycl/src/core/verify.cpp:298-300,345-401,404-413,622-636,2338-2368`; `serve/server.py:1264-1280`。
+dump は `strata verify trace (#649): the last ... handshake events ...` で始まり、GPU breadcrumb がなければ `strata verify trace: no GPU breadcrumb in this window (the GPU never started it)` と出す。ある場合は到達 layer と stamp 時刻を表示する（CUDA/HIP: `engine/src/core/verify.cpp:714-753`; SYCL: `engine/sycl/src/core/verify.cpp:516-555`）。timeout 時は既存の `verify: timed out at layer ...` などの失敗文字列も返る。性能値の計測・主張は確認していない。
+
+server の `death_note()` は watchdog の `issue #29` 行を engine log 全体の末尾 256 KiB から探す。trace dump は約 30 KB になり得るため、4 KiB tail だけを見て watchdog 行を取り落とさないための処理である（`terminal/serve/server.py:1086-1103`; 補足テスト記述 `terminal/serve/test_server.py:6196-6206`）。
 
 ## 根拠
 
-- 値判定と読み取り箇所: `src/core/verify.cpp:299-307`, `sycl/src/core/verify.cpp:94-102`。
-- trace event の保存と dump 内容: `src/core/verify.cpp:549-559,614-670`; SYCL 側 `sycl/src/core/verify.cpp:290-300,345-401`。
-- mapped breadcrumb の確保と有効時ログ: `src/core/verify.cpp:1005-1020`; SYCL 側 `sycl/src/core/verify.cpp:622-636`。
-- timeout と失敗経路: `src/core/verify.cpp:2976-2991,3213-3235`; SYCL 側 `sycl/src/core/verify.cpp:2338-2368`。
-- server log の検索範囲: `serve/server.py:1264-1280`。
+- `engine/src/core/verify.cpp:336-345` — env 判定と CUDA/HIP 共通の一度限りの値保持。
+- `engine/src/core/verify.cpp:634-644`, `:699-723` — host event ring と dump の出力。
+- `engine/src/core/verify.cpp:1245-1260`, `:1516-1519`, `:3720-3723` — breadcrumb 領域、記録点、window ごとの初期化。
+- `engine/src/core/verify.cpp:3673-3689`, `:4023-4028`, `:4031-4061` — gate timeout、応答欠落、通常 timeout の診断経路。
+- `engine/sycl/src/core/verify.cpp:151-194`, `:379-389`, `:501-557`, `:800-814`, `:1052-1056`, `:2413-2414`, `:2654-2684` — SYCL 側の対応実装。
+- `engine/include/strata/core/verify.hpp:104-108`, `:641-646`; `engine/sycl/include/strata/core/verify.hpp:68-72`, `:412-417` — 公開診断 API と trace 領域の説明。
+- `terminal/serve/server.py:1086-1103` — 長い trace 出力後も watchdog 行を見つける server の診断処理。

@@ -1,48 +1,46 @@
 # `STRATA_EXPERT_ROW_E3`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL の IQ2_S / IQ3_XXS expert gate/up row-reuse カーネルで、残りの entry がちょうど 3 個のときに、3 entry を一度に処理する経路を選びます。無効時は同じ tail を 2 entry と 1 entry に分けます。4 entry 以上はどちらの場合も 4 entry ずつ処理され、2 entry / 1 entry の残りも従来どおりです。対象は Strata の SYCL 実装で、CUDA/HIP/CPU の実装でこの名前を読む箇所はありません。
+Intel 向け SYCL backend の IQ2_S / IQ3_XXS gate/up row-reuse kernel で、各 expert group の末尾にちょうど 3 entry が残るとき、3 entry をまとめて処理する E3 kernel variant を選びます。未設定時は無効です。IQ3_S も同じ launcher を通りますが、`TG == 21` のため E3 は常時有効で、この環境変数は評価されません（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4428-4457`）。
+
+この設定自体は row-reuse 経路を有効化しません。すでに選ばれた row-reuse kernel 内で、末尾 3 entry の処理方法だけを切り替えます。Strata のコードから確認できる変化は entry のまとめ方であり、性能差や出力の一致に関する測定結果はここでは確認できません（同ファイル `:4405-4424`）。
 
 ## 値と判定
 
-`strata::bm_default_on(name, device, false)` が環境値を判定します。値全体の parse はせず、空でない値の先頭文字だけを確認します。
+`strata::bm_default_on` は `std::getenv` で値を読み、未設定または空文字なら引数 `bm_default` と GPU 世代から既定値を返します。この呼び出しは `bm_default=false` を渡すため、どの GPU でも既定値は OFF です。空でない値は文字列全体や数値として parse せず、先頭文字が `0` なら OFF、それ以外なら ON です（`engine/sycl/include/strata/sycl_queue.hpp:193-200`、`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4437`）。
 
-| 状態 | `e3` の値 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（未設定と同じく `bm_default=false` にフォールバック） |
-| 空でない値の先頭が `0` | 無効。例: `0`, `0abc` |
-| 空でない値の先頭が `0` 以外 | 有効。例: `1`, `2`, `true`, `false`, 空白で始まる値 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| IQ2_S / IQ3_XXS row-reuse launcher | OFF（Battlemage でも OFF） | 空でない文字列で先頭文字が `0` 以外。例: `1`, `true`, `false`, ` 0`, `x` (`0anything` は無効) | 空文字は unset と同じ。先頭が `0` の文字列は OFF（例: `0`, `0anything`, `01`） |
+| IQ3_S row-reuse launcher (`TG == 21`) | E3 は常時 ON。環境変数を評価しない | 該当なし | 該当なし |
 
-大文字小文字、空白の除去、数値としての妥当性、文字列全体は検査しません。そのため `false` も有効で、`0anything` は無効です。通常の既定値はオフで、CLI 引数や設定ファイルによる上書きはこの読み取り箇所にはありません。
+大文字小文字、空白、後続文字、数値としての妥当性は検査しません。たとえば `false` や先頭に空白がある ` 0` は ON、`0.5` と `01` は OFF です。`STRATA_EXPERT_ROW_E3` の判定と helper の結果は `launch_gu_row_reuse<TG>` の関数内 `static` に保持され、TG ごとに最初に launcher が呼ばれたときの環境値と queue device で決まります。その後の環境変更は反映されません（同ファイル `:4428-4438`）。
 
 ## 有効になる条件
 
-この値が有効でも、次の条件が満たされなければ三 entry 経路は実行されません。
-
-- Strata の SYCL カーネル経路であること。SYCL ビルドは `sycl/CMakeLists.txt` で `iq_kernels` をカーネル一覧に加えています。
-- 量子化形式が IQ2_S (`TG == 22`) または IQ3_XXS (`TG == 18`) で、8 lane の `launch_gu_port` 経路を通ること。
-- 対応する row-reuse 制御 `STRATA_IQ2S_GU_ROW_REUSE` または `STRATA_IQ3XXS_GU_ROW_REUSE` が有効で、旧カーネル (`STRATA_OLD_IQ_MMVQ`) と split multi (`STRATA_EXPERT_SPLIT`) が選ばれていないこと。
-- GPU 世代が Battlemage であること。row-reuse launcher がこの条件を別途確認するため、`STRATA_EXPERT_ROW_E3` を明示しても他世代ではこの row-reuse 経路を有効にしません。
-- row ごとの entry 数の残りがちょうど 3 個であること。
-
-IQ3_S (`TG == 21`) は `launch_gu_row_reuse` を共有しますが、コード上 `TG == 21` なら `e3` は常に true です。この場合、短絡評価により `STRATA_EXPERT_ROW_E3` の helper 呼び出し自体が行われず、当環境変数は IQ3_S の判定には使われません。
+- Strata の実験的 Intel SYCL backend を使う必要があります。SYCL は `STRATA_ENABLE_SYCL` による別 build で、CUDA/HIP と同時には選べません（`engine/CMakeLists.txt:23-32`）。
+- 対象は IQ2_S (`TG == 22`) または IQ3_XXS (`TG == 18`) の gate/up 経路です。通常の `launch_gu_port` では `LN == 8`、`!g_old_kernels`、`!g_split_multi` が必要で、さらに各形式の row-reuse 制御が ON で、device が Battlemage の場合に launcher が呼ばれます。各 row-reuse 制御は `STRATA_IQ2S_GU_ROW_REUSE` または `STRATA_IQ3XXS_GU_ROW_REUSE` で、未設定時は Battlemage で ON、それ以外では OFF です（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:5885-5908`、helper `engine/sycl/include/strata/sycl_queue.hpp:193-200`）。このため `STRATA_EXPERT_ROW_E3=1` だけでは Battlemage 以外でこの経路を強制できません。
+- IQ2_S には private hook もあり、`LN == 8`、旧 kernel / split-multi が無効で、`STRATA_PRIVATE_GU_PREPARED` が `1` 始まり、device が Battlemage の場合に同じ launcher を呼びます（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4463-4472, 5863-5876`）。
+- `#if !STRATA_GRID_SLM` の条件が偽の build では通常の IQ2_S / IQ3_XXS row-reuse 分岐がコンパイルされません（同ファイル `:5895-5910`）。
+- IQ3_S の row-reuse は別の `STRATA_IQ3S_GU_ROW_REUSE` 判定、8 lanes、`n_embd == 2560`、`n_ff == 640`、Battlemage 等の条件で選ばれますが、選ばれた場合も E3 は `TG == 21` により常時有効です。`STRATA_EXPERT_ROW_E3` はこの経路を変更しません（同ファイル `:6020-6038, 4437`）。
 
 ## 実行時の詳細
 
-各 `launch_gu_row_reuse<TG>` の `static const bool e3` 初期化時に helper が環境を読み、特殊化ごとに結果を保持します。したがって IQ2_S / IQ3_XXS では、その特殊化の最初の呼び出し後にプロセス環境を変更しても判定は更新されません。値が有効になると stderr に `strata: IQ2_S exact three-entry row reuse enabled` または `strata: IQ3_XXS exact three-entry row reuse enabled` が一度出て、`native_gu_row_reuse_kernel<TG, true>` を launch します。無効なら通常の `native_gu_row_reuse_kernel<TG>` を launch します。
+E3 が無効なら launcher は通常の `native_gu_row_reuse_kernel<TG>` を投入し、有効なら `native_gu_row_reuse_kernel<TG, true>` を投入します。kernel は各 group の entry をまず 4 件ずつ処理し、残数がちょうど 3 件なら E3 版で 3 件をまとめます。E3 が無効、または残数が 3 件以外なら 2 件単位と最後の 1 件に分けます。各 pass は IQ2_S / IQ3_XXS の gate/up 2 row を再利用し、対応する出力バッファへ計算結果を書き込みます（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4374-4424, 4428-4457`）。
 
-カーネルは各 group の entry 区間を先に 4 個ずつ処理し、`E3` が有効で残りがちょうど 3 個の場合だけ `E=3` の dot 処理を行います。その後の 2 個・1 個の tail は両方の経路にあります。この変数の値が 3-tail の処理方法以外を変えることは、参照した呼び出し経路からは確認できません。
+設定の読み取りはモデル要求ごとではなく、TG ごとの launcher 初回呼び出し時の static 初期化です。CLI 引数による上書きはこのコードにはなく、同じ環境変数への別の Strata 読み取りもありません。標準の IQ2_S / IQ3_XXS row-reuse 経路では Battlemage 判定が別途必要なため、値が ON でも条件を満たさなければ E3 launcher まで到達しません（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:5895-5908`）。
+
+## ログと測定値
+
+E3 launcher が有効な場合、TG ごとに初回起動時に stderr へ `strata: IQ2_S exact three-entry row reuse enabled` または `strata: IQ3_XXS exact three-entry row reuse enabled` を出します。IQ3_S は launcher が選ばれれば環境変数の値によらず `strata: IQ3_S exact three-entry row reuse enabled` を出します。E3 無効時はこの exact three-entry ログを出しません（`engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4437-4443`）。この変数による性能測定値は記載していません。
 
 ## 根拠
 
-- `sycl/src/kernels/cuda/iq_kernels.dp.cpp:4813-4818` — 4-entry の反復、`E3` による厳密な 3-entry tail、続く 2-entry / 1-entry tail。
-- `sycl/src/kernels/cuda/iq_kernels.dp.cpp:4822-4852` — `e3` の判定、診断ログ、true/false で選ばれる kernel specialization。
-- `sycl/include/strata/sycl_queue.hpp:159-166` — Battlemage 既定判定 helper の空文字・先頭文字規則とデバイス条件。
-- `sycl/src/kernels/cuda/iq_kernels.dp.cpp:4873-4887` — IQ2_S / IQ3_XXS row-reuse 経路の lane、別環境変数、旧カーネル・split 経路の条件、Battlemage 制約。
-- `sycl/src/kernels/cuda/iq_kernels.dp.cpp:4986-4998` — IQ3_S も共通 launcher を呼ぶ経路。
-- `sycl/CMakeLists.txt:245-254` — SYCL `iq_kernels` ソースの選択。
-- `docs/INTEL.md:527-541` — SYCL runtime control の説明と、この変数の対象として記載された IQ2_S / IQ3_XXS row-reuse path。
+- 値の読み取り・既定値・Battlemage 判定 helper: `engine/sycl/include/strata/sycl_queue.hpp:193-200`
+- E3 variant の選択、entry tail の分割、出力: `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4374-4457`
+- IQ2_S / IQ3_XXS row-reuse の呼び出し条件: `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:5885-5908`
+- IQ2_S private hook と IQ3_S 経路: `engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp:4463-4472, 5863-5876, 6020-6038`
+- SYCL backend の分離: `engine/CMakeLists.txt:23-32`

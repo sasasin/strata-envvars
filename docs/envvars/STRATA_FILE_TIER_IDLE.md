@@ -1,45 +1,45 @@
 # `STRATA_FILE_TIER_IDLE`
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux の mapped file tier で、GPU cache に全 expert が収まってファイル層を読まない間に、Linux 既定の I/O prefetch と routing-aware look-ahead を自動停止し、GPU cache から expert が外れたら再開する idle policy を制御します。`0` を指定するとこの自動停止・再開を無効にします。これは file tier や prefetch 自体を無効にする設定ではありません。
+file-tier の全 expert が GPU cache に載っている間、Linux の既定 I/O prefetch と、明示的に要求されていない routing-aware look-ahead を休止する policy を有効にする。未設定では有効、`0` では policy 全体を無効にする。値を読むのは `engine/src/program/generate.cpp` の `generate` 処理で、GPU cache の residency 判定と `refresh_file_tier` が実際の切替を行う（`engine/src/program/generate.cpp:10251-10258,10275-10286,10341-10379`）。
 
 ## 値と判定
 
-`src/program/generate.cpp` で `std::getenv` の結果を `std::atoi(v) != 0` で判定します。
+`std::getenv` の戻り値を `std::atoi(v) != 0` で判定する。未設定 (`nullptr`) は有効、設定された値は `atoi` の結果が非ゼロなら有効。従って空文字、`0`、`0anything`、`true`、数字で始まらない文字列は無効になり、`1`、`-1`、`1anything` は有効になる。先頭の空白と符号は `atoi` の変換規則に従い、数字の後ろは検査しない。数値として表現範囲を超える入力は `atoi` の仕様上、結果を規定できない（`engine/src/program/generate.cpp:10258`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 有効（既定） |
-| 空文字 | 無効（`atoi("")` は 0） |
-| `0`、`00`、`false`、数字で始まらない文字列 | 無効（変換結果 0） |
-| `1`、`-1`、数字で始まり 0 以外になる文字列（例: `2x`） | 有効 |
+| 条件 | 未設定 | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| `generate` 内の全経路 | 有効 | `1`, `-1`, `1junk` | 空文字, `0`, `0anything`, `true` |
 
-`atoi` は文字列全体の妥当性を検査せず、先頭の空白・符号・数字列を変換し、後続文字を無視します。CLI 引数による上書きや、無効値時の fallback はありません。環境変数の判定は `generate` の初期化時に一度行い、ローカルの `const bool` に保持します。実行中に環境を変更しても再評価されません。
+この変数を上書きする CLI 引数はなく、コード内でもこの変数名を読む箇所は1箇所だけ。`STRATA_IO_PREFETCH` と `STRATA_LOOKAHEAD` は休止対象を個別に明示要求できるが、`STRATA_FILE_TIER_IDLE` 自体の判定を上書きしない（`engine/src/program/generate.cpp:10258-10260,10288-10290,10343-10344`）。
 
 ## 有効になる条件
 
-- 自動判定が有効でも、処理対象は `srcp == &src`、すなわち `FileExpertSource` の file tier 経路です。pinned arena (`arena_src`) 経路には適用されません。
-- Linux の file tier 既定 prefetch は `FileExpertSource::linux_io_defaults()` が Linux 以外では常に false を返し、Linux でも GGUF in-place または experts.bin の page-cache room 条件を満たす場合だけ true になります（`include/strata/core/expert_source.hpp:1047-1059`）。したがって Windows/macOS ではこの既定動作の自動停止・再開は起きません。
-- 全 expert が GPU cache の live slot にある場合に停止対象になります。`count_gpu_held()` は layer ごとの cache slot を走査し、live slot にある expert 数を layer 数×expert 数と比較します（`src/program/generate.cpp:8864-8879,8940-8945`）。
-- `STRATA_IO_PREFETCH` を明示して有効にした prefetch は `io_pf_by_default` にならないため、この policy による停止対象ではありません。明示値 `1` は `la_asked` も真にするため、通常の routing-aware look-ahead も維持します。`STRATA_LOOKAHEAD` の非ゼロ値も look-ahead を維持します（同ファイル `:7505-7516,8890-8892`）。
-- `STRATA_FS_SLOTS` と `STRATA_FS_AHEAD` による Foresight 経路、または `STRATA_LOOKAHEAD_STATS` による統計経路は look-ahead の別条件です。idle policy は通常 look-ahead を切り離す場合でも、これらの経路を切り離しません（同ファイル `:8900-8905,8925-8927,8956`）。
+- file-tier 用 `FileExpertSource` (`srcp == &src`) を使う経路で policy が動く。通常は `--mmap-experts`、または RAM 不足時に mmap 経路へ fallback した場合が該当する。resident arena 経路 (`srcp != &src`) では適用されない（`engine/src/program/generate.cpp:8621-8647,8740-8747,10275-10276,10343-10345`）。
+- GPU cache の全 slot が全 layer の全 expert を保持しているときだけ休止する。判定は各 layer について primary の stage cache（単一 GPU では `xcache`）を選び、各 `(layer, expert)` の slot が `kNotResident` でなく、かつ live slot 数未満かを数え、合計を `g.n_layers * g.n_expert` と比較する（`engine/src/program/generate.cpp:10262-10278`）。
+- I/O prefetch の休止対象は `STRATA_IO_PREFETCH` 未指定または空文字のときに選ばれた Linux 既定値のみ。明示的な `STRATA_IO_PREFETCH` が非ゼロなら、`io_pf_by_default` は false となり、この policy は prefetch を止めない（`engine/src/program/generate.cpp:8693-8704,10278-10280`）。Linux 以外では `FileExpertSource::linux_io_defaults()` が false を返すため、この Linux 既定 prefetch は選ばれない（`engine/include/strata/core/expert_source.hpp:1081-1094`）。
+- routing-aware look-ahead は `STRATA_LOOKAHEAD` が未設定または `atoi` で非ゼロで、file source が `warms()` を返す場合に開始対象になる。全 expert が GPU にある状態で開始済みでも、`STRATA_LOOKAHEAD` または `STRATA_IO_PREFETCH` の非空・非ゼロ値で要求されている場合、`STRATA_FS_SLOTS` の `atoi` が正で `STRATA_FS_AHEAD` が未設定または `atoi` で非ゼロの場合、もしくは `STRATA_LOOKAHEAD_STATS` の `atoi` が非ゼロの場合は切り離さない（`engine/src/program/generate.cpp:10288-10303,10328-10338,10359-10360`）。
 
 ## 実行時の詳細
 
-起動時、file tier が `src` の場合に GPU cache の residency を数えます。全 expert が収まっていて、かつ Linux 既定 prefetch が実際に起動していた場合、`src.set_io_prefetch(false, 0)` を呼び I/O prefetch とそれに伴う decode gate を止め、stderr に `strata generate: every expert is in the GPU caches ...` を出します（`src/program/generate.cpp:8877-8888`）。通常の routing-aware look-ahead が起動済みで、明示的な I/O prefetch/look-ahead や Foresight・統計の要求がなければ、`drive.d.lookahead` を null にして decode から切り離します。look-ahead 自体の初期化・起動条件は別判定です（同ファイル `:8904-8936`）。
+対象値は `generate` の当該実行に入ったとき一度読み、ローカルの `const bool` に保存する。`static` cache や各リクエストでの再読込はないため、実行中に環境値を変更しても反映されない（`engine/src/program/generate.cpp:10258`）。
 
-serve の `GEN` / `GENI` リクエスト開始時に residency を再確認します（同ファイル `:15699-15700`）。全 expert が cache にある状態へ変わると、policy が停止した既定 prefetch を停止し、通常 look-ahead を切り離します。全 expert がいなくなった状態へ変わると、policy が停止した prefetch を再開し、look-ahead を再接続します。遷移時は `strata serve: every expert is in the GPU caches again ...` または `strata serve: ... file tier's Linux defaults are on again` を stderr に出します（同ファイル `:8948-8974`）。変更はリクエスト開始時の quiet point で行われ、リクエスト中には residency を再評価しません。
+初期化時に file-tier 経路かつ policy 有効なら GPU residency を数える。全 expert が GPU にあれば `io_pf_by_default` が true の場合に限って `src.set_io_prefetch(false, 0)` を呼ぶ。また、既定動作として開始した look-ahead は、明示要求や Foresight・計測条件がなければ `drive.d.lookahead` から外す（`engine/src/program/generate.cpp:10275-10286,10302-10303,10328-10330`）。
 
-この変数が無効でも、Linux 既定 prefetch と look-ahead は通常どおり起動条件を満たせば動作しますが、全 expert が GPU cache にあることを理由に自動停止・再開しません。`set_io_prefetch(false, ...)` は Linux 実装で gate を先に off にしますが、変数自体に警告・エラー・終了経路はありません（`src/core/expert_source.cpp:1171-1177`）。
+serve の `GEN` / `GENI` リクエストを処理する直前に `refresh_file_tier()` が呼ばれ、同じ residency 判定で状態変化を確認する。全 expert が GPU に揃ったときは既定 prefetch を停止し、既定 look-ahead を切り離す。GPU cache から expert が欠けた状態になると、停止していた prefetch を再開し、look-ahead を再接続する。I/O prefetch 再開時の `STRATA_IO_PF_THREADS` の既定は `0`（setter 側では自動値として扱う）である。切替はリクエスト境界で行われ、リクエスト中の各 adaptive swap の直後にこの lambda が呼ばれる箇所はない（`engine/src/program/generate.cpp:10341-10377,18808-18812`）。
+
+## ログと測定値
+
+初期状態で全 expert が GPU cache にあり、既定 I/O prefetch を停止した場合は stderr に `strata generate: every expert is in the GPU caches (%lld of %lld): the file tier's Linux defaults (io prefetch, the decode gate) are off, the decode reads nothing from it (STRATA_IO_PREFETCH=1 keeps them)` を出す（`engine/src/program/generate.cpp:10278-10285`）。serve 中の切替では実際に切替が発生した場合に限り、stderr に `strata serve: every expert is in the GPU caches again (%lld of %lld): the file tier's Linux defaults are off` または `strata serve: %lld of %lld experts are in the GPU caches now: the file tier's Linux defaults are on again` を出す（`engine/src/program/generate.cpp:10351-10362,10363-10377`）。この変数固有の警告、終了、エラー経路はない。性能測定値は記載しない。
 
 ## 根拠
 
-- 候補名の全参照: `src/program/generate.cpp:8859-8860`（コメントと実読み取り）、`docs/DETAILS.md:297`（説明）。他の読み取り箇所や helper への動的な名前渡しはありません。
-- 値の読み取り、既定 Linux prefetch の判定: `src/program/generate.cpp:7500-7516,8853-8862`。
-- residency による初期動作と切替: `src/program/generate.cpp:8864-8888,8890-8936,8938-8974,15699-15700`。
-- Linux 以外の既定値と Linux の file tier 条件: `include/strata/core/expert_source.hpp:1047-1059`。
-- I/O prefetch 停止時の gate 処理: `src/core/expert_source.cpp:1171-1177`。
-- 設計説明との照合: `docs/DETAILS.md:291-297` は、全 expert が GPU cache にある場合の既定動作停止、`STRATA_IO_PREFETCH=1` / `STRATA_LOOKAHEAD=1` による維持、および `STRATA_FILE_TIER_IDLE=0` による policy 無効化を説明しており、実装と整合します。
+- `engine/src/program/generate.cpp:10251-10260` — policy の範囲、対象値の読み取り、状態変数。
+- `engine/src/program/generate.cpp:10262-10286` — GPU residency と初期休止、ログ。
+- `engine/src/program/generate.cpp:10288-10339` — look-ahead の有効条件と明示要求。
+- `engine/src/program/generate.cpp:10341-10379,18808-18812` — residency 変化時の再開・休止と serve 呼び出し箇所。
+- `engine/src/program/generate.cpp:8621-8647,8693-8704,8740-8747` — mmap file-tier 経路と Linux 既定 prefetch。
+- `engine/include/strata/core/expert_source.hpp:1081-1094` — Linux 専用既定値の条件。

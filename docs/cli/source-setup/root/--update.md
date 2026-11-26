@@ -1,68 +1,76 @@
 # `--update`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`setup.sh`、`START-HERE.bat`、`UPDATE.bat`、`update.sh` からも委譲） |
+| コマンド | `setup.py`（`setup.sh` / `START-HERE.bat` 経由） |
 | オプション | `--update` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。省略時 `False`、指定時 `True` |
+| 値 | 値を取らないフラグ（`argparse` の `store_true`）。省略時 `False` |
 
 ## 役割
 
-インストール済みモデルの起動前更新処理を実行し、モデル自体は起動しません。対象は Python 実行環境の Strata runtime packages、必要な engine、インストール済みモデルごとの設定移行と MTP draft vocabulary です。モデルの重みファイルはこの処理では更新しません（`setup.py:6682-6709`）。
+モデルを起動せず、既存インストールを通常起動前と同様に更新する。git clone では最初に Strata のコードを取得し、続いて必要な Python パッケージ、古い／ソース変更済みのエンジン、各モデルの設定形式、draft token subset を更新する。モデル本体の重みファイルはこの経路では更新しない。`--build` と併用すると、通常の更新条件にかかわらず既存エンジンを現 checkout のソースから再コンパイルする（下記「相互作用」参照）。
 
 ## 使い方
 
-ソース checkout のルートで直接実行する場合:
-
 ```sh
-python setup.py --update
+# Linux: checkout 内で実行。モデルは起動せずに更新する
+./setup.sh --update
+
+# Windows: checkout 内で実行
+START-HERE.bat --update
+
+# 現在の Strata ソースからエンジンも再コンパイルする
+./setup.sh --update --build
 ```
 
-POSIX の更新 wrapper は `./update.sh`、Windows は `UPDATE.bat` です。これらはソース checkout なら先に `git pull --ff-only` を試み、その後 `setup.py --update` を起動します。GitHub archive など `.git` のないコピーではソース更新は行わず、既存モデルの設定等を確認します（`update.sh:1-6, 9-17, 55-62`; `UPDATE.bat:1-6, 11-20, 72-80`）。`setup.py --update` の直接実行には `git pull` はありません。
+`setup.sh` は引数を `terminal/setup.py` に渡す。Windows の `START-HERE.bat` も同ファイルを Python で起動し、`UPDATE.bat` はこれを `--update` 付きで呼び出す。`strata install --update` は別の `strata-terminal` CLI スコープなので、この文書の対象外。
 
 ## 値と既定値
 
-`argparse` の `action="store_true"` で宣言され、値は不要です。省略時は偽、指定時は真です。値を付ける形式ではなく、重複して指定しても真のままです。無効な値・未知の引数は `argparse` の標準エラー処理になります（`setup.py:8420, 8496-8498, 8553`）。
+値は指定しない。parser は `action="store_true"` として登録し、指定時に `a.update` が真となる。`--update=true` のような値形式や重複指定の個別動作は定義されていない（重複指定を別の意味に解釈する処理もない）。通常の `argparse` により未知の引数や不正な引数形式は usage とエラーになる。
 
 ## 実行時の動作
 
-`main()` はインストール済み設定を列挙した後、`--update` が真なら `update_install(have, a)` を返し、その後の通常 setup／モデル開始経路へ進みません。`update_install` は有効なモデル設定だけに絞り、該当設定がなければ「モデル未インストール」の案内を出して終了コード 0 を返します（`setup.py:8602-8609, 8617-8619, 6682-6692`）。
+1. `setup.py` は `--update` を parse した後、git clone なら `git pull -q --ff-only` を行う。pull に失敗した場合、git の出力を表示する。履歴が書き換わった旧 clone の特例では、追跡対象ファイルに変更がなければ旧 commit をバックアップ branch に残して `origin/main` へ移る。追跡対象のローカル変更があれば何も移動せず、終了コード 1 で止まる。detached HEAD や git 不在もエラー経路となる。
+2. pull で HEAD が変わった場合、新しい `terminal/setup.py` を同じ引数で起動し、環境変数 `STRATA_UPDATE_PULLED=1` で二度目の pull を抑止する。変更がない場合は現在のプロセスが続行する。git clone でないソース配布物では自動取得できない旨と最新版のダウンロード案内を表示し、現在のコピーでインストール更新を続ける。
+3. インストール済みモデルがなければ案内を表示して終了コード 0 で終わる。ある場合は（Control モードを除き）実行環境の runtime packages を `.venv` に導入する（同じ依存一覧が導入済みならスキップ。Control モードはアプリ同梱 package の有無を確認する）。その後、通常は必要なときだけエンジンを更新し、各モデル設定を現行形式へ移行し、通常のモデルでは共有 draft subset を更新する。Windows の HIP 設定ではエンジンの HIP runtime も配置する。
+4. この処理はモデルを起動しない。エンジン更新に失敗した場合も、利用可能な既存エンジンを保って警告を出し、更新処理自体は完了扱いとなる場合がある。
 
-有効な設定がある場合は次の順に処理します。
+## 相互作用
 
-1. `runtime_packages()` が組み立てる runtime requirements を pip で確認・導入します。同じ内容が記録済みなら再導入を省略します（`setup.py:3270-3276, 3295-3317, 6693-6694`）。
-2. `--build` が指定されていなければ `update_installed_engine(a.prebuilt)` を呼びます。対象 engine がない場合や、既に十分新しい場合は更新対象になりません。更新失敗・使用中・該当 GPU 用 engine がない場合は警告して既存 engine を維持する経路があります（`setup.py:5235-5248, 5280-5323, 6695-6696`）。
-3. 各モデルの JSON 設定を `upgrade_config()` に通します。旧 `--prefill 2048` の更新や WSL での KV streaming 設定削除が必要な場合、設定ファイルを一時ファイル経由で置換します。MTP を使う設定は draft vocabulary を更新し、Windows の HIP 設定では engine の隣の HIP runtime も確認します（`setup.py:6154-6159, 6657-6679, 6698-6704, 7171-7188`）。
-
-各モデルを `[ok] ...: up to date` と表示し、最後に更新完了と通常の起動方法を表示して 0 を返します。更新分岐からモデル起動関数は呼ばれません（`setup.py:6704-6709, 8617-8619`）。
+- `--build`: `--update --build` は再コンパイルを強制する。通常の `--update` では、ローカルビルド済みエンジンはソース fingerprint や binary の古さを確認し、ready-made エンジンは最低必要バージョン未満の場合に更新する。
+- `--rollback-engine`: rollback 分岐は `--update` のインストール更新分岐より先に評価される。ただし git clone であれば、その前に `--update` の pull 処理が行われる。
+- Apple Silicon の通常の setup 呼び出しは `metal/setup_mac.py` に委譲される。その parser の `--update` は索引上の別 scope `source-setup/mac/--update.md` が対象であり、本書は `terminal/setup.py` の root scope を扱う。Strata Control 実行時は pull を行わない。
 
 ## 適用条件と副作用
 
-- `--update` 自体は `setup.py` が見つけるこの Strata folder 内のインストール済みモデル設定に適用されます。設定ファイルは `exe` と `args` を持つ JSON として判定されます（`setup.py:6456-6469, 6472-6474, 6688-6692`）。
-- `UPDATE.bat` / `update.sh` は `.git` があると `git pull --ff-only` を実行します。これは wrapper の動作で、`setup.py --update` の動作ではありません（`update.sh:9-17, 55-62`; `UPDATE.bat:11-20, 72-80`）。
-- `--build` 併用時は `update_install` 内の ready-made / installed engine 更新呼び出し自体が省略されます。`--prebuilt`（既定値は `STRATA_PREBUILT_URL` または `PREBUILT_URL`）は、その engine 更新呼び出しの配布元として渡されます（`setup.py:8513-8514, 6695-6696`）。
-- `--rollback-engine` も併用した場合、`main()` の rollback 分岐が `--update` 分岐より先に返るため、rollback のみ実行されます。`--setup` やモデル選択などを併用しても `--update` 分岐が先に返るため、通常 setup は行われません（`setup.py:8614-8620`）。
-- `--data-dir`、`--move-data`、`--set-default-data-dir`、`--yes` は `--update` の分岐より前に共通データフォルダ処理へ渡されます。このため併用時は指定先フォルダの作成、設定保存、またはモデルデータの移動が起こり得ます。`--data-dir` 単独では通常既存データを移動せず、`--move-data` などが移動条件に影響します（`setup.py:6042-6050, 6136-6139, 8606-8619`）。
-- engine の更新ではネットワーク取得や、ローカルビルド済み engine の再コンパイルが発生し得ます。パッケージ導入も pip を実行します（`setup.py:3295-3317, 5235-5323`）。
+- 対象にモデル設定が存在すると、Python package 環境、エンジンファイル、モデルの run config、共有 draft subset などを変更し得る。通常のモデル重みは更新対象外。
+- git clone ではネットワークアクセスを伴う git pull が行われる。依存やエンジンの取得も必要に応じてネットワークを使う。既存エンジンが実行中・ロック中なら更新を見送り、モデルを閉じて再実行する案内を表示する。
+- `--build` を併用した場合は GPU 検出とソースビルドを伴う。ビルド失敗時は警告して既存エンジンを維持する経路がある。
+- 通常の macOS setup は Metal 用 parser へ委譲される。Windows/Linux の wrapper は必要な場合に Python 仮想環境を作成してから parser を起動する。Control モードではコードの pull は行わず、package はアプリ同梱のものを確認する。
 
 ## 出力とエラー
 
-進捗・完了案内・警告は `print()` による標準出力です。該当モデルがない場合も標準出力に案内を出して 0 で終了します（`setup.py:808-829, 6688-6692, 6704-6709`）。
-
-不正な型の引数や未知の引数は argparse の usage/error 経路になります（`setup.py:8420, 8496-8498, 8553`）。pip 導入などの失敗は `run()` 側の例外・終了処理に委ねられます。engine 更新中の取得・compile・使用中など一部の失敗は警告して既存 engine を使い続けます（`setup.py:5235-5323`）。エラー時の終了コードは個々の呼び出し先に依存し、すべての失敗条件を一律に 1 とする処理は確認できません。
+- git clone で git が見つからない、detached HEAD、通常の pull 失敗、追跡対象ローカル変更により旧履歴へ移行できない場合は、案内を表示して非 0 で終了する。pull 失敗時は git の stdout/stderr を表示する。
+- インストール済みモデルがない場合は setup の案内を表示して `0` を返す。
+- エンジンが実行中・取得不能・再コンパイル不能などの場合、警告を表示して既存エンジンで続行する経路がある。更新後も必要最低バージョンに届かない場合、その旨を警告する。
+- 最終的な終了コードは `main()` の戻り値をプロセス終了コードとして返す。メッセージは `say()` 経由で stdout に出力される。
 
 ## 根拠
 
-- parser と値の型: `setup.py:8420-8421, 8493-8501, 8553`
-- `--update` 分岐と設定列挙: `setup.py:6456-6474, 8602-8619`
-- 更新内容、未インストール時、完了出力: `setup.py:6682-6709`
-- Python packages と導入処理: `setup.py:3270-3317`
-- engine の更新条件と fallback: `setup.py:5184-5205, 5235-5323`
-- 設定移行と draft vocabulary: `setup.py:6154-6159, 6657-6679, 7149-7188`
-- wrapper の委譲とソース更新: `setup.sh:6-12, 76`; `START-HERE.bat:44-54`; `SETUP.bat:1-3`; `update.sh:9-17, 55-62`; `UPDATE.bat:11-20, 72-80`
-
-同一 revision の CLI `--help` は実行していません。記載は parser 定義と処理経路を照合したソース調査に基づきます。Release 配布物の実体や各 OS 上での実行確認はこの調査では行っていません。
+- `terminal/setup.py:11530-11532` — `--update` の parser 定義、値を取らない action、help の説明。
+- `terminal/setup.py:11606-11613` — parse 後に update pull を先に処理し、戻り値があればそこで終了する分岐。
+- `terminal/setup.py:8386-8423` — git clone 判定、CONTROL/PULLED の抑止、detached HEAD・pull 失敗・変更なし・変更後の新 setup 再実行。
+- `terminal/setup.py:8330-8365` — fast-forward pull 失敗後の旧履歴移行条件と、tracked local changes を検出した際の停止。
+- `terminal/setup.py:8497-8530` — インストール済みモデルの有無、runtime packages、engine/config/draft 更新、非起動、警告後の終了。
+- `terminal/setup.py:4310-4317`, `4349-4372` — 導入対象 package 群と、既導入時のスキップ・`.venv` への pip install。
+- `terminal/setup.py:8273-8295`, `9135-9158` — run config の必要な移行時の書き込みと draft subset の更新。
+- `terminal/setup.py:6452-6551` — エンジン更新条件、再ビルド指定、実行中・更新失敗時の既存エンジン維持。
+- `terminal/setup.py:11692-11697` — `--rollback-engine` と `--update` の分岐順。
+- `terminal/setup.py:11436-11437`, `9290-9294` — 通常の macOS setup を Metal 用 setup へ委譲。
+- `terminal/setup.py:997-999`, `12565-12571` — stdout 出力と戻り値をプロセス終了コードにする処理。
+- `setup.sh:6-17`, `81`; `START-HERE.bat:8-17`, `49-65`; `UPDATE.bat:1-7` — POSIX/Windows wrapper から `setup.py` への引数転送。

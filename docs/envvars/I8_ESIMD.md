@@ -1,48 +1,49 @@
 # `I8_ESIMD`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`I8_ESIMD` は SYCL エンジンのビルド時設定です。`sycl/tools/build.sh` が値を CMake 変数 `STRATA_SYCL_I8_ESIMD` に渡し、fused int8 ESIMD expert kernel を実装するバイナリを含めるか決めます。Strata のエンジン起動時にこの名前を読む箇所はなく、実行中に変更しても既にビルドされたエンジンには反映されません（`sycl/tools/build.sh:40-44`, `sycl/CMakeLists.txt:58-71`）。
+`I8_ESIMD` は `engine/sycl/tools/build.sh` が読む**ビルド時の環境変数**で、SYCL エンジンに fused int8 ESIMD expert kernels を含めるかを CMake の `STRATA_SYCL_I8_ESIMD` に渡す。実行中の Strata が `I8_ESIMD` を読む箇所はなく、ランタイム設定ではない。OFF でビルドすると該当実装は stub になり、対応する prompt expert が利用可能な場合の int8 経路は無効になる（`engine/sycl/tools/build.sh:38-43`, `engine/sycl/CMakeLists.txt:78-96`, `engine/sycl/src/prefill/esimd_moe.dp.cpp:41-58`）。
 
 ## 値と判定
 
-シェルの変数展開は unset と空文字を同じく「値なし」として扱う箇所があります。CMake が受け付ける値は大文字の `AUTO`、`ON`、`OFF` のみで、空文字や別の綴りは有効値ではありません（`sycl/tools/build.sh:40-43`, `sycl/CMakeLists.txt:58-68`）。
+シェルスクリプトは数値変換をせず、初回 CMake 設定では `${I8_ESIMD:-AUTO}` を渡す。未設定または空文字なら `AUTO`。CMake は文字列全体を大文字小文字を区別して `AUTO` / `ON` / `OFF` のいずれかと照合する（`engine/sycl/tools/build.sh:25,40-43`, `engine/sycl/CMakeLists.txt:83-93`）。
 
-| 入力・状態 | ビルドスクリプトが渡す値／扱い |
-| --- | --- |
-| unset または空文字、新しい build directory | `AUTO` を CMake に渡す |
-| unset または空文字、既存 `build.ninja` がある | 再設定を行わず、CMake cache の値を維持 |
-| 非空文字、既存 `build.ninja` がある | その文字列を `-DSTRATA_SYCL_I8_ESIMD=...` で再設定 |
-| `AUTO` | JIT ビルドと `bmg` / `lnl` AOT ではカーネルを含める。それ以外の AOT では含めない |
-| `ON` | AOT ターゲットに関係なくカーネルを含める |
-| `OFF` | カーネルを含めない |
-| その他の非空文字列（例: `off`, `1`） | CMake の `FATAL_ERROR`。`AUTO` への自動変換はしない |
+| ビルド条件 | unset / 空文字 | 受理値 | 無効値・結果 |
+|---|---|---|---|
+| 新規 configure、JIT（`AOT` 空） | `AUTO`。カーネルを含める | `AUTO` または `ON`: 含める。`OFF`: stub にする | 例: `off`, `AUTO `, `0`, `true` は CMake の `FATAL_ERROR` |
+| 新規 configure、AOT が `bmg` / `lnl` で始まる | `AUTO`。カーネルを含める | 上記と同じ | 同上 |
+| 新規 configure、その他の非空 AOT | `AUTO`。stub にする | `ON`: 含める。`OFF`: stub にする | `AUTO` は stub。その他は同上 |
+| 既存 build directory | 空文字なら既存 CMake cache を維持 | 非空なら当該値で cache を更新してから build を試みる | 不正値での更新エラーはスクリプトが隠すため、既存 cache の値のまま続く場合がある |
 
-CMake の `AUTO` 判定における `bmg` / `lnl` は `STRATA_SYCL_AOT` の先頭に一致するターゲット名です。`OFF` の場合、または `AUTO` で対象外 AOT の場合、`STRATA_I8_NO_ESIMD=1` を定義してスタブ実装に切り替えます（`sycl/CMakeLists.txt:48-71`, `sycl/src/prefill/esimd_moe.dp.cpp:41-57`）。
+CMake の `AUTO` は JIT と `bmg` / `lnl` AOT で有効、それ以外の非空 AOT で無効になる。`ON` はこの AOT 条件を適用せず有効、`OFF` は全 build で無効。新規 build で不正値を渡すと configure は `STRATA_SYCL_I8_ESIMD must be AUTO, ON or OFF (got '...')` で失敗する。既存 build では `build.sh` の2回目の configure が標準出力・標準エラーを捨て、その終了状態も検査しないため、失敗後に以前の cache が使われ得る（`engine/sycl/tools/build.sh:40-44`, `engine/sycl/CMakeLists.txt:83-96`）。
 
 ## 有効になる条件
 
-この設定が作用するのは `sycl/tools/build.sh` を使って行う SYCL CMake configure/build です。CUDA/HIP のビルドや、既に存在する実行ファイルの起動設定としては参照されません（`sycl/tools/build.sh:1-6,38-44`）。
-
-コンパイルされたカーネルがあっても、実行時に使えるとは限りません。SYCL device が `ext_intel_esimd` を持ち、int8×int8 の matrix combination に `nsize=16` と `ksize=32` があることが `available()` の条件です。さらに `STRATA_I8_FORCE` の先頭文字が `0` なら利用不可とされ、その結果は device ごとに初回判定後 cache されます（`sycl/src/prefill/esimd_moe.dp.cpp:836-854`）。`STRATA_I8_NO_ESIMD` ビルドでは `available()` が常に false です（同 `:41-52`）。
-
-実際の prompt expert 処理では、これらに加えて native expert layout、対応する gate/up と down の形式、`n_ff=640` / `n_embd=2560`、MMQ 経路でないことなどを満たす必要があります。`STRATA_PREFILL_MMQ`（空または未設定なら `STRATA_PF_I8` が代替）が int8 経路の選択に関わりますが、ESIMD カーネルがビルドされていない場合は利用可能性条件を通りません（`sycl/src/prefill/prefill.cpp:284-295,4343-4352`）。
+- 対象は `engine/sycl` の SYCL build。CUDA / HIP / 他の build にこの環境変数を適用する処理は見つからない（`engine/sycl/tools/build.sh:1-6`）。
+- CMake の `AUTO` でカーネルを含めるのは JIT build、または AOT device 名が `bmg` / `lnl` で始まる build。その他の AOT は stub になる。`ON` は CMake 判定上この制限を外す（`engine/sycl/CMakeLists.txt:73-76,83-96`）。
+- 実行時に int8 prompt expert 経路を使うには、カーネルが build に含まれ、対象 device が ESIMD と s8 matrix combination（`nsize=16`, `ksize=32`）を持つ必要がある。利用可否は device ごとに cache され、`STRATA_I8_FORCE` の先頭文字が `0` なら利用不可になる（`engine/sycl/src/prefill/esimd_moe.dp.cpp:840-858`）。
+- モデル側では native expert layout、対応する gate/up と down の型、`n_ff=640`, `n_embd=2560` などの形状条件を満たし、MMQ / XMX mode による除外や Hadamard 条件に該当せず、`available()` が true である必要がある。満たさない層・形式は int8 経路を使わない（`engine/sycl/src/prefill/prefill.cpp:4772-4787`）。
+- ランタイム選択には別変数 `STRATA_PREFILL_MMQ`（空または未設定時は `STRATA_PF_I8`）も関与する。明示的に int8 を選んでも build stub または非対応 device では `available()` が false のため実カーネルを使えない。`I8_ESIMD` 自体はランタイム選択を上書きしない（`engine/sycl/src/prefill/prefill.cpp:333-350`, `engine/sycl/include/strata/prefill/esimd_moe.hpp:39-50`）。
+- AOT が `bmg` / `lnl` で始まり、`I8_ESIMD` が `OFF` でなく、`ALLOW_BAD_OCLOC` が厳密に `1` でない場合、build script は既知の不具合版 `ocloc` を検査する。これは build 前の保護条件であり、カーネルの選択条件とは別（`engine/sycl/tools/build.sh:15-35`）。
 
 ## 実行時の詳細
 
-ビルドスクリプトは `AOT` が `bmg` / `lnl` で始まり、`I8_ESIMD` が厳密に `OFF` ではなく、`ALLOW_BAD_OCLOC` が厳密に `1` でもない場合、`ocloc --version` の最初の数値バージョンを確認します。バージョンが `26.22.38646` またはその接尾辞付きなら、コンパイル前に stderr へ既知の問題と対処を表示し、終了コード 2 で停止します。`I8_ESIMD=OFF` はこの事前停止を回避し、`ALLOW_BAD_OCLOC=1` もビルド続行を許します。unset/空文字、`off`、`0` はこの判定では `OFF` と見なされません。該当する ocloc が見つからない場合、この事前停止は起きません（`sycl/tools/build.sh:15-35`）。
+環境変数は `build.sh` 起動時のシェル展開で参照され、CMake cache 値とコンパイル時定義 `STRATA_I8_NO_ESIMD=1`（無効時）に変換される。実行中のプロセスが `I8_ESIMD` を読み直すことはなく、プロセス起動後の環境変更は効果がない。既存 build directory では空の `I8_ESIMD` は cache の値を変えず、非空値だけを更新しようとする（`engine/sycl/tools/build.sh:38-44`, `engine/sycl/CMakeLists.txt:88-96`）。
 
-新しい build directory の初回 configure では unset/空文字は `AUTO` に展開されます。`build.ninja` が既にある場合は、非空の `I8_ESIMD` だけが CMake cache を更新し、unset/空文字では既存設定を使います。configure のあと `cmake --build` を実行し、`BUILD EXIT <code>` を出力します。スクリプトは `set -e` を有効にしていないため、configure エラーの後も後続処理へ進むことがあります。既存 cache に無効値を渡したときは再 configure の診断が抑制され、その後の build 結果だけでは設定更新の成否が分かりにくい場合があります（`sycl/tools/build.sh:7,38-50`; CMake の値検証は `sycl/CMakeLists.txt:60-61`）。
+stub build の `available()` は常に false を返す。ランタイムの `STRATA_PREFILL_MMQ` などが int8 経路を選ぶ設定でも、該当経路の適用条件を満たせず、通常の FP16 / XMX 側の処理に残る。なお `I8_ESIMD` の直接読み取りは build script だけで、別のランタイム挙動は確認できない（`engine/sycl/src/prefill/esimd_moe.dp.cpp:41-58`, `engine/sycl/src/prefill/prefill.cpp:4772-4787`）。
 
-無効化されたビルドでは、prompt の該当 expert は fused int8 経路ではなく既存の FP16 / XMX 経路に進みます。実行時の適用条件が不足する場合や int8 呼び出しが失敗した場合も FP16 chain に fallback します。prompt 処理は `STRATA_PREFILL_MMQ` またはその代替 `STRATA_PF_I8` に非空値があるとき、対象 format ごとの int8 経路選択を stderr に `strata: layer ... -> int8 path yes/no` と表示します。`I8_ESIMD` 自体を表示する実行時ログは確認できません（`sycl/src/prefill/prefill.cpp:4353-4358,4419-4432`）。
+## ログと測定値
+
+機能を stub にする設定では CMake が `Strata SYCL: the fused int8 ESIMD expert kernels are off (STRATA_SYCL_I8_ESIMD=<値>): stubs, the XMX path serves the prompt's experts` を status 出力する（`engine/sycl/CMakeLists.txt:94-96`）。既知の不具合 `ocloc` に該当すると `build.sh` は stderr に version と回避策を表示し、終了コード 2 で停止する（`engine/sycl/tools/build.sh:25-35`）。ビルド後に I8 の runtime mode が選択されたときのログは `STRATA_PREFILL_MMQ` によるもので、この変数自身のログではない（`engine/sycl/src/prefill/prefill.cpp:1416-1419,4880-4886`）。
+
+`docs/INTEL.md:85-90` と `docs/release-notes-0.2.1.md:67` も OFF 時の build stub と XMX 経路を説明しており、現行 CMake の分岐と整合する。これらの資料にある性能・正確性の表現は本調査で新たに測定していないため、測定値は記載しない。
 
 ## 根拠
 
-- 候補一覧: `docs/envvars/000_envvers.md:677`。
-- シェルでの参照、ocloc guard、CMake への引き渡し: `sycl/tools/build.sh:5,15-50`。
-- CMake cache の既定値、値の検証、AOT 条件、compile definition: `sycl/CMakeLists.txt:53-71`。
-- ESIMD を外した場合の stub 実装: `sycl/src/prefill/esimd_moe.dp.cpp:41-57`。
-- 実行時の device 判定と cache: `sycl/src/prefill/esimd_moe.dp.cpp:836-854`。
-- prompt 経路の追加条件、ログ、FP16 fallback: `sycl/src/prefill/prefill.cpp:284-295,4343-4358,4419-4432`。
+- `engine/sycl/tools/build.sh:25-50` — build guard、CMake への値の引き渡し、既存 cache 更新、build の観測出力。
+- `engine/sycl/CMakeLists.txt:73-96,303-309` — AOT 条件、値の検証、stub 用 compile definition とカーネルソース。
+- `engine/sycl/src/prefill/esimd_moe.dp.cpp:41-58,840-858` — stub の挙動と runtime device availability。
+- `engine/sycl/src/prefill/prefill.cpp:333-350,4772-4787` — runtime mode とモデル・経路条件。
+- `engine/sycl/include/strata/prefill/esimd_moe.hpp:39-50` — runtime mode 値の判定。

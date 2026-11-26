@@ -1,49 +1,46 @@
 # `STRATA_MMVQ_WIDE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。Strata が所有するソースを対象とし、外部ライブラリの挙動は含めない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL backend の Q6_K 行列ベクトル積（MMVQ）で、16-byte load を使う wide kernel を選ぶかどうかを制御する。既定は有効。Q6_K の呼び出しは推論の native MMVQ dispatcher からも到達するため、ベンチマーク専用の設定ではない。変数が直接制御するのは wide 経路の候補化であり、無効にしても別の条件によって別の専用 kernel が選ばれる場合がある。
+SYCL backend の Strata 独自 native MMVQ で、Q6_K 行列に 16-byte load の wide kernel を選択するかを制御する。既定は有効。無効にすると wide kernel の分岐を飛ばし、後続の rowwarp 条件または通常の Q6_K MMVQ 経路へ進む。Q4_K など他の形式の wide kernel を制御する変数ではない。読み取りと選択は `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp` の `g_q6k_wide` と `native_q6_k_mmvq` にある（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2185,3935-3978`）。
 
 ## 値と判定
 
-カーネル実装のグローバル変数 `g_q6k_wide` を初期化するとき、`getenv("STRATA_MMVQ_WIDE")` が未設定なら `true`、設定済みなら `atoi(value) != 0` とする（`sycl/src/kernels/cuda/native_mmvq.dp.cpp:1989`）。したがって値は文字列全体の比較ではなく、C の `atoi` による整数変換で判定される。
+ファイルスコープの `g_q6k_wide` 初期化時に `std::getenv` を使い、未設定なら `true`、設定済みなら `std::atoi(...) != 0` とする。明示的な空文字は `atoi("") == 0` となり無効。文字列全体の厳密な数値検証はなく、`atoi` が先頭から変換できた整数で判定する。先頭空白と符号は `atoi` の規則で扱われ、後続文字は無視される。大文字小文字の比較はない。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 有効 |
-| `1`、`-1`、`2` | 有効（変換値が 0 以外） |
-| `0`、`00`、`0suffix` | 無効 |
-| 空文字、数値に変換できない文字列 | 無効（変換値が 0） |
-| 先頭に空白や符号があり、その後に非ゼロ整数がある文字列 | 有効 |
+| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| SYCL `strata_kernels` にこの実装を含むビルド | 有効 | `1`, `-1`, `2`, `1junk`（`atoi` の結果が非ゼロ） | `0`, `0junk`, `true`, `false`, 空文字、整数に変換できない文字列（結果がゼロ） |
 
-`atoi` は数値以降の文字列を検査しないため、たとえば `1suffix` は有効、`0suffix` は無効になる。大文字小文字の比較はない。
+値は boolean 化するだけで、範囲 clamp や無効文字列の警告はない。`atoi` の整数範囲を超える入力は C の変換規則上安全な値として扱えないため、利用可能な値として保証されない（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2185`）。
 
 ## 有効になる条件
 
-- 適用先は SYCL backend の Q6_K MMVQ。通常の `native_mmvq()` は GGML type 14 を `native_q6_k_mmvq()` へ振り分ける。他の量子化形式にはこの変数は使われない（`sycl/src/kernels/cuda/native_mmvq.dp.cpp:3685-3701`）。
-- `native_q6_k_mmvq()` は先に packed Q6_K 経路を試し、それが処理した場合は wide 判定へ進まない（同 `:3426-3429`）。
-- wide 経路の選択には、さらに `1 <= ncols <= wide_maxc`、`n_in` が 256 の倍数、`n_out >= wide_min` が必要（同 `:3433-3446`）。`wide_min` / `wide_maxc` は別環境変数 `STRATA_MMVQ_WIDE_MIN` / `STRATA_MMVQ_WIDE_MAXC` で上書きできる。未設定時の既定値は `STRATA_MMVQ_A2` の判定にも依存し、A2 が有効ならそれぞれ `0` / `8`、無効なら `4096` / `4`。この2変数は初回評価時に `static const` へ保存される（同 `:1534-1536,3433-3435`）。
-- wide 判定を通らなければ、その後の rowwarp 等の候補判定と通常経路へ続く。したがって `STRATA_MMVQ_WIDE=0` は wide kernel を除外するが、単独で特定の代替 kernel を保証しない（同 `:3448` 以降）。
-- `sycl/CMakeLists.txt` は `native_mmvq` を GPU engine の kernel 群に含める（`sycl/CMakeLists.txt:205-214`）。推論側では layer の native projection から `native_mmvq()` を呼び出している（`sycl/src/core/layer.cpp:145-157`）。
+- 対象は SYCL backend の Strata native MMVQ 経路。`engine/sycl/CMakeLists.txt` は `src/kernels/cuda/native_mmvq.dp.cpp` を SYCL kernel source として `strata_kernels` に含める（`engine/sycl/CMakeLists.txt:273-280`）。
+- 行列形式が Q6_K であること。汎用 `native_mmvq` は GGML type `14` を `native_q6_k_mmvq` に振り分ける（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:4204-4217`）。
+- Q6_K の packed / planar 登録済み行列は wide 判定より先にそれぞれの kernel で処理されるため、この変数はその呼び出しでは効かない（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3935-3938`）。
+- wide 分岐には `1 <= ncols <= wide_maxc`, `n_in % 256 == 0`, `n_out >= wide_min` も必要。`wide_maxc` と `wide_min` は `STRATA_MMVQ_WIDE_MAXC` / `STRATA_MMVQ_WIDE_MIN` で指定でき、未設定時は `STRATA_MMVQ_A2` の状態に応じてそれぞれ 8/0（A2 有効）または 4/4096（A2 無効）になる。これらの読み取り値は各関数内 `static` に保存される（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:1545-1548,3943-3955`）。
+- 上の wide 条件を満たさない場合でも、`ncols` が 1〜4、`n_in` が 256 の倍数で、`STRATA_MMVQ_RPW` の値が正なら rowwarp 経路が後続で選ばれうる。そうでなければ通常の Q6_K 経路へ進む（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3958-3978`）。
+- CLI 引数による優先上書きはこの読み取り経路にない。ベンチマーク実行ファイルは比較測定中に setter で一時的に off/on し、比較後に環境変数を読み直して値を復元する（`engine/sycl/src/kernels/mmvq_bench.cpp:29-38`）。
 
 ## 実行時の詳細
 
-エンジン側の `g_q6k_wide` はグローバル初期化時に環境を読み、その後の各 Q6_K 呼び出しで判定結果を参照する。通常の推論経路では起動後に環境を変更しても再読込されない。公開 setter `native_mmvq_set_q6k_wide(bool)` はこの状態を実行時に変更できるが、対象ソース全体で呼び出しがあるのは `mmvq_bench` のみで、そこで比較のため一時的に false/true を設定した後、環境値から再設定する（`sycl/src/kernels/cuda/native_mmvq.dp.cpp:2954-2955`, `sycl/src/kernels/mmvq_bench.cpp:27-35`）。
+通常の SYCL engine では、翻訳単位のファイルスコープ変数として初期化され、プロセス開始後に環境を変更してもこの値は再読込されない。`native_q6_k_mmvq` はまず packed / planar 行列を判定し、そのどちらでもなければ `g_q6k_wide` と形状条件を調べる。条件を満たすと `ncols` ごとの `launch_q6k_wide` を起動して戻る。wide 分岐に入らなければ rowwarp を試し、続いて通常 kernel に進む。`ncols > 1` の通常経路は multi kernel、1 列は通常の Q6_K kernel を使う（`engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:3935-4005`）。
 
-wide 経路に入ると、`ncols` に対応する `launch_q6k_wide` specialization を選ぶ。内部では `STRATA_MMVQ_WIDE_RPW`、`STRATA_MMVQ_PF`、および `STRATA_MMVQ_A2` に応じて kernel variant が分かれる。これらは wide kernel 内部の分岐であり、`STRATA_MMVQ_WIDE` 自体の判定とは別である（同 `:1693-1741`）。この変数について専用のログ出力や警告は見当たらない。
+ベンチマークの `mmvq_bench` では、環境値の初期化後に correctness 比較のため wide を一度無効化・有効化し、その後 `STRATA_MMVQ_WIDE` を再度読み取って測定用の選択値に戻す。このためこのベンチマーク内に限り、比較用 setter の変更後に環境を再参照する箇所がある（`engine/sycl/src/kernels/mmvq_bench.cpp:29-50`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/INTEL.md` は Intel B70 の SYCL port で Q6_K wide kernel の aligned-load 版が対象 shape を広げた経緯と測定を記載している。記載上は 2560→10240 行、1/2/4/6 columns で 160/145/141/101 から 493/432/331/273 GB/s、Coder の greedy decode（2k prompt）で 44.9 から 54 tok/s となっている（`docs/INTEL.md:448-455`）。これは特定構成での wide kernel の測定値であり、`STRATA_MMVQ_WIDE` の ON/OFF 比較値としては記載されていない。実装側では `STRATA_MMVQ_A2` が無効な場合の旧い shape gate も残るため、文書の測定を他の backend・GPU や任意の shape に一般化しない。
+この変数の値や wide kernel 選択を直接知らせるログ、警告、終了経路は見つからない。測定値は記載しない。
 
 ## 根拠
 
-- 環境値の既定と変換: `sycl/src/kernels/cuda/native_mmvq.dp.cpp:1989`
-- Q6_K 用の呼び出し、wide の適用条件と launch: 同 `:3426-3446`
-- native MMVQ の type dispatch: 同 `:3685-3701`
-- wide kernel の内部 variant: 同 `:1693-1741`
-- setter とベンチマーク上の一時切替: 同 `:2954-2955`; `sycl/src/kernels/mmvq_bench.cpp:27-35`
-- SYCL build 対象と推論側呼び出し: `sycl/CMakeLists.txt:205-214`; `sycl/src/core/layer.cpp:145-157`
-- 設計経緯・測定条件: `docs/INTEL.md:448-455`
+- `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2185` — 環境値の初期化。
+- `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:2876-2898,3007-3028,3935-3978` — packed / planar の先行処理、Q6_K wide の形状ゲートと kernel 選択、fallback。
+- `engine/sycl/src/kernels/cuda/native_mmvq.dp.cpp:4204-4217` — Q6_K 形式から対象関数への dispatch。
+- `engine/sycl/src/kernels/mmvq_bench.cpp:29-50` — ベンチマーク内の一時切替と環境値の復元。
+- `engine/sycl/CMakeLists.txt:141-149,273-286` — `.cu` 名の SYCL source 解決と `strata_kernels` への登録。
+
+`terminal/data/settings-register.json:25400-25429` にも名前と読み取り座標が載るが、これは設定レジストリのメタデータであり、追加の実行時読み取り箇所ではない。

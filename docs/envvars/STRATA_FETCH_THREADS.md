@@ -1,45 +1,44 @@
 # `STRATA_FETCH_THREADS`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--mmap-experts` 経路の `FileExpertSource` が、ステージバッファへ複数の未キャッシュ expert を読み込むときに使う CPU worker 数を設定します。ファイルから読む対象は pack の `experts.bin`、またはそれがない native pack で参照する GGUF shard です。変数名やヘッダーコメントは GGUF の読み取りを挙げていますが、同じ `fill_many()` は mmap の両形式に使われます。
+`--mmap-experts` 系のファイル読み込みで、staging buffer に読み込む expert 群を処理する worker 数を指定する。既定は 8。CUDA/HIP 系の `engine/src/program/generate.cpp` と SYCL の `engine/sycl/src/program/generate.cpp` が値を `FileExpertSource` に渡し、通常の mapped-file 読み込みでは `fill_many` の同時 worker 数の上限として使う。GPU cache の容量や prompt 用の staging thread 数を設定する変数ではない（読み取りと setter: `engine/src/program/generate.cpp:8628-8631`, `engine/sycl/src/program/generate.cpp:4726-4736`; worker 数の使用: `engine/src/core/expert_source.cpp:2745-2757`, `engine/sycl/src/core/expert_source.cpp:1030-1041`）。
 
 ## 値と判定
 
-| 値 | 動作 |
-|---|---|
-| 未設定 | 既定の 8 を使う |
-| 空文字、数値に変換できない文字列、変換結果が 0 以下 | setter を呼ばず、既定の 8 を使う |
-| `atoi()` の変換結果が正 | その整数を設定する。例: `12` と `12workers` は 12、`  +3tail` は 3 |
+両方の読み取り箇所で `getenv` が null でないことに加え、`std::atoi(v) > 0` を要求する。通過した値を `set_fetch_threads` に渡し、setter は 1 未満を 1 にするが、呼び出し側の条件により実際に渡るのは正数だけ。未設定、空文字、`atoi` が 0 を返す文字列、負数は setter を呼ばず、メンバー初期値 8 のままになる（`engine/src/program/generate.cpp:8628-8631`, `engine/sycl/src/program/generate.cpp:4733-4736`, `engine/include/strata/core/expert_source.hpp:910-911,1187`, `engine/sycl/include/strata/core/expert_source.hpp:543-544,647`）。
 
-文字列全体の検証はなく、`atoi()` が先頭の整数部分を読むため、後続文字は無視されます。`atoi()` の結果が `int` の範囲を超える入力について、C/C++ の変換結果は保証されません。値を上限で clamp する処理はありません。`set_fetch_threads()` 自体は 1 未満を 1 にしますが、呼び出し側が `atoi(v) > 0` の場合だけ setter を呼ぶため、環境変数から 1 未満は設定できません。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---:|---|---|
+| `engine/src` と SYCL の mmap expert source 初期化 | 8 | `1`, `8`, `+3`, ` 4`, `12x`（`atoi` が正数を返す） | 空文字、`0`, `-2`, `true`, `0anything`, `x12`（`atoi` が 0 以下） |
 
-根拠: CUDA/HIP 側 `src/program/generate.cpp:4622-4632`、SYCL 側 `sycl/src/program/generate.cpp:4168-4178`、setter と初期値 `include/strata/core/expert_source.hpp:645-646,803`（SYCL 側 `sycl/include/strata/core/expert_source.hpp:541-542,640`）。
+文字列全体の妥当性検査はなく、`atoi` が認識する先頭の整数部分が使われるため、`12x` は 12、先頭空白と符号も受け付ける。大文字小文字の概念はない。正数への上限 clamp はない。`atoi` の表現範囲を超える入力の結果はコードで検査・定義していないため、範囲外値は指定しないこと。無効値を示す警告やエラーはこの判定箇所からは出ない。
 
 ## 有効になる条件
 
-- `strata generate` が `o.mmap_experts` の経路に入る場合にだけ、この変数を読みます。明示的な `--mmap-experts` のほか、低 RAM 関連のオプションがこの状態を設定する箇所があります。通常の resident expert arena 経路では読みません。
-- `FileExpertSource::fill_many()` に未処理の読み込みがあり、buffered/mapped 読み取りを行う場合に、設定した数が worker 数の上限になります。実際の worker 数は `min(todo.size(), fetch_threads_)` です。呼び出し元のスレッドも仕事を受け持つため、ここで作る追加スレッド数はその値より最大 1 少なくなります。読み込み対象が少なければ設定値より少ない数になります。
-- `direct_` を使う unbuffered 読み取りでは別のバッチ読み取り経路になり、最大 4 worker（16 blob ずつ割当）を固定で使うため、この設定値はその経路の並列数を変えません。
-- Linux の `STRATA_IO_PREFETCH` が利用可能で有効な場合、layer prefetch は I/O worker queue に渡され、worker 数は `STRATA_IO_PF_THREADS` が担当します。この prefetch の並列数は `STRATA_FETCH_THREADS` では制御されません。`STRATA_IO_PREFETCH` の条件を満たさず通常の `fill_many()` に進む読み込みでは、この変数の設定が適用されます。
+- `engine/src` では `o.mmap_experts` の分岐に入ることが必要。通常は `--mmap-experts`、`--ssd-experts`、`--resident-experts`、`--resident-budget-gib` などがこの状態を作る。CUDA 系では expert arena を RAM 不足で開けず file source に fallback する経路も同じ設定を読む（`engine/src/program/generate.cpp:4218-4257,8876-8911`）。
+- SYCL では `o.stream_experts && !o.mmap_experts` が優先される。この分岐は `GgufExpertSource` を使い、`STRATA_FETCH_THREADS` を読む mmap 分岐には進まない。mmap 側に入るには `o.mmap_experts` が必要（`engine/sycl/src/program/generate.cpp:4711-4736`）。
+- mapped reads で `fill_many` が処理する todo がある場合、実 worker 数は `min(todo の件数, fetch_threads_)`。このため指定値より todo 件数が少なければ指定値全員は起動しない（`engine/src/core/expert_source.cpp:2692-2758`, `engine/sycl/src/core/expert_source.cpp:979-1041`）。
+- `direct_` が有効な unbuffered 読み込みでは、この変数による上限は使われず、16 blob 単位の direct batch を最大 4 worker で処理する。CUDA の非同期 prefetch 経路も direct reads なら同じ 4 worker 上限を使う（`engine/src/core/expert_source.cpp:2581-2611,2692-2719`; SYCL: `engine/sycl/src/core/expert_source.cpp:979-1004`）。
+- 同じ source の RAM copy にある expert、override 済みの expert、既に staging 中／済みの expertは todo に追加されないため、その読み込みに worker は使われない（`engine/src/core/expert_source.cpp:2513-2542`; SYCL: `engine/sycl/src/core/expert_source.cpp:920-943`）。
+- CLI に fetch thread 数を指定する引数はこの設定箇所にはなく、他の環境変数との優先順位や上書きもない。`STRATA_STAGER_THREADS` / `STRATA_STAGER_RING` は prompt 側に別設定として記載されており、この変数からは読み取られない（区別の記述: `engine/src/core/expert_source.cpp:2500-2502`; `docs/UNSLOTH_Q4.md:235`）。
 
 ## 実行時の詳細
 
-環境変数は `FileExpertSource` を開く前の mmap 初期化時に読み、一度だけ `fetch_threads_` に設定します。後からプロセス環境を書き換えても再読込しません。`prefetch()` は対象 expert の読み込みが必要な分だけステージ枠を確保し、`fill_many()` は atomic な仕事番号を使って worker に割り当て、各 expert の読み込み完了後に待ち合わせます。CUDA/HIP と SYCL の実装で、この buffered/mapped 経路の worker 数の決め方は同じです。
+環境変数は engine の起動処理で mmap source を初期化する際に読み取られ、`FileExpertSource` instance の `fetch_threads_` に保存される。値を `static` cache したり、各 token ごとに環境から読み直したりする実装ではない。通常の `prefetch` は有効な expert のうち必要なものを todo に集めて `fill_many` に渡し、mapped read では最大 `fetch_threads_` 個の worker（そのうち 1 個は呼び出し thread）が `fill_stage` を処理して全 worker を join する。CUDA 系の `prefetch_begin` の非 direct 経路も同じ上限で thread を作る（`engine/src/core/expert_source.cpp:2449-2478,2547-2612,2692-2758`; SYCL: `engine/sycl/src/core/expert_source.cpp:920-944,979-1041`）。
 
-Windows では buffered/mapped 読み取りの worker 処理に先立ち、利用可能なら `PrefetchVirtualMemory` に対象範囲をまとめて渡します。これは `STRATA_FETCH_PVM` による別制御で、`STRATA_FETCH_THREADS` はこの API の呼び出し有無や値を変えません。`STRATA_FETCH_THREADS` 固有のログ出力はありません。
+ファイル source の open に失敗すると、通常の mmap 経路では `strata generate: <error>` を stderr に出して終了コード 1。CUDA 系の RAM fallback 後に file source も開けない場合は、別の stderr 文言を出して resident arena 側へ戻す再試行が行われる。この環境変数自体について、値を表示するログや無効値警告はない（`engine/src/program/generate.cpp:8631-8643`; SYCL: `engine/sycl/src/program/generate.cpp:4736-4738`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/DETAILS.md` は、GGUF shard からの expert 読み込みについて既定 8 thread と Windows のまとめた page request を説明しています。これはコード上の既定値および Windows の prefetch 処理と一致します。同資料では `experts.bin` の場合はこの設定に触れていませんが、コードでは同じ `fill_many()` が mapped `experts.bin` にも適用されます。`docs/UNSLOTH_Q4.md` には 16 thread でも速くならなかったという記載がありますが、測定環境・手順・結果表はその記述箇所にはないため、一般的な性能効果としては扱いません。
+設定値や実際に使った fetch worker 数を表示するログは見当たらない。open 成功時には mmap source の使用を示す `strata generate: experts via mmap (...)` が stderr に出るが、thread 数の確認にはならない（`engine/src/program/generate.cpp:8645-8647`, `engine/sycl/src/program/generate.cpp:4740-4741`）。この変数単独の測定値は現行ソース内で確認できない。`docs/UNSLOTH_Q4.md:235` は既定 8 と用途を説明しており、setter の初期値・利用箇所と一致する一方、unbuffered/direct 経路の最大 4 worker という例外もソースにある。
 
 ## 根拠
 
-- mmap 初期化、環境変数の変換、ファイル形式の選択: `src/program/generate.cpp:4622-4637`、SYCL 側 `sycl/src/program/generate.cpp:4168-4183`。
-- 既定値 8 と設定 setter: `include/strata/core/expert_source.hpp:645-646,803`、SYCL 側 `sycl/include/strata/core/expert_source.hpp:541-542,640`。
-- buffered/mapped worker 上限と呼び出しスレッドを含む仕事分担: `src/core/expert_source.cpp:1519-1580`、SYCL 側 `sycl/src/core/expert_source.cpp:968-1030`。
-- unbuffered 経路の固定 worker 数: `src/core/expert_source.cpp:1519-1544`、SYCL 側 `sycl/src/core/expert_source.cpp:968-993`。
-- Linux I/O prefetch の別経路と別スレッド設定: `src/program/generate.cpp:4667-4678`、`src/core/expert_source.cpp:1426-1440`。
-- 資料: `docs/DETAILS.md:215-223`、`docs/UNSLOTH_Q4.md:235`。
+- 値の読み取りと setter: `engine/src/program/generate.cpp:8628-8631`, `engine/sycl/src/program/generate.cpp:4733-4736`
+- 既定値・setter: `engine/include/strata/core/expert_source.hpp:910-911,1187`, `engine/sycl/include/strata/core/expert_source.hpp:543-544,647`
+- mapped reads と direct reads の worker 数: `engine/src/core/expert_source.cpp:2692-2758`, `engine/sycl/src/core/expert_source.cpp:979-1041`
+- prefetch 経路と todo の選別: `engine/src/core/expert_source.cpp:2449-2478,2513-2542,2547-2612`, `engine/sycl/src/core/expert_source.cpp:920-944`
+- mmap / stream の条件と観測可能な open 結果: `engine/src/program/generate.cpp:4218-4257,8631-8647,8876-8911`, `engine/sycl/src/program/generate.cpp:4711-4741`

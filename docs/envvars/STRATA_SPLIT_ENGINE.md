@@ -1,43 +1,54 @@
 # `STRATA_SPLIT_ENGINE`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`strata launch` が all-cards split engine（`strata-split-N`）を選ぶモードを指定します。これは Strata の Python 制御層が読む値で、split engine の GPU kernel 自身が読む変数としては使われていません。未指定時の `auto` は条件に合う環境で選択し、`on` は選択を明示的に要求し、`off` は選択を止めます。対象の設定値は `strata_control.split_engine.mode()` が決めます。
+Terminal の `strata launch` が通常の layer split の代わりに all-cards split engine を使うか、その判定モードを上書きする。`strata_control.split_engine.mode()` は既定の `auto`、明示的に要求する `on`、無効化する `off` を返し、`STRATA_SPLIT_ENGINE` は run config の `split_engine` より優先される。実行するかどうかはこの値だけでは決まらず、カード・モデル・メモリ等の判定も通る必要がある（`terminal/strata_control/split_engine.py:435-448,516-530,567-639`）。
+
+CLI の `--split-engine auto|on|off` は launch 設定に保存される。非空の環境値があればそれが CLI/config の設定に優先し、空の環境値なら config の値を使う（`terminal/strata_cli/launch/cmd.py:108-111,260-261`、`terminal/strata_cli/launch/settings.py:139,446-447`、`terminal/strata_control/split_engine.py:435-448`）。
 
 ## 値と判定
 
-環境変数の値を `strip()` して空でなければ、その文字列を `lower()` した完全一致で判定します。数値変換や先頭文字だけの判定ではありません。
+環境からは `os.environ.get("STRATA_SPLIT_ENGINE")` で取得する。文字列の前後空白を除き、小文字化した値全体を表の文字列と照合する。数値変換や先頭文字だけの判定はしない（`terminal/strata_control/split_engine.py:435-448`）。
 
-| 環境値 | 判定 |
-|---|---|
-| `on`, `1`, `true`, `yes`（大文字小文字不問、前後空白可） | `on` |
-| `off`, `0`, `false`, `no`（大文字小文字不問、前後空白可） | `off` |
-| 未設定、空文字、空白だけ | run config の `split_engine` を判定 |
-| 上記以外（例: `2`, `auto`, `enabled`） | `auto` |
+| 環境値 | 判定 | 結果 |
+| --- | --- | --- |
+| 未設定 | run config の `split_engine` を使う | config も未指定なら `auto` |
+| 空文字 `""`、空白だけ `"  "` | 未設定と同様に扱う | run config の値へ戻る |
+| `on`, `1`, `true`, `yes` | `on` | 利用を要求し、実行不可なら理由を通知 |
+| `off`, `0`, `false`, `no` | `off` | all-cards split engine を使わない |
+| 上記の大文字・混在大文字（例 `YES`） | trim 後に小文字化 | 対応する値と同じ |
+| 前後に空白がある値（例 ` 1 `） | trim 後に照合 | 対応する値と同じ |
+| 未知の非空値（例 `trueish`, `0anything`, `2`） | `auto` | 環境値が config より優先したうえで自動判定 |
 
-run config 側は真偽値 `true` / `false` もそれぞれ `on` / `off` として扱います。その他の値は、同じ文字列表にない限り `auto` です。したがって CLI の `--split-engine auto` または設定ファイルの `"split_engine": "auto"` は自動選択を意味します。空または空白だけの環境値は「未指定」として設定値へ戻ります。
-
-根拠: `strata_control/split_engine.py:356-369`。
+config 側の boolean `true` / `false` は `on` / `off` になる。config の文字列も同じ対応表で判定し、未対応値は `auto`。環境値が空文字または空白だけの場合だけ config にフォールバックする（`terminal/strata_control/split_engine.py:441-448`）。
 
 ## 有効になる条件
 
-値が `on` または `auto` でも、split engine の適用条件を満たさなければ通常の layer split が使われます。主な条件は Linux、2〜4 枚の同一 make・同一モデル・同一 VRAM 容量のカード、認識するカード世代とモデル形状、必要な GPU memory / RAM、単一 GGUF file set、`--kv int8`（または `--kv` なし）、MTP draft layer と必要な engine package / `draft_vocab_en.bin` が揃うことです。独自 engine 引数・replicas、DFlash2 指定、drafting off も適用を止めます。各条件の拒否理由は `decide()` と `_apply()` に実装されています（`strata_control/split_engine.py:176-247,435-513`）。
+有効値でも all-cards split engine が選ばれない場合がある。
 
-`auto` は一般条件に加えて、NVIDIA ではカードが `AUTO_SPLIT_BEATS_DFLASH2`（この revision では sm_86 / sm_120）に含まれる場合に限り選びます。AMD では `AUTO_SPLIT_AMD_ARCHS`、`AUTO_SPLIT_AMD_CARD_COUNTS`、`AUTO_SPLIT_AMD_EXPERT_TYPES` の条件をすべて満たす場合だけ自動選択します。この revision の定数は AMD gfx1201、4 枚、専門家 tensor type が Q4_K / Q5_K / Q5_1 / Q8_0 の範囲です。`on` はこれらの自動選択 gate を迂回しますが、一般条件は残ります。AMD の明示 `on` では未テスト構成を許す設定も加わります（`strata_control/split_engine.py:41-71,377-390,421-424,484-492`）。
-
-`off` は `apply_split_engine()` 冒頭で戻るため、他の条件を調べず split engine 設定を作りません。`auto` の拒否は `Decision.quiet` になり、通常の layer split が静かに続きます。`on` で拒否されると、その理由を含む一行が launch の設定通知に出ます（`strata_control/split_engine.py:435-448`; `strata_cli/launch/runner.py:1630-1682`）。
+- `off` は常に選択を止める。`auto` は自動判定、`on` は自動判定の一部制限を越えて明示要求するモードだが、ハードウェア・モデル等の基本要件を無効化しない（`terminal/strata_control/split_engine.py:191-264,456-469`）。
+- `strata launch` の対象が native Strata model family であれば launcher は split engine 判定を呼ばず、環境値の効果はない（`terminal/strata_cli/launch/runner.py:2241-2248`）。
+- 基本判定は Linux、または Windows AMD、2〜4 枚、同一 vendor・同一カードモデルと VRAM 容量、NVIDIA は compute capability 7.0 以上、AMD は対応アーキテクチャ、モデル形状・tensor type 対応、必要 VRAM/RAM、テスト済み context 128K 以下等を要求する（`terminal/strata_control/split_engine.py:191-264`）。
+- `auto` では追加の適用条件がある。NVIDIA は `AUTO_SPLIT_BEATS_DFLASH2` の対象カードであること、AMD は `AUTO_SPLIT_AMD_EXPERT_TYPES`、`AUTO_SPLIT_AMD_CARD_COUNTS`、`AUTO_SPLIT_AMD_ARCHS` の各条件を満たすこと（定数は同ファイル `:47-55`、判定は `:456-469`）。それ以外は通常の layer split になる。`on` はこれら auto 専用の除外を越えて要求できる。
+- `--drafting off`、または `--drafting dflash2` と `auto`/`off` の組合せ、engine 独自 `user_args`、replicas、`--kv` が `int8` 以外の場合は選ばれない。`on` と DFlash2 の組合せでは対応版 engine と DFlash2 pack が必要（`terminal/strata_control/split_engine.py:477-495,576-639`）。
+- 実行 engine package、draft layer（DFlash2 を明示選択した `on` の場合を除く）、`draft_vocab_en.bin` が必要。不足時は通常の layer split に戻る（`terminal/strata_control/split_engine.py:616-639`、`terminal/strata_cli/launch/runner.py:2250-2259`）。
+- `STRATA_SPLIT_ALLOW_UNTESTED=1` は未テスト構成の基本判定を許容し、AMD で `on` は未テスト architecture も許容する。これは別変数であり、本変数の値判定を変えない（`terminal/strata_cli/launch/runner.py:2265-2266`、`terminal/strata_control/split_engine.py:502-504,601-604`）。
 
 ## 実行時の詳細
 
-環境値は Python の `os.environ` から `mode()` が呼ばれるたびに読み直され、static cache はありません。launch の予測処理（`expected()`）と、run config を確定する `apply_split_engine()` がそれぞれ判定します（`strata_control/split_engine.py:356-374,398-430,435-448`; `strata_cli/launch/runner.py:1521-1549,1619-1637`）。CLI の `--split-engine` は launch settings に入り run config を組み立てる際に `split_engine` を上書きしますが、非空の環境値はその CLI / 保存済み設定より優先します（`strata_cli/launch/cmd.py:108-111,251-252`; `strata_cli/launch/runner.py:533-551`; `strata_control/split_engine.py:361-369`）。
+Terminal launcher は run config を作る際に `apply_split_engine()` を呼び、その中で `SE.mode(cfg)` を参照してから `SE.apply_to_config()` を実行する。Desktop app 側も `strata split-engine apply` から `apply_run_config()` を呼び、同じ `mode()` の判定を使う（`terminal/strata_cli/split_cmd.py:1-5,41-44`、`terminal/strata_control/split_engine.py:712-737`）。`mode()` 自体にキャッシュはなく、デフォルトでは呼び出しごとに現在の `os.environ` を読む。従って各 Control/Terminal プロセスで launch 判定時点に評価され、実行中に環境を変更しても既に書き出した run config の engine 選択は変わらない（`terminal/strata_cli/launch/runner.py:2228-2237,2241-2281`、`terminal/strata_control/split_engine.py:435-448,516-530`）。
 
-この判定は server が起動する engine の種類を run config に書く前に行われます。split engine の起動自体が失敗した場合、server は config の `split_fallback` に入った通常 engine を起動し、標準出力へ `[strata] The all-cards split engine could not start (...)` を出します。CLI 側は server の metrics に `split_fallback` があると、split engine ログの末尾にある `sfnx:` 行を添えて警告通知を出します（`serve/server.py:9107-9145`; `strata_cli/launch/runner.py:2198-2219`）。
+同じ Runner の事前計画には `split_expected()` の memoization があるが、実際の launch 適用は別に `apply_split_engine()` から判定する（`terminal/strata_cli/launch/runner.py:2033-2064,2228-2231`）。この関数は主に app/Terminal の drafting 計画に使われ、環境値の永続キャッシュではない。
+
+`auto` で条件不成立なら通常の layer split を無言で維持する。`on` で判定拒否または処理例外があれば理由を一行通知し、launcher は起動自体を止めない。選択時は `Using the all-cards split engine on N cards.` を通知する。split engine の起動が失敗した場合、server は `[strata] The all-cards split engine could not start (...). Starting the normal layer split instead.` を出して fallback config で通常 engine を起動する（`terminal/strata_control/split_engine.py:123-140,516-530,712-737`、`terminal/strata_cli/launch/runner.py:2265-2281`、`terminal/serve/server.py:8788-8825`）。
 
 ## 根拠
 
-- 候補名の実読み取りと優先順位: `strata_control/split_engine.py:356-369`。
-- 実行モードと環境依存の制約: `strata_control/split_engine.py:176-247,377-390,398-430,435-513`。
-- CLI 値の受け取りと run config 反映: `strata_cli/launch/cmd.py:108-111,251-252`; `strata_cli/launch/runner.py:533-551,1619-1682`。
-- 起動時 fallback と観測可能な警告: `serve/server.py:9107-9145`; `strata_cli/launch/runner.py:2204-2219`。
+- 環境値の読み取り・優先順位・値変換: `terminal/strata_control/split_engine.py:435-448`
+- 判定モードと自動適用の追加条件: `terminal/strata_control/split_engine.py:191-264,456-469,516-530`
+- 実行条件と split config への変換: `terminal/strata_control/split_engine.py:567-639`
+- CLI 設定の取り込みと launch 時の適用・通知: `terminal/strata_cli/launch/cmd.py:108-111,260-261`、`terminal/strata_cli/launch/runner.py:2228-2281`
+- Desktop app の Control 経由の適用: `terminal/strata_cli/split_cmd.py:1-5,41-44`、`terminal/strata_control/split_engine.py:712-737`
+- split 起動失敗時の fallback: `terminal/serve/server.py:8788-8825`

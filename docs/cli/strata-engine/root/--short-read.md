@@ -1,66 +1,55 @@
 # `--short-read`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの root 引数 parser） |
+| コマンド | `strata`（ネイティブ engine のトップレベル。`--serve` で server 入力を処理） |
 | オプション | `--short-read N` |
 | 別名 | なし |
-| 値 | 0 以上の整数として扱うトークン数 |
+| 値 | 整数。parser は `atoll` で変換して 0 未満を 0 に丸める |
 
 ## 役割
 
-`--serve` のプロンプト読み込みで、短いテキスト区間を通常の batched prompt path ではなく decode の verify windows 経由で読む上限を指定します。説明文と実装コメントは、短いチャットメッセージや assistant header などにこの経路を使う設定として示しています。`strata --help` の表示内容も `src/program/generate.cpp` の usage 定義（931–932行）にあります。
+`--serve` の各リクエストで、短いテキスト区間を通常の batched prompt path ではなく decode verify windows で読む上限を指定します。区間ごとに判定されるため、長い prompt 全体が batched path に回っても、短い末尾メッセージや assistant header は window path になる場合があります。`--short-read 0` はこの振り分けを無効にし、batched path を選びます（`engine/src/program/generate.cpp:1139-1143,20223-20229,20238-20243`）。
 
 ## 使い方
 
 ```sh
-strata --serve --short-read 64 --native /path/to/model.gguf
+strata --pack /path/to/model.pack --serve --short-read 24
 ```
 
-これはネイティブエンジンのオプション例です。`--short-read` は `--serve` なしでも parser に受理されますが、実際のプロンプト振り分けは serve のリクエスト処理にあります。
+`--serve` を使う engine 起動時に指定します。`--serve` 以外の生成経路に対する用途は parser help でも `--serve` 専用として説明されています（`engine/src/program/generate.cpp:1338-1340`）。
 
 ## 値と既定値
 
-- 省略時は `64`。
-- parser は `std::atoll` で値を読み、`std::max(0LL, ...)` で負値を `0` に丸めます。`0` は短い区間も verify windows に回さず、batched prompt path を使う設定です。
-- 正の上限値はコード上で別途制限されていません。値は `int64_t` に保持されます。
-- 数値変換は `atoll` に委ねられ、先頭に整数がない値は 0 と同様に扱われます（整数の後ろに文字が続く値は整数部分まで読み取られます）。重複指定を拒否する処理はなく、引数走査で後に現れた値が残ります。
-- 値を省略すると parser の `next()` が `--short-read needs a value` を stderr に出し、終了コード 2 で終了します。
+- 値は必須です。parser は `std::atoll` の結果を `std::max(0LL, ...)` で下限 0 に丸めます。明示した場合は `short_read_set` も true にし、環境・モデルに応じた class default を適用しないようにします（`engine/src/program/generate.cpp:1142-1143,4117`）。
+- CUDA/HIP の主要 engine 経路では、未指定時の基底値は 64 です。expert layout が native で形式情報を持つ場合に限り、測定クラス、全層 fused-only か、staged fused entry の有効状態、folded trellis の有無、CUDA sm_120 条件などから既定値を選びます。通常は 64、該当する Windows gfx1151 の条件では 24、CUDA sm_120 の条件では 16 となり得ます。CLI で値を明示するとこの問い合わせ自体を行いません（`engine/src/program/generate.cpp:13831-13833`、`engine/src/prefill/prefill.cpp:3563-3579`、`engine/include/strata/prefill/staged_fo_rule.hpp:32-52`）。
+- SYCL の parser は同じく 0 未満を 0 に丸めますが、`short_read_set` による適応既定値の切替はなく、構造体既定値 64 を使います（`engine/sycl/src/program/generate.cpp:759,2095`）。
+- parser に数値形式の検査や上限値検査はありません。`atoll` が整数として読めない値をどう扱うかは C ライブラリ変換に委ねられています。値の範囲や重複指定時の専用エラーは定義されていません（`engine/src/program/generate.cpp:4117`）。
 
 ## 実行時の動作
 
-serve の各リクエストでは `req_short_read` を設定値で初期化し、各プロンプト区間 `[a,b)` の長さ `b-a` がこの上限以下なら windows 経路の候補になります。区間が上限を超える場合は batched 経路を使います。候補区間は `read_windows`（通常は verify windows、条件を満たす pipeline 設定では pipelined windows）へ渡され、そうでない区間は `read_part` へ渡されます。区間ごとに判定するため、長いプロンプトの一部は batched、短い末尾の一部は windows という組み合わせもあります。
+通常の serve 経路では、リクエスト内の各候補区間について、区間長が `req_short_read` 以下であることを確認します。0 のときは長さが正の区間が条件を通らず、window path は使われません。`STRATA_CKPT_REREAD` が設定されていると長さに関わらず batched path を選びます。候補に埋め込み行（画像など）が含まれる区間も window path から除外されます（`engine/src/program/generate.cpp:20230-20243,21551-21571`）。
 
-- `STRATA_CKPT_REREAD` が設定されていると短区間判定を無効化し、すべて batched path にします。
-- 画像埋め込み行を含む区間は windows 対象になりません。
-- `STRATA_PIPELINE_SWITCH` が設定され、pipeline 実行中にそのファイルを開けた場合、ファイル内の `short_read=N` がリクエスト単位の上書き値になります。値は同様に 0 以上へ丸められ、選ばれた値が stderr に表示されます。これは診断用の環境変数経路です。
-- `--short-read` が正のとき prompt windows で non-finite logits が検出された場合、次のリクエストは一度だけ `req_short_read=0` にして全プロンプトを batched path で読みます。その際 stderr に理由が出ます。
-- `--prefill-head-alias` は `--short-read 0` を必要条件とし、正の値なら利用不可として終了コード 2 になります。
-- `--prompt-cache-tail` の追加 checkpoint 判定でも `o.short_read` が閾値として参照されます（環境変数によるリクエスト単位の上書き値ではありません）。
+window path を選んだ後は、verify window の容量 `S` ごとに区間を分けて prompt token を処理します。`--short-read` が定めるのは window 1回あたりの token 数ではなく、batched path と window path のどちらへ渡すかの区間長上限です（`engine/src/program/generate.cpp:20414-20431`）。CUDA/HIP の serve では、非有限 logits が prompt window で検出された後の再試行に限り、次のリクエスト1件を batched path のみにし、stderr に理由を出します（`engine/src/program/generate.cpp:13826-13833,19243-19251,20231-20243`）。
 
 ## 適用条件と副作用
 
-この設定が読み込み経路を変えるのは `--serve` のプロンプト処理です。値の指定自体にモデル・backend の追加 validation はありません。`--pipeline-windows` の有効化は必須ではなく、verify windows 経路は通常実行されます。適用時は prompt の計算経路が変わり、通常 path では区間を batched に読み、短い対象区間ではトークンを verify windows に通します。ファイルの作成・変更やネットワーク接続などの副作用は、このオプションの実装箇所にはありません。
+- 文書化された適用範囲は `--serve` です。CUDA/HIP と SYCL で既定値決定の実装が異なるため、24/16 への自動変更は全 backend 共通ではありません（`engine/src/program/generate.cpp:1338-1340,13831-13833`、`engine/sycl/src/program/generate.cpp:759,2095`）。
+- `--prefill-head-alias` を使う場合、同オプションの条件検査は `--short-read 0` を要求します。既定の正値のまま併用すると「it needs --short-read 0」を stderr に表示して終了コード 2 になります（`engine/src/program/generate.cpp:8443-8455`）。
+- この値で選択される read path は GPU/CPU prefill 処理に関わりますが、このオプション自体がファイルを書き換えたり、別プロセスを起動したりする処理は確認できません。特定値による性能優位は機器・モデル条件に依存し、ここでは推奨値として断定しません。
 
 ## 出力とエラー
 
-有効な値に対する専用の通常出力や警告は確認できません。パラメーター欠落時は stderr に値不足を出して終了コード 2、未知の引数は stderr に `unknown argument` と usage を出して終了コード 2 です。windows 経路で読み込みに失敗した場合は serve の一般エラー経路で stderr と `ERR ...` を出し、通常は終了コード 1 で返ります。non-finite prompt window の検出時はエラー詳細を stderr に出し、該当リクエストは `DONE nonfinite` で終了します。
+通常、`--short-read` 自身の値検査に由来する警告や専用エラー出力はありません。serve の prompt window で非有限 logits が発生した後、次のリクエストでは一時的に window read を止める旨が stderr に出ます（`engine/src/program/generate.cpp:20231-20237`）。`--prefill-head-alias` と不整合な正値の場合のエラー・終了コードは前節のとおりです。
 
 ## 根拠
 
-- 索引上の配置と scope: `docs/cli/README.md:12`、`docs/cli/README.md:1128-1135`、対象リンク `docs/cli/README.md:1282`。
-- 値の既定値: `src/program/generate.cpp:762-765`。
-- help 表示: `src/program/generate.cpp:931-932`。
-- parser の値変換と既定値上書き: `src/program/generate.cpp:2416-2421`、`src/program/generate.cpp:2669`。
-- 上限判定、環境変数による無効化、画像区間除外、診断用上書き: `src/program/generate.cpp:13057-13103`。
-- windows/batched 経路の選択と呼び出し: `src/program/generate.cpp:14065-14091`。verify windows 処理は `src/program/generate.cpp:13194-13253`。
-- non-finite 後の一回限りの無効化: `src/program/generate.cpp:9355-9360`、`src/program/generate.cpp:9653-9666`、`src/program/generate.cpp:12549-12557`、`src/program/generate.cpp:13065-13070`。
-- `--prefill-head-alias` との条件: `src/program/generate.cpp:5576-5588`。
-- prompt-cache tail 判定: `src/program/generate.cpp:9907-9912`。
-- parser の unknown argument と usage 経路: `src/program/generate.cpp:2787-2793`。
-- serve の区間エラー出力: `src/program/generate.cpp:14107-14118`。
-
-調査対象 checkout は commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`、branch `main` で、調査時点の `git status --short --branch` は `## main...origin/main` でした。作業ツリー変更は確認されませんでした。既存の build 済み CLI の revision を確認できないため、実行による `--help` 照合は行わず、同 revision のソース内 usage と parser を照合しました。
+- `engine/src/program/generate.cpp:1139-1143,1338-1340,4117` — 値の保持、help の説明、CUDA/HIP parser。
+- `engine/src/program/generate.cpp:13831-13833` — 指定有無を見た適応既定値の適用。
+- `engine/src/prefill/prefill.cpp:3563-3579`、`engine/include/strata/prefill/staged_fo_rule.hpp:32-52` — native layout、GPU 条件による既定値の決定。
+- `engine/src/program/generate.cpp:20223-20243,20414-20431,21551-21571` — request ごとの path 判定と verify window 処理。
+- `engine/src/program/generate.cpp:19243-19251,20231-20237,8443-8455` — 非有限 logits 後の一時無効化、および `--prefill-head-alias` との条件。
+- `engine/sycl/src/program/generate.cpp:759,915-916,2095` — SYCL 側の値既定、help、parser。

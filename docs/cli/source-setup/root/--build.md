@@ -1,63 +1,65 @@
 # `--build`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `source-setup` |
-| コマンド | `setup.py`（`./setup.sh`、`START-HERE.bat` などから起動） |
+| コマンド | `setup.py` / `setup.sh` / `START-HERE.bat` / update wrappers |
 | オプション | `--build` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。既定値は `False` |
+| 値 | 値を取らないフラグ。指定すると真になる（`terminal/setup.py:11535`）。 |
 
 ## 役割
 
-通常の Linux/Windows setup で、利用可能な既製 Strata エンジンを選ぶ代わりに、この checkout のソースから GPU エンジンをコンパイルします。画像 encoder が必要な場合はそれもビルドします。CMake build にはテストを含めません（`setup.py:5570-5575`, `setup.py:5608-5614`）。
+モデルのセットアップで既製 engine を選ぶ代わりに、対象 engine をこの Strata checkout のソースからローカルでコンパイルします。インストール済みモデルの更新と組み合わせる場合は `--update --build` で engine を再コンパイルします（`terminal/setup.py:9597-9625`、`terminal/setup.py:8497-8510`、`terminal/setup.py:6452-6458`）。
 
 ## 使い方
 
-Linux では次のように指定できます。初回 setup を行い、エンジンとモデルの準備後にサーバーを起動せず終了します。
+Linux の checkout でモデルのセットアップ時に engine をビルドする例です。`--no-start` を付けると、セットアップ後にモデルを起動しません。
 
 ```sh
-./setup.sh --build --no-start
+./setup.sh --setup --build --no-start
 ```
 
-Windows では `START-HERE.bat --build --no-start` を使います。`setup.sh` は引数を `setup.py` にそのまま渡し、Windows wrapper も同様に `%*` を渡します（`setup.sh:7-12,76`, `START-HERE.bat:44-55`）。
+Windows では同じ root parser を使う `START-HERE.bat` にフラグを渡せます。既存モデルの更新時は次のように指定します。
+
+```sh
+./setup.sh --update --build
+```
+
+`--update` はモデルを起動せずに更新処理を行います（`terminal/setup.py:11530-11535`、`terminal/setup.py:8497-8502`）。
 
 ## 値と既定値
 
-`argparse` の `action="store_true"` で定義されるため、値は不要で、未指定時は偽です。値の範囲や数値 validation はありません（`setup.py:8501-8501`）。
+値は不要で、既定では無効です。`argparse` の `store_true` で定義されており、数値・文字列・選択肢の validation はありません（`terminal/setup.py:11535`）。
 
 ## 実行時の動作
 
-- 通常の NVIDIA 経路では `--build` が真なら既製エンジンの取得を行わず、`build_engine()` に進みます。AMD HIP 経路（Linux）も同様にローカルビルドへ進みます（`setup.py:7383-7409`）。
-- NVIDIA のビルドは選択 GPU のアーキテクチャに合わせて CMake/Ninja の `strata` target をビルドし、生成エンジンと必要なライブラリを `engine/` または CUDA 12 用 `engine-cuda12/` に置き、`BUILD.json` にソース fingerprint などを記録します（`setup.py:5570-5586`, `setup.py:5600-5641`）。HIP は `build-hip/` から実行ファイルを `engine/` にコピーし、build metadata を記録します（`setup.py:4510-4564`）。画像 encoder も要求されていて未ビルドなら、別の CMake target として作成されます（`setup.py:5624-5639`）。
-- CUDA toolkit の選択は `--cuda`（または `STRATA_CUDA`）と GPU 世代に従います。`--prebuilt` は既製エンジンの場所を指定する設定ですが、通常経路では `--build` がその取得を迂回します（`setup.py:8509-8514`, `setup.py:7398-7409`）。
-- ビルドツールが不足している場合、NVIDIA 経路は Windows で `winget`、Ubuntu/Debian で apt を使った導入を案内・実行し、その他の Linux では手動導入を要求します。CMake/Ninja が不足している場合は build 用 Python package の導入を試みます。`--yes` は推奨回答を受け入れ、確認を省くための別フラグです（`setup.py:5410-5458`, `setup.py:5464-5475`）。
-- `--update` と併用した場合は、`update_install()` が `--build` を見て既製エンジン更新をスキップしますが、同関数内でコンパイルは実行しません（`setup.py:6682-6708`, `setup.py:8614-8619`）。
+通常のモデルセットアップでは、CUDA または Linux の HIP 経路で既製 engine の検索を飛ばし、`build_engine()` または `build_engine_hip()` を呼びます。コンパイル結果は Strata の engine 用フォルダーに置かれ、ビルド記録も保存されます。既存のローカルビルドが現在のソース・GPU アーキテクチャ等に合致している場合、ビルド関数は「すでにビルド済み」として戻ることがあります（`terminal/setup.py:9597-9631`、`terminal/setup.py:5656-5713`、`terminal/setup.py:6902-6957`）。
+
+`--update --build` は `update_install()` から `update_installed_engine(..., rebuild=True)` へ渡されます。既製 engine もローカル engine も再ビルド対象になり、通常の `--update` のように engine のバージョンやローカルソースの変更有無だけで更新を省略しません。モデルファイルは触らず、モデルも起動しません（`terminal/setup.py:8497-8518`、`terminal/setup.py:6452-6517`）。
+
+`--build` を付けただけの既存モデルの通常起動は、セットアップ用の engine 選択処理を通らず、build を実行しません。既存モデルの engine を再ビルドする目的では `--update --build` を使います。`--setup` や `--model` を指定する経路はセットアップ処理に入り、engine 選択を行います（`terminal/setup.py:11676-11698`、`terminal/setup.py:9597-9625`）。
 
 ## 適用条件と副作用
 
-- NVIDIA のコンパイルには CUDA Toolkit と C++ build tools が必要です。Windows では Visual Studio C++ build environment も必要です。HIP ビルドは Linux のみで、ROCm 環境・C++ compiler・git を必要とします（`setup.py:4532-4553`, `setup.py:5487-5501`, `setup.py:5410-5458`）。
-- コンパイルは `build/`、`build-cuda12/`、`build-hip/` などの build directory と `engine/` または `engine-cuda12/` に成果物・metadata を書き込みます。足りないツールの導入では OS package manager や Python package の取得が起きます（`setup.py:5479-5501`, `setup.py:5602-5641`）。
-- CPU に AVX2 がない場合は、通常の engine 選択に関わらず setup が `a.build = True` として互換 CPU 向けにコンパイルします。AVX2 非対応 CPU のサポートはソース上で experimental とされています（`setup.py:8845-8859`）。
-- Windows の AMD HIP は `--build` を指定してもローカルコンパイルしません。既製 engine が選ばれずエラーとなり、Linux でのビルドまたは別途 `tools\hip\build_windows.bat` で作成した package の利用を案内します（`setup.py:7390-7396`）。
-- `--backend sycl` は `sycl/setup_intel.py` へ処理を委譲します。SYCL engine は setup.py の `--build` で生成されず、事前に存在する `build-sycl-aot/strata` または `build-sycl/strata` を必要とします（`setup.py:8561-8564`, `setup.py:7321-7344`, `sycl/setup_intel.py:98-105`, `sycl/setup_intel.py:391-398`）。
-- アプリ内 setup（`CONTROL`）の Mac 経路はエンジンをコンポーネントとして扱い、ここではビルドしません（`setup.py:8561-8562`, `setup.py:8236-8241`, `setup.py:7386-7388`）。
-- DeepSeek-V4.1 の固有 engine 経路では、`--build` は配布 engine の取得・更新を抑止しますが、setup.py はその engine をコンパイルしません。既存の engine がなければ engine 不在で失敗し、既存の engine があればそれを使います（`setup.py:7947-7951`, `setup.py:8041-8058`）。
+- CUDA / HIP のローカルビルドではコンパイラや CMake 等の build tool が必要になり、engine ソースを構成してコンパイルし、engine ファイルや build metadata を書き込みます。CUDA のビルドは `build/`（CUDA 12 は `build-cuda12/`）などを使い、engine 出力先の既存ファイルを更新します（`terminal/setup.py:6902-6957`、`terminal/setup.py:6793-6820`）。
+- `--backend hip` の Windows 経路では既製 AMD engine が必要で、`--build` でローカルコンパイルには進みません。既製品が見つからない場合は案内を出して失敗します（`terminal/setup.py:9606-9612`）。
+- `--backend sycl` は Intel 用の別 setup に委譲され、同ファイルの通常 CUDA/HIP engine 経路とは異なります。Intel のセットアップはソースビルドを使う実験的経路です（`terminal/setup.py:11635-11638`、`terminal/setup.py:9297-9320`）。
+- Apple Silicon の通常 setup は Metal 用 `engine/metal/setup_mac.py` に委譲され、索引上も別 scope の `source-setup/mac/` です。この文書は `terminal/setup.py` の root scope を対象とします（`terminal/setup.py:9290-9294`、`docs/cli/README.md:1661-1668`、`docs/cli/README.md:1725-1731`）。
+- `CONTROL` モードは通常の engine step で `control_engine_step()` に分岐するため、root の `--build` が通常の CUDA/HIP engine ビルドを起動する経路とは異なります。shape engine（Hy4 / Inkling）の非 `CONTROL` 経路では `--build` により個別の `strata-hy4` / `strata-inkling` をローカルコンパイルします（`terminal/setup.py:9597-9603`、`terminal/setup.py:9512-9584`）。
+- `--build` は `--update` と他の setup 引数を排他的にはしません。通常のセットアップで実際にどの engine が対象になるかは、backend、モデルの shape、制御モードにより分岐します（`terminal/setup.py:9597-9625`）。
 
 ## 出力とエラー
 
-通常経路では setup が手順・コマンドを表示します。ビルドコマンドが失敗すると一度再試行し、再試行も失敗した場合は `run()` が失敗コマンドと終了コードを表示して `Setup stopped` を出し、終了コード 1 で停止します（`setup.py:5485-5501`, `setup.py:880-899`, `setup.py:825-830`）。ビルド後に既存の古いバイナリが残っていると判定された場合も、engine を入れ替えず失敗します（`setup.py:5615-5618`）。
+通常のコンパイルでは進行状況を表示し、完了時に engine の保存先を表示します。setup の `fail()` 経由の失敗はエラーを出力して終了コード 1 となり、JSONL 出力モードでは `error` event に `exit_code: 1` を含めます。例えば Windows AMD で既製 engine がない場合や、shape engine のビルドに CMake がない場合は失敗経路があります（`terminal/setup.py:1039-1056`、`terminal/setup.py:5702-5713`、`terminal/setup.py:9524-9528`、`terminal/setup.py:9606-9612`）。
 
 ## 根拠
 
-- parser と既定値: `setup.py:8501`
-- ラッパーからの引数委譲: `setup.sh:7-12,76`, `START-HERE.bat:44-55`
-- CUDA/HIP の既製版選択と build dispatch: `setup.py:7383-7415`
-- CUDA build、metadata、成果物配置: `setup.py:5570-5641`
-- HIP build と成果物配置: `setup.py:4510-4564`
-- build helper、再試行、失敗の終了コード: `setup.py:5479-5501`, `setup.py:880-899`, `setup.py:825-830`
-- 特殊経路（update、Mac、SYCL、DeepSeek）: `setup.py:6682-6708`, `setup.py:8236-8241`, `setup.py:7321-7344`, `setup.py:7947-8058`
-
-調査範囲は上記 revision の checkout 内の `setup.py` と該当 wrapper / SYCL setup 実装です。実機での build、各 OS の toolchain 導入結果、GPU 実行は確認していません。
+- parser と既定値: `terminal/setup.py:11530-11536`
+- update の分岐と再ビルド引数: `terminal/setup.py:8497-8518`、`terminal/setup.py:6452-6517`
+- 通常の engine 選択とローカルビルド: `terminal/setup.py:9597-9631`、`terminal/setup.py:5656-5713`、`terminal/setup.py:6902-6957`
+- setup build tool と CMake 実行: `terminal/setup.py:6793-6820`
+- backend / shape / platform 分岐: `terminal/setup.py:9290-9320`、`terminal/setup.py:9512-9603`、`terminal/setup.py:11635-11638`
+- 索引上のコマンド階層と scope: `docs/cli/README.md:1659-1671`、`docs/cli/README.md:1725-1731`

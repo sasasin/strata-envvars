@@ -1,54 +1,58 @@
 # `--no-fused-gdn`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout は `main...origin/main` で、`git status --short --branch` に未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（ネイティブ推論エンジンのトップレベル CLI） |
+| コマンド | `strata generate`（root scope） |
 | オプション | `--no-fused-gdn` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ |
+| 値 | 取らないフラグ |
 
 ## 役割
 
-対応する GDN 層で、融合 GDN カーネルを使わないようにします。実装の A/B 比較や診断に使えるスイッチです。CUDA/HIP 実装と SYCL 実装の両方に parser と切替処理があります（`src/program/generate.cpp:2785,3928`、`sycl/src/program/generate.cpp:2063,3006`）。
+GDN（gated delta network）の decode 処理で、条件を満たす場合に使う融合 native kernel 経路を無効にする診断・比較用フラグです。native GDN 自体を無効にするものではなく、native GDN が有効なら各処理を分割した kernel 呼び出しに切り替えます。
 
 ## 使い方
 
 ```sh
-strata generate --pack pack/full --tokens "1,2,3" --no-fused-gdn
+# native GDN と native BF16 を有効にして、decode の融合 GDN kernel を使わない
+strata generate --pack ./pack/full --tokens "1,2,3" --native-gdn --native-bf16 --no-fused-gdn
 ```
-
-`strata generate` の構文は `src/program/generate.cpp:806-812` に定義されています。実際の実行にはモデル pack と有効な入力トークンが必要です。
 
 ## 値と既定値
 
-値は不要です。オプションを省略すると `no_fused_gdn` は `false` のままで、融合 GDN は許可されます（`src/program/generate.cpp:607`、`src/core/layer.cpp:51`）。指定すると parser が `true` にします。値の範囲検証はありません。同じフラグの複数指定は同じ真値を設定するだけです（`src/program/generate.cpp:2785`）。値を後ろに付けず別引数で渡すと、その引数は別のオプションとして解析されます。
+値は不要です。指定されなければ内部値 `no_fused_gdn` は `false` で、融合を許可します。指定すると `true` になり、同じ引数を複数回指定しても同じ値のままです。数値などを後ろに置いてもこのオプションの値としては消費せず、別の引数として解析されます。専用の値検証はありません。
 
 ## 実行時の動作
 
-parser の値は `layer_set_fused_gdn(!o.no_fused_gdn)` に渡されます（`src/program/generate.cpp:3926-3929`）。通常の GDN 層では、融合前処理（畳み込み・正規化と alpha/beta 計算）と、GDN step・出力 norm の融合呼び出しを無効にします。代わりに、前処理は個別の処理へ、step と出力 norm は `native_gdn_step` と `native_gdn_out_norm` へ分けて実行します（`src/core/layer.cpp:280-307,321-345,347-369`）。SYCL 側も同じ条件と代替経路です（`sycl/src/core/layer.cpp:274-307,320-337,339-361`）。
+parser は `Options::no_fused_gdn` を立て、初期化時に `layer_set_fused_gdn(!o.no_fused_gdn)` へ反映します。既定では fusion switch は有効です（CUDA/HIP と SYCL の parser・設定箇所はそれぞれ `engine/src/program/generate.cpp:958,4266,6110`、`engine/sycl/src/program/generate.cpp:624,2212,3225`）。
 
-この切替は `native_gdn_enabled()` が有効な場合に融合処理の選択へ影響します。`--native` は `native_gdn` を有効にし、個別指定では `--native-gdn` が有効化します（`src/program/generate.cpp:2492,3263-3267,3937`）。ネイティブ GDN が無効なら融合条件が成立しないため、このフラグによる実行経路の変化はありません。融合前処理はさらに BF16 projection、有効な形状 `ssm_d_conv == 4` と `ssm_state_size == 128` が条件です。step と norm の融合は `ssm_state_size == 128` も条件です（`src/core/layer.cpp:282-283,349`）。
+実際に融合するかは、別途 native GDN が有効かにも依存します。`--native-gdn` または native preset が native GDN を有効にします（`engine/src/program/generate.cpp:1957,2595,6119`）。融合 switch が有効な場合でも、前段の畳み込み・正規化・alpha/beta 計算の融合には `native_bf16_projections`、`ssm_d_conv == 4`、`ssm_state_size == 128` が必要です。再帰 step と出力 norm の融合には native GDN と `ssm_state_size == 128` が必要です（`engine/src/core/layer.cpp:282-285,349-369`）。
 
-このフラグはセッション設定 fingerprint に `no_fused_gdn` として含まれます（`src/program/generate.cpp:9458-9467`）。したがって設定識別にも反映されます。直接のファイル・ネットワーク操作は確認できません。
+このフラグを指定すると、decode の前段は `native_gdn_conv_silu`、個別の Q/K 正規化、別々の alpha/beta 投影と gate 処理へ進み、step と出力 norm も `native_gdn_step` と `native_gdn_out_norm` に分かれます（同 `engine/src/core/layer.cpp:287-307,321-345,349-369`）。SYCL 側にも同じ条件分岐があります（`engine/sycl/src/core/layer.cpp:276-307,321-337,341-361`）。native GDN が無効、またはモデル形状等の融合条件を満たさないときは、該当箇所ですでに分割経路を通るため、このフラグによる切替はありません。`layer_verify_compatible` はこのフラグが無効化した場合に fused GDN kernel が無効である理由を返します（`engine/src/core/layer.cpp:537-546`）。
+
+この switch の参照先は `core/layer.cpp` の層処理です。prefill 側は別の GDN 実装（`engine/src/prefill/prefill.cpp:5196-5205,9334-9341`）を通り、この switch から切り替える処理は確認できません。
+
+serve のセッション設定 fingerprint にも `no_fused_gdn` が含まれ、設定の識別に使われます（CUDA/HIP: `engine/src/program/generate.cpp:14026-14029`、SYCL: `engine/sycl/src/program/generate.cpp:8204-8208`）。ソース上、このオプションによるファイル生成・削除や子プロセス起動は確認できません。
 
 ## 適用条件と副作用
 
-- `--verify` の検証窓は既定の fused native decode path との互換性を要求します。このフラグを指定すると fused GDN が無効になり、互換性チェックが失敗し、`verify: the fused native GDN kernels are off ...` のエラーになります（`src/core/layer.cpp:537-546`、`src/core/verify.cpp:732-735`）。SYCL でも同じチェックがあります（`sycl/src/core/layer.cpp:539-547`、`sycl/src/core/verify.cpp:493-495`）。
-- Qwen3.6-35B の専用経路は共通 parser より前に分岐します（`src/program/generate.cpp:2393-2407`）。専用 parser は通常の生成モードではこのフラグを認識せず、unknown option として終了コード 2 で拒否します。serve モードでは未知の `--...` 引数を警告して無視するため、このフラグも効果を持ちません（`src/qwen35/q36_engine.cu:3742-3795`）。
-- 通常 parser における未知引数は stderr に `unknown argument` と usage を出して終了コード 2 です（`src/program/generate.cpp:2787-2792`）。現行 `usage()` の表示には `--no-fused-gdn` の項目がありません（`src/program/generate.cpp:806-875`）。つまり parser は受理しますが、`--help` のオプション一覧からは確認できません。
+- 対象は `strata generate` の root 引数です。CUDA/HIP 実装と SYCL 実装の双方に parser と対応する decode layer 経路があります。
+- native GDN が無効の場合、融合 kernel はもともと選ばれないため、このフラグは実行経路を変えません。
+- 対応する融合条件を満たすモデルでは、GDN を構成する処理が融合 kernel から分割 kernel に切り替わります。性能や数値差の大きさはソースだけでは確定できません。
+- kernel 呼び出し中の例外は層名付きの `err` に設定され、処理関数は失敗を返します（`engine/src/core/layer.cpp:294,307,345,353-355,369`）。
+
+## 出力とエラー
+
+このフラグ固有の検証エラーやメッセージ出力はありません。別の未知引数がある場合は parser が `unknown argument: ...` と usage を stderr に出して終了コード 2 を返します（`engine/src/program/generate.cpp:4268-4273`）。
 
 ## 根拠
 
-- CUDA/HIP の parser・既定値・適用: `src/program/generate.cpp:607,2785,3926-3929`
-- SYCL の parser・適用: `sycl/src/program/generate.cpp:585,2063,3004-3007`
-- 融合経路と代替経路、条件: `src/core/layer.cpp:280-307,321-369`、`sycl/src/core/layer.cpp:274-307,320-361`
-- 検証との相互作用: `src/core/layer.cpp:537-549`、`src/core/verify.cpp:732-735`
-- Qwen3.6-35B の委譲と専用 parser: `src/program/generate.cpp:2393-2407`、`src/qwen35/q36_engine.cu:3742-3795`
-- 索引上の配置: `docs/cli/README.md:1227`（`strata-engine/root` の指定リンク）
-
-## 調査範囲
-
-ソース checkout の CUDA/HIP、SYCL、Qwen3.6-35B の該当 parser・使用箇所を確認しました。同一 revision の既存 CLI help は実行していません。CUDA/HIP と SYCL のビルド済みバイナリ、各 GPU での実動作・性能差は確認していません。
+- `engine/src/program/generate.cpp:958,4266` — 既定値 `false` と CUDA/HIP 側 parser。
+- `engine/sycl/src/program/generate.cpp:624,2212` — SYCL 側の既定値と parser。
+- `engine/src/program/generate.cpp:6110-6119`、`engine/sycl/src/program/generate.cpp:3223-3234` — layer switch と native GDN 設定の反映。
+- `engine/src/core/layer.cpp:282-307,321-369`、`engine/sycl/src/core/layer.cpp:276-307,321-361` — 融合条件と分割経路。
+- `engine/src/core/layer.cpp:537-549`、`engine/sycl/src/core/layer.cpp:539-551` — fused GDN の互換性判定と switch setter。
+- `engine/src/program/generate.cpp:14026-14029`、`engine/sycl/src/program/generate.cpp:8204-8208` — serve session fingerprint への反映。

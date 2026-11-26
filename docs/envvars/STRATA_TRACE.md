@@ -1,48 +1,61 @@
 # `STRATA_TRACE`
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Strata の起動・prompt 読み込み・serve/batch 処理の進行状況や所要時間、GPU 空きメモリなどを stderr に出す診断用スイッチです。通常の計算経路や CLI 設定を選ぶ変数ではありません。ただし CUDA/HIP 系の `mem_mark()` では値の先頭が `2` の場合、各メモリ計測地点で追加の device 同期とエラー状態の出力を行います。
+Strata engine と同梱の vision ツールが、起動・prompt 処理・serve 処理などの状態や所要時間を stderr に記録する診断スイッチ。engine の選択や通常処理は主に変えず、CUDA/HIP engine のメモリ記録では値が `2` で始まる場合に限り追加の GPU 同期とエラー状態の記録を行う。SYCL engine にはこの追加同期はない。vision tool は追加の F16 数え上げも行う。主な実装は `engine/src/program/generate.cpp`、`engine/src/prefill/prefill.cpp`、SYCL 版の同名ファイル、および `terminal/tools/vision/own/vit_gpu.cu` にある（例: `engine/src/program/generate.cpp:2218-2234`, `engine/sycl/src/program/generate.cpp:1363-1375`, `terminal/tools/vision/own/vit_gpu.cu:721-727, 952-954`）。
 
-読み取りは `src/program/generate.cpp` と `src/prefill/prefill.cpp`、および SYCL 版の同名ソースにあります。設定を CLI 引数で上書きする処理や、Strata がこの値を子プロセスへ渡す処理は見つかりませんでした。`STRATA_TRACE_ADAPT` は別の環境変数であり、適応層専用ログの切替です。
+この名前を読むコードは複数の実行経路にある。serve loop では request の drain、prompt read、checkpoint、slot の貸し借りなどの時間・状態を記録し、prefill では prompt chunk と routed stream の ring entry 数を記録する（`engine/src/program/generate.cpp:16069-16078, 23728-23742`; `engine/src/prefill/prefill.cpp:4387-4395, 7735-7740`）。これらの診断出力は CLI 引数で有効・無効を切り替える実装ではない。
+
+起動時にも、GPU memory mark、KFD quiet の設定状態、ROCm kpack path、card node の CPU 配置、prompt buffer を loan しない判定、file tier の切替理由などを条件付きで記録する。HIP の launch probe が成功した場合の trace 行もある。probe が失敗した場合は `STRATA_TRACE` の有無によらず診断理由を出して終了コード 2 で終わる（`engine/src/program/generate.cpp:2200-2214, 3760-3767, 4352-4363, 4684-4693, 9554-9566, 12231-12243`）。
 
 ## 値と判定
 
-| 状態・値 | Strata の判定 |
-|---|---|
-| 未設定 | 対象ログを出さない。`mem_mark()` は何もしない。 |
-| 空文字 | 設定済みとして扱い、通常の trace ログを有効にする。 |
-| 任意の非空文字列（例: `0`, `1`, `true`, `false`, `abc`） | 文字列全体の parse や数値検証はなく、存在するだけで通常の trace ログを有効にする。 |
-| 先頭文字が `2`（例: `2`, `2abc`） | 同様にログを有効にし、CUDA/HIP 系 `mem_mark()` では追加同期と device 状態ログも有効にする。 |
+engine のほとんどの読み取りは `getenv` の返り値が null かどうかだけを見る。したがって未設定なら無効、設定されていれば空文字を含めて有効であり、文字列の数値変換や真偽値 parse はしない。`0`、`false`、`no`、空文字も通常の診断を有効にする。例外は CUDA/HIP 共通 engine の `mem_mark` で、診断有効判定は同じく設定有無だが、追加同期は値の先頭文字だけを `'2'` と比較する（`engine/src/program/generate.cpp:2218-2234`）。
 
-SYCL 版も設定の有無だけでメモリ trace を有効にしますが、同版の `mem_mark()` に値 `2` による追加同期分岐はありません。参照: `src/program/generate.cpp:1951-1967`, `sycl/src/program/generate.cpp:1322-1334`。
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| engine の通常の trace 判定 | trace 出力なし | 空文字、`0`、`1`、`true`、その他すべての非 null 値 | なし（設定されていれば有効） |
+| CUDA/HIP `mem_mark` の追加同期 | trace なし、同期なし | `2`、`2anything` など先頭が `2` の値 | 空文字、`0`、`1`、` 2` など先頭が `2` 以外の値。VRAM 空き量の trace は出る |
+| SYCL `mem_mark` | VRAM trace なし | 空文字を含むすべての設定値 | なし（設定されていれば有効）。`2` 固有の同期分岐はない |
+
+文字列全体の検証、大文字小文字の扱い、空白除去、数値範囲検査は行わない。CLI・設定ファイル・他の環境変数より優先する値の選択処理もなく、ここでの判定は設定有無または `mem_mark` の先頭文字判定のみ。
 
 ## 有効になる条件
 
-- **起動時のメモリ計測**: `mem_mark()` が呼ばれる起動経路で有効です。CUDA/HIP 系では重み、session、expert cache、profile fill、prompt path 等の確保後に呼び出され、各地点の MiB 空き容量を出力します（`src/program/generate.cpp:5168,5190,6724,7247,7805,8335,8452,9023,9145,11218,11285,11777,20034,20108,20384,20433`）。SYCL 版にも対応する計測地点があります（`sycl/src/program/generate.cpp:4703,5053,5245,5662,5785,7410,7763,13082,13121`）。
-- **prompt 処理**: CUDA/HIP 系では batched prompt の各 chunk で stage と経過時間を記録し、routed stream が有効な場合はコピー数と未使用 ring entry 数を追加出力します（`src/prefill/prefill.cpp:3464-3479,6236-6247`）。SYCL 版も各 prompt chunk を記録します（`sycl/src/prefill/prefill.cpp:2548-2551`）。routed stream の集計ログは `rs_on` かつ issuer thread の join 時だけです。
-- **serve/batch 処理**: CUDA/HIP 系は serve ループで一度環境を確認して trace 関数を作り、要求処理の区間、prompt read、cache slot lend、batch decode、admission の時間などを記録します（`src/program/generate.cpp:13760-13770,15335-15348,17086-17095,17751-17765,17940-17953,19702-19715`）。SYCL 版も serve ループで設定有無を取得し、slot lend、batch decode、read のログを出します（`sycl/src/program/generate.cpp:9032-9039,10952-10959,11040-11052,11145-11152`）。
-- **個別の補助ログ**: HIP の大きな prompt chunk 起動 probe が通った時のログ、file tier の再判定時の RAM 状態、prompt buffer サイズも設定有無で出力されます（`src/program/generate.cpp:1932-1947,10495-10508,20033-20044`）。
-- **checkpoint の詳細計時**: CUDA/HIP 系の serve 実装で checkpoint 処理が通る際、sync/save/eviction の時間を記録します。checkpoint が無効、またはその経路を通らない場合は該当ログはありません（`src/program/generate.cpp:12331-12338,12415-12430,12431-12460,12507-12512`）。
-
-この変数は診断出力を追加するもので、ログが出ること自体が機能の実行条件を変えるわけではありません。例外は値先頭 `2` の CUDA/HIP `mem_mark()` 同期です。OS や model 状態による一般的な有効条件はなく、上記のコード経路が実行されるかどうかで各ログの有無が決まります。
+- 対象の Strata engine build に該当する診断コードが含まれ、そのコード経路が実行されること。共通 engine の `mem_mark` は CUDA/HIP 側、別実装は SYCL 側にあり、両者で追加同期の有無が異なる（`engine/src/program/generate.cpp:2218-2234`; `engine/sycl/src/program/generate.cpp:1363-1375`）。
+- request の timing 行は serve loop の処理を通った場合に出る。prompt chunk / routed stream の行はそれぞれ該当する prefill 経路が使われた場合に限られる（`engine/src/program/generate.cpp:16069-16078`; `engine/src/prefill/prefill.cpp:4387-4395, 7735-7740`; `engine/sycl/src/prefill/prefill.cpp:2826-2829`）。
+- KFD quiet の arena 登録、load order、signal handler、staged copy に関する trace は Linux HIP build の条件付きコード内にあり、該当する KFD quiet 分岐が成立した場合だけ出る（`engine/src/program/generate.cpp:3750-3762, 4346-4364, 16341-16344`）。
+- SYCL prefill の Battlemage grouped projection 行は `fp16_group` が使われる場合だけ、expert window fallback の理由行は fallback がまだ記録されておらず、window mode が enabled か `STRATA_TRACE` が設定されている場合に出る（`engine/sycl/src/prefill/prefill.cpp:4931-4937, 5945-5954`）。
+- 同梱 vision ツールでは GPU vision model の読込時に設定有無を `m.trace` に保存する。BF16 matrix を F16 へ扱う経路で、行列の F16 表現に関する数え上げと stderr の `vit-f16 trace:` 行が有効になる（`terminal/tools/vision/own/vit_gpu.cu:721-727, 952-954, 1014-1018`）。
+- CLI オプションや他の環境変数が `STRATA_TRACE` 自体を無効化・上書きする処理は確認できなかった。個々のログには上記の実行経路・追加条件がある。
 
 ## 実行時の詳細
 
-`mem_mark()` は `STRATA_TRACE` の `getenv()` 結果を `static` 変数に保持します。設定されていれば `cudaMemGetInfo`（SYCL は device memory info）で空き容量を取得し、`strata trace: <MiB> MiB free after <地点>` を stderr に出します。CUDA/HIP 系で値の先頭文字が `2` なら、さらに `cudaDeviceSynchronize()` と `cudaGetLastError()` を呼び、`strata trace: device ok/ERROR after ... (sync: ..., last error: ...)` を出力します。この同期結果による明示的な終了・fallback 分岐はありませんが、同期自体は追加の診断処理です（`src/program/generate.cpp:1951-1967`）。
+読み取りの時期はコード経路ごとに異なる。`engine/src/program/generate.cpp` の通常の分岐や CUDA/HIP trace 出力の多くは各箇所で `getenv` を評価する。一方、CUDA/HIP `mem_mark` は初回呼出し時に環境文字列へのポインタを関数内 static に保存し、後続の各マークでそれを使う。値が `2` で始まる場合、各 `mem_mark` は空き VRAM を記録した後 `cudaDeviceSynchronize` と `cudaGetLastError` を呼び、`ok` / `ERROR` と両 API のエラー文字列を出すが、結果で Strata の処理を中止・失敗扱いにはしない（`engine/src/program/generate.cpp:2218-2234`; 呼出し例: `6036-6036, 6058-6058, 7765-7765, 9047-9047, 10589-10590`）。
 
-その他の読み取りのタイミングは一律ではありません。serve trace は serve ループに入る時点で bool にし、そのループ中の各 log site で使います（`src/program/generate.cpp:13760-13769`）。prompt chunk のログや routed-stream 集計、HIP launch-probe 成功ログ、file-tier 再判定ログ、prompt buffer summary はそれぞれの処理時に `getenv()` を呼びます（`src/prefill/prefill.cpp:3472,6242`; `src/program/generate.cpp:1940,10503,20035`）。checkpoint trace は該当 serve 実行内で bool にします（`src/program/generate.cpp:12331-12338`）。したがって、プロセス開始時に一度だけ全用途の値を読む実装ではありません。通常の OS 環境変数はプロセス外から実行中に書き換えられないため、実用上は起動前に設定します。
+SYCL の `mem_mark` は初回呼出し時に設定有無を static bool に保存し、以後はその値で VRAM 空き量を記録する。serve loop の `trace` と checkpoint の `ckpt_trace` も各処理のセットアップ時に bool として読み取られ、その serve 処理中の複数ログで共有される（`engine/sycl/src/program/generate.cpp:1363-1375`; `engine/src/program/generate.cpp:14579-14585, 16069-16078`）。vision tool はモデル初期化時に `m.trace` へ保存する（`terminal/tools/vision/own/vit_gpu.cu:952-954`）。Strata 内でこの環境変数を書き換える処理は見つからなかった。よって通常はプロセス起動前に設定する。実行中に環境を書き換える仕組みが外部から使われる場合でも、static/local に保存済みの判定には反映されない一方、その都度 `getenv` する箇所は次回評価時に読む。
 
-無効値による parse error、警告、終了経路はありません。追加出力先は stderr で、trace を設定しない場合も通常の進捗表示や処理エラー出力は別途行われます。serve loop の trace 行に steady-clock の時刻を付ける仕様は Strata docs に記載されています（`docs/DETAILS.md:1614`）。同資料は routed-stream の chunk ごとのコピー/破棄件数（`docs/DETAILS.md:1141-1144`）、`docs/BATCHING.md:126` は admission の段階別時間を説明しており、いずれも上記実装と一致します。
+trace が出ない場合でも同じ状態・計算を進める診断分岐が大半である。例外として CUDA/HIP の `mem_mark` で値が `2` から始まると同期を挿入するため、診断に追加待ち時間が入り、遅延していた GPU エラーをそのマークで観測できる。Strata はその結果をログに記すだけで、この分岐から終了・失敗経路へは移らない（`engine/src/program/generate.cpp:2225-2234`）。
+
+## ログと測定値
+
+出力先は stderr。代表的な実装文字列は次のとおり。
+
+- CUDA/HIP startup memory trace: `strata trace: %lld MiB free after %s`。値が `2` で始まると続けて `strata trace: device %s after %s (sync: %s, last error: %s)` を出す（`engine/src/program/generate.cpp:2220-2233`）。
+- prompt 処理: `strata trace: prompt chunk ...`、`strata trace: routed stream: ... ring entries copied, ... dropped ...`（`engine/src/prefill/prefill.cpp:4387-4395, 7735-7740`; SYCL の chunk 行は `engine/sycl/src/prefill/prefill.cpp:2826-2829`）。
+- serve timing: `strata trace: %s %lld %lld %.1f ms`。checkpoint や batch admission では sync/save/evict や各 phase の時間を別の `strata trace:` 行に出す（`engine/src/program/generate.cpp:16069-16078, 14663-14707, 23728-23742`）。
+- vision BF16/F16 count: `vit-f16 trace: ...`（`terminal/tools/vision/own/vit_gpu.cu:1014-1018`）。
+
+`docs/DETAILS.md:1322-1330` は routed stream の chunk ごとの copied/dropped ring entry を `STRATA_TRACE=1` で記録すると説明しており、実装の presence 判定とログ内容に一致する。ここに記載した調査では新たな性能測定をしていない。
 
 ## 根拠
 
-- 値の読み取り、cache、追加 device 同期: `src/program/generate.cpp:1951-1967`; SYCL: `sycl/src/program/generate.cpp:1322-1334`。
-- prompt chunk と routed stream: `src/prefill/prefill.cpp:3464-3479,6236-6247`; SYCL: `sycl/src/prefill/prefill.cpp:2548-2551`。
-- serve trace bool と timestamped trace helper: `src/program/generate.cpp:13760-13770`。
-- admission / checkpoint / read / lend trace: `src/program/generate.cpp:12331-12338,12415-12430,12431-12460,12507-12512,15335-15348,17086-17095,17751-17765,17940-17953,19702-19715`。
-- 起動 probe / file tier / prompt buffers: `src/program/generate.cpp:1932-1947,10495-10508,20033-20044`。
-- SYCL serve trace: `sycl/src/program/generate.cpp:9032-9039,10952-10959,11040-11052,11145-11152`。
-- Strata の記述との照合: `docs/DETAILS.md:1141-1144,1614`; `docs/BATCHING.md:126`。
+- `engine/src/program/generate.cpp:2218-2234` — CUDA/HIP `mem_mark` の設定有無、値先頭 `2` の同期とログ。
+- `engine/src/program/generate.cpp:14579-14585, 16069-16078, 18419-18431, 23728-23742` — checkpoint・serve timing の読み取りと trace 出力。
+- `engine/src/program/generate.cpp:3750-3767, 4346-4364, 4684-4693, 9554-9566, 12231-12243, 16341-16344` — 条件付き KFD quiet、card node、file tier、prompt buffer などの診断出力。
+- `engine/src/prefill/prefill.cpp:4387-4395, 7735-7740` — prompt chunk と routed stream trace。
+- `engine/sycl/src/program/generate.cpp:1363-1375, 9461-9467` — SYCL VRAM mark と request trace。
+- `engine/sycl/src/prefill/prefill.cpp:2826-2829, 4931-4937, 5891-5899, 5945-5954` — SYCL prompt・Battlemage・expert window 診断。
+- `terminal/tools/vision/own/vit_gpu.cu:721-727, 952-954, 1014-1018` — vision tool の設定読取と F16 count trace。

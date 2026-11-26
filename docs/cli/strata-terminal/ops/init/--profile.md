@@ -1,6 +1,6 @@
-# `strata ops init --profile`
+# `--profile`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,61 +8,52 @@
 | コマンド | `strata ops init` |
 | オプション | `--profile` |
 | 別名 | なし |
-| 値 | 必須の profile 名（文字列） |
+| 値 | 保存済み serving profile の名前（必須） |
 
 ## 役割
 
-初期化対象となる保存済み serving profile を選び、その profile に紐づく operation recipe の初期セットを用意します。profile 自体を新規作成するオプションではありません。profile は事前に保存されている必要があります（`strata_cli/cli.py:1395-1398`、`strata_control/recipes.py:153-157`）。
+初期化する operation recipe の保存先となる serving profile を指定する。指定した profile に、標準 recipe `restart`、`calibrate`、`check` を作成する。profile の JSON パスではなく、保存済み profile の ID を渡す。
 
 ## 使い方
 
 ```sh
-strata ops init --profile PROFILE_NAME
+# saved serving profile "local" に標準 recipes を初期化
+strata ops init --profile local
 ```
-
-`PROFILE_NAME` は作成済みの profile ID に置き換えます。機械可読な成功結果が必要なら `--output json` または `--json` を併用できます。
 
 ## 値と既定値
 
-- 値は必須です。parser は `--profile` を `required=True` で登録し、既定値や型変換は指定していません（`strata_cli/cli.py:255-267`）。値の省略は argparse の usage error になります。
-- profile 名は英小文字で始まり、続く文字は英小文字・数字・`_`・`-`、長さは最大64文字です。正規表現に一致しない値は profile 読み込み時に拒否されます（`strata_control/profiles.py:25`、`strata_control/profiles.py:48-55`）。空文字、英大文字、空白、64文字を超える名前も受理されません。
-- 名前の検証後、profile は `STRATA_PROFILE_DIR` があればそのディレクトリから、それ以外は Windows では `%APPDATA%/Strata/profiles`（未設定時はホーム下の `AppData/Roaming/Strata/profiles`）、POSIX では `$XDG_CONFIG_HOME/strata/profiles`（未設定時は `~/.config/strata/profiles`）から読み込まれます（`strata_control/profiles.py:38-45`）。
+値は必須で、parser 上の既定値はない。値の文字列形式は parser では制約されず、その後の profile 読み込みで検証される。profile ID は小文字 `a-z` で始まり、続く文字は小文字英字・数字・`_`・`-`、全体で1〜64文字でなければならない。空文字、パス、拡張子付きの JSON ファイル名は profile ID として無効。
+
+指定した profile が保存されていない場合も失敗する。つまりこのオプションは profile の作成やパス指定を行わず、事前に `strata profile create` 等で作成された profile を参照する。
 
 ## 実行時の動作
 
-`strata ops init` の parser は `--profile` をこのサブコマンドを含む各 `ops` action に必須登録します。`init` の handler は値を `recipes.initialize(a.profile)` に渡し、その処理はまず対象 profile を読み込みます（`strata_cli/cli.py:255-267`、`strata_cli/cli.py:1391-1398`、`strata_control/recipes.py:153-157`）。このオプションの適用対象は `ops init` です。
+`strata ops init` は `--profile` の値を recipe 初期化関数にそのまま渡す。profile を読み込んだ後、`restart`（`runtime.restart`）、`calibrate`（`engine.calibrate.measure`）、`check`（`components.verify`）の順に既定 recipe を確認する。まだ存在しないものだけを作成し、同じ名前・同じ kind の recipe がすでにあれば再利用するため、再実行は冪等。既存 recipe の内容は上書きしない。既存の同名 recipe の kind が期待値と異なる場合はエラーになる。
 
-初期化される recipe は次の3つです（`strata_control/recipes.py:153-157`）。
-
-| ID | 種別 | 初期パラメーター |
-| --- | --- | --- |
-| `restart` | `runtime.restart` | `startup_wait_s: 300` |
-| `calibrate` | `engine.calibrate.measure` | profile ディレクトリ下の `.reports` を指す絶対パス `report_dir` |
-| `check` | `components.verify` | 空のパラメーター |
-
-recipe は profile ディレクトリ内の `.ops/<profile>/` に保存されます。新規作成時は既存ファイルを排他的に作成するため上書きせず、ファイル mode は `0600` です。POSIX では保存ディレクトリとファイルの owner-only 条件も確認します（`strata_control/recipes.py:38-59`、`strata_control/recipes.py:130-150`、`strata_control/recipes.py:153-177`）。
+recipe は profile ディレクトリ下の `.ops/<profile>/<name>.json` に保存される。recipe ディレクトリとファイルは owner-only として作成され、POSIX では既存のディレクトリやファイルが symlink または不適切な権限の場合に拒否される。profile ディレクトリのルートは `STRATA_PROFILE_DIR` が設定されていればその値、なければ OS ごとの既定設定ディレクトリとなる。
 
 ## 適用条件と副作用
 
-- 対象 profile が読み込み可能であることが前提です。存在しない profile は「保存されていない」旨のエラーになり、`strata profile create` を案内します（`strata_control/profiles.py:150-166`）。
-- 既定 ID の recipe がすでに存在する場合、内容を読み込み検証します。種別が期待値と同じならその recipe は保持され、新規作成一覧には含まれません。異なる種別なら初期化はエラーになります（`strata_control/recipes.py:158-177`）。
-- 新規 recipe があると `.ops` 以下にディレクトリと JSON ファイルを作成します。profile ファイル自体を書き換える処理はありません（`strata_control/recipes.py:130-150`、`strata_control/recipes.py:153-177`）。
-- 同時実行などで作成時に同名ファイルが先にできた場合は、既存 recipe を読み直し、期待する種別ならそのまま続行します（`strata_control/recipes.py:134-150`、`strata_control/recipes.py:165-176`）。
+- `--profile` は `ops` の全サブコマンドで共通に登録されるが、この文書の対象 `init` では必須の保存済み profile ID として働く。
+- profile 本体を更新せず、recipe 用のディレクトリと、欠けている標準 recipe ファイルを新規作成する。recipe ファイル作成時は排他作成を使い、同時作成で既に存在する場合は読み直す。
+- `--output json`（または共通 alias の `--json`）を併用すると、成功結果に profile 名と今回新規作成した recipe 名の配列が含まれる。省略時は作成名の一覧、または `Recipes already initialized` を表示する。
 
 ## 出力とエラー
 
-- 成功時の人間向け出力は、新規作成があれば `Created: restart, calibrate, check` のように作成 ID を列挙し、すべて初期化済みなら `Recipes already initialized` です。終了コードは `0` です（`strata_cli/cli.py:1395-1398`、`strata_cli/cli.py:535-542`）。
-- `--output json` または `--json` では `{ "schema_version": 1, "ok": true, "profile": ..., "created": [...] }` 形式を stdout に出します（`strata_cli/cli.py:1391-1398`、`strata_cli/cli.py:535-542`、`strata_cli/cli.py:508-515`、`strata_cli/cli.py:2232-2236`）。
-- profile 名など通常の入力エラーは `ProfileError` / `ValueError` として処理され、human 出力では `strata: <message>` を stderr に出して終了コード `2`（または例外が指定するコード）を返します。保存 profile がない場合や読み込み可能な recipe でない場合はコード `5` です（`strata_control/profiles.py:30-35`、`strata_control/profiles.py:150-166`、`strata_control/recipes.py:153-177`、`strata_cli/cli.py:2166-2173`、`strata_cli/cli.py:527-532`）。
-- `--quiet` は `ops init` にも登録されますが、quiet 時に抑制されるのは stdout の人間向け情報です。JSON 出力では `_run` を通常どおり実行するため、JSON は抑制されません（`strata_cli/cli.py:508-515`、`strata_cli/cli.py:2232-2248`）。
+成功時は終了コード `0`。人間向け出力は `Created: <名前一覧>`、変更がなければ `Recipes already initialized`。JSON 出力は `ok: true`、`profile`、`created` を含む。
+
+profile 名が不正、profile が未保存、または既存 recipe が不正・期待する kind と異なる場合はエラーになる。通常の `ValueError` 系は `strata: <message>` を stderr に出し、例外に指定された終了コードを返す（profile の形式エラーは `2`、未保存 profile や recipe の安全性・読込エラーは主に `5`）。JSON モードでは `{ "ok": false, "error": ... }` を stdout に出す。ファイル操作の `OSError` は整形したエラーを返し、CLI の一般的な file operation error code は `6`。
 
 ## 根拠
 
-- 索引上の配置・コマンド階層・リンク: `docs/cli/README.md:476-484`。
-- parser 定義と適用スコープ: `strata_cli/cli.py:255-267`。
-- `--profile` の初期化処理への引き渡しと成功文言: `strata_cli/cli.py:1391-1398`。
-- profile ID と保存先、profile 読み込み失敗: `strata_control/profiles.py:25`、`strata_control/profiles.py:38-55`、`strata_control/profiles.py:150-166`。
-- 初期 recipe、既存 recipe の扱い、保存処理: `strata_control/recipes.py:117-177`。
-- help の補助確認: 同一 checkout の `python strata.py ops init --help` は `--profile PROFILE` を必須として表示し、parser 定義と一致しました。
-
-調査範囲は上記 commit の source checkout です。別の Release artifact やインストール済み CLI の挙動は照合していません。
+- `terminal/strata_cli/cli.py:283-295` — `ops init` の parser 階層。`--profile` は必須で値型・既定値・choices は指定されていない。
+- `terminal/strata_cli/cli.py:539-546` — `ops` の各サブコマンドに `--json` と `--quiet` を追加。
+- `terminal/strata_cli/cli.py:1461-1468` — `init` が profile を初期化関数に渡し、成功メッセージと JSON payload を構成。
+- `terminal/strata_control/recipes.py:32-59` — recipe profile ID の形式、保存先、ディレクトリ symlink・権限の確認と作成。
+- `terminal/strata_control/recipes.py:153-177` — profile 読込後の標準 recipe 名・kind、既存項目の検査、欠落項目の作成、および返却値。
+- `terminal/strata_control/recipes.py:130-150` — recipe の排他新規作成、0600 指定、書込失敗時の部分ファイル削除。
+- `terminal/strata_control/private_files.py:1-5` — private directory/file の POSIX mode と Windows ACL の設計。
+- `terminal/strata_control/profiles.py:25,38-50,153-174` — profile ID の検証、profile 保存ディレクトリ、未保存 profile と破損時のエラー。
+- `terminal/strata_cli/cli.py:558-573,2248-2265` — 成功・失敗の出力先と終了コードの処理。
+- `terminal/strata_cli/cli.py:2335-2339` — `--json` を `--output json` として扱う処理。

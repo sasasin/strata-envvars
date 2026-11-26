@@ -1,6 +1,6 @@
-# `--open`
+# `strata launch --open`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。対象 checkout は `main...origin/main` で未コミット変更なし。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,47 +8,50 @@
 | コマンド | `strata launch` |
 | オプション | `--open` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。指定すると真になる（`store_true`）。 |
+| 値 | なし。`argparse` の `store_true` フラグ |
 
 ## 役割
 
-サーバーが serving 状態になった後、Strata のサーバーページを既定のブラウザーで開きます。既定ではブラウザーを開きません。
+サーバーが起動した後、そのサーバーの Web ページを既定のブラウザーで開きます。省略時はブラウザーを開きません。ブラウザーを開く処理は Terminal CLI 側にあり、起動設定の `open_browser` を有効にしたり、サーバーへ `--open` を転送したりするものではありません。
 
 ## 使い方
 
 ```sh
-strata launch --preset "Office" --no-tui --open
+# モデルを起動し、サーバーが利用可能になったらブラウザーで開く
+strata launch --model q2_0 --no-tui --open
 ```
 
-`--open` は preset や model の指定に追加できます。`--no-tui` を付けない対話式起動でも、起動後に monitor を表示する経路で有効です。
+`--no-tui` を付けない対話画面から起動する場合も、`strata launch --open` を指定すると、起動完了後にページを開きます。
 
 ## 値と既定値
 
-値・引数はありません。省略時はブラウザーを開かず、複数回指定しても真偽値のままです。parser 側に個別の値 validation はありません。`strata launch --open` のように起動対象を指定せず、対話可能な TTY もない場合は、起動対象を明示するようエラーになります。`--open` 自体は起動対象を選びません。
+値を取りません。parser は `action="store_true"` で登録しているため、指定すると真、未指定では偽です。別名はなく、複数回指定しても同じ真偽値として扱われます（`terminal/strata_cli/launch/cmd.py:141-151`）。
 
 ## 実行時の動作
 
-- フラグは TUI 起動時に `open_page` として渡されます。サーバー起動後、結果が serving であれば `webbrowser.open(url)` を呼びます。TUI 経路では `result.urls[0]` が選ばれ、URL がなければ `http://127.0.0.1:<port>` に fallback します。Cloudflare access の URL 一覧は tunnel URL が先頭になるため、TUI 経路では tunnel URL を開きます（`strata_cli/launch/app.py:404-412,471-474`、`strata_cli/launch/access.py:285-296`）。
-- 非 TUI の人間向け出力では、URL 一覧から `127.0.0.1` を含む URL を優先し、なければ先頭 URL を開きます。現在の URL 生成処理では通常 localhost URL が一覧に含まれます（`strata_cli/launch/cmd.py:806-822`、`strata_cli/launch/access.py:285-296`）。
-- `strata launch` はサーバー設定の `open_browser` を常に `False` にし、設定内の engine 引数から `--open` を取り除きます。ブラウザー起動は launch CLI 側の明示指定で行われ、エンジン任せではありません（`strata_cli/launch/runner.py:374-388`）。
+フラグ起動では、`Runner.run()` が serving 状態を返した後、人向け出力経路で開く URL を選び、`--open` が指定されていれば `open_page()` を呼びます。URL は `127.0.0.1` を含むものを優先し、なければ返された URL の先頭を使います（`terminal/strata_cli/launch/cmd.py:967-999`）。対話画面ではフラグを画面処理へ渡し、結果が serving の場合にその URL を開いてから monitor を開始します（`terminal/strata_cli/launch/cmd.py:867-871, 947-948`; `terminal/strata_cli/launch/app.py:693-695, 713-730`）。
+
+起動用設定を組み立てる際、`open_browser` は常に `false` にされ、設定内の既存 `args` にある `--open` も取り除かれます。したがってこのオプションの作用は CLI 側の明示的なブラウザー起動に限定されます（`terminal/strata_cli/launch/runner.py:724-749`）。サーバー自身にも別の `--open` parser とブラウザー起動処理がありますが（`terminal/serve/server.py:9195, 9746-9751`）、`strata launch` の設定ではそれを有効化しません。
 
 ## 適用条件と副作用
 
-ブラウザーを開くのは起動結果が `serving` のときです。`--plan` は計画を表示して終了し、`--output json` は成功結果を JSON 出力して終了するため、どちらもブラウザーを開きません。管理操作（preset 一覧・削除、status、stop、show-key）も起動処理より先に終了します。既に同じ設定で serving 中の場合は runner が再利用結果を返すため、通常の人間向け経路ではその URL を開きます（`strata_cli/launch/cmd.py:659-676,697-710,735-760,784-805`、`strata_cli/launch/runner.py:1516-1521`）。
-
-ブラウザー起動には Python 標準の `webbrowser` を使います。呼び出しが例外を送出した場合は握りつぶし、`webbrowser.open()` が偽を返した場合も追加エラーを出しません。したがってブラウザーが開かなくてもサーバー自体は止めず、アドレス表示など後続の案内を続けます（`strata_cli/launch/cmd.py:529-535,806-829`、`strata_cli/launch/app.py:471-475`）。
+- 通常起動でサーバーが serving になり、人向け出力経路に到達した場合に働きます。起動結果が serving でなければ呼び出されません（`terminal/strata_cli/launch/cmd.py:967-999`）。
+- 対話画面でも serving の場合に限り、起動後にブラウザーを開きます（`terminal/strata_cli/launch/app.py:713-730`）。
+- `--plan` は計画を表示して終了し（`terminal/strata_cli/launch/cmd.py:897-925`）、`--output json` は起動結果を JSON 出力して終了するため（同 `975-979`）、どちらもブラウザーを開きません。
+- `--list-presets`、`--delete-preset`、`--stop`、`--status`、`--show-key` も起動処理より前に分岐して終了する管理モードです（`terminal/strata_cli/launch/cmd.py:766-815`）。これらのモードに `--open` を併記してもページを開く処理には到達しません。
+- 実際にブラウザーを開く関数は Python の `webbrowser.open(url)` を呼びます。OS の既定ブラウザー起動につながる副作用があります（`terminal/strata_cli/launch/cmd.py:625-631`）。
 
 ## 出力とエラー
 
-このオプション固有の validation error はありません。ブラウザー起動失敗は標準エラーや警告として報告されません。通常の起動失敗は `strata launch` 共通のエラー経路を通り、人間向けでは `strata: ...` を stderr に出し、失敗コードを返します。起動結果が serving でない場合は通常の結果メッセージを出して終了し、ブラウザー処理には入りません（`strata_cli/launch/cmd.py:642-649,784-800,832-837`）。
+`webbrowser.open()` が偽を返す場合や例外を送出する場合、関数は `False` を返して終了し、CLI はその結果を確認しません。したがってブラウザーを起動できなくても、この処理自体は警告や非ゼロ終了コードを出しません（`terminal/strata_cli/launch/cmd.py:625-631, 997-1000`）。サーバーの起動失敗は `--open` のブラウザー起動より前に扱われ、`LaunchError` は `fail()` 経由でエラー出力・終了コードになります（同 `950-961`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:136` — `--open` の parser 定義（値なし、`store_true`）。
-- `strata_cli/launch/cmd.py:529-535` — 標準 `webbrowser.open()` の呼び出しと例外抑制。
-- `strata_cli/launch/cmd.py:688-710,780-783,793-805,820-829` — TUI・plan・JSON・非 TUI の分岐とブラウザー起動条件。
-- `strata_cli/launch/runner.py:374-388,1516-1521` — server config での自動 browser 無効化、同一設定の稼働 server 再利用。
-- `strata_cli/launch/app.py:404-412,471-475` — TUI 経路で開く URL と起動後の呼び出し。
-- `strata_cli/launch/access.py:285-296` — access mode ごとの URL 順序。
+- `terminal/strata_cli/launch/cmd.py:73-80, 141-151` — `launch` parser と `--open` の `store_true` 登録。
+- `terminal/strata_cli/launch/cmd.py:897-925, 950-1000` — 計画・起動失敗・JSON・人向け起動結果それぞれの分岐とブラウザー起動。
+- `terminal/strata_cli/launch/cmd.py:625-631` — ブラウザー呼び出しと例外の扱い。
+- `terminal/strata_cli/launch/app.py:693-730` — 対話画面からの起動結果とブラウザー起動。
+- `terminal/strata_cli/launch/runner.py:724-749` — 起動設定で `open_browser` を無効化し、引数から `--open` を除く処理。
+- `terminal/serve/server.py:9195, 9746-9751` — 別途存在するサーバー側 `--open` と、その条件付きブラウザー起動。
 
-調査範囲は上記 commit の Terminal CLI ソースです。OS ごとの `webbrowser` backend が実際にどのアプリを起動するか、各環境で URL を開けるかは実行確認していません。
+調査範囲はこの revision の Strata 所有ソースです。OS ごとの `webbrowser` の既定ブラウザー選択や、起動要求後にブラウザーが実際に表示されるかは Python・OS 側の挙動に依存するため、ここでは断定していません。

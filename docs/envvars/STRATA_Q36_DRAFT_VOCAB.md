@@ -1,48 +1,45 @@
 # `STRATA_Q36_DRAFT_VOCAB`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。対象は Strata 所有ソースコード。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Qwen3.6-35B-A3B 用エンジンの MTP draft head が候補にする語彙行数を指定します。値が正の数 `N` なら、draft は出力行列の先頭 `N` 行（低い token ID 側）だけで候補 token を選びます。これは draft 候補の制限であり、通常の greedy 結果をその範囲に制限するものではありません。検証 window が draft を採用するか決め、範囲外 token が正解なら draft が棄却されます。
+Qwen3.6 専用 engine の MTP draft head が候補にする語彙行数を指定する。正の値が高速 draft head の条件を満たすと、出力行列の先頭 N 行（低い token ID 側）だけで draft token を選ぶ。候補を絞っても、通常モデルによる verify が採用・拒否を決め、最終的な greedy token は変えない。高速 head の条件を満たさない値・モデルでは全語彙の head 計算へ fallback する（`engine/src/qwen35/q36_engine.cu:3054-3077`）。
 
-環境変数を読むのは `src/qwen35/q36_engine.cu` の Qwen3.6 エンジン初期化経路だけです。`strata` は GGUF の model family が `qwen35moe` のときこのエンジンへ切り替わります。他の model family ではこの設定を読むコード経路に入りません。
+この変数を読むのは `strata::qwen35::run` の CUDA/HIP 用 Qwen3.6 engine である。`strata` の通常モデル起動は build に `STRATA_HAVE_QWEN35` があり、GGUF の family が `Qwen35Moe` のときこの engine に振り分ける（`engine/src/program/generate.cpp:3804-3818`）。
 
 ## 値と判定
 
-環境変数は `std::atoi` で変換し、文字列全体の妥当性検証はしません。値は `--draft-vocab` CLI 引数より優先度が低く、CLI 引数が指定されて値が 0 以上なら環境変数は参照されません。
+`--draft-vocab` の値が負のままで、かつ環境変数が設定されている場合に `std::atoi` で変換する。従って、環境変数が未設定なら `draft_vocab` は初期値 `-1` のまま `std::max(0, ...)` により 0 となる。空文字も `atoi` の結果は 0。0 以下は `draft_n <= 0` により全語彙の head を使う。CLI の `--draft-vocab` が 0 以上ならそちらが優先され、環境変数は読み取られない。CLI 値が負なら環境変数の fallback が行われる（`engine/src/qwen35/q36_engine.cu:5345,5380,5557-5558`）。
 
-| 入力 | 結果 |
-|---|---|
-| `--draft-vocab` が 0 以上 | CLI 値を使用。環境変数は読まない |
-| CLI 引数なし（初期値 `-1`）または CLI 値が負 | 環境変数が設定されていれば `atoi` の結果を採用 |
-| CLI が負で、環境変数も未設定 | 最終的な `draft_n` は 0 |
-| CLI が負で、環境変数が空または数値変換できない文字列 | `atoi` が 0 を返し、最終的な `draft_n` は 0 |
-| 変換結果が負 | `std::max(0, ...)` により 0 |
+| 判定条件 | 例 | 結果 |
+|---|---|---|
+| 環境変数が未設定、または変換結果が 0 以下 | unset、空文字、`0`、`-8`、`true` | `draft_n` は 0。全語彙で head を計算する |
+| 正数で、高速 head の形状条件も満たす | 語彙数未満の 8 の倍数（例 `8`、`16`） | 先頭 N 行だけで draft token を選ぶ |
+| 正数でも高速 head の条件を満たさない | `7`、語彙数以上、`16` 以外の値を返すモデル形状 | 全語彙の head 計算へ fallback する。値の clamp やエラー終了はない |
 
-`atoi` は数値の前にある空白と符号を扱い、数値の後ろに続く文字列を検査しません。したがって、たとえば `128junk` は 128、`junk128` は 0 になります。変換範囲外の値について、ソースは追加の検証を行いません。
-
-`draft_n == 0` は「候補を 0 個にする」意味ではなく、全語彙を使う設定です。また `draft_n >= 語彙数` や 8 の倍数でない値も、subset 専用計算の条件を満たさないため全語彙を使う経路にフォールバックします。
+`atoi` は文字列全体の厳密な検証をしない。先頭の空白や符号の後の数値部分を読み、数値の後ろに文字があっても数値部分を使う（例: `16junk` は 16）。数値として始まらない文字列は 0 となる（例: `true`）。この変数について大文字小文字を比較する処理はない。変換後の上限 clamp はなく、語彙数以上は後段の head 条件で全語彙計算に戻る（`engine/src/qwen35/q36_engine.cu:5557-5558,3062-3064`）。
 
 ## 有効になる条件
 
-環境変数値が設定されても、次の条件が必要です。
-
-- Qwen3.6-35B-A3B (`qwen35moe`) のエンジン経路を実行している。
-- モデルに MTP block があり、`--mtp N` で 1〜7 draft を有効にしている。MTP がないモデルでは `E.mtp_d` は 0 になり、draft head は使われません。
-- draft head の subset 計算にはさらに `fast_k` が有効、値が `0 < draft_n < n_vocab` かつ 8 の倍数、出力 head の型が 8、入力幅が埋め込み幅と一致、`N / 32 == 64` という条件が必要です。これらの条件を満たさない場合、エンジンは全語彙に対する `head_rows()` を呼びます。
-
-`--draft-vocab` に 0 以上を指定した場合は環境変数より優先されます。CLI の `--draft-vocab -1` のように負値を渡すと環境変数への fallback が起きます。
+- Qwen3.6-35B-A3B（GGUF family `Qwen35Moe`）として `strata::qwen35::run` に入ること。別 family のモデルではこの読み取り経路を通らない（`engine/src/program/generate.cpp:3804-3818`）。
+- モデルに MTP 層があり、`--mtp N` で N が正であること。読み込んだモデルに MTP がなければ `E.mtp_d` は 0 になる（`engine/src/qwen35/q36_engine.cu:5342,5373-5378,5456,5555-5558`）。
+- 通常の token 生成では forced token と full logits dump を使わず、MTP speculative step に進むこと（`engine/src/qwen35/q36_engine.cu:5614-5623`）。serve 経路では MTP を有効にし、stop 要求中でなく、context に余裕がある request が speculative step を実行すること（`engine/src/qwen35/q36_engine.cu:5238-5240`）。
+- N を限定した高速 head が使われるには、`STRATA_Q36_OLD_KERNELS` が未設定で、`draft_n` が 0 より大きく語彙数未満、8 の倍数、出力 head が Q8_0、入力幅が埋め込み幅で 2048 であること。いずれかを満たさなければ全語彙で head を計算する。`STRATA_Q36_OLD_KERNELS` は値の内容ではなく設定有無で高速 kernel を無効にする（`engine/src/qwen35/q36_engine.cu:2406,3062-3077`）。
 
 ## 実行時の詳細
 
-`run()` の CLI 解析時に `draft_vocab` は `-1` で初期化され、`--draft-vocab` があれば `atoi` の結果に置き換わります。モデル初期化後、MTP draft 数の設定と同じ初期化区間で、`draft_vocab < 0` の場合だけ環境変数を読み、`E.draft_n = std::max(0, draft_vocab)` に保存します。以降は `head_draft()` がその値を使います。各 generation request ごとに環境を読み直す処理はなく、プロセス起動後の環境変更は反映されません。
+CLI 引数は `run` の引数走査中に処理される。モデルを読み込み、engine 初期化後に `draft_vocab < 0` のときだけ環境変数を調べ、結果を `E.draft_n` に設定する。この設定処理は run 中に一度だけ行われ、その後の環境変更は反映されない（条件確認と変換で `getenv` をそれぞれ呼ぶ）。CLI の非負値は環境変数を上書きし、CLI の負値では環境変数があればその値が使われる（`engine/src/qwen35/q36_engine.cu:5345-5380,5458-5466,5555-5559`）。
 
-subset 経路では先頭 `draft_n` 行の logits で argmax を取り、draft token を提案します。条件を満たさない場合は同じ `head_draft()` から全語彙の logits と argmax を計算します。検証側が提案を棄却した場合も、最終回答は通常の greedy 結果です。この環境変数を読んだことを示す専用ログやエラー出力は実装にありません。
+MTP の forward が draft を求めるとき `head_draft` がこの行数を使う。限定 head が選んだ候補 token は、通常モデルの verify window に通され、一致した連続 prefix だけが採用される。候補外の token は draft として拒否されるが、コード上の説明では答えは `draft_n` にかかわらず通常の greedy answer である（`engine/src/qwen35/q36_engine.cu:3054-3077,3093-3094,3998-4019`）。
+
+## ログと測定値
+
+この変数の値、限定 head の採用、fallback を示す専用ログはない。値が条件を満たさず全語彙 head に戻っても警告やエラーにはならない（`engine/src/qwen35/q36_engine.cu:3062-3077`）。値による終了・失敗経路は実装されていない。MTP step の通常の受理数は、非 serve の MTP 生成では `strata-q36: ... MTP ... accepted`、serve では request ごとの `drafts accepted ...` として stderr に出るが、どちらもこの変数専用の診断ではない（`engine/src/qwen35/q36_engine.cu:5269-5273,5633-5636`）。この変数の効果を定量化する資料・測定値は確認できなかった。
 
 ## 根拠
 
-- `src/program/generate.cpp:2253-2265` — model family を見て Qwen3.6 エンジンへ切り替える。
-- `src/qwen35/q36_engine.cu:3732-3738,3764-3772` — `run()` と `--draft-vocab` の解析、初期値。
-- `src/qwen35/q36_engine.cu:2104-2128` — draft subset の意味、条件判定、全語彙 fallback。
-- `src/qwen35/q36_engine.cu:3880-3885` — 環境変数の読み取り、CLI fallback、0 未満の clamp、MTP 有効条件。
+- 環境変数の読み取り、CLI 優先、0 への下限処理: `engine/src/qwen35/q36_engine.cu:5345,5380,5557-5558`
+- 限定 head と全語彙 fallback の条件: `engine/src/qwen35/q36_engine.cu:3054-3077`
+- MTP draft head の呼び出しと verify / 採用: `engine/src/qwen35/q36_engine.cu:3080-3094,3953-4019`
+- family による engine dispatch: `engine/src/program/generate.cpp:3804-3818`

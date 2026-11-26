@@ -1,39 +1,42 @@
 # `STRATA_P4_TRACE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-layer split を使った pipelined batch の各 GPU stage について、window の launch と完了時刻をファイルへ記録する診断用 trace です。計算方法や batch の選択を変える設定ではありません。環境変数が未設定なら trace file は開かれず、この目的の clock 読み取りも行われません（`include/strata/program/pipe_probe.hpp:31-49`）。
+層分割した pipelined batch の stage window の開始・完了イベントを、指定ファイルへ記録する診断用スイッチである。Strata の `PipeProbe` が環境から値を読み、ファイルを開けた場合に `L`（launch）と `D`（done）の行を書き込む。モデル計算、生成 token、stage 選択を切り替える設定ではなく、観測用 I/O を追加する。通常の実行では未設定なら probe は無効である。`engine/include/strata/program/pipe_probe.hpp:31-46,81-102`、生成経路での probe の生成は `engine/src/program/generate.cpp:18029-18034`。
 
 ## 値と判定
 
-値全体を真偽値として parse するのではなく、出力先パスとして扱います。
+コンストラクターで `std::getenv` を一度呼び、値を数値や真偽値として parse せず、ファイルパスとして扱う。未設定なら trace ファイルを開かない。設定されていて値が空文字、または文字列全体がちょうど `1` の場合は `strata-p4-trace.csv` を使う。それ以外は値全体をパスとして `fopen(path, "w")` に渡す。したがって `0`、`true`、空白を含む値、`1x` もそのままパスであり、`1` の判定は大文字小文字や先頭文字だけの比較ではない。数値境界や負値の規則はない。
 
-| 環境変数の状態 | 出力先・結果 |
-|---|---|
-| 未設定 | trace を開かない。既定で無効 |
-| 空文字 | `strata-p4-trace.csv` |
-| 文字列がちょうど `1` | `strata-p4-trace.csv` |
-| その他の文字列 | その文字列をパスとして使用（例: `0`, `true`, `01`, `/tmp/run.csv`） |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP の pipelined batch 経路（この読み取り箇所には backend 別の値判定なし） | trace を開かない | 空文字または `1` は既定パス、`/tmp/p4.log` はそのパス | パスとして開けない値。`0`、`true`、`1x` は「無効値」ではなく、それぞれの名前のパスを開こうとする |
 
-`fopen(path, "w")` で開くため、相対パスはプロセスの current working directory を基準とし、同名ファイルがあれば切り詰めます。ディレクトリ作成やパスの検証は行いません。開けなければ stderr に `strata p4: cannot write the trace <path>` と出します。trace pointer は null のままなので、`STRATA_P4_TIMING` も無効なら trace は記録されず、ここでプロセスを終了させる処理もありません（`include/strata/program/pipe_probe.hpp:34-40,46`）。
+パスを開けない場合、`trace_` は null のままとなり、stderr に `strata p4: cannot write the trace <path>` を出す。これは処理失敗として返されず、trace 出力だけが行われない。`STRATA_P4_TIMING` が別途有効なら timing 計測は継続する。`engine/include/strata/program/pipe_probe.hpp:33-40,46`。
 
 ## 有効になる条件
 
-`--batch` が正、`--batch-groups` が 1 より大きく、layer split により `stages.size() + 1` が 1 より大きいときに pipelined 経路になります。その経路で `PipeProbe` が生成され、`STRATA_P4_TRACE` が読み取られます。これらの条件を満たさない通常の batch / 非 split 経路では、この `PipeProbe` の読み取りと trace は実行されません（`src/program/generate.cpp:13012-13016,13245-13246`）。
+- `generate.cpp` の pipelined batch 経路が動くこと。コード上の条件は `o.batch > 0`、`o.batch_groups > 1`、`n_pipe > 1` で、`n_pipe` は layer split の `stages.size() + 1`。従って batch groups が複数でも layer split がなければこの pipelined 経路にはならない。`engine/src/program/generate.cpp:17529-17533`。
+- `PipeProbe` の生成時に変数が設定されていること。値はそのコンストラクターで読み込まれ、パスもそこで一度開く。probe は pipelined batch 処理の初期化時に作られ、実行中に環境変数を再読込しない。変更を反映するには、少なくとも probe の再生成が必要である。`engine/src/program/generate.cpp:18029-18034`、`engine/include/strata/program/pipe_probe.hpp:31-40`。
+- ファイルを開けること。開けないと警告後も batch は続くが、`STRATA_P4_TRACE` によるイベント記録は無効になる。ファイルは `"w"` で開くため、同じパスに既存ファイルがあれば開いた時点で切り詰められる。`engine/include/strata/program/pipe_probe.hpp:36-40`。
+- OS、CUDA/HIP の違い、GPU 世代、CLI による値の優先順位をこの読み取り箇所は設けていない。対象の `generate.cpp` 経路は CUDA/HIP engine の pipelined batch であり、経路が選ばれる条件は上記の batch/layer-split 条件による。
 
 ## 実行時の詳細
 
-環境は `PipeProbe` の各インスタンス生成時に読み取られ、インスタンスの寿命中に再読込されません。値は `static` cache されていないため、同じプロセスでも後続のインスタンス生成前に環境が変われば、そのインスタンスでは新しい値が評価されます（`include/strata/program/pipe_probe.hpp:31-40`）。CLI 引数や他の環境変数によるパス上書きはありません。`STRATA_P4_TIMING` は別設定で、trace path を選ぶ優先順位には関与しません。
+`PipeProbe` は `STRATA_P4_TRACE` の値を受けて出力ファイルを開き、バッファリングを無効化する。各 stage の batch launch 成功後に `L <stage> <steady-clock の時刻（µs）> <group>`、完了時に `D <stage> <時刻（µs）> 0` を1行出力する。stage と group はコード上 0 始まりで、時刻は `steady_clock` の epoch からのマイクロ秒値である。ヘッダー行はなく、各行は `fprintf` され、無バッファ設定のため都度 flush される。終了時にファイルを閉じる。`engine/include/strata/program/pipe_probe.hpp:36-42,81-102`、イベント呼び出しは `engine/src/program/generate.cpp:18064-18068,18291-18306`。
 
-ファイルにはヘッダーなしで、stage の開始時に `L <stage> <time_us> <group>`、完了時に `D <stage> <time_us> 0` を1行ずつ出します。stage と group は 0 始まりです。時刻は `steady_clock` の時刻を microseconds にした値で、暦時刻ではありません。出力は行ごとに flush されます。正常なスコープ終了時にはファイルを閉じます（`include/strata/program/pipe_probe.hpp:26-29,34-42,81-102,131-132`）。実際の hook は window 完了後の `done` と、stage の batch launch 成功後の `launched` です（`src/program/generate.cpp:13274-13280,13417-13427`）。
+trace が開けていると `on()` が true になり、trace 記録に必要な時刻取得と probe のイベント処理が有効になる。一方、stderr の詳細 timing summary は `STRATA_P4_TIMING` が設定されているときだけ `flush()` が出す。`STRATA_P4_TRACE` 単独では `flush()` は即時 return し、timing summary を出さない。pipelined group が実行されない場合はイベント行も発生しない。`engine/include/strata/program/pipe_probe.hpp:46-49,104-120`、呼出し・summary のタイミングは `engine/src/program/generate.cpp:18358-18382`。
 
-`STRATA_P4_TRACE` だけを設定し、出力先を開けた場合は trace file が書かれますが、`STRATA_P4_TIMING` 用の集計行は出ません。後者が設定されているときは、pipelined batch が idle になったタイミングで `strata p4: ...` の集計を stderr に出します（`include/strata/program/pipe_probe.hpp:46-48,104-120`; `src/program/generate.cpp:13459-13475`）。
+## ログと測定値
+
+出力先を開けないときの stderr 文言は `strata p4: cannot write the trace %s\n`。trace 行はファイルへ出力され、Strata は trace 専用の成功ログを出さない。`STRATA_P4_TRACE` 自体に対応する測定値はなく、数値集計の stderr summary は別変数 `STRATA_P4_TIMING` により制御される。`engine/include/strata/program/pipe_probe.hpp:33-40,81-102,104-120`。
 
 ## 根拠
 
-- 全参照の確認では、候補名の本番コード読み取りは `include/strata/program/pipe_probe.hpp:34` の `std::getenv` です。`src/program/generate.cpp:13245` は説明コメント、`src/core/window_limits_test.cpp:36` はテスト内での unset のみです。
-- `include/strata/program/pipe_probe.hpp:34-40` は値判定、ファイル open と失敗ログを定義します。
-- `src/program/generate.cpp:13012-13016,13245-13246` は pipelined 経路の条件と probe の生成を示します。
-- `include/strata/program/pipe_probe.hpp:81-102` と `src/program/generate.cpp:13274-13280,13417-13427` は trace event の記録を示します。
+- `engine/include/strata/program/pipe_probe.hpp:31-49` — 値の読み取り、既定パス、ファイル open、失敗時警告、probe 有効判定。
+- `engine/include/strata/program/pipe_probe.hpp:81-102` — イベント行の形式、時刻と出力。
+- `engine/include/strata/program/pipe_probe.hpp:104-120` — timing summary が `timing_` 有効時だけ出ること。
+- `engine/src/program/generate.cpp:17529-17533` — pipelined batch の条件と stage 数。
+- `engine/src/program/generate.cpp:18029-18034,18064-18068,18291-18306,18358-18382` — probe の生成、イベント呼び出し、集計区間と flush。

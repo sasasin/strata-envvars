@@ -1,53 +1,63 @@
 # `STRATA_ADAPT_OVERLAP`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-適応層（adaptive tier）が GPU に送る expert の入れ替えコピーを、次の decode window の実行と重ねます。通常はコピー完了を待ってから residency table を更新します。この機能では、通常ならその待ちが終わる時点で residency table を先に更新し、コピーは layer 順に続けます。検証 window は、入れ替えのある layer について、その layer のコピーが到着するまで GPU の実行計画を進めません。したがって、GPU/CPU で計算する expert の選択と生成 token は通常の待機方式と同じで、変わるのはコピー待ちの配置です。
+適応型エキスパート層が GPU キャッシュへ行う swap コピーを、次の decode window の実行と重ねるスイッチ。コピーが到着する前に次 window のレジデンシ表を更新し、Verifier は各層の計画を、その層に必要なコピーが到着するまで待たせる。通常の逐次待機に比べてコピー待ちを window の実行中に隠す構成だが、コード上では生成 token は同じと説明されている。読み取りと制御は `engine/src/program/generate.cpp` の `adapt_overlap()` と生成ループにある（`engine/src/program/generate.cpp:2253-2289, 15113-15143, 22818-22835`）。
 
-実装は `src/program/generate.cpp` の `adapt_overlap()` と decode loop、`include/strata/core/verify.hpp` の `AdaptGate`、`src/core/verify.cpp` の layer gate にあります。環境変数の判定結果は関数内の `static const bool` に保存されます。プロセス内で最初に判定した後、実行中に環境を書き換えても再評価されません。
+これは Strata engine の生成経路で使われる機能で、環境値は起動時の状態表示にも使われる。`--adapt-async` が省略された場合の自動選択では、このスイッチが有効だと非同期 adaptive tier の自動選択を抑止する（`engine/src/program/generate.cpp:11774-11794`; `engine/include/strata/core/adapt_async_default.hpp:41-60`）。
 
 ## 値と判定
 
-実装は文字列全体を parse しません。`getenv()` の結果の先頭文字 `e[0]` だけを比較します。空文字は値が設定されている状態ですが、先頭文字は `\0` です。
+`adapt_overlap()` は `std::getenv("STRATA_ADAPT_OVERLAP")` の値の**先頭文字だけ**を見て、`'1'` なら要求ありとする。文字列全体の数値変換や真偽値 parse はしない。関数内 `static const bool` に保存され、初回評価以後の環境変更は反映されない（`engine/src/program/generate.cpp:2269-2289`）。
 
-| ビルド | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
 |---|---|---|---|
-| Linux CUDA | 有効（既定） | 先頭文字が `0` ではないすべての文字列。例: `1`, `true`, `false`, `2`, 空文字 | 先頭文字が `0` の文字列。例: `0`, `0anything` |
-| Windows CUDA | 無効 | 先頭文字が `1` の文字列。例: `1`, `10`, `1anything` | それ以外すべて（unset、`0`, `true`, 空文字を含む） |
-| HIP | 無効 | 先頭文字が `1` の文字列。例: `1`, `10`, `1anything` | それ以外すべて（unset、`0`, `true`, 空文字を含む） |
+| 通常の起動時判定 | OFF | `1`, `10`, `1anything`（先頭が `1`） | 空文字、`0`, `0anything`, `true`, `TRUE`, ` 1`, `2` |
+| CUDA、同じ compute capability の全カードが `sm_70` で、既定値適用が有効 | 起動時に `1` を設定して ON | 利用者が値を設定済みなら、その値を保持 | 利用者が空文字や `0` を設定済みなら保持され、OFF |
+| Windows + HIP build | 値判定は通常どおり。ただし `STRATA_WIN_HIP_RISKY` が無効なら要求を拒否 | `STRATA_WIN_HIP_RISKY` が空でなく、かつ文字列全体が `0` でなければ要求を許可 | 同変数が unset、空文字、または厳密に `0` なら拒否 |
 
-大文字小文字、空白、数値としての妥当性は検査されません。たとえば Linux CUDA では `false` も有効、Windows CUDA/HIP では `true` は無効です。`STRATA_ADAPT_OVERLAP=0` はすべてのビルドで無効にします。
+`sm_70` の既定値は、engine が CUDA build で、見えている全 GPU の compute capability が同じ場合に `apply_nv_defaults()` が適用する NVIDIA 既定値の一つ。`STRATA_SM70_PERF` の先頭が `0`、または `STRATA_DEFAULTS=026` の場合はこの既定値一覧から外れる。既定値適用は環境変数がすでに存在すれば値にかかわらず上書きしないため、明示的な空文字も利用者の設定として扱われる（`engine/src/program/generate.cpp:4421-4449`; `engine/src/core/nv_defaults.cpp:15-18, 136-143, 222-238`）。
 
-根拠: `src/program/generate.cpp:1335-1347`。
+Windows + HIP で拒否を解除する `STRATA_WIN_HIP_RISKY` は `value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0` で判定される。したがって `00` や `false` も解除扱いになる（`engine/include/strata/core/win_hip_risky.hpp:17-25`）。
 
 ## 有効になる条件
 
-上の値判定が有効でも、次の条件をすべて満たさなければ overlap 動作は有効化されません。
+`STRATA_ADAPT_OVERLAP` が ON でも、次のいずれかに当たると overlap は実行されない。該当理由は `aov_why` の最初に一致した条件で決まる（`engine/src/program/generate.cpp:15122-15143`）。
 
-- 適応層が稼働している（`--adapt-every` と `--adapt-swaps` による usage table が空でない）。
-- 単一 GPU で、layer split / 複数 GPU ではない。
-- `--peer-device` と `--remote-expert-opt` を使っていない。
-- `--adapt-async` と `--pipeline-windows` を使っていない。
-- page-locked swap source が無効。
-- `STRATA_DMA_BATCH` が無効（DMA batch mode が 0）。
-- `STRATA_ADAPT_LAG` が既定値の 1 で、`STRATA_ADAPT_NOWAIT` が有効でない。
-- `STRATA_VERIFY_DEVICE_PLAN` による device-planned layers が有効でない（Verifier が gate の設定を拒否する）。
-- resident RAM mode（`src.complement_ready()`）では、別の環境変数 `STRATA_ADAPT_OVERLAP_RESIDENT` の先頭文字が `1` である。
+- 層分割 GPU（`multi_gpu` または stage 分割）では使わない。
+- `--remote-expert-opt`、`--adapt-async`、`--pipeline-windows` と併用しない。
+- swap 元 blob の page-lock が有効な場合は使わない。
+- `STRATA_DMA_BATCH` が有効な場合は使わない。
+- `STRATA_ADAPT_LAG` が 1 以外、または `STRATA_ADAPT_NOWAIT` が有効な場合は使わない。これらは overlap と別の swap 到着タイミング制御である。
+- resident RAM mode では、追加で `STRATA_ADAPT_OVERLAP_RESIDENT` の先頭文字が `1` でなければ使わない。
+- adaptive tier が無効（`--adapt-every` または `--adapt-swaps` が正でない等で usage table が空）の場合は使わない。usage table は adaptive tier が有効で、全エキスパートが resident ではなく GPU cache slot がある場合に初期化される（`engine/src/program/generate.cpp:15001-15002`）。
+- `STRATA_VERIFY_DEVICE_PLAN` による device-planned layers または device hits が有効だと `Verifier::set_adapt_gate()` が拒否する。
+- Windows + HIP では `STRATA_WIN_HIP_RISKY` の解除がない限り、`STRATA_ADAPT_OVERLAP=1` の要求自体が拒否される。
 
-条件を満たさないとき、要求値が環境変数に明示設定されていれば stderr に `STRATA_ADAPT_OVERLAP=1 is off: ...` と理由を出します。Linux CUDA で変数を unset のまま既定 ON にした場合は、条件に合わなくてもこの理由ログは抑制されます。条件を満たして開始した場合は `adaptive overlap ...` の有効ログが出ます。
-
-resident RAM mode では別変数を `1` にしても常に overlap できるとは限りません。swap のソフト commit に失敗した場合、実装は通常のコピー完了待ちに fallback します。関連箇所: `src/program/generate.cpp:8277-8304,11861-11870`。
+逆に、`STRATA_ADAPT_FETCH` は overlap の実行条件を直接拒否しないが、overlap が有効なときは fetch 側の停止理由として扱われる（`engine/src/program/generate.cpp:15055-15060, 15067-15072`）。`--adapt-async` を明示した場合も overlap は実行されず、自動選択の場合は `adapt_overlap()` が true なら非同期 tier の自動選択を行わない（`engine/src/program/generate.cpp:11777-11794, 15122-15129`; `engine/include/strata/core/adapt_async_default.hpp:54-59`）。
 
 ## 実行時の詳細
 
-コピー完了を通知する CUDA stream host callback が、各 layer の最後の swap の後に `AdaptGate::landed` を更新します。Verifier はその layer の GPU 処理が到達した後、swap のある layer なら `landed >= layer` になるまで spin wait し、それから layer の計画を公開します。all-resident graph の経路では layer ごとに止められないため、graph の launch 前にすべてのコピーを待ちます。gate wait は 20 秒を超えると window error になります。
+初回の `adapt_overlap()` 呼び出しは、`--adapt-async` の自動選択判定中か、adaptive tier の起動準備時に行われる。前者が先なら、その値が関数内 static に保持され、後続の呼び出しも同じ値を使う。起動前に適用される `sm_70` 既定値は判定に反映されるが、初回評価後にプロセス環境を変えても再評価しない（`engine/src/program/generate.cpp:2269-2289, 11777-11794`; `engine/src/core/nv_defaults.cpp:222-238`）。
 
-参照: `src/program/generate.cpp:8448-8459`, `include/strata/core/verify.hpp:46-53`, `src/core/verify.cpp:2120-2134,2169-2172,2235-2237`。
+adaptive round で swap が残っていると、通常の「コピー完了を待ってから次 window」ではなく、まずホスト側のレジデンシ表を更新し、Verifier の gate を有効にして次 window を始める。コピー stream は層順に各 swap を転送し、その層のコピー完了を atomic counter または pinned-memory の copy signal で通知する。Verifier は GPU が層を要求した時点で、その層の swap があれば通知値まで host を待たせる。peer tier がある場合も同じ gate に参加する。resident RAM mode では `soft_commit_exchanges()` が成立しなければ通常の待機へ fallback する（`engine/src/program/generate.cpp:15138-15143, 15431-15479, 22818-22835`; `engine/include/strata/core/verify.hpp:46-78`; `engine/src/core/verify.cpp:3657-3673, 4071-4074`）。
 
 ## ログと測定値
 
-この最適化は同じ token を生成する設計です。Strata の `docs/DETAILS.md` は Linux CUDA では既定 ON、Windows CUDA/HIP では opt-in と説明しています。記載された測定では RTX A4000 の 6 組の interleaved run で、decode median tok/s が Q2_0 16 GB 62.5→66.2 (+5.9%)、Q2_0 12 GB 51.3→54.2 (+5.7%)、IQ3_XXS 16 GB 48.6→52.6 (+8.3%)、IQ3_XXS 12 GB 39.3→41.5 (+5.5%) で、各条件とも 6/6 組で向上しています。これは記載された測定環境での値であり、他機種の性能を保証しません。Windows RTX 5070 の Q2_0 では -2.6%、IQ3_XXS では中立だったため Windows は既定 OFF、HIP は未測定で opt-in です。
+- 機能が使われる場合、stderr に `strata serve: adaptive overlap (STRATA_ADAPT_OVERLAP=0 turns it off): the adaptive tier's copies land while the next window runs (same tokens, a layer waits for its own copies)` と出る。peer tier があれば末尾に peer の signal 方式も表示する（`engine/src/program/generate.cpp:15176-15181`）。
+- 値が要求され、適用条件で止められた場合は `strata serve: STRATA_ADAPT_OVERLAP=1 is off: <理由>` と出る。理由には `not on a layer split`、`not with --adapt-async`、`not with STRATA_ADAPT_LAG / STRATA_ADAPT_NOWAIT`、`the adaptive tier is off` などがある。変数が無効値または未設定なら、`strata serve: adaptive overlap: off...` の状態行になる（`engine/src/program/generate.cpp:15182-15186`）。
+- Windows + HIP で要求を拒否する場合は `strata: STRATA_ADAPT_OVERLAP=1 is off on Windows with an AMD card: it ended the first request with a GPU fault there, and it was only checked on NVIDIA cards. STRATA_WIN_HIP_RISKY=1 turns it on anyway.` と出る。解除値がある場合は `strata: STRATA_WIN_HIP_RISKY=1: STRATA_ADAPT_OVERLAP=1 is on as asked, on Windows with an AMD card; it has reset the display driver or ended requests with a GPU fault there.` と警告する（`engine/src/program/generate.cpp:2280-2286`; `engine/include/strata/core/win_hip_risky.hpp:27-40`）。
+- gate がコピー完了を 20 秒超待つと、stderr に `strata verify: the adaptive gate waited ...` と進捗値を出し、Verifier は `verify: the adaptive tier's copies for layer ... never landed` をエラーとして返す（`engine/src/core/verify.cpp:3665-3689`）。
+- Strata の `docs/DETAILS.md` は 6 組の interleaved 比較として、RTX A4000 の Q2_0 / IQ3_XXS で +5.5〜8.3%、Tesla P100 で +4.4%、RTX 5070 Windows で -2.6%、RTX 5090 Laptop（WSL2、Core Ultra 9 275HX、native IQ3_XXS pack、`--expert-cache-per-layer`）で 84.6 対 106.6 tok/s（-21%）を記録している。これらは記載された条件での資料値で、一般的な性能保証ではない（`docs/DETAILS.md:1720`）。
 
-出典: `docs/DETAILS.md:1699-1706`。実装注釈には Linux CUDA の別測定として A4000 +5.5–8.3%、P100 +4.4% とあります（`src/program/generate.cpp:1333-1344`）。
+## 根拠
+
+- 値の読み取り、Windows HIP 判定、cache: `engine/src/program/generate.cpp:2253-2289`
+- NVIDIA 既定値の設定条件と優先: `engine/src/program/generate.cpp:4421-4449`; `engine/src/core/nv_defaults.cpp:15-18, 136-143, 222-238`
+- 有効条件・状態ログ・gate 準備: `engine/src/program/generate.cpp:15113-15186`
+- swap と window の重なり: `engine/src/program/generate.cpp:15431-15479, 22818-22835`; `engine/src/core/verify.cpp:3657-3693, 4071-4074`
+- 非同期 adaptive tier との関係: `engine/src/program/generate.cpp:11774-11794`; `engine/include/strata/core/adapt_async_default.hpp:41-60`
+- Windows HIP の拒否・警告: `engine/include/strata/core/win_hip_risky.hpp:17-40`
+- Strata に記載された測定値: `docs/DETAILS.md:1720`

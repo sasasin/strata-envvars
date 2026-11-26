@@ -1,49 +1,49 @@
 # `STRATA_DF2_STAGE`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-明示的に DFlash2 drafter を使う複数 GPU の layer split で、drafter の配置先を選びます。値が `first` のときは最初の stage の GPU に置き、それ以外では最後の stage の GPU に置きます。コードコメント上も測定用の選択点であり、既定の配置ではありません。
+CUDA/HIP ビルドで DFlash2 drafter をレイヤー分割のどの stage に置くかを切り替える、計測用の環境変数。通常は最後の stage に置き、`STRATA_DF2_STAGE=first` のときだけ最初の stage に置く。DFlash2 の計算方式や CLI オプション値を変える処理ではなく、配置先の選択に使われる（`engine/src/program/generate.cpp:6738-6744,8273-8275`）。
 
-これは DFlash2 を有効にする設定ではありません。DFlash2 を使うかどうかは `--draft dflash2` などで決まり、この変数はその後の配置を選びます。単一 GPU、`--draft auto`、stage のない経路では環境変数を読みません（`src/program/generate.cpp:5561-5567`）。
+実際の読み取りは `generate.cpp` の `df2_first` 判定 1 箇所だけ。名前の他の参照は同ファイルのコメントと `terminal/data/settings-register.json` の設定レジストリ項目で、後者はソースでの読み取りではない。
 
 ## 値と判定
 
-| 値 | 判定・配置 |
-|---|---|
-| 未設定 | `df2_first=false`。最後の stage に配置 |
-| 空文字 | `std::string("") == "first"` が偽。最後の stage に配置 |
-| `first` | 完全一致し、最初の stage に配置 |
-| その他（`FIRST`, `First`, `first `, `0`, `1` を含む） | 完全一致しないため最後の stage に配置 |
+`std::getenv` で値を取得し、未設定でない場合に `std::string(e) == "first"` で文字列全体を比較する。空文字、`0`、`1`、`true`、`FIRST`、`first ` は一致せず、既定の最後の stage が使われる。大文字小文字を区別し、trim、数値変換、部分一致はしない。`first` が有効値で、それ以外はこの切替に対して無効値（最初の stage を選ばない）となる（`engine/src/program/generate.cpp:6740-6744`）。
 
-数値変換や前後空白の除去はありません。無効な文字列への警告やエラーもなく、既定の last-stage 配置にフォールバックします。`getenv` の読み取りは `multi_gpu` が真、`stages` が空でなく、`o.draft == "dflash2"` かつ `o.draft_auto` が偽の場合に限られます。
+| 条件 | unset | 最初の stage を選ぶ値 | 最初の stage を選ばない値 |
+|---|---|---|---|
+| `multi_gpu` で DFlash2 を明示選択し、`--draft auto` ではない | 最後の stage | 完全一致の `first` | 空文字、`0`、`1`、`true`、`FIRST`、`first ` など |
+| 上記以外 | 配置切替の判定は常に false | なし | 全て（環境変数を読まない） |
 
 ## 有効になる条件
 
-- DFlash2 対応コードがビルドに含まれ、DFlash2 が実際に利用可能であること。初期化・利用箇所は `STRATA_HAVE_DFLASH2` の条件付きコードです（`src/program/generate.cpp:6765-6766`）。
-- 複数 GPU の layer split があり、少なくとも 2 stage あること。
-- `--draft dflash2` を明示し、`--draft auto` ではないこと。
-- `--pipeline-windows` が有効な場合、DFlash2 は使われず、環境変数の配置選択も利用効果を持ちません。通常は MTP にフォールバックしますが、`--draft-fallback none` では代替 drafter がないため起動を終了します（`src/program/generate.cpp:6767-6771,6802-6818`）。
-
-これらの条件外では `STRATA_DF2_STAGE=first` を設定しても DFlash2 の起動や layer split の有効化は行いません。
+- DFlash2 対応の CUDA または HIP ビルドであること。GPU 共通 CMake 設定は CUDA/HIP の場合に `STRATA_HAVE_DFLASH2=1` を定義し、Metal/SYCL は DFlash2 なしでビルドすると記載している（`engine/cmake/strata_gpu_engine.cmake:6-13`）。DFlash2 本体のロード処理はこの macro の下にある（`engine/src/program/generate.cpp:8266-8275`）。
+- 複数 GPU のレイヤー分割が実際に残っていること。1 GPU になった場合や `--split-skip-if-fits` で分割が解消された場合は `multi_gpu` が false となり、この環境変数では配置を変えない（`engine/src/program/generate.cpp:4856,6472-6484`）。
+- `--draft dflash2` を明示し、`--draft auto` を使わないこと。CLI は `auto` を内部で DFlash2 に変換しつつ `draft_auto` を立てるため、環境変数の条件から除外される（`engine/src/program/generate.cpp:4143-4149,6740-6744`）。`--draft mtp` でも効かない。
+- DFlash2 のロード自体が可能であること。通常経路では native pack、必要な fallback / `--mtp`、`--draft-model`、`--pipeline-windows 0` などの条件を別途確認し、ロード失敗時は fallback 設定に応じて MTP に切り替えるか起動を終了する（`engine/src/program/generate.cpp:8266-8275,8310-8326`）。この環境変数はその条件や失敗を上書きしない。
+- serve のレイヤー分割でも同じ stage 選択値が使われる。DFlash2 の stage ごとの prompt tap を drafter 側へ集める準備は、配置先とは別に必要となる（`engine/src/program/generate.cpp:13584-13613`）。
 
 ## 実行時の詳細
 
-判定は `generate` の stage 構成後に一度行い、その結果をローカルの `const bool df2_first` として後続の配置処理で使います。関数内の static cache ではありませんが、同じ実行経路の途中で環境変数を変更しても、この判定はやり直されません（`src/program/generate.cpp:5561-5567`）。
+環境変数は stage 構築後、split の配置・容量計画に入る箇所で評価される。`df2_first` が true なら split 自動配置時に最初の stage の容量を drafter 分として見積もり（`engine/src/program/generate.cpp:6959-6972`）、通常起動では DFlash2 を device 0 にロードする。false なら複数 GPU 時は最後の stage の device にロードする（`engine/src/program/generate.cpp:8273-8275`）。レイヤー分割は primary device 0 を前提としており、別 primary device との組み合わせは拒否される（`engine/src/program/generate.cpp:4856-4863`）。
 
-`--layer-split auto` の stage ごとの空き VRAM 見積もりでは、`df2_first` が真なら drafter 分の余地を先頭 stage に、偽なら最終 stage に見込みます（`src/program/generate.cpp:5715-5731,5733-5746`）。DFlash2 pack のロード先も、真なら device 0、偽なら最後の stage の device です（`src/program/generate.cpp:6772-6774`、`src/core/dflash2.cpp:127-130`）。
+serve 経路では true の場合に first stage、false の場合に last stage を drafter の重み元・配置先として選び、全 verifier stage の tap を drafter 側に集める。成功時の起動ログには `layer split: the drafter is on CUDA... (first|last stage), the other stages' taps are gathered onto it` と配置が出る（`engine/src/program/generate.cpp:13588-13595,13607-13613`）。通常の CLI 起動ログは DFlash2 の起動を示すが、この環境変数専用のログはない（同 `:8273-8324`）。
 
-layer split の DFlash2 初期化では、真なら CUDA0 側の weight table を使い、偽なら最後の stage の weight table を使います。head は最後の stage の head を渡し、drafter と head が別 GPU で vocabulary subset の行が必要な場合は、head 側で行を集めて drafter 側へコピーします。stage の taps はどちらの配置でも drafter の GPU に集めます（`src/program/generate.cpp:11146-11157,11170-11175`、`src/core/dflash2.cpp:310-323,342-379`）。
+値はこの初期化時の式で読み、`static` cache は使わない。リクエスト単位の再読み込み箇所はなく、serve のリクエスト処理はこの判定より後に進む（`engine/src/program/generate.cpp:6740-6744,18862-18944`）。起動後にプロセス環境を変えても、既に決まった stage 配置は切り替わらない。
 
-起動成功時の stderr ログには DFlash2 の device 番号と `first` / `last` stage のどちらかが表示されます。初期化できない場合は理由を stderr に出して MTP にフォールバックします。`--draft-fallback none` で MTP がない場合は、その理由を出した後に起動を終了します（`src/program/generate.cpp:11160-11175,6802-6818`）。環境変数の値自体を報告するログや、未知値を拒否する処理はありません。
+## ログと測定値
+
+serve の成功ログでは選ばれた CUDA device 番号と `first stage` / `last stage` を確認できる（`engine/src/program/generate.cpp:13610-13613`）。無効値や未設定だけを理由にした警告・エラーはなく、通常配置のまま進む。DFlash2 自体のロード失敗は `--draft-fallback` に応じた起動ログまたは終了経路となり、この変数による専用の失敗経路ではない（同 `:8310-8324`）。
+
+`docs/DETAILS.md` にこの変数の stage 切替に関する測定値はなく、この調査でも測定していない。
 
 ## 根拠
 
-- 変数の読み取り、適用条件、完全一致判定: `src/program/generate.cpp:5561-5567`
-- 自動 split の drafter 用 VRAM 見積もり: `src/program/generate.cpp:5715-5731,5733-5746`
-- DFlash2 build guard、load device と pipeline 制約、失敗時の fallback: `src/program/generate.cpp:6765-6774,6802-6818`
-- stage 上の weights/head/taps の結び付け、起動ログと失敗ログ: `src/program/generate.cpp:11146-11175`
-- pack の device 設定と GPU allocation: `src/core/dflash2.cpp:127-130`; head 行の転送: `src/core/dflash2.cpp:310-323,342-379`
-
-`docs/DETAILS.md` にこの環境変数の説明は見つかりませんでした。性能値や配置の優位性は、このソース調査では確認していません。
+- `engine/src/program/generate.cpp:6738-6744` — 既定配置、条件判定、唯一の `getenv` 読み取り。
+- `engine/src/program/generate.cpp:4143-4149,4856-4863,6472-6484` — `--draft auto` の内部表現、multi-GPU 条件、分割解消条件。
+- `engine/src/program/generate.cpp:6959-6972,8266-8275,8310-8326` — 自動配置計画、DFlash2 のロード先と起動可否。
+- `engine/src/program/generate.cpp:13584-13613` — serve の stage binding、tap 集約、観測できる配置ログ。
+- `engine/cmake/strata_gpu_engine.cmake:6-13` — DFlash2 を含む CUDA/HIP build macro。
+- `docs/DETAILS.md:1237-1246` — DFlash2 の一般的な測定記述はあるが、この stage 選択変数の測定値は記載されていない。

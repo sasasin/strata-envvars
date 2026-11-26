@@ -1,42 +1,59 @@
 # `STRATA_FORCE_ISA`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata 独自の CPU ISA 判定に上限を設け、対応する AVX-512 / AVX2 / AVX のカーネル選択を抑制します。テストと、古い CPU 向けビルドの経路を新しい CPU 上で試す用途です。CPU 機能を実際に無効化するものではなく、`ggml-cpu` のビルド設定やその ISA 判定も変更しません。
+Strata が持つ CPU 命令セットの実行時 probe を低い tier に制限し、CPU kernel の dispatch を狭める診断・互換確認用の変数。実 CPU や OS が持たない命令を追加で使えるようにはしない。主なエンジン実装は `engine/src/kernels/cpu/expert_layout.cpp` と `engine/src/quant/isa.cpp` で、HY4 CPU experts と Vision ツールにも独立した読み取り実装がある。Strata が同梱する ggml-cpu のコンパイル済み ISA はこの変数では変更されない（`engine/src/kernels/cpu/expert_layout.cpp:26-39`）。
 
 ## 値と判定
 
-`src/kernels/cpu/expert_layout.cpp:25-39` で文字列全体を大文字小文字を区別して比較します。前後の空白除去や数値変換はありません。
+同じ名前でも、実装ごとに受け付ける文字列と不正値の扱いが異なる。数値変換はせず、C++ 実装は値全体を大文字小文字を区別して比較する。
 
-| 値 | 上限 | 判定 |
-|---|---:|---|
-| 未設定または空文字 | 3 | 上限なし。CPU/OS の実機判定を使う |
-| `avx2` | 2 | AVX-512 を使わず、AVX2 までを許す |
-| `avx` | 1 | AVX2 / AVX-512 を使わず、AVX までを許す |
-| `sse`、`sse4.2`、`none` | 0 | AVX / AVX2 / AVX-512 を使わない |
-| その他 | 3 | stderr に `strata: STRATA_FORCE_ISA=<値> is not avx2, avx or sse; ignored` を出し、上限なしとして扱う |
+| 実装 | unset / 空文字 | 有効値と効果 | 無効値 |
+|---|---|---|---|
+| CPU expert dispatch (`engine/src/kernels/cpu/expert_layout.cpp`) | 上限なし（cap 3）。空文字も unset と同じ | `avx2` は AVX-512/VNNI を抑止し AVX2 まで、`avx` は AVX2 以上を抑止し AVX1 まで、`sse` / `sse4.2` / `none` は AVX1 以上を抑止 | それ以外（例: `0`, `1`, `true`, `AVX`, `avx2 `）は無視して上限なし。stderr に警告 |
+| Quant layer (`engine/src/quant/isa.cpp`, x86) | 上限なし。空文字も unset と同じ | `avx2`, `avx`, `sse` は順に AVX-512、AVX2、AVX を上限から外す | それ以外（`sse4.2`, `none` を含む）は無視して上限なし。stderr に警告 |
+| HY4 CPU experts (`engine/src/hy4flash/run/hy4_cpu_experts.cpp`, x86) | probe を制限しない。空文字も制限しない | `avx2`: AVX-512 と AVX-VNNI を抑止。`avx2-vnni` / `no-avx512`: AVX-512 を抑止。`avx` / `sse`: AVX2 以上を抑止 | その他は無視。ここでは `STRATA_FORCE_ISA` 自身の警告なし |
+| HY4 CPU experts (NEON) | dot-product probe を制限しない。空文字も制限しない | `scalar` / `lib` は NEON dot-product kernel を無効化 | その他は無視し、警告なし |
+| Vision の CPU tower (`terminal/tools/vision/own/cpu_caps.h`) | x86 は上限なし。AArch64 は NEON | x86: `scalar`, `sse41`, `avx`, `avx2`, `avx512` は該当 tier を上限にする。AArch64: `scalar` のみ NEON を scalar にする | x86 の未知値（空文字を含む）は `avx512` 上限として扱われる（通常は CPU の最高 tier より上限が高く、結果を変えない）。AArch64 の `scalar` 以外は NEON のまま |
 
-したがって `AVX`、` sse`、`0` は有効値ではありません。値が `sse4.2` または `none` の場合もログ上の値はそれぞれ受け取った文字列のままですが、上限値は `sse` と同じです。
+エンジンの expert dispatch は `cpu_isa_cap()` が `static const` に値を一度保存し、cap 3/2/1/0 を返す。x86 CPU feature probe も関数内 `static` で保存される。`STRATA_FORCE_AVX2=1` が設定されると、その expert dispatch では `STRATA_FORCE_ISA` の値に関係なく AVX-512 probe も false になる（`engine/src/kernels/cpu/expert_layout.cpp:26-39,75-82`）。
+
+Quant layer は `strata::quant::caps()` の初回呼び出しで CPU feature と cap を保存し、以後同じ値を使う。cap 3 は無制限、2 は AVX-512系を除外、1 はさらに AVX2系、0 はさらに AVXを除外する（`engine/src/quant/isa.cpp:48-57,59-87,109-112`）。
 
 ## 有効になる条件
 
-値を読むのは `src/kernels/cpu/expert_layout.cpp` の CPU ISA 判定を使う実行経路です。値が有効でも、そのレベルの機能を備えた CPU/OS でなければ対応カーネルは選択されません。上限は機能の実在判定に追加される制限であり、機能を追加する設定ではありません。
-
-この上限が適用されるのは Strata 独自の `cpu_avx512_ok()`, `cpu_avx2_ok()`, `cpu_avx1_ok()`、gather-fast 判定、および AVX-VNNI 判定です。`cpu_avx512bw_ok()` はこの上限を参照しませんが、HEAD 内にこの関数の呼び出し箇所はありません。`cpu_features()` による標準 Q2_0 エンジンの AVX-512 必須チェックもこの上限とは独立です。従って `STRATA_FORCE_ISA` は標準 Q2_0 エンジンの CPU 要件を回避しません（`src/kernels/cpu/expert_layout.cpp:76-108,260-273,322-353`、`src/program/generate.cpp:2898-2900`）。
+- **エンジンの CPU expert kernels**: x86 では `cpu_avx512_ok()`、`cpu_avx2_ok()`、`cpu_avx1_ok()` などの gate が cap を参照し、Q2_0、native expert、IQ/KQ/NVFP4 等の Strata 所有 kernels の選択を狭める。実 CPU/OS の CPUID・XGETBV 条件も引き続き必要（`engine/src/kernels/cpu/expert_layout.cpp:80-110,206-265`; dispatch 例 `engine/src/kernels/cpu/expert_layout.cpp:465-485`）。
+- `STRATA_FORCE_ISA=avx2` は VNNI tier を有効にする cap 3 未満のため `cpu_vnni_ok()` も無効にする。`STRATA_VNNI_TIER=1` があっても cap が上書き条件となり、AVX-512 VNNI tier は選ばれない（`engine/src/kernels/cpu/expert_layout.cpp:188-203`）。
+- 通常の x86 build は起動時に AVX2 + FMA + F16C が必要。`avx`, `sse`, `sse4.2`, `none` により `cpu_avx2_ok()` が false になると、`STRATA_ISA_FLOOR` のない通常 build の `strata generate` は AVX2 不在として stderr に理由を出し、status 2 で終了する。低 ISA build は対応する `STRATA_ISA_FLOOR=avx` または `none` と、その CPU が build floor を実行できることが別途必要（`engine/src/program/generate.cpp:5331-5367`）。
+- この変数は ggml-cpu が build 時に含めた ISA を変えない。よって cap により Strata 自前 kernel が使えなくなったとき ggml-cpu に fallback する経路も、build floor・モデル pack 条件による（`engine/src/kernels/cpu/expert_layout.cpp:26-39`; `engine/src/program/generate.cpp:5332-5367`）。
+- **Quant layer / Inkling host kernels**: x86 の `strata::quant::caps()` を参照する dispatch で有効。Inkling の host AVX2/AVX-512 kernels は対応する TU が build に含まれることも必要。AVX-512 gate は `INK_HOST_AVX512_BUILT` がない build では常に false（`engine/src/quant/isa.cpp:59-87,109-120`; `engine/src/inkling2/ink_host_avx2.cpp:12-25`; `engine/src/inkling2/ink_host_avx512_gate.cpp:12-19`）。Quant layer の ARM64 probe は NEON/feature 判定にこの変数を適用しない（同 `isa.cpp:88-103`）。
+- **HY4 CPU experts**: `HY4_KERNELS` の x86 kernel build、または `HY4_NEON_KERNELS` の ARM build でのみ対応する branch がある。x86 で `STRATA_CPUEXP_KERNEL` に明示値を指定すると、それが probe 後の自動選択より優先するが、cap 後の probe が false にした kernel を強制できない。unsupported 指定は `best` に戻る（`engine/src/hy4flash/run/hy4_cpu_experts.cpp:1131-1185,1820-1857`）。
+- **Vision CPU tower**: tower load 時 `quant::best_isa()` を使って ops table を選ぶ。これは独立の helper であり、engine quant helper と値規則が異なる（`terminal/tools/vision/own/vit_cpu.cpp:142-148`; `terminal/tools/vision/own/cpu_caps.h:88-106`）。
 
 ## 実行時の詳細
 
-最初の `cpu_isa_cap()` 呼び出しで環境変数を読み、その結果を関数内の `static const int` に保存します。同一プロセスで環境を後から変更しても再評価されません。`cpu_avx512_ok()` は上限が `3` 未満なら false、`cpu_avx2_ok()` は `2` 未満なら false、`cpu_avx1_ok()` は `1` 未満なら false を返します。gather-fast と AVX-VNNI の判定も、上限が `3` 未満なら false になります。実際の CPUID と OS の状態チェックは各判定に残るため、上限以下の命令セットを CPU がサポートしないときはそのカーネルも使われません（`src/kernels/cpu/expert_layout.cpp:41-73,110-185,219-272`）。
+通常の engine path では、`cpu_isa_cap()` の最初の呼び出し時に環境を読む。expert probe の `static` 結果と quant の `static const Caps` も初回評価後に保持されるため、プロセス起動後に環境を変更しても該当プロセス内の選択は更新されない。値を子プロセスへ転送する Strata 側の処理は確認できなかった。CPU dispatch の cap は CLI 引数ではなく、別環境変数 `STRATA_FORCE_AVX2=1` が AVX-512 probe をさらに止める。ggml-cpu の選択はこの cap を受け取らない（`engine/src/kernels/cpu/expert_layout.cpp:26-39,75-82`; `engine/src/quant/isa.cpp:109-112`）。
 
-CPU の expert 計算では、これらの判定を使って AVX-512、AVX2、AVX1 の実装を選びます。native expert の経路では AVX-512/AVX2/AVX1 カーネルを選べない場合に ggml の `vec_dot` へフォールバックします。一方、canonical Q2_0 の `q2_rows_any()` と `act_quant_any()` は AVX-512/AVX2 の probe が false なら AVX1 実装を選ぶため、`STRATA_FORCE_ISA=sse` でもこの経路だけは AVX1 を選び得ます。標準 Q2_0 engine は実 CPU の AVX-512 要件を別途確認しますが、この環境変数は完全な CPU 命令セット・エミュレーターではありません（`src/kernels/cpu/expert_layout.cpp:356-373`、`src/kernels/cpu/native_expert.cpp:143-230`、`src/program/generate.cpp:2898-2900`）。`STRATA_FORCE_ISA=avx` を使った旧 CPU 経路の動作確認について、`docs/INSTALL.md` は通常ビルドの ggml-cpu と AVX/AVX-512 カーネルでは丸めが異なるため、生成 token が通常ビルドと一致しないことがあると説明しています（`docs/INSTALL.md:154-167`）。
+HY4 は初期化時に `probe_kernel_caps()` を呼び、その結果から best kernel を選んだ後で `STRATA_CPUEXP_KERNEL` を読む。`STRATA_FORCE_ISA` の probe は呼び出しごとで static cache ではないが、実際の kernel は初期化時に `kern` に保存される。別途 `CpuExperts::selftest_kernels()` も同じ probe を使う（`engine/src/hy4flash/run/hy4_cpu_experts.cpp:1154-1185,1820-1857,2957-2975`）。
+
+Vision helper は CPU feature `caps()` のみ static cache し、`best_isa()` ごとに `getenv("STRATA_FORCE_ISA")` を評価する。実際の tower load は `VitCpu::load()` で `best_isa()` を呼んで ops table を決める（`terminal/tools/vision/own/cpu_caps.h:67-70,88-106`; `terminal/tools/vision/own/vit_cpu.cpp:142-148`）。
+
+## ログと測定値
+
+engine expert dispatch と quant layer は、無効値に対して `strata: STRATA_FORCE_ISA=%s is not avx2, avx or sse; ignored\n` を stderr に出す。engine expert dispatch は `sse4.2` と `none` を有効値として受け入れる一方、quant layer は同じ値を無効として警告する。空文字は両者とも unset 相当で警告しない（`engine/src/kernels/cpu/expert_layout.cpp:29-38`; `engine/src/quant/isa.cpp:49-56`）。
+
+通常 build で強い cap を指定して AVX2 gate が閉じた場合、`strata generate` は `this CPU (...) does not support AVX2 with FMA and F16C...` の理由を stderr に出し、status 2 を返す（`engine/src/program/generate.cpp:5344-5351`）。HY4 の無効 `STRATA_FORCE_ISA` はそれ自体ではログを出さないが、最終的な kernel 名は起動時の `[cpuexp] ... kernel=%s` 行で観測できる。ここでは性能値を記載しない。
 
 ## 根拠
 
-- 値の読み取り、文字列比較、無効値ログ、static cache: `src/kernels/cpu/expert_layout.cpp:25-39`
-- AVX-512 / AVX2 / AVX / SSE4.2 判定と上限の反映: `src/kernels/cpu/expert_layout.cpp:41-185`
-- 上限を使う gather-fast / AVX-VNNI 判定: `src/kernels/cpu/expert_layout.cpp:219-272`
-- CPU expert のカーネル選択: `src/kernels/cpu/expert_layout.cpp:356-373`、`src/kernels/cpu/native_expert.cpp:143-230`
-- 標準 Q2_0 経路での独立した CPU 要件チェック: `src/kernels/cpu/expert_layout.cpp:322-353`、`src/program/generate.cpp:2898-2900`
-- `STRATA_FORCE_ISA` をテスト用に設定する例と旧 CPU 経路の注意: `CMakeLists.txt:1377,1403`、`docs/INSTALL.md:154-167`
+- `engine/src/kernels/cpu/expert_layout.cpp:26-39,75-82,80-110,188-208,241-265,319-327,465-485`
+- `engine/src/quant/isa.cpp:48-57,59-112,114-140`
+- `engine/src/inkling2/ink_host_avx2.cpp:12-25`
+- `engine/src/inkling2/ink_host_avx512_gate.cpp:12-19`
+- `engine/src/hy4flash/run/hy4_cpu_experts.cpp:1131-1185,1820-1858,2957-2975`
+- `engine/src/program/generate.cpp:5331-5367`
+- `terminal/tools/vision/own/cpu_caps.h:67-106`
+- `terminal/tools/vision/own/vit_cpu.cpp:142-148`
+- `docs/DETAILS.md:1274`（資料の説明は主 engine の `avx2|avx|sse` cap と一致。実装上の差異は上記 helper ごとに記載。）

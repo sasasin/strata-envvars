@@ -1,44 +1,46 @@
 # `STRATA_TOPK_OLD`
 
-調査対象: Strata main の HEAD a0116b2782a5b82622358c04a06496485d12b2d6（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-26 時点）。
 
 ## 役割
 
-QSA の block top-k 選択で、現行の最適化カーネル群ではなく元の参照カーネルを選びます。CUDA と HIP の本体、および SYCL 移植の実装に読み取り箇所があります。参照カーネルは query ごとに 256 thread のカーネルを起動し、score を読みながら radix 選択を行います。値を設定しない場合は、デバイス・入力形状などに応じた通常の dispatch（cluster / register / wide 等）が使われます。
+QSA の block top-k 選択で、最適化された dispatch を通さず、参照実装 `qsa_block_topk_ref` を使わせる切り替えです。CUDA/HIP 実装と SYCL 移植実装の `qsa_block_topk` がこの変数を読み、設定されている場合は参照カーネルへ分岐します。API のコメントでは、参照カーネルは元の 256-thread 実装で、選択 ID は通常経路と同じとされています（`engine/src/kernels/cuda/qsa_select.cu:2449-2459`、`engine/include/strata/kernels/qsa_select.hpp:92-95`）。
 
-この変数が影響するのは qsa_block_topk() が呼ばれる経路です。通常の layer 実装は g_fast_select が有効なら block score と block top-k を呼び、無効なら従来の index と top-k の経路に進みます。--no-fast-select は g_fast_select を無効にするため、その実行では本変数の参照カーネル選択に入りません。
+設定時に変わるのは top-k の実装経路です。CUDA では cluster および split 経路も抑止され、CUDA の実験的 long-context verifier 経路では multi-CTA top-k を選ばず通常の `qsa_block_topk` に戻ります（`engine/src/kernels/cuda/qsa_select.cu:3020-3039,3230-3245`）。HIP には cluster / split 分岐がなく、SYCL 実装にも split 分岐はありませんが、いずれも通常の top-k 関数内で参照実装へ分岐します（`engine/src/kernels/cuda/qsa_select.cu:3060-3076`、`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2012-2026,2046-2056`）。
 
 ## 値と判定
 
-値の内容は parse されず、std::getenv("STRATA_TOPK_OLD") != nullptr という設定有無だけで判定されます。
+値の内容は parse せず、`std::getenv(...) != nullptr` で設定有無だけを判定します。したがって値が空でも設定扱いになり、`0` や `false` も参照経路を有効にします。大文字小文字、空白、数値としての妥当性の検査はありません（`engine/src/kernels/cuda/qsa_select.cu:3020`、`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2016`、CUDA の long wrapper は `engine/src/kernels/cuda/qsa_select.cu:3234`）。
 
-| 環境変数の状態 | 判定 | qsa_block_topk() の選択 |
-|---|---|---|
-| 未設定 | false | 通常の dispatch。条件が合えば CUDA の cluster、register / wide カーネル等を選ぶ |
-| 設定あり（空文字を含む） | true | 参照カーネル qsa_block_topk_ref() に進む |
-
-1、0、false、任意の文字列はすべて同じ「設定あり」です。数値変換、大小文字、前後の空白、範囲チェックはありません。値を設定していても、プロセス内で最初に qsa_block_topk() が呼ばれた時点での結果が static const bool に保存され、その後の環境変更は再評価されません。読み取りは nq <= 0 の早期 return より前に行われます。
+| 実装経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA / HIP `qsa_block_topk`、SYCL `qsa_block_topk` | `old=false`。条件に応じて最適化経路を選ぶ | `1`、`0`、`false`、空文字、任意の文字列。値の有無で `old=true` | なし。設定値の内容による無効値はない |
+| CUDA `qsa_block_topk_long`（`STRATA_EXPERIMENTAL_SM60` ビルド） | 条件が合えば multi-CTA 経路を検討 | 上と同じ。設定ありなら multi-CTA 経路を迂回 | なし |
 
 ## 有効になる条件
 
-- qsa_block_topk() に到達することが必要です。通常の layer 経路では g_fast_select が有効な場合に呼ばれ、--no-fast-select を指定すると別経路を使います。
-- CUDA では、参照カーネルへの分岐より先に行われる cluster dispatch も !old を条件に含むため、本変数が設定されている場合は cluster kernel を試しません。その後、参照カーネルへ進みます。
-- HIP では cluster dispatch 部分がコンパイル条件によりありません。値を設定した場合は参照カーネルへ進み、未設定時は HIP 側の入力条件に応じた register kernel / 参照 kernel の dispatch になります。
-- SYCL 移植にも同じ設定有無判定と旧カーネルへの分岐があります。
-- qsa_block_topk_ref() は nq <= 0 なら何もせず、対応しない geometry または cap では stderr に qsa_block_topk: unsupported geometry or cap を出して終了します。これは環境変数固有のエラーではなく、参照カーネルの入力検査です。
+- CUDA/HIP の `engine/src/kernels/cuda/qsa_select.cu` または Intel GPU 向け SYCL の `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp` にある QSA top-k 実装がビルドされ、その `qsa_block_topk` が呼ばれること。たとえば CUDA の QSA layer は fast-select 経路で block score 計算の後に呼び出します（`engine/src/core/layer.cpp:1273-1282`）。通常の QSA 選択を通らない処理には影響しません。
+- CUDA の verifier long-context 経路で multi-CTA 版を抑止する効果は、`STRATA_EXPERIMENTAL_SM60` が定義された CUDA ビルドで `qsa_block_topk_long` が呼ばれる場合に限ります。同関数は `old` が false で、scratch・query 数・active count・geometry・capacity 条件を満たす場合だけ multi-CTA 版を試します（`engine/src/kernels/cuda/qsa_select.cu:3230-3245`）。
+- 他の環境変数や CLI 引数が `STRATA_TOPK_OLD` の値を上書きする処理はありません。設定時は cluster / split / long multi-CTA の選択を抑止し、通常の関数内で参照カーネルへ進みます。未設定時に使われる最適化経路は、backend、GPU と入力形状など各 dispatch 条件に依存します（`engine/src/kernels/cuda/qsa_select.cu:3022-3076,3232-3245`、`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2018-2056`）。
 
 ## 実行時の詳細
 
-値が有効な場合、通常の dispatch を行う前に qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream) を呼び、関数から戻ります。参照カーネルの実装は 256 thread / query で起動します。未設定時は通常の選択規則が続き、CUDA では条件により cluster、wide、register カーネルなどを使い分けます。HIP も独自の reach 条件で register kernel と参照カーネルを選びます。そのため、未設定時でもすべての呼び出しが最適化カーネルになるわけではありません。
+判定は関数内 `static const bool` です。CUDA/HIP と SYCL の `qsa_block_topk` はそれぞれ最初の呼び出し時に一度読み、以後はその値を使います。プロセス実行中に環境を変更しても反映されません。CUDA の実験的 long wrapper にも別の `static` 判定があるため、そこでは同 wrapper の初回呼び出し時に独立して読みます（`engine/src/kernels/cuda/qsa_select.cu:3016-3021,3230-3235`、`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2012-2017`）。
 
-実装コメントと qsa_select.hpp は参照版と最適化版が同じ ID を返すものとして記述していますが、この調査では性能測定や parity 実行はしていません。変数判定やカーネル選択に伴う専用ログ出力は見つかりませんでした。
+通常の `qsa_block_topk` では、CUDA は `old` が true だと cluster と split 分岐を飛ばし、HIP/CUDA 共通の後段で `qsa_block_topk_ref` を呼んで戻ります。SYCL でも cluster を試さず、同関数内の後段から参照実装に進みます。参照実装の ID 出力はその後の QSA KV 解決や attention に渡されます（`engine/src/kernels/cuda/qsa_select.cu:3029-3039,3069-3076`、`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2025-2026,2046-2056`、`engine/src/core/layer.cpp:1284-1290`）。
+
+CUDA の `qsa_block_topk_long` はこの変数が設定されると multi-CTA 経路の条件を満たさず、通常の `qsa_block_topk` に委譲します。委譲先には別の関数-local cache があります（`engine/src/kernels/cuda/qsa_select.cu:3232-3245`）。
+
+## ログと測定値
+
+この変数を検出したこと自体を知らせるログはありません。CUDA/HIP の参照実装も geometry または capacity が未対応なら `qsa_block_topk: unsupported geometry or cap` を stderr に出して `exit(1)` し、kernel launch error の場合も `qsa_block_topk: <CUDA error>` を出して `exit(1)` します（`engine/src/kernels/cuda/qsa_select.cu:2449-2459`）。通常実装側にも同じ geometry エラー文言と launch error 終了経路があります（`engine/src/kernels/cuda/qsa_select.cu:3078-3080,3104-3105`）。この調査では build や実行をしておらず、性能値は測定していません。
 
 ## 根拠
 
-- src/kernels/cuda/qsa_select.cu:1199-1209 — 参照カーネルの入力検査と 256 thread カーネル起動。
-- src/kernels/cuda/qsa_select.cu:1295-1344 — 設定有無の static cache、CUDA cluster の抑止、HIP/CUDA 条件分岐、参照カーネルへの dispatch。
-- sycl/src/kernels/cuda/qsa_select.dp.cpp:1786-1805,1953-2000 — SYCL 移植の参照カーネルと同じ dispatch。
-- include/strata/kernels/qsa_select.hpp:39-55 — qsa_block_topk と参照実装の API 説明。コメントでは参照版について「同じ ids」と記載。
-- src/core/layer.cpp:44,491,1126-1132 — fast select の既定値、setter、block top-k と従来経路の分岐。
-- src/program/generate.cpp:510,2180,3083 — --no-fast-select の既定値、引数処理、layer 機能への反映。
-- src/core/verify.cpp:1367-1384, src/prefill/prefill.cpp:2774,2821 — verify / prefill からの block top-k 呼び出し。
+- `engine/src/kernels/cuda/qsa_select.cu:3016-3105` — CUDA/HIP の環境判定、dispatch 条件、参照実装への分岐とエラー経路。
+- `engine/src/kernels/cuda/qsa_select.cu:2449-2459` — 参照実装の geometry 検査、kernel launch とエラー経路。
+- `engine/src/kernels/cuda/qsa_select.cu:3230-3245` — CUDA 実験的 long-context wrapper の別 cache と multi-CTA 抑止。
+- `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2012-2059` — SYCL 実装の環境判定、dispatch と参照実装への分岐。
+- `engine/include/strata/kernels/qsa_select.hpp:92-101` — 参照実装と long-context API の説明。
+- `engine/src/core/layer.cpp:1273-1290` — QSA fast-select の呼び出しと選択 ID の後続処理。
+- `engine/src/core/verify.cpp:2266-2276` — verifier の通常 / long-context top-k 呼び出し。

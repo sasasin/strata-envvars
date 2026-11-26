@@ -1,6 +1,6 @@
-# `--use`
+# `strata tune auto --use`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,50 +12,49 @@
 
 ## 役割
 
-自動チューニングで各設定の性能を比べるとき、どのワークロード指標を主に評価するかを選びます。エンジンやモデルの設定値そのものを直接指定するオプションではありません。
+自動チューニングで各設定を比較する評価軸を選びます。`chat` は主に生成速度（decode）を比較し、`coding` は生成速度に加えて長い入力の処理速度も評価します。チューニング結果を保存する場合、この値はプリセットの対象選択にも記録されます。
 
 ## 使い方
 
 ```sh
-strata tune auto "My profile" --use coding
+# 生成速度を主に評価する（既定値）
+strata tune auto qwen/IQ3_S
+
+# 生成と長文入力の速度を評価する
+strata tune auto qwen/IQ3_S --use coding
 ```
 
-`target` には保存済み profile 名またはチューニング対象の run configuration を指定します。`--use` を省略すると `chat` です。
+`target` にはインストール済みモデル、保存済み profile、または run configuration の JSON を指定します。
 
 ## 値と既定値
 
-- `chat`: 生成（decode）の tokens/s で比較します。
-- `coding`: 生成速度と長い prompt の処理速度を合わせた指標で比較します。両方の値が得られる場合、幾何平均 `sqrt(decode_tok_s × prompt_tok_s)` を使います。長い prompt の測定値がない場合は通常の prompt 処理速度にフォールバックし、それもなければ decode 速度が評価値になります。
-- 既定値は `chat` です。値は `argparse` の `choices` で制限され、別名や複数回指定時の独自処理はありません（同じ引数の後の値が argparse により採用されます）。
+- `chat` と `coding` のみを受け付けます。省略時は `chat` です。別名はありません（`terminal/strata_cli/tune_commands.py:21-35`）。
+- これら以外の値は parser の `choices` により拒否されます。値の追加 validation や補正は `auto()` 内にはありません（`terminal/strata_cli/tune_commands.py:34`）。
 
 ## 実行時の動作
 
-parser の値は `autotune.Options.use` に渡され、基準設定・候補設定の評価に使われます。`chat` は decode 速度、`coding` は上記の複合指標を評価し、測定結果のノイズ確認、候補の勝敗判定、確認試行にも同じ指標を用います（`strata_control/autotune.py:139-153,397-407,521-541`）。
-
-`coding` かつ `--mode thorough` で、対象 context が 64K 未満の場合は最大 `min(28000, 0.8 × context)` tokens の長い prompt を測定要求に加えます。context が 64K 以上なら `--use` の値にかかわらず長い prompt を要求します。短い context の quick mode では専用の長い prompt を追加しないため、`coding` の評価は得られた通常 prompt 指標を使います（`strata_control/autotune.py:369-377`）。prompt 処理だけを対象とする個別 knob は、`--use` にかかわらず prompt 指標で評価されます（`strata_control/autotune.py:430-433,537-545`）。
-
-結果を保存する場合、`use` は preset の `choices` に記録されます（`strata_cli/tune_commands.py:236-248`, `strata_control/presets.py:89-117`）。ただし slot の識別に使うのはモデル digest、context、KV 形式、vision、goal で、`use` は含まれません（`strata_control/presets.py:128-131`）。したがって、これらの選択が同じなら `--use coding` で得た preset も通常起動時の検索対象になり得ます。通常起動の検索は `presets.overlay(...)` の既定 `use="chat"` で行われますが、`use` が slot key に含まれないためです（`strata_control/presets.py:441-455`, `strata_cli/launch/runner.py:1425`）。
-
-このオプションはチューニングの測定・比較に作用します。チューナーは基準設定および候補をエンジンで実行して測定するため、`--use` はその実行自体を省略するものではありません（`strata_control/autotune.py:397-400,475-500`）。
+- `auto()` は選択値を `autotune.Options.use` に渡し、チューナーが baseline と候補設定を評価するときの `metric()` に使います（`terminal/strata_cli/tune_commands.py:342-345`; `terminal/strata_control/autotune.py:418-421,504-505`）。
+- `chat` の評価値は decode tokens/sec です。`coding` は decode と prompt tokens/sec の幾何平均を使い、長文 prompt の測定値がない場合は通常の prompt 測定値にフォールバックします。ただし `--concurrency` により `load_tok_s` が記録される測定では、`coding` の幾何平均より先に同時処理全体の `load_tok_s` が評価値になります（`terminal/strata_control/autotune.py:146-162`）。
+- 長文 prompt を測る条件は別に決まります。コンテキストが 65,536 token 以上ならモードにかかわらず長文 prompt を設定します。未満の場合は `coding` かつ `--mode thorough` のときに限り、最大 28,000 token（コンテキストの 80% まで）を測定します。これ以外は長文 prompt の測定を設定しません（`terminal/strata_control/autotune.py:386-395`）。
+- 候補設定の適用条件にも `use` が伝わります。例えば prompt chunk 候補は長文 prompt がある場合に対象となり、`coding` ならコンテキスト長が 65,536 未満でも条件を満たし得ます（`terminal/strata_control/tune_knobs.py:88-89,232`）。
+- チューニング完了後、`choices_from_config(cfg, use=a.use)` で選択値を含む対象情報を作り、結果が改善したか既定値確認となり、かつ `--no-save` がない場合にプリセットを保存します（`terminal/strata_cli/tune_commands.py:396-410`; `terminal/strata_control/presets.py:89-116`）。したがって `chat` と `coding` は別の preset slot になります。
 
 ## 適用条件と副作用
 
-- `coding` の長い prompt 測定は、上記の mode と context 条件に依存します。常に長文 prompt の速度を測定するとは限りません。
-- `--no-save` がなければ、改善が確認された場合、または現設定が最速と確認された場合に preset を保存します。その preset の選択情報に `use` が記録されます。`--no-save` を指定した場合は preset を作成しません（`strata_cli/tune_commands.py:236-248`）。
-- 測定はエンジン実行を伴います。候補が失敗・スキップされることがあり、ベース設定を測定できない場合は `base_failed` となります（`strata_control/autotune.py:397-407,475-490`）。
+- このオプションは `strata tune auto` の測定・候補選択を変えます。モデル起動時の推論方式を coding モードに切り替える指定ではありません。
+- 通常の保存プリセット照合は `presets.overlay()` の既定値 `use="chat"` で行われます。Terminal と server の起動経路はいずれも `overlay(cfg)` を呼び、`--use coding` は渡しません。そのため coding 用 slot に保存されたプリセットは通常の起動時照合（chat slot）には一致しません（`terminal/strata_control/presets.py:488-502`; `terminal/serve/server_parts/http_api.py:486-496`; `terminal/strata_cli/tune_commands.py:544-550`）。
+- 値自体によるファイル・ネットワーク・GPU の直接操作はありませんが、`strata tune auto` は実際に基準設定と候補を起動して測定し、結果が保存条件を満たせばプリセットを作成します（`terminal/strata_cli/tune_commands.py:355-387,408-410`）。測定を開始せず候補計画だけを見る場合は `--plan` を併用できます（`terminal/strata_cli/tune_commands.py:349-353`）。
 
 ## 出力とエラー
 
-値が `chat` / `coding` 以外の場合、parser の choices validation により受理されず、argparse の usage/error 経路になります（`strata_cli/tune_commands.py:20-32`; parser の登録は `strata_cli/cli.py:486`）。測定開始前の profile 読込・設定 validation や engine 不在など `_fail` を通る失敗は、人向けなら stderr に `strata: ...` を出し、`--output json` なら `ok: false` の JSON を stdout に出して対応するコードを返します（`strata_cli/tune_commands.py:103-108,178-196`）。測定後の `base_failed` / `inconclusive` 等は別経路で、結果 JSON の `ok: true` と `result.code` / 終了コードに結果を記録します（`strata_cli/tune_commands.py:230-261`, `strata_control/autotune.py:355-367,397-407`）。
+- `--use` の値に対する固有のエラー処理はありません。許可外の値は parser の choices 制約で拒否されます（`terminal/strata_cli/tune_commands.py:34`）。
+- チューニング結果は通常、人間向け表示または `--output json` の JSON で出力されます。`--use` は成功時の出力形式を変更しません（`terminal/strata_cli/tune_commands.py:314,421-425`）。
 
 ## 根拠
 
-- `strata_cli/tune_commands.py:20-32` — `strata tune auto` parser、許容値と既定値。
-- `strata_cli/tune_commands.py:174-197,230-261` — option の伝達、preset 選択情報への記録、出力と終了コード。
-- `strata_control/autotune.py:50-63,139-153` — `Options.use` と評価指標。
-- `strata_control/autotune.py:369-377,397-407,430-433,475-505,521-545` — 測定条件、基準・候補評価、prompt-only knob の評価。
-- `strata_control/presets.py:89-117,128-131,441-455` — `use` を含む preset choices と、`use` を含めない slot 検索。
-- `strata_cli/launch/runner.py:1425` — 通常起動からの preset 検索呼び出し。
-- `strata_cli/cli.py:486` — `tune auto` parser の登録。
-
-調査範囲は記載した checkout のソースです。同一 revision の既存 CLI `--help` や Release 配布物は照合していません。
+- `terminal/strata_cli/tune_commands.py:21-50` — `strata tune auto` parser と `--use` の choices / 既定値。
+- `terminal/strata_cli/tune_commands.py:309-345,396-410` — option を tuner と preset choices に渡す経路。
+- `terminal/strata_control/autotune.py:146-162,386-395,418-421` — 評価式、長文 prompt 条件、評価関数の使用箇所。
+- `terminal/strata_control/tune_knobs.py:88-89,232` — coding 選択による候補条件。
+- `terminal/strata_control/presets.py:89-116,488-502` — preset slot の選択値と overlay の既定値。
+- `terminal/serve/server_parts/http_api.py:486-496` — 起動時の保存 tuning 照合経路。

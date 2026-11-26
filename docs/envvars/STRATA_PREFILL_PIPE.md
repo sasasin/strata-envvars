@@ -1,50 +1,54 @@
 # `STRATA_PREFILL_PIPE`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-複数 GPU の layer split で、prompt の chunk サイズを各 stage の処理が重なるように計画する設定です。通常の prompt prefill 動作全般や decode を切り替える変数ではありません。`--prefill-pipe` が未指定のときの既定値として使われます。対象実装は共通の prefill 経路で、Qwen3.6 専用 engine の `STRATA_Q36_CHUNK` とは別の設定です。
+複数段の layer split で prompt を読む際、各 stage の処理が重なるように prompt の chunk 長を計画する opt-in 値。`0` は通常の buffer chunk、`1` は既存の chunk 数を条件付きで均等化、それより大きい値はこの PC の `b/a` 比を token 単位で指定する。環境変数は `Prefill::pipe_value()` が参照し、計画は `Prefill::plan_chunk()` から `pipeline_chunk()` に進む（`engine/src/prefill/prefill.cpp:3618-3625,3647-3687`）。
+
+この計画が働くのは prompt が 2 段以上の layer split で読まれる場合だけ。stage 数が 1、または後段 stage に hand-in 済みの場合は `plan_chunk()` が無効値を返し、通常の buffer chunk を使う（`engine/src/prefill/prefill.cpp:3678-3687,4283-4297`）。設定値そのものは生成 token 選択の設定ではなく、prompt の分割長を決める。
 
 ## 値と判定
 
-環境値は最初に必要になったときに一度だけ読み、`static const` に保存します。未設定または空文字列なら `0` です。非空文字列は `std::atof` で数値化し、`std::max(0.0, value)` により負値を `0` にします。文字列全体の検証はしないため、`"1536tail"` は `1536`、数値として読めない文字列は `0` になります。正の無限大は後段で最大 `1,048,576` token 相当に丸められます。NaN は `std::max(0.0, NaN)` の結果として無効値側になります。
+環境変数は `std::getenv` で取得し、未設定または空文字なら `0.0`。それ以外は `std::atof` の結果を `std::max(0.0, ...)` で負値から下限 0 にする。文字列全体の妥当性検査やエラー通知はない。`atof` が認識する数値の先頭部分が使われるため、たとえば `12junk` は 12、`junk` は 0 になる。`true` / `false` は真偽値として扱われず、どちらも 0 になる。`nan` も `std::max` のこの引数順では 0、正の無限大は正値として残る（後段の ratio 計算では `2^20` token に上限をかける）。環境値は `pipe_value()` 初回評価時に static cache され、その後の環境変更は反映されない（`engine/src/prefill/prefill.cpp:3621-3625,3641-3644`）。
 
-| 値 | layer split での意味 |
-|---|---|
-| 未設定、空、0、負値、無効文字列 | pipeline chunk 計画を使わない |
-| `0` より大きく `1` 以下 | 既定の chunk 数を維持し、条件を満たすとき chunk を均等化する |
-| `1` より大きい有限値 | stage 間の固定費/ token 費の比 `b/a`（token 単位）として chunk 数を探索する |
+| 条件 | unset / 空文字 | 有効になる値 | 無効になる値・扱い |
+|---|---|---|---|
+| `STRATA_PREFILL_PIPE` | 0（pipe 無効） | `1` は均等化規則、`1` より大きい有限値は `b/a` 比。例: `2`, `1024`, `12junk` | `0`, 負数、`true`, `junk`, 空文字は 0 と同じく pipe 無効。正値 `0 < R < 1` は pipe を有効にし、均等化規則（比 0 として計画）を選ぶ。 |
+| CLI `--prefill-pipe R` が指定された場合 | 環境変数より CLI が優先 | `atof` 後に 0 以上へ clamp。CLI も `0 < R <= 1` で均等化、`R > 1` で比を指定 | 負数・空・数値で始まらない文字列は 0。CLI 値は `Prefill::set_pipe()` に入り、環境値の評価より優先（`engine/src/program/generate.cpp:4033,6830`; `engine/src/prefill/prefill.cpp:3618-3625,3637-3639`）。 |
+| serve リクエストの `pipe=R` | そのリクエストでは unset を表す `-1`。run の CLI / 環境設定を使用 | `strtof` 後に 0 以上へ clamp。非負値は run 設定を上書き | 負数は 0 へ clamp され、そのリクエストでは pipe 無効。空や非数値文字列も変換値 0。 |
 
-設定名から想像される真偽値 parse ではありません。たとえば `true` は `atof` で `0` となり無効、`1suffix` は均等化モード、`1536tail` は比率 1536 として扱われます。大文字小文字の比較はありません。
-
-優先順位は、リクエストの `pipe=` 値、起動引数 `--prefill-pipe`、環境変数、既定値 `0` の順です。`--prefill-pipe` は負数も 0 に clamp されます。サーバーの `strata_tune.prefill_pipe` は数値（bool は除外）かつ 0..262144 の場合だけ `pipe=` として転送されます。各リクエストの `pipe=` 値はそのリクエストに限り、リクエストごとに未指定状態へ戻されます。
+`pipeline_chunk()` は段数 2 未満、prompt 長 0 以下、または cap 0 以下なら cap を返す。`R <= 1` の均等化は、現在の chunk 数が 1 より大きく、現在の末尾 chunk が `stream_all_min()` 以上の場合だけ 256 token grid に切り上げて均等化する。それ以外は cap（現在の分割）を維持する。`R > 1` は候補 chunk を探索し、現行分割より 3%を超えて良い計画がある場合だけ変更する。比は整数 token に丸めて最大 `2^20` に制限され、候補は最大 64 chunk、最小 chunk は `STRATA_PREFILL_PIPE_FLOOR` に従う（既定 512、256 token grid 上で 256..4096 に clamp）（`engine/src/prefill/prefill.cpp:3627-3634,3641-3676`）。
 
 ## 有効になる条件
 
-値が正でも、prefill が 2 stage 以上の layer split であること、現在の prefill が stage 間で hand-in 済みでないことが必要です。1 stage、単一 GPU、値 0 以下では `plan_chunk()` が 0 を返し、既存の buffer chunk (`impl_->T`) を使います。従って環境変数を設定しただけでは単一 GPU の chunk サイズは変わりません。
-
-この環境変数の fallback は CLI 引数とリクエスト設定に限られます。`--prefill-pipe 0` は環境変数を明示的に無効化します。CLI の値は parse 後 `Prefill::set_pipe()` で設定され、リクエスト値は `Prefill::set_pipe_request()` で上書きされます。
+- 少なくとも 2 段の layer split が構成され、先頭 stage が prompt segment を計画すること。1 GPU / 1 stage では値が正でも無効（`engine/src/prefill/prefill.cpp:3678-3687`）。
+- `--prefill-pipe` を指定した場合は環境変数より優先される。serve ではリクエスト `pipe=R` が run 値より優先される。リクエストごとに request override を設定し直すため、前の request の値は持ち越さない（`engine/src/program/generate.cpp:6830,18864-18865,18925,18943`; `engine/src/prefill/prefill.cpp:3618-3625`）。
+- prompt segment の予定 chunk が buffer chunk と同じなら専用計画による変更はなく、ログも出ない。既存の segment を再開する際は保存された計画が現在の `pipe_setting()` と同等な `pipe_key()` の場合に再利用される（`engine/src/program/generate.cpp:20775-20800`）。
+- 設定表では NVIDIA / AMD 向けとされている（`docs/SETTINGS.md:264`）。この環境変数を読むコードは共通の prefill 実装に一箇所あり、個別 OS / build macro による別の値解釈は見当たらない。GPU 実行は行っていないため、個々の機器で split が成立する条件や性能はこの調査では実測していない。
 
 ## 実行時の詳細
 
-`Prefill::plan_chunk()` は stage 数を数え、正の設定値かつ 2 stage 以上の場合に `pipeline_chunk()` を呼びます。値が 1 以下なら現在の chunk 数を維持した均等化候補を使いますが、chunk 数が 1 以下、または末尾 chunk が `stream_all_min()` 未満なら均等化せず、既存の chunk 上限を返します。値が 1 より大きい場合は `b/a` を最大 `2^20` token に丸め、許される chunk 数候補を評価します。候補サイズは 256 token 境界に切り上げ、最低 512 token とし、通常の分割より計算コストが 3% を超えて改善するときだけ小さい chunk を採用します。
+CLI 引数は `std::atof` で読み、指定があれば起動設定に保存する。serve の各 request は `pipe=` key を `strtof` で読み、`Prefill::set_pipe_request()` に設定する。優先順位は request override（0 以上）、CLI（0 以上）、環境変数 static 値の順。request key がなければ `-1` の sentinel をセットして run 設定へ戻す（`engine/src/program/generate.cpp:4033,6830,18864-18865,18925,18943`; `engine/src/prefill/prefill.cpp:3618-3639`）。環境値の初回評価より前に CLI が設定されていると `pipe_value()` は CLI を返して環境値を読まない。環境値が初回に読まれた後は process 内でキャッシュされる。
 
-計画された chunk が従来の上限より小さく実際に分割される場合、stderr に `strata prefill: <N> tokens in <C>-token chunks over <S> stages (--prefill-pipe <値>)` 形式のログが出ます。通常値 1 以下の表示は `1: today's chunk count, evened out`、大きい値は `<丸めた b/a>: b/a` です。ログが出ない場合も、変数を読んだことや設定値が正であることだけから chunk が変更されたとはいえません。
+先頭 stage は segment 全体の長さと stage 数を使って chunk を一度計画し、計画が有効なら各 run に `force_chunk()` で渡す。これにより分割実行、decode slot と並行する実行、checkpoint / BYIELD からの継続でも同じ segment の chunk が使われる（`engine/src/program/generate.cpp:20769-20809,20876-20885`; `engine/src/prefill/prefill.cpp:4286-4302`）。
 
-環境値の変更は同一プロセスでは、static 初期化後に再評価されません。CLI や per-request 値は別の上書き経路です。環境変数自体を子プロセスへ転送する処理はこの実装では確認できません。
+`pipeline_chunk()` が cap より小さい chunk を選んで実際に複数 chunk へ分けるとき、stderr に次の形式で計画を記録する。設定が有効でも chunk が変わらない場合、この計画ログは出ない（`engine/src/prefill/prefill.cpp:3694-3700,4295-4302`）。
 
-## 文書との照合
+```text
+strata prefill: <tokens> tokens in <chunk>-token chunks over <stages> stages (--prefill-pipe <setting>)
+```
 
-`docs/MULTI_GPU.md` の「Prompt chunks sized for the pipeline」節は、`STRATA_PREFILL_PIPE=<R>` を `--prefill-pipe` と同じ設定として説明し、chunk の計画と layer split に限ることを記載しています。実装とも整合します。同節にある性能測定値は特定環境の記録であり、この調査で再測定していません。
+## ログと測定値
+
+上記の stderr 計画ログが実際に chunk 数・長さを変更する場合に出る。無効値、条件不成立、または選択 chunk が現行 cap と同じ場合に、この変数専用の警告やエラーはない。通常の prompt read が失敗した場合は呼び出し側の一般的な read error 経路へ進むが、環境変数の値を理由とする失敗経路は実装上見当たらない。
+
+`docs/MULTI_GPU.md:151` は `--prefill-pipe` / 環境変数の要約と calibration に触れている。数値測定は同資料の表にある CLI 指定の測定であり、環境変数単独の性能測定としては記載しない。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:2037-2069` — env 読み取り、parse、static cache、CLI/request 値との優先順位。
-- `src/prefill/prefill.cpp:2071-2105,2112-2128` — 比率の丸め、候補 chunk 計画、適用条件、ログ。
-- `src/prefill/prefill.cpp:2410-2429` — 既定 chunk と planned chunk の選択、実際の prefill への適用。
-- `src/program/generate.cpp:622-625,2456,4246` — CLI オプションの説明、parse、設定反映。
-- `src/program/generate.cpp:11651,11685,11702` — request 値の既定、parse、各 request での設定。
-- `serve/server.py:1199-1209` — server tuning config から request `pipe=` を送る条件。
-- `src/program/generate.cpp:12757-12805` — request prompt segment に chunk を計画し、forced chunk として読み進める処理。
-- `docs/MULTI_GPU.md:245-292` — 設計説明と記載された測定条件・例。
+- `engine/src/prefill/prefill.cpp:3615-3639` — 環境値の読み取り、変換、cache、CLI / request 値の優先順位。
+- `engine/src/prefill/prefill.cpp:3641-3676` — 比の丸め・上限、chunk 選択、均等化規則と改善判定。
+- `engine/src/prefill/prefill.cpp:3678-3700,4283-4302` — stage 条件、実 chunk への適用、stderr 記録。
+- `engine/src/program/generate.cpp:4033,6830,18864-18865,18925,18943,20769-20809` — CLI 設定、server request 上書き、segment 計画。
+- `docs/SETTINGS.md:264`, `docs/MULTI_GPU.md:151` — 対応 backend 表記と機能の概要。

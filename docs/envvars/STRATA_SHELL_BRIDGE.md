@@ -1,48 +1,44 @@
 # `STRATA_SHELL_BRIDGE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `main...origin/main` で未コミット変更なし。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-デスクトップシェルが App Host に渡す、シェル内 loopback bridge の URL です。App Host はこの URL と対になる `STRATA_SHELL_TOKEN` を使い、デスクトップアプリのアップデーターやシェル通知へ HTTP 要求を送ります。Strata 自身が bridge listener を `127.0.0.1` の空きポートで開き、その URL を子プロセス環境に設定します。通常の推論エンジンやモデル設定を制御する変数ではありません。
+Strata Desktop の Rust shell が App Host に渡す、shell 側 loopback bridge の URL です。Host の `app-updater.mjs` はこの値と対になる `STRATA_SHELL_TOKEN` を使って Tauri updater の確認・インストール API を呼びます。`shell-prefs.mjs` も同じ bridge を使って shell 通知を試みます。これは利用者が任意の機能を切り替える設定ではなく、shell が作成した bridge の接続先を Host に渡す内部値です。通常の Terminal やソース checkout では shell が bridge を渡さないため、アプリ自身の更新機能は利用できません（`app/desktop/src-tauri/src/updater.rs:1-14,441-464`、`app/host/server/app-updater.mjs:1-10,19-22`、`app/host/server/shell-prefs.mjs:66-77`）。
 
 ## 値と判定
 
-Rust 側では `STRATA_SHELL_BRIDGE` を読みません。bridge の起動に成功した場合だけ、生成した `http://127.0.0.1:<port>` を App Host 子プロセスの環境に設定します。起動に失敗した場合は URL を設定せず、アプリ内アップデーターは利用できません（Windows/macOS の Host 起動経路）。
+Strata 内で数値や真偽値への変換はしません。App Host の updater と通知 helper は、渡された `env` オブジェクトから bridge と token を読み、両方が JavaScript の truthy 値で、bridge が `/^http:\/\/127\.0\.0\.1:\d+$/` に完全一致するときだけ client を作ります（`app/host/server/app-updater.mjs:19-28`、`app/host/server/shell-prefs.mjs:66-70`）。
 
-Node 側の `createAppUpdater` と `createShellNotifier` は、値を文字列として変換せず、`STRATA_SHELL_TOKEN` とともに判定します。両方が truthy で、URL 全体が `^http://127\.0\.0\.1:\d+$` に一致した場合だけクライアントを作ります。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `createAppUpdater` / `createShellNotifier` の `env` | bridge または token がない場合は client を作らない | `http://127.0.0.1:5555` と、空でない token | 空文字、`http://localhost:5555`、`http://[::1]:5555`、末尾 `/`、port なし、空 token |
+| Linux window process から `setBridge` で登録 | 登録前は bridge 未設定 | URL は同じ loopback 形式、token は文字列かつ 16 文字以上 | URL 不一致、token が文字列でない、15 文字以下。`setBridge` は `That is not a bridge address.` を投げる |
 
-| 値 | Strata 側の扱い |
-|---|---|
-| 未設定または空文字 | falsy のためクライアントを作らない。通常の子 Host 起動時は、bridge が起動できなければ Rust もこの変数を設定しない。 |
-| `http://127.0.0.1:<数字>` | token も truthy ならクライアントを作る。ポートは正規表現上、1 桁以上の数字であれば一致する。 |
-| `http://localhost:<port>`、別ホスト、HTTPS、末尾 `/`、パス付き、空白入り | 正規表現に一致せずクライアントを作らない。 |
-| その他の非空文字列 | URL parse や数値変換をせず、完全一致しない限り使わない。 |
-
-この判定自体に CLI 引数や設定ファイルとの優先順位はありません。Windows/macOS のシェル起動経路では `Command::env` が生成 URL で同名の既存環境値を上書きします。環境を明示的に消去する処理はなく、bridge がない場合は通常の子プロセス環境継承の対象です。Node の `createAppUpdater` にはポート範囲検査がないため、正規表現に合っても接続できない URL は要求時に失敗し得ます。
+URL の正規表現は port を数字列としてしか確認せず、数値範囲や URL 全体を別途 parse しません。環境値経由では token の長さや文字種も検査せず、truthy かどうかだけです。Desktop shell は空き port で listener を開き、`127.0.0.1:<port>` を作り、random token とともに host へ渡すため、通常のアプリ起動ではこの内部生成値が使われます（`app/desktop/src-tauri/src/updater.rs:443-454,457-464`、`app/host/server/app-ui.mjs:29,91-95`）。
 
 ## 有効になる条件
 
-- Windows/macOS のデスクトップシェルは App Host コマンドを起動する際、listener の起動に成功したとき `STRATA_SHELL_BRIDGE` と `STRATA_SHELL_TOKEN` を設定します。Host はそれを updater と notifier の作成に使います。
-- Linux では `run_window_process` が別プロセスで bridge listener を起動し、Host の `/api/control/ui` に URL/token を POST します。Host の `app-ui.mjs` はこの通知から updater を作るため、アップデーター登録は環境変数とは別経路です。`shell-prefs.mjs` の notifier は起動時の `process.env` から作られるため、この API 登録だけでは notifier に bridge は入りません。さらに Rust の `/shell/notify` は Linux では `shown: false` を返します。
-- Host を手動起動する場合など、環境から受け取った値を利用するには、URL が上記の loopback 形式で token も空でない必要があります。
-- `app-ui.mjs` の `setBridge` で後から登録する updater は、同じ URL 形式に加えて token が文字列で16文字以上であることを要求します。通常の起動時 `createAppUpdater` にはこの長さ検査はありません。
+- updater が動くには `STRATA_SHELL_TOKEN` も必要です。Host は token を `Authorization: Bearer ...` に設定し、shell bridge は一致しない・欠けた認証値に `401 Unauthorized` と `not allowed` を返します（`app/host/server/app-updater.mjs:20-24`、`app/desktop/src-tauri/src/updater.rs:389-398`）。
+- Windows/macOS の Desktop は Host の起動コマンドへ bridge URL と token を設定します。listener の bind または port 取得に失敗した場合 `start` は `None` を返し、2つの値を Host に設定しません（`app/desktop/src-tauri/src/main.rs:554-568`、`app/desktop/src-tauri/src/updater.rs:441-464`）。
+- Linux では shell が updater bridge を開き、Host の `/api/control/ui` に `{bridge:{url,token}}` を送って登録します。登録前の updater client がない場合、window mode でも呼び出しは `APP_UPDATER_NOT_READY` で失敗します。browser mode では updater は利用不可です（`app/desktop/src-tauri/src/main.rs:1295-1297,1335-1349`、`app/host/server/index.mjs:1438-1460`、`app/host/server/app-ui.mjs:64-80,91-104`）。
+- `STRATA_SHELL_BRIDGE` があっても `STRATA_SHELL_TOKEN` がなければ client は作られません。通常の process environment 以外に、Linux `setBridge` は同名キーを持つオブジェクトを updater factory に渡して client を作り直します（`app/host/server/app-ui.mjs:91-95`）。
+- 通知 client は同じ値を使いますが、shell bridge の `/shell/notify` は Linux build では常に `shown: false` を返します。したがって Linux で URL/token があっても、この経路からの shell 通知は表示されません（`app/desktop/src-tauri/src/updater.rs:427-435`）。
+- bridge が開いても、アプリ更新の check/install はユーザーによる更新確認・更新操作から呼ばれるもので、Host 起動だけでは updater feed へ問い合わせません（`app/desktop/src-tauri/src/updater.rs:11-14`、`app/host/server/app-updater.mjs:9-10,35-42`）。
 
 ## 実行時の詳細
 
-Windows/macOS の `start_host` は listener を開始し、成功時の `Bridge.url` を `apply_env` で Host 子プロセスへ渡します。`createAppUi` の初期化時に `createAppUpdater` が環境を読み、URL/token をクロージャに保持します。後から Linux ウィンドウプロセスが `/api/control/ui` で bridge を登録する場合は、`setBridge` が受け取った値から別の updater を作り、現在の updater として優先します。プロセス環境を再読み込みする処理はありません。
+`app-updater.mjs` は `createAppUpdater` 呼び出し時に `env.STRATA_SHELL_BRIDGE` と token をローカル変数へ読み込みます。`shell-prefs.mjs` の `createShellNotifier` も同様に生成時の値を保持するため、これらの client は環境変更を後から再読込しません。Host の `index.mjs` は起動時に両 factory を呼びます（`app/host/server/app-updater.mjs:19-24`、`app/host/server/shell-prefs.mjs:66-70`、`app/host/server/index.mjs:148-152`）。
 
-アップデーターは明示的な更新確認・インストール時だけ bridge の `/app-update/check`、`/app-update/install`、`/app-update/status` に要求します。HTTP 応答が成功でなければ応答 JSON の `error`、または状態コードを含むエラーになります。インストール処理の失敗は status の `error` として Host に返ります。Host 起動時に変数が無効なら updater がなく、UI は「アプリ更新不可」として扱います。
+Windows/macOS では Rust が listener を起動し、Host の子プロセス環境へ URL/token を設定してから spawn します。Linux では Host 起動時の環境変数設定ではなく、window process が認証付き POST で URL/token を登録し、`app-ui.mjs` の bridge client を差し替えます。Host は `/api/control/ui` を受け取った時点で登録値を検査します（`app/desktop/src-tauri/src/main.rs:554-578,1335-1349`、`app/desktop/src-tauri/src/updater.rs:443-464`、`app/host/server/index.mjs:1438-1460`、`app/host/server/app-ui.mjs:91-95`）。
 
-通知では `createShellNotifier` が同じ URL/token を使って `/shell/notify` を呼びます。HTTP 要求や応答 JSON の取得が失敗した場合は通知結果を `shown: false` として返し、Host の `/api/shell/notify` も例外を捕捉して `shown: false` を返します。bridge は認証 token の不一致に `401 Unauthorized`、未対応 route に `404 Not Found` を返します。
+updater client は `/app-update/check`、`/app-update/install`、`/app-update/status` を呼び、通常の各 request には 120 秒、status polling には 15 秒の timeout を設定します。shell updater listener は接続読み取りに 5 秒の timeout を設定します。通知 client は `/shell/notify` を 5 秒で呼びます。Host の更新確認では失敗詳細を `appCheckFailed` に入れ、画面用の一般文言 `Strata couldn't check for a new version of the app itself. Try again later.` と details を返します。更新処理では `app check: ...` を update log に記録します。認証失敗は HTTP 401、更新 check 内の失敗は HTTP 502、実行中の二重 install 要求は HTTP 409 になります（`app/host/server/app-updater.mjs:23-28,41-65`、`app/host/server/shell-prefs.mjs:71-77`、`app/desktop/src-tauri/src/updater.rs:379-417`、`app/host/server/updates.mjs:84-105`、`app/host/server/native-control.mjs:811-829`）。
 
 ## 根拠
 
-- `apps/desktop/src-tauri/src/updater.rs:227-240,243-250` — loopback の空きポートで listener を開き、bridge が存在する場合に子プロセス環境へ URL/token を設定。
-- `apps/desktop/src-tauri/src/main.rs:497-505` — Windows/macOS の Host 起動時に bridge を作り、環境へ適用。
-- `apps/desktop/src-tauri/src/main.rs:1165-1178` — Linux の別ウィンドウプロセスが bridge 情報を `/api/control/ui` に登録。
-- `apps/host/server/app-updater.mjs:13-22,24-40` — bridge URL/token の判定、値の保持、HTTP 要求と失敗判定。
-- `apps/host/server/app-ui.mjs:63-90` — 起動時 updater の作成、動的 bridge 登録の検証と置き換え。
-- `apps/host/server/shell-prefs.mjs:64-75` — notifier の起動時判定、通知要求と失敗時の結果。
-- `apps/host/server/index.mjs:128-143,1319-1328,1958-1962` — Host 起動時の notifier 作成、shell bridge 登録、通知 API の応答。
-- `apps/desktop/src-tauri/src/updater.rs:174-224` — bridge の認証、update/status/notify route の応答。Linux 通知は `shown` を false にする。
+- `app/desktop/src-tauri/src/updater.rs:1-14,218-230,379-464` — bridge の用途、loopback listener、環境への設定、認証と route。
+- `app/desktop/src-tauri/src/main.rs:554-578,1295-1297,1335-1349` — OS ごとの Host 起動と Linux window からの bridge 登録。
+- `app/host/server/app-updater.mjs:19-67` — bridge 値の判定、読み取り時期、Host updater request。
+- `app/host/server/shell-prefs.mjs:66-77` — 通知 client の bridge 読み取り。
+- `app/host/server/app-ui.mjs:64-104`、`app/host/server/index.mjs:1438-1460` — app mode、Linux bridge setter、登録 API。
+- `app/host/server/updates.mjs:84-105`、`app/host/server/native-control.mjs:808-829` — 更新 check の UI 結果と update log。

@@ -1,42 +1,45 @@
 # `STRATA_TQ_ISA`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-CPU 上で Strata 独自の trellis（TQ2_T / TQK6 / TQK7）expert カーネルを使うとき、実行する命令セットの上限を指定します。上限を指定しない場合は CPU が実行できる最も広い実装（AVX-512、AVX2、scalar の順）を選びます。この変数はカーネルの有効・無効ではなく、選択する ISA を制限します。
+CPU の trellis 量子化（TQ/Gyro）expert 行カーネルが使う命令セットを上限指定する。値は `tq_isa()` が選ぶ ISA を scalar または AVX2 に制限できる。未指定時は x86 CPU が使える AVX-512、AVX2、scalar の順に選ぶ。これはモデルの量子化形式や GPU カーネルを切り替える設定ではなく、CPU native expert の trellis 行処理に渡す ISA の選択だけを変える（`engine/src/kernels/cpu/tq_cpu.cpp:48-55,167-175`、`engine/src/kernels/cpu/native_expert.cpp:675-679,803-805`）。
 
 ## 値と判定
 
-`src/kernels/cpu/tq_cpu.cpp` は値を文字列全体で、大文字小文字を区別して比較します。
+`std::getenv` で文字列を取得し、未設定または空文字なら上限 `2`（制限なし）とする。文字列全体を大文字小文字を区別して比較するのは `scalar` と `avx2` だけで、それぞれ上限 `0` と `1`。それ以外はすべて上限 `2` になる。数値変換や前後空白の除去はない（`engine/src/kernels/cpu/tq_cpu.cpp:48-55`）。
 
-| 値 | ISA 上限 | 選択結果 |
-|---|---|---|
-| 未設定または空文字 | 2（既定） | CPU が対応すれば AVX-512、次に AVX2、どちらも不可なら scalar |
-| `scalar` | 0 | scalar |
-| `avx2` | 1 | AVX2 対応 CPU なら AVX2、そうでなければ scalar |
-| その他すべて（`avx512`、`AVX2`、空白付き文字列、不明な値を含む） | 2 | 既定と同じ自動選択 |
+| 条件 | unset / 空文字 | 値と選択への上限 | 無効値の扱い |
+|---|---|---|---|
+| x86-64 | 上限 2。実 CPU で実行可能なら AVX-512、次に AVX2、どちらも不可なら scalar | `scalar` → 0（scalar 固定）、`avx2` → 1（AVX2 以下）。`avx512` も特別分岐はないが、その他の文字列と同じ上限 2 | `0`、`1`、`true`、`false`、`AVX2`、`avx2 ` などは上限 2となり、未指定時と同じ自動選択 |
+| x86-64 以外（AVX ユニットを含まないビルド） | scalar | 指定値にかかわらず scalar | 不正値エラーや警告はなく scalar |
 
-したがって実装では `avx512` を特別扱いせず、明示値として認識するのは `scalar` と `avx2` だけです。不明値に警告を出したり、scalar に fallback したりはしません。CPU が対応しない ISA は実行時機能判定で候補から外れます。
+x86 の AVX-512 と AVX2 はそれぞれ `cpu_avx512_ok()` / `cpu_avx2_ok()` が true の場合だけ候補になる。環境変数が CPU にない命令を強制することはなく、`avx2` 指定でも AVX2 非対応なら scalar に落ちる（`engine/src/kernels/cpu/tq_cpu.cpp:155-164,167-175`）。
 
 ## 有効になる条件
 
-- CPU native expert 経路で trellis 型（ggml type 144–146）の gate/up または down rows を処理するときに参照されます。ほかの形式の CPU カーネル選択には使われません。
-- x86-64 では AVX2 / AVX-512 実装を CPU 機能判定の後に選べます。AVX-512 対応判定は `cpu_avx512_ok()`、AVX2 対応判定は `cpu_avx2_ok()` に委ねられます。
-- x86-64 以外では AVX 実装はビルドされず、scalar のみです。
-- `STRATA_NO_TQ_KERNELS` が非ゼロとして判定され、かつ利用中の ggml に対象型の `vec_dot` がある場合、trellis rows は ggml-cpu 側へ進むため、この ISA 選択は使われません。対象型の `vec_dot` がない場合は Strata 独自カーネルが維持されます。
+- `tq_cpu.cpp` を含む CPU native expert ビルドであること。x86 の通常ビルドでは AVX2 / AVX-512 の各翻訳単位もビルド対象になり、非 x86 では dispatcher と scalar 行カーネルを含む（`engine/cmake/backends/cpu.cmake:303-317,343-346`）。Metal は `tq_cpu.cpp` の scalar 実装を含む（`engine/metal/CMakeLists.txt:145-146`）。SYCL も CPU native expert 用に trellis CPU 行カーネル一式を加え、コメント上 GPU 側の trellis 経路とは区別されている（`engine/sycl/CMakeLists.txt:220-240`）。
+- 実行時に CPU native expert の gate/up または down 行処理へ trellis 型が渡ること。gate/up は `tq_rows_own(f.gu_type)`、down は `tq_rows_own(f.d_type)` が真のとき `tq_isa()` を渡す（`engine/src/kernels/cpu/native_expert.cpp:38-48,675-679,803-805`）。非 trellis 型や他の実行経路ではこの変数を参照しない。
+- `STRATA_NO_TQ_KERNELS` との関係: `tq_rows_own` は trellis 型で、`tq_kernels_enabled()` が true なら常に Strata の行カーネルを使う。`STRATA_NO_TQ_KERNELS` が `atoi` で非ゼロとなる場合は、ggml 型情報に dot 実装があるか、`STRATA_OWN_CPU_QUANT` が有効かによって Strata の行カーネルがなお選ばれる場合がある。したがってこの別変数が有効な環境では、`STRATA_TQ_ISA` の選択結果が使われるかはその分岐にも依存する（`engine/src/kernels/cpu/tq_cpu.cpp:177-185`、`engine/src/kernels/cpu/native_expert.cpp:38-48`）。
+- CLI 引数、設定ファイル、別の ISA 指定による上書きは見つからなかった。`STRATA_TQ_ISA` は CPU feature 判定で選択できる最大 ISA を制限するだけである（`engine/src/kernels/cpu/tq_cpu.cpp:167-175`）。
 
 ## 実行時の詳細
 
-`env_isa_cap()` は `std::getenv()` を呼び、値が未設定または空なら上限 2 を返します。非空値は `scalar` との完全一致で 0、`avx2` との完全一致で 1、それ以外は 2 になります。数値変換は行いません。
+最初に `tq_isa()` が呼ばれた時に `static const TqIsa` を初期化し、その中で `STRATA_TQ_ISA` を一度読む。選んだ値はプロセス内に保持されるため、その後の環境変更は反映されない（`engine/src/kernels/cpu/tq_cpu.cpp:48-55,167-175`）。コマンド行やリクエストごとの再評価はない。
 
-`tq_isa()` は選んだ ISA を関数内の `static const` に保存します。最初にこの関数が呼ばれた後でプロセス環境を変更しても、選択は再評価されません。選択は各 row kernel の呼び出しに渡され、AVX-512 / AVX2 / scalar の実装へ dispatch されます。環境変数自体を読み取ったことを示すログはこの実装にはありません。
+native expert の gate/up では `tq_gu_rows()` に、down では `tq_rows()` に選択 ISA が渡る。通常の trellis レイアウトでは scalar / AVX2 / AVX-512 の対応行カーネルへ分岐する。Gyro-L の pair layout は AVX-512 選択時も pair 用 AVX2 実装を使い、scalar 指定時だけ scalar pair 実装を使う（`engine/src/kernels/cpu/native_expert.cpp:675-679,803-805`、`engine/src/kernels/cpu/tq_cpu.cpp:238-276`）。不正な ISA を直接渡す呼び出し側バグには `tq_rows` / `tq_gu_rows` が `std::abort()` するが、この環境変数の不正値は自動選択扱いなので、その経路にはならない（`engine/src/kernels/cpu/tq_cpu.cpp:266-281`）。
+
+## ログと測定値
+
+この変数の読み取り、未認識値、ISA 選択について Strata のログ出力はない。無効値も警告されず自動選択される。CPU が実行できない ISA は選択されず、環境変数に起因する終了・timeout の経路はない（`engine/src/kernels/cpu/tq_cpu.cpp:48-55,155-175`）。
+
+`docs/GYRO.md:262-265` は `avx2` と `scalar` が命令セットを cap すると説明しているが、実装で `avx512` は上限 2 の自動選択と同じ扱いである。同資料の約 45% という記述は AVX2 上での trellis CPU カーネルと ggml-cpu の時間比較についての資料上の主張であり、この環境変数の効果を測定した値ではない。`docs/SETTINGS.md:344` の `on / off` 分類も値判定を示すものではなく、実装は真偽値を解釈しない。
 
 ## 根拠
 
-- `src/kernels/cpu/tq_cpu.cpp:42-49`: 環境変数の読み取り、既定値、完全一致判定。
-- `src/kernels/cpu/tq_cpu.cpp:96-115`: CPU 対応判定、自動選択、選択結果の static cache。
-- `src/kernels/cpu/tq_cpu.cpp:170-178,183-195`: ISA ごとの row dispatch。
-- `src/kernels/cpu/native_expert.cpp:31-37,62-76,224-228,297-299`: trellis 型と独自カーネル経路、ggml fallback、および gate/up・down 側からの呼び出し。
-- `include/strata/kernels/cpu/tq_cpu.hpp:21-24`: カーネルの位置づけと変数の設計意図。動作の値判定は実装を根拠とした。
-- `docs/GYRO.md:305-309`: CPU trellis kernels の概要と比較用途の説明。記載の性能説明は特定環境の説明であり、本調査では一般化していない。
+- 読み取りと値判定、ISA 選択の cache、CPU feature guard: `engine/src/kernels/cpu/tq_cpu.cpp:48-55,155-175`
+- ISA ごとの行カーネル分岐と不正な内部 ISA の abort: `engine/src/kernels/cpu/tq_cpu.cpp:238-281`
+- native expert での trellis 型選別、gate/up・down 呼び出し: `engine/src/kernels/cpu/native_expert.cpp:38-48,363-385,675-679,803-805`
+- CPU / Metal / SYCL のビルド対象: `engine/cmake/backends/cpu.cmake:303-317,343-346`、`engine/metal/CMakeLists.txt:145-146`、`engine/sycl/CMakeLists.txt:220-240`
+- 関連資料と分類: `docs/GYRO.md:262-265`、`docs/SETTINGS.md:344`

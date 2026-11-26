@@ -1,44 +1,45 @@
 # `STRATA_METAL_PROMPT`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal backend の prompt 処理経路を選びます。値が文字列 `window` と完全一致すると、prompt kernels を使う高速経路を選ばず、prompt を decode window で読みます。Strata の `docs/MAC.md` はこれを遅い exact fallback（約 190 tok/s）として説明しています。CUDA/HIP/SYCL の prompt 経路にはこの変数の読み取りはありません。
+Metal の prompt prefill 経路を選ぶ開発・診断用スイッチ。値が完全一致で `window` の場合、通常の prompt GEMM 経路を避け、decode window を使って prompt を処理する。それ以外は通常経路の選択に進む。これは Metal engine の `prompt_run_rows` でのみ読まれる（`engine/metal/src/engine/window.cpp:3743-3776`）。
+
+通常経路では、非 streaming の長い prompt は `Window::prompt`、streaming の長い prompt は prompt GEMM chunks を使う条件があり、短い prompt や GEMM を選ばない場合は decode window に戻る。`window` はこれらの通常経路選択を強制的に decode-window fallback にする。fallback は最大 8 行ずつ `run` と `commit` を行い、DFlash2 tap と `on_chunk` callback も各 chunk の後に呼ぶ（`engine/metal/src/engine/window.cpp:127,3748-3776`）。
 
 ## 値と判定
 
-| `STRATA_METAL_PROMPT` | `windows` 判定 | 動作 |
-|---|---:|---|
-| 未設定 | false | 通常の Metal prompt 経路を使う。prompt 長や streaming 状態により prompt kernels、prompt GEMM、または decode window に分岐する。 |
-| `window` | true | 長さや streaming 状態によらず decode window 経路を使う。 |
-| 空文字、`WINDOW`、`1`、`0`、その他の文字列 | false | 未設定と同じ経路選択。 |
+関数内 `static const bool` の初期化時に `std::getenv` で読み、値全体を大文字小文字を区別して文字列 `window` と比較する。未設定は false、空文字も false。`1`、`true`、`WINDOW`、前後に空白を含む値など、完全一致しない値はすべて false となり通常経路選択に進む。数値変換や無効値警告はない。候補索引の「on / off」分類ではなく、実装が判定する値は `window` である（`engine/metal/src/engine/window.cpp:3745-3748`）。
 
-値は数値変換されず、文字列全体を大文字小文字を区別して `window` と比較します。環境変数の判定は `prompt_run_rows()` 内の `static const bool` に保存されるため、プロセス内の初回判定後に環境を書き換えても反映されません。根拠: `metal/src/engine/window.cpp:2555-2559`。
+| 条件 | unset | fallback を強制する値 | fallback を強制しない値 |
+|---|---|---|---|
+| `prompt_run_rows` が呼ばれる Metal engine | 通常経路選択（短い prompt は decode-window fallback） | `window` | 空文字、`0`、`1`、`true`、`WINDOW`、`window ` など |
 
 ## 有効になる条件
 
-- `Prefill::run()` が `STRATA_GPU_METAL` ビルドで Metal engine の `prompt_run()` を呼ぶ経路に限られます（`src/prefill/prefill.cpp:4338-4348`）。
-- `STRATA_METAL_PROMPT=window` なら、resident/streaming の別を問わず decode window fallback に進みます。
-- 変数が未設定または `window` 以外でも、resident model では prompt 長が `STRATA_METAL_PROMPT_MIN`（既定 32 rows）以上の場合に prompt kernels を使います。これ未満なら decode window に進みます。`STRATA_METAL_PROMPT_MIN` は初回判定時に `atoll()` で読みます。根拠: `metal/src/engine/window.cpp:2558-2560`。
-- streaming model では、`STRATA_METAL_PROMPT` が `window` 以外のとき `STRATA_METAL_PROMPT_GEMM` と `STRATA_METAL_PROMPT_GEMM_MIN` による別判定を行います。既定では prompt GEMM が有効で、長さの既定下限は 64 rows です。GEMM しない場合は decode window に進みます。したがって `STRATA_METAL_PROMPT` はこの streaming 用 GEMM 判定より優先されます。根拠: `metal/src/engine/window.cpp:2560-2579`。
+- Metal engine を含む macOS build であること。Metal CMake project は Apple 以外で configure を拒否し、engine が `STRATA_GPU_METAL` 定義の下で Metal prompt 関数を呼ぶ（`engine/metal/CMakeLists.txt:1-2,18-20,103-109`; `engine/src/prefill/prefill.cpp:9633-9649`）。
+- Metal prompt prefill または `engine/metal/probe/window_probe.cpp` の prompt 呼び出しが実行されること。候補値は decode/generation 全般の切替ではない（`engine/metal/probe/window_probe.cpp:109`; `engine/metal/src/engine/window.cpp:3733-3741`）。
+- `g_window` が準備済みであること。未準備なら環境変数による分岐より先に `metal prompt: the decode window is not up yet` を返す（`engine/metal/src/engine/window.cpp:3743-3747`）。
+- 他の prompt 閾値・切替との関係: `STRATA_METAL_PROMPT_MIN` は通常経路の非 streaming prompt 閾値（既定 32 行）、`STRATA_METAL_PROMPT_GEMM` と `STRATA_METAL_PROMPT_GEMM_MIN` は streaming GEMM の選択に使われるが、`window` が true の場合これらの通常経路選択ブロックを通らない（`engine/metal/src/engine/window.cpp:3746-3767`）。
+- CLI 引数による `STRATA_METAL_PROMPT` の上書きは、確認した読取経路にはない。値はプロセス環境から取得する。
 
 ## 実行時の詳細
 
-decode window 経路は最大 `MAXT`（8）rows ずつ token を `int32_t` に変換し、`Window::run()` と `Window::commit()` を呼びます。各 chunk の後に `on_chunk` callback があれば実行します。window がまだ用意されていない場合は `metal prompt: the decode window is not up yet` を返し、run/commit または callback が失敗した場合も prompt 処理は失敗します。根拠: `metal/src/engine/window.cpp:52,2555-2557,2580-2587`。
+`prompt_run` は埋め込み行ポインタを一時的に保持して `prompt_run_rows` に委譲する。`prompt_run_rows` は decode window の存在を確認してから `windows` の static 初期化を行うため、環境値は最初の window-ready prompt 呼び出しで一度だけ読み取られ、同一プロセス内の後続呼び出しでは再読取されない。プロセス実行中に環境値を変えても、このキャッシュ済み判定には反映されない（`engine/metal/src/engine/window.cpp:3735-3748`）。
 
-通常の resident prompt kernel 経路では `Window::prompt()` が呼ばれ、chunk ごとに prompt chain を実行します。streaming の prompt GEMM 経路は `prompt_region(true/false)` で region を囲み、chunk ごとに GEMM prompt を実行します。いずれも `STRATA_METAL_PROMPT=window` では選択されません。根拠: `metal/src/engine/window.cpp:2560-2577`, `metal/src/engine/prompt_chain.inc:394-420`。
+`window` が有効なら、prompt 全体を `MAXT`（8）行以下の範囲に分けて token ID を `int32_t` にし、各範囲で `g_window->run(..., false, ...)`、`commit`、tap 配信、任意の `on_chunk` callback を順に実行する。どれかが false を返せばそこで終了し、そのエラー文字列を呼び出し元へ返す。生成 token のサンプリングはこの fallback loop では行わない（head 引数は false、`engine/metal/src/engine/window.cpp:126-127,3768-3775`）。
 
-この変数専用の有効化ログはありません。decode window 経路でエラーになった場合は上記の prompt error が返ります。prompt kernel 経路では `STRATA_METAL_TRACE` または `STRATA_METAL_PROFILE` が設定されている場合に prompt tokens、時間、tok/s の診断が stderr に出ます（`metal/src/engine/prompt_chain.inc:416-419`）。
+通常経路では、`windows == false` かつ非 streaming で `n >= STRATA_METAL_PROMPT_MIN`（未設定時 32）なら `g_window->prompt` を使う。streaming では `STRATA_METAL_PROMPT_GEMM` が未設定または文字列 `0` 以外、かつ `n >= STRATA_METAL_PROMPT_GEMM_MIN`（既定 64）の場合に prompt GEMM chunks を選び、そうでなければ同じ decode-window loop に進む（`engine/metal/src/engine/window.cpp:3747-3776`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/MAC.md:183-194` は `STRATA_METAL_PROMPT=window` を decode window 経由の遅い exact fallback とし、約 190 tok/s と記載しています。同じ文書の `:165` では fast prompt path と decode window の比較として mean KL 0.0004、top-1 agreement 99.4–99.6% を挙げています。ソースは `window` の完全一致で fallback に切り替えることを確認できます。性能・品質値は文書記載の測定値であり、この調査で再測定したものではありません。
+この環境変数の判定自体はログを出さず、無効値も警告しない。Metal 側の prompt 実行が失敗すると `prompt_run` の false と `err` が `Prefill::run` へ返る（`engine/metal/src/engine/window.cpp:3745,3772-3775`; `engine/src/prefill/prefill.cpp:9637-9649`）。decode window 未準備時のエラー文字列は `metal prompt: the decode window is not up yet`。
 
 ## 根拠
 
-- Metal backend の呼び出し条件: `src/prefill/prefill.cpp:103-110,4338-4348`
-- 値の判定、static cache、resident/streaming 分岐: `metal/src/engine/window.cpp:2555-2587`
-- Decode window の chunk 処理: `metal/src/engine/window.cpp:52,2580-2587`
-- Prompt kernel の chunk 処理と診断ログ: `metal/src/engine/prompt_chain.inc:394-420`
-- 設定説明と測定値: `docs/MAC.md:165,183-194`
+- `engine/metal/src/engine/window.cpp:3733-3776` — prompt wrapper、環境値の cache、通常経路と fallback の分岐、fallback の処理順。
+- `engine/metal/src/engine/window.cpp:126-127` — window の最大行数 `MAXT=8`。
+- `engine/src/prefill/prefill.cpp:280-288,9633-9649` — Metal build 側の宣言と `Prefill::run` からの呼び出し・戻り値。
+- `engine/metal/CMakeLists.txt:1-2,18-20,103-109` — Metal project の macOS 条件と engine build option。
+- `engine/metal/probe/window_probe.cpp:109` — 同梱 probe の prompt 呼び出し。

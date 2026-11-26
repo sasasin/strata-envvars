@@ -1,58 +1,53 @@
 # `--native-rope`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（エンジンの root parser） |
+| コマンド | `strata`（エンジン引数、サブコマンドなし） |
 | オプション | `--native-rope` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ |
+| 値 | 値を取らない真偽フラグ。指定すると有効 |
 
 ## 役割
 
-テキスト経路の rotary position embedding (RoPE) に、実験的な native CUDA 算術を選びます。標準経路の RoPE ではなく `native_rope_apply` を使う切り替えです。エンジンの usage も「experimental pinned text-only CUDA rotary arithmetic」と説明しています（`src/program/generate.cpp:852`）。
+QSA の RoPE（rotary positional embedding）処理で、通常の RoPE 経路に代えて実験的な native 算術カーネルを使います。CLI の説明文は「pinned text-only CUDA rotary arithmetic」としています。通常は無効で、モデル形状などがカーネルの対応条件を満たす必要があります。`--native SHARD1` プリセットを使う場合は、このフラグも自動で有効になります。
 
 ## 使い方
 
 ```sh
-strata generate --pack pack/full --tokens "1,2,3" --native-rope
+strata MODEL --native-rope
 ```
 
-`--tokens` は必須のトークン ID 列です。実際の入力 pack とトークン列に置き換えてください（`src/program/generate.cpp:806-812`）。
+`MODEL` はエンジンが受け付けるモデル指定です。オプション自体は引数を取りません。ヘルプ文字列では実験的機能として案内されています（`engine/src/program/generate.cpp:1254`）。
 
 ## 値と既定値
 
-- 引数 parser は `--native-rope` を見つけると `native_rope` を `true` にします。初期値は `false` で、通常は指定しない限り native RoPE を使いません（`src/program/generate.cpp:464`, `src/program/generate.cpp:2496`）。
-- 値を要求せず、同じフラグを複数回指定しても真偽値を再度 true にするだけです。フラグの直後に値を置く構文ではありません。余分な値が独立した引数として parser に渡ると未知引数扱いになります（`src/program/generate.cpp:2416-2421`, `src/program/generate.cpp:2496`, `src/program/generate.cpp:2787-2792`）。
-- parser 段階でこのフラグ固有の数値 validation はありません。RoPE 関数側は入力ポインタ、行数、幅、回転幅、scaling、アラインメント、stream を検証します（`src/kernels/cuda/native_rope.cu:189-202`）。
+`--native-rope` の parser はフラグを `true` にするだけで、値の読み取りや専用の CLI validation はありません。設定の初期値は `false` です（`engine/src/program/generate.cpp:802,3922`）。同じフラグを繰り返しても有効のままです。対応する `--no-native-rope` は parser にありません。
+
+native kernel 側では、入力ポインタと stream が有効であること、行数が 1〜65535、head 幅が 128 または 256、回転次元が 64、RoPE scaling が有効、float32 バッファが 4-byte aligned であることを検証します。部分的に重なるバッファも拒否します。条件を満たさない場合は `std::invalid_argument`、起動時の CUDA エラーは `std::runtime_error` になります（`engine/src/kernels/cuda/native_rope.cu:194-223`）。これらは parser 時ではなく、native 経路が呼び出された時点の検証です。
 
 ## 実行時の動作
 
-起動時に parser の値を `native_rope_set_enabled` に設定します（`src/program/generate.cpp:3941`）。native RoPE が有効な場合、通常レイヤーの QSA 正規化後の回転処理は `native_rope_apply`、無効の場合は `rope_neox_apply` に分岐します（`src/core/layer.cpp:1131-1140`）。検証・MTP の RoPE 経路にも同じ native/標準の分岐があります（`src/core/verify.cpp:1559-1564`, `src/core/mtp.cpp:947-956`, `src/core/mtp.cpp:989-994`）。
+parser の設定は `native_rope_set_enabled` に渡され、カーネル側の有効状態になります（`engine/src/program/generate.cpp:6123`、`engine/src/kernels/cuda/native_rope.cu:178-179`）。有効時、QSA 層の正規化後のデータに native RoPE を適用し、無効時は `rope_neox_apply` を使います（`engine/src/core/layer.cpp:1154-1164`、`engine/src/core/verify.cpp:2028-2033`）。MTP の Q/K 処理にも同じ有効状態の分岐があります（`engine/src/core/mtp.cpp:1301-1306,2406-2419,2457-2477`）。native kernel は RoPE scaling から引数を作り、適合する場合は登録済みの cos/sin table を利用し、そうでない場合は native 算術経路で起動します（`engine/src/kernels/cuda/native_rope.cu:173-176,209-220`）。
 
-native 実装は `RopeScaling` の値を kernel 引数に変換して CUDA kernel を起動し、CUDA launch error は例外にします（`src/kernels/cuda/native_rope.cu:204-217`）。RoPE scaling の値は別オプションやモデル GGUF metadata から組み立てられ、このフラグ自体は scaling 値を変更しません（`src/program/generate.cpp:3669-3707`）。詳細は [`--rope-scaling`](--rope-scaling.md)、[`--rope-scale`](--rope-scale.md)、[`--rope-freq-base`](--rope-freq-base.md) などの文書を参照してください。
-
-`--native SHARD1` を指定した場合、native preset の初期化が `native_rope` を含む native 経路群を自動で有効化します（`src/program/generate.cpp:3263-3268`）。
+`--native-qsa` と native RoPE がともに有効で、head 幅が 128/256 かつ回転次元が 64 などの条件を満たす場合、QSA の norm と RoPE をまとめた経路が選ばれます。通常の native RoPE 呼び出しへフォールバックする分岐もあります（`engine/src/core/verify.cpp:2030-2037`、usable 条件は `engine/src/kernels/cuda/native_rope.cu:180-191`）。また、`--native SHARD1` は `native_rope` を含む複数の native 設定をまとめて有効にします（`engine/src/program/generate.cpp:5160-5165`）。
 
 ## 適用条件と副作用
 
-- 実装関数は幅 `128` または `256`、回転幅 `64`、行数 `1..65535`、有効な scaling、4-byte aligned な F32 入出力・position 配列と明示 stream を要求します。入出力の部分重複や position 配列との重複も拒否します（`src/kernels/cuda/native_rope.cu:189-202`）。この関数レベルの条件を満たさない場合、標準 RoPE への fallback は実装されていません。
-- `--native-qsa` も有効で、形状が利用条件に合う場合は QSA の RMSNorm と RoPE を一つの kernel にまとめる経路が選ばれます。`STRATA_NO_NORM_ROPE` はこの融合可否に影響しますが、native RoPE 自体の有効化フラグではありません（`src/core/verify.cpp:1566-1572`, `src/kernels/cuda/native_rope.cu:175-186`）。
-- `STRATA_ROPE_TABLE=1` が設定され、同じ scaling の RoPE table が登録済みなら、native kernel はその table を使います。未設定・不一致なら別の算術 kernel 経路を起動します。この環境変数は `--native-rope` の代替ではありません（`src/kernels/cuda/native_rope.cu:151-171`, `src/kernels/cuda/native_rope.cu:204-215`）。
-- フラグの説明は text-only です。一方、parser に `--vision` との明示的な排他検証はなく、engine 起動時には vision 用 mRoPE table も設定されます（`src/program/generate.cpp:852`, `src/program/generate.cpp:3942-3957`）。この調査では `--native-rope --vision` の対応範囲や正しさまでは確認できません。
-- 実行時の副作用は GPU 上の RoPE kernel の選択・起動と、その結果の token/query/key 表現への反映です。ファイルやネットワークへの書き込みをこのオプションが行う処理は確認できません。
+フラグを設定しただけでは全モデルで即時に native kernel が実行されるとは限らず、実際に対象の QSA/MTP RoPE 経路へ到達した時に使用されます。呼び出し時の形状・alignment・scaling 条件は上記の kernel validation に従い、不適合なら実行時エラーになります。QSA の呼び出し側は例外を捕捉してエラー文字列にし、処理失敗を返します（`engine/src/core/layer.cpp:1154-1164`）。MTP 側も例外を捕捉して `err` に設定し、失敗を返す経路があります（`engine/src/core/mtp.cpp:1293-1298,2438-2442`）。
+
+このフラグ自体がファイルやネットワークを操作する処理は確認できません。native kernel は device stream に計算を投入し、直後に取得できる kernel launch error を例外にします（`engine/src/kernels/cuda/native_rope.cu:215-223`）。性能上の効果や特定モデルでの適合可否は、このソース調査だけでは保証できません。
 
 ## 出力とエラー
 
-- parser が未知の引数を受け取ると `unknown argument: ...` を stderr に出し、usage を stderr に表示して終了コード `2` を返します（`src/program/generate.cpp:2787-2792`）。
-- native 関数は引数・shape 不一致で `std::invalid_argument`、CUDA kernel 起動エラーで `std::runtime_error` を送出します（`src/kernels/cuda/native_rope.cu:191-217`）。QSA の該当処理は例外文を `err` に格納して失敗を返し、MTP の該当処理も `mtp: ...` を `err` に格納して失敗を返します（`src/core/layer.cpp:1131-1141`, `src/core/mtp.cpp:982-986`）。最終的な利用者向け表示と終了コードは呼び出し元・実行モードに依存するため、このオプション固有の一律な出力としては確認できません。
+parser はこのフラグ固有の警告や validation error を出しません。native kernel の引数・バッファ条件を満たさない場合は `native RoPE requires aligned F32 rows, width 128/256, rotation 64, valid base/scaling and explicit stream`、バッファの部分重複では `native RoPE buffers partially overlap` の例外になります。kernel 起動エラーも例外になります（`engine/src/kernels/cuda/native_rope.cu:196-223`）。呼び出し元がそれを処理エラーへ変換する箇所は上記の通りです。CLI 全体での最終的な終了コードや標準出力・標準エラーへの表示形式は、ここで確認した呼び出し範囲だけからは特定できません。
 
 ## 根拠
 
-- parser の既定値・help・受理: `src/program/generate.cpp:464`, `src/program/generate.cpp:852`, `src/program/generate.cpp:2416-2421`, `src/program/generate.cpp:2496`
-- `--native` からの自動有効化・初期設定: `src/program/generate.cpp:3263-3268`, `src/program/generate.cpp:3941`
-- native/標準 RoPE の分岐: `src/core/layer.cpp:1131-1140`, `src/core/verify.cpp:1559-1564`, `src/core/mtp.cpp:947-956`, `src/core/mtp.cpp:989-994`
-- shape validation・kernel launch・table 経路: `src/kernels/cuda/native_rope.cu:151-217`
-- 調査対象 checkout の開始時状態: `git rev-parse HEAD` は `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`、`git status --short --branch` は `## main...origin/main`（未コミット変更なし）。
+- `engine/src/program/generate.cpp:802,1254,3922` — 既定値、help 表示、parser 登録。
+- `engine/src/program/generate.cpp:5160-5165,6123` — `--native` プリセットとの関係と実行時有効化。
+- `engine/src/core/layer.cpp:1154-1164`、`engine/src/core/verify.cpp:2028-2037` — QSA の通常/native 分岐、融合条件、例外処理。
+- `engine/src/core/mtp.cpp:1301-1306,2406-2419,2438-2442,2457-2477` — MTP での適用箇所と例外処理。
+- `engine/src/kernels/cuda/native_rope.cu:173-223` — 有効状態、対応条件、RoPE kernel 呼び出しとエラー。

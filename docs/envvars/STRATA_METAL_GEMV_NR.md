@@ -1,42 +1,45 @@
 # `STRATA_METAL_GEMV_NR`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。作業ツリーは `main...origin/main` で、変更はありませんでした。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal エンジンの window GEMV で、複数トークンをまとめて処理するときの出力行タイルを選びます。既定のタイルは `NR=1`、値 `2` が条件を満たすと `NR=2` 相当のカーネルを選びます。カーネルでは各 lane が `NR` 行を扱い、重みを読み出す際に複数トークン分の入力を使います。これは Metal エンジン専用の調整フックで、CUDA/HIP/SYCL の共通設定ではありません。
+Metal decode window の GEMV カーネルで、複数 token をまとめて処理するときに各 lane が扱う出力行数（カーネル template の `NR`）を 1 から 2 にする実験用の選択値です。既定値は 1 で、環境変数を `2` と解釈した場合だけ条件付きで tile を変更します。GEMV の対象演算やモデル設定を切り替えるものではありません。実装は `Window::gemv` です（`engine/metal/src/engine/window.cpp:1019-1061`）。
 
 ## 値と判定
 
-| 環境変数の状態・値 | `nr_env` の値 | 効果 |
-|---|---:|---|
-| 未設定 | 1 | 既定タイルを使う |
-| 数値変換結果が2 | 2 | 後述の条件を満たす GEMV で `Rr=2` を選ぶ |
-| 空文字、数値で始まらない文字列 | 0 | 特別なタイル選択はしない |
-| その他の値 | `atoi` の変換結果 | 変換結果が厳密に2の場合に限り有効 |
+`std::getenv` で値の有無を調べ、設定されていれば `std::atoi` の戻り値を使います。文字列全体の検証はなく、`atoi` が先頭から読める整数を変換します。したがって未設定は 1、空文字は 0、`true` のような数字で始まらない文字列も 0 です。`2tail` や先頭空白付きの ` 2` は 2 と判定されます。変換結果がちょうど 2 でない値は tile 変更を起こしません。大文字小文字の扱いはありません（文字列比較ではないため）。読み取り式は `engine/metal/src/engine/window.cpp:1036-1045`。
 
-読み取りは C の `std::atoi` です。文字列全体の検証はせず、先頭の空白・符号を許容する整数の接頭部を変換し、その後ろの文字は無視します。したがって `2junk` は2になり有効ですが、`1`, `0`, `3`, `-2`, `junk`, 空文字はこの分岐を有効にしません。値の範囲チェックや clamp はありません。
+| 条件 | unset | tile を変える値 | tile を変えない例 |
+|---|---:|---|---|
+| Metal `Window::gemv` の初回呼び出し時 | 1 | `2`, `02`, `+2`, `2tail`, ` 2`（`atoi` 結果が 2） | 空文字、`0`, `1`, `3`, `-2`, `true`, `0anything` |
+
+`atoi` は変換不能な文字列を 0 として扱い、無効値の警告や fallback ログはありません。2 以外の変換結果は既定 tile のままです。数値変換後に上限・下限を clamp する処理はありません（同 `window.cpp:1039-1044`）。
 
 ## 有効になる条件
 
-値の変換結果が2で、かつ同じ `Window::gemv` 呼び出しにおいて両方を満たす場合だけタイル選択が変わります。
-
-- `ntok > 1`
-- 出力行数 `n_out >= 2048`
-
-通常の既定呼び出しは `NR=1` です。条件を満たした場合、初期タイル (`L`, `S`, `K`) に応じてさらに調整します。具体的には、`S=8,K=2` は `S=4,K=2` に、`S=8,K=1` は `S=4` にし、`K=1` または `L=32,K=2` なら `Rr=2` にします。これらのタイル値から `gemv_<type>_<L>_<Rr>_<S>_<K>` のパイプライン名を組み立てるため、別カーネルが選ばれます。
+- Metal backend の `Window::gemv` が実行されること。Metal プロジェクトは macOS 専用で、`STRATA_METAL_ENGINE=OFF` の build では engine を作りません（`engine/metal/CMakeLists.txt:1-2,18-20,105-109,168-177`）。
+- GEMV の token 数 `ntok` が 1 より大きく、出力行数 `n_out` が 2048 以上であること。この条件を外れる場合、値が 2 でも tile は変わりません（`engine/metal/src/engine/window.cpp:1039-1044`）。
+- 通常の window `run` からは各 layer の GEMV と head GEMV が対象です。batch rows が一つの window にまとめられる経路も `run(S, ...)` を呼ぶため対象になり得ます（`engine/metal/src/engine/window.cpp:1153-1214,1614-1617,1644-1667`）。一方、batch slot を一つずつ処理する fallback は `run(1, ...)` を使うため、この条件を満たしません（同 `window.cpp:2255-2269`）。
+- MTP draft model の GEMV は `Window::gemv` とは別の lambda で tile を作り、この値を読みません（`engine/metal/src/engine/window.cpp:2707-2725`）。CLI 引数や他の環境変数によるこの値の上書きはありません。
 
 ## 実行時の詳細
 
-環境変数は `Window::gemv` 内の関数ローカル `static const int` 初期化子で読みます。プロセス内で最初にこの GEMV 関数へ入った時点の値がキャッシュされ、以降の呼び出しでは読み直しません。初回読み取り後に環境を変更しても反映されません。
+環境値は `Window::gemv` 内の関数ローカル `static const int` で初期化されるため、プロセス中の最初の同関数呼び出しで一度だけ読み取られます。その後に環境を変更しても反映されません（`engine/metal/src/engine/window.cpp:1039`）。
 
-`Window::gemv` は、attention の射影、ルーター、共有 expert、出力 head などで使われます。ただし、上記のトークン数・出力行数条件を満たさない個々の呼び出しには効果がありません。選択されたカーネルでは `NR` が1から2になると、lane が担当する重み行数を増やし、複数トークン窓の入力ロードを共有します。Metal カーネルのコメントは `NR` 間で加算順序が同じで答えは変わらないと説明していますが、この調査では実機で出力や性能を測定していません。
+値が 2 で適用条件も満たす場合、初期 tile `(L, Rr, S, K)` のうち、`S=8,K=2` なら `S=4,K=2` にし、`S=8,K=1` なら `S=4` にします。さらに `K=1`、または `L=32,K=2` のとき `Rr=2` にします。それ以外の初期 tile はこの条件による変更を受けません。ここで `Rr` がカーネルの `NR` に対応し、結果として選ばれる `gemv_<type>_<L>_<Rr>_<S>_<K>` pipeline 名と grid の行 tile 幅が変わります（`engine/metal/src/engine/window.cpp:1021-1045,1048-1061`; template 引数 `NR` と lane ごとの行処理は `engine/metal/kernels/gemv.metal:24-45,60-76`）。
 
-この変数の挙動を説明する記載は `docs/DETAILS.md` と `docs/MAC.md` では見つかりませんでした。したがって性能差や速度向上は記載しません。
+カーネルのコメントは NR の違いで加算順序を揃え、答えは変わらない設計意図を記しています（`engine/metal/src/engine/window.cpp:1037-1038`）。この調査ではその正確性を実行・測定していません。登録情報でも本変数は `research`、NR=2 は調整実験として記録され、製品採用の結論は付いていません（`terminal/data/settings-register.json:22371-22399`）。
+
+## ログと測定値
+
+環境変数の値や選ばれた NR を知らせる専用ログ、無効値の警告、変数固有の終了経路はありません。選択された関数名に対応する Metal function が見つからない場合、pipeline 取得時に stderr へ `mtl: no function <function> `（エラー詳細がある場合は続く）を出して exit code 3 で終了します（`engine/metal/src/engine/window.cpp:327-333,1048-1050`; `engine/metal/src/mtl_rt.mm:229-255`）。変数による速度差の測定値は、対象 commit の利用者向け資料から確認できません。
 
 ## 根拠
 
-- `metal/src/engine/window.cpp:566-597`: `Window::gemv` の初期タイル選択、環境変数の `atoi` と static cache、適用条件、パイプライン名・dispatch 設定。
-- `metal/src/engine/window.cpp:657-701, 758-783, 865, 1025-1027, 1070`: window の層処理や head から `gemv` を呼ぶ例。
-- `metal/kernels/gemv.metal:1-7, 24-45, 60-73, 93-101`: `NR` が lane あたりの行数を示すこと、タイル別カーネルの生成、および複数 token の GEMV 処理。
-- `docs/MAC.md:3-4`: Metal が Strata の独自エンジンとして macOS/Apple Silicon で使われる説明。
+- `engine/metal/src/engine/window.cpp:1019-1061` — GEMV の既定 tile、値の読み取り、適用条件と dispatch 設定。
+- `engine/metal/src/engine/window.cpp:1153-1214,1489-1492,1614-1617,1644-1667,2255-2269,2707-2725` — window / batch rows / fallback / MTP の呼び出し範囲。
+- `engine/metal/kernels/gemv.metal:1-7,24-45,60-90,93-100` — GEMV template の NR、行処理、利用可能な kernel variants。
+- `engine/metal/CMakeLists.txt:1-2,18-20,105-109,168-177` — Metal engine の build 条件。
+- `engine/metal/src/mtl_rt.mm:229-255` — pipeline が見つからない場合の診断と終了。
+- `terminal/data/settings-register.json:22371-22399` — 候補の登録情報と research 扱い。挙動の根拠には使用していません。

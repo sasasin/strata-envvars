@@ -1,55 +1,54 @@
 # `STRATA_UPDATE_TRUSTED_KEYS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。Strata の作業ツリーは `main...origin/main` で clean。外部ライブラリの環境変数の挙動は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-組み込みの `strata_control/update_keys.json` に登録された公開鍵に、追加の Ed25519 公開鍵を持つ JSON ファイルを加えます。主な用途はローカル feed やテスト用 feed の署名検証です。値はオン・オフ指定ではなくファイルパスです。追加鍵があれば feed と engine component の署名検証に使われます。
-
-この名前は `signing.ENV_EXTRA_KEYS` として定義され、`load_trusted_keys()` が `os.environ.get()` 経由で値を読むため、候補一覧にあるだけの語ではなく Strata が実際に読む環境変数です。直接の読み取りと鍵読込: `strata_control/signing.py:31,194-216`。
+`strata_control/signing.py` の `load_trusted_keys()` が、同梱の `update_keys.json` に加えて信頼する公開鍵 JSON ファイルを指定する。値は鍵そのものや `1` のような有効化フラグではなく、追加鍵ファイルのパスである。読み込んだ鍵は更新 feed の署名検証と、署名付き engine component の検証に使われる。環境変数だけで署名検証を必須にはせず、署名検証が行われる経路に検証鍵を追加する（`terminal/strata_control/signing.py:194-216,248-259`）。
 
 ## 値と判定
 
-値は変換・正規化されず、真偽値として parse されません。空白の trim、大小文字変換、数値変換、範囲チェックもありません。`extra or environ.get(...)` のため、関数引数 `extra` に truthy な値を渡した場合は環境変数より優先し、空文字など falsy な値なら環境変数へ戻ります。通常の CLI 呼び出しは引数を渡さず環境変数を使います。
+`load_trusted_keys()` は、引数 `environ` が省略された場合は `os.environ` を参照し、`extra or environ.get("STRATA_UPDATE_TRUSTED_KEYS")` を鍵ファイルの候補として使う。環境変数の文字列全体をパスとして `Path` に渡す。真偽判定や数値・真偽値への変換、空白の trim、`~` の展開はしない（`terminal/strata_control/signing.py:194-205`）。
 
-| 環境変数の状態 | Strata の扱い |
-|---|---|
-| 未設定 | 追加鍵ファイルを読まない。組み込み鍵は引き続き読み込む |
-| 空文字 | `Path("")` としては扱われず、追加鍵なし。組み込み鍵だけを使う |
-| 空白だけ、または他の非空文字列 | その文字列をパスとして使う。trim や真偽値判定はせず、該当パスを開く |
-| 有効なパス | UTF-8-SIG で読み、JSON のルート配列、またはオブジェクトの `keys` 配列から公開鍵を追加 |
-| 読めないパス、壊れた JSON、配列でない内容、不正な鍵 entry | `SignatureError`。無効な entry は読み飛ばさず、鍵ファイル全体の読込処理を失敗させる |
+| 条件 | 判定・結果 | 例 |
+|---|---|---|
+| 未設定 | 追加ファイルなし。同梱鍵ファイルがあればその鍵を使う | unset |
+| 空文字 | 空文字は `if not path` でスキップ。同梱鍵ファイルの読み込みは続く | `""` |
+| 空でない値 | 指定されたパスの JSON を読み、同梱鍵に追加する | `"/tmp/trust.json"` |
+| 内容が不正・読めない | `SignatureError`。同梱鍵だけで続行する fallback はしない | 存在しないパス、空白だけの文字列、壊れた JSON |
+| 値が `0` / `1` / `true` / `false` / `0anything` | いずれも特別な意味はなく、その文字列をファイルパスとして扱う | `"1"` は `1` というパス |
 
-各 entry は `alg: "ed25519"`、32 byte 公開鍵の base64、公開鍵から計算した SHA-256 先頭 8 byte の hex と一致する `key_id` を必要とします。組み込み鍵と追加鍵は同じ辞書にまとめられ、辞書キーは `key_id` です。組み込みファイルが存在しない場合は組み込み鍵だけを読み飛ばしますが、指定された追加鍵ファイルを読めない場合はエラーになります。根拠: `strata_control/signing.py:184-216`。
+追加鍵ファイルは UTF-8-SIG として読み、トップレベルが `{"keys": [...]}` のオブジェクト、または鍵エントリーの配列である必要がある。各エントリーは `alg` が `ed25519`、32 byte の公開鍵を表す Base64、公開鍵に対応する `key_id` を満たさなければならない。ファイルを読めない場合は `the key file <path> cannot be read (<例外型>)`、配列がない場合は `the key file <path> has no list of keys`、各鍵が不正なら該当理由の `SignatureError` となる（`terminal/strata_control/signing.py:184-215`）。
 
 ## 有効になる条件
 
-- `strata update` / `strata components update` は、acquisition の許可確認後に鍵を読み込み、その鍵で署名付き feed を検証します。`--feed` や `STRATA_UPDATE_FEED` は feed の場所を選びますが、信頼鍵ファイルのパスを上書きしません。`--check` も同じ鍵読込・feed 検証経路です。根拠: `strata_cli/update_cmd.py:97-106,229-245`。
-- `strata components install-file` も `load_trusted_keys()` を呼び、engine component の署名検証に使います。root command と異なり、この経路では feed を読みません。根拠: `strata_cli/update_cmd.py:219-228`。
-- テスト用の shell / PowerShell installer は、別変数 `STRATA_INSTALL_TEST_TRUST=1` のとき test feed から `test-trust.json` を取得し、この変数にそのファイルパスを設定して `strata update --check` を実行します。通常 installer でこの override を設定する分岐はありません。根拠: `packaging/install.sh:112-119`, `packaging/install.ps1:104-112`; ローカル feed 作成側は公開鍵ファイルの利用方法を表示します (`packaging/make_local_feed.py:116-118`)。
-- DSV4.1 engine の install / upgrade は feed 用に同じ鍵を読みます。自動 upgrade は DeepSeek モデルで既存の同梱 `engine-dsv41` を使う場合に呼ばれ、`STRATA_DSV41_EXE` または `--dsv41-package` を選んだ場合や、feed に接続できない場合などはその経路を通りません。根拠: `strata_cli/launch/runner.py:2153-2190`, `strata_control/dsv41_engine.py:142-182,227-288`。
-- engine component の一般的な署名検証では、署名付き component の初回検証時に verifier が未登録なら `ensure_component_verifier()` が鍵を読み込みます。呼び出し後の verifier は module 内に登録され、以後そのプロセスでは同じ verifier を再使用します。更新 CLI はロード済み `ctx.trusted` から verifier を登録する経路もあります。根拠: `strata_control/engine_component.py:348-375`, `strata_control/signing.py:248-272`, `strata_control/updater.py:690-692,1191-1193`。
-- CUDA 12 driver floor の補助取得でも、呼び出し元が feed source を渡した場合に helper thread が鍵を読みます。feed 不在、鍵エラー、その他の例外はこの補助値の取得では `None` になります。根拠: `strata_control/driver_floor.py:64-93`。
-
-値を読む処理自体には OS、GPU backend、build macro、モデル状態による条件分岐はありません。どの署名検証経路まで進むかは上記の CLI / launch 条件に依存します。外部の暗号ライブラリや driver の環境変数としては使われていません。
+- `update_keys.json` の鍵は常に先に読み込まれ、指定ファイルの鍵はその辞書に加えられる。同じ `key_id` が重複すれば後から読んだ鍵で辞書値が置き換わる（`terminal/strata_control/signing.py:32,199-216`）。
+- `strata update` / `strata components update` の feed 確認・適用では、`load_trusted_keys()` の結果が feed 検証に渡される。`--feed` や `STRATA_UPDATE_FEED` は feed の場所を選び、信頼鍵の選択は別に行われる（`terminal/strata_cli/update_cmd.py:33-36,355-372`）。
+- `strata components install-file` も同じ関数で鍵を読み込む（`terminal/strata_cli/update_cmd.py:345-354`）。
+- モデル feed の取得、driver floor の feed 参照、engine update の feed check なども `load_trusted_keys()` を呼ぶ。鍵を使った取得に失敗しても、モデル一覧取得はキャッシュへ戻るか空の結果を返す場合があり、driver floor の取得失敗は `None` として扱われる（`terminal/strata_control/feed_models.py:110-137`; `terminal/strata_control/driver_floor.py:64-81`; `terminal/strata_control/engine_update.py:117-131,428-435`）。
+- 署名付き engine component の検証時、verifier が未登録なら `ensure_component_verifier()` が同梱鍵とこの環境変数の追加鍵を読み、verifier を登録する。component が未署名ならこの変数による鍵読み込みは行われない。verifier 登録後は同じプロセスで再読込せず、環境変数の変更や追加ファイルの変更はその登録済み verifier に反映されない（`terminal/strata_control/engine_component.py:386-413`; `terminal/strata_control/signing.py:248-272`）。
+- 同梱鍵も追加鍵も無く verifier を登録できない場合、component は「未検証」となり、`STRATA_REQUIRE_SIGNED_COMPONENTS` が有効なら `this build cannot check signatures yet` で拒否される。この別変数が無効なら署名を確認できない状態でも `unverified` として返る（`terminal/strata_control/signing.py:262-272`; `terminal/strata_control/engine_component.py:386-406`）。
+- 通常の `strata update` ではコマンド実行中に鍵を読み込む。`load_trusted_keys()` 自体にキャッシュはないため、通常の各呼び出しでファイルを再読込する（`terminal/strata_cli/update_cmd.py:355-360`; `terminal/strata_control/signing.py:194-216`）。
+- パッケージング用 `tools/packaging/feed_tool.py verify-feed` は `load_trusted_keys(a.pub, environ={})` と明示し、環境変数を見ず `--pub` 相当の引数から鍵ファイルを指定する（`tools/packaging/feed_tool.py:547-549`）。
 
 ## 実行時の詳細
 
-`load_trusted_keys()` は呼び出されるたびに `os.environ`（または明示された mapping）から値を取得し、鍵ファイルを読み直します。通常の updater は `strata update` 実行時に一度ロードして `ctx.trusted` に保持し、その context を使って feed を検証します。読み込み後に環境変数を書き換えても、その context の鍵辞書には反映されません。プロセス起動時の一律読み込みではありません。
+通常の更新コマンドは `load_trusted_keys()` で鍵を読み、結果を `updater.Context.trusted` に渡して feed の確認・更新に使う（`terminal/strata_cli/update_cmd.py:355-372`）。
 
-一方 `extra_keys_in_effect()` は値が非空かどうかだけを `bool(environ.get(...))` で判定します。通常 CLI の人間向け出力では、非空なら stderr に `note: trusting the extra keys in <path> (a test setup)` を出します。`--output json` / `jsonl` ではこの注記を出しません。`--check` の JSON 報告では `trusted_by` が `test key file` または `built-in keys` になります。根拠: `strata_control/signing.py:219-221`, `strata_cli/update_cmd.py:183-192,229-240`, `strata_control/updater.py:631-639`。
+## ログと測定値
 
-追加鍵ファイルの読込失敗は通常 CLI では `SignatureError` として捕捉され、stderr（または機械出力の JSON error）へ表示されて終了コード 5 になります。鍵辞書が空なら feed の取得前に `FeedError` となり、「this build trusts no update key ... so no update can be verified; nothing was downloaded」と報告します。署名不一致や未知の key id も feed を信頼しないエラーとなり、feed を受け入れません。根拠: `strata_cli/update_cmd.py:187-192,257-262`, `strata_control/feed.py:335-362,376-396`。
+通常の更新コマンドは追加鍵が非空で、JSON/JSONL モードでない場合、stderr に `note: trusting the extra keys in <値> (a test setup)` を出す。この注記は設定の有無を示すもので、ファイルの有効性を保証しない（`terminal/strata_cli/update_cmd.py:355-360`）。
 
-通常の launch による DSV4.1 自動更新では、feed を読めない場合は静かに現在の engine を使い続け、鍵や署名などの検証失敗時は理由を示して更新を見送ります。追加鍵ファイルのパスが壊れていても launch 全体は止めず、外側の例外処理も現在の engine を返します。根拠: `strata_cli/launch/runner.py:2171-2190`, `strata_control/dsv41_engine.py:245-258,278-290`。
+有効な鍵辞書が空の場合、feed の検証は `this build trusts no update key (update_keys.json is empty and STRATA_UPDATE_TRUSTED_KEYS is not set), so no update can be verified; nothing was downloaded` で失敗する。feed が追加鍵で信頼されない場合は署名検証理由を含む `the update feed is not trusted: ...` となる（`terminal/strata_control/feed.py:650-677,691-716`）。通常 CLI は `FeedError` を人間向け実行では `strata: <理由>` と stderr に出し、その exit code を返す。更新コマンドの署名エラーは exit code 5（`terminal/strata_cli/update_cmd.py:311-316,378-390`）。
+
+追加鍵ファイルの読み込みエラーは `SignatureError` であり、通常の更新コマンドでは `strata: <理由>` と stderr に出て exit code 5 になる。署名付き engine component の検証で鍵ファイルを読めない場合は `this PC's update keys cannot be read (<理由>)` の `IntegrityProblem` に変換される（`terminal/strata_cli/update_cmd.py:385-386`; `terminal/strata_control/engine_component.py:395-413`; `terminal/strata_control/signing.py:206-215`）。
 
 ## 根拠
 
-- `strata_control/signing.py:31,194-221` — 変数名、ファイルパスとしての読み込み、追加鍵の解析、非空判定。
-- `strata_control/signing.py:184-216` — JSON 形式、鍵 entry の検証、読み込みエラー。
-- `strata_cli/update_cmd.py:219-245,257-264` — CLI からのロード、注記、feed 更新・失敗終了。
-- `strata_control/feed.py:335-362,376-396` — feed の鍵検証と無効・鍵なし時の拒否。
-- `strata_control/engine_component.py:348-375`, `strata_control/signing.py:248-272` — component 検証の遅延ロードと verifier 登録。
-- `strata_cli/launch/runner.py:2153-2190`, `strata_control/dsv41_engine.py:142-182,227-290` — DSV4.1 自動更新の適用範囲と失敗時の継続。
-- `strata_control/driver_floor.py:64-93` — 補助的な feed 読込経路。
-- `packaging/UPDATES.md:65-74,119-123` — 文書上の説明も、追加鍵ファイルを test/local feed 用とし、feed 署名検証に使う点で実装と一致。
+- `terminal/strata_control/signing.py:31-32,184-221` — 環境変数名、値の読み取り、追加鍵ファイルとエントリーの検証。
+- `terminal/strata_control/signing.py:248-272` — component verifier 登録と登録後の再利用。
+- `terminal/strata_control/feed.py:650-677,691-717` — feed 署名検証と鍵不足・不信頼時の失敗。
+- `terminal/strata_cli/update_cmd.py:345-372,378-390` — CLI からの読み取り、注記、失敗の表示と終了コード。
+- `terminal/strata_control/engine_component.py:386-413` — 署名付き component の検証時に verifier を初期化する経路。
+- `terminal/strata_control/feed_models.py:110-137`, `terminal/strata_control/driver_floor.py:64-81`, `terminal/strata_control/engine_update.py:117-131,428-435` — その他の Strata 所有呼び出し元。
+- `tools/packaging/feed_tool.py:547-549` — 環境変数を参照せず明示引数で鍵を渡す例外経路。

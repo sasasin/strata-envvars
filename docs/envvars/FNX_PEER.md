@@ -1,46 +1,53 @@
 # `FNX_PEER`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。調査範囲は Strata 所有ソース。外部ライブラリ・driver の挙動は含めない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-AMD HIP 版の all-cards split engine（`strata-split-N`）が、カード間の window sum と attention merge の交換に peer push を使うかを決めます。peer push は送信側の kernel が相手カードの device memory に書き込む経路です。`FNX_PEER` を読む本番箇所は `src/split/src/engine.cu` の HIP 条件ブロック内だけです。CUDA 版ではこの環境変数は読まれません（`src/split/src/engine.cu:86-94`、`src/split/CMakeLists.txt:97-109`）。
+HIP 版の Flash-Next 全カード split engine で、カード間の window sum と attention merge に peer device memory への送信を使うかを決める。`FNX_PEER` が未設定ならビルド定数 `PEER_DEFAULT_ON=true` により peer push を試し、値が完全一致で `"0"` なら host mailbox 経路を選ぶ。peer push を試す場合は engine の構築時に全カード間を probe し、どれかが失敗すれば実行全体のデータ交換を host mailbox 経路にする。CUDA ビルドにはこの環境読み取りがなく、同じ名前を設定してもこの engine の分岐は変わらない。根拠: `engine/src/split/src/engine.cu:120-132`, `engine/src/split/src/hip/peer_policy.hpp:17-40`, `engine/src/split/CMakeLists.txt:121-140`。
 
 ## 値と判定
 
-`peer_decide()` は値全体を文字列比較し、数値変換はしません。`FNX_PEER` の未設定と設定値は次のように判定されます。
+`Engine::Engine` が HIP ビルド時に `std::getenv("FNX_PEER")` を呼び、helper `peer_decide` は値全体を `std::strcmp` で文字列 `"0"` と比較する。数値変換・空白除去・大文字小文字変換はない。未設定は `PEER_DEFAULT_ON`（現在 `true`）、設定値が厳密に `"0"` の場合だけ OFF、それ以外の設定値はすべて ON を要求する。
 
-| 値 | 判定 |
-| --- | --- |
-| 未設定 | `PEER_DEFAULT_ON` を使う。現 commit では `true` なので peer probe を行う |
-| `0`（文字列がちょうど `0`） | peer push を無効化し、probe とこの変数由来のログを出さない |
-| その他の設定値 | peer push を要求して probe する。空文字、`00`、`false`、` 0` も含む |
+| ビルド・値 | 判定 | 結果 |
+|---|---|---|
+| HIP、unset | 既定 `true` | peer push を試す |
+| HIP、`0` | `strcmp(env, "0") == 0` | host mailbox を選ぶ。peer probe を呼ばず、policy の行も出さない |
+| HIP、`1` | `"0"` 以外 | peer push を試す |
+| HIP、空文字 `""`、`00`、`0x`、`false`、`TRUE`、` 0` | いずれも `"0"` 以外 | peer push を試す |
+| CUDA | `#if FNX_HIP` の外 | `FNX_PEER` を読まない |
 
-大文字小文字・前後空白の除去や数値としての妥当性検査はありません。CLI 引数による `FNX_PEER` の上書きもありません。`--split-engine` / `STRATA_SPLIT_ENGINE` は split engine 自体を選ぶ launcher 側の設定であり、engine 起動後の peer 判定とは別です（`strata_control/split_engine.py:356-374`）。
+根拠: `engine/src/split/src/hip/peer_policy.hpp:17-30`, `engine/src/split/src/engine.cu:125-132`, `engine/src/split/CMakeLists.txt:121-140`。
 
 ## 有効になる条件
 
-- HIP でコンパイルされた split engine が起動すること。ビルド設定は Linux の CUDA/HIP split engine を対象にし、HIP target は `FNX_HIP=1` でコンパイルされます（`src/split/CMakeLists.txt:1-5,97-109`）。
-- launcher が all-cards split engine を選ぶこと。モデル・GPU・起動設定などにより launcher が通常の layer split を選んだ場合、この engine 内の `FNX_PEER` 判定には到達しません（`strata_control/split_engine.py:372-389`、`strata_cli/launch/runner.py:1630-1647`）。
-- 未設定または `0` 以外の値で peer push を要求した場合、engine 起動時に全カード間の全 directed pair の probe が成功すること。peer 可否確認、peer access の有効化、書き込み・比較・read-back・flag round-trip のどれかが失敗すれば、peer push は全 run で使わず host-memory exchange にします（`src/split/src/hip/peer.h:58-80,81-145`）。
-
-`FNX_PEER_PARTS` は peer が有効なときに window sums（bit 1）と attention merge（bit 2）のどちらに peer memory を使うかを選びます。既定値は `3`（両方）です。この値は `FNX_PEER` の on/off 判定を変えません（`src/split/src/engine.cu:90-94,244-250`）。window sum は `FNX_ONEHOP` が非 0、fp16 ring、`T <= MAXT` の場合に専用 peer-push kernel を選び、各カードが自分の値を他カードの mailbox に書き、各カードが自分の mailbox から他カードの値を読みます。それ以外はこの専用 peer-push kernel を使いません（`src/split/src/engine.cu:266-270`、`src/split/src/kernels.cu:976-1004,1568-1598`）。attention merge 側では bit 2 が ring buffer を fine-grained device memory に確保し、one-hop 経路は各カードの buffer に書いて他カードの buffer を読みます（`src/split/src/engine.cu:243-250,258-268`、`src/split/src/kernels.cu:952-973`）。
+- `FNX_PEER` の読み取りは `FNX_HIP` ビルドだけにあり、対象は `engine.cu` の Flash-Next `Engine`。CUDA 版と、別の通常 layer split 経路ではこの読み取りは行われない。HIP の split target は `FNX_27B=0` でビルドされる。根拠: `engine/src/split/src/engine.cu:1-2,125-132`, `engine/src/split/CMakeLists.txt:121-140`。
+- launcher が all-cards split engine を実際に起動する必要がある。CLI / server が通常の layer split を選んだ場合、この変数を読む engine には到達しない。選択条件には OS、GPU 数・種類、モデル形式、engine package の有無などがある。根拠: `terminal/strata_control/split_engine.py:193-220,602-625`。
+- `FNX_PEER` 未設定または `"0"` 以外の値では、HIP runtime が各向きのカード対を peer access 可能と報告し、peer access を有効化し、送信・全語比較・read-back・flag round trip の probe がすべて成功する必要がある。probe が失敗すると `peer_on=false` となり host mailbox 経路を使う。根拠: `engine/src/split/src/hip/peer.h:56-80,81-146`, `engine/src/split/src/hip/peer_policy.hpp:25-40`。
+- `FNX_PEER_PARTS` は peer push が使える場合の対象を bit で選ぶ。既定 `3` は window sum（bit 1）と attention merge（bit 2）の両方、`1` は window sum、`2` は attention merge、両 bit がなければどちらの専用 mailbox も割り当てない。この変数は `FNX_PEER=0` の場合も HIP build で読み取られ、完全な 10 進整数でない値は `env_int` が例外にする。根拠: `engine/src/split/src/engine.cu:129-133,286-292`, `engine/src/split/src/env.hpp:15-21,33-40`。
+- window sum の peer kernel にはさらに one-hop が必要で、`FNX_ONEHOP=0` では `ring.peer` が false になり、window sum は peer push kernel を選ばない。通常は 3 枚以上のカード、または `peer_on` で one-hop が選ばれるが、float32 ring では one-hop が無効。attention merge は `FNX_PEER_PARTS` の bit 2 によって受信 buffer の割り当て先が決まり、one-hop / ring の実装を選ぶ。根拠: `engine/src/split/src/engine.cu:308-316`, `engine/src/split/src/kernels.cu:1582-1614,1385-1421`。
+- prompt chunk sum は別の分岐で、`FNX_PEER=0` なら peer 経路を使わない。peer が有効な場合でも `FNX_PF_PEER=0` なら host exchange を保ち、`FNX_PF_RCCL` が RCCL 利用を選ぶとその sum は RCCL が担当する。根拠: `engine/src/split/src/engine.cu:134-146`。
+- `FNX_PEER_PROBE_FAIL=1` は peer を試す分岐で probe を意図的に失敗させる helper 入力。`FNX_PEER=0` のときは probe 自体を通らないため影響しない。根拠: `engine/src/split/src/hip/peer_policy.hpp:28-36`。
 
 ## 実行時の詳細
 
-環境値は `Engine` の構築中、カード一覧を作った直後に一度読みます。`FNX_PEER` 自体は `static` cache されませんが、この判定結果 `peer_on` は engine instance の初期化中に決まり、既に作成済み engine に対する環境変更を再読する経路はありません（`src/split/src/engine.cu:31,84-94`）。
+値は `Engine::Engine` の初期化中に一度だけ読み、`PeerDecision` の `use` を engine 構築時の `peer_on` に保存する。変数を読み直すループや request ごとの評価はないため、起動後の環境変更は既存 engine に反映されない。各 GPU の buffer 割当てで `FNX_PEER_PARTS` に応じた mailbox を作り、window sum は `ring.peer` のとき `k_ring_a2a_push` を選ぶ。同 kernel は各カードの addend を相手の device memory に書き、各カードは自分の mailbox から読み取って合計する。attention merge も peer mailbox を割り当てた場合、カード間 partial を所有カードへ送る。prompt chunk sum は `FNX_PF_PEER` と `FNX_PF_RCCL` も評価して別に決める。根拠: `engine/src/split/src/engine.cu:125-146,286-313`, `engine/src/split/src/kernels.cu:973-1001,696-744,1582-1614`。
 
-peer push が要求され、probe が成功した場合、stderr に `fnx: Peer push between the cards is on (...)` と probe 結果を出し、続けて有効な部位を示す `fnx: peer push: ... pushed into the peers' memory` を出します。失敗した場合は `fnx: The cards cannot push into each other's memory here (...): using the host exchange for this run.` を出し、peer push 用 buffer を確保しません。`FNX_PEER=0` なら `peer_decide()` は空のログと無効判定を返します（`src/split/src/hip/peer_policy.hpp:20-40`、`src/split/src/engine.cu:90-94,245-247`）。
+probe は全 directed pair ごとに実施され、4 MiB の書込み値を receiver と sender の両方で比較し、200 回の flag round trip を確認する。probe のどの段階でも失敗すると `peer_decide` は `use=false` を返し、その run の交換経路を host mailbox にする。すでに probe の途中までに有効化された runtime peer access を無効化する処理はこの経路にはない。根拠: `engine/src/split/src/hip/peer.h:56-80,81-146`, `engine/src/split/src/hip/peer_policy.hpp:31-40`。
 
-`FNX_PEER_PROBE_FAIL=1` は要求された probe を意図的に失敗扱いにします。`FNX_PEER=0` のときは probe に進まないため、この設定は判定に影響しません（`src/split/src/hip/peer_policy.hpp:32-36`）。peer 成功後の fine-grained device buffer 確保に失敗すると、engine は `FNX_PEER: fine-grained device allocation of ... KiB failed` の例外で初期化に失敗します（`src/split/src/engine.cu:106-111`）。
+## ログと測定値
+
+- peer probe 成功時は stderr に `fnx: Peer push between the cards is on (<probe summary>).`、続けて `FNX_PEER_PARTS` に応じた `fnx: peer push: ... pushed into the peers' memory` を出す。`FNX_PEER=0` は policy の行を出さない。probe 失敗時は stderr に `fnx: The cards cannot push into each other's memory here (<reason>): using the host exchange for this run.` を出す。根拠: `engine/src/split/src/hip/peer_policy.hpp:34-40`, `engine/src/split/src/engine.cu:129-146`。
+- engine は buffer 割当ての後に `fnx: HOSTRING build: the cards exchange through page-locked host memory; peer access is never enabled, no peer probe, IOMMU and BAR1 checks skipped` も無条件に出す（`engine/src/split/src/engine.cu:296-299`）。これは同じ HIP 経路で先に peer probe・割当てを行う現行コード（`engine/src/split/src/engine.cu:125-151,286-292`）と整合しない文字列であり、この行の説明を実際の peer 分岐の根拠にはできない。
+- `docs/SPLIT_ENGINE.md:77-80` は `FNX_PEER=0` でも fallback の plain line が出ると記述するが、現行 policy は厳密な `"0"` で空の `PeerDecision` を返し、policy line を出さない（`engine/src/split/src/hip/peer_policy.hpp:28-30`, `engine/src/split/src/engine.cu:129-130`）。また `docs/DETAILS.md` にこの変数の追加説明は見つからなかった。性能値は記載しない。
+- peer mailbox の HIP allocation が失敗した場合は `FNX_PEER: fine-grained device allocation of <KiB> KiB failed` の例外になる。Engine 構築中の失敗は `ERR <error>` を出力し、stderr に `sfnx: failed: <error>` を出して `_Exit(1)` する。根拠: `engine/src/split/src/engine.cu:148-152`, `engine/src/split/tools/sfnx.cpp:1094-1103,1122-1136`。
 
 ## 根拠
 
-- 唯一の本番読み取りと判定呼び出し: `src/split/src/engine.cu:84-94`。
-- 既定値、完全一致の `0` 判定、fallback とログ文言: `src/split/src/hip/peer_policy.hpp:17-40`。
-- probe のカード間可否・有効化・データ比較・round-trip 判定: `src/split/src/hip/peer.h:58-145`。
-- peer memory buffer の割り当てと例外: `src/split/src/engine.cu:106-111,244-250`。
-- all-cards split engine の HIP build 条件: `src/split/CMakeLists.txt:1-5,97-109`。
-- 候補一覧との照合: `docs/envvars/000_envvers.md` に `FNX_PEER` の項目があり、今回の調査では Strata 所有ソースに実際の読み取りを確認した。
-
-なお、`src/split/src/hip/peer_policy.hpp:17` のコメントには「既定は off」とありますが、同じファイルの実コードは `PEER_DEFAULT_ON = true`（18 行）です。本書は実行分岐を根拠に現 commit の既定を記載しています。
+- 読み取りと判定、既定値: `engine/src/split/src/engine.cu:125-132`; `engine/src/split/src/hip/peer_policy.hpp:17-40`
+- HIP / CUDA build 条件: `engine/src/split/CMakeLists.txt:121-140`
+- peer access と probe: `engine/src/split/src/hip/peer.h:56-146`
+- buffer と one-hop 条件: `engine/src/split/src/engine.cu:286-313`; `engine/src/split/src/kernels.cu:1582-1614`
+- window sum と attention merge: `engine/src/split/src/kernels.cu:696-744,973-1001`
+- 関連する launcher 条件: `terminal/strata_control/split_engine.py:193-220,602-625`

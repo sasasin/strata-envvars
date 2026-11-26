@@ -1,60 +1,65 @@
 # `--stage-timing`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン。診断メッセージ上の処理名は `strata generate`） |
+| コマンド | `strata generate`（エンジン引数） |
 | オプション | `--stage-timing` |
 | 別名 | なし |
-| 値 | なし。フラグを指定すると有効 |
+| 値 | 値を取らない boolean flag |
 
 ## 役割
 
-推論中にレイヤー内の区間へ CUDA event を記録し、実行終了時に区間ごとの GPU 上の経過時間を stderr に表示します。これはカーネル数の比率ではありません。計測区間にはホストが次の仕事を投入するまで GPU が待つ時間も含まれ得るため、純粋な GPU 処理時間の比較としては読めません（`src/core/layer.cpp:1039-1044,1087-1105`）。
+層内の区間ごとに GPU event を使った時間を集計し、実行後にレポートするための診断 flag です。parser はこの flag を設定しますが、現行 checkout では event の開始・終了を記録する関数の呼び出し箇所を確認できません。そのため、ソースから計測値が区間別の実時間を表すとは確認できず、性能判断に使える計測結果としては扱えません（`engine/src/program/generate.cpp:848-850,10435-10463`; `engine/src/core/layer.cpp:1099-1110`; 「実行時の動作」参照）。
 
 ## 使い方
 
 ```sh
-strata --pack /path/to/model.pack --tokens 1,2,3 --stage-timing --no-capture
+# 実行例。MODEL.strata と token ID は利用環境に合わせる。
+strata generate --pack MODEL.strata --tokens "1,2,3" --no-capture --no-pool --stage-timing
 ```
 
-このエンジンは tokenizer を持たず、通常の生成では `--tokens` または `--tokens-file` が必要です。上の pack パスと token ID は利用環境に合わせてください（`src/program/generate.cpp:2425-2440,3174-3178`）。
+`--stage-timing` は通常の captured graph 経路では拒否されます。`--no-capture` を付けると、別の検査で `--no-pool` も要求されます。後者は CPU expert pool を使わない GPU-only 経路を選ぶため、通常の pool あり生成と同じ条件の測定ではありません（`engine/src/program/generate.cpp:10435-10440,10479-10487,10557-10571`）。
 
 ## 値と既定値
 
-- 値を取らない真偽値フラグです。`Options::stage_timing` の初期値は `false` で、parser が `--stage-timing` を読むと `true` にします（`src/program/generate.cpp:510-512,2504-2509`）。
-- 重複指定しても同じ真偽値を再度 `true` にするだけです。値の範囲検証はありません。値を続けて書くと、その文字列は別引数として解析され、未知引数なら usage を表示して終了コード 2 になります（`src/program/generate.cpp:2416-2423,2507,2787-2792`）。
-- 未指定時はイベント計測・集計を行いません。
+- 値・別名はありません。`Options::stage_timing` の初期値は `false` で、引数が `--stage-timing` と一致すると `true` になります（CUDA: `engine/src/program/generate.cpp:850,3933`; SYCL: `engine/sycl/src/program/generate.cpp:534,1972`）。
+- 重複指定を拒否する処理はなく、複数回指定しても同じ `true` の状態です。値を付けた `--stage-timing=true` は一致する parser 分岐がなく、unknown argument と usage を stderr に出して終了コード `2` になります（`engine/src/program/generate.cpp:3933,4268-4273`）。
+- 未指定時は timing 初期化とレポートの分岐に入りません（`engine/src/program/generate.cpp:10435,25401`）。
 
 ## 実行時の動作
 
-- `--no-capture` との併用が必須です。指定がなければ、stream capture 中の event record は無視されて誤解を招く値になるとして stderr に理由と併用方法を表示し、終了コード 2 で終了します（`src/program/generate.cpp:6881-6889`）。
-- 有効時は最大64レイヤー、20区間分の開始・終了 CUDA event を作成します。作成に失敗した場合は `stage_timing_enable failed` を stderr に出し、終了コード 1 になります（`src/core/layer.cpp:1045-1067`; 呼び出し元 `src/program/generate.cpp:6891-6894`）。
-- 主な区間は attention 側の hyper-connection read、attention block、write、FFN 側の read、MoE route/finish/write です。GDN 内部については活性値量子化、QKV GEMV、conv+SiLU、norm、gate、GDN step、出力 norm、出力 GEMV も記録します（`src/program/generate.cpp:6895-6912`; 記録箇所 `src/core/layer.cpp:1534-1572,1611-1632,261-276,298-383`）。
-- `--stage-timing` は fused hyper-connection 経路の選択条件から除外されるため、その経路を使う設定でも fused GR を無効にし、read/write を分けた計測可能な形にします（`src/program/generate.cpp:3927-3932`）。
-- 推論終了時に `stage_timing_report` が CUDA device を同期し、記録済み event の経過時間をレイヤーごとに加算します。stderr には区間別の合計 ms/token、ms/layer、割合、区間合計、および attention block のレイヤー別時間と GDN/QSA 別集計を出します（`src/core/layer.cpp:1087-1123`; 呼び出し元 `src/program/generate.cpp:16865`）。各レイヤー・区間の event は同じハンドルを再利用する実装です（`src/core/layer.cpp:1047-1052,1079-1085`）。
+1. parser は flag を `o.stage_timing` に保存します。層の fused GR 経路はこの値が true の場合に無効化され、計測向けに別の kernel 構成が選ばれます（`engine/src/program/generate.cpp:3933,6112-6113`; SYCL: `engine/sycl/src/program/generate.cpp:1972,3227-3228`）。
+2. CUDA 実装と SYCL 実装はいずれも `--no-capture` がなければ、stream capture 内の event record が落ちて正しい結果にならないとしてエラーを stderr に出し、終了コード `2` で拒否します。通過後は各 stage 名を登録します（CUDA: `engine/src/program/generate.cpp:10432-10464`; SYCL: `engine/sycl/src/program/generate.cpp:5886-5918`）。
+3. `--no-capture` 実行では `session_token` が CPU expert pool hook を持たないため、`--no-pool` がなければ routed experts が欠落するとして stderr に理由を出し、終了コード `2` で拒否されます（`engine/src/program/generate.cpp:10557-10571`）。このため、実行例の組み合わせは通常の pool あり生成とは異なる経路です。
+4. CUDA/SYCL の timing 実装は stage ごとの event 対を最大 64 層分確保し、完了後に層ごとの経過時間を合計して `per-stage GPU time`、層あたり時間、割合などを stderr に出す設計です（CUDA: `engine/src/core/layer.cpp:1068-1089,1110-1128`; SYCL: `engine/sycl/src/core/layer.cpp:1068-1097,1119-1144`）。通常の生成完了処理からこのレポート関数を呼びます（CUDA: `engine/src/program/generate.cpp:25401`; SYCL: `engine/sycl/src/program/generate.cpp:14379`）。
+
+### 計測結果に関する確認制約
+
+現行 checkout の `engine/` 全体で `stage_mark_begin` / `stage_mark_end` を検索すると、宣言・定義のみで、層処理からの呼び出し箇所は見つかりませんでした。レポート関数はその event 対から経過時間を読みますが、呼び出し側で値が記録されていることを確認できません（`engine/include/strata/core/layer.hpp:363-364`; CUDA 実装: `engine/src/core/layer.cpp:1099-1107,1110-1128`; SYCL 実装: `engine/sycl/src/core/layer.cpp:1106-1117,1119-1144`）。よって、ヘルプの「per-stage KERNEL-COUNT shares」という説明（CUDA: `engine/src/program/generate.cpp:1389-1390`; SYCL: `engine/sycl/src/program/generate.cpp:946-947`）を実装上の出力として裏付けられません。また、レポートはカーネル数を集計せず GPU 時間として表示するコードですが、その値が有効な計測値かはソースから確認できません。
+
+同じヘルプは `--gpu-only-full` を先に実行するよう案内しますが、これは別の実行で GPU-only 基準を測る案内です。`--stage-timing` 自体は `--no-capture --no-pool` が必要なので、captured graph を使う GPU-only 計測と同一実行にはできません（`engine/src/program/generate.cpp:1390,1393-1394,10435-10440,10557-10571`）。
 
 ## 適用条件と副作用
 
-- `--no-capture` の通常 launch 経路でのみ使用できます。capture を使う通常経路では拒否されます（`src/program/generate.cpp:6881-6889`）。
-- CUDA event を多数作成して保持し、終了時に device 全体を同期します。計測自体は GPU の実行中には同期しない設計ですが、イベント記録と最後の同期は実行時の追加処理です（`src/core/layer.cpp:1045-1067,1079-1089`）。
-- event 間の時間は GPU 上の区間時間として表示されますが、非 capture 経路ではホスト側の投入待ちも区間に含み得ます。したがってカーネル単体の実行時間や純粋な GPU 下限を示すものではありません（`src/core/layer.cpp:1039-1044`; parser 用 usage もこの注意を記載: `src/program/generate.cpp:972-973`）。
-- stage timing 専用のファイル出力はありません。レポートは stderr、生成トークン等の通常出力は stdout です（`src/core/layer.cpp:1099-1122`; `src/program/generate.cpp:16865-16872`）。
+- CUDA および SYCL のエンジン parser に登録されています。両方とも `--no-capture` が必須で、さらに no-capture 経路の一般検査により `--no-pool` も必要です（上記参照）。
+- flag を有効にすると fused GR が無効になるため、通常経路と計算構成が変わります（`engine/src/program/generate.cpp:6112-6113`; SYCL: `engine/sycl/src/program/generate.cpp:3227-3228`）。
+- timing 初期化では CUDA event または SYCL event を多数作成し、レポート前に device/queue の完了を待つ実装です（CUDA: `engine/src/core/layer.cpp:1080-1089,1110-1112`; SYCL: `engine/sycl/src/core/layer.cpp:1080-1097,1119-1121`）。
+- `--no-capture --stage-timing` だけでは `--no-pool` の検査で拒否されます。`--stage-timing` と `--no-capture` の不整合は終了コード `2`、CUDA event 初期化が false を返す場合は `stage_timing_enable failed` を stderr に出し終了コード `1` です（`engine/src/program/generate.cpp:10435-10444,10566-10571`）。SYCL の event 作成時に例外が起きる場合は catch 内で例外情報を stderr に出し `std::exit(1)` します（`engine/sycl/src/core/layer.cpp:1080-1097`）。
 
 ## 出力とエラー
 
-- `--no-capture` がない場合: stderr に `Pass --no-capture as well.` を含むエラーを出し、終了コード 2（`src/program/generate.cpp:6884-6889`）。
-- CUDA event の初期化に失敗した場合: stderr に `stage_timing_enable failed` を出し、終了コード 1（`src/program/generate.cpp:6891-6894`）。
-- 正常時: 実行末尾で stderr に per-stage と per-layer の集計を表示し、その後通常の生成結果を stdout に出します（`src/core/layer.cpp:1099-1122`; `src/program/generate.cpp:16865-16872`）。
-- ソース内の usage 文は「per-stage KERNEL-COUNT shares」と説明していますが、実装が出力するのは event の経過時間と時間比率です。ここでは実装を説明の根拠とし、usage 文との不一致を記録します（`src/program/generate.cpp:972-973`; `src/core/layer.cpp:1091-1105`）。
+- 成功経路ではタイミング表を stderr に出すコードがあります。通常の token 出力・decode 統計は別途 stdout に出力され、レポート後も通常の処理が続きます。したがって、`--stage-timing` は測定後すぐに終了するモードではありません（CUDA: `engine/src/program/generate.cpp:25401-25415`; SYCL: `engine/sycl/src/program/generate.cpp:14379-14390`）。
+- captured path との併用は stderr の説明と終了コード `2`、no-capture で pool を残した場合も stderr の説明と終了コード `2` で失敗します。未知の引数も stderr に unknown argument と usage を出して `2` です（`engine/src/program/generate.cpp:10435-10440,10566-10573,4268-4273`）。
+- CUDA のレポートは event elapsed の取得失敗時にその値を合計へ加えず続行します（`engine/src/core/layer.cpp:1114-1118`）。ただし begin/end event の記録呼び出しが見つからないため、成功時に表示される値が何を表すか、また SYCL で profiling 情報取得が成功するかは、このソース調査では確定できません。
 
-## 根拠と調査範囲
+## 根拠
 
-- parser と既定値: `src/program/generate.cpp:510-512,2416-2423,2504-2509`
-- capture 条件、失敗経路、区間名: `src/program/generate.cpp:6881-6912`
-- 計測対象の記録箇所と event 集計: `src/core/layer.cpp:261-276,1045-1123,1534-1572,1611-1632`
-- 実行経路での fused GR 条件、レポート呼び出し: `src/program/generate.cpp:3927-3932,16865-16872`
-
-同一 revision の実行バイナリは使わず、CLI `--help` も実行していません。usage の記載はソース中の parser 実装と照合しました。GPU/各 backend で実測した値や event 作成失敗時のデバイス固有挙動は調査していません。
+- `engine/src/program/generate.cpp:848-850,3933` — option state の既定値と parser。
+- `engine/src/program/generate.cpp:10432-10464,10566-10571,25401` — capture 条件、stage 名登録、no-capture 時の pool 条件、実行後の report 呼び出し。
+- `engine/src/program/generate.cpp:6112-6113` — timing 有効時に fused GR を使わない条件。
+- `engine/src/core/layer.cpp:1061-1067,1080-1128` — event 計測の前提、初期化、report 出力。
+- `engine/sycl/src/program/generate.cpp:532-534,1972,3227-3228,5886-5918,14379` と `engine/sycl/src/core/layer.cpp:1080-1144` — SYCL 側の対応実装。
+- `engine/include/strata/core/layer.hpp:355-364` — timing API 宣言。checkout 内検索では `stage_mark_begin` / `stage_mark_end` の呼び出し箇所を確認できず、実際の区間記録は検証できませんでした。

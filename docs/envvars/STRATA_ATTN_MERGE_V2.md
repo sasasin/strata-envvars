@@ -1,39 +1,46 @@
 # `STRATA_ATTN_MERGE_V2`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-QSA decode attention の chunk 結果をまとめる merge kernel を選びます。`0` は `attn_merge_kernel`、0 以外は `attn_merge_v2_kernel` です。対象コードは `src/kernels/cuda/qsa_decode_attn.cu` にあり、単一 query、batch、slot、batch rows の decode attention から呼ばれます。これは実際の処理を切り替える環境変数です。
+CUDA/HIP 共通の QSA decode attention で、チャンクごとに計算した partials を統合する merge kernel を選ぶ。値が有効なら `attn_merge_v2_kernel`（1）、無効なら `attn_merge_kernel`（0）を起動する。対象は merge 段だけで、チャンク計算側の選択をこの変数は変えない。実装は `engine/src/kernels/cuda/qsa_decode_attn.cu` の `attn_merge_v2()` と `launch_merge()`。実装コメントは両 kernel の出力が bitwise 同じとしている（同ファイル 1003-1020）。
 
 ## 値と判定
 
-`attn_merge_v2()` の初回呼び出し時に値を読み、関数内の `static const int` に保存します。プロセスの起動時ではなく、最初に merge 選択が必要になった時点で評価されます。その後に環境を変更しても再評価されません。
+`attn_merge_v2()` の初回呼び出し時に `std::getenv` で値を読み、関数内 `static const int` に保存する（`engine/src/kernels/cuda/qsa_decode_attn.cu:1005-1010`）。
 
-| `STRATA_ATTN_MERGE_V2` | 判定 |
-|---|---|
-| 未設定または空文字 | `STRATA_ATTN_DAILY` に従う |
-| 空でない文字列 | `std::atoi` の結果が 0 なら標準 merge、0 以外なら v2 merge |
+| 条件 | 未設定 | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 設定値が非空 | `STRATA_ATTN_DAILY` の判定にフォールバック | `atoi(v) != 0`。例: `1`, `-1`, `+1`, `1abc`, ` 1` | `atoi(v) == 0`。例: `0`, `0anything`, `true`, `false`, `abc`, `  ` |
+| 設定値が空文字 | `STRATA_ATTN_DAILY` の判定にフォールバック（空文字は未設定相当） | ― | ― |
 
-空でない値は文字列全体の真偽判定ではなく、`atoi` で10進整数に変換した結果で判定します。先頭の空白と符号は整数変換の規則に従い、数字の後の文字列は変換を止めます。したがって `1anything` や `-1` は v2、`0anything` や `true` は標準 merge になります。数字を含まない値は `atoi` が 0 を返すため標準 merge です。整数の範囲検証や clamp はありません。
+非空文字列は `atoi` で整数変換し、文字列全体の妥当性検査はしない。したがって先頭の空白や符号を許容し、数値の後ろに文字があっても整数部分で判定する。`atoi` が 0 以外なら v2、0 なら従来版を選ぶ。`STRATA_ATTN_DAILY` はこの変数が未設定または空の場合だけ関係する。`daily_attn()` は CUDA では値がちょうど文字列 `1` の場合に有効、別の設定値なら無効、未設定ならデバイス判定に進む。HIP では常に false を返す（`engine/src/kernels/cuda/qsa_decode_attn.cu:902-923`）。
 
 ## 有効になる条件
 
-この設定を読む実装は `src/kernels/cuda/qsa_decode_attn.cu` です。CUDA build では明示設定がなければ `STRATA_ATTN_DAILY` が既定値になります。`STRATA_ATTN_DAILY` は値がちょうど1文字の `1` の場合だけ有効です。`STRATA_ATTN_MERGE_V2` が空でない値なら、この既定を `atoi` の結果で上書きします。
-
-HIP build では `daily_attn()` が常に `false` を返すため、`STRATA_ATTN_MERGE_V2` が未設定または空なら標準 merge が選ばれます。空でない明示値による上書きは同じ `attn_merge_v2()` 内で行われます。検索した SYCL 側の実装にはこの環境変数の読み取りはありません。
+- QSA decode attention の merge 処理が呼ばれること。対象関数では、`qsa_decode_attn_batch`、`qsa_decode_attn_slots`、`qsa_decode_attn_batch_rows`、`qsa_decode_attn_step` がこの選択を merge launch に渡す（`engine/src/kernels/cuda/qsa_decode_attn.cu:1132-1147, 1217-1223, 1295-1301, 1349-1354`）。
+- 環境変数の非空値があると、その `atoi` 結果が `STRATA_ATTN_DAILY` より優先される。未設定・空文字の場合、CUDA は `STRATA_ATTN_DAILY=1` または同変数未設定時のデバイス既定値で v2 を選ぶ。未設定時のデバイス既定値は compute capability を初回デバイスごとに調べ、`sm12x_default(..., kGb10AttnDaily)` の結果をキャッシュする。設定された `STRATA_ATTN_DAILY` は文字列全体が `1` でなければ無効（`engine/src/kernels/cuda/qsa_decode_attn.cu:902-923`、`engine/include/strata/core/sm120_series.hpp:78-81, 87-95`）。
+- AMD gfx12 では、エンジンがアーキテクチャ既定値を適用し、`STRATA_GFX12_DEFAULTS` が先頭文字 `0` でなく、`STRATA_DEFAULTS=026` の既定値セットでもない場合、この変数を `1` に設定する。適用前から値が設定済みなら空文字を含めその値が維持され、利用者の値が優先される（`engine/src/core/arch_defaults.cpp:28-55, 302-310`）。この既定値表は `apply_arch_defaults()` を通じて適用される（`engine/src/program/generate.cpp:4320`）。
+- CLI 引数による別の上書き経路は、この値の読み取り・選択箇所には見当たらない。アーキテクチャ既定値は未設定時のみプロセス環境へ設定される（`engine/src/core/arch_defaults.cpp:302-310`）。
 
 ## 実行時の詳細
 
-`attn_merge_v2_kernel` は step record の幅から実データがある chunk 数を求め、その範囲だけを merge します。また、複数 chunk の値をまとめてロードしてから chunk 順に累積します。標準 kernel は全 chunk を走査し、空 chunk を `m == -FLT_MAX` で飛ばします。ソースコメントは、v2 が標準 kernel と同じ演算順・同じ有効値を使い出力 bit を変えない設計だと説明しています。この文書では、その性質を独立に測定・検証したものとしては扱いません。
+初回 merge 選択時に環境を読み取り、以後は `static` に保持した判定を使う。プロセス実行中に環境を変更しても再評価されない。`STRATA_ATTN_MERGE_V2` が空または未設定なら、`daily_attn()` の既定値に従う。CUDA では `STRATA_ATTN_DAILY` が未設定のときデバイスごとの判定結果も `per_dev[64]` にキャッシュする。HIP の `daily_attn()` は常に false だが、`STRATA_ATTN_MERGE_V2` に非空値があればその明示値は merge kernel 選択に使われる（`engine/src/kernels/cuda/qsa_decode_attn.cu:902-923, 1005-1020`）。
 
-この設定自体についてログ出力はありません。`docs/DETAILS.md` には `STRATA_ATTN_DAILY=1` を有効にした CUDA 全体の測定があり、RTX 3060 / RTX A4000 でそれぞれ +3.2% / +0.7% と記録されていますが、これは chunk kernel と merge を含む `STRATA_ATTN_DAILY` の組み合わせの結果であり、`STRATA_ATTN_MERGE_V2` 単独の性能値ではありません。
+`launch_merge()` は v2 が真なら `attn_merge_v2_kernel`、偽なら `attn_merge_kernel` を起動する。両方とも同じ partials、steps、出力領域を受け取る。各 QSA decode 経路は merge 後に CUDA/HIP の起動エラーを検査し、エラー時は経路名とエラー文字列を stderr に出して `exit(1)` する（`engine/src/kernels/cuda/qsa_decode_attn.cu:1013-1020, 1143-1147, 1219-1223, 1297-1301, 1350-1354`）。
+
+## ログと測定値
+
+この変数の値を直接表示するログや、無効値の警告は見当たらない。gfx12 の既定値適用がこの変数を自動設定した場合は、他の gfx12 既定スイッチとともに `strata: gfx12 (RDNA4): exact extra switches on by default ...` の行にスイッチ名が表示される。利用者が値を設定済みならその変数は既定値適用の表示対象に含まれない（`engine/src/core/arch_defaults.cpp:360-370`）。
+
+ソースコメントは二つの merge kernel の出力を bitwise 同一としているが、本調査では再測定していない（`engine/src/kernels/cuda/qsa_decode_attn.cu:1013-1020`）。
 
 ## 根拠
 
-- `src/kernels/cuda/qsa_decode_attn.cu:831-845` — `STRATA_ATTN_DAILY` の読み取り条件。HIP では常に false。
-- `src/kernels/cuda/qsa_decode_attn.cu:910-920` — この変数の既定値、`atoi` による上書き、初回評価後の static cache。
-- `src/kernels/cuda/qsa_decode_attn.cu:698-721,723-800` — 標準 merge と v2 merge の実装、およびソースコメントにある同一演算の説明。
-- `src/kernels/cuda/qsa_decode_attn.cu:1028-1057,1059-1114,1117-1167,1174-1220` — batch、slot、batch rows、single-query 経路からの merge 選択。
-- `include/strata/kernels/qsa_decode_attn.hpp:67-77` — parity 用インターフェースの説明。これは比較用で、エンジン経路が環境から選択する処理とは別です。
-- `docs/DETAILS.md:2220-2228` — `STRATA_ATTN_DAILY` 全体の測定条件と数値。
+- `engine/src/kernels/cuda/qsa_decode_attn.cu:902-923` — `STRATA_ATTN_DAILY` の値判定と CUDA/HIP の既定値。
+- `engine/src/kernels/cuda/qsa_decode_attn.cu:1003-1020` — 本変数の読み取り、空文字・数値判定、merge kernel の分岐。
+- `engine/src/kernels/cuda/qsa_decode_attn.cu:1132-1147, 1217-1223, 1295-1301, 1349-1354` — decode 経路からの選択利用と起動エラー処理。
+- `engine/src/core/arch_defaults.cpp:28-55, 302-310, 360-370` — AMD gfx12 の既定値と既設定値の優先、観測ログ。
+- `engine/src/program/generate.cpp:4320` — アーキテクチャ既定値適用の呼び出し。
+- `engine/include/strata/core/sm120_series.hpp:78-81, 87-95` — CUDA compute capability の既定判定に使う helper と GB10 設定。

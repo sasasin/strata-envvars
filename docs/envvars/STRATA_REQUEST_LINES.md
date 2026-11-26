@@ -1,45 +1,51 @@
 # `STRATA_REQUEST_LINES`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata の Python サーバーが engine のログを追い、request summary をサーバープロセス自身の stdout に再出力するための opt-in です。engine の stderr はログファイルへ送られるため、サーバーの stdout だけを読む supervisor などにもリクエスト単位の数値を見せます。生成処理や engine への引数を変える環境変数ではありません。
-
-候補一覧にはありますが、値を実際に読む箇所は `serve/server.py` です。C++/CUDA/HIP/SYCL 側にこの名前の読み取りはありません。`docs/DETAILS.md` にこの名前の説明も見つかりませんでした。
+`terminal/serve` の Python サーバーが、エンジンのログファイルからリクエスト完了行を読み取り、サーバープロセスの stdout に `[strata] request ...` 行として再出力するための設定です。リクエスト処理や生成の選択・計算は変えず、エンジンの stderr がログに送られる構成でも、サーバー外側の supervisor がリクエスト単位の数値を stdout で観測できるようにします（`terminal/serve/server.py:533-553, 809-835`）。
 
 ## 値と判定
 
-Python の `os.environ.get("STRATA_REQUEST_LINES")` の真偽値だけで判定します。文字列を `1` と比較したり、数値に変換したりはしません。
+サーバー側の `os.environ.get("STRATA_REQUEST_LINES")` の戻り値を Python の真偽値として判定します。文字列を `1` や真偽値として parse しません（`terminal/serve/server.py:809`）。
 
-| 親サーバーの環境値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 `""` | 無効 |
-| 空でない任意の文字列（`"1"`, `"0"`, `"false"` など） | 有効 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 通常の `StrataEngine` 初期化 | 無効 | 空文字列でない任意の値。`1`、`true`、`false`、`0`、`0anything`、空白だけの値も有効 | 未設定、明示的な空文字列 |
+| `lazy=True` の初期化 | ログ追従処理自体を開始しない | なし | 値にかかわらず適用されない |
 
-したがって、`STRATA_REQUEST_LINES=0` や `false` も有効です。無効値用の警告や fallback はありません。根拠: `serve/server.py:1054-1056`。
+大文字小文字、前後の空白、数値としての妥当性は検査されません。たとえば `false` や `0` も空でない文字列なので有効です。変数の値による fallback や範囲制限はありません（`terminal/serve/server.py:798-811`）。
 
 ## 有効になる条件
 
-値が空でなくても、次の条件を満たすときだけ follower thread を開始します。
-
-- `StrataEngine` が lazy でないこと。lazy 初期化はこの判定より前に return します。
-- `log` が指定されていること。
-- その絶対パスのログを、このサーバープロセスがすでに追跡対象にしていないこと。
-
-この判定に OS、backend、モデル状態、CLI 引数による分岐はありません。同じ絶対パスにつき `_echoing` set により follower は一つだけです。ログを指定しない場合や lazy 初期化の場合は、変数が設定されていても何も出力しません。根拠: `serve/server.py:1043-1056`。
-
-サーバー設定の `env` は `child_env()` が親プロセス環境をコピーした後で engine 子プロセス用の値を反映し、`StrataEngine` に渡します。一方、この変数の条件判定は `env` 引数ではなく `os.environ` を直接参照します。そのため設定ファイルの `env: {STRATA_REQUEST_LINES: ...}` だけでは有効になりません。根拠: `serve/server.py:104-1056, 3747-3760, 9278-9279`。
+- 対象は `terminal/serve` のサーバープロセスです。エンジン単体の起動時にこの変数を読む箇所はなく、候補名の全参照ではサーバーの設定有無チェックだけが実読み取りです（`terminal/serve/server.py:809`）。
+- `StrataEngine` が lazy 初期化ではなく、かつ `log` パスを受け取る必要があります。ログがない場合はエンジン stderr が `DEVNULL` に向けられ、この追従スレッドも作られません（`terminal/serve/server.py:798-811, 833-835`）。
+- 1 つの絶対ログパスにつき追従スレッドを一度だけ作成します。同じログを使うエンジン再起動では既存スレッドが追従を続けるため、再初期化のたびに別のスレッドは作られません（`terminal/serve/server.py:808-811`; `_echoing` は `terminal/serve/server_parts/engines.py:185`）。
+- CLI 引数や設定ファイルによる値の上書き・優先順位はありません。サーバープロセス自身の環境を直接確認します。エンジン起動用の `env` 引数は別に渡されており、この分岐はそれを参照しません（`terminal/serve/server.py:809, 833-835`）。
 
 ## 実行時の詳細
 
-`StrataEngine.__init__` の lazy 判定後、ログを開いた時点で親プロセスの環境を読みます。値を別の変数に cache する処理はありませんが、ログごとに follower thread を一度だけ起動するため、既に追跡中のログについて後から環境を変更しても thread の開始・停止には反映されません。follower の開始位置は起動時点のログファイルサイズで、以後は追加行を読みます。EOF では 0.2 秒待って再読込します。engine は `--serve` で起動され、stdout は pipe、stderr はログファイルに接続されます。根拠: `serve/server.py:698-710, 1043-1056, 1077-1079`。
+`StrataEngine.__init__` は lazy 判定の後、指定されたログの現在のサイズを基準位置として記録します。変数が有効なら、ログの絶対パスが `_echoing` に未登録の場合に限り、デーモンスレッドで `echo_requests(log, 現在のサイズ)` を開始します。追従関数はその位置からログを開いて行単位で読み、まだ新しい行がない場合は 0.2 秒待って再試行します（`terminal/serve/server.py:798-811, 533-553`）。
 
-follower は `ENGINE_REQUEST` の正規表現に一致した行だけを拾います。一致すると、prompt token 数、再利用 token 数（出力では `cached`）、生成 token 数、prompt 読み取り時間、読み取り時間と生成時間の合計、prefill/decode tok/s を `[strata] request ...` 行として stdout に flush します。所要時間は `%.0f` で丸めて表示します。一致しない行は無視します。根拠: `serve/server.py:500-504, 690-710`。
+この変数はエンジン起動前のサーバー側で評価され、エンジンの環境変数として値を転送する処理ではありません。値を設定・変更しても、既に追従中のログには再評価が行われません。同じサーバープロセス内で新たなログパスを初期化した場合は、その時点の環境値と `_echoing` の登録状態で判定されます（`terminal/serve/server.py:809-811`）。
 
-現在の通常 engine の request summary は stderr に `strata serve: prompt ... tokens = ... reused + ... read ...` として出力されます。サーバーはその行から必要なフィールドを抽出し、engine の元の文面ではなく整形した行を再出力します。根拠: `src/program/generate.cpp:17462-17473`。この変数によって engine 側のログ出力自体が変更されるわけではありません。
+追従側は `ENGINE_REQUEST` 正規表現に一致したログ行だけを出力します。正規表現は prompt token 数、再利用数、読み取り時間と速度、生成数、生成時間と速度を拾い、`echo_requests` は `cached` を再利用数、`total` を読み取り時間と生成時間の合計として表示します。プロンプト読込途中のキャンセル形式（`<read> of <total> read`）も一致対象です（`terminal/serve/server_parts/engines.py:178-182`; `terminal/serve/server.py:548-553`）。Strata エンジンの標準サーバー経路は完了時に同じ項目を stderr に書きます（`engine/src/program/generate.cpp:23754-23765`）。
 
-## ログと失敗経路
+## ログと測定値
 
-この環境変数専用の有効化ログ、警告、エラー終了経路はありません。空値、未設定、ログなしでは follower が起動しません。一致する summary 行がなければ追加出力はありません。follower は daemon thread で、通常はログを読み続けます。根拠: `serve/server.py:698-710, 1050-1056`。
+追従スレッドが一致行を見つけると、stdout に次の形式を flush 付きで出します（実際の数値・速度部分はログから取得）。
+
+```text
+[strata] request prompt P cached C output O prompt_read R ms total S ms prefill X tok/s decode Y tok/s
+```
+
+出力文字列は `terminal/serve/server.py:551-553`、元のエンジン側の完了行は stderr への `strata serve: prompt ...` 出力として `engine/src/program/generate.cpp:23760-23765` にあります。エンジン側ログ行が正規表現に一致しない場合、この機能による stdout 行は出ません。測定値や性能差を示す資料はこの設定の根拠として確認できなかったため記載していません。
+
+## 根拠
+
+- `terminal/serve/server.py:533-553` — ログ追従、行の正規表現照合、stdout 出力。
+- `terminal/serve/server.py:798-811` — lazy 判定、ログの有無、環境値の読み取り、ログごとの追従スレッド制御。
+- `terminal/serve/server.py:833-835` — エンジン stderr をログへ、stdout をパイプへ接続する起動経路。
+- `terminal/serve/server_parts/engines.py:178-185` — 対象となるエンジン行の正規表現と既追従ログ集合。
+- `engine/src/program/generate.cpp:23754-23765` — 通常の Strata サーバー経路が出すリクエスト完了行。

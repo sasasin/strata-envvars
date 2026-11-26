@@ -1,44 +1,41 @@
 # `STRATA_COPY_HIP_PRIO`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。Strata 所有ソースを対象とし、外部ライブラリやHIPランタイム内部の動作は含めない。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-通常のHIPビルドで、Verifierがexpert転送に使う専用copy streamを高優先度で作るかを指定する。既定では通常のnon-blocking streamを作る。環境変数が有効と判定された場合、HIPから取得した優先度範囲の `hi` を使ってstream作成を試みる。
-
-このstreamは、GPU planで必要になったmiss expertのホストからデバイスへのDMA転送と、その完了後にGPU側の待ちを解除するhost functionに使われる。したがって、この設定は転送データやモデル計算を変更せず、転送streamの作成方法を変える（`src/core/verify.cpp:2535-2564`; `include/strata/core/verify.hpp:482-488`）。
+HIP 用 `Verifier` の初期化で、欠落 expert の DMA に使う copy stream を高優先度で作成する opt-in です。優先度付き stream を作成できた場合は `copy_` に保存され、欠落 expert のデータ転送と、その完了を知らせる順序付き host function がこの stream に投入されます（`engine/src/core/verify.cpp:1335-1348,4391-4412`）。Strata のコメントは、window graph と同じ優先度の queue に copy や host function が並んで flag 待ちが起きる場合への対処として説明しています（同 `1337-1339`）。
 
 ## 値と判定
 
-実装は `std::atoi` で整数変換し、結果が0でないかを判定する。文字列全体の妥当性確認はない。
+`std::getenv` の戻り値を `std::atoi(v) != 0` で判定します。値全体の形式検証や範囲検査はありません。未設定は無効、空文字や数値に変換できない文字列も `atoi` が 0 を返すため無効です。数値として読める先頭部分が 0 以外なら有効で、後続文字は判定に使われません（`engine/src/core/verify.cpp:1341`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効。通常streamを作る |
-| 空文字、整数に変換できない文字列、`0`、`-0` | `atoi` の結果が0となり無効 |
-| `1`、`2`、`-1` など、変換結果が0以外 | 有効 |
-| 数字の後ろに文字が続く値（例: `1abc`） | `atoi` が読む先頭の整数部分が非0なら有効（例では有効） |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `STRATA_USE_HIP` 定義、`STRATA_HIP_GFX906` 未定義 | 無効 | `1`, `-1`, `1suffix`, ` 1` | 空文字, `0`, `0anything`, `true`, `false`, ` 0` |
+| それ以外の build | この箇所では読まれない | 該当なし | 該当なし |
 
-先頭の空白と符号は `atoi` の整数変換に従う。たとえば ` 1` は有効、`0abc` は無効になる。値の判定はVerifierの初期化中に行い、関数内 `static const bool` に保存するため、その判定後に環境変数を変更しても再評価されない（`src/core/verify.cpp:752-763`）。
+大文字小文字は数値変換の対象にならず、`true` / `false` は有効値ではありません。`atoi` の数値変換に失敗する値は無効扱いです。別の CLI 引数や環境変数による値の上書き、clamp はありません。
 
 ## 有効になる条件
 
-環境変数を読むコードは `STRATA_USE_HIP` が定義され、かつ `STRATA_HIP_GFX906` が定義されていないビルドに限られる。通常のCUDA、Metal、およびgfx906互換HIPビルドではこの分岐がコンパイルされず、設定しても本変数によるstream優先度の変更はない（`src/core/verify.cpp:753-764`; gfx906互換ビルド定義: `CMakeLists.txt:128-144`）。
-
-通常HIPビルドでも、非0値の設定だけで高優先度streamが確定するわけではない。優先度範囲の取得または高優先度stream作成が失敗した場合、Strataは通常のnon-blocking stream作成に進む。通常stream作成も失敗した場合は `verify: copy stream create failed` をエラー文字列にして初期化を失敗させる（`src/core/verify.cpp:758-767`）。
+- `engine/src/core/verify.cpp` が `STRATA_USE_HIP` 定義かつ `STRATA_HIP_GFX906` 未定義でコンパイルされていること。同ファイル先頭の guard は Windows HIP または CUDA 系実装を選び、GFX906 互換 build はこの読み取り分岐から除きます（`engine/src/core/verify.cpp:1-5,1335-1347`）。
+- `Verifier::init` が実行されること。serve/generate は verifier を初期化し、`--pipeline-windows` や layer split の経路でも追加 verifier を初期化します（`engine/src/program/generate.cpp:13393-13420,13431-13465,13481-13501`）。この設定の判定そのものは `--spec` の値を参照しません。
+- `atoi` の結果が 0 以外で、HIP の stream priority range 取得と優先度付き stream 作成の両方が成功すること（`engine/src/core/verify.cpp:1341-1345`）。条件を満たさない場合、通常優先度の non-blocking stream を作成します（同 `1348`）。
 
 ## 実行時の詳細
 
-Verifier初期化時に `STRATA_COPY_HIP_PRIO` を読み、非0なら `hipDeviceGetStreamPriorityRange(&lo, &hi)` を呼ぶ。成功時は返された `hi` で `hipStreamCreateWithPriority(&copy_, hipStreamNonBlocking, hi)` を試す。どちらかの呼び出しに失敗すると `copy_made` はfalseのままなので、続いて `cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking)` を実行する。HIP互換層ではこのCUDA互換APIがHIP APIへ写像される（`include/strata/platform/hip_compat/strata_hip.h:129-130`）。優先度付きstream作成のエラー状態はその場で `cudaGetLastError()` により消費され、fallback自体の失敗時のみ上記の初期化エラーとなる。
+値は `Verifier::init` 内の関数ローカル `static const bool` により、最初にこの HIP 分岐を通る初期化時に一度だけ読み取られます。その値は同プロセス内の後続初期化でも共有されるため、最初の評価後に環境を変更しても反映されません（`engine/src/core/verify.cpp:956,1335-1345`）。
 
-DMA fetchでは、`copy_` にexpert blobを非同期コピーし、その後同じstreamにhost functionを登録して、転送完了を示すflagを上げる。Verifierはwindow完了時にcopy streamも同期し、次windowで前windowのhost functionがflagを上げないようにする（`src/core/verify.cpp:2428-2433,2535-2564`）。
+有効値の場合、Strata は `hipDeviceGetStreamPriorityRange` で範囲を得て、その `hi` を渡して non-blocking `copy_` を作成します。優先度 range 取得または優先度付き作成が失敗すると `copy_made` は false のままなので、`make_stream(&copy_)` による通常 stream 作成へ進みます。通常 stream も失敗した場合は `err` に `verify: copy stream create failed` を設定して `false` を返します（`engine/src/core/verify.cpp:1341-1350`）。成功時、欠落 expert の upload (`cudaMemcpyAsync` または `copy_expert_blobs`) と、それらの後に flag を上げる処理が `copy_` 上で行われます（同 `4391-4412`）。
 
-`src/core/verify.cpp` の完全一致検索では環境変数の読み取り箇所は上記1箇所だけだった。`docs/DETAILS.md` と `docs/AMD_HIP.md` にこの環境変数の個別説明や測定値は見当たらない。ソースコメントは、HIPで優先度ごとにhardware queueが割り当てられる前提と、window graph待ち中にコピーstreamの処理が同じqueueで詰まる問題を理由として記すが、その効果や性能向上を裏付ける測定条件はリポジトリ資料に示されていない（`src/core/verify.cpp:754-756`）。
+## ログと測定値
+
+この変数の値や優先度付き stream の選択を知らせる専用ログはありません。優先度付き stream と通常 stream の両方の作成に失敗すると `Verifier::init` は `verify: copy stream create failed` を返します。メインの serve 初期化側では `strata serve: <err>` を stderr に出し、終了コード 1 を返します（`engine/src/core/verify.cpp:1348-1350`; `engine/src/program/generate.cpp:13496-13501`）。高優先度設定の性能測定値は、この設定を条件付きで評価できる資料内に確認できません。
 
 ## 根拠
 
-- 変数の読み取り、値判定、priority付きstream作成、通常streamへのfallback: `src/core/verify.cpp:752-767`
-- DMA fetchとコピー完了flagの登録: `src/core/verify.cpp:2535-2564`
-- window終了時のcopy stream同期: `src/core/verify.cpp:2428-2433`
-- copy streamの役割とfetch callbackの宣言: `include/strata/core/verify.hpp:482-488`
-- HIP gfx906互換ビルドのmacro定義: `CMakeLists.txt:128-144`
+- `engine/src/core/verify.cpp:1-5` — verifier 実装の compile guard。
+- `engine/src/core/verify.cpp:956-957,1335-1355` — `Verifier::init` と値の読み取り、stream 作成・fallback・失敗。
+- `engine/src/core/verify.cpp:4391-4412` — `copy_` を使った欠落 expert の転送と順序制御。
+- `engine/src/program/generate.cpp:13393-13420,13431-13465,13481-13501` — serve/generate の verifier 初期化と失敗報告。

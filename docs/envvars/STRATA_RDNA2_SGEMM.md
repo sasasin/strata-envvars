@@ -1,44 +1,50 @@
 # `STRATA_RDNA2_SGEMM`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。対象は Strata 所有ソース。外部ライブラリの内部動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-HIP の prefill dense GEMM で、FP16 または BF16 の入力を FP32 に拡張してから FP32 SGEMM を使う経路を選びます。主な呼び出し元は BF16 GEMM と FP16 GEMM です。この変数は経路選択だけを変え、Strata は `hipblasSgemm` を呼び出します。変数が未設定または無効なら、呼び出し元の通常 GEMM に進みます。
+HIP 版の dense prefill GEMM の一部を、16-bit 入力を FP32 バッファへ拡張して `hipblasSgemm` で計算する opt-in 切り替え。対象経路では FP16/BF16 入力の `Gemm::f16` / `Gemm::bf16` がこの実装を呼び、適用された積は FP32 出力 `Y` に加算係数 `beta` で書く。GPU 全体や decode の設定ではない。CUDA/SYCL にはこの読み取り・実装はない。`engine/src/prefill/gemm.cu:1052-1066, 1120-1140, 1191-1194, 1303-1306, 1358-1360`
 
 ## 値と判定
 
-判定は `rdna2_sgemm_on()` の最初の呼び出しで一度行われ、関数内の `static const int mode` に保存されます。空文字と未設定は同じく無効です。
+`rdna2_sgemm_on()` の関数内 `static const int mode` 初期化で `std::getenv` を一度読み、結果をプロセス内で保持する。未設定または空文字列なら mode 0。文字列が厳密に小文字の `all` と一致すると mode 2。それ以外は `std::atoi(v) > 0` なら mode 1、そうでなければ mode 0。整数全体の妥当性検査はないため、`atoi` が先頭から読める正の10進数を含む値（例 `1x`, `1.5`, ` 1`, `+1`）も mode 1 になる。数値に変換できない文字列、`0`、`-1`、`0x10` は mode 0。`all `、`ALL`、` true` は mode 2 にならない。`atoi` の範囲外入力の結果は本コードで検査・規定していない。`engine/src/prefill/gemm.cu:1082-1089`
 
-| 値 | 判定 |
-|---|---|
-| unset、空文字 | 無効（`mode=0`） |
-| 文字列全体が小文字の `all` | 全 AMD GPU 向け（`mode=2`） |
-| それ以外で `atoi(value) > 0` | gfx103x 向け（`mode=1`） |
-| `atoi(value) <= 0` | 無効（`mode=0`） |
+| 条件 | unset / 空文字 | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| HIP build、mode 判定 | mode 0（native GEMM） | `all` は全 AMD device、`atoi` 結果が正なら gfx103x のみ | `0`, `-1`, `true`, `ALL`, 空文字 |
+| CUDA / SYCL build | この変数を読むコードなし | 該当なし | 該当なし |
 
-`all` の比較は大文字小文字を区別し、文字列全体の一致が必要です。数値判定は `atoi` なので、文字列全体の数値検証ではありません。たとえば `1abc`、`+1`、先頭空白の後の `1` は正数として判定され、`0abc`、`-1`、数値で始まらない文字列は無効です。`2` も `all` ではなく gfx103x モードになります。
+`mode=1` では device 名 `gcnArchName` の先頭6文字が `gfx103` かを確認する。device が選べない、device index が 0–63 の範囲外、または device properties の取得に失敗した場合は無効として呼び出し元が native 経路を続ける。`all` は architecture 判定を通らず全 AMD device で有効になる。どちらの mode も出力行数 `N < 64` では無効。`K <= 0` でも SGEMM 関数は失敗扱いで戻る。`engine/src/prefill/gemm.cu:1090-1102, 1120-1123`
 
 ## 有効になる条件
 
-- HIP コンパイル時にだけ、この読み取りと経路がコンパイルされます（`__HIPCC__`）。CUDA 専用ビルドではこの変数を読むコードはありません。
-- SGEMM 経路は `K > 0` かつ `N >= 64` の場合に限られます。`N < 64` の router/gate 等は設定値にかかわらず通常経路を使います。
-- `mode=1` は実行中の HIP device の `gcnArchName` が `gfx103` で始まる場合だけ有効です。各 device の architecture 判定結果は最大64 device分 static 配列に cache されます。device query が失敗するか device index が範囲外なら無効になります。
-- `mode=2`（値が厳密に `all`）は architecture 判定を飛ばして、`N >= 64` の AMD device で有効になります。
-- BF16 呼び出しでは、先行する hipBLASLt 経路が処理した場合はそこで戻るため、この SGEMM 判定に到達しません。また `ldx != 0`（padded X）の場合も SGEMM 呼び出しをスキップし、通常経路を使います。
-- BF16 呼び出しで `f16_io_` が有効な場合は、その専用 FP16 画像経路が先に処理して戻るため、この環境変数の経路には入りません。
-- scratch 用 FP32 buffer の確保に失敗した場合は `rdna2_sgemm()` が false を返し、呼び出し元が通常 GEMM を実行します。
+- HIP (`__HIPCC__`) でビルドされた engine であること。環境変数の読み取りと本体は `__HIPCC__` の条件付きコードにある。engine で CLI 引数や設定ファイルとこの値を合成する処理はなく、環境値の mode 判定が直接使われる。`engine/src/prefill/gemm.cu:1052, 1141`
+- mode が 1 なら実行中 device が `gfx103x`、mode が `all` なら AMD device であること。さらに `N >= 64`、`K > 0` が必要。`engine/src/prefill/gemm.cu:1090-1102, 1122`
+- BF16 `Gemm::bf16` では、`ldx == 0`（連続行）であり、前段の `f16_io_` 経路が処理を終えておらず、ビルド済み hipBLASLt がある場合は `try_hipblaslt` も処理を終えていないこと。前者なら SGEMM 呼び出し自体を飛ばし、hipBLASLt が成功すればそこから return する。 `f16_io_` 経路で `beta != 0` の場合は SGEMM へ進まず stderr に `prefill gemm: an accumulating BF16 GEMM on the FP16 prompt path` を出して `exit(1)` する。`engine/src/prefill/gemm.cu:1169-1194`
+- FP16 `Gemm::f16` では、HIP の `f16_io_ && beta == 0` 経路が先に `f16_inplace` を実行して return する。ビルド済み hipBLASLt が積を処理した場合も SGEMM へ進まない。`engine/src/prefill/gemm.cu:1318-1327, 1358-1360`
+- 必要な FP32 変換バッファを確保できること。確保に失敗した場合は SGEMM を行わず、呼び出し元が native GEMM に進む。`engine/src/prefill/gemm.cu:1104-1114, 1125-1126, 1191-1194, 1358-1360`
+- `STRATA_HIP_PROMPT_F16` 自体はこの関数で読まないが、prefill 初期化で選ばれた `m.f16_io` が `Gemm` に渡され、上記の先行 FP16 経路を制御する。`engine/src/prefill/prefill.cpp:2724-2729`, `engine/src/prefill/gemm.cu:1169-1179, 1318-1320`
 
 ## 実行時の詳細
 
-有効な場合、Strata は重みを FP32 buffer に拡張し、入力 activation は最大128 MiB相当ずつの slice に分けて同じ stream 上で FP32 に拡張します。その後、各 slice の出力範囲に `hipblasSgemm` を発行します。FP16/BF16からFP32への拡張後の値は表現上正確ですが、native GEMM と加算順序が異なるため、結果は bit-identical とは限りません。ソースコメントでは差が和の順序によるものとされています。
+環境変数値は `rdna2_sgemm_on()` が最初に呼ばれた時に一度だけ評価され、後からの環境変更は反映されない。gfx 判定も device ごとの固定長 atomic 配列に cache される。`mode=1` で architecture 判定が失敗したときはその呼び出しでは native 経路に戻る。`mode=all` は device 判定をしない。`engine/src/prefill/gemm.cu:1083-1102`
 
-BF16 GEMM は hipBLASLt の試行後、`ldx == 0` のときにこの経路を試します。FP16 GEMM は HIP 用呼び出し箇所からこの経路を試します。成功すれば通常 GEMM を呼ばず、失敗または条件不一致なら通常経路へ進みます。読み取りはリクエストごとではなく最初の `rdna2_sgemm_on()` 呼び出し時であり、実行中に環境を変更しても mode は再評価されません。ソースにこの変数の専用ログ出力はありません。
+SGEMM は重みを FP32 に広げ、入力行を最大 `32 Mi` FP32 要素（128 MiB）の slice に分けて同じ stream で処理する。BF16 の拡張は 16-bit 値の上位ビットを FP32 に写し、FP16 は half-to-float 変換を使う。slice ごとの出力領域は別々なので各々に呼び出し元の `beta` を渡す。必要サイズに応じて `tc_w_` / `tc_x_` を再利用または確保し、再確保前には過去 GEMM が stream 上で読むバッファを解放しないよう同期する。`engine/src/prefill/gemm.cu:1068-1080, 1104-1116, 1120-1139`
+
+変換バッファの `cudaMalloc` が失敗すると Strata は CUDA/HIP の last error を消費して `false` を返し、呼び出し元の native GEMM に進む。この fallback に専用ログはない。SGEMM の `hipblasSgemm` が失敗した場合、共通 `ck()` が stderr に `prefill gemm: hipblasSgemm (RDNA2): cuBLAS status %d` を出して `exit(1)` する。成功を示す専用ログはない。`engine/src/prefill/gemm.cu:1105-1113, 1135-1138, 160-165`
+
+## ログと測定値
+
+有効化・architecture 判定・バッファ確保失敗を知らせるログはコードにない。SGEMM 呼び出し失敗時だけ上記 `ck()` の status ログと終了がある。ソースコメントには RX 6800 / ROCm 10.2.0a20260930 の個別測定（Coder の prompt shapes、12K token prompt で GEMM 合計 14.1 秒から 4.7 秒、BF16 hyper-connection GEMM 10.9 ms から 7.5 ms）が記載されているが、特定条件での開発者測定であり、一般性能の保証ではない。`engine/src/prefill/gemm.cu:1056-1063, 160-165`
+
+`docs/AMD_HIP.md:517` の説明は「`STRATA_HIP_PROMPT_F16=1` と併用すると FP16 route が先に実行され、SGEMM が残った積を処理する」としている。一方、現行 `Gemm::bf16` は `f16_io_` なら `f16_inplace` 後に無条件 return し、`Gemm::f16` も `f16_io_ && beta == 0` なら先に return するため、これらの呼び出しでは当該 GEMM は SGEMM に到達しない。適用結果は説明ではなく上記の現行分岐に従う。`engine/src/prefill/gemm.cu:1169-1179, 1191-1194, 1318-1320, 1358-1360`
 
 ## 根拠
 
-- `src/prefill/gemm.cu:849-869` — 環境変数の読み取り、`all` / `atoi` 判定、mode cache、device architecture 判定。
-- `src/prefill/gemm.cu:885-906` — shape gate、buffer 確保、FP32 拡張、SGEMM 発行。
-- `src/prefill/gemm.cu:921-960` — BF16 経路の順序、hipBLASLt・`ldx` 条件・呼び出し元 fallback。
-- `src/prefill/gemm.cu:1104-1106` — FP16 経路の呼び出し。
-- `docs/AMD_HIP.md:550-576` — 経路の説明と、RX 6800での測定条件・結果。記載値は同資料の測定結果であり、ここで再測定したものではありません。
+- `engine/src/prefill/gemm.cu:1052-1066` — HIP 限定の機能と設計コメント。
+- `engine/src/prefill/gemm.cu:1082-1102` — 値の読み取り、static cache、device 判定。
+- `engine/src/prefill/gemm.cu:1104-1140` — バッファ確保、FP32 変換、slice SGEMM と失敗処理。
+- `engine/src/prefill/gemm.cu:1169-1194, 1303-1360` — BF16/FP16 の先行経路と native fallback。
+- `engine/src/prefill/prefill.cpp:2724-2729`; `engine/include/strata/prefill/gemm.hpp:63-66` — `f16_io_` の設定元と用途。
+- `docs/AMD_HIP.md:510-518`; `docs/SETTINGS.md:294` — 補助資料との照合。

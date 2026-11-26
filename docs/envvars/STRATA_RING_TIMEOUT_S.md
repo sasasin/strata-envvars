@@ -1,54 +1,44 @@
 # `STRATA_RING_TIMEOUT_S`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL backend の検証 window が、GPU の layer doorbell（ring）を待つ時間を秒単位で指定します。実装コメントでは、既定20秒では初回に GPU kernel を JIT コンパイルするカード（例として Arc A750）で最初の window の開始に足りない場合があるため、この値で延長できると説明しています。
-
-この環境変数を読むのは `sycl/src/core/verify.cpp` だけです。CUDA 側の `src/core/verify.cpp` は同じ種類の待機に固定20秒を使い、この環境変数を読みません。SYCL のパイプライン用 `Verifier::service()` にも別の固定20秒 timeout があり、この変数の対象外です。
+SYCL エンジンが GPU の layer doorbell（ring）を待つ時間を秒単位で変える。既定は 20 秒で、正の値を指定するとその秒数を超えるまで待つ。CUDA/HIP 側ではこの名前を読む実装は見つからず、対象は SYCL の `Verifier` である。設定値はモデル計算や token の選択を直接変えるものではなく、doorbell が遅れて届く場合の待ち時間と、届かない場合に timeout として失敗にする時点を変える。`engine/sycl/src/core/verify.cpp:297-307,2673-2684,3756-3759,4028-4031`。
 
 ## 値と判定
 
-`std::atol()` で値を `long` に変換し、結果が1以上ならその秒数を採用します。それ以外は20秒に戻します。文字列全体の数値検証はせず、`atol()` が変換できる先頭部分を使います。
+`strata_ring_timeout()` は `std::getenv` で値を取得し、設定されていれば `std::atol`、未設定なら `20` を使う。変換結果が 1 未満なら 20 に戻し、1 以上なら上限なしで秒数として使う。`atol` は数値全体の厳密な検証ではないため、先頭の空白や符号を含む数値部分を変換し、変換後の文字列は検査しない。数値として読めない先頭なら 0 となり既定値に戻る。正の範囲外で `atol` が扱えない値の結果は、このコードでは別途検証されない。
 
-| 環境変数の状態・値 | 採用値 |
-|---|---:|
-| 未設定 | 20秒 |
-| 空文字、数値に変換できない文字列、`0`、負数 | 20秒 |
-| `1` 以上の整数文字列 | 変換後の秒数 |
-| 数値の後ろに文字がある値（例: `30abc`） | 先頭の整数部分。例では30秒 |
-| 数字より前に空白や符号がある値（例: ` 30`, `+30`） | `atol()` が変換した値。例では30秒 |
+| ビルド・経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| SYCL `Verifier` | 20 秒 | 1 以上に変換される値（例: `1`, `+3`, ` 4`, `3seconds` → 1, 3, 4, 3 秒） | 空文字、`0`, `0anything`, 負数、数値に変換できない文字列は 20 秒に戻る |
 
-明示的な上限・clamp はありません。変換結果が正の `long` であればその値を使います。`atol()` の範囲外入力に対するエラー検査もありません。
-
-根拠: `sycl/src/core/verify.cpp:209-216`。
+変換後の値で比較するため、`1.5` は 1 秒として扱われ、`1abc` は 1 秒として扱われる。`+0` と `-1` は 20 秒に戻る。`atol` の整数オーバーフロー時の挙動は規格上保証されないため、その場合の値は定められない。`engine/sycl/src/core/verify.cpp:300-307`。
 
 ## 有効になる条件
 
-- SYCL backend を使うビルド・実行経路であること。SYCL の engine は `sycl/CMakeLists.txt:220-228` で `sycl/src/core/verify.cpp` を含みます。通常の CUDA engine は `CMakeLists.txt:472-478` で別の `src/core/verify.cpp` を含みます。
-- GPU が doorbell を上げるまでホストが待つ経路であること。すでに doorbell が届いていれば timeout 判定は実行されません。
-- all-resident など、layer ごとの host doorbell 待ちを行わない経路では、この待ち時間は適用されません。
-- `Verifier::service()` のパイプライン経路は別実装で、`fl_since_ms_` からの経過時間が20,000 msを超えると timeout します。`STRATA_RING_TIMEOUT_S` は参照されません。
+- SYCL エンジンの `Verifier` の doorbell wait 経路で使われる。SYCL の engine source list に `src/core/verify.cpp` が含まれる（`engine/sycl/CMakeLists.txt:290-293`）。
+- 通常の layer-by-layer wait、同期 batch wait、batch polling で GPU の sequence counter が期待値に届かない場合に timeout 判定を行う（`engine/sycl/src/core/verify.cpp:2637-2684,3726-3759,4006-4034`）。
+- ホストが layer ごとの doorbell を待たない経路ではこの変数はその待ちに作用しない。たとえば `STRATA_VERIFY_NO_HOST` が有効な通常 window は `!no_host` の待ちループを通らず、all-resident 経路にも個別のホスト待ちはない（`engine/sycl/src/core/verify.cpp:2615-2620,2623-2637,3998-4005`）。
+- 別の環境変数や CLI 引数による timeout の上書きは見つからなかった。SYCL spin kernel 側の読み取り上限は別設定 `STRATA_SPIN_MAX` / `STRATA_SYCL_SPIN_MAX` に関する別機構であり、この変数の秒数とは別である（`engine/sycl/CMakeLists.txt:59-70`）。
 
 ## 実行時の詳細
 
-`strata_ring_timeout()` は関数内 `static const long` を初回呼び出し時に初期化します。通常の window 実行では、各 layer の `h_seq_` が期待値に達するまで spin wait し、その待ちが設定秒数を**超えた**場合に timeout とします。バッチ実行と `batch_poll()` にも同じ関数が使われます。初回の ring 待ちで timeout 関数が呼ばれた後は結果がプロセス内にキャッシュされ、環境変数を変更しても再読込しません。
+秒数は `strata_ring_timeout()` 内の関数ローカル `static const long` に初回評価時だけ保存される。したがって最初の呼び出し後にプロセス環境を変えても反映されず、そのプロセス内の後続 wait でも同じ秒数を使う（`engine/sycl/src/core/verify.cpp:300-307`）。
 
-timeout 時は検証処理がエラーを返し、GPU 側の待ちを最大5秒間解放・drain しようとします。エラー文字列は通常経路で `verify: timed out at layer N`、バッチ経路で `verify batch: timed out at layer N` です。通常経路で `STRATA_VERIFY_TRACE` が有効なら、timeout 前後の診断出力も行います。これらの後処理時間5秒は本変数では変わりません。
+通常の window と同期 batch は、GPU の sequence counter が期待値未満の間 spin し、待ち始めから設定秒数より長く経過すると timeout にする。batch polling は前回の doorbell 時刻 `b_last_` から計り、未到着時に 2 ms を超えた polling で timeout を確認する。比較は `>` なので、指定秒数ちょうどではなくそれを超えた後に判定される（`engine/sycl/src/core/verify.cpp:2641-2645,2673-2684,3728-3734,3756-3759,4006-4034`）。
 
-パイプライン用の `Verifier::service()` は `fl_since_ms_ > 20000.0` を独自に判定するため、`STRATA_RING_TIMEOUT_S` を大きくしてもそこは延長されません。
+timeout 時は `verify: timed out at layer <番号>` または `verify batch: timed out at layer <番号>` を error 文字列に設定し、GPU wait の解放を最大 5 秒試みる。通常 window では `STRATA_VERIFY_TRACE` 有効時に診断と trace dump を行い、無効時はそれらを行わず解放を試みる（`engine/sycl/src/core/verify.cpp:2673-2684,3756-3759,4028-4031`）。
 
-## 文書との照合
+## ログと測定値
 
-ソース内の実装コメントに既定20秒と、初回 JIT の起動がそれを超えうる旨があります。`docs/DETAILS.md`、`docs/INTEL.md`、`docs/A770_SPEED_SPEC.md`、`docs/TROUBLESHOOTING.md` を検索した範囲では、この環境変数の値や使い方を説明する記述は見つかりませんでした。性能値や実測効果は記載していません。
+timeout 自体は `stderr` に直接出力せず、`err` に上記の文字列を設定して呼び出し元へ失敗を返す。SYCL generation 呼び出し元は失敗時に `ERR <error>` を stdout に出す（`engine/sycl/src/core/verify.cpp:2673-2684,3756-3759`; `engine/sycl/src/program/generate.cpp:10028-10030`）。`STRATA_VERIFY_TRACE` が有効な通常 window の timeout では診断・trace が stderr に出る。設定値ごとの測定値はソースに示されていない。
 
 ## 根拠
 
-- `sycl/src/core/verify.cpp:206-216`: 既定値、`atol()`、1秒未満の fallback、関数内 static cache。
-- `sycl/src/core/verify.cpp:2202-2249`: 通常の window の doorbell 待ちと timeout error。
-- `sycl/src/core/verify.cpp:3173-3205`: batch run の doorbell 待ち。
-- `sycl/src/core/verify.cpp:3412-3453`: `batch_poll()` の doorbell 待ち。
-- `sycl/src/core/verify.cpp:3713-3769`: pipelined `service()` はこの環境変数を使わず固定20秒。
-- `CMakeLists.txt:472-478`, `sycl/CMakeLists.txt:220-228`: CUDA と SYCL で異なる `verify.cpp` を engine に含める構成。
-- `src/core/verify.cpp:2195-2229,2882-2905,3045-3061,3317-3337`: CUDA 側の対応する待ち時間は固定20秒。
+- 値の取得・変換・static cache: `engine/sycl/src/core/verify.cpp:297-307`
+- 通常 window の待ちと timeout 経路: `engine/sycl/src/core/verify.cpp:2615-2620,2637-2684`
+- 同期 batch と batch polling の timeout: `engine/sycl/src/core/verify.cpp:3726-3759,3993-4034`
+- SYCL engine への組み込みと別の device spin limit: `engine/sycl/CMakeLists.txt:59-70,290-293`
+- generation 呼び出し元での失敗表示: `engine/sycl/src/program/generate.cpp:10028-10030`

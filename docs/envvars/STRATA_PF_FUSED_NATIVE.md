@@ -1,50 +1,43 @@
 # `STRATA_PF_FUSED_NATIVE`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。調査開始時の作業ツリーは `main` で変更なし。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`STRATA_PF_FUSED=1` などで選択される native IQ pack の prompt expert fused int8 kernel を、明示的に無効化する A/B 用スイッチです。コードではこの変数を「無効化フラグ」として読み、値の先頭文字が `0` の場合だけ native kernel を不許可にします。`1` を指定して機能を有効にする変数ではありません。
-
-対象は native pack の gate/up と down の型が fused native 実装の対応範囲にあり、デバイス初期化検査も通る場合です。Q2_0 pack の別実装や、native fused をビルドしていない経路をこの変数が制御するわけではありません。
+native 形式の MoE prompt expert が対応する fused int8 kernel を選べるかを拒否するための切替です。`STRATA_PF_FUSED_NATIVE` が設定され、その先頭文字が `0` の場合、`native_supported()` は他の条件を調べる前に `false` を返します。その結果、対象 layer は fused native kernel の候補から外れ、通常の dispatch に戻ります。MMQ が使える layer は MMQ、使えない layer は FP16 経路などを選ぶ既存の fallback に従います。この変数自体は fused kernel を有効化せず、`0` 以外の値も有効化を保証しません。CUDA/HIP の実装は `engine/src/prefill/moe_fused_iq.cu:3415-3432` にあります。
 
 ## 値と判定
 
-CUDA/HIP 実装と SYCL 実装は、`native_supported()` の初回呼び出し時に `std::getenv()` で値を読み、関数内の `static const bool` に保存します。文字列全体の parse はせず、先頭文字だけを確認します。
+関数内 `static const bool` の初期化時に `std::getenv` で読み、値の先頭 1 文字だけを比較します。文字列全体の parse、数値検査、空白除去、大文字小文字変換はありません。
 
-| 値 | native kernel の無効化 |
-|---|---|
-| 未設定 | しない |
-| 空文字 | しない（値は存在するが先頭文字が `\0`） |
-| `0`、`0anything` | する |
-| `1`、`true`、`false`、その他 `0` 以外で始まる値 | しない |
+| 条件 | unset | 対象経路を拒否する値 | 拒否しない値の例 |
+|---|---|---|---|
+| `moe_fused_iq.cu` が組み込まれた CUDA/HIP 実装 | 拒否しない（この変数による追加 veto なし） | 先頭文字が `0`。例: `0`, `00`, `0anything` | 空文字、`1`, `true`, `false`, ` 0`, `2` |
 
-空白除去、数値変換、大文字小文字変換はありません。最初の `native_supported()` 評価後に環境を変更しても、そのプロセスでは判定は変わりません。
+空文字は未設定とは区別されますが、先頭文字が `0` ではないため拒否しません。`false` も拒否値ではありません。先頭が `0` なら後続文字列の妥当性にかかわらず拒否します。別の値が有効かどうかは `native_supported()` 内の形式・device・他設定の条件で決まります（同ファイル `:3416-3419,3425-3432`）。
 
 ## 有効になる条件
 
-- CUDA/HIP では、`STRATA_PF_FUSED_NATIVE` が無効化を要求しないことに加えて、`STRATA_PF_FUSED` による native 対応の選択、形式対応、デバイス検査が必要です。したがってこの変数単独では kernel を有効化しません。
-- CUDA/HIP の native 実装は gate/up と down の型を別々に対応判定します。CUDA の通常経路は IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_XS の gate/up と Q2_0 / IQ4_NL の down が対象です。HIP では追加形式がありますが、Q4_K / Q5_K gate/up と Q5_1 / Q8_0 down は `STRATA_PF_FUSED_KQ=1` の場合に限り対応します。
-- HIP 側では gfx11 / gfx12 の対応 kernel がロードされ、デバイス情報・occupancy 検査が通る必要があります。gfx906 はこの native 実装を利用不可として返します。
-- CUDA 側では compute capability 8.0 以上で、この build の native kernel の属性設定と occupancy 検査がすべて通る必要があります。
-- CUDA/HIP の native 実装では、`STRATA_PF_FUSED` が未設定の場合も gfx12 の IQ3_S / IQ3_XXS gate/up に限り既定で候補になります。`STRATA_PF_FUSED=0` は候補から外します。gfx12 の他の対応形式を含め、`STRATA_PF_FUSED=1` は `requested()` を満たす明示 opt-in です。
-- SYCL 実装は `STRATA_PF_FUSED_NATIVE` が `0` でないことに加え、`requested()`（`STRATA_PF_FUSED` の先頭文字が `1`）と対応形式・デバイス検査を要求します。CUDA/HIP 実装にある gfx12 の未設定時既定分岐は SYCL の `native_supported()` にはありません。
-- native fused 実装を含まない stub の `native_supported()` は常に `false` を返します。
-
-`prefill.cpp` は `native_supported()` の結果で native pack の fused expert 経路を選びます。false の場合は該当経路で MMQ または既存の別 expert 経路が使われます。native pack 全体の MoE buffer を fused 用に縮められるかも、全 layer が対応するかどうかで判定されます。
+- fused native kernels を含む CUDA または HIP の build で `native_supported()` が実装版に到達する必要があります。該当コードは CUDA backend の `strata_pf_own` に含まれ（`engine/cmake/backends/cuda.cmake:135-142`）、HIP backend でも同ソースを含みます（`engine/cmake/backends/hip.cmake:30-44`）。fused 実装を含まない build では `prefill.cpp` の stub が常に `false` を返します（`engine/src/prefill/prefill.cpp:180-200`）。
+- `STRATA_PF_FUSED_NATIVE` が先頭 `0` でなければ veto はありませんが、対象形式の kernel がその device/build で対応・setup 済みであり、`STRATA_PF_FUSED` 等の通常条件を満たす必要があります。CUDA/HIP で対応形式・device 条件を評価する分岐は `engine/src/prefill/moe_fused_iq.cu:3433-3561` 以下にあります。
+- `STRATA_PF_FUSED` が `native_supported()` のキャッシュ値として `0` になる場合、または small-card prompt override が `0` の場合は、この変数が `0` でなくても `false` になります（同ファイル `:3425-3432`）。
+- `native_supported()` の結果は layer ごとの prompt dispatch 判定に使われます。通常の MoE prompt walk では `fused_nat` 条件の一つであり、偽なら native fused kernel を選びません（`engine/src/prefill/prefill.cpp:5686-5704`）。MMQ のない形式で native fused を使う計画も同じ判定に依存します（同ファイル `:2062-2072`）。
+- Qwen3.6 用の形状別 kernel copy は `moe_fused_iq.cu` を別 namespace で include するため、同じ veto 判定を持ち、独立した関数内 static cache を使います（`engine/src/prefill/moe_fused_iq_q36.cu:1-6,33-39`）。
 
 ## 実行時の詳細
 
-CUDA/HIP の `src/prefill/moe_fused_iq.cu` と SYCL の `sycl/src/prefill/moe_fused_iq.dp.cpp` が、`native_supported()` 内で本変数を読みます。CUDA/HIP 実装では環境変数の抑止判定後に、`STRATA_PF_FUSED` の選択状態、対応形式、backend ごとの既定条件、`dev_info()` を順に確認します。SYCL 実装では抑止判定の後に `requested()`、形式対応、`dev_info().ok` を確認します。
+環境値は `native_supported()` が最初に呼ばれたときに関数内 `static` として評価され、そのプロセス内の同じ実装 copy では以後キャッシュされます。実行中に環境値を変更しても、その copy の判定には反映されません。Qwen3.6 用 copy は別 translation unit 内で元ソースを再コンパイルするため、初回評価も別です（`engine/src/prefill/moe_fused_iq.cu:3415-3419`; `engine/src/prefill/moe_fused_iq_q36.cu:33-39`）。
 
-この変数専用のログ出力はありません。上位の prompt 実装が native fused を選んだ場合、初回 prompt で `strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)` を出力するコードがありますが、これは fused 経路のログであり、本変数の値を報告するものではありません。
+`native_supported()` が `false` になると fused native 対応判定から外れます。通常経路では `fused_nat` が成立せず、layer は MMQ または既存の FP16 fallback に進みます（`engine/src/prefill/prefill.cpp:2062-2072,5698-5704`）。native pack 全体で fused layout を使えるかの判定も全 layer に対する `native_supported()` に依存するため、この変数で一部 layer が拒否されると fused layout を選ばない場合があります（同ファイル `:782-806`）。
+
+## ログと測定値
+
+この変数の veto 自体について、該当コードに専用ログ、警告、終了処理はありません。呼び出し側が返り値に応じて別の経路を選びます（`engine/src/prefill/moe_fused_iq.cu:3415-3432`; `engine/src/prefill/prefill.cpp:5698-5704`）。既存資料には関連する fused prompt 経路の説明・測定がありますが、ここではこの変数を設定した場合の独立した測定値として扱える根拠は確認できません。
 
 ## 根拠
 
-- `src/prefill/moe_fused_iq.cu:1118-1139` — CUDA/HIP の無効化判定、`STRATA_PF_FUSED` との組み合わせ、gfx12 既定分岐、対応形式とデバイス条件。
-- `sycl/src/prefill/moe_fused_iq.dp.cpp:1361-1366` — SYCL の無効化判定と opt-in / 対応形式 / デバイス条件。
-- `src/prefill/moe_fused.cu:667-673`, `sycl/src/prefill/moe_fused.dp.cpp:956-962` — `requested()` が `STRATA_PF_FUSED` の先頭文字 `1` と backend の利用可能性を確認。
-- `src/prefill/moe_fused_iq.cu:1076-1089`, `sycl/src/prefill/moe_fused_iq.dp.cpp:1223-1236` — native 実装の gate/up・down 対応形式。
-- `src/prefill/prefill.cpp:225-240, 2985-2988, 3016-3018` — native pack の対応判定、fused 経路選択、および fused kernel のログ。
-- `src/prefill/prefill.cpp:79-92`, `sycl/src/prefill/moe_fused_stub.cpp:22-30` — fused native を提供しない stub が false を返す。
-- `docs/DETAILS.md:27-28`, `docs/AMD_HIP.md:357-369` — native fused の opt-in と gfx12 /測定の説明、および `STRATA_PF_FUSED_NATIVE=0` が MMQ を保つ A/B 設定であること。測定値は各文書に記された環境・条件の報告であり、本調査で再測定していません。
+- `engine/src/prefill/moe_fused_iq.cu:3415-3432` — 対象変数の読み取り、先頭文字判定、他の fused 条件との合成。
+- `engine/src/prefill/moe_fused_iq.cu:3433-3561` — 形式、backend、device、kernel setup ごとの追加条件。
+- `engine/src/prefill/prefill.cpp:180-200,2062-2072,5686-5704,782-806` — 実装のない build の stub、layer dispatch/fallback、native pack 全体の layout 判定。
+- `engine/src/prefill/moe_fused_iq_q36.cu:1-6,33-39` — 同じ実装の Qwen3.6 用 copy。
+- `engine/cmake/backends/cuda.cmake:135-142`; `engine/cmake/backends/hip.cmake:30-44` — CUDA/HIP backend のソース組み込み。

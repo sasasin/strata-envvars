@@ -1,45 +1,48 @@
 # `STRATA_DF2_PROFILE`
 
-調査対象: Strata `main` の HEAD `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-DFlash2 drafter の各 draft round を CUDA graph 経由で実行せず、各処理段階の前後に CUDA event を置いて所要時間を集計する計測用スイッチです。DFlash2 の実装コメントも「measurement only」としています。通常のグラフ実行経路を切り替えるため、プロファイル有効時の処理時間は通常実行の性能を表しません。トークンや確率の同一性について、この計測機能の実装から保証することはできません。
-
-対象は `STRATA_HAVE_DFLASH2` を含むビルドで、CLI の `--draft dflash2` が選ばれ、DFlash2 の利用条件を満たしてロードできた場合です。DFlash2 は `--mtp` と `--spec 2` 以上、native pack、単一 GPU の CLI 実行、`--draft-model PACK` を必要とします。serve、batch、複数 GPU / layer split では DFlash2 を選べず、MTP に fallback します。
+DFlash2 drafter の計測用プロファイルを有効にする。`Dflash2Drafter::make_streams()` がこの変数を読み、値が有効なら `Prof` を確保する。その drafter の draft round は CUDA graph を使わず通常の記録関数を実行し、各 stage の後に event を置く。round ごとの stage 時間を集計し、drafter の破棄時に平均を stderr へ出す。通常のモデル実行全般や verifier のプロファイルを有効にする設定ではない。`engine/src/core/dflash2.cpp:129-135,148-179,296`。
 
 ## 値と判定
 
-| 環境変数の状態 | `prof_` |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（先頭文字が `\0`） |
-| 先頭文字が `1` | 有効。例: `1`, `10`, `1anything` |
-| その他の設定値 | 無効。例: `0`, `true`, ` 1` |
+`std::getenv` の戻り値が非 null で、先頭 1 文字が ASCII の `1` のときだけ有効。文字列全体を数値や真偽値として parse しない。
 
-値全体の parse、数値変換、大文字小文字変換は行いません。`load()` 中に `getenv()` を一度呼び、その時点で `prof_` を作ります。static cache ではありませんが、この drafter インスタンスではロード後に環境を書き換えても有効状態は変わりません。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `Dflash2Drafter::make_streams()` が実行されるビルド | 無効（`prof_` は null） | `1`、`10`、`1anything` | 空文字、`0`、`true`、`True`、` 1`、`01`、`2` |
+
+大文字小文字・空白の正規化、文字列全体の数値妥当性検査、範囲検査はない。`1` の後ろに何が続いても先頭が `1` なら有効。未設定と空文字はいずれも無効だが、前者は null、後者は先頭文字が終端文字となるため条件を満たさない。`engine/src/core/dflash2.cpp:296`。
 
 ## 有効になる条件
 
-値が有効でも、DFlash2 が実際にロードされて使用されなければ計測されません。`generate.cpp` では `--draft dflash2` のほかに、`--mtp`、`--spec 2` 以上、native pack、単一 GPU / CLI モード、draft pack が必要です。条件不足や load 失敗時は stderr に理由を出し、MTP が draft を続けます。DFlash2 対応コードがビルドに含まれない場合もこの環境変数の効果はありません。
+- 実行経路が DFlash2 drafter を生成して `make_streams()` まで進む必要がある。通常の generate 経路では `STRATA_HAVE_DFLASH2` が定義された build で DFlash2 分岐がコンパイルされ、`--draft dflash2` または `--draft auto` の DFlash2 選択後に `df2.load()` が呼ばれる。CUDA/HIP 共通 build は同 macro を定義し DFlash2 ソースを `strata_engine` に含める。`engine/cmake/strata_gpu_engine.cmake:8-13,310-313`、`engine/src/program/generate.cpp:8266-8275`。
+- `load()` が stream/event 作成まで成功しなければ profile 設定行に到達しない。`make_streams()` の呼び出し元は `load()` と `clone_alloc()`。後者は batch slot 用 drafter を複製する経路で、各インスタンスが独立して環境値を判定する。`engine/src/core/dflash2.cpp:187-192,267-268,271-302,658-666`。
+- `--draft auto` では要求・ルールにより選ばれた drafterが DFlash2 である場合に限る。MTP のみを使う実行ではこの変数は参照されない。`engine/src/program/generate.cpp:1184-1192,8266-8275`。
+- OS やサーバーモード専用の分岐は読み取り箇所にない。ビルドが DFlash2 実装を含み、実行時に DFlash2 drafter が作成されることが条件。
 
 ## 実行時の詳細
 
-通常の DFlash2 は `prepare()` で `n_new=1..8` の CUDA graph を capture します。プロファイル有効時は `prepare()` が早期 return し、graph を capture しません。各 `draft()` は stream を同期し、context と block の処理を個別に実行します。処理段階ごとに `stamp()` が event を記録し、`prof_collect()` が隣り合う event 間の時間を集計します。集計はラウンド数で割ったミリ秒として、DFlash2 インスタンスの破棄時に stderr へ次の形式で出ます:
+環境値は `make_streams()` が drafter ごとに呼ばれるときに一度読み、そのインスタンスの `prof_` に保存される。`load()` は `make_streams()` の後に `alloc()` へ進む。clone も `clone_alloc()` の中で同じ処理を通る。したがって各 drafter の stream 作成時点の値が使われ、同じインスタンスの実行中に環境値を変えても設定は更新されない。関数内 `static` cache ではない。`engine/src/core/dflash2.cpp:187-189,267-268,271-302,658-666`。
+
+有効時、`prepare()` は graph capture をせず成功扱いで戻る。また `draft_launch()` は各 round で event を付けながら `record_context()` と `record_block()` を直接実行し、`prof_collect()` が stream を同期して前後 event の経過時間を stage 名ごとに加算する。stage event の名前には `df2_attention`、`gemm:fc`、`native_mmvq` などがある。context 呼び出しで記録した event は round 開始時に破棄・クリアされ、round 内の値として集計されない。`engine/src/core/dflash2.cpp:148-170,493-618,752-763,1170-1209`。
+
+`draft_finish()` は stream 同期後も通常どおり draft token と確率を出力先へコピーし、round 数を加算する。コードは profile 有効時に別の token 選択規則を設定していない。`engine/src/core/dflash2.cpp:1218-1240`。
+
+## ログと測定値
+
+少なくとも 1 round の集計があれば、`Dflash2Drafter` のデストラクタで次の形式を stderr に出力する（stage 項目は実行されたもの）。round 数が 0 の場合は出力しない。
 
 ```text
-strata dflash2 profile (<rounds> rounds, ms per round, total <ms>): <stage> <ms> ...
+strata dflash2 profile (<rounds> rounds, ms per round, total <sum>): <stage> <average-ms> ...
 ```
 
-`rounds` が 0 の場合は profile 行を出しません。プロファイル有効時も `draft()` の結果取得やラウンド統計更新は通常経路と共通です。通常の生成終了時に出る `dflash2 ... ms/round drafting ... GPU ...` の集計行は stdout で、profile 行とは別です。コード上、この環境変数による処理は診断・計測のための実行方式変更であり、生成データの保存や環境変数の子プロセス転送は行いません。
+文字列の書式は固定小数点 3 桁。stage ごとの累計時間を `rounds` で割り、`total` は stage 平均の合計として出す。CUDA event の作成・記録・同期を伴う計測であり、graph 実行時の測定値ではない。Strata の資料にこの変数による測定値は確認できない。`engine/src/core/dflash2.cpp:40-44,157-179`。
 
 ## 根拠
 
-- `src/core/dflash2.cpp:64-70,107-114`: 計測専用の説明、profile 状態、および終了時の stderr 出力形式。
-- `src/core/dflash2.cpp:83-105`: stage event の記録、隣接 event 間の時間集計、round 数の更新。
-- `src/core/dflash2.cpp:218-224`: `load()` 時に値の先頭文字を検査し、profile と timing の別設定を初期化。
-- `src/core/dflash2.cpp:476-487,504-550`: profile 時の graph capture 回避、draft round ごとの event 計測と処理。
-- `include/strata/core/dflash2.hpp:33-62,86-91`: DFlash2 drafter の公開 API と profile helper。
-- `src/program/generate.cpp:5446-5449,5474-5518`: 対応ビルドでの DFlash2 選択条件、失敗時の MTP fallback。
-- `src/program/generate.cpp:16159-16165,16494-16503,16831-16840`: graph 準備、round 呼び出し、通常の DFlash2 統計行。
-- `docs/DETAILS.md` と `tools/dflash2/README.md` を確認しましたが、`STRATA_DF2_PROFILE` の判定や計測方式に関する追加説明は見当たりませんでした。したがって、性能値や計測による出力同一性は記載していません。
+- 全参照と判定、stage event、集計、出力: `engine/src/core/dflash2.cpp:129-179,296`
+- DFlash2 build と generate 経路: `engine/cmake/strata_gpu_engine.cmake:8-13,310-313`、`engine/src/program/generate.cpp:8266-8275`
+- graph を使わない profile 経路と round 完了: `engine/src/core/dflash2.cpp:621-656,752-763,1170-1240`

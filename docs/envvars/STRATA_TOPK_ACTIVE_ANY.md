@@ -1,51 +1,52 @@
 # `STRATA_TOPK_ACTIVE_ANY`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-QSA の prompt prefill で、実際に使うブロック数（`active_blocks`）を使った top-k dispatch を、Turing（sm_75）以外の CUDA GPU にも強制します。通常の CUDA 実行ではこの dispatch は Turing のみを対象にしています。名前に `ANY` とありますが、後述のとおり有効値は `1` で始まる文字列に限られます。
+CUDA 系 QSA block top-k の active-block 数を使う dispatch を、Turing（Compute Capability 7.5）以外のデバイスでも有効にする内部 override です。通常は Turing 判定が true のときに限って、既知の active-block 数を top-k の探索範囲として使います。この変数が有効だと、そのデバイス判定を迂回します。探索範囲 `reach` と register kernel の収容判定 `fit` が変わり、register / wide kernel の選択に影響します（`engine/src/kernels/cuda/qsa_select.cu:3047-3059,3082-3103`、SYCL 移植版 `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2033-2045,2062-2070`）。
 
-これは通常の利用者向け設定というより、全 CUDA カードで同じ dispatch を検証するためのフックです。CMake は `qsa_topk_active_parity` をテストとして登録し、そのテスト自身がこの変数を `1` に設定します。製品コード側にも読み取り箇所があるため、テスト以外の CUDA 実行で設定すれば dispatch に影響します。
+ソースコメントは parity test 用の強制スイッチとしています。通常のユーザー向け設定として案内されているものではありません。テストは active-bound 経路と capacity 経路の選択 ID を比較する目的で、この変数を設定します（`engine/src/kernels/qsa_topk_active_parity.cpp:53-64,81-100`、登録箇所 `engine/cmake/strata_gpu_engine.cmake:174-185`）。
+
+この変数は top-k 選択条件や scores 自体を変更するものではなく、カーネル dispatch の入力範囲を選びます。テストコードは選択 ID の一致を検査していますが、その結果をあらゆる実行条件で保証する測定としては扱いません。
 
 ## 値と判定
 
-実装は文字列を数値変換せず、値の先頭文字が `'1'` かどうかだけを検査します。
+CUDA 実装と SYCL 移植実装の読み取りは同じ規則です。`getenv` の結果が非 null で、先頭 1 byte が ASCII `'1'` のときだけ true です。数値・真偽値としての parse はせず、残りの文字を検査しません。未設定、空文字、先頭が `1` 以外なら false です（`engine/src/kernels/cuda/qsa_select.cu:3052-3056`、`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2038-2042`）。
 
-| 値 | `any_card` |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効 |
-| `1`, `10`, `1anything` | 有効 |
-| `0`, `true`, ` 1` など、先頭文字が `1` でない値 | 無効 |
+| 条件 | unset | 有効になる値の例 | 無効になる値の例 |
+|---|---|---|---|
+| CUDA (`!__HIPCC__`) および同じ条件の SYCL 移植実装 | false | `1`, `10`, `1anything` | 空文字, `0`, `true`, ` 1`, `01` |
+| HIP (`__HIPCC__`) | この変数を読み取らない。分岐は `active_blocks > 0` のみ | 該当なし | 該当なし |
 
-CUDA 実装では `qsa_block_topk()` 内の `static const bool` に保存されるため、環境変数は関数がこの判定箇所に初めて到達した時に一度だけ評価されます。その後の同一プロセス内の変更は反映されません。`nq <= 0` の呼び出しや、先行する cluster kernel が処理して戻る呼び出しでは、この判定箇所に到達しないことがあります。
+空白除去、大文字小文字変換、文字列全体の妥当性検査はありません。したがって `1anything` も有効です。値が true でも `STRATA_TOPK_CAPACITY_GUARD` が設定されていれば active-block dispatch は無効です。こちらは値の内容ではなく設定有無で判定され、空文字も設定ありです（同上）。
 
 ## 有効になる条件
 
-CUDA では、`STRATA_TOPK_CAPACITY_GUARD` が**設定されていない**こと、`active_blocks > 0` かつ `active_blocks <= max_blocks` であることが必要です。そのうえで、通常は実行 GPU が sm_75 の場合に active-block dispatch が使われます。この変数が有効なら GPU 世代の条件を満たしたものとして扱います。`STRATA_TOPK_CAPACITY_GUARD` は値の内容を問わず、設定されているだけで active-block dispatch を抑止します。
-
-`active_blocks` を渡している本番呼び出しは prefill の QSA 選択です。decode の `qsa_block_topk()` 呼び出しや verify の呼び出しはこの引数を省略するため、通常の経路ではこの変数による dispatch 変更は起きません。CUDA の HIP ビルドではコードが別分岐になり、この変数は読み取られません。
+- CUDA 系の該当 QSA top-k 実装であること。`__HIPCC__` のビルドでは対象変数を読まず、active-block が正数かだけを使います（`engine/src/kernels/cuda/qsa_select.cu:3044-3056`）。
+- 呼び出し側が `active_blocks` を渡し、その値が `0` より大きく `max_blocks` 以下であること。プロンプトの prefill はバッチ最後の query の block index から `active = index + 1` を作って渡します（`engine/src/prefill/prefill.cpp:5371-5376,5392-5393`）。
+- `STRATA_TOPK_CAPACITY_GUARD` が未設定であること。設定されていると `counted` は false です（`engine/src/kernels/cuda/qsa_select.cu:3051-3056`）。
+- 関数より前に別の経路が返らないこと。`nq <= 0` は即時 return、対応可能な CUDA cluster 経路は先に実行され得ます。また `active_blocks <= 0` の場合に条件を満たせば split 経路が先に実行されます（`engine/src/kernels/cuda/qsa_select.cu:3021-3040`）。
+- `STRATA_TOPK_OLD` が設定されると最終的に reference kernel が選ばれ、この override による dispatch 差は使われません（設定有無の判定と fallback: `engine/src/kernels/cuda/qsa_select.cu:3020,3072-3076`）。
 
 ## 実行時の詳細
 
-prefill は各 query batch の最後の query から `active = n_bid + 1` を求め、QSA block top-k に渡します。active-bound dispatch が選ばれると、実際に有効なブロック数を使って `reach` と register kernel の適用範囲を判断します。条件により reference kernel、register kernel、wide kernel の選択が変わります。score 行の stride と top-k kernel に渡す `max_blocks` は引き続き capacity の値です。GPU 世代別の `active_blocks` 取得条件を変えるものであり、値そのものや top-k の設定値を変える変数ではありません。
+対象値は `qsa_block_topk` 内の関数ローカル `static const bool` として初回評価時に読み取られ、同じ実装内では以後再読込されません。したがってプロセス起動後に環境を書き換えても、初回の `qsa_block_topk` 呼び出し後には反映されません（`engine/src/kernels/cuda/qsa_select.cu:3016-3017,3052-3054`、`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:2012-2013,2038-2040`）。
 
-SYCL 用に生成・保守されている `sycl/src/kernels/cuda/qsa_select.dp.cpp` にも同じ環境変数判定と active-bound dispatch があります。SYCL ビルドは `qsa_select` を kernel 群に含めています。CUDA と SYCL のいずれの該当箇所にも、この変数専用のログ出力はありません。HIP は `active_blocks > 0` を直接 dispatch 条件にするため、この変数を使いません。
+有効時は、`capacity_guard` が無効で、`active_blocks` が `1..max_blocks` に収まると `counted` が true になります。すると `reach` は `active_blocks`（`max_blocks` より小さい場合）となり、`fit` は `TK_T * TK_PER_MAX` になります。以降、`reach > fit` や `STRATA_TOPK_STREAM`、固定のしきい値などで register / wide kernel または reference kernel を選びます。変数は kernel 選択に関わり、QSA block top-k が返す選択 ID の計算規則を書き換える処理はありません（`engine/src/kernels/cuda/qsa_select.cu:3055-3103`）。
 
-この分岐を検証する `qsa_topk_active_parity` は、capacity に基づく呼び出しと active count を渡す呼び出しの選択 ID を比較し、差があれば失敗する作りです。ソースには成功時の `PASS: 20 top-k active-bound cases, selected IDs bitwise identical` 出力がありますが、この調査ではテストを実行していません。
+通常の Turing デバイスでは `topk_active_turing_device()` がデバイスを判定し、呼び出しスレッドごとに現在デバイスの判定結果を cache します。`STRATA_TOPK_ACTIVE_ANY=1` はこの判定を任意の CUDA デバイスで true にします（`engine/src/kernels/cuda/qsa_select.cu:2461-2476,3054-3056`）。SYCL 移植版も現在デバイスの判定を cache しますが、同版の判定は compute capability 7.5 のみです（`engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1878-1905,2040-2042`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/TROUBLESHOOTING.md` は、Turing の長い prompt で top-k の wide kernel を選び、`STRATA_TOPK_STREAM=0` で register kernel に戻せることを説明しています。これは関連する Turing prompt dispatch の説明ですが、`STRATA_TOPK_ACTIVE_ANY` 自体の値や用途は記載していません。現行コードではこの変数はカード選択条件を強制し、wide/register の選択は active count や `STRATA_TOPK_STREAM` などに基づいて別途行われます。
+この変数の読み取りや有効化を知らせるログはありません。top-k kernel の起動エラー時には CUDA 実装が `qsa_block_topk: <CUDA error>`、split kernel では `qsa_block_topk (split): <CUDA error>` を stderr に出して終了コード 1 で終了します。geometry / cap が非対応の場合も `qsa_block_topk: unsupported geometry or cap` を出して終了します（`engine/src/kernels/cuda/qsa_select.cu:3078-3079,3104-3105`、split 経路 `3034-3039`）。
+
+`docs/DETAILS.md` にはこの変数名の記載はありません（調査対象 HEAD で `STRATA_TOPK_ACTIVE_ANY` を検索して該当なし）。同資料とソースコメントには top-k 関連の一般説明・設計上の測定値がありますが、この override 自体を有効にした場合の独立した性能値は確認できませんでした。
 
 ## 根拠
 
-- `src/kernels/cuda/qsa_select.cu:1295-1328` — 変数の読み取り、値判定、容量 guard と Turing 判定との組み合わせ、`reach` の決定。
-- `src/kernels/cuda/qsa_select.cu:1334-1362` — active count を使う kernel dispatch と fallback。
-- `src/kernels/cuda/qsa_select.cu:1211-1227` — 通常の CUDA dispatch が sm_75 を判定する処理。
-- `src/prefill/prefill.cpp:2760-2775` — prefill で active count を計算し、top-k に渡す箇所。
-- `src/core/layer.cpp:1122-1131`, `src/core/verify.cpp:1367-1384` — decode / verify 呼び出しで active count を渡さない箇所。
-- `src/kernels/qsa_topk_active_parity.cpp:41-55,74-95`, `CMakeLists.txt:392-399` — 検証テストの設定、比較、出力、および CUDA テストとしての登録。
-- `sycl/src/kernels/cuda/qsa_select.dp.cpp:1953-1986`, `sycl/CMakeLists.txt:205-216` — SYCL 側の同等実装と kernel 登録。
-- `docs/TROUBLESHOOTING.md:93-95` — 関連する Turing prompt dispatch の説明。
+- `engine/src/kernels/cuda/qsa_select.cu:2461-2476,3016-3105` — CUDA 実装、デバイス判定、active-bound と kernel dispatch。
+- `engine/sycl/src/kernels/cuda/qsa_select.dp.cpp:1878-1905,2012-2095` — SYCL 移植実装。
+- `engine/src/prefill/prefill.cpp:5371-5393` — prefill から active-block 数を渡す経路。
+- `engine/src/kernels/qsa_topk_active_parity.cpp:53-64,75-100` — test 内での設定と選択 ID の比較。
+- `engine/cmake/strata_gpu_engine.cmake:174-185` — parity test のビルド・登録。

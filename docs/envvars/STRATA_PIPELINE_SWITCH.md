@@ -1,65 +1,57 @@
 # `STRATA_PIPELINE_SWITCH`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`STRATA_PIPELINE_SWITCH` は通常の真偽値設定ではなく、pipeline windows の試験用スイッチファイルのパスです。サーバーの各要求でそのファイルを読み、`pw`（prompt/decode window pipeline の段階）、`theta`、`force_miss`、`short_read` の値を上書きします。実際に有効になるには、別途 `STRATA_PIPELINE_DEBUG` と起動時の pipeline 設定が必要です。
+`STRATA_PIPELINE_SWITCH` は真偽値ではなく、パイプラインの試験設定を記したファイルのパスです。サーバーの各リクエストでファイルを開き、`pw`、`theta` などの項目があれば、そのリクエストに限ってパイプライン設定やプロンプト読み取り上限を上書きします。対象箇所は CUDA/HIP 実装と SYCL 実装の `engine/.../program/generate.cpp` です（`engine/src/program/generate.cpp:20245-20302`、`engine/sycl/src/program/generate.cpp:11151-11176`）。
 
-この環境変数名を含む実装は CUDA 系 `src/program/generate.cpp` と SYCL 系 `sycl/src/program/generate.cpp` のサーバー生成経路にあります。両方で同じファイル形式を読みます。`docs/DETAILS.md` にこのスイッチファイルの利用者向け説明は見当たらず、実装コメントでは testing 用とされています。
+この変数だけではパイプラインを有効にできません。`pipe` が成立し、さらに `STRATA_PIPELINE_DEBUG` が有効なときだけファイルを開きます。`pipe` は CUDA/HIP では `--pipeline-windows > 0`、複数 stage、同一 GPU 上の分割でないこと、全 stage が存在することが条件です（`engine/src/program/generate.cpp:13256-13267`）。SYCL では `--pipeline-windows > 0`、2 stage、同一 GPU 上の分割でないこと、stage 数が 1 つであることが条件です（`engine/sycl/src/program/generate.cpp:7708-7712`）。
 
 ## 値と判定
 
-| 状態 | Strata の処理 |
-|---|---|
-| `STRATA_PIPELINE_DEBUG` が未設定、空、または先頭文字が `0` | 共通 helper が対象名の値を取得せず、この変数は無効。`0anything` も無効。 |
-| `STRATA_PIPELINE_DEBUG` が上記以外 | 対象変数の値をファイルパスとして取得する。空文字も helper 上は設定値だが、`fopen("")` は失敗するためファイル内容による上書きはない。 |
-| 対象変数が未設定 | スイッチファイルを開かず、CLI 由来の既定値を使う。 |
-| パスのファイルを開けない | 無言でスイッチファイルの処理を飛ばし、既定値を使う。 |
-| ファイルを開ける | 先頭から最大255 byteを読み、そこに含まれる各キーを探す。キーがない項目は既定値を保つ。 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP・SYCL 共通 | ファイルを開かず、各リクエストは通常の設定を使う | `STRATA_PIPELINE_DEBUG` が有効で `pipe` も成立していれば、環境変数の値をファイルパスとして `fopen(..., "r")` に渡す | 空文字は設定済みポインタですが空パスを開けず、何も上書きしない。存在しない・読めないパスも同様 |
 
-ファイル中のキーは `strstr` で最初の部分一致を探し、その直後を `atoi` / `atof` / `atoll` に渡します。区切り文字や行形式の検証、数値文字列全体の検証はありません。変換できない文字列は各 C 変換関数の規則により通常 0 になります。
+環境変数値の文字列比較や数値変換はありません。環境変数が指すファイルから最大 255 byte を読み、NUL 終端した内容を検索します。内容全体の文法検証はせず、`strstr` で各キーの最初の出現を探し、その直後を `atoi` / `atof` / `atoll` で変換します。したがって空白や前後の文字列を含められ、数値の後ろにある非数値文字は変換時に無視されます。キーに値がない、または変換先頭が数値でない場合、`atoi` / `atoll` は 0、`atof` は 0.0 相当になります（`engine/src/program/generate.cpp:20284-20301`、`engine/sycl/src/program/generate.cpp:11163-11174`）。
 
-| キー | 変換・制限 | 適用される値 |
-|---|---|---|
-| `pw=` | `atoi` の結果を `[0, 2]` に clamp | 0 は pipeline windows を要求しない。1 以上は対応条件下で prompt の window pipeline を使う。2 は追加条件を満たせば decode の window pipeline も要求する。 |
-| `theta=` | `atof` を `float` に変換。範囲制限なし | speculative window の判定閾値を上書きする。 |
-| `force_miss=` | `atoi` の結果を 0 以上に clamp | 0 は forced miss なし。正値はテスト用の強制 miss 間隔を上書きする。 |
-| `short_read=` | `atoll` の結果を 0 以上に clamp | prompt の verify windows に送る区間長の上限を要求ごとに上書きする。 |
+| ファイル内キー | CUDA/HIP | SYCL | 境界・無効値の扱い |
+|---|---|---|---|
+| `pw=` | 対応 | 対応 | 整数変換後に 0〜2 へ clamp。例: `pw=-1` と `pw=garbage` は 0、`pw=3` は 2、`pw=1tail` は 1 |
+| `theta=` | 対応 | 対応 | `atof` の float 値をそのまま使い、範囲 clamp なし。数値でない値は 0.0 相当 |
+| `hit=` | 対応 | 非対応 | CUDA/HIP のみ。`atof` の値をそのまま使う。`theta=` が同じファイルに無ければ、判定を hit 率方式に切り替える |
+| `lazy=` / `run=` | CUDA/HIP のみ | 非対応 | `atoi(...) != 0`。`1`, `-1`, `1tail` は true、`0`, 空値、非数値始まりは false |
+| `force_miss=` | 対応 | 対応 | 整数変換後に 0 未満を 0 に clamp。正の `k` は k 回ごとの speculative window に強制 miss を入れる |
+| `short_read=` | 対応 | 対応 | `atoll` 後に 0 未満を 0 に clamp。プロンプトの短い読み取りに使う上限 token 数 |
 
-数値の前後の空白や数値の後ろの文字列は専用に検査されません。たとえば `pw=2junk` は `atoi` により 2 として扱われ、`pw=-1` は 0、`pw=9` は 2 になります。`theta=` には clamp がなく、値の妥当性や有限性もこの処理では確認されません。
+ファイルで項目を指定しない場合、既存値を引き継ぎます。`pw` は `--pipeline-windows`（または自動選択値）、`short_read` は `--short-read` の値です。CUDA/HIP の `theta` は `STRATA_PIPELINE_THETA` が有効ならその値、なければ `STRATA_PIPELINE_HIT_MIN` が 0 以上のとき hit 率方式用の `-1`、それ以外は `0.2` です。`hit` は `STRATA_PIPELINE_HIT_MIN` の初期値を上書きします。`lazy` と `run` はそれぞれ `STRATA_PIPELINE_LAZY_CHAIN` と `STRATA_PIPELINE_LOOKUP_RUN` の値を上書きします。`force_miss` は `STRATA_PIPELINE_FORCE_MISS` の値を上書きします。SYCL では `theta` と `force_miss` の初期値に `STRATA_PIPELINE_THETA` と `STRATA_PIPELINE_FORCE_MISS` が使われます（`engine/src/program/generate.cpp:20248-20283`、`engine/sycl/src/program/generate.cpp:11154-11161`）。
+
+`STRATA_PIPELINE_DEBUG` は `pipe_dbg_env` 内で一度だけ評価され、未設定・空文字・先頭文字が `0` の場合は無効、それ以外は有効です。したがって `0anything` は無効、`false` や ` 0` は有効です（`engine/src/program/generate.cpp:681-686`、`engine/sycl/src/program/generate.cpp:325-340`）。
 
 ## 有効になる条件
 
-- `STRATA_PIPELINE_DEBUG` は `pipe_dbg_env()` 内の `static const bool` で初回評価時に一度判定されます。未設定・空・先頭が `0` の場合は対象変数を含む `STRATA_PIPELINE_*` helper 読み取りが無効になります。それ以外（例: `1`, `true`, 空白始まり）は有効です。
-- スイッチファイルのパスも要求処理内の `static const char*` として一度取得されます。したがってプロセス実行中に `STRATA_PIPELINE_SWITCH` 自体を書き換えても再取得されません。一方、同じパスのファイル内容は `fopen` / `fread` により各要求で読み直されます。
-- 読み取り場所は `pipe_dbg_env("STRATA_PIPELINE_SWITCH")` の後に `&& pipe` で条件付けられています。`pipe` は起動時に pipeline windows が有効で、複数 GPU の layer split などの条件を満たすときだけ真になります。CUDA では複数 stage の layer split 経路、SYCL では二 stage の layer split 経路です。通常の単一 GPU 実行や pipeline windows が起動時に無効な経路では、このファイル値は使われません。
-- 起動時の有効化は別設定です。明示した `--pipeline-windows` は 0〜2 に clamp されます。自動設定 (`o.pipeline_windows < 0`) では `STRATA_PIPELINE_AUTO=0` が自動有効化を止めます。CUDA/HIP 共用コードでは自動有効化が HIP macro と GPU/モデル等の条件に限られ、SYCL では Intel GPU 世代などの判定を使います。いずれの場合も、`STRATA_PIPELINE_SWITCH` の要求時 `pw=` は起動時に確保される機能・リソースを変更しません。
-- `pw` は要求ごとに起動時の `o.pipeline_windows` を初期値として設定され、ファイルの `pw=` があれば上書きされます。そのためこの環境変数だけで、起動時に pipeline 機能が無効だった状態を有効化することはできません。`pw=0` による要求単位の無効化は可能です。
-- `pw>=1` の prompt pipeline は、CUDA では `pipe && n_stages == 2`、SYCL では `pipe` のときに選択され、`STRATA_LOGPOS` が設定されている要求ではシリアル経路になります。
-- `pw>=2` の decode pipeline は snapshot 準備が済んでいることも必要です。さらに履歴に対する repetition penalty や coupled draft sampling がある要求では decode はシリアル経路に戻ります。必要な snapshot などが起動時に用意されていない場合も実行されません。
-- `short_read=` はその要求の CLI `--short-read` 由来の値を上書きします。区間長が値を超える場合、または `STRATA_CKPT_REREAD` が設定されている場合や画像 embedding row を含む場合には、該当区間は verify windows を使いません。0 にすると通常の正の長さの区間は window 対象外です。
+- `STRATA_PIPELINE_DEBUG` が有効であること。無効なら helper が常に `nullptr` を返すため、対象ファイルは読みません（`engine/src/program/generate.cpp:684-686`、`engine/sycl/src/program/generate.cpp:337-339`）。
+- `pipe` が成立していること。従ってパイプライン対応の serve 経路で `--pipeline-windows` が 1 以上である必要があります。`pw=` で 0 から 1/2 に変えることはできず、もともと `pipe` が成立していない場合はファイル読み取り分岐にも入りません（同 `engine/src/program/generate.cpp:13267,20284`、同 `engine/sycl/src/program/generate.cpp:7712,11163`）。
+- CUDA/HIP では prompt の pipelined read は `n_stages == 2`、`pl_pw >= 1`、`STRATA_LOGPOS` 未設定のときに選ばれます。3 stage 以上では prompt read は serial ですが decode の pipeline 条件は別に評価されます（`engine/src/program/generate.cpp:20414-20419`）。SYCL の prompt read は `pl_pw >= 1` かつ `STRATA_LOGPOS` 未設定で pipeline へ進みます（`engine/sycl/src/program/generate.cpp:11277-11281`）。
+- decode の speculative pipeline は `pl_pw >= 2` に加えて snapshot が利用可能である必要があります。CUDA/HIP では repetition penalty (`hist_n > 0`) または coupled draft sampling のリクエストは serial decode に戻ります（`engine/src/program/generate.cpp:21810-21818`）。SYCL でも `pl_pw >= 2` と snapshot の条件があります（`engine/sycl/src/program/generate.cpp:11783-11794`）。
+- `short_read=` は `STRATA_CKPT_REREAD` が設定されていると効きません。これは `windows_ok` が `no_short` を先に検査するためです。画像 embedding 行を含む区間も verify windows を使いません（`engine/src/program/generate.cpp:20230-20243`、SYCL: `engine/sycl/src/program/generate.cpp:11142-11149`）。CUDA/HIP では非有限 prompt logits 後の一回限りの `req_short_read=0` 設定より後に switch file を読むため、ファイル内 `short_read=` があればその値で上書きします（`engine/src/program/generate.cpp:20231-20237,20284-20299`）。
+- CLI の `--pipeline-windows` が明示されていれば通常その値が初期値ですが、switch 内 `pw=` が読み取られるとリクエスト単位で上書きします。未指定時の自動値は backend・GPU・serve/model 等で異なります。例として SYCL は 2 枚の Arc B-series、serve、MTP drafter などの条件で 2 を選び、CUDA/HIP の自動選択も serve、layer split、stage 数、draft、batch、helper cache などで制限されます（`engine/sycl/src/program/generate.cpp:3590-3633`、CUDA/HIP: `engine/src/program/generate.cpp:6555-6592`）。
 
 ## 実行時の詳細
 
-要求処理では `pl_pw` を pipeline startup 設定、または `pipe` が偽なら 0 で初期化します。ファイルが開けた場合に限り、認識した各キーでその要求のローカル値を更新します。`short_read` は `req_short_read` に入り、`windows_ok` が prompt 区間の長さと照合します。`pw>=1` は対応する二 stage / SYCL pipeline 経路で prompt windows の処理を切り替え、`pw>=2` は decode pipeline を試みる条件に使われます。これらは要求単位の制御で、CLI の `--pipeline-windows` や起動時に確保される pipeline 用リソースを置き換えません。
+`pipe_dbg_env` の有効/無効判定は関数内 `static` で、最初の呼び出し時に決まります。switch のパスも `if (static const char* sw = ...)` により最初にこのリクエスト箇所へ到達したときの値を保持し、以後の環境変数変更は反映しません。一方、保持したパスのファイルは各リクエストで再度 `fopen`・`fread` するため、ファイル内容の変更は後続リクエストに反映されます（`engine/src/program/generate.cpp:20284-20289`、SYCL: `engine/sycl/src/program/generate.cpp:11163-11168`）。
 
-ファイルが読めた要求では stderr に次の形式で処理後の値を出します（文言は実装どおりです）。ファイルを開けない場合、この行も出ません。
+読み取った値は当該リクエストの `pl_pw`、speculative launch gate (`pl_theta` / CUDA/HIP の `pl_hit_min`)、lazy chain / lookup continuation (`pl_lazy`, `pl_run`)、強制 miss (`pl_force_miss`)、prompt の `req_short_read` に適用されます。`pw >= 1` は条件を満たす prompt read を pipelined windows に切り替え、`pw >= 2` は snapshot 条件を満たす decode に speculative window を許します。`theta` は推測 window の gate 閾値、`force_miss` はテスト用の miss 発生間隔です（`engine/src/program/generate.cpp:21810-21818,21850-21870,21982`、SYCL: `engine/sycl/src/program/generate.cpp:11783-11794,11815-11816,11952`）。
 
-```text
-strata pipeline switch: pw=%d theta=%.3f force_miss=%d short_read=%lld
-```
-
-スイッチファイル自体の読込失敗による終了や警告はありません。pipeline 実行に入った後の準備・検証失敗には別のエラー経路がありますが、この環境変数の読み取り処理自体は失敗を返しません。
+ファイルは 256 byte のバッファに最大 255 byte 読み込まれ、後続部分は無視されます。`fopen` が失敗した場合は警告やエラーを出さず switch の上書きもログもありません。正常に開けた場合はキーの有無にかかわらず stderr に `strata pipeline switch: ...` の行を出します。CUDA/HIP のログ項目は `pw/theta/hit/lazy/run/force_miss/short_read`、SYCL は `pw/theta/force_miss/short_read` です（`engine/src/program/generate.cpp:20285-20302`、`engine/sycl/src/program/generate.cpp:11164-11175`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:461-467` — `STRATA_PIPELINE_DEBUG` の値判定と、その結果に応じた helper 経由の取得。
-- `sycl/src/program/generate.cpp:298-303` — SYCL 側の同じ helper。
-- `src/program/generate.cpp:14777-14801`, `sycl/src/program/generate.cpp:10428-10452` — 要求ごとのパス利用、最大255 byteの読込、キー検索・変換・clamp、stderr ログ。
-- `src/program/generate.cpp:3256-3258` — CLI `--short-read` と `--pipeline-windows` の値制限。
-- `src/program/generate.cpp:4985-5020`, `sycl/src/program/generate.cpp:3421-3462` — 自動 pipeline 判定と `STRATA_PIPELINE_AUTO`、CLI 指定、serve・layer split・モデル・backend 等の起動条件。
-- `src/program/generate.cpp:10000-10005`, `sycl/src/program/generate.cpp:7325-7329` — pipeline 実行経路が成立する条件。
-- `src/program/generate.cpp:14892-14897`, `sycl/src/program/generate.cpp:10554-10558` — prompt pipeline の適用条件。`src/program/generate.cpp:14894-14896` は三 stage 以上では prompt window をシリアルで処理することも示す。
-- `src/program/generate.cpp:16087-16098`, `sycl/src/program/generate.cpp:11037-11048` — decode pipeline の `pw>=2`・snapshot 条件、要求状態によるシリアル fallback。
-- `src/program/generate.cpp:14770-14776`, `sycl/src/program/generate.cpp:10420-10426`; `src/program/generate.cpp:14896`, `sycl/src/program/generate.cpp:10891-10903` — `short_read` を区間ごとに適用する判定と、その後の prompt 処理。
+- `engine/src/program/generate.cpp:681-686` — CUDA/HIP の `STRATA_PIPELINE_DEBUG` gate。
+- `engine/sycl/src/program/generate.cpp:325-340` — SYCL の同 gate。
+- `engine/src/program/generate.cpp:20231-20302` — リクエスト値、switch file の読み取り・変換・ログ。
+- `engine/sycl/src/program/generate.cpp:11142-11176` — SYCL の同処理。
+- `engine/src/program/generate.cpp:13256-13267,20414-20419,21810-21818` — CUDA/HIP の適用条件。
+- `engine/sycl/src/program/generate.cpp:3590-3633,7708-7712,11277-11281,11783-11794` — SYCL の自動設定・適用条件。
+- `docs/MULTI_GPU.md:203` — `STRATA_PIPELINE_*` tuning/test variables は `STRATA_PIPELINE_DEBUG=1` のときだけ読み込むという資料上の説明。具体的な値の処理は上記ソースで確認。

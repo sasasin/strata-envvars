@@ -1,49 +1,47 @@
 # `STRATA_STATE_HASH`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-`--serve` の会話状態を診断用に指紋化し、リクエストごとに `STATE_HASH` 行として stderr へ出します。状態を変更する設定ではなく、prompt-cache の実行前後などで状態が一致するかを比較するための出力です。CUDA 実装と SYCL 実装の両方にあります。
+`--serve` のリクエスト処理後に、セッション状態の診断用 fingerprint を計算してログへ出すスイッチ。CUDA/HIP 実装と SYCL 実装にそれぞれ同じ設定有無判定がある。状態を書き換える処理ではなく、デバイス処理の同期と状態メモリの読み取りを行い、`STATE_HASH` を stderr に出力する（`engine/src/program/generate.cpp:23432-23438,23529-23538`、`engine/sycl/src/program/generate.cpp:12983-12991,13096-13105`）。
+
+設計資料 `docs/SPLIT_SERVE.md:123-126` もこれを状態 fingerprint として説明し、prefill と restore 後の decode の照合結果を記載している。資料の「whole session」という説明に対し、実装は下記の項目別 hash を出力する診断処理であり、ここでは資料記載の照合試験を再実行していない。
 
 ## 値と判定
 
-値の内容は parse せず、`std::getenv("STRATA_STATE_HASH") != nullptr` で設定有無だけを見ます。未設定なら無効、空文字を含め何らかの値が設定されていれば有効です。`0`、`false`、大小文字、空白などによる無効化はありません。
+値の文字列や数値は parse せず、`std::getenv(...) != nullptr` で設定されているかだけを判定する。したがって未設定なら無効、設定されていれば空文字・`0`・`false`・`1` など値に関係なく有効。大文字小文字、空白、数値としての妥当性、範囲、境界値の検査はない（`engine/src/program/generate.cpp:23432`、`engine/sycl/src/program/generate.cpp:12983`）。
 
-判定値は関数内の `static const bool` に保存されます。そのコード行に初めて到達した時点で一度だけ評価され、以後同一プロセスで環境を書き換えても再評価されません。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| CUDA/HIP および SYCL の `--serve` リクエスト処理 | `state_hash == false` | 空文字、`0`、`false`、`1` を含む、環境変数が存在する状態 | 変数が存在しない状態のみ |
 
 ## 有効になる条件
 
-- `--serve` のリクエスト処理を通ること。
-- `o.prompt_cache > 0` であること。`--prompt-cache 0` では出力しません。
-- リクエストがキャンセルされていないこと。
-
-完了した非キャンセルリクエストごとに出力します。ソースコメントは checkpoint が 0 の場合も対象としていますが、実際の条件は `o.prompt_cache > 0` です。値を指定しても通常の非 serve 経路ではこのコードを通らず、出力されません。
+- 該当 backend のエンジンを使い、サーバーのリクエスト処理まで到達すること。読み取り箇所は CUDA/HIP と SYCL の `generate.cpp` にある（上記各行）。
+- リクエストがキャンセルされておらず、`o.prompt_cache > 0` であること。この条件を満たさない場合は fingerprint 処理を通らない（`engine/src/program/generate.cpp:23433`、`engine/sycl/src/program/generate.cpp:12984`）。
+- GDN のレイヤー別短縮 hash を追加出力するには、別変数 `STRATA_STATE_HASH_GDN` も設定され、かつ `ss.gdn_alloc > 0` であること。これは本変数による全体 fingerprint 処理の内側にある（`engine/src/program/generate.cpp:23470-23478`、`engine/sycl/src/program/generate.cpp:13037-13045`）。
 
 ## 実行時の詳細
 
-ハッシュ計算前にデバイス処理を同期します。CUDA では `cudaDeviceSynchronize()`、SYCL では現在の device queue の `queues_wait_and_throw()` を使います。固定長 64 KiB の作業バッファへ状態データを読み込み、FNV-1a（初期値 `1469598103934665603`、乗数 `1099511628211`）で集約します。
+関数内 `static const bool` として、リクエスト処理箇所へ初めて到達したときに設定有無を一度だけ読み取る。以降のリクエストでは同じ値を使うため、プロセス稼働中に環境を変更しても再評価されない（`engine/src/program/generate.cpp:23432-23433`、`engine/sycl/src/program/generate.cpp:12983-12984`）。
 
-stderr の行は `strata serve: STATE_HASH L=... gdn=... ple=... tail=... pooled=... kv=... mtp=... stale=... dead=... pooled_full=... ple_prev=...` の形式です。`L` は現在の live session の token 数です。各フィールドは次の状態を指します。
+有効なリクエストではまずデバイス処理の完了を待ち、その後 64 KiB の作業バッファを使って状態データを読み、FNV-1a で hash する。出力はセッション長 `L`、GDN state、PLE 履歴、QSA の index tail / pooled 行 / KV、KV の有効範囲外の stale cells、dead 行、pooled 全行、MTP を使用する場合の draft K/V、`ple_prev` を項目別に示す。CUDA/HIP 側では QSA の各 session-owned state を走査し、SYCL 側も同じ構成を出力する（`engine/src/program/generate.cpp:23440-23468,23480-23527`、`engine/sycl/src/program/generate.cpp:12993-13035,13047-13094`）。
 
-- `gdn`: セッションの GDN/畳み込み状態全体。
-- `ple`: PLE 履歴全体。
-- `tail` と `dead`: 各 QSA 状態の indexer tail と spare/dead key。
-- `pooled`: `L / idx_block` 個の完了済み pooled indexer 行。
-- `pooled_full`: `pooled` に次の block 完了時に上書きされる spare 行も含めた範囲。
-- `kv`: 各 QSA 状態の KV データのうち token cell `[0, L)`。
-- `stale`: 最後の KV page 内で `[L, page-rounded-up(L))` にある未使用 cell。
-- `mtp`: MTP が有効な場合の draft KV データ（長さは `min(L, max_cells)`）。無効なら初期値のハッシュが出ます。
-- `ple_prev`: `ss.ple_prev[0]` と `[1]` の整数値で、ハッシュではありません。
+処理は状態をコピーして hash する診断経路であり、生成やセッション状態を更新するコードはこの分岐内にない。キャンセルされたリクエストと prompt cache 無効時には hash しない。読み取り範囲や項目は実装上の状態構成に依存するため、この出力だけから全ての内部状態を検査したとは断定できない。
 
-KV のハッシュ対象配列は状態の KV 形式（Q4、hybrid、int8、通常）と host/device mode に応じて選ばれます。QSA 状態が複数ある場合は session が所有する状態を順に同じハッシュへ追加します。`STRATA_STATE_HASH_GDN` も設定されていて GDN 状態が割り当て済みなら、別途 GDN 各層の下位16 bit のハッシュ列を `strata serve: STATE_HASH_GDN ...` として stderr に出します。この追加出力は別変数によるものです。
+## ログと測定値
 
-同期に失敗すると stdout に `ERR synchronizing state fingerprint` を出してプロセスを終了し、データ読取りに失敗すると `ERR reading state fingerprint` を出して終了します。SYCL のハッシュ読取り例外では例外情報とファイル・行を stderr に出した後 `exit(1)` します。
+成功時は stderr に次の形式で出力する（`engine/src/program/generate.cpp:23533-23538`、`engine/sycl/src/program/generate.cpp:13100-13105`）。
+
+```text
+strata serve: STATE_HASH L=... gdn=... ple=... tail=... pooled=... kv=... mtp=... stale=... dead=... pooled_full=... ple_prev=...,...
+```
+
+デバイス同期に失敗すると stdout に `ERR synchronizing state fingerprint` を出し、`return 1` で処理を抜ける。状態読み取り中に失敗した場合は `ERR reading state fingerprint` を stdout に出し、同じく `return 1` する（`engine/src/program/generate.cpp:23436-23438,23529-23531`、`engine/sycl/src/program/generate.cpp:12987-12991,13096-13098`）。SYCL のコピー時に `sycl::exception` が投げられた場合は `what()` と `Exception caught at file:` / `line:` を stderr に出して `exit(1)` する（`engine/sycl/src/program/generate.cpp:12997-13022`）。測定値は該当なし。
 
 ## 根拠
 
-- `src/program/generate.cpp:12221-12229` は設定有無の判定、適用条件、CUDA 同期、live 長を示します。
-- `src/program/generate.cpp:1481-1485` は FNV-1a の初期値と更新式、`src/program/generate.cpp:12235-12331` は対象領域と出力形式です。
-- `src/program/generate.cpp:12263-12272` は関連する `STRATA_STATE_HASH_GDN` の追加出力、`src/program/generate.cpp:12322-12331` は失敗処理と `STATE_HASH` 行です。
-- `sycl/src/program/generate.cpp:11368-11383,11424-11494` は SYCL 側の対応箇所です。
-- `docs/DETAILS.md` には `STRATA_STATE_HASH` の説明を確認できませんでした。
+- `engine/src/program/generate.cpp:23432-23538` — CUDA/HIP 側の設定有無判定、条件、計算、出力、失敗経路。
+- `engine/sycl/src/program/generate.cpp:12983-13105` — SYCL 側の対応実装。
+- `engine/include/strata/core/mtp.hpp:110`、`engine/sycl/include/strata/core/mtp.hpp:76` — `--serve` の `STRATA_STATE_HASH` が draft layer の K/V を hash 対象とする旨の注記。

@@ -1,53 +1,55 @@
-# `--native-qsa`
+# `strata --native-qsa`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジンの引数 parser） |
+| コマンド | `strata`（エンジン引数。内部 usage は `strata generate`） |
 | オプション | `--native-qsa` |
 | 別名 | なし |
-| 値 | 取らない真偽フラグ |
+| 値 | 値なしのフラグ |
 
 ## 役割
 
-QSA 層の RMS 正規化と attention 出力ゲートに、実験的な native 演算実装を選びます。`strata generate` の usage もこの option を「QSA normalization and output gate」と説明しています（`src/program/generate.cpp:849-852`）。
+QSA attention の一部演算を native QSA kernel に切り替える実験用フラグです。重み付き RMSNorm と attention 出力 gate が対象で、QSA の attention 全体や indexer key cache/pooling を切り替えるものではありません。後者は別オプション `--native-qsa-indexer` の対象です。CUDA/HIP 系 parser と SYCL parser の両方に同じフラグがあります（`engine/src/program/generate.cpp:3920-3921`、`engine/sycl/src/program/generate.cpp:1959-1960`）。
 
 ## 使い方
 
 ```sh
-strata generate --pack DIR --tokens "1,2,3" --native-qsa
+# 通常の pack と token 入力に native QSA の norm / gate を適用する
+strata --pack pack/full --tokens "1,2,3" --native-qsa
 ```
 
-`--pack` と `--tokens` は engine の基本入力です。QSA を持つモデルでない場合、このフラグだけでは QSA 演算は呼び出されません。
+この例はエンジン parser の `--pack` と `--tokens` を併記しています。実際の pack と token ID は利用するモデル・入力に合わせてください（usage: `engine/src/program/generate.cpp:1208-1214`）。
 
 ## 値と既定値
 
-値は不要です。parser は `--native-qsa` を見つけると `o.native_qsa = true` にし、`Options` の初期値は `false` です。繰り返し指定しても同じ真値を設定します。option 自体に値範囲や追加 validation はありません（`src/program/generate.cpp:448-450,2494-2497`）。値を続けて別引数として渡すと、その引数は別 option として解析され、未知の引数なら usage を stderr に出して終了コード 2 で終了します（`src/program/generate.cpp:2787-2792`）。
+値を取りません。parser は `--native-qsa` を見つけると `native_qsa` を `true` にし、フラグを指定しない場合の初期値は `false` です（`engine/src/program/generate.cpp:786-787,3920-3921`）。SYCL 側も同じ初期値と代入です（`engine/sycl/src/program/generate.cpp:470-471,1959-1960`）。複数回指定した場合も同じ真偽値を再設定するだけです。フラグ固有の値 validation はありません。
 
 ## 実行時の動作
 
-parser の値は session 構築前に `native_qsa_set_enabled` へ渡されます（`src/program/generate.cpp:3936-3941`）。有効時、QSA 層の正規化では通常の `rms_norm_weighted` の代わりに native weighted RMS norm を選択します（`src/core/layer.cpp:1131-1140`）。この実装は各行の二乗平均から `rsqrt(mean + epsilon)` を求め、入力・重み `gamma` を乗じて出力します（`src/kernels/cuda/native_qsa.cu:45-68,133-143`）。
+起動時に設定値を native QSA kernel の有効状態へ渡します（CUDA/HIP 系: `engine/src/program/generate.cpp:6121`、SYCL: `engine/sycl/src/program/generate.cpp:3236`）。通常の QSA 層では、Q/K の重み付き RMSNorm を native 実装へ送り、attention 出力の gate も native 実装へ送ります。無効時はそれぞれ既存の `rms_norm_weighted` と `qsa_gate_apply_f32` を使います（`engine/src/core/layer.cpp:1154-1159,1317-1323`、SYCL: `engine/sycl/src/core/layer.cpp:1182-1187,1344-1350`）。decode verify 経路にも同様の分岐があり、native flag と別途 native RoPE が有効な条件では RMSNorm と RoPE を融合する経路も選べます（`engine/src/core/verify.cpp:2028-2041,2592-2603`）。
 
-attention の出力ゲートでは、native 実装が `q_full` の各 head の後半 gate 値に sigmoid を適用し、attention 値に乗じます。無効時は既存の `qsa_gate_apply_f32` を使います（`src/core/layer.cpp:1294-1301`; native 演算は `src/kernels/cuda/native_qsa.cu:94-101,160-165`）。バッチ verify の QSA 経路にも同じ切替があり、適用箇所の一つです（`src/core/verify.cpp:1559-1565,1902-1910`）。
+CUDA 実装では norm は F32 入力・重みを読み、RMSNorm の後に重みを乗算します。gate は query の gate 半分に sigmoid を適用し attention 出力に乗算します（`engine/src/kernels/cuda/native_qsa.cu:80-101`）。SYCL 実装にも同様の norm/gate kernel があります（`engine/sycl/src/kernels/cuda/native_qsa.dp.cpp:90-124`）。
+
+`--native` はモデルの native preset 処理中に `native_qsa` と `native_qsa_indexer` をともに有効化します。この preset は追加のモデル shard / PLE 要件も持ちますが、これは `--native-qsa` 単独の要件ではありません（`engine/src/program/generate.cpp:5155-5164`、SYCL: `engine/sycl/src/program/generate.cpp:2588-2596`）。
 
 ## 適用条件と副作用
 
-- 影響するのはモデル実行中に通る QSA 層の正規化・出力ゲートです。ほかの層や QSA indexer の key cache / pooling はこのフラグの対象外です。indexer は別の `--native-qsa-indexer` で切り替えます（`src/core/layer.cpp:1131-1140,1294-1301`; `src/program/generate.cpp:2494-2497`）。
-- `--native` で native model を選ぶ経路では、この option も含む一連の native 経路がまとめて有効になります（`src/program/generate.cpp:3258-3268`）。個別 option は A/B 用に残すと usage にあります（`src/program/generate.cpp:856-859`）。
-- `--native-rope` は独立した切替です。通常の QSA 正規化後の RoPE は別の native/fallback 分岐を持ち、batch verify では `--native-qsa` と `--native-rope` の両方が有効で、形状が利用条件を満たす場合に norm と RoPE の融合経路を選ぶことがあります（`src/core/layer.cpp:1133-1136`; `src/core/verify.cpp:1566-1575`）。`--native-qsa` 単独では RoPE の実装を切り替えません。
-- CUDA 実装は GPU kernel を起動します。ヘッダーでは、この helper 群は呼び出し元所有の stream を使い、helper 自身は同期・メモリ確保をしないとしています（`include/strata/kernels/native_qsa.hpp:10-20`）。
-- Metal engine の stub には setter/getter がある一方、native QSA 演算は `missing(...)` を呼び出す実装です。そのため Metal build でこのフラグが parser に受理されても、該当演算が呼ばれれば失敗し得ます。parser に backend 別の拒否条件はありません（`metal/src/engine/setup_host.cpp:53-55`; `metal/src/engine/stubs.cpp:275,279-281`）。この調査では各 backend の実行確認はしていません。
+- フラグはプロセス起動時の engine parser で処理され、通常の QSA 層と verify の QSA 演算に適用されます。QSA 以外の層に対するスイッチではありません（`engine/src/core/layer.cpp:1154-1159,1317-1323`、`engine/src/core/verify.cpp:2028-2041,2592-2603`）。
+- `--native-qsa-indexer` は独立した設定値として保持・適用されます。`--native-qsa` だけでは indexer cache/pooling を native 化しません（`engine/src/program/generate.cpp:786-787,3920-3921,6121-6122`）。
+- native kernel の実行時検査では、列数・行数が正で積が `INT_MAX` 以下、epsilon が有限かつ非負、stream とポインタが有効かつ 4-byte 整列、重み領域と他領域が重ならないことを要求します。入力と出力は完全一致の in-place alias を許します（CUDA: `engine/src/kernels/cuda/native_qsa.cu:103-121,133-165`。SYCL の検査: `engine/sycl/src/kernels/cuda/native_qsa.dp.cpp:126-144,174-179`）。通常経路は内部でこれらの引数を用意しますが、実行環境での kernel 成否や性能はソース調査だけでは確認していません。
+- ファイル・ネットワーク・子プロセスを操作する副作用は、このフラグの処理では確認できません。効果は GPU 演算経路の切り替えです。
 
 ## 出力とエラー
 
-CUDA native helper は次元が正で要素数が上限内であること、epsilon が有限かつ非負であること、stream・buffer の整列と重なり条件などを検査し、不正なら例外を投げます。また kernel 起動エラーも例外になります（`src/kernels/cuda/native_qsa.cu:103-126,133-165`）。QSA 層の正規化・gate 呼び出しは例外を捕捉して層名付きのエラー文字列を返し、上位の層実行を失敗させます（`src/core/layer.cpp:1131-1141,1297-1301,1547-1549`）。このフラグ固有の成功時メッセージや終了コード変更は確認できません。
+フラグ自体に専用の出力・警告・拒否条件はありません。未知の引数は stderr に `unknown argument` と usage を出して終了コード 2 になります（`engine/src/program/generate.cpp:4268-4273`）。native QSA kernel の引数検査は `std::invalid_argument` を投げます。QSA layer の norm/gate 呼び出しは例外を `err` に移して失敗を返します（`engine/src/core/layer.cpp:1161-1163,1320-1323`）。SYCL runtime の非同期エラーがどの時点で利用者向け出力になるかは、この文書のソース範囲からは確定できません。
 
 ## 根拠
 
-- `src/program/generate.cpp:448-450,849-859,2494-2497,3258-3268,3936-3941` — 既定値、usage、parser、`--native` との相互作用、setter 呼び出し。
-- `src/core/layer.cpp:1131-1141,1294-1308` — QSA 層での正規化と出力ゲートの切替・例外処理。
-- `src/core/verify.cpp:1559-1575,1902-1910` — batch verify 経路と native RoPE との条件付き融合。
-- `src/kernels/cuda/native_qsa.cu:45-68,94-126,130-165`、`include/strata/kernels/native_qsa.hpp:5-33` — CUDA 演算、検査、helper 契約。
-- `metal/src/engine/setup_host.cpp:53-55`、`metal/src/engine/stubs.cpp:275,279-281` — Metal 側の enable 状態と未実装 stub。
+- parser、既定値、help 表示: `engine/src/program/generate.cpp:786-787,1252-1253,3920-3921`。同じ option を持つ SYCL parser: `engine/sycl/src/program/generate.cpp:470-471,840-841,1959-1960`。
+- native 状態の適用と `--native` との相互作用: `engine/src/program/generate.cpp:5155-5164,6121-6122`、`engine/sycl/src/program/generate.cpp:2588-2596,3236-3237`。
+- CUDA/HIP 系での QSA norm / gate 分岐と例外経路: `engine/src/core/layer.cpp:1154-1163,1317-1326`。verify 経路: `engine/src/core/verify.cpp:2028-2041,2592-2603`。
+- native kernel の計算と入力検査: `engine/src/kernels/cuda/native_qsa.cu:80-101,103-165`。SYCL 実装: `engine/sycl/src/kernels/cuda/native_qsa.dp.cpp:90-124,126-144,171-179,269-288`。
+- 対象範囲は調査開始時点の checkout の engine parser・QSA layer/verify・CUDA/SYCL native QSA 実装です。既存バイナリの help は実行していません。

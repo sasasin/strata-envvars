@@ -1,42 +1,52 @@
 # `STRATA_PREFILL_LM_TOKENS`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-layer-major prefill が一度に処理する super-chunk の目標 token 数を指定します。layer-major は各 layer の attention/router を sub-chunk ごとに進め、同じ super-chunk 内の expert 計算をまとめて実行する経路です。この変数は経路を有効化しません。通常の `Prefill::run()` では `STRATA_PREFILL_LAYER_MAJOR` などで layer-major が選ばれた後、また複数 prompt の co-read では `run_multi()` が layer-major 準備を行う際にサイズ決定へ使われます（`src/prefill/prefill.cpp:6188-6198,7222-7255`）。
+layer-major prefill が一度に処理する super-chunk の目標 token 数を指定する。値が正なら通常値より大きな単位で各層の routed expert を処理する layer-major walk のサイズに使われ、未設定または正でない値ならコード内の既定目標を使う。この変数自体は layer-major を有効化しない。通常の chunk-major 経路、または layer-major が無効・適用不可の prompt には影響しない。読み取りとサイズ決定は `Prefill::lm_prepare`（`engine/src/prefill/prefill.cpp`）にある。
+
+layer-major 経路では、attention halves と router/shared expert を sub-chunk ごとに進め、routed experts を super-chunk 内の全 token について層ごとにまとめて実行する。したがってこの変数が変えるのは処理単位とバッファ規模であり、生成 token の数を指定するものではない。コードコメントは expert の加算順序と MMQ の row grouping が chunk-major と異なり、FP32 丸め差がありうると説明している（`engine/src/prefill/prefill.cpp:8066-8080`）。
 
 ## 値と判定
 
-値は `std::getenv()` で取得し、`std::atoll()` で符号付き整数に変換します。環境変数を未設定なら 0、設定値が空文字または数値として読めない文字列でも `atoll` の変換結果は 0 です。先頭の空白や符号は数値変換の規則に従い、数値の後ろにある文字列は検査されません（例: `4096tail` は 4096 として扱われます）。正の値だけが明示目標として使われ、0 以下は既定値に戻ります。文字列全体の妥当性検査、エラー通知、独自の数値範囲検査はありません（`src/prefill/prefill.cpp:5910-5913,6024-6029`）。
+初回の `lm_tokens_env()` 呼び出し時に `std::getenv` で読み、関数内 `static` に `std::atoll` の結果を保存する。未設定は `0`、空文字も `atoll` の結果が `0` となる。文字列全体の妥当性検査やエラー報告はなく、`atoll` が先頭から数値として読める部分を変換する（`12junk` は 12、`junk12` や `true` は 0）。先頭の空白や符号も `atoll` の規則で扱われる。正値のみ明示目標として採用され、0・負値は既定値へ戻る（`engine/src/prefill/prefill.cpp:8098-8100,8235-8240`）。
 
-| 変換結果 | サイズ決定 |
-|---|---|
-| `> 0` | 指定値を目標にする。通常の prompt では最小サイズを `m.T` とし、目標を `m.T` の整数倍へ切り下げたうえで、少なくとも `m.T` にする。 |
-| `0` または `< 0` | `lm_by_default_` が true（何も明示せず通常経路の既定で layer-major が選ばれた状態）なら 32768 token、それ以外は 8192 token を目標にする。通常の prompt では最小サイズは `2 * m.T`。 |
+| 条件 | unset | 有効になる値（例） | 無効・既定扱いになる値（例） |
+|---|---|---|---|
+| `lm_prepare` が呼ばれる layer-major 経路 | 目標サイズは既定値 | `1`、`512`、`12junk`（変換結果が正） | 空文字、`0`、`0anything`、`-1`、`true`、`junk12`（変換結果が 0 以下） |
+| 通常の chunk-major 経路、または layer-major が適用されない場合 | 参照されない | 参照されない | 値にかかわらず本変数によるサイズ指定は使われない |
 
-`m.T` はモデル/実行構成における prefill chunk の token 数です。目標は厳密な上限ではありません。計算後のサイズは prompt 長に合わせて切り上げた chunk 境界で制限され、GPU メモリに収まらなければ `m.T` 単位で縮小されます。layer split では stage 間で共通のサイズに制限されます。複数 prompt co-read は `lm_force_` により最小サイズ判定を 1 token まで緩めます（`src/prefill/prefill.cpp:6024-6032,6044-6048,6117-6168,6195-6198`）。
+正の目標値もそのままのサイズを保証しない。最小値（通常は chunk `m.T` の 1 個分、`STRATA_PREFILL_LM_FORCE` の先頭文字が `1` または複数 prompt の `run_multi` では 1）以上にし、`m.T` 単位へ切り下げ、prompt 全体と layer split の cap で上限を設ける。さらに必要な CUDA バッファが空き VRAM の余裕内に収まらないと、`m.T` ずつ縮める。従って正値が `m.T` より小さくても通常は 1 chunk 分になり、正値が大きくても実際の super-chunk は小さくなることがある（`engine/src/prefill/prefill.cpp:8235-8261`）。
 
 ## 有効になる条件
 
-- 通常の `Prefill::run()` では、layer-major 自体が選択され、初期化済みで、chunk hand-off 中でないことが必要です。`STRATA_PREFILL_LAYER_MAJOR` が非空なら `atoi` が 0 以外で opt-in、0 なら opt-out です。未設定または空文字の場合は CUDA の 2 stage 以上で既定 ON（ただし `STRATA_DEFAULTS=026` では OFF）、単一 GPU と HIP では既定 OFF です（`src/prefill/prefill.cpp:5894-5898,7233-7243`; `include/strata/core/sm120_series.hpp:112-120`）。
-- HIP build では layer-major の準備時に `STRATA_LM_HIP` の先頭文字が `1` でなければ chunk-major に戻ります（`src/prefill/prefill.cpp:5955-5967`）。Metal build は `Prefill::run()` の冒頭で Metal engine に委譲し、この CUDA/HIP layer-major 選択処理を通りません（同 `:7222-7237`）。
-- 通常 prompt の layer-major は、image prompt、peer GPU、未対応の layer split 状態、DFlash2 prompt taps、`STRATA_KVA`、chunk 境界で yield する batch read、`--prefill-pipe` が chunk 数を固定する場合、未対応の expert format/layout、必要 buffer 不足、短い prompt などで準備を見送ることがあります。4-bit expert nibble が build に含まれる場合、その slot を使う layer も対象外です（`src/prefill/prefill.cpp:5971-6026`）。
-- 複数 prompt の co-read は `run_multi()` から `lm_prepare_chain()` を直接呼ぶ別経路です。そこでは layer-major opt-in 判定を経ず `lm_force_` を立てますが、chunk hand-off 中や buffer 準備失敗なら co-read を辞退し、呼び出し元が通常の prompt read に戻ります（`src/prefill/prefill.cpp:6188-6198`; `src/program/generate.cpp:15204-15224`）。
+- layer-major 経路そのものが有効であること。通常は `STRATA_PREFILL_LAYER_MAJOR` が空でない値として設定され、`atoi` 結果が非 0 の場合に有効となる。未設定時の現行 `prefill_layer_major_default` は常に false。単一 CUDA GPU の small expert cache の自動経路は、条件を満たすと `STRATA_PREFILL_LAYER_MAJOR=1` を設定する。`STRATA_PREFILL_LAYER_MAJOR=0` など明示的な 0 は自動判定より優先して無効にする（`engine/include/strata/core/sm120_series.hpp:176-191`; `engine/src/program/generate.cpp:12562-12612`）。
+- AMD HIP/HIP GFX906 build では、別途 `STRATA_LM_HIP` の先頭文字が `1` でなければ `lm_prepare` が layer-major を断り、chunk-major に戻る。CUDA build にはこの gate がない（`engine/src/prefill/prefill.cpp:8166-8178`）。
+- prompt は text prompt でなければならず（image prompt は不可）、KVA が on でなく、chunk 境界で yield する batch read や `--prefill-pipe` の強制 chunk plan でなく、peer GPU の共有や peer helper、実行中の chunk hand-off を使わない必要がある（`engine/src/prefill/prefill.cpp:8182-8200`）。
+- `STRATA_EXPERT_NIBBLE` の 4-bit expert slot、routing/row debug dump（`STRATA_DBG_FEAT`、`STRATA_DBG_ROUTE_OVERRIDE`、`STRATA_PREFILL_DUMP_R_ALL`）、未対応の WMMA-only / APR / NVFP4 レイヤー、必要な MMQ・FP16・MoE バッファ不足、fused expert layout などでも layer-major 準備を断り、chunk-major に戻る（`engine/src/prefill/prefill.cpp:8201-8234`）。
+- prompt が算出された最小サイズより短い場合や、super-chunk 用の CUDA / pinned host バッファを確保できない場合も適用されない（`engine/src/prefill/prefill.cpp:8235-8237,8273-8313`）。
+- この変数に対応する CLI 引数による上書きはない。`--prefill-pipe` はむしろ layer-major を断る条件である（`engine/src/prefill/prefill.cpp:8199-8200`）。
 
 ## 実行時の詳細
 
-`lm_tokens_env()` の値は関数内の `static const int64_t` に保存されます。したがってプロセス内で最初にサイズ判定した後に環境を変更しても再読込されません。読み取り箇所はこの helper の `getenv` 1 箇所で、候補名の完全一致検索でも他の参照はありません（`src/prefill/prefill.cpp:5910-5913`）。この値は CLI 引数で上書きされず、CLI の `--prefill-pipe` はサイズ指定ではなく通常 prompt の layer-major 経路を辞退させます（同 `:5988-5989`）。
+`lm_tokens_env()` は `lm_prepare` 内の min size と target の計算で参照される。値はその関数の最初の呼び出し時に一度 cache され、実行中に環境を変えても反映されない。正の値は目標 `want` となり、0 以下では `lm_by_default_` が true のとき 32768、false のとき 8192 が目標になる（`engine/src/prefill/prefill.cpp:8098-8100,8120-8122,8235-8240`）。現行の自動 default 判定は false だが、別経路が default-on として呼び出した場合に備え、準備処理には 32768 の分岐も残る（`engine/include/strata/core/sm120_series.hpp:184`; `engine/src/prefill/prefill.cpp:9657-9663`）。
 
-正の目標値は buffer の必要量を見積もる初期サイズです。残り VRAM（既定余白を差し引く）に収まる最大 super-chunk まで縮小され、指定目標全体が入らない場合は pinned host RAM 側の残差行配置も試されます。最小サイズまで確保できない場合は準備失敗です（`src/prefill/prefill.cpp:6027-6059`）。
+サイズを確定すると、CUDA 空きメモリと margin を見て収まる最大サイズを探す。既定の row placement は VRAM に目標全体が収まる場合に VRAM、そうでなければ pinned host memory へ切り替える。層 split の後段は host 側の residual rows を使う。適合サイズがなければ準備を断り、通常経路へ戻る。layer-major のために CUDA allocation に失敗した場合も理由付きで準備を断る（`engine/src/prefill/prefill.cpp:8249-8285,8287-8313`）。
 
-通常 prompt で layer-major を選択した後、準備失敗の理由は stderr に `strata prefill: layer-major off for this prompt: ...` と出て、chunk-major 経路が続きます。ただし既定 ON 時の短い prompt はこのログを抑制します。成功すると処理完了時に `strata prefill: layer-major ... tokens in ... super-chunk(s) of up to ...` が stderr に出て、実際に採用したサイズや VRAM/pinned RAM 配置などが示されます（`src/prefill/prefill.cpp:7254-7271,7159-7167`）。実行中の CUDA 処理や同期が失敗した場合は `run_layer_major()` の error を返し、通常 prompt では `Prefill::run()` が false を返します。複数 prompt の準備失敗は `prefill: multi-prompt read declined: ...` となり、co-read 呼び出し元がその prefix を検出して通常 read に fallback します（同 `:6188-6206,7254-7263`; `src/program/generate.cpp:15218-15224`）。
+有効時は `run_layer_major` が `lm_run` を呼び、chunk-major とは異なる層単位の処理を行う。layer-major の実行結果は stderr に実際の token 数・super-chunk 数・最大サイズ・residual の置き場所・streamed expert blob 数などを出す。準備が断られた場合は理由に応じて `strata prefill: layer-major off for this prompt: ...` を出すが、既定で短い prompt の場合はこの理由行を抑制する。失敗して通常 chunk-major に戻った回数が続く場合、16 回ごとに継続中の理由を出す（`engine/src/prefill/prefill.cpp:9673-9705,9566-9574`）。
+
+## ログと測定値
+
+成功時の layer-major ログ形式は `strata prefill: layer-major (layers ...): ... tokens in ... super-chunk(s) of up to ...` で、実際に採用したサイズを確認できる。準備時の拒否理由は `strata prefill: layer-major off for this prompt: ...` に出る。既定で短い prompt の拒否理由は抑制される。ログ文字列・抑制条件は `engine/src/prefill/prefill.cpp:9567-9574,9694-9702`。
+
+ソースコメントには 2x RTX A4000・32K prompt の測定を根拠として default-on 時の目標 32768 が記されるが、測定方法や結果値はここには示されていない。本調査ではその性能値を一般化しない（`engine/src/prefill/prefill.cpp:8120-8122`）。
 
 ## 根拠
 
-- 候補名の読み取り、変換と cache: `src/prefill/prefill.cpp:5910-5913`。
-- 目標値、既定値、最小値、chunk 境界への丸め: `src/prefill/prefill.cpp:5932-5934,6024-6032`。
-- VRAM に合わせた縮小と準備失敗: `src/prefill/prefill.cpp:6034-6060`。
-- layer-major 選択条件および既定の解決: `src/prefill/prefill.cpp:7233-7255`; `include/strata/core/sm120_series.hpp:112-120`。
-- 適用除外と実行時エラー理由: `src/prefill/prefill.cpp:5955-6026,7254-7271`。
-- 成功ログ、複数 prompt co-read の fallback: `src/prefill/prefill.cpp:7159-7167,6188-6206`; `src/program/generate.cpp:15218-15224`。
+- `engine/src/prefill/prefill.cpp:8063-8080,8098-8100` — layer-major の処理内容と環境変数読み取り。
+- `engine/src/prefill/prefill.cpp:8166-8238` — backend、prompt、機能条件、最小サイズと目標サイズ。
+- `engine/src/prefill/prefill.cpp:8239-8313` — 丸め、prompt/cap 上限、VRAM 判定と allocation。
+- `engine/src/prefill/prefill.cpp:9566-9574,9657-9705` — 成功ログ、経路選択、拒否ログと fallback。
+- `engine/include/strata/core/sm120_series.hpp:176-191` — layer-major の default と明示値の解決。
+- `engine/src/program/generate.cpp:12562-12612` — small expert cache における自動有効化。

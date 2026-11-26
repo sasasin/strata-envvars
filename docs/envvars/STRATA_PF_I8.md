@@ -1,49 +1,54 @@
 # `STRATA_PF_I8`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL の prompt 処理で、対象形式の expert を fused int8 DPAS kernel で計算するかを指定します。これは `STRATA_PREFILL_MMQ` の別名です。通常の未設定時は Battlemage でのみ auto 選択され、それ以外の GPU は FP16 expert path です。明示指定すると、対象形式があり、カーネルが利用可能な経路では int8 または FP16 を選びます。
+SYCL の prompt 処理で使う fused int8 expert products の選択値です。`STRATA_PREFILL_MMQ` が未設定または空文字のとき、この変数を alias として読みます。対象経路では、条件を満たす expert group の gate/up・SwiGLU・down を int8 DPAS カーネルで処理し、使わない場合は既存の FP16 dequantize + oneMKL 経路へ進みます。alias の読み取りとモード判定は `engine/sycl/src/prefill/prefill.cpp:333-350`、処理切替は同 `:4773-4780` と `:4862-4932` です。
+
+CUDA/HIP や Strata の他のコードでこの名前を読む箇所は、候補名の全参照検索では見つかりませんでした。従って、この名前単独では SYCL 以外の prompt 経路を制御しません。
 
 ## 値と判定
 
-`i8_env()` はまず `STRATA_PREFILL_MMQ` を読みます。値が未設定または空文字なら `STRATA_PF_I8` を読み、最終的に空文字も未設定相当（null）として扱います。したがって、空の `STRATA_PREFILL_MMQ` は `STRATA_PF_I8` にフォールバックします。非空の `STRATA_PREFILL_MMQ` があれば、`STRATA_PF_I8` より優先されます。(`sycl/src/prefill/prefill.cpp:275-278`)
+`i8_env()` はまず `std::getenv("STRATA_PREFILL_MMQ")` を読み、その値が未設定または空なら `STRATA_PF_I8` を読みます。両方が未設定または空なら unset として扱います。非空の primary 値は alias に優先します。読み取り結果は `i8_env()` / `i8_mode()` の呼び出しごとに取得し、alias 自体を保存する static cache はありません（`engine/sycl/src/prefill/prefill.cpp:333-350`）。
 
-非空値は文字列全体の比較ではありません。先頭文字が `a` または `A` なら `auto` mode、それ以外は先頭から連続する数字を `long` に蓄積し、結果が 0 かどうかで mode を選びます。数字を一つも読めなければ 0 です。蓄積値が 1,000,000 以上になると追加読み取りを止めますが、結果は非ゼロのままなので mode 1 になります。(`sycl/include/strata/prefill/esimd_moe.hpp:43-50`)
+| `STRATA_PREFILL_MMQ` | `STRATA_PF_I8` | 判定 |
+|---|---|---|
+| 非空 | 任意 | primary 値だけで判定。alias は無視 |
+| 未設定または空 | 未設定または空 | unset。Battlemage と kernels が使える場合だけ auto、それ以外は FP16 |
+| 未設定または空 | 非空 | 下記の文字列判定 |
 
-| 有効な環境値 | 判定結果 |
-|---|---|
-| 未設定、空文字 | Battlemage かつ kernel 利用可能なら auto、それ以外は FP16 |
-| `0`、`00`, `0xyz`、`true`、` 1` | mode 0（FP16）。数字が先頭でない場合も 0 |
-| `1`、`2`、`1suffix`、`0002` | mode 1（対象 group で int8 を選択） |
-| `auto`、`AUTO`、`anything` のうち先頭が `a` / `A` の値 | mode 2（auto） |
-
-`true` は一般的な真偽値として扱われません。たとえば `1suffix` は先頭の数字 `1` を読んで mode 1、`2x` も mode 1 です。`auto` の判定は先頭一文字だけなので `a-no` も mode 2 です。
+非空値は文字列全体の比較や `atoi` ではなく、先頭だけを判定します。先頭が `a` または `A` なら後続文字列に関係なく auto（モード 2）。それ以外は先頭から連続する ASCII 数字を `long` に累積し、値が 1 以上なら int8 強制（モード 1）、0 なら FP16（モード 0）です。累積値が 1,000,000 以上になると追加の数字は読みません。従って `1`, `1junk`, `0002` は int8、`0`, `0anything`, `000` は FP16、`auto` / `AUTO` / `aJunk` は auto です。`true`、`false`、先頭空白付きの数字、`-1`、英字で始まる値（`auto` の a/A を除く）は数字列が 0 桁または 0 のため FP16 になります。大文字小文字は auto の先頭 `a` だけを区別せず、空白除去や全体 parse はしません（`engine/sycl/include/strata/prefill/esimd_moe.hpp:39-50`）。
 
 ## 有効になる条件
 
-環境値で mode 1 / 2 を指定しても、それだけでは int8 kernel は実行されません。SYCL の expert layer ごとの処理で、MMQ 経路を使っておらず、native expert layout であり、Hadamard 変換の gate/up と down を使わず、gate/up type が IQ3_XXS (18)、IQ3_S (21)、IQ2_S (22)、down type が IQ4_NL (20) または Q2_0 (42)、形状が `n_ff=640` / `n_embd=2560` で、`i8::available()` が true の場合に対象になります。その他の形式・形状は int8 経路の対象外です。(`sycl/src/prefill/prefill.cpp:4230-4236`)
-
-- 未設定時に auto を既定選択する Battlemage は、GPU の architecture id が `intel_gpu_bmg_g21` または `intel_gpu_bmg_g31` の場合です。製品名では判定しません。カーネル利用可否も確認します。(`sycl/src/prefill/esimd_moe.dp.cpp:811-832`, `sycl/src/prefill/prefill.cpp:282-286`)
-- 実行可能性の確認は device ごとに一度行った結果を cache します。`STRATA_I8_FORCE` の先頭文字が `0` なら false、ESIMD aspect がなければ false、sint8 × sint8 の matrix combination に `nsize=16`, `ksize=32` がなければ false です。(`sycl/src/prefill/esimd_moe.dp.cpp:835-853`)
-- `STRATA_SYCL_I8_ESIMD=OFF`、または `AUTO` の AOT build が `bmg` / `lnl` 以外を対象とすると stub 実装になり、`available()` は常に false です。JIT と Xe2 AOT（bmg / lnl）では既定 `AUTO` が kernel を含めます。(`sycl/CMakeLists.txt:45-63`, `sycl/src/prefill/esimd_moe.dp.cpp:40-55`)
-- int8 kernel が対象でも scratch を確保できない、または kernel が処理できない group は FP16 chain に fallback します。例外で launch が失敗した場合は `g_i8_failed` が立ち、その後の mode 判定はプロセス内で FP16 を返します。(`sycl/src/prefill/prefill.cpp:280-286,4303-4315`)
+- SYCL port の prompt expert 処理でのみ参照されます。Strata の shell launcher は `STRATA_*` 環境をコンテナへ渡しますが、これは転送処理であり別 backend の実装を意味しません（`engine/sycl/serve/strata-sycl.sh:33-43`）。
+- 設定が unset/空のときの自動選択は、実行デバイスが architecture ID で Battlemage と判定され、かつ当該ビルドで kernel が利用可能な場合に auto です。それ以外は FP16 です。`battlemage()` と `available()` がこの判定に使われます（`engine/sycl/src/prefill/prefill.cpp:340-350`; `engine/sycl/src/prefill/esimd_moe.dp.cpp:824-827,840-858`）。
+- 明示値が int8 または auto でも、実際の `i8on` には ESIMD kernel の利用可能性が必要です。AOT の対象外、または `STRATA_SYCL_I8_ESIMD=OFF` の build は stub となり `available()` は false です（`engine/sycl/CMakeLists.txt:78-96`; `engine/sycl/src/prefill/esimd_moe.dp.cpp:41-61`）。さらに `STRATA_I8_FORCE` の先頭が `0` なら `available()` を false にします。この判定は device ごとに static map へ cache されます（同 `esimd_moe.dp.cpp:840-858`）。
+- native expert layout であり、Hadamard fold が gate/up と down のどちらにもなく、gate/up 型が IQ3_S (21) / IQ3_XXS (18) / IQ2_S (22)、down 型が IQ4_NL (20) / Q2_0 (42)、`n_ff == 640`、`n_embd == 2560` である必要があります。別形式・寸法は int8 の対象になりません（`engine/sycl/src/prefill/prefill.cpp:4775-4780`）。
+- `STRATA_PF_XMX=2` で当該 layer が `xmx2_fmt()` の対象になると `xmx2_only` が立ち、fused int8 DPAS は使われません。これは XMX grouped 経路の優先条件です（`engine/sycl/src/prefill/prefill.cpp:4754-4772,4775-4781`）。
+- `STRATA_PREFILL_MMQ` が有効でその layer が MMQ plan の対象なら `use_mmq` が立ち、fused int8 条件の `!use_mmq` によりこの経路は使われません。MMQ plan は `STRATA_PREFILL_MMQ` だけを直接読み、`STRATA_PF_I8` を見ません。primary の `atoi` が 0 以外なら MMQ を有効にする一方、primary が空で alias を int8 指定しても、MMQ が built で対象 layer を持てば MMQ が優先されます（`engine/sycl/src/prefill/prefill.cpp:1255-1275,3945-3946,4775-4780`）。
+- `STRATA_PREFILL_MMQ=0` は alias より優先され、MMQ plan を無効にし、同時に int8 モードも 0 にします。従って alias の int8 指定を打ち消して FP16 を選びます（`engine/sycl/src/prefill/prefill.cpp:333-345,1255-1264`）。
+- auto は対象 group ごとに実行時の行数と、GPU / driver / format / shape ごとの crossover を使います。format ごとに queue 内で較正結果を保持し、ディスク上の `i8-crossover.txt` に一致キーがあれば再利用します。較正失敗時は 64 rows/expert 未満で int8 を使う扱いです（`engine/sycl/src/prefill/prefill.cpp:948-979,1005-1018,1099-1129,4867-4878`）。
 
 ## 実行時の詳細
 
-設定文字列は `i8_env()` を通して `i8_mode()` から読み直され、関数内に環境値の static cache はありません。値の変更が環境に反映される実行環境なら、後続の `i8_mode()` 呼び出しは再評価します。ただし、`STRATA_I8_FORCE` を含む kernel 利用可否は device ごとに最初の確認結果が cache されます。未設定時の「Battlemage GPU があるか」の探索結果も static cache です。(`sycl/src/prefill/prefill.cpp:275-292`, `sycl/src/prefill/esimd_moe.dp.cpp:824-852`)
+alias は prompt の `Prefill::init` の通知判定、stage slot 数の見積り、各 expert layer のモード選択で helper 経由に再評価されます。環境変数名の値を process 起動時に一度だけ cache する処理はありません。一方、int8 kernel launch に例外が出ると `g_i8_failed` が process 内で true に固定され、以後 `i8_mode()` はモード 0 を返します（`engine/sycl/src/prefill/prefill.cpp:333-350,1415-1419,4775-4780`; 同 `:338-344,4917-4921`）。
 
-明示値 `1` は対象 group ごとに int8 chain を試みます。`auto` は device queue と形式ごとに crossover を測定・再利用し、group の平均 rows/expert がその境界未満の場合に int8 を選びます。選択した group は activation を量子化し、int8 gate/up、SwiGLU 後の量子化、int8 down の順に実行します。int8 の結果が使えない場合は、FP16 dequantize + oneMKL GEMM の chain を実行します。(`sycl/src/prefill/prefill.cpp:4266-4328`)
+int8 が選ばれた layer でも、group の実行時に workspace 確保または対象 format の kernel 呼び出しが成立しなければ、その group は FP16 chain に戻ります。auto は較正 crossover より平均 rows/expert が小さい group を int8 にし、それ以上を FP16 にします（`engine/sycl/src/prefill/prefill.cpp:4862-4872,4887-4915,4931-4932`）。この変数が切り替えるのは prompt expert の積の計算経路です。生成結果が同一になることはこの変数の実装からは保証できません。
 
-有効判定時は stderr に `strata: int8 prompt experts are on (...)` が出ます。明示値で対象形式を走査したときは layer ごとの int8 path 選択ログも出ます。kernel を実行できない場合や launch が失敗した場合は、FP16 fallback のログを出します。ログ文面では alias 名ではなく `STRATA_PREFILL_MMQ` が表示されます。(`sycl/src/prefill/prefill.cpp:1205-1209,4237-4243,4303-4313`)
+## ログと測定値
+
+`i8_mode()` が非ゼロなら初回の `Prefill::init` で stderr に `strata: int8 prompt experts are on (%s); STRATA_PREFILL_MMQ=0 turns them off` を一度出します。alias 指定時も文面は alias 名ではなく `STRATA_PREFILL_MMQ set` と表示されます。非zero モードでもデバイスや形式条件を満たさない場合、後続ログの layer ごとの `int8 path no` で確認できます（`engine/sycl/src/prefill/prefill.cpp:1416-1419,4782-4787`）。
+
+int8 実行を試みたが workspace または kernel が format を扱えない場合は `strata: the int8 expert products could not run (layer ..., no workspace or a format they do not handle): the FP16 chain is used`、launch 例外時は `strata: the int8 expert kernels failed to launch (...): the FP16 expert chain is used from here` を stderr に出します。auto の較正成功時は実測値と crossover、cache 使用時は cache の crossover を stderr に出します。較正失敗時は理由と 64 rows/expert の fallback を stderr に出します（同 `prefill.cpp:1015-1018,1099-1101,1126-1128,4910-4920`）。
 
 ## 根拠
 
-- alias の優先順位と空値処理: `sycl/src/prefill/prefill.cpp:275-278`
-- 値の parse と unset 時の default: `sycl/include/strata/prefill/esimd_moe.hpp:39-50`; `sycl/src/prefill/prefill.cpp:282-292`
-- 対象 format / shape / 実行条件: `sycl/src/prefill/prefill.cpp:4230-4236`
-- device 判定と利用可否の cache: `sycl/src/prefill/esimd_moe.dp.cpp:811-853`
-- AOT / stub 条件: `sycl/CMakeLists.txt:45-63`; `sycl/src/prefill/esimd_moe.dp.cpp:40-55`
-- 実行、fallback、ログ: `sycl/src/prefill/prefill.cpp:1205-1209,4266-4328`
-- 説明資料との照合: `docs/INTEL_INT8_EXPERTS.md:13-27,66-71` は `STRATA_PF_I8` を `STRATA_PREFILL_MMQ` の alias とし、既定条件と形式制限を説明しています。現行ソースでは alias の実際の優先順位・値 parse を上記の実装から確認しました。
+- `engine/sycl/src/prefill/prefill.cpp:333-350` — primary / alias の選択、値の読み取り、既定モード、失敗時のモード。
+- `engine/sycl/include/strata/prefill/esimd_moe.hpp:39-50` — 値の文字列判定規則。
+- `engine/sycl/src/prefill/prefill.cpp:1255-1275,3945-3946,4773-4787` — MMQ との競合、実際の適用条件、layer ごとの診断。
+- `engine/sycl/src/prefill/prefill.cpp:4862-4932` — auto の group 選択、int8 実行と FP16 fallback。
+- `engine/sycl/CMakeLists.txt:78-96`; `engine/sycl/src/prefill/esimd_moe.dp.cpp:41-61,824-858` — build stub、device capability、`STRATA_I8_FORCE`。
+- `engine/sycl/src/prefill/prefill.cpp:948-1129` — auto crossover の cache・較正・ログ。
+- `engine/sycl/serve/strata-sycl.sh:33-43` — SYCL launcher の環境変数転送。

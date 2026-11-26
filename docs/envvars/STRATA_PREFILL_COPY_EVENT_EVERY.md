@@ -1,60 +1,54 @@
 # `STRATA_PREFILL_COPY_EVENT_EVERY`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-chunk-major prefill の streamed expert copy で、copy 完了を示す CUDA event を何 entry ごとに記録するかを指定します。既定値は `1` で、各 expert copy の後に event を記録します。`2` 以上にすると event を間引き、compute stream は必要な entry 以降で最初に記録された event を待ちます。copy stream の順序により、その event が先行 entry のコピーもカバーします。
-
-この値はコピーする expert やデータを変更する設定ではなく、記録・待機する event の粒度を変える tester switch です。実際に疎な event 記録になるのは、長い chunk の streamed walk と threaded issuer の両方が有効な場合です。
+長い prompt chunk の非常駐 expert を host から GPU へ流すとき、copy stream 上の「コピー完了」event をどの間隔で記録するかを指定する。既定相当の `1` では各 expert entry のコピー後に event を記録する。`2` 以上では間隔を空け、compute stream は必要な entry 以降で最初に記録された event を待つ。コピー順や ring slot は同じで、変わるのは event の記録と待機の粒度である（`engine/src/prefill/prefill.cpp:4807-4816, 4865-4914, 4920-4940`、`engine/include/strata/prefill/copy_events.hpp:18-33`）。
 
 ## 値と判定
 
-`src/prefill/prefill.cpp` は環境値を `std::atoi` に渡し、`copy_event_every_from()` が結果を `1..64` に制限します。文字列全体の妥当性検証はありません。`atoi` が先頭の空白と符号を許し、数字列以降を無視するため、たとえば `"  +3tail"` は `3`、`"junk"` は `0` として扱われます。
+prefill 処理が最初にこの宣言を実行した際、関数内 `static` 初期化で一度 `std::getenv` し、設定値には `std::atoi` を適用した後 `copy_event_every_from` で正規化する。未設定は `1`。設定済みでも parse 結果が `1` 以下なら `1`、`2..63` はその値、`64` 以上は `64` になる（`engine/src/prefill/prefill.cpp:4761-4764`、`engine/include/strata/prefill/copy_events.hpp:15-16`）。
 
-| 環境値 | 結果 |
-|---|---:|
-| 未設定 | `1` |
-| 空文字 | `1`（`atoi("")` は `0`） |
-| 数値として `1` 以下 | `1`（`0`、負数を含む） |
-| `2..63` | その整数 |
-| `64` 以上 | `64` |
-| 数字で始まらない文字列 | `1`（`atoi` の結果 `0`） |
+| 入力例 | parse / 有効値 |
+|---|---|
+| 未設定、空文字、`0`、`1`、`-2`、`true` | いずれも実効値 `1`（未設定は明示的な既定値。空文字・`true` は `atoi` が `0` を返し、`<=1` は `1` に正規化） |
+| `2`, `63` | `2`, `63` |
+| `64`, `65` | `64` |
+| `2tail`, `  +3x` | `atoi` が読む先頭の整数部分を採用し、それぞれ `2`, `3` |
 
-小数は整数部分の数字列までしか読まず、数値の後ろに続く文字も検査しません。`atoi` の整数型範囲を超える入力については、実装に安全な範囲検証がありません。
-
-値の判定結果は `run_impl()` 内の function-local `static const int` に保存されます。最初にその宣言へ到達した時点で一度だけ読み取り、同じプロセスで後から環境値を変えても再評価されません。CLI 引数や設定ファイルからこの値を上書きする経路はありません。
+文字列全体の数値妥当性は検証せず、空白や符号、数字の後ろの文字も `atoi` の規則に従う。したがって `1tail` は `1` 相当、数字で始まらない文字列は `0` 相当となる。無効入力専用の警告やエラー処理はない（同上）。
 
 ## 有効になる条件
 
-疎な event 記録は、次のすべてを満たすときだけ有効です。
-
-- 通常の chunk-major `run_impl()` 経路に入る。layer-major prefill が選択されて準備に成功した場合は `run_layer_major()` が使われ、この設定箇所を通りません。
-- `stream_all` が真である。これは `m.ring > STAGE`（`STAGE` は 8）、`T >= stream_all_min()`、`m.src != nullptr` のときです。
-- `STRATA_PREFILL_ISSUER` が有効で、threaded issuer が使われる。これは未設定なら既定で有効、設定時は `atoi(value) != 0` です。`STRATA_PREFILL_ISSUER=0` などで issuer が無効なら、この変数を `2` 以上にしても各 entry の event 記録・従来の wait のままです。
-- この変数の判定値が `2` 以上である。
-
-`strata_prefill` は CUDA/HIP runtime とリンクされる共通 prefill ライブラリです（`CMakeLists.txt:819-825`）。Metal の `Prefill::run()` は `metal_engine::prompt_run()` へ直接委譲して戻るため、この CUDA event の処理は適用されません（`src/prefill/prefill.cpp:7222-7231`）。
+- `prefill.cpp` を含む GPU engine の prefill 経路で有効。CUDA/HIP engine の共通ターゲット、SYCL ターゲット、Metal ターゲットが同じ `src/prefill/prefill.cpp` を含む（`engine/cmake/strata_gpu_engine.cmake:482-488`、`engine/sycl/CMakeLists.txt:303-308`、`engine/metal/CMakeLists.txt:135-146`）。この変数自体に OS、build macro、server/CLI の個別条件はない。
+- 実際に作用するのは、その chunk で `stream_all` が真、すなわち ring が `STAGE`（8）より大きく、chunk token 数 `T` が `stream_all_min()` 以上で、expert source `m.src` がある場合（`engine/src/prefill/prefill.cpp:321, 4625-4629`）。しきい値は `STRATA_PREFILL_STREAM_MIN` や build / device 側の規則で変わり得る（同:648-658）。モデルに非常駐 expert がなく source がない場合など、この streaming 条件に入らない経路では影響しない。
+- さらに issuer thread が動く必要がある。`STRATA_PREFILL_ISSUER=0`（`atoi` 結果が 0）なら issuer は inline となり、この値による sparse event 記録は使われない（同:4757-4764, 4807-4816）。他の値の parse 詳細は当該変数の文書を参照。
+- `STRATA_PREFILL_ROUTED_STREAM=1` との併用では、copy event 間隔が `1` 以外だと routed walk は使われず、通常の issuer walk が残る。peer prompt ring も routed walk を止める条件だが、copy event 間隔自体の適用条件ではない（`engine/include/strata/prefill/routed_stream.hpp:42-58`、`engine/src/prefill/prefill.cpp:4777-4795`）。
+- chunk サイズを決める CLI 引数等が間接的に `T` を変えることはあるが、この環境変数を上書きする CLI / 設定値はこの読み取り経路にはない。
 
 ## 実行時の詳細
 
-threaded issuer が動き、判定値が `2` 以上なら `sparse_copied` が真になります。issuer は copy stream 上で entry を順番に転送し、N 個ごとと最後の entry に event を記録します。また、stager 待ちで issuer が止まる前にも、それまで発行済みの範囲を覆う event を記録します。compute 側は必要な entry 以降で最初に記録済みの event を選び、その event を待ちます。MMQ group gather を使う経路では group の最後の streamed copy に対応する event を待ちます（`src/prefill/prefill.cpp:3511-3519,3555-3556,3571-3585,5190-5195`）。
+値は prefill 関数内の局所 `static` に保存されるため、最初にこの宣言を実行した時に一度読み、以後の prompt chunk や同一プロセス内の環境変更では再評価しない（`engine/src/prefill/prefill.cpp:4761-4764`）。
 
-threaded issuer が動いていて、疎な event 記録または `STRATA_PREFILL_COPY_WAIT_DEDUPE` が有効な場合、プロセス内で一度 stderr に次の形式のログを出します。後半は同じ wait-dedupe 変数の状態を表示します。
+実効値 `1` では各 copy 後に slot の `copied` event を記録する。`2..64` では通常は N 個ごとと最後の entry に記録するが、issuer が待ちに入る前にも、未記録のコピー範囲を consumer が待てるよう補助記録を行う。consumer は必要な entry 以降で最初に記録された event を探し、それを compute stream で待つ。copy stream の順序により、その event は対象 entry のコピーも完了した位置を示す（`engine/include/strata/prefill/copy_events.hpp:18-33`、`engine/src/prefill/prefill.cpp:4865-4914, 4920-4940`）。consumer 側は entry 単位または MMQ group の最後の entry で待つ（同:5815-5820, 7117-7124, 7202-7209, 7564-7574）。
+
+この設定は prompt の streamed expert copy に限られ、token ごとの decode や他の upload event の設定ではない。ソース上でこの値による独自の終了・fallback はなく、`atoi` 後の正規化で無効値も `1` 相当として扱われる。
+
+## ログと測定値
+
+issuer thread が有効で、実効値が `1` より大きいと、初回に次の stderr 行を出す（`copy_wait_dedupe` が有効なら `%s` 部分は `one wait per release event`、そうでなければ `a wait per slot`）。
 
 ```text
-strata: prompt copies: a copied event every N streamed experts (STRATA_PREFILL_COPY_EVENT_EVERY), a wait per slot (STRATA_PREFILL_COPY_WAIT_DEDUPE)
+strata: prompt copies: a copied event every %d streamed experts (STRATA_PREFILL_COPY_EVENT_EVERY), %s (STRATA_PREFILL_COPY_WAIT_DEDUPE)
 ```
 
-wait-dedupe も有効なら末尾は `one wait per release event` になります。値が `1` で wait-dedupe も無効なら、このログは出ません（`src/prefill/prefill.cpp:3486-3498`）。
-
-この環境変数自体に不正値警告や即時終了の経路はありません。copy/event 操作のエラーはこの箇所で個別に検査されず、後続の stream 同期でエラーが表面化した場合、`run_impl()` は compute stream について `prefill: ...`、copy stream について `prefill: expert copy stream: ...` を `err` に設定して失敗を返します。呼び出し元の `Prefill::run()` は失敗を返します（`src/prefill/prefill.cpp:5762-5769,7271-7280`）。この失敗経路は event 間引きの値に固有のものではありません。
+`%d` は正規化後の値。値が `1` のみで wait dedupe も無効ならこの行は出ない（`engine/src/prefill/prefill.cpp:4816-4824`）。この変数の値だけを理由に出る error / warning / 終了ログはない。
 
 ## 根拠
 
-- 候補一覧には名前がありますが、直接の環境読み取りは `src/prefill/prefill.cpp:3482-3485` の `std::getenv` です。リポジトリ全体での完全一致検索では、同ファイルのコメント・ログ参照と `include/strata/prefill/copy_events.hpp` のコメント／helper 以外に読み取り箇所はありません。
-- 変換後の clamp: `include/strata/prefill/copy_events.hpp:15-16`。
-- streamed walk の条件、issuer の既定値と値判定: `src/prefill/prefill.cpp:3332,3459-3473`。
-- event の間引き・consumer wait: `src/prefill/prefill.cpp:3511-3519,3555-3585`。
-- layer-major 経路と Metal 経路: `src/prefill/prefill.cpp:7222-7271`。
-- 基準文書 `docs/DETAILS.md` に本変数の具体的な挙動説明は見つかりませんでした。外部ライブラリや driver が同名の値を読む挙動については記載していません。
+- `engine/src/prefill/prefill.cpp:4761-4764` — 環境からの読み取り、`atoi`、cache。
+- `engine/include/strata/prefill/copy_events.hpp:15-33` — clamp、記録間隔、consumer が待つ entry の選択。
+- `engine/src/prefill/prefill.cpp:4625-4629, 4807-4816, 4865-4940` — streaming / threaded issuer 条件、event の記録と待機。
+- `engine/src/prefill/prefill.cpp:5815-5820, 7117-7124, 7202-7209, 7564-7574` — consumer が copy event を待つ地点。
+- `engine/include/strata/prefill/routed_stream.hpp:42-58` — routed stream との適用条件。

@@ -1,6 +1,6 @@
-# `--list-presets`
+# `strata launch --list-presets`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,56 +8,44 @@
 | コマンド | `strata launch` |
 | オプション | `--list-presets` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ。指定すると真、未指定時は偽。 |
+| 値 | 値を取らないフラグ（`store_true`）。未指定時は `False` |
 
 ## 役割
 
-このユーザーの保存済み launch preset を列挙します。preset は `strata launch` の設定一式を名前付きで保存したものです。指定した場合、通常のモデル準備やサーバー起動経路には進まず、一覧を表示して終了します。
+保存済み launch preset を一覧表示する管理モードです。通常の guided setup やサーバー起動には進まず、一覧を出力して終了します。保存先は profiles ディレクトリに隣接する `launch-presets/` で、`STRATA_LAUNCH_PRESET_DIR` が設定されている場合はそのディレクトリです。
 
 ## 使い方
 
 ```sh
+# 保存済み preset を人間向けの形式で表示
 strata launch --list-presets
-```
 
-JSON で取得する場合:
-
-```sh
+# 機械処理向け JSON で表示
 strata launch --list-presets --output json
 ```
 
-`--output` は `human` または `json` を受け取り、既定値は `human` です。
-
 ## 値と既定値
 
-`--list-presets` 自体は `argparse` の `store_true` フラグで、引数値・別名・追加 validation はありません。未指定なら一覧表示分岐に入りません。`--output` の値が不正な場合は通常の parser validation で拒否されます（`strata_cli/launch/cmd.py:140-142`）。
+`--list-presets` 自体は値を取らず、既定値は `False` です。繰り返し指定や値の指定について個別の処理はありません。出力形式は同じ `launch` parser の `--output` で選択され、既定値は `human`、受理値は `human` または `json` です（`terminal/strata_cli/launch/cmd.py:154-156`）。
 
 ## 実行時の動作
 
-一覧の取得には `store.list_presets()` を使います。保存先は環境変数 `STRATA_LAUNCH_PRESET_DIR` があればその展開後のパス、なければ profiles ディレクトリの隣の `launch-presets/` です。保存ディレクトリが存在しない場合は空の一覧になります（`strata_cli/launch/store.py:27-32,115-120`）。
+`run_launch()` はこのフラグを検出すると `store.list_presets()` を呼び、通常の起動処理に進まず終了コード 0 を返します（`terminal/strata_cli/launch/cmd.py:766-782`）。preset は `STRATA_LAUNCH_PRESET_DIR` があればその値、なければ profiles の親ディレクトリにある `launch-presets/` から読みます（`terminal/strata_cli/launch/store.py:28-34`）。ディレクトリが存在しなければ空の一覧です。`.json` ファイルを読み込み、`last_used` または `created` の文字列が新しい順に並べます。読み込み時の `OSError` または JSON の `ValueError` が起きたファイルは一覧からスキップされます（`terminal/strata_cli/launch/store.py:128-150`）。
 
-ディレクトリ直下の `*.json` を名前順で読み、読み込み時に `OSError` または `ValueError` が発生しなかった preset を `last_used`、次に `created` の文字列の降順で返します。読み取り不能や JSON 構文エラーなど、この例外に該当するファイルは一覧から黙って除外されます（`strata_cli/launch/store.py:120-129`）。
-
-既定の human 出力では、preset がないときは保存方法を案内するメッセージを表示します。ある場合は名前、model、context、並列数または `fit to card`、調整済みかどうか、最終使用時刻を1件ずつ表示します（`strata_cli/launch/cmd.py:648-655`）。JSON 出力は `schema_version: 1`、`ok: true`、`presets` を含む JSON オブジェクトです。preset の設定項目を含みますが、`api_key` は `set` または `null` に置き換え、実値を出力しません（`strata_cli/launch/cmd.py:646-647`; `strata_cli/launch/settings.py:114-118`）。
+既定の human 出力では、preset ごとに名前、モデル、context、並列数（または `fit to card`）、tuning 状態、最終使用日時を表示します。空の場合は保存方法の案内を表示します（`terminal/strata_cli/launch/cmd.py:771-781`）。`--output json` では stdout に `schema_version: 1`、`ok: true` と `presets` 配列を含む JSON オブジェクトを出力します。各 preset の `api_key` は値そのものを出さず、設定済みなら文字列 `set`、未設定なら `null` です（`terminal/strata_cli/launch/cmd.py:768-770`; `terminal/strata_cli/launch/settings.py:161-165`）。
 
 ## 適用条件と副作用
 
-このオプションを先に処理するため、同じ呼び出しで `--delete-preset`、`--status`、`--stop`、`--show-key` なども指定した場合、それらの後続分岐には進まず一覧表示で終了します。複数の管理フラグの同時指定は専用エラーにはならず、ソース上の分岐順で `--list-presets` が優先されます（`strata_cli/launch/cmd.py:643-677`）。
-
-一覧処理は preset の読み取りと標準出力への表示を行い、preset の保存・削除、モデルや tuning 結果の変更、サーバーの起動・停止は行いません（`strata_cli/launch/cmd.py:643-656`; `strata_cli/launch/store.py:115-129`）。この調査では異なる OS での実行結果や実データを使った実行確認はしていません。
+一覧取得では preset ファイルを読み取るだけで、preset の保存・削除、モデルの変更、tuning、サーバー起動は行いません。preset ディレクトリがない場合もエラーにはならず空一覧として扱います（`terminal/strata_cli/launch/store.py:128-150`）。一覧結果は `last_used` / `created` の文字列の降順です。時刻文字列の形式が異なる場合の意味的な時系列比較までは、この並べ替え処理からは保証できません。
 
 ## 出力とエラー
 
-- preset がないときも正常終了し、human では案内文、JSON では空の `presets` 配列を出力します（`strata_cli/launch/cmd.py:646-656`）。
-- 個別の preset ファイルを読む際に `OSError` または `ValueError` が発生した場合は、そのファイルだけを飛ばし、他の対象ファイルの列挙を続けます。ほかの例外型による失敗挙動までは、この処理から確認できません（`strata_cli/launch/store.py:120-127`）。
-- human 出力は標準出力へ書き込まれます（`strata_cli/launch/cmd.py:416-419,648-655`）。
-- `--output` に `human` / `json` 以外を指定した場合の parser エラー表示と終了コードは、共通の `argparse` 処理に委ねられます。CLI 本体は `parse_known_args` の後、未知引数を `strata:` 付きで標準エラーへ出し終了コード `2` を返します（`strata_cli/launch/cmd.py:140`; `strata_cli/cli.py:2223-2231`）。
+human 出力は stdout に書き込まれます（`terminal/strata_cli/launch/cmd.py:495-497, 771-781`）。JSON を選んだ場合も成功オブジェクトを stdout に出します（`terminal/strata_cli/launch/cmd.py:768-770`）。個々の preset ファイルが読めない、または JSON として壊れている場合は、そのファイルを飛ばして残りを表示します（`terminal/strata_cli/launch/store.py:139-150`）。ディレクトリの列挙自体に失敗した場合は `is_dir()` が false となるか、キャッシュ用の走査キーが `None` となり、実装上は結果が空になる場合があります（`terminal/strata_cli/launch/store.py:119-150`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:16-29,75-82,127-146` — `launch` の説明・例、共通 `--output` と `--list-presets` の parser 定義。
-- `strata_cli/launch/cmd.py:630-656` — JSON/human の分岐、空一覧メッセージ、human の列、早期 return。
-- `strata_cli/launch/store.py:27-32,115-129` — preset 保存先、読み込み対象、読み込み失敗のスキップ、並び順。
-- `strata_cli/launch/settings.py:114-128` — JSON 化時の API key マスキングと preset 設定の復元。
-- `strata_cli/cli.py:2223-2231` — parser 呼び出しと未知引数のエラー処理。
-- 索引: [`docs/cli/README.md`](../../README.md) の `strata launch` 節に本書へのリンクが掲載されています。
+- `terminal/strata_cli/launch/cmd.py:73-80, 155-156` — `launch` parser と `--list-presets` の引数定義、`--output` の選択肢・既定値。
+- `terminal/strata_cli/launch/cmd.py:753-782` — 一覧モードの分岐、human / JSON 出力、終了コード。
+- `terminal/strata_cli/launch/store.py:28-34, 119-150` — preset 保存先、読み込み・キャッシュ・破損ファイルのスキップ・並べ替え。
+- `terminal/strata_cli/launch/settings.py:161-165` — JSON で API key の値を伏せる変換。
+

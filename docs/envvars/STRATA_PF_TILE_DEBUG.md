@@ -1,51 +1,50 @@
 # `STRATA_PF_TILE_DEBUG`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 ## 役割
 
-CUDA の sm_121（GB10 / DGX Spark）で native fused IQ prefill のタイル幅を選ぶ際、その選択内容を stderr に出す診断用環境変数です。タイル幅の選択条件や計算結果そのものは変更しません。
+fused prefill の native expert kernel が自動 tile rule を使って work item を選んだとき、その選択を stderr に出す診断用スイッチである。tile 選択や fused kernel の有効化自体は変えず、`pick_ww()` が得た `pk.ww` をそのまま返す。`ww=2` は routed row 128、`ww=4` は routed row 64 を表す（`engine/src/prefill/moe_fused_iq.cu:3336-3352`、`engine/include/strata/prefill/fused_tile_rule.hpp:35-39`）。
 
-この値を読むのは `src/prefill/moe_fused_iq.cu` の `pick_ww()` だけです。通常の `Batch` 版 native expert 経路から呼ばれた場合に限り、sm_121 で選ばれた `ww` と routed rows / experts / 平均値をログに出します。
+読み取りと出力は `engine/src/prefill/moe_fused_iq.cu` の `pick_ww()` にある。通常形状の fused expert 実装に加え、同ファイルを Qwen3.6 用 namespace で再コンパイルするコピーもこのコードを使う（`engine/src/prefill/moe_fused_iq_q36.cu:1-8,33-36`）。これは fused prefill が選ばれた後の診断であり、通常の MMQ 経路などでは読み取られない（同 `moe_fused_iq.cu:3355-3374,3867`）。
 
 ## 値と判定
 
-環境変数の文字列全体や数値としての妥当性は検査せず、値が存在し、先頭文字が `'1'` かだけを見ます。`static const bool` に保存するため、最初に `pick_ww()` が強制 tile の早期 return を通過して sm_121 分岐へ入った時点で値が評価され、その後の環境変更は反映されません。
+`std::getenv()` の結果が null でなく、先頭文字が `'1'` なら有効。文字列全体の parse・比較はせず、空文字の特別扱いもない（空文字は設定済みだが `v[0]` が NUL なので無効）。空白除去、大文字小文字変換、数値範囲検査もない。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効。ログなし |
-| 空文字 | 無効。値は設定されているが先頭文字は `\0` |
-| `1`, `10`, `1anything` など | 有効。先頭文字が `1` |
-| `0`, `true`, ` 1`, `-1`, その他先頭文字が `1` でない値 | 無効 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `pick_ww()` 内の自動 rule 分岐 | 無効 | `1`, `1anything` | 空文字, `0`, `true`, ` 1`, `0anything` |
 
-無効値に対する警告やエラーはありません。CLI 引数や設定ファイルとの優先順位もありません。
+判定は数値の真偽ではなく先頭文字だけを見るため、`10` や `1false` も有効である。無効値は warning にならず、デバッグ行が出ない。CLI 引数によるこの変数の上書きは実装にない。別環境変数 `STRATA_PF_FUSED_TILE` の `atoi()` 結果が 64 または 128 なら自動 rule を通らず、このデバッグ判定にも到達しない（`engine/src/prefill/moe_fused_iq.cu:3327-3345`）。
 
 ## 有効になる条件
 
-値が有効でも、次の条件が必要です。
-
-- CUDA のデバイス属性が compute capability 12.1（major 12 / minor 1）であること。`dev_info()` は CUDA 側でのみ `s121` を設定し、HIP 側ではこの分岐を設定しません。
-- `prefill` が native fused expert 経路を選び、`experts_native(const Batch&)` に到達すること。native 経路の対応可否・有効化は `native_supported()` などで判定されます（`STRATA_PF_FUSED` 等が関与）。native fused を選べない場合は別経路となり、この診断は実行されません。
-- `experts_native()` が wide kernel（NT=256 または warp-specialized）用の `WideBatch` 経路を使わないこと。この経路では `pick_ww()` を呼ばず、環境変数も読まれません。
-
-sm_121 の `pick_ww()` は `n >= 65536` なら `ww=2`、それ未満なら `ww=4` を返します。この分岐で環境変数が変更するのはログ出力だけです。`STRATA_PF_FUSED_TILE` は先に `atoi()` で評価され、変換結果が 64 または 128 なら強制幅を返すため、`STRATA_PF_TILE_DEBUG` は読み取られません。`STRATA_PF_FUSED_NT` / `STRATA_PF_FUSED_WS` などによって wide kernel 経路が選ばれた場合も対象外です。
+- fused native prefill の起動経路が `launch_ww()` から `pick_ww()` を呼ぶこと。これは tile のログだけを有効にし、fused prefill 自体を有効化しない。どの layer が native fused 経路を使うかは別の対応形式・デバイス・設定条件で決まる（`engine/src/prefill/moe_fused_iq.cu:3355-3374,3867`）。
+- 自動 rule の結果 `pk.why` が `Why::kBand` 以外であること。通常の 56–112 rows/expert の band 選択はログ対象外。rule 固有の対象は GPU class、SM 数、routed rows、expert 数、staging 状態、quant pair による（`engine/include/strata/prefill/fused_tile_rule.hpp:42-106`）。
+- 早期 return に入らないこと。`STRATA_PF_FUSED_TILE=64` または `128` の強制指定、CUDA の Turing (`dv.t75`) 経路、CUDA の staged blob check 失敗による unstaged fallback は `pick_ww()` の診断分岐より先に戻る（`engine/src/prefill/moe_fused_iq.cu:3327-3334,3358-3373`）。
+- そのビルドで `moe_fused_iq.cu` が実装として使われること。CUDA/HIP 用の CMake backend が同ファイルをビルド対象にする。SYCL の `moe_fused_stub.cpp` は stub で、この読み取り箇所を含まない（`engine/cmake/backends/cuda.cmake:135-136`、`engine/cmake/backends/hip.cmake:34-37`、`engine/sycl/src/prefill/moe_fused_stub.cpp:1-12`）。Qwen3.6 用コピーでは CUDA および gfx12 HIP の実装に同じ読み取りコードが含まれる（`engine/src/prefill/moe_fused_iq_q36.cu:1-8,33-36`）。
 
 ## 実行時の詳細
 
-`prefill.cpp` が `fused_nat` の場合に `fused::experts_native()` を呼びます。`Batch` 版では妥当性確認後、wide kernel を使わない場合に `pick_ww(n, n_expert)` を呼び、その戻り値から gate/up と down の grid サイズを算出して native kernel を起動します。sm_121 の選択分岐では、有効な debug 値があると呼び出しごとに stderr へ次の形式で出力します。
+環境値を読むのは、`pk.why != Why::kBand` となる `pick_ww()` 呼び出しが初めて起きた時である。読み取りはブロック内の関数ローカル `static const bool` に保存され、以後同じコンパイル単位の呼び出しでは再読込しない。そのため実行中に環境値を変更しても、そのコピーの判定には反映されない。Qwen3.6 用コピーは元ソースを別 namespace で再コンパイルするので、コピーごとに別の static cache を持つ（`engine/src/prefill/moe_fused_iq.cu:3344-3352`、`engine/src/prefill/moe_fused_iq_q36.cu:1-8,33-36`）。
+
+`pick_ww()` は rule の `Pick` を計算した後にだけ診断判定を行う。値が有効で条件を通れば、該当する各起動で rows、experts、平均 rows/expert、rule class と選択された `ww` を出力する。デバッグ変数によって処理を終了したり、選択や出力値を書き換えたりする経路はない（`engine/src/prefill/moe_fused_iq.cu:3341-3352`）。
+
+## ログと測定値
+
+有効値かつ自動 rule の非-band 分岐では、stderr に次の形式を出す。出力は選択ごとに1行で、`cls` は `s121`、`s120 small`、`staged`、`s86 wide`、`s86 kq`、`s120 kq`、または `s120` のいずれかである（`engine/src/prefill/moe_fused_iq.cu:3344-3350`）。
 
 ```text
-strata: fused tile: rows <n> experts <n_expert> avg <avg> s121 yes -> ww <ww>
+strata: fused tile: rows <n> experts <n_expert> avg <平均値> <cls> yes -> ww <2 または 4>
 ```
 
-ログは `fprintf(stderr, ...)` によるもので、環境変数が未設定・無効でも処理失敗にはなりません。診断値はログ以外の処理に使われません。
+この変数自身による警告、エラー、終了コード変更はない。既定値のまま、band rule、強制 tile、早期 return の場合は上記行を出さない。tile rule header には別途測定記録があるが、この診断変数の性能効果を示す測定ではないため、本書では性能値を主張しない（`engine/include/strata/prefill/fused_tile_rule.hpp:4-14,42-106`）。
 
 ## 根拠
 
-- `src/prefill/moe_fused_iq.cu:1950-1971` — タイル幅選択、環境変数の先頭文字判定と static cache、stderr のログ。
-- `src/prefill/moe_fused_iq.cu:1771-1815` — デバイス情報の cache と、CUDA の compute capability 12.1 判定。HIP 分岐は `s121` を設定しない。
-- `src/prefill/moe_fused_iq.cu:2025-2033,2113-2138` — `Batch` 版の native expert 経路、wide 経路の早期 return、`pick_ww()` の呼び出しと tile ごとの launch。
-- `src/prefill/prefill.cpp:4307-4320` — prefill から native fused experts または通常 fused experts を選んで呼ぶ箇所。
-- `src/prefill/moe_fused_iq.cu:1951-1956` — `STRATA_PF_FUSED_TILE` が有効値なら先に tile 幅を返すため debug 判定を通らないこと。
-- `include/strata/prefill/moe_fused_iq.hpp:29-45` — native fused 経路の宣言と `WideBatch` 経路に関する説明。
+- `engine/src/prefill/moe_fused_iq.cu:3327-3352` — `STRATA_PF_FUSED_TILE` による早期 return、対象変数の読み取り・cache・stderr 出力・選択値の return。
+- `engine/src/prefill/moe_fused_iq.cu:3355-3374,3867` — launch から `pick_ww()` への経路と CUDA early return。
+- `engine/include/strata/prefill/fused_tile_rule.hpp:35-39,42-106` — tile の対応と自動 rule。
+- `engine/src/prefill/moe_fused_iq_q36.cu:1-8,33-36` — Qwen3.6 用の別コンパイルコピー。
+- `engine/cmake/backends/cuda.cmake:135-136`、`engine/cmake/backends/hip.cmake:34-37`、`engine/sycl/src/prefill/moe_fused_stub.cpp:1-12` — backend ごとの実装配置。

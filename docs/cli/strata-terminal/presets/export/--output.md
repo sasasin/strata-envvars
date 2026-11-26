@@ -1,6 +1,6 @@
-# `--output`
+# `strata presets export --output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,48 +8,51 @@
 | コマンド | `strata presets export` |
 | オプション | `--output` |
 | 別名 | なし |
-| 値 | `human` または `json` |
+| 値 | `human` または `json`。省略時は `human` |
 
 ## 役割
 
-ファイル出力を指定した場合の完了メッセージ形式を選びます。プリセットを書き出すファイル名を指定するオプションではありません。出力先ファイルは `--file` で指定します。
+export の結果通知と、処理失敗時のエラー表現を人向けまたは JSON にします。ただし、出力先を省略してプリセット本体を stdout に表示する経路は常に整形 JSON であり、`--output` の値では切り替わりません。
 
 ## 使い方
 
 ```sh
-strata presets export PRESET_ID --file ./preset.json --output json
-```
+# JSON形式のプリセット本体を stdout に表示する（この経路では --output の指定は結果形式を変えない）
+strata presets export "Preset name" --output json
 
-`PRESET_ID` にはプリセット ID、4文字以上の一意な ID 接頭辞、または大文字小文字を区別しない名前を指定できます。
+# export ファイルを書き、成功通知を JSON にする
+strata presets export "Preset name" --file ./preset-copy.json --output json
+```
 
 ## 値と既定値
 
-- 値は `human` または `json` に限られます。既定値は `human` です。
-- 値を省略すると argparse がエラーにし、候補外の値も受理しません。`--output` は値を1つ取ります。同じオプションを複数回指定したときは、argparse の通常の `store` 動作により最後の値が使われます。
-- `--output` に短縮別名はありません。
+`human` と `json` のみ受け付けます。既定値は `human` です。値は `argparse` の choices で検証されるため、それ以外の値は parser エラーになります（`terminal/strata_cli/tune_commands.py:59-61`）。短縮別名はありません。
 
 ## 実行時の動作
 
-- `--file PATH` を指定すると、まず `presets.export_preset(PRESET_ID)` でプリセットを解決し、JSON を UTF-8 で `PATH` に書き込みます。JSON はインデント付きで非 ASCII 文字をエスケープせずに出力します。その後 `--output human` なら `Wrote PATH`、`--output json` なら `{"schema_version":1,"ok":true,"file":"PATH"}` 形式の完了情報を stdout に出します。
-- `--file` を省略すると、プリセット本体をインデント付き JSON として stdout に出して終了します。この経路は `--output human` / `json` のどちらでも同じで、`--output json` の成功 envelope には包まれません。
-- `--file` の書き込みは `Path.write_text` によるため、同名ファイルがあれば上書きし、親ディレクトリは自動作成しません。`--output` 自体はファイルの有無や書き込み方法を変えません。
-- エクスポートされたプリセットは保存済みプリセットを検索したデータから `active` 情報を除いた辞書です。エクスポート処理はプリセットストアを更新しません。
+この option は `presets` の各サブコマンドに共通登録されます。`export` はプリセット参照を位置引数に取り、任意の `--file` とともに `--output` を使えます（`terminal/strata_cli/tune_commands.py:55-61,79-81`）。
+
+export 処理はまず ID・ID prefix・名前からプリセットを検索し、保存データから `active` フィールドを除いた内容を得ます（`terminal/strata_control/presets.py:243-256,417-420`）。`--file` が空でない場合、内容を UTF-8 のインデント付き JSON として指定先へ書き込みます。ファイルへの書き込み後、`human`（既定）なら `Wrote <path>` を表示し、`json` なら `{"schema_version":1,"ok":true,"file":"<path>"}` 形式の成功応答を stdout に表示します（`terminal/strata_cli/tune_commands.py:514-518,101-106`）。
+
+`--file` を省略した場合はプリセット本体をインデント付き JSON として stdout に出して終了し、`--output human` と `--output json` のどちらでも同じ経路です（`terminal/strata_cli/tune_commands.py:514-520`）。
 
 ## 適用条件と副作用
 
-プリセットの解決は、ID 完全一致、4文字以上の ID 接頭辞、または完全一致する名前で行います。該当なし、接頭辞の曖昧一致、名前の曖昧一致は拒否されます。保存先は相対パスなら現在の作業ディレクトリを基準にします。既存ファイルを指定すると上書きされるため、必要なファイルを誤って置き換えない出力先を選んでください。
+`--output` 自体はプリセットや設定を変更しません。ファイル書き込みの副作用は `--file` を空でない値で指定したときに発生します。実装は `Path.write_text` を直接呼ぶため、指定先に既存ファイルがあれば内容を置き換えます。親ディレクトリの作成や一時ファイル経由の書き込みはこの処理にはありません（`terminal/strata_cli/tune_commands.py:514-518`）。
+
+明示的に空文字列 `--file ""` を渡した場合は条件判定が偽になり、ファイルには書かず stdout 出力経路になります（同:517-520）。
 
 ## 出力とエラー
 
-- `--file` ありの成功時は、前述の human メッセージまたは JSON envelope を stdout に出し、終了コード `0` を返します。`--file` なしの成功時はプリセット JSON を stdout に出して `0` を返します。
-- プリセットが存在しない、ID/名前が曖昧など `PresetError` となる場合、human 出力では `strata: <理由>` を stderr に出して終了コード `5`、JSON 出力では `{"schema_version":1,"ok":false,"error":{"code":5,"message":"<理由>"}}` を stdout に出します。
-- ファイル書き込みなどで `OSError` または `ValueError` が起きる場合、human 出力では理由を stderr に出し、JSON 出力ではエラー envelope を stdout に出します。通常の `OSError` / `ValueError` の終了コードは `2` です。
-- `--output` の値が不正、または値が欠落している場合は argparse が usage とエラーを stderr に表示し、終了コード `2` になります。
+- 不明または曖昧なプリセット参照は stderr に `strata: ...` を出し、終了コード `5` になります。`--output json` の場合は stderr ではなく、`ok:false` と `error.code` / `error.message` を含む JSON を stdout に出します（`terminal/strata_control/presets.py:243-256`; `terminal/strata_cli/tune_commands.py:109-114,527-530`）。
+- 出力先の書き込みに失敗した場合は `OSError` を捕捉し、同じ human/JSON エラー経路に入ります。終了コードは例外の `exit_code` 属性があればそれを使い、なければ `2` です（`terminal/strata_cli/tune_commands.py:517,529-530`）。
+- `--output` に許可されていない値を指定すると parser が拒否します（`terminal/strata_cli/tune_commands.py:59-61`）。usage 表示とその場合の終了コードは Python `argparse` の処理に委ねられており、この Strata 側ソースだけから個別の出力文面は確認できません。
 
 ## 根拠
 
-- `strata_cli/tune_commands.py:49-55` は `presets` の各サブコマンド共通 parser に `--output` の選択肢と既定値を定義し、`strata_cli/tune_commands.py:73-76` は `export` に `--file` を別途定義します。
-- `strata_cli/tune_commands.py:95-108` は human / JSON 成功出力と失敗出力の形式・終了コード返却を定義します。
-- `strata_cli/tune_commands.py:331-347` は export のファイル有無による処理分岐、JSON 直出力、`PresetError` / `OSError` / `ValueError` の捕捉を定義します。
-- `strata_control/presets.py:218-231` はプリセット検索方法と未検出・曖昧一致のエラーを定義し、`strata_control/presets.py:390-393` はエクスポート時に `active` 情報を除去します。
-- `strata_cli/cli.py:487-489` は `presets` parser をトップレベル CLI に登録し、`strata_cli/cli.py:2151-2152` は `presets` コマンドを `presets_command` へ委譲します。
+- `terminal/strata_cli/tune_commands.py:55-61,79-81` — `presets` 配下の共有 `--output` parser 定義と `export` の引数。
+- `terminal/strata_cli/tune_commands.py:472-476,514-531` — 出力モードの判定、export の stdout/file 分岐、例外処理。
+- `terminal/strata_cli/tune_commands.py:101-114` — 成功・失敗時の human/JSON 出力。
+- `terminal/strata_control/presets.py:243-256,417-420` — 参照の解決と export データ（`active` を除去）の生成。
+- `terminal/strata_cli/cli.py:514-515,2229-2230` — parser 登録と `presets_command` への dispatch。
+- 索引 `docs/cli/README.md:804-808` — `presets/export` の階層と `--output` の掲載。索引上の scope と現行 parser 定義は一致。

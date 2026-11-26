@@ -1,52 +1,45 @@
 # `STRATA_PYTHON`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありません。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata Terminal の `bin/strata`、`bin/strata.cmd`、`bin/strata.ps1` では、Python 実行ファイルの明示指定です。空でない指定は launcher の他の候補（同梱 Python、checkout の venv、PATH 上の Python）より優先されます。Strata App Host の Python resolver も `STRATA_PYTHON` を参照し、非空なら `STRATA_NATIVE_PYTHON` や Control 同梱 Python より優先します。
-
-この値は「Python のパス」として使われ、引数を含むコマンド文字列には対応していません。Terminal launcher の指定値については Python のバージョンを検査しません。3.10 以上という案内はありますが、明示指定値の最低バージョンを保証するチェックはありません。
+Strata Terminal の起動スクリプトと App Host の Python resolver 経由で、Strata の Python プログラムを実行する interpreter を明示指定する。Terminal の `terminal/bin/strata`、`terminal/bin/strata.cmd`、`terminal/bin/strata-direct.ps1` は、値が空でなければ自動選択より優先し、その Python で `strata.py` を起動する。App Host の `python-resolver.mjs` では `STRATA_NATIVE_PYTHON` より優先して Python 子プロセスの command に使う。ただし packaged Control の子プロセス環境からはこの変数が除かれ、native-control の packaged 経路は Control 同梱 Python を直接使う。指定 interpreter のバージョンや依存パッケージを一律に検査する設定ではない。 (根拠: `terminal/bin/strata:45-49,142-147`; `terminal/bin/strata.cmd:16-32,42-44`; `terminal/bin/strata-direct.ps1:27-35,55-59`; `app/host/server/python-resolver.mjs:33-43`; `app/host/server/control-runtime.mjs:88-107`; `app/host/server/native-control.mjs:195-201`)
 
 ## 値と判定
 
-| 読み取り経路 | unset / 空文字 | 非空値の判定・変換 | 無効値の結果 |
+| 読み取り経路 | 未設定または空文字 | 空でない値 | 値の検査 |
 |---|---|---|---|
-| POSIX `bin/strata` | `${STRATA_PYTHON:-}` と `-n` により unset と空文字は同じ。次の候補へ進む | 値全体を引用してパスとして使い、`-x` で実行可能か確認。数値変換やバージョン検査なし | 実行可能でなければ stderr に `strata: STRATA_PYTHON=<値> is not executable`、終了コード 5。指定が実行可能でも Python でなければ後続の実行に失敗し得る |
-| Windows `bin/strata.cmd` | `if defined STRATA_PYTHON` が真なら指定経路へ進む。空の環境値は未設定と区別されない扱い | 値全体を引用したパスとして `if not exist` で確認。実行可能性・Python バージョンは検査しない | パスが存在しなければ stderr に `strata: STRATA_PYTHON=<値> does not exist`、終了コード 5。存在しても Python でなければ実行時に失敗し得る |
-| Windows `bin/strata.ps1` | PowerShell の `if ($env:STRATA_PYTHON)` により unset と空文字は次の候補へ進む | `Test-Path -LiteralPath` でパスの存在を確認し、その文字列を実行コマンドに使う。実行可能性・Python バージョンは検査しない | パスが存在しなければ stderr に `strata: STRATA_PYTHON=<値> does not exist`、終了コード 5。存在しても Python でなければ実行時に失敗し得る |
-| App Host `resolvePython()` | JavaScript の `env.STRATA_PYTHON || env.STRATA_NATIVE_PYTHON` により unset と空文字は同様に扱い、後者または次候補へ進む | 非空文字列をそのまま `{ command: explicit, args: [] }` として選ぶ。パス存在、実行可能性、Python バージョンの事前検査なし | resolver は失敗を判定せず値を返す。実際の spawn が失敗する場合は呼び出し側でエラーになる |
-| `integrations/harness/tool_flow_e2e.py` | `os.environ.get("STRATA_PYTHON", sys.executable)` により unset のみ `sys.executable` に fallback。空文字は空文字のまま | `python -m serve.server ... --engine mock` の実行ファイル要素として渡す | 起動できなければ `subprocess.Popen` の起動失敗。これは E2E ツール内の読み取りで、通常の製品 launcher の選択規則ではない |
+| POSIX Terminal (`terminal/bin/strata`) | 同梱 Python、PATH 等の候補を探索 | 指定値を最優先し、通常の実行ビット確認または `-c 'pass'` の起動で使えるか確認 | ファイルであることと起動可能性のみ。Python バージョン確認はしない |
+| Windows cmd (`terminal/bin/strata.cmd`) | 同梱 runtime、venv、`py -3`、`python` の順に探索 | `if defined` で優先し、パスが存在すれば起動 | 存在確認のみ。Python バージョン確認はしない |
+| Windows PowerShell (`terminal/bin/strata-direct.ps1`) | 同梱 runtime、venv、`py -3`、`python` の順に探索 | PowerShell の truthy 判定で優先し、パスが存在すれば起動 | `Test-Path` の存在確認のみ。明示値は起動テスト・バージョン確認をしない |
+| App Host resolver (`app/host/server/python-resolver.mjs`) | `STRATA_NATIVE_PYTHON`、Control runtime、repo venv、OS 別候補へ進む | `env.STRATA_PYTHON || env.STRATA_NATIVE_PYTHON` の結果を command としてそのまま返す | 明示値の存在・起動・バージョン確認なし |
 
-POSIX launcher では有効な override があればそれを最優先します。なければ同梱 Python、続いて PATH や macOS の既知の配置場所にある Python 3.10 以上を探索します。Windows launcher の優先順は override、同梱 Python、checkout の `.venv`、`py -3`、`python` です。これらの fallback 候補には 3.10 以上の確認がありますが、明示 override にはありません（`bin/strata:31-73`, `bin/strata.cmd:16-32`, `bin/strata.ps1:25-46`）。
+Terminal の POSIX / PowerShell / resolver は空文字を「指定なし」と扱う。cmd は `if defined` で判定するため、空値を設定した状態は通常の cmd 環境では未定義と同じく自動探索へ進む。App Host の resolver は文字列を変換せず、空白だけの文字列も非空として採用する。明示値に対して `STRATA_PYTHON="0"`、`true`、`false` などの特別な意味はなく、各ラッパーが interpreter のパス・コマンドとして扱う。 (根拠: `terminal/bin/strata:45-49`; `terminal/bin/strata.cmd:16-32`; `terminal/bin/strata-direct.ps1:27-35`; `app/host/server/python-resolver.mjs:33-43`)
 
 ## 有効になる条件
 
-- `bin/strata`、`bin/strata.cmd` または `bin/strata.ps1` を通じて Terminal CLI を起動する場合に interpreter 選択へ使われます。CLI のサブコマンドによって優先順位は変わりません。
-- POSIX launcher の `serve` または `bench` では、選んだ interpreter に必要な Python packages があるか先に確認します。不足・probe 失敗時は stderr に `strata: the interpreter <PY> is missing packages the API server needs.` と pip install 案内を出して終了コード 5 です。その他の CLI ではこの probe を行いません（`bin/strata:102-126`）。
-- App Host の `resolvePython()` では、非空の `STRATA_PYTHON` が非空の `STRATA_NATIVE_PYTHON` に優先します。両方なければ Control 同梱 Python、repo venv、Windows の `py -3` / `python.exe`、または POSIX の Homebrew Python 3.11/3.10 / `python3` の順です（`apps/host/server/python-resolver.mjs:33-52`）。
-- Host の packaged Control を動かす環境は `controlEnvironment()` が `STRATA_PYTHON` と `STRATA_NATIVE_PYTHON` を削除してから作ります。したがって Host のプロセスで値を選択に使う経路と、Control 子プロセスの環境とは区別されます（`apps/host/server/control-runtime.mjs:88-103`）。
-- Source checkout の native-control は resolver で選んだ interpreter で MCP client、source server、auto-tuner、更新などの Python コマンドを起動します。ただし較正・tune job は resolver の結果を得た後、`command` を repo の venv Python に置き換えます。`STRATA_PYTHON` はその較正・tune 実行の interpreter 選択には効きません（`apps/host/server/native-control.mjs:55,98,102-110,387-390,408-414`）。
-- Host の `index.mjs` は起動時に `resolvePython({ repo, control })` を一度呼び、その結果を tune 関連の Python 設定として保持します。環境を書き換えてもこの設定は再評価されません。native-control の resolver は呼び出し時の env 値を cache key に含めるため、値が変われば別 key の選択になります（`apps/host/server/index.mjs:763-769,903-910`; `apps/host/server/python-resolver.mjs:31-55`）。
+- Terminal ラッパーを通じて起動すること。指定値が使える場合は同梱 runtime や PATH 上の Python より優先される。POSIX では指定先がファイルで起動可能である必要があり、失敗すると自動候補への fallback はせず、`strata: STRATA_PYTHON=... is not executable` を stderr に出して失敗する。Windows cmd / PowerShell は指定先の存在を確認し、存在しない場合は各々 `strata: STRATA_PYTHON=... does not exist` を stderr に出して終了コード 5 で終わる。 (根拠: `terminal/bin/strata:39-49`; `terminal/bin/strata.cmd:29-32,46-48`; `terminal/bin/strata-direct.ps1:30-34`)
+- Terminal の自動探索で使われる Python 3.10 以上の確認は PATH 等の候補に対するもので、明示指定した interpreter には適用されない。POSIX は `serve` / `bench` 起動時に必要パッケージを別途検査し、不足なら interpreter のパスを含む案内を stderr に出して終了コード 5 とする。 (根拠: `terminal/bin/strata:65-85,123-140`)
+- App Host の resolver では、非空の `STRATA_PYTHON` が `STRATA_NATIVE_PYTHON` に優先する。指定値が使われるのは resolver の呼び出し元がその戻り値で Python 子プロセスを起動する経路である。明示指定値が起動不能でも resolver は代替 interpreter を選び直さず、起動側で失敗する。 (根拠: `app/host/server/python-resolver.mjs:33-43`; 呼び出し例 `app/host/server/index.mjs:800-805`; `app/host/server/native-control.mjs:190-201`)
+- Packaged App Host の Control 子プロセスは `controlEnvironment` が子環境から `STRATA_PYTHON` と `STRATA_NATIVE_PYTHON` を除去する。packaged native-control 経路も `control.control.python` を使う。そのため、この環境変数は Control の子プロセス interpreter を差し替えない。 (根拠: `app/host/server/control-runtime.mjs:88-107`; `app/host/server/native-control.mjs:195-201`)
 
 ## 実行時の詳細
 
-POSIX launcher は非空の `STRATA_PYTHON` が実行可能かを確認してから選択し、override 選択時は private runtime 用の `PYTHONHOME` / `PYTHONPATH` 除去を行いません（同梱 runtime を選んだ場合だけ除去します）。その後、選択した interpreter で `strata.py` を `exec` します。CLI 引数はそのまま `strata.py` へ渡されます（`bin/strata:31-36,76-100,128-134`）。
+Terminal の各ラッパーは起動のたびに環境変数を読み、選んだ Python で `strata.py` と元の引数を実行する。POSIX は `exec "$PY" "$APP/strata.py" "$@"` でプロセスを置き換える。指定値がある場合、POSIX は起動確認として `-c 'pass'` を実行するが、その後にバージョンを照会しない。Windows cmd / PowerShell はパスの存在確認後に本体を起動する。 (根拠: `terminal/bin/strata:45-49,90-102,142-147`; `terminal/bin/strata.cmd:16-32,42-44`; `terminal/bin/strata-direct.ps1:27-59`)
 
-Windows launcher は override を指定した場合、bundled interpreter 選択時の `PYTHONHOME` / `PYTHONPATH` 除去を行わず、最終的に `strata.py` を起動します。cmd と PowerShell は起動時に `PYTHONUTF8=1` を設定します（`bin/strata.cmd:29-44`; `bin/strata.ps1:28-56`）。
+App Host resolver は `resolvePython()` の呼び出し時に環境値を参照し、選択結果を module-level `Map` に保存する。cache key に `STRATA_PYTHON`、`STRATA_NATIVE_PYTHON`、repo、Control interpreter、platform を含むため、同一 key では選択結果を再利用し、環境値が異なれば別 key になる。fallback 判定 (`source: 'fallback'`) は cache しない。App Host の server index は module 初期化時に一度 `resolvePython()` を呼んで `PYTHON` として保持する。一方 native-control の `python()` は呼び出し時に resolver を呼ぶ。実行中に環境を変えた場合、すでに保持した `PYTHON` には反映されず、後続 resolver 呼び出しは新しい値または該当 key の cache を使う。 (根拠: `app/host/server/python-resolver.mjs:31-56`; `app/host/server/index.mjs:800-805`; `app/host/server/native-control.mjs:190-201`)
 
-App Host の resolver は通常 `process.env` を入力にします。`index.mjs` の結果は Host 起動時の Python 選択に使われます。source native-control の resolver 結果は Python 子プロセス起動時に使われ、source server、MCP client、auto-tuner などは `{ ...process.env, ... }` の環境を渡すため `STRATA_PYTHON` も子プロセス環境に残ります。対して packaged Control の環境生成では同名を削除します（`apps/host/server/native-control.mjs:55,98,102-110,387-390`; `apps/host/server/control-runtime.mjs:88-103`）。
+## ログと測定値
 
-`integrations/harness/tool_flow_e2e.py` の読み取りは別経路です。この E2E tool flow は `STRATA_PYTHON` か `sys.executable` を使って mock server の子プロセスを開始します（`integrations/harness/tool_flow_e2e.py:58-66,406-420`）。
+POSIX Terminal は明示値を起動できない場合に stderr へ `strata: STRATA_PYTHON=<値> is not executable` を出す。Windows cmd は存在しない場合に `strata: STRATA_PYTHON=<値> does not exist`、PowerShell も同じ文言を出して終了コード 5 とする。指定 interpreter の起動後に発生する Python のエラーは通常の子プロセス出力・終了コードとしてラッパーから返る。App Host resolver 自体には明示値の妥当性を示すログはない。性能測定値は該当しない。 (根拠: `terminal/bin/strata:47-49`; `terminal/bin/strata.cmd:46-48`; `terminal/bin/strata-direct.ps1:30-34,58-59`; `app/host/server/python-resolver.mjs:33-43`)
 
 ## 根拠
 
-- Terminal POSIX launcher の優先順、override 判定、失敗、serve/bench probe、実行: `bin/strata:8-17,31-73,76-88,102-134`。
-- Windows cmd launcher の override と fallback、失敗・起動: `bin/strata.cmd:4-7,16-32,34-48`。
-- PowerShell launcher の override と fallback、失敗・起動: `bin/strata.ps1:1-7,25-56`。
-- App Host resolver の優先順位・cache・fallback: `apps/host/server/python-resolver.mjs:31-57`。
-- Host 起動時の resolver と用途: `apps/host/server/index.mjs:763-769,903-910`。
-- Source native-control の resolver 呼び出し、Python child process、較正/tune における venv 上書き: `apps/host/server/native-control.mjs:55,98-110,387-390,408-414`。
-- Packaged Control 子プロセス向け環境からの削除: `apps/host/server/control-runtime.mjs:88-103`。
-- 同梱 E2E harness の独立した読み取り: `integrations/harness/tool_flow_e2e.py:58-66,406-420`。
-- 候補一覧: `docs/envvars/000_envvers.md:1344`。候補名だけでは通常利用時の読み取りを保証しない。
+- `terminal/bin/strata:39-49,90-102,123-147` — POSIX の設定値判定、失敗時出力、子プロセス起動。
+- `terminal/bin/strata.cmd:16-32,42-48` — Windows cmd の優先順位、存在確認、起動・失敗処理。
+- `terminal/bin/strata-direct.ps1:27-59` — PowerShell の優先順位、存在確認、起動・失敗処理。
+- `app/host/server/python-resolver.mjs:31-56` — App Host の値選択、優先順位、cache。
+- `app/host/server/index.mjs:800-805` — server index 初期化時の resolver 呼び出し。
+- `app/host/server/native-control.mjs:190-201` — source / packaged native-control の interpreter 選択と子環境。
+- `app/host/server/control-runtime.mjs:88-107` — Control 子環境から本変数を除去。

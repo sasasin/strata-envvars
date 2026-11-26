@@ -1,59 +1,60 @@
 # `--tokens-file`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 調査）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | ネイティブ推論エンジン `strata`（root parser） |
-| オプション | `--tokens-file PATH` |
+| コマンド | `strata`（推論エンジン、root 引数） |
+| オプション | `--tokens-file` |
 | 別名 | なし |
-| 値 | 事前 token 化された prompt ID を格納したファイルへのパス |
+| 値 | トークン ID を記したファイルのパス |
 
 ## 役割
 
-トークナイザーを持たない engine に、prompt を token ID の列として渡します。`--tokens` の直接指定に代わる入力経路です。ファイル全体を読み込み、ID の列として解析します。parser の help にもカンマまたは空白区切りと記載されています（`src/program/generate.cpp:806-813`）。
+トークナイズ済みプロンプトをファイルから読み込み、`--tokens` で直接渡す場合と同じトークン列として推論エンジンに渡します。長い ID 列をコマンドライン引数に載せずに渡したい場合に使えます。parser はファイルを読み取って `Options::tokens` に格納し、後続の prefill がその配列を入力にします。
 
 ## 使い方
 
 ```sh
-strata --pack <pack-dir> --native <model-shard-1.gguf> \
-  --ple-gguf <PLE-shard.gguf> --tokens-file prompt.ids --max-new 16
+# prompt.ids にトークン ID を保存しておき、pack を使って生成する
+strata generate --pack pack/full --tokens-file prompt.ids --max-new 128
 ```
 
-`<...>` は実際の pack / model のパスに置き換えます。`prompt.ids` は、使用モデルに対応する tokenizer で事前に作った token ID 列です。engine は `Options::tokens` に prompt として保持し、prompt 処理と後続生成に用います（`src/program/generate.cpp:418-423, 2424-2443, 7122-7123, 15850-15855`）。
+ファイル内の例:
+
+```text
+248045, 123 456
+```
 
 ## 値と既定値
 
-- `PATH` は次の argv 要素から取得されます。値を省略すると `--tokens-file needs a value` を stderr に出して終了コード 2 で終了します（`src/program/generate.cpp:2416-2421, 2432-2435`）。
-- ファイル内容は全量メモリーに読み込まれます。カンマを空白に置き換えたうえで、空白区切りの各要素を整数として解析します。空白だけの区切りとカンマ区切りを混在できます（`src/program/generate.cpp:2434-2439, 1097-1114`）。
-- 各 ID は 0〜2,147,483,647 の範囲です。負数、整数でない要素、範囲外の値、要素なしの空ファイルは受け付けません。NUL byte を含むファイルも拒否されますが、この経路ではエラー詳細文字列は空です。形式エラーは `malformed token file: ...` を stderr に出し、終了コード 2 になります（`src/program/generate.cpp:1097-1114, 2439-2441`）。
-- この option の既定値はありません。`--tokens` または `--tokens-file` のいずれか一方が必要です（`src/program/generate.cpp:2426-2443, 3168-3179`）。
-- `--max-new` の既定値は 16、`--max-context` の既定値は 4096 です。prompt ID 数と生成数の合計が `--max-context` に収まらないとエラーになります（`src/program/generate.cpp:418-423, 3302-3310, 3970-3973`）。
+- `PATH` は必須です。値を省略すると parser 共通の `--tokens-file needs a value` を stderr に出して終了コード 2 で終了します。
+- ファイル内容は符号付き 32 bit 整数として解釈できる非負 ID（`0`〜`2147483647`）の列です。カンマまたは空白類（空白、タブ、改行、復帰、垂直タブ、フォームフィード）で区切れます。空のファイルや区切りだけのファイルは受理されません。
+- 既定のファイルパスやトークン列はありません。`--tokens` と `--tokens-file` は同時に指定できず、どちらかのトークン入力を複数回指定すると `supply one token input only` を stderr に出して終了コード 2 になります。
 
 ## 実行時の動作
 
-parser はファイルを読み取り専用で開きます。開けない場合は `cannot open token file`、読み込み時に stream error が発生した場合は `cannot read token file` を stderr に出し、どちらも終了コード 2 で終了します。ファイルへの書き込みや削除は行いません（`src/program/generate.cpp:2432-2441`）。
+parser は指定されたパスを `std::ifstream` で開き、ファイル全体を文字列に読み込みます。開けない場合は `cannot open token file`、読み取り状態が失敗した場合は `cannot read token file` を stderr に出して終了コード 2 になります。内容に NUL バイトがある場合、数値列として解析できない場合、または列が空の場合は `malformed token file: ...` を stderr に出して終了コード 2 になります。
 
-`--tokens` と `--tokens-file` は共通の `have_tokens` 判定で排他です。どちらを先に指定しても、2つ目の token 入力で `supply one token input only` を stderr に出して終了コード 2 になります。各 option は1回だけ指定できます（`src/program/generate.cpp:2426-2443`）。
+受理後の ID 列は `Options::tokens` に入り、prefill に渡され、プロンプト先頭の ID はデコード開始時のトークンとしても使われます。入力ファイル自体を書き換える処理はこのオプションの parser にはありません。通常の生成ではトークン入力が必要ですが、`--serve` でトークン入力を省略した場合はリクエスト用の既定値を別経路で設定します。`--tokens-file` を指定した場合はその入力が使われます。
 
-読み込んだ配列は prompt の各位置で参照され、最終的に標準出力の `prompt  :` 行にも ID として表示されます（`src/program/generate.cpp:7122-7123, 15850-15855, 16867-16872`）。ID から文字列への tokenizer 処理はこの CLI では行いません（`src/program/generate.cpp:10-13`）。
+プロンプト長は `--max-new` と合わせて `--max-context` に収まる必要があります。収まらない場合は `strata generate: --max-context ... cannot hold ...` を stderr に出し、終了コード 2 で拒否されます。このオプション単独ではモデル固有の ID 範囲までは検査せず、ここで確認した parser は共通の `int32` 非負範囲を検査します。
 
 ## 適用条件と副作用
 
-この文書は `strata-engine/root` の通常 parser に対する説明です。`--serve` の要求 prompt は標準入力上の `GEN <max_new> <id,id,...>` で別途渡されるため、`--tokens-file` の内容が各 serve request に使われるわけではありません（`src/program/generate.cpp:7497-7518`）。通常 parser では、serve 時に明示的な token 入力がなければ内部の初期値 `{248045}` を置きます（`src/program/generate.cpp:3168-3172`）。
-
-Qwen3.6 family の model を `--native` / `--model` で指定すると、通常 parser の処理前に専用 `qwen35::run` parser へ振り分けられます。その parser に `--tokens-file` の分岐はありません。serve 時は未知 option として警告して値を読み飛ばし、非 serve 時は usage を出して終了コード 2 となります。Qwen3.6 の token 入力は別形式の `--tokens` です（`src/program/generate.cpp:2393-2408`; `src/qwen35/q36_engine.cu:3742-3795`）。
+このオプションは `strata-engine` の root 引数に属します。CUDA/HIP 系の `engine/src/program/generate.cpp` と SYCL 系の `engine/sycl/src/program/generate.cpp` の両 parser に実装されています。トークン列をファイルから読み込むため、プロンプトの長さがコマンドライン引数のサイズ制限に左右されにくくなります。読み込み時にファイル全体をメモリ上の文字列に置く実装ですが、ソース上にこの読み込みのサイズ上限はありません。
 
 ## 出力とエラー
 
-この option 固有の成功メッセージはありません。token 入力・ファイル読込・内容解析・prompt と context の不整合によるエラーは stderr に出て終了コード 2 になります。ファイルを開けない、または内容が読めないときの診断は上記の通りです。unknown option は `unknown argument: ...` と usage を stderr に出して終了コード 2 です（`src/program/generate.cpp:2787-2792`）。正常終了時は標準出力に prompt ID と生成 ID を出力します（`src/program/generate.cpp:16867-16875`）。
+このオプションの引数・ファイル・内容のエラーは stderr に出力され、終了コードは 2 です。ファイル読み込み後、prompt と生成長が context に収まらない場合も終了コード 2 です。prefill 自体が失敗した場合はエラーメッセージを stderr に出して終了コード 1 になります。
 
 ## 根拠
 
-- parser help と option 宣言: `src/program/generate.cpp:806-813, 418-423`
-- PATH 取得、ファイル読込、重複指定と形式検証: `src/program/generate.cpp:2416-2443`
-- ID 列の区切り・範囲・空入力 validation: `src/program/generate.cpp:1097-1114`
-- token 入力必須条件、serve 既定入力、prompt/context 上限: `src/program/generate.cpp:3168-3179, 3302-3310, 3970-3973`
-- prompt と出力での利用: `src/program/generate.cpp:7122-7123, 15850-15855, 16867-16875`
-- family dispatch と Qwen3.6 専用 parser: `src/program/generate.cpp:2393-2408`; `src/qwen35/q36_engine.cu:3742-3795`
+- `engine/src/program/generate.cpp:1210-1214` — usage と「カンマまたは空白区切りのトークン列」「`--tokens` の代替」という説明。
+- `engine/src/program/generate.cpp:1554-1581` — 区切り文字、整数変換、非負 `int32` 範囲、空入力の検査。
+- `engine/src/program/generate.cpp:3839-3869` — root parser、重複入力の拒否、ファイルの open/read、NUL・書式検査とエラー経路。
+- `engine/src/program/generate.cpp:4996-5006` — 通常実行でトークン入力を要求し、serve で入力がない場合は別途既定値を設定する経路。
+- `engine/src/program/generate.cpp:6152-6155` — prompt と生成長が context に収まるかの検査。
+- `engine/src/program/generate.cpp:10714-10715, 24164-24166` — `Options::tokens` のプロンプト開始位置と prefill への入力利用、prefill 失敗時の出力と終了コード。
+- `engine/sycl/src/program/generate.cpp:802-806, 1053-1070, 1890-1908, 2504-2514, 2636-2639, 3276-3279, 13385-13387` — SYCL parser と同等の受理・検査・実行経路。

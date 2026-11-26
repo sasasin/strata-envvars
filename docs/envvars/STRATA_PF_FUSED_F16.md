@@ -1,44 +1,60 @@
 # `STRATA_PF_FUSED_F16`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の native fused prompt-expert kernel で、256-thread kernel の整数 int8 積を F16 行列積に切り替える opt-in です。F16 積は FP32 accumulator に加算されます。実装資料は出力が丸めレベルで変化すると説明しています。値を有効にすると `STRATA_PF_FUSED_NT=256` を別途指定しなくても 256-thread 経路が要求されます（`src/prefill/moe_fused_iq.cu:1714-1722`）。
+CUDA の fused native prompt-expert 経路で、NT=256 カーネルの積和を int8 積から F16 積へ切り替える opt-in です。重みとスケール、および activation とスケールを F16 にして `m16n8k16` の F16 積を FP32 accumulator に加算します。ソースは出力が丸めレベルで変化すると記載しています。対象は NT=256 の形式であり、warp-specialized (`STRATA_PF_FUSED_WS`) を選ぶスイッチではありません（`engine/src/prefill/moe_fused_iq.cu:822-831, 3252-3269`）。
 
-この変数だけでは fused prompt-expert 経路そのものは有効になりません。通常の fused 経路の選択条件、native pack の形式、対象デバイスが先に適合する必要があります。
+環境変数の値だけで全レイヤーがこの計算に切り替わるわけではありません。prompt 側が native fused 経路を選択し、デバイスで当該カーネル群のセットアップが成功した場合に使われます（`engine/src/prefill/prefill.cpp:5698-5704, 5793-5841`）。HIP ビルドにはこの読み取りと F16 NT=256 経路はなく、読み取り元は CUDA 専用コード内です（`engine/src/prefill/moe_fused_iq.cu:2702-2711, 2777-2809`）。同ファイルは Qwen3.6 用の `moe_fused_iq_q36.cu` からも include されます（`engine/src/prefill/moe_fused_iq_q36.cu:1-4, 36`）。
 
 ## 値と判定
 
-| 環境値 | 判定 | 結果 |
-|---|---|---|
-| 未設定 | 無効 | F16 版を要求しない |
-| 空文字 | 無効 | `getenv` は非 null だが先頭文字が `'1'` ではない |
-| 先頭文字が `1` | 有効 | `1`, `10`, `1anything` など。文字列全体の parse はしない |
-| その他 | 無効 | `0`, `true`, ` 1` など |
+| 条件（build / 経路） | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA の `moe_fused_iq.cu`（および同ファイルを include する Qwen3.6 版） | F16要求は false。NT=256 は別途 `STRATA_PF_FUSED_NT=256` が要求しない限り設定しない | 値の先頭1文字が `1`。例: `1`, `10`, `1anything` | 空文字、`0`, `true`, ` 1`, `2`, `01`。文字列全体の parse や数値検証はせず、先頭1文字だけを比較する |
+| HIP ビルド | 読み取りなし | 該当なし | 該当なし |
 
-比較は大文字小文字を区別する先頭 1 文字との比較です。数値変換、範囲検査、無効値の警告や fallback はありません。判定は `f16c_requested()` の function-local `static const bool` に保存されます。また 256-thread 有効性とデバイス情報も cache されるため、最初の判定後にプロセス環境を変えても再評価されません。CLI 引数や設定ファイルによる上書きはこの読み取り箇所にはありません（`src/prefill/moe_fused_iq.cu:1716-1722,1771-1777`）。
+`std::getenv` の結果が非 null で、かつ `v[0] == '1'` のときだけ要求扱いです。空文字は設定済みでも無効です。大文字小文字や後続文字は判定せず、`1` で始まれば受理します。関数内 `static const bool` に初回結果を保存するため、同プロセスでその関数が初めて呼ばれた後に環境を変更しても反映されません（`engine/src/prefill/moe_fused_iq.cu:2777-2785`）。
+
+`STRATA_PF_FUSED_NT` との関係では、`nt256_requested()` がこの変数または `STRATA_PF_FUSED_NT` の `atoi(...) == 256` を見て NT=256 のセットアップを要求します。したがって F16 指定は NT=256 を暗黙に要求します。両方指定した場合も F16 判定が true ならセットアップと launch は F16 形式を選びます。一方、F16 が無効で NT=256 だけが有効なら通常の int8 NT=256 形式です（`engine/src/prefill/moe_fused_iq.cu:2779-2809, 3007-3015, 3260-3269`）。
 
 ## 有効になる条件
 
-- CUDA build であること。HIP の `dev_info()` は HIP 用 device 情報を設定した後に return し、CUDA 専用の `nt256_requested()` / `setup_nt()` に進みません。F16 launch も `#if !defined(__HIPCC__)` の中です（`src/prefill/moe_fused_iq.cu:1782-1807,1837-1845,1933-1942`）。
-- CUDA compute capability 8.0 以上であること。7.5 以下は 256-thread setup 判定より前に return し、コメント上も F16 経路は sm_80+ のみです（`src/prefill/moe_fused_iq.cu:1817-1830,228-231`）。
-- その GPU 上で必要な F16 版 native kernel 群の attribute 設定と occupancy 判定がすべて成功すること。失敗時は `occ_nt` が 0 のままとなり、stderr に `prefill fused experts (native): STRATA_PF_FUSED_NT=256 is not available here` を出します。この文言は `_F16` が要求された場合にも同じです。WS kernel も使えない場合、基礎の native fused kernel が利用可能なら通常の int8 native kernel に進みます（`src/prefill/moe_fused_iq.cu:1701-1711,1837-1845,2113-2138`）。
-- native fused prompt-expert がその層で選ばれること。呼び出し元は `stream_all`、peer device 不使用、native layout、Hadamard folded gate/up・down なし、MMQ plan 対象か fused-only 対象、対応形式などを確認します。層やチャンクがこの経路を取らなければ本変数の F16 kernel は使われません（`src/prefill/prefill.cpp:4192-4205,4217-4223`）。
-- `STRATA_PF_FUSED_WS=1` による warp-specialized kernel が setup 済みの場合はそちらを先に launch します。WS が選ばれない wide 経路では、`STRATA_PF_FUSED_F16` が有効なら F16 版を起動し、無効なら 256-thread int8 版を起動します（`src/prefill/moe_fused_iq.cu:1926-1942,2154-2172`）。
+- CUDA ビルドであること。HIP の同名ソースにも他の prompt kernel はありますが、この F16 要求コードは CUDA 条件内で、F16 NT=256 経路は HIP にありません（`engine/src/prefill/moe_fused_iq.cu:2702-2711, 2803-2810`）。
+- デバイスの compute capability が sm_80 以上であること。sm_80 未満は通常の NT=256 セットアップ箇所に到達しません。Turing (sm_75) 用 setup は先に return するため、この変数では F16 カーネルを有効にしません（`engine/src/prefill/moe_fused_iq.cu:2887-2905, 3007-3015`）。
+- build が `STRATA_PF_WIDE_PARAMS` を有効にできること。CUDA の nvcc が 12.1 未満なら WideBatch の大きな kernel parameter を理由に無効化され、`setup_nt()` は false を返します（`engine/src/prefill/moe_fused_iq.cu:2693-2700, 2803-2809`）。
+- ベースの native kernel がデバイス上で setup でき、対象すべての NT=256 カーネルについて関数属性、共有メモリ属性、occupancy の setup が通ること。F16 用 setup は共有 memory と occupancy も確認します（`engine/src/prefill/moe_fused_iq.cu:2745-2764, 3007-3015`）。
+- モデルの対象レイヤーが prompt 側の native fused 条件を満たすこと。`use_mmq || fused_only`、stream-all、peer 不使用、native expert layout、folded layer の対応条件、および `native_supported()` を満たさないと、この経路自体を選びません。`STRATA_PF_FUSED` などによる `native_supported()` の拒否もここに含まれます（`engine/src/prefill/prefill.cpp:5692-5704`; `engine/src/prefill/moe_fused_iq.cu:3415-3432`）。
+- F16 NT=256 kernel 群のいずれかが setup に失敗すると `d.occ_nt` は 0 になり、NT=256 利用可の条件を満たしません。標準の native 512-thread path に留まる場合があり、F16 での実行は保証されません（`engine/src/prefill/moe_fused_iq.cu:3007-3015, 3854-3863`）。
+- `STRATA_PF_BATCH` は複数 expert を一度に launch する上限を変え、128 を超える wide batch を選ぶ条件に関係しますが、F16 積和を選ぶ値ではありません。これが wide batch 条件を満たさなくても `Batch` overload は NT=256 が setup 済みなら `WideBatch` overload へ転送します（`engine/src/prefill/prefill.cpp:5784-5794`; `engine/src/prefill/moe_fused_iq.cu:3854-3863`）。
 
 ## 実行時の詳細
 
-`dev_info()` は device ごとの `DevInfo` を初回に初期化し、`done` を立てた後はその情報を再利用します。CUDA sm_80+ では `nt256_requested()` が `_F16` の値を含めて 256-thread 経路を要求し、`setup_nt()` は F16 値が有効なら各 native kernel type の F16 template を attribute / shared-memory / occupancy 検査します。どれか一つでも失敗すれば `occ_nt` を無効にします。その場合も WS が利用可能なら WS を使い、WS も無効なら後続の native fused 呼び出しは通常の int8 kernel に進みます（`src/prefill/moe_fused_iq.cu:1771-1777,1837-1851,1701-1711,1736-1738,2113-2138`）。
+`f16c_requested()` は関数内 static に判定を保持します。`dev_info()` もデバイスごとの `done` フラグで初回 setup 結果を保持します。F16 が要求されると `nt256_requested()` により NT=256 のカーネル群を setup し、`setup_nt()` は F16 template (`F16=true`) の occupancy を調べます（`engine/src/prefill/moe_fused_iq.cu:2779-2809, 2847-2853, 3007-3015`）。
 
-実行時は prompt layer の native fused path が expert kernels を呼び、F16 が有効で WS が選ばれていなければ F16 template を起動します。F16 kernel はデコードした重みと activation を F16 にし、16 要素単位の F16 products を FP32 accumulators に積算します（`src/prefill/moe_fused_iq.cu:557-561,1933-1942,2143-2172`）。fused prompt path が実際に選ばれた場合、呼び出し元は一度だけ stderr に `strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)` と出します。これは F16 選択を個別に示すログではありません（`src/prefill/prefill.cpp:4252-4257`）。
+実際の prompt 処理では `native_supported()` を通ったレイヤーが `experts_native()` に入ります。NT=256 が setup 済みなら、Batch overload も WideBatch overload に移し、CUDA launch が `f16c_requested()` に従って F16 template を実行します（`engine/src/prefill/prefill.cpp:5698-5704, 5830-5841`; `engine/src/prefill/moe_fused_iq.cu:3252-3269, 3854-3863, 3954-3990`）。
 
-既定の unset 状態は F16 無効です。無効値を理由とした警告はありません。kernel setup 失敗時は前記 stderr ログが出て、`occ_nt` が無効になります。実装資料は F16 経路で出力が丸めレベルで変化すると記載し、著者測定として CMP 170HX の MoE 1 layer / 3,256 tokens で 7.90 ms を挙げています。この値は Strata 内の今回の調査で測定したものではありません（`docs/DETAILS.md:1535-1544`）。
+NT=256 の F16 形式は重み・activation のスケール適用後の F16 値を積算するため、丸め挙動が int8 形式と異なります。これは F16 重みを使う別カーネルの選択ではなく、NT=256 native kernel 内の積演算形式の変更です（`engine/src/prefill/moe_fused_iq.cu:827-831`）。
+
+## ログと測定値
+
+NT=256 のセットアップに失敗した場合、デバイス情報の初期化で stderr に次の行を出します（F16 の無効値や unset だけでは出ません。デバイスが `d.ok` で、NT=256 が要求され、セットアップ全体が失敗した場合です）。
+
+```text
+prefill fused experts (native): STRATA_PF_FUSED_NT=256 is not available here
+```
+
+この失敗時、NT=256 専用経路は利用可能と扱われず、F16 の積和で処理されるとは限りません（`engine/src/prefill/moe_fused_iq.cu:3007-3015, 3854-3863`）。
+
+`docs/DETAILS.md` は変更著者による CMP 170HX（GA100、70 SMs）での報告として、Qwen3.8-Flash-Next IQ3_S native pack の同一レイヤーで F16 variant 7.90 ms と記録しています。計測条件の概要は同資料の直前にあり、Strata 側では測定していないと明記されています。そこでは F16 が bitwise base と丸めレベルで異なる設定の一つで、20 prompts の teacher-forced KL 平均 0.0062、top-1 agreement 100% とも報告されています。これらは資料中の著者報告であり、この調査で再測定した結果ではありません（`docs/DETAILS.md:1804-1806, 1815-1824`）。
 
 ## 根拠
 
-- 唯一の本番環境読み取りと cache、256-thread 要求への連動: `src/prefill/moe_fused_iq.cu:1714-1722`。
-- CUDA/HIP・GPU世代ごとの初期化と kernel setup、失敗ログ: `src/prefill/moe_fused_iq.cu:1771-1845`。
-- F16 template の内容と launch 分岐: `src/prefill/moe_fused_iq.cu:557-561,1926-1942,2143-2172`。
-- 呼び出し元の native fused 経路と観測ログ: `src/prefill/prefill.cpp:4192-4205,4217-4223,4252-4257`。
-- 測定条件を含む既存資料: `docs/DETAILS.md:1535-1544`。
+- 値の判定と `STRATA_PF_FUSED_NT` への接続: `engine/src/prefill/moe_fused_iq.cu:2777-2809`
+- sm_80 以上、wide parameter build macro とセットアップ結果: `engine/src/prefill/moe_fused_iq.cu:2693-2700, 2887-2905, 3007-3015`
+- F16 積和の形式: `engine/src/prefill/moe_fused_iq.cu:822-831, 3252-3269`
+- prompt 経路の選択と呼び出し: `engine/src/prefill/prefill.cpp:5692-5704, 5784-5794, 5830-5841`
+- 設定失敗時のログと Batch から WideBatch への転送: `engine/src/prefill/moe_fused_iq.cu:3007-3015, 3854-3863`
+- 同じ実装の Qwen3.6 用 include: `engine/src/prefill/moe_fused_iq_q36.cu:1-4, 36`
+- 測定値の出典と条件: `docs/DETAILS.md:1804-1806, 1815-1824`

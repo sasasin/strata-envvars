@@ -1,63 +1,62 @@
-# `strata-hy4-sycl --vram-experts-gb`
+# `--vram-experts-gb`
 
-調査対象: Strata commit `b394b71292adf278b410d120592c773ba178e648`（2026-11-23 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
-| ツール ID | `strata-hy4-sycl` |
-| コマンド | `strata-hy4-sycl`（トップレベル） |
+| ツール ID | `strata-hy4` |
+| コマンド | `strata-hy4-sycl` |
 | オプション | `--vram-experts-gb` |
 | 別名 | なし |
-| 値 | 浮動小数点数として `atof` で読み取る GiB 値 |
+| 値 | 数値を1つ取る。実装は `double` に変換し、非負値を VRAM 予算として扱う。単位換算は 1 GiB = 1,073,741,824 bytes。 |
 
 ## 役割
 
-HY4-SYCL runner が expert cache に割り当てる GPU メモリ予算を指定する。単体実行では主 GPU の VRAM expert cache の上限として使われ、複数 GPU を指定した場合は同じ正数値が各 peer GPU の上限にも個別に渡される。指定がない場合や負数の場合は環境変数または空き容量から自動決定する（`engine/src/hy4flash/sycl/sy_graph.h:127-150`）。
+Hy4-Flash の Section 4 expert のうち、rank 順で選ばれるものを VRAM キャッシュへ置くための予算を指定する。残りの expert は RAM、さらに RAM 予算を超えた分は cold SSD tier に振り分けられる。単一プロンプト実行と `--serve` の両方で同じ配置処理に渡される（`engine/src/hy4flash/sycl/sy_main.cpp:103,140,226-248,298-307`、`engine/src/hy4flash/sycl/sy_serve.h:280-285`、`engine/src/hy4flash/sycl/sy_graph.h:118-123,155-200`）。
 
 ## 使い方
 
 ```sh
-# 単体実行で expert cache 予算を 4 GiB に設定
-strata-hy4-sycl --native model.strata --tokens tokens.txt --vram-experts-gb 4
+# SYCL エンジンでモデルを起動し、expert 用 VRAM 予算を 8 GiB に指定
+strata-hy4-sycl --native model.strata --vram-experts-gb 8
 
-# server モードでも同じ予算を設定
-strata-hy4-sycl --serve --native model.strata --vram-experts-gb 4
+# engine line protocol の serve 起動でも同じ配置予算を指定
+strata-hy4-sycl --serve --native model.strata --vram-experts-gb 8
 ```
+
+`--native` は parser 上で `--model` と同じモデル引数です（`engine/src/hy4flash/sycl/sy_main.cpp:130`）。
 
 ## 値と既定値
 
-- 値は `atof` で `double` に変換される。パーサーには数値形式・正値・上限を検証する処理がなく、無効な文字列は `atof` の結果（通常 `0`）として扱われる。重複指定時は後の値が前の値を上書きする（`engine/src/hy4flash/sycl/sy_main.cpp:107-115,140-141`）。
-- 既定値は `-1.0`。負数は明示的な予算には使われず、自動決定分岐へ進む（`engine/src/hy4flash/sycl/sy_main.cpp:103,140`、`engine/src/hy4flash/sycl/sy_graph.h:127-139`）。
-- 値は GiB を `1073741824` バイトとして変換される。主 GPU では `0` は VRAM cache の予算 0 となる。cache 初期化は少なくとも全レイヤー分の slot 容量がない場合に正常終了し、cache を無効化する（`engine/src/hy4flash/sycl/sy_graph.h:129-141`、`engine/src/hy4flash/sycl/sy_vram_cache.h:723-725`）。
-- オプションの値を省略すると `nxt()` が `ERR --vram-experts-gb needs a value` を stdout に出し、終了コード 2 で終了する（`engine/src/hy4flash/sycl/sy_main.cpp:109-115,140`）。
+値は `atof` で `double` に変換され、構文や数値範囲を検査する専用 validation はありません。数値に変換できない文字列は `atof` の変換結果（通常 0）として扱われます。オプションを複数回指定すると、引数走査中に同じ変数へ代入されるため最後の指定が残ります。値を省略した場合は `nxt()` が `ERR --vram-experts-gb needs a value` を stdout に出し、終了コード 2 で終了します（`engine/src/hy4flash/sycl/sy_main.cpp:103,109-115,140`）。
+
+初期値は `-1.0` です。負値は直接 VRAM 予算にせず、後述する環境変数または自動算出へ進みます。`0` は明示的なゼロ予算となり、主 GPU の expert cache は無効になります。正数は `値 × 1,073,741,824` bytes に変換されます（`engine/src/hy4flash/sycl/sy_graph.h:127-141`）。
 
 ## 実行時の動作
 
-parser は値を `vram_experts_gb` に格納し、server モードでは `ServeOpts` にコピーする。通常の単体実行と server のどちらも `setup_experts_unified` に渡され、主 GPU の expert cache の予算を決める（`engine/src/hy4flash/sycl/sy_main.cpp:140,226-248,298-305`、`engine/src/hy4flash/sycl/sy_serve.h:28-37,280-285`）。
+引数値が 0 以上なら `HY4S_VRAM_EXPERTS_GB` より優先して使います。引数が負値または未指定なら、環境変数が存在する場合はその値を `atof` で読み、正値だけを予算にします。環境変数が存在しない場合は主 GPU の global memory の 94% を上限候補にし、すでに割り当て済みの device memory と呼び出し側の予約分を差し引きます。残りが 256 MiB を超えなければ予算は 0 です（`engine/src/hy4flash/sycl/sy_graph.h:127-141`）。環境変数の説明は [`HY4S_VRAM_EXPERTS_GB`](../../../envvars/HY4S_VRAM_EXPERTS_GB.md) を参照してください。
 
-- 値が `>= 0` の場合、主 GPU 予算を指定値（GiB）にする。
-- 値が負数で `HY4S_VRAM_EXPERTS_GB` が設定されている場合、その環境変数を `atof` で読み、正数ならその値を使用し、0 以下なら予算 0 にする。
-- 引数が負数で環境変数も未設定なら、GPU 全メモリの 94% を安全上限とし、既割当量と呼び出し元の予約量を差し引く。残りがその合計より 256 MiB を超えない場合、予算は 0 のままになる。
-- 予算から workspace と expert slot 容量を差し引き、可能な slot 数を最大 1.4 GiB の slab 単位で確保する。実際の割当てが失敗した場合は、それまでに確保できた slab 数に留まる。slot が確保できると rank 順に expert データを読み込む（`engine/src/hy4flash/sycl/sy_vram_cache.h:728-750,752-798`）。
-- `--gpus` / `--devices` 等で peer GPU があるとき、引数が正数ならその値を**各 peer GPU ごと**の予算として使う。0 または負数の場合は peer GPU ごとに自動予算（全メモリの 90% から workspace と 256 MiB を控除）になる。このため `--vram-experts-gb 0` は主 GPU cache を止める一方、peer GPU cache を自動予算にする場合がある（`engine/src/hy4flash/sycl/sy_graph.h:144-152`、`engine/src/hy4flash/sycl/sy_peer.h:182-186,231-259`）。
+算出予算は `SyVramExpertCache::init` に渡されます。最大 expert body サイズを 4 KiB 境界に丸めた slot が 41 個分に満たない予算、または slot サイズ 0 の場合、キャッシュを有効化せず正常に戻ります。それ以上でも workspace 分を引いた残額から格納 slot 数を決め、rank 順に expert body を device memory へ読み込みます。割り当て可能な device memory が要求数に届かない場合は、確保できた slab 分で続行します（`engine/src/hy4flash/sycl/sy_vram_cache.h:691-750,776-798`）。
+
+`--gpus` / `--devices` で peer GPU が指定されている場合、正の CLI 引数値は各 peer にも同じ値の予算として個別に渡されます。そのため複数 GPU 全体の合計上限ではありません。CLI 引数が 0 または負値なら peer GPU は各デバイスの global memory の 90% から workspace と 256 MiB を差し引く自動予算を使います。この peer 側の分岐は環境変数ではなく CLI 引数を見ており、たとえば CLI 引数が負値で `HY4S_VRAM_EXPERTS_GB` が正値でも、主 GPU と peer GPU では異なる予算決定経路になります（`engine/src/hy4flash/sycl/sy_graph.h:144-152`、`engine/src/hy4flash/sycl/sy_peer.h:182-186,231-255`）。
+
+キャッシュに載った expert は VRAM に置かれ、残りは rank 順に RAM 予算へ入り、RAM を超えた expert は cold SSD 側へ割り当てられます。起動後の配置数・容量は `[experts] unified pool` の stderr ログに表示されます。キャッシュが有効な場合は `[vram-cache]` に slot 数・slab 数・device bytes も出力されます（`engine/src/hy4flash/sycl/sy_graph.h:173-200,229-235`、`engine/src/hy4flash/sycl/sy_vram_cache.h:795-798`）。
 
 ## 適用条件と副作用
 
-この値は SYCL 版 `strata-hy4-sycl` の parser に属する。通常実行ではモデルのロード・初期化後に expert 配置を行い、server 経路でも server 初期化後に同じ配置関数を呼ぶ（`engine/src/hy4flash/sycl/sy_main.cpp:255-264,294-305`、`engine/src/hy4flash/sycl/sy_serve.h:267-285`）。cache の slab は GPU メモリに確保され、選択した expert 重みをファイルから読み込む。指定予算を超えて割り当てる保証はなく、GPU メモリ確保が失敗すれば部分的な slot 数になる（`engine/src/hy4flash/sycl/sy_vram_cache.h:736-750,769-798`）。
+このオプションは `strata-hy4-sycl` の parser にある設定です。単一実行はモデルと runner の初期化後、expert pool の構築に使います。`--serve` 経路も trunk/KV/DFly2 を割り当てた後に同じ helper を呼びます。したがって自動予算は、実行モードごとの呼び出し時点で既に使用中の GPU memory を差し引きます（`engine/src/hy4flash/sycl/sy_main.cpp:298-307`、`engine/src/hy4flash/sycl/sy_serve.h:280-285`）。
+
+主 GPU キャッシュを増やすほど、その分の expert を RAM / cold SSD へ配置せず device memory に保持します。値が小さく cache slot 条件を満たさない場合は VRAM expert cache を使わず、expert は後段の配置対象になります。GPU 数、モデルの expert body サイズ、残りの device memory により実際の slot 数は指定値と一致しないことがあります（`engine/src/hy4flash/sycl/sy_vram_cache.h:723-750`）。
 
 ## 出力とエラー
 
-- 主 GPU cache の初期化が成功して slot がある場合、stderr に `[vram-cache] ...` の slot 数、slab 数、実割当 GiB などを出力する。予算不足で cache が無効化された場合、この初期化ログは出ない（`engine/src/hy4flash/sycl/sy_vram_cache.h:723-725,750,796-798`）。
-- expert 配置関数が失敗した場合、単体実行は stderr に `experts: <理由>` を出して終了コード 1、server はプロトコル出力に `ERR experts: <理由>` を出して終了コード 1（`engine/src/hy4flash/sycl/sy_main.cpp:304-306`、`engine/src/hy4flash/sycl/sy_serve.h:283-285`）。
-- 確認したソースでは、数値が不正な場合に専用の validation error を出す経路は見つからなかった。`atof` の詳細な受理規則は C ライブラリ側の仕様となるため、本調査では Strata の独自挙動として扱わない。
+この値自体に対する範囲エラーや警告は実装されていません。expert cache / pool の構築に失敗した場合、通常実行では `experts: <詳細>` を stderr に出して終了コード 1、`--serve` では `ERR experts: <詳細>` を protocol 出力して終了コード 1 になります（`engine/src/hy4flash/sycl/sy_main.cpp:304-307`、`engine/src/hy4flash/sycl/sy_serve.h:283-285`）。
 
 ## 根拠
 
-- `engine/src/hy4flash/sycl/sy_main.cpp:103-115,140` — 既定値、値の読み取り、値省略時のエラー。
-- `engine/src/hy4flash/sycl/sy_main.cpp:226-248,298-309` — server 設定への転送と通常実行での expert 配置呼び出し。
-- `engine/src/hy4flash/sycl/sy_serve.h:28-37,280-288` — server オプション保持と配置処理の呼び出し。
-- `engine/src/hy4flash/sycl/sy_graph.h:123-153` — 引数・環境変数・GPU空き容量による予算決定、および peer GPU への予算転送。
-- `engine/src/hy4flash/sycl/sy_vram_cache.h:690-798` — cache 初期化、予算不足時の無効化、GPU slab 確保、expert 読み込みとログ。
-- `engine/src/hy4flash/sycl/sy_peer.h:182-259,286-364` — peer ごとの予算と自動算出、割当て、失敗経路。
-
-環境変数 `HY4S_VRAM_EXPERTS_GB` の専用調査文書は、文書リポジトリで確認できなかった。
+- `engine/src/hy4flash/sycl/sy_main.cpp:103,109-115,140`: 既定値、引数の値取得・変換、値省略時の出力と終了。
+- `engine/src/hy4flash/sycl/sy_main.cpp:226-248,298-307`: `--serve` への値引き渡し、単一実行で helper を呼ぶ箇所と失敗処理。
+- `engine/src/hy4flash/sycl/sy_serve.h:280-285`: serve 側での expert pool 構築と失敗出力。
+- `engine/src/hy4flash/sycl/sy_graph.h:127-152,155-200,229-235`: CLI・環境変数・自動値の優先順位、peer GPU への予算、RAM / cold SSD への振り分け、配置ログ。
+- `engine/src/hy4flash/sycl/sy_vram_cache.h:691-798`: cache の閾値、slot / slab 確保、expert 読み込みと cache ログ。
+- `engine/src/hy4flash/sycl/sy_peer.h:182-186,231-255`: peer GPU の自動予算と明示予算の適用。

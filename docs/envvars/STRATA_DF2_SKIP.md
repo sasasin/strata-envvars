@@ -1,47 +1,50 @@
 # `STRATA_DF2_SKIP`
 
-調査対象: Strata `main` の HEAD `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-DFlash2 drafter の context 更新や block 推論の一部を省きます。ソースコメントは計測用途としています。対象名をカンマ区切りで渡す例は `attn,head,ctx,mlp,qkvo` ですが、実装はカンマ区切りの解析をせず、環境変数全体から処理ラベルを部分文字列検索します。
+これは DFlash2 drafter の処理段階を省略する計測用フックです。`skip_part()` が指定名を含む値を見つけると、DFlash2 の context 更新や draft block の一部計算を実行しません。コメントにも measurement only とあり、通常の推論品質を保つ設定ではありません。DFlash2 の候補生成だけに作用し、対象モデルの重みや検証側の計算を切り替えるものではありません（`engine/src/core/dflash2.cpp:142-146,514-537,539-618`）。
 
 ## 値と判定
 
-`skip_part(what)` は、最初に呼ばれた時点で `getenv("STRATA_DF2_SKIP")` の値を `static const std::string` に保存し、空でなく、保存した文字列に `what` が含まれていれば `true` を返します。
+`skip_part()` の初回呼び出し時に `std::getenv` の結果を関数内 `static const std::string` に一度コピーし、以後はその文字列に対する大文字小文字を区別する部分文字列検索 `list.find(what)` を使います。カンマ区切りの解析、真偽値変換、空白除去、数値変換はありません。したがって、空文字と未設定はどちらも何も省略せず、値に対象名がどこかに含まれていれば有効です（`engine/src/core/dflash2.cpp:143-146`）。
 
-| 環境変数 | 判定 |
+| 値に含まれる文字列 | 省略する段階 |
 |---|---|
-| 未設定 | 空文字列として扱い、何も省かない |
-| 明示的な空文字列 | 未設定と同じ |
-| `attn` | `attn` の処理を省く |
-| `attn,head` | `attn` と `head` の処理を省く |
-| `small` | `small` とラベルが完全に一致する省略対象処理を省く |
-| `ATTN` | 大文字小文字を区別するため `attn` には一致しない |
-| 任意の文字列 | その文字列に処理ラベルが部分文字列として含まれる場合だけ該当処理を省く。数値変換や値の妥当性検査はない |
+| `ctx` | DFlash2 の context 更新全体（`record_context` の処理） |
+| `attn` | 各 block の attention 計算 |
+| `head` | DFlash2 draft head の logits 計算 |
+| `mlp` | gate/up および down projection の GEMM |
+| `qkvo` | q/k/v projection と o projection の GEMM |
+| `tiny` | attention/MLP convolution の kernel projection GEMM |
+| `small` | convolution、norm、RoPE、SwiGLU を含む補助処理 |
 
-たとえば `xattny` も `attn` に一致します。`,` は区切り文字として特別扱いされません。評価結果は最初の呼び出しでキャッシュされるため、その後プロセス内で環境を書き換えても反映されません。初回呼び出しが DFlash2 の context 記録か block 記録かによって読み取り時点が決まり、要求ごとには読み直しません。
+実際の判定対象は各行の文字列全体でなく部分文字列です。たとえば `attn`、`0attn`、`attn,head` は `attn` 段階を省略し、`ATTN`、`true`、`false`、`0`、空文字はどの段階名も含まないため省略しません。`small` と `tiny` も実装上の判定名ですが、コメントに示された例の一覧にはありません（`engine/src/core/dflash2.cpp:142-146,557-584`）。
 
 ## 有効になる条件
 
-- DFlash2 drafter を含む CUDA または HIP ビルドである必要があります。CMake は `STRATA_ENABLE_CUDA` または `STRATA_ENABLE_HIP` のとき DFlash2 を含め、Metal と SYCL のビルドには含めません。
-- 実行時に `--draft dflash2` を選び、必要な `--mtp`、native pack、`--spec 2` 以上、`--draft-model PACK` などの条件を満たす必要があります。この経路は単一 GPU の CLI 実行向けで、`--serve`、`--batch`、複数 GPU / layer split では選択されません。
-- verifier が taps を保持できず DFlash2 を使えない場合、または bind / graph prepare に失敗した場合は MTP drafter に切り替わります。その場合 `skip_part()` の呼び出しは実行されません。
-- 判定は profiling 専用モードに限定されていません。環境変数が設定され、DFlash2 が使われる経路では、通常の DFlash2 実行でも同じ省略が適用されます。
+- 実行ファイルに `Dflash2Drafter` が組み込まれ、DFlash2 の `record_context()` または `record_block()` が実行される必要があります。通常の MTP 経路では参照されません（`engine/src/core/dflash2.cpp:514-537,539-618,1170-1208`; `engine/src/program/generate.cpp:8152-8154`）。
+- 共通実装 `engine/src/core/dflash2.cpp` は CUDA/HIP の engine と SYCL engine に組み込まれ、split engine でも DFlash2 target が作られると同じ実装が使われます（`engine/sycl/CMakeLists.txt:297-301`; `engine/src/split/CMakeLists.txt:104-114`）。Metal の独立した DFlash2 実装にはこの `skip_part()` の読み取り箇所がありません。
+- `STRATA_DF2_PROFILE=1` の計測経路でも `record_context()` / `record_block()` が直接呼ばれるため、この省略判定は有効です。`STRATA_DF2_PROFILE` 自体は別の設定です（`engine/src/core/dflash2.cpp:296,1170-1208`）。
+- CLI 引数や別の環境変数による `STRATA_DF2_SKIP` の上書きは、この読み取り箇所にはありません。DFlash2 が起動しない経路ではこの変数は使われません。
 
 ## 実行時の詳細
 
-`ctx` は `record_context()` の冒頭で一致すると関数を成功扱いで返し、DFlash2 の context 表現と K/V ring 更新を省きます。block 側では、`tiny` が attention / MLP の動的畳み込み用 projection、`small` が畳み込み・正規化・量子化など、`qkvo` が Q/K/V/O projection、`attn` が attention、`mlp` が gate/up/down projection、`head` が draft head の行列積を省きます。各スキップ対象の後に置かれた profiler の `stamp()` は呼ばれますが、該当する計算処理は実行されません。
+値は `skip_part()` が初めて呼ばれた時点でキャッシュされます。通常は初回 DFlash2 draft の graph capture 中、または `STRATA_DF2_PROFILE=1` の最初の直接実行中です。その後にプロセス環境を変更しても、このキャッシュ値は更新されません。全 DFlash2 drafter インスタンスがこの翻訳単位の同じ static 値を参照します（`engine/src/core/dflash2.cpp:143-146,621-655,1174-1208`）。
 
-これらの処理は、後続段の入力や最終的な draft token / 確率の計算に使われます。したがって省略は drafter の候補を通常と異なるものにし得ます。生成ループは DFlash2 の draft を verifier に渡してから次の round の候補を作りますが、この環境変数自体が通常のモデル出力を保つ保証はありません。計測用として使い、通常の推論品質や処理時間を表す設定として解釈しないでください。
+段階を省略しても後続処理は一律には止まりません。たとえば `ctx` は `record_context()` を直ちに成功で返し、context 由来の K/V 更新をしません。一方 `head` は head logits 計算だけを飛ばした後も `df2_topk()` と selector を実行します。`attn`、`mlp`、`qkvo`、`tiny`、`small` も各段階の処理だけを条件付きで飛ばし、その後の処理と graph capture は続きます。したがって、これらの指定はモデル計算の一部を欠いた draft 候補・確率を生み得る診断用操作であり、通常の DFlash2 出力と同等とは扱えません（`engine/src/core/dflash2.cpp:514-537,539-618`）。
 
-値の読み取りや処理省略について、この変数固有のログはありません。ソースコメントは計測用としていますが、`docs/DETAILS.md` に本変数の具体的な説明や測定値は見つかりませんでした。
+この関数自体は値の検証、警告、失敗返却を行いません。変数に一致したかどうかの専用ログもありません。計測イベントは省略分岐の前後で引き続き stamp されます。別途 profile が有効なら終了時に `strata dflash2 profile (%lld rounds, ms per round, total %.3f):` から始まる段階別時間が stderr に出ますが、値や省略理由は表示しません（`engine/src/core/dflash2.cpp:148-178,557-618`; `engine/src/core/dflash2.cpp:42-43`）。
+
+## ログと測定値
+
+`STRATA_DF2_SKIP` 専用のログ・警告・終了経路はありません。コメントは、指定した計算段階を省いて graph の GPU 時間を読めるようにする意図を示しますが、この変数に関する測定値は `docs/DETAILS.md` で確認できません（`engine/src/core/dflash2.cpp:142-146`; `docs/DETAILS.md:1237,1591-1595`）。
 
 ## 根拠
 
-- `src/core/dflash2.cpp:77-80` — 値の読み取り、static cache、部分文字列判定。`src/core/dflash2.cpp:346-349` — `ctx` のスキップ。
-- `src/core/dflash2.cpp:392-424` — `tiny`、`small`、`qkvo`、`attn`、`mlp`、`head` の各スキップ箇所と処理。
-- `CMakeLists.txt:335-340` — DFlash2 が CUDA / HIP ビルドに含まれる条件。
-- `src/program/generate.cpp:5474-5482,16148-16165` — DFlash2 の選択条件と MTP への切替。
-- `src/program/generate.cpp:16494-16503` — DFlash2 の draft が生成ループに渡される箇所。
-- `include/strata/core/dflash2.hpp:3-16,54-59` — Drafter の処理概要と context / draft API。
+- `engine/src/core/dflash2.cpp:142-146` — 値の読み取り、初回キャッシュ、部分文字列判定。
+- `engine/src/core/dflash2.cpp:514-537,539-618` — `ctx` および block 内各段階の省略対象と後続処理。
+- `engine/src/core/dflash2.cpp:621-655,1170-1208` — graph capture と profile 直接実行からの呼び出し。
+- `engine/sycl/CMakeLists.txt:297-301`; `engine/src/split/CMakeLists.txt:104-114` — 共通実装を含む build target。
+- `docs/DETAILS.md:1237,1591-1595` — DFlash2 関連資料の確認箇所。本変数の説明・測定値はなし。

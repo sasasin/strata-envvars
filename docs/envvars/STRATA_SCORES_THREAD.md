@@ -1,48 +1,51 @@
 # `STRATA_SCORES_THREAD`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-QSA の prompt block score 計算で、warp 単位の scorer の代わりに thread-per-head（HIP の実装コメントでは four-lanes-per-query）kernel を選びます。CUDA では active block 数が指定された prompt 呼び出し、HIP ではさらに GPU 世代・live block 数・query 数の条件を満たす呼び出しに適用されます。decode の `active_blocks <= 0` 経路はこの切替判定を通りません。
-
-ソースコメントと `docs/DETAILS.md` は、置き換え先と bitwise 同じ score を計算すると説明しています。実行条件を満たさない呼び出しは通常の warp scorer に進みます。
+QSA のプロンプト処理で使う block score kernel を、既存の warp scorer から thread-per-head scorer に切り替える。CUDA では `qsa_block_scores` の `active_blocks > 0` の呼び出しで選択され、HIP では実際の有効 block 数・query 数・GPU 世代も満たした場合に選択される。切替先は通常 scorer と同じ score bits を作る実装として記述されている。decode など `active_blocks` を渡さない呼び出しにはこの切替条件が成立しない（`engine/src/kernels/cuda/qsa_select.cu:2152-2154,2261-2275`、呼び出し元 `engine/src/prefill/prefill.cpp:9445-9457`、`engine/src/core/layer.cpp:1277-1280`）。
 
 ## 値と判定
 
-| ビルド | unset | 設定時 | 空文字・不正文字列 |
+| ビルド経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
 |---|---|---|---|
-| CUDA | Turing（compute capability 7.5）では `STRATA_SM75_PERF` が非ゼロなら有効。それ以外は無効 | `atoi(value) != 0` なら有効。0 は無効 | `atoi` の結果で判定。空文字や数字で始まらない文字列は 0。先頭空白や符号の後の数値は変換され、数値以降の文字列は全体検査されない |
-| HIP | gfx12 では有効、gfx1100 およびその他では無効 | `atoi(value) == 1` のときだけ明示的な有効値。その他は無効 | `atoi` の結果が厳密に 1 かで判定。空文字・数字で始まらない値・`2` は無効。`1x` は 1 として扱われる |
+| CUDA (`!__HIPCC__`) | `-1` 相当。Turing は `STRATA_SM75_PERF` に従い、Volta は `STRATA_SM70_PERF` / `STRATA_DEFAULTS` に従う。それ以外は off。 | `std::atoi` の結果が 0 以外。例: `1`, `2`, `-1`, `1tail`, ` 1` | `std::atoi` の結果が 0。例: `0`, `0anything`, `true`, 空文字、数字で始まらない文字列 |
+| HIP (`__HIPCC__`) | `-1`。gfx12 では候補、gfx1100 では off | `std::atoi` の結果がちょうど 1。例: `1`, `01`, `1tail`, ` 1` | `std::atoi` の結果が 1 以外。例: `0`, `2`, `-1`, `true`, 空文字 |
 
-CUDA の設定値は「1 との一致」ではなく、`atoi` の結果が非ゼロかで判断されます（例: `2` は有効）。HIP は `atoi` の結果が厳密に 1 かで判断されます。いずれも文字列の大文字小文字比較はしません。
+どちらも文字列全体の妥当性を検査しない。先頭の空白や符号を `atoi` が処理し、数値部分より後ろの文字は判定に使われない。設定された空文字は `atoi("") == 0` となるため無効。CUDA は 0 以外を on と扱う一方、HIP はちょうど 1 だけを on と扱う（`engine/src/kernels/cuda/qsa_select.cu:2164-2166,2233-2237`）。
 
 ## 有効になる条件
 
-- **CUDA**: QSA block scorer が `active_blocks > 0` で呼ばれ、環境判定が有効であること。明示した非ゼロ値は GPU 世代を問わずこの scorer を選択可能にします。unset 時の既定 ON は Turing（CC 7.5）かつ `STRATA_SM75_PERF` が `atoi` で非ゼロの場合に限られます。
-- **HIP**: `active_blocks >= 16385`、`active_blocks <= max_blocks`、`nq >= 64` であり、GPU が gfx12 であるか、`STRATA_SCORES_THREAD` が明示的に 1 と判定されて GPU が gfx1100 であること。gfx12 は unset でも候補になります。gfx1100 は unset では有効になりません。
-- HIP の GPU 判定は device 名から gfx12 / gfx1100 を確認します。その他の GPU では有効値を設定してもこの kernel に切り替わりません。
-- QSA scorer の上位経路が tensor-core scorer を選んだ場合はこの block scorer に到達しません。たとえば prefill は `qsa_block_scores_tc` が成功すると `qsa_block_scores` を呼びません。CUDA の `STRATA_SELECT_OLD` は通常その tensor-core scorer を迂回する条件の一つです。
-- `active_blocks <= 0` かつ複数 query の通常経路では、`qsa_block_scores` 内の別の multi scorer が先に選ばれます。したがって CUDA の任意 GPU opt-in は、この早期分岐を迂回して全呼び出しに適用されるものではありません。
+- **CUDA:** `qsa_block_scores` が `active_blocks > 0` で呼ばれること。値を明示した場合、`atoi` が 0 以外なら GPU 世代による追加制限なしに thread scorer を選ぶ。未設定なら現在の device の compute capability をキャッシュして判定し、Turing (sm_75) は `STRATA_SM75_PERF` が `atoi` で非ゼロ、Volta (sm_70) は `STRATA_SM70_PERF` が未設定または先頭文字が `0` 以外で、かつ `STRATA_DEFAULTS` が文字列 `026` と完全一致しない場合に on。それ以外の世代では off（`engine/src/kernels/cuda/qsa_select.cu:2155-2176`、`engine/include/strata/core/sm75_series.hpp:24-37`）。
+- CUDA の通常起動時、GPU が同一世代の Volta で `STRATA_SM70_PERF` が先頭 `0` でなく、`STRATA_DEFAULTS` が未設定または `026` / `0.2.6` / `v0.2.6` のいずれとも一致しない場合、engine の NV defaults は未設定の `STRATA_SCORES_THREAD` に `1` を設定する。既に設定済みなら値を保持する。混在世代 GPU ではこの NV defaults 適用をスキップする（`engine/src/core/nv_defaults.cpp:136-163,222-233`、`engine/src/program/generate.cpp:4428-4453`、`engine/include/strata/core/defaults_026.hpp:21-29`）。
+- **CUDA の既定値上の差:** `STRATA_DEFAULTS=0.2.6` または `v0.2.6` は NV defaults の Volta 表を抑止するが、`scores_thread_on()` 自体が見るのは文字列 `026` との完全一致だけ。そのためこの二つの別名では、`STRATA_SCORES_THREAD` が未設定かつ `STRATA_SM70_PERF` が無効指定でなければ、Volta fallback は on になる（同上）。
+- **HIP:** `active_blocks` が `16385` 以上かつ `max_blocks` 以下、`nq >= 64` であること。さらに gfx12 は unset または `atoi` が 1、gfx1100 は明示値の `atoi` が 1 の場合に限り on。別の AMD GPU 世代はこの分岐の対象外。確保済み `max_blocks` だけでは足りず、引数 `active_blocks` 自体が閾値以上である必要がある（`engine/src/kernels/cuda/qsa_select.cu:1283-1297,2233-2240`）。
+- CUDA/HIP とも、`active_blocks <= 0` かつ `nq <= MQ` の呼び出しは先行する multi/rows/halve 経路へ進み、この変数の分岐に到達しない（`engine/src/kernels/cuda/qsa_select.cu:2201-2229`）。
+- CLI 引数による直接の上書きはこの判定箇所にはない。関係する他変数は CUDA の未設定時既定値を選ぶ `STRATA_SM75_PERF`、`STRATA_SM70_PERF`、`STRATA_DEFAULTS` と、HIP で診断行を出す `STRATA_SCORES_THREAD_TRACE`。
 
 ## 実行時の詳細
 
-値は `qsa_block_scores` 内の関数ローカル static で初回評価時に保存されます。CUDA は `scores_thread_on()` の static 値として、HIP は `thread_env` としてキャッシュするため、判定後に同じプロセス内で環境値を変更しても再評価されません。未設定時の CUDA Turing 既定は `sm75_default()` に委譲され、これは CC 7.5 と `STRATA_SM75_PERF` の `atoi(value) != 0` の両方を要求します。
+`scores_thread_on()`（CUDA）または `qsa_block_scores` 内の HIP 分岐で環境変数を関数ローカル `static` として初回に読み、その値を以後の呼び出しでも使う。CUDA は未設定時の GPU ごとの既定判定も `ok[dev]` に保存する。HIP の arch 判定は現在の device ごとに host thread local cache を持つ。したがって初回評価後にプロセス環境を変更しても、この値判定には反映されない（`engine/src/kernels/cuda/qsa_select.cu:2164-2176,2233-2237,1283-1297`）。
 
-HIP で実際に切り替わると、`block_scores_thread_kernel` に続けて `block_scores_tail_kernel` を起動します。CUDA も同じ2 kernel を起動します。起動エラー時は stderr に `qsa exact thread: <CUDA error>`（HIP）または `qsa_block_scores thread: <CUDA error>`（CUDA）を出し、プロセスを終了します。
+thread scorer を選ぶと `block_scores_thread_kernel` を起動し、末尾 block は別途 `block_scores_tail_kernel` で処理する。CUDA で起動時エラーがあれば `qsa_block_scores thread: ...` を stderr に出して `exit(1)`。HIP では `qsa exact thread: ...` を出して `exit(1)`。選ばれないときは通常の `block_scores_kernel` へ進む（`engine/src/kernels/cuda/qsa_select.cu:2248-2277`）。
 
-HIP は一 host thread あたり一度だけ利用ログを出せます。環境変数が unset の gfx12 既定動作では TRACE 未設定でもログを出し、明示設定時は `STRATA_SCORES_THREAD_TRACE` が設定されているときに限ります。TRACE は設定有無だけで判定され、空文字でも設定扱いです。ログ文字列は `qsa exact thread: the prompt's block scorer runs as the four-lanes-per-query kernel ...` です。CUDA のこの切替箇所には利用ログがありません。
+## ログと測定値
 
-## 文書と測定値
+HIP の thread scorer が実際に選ばれたとき、`STRATA_SCORES_THREAD_TRACE` が設定されているか、設定変数が unset 由来の既定 on なら stderr に次の行を出す（各 host thread につき一度）。TRACE は値の内容ではなく設定有無で判定するため、空文字でも行が出る。明示的な `STRATA_SCORES_THREAD=1` で TRACE が unset の場合は抑制される（`engine/src/kernels/cuda/qsa_select.cu:2241-2246`）。
 
-`docs/DETAILS.md` は CUDA Turing の thread-per-head scorer を説明し、Tesla P100 の 30–60K token 条件で prompt speed +1–3% と報告しています。HIP の `docs/AMD_HIP.md` は gfx12 を既定 ON、gfx1100 を opt-in とし、R9700 上の測定・比較条件を記載しています。これらは資料に記された機種・条件での結果であり、他の機種や prompt での性能を示すものではありません。
+```text
+qsa exact thread: the prompt's block scorer runs as the four-lanes-per-query kernel (nq=%lld active_blocks=%lld capacity=%lld; the same scores bit for bit; STRATA_SCORES_THREAD=0 turns it off)
+```
+
+CUDA にはこの kernel の選択だけを知らせるログはない。ソースコメントは gfx12 の R9700 上で warp scorer と bitwise equal と記し、parity の 35 cases と 70K / 131K token の exact residual dumps、および scorer stage 3.6–4.4x・prompt read +8–15% という測定結果も記載する。ただしコメントだけでは OS、モデル、量子化、測定回数などの全条件を特定できないため、これらの数値は一般的な性能保証として扱わない（`engine/src/kernels/cuda/qsa_select.cu:1279-1282`）。
 
 ## 根拠
 
-- `src/kernels/cuda/qsa_select.cu:1219-1237` — HIP 対象 GPU の分類（gfx12 / gfx1100）。
-- `src/kernels/cuda/qsa_select.cu:1676-1691` — CUDA の値判定と Turing 既定条件。
-- `include/strata/core/sm75_series.hpp:24-37` — `STRATA_SM75_PERF` の読み取り・既定条件。
-- `src/kernels/cuda/qsa_select.cu:1709-1793` — 早期分岐、CUDA/HIP の有効条件、kernel 選択とエラー処理。
-- `src/prefill/prefill.cpp:3150-3162` — prompt 経路の active block 算出、tensor-core scorer からの fallback。
-- `CMakeLists.txt:405-418,455-460` — parity test が環境値を設定する箇所（本番挙動の根拠ではなく、テスト専用設定）。
-- `docs/DETAILS.md:2244-2257`, `docs/AMD_HIP.md:307-319` — Strata 資料の適用説明と測定条件。
+- CUDA/HIP の値の変換と dispatch: `engine/src/kernels/cuda/qsa_select.cu:2164-2176,2231-2277`
+- HIP の対象 GPU 判定・cache: `engine/src/kernels/cuda/qsa_select.cu:1283-1297`
+- prompt から live bound 付きで呼ぶ箇所: `engine/src/prefill/prefill.cpp:9445-9457`
+- QSA 切替 kernel の実装: `engine/src/kernels/cuda/qsa_select.cu:1211-1277,1316-1360`
+- Volta の既定挿入: `engine/src/core/nv_defaults.cpp:136-163,222-233`; 初期化呼び出し: `engine/src/program/generate.cpp:4428-4453`
+
+`docs/AMD_HIP.md:352-366` の gfx1100 / gfx12 の説明は現行 HIP 分岐の主な閾値と整合する。ただし同資料は `STRATA_SCORES_THREAD_TRACE=1` と記載する一方、実装は値 `1` の比較ではなく設定有無でログを出す。また、同資料の gfx1100 対象が `=1` の場合に限る点は一致する。`docs/DETAILS.md:1336-1344` は Turing 向け `STRATA_SM75_PERF=1` の系列を説明し、現行 CUDA の未設定時 fallback と整合する。

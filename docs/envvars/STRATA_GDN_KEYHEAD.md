@@ -1,50 +1,50 @@
 # `STRATA_GDN_KEYHEAD`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Gated DeltaNet (GDN) prefill recurrence で、1つの key head を共有する value head 群をまとめて計算する `gdn_rec_kh_kernel` を選ぶ制御です。対象コードは CUDA と SYCL にあります。CUDA では環境変数が未設定ならデバイスの compute capability と occupancy から自動選択し、この変数でその選択を抑止できます。SYCL では opt-in で、値が `1` と parse されたときだけ選びます。
+GDN prefill の recurrence kernel を、従来の列分割 kernel `gdn_rec_cols_pipe_kernel` から key-head kernel `gdn_rec_kh_kernel` に切り替えるかを制御する。CUDA では適格性を満たせば通常 dispatch で key-head を使い、`STRATA_GDN_KEYHEAD=0` で抑止する。SYCL では `=1` の明示指定が必要で、それ以外は従来 kernel を使う。CUDA と SYCL で環境変数の既定判定が異なる（CUDA: `engine/src/prefill/kernels.cu:966-982`、SYCL: `engine/sycl/src/prefill/kernels.dp.cpp:1334-1339`）。
 
-このカーネルは GDN recurrence の代替実装です。環境変数を設定しても、GDN prefill が実行されない場合や、より優先される経路が選ばれた場合には影響しません。
+この切替は recurrence kernel の選択に限られる。通常経路では後続の出力正規化は引き続き実行され、両 kernel は同じ bit を保つ設計とソースコメントに記されている（CUDA: `engine/src/prefill/kernels.cu:826-835, 3254-3278`、SYCL: `engine/sycl/src/prefill/kernels.dp.cpp:1100-1109, 2893-2938`）。
 
 ## 値と判定
 
-両 backend とも `std::atoi` を使い、文字列全体の比較や厳密な数値 parse はしません。先頭の空白と符号を含む `atoi` の変換規則に従い、数値以降の文字列は無視されます。未設定、空文字、数値に変換できない文字列は `atoi` の結果が 0 です。
+両実装とも `std::getenv` の文字列を `std::atoi` で変換し、関数内 `static` に一度だけ保存する。文字列全体の妥当性検査はなく、`atoi` が読む数値接頭辞で判定する。したがって `1tail` は 1、`0tail` は 0、空文字・`true`・数値で始まらない文字列は 0 になる。先頭の空白や符号も `atoi` の変換対象。未設定は `nullptr` として扱う（CUDA: `engine/src/prefill/kernels.cu:966-968`、SYCL: `engine/sycl/src/prefill/kernels.dp.cpp:1334-1338`）。
 
-| 設定値 | CUDA | SYCL |
-| --- | --- | --- |
-| 未設定、空文字、`abc`、`0`、`00`、`0tail` | 自動選択を許す | 選択しない |
-| `1`、`01`、`1tail` | 自動選択を許す | 選択する |
-| `2`、`-1`、`2tail` | 自動選択を許す | 選択しない |
+| backend / 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+| --- | --- | --- | --- |
+| CUDA、通常 dispatch | key-head を適格 GPU で許可 | `1`, `2`, `true`, `1tail`（変換結果が 0 以外） | `0`, 空文字, `false`, `0tail`（変換結果が 0） |
+| SYCL、通常 dispatch | 無効 | `1`, `1tail`, `1.0`（変換結果がちょうど 1） | `0`, `2`, 空文字, `true`, `2tail`（変換結果が 1 でない） |
 
-CUDA は `atoi(v) == 0` のときだけ明示的な抑止フラグを立てます。したがって非ゼロ値はカーネルを強制する指定ではなく、ハードウェア適格性の自動判定を残す指定です。SYCL は `atoi(v) == 1` のときだけ有効にします。
+これは単独の CLI 引数や設定値ではない。該当コードに CLI 引数・設定ファイルによる上書きはない。`STRATA_GDN_PIPELINE` は別の条件として作用し、CUDA/SYCL とも unset または `atoi` 結果が非 0 の場合に pipeline 経路を許可する（CUDA: `engine/src/prefill/kernels.cu:3188`、SYCL: `engine/sycl/src/prefill/kernels.dp.cpp:2888`）。
 
 ## 有効になる条件
 
-- **CUDA**: `STRATA_GDN_KEYHEAD` が 0 と parse されず、現在の GPU で compute capability major が 8 以上、かつ `cudaOccupancyMaxActiveBlocksPerMultiprocessor` が返す常駐可能 block 数と SM 数の積が `HK * NCB` 以上である必要があります。条件を満たさなければ、値が非ゼロでも key-head kernel は選ばれません。現在の device を取得できない場合や device index が 64 以上の場合も選択しません。
-- **SYCL**: 値が `atoi(...) == 1` であることが必要です。SYCL 側では CUDA の SM 数・occupancy 判定は行いません。
-- **両 backend**: `STRATA_GDN_REC_HEADS` が設定されると serial recurrence 経路が選ばれ、key-head の選択を通りません。値そのものは判定されず、空文字や `0` でも「設定済み」です。また `T <= 0` のときも通常の recurrence variant では serial 側の分岐を通ります。
-- **CUDA**: `STRATA_GDN_CHUNKED` が非ゼロで、長さ条件と scratch allocation などを満たして chunked recurrence が成功した場合は、その経路が先に選ばれ、key-head kernel は使いません。chunked 経路が使われない場合、`STRATA_GDN_PIPELINE` が未設定または `atoi(...) != 0` なら pipeline 経路に入り、そこではじめて key-head 判定が行われます。pipeline が無効なら通常の column recurrence を選びます。
-- **SYCL**: `STRATA_GDN_PIPELINE` が未設定または `atoi(...) != 0` のときに限り key-head 判定を行います。0 と parse される場合は key-head kernel を含む pipeline 経路を使いません。
-- HIP 用ビルドでは `gdn_keyhead_ok` とその呼び出しが `!defined(__HIPCC__)` 側にあるため、この変数は HIP の recurrence variant を選びません。
+- **CUDA:** `__HIPCC__` ではない CUDA dispatch の通常経路であること。`STRATA_GDN_KEYHEAD` が unset または `atoi` 結果が非 0 で、実行中 GPU の compute capability major が 8 以上、occupancy API が成功し、`per_sm * SM数 >= HK * NCB`（全 64 block を同時に resident にできる）を満たす必要がある。GPU 属性取得・occupancy の失敗、CUDA device の取得失敗、device index が 0–63 の範囲外なら不適格となる（`engine/src/prefill/kernels.cu:969-982`）。
+- **SYCL:** `__HIPCC__` ではない SYCL 実装で、`STRATA_GDN_KEYHEAD` の `atoi` 結果がちょうど 1、かつ `STRATA_GDN_PIPELINE` が有効であること。コード上、この opt-in に CUDA の occupancy 判定はない（`engine/sycl/src/prefill/kernels.dp.cpp:1334-1339, 2888-2907`）。
+- **SYCL Xe (`xe`):** `detail::gdn_xe_launch` が key-head 判定より先に呼ばれるため、この環境変数では切り替わらない（`engine/sycl/src/prefill/kernels.dp.cpp:2887-2893`）。
+- **両 backend:** fused / serial / 診断 variant など recurrence dispatch の別分岐に入る場合は key-head 判定に到達しない。CUDA の `STRATA_GDN_CHUNKED` や `STRATA_GDN_TC` が条件を満たして先に成功した場合も key-head を使わない。`STRATA_GDN_PIPELINE=0`（または CUDA/SYCL で `atoi` 結果 0）なら通常の key-head 分岐は通らない（CUDA: `engine/src/prefill/kernels.cu:3083-3110, 3164-3193, 3234-3268`、SYCL: `engine/sycl/src/prefill/kernels.dp.cpp:2887-2910`）。
+- **AMD/HIP:** key-head kernel を選ぶ実装はこの dispatch に含まれない。該当する CUDA/SYCL 判定と SYCL 呼び出しは `!defined(__HIPCC__)` 側にある（`engine/src/prefill/kernels.cu:3190`、`engine/sycl/src/prefill/kernels.dp.cpp:1334-1341, 2892-2907`）。
 
 ## 実行時の詳細
 
-CUDA は `gdn_keyhead_ok()` の初回呼び出し時に環境値を `static const bool off` へ保存します。値を 0 と parse した場合は直ちに false を返します。それ以外は GPU ごとの `known[64]` に適格性判定を保存し、以後同じプロセス内では再判定しません。したがって初回評価後に環境値を変更しても反映されません。選択時には grid `HK * NCB` で `gdn_rec_kh_kernel` を起動し、その後に通常の GDN output norm kernel を起動します。
+CUDA では `gdn_keyhead_ok()` 初回呼び出し時に環境変数を読み、`static const bool off` に保持する。その後はプロセス実行中に環境を書き換えても反映されない。環境変数が無効化していなければ、現在 device の capability と occupancy を初回に検査して `known[dev]` に保存する。key-head kernel が不適格なら自動 dispatch は `gdn_rec_cols_pipe_kernel` に fallback する（`engine/src/prefill/kernels.cu:966-982, 3254-3262`）。
 
-SYCL は同関数内の `static const bool on` に `atoi(v) == 1` の結果を初回評価時に保存します。選択時は `HK * NCB` の work-group 配置で `gdn_rec_kh_kernel` を投入し、後続の output norm kernel を実行します。初回評価後の環境値変更は反映されません。
+SYCL も `gdn_keyhead_ok()` の初回呼び出しで `static const bool on` を決め、そのプロセス内で cache する。pipeline が有効で key-head が on なら `gdn_rec_kh_kernel`、それ以外で pipeline が有効なら列分割 pipeline kernel を launch する（`engine/sycl/src/prefill/kernels.dp.cpp:1334-1339, 2888-2938`）。この変数が recurrence の呼び出しごとに再評価されるコードではない。
 
-環境変数専用のログや警告はこれらの分岐にはありません。kernel 実行後には既存の `check("gdn_recurrence")` が呼ばれます。
+CUDA の probe が key-head を明示的に force した場合は適格ならその kernel を選び、不適格なら launch せず、probe の `reason` に `keyhead kernel not eligible here (needs sm_80+ with all 64 blocks resident, or STRATA_GDN_KEYHEAD=0 is set` を記録する。通常の自動 fallback ではこの理由文字列は設定されず、pipe kernel が選択される。dispatch 後の `check("gdn_recurrence")` は CUDA launch error を検出した場合 `exit_device_error` に渡す（`engine/src/prefill/kernels.cu:110-116, 3222-3229, 3269-3279`）。環境変数が不適格を生じさせるだけで通常経路が終了する処理はない。
 
-`docs/INTEL.md` は SYCL の B70 で `STRATA_GDN_KEYHEAD=1` を opt-in のままにし、prompt throughput を 727 tok/s 対 788 tok/s と記しています。また同文書は上流 PR #413 の parity test は NVIDIA の SM-holding bench であり SYCL では実行されていないと説明しています。これらは文書に記録された特定環境の測定・検証結果であり、他の GPU やモデルへの性能・出力特性を保証するものではありません。
+## ログと測定値
+
+通常の自動 fallback や key-head 選択そのものに対するログ出力は、この dispatch にはない。forced probe の不適格理由は上記 `reason` フィールドに記録される（`engine/src/prefill/kernels.cu:3222-3226, 3269`）。CUDA launch error があれば `check` が device error 経路へ渡す（`engine/src/prefill/kernels.cu:110-116, 3278-3279`）。
+
+`docs/INTEL.md:541` は PR #413 の記録として「8% slower prompt: off (`STRATA_GDN_KEYHEAD=1`)」と記すが、同ファイルの該当行には測定機種・モデル・backend などの条件がない。ソースコメントの CUDA 測定値は CUDA kernel のベンチ記述であり、一般的な効果の保証としては扱わない（`engine/src/prefill/kernels.cu:959-965`）。
 
 ## 根拠
 
-- `src/prefill/kernels.cu:696-713` — CUDA の設定値判定、device ごとの compute capability / occupancy 条件と cache。
-- `src/prefill/kernels.cu:1927-1994` — CUDA recurrence の優先経路、pipeline 条件、key-head kernel と output norm の起動。
-- `sycl/src/prefill/kernels.dp.cpp:1228-1233` — SYCL の `atoi(...) == 1` 判定と初回値の cache。
-- `sycl/src/prefill/kernels.dp.cpp:2603-2735` — SYCL recurrence の serial / pipeline 分岐、key-head kernel と output norm の投入。
-- `src/prefill/kernels.cu:596-688`, `sycl/src/prefill/kernels.dp.cpp:1070-1219` — key-head recurrence kernel 実装。
-- `src/prefill/prefill.cpp:2623`, `sycl/src/prefill/prefill.cpp:2906` — prefill の GDN 経路から `gdn_recurrence` を呼ぶ箇所。
-- `docs/INTEL.md:642-666` — SYCL B70 での opt-in 状態、記録された throughput、および上流 parity test の制約。
+- `engine/src/prefill/kernels.cu:966-982` — CUDA の環境変数判定、GPU 適格性と per-device cache。
+- `engine/src/prefill/kernels.cu:3083-3110, 3164-3193, 3222-3279` — 別分岐、優先経路、kernel 選択、probe と CUDA error 処理。
+- `engine/sycl/src/prefill/kernels.dp.cpp:1334-1339, 2887-2938` — SYCL の opt-in 判定、Xe の bypass と kernel 選択。
+- `engine/sycl/CMakeLists.txt:573-577` — SYCL では parity benchmark でなく engine 経由で検証する記述。
+- `docs/INTEL.md:541` — 条件が不足する測定記録。

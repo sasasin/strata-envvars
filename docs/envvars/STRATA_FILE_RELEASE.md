@@ -1,46 +1,44 @@
 # `STRATA_FILE_RELEASE`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Windows で `FileExpertSource` が管理するファイルマッピングから、GPU への転送が完了した expert の全ページ部分をワーキングセットから外すよう OS に依頼します。`experts.bin` のマッピングと、GGUF ファイル内の expert を直接参照するマッピングが対象です。CUDA と実験的 SYCL backend の実装にあります。Linux では同関数は何もせず 0 を返します。
+Windows で file-backed expert の GPU 転送後に、その expert が占めていた read-only file mapping の完全なページ範囲を working set から外す処理を有効にする。mapping 自体を解除したり、resident complement や staging buffer を解放したりする設定ではない。通常は無効で、`FileExpertSource::release()` が呼ばれたときだけ作用する。実装は CUDA/HIP 系の `engine/src/core/expert_source.cpp` と SYCL 系の `engine/sycl/src/core/expert_source.cpp` にある。両実装とも `_WIN32` のときだけ環境変数を読む。
 
 ## 値と判定
 
-Windows の `FileExpertSource::release()` が初めて呼ばれた時に値を読み、関数内の `static const bool` に保存します。文字列全体が厳密に `1` の場合だけ有効です。数値変換や前後空白の除去はありません。
+Windows 実装は `std::getenv` の結果を文字列全体で `std::strcmp(v, "1") == 0` と比較し、関数内 `static const bool` に保存する。未設定は無効、空文字も無効で、`1` との完全一致だけが有効。数値変換・trim・大文字小文字変換はしないため、`01`、`1anything`、`true`、` 1`、`1 `、`0` は無効。値の境界や負数の解釈はなく、`"1"` 以外はすべて同じ無効扱いとなる。非 Windows では `getenv` 自体がコンパイル対象外で、関数は常に `0` を返す。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効 |
-| `1` | 有効 |
-| 空文字、`0`、`01`、`1 `、`true` など | 無効 |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| Windows (`_WIN32`) | 無効 | 文字列全体が `1` | 空文字、`0`、`true`、`01`、`1anything`、前後空白付きなど `1` 以外 |
+| Windows 以外 | 変数を読まない。常に無効 | なし | すべて（実装は常に `0`） |
 
-初回判定以降に環境変数を変更しても、このプロセスでは反映されません。非 Windows ビルドは値を読みません。
+読み取りは `release()` の最初の呼び出し時に一度だけ行う。プロセス起動後に値を変えても反映されず、同じプロセスでは後から再評価されない。ここに CLI 引数や別の環境変数との優先順位・上書き処理はない。`engine/src/core/expert_source.cpp:3933-3940`、`engine/sycl/src/core/expert_source.cpp:1609-1616`。
 
 ## 有効になる条件
 
-- Windows であること。CUDA 実装は `_WIN32` の分岐内でのみ処理し、SYCL 実装も同じ Windows 分岐を持ちます。
-- `FileExpertSource` のファイルマッピングが存在し、layer と expert の番号が範囲内であること。
-- 対象ページが blob の中に完全に収まること。ページ境界をまたぐ端の部分と隣接 expert と共有するページは残ります。
-- ページを別のバッファから読む場合でも、関数は pinned RAM や exchange buffer ではなく、マッピング上のファイル範囲を直接計算します。resident complement は直接コピー経路であり、ここで trim する対象ではありません。
-
-`ArenaExpertSource` の解放処理は別実装で、この環境変数を参照しません。
+- Windows ビルドであること。CUDA/HIP 系と SYCL 系の両実装に Windows 用分岐がある。Linux 等では環境変数を読まず、release は `0` を返す（`engine/src/core/expert_source.cpp:3933-3940,3979-3982`、`engine/sycl/src/core/expert_source.cpp:1609-1616,1655-1658`）。
+- `FileExpertSource::release()` が呼ばれること。呼び出し元には、GPU cache への転送完了後の expert、adaptive tier の入替後、prefill が借りた cache slot の refill 完了後がある（例: `engine/src/program/generate.cpp:15216-15221,15873-15881,20520-20529`; SYCL: `engine/sycl/src/program/generate.cpp:8823-8829,9319-9326,11360-11365`）。
+- `release()` 内で有効値のほか、file mapping が開いていて (`base_ != nullptr`)、layer/expert index が範囲内であること。CUDA/HIP 系はさらに unmapped 状態でないことを確認する。条件を満たさない呼び出しは何もせず `0` を返す（同上）。
+- CLI モード、モデルの GPU 配置、resident complement の有無はこの変数の値判定を変えない。ただし、呼び出し元が release を実行しない経路では効果もない。`FileExpertSource` は generate 側で生成される（`engine/src/program/generate.cpp:8498`、`engine/sycl/src/program/generate.cpp:4645`）。
 
 ## 実行時の詳細
 
-`release(layer, expert)` は Windows で system page size の整数倍に切りそろえた範囲に `VirtualUnlock` を呼びます。通常の失敗は stderr に `FileExpertSource: cannot trim mapped pages for layer ... expert ... (... bytes, Windows error ...)` を出して 0 を返します。未ロック範囲についての `ERROR_NOT_LOCKED` は、このコードでは trim 成功として扱います。戻り値は trim を依頼したバイト数で、実際に RAM が回収された量の測定ではありません。
+有効な呼び出しでは、expert の file span から OS page size にそろった内部ページ範囲を計算し、両端の共有・端数ページを除いた完全なページだけ `VirtualUnlock` に渡す。通常の連続 blob では `mapped_blob()` の範囲を使い、GGUF の role 別配置では3つの role span を個別に処理して戻り値を合算する。戻り値は処理対象として渡した byte 数であり、物理 RAM が実際に回収された量の測定ではない（`engine/src/core/expert_source.cpp:3941-3978`、SYCL: `engine/sycl/src/core/expert_source.cpp:1617-1654`）。
 
-CUDA 実装は未マッピング状態も無効条件に含めます。SYCL 版にも同じ環境値判定と Windows の trim 処理があります。両 backend とも生成コードから `release()` が呼ばれ、初期 cache fill 後の GPU 保持 expert、および実行中の swap-in / prefill への貸し出し分について、コピー完了後に呼ぶ箇所があります。したがって、設定が有効でもファイルマッピングを使わない実行や、対象ページがない呼び出しでは何も解放されません。
+この処理は mapping を閉じず、後続の file read は同じ mapping を使える。値が無効、mapping が不適用、index が不正、または対象となる完全ページがない場合は `0` で何もしない。GPU への copy が完了してから呼ぶ箇所では、転送元 file page の working set を整理する用途である（呼び出し順の例: `engine/src/program/generate.cpp:15208-15221`、`engine/sycl/src/program/generate.cpp:8810-8829`）。
 
-## 文書との照合
+## ログと測定値
 
-`docs/DETAILS.md` は Windows の opt-in として説明し、1 台の Windows 11 laptop 構成で available RAM が増えた測定を記載しています。同じ説明で prefill throughput の低下、committed memory や物理 SSD read は減らなかったこと、OS が file cache を破棄する保証はないことも示しています。これらは記載された構成での測定であり、一般的な性能保証ではありません。
+通常の成功時にこの関数自身が出すログはない。`VirtualUnlock` が失敗し、Windows error が `ERROR_NOT_LOCKED` 以外の場合は stderr に `FileExpertSource: cannot trim mapped pages for layer %lld expert %lld (%llu bytes, Windows error %lu)\n` を出して flush し、その span の戻り値を `0` にする。`ERROR_NOT_LOCKED` はこの実装では成功相当として扱う（`engine/src/core/expert_source.cpp:3954-3967`、SYCL: `engine/sycl/src/core/expert_source.cpp:1630-1643`）。呼び出し元の多くは戻り値を捨てるため、成功 byte 数のログや終了コードへの反映はない。
+
+`docs/DETAILS.md:290-292` は Windows の working-set hint と説明しており、現行実装と一致する。関連する測定報告 `docs/bench-results/2026-10-04-windows-mapped-release/README.md:3-6,27-43` は Windows 11 / RTX 4080 Laptop + Thunderbolt RTX 3090 / IQ2_XS の構成を記載するが、測定対象は upstream commit `6f32ec070f23ced9f50e704d854d775da52591ab` の prototype である。同報告の `:105-106` では prototype 時の変数名も `STRATA_ARENA_RELEASE` と記録されているため、測定値を本調査対象 commit の `STRATA_FILE_RELEASE` による現行コードの実測値とは扱わない。
 
 ## 根拠
 
-- 値判定、Windows guard、範囲検査、ページ trim、エラー出力: `src/core/expert_source.cpp:2545-2595`、`sycl/src/core/expert_source.cpp:1598-1648`。
-- `FileExpertSource` の仮想メソッド宣言と Windows 向け説明: `include/strata/core/expert_source.hpp:687-689`、`sycl/include/strata/core/expert_source.hpp:565-567`。
-- 初期 fill 後の解放呼び出し: `src/program/generate.cpp:6122-6137`、`sycl/src/program/generate.cpp:5779-5794`。
-- 実行中の交換後および prefill 貸し出し後の呼び出し例: `src/program/generate.cpp:8327-8331,8777-8785`、`sycl/src/program/generate.cpp:7798-7804,8260-8269,10039-10048`。
-- 説明と測定条件・制限: `docs/DETAILS.md:206-213`。
+- `engine/src/core/expert_source.cpp:3933-3982` — Windows guard、環境値の完全一致判定と static cache、mapping 条件、ページ範囲処理、失敗ログ、非 Windows の no-op。
+- `engine/sycl/src/core/expert_source.cpp:1609-1659` — SYCL 実装の同じ判定と処理。
+- `engine/src/program/generate.cpp:15208-15221,15873-15881,20520-20529`、`engine/sycl/src/program/generate.cpp:8810-8829,9319-9326,11360-11365` — GPU 転送・refill 完了後の release 呼び出し例。
+- `engine/include/strata/core/expert_source.hpp:971-973`、`engine/sycl/include/strata/core/expert_source.hpp:567-569` — API コメント上の Windows opt-in と対象。

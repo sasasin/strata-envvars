@@ -1,60 +1,52 @@
 # `STRATA_CVEC_FUSE_CHECK`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-制御ベクトルを適用する prefill の融合経路について、融合カーネルの結果と従来の複数カーネル経路の結果を比較する診断用環境変数。正の整数 `N` を指定すると、プロセス内で最初に行われる `N` 回の対象書き込みで従来経路も一時コピー上に実行し、残差 `R`、row scale (`rs`)、BF16 画像 (`xn16`) がビット単位で一致するかを stderr に出力する。
-
-この変数だけでは融合経路を有効にしない。融合経路自体には `STRATA_CVEC_FUSE` による有効化と、制御ベクトルが対象層を覆うなどの条件が必要である。
+制御ベクトルを適用する fused prefill write が実行されるとき、通常の3カーネル処理を一時コピー上でも実行し、fused 経路との値の一致を診断ログに出すための検査回数です。設定値は fused 経路を有効化せず、計算結果の選択にも使われません。正の値では検査用の追加 GPU メモリ、コピー、同期が発生します。CUDA/HIP 実装と SYCL 実装の両方に読み取りがあります（`engine/src/prefill/prefill.cpp:7676-7711`、`engine/sycl/src/prefill/prefill.cpp:5406-5496`）。
 
 ## 値と判定
 
-| 値 | 判定 |
-| --- | --- |
-| 未設定 | `0`。比較しない。 |
-| 空文字 | `atoi("")` により `0`。比較しない。 |
-| 先頭が整数として解釈できない文字列 | `atoi` により `0`。比較しない。 |
-| 正の整数 | その回数だけ比較する。 |
-| `0` または負の整数 | 比較しない。 |
-| 整数の後ろに文字が続く値 | `atoi` が先頭の整数部分を変換するため、例 `2junk` は `2` として扱われる。 |
+両 backend とも `std::getenv` の結果を関数内 `static int` の初期化で `std::atoi` に渡します。未設定は `0`、空文字も `0` となり、どちらも検査しません。`atoi` のため文字列全体の妥当性検査はなく、先頭の空白と符号を許し、数値部分以降は無視します。たとえば `2`、`+2`、` 2tail` は `2` になり、`0anything`、`true`、空文字、数値に変換できない文字列は `0` になります。変換結果が正のときだけ検査し、`0` と負数は検査しません。値の clamp や独自の範囲チェックはありません（`engine/src/prefill/prefill.cpp:7679-7681`、`engine/sycl/src/prefill/prefill.cpp:5409-5411`）。
 
-実装は `std::atoi` を使い、文字列全体の検証や範囲制限はしない。`atoi` の通常の規則により先頭空白と符号は受け付ける。整数として表現できないほど大きな値の結果は保証されない。
+`atoi` が `int` で表せない値を受け取った場合の結果はこのコードで規定されていません。範囲外の値を検査回数として使う保証はありません。
 
-カウンターは関数内 `static int` で、環境変数を最初に評価した後、対象比較のたびに1減る。正値が残っている間だけ比較を行う。
+| backend | 未設定・空文字 | 正の変換結果 | 0・負の変換結果 |
+|---|---|---|---|
+| CUDA/HIP | `0`、検査なし | 最初の N 回の対象 fused write を検査 | 検査なし |
+| SYCL | `0`、検査なし | 最初の N 回の対象 fused write を検査 | 検査なし |
+
+CLI 引数からこの変数を設定・上書きする処理はありません。CLI の制御ベクトル指定は別途 `--control-vector` / `--control-vector-scaled` などで行います（`engine/src/program/generate.cpp:4164-4188`、SYCL 側 `engine/sycl/src/program/generate.cpp:2128-2152`）。
 
 ## 有効になる条件
 
-コード上の比較は、prefill のハイパーコネクション書き込みで次を満たす場合に限られる。
-
-- 2番目の half であり、制御ベクトルがその層を覆う。
-- `STRATA_CVEC_FUSE` が設定され、その先頭文字が `'1'`。
-- `STRATA_GR_UNFUSED` が融合を無効にしていない。
-- 次層の正規化が可能で、対象の PLE 条件に該当しない。
-- 制御ベクトルの埋め込み次元と HC 次元が実行側の `N`、`HC` に一致し、テーブルを取得できる。
-
-したがって、この変数を正値にしても、モデルに適用対象の制御ベクトルがない場合や、上記条件を満たさない場合は比較ログは出ない。文書 `docs/DETAILS.md` は制御ベクトルの実験機能とその設定方法を説明しているが、この比較用変数自体の説明は確認できなかった。
+- prefill の対象箇所で、制御ベクトルが現在の層をカバーする必要があります。判定は `half == 1` かつ `cvec().covers(l)` です（`engine/src/prefill/prefill.cpp:7662-7668`、`engine/sycl/src/prefill/prefill.cpp:5392-5398`）。制御ベクトルのファイル、層範囲、モードは別の CLI 設定です（`engine/src/program/generate.cpp:4164-4188`）。
+- fused 経路の有効化には別環境変数 `STRATA_CVEC_FUSE` が真であること、`STRATA_GR_UNFUSED` が有効でないこと、次の層が `LE` 未満であること、`nl == 1 && ple_on` でないこと、制御ベクトルの `n_embd` と `hc` が実行中の `N` と `HC` に一致すること、現在の device に制御ベクトルの table があることが必要です。これらを満たさなければこの検査分岐に入りません（`engine/src/prefill/prefill.cpp:7666-7676`、`engine/sycl/src/prefill/prefill.cpp:5396-5406`）。
+- `STRATA_CVEC_FUSE` は gfx12 / gfx1151 向けの arch default に含まれ、arch defaults 適用時は同名の利用者設定があれば保持されます。ただしこれは検査変数の既定値ではなく、検査を実行する fused 経路側の条件です（`engine/src/core/arch_defaults.cpp:28-50`、`engine/src/core/arch_defaults.cpp:64-75`、`engine/src/core/arch_defaults.cpp:302-310`）。
+- 対象変数に OS、CLI、サーバーモード、モデル状態による独自の値判定や fallback はありません。いずれの実行形態でも、上記の prefill 条件に到達しなければ値は使われません。
 
 ## 実行時の詳細
 
-比較対象の書き込み前に `R` を一時バッファへコピーし、そこへ従来の `gr_write`、`cvec_apply`、`gr_norm_rs` を順に実行する。同時に本来の `R` には融合関数 `gr_write_cvec_norm_rs` を実行する。その後、両方の `R`、row scale、BF16 画像をホスト側へコピーして同期し、`memcmp` でそれぞれを比較する。一時バッファは比較後に解放される。
+環境変数はプロセス起動時ではなく、各 backend の fused write 分岐に初めて到達した時に読み取られます。関数内 `static` に整数を保持するため、その後の環境変更は反映されず、同一プロセスの後続 prefill 呼び出しでも残り回数を共有します（`engine/src/prefill/prefill.cpp:7676-7681`、`engine/sycl/src/prefill/prefill.cpp:5406-5411`）。
 
-stderr には次の形式で各結果を記録する。
+残り回数が正なら1減らし、CUDA/HIP では `R` の device copy に `gr_write`、`cvec_apply`、`gr_norm_rs` を実行し、その一方で本来の `R` に fused `gr_write_cvec_norm_rs` を実行します。SYCL も同じ処理を行います。両方の結果を host にコピーして stream/queue を同期し、一時領域を解放した後に比較します。比較対象は `R`、row scale (`rs`、`grs`)、BF16 image (`xn16`) の各バッファです。CUDA/HIP 側で fused kernel に渡す `xn16_lo` は比較配列に含まれていません（`engine/src/prefill/prefill.cpp:7682-7707`、`engine/sycl/src/prefill/prefill.cpp:5412-5492`）。
+
+検査用の3カーネル経路はコピー上で動作し、本来の `R` には fused 経路を実行します。残り回数が0以下なら追加のコピー・比較をせず、fused kernel を通常実行します（`engine/src/prefill/prefill.cpp:7708-7719`、`engine/sycl/src/prefill/prefill.cpp:5493-5516`）。
+
+## ログと測定値
+
+検査1回ごとに stderr へ次の形式で出力します。各項目は `memcmp` によるバイト単位の比較で、`identical` または `DIFFERS` です。
 
 ```text
-strata: STRATA_CVEC_FUSE_CHECK layer <層> T <トークン数>: R <identical|DIFFERS>, rs <identical|DIFFERS>, xn16 <identical|DIFFERS>
+strata: STRATA_CVEC_FUSE_CHECK layer <層> T <トークン数>: R <結果>, rs <結果>, xn16 <結果>
 ```
 
-差異があってもログ出力以外のエラー処理、停止、従来経路への切替は行わない。実際の `R` と後続計算に使うバッファは融合関数が書いた側であり、従来経路の結果は一時コピー上の診断値である。比較時は追加の割当て、カーネル実行、デバイス・ホスト間コピー、同期が発生するため、その回の処理時間には診断負荷が加わる。
-
-環境変数の値と比較回数は最初の対象比較ブロックで static 初期化されるため、プロセス起動後の環境変更は反映されない。カウンターも同じプロセス内で共有される。
-
-CUDA 実装と SYCL 実装の双方にこの診断ブロックがある。対象バックエンドに応じて該当実装が使われる。
+未設定・空文字・0・負数の場合や、対象の fused write に到達しない場合、この変数由来のログはありません（`engine/src/prefill/prefill.cpp:7703-7707`、`engine/sycl/src/prefill/prefill.cpp:5488-5492`）。この変数による測定値や速度の報告はありません。値の不正を警告する専用ログもありません。検査時は追加 device allocation と同期を行いますが、対象コードに環境値に応じた allocation 失敗時の fallback はありません（`engine/src/prefill/prefill.cpp:7682-7702`、`engine/sycl/src/prefill/prefill.cpp:5412-5487`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:3926-3946` — 制御ベクトル適用状態、融合の条件、`STRATA_CVEC_FUSE_CHECK` の `atoi` と static カウンター。
-- `src/prefill/prefill.cpp:3947-3979` — 一時コピー上の従来処理、融合処理、比較、stderr 出力、通常経路への合流。
-- `sycl/src/prefill/prefill.cpp:4295-4315` — SYCL 側の融合条件と値の読み取り。
-- `sycl/src/prefill/prefill.cpp:4316-4403` — SYCL 側の一時コピー、従来処理、比較と出力。
-- `docs/DETAILS.md:1752-1777` — 制御ベクトル機能が実験機能であること、およびセットアップ時にエンジン設定へ渡す方法。比較用環境変数の説明はない。
+- 全参照と読み取り: `engine/src/prefill/prefill.cpp:7677-7679,7703-7707`、`engine/sycl/src/prefill/prefill.cpp:5407-5409,5488-5492`。
+- fused 経路の条件と fallback: `engine/src/prefill/prefill.cpp:7662-7676,7708-7721`、`engine/sycl/src/prefill/prefill.cpp:5392-5406,5493-5516`。
+- CLI の制御ベクトル指定: `engine/src/program/generate.cpp:4164-4188`、`engine/sycl/src/program/generate.cpp:2128-2152`。
+- arch default と利用者値の保持: `engine/src/core/arch_defaults.cpp:28-50,64-75,302-310`。

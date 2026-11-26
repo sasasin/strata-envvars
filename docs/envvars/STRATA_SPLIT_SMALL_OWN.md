@@ -1,49 +1,47 @@
 # `STRATA_SPLIT_SMALL_OWN`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-層分割した `strata serve` で、後段 GPU など各 stage が自身の expert cache の末尾に prompt path 用の領域を確保し、短い prompt ではその領域だけを使うための設定です。`S` は確保領域を見積もる prompt chunk の token 数です。各 stage の対象領域にいた expert は起動時に非 resident 扱いとなり、device residency table に反映されます。長い prompt では確保領域より手前の cache slot を追加で借りられます。
-
-これは起動時に一度読む serve 経路の設定です。通常の単一 GPU 実行には適用されません。
+`--serve` で複数 GPU の layer split があり、prompt 用の stage (`pf_parts`) と host residency table がある場合に、layer split の各 stage 用 cache の末尾に prompt buffer 用 slot を確保する token chunk サイズ `S` を決める。通常の prompt borrowing と比べ、短い prompt は stage cache の予約済み領域を prompt buffer に使い、その領域にあった expert を起動時に non-resident にして CPU / PCIe 経路に回す。対象は serve の prompt path であり、単一 GPU や通常の一回生成経路ではこの値は参照されない（`engine/src/program/generate.cpp:12302,13171-13183`）。
 
 ## 値と判定
 
-値は文字列全体の検証ではなく `std::atoll` で符号付き整数に変換し、その結果を `request_chunk()` に渡します。`request_chunk()` は token 数が 0 以下、または chunk 上限が 0 以下なら 0 を返し、それ以外は 256 の倍数へ切り上げて `--prefill` の chunk 上限で制限します。
+値は `std::getenv` で取得し、設定されていれば `std::atoll` で数値変換した後、`request_chunk` が 256-token 単位に切り上げ、実行時の `o.prefill_chunk` 以下に制限する。`request_chunk` は入力または上限が 0 以下なら 0 を返す（CUDA: `engine/src/program/generate.cpp:11159-11165,13177-13183`、SYCL: `engine/sycl/src/program/generate.cpp:6640-6646,7635-7641`）。
 
-| 設定 | 結果 |
-|---|---|
-| 未設定 | `S=0`。機能を無効化 |
-| 空文字、数値に変換できない文字列 | `atoll` の結果は 0 となり、機能を無効化 |
-| 正の整数 | 256 token 単位に切り上げ、`o.prefill_chunk` 以下に制限した値が `S` |
-| 0 または負数 | `request_chunk()` が 0 を返し、機能を無効化 |
-| 数字の後ろに文字がある値 | `atoll` が先頭の整数部分を変換し、その後ろは判定に使わない |
+| 条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `--serve` の layer split（`multi_gpu && !pf_parts.empty() && !host_res.empty()`） | `S=0`。予約・小 prompt 用分岐なし | 正の数値 prefix。例: `1` は 256、`300` は 512、`512tokens` は 512。ただし `o.prefill_chunk` が小さければその値まで | 空文字、`0`、`0anything`、`true`、`false`、負数、数値 prefix のない文字列は変換後 0 となり無効 |
+| 上記以外 | 読み取り箇所に入らず機能しない | なし | なし |
 
-たとえば `257` は通常 `512` token の `S` になりますが、`--prefill` 上限がそれより小さければその上限になります。大きすぎて `atoll` の変換範囲を超える値について、呼び出し側にエラー検査や fallback はありません。
-
-有効な `S` のとき、関連設定 `STRATA_SPLIT_SMALL_MAX=M` が未設定なら上限は `S` です。設定されていれば同じく `atoll` で読み、実際の上限を `max(S, M)` とします。したがって M が空、非数値、0、負数、または S 未満でも上限は少なくとも S です。この関連変数の説明全体は本書の対象外です。
+`atoll` の結果に独自の完全文字列検査、真偽値解釈、大文字小文字判定、範囲エラー処理はない。正の値でも `request_chunk` が有効 `--prefill` chunk で cap する。後続の `STRATA_SPLIT_SMALL_MAX` は独立に `atoll` され、未設定なら `S`、設定時は `max(S, atoll(value))` が prompt の適用上限になる。従って空文字や無効な値は 0 となり、下限 `S` のため既定相当の上限になる。`S<=0` なら上限も 0 で機能しない（`engine/src/program/generate.cpp:13177-13183`、SYCL: `engine/sycl/src/program/generate.cpp:7635-7641`）。
 
 ## 有効になる条件
 
-- serve 起動で `multi_gpu` が真である（複数 GPU の層分割）。
-- prompt 用 stage cache のリスト `pf_parts` が空でなく、resident table `host_res` が存在する。
-- 変換後の `S` が正で、対象 stage の `p.first` が有効である。
-
-条件を満たさない場合、値が設定されていても予約・resident table の変更はありません。環境変数を CLI 引数や設定ファイルが上書きする経路はなく、`S` の最大値に `o.prefill_chunk` が使われます。
+- `--serve` が有効であること。読み取り箇所は serve 初期化の `if (o.serve)` ブロック内（`engine/src/program/generate.cpp:12302,13171-13183`）。
+- 実行時に layer split が選択され、`multi_gpu`、`pf_parts`、`host_res` がそれぞれ有効であること。条件を満たさないと環境変数を読み取らず、予約も行わない（同 `:13177-13183`）。
+- `S > 0` で、個々の `PfPart` が有効な `p.first >= 0` であること。対象 part の cache tail について `host_res` に記録された slot が閾値以上なら non-resident に変更される（同 `:13184-13197`）。
+- prompt segment の token 数が `split_small_max` 以下のとき、小 prompt 分岐で必要 chunk を `min(want_full, S)` にする。上限を超える segment は通常の `want_full` を使う（同 `:11403-11411`）。`STRATA_SPLIT_SMALL_MAX` は既定で `S`、明示値は `S` 未満でも `S` 以上に引き上げられる（同 `:13181-13183`）。
+- 有効な `S` は `request_chunk(..., o.prefill_chunk)` で cap されるため、`--prefill` 等で決まった実行時 chunk が `S` より小さい場合はその小さい値になる（同 `:11159-11165,13179-13183`）。
 
 ## 実行時の詳細
 
-serve エンジンの初期化時、条件を満たす場合に `STRATA_SPLIT_SMALL_OWN` を読みます。各借用対象 stage について `part_slots(p, S)` で S-token chunk の prompt buffers に要る slot 数を求め、`first_s = max(p.first, cache_slots - part_slots(p, S))` とします。その stage が担当する layer の expert のうち、resident slot 番号が `first_s` 以上のものを `kNotResident` に変更します。該当 expert 数を stderr に `strata serve:   CUDA%d keeps ... slots for ...-token prompts (... experts no longer resident)` と出し、1個以上変更した場合は primary と各 stage の device residency table を更新します。SYCL 側のコピーも同じログ文字列を持ちます。
+変数は serve の prompt path 初期化後に読み込まれ、`split_small` と `split_small_max` に保存される。static cache や request ごとの再読込ではない。以後の prompt lending が保存値を使うため、実行中に環境値を変えてもこの serve session の判定には反映されない（`engine/src/program/generate.cpp:13142-13183,11403-11411`）。SYCL 側も同じタイミングと処理（`engine/sycl/src/program/generate.cpp:7607-7641`）。
 
-prompt segment を貸し出す際、`tokens <= split_small_max` なら通常の必要 chunk `want_full` を `min(want_full, S)` にし、stage ごとにその chunk の buffers に必要な slot だけを借ります。初期化時に S-token 分を予約しているため、この範囲の prompt では当該予約領域を越える expert slot の貸し出し・refill は不要です。`tokens > split_small_max` では通常の `want_full` を使い、必要な範囲を借ります。空の segment など通常の lend 条件によるエラー処理は別途あります。
+`S>0` の場合、各有効 part で `first_s = max(p.first, cache.slots() - part_slots(p,S))` を求め、その part が担当する layer の expert residency slot `r >= first_s` を `kNotResident` にする。1 件以上変更した場合は head と各 stage の device residency table を更新する。これにより予約 tail の expert は GPU resident 扱いでなくなる（CUDA: `engine/src/program/generate.cpp:13184-13206`、SYCL: `engine/sycl/src/program/generate.cpp:7642-7665`）。
 
-slot を非 resident にすると、GPU residency table から expert が外れます。関連する serve 実装はその slot を「貸し出し」対象として扱い、prompt path 用 buffer に置き換えます。したがってこの設定は cache residency と prompt の slot 使用を変えるもので、単なるログ設定ではありません。ソースだけでは、この変数を使った場合の出力同一性や性能値を保証できません。
+serve 中の prompt segment では、token 数が `split_small_max` 以下なら `want_full` を最大 `S` に制限する。予約範囲の experts は既に non-resident のため、その範囲を prompt buffer に使い、通常の expert lend/refill は発生しない。適用上限を超える segment は通常の chunk 選択に戻り、予約範囲を超える必要があれば追加 slot を借りる（CUDA: `engine/src/program/generate.cpp:20609-20616`、SYCL: `engine/sycl/src/program/generate.cpp:11403-11429`）。
+
+## ログと測定値
+
+予約が有効な part ごとに stderr へ `strata serve:   CUDA%d keeps %lld slots for %lld-token prompts (%lld experts no longer resident)` を出す。`S<=0`、または part が無効ならこの行は出ない。変更 expert が 1 件以上ある場合に限り residency table を再送する。環境変数固有のエラー終了経路や測定値はない（CUDA: `engine/src/program/generate.cpp:13184-13206`、SYCL: `engine/sycl/src/program/generate.cpp:7642-7665`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:6326-6332` — `request_chunk()` の切り上げ・上限処理。
-- `src/program/generate.cpp:7389-7424` — 変数読み取り、関連上限、stage ごとの予約計算、resident table の変更とログ。
-- `src/program/generate.cpp:7017-7019,10903-10907,10927-10960` — slot 数計算と prompt segment ごとの chunk 選択・slot lend。
-- `sycl/src/program/generate.cpp:5973-5979,6962-6997,10148-10154` — SYCL コピーの同等処理。
-- `docs/MULTI_GPU.md:76-83` — #340 の層分割・短い prompt の一般的背景を説明。ただし同節で記載される設定名は `STRATA_SPLIT_OWN` であり、本変数の効果や測定値を直接説明する資料ではありません。
+- CUDA backend の serve 条件と値取得・変換: `engine/src/program/generate.cpp:12302,13171-13183`
+- CUDA chunk の 256-token 切り上げと上限: `engine/src/program/generate.cpp:11159-11165`
+- CUDA residency 更新・診断ログ: `engine/src/program/generate.cpp:13184-13206`
+- CUDA prompt segment ごとの chunk 選択・borrowing: `engine/src/program/generate.cpp:20609-20616`
+- SYCL 実装の同じ値取得・更新: `engine/sycl/src/program/generate.cpp:7629-7665`
+- SYCL chunk の上限処理と segment ごとの borrowing: `engine/sycl/src/program/generate.cpp:6640-6646,11403-11429`

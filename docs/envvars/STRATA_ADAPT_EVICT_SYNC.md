@@ -1,51 +1,47 @@
 # `STRATA_ADAPT_EVICT_SYNC`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-適応 tier が expert の入れ替えコピーを待たずに次の検証 window を始める経路で、GPU 側の residency table に eviction を反映してから window を実行します。これにより、すでに VRAM から追い出された expert を GPU table が resident と誤認し、CPU 側の expert pool が古い activation を使って計算する状態を防ぎます。
-
-この変数は `src/program/generate.cpp` の `adapt_evict_sync()` で一度だけ評価され、その結果が `ExpertDispatch::evict_sync` の設定に使われます。値の既定値は有効ですが、適応 tier がコピーを待つ通常経路ではこの機能は有効になりません。
+adaptive tier が swap した expert の residency table を、コピー完了を待たずに次の verify window の前に GPU 側へ反映する経路を制御する。既定では有効で、`0` にするとこの早期反映を止める。適用経路は `strata serve` と `strata generate` の GPU decode で、expert cache の residency table と適応 swap がある場合に限られる。フラグ自体は swap 選択やコピーの実行を有効化せず、adaptive tier の設定は別途必要である（`engine/src/program/generate.cpp:2350-2354,15249-15257,24615-24619`）。
 
 ## 値と判定
 
-`std::atoi()` の結果が 0 かどうかで判定します。文字列全体の厳密な検証はなく、`atoi` が数値として読める先頭部分を変換します。
+`adapt_evict_sync()` は `std::getenv` の結果を関数内 `static const bool` に一度だけ保存する。未設定なら `true`、設定済みなら `std::atoi(e) != 0` が判定となる。文字列全体の妥当性検査や範囲制限はない。したがって空文字、`0`、`0anything`、`false`、`true`、数値に変換できない文字列は `atoi` が 0 を返すため無効。`1`、`-1`、`2tail` のように先頭の数値部分が非 0 なら有効。先頭空白は `atoi` が読み飛ばし、`+0` は無効、`+1` は有効となる。数値範囲外の文字列については `atoi` の変換結果をコードが検査していない（`engine/src/program/generate.cpp:2351-2354`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 有効（既定値） |
-| `0`、空文字、整数に変換できない文字列（例: `false`） | 無効（変換結果 0） |
-| 0 以外の整数（負数を含む） | 有効 |
-| 数字の後ろに文字が続く値（例: `1abc`、`0abc`） | 数字部分を変換し、その結果が 0 以外なら有効 |
-
-先頭の空白や符号を含む入力の扱いも `atoi` の変換規則に従います。評価結果は関数内の `static const bool` に保存されるため、最初の評価後にプロセス環境を変更しても反映されません。
-
-根拠: `src/program/generate.cpp:1507-1511`。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 全呼び出し経路 | 有効（`true`） | `1`, `-1`, `2tail` | 空文字, `0`, `0anything`, `true`, `false`, `abc` |
 
 ## 有効になる条件
 
-環境変数の判定が有効でも、次の条件を満たす経路でのみ eviction 同期が動作します。
-
-- 適応 tier が有効で、`--adapt-every` と `--adapt-swaps` から routing usage table が作られている。
-- tier がコピー完了を待たない設定である。`STRATA_ADAPT_NOWAIT` の先頭文字が `1`、または `STRATA_ADAPT_LAG` の実効値が 1 より大きい。
-- GPU の device residency table が存在する。
-- `serve` の場合、window が serial である（`--pipeline-windows` ではなく、layer split を使った複数 batch group 経路でもない）。
-
-`STRATA_ADAPT_NOWAIT` は先頭文字が `1` の場合だけ有効です。`STRATA_ADAPT_LAG` は `atoi` で変換され、未設定時は 1、設定時は最低 1 に clamp されます。したがって `STRATA_ADAPT_LAG=0` や数値に変換できない文字列だけでは tier-lag 条件を満たしません。
-
-layer split を使った複数 batch group 経路では `evict_sync` 自体を立てず、変数が有効なら verifier に常に activation を publish させます。`serve` の `--pipeline-windows` 経路はこの同期フックの対象外です。単一 generate 経路には `serve` の `serial_windows` 判定はなく、device table、usage table、lag 条件で判定します。
-
-関連箇所: `src/program/generate.cpp:1472-1485,9606-9614,15321-15336`。
+- `strata serve`: adaptive tier の usage 情報があり、`STRATA_ADAPT_NOWAIT=1` または `STRATA_ADAPT_LAG` の変換値が 1 より大きく、かつ通常の serial-window 経路（`!pipe && !piped_groups`）であること。`piped_groups` 経路では `evict_sync` による table patch は設定せず、この変数が有効なら verifier に全 activation を publish させる（`engine/src/program/generate.cpp:15249-15257`）。
+- `strata generate`: GPU residency table `d_res` があり、adaptive tier の usage 情報があり、同じ `NOWAIT` / `LAG` 条件を満たすこと（`engine/src/program/generate.cpp:24615-24619`）。
+- どちらの経路も `STRATA_ADAPT_FETCH` による admission が有効なら、`fetch_admit > 0` が `adapt_evict_sync()` の false を補い、`evict_sync` を有効にする。つまり `STRATA_ADAPT_EVICT_SYNC=0` でもこの場合は admission に必要な table 更新処理が残る（serve: `engine/src/program/generate.cpp:15252`; generate: `engine/src/program/generate.cpp:24615-24616`）。
+- `NOWAIT` / `LAG` が遅延を作らない、adaptive tier がない、または residency table がない場合、この変数単独では同期処理を発生させない。`STRATA_ADAPT_NOWAIT` と `STRATA_ADAPT_LAG` は関数内 static cache で読み、既定はそれぞれ false と 1（`engine/src/program/generate.cpp:2237-2250`）。
+- この変数を読む箇所に OS 分岐はない。実処理は `generate.cpp` の GPU verifier/residency table 経路で行われる。
 
 ## 実行時の詳細
 
-適応 swap で evict した expert の index を dirty list に記録します。tier が待たないと、host 側の table では evicted expert を non-resident にした後も GPU table の更新は次の verifier launch まで遅れるため、その launch 前 hook が dirty entry を GPU に反映します。小さい更新は mapped host memory 上の `(index, value)` pair を使う `res_patch` kernel で変更箇所だけを更新し、pair 用 buffer が得られない場合や変更数が上限 16,384 を超える場合は residency table 全体を upload します。コピー完了後に新しく resident になった expert の entry も dirty list に加え、以降の window 前に反映します。
+最初に `adapt_evict_sync()` が呼ばれた時点で環境値を読み、その後は同一プロセス内で値を再読しない。serve/generate は `drive.d.evict_sync` を上記条件で決める。adaptive round で swap が始まると、evicted expert を host table で non-resident にし、`evict_sync` が有効なら変更 index を dirty として記録する。serial-window の verifier pre-launch hook は次の window の前に dirty entry を device residency table に patch し、件数が patch 上限を超える場合は table 全体を upload する。こうしてコピーが完了するまでの間も、device table が evicted expert を resident と扱わない。コピー完了後は incoming expert の residency も反映し、dirty 状態を解消する（serve: `engine/src/program/generate.cpp:15217-15234,15272-15295,15468-15488`; generate: `engine/src/program/generate.cpp:24630-24647,24670-24699,24784-24791`）。
 
-更新 API が CUDA error を返した場合、window は続行せず `the residency table update failed: ...` のエラーで失敗します。`serve` では機能が有効なとき起動時に `strata serve: the adaptive tier's evictions reach the device's table before the next window (STRATA_ADAPT_EVICT_SYNC=0: when its copies land)` を stderr に出します。通常の待機経路では同期機能を設定しないため、このログも出ません。単一 generate 経路にはこの機能を示す専用ログはありません。
+この経路はコピー完了待ちを追加する設定ではない。`evict_sync` が無効で fetch admission もなければ、swap の copies が完了して `apply_pending` が table を upload した後に residency table が更新される（serve: `engine/src/program/generate.cpp:15217-15234`; generate: `engine/src/program/generate.cpp:24670-24699`）。serve の `--pipeline-windows` 等では別の publish/fence 経路が使われ、serial-window 用 patch hook の適用外となる（`engine/src/program/generate.cpp:15236-15257`）。
 
-根拠: `src/program/generate.cpp:1536-1566,9581-9592,9621-9650,9685-9692,9821-9824,15347-15364,15406-15415`、`src/kernels/cuda/verify_kernels.cu:601-603,700-704`、`src/core/verify.cpp:2662-2665,3542-3549`。
+## ログと測定値
 
-## 文書との照合
+serve の serial-window 経路で `drive.d.evict_sync` と変数の判定がともに有効なとき、stderr に次の行を出す。`STRATA_ADAPT_FETCH` が false を補う場合や、generate 経路ではこの行は出ない（`engine/src/program/generate.cpp:15330-15335`）。
 
-`docs/DETAILS.md:1885-1887` は `STRATA_ADAPT_NOWAIT=1` または `STRATA_ADAPT_LAG` が 1 より大きい場合に、eviction を次 window 前に device table へ反映する修正と説明しています。また `STRATA_ADAPT_EVICT_SYNC=0` でその修正を無効化でき、既定の「tier がコピーを待つ」経路は変更しないとしています。今回確認した実装と一致します。同資料はこの変数による性能値を示していません。
+```text
+strata serve: the adaptive tier's evictions reach the device's table before the next window (STRATA_ADAPT_EVICT_SYNC=0: when its copies land)
+```
+
+`docs/DETAILS.md` の opt-in switch 表にはこの変数固有の測定値や挙動の記載はない（`docs/DETAILS.md:1252-1262`）。ここでは性能値を記載しない。
+
+## 根拠
+
+- `engine/src/program/generate.cpp:2350-2354` — 変数の唯一の読み取り箇所、判定と static cache。
+- `engine/src/program/generate.cpp:15236-15257,15330-15335` — serve の適用条件、piped groups の代替処理、ログ。
+- `engine/src/program/generate.cpp:15217-15234,15272-15295,15468-15488` — serve の swap と residency table 更新。
+- `engine/src/program/generate.cpp:2237-2250,24615-24619,24630-24655,24670-24699,24784-24791` — 関連する `NOWAIT` / `LAG` の判定と generate 経路。
+- `engine/include/strata/core/expert_source.hpp:662-669` — `ExpertDispatch::evict_sync` と residency table の役割の説明。

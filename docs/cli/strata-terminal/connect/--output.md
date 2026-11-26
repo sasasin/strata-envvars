@@ -1,6 +1,6 @@
-# `--output`
+# `strata connect --output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,48 +8,53 @@
 | コマンド | `strata connect` |
 | オプション | `--output` |
 | 別名 | なし |
-| 値 | `human` または `json` |
+| 値 | `human` または `json`。省略時は `human` |
 
 ## 役割
 
-`strata connect` の標準出力を、人向けの説明形式か機械処理向け JSON 形式に切り替えます。アプリ名を省略した場合は接続可能なアプリ一覧、指定した場合はそのアプリ向けの設定内容が出力対象です。
+`strata connect` が対応アプリの一覧またはアプリ向け接続設定を表示するとき、出力を人間向け表示にするか、機械処理向け JSON にするか選びます。設定ファイルの書き込みやサーバー確認を有効にするオプションではなく、`--check`・`--write`・`--dry-run` の処理自体はこの値で切り替わりません（`terminal/strata_cli/launch/cmd.py:163-183,1052-1119,1120-1167`）。
 
 ## 使い方
 
 ```sh
+# OpenCode 用設定を JSON として標準出力へ表示する
 strata connect opencode --output json
-strata connect --output human
+
+# 対応アプリ一覧を JSON として取得する
+strata connect --output json
+
+# 確認処理の結果も JSON に含める
+strata connect opencode --check --output json
 ```
 
 ## 値と既定値
 
-- parser が受け付ける値は `human` と `json` のみで、既定値は `human` です。別名はありません（`strata_cli/launch/cmd.py:148-165`）。
-- 値は選択肢で検証されます。その他の値は `argparse` の引数エラーとなり、コマンド処理には進みません（同 `strata_cli/launch/cmd.py:164`）。
+値は `human` と `json` のいずれかで、既定値は `human` です。`argparse` の `choices` による検証で、他の値は受理されません。短縮別名、繰り返し指定のための特別な処理、`connect` における `--json` 別名は定義されていません（`terminal/strata_cli/launch/cmd.py:163-183`）。
 
 ## 実行時の動作
 
-- 実装は `a.output == "json"` を JSON 出力モードとして扱います（`strata_cli/launch/cmd.py:842-845`）。
-- `strata connect --output json` は、アプリ一覧を `schema_version: 1`、`ok: true`、`harnesses` を持つ JSON オブジェクトとして標準出力に出し、終了コード `0` を返します。`human` では表形式の一覧と補足案内を出します（同 `strata_cli/launch/cmd.py:845-856`）。
-- アプリ名を指定した JSON 出力は、設定ファイル・環境変数などを `files` / `env` 等に含めた JSON オブジェクトです。設定中の API key は JSON 内でマスクされ、`--show-key` を同時指定しても JSON 経路ではマスクされたままです（同 `strata_cli/launch/cmd.py:864-879`; `strata_cli/launch/harness.py:263-268,310-311`）。
-- `--output json` の通常経路は JSON を出力して `return 0` するため、その後にある `--write` 処理を実行しません。これは `--write` 単独の場合の動作と異なります（同 `strata_cli/launch/cmd.py:872-879,930-948`）。
-- `--check` を併用すると、設定されたアプリの通信形式でサーバーへ prompt と tool call を1回ずつ送信し、その結果を JSON の `checks` に加えます。2つとも成功すれば `ok: true` / 終了コード `0`、いずれか失敗なら `ok: false` / `error` と終了コード `1` です。チェック実行後も JSON 経路は戻るため、`--write` は実行されません（同 `strata_cli/launch/cmd.py:880-896`; `strata_cli/launch/check.py:1-7,111-143`）。
+`human` では、アプリ一覧を表形式で表示し、個別アプリの場合は生成される設定ファイルの内容、環境変数、注意事項などを人間向けの文言で表示します。`json` では、一覧を `schema_version: 1` と `harnesses` を含む JSON オブジェクトとして返し、個別アプリでは設定情報と `files`、`vendor_tested` などを JSON オブジェクトとして標準出力に返します。JSON のファイル内容と文字列値は API キーが含まれていればマスクされます（`terminal/strata_cli/launch/cmd.py:1052-1066,1082-1086,1118`）。
+
+`--check` を併用すると JSON に `checks`、`checked_server`、総合判定 `ok` が含まれ、失敗時は `error` も追加されます。失敗時の終了コードは `1` です。`--write` または `--dry-run` を併用すると JSON に書き込み結果が含まれます。`--write` の確認が必要な場合、確認プロンプトは標準エラーへ出し、JSON 本体は標準出力に保たれます（`terminal/strata_cli/launch/cmd.py:1087-1118,1019-1050`）。
 
 ## 適用条件と副作用
 
-- `--output` 自体は出力形式を選びます。`--check` を付けた場合はサーバーへ2つのリクエストを送信し、応答内容も検査します（`strata_cli/launch/check.py:36-43,111-143`）。
-- JSON と `--write` の併用ではファイル書き込みは行われません。人向けの既定形式で `--write` を指定した場合は確認後に設定ファイルを書き込み、既存ファイルのバックアップや JSON 設定のマージを行う経路があります（`strata_cli/launch/cmd.py:930-948`; `strata_cli/launch/harness.py:275-298`）。
-- JSON 出力には秘密情報のマスクが含まれます。人向け出力では `--show-key` により実際の key を表示する経路があります（`strata_cli/launch/cmd.py:870-875,900-910`）。
+このオプションは `strata connect` の出力分岐に適用され、`strata launch` など別コマンドの同名オプションとは別スコープです（parser: `terminal/strata_cli/launch/cmd.py:73-80,163-183`）。`--output json` 単独ではファイルを書き換えず、書き込みは `--write`、プレビューは `--dry-run` によって行われます（`terminal/strata_cli/launch/cmd.py:1108-1118,1156-1167`）。
+
+JSON 出力では `--show-key` を併用してもキーはマスクされます。`run_connect` は JSON 分岐で設定内容を `harness.mask` に通しており、`--show-key` の値を使うのは human 分岐だからです（`terminal/strata_cli/launch/cmd.py:1081-1086,1120-1127`）。
 
 ## 出力とエラー
 
-- JSON モードの一覧・設定内容は標準出力へ出ます。人向けモードも説明内容を標準出力へ出します（`strata_cli/launch/cmd.py:847-855,872-879,897-920`）。
-- 存在しないアプリ名は、形式指定にかかわらず `strata: ...` の案内を標準エラーへ出し、終了コード `2` を返します（`strata_cli/launch/cmd.py:857-863`）。したがって、この失敗経路は JSON エラーオブジェクトではありません。
-- `--check` の失敗結果は JSON に記録され、終了コード `1` になります（`strata_cli/launch/cmd.py:884-896`）。
+不正な値は parser の選択肢検証で拒否されます。`strata` は `parse_known_args` の後に connect の未知引数を独自メッセージとして標準エラーに出し、終了コード `2` を返します（`terminal/strata_cli/launch/cmd.py:182`; `terminal/strata_cli/cli.py:2325-2334`）。不明なアプリ名も標準エラーに案内を出して `2` を返し、`--output json` で JSON 形式には変換されません（`terminal/strata_cli/launch/cmd.py:1067-1073`）。
+
+JSON モードで `--check` が失敗した場合は、失敗結果を含む JSON を標準出力へ出して終了コード `1` を返します。書き込み時にファイル操作が失敗した場合も、失敗ファイルと後続の未書き込みファイルを示す JSON を出し、コード `1` で終了します（`terminal/strata_cli/launch/cmd.py:1093-1118,1039-1049`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:148-165` — `connect` parser と `--output` の choices・既定値。
-- `strata_cli/launch/cmd.py:842-948` — JSON / human の出力、key のマスク、`--check` と `--write` の制御フロー。
-- `strata_cli/launch/harness.py:238-268,310-311` — アプリ名解決、出力データ生成、key マスク。
-- `strata_cli/launch/harness.py:275-298` — 書き込み時のバックアップ・マージ・権限設定。
-- `strata_cli/launch/check.py:1-7,36-43,111-155` — `--check` が送るリクエストと判定・失敗内容。
+- `terminal/strata_cli/launch/cmd.py:163-183` — `connect` parser と `--output` の `choices=("human", "json")`、既定値 `human`。
+- `terminal/strata_cli/cli.py:516-517,2235-2237` — `connect` parser の登録と `run_connect` への dispatch。
+- `terminal/strata_cli/launch/cmd.py:1052-1066` — 一覧表示における human / JSON 分岐。
+- `terminal/strata_cli/launch/cmd.py:1074-1086,1120-1136` — 個別 harness の JSON / human 出力とキーのマスク。
+- `terminal/strata_cli/launch/cmd.py:1087-1119,1147-1167` — check と write / dry-run の出力・終了経路。
+- `terminal/strata_cli/launch/cmd.py:1019-1050` — 書き込み時の確認、ファイルエラー、終了コード。
+- `terminal/strata_cli/cli.py:2325-2334` — parser 後の未知引数のエラー処理。

@@ -1,41 +1,47 @@
 # `STRATA_VERIFY_HOST_UNCACHED`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-SYCL verifier が使うホスト共有バッファの割り当て方法と、stepped verify の doorbell payload store を切り替えます。`STRATA_VERIFY_STEPPED` が無効ならこの変数の値にかかわらず uncached 側が選ばれます。stepped verify が有効なときは、この変数も有効にしない限り、通常の host USM と plain payload store を選びます（`sycl/src/core/verify.cpp:94-105,220-229,231-243,1783-1789`）。
+SYCL verifier の verify window 用 mapped staging buffer を uncached host allocation 経由にするかを選ぶ。さらに stepped verify の segmented capture では、window の payload publish を通常 store に強制するかにも使われる。`STRATA_VERIFY_STEPPED` が無効なら、この変数の値にかかわらず uncached 側が選ばれるため、主に stepped verify の A/B 用設定である（`engine/sycl/src/core/verify.cpp:194,315-318,328-330,2051-2057`）。
 
 ## 値と判定
 
-`env_on()` は値を数値や真偽値として parse せず、設定があり、空文字でなく、先頭文字が `0` でないことだけを調べます（`sycl/src/core/verify.cpp:94-97`）。この判定は `window_host_uncached()` 内の `static const bool` に保存されるため、最初の呼び出し以降に環境を変更しても再評価されません（同 `:226-229`）。
+`env_on(name)` は `std::getenv` の結果が null でなく、先頭文字が NUL（空文字）でも `'0'` でもない場合に true とする。文字列全体や数値は parse しない（`engine/sycl/src/core/verify.cpp:151-154`）。
 
-| `STRATA_VERIFY_STEPPED` | `STRATA_VERIFY_HOST_UNCACHED` | `window_host_uncached()` |
-|---|---|---|
-| 無効（未設定、空、または先頭が `0`） | 任意 | `true`（この変数は判定に使われない） |
-| 有効 | 未設定、空文字、先頭が `0` | `false` |
-| 有効 | 空でなく、先頭が `0` 以外 | `true` |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| `STRATA_VERIFY_STEPPED` が有効 | `window_host_uncached()` は true | 空文字以外で先頭が `0` 以外でも、結果は常に true | 同左 |
+| stepped verify が有効 | false（通常の stepped 経路では uncached を外す） | `1`, `true`, `yes`, `2`, ` 1`（先頭が `0` 以外） | 空文字、`0`, `0anything` |
 
-したがって stepped 時は `1`, `true`, `false`, `2`, `anything` が有効で、`0`, `0anything`, 空文字は無効です。大文字小文字、後続文字、空白、数値としての妥当性は検査しません。CLI 引数や設定ファイルによるこの変数の上書きは実装にありません。
+大文字小文字、後続文字、数値としての妥当性は検査しない。設定値は `window_host_uncached()` 内の関数ローカル `static` に初回評価時に保存される。実行中に環境を変更しても値は更新されない。なお `g_stepped` 自体も初期化時に `STRATA_VERIFY_STEPPED` を同じ helper で一度読み取る（`engine/sycl/src/core/verify.cpp:151-154,194,315-317`）。
 
 ## 有効になる条件
 
-- 対象コードは SYCL verifier (`sycl/src/core/verify.cpp`) です。CUDA/HIP verifier でこの名前を読む箇所はありません。ソース上で `STRATA_VERIFY_STEPPED` は Arc A-series 向け opt-in と記され、stepped mode では doorbell window を segment に分けます（`sycl/src/core/verify.cpp:103-105,1830-1837,2160-2164`）。
-- stepped mode で segmented verify を使うのは、all-resident (`ar_on()`) でなく、`STRATA_VERIFY_EAGER` が未設定の経路です（同 `:1830-1837`）。このとき `STRATA_VERIFY_HOST_UNCACHED` は割り当て方式に加え、segment の publish payload を plain store にするかにも作用します。
-- `STRATA_VERIFY_EAGER` が設定されている場合や all-resident 経路では `capture_segments()` を通らないため、`PlainPayload` による plain store の切り替えは行われません。ただし `mapped()` は verifier の staging 領域に共通して `window_host_uncached()` を参照します（同 `:231-243,1830-1837`）。
-- 実際に Level Zero の uncached host allocation を得るかは、この変数だけでは決まりません。`host_malloc_polled()` は `STRATA_HOST_UNCACHED` が未設定または先頭文字が `0` でないこと、Level Zero 関連ヘッダーがビルド時に存在すること、queue backend が Level Zero であることを条件に `zeMemAllocHost` を試します。それ以外や確保失敗時は `sycl::malloc_host` に fallback します（`sycl/include/strata/sycl_queue.hpp:48-53,63-78`）。
-- segmented verify で plain store を使うかは `STRATA_DOORBELL_PLAIN` による既定判定とも合成されます。`doorbell_plain_payload()` は設定時に先頭文字が `1` なら true、その他なら false、未設定時は i915 driver 判定を返し、publish 側はこの値または stepped window が設定する plain flag のどちらかが true なら plain store を選びます（`sycl/include/strata/sycl_doorbell.hpp:100-112`, `sycl/src/kernels/cuda/elementwise.dp.cpp:629-636,736-768`）。
+- 対象の読み取りと効果は `engine/sycl` の verifier 実装にある。CUDA/HIP の verifier 経路がこの名前を読む箇所はない（同ファイル `:315-318`）。
+- `STRATA_VERIFY_STEPPED` が無効なら本変数では切り替えられず、`window_host_uncached()` は true を返す。
+- stepped verify で false になった場合、staging buffer は `sycl::malloc_host` に進み、segmented capture の payload に通常 store を強制する（`engine/sycl/src/core/verify.cpp:315-318,328-330,2051-2057`）。
+- `STRATA_VERIFY_STEPPED` が有効でこの変数も有効でも、実際に uncached host allocation を得られるかは `strata::host_malloc_polled` の条件次第。ビルドに Level Zero headers があり (`STRATA_HAVE_ZE`)、queue backend が Level Zero で、かつ `STRATA_HOST_UNCACHED` が先頭 `0` でないときに Level Zero host allocation を試す。それ以外や allocation が失敗した場合は `sycl::malloc_host` に fallback する（`engine/sycl/include/strata/sycl_queue.hpp:64-78`）。従ってこの変数単独では uncached allocation を保証しない。
+- segmented capture 内の payload store 切替は `g_stepped && !ar_on() && STRATA_VERIFY_EAGER 未設定` の経路に限られる。`STRATA_VERIFY_EAGER` が設定されている場合は segmented capture に入らない（値が空でも「設定あり」）ため、この変数による PlainPayload guard は適用されない（`engine/sycl/src/core/verify.cpp:2098-2105`）。
+- `STRATA_DOORBELL_PLAIN` は publish の plain/atomic store 選択に別途作用する。guard が通常 store を強制しなくても、この別設定または既定判定が plain store を選ぶ場合がある（`engine/sycl/include/strata/sycl_doorbell.hpp:101-113`, `engine/sycl/src/kernels/cuda/elementwise.dp.cpp:638-645,745-750`）。
 
 ## 実行時の詳細
 
-`Verifier::init()` は token、step、position、doorbell、expert payload、plan などの mapped staging 領域を `mapped()` で確保します（`sycl/src/core/verify.cpp:527-553`）。`window_host_uncached()==true` なら `host_malloc_polled()`、false なら `sycl::malloc_host()` を選びます。前者を選んでも、前節の backend・build・`STRATA_HOST_UNCACHED` 条件により Level Zero 特殊確保が使われない場合があります。確保に失敗すると初期化エラー `verify: mapped staging allocation failed`（plan 領域では `verify: mapped plan allocation failed`）になります。SYCL exception は `exc.what()` とソース位置を stderr に出して `exit(1)` します（同 `:239-249,543-552`）。解放時は同じ補助 API の `host_free_polled()` を使います（同 `:452-455`; `sycl/include/strata/sycl_queue.hpp:79-90`）。
+`window_host_uncached()` の static 値を `mapped()` が参照し、verify window の token、flag、plan、payload などの mapped staging を `strata::host_malloc_polled` または `sycl::malloc_host` で確保する。成功時はゼロ初期化し、同じ host pointer を device 側 pointer に設定する。主要 staging の確保失敗は `verify: mapped staging allocation failed`、plan buffer は `verify: mapped plan allocation failed` として caller に返る（`engine/sycl/src/core/verify.cpp:320-332,691-730`）。
 
-segmented verify では `capture_segments()` の RAII guard が、`!window_host_uncached()` を `doorbell_plain_payload(bool)` に設定し、capture 終了時に false に戻します（`sycl/src/core/verify.cpp:1783-1789`）。この flag は publish kernel の payload store に渡されます（`sycl/src/kernels/cuda/elementwise.dp.cpp:629-640,736-768`）。従って stepped 時に本変数が有効なら、この guard は plain store を強制せず、無効なら segment capture 中に plain store を有効にします。`STRATA_DOORBELL_PLAIN` が独立に plain を選んでいる場合はその設定も反映されます。
+stepped の segmented capture では RAII guard が window 中 `doorbell_plain_payload(!window_host_uncached())` を設定し、終了時に false に戻す。従って変数が有効ならこの guard は通常 store を強制せず、無効なら通常 store を選ぶ。doorbell publish はこの状態と `STRATA_DOORBELL_PLAIN` の設定を参照する。payload store の選択は verify の token 選択・受理条件を変更する設定としては実装されていない（`engine/sycl/src/core/verify.cpp:2051-2057`, `engine/sycl/src/kernels/cuda/elementwise.dp.cpp:638-645,745-750`）。
 
-本変数自体を理由とするログや警告はありません。コードコメントは、stepped mode が segment の完了後に payload を読み、既定の uncached host memory と uncached payload store を避けられる設計だと説明しています（`sycl/src/core/verify.cpp:220-225`; `sycl/src/kernels/cuda/elementwise.dp.cpp:629-632`）。本変数が直接変えるのはその選択です。環境値による性能効果はこの調査で測定していません。
+## ログと測定値
+
+この変数自体について値や分岐を表示するログはない。関連する SYCL allocation exception は `exc.what()` と `Exception caught at file:...` を stderr に出して `exit(1)` する経路がある（`engine/sycl/src/core/verify.cpp:334-337`）。
+
+実装コメントには Arc A770、xe、Coder IQ1_M、8K prompt の条件で、uncached の有無による GPU wait と decode throughput の値が記載されている（`engine/sycl/src/core/verify.cpp:309-314`）。測定回数、詳細な実行環境や測定方法はそのコメントにないため、再現性や他機種への一般化は確認できない。`docs/DETAILS.md` にこの変数の説明は見当たらず、同文書にある別の I/O uncached 機能とは別の実装である。
 
 ## 根拠
 
-- 全リポジトリで `STRATA_VERIFY_HOST_UNCACHED` を検索し、実際に環境値を読む箇所は `sycl/src/core/verify.cpp:227` の一箇所と確認しました。もう一つの一致は直前の説明コメント (`:225`) です。helper の値判定は同ファイル `:94-97`、読み取り時期と既定は `:103-105,220-229` です。
-- staging の割り当てと失敗経路: `sycl/src/core/verify.cpp:231-249,527-553`; Level Zero 条件・fallback・free: `sycl/include/strata/sycl_queue.hpp:48-90`。
-- stepped segmented capture と doorbell payload の連携: `sycl/src/core/verify.cpp:1783-1789,1830-1837`; plain flag と publish 経路: `sycl/src/kernels/cuda/elementwise.dp.cpp:629-640,736-768`; doorbell の既定値: `sycl/include/strata/sycl_doorbell.hpp:100-112`。
+- `engine/sycl/src/core/verify.cpp:151-154,188-194` — flag 判定 helper と stepped mode の読み取り。
+- `engine/sycl/src/core/verify.cpp:309-318,320-337` — 既定条件、対象 allocation、allocation 失敗時の処理。
+- `engine/sycl/src/core/verify.cpp:691-730,2051-2057,2098-2105` — mapped buffer の利用、payload guard、segmented capture 条件。
+- `engine/sycl/include/strata/sycl_queue.hpp:64-78` — uncached host allocation の build/backend/別環境変数条件と fallback。
+- `engine/sycl/include/strata/sycl_doorbell.hpp:101-113`、`engine/sycl/src/kernels/cuda/elementwise.dp.cpp:638-645,745-750` — payload store 選択。

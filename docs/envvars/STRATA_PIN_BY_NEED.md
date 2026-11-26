@@ -1,62 +1,56 @@
 # `STRATA_PIN_BY_NEED`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-通常の resident arena では、GPU から DMA できるように arena の先頭から連続範囲を登録します。この方式は、GPU が保持するエキスパートの分布に関係なく先頭側を優先します。`STRATA_PIN_BY_NEED` を有効にすると、`--expert-profile` の順位と GPU エキスパートキャッシュの推定内容から登録候補を作り、GPU に常駐しない見込みの高順位エキスパートから個別の範囲として host pin します。ピンできなかった領域は、可能な場合 OS の working-set lock で常駐させます。
+ネイティブ expert arena を開く前に、GPU expert cache に入らないと推定した expert を expert profile の順位順にホストメモリ登録し、空きがあれば GPU 常駐と推定した expert も後順位で登録する。既定の prefix pinning では先頭側の領域から登録するため、この変数が有効な経路では `ArenaExpertSource` に登録対象の優先順位を渡す。実際に登録された範囲だけが `pinned()` / `device_alias()` で PCIe 経由の GPU 読み出し対象になり、登録されなかった expert はその範囲として扱われない（`engine/src/program/generate.cpp:8762-8774, 8833-8845`; `engine/include/strata/core/expert_source.hpp:1356-1375`; `engine/src/core/expert_source.cpp:7013-7033`）。
 
-これは起動時に arena を作る経路の設定で、生成時にエキスパートの選択やモデル出力を変更する機能ではありません。直接の環境変数読み取りは `src/program/generate.cpp` の resident arena 初期化箇所一つです。
+この処理はモデルの expert の配置・読出し経路に関するもので、通常の生成処理や選択順位をこの変数だけで変えるとはコードから確認できない。コードコメントは prefix pinning と byte-identical と記すが、ここでは測定や出力同一性を独立に検証していない（`engine/src/program/generate.cpp:8762-8771`）。
 
 ## 値と判定
 
-`std::getenv()` の戻り値が存在し、先頭文字が NUL でも `'0'` でもなければ有効です。文字列全体の parse、数値変換、大文字小文字変換はありません。
+エンジン起動中、アリーナを開く前に `std::getenv` で一度読み、値全体は parse せず、空でない文字列の先頭文字だけを見る（`engine/src/program/generate.cpp:8774, 8784`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | 無効。先頭からの従来 pinning を使用 |
-| 空文字 | 無効（`pn[0] == '\0'`） |
-| `0`、`0anything` | 無効（先頭が `'0'`） |
-| `1`、`true`、`false`、空白で始まる文字列など | 有効（空でなく先頭が `'0'` 以外） |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| 明示値の判定（各ビルド） | 通常は off。Windows HIP の条件付き既定動作は次節を参照 | 空でなく先頭が `0` 以外。`1`, `true`, `false`, ` 0`, `0anything` のうち前3つと ` 0` は on | 空文字、`0`, `0anything` は off |
 
-従って `=1` だけが有効値ではありません。`false` もコード上は有効です。
-
-併用する `STRATA_PIN_BY_NEED_SKIP` は、空でないとき `std::atoll()` で変換されます。負値は 0 に丸め、結果は profile の件数を上限にします。数値として読めない文字列は `atoll` の結果 0 です。未設定または空文字なら自動推定を使います。これは本変数の有効化条件ではなく、GPU に常駐すると見積もる ranked pair の件数を指定します（`src/program/generate.cpp:4938-4969`）。
+大小文字、空白、数値としての妥当性、文字列の残りは検査しない。したがって `false` も先頭が `f` のため有効で、` 0` も先頭が空白のため有効である。明示的な値が空文字ならこの判定は off だが、Windows HIP の既定条件が成立すれば既定動作で on になり得る（`engine/src/program/generate.cpp:8774-8784`）。
 
 ## 有効になる条件
 
-次の条件が必要です。
-
-- `--mmap-experts` の FileExpertSource 経路ではなく、resident arena を使う。
-- `--expert-profile` が読み込まれ、ランキングが空でない。
-- 単一 GPU で、layer split／peer GPU を使わない。
-- 他 GPU 上の helper expert cache がない。
-
-profile が空、複数 GPU／peer GPU、または helper cache がある場合、stderr に `strata generate: pin by need: off (%s); the prefix pinning stays` という理由付きログが出て、従来方式に戻ります。profile がない理由は `it needs --expert-profile (the ranking)`、GPU 構成の理由は `not with a layer split or a peer GPU`、helper cache の理由は `not with helper caches on other GPUs` です（`src/program/generate.cpp:4929-4936`）。
-
-`STRATA_ARENA_MMAP` が arena の file-backed mmap を選ぶ場合と `--shared-expert-arena` を使う場合も、`ArenaExpertSource::open()` は padded layout／by-need 登録を作りません。呼び出し側はその前に優先順位を設定し、候補数のログを出すことがありますが、この二つの arena 方式では登録順を by-need に切り替える結果にはなりません（`src/core/expert_source.cpp:4510-4519,4595-4602`）。
+- 対象は `o.mmap_experts` のファイル読み出し経路ではなく、`generate.cpp` の `else` 側で使う `ArenaExpertSource` の経路である。エンジンがアリーナを開く前に候補順位を設定する（`engine/src/program/generate.cpp:8621-8628, 8745-8747, 8844, 8871-8872`）。
+- 明示的に on と判定されても、expert profile がなければ off となり、stderr に `strata generate: pin by need: off (it needs --expert-profile (the ranking)); the prefix pinning stays` を出す（`engine/src/program/generate.cpp:8784-8792`）。
+- layer split、peer GPU、他 GPU の helper cache がある場合も off となり、同じ形式で理由を stderr に出す。判定箇所は `multi_gpu || o.peer_device >= 1` および `o.expert_cache_remote` の正値（`engine/src/program/generate.cpp:8785-8792`）。
+- HIP を Windows で使う場合に限り、環境変数が unset または空文字なら、WDDM、discrete GPU での spill、Qwen defaults 0.2.6 でないこと、有効な profile、単一 GPU、peer device なし、helper cache なしをすべて満たすと既定で有効になる。それ以外の build ではこの条件付き既定値は常に false。明示値の有効判定は別途適用される（`engine/src/program/generate.cpp:8775-8784`）。
+- `STRATA_ARENA_MMAP` により arena が mmap される場合、および `--shared-expert-arena` の共有 arena では `ArenaExpertSource::open` が pin-by-need の padded layout を選ばない。HIP/Windows の既定判定そのものは共有 arena を条件に含めないが、登録レイアウト側で適用されない（`engine/src/core/expert_source.cpp:6692-6710`）。
+- Linux HIP の UMA no-register 状態では、pin-by-need の候補があっても `PinnedArena::ByNeed` は範囲を GPU 登録しない。`STRATA_ARENA_PIN_GIB` のほか、HIP/Linux では engine の no-register flag がこの判定に関わる（`engine/src/core/pinned.cu:611-620, 1213-1238`）。
+- `STRATA_ARENA_PIN_GIB` および生成側の pin limit が登録範囲を制限する。登録は候補順で進み、cap 到達または driver の登録拒否でそこで止まる。これは変数を有効にしたことが全候補の登録を保証しないことを意味する（`engine/src/program/generate.cpp:8753-8761, 8871-8874`; `engine/src/core/pinned.cu:1193-1238`）。
+- `STRATA_ARENA_LOCK=0` は GPU 用の範囲登録を止める条件ではないが、登録されなかった arena の穴をホスト側で resident lock する処理を無効にする（`engine/src/core/pinned.cu:1243-1270`）。
 
 ## 実行時の詳細
 
-環境変数は `generate` の arena 初期化中、arena の `open()` より前に読みます。profile はそれ以前に `--expert-profile` から読み込まれます。設定はその起動処理で一度判定され、リクエストごとには読み直されません（`src/program/generate.cpp:3656-3699,4927-4990`）。
+値は engine startup の arena setup 時に読み取られ、リクエストごとの再評価や関数内 static cache はない。profile は先に読み込まれており、明示 profile がない場合は pin-by-need を実行しない（`engine/src/program/generate.cpp:6746-6751, 8772-8792`）。設定値をプロセス実行中に変更しても、作成済みの候補順位や登録範囲は変わらない。反映には engine の再起動が必要となる。
 
-GPU に常駐すると見積もる順位数 `skip` は、`STRATA_PIN_BY_NEED_SKIP` がなければ `--expert-cache` の明示スロット数、または空き VRAM から予約量を差し引いた値を基に算出されます。推定バイト数は 2% 減らし、profile の順位順に収まる pair 数を数えます。続いて pin 候補は、profile の `skip` 位以降、profile にない全 pair（layer/expert 順）、最後に GPU 常駐見込みの上位 `skip` pair の順です。最初の二群が非常駐見込みの候補として別カウントされ、pin 上限が余れば最後の群も対象になります（`src/program/generate.cpp:4938-4986`）。この推定は実際の後続 GPU cache 初期化より前に行われます。
+有効時は profile の順位列から、GPU cache に入ると見積もった先頭 `skip` 件を除いた残りを候補にし、profile にない expert を layer 順で追加する。これを非 GPU 常駐候補として記録し、最後に先頭 `skip` 件も低い優先度で追加する（`engine/src/program/generate.cpp:8793-8844`）。`STRATA_PIN_BY_NEED_SKIP` が非空なら `atoll` 変換値を 0 以上かつ profile 件数以下に制限して `skip` に使う。非数値や負値は 0、過大値は profile 件数になる。unset / 空文字なら、`--expert-cache N` が正値のとき `N * nibble_max_slot_bytes()`、それ以外では free VRAM から prefill / drafter / pipeline 等の予約分を引いた値の 98%を使い、profile 順に GPU 常駐件数を推定する（`engine/src/program/generate.cpp:8795-8827`）。
 
-`ArenaExpertSource` は by-need layout の場合、各 expert blob の stride を 4 KiB 境界に切り上げ、候補の隣接 blob を結合して登録範囲を作ります。stride 分の arena 増加があります。登録は優先順位順で、4 KiB ページの内側に合わせて行い、先行範囲と重なるページを除外します。`STRATA_ARENA_PIN_GIB` または呼び出し側の上限に達したとき、あるいは CUDA/HIP runtime の host registration が失敗したとき、後続の登録を止めます。未登録の穴は `STRATA_ARENA_LOCK=0` でなければ resident lock の対象になります（`src/core/expert_source.cpp:4595-4643`; `src/core/pinned.cu:502-586`）。
+`set_pin_priority` の順位は `open()` で blob 単位の範囲へ変換され、隣接 blob は同じ優先 tier 内で結合される。範囲はページ境界に合わせ、順位順にホスト登録される。登録対象・上限により一部だけが登録されることがあり、同じ `pinned()` / `device_alias()` 判定を通じて PCIe share がある layer と expert が決まる（`engine/include/strata/core/expert_source.hpp:1363-1373`; `engine/src/core/expert_source.cpp:6692-6741, 6897-6921, 7013-7033`; `engine/src/core/pinned.cu:1214-1238`）。
 
-登録後、各範囲の device alias を取得します。失敗すると by-need の alias 表を破棄して pin 済みバイト数を 0 とし、正しい device pointer を使えない経路を避けます。成功時は blob 全体が一つの登録範囲内にある場合だけ `pinned()`／`device_alias()` が pin 済みと判定し、layer に PCIe 経由で利用可能な blob があるかも範囲から作ります（`src/core/expert_source.cpp:4752-4778,4852-4884`）。
+Terminal の `strata launch --set STRATA_PIN_BY_NEED=1` は env 名として受け付けられ、launch config の `env` に格納される。engine 起動時には config の env が継承環境に上書きされるため、同じキーを shell 環境にも設定している場合は launch config 側が優先する（`terminal/strata_cli/launch/settings.py:361-377`; `terminal/strata_cli/launch/runner.py:801-806`; `terminal/serve/server.py:4007-4028`）。エンジン側にこの名前の CLI option はなく、直接起動時は環境変数として渡す。
 
-主な stderr 出力は、有効経路の候補・profile 件数、登録範囲数、pin されたバイト数と非常駐候補に対する割合です（`src/program/generate.cpp:4983-5009`）。この設定だけで pin 上限を増やすことはありません。特に Windows では `STRATA_ARENA_PIN_GIB` の既定上限が適用されます。Linux では同じ候補選択ロジックでも登録可能量は runtime／ドライバーの結果に依存します。
+## ログと測定値
 
-## 文書・測定値との照合
-
-`docs/DETAILS.md:188-194` は本機能を opt-in、単一 GPU の arena 向けとして説明し、Windows の WDDM 共有予算により prefix pinning では後半層に PCIe share がなくなる例と、ranked non-GPU-resident expert を優先する動作を記しています。ソースにも単一 GPU・profile 前提および順位付き候補登録が確認できます。README 日本語版は Windows の prompt read が RTX 5070 で +4.4% と記載します（`README.ja.md:168-180`）。DETAILS の community report は RTX 3090 + Ryzen 5 5600X、prompt read +5–7%（56K–117K tokens）等を報告しています。いずれもリポジトリ記載の測定値であり、この調査で再測定した値ではありません。一般的な性能向上を保証するものではありません。
+- profile 条件などを満たさない場合、理由付きの `pin by need: off (...)` と prefix pinning 継続を stderr に出す（`engine/src/program/generate.cpp:8790-8792`）。
+- 有効経路では、GPU 常駐と推定した順位件数と pin 候補数を stderr に出す（`engine/src/program/generate.cpp:8841-8844`）。
+- arena の読み込み後、登録範囲数、非 GPU 常駐 expert のうち登録された割合、PCIe share がある layer 数を stderr に出す（`engine/src/program/generate.cpp:8917-8932`）。`expert arena: ...` の note には登録範囲数と MiB、driver が次の範囲を拒否した場合は `the driver refused the next one`、cap 到達時は `the cap was reached` が含まれる（`engine/src/core/pinned.cu:1230-1251`; `engine/src/program/generate.cpp:8934-8939`）。
+- 登録候補の値だけを見た性能測定値はここでは記載しない。関連資料 `docs/DETAILS.md:293-297` は Windows の opt-in と登録対象の概要、上限の説明を載せるが、条件付き測定値は示していない。現行コードには Windows HIP の条件付き既定動作もあるため、詳細は上記ソースの条件を基準とする。
 
 ## 根拠
 
-- `src/program/generate.cpp:3656-3699`: expert profile の読込。
-- `src/program/generate.cpp:4902-4916,4927-5009`: resident arena 経路、環境値判定、条件、候補順位とログ。
-- `include/strata/core/expert_source.hpp:952-964`: 優先順位 API と呼び出し前提。
-- `src/core/expert_source.cpp:4510-4519,4595-4643,4752-4778,4852-4884`: mmap 除外、padded layout、範囲作成、alias と pinned 判定。
-- `src/core/pinned.cu:502-586`: 範囲ごとの登録、上限・失敗時の停止、未登録範囲の resident lock。
-- `docs/DETAILS.md:188-194`, `README.ja.md:168-180`: 公開説明と測定値。
+- `engine/src/program/generate.cpp:6746-6751, 8621-8628, 8745-8845, 8871-8939`
+- `engine/include/strata/core/expert_source.hpp:1356-1375`
+- `engine/src/core/expert_source.cpp:6692-6741, 6897-6921, 7013-7033`
+- `engine/src/core/pinned.cu:611-629, 1177-1270`
+- `terminal/strata_cli/launch/settings.py:361-385`, `terminal/strata_cli/launch/runner.py:801-806`, `terminal/serve/server.py:4007-4028`
+- 関連資料との照合: `docs/DETAILS.md:288-297`

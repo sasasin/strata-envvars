@@ -1,51 +1,59 @@
 # `STRATA_ATTN_DAILY`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の QSA decode attention で、chunk 計算に `attn_chunk_kernel_pre75`（Daily 由来の実装）を選ぶかを指定します。有効時は merge にも `attn_merge_v2_kernel` が既定で選ばれます。CUDA の全カードで明示的に有効化できますが、unset の場合は compute capability 12.0（sm_120）だけで既定有効です。HIP では `daily_attn()` が常に false を返すため、この変数による切り替えはありません。
+CUDA の QSA decode attention で、通常の `attn_chunk_kernel` の代わりに Daily 系の `attn_chunk_kernel_pre75` を選ぶスイッチです。対応する通常 CUDA build では明示的に `1` を指定すると全 CUDA カードでこの chunk kernel を選び、未設定時は sm_120 / 測定対象の sm_121 と一部の起動時アーキテクチャ既定値で選びます。HIP build では `daily_attn()` が常に `false` を返すため、この変数は kernel 選択に使われません（`engine/src/kernels/cuda/qsa_decode_attn.cu:896-924, 926-975`）。
 
-対象の decode attention は、逐次 1 query の `qsa_decode_attn_step` のほか、複数 query の batch、slot、row 経路から呼ばれます。slot 経路は PR #540 の kernel を使う場合、slot 一括 kernel を使わず batch 呼び出しへ fallback します。
+同じ関数の結果は `STRATA_ATTN_MERGE_V2` が未設定または空文字のときの merger 選択にも使われます。`STRATA_ATTN_MERGE_V2` に非空値がある場合はそちらが優先されるため、Daily chunk と v2 merger は個別に切り替えられます（`engine/src/kernels/cuda/qsa_decode_attn.cu:1003-1021`）。
 
 ## 値と判定
 
-CUDA 実装は、最初に `daily_attn()` が呼ばれた時に環境変数を一度読み、プロセス内の static 値に保存します。値が設定されている場合は文字列全体が厳密に `1` と一致する時だけ有効です。
+CUDA では `std::getenv` の結果を関数内 `static` に一度だけ保存し、文字列全体がちょうど `"1"` のときだけ有効です。未設定はアーキテクチャ既定値に委ねられます。空文字、`0`、`true`、`01`、`1x`、前後に空白のある ` 1` はすべて明示的な無効値です。数値変換はしません（`engine/src/kernels/cuda/qsa_decode_attn.cu:902-922`）。
 
-| 値 | `daily_attn()` の結果 |
-|---|---|
-| unset | 現在の CUDA device が sm_120 で、`STRATA_SM120_PERF` が無効化していない場合に有効。それ以外は無効 |
-| `1` | 有効（全 CUDA card） |
-| `0`、空文字、`01`、`1x`、`true` など | 無効。unset 時の sm_120 既定判定も行わない |
+| CUDA build / 実行条件 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| 通常 build、sm_86。全可視 CUDA GPU が同一 compute capability のとき起動時に既定値テーブルを適用 | `STRATA_SM86_PERF` が `0` で始まらなければ起動時に `1` が設定される。`0` または `0anything` なら既定値なし | `1` | `0`、空文字、`true`、`01`、`1x` 等 |
+| 通常 build、sm_89。同一 capability のとき既定値テーブルを適用 | `STRATA_SM89_PERF` が `0` で始まらず、`STRATA_DEFAULTS` が `026` / `0.2.6` / `v0.2.6` でなければ起動時に `1` が設定される（`STRATA_SM89_PERF=0anything` も抑止値） | `1` | 上記以外の設定値 |
+| 通常 build、sm_120 | 未設定なら `sm120_default` により既定で有効。`STRATA_SM120_PERF` が未設定または整数変換結果が非 0 の場合に有効 | `1` | 上記以外の設定値 |
+| 通常 build、sm_121（GB10） | 未設定なら `kGb10AttnDaily=true` のアーキテクチャ既定値で有効。ただし `STRATA_SM121_PERF=0` または `STRATA_DEFAULTS` の 0.2.6 指定時は無効 | `1` | 上記以外の設定値 |
+| 上記以外の通常 CUDA GPU | 未設定なら無効 | `1` | 上記以外の設定値 |
+| CUDA `STRATA_EXPERIMENTAL_SM60` build、sm_75 未満 | unset 時にこの変数自体は通常の sm_12x 既定値に従う。ただし別の `STRATA_ATTN_PRE75` 判定が旧 kernel を選べる | `1` | 上記以外の設定値。ただし sm_75 未満では `STRATA_ATTN_PRE75` が別途選択を変える |
 
-未設定時の sm_120 判定では `STRATA_SM120_PERF` も static cache されます。同変数が未設定なら有効、設定時は `atoi(value) != 0` なら有効です。そのため `STRATA_SM120_PERF=0` なら sm_120 での既定有効化は止まります。`STRATA_ATTN_DAILY` に何らかの値（空文字を含む）を明示すると、sm_120 既定値より優先されます。
+既定値を設定する `nv_default_env` は sm_86 / sm_89 の表にこの変数を含め、既に環境に値があれば値の内容を問わず上書きしません。sm_86 の表は `STRATA_SM86_PERF` で、sm_89 は `STRATA_SM89_PERF` または `STRATA_DEFAULTS` で無効になります（`engine/src/core/nv_defaults.cpp:41-58, 75-90, 222-237`）。sm_120 / sm_121 は同表からこの変数を設定せず、kernel 側の未設定時判定で既定値を決めます（同 `:104-129, 176-180`; `engine/src/kernels/cuda/qsa_decode_attn.cu:912-922`; `engine/include/strata/core/sm120_series.hpp:32-42, 60-81, 83-95`）。
 
 ## 有効になる条件
 
-- この切替の実装は CUDA の `src/kernels/cuda/qsa_decode_attn.cu` にあります。HIP ビルドでは `daily_attn()` は常に false です。
-- CUDA では PR #540 の kernel がビルドされます。CUDA の通常ビルドでは `pre75_attn()` は `daily_attn()` の結果を使います。`STRATA_EXPERIMENTAL_SM60` ビルドでは、Daily kernel が無効でも compute capability が sm_75 未満なら PR #540 kernel が選ばれます。
-- `STRATA_ATTN_PRE75=0` は PR #540 kernel の選択を止めます。したがって `STRATA_ATTN_DAILY=1` でも chunk kernel の切替が抑止されます。`STRATA_ATTN_PRE75` の他の値判定は同ファイルの `pre75_attn()` に従います。
-- `STRATA_ATTN_MERGE_V2` が空でない値として設定されていれば、その `atoi(value) != 0` の結果が merge 選択に優先します。未設定または空文字なら `STRATA_ATTN_DAILY` の判定に追従します。
-- sm_120 以外のカードでは、変数 unset 時の `STRATA_SM120_PERF` による既定判定は適用されません。ただし `STRATA_ATTN_DAILY=1` の明示指定はカードを問わず有効です。
+- 対象は CUDA の QSA decode attention 経路です。HIP では前処理分岐により `daily_attn()` が `false` 固定です（`engine/src/kernels/cuda/qsa_decode_attn.cu:902-910`）。
+- Kernel の選択点が `STRATA_ATTN_PRE75_BUILT` でコンパイルされている必要があります。この define は全 CUDA build と、gfx906 wave64 以外の HIP build で立ちます。通常の CUDA build では Daily 系 kernel が組み込まれています（同 `:492-505`）。
+- 通常 CUDA build では `STRATA_ATTN_DAILY=1` ならカード世代に関係なく `pre75_attn()` が Daily kernel を選びます。unset 時の既定は sm_120 および測定対象として定義された sm_121 に限られます（同 `:912-962`; `engine/include/strata/core/sm120_series.hpp:60-81, 93-95`）。
+- `STRATA_EXPERIMENTAL_SM60` CUDA build では `STRATA_ATTN_PRE75=0` が `pre75_attn()` を先に無効化します。一方、sm_75 未満は `STRATA_ATTN_DAILY` が `0` 相当でも capability 判定から pre75 kernel を選びます。`STRATA_ATTN_PRE75=1` は sm_75 以上でもその kernel を選びます（`engine/src/kernels/cuda/qsa_decode_attn.cu:926-965`）。
+- 起動時の sm_86 / sm_89 既定値適用は CUDA build で、可視 GPU が 1 枚以上あり、全カードの compute capability が同じ場合に限られます。混在 capability の multi-GPU ではこの既定値テーブルがスキップされます。ただし kernel 側の sm_120 / sm_121 未設定時判定はデバイスごとに評価されます（`engine/src/program/generate.cpp:4421-4450`; `engine/src/kernels/cuda/qsa_decode_attn.cu:912-922`）。
+- sm_86 の既定値は `STRATA_SM86_PERF=0` で抑止されます。sm_89 は `STRATA_SM89_PERF=0` または `STRATA_DEFAULTS=026` 系の指定、sm_120 は `STRATA_SM120_PERF=0`、sm_121 は `STRATA_SM121_PERF=0` または `STRATA_DEFAULTS=026` 系の指定で、それぞれ unset 時の既定が抑止されます。いずれも明示的な `STRATA_ATTN_DAILY` 値がある場合はその値が優先します（`engine/src/core/nv_defaults.cpp:41-43, 75-106, 176-180, 227-233`; `engine/include/strata/core/sm120_series.hpp:32-42, 66-81`）。
+- ソースコメントと `docs/DETAILS.md:1295, 1486-1490` は sm_120 などの既定動作を説明していますが、sm_120 の `sm120_default()` は `STRATA_DEFAULTS` を参照せず `STRATA_SM120_PERF` だけを見ます。そのため現行コードでは sm_120 の未設定時 Daily 既定値は `STRATA_DEFAULTS=026` だけでは抑止されません（`engine/include/strata/core/sm120_series.hpp:32-42, 60-81`）。
+- multi-slot / batch rows の専用経路では、Daily / pre75 kernel が選ばれていても `STRATA_ATTN_PRE75_SLOTS` または `STRATA_BATCH_QSA_STREAM_OPT` が有効でなければ slots 経路は `false` を返すか per-row 経路へ戻ります。これは kernel を使う機会・バッチ化を制限します（`engine/src/kernels/cuda/qsa_decode_attn.cu:978-990, 1150-1172, 1245-1270`）。
+- merger は別設定です。`STRATA_ATTN_MERGE_V2` が非空なら `atoi` の結果が 0 かどうかで v2 を選び、Daily の値を上書きします。未設定または空文字なら Daily の判定に追従します（`engine/src/kernels/cuda/qsa_decode_attn.cu:1003-1021`）。
 
 ## 実行時の詳細
 
-`daily_attn()` は変数が設定済みなら厳密な `1` 判定を返し、unset なら CUDA の現在 device の compute capability を取得して `strata::sm120_default()` を判定します。device 情報の取得に失敗した場合、または device ordinal が 0–63 の範囲外なら false です。unset 時の device ごとの結果も static 配列に cache されます。CUDA 環境変数をプロセス起動後に変更しても、最初の評価後は反映されません。
+`daily_attn()` の初回呼び出し時に環境値を読み、以後は関数内 `static` にキャッシュします。従ってプロセス実行中に環境を変更しても反映されません。unset の場合は GPU の compute capability をデバイスごとの配列にキャッシュし、`sm12x_default(major, minor, kGb10AttnDaily)` の結果を使います。CUDA device の取得・属性取得に失敗した場合はその呼び出しで `false`（kernel 不選択）です（`engine/src/kernels/cuda/qsa_decode_attn.cu:906-922`）。
 
-`pre75_attn()` が true になると batch chunk pass は `attn_chunk_kernel_pre75` を選択します。通常の CUDA ビルドでは `STRATA_ATTN_DAILY=1` が全カードでこの選択を有効にします。merge 関数は `STRATA_ATTN_MERGE_V2` に明示的な非空値がなければ `daily_attn()` の結果を使います。`qsa_decode_attn_batch()` と `qsa_decode_attn_step()` はこの merge 選択を使います。slot batching は `pre75_attn()` が有効な場合に一括 slot kernel を使わず、query ごとの batch 経路へ戻ります。
+通常起動の sm_86 / sm_89 では、`generate.cpp` が GPU を調べた後に `apply_nv_defaults()` を呼び、既存環境値がない場合だけ `STRATA_ATTN_DAILY=1` をプロセス環境へ設定します。設定済みなら空文字や `0` でも保持されます。sm_89 / sm_120 / sm_121 のアーキテクチャ表は `STRATA_DEFAULTS=026` により省かれますが、sm_120 は kernel 側の独立した既定判定が残ります（`engine/src/program/generate.cpp:4421-4449`; `engine/src/core/nv_defaults.cpp:222-237`; `engine/include/strata/core/sm120_series.hpp:32-42, 60-81`）。
 
-別に、CUDA の起動処理は全ての可視 GPU が同じ compute capability である場合に限り、sm_86 / sm_60 用の既定 switch 群を適用します。その群には `STRATA_ATTN_DAILY=1` が含まれ、`STRATA_SM86_PERF=0` または `STRATA_SM60_PERF=0` で該当群を止められます。ユーザーが `STRATA_ATTN_DAILY` を設定済みなら値を上書きせず、未設定時だけ `1` を設定します。設定時には stderr に有効化した switch 名を含む `strata: sm_86 (Ampere)...` または `strata: sm_60 (Pascal)...` のログを出します。これは起動時に環境値を設定する実装であり、kernel 内の環境変数読み取りより先に実行されます。
+QSA batch 経路は選択に応じて chunk kernel を起動し、別途 `attn_merge_v2()` で部分結果をマージします。CUDA API の起動エラーがあれば stderr に `qsa_decode_attn_batch: <CUDA error>` または slots 経路の同様の文言を出し、プロセスを終了コード 1 で終了します。不正な geometry / buffer も具体的な `unsupported geometry or missing buffers` を出して終了します（`engine/src/kernels/cuda/qsa_decode_attn.cu:1132-1147, 1150-1156, 1217-1223`）。
 
-## 資料との照合
+## ログと測定値
 
-`docs/DETAILS.md` は 0.1.45 の CUDA opt-in 測定として、RTX 3060 / RTX A4000 での結果をそれぞれ +3.2%（5/5） / +0.7% と記載しています。同資料の見出しは「all off unless you set them」としていますが、現 HEAD には sm_86 / sm_60 用起動時既定値があり、sm_120 でも unset 時の既定有効化があります。したがって、その表は当該測定時の opt-in 設定を説明する資料として扱い、現 HEAD の全カード既定動作の根拠にはしていません。`sm120_series.hpp` のコメントは RTX PRO 5000 Blackwell 72 GB、IQ3_S、全 expert VRAM resident の測定で、この switch を含む組み合わせの verify round が 13.70 ms から 12.23 ms になったと記載しています。個別 switch の寄与を示す値ではありません。
+sm_86 / sm_89 の起動時既定値が少なくとも一つ追加された場合、`apply_nv_defaults()` は stderr に `strata: sm_86 (Ampere): ... speed switches on by default ...` または `strata: sm_89 (Ada): ...` の形式で追加したスイッチ名を列挙します。環境値が既にある場合や既定値テーブルが空の場合は、この関数から既定値一覧の行は出ません（`engine/src/core/nv_defaults.cpp:227-255`）。この行は `STRATA_ATTN_DAILY` 専用の有効ログではありません。
+
+Strata の `docs/DETAILS.md:1295` は sm_86 と 12.0 で exact、既定 ON と記載しています。`engine/include/strata/core/sm120_series.hpp:4-9` は RTX PRO 5000 Blackwell 72 GB / IQ3_S の 4-token verify で複数スイッチを合わせた測定として 13.70 ms から 12.23 ms を記しますが、単独の `STRATA_ATTN_DAILY` の効果値ではありません。`docs/DGX_SPARK_LINUX.md:120-123` と同 header `:83-90` は DGX Spark GB10 での測定を記載します。これらは資料記載値であり、本調査で性能測定はしていません。
 
 ## 根拠
 
-- `src/kernels/cuda/qsa_decode_attn.cu:832-860`: CUDA/HIP 分岐、値の完全一致判定、sm_120 既定値、device ごとの cache。
-- `src/kernels/cuda/qsa_decode_attn.cu:862-900`: `STRATA_ATTN_PRE75` とビルド条件による chunk kernel 選択。
-- `src/kernels/cuda/qsa_decode_attn.cu:925-933, 1023-1038, 1054-1065, 1209-1227`: merge の優先順位と batch/step の kernel 呼び出し。
-- `src/kernels/cuda/qsa_decode_attn.cu:1072-1127`: slot 経路が PR #540 kernel の場合に一括処理を断念する条件。
-- `include/strata/core/sm120_series.hpp:28-41`: `STRATA_SM120_PERF` と sm_120 既定判定。
-- `src/core/nv_defaults.cpp:18-35,52-70`, `src/program/generate.cpp:2800-2816`: sm_86 / sm_60 switch の既定値、上書き回避、診断ログと適用時期。
-- `docs/DETAILS.md:2502-2511`, `include/strata/core/sm120_series.hpp:1-18`: 資料にある測定条件と主張。
+- `engine/src/kernels/cuda/qsa_decode_attn.cu:896-965` — CUDA の値判定、unset 時の capability 既定、pre75 条件。
+- `engine/src/kernels/cuda/qsa_decode_attn.cu:978-990, 1003-1021, 1132-1147, 1150-1223, 1245-1270` — slots/batch rows の条件、merger、呼び出しとエラー経路。
+- `engine/src/core/nv_defaults.cpp:41-58, 75-106, 176-180, 222-255` — sm_86 / sm_89 起動時の値設定と優先順位、ログ。
+- `engine/src/program/generate.cpp:4421-4450` — 起動時 default 適用条件。
+- `engine/include/strata/core/sm120_series.hpp:32-42, 60-95` — sm_120 / sm_121 未設定時既定と測定資料。
+- `engine/include/strata/core/defaults_026.hpp:21-29` — `STRATA_DEFAULTS` の受理値と cache。

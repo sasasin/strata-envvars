@@ -1,52 +1,55 @@
 # `--ple-delay-us`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 調査）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate` |
+| コマンド | `strata`（エンジン引数。parser 内の usage 表記は `strata generate`） |
 | オプション | `--ple-delay-us` |
 | 別名 | なし |
-| 値 | マイクロ秒単位の非負数（`double`） |
+| 値 | マイクロ秒単位の非負数（`double` として変換） |
 
 ## 役割
 
-PLE（Per-Layer Embedding）の行読み込み完了を意図的に遅らせる fault injection 用オプションです。通常動作の調整値ではなく、PLE の読み込み遅延を含む挙動を調べるための値です。ヘルプも「各行読み込みが U マイクロ秒より早く完了しない」と説明しています（`src/program/generate.cpp:825`）。
+PLE（n-gram table）の行読み取り完了を意図的に遅らせる fault injection 用オプションです。ストレージの通常動作を指定する設定ではなく、PLE reader の遅延時の動作を調べる用途です。CUDA/HIP 系と SYCL 系の engine parser に実装があります。
 
 ## 使い方
 
 ```sh
-strata generate --pack pack/full --tokens "1,2,3" --ple-gguf /path/to/ple.gguf --ple-delay-us 1000
+strata --pack pack/full --tokens "1,2,3" --ple-delay-us 500
 ```
 
-`1000` は各行読み込みに対する最小遅延を 1000 マイクロ秒にする例です。モデルと PLE テーブルを使う実行例であり、この調査では実行していません。コマンド形式は parser の usage に基づきます（`src/program/generate.cpp:806-808`）。
+上例は、実際に PLE table の行読み取りが発生した場合、その読み取り完了を発行から最低 500 µs 保留します。モデルや pack に応じた通常の引数は別途必要です。
 
 ## 値と既定値
 
-- 値は `std::atof` で `double` に変換されます。既定値は `0` で、遅延注入は行われません（`src/program/generate.cpp:484,2478`）。
-- `0` は有効で、負数は後段 validation で拒否されます。NaN も `!(value >= 0)` に該当して拒否されます。一方、この validation は正の無限大を拒否しません（`src/program/generate.cpp:3181-3184`）。極端に大きな値は読み込み完了を長時間保留させるため、通常の値として使わないでください。
-- `atof` のため、数値として解釈できない文字列は `0` に変換されて受理され得ます。厳密な数値形式検証はありません（`src/program/generate.cpp:2478`）。
-- 同じオプションを複数回指定すると、parser が順に代入するため最後の値が残ります（`src/program/generate.cpp:2416-2421,2478`）。値を省略すると `--ple-delay-us needs a value` を標準エラーに出して終了コード 2 になります（`src/program/generate.cpp:2418-2420`）。
+- 値は `std::atof` で `double` に変換されます。未指定時は `0` で、遅延注入は設定されません。正の値のときだけ reader に設定されます（`engine/src/program/generate.cpp:822,3904,6419`、SYCL: `engine/sycl/src/program/generate.cpp:506,1943,3487`）。
+- `--ple-delay-us` の後ろに値がない場合、parser の共通 `next()` が stderr に `--ple-delay-us needs a value` を出して終了コード 2 で終了します（`engine/src/program/generate.cpp:3844-3846`、SYCL: `engine/sycl/src/program/generate.cpp:1884-1886`）。
+- `atof` による変換で、整数専用ではなく小数値も指定できます。ただし入力全体の厳密な数値検査はありません。変換結果が負、または NaN なら PLE 関連オプションの validation に失敗し、stderr に `invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us` を出して終了コード 2 になります（`engine/src/program/generate.cpp:5009-5012`、SYCL: `engine/sycl/src/program/generate.cpp:2517-2520`）。
+- 同じオプションを複数回指定した場合の重複拒否処理はなく、引数ループで後の値が上書きします（`engine/src/program/generate.cpp:3842-3843,3904`、SYCL: `engine/sycl/src/program/generate.cpp:1881-1883,1943`）。
 
 ## 実行時の動作
 
-PLE テーブルが構築されるとき、値が `0` より大きければ `PleTable` に注入値を設定します（`src/program/generate.cpp:4033-4040,4161-4164`）。PLE reader は実際の行読み込み完了を受け取った後、行の発行時刻から指定時間が経過していなければ完了を保留し、経過後に行データを確定します（`src/ngram/ple_reader.cpp:253-271,274-285`）。したがって、指定値は実ディスク読み込みを遅くする設定ではなく、完了通知を遅らせる fault injection です。
+parser は値を `Options::ple_delay_us` に格納します。PLE table を開いて engine session に配線する箇所で、値が `0` より大きければ `PleTable::set_injected_delay_us` に渡します（`engine/src/program/generate.cpp:6419-6420`、SYCL: `engine/sycl/src/program/generate.cpp:3487-3489`）。reader は読み取り発行時刻を記録し、ファイル読み取りが完了しても発行から指定時間に満たない場合は completion を保留し、経過後に処理します（`engine/src/ngram/ple_reader.cpp:158-166,264-280,285-296,606-609`。SYCL: `engine/sycl/src/ngram/ple_reader.cpp:268-284,289-300,558-561`）。
 
-この値は PLE テーブルの利用が前提です。`--ple-gguf` などによって PLE テーブルが指定されず構築ブロックに入らない場合、このオプション値は reader に設定されません（`src/program/generate.cpp:4033,4163`）。`--no-ple` は別の PLE 無効化指定であり、このオプション自体が PLE を有効化することはありません（`src/program/generate.cpp:2473-2478,3290-3298`）。遅延値による専用の警告や出力経路は parser/reader の該当処理にはありません。
+遅延を設定しても、読み取り自体を遅くするものではなく、完了済みの読み取り結果を reader 内で遅らせます。したがって PLE が有効で table の行読み取りが起きる経路に限って影響します。`--no-ple` で PLE を無効化する経路では table を開かず、遅延 setter も呼びません（`engine/src/program/generate.cpp:5155,5205-5213,6419`）。キャッシュヒットなど、ファイル行読み取りが生じない処理にもこの完了保留は適用されません（reader の保留対象は `file.wait` から返った completion: `engine/src/ngram/ple_reader.cpp:264-280`）。
 
 ## 適用条件と副作用
 
-遅延は PLE reader が完了した行読み込みに対して適用されます。 reader は保留した完了を後で処理し、その間は該当する行データの利用が待たされます（`src/ngram/ple_reader.cpp:108-109,253-285`）。実行時間や待ち時間が増える可能性があります。GPU、ネットワーク、ファイル生成への追加処理は、このオプションの実装箇所では確認できません。
+- 既定値の `0` は fault injection を行いません。正の値では読み取り結果の処理が遅れ、PLE を使う推論の待ち時間に影響し得ます。通常の設定・出力先・環境変数との優先順位はありません。
+- 値は有限性の検査を受けず、validation は `value >= 0` のみです。そのため正の無限大は parser の条件を通過し得ます。reader の経過時間との比較では有限の経過時間が無限大以上にならず、保留 completion が解放されない可能性があります（`engine/src/program/generate.cpp:5009-5012`、`engine/src/ngram/ple_reader.cpp:285-294`）。無限大は指定しないでください。
+- 明示的な範囲上限、単位変換、警告、出力ファイル生成は確認できませんでした。値の厳密な表記形式やプラットフォーム別の境界動作については、`atof` と validation の実装以上の保証を確認できません。
 
 ## 出力とエラー
 
-共通の PLE 設定 validation で負値または NaN が見つかると、標準エラーに `strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us` と出し、終了コード 2 で戻ります（`src/program/generate.cpp:3181-3184`）。値の欠落時も標準エラーと終了コード 2 です（`src/program/generate.cpp:2418-2420`）。遅延注入は完了を保留する処理であり、それ自体がエラーを生成する分岐は確認できません（`src/ngram/ple_reader.cpp:253-285`）。
+無効値は前述の PLE 関連 validation エラーを stderr に出し、終了コード 2 で終了します。オプションが未知の引数として扱われた場合は `unknown argument: ...` と usage を stderr に出して終了コード 2 ですが、この revision では CUDA/HIP 系・SYCL 系の両 parser に登録されています（`engine/src/program/generate.cpp:4268-4273`、SYCL: `engine/sycl/src/program/generate.cpp:2214-2219`）。正の値による遅延専用の通知出力は確認できませんでした。
 
 ## 根拠
 
-- parser のヘルプ表記・既定値・値の読み込み: `src/program/generate.cpp:484,825,2416-2421,2478`
-- 値の validation と失敗出力: `src/program/generate.cpp:3181-3184`
-- PLE reader の構築設定と注入適用箇所: `src/program/generate.cpp:4033-4040,4161-4164`
-- 読み込み完了の保留と解放: `src/ngram/ple_reader.cpp:253-285`
-- 調査範囲: checkout の parser と PLE reader の実装を確認しました。同一 revision の CLI `--help` 実行、ビルド、テスト、GPU 実行、性能測定は行っていません。
+- `engine/src/program/generate.cpp:817-823,1225-1228,3901-3905` — CUDA/HIP 系の option default、usage、parser 登録。
+- `engine/src/program/generate.cpp:3842-3846,5009-5012,6419-6420` — 値取得、validation、PLE table への適用。
+- `engine/src/ngram/ple_reader.cpp:158-166,264-296,606-609` — 読み取り発行時刻、completion の保留と解放、setter。
+- `engine/sycl/src/program/generate.cpp:501-507,810-816,1940-1944,2517-2520,3487-3489` — SYCL 系の default、usage、parser、validation、適用箇所。
+- `engine/sycl/src/ngram/ple_reader.cpp:268-300,558-561` — SYCL reader の completion 保留と setter。
+- `engine/src/program/generate.cpp:5155,5205-5213` — `--no-ple` 時の PLE 無効化経路。

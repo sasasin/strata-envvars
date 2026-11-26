@@ -1,57 +1,54 @@
 # `--sync-every-layer`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（ネイティブ engine の root parser） |
+| コマンド | `strata generate` |
 | オプション | `--sync-every-layer` |
 | 別名 | なし |
-| 値 | 値を取らないフラグ |
+| 値 | 取らないフラグ。既定値は無効（`false`） |
 
 ## 役割
 
-デバッグ用に、非 capture 実行時の各層の処理後に GPU stream を同期し、非同期 GPU エラーを発生した層の位置で検出しやすくします。エラーを後続の層や token 処理末尾で検出する代わりに、該当層の後で報告する用途です（`include/strata/core/session.hpp:117-120`、`src/core/session.cpp:834-844`）。
+`--no-capture` で各層を直接実行するとき、各層の処理後に GPU ストリームを同期し、非同期エラーをその層の位置で検出するデバッグ用オプションです。GPU エラーが後続層やトークン末尾で初めて表面化する状況を、原因となった層に結び付けるために使います。
 
 ## 使い方
 
-`strata generate` に指定します。`--sync-every-layer` の効果を有効にするには、各層を直接実行する `--no-capture` も指定します。
-
 ```sh
-strata generate --pack PATH --tokens "1,2,3" --no-capture --sync-every-layer
+strata generate --pack pack/full --tokens "1,2,3" --no-capture --no-pool --sync-every-layer
 ```
 
-エンジンの usage は `--pack DIR` と `--tokens LIST` を基本形として示しています（`src/program/generate.cpp:806-812`）。
+`--tokens` は必須です。`--no-capture` を指定すると CPU expert pool を使えないため、エンジンは `--no-pool` も要求します。上の例はその GPU-only 経路を明示しています（`engine/src/program/generate.cpp:1210-1214,10557-10571`）。
 
 ## 値と既定値
 
-値は不要です。parser はフラグを見つけると `Options::sync_every_layer` を `true` にし、初期値は `false` です。したがって未指定時は層ごとの同期を追加しません。複数回指定しても同じ bool を `true` にするだけです（`src/program/generate.cpp:507-510,2504-2507`）。
+値は取りません。parser は `Options::sync_every_layer` を `false` で初期化し、オプションを見つけると `true` にします。同じフラグを複数回指定しても値を重ねて変更する処理はありません（`engine/src/program/generate.cpp:847,3932`）。
 
-値の検証処理はありません。値を付けた `--sync-every-layer=...` などはこの parser のフラグ表記に一致せず、未知引数として扱われます（`src/program/generate.cpp:2787-2793`）。
+有効範囲などの値検証はありません。未知の引数は stderr に `unknown argument: ...` と usage を出して終了コード 2 になります（`engine/src/program/generate.cpp:4268-4273`）。
 
 ## 実行時の動作
 
-`session_token` はモデルの各層を順に処理し、`sync_every_layer` が真なら各層の処理成功後に `cudaStreamSynchronize` を呼びます。同期エラーがあれば、その層番号と CUDA のエラー文字列を `err` に設定して失敗を返します（`src/core/session.cpp:805-807,812-844`）。
+parser が設定した値は、`o.no_capture` が真のときに呼ばれる `session_token` に渡されます。通常の捕捉経路では `session_run_token` または `session_loop` が呼ばれ、この値は渡されないため、`--sync-every-layer` 単独では層ごとの同期は行われません（`engine/src/program/generate.cpp:24296-24314`）。
 
-この値が `session_token` に渡されるのは、`--no-capture` が有効な分岐だけです。capture 経路は `session_run_token` または `session_loop` を使い、このフラグを渡しません。そのため `--no-capture` なしで指定しても同期は追加されず、ソース上では警告も出しません（`src/program/generate.cpp:15932-15945`）。両方を指定する例では、`--no-capture` が直接実行経路を選び、このフラグがその各層後の同期を有効にします。
+`session_token` は各層の `block_layer` が成功した後、フラグが有効ならその層ごとに CUDA ストリームを同期します。同期の失敗時は `layer N: <CUDA error>` を設定して処理を中断し、呼び出し元が `strata generate: session_token: ...` を stderr に出して終了コード 1 を返します（`engine/src/core/session.cpp:801-842`; `engine/src/program/generate.cpp:24296-24301`）。この同期により、後続処理まで遅れて現れ得る非同期 GPU エラーを、検出した層の番号とともに報告します。
 
 ## 適用条件と副作用
 
-- 対象となるのは `--no-capture` による直接実行経路です。capture 実行では効果がありません（`src/program/generate.cpp:15932-15945`）。
-- 有効時は層ごとに GPU stream の完了を待つため、通常の非同期実行に同期と待ち時間が加わります。ヘッダーの説明でも、fast path では行わないデバッグ用同期として位置づけています（`include/strata/core/session.hpp:117-120`）。
-- このフラグ自体はファイルやネットワークを操作しません。同期・エラー検査は `session_token` の層ループ内で行います（`src/core/session.cpp:812-844`）。
+- 層ごとの同期が行われるのは `--no-capture` 経路だけです。捕捉経路でも parser はフラグを受理しますが、値は実行関数に渡されません（`engine/src/program/generate.cpp:24296-24314`）。
+- `--no-capture` と `--no-pool` の組み合わせが必要です。`--no-capture` だけを指定すると、CPU expert pool がない経路で routed experts が実行されないため、エンジンは GPU-only 実行を意図した場合に `--no-pool` を併記するよう stderr に説明して終了コード 2 を返します（`engine/src/program/generate.cpp:10557-10571`）。
+- 同期は層ごとに実際のストリーム待ちを発生させます。通常の高速経路では行わない同期であり、デバッグ用の動作です（`engine/src/core/session.cpp:830-839`）。
 
 ## 出力とエラー
 
-`session_token` が失敗すると、呼び出し元は標準エラーに `strata generate: session_token: ...` を出して終了コード `1` を返します。層後の同期エラーではメッセージに `layer N:` と CUDA エラー文字列が含まれます（`src/core/session.cpp:839-842`、`src/program/generate.cpp:15933-15937`）。
-
-未対応の表記など未知の引数は標準エラーに `unknown argument: ...` と usage を出して終了コード `2` になります（`src/program/generate.cpp:2787-2793`）。
+正常時にこのフラグ固有の出力はありません。`block_layer` 自体の失敗は層番号を付けて `session_token` から返され、呼び出し元が stderr に出力して終了コード 1 を返します（`engine/src/core/session.cpp:818-827`; `engine/src/program/generate.cpp:24296-24301`）。層後の同期エラーも同様に終了コード 1 となり、同期した層と CUDA エラー文字列が報告されます（`engine/src/core/session.cpp:830-839`; `engine/src/program/generate.cpp:24296-24301`）。
 
 ## 根拠
 
-- `src/program/generate.cpp:507-510,806-812,967-969` — option state の初期値、usage、help 表記。
-- `src/program/generate.cpp:2504-2507,2787-2793` — parser の受理と未知引数のエラー経路。
-- `src/program/generate.cpp:15932-15945` — `--no-capture` 分岐でのみ値を渡す実行経路。
-- `include/strata/core/session.hpp:117-123`、`src/core/session.cpp:805-844` — option の意味、各層後の stream 同期、エラー伝播。
-- SYCL 実装にも同名 option の parser と同様の `--no-capture` 分岐があります（`sycl/src/program/generate.cpp:490-495,1845-1849,12173-12179`、`sycl/src/core/session.cpp:1146-1149,1176-1184`）。この文書の主な根拠は索引の対象境界に従い `src/program/generate.cpp` の parser と CUDA 実装です。
+- parser の既定値とフラグ処理: `engine/src/program/generate.cpp:847,3932`
+- `strata generate` の usage と引数構文: `engine/src/program/generate.cpp:1208-1214`
+- 直接実行経路への値の受け渡し、および捕捉経路: `engine/src/program/generate.cpp:24296-24314`
+- `--no-capture` に `--no-pool` を要求する検査と失敗出力: `engine/src/program/generate.cpp:10557-10571`
+- 1層ごとの `cudaStreamSynchronize` と失敗時の層番号・エラー文字列: `engine/src/core/session.cpp:801-842`
+- ツール ID、parser 所在、文書 scope: `docs/cli/000_cli_tools.md:7-10`; 索引リンクと `strata-engine` の root scope: `docs/cli/README.md:1036-1042,1214-1219`

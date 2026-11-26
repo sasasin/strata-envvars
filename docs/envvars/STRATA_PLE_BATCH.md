@@ -1,52 +1,59 @@
 # `STRATA_PLE_BATCH`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-PLE（layer 1 の n-gram / history block）の key/value projection を、複数行まとめて計算する経路を選びます。プロンプト prefill と decode の verify window の両方で参照されます。どちらも PLE が実行される場合に限って関係します。
-
-同じ名前でも、prefill は `atoi()` の結果、verify window は先頭文字を使って判定します。さらに verify window 内でも、BF16 key/value projection 用と別の multi-row projection 用とで判定条件が分かれています。
+PLE（n-gram 埋め込みを使う層）の key/value 射影を、プロンプト読み込み時にチャンク単位でまとめて計算するか、各 token で計算するかを切り替える。バッチ処理が実際に選ばれるのは、PLE がモデルにあり、対象レイヤーを処理し、native post-ops と重み形式・スクラッチ領域の条件を満たす場合だけ。CUDA/HIP と SYCL のプロンプト経路、および CUDA/HIP・SYCL の speculative verify 経路で読まれる。verify ではさらに複数行の key/value 射影の経路を選ぶ。`engine/src/prefill/prefill.cpp:4327-4333,5012-5064`、`engine/sycl/src/prefill/prefill.cpp:2772-2782`、`engine/src/core/verify.cpp:1698-1717`、`engine/sycl/src/core/verify.cpp:1137-1156`。
 
 ## 値と判定
 
-| 経路 | 未設定 | 設定時の判定 |
-|---|---|---|
-| プロンプト prefill | 有効 | `atoi(value) != 0` なら有効。それ以外は無効 |
-| verify window: BF16 key/value projection | 有効 | 先頭文字が `0` でなければ有効 |
-| verify window: 別の multi-row projection | 無効 | 先頭文字が `1` の場合だけ有効 |
+プロンプト経路は `std::getenv` の結果を初回呼び出し時に `static const char*` に保存し、設定値を `std::atoi` に渡して `!= 0` で判定する。したがって空文字は 0、`0anything` も 0、`1anything`・`-1` は非 0。`true`、空白だけの値、整数として読み始められない文字列は 0 になる。`" 1"` は先頭空白の後の `1` が変換されて有効。先頭の空白は `atoi` が読み飛ばし、整数として読める部分の後ろは無視する。大文字小文字の比較はしない。未設定時だけ backend・CUDA toolkit・GPU で既定値が決まる。CUDA 側は `engine/src/prefill/prefill.cpp:94-116` と `engine/include/strata/core/sm120_series.hpp:44-57`、SYCL 側は `engine/sycl/src/prefill/prefill.cpp:2772-2782`。
 
-prefill の `atoi()` は文字列全体の妥当性を検証しません。たとえば空文字や `true` は 0 となり無効、`1junk` や `-1` は非ゼロとなり有効です。verify window の BF16 key/value 判定では `0`, `0anything` は無効ですが、空文字、`true`、`2` は先頭文字が `0` ではないため有効です。別の multi-row projection は `1`, `10`, `1anything` のように先頭が `1` の場合だけ有効で、空文字や `true` は無効です。大文字小文字、空白の trim、文字列全体の数値 parse は行いません。
+| 経路・条件 | unset | 有効になる設定値 | 無効になる設定値 |
+|---|---|---|---|
+| CUDA/HIP prompt prefill | 原則 ON。CUDA 12.8（`CUDART_VERSION` 12080–12089）で compute capability 12.0 のときだけ OFF。HIP build はこの CUDA 12.8 例外の対象外 | `atoi(value) != 0`。例: `1`, `-1`, `1tail`, ` 1` | `atoi(value) == 0`。例: 空文字, `0`, `0tail`, `true` |
+| SYCL prompt prefill | ON | `atoi(value) != 0`（例は上と同じ） | `atoi(value) == 0`（例は上と同じ） |
+| CUDA/HIP・SYCL verify の `ple_batch_kv` 判定 | ON（設定有無だけを使い、先頭文字が `0` でなければ ON） | unset または先頭が `0` 以外。例: 空文字, `1`, `true`, ` 0` | 先頭文字が `0`。例: `0`, `0tail` |
+| CUDA/HIP・SYCL verify の `batched` 判定 | OFF | 先頭文字が `1`。例: `1`, `1tail` | unset、空文字、`0`, `true`, ` 1` など先頭が `1` でない値 |
 
-読み取り結果は各経路の関数内 `static const bool` に保存されます。その経路で初めて評価された後にプロセス環境を書き換えても、値は再評価されません。
+verify の二つの判定は別々の `static bool` であり、一般的な真偽値パーサーではない。`ple_batch_kv` は未設定または先頭文字が `'0'` 以外、`batched` は設定値の先頭文字が `'1'` のときだけ有効。よって、たとえば `true` は `ple_batch_kv` 判定では許可されるが `batched` 判定では無効。`engine/src/core/verify.cpp:1704-1717`、`engine/sycl/src/core/verify.cpp:1143-1156`。
 
-根拠: `src/prefill/prefill.cpp:2111-2120`, `src/core/verify.cpp:955-974`。
+AMD の通常エンジン起動では、RDNA3 discrete の既定値表が候補値 `1` を環境へ設定するため、ユーザーが明示していない場合に verify 側でも ON になる。既に変数が設定済みなら Strata は上書きしない。`STRATA_GFX11_DEFAULTS=0` または `STRATA_DEFAULTS=026` はこの RDNA3 既定値表を抑止する。`engine/include/strata/core/gfx11_extra.hpp:39-73`、`engine/src/core/arch_defaults.cpp:302-323`、`engine/src/program/generate.cpp:4287-4320`。CUDA の prompt 既定値（CUDA 12.8 / 12.0 例外）はこの arch-default 表とは別に決まる。対象名を直接指定する専用 CLI 引数は見つからなかった。`--gpu` は GPU 選択変数を上書きするだけで、本変数の優先順位には関与しない（`engine/src/program/generate.cpp:3781-3802`）。
 
 ## 有効になる条件
 
-prefill の batched PLE は、PLE が ready で対象 layer 範囲が layer 1 を含むこと、native postops が有効であること、BF16 または native の PLE key projection があること、scratch 領域から計算した token 収容数が 64 以上であることを要します。条件を満たさないときは、変数が有効でも従来の token ごとの PLE 処理に進みます。実際の batched 部分は chunk 内を scratch 容量に合わせて sub-batch に分けて実行します。
-
-verify window では次の2経路があります。
-
-- BF16 key/value projection をまとめる経路は、変数が上表の BF16 判定で有効、`STRATA_DEC_BATCH` が有効、verify group の行数 `n > 1`、key と value の BF16 weights があり、native BF16 projection と native postops が有効な場合に使われます。
-- もう一つの multi-row projection は、値の先頭が `1`、`n > 1`、key weight が BF16 または native、native BF16 projection が有効で、BF16 経路が選ばれていない場合に使われます。
-
-このため、たとえば `STRATA_PLE_BATCH=true` は prefill では `atoi()` が 0 となって無効ですが、verify window の BF16 経路では値判定上は有効です（ただし残りの条件も必要です）。`STRATA_PLE_BATCH=2` も prefill と verify の BF16 経路では有効になり得ますが、verify の別の multi-row projection では選ばれません。
-
-HIP の gfx1151（Strix Halo）では、起動時に `STRATA_PLE_BATCH=1` が既定設定されます。利用者が変数を何らかの値（空文字を含む）で設定済みならその値を保持します。`STRATA_GFX1151_DEFAULTS=0` で既定値テーブル全体を無効にできます。CUDA ビルド、gfx1151 以外の HIP GPU にはこの既定設定は適用されません。
-
-根拠: `src/prefill/prefill.cpp:2111-2120,2504-2518`, `src/core/verify.cpp:845,955-975`, `src/core/arch_defaults.cpp:32-35,61-69`, `src/program/generate.cpp:2190-2196`, `docs/STRIX_HALO.md:83-97`。
+- **Prompt prefill:** PLE が ready で、処理範囲が layer 1 を含む必要がある。さらに `ple_native_postops_enabled()`、BF16 key または native key の重み、および式で計算される 64 token 分以上のスクラッチ領域が必要。満たさなければ `ple_batch` は false となり、layer 1 で `ple_block` を token ごとに実行する。CUDA/HIP は通常経路と layer-major 経路の両方で同条件を判定する。`engine/src/prefill/prefill.cpp:4327-4333,5012-5064,8470-8474,9216-9268`、SYCL は `engine/sycl/src/prefill/prefill.cpp:2772-2782`。
+- **Verify の `ple_batch_kv`:** `STRATA_DEC_BATCH` に由来する `dec_batch` が有効、グループ行数 `n > 1`、key と value が BF16 重み、native BF16 と native PLE post-ops が有効であることが必要。変数が許可しても条件不足ならこの経路を使わない。`engine/src/core/verify.cpp:1708-1710`、`engine/sycl/src/core/verify.cpp:1147-1149`。
+- **Verify の `batched`:** `ple_batch_kv` が成立していないこと、変数の先頭文字が `'1'`、`n > 1`、BF16 または native key 重み、および native BF16 が必要。key/value 射影をまとめた後も、履歴に依存する残りの PLE 処理は各行で実行する。`engine/src/core/verify.cpp:1714-1717,1728-1742,1773-1792`、`engine/sycl/src/core/verify.cpp:1153-1156,1167-1205`。
+- verify の `STRATA_DF_PLE` は別の後段 post-projection 最適化を制御する。`STRATA_PLE_BATCH` 単独でその経路は有効にならない。`engine/src/core/verify.cpp:1744-1752`。
+- CUDA 12.8 build と compute capability 12.0 の組み合わせでは、未設定時に prompt batching が無効になる。明示値は優先され、非ゼロ値で有効化できる。これは prompt 側の既定値規則であり、verify 側に同じ toolkit/GPU 既定値判定はない。`engine/include/strata/core/sm120_series.hpp:44-57`、`engine/src/prefill/prefill.cpp:94-115`。
 
 ## 実行時の詳細
 
-prefill の有効経路は layer 1 で chunk の PLE rows に対して key/value projection を複数行まとめて実行し、native batched postops を呼びます。変数が無効、または条件を満たさない場合は `ple_block()` を token ごとに呼ぶ経路です。PLE rows の読み込みと device への転送は、この分岐とは別に chunk ごとに行われます。
+CUDA prompt は最初に `ple_batch_enabled()` が呼ばれた時点で環境文字列へのポインタを static 保存する。unset なら各評価時に現在の CUDA device の compute capability を問い合わせて既定値を解決する（問い合わせ失敗時の major/minor は初期値 0）。CUDA 12.8 / 12.0 で無効になった旨の警告はプロセス内で一度だけ出す。SYCL prompt は関数内 static bool を初回評価時に作り、verify の各経路も static bool に判定結果を保存するため、以降の環境変更は再評価されない。`engine/src/prefill/prefill.cpp:94-116`、`engine/sycl/src/prefill/prefill.cpp:2775-2778`、`engine/src/core/verify.cpp:1704-1714`、`engine/sycl/src/core/verify.cpp:1143-1153`。
 
-verify window の BF16 経路は key/value projection を multi-row kernel で計算した後、通常は各行の PLE postprojection と history advance を行います。`STRATA_DF_PLE` も有効で、batch recording 中でない場合には `native_ple_postops_batch_snap()` の経路に進みます。別の multi-row projection 経路も key/value を先に計算しますが、その後の PLE block と history advance は行ごとに処理します。
+Prompt の有効時はチャンク内の PLE key/value 射影と native post-ops をバッチ単位で処理し、無効時や条件不足時は `ple_block` を token ごとに呼び出す。どちらの経路でも変数が直接選ぶのは PLE 計算方法であり、CLI の生成設定そのものではない。`engine/src/prefill/prefill.cpp:5012-5064,9216-9268`、`engine/sycl/src/prefill/prefill.cpp:2772-2782`。
 
-投影処理で例外が発生した場合、prefill は `prefill PLE: ...`、verify window の BF16 multi-row 投影は `verify PLE multi: ...`、別の multi-row 投影は `verify PLE batch: ...` をエラー文字列に設定します。これらの呼び出し側で処理が失敗として返されます。この変数自体に専用の有効・無効ログはありません。gfx1151 の起動時既定値が設定された場合は、`arch_defaults.cpp` が変更したスイッチ名を含む stderr の行を出します。
+Verify は layer 1 の処理で、該当する射影を multi-row kernel にまとめる。例外が起きると `err` に `verify PLE multi: `、`verify PLE batch: `、または `verify PLE: ` を付けてその処理を失敗で返す。Prompt の PLE 例外は `prefill PLE: ` を設定して false を返す。`engine/src/core/verify.cpp:1718-1742,1773-1791`、`engine/sycl/src/core/verify.cpp:1157-1181,1186-1203`、`engine/src/prefill/prefill.cpp:5046-5063`。
 
-根拠: `src/prefill/prefill.cpp:2225-2257,2499-2545`, `src/core/verify.cpp:975-999,1029-1049`, `src/core/arch_defaults.cpp:61-80`。
+## ログと測定値
 
-## 文書との照合
+CUDA 12.8 build / compute capability 12.0 で未設定のため prompt batching を OFF にしたとき、一度だけ stderr に次の警告を出す。明示的に `0` を指定した場合や他の build/device の場合、この警告条件には入らない。
 
-`docs/STRIX_HALO.md` は gfx1151 の既定スイッチとしてこの変数を挙げ、verify window の PLE key/value projection をまとめるものと説明しています。`include/strata/core/arch_defaults.hpp` と `src/core/arch_defaults.cpp` の実装も gfx1151 のみで既定値 `1` を設定します。文書の説明は verify window の projection に絞られていますが、ソースではプロンプト prefill も同じ変数を読み、異なる parse 規則で batched PLE を選びます。既定設定と環境値の取り扱いはコードを根拠に記載しました。
+```text
+strata prefill: the batched PLE post-ops are off by default here: this engine was built with CUDA 12.8, whose build faults in the prompt path on a compute capability 12.0 card (issues #220, #224). Use an engine built with CUDA 13.0 or newer; STRATA_PLE_BATCH=1 turns it on anyway.
+```
+
+`engine/src/prefill/prefill.cpp:112-115`。verify で例外があった場合のエラー接頭辞は「実行時の詳細」に記載した。ソースコメントは RTX PRO 5000 Blackwell の特定測定で CUDA 13.0 以降の prompt batching が約 23% の prompt speed 改善と述べるが、同コメントには OS・モデル条件・測定回数が揃っていないため、一般的な性能値としては扱わない（`engine/include/strata/core/sm120_series.hpp:44-48`）。
+
+## 根拠
+
+- `engine/src/prefill/prefill.cpp:92-117,4327-4333,5012-5064,8470-8474,9216-9268`
+- `engine/sycl/src/prefill/prefill.cpp:2772-2782`
+- `engine/src/core/verify.cpp:1698-1792`
+- `engine/sycl/src/core/verify.cpp:1137-1205`
+- `engine/include/strata/core/sm120_series.hpp:44-57`
+- `engine/include/strata/core/gfx11_extra.hpp:39-73`
+- `engine/src/core/arch_defaults.cpp:302-323`
+- `engine/src/program/generate.cpp:3781-3802,4287-4320`

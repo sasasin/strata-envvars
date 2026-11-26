@@ -1,51 +1,50 @@
 # `STRATA_TRACE_ADAPT`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-適応 expert tier の swap を追跡する診断用スイッチです。適応 round の実行状況と、前 round で始めた非同期コピーが次の decode window までに完了したかを stderr に出します。swap の選択、コピー、常駐状態を変える設定ではありません。
-
-読み取り箇所は CUDA 系 `src/program/generate.cpp` と SYCL 系 `sycl/src/program/generate.cpp` のそれぞれ2箇所です。候補一覧にはありますが、セットアップや Python サーバーではなく engine の生成処理が読みます。
+speculative decode の適応 VRAM expert tier が行う交換ラウンドについて、検討開始・保留・交換件数と、前ラウンドの非同期コピーが次の window までに完了したかを stderr に記録する診断用変数です。値は適応処理の有効化や交換候補の選択には使われず、ログ出力条件にだけ使われます。実際に適応処理が走るには、別途 `adapt_every` と `adapt_swaps` によって usage 計測が有効である必要があります（CUDA/HIP/GFX906: `engine/src/program/generate.cpp:24570,25188-25191`、SYCL: `engine/sycl/src/program/generate.cpp:13800,14185-14188`）。
 
 ## 値と判定
 
-値は parse されず、`std::getenv("STRATA_TRACE_ADAPT") != nullptr` で設定有無だけを判定します。
+CUDA/HIP/GFX906 の共有 GPU 実装と SYCL 実装で `std::getenv("STRATA_TRACE_ADAPT") != nullptr` を使います。文字列の変換や内容の比較はありません。したがって未設定だけが無効で、空文字、`0`、`false`、大文字小文字を含む任意の設定値はいずれも有効です。数値・空白・境界値の検査はありません（CUDA/HIP/GFX906: `engine/src/program/generate.cpp:24670-24717`、SYCL: `engine/sycl/src/program/generate.cpp:13822-13871`）。
 
-| 環境変数の状態 | ログ |
-|---|---|
-| 未設定 | 抑止 |
-| `1`、`0`、`false`、その他の文字列 | 有効 |
-| 空文字で設定 | 有効 |
-
-各読み取り結果は `static const bool` に保存されます。`apply_pending` 側と `adapt` 側はそれぞれ初回に評価され、その後にプロセス環境を書き換えても、既に評価された側は再判定しません。
+| ビルド／経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| CUDA/HIP/GFX906 共有 GPU 実装の speculative decode | ログなし | 値の内容を問わず、例: 空文字、`0`、`1`、`false` | なし（環境変数自体が未設定の場合だけ無効） |
+| SYCL speculative decode | ログなし | 値の内容を問わず、例: 空文字、`0`、`1`、`false` | なし（環境変数自体が未設定の場合だけ無効） |
 
 ## 有効になる条件
 
-適応 tier が有効な生成処理で、該当する `apply_pending` または `adapt` の処理に到達するとログが出ます。適応用 routing usage 配列は `--adapt-every` と `--adapt-swaps` の両方が正の場合に確保されます。従ってこの機能は適応 tier を使わない実行では診断対象となる round がありません。
-
-CUDA と SYCL に同じ環境変数判定およびログ分岐があります。SYCL 側は `apply_pending` を `sycl::exception` で捕捉するラッパー内に置いていますが、環境変数の判定方法とログ内容は同じです。
+- CUDA/HIP/GFX906 共有 GPU 実装 (`engine/src/program/generate.cpp`) または SYCL (`engine/sycl/src/program/generate.cpp`) の該当 speculative decode 実装を使うこと。両実装に同じ名前の読み取り箇所が各 2 箇所あります。
+- 適応 tier が有効で、decode loop が適応ラウンドを開始すること。共有 GPU 実装は usage が空でなく、pending 交換がなく、`(rounds + 1) % o.adapt_iv(rounds) == 0` のとき、SYCL は usage が空でなく、pending 交換がなく、`(rounds + 1) % o.adapt_every == 0` のときにラウンドを開始します。既定値は `adapt_every=4`、`adapt_swaps=96` で、`--adapt-every` と `--adapt-swaps` がそれぞれを設定します（`engine/src/program/generate.cpp:1045-1048,1084-1085,4058,4202,25188-25191`、SYCL の呼び出し条件は `engine/sycl/src/program/generate.cpp:14185-14188`）。
+- pending コピーの着地ログは、前ラウンドからの pending がある状態で次の window が `apply_pending` を呼んだ場合に限られます。pending が空ならこの関数は先に戻るため、そのログは出ません（CUDA/HIP/GFX906: `engine/src/program/generate.cpp:24670-24682`、SYCL: `engine/sycl/src/program/generate.cpp:13822-13837`）。
+- `STRATA_TRACE_ADAPT` 自体に OS、CLI、モデル状態、別環境変数による値の上書きはありません。適応 tier の条件を満たさない場合、この変数を設定しても該当ログは出ません。
 
 ## 実行時の詳細
 
-`apply_pending` は、未完了の swap があると、待機しない呼び出しではコピー完了イベントを調べます。未完了なら次のログを出して、この window では対象 expert を非 resident のままにします。完了時には pending 数を出してから常駐表を更新します。
+`adapt` lambda 内と `apply_pending` lambda 内に独立した関数内 `static const bool` があり、それぞれの lambda が初めて呼ばれた時点で環境変数の有無を一度だけ読みます（CUDA/HIP/GFX906: `engine/src/program/generate.cpp:24670-24717`、SYCL: `engine/sycl/src/program/generate.cpp:13822-13871`）。このため、プロセス起動後に環境変数を変更しても、該当 static の初期化後はそのログ条件に反映されません。2 つの static は初回評価時期も独立しています。
+
+`adapt` は pending が残っている場合は `SKIPPED` を記録してラウンドを終え、pending がなければ `considering` を記録して通常の候補選定・交換処理を続けます。終了時には交換数を記録します。`apply_pending` はイベントを待つか完了状態を調べ、未完了なら「未着地・この window では非 resident」のログを出して戻り、完了していれば「着地・resident になる」ログの後に residency table などの通常処理を進めます。ログ用 bool はこれらの処理分岐の条件ではありません（CUDA/HIP/GFX906: `engine/src/program/generate.cpp:24670-24717,24739-24804`、SYCL: `engine/sycl/src/program/generate.cpp:13822-13871,13889-13951`）。
+
+## ログと測定値
+
+値が設定され、該当処理に到達した場合に stderr に次の文字列を出します（両 backend 共通）。`%lld` と `%zu` / `%d` は実行時のラウンド番号・件数・上限で置換されます。
 
 - `strata: PENDING not landed, %zu stay non-resident this window`
 - `strata: PENDING landed, %zu experts become resident`
-
-`adapt` は round 番号を進めます。前 round の swap がまだ `pending` に残っていれば、その round を skip した理由を出して終了します。そうでなければ検討開始を出し、routing usage と resident 状態を使って候補 swap を決めます。処理後は実際に選んだ swap 数と `--adapt-swaps` の上限を表示し、usage を減衰させます。
-
 - `strata: ADAPT round=%lld SKIPPED, %zu swaps still in flight`
 - `strata: ADAPT round=%lld considering`
 - `strata: ADAPT round=%lld swapped %zu of %d slots, usage decayed`
 
-ログに `swapped 0` と出る場合もあります。診断ログ自体は swap 選択やデータを変更せず、コピー完了の待ち方も変更しません。ソース内の `=1` コメントは利用例であり、実装上は値が `1` かどうかを検証していません。
+ログが無効でも適応交換や pending の処理自体は同じコード経路で行われます。ただしログ出力は適応処理のスレッド上でも実行され、非同期コピーの完了タイミングが変わる余地があります。ソースにはコピー時期により GPU / CPU のどちらで expert を処理するかが変わり得るとの説明があります（`engine/src/program/generate.cpp:25099-25103`）。よってこの診断を有効にした実行が、ログなしの実行と timing-sensitive な結果まで常に一致するとは断定できません。測定値は該当なしです。
 
 ## 根拠
 
-- `src/program/generate.cpp:12828-12829` — 適応 routing usage 配列の確保条件。
-- `src/program/generate.cpp:12843-12866` — `apply_pending` の環境判定、コピー完了の確認、resident 表更新とログ。
-- `src/program/generate.cpp:12870-12960` — `adapt` の環境判定、skip / considering / swapped ログと適応処理。
-- `sycl/src/program/generate.cpp:12098-12152` — SYCL 側の usage 配列と `apply_pending`。
-- `sycl/src/program/generate.cpp:12156-12249` — SYCL 側の `adapt` 判定と同じログ。
-- `docs/DETAILS.md:106-108,168-180` — 適応 tier と関連オプションの説明。`STRATA_TRACE_ADAPT` 自体の説明はなく、ログ文言と値の判定はソースから確認した。
+- `engine/src/program/generate.cpp:24670-24717` — 共有 GPU 実装の pending / adapt ログ条件と文字列。
+- `engine/src/program/generate.cpp:24739-24804` — CUDA/HIP/GFX906 共有 GPU 実装の交換候補処理、失敗経路、交換完了ログ。
+- `engine/src/program/generate.cpp:1045-1048,1084-1085,4058,4202,24570,25188-25191` — 適応 tier の既定値、CLI 設定、usage とラウンドの条件。
+- `engine/src/program/generate.cpp:25099-25103` — 非同期コピーの完了時期に関する経路。
+- `engine/sycl/src/program/generate.cpp:13822-13871` — SYCL の pending / adapt ログ条件と文字列。
+- `engine/sycl/src/program/generate.cpp:13889-13951,14185-14188` — SYCL の交換処理と適応ラウンド開始条件。

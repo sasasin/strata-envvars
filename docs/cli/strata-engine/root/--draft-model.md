@@ -1,62 +1,70 @@
 # `--draft-model`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` エンジン（`generate` 引数 parser） |
+| コマンド | `strata`（エンジン引数、root） |
 | オプション | `--draft-model` |
 | 別名 | なし |
-| 値 | DFlash2 の `DF2P v1` pack ファイルのパス |
+| 値 | DFlash2 drafter pack (`PACK`) のファイルパス。省略時の値は空（既定 pack なし） |
 
 ## 役割
 
-`--draft dflash2` を選ぶときに使う DFlash2 block drafter の pack ファイルを指定します。DFlash2 は対象モデルの中間状態から次の候補 token を作り、検証には通常の verifier を使います。MTP drafter は fallback としてロードされたままです。`--draft-model` 単独では drafter を切り替えません。
+`--draft-model` は、`--draft dflash2` で使う DFlash2 block drafter の pack を指定します。通常の MTP draft 経路では参照されません。DFlash2 は Qwen3.8-Flash-Next 用の専用 drafter で、対象エンジンの native pack と speculative window が必要です。pack は起動時に読み込まれて GPU 側に展開されます（`engine/src/program/generate.cpp:1184-1186, 8266-8275`）。
 
 ## 使い方
 
-`pack`、native model、MTP model、token 入力など通常のエンジン引数も必要です。例:
-
 ```sh
-strata generate --pack pack/full --native models/target.gguf --mtp models/mtp \
-  --tokens "1,2,3" --draft dflash2 --draft-model models/dflash2.df2p
+strata --native /models/flash-next.native --draft dflash2 \
+  --draft-model /models/flash-next-dflash2.pack --spec 6 \
+  --mtp /models/flash-next-mtp
 ```
 
-これは構文例です。`models/dflash2.df2p` は `tools/dflash2_pack.py` で作られた pack を指す想定で、ここでは pack の入手・作成や実行結果を検証していません。
+この例では `--mtp` ディレクトリの `draft_vocab.bin` を語彙部分集合として使います。通常の CUDA/HIP build で `--draft-fallback` を省略した場合、MTP layer 自体は読み込まず、DFlash2 だけで draft します（`engine/src/program/generate.cpp:1187-1190, 6494-6530`）。
 
 ## 値と既定値
 
-- 値は次の argv 要素をそのまま文字列として受け取ります。値の形式やファイル存在は parser 段階では検査しません。値を省略すると `needs a value` を stderr に出し、終了コード 2 で終了します。
-- 既定値は空文字列です。`--draft dflash2` を選び、パスが空なら DFlash2 を有効化せず MTP に戻ります。`--draft` 自体を省略した場合も MTP 経路です。
-- 複数回指定した場合は引数ループで後の値が `draft_model` に代入されます。
-- `--draft` の値は `mtp` または `dflash2` のみです。別値は parser がエラーを出して終了コード 2 で終了します。
+- 値は次の引数をそのまま受け取る文字列です。parser は値の形式、拡張子、存在を検証せず、`--draft-model` の繰り返し指定は後の値で上書きします（`engine/src/program/generate.cpp:3842-3847, 4154`）。
+- 値を省略すると parser は終了コード `2` で `--draft-model needs a value` を stderr に出します（`engine/src/program/generate.cpp:3844-3846`）。
+- pack に既定値はありません。DFlash2 を選んだ場合、空のままでは起動時検査に失敗します。`--draft mtp`（または通常の MTP 経路）では、この値は使用されません（`engine/src/program/generate.cpp:8267-8274`）。
+- CUDA/HIP の loader は `DF2P` magic と version 1、pack index と tensor shape を確認します。ファイルが開けない、形式・index・shape が不正、または GPU に収まらない場合は load に失敗します（`engine/src/core/dflash2.cpp:187-196, 225-236`）。Metal 実装も `DF2P` v1 を読み、pack index を処理します（`engine/metal/src/engine/dflash2.inc:131-140, 1046-1056`）。
 
 ## 実行時の動作
 
-DFlash2 は CUDA または HIP でコンパイルしたエンジンに含まれます。`--draft dflash2`、MTP が有効（`--mtp` と `--spec` が必要）、native pack 使用、単一 GPU、非 batch、非 serve の CLI 実行、空でない `--draft-model` が揃ったときに、指定パスを GPU 0 向けに読み込みます。MTP は DFlash2 と並行して fallback としてロードされます。
+`--draft dflash2` が選ばれると、engine は pack を開いて index と重みを読み、DFlash2 の GPU/device 側領域へロードします。CUDA/HIP 実装では tensor を device memory に確保し、Q8_0/Q4_0 tensor の変換・転送を行って drafter の stream/buffer を準備します（`engine/src/core/dflash2.cpp:187-196, 236-268`）。Metal 実装では index を読み込んだ後、Metal decode window に pack を読み込ませます（`engine/metal/src/engine/dflash2.inc:1046-1065`）。
 
-ロード処理はファイルをバイナリで開き、`DF2P` magic と version 1、pack index、Flash-Next drafter に合う shape を確認し、tensor データを GPU に確保・転送します。DFlash2 の verifier tap が利用できない場合、head/vocabulary の bind に失敗した場合、または graph 準備に失敗した場合も DFlash2 を止めて MTP に戻ります。成功時は stderr に DFlash2 が有効になった旨を出力し、生成終了時に round あたりの時間と VRAM 使用量を stdout に出します。
+`--draft-model` 単独では DFlash2 を有効にしません。DFlash2 を選んだときは、pack に加えて `--spec` が 2 以上で、`--mtp DIR` または `--mtp-draft-vocab FILE` のいずれかが必要です。MTP directory は fallback 用の MTP layer を必ず意味するわけではなく、fallback を無効にした通常経路では `draft_vocab.bin` の場所として使われ、その後 MTP layer の読み込み対象から外されます（`engine/src/program/generate.cpp:6494-6507, 6527-6530`）。
+
+| build / 選択 | この値の扱いと条件 |
+| --- | --- |
+| CUDA/HIP, `--draft dflash2` | `--draft-model` と native pack が必要です。MTP vocabulary は `--mtp DIR` または `--mtp-draft-vocab FILE` から選びます。既定の fallback は `none` で、DFlash2 が起動できなければ処理を終了します。`--draft-fallback mtp` を指定すると MTP layer も読み込み、DFlash2 の開始・bind・prepare が失敗した場合に MTP へ fallback します（`engine/src/program/generate.cpp:1184-1190, 8266-8326, 24512-24536`）。 |
+| CUDA/HIP, `--draft auto` | serve 用の選択です。DFlash2 pack と MTP drafter の両方を用意し、要求ごとに drafter を選ぶ経路です。`--draft-fallback none` は組み合わせられません（`engine/src/program/generate.cpp:1367-1368, 6501-6503`）。 |
+| SYCL, `--draft dflash2` | MTP layer は読み込まず、失敗時 fallback もありません。pack と MTP vocabulary、`--spec >= 2` が必要で、複数 GPU、`--batch`、`--pipeline-windows` は拒否されます（`engine/sycl/src/program/generate.cpp:785-788, 2118-2123, 4499-4517, 4557-4568`）。 |
+
+CUDA/HIP では `--draft-cap` によって `--spec` の上限が変わる場合があります。DFlash2 load が失敗した場合、既定の `none` では stderr に理由を出し終了コード `1`、`mtp` fallback では MTP が draft を続けます（`engine/src/program/generate.cpp:8298-8303, 8310-8326`）。Metal build の target は DFlash2 support を定義しており、共通 parser/起動処理から Metal 固有の loader に接続します（`engine/metal/CMakeLists.txt:154-177`, `engine/metal/src/engine/dflash2.inc:1046-1065`）。build ごとの feature 構成は異なるため、ここに挙げた以外の配布 build での可否は確認していません。
 
 ## 適用条件と副作用
 
-- CMake では CUDA または HIP 有効時に `STRATA_HAVE_DFLASH2` を定義します。Metal / SYCL build には DFlash2 実装がなく、このオプションで DFlash2 は有効になりません。
-- `--draft-model` が空、MTP がない、native pack でない、複数 GPU・batch・serve のいずれか、の条件では stderr に理由を出して MTP を使います。これらは拒否終了ではありません。
-- 読み込み時にパスのファイルを開き、pack の tensor を GPU VRAM に確保・転送します。shape 不一致、切り詰められた index/data、開けないファイル、VRAM 不足等のロード失敗は stderr に理由を出して MTP へ fallback します。DFlash2 として必要な VRAM はエラー案内で約 1.2 GiB と説明されますが、実使用量は pack と実行環境によります。
-- pack が読み込まれた後、カード判定により `--spec` の最大窓幅が縮められることがあります。`--draft-cap N` が正ならその値を cap とし、そうでなければカード別 cap を使います。cap を適用したときは stderr に通知します。
-- DFlash2 自体は Flash-Next 向けです。別 family や backend、Release 配布物での利用可能性はこの調査では実機確認していません。
+- CUDA/HIP 共通 parser は `--draft` の値として `mtp`、`dflash2`、`auto` を受け付けます。DFlash2 の起動経路では native pack が必要で、CUDA/HIP は `STRATA_HAVE_DFLASH2` build 条件下で load します（`engine/src/program/generate.cpp:4143-4149, 8266-8274`; build 定義は `engine/cmake/strata_gpu_engine.cmake:6-13`）。
+- DFlash2 を使うと GPU/device memory を pack や drafter 用に確保し、ファイルから pack を読みます。解析した範囲では pack 自体を書き換える処理はありません（`engine/src/core/dflash2.cpp:187-196, 236-268`）。
+- CUDA/HIP の DFlash2 で `--pipeline-windows` を有効にすると、対応する次 window の draft 経路がないため DFlash2 は停止し、既定 `none` では起動失敗、MTP fallback が有効なら MTP に切り替わります（`engine/src/program/generate.cpp:8268-8273, 8319-8326`）。
+- SYCL では `--draft-fallback` は `none` 以外を拒否します（終了コード `2`）。また DFlash2 は一 GPU・一 request のみで、batch、pipeline、layer split を拒否します（`engine/sycl/src/program/generate.cpp:2119-2123, 4557-4560`）。
 
 ## 出力とエラー
 
-pack を開けない場合は `dflash2: cannot open <path>`、DF2P magic/version や shape が合わない場合は各理由が stderr に出ます。これらの DFlash2 初期化失敗は通常 MTP に fallback するため、CLI 全体の即時エラーとは限りません。GPU での生成や失敗経路は実行しておらず、記載はソース読解に基づきます。
+- 値がない場合は stderr に `--draft-model needs a value` を出し、終了コード `2` です（`engine/src/program/generate.cpp:3844-3846`）。
+- DFlash2 選択時に `--draft-model`、`--spec >= 2`、または MTP vocabulary のいずれかが不足すると、要件を stderr に出し、終了コード `2` です（`engine/src/program/generate.cpp:6505-6508`; SYCL: `engine/sycl/src/program/generate.cpp:4504-4508`）。
+- pack の open、format、shape、GPU memory 等で load できない場合、CUDA/HIP は `--draft-fallback none` なら理由を stderr に出して終了コード `1`、`mtp` なら理由と fallback を stderr に出して MTP で続行します（`engine/src/program/generate.cpp:8310-8326`）。SYCL は fallback を行わず終了コード `1` です（`engine/sycl/src/program/generate.cpp:4562-4565`）。
 
 ## 根拠
 
-- parser、値の格納、`--draft` の受理値と usage: `src/program/generate.cpp:949-950`, `src/program/generate.cpp:2418-2420`, `src/program/generate.cpp:2692-2701`。
-- MTP 条件と DFlash2 の適用条件、pack load、カード別窓幅 cap、fallback 診断: `src/program/generate.cpp:5455-5479`, `src/program/generate.cpp:5480-5517`。
-- verifier tap、bind、graph prepare の失敗時 fallback と成功メッセージ: `src/program/generate.cpp:16148-16165`。
-- DFlash2 round での draft 呼び出し、confidence による窓選択、実行統計: `src/program/generate.cpp:16494-16503`, `src/program/generate.cpp:16544-16549`, `src/program/generate.cpp:16832-16838`。
-- pack の open、magic/version、shape 検査、VRAM 確保・データ転送: `src/core/dflash2.cpp:122-172`, `src/core/dflash2.cpp:179-193`。
-- DFlash2 の pack 形式・drafter 概要: `include/strata/core/dflash2.hpp:1-8`, `include/strata/core/dflash2.hpp:33-47`。
-- 対応 build backend: `CMakeLists.txt:336-340`。
-
+- `engine/src/program/generate.cpp:1184-1190` — DFlash2 と `--draft-model` の役割、fallback の既定値。
+- `engine/src/program/generate.cpp:3842-3847, 4143-4159` — 値の取得、missing value、`--draft` / fallback parser。
+- `engine/src/program/generate.cpp:6494-6530` — vocabulary と fallback 条件、MTP directory の扱い。
+- `engine/src/program/generate.cpp:8266-8326, 24512-24536` — native pack 条件、load、failure/fallback、出力経路。
+- `engine/src/core/dflash2.cpp:187-268` — CUDA/HIP pack 読込・形式検証・device allocation。
+- `engine/metal/src/engine/dflash2.inc:131-140, 1046-1065` — Metal の index 読込と bind。
+- `engine/sycl/src/program/generate.cpp:785-788, 2118-2123, 4499-4517, 4557-4568` — SYCL parser と適用条件・失敗経路。
+- `engine/cmake/strata_gpu_engine.cmake:6-13`, `engine/metal/CMakeLists.txt:154-177` — CUDA/HIP と Metal の feature build 定義。

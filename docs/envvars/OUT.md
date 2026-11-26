@@ -1,42 +1,51 @@
 # `OUT`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`OUT` は Strata のエンジン実行時設定ではなく、リポジトリ内のビルド・パッケージ用スクリプトや Docker smoke test が生成物・ログを置くディレクトリを指定する環境変数です。Strata の C++/Python 実行経路で `OUT` を読む箇所は見つかりませんでした。
+`OUT` は Strata 本体の engine 実行時設定ではなく、リポジトリ内の packaging/build・Docker smoke-test・E2E スクリプトが出力先を選ぶための環境変数である。Linux の CUDA / HIP / SYCL packaging ではパッケージまたは作業成果物の場所、Windows CUDA packaging ではパッケージ先、`engine/spark/build_engine.sh` では engine フォルダー、`tools/docker/smoke-test.sh` ではログフォルダー、Node の画像読み込み E2E では記録とスクリーンショットの保存先を指定する。対象はこれらのスクリプトを実行したときに限られ、通常の `strata` プロセスやサーバーの挙動を変える読み取りは確認できない（例: `tools/packaging/build_cuda_linux.sh:16-28`, `tools/packaging/build_hip_linux.sh:21-44`, `tools/packaging/build_cuda_windows.py:151-165`, `app/host/scripts/load-pictures-e2e.mjs:19-26`）。
 
 ## 値と判定
 
-| 読み取り箇所 | 未設定または空文字 | 非空文字列 | 判定・優先順位 |
-|---|---|---|---|
-| `packaging/build_cuda_linux.sh:22` | リポジトリ直下の `out-engine-<variant>` | 指定値をパッケージ出力先にする | `${OUT:-default}`。未設定と空文字は同じ既定値。`${VARIANT}` の既定は `cuda13`（同:15）。スクリプト内に別の `--out` 上書きはない。 |
-| `packaging/build_cuda_linux_aarch64.sh:19` | リポジトリ直下の `out-engine-cuda13-aarch64` | 指定値を最終パッケージの出力先にする | `${OUT:-default}`。空文字は既定値。子の `spark/build_engine.sh` には一時 staging path を `OUT` として明示的に渡す（同:30-32）。 |
-| `packaging/build_sycl_linux.sh:25` | リポジトリ直下の `out-engine-sycl` | 指定値をパッケージ出力先にする | `${OUT:-default}`。空文字は既定値。他の CLI 出力指定での上書きはない。 |
-| `packaging/build_hip_linux.sh:29` | 起動時の作業ディレクトリにある `work-<VARIANT>` | 指定値を作業・stage・package のルートにする | `${OUT:-default}`。空文字は既定値。`VARIANT` は必須（同:23）。 |
-| `packaging/build_dsv41_hip_linux.sh:21` | 起動時の作業ディレクトリにある `work-dsv41-<VARIANT>` | 指定値を作業・stage・package のルートにする | `${OUT:-default}`。空文字は既定値。`VARIANT` は必須（同:15）。 |
-| `spark/build_engine.sh:19` | リポジトリ直下の `out-spark/engine` | 指定値を完成エンジンフォルダーにする | `${OUT:-default}`。空文字は既定値。他の CLI 出力指定での上書きはない。 |
-| `docker/smoke-test.sh:11` | エラー終了 | 指定値を smoke test のログ置き場にする | `${OUT:?}`。空文字と未設定のどちらも、シェルがパラメーター展開エラーを出して終了する。 |
+値はパス文字列として使われ、数値変換や値域検査はない。既定値と空文字の扱いは実装ごとに異なる。
 
-いずれも値を数値や列挙値として parse せず、パス文字列として使います。文字列比較、範囲検査、正規化、相対パスの一律な基準化はありません。相対パスは各スクリプトがその後 `cd` するディレクトリとの組み合わせで解決されます。ディレクトリ作成や後続コマンドが失敗すればビルド／テスト処理も失敗します。
+| 実行経路 | unset | 設定時に使われる値 | 空文字・無効値 |
+|---|---|---|---|
+| Linux CUDA x86_64 packaging | `$repo/out-engine-$variant`（variant の既定は `cuda13`） | `OUT` の文字列 | `${OUT:-...}` のため空文字も既定値へ戻る。パスの存在・書き込み可能性は事前検査せず、後続コマンドで失敗する（`tools/packaging/build_cuda_linux.sh:17-28,76-82`）。 |
+| Linux HIP packaging | `$PWD/work-$V`（`V` は必須の `VARIANT`） | `OUT` の文字列 | 空文字も既定値へ戻る。文字列のパス妥当性検査はない（`tools/packaging/build_hip_linux.sh:21-32,44`）。 |
+| Linux SYCL packaging | `$repo/out-engine-sycl` | `OUT` の文字列 | 空文字も既定値へ戻る。パス検査はない（`tools/packaging/build_sycl_linux.sh:18-28,72-80`）。 |
+| Linux CUDA aarch64 packaging | `$repo/out-engine-cuda13-aarch64` | `OUT` の文字列 | 空文字も既定値へ戻る。パス検査はない（`tools/packaging/build_cuda_linux_aarch64.sh:15-18,38-48`）。内部の `engine/spark/build_engine.sh` は別途 `OUT=$stage/engine` を渡されるため、親スクリプトの package 出力先 `OUT` はそこで上書きされる（同 `:32-35`）。 |
+| DGX Spark engine build | `$repo/out-spark/engine` | `OUT` の文字列 | 空文字も既定値へ戻る。`rm -rf "$out"` を含むため、指定先は成果物の削除・再作成対象になる（`engine/spark/build_engine.sh:17-27,75-89`）。 |
+| Windows CUDA packaging | `<repo>/out-engine-win-<variant>` | `os.environ.get("OUT")` が空でない場合の文字列 | Python の `or` により unset と空文字は既定値。値は `Path` に渡されるが、独自の値域検査はない（`tools/packaging/build_cuda_windows.py:151-165,191-203`）。 |
+| Docker smoke-test | 既定値なし。必須 | `OUT` の文字列 | `${OUT:?}` で unset または空文字ならシェルがエラーとして停止する。その後、ディレクトリ作成と `test.log` の出力に使う（`tools/docker/smoke-test.sh:10-17`）。 |
+| 画像読み込み E2E | `./lp-out` | `process.env.OUT` の値 | `??` 判定なので空文字は既定値へ戻らず、そのまま `mkdirSync` に渡される。数値・形式の検査はない（`app/host/scripts/load-pictures-e2e.mjs:19-26`）。 |
+
+これらのパス値は大文字小文字を変換せず、そのまま使われる。相対パスの基準はスクリプトの作業ディレクトリに依存する。Linux CUDA / SYCL / aarch64 の各 packaging script は `OUT` を読み取った後に repo へ `cd` してから成果物を書き出すため、相対指定は repo 基準になる。HIP は初期の `mkdir -p "$OUT"` の後に `cd "$SRC"` するので、相対指定は初期ディレクトリで作業フォルダーを作り、その後の同じ相対表記の参照は `$SRC` 基準になる（`tools/packaging/build_hip_linux.sh:23-29,44,58-65`）。Spark build は `cd "$repo"` 後に出力先を操作する（`engine/spark/build_engine.sh:18-20,50,75-89`）。Windows は `Path` に渡した相対パスを実行時カレントディレクトリ基準で扱う（`tools/packaging/build_cuda_windows.py:161-165,191-203`）。
 
 ## 有効になる条件
 
-- 6 つのビルドスクリプトを実行したときに、そのスクリプト内で出力先が決まります。CUDA Linux x86_64 / arm64、SYCL、HIP、HIP DeepSeek-V4.1、DGX Spark 用エンジンの経路が該当します。
-- Docker smoke test では `OUT` が空でないことが必須で、`OUT/test.log` を作り、以後の標準出力・標準エラーをそのログへ tee します（`docker/smoke-test.sh:11-17`）。
-- これらはスクリプトのシェル変数展開であり、OS/backend/build macro によるエンジン内の機能切替はありません。ビルドされた `strata` へこの値を環境設定として転送する処理も見つかりません。
-- `packaging/mac/sign-and-notarize.sh` の `--out`、`packaging/mac/build_dsv41_engine.sh` の `--out`、デスクトップ補助 script の `OUT` は、それぞれ引数から設定するシェル変数です。`OUT` 環境変数を読むものではありません（例: `packaging/mac/sign-and-notarize.sh:52,65-70`）。
+- Linux CUDA x86_64 は Linux 向け build script の実行時に使う。`VARIANT` の検査、CUDA toolkit の一致確認、CMake build が先にあり、`OUT` はその成果物のパッケージ場所を選ぶだけ（`tools/packaging/build_cuda_linux.sh:17-32,43-50,76-82`）。
+- Linux HIP は `VARIANT` と `HP` が必須で、build 条件に応じて engine / vision / package を生成する。`VISION_ONLY` や `NO_PACKAGE` などで後続処理を早期終了する場合、`OUT` が指定されても package 出力まで到達しない（`tools/packaging/build_hip_linux.sh:21-32,60-86,127-141`）。
+- Linux SYCL は oneAPI / `icpx` が必要で、`AOT` が空なら JIT package、Battlemage device list なら AOT build となる。`OUT` はどちらも package 出力先（`tools/packaging/build_sycl_linux.sh:20-37,49-50,71-80`）。
+- Linux aarch64 packaging と Spark engine build は arm64 Linux 専用。外側の `OUT` は package 先、内側では一時 stage を `OUT` に設定し直す（`tools/packaging/build_cuda_linux_aarch64.sh:16-24,32-40`; `engine/spark/build_engine.sh:18-32`）。
+- Windows packaging は Windows 上で実行する必要がある。非 Windows では `this builds the Windows engine; on Linux use tools/packaging/build_cuda_linux.sh` を出して失敗する（`tools/packaging/build_cuda_windows.py:151-158`）。
+- Docker smoke-test は `IMAGE`、`NAME`、`BASE` と `OUT` が設定済みである必要がある（`tools/docker/smoke-test.sh:10-17`）。
+- E2E スクリプトは `HOST_URL` が必要で、未設定なら `HOST_URL is required` を出して終了コード 2。`OUT` はホストへの接続・モデル操作の成否を変えず、記録ファイルの保存先だけを変える（`app/host/scripts/load-pictures-e2e.mjs:19-26,48-87`）。
 
 ## 実行時の詳細
 
-各ビルド script は開始時に一度 `OUT` を展開してローカルの `out` または `OUT` に保持し、その値を作業ディレクトリ、stage、パッケージ出力先に使います。CUDA x86_64 と SYCL は `mkdir -p` 後に `package_engine.py --out` へ渡し、成功時に `built: <path>` を表示します（`packaging/build_cuda_linux.sh:61-67`; `packaging/build_sycl_linux.sh:65-74`）。arm64 CUDA は `OUT` を最終パッケージ先に使い、内側の Spark build の出力は一時ディレクトリへ分けます（`packaging/build_cuda_linux_aarch64.sh:30-32,35-53`）。
+各スクリプトの起動時に `OUT` をローカル変数または定数へ一度取り込む（Docker smoke-test は起動時に必須性を展開確認し、後続で値を利用）。実行中に親プロセス環境の値を変更しても、取り込み済みの出力先は変化しない。値をモデル、生成結果、server request、子プロセスへ一般設定として転送する処理はない。例外的に aarch64 packaging は engine build 子プロセスへ `OUT=$stage/engine` を明示的に渡し、そこで一時的な engine folder を作らせる（`tools/packaging/build_cuda_linux_aarch64.sh:32-40`; `engine/spark/build_engine.sh:19-27,75-89`）。
 
-HIP の2 script は `OUT` 配下に build tree、ログ、stage、components を作ります。通常の HIP script は `NO_PACKAGE` が空でない場合、package 作成前に stage 完了として終了します（`packaging/build_hip_linux.sh:45,60-123`）。DeepSeek-V4.1 専用 script も同様に `OUT` 配下へ置き、`NO_PACKAGE` 指定時は stage 後に終了します（`packaging/build_dsv41_hip_linux.sh:33-81`）。DGX Spark script は `OUT` をエンジン、ライブラリ、`BUILD.json` の配置先として使います（`spark/build_engine.sh:77-94`）。
+Linux CUDA / SYCL / aarch64 と Windows の `OUT` は package 出力ディレクトリ、HIP と Spark の `OUT` は build 作業ディレクトリも兼ねる。Spark build は指定ディレクトリを `rm -rf` してから再作成する。HIP は `build.status` と各 configure/build ログ、stage、components を配下に作る。Node E2E は出力ディレクトリを再帰作成し、スクリーンショット、`timeline.json`、失敗時の `error.txt` を保存する（`tools/packaging/build_hip_linux.sh:44-45,86-100,129-140`; `engine/spark/build_engine.sh:75-89`; `app/host/scripts/load-pictures-e2e.mjs:26,46,81-87`）。
 
-読み取り後にプロセス環境の `OUT` を変更して再評価する処理や cache はありません。値がファイルシステム上で使えない場合、`mkdir`、リダイレクト、copy、build、packaging のいずれかがエラーになります。CUDA/SYCL script は `set -e` で失敗時に停止し（各 `:14`, `:17`）、HIP script はコマンド結果を status に記録して `ABORT ... failed` で終了する経路があります（例: `packaging/build_hip_linux.sh:47-48,64-90`; `packaging/build_dsv41_hip_linux.sh:34-35,49-52`）。Docker smoke test は必須 `OUT` が空なら先へ進まず、後続のテスト失敗は標準ログと `test.log` に `FAIL` として出力されます（`docker/smoke-test.sh:11-17,21-22`）。
+## ログと測定値
+
+通常の成功時には packaging/build script が `built: <path>` を表示する（CUDA x86_64 `tools/packaging/build_cuda_linux.sh:81-82`、SYCL `tools/packaging/build_sycl_linux.sh:76-80`、aarch64 `tools/packaging/build_cuda_linux_aarch64.sh:43-48`、Spark `engine/spark/build_engine.sh:87-89`）。Windows は最後に `built: <folder>` を表示する（`tools/packaging/build_cuda_windows.py:200-203`）。HIP は `build.status` に工程記録を書き、package log を同ファイルへ追記する（`tools/packaging/build_hip_linux.sh:44-47,135-141`）。Docker smoke-test は `$OUT/test.log` に標準出力・標準エラーを tee する（`tools/docker/smoke-test.sh:15-17`）。E2E は JSON の結果概要を標準出力に出し、失敗時はエラーメッセージを標準エラーにも出す（`app/host/scripts/load-pictures-e2e.mjs:81-87`）。`OUT` 自体に関する測定値は該当しない。
 
 ## 根拠
 
-- 環境値の読み取り・既定値: `packaging/build_cuda_linux.sh:15-24`; `packaging/build_cuda_linux_aarch64.sh:17-19`; `packaging/build_sycl_linux.sh:17-28`; `packaging/build_hip_linux.sh:22-32`; `packaging/build_dsv41_hip_linux.sh:14-24`; `spark/build_engine.sh:16-25`。
-- `OUT` 必須の smoke test: `docker/smoke-test.sh:10-17`。
-- 候補一覧上の名前: `docs/envvars/000_envvers.md:744`（この一覧だけでは実装の有無は確定しない）。
+- Linux packaging / build: `tools/packaging/build_cuda_linux.sh:16-28,76-82`; `tools/packaging/build_hip_linux.sh:21-45,58-65,86-100,120-141`; `tools/packaging/build_sycl_linux.sh:18-28,40-50,72-80`; `tools/packaging/build_cuda_linux_aarch64.sh:15-48`; `engine/spark/build_engine.sh:17-27,50,75-89`。
+- Windows packaging: `tools/packaging/build_cuda_windows.py:151-165,189-203`。
+- Docker smoke-test: `tools/docker/smoke-test.sh:10-17`。
+- E2E output: `app/host/scripts/load-pictures-e2e.mjs:19-26,46,81-87`。

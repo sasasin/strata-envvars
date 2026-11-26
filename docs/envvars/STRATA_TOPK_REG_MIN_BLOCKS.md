@@ -1,48 +1,50 @@
 # `STRATA_TOPK_REG_MIN_BLOCKS`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-HIP 版 QSA の block top-k で、prompt 選択時に register kernel を使う最小の active block 数を決めます。閾値未満なら参照 radix kernel に切り替えます。主に Strix Halo（gfx1151）では起動時に `4096` が既定値として設定され、それ以外の HIP GPU では QSA 実装内の既定値 `7168` が使われます。
+HIP 版の QSA ブロック top-k 選択で、active block 数がこの閾値より小さい場合に register top-k kernel を使わず reference kernel に切り替えるための閾値です。値は block 数で、セル数や token 数ではありません。`qsa_block_topk` 内で使われ、prompt の QSA selection のうち active count を渡す呼び出しで判定されます。active count を渡さない呼び出しでは閾値判定されません。CUDA 版ではこの変数を読みません。`engine/src/kernels/cuda/qsa_select.cu:3060-3076`, `engine/src/prefill/prefill.cpp:5390-5393,9456-9457`, `engine/src/core/layer.cpp:1277-1282`
 
 ## 値と判定
 
-QSA top-k 関数の初回実行時に `std::getenv` の値を `std::atoll` で変換し、関数内 `static const` に保存します。数値全体の厳密な検証や範囲制限はありません。`atoll` が読む先頭の整数部分が閾値となり、数字に変換できない場合は `0` です。末尾の非数字以降は閾値に含まれません。
+HIP コンパイル時に `qsa_block_topk` の初回実行で `std::getenv` を呼び、値が存在すれば `std::atoll` で `int64_t` に変換します。未設定は `7168`。空文字や数値として読めない先頭文字列は `atoll` の結果 `0` になります。数値の後ろに文字があっても数値の先頭部分を読み、空白や符号も `atoll` の規則で扱います。`0anything` は `0`、`-1` は `-1` です。全体の妥当性検査、範囲制限、clamp はありません。`engine/src/kernels/cuda/qsa_select.cu:3060-3067`
 
-| 状態 | 判定値 |
-|---|---:|
-| 未設定（かつ arch default が適用されない） | `7168` |
-| 未設定、gfx1151 で arch defaults が適用 | `4096` |
-| 明示設定 `4096`, `4096tail` | `4096` |
-| 空文字、非数値、`0` | `0` |
-| 明示設定 `-1` | `-1` |
+| 条件 | 未設定時 | 値の例と結果 |
+| --- | --- | --- |
+| HIP build | `7168` blocks | `4096`, `0`, `-1`, `12tail` はそれぞれ `4096`, `0`, `-1`, `12`。空文字、`true`、`0anything` は `0`。 |
+| CUDA build | この変数は読まれない | 値は top-k dispatch に影響しません。CUDA 側には別の `kWideMinBlocks=4608` の分岐があります。 |
 
-空文字や非数値は変数としては設定済みなので gfx1151 の `4096` 注入を妨げ、その後 `atoll` により `0` になります。`STRATA_GFX1151_DEFAULTS=0` を先頭文字判定で設定すると gfx1151 の arch-default 表自体が無効になり、対象変数の明示設定がなければ内部既定値 `7168` が使われます。
+ただし HIP でも、この閾値比較が行われるのは `active_blocks > 0` のときだけです。`reach` は active count が `max_blocks` より小さければ active count、それ以外は `max_blocks` です。`counted && reach < kRegMinBlocks` の場合に reference kernel に進みます。閾値以下と等しい `reach` は `too_small` になりません。`engine/src/kernels/cuda/qsa_select.cu:3042-3069`
 
 ## 有効になる条件
 
-- 対象の読み取りと分岐は HIP 用の `__HIPCC__` 経路だけです。CUDA ではこの変数を読みません。
-- 閾値比較は `active_blocks > 0` のときだけ有効です。active count がない呼び出しでは閾値は選択に影響しません。
-- `STRATA_TOPK_OLD` が設定されている場合は、閾値に関係なく参照 radix kernel を使います。
-- HIP では QSA cluster kernel の早期 return はありません。active block 数が閾値未満なら参照 radix kernel、それ以外は geometry 条件と `reach` に応じて register kernel または wide kernel を選びます。
-- arch defaults は HIP ビルドで GPU 0 のプロパティ取得に成功した場合に適用されます。gfx1151 では、利用者がこの変数を設定済みなら値を保持します（空文字も設定済み）。gfx12 の arch-default 表にはこの変数は含まれません。
+- HIP backend の `qsa_block_topk` 経路で有効です。CUDA build は `__HIPCC__` でない側に入り、この変数を参照しません。`engine/src/kernels/cuda/qsa_select.cu:3044-3074`
+- `active_blocks > 0` が必要です。active count を渡さない呼び出しでは `counted` が false となり、閾値は無視されて `reach=max_blocks` で dispatch します。`engine/src/kernels/cuda/qsa_select.cu:3044-3059`
+- top-k の geometry と capacity がサポート条件を満たす必要があります。`s.idx_block != R` または `cap < qsa_selection_width(...)` の場合は `qsa_block_topk: unsupported geometry or cap` を stderr に出して `exit(1)` します。`engine/src/kernels/cuda/qsa_select.cu:3078-3080`
+- Strata は `gfx1151` と discrete RDNA3（gfx1100/1101/1102）の既定値テーブルに `4096` を登録します。既に環境変数が設定済みなら空文字や `0` を含めその値を保持します。gfx1151 は `STRATA_GFX1151_DEFAULTS=0` でテーブルを止められ、discrete RDNA3 は `STRATA_GFX11_DEFAULTS=0` または `STRATA_DEFAULTS=026` で止まります。gfx1151 のテーブルには `STRATA_DEFAULTS=026` による除外条件はありません。`engine/src/core/arch_defaults.cpp:64-77,302-310`, `engine/include/strata/core/gfx11_extra.hpp:27-55`
+- 表にない HIP GPU では、Strata の arch default による値の挿入は確認できず、カーネル内の未設定既定値 `7168` を使います。gfx12 の既定表は gfx1151 表から一部を選んでいますが、この変数を含めていません。`engine/src/core/arch_defaults.cpp:30-62,64-77`
+- 対象変数に対応する CLI 引数や別環境変数による閾値の上書きは見つかりませんでした。上記 default table の無効化変数は「未設定時の自動挿入」にだけ影響します。
 
 ## 実行時の詳細
 
-通常の prefill selection は batch 内の最終 query の `n_bid + 1` を `active_blocks` として `qsa_block_topk` に渡します。HIP 側ではこれを `reach` とし、`reach < STRATA_TOPK_REG_MIN_BLOCKS` なら `qsa_block_topk_ref` に戻ります。`reach` が閾値以上なら、register kernel の処理可能範囲と `STRATA_TOPK_STREAM` などの別条件を使って後続 kernel を選びます。この変数自体は選択 cell の値を変える計算ではなく、kernel dispatch の閾値です。
+自動既定値は engine の `apply_arch_defaults` が GPU の arch を調べた後に、対象変数が未設定の場合だけ process environment に設定します。Linux では `setenv(..., overwrite=0)`、Windows では `_putenv_s` を使います。gfx1151 の値は arch default table、discrete RDNA3 の値は gfx11 exact table から設定されます。`engine/src/program/generate.cpp:4290-4320`, `engine/src/core/arch_defaults.cpp:218-224,302-323`, `engine/src/core/arch_defaults.cpp:64-77`, `engine/include/strata/core/gfx11_extra.hpp:41-55`
 
-`static const` の値は最初に関数が評価された時点で固定され、同一プロセス内での後の環境変更は反映されません。gfx1151 の arch default はそれより前、引数処理後の起動時に GPU 0 を調べて設定されます。対象変数専用のログはありませんが、arch default が注入された場合は起動時の一覧ログに `TOPK_REG_MIN_BLOCKS` が含まれます。
+カーネル内の `static const int64_t kRegMinBlocks` initializer が環境値を一度だけ読み取るため、最初の `qsa_block_topk` 呼び出し後に同一プロセス内で環境値を変えても再評価されません。active count が閾値より小さいと reference kernel に切り替わり、それ以外は geometry に応じて register kernel または wide kernel を選びます。`engine/src/kernels/cuda/qsa_select.cu:3060-3105`
 
-## 文書との照合
+gfx1151 の既定値 `4096` は `reach=4096` から閾値判定を通過します。未設定のカーネル既定 `7168` では、`reach=4096` は reference kernel 側になります。0 以下の値では非負の `reach` が閾値未満にならないため、この閾値条件による reference fallback は発生しません。負値を含む値の clamp はありません。`engine/src/kernels/cuda/qsa_select.cu:3063-3076`
 
-`docs/STRIX_HALO.md` は gfx1151 で `4096` を使い、register kernel の開始点を context 16K 相当（通常の閾値 7168 は約 28K 相当）に下げる説明をしています。同文書は対象の測定値と同一 cell 選択を記していますが、この調査では測定や parity test を再実行していません。
+## ログと測定値
+
+`apply_arch_defaults` が gfx1151 用の値を挿入した場合、stderr の `strata: gfx1151 (Strix Halo): ... exact speed switches on by default ...` に設定したスイッチ名を列挙します。ユーザーが値を指定済みの場合はこの既定値設定リストには入りません。discrete RDNA3 では `strata: gfx11 (RDNA3): ... exact speed switches on by default ...` に列挙されます。カーネルの閾値分岐自体に専用ログはありません。カーネル起動失敗時は `qsa_block_topk: <CUDA/HIP error string>` を stderr に出し `exit(1)` します。`engine/src/core/arch_defaults.cpp:318-332,397-404`, `engine/src/kernels/cuda/qsa_select.cu:3104-3105`
+
+`docs/STRIX_HALO.md:114` は gfx1151 で `4096` により register kernel の開始位置が 16K cells になり、選択 cells は同一と記しています。ソースコード上も gfx1151 default `4096` と reference/register/wide dispatch は確認できますが、この調査では性能測定や parity test を実行していません。測定値を独立に確認したものとしては扱いません。`engine/src/core/arch_defaults.cpp:77`, `engine/src/kernels/cuda/qsa_select.cu:3063-3103`
 
 ## 根拠
 
-- `src/kernels/cuda/qsa_select.cu:2495-2510,2521-2555,2561-2584` — HIP/CUDA 分岐、変換、既定値、閾値分岐、後続 kernel dispatch。
-- `include/strata/kernels/qsa_select.hpp:62-70` — `active_blocks` の契約。値が正なら query の block 上限として渡される。
-- `src/prefill/prefill.cpp:3147-3162` — prompt で batch の active block 数を算出して渡す箇所。
-- `src/program/generate.cpp:2641-2648` — HIP 起動時に GPU 0 を確認して arch defaults を適用。
-- `src/core/arch_defaults.cpp:12-34,43-47,62-80` — gfx1151 で `4096` を既定設定し、既存環境値を保持する処理。gfx12 表には対象変数がない。
-- `docs/STRIX_HALO.md:83-96` — gfx1151 の設定と記載された動作・測定の照合。
+- `engine/src/kernels/cuda/qsa_select.cu:3016-3021,3042-3105` — QSA top-k dispatch、HIP/CUDA 条件、値の読み取り、比較、kernel 起動、失敗経路。
+- `engine/src/prefill/prefill.cpp:5390-5393` — prompt 側から active block count 付きで呼び出す箇所。
+- `engine/src/core/arch_defaults.cpp:28-77,218-224,302-323,397-404` — gfx1151 の既定値、環境値を保持する処理、既定値ログ。
+- `engine/include/strata/core/gfx11_extra.hpp:27-55` — discrete RDNA3 の既定値条件と値。
+- `engine/src/program/generate.cpp:4290-4320` — GPU arch 判定後の arch defaults 適用。
+- `docs/STRIX_HALO.md:114` — gfx1151 の設定・測定資料との照合。

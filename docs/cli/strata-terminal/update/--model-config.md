@@ -1,6 +1,6 @@
-# `--model-config`
+# `strata update --model-config`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,51 +8,52 @@
 | コマンド | `strata update` |
 | オプション | `--model-config` |
 | 別名 | なし |
-| 値 | `RUN_CONFIG.json`（モデル起動設定ファイルのパス） |
+| 値 | run config JSON ファイルのパス（`RUN_CONFIG.json`）。parser は文字列として受け取る |
 
 ## 役割
 
-エンジン更新時のテスト起動で使う run config を指定します。更新対象エンジンを切り替える前に、その設定でステージ済みエンジンを起動し、モデル読み込みと1 token の応答を確認します。このオプションは更新後の通常起動設定を変更するものではありません。
+エンジン更新時、新しいエンジンを実際に起動して確認する試験に使うモデルの run config を指定します。省略時はインストール済みモデルから対象エンジン用の config が選ばれます。この指定は更新後エンジンの試験起動に使われ、`--check` の確認処理には使われません。
 
 ## 使い方
 
 ```sh
-strata update --model-config /absolute/path/to/strata-example.json
-```
+# 指定した run config のモデルで、新しいエンジンを試験してから更新する
+strata update --model-config ./configs/test-run.json
 
-このパスはテスト起動に使われます。CLI は実行前に存在確認や内容検証をせず、テスト起動時に読み込みます。
+# 更新候補だけを確認する。この場合、run config による試験起動は行わない
+strata update --check --model-config ./configs/test-run.json
+```
 
 ## 値と既定値
 
-- 値は必須です。parser は `--model-config` に `default=None` と metavar `RUN_CONFIG.json` を設定し、型・選択肢・独自 validation は設定していません。省略時は `None` です。同じ引数を複数回指定した場合の値は argparse の通常の処理に従います。【`strata_cli/update_cmd.py:37-38`】
-- 省略時、既定のテスト起動処理はインストール済みモデルを列挙し、ファイルが存在するモデルを候補にします。保存済みプロファイルが使う設定を優先し、それ以外はモデル ID 順に選びます。該当モデルがなければモデルなしの smoke test に進みます。【`strata_control/updater.py:701-717`, `strata_control/updater.py:842-850`】
-- 指定ファイルは UTF-8 (BOM 付きも可) の JSON として読み込まれ、プロファイル用 run config 検証では `args` が文字列配列であること、`exe` と `tokenizer` が空でない文字列であることが確認されます。これらの検証は parser 段階ではなく、テスト起動時に行われます。【`strata_control/updater.py:852-854`, `strata_control/updater.py:867-870`, `strata_control/profiles.py:135-147`】
+- parser は `--model-config` に `RUN_CONFIG.json` という metavar を付け、文字列を受け取ります。既定値は `None` で、必須指定ではありません（`terminal/strata_cli/update_cmd.py:47-56,59-62`）。
+- Strata 側にパスの存在確認や JSON の事前検証をする parser 処理はありません。相対パスは `Path` として読み込まれるため、実行時の作業ディレクトリを基準に解決されます（`terminal/strata_control/updater.py:1360-1376`）。
+- 空文字列は実行時の選択式で未指定と同様に扱われ、インストール済みモデルからの自動選択に進みます（`terminal/strata_control/updater.py:1364-1365`）。
+- `strata components update` にも同じ `_common` parser が登録され、同じ `run_config` 経路を通ります。索引上のこの文書の scope は `strata update` です（`terminal/strata_cli/update_cmd.py:47-56,59-79,324`; `terminal/strata_cli/cli.py:2210-2212`）。
 
 ## 実行時の動作
 
-parser の値は `update_cmd.run()` から `updater.Context.run_config` に渡されます。【`strata_cli/update_cmd.py:174-184`】通常の `strata update` では、エンジンをダウンロード・検証・ステージした後、指定 config を使ったテスト起動を行い、成功してからエンジンを切り替えます。【`strata_control/updater.py:944-959`, `strata_control/updater.py:977-1027`】
-
-テスト用コピーでは `exe` と `backend` をテスト対象エンジン用に置き換え、`lib_dirs` を除去し、接続先を `127.0.0.1` と空きポートにし、ログを一時領域に設定します。元の指定ファイル自体は書き換えません。分離した component/runtime/profile ディレクトリで起動し、generation ready でなければ1 token 検証を要求します。【`strata_control/updater.py:852-884`】
-
-この値が使われるのはエンジンのテスト起動です。`--check` は feed の確認結果を返して終了し、テスト起動を呼びません。また、`--no-engine` でエンジン更新を無効にした場合や `strata components rollback` の場合も、指定値はテスト起動に使われません（rollback 分岐は `run_update()` より前に処理されます）。【`strata_cli/update_cmd.py:185-209`, `strata_cli/update_cmd.py:210-224`】
+1. `strata update` は引数を `updater.Context.run_config` に渡します（`terminal/strata_cli/update_cmd.py:318-325`）。
+2. エンジン更新の試験起動では、指定値があればそのパスを使い、なければインストール済みモデルから対象 engine component に合う run config を探します（`terminal/strata_control/updater.py:1360-1365,917-938`）。対象 component と異なる config と判定された場合は、対象に合う config を再検索します（`terminal/strata_control/updater.py:1364-1369`）。
+3. 選ばれた JSON を読み込み、試験用 sandbox 内のコピーを作ります。config の engine 参照・backend・host・port・log を試験用に置き換え、引数を短時間の試験向けに軽量化し、試験環境変数を加えて一時 profile から起動します。新エンジンが ready になっても generation が未確認なら 1 token の応答を検証し、最後に停止します。指定元の config ファイル自体を書き換える処理ではありません（`terminal/strata_control/updater.py:1373-1395,1414-1456`）。
+4. 更新候補確認の `--check` は `updater.check` の結果を出して終了し、試験起動へ進みません。また、エンジン更新を無効にした実行ではこの値を使うエンジン試験は行われません（`terminal/strata_cli/update_cmd.py:361-372`）。
 
 ## 適用条件と副作用
 
-- 新しいエンジンパッケージを実際にインストールする経路でのみ、テスト起動の config として適用されます。既に最新などの理由でエンジン更新が不要ならテスト起動はありません。【`strata_control/updater.py:930-937`】
-- テスト起動は一時的なサーバープロセスを起動し、モデルを読み込んで1 token を生成します。設定上のモデルファイルや実行条件に問題があれば更新は失敗し得ます。試験ログは component の `.updates/logs/test-start-<version>.log` に保持され、テスト用 sandbox は終了時に削除されます。【`strata_control/updater.py:825-839`, `strata_control/updater.py:852-896`】
-- `--check` は feed を読むだけで、指定モデル設定を使いません。`--model-config` は feed や設定ファイルから自動補完される値ではありません。【`strata_cli/update_cmd.py:87-95`, `strata_cli/update_cmd.py:197-209`】
+- 効果があるのは更新処理がエンジンを試験する場合です。対象モデルが見つからず `run_config` も指定されていない場合、既定で `allow_no_model_smoke=True` のため、モデルをロードせずバイナリの smoke check にフォールバックします（`terminal/strata_control/updater.py:423-427,1364-1372`）。
+- 指定 config が別 component 用と判定された場合は、その指定を使わず対象 component 用 config の自動検索に切り替わります。config component の判定には `exe`、`arch`、engine 固有引数が使われます（`terminal/strata_control/updater.py:865-908,1364-1369`）。
+- 試験用の一時 directory、profile、runtime、engine log を作り、試験では loopback host と空き port を使用します。通常は完了後に sandbox を削除します。試験起動に失敗した場合は診断用ログ・記録を更新領域に残してから sandbox を削除します（`terminal/strata_control/updater.py:1374-1375,1414-1425,1435-1456,1123-1149`）。
+- 試験時は config 内の `env` を引き継ぎますが、試験専用環境変数で上書きします。API key は子プロセス環境から除かれます（`terminal/strata_control/updater.py:1394-1398,1419-1425`）。
 
 ## 出力とエラー
 
-テスト起動が失敗すると exit code 6 の更新エラーとなり、新エンジンは切り替えられず、既存エンジンが維持されます。失敗理由は人向けでは stderr の `strata: ...`、`--output json` / `jsonl` では JSON の error として出力されます。無効 JSON、読み取り不能、run config の必須項目不足などはテスト起動失敗として扱われます。【`strata_control/updater.py:79-123`, `strata_control/updater.py:852-889`, `strata_cli/update_cmd.py:163-172`, `strata_cli/update_cmd.py:225-234`】
+- 指定 config を読み込めない、JSON として読めない、または試験起動に使えない場合、試験起動の失敗として扱われます。試験失敗は exit code 6 となり、新エンジンは切り替えられず現在のエンジンが維持されます。テキスト出力は stderr に `strata: ...` を出し、`--output json` / `jsonl` では機械可読形式の失敗を出します（`terminal/strata_control/updater.py:86-100,132,1442-1449,1567-1588`; `terminal/strata_cli/update_cmd.py:311-316,378-386`）。
+- JSON 読み込みの前段で component 判定に失敗した場合、その判定関数は一般 engine として扱います。対象が別 component なら自動検索に切り替わるため、指定 path の問題が直ちに報告されるとは限りません（`terminal/strata_control/updater.py:871-877,1364-1369`）。
 
 ## 根拠
 
-- parser と既定値: `strata_cli/update_cmd.py:30-59`
-- 値の Context への引き渡し、rollback / check の分岐、エラー出力: `strata_cli/update_cmd.py:163-234`
-- 既定 config の探索: `strata_control/updater.py:701-717`
-- テスト起動での config 使用、sandbox と上書き項目: `strata_control/updater.py:842-896`
-- run config の検証: `strata_control/profiles.py:135-147`
-- テスト失敗時のエンジン更新処理: `strata_control/updater.py:930-1027`
-
-調査は上記 commit の checkout 内ソースに限定しました。CLI `--help` や Release 配布物との照合は行っていません。
+- `terminal/strata_cli/update_cmd.py:47-56,59-79` — parser 定義、既定値、値の表示名、および `components update` との共通登録。
+- `terminal/strata_cli/update_cmd.py:318-325,361-382` — 値の Context への転送、`--check` 分岐、出力と例外処理。
+- `terminal/strata_control/updater.py:865-938,1360-1399` — config の component 判定・自動選択・読込・試験用変換。
+- `terminal/strata_control/updater.py:1414-1456,1560-1588` — sandbox 内の試験起動、停止、失敗時記録と更新中止。
+- `docs/cli/README.md:257-268` — `strata update` 階層と作成対象リンクの確認。索引は変更していません。

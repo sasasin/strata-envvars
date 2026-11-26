@@ -1,47 +1,43 @@
 # `STRATA_NO_IQ4NL`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-15 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CPU native expert 経路で、IQ4_NL 形式の down projection に使う AVX2 複数 token カーネルを無効にする開発・診断用スイッチです。無効にすると、このカーネルの代わりに後続の実装選択（ggml-cpu の dot、または AVX2 非対応 CPU で使える AVX1 カーネル）が行われます。ゲート/up projection や GPU 側の IQ4_NL カーネルはこの変数では切り替わりません。
+CPU native expert の down projection が IQ4_NL（型 ID 20）である場合に使う、AVX2 multi-token 行カーネルを無効にする。未設定なら条件を満たすと `iq4nl256_down_rows` に分岐し、設定されていればその分岐を通さず、後続の通常の dot 経路へ進む。これは native expert の CPU 行計算に限った切替で、gate/up 行や CUDA/SYCL の IQ4_NL カーネルを切り替える読み取りではない（`engine/src/kernels/cpu/native_expert.cpp:792-839`）。
 
 ## 値と判定
 
-数値や文字列を parse せず、`std::getenv("STRATA_NO_IQ4NL") != nullptr` の結果だけを使います。
+`std::getenv("STRATA_NO_IQ4NL") == nullptr` の結果だけを見る。文字列を parse せず、未設定なら multi-token カーネルを許可し、設定済みなら値にかかわらず抑止する。したがって空文字、`0`、`1`、`false`、任意の文字列はいずれも同じ「抑止」扱いである。境界値や大文字小文字の判定はない（`engine/src/kernels/cpu/native_expert.cpp:797-798`）。
 
-| 環境変数の状態 | IQ4_NL AVX2 複数 token カーネル |
-|---|---|
-| 未設定 | 使用候補になる |
-| 値が設定されている（`1`、`0`、任意の文字列、空文字を含む） | 無効 |
-
-判定結果は `native_down_rows()` 内の `static const bool` に初回評価時に保存されます。同じプロセスで後から環境変数を変更しても、この判定は再評価されません。
+| 条件 | unset | 設定済みの値（例） |
+| --- | --- | --- |
+| CPU native expert の down-row dispatch | `iq4nl_mt == true` | 空文字、`0`、`1`、`false` を含め `iq4nl_mt == false` |
 
 ## 有効になる条件
 
-未設定であっても、次の条件を満たす場合だけ AVX2 複数 token カーネルを呼びます。
-
-- Strata の native expert CPU 経路を実行している。
-- down projection の型が IQ4_NL（ggml type `20`）。
-- CPU の AVX2 が利用可能と判定される。
-- token グループの大きさ `nt` が `STRATA_IQ_MT_MIN` の閾値以上。
-
-`STRATA_IQ_MT_MIN` は未設定なら `2`、設定時は `std::atoi()` の結果です。したがって既定では `nt == 1` のとき、この AVX2 複数 token カーネルは使いません。`STRATA_NO_IQ4NL` が設定されている場合も、条件式が偽になり同じカーネルを使いません。
-
-AVX2 が使えない CPU では、この AVX2 経路自体が選ばれません。後続の分岐で AVX1 が利用可能かつ IQ4_NL down に対応していれば AVX1 カーネルを使います。この AVX1 選択には `STRATA_NO_IQ4NL` の判定がなく、この変数は AVX1 経路を無効にしません。
+- `engine/src/kernels/cpu/native_expert.cpp` を含む CPU native-expert backend がビルドされ、その CPU native-expert down-row dispatch が実行されること。同ファイルは CPU backend の `strata_cpu_native_experts` で `strata_kernels_cpu` に加えられ、同 backend は `STRATA_NATIVE_EXPERTS=1` を定義する（`engine/cmake/backends/cpu.cmake:303-317, 370`）。
+- down-row の型 `f.d_type` が IQ4_NL の型 ID `20`、CPU が AVX2 対応、かつ `nt >= STRATA_IQ_MT_MIN` であること。`STRATA_IQ_MT_MIN` は別の環境変数で、未設定時 `2`、設定時は `std::atoi` で一度読み取られる。これらを満たし、かつ本変数が未設定なら `Default` arithmetic では `iq4nl256_down_rows` が選ばれる。`WindowInvariant` arithmetic では `mt_min <= 1` なら同じ kernel、それ以外は x86-64・AVX2 flavor・`iq4nl_reference_ok()` 成功時に `iq4nl_reference_rows` が選ばれ、条件不成立または照合失敗時は後続の一般 dot 経路へ進む（`engine/src/kernels/cpu/native_expert.cpp:797-798, 828-839`）。
+- この条件を満たしても本変数が設定済みなら AVX2 multi-token 分岐を飛ばす。AVX2 がない CPU では当該分岐自体が成立しないため、この変数による追加の切替はない（同: `828-843`）。
+- 型 ID 20 の場合、後続の旧 CPU 向け AVX1 分岐は AVX2 非対応・AVX1 対応・`STRATA_NO_IQ128` 未設定のときに別途成立し得る。本変数はこの分岐を無効化しない（同: `840-843`）。
+- CPU native expert の外側の呼び出し経路も必要である。`ExpertPool::native_rows` と依存タスク処理から native down-row 関数が呼ばれ、通常の `NativeArithmetic::Default` と `WindowInvariant` の双方が同じ環境判定を持つ実装に到達する（`engine/src/kernels/cpu/pool.cpp:1274-1310, 1433-1453`; `engine/src/kernels/cpu/native_expert.cpp:903-915`）。
 
 ## 実行時の詳細
 
-Qwen 3.5/3.8 系 engine の hybrid 実行では、GPU に resident でない routed expert を CPU pool に送り、`run_split_multi_native()` で native expert の gate/up と down を処理します。CPU pool の down phase は Q2_0 等の専用経路に該当しない場合 `native_down_rows()` を呼びます。IQ4_NL はそこで AVX2 条件を満たすと `iq4nl256_down_rows()` に渡されます。
+判定は `native_down_rows_impl` 内の関数ローカル `static const bool` であり、最初にそのテンプレート実体（`Default` または `WindowInvariant`）へ入ったときに初期化され、その実体についてプロセス内で cache される。以降に環境を変更しても、初期化済みの実体の判定は変わらない。CPU native expert では down-row の型・token 数などを見て IQ4_NL multi-token kernel を選ぶ条件にこの値を使う（`engine/src/kernels/cpu/native_expert.cpp:792-798, 828-839, 903-915`）。
 
-この複数 token カーネルは、IQ4_NL の nibble を decode して重みを処理する作業を block ごとにまとめて行います。無効時に AVX2 CPU で到達する汎用 fallback は `ggml-cpu` の `vec_dot` を各 row・各 token に適用する経路です。AVX2 非対応 CPU では前述の AVX1 対応分岐が先に評価されます。値の parse に伴う警告や、この変数専用のログ出力はありません。
+抑止時、または型・CPU・token 数の条件を満たさないときは、IQ4_NL multi-token 分岐を通らず後続の一般行処理へ進む。AVX1 専用経路が成立しなければ、各行・各 token について `traits(f.d_type).dot(...)` を呼ぶ経路となる。`STRATA_OWN_CPU_QUANT` が有効な build では `traits` は Strata quant layer の dot kernel を参照し、無効な build では ggml-cpu の type traits を参照するため、fallback の実装元は build 設定によって異なる（`engine/src/kernels/cpu/native_expert.cpp:840-893`; `engine/include/strata/kernels/cpu/pool_quant.hpp:4-5, 32-64, 78-91`; `engine/CMakeLists.txt:184`）。この変数が変えるのは CPU native expert の down-row 計算経路であり、ルーティングや expert の選択条件を変更する処理はここにはない。
+
+## ログと測定値
+
+この変数の読み取り・分岐に伴う専用ログ、警告、終了処理はない（`engine/src/kernels/cpu/native_expert.cpp:792-893`）。IQ4_NL multi-token kernel と通常の dot 経路の性能差をこの調査で測定していない。ソースコメントには multi-token kernel が block ごとの decode を token ごとに繰り返さない設計との説明があるが、測定値や一般的な速度向上としては扱わない（同: `795-797`）。
 
 ## 根拠
 
-- `src/kernels/cpu/native_expert.cpp:233-239`: IQ4_NL 用フラグの有無判定と `STRATA_IQ_MT_MIN` の既定値・parse。
-- `src/kernels/cpu/native_expert.cpp:240-257`: AVX2、token 数、down 型によるカーネル選択、AVX1 fallback。
-- `src/kernels/cpu/native_expert.cpp:270-277`: 専用カーネルに入らない場合の `ggml-cpu` `vec_dot` fallback。
-- `src/kernels/cpu/iq_avx2.cpp:503-519`: IQ4_NL 複数 token カーネルの入口と、AVX-VNNI variant の選択。
-- `src/kernels/cpu/pool.cpp:709-719,817-838`: native down rows を使う CPU pool phase と複数 native expert の実行。
-- `src/qwen35/q36_engine.cu:1665-1693`: hybrid engine が CPU 側 routed expert を native pool に渡し、結果を GPU 側へ戻す処理。
-- `docs/DETAILS.md:288-290`: CPU i-quant / IQ4_NL 行カーネルと `STRATA_NO_AVXVNNI` の説明はあるが、`STRATA_NO_IQ4NL` の記載はありません。
+- `engine/src/kernels/cpu/native_expert.cpp:792-839` — 環境判定、CPU・型・token 数の条件、AVX2 / AVX1 の経路。
+- `engine/src/kernels/cpu/native_expert.cpp:840-893` — multi-token 分岐を通らない場合の行 dot 処理。
+- `engine/src/kernels/cpu/native_expert.cpp:903-915` — 通常・WindowInvariant entry point とテンプレート実装への接続。
+- `engine/src/kernels/cpu/pool.cpp:1274-1310, 1433-1453` — ExpertPool の native down-row dispatch。
+- `engine/include/strata/kernels/cpu/pool_quant.hpp:4-5, 32-64, 78-91` — build による `traits().dot` の実装元。
+- `engine/cmake/backends/cpu.cmake:303-317, 370-374` — CPU native-expert ソースの登録と build macro。
+

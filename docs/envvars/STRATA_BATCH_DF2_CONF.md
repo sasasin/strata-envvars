@@ -1,52 +1,48 @@
 # `STRATA_BATCH_DF2_CONF`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`--serve` のバッチスロットで DFlash2 の追加 draft row を何行使うかを、各 draft の selector 確率の累積積で制限します。閾値 `P` が正の場合、各スロットの確率を順に掛け、積が `P` 以上の間だけ draft row を残します。この変数は DFlash2 バッチ機能自体を有効化せず、機能が稼働しているときの row 数を制御します。
+サーバーの DFlash2 バッチ処理で、各スロットが次の検証窓へ載せるドラフト行数を、DFlash2 が返した各行の selector 確率の積で制限します。積が設定値以上である間だけドラフト行を残し、下回る行以降はその窓に加えません。これはドラフトの提案行数を決める規則で、環境変数自体はモデルの selector 確率やターゲットモデルの計算を変更しません（`engine/src/program/generate.cpp:17133-17146`）。
 
-環境変数を読むのは `src/program/generate.cpp` のバッチ窓初期化時の1箇所です。値はその時点で `const double` に読み込まれ、slot ごとの窓構築で使われます。リクエストごと・窓ごとの再読み込みや static cache はありません（`src/program/generate.cpp:13599-13605,13891-13909`）。
+この値はバッチ状態の初期化時にローカル変数 `df2_conf` として一度読み取られ、バッチ窓ごとに再読込されません。実行中にプロセス環境を変更しても、すでに初期化したバッチ処理には反映されません（同 `:16802-16808`）。値の出力や、この変数に固有の警告はありません。
 
 ## 値と判定
 
-空でない環境値には `std::atof` を適用します。文字列全体の検査、エラー検出、範囲制限はありません。空文字または未設定では CLI の `--draft-conf` が正値ならそれを使い、そうでなければ `0.35` です。
+空でない値は `std::atof` で変換します。文字列全体の妥当性検査や範囲制限はなく、`--draft-conf` の 0..1 clamp も環境値には適用されません。したがって、数値の後ろに文字が続く値は数値部分で変換され、数値に変換できない文字列は通常 `atof` の 0 として扱われ、このバッチ処理では確信度フィルターを無効にします（`engine/src/program/generate.cpp:4162,16806,17140-17145`）。
 
-| `STRATA_BATCH_DF2_CONF` | 採用値 | row 選別への影響 |
-|---|---:|---|
-| 未設定または空文字 | `--draft-conf` が `> 0` ならその値、そうでなければ `0.35` | 正の閾値として累積確率を判定 |
-| 非空で `atof` の結果が正 | 変換結果をそのまま使用（`--draft-conf` より優先） | 累積積が閾値以上の draft row を残す |
-| 非空で `atof` の結果が `0` 以下、または正値比較が成立しない | 変換結果をそのまま使用 | 閾値判定を行わず、他の row 上限まで使う |
+| 条件 | 未設定 | 空文字 | 例: 有効になる値 | 例: フィルターが無効になる値 |
+|---|---|---|---|---|
+| DFlash2 バッチ処理が動作する経路 | `--draft-conf` が 0 より大きければその値、そうでなければ `0.35` | 未設定と同じ | `0.35`, `0.8`, `0.35junk`（変換結果が正で、確率積が閾値以上の行を残す） | `0`, `-0.1`, `0anything`, `true`, `false`（変換結果が 0 以下） |
 
-`atof` が数値として読める先頭部分を変換するため、たとえば数値の後ろに文字が続いても先頭の数値が採用されます。数値に変換できない非空文字列は通常 `0` となり、閾値判定を無効にします。値を `0` にしても DFlash2 drafts 自体は止まりません。CLI の `--draft-conf` は `std::clamp(..., 0.0, 1.0)` で制限されますが、この環境変数には同じ clamp がありません（`src/program/generate.cpp:3590,13600-13603`）。
+環境変数が空でない場合は `--draft-conf` より優先されます。`--draft-conf` はコマンドライン解析時に `atof` 後 `[0,1]` に clamp されますが、バッチ用既定値の選択では `o.draft_conf > 0.0` の場合だけ採用されます。このため CLI の省略時と明示的な `--draft-conf 0` はこの箇所では同じく `0.35` です。環境変数に `0` を指定すれば CLI 値に関係なく確信度フィルターを無効にできます（同 `:1191,4162,16806`）。
 
-`--draft-conf` は環境値が未設定または空文字の場合だけ fallback として使います。非空の環境値があれば、その変換結果が CLI 値に優先します。
+変換後の値が `0` 以下なら `df2_conf > 0.0` が偽となり、確率積による追加制限は行いません。正の値では、各スロットの確率積が閾値以上である間ドラフト行を残します。閾値が `1` の場合は積が 1 以上の行だけが残り、`1` を超える正値では通常の確率積が閾値に届かないため行数は 0 になります。上限 1 への clamp はありません（同 `:17140-17145`）。
 
 ## 有効になる条件
 
-この閾値が実際に使われるには `batch_df2` が有効である必要があります。コード上の主な条件は次のとおりです。
-
-- `STRATA_HAVE_DFLASH2` が定義されたビルドであること。未定義の場合、`batch_df2` はコンパイル時定数 `false` です（`src/program/generate.cpp:6684-6692`）。
-- Metal 以外で、明示的な `--draft dflash2`、`--batch >= 2`、`--serve`、`!split_same` が成立すること。`--draft auto` は対象外です。
-- `STRATA_BATCH_DF2=0...` で明示的に無効化していないこと。`STRATA_BATCH_DF2` が非空で先頭文字が `0` 以外なら強制要求できます。未設定時は layer split があり、`batch_groups_for(false).groups <= 1` の場合だけ既定で要求されます。
-- 要求後の `batch_mtp` 条件も通ること。たとえば `--spec >= 2` が必要で、layer split 上の helper expert cache とは併用されません。pipelined groups で batch drafts が動かない条件もあります。
-- solo DFlash2 drafter が起動し、各 slot drafter の割り当て・bind・prepare が成功すること。
-
-Metal は `batch_df2_wanted` を常に false にします。機能の要求条件に合わない場合は `strata generate: WARNING: ... is off: ...` が stderr に出ます。DFlash2 が起動しない場合も警告され、slot drafts は無効になります（`src/program/generate.cpp:6464-6480,6482-6506,6684-6692,6820-6840,11185-11196`）。
+- サーバーモード（`--serve`）で、`--batch` が 2 以上である必要があります。バッチ DFlash2 の自動選択条件は明示した `--draft dflash2`、`--draft auto` ではないこと、同一 GPU 上の split 構成でないことです。`STRATA_BATCH_DF2` の設定が自動選択や抑止を変える場合があります（`engine/src/program/generate.cpp:7822-7842`）。
+- Metal build ではスロットごとの DFlash2 drafter が無効化されます。Metal のバッチ窓はドラフト行を扱わず、`batch_df2_wanted` を常に false にします（同 `:7832-7834,7849-7855`）。
+- DFlash2 を含む build で、ソロ DFlash2 drafter が起動してスロット drafter の確保・準備が成功した場合に限り、バッチ DFlash2 が実際に有効になります。DFlash2 が動いていない場合は警告を出してスロットドラフトを止めます（同 `:8328-8348,13623-13635`）。
+- バッチ speculative draft の共通条件として `--spec` が 2 以上、`--serve` が有効であることなどが検査されます。条件を満たさないと `strata generate: WARNING: ... is off: ...` が stderr に出て `batch_mtp` が無効になります（同 `:7843-7873`）。
+- 各窓のドラフト行数は、この閾値に加え、空き窓行数をアクティブスロット間で分けた数、DFlash2 が提案できる行数、リクエストの残り生成数、コンテキスト残量、および `STRATA_BATCH_DF2_MAXX` に制限されます。閾値が有効でも空き行がなければドラフト行は載りません（同 `:17123-17146`）。
 
 ## 実行時の詳細
 
-各 batch window の開始時に、稼働中 slot の数 `nact` と窓の余剰 row 数から、各 slot の基本 `want` を割り当てます。その後、DFlash2 が作れる上限、slot の残り生成数、context の残り、`STRATA_BATCH_DF2_MAXX` の上限（未設定・空なら `99`）で `want` を制限します。draft が準備済みで `df2_conf > 0` の場合、`q.dprob` の先頭から積を計算し、積が閾値以上である間だけ `want` を残します。閾値に達しない最初の row とそれ以降は追加しません（`src/program/generate.cpp:13887-13909`）。
+バッチ初期化時、未設定または空文字なら CLI の正の `--draft-conf` を使い、それも正でなければ `0.35` を設定します。空でない環境値は `atof` で直接変換して採用します。環境値の変換エラーを報告する分岐はありません（`engine/src/program/generate.cpp:16802-16808`）。
 
-したがって、高い閾値は各 slot の draft row を減らし、閾値より累積確率が低い場合はその slot の draft row が 0 になります。閾値が正でない場合はこの確率による削減を行いませんが、窓の余剰、DFlash2 の row 上限、残り token/context、`STRATA_BATCH_DF2_MAXX` による上限は引き続き適用されます。
+各バッチ窓の準備では、空き行をアクティブスロットに分配し、行数上限を順に適用します。ドラフトが準備済みで、`df2_conf > 0` の場合は、確率積を先頭のドラフトから累積し、積が閾値を下回る前の行数だけを `df2_extra` に残します。結果は、そのスロットの token 行に続く DFlash2 ドラフト行として窓に配置されます（同 `:17123-17146,17175-17188`）。
 
-この変数の値や閾値判定結果を直接表示するログはありません。DFlash2 slot drafter の起動時には slot 数や VRAM 使用量、ready 状態が stderr に出ます。clone/bind/prepare の失敗はエラーを出して終了します。 deferred row の catch-up 失敗は stderr に `catch-up failed ...: no drafts for it this round` と出し、その slot の当該 round の追加 draft を見送ります。窓後の gather/draft 処理の失敗は stdout に `ERR batch DFlash2 slot ...` を出して batch 処理を失敗させます（`src/program/generate.cpp:6823-6839,11185-11196,13914-13930,14084-14146`）。
+窓にドラフト行を載せなかったスロットは、そのラウンドでドラフト計算を行わず、確定行の tap を後で使えるよう保留します。後続の窓で必要な行が戻ると catch-up してドラフトを作ります。catch-up に失敗した場合は `strata batch: DFlash2 slot %d: catch-up failed (%s): no drafts for it this round` を stderr に出し、そのラウンドのそのスロットのドラフトを見送ります（同 `:17148-17171,17343-17374`）。
+
+## ログと測定値
+
+この変数の変換値や閾値そのものを表示するログはありません。バッチ speculative 条件を満たさないときは stderr に `strata generate: WARNING: %s is off: %s\n` の形式で警告が出ます。遅延 tap の catch-up に失敗した場合は、該当スロットがそのラウンドのドラフトを見送る旨が stderr に記録されます（`engine/src/program/generate.cpp:7870-7873,17160-17167`）。この環境変数の設定値に結び付いた測定値は、対象ソースおよび `docs/DETAILS.md` に確認できません。
 
 ## 根拠
 
-- 環境値・fallback の読み取りと隣接する DF2 上限設定: `src/program/generate.cpp:13600-13605`。
-- CLI `--draft-conf` の変換と範囲制限: `src/program/generate.cpp:3590`。
-- `STRATA_BATCH_DF2` の要求条件、他の batch 条件および警告: `src/program/generate.cpp:6464-6506`。
-- DFlash2 build guard、slot drafter の確保と起動失敗経路: `src/program/generate.cpp:6684-6692,6820-6840,11185-11196`。
-- 閾値が slot ごとの draft row 数に作用する箇所: `src/program/generate.cpp:13887-13909`。
-- 窓後の slot draft 実行と実行時エラー出力: `src/program/generate.cpp:14084-14146`。
+- `engine/src/program/generate.cpp:16802-16808` — バッチ状態の初期化時における環境値、CLI 値、既定値の選択と読み取り時期。
+- `engine/src/program/generate.cpp:17123-17146` — 窓の空き行、他の上限、確率積によるドラフト行数の決定。
+- `engine/src/program/generate.cpp:7822-7859,8328-8348` — バッチ DFlash2 の選択条件とスロット drafter 起動。
+- `engine/src/program/generate.cpp:13623-13635,17148-17171,17343-17374` — drafter 準備、遅延行の catch-up、および失敗時の処理。

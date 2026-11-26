@@ -1,46 +1,54 @@
 # `STRATA_SKIP_SHA256`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。対象は Strata 所有のソースと文書。外部ライブラリ・GPU driver の環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-`setup.py` が取得した ready-made engine の ZIP を展開する前に行う、公開済みサイズと SHA-256 の照合を省略するための開発・運用向けフックです。値が文字列として厳密に `1` の場合、Strata は照合を行わず警告を出して次のインストール処理へ進みます。通常の CUDA engine と Windows AMD 用 HIP engine のダウンロード後に共通の検証関数が呼ばれるため、どちらにも適用されます。
+`terminal/setup.py` がダウンロードした既製エンジンの zip を検証する `verify_engine_archive()` で、GitHub 公開 SHA-256 による検証を省略するための環境変数。値が文字列 `"1"` の場合、警告を出して関数から戻り、アーカイブを展開・インストールする処理へ進む。ソース上では同じ早期 return により公開サイズの比較と GitHub API からの digest 取得も省略される。したがって、この値はハッシュ計算だけを飛ばすものではない（`terminal/setup.py:6138-6147`）。
+
+対象はセットアップ／更新が平置きの既製エンジン zip を取得して `verify_engine_archive()` を呼ぶ経路。通常の CUDA、CUDA 12 と Windows HIP がそれぞれこの関数を呼ぶ（`terminal/setup.py:5451-5455`, `terminal/setup.py:6351-6357`）。モデルファイルの検証やエンジンの実行時挙動を制御する変数ではない。
 
 ## 値と判定
 
-| `os.environ.get()` の結果 | 動作 |
-|---|---|
-| 未設定（`None`） | 検証を続ける |
-| 文字列 `1` | SHA-256 と公開サイズの照合を両方省略し、警告を出して戻る |
-| 空文字、`0`、`true`、`01` などその他すべて | 検証を続ける |
+`os.environ.get("STRATA_SKIP_SHA256") == "1"` による文字列全体の完全一致で、数値変換・trim・大文字小文字変換はない。空文字も未設定と同様に分岐を通らず、通常の検証を行う（`terminal/setup.py:6138-6147`）。
 
-数値変換や真偽値変換はせず、Python の文字列との完全一致です。大文字小文字、前後の空白、先頭文字だけの比較もありません。関数呼び出しごとに環境を読み取ります（結果の static cache はありません）。
+| 条件 | unset | 有効になる値 | 無効になる値 |
+|---|---|---|---|
+| `verify_engine_archive()` が呼ばれるとき | SHA-256 検証を試みる | `1` | 空文字、`0`、`true`、`TRUE`、` 1`、`1 `、`01`、`1anything` など、文字列 `1` と異なる値 |
 
-検証を続ける場合、GitHub release API から asset の公開サイズと `sha256:` digest を取得できれば、まずファイルサイズを照合し、次にファイル全体の SHA-256 を比較します。不一致ではダウンロード済み ZIP と `.done` マークを削除して `UnverifiedEngine` を送出します。公開 digest を取得できない場合（オフライン、rate limit、digest のない release、ローカルフォルダーまたは通常の mirror など）は、変数が未設定でも警告を出して未検証のまま進みます。
+優先順位を変える CLI 引数はない。`--prebuilt` / `STRATA_PREBUILT_URL` は取得元を選ぶが、この変数の文字列判定を上書きしない（`terminal/setup.py:6295-6302`, `terminal/setup.py:11546-11551`）。
 
 ## 有効になる条件
 
-- `setup.py` が ready-made engine archive をダウンロードして `verify_engine_archive()` を呼ぶ経路で有効です。通常の engine は `get_prebuilt()`、Windows AMD の prebuilt HIP engine は `get_prebuilt_hip()` がこの関数を呼びます。
-- すでに条件を満たす engine がインストール済みでダウンロードが発生しない場合、この変数による検証処理は実行されません。
-- 検証を省略しても、その後に行う ZIP 展開、engine の版・backend・GPU 対応の確認、インストール処理は残ります。これらの確認を回避する変数ではありません。
-- `setup.py` の別処理にある `verify_sha256()`（モデル shard の照合）ではこの変数を参照しません。
+- セットアップまたは更新が既製エンジンの平置き zip をダウンロードし、`verify_engine_archive()` に到達すること。
+- 通常の CUDA / CUDA 12 では `--build` が指定されておらず、既製エンジン取得が選ばれること（`terminal/setup.py:9597-9625`）。Windows HIP では `--build` なしで既製 HIP zip を取得する経路であること（`terminal/setup.py:9606-9612`）。
+- `--update` は古い既製エンジンの置き換えが必要になり、平置き zip を取得する場合に限る。更新対象が既に現行であれば早期 return し、feed からエンジンを取得する場合はこの変数を読む検証関数に入らない（`terminal/setup.py:6511-6549`, `terminal/setup.py:5435-5455`, `terminal/setup.py:6332-6357`）。
+- OS/backend に固有の分岐は、Windows の HIP とその他の `get_prebuilt()` 経路。署名付き更新 feed のコンポーネント取得、ローカルビルド、既にインストール済みのエンジンをそのまま使う経路には適用されない（`terminal/setup.py:5374-5411`, `terminal/setup.py:6295-6303`, `terminal/setup.py:9597-9625`）。
 
 ## 実行時の詳細
 
-環境変数は `verify_engine_archive()` の冒頭で読み、`== "1"` なら `STRATA_SKIP_SHA256=1: NOT checking ...` から始まる警告を出して即時 return します。このため、この経路では digest API の問い合わせ、公開サイズ確認、SHA-256 計算のいずれも行いません。値は起動時に一度だけ固定されるのではなく、各 archive 検証呼び出し時に読み取られます。
+`verify_engine_archive()` が呼ばれるたびに、関数内で現在の `os.environ` を読む。モジュール読み込み時の定数化やキャッシュはないため、同一プロセス内で環境値が関数呼び出し前に変更されれば、その呼び出しは変更後の値で判定される（`terminal/setup.py:6138`）。判定のタイミングは zip の取得後、展開前（`terminal/setup.py:5451-5459`, `terminal/setup.py:6351-6362`）。
 
-通常検証で不一致になった場合、初回導入では `engine_refused()` がエラーを出して setup を止めます。更新時は既存 engine を保持し、悪いダウンロードを展開・置換に使わず、警告を出して既存 engine を使える状態にします。`STRATA_SKIP_SHA256=1` の場合、この不一致処理には入りません。
+値が `"1"` なら警告を出して検証関数を抜け、呼び出し元は zip を展開して後続の形式・エンジン metadata・version・GPU 対応確認を続ける。値がそれ以外なら GitHub Releases API から asset のサイズと `sha256:` digest を取得し、両方が得られたときにサイズを比較してから SHA-256 を計算する。サイズ不一致または hash 不一致ではダウンロードと `.done` 印を削除し `UnverifiedEngine` を送出する。初回導入では setup を終了し、更新では既存エンジンを維持する。API から digest を得られない場合は別の警告を出して検証なしで続行する（`terminal/setup.py:6083-6094`, `terminal/setup.py:6142-6164`, `terminal/setup.py:6167-6181`）。
 
-## 文書との照合
+`--prebuilt` のローカルフォルダーや GitHub Releases 以外の mirror は公開 digest がないため、通常値でも「digest が取れない」分岐で警告して進む。`STRATA_SKIP_SHA256=1` の場合はその取得も行わず、変数専用の警告に置き換わる（`terminal/setup.py:6047-6051`, `terminal/setup.py:6079-6094`, `terminal/setup.py:6138-6147`）。
 
-`docs/TROUBLESHOOTING.md` は `STRATA_SKIP_SHA256=1` でチェックを省略すると説明しています。現行コードでは SHA-256 のみならず、GitHub が公開する asset サイズの照合も同じ早期 return により省略されます。また、GitHub から digest を取得できないケースは、この変数なしでも警告後にインストールへ進みます。測定値や速度効果は本変数の役割の説明に必要な資料がないため記載しません。
+## ログと測定値
+
+値が `"1"` のときの警告本文は次のとおり。`warn()` は `[!]` を付けて stdout に表示し、JSONL 出力時は warning event も出す（`terminal/setup.py:6138-6141`, `terminal/setup.py:1044-1046`）。
+
+> `STRATA_SKIP_SHA256=1: NOT checking {asset} against its SHA-256. If the file is corrupt or tampered with, it will be installed anyway. Unset it to get the check back.`
+
+値が `"1"` でない場合、digest が取れなければ `could not get a SHA-256 for {asset} from GitHub (offline, rate limited, or not a release URL), so it was NOT verified. Installing it as it is.` と警告する。検証成功時は `SHA-256 checksum verified against GitHub's (...)` を表示する（`terminal/setup.py:6142-6146`, `terminal/setup.py:6160-6164`）。
+
+`docs/SAFETY.md:140-142` と `docs/TROUBLESHOOTING.md:101-105` はこの変数をチェック無効化として説明している。実装では早期 return がサイズ比較より前にあるため、`"1"` は公開サイズ照合も飛ばす。性能値の記載はない。
 
 ## 根拠
 
-- `setup.py:2798-2836`: `verify_engine_archive()` の対象、厳密な値比較、警告と早期 return、通常検証への分岐。
-- `setup.py:2837-2859`: digest を得られない場合の警告・継続、公開サイズと SHA-256 の検査、不一致時の削除・例外。
-- `setup.py:2481-2487`: Windows AMD prebuilt HIP archive のダウンロード後に共通検証関数を呼び、不一致を扱う箇所。
-- `setup.py:3005-3012,3015-3043`: ready-made engine のダウンロード、検証後の展開・版/GPU 対応確認・導入。
-- `setup.py:2862-2876`: 初回導入と更新時で検証拒否時の扱いが異なる箇所。
-- `setup.py:1626-1648,5499-5502`: モデル shard 用の別の `verify_sha256()` 経路。本変数の参照はない。
-- `docs/TROUBLESHOOTING.md:69-70`: 利用者向け説明。
+- `terminal/setup.py:6138-6147` — 環境値の完全一致判定、警告、早期 return、通常の digest 取得。
+- `terminal/setup.py:6148-6164` — 公開サイズと SHA-256 の照合、成功ログ。
+- `terminal/setup.py:6167-6181` — 不一致時の初回導入／更新時の結果。
+- `terminal/setup.py:5451-5459`, `terminal/setup.py:6351-6362` — Windows HIP と CUDA 系の呼び出し、検証後の展開。
+- `terminal/setup.py:5374-5411` — 署名付き feed からエンジンを取得する別経路。
+- `terminal/setup.py:9597-9625`, `terminal/setup.py:6511-6549` — 通常セットアップと更新の既製エンジン取得条件。
+- `terminal/setup.py:1044-1046` — 警告の表示先と JSONL event。

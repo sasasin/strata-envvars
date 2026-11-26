@@ -1,47 +1,44 @@
 # `STRATA_HANDOFF_PIPE_WORKER`
 
-調査対象: Strata `main` の HEAD `477ac13cbe8e582c20484871ce459d20d82df09d`（2026-10-17 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-`STRATA_HANDOFF_PIPE` による layer split の prompt hand-off で、後段 `Prefill` の chunk 処理を専用の常駐 worker thread に投入するか選びます。既定では worker を使います。無効にすると、各 chunk を `std::async` で起動する従来の thread-per-chunk 経路になります。
-
-この変数は hand-off の分割数や GPU 転送内容を変えません。`STRATA_HANDOFF_PIPE` が有効な場合だけ worker の選択に影響します。
+レイヤー分割した prefill で次 stage の chunk を起動する方法を選ぶ。値が有効なら stage ごとに遅延生成する `HandWorker` の専用 thread に job を投入し、無効なら chunk ごとに `std::async(std::launch::async, ...)` を使う。どちらも `next_->run_impl(...)` を実行し、次 stage の処理結果を future で待つ。これは `STRATA_HANDOFF_PIPE` が有効にする分割 hand-off の thread 戦略を切り替えるもので、piece 数や chunk の分割方法そのものは変更しない（`engine/src/prefill/prefill.cpp:921-928, 7812-7834`）。
 
 ## 値と判定
 
-値は `std::atoi` で整数に変換し、変換結果が 0 かどうかで判定します。文字列全体の妥当性検査はありません。
+`handoff_pipe_worker()` 内の関数ローカル `static const bool` を初期化するときに `std::getenv` で取得し、設定値があれば `std::atoi(e) != 0`、未設定なら `true` とする。`atoi` は整数として読める先頭部分で判定されるため、数値全体・文字列一致・大小文字は検査しない。明示的な空文字、数値で始まらない文字列、`0` や `0anything` は `atoi` が 0 を返して無効。`1`、`-1`、`+2`、`1suffix` は非 0 となり有効（`engine/src/prefill/prefill.cpp:925-927`）。
 
-| 値 | worker 選択 |
-|---|---|
-| 未設定 | 有効（既定） |
-| `0`、空文字、数値に変換できない文字列（例: `off`） | 無効 |
-| 0 以外に変換される値（例: `1`, `2`, `-1`, `1tail`） | 有効 |
-
-`atoi` が先頭の整数部分を変換するため、`0tail` は無効、`1tail` は有効です。空白と符号は `atoi` の変換規則に従います。値は `handoff_pipe_worker()` 内の function-local `static const bool` に保存されるので、最初の評価後にプロセス環境を変更しても再評価されません。
+| 条件 | unset | 設定時に有効 | 設定時に無効 |
+|---|---|---|---|
+| `STRATA_HANDOFF_PIPE` により hand-off pieces が用意されている | worker 有効（既定） | `atoi` の結果が非 0（例: `1`, `-1`, `1suffix`） | `atoi` の結果が 0（例: 空文字, `0`, `0anything`, `true`） |
+| hand-off pieces が 0 | この変数の判定に到達せず、chunk ごとの `std::async` | 同左 | 同左 |
 
 ## 有効になる条件
 
-- `STRATA_HANDOFF_PIPE` が有効であること。実装は値を `atoi` で読み、2 未満を無効、2 以上を有効とし、16 に clamp します。
-- `Prefill` に後段 stage (`next_`) がある layer split であること。分割数が有効なら初期化時に hand-off event が作成されます。
-- Metal backend では `Prefill::init()` が Metal engine に委譲して戻るため、この CUDA/HIP hand-off 実装は通りません。
-
-`STRATA_HANDOFF_PIPE` が未設定・0・1などで分割数が無効なら、`handoff_pipe_worker()` はこの変数の値に関係なく false となり、worker 経路を選びません。
+- `engine/src/prefill/prefill.cpp` が組み込まれる GPU prefill 経路であること。同ファイルは `strata_prefill` ライブラリのソースで、CUDA/HIP GPU engine の CMake 構成に属する（`engine/cmake/strata_gpu_engine.cmake:478-485`）。
+- 次 stage を持つレイヤー分割であること。次 stage がなければ hand-off job は投入されない（`engine/src/prefill/prefill.cpp:7748, 7821`）。
+- `STRATA_HANDOFF_PIPE` が 2 以上として解釈され、初期化で pieces とイベントが設定されること。unset / `0` / `1` / 0 以下では `hand_pieces` が 0 のままで、worker 変数は実質的に使われず `std::async` 経路になる。`STRATA_HANDOFF_PIPE` の値は `atoi` され、2 以上は最大 16 に制限される（`engine/src/prefill/prefill.cpp:899-913, 2488-2502`）。
+- この切替に別の CLI 引数や他の環境変数による上書きはない。`--prefill-pipe` / `STRATA_PREFILL_PIPE` は chunk 計画に関わる別設定であり、worker の分岐条件には使われていない（`engine/src/prefill/prefill.cpp:3615-3625, 3683-3687, 7821-7831`）。
 
 ## 実行時の詳細
 
-有効時、前段 `Prefill` は `HandWorker` を最初の successor hand-off 時に遅延作成し、以後の successor `run_impl()` を packaged task としてその worker の queue に投入します。worker thread は起動時に `strata::aux_cpus::pin_current_thread()` を呼び、job を順に実行します。future を通して戻り値を受け取り、通常の chain drain で待ちます。worker は `Prefill::release()` 時に破棄され、thread を join します。
+`handoff_pipe_worker()` は次 stage へ chunk を渡した後に呼ばれる。pieces が 0 より大きいときだけ `&&` の右辺が評価され、そこで初回に環境値を読み込んで static cache する。したがって通常は最初の該当 hand-off 時に値が固定され、その後の環境変更は同一プロセスでは反映されない。pieces が 0 の間は右辺が短絡され、worker 設定の static 値自体はまだ初期化されない（`engine/src/prefill/prefill.cpp:925-927, 7821`）。
 
-無効時は chunk ごとに `std::async(std::launch::async, ...)` を使い、同じく新しい thread 上で `pin_current_thread()` を呼びます。どちらの経路も後段の `run_impl()` の結果を future で chain に返します。
+有効時は stage の `Impl` に `HandWorker` を必要時に一つ作り、thread に `strata-hand` という名前を付けて CPU pinning を行う。投入された `packaged_task` は `next_->run_impl(...)` の bool 結果を future に返し、thread 終了時に `cudaGetLastError()` を呼ぶ。無効時は各 chunk ごとに `std::async` で同じ `run_impl` を起動し、呼び出し thread に CPU pinning を行う（`engine/src/prefill/prefill.cpp:929-968, 7821-7832`）。worker は prefill の `release()` 時に reset され、待機 thread を join する（`engine/src/prefill/prefill.cpp:1832-1838`）。
 
-変数自身に対応するログ出力はありません。hand-off event の初期化失敗時には `prefill: the layer split's hand-off events (STRATA_HANDOFF_PIPE)` がエラー文字列になりますが、これは分割数側の初期化エラーであり、worker の選択状態を示すログではありません。
+この変数は piece ごとのデータ転送を有効化しない。piece 数が正なら、別途 hand-off 側で chunk の完了 event と各 piece の download event を記録し、次 stage の upload を event 待ちにする（`engine/src/prefill/prefill.cpp:7771-7785, 4427-4448`）。
+
+## ログと測定値
+
+この変数の読み取り値や worker 選択を知らせる専用ログはない。hand-off の event 作成失敗は `prefill: the layer split's hand-off events (STRATA_HANDOFF_PIPE)`、piece upload 失敗は `prefill: the layer split's hand-off upload failed (STRATA_HANDOFF_PIPE): ...` として返される。投入した次 stage の失敗は future の `get()` を通じて `next_err_` に伝播する（`engine/src/prefill/prefill.cpp:2493-2501, 4445-4448, 7797-7801, 9592-9607`）。これらは hand-off 自体のエラー経路であり、worker 設定固有の警告ではない。測定値は記載しない。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:349-363`: `STRATA_HANDOFF_PIPE` の parse、範囲制限、static cache。
-- `src/prefill/prefill.cpp:371-377`: 本変数の parse と、分割数が有効な場合だけ true となる条件。
-- `src/prefill/prefill.cpp:379-418`: worker の queue、thread 起動、CPU pinning、job 実行、join。
-- `src/prefill/prefill.cpp:1036-1048`: `Prefill` の破棄・release と worker の後始末。
-- `src/prefill/prefill.cpp:1234-1270`: Metal 早期分岐、layer split 用 hand-off buffer/event の初期化。
-- `src/prefill/prefill.cpp:4581-4629`: 前段から後段への chunk hand-off、worker queue と `std::async` fallback。
-- `docs/BATCHING.md:124`: `STRATA_HANDOFF_PIPE` の概要。P 個の piece と persistent thread を説明しており、ソースの hand-off 概要と一致します。本変数による opt-out の値判定はこの資料には記載されていません。
+- 候補名の実読取りと値判定、pieces による短絡条件: `engine/src/prefill/prefill.cpp:899-928`
+- GPU prefill ライブラリへの組み込み: `engine/cmake/strata_gpu_engine.cmake:478-485`
+- hand-off pieces と event 初期化: `engine/src/prefill/prefill.cpp:2488-2502`
+- persistent worker の実装と破棄: `engine/src/prefill/prefill.cpp:929-968, 1832-1838`
+- worker / `std::async` の選択、future への結果伝達: `engine/src/prefill/prefill.cpp:7812-7834`
+- hand-off event / upload と失敗経路: `engine/src/prefill/prefill.cpp:4427-4448, 7771-7801`

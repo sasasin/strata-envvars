@@ -1,48 +1,49 @@
 # `STRATA_START_RETRIES`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata の Python サーバーが engine を起動したとき、GPU runtime の一時的な初期化失敗と判定した早期終了を再試行する回数です。既定値は 3 回で、初回起動を含め最大 4 回の起動を行います。これは一般の起動失敗すべてや、engine の実行中に起きたクラッシュを再試行する設定ではありません。読み取りと再試行は `serve/server.py` の `StrataEngine` にあり、engine 本体や one-shot CLI の環境変数ではありません（`serve/server.py:658-663,1017-1019,1126-1141`）。
+`strata serve` の Python サーバーがエンジンを起動した際、エンジンが `READY` を返す前に短時間で終わった場合のうち、GPU runtime の一時的な起動失敗と判定できるものを何回追加で起動し直すかを指定する。既定は追加 3 回（初回を含め最大 4 回）、`0` はこの再試行を無効にする。エンジンの生成処理やリクエスト後の再起動回数を直接指定する変数ではない。読み取りと再試行判定は `terminal/serve/server.py` の `START_RETRIES` と `StrataEngine.__init__` にある（`terminal/serve/server.py:506, 761-763, 886-902`）。
 
 ## 値と判定
 
-`serve/server.py` の import 時に `os.environ.get("STRATA_START_RETRIES", "3") or 0` を `int()` に渡し、結果を 0 以上に clamp します（`serve/server.py:663`）。
+モジュール読込時に `os.environ.get("STRATA_START_RETRIES", "3") or 0` を Python の `int()` に渡し、その結果を `max(0, ...)` で 0 以上に clamp する（`terminal/serve/server.py:506`）。
 
-| 環境値 | 判定 |
-| --- | --- |
-| 未設定 | 既定文字列 `"3"` を整数化し、3 回再試行 |
-| 空文字 | `or 0` により整数 0。再試行なし |
-| 整数として読める値 | `int()` の結果を使う。負数は 0 に clamp。正数 N は最大 N 回再試行 |
-| 整数にできない文字列 | `ValueError` が import 時に発生し、サーバーモジュールの読み込みに失敗する。fallback はない |
+| 条件 | 未設定 | 設定時に有効になる値 | 無効・失敗になる値 |
+|---|---|---|---|
+| `terminal/serve/server.py` を読み込むサーバープロセス | `3` | 整数に変換できる文字列。例: `0`、`1`、`+2`、`-1`（負数は `0` に clamp）、前後に空白のある ` 2 ` | 空文字は `0`。小数 `1.5`、`0anything`、空白だけの文字列など `int()` が変換できない値は `ValueError` となり、サーバーモジュールの読込に失敗する。 |
 
-Python の `int()` による変換なので、小数表記（例 `1.5`）は受け付けず、符号付き整数や前後の空白は整数化されます。上限は設定されていません。`START_RETRIES` はモジュール定数であり、実行中に環境を変更しても再読込されません。CLI 引数、設定ファイル、別の環境変数による上書きはありません（`serve/server.py:663`）。
+文字列全体が整数として変換され、先頭だけの判定や部分文字列の読み飛ばしはない。大文字小文字の区別は関係しない。上限 clamp はなく、負数は再試行 0 回として扱われる。CLI 引数、設定ファイル、別の環境変数による上書きはない。`--engine mock` は再試行経路には入らないが、この値の変換はモード選択前のモジュール読込時に行われるため、無効な文字列は mock モードでもモジュール読込を失敗させる（`terminal/serve/server.py:506, 9157-9159, 9386-9394, 9484-9489`）。
 
 ## 有効になる条件
 
-値の変換自体は `serve.server` の import 時に行われるため、同モジュールを使う `--engine mock` や lazy 起動でも無効な文字列なら import が失敗します。一方、実際の再試行処理は `StrataEngine` が engine を spawn した後に限られ、OS/backend/build macro による分岐はありません。初回起動が `lazy=True` なら constructor は engine を spawn せず戻るため、その段階では再試行は起きません。後で起動する際は通常の constructor 経路に入ります（`serve/server.py:1017-1018,1043-1045`）。
-
-再試行は次の条件をすべて満たす場合に限られます。
-
-- engine が `READY` を報告せずに終了した。READY 待ち timeout の場合は再試行しない（`serve/server.py:1085-1100,1111-1127`）。
-- その起動の経過時間が 30 秒以内で、ログファイルが指定されている（`serve/server.py:666-677`）。
-- ログに `hsa_exception`、`HSA_STATUS_ERROR`、`hsaKmt` のいずれかがある場合、engine 自身の `[strata]` 行以外は `terminate called`、`what()`、または上記 runtime マーカーを含む行だけである。マーカーがない場合は、engine 自身の行が一つもなく、終了コードが 1 でなく、signal/NTSTATUS でのシステムクラッシュでもないこと（`serve/server.py:678-687`）。ログは起動位置から最大 64 KiB だけ読みます（`serve/server.py:673-680`）。
-
-これはコメントが ROCm の queue teardown 競合を主な例として挙げるものの、実装上は ROCm 専用ではありません。ログ条件に一致する起動なら他 backend でも同じ判定を通ります（`serve/server.py:658-663,666-687`）。
+- `--engine strata` で設定された実エンジンを `StrataEngine` 経由で起動すること。単一エンジン、replica、split serving の各起動がこのクラスを使う（`terminal/serve/server.py:8788-8796, 8845-8852, 8899-8919`）。
+- 起動した子プロセスが `READY` 前に終了し、READY 待ちの timeout ではなく、起動経過が 30 秒以内で、ログが再試行対象の一時失敗条件を満たすこと（`terminal/serve/server.py:509-530, 886-887`）。
+- `STRATA_START_RETRIES` は設定可能な追加回数を残していること（`_attempt < START_RETRIES`）。他の API オプション、モデル名、GPU backend による値の変更はない。
+- lazy load の場合もサーバーモジュール読込時に値は取得され、実エンジンを初めてロードするときに同じ上限を使う。環境を変更しても、既に読み込まれたモジュール内の値は変わらない（`terminal/serve/server.py:506, 798-800, 5032-5054`）。
 
 ## 実行時の詳細
 
-初回起動からの試行番号 `_attempt` は 0 で始まります。再試行可能な失敗では待ち時間を `2 * 2**_attempt` 秒（2、4、8 秒…）とし、次の engine start を再帰的に呼び出します。したがって N 回の再試行を使い切る場合、最後の失敗までの待ち時間合計は `2 + 4 + ... + 2**N` 秒です（`serve/server.py:1126-1141`）。
+`StrataEngine.__init__` はプロセス起動時刻を記録し、エンジンの標準出力から `READY` を待つ。READY 前にプロセスが終わった場合、timeout でなく、起動から 30 秒以内であることに加え、ログファイルが存在して読み出せることを確認する。ログの当該起動部分（最大 64 KiB）から空行を除き、`[strata]` で始まるサーバー自身の行を除いたエンジン行を調べる。`hsa_exception`、`HSA_STATUS_ERROR`、`hsaKmt` のいずれかをログに含む場合は、エンジン行が `terminate called` または `what()` で始まるか、それらのマークを含む場合だけ再試行する。このマーク分岐では終了コードによる追加除外はしない。マークがない場合はエンジン自身の行が一つもなく、終了コードが `1` でなく、システムによる crash 終了と認定されない場合だけ再試行する。ログがない・読めない、30 秒超、上記以外のエンジン行、（マークなしの場合の）終了コード `1` または OS crash code、READY timeout はこの再試行の対象外（`terminal/serve/server.py:509-530, 886-887`; `terminal/serve/server_parts/engines.py:292-300, 347-365`）。
 
-runtime のエラー文字列がログで確認できた場合、サーバー標準出力に `[strata] the engine stopped while the GPU runtime was starting ...: starting it again in ... s (try X of Y)` を出します。ログが無言の終了の場合は「it may be a GPU runtime that was not ready yet」として再試行を通知します（`serve/server.py:1130-1139`）。再試行条件を満たさない、または回数を使い切った場合は `EngineDied` を送出し、READY 前終了または READY timeout の説明、ログ位置、終了情報とログ末尾を付けます（`serve/server.py:1143-1153`）。
+再試行間隔は 2、4、8 秒…と試行ごとに倍増し、成功すれば READY 後の通常処理へ進む。`START_RETRIES=N` のとき、初回と追加 N 回を合わせて最大 N+1 回起動する。上限に達した場合や対象外の失敗では `EngineDied` を発生させ、「the engine did not report READY within … s」または「the engine exited before it was ready」を理由に、終了情報やログ末尾を付ける（`terminal/serve/server.py:888-902, 929-939`）。
 
-engine が運転中に落ちて server の `restart()` が呼ばれる場合には、別途 `tries=3` の再起動ループと固定 `RESTART_RETRY_S` 待ちがあります。各 `__init__` の起動が上記の一時的失敗条件に合えば `STRATA_START_RETRIES` の再試行も働きますが、この環境変数は `restart()` の `tries` 自体を変更しません（`serve/server.py:1335-1362`）。
+この判定に該当しない失敗では、別機能として VRAM 不足時に drafter なしで再起動する経路や、Auto 選択した DFlash2 の起動失敗時に MTP で再起動する経路が続けて判定される。これらは `STRATA_START_RETRIES` の回数に含めず、条件が一致した一時失敗の再試行より後に評価される（`terminal/serve/server.py:903-927`）。エンジンの通常 restart は `restart()` の別の `tries` 制御を持つが、その各起動も `__init__` を呼ぶため、この変数の起動失敗判定を通る（`terminal/serve/server.py:1206-1232`）。
+
+値は `server.py` の import 時に一度だけ読み取られ、リクエストごとや起動試行ごとには読み直さない。子プロセス用の `child_env` は現在の `os.environ` のコピーから作るため、親に設定済みの `STRATA_START_RETRIES` は通常そのまま子の環境にも含まれる。設定ファイルの `env` に同名キーがあれば、その値がコピー後に上書きされる。ただし、Strata ソース内でこの名前を値として読む箇所は親サーバーの上記一箇所だけであり、子への転送値は親サーバーの再試行上限を変えない（`terminal/serve/server.py:4007-4028, 506, 833-835`）。
+
+## ログと測定値
+
+一時的な GPU runtime 失敗と判定した場合、サーバー stdout に `[strata] the engine stopped while the GPU runtime was starting ...: starting it again in N s (try X of Y)` を出す。ログに runtime のマークがなく、エンジン自身が何も書かずに終わった場合は、`[strata] the engine exited before it wrote anything to its log ...; it may be a GPU runtime that was not ready yet: starting it again in N s (try X of Y)` を出す。ここで `X` は次の試行番号、`Y` は初回を含む最大試行数。別の失敗ではこの再試行通知を出さず、READY timeout または起動前終了の `EngineDied` 経路になる（`terminal/serve/server.py:890-900, 929-939`）。
+
+`docs/DETAILS.md` にこの変数や再試行回数の説明は見つからなかったため、測定値は記載しない。
 
 ## 根拠
 
-- 候補一覧には名前があります（`docs/envvars/000_envvers.md:1529`）。Strata 所有ソースでの実参照は `serve/server.py:663` の環境読み取りのみで、その値を使う箇所は同ファイルの `1126-1141` です。コメント内の記載は `658-662` です。
-- 適用される失敗判定とログ条件: `serve/server.py:644-687`。
-- spawn と READY 待ち、最終的な失敗経路: `serve/server.py:1043-1089,1111-1153`。
-- 通常の再起動 retry ループとの関係: `serve/server.py:1335-1362`。
-- `docs/DETAILS.md` の設定キー一覧（`457-489`）にはこの変数の説明はありません。
+- 値の読取・既定値・clamp: `terminal/serve/server.py:506`
+- エンジンの起動と READY 待ち: `terminal/serve/server.py:761-763, 798-835, 841-870`
+- 一時失敗の判定と通知・間隔・回数: `terminal/serve/server.py:509-530, 886-902`
+- GPU runtime の判定語と crash 終了の判定: `terminal/serve/server_parts/engines.py:292-300, 347-365`
+- 対象となる実エンジンモードと mock 経路: `terminal/serve/server.py:9157-9159, 9386-9394, 9484-9489`
+- 別の起動 fallback と restart 経路: `terminal/serve/server.py:903-927, 1206-1232`

@@ -1,61 +1,59 @@
-# `--prompt-cache-every`
+# `strata --prompt-cache-every`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ推論エンジン、root 引数） |
-| オプション | `--prompt-cache-every N` |
-| 別名 | なし |
-| 値 | prompt の新規読み込み token 数を表す整数。既定値 `16384`、`0` は周期 checkpoint 無効 |
+| コマンド | `strata`（root parser） |
+| 値 | `N`（prompt token 数） |
+| 既定値 | `16384` |
+| 主な実装 | `engine/src/program/generate.cpp`、`engine/sycl/src/program/generate.cpp` |
 
 ## 役割
 
-`--serve` で会話 prompt を読む途中にも、会話状態の checkpoint を定期的に保存します。長い prompt の途中に保存点ができるため、後続リクエストがその位置までと同じ token 列を持つ場合に、prompt の先頭から読み直す範囲を減らせます。エンジンのヘルプも本オプションを `--serve` 用と説明しています（`src/program/generate.cpp:922`）。
+`--serve` 中に、新規に読み込んだ prompt の途中状態を会話チェックポイントとして定期保存する間隔を指定します。チェックポイントがあれば、後続リクエストで会話履歴の一致する位置から再利用できます。値は「prompt を N token ごとの断片に分ける」指定ではなく、既存の batched prefill が到達した chunk 境界で状態を保存する cadence です。
 
 ## 使い方
 
 ```sh
-build/strata --serve --prompt-cache-every 4096
-```
+# サーバーモードで、再開地点から新たに読んだ prompt を約 16384 token 間隔で保存する
+strata --serve --pack <pack> --prompt-cache 6 --prompt-cache-every 16384
 
-実際の起動では必要なモデル・pack 関連引数も指定してください。エンジンの usage は `strata generate --pack DIR ...` 形式を示し、serve は `--serve` で有効になります（`src/program/generate.cpp:806-812`、`src/program/generate.cpp:8354`）。
+# 定期チェックポイントを無効にする（会話末尾など他のチェックポイント設定は別途適用）
+strata --serve --pack <pack> --prompt-cache-every 0
+```
 
 ## 値と既定値
 
-- 既定値は `16384` token です（`src/program/generate.cpp:747-748`）。
-- parser は次の argv を `std::atoll` で読み、`std::max(0LL, ...)` で負数を 0 に丸めます。strict な数値 validation や範囲エラーはこの parser にはありません（`src/program/generate.cpp:2665`）。整数変換を開始できない文字列は `atoll` の結果 0 となり、周期保存が無効になります。
-- 同じオプションを複数回指定した場合は、引数を順に走査するたびに値を代入するため、最後の指定値が残ります（`src/program/generate.cpp:2416-2421`、`src/program/generate.cpp:2665`）。
-- 値を省略すると parser は標準エラーに `--prompt-cache-every needs a value` を出して終了コード 2 で終了します（`src/program/generate.cpp:2418-2420`）。
+- `N` は整数として `std::atoll` で変換され、負数は `std::max(0, ...)` により `0` に補正されます。明示的な上限値や厳密な文字列全体の検証はこの parser にありません。非数値文字列は `atoll` の変換結果に従い、通常 `0` として扱われます。
+- 未指定時は `16384` です。`0` は周期チェックポイントを無効にします。
+- 複数回指定した場合、parser は出現順に値を代入するため最後の指定が残ります。
+- 値を省略すると `--prompt-cache-every needs a value` を stderr に出してプロセスを終了コード `2` で終了します。
 
 ## 実行時の動作
 
-この値が有効なのは serve の prompt 読み込み経路です。各リクエストの周期閾値は、再利用した位置 `resume` から `N` token 先に設定されます。リクエスト単位で checkpoint を無効にした場合や先頭からの再読み込み診断の場合は閾値を無効化します（`src/program/generate.cpp:13042-13052`）。
-
-prompt の batched prefill が chunk を終えるたびに、読み込み済み位置 `done` が次の閾値以上か確認します。到達した chunk 境界で状態を保存し、次の閾値をその実際の保存位置 `done + N` に進めます。そのため保存間隔は厳密に N token ごとではなく、既存の prefill chunk 境界に合わせて閾値以上へ進む場合があります（`src/program/generate.cpp:9900-9931`）。multi-GPU の layer split では、各 stage が対応位置の checkpoint 部分を保存し、最後の stage が揃った部分をまとめます（`src/program/generate.cpp:9673-9679`、`src/program/generate.cpp:9935-9950`）。
-
-checkpoint は実行中の会話キャッシュに保存されます。`--prompt-cache` が 0 以下なら `checkpoint_at` は保存せず、multi-GPU 経路も部分保存を行いません。保存件数は `--prompt-cache` の上限内で管理され、上限を超えると既存の eviction policy で checkpoint が退避されます（`src/program/generate.cpp:9701-9711`、`src/program/generate.cpp:9829-9855`）。従って本オプションだけでは保存件数・RAM 使用量の上限は決まりません。
-
-`--prompt-cache-tail` は別の追加保存点を選ぶオプションで、既存 chunk 境界、単一 GPU、正の `--prompt-cache` と本オプション値を条件とします。周期 checkpoint の閾値や chunk 分割自体は変えません（`src/program/generate.cpp:923-924`、`src/program/generate.cpp:9907-9931`）。
+- この設定は `--serve` 向けです。各 parser は `prompt_cache_every` を `16384` で初期化し、serve の prompt 読み込み callback が `N > 0` かつ読み込み位置が次の目標以上になった場合に周期 checkpoint を試みます（CUDA/HIP: `engine/src/program/generate.cpp:1124-1125,14818-14827`、SYCL: `engine/sycl/src/program/generate.cpp:742-743,8645-8652`）。通常の非 serve 実行にはこの serve callback 経路がありません。
+- 周期はリクエストが再開した位置（再利用した prefix の末尾）を起点にします。CUDA/HIP は `anchor + k*N` の格子点を計算し、その点以降で最初に到達した chunk 末尾に保存します。1 chunk が複数格子点をまたいでも、その境界で保存する checkpoint は1つです（`engine/include/strata/core/prompt_checkpoint_grid.hpp:11-23`）。SYCL 側も `resume + N` から開始し、実際の prefill chunk 境界で判定します（`engine/sycl/src/program/generate.cpp:11119-11126,8640-8652`）。したがって、実際の保存間隔や位置は chunk 境界に依存します。
+- `--prompt-cache` が `0` 以下の場合は checkpoint 保存処理が何もせず戻るため、この値を正にしても途中 checkpoint は保存されません（`engine/src/program/generate.cpp:14595-14598`）。また serve request の `ckpt=0` 指定では `pp_next_check` が無効位置になり、その request は周期・tail checkpoint を作りません（`engine/src/program/generate.cpp:18841-18845,20212-20214`）。
+- 保存に成功した checkpoint は `--prompt-cache` の件数上限に含まれ、上限超過時に既存 checkpoint が退避されます。退避の選択は `--prompt-cache-spread` の有無で変わります（`engine/src/program/generate.cpp:14723-14753`）。このため cadence を小さくすると保存候補が増えますが、保持件数自体は増えません。
+- `--prompt-cache-tail` は別の追加 checkpoint です。`--prompt-cache > 0`、`--prompt-cache-every > 0`、単一 GPU などの条件を満たすと、既存の chunk 境界のうち prompt 末尾近くで追加保存を試みます。これは prefill の chunk 分割を変更せず、周期 checkpoint と同じ保存上限を共有します（`engine/src/program/generate.cpp:14820-14827,14712-14723`）。
 
 ## 適用条件と副作用
 
-- `--serve` なしでは値自体は parser に受理されますが、この periodic checkpoint 処理は serve のリクエスト処理経路にあるため、単発生成でこの設定による途中保存は行われません（`src/program/generate.cpp:2665`、`src/program/generate.cpp:8354`、`src/program/generate.cpp:9907-9950`）。
-- 保存時は GPU 状態を同期し、会話状態をホスト側 checkpoint にコピーします。layer split では各 stage の状態も保存します（`src/program/generate.cpp:9693-9700`、`src/program/generate.cpp:9790-9803`）。そのため有効化すると checkpoint 保存に伴う同期・コピー処理が発生します。性能上の効果やコスト量は機材・モデル・要求に依存し、この調査では測定していません。
-- `N=0` は周期 checkpoint を止めますが、会話キャッシュ全体を無効にする指定ではありません。turn 境界など別経路の checkpoint は別途処理されます（`src/program/generate.cpp:9907`、`src/program/generate.cpp:14123-14128`）。
+- 適用先は `strata-engine` の root parser です。CUDA/HIP 実装と SYCL 実装に同名引数があります（parser: `engine/src/program/generate.cpp:4113`、`engine/sycl/src/program/generate.cpp:2091`）。索引上の Qwen3.6 専用 `qwen36/` scope とは別です（`docs/cli/README.md:1038-1041,1183-1185,1240-1244`）。
+- checkpoint 作成では各 GPU の状態同期と状態コピーが行われます。GPU が停止応答するなど保存を継続できない場合は request が失敗します。一方、状態のコピーだけが失敗し回復可能と判定された場合、その checkpoint を stderr に「skipped」と出して request を続行します（`engine/src/program/generate.cpp:14587-14592,14688-14699,14843-14853`）。
+- checkpoint 保存は RAM を使い、チェックポイント上限を超えれば古い候補が退避されます。保存にかかる時間やメモリ量、適切な間隔はモデル・状態・実行環境依存であり、このソース調査だけでは定量化できません。
 
 ## 出力とエラー
 
-周期 checkpoint の保存に失敗すると、prompt callback が失敗を返し、serve は標準エラーに `strata serve: ...`、標準出力に `ERR ...` を出して終了コード 1 を返します。GPU の CUDA fault が検出された場合は、後片付けで停止することを避けるため `_Exit(1)` を使います（`src/program/generate.cpp:9929`、`src/program/generate.cpp:14107-14118`）。checkpoint コピー失敗の詳細は標準エラーの `strata serve: checkpoint save: ...` に出ます（`src/program/generate.cpp:1732-1736`）。
+- `--prompt-cache-every` 自体に成功時の専用出力はありません。保存に失敗して回復可能な場合は stderr に `strata serve: checkpoint at ... skipped: its state could not be copied out ...; the request goes on without it` が出ます（`engine/src/program/generate.cpp:14843-14853`）。回復不能な失敗は request のエラー経路へ進みます（`engine/src/program/generate.cpp:14843-14847,21593-21604`）。
+- 引数欠落時の stderr と終了コードは「値と既定値」を参照してください。負数・非数値を拒否する専用 validation メッセージはありません。
 
 ## 根拠
 
-- option の既定値・serve 用 help: `src/program/generate.cpp:747-748`、`src/program/generate.cpp:922-927`
-- parser と値の変換・不足値処理: `src/program/generate.cpp:2416-2421`、`src/program/generate.cpp:2663-2666`
-- serve の閾値初期化、chunk 境界での周期保存、multi-GPU の部分保存: `src/program/generate.cpp:9673-9679`、`src/program/generate.cpp:9900-9950`、`src/program/generate.cpp:13042-13052`
-- 保存先の bounded cache と `--prompt-cache` 条件: `src/program/generate.cpp:9701-9711`、`src/program/generate.cpp:9829-9855`
-- checkpoint 保存処理と失敗経路: `src/program/generate.cpp:1732-1736`、`src/program/generate.cpp:9790-9803`、`src/program/generate.cpp:14095-14128`
-- 補助資料（ソース実装と照合）: `docs/DETAILS.md:1144-1145`、`docs/MULTI_GPU.md:388-390`
-
-調査範囲は指定 commit の checkout 内の通常エンジン `src/program/generate.cpp` と関連する同 revision の説明資料です。別 backend の `sycl/src/program/generate.cpp`、ビルド済みバイナリ、公式 Release artifact の実行確認は行っていません。
+- `engine/src/program/generate.cpp:1124-1126,1329-1331,4111-4114` — 既定値、help 記述、parser の変換と関連 option。
+- `engine/src/program/generate.cpp:3842-3847,4113` — 値の取得、引数欠落時のエラーと終了。
+- `engine/src/program/generate.cpp:14595-14607,14723-14753,14818-14853,20212-20214` — checkpoint の保存・上限・失敗処理、周期開始位置と `ckpt=0`。
+- `engine/sycl/src/program/generate.cpp:742-744,909-911,2091,8645-8679,11119-11130` — SYCL parser、既定値、適用条件と失敗時の継続処理。
+- `engine/include/strata/core/prompt_checkpoint_grid.hpp:11-23` — CUDA/HIP の再開位置起点の grid と chunk 境界規則。

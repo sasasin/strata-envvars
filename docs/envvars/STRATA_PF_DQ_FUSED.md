@@ -1,42 +1,40 @@
 # `STRATA_PF_DQ_FUSED`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-SYCL の prompt prefill で、native IQ pack の expert 重みを FP16 に逆量子化する際、gate/up 行列と down 行列の処理を1回の kernel launch にまとめるか選びます。既定ではまとめます。無効にすると、gate/up と down を別々の2回の launch で処理します。コードのコメントは、出力値は従来の2回処理と byte-for-byte で同じで、変わるのは expert あたりの launch 数だけと説明しています。
+SYCL の prompt prefill において、native expert weight の gate/up と down の FP16 dequantize を `iq_dequant_expert_f16` の一呼び出しで行うか、gate/up と down を別々の呼び出しで行うかを切り替える。既定は一呼び出しで、環境変数の先頭文字が `0` のときは分割する。分岐は expert の dequantize 方法を選び、その後の gate/up・SwiGLU・down の計算自体は同じ `compute` 経路で続く（`engine/sycl/src/prefill/prefill.cpp:5076-5083`, `5163-5180`, `5225-5229`）。
+
+この名前を環境から読む実装は SYCL の `engine/sycl/src/prefill/prefill.cpp` だけにある。同じ名前のコメントと terminal の設定レジストリ項目はあるが、それらは追加の読み取り箇所ではない。
 
 ## 値と判定
 
-値全体の parse ではなく、`getenv()` が返す文字列の先頭1文字だけを調べます。
+`std::getenv` の戻り値を文字列として parse せず、先頭文字だけを調べる。値が未設定なら `dq_one` は `true`。設定されていて先頭文字が `0` なら `false`、それ以外なら `true` となる。従って空文字も `true` であり、数字・真偽値としての妥当性、大文字小文字、後続文字、空白は検査されない（`engine/sycl/src/prefill/prefill.cpp:5167-5169`）。
 
-| 環境変数の状態 | 判定 |
-|---|---|
-| 未設定 | 有効（1 launch） |
-| 空文字 | 有効（1 launch） |
-| 先頭文字が `0` | 無効（2 launches）。`0`, `0anything` など |
-| それ以外の先頭文字 | 有効（1 launch）。`1`, `true`, `false`, `anything` など |
+| 条件 | unset | fused 側 (`dq_one=true`) | 分割側 (`dq_one=false`) |
+|---|---|---|---|
+| SYCL の対象 dequantize 分岐 | fused 側 | `1`, `true`, `false`, 空文字, ` 0`, `-0`, `00x` など、先頭文字が `0` 以外 | `0`, `0anything`, `00` など、先頭文字が `0` |
 
-大文字小文字、空白、数値としての妥当性、後続文字は検査しません。たとえば `false` も有効です。値を判定する `static const bool` は、native pack の対象分岐に初めて入った時に初期化され、その後プロセス内で再評価されません。起動後に環境を変えても反映されません。
+ここでの「有効」は fused 側を選ぶ値という意味であり、対象分岐に入るための実行条件は次節のとおり。
 
 ## 有効になる条件
 
-- SYCL backend のビルドであること。この名前を読む実装は `sycl/src/prefill/prefill.cpp` に1箇所だけあり、CUDA/HIP側の同名設定は確認できませんでした。
-- prompt prefill のMoE expert処理に入ること。decode等の別経路には適用されません。
-- `lay.native` が真で、かつそのlayerがMMQ経路でも `STRATA_PF_XMX=2` の専用経路でもないこと。この分岐は、native packであっても特定のMMQ、XMXグループ化経路を選んだlayerでは通りません。
-
-対象の分岐では、`STRATA_PF_XMX=1` の grouped XMX GEMMを後段で使う場合も、この設定による逆量子化を先に行います。設定の値にかかわらず、canonical（非native）packには適用されません。
+- SYCL backend のビルドであること。このファイルは `engine/sycl/CMakeLists.txt:303-308` で `strata_prefill` に含まれる。
+- prompt の routed expert を処理する `Prefill::run_impl` の expert `compute` 経路に入り、`use_mmq` と `xmx2 || fp16_group` の早期分岐を通らないこと（`engine/sycl/src/prefill/prefill.cpp:2693`, `5076-5083`, `5083-5136`）。
+- 上記の後、layer が native layout (`lay.native`) であること。非-native layout は `blob_dequant_f16` に進むため、この環境変数を読まない（`engine/sycl/src/prefill/prefill.cpp:5163-5180`）。
+- `f16_pairs` が偽であること。これは `STRATA_SYCL_F16_EXPERT_PAIR` の先頭文字が `1` で、かつ native layout、`!use_mmq`、XMX mode が `0` のとき真となり、その場合は `dq_one` の値にかかわらず分割 dequantize 側を選ぶ（`engine/sycl/src/prefill/prefill.cpp:4627-4629`, `5168-5177`）。
+- CLI 引数、別設定ファイル、別環境変数による `dq_one` の上書きは、この読み取り箇所にはない。上記の `STRATA_SYCL_F16_EXPERT_PAIR` は別の経路条件として作用する。
 
 ## 実行時の詳細
 
-対象layerで各routed expertを処理する時、既定経路は `iq_dequant_expert_f16()` を呼び、gate/up と down を同じSYCL kernelに渡します。`STRATA_PF_DQ_FUSED=0` のように先頭が `0` の時は、`iq_dequant_gu_f16()` と `iq_dequant_f16()` を個別に呼びます。両方とも後続の同じFP16 GEMM処理へ渡されます。環境変数による専用ログや警告はありません。
+判定は expert `compute` lambda 内の関数ローカル `static const bool` で、当該分岐に初めて到達した時に一度だけ評価される。最初の評価後に環境値を変更しても、このプロセス内の `dq_one` には反映されない。対象分岐では native layer の format と blob の offset、tail scale を使って、真なら `iq_dequant_expert_f16` に gate/up と down の両データを渡す。偽、または `f16_pairs` が真なら `iq_dequant_gu_f16` の後に down 用 `iq_dequant_f16` を呼ぶ（`f16_pairs && d_type == 42 && tail == nullptr` のときだけ `iq_dequant_f16_plain_launch`）。その後に gate/up projection、SwiGLU、down projection を行う（`engine/sycl/src/prefill/prefill.cpp:5163-5180`, `5225-5229`）。
 
-helperの宣言と実装コメントは、新経路が旧2 kernel経路と同じFP16値を生成し、expertごとにlaunch境界を1つ減らすものとしています。headerのコメントには約4K promptで約24,500回のlaunch削減とありますが、これはコメント中の記載であり、この調査では性能を測定していません。`docs/DETAILS.md` にこの変数固有の説明や測定値は見つかりませんでした。
+この変数専用のログや無効値エラーはない。`compute` 中に捕捉される SYCL exception は `exc.what()` と `Exception caught at file:...`、`, line:...` を標準エラーへ出して `exit(1)` する一般処理があるが、当該例外をこの変数に固有の失敗として示す分岐はない（`engine/sycl/src/prefill/prefill.cpp:5232-5237`）。
 
 ## 根拠
 
-- `sycl/src/prefill/prefill.cpp:4084-4102` — native pack分岐、環境変数の読み取り、2つの処理経路。
-- `sycl/src/prefill/prefill.cpp:3225-3235,3945-3958,4214-4224` — packの判定、MMQ/XMX2経路の条件、streamed/resident expertからcomputeを呼ぶ流れ。
-- `sycl/include/strata/kernels/iq_dequant_expert.hpp:1-10` — 新kernelの目的、値の同一性に関する実装コメントと宣言。
-- `sycl/src/kernels/cuda/iq_kernels.dp.cpp:4443-4465` — SYCL移植kernelの実装。gate/upとdownを1つのkernelでFP16出力へ書き込む。
-- `docs/DETAILS.md` — この変数名の記載なし（文書化・測定値との照合対象となる記述なし）。
+- `engine/sycl/src/prefill/prefill.cpp:5167-5178` — 環境値の読み取り、先頭文字判定、native と非-native の dequantize 呼び分け。
+- `engine/sycl/src/prefill/prefill.cpp:4627-4629` — `STRATA_SYCL_F16_EXPERT_PAIR` と native/MMQ/XMX mode による別経路条件。
+- `engine/sycl/src/prefill/prefill.cpp:5076-5136`, `5225-5237` — expert `compute` の呼び出し位置、分岐、後続計算と例外処理。
+- `engine/sycl/CMakeLists.txt:303-308` — SYCL prefill ソースのビルド対象。

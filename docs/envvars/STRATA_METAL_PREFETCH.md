@@ -1,53 +1,52 @@
 # `STRATA_METAL_PREFETCH`
 
-調査対象: Strata `main` の HEAD `296b59d2f73c8f04a805df29c2fa97655adace78`（2026-10-14 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Metal engine の SSD expert streaming が選ばれた場合に、次の layer で使われると予測した routed expert を先読みする数を制御します。各 token の次 layer router logits から上位 K 個を選び、重複 expert をまとめて I/O queue に積みます。これは予測読み込みの制御であり、layer が実際に必要とする expert は通常の layer 処理で読み込まれます。
+Metal エンジンがモデルを SSD から expert arena へストリームする場合に、次層の router 出力から予測した expert を先に読む機能を制御する。正の値は各 token について先読み候補にする上位 expert 数である。実装は `ExpertStream::open` の値設定と、`Window` の予測 router logits の生成に分かれている（`engine/metal/src/engine/stream.cpp:28-31,157-163`、`engine/metal/src/engine/window.cpp:975-983,1290-1303`）。
+
+これは Metal backend 固有の設定で、CUDA/HIP/SYCL や通常の resident model 経路には適用されない。`STRATA_METAL_PREFETCH` を読む CLI／起動ラッパーはなく、Metal engine 内で直接読み取る。
 
 ## 値と判定
 
-`ExpertStream::open()` は共通 helper `env_int()` で値を読みます。未設定または空文字列なら既定値を使い、それ以外は `std::atoi()` の結果です。したがって文字列全体の厳密な整数 parse ではなく、先頭の空白と符号を許し、数字列の後ろは無視します。数字で始まらない文字列は 0 になります。
+`stream.cpp` の `env_int` は unset または空文字なら呼び出し側の既定値を返し、それ以外は `std::atoi` を使う。先頭の空白と符号付き数字は `atoi` の規則で変換され、数字以降の文字は変換結果に含まれない。数字を開始できない文字列は `0` になる。数値の範囲・文字列全体・真偽語を検証する処理はない（`engine/metal/src/engine/stream.cpp:28-31`）。
 
-| 環境変数値 | `pre_k_` の結果 | 予測読み込み |
-|---|---:|---|
-| 未設定または空文字列 | expert が大きい場合 6、それ以外 10 | 有効 |
-| `0`、負数、数値で始まらない文字列 | 0 以下 | 無効 |
-| 正の整数 | parse した値 | 有効。読み込み時の K は最大 32 に制限 |
-| 正の整数の後に文字が続く値（例: `4xyz`） | 先頭の整数 | その値で有効 |
+同じ環境変数を `window.cpp` も別に読み、`std::atoi(e) <= 0` なら予測 logits の計算を止める。こちらは unset なら有効だが、空文字は `atoi("") == 0` として無効になる（`engine/metal/src/engine/window.cpp:980-983`）。
 
-「expert が大きい」は各 layer の平均 expert byte 数 `eb / 48` が 1,500,000 を超える場合です。`atoi()` の範囲外値の扱いは C/C++ 実装に依存するため、文書では有効な `int` 範囲外の結果を規定しません。
+| 条件 | unset | 有効になる値の例 | 無効になる値の例 |
+|---|---|---|---|
+| `ExpertStream::open` の先読み数 | expert bytes / layer が 1.5 MB を超える場合 `6`、それ以外 `10` | `1`, `2`, `1abc` → 1, 2, 1 | `0`, `-1`, `true`, 空白だけ → 0 以下 |
+| `Window` の予測 logits | 有効 | `1`, `2`, `1abc`（`atoi` が正） | `0`, `-1`, `true`, 空文字、空白だけ（`atoi` が 0 以下） |
 
-Window 側にも独立した読み取りがあります。ここでは未設定なら予測 logits 用バッファを確保し、設定時は `atoi(value) > 0` の場合だけ確保します。このため、数値でない文字列は両方の読み取りで 0 となり無効です。一方、明示的な空文字列は不一致があります。`stream.cpp` は helper により既定 K（6 または 10）を採用しますが、`window.cpp` は `atoi("") == 0` として予測バッファを確保しません。その結果、先読みは実行されません。
+空文字は前者で既定値を使い、後者では予測を無効にする。このため空文字を設定すると、`pre_k_` 自体は正の既定値でも予測 logits が渡されず、decode の router 予測先読みは実行されない。非空の非数値文字列や `0anything` はどちらでも `atoi` 結果が 0 となり先読みを止める。`-2tail` などの負値も止める。`atoi` に渡す数値範囲外の文字列の結果は保証できないため、範囲外値の動作は定められない。
 
 ## 有効になる条件
 
-- Metal engine が使われ、かつ `ExpertStream::wanted()` が expert streaming を選んだ場合だけ参照されます。streaming は `STRATA_METAL_STREAM=1` で強制でき、`=0` で無効化できます。それ以外（未設定を含む）は、モデル expert が GPU working set に余裕を持って収まらない場合に自動選択されます。
-- prompt chunk (`T > 8`) の処理では `at_layer()` が prompt 経路を通って戻るため、この変数による予測 read-ahead は行いません。
-- 次 layer が存在し、router logits の予測 pointer が渡される必要があります。最後の layer では次 layer がないため実行されません。
-- 先読み数は `ahead()` の入口で 32 に上限設定されます。実際の読み込みは空き victim slot がなくなればそこで打ち切られ、すでに arena にある expert の読み直しは行いません。
-- `STRATA_METAL_PREFETCH2` は別途 layer + 2 の予測読み込みを制御します。本変数を 0 以下にしても、`STRATA_METAL_PREFETCH2` が正なら layer + 2 の先読みは独立して実行可能です。ただし Window 側の予測バッファ確保は本変数が正（または未設定）であることを条件にするため、本変数が 0 以下なら `pred2` も供給されず、layer + 2 の先読みも実行されません。
+- Metal engine の `Window` がモデルをストリーミングする場合に限る。ストリーム化は `STRATA_METAL_STREAM=1` で強制でき、`=0` なら無効。その他の値または unset では、GGUF の重みと余裕分が GPU working set / RAM の resident footprint cap に収まるかで自動判定される（`engine/metal/src/engine/stream.cpp:34-48`、`engine/metal/src/engine/window.cpp:736-744`）。
+- 環境変数を読むのは `ExpertStream::open` 時と `Window` の初期化時である。この時点でモデルの stream 経路に入っていなければ値は使われない。起動後の環境変更を再評価するループや static cache はなく、すでに作られた `ExpertStream` / `Window` には反映されない（`engine/metal/src/engine/stream.cpp:61-66,157-165`、`engine/metal/src/engine/window.cpp:975-983`）。
+- 値が正でも、次層の予測 logits がない呼び出しでは先読みされない。`Window::at_cut` は `st_pred_` が真で、かつ cut IDs がないときだけ logits を `ExpertStream::at_layer` に渡す（`engine/metal/src/engine/window.cpp:557-560`）。
+- プロンプト chunk（`T > 8`）では、現在層処理後に次層の arena 未常駐 experts を読み込む専用経路に入り、予測 logits による top-k 先読みとは別に動く。したがって本変数を 0 にしても、この prompt 向け先読みは止まらない（`engine/metal/src/engine/stream.cpp:620-623,693-712`）。
+- この変数が制御するのは次層 router 予測の expert 先読み数である。第 2 層先読み数は別変数 `STRATA_METAL_PREFETCH2` が 0 より大きい場合だけ設定される（`engine/metal/src/engine/stream.cpp:160-163,714-716`）。
 
 ## 実行時の詳細
 
-値は Window 初期化中に作られる `ExpertStream` の `open()` 時に読み取られ、`pre_k_` と `prefetch_` に保存されます。Window 初期化は予測 logits 用の `predL_` バッファを必要に応じて確保します。環境変数を変更しても、すでに初期化済みの stream や window の保存値・バッファは再評価されません。
+ストリーム経路の初期化時、各層の gate / up / down expert bytes の合計を層数で割り、その平均が `1.5e6` bytes より大きいモデルを `big` と判定する。`STRATA_METAL_PREFETCH` が unset または空なら `big` は既定 top-k `6`、それ以外は `10` を使う。`pre_k_ > 0` が `prefetch_` となる（`engine/metal/src/engine/stream.cpp:157-163`）。
 
-通常の decode layer では、Window が layer `l` の FFN input から layer `l+1` の router logits を計算して保存します。layer の host cut に到達すると `at_layer()` にその logits が渡り、`prefetch_` が有効であれば `ahead(l+1, ..., pre_k_)` が上位候補を選びます。候補 expert の読み込みは I/O queue に追加され、I/O thread が非同期に処理します。後続 layer では resident な expert を使い、未到着の予測読み込みは待機・昇格され、予測に外れた未開始の queue entry は破棄されます。
+各層の MoE 入力から、その層の通常 router logits に加えて次層の router logits を計算する。`st_pred_` が有効な場合に限って計算される。レイヤー間の host handoff で `ExpertStream::at_layer` に予測 logits が渡ると、各 token の予測順位から最大 `pre_k_` 個を次層の expert として非同期 I/O queue に入れる。先読みが無効なら `prefetch_` が偽、または `pred` が null になり、この経路は呼ばれない（`engine/metal/src/engine/window.cpp:1290-1303`、`engine/metal/src/engine/stream.cpp:620-623,714-717`）。
 
-stream arena の起動時 stderr 統計には `read-ahead top %d` として有効な `pre_k_` が表示され、先読み無効時は 0 と表示されます（`STRATA_METAL_PREFETCH=0` の場合）。このログは arena の fill 統計であり、個別の候補や命中率を表示するものではありません。
+既に arena にある expert は再読込せず、未開始の不要な先読みはキャンセルされる。先読み済み expert が現在必要になった場合は queue 内の読み込みを優先し、読み込み完了を待つ（`engine/metal/src/engine/stream.cpp:643-680,365-372`）。プロンプト chunk は別途、次層の未常駐 experts を読み込んでから復帰する（`engine/metal/src/engine/stream.cpp:693-712`）。
+
+## ログと測定値
+
+専用の有効・無効警告はない。arena 作成ログの `read-ahead top %d` は有効なら `pre_k_`、無効なら `0` を出すため、設定値そのものではなく `ExpertStream` 側で使う top-k を確認できる。終了時の stream report には `read-aheads` の発行数・window 当たり数・drop 数と、`read-ahead hits` が出る（`engine/metal/src/engine/stream.cpp:544-547,806-824`）。空文字では前述の二つの読み取りの差によりログの `read-ahead top` が正数でも decode の予測 logits がなく、予測先読みが発行されない場合がある。
+
+ストリームの実 I/O 失敗時には `strata metal stream: reading expert %d of layer %d failed` を stderr に出して `exit(6)` する。また、層で利用可能な slot がない場合は `strata metal stream: no free slot (layer %d)` を出して `exit(6)` する。これは環境変数の値検証エラーではなく、streaming 中の I/O / arena 経路の失敗である（`engine/metal/src/engine/stream.cpp:278-308,674-680`）。
 
 ## 根拠
 
-- `metal/src/engine/stream.cpp:27-30`: `env_int()` の unset・空文字の fallback と `atoi()` 変換。
-- `metal/src/engine/stream.cpp:33-48`: Metal streaming の選択。`STRATA_METAL_STREAM` の完全一致 `1` / `0` と自動判定。
-- `metal/src/engine/stream.cpp:154-160`: expert サイズ区分、既定 K、変数読み取り、正値判定。
-- `metal/src/engine/stream.cpp:538-541`: arena fill 統計に read-ahead top を出力。
-- `metal/src/engine/stream.cpp:571-612`: K の 32 上限、router logits の上位候補抽出、重複排除、先読み queue 登録。
-- `metal/src/engine/stream.cpp:614-711`: prompt 経路の除外、実際の layer expert 処理後に行う layer + 1 / layer + 2 の先読み。
-- `metal/src/engine/window.cpp:427-432`: streaming の選択と `ExpertStream::open()` 呼び出し。
-- `metal/src/engine/window.cpp:538-547`: Window 側の独立した変数読み取りと予測バッファ確保。
-- `metal/src/engine/window.cpp:292-295, 768-777`: host cut への logits 渡しと layer + 1 / layer + 2 router logits の生成。
-- `metal/src/engine/stream.h:62-66, 119-120`: 予測入力と設定値のメンバー。
-
-`docs/DETAILS.md` には `STRATA_METAL_PREFETCH` の個別説明を確認できませんでした。この調査では性能値や先読みの正答率は主張しません。
+- 読み取り helper と unset / empty の既定値処理: `engine/metal/src/engine/stream.cpp:28-31`
+- streaming の選択条件と初期化: `engine/metal/src/engine/stream.cpp:34-48,157-165`、`engine/metal/src/engine/window.cpp:736-744`
+- 予測 logits の別判定、生成と受け渡し: `engine/metal/src/engine/window.cpp:557-560,975-983,1290-1303`
+- top-k 先読みと prompt chunk の別経路: `engine/metal/src/engine/stream.cpp:620-623,693-717`
+- queue の発行・待機、ログと失敗経路: `engine/metal/src/engine/stream.cpp:278-308,643-680,544-547,806-824`

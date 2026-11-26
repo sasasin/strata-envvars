@@ -1,6 +1,6 @@
-# `--output`
+# `strata presets apply --output`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -12,48 +12,37 @@
 
 ## 役割
 
-成功時・失敗時の結果を、人向けの短いテキストか JSON のどちらで標準出力へ出すかを選びます。適用する preset は必須位置引数 `preset` で指定します。
+プリセットを有効化する `strata presets apply` の結果を、人間向けテキストまたは機械処理向け JSON で表示します。`--output` は有効化の対象や設定内容を変えず、結果の形式を選びます。
 
 ## 使い方
 
 ```sh
-strata presets apply <preset-id-or-name> --output json
+strata presets apply preset-name --output json
 ```
 
-例では保存済み preset の ID（または名前）を指定します。ID の一部を使う場合は4文字以上が必要です。
+`preset-name` はプリセットの正確な名前、ID、または4文字以上の一意な ID 接頭辞です。適用するプリセットを位置引数で指定します（`terminal/strata_cli/tune_commands.py:67-70`、`terminal/strata_control/presets.py:243-256`）。
 
 ## 値と既定値
 
-- `human`: 既定値です。成功時は `'<名前>' is now active...` の形式のメッセージを標準出力へ出します。
-- `json`: 成功時は `schema_version: 1`、`ok: true`、`preset`、`notice` を含む JSON オブジェクトを標準出力へ1行で出します。
-- それ以外の値は parser の `choices` 検証で拒否されます。`--output` は値を1つ取り、繰り返し指定時は argparse の通常動作により最後の値が残ります。
+- `--output` は値を1つ取り、`human` と `json` だけを受け付けます。既定値は `human` です（`terminal/strata_cli/tune_commands.py:59-61,67-70`）。
+- 値を省略した場合や選択肢外の値（空値を含む）を指定した場合は、処理開始前に `argparse` が引数エラーとして拒否します。`--output` の反復指定に対する独自処理はありません。
 
 ## 実行時の動作
 
-このオプションは出力形式だけを選び、preset の選択や適用方法を変えません。`apply` は指定値を preset ID、4文字以上の ID prefix、または大文字小文字を区別しない完全一致の名前として検索します。一致しない場合や曖昧な場合は失敗します。
+コマンド処理は `a.output == "json"` で機械出力を選び、`presets.activate_preset(a.preset)` を呼び出してから結果を出力します（`terminal/strata_cli/tune_commands.py:472-476,493-496`）。このオプション自体はプリセット選択・有効化処理に渡されません。
 
-見つかった preset をその選択条件の slot で active にします。すでに同じ preset が active なら保存処理をせず返します。別 preset が active ならその ID を最大20件の履歴へ残し、新しい active と `previous` を記録します。preset JSON と `active.json` は preset store に書かれます。preset store の場所は `STRATA_PRESET_DIR` があればその値、なければ profile directory の隣の `presets/` です。
-
-この CLI 呼び出しはモデルエンジンを起動しません。active preset は後のモデル起動時に構成へ overlay されます。起動時には選択条件や現在のモデル・エンジン等の識別情報を確認し、hard な変更がある場合や安全規則に合わない設定は適用されません。
+有効化はプリセットの slot 単位で `active.json` を更新し、置き換え前の有効 ID を履歴に保存します。すでに同じプリセットが有効なら追加更新せず、そのプリセットを返します（`terminal/strata_control/presets.py:227-233,337-353`）。プリセットの設定はこのコマンドでモデル起動時に即時適用されるのではなく、後の起動経路が active preset を overlay するときに反映されます。overlay はモデル・選択条件の slot を照合し、ハードな環境差や設定検証失敗がある場合は適用を見送ります（`terminal/strata_control/presets.py:488-546`）。
 
 ## 適用条件と副作用
 
-preset store に読み取り・書き込み可能で、指定 preset が存在し一意に特定できる必要があります。`--output` 自体はファイルを作成・上書きしませんが、`apply` 操作は store 内の preset JSON と active index を更新します。置き換えた preset は undo 用履歴に残ります。次のモデル起動時にのみ設定が使われ、適用時点で測定やエンジン起動は行いません。
-
-## 出力とエラー
-
-- 成功時は終了コード `0` です。`human` は短い成功文、`json` は成功 JSON を標準出力へ出します。
-- preset が見つからない・曖昧などの `PresetError` は終了コード `5` です。`human` では `strata: ...` を標準エラーへ、`json` では `ok: false` とエラー情報を含む JSON を標準出力へ出します。
-- `OSError` / `ValueError` は `presets_command` 内で捕捉され、例外に `exit_code` がなければ終了コード `2` になります。JSON モードではエラー JSON、human モードでは標準エラーへのメッセージです。
-- `human` / `json` 以外の値は argparse が usage とエラーを標準エラーへ表示し、終了コード `2` で終了します。
+- `human` では有効化完了の案内を標準出力に表示します。`json` では標準出力に `schema_version: 1`、`ok: true`、`preset`（要約）、`notice` を含む JSON オブジェクトを1行で出します（`terminal/strata_cli/tune_commands.py:493-496,101-106`）。
+- `--output` の選択によるファイル・ネットワーク・モデル起動の副作用はありません。ただし `apply` 自体はプリセットファイルと `active.json` を更新します。有効化時に以前の active ID があれば履歴に追加し、最大20件を保持します（`terminal/strata_control/presets.py:337-352`）。
+- 指定名・IDが見つからない、または曖昧な場合は `PresetError` となり終了コード `5` です。`human` では `strata: ...` を標準エラーへ、`json` では `ok: false` と `error.code` / `error.message` を含む JSON を標準出力へ出します。I/O エラーは終了コード `2`（例外に `exit_code` があればその値）で同じ出力分岐を通ります（`terminal/strata_control/presets.py:243-256`、`terminal/strata_cli/tune_commands.py:527-530,109-114`）。
 
 ## 根拠
 
-- `strata_cli/tune_commands.py:53-55` — `presets` 配下の共通 parser に `--output` を登録し、値・既定値を定義。
-- `strata_cli/tune_commands.py:63-64` — `apply` parser と必須 preset 位置引数。
-- `strata_cli/tune_commands.py:95-108,289-314,344-348` — JSON / human の成功・失敗出力、preset 検索と適用呼び出し、例外の終了コード。
-- `strata_control/presets.py:45-68,218-231,310-326` — store の場所、preset の検索規則、active 切替え・履歴保持・書き込み。
-- `strata_control/presets.py:11-17,441-482` — 起動時 overlay の説明、hard change・安全規則・適用時の例外処理。
-- `strata_cli/cli.py:2223-2235` — argparse による引数解析と選択肢外の引数エラー処理。
-
-調査範囲は指定 revision の Python CLI parser と preset 管理実装です。OS ごとの配置先の詳細や、外部の Strata Desktop が同時に store を操作する場合の競合挙動は、このオプション調査では検証していません。
+- `terminal/strata_cli/tune_commands.py:55-70` — `presets apply` の parser 階層、位置引数、共通 `--output` の選択肢と既定値。
+- `terminal/strata_cli/tune_commands.py:472-476,493-496` — JSON モード判定、プリセット有効化呼び出しと成功結果。
+- `terminal/strata_cli/tune_commands.py:101-114,527-530` — 成功・失敗の stdout/stderr 形式と終了コード処理。
+- `terminal/strata_control/presets.py:243-256,337-353` — プリセット参照の解決と active 状態・履歴の永続化。
+- `terminal/strata_control/presets.py:488-546` — 後の起動時 overlay と、適用を見送る条件。

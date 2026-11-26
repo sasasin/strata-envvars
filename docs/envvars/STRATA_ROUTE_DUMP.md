@@ -1,52 +1,45 @@
 # `STRATA_ROUTE_DUMP`
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-検証 window の expert dispatch が受け取った routing を、指定ファイルへテキストで追記します。ソースコメント上の用途はベンチ用 replay placement の入力です。生成・推論結果を制御する値ではなく、出力先のパスです。
-
-この読み取りは `src/core/expert_source.cpp` の `expert_pool_dispatch_multi()` にのみあります。対応する SYCL 実装 `sycl/src/core/expert_source.cpp` にはこの変数の読み取りがなく、同名の設定で SYCL 側が出力することは確認できません。ソースにはベンチ用とのコメントがありますが、実装上はベンチモード判定をせず、後述の dispatch 条件を満たす経路で出力します。
+`STRATA_ROUTE_DUMP` は、CUDA/HIP エンジンの `expert_pool_dispatch_multi` が処理する layer-window ごとに、ルーティングされた distinct expert、各 expert の行数、GPU キャッシュ上の状態をテキストで追記出力する診断用フックです。値を読んでファイルを開く以外に、ルーティング、expert の選択、出力計算を変更する処理はありません。読み取りと書き込みは `engine/src/core/expert_source.cpp` にあります（`engine/src/core/expert_source.cpp:5426-5429,5528-5542`）。コードコメントは「bench only」としますが、実装にbench専用の条件分岐はなく、通常の generate 経路からも multi dispatch が呼ばれます（`engine/src/core/expert_source.cpp:5528-5532`; `engine/src/program/generate.cpp:1631-1636,14886,24547-24549`）。
 
 ## 値と判定
 
-| 環境値 | 動作 |
-|---|---|
-| 未設定 | 出力しない。`getenv()` が null になり、ファイルを開かない |
-| 空文字 | 出力しない。`f[0] == '\0'` でファイルを開かない |
-| 空でない文字列 | 文字列全体をファイル名として `fopen(path, "a")` で開く。既存ファイルには追記し、存在しない場合は作成を試みる |
-| 無効なパス、権限不足などで open 失敗 | `fopen()` が null を返すため出力しない。専用の警告・エラー処理はない |
+関数内 `static` 初期化子で `std::getenv` を呼び、値が未設定（null）または空文字なら無効、それ以外なら値全体をファイル名として `std::fopen(path, "a")` に渡します。真偽文字列や数値への変換はありません。したがって `0`、`false`、空白だけの値も空でないパスとして扱われます。ファイルを開けない場合はポインターが null となり、その後の記録を行いません（`engine/src/core/expert_source.cpp:5531-5532`）。
 
-数値変換、範囲制限、大文字小文字の判定はありません。相対パスの場合、プロセスの作業ディレクトリを基準に解決されます（`fopen` に渡す前のパス変換はありません）。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP の multi dispatch で GPU plan と容量条件を満たす場合 | 記録なし | `trace.txt`、`0`、`false`（いずれもパス） | 空文字。パスを開けない場合も記録なし |
+| 上記以外 | 読み取り箇所に到達しない | なし | なし |
+
+CLI 引数や他の環境変数との優先順位はありません。CLI の `--dump-routing` は別経路で routing ID と weights を記録する機能であり、この変数の設定を上書きしません（`engine/src/program/generate.cpp:1608-1626,3898`）。
 
 ## 有効になる条件
 
-- `expert_pool_dispatch_multi()` が呼ばれる検証 window の経路であること。通常の単一 token 用 `expert_pool_dispatch()` にはこの読み取りがありません。
-- 関数が失敗済みでなく、window の token 数と routing 幅の初期検査を通過していること。
-- 計画テーブルを処理する `d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap` の分岐に入ること。この条件外では環境変数を読まず、出力もしません。
-- `src/core/expert_source.cpp` の実装が使われる backend であること。対応する SYCL 実装には出力コードがありません。
-
-CLI や設定ファイルとの優先順位はありません。値はファイル出力を有効にするかと、そのパスだけを指定します。
+- CUDA/HIP 用の共有 GPU engine に含まれるコードです。CPU-only build にはこの `strata_engine` ソースの組み込みはありません（`engine/cmake/strata_gpu_engine.cmake:305-316`）。
+- `expert_pool_dispatch_multi` が呼ばれ、`d.plan != nullptr` かつ `n_tok * k <= kMaxWindowEntries` および `n_tok * k <= d.plan->cap` の分岐に入る必要があります。関数は `n_tok` が 1 以上 `kWindowMaxT` 以下であることも先に確認します（`engine/src/core/expert_source.cpp:5426-5434,5443-5449,5479`）。通常の generate 経路では verify の plan sink を `d.plan` に設定します（`engine/src/program/generate.cpp:14886,24547-24549`）。条件を満たさない場合は環境変数を読む処理にも到達しません。
+- `STRATA_ROUTE_TAIL_SKIP` が有効な場合、出力される `nmiss` と `res` に tail-skip の状態が反映されます。この変数自体は tail-skip の有効化条件ではありません（`engine/src/core/expert_source.cpp:5502-5525,5533-5539`）。
 
 ## 実行時の詳細
 
-環境変数は計画分岐に最初に入ったとき、関数ローカル `static` 初期化で一度読みます。ファイルもその時点で append モードで一度開き、同じ `FILE*` をプロセス内で使い続けます。初回の判定後に環境変数を変更しても再読込・再オープンしません。初回に未設定・空文字だった場合も無効状態がキャッシュされます。
+環境変数はプロセス起動時ではなく、この関数内の出力ブロックが初めて実行された時に一度読みます。`static` に保存した `FILE*` を以後の呼び出しで再利用するため、プロセス実行中に環境値を変更しても反映されず、出力先も切り替わりません（`engine/src/core/expert_source.cpp:5531-5532`）。
 
-ファイルを開けた場合、各 layer-window について次の1行を書きます。
+出力ファイルは追記モードで開きます。各行は `layer n_tok nd nmiss |` に続けて、routing 順の各 distinct expert を `expert_id:rows:res` で記録します。`rows` はその window 内で expert ID が現れた回数、`res` は GPU cache resident が `1`、tail-skip が `2`、それ以外が `0` です。`nmiss` は distinct 数から GPU cache、peer/helper 所有分などを除き、tail-skip 分も差し引いた値です（`engine/src/core/expert_source.cpp:5491-5500,5519-5525,5533-5542`）。
 
-```text
-layer n_tok nd nmiss | expert_id:rows:res ...
-```
+ファイルを開けない場合も警告・エラー出力やプロセス終了はなく、書き込み戻り値も検査しません（`engine/src/core/expert_source.cpp:5531-5542`）。この変数による計算結果や生成 token の変更はコード上ありません。
 
-expert は routing に初めて現れた順で並びます。`rows` はその expert に routing された window 内の行数、`res` は `1` が GPU cache resident、`0` が nonresident miss、`2` が tail-skip 対象です。先頭の `nmiss` はこの計画処理で数えた miss 数で、tail-skip が有効なら対象を除いた後の数になります。記録は PCIe share の最終割り当てを示すものではなく、ソースコメントにあるようにオフライン placement replay 用の routing/状態記録です。
+## ログと測定値
 
-各行は `fprintf()` と改行文字の `fputc()` で書きます。open 失敗や書き込みエラーを検査して stderr に警告したり、処理を失敗扱いにしたりする経路はありません。明示的な flush もこの箇所にはありません。
+ログ出力ではなく、指定ファイルへのテキスト記録です。1 行の書き込みは `fprintf` と改行の `fputc` で行われます。失敗時の Strata ログはありません。Strata の `docs/DETAILS.md` が説明している `--dump-routing` は別形式の routing trace であり、本変数の記録形式や挙動の根拠にはしていません（`docs/DETAILS.md:84-87,364-368`; `engine/src/program/generate.cpp:1608-1626`）。この変数に関する測定値はありません。
 
 ## 根拠
 
-- `src/core/expert_source.cpp:4887-4909` — multi-token dispatch の入口、失敗・window 範囲検査。
-- `src/core/expert_source.cpp:4936-4940` — GPU plan 処理の分岐条件。
-- `src/core/expert_source.cpp:4963-4984` — tail-skip による miss 数の更新。
-- `src/core/expert_source.cpp:4986-4999` — 用途コメント、環境値の読み取りと static cache、append open、記録内容。
-- `src/program/generate.cpp:1420-1427,11773-11776` — serve の検証 window から multi-token dispatch に渡す経路。
-- `sycl/src/core/expert_source.cpp:2547-2586` — 対応する SYCL multi-token 実装に `STRATA_ROUTE_DUMP` の読み取りがないこと。
+- `engine/src/core/expert_source.cpp:5426-5449,5479` — 関数入口、window 範囲、plan/capacity 条件。
+- `engine/src/core/expert_source.cpp:5491-5500,5519-5542` — miss と skip の判定、出力列、ファイル書き込み。
+- `engine/src/program/generate.cpp:1631-1636,14886,24547-24549` — multi dispatch の呼び出しと generate 経路での plan sink 設定。
+- `engine/cmake/strata_gpu_engine.cmake:305-316` — CUDA/HIP 共通 GPU engine への組み込み。
+- `engine/src/program/generate.cpp:1608-1626,3898` — CLI `--dump-routing` は独立した binary routing trace。
+- `docs/DETAILS.md:84-87,364-368` — 文書中の routing trace 説明との照合。

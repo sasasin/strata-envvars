@@ -1,49 +1,57 @@
 # `USERPROFILE`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査開始時の作業ツリーは `## main...origin/main` で、未コミット変更はありませんでした。外部ライブラリ側の動作は対象外です。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Strata Control、ホストサーバー、デスクトップアプリが、Windows 上でユーザーの Documents、作業フォルダー、状態・診断ファイルの場所を組み立てるために参照します。また、ホストはエージェント用 Harness の子プロセスへこの環境変数を引き継ぎます。エンジンの推論動作を制御する変数ではありません。
+`USERPROFILE` は Windows でユーザーのホーム／プロファイル基準パスとして使われます。Strata は一律に解釈せず、呼び出し箇所ごとに空値の fallback が異なります。主な用途は、Terminal が既存モデルのある `Documents/Strata` を候補に加えること、host が既定 workspace と Home shortcut と診断ファイルの場所を決めること、Windows desktop shell がデータフォルダーと `--save-logs` の保存先を決めることです。CUDA/HIP/SYCL engine の挙動を制御する変数ではありません。
+
+参照候補のうち、実行時に値を読む実装は `terminal/strata_control/discovery.py`、`app/host/server/index.mjs`、`app/host/server/agent/agent-bridge.mjs`、`app/host/server/platform-paths.mjs`、`app/desktop/src-tauri/src/desktoplog.rs` にあります。`harness-runtime.mjs` の名前 allowlist は agent 子プロセスへ環境を転送するもので、名前の動的な読み取りではありません（`app/host/server/agent/harness-runtime.mjs:22-36,80-83`）。
 
 ## 値と判定
 
-Strata は `USERPROFILE` の文字列を数値や真偽値に parse しません。用途ごとの未設定・空文字の扱いは異なります。
+文字列全体を数値や boolean に parse せず、パスとして使います。空白除去、絶対パス検査、正規化をこの変数値そのものに対して行う共通処理はありません。未設定・空文字の扱いは箇所ごとに異なります。
 
-| 箇所・条件 | 未設定 | 空文字 | 設定値 |
+| 読み取り箇所・条件 | unset | 有効になる値（例） | 空文字・無効値の例 |
 |---|---|---|---|
-| Control の Windows Documents 候補 | `_home(home)`（`home` 引数がなければ `Path.home()`）に fallback | `or` 判定で同じ fallback | そのまま `Path` にし、`Documents` を追加 |
-| Host の既定 workspace / Downloads / Home ショートカット | `HOME`、さらに Node の `homedir()`（Home ショートカットは `HOME` まで） | nullish 判定なので空文字を採用。workspace は相対パスから作成を試み、Downloads 等も相対パスになる | そのまま採用。trim、絶対パス検査なし |
-| Host のエージェント tracker 除外パス | `HOME`、さらに `homedir()` | nullish 判定なので空文字を採用 | `AppData` 等の除外先の基準に採用 |
-| Host が Harness に渡す環境 | この変数は追加されない | 名前が allowlist に一致し、値が空でも除外されず転送 | allowlist を通して値を転送 |
-| Desktop Rust の Windows データフォルダー | `temp_dir()` を基準にする | `var_os` は空文字も値として扱い、相対 `AppData/Local/Strata` になる | `USERPROFILE/AppData/Local/Strata`。絶対パス検査なし |
-| Desktop Rust の Downloads | `temp_dir()` | 空値を値として扱い、相対 `Downloads` | `USERPROFILE/Downloads` |
+| Terminal の `documents_dirs`、Windows (`windows=None` の既定は `os.name == "nt"`) | `Path.home()/Documents` を候補にする | 非空の任意の文字列を `Path` にし、その `Documents` を候補にする | `""` は `or` により `Path.home()` へ fallback。文字列の妥当性・絶対性は検査しない |
+| host の既定 workspace（`STRATA_WORKSPACE` が truthy でない場合） | `HOME`、さらに Node の `homedir()` | 任意の文字列を user 基準に使う | `""` は nullish fallback を発生させず、その空文字を基準に `workspaceBases` へ渡す |
+| host の Home shortcut と診断保存 | shortcut は `HOME`、未設定なら値なし。診断保存は `HOME`、さらに `homedir()` | 任意の文字列 | 空文字は nullish fallback されず、shortcut では `.filter(Boolean)` により項目が消える。診断保存では `Downloads` 相対パスになる |
+| host Windows state path、`LOCALAPPDATA` が truthy でない場合 | `homedir()` を使う | 非空なら `<USERPROFILE>\\AppData\\Local\\Strata` | `""` は `||` により `homedir()` に fallback。絶対性は検査しない |
+| Rust desktop、Windows の `LOCALAPPDATA` が未設定または絶対パスでない場合 | `USERPROFILE` があればその下の `AppData/Local`、なければ temp dir | `OsString` を `PathBuf` にして `AppData/Local` を追加 | 空でも `var_os` は値ありとして扱われ、その相対 `AppData/Local/Strata` が組み立てられる。USERPROFILE の絶対性検査はない |
+| Rust desktop の `--save-logs`、Windows | `temp_dir()/Downloads` | `USERPROFILE/Downloads` | 空でも値ありとして `Downloads` が使われる。パス検証なし |
 
-Host の既定 workspace では `STRATA_WORKSPACE` が truthy ならそちらを優先します。未指定時は `USERPROFILE ?? HOME ?? homedir()` を基準に `<user>/Documents/Strata/Workspace`、次に `<user>/Strata/Workspace` の順で作成を試し、両方失敗すると基準値自体を使います。`WORKSPACE` はモジュール読み込み時に一度計算されます。診断保存先とローカルモデル一覧の Home ショートカットは各 HTTP リクエストで環境を参照します（`apps/host/server/index.mjs:102-115,1023-1025,1404-1408`）。
+根拠: `terminal/strata_control/discovery.py:39-44,67-90`、`app/host/server/index.mjs:111-124,1545-1549`、`app/host/server/platform-paths.mjs:16-23`、`app/desktop/src-tauri/src/desktoplog.rs:39-47,516-518`。
 
 ## 有効になる条件
 
-- Control の Documents 候補では Windows 判定時だけ使用します。`STRATA_DOCUMENTS_DIR` が空でない場合、その候補が先に置かれます。`USERPROFILE/Documents` の後ろに `OneDrive`、`OneDriveConsumer`、`OneDriveCommercial` の各 `Documents` 候補が追加されます。非 Windows では `USERPROFILE` を使わず、`XDG_DOCUMENTS_DIR` と `home/Documents` を使います (`strata_control/discovery.py:64-87`)。
-- Control の `data_dir_choices()` はアプリ内モード (`STRATA_SETTINGS_FILE` が truthy) では Documents 候補自体を追加しません。通常の Control 経路では候補の `Documents/Strata` がデータフォルダーとして採用されるのは、そこに `Models`、`models`、または `packs` の非空ディレクトリがある場合です。設定ファイルやアプリ側候補が先に選ばれることもあります (`strata_control/discovery.py:262-289`)。
-- Host の `apps/host/server/platform-paths.mjs` では Windows の状態ディレクトリー計算で `LOCALAPPDATA` が truthy なら `USERPROFILE` より優先されます。`LOCALAPPDATA` が空または未設定なら、`USERPROFILE || homedir()` を使います。非 Windows は `USERPROFILE` を使いません (`apps/host/server/platform-paths.mjs:16-22`)。
-- Desktop Rust の Windows データディレクトリーは `LOCALAPPDATA` が絶対パスならそれを優先します。未設定・相対値なら `USERPROFILE` を使い、こちらも未設定なら一時ディレクトリーに fallback します。非 Windows のコンパイルではこの関数は `USERPROFILE` を参照せず `XDG_DATA_HOME` / `HOME` を使います (`apps/desktop/src-tauri/src/desktoplog.rs:39-59`)。
-- Desktop Rust の Downloads 選択は `cfg!(windows)` で実行時に `USERPROFILE` または `HOME` のどちらを読むか選びます。値があれば `Downloads` を付加し、なければ一時ディレクトリーです。保存ログ処理から呼び出されます (`apps/desktop/src-tauri/src/desktoplog.rs:516-518`; 呼び出し `apps/desktop/src-tauri/src/supervisor.rs:323`)。
+- Terminal の Documents 候補では Windows 判定が必要です。`STRATA_DOCUMENTS_DIR` が truthy ならそれが先の候補になり、`USERPROFILE/Documents` より前に調べられます。`OneDrive`、`OneDriveConsumer`、`OneDriveCommercial` が設定されていればそれぞれの `Documents` も候補に追加されます（`terminal/strata_control/discovery.py:67-90`）。
+- その Documents 候補がデータフォルダーとして採用されるには、アプリ内モードでなく、先行する settings/app のデータ指定で決まらず、`Documents/Strata` 以下の `Models`、`models`、`packs` のいずれかに中身のあるディレクトリーが必要です。満たさなければ `data_dir` は指定された default を返します（`terminal/strata_control/discovery.py:258-291,294-314`）。
+- host の既定 workspace では truthy な `STRATA_WORKSPACE` が最優先で、その場合 `USERPROFILE` は workspace 選択に使われません。通常は `<user>/Documents/Strata/Workspace` を作成し、作成に失敗すれば `workspaceBases` の次の候補を試し、全候補で失敗すれば user 値自体を返します。`WORKSPACE` はモジュール初期化時に一度決まり、その後 workspace、chat の fallback、Skills などに使われます（`app/host/server/index.mjs:111-124,419,539-552,644`、`app/host/server/model-directory-default.mjs:28-42`）。
+- host の state path は Windows でのみ `USERPROFILE` fallback を使います。truthy な `LOCALAPPDATA` があれば `USERPROFILE` は参照されず、`STRATA_TUNE_DIR`／`STRATA_TIMESKIP_DIR` の明示値は state root より優先します（`app/host/server/platform-paths.mjs:16-32`）。
+- Rust desktop の `USERPROFILE` によるデータ path fallback は Windows build だけです。`LOCALAPPDATA` は絶対パスなら優先され、未設定または相対パスなら `USERPROFILE`、それも未設定なら temp directory へ進みます（`app/desktop/src-tauri/src/desktoplog.rs:39-47`）。
+- Rust `--save-logs` 分岐は CLI 引数が必要です。`downloads_dir` は Windows では `USERPROFILE`、それ以外では `HOME` を使います。保存先 directory の作成・ファイル書き込みが成功すると stdout に `Saved to ... Please send this file to us.`、失敗すると stderr に `[strata] could not save the logs: {e}` を出して終了コード `1` を返します（`app/desktop/src-tauri/src/supervisor.rs:43-53,478-494`、`app/desktop/src-tauri/src/desktoplog.rs:310-341,516-518`）。
+- host の diagnostics API は `/api/native/logs/save` の POST 時に限り、`USERPROFILE ?? HOME ?? homedir()` の `Downloads` にファイルを作成して path を返します。shortcut API は `/api/local-models/browse` で Home を表示します（`app/host/server/index.mjs:1138-1149,1545-1549`）。
+- agent の deliverable tracking では `trackerFolders()` が `USERPROFILE ?? HOME ?? homedir()` を基準に `AppData`、`.cache`、`.config`、`.local`、`Library` を除外対象に加えます。tracker の生成時に計算され、`USERPROFILE` 単独でファイル操作や agent の cwd は決まりません（`app/host/server/agent/agent-bridge.mjs:181-190,534`）。agent subprocess には host の環境から `USERPROFILE` 名が許可されていれば値が転送されます（`app/host/server/agent/harness-runtime.mjs:22-36,80-83`）。
 
 ## 実行時の詳細
 
-Control の `documents_dirs()` は `environ` 引数が省略された場合に `os.environ` を参照します。明示的に渡された環境辞書と `windows` / `home` 引数で動作を差し替えられます。そこで作られた Documents 候補は、通常モードのデータフォルダー探索に渡されます。候補が存在しない、またはモデル用ディレクトリーを含まない場合は採用されず、後続候補または既定値になります (`strata_control/discovery.py:64-87,262-289`)。
+- Python の `documents_dirs` は呼び出しごとに渡された `environ` を参照し、未指定ならその時点の `os.environ` を使います。`USERPROFILE` の値を cache しません。`windows=None` の OS 判定は `_windows` が行います（`terminal/strata_control/discovery.py:39-44,67-90,279-306`）。
+- host server は import 初期化中に `defaultWorkspace()` を実行して `WORKSPACE` 定数を作ります。`USERPROFILE` の実行中変更はこの既定 workspace に再反映されません。diagnostics と Home shortcut は各 API handler が `process.env` を参照するため、handler 到達時の値を使います（`app/host/server/index.mjs:111-124,1138-1149,1545-1549`）。
+- `stateRoot` は既定引数で `process.env` と `process.platform` を受け、`tuningDir`／`timeSkipDir` が呼ぶたびに計算します。固定 cache はありません（`app/host/server/platform-paths.mjs:16-32`）。
+- Rust desktop の `platform_data_dir()` と `downloads_dir()` は呼び出すたびに `std::env::var_os` を読みます。値を別の static cache に保存しません（`app/desktop/src-tauri/src/desktoplog.rs:31-59,516-518`）。
 
-Host サーバーは `WORKSPACE` をモジュール初期化時に決め、優先先のフォルダーを作れなければ次候補へ進みます。API `/api/native/logs/save` は環境変数から Downloads を選び、`mkdirSync` と `writeFileSync` で診断テキストを書き、成功時に JSON の `path` を返します。このブロックでは書き込みを囲む `try/catch` がなく、失敗すれば通常のリクエスト処理へ例外が伝わります。ローカルモデル閲覧 API は `USERPROFILE ?? HOME` を Home ショートカットとして返し、どちらも falsy の場合はそのショートカットを除きます (`apps/host/server/index.mjs:102-115,1014-1025,1404-1408`)。
+## ログと測定値
 
-Agent bridge は `USERPROFILE` をユーザープロファイル配下の `AppData`、`.cache`、`.config`、`.local`、`Library` を tracker の除外対象にするため参照します。`env` の既定値は `process.env` ですが、生成時に環境オブジェクトを注入できます (`apps/host/server/agent/agent-bridge.mjs:120-135`)。Harness 起動時には `agentEnvironment()` が親環境のうち allowlist に合う変数だけを子プロセス環境へコピーします。`USERPROFILE` は大文字小文字を区別しない allowlist に含まれ、別途 `extra` で上書きもできます (`apps/host/server/agent/harness-runtime.mjs:20-36,75-83`)。これは Strata による転送の記述であり、Harness 内部での変数利用は説明対象外です。
+`USERPROFILE` 自体について有効／無効を通知するログは見つかりませんでした。host は起動時に `workspace    ·  <path>` を stdout に表示します。診断保存 API は成功時に生成 path をレスポンスに含み、Rust の `--save-logs` は上記の成功・失敗文言を出力します。測定値は該当しません（`app/host/server/index.mjs:310-316,1138-1149`、`app/desktop/src-tauri/src/supervisor.rs:484-493`）。
 
 ## 根拠
 
-- `strata_control/discovery.py:64-87,262-289` — Windows の Documents 候補、データフォルダー探索と採用条件。
-- `apps/host/server/index.mjs:102-115,1014-1025,1404-1408` — workspace の初期化、診断ファイル保存、Home ショートカット。
-- `apps/host/server/platform-paths.mjs:16-22` — Windows 状態ディレクトリーと `LOCALAPPDATA` 優先。
-- `apps/host/server/agent/agent-bridge.mjs:120-135` — tracker 除外先の基準。
-- `apps/host/server/agent/harness-runtime.mjs:20-36,75-83` — allowlist による子プロセスへの環境転送。
-- `apps/desktop/src-tauri/src/desktoplog.rs:39-59,516-518`、`apps/desktop/src-tauri/src/supervisor.rs:323` — Windows データディレクトリーと Downloads の選択、ログ保存からの呼び出し。
-
-候補一覧には `USERPROFILE` が載っています (`000_envvers.md:1694`)。Strata 所有の本番コードに上記の読み取り・転送が確認できました。`docs/DETAILS.md` にある `%USERPROFILE%` の記述 (`docs/DETAILS.md:852`) は Codex CLI の設定場所の説明で、Strata による読み取りの根拠にはしていません。
+- `terminal/strata_control/discovery.py:39-44,67-90,258-314`
+- `app/host/server/index.mjs:111-124,310-316,1138-1149,1545-1549`
+- `app/host/server/model-directory-default.mjs:7-25,28-42`
+- `app/host/server/platform-paths.mjs:16-32`
+- `app/host/server/agent/agent-bridge.mjs:181-190,534`
+- `app/host/server/agent/harness-runtime.mjs:22-36,80-83`
+- `app/desktop/src-tauri/src/desktoplog.rs:31-59,310-341,516-518`
+- `app/desktop/src-tauri/src/supervisor.rs:43-53,478-494`

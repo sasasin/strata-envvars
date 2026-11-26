@@ -1,62 +1,60 @@
 # `--native-moe-combine`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata generate`（CMake 生成の `strata` エンジン） |
+| コマンド | `strata generate`（トップレベルのエンジン引数） |
 | オプション | `--native-moe-combine` |
 | 別名 | なし |
-| 値 | 取らない真偽値フラグ |
+| 値 | 値を取らないフラグ。指定すると有効 |
 
 ## 役割
 
-MoE の routed expert 出力を routing weight で加重合算し、shared expert 出力を加える処理に、実験的な pinned CUDA weighted-reduction カーネルを選びます。既定では無効です。エンジンのヘルプも「experimental pinned CUDA routed/shared combination」と説明しています（`src/program/generate.cpp:847`）。
+MoE 層の routed expert 出力を router weight で合成し、shared expert 出力を加える処理を、標準経路から実験的な CUDA native combine カーネルへ切り替える。実装上は routed 部分の重み付き和に shared 出力を一度加算する。MoE 層を実行しないモデル・経路では、この切替による処理は発生しない。カーネルの算術契約とフラグの初期状態は `engine/src/kernels/cuda/native_moe.cu:33-38,41-74`、標準 MoE 経路の切替は `engine/src/core/layer.cpp:520-529`。
 
 ## 使い方
 
-トークン ID を指定するエンジンの例です。`PACK` はモデル pack のディレクトリに置き換えます。
+`strata generate` の引数として指定する。以下は必須の prompt token を含む構文例であり、実行には対象モデルと通常のモデル設定が必要。
 
 ```sh
-strata generate --pack PACK --tokens "1,2,3" --native-moe-combine
+strata generate --pack DIR --tokens "1,2,3" --native-moe-combine
 ```
 
-エンジンの使用形式は `strata generate --pack DIR --tokens "…" [options]` です（`src/program/generate.cpp:806-812`）。
+usage は `--pack DIR` と `--tokens LIST` を示し、parser はこのフラグをそのまま受理する（`engine/src/program/generate.cpp:1208-1214,3914-3918`）。
 
 ## 値と既定値
 
-- 値は不要です。指定すると `Options::native_moe_combine` を `true` にします。初期値は `false` で、同じフラグを複数回指定しても同じ値のままです（`src/program/generate.cpp:445`, `src/program/generate.cpp:2490-2492`）。
-- `--native-moe-combine=...` のような値形式や、フラグ専用の値検証は parser にありません。未指定なら標準 MoE combine が選ばれます（`src/program/generate.cpp:2490-2492`, `src/program/generate.cpp:3932-3937`, `src/core/layer.cpp:514-529`）。
-- `--native SHARD1` を指定した場合、このフラグも自動的に有効になります。`--native` は複数の native 経路をまとめて有効化する preset です（`src/program/generate.cpp:3232-3267`）。
+値・別引数は不要。オプション状態の初期値は `false` で、指定時に `true` へ設定される。複数回指定しても同じ `true` の代入を繰り返すだけで、専用の重複指定エラーはない（`engine/src/program/generate.cpp:783,3917`）。
+
+未指定時は標準 MoE combine を使う。`--native <model>` を指定した場合は、このフラグを含む native 推論機能群がまとめて有効化されるため、`--native-moe-combine` を別途指定しなくても有効（`engine/src/program/generate.cpp:5155-5164`）。
 
 ## 実行時の動作
 
-- 初期化時にフラグ値を `native_moe_combine_set_enabled` へ渡し、カーネルの有効状態を設定します（`src/program/generate.cpp:3932-3937`, `src/kernels/cuda/native_moe.cu:31-34,150-151`）。
-- 通常の MoE 層では、この状態が有効なら `native_moe_combine`、無効なら既存の `moe_combine` を呼びます。native 側は各 expert の `parts` と、その層の router が作った `weights` を対応させて加重合算し、shared expert 出力を加算します（`src/core/layer.cpp:514-529`）。
-- native カーネルは expert 数 `k` が1〜15、埋め込み幅が正で `int` 範囲内、CUDA stream があることを要求します。出力領域と入力領域の重なり、float 境界に整列していない span も拒否します（`src/kernels/cuda/native_moe.cu:152-175`）。`k=10`、shared 出力あり、幅が4要素単位、parts/shared/output が16-byte 整列の場合は float4 カーネルを使い、それ以外は scalar カーネルを使います（同 `:164-173`）。
-- 複数 token の verify 経路では、native combine が有効で decode batch の token 数が2以上なら multi-token カーネルを使います。verify の expert-hit 加算も融合する経路は、追加で token 数1〜8、`k=10`、幅とアドレスの条件、profiling/remote/shared-gate 条件を満たす必要があります。条件を満たさない場合は通常の hit-add 後に combine する経路へ進みます（`src/core/verify.cpp:2168-2172,2179-2199`; カーネル側条件: `src/kernels/cuda/native_moe.cu:177-205`）。
-- MTP の複数 token 経路でも、フラグが有効なら multi-token combine を呼びます（`src/core/mtp.cpp:1143-1154`）。
-- Strata の Qwen3.6-35B-A3B family switch は GGUF を見て通常 parser より前に `src/qwen35` へ argv 全体を渡します（`src/program/generate.cpp:2393-2408`）。その実装の通常モードでは `--native-moe-combine` を受理せず、unknown option として usage を出し終了コード2を返します。`--serve` モードでは未知の `--` option を警告して無視します（`src/qwen35/q36_engine.cu:3742-3749,3782-3795`）。この family に本オプションの効果は適用されません。
+起動時にフラグ値を `native_moe_combine_set_enabled` へ設定する。通常の層処理では有効時に `native_moe_combine(...)`、無効時に `moe_combine(...)` を呼び、例外を層名付きのエラーへ変換する（`engine/src/program/generate.cpp:6114-6119`; `engine/src/core/layer.cpp:520-529`）。
+
+native カーネルは各出力要素について routed expert の `parts[i] * weights[i]` を合計し、shared 出力があればその値を一度加える。shared は router weight で重み付けされない。通常カーネルは入力 F32 行を読み、出力を書き込む。CUDA 実装には単一トークン用と複数トークン用があり、検証窓の複数行では `dec_batch && n > 1 && native_moe_combine_enabled()` の条件で複数行を一度に処理する（`engine/src/kernels/cuda/native_moe.cu:41-74,203-218`; `engine/src/core/verify.cpp:2956-2959`）。
+
+通常経路では `k`（使用 expert 数）が 1〜15、埋め込み幅が正で `int` の範囲内である必要があり、CUDA 実装は非 null の stream、妥当なアラインメント、出力と入力各 span の非重複も要求する。条件を満たす場合でも、`k` がビルド時の expert 数 `KU` と一致し、shared があり、幅が 4 要素単位で、parts/shared/output が 16 バイト整列しているときに限り、専用の vec4 カーネルへ進む。それ以外は通常カーネルを使う（`engine/src/kernels/cuda/native_moe.cu:35-36,162-185,203-218`）。ヘッダーの契約も単一行の `k` を 1〜15 と定めている（`engine/include/strata/kernels/native_moe.hpp:10-17`）。
 
 ## 適用条件と副作用
 
-- 実際の置換先は CUDA native kernel です。`src/kernels/cuda/native_moe.cu` は CUDA kernel として定義され、CMake の CUDA kernel source 群に含まれます（`CMakeLists.txt:388-400`）。CUDA backend 以外の build でこのフラグを指定した場合の挙動は、この調査ではビルド生成バイナリを実行して確認していません。
-- カーネルは device stream に処理を enqueue し、入力 span・カーネル起動エラーを検査します（`src/kernels/cuda/native_moe.cu:152-175,193-208`）。性能向上は測定していないため断定しません。
-- `--native` preset と併用すると本フラグ単体の指定がなくても有効になります（`src/program/generate.cpp:3263-3267`）。
+- フラグは起動時にグローバルなカーネル選択状態へ設定される。ヘッダーはセッション構築・CUDA graph capture の前に設定するよう定め、既に capture 済みの graph は後からフラグを変更しても選択カーネルが変わらないとしている（`engine/include/strata/kernels/native_moe.hpp:5-8`; `engine/src/program/generate.cpp:6114-6119`）。
+- `--native` プリセットとの相互作用は上記「値と既定値」の通り。このプリセットは `--stream-token` や複数の native 機能も同時に有効化する（`engine/src/program/generate.cpp:5160-5164`）。
+- CUDA の verify 窓では、resident/CPU 側 expert hit の加算をcombineに折り込む専用経路や shared gate をcombine内で処理する経路もある。hit 経路は `k == KU`、shared が存在、幅が4要素単位、該当バッファが16バイト整列、token 数が1〜8（wide buildでは上限16）などの条件で選択され、条件外では通常のhit加算経路へ戻る。shared gate 経路は `STRATA_LFUSE` 等を含む別条件であり、いずれも同フラグ有効が条件の一つ（`engine/src/core/verify.cpp:1522-1524,2859-2861,2934-2959`; `engine/src/kernels/cuda/native_moe.cu:187-201`; `engine/include/strata/kernels/native_moe.hpp:18-35`）。
+- カーネルは指定 stream に CUDA kernel を enqueue し、ソース上でホスト側の明示的なメモリ確保や同期は行わない。実装は一時ファイル等を生成しない（`engine/src/kernels/cuda/native_moe.cu:162-185,203-218`; `engine/include/strata/kernels/native_moe.hpp:10-17`）。
 
 ## 出力とエラー
 
-- このフラグ単独の parser validation、警告、成功時メッセージはありません。カーネルの無効な引数・span は例外になり、通常 MoE 経路では `blk.<layer>.moe_combine: <error>` として呼び出し元へ返されます（`src/kernels/cuda/native_moe.cu:154-163`, `src/core/layer.cpp:523-529`）。verify 経路の例外は `verify combine: <error>` になります（`src/core/verify.cpp:2179-2193`）。
-- CUDA launch の失敗は `cudaGetLastError()` の文言を含む例外になります（`src/kernels/cuda/native_moe.cu:174-175,207-208`）。その後のエンジン全体での表示・終了コードは、この個別 combine 関数の根拠範囲では特定していません。
+parser はこのフラグの値検証を行わない。未知の引数は `unknown argument: ...` を stderr に出し、usage を表示して終了コード 2 で返す。`--native-moe-combine` 自体は現行 parser で認識される（`engine/src/program/generate.cpp:3917,4268-4273`）。
+
+native CUDA 関数は stream・寸法・expert 数・span の条件違反を `std::invalid_argument`、CUDA launch error を `std::runtime_error` として返す（`engine/src/kernels/cuda/native_moe.cu:162-185,203-218`）。通常 MoE 層の呼び出し元は例外文を `blk.<layer>.moe_combine: ...` にして失敗を返す（`engine/src/core/layer.cpp:526-529`）。この調査では実行時の標準出力・終了コードへの伝播を別途実行して確認していない。
 
 ## 根拠
 
-- parser、既定値、ヘルプ、preset、有効状態の設定: `src/program/generate.cpp:445,806-812,847,2490-2492,3232-3267,3932-3937`
-- 通常経路の切替と失敗伝播: `src/core/layer.cpp:514-529`
-- CUDA kernel の選択、入力条件、launch error: `src/kernels/cuda/native_moe.cu:31-64,150-175,177-208`
-- verify/MTP の複数 token 経路: `src/core/verify.cpp:2168-2199`, `src/core/mtp.cpp:1143-1154`
-- Qwen3.6 family への引数委譲と同 family parser: `src/program/generate.cpp:2393-2408`, `src/qwen35/q36_engine.cu:3735-3795`
-- CUDA build への source 登録: `CMakeLists.txt:388-400`
-
-この調査では parser とソース上の呼び出し経路を確認しました。既存バイナリの `--help`、CUDA/HIP のビルド差、実機動作、性能は確認していません。
+- parser、既定値、usage、`--native` による暗黙有効化、起動時設定: `engine/src/program/generate.cpp:783,1208-1214,1244-1250,3914-3918,5155-5164,6114-6119`
+- combine の選択と層エラー変換: `engine/src/core/layer.cpp:520-529`
+- CUDA 算術・入力条件・launch error: `engine/src/kernels/cuda/native_moe.cu:33-38,41-74,162-185,203-218`
+- verify の複数 token/hit 適用条件: `engine/src/core/verify.cpp:1522-1524,2859-2861,2934-2959`
+- API 契約と capture timing: `engine/include/strata/kernels/native_moe.hpp:5-17`

@@ -1,65 +1,64 @@
-# `--vram-reserve-later-mib`
+# `strata`（Strata engine）`--vram-reserve-later-mib`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata`（ネイティブ engine。`src/program/generate.cpp` の引数 parser） |
+| コマンド | `strata`（エンジンのトップレベル引数） |
 | オプション | `--vram-reserve-later-mib` |
 | 別名 | なし |
-| 値 | 整数 MiB。parser は `std::atoi` で変換する |
+| 値 | MiB 単位の整数。parser は `atoi` で変換し、独自の範囲検査をしない |
 
 ## 役割
 
-`--layer-split` でモデルを複数GPUへ層分割したとき、先頭以外の GPU に残す VRAM の基準量を MiB で指定します。ディスプレイを接続していない後段 GPU の余裕を先頭 GPU と別に調整する用途です。ソースコメントは「後段カードの reserve は省略時に先頭と同じ」と説明しています（`src/program/generate.cpp:617-619`）。
+レイヤー分割で使う後段 GPU の空き VRAM 見積もりに、先頭 GPU 用の予約量とは別の基本予約量を指定します。後段 GPU の分割配置や expert cache の利用可能量を見積もるための値で、既定では `--vram-reserve-mib` の値（未指定時 700 MiB）を引き継ぎます。先頭 GPU の予約量はこのオプションでは変わりません（`engine/src/program/generate.cpp:960-970, 6911-6922`）。
 
 ## 使い方
 
 ```sh
-strata --serve --pack /path/to/pack --native /path/to/model.gguf \
-  --layer-split 24 --vram-reserve-mib 300 --vram-reserve-later-mib 1800
+# 後段 GPU ごとに 1200 MiB を基本予約量として扱い、モデルを実行する
+strata --pack /path/to/model --layer-split auto --vram-reserve-later-mib 1200
 ```
 
-この例では、先頭 GPU の予約基準を 300 MiB、後段 GPU の予約基準を 1800 MiB にします。複数の境界で3台以上へ分割する場合も、オプションは一つで、全ての後段 stage に共通して使われます。`--layer-split` は `--serve` を必要とし、`24` のような値は後段 GPU が担当する最初の層番号です（`src/program/generate.cpp:2998-3027`）。
+例の `--pack` と `--layer-split` は実行に必要なモデルと分割設定を示す文脈説明用の引数です。このオプション自体は値を1つ取ります。
 
 ## 値と既定値
 
-- 値は必須です。次の argv 要素がなければ stderr に `<option> needs a value` を出して終了コード 2 で終了します（`src/program/generate.cpp:2418-2420,2572-2573`）。
-- 文字列を `std::atoi` で `int` に変換します。専用の範囲・形式 validation はありません。そのため数値として読めない値は `atoi` の規則で 0 になり、数値の後ろにある非数値部分も検査されません（`src/program/generate.cpp:2572-2573`）。
-- 未指定時の内部値は `-1` です。後段予約の選択時に `-1` を sentinel として扱い、その実行時点の `--vram-reserve-mib` の値を使います。`--vram-reserve-mib` 自体の初期値は 700 MiB ですが、他の起動時調整があるため、常に 700 になるとは限りません（`src/program/generate.cpp:611-619,4566-4570`）。
-- 0 以上の値は後段の予約基準として採用されます。負数はエラーにならず、既定と同様に `--vram-reserve-mib` へ戻ります。複数回指定した場合は parser が順に代入し、最後に読んだ値が残ります（`src/program/generate.cpp:2416-2421,2572-2573,4567-4569`）。
+- 既定値は内部値 `-1` です。後段 GPU で `-1` の場合は `--vram-reserve-mib` の値を使います。同オプションの既定値は 700 MiB です（`engine/src/program/generate.cpp:960-970`）。
+- 数値は `std::atoi` で読み取られます。正の値だけに制限する validation はありません。0 は明示値として有効で、負数は後段計算の条件 `>= 0` を満たさないため、先頭 GPU 用の予約量へフォールバックします（`engine/src/program/generate.cpp:3997-3999, 5870, 6084, 6911-6914`）。
+- 数字として解釈できない文字列は `atoi` の結果 0 になります。そのため独立した「不正な数値」エラーにはならず、0 MiB 指定と同様に扱われます（`engine/src/program/generate.cpp:3998-3999`）。
+- 同じオプションを複数回指定した場合、引数ループで各値を順に代入するため最後の値が残ります（`engine/src/program/generate.cpp:3842-3847, 3998-3999`）。
+- 値を省略すると parser の `next` が標準エラーに `--vram-reserve-later-mib needs a value` を出し、終了コード 2 で終了します（`engine/src/program/generate.cpp:3844-3846, 3998-3999`）。
 
 ## 実行時の動作
 
-後段 GPU の空き容量から、指定された予約基準に加えて、prefill 用領域、window、pipeline window、条件に応じた drafter 用領域を差し引き、expert cache に使える容量を計算します。`--layer-split auto` の候補容量計算と、分割確定後の後段 cache 容量計算の双方でこの値を参照します（`src/program/generate.cpp:4560-4571,4573-4585,6538-6556`）。
+CUDA/HIP のレイヤー分割における配置探索では、後段 stage に限り、この値（非負値の場合）または `--vram-reserve-mib` を基本予約量にします。さらに prompt buffer、window、pipeline window、必要な drafter 等の予約分を加え、その合計を GPU の空き VRAM から差し引いて stage が expert cache に使える容量を見積もります。差し引き結果は 0 未満にならないようにされます（`engine/src/program/generate.cpp:6901-6922`; 計算式: `engine/include/strata/program/stage_reserve.hpp:36-56`）。したがって、この値を増やすと後段 GPU の cache に割り当て可能と見積もられる量は減り、小さくすると増えます。これは見積もり・配置計算への入力であり、指定量の VRAM を別途確保する処理ではありません。
 
-この値は VRAM を直接確保・固定する指定ではありません。後段 GPU に残す空き容量を見積もって expert cache の容量や自動分割の判断に反映し、後段 GPU の起動後メモリ診断にも使います。別途必要な window 等の容量は予約基準に加算されます（`src/program/generate.cpp:4566-4571,11032-11055`）。
+同じ後段予約量は分割後の stage trimming の判定（`engine/src/program/generate.cpp:6074-6092`）や multi-GPU の見積もり表示にも使われます（同:5870-5872）。起動後、後段 CUDA GPU の空きが 512 MiB 未満なら stderr に低空き容量の注意を出し、目安値として「基本予約量 + 768 MiB - 現在の空き量」を表示します。さらに予約・prompt buffer・window 分を用いた計画値との比較を出す経路があります（同:16131-16163）。注意表示は値を自動変更しません。
 
-後段 GPU ごとの起動後空き容量が 512 MiB 未満なら stderr に `LOW` 警告を出し、指定値から算出した参考値とともに `--vram-reserve-later-mib` の追加、または `--max-context` の引き下げを案内します。512 MiB 以上なら GPU 番号と空き容量を stderr に記録します。`cudaMemGetInfo` が失敗した場合、その GPU のこの診断はスキップされます（`src/program/generate.cpp:11032-11055`）。
+SYCL 実装にも同名 parser があり、`atoi` で値を設定します。SYCL の stage 空き容量計算では後段 stage に限り非負の指定値を基本予約量に選び、window 等と合算して空き量から差し引きます（`engine/sycl/src/program/generate.cpp:634-636, 2015-2017, 3896-3918`）。
 
 ## 適用条件と副作用
 
-- 後段 GPU を持つ layer split の容量計算が主な適用先です。layer split がなければ、後段 stage の room 計算・診断は行われません（`src/program/generate.cpp:2998-3030,6538-6544,11032-11041`）。
-- `--layer-split auto` では候補配置の容量・cache 見積もりを変え、選ばれる分割位置や各 GPU の cache 容量に影響し得ます。手動分割でも後段 GPU の expert cache に割り当て可能と見積もる容量に反映します（`src/program/generate.cpp:4573-4585,4680-4704,6538-6556`）。
-- 予約を小さくすると計算上 cache に回せる容量が増えますが、window の初回 graph capture など後から必要になる空き容量を圧迫する可能性があります。ソースは 512 MiB 未満で後段 GPU の window graph に必要な余裕が少ないとして警告します（`src/program/generate.cpp:11001-11010,11032-11055`）。実際の性能改善や安全な推奨値はこのコードからは断定できません。
-- `--vram-reserve-mib` とは別の値を設定でき、指定しなければそちらの値が使われます。複数の後段 GPU を使う構成でも、後段 GPU ごとの個別指定はありません（`src/program/generate.cpp:4567-4569,11036-11055`）。
-- `--native` で Qwen3.6 (`qwen35moe`) を選ぶと、通常 parser より前に専用実装へ委譲されます。その専用 parser は `--serve` を処理済みで serve mode に入っている場合（通常は `--serve` を先に指定した場合）、未対応 option を値とともに無視して警告し、serve mode でなければ usage を出して終了コード 2 にします。このファミリーでは本オプションは後段 GPU 予約を制御しません（`src/program/generate.cpp:2394-2406`; `src/qwen35/q36_engine.cu:3742-3748,3782-3795`）。
+- 主な効果はレイヤー分割時の後段 GPU の見積もりです。単一 GPU では後段 stage がなく、先頭 GPU の予約量を変更しません（`engine/src/program/generate.cpp:6911-6922`）。
+- 予約量の見積もりには、CUDA/HIP の通常経路で後段 GPU 追加割当分（`late_alloc`）も加算される場合があります。これは `later` stage かつ `strata::qwen_defaults_026()` が false の条件です。オプション値そのものはこの加算分を置き換えません（`engine/src/program/generate.cpp:6908-6919`）。
+- stage reserve の計算では後段 GPU の window 96 MiB、prompt buffer、pipeline 用 window、および配置条件に応じた drafter / DFlash2 の分を基本予約量に追加します（`engine/include/strata/program/stage_reserve.hpp:18-50`）。
+- 起動後に空き VRAM が少ない場合、診断文は設定変更の目安を stderr に出しますが、このオプション値を書き換えたり、VRAM の確保を試みたりはしません（`engine/src/program/generate.cpp:16135-16163`）。
+- ソース上の CUDA/HIP 低空き容量診断は後段 CUDA stage を走査します。別 backend やすべての失敗状態で同じ診断が出ることまでは確認できません。
 
 ## 出力とエラー
 
-- 値が欠けた場合: stderr に `--vram-reserve-later-mib needs a value`、終了コード 2（`src/program/generate.cpp:2418-2420,2572-2573`）。
-- 未知 option の一般経路: stderr に `unknown argument: ...` と usage を出し、終了コード 2。ただし上記 Qwen3.6 の serve 委譲経路では未対応 option は警告付きで無視されます（`src/program/generate.cpp:2787-2792`; `src/qwen35/q36_engine.cu:3782-3789`）。
-- 後段 GPU の空き VRAM が 512 MiB 未満の場合の警告は上記「実行時の動作」を参照してください（`src/program/generate.cpp:11036-11055`）。
+値の欠落時は上記のとおり stderr に不足を出して終了コード 2 となります。未知の引数は stderr に `unknown argument: ...` を出し、usage を表示して終了コード 2 です（`engine/src/program/generate.cpp:4268-4274`）。オプション値については数値範囲 validation がないため、範囲外を理由とする専用エラー経路は確認できません。
+
+低空き容量の診断は stderr に出力され、CUDA stage の空き容量取得に失敗した場合はその stage の診断をスキップします（`engine/src/program/generate.cpp:16135-16147`）。実際の GPU allocation failure や他の起動失敗の挙動は、その発生箇所に依存し、このオプション固有のエラーには限定されません。
 
 ## 根拠
 
-- parser と値変換: `src/program/generate.cpp:2416-2421,2571-2573`
-- option の既定値と説明: `src/program/generate.cpp:611-619`
-- 予約量を差し引く容量計算、自動分割: `src/program/generate.cpp:4560-4585,4680-4704`
-- 手動・確定後 split stage の cache 容量見積もり: `src/program/generate.cpp:6538-6556`
-- 後段 GPU の VRAM 診断: `src/program/generate.cpp:11032-11055`
-- Qwen3.6 専用 parser への委譲と未対応 option の扱い: `src/program/generate.cpp:2394-2406`; `src/qwen35/q36_engine.cu:3735-3795`
-- 利用者向け説明（ソース実装の補助資料）: `docs/MULTI_GPU.md:256-258`
-
-調査範囲はこの checkout のソースと同 revision の索引・CLI 文書です。CLI バイナリの `--help`、Release 配布物、各 GPU/backend での実行結果は確認していません。
+- `engine/src/program/generate.cpp:960-970` — 基本予約量の既定値と後段予約値の初期値。
+- `engine/src/program/generate.cpp:3842-3847, 3997-3999` — 引数値の取得、整数変換、未指定値の失敗、および後段予約値の parser。
+- `engine/src/program/generate.cpp:5870-5872, 6074-6092, 6901-6922` — 後段予約値を使う見積もり・stage trim 判定・cache room 計算。
+- `engine/include/strata/program/stage_reserve.hpp:36-56` — 基本予約量に加算する項目と空き量計算。
+- `engine/src/program/generate.cpp:16131-16163` — 起動後の後段 GPU 空き容量診断と比較。
+- `engine/sycl/src/program/generate.cpp:634-636, 2015-2017, 3896-3918` — SYCL parser と stage の基本予約量計算。
+- `engine/src/program/generate.cpp:4268-4274` — 未知引数の stderr・usage・終了コード。

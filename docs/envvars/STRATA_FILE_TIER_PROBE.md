@@ -1,46 +1,49 @@
 # `STRATA_FILE_TIER_PROBE`
 
-調査対象: Strata `main` の HEAD `011c9e600a93bbc9fd451c563501b5831c32bbca`（2026-10-22 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Linux の `--mmap-experts` と resident budget を使う経路で、ページキャッシュに読み戻し対象の半分未満しか置けないと見積もられた場合に行う、起動時の file-tier 速度測定を抑止できます。測定結果は unbuffered read（`O_DIRECT`）と mmap 経由の cached read のどちらを使うか決めるために使われます。この変数は選択を直接指定せず、`0` で測定を無効にするだけです。
+Linux で `--mmap-experts` のファイル tier をページキャッシュ経由にするか、unbuffered read にするか決める際、メモリ上の余裕だけでキャッシュ可能と判定されたケースに限り、両経路の読み取り速度を測る起動時 probe を有効にする。測定結果は `file_tier_prefers_direct` の判定に使われ、モデル計算や expert の選択結果ではなく I/O 経路だけを変える。`STRATA_FILE_TIER_PROBE=0` はこの追加測定を抑止し、従来の room 判定を使う。読み取りと分岐は `engine/src/core/expert_source.cpp:959-1038`、速度判定は `engine/include/strata/platform/memory.hpp:63-78`。
 
 ## 値と判定
 
-| 値 | 測定を抑止するか |
-|---|---|
-| 未設定 | 抑止しない |
-| 空文字 | 抑止しない（先頭文字は `\0` で `0` ではない） |
-| 先頭文字が `0`（例: `0`, `00`, `0abc`） | 抑止する |
-| それ以外（例: `1`, `false`, `abc`, 空白始まり） | 抑止しない |
+`std::getenv` の値の先頭文字が `'0'` かだけを見る。文字列全体の比較、数値変換、空白除去、大文字小文字変換はない。未設定、空文字、先頭が `0` 以外なら probe を許可し、`0` で始まる値は抑止する。したがって `0`、`0anything` は抑止、`1`、`true`、`false`、` 0`、`00` は許可される。設定値の範囲エラーはなく、先頭文字以降は無視される。判定箇所: `engine/src/core/expert_source.cpp:1014-1019`。
 
-値全体の parse、数値変換、大文字小文字変換はありません。読み取り箇所は `getenv()` で、その値の先頭文字だけを比較します。環境変数を読んだ時点で `0` 以外でも、後述の条件が合わなければ測定自体は行いません。
+| 条件 | unset | probe を許可する値の例 | probe を抑止する値の例 |
+|---|---|---|---|
+| Linux の通常の file-tier room 判定 | 許可 | 空文字、`1`、`true`、` 0` | `0`、`0anything` |
+| Linux の `STRATA_HIP_GFX906` 旧 room rule | probe 判定まで到達しない | 該当なし | 該当なし |
+| Windows、SYCL 複製の Linux 経路、その他の OS | この変数を読まない | 該当なし | 該当なし |
 
 ## 有効になる条件
 
-この変数が参照されるのは Linux の `file_tier_unbuffered()` です。さらに以下がすべて成立するときだけ測定の可否に影響します。
-
-- room rule が cached read を選ぶ（`keepable` が真）。
-- `STRATA_FILE_CACHE_OLD_RULE` による旧 room rule が選ばれていない。
-- file tier の読み取り対象が 0 byte より大きい。
-- 利用可能 RAM から RAM copy と 1 GiB の余裕を引いた後の保持可能量が、読み取り対象の半分未満（`held < 0.5`）。
-
-`--mmap-experts` かつ `--resident-budget-gib` がある場合、`FileExpertSource::set_unbuffered()` から起動時の判定に到達します。resident RAM copy 構築後、条件により `recheck_unbuffered()` が再判定します。budget なしの経路ではこの probe に到達しません。Windows は `experts_unbuffered()` を使い、macOS など Linux/Windows 以外では file tier を buffered とするため、この変数を読みません。
+- 対象は `engine/src/core/expert_source.cpp` の Linux 実装。Windows は `experts_unbuffered` に委譲し、SYCL の複製 `engine/sycl/src/core/expert_source.cpp:395-422` にはこの変数も drive probe も実装されていない。Linux の `STRATA_HIP_GFX906` build は既定で旧 room rule を使うため probe に進まないが、`STRATA_FILE_CACHE_OLD_RULE` が設定されていれば先頭文字に基づいて `old_rule` を上書きできる（`engine/src/core/expert_source.cpp:995-1002`）。
+- `--mmap-experts` と resident RAM budget があるとき、初期判定は `FileExpertSource::set_unbuffered` から呼ばれる。`--ssd-experts` は `set_unbuffered(..., force=true)` の強制経路で先に unbuffered を開くため、この変数の判定を通らない（`engine/src/program/generate.cpp:8648-8658`、`engine/src/core/expert_source.cpp:2842-2858`）。resident budget がなく `--ssd-experts` もない場合、room 判定自体が呼ばれない（`engine/src/program/generate.cpp:8651-8674`）。
+- 同じ Linux 判定で、空でない `STRATA_UNBUFFERED_LOAD` は本変数より先に処理される。先頭文字が `0` なら cache、そうでなければ unbuffered を返し、drive probe は行わない（`engine/src/core/expert_source.cpp:963-972`）。
+- probe は room 判定が cache 可 (`keepable`)、旧 rule ではなく、`read_bytes > 0` であり、`held < 0.5` のときだけ候補になる。`held` は `max(avail - arena_bytes - 1 GiB, 0) / read_bytes`。それ以外は本変数に関係なく probe をスキップし、元の room rule の結果を使う（`engine/src/core/expert_source.cpp:995-1033`）。
+- `avail` は Linux の利用可能 RAM で、既定では `STRATA_FILE_TIER_HONEST` が `0` でない場合に host-memory sampler のより小さい値を採用する。この変数は probe の判定条件に間接的に影響する（`engine/src/core/expert_source.cpp:973-987`）。
+- probe 可能なときでも測定不能なら cache を維持する。正常測定時は direct が 4 GB/s 以上で、かつ held が 30% 未満なら cached 経路の 1.3 倍以上、30%以上50%未満なら1.5倍以上の場合だけ unbuffered を選ぶ。それ以外は cache を維持する（`engine/src/core/expert_source.cpp:1022-1032`、`engine/include/strata/platform/memory.hpp:73-78`）。
 
 ## 実行時の詳細
 
-測定は最大サイズのファイル一つを使い、ページキャッシュに載っていないランダムな 1 MiB 領域を direct read（8 thread）と mmap の初回ページ読み込み（3 thread）で読みます。各方式を2 round実行し、各 pass は最大1.5秒です。成功した場合は取得した帯域と保持可能割合から選択し、その説明を file-tier の理由文字列へ加えます。direct read を選ぶには direct 側が 4 GB/s 以上であることが必要で、保持割合が30%未満なら direct が cached の1.3倍以上、30%以上50%未満なら1.5倍以上速い必要があります。基準を満たさなければ file cache を維持します。
+設定値は `file_tier_unbuffered` が呼ばれるたびに読み直され、対象値そのものを保存する static cache はない。通常の初期判定に続き、RAM copy の構築後に Linux で `--mmap-experts` かつ resident budget がある場合、`recheck_unbuffered` が実際に残った RAM copy と file tier のサイズで再判定する。この再判定でも他の条件を満たせば設定値が再評価される。probe の測定結果だけは `file_tier_probe` 内の mutex 保護された static memo に成功・失敗とも保存され、同一プロセスで後から条件を満たしても再測定しない（`engine/src/core/expert_source.cpp:853-858`、`963-1033`、`2867-2903`、`engine/src/program/generate.cpp:12219-12229`）。
 
-測定対象のファイルがない、最大ファイルが小さすぎる、`O_DIRECT` で開けないなど測定できない場合も file cache を維持し、理由に `the drive probe could not run, the file cache stays` を加えます。起動時の選択理由は `strata generate: the file tier reads ...` の stderr ログに出ます。環境変数の判定自体は呼び出しごとに行われ、`static` cache されません。一方、測定結果は mutex 保護された process 内 memo に一度だけ保存されるため、最初の測定が失敗しても同一 process 内では再試行しません。
+probe は最大サイズの expert file 1 個を選び、1 MiB のランダム領域を direct 経路（`O_DIRECT`、8 threads）と mapped page-cache 経路（3 threads）で各2 round測る。各経路の最高転送速度を比較し、既存の page-cache resident 領域を避ける。file が見つからない、ファイルが小さすぎる、open/mmap/mincore/read が失敗する、測定バイト数がゼロなどでは測定失敗となり、cache を選ぶ。測定用 read の deadline は各 pass 1.5 秒（`engine/src/core/expert_source.cpp:845-955`）。
 
-測定はファイルキャッシュを使うページを `madvise(..., MADV_DONTNEED)` と `posix_fadvise(..., POSIX_FADV_DONTNEED)` で解放するよう試みます。測定値やその性能上の有効性はドライブ・負荷に依存します。release note は PCIe 5 の約8 GB/s drive の報告を導入動機として記載し、測定した 1.6–3.1 GB/s の drive では file cache を選び、4 GB/s 超の drive では未検証と明記しています。これらは release note の記載であり、本調査で性能を再測定したものではありません。
+選ばれた経路の設定後、`open_direct` が失敗すれば unbuffered 化に失敗し、呼び出し元では mapped/cache 経路が残る。resident copy の構築後の再判定で cache に切り替わる場合は direct handle を閉じ、逆の場合は direct handle を開く（`engine/src/core/expert_source.cpp:2770-2813`、`2842-2903`）。
+
+## ログと測定値
+
+この変数専用の警告やエラー出力はない。generate 経路は初期判定の結果を `strata generate: the file tier reads %s (%s)` で stderr に出す。probe 成功時は理由文字列に cache が保持できる割合と direct/cached の GB/s、倍率、選択結果が付く。測定失敗時は `; the drive probe could not run, the file cache stays` が付く。RAM copy 構築後の再判定も結果と理由を出力する（`engine/src/program/generate.cpp:8654-8658,12224-12229`）。
+
+`docs/release-notes-0.2.1.md:49` は Linux の probe を説明し、96個の1 MiB片を測る旨や報告された drive の性能差を記録している。現行コードでは各 pass が最大96片を選び、2 round測定する（`engine/src/core/expert_source.cpp:865-867,881-895`）。同じ release note は測定値を特定機種・状態の報告として記しており、ここでは一般的な性能保証として扱わない。`docs/DETAILS.md` の mmap 説明（`docs/DETAILS.md:266`）とも照合したが、この変数の probe 判定条件は同資料には記載されていない。
 
 ## 根拠
 
-- `src/core/expert_source.cpp:747-858` — Linux 専用 probe、サイズ最大ファイルの選択、測定方式・回数・時間制限、process 内 memo。
-- `src/core/expert_source.cpp:861-930` — 環境変数の読み取り、`held` 計算、適用条件、probe 失敗時の fallback、および Windows/Linux/その他 platform 分岐。
-- `src/core/expert_source.cpp:2474-2523` — 起動時 `set_unbuffered()` と RAM copy 後の `recheck_unbuffered()`。
-- `include/strata/platform/memory.hpp:63-78` — direct read の帯域・相対速度の採用基準。
-- `src/program/generate.cpp:5610-5641,8168-8178` — `--mmap-experts` / resident budget の呼び出し箇所と stderr 出力。
-- `docs/release-notes-0.2.1.md:49,93` — 変更の説明、記載された観測と未検証範囲。
+- 候補名の実読み取りと値判定、room 条件、fallback: `engine/src/core/expert_source.cpp:963-1038`
+- Linux probe の測定とプロセス内 memo: `engine/src/core/expert_source.cpp:845-957`
+- 転送速度の threshold: `engine/include/strata/platform/memory.hpp:63-78`
+- 初期適用と `--ssd-experts` 強制経路: `engine/src/core/expert_source.cpp:2842-2858`、`engine/src/program/generate.cpp:8648-8658`
+- RAM copy 後の再判定と結果ログ: `engine/src/core/expert_source.cpp:2867-2903`、`engine/src/program/generate.cpp:12219-12229`
+- SYCL 実装との差: `engine/sycl/src/core/expert_source.cpp:395-422`

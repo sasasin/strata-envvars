@@ -1,49 +1,43 @@
 # `STRATA_UI`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。調査対象リポジトリの状態は `main...origin/main` で、未コミット変更はありません。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-Linux のデスクトップ版で、Strata の画面をアプリ内ウィンドウで表示するか、既定のブラウザーで開くかを選びます。`STRATA_UI=browser` は `--browser` と同じ扱いで、ブラウザー表示を要求します。それ以外の値は通常のウィンドウ表示を選びます。Linux 以外のデスクトップ起動経路ではこの変数を読みません。
-
-ブラウザー表示を選ぶと、Linux supervisor は App Host に `STRATA_UI_MODE=browser` と `STRATA_UI_REASON=chosen` を設定します。ページはブラウザーで開き、タブを閉じてもホストとエンジンは終了しません。アプリ内ウィンドウ専用のアプリ更新機能は使えず、終了には画面の「Quit Strata」または `--quit` を使います（`apps/desktop/src-tauri/src/supervisor.rs:353-388`、`apps/host/server/app-ui.mjs:63-85`）。
+Linux 版デスクトップアプリの起動時に、アプリ window の代わりに既定ブラウザーで App Host のページを開くかを選ぶ。Strata の shell が `browser` を選んだ場合は Host を browser mode として起動し、UI 制御 API 経由でページを開く。`STRATA_UI` はこの mode の選択だけを行い、エンジンやモデル設定は変えない。読み取りは Linux 専用の `main` 分岐にあり、Windows/macOS の埋め込み UI 起動経路では読まれない（`app/desktop/src-tauri/src/main.rs:929-945`、`app/desktop/src-tauri/src/supervisor.rs:43-55,515-550`）。
 
 ## 値と判定
 
-起動時に `std::env::var("STRATA_UI").ok()` で文字列を取得します。値は前後の空白を `trim()` で除き、ASCII 小文字化した後、文字列全体が `browser` と一致する場合だけブラウザー表示になります（`apps/desktop/src-tauri/src/main.rs:869`、`apps/desktop/src-tauri/src/supervisor.rs:43-55`）。
+起動時に `std::env::var("STRATA_UI").ok()` で Unicode 文字列を取得し、その値を `trim()` してから `to_ascii_lowercase()` を適用し、結果が文字列 `browser` と完全一致するか判定する（`app/desktop/src-tauri/src/main.rs:931-935`、`app/desktop/src-tauri/src/supervisor.rs:43-55`）。
 
-| 値 | 判定 |
-|---|---|
-| 未設定 | ウィンドウ表示 |
-| 空文字または空白のみ | ウィンドウ表示 |
-| `browser`（大小文字を問わない） | ブラウザー表示 |
-| 前後に空白を含む `browser` | ブラウザー表示 |
-| `window`、`1`、`true`、`browser-extra` など、正規化後に `browser` と完全一致しない値 | ウィンドウ表示 |
-| Unicode 文字列として取得できない値 | `.ok()` により `None` となり、ウィンドウ表示 |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| Linux デスクトップ shell | window mode（通常のアプリ window） | `browser`、` Browser `、前後に空白を含む `BROWSER` | 空文字、`window`、`1`、`true`、`browser extra` |
+| Windows/macOS 埋め込み UI | この変数は読み取られず、埋め込み window を起動 | 該当なし | 設定値はこの経路では無視される |
 
-無効値への警告やエラーはありません。数値変換や範囲判定もありません。
+大文字小文字は ASCII の範囲で区別されず、前後の Unicode 空白は `trim()` で取り除かれる。中間の空白や余分な文字は許されず、真偽値・数値への変換もない。環境文字列が Unicode として取得できない場合、`.ok()` により未設定と同じ `None` 扱いになる。`--browser` は判定後の `browser` flag を true にするだけなので環境値を上書きして無効化する引数はない（`app/desktop/src-tauri/src/supervisor.rs:43-55`）。
 
 ## 有効になる条件
 
-- `main.rs` の `#[cfg(target_os = "linux")]` ブロック内だけで読み取られ、Linux の supervisor 経路に適用されます。Windows と macOS は `run_embedded()` へ進み、この変数を参照しません（`apps/desktop/src-tauri/src/main.rs:43-44,867-876`）。
-- 起動引数 `--browser` は `browser` フラグを `true` にします。環境変数からすでに `true` になっている場合に、それを戻す CLI 引数はありません。したがって環境変数と CLI のどちらかがブラウザー表示を要求すれば有効です（`apps/desktop/src-tauri/src/supervisor.rs:43-55`）。
-- `--help`、`--save-logs`、`--quit` は `run()` の先行分岐で処理され、通常の新規起動モード選択には進みません。既存セッションが見つかった場合、ブラウザー指定は新しいホストを起動せず、その既存ホストのページをブラウザーで開く要求として使われます（`apps/desktop/src-tauri/src/supervisor.rs:317-339`）。
-- `--window-child` では supervisor を起動せず、ウィンドウプロセスへ進みます。この経路では `STRATA_UI` の判定結果は表示モード選択に使われません（`apps/desktop/src-tauri/src/main.rs:869-874`）。
+- `target_os = "linux"` のデスクトップアプリ起動経路であること。self-test は引数処理より先に終了し、`--window-child` は shell 起動処理を通らない（`app/desktop/src-tauri/src/main.rs:924-945`）。
+- `STRATA_UI` が上表の値であるか、`--browser` を指定すること。どちらも満たさなければ通常は window mode になる（`app/desktop/src-tauri/src/supervisor.rs:43-55,515-555`）。
+- `--help`、`--save-logs`、`--quit` は `run` 内で browser 起動より先に処理されるため、それぞれヘルプ表示、ログ保存、既存 Strata の終了が優先される（`app/desktop/src-tauri/src/supervisor.rs:478-501`）。
+- すでに Strata が起動中の場合、新しい browser 指定は既存セッションの mode を変更しない。browser 指定または既存 session の mode が browser ならページを開き、それ以外では既存 window を前面化する経路になる（`app/desktop/src-tauri/src/supervisor.rs:430-449,499-501`）。
 
 ## 実行時の詳細
 
-環境変数は各 Linux プロセスの起動経路で `parse_args()` に渡され、その呼び出し時に一度判定されます。値をキャッシュする static 変数はなく、同じプロセス内で後から環境を変更して再評価する経路もありません。ウィンドウ子プロセスでは環境変数を再び解析しますが、`--window-child` によって supervisor を迂回します（`apps/desktop/src-tauri/src/main.rs:869-874`）。
+Linux の `main` が引数を解析する時に環境を一度読み、同じ呼び出しで `supervisor::parse_args` に渡す。関数内 cache はなく、この起動プロセスでの後からの環境変更を再評価しない（`app/desktop/src-tauri/src/main.rs:929-935`、`app/desktop/src-tauri/src/supervisor.rs:43-55`）。
 
-新規起動では判定結果から `window` / `browser` の mode を決め、App Host 起動時に `STRATA_UI_MODE` を設定します。ブラウザー指定時だけ `STRATA_UI_REASON=chosen` も設定し、端末とログにブラウザーの URL と終了方法を出して、ホストにブラウザー表示を依頼します（`apps/desktop/src-tauri/src/supervisor.rs:341-388`）。`STRATA_UI` 自体を App Host に渡してはいません。ホスト側は `STRATA_UI_MODE` を読み、UI 状態に `mode=browser`、`canQuit=true`、`appUpdate=unavailable` を反映します（`apps/host/server/app-ui.mjs:63-85`）。
+新しい session では browser mode を `STRATA_UI_MODE=browser` として Host 子プロセスへ渡し、health check 後に session を記録する。続いて端末と desktop log に browser 用の案内文を出し、Host の `/api/control/ui` に `mode: browser` と `open: true` を送る。window mode では代わりに `--window-child` を起動する（`app/desktop/src-tauri/src/supervisor.rs:503-555`）。Host の `createAppUi` は `STRATA_UI_MODE` を読んで UI mode を決める。browser mode では app updater が利用不可とされ、ページを閉じても engine は止まらず、ページの Quit Strata または `--quit` が必要になる（`app/host/server/app-ui.mjs:64-86`、`app/desktop/src-tauri/src/supervisor.rs:58-63`）。
 
-ブラウザー起動に失敗すると、端末に手動で開く URL を案内します。既定のウィンドウ起動を選んだ後でウィンドウプロセスが開始できない、または異常終了した場合もホストは維持され、supervisor がブラウザーへ切り替えて理由を記録し、異常終了メッセージとクラッシュログの案内を出します（`apps/desktop/src-tauri/src/supervisor.rs:182-192,303-313,385-431`）。これらは `STRATA_UI` の値判定エラーではなく、ウィンドウ起動後の fallback です。
+## ログと測定値
+
+browser mode を選んだ場合は `Strata is open in your browser at http://127.0.0.1:<port>/. Closing the tab does not stop Strata: choose Quit Strata in the menu, or run <command> --quit.` を出す（`app/desktop/src-tauri/src/supervisor.rs:75-80,547-550`）。Host から開けたという応答がない場合は `[strata] No browser could be opened. Open http://127.0.0.1:<port>/ in your browser.` を stderr に出す。Host への制御要求自体が失敗した場合は `[strata] could not tell the host to open your browser (<error>). Open http://127.0.0.1:<port>/ in your browser.` を出す（`app/desktop/src-tauri/src/supervisor.rs:178-193`）。この環境変数による性能測定値は該当しない。
 
 ## 根拠
 
-- 唯一の実コード上の `STRATA_UI` 読み取り: `apps/desktop/src-tauri/src/main.rs:867-874`。
-- 値の正規化、CLI フラグ、ヘルプ: `apps/desktop/src-tauri/src/supervisor.rs:43-63`。
-- Linux 限定の supervisor 選択: `apps/desktop/src-tauri/src/main.rs:43-44,865-876`。
-- モード決定、App Host への派生環境変数設定、既存セッションと先行 CLI 分岐: `apps/desktop/src-tauri/src/supervisor.rs:317-388`。
-- ホストでのモード反映: `apps/host/server/app-ui.mjs:63-85`。
-
-候補一覧 `000_envvers.md` にある `STRATA_UI` はこの Linux デスクトップ実装で実際に読み取られています。リポジトリ全体の完全一致検索では、その他の出現はコメント、トラブルシューティング文書、または別名の `STRATA_UI_BASE` / `STRATA_UI_MODE` / `STRATA_UI_PREVIEW` / `STRATA_UI_REASON` でした。外部ライブラリの挙動は対象にしていません。
+- `app/desktop/src-tauri/src/main.rs:929-945` — Linux のみ `STRATA_UI` を読み、self-test と window-child 経路を除いて supervisor を呼ぶ。
+- `app/desktop/src-tauri/src/supervisor.rs:43-55` — 値の trim・ASCII 小文字化・完全一致判定と `--browser` の加算。
+- `app/desktop/src-tauri/src/supervisor.rs:478-555` — help / logs / quit / 既存 session の優先、Host 子プロセスへの mode 伝達と browser 起動。
+- `app/desktop/src-tauri/src/supervisor.rs:75-83,178-193` — browser 起動時の案内文と手動で URL を開くよう求める失敗経路。
+- `app/host/server/app-ui.mjs:64-86` — Host が受け取った `STRATA_UI_MODE` の扱いと UI 状態。

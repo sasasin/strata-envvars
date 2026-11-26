@@ -1,62 +1,56 @@
-# `--max-new`
+# `strata` / `strata-q36` `--max-new`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-engine` |
-| コマンド | `strata` の Qwen3.6 実装（または `strata-q36`） |
+| コマンド | `strata`（Qwen3.6 モデル選択時）または `strata-q36` |
 | オプション | `--max-new` |
-| 別名 | なし。`--n` は別の表記で同じ生成数変数を設定する |
-| 値 | 整数として `std::atoi` で変換 |
+| 別名 | なし。`--n` は同じ生成数変数を設定する別オプション |
+| 値 | 整数。Qwen parser は `std::atoi` で読み取る |
 
 ## 役割
 
-Qwen3.6 の単発トークン生成モードで、出力するトークン数の上限を指定します。モデルが GGUF の `qwen35moe` family なら、`strata` は引数一式を Qwen3.6 実装に渡します。CMake の該当 build では同じ実装を `strata-q36` としても生成します（`src/program/generate.cpp:2393-2407`、`src/qwen35/q36_main.cpp:1-5`、`CMakeLists.txt:790-794`）。
+非 serve の Qwen3.6 推論で生成する token 数を指定します。`strata` は `--model` または `--native` で指定された GGUF の family が Qwen3.6 (`qwen35moe`) なら、通常 engine の処理に入る前に Qwen 専用実装へ引数全体を渡します。単独 executable の `strata-q36` も同じ Qwen parser を使います（`engine/src/program/generate.cpp:3804-3818`、`engine/src/qwen35/q36_main.cpp:1-2`、`engine/src/qwen35/q36_engine.cu:5339-5356`）。
 
 ## 使い方
 
 ```sh
-strata --model ./qwen36.gguf --tokens 1,2,3 --max-new 32
+strata --model model.gguf --tokens 1,2,3 --max-new 32
+strata-q36 --model model.gguf --tokens 1,2,3 --max-new 32
 ```
 
-`--tokens` には prompt の token ID をカンマ区切りで渡します。単体実行ファイルを使う場合も `strata-q36 --model ./qwen36.gguf --tokens 1,2,3 --max-new 32` と指定できます。Qwen3.6 parser は `--model` / `--native`、`--tokens`、`--max-new` を処理します（`src/qwen35/q36_engine.cu:3742-3761`）。
+`--tokens` は token ID のプロンプト例です。実際の GGUF パスと入力 token 列に置き換えてください。
 
 ## 値と既定値
 
-- 省略時は `64` トークンです（`src/qwen35/q36_engine.cu:3735-3738`）。
-- 値は `std::atoi` で整数化され、parser 自体は正数・数値形式の検証をしません（`src/qwen35/q36_engine.cu:3744-3750`）。末尾に値がなければ `strata-q36: --max-new needs a value` を stderr に出して終了コード `2` で終了します（同 `:3744-3746`）。
-- 数値に変換できない文字列は `atoi` の結果 `0` となり、数値以外を含む文字列も数値部分だけが変換対象です。単発生成では `0` 以下の場合に生成ループが実行されません。MTP の単発経路ではループ後に `gen.resize((size_t) n_gen)` を行うため、負数は巨大な size への変換となり、割り当て失敗等の異常終了につながり得ます（同 `:3940-3950`）。
-- `--n` も同じ `n_gen` を設定します。両方を指定した場合は引数列で後に現れた方が残ります（同 `:3750-3760`）。
+- 省略時は `64` token です（`engine/src/qwen35/q36_engine.cu:5342`）。
+- 値は `std::atoi` で整数化されます。別名 `--n` も同じ `n_gen` を設定します。両方、または同一オプションを複数回指定した場合、引数を左から処理するため最後に現れた値が残ります（`engine/src/qwen35/q36_engine.cu:5348-5366`）。
+- 値を省略すると `strata-q36: --max-new needs a value` を stderr に出し、終了コード 2 で終了します（`engine/src/qwen35/q36_engine.cu:5348-5352`）。数値でない値を含む厳密な数値形式の validation はありません。`atoi` が変換できない値は 0 となり、通常の単独生成では生成ループが実行されず空の `gen:` が出ます（`engine/src/qwen35/q36_engine.cu:5356`、`5639-5653`）。
 
 ## 実行時の動作
 
-通常の `--tokens` モードでは、`n_gen` 回のループで greedy token を追加し、`gen: <token id> ...` を stdout に出します。`--max-new` が生成ループの回数を決めます。MTP が有効で、`--force` と `--dump-full-logits` がない場合は speculative 経路に入り、同じ `n_gen` を上限として候補 token を追加します（`src/qwen35/q36_engine.cu:3935-3958`、`3960-3974`）。このモードのループには EOS による早期終了判定がなく、指定数までの token ID を出力します。
+通常の `--tokens` 実行では `n_gen` 回 greedy decode し、生成 token ID を stdout の `gen:` 行に出します。MTP が有効で forced token 列も logits dump もない場合は MTP の speculative loop が同じ上限まで生成します（`engine/src/qwen35/q36_engine.cu:5610-5637`、`5639-5657`）。この parser では `--greedy` も受理されますが、Qwen3.6 の `--tokens` 経路はもともと greedy とされ、`--max-new` は sampling を有効化しません（`engine/src/qwen35/q36_engine.cu:5354-5360`）。
 
-`--force IDS` により強制 token 列が空でない場合、parser で設定した `--max-new` / `--n` は後から `forced.size() + 1` に置き換わります。したがって、この組み合わせでは `--max-new` の値は生成数を決めません（`src/qwen35/q36_engine.cu:3760`、`3916-3918`、`3960-3969`）。
+`--force` で token 列を指定した場合は、その列の長さに 1 を足した値で `n_gen` が上書きされます。従ってこの場合 `--max-new` の指定値は使われません（`engine/src/qwen35/q36_engine.cu:5595-5597`）。
 
-`--serve` モードでは起動時の `n_gen` は使われません。各 `GEN` / `GENI` 要求が独自に `<max_new>` を渡し、serve 実装がその値を検証し、生成上限として使います。要求値が `1` 未満、または prompt token 数との合計が engine context を超える場合は要求を拒否します。serve の通常要求は `T` 行と `DONE` 行、batch 要求は `BT` / `BDONE` 行で結果を返します（同 `:3431-3452`、`:3494-3508`、`:3630-3638`、`:3284-3299`）。
-
-`--bench-pp` / `--bench-tg` の benchmark 分岐は `n_gen` を参照せず、`--bench-tg` の回数を使います（同 `:3889-3914`）。
+`--serve` では engine 起動後の各 `GEN` / `GENI` 要求が独自の `max_new` をプロトコル行で渡し、要求単位で 1 以上かつ prompt と合わせて context 内に収まるか検証します。起動時 `--max-new` の `n_gen` はこの上限を決めません（serve への分岐 `engine/src/qwen35/q36_engine.cu:5561-5562`、要求値の parse・検証 `engine/src/qwen35/q36_engine.cu:5025-5026,5067-5081`）。
 
 ## 適用条件と副作用
 
-- `strata` での適用条件は、`--model` または `--native` が指す GGUF の architecture が `qwen35moe` であり、Qwen3.6 実装を含む build であることです。それ以外は通常 engine parser に進みます（`src/program/generate.cpp:2393-2407`）。
-- `--tokens` の単発生成数に対する明示的な正数チェックや、prompt + `--max-new` が `--max-context` に収まるかの事前検査は、Qwen3.6 parser のこの経路では確認できません。`--max-context` の既定値は `32768` で、engine はその値を `E.init` に渡します（`src/qwen35/q36_engine.cu:3737`、`:3807-3809`、`:3863`）。
-- `--max-new` 自体はファイルや環境変数を書き換えません。生成された token ID を stdout に出し、所要時間等を stderr に報告します（同 `:3951-3957`、`:3972-3977`）。
+- `strata` の Qwen parser へ切り替わるのは、モデル指定から GGUF architecture が `qwen35moe` と判定された場合です。Qwen3.6 以外のモデルではこの `qwen36` scope の parser は使われません（`engine/src/program/generate.cpp:3804-3818`）。
+- Qwen parser は `--max-new` の正数検証を行いません。0 以下では通常の token 生成ループは動きません。負数と MTP 有効・forced 列なしの組合せでは、speculative loop 後の `gen.resize((size_t)n_gen)` に負数が `size_t` として渡されます。正常な生成上限として使える値ではなく、例外等で異常終了する可能性があります（`engine/src/qwen35/q36_engine.cu:5614-5629`）。
+- 生成経路で context を使い、serve 要求では prompt と `max_new` の合計が `E.ctx` を超える要求を拒否します。単独 `--tokens` 経路の `--max-new` と context 容量との境界について、parser 直後の同等な明示 validation は確認できませんでした。内部処理が許容する境界の詳細は本調査範囲では確定できません。
+- ファイル出力の副作用はこのオプション自体にはありません。別オプション `--dump-full-logits` は単独生成の出力先を開きますが、その設定は本書の対象外です。
 
 ## 出力とエラー
 
-- 成功時、token ID 列は `gen:` を先頭に stdout へ出力し、生成数と所要時間等は stderr に出力します（`src/qwen35/q36_engine.cu:3951-3957`、`:3972-3977`）。
-- 値の欠落は前述の通り終了コード `2` です。`--model` の欠落も終了コード `2` でエラーになります（同 `:3744-3746`、`:3797`）。
-- `--serve` の要求単位では、`max_new < 1` は stdout の `ERR bad request: max_new or the ids` で拒否され、context 超過は `ERR prompt ... exceeds the context ...` で拒否されます。これらは要求エラーであり、起動時 `--max-new` の validation ではありません（同 `:3494-3508`）。
+値の不足は stderr と終了コード 2 になります。`--max-new` 固有の範囲エラーや警告は parser にありません。通常生成の生成 ID 列は stdout、生成数や時間の要約は stderr に出ます（`engine/src/qwen35/q36_engine.cu:5350-5352,5651-5657`）。serve の不正な要求は `ERR ...` 行を stdout に返し、engine 起動時の `--max-new` はこれらの要求上限を変更しません（`engine/src/qwen35/q36_engine.cu:5067-5081`）。
 
 ## 根拠
 
-- parser、既定値、変換と同一変数の `--n`: `src/qwen35/q36_engine.cu:3735-3760`
-- 単発生成数の上書き、MTP / 通常生成、標準出力と統計: `src/qwen35/q36_engine.cu:3916-3977`
-- serve の要求単位上限、validation、生成停止条件: `src/qwen35/q36_engine.cu:3431-3508`、`:3625-3638`
-- `strata` から family 固有実装への振り分け: `src/program/generate.cpp:2393-2407`
-- 独立 executable の entry point と build target: `src/qwen35/q36_main.cpp:1-5`、`CMakeLists.txt:790-794`
-
-調査範囲は上記 commit のソースです。同一 revision の既存バイナリによる `--help` や Release 配布物は確認していません。値変換はソースの `std::atoi` と実際の使用箇所に基づき記載しました。
+- `engine/src/program/generate.cpp:3804-3818` — GGUF family による Qwen 専用 parser への dispatch。
+- `engine/src/qwen35/q36_engine.cu:5342-5366` — 既定値、値変換、`--n` との共有。
+- `engine/src/qwen35/q36_engine.cu:5595-5657` — forced token による上書き、通常生成・MTP の上限と出力。
+- `engine/src/qwen35/q36_engine.cu:5025-5081` — serve protocol の要求ごとの上限と context validation。

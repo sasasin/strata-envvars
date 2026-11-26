@@ -1,42 +1,47 @@
 # `STRATA_GROUP_COPY`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-prompt prefill の MoE expert grouping 用配列について、GPU から通常の host vector へ読み戻して処理後に GPU へ書き戻す経路を使うか、mapped/pinned host memory とその device alias を使うかを切り替える A/B 用の変数です。先頭文字が `1` のとき mapped buffer の確保を抑え、通常の host vector と明示的な転送を使わせます。ルーティング結果や grouping の計算内容を変更するものではありません。
+MoE prompt prefill の host grouping で使う routing table（`ids`、`slot`、`src`、group bounds）の置き方を選ぶ。mapped pinned host memory を作れた場合はそこで host が表を作り、device alias から読む経路を使う。copy 側では通常の host vector で表を作り、device へ転送する。対象は `Prefill::init` と `Prefill::run_impl` の CUDA/HIP 実装、および SYCL 実装である（`engine/src/prefill/prefill.cpp:2443-2456,2570-2593`、`engine/sycl/src/prefill/prefill.cpp:1389-1403,1507-1546`）。
+
+CUDA/HIP と SYCL では既定値と値判定が異なる。Metal の `Prefill::init` は `STRATA_GPU_METAL` 分岐で早期 return し、この変数を読む箇所に進まない（`engine/src/prefill/prefill.cpp:2449-2454`）。
 
 ## 値と判定
 
-CUDA と SYCL の両実装で `getenv()` の結果の先頭文字だけを `gc[0] == '1'` と比較します。文字列全体の parse は行いません。
+どちらの実装も `std::getenv` の結果の先頭文字だけを見る。文字列全体の parse、空白除去、大文字小文字変換、数値範囲検査はしない（`engine/src/prefill/prefill.cpp:2576-2577`、`engine/sycl/src/prefill/prefill.cpp:1513-1515`）。
 
-| 値 | buffer の確保判定 |
-|---|---|
-| unset、空文字、先頭が `1` 以外 | `grp_n < need` なら mapped/pinned buffer の確保を試みる（既定動作） |
-| 先頭文字が `1` | `grp_n < need` でも新たな mapped/pinned buffer を確保しない |
+| 実装 | unset | mapped allocation を選ぶ値の例 | mapped allocation を選ばない値の例 |
+| --- | --- | --- | --- |
+| CUDA/HIP | mapped allocation を試みる | `0`、`0anything`、空文字、`true`、`2`、` 1` | 先頭が `1` の値（`1`、`10`、`1anything`） |
+| SYCL | copy 側を選ぶ | 先頭が `0` の値（`0`、`0anything`） | 空文字、`1`、`true`、`2`、` 0` |
 
-したがって `1`, `10`, `1anything` は同じ分岐です。`true`, `0`, 空文字は mapped buffer を抑止しません。`need` 以上の buffer がすでにある場合は確保判定自体に入らず、その既存 buffer を引き続き使います。そのため、設定値は `Prefill::init()` の呼び出しごとに読み直されますが、既に確保された十分な buffer を `1` で解除する動作ではありません。
+表は allocation を試みるかの判定であり、mapped memory の利用を保証しない。既存の `grp_n` が今回必要な大きさ以上なら allocation 判定部分を通らず、保持中の `grp_host` の有無で実行経路が決まる。そのため、より大きな mapped allocation がすでに保持されている場合、後の初期化で copy 側の値を指定しても mapped 経路が残り得る（CUDA/HIP: `engine/src/prefill/prefill.cpp:2577-2588`、SYCL: `engine/sycl/src/prefill/prefill.cpp:1515-1538`）。
 
 ## 有効になる条件
 
-- CUDA または SYCL の prompt prefill 実装で参照されます。確認した読み取り箇所は CUDA の `src/prefill/prefill.cpp` と SYCL の `sycl/src/prefill/prefill.cpp` です。
-- mapped buffer が実際に使われるのは、確保に成功して `grp_host != nullptr` となった場合です。CUDA は `cudaHostAllocMapped` と `cudaHostGetDevicePointer`、SYCL は `sycl::malloc_host` を使います。
-- `STRATA_TEST_PAGEABLE` の先頭文字が `1` なら `force_pageable()` が true となり、この buffer の確保を試みません。確保 API が失敗した場合も通常のコピー経路へ進みます。
-- 環境変数を読むのは `Prefill::init()` 内の容量確認時です。値が先頭 `1` で、過去により小さい mapped buffer が確保済みの状態から、より大きな `need` で再初期化すると、コードは再確保を行わず既存 pointer を残します。この場合の容量不足を回避する分岐は見当たりません。通常は初期化前に設定する値として扱う必要があります。
-- GPU 上で grouping を行う fused path では、同じ host grouping buffer の分岐を通りません。host で token/expert の組を group 化する分岐に入った場合に影響します。
+- MoE prompt prefill が `Prefill::run_impl` の host grouping 側に進むと、`m.grp_host != nullptr` で mapped 経路を選ぶ。fused expert path 側ではこの host grouping 分岐を通らない（CUDA/HIP: `engine/src/prefill/prefill.cpp:5862-5875`、SYCL: `engine/sycl/src/prefill/prefill.cpp:4041-4050`）。
+- mapped 経路には `STRATA_TEST_PAGEABLE` が無効であることと、backend の host allocation / device alias 作成の成功が必要。`force_pageable()` は同変数の先頭文字が `1` の場合に true となる static cache である（CUDA/HIP: `engine/src/prefill/prefill.cpp:361-364,2581-2592`、SYCL: `engine/sycl/src/prefill/prefill.cpp:206-209,1519-1545`）。
+- allocation が禁止または失敗した場合、`grp_host` は設定されず copy 経路に進む。ここでは `STRATA_GROUP_COPY` による別の警告やエラーは出さない（同上）。
+- CLI 引数や設定ファイルからこの変数を上書きする処理は、候補名の全参照と該当 helper の追跡範囲では見つからなかった。優先関係が確認できる別設定は `STRATA_TEST_PAGEABLE` のみ。
 
 ## 実行時の詳細
 
-`need` は `3 * T * K + 2 * (n_expert + n_expert / MMQ_GROUP + 2)` 個の `int32_t` で計算されます。mapped buffer が使える場合、`ids`, `slot`, `src` を mapped host memory 上で読み書きし、GPU routing 結果の読み戻しと slot/src の書き戻しには device alias を使います。MMQ を使うときは grouping bounds も同じ領域に置いて alias 側へ転送します。
+変数は `Prefill::init` が grouping table 用領域を準備するたびに読み取られる。`STRATA_GROUP_COPY` 自体の関数 static cache はない。必要サイズ `need` は chunk の `T*K`、expert 数、CUDA/HIP では `ws::mode()` による weight-stationary 領域を含み、SYCL では `MMQ_GROUP` に基づく bounds 領域を含む（CUDA/HIP: `engine/src/prefill/prefill.cpp:2570-2588`、SYCL: `engine/sycl/src/prefill/prefill.cpp:1507-1538`）。
 
-mapped buffer がない場合、`ids` は device から通常の host vector に読み戻し、処理後の `slot` と `src`、MMQ の bounds は host から device buffer へコピーします。このため変数名の通り、先頭 `1` は mapped 経路の A/B 対照となるコピー経路を選びます。prefill の routing/grouping 手順自体は両経路で共通です。環境変数専用のログやエラー文は確認できません。
+mapped 経路では CUDA/HIP は `cudaHostAlloc` と `cudaHostGetDevicePointer`、SYCL は `sycl::malloc_host` を試みる。host grouping では routed ids を mapped 領域へ置き、`slot`、`src` と bounds も同じ領域に書いて device 側へ反映する。copy 経路では通常の host vectors を使い、CUDA/HIP は routed ids を同期 download してから routing tables / bounds を upload する。SYCL は `m.cs` から ids を host vector に移し、`slot`、`src`、bounds を device buffer に memcpy する（CUDA/HIP: `engine/src/prefill/prefill.cpp:5867-5874,6170-6177,6529-6536`、SYCL: `engine/sycl/src/prefill/prefill.cpp:4046-4059,4198-4221,4240-4254`）。
 
-SYCL 実装は CUDA 実装と同じ先頭文字判定・容量条件を持ち、確保できなかった場合も通常の host vector と queue memcpy を使います。
+未設定・無効値時に CLI 優先順位や fallback 数値はなく、上記 backend ごとの先頭文字判定が直接使われる。copy 経路の CUDA/HIP download/upload 失敗は `err` に理由を設定して `run_impl` を失敗させる（`engine/src/prefill/prefill.cpp:5871-5874,6173-6177,6533-6536`）。SYCL の該当 memcpy 箇所にはこの変数専用のエラー処理はない。
+
+## ログと測定値
+
+この変数を読んだ結果を示す専用ログはない。CUDA/HIP 側の copy 失敗は上記のとおり `err` に記録される。ソースコメントには prefill 時間などの測定値があるが、同コメントだけでは測定環境や条件を十分に特定できないため、ここでは性能値として記載しない（`engine/src/prefill/prefill.cpp:1647-1653`、`engine/sycl/src/prefill/prefill.cpp:846-852,1509-1512`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:1132-1152` — 値判定、必要容量、CUDA mapped/pinned buffer の確保と失敗時の fallback。
-- `src/prefill/prefill.cpp:3045-3055, 3270-3276, 3345-3360` — host-grouped path での ids 読み戻し、slot/src/bounds の mapped 経路とコピー経路。
-- `sycl/src/prefill/prefill.cpp:1018-1054` — SYCL の同じ値判定と host allocation。
-- `sycl/src/prefill/prefill.cpp:3310-3328, 3411-3424, 3445-3467` — SYCL host-grouped path の mapped 経路と memcpy fallback。
-- `src/prefill/prefill.cpp:3260-3261` — fused path では GPU 上で grouping し、host-grouped 分岐を通らないこと。
+- `engine/src/prefill/prefill.cpp:2443-2456,2570-2595` — CUDA/HIP `Prefill::init`、値判定、mapped allocation と fallback。
+- `engine/src/prefill/prefill.cpp:361-364` — `STRATA_TEST_PAGEABLE` の読み取りと cache。
+- `engine/src/prefill/prefill.cpp:5862-5875,6170-6177,6529-6536` — host grouping、ids download、routing table / bounds の転送とエラー。
+- `engine/sycl/src/prefill/prefill.cpp:1389-1403,1507-1546` — SYCL `Prefill::init`、値判定、mapped allocation と fallback。
+- `engine/sycl/src/prefill/prefill.cpp:206-209,4041-4065,4198-4221,4240-4254` — pageable 条件、host grouping と table 転送。

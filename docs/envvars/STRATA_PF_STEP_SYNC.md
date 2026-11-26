@@ -1,45 +1,42 @@
 # `STRATA_PF_STEP_SYNC`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-バッチ型 prompt 処理中に GPU の compute stream と copy stream を特定の区間ごとに同期し、遅い区間や停止した区間をログ上で絞り込む診断用フックです。CUDA/HIP 共通ソースと SYCL ソースにそれぞれ実装があります。通常の処理に同期点を加えるため、prompt 処理は遅くなります。ソースコメントでは処理する byte 数は同じとされています。
+プロンプトを読む CUDA/HIP または SYCL の通常の chunk-major prefill 経路で、指定された GPU 処理の後に compute stream と copy stream の完了を待ちます。GPU 処理を細かい境界で同期し、250 ms 超の step と同期エラーをログに出す診断用スイッチです。同期の追加で処理は遅くなり得ます。コードコメントはデータ量は同じとしていますが、この変数が生成結果の同一性を独立に検証するものではありません。CUDA/HIP 実装は `Prefill::run_impl`、SYCL 実装は同名の prefill 処理にあります（`engine/src/prefill/prefill.cpp:4956-4969`; `engine/sycl/src/prefill/prefill.cpp:3334-3364`）。
 
 ## 値と判定
 
-| 環境変数の状態 | 動作 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（設定値の先頭文字が `\0`） |
-| 先頭文字が `1` | 有効。`1`, `10`, `1anything` などを含む |
-| それ以外 | 無効。`true`, `0`, `2`, 空白で始まる値など |
+両実装とも `std::getenv` の結果が非 null で、かつ `e[0] == '1'` の場合だけ有効です。文字列全体は parse しません。未設定・空文字・先頭が `1` 以外なら無効、先頭が `1` なら後続文字にかかわらず有効です。空白除去、大文字小文字変換、数値としての妥当性検査、範囲検査はありません（`engine/src/prefill/prefill.cpp:4959`; `engine/sycl/src/prefill/prefill.cpp:3337`）。
 
-数値変換や文字列全体の比較は行いません。大文字小文字や後続文字も判定しません。各実装の関数内 `static const bool` に結果が保存され、初回にこの判定行へ到達した後は同じプロセス内で環境を変更しても再評価されません。判定行に到達するのは後述のバッチ型 prompt 経路です。
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| CUDA/HIP の `engine/src` 実装、SYCL の `engine/sycl` 実装 | 無効 | `1`, `10`, `1anything` | 空文字, `0`, `0anything`, `true`, `false`, ` 1` |
+
+CLI 引数による上書きや数値境界はありません。サーバー起動時は `child_env` が親環境を複製した後、run config の `env` を文字列化して子エンジン環境に設定するため、同じ名前を config に書けば親環境の値を置き換えます（`terminal/serve/server.py:4007-4028`）。
 
 ## 有効になる条件
 
-`Prefill::run` のチャンク処理がバッチ型に選ばれる必要があります。CUDA/HIP ソースでは、layer split からの `hand_in_` がなく、device token buffer があり、native embedding または対応形式の token embedding を使い、チャンクに画像などの embedding row がなく、各 token id が有効な場合にバッチ型になります。条件を満たさないチャンクは per-token 経路へ切り替わります。この場合、この変数による追加同期・診断は通りません。
-
-変数が有効でも、レイヤー間の診断同期は最初の layer では行われず、前の layer があるときだけ行われます。K/V の追加診断同期は K/V streaming の `staged` が有効なときだけです。したがって、変数を設定しただけで全 GPU 処理を同期するものではありません。
+- 対象バックエンドの Strata 所有 prefill 実装を使うこと。`engine/src/prefill/prefill.cpp` に CUDA/HIP 側、`engine/sycl/src/prefill/prefill.cpp` に SYCL 側の読み取りがあります。対象箇所は Metal 専用の早期 return より後にある CUDA/HIP `Prefill::run` の chunk-major 経路にあります（`engine/src/prefill/prefill.cpp:9629-9650`, `engine/src/prefill/prefill.cpp:9705-9708`）。
+- CUDA/HIP では、`Prefill::run` が `STRATA_PREFILL_LAYER_MAJOR` 等の判定で layer-major 経路を選んだ場合、`run_layer_major` を実行して戻るため、この `run_impl` 内のスイッチは評価されません。layer-major が無効またはその prompt で準備できない場合に `run_impl` へ進みます（`engine/src/prefill/prefill.cpp:9657-9705`）。
+- 環境値が有効でも、同期地点はループ内の該当 step に限られます。各 layer の先頭で前 layer の処理を待つ地点は `l > LB` の場合だけです。K/V の RAM staging と K/V append 後の追加待ちは、KV 状態が staged (`st.kv_mode == 1`) のときだけです（`engine/src/prefill/prefill.cpp:4994`, `engine/src/prefill/prefill.cpp:5250-5264`, `engine/src/prefill/prefill.cpp:5303-5308`; SYCL: `engine/sycl/src/prefill/prefill.cpp:3370`, `engine/sycl/src/prefill/prefill.cpp:3580-3594`, `engine/sycl/src/prefill/prefill.cpp:3633-3638`）。
+- Strata の `--prefill` 等がどの prompt 経路を選ぶかは別の設定で決まります。この変数自身は経路を選択せず、選ばれた chunk-major 経路内の待ちと診断だけを変えます。
 
 ## 実行時の詳細
 
-バッチ型チャンクの処理中、対象ステップの開始前に `core::progress_at` で進捗位置を更新し、その後 compute stream と copy stream の完了を待ちます。同期対象は次のとおりです。
+`step_sync` は `run_impl` 内の関数ローカル `static const bool` です。環境を読むのはその初回初期化時だけで、以後同じプロセスでは環境を変更しても値は更新されません。初回判定が false なら各 step の lambda は直ちに戻ります（`engine/src/prefill/prefill.cpp:4959-4962`; `engine/sycl/src/prefill/prefill.cpp:3337-3342`）。
 
-- layer の先頭（最初の layer を除く）: 前 layer の expert 処理と残りの処理。
-- K/V streaming が staged の場合: RAM からの K/V staging 後、および K/V append 後。
+有効時、各対象地点で `core::progress_at` に step 名と layer を渡してから、CUDA/HIP は `m.cs` と `m.copy` に `cudaStreamSynchronize`、SYCL は対応する `wait()` を順に実行します。通常の layer 境界では前 layer の experts と残りの処理を待ち、staged KV 経路では RAM からの KV staging と KV append もそれぞれ待ちます（`engine/src/prefill/prefill.cpp:4960-4969`, `engine/src/prefill/prefill.cpp:4994`, `engine/src/prefill/prefill.cpp:5263`, `engine/src/prefill/prefill.cpp:5308`; `engine/sycl/src/prefill/prefill.cpp:3338-3364`, `engine/sycl/src/prefill/prefill.cpp:3370`, `engine/sycl/src/prefill/prefill.cpp:3594`, `engine/sycl/src/prefill/prefill.cpp:3638`）。
 
-CUDA/HIP 経路は同期にかかった時間が 250 ms を超えた場合、またはいずれかの同期 API がエラーを返した場合に、stderr へ `strata pf-step: chunk from token ..., layer ...: ... took ... ms (... / ...)` を出します。API エラー時もこの箇所では戻り値をエラーにせず、ログ後に処理を続けます。SYCL 経路も 250 ms 超またはエラー状態で同じ `strata pf-step:` 形式を出しますが、wait 中に `sycl::exception` が発生すると例外内容とソース位置を stderr に出して `exit(1)` します。
+CUDA/HIP はいずれかの待ちが 250 ms を超えるか同期 API がエラーを返すと、次の形式を stderr に出します: `strata pf-step: chunk from token %lld, layer %lld: %s took %.0f ms (%s / %s)`。250 ms 以下かつ両方成功ならこの行は出しません。同期 API の返り値を prefill の `err` に変換して即時終了する処理はこの lambda にはなく、主に step の特定と所要時間・エラー文字列の記録を行います（`engine/src/prefill/prefill.cpp:4964-4969`）。同期が戻らない stall では lambda 内のログ行まで到達できませんが、step 名は `progress_at` に渡されています（同 `:4962`）。
 
-`docs/TROUBLESHOOTING.md` は Windows AMD の prompt 中の GPU hang を調べる手順として、サーバー設定 JSON の `env` に `"STRATA_PF_STEP_SYNC": "1"` を加え再起動する方法を案内しています。そこで説明される「250 ms を超えた step のログ」と速度低下は実装と一致します。
+SYCL は 250 ms 超または wait のエラーコードが非ゼロのとき、同じ `strata pf-step: ...` 形式を stderr に出します。同期中に `sycl::exception` が送出されると `exc.what()` と file/line を stderr に出し、`std::exit(1)` します（`engine/sycl/src/prefill/prefill.cpp:3341-3364`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:2156-2170` — CUDA/HIP 経路でのバッチ型判定。
-- `src/prefill/prefill.cpp:2484-2502` — 環境変数の判定、キャッシュ、CUDA/HIP の同期・ログ、layer 間呼び出し。
-- `src/prefill/prefill.cpp:2673-2689,2727-2732` — staged K/V の前後で行う診断同期。
-- `sycl/src/prefill/prefill.cpp:2708-2747,2930-2946,2985-2990` — SYCL の判定、同期・例外処理、呼び出し箇所。
-- `CMakeLists.txt:585-592` — CUDA/HIP 用 `strata_prefill` に `src/prefill/prefill.cpp` を含める。
-- `sycl/CMakeLists.txt:232-239` — SYCL 用 `strata_prefill` に SYCL 側 prefill ソースを含める。
-- `docs/TROUBLESHOOTING.md:155-168` — 診断設定の案内と目的。
+- `engine/src/prefill/prefill.cpp:4956-4969` — CUDA/HIP 側の値判定、同期、閾値ログ。
+- `engine/src/prefill/prefill.cpp:4994-4995`, `engine/src/prefill/prefill.cpp:5250-5264`, `engine/src/prefill/prefill.cpp:5303-5308` — 同期を呼ぶ layer / KV staging / KV append の位置と条件。
+- `engine/sycl/src/prefill/prefill.cpp:3334-3364`, `engine/sycl/src/prefill/prefill.cpp:3370`, `engine/sycl/src/prefill/prefill.cpp:3580-3594`, `engine/sycl/src/prefill/prefill.cpp:3633-3638` — SYCL 側の同等処理と例外終了。
+- `engine/src/prefill/prefill.cpp:9629-9650`, `engine/src/prefill/prefill.cpp:9657-9708` — Metal の早期 return、CUDA/HIP の layer-major 選択と `run_impl` への分岐。
+- `terminal/serve/server.py:4007-4028` — サーバーが run config の `env` を子エンジン環境へ反映する処理。

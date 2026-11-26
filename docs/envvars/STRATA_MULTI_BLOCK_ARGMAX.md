@@ -1,47 +1,53 @@
 # `STRATA_MULTI_BLOCK_ARGMAX`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-13 時点）。外部ライブラリの環境変数は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA と同梱 SYCL backend の head 処理で、複数 block に分ける argmax / top probability kernel を使うかを制御します。対象コードでは `multi_block_head_ops()` がこの設定を返し、MTP の候補 token 確率計算を 8 block の `row_top_prob_split()` に切り替えます。また、CUDA device の compute capability major が 8 の場合、speculative verify と MTP の greedy argmax を複数 block の `argmax_rows()` に切り替えます。
+GPU head 処理で、語彙 logits の argmax や選択 token の確率計算を複数ブロックで処理する機能を許可・抑止する。主な適用先は CUDA/HIP/SYCL の MTP draft token 選択で、`argmax_rows_wanted()` が真になる実行経路では verifier と drafter の greedy argmax にも関係する。CPU 処理や通常のサンプリング設定を直接変更する変数ではない。読み取り関数は CUDA/HIP 実装と SYCL 実装にそれぞれある（`engine/src/kernels/cuda/verify_kernels.cu:1080-1102`、`engine/sycl/src/kernels/cuda/verify_kernels.dp.cpp:1886-1896`）。
 
 ## 値と判定
 
-値全体を真偽値として parse するのではなく、`std::atoi()` の結果が 0 かどうかで判定します。
+両実装とも `std::getenv` の結果を `std::atoi` に渡し、文字列全体の妥当性検査はしない。数値変換結果が 0 なら無効、0 以外なら有効。`atoi` は先頭の空白と符号を許し、先頭の整数部分を読み、後続の非数字を無視する。数値変換できない文字列は 0 になる。したがって `1`、`-1`、`1junk`、` 1` は有効、`0`、`0junk`、空文字、`true`、`false` は無効。大文字小文字の比較はない。`atoi` の後に clamp や範囲検査はない。
 
-| 値 | `multi_block_head_ops()` |
-|---|---|
-| unset | 有効 |
-| 数値変換結果が 0（空文字、`0`、`false`、数字で始まらない文字列など） | 無効 |
-| 数値変換結果が 0 以外（例: `1`, `-1`, `2`, `1tail`） | 有効 |
+| ビルド・経路 | unset | 設定時に有効 | 設定時に無効 |
+|---|---|---|---|
+| CUDA（`STRATA_HIP_GFX906` なし） | 有効 | `atoi(value) != 0` | `atoi(value) == 0` |
+| HIP（`STRATA_HIP_GFX906` なし） | `gfx12` 以外では無効、`gfx12` では有効 | `gfx12` で `atoi(value) != 0` | 全 arch で `atoi(value) == 0` |
+| HIP（`STRATA_HIP_GFX906` 定義） | 常に無効。環境変数を読まない | なし | 常に無効 |
+| SYCL（`__HIPCC__` なし） | 有効 | `atoi(value) != 0` | `atoi(value) == 0` |
+| SYCL（`__HIPCC__` 定義） | 常に無効。環境変数を読まない | なし | 常に無効 |
 
-`atoi` は先頭空白と符号を許し、数字列の後ろは判定に使いません。したがって `0tail` は無効、`1tail` は有効です。値の大文字小文字自体は解釈されません。数値変換できない文字列と空文字は 0 として扱われます。
-
-判定値は `multi_block_head_ops()` 内の `static const bool` に保存されます。最初の呼び出し後にプロセス環境を変更しても再評価されません。CUDA と SYCL の実装で既定値と parse は同じです（`src/kernels/cuda/verify_kernels.cu:879-889`、`sycl/src/kernels/cuda/verify_kernels.dp.cpp:1571-1581`）。
+CUDA/HIP 側の HIP gfx12 判定は、`cudaGetDevice` と `cudaGetDeviceProperties` が成功し、デバイス番号が 0–63 の範囲である場合に行う。デバイスごとの arch 判定は `static arch[64]` に保持する（`engine/src/kernels/cuda/verify_kernels.cu:1080-1102`）。SYCL 実装は `__HIPCC__` の場合を除き、値だけで許可を判定する（`engine/sycl/src/kernels/cuda/verify_kernels.dp.cpp:1886-1896`）。
 
 ## 有効になる条件
 
-- HIP (`__HIPCC__`) では `multi_block_head_ops()` と `argmax_rows_wanted()` が常に `false` を返し、この設定は使われません。HIP は一 block の `row_top_prob()` と既存の greedy sampler 経路を使います。
-- CUDA/SYCL では、値が有効なら MTP の各 head-logit row に対する top probability 計算に `row_top_prob_split()` を使います。無効なら同じ呼び出し元が `row_top_prob()` を使います（`src/core/mtp.cpp:993-1003`、`sycl/src/core/mtp.cpp:1136-1146`）。
-- greedy argmax の `argmax_rows()` 切り替えはさらに device の compute capability major が 8（SM 8.0–8.9）であることが必要です。device 情報取得に失敗した場合、または他の世代の場合は `argmax_rows_wanted()` が false になり、呼び出し元は `sample_tokens()` を使います（`src/kernels/cuda/verify_kernels.cu:891-904`、`sycl/src/kernels/cuda/verify_kernels.dp.cpp:1583-1597`）。
-- MTP では coupled draft sampling の分岐に入ると、greedy argmax と top probability の処理より前に関数を終了します。その経路ではこれらの切り替えは実行されません（`src/core/mtp.cpp:981-992`、SYCL: `sycl/src/core/mtp.cpp:1129-1135`）。
+- CUDA/HIP または SYCL の GPU kernel 実装が使われる必要がある。CPU 経路からこの判定関数を使う呼び出しは確認できない。
+- CUDA では unset が許可扱いで、明示的な 0 相当だけが抑止する。HIP は許可判定の後に arch 条件が加わり、`STRATA_HIP_GFX906` ビルドでは常に無効。
+- HIP の `gfx12` 判定はデバイスごとにキャッシュされる。`cudaGetDevice` の失敗、デバイス番号が範囲外、または device properties の取得失敗時は false になる（`engine/src/kernels/cuda/verify_kernels.cu:1089-1099`）。
+- 通常 verifier の greedy argmax を `argmax_rows` にするには、さらに `argmax_rows_wanted()` の条件が要る。CUDA では未指定時は compute capability major 8 が対象で、major 7 は `STRATA_ARGMAX_ROWS_SM70` が非 0 の場合に対象。`STRATA_ARGMAX_ROWS` が明示されるとその値が優先され、0 以外ならこの変数の許可判定と組み合わせて対象になる。SYCL は未指定時 major 8 のみが対象で、このビルドには `STRATA_ARGMAX_ROWS` override はない（`engine/src/kernels/cuda/verify_kernels.cu:1104-1135`、`engine/sycl/src/kernels/cuda/verify_kernels.dp.cpp:1898-1912`）。
+- verifier が head bitplane 処理を使った場合、または split head の対象 window の場合、CUDA verifier は `argmax_rows_wanted()` の判定と greedy fallback を通らない（`engine/src/core/verify.cpp:3108-3119,3130-3141`）。SYCL verifier には同じ条件分岐はない（`engine/sycl/src/core/verify.cpp:1937-1956`）。
+- MTP の通常 token 選択では、変数が有効なら `row_top_prob_split`、無効なら `row_top_prob` を使う。`argmax_rows_wanted()` も真なら argmax 自体も `argmax_rows` に切り替える（`engine/src/core/mtp.cpp:1533-1543,2654-2664`、`engine/sycl/src/core/mtp.cpp:1238-1248`）。
+- CUDA と SYCL の MTP `coupled_rec_` 経路は独自の `coupled_draft_sample`（または CUDA の条件により `spec_draft_sample`）を呼び、その場で return するため、この後の `argmax_rows_wanted()` と `multi_block_head_ops()` による選択を通らない（`engine/src/core/mtp.cpp:1521-1531`、`engine/sycl/src/core/mtp.cpp:1231-1236`）。
+- CLI 引数や設定ファイルからこの値を上書きする読み取り・転送経路は見つからなかった。
 
 ## 実行時の詳細
 
-`argmax_rows_wanted()` は SM 8.x かつ `multi_block_head_ops()` が有効な場合だけ true です。呼び出し元の verifier は各 verify window の head logits について、true なら `argmax_rows()`、false なら greedy `sample_tokens()` を起動します（`src/core/verify.cpp:1783-1796`、`sycl/src/core/verify.cpp:1626-1636`）。MTP の head も同じ分岐を持ちます（`src/core/mtp.cpp:993-1000`、`sycl/src/core/mtp.cpp:1136-1143`）。複数 block argmax は row を最大 128 block に分け、各 block の候補を scratch に書き、最後に候補をまとめます。header は tie 時の最小 index、NaN を選ばないこと、および全値が `-inf` 以下の場合に index 0 を返すことを single-token greedy pick と同じ仕様として記しています（`src/kernels/cuda/verify_kernels.cu:710-787`、`include/strata/kernels/verify_kernels.hpp:121-126`）。
+CUDA/HIP では `multi_block_head_ops()` の初回呼び出しで値を読み、関数内 `static const int env` に保存する。HIP gfx 判定は別の関数内 static 配列にデバイスごとに保存する。SYCL では初回呼び出し時に値を `static const bool on` に保存する。したがって同一プロセス中に環境値を変更しても再評価されない（`engine/src/kernels/cuda/verify_kernels.cu:1080-1101`、`engine/sycl/src/kernels/cuda/verify_kernels.dp.cpp:1886-1896`）。
 
-MTP の通常経路では、argmax の後に選択 token の確率を計算します。有効時の `row_top_prob_split()` は row ごとに 8 block で指数和を部分計算し、部分和を合算して `1 / total` を出力します。無効時は一 block の `row_top_prob()` に戻ります（`src/kernels/cuda/verify_kernels.cu:702-704,789-819,836-841`）。この関数は CUDA/SYCL の head kernel を共有する名前ですが、MTP 呼び出し元で確率分岐が確認できるものです。
+リポジトリ全体で名前を検索したところ、上記 2 箇所以外にはヘッダーの説明コメントと `terminal/data/settings-register.json` の登録名があった。登録 JSON は設定項目のメタデータであり、値を読む実装ではない（`engine/include/strata/kernels/verify_kernels.hpp:241-243`、`terminal/data/settings-register.json:26398-26435`）。
 
-この変数は `STRATA_ARGMAX_MULTI` とは別です。後者は `sample_tokens()` 内で SM 9.0+ の cluster greedy kernel を使うかを決めます（`src/kernels/cuda/sampler.cu:1252-1263`）。`STRATA_MULTI_BLOCK_ARGMAX=0` はこの別フラグを変更しません。SM 8.x で argmax の複数 block 分割を無効にしたとき、呼び出し元は通常の sampler に戻ります。
+MTP では head logits の各行に対する greedy token を選び、選んだ token の確率計算を行う。許可された場合は複数ブロック実装を呼び、それ以外は既存の一ブロック関数を呼ぶ。実装コメントは `argmax_rows` を一ブロック greedy pick と bitwise 同じものとして記述しているが、この調査では build や実行による再検証はしていない（`engine/include/strata/kernels/verify_kernels.hpp:217-225`、`engine/src/core/mtp.cpp:1533-1543`）。CUDA verifier でも条件を満たす場合は greedy pick を `argmax_rows` にし、そうでなければ `sample_tokens` の greedy 設定を使う（`engine/src/core/verify.cpp:3127-3140`）。
 
-実装に、この変数専用のログ、警告、エラー出力はありません。関連 header のコメントは `STRATA_MULTI_BLOCK_ARGMAX=0` を `multi_block_head_ops()` の無効化条件として示しています（`include/strata/kernels/verify_kernels.hpp:137-142`）。`docs/DETAILS.md` では近い機能の別フラグ `STRATA_ARGMAX_MULTI` に触れていますが、この環境変数の具体的な値や挙動の説明は見つかりませんでした（`docs/DETAILS.md:28`）。
+## ログと測定値
+
+この変数の値や有効・無効理由を出力するログは、確認した読み取り・呼び出し経路にはない。呼び出される複数ブロック kernel の launch error は既存の `check("argmax_rows")` / `check("row_top_prob_split")` に渡るが、当該 kernel のエラー時は `check` が `stderr` に `<名前>: <CUDA error string>` を出して `exit(1)` する（`engine/src/kernels/cuda/verify_kernels.cu:24-27,985-992,1015-1020`）。この変数固有の測定値は `docs/DETAILS.md` などの資料で確認できなかった。
 
 ## 根拠
 
-- `src/kernels/cuda/verify_kernels.cu:879-904` — 値の読み取り、既定値、HIP 除外、SM 8.x 条件。
-- `sycl/src/kernels/cuda/verify_kernels.dp.cpp:1571-1597` — SYCL 実装の同じ判定。
-- `src/core/verify.cpp:1783-1796`、`sycl/src/core/verify.cpp:1626-1636` — verify の greedy argmax 呼び出し。
-- `src/core/mtp.cpp:981-1003`、`sycl/src/core/mtp.cpp:1129-1146` — MTP の coupled sampling、argmax、top probability の分岐。
-- `src/kernels/cuda/verify_kernels.cu:702-819,823-841`、`include/strata/kernels/verify_kernels.hpp:121-142` — kernel 処理と公開関数の説明。
-- `src/kernels/cuda/sampler.cu:1252-1263`、`include/strata/kernels/sampler.hpp:47-50` — 独立した `STRATA_ARGMAX_MULTI` の制御。
+- `engine/src/kernels/cuda/verify_kernels.cu:1080-1102` — CUDA/HIP の読み取り、変換、既定値、gfx12 条件。
+- `engine/sycl/src/kernels/cuda/verify_kernels.dp.cpp:1886-1917` — SYCL の読み取り、既定値、GPU major 条件、例外時の終了経路。
+- `engine/src/kernels/cuda/verify_kernels.cu:985-992,1015-1020` — CUDA の複数ブロック kernel 呼び出しとエラー処理。
+- `engine/src/core/verify.cpp:3127-3141`、`engine/sycl/src/core/verify.cpp:1946-1956` — verifier の greedy 経路。
+- `engine/src/core/mtp.cpp:1521-1543,2649-2664`、`engine/sycl/src/core/mtp.cpp:1226-1248` — MTP の選択・確率計算経路。
+- `engine/include/strata/kernels/verify_kernels.hpp:217-246` — kernel と判定関数の宣言・設計上の説明。

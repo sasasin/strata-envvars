@@ -1,47 +1,54 @@
 # `STRATA_PF_PEER_SUMS`
 
-調査対象: Strata `main` の HEAD `a0116b2782a5b82622358c04a06496485d12b2d6`（2026-10-13 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-CUDA の prompt prefill で、P2P 接続できない peer GPU が計算した expert の結果を、expert ごとの行列で主 GPU に戻す代わりに、token ごとの重み付き合計にまとめてから戻すかを選ぶ。まとめると戻すデータは `peer rows × N` 要素から `T × N` 要素になる。これは Strata の `--peer-device` による peer prefill のうち、P2P が使えず mapped host memory を経由する経路だけに関係する。
+P2P を使えない peer GPU の prompt prefill で、peer が計算した expert の結果を主 GPU に返す形式を選ぶ。値が非ゼロ（または未設定）なら peer 側で routing weight を掛けた token ごとの和を作って返し、0 なら expert row ごとに返す。どちらも peer が担当する expert と計算結果自体は同じで、変わるのは host 経由で戻すデータの形式と主 GPU 側の combine 経路である（`engine/src/prefill/prefill.cpp:1387-1391, 3467-3471, 6883-6904, 6972-6980, 7617-7625`）。
+
+変数を読むのは serve の prompt path 初期化から呼ばれる `Prefill::set_peer()` の CUDA peer tier 初期化だけである。CUDA device を使う `--peer-device` の prompt prefill 向けで、通常の単一 GPU 経路、peer tier を使わない実行、layer split の stage helper ではこの変数を読まない（`engine/src/prefill/prefill.cpp:3333-3339, 3467-3471`; `engine/src/program/generate.cpp:13146-13150`）。
 
 ## 値と判定
 
-| 環境変数の状態 | `pp->sums` | 動作 |
-|---|---:|---|
-| 未設定 | ON | token ごとの重み付き合計を戻す |
-| `atoi` の結果が 0 | OFF | peer の結果行を戻す |
-| `atoi` の結果が非 0 | ON | token ごとの重み付き合計を戻す |
+`std::getenv` で取得し、未設定なら `sums=true`、設定されていれば `std::atoi(v) != 0` を使う。文字列全体の検証や値域チェックはしない。`atoi` が先頭から整数に変換できる部分を読むため、空文字・数値で始まらない文字列・`0anything` は 0、`1anything` や `-1` は非ゼロになる。先頭空白と符号は `atoi` の整数変換に従う。大文字小文字の区別はなく、`true` / `false` は整数として読めずどちらも 0 扱いとなる（`engine/src/prefill/prefill.cpp:3467-3471`）。
 
-実装は `std::atoi` を使うため、文字列全体の厳密な数値検査ではない。空文字、数字で始まらない値、`"0"` は 0 になり OFF。`"1"` や負の非ゼロ値は非 0 になり ON。数値の後ろの文字列も `atoi` の変換結果には影響しない。無効値を検出したり警告を出したりする処理はない。
+| 条件 | unset | 和を返す値（例） | 行を返す値（例） |
+|---|---|---|---|
+| `set_peer()` が非 P2P の compact peer を初期化 | 和を返す | `1`, `2`, `-1`, `1tail` | `0`, 空文字, `true`, `0anything`, `abc` |
+| P2P peer / peer prefill を使わない | 読み取りなし | 該当なし | 該当なし |
+
+整数として表せないほど大きな数値に対する `atoi` の範囲外動作はこのコードで検査・処理されない。未設定時の既定は和モードで、CLI 引数による上書きはない（同: `3467-3471`; CLI の peer prefill 行数は `engine/src/program/generate.cpp:922-924, 4205-4209`）。
 
 ## 有効になる条件
 
-- CUDA の `Prefill::set_peer` が有効な peer を受け取り、peer prefill が構成されること。呼び出し元では `peer` が有効で、`--peer-prefill-rows` 相当の値が 0 でない場合に設定する。
-- CUDA 実装では P2P がないとき `STRATA_PF_PEER_HOST` が 0 でない（または未設定）であること。無効なら `set_peer` は失敗し、`strata serve` は prompt path を primary GPU に残す。
-- MMQ prompt path が利用可能であること。peer prefill 自体が MMQ を必要とする。
-- `sums` の読み取りは `!pp->p2p && pp->compact` の場合に限られる。compact は既定で有効であり、P2P がない場合は `STRATA_PF_PEER_COMPACT=0` でも強制的に有効になる。P2P がある場合、この変数は読まれず結果行を P2P で戻す。
-- SYCL の `Prefill::set_peer` は P2P がない peer を拒否するため、この変数による mapped-host の sums 経路は SYCL では使われない。
+- `--peer-device N`（`N >= 1`）で peer tier が開かれ、prompt peer の設定が実行されること。`--peer-prefill-rows 0` なら設定呼び出し自体が省かれる。行数の既定 `-1` は chunk × top-k の半分を使う（`engine/src/program/generate.cpp:918-924, 10211-10223, 13146-13150`）。
+- 2 GPU 間で P2P が使えないこと。peer が有効でも P2P 経路なら `!pp->p2p` が偽となり、この変数を読み取らず row 転送経路を使う（`engine/src/prefill/prefill.cpp:3373-3376, 3467-3471`）。P2P 判定は `STRATA_PEER_NO_P2P` や peer access の確認・試験コピーで決まる（`engine/src/core/peer_experts.cpp:208-234`）。
+- 非 P2P route が `STRATA_PF_PEER_HOST` で拒否されないこと。`STRATA_PF_PEER_HOST` が `0` に変換されると `set_peer()` は失敗し、呼び出し元は「prompt path stays on the primary GPU」と出して peer prompt 処理を取り下げる（`engine/src/prefill/prefill.cpp:3336-3339`; `engine/src/program/generate.cpp:13146-13153`）。
+- compact buffer が使われること。非 P2P では `STRATA_PF_PEER_COMPACT=0` を指定しても `!pp->p2p` が真なので compact は強制される（`engine/src/prefill/prefill.cpp:3411-3415`）。
+- 和モード内の転送型は `STRATA_PF_PEER_F16` と次元 `N` による。未設定または `atoi` 非ゼロかつ `N % 8 == 0` なら FP16、0 扱いまたは `N % 8 != 0` なら FP32。和を作る kernel は `STRATA_PF_PEER_GATHER` が未設定または非ゼロなら group gather、0 扱いなら expert row ごとの scatter になる（`engine/src/prefill/prefill.cpp:3472-3485, 6883-6893, 6972-6978`）。
+- 対応する peer prompt kernel とモデル状態があること。`set_peer()` は対応層がない場合や NVFP4 expert の場合にエラーで断り、APR pack では警告を出して peer prompt を使わない（`engine/src/prefill/prefill.cpp:3340-3369`）。
 
 ## 実行時の詳細
 
-`set_peer` の peer buffer 構成時に値を読み、`PeerPrefill` に保存する。token/chunk ごとには再読しない。したがって、その `PeerPrefill` を使っている間にプロセス環境を変えても設定は切り替わらない。初期化に失敗して作り直す場合や、別の `set_peer` を呼ぶ場合は、その構成時の環境値が使われる。
+`Prefill::set_peer()` が peer buffer を設定するたび、非 P2P かつ compact の場合に環境を読み、その `bool` を `PeerPrefill::sums` に保存する。static cache はなく、token/request ごとには読み直さない。prompt path の再初期化で `set_peer()` が再度呼ばれれば、その時点の値で再評価される（`engine/src/prefill/prefill.cpp:3333-3339, 3373-3377, 3467-3471`; `engine/src/program/generate.cpp:13101-13103, 13143-13150`）。
 
-ON の場合、primary GPU から routing weight と peer rows の routing pair を host buffer 経由で peer GPU に渡し、peer GPU 側で row と routing weight を掛けて token ごとに加算する。group 単位の gather 加算が既定で、`STRATA_PF_PEER_GATHER=0` なら expert ごとの scatter 加算を使う。合計値を host memory にコピーし、primary GPU は local expert の合計に peer の合計と shared expert の結果を加えて MoE 出力を作る。`STRATA_PF_PEER_F16` が有効なら、合計値を FP16 に変換して転送し、primary 側で float に戻してから combine する。これらの関連変数は本書の対象外だが、転送形式や加算方法に影響する。
+和モードでは主 GPU から routing weight と peer row の token/top-k 対応を host buffer に渡し、peer が和 buffer をゼロ初期化する。peer の各 expert row の結果に対応する routing weight を使い、`STRATA_PF_PEER_GATHER` の設定に応じて group gather または row scatter で token ごとの和を作る。和（`T × N`）を mapped host memory にコピーし、主 GPU は `moe_combine_peer()`（`STRATA_PF_PEER_F16` が有効な場合は `moe_combine_peer16()`）で主 GPU 側の expert 結果と合わせる（`engine/src/prefill/prefill.cpp:6621-6628, 6664-6669, 6883-6893, 6972-6980, 7617-7625`）。
 
-OFF の場合、peer の結果行を mapped host buffer にコピーし、primary GPU が `Dm` に読み込んで通常の MoE combine に使う。どちらの経路でも mapped host buffer の確保に失敗すると `set_peer` は失敗し、コード上のエラーには pinned buffer 不足が記載される。
+行モードでは peer rows を mapped host memory の `host_rows` にコピーし、主 GPU がその rows を `Dm` に戻して通常の `moe_combine()` に渡す（同: `3522-3524, 6895-6904, 7617-7630`）。この変数は転送形式を切り替えるもので、CLI の peer row 配分を変更しない。
 
-構成時には stderr に peer GPU の処理内容を出す。sums 有効時は `no P2P: through mapped host memory` と、FP16 使用時には `in FP16`、および `one weighted sum per token back` が表示される。sums 無効時は `no P2P: through mapped host memory` のみとなる。`docs/DETAILS.md` にこの環境変数の個別説明は見つからず、効果と既定値は以下の実装に基づく。
+## ログと測定値
+
+peer の初期化成功時、和モードでは次のいずれかの説明が `stderr` の `strata prefill: peer GPU ...` 行に含まれる。
+
+- `, no P2P: through mapped host memory, one weighted sum per token back`
+- FP16 transfer も有効なら `, no P2P: through mapped host memory in FP16, one weighted sum per token back`
+
+`STRATA_PF_PEER_SUMS=0` 相当の row mode では `, no P2P: through mapped host memory` と表示される。バッファ確保に失敗した場合は `prefill peer: the host route's pinned buffers (... MiB) do not fit in RAM` または `prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)` が `err` に入り、serve 側で主 GPU のみの prompt path に戻る。変数固有の測定値は確認できない（`engine/src/prefill/prefill.cpp:3527-3545`; `engine/src/program/generate.cpp:13149-13153`）。
 
 ## 根拠
 
-- `src/prefill/prefill.cpp:640-658`: sums mode の目的、既定値の説明、peer buffer 状態。
-- `src/prefill/prefill.cpp:1649-1672`: peer 経路の設定、no-P2P 時の host-route 条件と MMQ 条件。
-- `src/prefill/prefill.cpp:1697-1699,1736-1755`: compact 条件、`STRATA_PF_PEER_SUMS` の唯一の読み取り箇所、`atoi` 判定、および関連 buffer の確保。
-- `src/prefill/prefill.cpp:1767-1797`: host-route buffer の確保と失敗時のエラー。
-- `src/prefill/prefill.cpp:1803-1812`: 構成時の stderr 表示。
-- `src/prefill/prefill.cpp:3410-3449,3575-3595,3658-3674,3938-3948`: routing data の転送、sum または rows の返送、primary 側の combine。
-- `src/prefill/kernels.cu:2062-2114,2130-2163`: peer の重み付き加算と primary 側の合成カーネル。
-- `src/program/generate.cpp:7368-7373`: peer prefill 設定の呼び出しと失敗時の fallback。
-- `sycl/src/prefill/prefill.cpp:1689-1695`: SYCL 実装は no-P2P peer を拒否する。
+- 候補名は envvar 索引にあるが、実際の読み取りは `engine/src/prefill/prefill.cpp:3467-3471` の一箇所（索引: `docs/envvars/000_envvers.md:1710`）。
+- peer tier / prompt peer の CLI 条件: `engine/src/program/generate.cpp:918-924, 10211-10223, 13146-13150`。
+- P2P / host route の選択: `engine/src/core/peer_experts.cpp:208-234`; `engine/src/prefill/prefill.cpp:3336-3339, 3411-3415`。
+- 和と行の計算・返送・combine: `engine/src/prefill/prefill.cpp:6621-6628, 6664-6669, 6883-6904, 6972-6980, 7617-7630`。
+- 関連資料 `docs/SECOND_GPU.md:70-103` は peer tier と host route の概要を記載するが、この環境変数の値規則や和モードの測定値は示していない。

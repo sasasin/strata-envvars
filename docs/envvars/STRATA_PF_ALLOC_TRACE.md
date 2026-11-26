@@ -1,50 +1,55 @@
 # `STRATA_PF_ALLOC_TRACE`
 
-調査対象: Strata `main` の HEAD `146df3c468739147f520ac3816de806f71232571`（2026-11-07 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-プロンプト処理の `Prefill::init` 中に、GPU の空きメモリ量とコードが要求した割当量を stderr に記録する診断スイッチです。プロンプト処理や割当方法を変更する分岐ではなく、計測とログ出力だけを有効にします。候補一覧には載っていますが、今回確認した実装は `src/prefill/prefill.cpp` の直接読み取り 1 か所です。
+prompt 用 `Prefill` の初期化中に、GPU 空きメモリの変化と `Alloc::take` が要求した割り当て量を stderr に出す診断スイッチ。`pf_alloc_trace()` の結果はログと `cudaMemGetInfo` による計測の分岐にだけ使われ、バッファサイズや割り当て方を選ぶ条件には使われない。実装は `engine/src/prefill/prefill.cpp` の `pf_alloc_trace`、`pf_mark`、`Alloc::take` にある（`engine/src/prefill/prefill.cpp:1063-1116`）。
 
 ## 値と判定
 
-`std::getenv()` の結果が null でないことに加え、先頭文字が `'1'` かを比較します。文字列全体の parse や数値変換はしません。
+`std::getenv` の戻り値が null でないことに加え、値の先頭文字が文字 `'1'` であることを判定する。文字列全体の数値変換・比較はしない（`engine/src/prefill/prefill.cpp:1065-1067`）。
 
-| 環境変数の値 | 診断 |
-|---|---|
-| 未設定 | 無効 |
-| 空文字 | 無効（設定値の先頭文字が `\0`） |
-| 先頭文字が `1`（例: `1`, `10`, `1anything`） | 有効 |
-| その他（例: `0`, `true`, ` 1`） | 無効 |
+| ビルド / 実行経路 | unset | 設定時に有効になる値 | 設定時に無効になる値 |
+|---|---|---|---|
+| `Prefill::init` がこの実装を通る経路 | 無効 | `1`、`10`、`1anything`（先頭が `1`） | 空文字、`0`、`true`、` 1`、`True`（先頭が `1` でない） |
 
-有効・無効の判定は `pf_alloc_trace()` の初回呼び出し時に `static const bool` へ保存されます。そのプロセスで後から環境値を変えても再評価されません。既定値は無効です。CLI 引数や別の環境変数による上書きは、この判定にはありません。根拠: `src/prefill/prefill.cpp:641-644`。
+大文字小文字や数値としての妥当性は検査しない。先頭の空白は読み飛ばさない。設定有無だけを判定する方式ではないため、空文字は無効。コード上の既定値は無効である（同 `1065-1067`）。
 
 ## 有効になる条件
 
-プロンプト経路が `Prefill::init` に到達すると、冒頭で判定され、開始時の計測点が出力されます。通常の CUDA/HIP 互換 GPU 経路では、その後のステージング領域、routing table、host buffer、GEMM scratch、chunk buffer の各計測点と、`Alloc` による割当集計が実行されます。単一 GPU 経路と layer split の各 GPU stage のどちらも `Prefill::init` を呼びます（`src/program/generate.cpp:11127-11145,11157-11159,20026-20032`）。
-
-`STRATA_GPU_METAL` の場合は `Prefill::init` が冒頭の開始計測後に Metal window へ委譲して戻るため（`src/prefill/prefill.cpp:1797-1808`）、CUDA 経路の後続計測点や `Alloc` 集計は通りません。ビルド macro によるこの早期 return 以外に、CLI・モデル状態・backend 固有の値判定や追加条件はありません。
+- `Prefill::init` が呼ばれること。通常の生成コードでは prompt path の初期化時に呼ばれ、複数 GPU の stage がある場合は各 stage でも呼ばれる（`engine/src/program/generate.cpp:13006-13029,13031-13041`）。
+- この計測コードは `engine/src/prefill/prefill.cpp` にある。設定レジストリは当該読み取りを `cuda-hip` として登録している（`terminal/data/settings-register.json:29763-29776`）。Metal 分岐も `Prefill::init` の先頭にある読み取りと最初の `pf_mark` の後に現れるが、通常の CUDA/HIP 初期化処理とは異なり `window_ensure` へ早期 return する（`engine/src/prefill/prefill.cpp:2443-2454`）。
+- 他の環境変数、CLI 引数、モデル形式による有効化条件はこのスイッチ自体にはない。環境変数が有効でも、`Prefill::init` を通らない実行では初期化ログは出ない。
 
 ## 実行時の詳細
 
-`pf_mark()` は各時点で `cudaMemGetInfo` から得た空き MiB、その直前の計測点からの差（`last - now`）、その区間でコードが要求した MiB を stderr に出します。ログの形式は次のとおりです。
+値は `pf_alloc_trace()` 内の関数ローカル `static const bool` に保存される。最初の参照は `Prefill::init` の開始時であり、その後プロセス内で環境を変更しても判定は更新されない（`engine/src/prefill/prefill.cpp:1065-1067,2443-2448`）。
+
+有効時、`pf_mark` は初期化の区切りで `cudaMemGetInfo` を呼び、空き量（整数 MiB）、前回マークからの減少量、呼び出し側から渡された要求量を出力する（`engine/src/prefill/prefill.cpp:1069-1081,2447-2448,2557,2595,2710,2737-2754`）。`Alloc::take` は借用領域からの切り出しではなく `cudaMalloc` を実行して成功した場合に限り、その直前・直後の空き量の差と要求 byte 数を加算する。従って借用領域からの切り出し、count-only の sizing、`Alloc` を介さない割り当て、失敗した `cudaMalloc` はこの集計に含まれない（同 `1083-1116`）。
+
+carve が失敗すると通常の初期化失敗経路へ進み、空き量・確保済み量・失敗した buffer の要求量を含む `prefill: device buffers for a chunk of ... tokens do not fit (...)` をエラーにする。この場合、成功時の `Alloc takes: ...` 集計行は出ない。診断フラグによる割り当て方式の fallback や再試行はない（同 `2738-2752`）。
+
+## ログと測定値
+
+有効時の区切りログは stderr に次の形式で出る。`what` と数値部分は実行経路の値で置き換わる（`engine/src/prefill/prefill.cpp:1075-1080`）。
 
 ```text
-prefill alloc trace: <mark> free <MiB> MiB, dropped <MiB> MiB, asked <MiB> MiB
+prefill alloc trace: <区切り名> free <MiB> MiB, dropped <MiB> MiB, asked <MiB> MiB
 ```
 
-`dropped` は空き量の差分で、負値にもなり得ます。`cudaMemGetInfo` の戻り値はこの計測 helper では検査されず、失敗時は初期化された `f = 0` に基づく値が使われます（`src/prefill/prefill.cpp:645-656`）。
+初期化の carve 成功後には次の集計行も stderr に出る。`asked` と `bytes_needed` は MiB 単位にシフトして表示され、`free fell` は成功した `Alloc::take` 内の各割り当て前後で観測した空き量の差の合計である（同 `1109-1112,2748-2752`）。
 
-`Alloc::take()` が通常の割当経路で成功した `cudaMalloc` については、割当の前後に空き量を測り、要求 byte 数・割当回数・空き量の差を集計します。`Prefill::init` の carve が成功すると、回数、要求 MiB、計測した空き量の差に加えて、`bytes_needed()` の見積りと `o.used` を出力します（`src/prefill/prefill.cpp:659-692,2014-2031`）。
+```text
+prefill alloc trace: Alloc takes: <個数> cudaMallocs, asked <MiB> MiB, free fell <MiB> MiB over them (bytes_needed counts <MiB> MiB for this chunk's own buffers; o.used <MiB> MiB)
+```
 
-この集計は全メモリ使用量の記録ではありません。`count_only` の見積り専用経路、借用領域内の sub-allocation、base の容量不足で失敗した take、失敗した `cudaMalloc` は成功割当カウンタに入りません。また、`cudaHostAlloc` など `Alloc::take()` の外の処理もこの集計値ではありません。したがって `asked` は `Alloc` 経由で成功した `cudaMalloc` の要求量であり、`dropped` はその前後で観測した空き量の差です（`src/prefill/prefill.cpp:671-691`）。
-
-変数を無効にしたり有効にしたりしても `Alloc` の成功・失敗処理は変わりません。carve が失敗すると成功時の集計行には到達せず、`Prefill::init` は必要量と失敗 buffer のサイズを含むエラー文字列を返します。通常 generate 経路では stderr に `strata generate: ...` と出して終了コード 1、layer split の stage 初期化では `layer split, CUDA<device> prompt path: ...` に包み、サイズ不適合なら 2、それ以外は 1 を返します（`src/prefill/prefill.cpp:2015-2023`; `src/program/generate.cpp:11143-11147,20027-20032`）。
+Strata の説明資料にこの変数の測定値は見つからなかった。ソースコメントは `RESULTS-STRIX2.md` を参照しているが、ここでは測定値を記載しない（`engine/src/prefill/prefill.cpp:1063-1064`）。
 
 ## 根拠
 
-- 候補名の全参照を Strata ソースで検索し、実際の `getenv("STRATA_PF_ALLOC_TRACE")` は `src/prefill/prefill.cpp:642` のみと確認。ほかの一致はコメント内の説明・集計フィールド（`src/prefill/prefill.cpp:639-640,662`）。helper は `pf_mark` と `Alloc::take` から呼ばれます（同 `:651-656,685-687`）。
-- prompt 初期化と先頭の計測点: `src/prefill/prefill.cpp:1797-1808`。
-- 各計測点および集計行: `src/prefill/prefill.cpp:1911,1949,1987,2014-2031`。
-- generate 側の単一 GPU / stage 初期化とエラー処理: `src/program/generate.cpp:11127-11147,11157-11159,20024-20032`。
-- `docs/DETAILS.md` にはこの診断変数に関する追加説明や測定値を確認できませんでした。
+- `engine/src/prefill/prefill.cpp:1063-1081` — 環境値の判定、cache、空きメモリ取得、マーク出力。
+- `engine/src/prefill/prefill.cpp:1083-1116` — Alloc 経由で成功した `cudaMalloc` の計測範囲。
+- `engine/src/prefill/prefill.cpp:2443-2454,2737-2755` — 初期化での読み取り・ログ・失敗時と成功時の分岐。
+- `engine/src/program/generate.cpp:13006-13041` — prompt path 初期化からの呼び出し。
+- `terminal/data/settings-register.json:29763-29776` — settings register 上の backend・読み取り情報（補助情報。実動作の根拠は上記ソース）。

@@ -1,69 +1,66 @@
 # `--ram-experts-gb`
 
-調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-inkling` |
-| コマンド | `strata-inkling`（CUDA/HIP） |
+| コマンド | `strata-inkling`（トップレベル） |
 | オプション | `--ram-experts-gb` |
 | 別名 | なし |
-| 値 | 浮動小数点数として解釈される値（RAM に置く expert の容量上限。実装は 1 GiB = 1,073,741,824 bytes として変換） |
+| 値 | GiB 単位の数値（`double`）。RAM に置く expert 重みの上限を指定する |
 
 ## 役割
 
-GPU に置ききれない Inkling expert のうち、ホスト RAM に常駐させる容量を上限指定します。CUDA/HIP backend は VRAM 配置を優先し、残った expert をこの上限まで RAM に置き、それ以外はモデルファイルからの cold/SSD streaming 対象にします。モデル全体が VRAM に収まり、SSD モードも指定されていない場合は全 VRAM 常駐経路が選ばれるため、この RAM 上限は使われません（`engine/src/inkling2/cuda/ink_runner.cuh:391-413`）。
+モデルの expert 重みを GPU メモリに置けなかった場合に、ホスト RAM に常駐させる量を制限する。上限を超えた expert は、backend とモデル形式に応じて SSD からの読み出し対象になる。値は `--serve`、`--bench` のほか、トップレベルの直接実行にも共通の backend 設定として渡される。CPU backend でも参照される。
 
 ## 使い方
 
 ```sh
-# VRAM に入らない expert の RAM 常駐上限を 8 GiB にする
-strata-inkling --native model.strata --ram-experts-gb 8
-
-# RAM 常駐を無効にし、GPU と SSD streaming で配置する
-strata-inkling --native model.strata --ram-experts-gb 0
-
-# Serve モードでも同じ backend 初期化設定を渡す
-strata-inkling --serve --native model.strata --ram-experts-gb 8
+strata-inkling --bench --native model.strata --ram-experts-gb 8
 ```
+
+この例は benchmark 実行時に RAM expert 上限を 8 GiB として起動する。値の指定自体はコマンドモードを限定しない。
 
 ## 値と既定値
 
-- 値は必須です。値が続かない場合、parser は `missing value after --ram-experts-gb` を stderr に出して終了コード 2 で終了します（`engine/src/inkling2/ink_main.cpp:379-383,435-436`）。
-- parser は `std::atof` で変換し、正の値・ゼロ・負の値を個別に拒否する validation はありません。数値でない文字列も `atof` の結果として 0 になり、後述の 0 指定相当になります（`engine/src/inkling2/ink_main.cpp:435-436`）。
-- 省略時の内部値は `-1.0` です。負の値は CUDA/HIP backend で自動容量扱いになり、利用可能 RAM などをもとに上限が決まります（`engine/src/inkling2/ink_backend.h:29-31`、`engine/src/inkling2/cuda/ink_runner.cuh:293-299`、`engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1028-1051`）。
-- `0` は RAM expert の常駐を許さない指定です。正の値は RAM 上限として扱います。複数回指定した場合、引数走査中に同じフィールドへ順次代入されるため最後の指定が残ります（`engine/src/inkling2/ink_main.cpp:379-384,435-436`）。
+- 引数が必要で、`std::atof` で `double` に変換される。オプションの後に値がなければ `missing value after --ram-experts-gb` を stderr に出して終了コード 2 で終了する（`engine/src/inkling2/ink_main.cpp:845-849,910-911`）。
+- 既定値は `-1.0`。負値は各 backend の自動上限を選ぶ（`engine/src/inkling2/ink_backend.h:30-32`）。
+- `0` は RAM 常駐を許さない指定。正値は指定 GiB を byte 上限に換算する。CUDA/HIP の換算は `2^30` byte/GiB、CPU backend は `cgroup_mem::gib_to_bytes` を使う（`engine/src/inkling2/cuda/ink_runner.cuh:296-303`; `engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1090-1094`; `engine/src/inkling2/ink_cpu_backend.cpp:229-231`）。
+- CLI に数値範囲や形式の検証はない。`atof` が数値として読めない文字列や空文字列を受け取ると `0` になり、0 の扱いへ進む。負の値も拒否されず自動上限として扱われる（parser: `engine/src/inkling2/ink_main.cpp:910-911`）。
+- 同じ引数を複数回指定した場合、parser はその都度同じフィールドへ代入するため、最後に現れた値が残る（`engine/src/inkling2/ink_main.cpp:845-849,910-911`）。
 
 ## 実行時の動作
 
-parser は値を `BackendOpts::ram_experts_gb` に格納します。通常の生成・serve の backend 初期化、および bench / selfcheck 等の backend 初期化へこの設定が渡されます（`engine/src/inkling2/ink_main.cpp:101-117,130-144,546-569`）。CUDA backend は `opts.ram_experts_gb` を runner の `load` に転送し（`engine/src/inkling2/cuda/ink_cuda_backend.cu:197`）、HIP backend は同じ値から RAM budget を計算します（`engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1028-1032`）。
+値は `BackendOptions::ram_experts_gb` に入り、backend のモデルロード時に expert の配置計画へ使われる。CUDA は backend から CUDA runner に値を転送する（`engine/src/inkling2/ink_cuda_backend.cu:227-232`）。
 
-CUDA では、正値を bytes に変換して上限とし、未指定相当の負値では利用可能ホスト RAM から OS 用の余裕を差し引いて上限を推定します。取得した上限は cgroup の空き容量から予約分を差し引いた値でも制限されます（`engine/src/inkling2/cuda/ink_runner.cuh:293-299,437-457`）。HIP も正値を GiB から bytes に変換し、負値では Linux の `/proc/meminfo` の `MemAvailable` を使った安全上限を計算します。さらに cgroup 制限がある場合は予約分を差し引いて RAM 上限を抑えます（`engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1028-1059`）。
+- **CUDA**: 正値では指定上限まで、GPU に入らない expert を RAM に割り当てる。負値では利用可能ホスト RAM から OS 用の余裕（2〜4 GiB相当の規則）を差し引いた量を上限にし、取得できない場合は上限なしとして扱う。`0` または `--ssd-experts` 指定時は RAM expert を割り当てず、SSD-only tier を使う。SSD-only のとき、正値は pinned DMA ring のサイズにも使われ、256 MiB 以上 2 GiB 以下に制限される。非正値では ring は 512 MiB（`engine/src/inkling2/cuda/ink_runner.cuh:296-303,448-468,534-568`）。
+- **HIP**: 正値は RAM 上限に使われる。`0` と `--ssd-experts` は RAM 上限 0。負値で `--ssd-experts` がない場合、Linux は `/proc/meminfo` の `MemAvailable`、Windows は `GlobalMemoryStatusEx` 等から得る利用可能量を元に OS 用余裕を差し引く。さらに CUDA/HIP/CPU では cgroup に制限がある場合、利用可能 cgroup メモリから最大 2 GiB または 1/8 の予約分を差し引いた上限で抑える。GPU にも RAM にも収まらない HIP expert は Strata 形式なら ColdStore 経由、その他の形式では読み直し・再変換経路となる（`engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1090-1133,1136-1170,1172-1209,1372-1392`）。
+- **CPU**: 正値は cgroup 上限でさらに抑えられ、負値は初期値の上限なしで expert を読み込む。ただし cgroup の利用可能量が取れ、制限中なら同じ予約規則で抑えられる。上限未満しか preload できない場合は ColdStore を開いて SSD streaming を使う。明示的な `--ssd-experts` と `--ram-experts-gb 0` の場合は preload を 0 にする。ColdStore を開けなければ警告を出し、直接読み出しへ fallback する（`engine/src/inkling2/ink_cpu_backend.cpp:226-260,270-296`）。
 
-両 backend とも expert の配置では VRAM を先に試し、VRAM に入らない expert だけを RAM 上限内で RAM に置きます。上限を超える expert は cold/SSD 側になります（CUDA: `engine/src/inkling2/cuda/ink_runner.cuh:442-457`、HIP: `engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1085-1098`）。
+配置対象の優先順は model の `vram_load_order` に従う。CUDA は GPU、RAM、SSD の順に容量内へ配置し、HIP も GPU 群の後に RAM を割り当てる（`engine/src/inkling2/cuda/ink_runner.cuh:453-468`; `engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1136-1170`）。
 
 ## 適用条件と副作用
 
-- この文書の対象は索引上の `strata-inkling`（CUDA/HIP、`engine/src/inkling2/ink_main.cpp`）です。`strata-inkling-metal` と `strata-inkling-sycl` は別入口・別スコープで、同じオプションの登録は索引にありません（`docs/cli/README.md:1509-1547,1549-1592`）。
-- `--ssd-experts` を併用すると RAM budget は 0 扱いとなり、正の `--ram-experts-gb` を指定していても RAM 常駐には使われません（CUDA: `engine/src/inkling2/cuda/ink_runner.cuh:293-295,441-457`、HIP: `engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1028-1032`）。
-- 値を `0` にした場合も CUDA は RAM 常駐を無効にし、必要な cold expert 用に pinned DMA ring と cold store を用意します（`engine/src/inkling2/cuda/ink_runner.cuh:441-457,478-505`）。
-- 正値を指定しても VRAM に expert が収まれば RAM は使われません。RAM と SSD の割り当てはモデルの expert サイズ、VRAM 容量、ホスト RAM / cgroup の余裕に依存します。
-- HIP は `.strata` モデルで VRAM と RAM に置けなかった expert があれば 512 MiB の ColdStore を試します。open に失敗した場合も ColdStore を開いた分岐に入らず、後続の expert 読み出しは直接読み出し経路を使います（`engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1235-1255,4129-4173`）。
-- CPU backend でも同じ設定フィールドが使われます。CPU backend は指定量を cgroup-aware な byte 上限に変換し、expert を優先順に RAM へ preload します。上限外の expert がある場合は bounded cold-store ring を使い、open に失敗すると stderr に警告して直接読み出しへ fallback します（`engine/src/inkling2/ink_cpu_backend.cpp:231-243,244-287`）。
-
-`--cpu` を付けると parser が CPU backend を選びます。この場合も `--ram-experts-gb` は同じ `BackendOpts` として渡され、上記 CPU backend の配置規則が使われます（`engine/src/inkling2/ink_main.cpp:477,564-565`）。
+- `--ssd-experts` との相互作用は backend ごとに異なる。CUDA/HIP は同オプションがあると RAM 上限を 0 として扱う。CPU では `--ssd-experts` だけで必ず preload を 0 にするのは `--ram-experts-gb` が 0 以下の場合であり、正値なら上限分を preload し、残りを cold storage 対象にできる（`engine/src/inkling2/cuda/ink_runner.cuh:296-303,452`; `engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1090-1095`; `engine/src/inkling2/ink_cpu_backend.cpp:246-259`）。
+- expert データを RAM に読み込むため、実際の常駐量は指定値以下となり、個々の expert のサイズや配置順にも左右される。CUDA/HIP は計画上の expert body を読み込み、CUDA は host arena、SSD-only 時は pinned ring を確保する（`engine/src/inkling2/cuda/ink_runner.cuh:524-568,574-620`; HIP: `engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1343-1372`）。
+- CPU と HIP は cgroup メモリ制限を考慮する。CUDA の自動上限は `ink_ram_available_bytes()` の値に依存する。OS・backend ごとの利用可能メモリ取得の詳細は各実装で異なる。
+- この option の不正値に対する専用エラーや clamp は確認できない。`NaN` や無限大を渡した場合の容量換算結果は本調査では規定せず、利用値として案内しない。
 
 ## 出力とエラー
 
-オプション値自体に対する範囲エラーや警告は parser にありません。モデル/backend 初期化が失敗した場合、通常モードは `init: <理由>` を stderr に出し終了コード 1、serve モードはプロトコルの `ERR init: <理由>` を出して終了コード 1 になります（`engine/src/inkling2/ink_main.cpp:564-568`）。CUDA が SSD streaming を有効にした場合は配置数や ring 情報を stderr に出します（`engine/src/inkling2/cuda/ink_runner.cuh:502-512`）。
+- 値欠落時は parser が stderr にエラーを出して終了コード 2（上記「値と既定値」参照）。未知の option も stderr に `unknown option`、終了コード 2 となるが、この option の値検証エラーはない（`engine/src/inkling2/ink_main.cpp:845-849,910-911,985-987`）。
+- CPU ColdStore の初期化失敗時は stderr に `cold store open failed` を出し、直接読み出しを続ける（`engine/src/inkling2/ink_cpu_backend.cpp:270-284`）。
+- GPU backend のモデルロード・メモリ確保・expert 読み出しが失敗すると backend の `init` が失敗し、通常起動では `init: <理由>` を stderr に出して終了コード 1 となる（`engine/src/inkling2/ink_main.cpp:1086-1090`; CUDA の確保失敗例: `engine/src/inkling2/cuda/ink_runner.cuh:524-530,558-560`）。具体的な失敗条件は GPU driver、空きメモリ、モデル、ColdStore 初期化結果に依存する。
 
 ## 根拠
 
-- `docs/cli/README.md:1509-1547` — `strata-inkling` の CUDA/HIP root scope と指定オプションの索引リンク。
-- `engine/src/inkling2/ink_main.cpp:379-383,433-436` — 引数値の取得と `atof` による格納。
-- `engine/src/inkling2/ink_backend.h:29-31` — backend option の既定値と RAM/SSD の意味。
-- `engine/src/inkling2/cuda/ink_runner.cuh:293-299,391-413,437-457,478-512` — CUDA の自動/明示 RAM 上限、配置順、cold-store 経路と出力。
-- `engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1028-1059,1085-1098` — HIP の RAM 上限計算と配置。
-- `engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1206-1255,4129-4173` — HIP の RAM 配置後に残る expert の ColdStore 利用と読み出し。
-- `engine/src/inkling2/ink_cpu_backend.cpp:231-287` — CPU backend の preload 上限・cgroup 制限・cold-store fallback。
-- `engine/src/inkling2/ink_main.cpp:564-568` — backend 初期化失敗時の出力と終了コード。
+- `engine/src/inkling2/ink_main.cpp:845-849,910-911` — 引数取得、欠落値処理、`atof` による parser 代入。
+- `engine/src/inkling2/ink_backend.h:30-32` — 既定値と `--ssd-experts` の設定。
+- `engine/src/inkling2/cuda/ink_runner.cuh:296-303,448-468,534-568` — CUDA の RAM 上限、配置、SSD-only ring。
+- `engine/src/inkling2/hip/ink_hip_backend.hip.cpp:1090-1133,1136-1170,1372-1392` — HIP の上限計算、配置、常駐数と streaming。
+- `engine/src/inkling2/ink_cpu_backend.cpp:226-260,270-296` — CPU の cgroup-aware 上限、preload、ColdStore と fallback。
+- `engine/src/inkling2/ink_cuda_backend.cu:227-232` — CUDA runner への option 転送。
+- `engine/src/inkling2/ink_main.cpp:1086-1090` — backend 初期化失敗の出力と終了。
+
+調査範囲: 現行 checkout の Strata ソースを確認し、GPU 実行や build は行っていない。Linux/Windows の各メモリ取得 API が実行環境で返す値、実機での実メモリ消費量、性能差は未測定。

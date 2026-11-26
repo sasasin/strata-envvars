@@ -1,43 +1,45 @@
 # `STRATA_UI_REASON`
 
-調査対象: Strata `main` の HEAD `c62d5e3a15b40ea51c96aae9e8d36928965f53ab`（2026-11-01 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-26` 時点）。
 
 ## 役割
 
-App Host が browser mode の理由を保持する文字列です。Linux 版 Strata デスクトップの supervisor は、利用者が browser mode を選んだ起動時に App Host の子プロセスへ `STRATA_UI_REASON=chosen` を設定します。App Host は browser mode の場合にこの値を `reason` として読み、`GET /api/app/mode` の JSON に含めます。モデル計算や engine の挙動は制御しません。
+ホストが起動した時点ですでにブラウザモードなら、その理由を `reason` として保持し、アプリモード状態 API の応答に含める文字列です。生成、モデル選択、アップデータ可否などをこの変数が制御するコードはありません。ブラウザモード自体は `STRATA_UI_MODE` が正確に `browser` の場合に限り成立し、`STRATA_UI_REASON` は理由欄だけに使われます（`app/host/server/app-ui.mjs:64-72,82-86`）。
+
+通常のデスクトップ起動では Rust supervisor がホスト子プロセスに `STRATA_UI_MODE` を設定し、CLI で browser mode を選択した場合に限って `STRATA_UI_REASON=chosen` も設定します（`app/desktop/src-tauri/src/supervisor.rs:515-526`）。
 
 ## 値と判定
 
-App Host は環境変数を数値や列挙値として parse せず、JavaScript の論理 OR (`||`) で空値を fallback します。
+ホスト起動時に `env.STRATA_UI_REASON || 'chosen'` と評価します。JavaScript の truthy 判定なので、未設定・空文字列は `chosen` に置き換わり、空でない文字列はそのまま採用されます。文字列の形式・大文字小文字・数値としての妥当性・長さを検査したり正規化したりする処理はありません（`app/host/server/app-ui.mjs:64-66`）。
 
-| 環境値 | browser mode での初期 `reason` |
-|---|---|
-| 未設定 (`undefined`) | `chosen` |
-| 空文字 (`''`) | `chosen` |
-| 空でない文字列 | その文字列をそのまま保持。trim、大小文字変換、長さ制限、許容値チェックなし |
-| browser mode 以外 | `null`。環境値は使わない |
+| 起動時の `STRATA_UI_MODE` | `STRATA_UI_REASON` が未設定または空文字 | 空でない値の例 | 無効になる値の例 |
+|---|---|---|---|
+| 正確に `browser` | `chosen` | `chosen`、`window-failed`、`anything` をそのまま採用 | 値自体に無効値は定義されない。値は検証されない |
+| `window` または `browser` 以外 | `null` | 値を読まず理由は `null` | 理由の値は適用されない |
 
-デスクトップ supervisor の browser mode 起動では子プロセスへ `"chosen"` を設定するので、親プロセスに別の値があってもこの値で置き換わります。`STRATA_UI_REASON` 自体が browser mode を選択することはありません。起動モードは `STRATA_UI=browser` または `--browser` で選択されます。
+`0`、`false`、前後に空白のある文字列も、環境変数として空でなければ理由欄にそのまま入ります。これは真偽値として解釈する設定ではありません（`app/host/server/app-ui.mjs:30,64-66`）。
 
 ## 有効になる条件
 
-- Linux 版 `apps/desktop` の supervisor が host を起動する経路では、browser mode を選択した場合に限り `STRATA_UI_REASON=chosen` を子プロセス環境に追加します。window mode ではこの変数を設定しません。
-- App Host は `STRATA_UI_MODE` が `window` または `browser` のどちらかと一致する場合だけアプリ起動として扱い、`browser` の場合にだけ `STRATA_UI_REASON` を参照します。`STRATA_UI_MODE` の値は大文字小文字を変換しません。無効値なら mode は `null` です。
-- supervisor では `STRATA_UI=browser` が初期 browser 選択を設定し、`--browser` はそれを有効化します。`STRATA_UI_REASON` はこの選択に関与しません。
-- App Host をデスクトップ supervisor を介さず起動し、`STRATA_UI_MODE=browser` を与えた場合は、継承された `STRATA_UI_REASON`（なければ `chosen`）が初期値になります。Windows/macOS のデスクトップ起動では `main.rs` の host 起動処理はこの変数を明示設定しません。
+- 起動時の `STRATA_UI_MODE` が `browser` と完全一致すること。そうでなければこの変数は読み取られず、初期 `reason` は `null` です（`app/host/server/app-ui.mjs:30,64-66`）。
+- 通常のデスクトップ supervisor 経由で browser mode を選ぶ場合、supervisor はホスト子プロセスへ `STRATA_UI_REASON=chosen` を渡します（`app/desktop/src-tauri/src/supervisor.rs:523-526`）。
+- ホストを手動起動するなど supervisor を介さない場合でも、`STRATA_UI_MODE=browser` なら読み取りは行われます。`STRATA_UI_REASON` が空または未設定なら `chosen` になります（`app/host/server/app-ui.mjs:64-66`）。
+- 起動後、desktop shell が認証済みの `/api/control/ui` に `mode: "browser"` を送る経路は、環境変数由来の理由を `switchToBrowser` の理由で置き換えます。この後続遷移では理由は最大 40 文字に切り詰められ、要求側の `reason` が省略された場合は `window-failed` です（`app/host/server/index.mjs:1438-1460`; `app/host/server/app-ui.mjs:99-104`）。
 
 ## 実行時の詳細
 
-App Host の `createAppUi()` が呼ばれるときに `process.env` から一度読み、初期 `mode` と `reason` に保存します。したがって、起動後にプロセス環境だけを変更しても初期 `reason` は再読込されません。`GET /api/app/mode` は現在の state を返します。browser mode への切替を shell が `POST /api/control/ui` で指示した場合は、そちらの request body の `reason` が使われ、`String(why).slice(0, 40)` で最大40文字に切られます。これは環境変数の値判定とは別の実行時更新経路です。
+`createAppUi` がホスト起動時に `process.env` を受け取り、モジュール初期化時に `mode` と `reason` を一度設定します。環境変数を後から変更しても再読込しません（`app/host/server/index.mjs:147-151`; `app/host/server/app-ui.mjs:64-67`）。初期状態の `reason` は `/api/app/mode` の GET 応答 JSON に含まれ、ページが表示状態を判断するために使います（`app/host/server/app-ui.mjs:82-86`; `app/host/server/index.mjs:1444`）。
 
-フロントエンドの app mode 型には `reason` フィールドがあります。確認したコードでは `useAppMode()` が `/api/app/mode` をページロードにつき一度取得します。環境値に対する専用ログ、警告、終了、エラー処理はありません。`reason` は API 応答で観測できます。
+アプリが起動後に browser mode へ切り替わる際は、shell からの `/api/control/ui` POST に含まれる理由が現在値を上書きします。状態 API は以後その値を返します（`app/host/server/index.mjs:1451-1460`; `app/host/server/app-ui.mjs:99-104`）。
+
+## ログと測定値
+
+`STRATA_UI_REASON` 自体を出力するログや標準出力・標準エラーの記述はありません。理由を観測できる経路は `/api/app/mode` の JSON 応答にある `reason` フィールドです（`app/host/server/index.mjs:1444`; `app/host/server/app-ui.mjs:82-86`）。この変数による終了・失敗経路や測定値もありません。
 
 ## 根拠
 
-- `apps/desktop/src-tauri/src/supervisor.rs:43-55` — `STRATA_UI` と `--browser` による起動モード選択。`--browser` は有効化のみ。
-- `apps/desktop/src-tauri/src/supervisor.rs:361-365` — Linux supervisor が App Host 子プロセスへ `STRATA_UI_MODE` を渡し、browser 選択時に `STRATA_UI_REASON=chosen` を設定。
-- `apps/desktop/src-tauri/src/main.rs:463-468` — App Host の host command は環境を継承し、ここでは `STRATA_UI_REASON` を明示設定しない。browser 選択時の明示設定は Linux supervisor 側。
-- `apps/host/server/app-ui.mjs:63-66` — `process.env` を既定入力として mode と reason を初期化し、browser mode 以外では reason を `null` にする。
-- `apps/host/server/app-ui.mjs:81-99` — state の返却と、shell による browser 切替時の reason 更新・40文字制限。
-- `apps/host/server/index.mjs:1311-1327` — `GET /api/app/mode` と shell 専用 UI 切替 API。
-- `apps/host/src/lib/app-mode.ts:4-24` — API 応答型とページロード中の取得・cache。
+- `app/desktop/src-tauri/src/supervisor.rs:515-526` — 起動モードと browser 選択時の子プロセス環境設定。
+- `app/host/server/app-ui.mjs:30,64-67` — 対応する mode と理由文字列の初期読取・fallback。
+- `app/host/server/app-ui.mjs:82-104` — API 状態用データと起動後の browser 切替による更新。
+- `app/host/server/index.mjs:1438-1460` — 状態取得 API と shell からの切替 API。
+- `app/host/server/index.mjs:147-151` — ホストの初期化時に `createAppUi` を生成。

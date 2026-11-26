@@ -1,67 +1,62 @@
-# `--config`（quick-benchmark）
+# `--config`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-24` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `quick-benchmark` |
-| コマンド | `bench.sh` / `BENCH.bat`（`tools/strata_bench.py` に委譲） |
+| コマンド | `bench.sh` / `BENCH.bat`（委譲先: `python tools/strata_bench.py`） |
 | オプション | `--config` |
 | 別名 | なし |
-| 値 | 設定 JSON ファイルのパス（`FILE`）。parser 上の型・範囲検証なし |
+| 値 | JSON 設定ファイルのパス（1 個） |
 
 ## 役割
 
-quick benchmark が起動する Strata サーバーのモデル設定 JSON を選びます。通常は設定内のエンジン実行ファイル・引数などを使ってサーバーを起動します。すでに対象サーバーが動いていれば、そのサーバーを使います。
-
-このオプションは `strata bench run` の標準比較ベンチマークではなく、`bench.sh` / `BENCH.bat` が起動する `tools/strata_bench.py` のものです（索引: [`docs/cli/README.md`](../../README.md) の `quick-benchmark` 節）。
+ベンチマークに使う Strata モデル設定ファイルを指定します。`--url` を指定せずサーバーを起動する場合は、この設定で起動し、ポートや API キーなども設定から読みます。省略時は `terminal/` 直下にある有効な `strata-*.json` のうち更新日時が最も新しいものを選びます。
 
 ## 使い方
 
 ```sh
-# Strata ルートで、指定した設定を使って quick benchmark を実行
-./bench.sh --config strata-q4.json
+# リポジトリルートから、terminal/ にある別のモデル設定を使って測定
+./tools/bench.sh --config strata-model.json
 ```
 
-Windows では同じ引数を `BENCH.bat --config strata-q4.json` に渡せます。両 wrapper は作業ディレクトリを Strata ルートへ移してから引数を Python スクリプトへそのまま渡します（`bench.sh:6-10`、`BENCH.bat:8-16`）。
+`tools/bench.sh` は `terminal/` に移動してから Python スクリプトへ全引数を渡します。Windows の `tools/BENCH.bat` も同じスクリプトへ引数を転送します（`tools/bench.sh:6-10`、`tools/BENCH.bat:8-16`）。
 
 ## 値と既定値
 
-- `FILE` は文字列として受け取られます。parser は拡張子、JSON schema、必須キーを検証しません（`tools/strata_bench.py:932-948`）。
-- `--config` を省略し、`--url` も省略した場合、Strata ルート直下の `strata-*.json` を探します。`.shared-settings.json` で終わる名前、読めない/不正な JSON、`exe` がない設定、`args` が list でない設定は候補から除き、更新日時が最も新しいものを選びます。複数候補があると選んだファイル名を通知します（`tools/strata_bench.py:653-664,957-968`）。
-- 指定した相対パスは、まずプロセスの現在ディレクトリから解決します。そのパスが存在しないときだけ Strata ルートを基準に再解決します。絶対パスはそのままです（`tools/strata_bench.py:959-963`）。wrapper 経由なら現在ディレクトリは Strata ルートです。
-- `--config` の繰り返し指定に独自処理はありません。`argparse` の通常の単一値引数として解析されます（`tools/strata_bench.py:934,948`）。
-- `--url` を使うと設定ファイルは起動サーバーの選択には使われません。ただし同時に `--config` を指定した場合は設定ファイルを先に読み込みます。`--url` と `--config` の両方を省略した場合だけ、設定ファイルの自動選択・読み込みを行わずに済みません（`tools/strata_bench.py:935,957-979`）。
+- 値は `argparse` が受け取る文字列で、parser に `type`、`choices`、`required`、既定値の指定はありません。省略時は `None` です（`terminal/tools/strata_bench.py:1079-1095`）。
+- 指定パスが絶対パスならそのまま使います。相対パスが現在の作業ディレクトリに存在すればそのパスを使い、存在しなければ Strata の `terminal/` (`ROOT`) を基準に解決します（`terminal/tools/strata_bench.py:56`、`1104-1110`）。
+- ファイルが存在しない、または通常ファイルでない場合は stderr にセットアップ案内を出し、終了コード `2` で終了します。JSON の読み込みは UTF-8 BOM を許容しますが、JSON 構文や設定オブジェクトの形はこのオプションの parser では検証されません。不正 JSON は `json.loads` から例外になります（`terminal/tools/strata_bench.py:1116-1121`）。
+- 設定オブジェクトはサーバー起動時に `terminal/serve/server.py` の `--config` へ渡されます。同サーバーの説明では `exe`、`args`、`cwd`、`tokenizer`、`model_name` などを含む JSON とされています（`terminal/tools/strata_bench.py:812-829`、`terminal/serve/server.py:9157-9160`）。
 
 ## 実行時の動作
 
-`--config` が指定されると、そのファイルが存在する通常ファイルかを確認して UTF-8 BOM を許容して JSON として読み込みます。ファイルが不在、または通常ファイルでない場合は stderr に設定がない旨を出し、終了コード `2` で終了します（`tools/strata_bench.py:959-973`）。
-
-`--url` がなく、設定の port に Strata サーバーが応答していない場合、bench は `serve/server.py --engine strata --config FILE --port PORT` を子プロセスとして起動し、設定中の `host` と port を使って応答を確認します。設定 JSON はサーバーのエンジン設定（`exe`、`args`、`cwd` など）として渡されます。設定の相対 `exe` は server 側で `cwd` を基準に絶対パス化されます（bench: `tools/strata_bench.py:977-995`、server: `serve/server.py:8141-8142,8394-8404`）。`--port` が併用されると設定中の port に優先します（bench: `tools/strata_bench.py:936,977-979`）。
-
-設定に `api_key` がある場合は接続キーの候補になります。明示した `--api-key`、または既定値として読み取った `STRATA_KEY` が空でなければそちらが使われます（`tools/strata_bench.py:938,974`）。
-
-既定設定を自動選択する場合と異なり、明示した設定は `find_configs` の候補条件による事前検査を通りません。JSON の構文エラーは読み込み箇所で捕捉されず、設定オブジェクトの形式不足も bench 側では schema 検証されません（`tools/strata_bench.py:653-664,969-974`）。サーバー側では設定に従ってエンジンを起動し、設定エラーは `[strata] config ...` の形で終了させる経路があります（`serve/server.py:8394-8408`）。
+- `--url` を指定しない場合、指定設定を読み込みます。`--port` がなければ JSON の `port`（なければ `8080`）を使用し、設定の `host` と組み合わせて接続先を決めます。既定サーバーがすでにそのポートで応答していて Strata と判定されれば、そのサーバーを利用します。別サービスが応答するとポート指定を案内して終了コード `2` になります（`terminal/tools/strata_bench.py:1121-1137`）。
+- Strata サーバーがまだ応答しない場合、ベンチマークが設定ファイルを `serve/server.py --engine strata --config <file> --port <port>` に渡して起動し、準備完了を待ちます。起動失敗またはタイムアウトではログ末尾を stderr に出し終了コード `1`、起動したプロセスは終了処理で停止します（`terminal/tools/strata_bench.py:812-829`、`1139-1146`、`1181-1184`）。
+- `--url` を指定した場合も `--config` を同時指定すると設定を読み込みますが、接続先は `--url` で決まり、その設定でサーバーは起動しません。設定は API キーのフォールバック、GPU・モデルなどの測定情報にも使われます。`--url` だけを指定した場合は設定ファイルを読みません（`terminal/tools/strata_bench.py:1104-1125`、`1128-1141`、`718-770`）。
+- 設定の `args` に `--expert-profile-save FILE`（または `--expert-profile-save=FILE`）があると、ベンチマークはサーバーへ渡す一時コピーからその指定を除きます。元の設定は変更せず、stderr に理由を通知し、一時設定をログファイルと同じ一時ディレクトリに作ります（`terminal/tools/strata_bench.py:796-829`）。
+- 設定情報は結果の `README.md` と `results.json` に記録されます。設定表示では `exe`・`args` のパスを基底名にし、`cwd`、`log`、設定の `env` 全体や名前に `key`／`token`／`secret`／`password`／`auth` が含まれるキーを除きます。`env` のうち `STRATA_`、`HIP_`、`CUDA_`、`ROCR_`、`ONEAPI_`、`SYCL_` で始まる項目は記録対象です。書き込み・表示前にホーム、ユーザー名、ホスト名、IP、API キーなどの値も置換されます（`terminal/tools/strata_bench.py:81-118`、`645-662`、`1057-1065`）。
 
 ## 適用条件と副作用
 
-- `--url` がなく、設定に記載された接続先で Strata サーバーが既に動作している場合、bench はそのサーバーを使い、設定から新しいサーバーを起動しません。したがって、`--config` を指定しても稼働中サーバーの設定を差し替えません（`tools/strata_bench.py:983-995`）。`--url` を明示した場合はその URL に接続し、応答する Strata がなければ stderr に表示して終了コード `2` です（同: `975-987`）。
-- 起動に使う設定に `args` 内の `--expert-profile-save FILE` または `--expert-profile-save=FILE` が含まれる場合、bench はその指定を除いた一時 JSON を OS の temp ディレクトリに作り、元の設定ファイルを変更せずに起動します。除去した旨を stderr に通知します（`tools/strata_bench.py:672-705`）。
-- bench が起動したサーバーは、bench 終了時に停止されます。bench は同時に一時ディレクトリへサーバーログを書きます（`tools/strata_bench.py:992-999,1035-1037`）。
-- ベンチマークが成功すると、結果レポートにも選択された設定由来の情報（モデル設定・起動引数など）が含まれます。設定中の secret/token/password 系キー、`log`、`cwd` はレポートの設定ビューから除外され、パスは一部の値でファイル名に短縮されます。出力先は既定で `bench/results` です（`tools/strata_bench.py:529-546,826-835,910-918,1017-1018`）。
-- 不正な JSON は `--config` の読み込み時に `JSONDecodeError` となり、独自の利用者向けエラー処理や終了コード変換は確認できません（`tools/strata_bench.py:973`）。設定の JSON schema・キーごとの完全な受理規則はこのオプションの parser では検証されず、設定を消費する server の処理に依存します。
+`--config` はベンチマークの入力設定を選びます。通常のサーバー起動経路では指定モデルのエンジンを起動し、HTTP API に測定リクエストを送ります。すでに Strata が応答していればそのサーバーを利用し、設定に基づく起動を行いません。設定ファイル自体は書き換えませんが、前述の `--expert-profile-save` 除去条件では一時 JSON を作成します。レポートは通常 `bench/results/`（リポジトリの `docs/bench-results/` があればそちら）に作成され、`--out` で変更できます（`terminal/tools/strata_bench.py:1057-1065`、`1164-1165`）。
+
+値が JSON ファイルのパスとして妥当か以外に、parser 側の独自 validation や空文字の拒否はありません。設定 JSON 内の実行可能ファイルや引数の妥当性、および起動後のエンジン固有の失敗条件は、このオプションだけからは確定できず、サーバー側の処理に委ねられます。
 
 ## 出力とエラー
 
-- 指定ファイルが見つからない場合、または通常ファイルでない場合は、「このフォルダーに Strata モデルが設定されていない」旨を stderr に出し、終了コード `2`（`tools/strata_bench.py:969-972`）。
-- `--config` による起動先 port が Strata 以外の応答を返す場合、port 指定を促すメッセージを stderr に出し、終了コード `2`（`tools/strata_bench.py:989-991`）。
-- 起動サーバーが ready にならない場合、stderr に最後のログ行（最大 15 行）を表示して終了コード `1`（`tools/strata_bench.py:996-999`）。
-- 明示した JSON の読み込み例外は捕捉されず、Python の例外出力になります（`tools/strata_bench.py:973`）。
+- パスが見つからない場合は stderr に「No Strata model is set up...」を出して `2`（`terminal/tools/strata_bench.py:1116-1119`）。
+- `--url` 先に Strata が応答しない場合は stderr に通知して `2`（`terminal/tools/strata_bench.py:1130-1134`）。
+- 起動したサーバーが準備完了にならない場合はログ末尾を秘匿化して stderr に出し `1`（`terminal/tools/strata_bench.py:1143-1146`）。
+- JSON 構文エラーはこの箇所では捕捉されず、通常の Python 例外として伝播します（`terminal/tools/strata_bench.py:1120`）。
 
 ## 根拠
 
-- `tools/strata_bench.py:932-948` — parser 定義。値の型変換・既定値・alias は指定されていない。
-- `tools/strata_bench.py:653-664,957-979` — 自動選択、明示パスの解決、存在確認、JSON 読み込み、port/host/key の利用。
-- `tools/strata_bench.py:672-705,983-999,1035-1037` — 設定からのサーバー起動、profile-save の除去、一時ファイル、既存サーバー利用、起動待ち失敗、終了時停止。
-- `serve/server.py:8141-8142,8394-8408` — server 側で設定 JSON を受け取り、設定の `exe` と `cwd` を使い、設定エラーを処理する箇所。
-- `bench.sh:6-10`、`BENCH.bat:8-16` — wrapper がルートへ移動して引数を委譲する箇所。
+- `terminal/tools/strata_bench.py:1079-1095` — `--config` の parser 定義と、型・既定値・必須指定がないこと。
+- `terminal/tools/strata_bench.py:1104-1125` — パス解決、既定設定選択、JSON 読み込み、`--url`・ポート・host との関係。
+- `terminal/tools/strata_bench.py:777-789` — 省略時に有効な `strata-*.json` を更新日時順で選ぶ条件。
+- `terminal/tools/strata_bench.py:796-829`、`1139-1146`、`1181-1184` — 設定の安全な一時加工、サーバー起動・準備待ち・終了処理。
+- `terminal/tools/strata_bench.py:645-662`、`1057-1065`、`1164-1165` — レポートに含める設定情報、秘匿化、出力先。
+- `terminal/serve/server.py:9157-9160` — 委譲先サーバーの `--config` と JSON の説明。
+- `tools/bench.sh:6-10`、`tools/BENCH.bat:8-16` — POSIX / Windows の入口からの引数転送。

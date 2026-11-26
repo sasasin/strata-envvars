@@ -1,6 +1,6 @@
-# `--yes`
+# `strata connect --yes`
 
-調査対象: Strata commit `7dd5cf18e68c639a8773e096c5c79f971ea2a9f5`（2026-10-25 時点）。調査対象 checkout は `main`（`origin/main` と同期）で、`git status --short --branch` に未コミット変更はありませんでした。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
@@ -8,47 +8,49 @@
 | コマンド | `strata connect` |
 | オプション | `--yes` |
 | 別名 | なし |
-| 値 | 値を取らない真偽フラグ。省略時 `False`、指定時 `True`。 |
+| 値 | 値を取らないフラグ（指定時 `True`、省略時 `False`） |
 
 ## 役割
 
-`strata connect <アプリ名> --write` が設定ファイルを書き込む前に行う確認を省略します。単独では書き込みを開始しません。parser は `connect` 専用であり、同じ綴りの `strata launch --yes` とは適用先が異なります（`strata_cli/launch/cmd.py:148-165`）。
+`--write` が出力するアプリ設定ファイルを書き込む前の対話確認を省略します。このフラグ単独ではファイルを書き換えません。
 
 ## 使い方
 
 ```sh
+# OpenCode 用の設定を確認なしで書き込む。既存ファイルは先にバックアップされる
 strata connect opencode --write --yes
 ```
 
-実際に書き込むファイルと接続設定はアプリ名および `--url`、`--key`、`--model`、`--preset` などで決まり、`--yes` 自体はそれらを変更しません（`strata_cli/launch/cmd.py:153-164, 864-870`）。
-
 ## 値と既定値
 
-`argparse` の `action="store_true"` で宣言されています。引数値は受け付けず、指定の有無だけを読みます。既定値は偽です。別名、追加の値 validation、範囲制限はありません（`strata_cli/launch/cmd.py:162`）。
+値は不要で、既定値は `False` です。parser は `store_true` として登録しており、短縮別名や値の validation はありません。同じフラグを複数回指定しても真偽値は `True` のままです（`terminal/strata_cli/launch/cmd.py:163-182`）。
 
 ## 実行時の動作
 
-アプリ名に対応する接続設定をレンダリングし、表示（または `--output json` の JSON 出力）した後、`--write` がある場合に書き込み処理へ進みます。生成対象ファイルがなければ「Nothing to write for this app.」を表示して終了し、確認も書き込みも行いません（`strata_cli/launch/cmd.py:857-879, 897-920, 930-933`）。
+`strata connect` は parser が作った Namespace を `run_connect` に渡します（`terminal/strata_cli/cli.py:2235-2237`）。`run_connect` はアプリ向け出力を組み立て、`--write` または `--dry-run` が指定されたときに書き込み処理へ進みます（`terminal/strata_cli/launch/cmd.py:1052-1054,1074-1080,1108-1110,1156-1158`）。
 
-書き込み対象がある場合、`--yes` が真なら確認入力を行わず `harness.write_file` を呼びます。偽なら対話端末では `[y/N]` を尋ね、「y」または「yes」のみ承認します（空入力を含む他の回答、および EOF は拒否）。承認されない場合は「Nothing was written.」を出して終了します（`strata_cli/launch/cmd.py:934-947`）。
+書き込み処理に対象ファイルがあり、`--dry-run` でもない場合、`--yes` がなければ確認を求めます。`--yes` があればこの確認分岐だけを飛ばし、対象ファイルを順に書き込みます（`terminal/strata_cli/launch/cmd.py:1019-1044`）。既存ファイルは `.strata-bak-<時刻>` 名でコピーされてから書き換えられ、出力先ディレクトリも必要に応じて作成されます（`terminal/strata_cli/launch/harness.py:355-360,387-399`）。
+
+他の関連フラグとの関係:
+
+- `--yes` だけでは書き込み処理は始まりません。`--write`（または `--dry-run`）が必要です。
+- `--dry-run` は確認を省いて書き込み内容をプレビューし、ディスク上のファイルを作成・変更しません。`--yes` の指定は不要です（`terminal/strata_cli/launch/cmd.py:1024-1027`, `terminal/strata_cli/launch/harness.py:355-360,387-390`）。
+- `--check` と併用した場合、サーバーへの確認を先に実行します。確認が失敗すると終了コード 1 で戻り、`--yes` が指定されていても書き込みません（`terminal/strata_cli/launch/cmd.py:1087-1107,1147-1155`）。
+- `--output json` でも同じ確認省略と書き込み経路を使います（`terminal/strata_cli/launch/cmd.py:1083-1118`）。
 
 ## 適用条件と副作用
 
-- `--yes` は `--write` の確認だけに作用します。`--check` を付けた場合、そのチェックは書き込み判定より先に実行され、省略されません（`strata_cli/launch/cmd.py:921-947`）。
-- 非対話環境で `--write` を使い、`--yes` を付けない場合は stderr に `strata: --write asks first; run it in a terminal or add --yes.` を出し、終了コード `2` で停止します（`strata_cli/launch/cmd.py:934-937`）。
-- `--yes` と `--write` を併用すると、生成された設定ファイルを書き込みます。親ディレクトリがなければ作成し、既存ファイルは `.strata-bak-<時刻>` にコピーしてから置き換えます。JSON merge 対象では既存キーを保ち、新しいキーを優先します。書き込み後は可能なら mode `0600` を設定します（`strata_cli/launch/harness.py:275-298`）。
-- `--yes` 単独（`--write` なし）ではこの書き込み処理に入らず、設定内容の表示だけです（`strata_cli/launch/cmd.py:930-947`）。
+この `--yes` は `connect` サブコマンドの parser に登録されたフラグで、`launch` 側の同名フラグとは別のスコープ・動作です（`terminal/strata_cli/launch/cmd.py:150-152,163-182`）。書き込みは `--write` が有効な場合に限られ、`--yes` 自体は設定ファイルを変更しません。書き込みによるファイル作成・置換・バックアップについては上記の通りです。
 
 ## 出力とエラー
 
-確認を省略して書き込みが成功すると、ファイルごとに `Created`、`Replaced`、`Merged` とパスを表示し、バックアップがあればそのパスも表示します（`strata_cli/launch/cmd.py:945-947`, `strata_cli/launch/harness.py:297-298`）。書き込み時の `OSError` はトップレベルの CLI 処理で捕捉され、通常出力では `strata: <エラー>` を stderr に、JSON 出力では `ok: false` のエラー JSON を stdout に出して終了コード `6` を返します（`strata_cli/cli.py:527-532, 2176-2183`）。
+- `--write` を対話端末なしで実行し、`--yes` も `--dry-run` もない場合は「端末で実行するか `--yes` を追加する」旨を返し、終了コード 2 になります（`terminal/strata_cli/launch/cmd.py:1025-1027`）。JSON 出力ではエラーを含む JSON オブジェクトを stdout に出します（同 `cmd.py:1108-1115`）。
+- 対話確認に `y` または `yes` 以外を入力した場合（EOF を含む）は何も書かず、終了コード 0 です（`terminal/strata_cli/launch/cmd.py:1028-1038`）。
+- 書き込み中の `OSError` は失敗として報告され、後続ファイルは `not_written` とされ、終了コード 1 になります（`terminal/strata_cli/launch/cmd.py:1039-1049`）。
 
 ## 根拠
 
-- `strata_cli/launch/cmd.py:148-165` — `connect` parser と `--yes` の定義。
-- `strata_cli/launch/cmd.py:842-870` — アプリ名の解決、既定接続先・設定値の選択。
-- `strata_cli/launch/cmd.py:921-947` — `--check`、確認・非対話時の拒否、書き込み呼び出し。
-- `strata_cli/launch/harness.py:275-298` — 親ディレクトリ作成、バックアップ、JSON merge、書き込み、権限設定。
-- `strata_cli/cli.py:527-532, 2176-2183` — 共通エラー出力と `OSError` の終了経路。
-
-調査は指定 commit のローカルソースに限定しました。CLI の実行や `--help`、Release 配布物との照合は行っていません。
+- `terminal/strata_cli/launch/cmd.py:163-182` — `connect` parser と `--yes` の `store_true` 登録、および隣接オプション。
+- `terminal/strata_cli/cli.py:2235-2237` — `connect` の処理関数への dispatch。
+- `terminal/strata_cli/launch/cmd.py:1019-1050,1052-1080,1087-1118,1147-1168` — 確認省略、書き込み・dry-run 条件、`--check` の順序、出力と終了コード。
+- `terminal/strata_cli/launch/harness.py:355-399` — 既存ファイルのバックアップ、dry-run、およびファイル書き込み。

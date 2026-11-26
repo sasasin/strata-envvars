@@ -1,61 +1,57 @@
-# `strata-inkling --parallel`
+# `strata-inkling` `--parallel`
 
-調査対象: Strata commit `73d4f4196c25a65e02f6b9ef25d354826ce55105`（`2026-11-23` 時点）。
+調査対象: Strata commit `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（2026-11-25 時点）。
 
 | 項目 | 内容 |
 | --- | --- |
 | ツール ID | `strata-inkling` |
-| コマンド | `strata-inkling`（root） |
+| コマンド | `strata-inkling`（トップレベル） |
 | オプション | `--parallel` |
 | 別名 | `--batch`、`--slots` |
-| 値 | 整数として `atoi` で変換し、`1..64` に丸める |
+| 値 | 整数。受理後に 1〜64 へ補正 |
 
 ## 役割
 
-同時に扱うリクエスト slot 数を指定します。主な効果は `--serve` の同時リクエスト枠で、`--bench` では同数の合成系列をまとめて実行します。値に応じて起動時の slot pool と KV cache の設定も変わります。CUDA/HIP 共通 parser は `--parallel`、`--batch`、`--slots` を同じ値に設定します（`engine/src/inkling2/ink_main.cpp:411-412`）。
+同時に扱うリクエスト slot の数を指定する。serve では同時に実行できるリクエスト数、bench と batch-check では処理する slot 数を決める。既定値は 1。
 
 ## 使い方
 
 ```sh
-# serve で最大 4 リクエストを同時に受け付ける
-strata-inkling --serve --native ./model.strata --parallel 4
-
-# benchmark で 4 系列の合成 prompt/decode を実行する
-strata-inkling --bench --native ./model.strata --parallel 4
+strata-inkling --serve --native ./model.strata --parallel 8
+strata-inkling --bench --native ./model.strata --parallel 8
 ```
+
+`--batch` と `--slots` も同じ値を設定する別名である。
 
 ## 値と既定値
 
-- 省略時は `BackendOpts::parallel` の初期値 `1` です（`engine/src/inkling2/ink_backend.h:17-20`）。
-- parser は `std::atoi` の結果を `max(1, min(64, value))` に通します。したがって `0`、負数、数値に変換できない文字列は `1`、`64` を超える値は `64` になります。範囲外・非数値としてエラーにはしません（`engine/src/inkling2/ink_main.cpp:411-412`）。slot 上限の定数は `64` です（`engine/src/inkling2/ink_batch.h:11-14`）。
-- 値が必要で次の引数がない場合は `missing value after --parallel` を stderr に出して終了コード `2` で終了します（別名でもその入力文字列を表示。`engine/src/inkling2/ink_main.cpp:381-383`）。
-- 同じオプションを複数回指定した場合、引数を順に処理して同じフィールドへ代入するため最後の値が残ります（`engine/src/inkling2/ink_main.cpp:379-383,411-412`）。
+値は `atoi` で整数へ変換され、その後 `max(1, min(64, 値))` が設定される。したがって 0 や負数は 1、64 を超える値は 64 になる。整数として変換できない文字列も `atoi` の結果 0 となるため 1 に補正され、厳密な数値検証エラーにはならない。値が省略された場合は `missing value after --parallel`（別名の場合は指定した表記）を標準エラーに出して終了コード 2 で終了する。複数回指定した場合は引数走査中に後の値で上書きされる。既定値 1 は `BackendOpts::parallel` の初期値である（`engine/src/inkling2/ink_main.cpp:845-849,877-878`; `engine/src/inkling2/ink_backend.h:17-20`）。
 
 ## 実行時の動作
 
-- **`--serve`**: 起動時に `P = clamp(parallel, 1, 64)` 個の slot を確保し、その数を `INFO` の `batch_slots` に出します。同出力の末尾の `parallel` 欄は上限値 `64` です。自動割り当ての `GENERATE` は空き slot を探し、すべて使用中なら `ERR busy: all P parallel slots active` を返します（`engine/src/inkling2/ink_serve.h:441-465,479-485,685-690`）。slot pool を作れない場合は `ERR alloc_slot ...` を出して終了コード `1` になります（同 `:458-464`）。
-- **`--bench`**: `P` 個の slot に合成 prompt を投入し、decode も各 slot で実行します。出力には実際の `parallel=P` が含まれます（`engine/src/inkling2/ink_main.cpp:158-185,225-248`）。
-- **直接生成（`--serve` / `--bench` なし）**: backend slot pool は `parallel` に応じて初期化されますが、直接生成経路は slot `0` のみを確保・使用します（`engine/src/inkling2/ink_main.cpp:564-578,588-610`）。ただし後述の KV 自動選択には値が使われます。
-- CPU、CUDA、HIP backend はいずれも `opts.parallel` から `1..64` の slot 数を決めます。CPU backend は pool をその数で resize し、slot ごとに KV・ShortConv 等の状態を初期化します（`engine/src/inkling2/ink_cpu_backend.cpp:304-327`）。CUDA backend は同じ数を容量見積りに使い、slot 数が大きい場合は KV 等の起動時必要量も変わります（`engine/src/inkling2/cuda/ink_cuda_backend.cu:146-189`）。
-- `--kv-dtype` / `--kv` を `auto` のままにしている場合、parallel が `16` 以上なら parser 後に KV dtype を FP8_E4M3 に設定します（`engine/src/inkling2/ink_main.cpp:535-538`）。明示的な KV dtype は parser で auto を解除します（`engine/src/inkling2/ink_main.cpp:415-424`）。CUDA backend も `max_slots_ >= 16` なら auto 選択を FP8 にします（`engine/src/inkling2/cuda/ink_cuda_backend.cu:148-159`）。HIP backend の追加の自動選択は auto が有効で、parallel が 16 以上かつ実効 GPU メモリが 36 GiB 以下の場合、または UMA でない GPU が 13 GiB 以下の場合です（`engine/src/inkling2/hip/ink_hip_backend.hip.cpp:693-701`）。
+- `--serve` では、補正済みの値を最大 slot 数 `P` として使い、backend に `0..P-1` の slot を割り当てる。空き slot がなければ `GENERATE` 要求に `ERR busy: all ... parallel slots active` を返し、指定 slot が範囲外なら範囲エラーを返す（`engine/src/inkling2/ink_serve.h:494-498,541-548,799-810`）。
+- `--bench` では `P` 個の slot を割り当て、合成 prompt を各 slot に流して同時処理を計測する。結果には `parallel=P` が表示される（`engine/src/inkling2/ink_main.cpp:131-165,167-184,227-250`）。
+- `--batch-check N` では比較対象の slot 数 `K` として使う。K 個の slot を割り当て、同一リクエストの単独実行と K slot バッチ実行の logits を比較する（`engine/src/inkling2/ink_main.cpp:450-463,496-538`）。
+- 自動 KV dtype が有効なまま値が 16 以上の場合、KV dtype の既定選択を FP8_E4M3 にする。`--kv` / `--kv-dtype` で明示形式を指定すると自動選択は無効になる（`engine/src/inkling2/ink_main.cpp:882-889,1021-1024`; 初期状態は `engine/src/inkling2/ink_backend.h:33-35`）。
+
+値は `BackendOpts` に保持され、slot pool の上限 64 として backend に渡る（`engine/src/inkling2/ink_batch.h:11-14`; `engine/src/inkling2/ink_backend.h:17-20,82-86`）。slot の KV 領域はページ単位で確保される設計だが、slot 数を増やすと同時に保持できるリクエストが増え、使用時のメモリ需要も増える（`engine/src/inkling2/ink_batch.h:13-14`; `engine/src/inkling2/ink_serve.h:541-548`）。
 
 ## 適用条件と副作用
 
-- この文書の対象は索引上の CUDA/HIP 共通 `strata-inkling` parser（`engine/src/inkling2/ink_main.cpp`）です。Metal と SYCL は別 parser・別 scope で、オプション文書も索引上別項目です（`docs/cli/README.md:1511-1513,1549-1552,1572-1575`）。
-- `--serve` では起動時に指定数の slot 状態を用意します。KV は paged 方式ですが、サーバーは全 slot を初期化し、最初のリクエストに先立って全 slot の `alloc_slot` を呼びます（`engine/src/inkling2/ink_serve.h:458-465`）。CUDA では slot 数が KV・workspace の容量見積りに含まれます（`engine/src/inkling2/cuda/ink_cuda_backend.cu:170-189`）。
-- slot 数は最大同時リクエスト枠であり、単発生成を複数系列で行う指定ではありません。`--bench` を除く直接生成では slot 0 だけが使われます（`engine/src/inkling2/ink_main.cpp:575-610`）。
-- FP8 自動選択は KV dtype が auto のときの動作です。明示的に `--kv-dtype fp16` 等を指定すると parser が auto を解除するため、parallel だけでは KV dtype を FP8 にしません（`engine/src/inkling2/ink_main.cpp:415-424,535-538`）。
+この parser は mode ごとにオプションの適用を制限せず、値を共通設定へ格納する。ただし通常の単発生成は slot 0 だけを割り当てるため、`--parallel` による複数リクエスト処理はしない（`engine/src/inkling2/ink_main.cpp:1097-1101`）。`--spec-check` は内部で `parallel=1` に固定する（`engine/src/inkling2/ink_main.cpp:599-611`）。これらの mode でも 16 以上なら、前述の自動 KV dtype 選択には影響する（`engine/src/inkling2/ink_main.cpp:1021-1024`）。
+
+serve / bench / batch-check は複数 slot を backend に割り当てるため、初期化または slot 割り当てに失敗することがある。各経路は失敗内容を標準エラーまたは serve のプロトコル出力に出し、終了コード 1 を返す（`engine/src/inkling2/ink_main.cpp:143-165,454-463,1086-1094`; `engine/src/inkling2/ink_serve.h:541-548`）。GPU ごとの実際のメモリ消費量や、全 backend での割り当て上限はこのオプションの parser だけからは確定できない。
 
 ## 出力とエラー
 
-- serve 起動時の `INFO` は指定 slot 数を `batch_slots` に、上限値 `64` を `parallel` 欄に出します（`engine/src/inkling2/ink_serve.h:479-485`）。
-- 自動 `GENERATE` 要求で空き slot がないときは busy エラーを protocol 出力します（`engine/src/inkling2/ink_serve.h:685-690`）。slot 初期化失敗時は protocol の `ERR alloc_slot` を出して `1` を返します（同 `:458-464`）。
-- 値の形式検証はありません。`atoi` の変換結果が範囲へ丸められるだけで、非数値は `0` として扱われ `1` になります（`engine/src/inkling2/ink_main.cpp:411-412`）。
+`--parallel` 自体は値の受理・補正について警告を出さない。serve は `INFO` の `batch_slots` に設定 slot 数を出し、bench は計測行に `parallel` を出す（`engine/src/inkling2/ink_serve.h:562-568`; `engine/src/inkling2/ink_main.cpp:248-250`）。値の欠落は標準エラーと終了コード 2、未知のオプションは `unknown option` と終了コード 2 になる（`engine/src/inkling2/ink_main.cpp:845-849,985-988`）。backend 初期化・slot 割り当て・forward の失敗は各経路のエラー出力と終了コード 1 になる（`engine/src/inkling2/ink_main.cpp:161-165,183-185,232-234`; `engine/src/inkling2/ink_serve.h:541-548`）。
 
 ## 根拠
 
-- `engine/src/inkling2/ink_main.cpp:379-383,411-412`: parser、別名、整数変換と上下限処理、値不足時の終了。
-- `engine/src/inkling2/ink_backend.h:17-20`、`engine/src/inkling2/ink_batch.h:11-14`: 既定値と共通上限。
-- `engine/src/inkling2/ink_main.cpp:535-538`、`engine/src/inkling2/cuda/ink_cuda_backend.cu:146-189`、`engine/src/inkling2/hip/ink_hip_backend.hip.cpp:693-701`: KV dtype の自動選択と backend 条件。
-- `engine/src/inkling2/ink_serve.h:441-465,479-485,685-704`: serve slot 数、起動出力、同時実行枠とエラー。
-- `engine/src/inkling2/ink_main.cpp:158-185,225-248,575-610`、`engine/src/inkling2/ink_cpu_backend.cpp:304-327`: benchmark と直接生成の利用箇所、および CPU slot pool。
+- parser、別名、値の補正、欠落値の処理: `engine/src/inkling2/ink_main.cpp:845-849,877-878`
+- 値の既定値と backend option: `engine/src/inkling2/ink_backend.h:17-20`
+- 1〜64 の slot 上限: `engine/src/inkling2/ink_batch.h:11-14`
+- serve の slot 割当と空き slot 判定: `engine/src/inkling2/ink_serve.h:494-498,541-548,799-810`
+- bench と batch-check の slot 利用: `engine/src/inkling2/ink_main.cpp:131-165,450-463,496-538`
+- KV dtype の自動選択: `engine/src/inkling2/ink_main.cpp:882-889,1021-1024`; `engine/src/inkling2/ink_backend.h:33-35`
+- 単発生成と spec-check の扱い: `engine/src/inkling2/ink_main.cpp:599-611,1097-1101`

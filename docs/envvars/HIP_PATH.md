@@ -1,51 +1,43 @@
 # `HIP_PATH`
 
-調査対象: Strata `main` の HEAD `4b9e05a2a806a3fe24f7b2560d98626c37dade35`（2026-10-26 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Strata の HIP backend では、`strata serve` が engine 用の子プロセス環境を作る際、`HIP_PATH` が指す場所が存在しないときに、その変数を子プロセスへ渡さないようにします。存在する場所を指定している場合は値を保ちます。これは Strata が行う環境の整理であり、HIP runtime が `HIP_PATH` をどう解釈するかは対象外です。
-
-Strata 同梱の Windows packaging tool も、engine の依存 DLL を探す既定検索先の組み立てにこの値を使います。また `setup.py` は HIP engine や HIP image engine の build 前に、見つけた ROCm root を `HIP_PATH` に設定します。
+Strata 本体の engine 設定値として解釈されるのではなく、Strata の Python サーバーが engine 用環境を組み立てる際に、存在しないパスを指す値を AMD (`backend: hip`) の子 engine に渡さないよう除去する。また Windows 向け engine package 作成では、未同梱 DLL を探す ROCm の候補ディレクトリをこの値から作る。どちらも値の真偽や場所を Strata が確認する処理であり、HIP runtime が値をどう使うかは本書の対象外である。`terminal/serve/server.py:4007-4062,4065-4095`、`tools/packaging/package_engine.py:239-249,252-271`。
 
 ## 値と判定
 
-serve の `hip_env_guard()` は値を数値やパス文字列として parse・正規化しません。Python の辞書値として truthy かを見て、truthy の場合に `Path(value).exists()` を確認します。
+| 経路 | 未設定 | 設定時に有効になる値 | 無効・特別扱い |
+|---|---|---|---|
+| `strata serve` の子 engine、HIP backend | 親プロセス環境に無ければ `child_env` のコピーにも無い。 | 空でない文字列で、そのパスが `Path.exists()` を満たす場合は値をそのまま子 engine 環境に残す。 | 空文字は `if v` を通らず削除されないので、空文字のまま子へ渡る。空でないが存在しないパスは環境から削除される。文字列の trim、大小文字変換、パス正規化はしない。 |
+| `strata serve` の子 engine、HIP 以外 | 親環境の値をそのままコピーする。 | 値の形式・存在をこの guard は検査しない。 | `hip_env_guard` 自体が呼ばれない。 |
+| `tools/packaging/package_engine.py` の Windows package | `HIP_PATH` が無ければ ROCm の候補は追加されない。 | 空でない値 `root` から `root/bin/x64` と `root/bin` を候補化し、そのうちディレクトリであるものだけ検索対象に残す。 | 空文字は `if root` で無視。パス文字列の形式検証はなく、存在しない・ディレクトリでない候補は `is_dir()` で落ちる。 |
 
-| serve 子プロセス用の値 | Strata の処理 |
-|---|---|
-| 未設定 | 何もしない |
-| 空文字 | truthy でないため残す。存在確認や警告はしない |
-| 空でない値で、そのパスが存在する | `HIP_PATH` をそのまま子プロセス環境に残す |
-| 空でない値で、そのパスが存在しない | 子プロセス環境から削除し、stderr に理由を出す |
-
-パスがディレクトリかファイルかは `exists()` だけでは区別しません。相対パスの解決や存在確認の細部は Python の `Path.exists()` に委ねられます。
-
-packaging tool の `_default_search(target)` は、target が `windows` で始まる場合に限り、`HIP_PATH` が空でなければ `<HIP_PATH>/bin/x64` と `<HIP_PATH>/bin` を検索候補に加え、存在するディレクトリだけを返します。明示的な `--search` が指定されていればそちらが優先されます。
+この変数について数値変換、真偽文字列 (`true` / `false`) の解析、数値境界はない。たとえば `0`、`false`、空白だけの値も一般のパス文字列として扱われ、サーバーではパスが存在するか、packager ではその配下がディレクトリかで決まる。サーバーでは `HIP_PATH=0` が存在しないパスなら除去され、実在する `HIP_PATH` なら残る。`server.py:4073-4077`、`package_engine.py:244-249`。
 
 ## 有効になる条件
 
-- serve の整理は `child_env()` が `cfg["backend"] == "hip"` の場合に `hip_env_guard()` を呼ぶ経路でだけ行われます。CUDA backend などではこの guard は呼ばれません。
-- `child_env()` はまず親プロセスの `os.environ` を複製し、config の `env` を重ねてから guard を呼びます。そのため確認対象は、親環境か config の `env` から得た最終的な子プロセス用の値です。
-- replicas も各 engine 起動時に `child_env()` を使います。
-- setup の build 時設定は `rocm_root()` が選んだ root を `HIP_PATH` に上書きします。これは利用者が起動前に設定する値の解釈とは別の処理です。
-- packaging の検索先として使うのは Windows target の場合だけです。既定検索先にディレクトリが追加されても、依存 DLL が実際に見つかったときだけコピー対象になります。
+- サーバー側の検査・除去は `cfg.get("backend") == "hip"` の場合だけ行われる。CUDA、SYCL、その他 backend では不正な値でも Strata はこの箇所で変更しない。`terminal/serve/server.py:4054-4062`。
+- server 環境は親の `os.environ` のコピーから作られ、続いて `cfg["env"]` の項目が同名値を上書きする。その後 HIP guard が評価されるため、設定内の `HIP_PATH` も guard の対象となる。`terminal/serve/server.py:4010,4027-4028,4054-4055`。
+- package 側の既定検索は `target.startswith("windows")` の場合だけ利用可能。明示的な `--search` 候補が1つ以上渡ると、その候補群が既定検索を置き換える。`--search` が空なら既定検索が使われる。`tools/packaging/package_engine.py:210,239-249,252-258,317-318,367-371`。
+- packager は missing library があるときに検索する。`HIP_PATH` 由来の候補も `PATH` 由来の既存ディレクトリと合わせて探索されるため、`HIP_PATH` が未設定でも `PATH` 等に DLL があれば解決しうる。見つからない DLL が残れば package 作成を拒否する。`tools/packaging/package_engine.py:252-281`。
 
 ## 実行時の詳細
 
-HIP backend の child environment を作るとき、Strata は `HIP_PATH`、`HIP_DEVICE_LIB_PATH`、`LLVM_PATH` を順に確認します。`HIP_PATH` が空でないのに `Path(value).exists()` が偽なら、環境辞書からそのキーを削除し、`strata serve: AMD: HIP_PATH=<値> does not exist: not passed to the engine` を stderr に出します。空か有効なパスならログを出さず、値を変更しません。親プロセスの `os.environ` はこの関数では変更されません。
+`child_env` は子 engine の起動環境を作るたびに `dict(os.environ)` を含む新しい辞書を作り、設定由来の `env` を反映してから HIP backend の guard を呼ぶ。存在しない `HIP_PATH` はその辞書から削除され、stderr に `strata serve: AMD: HIP_PATH=<値> does not exist: not passed to the engine` と出る。存在する値や空文字は変更されず、`StrataEngine` が `--serve` engine を `env=env` で起動するときに渡される。`terminal/serve/server.py:4007-4010,4027-4028,4054-4055,4073-4077,4093-4094, terminal/serve/server.py:833-835`。
 
-その後 `child_env()` の返却値が `StrataEngine` 起動に渡されます。直接の serve 起動と replica 起動の両方がこの経路を使います。`HIP_PATH` に有効な値があるとき、または空文字のとき、Strata はそれを保持して子に渡します。
+この処理は `child_env` の呼び出しごとに評価され、`HIP_PATH` を保存する static cache はない。したがってサーバープロセスの環境または設定値が次の engine 起動前に変われば、その次の環境構築で再評価される。既に起動した子の環境は起動時に渡された値のままである。通常起動のほか、分割 fallback、replica、prefill/decode engine も `child_env` を経由している。`terminal/serve/server.py:8820-8824,8845-8852,8911-8919,9391-9394`。
 
-## 文書との照合
+package 作成時は `build` から `_bundle_missing_libraries` に渡った検索候補が空の場合、Windows target に限り `HIP_PATH` を読み、存在する `bin/x64`・`bin` ディレクトリを検索候補に加える。対象 DLL がそこに見つかれば staging にコピーし、依存 DLL が最後まで見つからない場合は `SystemExit` で `refusing to package: ...` と説明を出して終了する。ここでの読み取りは packager の呼び出し中に行われ、engine 実行時の設定ではない。`tools/packaging/package_engine.py:210,239-281`。
 
-`docs/STRIX_HALO.md` は ROCm の build 環境例として `HIP_PATH` を設定しています。`docs/DETAILS.md` と `docs/AMD_HIP.md` には、この serve 時の存在確認・削除・警告の挙動は見当たりません。ソースで確認できるのは Strata が子プロセス用環境から削除するところまでで、HIP runtime 側の効果はここでは判断しません。
+## ログと測定値
+
+サーバーは HIP backend で空でない `HIP_PATH` が存在しないときだけ、stderr に `strata serve: AMD: HIP_PATH=<値> does not exist: not passed to the engine` を出す。存在する値・空文字・HIP 以外の backend では、この変数についての警告は出ない。packager は見つけた DLL を `bundled <DLL名> (imported by the engine; from <ディレクトリ>)` と出力し、依存関係を満たせないときは package 拒否のエラーを出す。`tools/packaging/package_engine.py:271-281`。測定値は該当しない。
 
 ## 根拠
 
-- `serve/server.py:3499-3537` — 親環境の複製、config `env` の上書き、HIP backend に限る guard 呼び出し。
-- `serve/server.py:3548-3578` — 空でない `HIP_PATH` の存在確認、削除、stderr 文言。
-- `serve/server.py:7980-7984,8344-8352` — replica engine と通常の Strata engine の起動で `child_env()` を利用。
-- `packaging/package_engine.py:236-246,249-255` — Windows target の default search に `HIP_PATH/bin/x64` と `HIP_PATH/bin` を追加し、明示検索先との優先を決める処理。
-- `setup.py:4619-4625,4690-4695,4842-4846` — HIP engine / image engine build 前に `HIP_PATH` を ROCm root に設定。
-- `docs/STRIX_HALO.md:56` — ROCm build 環境の設定例。
+- server 環境の継承・設定上書き・HIP backend 条件: `terminal/serve/server.py:4007-4062`
+- `HIP_PATH` の存在判定、削除、警告文: `terminal/serve/server.py:4065-4095`
+- 子 engine への環境引き渡し: `terminal/serve/server.py:833-835`
+- Windows package の環境読み取りと検索先構成: `tools/packaging/package_engine.py:210,239-249,252-281,317-318,367-371`

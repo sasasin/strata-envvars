@@ -1,46 +1,52 @@
 # `STRATA_KV_GROW_STEP`
 
-調査対象: Strata `main` の HEAD `7695859aa13afb248bdb4d36f9b2e95707db079d`（2026-10-12 時点）。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-elastic K/V（`--kv-grow`）が VRAM に追加確保するセル数の刻み幅を指定します。K/V を要求量に合わせて拡張するときと、要求が小さくなって K/V の VRAM を expert cache に返すときの丸め単位に使われます。K/V 拡張機能そのものを有効にするスイッチではありません。
+弾力的 K/V（`--kv-grow`）が K/V プールを追加確保するときのセル数の刻み幅を指定する。既定値は 8192 cells で、需要をこの幅の倍数へ切り上げて確保し、`--max-context` を上限にする。変数は `kvg_start` で読み取られ、CUDA/HIP 系の `engine/src/program/generate.cpp` と SYCL の `engine/sycl/src/program/generate.cpp` に同じ設定がある（`engine/src/program/generate.cpp:11527-11550`, `engine/sycl/src/program/generate.cpp:6782-6797`）。
+
+これは弾力的 K/V 自体を有効化するスイッチではない。K/V プールが先に elastic として初期化され、`kvg_start` が有効と判断した場合にだけ刻み幅を上書きする。機能の有効化には `--kv-grow` または `STRATA_KV_GROW` が関係する（`engine/src/program/generate.cpp:7715-7732`, `engine/sycl/src/program/generate.cpp:4282-4299`）。
 
 ## 値と判定
 
-`kvg_start()` が `STRATA_KV_GROW_STEP` を `std::atoll()` で読み、変換結果が正のときだけ `kvg.step` に採用します。既定値は `8192` セルです。
+両実装とも `std::getenv` の結果を `std::atoll` に渡し、変換結果が `> 0` の場合だけ `kvg.step` に代入する。文字列全体の検証はなく、`atoll` が読む先頭の整数部分が正なら後続文字は判定に影響しない。未設定・空文字・数値に変換できない文字列・0・負数は既定の 8192 のまま。例えば `1`、`+16`、` 16tail`、`16tail` は正の値として使われ、`0`、`0tail`、`true`、`-1`、空文字は既定値のままになる。正の値に上限 clamp はない（`engine/src/program/generate.cpp:11531-11533,11550`, `engine/sycl/src/program/generate.cpp:6785-6787,6797`）。
 
-| 環境変数の値 | 結果 |
-|---|---|
-| 未設定 | 既定の `8192` セル |
-| 空文字、数値に変換できない文字列、`0` または負数 | 既定の `8192` セル |
-| 正の整数 | その値をセル数として採用 |
-| 数字の後ろに別の文字が続く値 | `atoll()` が読めた先頭の整数が正なら採用（例: `4096tail` は `4096`） |
+| 条件 | unset / 空文字 | 有効になる値 | 無効値の扱い |
+|---|---|---|---|
+| `kvg_start` で elastic K/V が有効 | 既定 `8192` cells | `atoll` の変換結果が正の値 | 既定 `8192` cells を維持 |
+| `kvg_start` で elastic K/V が無効 | `kvg_start` が早期 return し、変数を読まない | なし | 刻み幅は使われない |
 
-全体の文字列一致や厳密な数値 parse、上限 clamp はありません。`atoll()` のため、先頭の空白や符号も整数変換の規則に従います。値の単位はバイトではなく K/V のセル数です。
+この変数と CLI 引数の優先順位は、`STRATA_KV_GROW` / `--kv-grow` が機能を有効にした後の刻み幅設定である。別の値との上書き関係はなく、正値なら既定の 8192 を置き換える。`STRATA_KV_GROW_INIT` は初期確保セル数、`STRATA_KV_GROW_FLOOR` は cache から K/V に渡す slot の下限を設定する別用途で、step の値を変えない。正値の上限チェックはなく、grow 先の丸め計算も `int64_t` で行われるため、極端に大きな値での算術境界はコード上保証されない（`engine/src/program/generate.cpp:7721-7732,11527-11553,11563-11566`, `engine/sycl/src/program/generate.cpp:4288-4299,6782-6799,6809-6812`）。
 
 ## 有効になる条件
 
-この値が使われるのは、elastic K/V が有効な場合だけです。起動時の有効条件は、`--kv-grow` または `STRATA_KV_GROW` による要求に加え、単一 GPU、expert profile、全 K/V が VRAM にあること、全 expert が RAM にあること、expert cache の利用、VMM 対応が必要で、`--batch`、`--vram-elastic`、`--peer-device` は併用できません。条件を満たさない場合、要求があれば stderr に `--kv-grow is off (...)` を出し、`STRATA_KV_GROW_STEP` は適用されません。
-
-さらに、K/V 初期化後の `kvg_start()` では、elastic K/V、cache の VMM range、device residency table、resident expert 情報、expert source が揃い、対象 cache 領域が既定 floor の 128 slots より大きい場合にだけ `kvg.step` を読みます。CUDA と SYCL の `generate.cpp` に同じ判定があります。
+- `--kv-grow` または `STRATA_KV_GROW` により弾力的 K/V が要求され、実際に K/V プールが elastic として初期化されていること。`STRATA_KV_GROW` が空でなければ先頭文字が `'0'` でないかで要求を判定し、空または未設定なら CLI 値を使う（`engine/src/program/generate.cpp:7718-7732`, `engine/sycl/src/program/generate.cpp:4285-4299`）。
+- エンジン側の要求条件を満たすこと。コードは単一 GPU、`--kv-resident` が無効、expert profile があり、CPU resident experts が無効、expert cache が有効、remote cache がなく、VMM が利用可能で、`--batch`・`--vram-elastic`・`--peer-device` を使わない条件を確認する。要求されているのに条件を満たさない場合は `--kv-grow is off (...)` を stderr に出す（`engine/src/program/generate.cpp:7719-7729`, `engine/sycl/src/program/generate.cpp:4286-4296`）。
+- その後の `kvg_start` では、CUDA/HIP 経路は `kv_grow_start` により elastic pool が必要で、cache から slot を借りる場合はさらに VMM range、residency table、expert source、および floor より大きい slot 範囲が必要になる。これらが不足しても elastic pool が有効なら K/V の伸長自体は有効で、cache slot の融通をせず新規 VRAM だけを使う。SYCL 経路も elastic pool、cache の VMM range、device residency table、host residency、expert source、floor 超の slot 範囲を条件に cache 連携を有効化する（`engine/include/strata/core/kv_grow_rules.hpp:18-31`, `engine/src/program/generate.cpp:11541-11551`, `engine/sycl/src/program/generate.cpp:6791-6799`）。
+- `STRATA_KV_GROW_STEP` 自体は `kvg.on` の確認後に読み取られるため、弾力的 K/V が無効な経路では効果がない。CLI の直接生成経路と serve のセッション初期化経路から `kvg_start` が呼ばれる（例: `engine/src/program/generate.cpp:13208,24100-24101,24158-24161,24232-24235`; SYCL: `engine/sycl/src/program/generate.cpp:7666,13335-13338,13378-13382,13339-13443`）。
 
 ## 実行時の詳細
 
-`kvg_ensure(cells, ...)` は、現在の K/V より多くのセルが必要な場合に `cells` を `kvg.step` の倍数へ切り上げ、`--max-context` を上限として K/V pool を拡張します。したがって大きい step は拡張時に要求量より多くのセルをまとめて確保し、小さい step はより細かい単位で確保します。セルが現在量以下なら何もしません。
+`kvg.step` は `KvGrow` 状態のメンバーで、初期値 8192。`kvg_start` が elastic pool を確認した後に環境変数を評価する。static cache はなく、`kvg_start` が呼ばれるたびに読み取るが、その後の grow/trim では保存済み `kvg.step` を使うため、実行中に環境を変更しても既存の `kvg` 状態には反映されない（`engine/src/program/generate.cpp:11527-11553,11563-11566,11678-11685`; SYCL: `engine/sycl/src/program/generate.cpp:6782-6799,6809-6812,6963-6967`）。
 
-request 間の trim も同じ step で切り上げた目標量を使います。十分に余剰がある場合にだけ、K/V pool の後半を unmap して cache に戻し、expert を補充します。そのため step は grow と trim の両方の粒度および trim 判定に影響します。grow/trim は実際に動く場合、stderr に K/V のセル数や cache slot の移動を出します。終了時には elastic K/V の現在セル数、grow/trim 回数、退避・再補充した expert 数が表示されます。
+K/V を `cells` まで伸ばす際、通常の CUDA/HIP 経路は `kv_grow_target(cells, kvg.step, o.max_context)` で次の step 境界へ切り上げる。SYCL も同じ計算を行う。結果は `o.max_context` で制限される。必要な K/V が現在の容量以下なら grow を行わず、step は使われない（`engine/include/strata/core/kv_grow_rules.hpp:34-37`, `engine/src/program/generate.cpp:11563-11567`, `engine/sycl/src/program/generate.cpp:6809-6813`）。
 
-値は `kvg_start()` の実行時に通常一度だけ読み、その後の request ごとには読み直しません。実行中に環境変数を変更しても、そのプロセスの `kvg.step` には反映されません。子プロセスへの転送処理はこの変数について見つかりませんでした。
+```text
+target = min(max_context, ceil(cells / step) * step)
+```
+
+通常の CUDA/HIP 経路では、grow 前に実行中の device 作業を quiesce し、必要に応じて expert cache の slot/chunk を K/V に渡した後、elastic pool を grow する。cache 条件を満たさない場合は新規 VRAM から伸長する。SYCL 経路も grow 前に queue を待ち、必要な cache chunk を調整してから pool を grow する（`engine/src/program/generate.cpp:11561-11575,11649-11674`, `engine/sycl/src/program/generate.cpp:6807-6821,6927-6959`）。
+
+## ログと測定値
+
+この変数で選ばれた `step` の数値を直接出力するログはない。cache 連携が使われる場合、初期化時に `strata generate: elastic K/V: ...` が stderr に出る。grow 後は `strata: K/V grown to ...` が出て、失敗時には `strata: the K/V could not grow to ...` が続く。expert 移動や residency table upload の失敗もそれぞれ `strata: moving experts for the K/V failed: ...`、`strata: the residency table upload failed: ...` と出力する（`engine/src/program/generate.cpp:11554-11559,11632-11645,11665-11674`; SYCL: `engine/sycl/src/program/generate.cpp:6800-6805,6889-6925,6937-6959`）。
+
+grow が失敗した場合、呼び出し元は生成処理から終了コード `1` で戻る（例: `engine/src/program/generate.cpp:24100-24101,24158-24161,24232-24235`; SYCL: `engine/sycl/src/program/generate.cpp:13335-13338,13378-13382,13439-13443`）。測定値は記載しない。
 
 ## 根拠
 
-- `src/program/generate.cpp:6401-6418` — 既定値、elastic K/V の開始条件、環境変数の parse。
-- `src/program/generate.cpp:6426-6432,6510-6528` — 要求セル数の切り上げと grow 処理。
-- `src/program/generate.cpp:6530-6541` — trim 目標値の切り上げと K/V shrink。
-- `src/program/generate.cpp:4221-4238` — `--kv-grow` / `STRATA_KV_GROW` の有効条件と VMM 初期化。
-- `src/program/generate.cpp:10215-10221,10362-10365,11891-11896` — request、parked conversation、decode window での grow 呼び出し。
-- `src/program/generate.cpp:10438-10448,13391-13394` — request 間の trim と終了時の統計。
-- `sycl/src/program/generate.cpp:3768-3785,6056-6087,6238-6242` — SYCL 側の同等実装。
-- `src/core/layer.cpp:576-603`, `sycl/src/core/layer.cpp:659-705` — elastic K/V の pool 単位の grow/shrink。
-- `docs/DETAILS.md:260-264` — `--kv-grow` の概要と適用条件。step の値域や parse 規則は説明していないため、値の判定は実装に基づく。
+- 候補名の全参照: `engine/src/program/generate.cpp:11550`, `engine/sycl/src/program/generate.cpp:6797` が実際の `std::getenv` 読み取り。`terminal/data/settings-register.json:20208` にも名前があるが、実行時の読み取りではない。
+- 値の既定値・判定・step 境界: `engine/src/program/generate.cpp:11527-11550,11563-11566`, `engine/sycl/src/program/generate.cpp:6782-6797,6809-6812`。
+- 有効化条件・関連設定: `engine/src/program/generate.cpp:7715-7732`, `engine/sycl/src/program/generate.cpp:4282-4299`, `engine/include/strata/core/kv_grow_rules.hpp:18-37`。
+- grow の実行・結果: `engine/src/program/generate.cpp:11649-11674`, `engine/sycl/src/program/generate.cpp:6927-6959`。

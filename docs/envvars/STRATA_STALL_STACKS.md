@@ -1,44 +1,51 @@
 # `STRATA_STALL_STACKS`
 
-調査対象: Strata `main` の HEAD `ffa80d73133ea5c548aefe57889a16e8085a938f`（2026-11-03 時点）。外部ライブラリの環境変数動作は対象外。
+調査対象: Strata `main` の HEAD `d46f5f268f8ed797e83a5c63a69bffbd7a581cf6`（`2026-11-25` 時点）。
 
 ## 役割
 
-Windows 版 Strata の stall report に、報告時点での他スレッドの call stack を追加します。通常の推論処理や stall の検出条件は変えず、report の診断情報を増やします。スタック採取コードも `generate.cpp` 内の `_WIN32` 条件下にあります。そのため、Linux など Windows 以外のビルドではこの名前を環境から読みません（`src/program/generate.cpp:1712-1717,1826-1830`）。
+Windows で stall report を出すとき、呼出しスレッド以外のプロセス内スレッドを一時停止してスタックを採取し、その report に追記する診断用スイッチ。生成内容や GPU 処理を制御するものではない。実装は `stall_report` と `stall_stacks` 名前空間にある（`engine/src/program/generate.cpp:1979-2097,2110-2112`）。
+
+Windows 以外では環境変数を読むコードもスタック採取・表示コードもコンパイルされず、この変数は効果を持たない（`engine/src/program/generate.cpp:1979,2093-2097,2110-2112`）。
 
 ## 値と判定
 
-値は文字列全体として parse せず、`getenv()` が返す文字列の先頭文字だけを `'1'` と比較します（`src/program/generate.cpp:1826-1829`）。
+Windows の `stall_report` 呼出し時に `std::getenv` で値を取り、未設定でないことと先頭文字が `'1'` であることだけを判定する。文字列全体の数値変換・比較はしない（`engine/src/program/generate.cpp:2093-2097`）。
 
-| 状態 | 結果（Windows の stall report） |
-|---|---|
-| 未設定 | スタックを採取・出力しない |
-| 空文字 | 先頭文字が `'1'` でないため採取・出力しない |
-| 先頭文字が `1`（例: `1`, `10`, `1anything`） | 採取・出力する |
-| その他の先頭文字（例: `0`, `true`, 空白 + `1`） | 採取・出力しない |
+| 条件 | unset | 有効になる値（例） | 無効になる値（例） |
+|---|---|---|---|
+| Windows | 無効 | `1`, `10`, `1anything`（先頭文字が `1`） | 空文字、`0`, `true`, ` 1`, `01` |
+| Windows 以外 | 無効（読み取りなし） | なし | すべて（このコード経路では参照されない） |
 
-大文字小文字や数値としての妥当性は関係しません。値を CLI 引数や別設定から上書きする処理はこのコードにありません。
+空文字は `getenv` が非 null を返しても `e[0]` が `'1'` でないため無効。大文字小文字、後続文字、数値としての妥当性、空白は検証せず、先頭1文字だけを見る。CLI 引数や別の環境変数による上書きはない（`engine/src/program/generate.cpp:2093-2097`）。
 
 ## 有効になる条件
 
-- Windows ビルドであること。スタック採取と環境変数判定の両方が `_WIN32` ガード内です（`src/program/generate.cpp:1712-1717,1826-1830`）。
-- stall report が実際に呼ばれること。通常の serve watchdog は `STRATA_WATCHDOG_S`（未設定時 60 秒）の間 progress がなく、ファイル tier の読み取り猶予や明示的な progress allowance でも解除されない場合に report を出して engine を abort します（`src/program/generate.cpp:13223-13234,13345-13379`）。`STRATA_SPEC_WATCH` が正数なら、その診断 watchdog も停滞時に report 後 abort します（`src/program/generate.cpp:20049-20069`）。この変数自体は stall を検出したり、report を発生させたりしません。
+- OS が Windows であること。ほかの OS では関連コードが `_WIN32` 条件内にあるため読み取られない（`engine/src/program/generate.cpp:1979,2093-2097,2110-2112`）。
+- `stall_report` が呼び出されること。通常は serve の進捗 watchdog が停止判定したときで、`STRATA_WATCHDOG_S` 等の条件を満たして watchdog が動作する必要がある（`engine/src/program/generate.cpp:16261-16277,16297-16321`）。speculative generate 経路では `STRATA_SPEC_WATCH` が正の `atoi` 値として読まれ、その監視が停止判定した場合にも report を呼ぶ（`engine/src/program/generate.cpp:24915-24936`）。
+- 値の先頭文字が `1` であること。これを満たすと採取を行い、report 内にスレッドスタック節を出す（`engine/src/program/generate.cpp:2093-2097,2110-2112`）。
+- 採取できるスレッドだけが出力される。スナップショット作成失敗時は採取を終え、スレッドを開けない・停止できない場合はそのスレッドを飛ばす。独立した理由ログはない（`engine/src/program/generate.cpp:2011-2027`）。
 
 ## 実行時の詳細
 
-各 `stall_report()` 呼び出し時に環境を読み直します。結果は関数内の通常のローカル `const bool` で、static cache ではありません。従って、同一プロセスでも次の report では再評価されます（`src/program/generate.cpp:1826-1830`）。
+値は `stall_report` のたびに読み直され、関数内 static cache はない。したがってプロセスの環境値が呼出し間に変更されれば次の report で再判定される（`engine/src/program/generate.cpp:2093-2097`）。
 
-有効時、Strata は現在のスレッドを除く同一プロセスのスレッドを列挙し、最大 256 件を対象にします。各 thread を一時停止して thread context から最大 32 frame の instruction address を静的配列へ記録し、thread を再開してから report に出力します。thread の open / suspend / context 取得に失敗した場合はその thread を飛ばすか、取得できた部分だけを記録します（`src/program/generate.cpp:1717-1723,1744-1786`）。
+有効時、スタック採取を report の本文生成より先に行う。プロセス内の他スレッドを列挙し、自スレッドを除いた最大256スレッドを対象にする。各スレッドはスタック取得の間だけ suspend され、最大32フレームまで unwind した後 resume される。スレッドの列挙・停止・context 取得などに失敗した場合、失敗したスレッドは省略される（`engine/src/program/generate.cpp:1984-1990,1992-2053`）。
 
-report には `thread stacks (STRATA_STALL_STACKS=1; innermost first; ...)` の見出し、thread ID、各 frame の module-relative offset または address が出ます。`strata.exe` の frame は、実行ファイルの隣に PDB がある場合に名前を引けるよう Strata が `dbghelp.dll` の symbol API を呼び出します。他 module は module 名と offset で表示します（`src/program/generate.cpp:1789-1822,1843-1845`）。スタックの採取・表示に失敗した場合の専用エラー文はなく、個別 thread の失敗は黙ってスキップされます。
+その後の report では `thread stacks ...` の見出し、thread ID、フレームを出す。フレームは innermost first。`strata.exe` のシンボル名は `dbghelp` が利用でき、実行ファイルの隣に PDB がある場合に限り解決を試みる。他モジュールは module 名と相対 offset、module を特定できないものはアドレスを出す（`engine/src/program/generate.cpp:2056-2088`）。
 
-通常の watchdog 経由では report の後に stderr を flush し、GPU wait を解放して `abort()` します。`STRATA_SPEC_WATCH` 経由も同様に report の後に abort します。変数が無効でも stall report 自体、通常の進捗情報、後続終了動作は残ります（`src/program/generate.cpp:13371-13379,20064-20069`）。
+このスイッチは report のテキストスタック採取・表示にだけ使われる。Windows の stall report は値に関係なく後段で `strata-stall-<pid>.dmp` の作成も試みる（`engine/src/program/generate.cpp:2153-2171`）。
+
+## ログと測定値
+
+有効時のテキスト出力は stall report の stderr に入り、見出しは実装上 `  thread stacks (STRATA_STALL_STACKS=1; innermost first; strata.exe frames named from its PDB when it is beside the exe):`（`engine/src/program/generate.cpp:2068-2088`）。report を起こす serve watchdog は `strata serve: no progress for ...` を出して report を書き、GPU wait 解放を試みた後 `std::abort()` する。speculative generate の watchdog も `strata generate: no progress for ...` と report を出し、同様に abort する（`engine/src/program/generate.cpp:16313-16321,24929-24934`）。
+
+`docs/DETAILS.md:1544` は watchdog の stall report と Windows の dump を案内するが、この環境変数によるスタック追記の値判定までは記載していない。測定値の記載はない。
 
 ## 根拠
 
-- 環境判定と report への接続: `src/program/generate.cpp:1826-1845`
-- Windows 限定スタック採取、thread/frame 上限と unwind: `src/program/generate.cpp:1712-1787`
-- stack の表示と symbol lookup: `src/program/generate.cpp:1789-1822`
-- serve watchdog の既定値と report・abort: `src/program/generate.cpp:13223-13379`
-- `STRATA_SPEC_WATCH` による追加 watchdog: `src/program/generate.cpp:20049-20069`
-- stall のユーザー向け概要: `docs/DETAILS.md:1333`
+- `engine/src/program/generate.cpp:1979-2097` — Windows 専用の採取処理と環境変数判定。
+- `engine/src/program/generate.cpp:2056-2088,2110-2112` — スタックの表示と report への挿入。
+- `engine/src/program/generate.cpp:16261-16321,24915-24936` — report を呼ぶ監視経路と終了処理。
+- `engine/src/program/generate.cpp:2153-2171` — 環境変数とは独立した Windows dump 作成処理。
+- `docs/DETAILS.md:1544` — stall report に関する利用者向け資料。
